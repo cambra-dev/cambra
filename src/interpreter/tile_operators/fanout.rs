@@ -125,10 +125,11 @@ struct FanOutShared {
     /// long as this fan-out does. What a program branch that holds this fan-out
     /// holds of each source is read off it ([`FanOut::source_producers`]).
     source_producers: Vec<String>,
-    /// Set when the input's notification is passed to the branches, cleared when a branch
-    /// pulls. A second one before that says nothing the first did not, so it stops here, as
-    /// it does at an operator's shared consumer (`crate::interpreter::GatedConsumer`).
-    forwarded: Notified,
+    /// The gate the input's notifications pass to the branches through, which a branch's pull
+    /// reopens. A second notification before that, naming no key the ones passed since did not,
+    /// says nothing they did not, so it stops here, as it does at an operator's shared consumer
+    /// (`crate::interpreter::GatedConsumer`).
+    admission: crate::interpreter::scheduler::Admission,
 }
 
 impl FanOutShared {
@@ -184,6 +185,37 @@ fn retain_flagged<T>(v: &mut Vec<T>, keep: &[bool]) {
     debug_assert_eq!(v.len(), keep.len(), "one flag per element");
     let mut flags = keep.iter();
     v.retain(|_| *flags.next().unwrap_or(&false));
+}
+
+/// The consumer a fan-out installs on its input: it forwards the input's region to every live
+/// slot's consumer, through the fan-out's gate ([`FanOutShared::admission`]): between pulls a
+/// notification passes only where it names a key none passed since the last pull named.
+struct FanOutInput {
+    shared: Weak<RefCell<FanOutShared>>,
+}
+
+impl Consumer for FanOutInput {
+    fn notify(&mut self, arrived: &Projection) {
+        // Clone the consumer handles while holding a short borrow, then release the borrow before
+        // calling notify(). This prevents a re-entrant panic when a consumer (e.g. SinkConsumer)
+        // calls FanOutProducer::get_impl(), which needs shared.borrow_mut() for the same Rc.
+        let Some(shared_rc) = self.shared.upgrade() else {
+            return;
+        };
+        let consumers = {
+            let shared = shared_rc.borrow();
+            if !shared.admission.admits(arrived) {
+                return;
+            }
+            shared
+                .live_indices()
+                .map(|i| shared.consumers[i].clone())
+                .collect::<Vec<_>>()
+        };
+        for c in &consumers {
+            c.borrow_mut().notify(arrived);
+        }
+    }
 }
 
 /// RAII guard for the cyclic `FanOut` `subscribing_inner` flag.  Created
@@ -289,7 +321,7 @@ impl FanOut {
             released_position: None,
             subscribers: Vec::new(),
             reentrancy,
-            forwarded: Notified::clear(),
+            admission: crate::interpreter::scheduler::Admission::new(Notified::clear()),
             source_producers: Vec::new(),
         }));
         Self {
@@ -613,28 +645,8 @@ impl TileOperator for FanOutSlot {
             scheduler.begin_source_producers();
             let inner = self.hold.subscribe_input(
                 intent_guard,
-                Box::new(move || {
-                    // Clone the consumer handles while holding a short borrow,
-                    // then release the borrow before calling notify().  This
-                    // prevents a re-entrant panic when a consumer (e.g.
-                    // SinkConsumer) calls FanOutProducer::get_impl(), which
-                    // needs shared.borrow_mut() for the same Rc.
-                    let Some(shared_rc) = shared_weak.upgrade() else {
-                        return;
-                    };
-                    let consumers = {
-                        let shared = shared_rc.borrow();
-                        if !shared.forwarded.mark_news() {
-                            return;
-                        }
-                        shared
-                            .live_indices()
-                            .map(|i| shared.consumers[i].clone())
-                            .collect::<Vec<_>>()
-                    };
-                    for c in &consumers {
-                        c.borrow_mut().notify(&Projection::Everything);
-                    }
+                Box::new(FanOutInput {
+                    shared: shared_weak,
                 }),
                 scheduler,
             );
@@ -765,7 +777,7 @@ impl TileProducer for FanOutProducer {
         let shared_rc = self.shared();
         // Reopened before the pull, as an operator's gate is (`TileProducer::get`), and so by
         // a pull that reads nothing.
-        shared_rc.borrow().forwarded.take();
+        shared_rc.borrow().admission.reopen();
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }

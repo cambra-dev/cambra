@@ -14,36 +14,89 @@ use crate::interpreter::{
 pub type SharedConsumer = Rc<RefCell<dyn Consumer>>;
 
 /// One operator's consumer, shared between its inputs, behind a gate: a [`Notified`] flag
-/// set when a notification passes and cleared when the operator is pulled.
+/// set when a notification passes and cleared when the operator is pulled, and the region
+/// passed since ([`Admission`]).
 ///
 /// A notification carries no payload, so a second one that arrives before the operator has
-/// been pulled says nothing the first did not: the first has already reached every consumer
-/// downstream, and none of them has read this operator since. Without the gate a change
-/// reaches a sink once per path where notification paths branch and merge, and around a
-/// cycle it never stops. A pull clears it whether or not it reads the input that notified,
-/// since a consumer pulling the operator is what the notification asked for
+/// been pulled, naming no key the ones passed since did not, says nothing they did not: they
+/// have already reached every consumer downstream, and none of them has read this operator
+/// since. One that names another key passes, since a consumer that acts on the region, as a
+/// memo marks it dirty, has not heard of that key. Without the gate a change reaches a sink
+/// once per path where notification paths branch and merge, and around a cycle it never
+/// stops. A pull clears it whether or not it reads the input that notified, since a consumer
+/// pulling the operator is what the notification asked for
 /// (`src/interpreter/design-operators.md`, "The notification contract").
 #[derive(Clone)]
 pub struct GatedConsumer {
     shared: SharedConsumer,
-    gate: Notified,
+    admission: Admission,
 }
 
 /// The gate of an operator's [`GatedConsumer`], for the operator's producer to take into its
 /// base ([`ProducerBase::sharing`](crate::interpreter::tile_operators::ProducerBase::sharing)),
 /// which clears it on every pull.
 ///
-/// A gate no pull clears closes on the first notification and drops every one after it, so
-/// the operator stops being woken without any error. The token is not `Clone` and is
+/// A gate no pull clears closes on the first notification, and from then on drops every
+/// notification naming only keys that passed since, so the operator stops being woken for them
+/// without any error. The token is not `Clone` and is
 /// `#[must_use]`, so a `subscribe` that builds a shared consumer and leaves its gate unused does
 /// not compile cleanly.
-#[must_use = "a gate no pull clears drops every notification after the first: pass it to \
+#[must_use = "a gate no pull clears drops every notification of keys that passed: pass it to \
               `ProducerBase::sharing`"]
 pub struct Gate(pub(crate) Notified);
 
+/// What a gate passes: the first notification after a pull, and after it one that names a key
+/// nothing passed since that pull named. A pull clears the gate's flag, which starts the region
+/// passed afresh. Clones share the flag and the region, so a forwarder reads what passed while
+/// the consumer behind the gate is borrowed. The region is a union of what passed, not closed
+/// over any tiling, so regions naming every tag of a tagged union whole do not make it
+/// `Everything`: a later `Everything` passes once more, and the region is then `Everything`.
+#[derive(Clone)]
+pub(crate) struct Admission {
+    gate: Notified,
+    // shared-state-ok: the region a gate passed since the last pull, shared by the gate and the
+    // forwarder that reads it on reentry; it names keys, never a tile.
+    passed: Rc<RefCell<Projection>>,
+}
+
+impl Admission {
+    /// An admission behind `gate`, which every pull of the operator clears.
+    pub(crate) fn new(gate: Notified) -> Self {
+        Admission {
+            gate,
+            passed: Rc::new(RefCell::new(Projection::Nothing)),
+        }
+    }
+
+    /// Whether `arrived` passes, which records it as passed.
+    pub(crate) fn admits(&self, arrived: &Projection) -> bool {
+        let mut passed = self.passed.borrow_mut();
+        if self.gate.mark_news() {
+            *passed = arrived.clone();
+            return true;
+        }
+        if arrived.minus(&passed) == Projection::Nothing {
+            return false;
+        }
+        *passed = passed.union(arrived);
+        true
+    }
+
+    /// Whether `arrived` would stop at the gate: the gate is closed, and what passed since the
+    /// last pull names every key `arrived` names. Records nothing.
+    pub(crate) fn covers(&self, arrived: &Projection) -> bool {
+        self.gate.is_set() && arrived.minus(&self.passed.borrow()) == Projection::Nothing
+    }
+
+    /// Clear the gate, as a pull of the operator does.
+    pub(crate) fn reopen(&self) {
+        self.gate.take();
+    }
+}
+
 /// The consumer a gate guards: forwards a notification to `consumer` when the gate passes it.
 struct Gated {
-    admit: Notified,
+    admit: Admission,
     consumer: Box<dyn Consumer>,
 }
 
@@ -53,7 +106,7 @@ impl Consumer for Gated {
             *arrived != Projection::Nothing,
             "no producer notifies of an empty region"
         );
-        if self.admit.mark_news() {
+        if self.admit.admits(arrived) {
             self.consumer.notify(arrived);
         }
     }
@@ -62,11 +115,12 @@ impl Consumer for Gated {
 impl GatedConsumer {
     /// `consumer` behind `gate`, which the operator's producer must clear on every pull.
     pub fn new(consumer: Box<dyn Consumer>, gate: Notified) -> Self {
+        let admission = Admission::new(gate);
         let shared: SharedConsumer = Rc::new(RefCell::new(Gated {
-            admit: gate.clone(),
+            admit: admission.clone(),
             consumer,
         }));
-        Self { shared, gate }
+        Self { shared, admission }
     }
 
     /// The handle a wakeup queue holds or a producer re-arms.
@@ -149,7 +203,7 @@ struct Forwarding {
 
 impl Consumer for Forwarding {
     fn notify(&mut self, arrived: &Projection) {
-        let GatedConsumer { shared, gate } = &self.gated;
+        let GatedConsumer { shared, admission } = &self.gated;
         let everything = Projection::Everything;
         let region = if self.keeps_keys {
             arrived
@@ -167,13 +221,14 @@ impl Consumer for Forwarding {
         // outside any cascade, where it cannot re-enter, and at worst wakes a consumer
         // whose next pull finds nothing new.
         //
-        // A re-entering notification behind a closed gate is dropped instead: nothing has
-        // pulled the operator since the notification in progress passed, so that one already
-        // says everything this would. Deferring it would deliver it again on the next drain,
-        // and around a cycle again on every poll after.
+        // A re-entering notification the gate would stop is dropped instead: nothing has
+        // pulled the operator since the notifications that passed, and they name every key this
+        // one does. Deferring it would deliver it again on the next drain, and around a cycle
+        // again on every poll after. One naming a key that has not passed is deferred, and
+        // delivered as `Everything`, since the wakeup queue holds handles and not regions.
         match shared.try_borrow_mut() {
             Ok(mut consumer) => consumer.notify(region),
-            Err(_) if gate.is_set() => {}
+            Err(_) if admission.covers(region) => {}
             Err(_) => self.wakeups.request(shared.clone()),
         }
     }
@@ -511,7 +566,8 @@ fn pull_counts(
 ///
 /// A gate closes when a notification passes and opens when the operator is pulled, so it rests
 /// on a rule nothing else checks: a consumer woken by an operator pulls that operator. While it
-/// has not, every later notification from the operator's inputs is dropped. A consumer that no
+/// has not, every later notification from the operator's inputs naming only keys that passed is
+/// dropped. A consumer that no
 /// longer reads the operator owes it nothing (a finished read, a settled seed, a recurrence
 /// whose last reader retired), so only one still pulled counts, and an operator released whole
 /// is never pulled again.
@@ -545,18 +601,33 @@ mod tests {
         Projection::of(&keys_between(first, last)).expect("keys name a projection")
     }
 
-    /// A consumer that pulls gets one notification between pulls, and the closed gate delivers
-    /// no region after it.
+    /// Between pulls a gate passes a notification only for keys it has not passed since the last
+    /// pull: one within what passed stops at the gate, one naming another key passes.
     #[test]
-    fn a_closed_gate_passes_one_notification_to_a_consumer_that_pulls() {
+    fn a_closed_gate_passes_only_keys_it_has_not_passed_since_the_last_pull() {
         let (log, regions) = RegionLog::new();
         let (gated, gate) = shared_consumer(Box::new(log));
         gated.notify(&keys(0, 3));
+        gated.notify(&keys(1, 2));
         gated.notify(&keys(10, 12));
-        assert_eq!(*regions.borrow_mut(), [keys(0, 3)]);
+        gated.notify(&keys(11, 12));
+        assert_eq!(*regions.borrow_mut(), [keys(0, 3), keys(10, 12)]);
         assert!(gate.0.take());
-        gated.notify(&keys(30, 31));
-        assert_eq!(*regions.borrow_mut(), [keys(0, 3), keys(30, 31)]);
+        // The pull starts the region passed afresh: keys that passed only before it pass again.
+        gated.notify(&keys(10, 12));
+        gated.notify(&keys(1, 2));
+        // A region naming some keys that passed and some that did not passes whole.
+        gated.notify(&keys(2, 5));
+        assert_eq!(
+            *regions.borrow_mut(),
+            [
+                keys(0, 3),
+                keys(10, 12),
+                keys(10, 12),
+                keys(1, 2),
+                keys(2, 5)
+            ]
+        );
     }
 
     /// A forwarder sends `Everything` unless its operator's keys are its input's.
@@ -757,6 +828,55 @@ mod tests {
         );
         scheduler.check_for_notifications();
         assert_eq!(notified.get(), 1);
+    }
+
+    /// A notification that re-enters the consumer it started from naming a key that did not pass
+    /// since the last pull is deferred, not dropped: the consumer has not heard of that key.
+    /// Delivered on the drain, it passes the gate, which then stops a copy naming nothing new.
+    #[test]
+    fn a_reentrant_wake_naming_a_new_key_is_deferred() {
+        let arrivals = Rc::new(RefCell::new(Vec::new()));
+        let feedback: Rc<RefCell<Option<Box<dyn Consumer>>>> = Rc::new(RefCell::new(None));
+        struct Log {
+            arrivals: Rc<RefCell<Vec<Projection>>>,
+            feedback: Rc<RefCell<Option<Box<dyn Consumer>>>>,
+        }
+        impl Consumer for Log {
+            fn notify(&mut self, arrived: &Projection) {
+                self.arrivals.borrow_mut().push(arrived.clone());
+                // The cycle: arm B's notification, of other keys, re-enters the operator this
+                // one is inside.
+                let rest = self.feedback.borrow_mut().take();
+                if let Some(mut arm_b) = rest {
+                    arm_b.notify(&keys(2, 3));
+                }
+            }
+        }
+        let downstream = Box::new(Log {
+            arrivals: arrivals.clone(),
+            feedback: feedback.clone(),
+        });
+        // Nothing pulls the operator here, so its gate is never cleared.
+        let (shared, _gate) = shared_consumer(downstream);
+        let mut scheduler = Scheduler::new();
+        let mut arm_a = forwarding_consumer_keeping_keys(&shared, &scheduler.wakeup_queue());
+        *feedback.borrow_mut() = Some(forwarding_consumer_keeping_keys(
+            &shared,
+            &scheduler.wakeup_queue(),
+        ));
+        arm_a.notify(&keys(0, 1));
+        assert!(
+            !scheduler.wakeups.is_empty(),
+            "the re-entrant notification of a new key was dropped"
+        );
+        scheduler.check_for_notifications();
+        assert_eq!(*arrivals.borrow(), vec![keys(0, 1), Projection::Everything]);
+        arm_a.notify(&keys(2, 3));
+        assert_eq!(
+            arrivals.borrow().len(),
+            2,
+            "a notification within what passed stops at the gate"
+        );
     }
 
     /// A pull that answers what the last one did but queues a wakeup is not quiescence: the
