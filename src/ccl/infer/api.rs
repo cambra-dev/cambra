@@ -1687,11 +1687,18 @@ pub fn check_module(
     ctx: &mut TypeInferenceContext,
     params: &[super::ModuleCheckParam],
     reported: &HashSet<Name>,
-) -> Result<HashMap<Name, Contract>, Vec<LocatedInferError>> {
+    public: &HashSet<Name>,
+) -> Result<ModuleChecked, Vec<LocatedInferError>> {
     // The arena tears down every variable the check mints, as for `infer`.
     let _arena = InferArena::new();
-    let (_, schemes, opened) =
-        super::run_with_params(expr, &ctx.source_types, &ctx.instances, params, reported)?;
+    let (_, schemes, opened, top_level) = super::run_with_params(
+        expr,
+        &ctx.source_types,
+        &ctx.instances,
+        params,
+        reported,
+        public,
+    )?;
     let mut contracts: HashMap<Name, Contract> = schemes
         .into_iter()
         .map(|(name, mut scheme)| {
@@ -1707,7 +1714,18 @@ pub fn check_module(
             contracts.insert(binding.name.clone(), Contract::Type(ty));
         }
     }
-    Ok(contracts)
+    Ok(ModuleChecked {
+        contracts,
+        top_level,
+    })
+}
+
+/// What checking a module on its own finds ([`check_module`]).
+pub struct ModuleChecked {
+    /// The contract of each binding the check reports.
+    pub contracts: HashMap<Name, Contract>,
+    /// What the module's top level requires and causes, less what its scopes discharge.
+    pub top_level: crate::ccl::effects::EffectSet,
 }
 
 /// The contract a module's check infers for one of its public members

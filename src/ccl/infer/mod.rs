@@ -594,7 +594,15 @@ pub(crate) fn run(
     sources: &HashMap<String, Type>,
     instances: &Rc<solver::traits::InstanceTable>,
 ) -> Result<Type, Vec<LocatedInferError>> {
-    run_with_params(expr, sources, instances, &[], &HashSet::new()).map(|(ty, _, _)| ty)
+    run_with_params(
+        expr,
+        sources,
+        instances,
+        &[],
+        &HashSet::new(),
+        &HashSet::new(),
+    )
+    .map(|(ty, ..)| ty)
 }
 
 /// The scheme each generalized binding a module check reports was bound at.
@@ -614,7 +622,16 @@ pub(crate) fn run_with_params(
     instances: &Rc<solver::traits::InstanceTable>,
     params: &[ModuleCheckParam],
     reported: &HashSet<Name>,
-) -> Result<(Type, NotedSchemes, OpenedVars), Vec<LocatedInferError>> {
+    public: &HashSet<Name>,
+) -> Result<
+    (
+        Type,
+        NotedSchemes,
+        OpenedVars,
+        crate::ccl::effects::EffectSet,
+    ),
+    Vec<LocatedInferError>,
+> {
     // Convert source registry once; reuse across all node emissions.
     let mut sub_ctx = {
         let pre = InferCtx::new(HashMap::new(), expr.node_id());
@@ -630,6 +647,7 @@ pub(crate) fn run_with_params(
     };
     let opened = sub_ctx.open_module_params(params).map_err(|e| vec![e])?;
     sub_ctx.reported = reported.clone();
+    sub_ctx.public = public.clone();
 
     // Pass 1: emit constraints. The high-value variants
     // (`UnboundVariable`/`TypeMismatch`/`ExpectedFunction`) all originate here.
@@ -781,7 +799,8 @@ pub(crate) fn run_with_params(
     // validator does not traverse for witness references. This additional walk is debug-only.
     #[cfg(debug_assertions)]
     debug_assert_no_free_witness(expr, "post-inference");
-    Ok((expr.ty.clone(), sub_ctx.schemes_noted, opened))
+    let top_level = sub_ctx.top_level_effects();
+    Ok((expr.ty.clone(), sub_ctx.schemes_noted, opened, top_level))
 }
 
 use crate::ccl::Expr;
