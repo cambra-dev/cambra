@@ -11,15 +11,13 @@ use crate::{
     interpreter::{ColumnValue, Consumer, Scheduler, Value},
 };
 
-/// Reduces a `DataFunction` input to a single scalar via an aggregation operation.
+/// Folds a collection's values into one [`Tile::Aggregation`].
 ///
-/// On each `get`, reads all codomain values from the input and folds them into a
-/// running `Tile::Aggregation` accumulator. The result becomes terminal once the
-/// input's `domain_predicate` is `True` (all elements seen).
+/// Accumulation, completion, and release follow `src/interpreter/design-operators.md`,
+/// "Aggregation and extraction". [`ExtractAggregate`] reads the terminal result.
 pub struct Aggregate {
     /// The `DataFunction`-typed input whose codomain elements are aggregated.
     input: Box<dyn TileOperator>,
-    /// Output tiling — always `Tiling::Aggregation { accumulator: <output extent> }`.
     base: OperatorBase,
 }
 
@@ -78,14 +76,13 @@ struct AggregateProducer {
     kind: AggregateKind,
     /// Running accumulation state; updated in place on each `get`.
     accumulator: Tile,
-    /// Set once the consumer has released this output universally, after which
-    /// the accumulator must never be handed back — it *is* the whole output, so
-    /// re-emitting it returns released data.
+    /// Suppresses subsequent emissions after universal release.
     released: bool,
 }
 
 impl AggregateProducer {
-    /// Construct an `AggregateProducer`, seeding the accumulator with the identity element.
+    /// Initialize through [`AggregateKind::initial_accumulator`]. An extremum without an identity
+    /// starts without a value and waits for its first element.
     fn new(base: ProducerBase, input: Box<dyn TileProducer>) -> Self {
         let (kind, accumulator) = match &base.tiling {
             Tiling::Aggregation {
@@ -151,8 +148,7 @@ impl TileProducer for AggregateProducer {
         };
         self.kind.accumulate(accumulator, &values, 0, values.rows());
         terminal[0] = is_terminal;
-        // An extreme with no identity has no value until its first element: an empty
-        // `terminal` says so ([`ExtractAggregate`]), however many pulls come first.
+        // No terminal flag can be emitted before the accumulator has a value.
         if self.kind.awaits_first_element(accumulator) {
             if is_terminal {
                 self.kind.no_extreme_of_nothing();
@@ -163,12 +159,8 @@ impl TileProducer for AggregateProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // An `Aggregation` guard is all-or-nothing — the accumulator has no
-        // sub-regions — so the only release that can arrive is the universal one.
-        // Releasing the input in full is what `get_impl` cannot do: it releases
-        // each delivery as it folds it in, so whatever the input never delivered
-        // — this aggregate being done before its source ran dry — would stay
-        // stranded upstream.
+        // Universal release also covers input not yet delivered. Per-delivery releases in
+        // `get_impl` cover only the received tiles.
         if obsolete_guard.expect_universal_or_empty(&self.name()) {
             self.released = true;
             self.input.release(self.input.tiling().universal_guard());
@@ -176,6 +168,7 @@ impl TileProducer for AggregateProducer {
     }
 }
 
+/// Extracts a terminal result from an aggregation. Partial-result extraction is unsupported.
 pub struct ExtractAggregate {
     input: Box<dyn TileOperator>,
     base: OperatorBase,
@@ -255,9 +248,7 @@ impl TileProducer for ExtractAggregateProducer {
                 self.input.tiling()
             );
         };
-        // An empty accumulator is `⊥`, not a finished aggregation of nothing: the
-        // input has either not produced yet, or has released what it produced and
-        // gone quiet. Either way there is no terminal flag to read.
+        // An empty tile has no terminal flag; it is not the completed fold of an empty input.
         if terminal.is_empty() {
             return self.tiling().empty_tile();
         }
@@ -279,19 +270,14 @@ impl TileProducer for ExtractAggregateProducer {
     }
 }
 
-/// Extracts terminal aggregation results from a `DataFunction(D, Aggregation)`, producing a
-/// `DataFunction(D, Scalar)`.
+/// Extracts terminal results beneath a chain of collection levels.
 ///
-/// One level, which is the fold's own: [`MapAggregate`] collapses the innermost collection,
-/// so the levels above it stay and this operator reads the one that is left. A fold under
-/// two or more levels leaves `DataFunction(D₀ … Dₙ₋₁, Aggregation)`, which this rejects.
-/// An element is emitted only where its terminal flag is set; the rest are filtered out.
+/// Preserves the enclosing levels and removes innermost keys whose aggregation is not terminal.
+/// See `src/interpreter/design-operators.md`, "Aggregation and extraction".
 pub struct MapExtractAggregate {
-    /// The `DataFunction(D, Aggregation)`-typed input.
     input: Box<dyn TileOperator>,
     /// The aggregation operation used to extract final values from accumulators.
     kind: AggregateKind,
-    /// Output tiling: `DataFunction { domain: input.domain, codomain: Scalar(output_extent) }`.
     base: OperatorBase,
 }
 
@@ -400,9 +386,8 @@ impl TileProducer for MapExtractAggregateProducer {
         output
     }
 
-    /// Every level passes through and only what sits under the innermost changes, so a
-    /// region named on the output names the same region of the input — a key of any level,
-    /// or a path down to one, alike.
+    /// Restates releases through the unchanged collection levels. Releasing part of an
+    /// extracted value does not release its input aggregation.
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         self.input.release(match obsolete_guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
@@ -494,23 +479,17 @@ fn build_levels_from_paths(
     nest_levels(domains, starts, codomain, domain_predicate)
 }
 
-/// Collapses the **innermost** collection of a nested tile into an aggregation, leaving the
+/// Collapses the innermost collection of a nested tile into an aggregation, leaving the
 /// levels above it intact.
 ///
-/// For `K₀ ⤇ … ⤇ Kₙ₋₁ ⤇ C` and an [`AggregateKind`] it produces `K₀ ⤇ … ⤇ Kₙ₋₂ ⤇
-/// Aggregation(C)`. Collapsing one level per operator is what lets nested aggregation nest:
-/// each `sum` in `sum([sum([…]) for …])` is one of these.
-///
-/// Accumulators are keyed by the **path** of the element being folded into, not by its own
-/// value: a key repeats across its siblings' groups, so below the outermost level a value
-/// does not identify an element. New data merges on each `get`; an element's aggregation
-/// becomes terminal where the input's `domain_predicate` names its outermost ancestor.
+/// Accumulators use complete key paths to distinguish equal keys under different parents.
+/// Completion and release follow `src/interpreter/design-operators.md`,
+/// "Aggregation and extraction".
 pub struct MapAggregate {
     /// The lookup-function input to aggregate per key.
     input: Box<dyn TileOperator>,
     /// The aggregation operation (Sum, Max, …).
     kind: AggregateKind,
-    /// Output tiling: `DataFunction { domain: input.domain, codomain: Aggregation { accumulator: output_extent } }`.
     base: OperatorBase,
 }
 
@@ -622,7 +601,7 @@ struct MapAggregateProducer {
     input: Box<dyn TileProducer>,
     /// The aggregation operation.
     kind: AggregateKind,
-    /// Running per-key accumulators, grown as new keys arrive across `get` calls.
+    /// Running accumulators indexed by complete paths, outermost key first.
     accumulators: HashMap<Vec<Value>, Tile>,
     /// Keys above the accumulators whose every accumulator was released without the key
     /// itself: a key is there only through what it maps to, and a release naming part of
@@ -710,19 +689,8 @@ impl TileProducer for MapAggregateProducer {
         // Release received values
         self.input.release(upstream_guard);
 
-        // Build the output from all known accumulators.
-        //
-        // **Terminal per element, which is what the predicates say.** A level's
-        // `domain_predicate` names which of that level's keys are closed, and a key called
-        // closed is closed at every depth beneath it — so an element is final as soon as
-        // some level on its path calls that prefix closed, whatever the rest of the domain
-        // is still doing. Reading the predicate as one bool answers "not yet" for every
-        // element whenever any part of the domain is open, which is never right for a live
-        // source: a collection held per row is complete as soon as its row arrives, and an
-        // aggregate over one would otherwise never settle. Reading only the **outermost**
-        // level is the same mistake one level up: under a nested store the enclosing
-        // positions stay open while the one being run is decided, so an aggregate inside the
-        // nest would never settle either.
+        // Completion is per path. An inner group can be complete while its enclosing
+        // collections remain open; `complete` combines the statements at every level.
         let mut entries: Vec<(Vec<Value>, Tile)> = self
             .accumulators
             .iter()
@@ -731,8 +699,7 @@ impl TileProducer for MapAggregateProducer {
         // Sorted so the outermost column stays ordered and a parent's children sit
         // contiguously, which is what rebuilding the offsets assumes.
         entries.sort_by(|a, b| compare_paths(&a.0, &b.0));
-        // A group whose extreme has no identity has no value until its first element, so
-        // its key waits for one; complete without one, it has none at all.
+        // Omit identity-free extrema until they have values; a completed empty group is invalid.
         entries.retain(|(path, acc)| {
             if !kind.awaits_first_element(acc) {
                 return true;
@@ -782,11 +749,7 @@ impl TileProducer for MapAggregateProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // The output domain *is* this producer's accumulator key set, and the
-        // input's own keys are that same key set, so a domain release names
-        // exactly which accumulators to drop and forwards verbatim. Keeping a
-        // released key would re-emit it on the next pull, since `get_impl` builds
-        // its output from every accumulator it holds.
+        // Remove covered accumulators before another pull rebuilds the output from this map.
         match obsolete_guard {
             g if g.is_empty() => {}
             g if g.is_universal() => {
@@ -794,13 +757,9 @@ impl TileProducer for MapAggregateProducer {
                 self.emptied_keys.clear();
                 self.input.release(self.input.tiling().universal_guard());
             }
-            // The guard is a region over the accumulators' own paths, whatever shape it
-            // names it at, so it is read at each of them rather than matched arm by arm.
-            // Keeping a released path would re-emit it on the next pull, `get_impl`
-            // building its output from every accumulator it holds.
-            // The input carries the aggregated level where the output holds each group's
-            // accumulator, so a region of the output's keys passes through and only a
-            // release of a whole accumulator reaches the group beneath its key.
+            // Preserve unreleased ancestor keys even when their last accumulator is removed.
+            // The input has a collection where the output has an accumulator, so restate
+            // the guard through their shared levels rather than forwarding it unchanged.
             g => {
                 let released: Vec<Vec<Value>> = self
                     .accumulators

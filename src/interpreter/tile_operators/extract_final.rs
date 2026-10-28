@@ -6,55 +6,32 @@ use crate::{
     pretty_tree::InspectNode,
 };
 
-// ---------------------------------------------------------------------------
-// ExtractFinal / ExtractFinalProducer
-// ---------------------------------------------------------------------------
-
-/// Extracts the final value of a `DataFunction` stream, the codomain at its highest
-/// position once the stream is terminal, as a `Scalar`: `final_or_default(stream, default)`
-/// over any stream but an induction accumulator's own history, whose final the store holds
-/// ([`StoreFinalRead`](crate::interpreter::commit_operator::StoreFinalRead)).
+/// Extracts the last live position's value once a collection is terminal.
 ///
-/// When the source becomes terminal but emits no values, the `default` operator's scalar
-/// value is emitted instead, so the read is total.
+/// The output has the source's codomain tiling, including collection-valued codomains.
+/// See `src/interpreter/design-operators.md`, "Final-value extraction", for ordering, fallback,
+/// and release. Induction histories use
+/// [`StoreFinalRead`](crate::interpreter::commit_operator::StoreFinalRead) instead.
 pub struct ExtractFinal {
     /// Operator producing the `DataFunction` tiling to extract from.
     source: Box<dyn TileOperator>,
-    /// Fallback scalar operator, pulled when `source` is terminal and emits zero
-    /// values.  Must have a `Scalar` tiling whose extent the output extent
-    /// *includes* — a width-narrower variant is admitted and widened on emission.
-    ///
-    /// `None` when the source is known to be **total** — a tag partition over an
-    /// exhaustive `match` always yields exactly one value, so there is no empty
-    /// case to fall back from and no default value has to be invented. An empty
-    /// source with no default is an invariant violation, not a fallback.
+    /// Fallback for a terminal source with no live positions. Its extent must be included
+    /// in the source codomain. `None` requires a source that cannot finish empty.
     default: Option<Box<dyn TileOperator>>,
     /// Output tiling — what one position of the source holds.
     base: OperatorBase,
 }
 
 impl ExtractFinal {
-    /// Construct a new `ExtractFinal` wrapping `source`, with `default`
-    /// as the fallback for the empty-source case.
+    /// Extract from a collection, using `default` if it finishes without a live position.
     ///
-    /// `source` must have a `DataFunction` tiling and `default` a `Scalar`
-    /// tiling whose extent that codomain includes. The output tiling becomes
-    /// the scalar codomain.
+    /// Panics if `source` is not a collection. Debug-asserts that its codomain extent includes
+    /// the default's extent. The output has the source's codomain tiling.
     pub fn new(source: Box<dyn TileOperator>, default: Box<dyn TileOperator>) -> Self {
         let tiling = Self::source_codomain_tiling(source.as_ref());
-        // The default has to be *representable* in the output value space — neither
-        // identically tiled nor even the same extent. Two independent reasons, both
-        // live:
-        //
-        // - **Tiling shape.** A record/tuple value is `Scalar(Record)` coming from a
-        //   mutable variable history but `Record({_0: Scalar, …})` (struct-of-arrays) from a
-        //   literal. `get_impl` normalizes both through `scalar_tile_to_column_value`,
-        //   so the structural tilings need not agree — only the value-spaces.
-        // - **Width.** A tag `match`/conditional whose arms carry different tags
-        //   collapses to the arms' join, and the trailing arm supplying the default is
-        //   one of those arms, so its extent carries its own tag and not its siblings'.
-        //   Emission builds the column at the declared extent, which is what makes the
-        //   narrower value fit.
+        // Non-collection defaults are normalized through `scalar_tile_to_column_value`.
+        // Record layouts may differ, and a variant default may carry fewer arms than the
+        // declared output extent; equality of tilings would reject both cases.
         debug_assert!(
             tiling.extent().includes(&default.tiling().extent()),
             "ExtractFinal default must be representable in the source codomain: \
@@ -68,12 +45,10 @@ impl ExtractFinal {
         }
     }
 
-    /// Construct an `ExtractFinal` over a source known to be **total**.
+    /// Extract from a collection that cannot finish without a live position.
     ///
-    /// Used where the stream is a partition that always covers exactly one
-    /// position — an exhaustive tag `match` — so the empty case cannot arise and
-    /// no default value has to be fabricated. If the source does turn out empty,
-    /// [`ExtractFinalProducer`] fails loudly rather than inventing a value.
+    /// Exhaustive tag partitions satisfy this precondition. A terminal empty source panics
+    /// during extraction. Construction panics if `source` is not a collection.
     pub fn without_default(source: Box<dyn TileOperator>) -> Self {
         let tiling = Self::source_codomain_tiling(source.as_ref());
         Self {
@@ -111,13 +86,8 @@ impl TileOperator for ExtractFinal {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        // Both branches need their own notification path: any progress on
-        // either side may unblock the consumer (source becoming terminal,
-        // default resolving its scalar value).  We give source the shared
-        // consumer handle since it's the primary trigger; default uses a
-        // no-op notifier because its readiness only matters at the moment
-        // we discover an empty source — by then we're already in `get_impl`
-        // and will pull it directly.
+        // Only source notifications reach the consumer. The default is subscribed eagerly
+        // but pulled only after a terminal source has no live positions.
         let source_producer =
             self.source
                 .subscribe(self.source.tiling().universal_guard(), consumer, scheduler);
@@ -143,26 +113,11 @@ impl TileOperator for ExtractFinal {
 struct ExtractFinalProducer {
     base: ProducerBase,
     source: Box<dyn TileProducer>,
-    /// Default-value producer, pulled when `source` becomes terminal
-    /// and emits zero values.  Subscribed eagerly alongside `source`;
-    /// `get` is deferred until we know we need it.
     default: Option<Box<dyn TileProducer>>,
-    /// Cached final scalar value.  `None` until the source becomes
-    /// terminal; `Some(_)` thereafter.  Every subsequent `get` returns
-    /// this same value until the consumer releases us with a universal
-    /// guard — which then sets [`Self::released`] and we go quiet.
-    /// Same emit-until-released protocol as [`Constant`], so consumers
-    /// that pull repeatedly (e.g. sibling `Final` projections off a
-    /// shared multi-accumulator mutation-loop) see a stable value
-    /// instead of an empty source after the first terminal pull.
-    /// The extracted result, re-emitted until released. A tile rather than a value: a
-    /// collection-valued position holds a whole sub-tile.
+    /// Cached result, re-emitted until release. May remain absent after source completion
+    /// while waiting for the default. Collection-valued results retain a whole sub-tile.
     final_tile: Option<Tile>,
-    /// Set to `true` by [`Self::release_impl`] on a universal release.
-    /// Returns an empty scalar from every subsequent `get`.  The
-    /// surrounding `Memo` normally issues this universal release as
-    /// soon as it has merged the value into its own cache, so
-    /// post-release emissions are rare in normal data flow.
+    /// Suppresses subsequent emissions after universal release.
     released: bool,
 }
 
@@ -189,42 +144,21 @@ impl TileProducer for ExtractFinalProducer {
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        // Every emission below is built at the **declared** extent rather than
-        // from the value alone. A variant value carries only the tag it holds, so
-        // a column built from it would have just that one arm — narrower than this
-        // operator's tiling whenever the alternatives it collapses carry more tags
-        // between them. Building at the declared extent keeps every arm present,
-        // with the ones that did not occur empty, which is the shape downstream
-        // merges and appends require.
+        // Scalar columns use the declared extent, retaining variant arms absent from the
+        // selected value so downstream merges see the declared layout.
         let extent = self.tiling().extent();
         let empty = self.tiling().empty_tile();
         if self.released {
             return empty;
         }
-        // Already extracted: keep re-emitting the same scalar until we
-        // are released.  Downstream `Memo` typically releases on first
-        // sight of a non-empty tile, so this branch only stays active
-        // across pulls when the consumer doesn't release immediately
-        // (e.g. while a sibling pipeline is still converging).
         if let Some(tile) = &self.final_tile {
             return tile.clone();
         }
         let source_tiling = self.source.tiling().clone();
         let source_tile = self.source.get(source_tiling.universal_guard());
         if !source_tile.is_terminal() {
-            // Source hasn't converged yet — emit an empty scalar of the
-            // correct extent.  Our own tiling *is* the source's codomain
-            // (always `Scalar`), so its extent gives us the value-space
-            // directly without going through `Tiling::codomain` (which
-            // would return `None` for a `Scalar`).
-            //
-            // Incremental release: we only ever need the *final* (highest-domain)
-            // value, so every position below the highest one seen so far is dead —
-            // release it. This is a promise never to re-request those positions;
-            // the source decides what upstream storage that frees (for a changelog
-            // dense read, the store prefix below the tail's carry source). Without
-            // it, a never-terminating loop would pin the whole changelog until a
-            // terminal that never comes.
+            // Release UInt positions below the highest live position without waiting for
+            // completion. Retain that position because it can still supply the final value.
             if let Some(keys) = source_tile.live_keys() {
                 let max_pos = keys
                     .filter_map(|(_, key)| match key {
@@ -243,12 +177,7 @@ impl TileProducer for ExtractFinalProducer {
             }
             return empty;
         }
-        // Source is terminal — we've seen the final tile, so we'll
-        // never need more data from it.  Release universally so
-        // upstream chains (`FanOut`, `Memo`, mutation-loop body
-        // sub-graphs) can in turn release their inputs and ultimately
-        // reach the underlying data source.  Release is idempotent, so
-        // a repeated call from the consumer's outer pull loop is fine.
+        // Release the completed source before selecting its final value or pulling the default.
         self.source.release(source_tiling.universal_guard());
         let Tile::DataFunction {
             domain,
@@ -296,14 +225,9 @@ impl TileProducer for ExtractFinalProducer {
             self.final_tile = Some(tile.clone());
             return tile;
         }
-        // Source is terminal *and* empty (the loop body ran zero times).  Pull the
-        // default scalar and emit that instead, then release the default so its
-        // upstream chain can release too.
+        // No live positions remain. Cache the default only once it is complete.
         let yields_a_level = self.tiling().is_data_function();
         let Some(default) = self.default.as_mut() else {
-            // No default means the source was declared total — an exhaustive tag
-            // partition always covers exactly one position. An empty source here is
-            // that invariant being wrong, so fail rather than invent a value.
             panic!(
                 "ExtractFinal over a source declared total emitted no value; the \
                  partition feeding it was not exhaustive"
@@ -329,8 +253,7 @@ impl TileProducer for ExtractFinalProducer {
                 self.final_tile = Some(tile.clone());
                 tile
             }
-            // Default hasn't converged yet — emit empty.  Outer pull
-            // loop will retry; once default resolves, we'll cache it.
+            // A subsequent pull can retry an incomplete default.
             None => empty,
         }
     }
