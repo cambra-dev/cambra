@@ -16,7 +16,7 @@
 
 use smol_str::SmolStr;
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     rc::Rc,
     sync::{Mutex, OnceLock},
@@ -388,6 +388,57 @@ struct FlaggingConsumer {
 impl Consumer for FlaggingConsumer {
     fn notify(&mut self, arrived: &Projection) {
         self.flag.mark();
+        self.downstream.notify(arrived);
+    }
+}
+
+/// The regions an input has notified since they were last taken.
+///
+/// `subscribe` installs [`Self::consumer`] on the input before the producer exists;
+/// `Rc<RefCell<_>>` connects the two and carries no tile values.
+#[derive(Clone)]
+pub struct Arrivals(
+    // shared-state-ok: see the type doc.
+    Rc<RefCell<Projection>>,
+);
+
+impl Arrivals {
+    /// No region arrived yet.
+    pub(crate) fn new() -> Self {
+        Self(Rc::new(RefCell::new(Projection::Nothing)))
+    }
+
+    /// The union of the regions that arrived since the last call, which resets it.
+    pub fn take(&self) -> Projection {
+        self.0.replace(Projection::Nothing)
+    }
+
+    /// Whether a region has arrived since the last [`take`](Self::take), which it leaves
+    /// recorded.
+    pub fn pending(&self) -> bool {
+        *self.0.borrow() != Projection::Nothing
+    }
+
+    /// An input consumer that records the region before forwarding it downstream.
+    pub fn consumer(&self, downstream: Box<dyn Consumer>) -> Box<dyn Consumer> {
+        Box::new(RecordingConsumer {
+            arrivals: self.clone(),
+            downstream,
+        })
+    }
+}
+
+/// What [`Arrivals::consumer`] returns: records the region, then forwards it unchanged.
+struct RecordingConsumer {
+    arrivals: Arrivals,
+    downstream: Box<dyn Consumer>,
+}
+
+impl Consumer for RecordingConsumer {
+    fn notify(&mut self, arrived: &Projection) {
+        let mut held = self.arrivals.0.borrow_mut();
+        *held = held.union(arrived);
+        drop(held);
         self.downstream.notify(arrived);
     }
 }
@@ -798,7 +849,6 @@ pub struct ProducerBase {
     pub tiling: Tiling,
     /// Obsolete region of the tiling
     pub obsolete_guard: TileGuard,
-    pub(crate) notified: Notified,
     /// The gate on the consumer this producer's operator shares between its inputs
     /// ([`shared_consumer`](crate::interpreter::scheduler::shared_consumer)), cleared by
     /// every pull. `None` for an operator that shares none.
@@ -812,24 +862,12 @@ pub struct ProducerBase {
 }
 
 impl ProducerBase {
-    /// Initialize a producer without an input notification flag; every pull may read its input.
+    /// Initialize a producer for `owner`'s operator.
     pub(crate) fn new(
         id: usize,
         tiling: &Tiling,
         owner: &OperatorBase,
         scheduler: &Scheduler,
-    ) -> Self {
-        Self::listening(id, tiling, owner, scheduler, Notified::Always)
-    }
-
-    /// Initialize with the flag whose [`Notified::consumer`] was installed on the input.
-    /// Producer-specific code decides when an unnotified pull can use cached data.
-    pub(crate) fn listening(
-        id: usize,
-        tiling: &Tiling,
-        owner: &OperatorBase,
-        scheduler: &Scheduler,
-        notified: Notified,
     ) -> Self {
         Self {
             id,
@@ -837,7 +875,6 @@ impl ProducerBase {
             probes: scheduler.probes().clone(),
             tiling: tiling.clone(),
             obsolete_guard: tiling.empty_guard(),
-            notified,
             gate: None,
             pulls: 0,
             last_output: None,
@@ -862,7 +899,6 @@ impl ProducerBase {
             probes: ProbeSlot::default(),
             tiling: tiling.clone(),
             obsolete_guard: tiling.empty_guard(),
-            notified: Notified::Always,
             gate: None,
             pulls: 0,
             last_output: None,
@@ -1304,6 +1340,9 @@ pub(crate) mod test_helpers {
     pub(crate) struct ProjectionSpy {
         pub(crate) base: ProducerBase,
         pub(crate) tile: Tile,
+        /// The tile it answers from instead of `tile`, which a test rewrites between pulls to
+        /// grow its input.
+        script: Option<std::rc::Rc<std::cell::RefCell<Tile>>>,
         pub(crate) pulled: GuardLog,
         pub(crate) released: GuardLog,
     }
@@ -1320,6 +1359,7 @@ pub(crate) mod test_helpers {
                 Self {
                     base: ProducerBase::unowned(Self::alloc_id(), &tiling),
                     tile,
+                    script: None,
                     pulled: pulled.clone(),
                     released: released.clone(),
                 },
@@ -1338,7 +1378,10 @@ pub(crate) mod test_helpers {
 
         fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
             self.pulled.borrow_mut().push(projection_guard.clone());
-            let mut tile = self.tile.clone();
+            let mut tile = match &self.script {
+                Some(script) => script.borrow().clone(),
+                None => self.tile.clone(),
+            };
             tile.remove_guarded(self.obsolete_guard().clone());
             tile.compact();
             let projection = projection_guard.projection("ProjectionSpy");
@@ -1549,6 +1592,8 @@ pub(crate) mod test_helpers {
         tile: Tile,
         tiling: Tiling,
         consumer: InputConsumer,
+        script: Option<std::rc::Rc<std::cell::RefCell<Tile>>>,
+        pulled: GuardLog,
     }
 
     impl NotifyingOp {
@@ -1559,9 +1604,30 @@ pub(crate) mod test_helpers {
                     tile,
                     tiling,
                     consumer: consumer.clone(),
+                    script: None,
+                    pulled: GuardLog::default(),
                 },
                 consumer,
             )
+        }
+
+        /// An operator whose producer answers what the returned cell holds, cut to the guard it
+        /// is pulled with, so a test grows its input between pulls, and the log of the guards
+        /// it was pulled with.
+        pub(crate) fn scripted(
+            tile: Tile,
+            tiling: Tiling,
+        ) -> (
+            Self,
+            InputConsumer,
+            std::rc::Rc<std::cell::RefCell<Tile>>,
+            GuardLog,
+        ) {
+            let (mut op, consumer) = Self::new(tile.clone(), tiling);
+            let cell = std::rc::Rc::new(std::cell::RefCell::new(tile));
+            op.script = Some(cell.clone());
+            let pulled = op.pulled.clone();
+            (op, consumer, cell, pulled)
         }
     }
 
@@ -1580,7 +1646,9 @@ pub(crate) mod test_helpers {
             _scheduler: &mut super::Scheduler,
         ) -> Box<dyn TileProducer> {
             *self.consumer.borrow_mut() = Some(consumer);
-            let (spy, _, _) = ProjectionSpy::new(self.tile.clone(), self.tiling.clone());
+            let (mut spy, _, _) = ProjectionSpy::new(self.tile.clone(), self.tiling.clone());
+            spy.script = self.script.clone();
+            spy.pulled = self.pulled.clone();
             Box::new(spy)
         }
     }
