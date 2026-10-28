@@ -539,6 +539,27 @@ fn uncurry_at_the_outermost_level_sends_everything() {
     assert_widens(&|| uncurry(CurryLevel::OUTERMOST), 0);
 }
 
+fn extract_final() -> Built {
+    let (source, keys) = feed(ints());
+    let (default, fallback) = feed(Tiling::Scalar(int()));
+    let op = ExtractFinal::new(source, default);
+    (Box::new(op), vec![keys, fallback])
+}
+
+/// The final value is the last position's, which a region of keys does not name.
+#[test]
+fn extract_final_sends_everything_for_a_region_of_its_source() {
+    assert_widens(&extract_final, 0);
+}
+
+#[test]
+fn extract_final_sends_everything_for_a_later_region() {
+    assert_eq!(
+        received(&extract_final, 0, &another_region()),
+        [Projection::Everything]
+    );
+}
+
 fn two_keys() -> Extent {
     Extent::Record(
         [
