@@ -1582,7 +1582,7 @@ mod projection_tests {
 
     /// A flat union over two scripted arms, subscribed at the universal guard. The even arm
     /// holds `[0, 2, 4, 6]` and the odd arm `odd`, each with its own statement.
-    fn scripted_union(odd: Tile) -> (Box<dyn TileProducer>, Rc<std::cell::RefCell<Tile>>) {
+    fn scripted_union(odd: Tile) -> (Box<dyn TileProducer>, Rc<RefCell<Tile>>) {
         let (even, _) = ScriptedOp::new(
             int_column(vec![0, 2, 4, 6], Predicate::True),
             stream_tiling(),
