@@ -5,10 +5,18 @@
 
 use super::test_helpers::{InputConsumer, NotifyingOp, RegionLog, keys_between, notify_input};
 use super::*;
-use crate::interpreter::{BaseType, Extent, Projection, Scheduler, Tiling};
+use crate::interpreter::{BaseType, CurryLevel, Extent, Projection, Scheduler, Tiling};
 
 /// An operator and the consumers it installed on its inputs, which a test notifies through.
 type Built = (Box<dyn TileOperator>, Vec<InputConsumer>);
+
+/// A stream of integers keyed by position.
+fn ints() -> Tiling {
+    Tiling::data_function(
+        Extent::uint_range(8),
+        Tiling::Scalar(Extent::Base(BaseType::Int)),
+    )
+}
 
 /// An operator that keeps the consumer it is subscribed with, for the test to notify through.
 fn feed(tiling: Tiling) -> (Box<dyn TileOperator>, InputConsumer) {
@@ -79,4 +87,56 @@ fn map_result_with_source_forwards_its_inputs_region() {
 #[test]
 fn map_result_with_source_carries_no_region_between_notifications() {
     assert_keeps_without_state(&map_result_with_source, 0);
+}
+
+fn nested() -> Tiling {
+    Tiling::data_function(Extent::uint_range(8), ints())
+}
+
+fn int() -> Extent {
+    Extent::Base(BaseType::Int)
+}
+
+/// The operator sends `Everything` for any region of input `notified`.
+fn assert_widens(build: &dyn Fn() -> Built, notified: usize) {
+    for sent in [region(), another_region(), Projection::Everything] {
+        assert_eq!(
+            received(build, notified, &sent),
+            [Projection::Everything],
+            "{sent:?}"
+        );
+    }
+}
+
+fn map_result_to_const(level: CurryLevel) -> Built {
+    let (input, data) = feed(match level == CurryLevel::OUTERMOST {
+        true => ints(),
+        false => nested(),
+    });
+    let (constant, constant_consumer) = feed(Tiling::Scalar(int()));
+    let op = MapResultToConst::new_at(input, constant, MapResultToConstMode::Replace, level);
+    (Box::new(op), vec![data, constant_consumer])
+}
+
+fn beneath_a_level() -> Built {
+    map_result_to_const(CurryLevel::new(1))
+}
+
+#[test]
+fn map_result_to_const_forwards_its_inputs_region_beneath_a_level() {
+    assert_keeps(&beneath_a_level, 0);
+    assert_keeps_without_state(&beneath_a_level, 0);
+}
+
+/// Every row reads all of the constant, so a change to it is a change at every key.
+#[test]
+fn map_result_to_const_sends_everything_for_its_constant() {
+    assert_widens(&beneath_a_level, 1);
+}
+
+/// Applied at the outermost level the constant replaces the whole input, so the input's keys are
+/// not the output's.
+#[test]
+fn map_result_to_const_at_the_outermost_level_sends_everything_for_its_inputs_region() {
+    assert_widens(&|| map_result_to_const(CurryLevel::OUTERMOST), 0);
 }

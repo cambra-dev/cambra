@@ -735,7 +735,12 @@ impl TileOperator for MapResultToConst {
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
         let constant_producer = subscribe_forwarding(&mut *self.constant, &shared, scheduler);
-        let input_producer = subscribe_forwarding(&mut *self.input, &shared, scheduler);
+        // The constant is read whole, since every row reads all of it, so its notification
+        // widens; the input is pulled at the projection.
+        let keeps_keys =
+            self.level != CurryLevel::OUTERMOST && self.input.tiling().is_data_function();
+        let input_producer =
+            subscribe_forwarding_keeping_keys_if(keeps_keys, &mut *self.input, &shared, scheduler);
         Box::new(MapResultToConstProducer {
             base: ProducerBase::new(
                 MapResultToConstProducer::alloc_id(),
@@ -871,8 +876,10 @@ impl MapResultToConstProducer {
             "MapResultToConst broadcasts a value, got {c_tiling:?}"
         );
         let i_tiling = self.input.tiling().clone();
-        // A scalar input has no keys to project, so it is read whole and the answer cut.
-        let input_guard = match i_tiling.is_data_function() {
+        // A scalar input has no keys to project, so it is read whole and the answer cut. Applied
+        // at the outermost level the constant replaces the whole input, so the output's keys are
+        // the constant's and the projection names none of the input's.
+        let input_guard = match i_tiling.is_data_function() && self.level != CurryLevel::OUTERMOST {
             true => projection.guard(&i_tiling),
             false => i_tiling.universal_guard(),
         };
