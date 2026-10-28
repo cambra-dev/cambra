@@ -19,7 +19,7 @@ use crate::ccl::nominal::Variance;
 use crate::ccl::subst::{RefinementScope, Subst};
 use crate::ccl::{FieldKey, HistoryKind, InferVarId, Name, Refinement, Type};
 
-use super::compact::AtomKey;
+use super::compact::{AtomKey, ConsultedNames};
 use crate::ccl::ty::KindPin;
 
 /// The identity of a use's instantiation, for deciding which uses may share one
@@ -327,6 +327,9 @@ impl fmt::Display for SpecKey {
     }
 }
 
+/// [`KeyCtx::memo`]'s key: the variable, the polarity and the enclosing binders.
+type KeyMemoKey = (InferVarId, bool, Vec<Option<Name>>);
+
 /// Walk-wide state: the cycle guard, the per-variable memo, and the truncation
 /// counter that decides what may be memoized.
 struct KeyCtx {
@@ -357,16 +360,21 @@ struct KeyCtx {
     /// at positive polarity whatever the reference's. A lower reaching its own barrier
     /// again is a recursive type, so the cut it makes is a truncation as `visiting`'s is.
     visiting_barriers: HashSet<BarrierVarId>,
-    /// Completed keys per `(variable, polarity, enclosing binders)`, for
-    /// variables reached under the identity substitution.
+    /// Completed keys per `(variable, polarity, enclosing binders)`, each with the
+    /// substitution it was reached under, restricted to the names that substitution could
+    /// act on below the variable ([`ConsultedNames`]).
     ///
     /// Sound because a variable's directed key depends only on the variable, the
-    /// direction, and the binders the refinement-closing runs against — not otherwise
-    /// on the position it was reached from. A variable reached under a
-    /// *non-identity* substitution bypasses the memo: the substitution
-    /// rewrites the predicates the walk materializes, so that result *is*
-    /// position-dependent.
-    memo: HashMap<(InferVarId, bool, Vec<Option<Name>>), KeyView>,
+    /// direction, the binders the refinement-closing runs against, and what the
+    /// substitution does to the predicates the walk materializes, which is what its
+    /// restriction says. A substitution with a witness half bypasses the memo, as does a
+    /// variable whose names are not known.
+    memo: HashMap<KeyMemoKey, Vec<(Subst, KeyView)>>,
+    /// The names below each variable a substitution could act on.
+    consulted: ConsultedNames,
+    /// How many variables the walk has expanded, for the tests to bound.
+    #[cfg(test)]
+    visits: usize,
     /// How many cycle back-edges the walk has dropped. A key computed while a
     /// truncation occurred inside it is *incomplete* — it is missing whatever the
     /// back-edge would have contributed — so it must not be memoized. Comparing
@@ -392,8 +400,11 @@ pub fn spec_key(ty: &Type) -> SpecKey {
         visiting_scopes: HashMap::new(),
         visiting_barriers: HashSet::new(),
         memo: HashMap::new(),
+        consulted: ConsultedNames::new(),
         truncations: 0,
         scope: RefinementScope::default(),
+        #[cfg(test)]
+        visits: 0,
     };
     // One walk-wide `ctx` for both reads: its memo is keyed by polarity, so the
     // two reads share it without contaminating each other.
@@ -618,8 +629,21 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         Type::Infer(state) => {
             let visit_key = (state.uid, pol);
             let memo_key = (state.uid, pol, ctx.scope.enclosing().to_vec());
-            let memoizable = subst_acc.is_id();
-            if memoizable && let Some(k) = ctx.memo.get(&memo_key) {
+            let under = if subst_acc.is_id() {
+                Some(Subst::id())
+            } else if subst_acc.has_witnesses() {
+                None
+            } else {
+                ctx.consulted
+                    .below(state, pol)
+                    .map(|names| subst_acc.restricted_to(&names))
+            };
+            if let Some(under) = &under
+                && let Some((_, k)) = ctx
+                    .memo
+                    .get(&memo_key)
+                    .and_then(|done| done.iter().find(|(at, _)| at == under))
+            {
                 return k.clone();
             }
             if !ctx.visiting.insert(visit_key) {
@@ -642,6 +666,10 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             #[cfg(debug_assertions)]
             ctx.visiting_scopes
                 .insert(visit_key, ctx.scope.enclosing().to_vec());
+            #[cfg(test)]
+            {
+                ctx.visits += 1;
+            }
             let bounds = {
                 let b = state.bounds.borrow();
                 Rc::clone(if pol { b.lower() } else { b.upper() })
@@ -658,8 +686,13 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             ctx.visiting.remove(&visit_key);
             #[cfg(debug_assertions)]
             ctx.visiting_scopes.remove(&visit_key);
-            if memoizable && ctx.truncations == truncations_before {
-                ctx.memo.insert(memo_key, acc.clone());
+            if let Some(under) = under
+                && ctx.truncations == truncations_before
+            {
+                ctx.memo
+                    .entry(memo_key)
+                    .or_default()
+                    .push((under, acc.clone()));
             }
             acc
         }
@@ -834,6 +867,53 @@ mod tests {
         assert_eq!(both, spec_key(&Type::Tuple(vec![b, a])));
     }
 
+    /// A variable reached along many paths under substitutions that act on nothing below
+    /// it is expanded once: the memo keys on the part of the substitution the walk below
+    /// could read, which here is the identity. Without that, a chain of variables each
+    /// reaching the next along two bounds is expanded once per path, `2ⁿ` times.
+    #[test]
+    fn a_variable_reached_under_inert_substitutions_is_expanded_once() {
+        let depth = 16;
+        let mut var = fresh_var(0);
+        let Type::Infer(bottom) = &var else {
+            unreachable!("fresh_var yields Type::Infer");
+        };
+        bottom
+            .bounds
+            .borrow_mut()
+            .lower_mut()
+            .push(Bound::conc(singleton(1)));
+        for level in 0..depth {
+            let above = fresh_var(0);
+            let Type::Infer(v) = &above else {
+                unreachable!("fresh_var yields Type::Infer");
+            };
+            for side in 0..2 {
+                let inert = Subst::discharge(
+                    format!("unread_{level}_{side}"),
+                    TypedExpr::lit(Lit::Int(0)).with_ty(int()),
+                );
+                v.bounds
+                    .borrow_mut()
+                    .lower_mut()
+                    .push(Bound::with_subst(var.clone(), inert));
+            }
+            var = above;
+        }
+        let mut ctx = fresh_ctx();
+        let view = key_go(&var, true, &Subst::id(), &mut ctx);
+        assert_eq!(
+            view,
+            key_go(&singleton(1), true, &Subst::id(), &mut fresh_ctx())
+        );
+        assert!(
+            ctx.visits <= depth + 1,
+            "{} variables expanded for a chain of {}",
+            ctx.visits,
+            depth + 1
+        );
+    }
+
     /// [`KeyView::union`]'s structural merges: two bounds contributing *different*
     /// shapes at one position must merge positionwise rather than one winning.
     ///
@@ -967,9 +1047,50 @@ mod tests {
             visiting_scopes: HashMap::new(),
             visiting_barriers: HashSet::new(),
             memo: HashMap::new(),
+            consulted: ConsultedNames::new(),
             truncations: 0,
             scope: RefinementScope::default(),
+            visits: 0,
         }
+    }
+
+    /// `?top :> ?v‹x ↦ 1›, ?v‹x ↦ 2›`, with `?v :> 𝐵` for a barrier `𝐵` whose lower
+    /// `{Int | __elem == x} ⇒ Int` names `x` at a negative position. The walk reaches `?v`
+    /// twice and reuses its key only where the second substitution acts on none of the names
+    /// below it: those include the barrier's lowers, which the walk reads. Read past the
+    /// barrier, the second reach would take the first's key, and `?top` would key as though
+    /// both were `x ↦ 1`.
+    #[test]
+    fn a_memoized_variable_s_names_include_its_barrier_s_lowers() {
+        use crate::ccl::Refinement;
+        use crate::ccl::infer::solver::test_helpers::dep_pred;
+        let barrier = crate::ccl::BarrierVar::fresh(Rc::from([]), Vec::new(), Vec::new());
+        let b = Type::BarrierVar(Rc::clone(&barrier));
+        let lower = Type::fun(
+            Type::refined_one(int(), Refinement::born(dep_pred("x"))),
+            int(),
+        );
+        let mut cache = ConstrainCache::new();
+        constrain_subtype(&lower, &b, &mut cache).expect("the lower flows in");
+        let v = fresh_var(0);
+        constrain_subtype(&b, &v, &mut cache).expect("the barrier flows into ?v");
+        let above = |xs: &[i64]| {
+            let top = fresh_var(0);
+            let Type::Infer(state) = &top else {
+                unreachable!()
+            };
+            for &x in xs {
+                let at = Subst::discharge("x", TypedExpr::lit(Lit::Int(x)).with_ty(int()));
+                state
+                    .bounds
+                    .borrow_mut()
+                    .lower_mut()
+                    .push(Bound::with_subst(v.clone(), at));
+            }
+            spec_key(&top)
+        };
+        assert_ne!(above(&[1, 2]), above(&[1]));
+        assert_eq!(above(&[1, 2]), above(&[2, 1]));
     }
 
     /// A barrier variable whose lower bound `Int ⇒ 𝐵` reaches `𝐵` again keys without

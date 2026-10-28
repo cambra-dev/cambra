@@ -1141,8 +1141,12 @@ relates a clone to its context another way breaks the rule.
 The rule over-splits: two under-determined uses whose joins supply one type get two clones.
 
 `key_go` has a cycle guard and a completed-result memo. The memo includes variable identity,
-polarity, and enclosing binders, and is used only with an identity accumulated substitution.
-A result whose walk cut a cycle is not cached. This memo belongs to one `spec_key` calculation;
+polarity, and enclosing binders, and keeps each result with the accumulated substitution it was
+reached under, restricted to the names that substitution could act on below the variable
+(`ConsultedNames`, compaction's `consulted_below`). A later reach reuses a result whose
+restricted substitution is the same, as the identity's is wherever the substitution acts on none
+of those names. A substitution with a witness half, and a variable whose names are not known,
+skip the memo. A result whose walk cut a cycle is not cached. This memo belongs to one `spec_key` calculation;
 it is distinct from the specialization list stored on a frame and from compaction's cycle guard.
 
 ##### Key timing and precision limits

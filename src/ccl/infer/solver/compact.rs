@@ -1900,6 +1900,27 @@ fn consulted_below(
     out
 }
 
+/// The names a substitution could act on below a variable, for a walk that reads each
+/// variable's bounds of its own polarity only: [`consulted_below`] with nothing collapsed.
+/// `spec_key`'s walk reads the bound graph so, and keys its memo on the part of its
+/// substitution these names select.
+pub(super) struct ConsultedNames(CompactState);
+
+impl ConsultedNames {
+    pub(super) fn new() -> Self {
+        ConsultedNames(CompactState::new(false))
+    }
+
+    /// The names below `state` at polarity `pol`; `None` where they are not known.
+    pub(super) fn below(
+        &mut self,
+        state: &Rc<crate::ccl::InferVar>,
+        pol: bool,
+    ) -> Option<Rc<BTreeSet<Name>>> {
+        consulted_below(state, pol, (false, false), &mut self.0)
+    }
+}
+
 /// Extend `names`, a variable's consulted names, with their images round each of `cycles`:
 /// the edges, outermost first, of a walk from the variable back to itself. A name reaching
 /// the variable comes back up the cycle through each edge's image, last edge first, and is

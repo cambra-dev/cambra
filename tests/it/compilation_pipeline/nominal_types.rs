@@ -2278,3 +2278,41 @@ fn an_instance_function_recursing_through_a_deeply_nested_value() {
         start.elapsed()
     );
 }
+
+/// A chain of `.extract()` calls on a value nested ten deep, each call specializing `extract`
+/// at the next type down.
+///
+/// Each specialization's pin crosses into the clones earlier ones pinned, so extrusion copies
+/// them, once per walk rather than once per edge. And a specialization's key is read once per
+/// variable under any substitution that acts on none of the names below it, not only under
+/// the identity. Either one per edge or per path took several times as long at each call as at
+/// the one before.
+#[test]
+fn a_chain_of_extracts_on_a_deeply_nested_value() {
+    let start = std::time::Instant::now();
+    check_scalar(
+        indoc! {"
+            type One(T) = T
+            c0 = 1
+            c1 = One::new(c0)
+            c2 = One::new(c1)
+            c3 = One::new(c2)
+            c4 = One::new(c3)
+            c5 = One::new(c4)
+            c6 = One::new(c5)
+            c7 = One::new(c6)
+            c8 = One::new(c7)
+            c9 = One::new(c8)
+            c10 = One::new(c9)
+            c10.extract().extract().extract().extract().extract().extract().extract().extract().extract().extract()
+        "},
+        Value::Int(1),
+    );
+    // A debug build compiles this in a few seconds, and CI's runner in about ten; per path,
+    // it took over a minute.
+    assert!(
+        start.elapsed() < std::time::Duration::from_secs(30),
+        "compiling took {:?}",
+        start.elapsed()
+    );
+}
