@@ -690,15 +690,65 @@ An output change discovered during a pull must wake readers that may still hold 
 result. That wake is deferred through `WakeupQueue`, not delivered synchronously inside
 `get`: a feedback path could re-enter a producer while its `RefCell` is borrowed.
 
-A notification carries no payload. `GatedConsumer` forwards at most one notification between
-pulls. `shared_consumer` constructs it with `Notified::clear()`, so the first notification
-passes, including one sent during `subscribe`. Forwarding sets the flag; `ProducerBase::sharing`
-holds the `Gate` token that clears it before each pull. `Notified::flag()` instead starts set
-to permit an initial input read, and `Notified::Always` is used when no flag intercepts input
-notifications. A `Notified::Flag` is set by notification and cleared by `take()`.
-`FanOutShared::forwarded` tracks forwarding to fan-out slots. Clearing does not depend on
-whether the pull reads the notifying input. Without this suppression, a change can reach a sink
-once per path through the graph, and cyclic notification paths can continue indefinitely.
+A notification carries the region of the notifying producer's outermost keys that changed:
+`Consumer::notify(arrived: &Projection)`. A producer that cannot name the region sends `Everything`,
+and none sends `Nothing`. A closure consumer ignores the region. A consumer that pulls on
+notification has no use for it, since its pull reads whatever arrived. A consumer that does not pull
+acts on the region instead.
+
+A component that merges notifications to one consumer unites their regions with `Projection::union`
+and narrows none. A gate passes the first notification after a pull, and after it each one that
+names a key no notification passed since that pull named. It drops the rest, whose keys its consumer
+has already heard of: a consumer that pulls reads them in its next pull, and one that acts on the
+region, as a memo marks it dirty, has marked them.
+
+**Forwarding.** An operator keeps an input's keys, forwarding its region unchanged, only if its row
+of the "Projection guards" table pulls that input at the projection and the input's keys are the
+operator's own output keys: a region of changed input keys is then a region of possibly changed
+output keys, and a changed completeness statement at a key is a change at that key. An operator that
+re-keys, or reads an input whole, sends `Everything` for that input, since it cannot say which of
+its own keys changed. `MapResult`'s function operand is pulled at the projection where the input's
+values are its keys, and still widens: its keys are the values looked up, not the result's keys. A
+producer with no keys of its own notifies `Everything` whatever it is read through. Where a row
+depends on the input's shape, the operator decides from its tiling when it subscribes, as its
+`get_impl` does when it pulls.
+
+| Operator | Input | Notification | Reason |
+| --- | --- | --- | --- |
+| `MapResult` | the input | keeps if applied one level in to a collection, else widens | A keyed input is pulled at the projection; applied at the outermost level or to a scalar, the function's keys are the result's. |
+| `MapResult` | the function operand | widens | Its keys are the values looked up, not the result's keys. |
+| `MapResultToConst` | the input | keeps where the constant applies one level in or deeper to a collection, widens at the outermost level or for a scalar | At the outermost level the constant replaces the whole input, so the output's keys are the constant's. |
+| `MapResultToConst` | the constant | widens | Every row reads all of it. |
+| `MapResultWithSource` | the input | keeps | Pulled at the projection, so its keys are the output's. |
+| `RecordWrap`, `MapDomain`, `Restrict` | the input, the predicate | keeps | Pulled at the projection; a restricted domain is the predicate's keys that pass. |
+| `SelectField` | the input | keeps for a stream of records, widens for a product of collections | The product is read whole and the field cut. |
+| `VariantWrap` | the payload | keeps where the result is a collection (applied at level 1 or beyond), widens at level 0 | The values at the level become one union column, which has no keys of its own at level 0. |
+| `VariantProject`, `VariantIs` | the input | keeps for a stream, widens for a bare union | A bare union has no keys of its own. |
+| `Zip`, `Product` | every arm, both sides | keeps | Pulled at the projection and aligned row for row. |
+| `MakeRecord` | every field | widens | A record of values has no keys. |
+| `Filter` | the predicate, the input | keeps for a side that is a collection, else widens | A collection side shares the mask's keys; the other is read whole. |
+| `Uncurry`, `Converse` | the input | keeps beneath a standing level, widens at the outermost | Inverting or pairing the outermost collection re-keys it. |
+| `UnionOperator` | every arm | keeps for a flat union, widens for a tagged one | Flat arms are disjoint slices of one collection; a tagged union keys its rows by arm. |
+| `CheckedLookup` | a stream of keys, or the pairs | keeps | Each answer sits at its key's position. |
+| `CheckedLookup` | one key | widens | One key has no keys to project. |
+| `CheckedLookup` | the collection | widens | Every key is answered against all of it. |
+| `Memo` | the input | keeps | Read at the projection, and its keys are the input's. |
+| `FanOutSlot` | the shared input | widens | The fan-out forwards through a closure that passes one notification between pulls and sends `Everything`; keeping keys needs a region merged across the notifications it suppresses. |
+| `ExtractFinal`, `PermuteRecordDomain`, `FlattenTupleDomain` | the input | widens | Read whole; the keys are re-keyed or the last position. |
+| `Aggregate`, `ExtractAggregate` | the input | widens | The accumulator has no keys. |
+| `MapAggregate`, `MapExtractAggregate` | the input | keeps | The groups keep the input's outermost keys. |
+| Stores, recurrences and the commit operators (`commit_operator.rs`) | every input | widens | A recurrence re-keys its inputs by its own positions. |
+
+`GatedConsumer` forwards at most one notification between pulls to a consumer that pulls.
+`shared_consumer` constructs it with `Notified::clear()`, so the first notification passes,
+including one sent during `subscribe`. Forwarding sets the flag; `ProducerBase::sharing` holds the
+`Gate` token that clears it before each pull. A notification behind a closed gate is not delivered,
+and the consumer's next pull reads the change. `Notified::flag()` instead starts set to permit an
+initial input read, and `Notified::Always` is used when no flag intercepts input notifications. A
+`Notified::Flag` is set by notification and cleared by `take()`. `FanOutShared::forwarded` tracks
+forwarding to fan-out slots. Clearing does not depend on whether the pull reads the notifying input.
+Without this suppression, a change can reach a sink once per path through the graph, and cyclic
+notification paths can continue indefinitely.
 
 `forwarding_consumer` delivers through the gate when its consumer can be borrowed. On reentry,
 it drops the notification if the gate is set: no pull has occurred since forwarding. Otherwise
