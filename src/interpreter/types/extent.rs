@@ -72,7 +72,7 @@ impl PartialEq for Extent {
             (Extent::Union(u1), Extent::Union(u2)) => u1 == u2,
             (Extent::UIntRange(s1), Extent::UIntRange(s2)) => s1 == s2,
             (Extent::DataSourceDomain(d1), Extent::DataSourceDomain(d2)) => {
-                Arc::ptr_eq(d1, d2) || d1.lock_now().get_id() == d2.lock_now().get_id()
+                Arc::ptr_eq(d1, d2) || d1.lock_wait().get_id() == d2.lock_wait().get_id()
             }
             _ => false,
         }
@@ -241,7 +241,7 @@ impl Extent {
             // of other.
             // The lock is released before the recursion, which may lock a source itself.
             (_, Extent::DataSourceDomain(d2)) => {
-                let element = d2.lock_now().element_extent();
+                let element = d2.lock_wait().element_extent();
                 self.includes(&element)
             }
 
@@ -519,7 +519,9 @@ impl std::fmt::Display for Extent {
                 false,
             ),
             Extent::UIntRange(set) => write!(f, "{set}"),
-            Extent::DataSourceDomain(source) => write!(f, "Source({})", source.lock_now().get_id()),
+            Extent::DataSourceDomain(source) => {
+                write!(f, "Source({})", source.lock_wait().get_id())
+            }
             Extent::Restricted { base, .. } => write!(f, "Restricted({base})"),
         }
     }

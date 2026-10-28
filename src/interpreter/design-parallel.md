@@ -257,6 +257,43 @@ or widened, never narrowed or lost.
   its ready-positions function reads, and the lock that parks idle workers).
 - **Closures.** A closure consumer ignores the region, and the scheduler's drains send `Everything`.
 
+### A pool owns its pipeline's release record
+
+A data source keeps one release record per producer reading it and reclaims only what every record
+releases. A pool breaks both halves of that: the `main` producer `compile_program` subscribes
+registers a record that releases nothing, and each worker's chain registers a record that releases
+only the morsels that worker ran. Either holds the agreement at nothing.
+
+The pool takes the pipeline's records as its own in two steps. The program's `main` producer goes
+once the plan and the source are accepted, which retires its record. It sits in the program's
+output, or with a `LiveProgram` that moved it out to drive it, which `LiveProgram::run_main_on_pool`
+hands to `run_main_holding`; the pool asserts in debug builds that it dropped one. A program the
+pool refuses keeps the producer and stays on the compiling thread. `run_pipeline` then subscribes
+every worker's chain inside `Scheduler::with_pooled_release_records`, and a source producer
+subscribed there (`IterateExtent`'s, and `MapResultWithSource`'s, which releases into the source as
+well) holds its record under `pool#n/<operator id>`, with `n` counting runs. The workers' producers
+of one operator share a record, which accumulates the union of what they released. The records of
+different operators are intersected by the source, so a key is reclaimed once every operator that
+reads the source has released it, as it is in a serial run.
+
+The pool retires its records itself. A producer whose record is under a pool's name does not retire
+it when it drops, so the first chain to drop does not take the others' record with it.
+`with_pooled_release_records` returns the records with the chains, and they retire when they drop,
+after the chains do and on a panic in `subscribe` or in a worker.
+
+A source's lock is taken with `lock_wait` where a worker and the delivering thread can both reach
+it: `get_yield_predicate`, `get_elements`, `get`, `get_fields`, `release`, `check_for_new_data`,
+`element_extent` (including the checks of an extent's type and of a predicate over it) and `get_id`
+(extent equality and display). `retire_producer` keeps `try_lock_now`, because a chain is dropped on
+the calling thread after its workers returned, and a drop that finds the source locked is a bug.
+Subscription keeps `lock_now`, because it runs before a worker exists. Locks nest in one order: the
+live source's state lock, then the source's lock. The delivering thread holds neither when it
+notifies.
+
+A `MapResultWithSource` producer retires its release record when it is dropped, as an
+`IterateExtent` producer does. It registered a record at construction and kept it for the life of
+the process, so the `main` producer the pool drops would have held a source's reclaim at nothing.
+
 ### Projection guards
 
 A worker names its morsel with `Domain(Intervals([first, last]))` at the chain's tail. Every tile

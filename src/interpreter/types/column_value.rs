@@ -397,7 +397,7 @@ impl ColumnValue {
                 ColumnValue::Records(fields)
             }
             Extent::DataSourceDomain(d) => {
-                let element = d.lock_now().element_extent();
+                let element = d.lock_wait().element_extent();
                 ColumnValue::from_values(values, &element)
             }
             Extent::Union(sub_extents) => {
@@ -524,7 +524,7 @@ impl ColumnValue {
     /// before comparison.
     pub fn is_compatible_with_extent(&self, extent: &Extent) -> bool {
         let extent = match extent {
-            Extent::DataSourceDomain(source) => source.lock_now().element_extent(),
+            Extent::DataSourceDomain(source) => source.lock_wait().element_extent(),
             Extent::Restricted { base, .. } => *base.clone(),
             other => other.clone(),
         };

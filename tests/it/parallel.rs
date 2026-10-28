@@ -222,3 +222,43 @@ fn a_chain_that_reads_a_shared_node_is_not_a_morsel_pipeline() {
         "{refused}"
     );
 }
+
+fn no_main() -> Box<dyn Consumer> {
+    Box::new(|| {})
+}
+
+/// The pool takes the `main` producer a live program moved out of its output to drive it: it
+/// registered a release record that would pin a source, and the pool owns the pipeline's record.
+/// A program the pool refuses keeps its producer, and the scheduler loop drives it.
+#[test]
+fn the_pool_drops_the_main_producer_of_a_live_program_it_runs_and_a_refused_one_keeps_it() {
+    use cambra::live_program::{LiveProgram, MAIN_BRANCH};
+
+    let config = Config {
+        threads: 2,
+        morsel_rows: 4,
+    };
+    let mut ctx = GlobalContext::default();
+    let mut live =
+        LiveProgram::start(&mut ctx, &LoadedProgram::test(program(8)), &no_main).expect("compiles");
+    assert!(live.main_producer_mut(MAIN_BRANCH).is_some());
+    live.run_main_on_pool(MAIN_BRANCH, &mut ctx, &config)
+        .expect("the branch exists")
+        .expect("a finite map is a morsel pipeline");
+    assert!(
+        live.main_producer_mut(MAIN_BRANCH).is_none(),
+        "the pool dropped the producer that held the pipeline's record"
+    );
+
+    let mut ctx = GlobalContext::default();
+    let grouped = "[sum(g) for g in groupby([1, 2, 3, 4], \\x -> x // 2)]";
+    let mut live =
+        LiveProgram::start(&mut ctx, &LoadedProgram::test(grouped), &no_main).expect("compiles");
+    live.run_main_on_pool(MAIN_BRANCH, &mut ctx, &config)
+        .expect("the branch exists")
+        .expect_err("a group-by is not a morsel pipeline");
+    assert!(
+        live.main_producer_mut(MAIN_BRANCH).is_some(),
+        "a refused program keeps the producer the scheduler loop drives"
+    );
+}

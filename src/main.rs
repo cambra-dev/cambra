@@ -131,8 +131,8 @@ fn run_program(
                 "note: {} applies to a run without --inspect or --control; running on one thread",
                 cambra::interpreter::parallel::Config::THREADS
             );
-        } else if let Some(program) = live.program_mut(MAIN_BRANCH) {
-            match cambra::interpreter::parallel::run_main(&mut ctx, program, &parallel) {
+        } else if let Some(result) = live.run_main_on_pool(MAIN_BRANCH, &mut ctx, &parallel) {
+            match result {
                 Ok(tile) => {
                     println!("Got value: {tile:#?}");
                     return Ok(());

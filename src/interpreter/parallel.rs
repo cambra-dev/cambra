@@ -212,6 +212,19 @@ pub fn run_main(
     program: &mut CompiledProgram,
     config: &Config,
 ) -> Result<Tile, Unsupported> {
+    run_main_holding(ctx, program, &mut None, config)
+}
+
+/// [`run_main`] for a program whose `main` producer is not in its output: a
+/// [`LiveProgram`](crate::live_program::LiveProgram) moves it out to drive it, and `main_producer`
+/// is where it sits. The pool drops it once the program is accepted, and a refused program keeps
+/// it.
+pub fn run_main_holding(
+    ctx: &mut GlobalContext,
+    program: &mut CompiledProgram,
+    main_producer: &mut Option<Box<dyn TileProducer>>,
+    config: &Config,
+) -> Result<Tile, Unsupported> {
     let pipeline = plan_main(&program.operator_graph)?;
     let output = program
         .main_mut()
@@ -229,6 +242,17 @@ pub fn run_main(
             ),
     };
     let source = source_of(chain_op)?;
+    // The program is the pool's from here: a program the plan or `source_of` refused still has
+    // its producer, and the scheduler loop drives it. The pool owns the pipeline's release
+    // record, so the producer `compile_program` subscribed for `main` goes: it registered a
+    // record that releases nothing, which a source would hold its reclaim at. It is in the
+    // program's output, or with the caller that moved it out to drive it.
+    let dropped = main_producer.take().or_else(|| output.producer.take());
+    debug_assert!(
+        dropped.is_some(),
+        "the pool drops the producer that held the pipeline's record"
+    );
+    drop(dropped);
     let breaker = match &pipeline.breaker {
         Breaker::Collect => PoolBreaker::Collect {
             collector: Mutex::new(chain_op.tiling().empty_tile()),
@@ -290,15 +314,22 @@ fn run_pipeline(
     // second would publish what the source has already claimed. The path from the source to
     // that consumer is region-driven and acyclic (`plan_main` admits no shared node or
     // recurrence), so no consumer on it drops or widens the region.
-    let mut chains: Vec<Vec<Box<dyn TileProducer>>> = (0..config.threads.max(1))
-        .map(|worker| {
-            let head: Box<dyn Consumer> = match (&delivery, worker) {
-                (Some(_), 0) => Box::new(PipelineConsumer(handle.clone())),
-                _ => Box::new(|| {}),
-            };
-            vec![chain_op.subscribe(tiling.universal_guard(), head, scheduler)]
-        })
-        .collect();
+    //
+    // The chains hold release records with a source, one per source operator and named for the
+    // pool: each worker releases the morsels it ran, and a source reclaims what every record
+    // releases. The records outlive the chains and retire when `records` drops.
+    let (mut chains, records): (Vec<Vec<Box<dyn TileProducer>>>, _) = scheduler
+        .with_pooled_release_records(pool_release_identity(), |scheduler| {
+            (0..config.threads.max(1))
+                .map(|worker| {
+                    let head: Box<dyn Consumer> = match (&delivery, worker) {
+                        (Some(_), 0) => Box::new(PipelineConsumer(handle.clone())),
+                        _ => Box::new(|| {}),
+                    };
+                    vec![chain_op.subscribe(tiling.universal_guard(), head, scheduler)]
+                })
+                .collect()
+        });
     // The chains are lent to the workers and dropped here, after the scope, one at a time:
     // a producer's drop detaches its probe with a lock that must not find the probe table
     // held by another worker's `get`.
@@ -320,11 +351,18 @@ fn run_pipeline(
         }
     });
     drop(chains);
+    drop(records);
     debug_assert!(
         dispatcher.all_done(),
         "every worker returned, so every pipeline finished"
     );
     breaker.finish()
+}
+
+/// The name a pool's chains hold their release record under, one per run.
+fn pool_release_identity() -> String {
+    static RUNS: AtomicU64 = AtomicU64::new(0);
+    format!("pool#{}", RUNS.fetch_add(1, Ordering::Relaxed))
 }
 
 /// What delivers to one pipeline of a [`Dispatcher`]: a region of arrived keys, and the end of

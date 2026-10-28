@@ -1324,7 +1324,7 @@ impl Predicate {
     fn applies_to_level(&self, extent: &Extent) -> bool {
         // Resolve transparent extent wrappers before matching.
         let extent = match extent {
-            Extent::DataSourceDomain(src) => src.lock_now().element_extent(),
+            Extent::DataSourceDomain(src) => src.lock_wait().element_extent(),
             Extent::Restricted { base, .. } => *base.clone(),
             other => other.clone(),
         };

@@ -1060,6 +1060,7 @@ impl TileOperator for MapResultWithSource {
         let input =
             self.input
                 .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+        let release_record = scheduler.pooled_release_record_for(self.operator_id());
         Box::new(MapResultWithSourceProducer::new(
             ProducerBase::new(
                 MapResultWithSourceProducer::alloc_id(),
@@ -1071,6 +1072,7 @@ impl TileOperator for MapResultWithSource {
             self.source.clone(),
             self.fields.clone(),
             self.input.result_correlation(),
+            release_record,
         ))
     }
 }
@@ -1092,6 +1094,10 @@ struct MapResultWithSourceProducer {
     /// key the inner side holds, so no release short of the whole one frees a source row,
     /// and the source is held until then.
     result_correlation: Option<Vec<TilePathStep>>,
+    /// The name this producer holds its release record under, when it is not its own: the
+    /// identity a worker pool gives every worker's chain, so the source sees one reader
+    /// (`src/interpreter/design-parallel.md`, "A pool owns its pipeline's release record").
+    shared_release_record: Option<String>,
     /// What the input last read holds, where it holds a level beneath its keys: a release
     /// naming paths beneath particular keys is read against it
     /// ([`Self::released_beneath_every_key`]).
@@ -1148,6 +1154,7 @@ impl MapResultWithSourceProducer {
         source: Arc<Mutex<dyn DataSourceDomainExtentImpl>>,
         fields: Vec<FieldPath>,
         result_correlation: Option<Vec<TilePathStep>>,
+        shared_release_record: Option<String>,
     ) -> Self {
         let result = Self {
             base,
@@ -1155,6 +1162,7 @@ impl MapResultWithSourceProducer {
             source,
             fields,
             result_correlation,
+            shared_release_record,
             last_nested_input: None,
         };
         // Register this producer with the source by calling release with a false predicate.
@@ -1163,9 +1171,36 @@ impl MapResultWithSourceProducer {
         // need.
         result
             .source
-            .lock_now()
-            .release(&result.name(), Predicate::False);
+            .lock_wait()
+            .release(&result.releaser(), Predicate::False);
         result
+    }
+
+    /// The name the source knows this producer by: where its releases are recorded.
+    fn releaser(&self) -> String {
+        self.shared_release_record
+            .clone()
+            .unwrap_or_else(|| self.name())
+    }
+}
+
+impl Drop for MapResultWithSourceProducer {
+    /// Hand back the release record this producer registered, as an `IterateExtent` producer
+    /// does: a record left behind holds the source's reclaim at wherever a dropped producer
+    /// stopped.
+    fn drop(&mut self) {
+        // A record under a pool's name belongs to the pool, which retires it with its chains.
+        if self.shared_release_record.is_some() {
+            return;
+        }
+        match self.source.try_lock_now() {
+            Some(mut source) => source.retire_producer(&self.name()),
+            None => debug_assert!(
+                false,
+                "{} dropped while its source was locked, so its release record outlives it",
+                self.name()
+            ),
+        }
     }
 }
 
@@ -1246,7 +1281,7 @@ impl TileProducer for MapResultWithSourceProducer {
         if self.input.tiling().levels() > 1 {
             self.last_nested_input = HeldBeneathKeys::of(&input_tile);
         }
-        let source = self.source.lock_now();
+        let source = self.source.lock_wait();
         let fields = &self.fields;
 
         process_tile_result(self.tiling(), input_tile, move |codomain| {
@@ -1258,8 +1293,8 @@ impl TileProducer for MapResultWithSourceProducer {
         let Some(correlation) = self.result_correlation.clone() else {
             if obsolete_guard.is_universal() {
                 self.source
-                    .lock_now()
-                    .release(&self.name(), Predicate::True);
+                    .lock_wait()
+                    .release(&self.releaser(), Predicate::True);
             }
             self.input.release(obsolete_guard);
             return;
@@ -1267,7 +1302,9 @@ impl TileProducer for MapResultWithSourceProducer {
         match &obsolete_guard {
             TileGuard::Function(FunctionGuard::Domain(pred)) => {
                 let extracted_pred = extract_predicate(pred, &correlation).clone();
-                self.source.lock_now().release(&self.name(), extracted_pred);
+                self.source
+                    .lock_wait()
+                    .release(&self.releaser(), extracted_pred);
             }
             TileGuard::Function(FunctionGuard::Codomain(g))
                 if matches!(**g, TileGuard::Function(FunctionGuard::Domain(_))) =>
@@ -1284,13 +1321,15 @@ impl TileProducer for MapResultWithSourceProducer {
                     );
                     let keys = self.released_beneath_every_key(pred);
                     let extracted_pred = extract_predicate(&keys, &correlation[1..]).clone();
-                    self.source.lock_now().release(&self.name(), extracted_pred);
+                    self.source
+                        .lock_wait()
+                        .release(&self.releaser(), extracted_pred);
                 }
             }
             g if g.is_universal() => {
                 self.source
-                    .lock_now()
-                    .release(&self.name(), Predicate::True);
+                    .lock_wait()
+                    .release(&self.releaser(), Predicate::True);
             }
             g if g.is_empty() => {}
             _ => panic!(
@@ -2081,6 +2120,7 @@ mod tests {
             as_domain,
             Vec::new(),
             Some(vec![TilePathStep::Codomain]),
+            None,
         );
         let _ = producer.get(producer.tiling().universal_guard());
         let beneath = |outer: u64| {
@@ -2425,6 +2465,45 @@ mod projection_tests {
         );
     }
 
+    /// A pool's records are per operator: a key that the `IterateExtent` of one chain released is
+    /// not reclaimed while a `MapResultWithSource` of the pool has not released it, since that
+    /// operator may still read the source's value at the key. One record for both would reclaim
+    /// what either released.
+    #[test]
+    fn a_pool_reclaims_what_every_operator_released_and_not_what_one_did() {
+        use crate::interpreter::TestDataSource;
+        let source = Arc::new(Mutex::new(TestDataSource::new(
+            "source1",
+            crate::ccl::Type::Base(BaseType::Int),
+            Extent::Base(BaseType::Int),
+        )));
+        source.lock_wait().add_data(
+            &(0..4)
+                .map(|k| (Value::UInt(k), Value::Int(k as i64)))
+                .collect::<Vec<_>>(),
+        );
+        let domain = Extent::DataSourceDomain(source.clone());
+        let mut iterate = IterateExtent::new(domain.clone());
+        let mut reader =
+            MapResultWithSource::new(source.clone(), Box::new(IterateExtent::new(domain)));
+        let mut scheduler = Scheduler::new();
+        let ((mut iterating, _reading), _records) =
+            scheduler.with_pooled_release_records("pool#test".to_string(), |scheduler| {
+                let guard = iterate.tiling().universal_guard();
+                let iterating = iterate.subscribe(guard, Box::new(|| {}), scheduler);
+                let guard = reader.tiling().universal_guard();
+                let reading = reader.subscribe(guard, Box::new(|| {}), scheduler);
+                (iterating, reading)
+            });
+
+        iterating.release(keys_between(2, 2));
+        let released = source.lock_wait().get_released_predicate();
+        assert!(
+            !released.contains(&Value::UInt(2)),
+            "the reader has not released key 2, so the source keeps it: {released:?}"
+        );
+    }
+
     #[test]
     fn nothing_pulls_nothing() {
         let (mut map, logs) = lookup_over_positions();
@@ -2707,6 +2786,7 @@ mod source_projection_tests {
                 source,
                 fields: Vec::new(),
                 result_correlation: None,
+                shared_release_record: None,
                 last_nested_input: None,
             },
             pulled,

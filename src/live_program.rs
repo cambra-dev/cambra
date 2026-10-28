@@ -588,6 +588,26 @@ impl LiveProgram {
         Some(&mut self.branches[at].program)
     }
 
+    /// Run `name`'s `main` output on the worker pool, or say why it is not a morsel pipeline.
+    /// `None` for a branch that does not exist. The pool takes the branch's `main` producer once
+    /// the program is accepted, so a program the pool ran is not driven by the scheduler loop
+    /// afterwards, and a refused program keeps its producer.
+    pub fn run_main_on_pool(
+        &mut self,
+        name: &str,
+        ctx: &mut GlobalContext,
+        config: &crate::interpreter::parallel::Config,
+    ) -> Option<Result<crate::interpreter::Tile, crate::interpreter::parallel::Unsupported>> {
+        let at = self.branches.iter().position(|b| b.name == name)?;
+        let branch = &mut self.branches[at];
+        Some(crate::interpreter::parallel::run_main_holding(
+            ctx,
+            &mut branch.program,
+            &mut branch.main_producer,
+            config,
+        ))
+    }
+
     /// Branch `name`'s `main` output's producer, for a driver to pull.
     pub fn main_producer_mut(&mut self, name: &str) -> Option<&mut Box<dyn TileProducer>> {
         let at = self.index_of(name).ok()?;
