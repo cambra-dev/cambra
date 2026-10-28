@@ -73,6 +73,7 @@
 //! | An endpoint is added | Accepted; the route serves as soon as the swap completes |
 //! | An endpoint is removed | Accepted; the route is retired and the address answers 404, unless it was the port's last route, in which case the port is released |
 //! | An endpoint is removed with a request already in flight to it | Accepted; that request is answered 404 too, rather than waiting for a reply no version will compute |
+//! | The same, and a later version serves the endpoint again before the request's body has arrived | Accepted; the request reaches the route serving its address when its body arrives |
 //! | Repeats and reverts | Accepted; each takes effect |
 //! | A reload after one that kept a stateful binding whole | Accepted; the variable under the kept binding is still carried and still guarded |
 //! | A variable is retired and a new one is seeded from it with `@LoadFrom(x)` | Accepted; the new variable starts at the value the retired one held |

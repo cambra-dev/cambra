@@ -67,7 +67,11 @@ One `tiny_http::Server` is bound per TCP port, shared by all `http_serve` routes
 `SharedHttpServer::register(method, path)` adds a route and returns the `mpsc::Receiver` of the
 route's channel. The dispatcher thread reads each incoming request and looks up the route in the
 routing table (`RouteTable`). It sends a request for a registered route to that route's channel as
-`RouteMessage::Request`, and answers any other request 404.
+`RouteMessage::Request`, and answers any other request 404. It reads the body after the lookup,
+then looks the route up again and sends while holding the table's lock, so a request whose route is
+retired during the read is answered 404
+([A route a version stops serving is retired](../ccl/design/program-evolution.md#a-route-a-version-stops-serving-is-retired)),
+and one whose route is opened again before its body arrives reaches the new route.
 
 Duplicate `(port, method, path)` registrations are rejected with a `LoweringError` at compile time.
 

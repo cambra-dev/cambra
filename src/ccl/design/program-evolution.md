@@ -1200,6 +1200,16 @@ both stages a request waits at: the dispatcher's channel, before the source has 
 shared pending map, after. The stage a request reached therefore does not decide what its client
 sees (`a_request_that_arrived_before_its_route_was_retired_is_answered`).
 
+Nothing reaches a route's channel after its drain. The dispatcher reads a request's body after
+looking its route up, and tiny_http hands over a request before its body has arrived when the body
+is chunked, over 1024 bytes, or sent with `Expect: 100-continue`, so a route can be retired during
+that read. The dispatcher looks the route up again under the routing-table lock and sends while
+holding it. A request sent before the unregister is in the channel when the drain runs. One whose
+second lookup follows the unregister finds the address unregistered, and the dispatcher answers it
+404, or finds it registered to a later route, which receives it
+(`a_request_whose_body_arrives_after_its_route_was_retired_is_answered`,
+`a_request_whose_route_is_served_again_during_its_body_reaches_the_new_route`).
+
 Retiring belongs to installing a version or deleting a branch, not to compiling one. It runs in
 `compile_version`, which installs both a first version and a replacement, and in
 `LiveProgram::delete_branch` (`GlobalContext::retire_routes_absent_from`), not in `run_frontend`. A

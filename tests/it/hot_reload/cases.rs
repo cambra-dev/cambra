@@ -1,6 +1,12 @@
 //! One case per row of the guard table in `tests/it/hot_reload.rs`.
 
-use std::{sync::mpsc, thread, time::Duration};
+use std::{
+    io::{BufRead, BufReader, Read, Write},
+    net::TcpStream,
+    sync::mpsc,
+    thread,
+    time::Duration,
+};
 
 use indoc::indoc;
 use rstest_log::rstest;
@@ -2824,6 +2830,126 @@ fn a_request_that_arrived_before_its_route_was_retired_is_answered() {
         answered,
         vec!["Not Found"],
         "the retired route answers the request it was holding",
+    );
+}
+
+/// Send `GET /peek` with `Expect: 100-continue` and a four-byte body, and answer the final
+/// response's body. The body is held back: `continued` fires on the `100 Continue` tiny_http writes
+/// when the body read starts, which follows the first lookup of the request's route, and the body
+/// is sent once `release` fires.
+fn get_peek_held_at_its_body(
+    port: u16,
+    continued: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    write!(
+        stream,
+        "GET /peek HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: 4\r\n\
+         Expect: 100-continue\r\nConnection: close\r\n\r\n"
+    )
+    .unwrap();
+    let mut response = BufReader::new(stream.try_clone().unwrap());
+    let mut status = String::new();
+    response.read_line(&mut status).unwrap();
+    assert!(
+        status.starts_with("HTTP/1.1 100"),
+        "the first response is `100 Continue`: {status}",
+    );
+    let mut line = String::new();
+    while line != "\r\n" {
+        line.clear();
+        let read = response.read_line(&mut line).unwrap();
+        assert_ne!(read, 0, "the connection closed inside `100 Continue`");
+    }
+    continued.send(()).unwrap();
+    release.recv().unwrap();
+    stream.write_all(b"body").unwrap();
+    let mut rest = String::new();
+    response.read_to_string(&mut rest).unwrap();
+    let body = rest.split_once("\r\n\r\n").map(|(_, body)| body);
+    body.unwrap_or_default().to_string()
+}
+
+/// A request whose route is retired and served again while its body is still arriving reaches the
+/// route serving its address when the body has arrived.
+///
+/// A request's route is looked up before its body is read and again after, and the second lookup
+/// decides where it goes. The client sends `Expect: 100-continue`, and tiny_http writes
+/// `100 Continue` when the body read starts, after the first lookup. Two reloads then retire
+/// `/peek` and open it again before the client sends the body. A lookup that held the
+/// routing-table lock across the read would block the first reload, and the timeout turns that
+/// into a failure.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_request_whose_route_is_served_again_during_its_body_reaches_the_new_route() {
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&source("guestbook", port));
+
+    let (continued, body_started) = mpsc::channel::<()>();
+    let (release, released) = mpsc::channel::<()>();
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        tx.send(get_peek_held_at_its_body(port, continued, released))
+            .unwrap()
+    });
+    body_started
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the body read starts");
+
+    live.reload_text(
+        &mut ctx,
+        MAIN_BRANCH,
+        &source("guestbook-drops-route", port),
+        &no_main,
+    )
+    .expect("dropping a stateless route is allowed");
+    live.reload_text(&mut ctx, MAIN_BRANCH, &source("guestbook", port), &no_main)
+        .expect("opening the route again is allowed");
+    release.send(()).unwrap();
+
+    let answered = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    assert_eq!(
+        answered, "peek\n",
+        "the version serving `/peek` when the body arrives answers the request",
+    );
+}
+
+/// A request whose body is still arriving when its route is retired is answered 404.
+///
+/// The client sends `Expect: 100-continue`, so tiny_http hands the request over before its body,
+/// and the dispatcher writes `100 Continue` when it starts reading the body after its first
+/// lookup. The client holds the body back until a reload has retired the route, so the retirement
+/// and its drain fall between the dispatcher's first lookup and its second.
+#[test]
+fn a_request_whose_body_arrives_after_its_route_was_retired_is_answered() {
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&source("guestbook", port));
+
+    let (continued, body_started) = mpsc::channel::<()>();
+    let (release, released) = mpsc::channel::<()>();
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        tx.send(get_peek_held_at_its_body(port, continued, released))
+            .unwrap()
+    });
+    body_started
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the dispatcher starts reading the body");
+
+    live.reload_text(
+        &mut ctx,
+        MAIN_BRANCH,
+        &source("guestbook-drops-route", port),
+        &no_main,
+    )
+    .expect("dropping a stateless route is allowed");
+    release.send(()).unwrap();
+
+    let answered = drive_until(&mut ctx, &rx, Duration::from_secs(5));
+    assert_eq!(
+        answered, "Not Found",
+        "the dispatcher answers a request whose route was retired while it read the body",
     );
 }
 

@@ -119,27 +119,40 @@ impl SharedHttpServer {
             loop {
                 match server.recv() {
                     Ok(mut request) => {
-                        let req_method = request.method().to_string();
-                        let req_url = request.url().to_string();
-
-                        // Look up the route while holding the lock briefly.
-                        let sender = routes_bg
-                            .lock()
-                            .unwrap()
-                            .senders
-                            .get(&(req_method.clone(), req_url.clone()))
-                            .cloned();
-
-                        match sender {
-                            Some(tx) => {
-                                let mut body_bytes = Vec::new();
-                                let _ = request.as_reader().read_to_end(&mut body_bytes);
-                                let body = SmolStr::new(String::from_utf8_lossy(&body_bytes));
-                                if tx.send(RouteMessage::Request(body, request)).is_err() {
-                                    debug!("HTTP route {req_method} {req_url}: receiver dropped");
+                        let address = (request.method().to_string(), request.url().to_string());
+                        if !routes_bg.lock().unwrap().senders.contains_key(&address) {
+                            respond_not_found(request);
+                            continue;
+                        }
+                        // tiny_http hands over a request before its body has arrived when the
+                        // body is chunked, over 1024 bytes, or sent with `Expect: 100-continue`
+                        // (`tiny_http::request::new_request`), so this read can outlast the route.
+                        let mut body_bytes = Vec::new();
+                        let _ = request.as_reader().read_to_end(&mut body_bytes);
+                        let body = SmolStr::new(String::from_utf8_lossy(&body_bytes));
+                        // The second lookup and the send share one critical section with
+                        // `unregister`, and retirement drains a route's channel after
+                        // unregistering it. A request sent here is therefore in the channel the
+                        // drain reads, and a request whose second lookup follows the unregister
+                        // finds the address unregistered, or registered to a later route.
+                        let (unrouted, undelivered) = {
+                            let table = routes_bg.lock().unwrap();
+                            match table.senders.get(&address) {
+                                Some(tx) => {
+                                    (None, tx.send(RouteMessage::Request(body, request)).err())
                                 }
+                                None => (Some(request), None),
                             }
-                            None => respond_not_found(request),
+                        };
+                        // Both are answered outside the lock. An undelivered request answers
+                        // tiny_http's 500 when it drops, and a write can wait on an earlier
+                        // response on the same connection.
+                        if let Some(request) = unrouted {
+                            respond_not_found(request);
+                        }
+                        if undelivered.is_some() {
+                            let (method, path) = &address;
+                            debug!("HTTP route {method} {path}: receiver dropped");
                         }
                     }
                     // `unblock` from `Drop`. The registry drops the handle only once no route
@@ -619,10 +632,20 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
     /// in either: the dispatcher's channel, before this source has accepted it,
     /// and the shared pending map, after. Both are answered, so the stage a
     /// request happened to be at does not decide what its client sees.
+    ///
+    /// The route is unregistered before this runs, and the dispatcher sends a request only under
+    /// the routing-table lock with the route registered, so nothing reaches the channel after
+    /// this drain.
     fn answer_in_flight(&mut self) {
         while let Ok(RouteMessage::Request(_, request)) = self.receiver.try_recv() {
             respond_not_found(request);
         }
+        debug_assert!(
+            matches!(self.receiver.try_recv(), Err(TryRecvError::Disconnected)),
+            "route `{}` still has a sender after its drain: it was drained before it was \
+             unregistered, or something besides the routing table holds its sender",
+            self.id,
+        );
         self.shared.answer_not_found();
     }
 
@@ -710,13 +733,41 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
 #[cfg(test)]
 mod tests {
     use std::{
-        io::{Read, Write},
+        io::{BufRead, BufReader, Read, Write},
         net::TcpStream,
         sync::mpsc::RecvTimeoutError,
         time::Duration,
     };
 
     use super::*;
+
+    /// Send `POST /x` with `Expect: 100-continue` and a four-byte body, and answer the final
+    /// response's body. The body is held back: `continued` fires on the `100 Continue` the
+    /// dispatcher writes when it starts reading the body, and the body is sent once `release`
+    /// fires.
+    fn post_held_at_its_body(port: u16, continued: Sender<()>, release: Receiver<()>) -> String {
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .write_all(
+                b"POST /x HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: 4\r\n\
+                  Expect: 100-continue\r\nConnection: close\r\n\r\n",
+            )
+            .unwrap();
+        let mut response = BufReader::new(stream.try_clone().unwrap());
+        let mut line = String::new();
+        while line != "\r\n" {
+            line.clear();
+            let read = response.read_line(&mut line).unwrap();
+            assert_ne!(read, 0, "the connection closed before `100 Continue`");
+        }
+        continued.send(()).unwrap();
+        release.recv().unwrap();
+        stream.write_all(b"body").unwrap();
+        let mut rest = String::new();
+        response.read_to_string(&mut rest).unwrap();
+        let body = rest.rsplit_once("\r\n\r\n").map(|(_, body)| body);
+        body.unwrap_or_default().to_string()
+    }
 
     /// A source named `route` reading the channel `messages` were sent on, with no listener.
     fn source_reading(messages: Vec<RouteMessage>) -> HttpServerDataSource {
@@ -748,6 +799,29 @@ mod tests {
     #[should_panic(expected = "route `route` was polled after its sender was dropped")]
     fn a_poll_of_a_route_with_no_sender_panics() {
         source_reading(Vec::new()).check_for_new_data();
+    }
+
+    /// The dispatcher holds no sender for a route while it reads a request's body. A route
+    /// unregistered during the read is disconnected at once, and the request is answered 404.
+    #[test]
+    fn a_route_unregistered_during_a_body_read_answers_404() {
+        let port = reserve_test_port();
+        let server = SharedHttpServer::new(port).expect("the reserved port binds");
+        let requests = server.register("POST".to_string(), "/x".to_string());
+        let (continued, body_started) = mpsc::channel();
+        let (release, released) = mpsc::channel();
+        let client = thread::spawn(move || post_held_at_its_body(port, continued, released));
+
+        body_started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the dispatcher starts reading the body");
+        server.unregister("POST", "/x");
+        assert!(
+            matches!(requests.try_recv(), Err(TryRecvError::Disconnected)),
+            "the routing table held the route's only sender",
+        );
+        release.send(()).unwrap();
+        assert_eq!(client.join().unwrap(), "Not Found");
     }
 
     /// A route registered after the dispatcher failed reads that failure, since no request

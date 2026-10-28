@@ -529,6 +529,8 @@ fn a_retired_route_answers_a_request_it_had_accepted() {
         "the request is accepted and unanswered: no sink exists to reply",
     );
 
+    // Retirement unregisters the route before it drains the source.
+    server.unregister("GET", "/x");
     source.answer_in_flight();
     assert_eq!(
         rx.recv_timeout(Duration::from_secs(5))
