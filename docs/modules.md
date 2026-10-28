@@ -329,6 +329,7 @@ public and private, so that `m::hidden` can say the member is private and point 
 | value, `def`, mutable variable, feed | its visibility, its statement, and for a `def` whether it takes a `Mut` parameter |
 | type alias | its visibility, its statement, and its type as its module lowered it |
 | nominal type | its declaration, visibility and statement, and each associated function's visibility, statement and arity, and whether it is a method (`NominalMember`) |
+| trait | its declaration, visibility and statement (`TraitMember`) |
 | member bound to a module, `pub audit = a` | its visibility, its statement, and the module it is bound to, as its module spells it |
 | parameter | its annotation, Module type, or bound, and whether it has a default |
 
@@ -342,7 +343,7 @@ registered in `history_param_fns` when its module begins lowering.
 
 Each module is lowered with fresh block state. Every spelling-keyed map in `LoweringContext`
 (`transactional_vars`, `type_aliases`, `history_param_fns`, `shadow_depth`, `nominal_types`,
-`associated_functions`, `used_nominal`) covers one module. The
+`associated_functions`, `used_nominal`, `traits`) covers one module. The
 entries a module seeds from interfaces and from its parameters' Module types, `Txn` members in
 `transactional_vars` and `Mut`- and `Feed`-parameter functions in `history_param_fns`, are keyed by qualified
 spelling. The out-of-block read gate and the `MutWrite` shape then apply to `eu::stock` and
@@ -426,12 +427,51 @@ uniquified copy of the module's chain, so a reference reads the binder it resolv
 each top-level binding and function an associated function reads, and refuses one that reaches a
 mutable variable, a feed, a source, a value parameter without `const`, a value member of a
 Module-typed parameter, or a member of a run the module declares, naming the path it reaches it
-through. Each type parameter and `const` parameter it reaches joins the type's identity.
+through. A function or constructor of a run's type is no such member. Calling one of another
+module's type, through an import or a run, reaches the type as that import or run gives it
+(`LoweringContext::qualified_type`), whose implicit arguments it reaches in turn, so a method
+call's candidate of another module's type reaches nothing forbidden whichever type its receiver has. Each
+type parameter and `const` parameter it reaches joins the type's identity.
 
 `cambra check` prints each public type as its module declares it, with each type parameter's
 variance and the module's type parameters whose arguments tell its instances apart, and each
 public associated function with its contract (`NominalMember::written`). A contract writes the
 module's own nominal types by name and another module's qualified by it (`chl_type_in`).
+
+### Traits and instances across modules
+
+A trait is a member of its module, and its declaration records the module's path
+(`TraitDecl::module`), so two modules' traits of one name are two traits. A module names a trait
+it declares, a compiler trait, one a `use` name reaches (`Reached::Trait`), or a public one of the
+module a qualifier names (`Qualifier::reach_trait`), as in `shapes::Area(S)`
+(`LoweringContext::resolve_trait`). A summon, a requirement and an instance's head name a trait the
+same way. An `impl` block whose head is written through a qualifier is an instance
+(`LoweringContext::is_instance_block`).
+
+Every module declares its instances before its statements lower, the root's as any other's
+(`declare_module_instances`). The instance table is the program's: `begin_module` clears the
+module's traits and leaves every module's instances in `LoweringContext::instances`, which a later
+module's instances are checked against and which inference reads. An instance stands in its
+trait's module or in the module of a nominal type its head names, and outside its trait's module
+no operand of its head is a type variable (`declare_instance`), so two instances that overlap are
+declared in modules one of which imports the other, and the later one reports the overlap.
+
+An instance's functions are bound under the binders lowering mints for them
+(`Implementation::Binding`), which uniquifying never re-mints, so every copy of the module binds
+them under the same names. A shared import's copy encloses the root and every module that imports
+it, so a call there reaches the instance's binder. The copies are one function only if they reach
+what an associated function may (`associated_reach`). An instance whose head names a type whose
+identity takes the module's parameters, or whose functions reach one, differs between the copies,
+and lowering refuses it as a gap (`instances_reaching_parameters`). A definition of another module
+specialized at a type whose instance a module importing it declares does not reach that instance's
+binder, and inference reports it (`InferError::InstanceOfAnotherModule`).
+
+A module's check notes the contract of each public member, which `cambra check` prints, and refuses
+one that requires a trait the module keeps private (`private_traits_in_contracts`). A `pub trait`
+naming a private type or trait in its functions' signatures or its `requires` clause is refused once
+the module lowers, against the module as written, since lowering reads it with `pub` removed
+(`private_names_in_public_traits`). `cambra check` prints each public trait with its associated
+types and each function's type (`TraitMember::written`).
 
 ### A Module type is not a `Type`
 

@@ -474,6 +474,20 @@ pub enum InferError {
         /// The instance's head, `Area(Circle)`.
         instance: String,
     },
+    /// A trait function's call, in a definition another module declares, answered by an
+    /// instance of a module the definition's module does not reach. Which such instances a
+    /// use may pass is not decided (`docs/chl-spec.md`, "Traits and instances across
+    /// modules \[Decided\]").
+    InstanceOfAnotherModule {
+        /// The trait function called, `Area::area`.
+        function: String,
+        /// The instance's head, `Area(Square)`.
+        instance: String,
+        /// The module declaring the definition, as a diagnostic names it.
+        definition_module: String,
+        /// The module declaring the instance, as a diagnostic names it.
+        instance_module: String,
+    },
     /// A trait function's call, inside a function of an instance, that the same function
     /// answers at the same types: the call is the one it is in, so it would never end.
     InstanceCallsItself {
@@ -837,6 +851,7 @@ impl InferError {
             | InferError::MissingRequirement { .. }
             | InferError::MonomorphicPolyBinding { .. }
             | InferError::InstanceAfterUse { .. }
+            | InferError::InstanceOfAnotherModule { .. }
             | InferError::InstanceCallsItself { .. }
             | InferError::MutWriteToNonMutable { .. } => {}
         }
@@ -1257,6 +1272,18 @@ impl std::fmt::Debug for InferError {
                 "this call of `{function}` is answered by `impl {instance}`, which is declared \
                  below it; an instance's functions are in scope after its `impl`, so declare \
                  the instance above the call, or above the definition the call is in"
+            ),
+            InferError::InstanceOfAnotherModule {
+                function,
+                instance,
+                definition_module,
+                instance_module,
+            } => write!(
+                f,
+                "this call of `{function}`, in a definition {definition_module} declares, is \
+                 answered by `impl {instance}`, which {instance_module} declares; a use of a \
+                 definition passes it the instances its module reaches, and which instances of \
+                 a module importing it a use may pass is not decided yet"
             ),
             InferError::InstanceCallsItself { function, at } => write!(
                 f,

@@ -641,7 +641,7 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
             def area(s: S) => Int
         summon(Area(_))::area(Circle::new(1))
     "},
-    "No Area instance for Area::area: operand 1 is Circle, and no instance of `Area` accepts a type there"
+    "no instance of `Area` accepts (_), so no use could satisfy this requirement"
 )]
 #[case::overlapping_instances(
     indoc! {"

@@ -11,6 +11,7 @@
 //! to the name its row records, and each completed from its trait's signature at the
 //! instance's types.
 
+use crate::ccl::lower::modules::{Qualifier, Reached, top_level_nominal_types, top_level_traits};
 use crate::ccl::module_type::AliasType;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -67,11 +68,13 @@ pub(super) fn named_requirement(
 /// (`docs/chl-spec.md`, "Summoning an instance").
 pub(super) fn refuse_trait_member(trait_: &Trait, q: &QualifiedName, span: Span) -> LoweringError {
     let holes = vec!["_"; trait_.arity()].join(", ");
+    // The trait as the program wrote it, `shapes::Area` included.
+    let written = crate::ccl::names::QualifiedName::of_segments(&q.qualifier);
     LoweringError::unsupported(
         span,
         format!(
             "a trait's functions are read from an instance, not from the trait: write \
-             `summon({trait_}({holes}))::{}`",
+             `summon({written}({holes}))::{}`",
             q.name.node
         ),
     )
@@ -93,6 +96,18 @@ fn instance_function(
             format!("`{trait_}` declares no function `{}`", function.node),
         ));
     };
+    // A summon of a trait no instance of which exists is refused here, as `requires`
+    // refuses it: left to inference, it is an obligation with nothing to accept.
+    if ctx.instances_declared
+        && ctx.instances.instances(trait_).is_empty()
+        && !trait_.collection_rule_admits(&instance.args, &instance.assoc)
+    {
+        return Err(unsatisfiable_requirement(
+            trait_,
+            &instance.args,
+            instance.at.unwrap_or(function.span),
+        ));
+    }
     let arity = declared.signature.inputs.len();
     let node = Expr::new(TypedExprNode::TraitFn {
         trait_: trait_.clone(),
@@ -180,8 +195,94 @@ pub(crate) struct InstanceBlock {
 fn trait_decls(stmts: &[Spanned<ChlStmt>]) -> impl Iterator<Item = &ChlTraitDecl> {
     stmts.iter().filter_map(|s| match &s.node {
         ChlStmt::TraitDecl(decl) => Some(decl),
+        ChlStmt::Pub { stmt, .. } => match &stmt.node {
+            ChlStmt::TraitDecl(decl) => Some(decl),
+            _ => None,
+        },
         _ => None,
     })
+}
+
+/// One error per `pub trait` among `stmts`, a module's top level as written with its `pub`
+/// marks, once it is lowered, whose functions' signatures or `requires` clause name a type or
+/// a trait the module keeps private: an importer could name the trait and not what its
+/// contract states (`docs/chl-spec.md`, "Traits and instances
+/// across modules \[Decided\]").
+pub(super) fn private_names_in_public_traits(
+    stmts: &[Spanned<ChlStmt>],
+    ctx: &LoweringContext,
+) -> Vec<LoweringError> {
+    let types = top_level_nominal_types(stmts);
+    let private_type = |decl: &NominalDecl| {
+        let local = |d: &Rc<NominalDecl>| d.module == decl.module && d.name == decl.name;
+        types
+            .iter()
+            .find(|t| t.name == decl.name && ctx.nominal_types.iter().any(local))
+            .filter(|t| !t.public)
+            .map(|t| (decl.name.clone(), t.span))
+    };
+    let traits = top_level_traits(stmts);
+    let private_trait = |trait_: &Trait| {
+        traits
+            .iter()
+            .find(|t| t.name == trait_.name())
+            .filter(|t| !t.public)
+            .map(|t| (t.name.clone(), t.span))
+    };
+    let mut errors = Vec::new();
+    for public in traits.iter().filter(|t| t.public) {
+        let name = &public.name;
+        let Some(trait_) = ctx.traits.iter().find(|t| t.name() == name) else {
+            continue;
+        };
+        let mut named: Vec<Type> = Vec::new();
+        let mut requires: Vec<&TraitRequirement> = trait_.requires.iter().map(|r| &**r).collect();
+        for function in &trait_.functions {
+            named.extend(function.signature.inputs.iter().cloned());
+            named.push(function.signature.output.clone());
+            requires.extend(function.signature.requires.iter().map(|r| &**r));
+        }
+        named.extend(trait_.assoc_bounds.iter().map(|(_, bound)| bound.clone()));
+        for r in &requires {
+            named.extend(r.args.iter().cloned());
+        }
+        let mut found = requires
+            .iter()
+            .filter(|r| ctx.traits.contains(&r.trait_))
+            .find_map(|r| private_trait(&r.trait_));
+        for ty in &named {
+            if found.is_some() {
+                break;
+            }
+            each_nominal(ty, &mut |decl| {
+                if found.is_none() {
+                    found = private_type(decl);
+                }
+            });
+        }
+        if let Some((private, declared)) = found {
+            errors.push(
+                LoweringError::unsupported(
+                    public.span,
+                    format!(
+                        "`pub trait {name}` names `{private}`, which is private to this module; \
+                         a public trait's functions and `requires` clause name only public types \
+                         and traits"
+                    ),
+                )
+                .with_related(declared, "declared here without `pub`"),
+            );
+        }
+    }
+    errors
+}
+
+/// Call `f` on each nominal type `ty` names, at any depth.
+fn each_nominal(ty: &Type, f: &mut dyn FnMut(&NominalDecl)) {
+    if let Type::Nominal(decl, ..) = ty {
+        f(decl);
+    }
+    ty.walk_children(|child| each_nominal(child, f));
 }
 
 /// Declare each `trait` among the module's top-level `stmts`, in source order, lowering its
@@ -228,7 +329,7 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
     if let Some(why) = taken_type_name(&name.node, ctx) {
         return Err(LoweringError::unsupported(name.span, why));
     }
-    if let Some(first) = ctx.trait_named(&name.node).filter(|t| !t.is_compiler()) {
+    if let Some(first) = ctx.traits.iter().find(|t| t.name() == name.node) {
         return Err(LoweringError::unsupported(
             name.span,
             format!(
@@ -341,8 +442,14 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
         functions.push(function?);
         function_spans.push(sig.span);
     }
+    // A trait is a member of its module, and the root's is at the empty path.
+    let module = ctx
+        .module
+        .labels
+        .as_ref()
+        .map_or_else(Vec::new, |path| path.segments().to_vec());
     Ok(Trait::declared(TraitDecl {
-        module: Vec::new(),
+        module,
         name: name.node.clone(),
         span: name.span,
         operands,
@@ -581,8 +688,13 @@ pub(super) fn declare_instances(
         let ChlStmt::Impl(block) = &stmt.node else {
             continue;
         };
-        let Some(trait_) = ctx.trait_named(&block.ty.node) else {
-            continue;
+        let trait_ = match ctx.block_trait(block) {
+            Ok(Some(trait_)) => trait_,
+            Ok(None) => continue,
+            Err(e) => {
+                errors.push(e);
+                continue;
+            }
         };
         let aliases = ctx.snapshot_type_aliases();
         let scoped = ctx.type_params_in_scope.len();
@@ -704,10 +816,16 @@ fn declare_instance(
             ),
         ));
     }
-    // The compiler's traits belong to no module, so an instance of one names a type this
-    // module declares, and stands outside its trait's module, where no operand is a whole
-    // type variable (`docs/chl-spec.md`, "Traits and instances across modules [Decided]").
-    if trait_.is_compiler() {
+    // An instance is declared in its trait's module or in the module of a type its head
+    // names, and outside its trait's module no operand is a whole type variable
+    // (`docs/chl-spec.md`, "Traits and instances across modules [Decided]"). The compiler's
+    // traits belong to no module, so an instance of one is always outside it.
+    if !ctx.traits.contains(&trait_) {
+        let whose = if trait_.is_compiler() {
+            format!("`{trait_}` is the compiler's")
+        } else {
+            format!("`{trait_}` is module `{}`'s", trait_.module.join("::"))
+        };
         let declares =
             |decl: &Rc<NominalDecl>| ctx.nominal_types.iter().any(|d| Rc::ptr_eq(d, decl));
         if !heads
@@ -718,8 +836,7 @@ fn declare_instance(
                 block.ty.span,
                 format!(
                     "`impl {}` names no type this module declares; an instance is declared in \
-                     its trait's module or in the module of a type its head names, and \
-                     `{trait_}` is the compiler's",
+                     its trait's module or in the module of a type its head names, and {whose}",
                     head_spelling(&trait_, &operands)
                 ),
             ));
@@ -734,8 +851,7 @@ fn declare_instance(
                 arg.span,
                 format!(
                     "`impl {}` has a type variable as a whole operand, which only an instance \
-                     in its trait's module may, and `{trait_}` is the compiler's; write an \
-                     instance for each type",
+                     in its trait's module may, and {whose}; write an instance for each type",
                     head_spelling(&trait_, &operands)
                 ),
             ));
@@ -1002,6 +1118,11 @@ fn declare_instance(
             .collect(),
         functions,
         declared: Some(DeclaredAt {
+            module: ctx
+                .module
+                .labels
+                .as_ref()
+                .map_or_else(Vec::new, |path| path.segments().to_vec()),
             head,
             span: block.ty.span,
         }),
@@ -1244,10 +1365,31 @@ fn instance_pattern(
             ),
         )
     };
+    // Another module's type, `shapes::Circle`, is named through its qualifier.
+    let qualified = |q: &QualifiedName, span: Span, ctx: &LoweringContext| {
+        qualified_nominal(q, span, ctx)?.ok_or_else(|| {
+            LoweringError::unsupported(
+                span,
+                format!(
+                    "`{}` names no nominal type; `impl {head}` names a type variable, a base \
+                     type or a nominal type at each operand",
+                    crate::ccl::names::QualifiedName::of(q)
+                ),
+            )
+        })
+    };
     let (name, args): (&SmolStr, &[Spanned<ChlExpr>]) = match &arg.node {
         ChlExpr::Name(n) => (n, &[]),
+        ChlExpr::Qualified(q) => {
+            let decl = qualified(q, arg.span, ctx)?;
+            return applied_pattern(arg, decl, &[], head, variables, ctx);
+        }
         ChlExpr::Call { func, args } => match &func.node {
             ChlExpr::Name(n) => (n, args.as_slice()),
+            ChlExpr::Qualified(q) => {
+                let decl = qualified(q, func.span, ctx)?;
+                return applied_pattern(arg, decl, args, head, variables, ctx);
+            }
             _ => return Err(refuse()),
         },
         _ => return Err(refuse()),
@@ -1277,6 +1419,19 @@ fn instance_pattern(
         }
         return Err(refuse());
     };
+    applied_pattern(arg, decl, args, head, variables, ctx)
+}
+
+/// The nominal type `decl` applied to the patterns `args` write, `Two(T)`, as an instance's
+/// head names it at `arg`.
+fn applied_pattern(
+    arg: &Spanned<ChlExpr>,
+    decl: Rc<NominalDecl>,
+    args: &[Spanned<ChlExpr>],
+    head: &str,
+    variables: &[(SmolStr, Rc<TypeParam>)],
+    ctx: &mut LoweringContext,
+) -> Result<Type, LoweringError> {
     if args.len() != decl.params.len() {
         return Err(LoweringError::unsupported(
             arg.span,
@@ -1595,10 +1750,89 @@ fn lower_instance_def(
 }
 
 impl LoweringContext {
-    /// The trait `name` names: the compiler's, or one the module declares.
+    /// The trait `name` names: the compiler's, one the module declares, or one a `use` name
+    /// of the module reaches.
     pub(super) fn trait_named(&self, name: &str) -> Option<Trait> {
         Trait::compiler_named(name)
             .or_else(|| self.traits.iter().find(|t| t.name() == name).cloned())
+            .or_else(
+                || match self.module.uses.get(name).map(|used| &used.reached) {
+                    Some(Reached::Trait(Some(trait_))) => Some(trait_.clone()),
+                    _ => None,
+                },
+            )
+    }
+
+    /// The trait `qualifier::name` names, written at `span`: by its name, as
+    /// [`trait_named`](Self::trait_named) reads it, or through the modules `qualifier`
+    /// names, `shapes::Area` (`docs/chl-spec.md`, "Traits and instances across modules
+    /// \[Decided\]").
+    /// `Ok(None)` where an unqualified name names no trait. A qualified one names a trait or
+    /// is an error.
+    pub(super) fn resolve_trait(
+        &self,
+        qualifier: &[Spanned<SmolStr>],
+        name: &Spanned<SmolStr>,
+        span: Span,
+    ) -> Result<Option<Trait>, LoweringError> {
+        if qualifier.is_empty() {
+            if let Some(Reached::Trait(None)) = self
+                .module
+                .uses
+                .get(name.node.as_str())
+                .map(|used| &used.reached)
+            {
+                return Err(Qualifier::no_trait(&name.node, name.span));
+            }
+            return Ok(self.trait_named(&name.node));
+        }
+        let at = self.qualifier_path(qualifier, span)?;
+        let spelled = crate::ccl::names::QualifiedName::of_segments(qualifier);
+        match at.reach_trait(&spelled, &name.node, name.span)? {
+            Some(trait_) => Ok(Some(trait_)),
+            None => Err(Qualifier::no_trait(
+                &spelled.child(name.node.clone()).to_string(),
+                name.span,
+            )),
+        }
+    }
+
+    /// The trait an `impl` block's head names, or `None` for a type's own block: one whose
+    /// head names a trait by its name, or names one through a module, which is a trait or
+    /// an error.
+    pub(super) fn block_trait(&self, block: &ImplBlock) -> Result<Option<Trait>, LoweringError> {
+        self.resolve_trait(&block.qualifier, &block.ty, block.ty.span)
+    }
+
+    /// Whether an `impl` block is an instance of a trait rather than a type's own block: its
+    /// head names a trait, or names something through a module, which only a trait's may.
+    pub(super) fn is_instance_block(&self, block: &ImplBlock) -> bool {
+        !block.qualifier.is_empty() || self.trait_named(&block.ty.node).is_some()
+    }
+
+    /// The trait a qualified name's qualifier ends at, `Area` in `Area::area` and in
+    /// `shapes::Area::area`, if it ends at one.
+    ///
+    /// An error where the qualifier's module declares a trait by that name but it cannot be
+    /// reached, a private one. A name the module does not declare as a trait is not an
+    /// error here: it is read as a type, whose own lowering reports what is wrong with it.
+    pub(super) fn trait_of_member(
+        &self,
+        q: &QualifiedName,
+    ) -> Result<Option<Trait>, LoweringError> {
+        let Some((last, modules)) = q.qualifier.split_last() else {
+            return Ok(None);
+        };
+        if modules.is_empty() {
+            return self.resolve_trait(modules, last, last.span);
+        }
+        let Ok(at) = self.qualifier_path(modules, last.span) else {
+            return Ok(None);
+        };
+        if !at.declares_trait(&last.node) {
+            return Ok(None);
+        }
+        self.resolve_trait(modules, last, last.span)
     }
 
     /// The innermost requirement in scope that `name` names.

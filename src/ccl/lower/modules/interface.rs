@@ -18,6 +18,8 @@ pub struct Interface {
     pub(super) types: HashMap<SmolStr, TypeMember>,
     /// Every nominal type the module declares, by name, public and private alike.
     pub(in crate::ccl::lower) nominal: HashMap<SmolStr, NominalMember>,
+    /// Every trait the module declares, by name, public and private alike.
+    pub(in crate::ccl::lower) traits: HashMap<SmolStr, TraitMember>,
     /// Every top-level member bound to a module, by spelling, public and
     /// private alike.
     pub(super) modules: HashMap<SmolStr, ModuleBinding>,
@@ -399,6 +401,82 @@ impl NominalMember {
     }
 }
 
+/// One trait a module declares (`docs/chl-spec.md`, "Traits and instances across modules \[Decided\]").
+#[derive(Debug, Clone)]
+pub struct TraitMember {
+    pub trait_: crate::ccl::infer::solver::traits::Trait,
+    pub public: bool,
+    /// The `trait` statement.
+    pub declared: Span,
+}
+
+impl TraitMember {
+    /// The trait as `cambra check` prints it, as the module at `home` writes it: its head
+    /// and what it requires, each associated type with its bound, and each function's type.
+    fn written(&self, home: &[SmolStr]) -> String {
+        let trait_ = &self.trait_;
+        let ty = |ty: &Type| crate::ccl::chl_print::chl_type_in(ty, home);
+        let requirement = |r: &crate::ccl::ty::TraitRequirement| {
+            let args: Vec<String> = r.args.iter().map(ty).collect();
+            format!("{}({})", r.trait_, args.join(", "))
+        };
+        let operands: Vec<&str> = trait_
+            .operands
+            .iter()
+            .map(|p| p.spelling.as_str())
+            .collect();
+        let mut head = format!("pub trait {}({})", trait_.name(), operands.join(", "));
+        if !trait_.requires.is_empty() {
+            // A name the clause gives is the trait's to show: its instances' functions read
+            // the requirement by it.
+            let requires: Vec<String> = trait_
+                .requires
+                .iter()
+                .map(
+                    |r| match trait_.named.iter().find(|(_, named)| **named == **r) {
+                        Some((name, _)) => format!("{name}: {}", requirement(r)),
+                        None => requirement(r),
+                    },
+                )
+                .collect();
+            head.push_str(&format!(" requires {}", requires.join(", ")));
+        }
+        let mut lines = vec![format!("{head}:")];
+        for (assoc, _) in &trait_.assocs {
+            match trait_.assoc_bounds.iter().find(|(a, _)| a == assoc) {
+                Some((_, bound)) => lines.push(format!("    {assoc} <: {}", ty(bound))),
+                None => lines.push(format!("    {assoc}")),
+            }
+        }
+        for function in &trait_.functions {
+            let signature = &function.signature;
+            let domain = match signature.inputs.as_slice() {
+                [one] => one.clone(),
+                inputs => Type::tuple(inputs.to_vec()),
+            };
+            let forall = match signature.params.as_slice() {
+                [] => String::new(),
+                params => {
+                    let params: Vec<&str> = params.iter().map(|p| p.spelling.as_str()).collect();
+                    format!("forall ({}) ", params.join(", "))
+                }
+            };
+            let mut line = format!(
+                "    {}: {forall}{}",
+                function.name,
+                ty(&Type::fun(domain, signature.output.clone()))
+            );
+            if !signature.requires.is_empty() {
+                let requires: Vec<String> =
+                    signature.requires.iter().map(|r| requirement(r)).collect();
+                line.push_str(&format!(" requires {}", requires.join(", ")));
+            }
+            lines.push(line);
+        }
+        lines.join("\n")
+    }
+}
+
 /// One associated function of a [`NominalMember`].
 #[derive(Debug, Clone)]
 pub struct AssociatedMember {
@@ -442,6 +520,31 @@ impl Interface {
     /// Whether `name` is a public value member.
     pub fn is_public(&self, name: &str) -> bool {
         self.members.get(name).is_some_and(|member| member.public)
+    }
+
+    /// The statement of the public member or public associated function `binding`, if it is
+    /// one.
+    pub fn public_declaration(&self, binding: &str) -> Option<Span> {
+        if let Some(member) = self.members.get(binding).filter(|m| m.public) {
+            return Some(member.declared);
+        }
+        let (ty, function) = binding.split_once("::")?;
+        let member = self.nominal.get(ty).filter(|m| m.public)?;
+        member
+            .functions
+            .get(function)
+            .filter(|f| f.public)
+            .map(|f| f.declared)
+    }
+
+    /// Whether the module declares the trait `name` without `pub`.
+    pub fn is_private_trait(&self, name: &str) -> bool {
+        self.traits.get(name).is_some_and(|t| !t.public)
+    }
+
+    /// The statement declaring the trait `name`, which the module declares.
+    pub fn trait_declared(&self, name: &str) -> Span {
+        self.traits[name].declared
     }
 
     /// The name of each public method of each public nominal type the module declares, the
@@ -566,6 +669,11 @@ impl Interface {
                 }
             }
         }
+        for member in self.traits.values() {
+            if member.public {
+                members.push((member.declared, member.written(self.module.segments())));
+            }
+        }
         members.sort_by_key(|(span, _)| span.start);
         lines.extend(members.into_iter().map(|(_, line)| line));
         match self.unimportable {
@@ -584,6 +692,7 @@ impl Interface {
             members: HashMap::new(),
             types: HashMap::new(),
             nominal: HashMap::new(),
+            traits: HashMap::new(),
             modules: HashMap::new(),
             parameters: Vec::new(),
             constants: HashMap::new(),
@@ -665,6 +774,7 @@ impl Interface {
             members,
             types,
             nominal: nominal_members(ast, ctx),
+            traits: trait_members(ast, ctx),
             modules,
             parameters,
             constants: bindings
@@ -720,6 +830,29 @@ fn nominal_members(ast: &ChlModule, ctx: &LoweringContext) -> HashMap<SmolStr, N
         );
     }
     nominal
+}
+
+/// The traits `ast`, a module whose lowering left `ctx`, declares, with whether each is
+/// public, which is read off `ast`.
+fn trait_members(ast: &ChlModule, ctx: &LoweringContext) -> HashMap<SmolStr, TraitMember> {
+    top_level_traits(&ast.body)
+        .into_iter()
+        .filter_map(|declared| {
+            let trait_ = ctx
+                .traits
+                .iter()
+                .find(|t| t.name() == declared.name)?
+                .clone();
+            Some((
+                declared.name,
+                TraitMember {
+                    trait_,
+                    public: declared.public,
+                    declared: declared.span,
+                },
+            ))
+        })
+        .collect()
 }
 
 /// The `def` of each public associated function among `stmts`, a module's top level: a
@@ -868,6 +1001,27 @@ pub fn top_level_nominal_types(stmts: &[Spanned<ChlStmt>]) -> Vec<TopLevelBindin
                 other => (other, false),
             };
             let ChlStmt::TypeDecl(decl) = inner else {
+                return None;
+            };
+            Some(TopLevelBinding {
+                name: decl.name.node.clone(),
+                span: stmt.span,
+                public,
+            })
+        })
+        .collect()
+}
+
+/// The traits `stmts`, a module's top level, declares, in order.
+pub fn top_level_traits(stmts: &[Spanned<ChlStmt>]) -> Vec<TopLevelBinding> {
+    stmts
+        .iter()
+        .filter_map(|stmt| {
+            let (inner, public) = match &stmt.node {
+                ChlStmt::Pub { stmt, .. } => (&stmt.node, true),
+                other => (other, false),
+            };
+            let ChlStmt::TraitDecl(decl) = inner else {
                 return None;
             };
             Some(TopLevelBinding {

@@ -2063,16 +2063,15 @@ fn check_modules(
         let mut tree = uniquify::run(check.tree);
         annotate_arguments(&mut tree, &check.arguments, &inferred);
         // The module's own public members head its check tree with no home,
-        // below the shared imports it reaches.
+        // below the shared imports it reaches. Their contracts are what `cambra check`
+        // prints, and what names only public traits.
         let mut wanted = HashSet::new();
-        if contracts_of == Some(check.file) {
-            for binding in tree.chain_binders() {
-                let base = binding.name.base();
-                if binding.name.home().is_none()
-                    && (check.interface.is_public(base) || check.interface.is_public_function(base))
-                {
-                    wanted.insert(binding.name.clone());
-                }
+        for binding in tree.chain_binders() {
+            let base = binding.name.base();
+            if binding.name.home().is_none()
+                && (check.interface.is_public(base) || check.interface.is_public_function(base))
+            {
+                wanted.insert(binding.name.clone());
             }
         }
         tree = anf::run(tree);
@@ -2091,11 +2090,18 @@ fn check_modules(
         }
         let errors = match checked {
             Ok(found) => {
-                contracts.extend(
-                    found
-                        .into_iter()
-                        .map(|(name, contract)| (SmolStr::from(name.base()), contract)),
-                );
+                reported.extend(private_traits_in_contracts(
+                    &check.module,
+                    &check.interface,
+                    &found,
+                ));
+                if contracts_of == Some(check.file) {
+                    contracts.extend(
+                        found
+                            .into_iter()
+                            .map(|(name, contract)| (SmolStr::from(name.base()), contract)),
+                    );
+                }
                 continue;
             }
             Err(errors) => errors,
@@ -2135,6 +2141,47 @@ fn check_modules(
         }
     }
     reported
+}
+
+/// One error per public member of `module`, declaring `interface`, whose contract, among those its check
+/// `found`, requires a trait the module keeps private: a public member's contract names only
+/// public traits, whether its `requires` clause is stated or inferred (`docs/chl-spec.md`,
+/// "Traits and instances across modules \[Decided\]").
+fn private_traits_in_contracts(
+    module: &ModulePath,
+    interface: &crate::ccl::lower::modules::Interface,
+    found: &HashMap<Name, Contract>,
+) -> Vec<CompileError> {
+    let mut errors = Vec::new();
+    let mut found: Vec<(&Name, &Contract)> = found.iter().collect();
+    found.sort_by_key(|(name, _)| name.base());
+    for (name, contract) in found {
+        let base = name.base();
+        let declared = match interface.public_declaration(base) {
+            Some(declared) if name.home().is_none() => declared,
+            _ => continue,
+        };
+        let Contract::Scheme(scheme) = contract else {
+            continue;
+        };
+        for requirement in &scheme.poly.requires {
+            let trait_ = &requirement.trait_;
+            if trait_.module == module.segments() && interface.is_private_trait(trait_.name()) {
+                errors.push(CompileError::Lower(
+                    LoweringError::unsupported(
+                        declared,
+                        format!(
+                            "`{base}` is public, and its contract requires `{trait_}`, which is \
+                             private to module `{module}`; a public member's contract names \
+                             only public traits, so declare `pub trait {trait_}`"
+                        ),
+                    )
+                    .with_related(interface.trait_declared(trait_.name()), "declared here"),
+                ));
+            }
+        }
+    }
+    errors
 }
 
 /// What makes two errors one error: its span, and the error as every copy of the code
@@ -2292,6 +2339,9 @@ pub fn check_program(
         let output_type = source.borrow().output_type();
         ctx.inference_ctx().register_source_type(&name, output_type);
     }
+    // The instances the program declares are each module's check's to read, as they are
+    // the linked program's inference's.
+    ctx.inference_ctx().instances = Rc::new(ctx.lowering_ctx().take_instances());
     let root = program.sources().root();
     let interface = checks
         .iter()

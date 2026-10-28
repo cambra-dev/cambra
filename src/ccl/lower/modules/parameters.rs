@@ -236,7 +236,10 @@ impl LoweringContext {
                 Reached::Value(Some(reference)) => {
                     Some((bound.clone(), reference.name.clone(), used.item))
                 }
-                Reached::Value(None) | Reached::Type(_) | Reached::Nominal(_) => None,
+                Reached::Value(None)
+                | Reached::Type(_)
+                | Reached::Nominal(_)
+                | Reached::Trait(_) => None,
             })
             .collect();
         used.sort_by(|l, r| l.0.cmp(&r.0));
@@ -529,7 +532,21 @@ impl LoweringContext {
         let qualifier = qualifier.clone();
         for item in uses {
             let bound = item.alias.as_ref().unwrap_or(&item.name);
-            if qualifier.declares_nominal(&item.name.node) {
+            if qualifier.declares_trait(&item.name.node) {
+                // A refused `use` item has no `use` name.
+                if !self.module.uses.contains_key(&bound.node) {
+                    continue;
+                }
+                let reached = qualifier.reach_trait(
+                    &QualifiedName::new(run.clone()),
+                    &item.name.node,
+                    item.name.span,
+                );
+                if let (Ok(reached), Some(used)) = (reached, self.module.uses.get_mut(&bound.node))
+                {
+                    used.reached = Reached::Trait(reached);
+                }
+            } else if qualifier.declares_nominal(&item.name.node) {
                 // A refused `use` item has no `use` name.
                 if !self.module.uses.contains_key(&bound.node) {
                     continue;

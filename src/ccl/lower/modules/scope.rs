@@ -42,6 +42,8 @@ pub enum Reached {
     /// A nominal type, as the instance the qualifier reaches, with how the module
     /// spells that qualifier, which its members' bindings are reached through.
     Nominal(Option<(NominalMember, QualifiedName)>),
+    /// A trait (`docs/chl-spec.md`, "Traits and instances across modules \[Decided\]").
+    Trait(Option<crate::ccl::infer::solver::traits::Trait>),
 }
 
 /// What a name that denotes a module reaches: an import name, a run name, a
@@ -148,7 +150,7 @@ impl LoweringContext {
                 Reached::Value(Some(reference)) if reference.history_param => {
                     self.register_history_param_fn(name.as_str());
                 }
-                Reached::Value(_) | Reached::Nominal(None) => {}
+                Reached::Value(_) | Reached::Nominal(None) | Reached::Trait(_) => {}
                 Reached::Nominal(Some(found)) => {
                     self.used_nominal.insert(name.clone(), found.clone());
                 }
@@ -160,6 +162,13 @@ impl LoweringContext {
         self.in_tx_body = false;
         self.type_params_in_scope.clear();
         self.shadow_depth.clear();
+        // A trait is a member of its module, so a module names its own and those its `use`
+        // names and qualifiers reach. An instance belongs to the whole program, so the table
+        // keeps every module's (`docs/chl-spec.md`, "Traits and instances across modules [Decided]").
+        self.traits.clear();
+        self.instances_declared = false;
+        self.pending_requirements.clear();
+        self.instance_blocks.clear();
     }
 
     /// The Module type `annotation` names, if it names one: written, or through
@@ -386,6 +395,33 @@ impl LoweringContext {
             )),
             segments => self.qualifier_path(segments, span),
         }
+    }
+
+    /// The nominal type of another module, as the import or run this module reaches it
+    /// through gives it, whose function or constructor the raw name `raw` spells,
+    /// `Circle` for `s::Circle::extract`. Its implicit arguments are what the import's or
+    /// run's arguments give, so what calling it reaches of this module's parameters is
+    /// read off them (`docs/chl-spec.md`, "Associated functions and methods").
+    pub(in crate::ccl::lower) fn qualified_type(
+        &self,
+        raw: &str,
+    ) -> Option<Rc<crate::ccl::nominal::NominalDecl>> {
+        let segments: Vec<&str> = raw.split("::").collect();
+        let [first, modules @ .., ty, _] = segments.as_slice() else {
+            return None;
+        };
+        let mut at = self.module.qualifiers.get(*first)?.clone();
+        let mut spelled = QualifiedName::new(*first);
+        for segment in modules {
+            let member = Spanned::new(at.statement, SmolStr::from(*segment));
+            at = at.module_member(&spelled, &member).ok()?;
+            spelled = spelled.child(*segment);
+        }
+        if !at.declares_nominal(ty) {
+            return None;
+        }
+        let found = at.reach_nominal(&spelled, ty, at.statement).ok()??;
+        Some(found.decl)
     }
 
     /// The module the qualifier `segments` names, written in a reference at
@@ -660,6 +696,60 @@ impl Qualifier {
             )),
             None => Ok(None),
         }
+    }
+
+    /// Whether the module this reaches declares a trait `member`. A module reached through a
+    /// Module type declares none.
+    pub(in crate::ccl::lower) fn declares_trait(&self, member: &str) -> bool {
+        self.view.is_none()
+            && self
+                .reachable()
+                .is_some_and(|interface| interface.traits.contains_key(member))
+    }
+
+    /// The public trait `member` of the module this reaches through the qualifier `name`, or
+    /// `None` when the module has errors of its own, which are reported where they stand.
+    pub(in crate::ccl::lower) fn reach_trait(
+        &self,
+        name: &QualifiedName,
+        member: &str,
+        span: Span,
+    ) -> Result<Option<crate::ccl::infer::solver::traits::Trait>, LoweringError> {
+        if self.view.is_some() {
+            return Err(LoweringError::unsupported(
+                span,
+                format!(
+                    "`{name}` is a parameter of Module type, and a Module type names no trait; \
+                     reach `{member}` through an import of its module"
+                ),
+            ));
+        }
+        let Some(interface) = self.reachable() else {
+            return Ok(None);
+        };
+        let Some(found) = interface.traits.get(member) else {
+            return Err(LoweringError::unsupported(
+                span,
+                format!("module `{}` declares no trait `{member}`", interface.module),
+            ));
+        };
+        if !found.public {
+            return Err(LoweringError::unsupported(
+                span,
+                format!("`{member}` is private to module `{}`", interface.module),
+            )
+            .with_related(found.declared, "declared here without `pub`"));
+        }
+        Ok(Some(found.trait_.clone()))
+    }
+
+    /// The error at `span` for `name`, a trait of a module with errors of its own, which
+    /// therefore names none.
+    pub(in crate::ccl::lower) fn no_trait(name: &str, span: Span) -> LoweringError {
+        LoweringError::unsupported(
+            span,
+            format!("`{name}` names no trait here: its module has errors of its own"),
+        )
     }
 
     /// Whether the module this reaches declares a nominal type `member`. A module reached
@@ -1052,6 +1142,14 @@ pub(super) fn module_scope(
         };
         let reached = if module.is_some() {
             Ok(Reached::Value(None))
+        } else if qualifier.declares_trait(&item.name.node) {
+            qualifier
+                .reach_trait(
+                    &QualifiedName::new(qualifier_name.clone()),
+                    &item.name.node,
+                    item.name.span,
+                )
+                .map(Reached::Trait)
         } else if qualifier.declares_nominal(&item.name.node) {
             qualifier
                 .reach_nominal(

@@ -266,6 +266,7 @@ impl CompilerTraits {
     fn build() -> CompilerTraits {
         use BaseType::{Bool, Int, String, UInt};
         let mut instances = InstanceTable {
+            run_modules: HashMap::new(),
             instances: Vec::new(),
         };
         let binary = ["A", "B"];
@@ -903,6 +904,8 @@ pub struct TraitInstance {
 /// Where a module declares an instance, for diagnostics.
 #[derive(Debug)]
 pub struct DeclaredAt {
+    /// The path of the module that declares it: empty for the program's root module.
+    pub module: Vec<SmolStr>,
     /// The instance's head as its `impl` writes it, `Area(Circle)`.
     pub head: String,
     /// The instance's head.
@@ -1292,6 +1295,10 @@ pub struct Signature {
 #[derive(Debug, Clone)]
 pub struct InstanceTable {
     instances: Vec<(Trait, Rc<TraitInstance>)>,
+    /// The path of the module each run copies, by its run path: where a definition a run
+    /// holds is declared, which a diagnostic compares with an instance's module
+    /// ([`DeclaredAt::module`]).
+    run_modules: HashMap<crate::ccl::RunPath, Vec<SmolStr>>,
 }
 
 /// A program's table before it declares anything: the compiler's instances.
@@ -1327,6 +1334,18 @@ impl InstanceTable {
         self.instances
             .iter()
             .any(|(t, i)| t == trait_ && i.declared.is_some())
+    }
+
+    /// Record that the run at `run` copies the module at `module`.
+    pub fn note_run(&mut self, run: crate::ccl::RunPath, module: Vec<SmolStr>) {
+        self.run_modules.insert(run, module);
+    }
+
+    /// The path of the module the run at `run` copies.
+    pub fn run_module(&self, run: &crate::ccl::RunPath) -> &[SmolStr] {
+        self.run_modules
+            .get(run)
+            .unwrap_or_else(|| panic!("linking notes the module of every run, `{run}` included"))
     }
 
     /// The binding each function of a declared instance is lowered to.

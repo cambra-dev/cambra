@@ -563,6 +563,10 @@ pub struct ImplBlock {
     /// An instance's type variables, `T` in `impl forall (T) Area(Two(T)):`; empty for a
     /// type's own block, whose head names its parameters.
     pub vars: Vec<Spanned<SmolStr>>,
+    /// The modules an instance's trait is reached through, `shapes` in
+    /// `impl shapes::Area(Circle):`; empty for a trait in scope by its name, and for a type's
+    /// own block.
+    pub qualifier: Vec<Spanned<SmolStr>>,
     /// The type whose associated functions the block declares, or the trait the block is an
     /// instance of.
     pub ty: Spanned<SmolStr>,
@@ -711,6 +715,9 @@ pub enum Requirement {
 /// Spec: `docs/chl-spec.md`, "Trait requirements".
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraitType {
+    /// The modules the trait is reached through, `shapes` in `shapes::Area(S)`; empty for a
+    /// trait in scope by its name.
+    pub qualifier: Vec<Spanned<SmolStr>>,
     pub name: SmolStr,
     pub name_span: Span,
     /// The operand types, positionally.
