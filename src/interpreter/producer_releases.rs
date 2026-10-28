@@ -46,6 +46,12 @@ impl ProducerReleases {
         *recorded = recorded.union(obsolete);
     }
 
+    /// How many producers hold a record.
+    #[cfg(test)]
+    pub(crate) fn records(&self) -> usize {
+        self.per_producer.len()
+    }
+
     /// Forget `producer`'s record, because that producer is gone.
     ///
     /// A record left behind holds [`agreed`](Self::agreed) at wherever that

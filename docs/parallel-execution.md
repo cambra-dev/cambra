@@ -367,16 +367,27 @@ ignores the region. The chain's notification path from the source to that consum
 invariant: every consumer on it reports `region_driven`, and the path is acyclic. A closure or a
 sink's consumer on the path ignores the region, and a fan-out's input consumer drops a second
 notification, so the plan refuses a chain with a shared operator or a recurrence. A consumer that
-only sends `Everything` loses nothing: a live source resolves it to every ready position less what
-was claimed.
+only sends `Everything` loses nothing: a live source resolves it to every ready key less what was
+claimed.
+
+**A data-source domain.** The keys of a data source are any totally ordered values, and the source
+holds them, so the source says where a morsel ends: a claim asks it for the first `rows` keys of the
+pending region in key order and names those keys, from the first to the last within the region. A
+source whose keys are not totally ordered, or that does not list them, is read whole on the
+compiling thread. The pool is one reader of a source: its workers' chains hold one release record,
+named for the pool, and the program's own `main` producer, whose record would release nothing, is
+dropped, so the source reclaims what the workers release. An arrival reaches the pipeline through
+the scheduler's polling of the source, run by the thread that delivers it, which notifies the
+consumers registered for the source.
 
 **Shared writes per morsel.** A claim on a finite source is one atomic update of its cursor, and the
 dispatcher counts a morsel outstanding before the claim and back at the acknowledgement, two atomic
 updates. No lock is taken on a finite source's morsel path. A live source's claim takes the lock of
-its pending region, a predicate cut and difference. Idle workers park on a `Condvar` taken only when
-nothing is claimable. A per-worker deque with stealing (`crossbeam-deque`) is the
-extension for socket affinity, a conjecture until measured. A breaker's thread-local partial is
-written by one worker; a merged table is written by the one worker or task that owns it; a head's
+its pending region and, holding it, asks the source for the first keys of the region (the lock order
+is the pending region's, then the source's), a predicate cut and difference. Idle workers park on a
+`Condvar` taken only when nothing is claimable. A per-worker deque with stealing (`crossbeam-deque`)
+is the extension for socket affinity, a conjecture until measured. A breaker's thread-local partial
+is written by one worker; a merged table is written by the one worker or task that owns it; a head's
 rows are written by its producer before they are claimable and never after. The other locks are at
 the places the per-breaker models name: the release-guard union on a `Memo` or `FanOut`, and
 `CommitEngine::attempt`.

@@ -382,10 +382,10 @@ finishes; a failure wakes a parked worker. `source_of` finds the one source, and
 with none and a chain with two.
 
 `LiveSource` has unit tests in `iterate.rs`: it claims only what was published, a region published
-twice is claimed once, `Everything` is cut to the positions that are ready, a region that becomes
+twice is claimed once, `Everything` is cut to the keys that are ready, a region that becomes
 ready ahead of an earlier one is claimed first, the earlier one is not claimable until it is ready,
 and an `Everything` sent while it is missing claims nothing from it, a region outside `ready` is
-refused, a region with open bounds names the positions it contains, and a closed source is exhausted
+refused, a region with open bounds names the keys it contains, and a closed source is exhausted
 after its published rows. The dispatcher has five more: a live pipeline waits for an arrival and
 finishes once closed and drained, a parked worker wakes on a publish and on a close, regions
 published before the pipeline starts are united and kept for its source, and an `Everything`
@@ -414,15 +414,44 @@ epoch move from `Dispatcher::publish`, the `Notified::Always` gate of a region-d
 subtraction of claimed positions in `LiveSource::publish`, or the cut to the yield predicate (a row
 count instead) each fail a test.
 
+**A real data source through the pool, end to end** (`parallel_source_tests.rs`). `[x + 1 for x in
+source1()]` is compiled over a `TestDataSource` and run with `run_main_delivering`. Its keys are
+sparse integers (10, 20, 35, 41, 90, 120, 7000) or strings, and they arrive in chunks, in order,
+last to first and shuffled with fixed seeds. The calling thread delivers a chunk in two steps, as a
+real source's rows precede its yield predicate: it writes the rows and calls
+`check_for_notifications`, and then adds the chunk's keys to the yield predicate and calls it again.
+The yield predicate is the keys that arrived, or, for chunks that arrive in order, the interval from
+the smallest key to the largest. Each run checks that the sink holds every row once with its mapped
+value, as the serial answer computes it, and that the source reclaimed every key: the pool's release
+records are the only ones left, so a key is reclaimed only once a worker claimed, pulled, merged and
+released it. In lockstep, every worker is parked before a delivery and the rows written before their
+keys are ready must stay unclaimed. Before the chunk of the smallest key is delivered after another,
+the delivering thread waits for the source to hold nothing, which a worker can only bring about by
+claiming a later chunk while the earlier one is missing, and fails with that cause after thirty
+seconds, or at once when the pool failed. Each pattern runs on one, two, four and eight workers, and
+one test repeats a run two hundred times. A source that says it cannot cut morsels is refused and
+the program then answers through the scheduler loop. A worker that fails reading the source stops
+the pool, `run_pipeline` raises that worker's own panic, and the pool's release records are gone.
+`run_main` over a source that already holds rows, with no delivery, returns them and finishes
+(`tests/it/parallel.rs`). Removing the subtraction of claimed keys, the cut to the yield predicate
+or the epoch move each fail a test.
+
 ## Not yet implemented
 
-A breaker other than the sink and a fold into `main`, a source over a data-source domain, a pipeline
-plan over more than one pipeline (the dispatcher runs dependent pipelines, and `plan_main` cuts
-one), the operator that serves a breaker's output to the pipeline behind it, a way to hand a morsel
-back, and the sink pulls the scheduler loop queues. A live source exists as `LiveSource`, and
-nothing outside tests publishes to it: `IterateExtent` over a data-source domain answers no
-`morsel_source`. Before a source over a data-source domain lands, the `main` producer
-`compile_program` subscribes has to be owned by the pool: it registers a release record of `False`
-with the source, and a source agrees to reclaim only what every record releases, so an idle producer
-pins the source. Every program the plan refuses runs on the thread that compiled it, through
-`Scheduler::check_for_notifications` and the sink pulls it queues.
+A breaker other than the sink and a fold into `main`, a pipeline plan over more than one pipeline
+(the dispatcher runs dependent pipelines, and `plan_main` cuts one), the operator that serves a
+breaker's output to the pipeline behind it, a way to hand a morsel back, and the sink pulls the
+scheduler loop queues. A source over a data-source domain runs on the pool when it cuts morsels
+(`cuts_morsels`), and `TestDataSource` is the only one that does: the HTTP and stdio sources keep
+the default, so a program over one stays on the compiling thread. Their arrivals reach the pipeline
+through the scheduler's polling, which a live pool drives from the calling thread
+(`run_main_delivering`), and nothing outside tests starts a pool over a live source: `run_main` has
+no delivery, so it runs the rows a source holds when it starts and closes the source. The
+scheduler's `check_for_notifications` notifies with `Everything`, because `check_for_new_data` says
+that a source has data and not which keys. A thread that knows the keys it wrote names them with
+`Scheduler::notify_source_consumers`, which wakes a consumer whose outermost keys are the source's
+with the region and any other with `Everything`. The end-to-end test names each chunk's keys that
+way, but the poll before it publishes `Everything` too, so it does not show the region reaching the
+head; `a_chain_over_a_source_forwards_the_region_an_arrival_names` does. The sources' own arrival
+regions are not reported. Every program the plan refuses runs on the thread that compiled it,
+through `Scheduler::check_for_notifications` and the sink pulls it queues.

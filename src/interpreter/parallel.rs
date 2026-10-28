@@ -392,19 +392,40 @@ fn run_pipeline(
     // The chains are lent to the workers and dropped here, after the scope, one at a time:
     // a producer's drop detaches its probe with a lock that must not find the probe table
     // held by another worker's `get`.
-    std::thread::scope(|scope| {
-        // Armed before the first spawn: a spawn that panics, or a delivery that does, stops the
-        // workers already running from claiming further morsels.
+    // A panic of a worker or of the delivery fails the dispatcher, which stops the other workers,
+    // and is raised again here as that panic: a worker's before the delivery's, since a delivery
+    // that waits on a failed pool fails because of it.
+    let panic = std::thread::scope(|scope| {
+        // Armed before the first spawn: a spawn that panics stops the workers already running
+        // from claiming further morsels.
         let _fail = FailOnUnwind(&dispatcher);
-        for worker_chains in chains.iter_mut() {
-            let (dispatcher, breaker) = (&dispatcher, &breaker);
-            scope.spawn(move || run_worker(worker_chains, dispatcher, breaker));
-        }
-        if let Some(delivery) = delivery {
-            delivery(handle.clone(), scheduler);
-            handle.close();
-        }
+        let workers: Vec<_> = chains
+            .iter_mut()
+            .map(|worker_chains| {
+                let (dispatcher, breaker) = (&dispatcher, &breaker);
+                scope.spawn(move || run_worker(worker_chains, dispatcher, breaker))
+            })
+            .collect();
+        let delivered = delivery.and_then(|delivery| {
+            let delivered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                delivery(handle.clone(), scheduler);
+                handle.close();
+            }));
+            if delivered.is_err() {
+                dispatcher.fail();
+            }
+            delivered.err()
+        });
+        // Every worker is joined: one that is not makes the scope panic in its stead.
+        let worker_panics: Vec<_> = workers
+            .into_iter()
+            .filter_map(|worker| worker.join().err())
+            .collect();
+        worker_panics.into_iter().next().or(delivered)
     });
+    if let Some(panic) = panic {
+        std::panic::resume_unwind(panic);
+    }
     drop(chains);
     drop(records);
     debug_assert!(
@@ -1020,6 +1041,10 @@ impl Drop for FailOnUnwind<'_> {
 #[cfg(test)]
 #[path = "parallel_live_tests.rs"]
 mod live_tests;
+
+#[cfg(test)]
+#[path = "parallel_source_tests.rs"]
+mod source_tests;
 
 #[cfg(test)]
 mod tests {

@@ -65,6 +65,10 @@ pub struct TestDataSource {
     /// Whether `get_elements` panics: a test that reads a morsel through `elements_in` refuses the
     /// whole read, so the morsel cannot be a cut of it.
     refuses_whole_reads: bool,
+    /// Whether the source says it cannot cut morsels, as a source that does not list its keys.
+    declines_morsels: bool,
+    /// Whether `get` panics, as a source whose read fails.
+    fails_to_get: bool,
     yield_predicate: Predicate,
     has_data: bool,
     data: HashMap<Value, Value>,
@@ -79,6 +83,8 @@ impl TestDataSource {
             output_extent,
             key_extent: Extent::Base(BaseType::UInt),
             refuses_whole_reads: false,
+            declines_morsels: false,
+            fails_to_get: false,
             yield_predicate: Predicate::False,
             has_data: false,
             data: HashMap::new(),
@@ -92,6 +98,25 @@ impl TestDataSource {
     pub fn with_key_extent(mut self, key_extent: Extent) -> Self {
         self.key_extent = key_extent;
         self
+    }
+
+    /// This source saying it cannot cut morsels, as a source that does not list its keys does.
+    #[cfg(test)]
+    pub(crate) fn declining_morsels(mut self) -> Self {
+        self.declines_morsels = true;
+        self
+    }
+
+    /// Make `get` panic, so that a worker that reads a value fails.
+    #[cfg(test)]
+    pub(crate) fn fail_to_get(&mut self) {
+        self.fails_to_get = true;
+    }
+
+    /// How many producers hold a release record with the source.
+    #[cfg(test)]
+    pub(crate) fn release_records(&self) -> usize {
+        self.releases.records()
     }
 
     /// Make `get_elements` panic, so that a read of the whole domain fails.
@@ -123,6 +148,12 @@ impl TestDataSource {
         }
         // Mark that new data is available so check_for_new_data() returns true.
         self.has_data = true;
+    }
+
+    /// How many keys the source still holds: those not every producer has released.
+    #[cfg(test)]
+    pub(crate) fn retained_keys(&self) -> usize {
+        self.data.len()
     }
 
     /// Returns a predicate corresponding to the data that has been entirely released from the source.
@@ -168,10 +199,11 @@ impl DataSourceDomainExtentImpl for TestDataSource {
     }
 
     fn cuts_morsels(&self) -> bool {
-        matches!(
-            self.key_extent,
-            Extent::Base(BaseType::UInt | BaseType::Int | BaseType::String)
-        )
+        !self.declines_morsels
+            && matches!(
+                self.key_extent,
+                Extent::Base(BaseType::UInt | BaseType::Int | BaseType::String)
+            )
     }
 
     fn first_keys_in(&self, region: &Predicate, rows: u64) -> Vec<Value> {
@@ -203,6 +235,11 @@ impl DataSourceDomainExtentImpl for TestDataSource {
     }
 
     fn get(&self, mut keys: ColumnValue) -> ColumnValue {
+        assert!(
+            !self.fails_to_get,
+            "the source failed to read {}",
+            self.name
+        );
         ColumnValue::from_values(
             keys.drain_to_value_iter()
                 .map(|key| {
