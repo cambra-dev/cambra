@@ -234,6 +234,32 @@ fn assert_widens(build: &dyn Fn() -> Built, notified: usize) {
     }
 }
 
+fn union(flat: bool) -> Built {
+    let (a, first) = feed(ints());
+    let (b, second) = feed(ints());
+    let arms = vec![a, b];
+    let op: Box<dyn TileOperator> = match flat {
+        true => Box::new(UnionOperator::new_flat(arms, int())),
+        false => Box::new(UnionOperator::new(arms, int())),
+    };
+    (op, vec![first, second])
+}
+
+#[test]
+fn a_flat_union_forwards_the_region_of_each_arm() {
+    for arm in [0, 1] {
+        assert_keeps(&|| union(true), arm);
+    }
+    assert_keeps_without_state(&|| union(true), 1);
+}
+
+/// A tagged union keys its rows by arm, which a region of plain keys does not name.
+#[test]
+fn a_tagged_union_sends_everything_for_any_region() {
+    assert_widens(&|| union(false), 0);
+    assert_widens(&|| union(false), 1);
+}
+
 fn filter(predicate: Tiling) -> Built {
     let (input, data) = feed(ints());
     let (predicate, mask) = feed(predicate);

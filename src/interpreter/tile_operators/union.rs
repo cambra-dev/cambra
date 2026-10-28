@@ -347,10 +347,14 @@ impl TileOperator for UnionOperator {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
+        // The arms of a flat union are disjoint slices of one collection, pulled at the
+        // projection. A tagged union keys its rows by arm, which a region of plain keys does not
+        // name.
+        let flat = self.flat;
         let input_producers: Vec<Box<dyn TileProducer>> = self
             .inputs
             .iter_mut()
-            .map(|op| subscribe_forwarding(&mut **op, &shared, scheduler))
+            .map(|op| subscribe_forwarding_keeping_keys_if(flat, &mut **op, &shared, scheduler))
             .collect();
         Box::new(UnionProducer {
             base: ProducerBase::new(
