@@ -969,10 +969,7 @@ impl TileOperator for Memo {
                 intent_guard,
                 // The memo reads its input at the projection and keeps its keys, so the keys that
                 // changed at the input are the keys that changed at the memo.
-                arrivals.consumer(forwarding_consumer_passing_regions(
-                    &consumer,
-                    &scheduler.wakeup_queue(),
-                )),
+                arrivals.consumer(forwarding_consumer_passing_regions(&consumer)),
                 scheduler,
             ),
             cached_tile: self.tiling().empty_tile(),

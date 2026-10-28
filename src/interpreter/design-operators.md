@@ -714,7 +714,7 @@ depends on the input's shape, the operator decides from its tiling when it subsc
 | `VariantWrap` | the payload | keeps where the result is a collection (applied at level 1 or beyond), widens at level 0 | The values at the level become one union column, which has no keys of its own at level 0. |
 | `VariantProject`, `VariantIs` | the input | keeps for a stream, widens for a bare union | A bare union has no keys of its own. |
 | `Zip`, `Product` | every arm, both sides | keeps | Pulled at the projection and aligned row for row. |
-| `MakeRecord` | every field | routes by field | An input's region is the region of its field, `Fields{name: region}`: a record of values has no keys of its own. A record of one field whose region is everything is `Everything`. |
+| `MakeRecord` | every field | routes by field | An input's region is the region of its field, `Fields{name: region}`: a record of values has no keys of its own. A record of one field whose region is everything is `Everything`. A record of 𝑛 fields whose inputs all notify passes 𝑛 notifications to its consumer, one cascade each: a known cost on a wide record, 𝑛 − 1 extra cascades per pull and two small allocations in each. |
 | `Filter` | the predicate, the input | keeps for a side that is a collection, else widens | A collection side shares the mask's keys; the other is read whole. |
 | `Uncurry`, `Converse` | the input | keeps beneath a standing level, widens at the outermost | Inverting or pairing the outermost collection re-keys it. |
 | `UnionOperator` | every arm | keeps for a flat union, widens for a tagged one | Flat arms are disjoint slices of one collection; a tagged union keys its rows by arm. |
@@ -754,7 +754,7 @@ A consumer that never pulls (`Consumer::region_driven`) has no gate. No pull is 
 notifications, so a gate it sat behind would pass one notification and hold the rest until a pull
 of the producer behind it, which a worker owes only to a claimed morsel. Its gate is
 `Notified::Always`, so no region waits behind one, and `forwarding_consumer` waits for the
-consumer's cell where it would drop or defer, because a dropped notification loses its region.
+consumer's cell where it would absorb a re-entry into the notification in progress, because a notification that waits for another loses its region to a consumer that pulls nothing.
 
 **Region-driven chains.** A region reaches a region-driven consumer intact only if every consumer
 between the notifying producer and it reports `region_driven`, and the notification graph between
@@ -770,10 +770,15 @@ source's state lock, the lock the source's ready-positions function reads, and t
 idle workers. The worker pool's plan admits only chains for which both hold ([The
 scheduler](../../docs/parallel-execution.md#the-scheduler)).
 
-`forwarding_consumer` delivers through the gate when its consumer can be locked. On reentry,
-it drops the notification if the gate is set: no pull has occurred since forwarding. Otherwise
-it queues the notification, because a pull during the current cascade may have missed the new
-change. Sharing notification handles does not share tile data; tiles still pass through `get`.
+`forwarding_consumer` delivers through the gate when its consumer can be locked. A notification that
+re-enters a consumer behind a closed gate is absorbed into the one in progress: the forwarder leaves
+its region with the gate, and the notification in progress delivers it through the gate when it
+returns, until nothing is pending. A region inside what the gate passed is suppressed there, which
+ends a cycle inside the notification that started it, and a region outside it, as the region of
+another field of a record is, reaches the consumer. A pull during the cascade that read past the
+change is woken again by that delivery, which is what the deferred wake that used to carry it did.
+No wake is queued for a re-entry, and the wakeup queue is left to the producers that re-arm
+themselves. Sharing notification handles does not share tile data; tiles still pass through `get`.
 
 A consumer woken by an operator must pull that operator if it still reads it. Until then,
 the operator suppresses later notifications from its inputs. Finished reads, settled seeds,

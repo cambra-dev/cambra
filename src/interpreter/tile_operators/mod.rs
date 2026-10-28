@@ -266,7 +266,7 @@ pub(crate) fn subscribe_forwarding(
 ) -> Box<dyn TileProducer> {
     op.subscribe(
         op.tiling().universal_guard(),
-        forwarding_consumer(shared, &scheduler.wakeup_queue()),
+        forwarding_consumer(shared),
         scheduler,
     )
 }
@@ -295,7 +295,7 @@ pub(crate) fn subscribe_forwarding_keeping_keys(
 ) -> Box<dyn TileProducer> {
     op.subscribe(
         op.tiling().universal_guard(),
-        forwarding_consumer_keeping_keys(shared, &scheduler.wakeup_queue()),
+        forwarding_consumer_keeping_keys(shared),
         scheduler,
     )
 }
@@ -421,10 +421,19 @@ pub struct GateState {
     /// Whether that region is `Everything`, which every region is inside: the lock-free answer
     /// for the notifications that name nothing narrower.
     everything: AtomicBool,
-    /// The union of the regions passed since the last pull. A region has no atomic form: it is
-    /// an interval set or a map by field, and only this gate's notifications and pulls touch it.
+    /// The regions held, which have no atomic form: they are interval sets or maps by field, and
+    /// only this gate's notifications and pulls touch them.
     // shared-state-ok: see the type doc.
-    passed: Mutex<Projection>,
+    held: Mutex<GateHeld>,
+}
+
+/// The regions a gate holds.
+struct GateHeld {
+    /// The union of the regions passed since the last pull.
+    passed: Projection,
+    /// The regions of notifications that re-entered the consumer behind the gate while it was
+    /// being notified, which that notification delivers when it returns.
+    pending: Projection,
 }
 
 impl Notified {
@@ -439,7 +448,10 @@ impl Notified {
         Self::Gate(Arc::new(GateState {
             set: AtomicBool::new(false),
             everything: AtomicBool::new(false),
-            passed: Mutex::new(Projection::Nothing),
+            held: Mutex::new(GateHeld {
+                passed: Projection::Nothing,
+                pending: Projection::Nothing,
+            }),
         }))
     }
 
@@ -461,11 +473,9 @@ impl Notified {
                 if gate.everything.load(Ordering::Acquire) {
                     return false;
                 }
-                let mut passed = gate
-                    .passed
-                    .lock()
-                    .expect("a gate's region is never poisoned");
-                if gate.set.load(Ordering::Acquire) && region.contained_in(&passed) {
+                let mut held = gate.held.lock().expect("a gate's region is never poisoned");
+                let passed = &mut held.passed;
+                if gate.set.load(Ordering::Acquire) && region.contained_in(passed) {
                     return false;
                 }
                 // One operator's notifications are all regions of keys or all regions of fields,
@@ -489,6 +499,30 @@ impl Notified {
         }
     }
 
+    /// Record that a notification of `region` re-entered the consumer behind this gate while it
+    /// was being notified, for that notification to deliver when it returns
+    /// ([`take_pending`](Self::take_pending)). Only a gate holds regions.
+    pub fn defer(&self, region: &Projection) {
+        match self {
+            Self::Gate(gate) => {
+                let mut held = gate.held.lock().expect("a gate's region is never poisoned");
+                held.pending = held.pending.union(region);
+            }
+            _ => unreachable!("only a gate holds a region to deliver later"),
+        }
+    }
+
+    /// The regions [`defer`](Self::defer) recorded, and forget them: `Nothing` where none.
+    pub fn take_pending(&self) -> Projection {
+        match self {
+            Self::Gate(gate) => {
+                let mut held = gate.held.lock().expect("a gate's region is never poisoned");
+                std::mem::replace(&mut held.pending, Projection::Nothing)
+            }
+            _ => Projection::Nothing,
+        }
+    }
+
     /// Whether a notification of `region` would be suppressed now, without recording anything: for
     /// a gate, a notification has passed since the last pull and its region is inside what
     /// passed. `Always` covers every region, and a flag covers any while it is set.
@@ -497,11 +531,8 @@ impl Notified {
             Self::Always => true,
             Self::Flag(c) => c.load(Ordering::Acquire),
             Self::Gate(gate) => {
-                let passed = gate
-                    .passed
-                    .lock()
-                    .expect("a gate's region is never poisoned");
-                gate.set.load(Ordering::Acquire) && region.contained_in(&passed)
+                let held = gate.held.lock().expect("a gate's region is never poisoned");
+                gate.set.load(Ordering::Acquire) && region.contained_in(&held.passed)
             }
         }
     }
@@ -539,13 +570,10 @@ impl Notified {
             Self::Always => true,
             Self::Flag(c) => c.swap(false, Ordering::AcqRel),
             Self::Gate(gate) => {
-                let mut passed = gate
-                    .passed
-                    .lock()
-                    .expect("a gate's region is never poisoned");
+                let mut held = gate.held.lock().expect("a gate's region is never poisoned");
                 gate.everything.store(false, Ordering::Release);
                 let was_set = gate.set.swap(false, Ordering::AcqRel);
-                *passed = Projection::Nothing;
+                held.passed = Projection::Nothing;
                 was_set
             }
         }

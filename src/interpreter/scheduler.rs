@@ -67,8 +67,21 @@ impl Consumer for Gated {
             !self.region_driven || matches!(self.admit, Notified::Always),
             "a region-driven consumer has no gate, or a closed one would hold its regions back"
         );
-        if self.admit.mark_news_of(arrived) {
-            self.consumer.notify(arrived);
+        // A notification that re-enters this consumer while it is being notified cannot be
+        // delivered inside the first, so the forwarder leaves its region with the gate
+        // ([`Notified::defer`]) and the notification in progress delivers it when it returns,
+        // through the gate, until nothing is left. Only a region outside what the gate passed
+        // reaches the consumer, and the gate only grows until a pull, so a cycle of such
+        // notifications ends inside the one that started it.
+        let mut region = arrived.clone();
+        loop {
+            if self.admit.mark_news_of(&region) {
+                self.consumer.notify(&region);
+            }
+            region = self.admit.take_pending();
+            if region == Projection::Nothing {
+                break;
+            }
         }
     }
 
@@ -135,36 +148,27 @@ pub fn shared_consumer(consumer: Box<dyn Consumer>) -> (GatedConsumer, Gate) {
 /// The consumer forwards every notification as [`Projection::Everything`]: an input's keys say
 /// nothing of the operator's own unless the operator's outermost keys are its input's, which
 /// [`forwarding_consumer_keeping_keys`] is for.
-pub fn forwarding_consumer(shared: &GatedConsumer, wakeups: &WakeupQueue) -> Box<dyn Consumer> {
+pub fn forwarding_consumer(shared: &GatedConsumer) -> Box<dyn Consumer> {
     Box::new(Forwarding {
         gated: shared.clone(),
-        wakeups: wakeups.clone(),
         route: Route::Widen,
     })
 }
 
 /// [`forwarding_consumer`] for an input whose outermost keys are the operator's: its region is
 /// forwarded as it is.
-pub fn forwarding_consumer_keeping_keys(
-    shared: &GatedConsumer,
-    wakeups: &WakeupQueue,
-) -> Box<dyn Consumer> {
+pub fn forwarding_consumer_keeping_keys(shared: &GatedConsumer) -> Box<dyn Consumer> {
     Box::new(Forwarding {
         gated: shared.clone(),
-        wakeups: wakeups.clone(),
         route: Route::Keys,
     })
 }
 
 /// [`forwarding_consumer`] for an input that is a product the operator passes on: its region,
 /// including a region of fields, is forwarded as it is.
-pub fn forwarding_consumer_passing_regions(
-    shared: &GatedConsumer,
-    wakeups: &WakeupQueue,
-) -> Box<dyn Consumer> {
+pub fn forwarding_consumer_passing_regions(shared: &GatedConsumer) -> Box<dyn Consumer> {
     Box::new(Forwarding {
         gated: shared.clone(),
-        wakeups: wakeups.clone(),
         route: Route::Region,
     })
 }
@@ -203,13 +207,11 @@ impl Consumer for SelectingField {
 /// field.
 pub fn forwarding_consumer_into_field(
     shared: &GatedConsumer,
-    wakeups: &WakeupQueue,
     name: SmolStr,
     names: Arc<[SmolStr]>,
 ) -> Box<dyn Consumer> {
     Box::new(Forwarding {
         gated: shared.clone(),
-        wakeups: wakeups.clone(),
         route: Route::Field { name, names },
     })
 }
@@ -260,7 +262,6 @@ impl Consumer for Widening {
 /// What [`forwarding_consumer`] returns.
 struct Forwarding {
     gated: GatedConsumer,
-    wakeups: WakeupQueue,
     route: Route,
 }
 
@@ -296,8 +297,8 @@ impl Consumer for Forwarding {
             }
         };
         let region = &region;
-        // Dropping or deferring the notification of a consumer that never pulls would lose its
-        // region, so the forwarder waits for the cell. The notification graph of a region-driven
+        // Absorbing the notification of a consumer that never pulls into one in progress would
+        // leave its region to a notification that may never return to it, so the forwarder waits for the cell. The notification graph of a region-driven
         // chain is acyclic, so a cascade does not reach one cell twice, and a cell downstream of a
         // region-driven consumer is itself region-driven, so a thread that holds one such cell
         // waits only for cells further along. That orders the cells' locks and nothing else: the
@@ -307,28 +308,31 @@ impl Consumer for Forwarding {
             shared.lock_wait().notify(region);
             return;
         }
-        // A notification that re-enters a consumer already being notified is deferred to
-        // the next drain of the wakeup queue. A recurrence's notification graph is cyclic,
-        // and nesting closes a cycle through *two* inputs of one operator: the inner store
-        // sits downstream of the enclosing body and its read feeds back into it, so one
-        // upstream change reaches the body's `Zip` along both arms. Delivering the second
-        // inside the first would re-enter the consumer. Dropping it would lose a change the
-        // call in progress may already have pulled past: a cascade can contain a pull, and
-        // a wake after one carries what arrived too late for it. Deferred, it is delivered
-        // outside any cascade, where it cannot re-enter, and at worst wakes a consumer
-        // whose next pull finds nothing new. The deferred wake carries `Everything`, so a
-        // cycle goes around once more and the gate then covers what it carries.
-        //
-        // A re-entering notification whose region is inside what the gate passed is dropped
-        // instead: nothing has pulled the operator since, so what passed already says
-        // everything this would. Deferring it would deliver it again on the next drain, and
-        // around a cycle again on every poll after. A region outside it is not said by what
-        // passed: the notification in progress may be for another field of a record, which a
-        // consumer that selects this field would have dropped.
+        // A notification that re-enters a consumer already being notified is absorbed into
+        // the one in progress. A recurrence's notification graph is cyclic, and nesting closes a
+        // cycle through *two* inputs of one operator: the inner store sits downstream of the
+        // enclosing body and its read feeds back into it, so one upstream change reaches the
+        // body's `Zip` along both arms. Delivering the second inside the first would re-enter
+        // the consumer, and dropping it would lose a change the call in progress may already
+        // have pulled past: a cascade can contain a pull, and a wake after one carries what
+        // arrived too late for it. So the region is left with the gate, and the notification in
+        // progress delivers it through the gate when it returns ([`Gated`]): a region inside
+        // what passed is suppressed there, which is what ends the cycle, and one outside it,
+        // as the region of another field of a record is, reaches the consumer. No wake is
+        // queued and no pull is needed.
         match shared.try_lock_now() {
             Some(mut consumer) => consumer.notify(region),
-            None if gate.covers(region) => {}
-            None => self.wakeups.request(shared.clone()),
+            None => {
+                gate.defer(region);
+                // The cell may have been released since, by a notification that had already
+                // looked for what was pending: deliver it here, through the gate.
+                if let Some(mut consumer) = shared.try_lock_now() {
+                    let pending = gate.take_pending();
+                    if pending != Projection::Nothing {
+                        consumer.notify(&pending);
+                    }
+                }
+            }
         }
     }
 
@@ -800,7 +804,8 @@ fn pull_counts(
 ///
 /// A gate closes when a notification passes and opens when the operator is pulled, so it rests
 /// on a rule nothing else checks: a consumer woken by an operator pulls that operator. While it
-/// has not, every later notification from the operator's inputs is dropped. A consumer that no
+/// has not, every later notification from the operator's inputs whose region is inside what
+/// passed is suppressed. A consumer that no
 /// longer reads the operator owes it nothing (a finished read, a settled seed, a recurrence
 /// whose last reader retired), so only one still pulled counts, and an operator released whole
 /// is never pulled again.
@@ -866,7 +871,7 @@ mod tests {
     fn a_consumer_that_never_pulls_is_not_gated() {
         let (log, regions) = RegionLog::new(true);
         let (gated, _gate) = shared_consumer(Box::new(log));
-        let mut input = forwarding_consumer_keeping_keys(&gated, &WakeupQueue::default());
+        let mut input = forwarding_consumer_keeping_keys(&gated);
         assert!(input.region_driven());
         for region in [keys(0, 3), keys(4, 7), keys(8, 9)] {
             input.notify(&region);
@@ -879,9 +884,8 @@ mod tests {
     fn a_forwarder_sends_everything_unless_it_keeps_keys() {
         let (log, regions) = RegionLog::new(true);
         let (gated, _gate) = shared_consumer(Box::new(log));
-        let wakeups = WakeupQueue::default();
-        forwarding_consumer(&gated, &wakeups).notify(&keys(2, 4));
-        forwarding_consumer_keeping_keys(&gated, &wakeups).notify(&keys(2, 4));
+        forwarding_consumer(&gated).notify(&keys(2, 4));
+        forwarding_consumer_keeping_keys(&gated).notify(&keys(2, 4));
         assert_eq!(*regions.lock_now(), [Projection::Everything, keys(2, 4)]);
     }
 
@@ -945,10 +949,9 @@ mod tests {
     fn a_forwarder_that_keeps_keys_widens_a_region_of_fields() {
         let (log, regions) = RegionLog::new(true);
         let (gated, gate) = shared_consumer(Box::new(log));
-        let wakeups = WakeupQueue::default();
-        forwarding_consumer_keeping_keys(&gated, &wakeups).notify(&fields_of(keys(2, 4)));
+        forwarding_consumer_keeping_keys(&gated).notify(&fields_of(keys(2, 4)));
         assert!(gate.0.take());
-        forwarding_consumer_keeping_keys(&gated, &wakeups).notify(&keys(2, 4));
+        forwarding_consumer_keeping_keys(&gated).notify(&keys(2, 4));
         assert_eq!(*regions.lock_now(), [Projection::Everything, keys(2, 4)]);
     }
 
@@ -1039,9 +1042,8 @@ mod tests {
     }
 
     /// A record's gate that has passed every field's region as everything holds everything, so a
-    /// later notification of everything, such as the wake a cycle defers, is suppressed. Without
-    /// the record's names the held regions never added up to everything, and that wake passed and
-    /// went around again.
+    /// later notification of everything, such as one a cycle brings around, is suppressed. Without
+    /// the record's names the held regions never added up to everything, and it passed.
     #[test]
     fn a_gate_that_passed_every_field_as_everything_suppresses_a_later_everything() {
         let all = ["a", "b", "c"];
@@ -1065,12 +1067,9 @@ mod tests {
         let names: Arc<[SmolStr]> = vec![SmolStr::new("_0"), SmolStr::new("_1")].into();
         let (log, regions) = RegionLog::new(false);
         let (shared, _gate) = shared_consumer(keys_only(Box::new(log)));
-        let queue = WakeupQueue::default();
         let mut inputs: Vec<Box<dyn Consumer>> = names
             .iter()
-            .map(|name| {
-                forwarding_consumer_into_field(&shared, &queue, name.clone(), names.clone())
-            })
+            .map(|name| forwarding_consumer_into_field(&shared, name.clone(), names.clone()))
             .collect();
         for _round in 0..3 {
             for input in &mut inputs {
@@ -1113,7 +1112,7 @@ mod tests {
     fn a_keeping_forwarder_passes_each_region_unchanged() {
         let (log, regions) = RegionLog::new(true);
         let (gated, gate) = shared_consumer(Box::new(log));
-        let mut input = forwarding_consumer_keeping_keys(&gated, &WakeupQueue::default());
+        let mut input = forwarding_consumer_keeping_keys(&gated);
         let sent = [keys(2, 4), Projection::Everything, keys(6, 7)];
         for region in &sent {
             input.notify(region);
@@ -1201,8 +1200,8 @@ mod tests {
         });
         let shared = GatedConsumer::new(downstream, gate);
         let mut scheduler = Scheduler::new();
-        let mut arm_a = forwarding_consumer(&shared, &scheduler.wakeup_queue());
-        *feedback.lock_now() = Some(forwarding_consumer(&shared, &scheduler.wakeup_queue()));
+        let mut arm_a = forwarding_consumer(&shared);
+        *feedback.lock_now() = Some(forwarding_consumer(&shared));
         arm_a.notify(&Projection::Everything);
         scheduler.check_for_notifications();
         assert_eq!(
@@ -1220,9 +1219,8 @@ mod tests {
         let notified = Arc::new(SyncCell::new(0u32));
         let n = notified.clone();
         let (shared, gate) = shared_consumer(Box::new(move || n.set(n.get() + 1)));
-        let scheduler = Scheduler::new();
-        let mut arm_a = forwarding_consumer(&shared, &scheduler.wakeup_queue());
-        let mut arm_b = forwarding_consumer(&shared, &scheduler.wakeup_queue());
+        let mut arm_a = forwarding_consumer(&shared);
+        let mut arm_b = forwarding_consumer(&shared);
         arm_a.notify(&Projection::Everything);
         arm_b.notify(&Projection::Everything);
         assert_eq!(
@@ -1241,10 +1239,10 @@ mod tests {
     }
 
     /// A notification that comes back around a cycle into the consumer it started from, with
-    /// nothing pulled since, is dropped rather than deferred: the one in progress already says
-    /// everything it would, and a deferred copy would go around again on every poll.
+    /// nothing pulled since, is absorbed into the one in progress and suppressed there: the one in
+    /// progress already says everything it would, and nothing is queued to go around again.
     #[test]
-    fn a_reentrant_wake_with_no_pull_since_is_dropped() {
+    fn a_reentrant_wake_with_no_pull_since_is_absorbed_and_suppressed() {
         use crate::interpreter::SyncCell;
         let notified = Arc::new(SyncCell::new(0u32));
         let feedback: Arc<Mutex<Option<Box<dyn Consumer>>>> = Arc::new(Mutex::new(None));
@@ -1260,12 +1258,12 @@ mod tests {
         // Nothing pulls the operator here, so its gate is never cleared.
         let (shared, _gate) = shared_consumer(downstream);
         let mut scheduler = Scheduler::new();
-        let mut arm_a = forwarding_consumer(&shared, &scheduler.wakeup_queue());
-        *feedback.lock_now() = Some(forwarding_consumer(&shared, &scheduler.wakeup_queue()));
+        let mut arm_a = forwarding_consumer(&shared);
+        *feedback.lock_now() = Some(forwarding_consumer(&shared));
         arm_a.notify(&Projection::Everything);
         assert!(
             scheduler.wakeups.is_empty(),
-            "the re-entrant notification was deferred"
+            "the re-entrant notification queued a wake"
         );
         scheduler.check_for_notifications();
         assert_eq!(notified.get(), 1);
@@ -1304,133 +1302,94 @@ mod tests {
     }
 
     /// A cycle reaches both inputs of a `MakeRecord`: the region of field `a` passes, and the
-    /// region of field `b` that re-enters inside it is outside what passed, so it is deferred and
-    /// reaches a consumer that selects `b`.
+    /// region of field `b` that re-enters inside it is outside what passed, so the notification in
+    /// progress delivers it when it returns, and a consumer that selects `b` hears it.
     #[test]
     fn a_reentrant_region_of_another_field_is_not_lost() {
         let names: Arc<[SmolStr]> = vec![SmolStr::new("a"), SmolStr::new("b")].into();
         let of = |name: &str| Projection::field_of(&["a", "b"], name, keys(1, 2));
         let (downstream, log, arm) = reentering(keys(1, 2));
         let (shared, _gate) = shared_consumer(downstream);
-        let mut scheduler = Scheduler::new();
-        let mut input_a = forwarding_consumer_into_field(
-            &shared,
-            &scheduler.wakeup_queue(),
-            SmolStr::new("a"),
-            names.clone(),
-        );
+        let mut input_a = forwarding_consumer_into_field(&shared, SmolStr::new("a"), names.clone());
         *arm.lock_now() = Some(forwarding_consumer_into_field(
             &shared,
-            &scheduler.wakeup_queue(),
             SmolStr::new("b"),
             names,
         ));
         input_a.notify(&keys(1, 2));
-        assert_eq!(*log.lock_now(), [of("a")]);
-        scheduler.check_for_notifications();
         assert_eq!(
             *log.lock_now(),
-            [of("a"), Projection::Everything],
-            "the re-entrant region of `b` was lost"
+            [of("a"), of("b")],
+            "the re-entrant region of `b` was lost or came late"
         );
     }
 
-    /// The deferred wake carries `Everything`, which the gate then covers, so a cycle that keeps
-    /// re-entering goes around once more and stops.
+    /// A consumer that re-enters the cell it is inside every time it is notified: the region the
+    /// gate passed covers what the next one carries, so the cycle ends inside the notification
+    /// that started it, with no wake queued, and a later pull opens the gate again.
     #[test]
-    fn a_cycle_that_keeps_reentering_stops_after_one_more_lap() {
+    fn a_cycle_that_keeps_reentering_ends_inside_the_notification_that_started_it() {
         let names: Arc<[SmolStr]> = vec![SmolStr::new("a"), SmolStr::new("b")].into();
         let (downstream, log, arm) = reentering(keys(1, 2));
-        let (shared, _gate) = shared_consumer(downstream);
+        let (shared, gate) = shared_consumer(downstream);
         let mut scheduler = Scheduler::new();
-        let mut input_a = forwarding_consumer_into_field(
-            &shared,
-            &scheduler.wakeup_queue(),
-            SmolStr::new("a"),
-            names.clone(),
-        );
+        let mut input_a = forwarding_consumer_into_field(&shared, SmolStr::new("a"), names.clone());
         *arm.lock_now() = Some(forwarding_consumer_into_field(
             &shared,
-            &scheduler.wakeup_queue(),
             SmolStr::new("b"),
             names,
         ));
         input_a.notify(&keys(1, 2));
         for _ in 0..5 {
             scheduler.check_for_notifications();
+            gate.0.take();
         }
         assert_eq!(log.lock_now().len(), 2, "{:?}", log.lock_now());
         assert!(scheduler.wakeups.is_empty());
     }
 
-    /// A notifier writes data and notifies the gate twice in a row; a puller wakes when a
-    /// notification passed, takes the gate and then reads. The second notification arrives as
-    /// the pull of the first begins, so the gate passes it or the pull reads what it announced.
-    /// A gate that dropped it after the pull began leaves the second write unread, and the
-    /// notifier waits for it until the test gives up.
+    /// Two records on crossing cycles: `G` has fields `c`, `d`, and `H` has `a`, `b`. What is
+    /// notified behind `G` notifies `G.d` and then `H.a`, and what is notified behind `H`
+    /// notifies `H.b` and then `G.c`. A notification of `G.c` ends after a bounded number of
+    /// notifications of each, with nothing queued, however many times the gates are pulled and
+    /// the scheduler polled.
     #[test]
-    fn a_notification_sent_while_a_pull_begins_is_never_lost() {
-        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        use std::time::{Duration, Instant};
-        const PAIRS: usize = 3_000;
-        let gate = Notified::clear();
-        let data = AtomicUsize::new(0);
-        let seen = AtomicUsize::new(0);
-        let wake = AtomicBool::new(false);
-        let finished = AtomicBool::new(false);
-        let lost = AtomicBool::new(false);
-        let pulls_begun = AtomicUsize::new(0);
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                'pairs: for pair in 0..PAIRS {
-                    for write in [2 * pair + 1, 2 * pair + 2] {
-                        // The second notification waits for the pull of the first to begin.
-                        while write % 2 == 0 && pulls_begun.load(Ordering::SeqCst) <= pair {
-                            std::hint::spin_loop();
+    fn two_records_on_crossing_cycles_settle_inside_one_notification() {
+        type Arms = Arc<Mutex<Vec<Box<dyn Consumer>>>>;
+        let g_names: Arc<[SmolStr]> = vec![SmolStr::new("c"), SmolStr::new("d")].into();
+        let h_names: Arc<[SmolStr]> = vec![SmolStr::new("a"), SmolStr::new("b")].into();
+        let counts: Arc<Mutex<(usize, usize)>> = Arc::default();
+        let (g_arms, h_arms): (Arms, Arms) = (Arc::default(), Arc::default());
+        let tap =
+            |arms: Arms, count: fn(&mut (usize, usize)), counts: Arc<Mutex<(usize, usize)>>| {
+                let consumer: Box<dyn Consumer> =
+                    Box::new(RegionTap(Box::new(move |_: &Projection| {
+                        count(&mut counts.lock_now());
+                        for arm in arms.lock_now().iter_mut() {
+                            arm.notify(&keys(1, 2));
                         }
-                        data.store(write, Ordering::SeqCst);
-                        if gate.mark_news_of(&Projection::Everything) {
-                            wake.store(true, Ordering::SeqCst);
-                        }
-                    }
-                    let deadline = Instant::now() + Duration::from_secs(2);
-                    while seen.load(Ordering::SeqCst) < 2 * pair + 2 {
-                        if Instant::now() > deadline {
-                            lost.store(true, Ordering::SeqCst);
-                            break 'pairs;
-                        }
-                        std::hint::spin_loop();
-                    }
-                }
-                finished.store(true, Ordering::SeqCst);
-            });
-            scope.spawn(|| {
-                while !finished.load(Ordering::SeqCst) && !lost.load(Ordering::SeqCst) {
-                    if wake.swap(false, Ordering::SeqCst) {
-                        pulls_begun.fetch_add(1, Ordering::SeqCst);
-                        gate.take();
-                        seen.store(data.load(Ordering::SeqCst), Ordering::SeqCst);
-                    }
-                    std::hint::spin_loop();
-                }
-            });
-        });
-        assert!(
-            !lost.load(Ordering::SeqCst),
-            "a notification sent as a pull began was dropped"
-        );
-    }
-
-    /// After a pull resets the gate, a region outside what passed before it passes, and one inside
-    /// what passed since is suppressed.
-    #[test]
-    fn a_pull_leaves_the_gate_holding_nothing() {
-        let gate = Notified::clear();
-        assert!(gate.mark_news_of(&keys(1, 4)));
-        assert!(gate.take());
-        assert!(gate.mark_news_of(&keys(6, 6)));
-        assert!(gate.mark_news_of(&keys(2, 3)));
-        assert!(!gate.mark_news_of(&keys(6, 6)));
+                    })));
+                consumer
+            };
+        let (g_shared, g_gate) = shared_consumer(tap(g_arms.clone(), |c| c.0 += 1, counts.clone()));
+        let (h_shared, h_gate) = shared_consumer(tap(h_arms.clone(), |c| c.1 += 1, counts.clone()));
+        let arm = |shared: &GatedConsumer, name: &str, names: &Arc<[SmolStr]>| {
+            forwarding_consumer_into_field(shared, SmolStr::new(name), names.clone())
+        };
+        // G's downstream notifies G.d then H.a; H's notifies H.b then G.c.
+        *g_arms.lock_now() = vec![arm(&g_shared, "d", &g_names), arm(&h_shared, "a", &h_names)];
+        *h_arms.lock_now() = vec![arm(&h_shared, "b", &h_names), arm(&g_shared, "c", &g_names)];
+        let mut seed = arm(&g_shared, "c", &g_names);
+        seed.notify(&keys(1, 2));
+        let mut scheduler = Scheduler::new();
+        for _ in 0..20 {
+            scheduler.check_for_notifications();
+            g_gate.0.take();
+            h_gate.0.take();
+        }
+        let (g, h) = *counts.lock_now();
+        assert_eq!((g, h), (2, 2), "G and H were notified this many times");
+        assert!(scheduler.wakeups.is_empty());
     }
 
     /// A pull that answers what the last one did but queues a wakeup is not quiescence: the

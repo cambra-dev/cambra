@@ -4801,7 +4801,7 @@ fn subscribe_driver_inputs(
     let source_news = Notified::flag();
     let source_producer = source_op.subscribe(
         source_op.tiling().universal_guard(),
-        source_news.consumer(forwarding_consumer(&consumer, &scheduler.wakeup_queue())),
+        source_news.consumer(forwarding_consumer(&consumer)),
         scheduler,
     );
     // The store's progress changes what the drive renders — the next position it may

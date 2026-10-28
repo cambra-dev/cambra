@@ -119,11 +119,12 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
     ("src/interpreter/tile_operators/mod.rs", "ambient mutable state"),
-    # A notification gate's held region: the union of the regions its notifications passed since
-    # the last pull. A region is an interval set or a map by field, which has no atomic form, and
-    # the cell names keys and fields, never a tile; only the gate's own notifications and pulls
-    # touch it, so it carries nothing from one operator to another.
-    ("src/interpreter/tile_operators/mod.rs", "cell of `Projection`"),
+    # A notification gate's held regions: the union of the regions its notifications passed since
+    # the last pull, and the regions of notifications that re-entered its consumer, which the
+    # notification in progress delivers. A region is an interval set or a map by field, which has
+    # no atomic form, and the cell names keys and fields, never a tile; only the gate's own
+    # notifications and pulls touch it, so it carries nothing from one operator to another.
+    ("src/interpreter/tile_operators/mod.rs", "cell of `GateHeld`"),
     ("src/interpreter/types/extent.rs", "shared cell of `Restriction`"),
     ("src/interpreter/types/extent.rs", "shared cell of `Restriction`"),
     # The probe slot. Shared because the driver reads one table while every

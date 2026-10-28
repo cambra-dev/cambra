@@ -763,12 +763,7 @@ impl TileOperator for MakeRecord {
                 .map(|(input, name)| {
                     input.subscribe(
                         input.tiling().universal_guard(),
-                        forwarding_consumer_into_field(
-                            &shared,
-                            &scheduler.wakeup_queue(),
-                            name.clone(),
-                            names.clone(),
-                        ),
+                        forwarding_consumer_into_field(&shared, name.clone(), names.clone()),
                         scheduler,
                     )
                 })
