@@ -666,12 +666,13 @@ The projection table ([Projection guards](#projection-guards)), the release rule
 contract](#the-notification-contract)) each state a fact about 𝑅. Keeping keys is the identity
 translation, and widening is the top element, `Everything`.
 
-**Not implemented.** A region payload is path-qualified like a guard (`TileGuard::Record`) for a
-product: `MakeRecord` notifies `Projection::Fields`, and `SelectField` over a product, `Memo` and
-`FanOutSlot` act on one. Every other operator that keeps keys widens a region of fields. The rename
-of `PermuteRecordDomain` and the re-keying of `FlattenTupleDomain` are exact translations that are
-missing: they widen. A field's region names the outermost keys of the field, and a region of the
-groups beneath them is not spelled.
+A region payload is path-qualified like a guard (`TileGuard::Record`) for a product: `MakeRecord`
+notifies `Projection::Fields`, `SelectField` over a product, `Memo` and `FanOutSlot` act on one, and
+every other operator that keeps keys widens it.
+
+**Not implemented.** The rename of `PermuteRecordDomain` and the re-keying of `FlattenTupleDomain`
+are exact translations that are missing: they widen. A field's region names the outermost keys of
+the field, and a region of the groups beneath them is not spelled.
 
 ## The notification contract
 
@@ -721,7 +722,7 @@ depends on the input's shape, the operator decides from its tiling when it subsc
 | `CheckedLookup` | one key | widens | One key has no keys to project. |
 | `CheckedLookup` | the collection | widens | Every key is answered against all of it. |
 | `Memo` | the input | keeps, and passes a region of fields | Read at the projection, and its keys are the input's. A product is the same product, so a region of its fields is the memo's. |
-| `FanOutSlot` | the shared input | keeps, and passes a region of fields | The fan-out forwards the input's region to every live slot, a region of fields included. It passes one notification between pulls and drops the next with its region, which a slot consumer that pulls does not need: its pull reads whatever arrived. A consumer that needs every region cannot sit behind a fan-out, and the worker pool's plan refuses a chain with one (`plan_main`). |
+| `FanOutSlot` | the shared input | keeps, and passes a region of fields | The fan-out forwards the input's region to every live slot, a region of fields included. Its gate suppresses a notification whose region is inside what passed since the last pull, which a slot consumer that pulls does not need: its pull reads whatever arrived. A consumer that needs every region cannot sit behind a fan-out, and the worker pool's plan refuses a chain with one (`plan_main`). |
 | `ExtractFinal`, `PermuteRecordDomain`, `FlattenTupleDomain` | the input | widens | Read whole; the keys are re-keyed or the last position. |
 | `Aggregate`, `ExtractAggregate` | the input | widens | The accumulator has no keys. |
 | `MapAggregate`, `MapExtractAggregate` | the input | keeps | The groups keep the input's outermost keys. |

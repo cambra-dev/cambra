@@ -735,7 +735,8 @@ fn fan_out_slot(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator>
     FanOut::new(inputs.remove(0)).slot()
 }
 
-/// The fan-out passes its input's region to a slot, one notification between pulls.
+/// The fan-out passes its input's region to a slot, and suppresses one inside what passed since
+/// the last pull.
 #[test]
 fn a_fan_out_slot_notifies_exactly_what_its_input_changed_over_growth() {
     check(&fan_out_slot, Values::Ints, Expect::Exact);

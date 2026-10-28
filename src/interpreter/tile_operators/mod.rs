@@ -443,8 +443,9 @@ impl Notified {
         }))
     }
 
-    /// Record that the input has new data, and say whether that is news: the flag was clear.
-    /// `Always` is always news.
+    /// Record that the input has new data, and say whether that is news: for a gate, unless a
+    /// notification of `Everything` has passed since the last pull, which is
+    /// [`mark_news_of`](Self::mark_news_of) for `Everything`. `Always` is always news.
     pub fn mark_news(&self) -> bool {
         self.mark_news_of(&Projection::Everything)
     }

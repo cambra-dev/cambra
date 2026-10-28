@@ -35,7 +35,7 @@ fn another_region() -> Projection {
 }
 
 /// What a recording consumer of the operator `build` makes receives when `region` is notified at
-/// its input `notified`. A consumer passes one notification between pulls, so each call builds an
+/// its input `notified`. A gate suppresses a notification inside what passed since the last pull, so each call builds an
 /// operator of its own.
 fn received(build: &dyn Fn() -> Built, notified: usize, region: &Projection) -> Vec<Projection> {
     let (mut operator, inputs) = build();

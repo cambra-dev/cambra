@@ -16,16 +16,17 @@ use crate::interpreter::{
 /// It carries notifications, not tile data.
 pub type SharedConsumer = Arc<Mutex<dyn Consumer>>;
 
-/// One operator's consumer, shared between its inputs, behind a gate: a [`Notified`] flag
-/// set when a notification passes and cleared when the operator is pulled.
+/// One operator's consumer, shared between its inputs, behind a gate: a [`Notified`] that holds
+/// the regions the notifications it passed named, and is cleared when the operator is pulled.
 ///
-/// A notification carries no payload, so a second one that arrives before the operator has
-/// been pulled says nothing the first did not: the first has already reached every consumer
-/// downstream, and none of them has read this operator since. Without the gate a change
-/// reaches a sink once per path where notification paths branch and merge, and around a
-/// cycle it never stops. A pull clears it whether or not it reads the input that notified,
-/// since a consumer pulling the operator is what the notification asked for
-/// (`src/interpreter/design-operators.md`, "The notification contract").
+/// A notification whose region is inside what already passed says nothing the first did not: the
+/// first has already reached every consumer downstream, and none of them has read this operator
+/// since. Without the gate a change reaches a sink once per path where notification paths branch
+/// and merge, and around a cycle it never stops. A region outside what passed is news, so a
+/// notification for another part of the input is not lost behind one nobody pulled for. A pull
+/// clears it whether or not it reads the input that notified, since a consumer pulling the
+/// operator is what the notification asked for (`src/interpreter/design-operators.md`, "The
+/// notification contract").
 #[derive(Clone)]
 pub struct GatedConsumer {
     shared: SharedConsumer,
@@ -834,7 +835,7 @@ mod tests {
         Projection::of(&keys_between(first, last)).expect("keys name a projection")
     }
 
-    /// A consumer that pulls gets one notification between pulls, and the closed gate delivers
+    /// A consumer that pulls is not notified of a region inside what passed since its last pull, and the closed gate delivers
     /// no region after it.
     #[test]
     fn a_closed_gate_passes_one_notification_to_a_consumer_that_pulls() {
