@@ -71,11 +71,12 @@ impl fmt::Display for Unsupported {
     }
 }
 
-/// The pipeline shape the plan admits: any number of `MapResult`s whose function operand is a
-/// `Constant`, over an `IterateExtent`, into the breaker. Every operator in the chain is
-/// streaming, so a worker's chain holds no state between morsels. Which rows the source
-/// enumerates, and whether it can be cut into morsels, is the source's to say
-/// ([`TileOperator::morsel_source`]).
+/// The pipeline shape the plan admits: any number of `MapResult`s, each applying a `Constant`
+/// function operand to its input, and `MapResultWithSource`s, each reading a source's value at the
+/// keys of an `IterateExtent` directly beneath it, over an `IterateExtent`, into the breaker.
+/// Every operator in the chain is streaming, so a worker's chain holds no state between morsels.
+/// Which rows the source enumerates, and whether it can be cut into morsels, is the source's to
+/// say ([`TileOperator::morsel_source`]).
 pub struct MainPipeline {
     /// What the chain ends in.
     pub breaker: Breaker,
@@ -181,6 +182,42 @@ pub fn plan_main(graph: &OperatorGraph) -> Result<MainPipeline, Unsupported> {
                 }
                 at = data.subscribed;
             }
+            // Reads a source's value at each key of its input: the keys are the input's, so the
+            // chain streams.
+            Some(GraphNode::Operator {
+                kind: "MapResultWithSource",
+                inputs,
+                ..
+            }) => {
+                let [input] = inputs.as_slice() else {
+                    return Err(Unsupported(
+                        "a `MapResultWithSource` without its one input".into(),
+                    ));
+                };
+                if !matches!(input.kind, EdgeKind::Value { deferred: false }) {
+                    return Err(Unsupported(
+                        "the chain closes a cycle or reads a shared node".into(),
+                    ));
+                }
+                // It releases its source by correlating the keys it is released at with the
+                // keys it reads, which only an `IterateExtent` beneath it states: over any other
+                // input it releases the source on a universal guard alone, and the pool releases
+                // morsels.
+                if !matches!(
+                    by_id.get(&input.subscribed),
+                    Some(GraphNode::Operator {
+                        kind: "IterateExtent",
+                        ..
+                    })
+                ) {
+                    return Err(Unsupported(
+                        "a `MapResultWithSource` reads a source's value at the keys of an \
+                         `IterateExtent` only"
+                            .into(),
+                    ));
+                }
+                at = input.subscribed;
+            }
             Some(GraphNode::Operator {
                 kind: "IterateExtent",
                 ..
@@ -224,6 +261,18 @@ pub fn run_main_holding(
     program: &mut CompiledProgram,
     main_producer: &mut Option<Box<dyn TileProducer>>,
     config: &Config,
+) -> Result<Tile, Unsupported> {
+    run_main_delivering(ctx, program, main_producer, config, None)
+}
+
+/// [`run_main_holding`] for a program over a live source: `delivery` runs on the calling thread
+/// while the workers run, and is how the source's arrivals reach the pipeline.
+pub(crate) fn run_main_delivering(
+    ctx: &mut GlobalContext,
+    program: &mut CompiledProgram,
+    main_producer: &mut Option<Box<dyn TileProducer>>,
+    config: &Config,
+    delivery: Option<DeliveringThread<'_>>,
 ) -> Result<Tile, Unsupported> {
     let pipeline = plan_main(&program.operator_graph)?;
     let output = program
@@ -269,15 +318,17 @@ pub fn run_main_holding(
         source,
         breaker,
         config,
-        None,
+        delivery,
     ))
 }
 
-/// The thread that delivers a live source's arrivals while the workers run: called once, on a
-/// thread of its own, with the handle that publishes a region to the pipeline's source. It stands
-/// in for the thread that reads the source's input. It publishes nothing once it returns, so
-/// `run_pipeline` closes the pipeline's source then.
-type DeliveringThread<'a> = Box<dyn FnOnce(PipelineHandle) + Send + 'a>;
+/// What delivers a live source's arrivals while the workers run: called once, on the calling
+/// thread, with the handle that publishes a region to the pipeline's source and the scheduler the
+/// chains were subscribed with. It stands in for the thread that reads the source's input: it
+/// writes rows to the source and tells the scheduler, whose `check_for_notifications` polls the
+/// source and notifies the consumers registered for it, which reach the pipeline's head. It
+/// publishes nothing once it returns, so `run_pipeline` closes the pipeline's source then.
+pub(crate) type DeliveringThread<'a> = Box<dyn FnOnce(PipelineHandle, &mut Scheduler) + 'a>;
 
 /// Run the plan's one pipeline: `config.threads` workers each pull their own subscription of
 /// `chain_op` at the morsels `source` hands out and feed `breaker`. The result is what the
@@ -286,7 +337,7 @@ type DeliveringThread<'a> = Box<dyn FnOnce(PipelineHandle) + Send + 'a>;
 /// With a `delivery` the pipeline's head is notified through a [`PipelineConsumer`]: an arrival
 /// a notification carries is published to `source` and wakes a parked worker. When `delivery`
 /// returns, `run_pipeline` closes the source, and the pipeline finishes once the workers have
-/// claimed everything.
+/// claimed everything. Without one the source holds every row it will, and it is closed at once.
 fn run_pipeline(
     scheduler: &mut Scheduler,
     chain_op: &mut dyn TileOperator,
@@ -330,24 +381,28 @@ fn run_pipeline(
                 })
                 .collect()
         });
+    // What the source holds when the pool starts is claimable: nothing notifies of rows that
+    // arrived before the chains were subscribed, and a source's own subscription notification
+    // reaches only worker 0's head and says nothing of them. Without a delivery no row arrives
+    // later, so the source closes now.
+    handle.publish(&Projection::Everything);
+    if delivery.is_none() {
+        handle.close();
+    }
     // The chains are lent to the workers and dropped here, after the scope, one at a time:
     // a producer's drop detaches its probe with a lock that must not find the probe table
     // held by another worker's `get`.
     std::thread::scope(|scope| {
-        // Armed before the first spawn: a spawn that panics stops the workers already running
-        // from claiming further morsels.
+        // Armed before the first spawn: a spawn that panics, or a delivery that does, stops the
+        // workers already running from claiming further morsels.
         let _fail = FailOnUnwind(&dispatcher);
-        if let Some(delivery) = delivery {
-            let (dispatcher, handle) = (&dispatcher, handle.clone());
-            scope.spawn(move || {
-                let _fail = FailOnUnwind(dispatcher);
-                delivery(handle.clone());
-                handle.close();
-            });
-        }
         for worker_chains in chains.iter_mut() {
             let (dispatcher, breaker) = (&dispatcher, &breaker);
             scope.spawn(move || run_worker(worker_chains, dispatcher, breaker));
+        }
+        if let Some(delivery) = delivery {
+            delivery(handle.clone(), scheduler);
+            handle.close();
         }
     });
     drop(chains);
@@ -368,7 +423,7 @@ fn pool_release_identity() -> String {
 /// What delivers to one pipeline of a [`Dispatcher`]: a region of arrived keys, and the end of
 /// arrivals.
 #[derive(Clone)]
-struct PipelineHandle {
+pub(crate) struct PipelineHandle {
     dispatcher: Arc<Dispatcher>,
     pipeline: PipelineId,
 }
@@ -740,9 +795,9 @@ impl Dispatcher {
     /// The keys `arrived` have been added to the pipeline's source: unite the region into what
     /// the source can hand out, and wake the workers parked for want of a morsel.
     ///
-    /// The caller has written the rows and made their positions ready before it calls, and holds
+    /// The caller has written the rows and made their keys ready before it calls, and holds
     /// no lock this call takes: the pipeline's early state, the source's state, the lock the
-    /// source's ready-positions function reads, and the lock that parks idle workers. The source
+    /// source's yield-predicate function reads, and the lock that parks idle workers. The source
     /// takes the region under its own lock, and the epoch moves after that, so a worker that finds
     /// no morsel in its claim read the epoch before the move and its park returns at once.
     fn publish(&self, pipeline: PipelineId, arrived: &Projection) {
@@ -970,12 +1025,11 @@ mod live_tests;
 mod tests {
     use super::*;
     use crate::interpreter::tile_operators::{
-        IterateExtent, LiveSource, RangeSource, union_of, zip_arms_at,
+        IterateExtent, LiveSource, RangeSource, uint_keys_in, uint_range, zip_arms_at,
     };
     use crate::interpreter::{BaseType, CurryLevel, Extent};
     use crate::interpreter::{FunctionGuard, Value};
     use intervalsets::Bounding;
-    use intervalsets::{Interval, IntervalSet};
     use std::collections::BTreeSet;
     use std::sync::mpsc;
     use std::time::Duration;
@@ -1265,40 +1319,38 @@ mod tests {
         }
     }
 
-    /// The positions that have ready at a live source, which the test advances.
-    type Ready = Arc<Mutex<IntervalSet<u64>>>;
+    /// The positions that are ready at a live source, which the test advances.
+    struct ReadyPositions {
+        ready: Mutex<Predicate>,
+        next: AtomicU64,
+    }
 
-    /// A live source over the positions that have ready, as a pipeline's source.
+    type Ready = Arc<ReadyPositions>;
+
+    /// A live source over the positions that are ready, as a pipeline's source.
     fn live_source() -> (Arc<LiveSource>, Ready) {
-        let ready: Ready = Arc::new(Mutex::new(IntervalSet::from(Interval::<u64>::empty())));
+        let ready = Arc::new(ReadyPositions {
+            ready: Mutex::new(Predicate::False),
+            next: AtomicU64::new(0),
+        });
         let read = ready.clone();
-        let source = Arc::new(LiveSource::new(move || read.lock_wait().clone()));
+        let source = Arc::new(LiveSource::new(
+            move || read.ready.lock_wait().clone(),
+            uint_keys_in,
+        ));
         (source, ready)
     }
 
     /// `count` positions arrive after the ones that did and are published to `pipeline`, as the
     /// delivering thread does: the rows first, then the region.
     fn arrive(dispatcher: &Dispatcher, pipeline: PipelineId, ready: &Ready, count: u64) {
-        let first = {
-            let mut set = ready.lock_wait();
-            let first = set
-                .intervals()
-                .last()
-                .and_then(|last| last.rval().copied())
-                .map_or(0, |last| last + 1);
-            *set = union_of(
-                &set,
-                &IntervalSet::from(Interval::closed(first, first + count - 1)),
-            );
-            first
-        };
-        let region = TileGuard::Function(FunctionGuard::Domain(Predicate::intervals(
-            IntervalSet::from(Interval::closed(
-                Value::UInt(first),
-                Value::UInt(first + count - 1),
-            )),
-        )));
-        dispatcher.publish(pipeline, &Projection::of(&region).expect("keys"));
+        let first = ready.next.fetch_add(count, Ordering::AcqRel);
+        let region = uint_range(first, first + count - 1);
+        {
+            let mut all = ready.ready.lock_wait();
+            *all = all.union(&region);
+        }
+        dispatcher.publish(pipeline, &Projection::admitting(region));
     }
 
     fn live_dispatcher(source: &Arc<LiveSource>, morsel_rows: u64) -> Dispatcher {
@@ -1391,9 +1443,9 @@ mod tests {
     fn an_everything_published_before_the_pipeline_starts_covers_what_is_ready_by_then() {
         let (source, ready) = live_source();
         let dispatcher = live_behind_another(&source, 8);
-        *ready.lock_wait() = IntervalSet::from(Interval::closed(0, 3));
+        *ready.ready.lock_wait() = uint_range(0, 3);
         dispatcher.publish(PipelineId(1), &Projection::Everything);
-        *ready.lock_wait() = IntervalSet::from(Interval::closed(0, 5));
+        *ready.ready.lock_wait() = uint_range(0, 5);
         dispatcher.close(PipelineId(1));
         assert_eq!(live_morsels(&dispatcher), [(0, 5)]);
     }
@@ -1427,16 +1479,7 @@ mod tests {
             });
             let claimed = |count: u64| {
                 let source = source.clone();
-                move || {
-                    source
-                        .claimed()
-                        .intervals()
-                        .iter()
-                        .map(|i| i.rval().map_or(0, |r| r + 1))
-                        .max()
-                        .unwrap_or(0)
-                        >= count
-                }
+                move || uint_keys_in(&source.claimed(), u64::MAX).len() as u64 >= count
             };
             arrive(&dispatcher, MAIN_PIPELINE, &rows, 3);
             wait_until(claimed(3));

@@ -262,3 +262,137 @@ fn the_pool_drops_the_main_producer_of_a_live_program_it_runs_and_a_refused_one_
         "a refused program keeps the producer the scheduler loop drives"
     );
 }
+
+/// `[x + 1 for x in source1()]` over a source whose keys are `key_extent`.
+fn over_a_source(key_extent: Extent) -> (GlobalContext, cambra::ccl::context::CompiledProgram) {
+    use cambra::interpreter::TestDataSource;
+    use std::sync::{Arc, Mutex};
+
+    let mut ctx = GlobalContext::default();
+    ctx.register_source(Arc::new(Mutex::new(
+        TestDataSource::new(
+            "source1",
+            cambra::ccl::Type::Base(cambra::ccl::BaseType::Int),
+            Extent::Base(BaseType::Int),
+        )
+        .with_key_extent(key_extent),
+    )));
+    let loaded = LoadedProgram::test("[x + 1 for x in source1()]");
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
+    (ctx, compiled)
+}
+
+/// A source read at each key of its domain is a streaming operator: the chain `IterateExtent`,
+/// `MapResultWithSource`, `MapResult` is a morsel pipeline.
+#[test]
+fn a_chain_over_a_source_is_a_morsel_pipeline() {
+    let (_ctx, compiled) = over_a_source(Extent::Base(BaseType::Int));
+    let pipeline = plan_main(&compiled.operator_graph).expect("a source is streamed");
+    assert!(matches!(pipeline.breaker, Breaker::Collect));
+}
+
+/// A source whose keys are not totally ordered cannot be cut into morsels, so the pool refuses the
+/// program and leaves the producer the live program moved out to drive it.
+#[test]
+fn a_source_with_unordered_keys_stays_on_the_compiling_thread() {
+    use cambra::interpreter::TestDataSource;
+    use cambra::live_program::{LiveProgram, MAIN_BRANCH};
+    use std::sync::{Arc, Mutex};
+
+    let keys = Extent::Record(
+        [(
+            cambra::interpreter::tuple_field(0),
+            Extent::Base(BaseType::Int),
+        )]
+        .into_iter()
+        .collect(),
+    );
+    let mut ctx = GlobalContext::default();
+    ctx.register_source(Arc::new(Mutex::new(
+        TestDataSource::new(
+            "source1",
+            cambra::ccl::Type::Base(cambra::ccl::BaseType::Int),
+            Extent::Base(BaseType::Int),
+        )
+        .with_key_extent(keys),
+    )));
+    let mut live = LiveProgram::start(
+        &mut ctx,
+        &LoadedProgram::test("[x + 1 for x in source1()]"),
+        &no_main,
+    )
+    .expect("compiles");
+    let config = Config {
+        threads: 2,
+        morsel_rows: 4,
+    };
+    let refused = live
+        .run_main_on_pool(MAIN_BRANCH, &mut ctx, &config)
+        .expect("the branch exists")
+        .expect_err("a source of unordered keys has no morsels");
+    assert!(
+        refused.to_string().contains("cut into morsels"),
+        "{refused}"
+    );
+    assert!(
+        live.main_producer_mut(MAIN_BRANCH).is_some(),
+        "the program's own producer is untouched"
+    );
+}
+
+/// Run `code` over a source holding the keys 1, 2 and 3, whose yield predicate is everything, with
+/// `run_main` and no delivery, failing instead of hanging.
+fn run_main_over_held_rows(code: &'static str) -> Tile {
+    use cambra::interpreter::TestDataSource;
+    use std::sync::{Arc, Mutex, mpsc};
+    use std::time::Duration;
+
+    let (done, finished) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut ctx = GlobalContext::default();
+        let source = Arc::new(Mutex::new(TestDataSource::new(
+            "source1",
+            cambra::ccl::Type::Base(cambra::ccl::BaseType::Int),
+            Extent::Base(BaseType::Int),
+        )));
+        source.lock().expect("no other holder").add_data(&[
+            (Value::UInt(1), Value::Int(10)),
+            (Value::UInt(2), Value::Int(20)),
+            (Value::UInt(3), Value::Int(30)),
+        ]);
+        source
+            .lock()
+            .expect("no other holder")
+            .set_yield_predicate(Predicate::True);
+        ctx.register_source(source);
+        let loaded = LoadedProgram::test(code);
+        let consumer: Box<dyn Consumer> = Box::new(|| {});
+        let mut compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
+        let config = Config {
+            threads: 2,
+            morsel_rows: 2,
+        };
+        let _ = done.send(run_main(&mut ctx, &mut compiled, &config));
+    });
+    finished
+        .recv_timeout(Duration::from_secs(30))
+        .expect("run_main finished: nothing closed the pipeline's source")
+        .expect("a source that cuts morsels is a morsel pipeline")
+}
+
+/// `run_main` has no delivery, so the rows the source holds are all there will be: the pool claims
+/// them, answers, and closes the source instead of waiting for arrivals.
+#[test]
+fn run_main_over_a_source_that_holds_rows_returns_them_and_finishes() {
+    let tile = run_main_over_held_rows("[x + 1 for x in source1()]");
+    assert_eq!(entries(&tile), [(1, 11), (2, 21), (3, 31)]);
+}
+
+/// The rows a source holds when the pool starts are claimable although nothing notified of them,
+/// and the answer is not stated complete without them.
+#[test]
+fn rows_held_before_the_pool_starts_are_not_lost() {
+    let tile = run_main_over_held_rows("[x for x in source1()]");
+    assert_eq!(entries(&tile), [(1, 10), (2, 20), (3, 30)]);
+}

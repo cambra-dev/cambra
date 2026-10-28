@@ -163,26 +163,42 @@ a pipeline finishes and when the dispatcher fails. The thread that moves it take
 before it notifies, so a worker between its check and its wait is not missed. Exhaustion moves it
 because a worker parked while attached has to wake and leave before the pipeline can finish.
 
-**A live source's arrivals are published to it.** `LiveSource` is the source of positions that
-receive rows, in any order. It holds the positions published and not claimed (`pending`) and the
-positions claimed, as interval sets under one lock, and reads the source's yield predicate, `ready`,
-an interval set of the positions whose rows are ready to read. The yield predicate is the region
-ready to read. It is not a tile's `domain_predicate`, which says that no further key arrives in a
-region: a position outside `ready` may arrive later, and one inside it has. `publish` names a region
-of `ready`, and `Everything` names `ready` itself. A `Keys` region lies within `ready`, since the
-rows and their positions in the yield predicate are visible before the region is published, and
-`publish` asserts it in release builds as well. The source unites the region, less what was claimed,
-into `pending`, so a region published twice is claimed once and a position that is not ready is
-never claimed. `UInt` is discrete, so a region built from open bounds holds closed ones, and the
-conversion to positions is exact. Nothing is published after `close`. `claim(rows)` cuts the lowest
-`rows` pending positions into a morsel, or answers `Idle` while the source is open and `Exhausted`
-once `close` was called and `pending` is empty. One lock orders every claim, so an `Exhausted`
-follows every morsel.
+**A live source's arrivals are published to it.** `LiveSource` is the source of keys that receive
+rows, in any order, and any totally ordered values: positions, integers, strings. It holds the keys
+published and not claimed (`pending`) and the keys claimed, as predicates under one lock, and reads
+the source's yield predicate, `ready`, the region of keys whose rows are ready to read. For a
+data-source domain the yield predicate is also what `IterateExtent` states complete, so a key
+outside it may arrive later and none arrives inside it. `publish` names a region of `ready`, and
+`Everything` names `ready` itself, not every key of the source's extent. A `Keys` region lies within
+`ready`, since the rows and their keys in the yield predicate are visible before the region is
+published, and `publish` asserts it in release builds as well. The source unites the region, less
+what was claimed, into `pending`, so a region published twice is claimed once and a key that is not
+ready is never claimed. Nothing is published after `close`. `claim(rows)` asks the source for the
+first `rows` keys of `pending` in key order, and claims the keys from the first to the last that
+`pending` names, so a morsel holds exactly those keys when they are sparse. A `pending` region that
+names no key the source holds is dropped from `pending`, since a yield predicate may cover keys that
+never arrive. The claim answers `Idle` while the source is open and nothing is pending, and
+`Exhausted` once `close` was called and `pending` is empty. One lock orders every claim, so an
+`Exhausted` follows every morsel.
+
+**The source cuts its keys.** `DataSourceDomainExtentImpl::cuts_morsels` says a source lists its
+keys and its extent's keys are totally ordered, and `first_keys_in(region, rows)` answers the first
+`rows` keys of a region in key order. The source answers it because it holds its keys and the pool
+does not. Both default to a source that does not cut (`false`, and unreachable):
+`IterateExtent::morsel_source` answers `None` for it, `source_of` finds no source, and the program
+stays on the compiling thread. `TestDataSource` cuts when its key extent is `Int`, `UInt` or
+`String`. `LiveSource::claim` calls `first_keys_in` with the `LiveSource` state lock held and takes
+the data source's `Mutex` inside it, which is the lock order. Each claim does work in proportion to
+the keys the source holds under both locks (`TestDataSource::first_keys_in` sorts every key it
+holds), and `claimed` grows with the keys claimed: known costs, not addressed.
+`elements_in(producer, region)` is `get_elements` cut to a region, and an `IterateExtent` over a
+data-source domain asks for it at a morsel, so the source renders only the morsel's keys.
 
 `Dispatcher::publish(pipeline, region)` and `close(pipeline)` reach a pipeline's source and move the
 epoch. A pipeline that has not started has no source yet, so they keep the region and the close in
 the pipeline's `Early` state, which `start` hands to the source it builds. The delivering thread
-holds no lock these calls take: `Early`'s, the source's state, the one `ready` reads, and `idle`.
+holds no lock these calls take: `Early`'s, the `LiveSource` state lock, the one `ready` reads, and
+`idle`.
 `start` holds that state's lock until the source is set, so a publish either lands in it first or
 finds the source set.
 
@@ -196,9 +212,16 @@ diamond. The path from the source to the `PipelineConsumer` is region-driven and
 ([Region-carrying notifications](#region-carrying-notifications)), which `plan_main` guarantees by
 admitting only `MapResult`s over a `Constant` function operand and refusing a shared node
 (`FanOutSlot`) or a deferred edge. `run_pipeline` is the body of `run_main` for a plan with one
-pipeline: it takes the breaker and the source, and with a `DeliveringThread` runs a thread that
-stands in for the one that reads the source's input and receives the handle. It closes the source
-when that thread returns, which can publish nothing more.
+pipeline. Once the chains are subscribed it publishes `Everything` to the source, so the rows the
+source holds when the pool starts are claimable, as no notification names them. Without a delivery
+it then closes the source, since no row arrives later. it takes the breaker and the source, and with
+a `DeliveringThread` runs that closure on the calling thread while the workers run. The closure
+receives the handle and the scheduler the chains were subscribed with, writes rows to the source and
+calls `Scheduler::check_for_notifications`, which polls the source (`check_for_new_data`) and
+notifies the consumers registered for it with `Everything`. The head's `PipelineConsumer` publishes
+that, and the live source resolves it to the keys that are ready. A region would add precision and
+not correctness, and the scheduler's serial path is the same call. `run_pipeline` closes the source
+when the closure returns, which can publish nothing more.
 
 **Rows are written before their region is published, and the region before the epoch moves.** The
 delivering thread writes the rows under their store's lock, publishes the region under the source's
@@ -253,8 +276,8 @@ or widened, never narrowed or lost.
   such a chain. Acyclicity makes the wait of `forwarding_consumer` safe: a cascade does not reach
   one cell twice, and a cell downstream of a region-driven consumer is itself region-driven. It
   orders the cells' locks only. The thread that notifies holds no lock the cascade takes (the
-  dispatcher's lock on what reached a pipeline before it started, the source's state lock, the lock
-  its ready-positions function reads, and the lock that parks idle workers).
+  dispatcher's lock on what reached a pipeline before it started, the `LiveSource` state lock, the
+  lock its yield-predicate function reads, and the lock that parks idle workers).
 - **Closures.** A closure consumer ignores the region, and the scheduler's drains send `Everything`.
 
 ### A pool owns its pipeline's release record
@@ -287,12 +310,12 @@ it: `get_yield_predicate`, `get_elements`, `get`, `get_fields`, `release`, `chec
 (extent equality and display). `retire_producer` keeps `try_lock_now`, because a chain is dropped on
 the calling thread after its workers returned, and a drop that finds the source locked is a bug.
 Subscription keeps `lock_now`, because it runs before a worker exists. Locks nest in one order: the
-live source's state lock, then the source's lock. The delivering thread holds neither when it
-notifies.
+`LiveSource` state lock, then the data source's `Mutex`. The delivering thread holds neither when
+it notifies.
 
-A `MapResultWithSource` producer retires its release record when it is dropped, as an
-`IterateExtent` producer does. It registered a record at construction and kept it for the life of
-the process, so the `main` producer the pool drops would have held a source's reclaim at nothing.
+A `MapResultWithSource` producer retires its own release record when it drops, as an `IterateExtent`
+producer does: a record that outlives its producer holds the source's reclaim at wherever the
+producer stopped.
 
 ### Projection guards
 

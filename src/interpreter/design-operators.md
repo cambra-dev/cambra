@@ -485,7 +485,7 @@ of a cyclic fan-out).
 
 | Operator | Projection |
 | --- | --- |
-| `IterateExtent` | A finite range is cut to the admitted interval before it is rendered. Every other extent renders whole and is cut after. |
+| `IterateExtent` | A finite range is cut to the admitted interval before it is rendered, and a data-source domain is cut to the admitted keys by its source (`elements_in`). Every other extent renders whole and is cut after. |
 | `Constant` | A collection constant answers the admitted keys. A scalar constant answers the whole value or nothing. |
 | `MapResult` | A keyed input is pulled at the projection; a scalar input is a key looked up in the function, has no keys to project, and is read whole. A function operand that is a collection is pulled at the projection too where the input's values are its keys, the arguments stand at the first level, and the operand is a data function; its keys are released with the data's. Any other function operand is read whole. |
 | `MapResultToConst` | A collection input is pulled at the projection where the constant applies one level in or deeper. At the outermost level the constant replaces the whole input, so the input is read whole. The constant is read whole, since every row reads all of it. |

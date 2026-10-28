@@ -60,6 +60,11 @@ pub struct TestDataSource {
     name: String,
     output_type: TestSourceType,
     output_extent: Extent,
+    /// The extent of the keys: the positions `0..` unless a test gives another.
+    key_extent: Extent,
+    /// Whether `get_elements` panics: a test that reads a morsel through `elements_in` refuses the
+    /// whole read, so the morsel cannot be a cut of it.
+    refuses_whole_reads: bool,
     yield_predicate: Predicate,
     has_data: bool,
     data: HashMap<Value, Value>,
@@ -72,11 +77,27 @@ impl TestDataSource {
             name: name.to_string(),
             output_type: TestSourceType::of(&output_type),
             output_extent,
+            key_extent: Extent::Base(BaseType::UInt),
+            refuses_whole_reads: false,
             yield_predicate: Predicate::False,
             has_data: false,
             data: HashMap::new(),
             releases: ProducerReleases::default(),
         }
+    }
+
+    /// This source with keys of `key_extent` in place of the positions `0..`. Its keys are then
+    /// the values a test adds, of that extent; a base extent is totally ordered, so a pool cuts
+    /// morsels from them, and any other is not and keeps the program on the compiling thread.
+    pub fn with_key_extent(mut self, key_extent: Extent) -> Self {
+        self.key_extent = key_extent;
+        self
+    }
+
+    /// Make `get_elements` panic, so that a read of the whole domain fails.
+    #[cfg(test)]
+    pub(crate) fn refuse_whole_reads(&mut self) {
+        self.refuses_whole_reads = true;
     }
 
     /// Set the yield predicate, describing the region of domain values currently available.
@@ -122,6 +143,11 @@ impl DataSourceDomainExtentImpl for TestDataSource {
     }
 
     fn get_elements(&self, producer: &str) -> ColumnValue {
+        assert!(
+            !self.refuses_whole_reads,
+            "the whole domain of {} was read",
+            self.name
+        );
         let filter = self
             .releases
             .of(producer)
@@ -138,7 +164,42 @@ impl DataSourceDomainExtentImpl for TestDataSource {
     }
 
     fn element_extent(&self) -> Extent {
-        Extent::Base(BaseType::UInt)
+        self.key_extent.clone()
+    }
+
+    fn cuts_morsels(&self) -> bool {
+        matches!(
+            self.key_extent,
+            Extent::Base(BaseType::UInt | BaseType::Int | BaseType::String)
+        )
+    }
+
+    fn first_keys_in(&self, region: &Predicate, rows: u64) -> Vec<Value> {
+        let mut keys: Vec<Value> = self
+            .data
+            .keys()
+            .filter(|key| region.contains(key))
+            .cloned()
+            .collect();
+        // Keys of one extent are mutually comparable (`cuts_morsels` admits only such extents).
+        keys.sort_by(|a, b| a.partial_cmp(b).expect("keys of one base extent compare"));
+        keys.truncate(usize::try_from(rows).unwrap_or(usize::MAX));
+        keys
+    }
+
+    fn elements_in(&self, producer: &str, region: &Predicate) -> ColumnValue {
+        let filter = self
+            .releases
+            .of(producer)
+            .unwrap_or_else(|| panic!("Unknown producer: {producer}"));
+        ColumnValue::from_values(
+            self.data
+                .keys()
+                .filter(|key| !key_matches_predicate(key, filter) && region.contains(key))
+                .cloned()
+                .collect(),
+            &self.element_extent(),
+        )
     }
 
     fn get(&self, mut keys: ColumnValue) -> ColumnValue {

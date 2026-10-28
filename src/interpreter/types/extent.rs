@@ -8,7 +8,7 @@ use std::{collections::HashMap, sync::Arc, sync::Mutex};
 use intervalsets::{Interval, IntervalSet};
 
 use crate::ccl::TagMap;
-use crate::interpreter::{HasDifference, Predicate, Tile};
+use crate::interpreter::{HasDifference, Predicate, Tile, Value};
 use crate::util::fmt_record;
 
 use super::ColumnValue;
@@ -351,6 +351,37 @@ pub trait DataSourceDomainExtentImpl: Send {
     /// Returns the [`Extent`] of each individual domain element.
     /// Used to construct a typed empty [`ColumnValue`] when the domain is empty.
     fn element_extent(&self) -> Extent;
+    /// Whether this source can cut a morsel out of its keys: it lists the keys it holds
+    /// ([`first_keys_in`](Self::first_keys_in)), and one extent's keys are totally ordered, so a
+    /// morsel is the keys between two of them. A source that cannot is read whole by the thread
+    /// that compiled the program. The default is `false`.
+    fn cuts_morsels(&self) -> bool {
+        false
+    }
+
+    /// The first `rows` keys, in key order, of the keys this source holds that `region` admits.
+    /// Where a pool's claim ends a morsel: the source knows its keys, and the morsel is the keys
+    /// from the first to the last returned, within `region`. Fewer than `rows` keys, or none,
+    /// when `region` admits fewer than that many held keys. Only a source that
+    /// [`cuts_morsels`](Self::cuts_morsels) answers it, and it holds no lock of its own across the
+    /// call.
+    fn first_keys_in(&self, _region: &Predicate, _rows: u64) -> Vec<Value> {
+        unreachable!("{} does not cut morsels", self.get_id())
+    }
+
+    /// The domain elements `producer` has not released that `region` admits: what
+    /// [`get_elements`](Self::get_elements) answers, cut to the region before it is rendered.
+    /// The default cuts the whole answer.
+    fn elements_in(&self, producer: &str, region: &Predicate) -> ColumnValue {
+        let mut elements = self.get_elements(producer);
+        ColumnValue::from_values(
+            elements
+                .drain_to_value_iter()
+                .filter(|key| region.contains(key))
+                .collect(),
+            &self.element_extent(),
+        )
+    }
     /// Returns the output value for a given domain key.
     ///
     /// Used by [`crate::interpreter::tile_operators::MapResultWithSource`] to map each domain

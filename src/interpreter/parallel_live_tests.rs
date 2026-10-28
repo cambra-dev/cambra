@@ -15,16 +15,13 @@ mod end_to_end {
     use super::super::*;
     use crate::interpreter::tile_operators::test_helpers::{int_entries, keys_between};
     use crate::interpreter::tile_operators::{
-        Constant, LiveSource, MapResult, ProducerBase, impl_producer_base, union_of,
+        Constant, LiveSource, MapResult, ProducerBase, impl_producer_base, uint_keys_in, uint_range,
     };
     use crate::interpreter::{
         BaseType, ColumnValue, CurryLevel, Extent, FunctionDef, UnaryOpKind, Value,
         operator_graph::InputEdgeSpec,
     };
     use crate::{pretty_graph::VizOptions, pretty_tree::InspectNode};
-    use intervalsets::Bounding;
-    use intervalsets::ops::Contains;
-    use intervalsets::{Interval, IntervalSet};
 
     /// The rows a live source holds, and what the pool did to them. The values are the rows' own;
     /// `None` marks a row a release reclaimed.
@@ -32,7 +29,7 @@ mod end_to_end {
         rows: Mutex<BTreeMap<u64, Option<i64>>>,
         /// The positions whose rows are written, the source's yield predicate. A chunk's positions
         /// join it once its rows are written.
-        ready: Arc<Mutex<IntervalSet<u64>>>,
+        ready: Arc<Mutex<Predicate>>,
         source: Arc<LiveSource>,
         /// The consumer each worker's chain subscribed with.
         consumers: Mutex<Vec<Box<dyn Consumer>>>,
@@ -45,12 +42,15 @@ mod end_to_end {
 
     impl LiveStore {
         fn new() -> Arc<Self> {
-            let ready = Arc::new(Mutex::new(IntervalSet::from(Interval::<u64>::empty())));
+            let ready = Arc::new(Mutex::new(Predicate::False));
             let read = ready.clone();
             Arc::new(Self {
                 rows: Mutex::new(BTreeMap::new()),
                 ready,
-                source: Arc::new(LiveSource::new(move || read.lock_wait().clone())),
+                source: Arc::new(LiveSource::new(
+                    move || read.lock_wait().clone(),
+                    uint_keys_in,
+                )),
                 consumers: Mutex::new(Vec::new()),
                 served: Mutex::new(BTreeSet::new()),
                 released: Mutex::new(BTreeSet::new()),
@@ -72,21 +72,13 @@ mod end_to_end {
             // The rows are written before the positions arrive, and the positions before the
             // notify.
             let mut ready = self.ready.lock_wait();
-            *ready = union_of(
-                &ready,
-                &IntervalSet::from(Interval::closed(chunk.first, last)),
-            );
+            *ready = ready.union(&uint_range(chunk.first, last));
             Some((chunk.first, last))
         }
 
         /// How many positions are ready.
         fn ready_rows(&self) -> usize {
-            self.ready
-                .lock_wait()
-                .intervals()
-                .iter()
-                .map(|i| (i.rval().expect("bounded") - i.lval().expect("bounded") + 1) as usize)
-                .sum()
+            uint_keys_in(&self.ready.lock_wait(), u64::MAX).len()
         }
 
         /// Notify every chain's consumer, as the delivering thread does.
@@ -99,17 +91,14 @@ mod end_to_end {
         /// The positions `region` names that are ready.
         fn positions(&self, region: &Projection) -> Vec<u64> {
             let ready = self.ready.lock_wait().clone();
-            ready
-                .intervals()
-                .iter()
-                .flat_map(|i| {
-                    i.lval().copied().expect("bounded")..=i.rval().copied().expect("bounded")
-                })
-                .filter(|&position| match region {
+            uint_keys_in(&ready, u64::MAX)
+                .into_iter()
+                .filter(|key| match region {
                     Projection::Everything => true,
                     Projection::Nothing => false,
-                    Projection::Keys(keys) => keys.contains(&Value::UInt(position)),
+                    Projection::Keys(keys) => keys.contains(key),
                 })
+                .map(|key| key.as_uint())
                 .collect()
         }
     }
@@ -196,20 +185,7 @@ mod end_to_end {
             // one. Once it is closed it decides every position.
             let decided = match self.store.closed.load(Ordering::Acquire) {
                 true => Predicate::True,
-                false => {
-                    let ready = self.store.ready.lock_wait();
-                    match ready.intervals().is_empty() {
-                        true => Predicate::False,
-                        false => Predicate::intervals(IntervalSet::from_iter(
-                            ready.intervals().iter().map(|i| {
-                                Interval::closed(
-                                    Value::UInt(i.lval().copied().expect("bounded")),
-                                    Value::UInt(i.rval().copied().expect("bounded")),
-                                )
-                            }),
-                        )),
-                    }
-                }
+                false => self.store.ready.lock_wait().clone(),
             };
             let mut tile = Tile::data_function(
                 ColumnValue::from_uints(wanted),
@@ -235,7 +211,7 @@ mod end_to_end {
             let mut released = self.store.released.lock_wait();
             for position in positions {
                 assert!(
-                    claimed.contains(&position),
+                    claimed.contains(&Value::UInt(position)),
                     "position {position} was released before a worker claimed it"
                 );
                 assert!(
@@ -292,7 +268,7 @@ mod end_to_end {
             CurryLevel::new(1),
         );
         let delivered = store.clone();
-        let delivery: DeliveringThread<'static> = Box::new(move |handle| {
+        let delivery: DeliveringThread<'static> = Box::new(move |handle, _scheduler| {
             for (n, chunk) in chunks.iter().enumerate() {
                 if let Pace::Lockstep = pace {
                     // Every worker waits, so the publish below has to wake one.
@@ -422,18 +398,12 @@ mod end_to_end {
             .collect();
         std::thread::scope(|scope| {
             let _fail = FailOnUnwind(&dispatcher);
-            scope.spawn({
-                let (dispatcher, handle) = (&dispatcher, handle.clone());
-                move || {
-                    let _fail = FailOnUnwind(dispatcher);
-                    delivery(handle.clone());
-                    handle.close();
-                }
-            });
             for worker_chains in chains.iter_mut().skip(1) {
                 let (dispatcher, breaker) = (&dispatcher, &breaker);
                 scope.spawn(move || run_worker(worker_chains, dispatcher, breaker));
             }
+            delivery(handle.clone(), &mut scheduler);
+            handle.close();
         });
         drop(chains);
         (breaker.finish(), store)
@@ -498,10 +468,14 @@ mod end_to_end {
             store.rows.lock_wait().values().all(Option::is_none),
             "the source reclaimed every row"
         );
+        let covered = match (rows.keys().next(), rows.keys().last()) {
+            (Some(&first), Some(&last)) => uint_range(first, last),
+            _ => Predicate::False,
+        };
         assert_eq!(
-            store.source.claimed().intervals().len(),
-            usize::from(!rows.is_empty()),
-            "the claims are contiguous and cover every row"
+            store.source.claimed(),
+            covered,
+            "the claims cover every row, each once"
         );
         let consumers = store.consumers.lock_wait();
         assert!(

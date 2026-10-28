@@ -359,8 +359,8 @@ before it looks for a morsel and parks only while the epoch is unchanged. The de
 writes the rows, then publishes the region under the source's lock, then moves the epoch, so a
 worker that misses the region in its claim read the epoch before the move, and its park returns at
 once. The delivering thread holds no lock the cascade takes: the dispatcher's lock on what reached
-a pipeline before it started, the source's state lock, the lock its ready-positions function reads,
-and the lock that parks idle workers.
+a pipeline before it started, the `LiveSource` state lock, the lock its yield-predicate function
+reads, and the lock that parks idle workers.
 
 Only the first worker's chain carries the `PipelineConsumer`; every other chain's head consumer
 ignores the region. The chain's notification path from the source to that consumer satisfies one

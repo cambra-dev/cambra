@@ -774,3 +774,49 @@ fn a_fan_out_suppresses_a_second_notification_until_a_pull_reopens_it() {
     notify_input(&consumer, &another_region());
     assert_eq!(*logs[0].lock_now(), [region(), another_region()]);
 }
+
+/// A data source's arrival reaches the head of `IterateExtent → MapResultWithSource →
+/// MapResult(negate)` as the keys it names: each operator on the way keeps keys, so the chain's
+/// consumer learns which keys changed, in the order they arrive.
+#[test]
+fn a_chain_over_a_source_forwards_the_region_an_arrival_names() {
+    use super::iterate::points;
+    use crate::interpreter::{FunctionDef, TestDataSource, UnaryOpKind, Value};
+    use std::sync::{Arc, Mutex};
+
+    let source = Arc::new(Mutex::new(
+        TestDataSource::new(
+            "source1",
+            crate::ccl::Type::Base(BaseType::Int),
+            Extent::Base(BaseType::Int),
+        )
+        .with_key_extent(Extent::Base(BaseType::Int)),
+    ));
+    let domain = Extent::DataSourceDomain(source.clone());
+    let reading = MapResultWithSource::new(source, Box::new(IterateExtent::new(domain)));
+    let negate = Constant::new(
+        Value::ComputableFunction(FunctionDef::UnaryOp(UnaryOpKind::Neg)),
+        Extent::Function {
+            domain: Box::new(Extent::Base(BaseType::Int)),
+            codomain: Box::new(Extent::Base(BaseType::Int)),
+        },
+    );
+    let mut chain = MapResult::new_at(Box::new(reading), Box::new(negate), CurryLevel::new(1));
+    let (log, regions) = RegionLog::new(true);
+    let mut scheduler = Scheduler::new();
+    let guard = chain.tiling().universal_guard();
+    let _producer = chain.subscribe(guard, Box::new(log), &mut scheduler);
+    regions.lock_now().clear();
+
+    let keys = |keys: &[i64]| {
+        Projection::admitting(points(
+            &keys.iter().map(|k| Value::Int(*k)).collect::<Vec<_>>(),
+        ))
+    };
+    // A later chunk arrives ahead of an earlier one.
+    for chunk in [&[41, 90][..], &[10, 20, 35]] {
+        assert!(scheduler.notify_source_consumers("source1", &keys(chunk)));
+        assert_eq!(regions.lock_now().pop(), Some(keys(chunk)));
+    }
+    assert!(regions.lock_now().is_empty(), "one notification each");
+}
