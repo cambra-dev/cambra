@@ -46,6 +46,13 @@ fn stream_tiling(values: Values) -> Tiling {
             ),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         ),
+        Values::Variants => Tiling::data_function(
+            keys,
+            Tiling::Scalar(Extent::Union(crate::ccl::TagMap::from_arms(vec![(
+                crate::ccl::FieldKey::Index(0),
+                Extent::Base(BaseType::Int),
+            )]))),
+        ),
         Values::Nested => Tiling::data_function(
             keys.clone(),
             Tiling::data_function(keys, Tiling::Scalar(Extent::Base(BaseType::Int))),
@@ -713,4 +720,113 @@ fn fan_out_slot(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator>
 #[test]
 fn a_fan_out_slot_notifies_exactly_what_its_input_changed_over_growth() {
     check(&fan_out_slot, Values::Ints, Expect::Exact);
+}
+
+fn int_extent() -> Extent {
+    Extent::Base(BaseType::Int)
+}
+
+fn union_of_ints() -> crate::ccl::TagMap<Extent> {
+    crate::ccl::TagMap::from_arms(vec![(crate::ccl::FieldKey::Index(0), int_extent())])
+}
+
+fn variant_project(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    Box::new(VariantProject::new(
+        inputs.remove(0),
+        crate::ccl::FieldKey::Index(0),
+        int_extent(),
+    ))
+}
+
+#[test]
+fn variant_project_notifies_exactly_what_a_stream_of_variants_changed_over_growth() {
+    check(&variant_project, Values::Variants, Expect::Exact);
+}
+
+fn variant_is(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    Box::new(VariantIs::new(
+        inputs.remove(0),
+        crate::ccl::FieldKey::Index(0),
+    ))
+}
+
+#[test]
+fn variant_is_notifies_exactly_what_a_stream_of_variants_changed_over_growth() {
+    check(&variant_is, Values::Variants, Expect::Exact);
+}
+
+fn variant_wrap(level: CurryLevel) -> impl Fn(Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    move |mut inputs| {
+        Box::new(VariantWrap::new_at(
+            inputs.remove(0),
+            crate::ccl::FieldKey::Index(0),
+            union_of_ints(),
+            level,
+        ))
+    }
+}
+
+#[test]
+fn variant_wrap_notifies_exactly_what_a_stream_of_payloads_changed_over_growth() {
+    check(
+        &variant_wrap(CurryLevel::new(1)),
+        Values::Ints,
+        Expect::Exact,
+    );
+}
+
+/// A scalar input that is unknown and then takes a value, which it can announce only as
+/// everything: a scalar that has been called complete does not change.
+fn scalar_script(
+    unknown: Tile,
+    known: Tile,
+    tiling: Tiling,
+) -> (Vec<(Tiling, Vec<Tile>)>, Vec<Step>) {
+    let step = Step {
+        input: 0,
+        changed: Projection::Everything,
+    };
+    (vec![(tiling, vec![unknown, known])], vec![step])
+}
+
+/// At the outermost level the payload becomes one union value, which has no keys. A scalar input
+/// announces only everything, so keeping and widening send the same region here: the decision is
+/// pinned by `variant_wrap_at_the_outermost_level_sends_everything`, and this checks the answers.
+#[test]
+fn variant_wrap_at_the_outermost_level_is_sound_over_a_changing_scalar() {
+    for v in [1, 2, 3] {
+        let (feeds, steps) = scalar_script(
+            Tile::Scalar(ColumnValue::Ints(vec![])),
+            Tile::Scalar(ColumnValue::Ints(vec![v])),
+            Tiling::Scalar(int_extent()),
+        );
+        assert_notification_sound(
+            &variant_wrap(CurryLevel::OUTERMOST),
+            &feeds,
+            &steps,
+            &[Expect::Widens],
+        );
+    }
+}
+
+/// A bare union has no keys of its own. As above, a scalar input announces only everything: the
+/// decision is pinned by `variant_project_over_a_bare_union_sends_everything`.
+#[test]
+fn variant_project_over_a_bare_union_is_sound_over_a_changing_scalar() {
+    let union = |values: Vec<i64>| {
+        let rows = (0..values.len()).collect();
+        Tile::Scalar(ColumnValue::Union(crate::ccl::TagMap::from_arms(vec![(
+            crate::ccl::FieldKey::Index(0),
+            crate::interpreter::UnionArm::new(rows, ColumnValue::Ints(values)),
+        )])))
+    };
+    for v in [1, 2, 3] {
+        let (feeds, steps) = scalar_script(
+            union(vec![]),
+            union(vec![v]),
+            Tiling::Scalar(Extent::Union(union_of_ints())),
+        );
+        assert_notification_sound(&variant_project, &feeds, &steps, &[Expect::Widens]);
+        assert_notification_sound(&variant_is, &feeds, &steps, &[Expect::Widens]);
+    }
 }

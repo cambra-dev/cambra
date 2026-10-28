@@ -361,6 +361,8 @@ pub(crate) enum Values {
     Pairs,
     /// [`Values::Pairs`] keyed by a one-field record holding the pair.
     PairsInARecord,
+    /// Integers tagged as the one arm of a union.
+    Variants,
 }
 
 /// A stream keyed by position holding the booleans `entries`, complete over `complete`.
@@ -449,6 +451,22 @@ impl Stream {
                     domain,
                     Box::new(Tile::Scalar(ColumnValue::Ints(
                         sorted.iter().map(|(_, value)| *value).collect(),
+                    ))),
+                    self.complete.clone(),
+                    BitSet::new(),
+                )
+            }
+            Values::Variants => {
+                let mut sorted = self.present.clone();
+                sorted.sort();
+                let arm = crate::interpreter::UnionArm::new(
+                    (0..sorted.len()).collect(),
+                    ColumnValue::Ints(sorted.iter().map(|(_, value)| *value).collect()),
+                );
+                Tile::data_function(
+                    ColumnValue::UInts(sorted.iter().map(|(key, _)| *key).collect()),
+                    Box::new(Tile::Scalar(ColumnValue::Union(
+                        crate::ccl::TagMap::from_arms(vec![(crate::ccl::FieldKey::Index(0), arm)]),
                     ))),
                     self.complete.clone(),
                     BitSet::new(),
