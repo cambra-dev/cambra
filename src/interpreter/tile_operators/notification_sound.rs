@@ -52,7 +52,7 @@ impl FeedOp {
 
 impl FeedHandle {
     /// Move the input to its state `step`, without telling its consumer.
-    fn advance_to(&self, step: usize) {
+    pub(crate) fn advance_to(&self, step: usize) {
         self.step.store(step, Ordering::SeqCst);
     }
 
@@ -356,6 +356,11 @@ pub(crate) enum Values {
     /// A collection of collections of integers: each step adds an element to the group of an
     /// outer key, which it creates when it is new.
     Nested,
+    /// A collection keyed by pairs of positions (`k / 4`, `k % 4`). A region of pairs has no
+    /// spelling, so its steps notify everything.
+    Pairs,
+    /// [`Values::Pairs`] keyed by a one-field record holding the pair.
+    PairsInARecord,
 }
 
 /// A stream keyed by position holding the booleans `entries`, complete over `complete`.
@@ -418,6 +423,37 @@ impl Stream {
     pub(crate) fn tile(&self) -> Tile {
         match self.values {
             Values::Ints => int_stream(&self.present, self.complete.clone()),
+            Values::Pairs | Values::PairsInARecord => {
+                let mut sorted = self.present.clone();
+                sorted.sort();
+                let column = |f: &dyn Fn(u64) -> u64| {
+                    ColumnValue::UInts(sorted.iter().map(|(key, _)| f(*key)).collect())
+                };
+                let pair = ColumnValue::Records(
+                    [
+                        (crate::interpreter::tuple_field(0), column(&|k| k / 4)),
+                        (crate::interpreter::tuple_field(1), column(&|k| k % 4)),
+                    ]
+                    .into_iter()
+                    .collect(),
+                );
+                let domain = match self.values {
+                    Values::PairsInARecord => ColumnValue::Records(
+                        [(crate::interpreter::tuple_field(0), pair)]
+                            .into_iter()
+                            .collect(),
+                    ),
+                    _ => pair,
+                };
+                Tile::data_function(
+                    domain,
+                    Box::new(Tile::Scalar(ColumnValue::Ints(
+                        sorted.iter().map(|(_, value)| *value).collect(),
+                    ))),
+                    self.complete.clone(),
+                    BitSet::new(),
+                )
+            }
             Values::Nested => {
                 let mut sorted = self.present.clone();
                 sorted.sort_by_key(|(key, _)| *key);
@@ -514,7 +550,9 @@ impl Stream {
                 added.push(key);
             }
         }
-        if !added.is_empty() {
+        if !added.is_empty() && matches!(self.values, Values::Pairs | Values::PairsInARecord) {
+            Projection::Everything
+        } else if !added.is_empty() {
             keys_region(&added)
         } else if matches!(growth, Growth::CompletenessAndEmpty) && action == 2 {
             self.complete = Predicate::True;

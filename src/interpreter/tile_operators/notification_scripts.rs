@@ -6,15 +6,27 @@
 use smol_str::SmolStr;
 
 use super::notification_sound::{
-    Expect, Growth, Step, Values, assert_notification_sound, assert_release_sound, grow, grow_many,
-    int_stream, int_stream_tiling, keys_region, positions_stream,
+    Expect, FeedOp, Growth, Step, Values, assert_notification_sound, assert_release_sound, grow,
+    grow_many, int_stream, int_stream_tiling, keys_region, positions_stream,
 };
+use super::test_helpers::RegionLog;
 use super::*;
 use crate::interpreter::{
     BaseType, ColumnValue, CurryLevel, Extent, Predicate, Projection, Tiling,
 };
 
 type Build = dyn Fn(Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator>;
+
+fn pair_keys() -> Extent {
+    Extent::Record(
+        [
+            (crate::interpreter::tuple_field(0), Extent::uint_range(4)),
+            (crate::interpreter::tuple_field(1), Extent::uint_range(4)),
+        ]
+        .into_iter()
+        .collect(),
+    )
+}
 
 fn stream_tiling(values: Values) -> Tiling {
     let keys = Extent::uint_range(16);
@@ -23,6 +35,17 @@ fn stream_tiling(values: Values) -> Tiling {
         Values::Ints => scalar(Extent::Base(BaseType::Int)),
         Values::Bools => scalar(Extent::Base(BaseType::Bool)),
         Values::Positions => scalar(Extent::uint_range(16)),
+        Values::Pairs => {
+            Tiling::data_function(pair_keys(), Tiling::Scalar(Extent::Base(BaseType::Int)))
+        }
+        Values::PairsInARecord => Tiling::data_function(
+            Extent::Record(
+                [(crate::interpreter::tuple_field(0), pair_keys())]
+                    .into_iter()
+                    .collect(),
+            ),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        ),
         Values::Nested => Tiling::data_function(
             keys.clone(),
             Tiling::data_function(keys, Tiling::Scalar(Extent::Base(BaseType::Int))),
@@ -526,4 +549,168 @@ fn product(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
 fn product_notifies_exactly_what_either_side_changed_over_growth() {
     let shapes = [(Values::Ints, None), (Values::Nested, None)];
     check_many(&product, &shapes, &[Expect::Exact, Expect::Exact]);
+}
+
+fn aggregate(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    Box::new(Aggregate::new(
+        inputs.remove(0),
+        crate::ccl::AggregateKind::Sum,
+    ))
+}
+
+/// The accumulator has no keys, so a change to any key is a change to it.
+#[test]
+fn an_aggregate_widens_over_growth() {
+    check(&aggregate, Values::Ints, Expect::Widens);
+}
+
+fn extract_aggregate(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    let fold = Aggregate::new(inputs.remove(0), crate::ccl::AggregateKind::Sum);
+    Box::new(ExtractAggregate::new(
+        Box::new(fold),
+        crate::ccl::AggregateKind::Sum,
+        true,
+    ))
+}
+
+#[test]
+fn an_extract_aggregate_widens_over_growth() {
+    check(&extract_aggregate, Values::Ints, Expect::Widens);
+}
+
+fn extract_final(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    let default = inputs.remove(1);
+    Box::new(ExtractFinal::new(inputs.remove(0), default))
+}
+
+/// The final value is the last position's, which a region of keys does not name.
+#[test]
+fn extract_final_widens_over_growth() {
+    let (default, tiling) = int_constant();
+    check_with_constant(
+        &extract_final,
+        Values::Ints,
+        default,
+        tiling,
+        Expect::Widens,
+    );
+}
+
+fn make_record(inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    Box::new(MakeRecord::new(inputs))
+}
+
+/// A record of values has no keys of its own.
+#[test]
+fn make_record_widens_over_growth() {
+    let shapes = [(Values::Ints, None), (Values::Ints, None)];
+    check_many(&make_record, &shapes, &[Expect::Widens, Expect::Widens]);
+}
+
+fn permute_record_domain(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    Box::new(PermuteRecordDomain::new(inputs.remove(0), vec![1, 0]))
+}
+
+/// The keys are renamed. A region of record keys has no spelling, so the input notifies
+/// everything and the check is of soundness only.
+#[test]
+fn permute_record_domain_notifies_soundly_over_growth() {
+    check(&permute_record_domain, Values::Pairs, Expect::Sound);
+}
+
+fn flatten_tuple_domain(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    Box::new(FlattenTupleDomain::new(inputs.remove(0), vec![0]))
+}
+
+/// The keys are re-keyed, so a region of the input's keys names none of the output's.
+#[test]
+fn flatten_tuple_domain_widens_over_growth() {
+    check(
+        &flatten_tuple_domain,
+        Values::PairsInARecord,
+        Expect::Widens,
+    );
+}
+
+/// A release of rows the mask rejected, and of rows it kept, leaves the rest answering as a fresh
+/// pull does.
+#[test]
+fn filter_releases_what_nothing_beneath_it_reads_again() {
+    let shapes = [(Values::Ints, None), (Values::Bools, None)];
+    for seed in [1, 2, 3] {
+        let (tiles, _) = grow_many(seed, &shapes, 16, Growth::Bursts);
+        let at: Vec<usize> = tiles.iter().map(|states| states.len() - 1).collect();
+        let feeds: Vec<(Tiling, Vec<Tile>)> = shapes
+            .iter()
+            .zip(tiles)
+            .map(|((values, _), tiles)| (stream_tiling(*values), tiles))
+            .collect();
+        assert_release_sound(&filter, &feeds, &at, &keys_region(&[0, 1, 2, 3]));
+        assert_release_sound(&filter, &feeds, &at, &keys_region(&[4, 7]));
+    }
+}
+
+/// The constant is read by every row, so releasing rows of the output never releases it.
+#[test]
+fn map_result_to_const_releases_rows_and_keeps_its_constant() {
+    let (constant, constant_tiling) = int_constant();
+    for seed in [1, 2, 3] {
+        let (tiles, _) = grow(seed, 14, Growth::Bursts, Values::Nested);
+        let last = tiles.len() - 1;
+        let feeds = [
+            (stream_tiling(Values::Nested), tiles),
+            (constant_tiling.clone(), vec![constant.clone()]),
+        ];
+        assert_release_sound(
+            &map_result_to_const(CurryLevel::new(1)),
+            &feeds,
+            &[last, 0],
+            &keys_region(&[0, 1, 2]),
+        );
+    }
+}
+
+/// Two slots of one fan-out: the input is released only what both slots released, so a release by
+/// one slot leaves the other its rows.
+#[test]
+fn a_fan_out_releases_the_meet_of_its_slots_releases() {
+    let (tiles, _) = grow(2, 12, Growth::Bursts, Values::Ints);
+    let last = tiles.len() - 1;
+    let (feed, handle) = FeedOp::new(stream_tiling(Values::Ints), tiles);
+    handle.advance_to(last);
+    let fan = FanOut::new(Box::new(feed));
+    let mut scheduler = Scheduler::new();
+    let mut slots = [fan.slot(), fan.slot()];
+    let tiling = stream_tiling(Values::Ints);
+    let guard = slots[0].tiling().universal_guard();
+    let (log_a, _regions_a) = RegionLog::new(true);
+    let (log_b, _regions_b) = RegionLog::new(true);
+    let mut first = slots[0].subscribe(guard.clone(), Box::new(log_a), &mut scheduler);
+    let mut second = slots[1].subscribe(guard, Box::new(log_b), &mut scheduler);
+    let region = keys_region(&[0, 1, 2, 3]);
+    first.get(region.guard(&tiling));
+    first.release(region.guard(&tiling));
+    let mut got = second.get(region.guard(&tiling));
+    got.compact();
+    let mut expected = {
+        let (tiles, _) = grow(2, 12, Growth::Bursts, Values::Ints);
+        tiles[tiles.len() - 1].clone()
+    };
+    expected.restrict_to(&region, &tiling);
+    expected.compact();
+    assert_eq!(
+        crate::interpreter::sort_function_by_domain(got),
+        crate::interpreter::sort_function_by_domain(expected),
+        "the second slot lost rows the first released"
+    );
+}
+
+fn fan_out_slot(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    FanOut::new(inputs.remove(0)).slot()
+}
+
+/// The fan-out passes its input's region to a slot, one notification between pulls.
+#[test]
+fn a_fan_out_slot_notifies_exactly_what_its_input_changed_over_growth() {
+    check(&fan_out_slot, Values::Ints, Expect::Exact);
 }
