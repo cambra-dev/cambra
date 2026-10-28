@@ -16,8 +16,9 @@ and the operational semantics in [docs/operational-semantics/](operational-seman
 CHL today **looks** like Python, but it is not Python. Several Python
 tokens are re-purposed (`<<`, `<<=`, `&`, `|`, `^`), one is new (`++`),
 and Python features that don't fit the dataflow model (mutable identity,
-exceptions, classes, true division, etc.) are absent. Where CHL diverges
-from Python, this document states the divergence explicitly.
+exception handlers looked up at run time, classes, true division, etc.) are
+absent. Where CHL diverges from Python, this document states the divergence
+explicitly.
 
 The Python resemblance itself is transitional: CHL is **converging away
 from Python-compatible surface syntax** toward its own syntax, designed
@@ -176,7 +177,10 @@ clause, which ends a `def` signature or a polymorphic type
 > `rec` (recursive binding — §4.3, **[Decided]**), `given` (the
 > transactions-as-contextual-parameters layer — §8.7, **[Decided]**),
 > and `assert` and its `static assert` form (function contracts — §6, **[Decided]** as the
-> surface, **[Open]** as to what `static` demands). Avoid taking these names for other purposes.
+> surface, **[Open]** as to what `static` demands), and `causes`, `only`, `nothing`, `raise`,
+> `try` and `except` (effects and exceptions —
+> [6.9 Effects and requirements [Decided]](#69-effects-and-requirements-decided), **[Decided]**).
+> Avoid taking these names for other purposes.
 > (`with`, `:=`, `match`, `case`, `where`, `forall`, `requires`, `type`, `impl`, `trait` and
 > the module keywords are **already** lexed — the first two carry today's transactions and
 > mutation, §8, `match`/`case` carry tag dispatch, §4.10, `where` separates a refinement's
@@ -425,19 +429,17 @@ optional `ident "="` prefix binding the transaction handle — `with t =
 begin():`, §8.2, `[Decided]`); any other context is rejected. `with` does
 **not** provide Python's general context-manager statement.
 
-> **Direction.** Planned statement forms, not in today's grammar:
-> `rec x = e` recursive bindings (**[Decided]**, §4.3), annotation-only
-> forward declarations such as `h: Feed(_)` with no initialiser
-> (**[Decided]**, §3.7 — today an annotation *requires* a value), and
-> out-of-line collection definition through a subscript target,
-> `c[i] = v` (**[Tentative]**, §6.3 — this would relax the
-> no-subscript-target rule above). A `type` declaration, a `def` whose name is
-> qualified by a type (`def Price::discounted(…)`), and `@RenamedFrom` on either a
-> `type` or one of its constructors are **[Decided]**, with their grammar in
-> [6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided).
-> (`mut_assign_stmt` and `with_stmt`
-> above are already implemented — §4.3, §8; they are in the grammar, not
-> this list.)
+> **Direction.** Planned statement forms, not in today's grammar: `rec x = e` recursive bindings
+> (**[Decided]**, §4.3), annotation-only forward declarations such as `h: Feed(_)` with no
+> initialiser (**[Decided]**, §3.7 — today an annotation *requires* a value), and out-of-line
+> collection definition through a subscript target, `c[i] = v` (**[Tentative]**, §6.3 — this would
+> relax the no-subscript-target rule above). A `causes` clause on a `def`, and the `raise` and
+> `try`/`except` statements, are **[Decided]**, with their grammar in [6.9 Effects and requirements
+> [Decided]](#69-effects-and-requirements-decided). A `type` declaration, a `def` whose name is
+> qualified by a type (`def Price::discounted(…)`), and `@RenamedFrom` on either a `type` or one of
+> its constructors are **[Decided]**, with their grammar in [6.8 Nominal types and methods
+> [Decided]](#68-nominal-types-and-methods-decided). (`mut_assign_stmt` and `with_stmt` above are
+> already implemented — §4.3, §8; they are in the grammar, not this list.)
 
 The module statements `import_stmt`, `run_stmt`, `param_stmt`, `renamed_from_stmt`, `discard_stmt`
 and `pub_stmt` parse, with the productions of [9. Modules](#9-modules), and so does `const` before a
@@ -656,9 +658,8 @@ perform an **effect** when evaluated. The effecting forms:
   A function's effects are always visible in its signature (a `Mut(…)`
   parameter, or a write to a `Txn` variable in its body); there are **no
   implicit-effect functions**, so an inert expression statement (§4.9)
-  stays detectable and rejected. Effects becoming part of a function's
-  type is **[Tentative]**
-  ([6.9 Effects in function types [Tentative]](#69-effects-in-function-types-tentative)).
+  stays detectable and rejected. A function's type stating its effects is
+  **[Decided]** ([6.9 Effects and requirements [Decided]](#69-effects-and-requirements-decided)).
 
 Mutation of a *variable* is a property of statements, not expressions:
 `x := e` (§4.3, §8.1) writes a mutable variable, and loop accumulation
@@ -1513,8 +1514,19 @@ statements whose last statement yields a value — i.e. one of:
   above (the branch's value is the function's result for that case).
 
 A function value captures the values of free names in its surrounding
-scope at definition time (lexical capture). Captured names are
-read-only: a function cannot mutate a name from an outer scope.
+scope at definition time (lexical capture). A captured mutable variable is
+the exception: a call reads it at the call's own position in its history.
+
+```python
+cnt := 10
+def f(x):
+    cnt + x
+cnt := 20
+f(0)          # 20
+```
+
+Captured names are read-only: a function cannot mutate a name from an outer
+scope.
 Recursion through self-reference is **[Planned]**; for now each
 function must be definable without referring to its own name.
 
@@ -2044,11 +2056,14 @@ Generator functions have a separate rule for bare `return`, specified under
 
 ### 4.9 Expression statement
 
-A final expression statement supplies its block's value. A nonterminal expression statement
-must have a permitted effect: a feed (`target << value`) or a function call that writes a
-`Mut(…)` parameter or transactional mutable variable. An inert nonterminal expression is
-rejected. Function effects must be visible in their types; there are no implicit-effect
-functions. See [Mutability, transactions, and feeds](#8-mutability-transactions-and-feeds).
+A final expression statement supplies its block's value. A nonterminal expression statement is
+evaluated only for what it causes
+([6.9 Effects and requirements [Decided]](#69-effects-and-requirements-decided)), so one that causes
+nothing is inert and is rejected. A statement that writes a variable, appends to a feed, commits a
+transaction, causes `Emit` or may raise an exception is not inert. What it requires does not count:
+a call that only reads the clock is inert. In a polymorphic `def`, a statement calling a function
+parameter causes whatever that function does, which each use decides, so the definition does not
+reject it. See [Mutability, transactions, and feeds](#8-mutability-transactions-and-feeds).
 
 **[Decided]** Contextual transaction parameters add calls that obtain their transaction from
 context rather than a `Mut(…)` argument; its contract is specified under
@@ -3157,24 +3172,276 @@ read from an instance, `summon(Area(_))::area(s)`
   method and a trait's function may share a name, and two traits may declare functions of one
   name: `c.area()`, `summon(Area(_))::area(c)` and `summon(Surface(_))::area(c)` are three calls.
 
-### 6.9 Effects in function types [Tentative]
+### 6.9 Effects and requirements [Decided]
 
-A function's type includes its **effects**. An effect is one of:
+A function's type states what a call reads from its context, in its **`requires` clause**, and what
+the call contributes besides its result, in its **`causes` clause**. A requirement is an input that
+the context supplies. An effect is an output. Trait requirements
+([Trait requirements](#trait-requirements)) are implemented, and the rest of this section is
+**[Decided]**. The effecting forms that are implemented
+([3. Expression semantics](#3-expression-semantics)) are the `Write` and `Append` effects below,
+read off a function's body rather than stated in its type.
 
-- IO, through a source or a sink ([7. Built-in functions and
-  sources](#7-built-in-functions-and-sources));
-- mutation of state provided from outside the function, through a `Mut(…)` parameter or a
-  captured mutable variable ([8. Mutability, transactions, and
-  feeds](#8-mutability-transactions-and-feeds)).
+| Requirement | Supplied by | Required by |
+| --- | --- | --- |
+| a trait instance | the instance that the call's types pick ([Summoning an instance](#summoning-an-instance)) | an operator, a `summon`, a trait's function |
+| `Transaction` | a `with begin():` block, for its body ([8.7 Direction [Decided]: transactions as contextual parameters](#87-direction-decided-transactions-as-contextual-parameters)) | a read or a write of a transactional mutable variable |
+| `Ext` | the run, at every position ([Inputs from outside the program](#inputs-from-outside-the-program)) | opening a source, a reading |
+| `Read(x)` | the scope binding `x`, to every call inside it | a read of the induction variable `x` |
 
-Today's effecting calls ([3. Expression semantics](#3-expression-semantics)) carry the
-mutation effect, read off a `Mut(…)` parameter or a `Txn` write in the body. Under this
-direction the function's type states it. Everything else about effects is **[Open]**: how an
-effect is written in a function type, how effects compose and are inferred, and whether a feed
-write is an effect of its own.
+| Effect | Caused by |
+| --- | --- |
+| `Write(x)` | a write to the mutable variable `x`: `x := e`, a compound assignment, passing `x` to a `Mut` parameter, or a call to a function that writes `x` |
+| `Append(f)` | a contribution to the feed `f`: `f << e` or `f <<= e` |
+| `Commit` | a `with begin():` block ([8.2 Transactions: `with begin():`](#82-transactions-with-begin)) |
+| `Emit` | an output outside the program ([Output outside the program](#output-outside-the-program)) |
+| `Raise(E)` | `raise e` with `e` of type `E` ([Exceptions](#exceptions)) |
 
-**[Open] — crash handling.** What a program does when an effect fails at run time, and in
-particular whether the dataflow downstream of the failure pauses, is undecided.
+**Every requirement and every effect is a trait.** A requirement's instance is what its context
+supplies, as the first table states. `Transaction`, `Ext` and `Read` are built-in traits that differ
+from a declared one only in where their instances come from. An effect is a built-in trait with no
+instances: the five above are every effect there is, and a program declares no effect of its own. A
+program extends an effect only through its parameters, as each exception type is another `Raise(E)`.
+A trait may take a term parameter, as `Read`, `Write` and `Append` take a variable.
+
+**A clause is a type.** A trait applied to its operands is a type, so each requirement and each
+effect is one, and an effect is a type with no values. A `causes` clause is the join of its effects
+in the subtype order. A `requires` clause is the meet of its requirements, since the context
+supplies an instance of each. Two built-in types bound them:
+
+- `Effect` is above every effect and every join of effects. `causes nothing` is the least of them.
+- `Context` is the requirement that every context meets, and every requirement and every meet of
+  requirements is below it. `requires nothing` is `Context`.
+
+The families are closed, so no other type is below `Effect` or `Context`. A variable standing for a
+clause is a type variable with one of them as its bound ([Kinds and bounds](#kinds-and-bounds)).
+
+An expression requires and causes what its parts and the calls it makes require and cause. A
+block, a function body and a module's top level require and cause what their statements do, less
+what they discharge.
+
+#### Discharging requirements and effects
+
+| Construct | Discharges |
+| --- | --- |
+| `with begin():` | `Transaction`, in its body |
+| `try` with `except T` | the exception `T`, in its `try` block |
+| the end of a scope | `Write(x)`, `Append(x)` and `Read(x)` for a variable `x` it binds, under the rules below |
+| the run | `Ext`, at a module's top level |
+
+- **A scope ends the history of each variable it binds.** A scope is a `def` body, a loop body, a
+  block, or a module's top level. At its end, `Write(x)`, `Append(x)` and `Read(x)` for each `x`
+  the scope binds are dropped: every write to `x` stands inside the scope, so nothing outside it
+  observes one, and every call inside the scope has a position in `x`'s history to read at.
+- **Two kinds of variable outlive the scope that binds them.** A transactional mutable variable is
+  bound by its run, and its history grows as transactions commit after the top level has run. A
+  feed other modules append to, a public one or a private one a public function appends to, is
+  the run's too. Neither one's effects is dropped at a scope's end.
+- **A `Mut` parameter's writes are the caller's.** A call passing `a` to a `Mut` parameter causes
+  `Write(a)`, whether or not the callee writes it. The callee's writes to its own `Mut` parameter are
+  not in its type, since the parameter's `Mut(…)` type states them.
+- **Nothing that outlives a scope names a variable whose history the scope ends.** A function value
+  or a public member whose type causes `Write(x)` or `Append(x)`, or requires `Read(x)`, for such
+  an `x` is an error at its definition. At a module's top level this rule is
+  [9.10 Induction variables stay in their module](#910-induction-variables-stay-in-their-module).
+- **A contract names a transactional mutable variable through its run**, private or not, as a type
+  mentions a private member ([9.13 Private-in-public](#913-private-in-public)). A module using
+  `inv::reserve` reads `causes Write(inv::stock)`, and two runs' variables are two effects.
+- **`Commit` and `Emit` are never discharged.** A `with begin():` block whose body causes `Commit`
+  is a nested transaction ([8.2 Transactions: `with begin():`](#82-transactions-with-begin)).
+- **A function value's requirements are supplied at each call.** A lambda that requires
+  `Transaction` reads the transaction of the block it is called in, not the block it was made in.
+
+#### Writing requirements and effects
+
+```ebnf
+def_stmt        ::= "def" ident "(" [ params ] ")" [ "=>" expression ]
+                    [ requires_clause ] [ causes_clause ] ":" block
+fun_type        ::= expression "=>" expression [ requires_clause ] [ causes_clause ]
+requires_clause ::= "requires" ( "nothing" | [ "only" ] requirement ( "," requirement )* )
+causes_clause   ::= "causes" ( "nothing" | [ "only" ] effect ( "," effect )* )
+requirement     ::= … | "Read" "(" variable ")" | "_"
+effect          ::= "Write" "(" variable ")" | "Append" "(" variable ")"
+                 |  "Commit" | "Emit" | "Raise" "(" expression ")" | Ident | "_"
+variable        ::= ( ident "::" )* ident
+```
+
+`requirement`'s other alternatives are those of [Trait requirements](#trait-requirements), and
+`Transaction`, `Ext` and a variable are written as a trait is. A capitalized name standing alone in
+a clause is a type variable or an associated type. One in a `causes` clause is bounded by `Effect`
+or a type below it, and one in a `requires` clause by `Context` or a type below it
+([Kinds and bounds](#kinds-and-bounds), [Effects in traits](#effects-in-traits)). Any other is an
+error.
+
+- **An omitted clause in a `def` is inferred.** `def total(xs): …` requires and causes what its
+  body does.
+- **A written clause in a `def` is a lower bound.** `def lookup(k) causes NotFound:` states that a
+  call may raise `NotFound`, and inference adds the rest of what the body causes. A call sees every
+  written requirement and effect whether the body has it or not, so a library may state an effect
+  its body does not cause yet.
+- **`only` makes a clause an upper bound.** Under `causes only Write(stock), NotFound`, an effect
+  the body causes beyond those listed is an error at the line that causes it, with a secondary label
+  at the clause. `nothing` is the empty upper bound: `def norm(v) requires nothing causes nothing:`.
+- **A trait requirement on a type parameter is always written.** A type parameter is opaque
+  ([Type parameters](#type-parameters)), so inference adds no requirement on one, whether the
+  clause is a lower or an upper bound ([Trait requirements](#trait-requirements)).
+- **A written type's clauses are exact.** A function type `A => B` with no clause requires nothing
+  and causes nothing, in an annotation, a parameter's type, a Module type's entry and a trait's
+  signature alike. `_` in a clause stands for what inference supplies, as it does in a type:
+  `A => B causes _`.
+- **A hole that a `def`'s body leaves open is a variable.** In
+  `def apply_all(f: Int => Int causes _, xs): [f(x) for x in xs]` nothing fixes the hole, so
+  `apply_all` has type
+  `forall (E <: Effect) {Int => Int causes E, List(Int)} => List(Int) causes E`, as a type that a
+  body leaves open makes a `def` polymorphic ([6.10 Polymorphic types](#610-polymorphic-types)). A
+  variable is written where an upper bound relates two positions:
+  `def apply_all(E <: Effect, f: Int => Int causes E, xs) causes only E`.
+- **A function type that requires and causes less is a subtype.** A `requires` clause is an input
+  and a `causes` clause an output, so `A => B requires R₁ causes E₁` is a subtype of
+  `A => B requires R₂ causes E₂` when `R₂ <: R₁` and `E₁ <: E₂`. A meet is below another when it has
+  each of the other's requirements, and a join is below another when each of its effects is below
+  one of the other's, as `Raise(Int@2)` is below `Raise(Int)` ([Exceptions](#exceptions)).
+- **A monomorphic function type requires only context.** A function value's trait requirements are
+  resolved where it is made, so its type's `requires` names only `Transaction`, `Ext`, `Read(x)`
+  and type variables bounded by `Context`. A polymorphic type has one clause after its function
+  type's codomain, holding its trait requirements and its context requirements together
+  ([Polymorphic type annotations](#polymorphic-type-annotations)).
+- **An arrow takes the clauses written after its codomain.** `=>` groups to the right, so in
+  `A => B => C causes E` the clause is `B => C`'s, and `A => (B => C) causes E` gives it to the
+  outer arrow.
+- **A diagnostic and `cambra check` print each clause in full,** inferred parts included
+  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)).
+
+#### Inputs from outside the program
+
+`Ext` is the requirement of every input from outside the program:
+
+- **Opening a source requires `Ext`** ([7.4 Sources](#74-sources)). The source's elements are
+  values, so a function that reads a captured source requires nothing further.
+- **A reading requires `Ext`.** A reading is an operation whose value comes from outside the
+  program at one position: the clock, a random value, or the reply to a call made outside the
+  program. The host registers readings as it registers sources.
+
+The run supplies `Ext` at every position, and no construct in a module supplies it. A top level
+that requires it is therefore run, not imported
+([Shareable modules [Decided]](#shareable-modules-decided)), and no constant reads one
+([9.19 Constants](#919-constants)). `Ext` has no parts: no construct supplies one kind of input
+without the others.
+
+The **position** of an evaluation is the run's start at the top level, extended by one iteration
+for each loop around the evaluation. A **call path** is the sequence of call sites, outermost first,
+through which an evaluation reaches an operation. Calls are resolved when the program is compiled,
+so each call path is fixed.
+
+- **A reading keyed by position** has one value at each position, however many calls read it. Every
+  call that reads the clock at one position returns one instant.
+- **A reading keyed by call path** has one value at each position and call path. Two calls at one
+  position that draw a random value return two values, and one call evaluated again returns its
+  value again. The reply to a call made outside the program is keyed this way.
+- **The run records each reading** the first time its key is evaluated and returns the recorded
+  value at every later evaluation, so a retried transaction and a computation repeated after a
+  crash read what the first evaluation read.
+- **A reading compiles to a source** keyed as the reading is, which the run fills as each key is
+  first evaluated.
+- **[Open]** — which readings a reload keeps. A reading at a position the new version still has is
+  kept; how the positions of two versions correspond is undecided
+  ([9.18 Reloading a program of modules](#918-reloading-a-program-of-modules)).
+
+#### Output outside the program
+
+`Emit` is the effect of every output outside the program. A **sink** is an operation that hands data
+out: binding a feed to a sink, as `http_serve` binds its responses ([7.4 Sources](#74-sources)), or
+calling a sink function, which takes a collection and writes it out. Each causes `Emit`. A call that
+sends a request out and returns the reply causes `Emit` and requires `Ext`.
+
+No construct discharges `Emit`. An output inside a `with begin():` block is sent only if the block
+commits
+([8.4 Feeds are the second form of mutability](#84-feeds-are-the-second-form-of-mutability)).
+
+#### Exceptions
+
+```ebnf
+raise_stmt  ::= "raise" expression
+try_stmt    ::= "try" ":" block ( "except" expression [ "as" ident ] ":" block )+
+```
+
+An **exception** is a value a `raise` raises, of any type. Its type is the parameter of the
+`Raise` effect it causes, so `Raise(Negative)` and `Raise(Timeout)` are two effects:
+
+```python
+type Negative = {qty: Int}
+
+def checked(qty):
+    if qty < 0:
+        raise Negative::new((qty=qty))
+    qty
+
+def checked_or_zero(qty):
+    try:
+        checked(qty)
+    except Negative:
+        0
+```
+
+- **`raise e` causes `Raise(E)`,** where `E` is the type of `e`, so `raise 2` causes
+  `Raise(Int@2)`. `raise` is a statement.
+- **`Raise` is covariant.** An exception is an output, so a function that may raise an `Int@2` may
+  raise an `Int`: `Raise(Int@2)` is a subtype of `Raise(Int)`. A set of effects is below another
+  when each of its effects is below one of the other's.
+  A path that raises contributes no value, so an `if` arm, a `match` arm or a branch of a function
+  body that raises is left out of the join
+  ([Joining the types of several values](#joining-the-types-of-several-values)).
+- **An exception ends its path.** The statements after a statement that raises run only on the path
+  where it did not raise. The statements before it are unaffected, and their outputs stand.
+- **A call causes each `Raise(E)` its callee causes** and does not catch.
+- **An exception is an output.** An expression that may raise raises whether its value is used or
+  not, and a statement whose only effect is an exception is not inert
+  ([4.9 Expression statement](#49-expression-statement)).
+- **`try` catches by type.** `except T` catches each `Raise(S)` its `try` block causes with `S` a
+  subtype of `T`. Where the block raises such an exception, the first clause catching it runs, with
+  the exception bound to the name after `as` at type `T`, and its value is the statement's. The
+  statement causes what its `try` block causes, less what its clauses catch, and what its clauses'
+  blocks cause. In value position its type is the join of its blocks' values, as an `if`'s is. A
+  clause that catches nothing its `try` block causes is an error.
+- **Catching is decided by type, not by value.** `except {Int where _ > 0}` catches `raise 2`,
+  whose type is `Int@2`, and not `raise n` with `n: Int`, whatever value `n` holds.
+- **An exception escaping a `with begin():` block aborts the transaction.** None of the block's
+  writes commits and no output inside it is sent, and the exception continues outward. An exception
+  caught inside the block does not abort it.
+- **An exception escaping a loop body orders the loop's iterations.** The loop raises the exception
+  of its first raising iteration in iteration order, and the iterations after that one contribute
+  nothing. This is a dependency from one iteration to the next, as an accumulator's is ([4.6 `for` —
+  iteration](#46-for--iteration)), and a loop whose source is not indexed by iteration position
+  catches inside its body ([Accumulator iteration order is not yet defined
+  [Open]](#accumulator-iteration-order-is-not-yet-defined-open)).
+- **No exception escapes the program.** An exception that a module's top level causes is an error
+  at the statement it escapes from, with a secondary label at the `raise`.
+- **Catching is resolved when the program is compiled.** A function that causes `Raise(E)` returns
+  its result or an `E`, and each caller passes the `E` on or catches it. No handler is looked up at
+  run time ([8.7 Direction [Decided]: transactions as contextual
+  parameters](#87-direction-decided-transactions-as-contextual-parameters)).
+
+**[Open] — crash handling.** What a program does when an operation outside it fails at run time,
+and in particular whether the dataflow downstream of the failure pauses, is undecided.
+
+#### Effects in traits
+
+- **A trait's signature is a written type.** A `def` line in a trait with no clause requires
+  nothing beyond its trait requirements and causes nothing, and an instance's function requires and
+  causes only what the trait's signature states
+  ([Declaring an instance](#declaring-an-instance)).
+- **An associated type lets instances differ.** `Name <: Effect` in a trait declares an associated
+  type that a `causes` clause names, and `Name <: Context` one that a `requires` clause names:
+
+  ```python
+  trait Sink(T):
+      Writes <: Effect
+      def put(t: T, v: String) causes Writes
+  ```
+
+  An instance writes no definition of such a type: it is what the instance's functions cause, or
+  require, beyond what their signatures list otherwise. Under `requires s: Sink(T)`, `s::Writes` is
+  the type of the instance each call passes, and a call of `s::put` causes it.
 
 ### 6.10 Polymorphic types
 
@@ -3270,6 +3537,11 @@ in the kind `K`:
 - `SubtypesOf(U)` is every subtype of `U`, `U` included. `T <: U`, the **bound** form, is
   `T: SubtypesOf(U)`.
 
+**[Decided]** A clause of
+[6.9 Effects and requirements [Decided]](#69-effects-and-requirements-decided) is a type, so a
+variable standing for one is a type variable with the bound form: `E <: Effect` ranges over `causes`
+clauses and `R <: Context` over `requires` clauses.
+
 Any other kind, such as a listing `T: [Int, String]`, is **[Open]** and an error. A type written as
 a kind, as in `T: Int`, is an error.
 
@@ -3354,6 +3626,9 @@ the sum of two `Int`s is an `Int`.
   parameter is an error unless a requirement or the parameter's bound covers it. Where both do, the
   requirement decides: `x + y` under `T <: Int` and `requires a: Addable(T, T), a::Output <: T` is
   an `a::Output`, which is a `T`.
+- **[Decided]** — the context requirements `Transaction` and `Ext`, a written clause as a lower
+  bound, and `only` and `nothing`, are specified in
+  [Writing requirements and effects](#writing-requirements-and-effects).
 - **Each call satisfies each requirement at its own instantiation,** and passes the instance that
   satisfies it. A call that does not is rejected at the call. A secondary label at the requirement
   is **[Decided]**.
@@ -3432,15 +3707,18 @@ def total(S, s: S) => Int requires a: Area(S):
 trait_stmt  ::= "trait" Ident "(" Ident ( "," Ident )* [ "," ] ")" [ requires_clause ] ":"
                 NEWLINE INDENT trait_item+ DEDENT
 trait_item  ::= Ident NEWLINE
-             |  "def" ident "(" params ")" "=>" expression [ requires_clause ] NEWLINE
+             |  Ident "<:" ( "Effect" | "Context" ) NEWLINE           (* [Decided] *)
+             |  "def" ident "(" params ")" "=>" expression [ requires_clause ]
+                [ causes_clause ] NEWLINE
 ```
 
 A `trait` declaration binds a capitalized name to a new trait over its **operands**, the types it
 names in parentheses: one instance type for each list of operand types. Its body declares
-**associated types**, each a capitalized name alone, `Elem`, and **functions**, each a `def` line
-with a signature and no body. Every instance defines each associated type and holds each function at
-its own operands. An associated type is an alias the instance defines, not a nominal type, so no
-`type` keyword introduces it.
+**associated types**, each a capitalized name alone, `Elem`, or bounded by `Effect` or `Context`
+([Effects in traits](#effects-in-traits)), and **functions**, each a `def` line with a signature
+and no body. Every instance holds each function at its own operands and defines each associated
+type, except one bounded by `Effect` or `Context`, which its functions decide. An associated type is
+an alias the instance defines, not a nominal type, so no `type` keyword introduces it.
 
 ```python
 trait Area(S):
@@ -3460,7 +3738,10 @@ trait Scales(V, F):
 - **A signature states every type.** Each parameter is annotated and the result is written. The
   operands and associated types are types in every signature. A function may declare type
   parameters of its own, as `tag` declares `R`, and a `requires` clause; each call opens the
-  parameters at its own types and satisfies the clause there.
+  parameters at its own types and satisfies the clause there. **[Decided]** A signature is a
+  written type, so one without a `causes` clause causes nothing, and an associated type
+  `Name <: Effect` lets instances cause different effects
+  ([Effects in traits](#effects-in-traits)).
 - **A trait's function is no method.** No parameter of one is named `self`, in the trait or in an
   instance, and a call reads it from an instance: `summon(Scales(_, _))::scale_vec(2, v)`, not
   `2.scale_vec(v)` ([Associated functions and methods](#associated-functions-and-methods)).
@@ -3557,7 +3838,8 @@ impl forall (T) Area(Two(T)) requires a: Area(T):
 - **The block defines each of the trait's functions, and nothing else.** A `def` in it is the
   trait's function at the instance's types. A parameter it leaves unannotated, its result, its own
   type parameters and its `requires` clause are the trait's there, and one it writes must be the
-  trait's. A `def` names no type of its own, and `pub` does not mark one.
+  trait's. **[Decided]** Its `causes` clause is the trait's there too, and its body causes only
+  what that clause states. A `def` names no type of its own, and `pub` does not mark one.
 - **No two instances of a trait accept one type.** Two instances overlap when some types match both
   heads, as `Two(T)` and `Two(Int)` do, and `Duo(Int, B)` and `Duo(A, String)`; the second is an
   error. `Two(Int)` and `Two(String)` do not overlap, and a summon picks between them by the types
@@ -3659,6 +3941,10 @@ pick: forall (T) {T, T} => T = first
   and `pick: Pick = first` uses it as a whole annotation
   ([6.7 Type-alias statements](#67-type-alias-statements)). Such an alias inside another type is
   the nested case above.
+- **[Decided]** — **A polymorphic function type has one `requires` clause,** after its codomain,
+  holding the trait requirements on the types it quantifies and the context requirements of a
+  call: `forall (T) {T, T} => T requires Orderable(T, T), Transaction causes Emit`
+  ([Writing requirements and effects](#writing-requirements-and-effects)).
 - **It is never a type constructor.** `forall (T) V` does not denote a function from types to
   types. A parameterised alias, if added, is written in the head form `Pair(T) = {T, T}`
   ([6.7 Type-alias statements](#67-type-alias-statements)).
@@ -3782,6 +4068,11 @@ responses ([10. Sinks](#10-sinks)).
 
 Additional sources may be pre-registered by the host embedding (testing,
 demos, etc.).
+
+**[Decided]** Opening a source requires `Ext`, and binding a sink causes `Emit`
+([Inputs from outside the program](#inputs-from-outside-the-program),
+[Output outside the program](#output-outside-the-program)). The host registers readings, such as
+the clock, as it registers sources.
 
 `http_serve` has a special-cased statement form:
 
@@ -4006,6 +4297,11 @@ for req in incr_reqs:
   (a disguised nested transaction).
 - **Nested transactions are rejected** — a block commits as one unit, so a
   `with` inside it has no coherent meaning.
+- **[Decided]** A block causes `Commit`, and its body supplies `Transaction` to what it calls. A
+  body that causes `Commit`, directly or through a call, is the nested transaction above
+  ([Discharging requirements and effects](#discharging-requirements-and-effects)). An exception
+  that escapes the block aborts it: none of its writes commits and no output inside it is sent
+  ([Exceptions](#exceptions)).
 - **Branch guards and tag dispatch.** A block may carry `if`/`elif`/`else`
   guards, more than one of them, and `match` dispatch. Each branch's
   writes are scoped to its own path and the transaction commits on the
@@ -4243,11 +4539,14 @@ Supporting decisions (same source):
   `with dom.begin()`, restores per-domain coherence while allowing fresh
   transactions across scopes. Start with one global domain and make `dom`
   itself a given, so the common case omits it.
-- **Commit/abort are data operations on a time-region**, not control
-  effects: block exit merges the region forward (commit), `abort()` drops
-  it (rollback) — a structured early-exit, not exception unwinding.
+- **A commit is a data operation on a time-region**, not a control effect:
+  block exit merges the region forward. A transaction that should not commit
+  is written with a guard, the deny idiom of
+  [8.2 Transactions: `with begin():`](#82-transactions-with-begin), or ends
+  with an exception that escapes the block, which drops the region
+  ([Exceptions](#exceptions)). There is no `abort()`.
 - **Terminology:** type `Transaction`; variable abbreviation `txn` (never
-  `tx`, which collides with "transmit"); operations `begin()` / `abort()`.
+  `tx`, which collides with "transmit"); operation `begin()`.
 - **Implicit *parameters* only — never implicit conversions**; given
   visibility stays explicit and resolution inspectable (hence `summon`).
 - **One `requires` clause.** `Transaction` and trait requirements share it:
@@ -4421,7 +4720,8 @@ members ([9.8 Module types](#98-module-types)).
   ([9.8 Module types](#98-module-types)).
 - **Module interface.** What checking records about a module for the modules that use it: its
   public members' contracts, its parameters, and whether it performs IO or declares mutable state
-  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)).
+  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). **[Decided]** In place
+  of the last, whether it is shareable ([Shareable modules [Decided]](#shareable-modules-decided)).
 
 ### 9.2 Imports
 
@@ -4703,6 +5003,43 @@ pub InStock = {String where _ in stock.keys()}   # intended; not supported today
 `InStock` is intended and not supported today, in one file as across modules: the compiler cannot
 name a mutable map's key set in a type. `run inventory as inv` and `run inventory as eu_inv` are two
 runs, each with its own `stock`, and `inv::InStock` is a different type from `eu_inv::InStock`.
+
+#### Shareable modules [Decided]
+
+A module is **shareable** when its top level, less what its scopes discharge, requires nothing but
+trait instances and causes nothing
+([6.9 Effects and requirements [Decided]](#69-effects-and-requirements-decided)). An import shares
+one evaluation among every import passing its arguments, so what decides is the module with its
+arguments: a statement naming a shareable module, whose arguments are each one an import may pass
+([9.2 Imports](#92-imports)), is an `import`, and any other is a `run`. Importing a module that is
+not shareable is an error at the `import`, naming what its top level requires or causes. Running a
+shareable module with arguments an import could pass is an error at the `run`. A run passing a run
+gives its module state an import cannot share, so `run shop(counter=c)` with a run `c` is legal
+whatever `shop`'s top level does.
+
+- **A top level that opens a source or takes a reading requires `Ext`,** and one that binds a sink
+  causes `Emit`. Its module is run.
+- **A transactional mutable variable makes its module a run.** Its declaration writes it, and the
+  top level's end does not discharge `Write` of a variable bound by the run.
+- **So does a public feed.** Other modules append to it, so declaring it causes `Append`, which
+  the top level's end does not discharge.
+- **An induction variable and a private feed do not.** Each one's history ends with the top level,
+  so its writes are discharged there, and a module whose only state is induction variables and
+  private feeds is shareable when nothing else makes it a run. A public function that reads or
+  writes an induction variable names it past its scope, which is an error
+  ([9.10 Induction variables stay in their module](#910-induction-variables-stay-in-their-module)).
+  A public function that appends to a private feed makes the feed the run's, as a public feed is,
+  since appends commute and have no order to lose across modules.
+- **[Open]** — how `@LoadFrom` ([8.8 `@LoadFrom`](#88-loadfrom)) and a reload bear on what a top
+  level requires and causes, if at all.
+- **A `run` statement requires and causes what its module's top level does,** so a module that runs
+  another is run.
+- **A top level from which an exception escapes is an error,** imported or run
+  ([Exceptions](#exceptions)).
+
+This rule replaces the one above it in two cases. A module whose only state is induction variables
+and private feeds is imported, where "declares mutable state" makes it a run. A module that performs
+no IO and declares no state cannot be run.
 
 ### 9.8 Module types
 
@@ -4994,7 +5331,10 @@ with the type `Count` names.
   ([9.19 Constants](#919-constants)).
   **[Planned]** — and which public functions may be called in a constant.
 - **Imports are read through contracts.** A module sees each member another module exports through
-  its contract, and whether the module performs IO or declares mutable state.
+  its contract, and whether the module performs IO or declares mutable state. **[Decided]** A
+  function's contract includes its `requires` and `causes` clauses, and in place of IO and state
+  the interface records whether the module is shareable
+  ([Shareable modules [Decided]](#shareable-modules-decided)).
 - **A public member's contract is its type.** An exactly annotated member's contract is the
   annotation, checked against the body, and a module using the member reads no body. An unannotated
   member's contract is its inferred type, refinements and all, and a `<:` member's is its inferred
@@ -5203,11 +5543,14 @@ pub type Capped = {Int where _ <= limit}
   ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). `const` before any
   other statement is an error.
 - **[Planned]** **A function may be called in a constant when its body reads only its own
-  parameters, constants, and functions that may be.** Functions carry no marker. The check follows
-  a `def` through its body and every function that body calls, and reads an imported function
-  through its module's interface, which records whether each public function may be
-  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). A call to one that may
-  not is an error naming the binding, source, feed or mutable variable its body reads.
+  parameters, constants, and functions that may be.** **[Decided]** — when, in addition, it requires
+  nothing and causes nothing ([6.9 Effects and requirements
+  [Decided]](#69-effects-and-requirements-decided)). A function that requires nothing and causes
+  nothing but captures a value the run computes is not one. Functions carry no marker. The check
+  follows a `def` through its body and every function that body calls, and reads an imported
+  function through its module's interface, which records whether each public function may be ([9.14
+  Checking a module on its own](#914-checking-a-module-on-its-own)). A call to one that may not is
+  an error naming the binding, source, feed or mutable variable its body reads.
 - **A read of a constant is known to be the constant**, in a module checked alone too, where a
   `const` parameter has no value yet. There `Capped::new(max_rate)` meets
   `{Int where _ <= max_rate}`, and in a module that writes `run shop(max_rate=r + 1) as a`, a value
@@ -5252,6 +5595,11 @@ the whole of what the program produces: the value of its trailing expression
 is discarded.
 
 Sinks may observe the indices of collections passed to them if needed.
+
+**[Decided]** A sink is any operation that hands data out of the program: binding a feed to a sink,
+or calling a sink function that takes a collection and writes it out. Feeds are one way to build the
+collection, not the only one. Each causes `Emit`
+([Output outside the program](#output-outside-the-program)).
 
 ## 11. Errors and recovery
 
