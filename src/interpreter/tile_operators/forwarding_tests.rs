@@ -111,6 +111,28 @@ fn nested() -> Tiling {
     Tiling::data_function(Extent::uint_range(8), ints())
 }
 
+fn zip() -> Built {
+    let (a, first) = feed(ints());
+    let (b, second) = feed(ints());
+    let op = Zip::new_at(
+        vec![SmolStr::new("_0"), SmolStr::new("_1")],
+        vec![a, b],
+        CurryLevel::new(1),
+    );
+    (Box::new(op), vec![first, second])
+}
+
+#[test]
+fn zip_forwards_the_region_of_its_first_arm() {
+    assert_keeps(&zip, 0);
+}
+
+#[test]
+fn zip_forwards_the_region_of_its_second_arm_without_state() {
+    assert_keeps(&zip, 1);
+    assert_keeps_without_state(&zip, 1);
+}
+
 fn int() -> Extent {
     Extent::Base(BaseType::Int)
 }
