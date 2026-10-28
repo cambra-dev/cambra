@@ -485,6 +485,10 @@ impl Notified {
     /// gate, whether `region` is not inside what the notifications passed since the last pull
     /// named. `Always` is always news.
     pub fn mark_news_of(&self, region: &Projection) -> bool {
+        // Nothing is never news, and a gate holds a region only for a notification that passed.
+        if *region == Projection::Nothing {
+            return false;
+        }
         match self {
             Self::Always => true,
             Self::Flag(c) => !c.swap(true, Ordering::AcqRel),
@@ -513,10 +517,10 @@ impl Notified {
         }
     }
 
-    /// Record that a notification of `region` re-entered the consumer behind this gate while it
+    /// Hold the region of a notification that re-entered the consumer behind this gate while it
     /// was being notified, for that notification to deliver when it returns
     /// ([`take_pending`](Self::take_pending)). Only a gate holds regions.
-    pub fn defer(&self, region: &Projection) {
+    pub(crate) fn hold_pending(&self, region: &Projection) {
         match self {
             Self::Gate(gate) => {
                 let mut held = gate.held.lock().expect("a gate's region is never poisoned");
@@ -526,8 +530,8 @@ impl Notified {
         }
     }
 
-    /// The regions [`defer`](Self::defer) recorded, and forget them: `Nothing` where none.
-    pub fn take_pending(&self) -> Projection {
+    /// The regions [`hold_pending`](Self::hold_pending) held, and forget them: `Nothing` where none.
+    pub(crate) fn take_pending(&self) -> Projection {
         match self {
             Self::Gate(gate) => {
                 let mut held = gate.held.lock().expect("a gate's region is never poisoned");
@@ -579,13 +583,12 @@ impl Notified {
     /// A gate's pull begins here. Whenever the lock is free, `set` is clear exactly where the
     /// region held is `Nothing`, and `everything` is set exactly where it is `Everything`: every
     /// critical section ends in that state. So a pull that finds `set` clear has nothing to reset
-    /// and returns without the lock, and one that finds it set clears `everything` before `set`
-    /// and resets the region before it releases the lock, so a notification that takes the lock
-    /// afterwards finds the gate clear and passes. A notification that read `everything` before
-    /// the pull began is suppressed, which loses nothing: the pull reads after this returns, so
-    /// it reads the data that notification announced. What orders that read after the write is
-    /// the data's own synchronization, the producer's mutex in production, and not the atomics
-    /// here.
+    /// and returns without the lock, and one that finds it set resets both and the region
+    /// under the lock, so a notification that takes the lock afterwards finds the gate clear and
+    /// passes. A notification that read `everything` before the pull began is suppressed, which
+    /// loses nothing: the pull reads after this returns, so it reads the data that notification
+    /// announced. What orders that read after the write is the data's own synchronization, the
+    /// producer's mutex in production, and not the atomics here.
     pub fn take(&self) -> bool {
         match self {
             Self::Always => true,

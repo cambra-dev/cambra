@@ -85,7 +85,7 @@ impl Consumer for Gated {
         }
         // A notification that re-enters this consumer while it is being notified cannot be
         // delivered inside the first, so the forwarder leaves its region with the gate
-        // ([`Notified::defer`]) and the notification in progress delivers it when it returns,
+        // ([`Notified::hold_pending`]) and the notification in progress delivers it when it returns,
         // through the gate, until nothing is left. Only a region outside what the gate passed
         // reaches the consumer, and the gate only grows until a pull, so a cycle of such
         // notifications ends inside the one that started it.
@@ -354,7 +354,7 @@ impl Consumer for Forwarding {
         // queued and no pull is needed.
         match shared.try_lock_now() {
             Some(mut consumer) => consumer.notify(region),
-            None => gate.defer(region),
+            None => gate.hold_pending(region),
         }
     }
 
@@ -1418,15 +1418,20 @@ mod tests {
         assert!(!gate.mark_news_of(&keys(6, 6)));
     }
 
-    /// The two interleavings of a lock-free reader with a pull, as the cases they reduce to. A
-    /// reader that saw `everything` before the pull began is suppressed, which loses nothing: the
-    /// pull reads after it, and the data that notification announced was written before it. One
-    /// that comes after the pull's critical section passes.
+    /// A gate that passed `Everything` suppresses a later one until a pull, and the pull of a gate
+    /// that is clear has nothing to reset. A reader that saw `everything` before a pull began and
+    /// is suppressed loses nothing: the pull reads after it, and the data it announced was
+    /// written before it.
     #[test]
-    fn a_notification_before_a_pull_is_suppressed_and_one_after_it_passes() {
+    fn a_pull_reopens_a_gate_that_passed_everything() {
         let gate = Notified::clear();
         assert!(gate.mark_news_of(&Projection::Everything));
         assert!(!gate.mark_news_of(&Projection::Everything));
+        assert!(
+            !gate.mark_news_of(&Projection::Nothing),
+            "nothing is never news"
+        );
+        assert!(!Notified::clear().mark_news_of(&Projection::Nothing));
         assert!(gate.take());
         assert!(gate.mark_news_of(&Projection::Everything));
         assert!(gate.take());
