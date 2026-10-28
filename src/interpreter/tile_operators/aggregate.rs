@@ -134,7 +134,7 @@ impl TileProducer for AggregateProducer {
         match projection_guard.projection(&self.name()) {
             Projection::Everything => {}
             Projection::Nothing => return self.tiling().empty_tile(),
-            Projection::Keys(_) => panic!(
+            Projection::Keys(_) | Projection::Fields(_) => panic!(
                 "{} is one accumulator, which has no keys to project: {projection_guard:?}",
                 self.name()
             ),
@@ -269,7 +269,7 @@ impl TileProducer for ExtractAggregateProducer {
         match projection_guard.projection(&self.name()) {
             Projection::Everything => {}
             Projection::Nothing => return self.tiling().empty_tile(),
-            Projection::Keys(_) => panic!(
+            Projection::Keys(_) | Projection::Fields(_) => panic!(
                 "{} extracts one value, which has no keys to project: {projection_guard:?}",
                 self.name()
             ),

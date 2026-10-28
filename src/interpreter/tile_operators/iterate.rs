@@ -307,7 +307,9 @@ impl MorselSource for LiveSource {
         let ready = (self.ready)();
         let region = match arrived {
             Projection::Nothing => return,
-            Projection::Everything => ready,
+            // A region of fields names where a change is in a record, and a source's pending
+            // region is keys: the keys that are ready are the region that is safe to name.
+            Projection::Everything | Projection::Fields(_) => ready,
             Projection::Keys(keys) => {
                 assert!(
                     keys.minus(&ready).is_false(),

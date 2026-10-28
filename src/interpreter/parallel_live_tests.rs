@@ -94,7 +94,7 @@ mod end_to_end {
             uint_keys_in(&ready, u64::MAX)
                 .into_iter()
                 .filter(|key| match region {
-                    Projection::Everything => true,
+                    Projection::Everything | Projection::Fields(_) => true,
                     Projection::Nothing => false,
                     Projection::Keys(keys) => keys.contains(key),
                 })

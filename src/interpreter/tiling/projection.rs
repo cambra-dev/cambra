@@ -1,6 +1,10 @@
 //! The projection guards a producer restates: [`Projection`].
 //! See `src/interpreter/design-operators.md`, "Projection guards".
 
+use std::collections::BTreeMap;
+
+use smol_str::SmolStr;
+
 use crate::interpreter::{FunctionGuard, Predicate, Tile, TileGuard, Tiling};
 
 /// The part of a producer's tile that a `get` asks for.
@@ -19,6 +23,14 @@ pub enum Projection {
     /// The outermost collection's keys that the predicate admits, each with the value under
     /// it. The predicate is neither `True` nor `False`, and names no enclosing path.
     Keys(Predicate),
+    /// A record's regions by field, each a region of that field's tile, for a notification from
+    /// a producer whose tile is a record. A field the map omits is [`Nothing`](Self::Nothing).
+    /// Built by [`Projection::fields`], which names no `Nothing` field and no empty map.
+    ///
+    /// A region of fields names where a notification's change is and nothing a read can ask
+    /// for, so it is a notification region only: every use of a projection as a pull
+    /// (`guard`, `restrict_to`, `within`) fails on it with the region in the message.
+    Fields(BTreeMap<SmolStr, Projection>),
 }
 
 impl Projection {
@@ -49,35 +61,119 @@ impl Projection {
             Projection::Everything => tiling.universal_guard(),
             Projection::Nothing => tiling.empty_guard(),
             Projection::Keys(keys) => TileGuard::Function(FunctionGuard::Domain(keys.clone())),
+            Projection::Fields(_) => panic!(
+                "a region of fields is a notification's and names no guard to read: {self:?}"
+            ),
         }
     }
 
     /// The projection of `self` within `other`: what both name.
+    ///
+    /// # Panics
+    ///
+    /// For a region of fields and a region of keys, which name different things.
     pub fn intersect(&self, other: &Projection) -> Projection {
         match (self, other) {
             (Projection::Nothing, _) | (_, Projection::Nothing) => Projection::Nothing,
             (Projection::Everything, kept) | (kept, Projection::Everything) => kept.clone(),
             (Projection::Keys(a), Projection::Keys(b)) => Projection::admitting(a.intersect(b)),
+            (Projection::Fields(a), Projection::Fields(b)) => {
+                Projection::fields(a.iter().filter_map(|(name, region)| {
+                    Some((name.clone(), region.intersect(b.get(name)?)))
+                }))
+            }
+            (a, b) => panic!("a region of fields and a region of keys meet nowhere: {a:?}, {b:?}"),
         }
     }
 
     /// What `self` names that `other` does not: the region still unread after a read at `other`.
+    ///
+    /// # Panics
+    ///
+    /// For a region of fields against a region of keys, and for everything less a region of
+    /// fields, whose remainder would name the fields the region omits.
     pub fn minus(&self, other: &Projection) -> Projection {
         let region = |projection: &Projection| match projection {
             Projection::Everything => Predicate::True,
             Projection::Nothing => Predicate::False,
             Projection::Keys(keys) => keys.clone(),
+            Projection::Fields(_) => unreachable!("handled below"),
         };
-        Projection::admitting(region(self).minus(&region(other)))
+        match (self, other) {
+            (Projection::Nothing, _) | (_, Projection::Nothing) => self.clone(),
+            (Projection::Fields(a), Projection::Fields(b)) => {
+                Projection::fields(a.iter().map(|(name, region)| match b.get(name) {
+                    Some(taken) => (name.clone(), region.minus(taken)),
+                    None => (name.clone(), region.clone()),
+                }))
+            }
+            (Projection::Fields(_), Projection::Everything) => Projection::Nothing,
+            (Projection::Fields(_), Projection::Keys(_))
+            | (Projection::Keys(_), Projection::Fields(_))
+            | (Projection::Everything, Projection::Fields(_)) => {
+                panic!("a region of fields cannot be subtracted this way: {self:?} minus {other:?}")
+            }
+            _ => Projection::admitting(region(self).minus(&region(other))),
+        }
     }
 
-    /// The projection naming what either names: the region a memo has read or must read
-    /// again.
+    /// The projection naming what either names: the region a memo has read or must read again, or
+    /// a notification that coalesces others.
+    ///
+    /// A region of fields and a region of keys name different things, and the union that is
+    /// larger than both is [`Everything`](Self::Everything), which a notification may widen to.
     pub fn union(&self, other: &Projection) -> Projection {
         match (self, other) {
             (Projection::Everything, _) | (_, Projection::Everything) => Projection::Everything,
             (Projection::Nothing, kept) | (kept, Projection::Nothing) => kept.clone(),
             (Projection::Keys(a), Projection::Keys(b)) => Projection::admitting(a.union(b)),
+            (Projection::Fields(a), Projection::Fields(b)) => {
+                let mut merged = a.clone();
+                for (name, region) in b {
+                    let united = match merged.get(name) {
+                        Some(held) => held.union(region),
+                        None => region.clone(),
+                    };
+                    merged.insert(name.clone(), united);
+                }
+                Projection::fields(merged)
+            }
+            (Projection::Fields(_), Projection::Keys(_))
+            | (Projection::Keys(_), Projection::Fields(_)) => Projection::Everything,
+        }
+    }
+
+    /// The regions of the fields `entries` name, with a `Nothing` region dropped and no entry
+    /// at all being `Nothing`.
+    ///
+    /// Everything for every field of the record is [`Everything`](Self::Everything), which this
+    /// cannot see without the record's field names: [`normalized`](Self::normalized) does.
+    pub fn fields(entries: impl IntoIterator<Item = (SmolStr, Projection)>) -> Projection {
+        let kept: BTreeMap<SmolStr, Projection> = entries
+            .into_iter()
+            .filter(|(_, region)| *region != Projection::Nothing)
+            .collect();
+        match kept.is_empty() {
+            true => Projection::Nothing,
+            false => Projection::Fields(kept),
+        }
+    }
+
+    /// This region for a record whose fields are `names`: [`Everything`](Self::Everything) where
+    /// every field's region is, at every depth.
+    pub fn normalized(self, names: &[SmolStr]) -> Projection {
+        match self {
+            Projection::Fields(fields) => {
+                let all = !names.is_empty()
+                    && names
+                        .iter()
+                        .all(|name| fields.get(name) == Some(&Projection::Everything));
+                match all {
+                    true => Projection::Everything,
+                    false => Projection::Fields(fields),
+                }
+            }
+            other => other,
         }
     }
 
@@ -173,6 +269,9 @@ impl Tile {
                     _ => Err("it holds cells, and the projection names none".into()),
                 }
             }
+            Projection::Fields(_) => Err(format!(
+                "a region of fields is a notification's, and no tile is within it: {projection:?}"
+            )),
             Projection::Keys(keys) => {
                 let Tile::DataFunction {
                     domain, deleted, ..
@@ -200,6 +299,9 @@ impl Tile {
             Projection::Everything => {}
             Projection::Nothing => *self = tiling.empty_tile(),
             Projection::Keys(keys) => self.restrict_to_keys(keys),
+            Projection::Fields(_) => {
+                panic!("a region of fields is a notification's and cuts no tile: {projection:?}")
+            }
         }
     }
 }
@@ -465,5 +567,152 @@ mod tests {
         let mut ignoring =
             TestTileProducer::new(ints_by_position(&[10, 20, 30, 40], true), ints_tiling(4));
         ignoring.get(keys_between(1, 2));
+    }
+}
+
+#[cfg(test)]
+mod fields_tests {
+    use super::*;
+    use crate::interpreter::Value;
+
+    fn name(field: &str) -> SmolStr {
+        SmolStr::new(field)
+    }
+
+    fn keys(first: u64, last: u64) -> Projection {
+        Projection::admitting(Predicate::intervals(intervalsets::IntervalSet::from(
+            intervalsets::Interval::closed(Value::UInt(first), Value::UInt(last)),
+        )))
+    }
+
+    fn fields(entries: &[(&str, Projection)]) -> Projection {
+        Projection::fields(
+            entries
+                .iter()
+                .map(|(field, region)| (name(field), region.clone())),
+        )
+    }
+
+    #[test]
+    fn fields_drops_a_nothing_field_and_an_empty_map_is_nothing() {
+        assert_eq!(
+            fields(&[("a", keys(1, 2)), ("b", Projection::Nothing)]),
+            fields(&[("a", keys(1, 2))])
+        );
+        assert_eq!(
+            fields(&[("a", Projection::Nothing), ("b", Projection::Nothing)]),
+            Projection::Nothing
+        );
+        assert_eq!(fields(&[]), Projection::Nothing);
+    }
+
+    #[test]
+    fn a_region_of_every_field_everything_normalizes_to_everything() {
+        let names = [name("a"), name("b")];
+        let both = fields(&[("a", Projection::Everything), ("b", Projection::Everything)]);
+        assert_eq!(both.normalized(&names), Projection::Everything);
+        let one = fields(&[("a", Projection::Everything)]);
+        assert_eq!(one.clone().normalized(&names), one);
+        let narrow = fields(&[("a", Projection::Everything), ("b", keys(1, 2))]);
+        assert_eq!(narrow.clone().normalized(&names), narrow);
+    }
+
+    #[test]
+    fn the_union_of_fields_unites_each_field_and_keeps_an_absent_one() {
+        let a = fields(&[("a", keys(1, 2)), ("b", keys(5, 6))]);
+        let b = fields(&[("a", keys(2, 4)), ("c", Projection::Everything)]);
+        assert_eq!(
+            a.union(&b),
+            fields(&[
+                ("a", keys(1, 4)),
+                ("b", keys(5, 6)),
+                ("c", Projection::Everything)
+            ])
+        );
+        assert_eq!(a.union(&Projection::Nothing), a);
+        assert_eq!(a.union(&Projection::Everything), Projection::Everything);
+    }
+
+    #[test]
+    fn the_union_of_fields_and_keys_is_everything() {
+        let record = fields(&[("a", keys(1, 2))]);
+        assert_eq!(record.union(&keys(1, 2)), Projection::Everything);
+        assert_eq!(keys(1, 2).union(&record), Projection::Everything);
+    }
+
+    #[test]
+    fn nested_fields_unite_beneath_their_field() {
+        let inner = |a: Projection| fields(&[("x", a)]);
+        let left = fields(&[("a", inner(keys(1, 2)))]);
+        let right = fields(&[("a", inner(keys(3, 4)))]);
+        assert_eq!(left.union(&right), fields(&[("a", inner(keys(1, 4)))]));
+    }
+
+    #[test]
+    fn the_intersection_of_fields_keeps_the_fields_both_name() {
+        let a = fields(&[("a", keys(1, 5)), ("b", keys(5, 6))]);
+        let b = fields(&[("a", keys(3, 9)), ("c", Projection::Everything)]);
+        assert_eq!(a.intersect(&b), fields(&[("a", keys(3, 5))]));
+        assert_eq!(
+            fields(&[("a", keys(1, 2))]).intersect(&fields(&[("a", keys(5, 6))])),
+            Projection::Nothing
+        );
+        assert_eq!(a.intersect(&Projection::Everything), a);
+        assert_eq!(a.intersect(&Projection::Nothing), Projection::Nothing);
+    }
+
+    #[test]
+    fn subtracting_fields_removes_what_each_field_took() {
+        let a = fields(&[("a", keys(1, 5)), ("b", keys(5, 6))]);
+        let taken = fields(&[("a", keys(1, 2))]);
+        assert_eq!(
+            a.minus(&taken),
+            fields(&[("a", keys(3, 5)), ("b", keys(5, 6))])
+        );
+        assert_eq!(a.minus(&a), Projection::Nothing);
+        assert_eq!(a.minus(&Projection::Everything), Projection::Nothing);
+        assert_eq!(a.minus(&Projection::Nothing), a);
+        assert_eq!(Projection::Nothing.minus(&a), Projection::Nothing);
+    }
+
+    #[test]
+    #[should_panic(expected = "meet nowhere")]
+    fn fields_and_keys_have_no_intersection() {
+        fields(&[("a", keys(1, 2))]).intersect(&keys(1, 2));
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot be subtracted")]
+    fn everything_less_fields_names_fields_the_region_omits() {
+        Projection::Everything.minus(&fields(&[("a", keys(1, 2))]));
+    }
+
+    #[test]
+    #[should_panic(expected = "notification's and names no guard")]
+    fn a_region_of_fields_names_no_guard() {
+        let tiling = Tiling::Scalar(crate::interpreter::Extent::Base(
+            crate::interpreter::BaseType::Int,
+        ));
+        fields(&[("a", keys(1, 2))]).guard(&tiling);
+    }
+
+    #[test]
+    #[should_panic(expected = "cuts no tile")]
+    fn a_region_of_fields_cuts_no_tile() {
+        let tiling = Tiling::Scalar(crate::interpreter::Extent::Base(
+            crate::interpreter::BaseType::Int,
+        ));
+        let mut tile = tiling.empty_tile();
+        tile.restrict_to(&fields(&[("a", keys(1, 2))]), &tiling);
+    }
+
+    #[test]
+    fn no_tile_is_within_a_region_of_fields() {
+        let tiling = Tiling::Scalar(crate::interpreter::Extent::Base(
+            crate::interpreter::BaseType::Int,
+        ));
+        let region = fields(&[("a", keys(1, 2))]);
+        let error = tiling.empty_tile().within(&region).expect_err("not within");
+        assert!(error.contains("notification's"), "{error}");
     }
 }

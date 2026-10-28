@@ -197,7 +197,7 @@ impl TileProducer for ExtractFinalProducer {
         match projection_guard.projection(&self.name()) {
             Projection::Everything => {}
             Projection::Nothing => return self.tiling().empty_tile(),
-            Projection::Keys(_) => panic!(
+            Projection::Keys(_) | Projection::Fields(_) => panic!(
                 "{} extracts one final value, which has no keys to project: {projection_guard:?}",
                 self.name()
             ),

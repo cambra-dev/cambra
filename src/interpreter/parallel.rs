@@ -471,7 +471,12 @@ impl Consumer for PipelineConsumer {
             *arrived != Projection::Nothing,
             "no producer notifies of an empty region"
         );
-        self.0.publish(arrived);
+        // A region of fields names where a change is in a record, and the pipeline's source cuts
+        // keys: only everything it has ready is safe to hand out.
+        match arrived {
+            Projection::Fields(_) => self.0.publish(&Projection::Everything),
+            keys => self.0.publish(keys),
+        }
     }
 
     fn region_driven(&self) -> bool {
