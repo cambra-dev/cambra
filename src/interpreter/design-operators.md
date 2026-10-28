@@ -676,7 +676,7 @@ keeps that operator's keys; until then the operator widens.
 | `CheckedLookup` | one key | widens | One key has no keys to project. |
 | `CheckedLookup` | the collection | widens | Every key is answered against all of it. |
 | `Memo` | the input | keeps | Read at the projection, and its keys are the input's. |
-| `FanOutSlot` | the shared input | widens | The fan-out forwards through a closure that passes one notification between pulls and sends `Everything`; keeping keys needs a region merged across the notifications it suppresses. |
+| `FanOutSlot` | the shared input | keeps | The fan-out forwards the input's region to every live slot. It passes one notification between pulls and drops the next with its region, which a slot consumer that pulls does not need: its pull reads whatever arrived. A consumer that needs every region cannot sit behind a fan-out, and the worker pool's plan refuses a chain with one (`plan_main`). |
 | `ExtractFinal`, `PermuteRecordDomain`, `FlattenTupleDomain` | the input | widens | Read whole; the keys are re-keyed or the last position. |
 | `Aggregate`, `ExtractAggregate` | the input | widens | The accumulator has no keys. |
 | `MapAggregate`, `MapExtractAggregate` | the input | keeps | The groups keep the input's outermost keys. |

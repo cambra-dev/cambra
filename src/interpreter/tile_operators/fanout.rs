@@ -186,6 +186,37 @@ fn retain_flagged<T>(v: &mut Vec<T>, keep: &[bool]) {
     v.retain(|_| *flags.next().unwrap_or(&false));
 }
 
+/// The consumer a fan-out installs on its input: it forwards the input's region to every live
+/// slot's consumer. One notification passes between pulls and the next is dropped with its region,
+/// which a slot consumer that pulls does not need, since its pull reads whatever arrived.
+struct FanOutInput {
+    shared: Weak<RefCell<FanOutShared>>,
+}
+
+impl Consumer for FanOutInput {
+    fn notify(&mut self, arrived: &Projection) {
+        // Clone the consumer handles while holding a short borrow, then release the borrow before
+        // calling notify(). This prevents a re-entrant panic when a consumer (e.g. SinkConsumer)
+        // calls FanOutProducer::get_impl(), which needs shared.borrow_mut() for the same Rc.
+        let Some(shared_rc) = self.shared.upgrade() else {
+            return;
+        };
+        let consumers = {
+            let shared = shared_rc.borrow();
+            if !shared.forwarded.mark_news() {
+                return;
+            }
+            shared
+                .live_indices()
+                .map(|i| shared.consumers[i].clone())
+                .collect::<Vec<_>>()
+        };
+        for c in &consumers {
+            c.borrow_mut().notify(arrived);
+        }
+    }
+}
+
 /// RAII guard for the cyclic `FanOut` `subscribing_inner` flag.  Created
 /// when we set the flag `true` to drive the inner `subscribe`; its `Drop`
 /// resets the flag to `false`.  This makes the path panic-safe — if
@@ -613,28 +644,8 @@ impl TileOperator for FanOutSlot {
             scheduler.begin_source_producers();
             let inner = self.hold.subscribe_input(
                 intent_guard,
-                Box::new(move || {
-                    // Clone the consumer handles while holding a short borrow,
-                    // then release the borrow before calling notify().  This
-                    // prevents a re-entrant panic when a consumer (e.g.
-                    // SinkConsumer) calls FanOutProducer::get_impl(), which
-                    // needs shared.borrow_mut() for the same Rc.
-                    let Some(shared_rc) = shared_weak.upgrade() else {
-                        return;
-                    };
-                    let consumers = {
-                        let shared = shared_rc.borrow();
-                        if !shared.forwarded.mark_news() {
-                            return;
-                        }
-                        shared
-                            .live_indices()
-                            .map(|i| shared.consumers[i].clone())
-                            .collect::<Vec<_>>()
-                    };
-                    for c in &consumers {
-                        c.borrow_mut().notify(&Projection::Everything);
-                    }
+                Box::new(FanOutInput {
+                    shared: shared_weak,
                 }),
                 scheduler,
             );
