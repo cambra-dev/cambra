@@ -13,6 +13,7 @@ use std::rc::Rc;
 
 use smol_str::SmolStr;
 
+use crate::ccl::capabilities::CapabilityVarId;
 use crate::ccl::ty::{PolyParam, PolyType, TraitRequirement, TypeParam, TypeParamId};
 use crate::ccl::{InferVarId, Level, Type};
 
@@ -121,11 +122,11 @@ fn replace_params(ty: &mut Type, with: &impl Fn(&TypeParam) -> Option<Type>) {
 /// caller renders it the way it renders any type.
 pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
     let reach = Reach::of(ty, cutoff);
-    let requirements: Vec<TraitRequirement> = reach
+    let (requirements, obligations): (Vec<TraitRequirement>, Vec<&Rc<TraitObligation>>) = reach
         .obligations
         .iter()
-        .filter_map(|o| o.stated_requirement())
-        .collect();
+        .filter_map(|o| Some((o.stated_requirement()?, o)))
+        .unzip();
 
     // One term, so a variable is one identity across the body and every
     // requirement. A requirement's operands receive values, as a function's
@@ -214,7 +215,11 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
         })
         .collect();
     let mut requires: Vec<Rc<TraitRequirement>> = Vec::new();
-    for (stated, part) in requirements.iter().zip(parts) {
+    // The variables standing for a carried requirement's associated effect types, as the
+    // requirement's members: `r::Writes` ([`TraitObligation::effects`]).
+    let mut members: HashMap<CapabilityVarId, crate::ccl::capabilities::ClauseParam> =
+        HashMap::new();
+    for ((stated, obligation), part) in requirements.iter().zip(&obligations).zip(parts) {
         let Type::Tuple(tys) = part else {
             unreachable!("a requirement is compacted as a tuple and materializes as one");
         };
@@ -225,10 +230,37 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
             .map(|t| crate::ccl::ccl_utils::strip_refinements(&names.rename(t)))
             .collect();
         let (args, assoc_tys) = tys.split_at(stated.args.len());
+        let mut effect_assoc = Vec::new();
+        for (assoc, var) in obligation.effects() {
+            let Some(declared) = stated
+                .trait_
+                .effect_assocs
+                .iter()
+                .find(|p| p.param.id == assoc)
+            else {
+                continue;
+            };
+            let member = members.entry(var.uid).or_insert_with(|| {
+                let param = TypeParam::declared(format!("_::{}", declared.param.spelling).as_str());
+                let bound = if declared.of_causes {
+                    crate::ccl::nominal::effect()
+                } else {
+                    crate::ccl::nominal::context()
+                };
+                params.push(PolyParam::with_bound(
+                    Rc::clone(&param),
+                    Some(Type::Nominal(bound, Vec::new())),
+                    None,
+                ));
+                crate::ccl::capabilities::ClauseParam::whole(param, declared.of_causes)
+            });
+            effect_assoc.push((assoc, member.clone()));
+        }
         let requirement = TraitRequirement {
             trait_: stated.trait_.clone(),
             args: args.to_vec(),
             terms: Vec::new(),
+            effect_assoc,
             assoc: stated
                 .assoc
                 .iter()
@@ -245,6 +277,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
             requires.push(Rc::new(requirement));
         }
     }
+    name_members(&mut body, &members);
     params.extend(name_capability_vars(&mut body, cutoff, &params));
     Some(InferredPoly {
         poly: PolyType {
@@ -420,6 +453,30 @@ fn name_capability_vars(body: &mut Type, cutoff: Level, taken: &[PolyParam]) -> 
     }
     rename(body, &names);
     params
+}
+
+/// `ty` with each variable `members` maps written as the member it stands for, `r::Writes`.
+fn name_members(
+    ty: &mut Type,
+    members: &HashMap<CapabilityVarId, crate::ccl::capabilities::ClauseParam>,
+) {
+    use crate::ccl::capabilities::{Capabilities, Repr};
+    if members.is_empty() {
+        return;
+    }
+    if let Type::Fun { capabilities, .. } = ty
+        && let Repr::Known(set) = capabilities.repr()
+        && set.vars.keys().any(|id| members.contains_key(id))
+    {
+        let mut set = set.clone();
+        for (id, member) in members {
+            if set.vars.remove(id).is_some() {
+                set.params.insert(member.clone());
+            }
+        }
+        *capabilities = Capabilities::known(set);
+    }
+    ty.walk_children_mut(|child| name_members(child, members));
 }
 
 /// What a type reaches through variable bounds: each variable's level, and the

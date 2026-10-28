@@ -741,10 +741,18 @@ fn push_capability_failures(errors: &mut Vec<LocatedInferError>, expr: &Expr) {
     use crate::ccl::infer_var::Origin;
     for failure in crate::ccl::capabilities::exceeded_uppers() {
         let item = failure.capability.item.to_string();
+        // A compiler trait's signature is written nowhere, so it labels nothing.
         let (error, written) = match failure.blame {
-            Blame::Clause(at) => (InferError::CapabilityBeyondClause { item }, at),
-            Blame::Written(at) => (InferError::CapabilityNotStated { item }, at),
-            Blame::Bound(at) => (InferError::CapabilityBeyondBound { item }, at),
+            Blame::Clause(at) => (InferError::CapabilityBeyondClause { item }, Some(at)),
+            Blame::Signature(at) => (
+                InferError::CapabilityBeyondSignature {
+                    item,
+                    compiler: at.is_none(),
+                },
+                at,
+            ),
+            Blame::Written(at) => (InferError::CapabilityNotStated { item }, Some(at)),
+            Blame::Bound(at) => (InferError::CapabilityBeyondBound { item }, Some(at)),
         };
         errors.push(
             LocatedInferError {
@@ -753,7 +761,7 @@ fn push_capability_failures(errors: &mut Vec<LocatedInferError>, expr: &Expr) {
                 also: Box::default(),
                 related: RelatedPositions::default(),
             }
-            .with_failure((None, Some(Origin::Written(written)))),
+            .with_failure((None, written.map(Origin::Written))),
         );
     }
 }
@@ -1271,7 +1279,9 @@ fn run_once(
     }
 
     // Each capability variable's capabilities are complete once emission is, so its upper bounds are
-    // checked here (`src/ccl/design/type-inference.md`, "Capability variables").
+    // checked here (`src/ccl/design/type-inference.md`, "Written clauses"), after each
+    // associated effect type is given what the obligation standing for it selected.
+    sub_ctx.settle_effect_links();
     push_capability_failures(&mut errors, expr);
     errors.extend(sub_ctx.requirements_beyond_clauses());
     if !errors.is_empty() {

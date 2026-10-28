@@ -3481,9 +3481,8 @@ is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 
 ### 6.9 Capabilities
 
-**[Decided]** — effects in traits ([Effects in traits](#effects-in-traits)); refusing a function
-that outlives a variable it names, and a nested transaction, by their capabilities; `Transaction` in
-a function a block calls ([8.7 Transactions as contextual
+**[Decided]** — refusing a function that outlives a variable it names, and a nested transaction, by
+their capabilities; `Transaction` in a function a block calls ([8.7 Transactions as contextual
 parameters](#87-transactions-as-contextual-parameters)); readings ([Inputs from outside the
 program](#inputs-from-outside-the-program)); exceptions ([Exceptions](#exceptions)); naming another
 module's public transactional variable, `WriteTxn(inv::stock)`; sink functions and calls made
@@ -3936,8 +3935,7 @@ and in particular whether the dataflow downstream of the failure pauses, is unde
   nothing beyond its trait requirements and causes nothing.
 - **The signature is every instance's contract.** An instance's function writes no clause of its
   own, its body causes nothing beyond what the signature states, and every call of it, through a
-  summon, a method call or a requirement, sees the signature
-  ([Declaring an instance](#declaring-an-instance)).
+  summon or a requirement, sees the signature ([Declaring an instance](#declaring-an-instance)).
 - **A trait's signature names no variable.** An instance may be declared in another module than the
   trait, so `Write(x)`, `WriteTxn(x)`, `Append(f)`, `Read(x)` and `ReadTxn(x)` in a signature are
   errors, while the tops, such as `WriteTxn(*)`, which name none, may be stated; what an instance's
@@ -3946,6 +3944,11 @@ and in particular whether the dataflow downstream of the failure pauses, is unde
   ([Traits and instances across modules [Decided]](#traits-and-instances-across-modules-decided)),
   so the state it writes is a `Mut` or `Feed` parameter's, which the caller passes
   ([Declaring a trait](#declaring-a-trait)).
+- **A trait's signature has no hole.** `_` in a signature's clauses, or in the clauses of a
+  function type in it, is an error: inference fills a hole at each call, so what an instance does
+  would reach no call's type. A signature polymorphic in what an argument does names a bounded
+  variable instead, of the trait or of the function. **[Planned]** — a trait function's bounded
+  type parameter, `def app(E <: Effect, …)`.
 - **An associated type lets instances differ.** `Name <: Effect` in a trait declares an associated
   type that a `causes` clause names, and `Name <: Context` one that a `requires` clause names:
 

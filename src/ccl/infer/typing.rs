@@ -379,6 +379,20 @@ pub(super) trait Typing {
         }
     }
 
+    /// How many links of associated effect types wait on their obligations
+    /// ([`InferCtx::settle_effect_links`](super::context::InferCtx::settle_effect_links)).
+    /// Check links none.
+    fn pending_effect_links(&self) -> usize {
+        0
+    }
+
+    /// Settle the links minted since `start` was [`pending_effect_links`]
+    /// (Self::pending_effect_links), a definition of type `scheme` generalizing: one whose
+    /// obligation is answered is settled, one whose obligation the scheme carries is left to
+    /// each use as a member of the requirement the scheme states, and any other takes what
+    /// every instance still answering it does.
+    fn settle_effect_links_since(&mut self, _start: usize, _scheme: &Type) {}
+
     /// Note a generalized definition of type `ty`, annotated `written`: a `def` whose
     /// `requires` clause is an upper bound has its inferred trait requirements checked
     /// against the clause once emission is complete. Check notes nothing.

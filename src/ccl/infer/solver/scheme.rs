@@ -66,8 +66,12 @@ pub struct Instance {
     /// mints an obligation for each.
     pub requires: Vec<TraitRequirement>,
     /// The copy of each capability variable the scheme reaches, by the original's id
-    /// ([`FreshenCache::capability_vars`]), which the specialization the use mints takes.
+    /// ([`FreshenCache::capability_vars`]), which the specialization the use mints takes: a
+    /// requirement's associated effect type is linked through it too.
     pub capability_copies: HashMap<CapabilityVarId, Rc<CapabilityVar>>,
+    /// The use's copy of each trait obligation the scheme carries, which the use links to the
+    /// instance it selects ([`TraitObligation::effects`]).
+    pub obligations: Vec<Rc<TraitObligation>>,
 }
 
 impl PolyScheme {
@@ -172,6 +176,7 @@ impl PolyScheme {
             bounds,
             requires,
             capability_copies: cache.capability_vars,
+            obligations: cache.obligations.into_values().collect(),
         }
     }
 
@@ -1307,6 +1312,15 @@ fn freshen_watches(
                 .assoc_types()
                 .iter()
                 .map(|ty| freshen_above(lim, ty, target, cache))
+                .collect(),
+        );
+        // What the copy selects is what its copies of the definition's associated effect types
+        // hold.
+        copy.set_effects(
+            obligation
+                .effects()
+                .into_iter()
+                .map(|(assoc, var)| (assoc, freshen_capability_var(lim, &var, target, cache)))
                 .collect(),
         );
         let _f = crate::ccl::provenance::copy_frame("infer.freshen_obligation_inputs");

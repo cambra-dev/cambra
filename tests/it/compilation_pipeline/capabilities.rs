@@ -814,6 +814,363 @@ fn a_public_function_naming_an_induction_variable_is_refused(
     assert!(errors.contains(needle), "{errors}");
 }
 
+/// A trait whose instances write state through an associated effect type, an instance that
+/// writes the transactional variable its call passes, and a polymorphic definition calling the
+/// trait. An instance reaches no variable of its module: the caller's is its argument.
+const TAKE: &str = indoc! {"
+    stock: Mut(Int, Txn) := 10
+    type Box = Int
+
+    trait Take(T):
+        Writes <: Effect
+        def take(t: T, s: Mut(Int, Txn), n: Int) => Int causes RunTransaction, Writes
+
+    instance Take(Box):
+        def take(t, s, n):
+            with begin():
+                s := s - n
+            n
+
+    def generic(T, a: T, s: Mut(Int, Txn), n: Int) requires t: Take(T) causes only RunTransaction, t::Writes:
+        t::take(a, s, n)
+"};
+
+/// A checked module prints a trait's associated effect types and its functions' clauses, and a
+/// requirement by the name its associated effect type is read through. What an instance's
+/// function causes that its signature lists is the signature's, so it does not reach the
+/// associated effect type, whose bound takes away `RunTransaction` here (`docs/chl-spec.md`,
+/// "Effects in traits").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_checked_module_prints_what_its_traits_cause() {
+    let interface = interface_of(indoc! {"
+        pub type Box = Int
+        pub trait Take(T):
+            Writes <: Effect except RunTransaction
+            def take(t: T, s: Mut(Int, Txn), n: Int) => Int causes RunTransaction, Writes
+        instance Take(Box):
+            def take(t, s, n):
+                with begin():
+                    s := s - n
+                n
+        pub def generic(T, a: T, s: Mut(Int, Txn), n: Int) requires t: Take(T):
+            t::take(a, s, n)
+    "});
+    assert_eq!(
+        interface,
+        indoc! {"
+            module main
+            pub type Box = Int
+            pub trait Take(T):
+                Writes <: Effect except RunTransaction
+                take: {T, Mut(Int, Txn), Int} => Int causes RunTransaction, Writes
+            pub generic: forall (T) {T, Mut(Int, Txn), Int} => Int requires t: Take(T) causes RunTransaction, t::Writes
+        "}
+    );
+}
+
+/// An operator's signature is the compiler's, so an instance's function doing more than it lists
+/// is refused with no label at the signature and no hint to add an associated type, which a
+/// compiler trait does not take.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_operator_instance_beyond_its_signature_is_refused_at_the_call() {
+    let errors = super::modules::compile_errors(&program(
+        indoc! {"
+            type Money = Int
+            def shout(n: Int) => Int causes AffectWorld:
+                n
+            instance Addable(Money, Money):
+                Output = Money
+                def add(a, b):
+                    Money::new(shout(1))
+            0
+        "},
+        &[],
+    ));
+    assert!(
+        errors.contains("this has `AffectWorld`, which the trait's signature does not list"),
+        "{errors}"
+    );
+    assert!(!errors.contains("associated type"), "{errors}");
+    assert!(!errors.contains("main.cambra:1:1"), "{errors}");
+}
+
+/// An unnamed requirement's associated effect type is named through a binder printing picks, so
+/// two requirements of one trait keep their members apart (`docs/chl-spec.md`, "Effects in
+/// traits").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_checked_module_names_each_unnamed_requirement() {
+    let interface = interface_of(indoc! {"
+        pub type Box = Int
+        pub trait Act(T):
+            Does <: Effect
+            def act(t: T) => Int causes Does
+        instance Act(Box):
+            def act(t):
+                1
+        pub def go(T, U, x: T, y: U) => Int requires Act(T), Act(U):
+            summon(Act(T))::act(x) + summon(Act(U))::act(y)
+    "});
+    assert!(
+        interface.contains(
+            "pub go: forall (T, U) {T, U} => Int requires r: Act(T), r1: Act(U) causes r::Does, \
+             r1::Does"
+        ),
+        "{interface}"
+    );
+}
+
+/// What a call of a trait's function does is its signature's, and what an instance's
+/// function does beyond it is the instance's associated effect type, which a call at that
+/// instance does (`docs/chl-spec.md`, "Effects in traits").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_call_at_an_instance(
+    indoc! {"
+        def direct(n: Int) causes only RunTransaction:
+            summon(Take(Box))::take(Box::new(1), stock, n)
+    "},
+    "this has `WriteTxn(stock)`, which the definition's clause"
+)]
+#[case::a_call_through_a_requirement(
+    indoc! {"
+        def through(n: Int) causes only RunTransaction:
+            generic(Box::new(1), stock, n)
+    "},
+    "this has `WriteTxn(stock)`, which the definition's clause"
+)]
+// A requirement inference adds to a definition is answered at each use, by the instance the
+// use selects.
+#[case::a_call_through_an_inferred_requirement(
+    indoc! {"
+        def inferred(a, s: Mut(Int, Txn), n: Int):
+            summon(Take(_))::take(a, s, n)
+        def through_inferred(n: Int) causes only RunTransaction:
+            inferred(Box::new(1), stock, n)
+    "},
+    "this has `WriteTxn(stock)`, which the definition's clause"
+)]
+#[case::a_requirement_beyond_its_bound(
+    indoc! {"
+        def narrow(T, a: T, s: Mut(Int, Txn), n: Int) requires t: Take(T) causes only RunTransaction:
+            t::take(a, s, n)
+    "},
+    "this has `t::Writes`, which the definition's clause"
+)]
+fn a_trait_call_does_what_its_instance_does(#[case] code: &str, #[case] needle: &str) {
+    let errors = super::modules::compile_errors(&program(&format!("{TAKE}\n{code}\n0\n"), &[]));
+    assert!(errors.contains(needle), "{errors}");
+}
+
+/// A module whose `inferred` leaves its `Take` requirement to inference, and an instance that
+/// does nothing; the root declares another that commits.
+const INFERRED_LIB: &str = indoc! {"
+    pub type Pure = Int
+    pub trait Take(T):
+        Writes <: Effect
+        def take(t: T, s: Mut(Int, Txn), n: Int) => Int causes Writes
+    instance Take(Pure):
+        def take(t, s, n):
+            n
+    pub def inferred(a, s: Mut(Int, Txn), n: Int):
+        summon(Take(_))::take(a, s, n)
+"};
+
+/// A requirement inference adds to a definition states a member for each associated effect type
+/// of its trait, as a written one does, so the interface shows that a call does what the instance
+/// it selects does (`docs/chl-spec.md`, "Effects in traits").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn an_inferred_requirement_states_its_associated_effect_types() {
+    let interface = interface_of(INFERRED_LIB);
+    assert!(
+        interface.contains(
+            "pub inferred: forall (A) {A, Mut(Int, Txn), Int} => Int requires r: Take(A) causes \
+             r::Writes"
+        ),
+        "{interface}"
+    );
+}
+
+/// Each use of a definition with an inferred requirement does what the instance it selects
+/// does, and no other instance's effects: a use selecting the instance that does nothing stays
+/// under `causes only WriteTxn(stock)`, and one selecting the committing instance does not.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::the_pure_instance("lib::Pure::new(1)", None)]
+#[case::the_committing_instance(
+    "Box::new(1)",
+    Some("this has `RunTransaction`, which the definition's clause")
+)]
+fn an_inferred_requirement_does_what_each_use_selects(
+    #[case] argument: &str,
+    #[case] refused: Option<&str>,
+) {
+    let root = format!(
+        "{}    lib::inferred({argument}, stock, n)\nvia(3)\n",
+        indoc! {"
+            import lib
+            stock: Mut(Int, Txn) := 10
+            type Box = Int
+            instance lib::Take(Box):
+                def take(t, s, n):
+                    with begin():
+                        s := s - n
+                    n
+            def via(n: Int) causes only WriteTxn(stock):
+        "}
+    );
+    let loaded = program(&root, &[("lib", INFERRED_LIB)]);
+    match refused {
+        None => super::helpers::check_program_scalar(&loaded, cambra::interpreter::Value::Int(3)),
+        Some(needle) => {
+            let errors = super::modules::compile_errors(&loaded);
+            assert!(errors.contains(needle), "{errors}");
+        }
+    }
+}
+
+/// A program calling an instance whose function writes state, directly and through a
+/// requirement, compiles and runs.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::directly("summon(Take(Box))::take(Box::new(1), stock, 3)")]
+#[case::through_a_requirement("generic(Box::new(1), stock, 3)")]
+fn a_trait_whose_instance_writes_state_runs(#[case] call: &str) {
+    super::helpers::check_program_scalar(
+        &program(&format!("{TAKE}\n{call}\n"), &[]),
+        cambra::interpreter::Value::Int(3),
+    );
+}
+
+/// A trait's declarations that cannot state what instances do are refused where they are
+/// written.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::an_instance_beyond_its_signature(
+    indoc! {"
+        type Box = Int
+        trait Take(T):
+            def take(t: T, s: Mut(Int, Txn), n: Int) => Int
+        instance Take(Box):
+            def take(t, s, n):
+                with begin():
+                    s := s - n
+                n
+    "},
+    "this has `RunTransaction`, which the trait's signature does not list"
+)]
+#[case::a_signature_naming_a_variable(
+    indoc! {"
+        count := 0
+        trait Take(T):
+            def take(t: T, n: Int) => Int causes Write(count)
+    "},
+    "a trait's signature names no variable"
+)]
+#[case::an_instance_writing_a_clause(
+    indoc! {"
+        type Box = Int
+        trait Take(T):
+            def take(t: T, n: Int) => Int
+        instance Take(Box):
+            def take(t, n) causes nothing:
+                n
+    "},
+    "so it writes no clause"
+)]
+#[case::a_hole_in_a_signature(
+    indoc! {"
+        trait App(T):
+            def app(t: T, n: Int) => Int causes _
+    "},
+    "`_` in the signature of `App::app`"
+)]
+#[case::a_hole_in_a_function_type_in_a_signature(
+    indoc! {"
+        trait App(T):
+            def app(t: T, f: (Int => Int requires _ causes _), n: Int) => Int
+    "},
+    "`_` in the signature of `App::app`"
+)]
+#[case::an_effect_bounded_parameter_of_a_trait_function(
+    indoc! {"
+        trait App(T):
+            def app(E <: Effect, t: T, f: (Int => Int causes E), n: Int) => Int
+    "},
+    "a trait function's type parameters take neither yet"
+)]
+#[case::an_associated_effect_type_of_no_requirement(
+    indoc! {"
+        def f(n: Int) causes s::Writes:
+            n
+    "},
+    "`s` names no requirement in scope"
+)]
+fn a_trait_declaration_that_cannot_state_effects_is_refused(
+    #[case] code: &str,
+    #[case] needle: &str,
+) {
+    let errors = super::modules::compile_errors(&program(&format!("{code}\n0\n"), &[]));
+    assert!(errors.contains(needle), "{errors}");
+}
+
+/// `Module::*` in a Module type's entry is the state of the run the parameter takes, so the
+/// run `h` meets it, and a call through the parameter writes `h`'s state
+/// (`docs/chl-spec.md`, "Writing requirements and effects").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_module_entry_states_the_runs_own_state() {
+    super::helpers::check_program_scalar(
+        &passing_helper(
+            "Int => Int requires ReadTxn(Module::*) causes WriteTxn(Module::*), RunTransaction",
+            "l::use_it(1)",
+        ),
+        Value::Int(1),
+    );
+}
+
+/// A Module type's entry is a written type, whose clauses are exact, so a run whose argument
+/// does more is refused at the argument (`docs/chl-spec.md`, "Writing requirements and
+/// effects").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_module_argument_beyond_its_entry_is_refused() {
+    let errors = super::modules::compile_errors(&program(
+        indoc! {"
+            run helper as h
+            run lib(p=h) as l
+            l::use_it(1)
+        "},
+        &[
+            (
+                "lib",
+                indoc! {"
+                    param p: Module{f: Int => Int}
+                    pub def use_it(x: Int) => Int:
+                        p::f(x)
+                "},
+            ),
+            (
+                "helper",
+                indoc! {"
+                    stock: Mut(Int, Txn) := 10
+                    pub def f(x: Int) => Int:
+                        with begin():
+                            stock := stock - x
+                        x
+                "},
+            ),
+        ],
+    ));
+    assert!(
+        errors.contains("this has `ReadTxn(h::stock)`, which the function type it must have"),
+        "{errors}"
+    );
+}
+
 /// A transactional variable belongs to the run, so its capabilities name no variable, and it is
 /// declared at a module's top level (`docs/chl-spec.md`, "Discharging requirements and
 /// effects").
@@ -945,7 +1302,8 @@ fn a_read_is_its_mentions_effect() {
     assert_eq!(mentions, [" requires Transaction, ReadTxn(n)", ""]);
 }
 
-/// The run's transactional capabilities are written as they print.
+/// Transactional capabilities are written in a `def`'s clauses naming the variable, and in a
+/// trait's signature as the tops, since a signature names no variable.
 #[rstest]
 // No other module names a private variable, so the interface writes it as the module's own
 // state.
@@ -956,6 +1314,22 @@ fn a_read_is_its_mentions_effect() {
             n
     "},
     "pub take: Int => Int requires ReadTxn(Module::*) causes WriteTxn(Module::*)"
+)]
+#[case::a_trait_signature(
+    indoc! {"
+        stock: Mut(Int, Txn) := 10
+        type Box = Int
+        trait Take(T):
+            def take(t: T, s: Mut(Int, Txn), n: Int) => Int requires ReadTxn(*) causes WriteTxn(*), RunTransaction
+        instance Take(Box):
+            def take(t, s, n):
+                with begin():
+                    s := s - n
+                n
+        pub def run_take(n: Int) => Int:
+            summon(Take(Box))::take(Box::new(1), stock, n)
+    "},
+    "pub run_take: Int => Int requires ReadTxn(*) causes RunTransaction, WriteTxn(*)"
 )]
 fn transactional_capabilities_are_written(#[case] code: &str, #[case] line: &str) {
     let interface = interface_of(code);
@@ -1175,6 +1549,20 @@ fn a_runs_state_is_written_where_it_has_one(#[case] code: &str, #[case] needle: 
      only E:\n    f(x)\n",
     "pub apply: forall (E <: Effect except Write(*)) {(Int => Int causes E), Int} => Int causes E"
 )]
+#[case::an_associated_bound_taking_capabilities_away(
+    indoc! {"
+        trait Act(T):
+            Does <: Effect except RunTransaction
+            def act(t: T) => Int causes Does
+        type Box = Int
+        instance Act(Box):
+            def act(t):
+                3
+        pub def go(x: Int) => Int:
+            summon(Act(Box))::act(Box::new(x))
+    "},
+    "pub go: Int => Int"
+)]
 fn a_top_is_written(#[case] code: &str, #[case] line: &str) {
     let interface = interface_of(code);
     assert!(interface.lines().any(|l| l == line), "{interface}");
@@ -1312,6 +1700,14 @@ fn a_top_is_written(#[case] code: &str, #[case] line: &str) {
             f(x)
     "},
     "this `except` takes away all of `Write(*)`, so it holds nothing"
+)]
+#[case::an_associated_type_bound_taking_capabilities(
+    indoc! {"
+        trait Sized(T):
+            Size <: Int except RunTransaction
+            def size(t: T) => Size
+    "},
+    "`except` takes capabilities out of a bound of `Effect` or `Context`, and this bound is a type"
 )]
 fn a_top_is_checked(#[case] code: &str, #[case] needle: &str) {
     let errors = errors_of(code);

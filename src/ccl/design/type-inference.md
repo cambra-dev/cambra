@@ -4557,9 +4557,9 @@ or a top taking away other than what the rest of its clause shares prints in par
 (`capabilities::clauses`). A top holding writes or reads names every mutable variable, and one
 holding appends every feed (`Every::names_mutable_variables`, `Every::names_feeds`), so a function
 whose type holds one is no public member of a module whose top level binds what it names. A clause
-variable's bound may take capabilities away (`TypeParam::clause_except`): opening the parameter
-bounds its variable by `Effect` or `Context` less them, which each use's copy keeps
-(`Blame::Bound`).
+variable's bound, and an associated effect type's, may take capabilities away
+(`TypeParam::clause_except`): opening the parameter, or an instance's variable for the associated
+type, bounds it by `Effect` or `Context` less them, which each use's copy keeps (`Blame::Bound`).
 
 **Upper bounds are checked once emission is complete.** A variable's capabilities are known only
 then, so `capabilities::exceeded_uppers` reads each bounded variable's resolution after the barrier
@@ -4583,6 +4583,31 @@ type, and holds what they admit, together with the requirements every path from 
 (`CapabilityVar::bound_holes_reaching`). In `def p(f: (Int => Int causes _), x: Int) causes
 nothing`, `f`'s clause is then `causes nothing`: the contract prints `{Int => Int, Int} => Int`, and
 a use passing a function that appends is refused at the call.
+
+### Trait calls
+
+A trait's signature carries its clauses as a written function type's (`Signature::capabilities`),
+and a call of the trait's function takes them (`emit_trait_fn`). An instance's function is stamped
+with its signature's clauses as a `def` under `only` would be (`signature_bound` in
+`lower/traits.rs`), with the signature as the secondary label of a body that exceeds them. An
+associated type bounded by `Effect` or `Context`, `Writes <: Effect`, is a clause parameter of the
+trait (`TraitDecl::effect_assocs`). Each instance has its own parameter for it
+(`TraitInstance::effect_assocs`), on whose variable, minted once at the top level, the instance's
+functions' bodies collect (`Written::of_instance`). A requirement `t: Take(T)` gives the definition
+a member parameter for it, `t::Writes` (`TraitRequirement::effect_assoc`), which opens rigidly as a
+declared parameter does. A call stands a fresh variable for the trait's parameter, and a use of a
+definition requiring the trait links its copy of the member's; each is linked through the obligation
+the call or the use mints (`InferCtx::link_effect`): to the variable of the instance the obligation
+selects, or to the member of the requirement in scope that answers it. A link the obligation has not
+decided is settled when the definition minting it generalizes, before any use copies its variables
+(`InferCtx::settle_effect_links_since`). One whose obligation the scheme carries, a requirement
+inference adds, is left to the uses instead: its variable is the requirement's member, which the
+scheme states as `r::Writes` (`TraitObligation::effects`), and each use links its copy of the
+variable through its copy of the obligation, as it links a written requirement's member. The rest
+are settled once emission is complete, before the bounds are checked
+(`InferCtx::settle_effect_links`): an obligation still undecided then holds what every instance and
+requirement still answering it does. A parameter variable with no rigid capability leaves its part
+of a bound open: it is what flows there.
 
 ### Checks that read a body's capabilities
 
