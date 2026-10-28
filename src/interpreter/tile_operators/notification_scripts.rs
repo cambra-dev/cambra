@@ -1043,11 +1043,15 @@ fn a_consumer_that_pulls_hears_every_field_of_a_record_behind_the_gates() {
                 .zip(tiles)
                 .map(|((values, _), tiles)| (stream_tiling(*values), tiles))
                 .collect();
-            assert_notifications_survive_the_gates(
-                &select_over_make_record(through),
-                &feeds,
-                &script,
-            );
+            let pulls: Vec<usize> = (2..script.len()).step_by(3).collect();
+            for pulls_after in [&[][..], &pulls[..]] {
+                assert_notifications_survive_the_gates(
+                    &select_over_make_record(through),
+                    &feeds,
+                    &script,
+                    pulls_after,
+                );
+            }
         }
     }
 }
@@ -1070,7 +1074,39 @@ fn a_consumer_that_pulls_hears_every_change_to_every_input_behind_the_gates() {
                 .zip(tiles)
                 .map(|((values, _), tiles)| (stream_tiling(*values), tiles))
                 .collect();
-            assert_notifications_survive_the_gates(&**build, &feeds, &script);
+            let pulls: Vec<usize> = (2..script.len()).step_by(3).collect();
+            assert_notifications_survive_the_gates(&**build, &feeds, &script, &[]);
+            assert_notifications_survive_the_gates(&**build, &feeds, &script, &pulls);
         }
+    }
+}
+
+/// A pull opens the gates again: a region inside what passed before the pull, here the keys an
+/// earlier notification of everything covered, must reach the consumer after it.
+#[test]
+fn a_gate_that_a_pull_reopened_passes_a_region_inside_what_passed_before_it() {
+    let none = Predicate::False;
+    let a = vec![
+        int_stream(&[], none.clone()),
+        int_stream(&[(2, 20)], none.clone()),
+        int_stream(&[(2, 20), (5, 50)], none.clone()),
+    ];
+    let b = vec![int_stream(&[], none.clone())];
+    let feeds = [
+        (stream_tiling(Values::Ints), a),
+        (stream_tiling(Values::Ints), b),
+    ];
+    // The first change is announced as everything, the second as the keys it added.
+    let steps = [(0, Projection::Everything), (0, keys_region(&[5]))]
+        .into_iter()
+        .map(|(input, changed)| Step { input, changed })
+        .collect::<Vec<_>>();
+    for through in [Through::Nothing, Through::Memo, Through::FanOutSlot] {
+        assert_notifications_survive_the_gates(
+            &select_over_make_record(through),
+            &feeds,
+            &steps,
+            &[0],
+        );
     }
 }
