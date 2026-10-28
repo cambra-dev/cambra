@@ -2771,8 +2771,8 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
 /// distinct base ceilings have no common value under them. Either way the requirement
 /// cannot be satisfied, and one of the two is what the lattice would have reported.
 ///
-/// Bases only. A structural bound is a different mistake (a tuple where a trait wants a
-/// base) and belongs to `Offered::NotABase`, which narrowing already rejects on arrival.
+/// Bases only. A non-base bound (a product, a variant, a function) arrives at the
+/// obligation through `deliver`, which narrows or rejects on it there ([`Offered`]).
 fn conflicting_base(var: &Rc<InferVar>, required: &BaseType) -> Option<BaseType> {
     let bounds = var.bounds.borrow();
     bounds
@@ -2866,6 +2866,10 @@ fn resolve_pass(
                         requirements,
                     });
                 }
+                // A nominal type at any arguments determines no one type, so there is nothing
+                // to deposit; the instance an obligation selects states its own types
+                // ([`TraitObligation::try_select`]).
+                [InstanceHead::Nominal(_)] => {}
                 // Exactly one base left: the requirements *determine* this value, so say
                 // so on the lattice rather than keeping it to ourselves. This is the
                 // write-back that makes `λ 𝑥 → 𝑥 + 1` infer `Int ⇒ Int` instead of
@@ -2878,10 +2882,6 @@ fn resolve_pass(
                 // it states what may flow in, which is exactly what the requirement
                 // says. It adds no lower bound, so a genuinely under-connected value is
                 // still under-determined afterwards.
-                // A nominal type at any arguments determines no one type, so there is nothing
-                // to deposit; the instance an obligation selects states its own types
-                // ([`TraitObligation::try_select`]).
-                [InstanceHead::Nominal(_)] => {}
                 [InstanceHead::Base(only)] => {
                     for var in &place.vars {
                         // Read the lattice before writing to it. `constrain_subtype`
@@ -2991,12 +2991,9 @@ pub enum OperandFailure {
 
 /// What a bound contribution tells a trait about the position it landed on.
 ///
-/// The distinction between the last two variants is the whole point. Both narrow
-/// nothing, but for opposite reasons: one is a position the program has not
-/// determined *yet*, and one is determined, at a type no instance accepts.
-/// Treating them alike is what let `(1, 2) == (3, 4)` type-check — a tuple narrows
-/// nothing, and a trait with no associated type has nothing left unresolved for a
-/// later wall to catch, so the program passed.
+/// `Unknown` is a position not determined yet and narrows nothing; `NotABase` is
+/// determined, at a type no base or nominal head names, and is rejected unless a candidate
+/// takes any type there.
 pub enum Offered<'a> {
     /// A base leaf, with refinements peeled — the fact narrowing consumes.
     Base(&'a BaseType),
@@ -3006,11 +3003,12 @@ pub enum Offered<'a> {
     Unknown,
     /// A determined **product** — a tuple or a record.
     ///
-    /// No instance keys on one ([`TraitInstance::heads`] are bases and nominal types), so a
-    /// product is
-    /// answered structurally or not at all: a
-    /// [structural](Trait::is_structural) trait decomposes it into one obligation per
-    /// component, and every other trait rejects it as [`NotABase`](Self::NotABase) does.
+    /// No head names one. Where a candidate takes any type at the position
+    /// ([`InstanceHead::Any`]), `deliver` narrows to those candidates
+    /// (`TraitObligation::narrow_to_variables`). Otherwise
+    /// `TraitObligation::narrow_product` answers it by an assumption stating that product or
+    /// by the product rule of a [structural](Trait::is_structural) trait, and rejects it in
+    /// every other case.
     Product(&'a Type),
     /// A determined nominal type. A row keys on its declaration as
     /// [`InstanceHead::Nominal`].
@@ -3018,13 +3016,10 @@ pub enum Offered<'a> {
     /// A determined type that is neither a base leaf, a product nor a nominal type — a
     /// variant or a function.
     ///
-    /// Every instance is keyed on a base or a nominal type ([`TraitInstance::heads`]), so
-    /// nothing in
-    /// any table accepts it and the requirement fails here rather than silently
-    /// going unresolved. That the tables hold only bases is their *content*, not a
-    /// property of resolution: giving `Equatable` a variant would add rows, and
-    /// would split this variant into the shapes a row can key on — it would not
-    /// change how narrowing works.
+    /// No head names one. Where a candidate takes any type at the position
+    /// ([`InstanceHead::Any`]), `deliver` narrows to those candidates
+    /// (`TraitObligation::narrow_to_variables`); otherwise the requirement fails here
+    /// (`TraitObligation::reject`) rather than going unresolved.
     NotABase,
     /// A type parameter, inside the definition that declares it. It supports what
     /// its bound supports, and nothing if it has none
@@ -3178,9 +3173,8 @@ pub fn offered_head(ty: &Type) -> Option<InstanceHead> {
 /// So the watch follows the edge, in the direction information flows: down, to the
 /// variables feeding the watched one. This is what a var-var kind edge does
 /// (`constrain_fun_kind`, recorded on both sides) — a kind force propagates along stored
-/// links for the same
-/// reason, and for kinds it is the only mechanism because a force is a flag rather
-/// than a bound.
+/// links for the same reason, and for kinds it is the only mechanism because a force is
+/// a flag rather than a bound.
 ///
 /// Recursion is bounded by the watch set only ever growing: a variable that gains
 /// nothing new stops the walk, which is what makes this safe on the cyclic bound
