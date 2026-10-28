@@ -593,6 +593,10 @@ struct Dispatcher {
     // shared-state-ok: parks idle workers and guards no data; `wake_idle` and `park` state how.
     idle: Mutex<()>,
     wake: Condvar,
+    /// How many workers are in `park`, which a test reads to publish only once every worker
+    /// waits. It is counted in production builds too, two atomic updates per park, because the
+    /// shared-state check cannot read a struct with a `#[cfg(test)]` field.
+    parked: AtomicUsize,
 }
 
 /// What reached a pipeline before it started: the union of the regions published to it, and
@@ -669,6 +673,7 @@ impl Dispatcher {
             epoch: AtomicU64::new(0),
             idle: Mutex::new(()),
             wake: Condvar::new(),
+            parked: AtomicUsize::new(0),
         };
         for index in 0..dispatcher.jobs.len() {
             if dispatcher.jobs[index].waiting.load(Ordering::Relaxed) == 0 {
@@ -859,12 +864,14 @@ impl Dispatcher {
     /// Wait until the epoch moves past `seen`, which the caller read before it looked for work.
     fn park(&self, seen: u64) {
         let mut guard = self.idle.lock_wait();
+        self.parked.fetch_add(1, Ordering::AcqRel);
         while self.epoch.load(Ordering::Acquire) == seen {
             guard = self
                 .wake
                 .wait(guard)
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
         }
+        self.parked.fetch_sub(1, Ordering::AcqRel);
     }
 
     /// One worker's turn: claim morsels, run each through `worker`, leave a pipeline once its
@@ -916,6 +923,10 @@ impl Drop for FailOnUnwind<'_> {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "parallel_live_tests.rs"]
+mod live_tests;
 
 #[cfg(test)]
 mod tests {

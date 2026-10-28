@@ -321,6 +321,39 @@ claimed from; an idle worker parks while another holds a morsel and wakes when t
 finishes; a failure wakes a parked worker. `source_of` finds the one source, and refuses a chain
 with none and a chain with two.
 
+`LiveSource` has unit tests in `iterate.rs`: it claims only what was published, a region published
+twice is claimed once, `Everything` is cut to the positions that are ready, a region that becomes
+ready ahead of an earlier one is claimed first, the earlier one is not claimable until it is ready,
+and an `Everything` sent while it is missing claims nothing from it, a region outside `ready` is
+refused, a region with open bounds names the positions it contains, and a closed source is exhausted
+after its published rows. The dispatcher has five more: a live pipeline waits for an arrival and
+finishes once closed and drained, a parked worker wakes on a publish and on a close, regions
+published before the pipeline starts are united and kept for its source, and an `Everything`
+published before it starts is resolved when the source is built.
+
+**A live source through the pool, end to end** (`parallel_live_tests.rs`). `LiveRows` is a test
+operator over a store of rows with a `LiveSource`. The delivering thread writes a chunk of rows,
+adds its positions to the source's yield predicate and notifies every chain's consumer with the
+chunk's positions (`Everything` for an empty chunk). It returns when the chunks are delivered, and
+`run_pipeline` closes the source. Workers claim the arrivals and run `LiveRows → MapResult(negate)`
+into the collecting breaker through `run_pipeline`. Each run checks that the breaker holds every row
+once with its mapped value, as the serial answer computes it; that the source's producer saw every
+position pulled once and released once, a release only after the claim and the pull, and reclaimed
+every row; and that only the first chain's consumer is region-driven. The chunks arrive in bursts,
+one row at a time, empty, and in lockstep, where every worker is parked (`Dispatcher::parked`)
+before each arrival and the next waits until the workers have pulled the rows so far, so that a
+parked worker has to be woken by the publish and not by the close. They also arrive out of order,
+last to first and shuffled with fixed seeds. Before the delivering thread delivers the chunk at
+position 0 after another, it waits for the workers to pull every row that arrived, and fails with
+that cause after thirty seconds, so the workers must consume rows of a later chunk while an earlier
+one is missing. Each pattern runs on one, two, four and eight workers, and the in-order and out-of-
+order patterns each repeat two hundred times in one test. A test in which the first worker never
+serves checks that its chain's notifications still reach the pipeline. A run that does not finish
+within a minute fails as a lost wake-up, and a panic in a worker fails as that panic. Removing the
+epoch move from `Dispatcher::publish`, the `Notified::Always` gate of a region-driven consumer, the
+subtraction of claimed positions in `LiveSource::publish`, or the cut to the yield predicate (a row
+count instead) each fail a test.
+
 ## Not yet implemented
 
 A breaker other than the sink and a fold into `main`, a source over a data-source domain, a pipeline
