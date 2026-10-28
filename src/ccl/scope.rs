@@ -304,7 +304,7 @@ where
         }
         // `target` is a type; its refinement predicate is reached by the
         // caller's type walk, not here (see the module docs).
-        N::Cast { value, .. } | N::Realize(value) => open(f, value),
+        N::Cast { value, .. } => open(f, value),
         N::BinOp { left, right, .. } => {
             open(f, left);
             open(f, right);
@@ -321,7 +321,8 @@ where
         | N::Tuple(elts)
         | N::Compose(elts)
         | N::Copair(elts)
-        | N::DisjointJoin(elts) => {
+        | N::DisjointJoin(elts)
+        | N::Realized(elts) => {
             for c in elts {
                 open(f, c);
             }
@@ -585,7 +586,6 @@ where
         | N::Error
         | N::Apply { .. }
         | N::Cast { .. }
-        | N::Realize(_)
         | N::BinOp { .. }
         | N::UnaryOp(..)
         | N::Aggregate { .. }
@@ -598,6 +598,7 @@ where
         | N::Compose(_)
         | N::Copair(_)
         | N::DisjointJoin(_)
+        | N::Realized(_)
         | N::ExprStmt { .. }
         | N::Begin { .. }
         | N::Lambda { .. }
@@ -644,7 +645,6 @@ mod tests {
             var("x"),
             node(N::Builtin(Builtin::Id)),
             TypedExpr::apply(var("f"), var("a")),
-            node(N::Realize(Box::new(var("v")))),
             node(N::Cast {
                 value: Box::new(var("v")),
                 target: Type::Hole,
@@ -734,6 +734,7 @@ mod tests {
             node(N::Compose(vec![var("c0"), var("c1")])),
             TypedExpr::copair(vec![var("cp0"), var("cp1")]),
             TypedExpr::disjoint_join(vec![var("dj0"), var("dj1")]),
+            node(N::Realized(vec![var("r0"), var("r1")])),
             TypedExpr::expr_stmt(var("stmt"), var("rest")),
             node(N::Begin {
                 body: Box::new(var("bg")),
@@ -843,7 +844,6 @@ mod tests {
         N::Apply { .. } => "Apply",
         N::Cast { .. } => "Cast",
         N::Comprehension { .. } => "Comprehension",
-        N::Realize(_) => "Realize",
         N::BinOp { .. } => "BinOp",
         N::UnaryOp(..) => "UnaryOp",
         N::Lambda { .. } => "Lambda",
@@ -867,6 +867,7 @@ mod tests {
         N::Compose(_) => "Compose",
         N::Copair(_) => "Copair",
         N::DisjointJoin(_) => "DisjointJoin",
+        N::Realized(_) => "Realized",
         N::ExprStmt { .. } => "ExprStmt",
         N::Begin { .. } => "Begin",
         N::Feed { .. } => "Feed",

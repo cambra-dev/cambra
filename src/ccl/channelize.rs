@@ -1502,7 +1502,6 @@ fn drop_expr_stmts(mut expr: Expr) -> Expr {
         | TypedExprNode::Source(..)
         | TypedExprNode::LoadFrom(_)
         | TypedExprNode::Apply { .. }
-        | TypedExprNode::Realize(_)
         | TypedExprNode::Cast { .. }
         | TypedExprNode::BinOp { .. }
         | TypedExprNode::UnaryOp(..)
@@ -1518,7 +1517,8 @@ fn drop_expr_stmts(mut expr: Expr) -> Expr {
         | TypedExprNode::LetRec { .. }
         | TypedExprNode::Compose(_)
         | TypedExprNode::Copair(_)
-        | TypedExprNode::DisjointJoin(_) => {
+        | TypedExprNode::DisjointJoin(_)
+        | TypedExprNode::Realized(_) => {
             expr.map_children(drop_expr_stmts);
             expr
         }
@@ -1582,7 +1582,6 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
         | TypedExprNode::Source(..)
         | TypedExprNode::LoadFrom(_)
         | TypedExprNode::Apply { .. }
-        | TypedExprNode::Realize(_)
         | TypedExprNode::Cast { .. }
         | TypedExprNode::BinOp { .. }
         | TypedExprNode::UnaryOp(..)
@@ -1599,6 +1598,7 @@ fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
         | TypedExprNode::Compose(_)
         | TypedExprNode::Copair(_)
         | TypedExprNode::DisjointJoin(_)
+        | TypedExprNode::Realized(_)
         | TypedExprNode::ExprStmt { .. } => {
             let mut result = Ok(());
             expr.walk_children(|child| {
@@ -2222,9 +2222,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
                 rec(function, bound, out);
                 rec(argument, bound, out);
             }
-            TypedExprNode::Cast { value, .. } | TypedExprNode::Realize(value) => {
-                rec(value, bound, out)
-            }
+            TypedExprNode::Cast { value, .. } => rec(value, bound, out),
             TypedExprNode::Begin { body } => rec(body, bound, out),
             TypedExprNode::BinOp { left, right, .. } => {
                 rec(left, bound, out);
@@ -2237,7 +2235,8 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
             | TypedExprNode::List(elts)
             | TypedExprNode::Compose(elts)
             | TypedExprNode::Copair(elts)
-            | TypedExprNode::DisjointJoin(elts) => {
+            | TypedExprNode::DisjointJoin(elts)
+            | TypedExprNode::Realized(elts) => {
                 for e in elts {
                     rec(e, bound, out);
                 }
@@ -2573,6 +2572,9 @@ fn extract_for_defer_impl(
         TypedExprNode::DisjointJoin(_) => {
             unreachable!("DisjointJoin is born by lambda_elim, which runs after channelize")
         }
+        TypedExprNode::Realized(_) => {
+            unreachable!("Realized is born by planning, which runs after channelize")
+        }
         TypedExprNode::Let {
             binding,
             bound_expr,
@@ -2756,14 +2758,6 @@ fn extract_for_defer_impl(
                 }
             }
         }
-        // `realize` wraps a pure value exactly as `cast` does; recurse and keep `target`.
-        TypedExprNode::Realize(value) => TypedExprNode::Realize(Box::new(extract_for_defer(
-            *value,
-            defer_name,
-            feeds,
-            define,
-            in_inner_scope,
-        )?)),
         // `cast` wraps a pure value; recurse into it and keep `target`.
         TypedExprNode::Cast { value, target } => TypedExprNode::Cast {
             value: Box::new(extract_for_defer(

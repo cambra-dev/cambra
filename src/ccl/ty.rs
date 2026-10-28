@@ -4921,7 +4921,6 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::Var(_)
         | N::Builtin(_)
         | N::Apply { .. }
-        | N::Realize(_)
         | N::Cast { .. }
         | N::BinOp { .. }
         | N::UnaryOp(..)
@@ -4944,6 +4943,7 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::Compose(_)
         | N::Copair(_)
         | N::DisjointJoin(_)
+        | N::Realized(_)
         | N::ExprStmt { .. }
         | N::Feed { .. }
         | N::Define { .. }
@@ -5143,7 +5143,8 @@ fn eq_term_modulo_ty_slots_go(
         | (N::Tuple(x), N::Tuple(y))
         | (N::Compose(x), N::Compose(y))
         | (N::Copair(x), N::Copair(y))
-        | (N::DisjointJoin(x), N::DisjointJoin(y)) => all_eq(x, y, pairs),
+        | (N::DisjointJoin(x), N::DisjointJoin(y))
+        | (N::Realized(x), N::Realized(y)) => all_eq(x, y, pairs),
         (
             N::Case {
                 scrutinee: s1,
@@ -5257,10 +5258,6 @@ fn eq_term_modulo_ty_slots_go(
             // A `Feed`/`Define` name is a *use* of the binder that introduced
             // the handle (`ccl::scope`), so it resolves like any reference.
         ) => paired_refs_match(pairs, n1, n2) && eq_term_modulo_ty_slots_go(v1, v2, pairs),
-        // A realized conditional collection. Reachable inside a predicate because a
-        // filter's predicate carries its own copy of the source (`__elem ▷ src ▷ 𝑓`), so
-        // when `src` is a conditional, realization rewrites it *in the predicate*.
-        (N::Realize(v1), N::Realize(v2)) => eq_term_modulo_ty_slots_go(v1, v2, pairs),
         _ => {
             // **A missing arm is not "unequal", it is unanswered.** Falling through with
             // two nodes of the *same* shape means this function has no rule for that
@@ -5882,41 +5879,6 @@ mod tests {
         assert_eq!(
             Type::data_fun(Type::UIntRange(0), Type::Base(BaseType::Int)).to_string(),
             "(0..0 ⤇ Int)"
-        );
-    }
-
-    /// **A rebuilt predicate equals itself, `Realize` included.** Refinement equality is
-    /// structural precisely so a predicate re-minted by planning compares equal to the one
-    /// it was built from; a node variant with no arm in `eq_term_modulo_ty_slots_go` breaks
-    /// that for every predicate containing it, and silently — pointer-equal predicates
-    /// short-circuit, so it bites only where a predicate is *rebuilt*, which is exactly
-    /// where the equality is load-bearing.
-    ///
-    /// `Realize` reaches a predicate because a filter's predicate carries its own copy of
-    /// the source, so a conditional source gets realized inside it. The symptom is remote
-    /// and unhelpful: a type mismatch whose two sides print identically, the predicate
-    /// being the part of a type `Display` does not show.
-    #[test]
-    fn a_rebuilt_predicate_containing_realize_equals_itself() {
-        let realizing = || {
-            Rc::new(
-                TypedExpr::new(TypedExprNode::Realize(Box::new(
-                    TypedExpr::new(TypedExprNode::Var(Name::elem()))
-                        .with_ty(Type::Base(BaseType::Int)),
-                )))
-                .with_ty(Type::Base(BaseType::Int)),
-            )
-        };
-        // Two *separately built* copies: distinct `Rc`s, so the pointer short-circuit
-        // cannot hide a missing arm.
-        let (a, b) = (Refinement::born(realizing()), Refinement::born(realizing()));
-        assert!(
-            !Rc::ptr_eq(&a.predicate, &b.predicate),
-            "the premise: these must be distinct terms"
-        );
-        assert_eq!(
-            a, b,
-            "a rebuilt predicate must equal the one it was built from"
         );
     }
 

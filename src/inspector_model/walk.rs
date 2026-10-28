@@ -83,7 +83,6 @@ pub(super) fn node_label(node: &TypedExprNode) -> String {
             trait_, function, ..
         } => format!("TraitFn({trait_}::{function})"),
         LoadFrom(n) => format!("LoadFrom({n})"),
-        Realize(_) => "Realize".to_string(),
         Transact { .. } => "Transact".to_string(),
         LetRec { .. } => "LetRec".to_string(),
         DefGroup { .. } => "DefGroup".to_string(),
@@ -105,6 +104,7 @@ pub(super) fn node_label(node: &TypedExprNode) -> String {
         // inspector names them apart because they are apart.
         Copair(_) => "Copair".to_string(),
         DisjointJoin(_) => "DisjointJoin".to_string(),
+        Realized(_) => "Realized".to_string(),
         ExprStmt { .. } => "ExprStmt".to_string(),
         Feed { name, .. } => format!("Feed({name})"),
         Define { name, .. } => format!("Define({name})"),

@@ -351,7 +351,8 @@ fn refuse_a_union_applied_at_the_input(term: &Expr) -> Result<(), String> {
             {
                 legs.iter().find_map(find)
             }
-            TypedExprNode::Realize(_) => None,
+            // A realized conditional answers at each key as the conditional it realizes does.
+            TypedExprNode::Realized(_) => None,
             TypedExprNode::Copair(_) | TypedExprNode::DisjointJoin(_) => {
                 e.ty.is_collection().then_some(e)
             }

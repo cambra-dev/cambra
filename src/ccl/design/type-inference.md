@@ -3323,18 +3323,15 @@ A leg is the sum's body at its candidate, a plain collection, so realization als
 (`discharge_determined_witnesses`). It does not descend into refinement predicates for this;
 realization replaces conditional predicate copies separately.
 
-#### Planning asserts the type it replaces
+#### A realized conditional is typed as its sum
 
-[`TypedExprNode::Realize`] gives a realized union the original sum type. The union has
-a tagged domain containing each leg, whereas the sum selects one candidate domain.
-The leg restrictions make their runtime values correspond; the ordinary subtyping rule
-does not prove that representation change.
-
-An assertion at this node keeps enclosing compositions, products and projections typed
-against the original sum. A [`TypedExprNode::Cast`] cannot perform this operation:
-`emit_cast` derives its type from the value while acquiring domain refinements, so
-casting the union would retain its tagged domain. See the `Realize` node's contract
-for the extent of the assertion.
+A realized conditional is a [`TypedExprNode::Realized`] node holding its gated legs, typed as
+the sum `Σ (σ : 𝐾). σ ⤇ 𝑉` the `Case` had, so enclosing compositions, products and projections
+keep that type. The check after planning holds each leg to the sum's body at one candidate:
+the leg's domain is a candidate `𝑑 ∈ 𝐾` further refined by its gate, and its type is a subtype
+of `𝑑 ⤇ 𝑉` over that domain (`check_realized`). A sum over several witnesses has a leg per
+combination of their candidates, and a function view `σ ⤇ 𝑉` reads its witness's candidates from
+the witness context. The legs' disjointness is their first-match gates', which no type records.
 
 ### Implementation limits
 

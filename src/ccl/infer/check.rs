@@ -980,15 +980,6 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         TypedExprNode::Lambda { param, body } => emit_lambda(param, body, &recorded_ty, ctx)?,
 
         TypedExprNode::Cast { value, target } => emit_cast(value, target, ctx)?,
-        // **The assertion is trusted**, which is the whole difference from `Cast`. The
-        // relation it claims — a gated tagged union realizing a sum — is one no typing rule
-        // can check, so re-deriving from the value would only rediscover that they differ.
-        // The child is still walked: it is an ordinary term and its own subtree must check.
-        TypedExprNode::Realize(value) => {
-            ctx.subexpr(value)?;
-            expr.ty.clone()
-        }
-
         TypedExprNode::Apply { function, argument } => {
             emit_apply(function, argument, &recorded_ty, ctx)?
         }
@@ -1054,6 +1045,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 
         TypedExprNode::Copair(exprs) => emit_copair(exprs, ctx)?,
         TypedExprNode::DisjointJoin(exprs) => emit_disjoint_join(exprs, &recorded_ty, ctx)?,
+        TypedExprNode::Realized(legs) => check_realized(legs, &recorded_ty, ctx)?,
 
         TypedExprNode::Transact {
             keys,
@@ -1145,6 +1137,81 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         }
     }
     Ok(ty)
+}
+
+/// A realized conditional: its gated legs, typed as the sum it realizes
+/// (`src/ccl/design/collections.md`, "Compiling a conditional collection").
+///
+/// Each leg is the sum's body at one of its candidates, its domain further refined by the
+/// leg's gate. Several legs can share a candidate, since arms over one domain make one
+/// candidate. The gates are first-match path conditions, so at most one leg holds rows; no
+/// type records that, and `flat_merge` checks it where it merges.
+fn check_realized(
+    legs: &mut [Expr],
+    recorded: &Type,
+    ctx: &mut CheckCtx,
+) -> Result<Type, LocatedInferError> {
+    let bodies = candidate_bodies(recorded.peel_refinements(), &ctx.witness_ctx);
+    for leg in legs.iter_mut() {
+        let leg_ty = ctx.subexpr(leg)?;
+        let body = leg_ty.domain().and_then(|leg_dom| {
+            bodies.iter().find(|body| {
+                body.domain().is_some_and(|d| {
+                    leg_dom.peel_refinements() == d.peel_refinements()
+                        && d.refinements()
+                            .iter()
+                            .all(|r| leg_dom.refinements().contains(r))
+                })
+            })
+        });
+        let Some(body) = body else {
+            return Err(ctx.raise(InferError::Unsupported(format!(
+                "a realized leg `{leg_ty}` is the body of none of `{recorded}`'s candidates; \
+                 this is a compiler bug"
+            ))));
+        };
+        // The leg's own domain, which carries its gate, over the body's codomain.
+        let (Some(leg_dom), Some(codomain)) = (leg_ty.domain(), body.codomain()) else {
+            unreachable!("a leg matched a body by its domain, and both are collections")
+        };
+        let expected = Type::fun_like(body, leg_dom, codomain);
+        ctx.require_sub(&leg_ty, &expected, &|| "realized leg".to_string())?;
+    }
+    Ok(recorded.clone())
+}
+
+/// `ty` at every combination of candidates for the witnesses it quantifies or names free:
+/// its own binders, outermost first, then each witness its domain reads from `gamma`. A kind
+/// that lists no candidates contributes none.
+fn candidate_bodies(ty: &Type, gamma: &crate::ccl::ty::WitnessContext) -> Vec<Type> {
+    use crate::ccl::ty::TypeKind;
+    let (witness, kind) = if let Some([first, ..]) = ty.sum() {
+        (None, first.type_kind())
+    } else if let Some(free) = ty.domain().and_then(|d| {
+        crate::ccl::ty::free_witness_refs(&d, &[])
+            .into_iter()
+            .next()
+    }) {
+        match gamma.type_kind_of(&free) {
+            Some(kind) => (Some(free), kind),
+            None => return Vec::new(),
+        }
+    } else {
+        return vec![ty.clone()];
+    };
+    let TypeKind::Enumerated(candidates) = kind else {
+        return Vec::new();
+    };
+    candidates
+        .iter()
+        .flat_map(|d| {
+            let body = match &witness {
+                None => ty.instantiate_sum(d),
+                Some(w) => crate::ccl::subst::Subst::discharge_witness(w, d).apply_type(ty),
+            };
+            candidate_bodies(&body, gamma)
+        })
+        .collect()
 }
 
 /// Type every refinement predicate `expr`'s own type slots carry, as the function it denotes.
@@ -1450,6 +1517,28 @@ mod tests {
         assert!(
             check(&dependent_projection(CompareKind::Greater)).is_err(),
             "`.1` equals `p.0`, so it is not greater than it"
+        );
+    }
+
+    /// A realized conditional is typed as the sum it realizes, each leg the sum's body at one of
+    /// its candidates ([`check_realized`]). A leg over a domain no candidate is, is an error.
+    #[test]
+    fn a_realized_conditional_holds_legs_over_its_sums_candidates() {
+        let int = prim(BaseType::Int);
+        let sum = Type::sum_over(
+            crate::ccl::ty::TypeKind::Enumerated(vec![Type::UIntRange(2), Type::UIntRange(3)]),
+            None,
+            int.clone(),
+        );
+        let leg = |n| {
+            TypedExpr::var(Name::fresh("xs"))
+                .with_ty(Type::data_fun(Type::UIntRange(n), int.clone()))
+        };
+        let join = |legs| TypedExpr::new(TypedExprNode::Realized(legs)).with_ty(sum.clone());
+        assert_eq!(check(&join(vec![leg(2), leg(3)])), Ok(()));
+        assert!(
+            check(&join(vec![leg(2), leg(4)])).is_err(),
+            "`0..4` is not a candidate of the sum"
         );
     }
 
