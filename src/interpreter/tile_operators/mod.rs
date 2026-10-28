@@ -545,7 +545,9 @@ impl Consumer for FlaggingConsumer {
 /// The regions an input has notified since they were last taken.
 ///
 /// `subscribe` installs [`Self::consumer`] on the input before the producer exists;
-/// an `Arc<Mutex<_>>` connects the two and carries no tile values.
+/// an `Arc<Mutex<_>>` connects the two and carries no tile values. A region of fields names a
+/// change inside a record, which a reader of keys cannot place, so it is recorded as
+/// [`Projection::Everything`].
 #[derive(Clone)]
 pub struct Arrivals(
     // shared-state-ok: see the type doc.
@@ -587,7 +589,7 @@ struct RecordingConsumer {
 impl Consumer for RecordingConsumer {
     fn notify(&mut self, arrived: &Projection) {
         let mut held = self.arrivals.0.lock_now();
-        *held = held.union(arrived);
+        *held = held.union(&arrived.keys_only());
         drop(held);
         self.downstream.notify(arrived);
     }

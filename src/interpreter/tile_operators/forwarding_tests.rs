@@ -888,7 +888,6 @@ fn every_operator_that_keeps_keys_widens_a_region_of_fields() {
         ("MapResultWithSource", Box::new(map_result_with_source), 0),
         ("MapAggregate", Box::new(map_aggregate), 0),
         ("MapExtractAggregate", Box::new(extract_over_a_feed), 0),
-        ("Memo", Box::new(memo), 0),
         ("Zip arm 0", Box::new(zip), 0),
         ("Zip arm 1", Box::new(zip), 1),
         ("Product outer", Box::new(product), 0),
@@ -918,7 +917,6 @@ fn every_operator_that_keeps_keys_widens_a_region_of_fields() {
             Box::new(|| uncurry(CurryLevel::new(1))),
             0,
         ),
-        ("FanOutSlot", Box::new(fan_out_slot_over_a_feed), 0),
     ];
     for (name, build, input) in &keepers {
         assert_eq!(
@@ -943,4 +941,21 @@ fn extract_over_a_feed() -> Built {
     let (input, consumer) = feed(fold_tiling);
     let op = MapExtractAggregate::new(input, crate::ccl::AggregateKind::Sum);
     (Box::new(op), vec![consumer])
+}
+
+/// A memo and a fan-out's slot pass a product on as it is, so a region of its fields reaches the
+/// consumer unchanged.
+#[test]
+fn a_memo_and_a_fan_out_slot_pass_a_region_of_fields_on() {
+    let fields = field("a", region());
+    assert_eq!(received(&memo, 0, &fields), std::slice::from_ref(&fields));
+    assert_eq!(
+        received(&fan_out_slot_over_a_feed, 0, &fields),
+        std::slice::from_ref(&fields)
+    );
+    let everything = field("a", Projection::Everything);
+    assert_eq!(
+        received(&memo, 0, &everything),
+        std::slice::from_ref(&everything)
+    );
 }

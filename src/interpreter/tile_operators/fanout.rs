@@ -12,7 +12,7 @@ use crate::{
     interpreter::{
         Consumer, Position, Projection, Scheduler,
         scheduler::{
-            GatedConsumer, WakeupQueue, forwarding_consumer_keeping_keys, shared_consumer,
+            GatedConsumer, WakeupQueue, forwarding_consumer_passing_regions, shared_consumer,
         },
     },
     pretty_graph::VizOptions,
@@ -214,7 +214,7 @@ impl Consumer for FanOutInput {
                 .collect::<Vec<_>>()
         };
         for c in &consumers {
-            c.lock_now().notify(&arrived.keys_only());
+            c.lock_now().notify(arrived);
         }
     }
 }
@@ -969,7 +969,7 @@ impl TileOperator for Memo {
                 intent_guard,
                 // The memo reads its input at the projection and keeps its keys, so the keys that
                 // changed at the input are the keys that changed at the memo.
-                arrivals.consumer(forwarding_consumer_keeping_keys(
+                arrivals.consumer(forwarding_consumer_passing_regions(
                     &consumer,
                     &scheduler.wakeup_queue(),
                 )),

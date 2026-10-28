@@ -155,6 +155,19 @@ pub fn forwarding_consumer_keeping_keys(
     })
 }
 
+/// [`forwarding_consumer`] for an input that is a product the operator passes on: its region,
+/// including a region of fields, is forwarded as it is.
+pub fn forwarding_consumer_passing_regions(
+    shared: &GatedConsumer,
+    wakeups: &WakeupQueue,
+) -> Box<dyn Consumer> {
+    Box::new(Forwarding {
+        gated: shared.clone(),
+        wakeups: wakeups.clone(),
+        route: Route::Region,
+    })
+}
+
 /// [`forwarding_consumer`] for the input that is the field `name` of the record the operator
 /// makes of its inputs, whose fields are `names`: its region is forwarded as the region of that
 /// field.
@@ -227,6 +240,8 @@ enum Route {
     Widen,
     /// The region, with a region of fields widened to `Everything` ([`Projection::keys_only`]).
     Keys,
+    /// The region as it is, a region of fields included.
+    Region,
     /// The region as the region of one field of the record the operator makes of its inputs.
     Field {
         name: SmolStr,
@@ -245,6 +260,7 @@ impl Consumer for Forwarding {
         let region = match &self.route {
             Route::Widen => Projection::Everything,
             Route::Keys => arrived.keys_only(),
+            Route::Region => arrived.clone(),
             Route::Field { name, names } => {
                 Projection::fields([(name.clone(), arrived.clone())]).normalized(names)
             }
