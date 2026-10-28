@@ -14,23 +14,81 @@ use std::{
     sync::atomic::{AtomicU32, Ordering},
 };
 
-use crate::ccl::{Level, Name};
+use crate::ccl::{
+    Level, Name,
+    infer::solver::traits::{Supplier, Trait},
+    ty::TraitRequirement,
+};
 
-/// An input a call's context supplies (`docs/chl-spec.md`, "6.9 Capabilities \[Decided\]"). Trait
-/// requirements are not here: a function value's are resolved where it is made, so a function
-/// type's `requires` names only context.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub enum Requirement {
+/// A requirement of a trait a call's context supplies (`docs/chl-spec.md`, "Discharging
+/// requirements and effects"): `Transaction`, `ObserveWorld` or `Read(x)`. Trait requirements
+/// answered by instance search are not here: a function value's are resolved where it is made, so a
+/// function type's `requires` names only context.
+///
+/// A context trait is over no types, so its trait and term arguments decide a requirement of
+/// it, and order it: by [`Supplier`], then by trait, then by term arguments.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct Requirement(TraitRequirement);
+
+impl Requirement {
+    fn of(trait_: Trait, terms: Vec<Name>) -> Requirement {
+        debug_assert!(
+            trait_.supplied_by != Supplier::Instances
+                && trait_.arity() == 0
+                && trait_.term_params.len() == terms.len(),
+            "a context requirement names a context trait, over no types, at one term argument \
+             per term parameter"
+        );
+        Requirement(TraitRequirement {
+            trait_,
+            args: Vec::new(),
+            terms,
+            assoc: Vec::new(),
+            at: None,
+        })
+    }
+
     /// The snapshot of a transaction, which a `with begin():` block supplies to its body.
-    Transaction,
+    pub fn transaction() -> Requirement {
+        Requirement::of(Trait::transaction(), Vec::new())
+    }
+
     /// An input from outside the program: opening a source, or a reading.
-    ObserveWorld,
-    /// The run's transactional state, which a read of a transactional variable reads and the
-    /// run supplies.
-    ReadTransactional,
-    /// A position in the history of the induction variable the name binds, which a read of it
-    /// stands at. The scope binding the variable supplies one to every call inside it.
-    Read(Name),
+    pub fn observe_world() -> Requirement {
+        Requirement::of(Trait::observe_world(), Vec::new())
+    }
+
+    /// The run's transactional state, which a read of a transactional variable reads.
+    pub fn read_transactional() -> Requirement {
+        Requirement::of(Trait::read_transactional(), Vec::new())
+    }
+
+    /// A position in the history of the induction variable `x` binds, which a read of it stands
+    /// at.
+    pub fn read(x: Name) -> Requirement {
+        Requirement::of(Trait::read(), vec![x])
+    }
+
+    /// The trait requirement this is.
+    pub fn requirement(&self) -> &TraitRequirement {
+        &self.0
+    }
+}
+
+impl PartialOrd for Requirement {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Consistent with equality: a context requirement has no operands and no associated types.
+impl Ord for Requirement {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        let key = |r: &Requirement| (r.0.trait_.supplied_by, r.0.trait_.clone());
+        key(self)
+            .cmp(&key(other))
+            .then_with(|| self.0.terms.cmp(&other.0.terms))
+    }
 }
 
 /// An output of a call besides its result (`docs/chl-spec.md`, "6.9 Capabilities \[Decided\]").
@@ -244,6 +302,11 @@ impl EffectVar {
 
     /// The capabilities recorded on this variable and on every variable flowing into it, each
     /// through the filters of the path it takes.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
+                  and a trait hashes and orders by its module path and name"
+    )]
     pub fn resolved(&self) -> BTreeSet<Capability> {
         let now = EFFECT_FACTS.with(Cell::get);
         if let Some((at, capabilities)) = &*self.resolved_at.borrow()
@@ -326,6 +389,11 @@ impl EffectVar {
     }
 
     /// The capabilities recorded on this variable itself, without what flows in.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
+                  and a trait hashes and orders by its module path and name"
+    )]
     pub fn own(&self) -> BTreeSet<Capability> {
         self.own.borrow().clone()
     }
@@ -357,6 +425,11 @@ impl Hash for EffectVar {
 }
 
 /// The set a group of capabilities states, without the depths that only inference reads.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "a `Capability` reaches a `Type` only through its requirement's trait declaration, \
+              and a trait hashes and orders by its module path and name"
+)]
 pub fn set_of(capabilities: &BTreeSet<Capability>) -> EffectSet {
     let mut set = EffectSet::default();
     for l in capabilities {
@@ -435,12 +508,12 @@ impl Effects {
 
 impl fmt::Display for Requirement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Requirement::Transaction => f.write_str("Transaction"),
-            Requirement::ObserveWorld => f.write_str("ObserveWorld"),
-            Requirement::ReadTransactional => f.write_str("ReadTransactional"),
-            Requirement::Read(x) => write!(f, "Read({x})"),
+        write!(f, "{}", self.0.trait_)?;
+        if !self.0.terms.is_empty() {
+            let terms: Vec<String> = self.0.terms.iter().map(ToString::to_string).collect();
+            write!(f, "({})", terms.join(", "))?;
         }
+        Ok(())
     }
 }
 
@@ -512,4 +585,24 @@ pub fn lower_effect_levels(ty: &crate::ccl::Type, level: Level) {
         v.lower_level(level);
     }
     ty.walk_children(|child| lower_effect_levels(child, level));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Context requirements order by supplier, so a `requires` clause lists the transaction,
+    /// then the run's input, then the reads; and a term argument is written in parentheses.
+    #[test]
+    fn context_requirements_order_by_supplier() {
+        let x = Name::from("x");
+        let mut requirements = [
+            Requirement::read(x),
+            Requirement::observe_world(),
+            Requirement::transaction(),
+        ];
+        requirements.sort();
+        let written: Vec<String> = requirements.iter().map(ToString::to_string).collect();
+        assert_eq!(written, ["Transaction", "ObserveWorld", "Read(x)"]);
+    }
 }

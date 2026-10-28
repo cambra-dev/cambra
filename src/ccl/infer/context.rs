@@ -370,7 +370,7 @@ impl EffectFrame {
             when_data: None,
             below: (!self.keeps_own).then_some(self.depth),
             discharges: if self.transactions > 0 {
-                [Requirement::Transaction].into_iter().collect()
+                [Requirement::transaction()].into_iter().collect()
             } else {
                 Default::default()
             },
@@ -2205,8 +2205,8 @@ impl Typing for InferCtx {
             Item::Causes(Effect::Write(_)) if binder.is_some_and(|b| b.transactional) => {
                 (Item::Causes(Effect::WriteTransactional), None)
             }
-            Item::Requires(Requirement::Read(_)) if binder.is_some_and(|b| b.transactional) => {
-                (Item::Requires(Requirement::ReadTransactional), None)
+            Item::Requires(_) if binder.is_some_and(|b| b.transactional) => {
+                (Item::Requires(Requirement::read_transactional()), None)
             }
             item => (item, binder),
         };
@@ -2230,16 +2230,16 @@ impl Typing for InferCtx {
             .get(name)
             .is_some_and(|b| b.transactional)
         {
-            self.record_effect(Item::Requires(Requirement::Transaction), None);
+            self.record_effect(Item::Requires(Requirement::transaction()), None);
         }
     }
 
     fn record_read(&mut self, name: &Name) {
         if let Some(transactional) = self.effect_binders.get(name).map(|b| b.transactional) {
             if transactional {
-                self.record_effect(Item::Requires(Requirement::Transaction), None);
+                self.record_effect(Item::Requires(Requirement::transaction()), None);
             }
-            self.record_effect(Item::Requires(Requirement::Read(name.clone())), Some(name));
+            self.record_effect(Item::Requires(Requirement::read(name.clone())), Some(name));
         }
     }
 
