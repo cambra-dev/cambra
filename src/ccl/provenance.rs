@@ -989,7 +989,7 @@ pub(crate) struct ProvenanceTable {
     interned: HashMap<RewriteTag, TagId>,
 }
 
-// Row enumeration remains private; callers query selected phases or a live set.
+// `tag_id`, `contains`, `deaths`, `len`, and `tag_count` are used only by tests.
 #[allow(dead_code)]
 impl ProvenanceTable {
     /// The [`TagId`] for `tag` in this table, assigning one on first sight.
@@ -1001,7 +1001,8 @@ impl ProvenanceTable {
         if let Some(id) = self.interned.get(&tag) {
             return *id;
         }
-        // Tags are shared by all products of the same phase, nature and label.
+        // Distinct phase/nature/label triples are bounded by the compiler's recording sites,
+        // not by the size of the program being compiled, so their count fits in u32.
         let id = TagId(
             u32::try_from(self.tags.len()).expect("more distinct rewrite tags than a u32 indexes"),
         );

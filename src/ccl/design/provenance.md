@@ -32,9 +32,6 @@ the checks and switches; enabling capture and asserting the absence of leaks are
 | **boundary node** | An operator-pane node representing a sink, with a label and identity but no tiling. A data source is not a node; an `IterateExtent` reads its domain. |
 | **recording** | The dynamic scope opened by `provenance::enter` and held by a `RecordingGuard`. The innermost recording captures a mint or copy. A recording site is the code location that opens it. |
 
-The internal vault's `projects/program-inspector/provenance-design` note contains the decision
-history and rejected alternatives. This reference specifies the implementation.
-
 ## Node identity
 
 `NodeId` is a `Copy` newtype allocated from a process-global atomic counter separate from the
@@ -157,7 +154,9 @@ earlier freshening has three possible outcomes:
 - Moved into the output: the placed node holds the fresh ID and names the original as its parent.
 - Copied again: the placed copy names the intermediate ID. If that intermediate was not recorded
   and is not in the input tree, the fold reports `DanglingParent`. A recorded intermediate instead
-  composes away. Substitution templates therefore use preserving copies until materialization.
+  composes away. A template copied without an open recording must preserve its IDs. A copy under
+  a recording may freshen: `Subst::discharge_env_in_place` and `discharge_env_in_binder` copy
+  templates this way under their callers' recordings before materialization.
 - Dropped: the ID and any recorded row may be unused. Uniqueness checks visit reachable nodes;
   there is no requirement that every recorded birth survive into an output tree.
 
@@ -295,28 +294,10 @@ Lowering leaf mints use `lowering_leaf` directly, supplying a literal source spa
 existing attribution. `fold_lowering` processes the log at the lowering handoff.
 The distinct log and fold contracts are specified under [The seam](#the-seam).
 
-**Where recordings are open today.** Lowering's leaf appends and copy sinks, plus
-every recording a pane pair's fold reads — each of the phases below runs inside a
-`PhaseScope` that `compile_program` opens, and sits between two retained AST
-snapshots: `infer/solve` (`mono.specialize`,
-`mono.coalesce_let`), `infer/emit` (`infer.lit_singleton`), `infer/context`
-(`infer.require_trait`), `infer/solver/scheme` (`infer.freshen_predicate`),
-`infer/solver/traits` (`infer.freshen_obligation`), `inline`
-(`inline.alias`, `inline.udf`, `inline.beta`), `mut_elim` (`letrec.loop`,
-`letrec.accumulator`, `letrec.feed`, `letrec.bare_write`,
-`letrec.hoist_writer_body`, `letrec.terminalize_write`),
-`transact_phase` (strip, unwrap block, writer, commit record, history binding,
-key rebind, key-init stash, store, the cross-domain and await-final rules), and
-`channelize` (`channelize.cluster`, `channelize.feed`, `channelize.defer_lift`,
-`channelize.defer_collapse`), `transact_phase`'s as-of-read rewrite
-(`transact.as_of_read`), and `lambda_elim` (`lambda_elim.abstract`,
-`lambda_elim.point_free`, `lambda_elim.filter`, `lambda_elim.value_case`). Three
-shared helpers record under whichever phase scope is open around them: `subst`
-(`subst.vacuous`, `subst.transport`, `subst.force_refinement`), `ccl_utils`'
-`PredMemo::rebuild` (`predicate.rebuild`), and `mut_elim`'s induction fold —
-`fold_induction_loop` and `InductionFold::acc_view` (`letrec.accumulator`,
-`letrec.feed`), which `transact_phase` calls for a cross-domain loop and so
-records a `letrec.*` label under `Transact`.
+`PANES` in `src/ccl/panes.rs` and the phase scopes opened by `compile_program` in
+`src/ccl/context.rs` define the retained boundaries and the phases whose recordings each pair
+folds. Lowering records leaf appends and copies through its separate log. Rewrite labels are
+supplied at recording sites, not enumerated here.
 
 Table capture is enabled by default and disabled by `CAMBRA_PROVENANCE=0` or a named audit span.
 When enabled, pipeline boundaries install the phase scopes. Shared helpers record under their
