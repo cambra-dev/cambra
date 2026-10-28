@@ -1,80 +1,18 @@
-//! Node identity, and the per-compile table that records where each node came
-//! from.
+//! Node identities, rewrite recording and source attribution.
 //!
-//! # The model
+//! Each produced node has at most one provenance row. Mint and copy hooks populate
+//! the innermost recording; closing it writes captured products to the active sink.
+//! `parents` records ancestry and `blame` records additional attribution. Neither
+//! column declares whether an input node survives.
 //!
-//! Every IR expression node carries a [`NodeId`], unique within a tree — a
-//! pipeline invariant asserted at every phase boundary by
-//! `assert_unique_node_ids`. Rows are keyed by that identity, so everything
-//! below rests on it: two nodes sharing an id would share one row and one
-//! attribution.
+//! [`fold`] relates selected phases' input and output IDs and derives source
+//! attribution, deaths and recording leaks. Lowering attaches literal source
+//! spans and uses the sequential [`fold_lowering`].
 //!
-//! Every node a phase *produces* gets a row in the [`ProvenanceTable`]: the ids
-//! the rewrite consumed to produce it (`parents`), the ids it attributes to
-//! (`blame` — **not** the same as what it consumed), and an interned
-//! [`RewriteTag`] carrying the [`Phase`], the fidelity `nature`, and a stable
-//! `label`. An id with no row was never rewritten.
-//!
-//! Rows are a byproduct of performing the rewrite, never a post-phase diff. A
-//! phase names the node it is about to rewrite ([`enter`]), and the construction
-//! hooks record every node minted while that guard is the innermost one open.
-//!
-//! For a pair of inspector panes the rows the phases between them wrote are
-//! folded once by [`fold`] into a [`ProvenanceMap`] — a bidirectional node↔node
-//! relation with an explicit self-edge for every id that survived — and, in
-//! parallel, into a [`SourceProjection`] that resolves each surviving node's
-//! attribution back to source spans. The fold composes away ids born and
-//! consumed within the phase; its [`Leak`] vector is what says whether a node
-//! silently lost its history, and the input ids it reports dead are the
-//! live-set difference.
-//!
-//! The fold is order-free: it reads the rows as an edge set and sweeps them in
-//! ascending [`NodeId`], which is a topological order of the definition graph
-//! (see [`fold`], "The algebra"). Write order is not chronology, and
-//! [`fold`] explains why nothing may depend on it.
-//!
-//! # Two columns, because they are two kinds of relation
-//!
-//! Both columns relate a node to other nodes, and differ in what the relation
-//! asserts. Both reach [`ProvenanceMap`], each labelling the edges it
-//! contributes:
-//!
-//! * **`parents`** — descends from. The ids the rewrite consumed to produce
-//!   this node, and the column the leak audit reads: a parent the fold
-//!   never heard of is an ancestry that stops at an id describing nothing
-//!   ([`Leak::DanglingParent`]).
-//! * **`blame`** — related to, but not consumed. It may name ids that survive
-//!   the rewrite, so it is not an ancestry claim, and a reader asking "what was
-//!   this made from" reads the edge's label rather than its presence.
-//!
-//! The labels compose weakest-link along a path, so that the inspector can
-//! render blame or prune it once transitivity has run; [`EdgeLabels`]
-//! states the composition.
-//!
-//! Attribution reads both columns, unioned: a node's spans are its parents'
-//! spans plus whatever distinct spans its blame adds. Blame is named at a
-//! handful of sites, all in the mutability phases, so for almost every node this
-//! is the spans of whatever it was made from. Attribution reads no label — a
-//! span is a span whichever column named the node it came from.
-//!
-//! # Domains, not phases
-//!
-//! [`ProvenanceMap`] is generic over its two id domains so a relation may run
-//! between distinct ones. Every instantiation is `NodeId → NodeId`, and operator
-//! identity does not change that: an operator carries a `NodeId` drawn from the
-//! same counter, so a pane pair spanning operator conversion is homogeneous like
-//! every other. The genericity buys the output container alone — the table, the
-//! fold, the projection and the leak classes are all monomorphically `NodeId`.
-//! Phases live in the *data* (each row's [`RewriteTag`]), never in the type.
-//!
-//! # What this module does not own
-//!
-//! Lowering's own attribution channel, whose entries carry a literal source span
-//! rather than a NodeId reference, is a [`LoweringLog`] folded once at the
-//! lowering handoff — see [`LoweringStep`] for why it is a separate sink.
-//! `CompiledProgram::materialize_panes` (`crate::ccl::context`) is the caller
-//! that folds a whole compile's table into the inspector's panes, and
-//! `design/provenance.md` is the reference for the design.
+//! The reference owns the cross-component contracts: `src/ccl/design/provenance.md`,
+//! "Node identity", "The provenance model", "The recorder" and "The fold".
+//! `crate::ccl::context` installs pipeline sessions; `crate::ccl::panes` defines
+//! pane topology and materialization.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -92,73 +30,48 @@ use crate::chl_parser::ast::Span;
 // why they live beside the table instead of behind an interface.
 // ===========================================================================
 
-/// A stable identity for an IR expression node, minted fresh and never reused.
+/// An expression or operator identity allocated from a process-global counter.
 ///
-/// Minted only via [`NodeId::fresh`]; nothing observes its numeric value (only
-/// id *equality*), so non-determinism across process runs is fine — uniqueness
-/// is all that matters. This mirrors the [`crate::ccl::names::Uid`] /
-/// `FRESH_UID` idiom in [`crate::ccl::names`]; it uses a separate counter
-/// because `NodeId` identifies expression *nodes* whereas `Uid` identifies
-/// *binders*, and the two id spaces should not be conflated.
+/// [`NodeId::fresh`] uses a separate counter from binder [`Uid`](crate::ccl::names::Uid).
+/// IDs are map keys, and [`fold`] uses their order to traverse produced-node dependencies.
+/// Serialized numbers are handles, not stable names across compilations.
 ///
-/// # Identity-contamination rule (load-bearing)
-///
-/// `NodeId` is embedded inline on `TypedExpr` (`crate::ccl::expr`), whose
-/// `PartialEq` is hand-written rather than derived precisely so it can
-/// **exclude** it. Provenance is metadata, not part of a node's value: two nodes
-/// that are structurally equal as values must still compare equal even with
-/// different `NodeId`s. The structural-equality memoization the phases rely on
-/// (`uniquify`'s memo, `planning`'s predicate memo) depends on this — including
-/// `node_id` would make every node look distinct and the memo tables would
-/// never hit. (Nodes are never hashed by value — `TypedExpr` has no `Hash` impl
-/// — so there is no equality/hash pair to keep consistent here; `NodeId`'s own
-/// `Hash` is for using it as a map key.)
+/// `TypedExpr::PartialEq` excludes `node_id`: structurally equal expressions with
+/// different provenance compare equal. `TypedExpr` has no value-hashing implementation;
+/// this type's `Hash` is for identity-keyed collections.
+/// See `src/ccl/design/provenance.md`, "Node identity".
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeId(u64);
 
 static FRESH_NODE_ID: AtomicU64 = AtomicU64::new(1);
 
 impl NodeId {
-    /// The reserved sentinel id for [`TypedExpr`](crate::ccl::expr::TypedExpr)'s
-    /// `Default`.
+    /// Sentinel for `Default`/`mem::take` placeholders and diagnostic throwaways.
     ///
-    /// `Default` exists only so `std::mem::take` can move an `Expr` out of a
-    /// slot, leaving a transient throwaway behind that is immediately
-    /// overwritten. Giving that throwaway a *reserved* id (rather than minting a
-    /// fresh one) keeps it from polluting an open recording: the recorder's
-    /// `on_mint` ignores this id, and `Default` constructs with it directly
-    /// rather than through [`TypedExpr::new`](crate::ccl::expr::TypedExpr::new).
-    ///
-    /// `FRESH_NODE_ID` starts at 1, so 0 is never minted — a placeholder node is
-    /// always distinguishable from a real one. It must never persist into a
-    /// checked tree; `assert_unique_node_ids` backstops that invariant.
+    /// Zero is never allocated by the counter. Construction at this ID and the
+    /// mint/copy hooks record no birth. It must not remain in the main tree;
+    /// `assert_unique_node_ids` checks that condition in debug/test builds.
     pub(crate) const PLACEHOLDER: NodeId = NodeId(0);
 
-    /// Mint a globally-fresh node id. The only way to construct a `NodeId`.
+    /// Allocate a fresh identity without calling the expression construction hooks.
     pub fn fresh() -> Self {
         NodeId(FRESH_NODE_ID.fetch_add(1, Ordering::Relaxed))
     }
 
-    /// The id's underlying number, for use as an opaque serialization handle
-    /// (the inspector wire shape carries a `NodeId` as a JSON number; see
-    /// [`crate::inspector_model`]). This is the *only* place the numeric value
-    /// is observed — internal logic compares ids by equality, never by value —
-    /// so it is exposed solely so a client can round-trip a handle, not to give
-    /// the value any in-compiler meaning.
+    /// The numeric handle used by the inspector wire representation.
+    ///
+    /// It exposes identity, not a stable program position. Allocation counts affect
+    /// later handles; internal folds also use mint order to resolve dependencies.
     pub fn as_u64(self) -> u64 {
         self.0
     }
 }
 
-/// An error paired with the [`NodeId`] of the node it was raised at.
+/// An error with the identity of the node where it was raised.
 ///
-/// A pass after lowering raises errors holding types and names, not spans; the
-/// node is what it has. `compile_program` resolves the node to a source
-/// [`Span`](crate::chl_parser::ast::Span) against the lowering projection, so
-/// every error a pass after lowering reports reaches the user with a span.
-///
-/// The location is metadata beside the error rather than inside it, so `E` stays
-/// location-free and comparable by value in tests.
+/// Pipeline error reporting resolves this identity through the available source
+/// projection. Keeping the location beside `E` leaves the underlying error
+/// location-free and comparable independently of attribution.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Located<E> {
     /// The underlying error.
@@ -180,23 +93,10 @@ impl std::fmt::Debug for NodeId {
     }
 }
 
-// Wire shape (inspector, feature `serde`): a bare JSON number. A `NodeId` is an
-// opaque handle the client round-trips, so it serializes as its underlying
-// `u64`, read off the field directly, not as a struct. Hand-written rather than
-// `#[serde(transparent)]` because the inner field is private. Nothing in the
-// compiler reads the number — ids are compared by equality — so the only
-// readers are this impl and [`NodeId::as_u64`], which the inspector model uses
-// to project an id onto the wire outside a `Serialize` context.
-//
-// TODO(wire-stability): the mint-order value is not stable across compiler
-// changes — anything that shifts upstream mint *counts* renumbers every later id,
-// so a semantically tiny change rewrites every subsequent `nodeId` and every
-// `paneLinks` endpoint in the golden fixtures. The fix belongs in the
-// serialization layer rather than here, leaving `NodeId` as the internal identity:
-// one deterministic walk of the snapshot assigns dense first-encounter indices
-// (the uniquify binder-index precedent), so mint-count changes produce no fixture
-// diff and a genuine reordering produces one proportional to it. Not yet
-// implemented.
+// Serialize the identity as a bare JSON number, matching `as_u64`.
+// TODO(wire-stability): allocation-count changes renumber later fixture handles.
+// A serialization-layer walk could assign deterministic first-encounter indices
+// without changing internal IDs. That remapping is not implemented.
 impl serde::Serialize for NodeId {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_u64(self.0)
@@ -1051,105 +951,35 @@ pub(crate) fn fold_lowering(
     (projection, leaks)
 }
 
-// ===========================================================================
-// The node table: the recording, keyed by the node it describes.
-//
-// One row per recorded *node*, which is how every consumer asks its question
-// ("where did this node come from?"), so a lookup is a hash probe and the pane
-// fold is one ascending sweep over the rows a pane pair's phases wrote.
-// ===========================================================================
+// Table storage and tag interning.
 
-/// An interned [`RewriteTag`] — a [`ProvenanceTable`] row's `tag` column.
+/// Table-local index of an interned `{via, nature, label}` triple.
 ///
-/// The whole `{via, nature, label}` triple is interned as one id because the
-/// three are settled together: `via` is the session's phase, and
-/// `nature`/`label` are the two literals at the [`enter`] call. There are on the
-/// order of fifty distinct triples in the compiler — a property of the source,
-/// not of the program being compiled — so one index buys all three columns and a
-/// row carries a single handle instead of three fields.
-///
-/// A `TagId` is not the identity of a *rewrite rule*: `via` is part of the
-/// interned triple, so a shared helper recorded under whichever [`PhaseScope`] is
-/// open around it — `subst`'s `"subst.transport"`, `PredMemo::rebuild`'s
-/// `"predicate.rebuild"` — interns one tag per phase it runs under. The `label`
-/// alone names the rewrite.
-///
-/// Only meaningful against the table that minted it: the ids are dense indices
-/// into that table's tag vector, not global constants.
+/// Shared helpers can use the same label under different phases, producing
+/// distinct tags. The index addresses this table's tag vector, not a global
+/// rule registry. A recording's births and copies share the same interned tag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct TagId(u32);
 
-/// One recorded node's row. Both edge kinds plus the interned tag; see
-/// [`ProvenanceTable`] for why there is no span column, and
-/// [`record`](ProvenanceTable::record) for the two invariants a row must satisfy.
+/// One node's ancestry, additional attribution and interned rewrite tag.
 struct Row {
     parents: Vec<NodeId>,
     blame: Vec<NodeId>,
     tag: TagId,
 }
 
-/// Per-compile provenance keyed by the node each record describes: `NodeId → {
-/// parents, blame, tag }`.
+/// Per-compile rows keyed by produced node identity.
 ///
-/// # The two edge kinds stay separate
+/// Each row separates ancestry (`parents`) from additional attribution (`blame`).
+/// Both contribute source spans during folding; only parents assert ancestry.
+/// Spans are derived from upstream attribution, not stored in the row.
 ///
-/// `parents` are the ids a rewrite consumed to produce the node — the node the
-/// recording named, or a fusion's whole consumed set. `blame` are the ids the
-/// rewrite is *related to* but did not consume; they may still be alive
-/// elsewhere in the tree, and they say nothing about any node's fate. Both are
-/// relations over the same pair of ids and both reach the fold, so what the
-/// columns buy is the **label** the fold puts on the edge ([`EdgeLabels`]).
-/// Merging them would answer "what was this made from" with a node that merely
-/// survives beside the answer (see the module docs, "Two columns, because they
-/// are two kinds of relation").
+/// Unknown IDs are permitted: edge accessors return empty slices and tag accessors
+/// return `None`. Enumeration includes recorded rows only. Predicate interiors use
+/// the same representation as main-tree nodes.
 ///
-/// # There is no span column, deliberately
-///
-/// A node's spans are *derived*: walk `parents` back until the walk reaches a
-/// node the lowering projection covers, which is where real spans live. That
-/// walk is a handful of hops and does not lengthen as programs grow, so a span
-/// column would be a denormalization paid on every row ever minted, for a
-/// lookup the parent edges already answer.
-///
-/// # "No row" is an expected state, not an error
-///
-/// The key space is `NodeId`, and a `NodeId` can be *addressed* without ever
-/// having been *recorded*. So every read tolerates an unknown id —
-/// [`parents`](Self::parents) and [`blame`](Self::blame) come back empty,
-/// [`tag`](Self::tag) `None` — and, the sharper half of the same rule,
-/// [`deaths`](Self::deaths) considers **only ids a [`record`](Self::record)
-/// actually wrote**. A death is the set difference `recorded ∖ live`, so a
-/// difference taken over addressed-but-unwritten ids would report nodes that
-/// never existed as deaths. Row enumeration is private for exactly that reason —
-/// [`deaths`](Self::deaths) and the pane fold's `rows_in` are the operations
-/// that legitimately need it, and each takes the difference against something
-/// (a live set, a set of phases) rather than against the key space.
-///
-/// Refinement-predicate interiors **are** recorded here. They are `TypedExpr`s
-/// inside a `Type::Refinement`'s predicate, carrying real `NodeId`s from the same
-/// global counter and interleaved with main-tree ids, and `collect_tree_ids`
-/// enumerates them — so the fold must explain them and this table must hold their
-/// rows (`design/provenance.md`, "Walking the ids").
-///
-/// **All three crossings of the predicate boundary record.** *Entry*: lowering
-/// sweeps the finished term, and inference records `singleton_predicate` against
-/// its literal. *Transformation*: `PredMemo::rebuild` either carries the ids or
-/// records against the node whose type holds the predicate. *Raising* — planning
-/// lifting a term back into the main tree — attributes the raised material to the
-/// predicate rather than to the term-tree site, because a clone's copy names the
-/// node it was freshened from (`design/provenance.md`, "Walking the ids").
-///
-/// Admitting these ids was a **population** change, not a schema change: they
-/// already had addresses here, so no column moved. The measurement that justified
-/// it, at the `post-inference..join-planned` audit span: the residue was
-/// [`Leak::DanglingParent`] edges and nothing else, every one a
-/// predicate-interior id of the input tree, and admitting them took every gated
-/// class to zero.
-///
-/// The backing store is a plain map on purpose: the row *semantics* above are
-/// what a reader has to check, and a paged/interned column encoding would be a
-/// pure re-encoding behind these accessors — the same promise
-/// [`ProvenanceMap`] makes.
+/// See `src/ccl/design/provenance.md`, "The provenance model" and
+/// "Table access and write invariants" for row semantics and write preconditions.
 #[derive(Default)]
 pub(crate) struct ProvenanceTable {
     rows: HashMap<NodeId, Row>,
@@ -1159,8 +989,7 @@ pub(crate) struct ProvenanceTable {
     interned: HashMap<RewriteTag, TagId>,
 }
 
-// The accessors are the table's whole contract and are exercised as such by this
-// module's tests; the compiler itself only ever writes rows.
+// `tag_id`, `contains`, `deaths`, `len`, and `tag_count` are used only by tests.
 #[allow(dead_code)]
 impl ProvenanceTable {
     /// The [`TagId`] for `tag` in this table, assigning one on first sight.
@@ -1172,9 +1001,8 @@ impl ProvenanceTable {
         if let Some(id) = self.interned.get(&tag) {
             return *id;
         }
-        // u32 is not a real limit: the distinct-tag count is a source-code
-        // property — one triple per label-and-nature pair the compiler writes —
-        // not a function of the program being compiled.
+        // Distinct phase/nature/label triples are bounded by the compiler's recording sites,
+        // not by the size of the program being compiled, so their count fits in u32.
         let id = TagId(
             u32::try_from(self.tags.len()).expect("more distinct rewrite tags than a u32 indexes"),
         );
@@ -1183,35 +1011,12 @@ impl ProvenanceTable {
         id
     }
 
-    /// Record one produced node's row.
+    /// Record a produced node. Debug-asserts that `id` has no row, at least one
+    /// of `parents` or `blame` is nonempty, and `id` is not its own parent.
     ///
-    /// Three invariants, all of them properties of the write and all of them
-    /// checked here, at the site that would violate one, rather than at a fold
-    /// that only runs when someone materializes a pane:
-    ///
-    /// * **one row per id.** Attribution has no join — a node cannot carry two
-    ///   `via`/`label` pairs — so a second writer for an id has no answer, and
-    ///   silently overwriting would make the surviving row a lie about which
-    ///   rewrite made the node. Ids come from one monotone counter and
-    ///   `produced` is captured from the construction hook, so a second write
-    ///   means a rewrite claimed to mint what already existed.
-    /// * **every row is anchored through some channel** — consumption or blame.
-    ///   A row with neither cannot explain where the node came from, which is
-    ///   the whole content of a provenance record. (A row with blame but no parents
-    ///   is the legal *pure insertion*: a node placed over surviving material,
-    ///   attributed through blame, with genuinely no ancestor.)
-    /// * **a node is not its own parent.** A node's provenance is the product of
-    ///   its parents', so an id on both sides would define itself in terms of
-    ///   itself — the one construct that makes an edge run backwards and forces
-    ///   [`fold`] to a fixed point rather than a single ascending sweep. An
-    ///   in-place rewrite that keeps its id is a **preserve**: it records
-    ///   nothing, and that is correct, because identity here is *referent*
-    ///   identity and the pane resolves it by shared id.
-    ///
-    /// The checks are `debug_assert!`s because this is the construction hot
-    /// path — every mint under an open guard lands here — and each one costs a
-    /// hash probe or a scan. What is gated is the checking; the row written is
-    /// the same row in every build.
+    /// The caller must satisfy these preconditions in every build; insertion
+    /// overwrites an existing row when debug assertions are disabled. A preserve
+    /// writes no row. A pure insertion may use blame without parents.
     pub(crate) fn record(&mut self, id: NodeId, parents: &[NodeId], blame: &[NodeId], tag: TagId) {
         debug_assert!(
             !self.rows.contains_key(&id),
@@ -1237,16 +1042,12 @@ impl ProvenanceTable {
         );
     }
 
-    /// The ids consumed to produce `id`; empty for an unrecorded id. Predicate
-    /// interiors used to be the standing example of one and no longer are — they
-    /// are recorded (see the type's docs).
+    /// The ancestry IDs of `id`, or an empty slice when it has no row.
     pub(crate) fn parents(&self, id: NodeId) -> &[NodeId] {
         self.rows.get(&id).map_or(&[], |r| r.parents.as_slice())
     }
 
-    /// The ids `id`'s rewrite is related to but did not consume; empty for an
-    /// unrecorded id, and empty for the common case of a row that mirrors its
-    /// parents' attribution.
+    /// Additional attribution IDs, or an empty slice when `id` has no row.
     pub(crate) fn blame(&self, id: NodeId) -> &[NodeId] {
         self.rows.get(&id).map_or(&[], |r| r.blame.as_slice())
     }
@@ -1268,23 +1069,14 @@ impl ProvenanceTable {
         self.rows.contains_key(&id)
     }
 
-    /// The rewrite that produced `id` **if that rewrite is one of `phases`**,
-    /// else `None`.
+    /// The producing tag when its phase is selected, otherwise `None`.
     ///
-    /// This is what restricts a whole-compile table to one pane pair: to that
-    /// pair, an id produced by a phase it does not span is an ordinary
-    /// un-produced id, which is exactly how the input pane's own nodes have to
-    /// read for the fold to bottom out there.
+    /// An earlier phase's row must not be followed past this fold's input boundary.
     pub(crate) fn tag_in(&self, id: NodeId, phases: &[Phase]) -> Option<RewriteTag> {
         self.tag(id).filter(|tag| phases.contains(&tag.via))
     }
 
-    /// The ids `phases` produced, in arbitrary order.
-    ///
-    /// Private, for the rule [`deaths`](Self::deaths) shares: enumerating rows is
-    /// only ever correct against a set of phases, since a `NodeId` can be
-    /// addressed without ever having been recorded. This module's folds are the
-    /// only callers.
+    /// Recorded IDs produced by the selected phases, in unspecified order.
     fn rows_in<'a>(&'a self, phases: &'a [Phase]) -> impl Iterator<Item = NodeId> + 'a {
         self.rows
             .iter()
@@ -1292,26 +1084,13 @@ impl ProvenanceTable {
             .map(|(id, _)| *id)
     }
 
-    /// Ids produced by the phases from `start` through `end` inclusive that are
-    /// absent from `live`: what those phases built and then discarded.
+    /// Recorded IDs produced from `start` through `end` inclusive and absent
+    /// from `live`, sorted by ID. Requires `start <= end` (debug-asserted).
+    /// Phase declaration order defines the range.
     ///
-    /// The range reads every phase between the two, [`Phase`]'s declaration
-    /// order being pipeline order, so `deaths(Phase::Inline, Phase::Channelize,
-    /// live)` covers `Transact` and `Letrec` as well.
-    ///
-    /// **Narrower than the fold's death product**, and the two answer different
-    /// questions. The fold takes `input_ids ∖ output_ids` over two pane walks, so
-    /// it sees a node no phase ever produced — a lowered node dropped by a later
-    /// rewrite — and it cannot see a node born and discarded between the panes.
-    /// This one is the mirror image: every id here has a row, so a never-produced
-    /// node is invisible to it, and an intra-phase transient is exactly what it
-    /// reports. Reach for the fold to ask what died between two trees, and for
-    /// this to ask what a phase churned.
-    ///
-    /// The difference is taken over rows in range, never over the key *space*:
-    /// the key space is a global counter, so it addresses ids this compile never
-    /// built, and an id that was addressed but never recorded describes no node
-    /// that could have died. Sorted, so a caller's report is deterministic.
+    /// Unlike [`fold`]'s input-minus-output deaths, this query can include products
+    /// born and discarded between boundaries, but excludes nodes with no selected
+    /// row. Neither result is necessarily a subset of the other.
     pub(crate) fn deaths(&self, start: Phase, end: Phase, live: &HashSet<NodeId>) -> Vec<NodeId> {
         debug_assert!(
             start <= end,
@@ -1342,12 +1121,10 @@ impl ProvenanceTable {
         self.tags.len()
     }
 
-    /// The distinct phases this table holds rows for, deduplicated.
+    /// Distinct phases in the interned tags, in first-interned order.
     ///
-    /// A tag is interned only when a row is written under it, so the interning
-    /// table's phases are exactly the phases that recorded something. Test-only:
-    /// it answers "which phases rewrote this program", which is a question about
-    /// a compile rather than about a node, and nothing in the pipeline asks it.
+    /// The recorder interns tags when writing products. Direct callers of
+    /// [`intern_tag`](Self::intern_tag) can also intern a tag without writing a row.
     #[cfg(test)]
     pub(crate) fn recorded_phases(&self) -> Vec<Phase> {
         let mut out: Vec<Phase> = Vec::new();
@@ -1360,78 +1137,36 @@ impl ProvenanceTable {
     }
 }
 
-// ===========================================================================
-// The recorder: an ambient thread-local stack of open recordings that turns node
-// construction into provenance rows as a byproduct of the rewrite.
-//
-// Discipline mirrors `infer_var::ACTIVE_ARENA`: install a capture target at a
-// boundary, let construction hooks feed it, drain at the boundary. The compile
-// path is single-threaded (the only `thread::spawn`s are runtime I/O), so a
-// per-thread stack is safe. An empty stack means recording is off — the
-// overwhelmingly common case (tests, non-recorded compiles), reduced to a cheap
-// emptiness check on the construction hot path.
-// ===========================================================================
+// Thread-local recording state. Lifetimes and routing are specified in
+// `src/ccl/design/provenance.md`, "The recorder".
 
 thread_local! {
-    /// The open recordings, innermost last. Empty ⇒ recording off. A
-    /// construction hook ([`on_mint`]/[`on_copy`]) pushes into the innermost
-    /// one only.
+    /// Open recordings, innermost last. Mint and copy hooks capture only there.
     static RECORDING_STACK: RefCell<Vec<OpenRecording>> = const { RefCell::new(Vec::new()) };
 
-    /// The [`ProvenanceTable`] a closing guard writes its rows into, installed by
-    /// a [`TableSession`]. `None` ⇒ no table, and the write is a silent no-op,
-    /// so there is one code path either way.
-    ///
-    /// Installed for a **whole compile** rather than per phase, unlike
-    /// [`ACTIVE_PHASE`]: a row is keyed by a node id, which is unique for the
-    /// life of the process, so one table spans every phase a compile runs and no
-    /// id can collide between them.
+    /// The compile-wide table installed by [`TableSession`]. No table means
+    /// table flushes are discarded; it does not disable recording hooks.
     static ACTIVE_TABLE: RefCell<Option<ProvenanceTable>> = const { RefCell::new(None) };
 
-    /// The phase a row is tagged with, installed per phase by a [`PhaseScope`].
-    /// `None` ⇒ no phase is being recorded: a guard still captures into itself,
-    /// but writes nothing when it drops.
-    ///
-    /// The phase is ambient for the scope's extent because a [`RewriteTag`] needs
-    /// it and the recording site cannot supply it: an [`OpenRecording`] carries the
-    /// two literals at its [`enter`] call (`label`, `nature`) and knows nothing
-    /// about which phase is running, while the boundary that opens the scope
-    /// knows exactly that.
+    /// The phase supplied to table rows by [`PhaseScope`]. Lowering and derivation
+    /// logs have separate routing and do not require this slot.
     static ACTIVE_PHASE: RefCell<Option<Phase>> = const { RefCell::new(None) };
 
-    /// Lowering's log, installed by the always-on [`LoweringSession`]. `None` ⇒
-    /// lowering is not running. Lowering records into its own sink because its
-    /// attribution is a literal span rather than a reference resolved later (see
-    /// [`LoweringStep`]).
+    /// Lowering's literal-span and copy log, installed by [`LoweringSession`].
     static ACTIVE_LOWERING_LOG: RefCell<Option<LoweringRecord>> = const { RefCell::new(None) };
 
-    /// The derivation log, installed by an always-on [`DerivationSession`].
-    /// `None` ⇒ no phase is deriving into one. Written alongside the table, not
-    /// instead of it.
+    /// The phase-local error-attribution log, written independently of table capture.
     static ACTIVE_DERIVATION_LOG: RefCell<Option<DerivationLog>> = const { RefCell::new(None) };
 }
 
-/// One in-flight recording, accumulating the ids born and copied while its guard
-/// is the innermost one open. Finalized when the [`RecordingGuard`] drops. The
-/// produced side is captured from the construction hooks rather than declared,
-/// which is what makes a row a byproduct of the rewrite.
+/// Products captured while this frame is innermost, flushed when its guard drops.
 struct OpenRecording {
     label: RewriteLabel,
-    /// Extra ids the rewrite consumed, added through
-    /// [`RecordingGuard::also_consumes`] for a fusion. The produced side is
-    /// discovered from the construction hooks, never declared.
-    ///
-    /// Empty at open, and — `also_consumes` having no production caller — empty
-    /// for every rewrite in the compiler today. See [`named`](Self::named).
+    /// Additional ancestors for minted products, supplied by `also_consumes`.
     consumed: Vec<NodeId>,
-    /// The id the recording site named — the node about to be rewritten. `None`
-    /// for a [`copy_frame`], which names no node.
-    ///
-    /// Every id minted in the guard's extent takes this as a **parent**: the
-    /// output was made from that node. The claim says nothing about whether that
-    /// node dies, which is what makes it safe to name a node the rewrite keeps
-    /// (keep the id, mint a wrapper over a child). Death is the live-set
-    /// difference between two panes, never a record-time claim.
+    /// The rewritten input. Minted products take it as a parent; copies use their
+    /// own origins. `None` denotes a copy-only frame. Naming an input does not
+    /// declare its death.
     named: Option<NodeId>,
     blame: Vec<NodeId>,
     nature: Nature,
@@ -1443,27 +1178,11 @@ struct OpenRecording {
 }
 
 impl OpenRecording {
-    /// Finalize this recording into the installed [`ProvenanceTable`], one row per
-    /// node it produced.
+    /// Write one row per captured product using the ambient phase.
     ///
-    /// Two products:
-    ///
-    /// * **the mints** — every id minted in the guard's extent takes the named
-    ///   node as its parent. With a fusion ([`RecordingGuard::also_consumes`]) it
-    ///   takes the named node plus every extra id, which is the many:1 shape and
-    ///   the only place any id is named at record time. Either way the parents
-    ///   are ancestry edges, not fate claims, so naming a node that survives
-    ///   costs an over-broad edge and never a phantom death.
-    /// * **the captured freshens** — each `(origin, fresh)` pair the `on_copy`
-    ///   hook reported rows the fresh id on the node it was duplicated from, not
-    ///   on the named node. A copy's origin is discovered through the hook rather
-    ///   than declared: every duplication path runs through [`copy_id`], called
-    ///   from `TypedExpr`'s `Clone`, so capture needs no help from the site.
-    ///
-    /// A guard that minted nothing, freshened nothing and fused nothing writes no
-    /// row. That is the **preserve** case — an in-place mutation such as `*op =
-    /// BinOpKind::Concat` — and it is what lets a phase open a recording on every
-    /// rewrite *attempt* rather than only on the ones that fire.
+    /// Births take the named input and extra consumed IDs as parents, plus this
+    /// frame's blame. Copies take only their own origin and no added blame.
+    /// An event-free attempt writes nothing, regardless of its named input.
     fn flush_into_table(self, via: Phase) {
         let OpenRecording {
             label,
@@ -1497,8 +1216,7 @@ impl OpenRecording {
         Self::row_per_copy(via, label, nature, &copies);
     }
 
-    /// Row each captured freshen on the node it duplicated. A copy mirrors its
-    /// origin rather than re-attributing, so it carries no blame of its own.
+    /// Write each copy with its origin as sole parent, no blame and the frame's tag.
     fn row_per_copy(via: Phase, label: RewriteLabel, nature: Nature, copies: &[(NodeId, NodeId)]) {
         if copies.is_empty() {
             return;
@@ -1511,11 +1229,9 @@ impl OpenRecording {
         });
     }
 
-    /// A [`copy_frame`] names no node, so it has nowhere to attach a consume or
-    /// a mint: a row needs a parent. Anything captured into one would vanish
-    /// from the record rather than land somewhere wrong. A phase site that trips
-    /// this wants [`enter`] on the node it is rewriting; a lowering site wants
-    /// [`lowering_leaf`] for its mints.
+    /// Debug-check the copy-only contract. Without a named input, consumed IDs and
+    /// births would be discarded. Rewrites that mint need [`enter`]; lowering
+    /// leaf attribution uses [`lowering_leaf`].
     fn assert_copy_only(label: RewriteLabel, consumed: &[NodeId], births: &[NodeId]) {
         debug_assert!(
             consumed.is_empty() && births.is_empty(),
@@ -1526,13 +1242,10 @@ impl OpenRecording {
         );
     }
 
-    /// Append this recording to a [`DerivationLog`]: one
-    /// [`DerivationStep::Mint`] for its births, one [`DerivationStep::Copy`] per
-    /// origin it copied.
+    /// Append births as one mint step and copies grouped by origin.
     ///
-    /// Blame is not logged: [`fold_derivation`] attributes a birth to the named
-    /// node alone, so a recording that widens its attribution would be folded
-    /// narrower than the table folds it.
+    /// Extra consumed IDs and blame are unsupported (debug-asserted): the derivation
+    /// fold attributes births to the named input alone.
     fn log_derivation(&self, log: &mut DerivationLog) {
         debug_assert!(
             self.blame.is_empty() && self.consumed.is_empty(),
@@ -1555,12 +1268,8 @@ impl OpenRecording {
         }
     }
 
-    /// Finalize this recording into a [`LoweringLog`]. Lowering opens a guard
-    /// only to capture ambient copies — uncurry's template-interior freshens and
-    /// the compare-chain operand freshens — while its leaf mints append directly
-    /// via [`lowering_leaf`]. So a lowering guard carries no consumed ids and no
-    /// births, and only the captured per-origin copies are written here, as
-    /// [`LoweringStep::Copy`]s mirroring their origins' folded entries.
+    /// Append captured copies by origin. Leaf mints use [`lowering_leaf`] directly;
+    /// births and extra consumed IDs violate this frame's copy-only contract.
     fn flush_into_lowering(self, rec: &mut LoweringRecord) {
         let OpenRecording {
             label,
@@ -1649,9 +1358,7 @@ pub(crate) fn lowering_leaf(id: NodeId, span: Span, nature: Nature, label: Rewri
     });
 }
 
-/// Run `f` against the installed [`ProvenanceTable`], or do nothing when no
-/// [`TableSession`] is installed — the one place a flush touches the sink, so
-/// "recording is off" is a single silent no-op rather than a branch per row.
+/// Mutate the active table, or do nothing when no table session is installed.
 fn with_table(f: impl FnOnce(&mut ProvenanceTable)) {
     ACTIVE_TABLE.with(|slot| {
         if let Some(table) = slot.borrow_mut().as_mut() {
@@ -1660,12 +1367,8 @@ fn with_table(f: impl FnOnce(&mut ProvenanceTable)) {
     });
 }
 
-/// RAII installer for the per-compile [`ProvenanceTable`] — the sink every closing
-/// guard writes into.
-///
-/// It covers a **whole compile** rather than a phase, so it outlives and nests
-/// around every [`PhaseScope`] that compile opens. `Drop` clears the slot, so a
-/// panicking compile never leaves a stale table for the next one.
+/// Compile-wide table owner. It surrounds phase scopes and clears the installed
+/// table on drop, including unwinding. [`into_table`](Self::into_table) drains it.
 pub(crate) struct TableSession {
     // Not `Copy`/`Clone`; holds the installed-table invariant for its lifetime.
     _private: (),
@@ -1713,33 +1416,14 @@ fn group_copies(copies: &[(NodeId, NodeId)]) -> Vec<(NodeId, Vec<NodeId>)> {
     out
 }
 
-/// Open a copy-only recording: it consumes nothing, mints nothing, and exists to
-/// capture the `(origin, fresh)` pairs a clone's freshen reports, written as
-/// per-origin [`LoweringStep::Copy`]s under lowering or as one row per copy
-/// under a phase scope.
+/// Capture standalone duplication without naming a rewritten input.
 ///
-/// This is the one recording that **names no node**, and the shape it fits is a
-/// duplication with *nothing being rewritten*, where there is no id to name:
-/// lowering's uncurry template-interior and compare-chain operand freshens, and
-/// inference's two freshens — a refinement predicate per scheme instantiation
-/// (`infer.freshen_predicate`) and a trait obligation's stored operand
-/// expressions per obligation copy (`infer.freshen_obligation`). Every captured
-/// copy carries its own origin from the hook, which is why this one can afford to
-/// declare nothing at all —
-/// [`row_per_copy`](OpenRecording::row_per_copy) never reads the named node.
+/// Each copy hook supplies its own origin. The frame must capture no births or
+/// extra consumed IDs; [`OpenRecording::assert_copy_only`] debug-checks this.
+/// Use [`enter`] when a rewrite also mints nodes.
 ///
-/// A duplication performed *as part of* a rewrite uses [`enter`] instead, naming
-/// the node the rewrite replaces, so the mints beside the copies have a parent.
-/// [`assert_copy_only`](OpenRecording::assert_copy_only) is what keeps the two
-/// apart: a mint captured here is a site that should have named a node.
-///
-/// `nature` is fixed at [`Machinery`](Nature::Machinery) rather than taken as an
-/// argument. Under lowering a copy's nature is never read — a
-/// [`LoweringStep::Copy`] mirrors the origin's already-folded attribution
-/// *verbatim* — so a nature would be unobservable, and a wrong one (a
-/// `Nature::Source` on a copy) would look meaningful while being inert. Under a
-/// phase scope the fixed value is the honest one: a duplication that rewrites
-/// nothing is plumbing by construction.
+/// Table rows use `Nature::Machinery`. Lowering copies instead mirror their
+/// origins' complete attribution and do not use this frame's nature or label.
 pub(crate) fn copy_frame(label: RewriteLabel) -> RecordingGuard {
     RECORDING_STACK.with(|s| {
         let mut stack = s.borrow_mut();
@@ -1757,55 +1441,15 @@ pub(crate) fn copy_frame(label: RewriteLabel) -> RecordingGuard {
     })
 }
 
-// ===========================================================================
-// Capture keyed on node identity.
-//
-// A rewriting site names the node it is *about to rewrite* and declares nothing
-// else. Every id minted while that guard is the innermost one open records the
-// named node as its parent, which says nothing about whether the named node
-// survived: death is the live-set difference between two panes, so no site predicts
-// a fate.
-//
-// The produced side is never declared. It is a byproduct of construction,
-// discovered through the mint and copy hooks. The one recording that names no
-// node is `copy_frame`, lowering's copy sink, whose captured copies each carry
-// their own origin.
-// ===========================================================================
-
-/// Open a recording over the node about to be rewritten, returning an RAII guard
-/// that finalizes it on drop.
+/// Record products of a local rewrite until the returned guard drops.
 ///
-/// `named_id` is read off the node *before* the rewrite runs; every id minted
-/// while this guard is the innermost one open records `named_id` as its parent.
-/// The site declares nothing further — see [`OpenRecording::flush_into_table`].
+/// Read `named_id` before rewriting. Births captured by this innermost frame
+/// take it as a parent; copies retain their own origins. The named input need
+/// not die. Bind the guard as `let _g = ...`; `let _ = ...` drops it immediately.
 ///
-/// A guard rather than a closure, for two reasons that outlive the ergonomics:
-///
-/// * **The region is a scope, not an expression.** A site may talk to the open
-///   recording after opening it — `mut_elim` calls [`RecordingGuard::blame`] on the
-///   next line, naming the `For` so the products resolve to the loop keyword's
-///   span rather than the enclosing statement's. A closure taking only the
-///   rewrite has no channel for that, so each extra channel would become a
-///   parameter.
-/// * **A channel may fire from a runtime-decided point inside the region.**
-///   Whether a rewrite takes the arm that widens its attribution is decided by a
-///   `match` on the node, potentially far below the `enter`. As a closure, that
-///   means making a function's whole tail a closure body so one arm can reach
-///   the recording.
-///
-/// The guard costs nothing in expressiveness: the id is needed only at *entry*,
-/// and nothing reads the named node again at exit.
-///
-/// Two consequences a site does not restate:
-///
-/// * **A recording is where the hooks write.** An installed table captures
-///   nothing on its own; the mint and copy hooks need an open recording to
-///   attach to, so a rewrite that clones or mints outside one drops its pairs on
-///   the floor. That is the failure mode, not a wrong parent.
-/// * **Open it after any recursion into children.** A recording adopts
-///   everything minted under it, so opening one around a recursive call attaches
-///   the callee's own products to this node instead of theirs. Open it around the
-///   rewrite alone, and after the early returns that abandon it.
+/// Open after recursive child work unless each child opens its own recording,
+/// as [`converting`] does. Otherwise the parent frame captures child products.
+/// See `src/ccl/design/provenance.md`, "Where to open a recording".
 pub(crate) fn enter(named_id: NodeId, label: RewriteLabel, nature: Nature) -> RecordingGuard {
     RECORDING_STACK.with(|s| {
         let mut stack = s.borrow_mut();
@@ -1823,35 +1467,20 @@ pub(crate) fn enter(named_id: NodeId, label: RewriteLabel, nature: Nature) -> Re
     })
 }
 
-/// Open a recording over the conversion of one expression node, for the whole
-/// extent of that node's conversion including its children.
+/// Record one expression's conversion, including recursive child conversion.
 ///
-/// The sibling of [`enter`] for a phase that walks rather than rewrites, and the
-/// difference is which of the two contracts holds. `enter`'s says to open it
-/// *after* recursing into children, because a rewrite that adopts a callee's
-/// products has attributed them to the wrong node. Operator conversion has no
-/// such hazard: every frame of the walk opens one of these, so a nested frame's
-/// recording is innermost while it runs and [`on_mint`] attaches to that one.
-/// What reaches this recording is exactly what the frame minted outside its
-/// children — which is the answer conversion wants, since an operator built after
-/// a child returns belongs to the parent expression.
-///
-/// One consequence to design around rather than fix: an operator minted in a
-/// parent arm *after* a child returns attributes to the parent. A site wanting
-/// finer grain opens its own recording — the commit-store builder does, once per
-/// writer, so a transaction's operators do not all resolve to its binding.
+/// Every recursive frame opens a recording, so child products use the child's
+/// frame. Operators minted after a child returns belong to the parent frame.
+/// Sites needing finer attribution, such as per-writer commit-store construction,
+/// open a nested recording on the relevant input.
 pub(crate) fn converting(named_id: NodeId) -> RecordingGuard {
     enter(named_id, "opconv.convert", Nature::Machinery)
 }
 
-/// RAII finalizer for an open recording. Popping and writing on `Drop` is
-/// panic-safe: an unwind through an open recording still pops it, so the stack
-/// is never left corrupt, and writes what was captured before the panic.
-///
-/// The guard is also the *only* handle on the recording it opened: the extra
-/// channels ([`RecordingGuard::also_consumes`], [`RecordingGuard::blame`]) are inherent
-/// methods on it, so a site cannot address a recording it does not hold — the
-/// innermost one may belong to a callee or to an enclosing recursion.
+/// Handle for one open recording. Drop pops it and flushes captured events,
+/// including during unwinding. Guards must be dropped in LIFO order; channel
+/// methods require this guard to be innermost. Both are debug-checked, not
+/// enforced by the type system.
 #[must_use = "a dropped RecordingGuard records nothing — bind it (`let _g = …`), \
               and note `let _ = …` drops it immediately"]
 pub(crate) struct RecordingGuard {
@@ -1861,25 +1490,11 @@ pub(crate) struct RecordingGuard {
 }
 
 impl RecordingGuard {
-    /// Fusion (many:1): this rewrite **also** consumed `id`, a node the
-    /// construction hooks cannot attribute because it is not the one the site
-    /// named.
+    /// Add an ancestor for every birth in this recording. Placeholder IDs are ignored.
+    /// This asserts ancestry, not death, and does not affect captured copies.
     ///
-    /// The only channel that adds a *consumed* id beyond the named one, and so
-    /// **the only place any id is named at record time** — everything else about
-    /// a recording is observed. The named id joins the site's own node in the
-    /// products' `parents`, asserting ancestry and nothing about `id`'s fate.
-    ///
-    /// A [`copy_frame`] names no node for it to sit beside, so this is
-    /// meaningless there and [`assert_copy_only`] catches it.
-    ///
-    /// [`assert_copy_only`]: OpenRecording::assert_copy_only
-    // No production caller: every rewrite in the compiler is 1:many, so each
-    // recording writes one parent per product. The channel is retained because
-    // nothing else can express the many:1 shape — a fusion onto an older
-    // survivor has to remint (`consumed: [S, D…] → produced: [S′]`) to keep
-    // parents ahead of children. Exercised by
-    // `a_fusion_gives_every_product_the_bipartite_product`.
+    /// Invalid on a copy-only frame. The fusion test
+    /// `a_fusion_gives_every_product_the_bipartite_product` exercises this channel.
     #[allow(dead_code)]
     pub(crate) fn also_consumes(&self, id: NodeId) {
         if id == NodeId::PLACEHOLDER {
@@ -1888,33 +1503,14 @@ impl RecordingGuard {
         self.with_own_frame(|top| top.consumed.push(id));
     }
 
-    /// Additional source attribution: nodes this rewrite's products are *about*
-    /// beyond the one being rewritten.
-    ///
-    /// With no blame the products take the named node's spans, which is right for
-    /// most rewrites. Naming blame **adds** to that — attribution is the union of
-    /// the parents' spans and these — so a site widens the attribution rather
-    /// than redirecting it.
-    ///
-    /// Blame relates without claiming ancestry: these ids may name nodes that
-    /// survive the rewrite, so they ride the `blame` column rather than `parents`
-    /// and reach the provenance map as *blame* edges ([`EdgeLabels`]), which the
-    /// inspector can render or prune. Weakest-link closure keeps that distinction
-    /// alive at a distance: anything reached through one of these hops is
-    /// related, never descended. Naming an id here therefore asserts nothing
-    /// about its fate, which is what lets a site blame a node it leaves in the
-    /// tree.
+    /// Add related source IDs for minted products without asserting ancestry.
+    /// Their spans augment the parents' spans; captured copies do not inherit them.
     pub(crate) fn blame(&self, ids: &[NodeId]) {
         self.with_own_frame(|top| top.blame.extend(ids.iter().copied()));
     }
 
-    /// Address *this* guard's own recording, asserting it is the innermost open
-    /// one.
-    ///
-    /// The channels above are only meaningful about the recording the caller
-    /// holds; reaching whatever happens to be on top would silently retarget a
-    /// callee's or an enclosing recursion's. Same `debug_assert_eq!` convention
-    /// as the LIFO tripwire in [`Drop`](RecordingGuard::drop).
+    /// Require this guard to be innermost before modifying the top frame.
+    /// The depth check is a debug assertion; callers must obey it in release builds.
     fn with_own_frame(&self, f: impl FnOnce(&mut OpenRecording)) {
         RECORDING_STACK.with(|s| {
             let mut stack = s.borrow_mut();
@@ -1974,13 +1570,9 @@ impl Drop for RecordingGuard {
     }
 }
 
-/// A hook called from `Expr::new` for every minted [`NodeId`]. Pushes the id
-/// into the innermost open recording's births, or does nothing when none is open
-/// (the common case — a borrow and an emptiness check). The [`PLACEHOLDER`]
-/// sentinel is ignored, so `Default`/`mem::take` throwaways are never attributed
-/// to a rewrite.
-///
-/// [`PLACEHOLDER`]: NodeId::PLACEHOLDER
+/// Capture a minted ID in the innermost frame, ignoring the placeholder.
+/// Outside lowering, an active phase requires a recording (debug-asserted).
+/// Without either a recording or an active phase, the event is discarded.
 pub(crate) fn on_mint(id: NodeId) {
     if id == NodeId::PLACEHOLDER {
         return;
@@ -2001,17 +1593,11 @@ pub(crate) fn on_mint(id: NodeId) {
     );
 }
 
-/// Whether a recording dropped here would write rows: a [`PhaseScope`] is
-/// installed and lowering is not running.
+/// Whether a phase scope is active outside lowering. This tests routing, not
+/// whether a table is installed. Lowering mints use its leaf channel instead.
 ///
-/// Mirrors the routing in [`RecordingGuard::drop`], which is what makes it the
-/// right precondition for [`on_mint`]'s assert. Lowering is excluded because it
-/// records through the leaf channel ([`LoweringStep::Leaf`]) rather than through
-/// births, so a mint with nothing recording is the designed path there, not a gap.
-///
-/// Not `cfg(debug_assertions)`-gated: `debug_assert!` compiles its expression in
-/// every configuration and only drops the execution, so a gated helper fails the
-/// release build.
+/// Keep the helper available in release builds: `debug_assert!` still
+/// type-checks its condition when its execution is disabled.
 fn rows_would_reach_the_table() -> bool {
     ACTIVE_LOWERING_LOG.with(|slot| slot.borrow().is_none())
         && ACTIVE_PHASE.with(|p| p.borrow().is_some())
@@ -2061,46 +1647,24 @@ thread_local! {
     static PRESERVING_IDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Open a scope in which [`TypedExpr`](crate::ccl::expr::TypedExpr)'s `Clone`
-/// **preserves** ids instead of freshening them.
+/// Enter a thread-local scope where expression clones preserve their source IDs.
 ///
-/// Reach for it through
-/// [`TypedExpr::clone_preserving_ids`](crate::ccl::expr::TypedExpr::clone_preserving_ids)
-/// or [`run_debug_check`], never directly: the scope must cover the clone and
-/// nothing else, and a genuine duplication performed inside one would silently
-/// produce a duplicate id.
+/// Callers use `TypedExpr::clone_preserving_ids` for one copy or [`run_debug_check`]
+/// for diagnostic work. A genuine duplication inside this scope would reuse IDs;
+/// the scope must not enclose unrelated cloning.
 pub(crate) fn preserve_ids() -> DepthGuard {
     PRESERVING_IDS.enter()
 }
 
-/// Run `f` with id-preserving clones — a scope over a whole *rewrite region*,
-/// not over a single copy.
+/// Run a replacement rewrite with id-preserving expression clones.
 ///
-/// # TODO(predicate-domain): do not add callers without reading this.
+/// `PredMemo` uses this only in replacing mode, currently selected by `uniquify`.
+/// The traversal must replace every occurrence of each predicate; otherwise the
+/// original and rebuilt terms may both survive with the same IDs. This scope covers
+/// every clone on the thread while `f` runs, including clones made by its callees.
 ///
-/// **One legitimate user: [`PredMemo`] in *replacing* mode**, which is to say
-/// [`uniquify`](crate::ccl::uniquify) and nothing else. Anything that needs a
-/// preserving *copy* has one — [`TypedExpr::clone_preserving_ids`] — and should
-/// use it. This scope silences the freshening for **every** clone on the thread
-/// until `f` returns, including genuine duplications a callee performs, so unlike
-/// the per-copy method it can manufacture duplicate ids.
-///
-/// It exists because what must keep its identity is not a copy but an arbitrary
-/// caller-supplied *rewrite*: `f` mints and copies *into* the term (a
-/// substitution materializing a template, a rule building a conjunction), and
-/// those products are part of the same replacement.
-///
-/// The justification is **replacement, not domain**. Predicate interiors are in
-/// the explanation domain and the fold explains them (`design/provenance.md`,
-/// "Walking the ids"). What makes preserving honest here is that the rebuilt term stands in
-/// for the original *everywhere* — which is true only because `uniquify` walks
-/// the whole tree, and which `uniquify` asserts on every compile as a 1:1
-/// correspondence over distinct predicate terms. A rebuild whose walk misses an
-/// occurrence leaves the original alive beside its replacement, and then this
-/// scope puts one id-set on two live terms.
-///
-/// [`PredMemo`]: crate::ccl::ccl_utils::PredMemo
-/// [`TypedExpr::clone_preserving_ids`]: crate::ccl::expr::TypedExpr::clone_preserving_ids
+/// A single preserving copy uses `TypedExpr::clone_preserving_ids` instead.
+/// See `src/ccl/design/provenance.md`, "Walking the ids".
 pub(crate) fn preserving_ids<R>(f: impl FnOnce() -> R) -> R {
     let _guard = preserve_ids();
     f()
@@ -2129,30 +1693,15 @@ pub(crate) const fn record_sealed() -> bool {
     false
 }
 
-/// Run a debug-only check with the provenance record **sealed**: nothing `f`
-/// builds takes an identity.
+/// Run a diagnostic check without allocating expression identities.
 ///
-/// A check that mints is observable. [`NodeId`] is a process-global counter, so
-/// an id minted here shifts every id minted after it, and the same program
-/// compiles to two different id sets — one per build configuration. The
-/// inspector's golden corpus records those ids, so a minting check makes the
-/// fixtures debug-only and a release run of `committed_fixtures_match_fresh_dumps`
-/// reports drift that belongs to the check rather than to the compiler.
+/// Clones preserve their source IDs, and `TypedExpr::new` builds
+/// [`NodeId::PLACEHOLDER`] throwaways. Nothing constructed by `f` may enter a live
+/// tree. Both nested scopes unwind through guards if the check panics.
 ///
-/// Inside the scope a clone keeps its origin's id and a construction takes
-/// [`NodeId::PLACEHOLDER`] — the region forms of
-/// [`TypedExpr::clone_preserving_ids`] and [`TypedExpr::throwaway`]. Both rest on
-/// one precondition, and it is the caller's: **`f` builds nothing that reaches a
-/// tree.** A check resolves, compares and drops, so the duplicate ids the clone
-/// half can manufacture are unreachable rather than merely unlikely;
-/// `assert_unique_node_ids` backstops a placeholder that escapes regardless.
-///
-/// A check that only reads needs no scope and loses nothing by having one. Reach
-/// for this wherever the check *resolves* a type: resolution forces suspended
-/// substitutions at each refinement leaf, which rebuilds the predicate term.
-///
-/// [`TypedExpr::clone_preserving_ids`]: crate::ccl::expr::TypedExpr::clone_preserving_ids
-/// [`TypedExpr::throwaway`]: crate::ccl::expr::TypedExpr::throwaway
+/// Type resolution can rebuild refinement predicates even during a check. Suppressing
+/// those allocations keeps diagnostic work from renumbering later serialized IDs
+/// between debug and release builds. Read-only checks need no such scope.
 #[cfg(debug_assertions)]
 pub(crate) fn run_debug_check<R>(f: impl FnOnce() -> R) -> R {
     let _preserving = preserve_ids();
@@ -2160,11 +1709,10 @@ pub(crate) fn run_debug_check<R>(f: impl FnOnce() -> R) -> R {
     f()
 }
 
-/// The id a clone of `origin` should carry, and the one place that decides.
+/// Select a clone's identity and report a fresh copy to [`on_copy`].
 ///
-/// Freshens by default — a clone is a sibling — reporting the pair through
-/// [`on_copy`]. Inside a [`preserve_ids`] scope it returns `origin` unchanged
-/// and records nothing, because no new node came into being.
+/// An open [`preserve_ids`] scope returns `origin` unchanged and records nothing.
+/// Otherwise the returned ID is freshly allocated.
 pub(crate) fn copy_id(origin: NodeId) -> NodeId {
     if PRESERVING_IDS.is_open() {
         return origin;
@@ -2174,18 +1722,11 @@ pub(crate) fn copy_id(origin: NodeId) -> NodeId {
     fresh
 }
 
-/// A hook called from the freshen helpers for every `(origin, fresh)`
-/// duplication. Pushes the pair into the innermost open recording's copies, or
-/// does nothing when none is open. Guards the [`PLACEHOLDER`] sentinel on both
-/// sides, as [`on_mint`] does: a placeholder origin would fold as
-/// [`Leak::DanglingParent`] against an id nothing ever records.
+/// Capture `(origin, fresh)` in the innermost recording, if one is open.
 ///
-/// Asserts the same coverage [`on_mint`] does, and for the same reason: a node
-/// reaches a tree by being minted or by being copied, so a check on one channel
-/// alone leaves the other silent. The silence was not hypothetical — copies
-/// outnumbered mints among the uncaptured nodes when the check was added.
-///
-/// [`PLACEHOLDER`]: NodeId::PLACEHOLDER
+/// Pairs containing [`NodeId::PLACEHOLDER`] are ignored. Outside lowering, an active
+/// phase with no recording triggers a debug assertion, matching [`on_mint`]'s
+/// coverage check. A copy with no active phase or recording writes nothing.
 pub(crate) fn on_copy(origin: NodeId, fresh: NodeId) {
     if origin == NodeId::PLACEHOLDER || fresh == NodeId::PLACEHOLDER {
         return;
