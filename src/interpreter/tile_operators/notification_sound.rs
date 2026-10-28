@@ -2,8 +2,8 @@
 //! growth, every output key whose answer changed lies in the region the operator's consumer was
 //! notified of, and a pull at that region after the step answers what a fresh pull of the whole
 //! answer cut to it does. A region larger than needed is sound and a smaller one is not, so the
-//! check holds a widening operator to soundness only; [`Expect::Exact`] and
-//! [`Expect::Narrower`] hold the keep rows of the table to what they claim.
+//! check holds a widening operator to soundness only; [`Expect::Exact`], [`Expect::Widens`],
+//! [`Expect::Routed`] and [`Expect::Silent`] hold the rows of the table to what they claim.
 //! See `src/interpreter/design-operators.md`, "Guard translation".
 
 use std::sync::{
@@ -156,8 +156,6 @@ pub(crate) fn keys_region(keys: &[u64]) -> Projection {
 pub(crate) enum Expect {
     /// Soundness only: any region that covers every change.
     Sound,
-    /// The region is not `Everything`.
-    Narrower,
     /// The region is exactly what the input notified.
     Exact,
     /// The region is `Everything`: the operator reads this input whole.
@@ -318,11 +316,6 @@ pub(crate) fn assert_notification_sound(
                 notified,
                 Projection::Everything,
                 "step {n}: the operator did not widen"
-            ),
-            Expect::Narrower => assert_ne!(
-                notified,
-                Projection::Everything,
-                "step {n}: the operator widened"
             ),
             Expect::Exact => assert_eq!(
                 notified, step.changed,
@@ -890,13 +883,9 @@ mod tests {
     }
 
     #[test]
-    fn a_widening_operator_is_sound_and_fails_the_narrower_variant() {
+    fn a_widening_operator_is_sound_and_fails_the_exact_variant() {
         let build = probe(Notify::Widened, Release::Honest);
         assert_notification_sound(&build, &growth(), &growth_steps(), &[Expect::Sound]);
-        let caught = std::panic::catch_unwind(|| {
-            assert_notification_sound(&build, &growth(), &growth_steps(), &[Expect::Narrower])
-        });
-        assert!(caught.is_err(), "Narrower accepted a widening operator");
         let caught = std::panic::catch_unwind(|| {
             assert_notification_sound(&build, &growth(), &growth_steps(), &[Expect::Exact])
         });

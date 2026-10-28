@@ -71,18 +71,13 @@ impl Projection {
     ///
     /// # Panics
     ///
-    /// For a region of fields and a region of keys, which name different things.
+    /// For a region of fields, whose intersection no caller needs yet.
     pub fn intersect(&self, other: &Projection) -> Projection {
         match (self, other) {
             (Projection::Nothing, _) | (_, Projection::Nothing) => Projection::Nothing,
             (Projection::Everything, kept) | (kept, Projection::Everything) => kept.clone(),
             (Projection::Keys(a), Projection::Keys(b)) => Projection::admitting(a.intersect(b)),
-            (Projection::Fields(a), Projection::Fields(b)) => {
-                Projection::fields(a.iter().filter_map(|(name, region)| {
-                    Some((name.clone(), region.intersect(b.get(name)?)))
-                }))
-            }
-            (a, b) => panic!("a region of fields and a region of keys meet nowhere: {a:?}, {b:?}"),
+            (a, b) => panic!("no caller intersects a region of fields yet: {a:?}, {b:?}"),
         }
     }
 
@@ -90,31 +85,17 @@ impl Projection {
     ///
     /// # Panics
     ///
-    /// For a region of fields against a region of keys, and for everything less a region of
-    /// fields, whose remainder would name the fields the region omits.
+    /// For a region of fields, whose subtraction no caller needs yet.
     pub fn minus(&self, other: &Projection) -> Projection {
         let region = |projection: &Projection| match projection {
             Projection::Everything => Predicate::True,
             Projection::Nothing => Predicate::False,
             Projection::Keys(keys) => keys.clone(),
-            Projection::Fields(_) => unreachable!("handled below"),
+            Projection::Fields(_) => {
+                panic!("no caller subtracts a region of fields yet: {self:?} minus {other:?}")
+            }
         };
-        match (self, other) {
-            (Projection::Nothing, _) | (_, Projection::Nothing) => self.clone(),
-            (Projection::Fields(a), Projection::Fields(b)) => {
-                Projection::fields(a.iter().map(|(name, region)| match b.get(name) {
-                    Some(taken) => (name.clone(), region.minus(taken)),
-                    None => (name.clone(), region.clone()),
-                }))
-            }
-            (Projection::Fields(_), Projection::Everything) => Projection::Nothing,
-            (Projection::Fields(_), Projection::Keys(_))
-            | (Projection::Keys(_), Projection::Fields(_))
-            | (Projection::Everything, Projection::Fields(_)) => {
-                panic!("a region of fields cannot be subtracted this way: {self:?} minus {other:?}")
-            }
-            _ => Projection::admitting(region(self).minus(&region(other))),
-        }
+        Projection::admitting(region(self).minus(&region(other)))
     }
 
     /// The projection naming what either names: the region a memo has read or must read again, or
@@ -684,42 +665,15 @@ mod fields_tests {
     }
 
     #[test]
-    fn the_intersection_of_fields_keeps_the_fields_both_name() {
-        let a = fields(&[("a", keys(1, 5)), ("b", keys(5, 6))]);
-        let b = fields(&[("a", keys(3, 9)), ("c", Projection::Everything)]);
-        assert_eq!(a.intersect(&b), fields(&[("a", keys(3, 5))]));
-        assert_eq!(
-            fields(&[("a", keys(1, 2))]).intersect(&fields(&[("a", keys(5, 6))])),
-            Projection::Nothing
-        );
-        assert_eq!(a.intersect(&Projection::Everything), a);
-        assert_eq!(a.intersect(&Projection::Nothing), Projection::Nothing);
+    #[should_panic(expected = "no caller intersects")]
+    fn no_caller_intersects_a_region_of_fields_yet() {
+        fields(&[("a", keys(1, 2))]).intersect(&fields(&[("a", keys(1, 2))]));
     }
 
     #[test]
-    fn subtracting_fields_removes_what_each_field_took() {
-        let a = fields(&[("a", keys(1, 5)), ("b", keys(5, 6))]);
-        let taken = fields(&[("a", keys(1, 2))]);
-        assert_eq!(
-            a.minus(&taken),
-            fields(&[("a", keys(3, 5)), ("b", keys(5, 6))])
-        );
-        assert_eq!(a.minus(&a), Projection::Nothing);
-        assert_eq!(a.minus(&Projection::Everything), Projection::Nothing);
-        assert_eq!(a.minus(&Projection::Nothing), a);
-        assert_eq!(Projection::Nothing.minus(&a), Projection::Nothing);
-    }
-
-    #[test]
-    #[should_panic(expected = "meet nowhere")]
-    fn fields_and_keys_have_no_intersection() {
-        fields(&[("a", keys(1, 2))]).intersect(&keys(1, 2));
-    }
-
-    #[test]
-    #[should_panic(expected = "cannot be subtracted")]
-    fn everything_less_fields_names_fields_the_region_omits() {
-        Projection::Everything.minus(&fields(&[("a", keys(1, 2))]));
+    #[should_panic(expected = "no caller subtracts")]
+    fn no_caller_subtracts_a_region_of_fields_yet() {
+        keys(1, 2).minus(&fields(&[("a", keys(1, 2))]));
     }
 
     #[test]

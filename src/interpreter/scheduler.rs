@@ -1038,14 +1038,13 @@ mod tests {
         );
     }
 
-    /// A region of fields and a region of keys name different things: neither is inside the
-    /// other, so the later passes, and the gate holds only the later one.
+    /// A gate is given regions of one kind: keys for a collection, fields for a record.
+    #[cfg(debug_assertions)]
     #[test]
-    fn keys_and_fields_are_not_inside_one_another() {
+    #[should_panic(expected = "notified of keys and of fields")]
+    fn a_gate_notified_of_keys_and_of_fields_is_a_wiring_bug() {
         let fields = Projection::fields([(SmolStr::new("a"), keys(1, 4))]);
-        assert_eq!(passes(&[keys(1, 4), fields.clone()]), 2);
-        assert_eq!(passes(&[fields.clone(), keys(1, 4)]), 2);
-        assert_eq!(passes(&[keys(1, 4), fields.clone(), keys(1, 4)]), 3);
+        passes(&[keys(1, 4), fields]);
     }
 
     /// The gate holds what it passed, not what was delivered: a consumer behind it that drops a
