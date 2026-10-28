@@ -104,6 +104,7 @@ use crate::{
 };
 use smol_str::SmolStr;
 
+mod clauses;
 mod comprehension;
 mod constants;
 mod exprs;
@@ -487,6 +488,12 @@ pub struct LoweringContext {
     /// same-named alias in the body is an error rather than a shadow
     /// (`docs/chl-spec.md`, "Type parameters"), which is what this answers.
     pub(super) type_params_in_scope: Vec<String>,
+
+    /// The declared type parameters bounded by `Effect` (`true`) or `Context` (`false`),
+    /// which stand for a clause rather than a type (`docs/chl-spec.md`, "Kinds and bounds").
+    /// Keyed by identity, so it needs no scoping: a clause reaches a parameter through the
+    /// alias its definition declares.
+    pub(super) clause_params: HashMap<crate::ccl::ty::TypeParamId, bool>,
 
     /// The nominal types the module declares, by name (`docs/chl-spec.md`, "Declaring a
     /// nominal type"). Unlike an alias, a nominal type survives lowering as a
@@ -1098,6 +1105,23 @@ impl LoweringContext {
     }
 
     /// What `name` means as a type at `at`, the span of a use.
+    /// The type parameter standing for a clause that `name` names at `at`, if it names one.
+    pub(super) fn clause_param(
+        &self,
+        name: &str,
+        at: Span,
+    ) -> Option<crate::ccl::effects::ClauseParam> {
+        let AliasAt::InScope(AliasType::Type(Type::Param(param))) = self.type_alias(name, at)
+        else {
+            return None;
+        };
+        let of_causes = *self.clause_params.get(&param.id)?;
+        Some(crate::ccl::effects::ClauseParam {
+            param: Rc::clone(param),
+            of_causes,
+        })
+    }
+
     pub(super) fn type_alias(&self, name: &str, at: Span) -> AliasAt<'_> {
         let Some(declared) = self.type_aliases.get(name) else {
             return AliasAt::Undeclared;

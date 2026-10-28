@@ -69,6 +69,43 @@ pub fn option() -> Rc<NominalDecl> {
     OPTION_DECL.with(Rc::clone)
 }
 
+/// The names of the two types bounding the variables that stand for clauses: every effect is
+/// below `Effect`, and every requirement below `Context` (`docs/chl-spec.md`, "6.9 Effects and
+/// requirements \[Decided\]").
+pub const EFFECT: &str = "Effect";
+pub const CONTEXT: &str = "Context";
+
+thread_local! {
+    static EFFECT_DECL: Rc<NominalDecl> = clause_bound_declaration(EFFECT);
+    static CONTEXT_DECL: Rc<NominalDecl> = clause_bound_declaration(CONTEXT);
+}
+
+/// `type name` in `std` with no constructor: no value has an effect or a requirement type.
+fn clause_bound_declaration(name: &str) -> Rc<NominalDecl> {
+    let decl = NominalDecl::declared_in(
+        vec![SmolStr::new_static(STD)],
+        name.into(),
+        Vec::new(),
+        Span::new(chl_parser::FileId::ROOT, 0, 0),
+        false,
+    );
+    decl.define(Vec::new())
+        .expect("a declaration with no constructor names no parameter");
+    decl
+}
+
+/// The compiler-provided `Effect`, which a variable standing for a `causes` clause is bounded
+/// by (`docs/chl-spec.md`, "Kinds and bounds").
+pub fn effect() -> Rc<NominalDecl> {
+    EFFECT_DECL.with(Rc::clone)
+}
+
+/// The compiler-provided `Context`, which a variable standing for a `requires` clause is
+/// bounded by.
+pub fn context() -> Rc<NominalDecl> {
+    CONTEXT_DECL.with(Rc::clone)
+}
+
 /// The tag a value built by the constructor `ctor` carries once nominal types erase: the
 /// constructor's name, as a label of the root's namespace whichever module declares the
 /// type. Construction, patterns and erasure all build it here, so they agree, and the
@@ -600,9 +637,13 @@ impl NominalDecl {
         }
     }
 
-    /// Whether the compiler provides the declaration ([`builtin`]).
+    /// Whether the compiler provides the declaration: one [`builtin`] names, or a bound of
+    /// the variables standing for clauses, which no type annotation names ([`effect`],
+    /// [`context`]).
     pub fn is_builtin(&self) -> bool {
         builtin(&self.name).is_some_and(|b| *b == *self)
+            || *self == *effect()
+            || *self == *context()
     }
 
     /// The constructor named `name`.

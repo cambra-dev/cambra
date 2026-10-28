@@ -138,7 +138,7 @@ with
 match  case
 pass
 where
-forall requires
+forall requires causes only   nothing
 type   impl   trait
 import use    as     pub    run    param  const  this
 ```
@@ -168,22 +168,23 @@ reserved for future use.
 
 `forall` begins a polymorphic type (**[Planned]**,
 [Polymorphic type annotations](#polymorphic-type-annotations)). `requires` begins a `requires`
-clause, which ends a `def` signature or a polymorphic type
-([Trait requirements](#trait-requirements)). `requires Transaction` is **[Planned]**
+clause and `causes` a `causes` clause, which end a `def` signature or a function type, and `only`
+and `nothing` bound one ([Writing requirements and effects](#writing-requirements-and-effects)).
+`requires Transaction` is **[Planned]**
 ([8.7 Direction [Decided]: transactions as contextual parameters](#87-direction-decided-transactions-as-contextual-parameters)).
 
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
 > `rec` (recursive binding — §4.3, **[Decided]**),
 > `assert` and its `static assert` form (function contracts — §6, **[Decided]** as the
-> surface, **[Open]** as to what `static` demands), and `causes`, `only`, `nothing`, `raise`,
-> `try` and `except` (effects and exceptions —
+> surface, **[Open]** as to what `static` demands), and `raise`, `try` and `except` (exceptions —
 > [6.9 Effects and requirements [Decided]](#69-effects-and-requirements-decided), **[Decided]**).
 > Avoid taking these names for other purposes.
-> (`with`, `:=`, `match`, `case`, `where`, `forall`, `requires`, `type`, `impl`, `trait` and
-> the module keywords are **already** lexed — the first two carry today's transactions and
-> mutation, §8, `match`/`case` carry tag dispatch, §4.10, `where` separates a refinement's
-> predicate, §6.4, `forall` and `requires` begin a polymorphic type and a `requires` clause, §6.10,
-> and `type`, `impl` and `trait` declare nominal types, their functions and traits, §6.8 and
+> (`with`, `:=`, `match`, `case`, `where`, `forall`, `requires`, `causes`, `only`, `nothing`,
+> `type`, `impl`, `trait` and the module keywords are **already** lexed — the first two carry
+> today's transactions and mutation, §8, `match`/`case` carry tag dispatch, §4.10, `where`
+> separates a refinement's predicate, §6.4, `forall` and `requires` begin a polymorphic type and a
+> `requires` clause, §6.10, `causes`, `only` and `nothing` write the other clause and bound both,
+> §6.9, and `type`, `impl` and `trait` declare nominal types, their functions and traits, §6.8 and
 > §6.10 — so they are not in this list.)
 
 ### 1.7 Literals
@@ -3302,9 +3303,7 @@ A function's type states what a call reads from its context, in its **`requires`
 the call contributes besides its result, in its **`causes` clause**. A requirement is an input that
 the context supplies. An effect is an output. Trait requirements
 ([Trait requirements](#trait-requirements)) are implemented, and the rest of this section is
-**[Decided]**. The effecting forms that are implemented
-([3. Expression semantics](#3-expression-semantics)) are the `Write` and `Append` effects below,
-read off a function's body rather than stated in its type.
+**[Decided]**.
 
 | Requirement | Supplied by | Required by |
 | --- | --- | --- |

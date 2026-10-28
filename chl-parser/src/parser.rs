@@ -11,12 +11,12 @@ use smol_str::SmolStr;
 
 use crate::ast::{
     AnnotationMode, ArmPattern, Arrow, AssignTarget, AssocArg, AugOp, BinOp, BindingTransparency,
-    BoolOp, CmpOp, CompClause, Comprehension, Constructor, ConstructorParam, ConstructorPattern,
-    DiscardHead, EntryForm, Expr, FileId, FunctionSignature, IfBranch, ImplBlock, KeywordArg,
-    KindAnnotation, Lit, MatchArm, MatchPattern, Module, ModuleTypeEntry, Param, PayloadPattern,
-    QualifiedName, RecordField, Requirement, Span, Spanned, Stmt, TraitDecl, TraitItem, TraitType,
-    TypeAnnotation, TypeDecl, TypeDeclBody, TypeParam, UnaryOp, UseItem, VariantPayload,
-    WrittenPath, is_type_name,
+    BoolOp, Clause, CmpOp, CompClause, Comprehension, Constructor, ConstructorParam,
+    ConstructorPattern, DiscardHead, EntryForm, Expr, FileId, FunctionSignature, IfBranch,
+    ImplBlock, KeywordArg, KindAnnotation, Lit, MatchArm, MatchPattern, Module, ModuleTypeEntry,
+    Param, PayloadPattern, QualifiedName, RecordField, Requirement, Span, Spanned, Stmt, TraitDecl,
+    TraitItem, TraitType, TypeAnnotation, TypeDecl, TypeDeclBody, TypeParam, UnaryOp, UseItem,
+    VariantPayload, WrittenPath, is_type_name,
 };
 use crate::builtins::SurfaceBuiltin;
 use crate::lexer::{self, Token};
@@ -1193,16 +1193,26 @@ where
             just(Token::DoubleArrow).to(Arrow::Compute),
             just(Token::DataArrow).to(Arrow::Data),
         ));
+        // The clauses after the codomain are this arrow's, so in `A => B => C causes E` the
+        // codomain `B => C causes E` takes them (`docs/chl-spec.md`, "Writing requirements and
+        // effects").
         let fun_type = feed
-            .then(arrow.then(expr.clone()).or_not())
-            .map_with(|(domain, codomain), e| match codomain {
+            .then(
+                arrow
+                    .then(expr.clone())
+                    .then(effect_clauses(expr.clone(), type_requirement(expr.clone())).boxed())
+                    .or_not(),
+            )
+            .map_with(|(domain, rest), e| match rest {
                 None => domain,
-                Some((arrow, codomain)) => Spanned::new(
+                Some(((arrow, codomain), (requires, causes))) => Spanned::new(
                     e.span(),
                     Expr::FunctionType {
                         domain: Box::new(domain),
                         arrow,
                         codomain: Box::new(codomain),
+                        requires: Box::new(requires),
+                        causes: Box::new(causes),
                     },
                 ),
             })
@@ -1855,11 +1865,12 @@ where
                     .delimited_by(just(Token::LParen), just(Token::RParen)),
             )
             .then(just(Token::DoubleArrow).ignore_then(expr.clone()).or_not())
-            .then(requires_clause(expr.clone()).or_not())
+            .then(effect_clauses(expr.clone(), requirement(expr.clone())).boxed())
             .then_ignore(just(Token::Colon))
             .then(block.clone())
             .map_with(
-                |(((((owner, name), (type_params, params)), output), requires), body), e| {
+                |(((((owner, name), (type_params, params)), output), (requires, causes)), body),
+                 e| {
                     Spanned::new(
                         e.span(),
                         Stmt::FunctionDef {
@@ -1868,7 +1879,8 @@ where
                             type_params,
                             params,
                             output,
-                            requires: requires.unwrap_or_default(),
+                            requires: Box::new(requires),
+                            causes: Box::new(causes),
                             body,
                         },
                     )
@@ -2460,6 +2472,95 @@ where
             .at_least(1)
             .collect::<Vec<_>>(),
     )
+}
+
+/// The `requires` and `causes` clauses after a `def` signature or a function type's codomain,
+/// each optional and each defaulting to the clause no one wrote, a `requires` item being what
+/// `requirement` parses.
+///
+/// Spec: `docs/chl-spec.md`, "Writing requirements and effects".
+fn effect_clauses<'src, I, E, R>(
+    expr: E,
+    requirement: R,
+) -> impl Parser<'src, I, (Clause<Requirement>, Clause<TraitType>), PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
+    R: Parser<'src, I, Spanned<Requirement>, PErr<'src>> + Clone,
+{
+    bounded_clause(Token::Requires, requirement)
+        .or_not()
+        .then(bounded_clause(Token::Causes, clause_item(expr)).or_not())
+        .map(|(requires, causes)| (requires.unwrap_or_default(), causes.unwrap_or_default()))
+}
+
+/// A function type's `requires` item: a [`clause_item`], which binds no instance.
+///
+/// A function type's clause items are capitalized names or `_`, never a lowercase name, so a
+/// function type in a parameter list ends at the comma before the next parameter:
+/// `def apply(f: Int => Int causes _, xs)`. A `def`'s `requires` clause also takes a named
+/// requirement and a bound, `a: Addable(A, B), a::Output <: B` ([`requirement`]), which end
+/// at its `:`.
+fn type_requirement<'src, I, E>(
+    expr: E,
+) -> impl Parser<'src, I, Spanned<Requirement>, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
+{
+    clause_item(expr).map(|ty| {
+        Spanned::new(
+            ty.span,
+            Requirement::Trait {
+                binder: None,
+                ty: ty.node,
+            },
+        )
+    })
+}
+
+/// A clause item: a trait type whose name is capitalized, `Write(x)`, or `_`.
+fn clause_item<'src, I, E>(expr: E) -> impl Parser<'src, I, Spanned<TraitType>, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
+{
+    trait_type(expr).try_map(|ty, span| {
+        if ty.node.name == "_" || is_type_name(&ty.node.name) {
+            Ok(ty)
+        } else {
+            Err(Rich::custom(
+                span,
+                "a clause item is a capitalized name or `_`",
+            ))
+        }
+    })
+}
+
+/// `keyword nothing`, or `keyword` with `only` or not before its items: a clause that
+/// `only` or `nothing` makes an upper bound.
+fn bounded_clause<'src, I, T, P>(
+    keyword: Token,
+    item: P,
+) -> impl Parser<'src, I, Clause<T>, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    P: Parser<'src, I, Spanned<T>, PErr<'src>> + Clone,
+    T: Clone,
+{
+    let nothing = just(Token::Nothing).map_with(|_, e| (Some(e.span()), Vec::new()));
+    let listed = just(Token::Only).map_with(|_, e| e.span()).or_not().then(
+        item.separated_by(just(Token::Comma))
+            .at_least(1)
+            .collect::<Vec<_>>(),
+    );
+    just(keyword)
+        .ignore_then(choice((nothing, listed)))
+        .map_with(|(only, items), e| Clause {
+            span: Some(e.span()),
+            only,
+            items,
+        })
 }
 
 /// One requirement: a trait type, `Addable(A, B)`, and before it the name the requirement
@@ -3481,6 +3582,7 @@ mod tests {
             domain,
             arrow: Arrow::Data,
             codomain,
+            ..
         } = parse_e("_ |=> Int").node
         else {
             panic!(
@@ -4703,7 +4805,7 @@ mod tests {
                 params,
                 requires,
                 ..
-            } => (type_params, params, requires),
+            } => (type_params, params, &requires.items),
             other => panic!("expected FunctionDef, got {other:?}"),
         }
     }
@@ -4876,12 +4978,89 @@ mod tests {
             type_params[1].annotation,
             Some(KindAnnotation::Bound(_))
         ));
-        assert!(
-            matches!(body.node, Expr::FunctionType { .. }),
-            "{:?}",
-            body.node
-        );
-        assert_eq!(requires.len(), 1);
+        // The clause after the codomain is the arrow's, which holds the polymorphic type's
+        // trait requirements with its context requirements.
+        assert!(requires.is_empty());
+        let Expr::FunctionType {
+            requires: arrow, ..
+        } = &body.node
+        else {
+            panic!("expected a FunctionType, got {:?}", body.node);
+        };
+        assert_eq!(arrow.items.len(), 1);
+    }
+
+    // ---- `requires` and `causes` clauses (`docs/chl-spec.md`, "Writing requirements and
+    // effects") ----
+
+    /// The clauses of the module's first statement, a `def`.
+    fn def_clauses(m: &Module) -> (&Clause<Requirement>, &Clause<TraitType>) {
+        match &m.body[0].node {
+            Stmt::FunctionDef {
+                requires, causes, ..
+            } => (requires, causes),
+            other => panic!("expected FunctionDef, got {other:?}"),
+        }
+    }
+
+    fn item_names(items: &[Spanned<TraitType>]) -> Vec<&str> {
+        items.iter().map(|t| t.node.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_def_writes_both_clauses_and_only_bounds_one() {
+        let m = parse_m("def f(x) requires Ext causes only Write(x), Commit:\n    x\n");
+        let (requires, causes) = def_clauses(&m);
+        assert_eq!(requires.items.len(), 1);
+        assert!(requires.only.is_none());
+        assert!(causes.only.is_some());
+        assert_eq!(item_names(&causes.items), ["Write", "Commit"]);
+    }
+
+    #[test]
+    fn nothing_is_a_bound_with_no_item() {
+        let m = parse_m("def f(x) requires nothing causes nothing:\n    x\n");
+        let (requires, causes) = def_clauses(&m);
+        for (only, items) in [
+            (requires.only, requires.items.len()),
+            (causes.only, causes.items.len()),
+        ] {
+            assert!(only.is_some());
+            assert_eq!(items, 0);
+        }
+    }
+
+    /// A function type's clause items are capitalized or `_`, so a parameter after a
+    /// function-typed one is not read as another item.
+    #[test]
+    fn a_function_type_in_a_parameter_list_ends_at_the_next_parameter() {
+        let m = parse_m("def apply(f: Int => Int causes _, xs):\n    xs\n");
+        let Stmt::FunctionDef { params, .. } = &m.body[0].node else {
+            panic!("expected FunctionDef");
+        };
+        assert_eq!(params.len(), 2);
+        let ty = &params[0].annotation.as_ref().expect("annotated").ty.node;
+        let Expr::FunctionType { causes, .. } = ty else {
+            panic!("expected a FunctionType, got {ty:?}");
+        };
+        assert_eq!(item_names(&causes.items), ["_"]);
+    }
+
+    /// `=>` groups to the right, so the clauses after the last codomain are the inner
+    /// arrow's.
+    #[test]
+    fn an_arrow_takes_the_clauses_after_its_codomain() {
+        let Expr::FunctionType {
+            codomain, causes, ..
+        } = parse_e("A => B => C causes Emit").node
+        else {
+            panic!("expected a FunctionType");
+        };
+        assert!(causes.items.is_empty());
+        let Expr::FunctionType { causes: inner, .. } = codomain.node else {
+            panic!("expected the codomain to be a FunctionType");
+        };
+        assert_eq!(item_names(&inner.items), ["Emit"]);
     }
 
     #[test]
@@ -4890,10 +5069,16 @@ mod tests {
         let Stmt::AnnAssign { annotation, .. } = &m.body[0].node else {
             panic!("expected an annotated assignment, got {:?}", m.body[0].node);
         };
+        let Expr::Forall {
+            type_params, body, ..
+        } = &annotation.ty.node
+        else {
+            panic!("expected a Forall, got {:?}", annotation.ty.node);
+        };
+        assert_eq!(type_params.len(), 1);
         assert!(matches!(
-            &annotation.ty.node,
-            Expr::Forall { type_params, requires, .. }
-                if type_params.len() == 1 && requires.len() == 1
+            &body.node,
+            Expr::FunctionType { requires, .. } if requires.items.len() == 1
         ));
     }
 

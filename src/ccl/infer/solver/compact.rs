@@ -1561,7 +1561,7 @@ pub enum JoinedPosition {
 /// following, so that spurious cycles (`?a <: ?b` and `?b <: ?a`) — which
 /// don't represent real recursive types — get pruned.
 pub fn compact_type(ty: &Type) -> CompactGraph {
-    compact_type_with(ty, true)
+    compact_type_with(ty, true, false)
 }
 
 /// [`compact_type`] with the opposite-polarity collapse suppressed **entirely**,
@@ -1578,11 +1578,19 @@ pub fn compact_type(ty: &Type) -> CompactGraph {
 /// [`fallback_allowed`] already confines the collapse to the entered position, so
 /// disabling it there disables it everywhere.
 pub fn compact_type_polarity_only(ty: &Type) -> CompactGraph {
-    compact_type_with(ty, false)
+    compact_type_with(ty, false, false)
 }
 
-fn compact_type_with(ty: &Type, collapse: bool) -> CompactGraph {
+/// [`compact_type_polarity_only`], with each function position's effects also holding the
+/// effect variables standing at it, which a rendering of a polymorphic type names
+/// (`src/ccl/design/type-inference.md`, "Effect variables").
+pub fn compact_type_for_display(ty: &Type) -> CompactGraph {
+    compact_type_with(ty, false, true)
+}
+
+fn compact_type_with(ty: &Type, collapse: bool, effect_vars: bool) -> CompactGraph {
     let mut st = CompactState::new(collapse);
+    st.effect_vars = effect_vars;
     let term = compact_go(ty, true, &Subst::id(), Position::default(), &mut st);
     debug_assert!(
         refinement_slot_present(&term) && st.rec_vars.values().all(refinement_slot_present),
@@ -2119,6 +2127,10 @@ struct CompactState {
     /// Whether the opposite-polarity collapse may fire at all on this walk.
     /// False for [`compact_type_polarity_only`]; see [`fallback_allowed`].
     collapse: bool,
+    /// Whether each function position records the effect variables standing at it
+    /// ([`EffectSet::vars`](crate::ccl::effects::EffectSet::vars)): only a rendering of a
+    /// polymorphic type reads them ([`compact_type_for_display`]).
+    effect_vars: bool,
     /// The functions the walk is inside of, and the closing memo over them
     /// (`src/ccl/design/type-inference.md`, "Where the conversions run"): a
     /// refinement's references to enclosing binders become indices before
@@ -2154,12 +2166,35 @@ impl CompactState {
             barrier_recursive: HashMap::new(),
             rec_vars: BTreeMap::new(),
             collapse,
+            effect_vars: false,
             scope: RefinementScope::default(),
             data_domain_depth: 0,
             candidate_widened: None,
             join_violations: Vec::new(),
         }
     }
+}
+
+/// The set `effects` states at a position of polarity `pol`, with the effect variables
+/// standing there when the walk records them: at an input, the position's own variable, and
+/// at an output, every variable flowing into it, which a rendering keeps where it also stands
+/// at an input.
+fn effects_at(
+    effects: &crate::ccl::effects::Effects,
+    pol: bool,
+    st: &CompactState,
+) -> crate::ccl::effects::EffectSet {
+    let mut set = effects.set();
+    if st.effect_vars
+        && let crate::ccl::effects::Repr::Var(v) = effects.repr()
+    {
+        set.vars = if pol {
+            v.reaching()
+        } else {
+            std::iter::once((v.uid, Rc::clone(v))).collect()
+        };
+    }
+    set
 }
 
 /// The resolution of a barrier variable, under `subst_acc`, as a [`CompactType`]: the join
@@ -2713,7 +2748,7 @@ fn compact_go(
                         KindPin::Sum(_) => KindPin::Data,
                         other => other,
                     },
-                    effects: Rc::new(effects.set()),
+                    effects: Rc::new(effects_at(effects, pol, st)),
                     name: name.clone(),
                     binders,
                     domains_disagree: false,
