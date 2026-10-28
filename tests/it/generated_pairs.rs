@@ -340,6 +340,33 @@ fn skeletons() -> Vec<Skeleton> {
             out = test_sink()
             out << sum([min([(v + {}, "a") for v in grp]).0 for grp in g])
         "#}},
+        Skeleton { name: "nominal_operator_operand", hole: Ty::Int, scope: &[], body: indoc! {r#"
+            type Money = Int
+            impl Addable(Money, Money):
+                Output = Money
+                def add(x, other):
+                    Money::new(x.extract() + other.extract())
+            impl Subtractable(Money, Money):
+                Output = Money
+                def sub(x, other):
+                    Money::new(x.extract() - other.extract())
+
+            out = test_sink()
+            out << (Money::new({}) + Money::new(1) - Money::new(2)).extract()
+        "#}},
+        Skeleton { name: "nominal_operator_accumulator", hole: Ty::Int, scope: &[("x", Ty::Int)], body: indoc! {r#"
+            type Money = Int
+            impl Addable(Money, Money):
+                Output = Money
+                def add(x, other):
+                    Money::new(x.extract() + other.extract())
+
+            t := Money::new(0)
+            for x in [1, 2, 3]:
+                t += Money::new({})
+            out = test_sink()
+            out << t.extract()
+        "#}},
         Skeleton { name: "trait_function_argument", hole: Ty::Int, scope: &[], body: indoc! {r#"
             type Box = Int
             trait Area(S):

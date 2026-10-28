@@ -82,8 +82,8 @@ use smol_str::SmolStr;
 use crate::ccl::nominal::NominalDecl;
 use crate::ccl::ty::{TypeParam, TypeParamId};
 use crate::ccl::{
-    BarrierVar, BaseType, FieldKey, InferVar, InferVarId, Name, Refinement, RefinementSet, Type,
-    TypedExpr, provenance,
+    ArithmeticKind, BarrierVar, BaseType, BinOpKind, CompareKind, FieldKey, InferVar, InferVarId,
+    Name, Refinement, RefinementSet, Type, TypedExpr, TypedExprNode, UnaryOpKind, provenance,
 };
 
 use super::constrain::{ConstrainCache, ConstrainError, constrain_subtype};
@@ -251,77 +251,107 @@ impl CompilerTraits {
             instances: Vec::new(),
         };
         let binary = ["A", "B"];
+        let primitive = |op| Some(InstanceBody::Binary(op));
         // The numeric rows every arithmetic trait has, `(Int, Int) ⇝ Int` and
-        // `(UInt, UInt) ⇝ UInt`.
-        let numeric = || vec![(vec![Int, Int], Some(Int)), (vec![UInt, UInt], Some(UInt))];
+        // `(UInt, UInt) ⇝ UInt`, each running the primitive `kind`.
+        let numeric = |kind| {
+            let op = primitive(BinOpKind::Arithmetic(kind));
+            vec![
+                (vec![Int, Int], Some(Int), op),
+                (vec![UInt, UInt], Some(UInt), op),
+            ]
+        };
         // Homogeneous comparison over every base the interpreter can compare, which is also
         // every base `max` folds (`ccl/aggregate.rs`). It associates nothing: a comparison's
         // `Bool` is fixed by the operator's signature, the same for every pair of types the
         // trait accepts, so recording it as an associated type would state that the trait
-        // determines something it does not.
+        // determines something it does not. It declares no function either, a comparison
+        // being by value.
         let comparison = || {
             vec![
-                (vec![Int, Int], None),
-                (vec![UInt, UInt], None),
-                (vec![String, String], None),
-                (vec![Bool, Bool], None),
+                (vec![Int, Int], None, None),
+                (vec![UInt, UInt], None, None),
+                (vec![String, String], None, None),
+                (vec![Bool, Bool], None, None),
             ]
         };
-        let mut arithmetic = |name: &str, rows| {
-            operator_trait(
-                name,
-                &binary,
-                true,
-                ProductReading::None,
-                rows,
-                &mut instances,
-            )
+        let arithmetic = |name, function| OperatorTrait {
+            name,
+            operands: &binary,
+            function,
+            output: true,
+            products: ProductReading::None,
         };
         // `+`. The `(String, String) ⇝ String` row is why surface `+` on strings types
-        // through arithmetic; `simplify` rewrites it to `Concat` later.
-        let addable = arithmetic("Addable", {
-            let mut rows = numeric();
-            rows.push((vec![String, String], Some(String)));
-            rows
-        });
+        // through arithmetic; its `add` is `Concat`.
+        let addable = arithmetic("Addable", Some("add")).build(
+            {
+                let mut rows = numeric(ArithmeticKind::Add);
+                rows.push((
+                    vec![String, String],
+                    Some(String),
+                    primitive(BinOpKind::Concat),
+                ));
+                rows
+            },
+            &mut instances,
+        );
         // `^+`, which computes what `+` computes on the numeric bases: its result's
-        // refinement is the operator's to state (`emit_binop`), not the trait's.
-        let addable_refined = arithmetic("AddableRefined", numeric());
-        let subtractable = arithmetic("Subtractable", numeric());
-        let multipliable = arithmetic("Multipliable", numeric());
-        let divisible = arithmetic("Divisible", numeric());
+        // refinement is the operator's to state (`emit_binop`), not the trait's. It declares no
+        // function, `^+` being its one use.
+        let addable_refined = arithmetic("AddableRefined", None).build(
+            numeric(ArithmeticKind::AddRefined)
+                .into_iter()
+                .map(|(bases, output, _)| (bases, output, None))
+                .collect(),
+            &mut instances,
+        );
+        let subtractable = arithmetic("Subtractable", Some("sub"))
+            .build(numeric(ArithmeticKind::Sub), &mut instances);
+        let multipliable = arithmetic("Multipliable", Some("mul"))
+            .build(numeric(ArithmeticKind::Mul), &mut instances);
+        let divisible = arithmetic("Divisible", Some("div"))
+            .build(numeric(ArithmeticKind::FloorDiv), &mut instances);
         // `**`, whose rows relate the two *bases*. That the exponent is non-negative is
         // stated where it can be discharged, as a refinement on the exponent's own binding
         // (`src/ccl/lower/exprs.rs`'s `pow_with_checked_exponent`), because a row admits a
         // base and not a predicate over its values. The refinement names `Int`, so the
         // `UInt` row is unreachable for `**` while that holds.
-        let exponentiable = arithmetic("Exponentiable", numeric());
-        let equatable = operator_trait(
-            "Equatable",
-            &binary,
-            false,
-            ProductReading::AnyProduct,
-            comparison(),
-            &mut instances,
-        );
+        let exponentiable = arithmetic("Exponentiable", Some("pow"))
+            .build(numeric(ArithmeticKind::Pow), &mut instances);
+        let equatable = OperatorTrait {
+            name: "Equatable",
+            operands: &binary,
+            function: None,
+            output: false,
+            products: ProductReading::AnyProduct,
+        }
+        .build(comparison(), &mut instances);
         // `<`, `<=`, `>`, `>=`. `max` and `min` place it on their codomain twice, `(γ, γ)`: a
         // pure requirement, since the aggregate's scheme already returns an element of what
         // it consumes.
-        let orderable = operator_trait(
-            "Orderable",
-            &binary,
-            false,
-            ProductReading::Tuples,
-            comparison(),
-            &mut instances,
-        );
+        let orderable = OperatorTrait {
+            name: "Orderable",
+            operands: &binary,
+            function: None,
+            output: false,
+            products: ProductReading::Tuples,
+        }
+        .build(comparison(), &mut instances);
         // Unary `-`: one operand, and an `Output` that genuinely depends on it.
-        let negatable = operator_trait(
-            "Negatable",
-            &["A"],
-            true,
-            ProductReading::None,
-            vec![(vec![Int], Some(Int))],
+        let negatable = OperatorTrait {
+            name: "Negatable",
+            operands: &["A"],
+            function: Some("neg"),
+            output: true,
+            products: ProductReading::None,
+        }
+        .build(
+            vec![(
+                vec![Int],
+                Some(Int),
+                Some(InstanceBody::Unary(UnaryOpKind::Neg)),
+            )],
             &mut instances,
         );
         CompilerTraits {
@@ -339,57 +369,99 @@ impl CompilerTraits {
     }
 }
 
-/// An operator's trait over `operands`, associating `Output` if `output` and reading
-/// `products` by their components, with an instance in `instances` for each of `rows`: the
-/// bases it accepts, and the base it associates as `Output`. Every row has the declaration's
-/// shape.
-fn operator_trait(
-    name: &str,
-    operands: &[&str],
+/// One instance of an operator's trait: the bases it accepts, the base it associates as
+/// `Output` where it associates one, and the primitive its function runs where the trait
+/// declares one.
+type OperatorRow = (Vec<BaseType>, Option<BaseType>, Option<InstanceBody>);
+
+/// An operator's trait, as the compiler declares it.
+struct OperatorTrait<'a> {
+    name: &'a str,
+    operands: &'a [&'a str],
+    /// The function its operator calls, over the trait's operands, whose result is `Output`.
+    function: Option<&'a str>,
+    /// Whether it associates `Output`.
     output: bool,
     products: ProductReading,
-    rows: Vec<(Vec<BaseType>, Option<BaseType>)>,
-    instances: &mut InstanceTable,
-) -> Trait {
-    let trait_ = Trait::compiler(TraitDecl {
-        module: vec![SmolStr::new_static(COMPILER_MODULE)],
-        name: name.into(),
-        span: Span::new(chl_parser::FileId::ROOT, 0, 0),
-        operands: operands.iter().map(|n| TypeParam::declared(*n)).collect(),
-        assocs: if output {
+}
+
+impl OperatorTrait<'_> {
+    /// The trait, with an instance in `instances` for each of `rows`. Every row has the
+    /// declaration's shape, and runs a primitive exactly where the trait declares a function.
+    fn build(self, rows: Vec<OperatorRow>, instances: &mut InstanceTable) -> Trait {
+        let name = self.name;
+        let operands: Vec<Rc<TypeParam>> = self
+            .operands
+            .iter()
+            .map(|n| TypeParam::declared(*n))
+            .collect();
+        let assocs = if self.output {
             vec![(Assoc::Output, TypeParam::declared("Output"))]
         } else {
             Vec::new()
-        },
-        functions: Vec::new(),
-        requires: Vec::new(),
-        named: Vec::new(),
-        products,
-    });
-    for (bases, associated) in rows {
-        assert!(
-            bases.len() == operands.len() && associated.is_some() == output,
-            "every instance of `{name}` has its declaration's shape"
-        );
-        let operands: Vec<Type> = bases.into_iter().map(Type::Base).collect();
-        instances.add(
-            trait_.clone(),
-            Rc::new(TraitInstance {
-                params: Vec::new(),
-                heads: operands.iter().map(InstanceHead::of_pattern).collect(),
-                operands,
-                assoc: associated
-                    .into_iter()
-                    .map(|b| (Assoc::Output, Type::Base(b)))
-                    .collect(),
-                requires: Vec::new(),
-                bounds: Vec::new(),
-                functions: Vec::new(),
-                declared: None,
-            }),
-        );
+        };
+        let operand_types: Vec<Type> = operands.iter().map(|p| Type::Param(Rc::clone(p))).collect();
+        let functions = self
+            .function
+            .map(|f| {
+                let (_, output) = assocs
+                    .first()
+                    .expect("an operator's function returns its trait's `Output`");
+                TraitFunction {
+                    name: f.into(),
+                    signature: Signature {
+                        params: Vec::new(),
+                        inputs: operand_types.clone(),
+                        output: Type::Param(Rc::clone(output)),
+                        requires: Vec::new(),
+                    },
+                }
+            })
+            .into_iter()
+            .collect();
+        let trait_ = Trait::compiler(TraitDecl {
+            module: vec![SmolStr::new_static(COMPILER_MODULE)],
+            name: name.into(),
+            span: Span::new(chl_parser::FileId::ROOT, 0, 0),
+            operands,
+            assocs,
+            functions,
+            requires: Vec::new(),
+            named: Vec::new(),
+            products: self.products,
+        });
+        for (bases, associated, primitive) in rows {
+            assert!(
+                bases.len() == self.operands.len()
+                    && associated.is_some() == self.output
+                    && primitive.is_some() == self.function.is_some(),
+                "every instance of `{name}` has its declaration's shape"
+            );
+            let operands: Vec<Type> = bases.into_iter().map(Type::Base).collect();
+            instances.add(
+                trait_.clone(),
+                Rc::new(TraitInstance {
+                    params: Vec::new(),
+                    heads: operands.iter().map(InstanceHead::of_pattern).collect(),
+                    operands,
+                    assoc: associated
+                        .into_iter()
+                        .map(|b| (Assoc::Output, Type::Base(b)))
+                        .collect(),
+                    requires: Vec::new(),
+                    bounds: Vec::new(),
+                    functions: self
+                        .function
+                        .zip(primitive)
+                        .map(|(f, p)| (SmolStr::from(f), Implementation::Primitive(p)))
+                        .into_iter()
+                        .collect(),
+                    declared: None,
+                }),
+            );
+        }
+        trait_
     }
-    trait_
 }
 
 impl Trait {
@@ -652,8 +724,8 @@ pub struct TraitInstance {
     /// requirements it names, each a parameter among `params` with its bound over `params`,
     /// `m::Output <: Int`: it answers only where each type is below its bound.
     pub bounds: Vec<(Rc<TypeParam>, Type)>,
-    /// The binding each of its functions is lowered to, by the trait function's name.
-    pub functions: Vec<(SmolStr, Name)>,
+    /// How it implements each of its trait's functions, by the function's name.
+    pub functions: Vec<(SmolStr, Implementation)>,
     /// Where a module declares it; `None` for the compiler's.
     pub declared: Option<DeclaredAt>,
 }
@@ -769,12 +841,81 @@ impl TraitInstance {
         })
     }
 
-    /// The binding the function `name` of this instance is lowered to.
-    pub fn implementation(&self, name: &str) -> Option<&Name> {
+    /// How this instance implements its trait's function `name`.
+    pub fn implementation(&self, name: &str) -> Option<&Implementation> {
         self.functions
             .iter()
             .find(|(n, _)| n == name)
-            .map(|(_, binding)| binding)
+            .map(|(_, implementation)| implementation)
+    }
+}
+
+/// How an instance implements one of its trait's functions.
+#[derive(Debug, Clone)]
+pub enum Implementation {
+    /// The function an instance's `def` binds, where its `impl` stands.
+    Binding(Name),
+    /// A compiler instance's primitive operation.
+    Primitive(InstanceBody),
+}
+
+/// The primitive operation a compiler instance's function runs: `Addable`'s `add` is `Add`
+/// at `Int` and `Concat` at `String`.
+#[derive(Debug, Clone, Copy)]
+pub enum InstanceBody {
+    /// Over the function's two parameters.
+    Binary(BinOpKind),
+    /// Over its one parameter.
+    Unary(UnaryOpKind),
+}
+
+impl InstanceBody {
+    /// The function as a term of `ty`, the type its call resolved to: `𝐴 ⇒ 𝑂` for one
+    /// parameter, `{𝐴, 𝐵} ⇒ 𝑂` for two. The parameters are taken out of the tuple by name,
+    /// so each operand the primitive reads is atomic.
+    pub fn build(&self, ty: &Type) -> TypedExpr {
+        let Type::Fun {
+            domain, codomain, ..
+        } = ty.peel_refinements()
+        else {
+            panic!("a trait function resolves to a function type, got {ty}");
+        };
+        let param = Name::fresh("__op");
+        let domain = (**domain).clone();
+        let codomain = (**codomain).clone();
+        let read = |name: &Name, ty: &Type| TypedExpr::var(name.clone()).with_ty(ty.clone());
+        let body = match (self, crate::ccl::ccl_utils::strip_refinements(&domain)) {
+            (InstanceBody::Binary(op), Type::Tuple(parts)) => {
+                let [left, right]: [Type; 2] = parts
+                    .try_into()
+                    .unwrap_or_else(|_| panic!("`{op:?}` is over two operands"));
+                let names = [Name::anf_temp(), Name::anf_temp()];
+                let mut body = TypedExpr::new(TypedExprNode::BinOp {
+                    left: Box::new(read(&names[0], &left)),
+                    op: *op,
+                    right: Box::new(read(&names[1], &right)),
+                })
+                .with_ty(codomain.clone());
+                for (i, (name, part)) in names.iter().zip([left, right]).enumerate().rev() {
+                    let projection = TypedExpr::apply(
+                        read(&param, &domain),
+                        TypedExpr::proj_index(i).with_ty(super::fun(domain.clone(), part.clone())),
+                    )
+                    .with_ty(part);
+                    body = TypedExpr::let_bind(name.clone(), projection, body)
+                        .with_ty(codomain.clone());
+                }
+                body
+            }
+            (InstanceBody::Unary(op), _) => {
+                TypedExpr::new(TypedExprNode::UnaryOp(*op, Box::new(read(&param, &domain))))
+                    .with_ty(codomain)
+            }
+            (InstanceBody::Binary(op), other) => {
+                panic!("`{op:?}` is over a pair of operands, got {other}")
+            }
+        };
+        TypedExpr::lambda(param, domain, body).with_ty(ty.clone())
     }
 }
 
@@ -859,6 +1000,58 @@ pub fn unify_all(a: &[Type], b: &[Type]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| unify(x, y, &mut subst))
 }
 
+/// The trait an operator requires of its operands and the function of it the operator calls
+/// (`docs/chl-spec.md`, "Trait requirements"): `a + b` is `summon(Addable(_, _))::add(a, b)`.
+#[derive(Debug, Clone)]
+pub struct OperatorCall {
+    pub trait_: Trait,
+}
+
+impl OperatorCall {
+    fn new(trait_: Trait) -> OperatorCall {
+        OperatorCall { trait_ }
+    }
+
+    /// The function called, the one its trait declares, or `None` for a comparison, which
+    /// compares by value whichever instance answers, and for `^+`, whose trait declares none.
+    pub fn function(&self) -> Option<&SmolStr> {
+        let functions = self.trait_.functions();
+        debug_assert!(
+            functions.len() <= 1,
+            "an operator calls the one function its trait declares"
+        );
+        functions.first().map(|f| &f.name)
+    }
+
+    /// The call a binary operator makes, or `None` for one with a fixed signature, a
+    /// boolean connective or `++`.
+    pub fn of_binop(op: BinOpKind) -> Option<OperatorCall> {
+        Some(match op {
+            BinOpKind::Arithmetic(kind) => match kind {
+                ArithmeticKind::Add => OperatorCall::new(Trait::addable()),
+                ArithmeticKind::AddRefined => OperatorCall::new(Trait::addable_refined()),
+                ArithmeticKind::Sub => OperatorCall::new(Trait::subtractable()),
+                ArithmeticKind::Mul => OperatorCall::new(Trait::multipliable()),
+                ArithmeticKind::FloorDiv => OperatorCall::new(Trait::divisible()),
+                ArithmeticKind::Pow => OperatorCall::new(Trait::exponentiable()),
+            },
+            BinOpKind::Compare(CompareKind::Equals | CompareKind::NotEquals) => {
+                OperatorCall::new(Trait::equatable())
+            }
+            BinOpKind::Compare(_) => OperatorCall::new(Trait::orderable()),
+            BinOpKind::BoolLogic(_) | BinOpKind::Concat => return None,
+        })
+    }
+
+    /// The call a unary operator makes, or `None` for `not`, whose signature is fixed.
+    pub fn of_unary(op: UnaryOpKind) -> Option<OperatorCall> {
+        match op {
+            UnaryOpKind::Neg => Some(OperatorCall::new(Trait::negatable())),
+            UnaryOpKind::Not => None,
+        }
+    }
+}
+
 /// A function a trait declares: what a call of it is typed by, before any instance is
 /// chosen (`src/ccl/design/type-inference.md`, "Trait functions").
 #[derive(Debug, Clone)]
@@ -919,11 +1112,21 @@ impl InstanceTable {
         self.instances.push((trait_, instance));
     }
 
-    /// The binding each function of a declared instance is lowered to.
-    pub fn declared_bindings(&self) -> impl Iterator<Item = &Name> {
+    /// Whether the program declares an instance of `trait_`.
+    pub fn declares(&self, trait_: &Trait) -> bool {
         self.instances
             .iter()
-            .flat_map(|(_, i)| i.functions.iter().map(|(_, b)| b))
+            .any(|(t, i)| t == trait_ && i.declared.is_some())
+    }
+
+    /// The binding each function of a declared instance is lowered to.
+    pub fn declared_bindings(&self) -> impl Iterator<Item = &Name> {
+        self.instances.iter().flat_map(|(_, i)| {
+            i.functions.iter().filter_map(|(_, f)| match f {
+                Implementation::Binding(b) => Some(b),
+                Implementation::Primitive(_) => None,
+            })
+        })
     }
 
     /// The trait, the declared instance and the name of the trait function whose `def` is
@@ -935,7 +1138,7 @@ impl InstanceTable {
         self.instances.iter().find_map(|(t, i)| {
             i.functions
                 .iter()
-                .find(|(_, b)| b == binding)
+                .find(|(_, b)| matches!(b, Implementation::Binding(b) if b == binding))
                 .map(|(f, _)| (t, i, f))
         })
     }

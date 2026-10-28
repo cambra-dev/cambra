@@ -150,9 +150,8 @@ pub(super) enum PlanningPhase {
     /// site, so it reaches a dependent tuple's key family.
     PairCorrelatedSites,
     /// Constant folding, so a collection literal's elements are values when op conversion
-    /// reads them. It runs after `simplify` because `try_string_add_to_concat` is what
-    /// retargets `String + String` to `Concat`, and the fold dispatches on the operator it is
-    /// handed.
+    /// reads them. The fold dispatches on the operator it is handed, which inference made
+    /// `Concat` for `String + String`.
     FoldConstants,
     /// The iteration walk ([`iterate::insert_iterate_recurse`]). Bottom-up: it builds a
     /// site's `restrict`s and a hash join's keys after walking the site's children, and does
