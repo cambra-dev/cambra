@@ -178,6 +178,10 @@ impl TileOperator for CheckedLookup {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // TODO(pipeline breaker): a pooled chain stops notifying at this operator. The region of
+        // the collection of a split lookup ends here, and the breaker raises its own region to the
+        // dispatcher once a worker has merged a morsel (`docs/parallel-execution.md`, "Pipeline
+        // boundaries"). The serial scheduler still needs the notification passed on below.
         let (source, gate) = match &mut self.source {
             // Two inputs, so both wake the same consumer. The collection is what decides an
             // absence, so when it settles after the keys it is the input that completes the

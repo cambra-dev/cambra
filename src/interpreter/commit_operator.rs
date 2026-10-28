@@ -1812,6 +1812,10 @@ impl TileOperator for CommitOperator {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // TODO(pipeline breaker): a pooled chain stops notifying at this operator. The region of
+        // its writers ends here, and the breaker raises its own region to the dispatcher once a
+        // worker has merged a morsel (`docs/parallel-execution.md`, "Pipeline boundaries"). The
+        // serial scheduler still needs the notification passed on below.
         // Wake this operator's consumer whenever any writer's (live) source
         // delivers a new item: the arrival drives a commit, and that commit must
         // propagate to a downstream reader of a store key or `__to_<defer>` tap (a
@@ -2458,6 +2462,10 @@ impl TileOperator for InductionStore {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // TODO(pipeline breaker): a pooled chain stops notifying at this operator. The region of
+        // its body ends here, and the breaker raises its own region to the dispatcher once a worker
+        // has merged a morsel (`docs/parallel-execution.md`, "Pipeline boundaries"). The serial
+        // scheduler still needs the notification passed on below.
         // Forward body progress to this store's consumer. The body's input is
         // the driver, which forwards the loop source's arrivals, so an async
         // source's incremental delivery reaches a downstream reader and it
@@ -4022,6 +4030,10 @@ impl TileOperator for AsOf {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // TODO(pipeline breaker): a pooled chain stops notifying at this operator. The region of
+        // its trigger and source ends here, and the breaker raises its own region to the dispatcher
+        // once a worker has merged a morsel (`docs/parallel-execution.md`, "Pipeline boundaries").
+        // The serial scheduler still needs the notification passed on below.
         // Both inputs wake the consumer: a new *trigger* position needs a fresh
         // latch, and *source* progress (a new commit) is what lets an
         // already-seen trigger position finally latch a value — and, crucially,
@@ -5022,6 +5034,10 @@ impl TileOperator for InductionDriver {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // TODO(pipeline breaker): a pooled chain stops notifying at this operator. The region of
+        // its inputs ends here, and the breaker raises its own region to the dispatcher once a
+        // worker has merged a morsel (`docs/parallel-execution.md`, "Pipeline boundaries"). The
+        // serial scheduler still needs the notification passed on below.
         let inputs = subscribe_driver_inputs(
             &mut *self.store_op,
             &mut *self.source_op,
@@ -5735,6 +5751,10 @@ impl TileOperator for TransactDriver {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // TODO(pipeline breaker): a pooled chain stops notifying at this operator. The region of
+        // its inputs ends here, and the breaker raises its own region to the dispatcher once a
+        // worker has merged a morsel (`docs/parallel-execution.md`, "Pipeline boundaries"). The
+        // serial scheduler still needs the notification passed on below.
         let inputs = subscribe_driver_inputs(
             &mut *self.store_op,
             &mut *self.source_op,
@@ -6513,6 +6533,10 @@ impl TileOperator for TransactWriter {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // TODO(pipeline breaker): a pooled chain stops notifying at this operator. The region of
+        // its inputs ends here, and the breaker raises its own region to the dispatcher once a
+        // worker has merged a morsel (`docs/parallel-execution.md`, "Pipeline boundaries"). The
+        // serial scheduler still needs the notification passed on below.
         // This writer re-arms nothing itself: the driver owns the transaction
         // source and re-arms while a transaction remains to attempt, which
         // subsumes every continuation this writer could want (an attempt is only

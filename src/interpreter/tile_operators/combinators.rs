@@ -73,6 +73,10 @@ impl TileOperator for Converse {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // TODO(pipeline breaker): a pooled chain stops notifying at this operator. The region of
+        // its input ends here, and the breaker raises its own region to the dispatcher once a
+        // worker has merged a morsel (`docs/parallel-execution.md`, "Pipeline boundaries"). The
+        // serial scheduler still needs the notification passed on below.
         // Beneath standing levels the input's outermost keys are the result's; inverting the
         // outermost collection re-keys.
         let keeps_keys = self.level != CurryLevel::OUTERMOST;

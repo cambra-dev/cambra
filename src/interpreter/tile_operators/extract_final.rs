@@ -111,6 +111,10 @@ impl TileOperator for ExtractFinal {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // TODO(pipeline breaker): a pooled chain stops notifying at this operator. The region of
+        // its source ends here, and the breaker raises its own region to the dispatcher once a
+        // worker has merged a morsel (`docs/parallel-execution.md`, "Pipeline boundaries"). The
+        // serial scheduler still needs the notification passed on below.
         // Both branches need their own notification path: any progress on
         // either side may unblock the consumer (source becoming terminal,
         // default resolving its scalar value).  We give source the shared

@@ -59,6 +59,10 @@ impl TileOperator for Aggregate {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // TODO(pipeline breaker): a pooled chain stops notifying at this operator. The region of
+        // its input ends here, and the breaker raises its own region to the dispatcher once a
+        // worker has merged a morsel (`docs/parallel-execution.md`, "Pipeline boundaries"). The
+        // serial scheduler still needs the notification passed on below.
         let input_producer = self.input.subscribe(
             self.input.tiling().universal_guard(),
             widening(consumer),
@@ -232,6 +236,10 @@ impl TileOperator for ExtractAggregate {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // TODO(pipeline breaker): a pooled chain stops notifying at this operator. The region of
+        // its input ends here, and the breaker raises its own region to the dispatcher once a
+        // worker has merged a morsel (`docs/parallel-execution.md`, "Pipeline boundaries"). The
+        // serial scheduler still needs the notification passed on below.
         Box::new(ExtractAggregateProducer {
             base: ProducerBase::new(
                 ExtractAggregateProducer::alloc_id(),
@@ -371,6 +379,10 @@ impl TileOperator for MapExtractAggregate {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // TODO(pipeline breaker): a pooled chain stops notifying at this operator. The region of
+        // its input ends here, and the breaker raises its own region to the dispatcher once a
+        // worker has merged a morsel (`docs/parallel-execution.md`, "Pipeline boundaries"). The
+        // serial scheduler still needs the notification passed on below.
         // The groups keep the input's outermost keys.
         let input_producer = self.input.subscribe(
             self.input.tiling().universal_guard(),
@@ -637,6 +649,10 @@ impl TileOperator for MapAggregate {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // TODO(pipeline breaker): a pooled chain stops notifying at this operator. The region of
+        // its input ends here, and the breaker raises its own region to the dispatcher once a
+        // worker has merged a morsel (`docs/parallel-execution.md`, "Pipeline boundaries"). The
+        // serial scheduler still needs the notification passed on below.
         // The groups keep the input's outermost keys.
         let input_producer = self.input.subscribe(
             self.input.tiling().universal_guard(),
