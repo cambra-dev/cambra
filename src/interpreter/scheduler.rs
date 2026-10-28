@@ -1392,6 +1392,37 @@ mod tests {
         assert!(scheduler.wakeups.is_empty());
     }
 
+    /// After a pull resets the gate, a region outside what passed before it passes, and one inside
+    /// what passed since is suppressed.
+    #[test]
+    fn a_pull_leaves_the_gate_holding_nothing() {
+        let gate = Notified::clear();
+        assert!(gate.mark_news_of(&keys(1, 4)));
+        assert!(gate.take());
+        assert!(gate.mark_news_of(&keys(6, 6)));
+        assert!(gate.mark_news_of(&keys(2, 3)));
+        assert!(!gate.mark_news_of(&keys(6, 6)));
+    }
+
+    /// The two interleavings of a lock-free reader with a pull, as the cases they reduce to. A
+    /// reader that saw `everything` before the pull began is suppressed, which loses nothing: the
+    /// pull reads after it, and the data that notification announced was written before it. One
+    /// that comes after the pull's critical section passes.
+    #[test]
+    fn a_notification_before_a_pull_is_suppressed_and_one_after_it_passes() {
+        let gate = Notified::clear();
+        assert!(gate.mark_news_of(&Projection::Everything));
+        assert!(!gate.mark_news_of(&Projection::Everything));
+        assert!(gate.take());
+        assert!(gate.mark_news_of(&Projection::Everything));
+        assert!(gate.take());
+        assert!(
+            !gate.take(),
+            "a pull of a gate that is clear has nothing to reset"
+        );
+        assert!(gate.mark_news_of(&keys(1, 2)));
+    }
+
     /// A pull that answers what the last one did but queues a wakeup is not quiescence: the
     /// wakeup is delivered by the next lap, and the producer it wakes answers anew.
     #[test]

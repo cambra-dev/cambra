@@ -436,6 +436,25 @@ struct GateHeld {
     pending: Projection,
 }
 
+impl GateState {
+    /// Check, in debug builds, the state every critical section ends in: `set` is clear exactly
+    /// where nothing is held, and `everything` is set exactly where everything is.
+    fn check_at_rest(&self, held: &GateHeld) {
+        debug_assert_eq!(
+            self.set.load(Ordering::Relaxed),
+            held.passed != Projection::Nothing,
+            "a gate's flag and its held region disagree: {:?}",
+            held.passed
+        );
+        debug_assert_eq!(
+            self.everything.load(Ordering::Relaxed),
+            held.passed == Projection::Everything,
+            "a gate's everything flag and its held region disagree: {:?}",
+            held.passed
+        );
+    }
+}
+
 impl Notified {
     /// A [`Flag`](Self::Flag) starting set, so the first pull can read before a notification.
     pub fn flag() -> Self {
@@ -474,6 +493,7 @@ impl Notified {
                     return false;
                 }
                 let mut held = gate.held.lock().expect("a gate's region is never poisoned");
+                gate.check_at_rest(&held);
                 let passed = &mut held.passed;
                 if gate.set.load(Ordering::Acquire) && region.contained_in(passed) {
                     return false;
@@ -532,6 +552,7 @@ impl Notified {
             Self::Flag(c) => c.load(Ordering::Acquire),
             Self::Gate(gate) => {
                 let held = gate.held.lock().expect("a gate's region is never poisoned");
+                gate.check_at_rest(&held);
                 gate.set.load(Ordering::Acquire) && region.contained_in(&held.passed)
             }
         }
@@ -559,18 +580,26 @@ impl Notified {
 
     /// Read and clear. `Always` reads set and stays set. A gate also forgets the region it held.
     ///
-    /// A gate's pull begins here, and a notification that arrives after it began passes. The
-    /// order is what makes that so: the lock is taken first, and `everything` is cleared before
-    /// `set`, so a lock-free reader that still sees `everything` read it before the pull began,
-    /// and a notification that comes later finds it clear and waits on the lock, which is
-    /// released only after the region is reset, and then sees `set` clear and passes. `Release`
-    /// stores pair with the `Acquire` loads in [`Self::mark_news_of`]; the lock orders the rest.
+    /// A gate's pull begins here. Whenever the lock is free, `set` is clear exactly where the
+    /// region held is `Nothing`, and `everything` is set exactly where it is `Everything`: every
+    /// critical section ends in that state. So a pull that finds `set` clear has nothing to reset
+    /// and returns without the lock, and one that finds it set clears `everything` before `set`
+    /// and resets the region before it releases the lock, so a notification that takes the lock
+    /// afterwards finds the gate clear and passes. A notification that read `everything` before
+    /// the pull began is suppressed, which loses nothing: the pull reads after this returns, so
+    /// it reads the data that notification announced. What orders that read after the write is
+    /// the data's own synchronization, the producer's mutex in production, and not the atomics
+    /// here.
     pub fn take(&self) -> bool {
         match self {
             Self::Always => true,
             Self::Flag(c) => c.swap(false, Ordering::AcqRel),
             Self::Gate(gate) => {
+                if !gate.set.load(Ordering::Acquire) {
+                    return false;
+                }
                 let mut held = gate.held.lock().expect("a gate's region is never poisoned");
+                gate.check_at_rest(&held);
                 gate.everything.store(false, Ordering::Release);
                 let was_set = gate.set.swap(false, Ordering::AcqRel);
                 held.passed = Projection::Nothing;
