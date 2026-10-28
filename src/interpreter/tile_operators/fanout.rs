@@ -214,7 +214,7 @@ impl Consumer for FanOutInput {
                 .collect::<Vec<_>>()
         };
         for c in &consumers {
-            c.lock_now().notify(arrived);
+            c.lock_now().notify(&arrived.keys_only());
         }
     }
 }

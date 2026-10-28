@@ -204,7 +204,7 @@ impl TileOperator for CheckedLookup {
                     pairs.tiling().universal_guard(),
                     // The pairs are pulled at the projection, and each answer sits at its
                     // row's position.
-                    consumer,
+                    keys_only(consumer),
                     scheduler,
                 )),
                 None,

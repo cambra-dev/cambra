@@ -34,7 +34,7 @@ use crate::{
     interpreter::value_probe::ProbeSlot,
     interpreter::{
         ColumnValue, Consumer, Extent, Gate, GatedConsumer, Projection, Scheduler, Value,
-        forwarding_consumer, forwarding_consumer_keeping_keys, validate_tile, widening,
+        forwarding_consumer, forwarding_consumer_keeping_keys, keys_only, validate_tile, widening,
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -280,7 +280,7 @@ pub(crate) fn consumer_keeping_keys_if(
     consumer: Box<dyn Consumer>,
 ) -> Box<dyn Consumer> {
     match keeps_keys {
-        true => consumer,
+        true => keys_only(consumer),
         false => widening(consumer),
     }
 }

@@ -820,3 +820,85 @@ fn a_chain_over_a_source_forwards_the_region_an_arrival_names() {
     }
     assert!(regions.lock_now().is_empty(), "one notification each");
 }
+
+/// An operator by name, the builder of it, and the input a test notifies through.
+type Keeper = (&'static str, Box<dyn Fn() -> Built>, usize);
+
+fn map_result() -> Built {
+    let positions =
+        Tiling::data_function(Extent::uint_range(8), Tiling::Scalar(Extent::uint_range(8)));
+    let (input, data) = feed(positions);
+    let (function, table) = feed(ints());
+    let op = MapResult::new_at(input, function, CurryLevel::new(1));
+    (Box::new(op), vec![data, table])
+}
+
+/// A region of fields names a change inside a record. An operator that keeps its input's keys has
+/// no field of its own to place it in, so it sends `Everything`: what a pulled-up region of keys
+/// would name there is not the record's field.
+#[test]
+fn every_operator_that_keeps_keys_widens_a_region_of_fields() {
+    let fields = Projection::fields([(SmolStr::new("a"), region())]);
+    let keepers: Vec<Keeper> = vec![
+        ("RecordWrap", Box::new(record_wrap), 0),
+        ("MapDomain", Box::new(map_domain), 0),
+        ("Restrict", Box::new(restrict), 0),
+        ("MapResultWithSource", Box::new(map_result_with_source), 0),
+        ("MapAggregate", Box::new(map_aggregate), 0),
+        ("MapExtractAggregate", Box::new(extract_over_a_feed), 0),
+        ("Memo", Box::new(memo), 0),
+        ("Zip arm 0", Box::new(zip), 0),
+        ("Zip arm 1", Box::new(zip), 1),
+        ("Product outer", Box::new(product), 0),
+        ("Product inner", Box::new(product), 1),
+        ("flat union", Box::new(|| union(true)), 1),
+        ("CheckedLookup keys", Box::new(lookup_of_a_stream), 1),
+        ("paired CheckedLookup", Box::new(paired_lookup), 0),
+        ("Filter input", Box::new(|| filter(bools())), 0),
+        ("Filter predicate", Box::new(|| filter(bools())), 1),
+        ("MapResult input", Box::new(map_result), 0),
+        ("MapResultToConst", Box::new(beneath_a_level), 0),
+        ("SelectField of a stream", Box::new(a_stream_of_records), 0),
+        ("VariantWrap", Box::new(wrapped_stream), 0),
+        (
+            "VariantProject",
+            Box::new(|| variant_project(union_stream())),
+            0,
+        ),
+        ("VariantIs", Box::new(|| variant_is(union_stream())), 0),
+        (
+            "Converse beneath a level",
+            Box::new(|| converse(CurryLevel::new(1))),
+            0,
+        ),
+        (
+            "Uncurry beneath a level",
+            Box::new(|| uncurry(CurryLevel::new(1))),
+            0,
+        ),
+        ("FanOutSlot", Box::new(fan_out_slot_over_a_feed), 0),
+    ];
+    for (name, build, input) in &keepers {
+        assert_eq!(
+            received(&**build, *input, &fields),
+            [Projection::Everything],
+            "{name}"
+        );
+    }
+}
+
+fn fan_out_slot_over_a_feed() -> Built {
+    let (input, consumer) = feed(ints());
+    (FanOut::new(input).slot(), vec![consumer])
+}
+
+/// A `MapExtractAggregate` read straight from a feed of what a `MapAggregate` answers, so that the
+/// fold beneath it does not widen for it.
+fn extract_over_a_feed() -> Built {
+    let fold_tiling = MapAggregate::new(feed(nested()).0, crate::ccl::AggregateKind::Sum)
+        .tiling()
+        .clone();
+    let (input, consumer) = feed(fold_tiling);
+    let op = MapExtractAggregate::new(input, crate::ccl::AggregateKind::Sum);
+    (Box::new(op), vec![consumer])
+}

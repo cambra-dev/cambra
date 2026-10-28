@@ -164,6 +164,28 @@ pub fn widening(consumer: Box<dyn Consumer>) -> Box<dyn Consumer> {
 
 struct Widening(Box<dyn Consumer>);
 
+/// `consumer` behind a consumer that sends [`Projection::Everything`] for a region of fields and
+/// any other region as it is.
+///
+/// An operator that keeps its input's keys passes this to its input: a region of fields names a
+/// change inside a record, which only an operator that routes by field can place in its own
+/// output, and the keys of the operator's output are not the fields of its input.
+pub fn keys_only(consumer: Box<dyn Consumer>) -> Box<dyn Consumer> {
+    Box::new(KeysOnly(consumer))
+}
+
+struct KeysOnly(Box<dyn Consumer>);
+
+impl Consumer for KeysOnly {
+    fn notify(&mut self, arrived: &Projection) {
+        self.0.notify(&arrived.keys_only());
+    }
+
+    fn region_driven(&self) -> bool {
+        self.0.region_driven()
+    }
+}
+
 impl Consumer for Widening {
     fn notify(&mut self, _arrived: &Projection) {
         self.0.notify(&Projection::Everything);
@@ -188,12 +210,11 @@ impl Consumer for Forwarding {
             gate,
             region_driven,
         } = &self.gated;
-        let everything = Projection::Everything;
-        let region = if self.keeps_keys {
-            arrived
-        } else {
-            &everything
+        let region = match self.keeps_keys {
+            true => arrived.keys_only(),
+            false => Projection::Everything,
         };
+        let region = &region;
         // Dropping or deferring the notification of a consumer that never pulls would lose its
         // region, so the forwarder waits for the cell. The notification graph of a region-driven
         // chain is acyclic, so a cascade does not reach one cell twice, and a cell downstream of a
@@ -790,6 +811,49 @@ mod tests {
             *regions.lock_now(),
             [Projection::Everything, Projection::Everything]
         );
+    }
+
+    fn fields_of(region: Projection) -> Projection {
+        Projection::fields([(smol_str::SmolStr::new("a"), region)])
+    }
+
+    /// A region of fields becomes everything where an operator keeps its input's keys, and any
+    /// other region passes.
+    #[test]
+    fn keys_only_widens_a_region_of_fields_and_passes_any_other() {
+        let (log, regions) = RegionLog::new(true);
+        let mut consumer = keys_only(Box::new(log));
+        let sent = [
+            fields_of(keys(2, 4)),
+            keys(2, 4),
+            Projection::Everything,
+            fields_of(Projection::Everything),
+        ];
+        for region in &sent {
+            consumer.notify(region);
+        }
+        assert_eq!(
+            *regions.lock_now(),
+            [
+                Projection::Everything,
+                keys(2, 4),
+                Projection::Everything,
+                Projection::Everything
+            ]
+        );
+    }
+
+    /// A forwarder that keeps keys widens a region of fields, and one that does not widens
+    /// everything.
+    #[test]
+    fn a_forwarder_that_keeps_keys_widens_a_region_of_fields() {
+        let (log, regions) = RegionLog::new(true);
+        let (gated, gate) = shared_consumer(Box::new(log));
+        let wakeups = WakeupQueue::default();
+        forwarding_consumer_keeping_keys(&gated, &wakeups).notify(&fields_of(keys(2, 4)));
+        assert!(gate.0.take());
+        forwarding_consumer_keeping_keys(&gated, &wakeups).notify(&keys(2, 4));
+        assert_eq!(*regions.lock_now(), [Projection::Everything, keys(2, 4)]);
     }
 
     /// A forwarder that keeps keys passes each region on as it is, `Everything` included, and

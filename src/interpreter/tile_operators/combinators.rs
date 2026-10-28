@@ -468,9 +468,11 @@ impl TileOperator for MapDomain {
                 &self.base,
                 scheduler,
             ),
-            input: self
-                .input
-                .subscribe(self.tiling().universal_guard(), consumer, scheduler),
+            input: self.input.subscribe(
+                self.tiling().universal_guard(),
+                keys_only(consumer),
+                scheduler,
+            ),
             level: self.level,
         })
     }
@@ -1184,7 +1186,7 @@ impl TileOperator for Restrict {
         // The restricted domain is the predicate's keys that pass, so a region of them is a region of the result's.
         let predicate_producer = self.predicate.subscribe(
             self.predicate.tiling().universal_guard(),
-            consumer,
+            keys_only(consumer),
             scheduler,
         );
         Box::new(RestrictProducer {

@@ -143,6 +143,15 @@ impl Projection {
         }
     }
 
+    /// This region for an operator that keeps its input's keys: a region of fields, which names
+    /// a change inside a record, becomes [`Everything`](Self::Everything).
+    pub fn keys_only(&self) -> Projection {
+        match self {
+            Projection::Fields(_) => Projection::Everything,
+            other => other.clone(),
+        }
+    }
+
     /// The regions of the fields `entries` name, with a `Nothing` region dropped and no entry
     /// at all being `Nothing`.
     ///
