@@ -73,26 +73,6 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ("nested_mut_source", "map_arrow", "CompilerPanics"),
     ("nested_mut_source", "map_lit", "CompilerPanics"),
     ("nested_mut_source", "union", "CompilerRejects"),
-    (
-        "nominal_key_groupby",
-        "binder_in_comp_filter[x]",
-        "CompilerPanics",
-    ),
-    (
-        "nominal_key_groupby",
-        "binder_in_corr_filter[x]",
-        "CompilerPanics",
-    ),
-    (
-        "nominal_key_join",
-        "binder_in_comp_filter[x]",
-        "CompilerPanics",
-    ),
-    (
-        "nominal_key_join",
-        "binder_in_corr_filter[x]",
-        "CompilerPanics",
-    ),
     ("nominal_key_join", "rows_sum", "CompilerPanics"),
     ("record_in_list", "comp_sum", "CompilerRejects"),
     ("record_in_list", "filtered_sum", "CompilerRejects"),

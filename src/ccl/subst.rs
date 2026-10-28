@@ -103,7 +103,8 @@ use crate::ccl::{Branch, Name, PredicateId, Type, TypedBinding, TypedExpr, Typed
 pub type Binder = Name;
 
 /// A single mapping target: a **rename** to another binder (invertible) or a
-/// **discharge** to a term (one-way).
+/// **discharge** to a term (one-way), held built or **deferred**: a discharge whose later
+/// substitution is not yet applied.
 ///
 /// The variant is the morphism's *species*, assigned at construction —
 /// provenance, not target shape reconstructed by inspecting terms. This is
@@ -132,6 +133,12 @@ pub enum Mapping {
     /// map to a new `Rc` per payload instead. See the vault's
     /// `freshening-clone-report`.
     Discharge(Box<TypedExpr>),
+    /// `binder ↦ σ(term)`, with `σ` not yet applied: a discharge composed with a later
+    /// substitution ([`Subst::then`]). Applying `σ` into the term at composition copies
+    /// every definiens it reaches into it, and a chain of `let`s whose definientia read the
+    /// binders before them, each twice, doubles the term at every link. Deferred, the term
+    /// and `σ` are shared, and the composite is built only where an occurrence is filled.
+    Deferred(Rc<TypedExpr>, Rc<Subst>),
 }
 
 /// What a substitution does to a **witness** binder — the witness-sort counterpart of
@@ -167,6 +174,7 @@ impl Clone for Mapping {
         match self {
             Mapping::Rename(b) => Mapping::Rename(b.clone()),
             Mapping::Discharge(t) => Mapping::Discharge(Box::new(t.clone_preserving_ids())),
+            Mapping::Deferred(t, under) => Mapping::Deferred(Rc::clone(t), Rc::clone(under)),
         }
     }
 }
@@ -187,21 +195,53 @@ fn assert_preserves_typedness(replacement: &TypedExpr, occurrence_ty: &Type) {
 }
 
 impl Mapping {
+    /// The variable this mapping sends its binder to, when it sends it to a bare variable:
+    /// a rename's target, or a discharge whose term is a variable. A deferred discharge is
+    /// read without building its term: a variable under `σ` is wherever `σ` sends it.
+    fn var_target(&self) -> Option<Binder> {
+        match self {
+            Mapping::Rename(to) => Some(to.clone()),
+            Mapping::Discharge(t) => match &t.node {
+                TypedExprNode::Var(n) => Some(n.clone()),
+                _ => None,
+            },
+            Mapping::Deferred(t, under) => match &t.node {
+                TypedExprNode::Var(n) => match under.binders.get(n) {
+                    None => Some(n.clone()),
+                    Some(m) => m.var_target(),
+                },
+                _ => None,
+            },
+        }
+    }
+
+    /// The term a discharge replaces its binder with, built where it is deferred.
+    fn discharged_term(&self) -> Cow<'_, TypedExpr> {
+        match self {
+            Mapping::Discharge(t) => Cow::Borrowed(t),
+            Mapping::Deferred(t, under) => Cow::Owned(under.apply_expr(t)),
+            Mapping::Rename(_) => unreachable!("a rename discharges nothing"),
+        }
+    }
+
     /// Materialize a replacement with ordinary fresh expression IDs.
     /// Rename retains the occurrence type; Discharge clones the template's type
-    /// and value. The typedness assertion applies to either result.
+    /// and value, and Deferred the template's under its later substitution. The
+    /// typedness assertion applies to every result.
     fn as_expr(&self, occurrence_ty: &Type) -> TypedExpr {
         let out = match self {
             // A renamed occurrence retains its type, including inside predicates.
             Mapping::Rename(to) => TypedExpr::var(to.clone()).with_ty(occurrence_ty.clone()),
             Mapping::Discharge(t) => (**t).clone(),
+            Mapping::Deferred(t, under) => under.apply_expr(t),
         };
         assert_preserves_typedness(&out, occurrence_ty);
         out
     }
 
     /// Materialize at the replaced occurrence's root ID. Rename constructs directly
-    /// at that ID; Discharge uses clone_at and freshens the interior.
+    /// at that ID; Discharge uses clone_at and freshens the interior, and Deferred roots
+    /// the term it builds there.
     /// The root therefore retains use-site attribution without an unused root mint.
     fn as_expr_preserving(&self, node_id: NodeId, occurrence_ty: &Type) -> TypedExpr {
         let out = match self {
@@ -209,6 +249,7 @@ impl Mapping {
             Mapping::Rename(to) => TypedExpr::preserve(node_id, TypedExprNode::Var(to.clone()))
                 .with_ty(occurrence_ty.clone()),
             Mapping::Discharge(t) => t.clone_at(node_id),
+            Mapping::Deferred(t, under) => under.apply_expr(t).rooted_at(node_id),
         };
         assert_preserves_typedness(&out, occurrence_ty);
         out
@@ -438,6 +479,7 @@ impl Subst {
                     out.insert(to.clone());
                 }
                 Some(Mapping::Discharge(t)) => out.extend(expr_free_vars(t)),
+                Some(Mapping::Deferred(t, under)) => out.extend(under.image_of(&expr_free_vars(t))),
                 None => {
                     out.insert(n.clone());
                 }
@@ -454,8 +496,19 @@ impl Subst {
     /// `freshen_above`'s bound-copying arm.
     pub fn for_each_discharge_term_mut(&mut self, f: &mut impl FnMut(&mut TypedExpr)) {
         for m in self.binders.values_mut() {
-            if let Mapping::Discharge(t) = m {
-                f(t);
+            match m {
+                Mapping::Discharge(t) => f(t),
+                // A new `Rc` per payload rather than `Rc::make_mut`: the payload is shared
+                // with the substitution it was copied from, and `TypedExpr`'s `Clone`
+                // freshens, so a copy-on-write would freshen at every visit.
+                Mapping::Deferred(t, under) => {
+                    let mut term = t.clone_preserving_ids();
+                    f(&mut term);
+                    let mut composed = (**under).clone();
+                    composed.for_each_discharge_term_mut(f);
+                    *m = Mapping::Deferred(Rc::new(term), Rc::new(composed));
+                }
+                Mapping::Rename(_) => {}
             }
         }
     }
@@ -507,7 +560,20 @@ impl Subst {
                             (Mapping::Discharge(a), Mapping::Discharge(b)) => {
                                 crate::ccl::eq_term_modulo_ty_slots(a, b)
                             }
-                            _ => false,
+                            (Mapping::Rename(_), _) | (_, Mapping::Rename(_)) => false,
+                            (Mapping::Deferred(a, ua), Mapping::Deferred(b, ub))
+                                if crate::ccl::eq_term_modulo_ty_slots(a, b)
+                                    && (Rc::ptr_eq(ua, ub) || ua.eq_modulo_ty_slots(ub)) =>
+                            {
+                                true
+                            }
+                            // A deferred discharge denotes the term it builds, and one
+                            // built eagerly, or deferred at another split, is the same
+                            // mapping where the terms agree.
+                            _ => crate::ccl::eq_term_modulo_ty_slots(
+                                &va.discharged_term(),
+                                &vb.discharged_term(),
+                            ),
                         }
                 })
     }
@@ -518,6 +584,26 @@ impl Subst {
         self.binders.values().any(|m| match m {
             Mapping::Rename(to) => to == name,
             Mapping::Discharge(t) => is_free(name, t),
+            Mapping::Deferred(t, under) => under.image_of(&expr_free_vars(t)).contains(name),
+        })
+    }
+
+    /// The part of this substitution that acts on a term whose free names are `names`: its
+    /// entries for those names, and its witness mappings. `None` when that part is the
+    /// identity, so the term is its own image.
+    fn acting_on(&self, names: &BTreeSet<Binder>) -> Option<Subst> {
+        let binders: BTreeMap<Binder, Mapping> = self
+            .binders
+            .iter()
+            .filter(|(k, _)| names.contains(*k))
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        if binders.is_empty() && self.witnesses.is_empty() {
+            return None;
+        }
+        Some(Subst {
+            binders,
+            witnesses: self.witnesses.clone(),
         })
     }
 
@@ -561,7 +647,18 @@ impl Subst {
                     Some(mb) => mb.clone(),
                     None => Mapping::Rename(to.clone()),
                 },
-                Some(Mapping::Discharge(t)) => Mapping::Discharge(Box::new(b.apply_expr(t))),
+                Some(Mapping::Discharge(t)) => match b.acting_on(&expr_free_vars(t)) {
+                    None => Mapping::Discharge(Box::new(t.clone_preserving_ids())),
+                    Some(under) => {
+                        Mapping::Deferred(Rc::new(t.clone_preserving_ids()), Rc::new(under))
+                    }
+                },
+                Some(Mapping::Deferred(t, under)) => {
+                    match Subst::then(under, b).acting_on(&expr_free_vars(t)) {
+                        None => Mapping::Discharge(Box::new(t.clone_preserving_ids())),
+                        Some(composed) => Mapping::Deferred(Rc::clone(t), Rc::new(composed)),
+                    }
+                }
                 None => match b.binders.get(&k) {
                     Some(mb) => mb.clone(),
                     None => continue,
@@ -572,6 +669,7 @@ impl Subst {
             let is_identity = match &composed {
                 Mapping::Rename(to) => *to == k,
                 Mapping::Discharge(t) => is_var_named(t, &k),
+                Mapping::Deferred(..) => composed.var_target().is_some_and(|n| n == k),
             };
             if !is_identity {
                 m.insert(k, composed);
@@ -645,9 +743,9 @@ impl Subst {
             .iter()
             .map(|(k, v)| {
                 let v = match v {
-                    Mapping::Discharge(t) => match &t.node {
-                        TypedExprNode::Var(n) => Mapping::Rename(n.clone()),
-                        _ => v.clone(),
+                    Mapping::Discharge(_) | Mapping::Deferred(..) => match v.var_target() {
+                        Some(n) => Mapping::Rename(n),
+                        None => v.clone(),
                     },
                     Mapping::Rename(_) => v.clone(),
                 };
@@ -943,13 +1041,7 @@ impl Subst {
     /// the in-place mode visit every name occurrence in the tree without a
     /// [`Name`] clone per node.
     fn retarget(&self, name: &Name) -> Option<Name> {
-        match self.binders.get(name)? {
-            Mapping::Rename(to) => Some(to.clone()),
-            Mapping::Discharge(t) => match &t.node {
-                TypedExprNode::Var(n) => Some(n.clone()),
-                _ => None,
-            },
-        }
+        self.binders.get(name)?.var_target()
     }
 
     /// The handle-rename half of [`Self::apply_handle_use`], shared with the
@@ -1391,7 +1483,7 @@ impl Subst {
         // `check_scope_valid` debug walk.
         #[cfg(debug_assertions)]
         for (b, m) in &self.binders {
-            if matches!(m, Mapping::Discharge(_)) {
+            if matches!(m, Mapping::Discharge(_) | Mapping::Deferred(..)) {
                 debug_assert!(
                     !is_free(b, &new_pred),
                     "discharged binder `{b}` still free after substitution into predicate",
@@ -2704,6 +2796,41 @@ mod tests {
         assert_eq!(abc, abc2); // associative
         // [k↦x];[x↦z];[z↦5] sends k ↦ 5
         assert_eq!(abc.apply_expr(&var("k")), int(5));
+    }
+
+    /// Composing a discharge with a later one that acts on its term keeps the term and the
+    /// later substitution side by side, and builds their composite where it is read.
+    #[test]
+    fn a_composed_discharge_is_built_where_it_is_read() {
+        let pair = |n: &str| TypedExpr::tuple(vec![var(n), var(n)]);
+        let composed = Subst::then(
+            &Subst::discharge("c2", pair("c1")),
+            &Subst::discharge("c1", pair("c0")),
+        );
+        assert!(matches!(
+            composed.binders.get(&Name::from("c2")),
+            Some(Mapping::Deferred(..))
+        ));
+        assert_eq!(
+            composed.apply_expr(&var("c2")),
+            TypedExpr::tuple(vec![pair("c0"), pair("c0")])
+        );
+        // It is the mapping a discharge of the built term is.
+        let built = Subst::then(
+            &Subst::discharge("c2", TypedExpr::tuple(vec![pair("c0"), pair("c0")])),
+            &Subst::discharge("c1", pair("c0")),
+        );
+        assert!(composed.eq_modulo_ty_slots(&built));
+        assert!(built.eq_modulo_ty_slots(&composed));
+        // A later substitution that does not act on the term leaves it a plain discharge.
+        let untouched = Subst::then(
+            &Subst::discharge("c2", pair("c1")),
+            &Subst::discharge("other", int(1)),
+        );
+        assert!(matches!(
+            untouched.binders.get(&Name::from("c2")),
+            Some(Mapping::Discharge(_))
+        ));
     }
 
     // The identity substitution is a perfect structural no-op.

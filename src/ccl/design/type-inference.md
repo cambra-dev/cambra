@@ -1920,8 +1920,14 @@ sharing is a separate contract described under
 
 ### Substitution and bound transport
 
-For term binders, `Subst` stores `Mapping::Rename` and `Mapping::Discharge`. A rename replaces a
-name; a discharge replaces it with a typed expression. The same infrastructure also has witness
+For term binders, `Subst` stores `Mapping::Rename`, `Mapping::Discharge` and `Mapping::Deferred`. A
+rename replaces a name; a discharge replaces it with a typed expression. A deferred mapping is a
+discharge whose later substitution is not yet applied: `Subst::then` composes a discharge with a
+later substitution that acts on its term's free names by keeping the term and that substitution,
+both shared, and the composite term is built only where an occurrence is filled. Built at
+composition, a chain of `let`s whose definientia each read the binder before twice doubles the
+term at every link. A deferred mapping and a discharge of the term it builds are one mapping, and
+`Subst::eq_modulo_ty_slots` compares them by that term. The same infrastructure also has witness
 mappings, but term substitution does not freshen `InferVar` identities.
 
 `apply_expr` and `apply_type` return transported structures. `rewrite_expr` rewrites an owned term
@@ -1929,8 +1935,8 @@ in place. Both reach type slots and type-borne predicates, respect binders, and 
 An unchanged predicate can retain its allocation. A returned expression copy is not necessarily an
 allocation or `NodeId` no-op: expression-copy identity follows the provenance rules.
 
-`Mapping::as_expr` gives a renamed variable the replaced occurrence's type and copies a discharge's
-typed argument. The in-place variant preserves the replacement root's occurrence identity.
+`Mapping::as_expr` gives a renamed variable the replaced occurrence's type, copies a discharge's
+typed argument, and builds a deferred mapping's term. The in-place variant preserves the replacement root's occurrence identity.
 Substitution must not discard type information merely because it changes the referenced name.
 Predicate interiors can subsequently be coalesced; they are not excluded from the type-slot walk.
 
