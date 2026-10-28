@@ -189,11 +189,10 @@ impl TileOperator for RecordWrap {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let input = self.input.subscribe(
-            self.input.tiling().universal_guard(),
-            widening(consumer),
-            scheduler,
-        );
+        // The input is pulled at the projection.
+        let input =
+            self.input
+                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(RecordWrapProducer {
             base: ProducerBase::new(
                 RecordWrapProducer::alloc_id(),
