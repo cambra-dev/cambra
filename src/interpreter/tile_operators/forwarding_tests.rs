@@ -288,6 +288,43 @@ fn a_lookup_of_one_key_sends_everything_for_any_region() {
     assert_widens(&one_key, 1);
 }
 
+/// The pairs are one stream, and each answer sits at its row's position.
+fn paired_lookup() -> Built {
+    let pairs = Tiling::data_function(
+        Extent::uint_range(8),
+        Tiling::Record(
+            [
+                (
+                    crate::interpreter::tuple_field(0),
+                    Tiling::Scalar(Extent::Function {
+                        domain: Box::new(Extent::Base(BaseType::UInt)),
+                        codomain: Box::new(int()),
+                    }),
+                ),
+                (
+                    crate::interpreter::tuple_field(1),
+                    Tiling::Scalar(Extent::Base(BaseType::UInt)),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    );
+    let (input, consumer) = feed(pairs);
+    let op = CheckedLookup::paired(input, int()).expect("a stream of pairs");
+    (Box::new(op), vec![consumer])
+}
+
+#[test]
+fn a_paired_lookup_forwards_the_region_of_its_rows() {
+    assert_keeps(&paired_lookup, 0);
+}
+
+#[test]
+fn a_paired_lookup_carries_no_region_between_notifications() {
+    assert_keeps_without_state(&paired_lookup, 0);
+}
+
 fn filter(predicate: Tiling) -> Built {
     let (input, data) = feed(ints());
     let (predicate, mask) = feed(predicate);
