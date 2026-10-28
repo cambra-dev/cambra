@@ -204,7 +204,9 @@ impl TileOperator for CheckedLookup {
             LookupSource::Paired(pairs) => (
                 ProducerSource::Paired(pairs.subscribe(
                     pairs.tiling().universal_guard(),
-                    widening(consumer),
+                    // The pairs are pulled at the projection, and each answer sits at its
+                    // row's position.
+                    consumer,
                     scheduler,
                 )),
                 None,
