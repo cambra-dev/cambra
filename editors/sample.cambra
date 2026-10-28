@@ -9,10 +9,10 @@ run storefront as us
 param region: String = "us"
 const param ceiling: Int = 10
 
-pub def quote(item, qty) => Int requires Transaction:
+pub def quote(item, qty) => Int requires Context except ObserveWorld causes only RunTransaction:
     return this::price(item) * qty
 
-bigger: forall (T <: {at: Int}) {T, T} => T = larger
+bigger: forall (T <: {at: Int}) {T, T} => T causes nothing = larger
 first: forall (A, T <: {A, ..}) T => A = head
 
 reqs, resps = http_serve(8080, 'GET', "/count")

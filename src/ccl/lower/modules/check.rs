@@ -298,6 +298,7 @@ impl<'a> ProgramLowering<'a> {
         self.checking = false;
         let scope = use_names(&lowered.scope, qualified);
         let mut chain = uniquify::run_in(chain, &raw_scope(&scope), None);
+        resolve_owners(&mut chain, &RunPath::default(), &lowered.scope, &modules);
         // Each of the module's own `const` parameters reads a value known only by its type,
         // bound just above it, which the parameter stands for in every predicate and which
         // a read of it is known to be ([`settle_const_params`]). The parameter's own `let`

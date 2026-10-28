@@ -593,6 +593,7 @@ fn lower_for_body_stmts_scoped(
                 params,
                 output,
                 requires,
+                causes,
                 body: fn_body,
             } => {
                 let name_str = name.node.as_str().to_string();
@@ -605,6 +606,7 @@ fn lower_for_body_stmts_scoped(
                     params,
                     output.as_ref(),
                     requires,
+                    causes,
                     fn_body,
                     ctx,
                 )?;

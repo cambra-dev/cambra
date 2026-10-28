@@ -138,7 +138,7 @@ with
 match  case
 pass
 where
-forall requires
+forall requires causes only   nothing
 type   impl   instance   trait
 import use    as     pub    run    param  const  this
 ```
@@ -168,23 +168,24 @@ trait, and `trait` a trait ([6.8 Nominal types and methods [Decided]](#68-nomina
 
 `forall` begins a polymorphic type (**[Planned]**,
 [Polymorphic type annotations](#polymorphic-type-annotations)). `requires` begins a `requires`
-clause, which ends a `def` signature or a polymorphic type
-([Trait requirements](#trait-requirements)). `requires Transaction` is **[Planned]**
+clause and `causes` a `causes` clause, which end a `def` signature or a function type, and `only`
+and `nothing` bound one ([Writing requirements and effects](#writing-requirements-and-effects)).
+`requires Transaction` is **[Planned]**
 ([8.7 Transactions as contextual parameters](#87-transactions-as-contextual-parameters)).
 
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
 > `rec` (recursive binding — §4.3, **[Decided]**),
 > `assert` and its `static assert` form (function contracts — §6, **[Decided]** as the
-> surface, **[Open]** as to what `static` demands), and `causes`, `only`, `nothing`, `raise`,
-> `try` and `except` (effects and exceptions —
+> surface, **[Open]** as to what `static` demands), and `raise`, `try` and `except` (exceptions —
 > [6.9 Capabilities](#69-capabilities), **[Decided]**).
 > Avoid taking these names for other purposes.
-> (`with`, `:=`, `match`, `case`, `where`, `forall`, `requires`, `type`, `impl`, `instance`,
-> `trait` and the module keywords are **already** lexed — the first two carry today's transactions
-> and mutation, §8, `match`/`case` carry tag dispatch, §4.10, `where` separates a refinement's
-> predicate, §6.4, `forall` and `requires` begin a polymorphic type and a `requires` clause, §6.10,
-> and `type`, `impl`, `instance` and `trait` declare nominal types, their functions, instances and
-> traits, §6.8 and §6.10 — so they are not in this list.)
+> (`with`, `:=`, `match`, `case`, `where`, `forall`, `requires`, `causes`, `only`, `nothing`,
+> `type`, `impl`, `instance`, `trait` and the module keywords are **already** lexed — the first two
+> carry today's transactions and mutation, §8, `match`/`case` carry tag dispatch, §4.10, `where`
+> separates a refinement's predicate, §6.4, `forall` and `requires` begin a polymorphic type and a
+> `requires` clause, §6.10, `causes`, `only` and `nothing` write the other clause and bound both,
+> §6.9, and `type`, `impl`, `instance` and `trait` declare nominal types, their functions,
+> instances and traits, §6.8 and §6.10 — so they are not in this list.)
 
 ### 1.7 Literals
 
@@ -438,9 +439,9 @@ begin():`, §8.2, `[Decided]`); any other context is rejected. `with` does
 
 > **Direction.** Planned statement forms, not in today's grammar: `rec x = e` recursive bindings
 > (**[Decided]**, §4.3), and out-of-line collection definition through a subscript target,
-> `c[i] = v` (**[Tentative]**, §6.3 — this would relax the no-subscript-target rule above). A
-> `causes` clause on a `def`, and the `raise` and `try`/`except` statements, are **[Decided]**, with
-> their grammar in [6.9 Capabilities](#69-capabilities). A
+> `c[i] = v` (**[Tentative]**, §6.3 — this would relax the no-subscript-target rule above). The
+> `raise` and `try`/`except` statements are **[Decided]**, with their grammar in
+> [6.9 Capabilities](#69-capabilities). A
 > `type` declaration, a `def` whose name is qualified by a type (`def Price::discounted(…)`), and
 > `@RenamedFrom` on either a `type` or one of its constructors are **[Decided]**, with their grammar
 > in [6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided).
@@ -3375,11 +3376,9 @@ is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 
 ### 6.9 Capabilities
 
-**[Decided]** — written clauses, tops and a run's state
-([Writing requirements and effects](#writing-requirements-and-effects)); the rule that nothing
-leaving a scope names a variable whose history the scope ends; a written `Transaction`, a function's
-`Transaction` supplied by the block that calls it, and block footprints; effects in traits
-([Effects in traits](#effects-in-traits)); outputs outside the program
+**[Decided]** — the rule that nothing leaving a scope names a variable whose history the scope ends;
+a written `Transaction`, a function's `Transaction` supplied by the block that calls it, and block
+footprints; effects in traits ([Effects in traits](#effects-in-traits)); outputs outside the program
 ([Output outside the program](#output-outside-the-program)); readings
 ([Inputs from outside the program](#inputs-from-outside-the-program)); and exceptions
 ([Exceptions](#exceptions)). The rest of this section is implemented.
@@ -3904,12 +3903,11 @@ in the kind `K`:
   `T: SubtypesOf(U)`. An open tuple `U` is not itself among them, no value having its type
   ([Tuple width](#tuple-width)).
 
-**[Decided]** A clause variable of
-[6.9 Capabilities](#69-capabilities) is written in the
-bound form, though a clause is not a type: `E <: Effect` ranges over `causes` clauses and
-`R <: Context` over `requires` clauses. A bound may end in `except` as a clause does:
-`E <: Effect except RunTransaction` ranges over the `causes` clauses without `RunTransaction`, so a
-function passed as `f: Int => Int causes E` does not commit, and each use is checked against it.
+A clause variable of [6.9 Capabilities](#69-capabilities) is written in the bound form, though a
+clause is not a type: `E <: Effect` ranges over `causes` clauses and `R <: Context` over `requires`
+clauses. A bound may end in `except` as a clause does: `E <: Effect except RunTransaction` ranges
+over the `causes` clauses without `RunTransaction`, so a function passed as `f: Int => Int causes E`
+does not commit, and each use is checked against it.
 
 Any other kind, such as a listing `T: [Int, String]`, is **[Open]** and an error. A type written as
 a kind, as in `T: Int`, is an error.
@@ -4023,9 +4021,11 @@ instance ([Equality and order](#equality-and-order)).
   parameter is an error unless a requirement or the parameter's bound covers it. Where both do, the
   requirement decides: `x + y` under `T <: Int` and `requires a: Addable(T, T), a::Output <: T` is
   an `a::Output`, which is a `T`.
-- **[Decided]** — the context requirements `Transaction`, `ObserveWorld`, `ReadTxn(x)` and
+- **Context requirements stand in the clause too.** `Transaction`, `ObserveWorld`, `ReadTxn(x)` and
   `Read(x)`, a written clause as a lower bound, and `only` and `nothing`, are specified in
-  [Writing requirements and effects](#writing-requirements-and-effects).
+  [Writing requirements and effects](#writing-requirements-and-effects). A written `Transaction` is
+  **[Decided]**
+  ([8.7 Transactions as contextual parameters](#87-transactions-as-contextual-parameters)).
 - **Each call satisfies each requirement at its own instantiation,** and passes the instance that
   satisfies it. A call that does not is rejected at the call. A secondary label at the requirement
   is **[Decided]**.
@@ -5740,8 +5740,8 @@ and through `Name <: T` or `Name: K` it cannot. A type member is in scope in the
 which is how `charge` above returns a `Receipt`.
 **[Decided]** `Module{Receipt requires Identified(Receipt), charge: {amount: Int} => Receipt}` is met by a run
 whose `Receipt` has an instance of `Identified`.
-**[Decided]** — an entry's clauses write the transactional state of the module the type describes as
-`Module::_`, and a run's state is the parameter's through it: `counter::_` for a parameter `counter`
+An entry's clauses write the transactional state of the module the type describes as `Module::_`,
+and a run's state is the parameter's through it: `counter::_` for a parameter `counter`
 ([Discharging requirements and effects](#discharging-requirements-and-effects)).
 
 `Module{…}` 𝐴 is a subtype of `Module{…}` 𝐵 when 𝐴 has every member 𝐵 names. A value member's type
@@ -5992,12 +5992,11 @@ restrict what a type may mention.
 ### 9.14 Checking a module on its own
 
 A module is checked once, alone, with no root and nothing that uses it. `cambra check lib.cambra`
-runs that check and prints the module's interface. **[Decided]** — no other module names the
-module's transactional variables, which are private, or the state of the runs it declares, so the
-interface writes their reads and writes `ReadTxn(Module::_)` and `WriteTxn(Module::_)`, as a Module
-type of the module would. **[Planned]** — the interface writes each type with the alias names its
-module wrote: a member annotated `base: Count` is printed `base: Count`, not with the type `Count`
-names.
+runs that check and prints the module's interface. No other module names the module's transactional
+variables, which are private, or the state of the runs it declares, so the interface writes their
+reads and writes `ReadTxn(Module::_)` and `WriteTxn(Module::_)`, as a Module type of the module
+would. **[Planned]** — the interface writes each type with the alias names its module wrote: a
+member annotated `base: Count` is printed `base: Count`, not with the type `Count` names.
 
 - **Parameters are typed binders.** A value parameter has its annotated type, with each `_` in it
   the type its uses infer. A type parameter is opaque apart from its bound. One with no bound is

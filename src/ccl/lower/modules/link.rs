@@ -2,6 +2,7 @@
 //! shared imports around the root (`docs/modules.md`, "Linking").
 
 use super::*;
+use crate::ccl::effects::Owner;
 use crate::ccl::{BaseType, BinOpKind, CompareKind, PredicateId, Refinement};
 
 /// The spelling of the placeholder a module's chain holds where the code below
@@ -407,6 +408,45 @@ fn copy_predicates(expr: &mut Expr, copies: &mut HashMap<PredicateId, (Rc<Expr>,
     expr.walk_children_mut(|child| copy_predicates(child, copies));
 }
 
+/// `chain`, a copy of the module that lowered in `scope` at `path`, with each top over a run's
+/// state, `WriteTxn(inv::_)`, holding the run its qualifier reaches in this copy: a run the
+/// module declares, at its path, or the run a Module-typed parameter takes, among `modules`. A
+/// parameter of the module being checked on its own takes none and stays abstract.
+pub(super) fn resolve_owners(
+    chain: &mut Expr,
+    path: &RunPath,
+    scope: &ModuleScope,
+    modules: &HashMap<SmolStr, Rc<HashMap<QualifiedName, Name>>>,
+) {
+    replace_owners_in(chain, &|owner| {
+        let Owner::Qualifier(spelled) = owner else {
+            return None;
+        };
+        let (first, rest) = spelled.split_once("::").unwrap_or((spelled, ""));
+        let Some(argument) = modules.get(first) else {
+            let run = scope.qualifiers.get(first)?.kind == QualifierKind::Run;
+            return (run && rest.is_empty()).then(|| Owner::Home(Home::Run(path.child(first))));
+        };
+        // A nested Module type's entry, `p::audit::_`, reaches the member `audit` of `p`'s run.
+        let names = match rest {
+            "" => (**argument).clone(),
+            rest => names_under(
+                argument,
+                &rest
+                    .split("::")
+                    .fold(QualifiedName::default(), |q, s| q.child(s)),
+            ),
+        };
+        // A member the module declares, spelled alone, has the home of the run it is a
+        // member of.
+        names
+            .iter()
+            .find(|(spelling, _)| spelling.split_first().is_some_and(|(_, r)| r.is_empty()))
+            .and_then(|(_, binder)| binder.home().cloned())
+            .map(Owner::Home)
+    });
+}
+
 /// `names` keyed by the raw name each spelling lowers to: the scope
 /// [`uniquify::run_in`] resolves a run's raw references in.
 pub(super) fn raw_scope(names: &HashMap<QualifiedName, Name>) -> HashMap<String, Name> {
@@ -621,8 +661,9 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
         );
         let (chain, refused) = finish_program(&ast.body, chain, &sinks, ctx);
         lowering.errors.extend(refused);
-        let scope = use_names(&scope, qualified);
-        let root = uniquify::run_in(chain, &raw_scope(&scope), None);
+        let names = use_names(&scope, qualified);
+        let mut root = uniquify::run_in(chain, &raw_scope(&names), None);
+        resolve_owners(&mut root, &RunPath::default(), &scope, &modules);
         // The root's `const` parameters bind their `let`s on its spine, with no home.
         let (spine_binders, _) = spine(&root);
         for binder in spine_binders {
@@ -1510,6 +1551,7 @@ impl<'a> ProgramLowering<'a> {
         let scope = use_names(&lowered.scope, qualified);
         let mut uniquified = uniquify::run_in(chain, &raw_scope(&scope), home.clone());
         substitute_in(&mut uniquified, &arguments);
+        resolve_owners(&mut uniquified, &path, &lowered.scope, &modules);
         let mut names = scope;
         let (spine, _) = spine(&uniquified);
         for name in spine {

@@ -873,11 +873,21 @@ impl CompactFun {
     fn merge(pol: bool, a: CompactFun, b: CompactFun) -> CompactFun {
         let name = a.name.clone().or_else(|| b.name.clone());
         // Effects are covariant: a positive position holds either function, so it may do
-        // what either does, and a negative one accepts only what both accept.
+        // what either does, and a negative one accepts only what both accept. The variables
+        // at a negative one are each a call's expectation of the one function value there,
+        // so every one stays: they stand for what that value does.
         let effects = Rc::new(if pol {
             a.effects.union(&b.effects)
         } else {
-            a.effects.intersection(&b.effects)
+            let mut meet = a.effects.intersection(&b.effects);
+            meet.vars = a
+                .effects
+                .vars
+                .iter()
+                .chain(&b.effects.vars)
+                .map(|(id, v)| (*id, Rc::clone(v)))
+                .collect();
+            meet
         });
         let codomain = Box::new(CompactType::merge(pol, *a.codomain, *b.codomain));
         // The domain merges **contravariantly** and as one ordinary position — there is no
@@ -1833,7 +1843,7 @@ pub enum JoinedPosition {
 /// following, so that spurious cycles (`?a <: ?b` and `?b <: ?a`) — which
 /// don't represent real recursive types — get pruned.
 pub fn compact_type(ty: &Type) -> CompactGraph {
-    compact_type_with(ty, true)
+    compact_type_with(ty, true, false)
 }
 
 /// [`compact_type`] with the opposite-polarity collapse suppressed **entirely**,
@@ -1850,11 +1860,19 @@ pub fn compact_type(ty: &Type) -> CompactGraph {
 /// [`fallback_allowed`] already confines the collapse to the entered position, so
 /// disabling it there disables it everywhere.
 pub fn compact_type_polarity_only(ty: &Type) -> CompactGraph {
-    compact_type_with(ty, false)
+    compact_type_with(ty, false, false)
 }
 
-fn compact_type_with(ty: &Type, collapse: bool) -> CompactGraph {
+/// [`compact_type_polarity_only`], with each function position's effects also holding the
+/// effect variables standing at it, which a rendering of a polymorphic type names
+/// (`src/ccl/design/type-inference.md`, "Polymorphism and materialization").
+pub fn compact_type_for_display(ty: &Type) -> CompactGraph {
+    compact_type_with(ty, false, true)
+}
+
+fn compact_type_with(ty: &Type, collapse: bool, effect_vars: bool) -> CompactGraph {
     let mut st = CompactState::new(collapse);
+    st.effect_vars = effect_vars;
     // One walk forces a shared predicate under one substitution once, however many bounds
     // carry it (`Subst::force_refinement`).
     let term = crate::ccl::subst::with_transport_memo(|| {
@@ -2532,6 +2550,10 @@ struct CompactState {
     /// Whether the opposite-polarity collapse may fire at all on this walk.
     /// False for [`compact_type_polarity_only`]; see [`fallback_allowed`].
     collapse: bool,
+    /// Whether each function position records the effect variables standing at it
+    /// ([`EffectSet::vars`](crate::ccl::effects::EffectSet::vars)): only a rendering of a
+    /// polymorphic type reads them ([`compact_type_for_display`]).
+    effect_vars: bool,
     /// The functions the walk is inside of, and the closing memo over them
     /// (`src/ccl/design/type-inference.md`, "Where the conversions run"): a
     /// refinement's references to enclosing binders become indices before
@@ -2570,6 +2592,7 @@ impl CompactState {
             barrier_recursive: HashMap::new(),
             rec_vars: BTreeMap::new(),
             collapse,
+            effect_vars: false,
             scope: RefinementScope::default(),
             data_domain_depth: 0,
             candidate_widened: None,
@@ -2577,6 +2600,28 @@ impl CompactState {
             own_content: Default::default(),
         }
     }
+}
+
+/// The set `effects` states at a position of polarity `pol`, with the effect variables
+/// standing there when the walk records them: at an input, the position's own variable, and
+/// at an output, every variable flowing into it, which a rendering keeps where it also stands
+/// at an input.
+fn effects_at(
+    effects: &crate::ccl::effects::Effects,
+    pol: bool,
+    st: &CompactState,
+) -> crate::ccl::effects::EffectSet {
+    let mut set = effects.set();
+    if st.effect_vars
+        && let crate::ccl::effects::Repr::Var(v) = effects.repr()
+    {
+        set.vars = if pol {
+            v.reaching()
+        } else {
+            std::iter::once((v.uid, Rc::clone(v))).collect()
+        };
+    }
+    set
 }
 
 /// The resolution of a barrier variable, under `subst_acc`, as a [`CompactType`]: the join
@@ -3243,7 +3288,7 @@ fn compact_go_inner(
                         KindPin::Sum(_) => KindPin::Data,
                         other => other,
                     },
-                    effects: Rc::new(effects.set()),
+                    effects: Rc::new(effects_at(effects, pol, st)),
                     name: name.clone(),
                     binders,
                     domains_disagree: false,
