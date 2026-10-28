@@ -125,28 +125,28 @@ A **streaming operator** holds nothing between pulls beyond its `ProducerBase` (
 its input is the output restricted to that sub-domain. A **pipeline breaker** holds state that
 later pulls read, so its output over a morsel depends on the morsels before it.
 
-| Operator | State between pulls | Breaker? | Merge law of the state | Partition axis |
-|---|---|---|---|---|
-| `MapResult`, `MapResultToConst`, `RecordWrap`, `SelectField`, `MakeRecord`, `MapDomain`, `Uncurry`, `PermuteRecordDomain`, `FlattenTupleDomain`, `VariantWrap`, `VariantProject`, `VariantIs`, `Filter`, `Restrict`, `UnionOperator` | none | no | `⊕` of outputs | any row range of the data input; the function operand of `MapResult` is read whole |
-| `Zip` | none; rebuilds `rows_by_path` per pull | no | `⊕` | a row range shared by every arm, which holds only when the arms are aligned by position, so an arm that arrives out of order needs a per-key buffer and becomes a breaker (a symmetric join) |
-| `Product` | none; re-renders the whole product per pull | no | `⊕` | outer rows; the inner side is read whole per outer row |
-| `MapResultWithSource` | `last_nested_input` cache | no | `⊕` | key range; reads the source handle under its lock |
-| `CheckedLookup` (paired form) | none | no | `⊕` | row range of the pairs |
-| `CheckedLookup` (split form) | none, but emits nothing until the collection is terminal | blocking | n/a | the keys; the collection is the build side |
-| `Memo` | `cached_tile`, `upstream_drained` | materializing, non-blocking | `⊕` (it merges deltas today) | the cached tile is immutable once emitted, so readers take snapshots |
-| `Aggregate` + `ExtractAggregate` | one accumulator; terminal flag | blocking at the extract (`only_terminal: true`) | `Sum`: `+`; `Max`/`Min`: lattice join; `Drain`: unit; `Sole`: at most one, asserted. All commutative, so partials combine in any order | any row range; partials per worker |
-| `MapAggregate` + `MapExtractAggregate` | `accumulators: HashMap<Vec<Value>, Tile>`, `emptied_keys` | materializing; a group is emitted terminal as soon as its key path is complete | per key, the kind's law; keys union | by key hash internally; by enclosing row path across a nest |
-| `Converse` | `held: Vec<(Value, Value)>` | materializing where its groups are consumed as groups: the hash join's probe, or a result that is the groups. Where a fold follows it, the fold is the breaker and `Converse` is the gather that fold's phase one performs anyway; see the fusion note below | key union; a group's members union | by key hash internally. This is the hash join's build side (`planning/join.rs`: `converse(build ≫ key)`, probed through `MapResult`) and the group-by's bucketize step (`planning/groupby.rs`: `converse(c ≫ key) ≫ map(c)`) |
-| `ExtractFinal` | `final_tile` once terminal | blocking | one value | none; it reports terminality of a stream |
-| `IterateExtent` | `released: Predicate` | source cursor | interval-set union | row ranges handed out to workers |
-| `FanOut` (`FanOutShared`) | per-slot release guards, their intersection, the cyclic snapshot | shared bookkeeping, no data | intersection of guards | n/a; one object per fan |
-| `InductionStore` (`Engines` of `CommitEngine`) | seed, per-key `BTreeMap<Position, Value>` changelog, frontier, decided positions | sequential recurrence | none along positions; across `Engines` leaves the stores are independent | enclosing row path of a nested `Transact` |
-| `InductionDriver`, `TransactDriver` | `DecodedSource`, `DriverWindow`, cursors | sequential | none | with their store |
-| `CommitProducer` (`CommitEngine`) | as above, plus per-writer consumed counts | serialization point | `attempt` is OCC: validate the read set, allocate the next tick, write | writers are parallel up to `attempt` |
-| `TransactWriter` | `emitted: Vec<InFlightProposal>`, cursors | per-site sequential | none | one writer per site; sites are independent until the engine |
-| `AsOf` | `latched`, `seen` | materializing | union over trigger positions | trigger row range |
-| `StoreDenseRead`, `StoreValueStream`, `StoreFinalRead` | a release cursor | no (reads a store render) | n/a | with their store |
-| `SinkConsumer` | `data: HashMap<Value, Value>` | terminal | union | by key |
+| Operator | State between pulls | Breaker? | Merge law of the state | Partition axis  Build side |
+|---|---|---|---|---|---|
+| `MapResult`, `MapResultToConst`, `RecordWrap`, `SelectField`, `MakeRecord`, `MapDomain`, `Uncurry`, `PermuteRecordDomain`, `FlattenTupleDomain`, `VariantWrap`, `VariantProject`, `VariantIs`, `Filter`, `Restrict`, `UnionOperator` | none | no | `⊕` of outputs | any row range of the data input; the function operand of `MapResult` is read whole | `MapResult`'s function operand, `MapResultToConst`'s constant, a function-valued `Filter` predicate |
+| `Zip` | none; rebuilds `rows_by_path` per pull | no | `⊕` | a row range shared by every arm, which holds only when the arms are aligned by position, so an arm that arrives out of order needs a per-key buffer and becomes a breaker (a symmetric join) | none |
+| `Product` | none; re-renders the whole product per pull | no | `⊕` | outer rows; the inner side is read whole per outer row | none |
+| `MapResultWithSource` | `last_nested_input` cache | no | `⊕` | key range; reads the source handle under its lock | none |
+| `CheckedLookup` (paired form) | none | no | `⊕` | row range of the pairs | none |
+| `CheckedLookup` (split form) | none, but emits nothing until the collection is terminal | blocking | n/a | the keys; the collection is the build side | the collection |
+| `Memo` | `cached_tile`, `upstream_drained` | materializing, non-blocking | `⊕` (it merges deltas today) | the cached tile is immutable once emitted, so readers take snapshots | none |
+| `Aggregate` + `ExtractAggregate` | one accumulator; terminal flag | blocking at the extract (`only_terminal: true`) | `Sum`: `+`; `Max`/`Min`: lattice join; `Drain`: unit; `Sole`: at most one, asserted. All commutative, so partials combine in any order | any row range; partials per worker | none |
+| `MapAggregate` + `MapExtractAggregate` | `accumulators: HashMap<Vec<Value>, Tile>`, `emptied_keys` | materializing; a group is emitted terminal as soon as its key path is complete | per key, the kind's law; keys union | by key hash internally; by enclosing row path across a nest | none |
+| `Converse` | `held: Vec<(Value, Value)>` | materializing where its groups are consumed as groups: the hash join's probe, or a result that is the groups. Where a fold follows it, the fold is the breaker and `Converse` is the gather that fold's phase one performs anyway; see the fusion note below | key union; a group's members union | by key hash internally. This is the hash join's build side (`planning/join.rs`: `converse(build ≫ key)`, probed through `MapResult`) and the group-by's bucketize step (`planning/groupby.rs`: `converse(c ≫ key) ≫ map(c)`) | none |
+| `ExtractFinal` | `final_tile` once terminal | blocking | one value | none; it reports terminality of a stream | none |
+| `IterateExtent` | `released: Predicate` | source cursor | interval-set union | row ranges handed out to workers | none |
+| `FanOut` (`FanOutShared`) | per-slot release guards, their intersection, the cyclic snapshot | shared bookkeeping, no data | intersection of guards | n/a; one object per fan | none |
+| `InductionStore` (`Engines` of `CommitEngine`) | seed, per-key `BTreeMap<Position, Value>` changelog, frontier, decided positions | sequential recurrence | none along positions; across `Engines` leaves the stores are independent | enclosing row path of a nested `Transact` | none |
+| `InductionDriver`, `TransactDriver` | `DecodedSource`, `DriverWindow`, cursors | sequential | none | with their store | none |
+| `CommitProducer` (`CommitEngine`) | as above, plus per-writer consumed counts | serialization point | `attempt` is OCC: validate the read set, allocate the next tick, write | writers are parallel up to `attempt` | none |
+| `TransactWriter` | `emitted: Vec<InFlightProposal>`, cursors | per-site sequential | none | one writer per site; sites are independent until the engine | none |
+| `AsOf` | `latched`, `seen` | materializing | union over trigger positions | trigger row range | none |
+| `StoreDenseRead`, `StoreValueStream`, `StoreFinalRead` | a release cursor | no (reads a store render) | n/a | with their store | none |
+| `SinkConsumer` | `data: HashMap<Value, Value>` | terminal | union | by key | none |
 
 Three observations on the table:
 
@@ -542,6 +542,30 @@ places, in decreasing order of payoff:
 `TransactWriter` sites are independent until `CommitEngine::attempt`, so several writers run their
 bodies concurrently and serialize only at the commit; the induction driver has one writer by
 construction and no equivalent.
+
+### Pipeline boundaries
+
+The consumer graph of a pooled chain ends inside its own pipeline. A pipeline behind a breaker has
+as its leaf an operator that reads the breaker's output through a shared handle and subscribes to
+the breaker, so no consumer of one pipeline is notified by an operator of another, and the invariant
+on a chain's notification path ([The scheduler](#the-scheduler)) applies to one pipeline at a time.
+The breaker raises its own region when a worker has merged a morsel.
+
+**Not implemented.** No breaker raises a region, and `plan_main` admits no pipeline behind a
+breaker: the pipeline behind one starts when the pipeline before it finishes.
+
+### Build sides
+
+A function operand or constant that every row reads whole is a **build side**: the function operand
+of `MapResult`, the constant of `MapResultToConst`, the collection of a split `CheckedLookup`, and a
+function-valued `Filter` predicate. The [Operator classification](#operator-classification) table
+names them in its Build side column. A pooled chain subscribes a build side with a boundary consumer
+that drops its notifications. A build side that can still grow is a blocking dependency: the probe
+pipeline starts after the build pipeline finishes. A morsel's worker pulls its keys once, merges and
+releases, so a row withheld for an unanswered key is never revisited. A static operand's single
+notification at subscribe time is replaced by the seed publish in `run_pipeline`.
+
+**Not implemented.** `plan_main` admits no chain with a build side.
 
 ### Function operands
 

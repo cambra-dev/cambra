@@ -726,6 +726,11 @@ depends on the input's shape, the operator decides from its tiling when it subsc
 | `MapAggregate`, `MapExtractAggregate` | the input | keeps | The groups keep the input's outermost keys. |
 | Stores, recurrences and the commit operators (`commit_operator.rs`) | every input | widens | A recurrence re-keys its inputs by its own positions. |
 
+The rows for a function operand or constant that every row reads whole (the function operand of
+`MapResult`, the constant of `MapResultToConst`, the collection of a split `CheckedLookup`, a
+function-valued `Filter` predicate) describe the serial scheduler. A pooled chain cuts them at a
+boundary consumer ([Build sides](../../docs/parallel-execution.md#build-sides)).
+
 `GatedConsumer` forwards at most one notification between pulls to a consumer that pulls.
 `shared_consumer` constructs it with `Notified::clear()`, so the first notification passes,
 including one sent during `subscribe`. Forwarding sets the flag; `ProducerBase::sharing` holds the

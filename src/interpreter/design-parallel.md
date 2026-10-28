@@ -278,6 +278,8 @@ or widened, never narrowed or lost.
   orders the cells' locks only. The thread that notifies holds no lock the cascade takes (the
   dispatcher's lock on what reached a pipeline before it started, the `LiveSource` state lock, the
   lock its yield-predicate function reads, and the lock that parks idle workers).
+- **Pipeline boundary.** The invariant holds per pipeline: a pipeline behind a breaker has its own
+  leaf consumer ([Pipeline boundaries](../../docs/parallel-execution.md#pipeline-boundaries)).
 - **Closures.** A closure consumer ignores the region, and the scheduler's drains send `Everything`.
 
 ### A pool owns its pipeline's release record
