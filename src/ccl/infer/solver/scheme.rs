@@ -65,6 +65,9 @@ pub struct Instance {
     /// The scheme's `requires` clause, freshened through the same copy: the use
     /// mints an obligation for each.
     pub requires: Vec<TraitRequirement>,
+    /// The copy each effect variable the body reaches was freshened to, by the original's
+    /// id: a requirement's associated effect type is linked through it.
+    pub effect_copies: HashMap<EffectVarId, Rc<EffectVar>>,
 }
 
 impl PolyScheme {
@@ -150,6 +153,7 @@ impl PolyScheme {
             ty,
             bounds,
             requires,
+            effect_copies: cache.effect_vars,
         }
     }
 

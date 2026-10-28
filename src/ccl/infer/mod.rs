@@ -617,6 +617,7 @@ fn push_effect_failures(errors: &mut Vec<LocatedInferError>, expr: &Expr) {
         let item = failure.label.item.to_string();
         let (error, written) = match failure.blame {
             Blame::Clause(at) => (InferError::EffectBeyondClause { item }, at),
+            Blame::Signature(at) => (InferError::EffectBeyondSignature { item }, at),
             Blame::Written(at) => (InferError::EffectNotStated { item }, at),
         };
         errors.push(
@@ -702,7 +703,9 @@ pub(crate) fn run_with_params(
     }
 
     // Each effect variable's labels are complete once emission is, so its upper bounds are
-    // checked here (`src/ccl/design/type-inference.md`, "Effect variables").
+    // checked here (`src/ccl/design/type-inference.md`, "Effect variables"), after each
+    // associated effect type is given what the obligation standing for it selected.
+    sub_ctx.settle_effect_links();
     push_effect_failures(&mut errors, expr);
     errors.extend(sub_ctx.requirements_beyond_clauses());
     if !errors.is_empty() {

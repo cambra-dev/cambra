@@ -2564,14 +2564,15 @@ fn call_instance_function(expr: &mut Expr, call: &OperatorCall, function: &str, 
         inputs,
         output,
         requires,
+        effects,
     } = &call
         .trait_
         .function(function)
         .expect("an operator calls a function its trait declares")
         .signature;
     debug_assert!(
-        params.is_empty() && requires.is_empty(),
-        "an operator's function has no type parameters and no requirements of its own"
+        params.is_empty() && requires.is_empty() && effects.is_none(),
+        "an operator's function has no type parameters, no requirements and no effects of its own"
     );
     // The signature at the operands' types, whose `Output` is the operator's own result.
     let mut opened: HashMap<TypeParamId, Type> = call

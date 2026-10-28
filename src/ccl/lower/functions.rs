@@ -499,6 +499,7 @@ pub(super) fn lower_def(
     body: &[Spanned<ChlStmt>],
     ctx: &mut LoweringContext,
 ) -> Result<(Expr, Option<Type>), LoweringError> {
+    let requires_clause = requires;
     // A clause names the `def`'s type parameters, so its items are classified and lowered
     // with them in scope.
     let trait_items = |ctx: &LoweringContext| -> Vec<Spanned<Requirement>> {
@@ -525,10 +526,12 @@ pub(super) fn lower_def(
             .zip(type_params)
             .map(|(d, tp)| (d.param.id, tp.name_span))
             .collect();
-        let clauses = clauses::lower_clauses(requires, causes, clauses::Site::Def, fn_span, ctx)?;
+        // The requirements first: a clause names their associated effect types, `t::Writes`.
         let (requires, named) =
             lower_named_requirements(&trait_items(ctx), Some(&mut declared), ctx)?;
         ctx.named_requirements.extend(named);
+        let clauses =
+            clauses::lower_clauses(requires_clause, causes, clauses::Site::Def, fn_span, ctx)?;
         // The parameters the clause added are determined by the requirements naming them,
         // and have no span of their own.
         let spans: Vec<Option<Span>> = declared

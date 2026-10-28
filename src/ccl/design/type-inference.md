@@ -3962,6 +3962,26 @@ So `causes only E` is checked once, at the definition, against what any use may 
 drops the rigid label, and a copied bound no longer bounds the part the parameter stands in
 (`freshen_effect_var`), so a use's copy holds what its arguments bring.
 
+**Traits.** A trait's signature carries its clauses as a written function type's
+(`Signature::effects`), and a call of the trait's function takes them (`emit_trait_fn`). An
+instance's function is stamped with its signature's clauses as a `def` under `only` would be
+(`signature_bound` in `lower/traits.rs`), with the signature as the secondary label of a body
+that exceeds them. An associated type bounded by `Effect` or `Context`, `Writes <: Effect`, is a
+clause parameter of the trait (`TraitDecl::effect_assocs`). Each instance has its own parameter
+for it (`TraitInstance::effect_assocs`), on whose variable, minted once at the top level, the
+instance's functions' bodies collect (`Written::of_instance`). A requirement `t: Take(T)` gives the
+definition a member parameter for it, `t::Writes` (`TraitRequirement::effect_assoc`), which opens
+rigidly as a declared parameter does. A call stands a fresh variable for the trait's parameter, and
+a use of a definition requiring the trait links its copy of the member's; each is linked through
+the obligation the call or the use mints (`InferCtx::link_effect`): to the variable of the instance
+the obligation selects, or to the member of the requirement in scope that answers it. A link the
+obligation has not decided is settled when the definition minting it generalizes, before any use
+copies its variables, and the rest once emission is complete, before the bounds are checked
+(`InferCtx::settle_effect_links`). An obligation still undecided then is one a definition leaves to
+its uses, a requirement inference adds: its variable holds what every instance and requirement still
+answering it does, which is at least what any use's does. A parameter variable with no rigid label
+leaves its part of a bound open: it is what flows there.
+
 **Upper bounds are checked once emission is complete.** A variable's labels are known only then,
 so `effects::exceeded_uppers` reads each bounded variable's resolution after the barrier variables'
 checks. The first label beyond a bound is reported at the node where it entered: the statement
