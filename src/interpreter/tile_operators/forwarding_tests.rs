@@ -273,3 +273,21 @@ fn variant_project_forwards_the_region_of_a_stream() {
 fn variant_project_over_a_bare_union_sends_everything() {
     assert_widens(&|| variant_project(Tiling::Scalar(union_extent())), 0);
 }
+
+fn variant_is(input: Tiling) -> Built {
+    let (input, consumer) = feed(input);
+    let op = VariantIs::new(input, crate::ccl::FieldKey::Index(0));
+    (Box::new(op), vec![consumer])
+}
+
+#[test]
+fn variant_is_forwards_the_region_of_a_stream() {
+    assert_keeps(&|| variant_is(union_stream()), 0);
+    assert_keeps_without_state(&|| variant_is(union_stream()), 0);
+}
+
+/// A bare union has no keys of its own.
+#[test]
+fn variant_is_over_a_bare_union_sends_everything() {
+    assert_widens(&|| variant_is(Tiling::Scalar(union_extent())), 0);
+}
