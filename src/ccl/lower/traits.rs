@@ -469,6 +469,30 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
     }))
 }
 
+/// An instance's choice of an associated type is one type, so a function type in it states
+/// its clauses exactly, and they are the capabilities it has: the known set they list.
+fn settle_written_capabilities(ty: &mut Type) -> Result<(), String> {
+    if let Type::Fun { capabilities, .. } = ty
+        && let crate::ccl::capabilities::Repr::Written(written) = capabilities.repr()
+    {
+        if written.open_requires || written.open_causes {
+            return Err(
+                "an instance chooses one type for an associated type, so a function \
+                        type in it states its clauses exactly, with no `_`"
+                    .to_string(),
+            );
+        }
+        *capabilities = crate::ccl::capabilities::Capabilities::known(written.set.clone());
+    }
+    let mut result = Ok(());
+    ty.walk_children_mut(|child| {
+        if result.is_ok() {
+            result = settle_written_capabilities(child);
+        }
+    });
+    result
+}
+
 /// Make every data-function type in `ty` whose funkind is a hole a plain collection. An
 /// instance's associated type is one type at every use, and a funkind hole is a fresh kind per
 /// use, which a sum could pin after inference has read the instance
@@ -935,6 +959,9 @@ fn declare_instance(
         }
         let mut ty = lower_type_expr(&a.value, ctx)?;
         close_kind_holes(&mut ty);
+        if let Err(why) = settle_written_capabilities(&mut ty) {
+            return Err(LoweringError::unsupported(a.value.span, why));
+        }
         if mentions_refinement(&ty) {
             return Err(LoweringError::internal(
                 a.value.span,
@@ -1566,12 +1593,28 @@ fn lower_instance_def(
         params,
         output,
         requires,
+        causes,
         body,
         ..
     } = &def.node
     else {
         unreachable!("`declare_instances` admitted only `def`s")
     };
+    // What an instance's function requires and causes is its trait's signature's, which
+    // states none yet (`docs/chl-spec.md`, "Effects in traits").
+    let context = requires
+        .items
+        .iter()
+        .find(|r| clauses::is_context_item(r, ctx))
+        .map(|r| r.span);
+    if let Some(span) = causes.span.or(requires.only).or(context) {
+        return Err(LoweringError::unsupported(
+            span,
+            "an instance's function requires and causes what its trait's signature states, \
+             and a clause stating that on an instance is not supported yet",
+        ));
+    }
+    let requires = requires.items.as_slice();
     let name = &name.node;
     let function = trait_
         .function(name)
@@ -1781,6 +1824,7 @@ fn lower_instance_def(
         &spans,
         &params,
         Some(&output),
+        None,
         requires,
         body,
         ctx,

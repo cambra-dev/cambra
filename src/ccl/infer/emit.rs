@@ -145,6 +145,10 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                     let instance = binding
                         .scheme
                         .instantiate_with_params(ctx.level, &ctx.telescope);
+                    // The specialization this use mints takes its copies of the definition's
+                    // capability variables (`capabilities::UseCapabilities`).
+                    ctx.use_capabilities
+                        .record_use(node_id, &instance.capability_copies);
                     for (instantiation, bound, bound_at) in instance.bounds {
                         let check = |ctx: &mut InferCtx| {
                             ctx.require_sub(&instantiation, &bound, &|| {
@@ -317,7 +321,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             let Some(registered) = ctx.sources.get(name).cloned() else {
                 return Err(ctx.raise(InferError::UnboundVariable(name.to_string())));
             };
-            ctx.record_capability(Capability::Requires(Requirement::observe_world()), None);
+            ctx.record_capability(Capability::Requires(Requirement::observe_world()));
             registered
         }
 
@@ -372,7 +376,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             site: _,
         } => {
             let target_ty = ctx.instantiate_binding(name)?;
-            ctx.record_capability(Capability::Causes(Effect::Append(name.clone())), Some(name));
+            ctx.record_capability(Capability::Causes(Effect::Append(name.clone())));
             emit_feed(name, &target_ty, value, row, &feed_role(name), ctx).map_err(|e| {
                 e.with_escape_target(EscapeTarget::Feed {
                     channel: name.to_string(),
@@ -390,7 +394,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                 Some(name) => format!("a definition of `{name}`"),
                 None => "this definition".to_string(),
             };
-            ctx.record_capability(Capability::Causes(Effect::Append(name.clone())), Some(name));
+            ctx.record_capability(Capability::Causes(Effect::Append(name.clone())));
             emit_define(name, &target_ty, value, &label, ctx)?
         }
 
@@ -441,7 +445,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             value,
         } => {
             let var_ty = ctx.instantiate_binding(name)?;
-            ctx.record_capability(Capability::Causes(Effect::Write(name.clone())), Some(name));
+            ctx.record_capability(Capability::Causes(Effect::Write(name.clone())));
             ctx.record_transactional_access(name);
             // The written value flows into the mutable variable's *value* type, not
             // the `Mut` handle itself — which is what a write means: it updates `V`.
@@ -620,8 +624,10 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
             fun_kind,
             domain: d,
             codomain: c,
+            capabilities,
             ..
         } => {
+            ctx.check_written(capabilities)?;
             for w in fun_kind.witnesses_mut() {
                 for t in w.types_mut() {
                     emit_annotation_predicates(t, ctx)?;
@@ -1295,14 +1301,8 @@ pub(super) fn emit_apply<C: Typing>(
             // a transactional variable needs no transaction: the callee writes it in a block of
             // its own, or requires one.
             TempNames::Variable(variable, _) => {
-                ctx.record_capability(
-                    Capability::Requires(Requirement::read(variable.clone())),
-                    Some(&variable),
-                );
-                ctx.record_capability(
-                    Capability::Causes(Effect::Write(variable.clone())),
-                    Some(&variable),
-                );
+                ctx.record_capability(Capability::Requires(Requirement::read(variable.clone())));
+                ctx.record_capability(Capability::Causes(Effect::Write(variable)));
                 None
             }
         };
@@ -1334,7 +1334,7 @@ pub(super) fn emit_apply<C: Typing>(
         // for a `Mut` parameter.
         (Some(param), None) if param.as_feed().is_some() && raw_arg_ty.as_feed().is_some() => {
             if let TypedExprNode::Var(a) = &argument.node {
-                ctx.record_capability(Capability::Causes(Effect::Append(a.clone())), Some(a));
+                ctx.record_capability(Capability::Causes(Effect::Append(a.clone())));
             }
             raw_arg_ty
         }
@@ -2281,6 +2281,10 @@ pub(super) fn emit_let<C: Typing>(
     let recoveries_before = ctx.recoveries();
     let (scheme, defined) = emit_let_definition(binding, bound_expr, Some(body), ctx)?;
     ctx.note_binding(&binding.name, &bound_expr.ty, bound_expr.node_id());
+    // An annotation states what the binding's type is, which other modules see.
+    if binding.user_annotation.is_some() {
+        ctx.note_binding(&binding.name, &binding.ty, bound_expr.node_id());
+    }
     // A right-hand side holding a statement recovered from has untyped nodes, so, like one
     // that did not type, it has no value to discharge.
     let defined = defined && ctx.recoveries() == recoveries_before;
@@ -2421,6 +2425,7 @@ fn emit_let_definition_inner<C: Typing>(
             _ => &scheme_ty,
         };
         ctx.note_scheme(&binding.name, noted);
+        ctx.note_definition(&scheme_ty, binding.annotation_ty(), bound_expr);
     }
     Ok((scheme, defined))
 }
@@ -3126,7 +3131,7 @@ pub(super) fn emit_begin<C: Typing>(
     body: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    ctx.record_capability(Capability::Causes(Effect::RunTransaction), None);
+    ctx.record_capability(Capability::Causes(Effect::RunTransaction));
     ctx.transaction_body(|ctx| ctx.in_transaction(|ctx| ctx.subexpr(body)))?;
     Ok(Type::Base(BaseType::Unit))
 }

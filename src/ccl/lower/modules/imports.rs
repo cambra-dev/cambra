@@ -445,6 +445,37 @@ pub(super) fn constant(expr: &ChlExpr) -> Option<Lit> {
     }
 }
 
+/// The names a requirement writes that could name a type or a module ([`mentioned_names`]).
+fn requirement_names(r: &chl_parser::ast::Requirement, names: &mut HashSet<SmolStr>) {
+    match r {
+        chl_parser::ast::Requirement::Trait { ty, .. } => trait_type_names(ty, names),
+        chl_parser::ast::Requirement::Bound { bound, .. } => mentioned_names(&bound.node, names),
+        chl_parser::ast::Requirement::Subtype { sub, sup } => {
+            mentioned_names(&sub.node, names);
+            mentioned_names(&sup.node, names);
+        }
+        chl_parser::ast::Requirement::Forall {
+            binders,
+            requirements,
+        } => {
+            for (_, ty) in binders {
+                mentioned_names(&ty.node, names);
+            }
+            for r in requirements {
+                requirement_names(&r.node, names);
+            }
+        }
+    }
+}
+
+/// The names a trait applied to its operands writes: the trait's and its operands'.
+fn trait_type_names(ty: &chl_parser::ast::TraitType, names: &mut HashSet<SmolStr>) {
+    names.insert(ty.name.clone());
+    for arg in &ty.args {
+        mentioned_names(&arg.node, names);
+    }
+}
+
 /// Each name `expr` writes that could name a type or a module: a bare name, and
 /// the first segment of a qualified one.
 pub(super) fn mentioned_names(expr: &ChlExpr, names: &mut HashSet<SmolStr>) {
@@ -487,8 +518,20 @@ pub(super) fn mentioned_names(expr: &ChlExpr, names: &mut HashSet<SmolStr>) {
             each(&mut [&**base, &**predicate].into_iter())
         }
         ChlExpr::FunctionType {
-            domain, codomain, ..
-        } => each(&mut [&**domain, &**codomain].into_iter()),
+            domain,
+            codomain,
+            requires,
+            causes,
+            ..
+        } => {
+            each(&mut [&**domain, &**codomain].into_iter());
+            for r in &requires.items {
+                requirement_names(&r.node, names);
+            }
+            for ty in &causes.items {
+                trait_type_names(&ty.node, names);
+            }
+        }
         ChlExpr::Subscript { target, index, .. } => each(&mut [&**target, &**index].into_iter()),
         ChlExpr::BinOp { left, right, .. } => each(&mut [&**left, &**right].into_iter()),
         ChlExpr::UnaryOp { operand, .. } => each(&mut std::iter::once(&**operand)),

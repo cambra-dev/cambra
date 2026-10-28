@@ -232,7 +232,7 @@ The connections between the layers above and the capabilities Cambra claims:
 | Aggregates | `sum`, `max`, `min` implemented; `count`/`avg`/`len` **[Planned]** |
 | Refinement typing | Machinery implemented (internal); surface syntax **[Decided]** |
 | Feed channels | `Feed(_)` declarations, `Feed(_)` parameters and `http_serve` implemented |
-| Function requirements and effects (`requires` / `causes`) | Inferred and printed; written clauses and exceptions **[Decided]** |
+| Function requirements and effects (`requires` / `causes`) | Implemented; exceptions **[Decided]** |
 | `rec` fixpoint bindings | **[Decided]** |
 | Collections-as-functions model | **[Decided]** — one representation (the data function `D ⤇ V`), five surface kinds; `Array`/`List`/`Collection` types implemented, `Map`/`Set` types and the operation layer landing (see [src/ccl/design/collections.md](../src/ccl/design/collections.md)) |
 | `match` / `case` | Tag dispatch implemented; deeper patterns **[Tentative]** |

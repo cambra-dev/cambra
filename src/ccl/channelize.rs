@@ -1174,14 +1174,12 @@ fn run_memoized(expr: Expr) -> Result<Expr, Located<DeferError>> {
     erase_chan_domains(&mut rewritten, &mut map, &kinds, &predicates);
     #[cfg(debug_assertions)]
     assert_no_type_residue(&rewritten);
-    // Every feed is a channel's union now, so nothing appends to one.
+    // Every feed is a channel's union now, so nothing appends to one, and this is the last
+    // pass that compiles an effectful construct away: what any top or clause variable stands
+    // for is gone too. Only the input a source opens is still required, which the run supplies.
     crate::ccl::capabilities::discharge(&mut rewritten, &|item| {
-        matches!(
-            item,
-            crate::ccl::capabilities::Capability::Causes(crate::ccl::capabilities::Effect::Append(
-                _
-            ))
-        )
+        !matches!(item, crate::ccl::capabilities::Capability::Requires(r)
+            if *r == crate::ccl::capabilities::Requirement::observe_world())
     });
     Ok(rewritten)
 }

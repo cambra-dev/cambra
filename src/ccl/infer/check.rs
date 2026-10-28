@@ -243,6 +243,19 @@ impl TelescopeWalk for CheckCtx {
     }
 }
 
+/// `ty` with each written clause stating nothing: Check reads no capabilities off an annotation.
+fn without_written_clauses(ty: &mut Type) {
+    if let Type::Fun { capabilities, .. } = ty
+        && matches!(
+            capabilities.repr(),
+            crate::ccl::capabilities::Repr::Written(_)
+        )
+    {
+        *capabilities = crate::ccl::capabilities::Capabilities::none();
+    }
+    ty.walk_children_mut(without_written_clauses);
+}
+
 impl Typing for CheckCtx {
     fn pred_memo(&self) -> TermMemo {
         self.pred_memo.clone()
@@ -307,8 +320,11 @@ impl Typing for CheckCtx {
 
     fn normalize(&mut self, ann: &Type) -> Type {
         // A fully-typed tree carries no `Hole`s, so normalization is the
-        // identity; refinements are kept (as everywhere else).
-        ann.clone()
+        // identity; refinements are kept (as everywhere else). Check reads no capabilities, so
+        // an annotation's written clauses state none here.
+        let mut ann = ann.clone();
+        without_written_clauses(&mut ann);
+        ann
     }
 
     fn require_trait_refined(

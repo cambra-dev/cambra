@@ -287,7 +287,12 @@ impl Printer {
                     format!("{}: {kind}", p.param.spelling)
                 }
                 None => match p.bound() {
-                    Some(bound) => format!("{} <: {}", p.param.spelling, self.ty(bound)),
+                    Some(bound) => format!(
+                        "{} <: {}{}",
+                        p.param.spelling,
+                        self.component(bound),
+                        crate::ccl::capabilities::except_text(&p.param.clause_except)
+                    ),
                     None => p.param.spelling.to_string(),
                 },
             })

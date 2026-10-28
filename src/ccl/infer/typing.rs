@@ -379,15 +379,25 @@ pub(super) trait Typing {
         }
     }
 
-    /// Record that the enclosing function body requires or causes `item`, which names
-    /// the variable `name` where it names one. Emit records it on the body's effect
-    /// variable; Check reads capabilities off the recorded types and records nothing.
-    fn record_capability(
-        &mut self,
-        _item: crate::ccl::capabilities::Capability,
-        _name: Option<&Name>,
-    ) {
+    /// Note a generalized definition of type `ty`, annotated `written`: a `def` whose
+    /// `requires` clause is an upper bound has its inferred trait requirements checked
+    /// against the clause once emission is complete. Check notes nothing.
+    fn note_definition(&mut self, _ty: &Type, _written: Option<&Type>, _definition: &Expr) {}
+
+    /// Refuse a written clause naming a variable that is not one of the kind it takes in
+    /// scope: a mutable variable for `Write` and `Read`, a feed for `Append`. Check has refused
+    /// nothing by then.
+    fn check_written(
+        &self,
+        _effects: &crate::ccl::capabilities::Capabilities,
+    ) -> Result<(), LocatedInferError> {
+        Ok(())
     }
+
+    /// Record that the enclosing function body requires or causes `item`. Emit records it on
+    /// the body's capability variable; Check reads capabilities off the recorded types and records
+    /// nothing.
+    fn record_capability(&mut self, _item: crate::ccl::capabilities::Capability) {}
 
     /// Record that writing `name` requires `Transaction`, when it is a transactional
     /// mutable variable. Check records nothing.

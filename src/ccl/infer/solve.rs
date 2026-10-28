@@ -148,6 +148,9 @@ pub(super) struct CoalesceCtx {
     /// error records them, so an error a use causes inside a clone is reported at the
     /// use that clone serves ([`coalesce_generalized_let`]).
     specializing: Vec<ActiveSpecialization>,
+    /// Each use's copies of its definition's capability variables, which the clone it mints takes
+    /// and is keyed by (`capabilities::UseCapabilities`).
+    use_capabilities: crate::ccl::capabilities::UseCapabilities,
     /// The monomorphic `let`s whose right-hand sides the walk is inside: with
     /// [`specializing`](Self::specializing)'s, the definitions a trait function's call
     /// cannot be answered by, since a definition does not reach itself
@@ -478,14 +481,14 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
                 fun_kind: k1,
                 domain: d1,
                 codomain: c1,
-                capabilities: e1,
+                ..
             },
             Type::Fun {
                 name: n2,
                 fun_kind: k2,
                 domain: d2,
                 codomain: c2,
-                capabilities: e2,
+                ..
             },
         ) => {
             // Two sums agree iff their binders' type kinds agree pairwise, binder by binder
@@ -508,9 +511,13 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
                             .zip(y.children())
                             .all(|(p, q)| types_agree_modulo_unread(p, q, refinements))
                 });
+            // Capabilities are not compared. A specialization pin relates no capabilities, since
+            // uses differing only in them share a clone, so a clone's function bound meets a
+            // use's at an input with other capabilities; and nothing after specialization reads
+            // an effect off a materialized type (`src/ccl/design/type-inference.md`,
+            // "Polymorphism and materialization").
             slots_agree
                 && n1 == n2
-                && e1 == e2
                 && types_agree_modulo_unread(d1, d2, refinements)
                 && types_agree_modulo_unread(c1, c2, refinements)
         }
@@ -1613,6 +1620,7 @@ pub(super) fn coalesce_pass(
     bound_at_annotation: std::collections::HashSet<Name>,
     definition_telescopes: HashMap<Name, crate::ccl::infer_var::Telescope>,
     instances: Rc<InstanceTable>,
+    use_capabilities: crate::ccl::capabilities::UseCapabilities,
 ) -> Vec<LocatedInferError> {
     let mut ctx = CoalesceCtx {
         instance_functions: instances.declared_bindings().cloned().collect(),
@@ -1632,6 +1640,7 @@ pub(super) fn coalesce_pass(
         coalesced_by_origin: HashMap::new(),
         discarding: false,
         specializing: Vec::new(),
+        use_capabilities,
         placed: Vec::new(),
         opaque_params_at: Vec::new(),
         assumptions: Vec::new(),
@@ -3713,6 +3722,8 @@ pub(super) fn specialize_use(
         own_params: Some(Rc::clone(&frame.own_params)),
         param_telescope: Some(param_telescope),
         entered_binders,
+        // The clone's capability variables are the use's copies (`capabilities::UseCapabilities`).
+        capability_vars: ctx.use_capabilities.copies(use_expr.node_id()),
         ..FreshenCache::new()
     };
     // Quantified channel-domain names must instantiate to the SAME names the
@@ -3737,6 +3748,9 @@ pub(super) fn specialize_use(
         FreshenLevel::Raise(raise)
     };
     freshen_expr_type_slots(&mut clone, cutoff, target, &mut fresh);
+    // Each use in the clone instantiated through the clone's copies.
+    ctx.use_capabilities
+        .specialize(&origins, &fresh.capability_vars);
 
     // Pin the clone to the use's live instantiation type. Outward, clone below
     // use, the pin connects the clone into the use's component of the live
@@ -3768,7 +3782,7 @@ pub(super) fn specialize_use(
         unreachable!("lookup_generalized returns indices of Generalized entries only");
     };
     let one_way = frame.bound_at_annotation;
-    let mut cache = ConstrainCache::new();
+    let mut cache = ConstrainCache::new().without_capabilities();
     let use_origin = Some(crate::ccl::infer_var::Origin::Node(use_expr.node_id()));
     cache.at(use_origin, use_origin);
     let pinned = constrain_subtype_in(

@@ -11,12 +11,12 @@ use smol_str::SmolStr;
 
 use crate::ast::{
     AnnotationMode, ArmPattern, Arrow, AssignTarget, AssocArg, AugOp, BinOp, BindingTransparency,
-    BoolOp, CmpOp, CompClause, Comprehension, Constructor, ConstructorParam, ConstructorPattern,
-    DiscardHead, EntryForm, Expr, FileId, FunctionSignature, IfBranch, ImplBlock, KeywordArg,
-    KindAnnotation, Lit, MatchArm, MatchPattern, Module, ModuleTypeEntry, Param, PayloadPattern,
-    QualifiedName, RecordField, Requirement, Span, Spanned, Stmt, TraitDecl, TraitItem, TraitType,
-    TypeAnnotation, TypeDecl, TypeDeclBody, TypeParam, UnaryOp, UseItem, VariantPayload,
-    WrittenPath, is_type_name,
+    BoolOp, Clause, CmpOp, CompClause, Comprehension, Constructor, ConstructorParam,
+    ConstructorPattern, DiscardHead, EntryForm, Expr, FileId, FunctionSignature, IfBranch,
+    ImplBlock, KeywordArg, KindAnnotation, Lit, MatchArm, MatchPattern, Module, ModuleTypeEntry,
+    Param, PayloadPattern, QualifiedName, RecordField, Requirement, Span, Spanned, Stmt, TraitDecl,
+    TraitItem, TraitType, TypeAnnotation, TypeDecl, TypeDeclBody, TypeParam, UnaryOp, UseItem,
+    VariantPayload, WrittenPath, is_type_name,
 };
 use crate::builtins::SurfaceBuiltin;
 use crate::lexer::{self, Token};
@@ -1102,6 +1102,7 @@ where
                 name,
                 name_span,
                 annotation,
+                except: Vec::new(),
             });
         let lambda = just(Token::Backslash)
             .ignore_then(
@@ -1134,10 +1135,12 @@ where
                     .map(|(mode, ty)| TypeAnnotation { mode, ty })
                     .or_not(),
             )
-            .map(|((name, name_span), annotation)| Param {
+            .then(except_list(clause_item(expr.clone())).or_not())
+            .map(|(((name, name_span), annotation), except)| Param {
                 name,
                 name_span,
                 annotation,
+                except: except.unwrap_or_default(),
             });
         let forall = just(Token::Forall)
             .ignore_then(
@@ -1240,16 +1243,26 @@ where
             just(Token::DoubleArrow).to(Arrow::Compute),
             just(Token::DataArrow).to(Arrow::Data),
         ));
+        // The clauses after the codomain are this arrow's, so in `A => B => C causes E` the
+        // codomain `B => C causes E` takes them (`docs/chl-spec.md`, "Writing requirements and
+        // effects").
         let fun_type = feed
-            .then(arrow.then(expr.clone()).or_not())
-            .map_with(|(domain, codomain), e| match codomain {
+            .then(
+                arrow
+                    .then(expr.clone())
+                    .then(effect_clauses(expr.clone(), type_requirement(expr.clone())).boxed())
+                    .or_not(),
+            )
+            .map_with(|(domain, rest), e| match rest {
                 None => domain,
-                Some((arrow, codomain)) => Spanned::new(
+                Some(((arrow, codomain), (requires, causes))) => Spanned::new(
                     e.span(),
                     Expr::FunctionType {
                         domain: Box::new(domain),
                         arrow,
                         codomain: Box::new(codomain),
+                        requires: Box::new(requires),
+                        causes: Box::new(causes),
                     },
                 ),
             })
@@ -1626,19 +1639,34 @@ where
             });
 
         // ---- def name(params): body ---------------------------------
+        // A function type's clause runs on through each capitalized item after it, so one in a
+        // parameter list is parenthesized (`docs/chl-spec.md`, "Writing requirements and
+        // effects").
         let param = select! { Token::Ident(s) => s }
             .map_with(|s, e| (s, e.span()))
             .labelled("parameter name")
             .then(
                 annotation_mode()
-                    .then(expr.clone())
-                    .map(|(mode, ty)| TypeAnnotation { mode, ty })
+                    .then(expr.clone().map_with(|ty, e| (ty, e.span())))
+                    .validate(|(mode, (ty, written)), _, emitter| {
+                        if clause_ends(&ty, written) {
+                            emitter.emit(Rich::custom(
+                                written,
+                                "a function type with a `requires` or `causes` clause is \
+                                 parenthesized in a parameter list, `f: (Int => Int causes E)`, \
+                                 since its clause runs on through each capitalized name after it",
+                            ));
+                        }
+                        TypeAnnotation { mode, ty }
+                    })
                     .or_not(),
             )
-            .map(|((name, name_span), annotation)| Param {
+            .then(except_list(clause_item(expr.clone())).or_not())
+            .map(|(((name, name_span), annotation), except)| Param {
                 name,
                 name_span,
                 annotation,
+                except: except.unwrap_or_default(),
             });
         // ---- module statements: import, run, param ------------------
         // (`docs/chl-spec.md`, "9.2 Imports", "9.3 Runs", "9.4 Parameters")
@@ -2029,6 +2057,7 @@ where
                 name: name.node,
                 name_span: name.span,
                 annotation,
+                except: Vec::new(),
             });
         let type_stmt = just(Token::Type)
             .ignore_then(binder)
@@ -2081,14 +2110,15 @@ where
                     .try_map(|items, _| split_params(items))
                     .delimited_by(just(Token::LParen), just(Token::RParen))
                     .then(just(Token::DoubleArrow).ignore_then(expr.clone()).or_not())
-                    .then(requires_clause(expr.clone()).or_not())
+                    .then(effect_clauses(expr.clone(), requirement(expr.clone())).boxed())
                     .then_ignore(just(Token::Colon))
                     .then(block.clone())
                     .map(Some)
                     .recover_with(via_parser(skip_tail.clone().to(None))),
             )
             .map_with(|((owner, name), tail), e| {
-                let Some(((((type_params, params), output), requires), body)) = tail else {
+                let Some(((((type_params, params), output), (requires, causes)), body)) = tail
+                else {
                     let name = owner.map_or_else(
                         || name.node.clone(),
                         |owner| format!("{}::{}", owner.node, name.node).into(),
@@ -2106,7 +2136,8 @@ where
                         type_params,
                         params,
                         output,
-                        requires: requires.unwrap_or_default(),
+                        requires: Box::new(requires),
+                        causes: Box::new(causes),
                         body,
                     },
                 )
@@ -2707,6 +2738,188 @@ where
     )
 }
 
+/// The `requires` and `causes` clauses after a `def` signature or a function type's codomain,
+/// each optional and each defaulting to the clause no one wrote, a `requires` item being what
+/// `requirement` parses.
+///
+/// Spec: `docs/chl-spec.md`, "Writing requirements and effects".
+fn effect_clauses<'src, I, E, R>(
+    expr: E,
+    requirement: R,
+) -> impl Parser<'src, I, (Clause<Requirement>, Clause<TraitType>), PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
+    R: Parser<'src, I, Spanned<Requirement>, PErr<'src>> + Clone,
+{
+    bounded_clause(Token::Requires, requirement)
+        .or_not()
+        .then(bounded_clause(Token::Causes, clause_item(expr)).or_not())
+        .map(|(requires, causes)| (requires.unwrap_or_default(), causes.unwrap_or_default()))
+}
+
+/// A function type's `requires` item: a [`clause_item`], which binds no instance.
+///
+/// A function type's clause items are capitalized names or `_`, never a lowercase name. A clause
+/// runs on through each one, so a function type with a clause is parenthesized in a parameter
+/// list, `def apply(f: (Int => Int causes _), xs)` ([`clause_ends`]). A `def`'s `requires` clause
+/// also takes a named requirement and a bound, `a: Addable(A, B), a::Output <: B`
+/// ([`requirement`]), which end at its `:`.
+fn type_requirement<'src, I, E>(
+    expr: E,
+) -> impl Parser<'src, I, Spanned<Requirement>, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
+{
+    clause_item(expr).map(|ty| {
+        Spanned::new(
+            ty.span,
+            Requirement::Trait {
+                binder: None,
+                ty: ty.node,
+            },
+        )
+    })
+}
+
+/// A clause item: a trait type whose name is capitalized, `Write(x)`, or `_`.
+fn clause_item<'src, I, E>(expr: E) -> impl Parser<'src, I, Spanned<TraitType>, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
+{
+    trait_type(clause_arg(expr)).try_map(|ty, span| {
+        if ty.node.name == "_" || is_type_name(&ty.node.name) {
+            Ok(ty)
+        } else {
+            Err(Rich::custom(
+                span,
+                "a clause item is a capitalized name or `_`",
+            ))
+        }
+    })
+}
+
+/// A clause item's argument: an expression, or a top's `*`, alone, `Write(*)`, or after the
+/// path of a run, `WriteTxn(inv::*)` (`docs/chl-spec.md`, "Writing requirements and effects").
+/// The `*` is a name, `Expr::Name("*")` or an `Expr::Qualified` one, which lowering reads.
+fn clause_arg<'src, I, E>(expr: E) -> impl Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
+{
+    let segment = select! { Token::Ident(s) => s }.map_with(|s, e| Spanned::new(e.span(), s));
+    let star = just(Token::Star).map_with(|_, e| Spanned::new(e.span(), SmolStr::new_static("*")));
+    let top = segment
+        .then_ignore(just(Token::ColonColon))
+        .repeated()
+        .collect::<Vec<_>>()
+        .then(star)
+        .map_with(|(qualifier, name), e| {
+            let node = if qualifier.is_empty() {
+                Expr::Name(name.node)
+            } else {
+                Expr::Qualified(QualifiedName { qualifier, name })
+            };
+            Spanned::new(e.span(), node)
+        });
+    top.or(expr)
+}
+
+/// Whether a clause ends `ty`, a parameter's type written over `written`: the clause of an arrow
+/// on the type's codomain spine that ends where the written type ends, outside any parentheses.
+///
+/// Spec: `docs/chl-spec.md`, "Writing requirements and effects".
+fn clause_ends(ty: &Spanned<Expr>, written: Span) -> bool {
+    let mut at = ty;
+    loop {
+        match &at.node {
+            Expr::FunctionType {
+                codomain,
+                requires,
+                causes,
+                ..
+            } => {
+                if [requires.span, causes.span]
+                    .into_iter()
+                    .flatten()
+                    .any(|clause| clause.end == written.end)
+                {
+                    return true;
+                }
+                at = codomain;
+            }
+            Expr::Forall { body, .. } => at = body,
+            _ => return false,
+        }
+    }
+}
+
+/// `keyword nothing`, or `keyword` with `only` or not before its items: a clause that
+/// `only` or `nothing` makes an upper bound.
+fn bounded_clause<'src, I, T, P>(
+    keyword: Token,
+    item: P,
+) -> impl Parser<'src, I, Clause<T>, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    P: Parser<'src, I, Spanned<T>, PErr<'src>> + Clone,
+    T: Clone,
+{
+    // A parenthesized item with an `except` of its own: `(Write(*) except Write(x))`.
+    let scoped = item
+        .clone()
+        .then(except_list(item.clone()))
+        .delimited_by(just(Token::LParen), just(Token::RParen))
+        .map(|(item, except)| (item, Some(except)));
+    let nothing = just(Token::Nothing).map_with(|_, e| (Some(e.span()), Vec::new()));
+    let listed = just(Token::Only).map_with(|_, e| e.span()).or_not().then(
+        choice((scoped, item.clone().map(|item| (item, None))))
+            .separated_by(just(Token::Comma))
+            .at_least(1)
+            .collect::<Vec<_>>(),
+    );
+    just(keyword)
+        .ignore_then(choice((nothing, listed)))
+        .then(except_list(item).or_not())
+        .map_with(|((only, written), except), e| {
+            let mut items = Vec::new();
+            let mut scoped = Vec::new();
+            for (item, own) in written {
+                match own {
+                    Some(own) => scoped.push((item, own)),
+                    None => items.push(item),
+                }
+            }
+            Clause {
+                span: Some(e.span()),
+                only,
+                items,
+                except: except.unwrap_or_default(),
+                scoped,
+            }
+        })
+}
+
+/// `except` and what it takes away: one item, or a parenthesized list of them, so that a
+/// clause or a bound ends where its item does (`docs/chl-spec.md`, "Writing requirements and
+/// effects").
+fn except_list<'src, I, T, P>(item: P) -> impl Parser<'src, I, Vec<Spanned<T>>, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    P: Parser<'src, I, Spanned<T>, PErr<'src>> + Clone,
+    T: Clone,
+{
+    let listed = item
+        .clone()
+        .separated_by(just(Token::Comma))
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .delimited_by(just(Token::LParen), just(Token::RParen));
+    just(Token::Except).ignore_then(choice((listed, item.map(|i| vec![i]))))
+}
+
 /// One requirement: a trait type, `Addable(A, B)`, and before it the name the requirement
 /// binds its instance to, if it names one; a bound, `a::Output <: T`; a type below another,
 /// `V(k) <: U`; or requirements under a `forall` that binds values, `forall (k: K) V(k) <: U`,
@@ -2778,7 +2991,7 @@ where
                     binder: Some(b),
                     ty: ty.node,
                 }),
-            trait_type(expr.clone()).map(|ty| Requirement::Trait {
+            trait_type(clause_arg(expr.clone())).map(|ty| Requirement::Trait {
                 binder: None,
                 ty: ty.node,
             }),
@@ -2833,6 +3046,16 @@ fn split_params<'src>(
     let mut params: Vec<Param> = Vec::new();
     for item in items {
         if !is_type_name(&item.name) {
+            if let Some(first) = item.except.first() {
+                return Err(Rich::custom(
+                    first.span,
+                    format!(
+                        "`except` follows a type parameter's bound, and `{}` is a value \
+                         parameter",
+                        item.name
+                    ),
+                ));
+            }
             params.push(item);
             continue;
         }
@@ -2876,6 +3099,7 @@ fn type_param<'src>(item: Param) -> Result<TypeParam, Rich<'src, Token, Span>> {
                 AnnotationMode::Exact => KindAnnotation::Kind(ty),
                 AnnotationMode::Bounded => KindAnnotation::Bound(ty),
             }),
+        except: item.except,
     })
 }
 
@@ -3570,7 +3794,7 @@ mod tests {
         assert!(
             matches!(
                 &kind.node,
-                Expr::FunctionType { domain, arrow: Arrow::Compute, codomain }
+                Expr::FunctionType { domain, arrow: Arrow::Compute, codomain, .. }
                     if matches!(&domain.node, Expr::Name(n) if n == "K")
                         && matches!(&codomain.node, Expr::Name(n) if n == "Type")
             ),
@@ -3882,6 +4106,7 @@ mod tests {
             domain,
             arrow: Arrow::Data,
             codomain,
+            ..
         } = parse_e("_ |=> Int").node
         else {
             panic!(
@@ -5234,7 +5459,7 @@ mod tests {
                 params,
                 requires,
                 ..
-            } => (type_params, params, requires),
+            } => (type_params, params, &requires.items),
             other => panic!("expected FunctionDef, got {other:?}"),
         }
     }
@@ -5491,12 +5716,108 @@ mod tests {
             type_params[1].annotation,
             Some(KindAnnotation::Bound(_))
         ));
-        assert!(
-            matches!(body.node, Expr::FunctionType { .. }),
-            "{:?}",
-            body.node
+        // The clause after the codomain is the arrow's, which holds the polymorphic type's
+        // trait requirements with its context requirements.
+        assert!(requires.is_empty());
+        let Expr::FunctionType {
+            requires: arrow, ..
+        } = &body.node
+        else {
+            panic!("expected a FunctionType, got {:?}", body.node);
+        };
+        assert_eq!(arrow.items.len(), 1);
+    }
+
+    // ---- `requires` and `causes` clauses (`docs/chl-spec.md`, "Writing requirements and
+    // effects") ----
+
+    /// The clauses of the module's first statement, a `def`.
+    fn def_clauses(m: &Module) -> (&Clause<Requirement>, &Clause<TraitType>) {
+        match &m.body[0].node {
+            Stmt::FunctionDef {
+                requires, causes, ..
+            } => (requires, causes),
+            other => panic!("expected FunctionDef, got {other:?}"),
+        }
+    }
+
+    fn item_names(items: &[Spanned<TraitType>]) -> Vec<&str> {
+        items.iter().map(|t| t.node.name.as_str()).collect()
+    }
+
+    #[test]
+    fn a_def_writes_both_clauses_and_only_bounds_one() {
+        let m = parse_m(
+            "def f(x) requires ObserveWorld causes only Write(x), RunTransaction:\n    x\n",
         );
-        assert_eq!(requires.len(), 1);
+        let (requires, causes) = def_clauses(&m);
+        assert_eq!(requires.items.len(), 1);
+        assert!(requires.only.is_none());
+        assert!(causes.only.is_some());
+        assert_eq!(item_names(&causes.items), ["Write", "RunTransaction"]);
+    }
+
+    #[test]
+    fn nothing_is_a_bound_with_no_item() {
+        let m = parse_m("def f(x) requires nothing causes nothing:\n    x\n");
+        let (requires, causes) = def_clauses(&m);
+        for (only, items) in [
+            (requires.only, requires.items.len()),
+            (causes.only, causes.items.len()),
+        ] {
+            assert!(only.is_some());
+            assert_eq!(items, 0);
+        }
+    }
+
+    /// A function type with a clause is parenthesized in a parameter list, so the parameter
+    /// after it is not read as another item.
+    #[test]
+    fn a_function_type_in_a_parameter_list_ends_at_its_parenthesis() {
+        let m = parse_m("def apply(f: (Int => Int causes _), xs):\n    xs\n");
+        let Stmt::FunctionDef { params, .. } = &m.body[0].node else {
+            panic!("expected FunctionDef");
+        };
+        assert_eq!(params.len(), 2);
+        let ty = &params[0].annotation.as_ref().expect("annotated").ty.node;
+        let Expr::FunctionType { causes, .. } = ty else {
+            panic!("expected a FunctionType, got {ty:?}");
+        };
+        assert_eq!(item_names(&causes.items), ["_"]);
+    }
+
+    /// A clause runs on through each capitalized name after it, so an unparenthesized one in a
+    /// parameter list is an error, before another parameter or not, and on an inner arrow too.
+    #[test]
+    fn an_unparenthesized_clause_in_a_parameter_list_is_rejected() {
+        for src in [
+            "def g(f: Int => Int causes E, S, s: S):\n    s\n",
+            "def apply(xs, f: Int => Int causes _):\n    xs\n",
+            "def apply(f: Int => Int => Int requires Transaction, xs):\n    xs\n",
+        ] {
+            let msg = custom_error(src);
+            assert!(
+                msg.contains("parenthesized in a parameter list"),
+                "{src}: {msg}"
+            );
+        }
+    }
+
+    /// `=>` groups to the right, so the clauses after the last codomain are the inner
+    /// arrow's.
+    #[test]
+    fn an_arrow_takes_the_clauses_after_its_codomain() {
+        let Expr::FunctionType {
+            codomain, causes, ..
+        } = parse_e("A => B => C causes AffectWorld").node
+        else {
+            panic!("expected a FunctionType");
+        };
+        assert!(causes.items.is_empty());
+        let Expr::FunctionType { causes: inner, .. } = codomain.node else {
+            panic!("expected the codomain to be a FunctionType");
+        };
+        assert_eq!(item_names(&inner.items), ["AffectWorld"]);
     }
 
     #[test]
@@ -5505,10 +5826,16 @@ mod tests {
         let Stmt::AnnAssign { annotation, .. } = &m.body[0].node else {
             panic!("expected an annotated assignment, got {:?}", m.body[0].node);
         };
+        let Expr::Forall {
+            type_params, body, ..
+        } = &annotation.ty.node
+        else {
+            panic!("expected a Forall, got {:?}", annotation.ty.node);
+        };
+        assert_eq!(type_params.len(), 1);
         assert!(matches!(
-            &annotation.ty.node,
-            Expr::Forall { type_params, requires, .. }
-                if type_params.len() == 1 && requires.len() == 1
+            &body.node,
+            Expr::FunctionType { requires, .. } if requires.items.len() == 1
         ));
     }
 

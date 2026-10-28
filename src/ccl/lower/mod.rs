@@ -106,6 +106,7 @@ use crate::{
 };
 use smol_str::SmolStr;
 
+mod clauses;
 mod comprehension;
 mod constants;
 mod exprs;
@@ -630,6 +631,11 @@ pub struct LoweringContext {
     /// application of a family parameter read them.
     pub(super) type_binders: Vec<(SmolStr, Type)>,
 
+    /// The declared type parameters bounded by `Effect` (`true`) or `Context` (`false`),
+    /// which stand for a clause rather than a type (`docs/chl-spec.md`, "Kinds and bounds").
+    /// Keyed by identity, so it needs no scoping: a clause reaches a parameter through the
+    /// alias its definition declares.
+    pub(super) clause_params: HashMap<crate::ccl::ty::TypeParamId, bool>,
     /// The nominal types the module declares, by name (`docs/chl-spec.md`, "Declaring a
     /// nominal type"). Unlike an alias, a nominal type survives lowering as a
     /// [`Type::Nominal`] naming its declaration. Declared only at the top level, so never
@@ -719,6 +725,9 @@ pub struct LoweringContext {
     /// "`_` is the value being refined" a local rule of the predicate rather than
     /// a global meaning of `_`.
     pub(super) in_refinement_predicate: bool,
+    /// How many `Module{…}` literals the type being lowered stands in, where `Module::*` names
+    /// the state of the module the innermost describes (save/restore, as above).
+    pub(super) in_module_type: u32,
 
     /// The [`Type::SharedHole`] id mint, shared with the comprehension phase
     /// (`crate::ccl::comprehension`), which states the same domain equations on
@@ -1314,6 +1323,22 @@ impl LoweringContext {
         names
     }
 
+    /// The type parameter standing for a clause that `name` names at `at`, if it names one.
+    pub(super) fn clause_param(
+        &self,
+        name: &str,
+        at: Span,
+    ) -> Option<crate::ccl::capabilities::ClauseParam> {
+        let AliasAt::InScope(AliasType::Type(Type::Param(param))) = self.type_alias(name, at)
+        else {
+            return None;
+        };
+        let of_causes = *self.clause_params.get(&param.id)?;
+        Some(crate::ccl::capabilities::ClauseParam::whole(
+            Rc::clone(param),
+            of_causes,
+        ))
+    }
     /// What `name` means as a type at `at`, the span of a use.
     pub(super) fn type_alias(&self, name: &str, at: Span) -> AliasAt<'_> {
         let Some(declared) = self.type_aliases.get(name) else {

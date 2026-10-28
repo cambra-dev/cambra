@@ -185,13 +185,15 @@ pub fn run(expr: Expr) -> Expr {
     );
     // Every induction variable is a recurrence now, so nothing reads or writes one.
     crate::ccl::capabilities::discharge(&mut out, &|item| {
-        matches!(
-            item,
-            crate::ccl::capabilities::Capability::Causes(crate::ccl::capabilities::Effect::Write(
-                _
-            ))
-        ) || matches!(item, crate::ccl::capabilities::Capability::Requires(r)
-            if r.requirement().trait_ == crate::ccl::infer::solver::traits::Trait::read())
+        use crate::ccl::capabilities::{Capability, Effect, Family};
+        match item {
+            Capability::Causes(e) => matches!(e, Effect::Write(_)),
+            Capability::Requires(r) => {
+                r.requirement().trait_ == crate::ccl::infer::solver::traits::Trait::read()
+            }
+            Capability::Every(top) => matches!(top.family, Some(Family::Write | Family::Read)),
+            Capability::Param(_) => false,
+        }
     });
     out
 }

@@ -14,7 +14,7 @@
 // hazard therefore doesn't apply here.
 #![allow(clippy::mutable_key_type)]
 
-use crate::ccl::capabilities::{Capabilities, Capability, Filter, Repr, ScopedCapability};
+use crate::ccl::capabilities::{Capabilities, Filter, Repr, ScopedCapability};
 use crate::ccl::nominal::{Variance, sides};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -305,6 +305,10 @@ pub struct ConstrainCache {
     /// walk's entry: this cache lives across walks, and a proxy minted inside a `let` that
     /// has since been generalized must not stand in for its original anywhere else.
     extruded: HashMap<Level, ExtrudeCache>,
+    /// Whether a `Fun`/`Fun` edge relates the two sides' capabilities. A specialization pin does
+    /// not: uses that differ only in what they cause share one clone, and relating their
+    /// capabilities through it would give each the others' ([`Self::without_capabilities`]).
+    relates_capabilities: bool,
 }
 
 /// The derivation a [`ConstrainCache`] serves: what the solver is doing when it
@@ -357,7 +361,15 @@ impl ConstrainCache {
             failure: None,
             unreported: Vec::new(),
             extruded: HashMap::new(),
+            relates_capabilities: true,
         }
+    }
+
+    /// This cache, relating no capabilities: each use's capabilities were collected apart at its
+    /// instantiation, and a pin relates only what chooses its clone.
+    pub fn without_capabilities(mut self) -> Self {
+        self.relates_capabilities = false;
+        self
     }
 
     /// Draw the next edge with its value from `value` and its demand from `demand`:
@@ -700,24 +712,42 @@ fn kind_edge_subst(own: &Subst, far: &Type, far_subst: &Subst) -> Subst {
 ///
 /// A known set on the right is a ceiling only where a written clause states it, and no
 /// clause is written yet, so a known right side records nothing.
-fn constrain_capabilities(e0: &Capabilities, e1: &Capabilities) {
+// Kept out of line: `constrain_go_impl` recurses through every type, and the edge's
+// `Filter` would otherwise widen each of its frames.
+#[inline(never)]
+fn constrain_capabilities(e0: &Capabilities, e1: &Capabilities, cache: &ConstrainCache) {
+    if !cache.relates_capabilities {
+        return;
+    }
     match (e0.repr(), e1.repr()) {
-        (Repr::Var(v0), Repr::Var(v1)) => v1.flows_from(v0, Filter::default()),
+        // Each label crossing the edge entered at the value's node: an argument passed where
+        // a written function type bounds it is where a label beyond the bound is reported.
+        (Repr::Var(v0), Repr::Var(v1)) => v1.flows_from(
+            v0,
+            Filter {
+                at: match cache.origins.0 {
+                    Some(Origin::Node(node)) => Some(node),
+                    _ => None,
+                },
+                ..Filter::default()
+            },
+        ),
         (Repr::Known(set), Repr::Var(v1)) => {
-            for r in &set.requires {
+            for item in set.items() {
                 v1.record(ScopedCapability {
-                    item: Capability::Requires(r.clone()),
+                    item,
                     bound: crate::ccl::capabilities::Bound::Escaping,
-                });
-            }
-            for e in &set.causes {
-                v1.record(ScopedCapability {
-                    item: Capability::Causes(e.clone()),
-                    bound: crate::ccl::capabilities::Bound::Escaping,
+                    at: None,
                 });
             }
         }
+        // A known set is a type the compiler built or materialized, which bounds nothing: a
+        // written type's clauses are normalized to a bounded variable
+        // (`InferCtx::normalize_annotation`).
         (_, Repr::Known(_)) => {}
+        (Repr::Written(_), _) | (_, Repr::Written(_)) => {
+            unreachable!("written clauses are normalized before the solver relates them")
+        }
     }
 }
 
@@ -1632,7 +1662,7 @@ fn constrain_go_impl(
             // kinds turn out to be, and how their binders correspond, is read once the kind
             // graph is closed.
             constrain_fun_kind(k0, k1, lhs, rhs, sl, sr)?;
-            constrain_capabilities(e0, e1);
+            constrain_capabilities(e0, e1, cache);
             // **Binders correspond by position across this edge.** A sum's binders are its
             // kind's positions, so position `i` of one side is position `i` of the other,
             // and the edge carries that correspondence in its own substitution — the Σ

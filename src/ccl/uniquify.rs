@@ -528,6 +528,15 @@ impl Uniquifier {
     /// (see module docs), with every occurrence re-pointed at the rebuilt `Rc`
     /// via `memo`.
     fn ty(&mut self, t: &mut Type) {
+        // A written clause's variables resolve here, as a predicate's free variables do: in
+        // the scope the clause is written in (`docs/chl-spec.md`, "Writing requirements and
+        // effects"). A name that resolves to no binder stays raw, and inference refuses it.
+        if let Type::Fun { capabilities, .. } = t
+            && let crate::ccl::capabilities::Repr::Written(written) = capabilities.repr()
+        {
+            let resolved = written.map_names(|n| self.resolve(n).unwrap_or_else(|| n.clone()));
+            *capabilities = crate::ccl::capabilities::Capabilities::written(resolved);
+        }
         if let Type::Refinement(_, refinements) = t {
             // A handle clone, so `self` stays freely borrowable for the rebuild —
             // which re-enters this same memo through `self.expr` → `self.ty`.

@@ -733,6 +733,31 @@ pub(crate) fn run(
     }
 }
 
+/// An error for each capability variable's upper bound that its capabilities exceed, at the node where
+/// the first capability beyond it entered, with the clause or the written type as the secondary
+/// label.
+fn push_capability_failures(errors: &mut Vec<LocatedInferError>, expr: &Expr) {
+    use crate::ccl::capabilities::Blame;
+    use crate::ccl::infer_var::Origin;
+    for failure in crate::ccl::capabilities::exceeded_uppers() {
+        let item = failure.capability.item.to_string();
+        let (error, written) = match failure.blame {
+            Blame::Clause(at) => (InferError::CapabilityBeyondClause { item }, at),
+            Blame::Written(at) => (InferError::CapabilityNotStated { item }, at),
+            Blame::Bound(at) => (InferError::CapabilityBeyondBound { item }, at),
+        };
+        errors.push(
+            LocatedInferError {
+                error,
+                node_id: failure.capability.at.unwrap_or_else(|| expr.node_id()),
+                also: Box::default(),
+                related: RelatedPositions::default(),
+            }
+            .with_failure((None, Some(Origin::Written(written)))),
+        );
+    }
+}
+
 /// The scheme each generalized binding a module check reports was bound at.
 pub(crate) type NotedSchemes = Vec<(Name, solver::display::InferredPoly)>;
 
@@ -1245,6 +1270,14 @@ fn run_once(
         return Err(sub_ctx.failure(errors));
     }
 
+    // Each capability variable's capabilities are complete once emission is, so its upper bounds are
+    // checked here (`src/ccl/design/type-inference.md`, "Capability variables").
+    push_capability_failures(&mut errors, expr);
+    errors.extend(sub_ctx.requirements_beyond_clauses());
+    if !errors.is_empty() {
+        return Err(sub_ctx.failure(errors));
+    }
+
     // The graph is complete here and nothing has been materialized yet — the one
     // point at which eager trait narrowing can be checked against the ground truth
     // it was approximating incrementally. Debug-only, and it leaves the graph as it
@@ -1358,6 +1391,7 @@ fn run_once(
         std::mem::take(&mut sub_ctx.bound_at_annotation),
         std::mem::take(&mut sub_ctx.definition_telescopes),
         Rc::clone(instances),
+        std::mem::take(&mut sub_ctx.use_capabilities),
     );
     sub_ctx.name_varying_binders(&mut errors);
     sub_ctx.name_other_feed_places(&mut errors);
@@ -1392,10 +1426,7 @@ fn run_once(
         .escaping
         .into_iter()
         .map(|(node, name, capability)| {
-            let item = match &capability.item {
-                crate::ccl::capabilities::Capability::Requires(r) => r.to_string(),
-                crate::ccl::capabilities::Capability::Causes(e) => e.to_string(),
-            };
+            let item = capability.item.to_string();
             LocatedInferError::new(
                 InferError::VariablePastItsScope {
                     member: name.base().to_string(),

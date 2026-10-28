@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::traits::{TraitObligation, TraitObligationId};
-use crate::ccl::capabilities::{Capabilities, CapabilityVar, CapabilityVarId, Repr};
+use crate::ccl::capabilities::{Capabilities, Capability, CapabilityVar, CapabilityVarId, Repr};
 use crate::ccl::infer_var::Telescope;
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::TraitRequirement;
@@ -65,6 +65,9 @@ pub struct Instance {
     /// The scheme's `requires` clause, freshened through the same copy: the use
     /// mints an obligation for each.
     pub requires: Vec<TraitRequirement>,
+    /// The copy of each capability variable the scheme reaches, by the original's id
+    /// ([`FreshenCache::capability_vars`]), which the specialization the use mints takes.
+    pub capability_copies: HashMap<CapabilityVarId, Rc<CapabilityVar>>,
 }
 
 impl PolyScheme {
@@ -168,6 +171,7 @@ impl PolyScheme {
             ty,
             bounds,
             requires,
+            capability_copies: cache.capability_vars,
         }
     }
 
@@ -382,12 +386,38 @@ fn freshen_capability_var(
     let f = CapabilityVar::fresh(target.level_of(v.level()));
     // Cached before the edges are copied, so a cycle reaches the copy.
     cache.capability_vars.insert(v.uid, Rc::clone(&f));
+    // A capability naming a parameter that stands for a clause is the definition's rigid stand-in
+    // for what each use passes (`InferCtx::open_poly`); a use's copy holds what its arguments
+    // bring instead.
     for capability in v.own() {
-        f.record(capability);
+        if !matches!(capability.item, Capability::Param(_)) {
+            f.record(capability);
+        }
     }
     for (source, filter) in v.incoming() {
         let source = freshen_capability_var(lim, &source, target, cache);
         f.flows_from(&source, filter);
+    }
+    // Each use answers the bounds the definition states: a use's arguments can add capabilities
+    // its copy holds and the definition's variable never does. A part a parameter stands in
+    // admits whatever the use passes there, and the definition was checked against it, less what
+    // the clause takes from the parameter: the top of its direction less that.
+    for mut upper in v.uppers() {
+        for param in std::mem::take(&mut upper.set.params) {
+            if !param.except.is_empty() {
+                upper.set.add_every(
+                    crate::ccl::capabilities::Every::of_direction(param.of_causes)
+                        .less(param.except.iter().cloned()),
+                );
+            } else if param.of_causes {
+                upper.of_causes = false;
+            } else {
+                upper.of_requires = false;
+            }
+        }
+        if upper.of_requires || upper.of_causes {
+            f.bound_above(upper);
+        }
     }
     f
 }
@@ -508,6 +538,10 @@ fn freshen_level(ty: &Type) -> Level {
             .map(|a| predicate_level(&a.term))
             .fold(app.param.opened_at.unwrap_or(0), Level::max),
         Type::ChanDom(_, l) => l.0,
+        // A capability variable is copied like any variable above the cutoff, so a type whose
+        // only quantified content is a function's capabilities is not returned verbatim: each use
+        // would add its arguments' capabilities to the definition's own variable.
+        Type::Fun { capabilities, .. } => capabilities.level(),
         _ => 0,
     };
     for r in ty.refinements() {
@@ -763,6 +797,9 @@ pub fn freshen_above(
                         Capabilities::var(freshen_capability_var(lim, v, target, cache))
                     }
                     Repr::Known(_) => capabilities.clone(),
+                    Repr::Written(_) => {
+                        unreachable!("a scheme's written clauses are normalized when it is bound")
+                    }
                 },
             };
             // The parts of a function whose kind may bind witnesses sit under those binders.

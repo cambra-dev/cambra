@@ -2,6 +2,7 @@
 //! parameters replaced by their arguments, and with a Module type's type members.
 
 use super::*;
+use crate::ccl::capabilities::{Owner, replace_owners};
 use crate::ccl::nominal::NominalDecl;
 use crate::ccl::{Pattern, PatternHead};
 
@@ -106,6 +107,13 @@ pub(super) fn substitute_in(expr: &mut Expr, arguments: &Arguments) {
     expr.walk_children_mut(|child| substitute_in(child, arguments));
 }
 
+/// `expr` with each owner of a top its types' clauses hold replaced by what `f` gives for it
+/// ([`replace_owners`]).
+pub(super) fn replace_owners_in(expr: &mut Expr, f: &impl Fn(&Owner) -> Option<Owner>) {
+    expr.walk_type_slots_mut(|ty| replace_owners(ty, f));
+    expr.walk_children_mut(|child| replace_owners_in(child, f));
+}
+
 /// `decl` as the instance `arguments` reach, when it reaches any of them
 /// ([`NominalDecl::substituted`]).
 pub(in crate::ccl::lower) fn substitute_decl(decl: &mut Rc<NominalDecl>, arguments: &Arguments) {
@@ -136,8 +144,14 @@ pub(super) fn instantiate(prefix: &QualifiedName, ty: &Rc<ModuleType>) -> Rc<Mod
             }
         }
         for entry in &mut ty.entries {
-            if let AliasType::Module(inner) = &mut entry.ty {
-                fresh(&prefix.child(entry.name.clone()), Rc::make_mut(inner), map);
+            match &mut entry.ty {
+                AliasType::Module(inner) => {
+                    fresh(&prefix.child(entry.name.clone()), Rc::make_mut(inner), map);
+                }
+                // `Module::*` in an entry is the state of the module the parameter takes.
+                AliasType::Type(ty) => replace_owners(ty, &|owner| {
+                    (*owner == Owner::Module).then(|| Owner::Qualifier(prefix.to_string().into()))
+                }),
             }
         }
     }
