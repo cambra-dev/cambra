@@ -214,3 +214,33 @@ fn select_field_over_a_product_of_collections_sends_everything() {
     };
     assert_widens(&product, 0);
 }
+
+fn variant_wrap(input: Tiling, level: CurryLevel) -> Built {
+    let (input, consumer) = feed(input);
+    let wrap = VariantWrap::new_at(
+        input,
+        crate::ccl::FieldKey::Index(0),
+        crate::ccl::TagMap::from_arms(vec![(crate::ccl::FieldKey::Index(0), int())]),
+        level,
+    );
+    (Box::new(wrap), vec![consumer])
+}
+
+fn wrapped_stream() -> Built {
+    variant_wrap(ints(), CurryLevel::new(1))
+}
+
+#[test]
+fn variant_wrap_forwards_the_region_of_a_stream() {
+    assert_keeps(&wrapped_stream, 0);
+    assert_keeps_without_state(&wrapped_stream, 0);
+}
+
+/// At the outermost level the payload becomes one union value, which has no keys.
+#[test]
+fn variant_wrap_at_the_outermost_level_sends_everything() {
+    assert_widens(
+        &|| variant_wrap(Tiling::Scalar(int()), CurryLevel::OUTERMOST),
+        0,
+    );
+}
