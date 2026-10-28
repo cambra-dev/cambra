@@ -805,7 +805,8 @@ impl ProvenanceTable {
 
     /// Recorded IDs produced from `start` through `end` inclusive and absent
     /// from `live`, sorted by ID. Requires `start <= end` (debug-asserted).
-    /// Phase declaration order defines the range.
+    /// Phase declaration order defines the range. It describes an exact pipeline interval
+    /// only at pane-pair granularity: a tag's runs can interleave with another tag within a pair.
     ///
     /// Unlike [`fold`]'s input-minus-output deaths, this query can include products
     /// born and discarded between boundaries, but excludes nodes with no selected

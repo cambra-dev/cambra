@@ -155,25 +155,13 @@ pub enum WitnessMapping {
     Discharge(Type),
 }
 
-/// Hand-written so that **copying a substitution does not duplicate its terms**
-/// — the one place `TypedExpr`'s freshening `Clone` is deliberately opted out
-/// of, and the reason it can be opted out of exactly here.
+/// Copy substitution templates without freshening their expression IDs.
+/// A template is not another live-tree occurrence; placement performs the copy
+/// needed for each use. See `src/ccl/design/provenance.md`, "Duplication".
 ///
-/// A `Discharge` payload is a **template**, not a tree node. It is cloned again
-/// at every read ([`Mapping::as_expr`] / [`as_expr_preserving`]), and *that*
-/// read is where the sibling gets minted, once per occurrence actually filled.
-/// So copying the map itself must mint nothing: the template is never in a tree,
-/// and no two nodes can end up sharing an id because of it.
-///
-/// Without this, every `Subst` copy inherits the freshening and re-mints its
-/// payloads. The solver copies substitutions constantly — `Bound::render_subst`,
-/// [`Subst::then`], `compact`, `constrain` — and a bound edge's payloads are **type-domain**
-/// terms whose ids are outside the recorded id domain, so each such copy records
-/// a `Copy` against an origin the table never saw and the pane fold reports it as
-/// [`Leak::DanglingParent`](crate::ccl::provenance::Leak::DanglingParent). Measured on
-/// `generator_pipeline`: 200 of them between the first two panes.
-///
-/// [`as_expr_preserving`]: Mapping::as_expr_preserving
+/// Freshening at map-copy time would allocate intermediate products even when
+/// no occurrence is replaced. Recorded intermediates are permitted, but an
+/// unrecorded origin can cause a dangling-parent leak.
 impl Clone for Mapping {
     fn clone(&self) -> Self {
         match self {
@@ -183,21 +171,10 @@ impl Clone for Mapping {
     }
 }
 
-/// A substitution must never leave a **typed** occurrence holding an untyped
-/// replacement.
-///
-/// Every term a substitution fabricates goes through
-/// [`Mapping::as_expr`]/[`as_expr_preserving`](Mapping::as_expr_preserving), so this is
-/// the one boundary that owns the invariant. It is load-bearing rather than tidy: a
-/// substitution fires *inside refinement predicates*, and a predicate's interior is
-/// outside the walk that resolves node types — so an untyped node introduced here is
-/// never typed by anything downstream, and surfaces at the post-inference wall as an
-/// unresolved variable with no way to recover the type except a lexical-scope guess.
-///
-/// A hard `assert!`, not a `debug_assert!`: it is O(1) on a path that would otherwise
-/// silently produce a type nothing can reconstruct. An *untyped* occurrence carries no
-/// obligation — substitution runs before inference too (lowering's uncurry template
-/// discharge, the chained-comparison operand freshens), where every slot is `Hole`.
+/// Reject a Hole-typed replacement when the occurrence has a non-Hole type.
+/// This is an unconditional assertion, including release builds. It does not
+/// check full type compatibility or reject every unresolved type variant.
+/// Pre-inference Hole occurrences impose no requirement here.
 #[track_caller]
 fn assert_preserves_typedness(replacement: &TypedExpr, occurrence_ty: &Type) {
     assert!(
@@ -210,19 +187,12 @@ fn assert_preserves_typedness(replacement: &TypedExpr, occurrence_ty: &Type) {
 }
 
 impl Mapping {
-    /// The mapping's replacement as a term (a `Rename` materializes as a bare
-    /// variable reference). The replacement carries a **new** identity
-    /// throughout: a fresh mint for a `Rename`, and — since `Clone` freshens —
-    /// a wholly fresh node-set for a `Discharge`, rather than the template's own
-    /// ids duplicated into every occurrence it fills.
+    /// Materialize a replacement with ordinary fresh expression IDs.
+    /// Rename retains the occurrence type; Discharge clones the template's type
+    /// and value. The typedness assertion applies to either result.
     fn as_expr(&self, occurrence_ty: &Type) -> TypedExpr {
         let out = match self {
-            // α-renaming cannot change a term's type: the occurrence's type is a
-            // property of the *position*, not of the name, so the replacement
-            // carries it. Building a bare `TypedExpr::var` here would leave the
-            // node at `Type::Hole` — and a rename fires inside refinement
-            // predicates, which no later pass types, so the hole would survive to
-            // the post-inference check.
+            // A renamed occurrence retains its type, including inside predicates.
             Mapping::Rename(to) => TypedExpr::var(to.clone()).with_ty(occurrence_ty.clone()),
             Mapping::Discharge(t) => (**t).clone(),
         };
@@ -230,17 +200,9 @@ impl Mapping {
         out
     }
 
-    /// [`as_expr`](Self::as_expr) at the **occurrence's own identity**: the
-    /// replacement's root takes `node_id`, so attribution at that position stays
-    /// the use site's rather than becoming the template's.
-    ///
-    /// A `Rename` is built directly at `node_id` rather than minted and then
-    /// overwritten: a mint fires `on_mint`, and an id no node ends up carrying is
-    /// a phantom birth in the provenance record.
-    ///
-    /// A `Discharge` copies through [`clone_at`](TypedExpr::clone_at), which
-    /// builds the replacement's root directly at `node_id` and freshens the
-    /// interior. Neither shape mints an id that no node ends up carrying.
+    /// Materialize at the replaced occurrence's root ID. Rename constructs directly
+    /// at that ID; Discharge uses clone_at and freshens the interior.
+    /// The root therefore retains use-site attribution without an unused root mint.
     fn as_expr_preserving(&self, node_id: NodeId, occurrence_ty: &Type) -> TypedExpr {
         let out = match self {
             // See [`as_expr`]: the rename keeps the occurrence's type.
@@ -985,58 +947,27 @@ impl Subst {
         self.rewrite_expr_go(e, &PredMemo::new());
     }
 
-    /// Discharge `binder ↦ term` over `e` **in place**, cloning `term` only
-    /// when `binder` actually occurs free in `e`. A vacuous substitution
-    /// costs one [`is_free`] walk and **no clone** — the pass-level callers
-    /// (lambda elimination, channelization, lowering's uncurrying)
-    /// substitute into many subtrees that never mention the binder, so
-    /// cloning `term` for those would be pure waste.
+    /// Substitute in place only if the binder occurs free. The stored template
+    /// preserves IDs; replacing occurrences retain their root IDs and freshen
+    /// replacement interiors. A vacuous substitution does not clone the template.
     pub fn discharge_in_place(e: &mut TypedExpr, binder: &Name, term: &TypedExpr) {
         if !is_free(binder, e) {
             return;
         }
-        // `term` is a *template*: `as_expr` clones it afresh at every occurrence
-        // it fills, and that read is where each sibling is minted. Copying it
-        // into the map must therefore mint nothing — a freshening clone here
-        // builds one whole extra tree per call that no occurrence ever uses.
+        // The template itself is not placed in the tree; each replacement is
+        // materialized by as_expr_preserving.
         Subst::discharge(binder.clone(), term.clone_preserving_ids()).rewrite_expr(e);
     }
 
-    /// Discharge a whole **environment** `{name ↦ term, …}` over `e` — every name
-    /// at once, in one traversal.
+    /// Apply an environment simultaneously in one expression traversal.
     ///
-    /// The env-shaped sibling of [`Self::discharge_in_place`], for the
-    /// read-your-writes environments the mutability-elimination phases thread
-    /// (`mut_elim`, `transact_phase`): a flat map with no binder structure,
-    /// applied to a whole subtree.
+    /// Only free keys are copied into the substitution. Replacements are not
+    /// recursively substituted by other entries: `{a ↦ b, b ↦ 0}` maps a to b.
+    /// Sequential single-key substitution would have different semantics.
     ///
-    /// **Simultaneous, not a fold of single-name discharges.** [`Subst`] is
-    /// already a simultaneous map, so this is a constructor over it rather than a
-    /// second engine. A sequential fold would re-substitute into a replacement
-    /// that mentions another env key, sending `{a ↦ b, b ↦ 0}`'s `a` to `0`
-    /// instead of to `b`. A read-your-writes environment resolves each value
-    /// against the environment before storing it, so caller ranges are key-free
-    /// today — a property of the callers, not of the operation.
-    ///
-    /// Each replaced occurrence keeps its own `NodeId`, so N reads give N distinct
-    /// roots; the contract is in [`Mapping::as_expr_preserving`] and
-    /// [`Self::rewrite_expr_go`], and its rationale in
-    /// `src/ccl/design/provenance.md`, "Duplication".
-    ///
-    /// Only the entries free in `e` are cloned into the substitution — the same
-    /// "vacuous costs no clone" discipline as the single-name sibling, and it
-    /// pays more here, since a writer's environment holds one fully-inlined value
-    /// per register and most subtrees mention none of them. The selection is one
-    /// traversal ([`free_among`], which carries the cost argument), not one per
-    /// entry.
-    ///
-    /// Two hard `assert!`s ride this path, release-live rather than debug
-    /// tripwires: [`assert_preserves_typedness`] fires if an environment value is
-    /// untyped against a typed occurrence, and [`Self::assert_no_capture`] fires
-    /// if the environment's range mentions a binder the walk passes under. The
-    /// mutability phases satisfy both — they run post-inference over α-unique
-    /// names — and the asserts make that an enforced precondition rather than a
-    /// comment.
+    /// Occurrence roots retain IDs and replacement interiors freshen. The
+    /// typedness and capture assertions remain active in release builds.
+    /// See `src/ccl/design/provenance.md`, "Duplication", for placement identities.
     pub fn discharge_env_in_place(mut e: TypedExpr, env: &HashMap<Name, TypedExpr>) -> TypedExpr {
         let live_names = free_among(env.keys(), &e);
         let live: BTreeMap<Binder, Mapping> = env
@@ -1048,17 +979,10 @@ impl Subst {
         e
     }
 
-    /// Discharge `env` into a **binder's declared type**.
-    ///
-    /// A binder a caller holds beside its definition — `(TypedBinding, TypedExpr)`, as the
-    /// mutability-elimination phases pass a recurrence's binding around — is not inside any
-    /// expression tree, so [`discharge_env_in_place`](Self::discharge_env_in_place) cannot
-    /// reach it. Rewriting only the definition leaves the two halves disagreeing about the
-    /// same type, which surfaces later as a mismatch between a binding and its own body.
-    ///
-    /// A binder's type is written in the *enclosing* scope — a binder does not bind in its
-    /// own type — so the substitution applies unrestricted, exactly as it does to a binder
-    /// type the walk reaches inside a tree.
+    /// Substitute into a detached binding's declared type and optional annotation.
+    /// An expression walk cannot reach a binding held separately from its definition.
+    /// Both slots are in the enclosing scope, so this does not shadow the binding's
+    /// own name. Include only environment keys free in either slot.
     pub fn discharge_env_in_binder(b: &mut TypedBinding, env: &HashMap<Name, TypedExpr>) {
         let live: BTreeMap<Binder, Mapping> = env
             .iter()
