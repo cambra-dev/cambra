@@ -4,6 +4,7 @@
 //! and are used by [`crate::ccl::context`] to wire compiled sink operators into
 //! the scheduler.
 
+use crate::interpreter::Projection;
 use std::{
     cell::RefCell,
     rc::Rc,
@@ -138,7 +139,7 @@ impl SinkConsumer {
     /// at once: the version a reload replaces hands its state to its successor, and one
     /// replaced before it was ever pulled has opened none to hand on.
     pub fn pull_now(&self) {
-        self.pull.borrow_mut().notify();
+        self.pull.borrow_mut().notify(&Projection::Everything);
     }
 
     /// Stop dispatching and release the producer chain behind this consumer.
@@ -159,7 +160,7 @@ impl SinkConsumer {
 impl Consumer for SinkConsumer {
     /// Schedules one pull rather than pulling. A change reaches the sink once along every
     /// path from where it happened, and the queue holds a pull once however many arrive.
-    fn notify(&mut self) {
+    fn notify(&mut self, _arrived: &Projection) {
         self.wakeups.request(self.pull.clone());
     }
 }
