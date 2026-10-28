@@ -55,9 +55,11 @@ impl TileOperator for Aggregate {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let input_producer =
-            self.input
-                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+        let input_producer = self.input.subscribe(
+            self.input.tiling().universal_guard(),
+            widening(consumer),
+            scheduler,
+        );
         Box::new(AggregateProducer::new(
             ProducerBase::new(
                 AggregateProducer::alloc_id(),
@@ -229,9 +231,11 @@ impl TileOperator for ExtractAggregate {
                 &self.base,
                 scheduler,
             ),
-            input: self
-                .input
-                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler),
+            input: self.input.subscribe(
+                self.input.tiling().universal_guard(),
+                widening(consumer),
+                scheduler,
+            ),
             kind: self.kind,
             only_terminal: self.only_terminal,
         })
@@ -359,9 +363,11 @@ impl TileOperator for MapExtractAggregate {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let input_producer =
-            self.input
-                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+        let input_producer = self.input.subscribe(
+            self.input.tiling().universal_guard(),
+            widening(consumer),
+            scheduler,
+        );
         Box::new(MapExtractAggregateProducer {
             base: ProducerBase::new(
                 MapExtractAggregateProducer::alloc_id(),
@@ -622,9 +628,11 @@ impl TileOperator for MapAggregate {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let input_producer =
-            self.input
-                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+        let input_producer = self.input.subscribe(
+            self.input.tiling().universal_guard(),
+            widening(consumer),
+            scheduler,
+        );
         Box::new(MapAggregateProducer {
             base: ProducerBase::new(
                 MapAggregateProducer::alloc_id(),
