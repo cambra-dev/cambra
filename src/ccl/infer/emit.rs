@@ -2000,9 +2000,15 @@ pub(super) fn emit_let<C: Typing>(
     // A right-hand side holding a statement recovered from has untyped nodes, so, like one
     // that did not type, it has no value to discharge.
     let defined = defined && ctx.recoveries() == recoveries_before;
+    // A `defer()` declares the feed the `let` binds. Any other `let` of a feed names one
+    // declared elsewhere, a parameter's or another module's, which is not this scope's.
+    let declares_feed = matches!(bound_expr.node, TypedExprNode::Defer);
     // The body passes its value along, as every tail does: a mutable variable it ends in is
     // read.
     let body_ty = ctx.scoped_let(binding, defined.then_some(&*bound_expr), scheme, |ctx| {
+        if declares_feed {
+            ctx.declare_mutable(&binding.name, &binding.ty);
+        }
         emit_passed_read(body, ctx)
     })?;
     // Lifting the body type out of the binder's scope must close it over the
