@@ -2454,6 +2454,7 @@ mod tests {
                     RefinementSet::one(Refinement::born(Rc::new(pred()))),
                 )),
                 codomain: Box::new(Type::Base(BaseType::Int)),
+                effects: crate::ccl::effects::Effects::none(),
             },
         });
         // The cast goes away; its predicate term survives as a sibling.
@@ -2513,6 +2514,7 @@ mod tests {
                         RefinementSet::one(Refinement::born(Rc::new(pred))),
                     )),
                     codomain: Box::new(Type::Base(BaseType::Int)),
+                    effects: crate::ccl::effects::Effects::none(),
                 },
             })
         };

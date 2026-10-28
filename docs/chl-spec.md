@@ -3375,10 +3375,15 @@ is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 
 ### 6.9 Capabilities
 
-**[Decided]** — the rules of this section, apart from trait requirements
-([Trait requirements](#trait-requirements)) and the `Write` and `Append` effects of a function's
-body, read off the body rather than stated in its type
-([3. Expression semantics](#3-expression-semantics)), which are implemented.
+**[Decided]** — written clauses, tops and a run's state
+([Writing requirements and effects](#writing-requirements-and-effects)); the feeds that belong to
+the run ([Discharging requirements and effects](#discharging-requirements-and-effects)); the rule
+that nothing leaving a scope names a variable whose history the scope ends; a written `Transaction`,
+a function's `Transaction` supplied by the block that calls it, and block footprints; effects in
+traits ([Effects in traits](#effects-in-traits)); outputs outside the program
+([Output outside the program](#output-outside-the-program)); readings
+([Inputs from outside the program](#inputs-from-outside-the-program)); and exceptions
+([Exceptions](#exceptions)). The rest of this section is implemented.
 
 A function's type states what a call reads from its context, in its **`requires` clause**, and what
 the call contributes besides its result, in its **`causes` clause**. A requirement is an input that
@@ -4552,10 +4557,11 @@ Additional sources may be pre-registered by the host embedding (testing,
 demos, etc.). `std::time` adds a clock read and an alarm source and sink
 ([7.5 Time [Decided]](#75-time-decided)).
 
-**[Decided]** Opening a source requires `ObserveWorld`, and binding a sink causes `AffectWorld`
-([Inputs from outside the program](#inputs-from-outside-the-program),
-[Output outside the program](#output-outside-the-program)). A reading, such as the clock, is a
-call of a `@Builtin` function a std module declares ([9.16 The std root](#916-the-std-root)).
+Opening a source requires `ObserveWorld`
+([Inputs from outside the program](#inputs-from-outside-the-program)). **[Decided]** — binding a
+sink causes `AffectWorld` ([Output outside the program](#output-outside-the-program)), and a
+reading, such as the clock, is a call of a `@Builtin` function a std module declares
+([9.16 The std root](#916-the-std-root)).
 
 `http_serve` opens its route when the program starts, so a call is the
 whole right-hand side of a `=` in the top-level block, and its three
@@ -4922,11 +4928,11 @@ for req in incr_reqs:
   own is a nested transaction.
 - **Nested transactions are rejected** — a block commits as one unit, so a
   `with` inside it has no coherent meaning.
-- **[Decided]** A block causes `RunTransaction`, and its body supplies `Transaction` to what it
-  calls. A body that causes `RunTransaction`, directly or through a call, is the nested transaction
-  above ([Discharging requirements and effects](#discharging-requirements-and-effects)). An
-  exception that escapes the block aborts it: none of its writes commits and no output inside it is
-  sent ([Exceptions](#exceptions)).
+- A block causes `RunTransaction`. A body that causes `RunTransaction`, directly or through a call,
+  is the nested transaction above
+  ([Discharging requirements and effects](#discharging-requirements-and-effects)). **[Decided]** —
+  its body supplies `Transaction` to what it calls, and an exception that escapes the block aborts
+  it: none of its writes commits and no output inside it is sent ([Exceptions](#exceptions)).
 - **Branch guards and tag dispatch.** A block may carry `if`/`elif`/`else`
   guards, more than one of them, and `match` dispatch. Each branch's
   writes are scoped to its own path and the transaction commits on the
@@ -5198,8 +5204,8 @@ Supporting decisions (same source):
   Cambra compiles to static dataflow; handler-based effects make control
   flow non-local and data flow handler-dependent — exactly what the
   dataflow compiler cannot see through. `requires Transaction` is ordinary
-  dictionary passing, resolved by the same solver that will serve general
-  typeclasses.
+  dictionary passing: `Transaction` is a context trait whose instance the
+  enclosing block supplies ([6.9 Capabilities](#69-capabilities)).
 - **Locally-scoped transactions, not global coherence.** A fresh transaction is
   minted per `with begin():` block; many exist over a program's life.
 - **[Open] — domains.** Every transaction is the one global domain's. A domain index,
@@ -6006,7 +6012,7 @@ names.
 - **Imports are read through contracts.** A module sees each member another module exports through
   its contract, and whether the module is shareable
   ([9.7 Importing asserts a shareable module](#97-importing-asserts-a-shareable-module)).
-  **[Decided]** A function's contract includes its `requires` and `causes` clauses.
+  A function's contract includes its `requires` and `causes` clauses.
 - **A public member's contract is its type.** An exactly annotated member's contract is the
   annotation, checked against the body, and a module using the member reads no body. An unannotated
   member's contract is its inferred type, refinements and all, and a `<:` member's is its inferred

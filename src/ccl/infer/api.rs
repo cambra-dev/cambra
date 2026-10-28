@@ -200,6 +200,7 @@ impl TypeInferenceContext {
             fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(Type::DataSource(name.to_string())),
             codomain: Box::new(elem_ty),
+            effects: crate::ccl::effects::Effects::none(),
         };
         self.source_types.insert(name.to_string(), ty);
     }
@@ -304,6 +305,8 @@ impl std::fmt::Display for StatedRequirement {
 pub enum InferError {
     /// A variable was referenced but not bound in the current scope.
     UnboundVariable(String),
+    /// A transactional mutable variable declared below a module's top level.
+    TransactionalOutsideTopLevel { name: String },
     /// A type mismatch was detected between two solved types.
     ///
     /// Named for the roles rather than positionally: `constrain_subtype(lhs, rhs)`
@@ -864,6 +867,7 @@ impl InferError {
             // No type to render: these carry a name, an id, a rendered label, or (the
             // binder join) a term `respell` rewrites.
             InferError::UnboundVariable(_)
+            | InferError::TransactionalOutsideTopLevel { .. }
             | InferError::NoJoinOverBinder { .. }
             | InferError::Unsupported(_)
             | InferError::EmptyCase { .. }
@@ -1262,6 +1266,11 @@ impl std::fmt::Debug for InferError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             InferError::UnboundVariable(name) => write!(f, "Unbound variable: '{}'", name),
+            InferError::TransactionalOutsideTopLevel { name } => write!(
+                f,
+                "`{name}` is a transactional mutable variable, which belongs to the run, so it is \
+                 declared at a module's top level"
+            ),
             InferError::TypeMismatch {
                 ctx,
                 found,
@@ -1854,12 +1863,16 @@ impl Contract {
     pub fn uncurried(&self, arity: usize) -> Contract {
         let uncurry = |ty: &Type| {
             let mut domains = Vec::new();
+            // A call of the uncurried function applies every arrow, so it does what each
+            // of them does.
+            let mut effects = crate::ccl::effects::EffectSet::default();
             let mut at = ty;
             for _ in 0..arity {
                 let Type::Fun {
                     name,
                     domain,
                     codomain,
+                    effects: arrow,
                     ..
                 } = at
                 else {
@@ -1871,9 +1884,11 @@ impl Contract {
                     "a curried `def`'s later parameters do not read an earlier one: `{ty}`"
                 );
                 domains.push((**domain).clone());
+                effects = effects.union(&arrow.set());
                 at = codomain;
             }
             Type::fun(Type::tuple(domains), at.clone())
+                .with_effects(crate::ccl::effects::Effects::known(effects))
         };
         match self {
             _ if arity < 2 => self.clone(),
@@ -3275,7 +3290,8 @@ mod tests {
                 name: None,
                 fun_kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
-                codomain: Box::new(Type::Base(BaseType::Int))
+                codomain: Box::new(Type::Base(BaseType::Int)),
+                effects: crate::ccl::effects::Effects::none(),
             }
         );
     }
@@ -3534,7 +3550,8 @@ mod tests {
                 name: None,
                 fun_kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
-                codomain: Box::new(Type::Base(BaseType::Int))
+                codomain: Box::new(Type::Base(BaseType::Int)),
+                effects: crate::ccl::effects::Effects::none(),
             }
         );
         // The param.ty was filled in as Int.
@@ -4498,7 +4515,8 @@ mod tests {
                 name: None,
                 fun_kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
-                codomain: Box::new(Type::Base(BaseType::Unit))
+                codomain: Box::new(Type::Base(BaseType::Unit)),
+                effects: crate::ccl::effects::Effects::none(),
             }
         );
         if let TypedExprNode::Lambda { param, .. } = &expr.node {
@@ -4521,6 +4539,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(Type::DataSource("mystream".into())),
             codomain: Box::new(Type::Base(BaseType::String)),
+            effects: crate::ccl::effects::Effects::none(),
         };
         let mut expr = Expr::new(TypedExprNode::Source("mystream".into(), Vec::new()));
         assert_eq!(infer(&mut expr, &mut ctx), Ok(source_ty));
@@ -4705,12 +4724,14 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(Type::DataSource("ints".into())),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            effects: crate::ccl::effects::Effects::none(),
         };
         let str_ty = Type::Fun {
             name: None,
             fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(Type::DataSource("strs".into())),
             codomain: Box::new(Type::Base(BaseType::String)),
+            effects: crate::ccl::effects::Effects::none(),
         };
 
         let mut e1 = Expr::new(TypedExprNode::Source("ints".into(), Vec::new()));
@@ -4910,6 +4931,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            effects: crate::ccl::effects::Effects::none(),
         });
         let expr = Expr::new(TypedExprNode::Apply {
             function: Box::new(lambda),
@@ -4995,6 +5017,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            effects: crate::ccl::effects::Effects::none(),
         });
         let expr = Expr::new(TypedExprNode::Apply {
             function: Box::new(func),
@@ -5049,6 +5072,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            effects: crate::ccl::effects::Effects::none(),
         });
         assert_eq!(
             check_fully_typed(&expr),
@@ -5068,6 +5092,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Hole),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            effects: crate::ccl::effects::Effects::none(),
         });
         assert_eq!(
             check_fully_typed(&expr),
@@ -5305,6 +5330,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::UIntRange(2)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            effects: crate::ccl::effects::Effects::none(),
         };
         let expr = Expr::new(TypedExprNode::List(vec![int_elem, str_elem])).with_ty(list_ty);
         let result = typecheck(&expr);
@@ -5340,6 +5366,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::String)),
             codomain: Box::new(Type::Base(BaseType::String)),
+            effects: crate::ccl::effects::Effects::none(),
         });
         let expr = Expr::new(TypedExprNode::Apply {
             function: Box::new(lambda),

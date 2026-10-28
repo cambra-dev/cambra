@@ -1301,61 +1301,63 @@ fn a_diagnostic_keeps_a_user_written_opaque_binder() {
     );
 }
 
-/// Rule 2: a function may not return a `Mut` — the mutable-variable reference would
-/// escape where its writer set is no longer statically known.
-#[test]
-fn rule2_function_returning_mut_is_rejected() {
-    expect_mut_discipline_error("x := 0\nf = \\z -> x\nf", "inside a composite type");
-}
-
-/// The escape is rejected **however many tail positions sit between the function
-/// boundary and the read**, which is not free: a tail position reports its
-/// continuation's *value*, so an intervening statement or binding derefs the handle
-/// out of the enclosing node's type. Rule 2 therefore asks what the body *denotes*
-/// rather than what its root node is stamped with.
-///
-/// Without that, inserting a line changed the verdict — and not to an acceptance but
-/// to a compiler panic, since the lambda's stamped codomain (`Int`) then disagreed
-/// with its body's own type (`Mut(Int, ?d)`) at the post-inference consistency wall.
+/// A function whose result is a mutable variable returns the variable's value, however many tail
+/// positions sit between the function boundary and the mention: the result reads it, as a
+/// statement's continuation does (`docs/chl-spec.md`, "8.3 Reads"), so no `Mut` leaves the
+/// function.
 #[rstest]
+#[case::a_lambda(indoc! {r#"
+    x := 0
+    f = \z -> x
+    f(1)
+"#}, 0)]
 #[case::through_a_binding(indoc! {r#"
     def f(c: Mut(Int)):
         y = 1
         c
     x := 0
     f(x)
-"#})]
+"#}, 0)]
 #[case::through_a_statement(indoc! {r#"
     def f(c: Mut(Int)):
         c += 1
         c
     x := 0
     f(x)
-"#})]
+"#}, 1)]
 #[case::through_a_mut_var_introduction(indoc! {r#"
     def f(c: Mut(Int)):
         z := 1
         c
     x := 0
     f(x)
-"#})]
-// A mutable variable does not escape its own introduction either: returning one declared
-// *inside* the function is the same escape as returning a parameter.
+"#}, 0)]
 #[case::its_own_mut_var(indoc! {r#"
     def g(n):
         z := n
         z
     g(5)
-"#})]
+"#}, 5)]
 #[case::its_own_mut_var_through_a_binding(indoc! {r#"
     def g(n):
         z := n
         y = 2
         z
     g(5)
-"#})]
-fn rule2_is_not_evaded_by_a_tail_position(#[case] code: &str) {
-    expect_mut_discipline_error(code, "inside a composite type");
+"#}, 5)]
+#[case::an_accumulator_after_its_loop(indoc! {r#"
+    def total(xs):
+        s := 0
+        for x in xs:
+            s += x
+        s
+    total([1, 2, 3])
+"#}, 6)]
+fn a_function_returning_a_mutable_variable_returns_its_value(
+    #[case] code: &str,
+    #[case] expected: i64,
+) {
+    check_scalar(code, Value::Int(expected));
 }
 
 /// The complement, and why the rule cannot simply refuse to deref a tail: a program

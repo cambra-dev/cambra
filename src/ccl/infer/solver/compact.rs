@@ -633,6 +633,10 @@ pub struct CompactFun {
     /// related two sides put their binders in correspondence — so a merge reconciles only
     /// what each side says the position ranges over.
     pub binders: Vec<CompactWitness>,
+    /// What a call requires and causes, resolved from the function type's effects
+    /// (`src/ccl/design/type-inference.md`, "Polymorphism and materialization"). Compaction
+    /// runs after emission, so a variable's resolution is final here.
+    pub effects: Rc<crate::ccl::effects::EffectSet>,
     /// The two **domains** had no common answer.
     ///
     /// Not a kind, which is why it is not in the kind: a domain disagreement says the arms
@@ -868,6 +872,13 @@ impl CompactFun {
     /// contravariantly (at `!pol`), the codomain covariantly (at `pol`).
     fn merge(pol: bool, a: CompactFun, b: CompactFun) -> CompactFun {
         let name = a.name.clone().or_else(|| b.name.clone());
+        // Effects are covariant: a positive position holds either function, so it may do
+        // what either does, and a negative one accepts only what both accept.
+        let effects = Rc::new(if pol {
+            a.effects.union(&b.effects)
+        } else {
+            a.effects.intersection(&b.effects)
+        });
         let codomain = Box::new(CompactType::merge(pol, *a.codomain, *b.codomain));
         // The domain merges **contravariantly** and as one ordinary position — there is no
         // domain lattice left to consult, because a `fun` slot holds one domain. What was a
@@ -917,6 +928,7 @@ impl CompactFun {
             name,
             kind,
             binders,
+            effects,
             domains_disagree,
             domain,
             combined,
@@ -3121,6 +3133,7 @@ fn compact_go_inner(
             fun_kind,
             domain: d,
             codomain: c,
+            effects,
         } => {
             // **The kind's binder correspondence rides the walk from here down**, so an
             // arm's occurrences arrive already spelled in this function's binders.
@@ -3230,6 +3243,7 @@ fn compact_go_inner(
                         KindPin::Sum(_) => KindPin::Data,
                         other => other,
                     },
+                    effects: Rc::new(effects.set()),
                     name: name.clone(),
                     binders,
                     domains_disagree: false,
@@ -4194,6 +4208,7 @@ mod tests {
         let data_fun = |domain: CompactType| CompactType {
             fun: Some(CompactFun {
                 binders: Vec::new(),
+                effects: Default::default(),
                 name: None,
                 kind: KindPin::Data,
                 domains_disagree: false,
@@ -4228,6 +4243,7 @@ mod tests {
         let data_fun = |domain: CompactType| CompactType {
             fun: Some(CompactFun {
                 binders: Vec::new(),
+                effects: Default::default(),
                 name: None,
                 kind: KindPin::Data,
                 domains_disagree: false,
@@ -4484,6 +4500,7 @@ mod tests {
         CompactType {
             fun: Some(CompactFun {
                 binders: Vec::new(),
+                effects: Default::default(),
                 name: None,
                 kind,
                 domains_disagree: false,
@@ -4587,6 +4604,7 @@ mod tests {
         let fun = |dom: BaseType| CompactType {
             fun: Some(CompactFun {
                 binders: Vec::new(),
+                effects: Default::default(),
                 name: None,
                 kind: KindPin::Data,
                 domains_disagree: false,
@@ -4703,6 +4721,7 @@ mod refinement_closing_tests {
                 Type::Base(BaseType::Int),
                 Refinement::born(dep_pred(binder)),
             )),
+            effects: crate::ccl::effects::Effects::none(),
         }
     }
 
@@ -4787,7 +4806,9 @@ mod refinement_closing_tests {
                     Type::Base(BaseType::Int),
                     Refinement::born(dep_pred(referenced)),
                 )),
+                effects: crate::ccl::effects::Effects::none(),
             }),
+            effects: crate::ccl::effects::Effects::none(),
         };
         assert_ne!(
             compact_type(&nested("y")).term,
