@@ -539,6 +539,37 @@ fn uncurry_at_the_outermost_level_sends_everything() {
     assert_widens(&|| uncurry(CurryLevel::OUTERMOST), 0);
 }
 
+fn two_keys() -> Extent {
+    Extent::Record(
+        [
+            (crate::interpreter::tuple_field(0), Extent::uint_range(8)),
+            (crate::interpreter::tuple_field(1), Extent::uint_range(8)),
+        ]
+        .into_iter()
+        .collect(),
+    )
+}
+
+fn permute_record_domain() -> Built {
+    let (input, consumer) = feed(Tiling::data_function(two_keys(), Tiling::Scalar(int())));
+    let op = PermuteRecordDomain::new(input, vec![1, 0]);
+    (Box::new(op), vec![consumer])
+}
+
+/// The keys are renamed, so a region of the input's keys names none of the output's.
+#[test]
+fn permute_record_domain_sends_everything_for_a_region_of_its_input() {
+    assert_widens(&permute_record_domain, 0);
+}
+
+#[test]
+fn permute_record_domain_sends_everything_for_a_later_region() {
+    assert_eq!(
+        received(&permute_record_domain, 0, &another_region()),
+        [Projection::Everything]
+    );
+}
+
 fn make_record() -> Built {
     let (a, first) = feed(ints());
     let (b, second) = feed(ints());
