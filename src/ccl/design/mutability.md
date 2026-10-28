@@ -883,7 +883,10 @@ is the block's footprint and the set of accumulators its decision reads, so a re
 standing would claim a read the block no longer makes. A commit *decision* that reads an induction
 accumulator (`balance += cnt`) **is also implemented** — the accumulator is threaded through the
 writer source and the commit engine co-iterates it (see [Reading an induction accumulator in a
-commit decision](#reading-an-induction-accumulator-in-a-commit-decision)). (A write to `balance`
+commit decision](#reading-an-induction-accumulator-in-a-commit-decision)). A read in the block before
+a lifted write sees the value before it
+([A block reads per-iteration values through captures](#a-block-reads-per-iteration-values-through-captures)).
+(A write to `balance`
 *outside* a `with begin():` block is rejected in both the model and the implementation.)
 
 After mut_elim (with `IncrIdx`/`GetIdx` the two request-source domains):
@@ -1102,10 +1105,13 @@ affordable by that complete compile-time knowledge.
 
 ## Reading an induction accumulator in a commit decision
 
-A commit decision may read an induction accumulator at its request position
-(`with begin(): balance += cnt` — the mutable variable write folds in `cnt(r)`). The intended letrec is the
-[worked example](#worked-example)'s: `𝑐𝑛𝑡` (induction, `IncrIdx`) and `balance`/`incr_commits`
-(transaction, `Txn`) mutually in scope, so `incr_commits(𝑟)` reads `𝑐𝑛𝑡(𝑟)`.
+A commit decision may read an induction accumulator its loop writes
+(`with begin(): balance += cnt`). The letrec is the [worked example](#worked-example)'s: `𝑐𝑛𝑡`
+(induction, `IncrIdx`) and `balance`/`incr_commits` (transaction, `Txn`) mutually in scope, so
+`incr_commits(𝑟)` reads `𝑐𝑛𝑡`'s history at `𝑟`. That history holds the value position `𝑟` commits,
+after every write the iteration makes; a read that a later write in the iteration overtakes reads
+through a capture instead
+([A block reads per-iteration values through captures](#a-block-reads-per-iteration-values-through-captures)).
 
 **CCL — outer induction letrec, accumulator threaded through the writer source.** The transaction
 phase folds the entangled induction loop (via `fold_induction_loop`, shared with `transform_loop`)
@@ -1132,6 +1138,47 @@ The accumulator stream is on the writer's own request domain, so it is position-
 as-of latch. The `balance ↔ incr_commits` cycle is unchanged (`get_prev_txn`-guarded); `𝑐𝑛𝑡` sits
 outside it, read-only to the transaction, so guardedness is unaffected. No new operator — the
 existing `zip`/`zip_arms_at` co-iteration plus a wider source decode.
+
+### A block reads per-iteration values through captures
+
+A read in a block is the value at the read's position in its iteration
+([CHL spec](../../../docs/chl-spec.md#83-reads)). Two such reads have no history of their own to
+zip into the writer source: an accumulator read that a later write in the iteration overtakes, and a
+binding the loop body makes before the block. Each reaches the writer as a **capture**.
+`transact_phase::partition_block` replaces the read in the block by a fresh accumulator `__at𝑛`,
+written ``__at𝑛 := `fired(𝑣)`` on the loop body where the read stands, so the capture's history at
+`𝑟` is the read's value. A binding is immutable, so its capture holds the value it was bound with.
+
+The capture's type is the tap variant ``{`fired{𝑉} | `idle}``. Its seed is the closed value
+`` `idle ``, which `fold_induction_loop` takes in place of a pre-loop binding, and no read reaches
+it, since the write precedes every read of the capture in an iteration. The writer source reads the
+capture through ``variant_project(`fired)``, a `zip` arm that op-conversion converts as a leaf. A
+capture lasts until a write to its source moves out of the block after it, and a later read takes a
+new one.
+
+Two rules bound what a capture is used for:
+
+- An accumulator's capture that no later write in the iteration overtakes holds `𝑐𝑛𝑡(𝑟)` itself,
+  so `strip` drops it and the block reads `𝑐𝑛𝑡` directly. The store gains a key only where the read
+  and the history differ.
+- A block reading a binding whose value holds a statement (a loop, a block, a feed, a definition, or
+  a write) is refused, as is a block reading a binding that reads one. `mut_elim`'s `flatten_spine`
+  lifts a write out of a binding's value onto the loop body (`hoist_writer_body`), but
+  `transact_phase` folds the loop before `mut_elim` runs, so the fold sees `y = bump(c)` with the
+  write to `c` still inside `y`'s value.
+
+The proposed fix for that refusal is to apply `mut_elim`'s value-position normalization
+(`push_bindings_into_writing_cases`, then `flatten_spine`) at the start of `transact_phase::run`,
+beside `lift_bindings_out_of_effect_position`. A block then reads `y = bump(c)` as it reads
+`c := c + 1; y = c * 10`, through a capture. A write under a `Case` in the value pushes the binding
+and its continuation into the branches, which puts the block inside a branch, a placement lowering
+refuses. Whether that normalization is sound to run before transactions are stripped is not yet
+decided.
+
+A loop whose body feeds and writes nothing outside a binding's value drops that write even after
+`flatten_spine` lifts it: the loop is lowered without the variable as an accumulator
+(`bug_a_loop_writing_only_in_a_bindings_value_drops_the_write` in
+`tests/it/compilation_pipeline/mutability.rs`). The fix above does not reach it.
 
 ### Co-indexed vs. cross-loop (broadcast)
 

@@ -3005,3 +3005,73 @@ fn an_inner_list_literal_reading_the_enclosing_binder_is_refused() {
         "a list element must be a constant",
     );
 }
+
+/// A write in a loop-body binding's value reaches the loop: `mut_elim`'s `flatten_spine` lifts
+/// `bump`'s write onto the loop body (`hoist_writer_body`), so `y` is 10, 20 and 30, as the
+/// differential interpreter answers.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_write_in_a_loop_body_bindings_value_reaches_the_loop() {
+    check_tile(
+        indoc! {r#"
+            def bump(p: Mut(Int)):
+                p := p + 1
+                p * 10
+            c := 0
+            s := 0
+            o = defer()
+            for x in [3, 1, 2]:
+                y = bump(c)
+                s := s + 1
+                o << y
+            o
+        "#},
+        make_int_list(&[10, 20, 30]),
+    );
+}
+
+/// BUG: a loop whose body feeds and writes nothing outside a binding's value drops the write.
+/// This is [`a_write_in_a_loop_body_bindings_value_reaches_the_loop`] without `s := s + 1`:
+/// after `flatten_spine` lifts `bump`'s write onto the loop body, the loop is still lowered
+/// without `c` as an accumulator, so every iteration computes `y` from the pre-loop `c` and the
+/// loop leaves `c` at 0. The differential interpreter feeds 10, 20 and 30 and ends `c` at 3.
+/// Without the feed, the compiler ends `c` at 3. These cases pin the current wrong values. The same write read from a `with begin():` block is
+/// refused; `src/ccl/design/mutability.md`, "A block reads per-iteration values through
+/// captures" gives the fix proposed for both.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::fed_in_the_loop(
+    indoc! {r#"
+        o = defer()
+        for x in [3, 1, 2]:
+            y = bump(c)
+            o << y
+        o
+    "#},
+    make_int_list(&[10, 10, 10])
+)]
+#[case::read_after_the_loop(
+    indoc! {r#"
+        o = defer()
+        for x in [3, 1, 2]:
+            y = bump(c)
+            o << y
+        c
+    "#},
+    Tile::Scalar(ColumnValue::Ints(vec![0]))
+)]
+fn bug_a_loop_writing_only_in_a_bindings_value_drops_the_write(
+    #[case] code: &str,
+    #[case] expected: Tile,
+) {
+    let program = format!(
+        "{}{code}",
+        indoc! {r#"
+            def bump(p: Mut(Int)):
+                p := p + 1
+                p * 10
+            c := 0
+        "#}
+    );
+    check_tile(&program, expected);
+}

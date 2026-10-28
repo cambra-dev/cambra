@@ -5918,6 +5918,10 @@ fn is_leaf_zip_arm(expr: &Expr, ctx: &OpConversionContext) -> bool {
         // `as_of((trigger, store))` — a live as-of read (a leaf that internally
         // drives its trigger).
         TypedExprNode::Apply { function, .. } => as_builtin(function) == Some(Builtin::AsOf),
+        // `leaf ≫ steps` — a leaf read and the steps on its values, such as a captured
+        // read's `__hist.__at ≫ variant_project(`fired)`. The compose converts its head
+        // with no input and feeds each step the one before it.
+        TypedExprNode::Compose(elts) => elts.first().is_some_and(|h| is_leaf_zip_arm(h, ctx)),
         _ => false,
     }
 }

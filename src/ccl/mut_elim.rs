@@ -1517,7 +1517,7 @@ fn transform_loop(
     // Fold the accumulators into a decision-factored history binding, then wrap it
     // in a nested `LetRec`: re-point the continuation's trailing reads at the
     // extracted finals, recurse into it, prepend the reads, and hoist the feeds.
-    let fold = fold_induction_loop(&target, &iter, loop_body, &value_tys);
+    let fold = fold_induction_loop(&target, &iter, loop_body, &value_tys, &HashMap::new());
     let mut cont = cont;
     for (acc, x_final) in &fold.renames {
         rename_uses(&mut cont, acc, x_final);
@@ -1639,6 +1639,10 @@ impl InductionFold {
 /// See [`InductionFold`]. Caller must guard on a non-empty accumulator set
 /// (an accumulator-free loop is a feed-only/no-op loop, handled separately).
 ///
+/// `seeds` gives the seed of an accumulator the loop body introduces by writing it, which
+/// has no pre-loop binding to read (`crate::ccl::transact_phase`'s capture of a block's
+/// read); every other accumulator is seeded from its pre-loop binding.
+///
 /// `value_tys` supplies each accumulator's value type ([`mut_var_value_tys`]);
 /// the caller builds it over the widest tree it holds, so that a mutable variable read
 /// only *downstream* of the loop still contributes its `Mut(V, D)`.
@@ -1647,6 +1651,7 @@ pub(crate) fn fold_induction_loop(
     iter: &Expr,
     loop_body: Expr,
     value_tys: &HashMap<Name, Type>,
+    seeds: &HashMap<Name, Expr>,
 ) -> InductionFold {
     let mut accs: Vec<AccumulatorVariable> = Vec::new();
     collect_writes(&loop_body, value_tys, &mut accs);
@@ -1755,7 +1760,11 @@ pub(crate) fn fold_induction_loop(
         .iter()
         .map(|a| {
             let _g = a.enter(ACCUMULATOR_LABEL, provenance::Nature::Expansion);
-            (a.name.field_key(), tvar(&a.name, a.ty.clone()))
+            let seed = seeds
+                .get(&a.name)
+                .cloned()
+                .unwrap_or_else(|| tvar(&a.name, a.ty.clone()));
+            (a.name.field_key(), seed)
         })
         .collect();
     let mut defaults = Expr::new(TypedExprNode::Record(seeds));
@@ -2554,7 +2563,13 @@ fn transform_chain(
                     if inner_accs.is_empty() && !body_has_feed(&inner_body) {
                         return transform_chain(*body, env, accs, writes_ty, entering, path, feeds);
                     }
-                    let fold = fold_induction_loop(&target, &iter, *inner_body, &value_tys);
+                    let fold = fold_induction_loop(
+                        &target,
+                        &iter,
+                        *inner_body,
+                        &value_tys,
+                        &HashMap::new(),
+                    );
                     // Both halves of a binding: a binder's declared type is written in
                     // the enclosing scope, so an inner loop correlated with this one's
                     // binder carries it there too — in the refinement on its own iteration
@@ -3420,7 +3435,7 @@ mod tests {
                 "transact.cross_domain_fold",
                 provenance::Nature::Expansion,
             );
-            let fold = fold_induction_loop(&target, &iter, *body, &value_tys);
+            let fold = fold_induction_loop(&target, &iter, *body, &value_tys, &HashMap::new());
             let view = fold.acc_view(0);
             let mut ids = Vec::new();
             fn collect(e: &Expr, out: &mut Vec<NodeId>) {
@@ -3506,7 +3521,7 @@ mod tests {
                 "transact.cross_domain_fold",
                 provenance::Nature::Expansion,
             );
-            let fold = fold_induction_loop(&target, &iter, *body, &value_tys);
+            let fold = fold_induction_loop(&target, &iter, *body, &value_tys, &HashMap::new());
             assert_eq!(fold.accs.len(), 1, "two writes to one variable is one slot");
             assert_eq!(
                 fold.accs[0].writes.len(),
