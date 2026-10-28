@@ -20,8 +20,8 @@ use crate::{
         Expr, Home, Name, Type, TypedExprNode, anf, channelize, comprehension,
         infer::{
             Contract, InferError, LocatedInferError, TypeInferenceContext, check_module,
-            check_mut_discipline, check_mut_write_targets, check_pre_channelize,
-            check_pre_channelize_located, infer, typecheck, typecheck_planned,
+            check_mut_discipline, check_mut_write_targets, check_pre_channelize_located, infer,
+            solver::traits::InstanceTable, typecheck_in, typecheck_planned,
         },
         inline, lambda_elim,
         lower::{
@@ -1709,8 +1709,9 @@ fn pre_channelize_wall(
     expr: &Expr,
     boundary: &str,
     blame: &Blame<'_>,
+    instances: &Rc<InstanceTable>,
 ) -> Result<(), Vec<CompileError>> {
-    check_pre_channelize_located(expr).map_err(|errs| {
+    check_pre_channelize_located(expr, instances).map_err(|errs| {
         if errs
             .iter()
             .all(|e| matches!(e.error, InferError::UnresolvedInfer { .. }))
@@ -1760,7 +1761,12 @@ enum Check<'a> {
 /// from one type and its domain from another binds a name the domain does not say. The
 /// reference is then free, which `typecheck` reports as two `σ`s that render identically
 /// while this names the reference and the node it sits on.
-fn settle(ir: &Expr, boundary: &str, check: Check<'_>) -> Result<(), Vec<CompileError>> {
+fn settle(
+    ir: &Expr,
+    boundary: &str,
+    check: Check<'_>,
+    instances: &Rc<InstanceTable>,
+) -> Result<(), Vec<CompileError>> {
     assert_unique_node_ids(ir, boundary);
     #[cfg(debug_assertions)]
     crate::ccl::infer::debug_assert_no_free_witness(ir, boundary);
@@ -1768,11 +1774,12 @@ fn settle(ir: &Expr, boundary: &str, check: Check<'_>) -> Result<(), Vec<Compile
     debug!("{boundary} CCL (typed):\n{}", symbolic_typed(ir));
     let outcome = match check {
         Check::PreChannelizeReportingAmbiguity(blame) => {
-            return pre_channelize_wall(ir, boundary, blame);
+            return pre_channelize_wall(ir, boundary, blame, instances);
         }
-        Check::PreChannelize => check_pre_channelize(ir),
-        Check::Typed => typecheck(ir),
-        Check::Planned(sources) => typecheck_planned(ir, sources),
+        Check::PreChannelize => check_pre_channelize_located(ir, instances)
+            .map_err(|errs| errs.into_iter().map(|e| e.error).collect()),
+        Check::Typed => typecheck_in(ir, instances),
+        Check::Planned(sources) => typecheck_planned(ir, sources, instances),
     };
     outcome.unwrap_or_else(|errs| invalid_tree(ir, boundary, &errs));
     Ok(())
@@ -2321,6 +2328,8 @@ fn run_passes(
     // phase, opened and closed in place: a phase scope is per-thread and
     // non-reentrant, so the scopes are sequential, never nested.
     let capture_provenance = record && provenance_capture_enabled();
+    // What the checks between phases read a nominal type's comparisons from.
+    let instances = Rc::clone(&ctx.inference_ctx().instances);
 
     if at_phase_output(Phase::Uniquify, &expr, stop, capture, panes) {
         return Ok(expr);
@@ -2440,6 +2449,7 @@ fn run_passes(
         &expr,
         "post-inference",
         Check::PreChannelizeReportingAmbiguity(&blame),
+        &instances,
     )?;
 
     // Enforce the second-class `Mut` discipline (`src/ccl/design/mutability.md`,
@@ -2504,6 +2514,7 @@ fn run_passes(
         &expr,
         "post-inline",
         Check::PreChannelizeReportingAmbiguity(&blame),
+        &instances,
     )?;
     if at_phase_output(Phase::Inline, &expr, stop, capture, panes) {
         return Ok(expr);
@@ -2547,7 +2558,7 @@ fn run_passes(
         transact_phase::run(expr, &txn_mut_vars)
     })
     .map_err(|error| blame.unsupported(error, None))?;
-    settle(&expr, "post-transact", Check::PreChannelize)?;
+    settle(&expr, "post-transact", Check::PreChannelize, &instances)?;
     if at_phase_output(Phase::Transact, &expr, stop, capture, panes) {
         return Ok(expr);
     }
@@ -2564,7 +2575,7 @@ fn run_passes(
     let audit_mutelim = ProvenanceAudit::start("mutelim", "post-transact..post-letrec", &expr);
     let phase_out = recorded(capture_provenance, Phase::Letrec, || mut_elim::run(expr));
     audit_mutelim.finish(&phase_out);
-    settle(&phase_out, "post-letrec", Check::PreChannelize)?;
+    settle(&phase_out, "post-letrec", Check::PreChannelize, &instances)?;
     audit_letrec.finish(&phase_out);
     if at_phase_output(Phase::Letrec, &phase_out, stop, capture, panes) {
         return Ok(phase_out);
@@ -2591,7 +2602,7 @@ fn run_passes(
             related: blame.run_labels(node_id, span, None),
         }]
     })?;
-    settle(&channelized, "post-channelize", Check::Typed)?;
+    settle(&channelized, "post-channelize", Check::Typed, &instances)?;
 
     // Retain the post-channelize tree for the inspector's downstream pane. On the
     // post-inference channelize order this snapshot is *downstream* of
@@ -2618,7 +2629,7 @@ fn run_passes(
             message,
         }]
     })?;
-    settle(&channelized, "post-as-of-read", Check::Typed)?;
+    settle(&channelized, "post-as-of-read", Check::Typed, &instances)?;
     if at_phase_output(Phase::AsOfRead, &channelized, stop, capture, panes) {
         return Ok(channelized);
     }
@@ -2648,7 +2659,7 @@ fn run_passes(
     })?;
     // `typecheck` enforces hole-freeness as its first phase, so the check here
     // covers both.
-    settle(&lambda_elim, "post-lambda-elim", Check::Typed)?;
+    settle(&lambda_elim, "post-lambda-elim", Check::Typed, &instances)?;
     if at_phase_output(Phase::LambdaElim, &lambda_elim, stop, capture, panes) {
         return Ok(lambda_elim);
     }
@@ -2667,10 +2678,10 @@ fn run_passes(
     let join_planned = recorded(capture_provenance, Phase::Planning, || {
         let recognized = planning::plan_loops(lambda_elim);
         debug!("Letrec recognized CCL:\n{}", symbolic(&recognized));
-        if let Err(errs) = typecheck(&recognized) {
+        if let Err(errs) = typecheck_in(&recognized, &instances) {
             invalid_tree(&recognized, "letrec recognition", &errs);
         }
-        planning::run(recognized)
+        planning::run(recognized, &instances)
     })
     .map_err(|message| {
         vec![CompileError::Internal {
@@ -2694,6 +2705,7 @@ fn run_passes(
         &join_planned,
         "post-planning",
         Check::Planned(ctx.inference_ctx().source_types()),
+        &instances,
     )?;
 
     // Invariant (debug): planning's `iterate`/`restrict` markers live in the

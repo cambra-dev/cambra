@@ -128,7 +128,8 @@ fn apply_binop_into(op: BinOpKind, left: &ColumnValue, right: &ColumnValue, out:
             ColumnValue::Bools(o),
         ) => o.extend(compare_records(op, l, r)),
         // A tuple orders lexicographically by position (`docs/chl-spec.md`, "3.4
-        // Comparisons").
+        // Comparisons"). A nominal value's order is compiled into one, its fields in the
+        // order its declaration writes them (`operator_conversion`'s `OrderKey`).
         (
             BinOpKind::Compare(
                 op @ (CompareKind::Less
@@ -140,11 +141,27 @@ fn apply_binop_into(op: BinOpKind, left: &ColumnValue, right: &ColumnValue, out:
             r @ ColumnValue::Records(_),
             ColumnValue::Bools(o),
         ) => o.extend(order_rows(op, l, r)),
+        // A nominal value compares by value: constructor, then argument.
+        (
+            BinOpKind::Compare(op @ (CompareKind::Equals | CompareKind::NotEquals)),
+            l @ (ColumnValue::Union(_) | ColumnValue::Variants(_)),
+            r @ (ColumnValue::Union(_) | ColumnValue::Variants(_)),
+            ColumnValue::Bools(o),
+        ) => o.extend(equal_rows(op, l, r)),
         _ => match (left.view(), right.view()) {
             (Some(l), Some(r)) => apply_binop_views(op, &l, &r, out),
             _ => panic!("Unsupported binop: {op:?} on {left:?}, {right:?}, into a column {out:?}"),
         },
     }
+}
+
+/// Compare two tagged columns row by row under `==` or `!=`, by value: a value's tag, then its
+/// payload.
+fn equal_rows(op: CompareKind, left: &ColumnValue, right: &ColumnValue) -> Vec<bool> {
+    let rows = left.len().min(right.len());
+    (0..rows)
+        .map(|i| (left.index_at(i) == right.index_at(i)) == (op == CompareKind::Equals))
+        .collect()
 }
 
 /// Order two tuple columns row by row, lexicographically by position ([`compare_values`]),

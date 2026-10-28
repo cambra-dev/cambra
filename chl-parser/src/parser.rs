@@ -1872,6 +1872,7 @@ where
 
         // ---- impl N(P…): ( [pub] def … | A = T )+ ----------------------
         // (`docs/chl-spec.md`, "Associated functions and methods" and "Declaring an instance")
+        #[derive(Clone)]
         enum ImplItem {
             Def(Box<Spanned<Stmt>>),
             Assoc(AssocArg),
@@ -1908,9 +1909,9 @@ where
         ));
         // The head is a type applied to its parameters, or a trait applied to the types an
         // instance is for, spelled as a requirement is: lowering tells them apart by what
-        // the name names.
-        // An instance's type variables are declared before its head, `impl forall (T)
-        // Area(Two(T))`; each is a capitalized name.
+        // the name names. A head with no block is an instance of a trait with no functions,
+        // `impl Equatable(Money, Money)`. An instance's type variables are declared before its
+        // head, `impl forall (T) Area(Two(T))`; each is a capitalized name.
         let instance_vars = just(Token::Forall).ignore_then(
             binder
                 .validate(|name, _, emitter| {
@@ -1932,14 +1933,10 @@ where
                 .collect::<Vec<_>>()
                 .delimited_by(just(Token::LParen), just(Token::RParen)),
         );
-        let impl_stmt = just(Token::Impl)
-            .ignore_then(instance_vars.or_not())
-            .then(trait_type(expr.clone()))
-            .then(requires_clause(expr.clone()).or_not())
-            .then_ignore(just(Token::Colon))
-            .then_ignore(just(Token::Newline))
-            .then_ignore(just(Token::Indent).labelled("indented `def`s"))
-            .then(
+        let impl_body = just(Token::Colon)
+            .ignore_then(just(Token::Newline))
+            .ignore_then(just(Token::Indent).labelled("indented `def`s"))
+            .ignore_then(
                 impl_item
                     .then_ignore(just(Token::Newline).repeated())
                     .repeated()
@@ -1947,6 +1944,12 @@ where
                     .collect::<Vec<_>>(),
             )
             .then_ignore(just(Token::Dedent))
+            .or(just(Token::Newline).to(Vec::new()));
+        let impl_stmt = just(Token::Impl)
+            .ignore_then(instance_vars.or_not())
+            .then(trait_type(expr.clone()))
+            .then(requires_clause(expr.clone()).or_not())
+            .then(impl_body)
             .map_with(|(((vars, head), requires), items), e| {
                 let TraitType {
                     name,

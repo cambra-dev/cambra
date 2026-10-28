@@ -1,6 +1,6 @@
 //! The traits and instances a module declares, and their functions, read from an instance
 //! (`docs/chl-spec.md`, "Summoning an instance", "Declaring a trait", "Declaring an
-//! instance"), and the arithmetic operators' instances on a module's types.
+//! instance"), and the operators' traits on a module's types ("Equality and order").
 
 use std::time::Duration;
 
@@ -764,16 +764,6 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
     "},
     "`Area::area` is no method, so no parameter of `area` is `self`"
 )]
-#[case::a_comparison_trait(
-    indoc! {"
-        type Money = Int
-        impl Equatable(Money, Money):
-            def eq(m, other):
-                True
-        1
-    "},
-    "an instance of one is not supported yet"
-)]
 #[case::a_trait_with_no_function(
     indoc! {"
         type Bag = List(Int)
@@ -1468,8 +1458,8 @@ fn a_refined_associated_type_is_an_internal_gap() {
     );
 }
 
-/// A nominal type with instances of arithmetic operators' traits: `+` and unary `-` call the
-/// functions the instances define.
+/// A nominal type with an instance of every operator's trait: `+` and unary `-` call the
+/// functions the instances define, and `==` and the orderings compare by value.
 const MONEY: &str = indoc! {"
     type Money = Int
     impl Addable(Money, Money):
@@ -1480,6 +1470,8 @@ const MONEY: &str = indoc! {"
         Output = Money
         def neg(x):
             Money::new(0 - x.extract())
+    impl Equatable(Money, Money)
+    impl Orderable(Money, Money)
 "};
 
 fn with_money(code: &str) -> String {
@@ -1614,6 +1606,135 @@ fn an_operator_trait_function_by_name(#[case] code: &str, #[case] expected: i64)
     check_scalar(&with_money(code), Value::Int(expected));
 }
 
+/// A comparison on a nominal type compares by value, wherever it stands: an operator, a
+/// comprehension's guard, the keys of a `map` and a `groupby`, which `set` lowers through, a
+/// join's condition, and `max` and `min`.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::equal("Money::new(1) == Money::new(1)", true)]
+#[case::not_equal("Money::new(1) != Money::new(2)", true)]
+#[case::equal_after_addition("Money::new(1) + Money::new(2) == Money::new(3)", true)]
+#[case::ordered(
+    "Money::new(1) < Money::new(2) and Money::new(3) >= Money::new(3)",
+    true
+)]
+#[case::a_tuple_holding_one("(Money::new(1), 5) < (Money::new(1), 7)", true)]
+#[case::a_guard(
+    "sum([1 for x in [Money::new(1), Money::new(2)] if x == Money::new(2)]) == 1",
+    true
+)]
+#[case::groupby_keys(
+    "sum([max(g) for g in groupby([1, 2, 3], \\x -> Money::new(x // 2))]) == 4",
+    true
+)]
+#[case::a_join(
+    indoc! {"
+        xs = [Money::new(1), Money::new(2), Money::new(3)]
+        ys = [Money::new(2), Money::new(3), Money::new(4)]
+        sum([a.extract() for a in xs for b in ys if a == b]) == 5
+    "},
+    true
+)]
+#[case::a_lookup(
+    indoc! {"
+        m = map([(Money::new(1), 10), (Money::new(2), 20)])
+        a: Option(Int) = m[Money::new(2)]?
+        match a:
+            case Option::some(v):
+                v == 20
+            case Option::none:
+                False
+    "},
+    true
+)]
+#[case::max("max([Money::new(1), Money::new(3)]) == Money::new(3)", true)]
+#[case::min("min([Money::new(5), Money::new(3)]) == Money::new(3)", true)]
+#[case::each_group_s_max(
+    indoc! {"
+        g = groupby([1, 2, 3, 4, 5], \\x -> x // 2)
+        sum([Money::extract(max([Money::new(v) for v in grp])) for grp in g]) == 9
+    "},
+    true
+)]
+#[case::a_generic_definition_s_max(
+    indoc! {"
+        def biggest(T, xs: List(T)) => T requires Orderable(T, T):
+            max(xs)
+        biggest(box([Money::new(4), Money::new(8)])).extract() + biggest(box([1, 2])) == 10
+    "},
+    true
+)]
+fn a_nominal_type_compares_by_value(#[case] code: &str, #[case] expected: bool) {
+    check_scalar(&with_money(code), Value::Bool(expected));
+}
+
+/// A nominal type's order is its declaration's: a constructor's parameters as written, and
+/// a record the declaration writes by its fields as written, nested ones too. A conditional
+/// instance compares its arguments' types by theirs.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_written_record(
+    indoc! {"
+        type P = {age: Int, name: String}
+        impl Equatable(P, P)
+        impl Orderable(P, P)
+        a = P::new((age=3, name=\"b\"))
+        b = P::new((age=3, name=\"c\"))
+        a < b and a != b and max([a, b]) == b
+    "}
+)]
+#[case::a_nested_written_record(
+    indoc! {"
+        type P = {b: {y: Int, x: Int}, a: Int}
+        impl Equatable(P, P)
+        impl Orderable(P, P)
+        p = P::new((b=(y=1, x=9), a=0))
+        q = P::new((b=(y=1, x=2), a=5))
+        max([p, q]).extract().b.x == 9
+    "}
+)]
+#[case::constructor_parameters(
+    indoc! {"
+        type V:
+            new(major: Int, minor: Int)
+        impl Equatable(V, V)
+        impl Orderable(V, V)
+        V::new(1, 9) < V::new(2, 0) and V::new(1, 2) == V::new(1, 2)
+    "}
+)]
+#[case::a_conditional_instance(
+    indoc! {"
+        type Money = Int
+        impl Equatable(Money, Money)
+        impl Orderable(Money, Money)
+        type Two(T) = {T, T}
+        impl forall (T) Equatable(Two(T), Two(T)) requires Equatable(T, T)
+        impl forall (T) Orderable(Two(T), Two(T)) requires Orderable(T, T), Equatable(T, T)
+        a = Two::new((Money::new(1), Money::new(9)))
+        b = Two::new((Money::new(2), Money::new(0)))
+        a < b and a != b and max([a, b]) == b
+    "}
+)]
+#[case::option("Option::some(1) == Option::some(1) and Option::some(1) != Option::none")]
+#[case::option_inside_a_type(
+    indoc! {"
+        type W = Option(Int)
+        impl Equatable(W, W)
+        W::new(Option::some(1)) == W::new(Option::some(1))
+    "}
+)]
+#[case::min_of_a_written_record_with_a_string(
+    indoc! {"
+        type Person = {age: Int, name: String}
+        impl Equatable(Person, Person)
+        impl Orderable(Person, Person)
+        min([Person::new((age=3, name=\"b\")), Person::new((age=3, name=\"a\"))]).extract().name == \"a\"
+    "}
+)]
+fn a_nominal_type_orders_as_declared(#[case] code: &str) {
+    check_scalar(code, Value::Bool(true));
+}
+
 /// A tuple orders lexicographically by position, and `max` and `min` read it so.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
@@ -1643,4 +1764,133 @@ fn a_tuple_orders_lexicographically(#[case] code: &str) {
 #[test]
 fn a_record_does_not_order() {
     check_compile_error("(a=1, b=2) < (a=3, b=4)", "No Orderable instance");
+}
+
+/// What an instance of `Equatable` or `Orderable` refuses, and a comparison no instance
+/// answers.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::two_different_types(
+    indoc! {"
+        type M = Int
+        impl Equatable(M, Int)
+        1
+    "},
+    "relates two different types"
+)]
+#[case::a_function_argument(
+    indoc! {"
+        type F = Int => Int
+        impl Equatable(F, F)
+        1
+    "},
+    "`F::new`'s argument is `Int => Int`, which is not `Equatable`"
+)]
+#[case::several_constructors(
+    indoc! {"
+        type S:
+            a(Int)
+            b(Int)
+        impl Orderable(S, S)
+        1
+    "},
+    "`S` has 2 constructors, which have no order"
+)]
+#[case::a_record_through_an_alias(
+    indoc! {"
+        R = {a: Int, b: Int}
+        type P = R
+        impl Orderable(P, P)
+        1
+    "},
+    "holds a record its declaration does not write"
+)]
+#[case::a_record_through_a_type_argument(
+    indoc! {"
+        type Two(T) = {T, T}
+        impl forall (T) Equatable(Two(T), Two(T)) requires Equatable(T, T)
+        impl forall (T) Orderable(Two(T), Two(T)) requires Orderable(T, T), Equatable(T, T)
+        type P = Two({b: Int, a: Int})
+        impl Equatable(P, P)
+        impl Orderable(P, P)
+        1
+    "},
+    "which is not `Orderable`"
+)]
+#[case::an_argument_without_the_requirement(
+    indoc! {"
+        type Two(T) = {T, T}
+        impl forall (T) Orderable(Two(T), Two(T))
+        1
+    "},
+    "`Two::new`'s argument is `{T, T}`, which is not `Orderable`"
+)]
+#[case::a_function_in_the_block(
+    indoc! {"
+        type M = Int
+        impl Equatable(M, M):
+            def eq(m, other):
+                True
+        1
+    "},
+    "`Equatable` declares no function `eq`"
+)]
+#[case::no_instance(
+    indoc! {"
+        type M = Int
+        M::new(1) == M::new(1)
+    "},
+    "No Equatable instance"
+)]
+#[case::option_s_own(
+    indoc! {"
+        impl forall (T) Equatable(Option(T), Option(T)) requires Equatable(T, T)
+        1
+    "},
+    "names no type this module declares"
+)]
+#[case::an_empty_type_block(
+    indoc! {"
+        type M = Int
+        impl M
+        1
+    "},
+    "defines no function"
+)]
+fn a_comparison_instance_refuses(#[case] code: &str, #[case] needle: &str) {
+    check_compile_error(code, needle);
+}
+
+/// `Orderable` requires `Equatable`: an instance needs one of `Equatable` above it. A
+/// requirement of `Orderable` states nothing of `Equatable`, so a definition that uses `==`
+/// requires both.
+#[test]
+fn orderable_requires_equatable() {
+    check_compile_error(
+        indoc! {"
+            type M = Int
+            impl Orderable(M, M)
+            1
+        "},
+        "`impl Orderable(M, M)` needs `Equatable(M, M)`, which `Orderable` requires of every \
+         instance",
+    );
+    let same_and_least = |requires: &str| {
+        formatdoc! {"
+            type M = Int
+            impl Equatable(M, M)
+            impl Orderable(M, M)
+            def same_and_least(T, a: T, b: T) => Bool requires {requires}:
+                a == b and a <= b
+            same_and_least(M::new(2), M::new(2))
+        "}
+    };
+    check_scalar(
+        &same_and_least("Orderable(T, T), Equatable(T, T)"),
+        Value::Bool(true),
+    );
+    check_compile_error(
+        &same_and_least("Orderable(T, T)"),
+        "No requirement states that `T` is Equatable",
+    );
 }
