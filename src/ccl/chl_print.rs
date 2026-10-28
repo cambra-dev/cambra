@@ -152,14 +152,23 @@ impl Printer {
                 None => p.param.spelling.to_string(),
             })
             .collect();
-        let body = self.ty(&poly.body);
+        // A function body's effects join the trait requirements after the codomain.
+        let (body, effects) = match &poly.body {
+            Type::Fun { effects, .. } => (
+                poly.body
+                    .clone()
+                    .with_effects(crate::ccl::effects::Effects::none()),
+                effects.clone(),
+            ),
+            body => (body.clone(), crate::ccl::effects::Effects::none()),
+        };
+        let body = self.ty(&body);
         let requires = poly.requires_text(|t| self.ty(t));
-        let mut text = format!("forall ({}) {body}", params.join(", "));
-        if !requires.is_empty() {
-            text.push_str(" requires ");
-            text.push_str(&requires.join(", "));
-        }
-        text
+        format!(
+            "forall ({}) {body}{}",
+            params.join(", "),
+            crate::ccl::effects::clauses(requires, &effects)
+        )
     }
 
     fn ty(&mut self, ty: &Type) -> String {
@@ -234,7 +243,11 @@ impl Printer {
                 fun_kind,
                 domain,
                 codomain,
-            } => self.fun(ty, name.as_ref(), fun_kind, domain, codomain),
+                effects,
+            } => format!(
+                "{}{effects}",
+                self.fun(ty, name.as_ref(), fun_kind, domain, codomain)
+            ),
             Type::History {
                 function,
                 history_kind,

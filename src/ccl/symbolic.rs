@@ -1133,7 +1133,7 @@ mod tests {
     #[case(
         Expr::lambda(
             "x",
-            Type::Fun { name: None, fun_kind: crate::ccl::ty::FunKind::Compute, domain: Box::new(Type::Base(BaseType::Int)), codomain: Box::new(Type::Base(BaseType::Bool)) },
+            Type::Fun { name: None, fun_kind: crate::ccl::ty::FunKind::Compute, domain: Box::new(Type::Base(BaseType::Int)), codomain: Box::new(Type::Base(BaseType::Bool)) , effects: crate::ccl::effects::Effects::none() },
             Expr::var("x"),
         ),
         "λ x : (Int ⇒ Bool) → x"

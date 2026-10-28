@@ -15,6 +15,7 @@ pub mod constant;
 pub mod content_hash;
 pub mod context;
 pub mod diff;
+pub mod effects;
 pub mod feed_nest;
 pub mod infer;
 pub mod inline;
