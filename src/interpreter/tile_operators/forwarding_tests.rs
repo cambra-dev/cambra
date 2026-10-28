@@ -561,6 +561,20 @@ fn make_record_sends_everything_for_a_later_region() {
     );
 }
 
+/// Every key is answered against all of the collection.
+#[test]
+fn a_lookup_sends_everything_for_its_collection() {
+    assert_widens(&lookup_of_a_stream, 0);
+}
+
+#[test]
+fn a_lookup_sends_everything_for_a_later_region_at_its_collection() {
+    assert_eq!(
+        received(&lookup_of_a_stream, 0, &another_region()),
+        [Projection::Everything]
+    );
+}
+
 /// A fan-out over a feed with a recording consumer on each of its two slots, as the bindings
 /// `logs`, `producers` and `consumer`: the consumers' logs, the slots' producers, and the consumer
 /// the feed notifies through.
