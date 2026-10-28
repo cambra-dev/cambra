@@ -1566,8 +1566,9 @@ impl TileOperator for Product {
                 scheduler,
             )
             .sharing(gate),
-            outer: subscribe_forwarding(&mut *self.outer, &shared, scheduler),
-            inner: subscribe_forwarding(&mut *self.inner, &shared, scheduler),
+            // Both sides are pulled at the projection, aligned row for row.
+            outer: subscribe_forwarding_keeping_keys(&mut *self.outer, &shared, scheduler),
+            inner: subscribe_forwarding_keeping_keys(&mut *self.inner, &shared, scheduler),
             level,
             empty_level,
             pair: self.tiling().deepest_values().clone(),
