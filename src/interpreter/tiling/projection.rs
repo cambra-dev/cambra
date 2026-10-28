@@ -93,13 +93,13 @@ impl Projection {
     ///
     /// # Panics
     ///
-    /// For a region of fields, whose intersection no caller needs yet.
+    /// For a region of fields, whose intersection is not spelled.
     pub fn intersect(&self, other: &Projection) -> Projection {
         match (self, other) {
             (Projection::Nothing, _) | (_, Projection::Nothing) => Projection::Nothing,
             (Projection::Everything, kept) | (kept, Projection::Everything) => kept.clone(),
             (Projection::Keys(a), Projection::Keys(b)) => Projection::admitting(a.intersect(b)),
-            (a, b) => panic!("no caller intersects a region of fields yet: {a:?}, {b:?}"),
+            (a, b) => panic!("the intersection of regions of fields is not spelled: {a:?}, {b:?}"),
         }
     }
 
@@ -107,17 +107,23 @@ impl Projection {
     ///
     /// # Panics
     ///
-    /// For a region of fields, whose subtraction no caller needs yet.
+    /// For a region of fields against anything but `Nothing` and `Everything`: the remainder of
+    /// a region of fields is not spelled.
     pub fn minus(&self, other: &Projection) -> Projection {
         let region = |projection: &Projection| match projection {
             Projection::Everything => Predicate::True,
             Projection::Nothing => Predicate::False,
             Projection::Keys(keys) => keys.clone(),
-            Projection::Fields(_) => {
-                panic!("no caller subtracts a region of fields yet: {self:?} minus {other:?}")
-            }
+            Projection::Fields(_) => panic!(
+                "the remainder of a region of fields is not spelled: {self:?} minus {other:?}"
+            ),
         };
-        Projection::admitting(region(self).minus(&region(other)))
+        match (self, other) {
+            (Projection::Nothing, _) => Projection::Nothing,
+            (_, Projection::Nothing) => self.clone(),
+            (Projection::Fields(_), Projection::Everything) => Projection::Nothing,
+            _ => Projection::admitting(region(self).minus(&region(other))),
+        }
     }
 
     /// The projection naming what either names: the region a memo has read or must read again, or
@@ -191,27 +197,27 @@ impl Projection {
         }
     }
 
-    /// The regions of the fields `entries` name of the record whose fields are `names`: a
+    /// The regions of the fields `entries` name of the record whose fields are `names`, sorted: a
     /// `Nothing` region is dropped, no entry at all is `Nothing`, and every field's region being
     /// [`Everything`](Self::Everything) is `Everything`.
     pub fn fields(
         names: Arc<[SmolStr]>,
         entries: impl IntoIterator<Item = (SmolStr, Projection)>,
     ) -> Projection {
-        // Names compare in order, so a record's are kept sorted: two regions of one record share
-        // the allocation when its names were sorted already.
-        let names = match names.is_sorted() {
-            true => names,
-            false => {
-                let mut sorted = names.to_vec();
-                sorted.sort();
-                sorted.into()
-            }
-        };
+        // Names compare in order, so a record's are sorted by whoever builds them, once.
+        debug_assert!(names.is_sorted(), "a record's names are sorted: {names:?}");
         let regions: BTreeMap<SmolStr, Projection> = entries
             .into_iter()
             .filter(|(_, region)| *region != Projection::Nothing)
             .collect();
+        debug_assert!(
+            regions.is_empty() || !names.is_empty(),
+            "a region of fields of a record with no fields: {regions:?}"
+        );
+        debug_assert!(
+            regions.keys().all(|name| names.contains(name)),
+            "a region names a field the record lacks: {regions:?} of {names:?}"
+        );
         let everything = !names.is_empty()
             && names
                 .iter()
@@ -227,7 +233,11 @@ impl Projection {
     #[cfg(test)]
     pub(crate) fn field_of(all: &[&str], name: &str, region: Projection) -> Projection {
         Projection::fields(
-            all.iter().copied().map(SmolStr::new).collect(),
+            {
+                let mut names: Vec<SmolStr> = all.iter().copied().map(SmolStr::new).collect();
+                names.sort();
+                names.into()
+            },
             [(SmolStr::new(name), region)],
         )
     }
@@ -646,8 +656,10 @@ mod fields_tests {
     }
 
     fn fields_of(all: &[&str], entries: &[(&str, Projection)]) -> Projection {
+        let mut names: Vec<SmolStr> = all.iter().map(|field| name(field)).collect();
+        names.sort();
         Projection::fields(
-            all.iter().map(|field| name(field)).collect(),
+            names.into(),
             entries
                 .iter()
                 .map(|(field, region)| (name(field), region.clone())),
@@ -680,10 +692,18 @@ mod fields_tests {
         assert!(matches!(narrow, Projection::Fields(_)));
     }
 
+    #[cfg(debug_assertions)]
     #[test]
-    fn a_records_names_compare_in_sorted_order_whatever_order_they_were_given() {
-        let given = |all: &[&str]| fields_of(all, &[("a", keys(1, 2))]);
-        assert_eq!(given(&["a", "b"]), given(&["b", "a"]));
+    #[should_panic(expected = "names are sorted")]
+    fn unsorted_names_are_a_bug_in_debug_builds() {
+        Projection::fields(vec![name("b"), name("a")].into(), [(name("a"), keys(1, 2))]);
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "names a field the record lacks")]
+    fn a_region_of_a_field_the_record_lacks_is_a_bug_in_debug_builds() {
+        Projection::fields(vec![name("a")].into(), [(name("z"), keys(1, 2))]);
     }
 
     #[test]
@@ -719,21 +739,29 @@ mod fields_tests {
 
     #[test]
     fn nested_fields_unite_beneath_their_field() {
-        let inner = |a: Projection| fields(&[("x", a)]);
+        let inner = |a: Projection| fields_of(&["x"], &[("x", a)]);
         let left = fields(&[("a", inner(keys(1, 2)))]);
         let right = fields(&[("a", inner(keys(3, 4)))]);
         assert_eq!(left.union(&right), fields(&[("a", inner(keys(1, 4)))]));
     }
 
     #[test]
-    #[should_panic(expected = "no caller intersects")]
-    fn no_caller_intersects_a_region_of_fields_yet() {
+    fn subtraction_is_total_where_fields_meet_nothing_or_everything() {
+        let a = fields(&[("a", keys(1, 2))]);
+        assert_eq!(a.minus(&Projection::Nothing), a);
+        assert_eq!(Projection::Nothing.minus(&a), Projection::Nothing);
+        assert_eq!(a.minus(&Projection::Everything), Projection::Nothing);
+    }
+
+    #[test]
+    #[should_panic(expected = "intersection of regions of fields is not spelled")]
+    fn the_intersection_of_regions_of_fields_is_not_spelled() {
         fields(&[("a", keys(1, 2))]).intersect(&fields(&[("a", keys(1, 2))]));
     }
 
     #[test]
-    #[should_panic(expected = "no caller subtracts")]
-    fn no_caller_subtracts_a_region_of_fields_yet() {
+    #[should_panic(expected = "remainder of a region of fields is not spelled")]
+    fn the_remainder_of_a_region_of_fields_is_not_spelled() {
         keys(1, 2).minus(&fields(&[("a", keys(1, 2))]));
     }
 

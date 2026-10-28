@@ -387,7 +387,11 @@ pub(crate) fn assert_notifications_survive_the_gates(
 /// The names of the fields of a record tiling.
 fn tiling_names(tiling: &Tiling) -> Arc<[SmolStr]> {
     match tiling {
-        Tiling::Record(fields) => fields.keys().cloned().collect(),
+        Tiling::Record(fields) => {
+            let mut names: Vec<SmolStr> = fields.keys().cloned().collect();
+            names.sort();
+            names.into()
+        }
         other => panic!("a record, got {other}"),
     }
 }
