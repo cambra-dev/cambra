@@ -899,20 +899,21 @@ impl SourceSinkRegistry {
         compile_to_in(lowering, program, phase)
     }
 
-    /// Compile `program` through `phase`, binding any port this
-    /// registry does not hold and keeping the listener.
+    /// Compile `program` through `phase`, binding the port of every route this registry does not
+    /// hold and keeping the listener.
     ///
-    /// The listener and nothing else: a route is registered by the compile that
-    /// installs the version, so a version refused after this one leaves none
-    /// behind.
+    /// The listener and nothing else: the pass lowers each such route to an
+    /// [`UnopenedRoute`](crate::interpreter::http_server::UnopenedRoute)
+    /// ([`Endpoints::BindPort`](crate::ccl::lower::Endpoints::BindPort)). The compile that
+    /// installs the version registers the routes, so a version refused after this compile leaves
+    /// no entry in a listener's routing table.
     ///
-    /// For the compile that precedes installing a version, and the reason it
-    /// opens is that binding is the one step the two compiles do not share.
-    /// [`compile_to`](Self::compile_to) names an address it does not hold rather
-    /// than taking it, so a port already in use — a typo, the control port, a
-    /// port another process holds — surfaced only from the compile *after* the
-    /// running graph was torn down, where there is nothing left to reject to.
-    /// Binding here makes it an ordinary compile error, raised while the running
+    /// This is the compile that precedes installing a version. It binds because binding is the one
+    /// step of the installing compile that can fail and that [`compile_to`](Self::compile_to),
+    /// which names an address it does not hold rather than taking it, skips. A port already in use,
+    /// such as a typo, the control port, or a port another process holds, would otherwise surface
+    /// only from the installing compile, after the running graph was torn down, where nothing is
+    /// left to reject to. Binding here makes it an ordinary compile error, raised while the running
     /// program is whole.
     ///
     /// The listener is kept rather than probed and dropped, so nothing can take
@@ -924,7 +925,9 @@ impl SourceSinkRegistry {
         program: &LoadedProgram,
         phase: Phase,
     ) -> Result<Expr, Vec<CompileError>> {
-        let mut scratch = GlobalContext::scratch(self.seed_lowering_context());
+        let mut lowering = self.seed_lowering_context();
+        lowering.bind_ports_only();
+        let mut scratch = GlobalContext::scratch(lowering);
         let compiled = run_frontend(&mut scratch, program, phase, &[], false);
         // Taken from the scratch *registry*, because `run_frontend` has already
         // folded the pass's listeners into it. Taken whether or not the compile

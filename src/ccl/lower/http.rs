@@ -258,10 +258,8 @@ impl LoweringContext {
         for sink in sinks {
             match sink {
                 DeclaredSink::Http { route, .. } => {
-                    let name = &route.source_name;
-                    if !self.sources.contains_key(name) {
-                        let source = Rc::new(RefCell::new(UnopenedRoute::new(name.clone())));
-                        self.sources.insert(name.clone(), source);
+                    if !self.sources.contains_key(&route.source_name) {
+                        self.declare_unopened_route(&route.source_name);
                     }
                 }
                 #[cfg(any(test, feature = "test-helpers"))]
@@ -334,35 +332,24 @@ impl LoweringContext {
             self.http_routes.contains_key(source_name) || !self.sources.contains_key(source_name),
             "http_serve source name {source_name} is already a source that is not a route",
         );
-        // Bind an already-open route, or open a new one. A route the
-        // source/sink registry already holds is *inherited*: reusing its
-        // `HttpServerDataSource` keeps the listener, the routing-table entry
-        // and the requests buffered behind it, which is what lets a
-        // replacement version of the program pick up where this one left
-        // off. A route it does not hold is opened, whether this is the
-        // program's first version or a replacement — a version that adds an
-        // endpoint serves it as soon as the swap completes.
-        Ok(match self.http_routes.get(source_name) {
-            Some(existing) => existing.sink.clone(),
-            None if self.endpoints == Endpoints::Inherited => {
-                let source_obj = Rc::new(RefCell::new(UnopenedRoute::new(source_name.clone())));
-                self.sources.insert(source_name.clone(), source_obj);
+        // A route the source/sink registry already holds is inherited: reusing its
+        // `HttpServerDataSource` keeps the listener, the routing-table entry and the requests
+        // buffered behind it, so a replacement version continues where the running one stopped.
+        if let Some(existing) = self.http_routes.get(source_name) {
+            return Ok(existing.sink.clone());
+        }
+        Ok(match self.endpoints {
+            Endpoints::Inherited => {
+                self.declare_unopened_route(source_name);
                 Arc::new(UnopenedRouteSink)
             }
-            None => {
-                // Share one tiny_http::Server per port across all http_serve routes.
-                if let std::collections::hash_map::Entry::Vacant(e) =
-                    self.shared_servers.entry(*port)
-                {
-                    let server = SharedHttpServer::new(*port).map_err(|e| {
-                        LoweringError::unsupported(
-                            args_span,
-                            format!("http_serve: failed to bind port {port}: {e}"),
-                        )
-                    })?;
-                    e.insert(Arc::new(server));
-                }
-                let server = self.shared_servers[port].clone();
+            Endpoints::BindPort => {
+                self.bind_port(*port, args_span)?;
+                self.declare_unopened_route(source_name);
+                Arc::new(UnopenedRouteSink)
+            }
+            Endpoints::Open => {
+                let server = self.bind_port(*port, args_span)?;
                 let source_obj = Rc::new(RefCell::new(HttpServerDataSource::new(
                     &server,
                     method.clone(),
@@ -383,5 +370,31 @@ impl LoweringContext {
                 sink
             }
         })
+    }
+
+    /// The listener on `port`, bound if this context holds none. One [`SharedHttpServer`] serves
+    /// every route on a port.
+    fn bind_port(
+        &mut self,
+        port: u16,
+        args_span: Span,
+    ) -> Result<Arc<SharedHttpServer>, LoweringError> {
+        if let std::collections::hash_map::Entry::Vacant(e) = self.shared_servers.entry(port) {
+            let server = SharedHttpServer::new(port).map_err(|e| {
+                LoweringError::unsupported(
+                    args_span,
+                    format!("http_serve: failed to bind port {port}: {e}"),
+                )
+            })?;
+            e.insert(Arc::new(server));
+        }
+        Ok(self.shared_servers[&port].clone())
+    }
+
+    /// Give the route named `source_name` an [`UnopenedRoute`] as its source, which no listener's
+    /// routing table names.
+    fn declare_unopened_route(&mut self, source_name: &str) {
+        let source = Rc::new(RefCell::new(UnopenedRoute::new(source_name.to_string())));
+        self.sources.insert(source_name.to_string(), source);
     }
 }

@@ -1052,10 +1052,11 @@ one.
 1. Render the difference between the predecessor's source and the new one, which compiles both to
    `Phase::AsOfRead`.
 2. Compile the new version to `Phase::Planning` against the endpoint registry, binding any port it
-   adds, and run the state-takeover guard on the planned tree. Neither step builds an operator, so a
-   version that fails either leaves every branch serving, and a refusal hands the ports back
-   (`release_unrouted_ports`). The report of every variable that begins above its loop's input comes
-   off this tree and is carried in `ReloadReport`, not rendered into the difference.
+   adds and registering no route, and run the state-takeover guard on the planned tree. Neither step
+   builds an operator, so a version that fails either leaves every branch serving, and a refusal
+   hands the ports back (`release_unrouted_ports`). The report of every variable that begins above
+   its loop's input comes off this tree and is carried in `ReloadReport`, not rendered into the
+   difference.
 3. Record, for each source, where producers registering from then on start
    (`GlobalContext::carry_release_from`, `carry_release_to_new_producers`): where the predecessor's
    producers stopped, per [Routes across branches](#routes-across-branches). This runs while the
@@ -1092,12 +1093,20 @@ Step 1 opens nothing. Rendering a difference runs with `Endpoints::Inherited`, s
 registry does not hold is named rather than opened: the context is thrown away but a socket is not,
 and opening one would make asking a question change what the program serves.
 
-Step 2 opens ports, because binding is the one thing it and step 5 would otherwise not share. A port
-already in use (a typo, the program's own control port, a port another process holds) would
-otherwise fail first at step 5, after step 3 had torn the running graph down, as the panic step 5
-documents. Taking the port at step 2 makes it an ordinary compile error raised while the program is
-whole, and taking it rather than probing means nothing can claim the port in between
-(`a_version_naming_an_unbindable_port_is_refused`).
+Step 2 binds ports, because binding is the one step of step 5 that can fail and that a compile
+naming its addresses would skip. A port already in use (a typo, the program's own control port, a
+port another process holds) would otherwise fail first at step 5, after step 3 had torn the running
+graph down, as the panic step 5 documents. Taking the port at step 2 makes it an ordinary compile
+error raised while the program is whole, and taking it rather than probing means nothing can claim
+the port in between (`a_version_naming_an_unbindable_port_is_refused`).
+
+Step 2 registers no route. It runs with `Endpoints::BindPort`, which lowers a route the registry
+does not hold to an `UnopenedRoute` after binding its port, and step 5 registers the route. An entry
+step 2 put in a listener's routing table would outlive a refusal, and its channel's receiver would
+go with step 2's context. The dispatcher would then send each request for the address to a channel
+nobody reads, and the address would answer 500 rather than 404
+(`a_refused_version_leaves_the_route_it_adds_unserved`). A port that a refused version adds holds
+no route, so the refusal releases it (`a_port_a_refused_version_adds_is_released`).
 
 Steps 3 and 4 come after step 2, so a rejection is never destructive, and before step 5, so what the
 new version inherits is held by the offer and not also by a running graph of the same branch.

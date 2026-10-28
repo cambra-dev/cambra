@@ -818,11 +818,10 @@ impl LiveProgram {
     ) -> Result<Checked, ReloadError> {
         let diff = difference(ctx, previous, loaded, Phase::AsOfRead)?
             .unwrap_or_else(|| no_difference(Phase::AsOfRead));
-        // This compile binds the ports the new version adds and keeps the
-        // listeners, because binding is the one step it and the compile that
-        // installs the version would otherwise not share: a port already in use
-        // would fail only after the running graph was torn down. Refusing below
-        // hands the ports back.
+        // This compile binds the ports the new version adds, keeps the listeners, and registers
+        // no route. Binding is the one step of the installing compile that can fail, so a port
+        // already in use is refused here, while the running graph is whole, rather than after it
+        // is torn down. Refusing below hands the ports back.
         let planned = ctx
             .sources_and_sinks_mut()
             .compile_to_opening(loaded, Phase::Planning)

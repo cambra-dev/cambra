@@ -315,24 +315,28 @@ impl LoweringResult {
 
 /// What a pass may do with an `http_serve` route the source/sink registry does not
 /// already hold.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default)]
 pub enum Endpoints {
     /// Open it. The pass is compiling the version that will serve it, and serving
     /// an address the previous version did not is what adding an endpoint means.
     #[default]
     Open,
+    /// Bind its port and keep the listener, and lower the route to an
+    /// [`UnopenedRoute`](crate::interpreter::http_server::UnopenedRoute).
+    ///
+    /// For the compile that precedes installing a version
+    /// ([`compile_to_opening`](crate::ccl::context::SourceSinkRegistry::compile_to_opening)),
+    /// which rejects a port already in use while the running program is whole. The compile that
+    /// installs the version registers the route. A routing-table entry this pass made would outlive
+    /// a refusal, with its channel's receiver dropped along with this pass's context.
+    BindPort,
     /// Leave it unopened, and lower it to an
     /// [`UnopenedRoute`](crate::interpreter::http_server::UnopenedRoute).
     ///
-    /// For `/diff`, the one pass that answers a question rather than installing a
-    /// version. Its context is thrown away, but a socket and a routing-table
-    /// entry are not, so opening one would make asking a question change what the
-    /// program serves.
-    ///
-    /// The compile that precedes installing a version runs `Open` and keeps what
-    /// it opens, because a port already in use has to be rejected while the
-    /// running program is whole
-    /// ([`compile_to_opening`](crate::ccl::context::SourceSinkRegistry::compile_to_opening)).
+    /// For rendering a difference, which `/diff` and the first step of a reload do, and which
+    /// answers a question rather than installing a version. Its context is thrown away, but a
+    /// socket and a routing-table entry are not, so opening one would make asking a question
+    /// change what the program serves.
     Inherited,
 }
 
@@ -802,6 +806,11 @@ impl LoweringContext {
     /// Answer against the endpoints this context already holds, opening none.
     pub fn inherit_endpoints_only(&mut self) {
         self.endpoints = Endpoints::Inherited;
+    }
+
+    /// Bind the port of each route this context does not hold, registering no route.
+    pub fn bind_ports_only(&mut self) {
+        self.endpoints = Endpoints::BindPort;
     }
 
     /// Seed this context with the sources and sinks a program already holds.
