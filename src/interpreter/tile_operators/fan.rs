@@ -285,7 +285,8 @@ impl TileOperator for Zip {
             inputs: self
                 .inputs
                 .iter_mut()
-                .map(|i| subscribe_forwarding(&mut **i, &shared, scheduler))
+                // Every arm is pulled at the projection: the arms share the pair's keys.
+                .map(|i| subscribe_forwarding_keeping_keys(&mut **i, &shared, scheduler))
                 .collect(),
         })
     }
