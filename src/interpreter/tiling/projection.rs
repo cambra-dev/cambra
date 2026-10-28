@@ -1,7 +1,7 @@
 //! The projection guards a producer restates: [`Projection`].
 //! See `src/interpreter/design-operators.md`, "Projection guards".
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use smol_str::SmolStr;
 
@@ -25,12 +25,34 @@ pub enum Projection {
     Keys(Predicate),
     /// A record's regions by field, each a region of that field's tile, for a notification from
     /// a producer whose tile is a record. A field the map omits is [`Nothing`](Self::Nothing).
-    /// Built by [`Projection::fields`], which names no `Nothing` field and no empty map.
+    /// Built by [`Projection::fields`], which names no `Nothing` field and no empty map, and is
+    /// everything where every field's region is.
     ///
     /// A region of fields names where a notification's change is and nothing a read can ask
     /// for, so it is a notification region only: every use of a projection as a pull
     /// (`guard`, `restrict_to`, `within`) fails on it with the region in the message.
-    Fields(BTreeMap<SmolStr, Projection>),
+    Fields(FieldRegions),
+}
+
+/// The regions of the fields of one record, which knows every field's name, so that a region of
+/// everything in each is [`Projection::Everything`] without a caller's help.
+///
+/// Two regions of fields of one record share its names. The algebra asserts that in debug builds.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FieldRegions {
+    names: Arc<[SmolStr]>,
+    regions: BTreeMap<SmolStr, Projection>,
+}
+
+impl FieldRegions {
+    /// The region of the field `name`, if it names one.
+    pub fn get(&self, name: &str) -> Option<&Projection> {
+        self.regions.get(name)
+    }
+
+    fn same_record(&self, other: &FieldRegions) -> bool {
+        self.names == other.names
+    }
 }
 
 impl Projection {
@@ -109,15 +131,19 @@ impl Projection {
             (Projection::Nothing, kept) | (kept, Projection::Nothing) => kept.clone(),
             (Projection::Keys(a), Projection::Keys(b)) => Projection::admitting(a.union(b)),
             (Projection::Fields(a), Projection::Fields(b)) => {
-                let mut merged = a.clone();
-                for (name, region) in b {
+                debug_assert!(
+                    a.same_record(b),
+                    "regions of different records: {a:?}, {b:?}"
+                );
+                let mut merged = a.regions.clone();
+                for (name, region) in &b.regions {
                     let united = match merged.get(name) {
                         Some(held) => held.union(region),
                         None => region.clone(),
                     };
                     merged.insert(name.clone(), united);
                 }
-                Projection::fields(merged)
+                Projection::fields(a.names.clone(), merged)
             }
             (Projection::Fields(_), Projection::Keys(_))
             | (Projection::Keys(_), Projection::Fields(_)) => Projection::Everything,
@@ -131,9 +157,15 @@ impl Projection {
             (Projection::Nothing, _) | (_, Projection::Everything) => true,
             (Projection::Everything, _) | (_, Projection::Nothing) => false,
             (Projection::Keys(a), Projection::Keys(b)) => a.minus(b).is_false(),
-            (Projection::Fields(a), Projection::Fields(b)) => a
-                .iter()
-                .all(|(name, region)| b.get(name).is_some_and(|held| region.contained_in(held))),
+            (Projection::Fields(a), Projection::Fields(b)) => {
+                debug_assert!(
+                    a.same_record(b),
+                    "regions of different records: {a:?}, {b:?}"
+                );
+                a.regions
+                    .iter()
+                    .all(|(name, region)| b.get(name).is_some_and(|held| region.contained_in(held)))
+            }
             (Projection::Keys(_), Projection::Fields(_))
             | (Projection::Fields(_), Projection::Keys(_)) => false,
         }
@@ -159,38 +191,45 @@ impl Projection {
         }
     }
 
-    /// The regions of the fields `entries` name, with a `Nothing` region dropped and no entry
-    /// at all being `Nothing`.
-    ///
-    /// Everything for every field of the record is [`Everything`](Self::Everything), which this
-    /// cannot see without the record's field names: [`normalized`](Self::normalized) does.
-    pub fn fields(entries: impl IntoIterator<Item = (SmolStr, Projection)>) -> Projection {
-        let kept: BTreeMap<SmolStr, Projection> = entries
+    /// The regions of the fields `entries` name of the record whose fields are `names`: a
+    /// `Nothing` region is dropped, no entry at all is `Nothing`, and every field's region being
+    /// [`Everything`](Self::Everything) is `Everything`.
+    pub fn fields(
+        names: Arc<[SmolStr]>,
+        entries: impl IntoIterator<Item = (SmolStr, Projection)>,
+    ) -> Projection {
+        // Names compare in order, so a record's are kept sorted: two regions of one record share
+        // the allocation when its names were sorted already.
+        let names = match names.is_sorted() {
+            true => names,
+            false => {
+                let mut sorted = names.to_vec();
+                sorted.sort();
+                sorted.into()
+            }
+        };
+        let regions: BTreeMap<SmolStr, Projection> = entries
             .into_iter()
             .filter(|(_, region)| *region != Projection::Nothing)
             .collect();
-        match kept.is_empty() {
-            true => Projection::Nothing,
-            false => Projection::Fields(kept),
+        let everything = !names.is_empty()
+            && names
+                .iter()
+                .all(|name| regions.get(name) == Some(&Projection::Everything));
+        match (regions.is_empty(), everything) {
+            (true, _) => Projection::Nothing,
+            (_, true) => Projection::Everything,
+            _ => Projection::Fields(FieldRegions { names, regions }),
         }
     }
 
-    /// This region for a record whose fields are `names`: [`Everything`](Self::Everything) where
-    /// every field's region is, at every depth.
-    pub fn normalized(self, names: &[SmolStr]) -> Projection {
-        match self {
-            Projection::Fields(fields) => {
-                let all = !names.is_empty()
-                    && names
-                        .iter()
-                        .all(|name| fields.get(name) == Some(&Projection::Everything));
-                match all {
-                    true => Projection::Everything,
-                    false => Projection::Fields(fields),
-                }
-            }
-            other => other,
-        }
+    /// The region of the field `name` of a record whose fields are `all`, for tests.
+    #[cfg(test)]
+    pub(crate) fn field_of(all: &[&str], name: &str, region: Projection) -> Projection {
+        Projection::fields(
+            all.iter().copied().map(SmolStr::new).collect(),
+            [(SmolStr::new(name), region)],
+        )
     }
 
     /// The projection naming the keys `keys` admits, normalized to
@@ -601,8 +640,14 @@ mod fields_tests {
         )))
     }
 
+    /// The regions `entries` of a record whose fields are `a` to `d`.
     fn fields(entries: &[(&str, Projection)]) -> Projection {
+        fields_of(&["a", "b", "c", "d"], entries)
+    }
+
+    fn fields_of(all: &[&str], entries: &[(&str, Projection)]) -> Projection {
         Projection::fields(
+            all.iter().map(|field| name(field)).collect(),
             entries
                 .iter()
                 .map(|(field, region)| (name(field), region.clone())),
@@ -623,14 +668,30 @@ mod fields_tests {
     }
 
     #[test]
-    fn a_region_of_every_field_everything_normalizes_to_everything() {
-        let names = [name("a"), name("b")];
-        let both = fields(&[("a", Projection::Everything), ("b", Projection::Everything)]);
-        assert_eq!(both.normalized(&names), Projection::Everything);
-        let one = fields(&[("a", Projection::Everything)]);
-        assert_eq!(one.clone().normalized(&names), one);
-        let narrow = fields(&[("a", Projection::Everything), ("b", keys(1, 2))]);
-        assert_eq!(narrow.clone().normalized(&names), narrow);
+    fn a_region_of_every_field_everything_is_everything() {
+        let both = |entries: &[(&str, Projection)]| fields_of(&["a", "b"], entries);
+        assert_eq!(
+            both(&[("a", Projection::Everything), ("b", Projection::Everything)]),
+            Projection::Everything
+        );
+        let one = both(&[("a", Projection::Everything)]);
+        assert!(matches!(one, Projection::Fields(_)));
+        let narrow = both(&[("a", Projection::Everything), ("b", keys(1, 2))]);
+        assert!(matches!(narrow, Projection::Fields(_)));
+    }
+
+    #[test]
+    fn a_records_names_compare_in_sorted_order_whatever_order_they_were_given() {
+        let given = |all: &[&str]| fields_of(all, &[("a", keys(1, 2))]);
+        assert_eq!(given(&["a", "b"]), given(&["b", "a"]));
+    }
+
+    #[test]
+    fn the_union_of_two_fields_that_are_everything_is_everything() {
+        let both = ["a", "b"];
+        let a = fields_of(&both, &[("a", Projection::Everything)]);
+        let b = fields_of(&both, &[("b", Projection::Everything)]);
+        assert_eq!(a.union(&b), Projection::Everything);
     }
 
     #[test]
@@ -718,7 +779,7 @@ mod containment_tests {
     }
 
     fn field(name: &str, region: Projection) -> Projection {
-        Projection::fields([(SmolStr::new(name), region)])
+        Projection::field_of(&["a", "b", "c"], name, region)
     }
 
     #[test]
@@ -737,10 +798,7 @@ mod containment_tests {
 
     #[test]
     fn fields_are_contained_field_by_field_and_a_missing_field_holds_nothing() {
-        let held = Projection::fields([
-            (SmolStr::new("a"), keys(1, 4)),
-            (SmolStr::new("b"), Projection::Everything),
-        ]);
+        let held = field("a", keys(1, 4)).union(&field("b", Projection::Everything));
         assert!(field("a", keys(2, 3)).contained_in(&held));
         assert!(field("b", keys(0, 9)).contained_in(&held));
         assert!(!field("c", keys(2, 3)).contained_in(&held));
@@ -766,10 +824,7 @@ mod containment_tests {
         assert_eq!(field("a", keys(1, 2)).passed_with(&keys(5, 6)), keys(5, 6));
         assert_eq!(
             field("a", keys(1, 2)).passed_with(&field("b", keys(1, 2))),
-            Projection::fields([
-                (SmolStr::new("a"), keys(1, 2)),
-                (SmolStr::new("b"), keys(1, 2))
-            ])
+            field("a", keys(1, 2)).union(&field("b", keys(1, 2)))
         );
     }
 }

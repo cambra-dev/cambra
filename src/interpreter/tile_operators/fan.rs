@@ -741,7 +741,11 @@ impl TileOperator for MakeRecord {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
-        let names: Arc<[SmolStr]> = self.names.clone().into();
+        let names: Arc<[SmolStr]> = {
+            let mut sorted = self.names.clone();
+            sorted.sort();
+            sorted.into()
+        };
         Box::new(MakeRecordProducer {
             base: ProducerBase::new(
                 MakeRecordProducer::alloc_id(),

@@ -698,7 +698,12 @@ fn make_record() -> Built {
 }
 
 fn field(name: &str, region: Projection) -> Projection {
-    Projection::fields([(SmolStr::new(name), region)])
+    // `MakeRecord` names its fields `_0`, `_1`, and a product built in a test `a`, `b`.
+    let all: &[&str] = match name.starts_with('_') {
+        true => &["_0", "_1"],
+        false => &["a", "b"],
+    };
+    Projection::field_of(all, name, region)
 }
 
 /// A record of values has no keys of its own: an input's region is the region of its field.
@@ -740,7 +745,10 @@ fn make_record_of_one_field_sends_everything_for_everything() {
         received(&one, 0, &Projection::Everything),
         [Projection::Everything]
     );
-    assert_eq!(received(&one, 0, &region()), [field("_0", region())]);
+    assert_eq!(
+        received(&one, 0, &region()),
+        [Projection::field_of(&["_0"], "_0", region())]
+    );
 }
 
 /// Every key is answered against all of the collection.
@@ -880,7 +888,7 @@ fn map_result() -> Built {
 /// would name there is not the record's field.
 #[test]
 fn every_operator_that_keeps_keys_widens_a_region_of_fields() {
-    let fields = Projection::fields([(SmolStr::new("a"), region())]);
+    let fields = field("a", region());
     let keepers: Vec<Keeper> = vec![
         ("RecordWrap", Box::new(record_wrap), 0),
         ("MapDomain", Box::new(map_domain), 0),
@@ -981,9 +989,6 @@ fn select_field_over_a_product_takes_its_fields_region() {
         [Projection::Everything]
     );
     assert_eq!(received(&product, 0, &region()), [Projection::Everything]);
-    let both = Projection::fields([
-        (SmolStr::new("a"), another_region()),
-        (SmolStr::new("b"), region()),
-    ]);
+    let both = field("a", another_region()).union(&field("b", region()));
     assert_eq!(received(&product, 0, &both), [another_region()]);
 }

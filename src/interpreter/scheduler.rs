@@ -292,7 +292,7 @@ impl Consumer for Forwarding {
             Route::Keys => arrived.keys_only(),
             Route::Region => arrived.clone(),
             Route::Field { name, names } => {
-                Projection::fields([(name.clone(), arrived.clone())]).normalized(names)
+                Projection::fields(names.clone(), [(name.clone(), arrived.clone())])
             }
         };
         let region = &region;
@@ -910,7 +910,7 @@ mod tests {
     }
 
     fn fields_of(region: Projection) -> Projection {
-        Projection::fields([(SmolStr::new("a"), region)])
+        Projection::field_of(&["a", "b"], "a", region)
     }
 
     /// A region of fields becomes everything where an operator keeps its input's keys, and any
@@ -1019,7 +1019,7 @@ mod tests {
     #[test]
     fn fields_follow_the_same_containment_rule() {
         let fields =
-            |name: &str, region: Projection| Projection::fields([(SmolStr::new(name), region)]);
+            |name: &str, region: Projection| Projection::field_of(&["a", "b", "c"], name, region);
         assert_eq!(
             passes(&[fields("a", keys(1, 4)), fields("b", keys(1, 4))]),
             2
@@ -1038,12 +1038,57 @@ mod tests {
         );
     }
 
+    /// A record's gate that has passed every field's region as everything holds everything, so a
+    /// later notification of everything, such as the wake a cycle defers, is suppressed. Without
+    /// the record's names the held regions never added up to everything, and that wake passed and
+    /// went around again.
+    #[test]
+    fn a_gate_that_passed_every_field_as_everything_suppresses_a_later_everything() {
+        let all = ["a", "b", "c"];
+        let gate = Notified::clear();
+        let passed: Vec<bool> = all
+            .iter()
+            .map(|name| {
+                gate.mark_news_of(&Projection::field_of(&all, name, Projection::Everything))
+            })
+            .collect();
+        assert_eq!(passed, [true, true, true]);
+        assert!(gate.covers(&Projection::Everything));
+        assert!(!gate.mark_news_of(&Projection::Everything));
+        assert!(!gate.mark_news_of(&Projection::field_of(&all, "a", keys(1, 2))));
+    }
+
+    /// Two inputs of a `MakeRecord` that each notify everything reach the consumer behind it as
+    /// two notifications, one per field, and a third round of them reaches it as none.
+    #[test]
+    fn make_record_inputs_that_notify_everything_reach_a_consumer_once_per_field() {
+        let names: Arc<[SmolStr]> = vec![SmolStr::new("_0"), SmolStr::new("_1")].into();
+        let (log, regions) = RegionLog::new(false);
+        let (shared, _gate) = shared_consumer(keys_only(Box::new(log)));
+        let queue = WakeupQueue::default();
+        let mut inputs: Vec<Box<dyn Consumer>> = names
+            .iter()
+            .map(|name| {
+                forwarding_consumer_into_field(&shared, &queue, name.clone(), names.clone())
+            })
+            .collect();
+        for _round in 0..3 {
+            for input in &mut inputs {
+                input.notify(&Projection::Everything);
+            }
+        }
+        assert_eq!(
+            *regions.lock_now(),
+            [Projection::Everything, Projection::Everything]
+        );
+    }
+
     /// A gate is given regions of one kind: keys for a collection, fields for a record.
     #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "notified of keys and of fields")]
     fn a_gate_notified_of_keys_and_of_fields_is_a_wiring_bug() {
-        let fields = Projection::fields([(SmolStr::new("a"), keys(1, 4))]);
+        let fields = Projection::field_of(&["a", "b"], "a", keys(1, 4));
         passes(&[keys(1, 4), fields]);
     }
 
@@ -1053,8 +1098,8 @@ mod tests {
     fn a_region_the_consumer_behind_the_gate_drops_still_closes_the_gate_to_it() {
         let (log, regions) = RegionLog::new(false);
         let (gated, gate) = shared_consumer(selecting_field(SmolStr::new("a"), Box::new(log)));
-        let other = Projection::fields([(SmolStr::new("b"), keys(1, 2))]);
-        let wanted = Projection::fields([(SmolStr::new("a"), keys(1, 2))]);
+        let other = Projection::field_of(&["a", "b"], "b", keys(1, 2));
+        let wanted = Projection::field_of(&["a", "b"], "a", keys(1, 2));
         gated.notify(&other);
         gated.notify(&other);
         gated.notify(&wanted);
@@ -1264,7 +1309,7 @@ mod tests {
     #[test]
     fn a_reentrant_region_of_another_field_is_not_lost() {
         let names: Arc<[SmolStr]> = vec![SmolStr::new("a"), SmolStr::new("b")].into();
-        let of = |name: &str| Projection::fields([(SmolStr::new(name), keys(1, 2))]);
+        let of = |name: &str| Projection::field_of(&["a", "b"], name, keys(1, 2));
         let (downstream, log, arm) = reentering(keys(1, 2));
         let (shared, _gate) = shared_consumer(downstream);
         let mut scheduler = Scheduler::new();

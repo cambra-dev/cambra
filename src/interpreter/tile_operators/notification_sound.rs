@@ -304,7 +304,10 @@ pub(crate) fn assert_notification_sound(
             Expect::Sound => {}
             Expect::Routed(name) => assert_eq!(
                 notified,
-                Projection::fields([(SmolStr::new(name), step.changed.clone())]),
+                Projection::fields(
+                    tiling_names(&tiling),
+                    [(SmolStr::new(name), step.changed.clone())]
+                ),
                 "step {n}: the operator did not route the region to its field"
             ),
             Expect::Silent => assert_eq!(
@@ -365,6 +368,14 @@ pub(crate) fn assert_notifications_survive_the_gates(
         normal(after_outside),
         "the answer changed outside {received:?}, which is all the consumer behind the gates heard"
     );
+}
+
+/// The names of the fields of a record tiling.
+fn tiling_names(tiling: &Tiling) -> Arc<[SmolStr]> {
+    match tiling {
+        Tiling::Record(fields) => fields.keys().cloned().collect(),
+        other => panic!("a record, got {other}"),
+    }
 }
 
 /// Cut `tile`, an answer of `tiling`, to `region`, or to what `region` leaves out where
