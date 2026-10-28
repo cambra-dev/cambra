@@ -1468,3 +1468,20 @@ fn a_refined_associated_type_is_an_internal_gap() {
         "internal compiler error in lowering",
     );
 }
+
+/// A gap the compiler refuses as its own: a refinement in a trait function's signature.
+#[test]
+fn a_refined_trait_signature_is_an_internal_gap() {
+    check_compile_error(
+        indoc! {"
+            type Bag = Int
+            trait Container(C):
+                def first(c: C) => {Int where _ >= 0}
+            impl Container(Bag):
+                def first(c):
+                    3
+            summon(Container(_))::first(Bag::new(1))
+        "},
+        "a refinement in the signature of",
+    );
+}
