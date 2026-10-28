@@ -469,3 +469,52 @@ fn make_record_sends_everything_for_a_later_region() {
         [Projection::Everything]
     );
 }
+
+/// A fan-out over a feed with a recording consumer on each of its two slots, as the bindings
+/// `logs`, `producers` and `consumer`: the consumers' logs, the slots' producers, and the consumer
+/// the feed notifies through.
+macro_rules! fan_out_with_two_slots {
+    ($logs:ident, $producers:ident, $consumer:ident) => {
+        let ($logs, mut $producers, $consumer) = {
+            let (input, consumer) = feed(ints());
+            let fan = FanOut::new(input);
+            let mut scheduler = Scheduler::new();
+            let mut logs = Vec::new();
+            let mut producers = Vec::new();
+            for _ in 0..2 {
+                let (log, regions) = RegionLog::new();
+                let mut slot = fan.slot();
+                let guard = slot.tiling().universal_guard();
+                producers.push(slot.subscribe(guard, Box::new(log), &mut scheduler));
+                logs.push(regions);
+            }
+            for regions in &logs {
+                regions.borrow_mut().clear();
+            }
+            (logs, producers, consumer)
+        };
+    };
+}
+
+#[test]
+fn a_fan_out_forwards_a_region_to_every_live_slot_unchanged() {
+    fan_out_with_two_slots!(logs, _producers, consumer);
+    notify_input(&consumer, &region());
+    for regions in &logs {
+        assert_eq!(*regions.borrow_mut(), [region()]);
+    }
+}
+
+/// One notification passes between pulls; a pull reopens it, and the region of the next one is
+/// delivered.
+#[test]
+fn a_fan_out_suppresses_a_second_notification_until_a_pull_reopens_it() {
+    fan_out_with_two_slots!(logs, producers, consumer);
+    notify_input(&consumer, &region());
+    notify_input(&consumer, &another_region());
+    assert_eq!(*logs[0].borrow_mut(), [region()]);
+    let guard = producers[0].tiling().universal_guard();
+    producers[0].get(guard);
+    notify_input(&consumer, &another_region());
+    assert_eq!(*logs[0].borrow_mut(), [region(), another_region()]);
+}
