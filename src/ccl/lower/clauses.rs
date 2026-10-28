@@ -26,6 +26,7 @@ pub(super) fn is_context_item(item: &Spanned<ChlRequirement>, ctx: &LoweringCont
     match &item.node {
         ChlRequirement::Trait { ty, .. } => {
             ty.name == "_"
+                || ty.instance.is_some()
                 || ty.name == "Context"
                 || Trait::context_named(&ty.name).is_some()
                 || ctx.clause_param(&ty.name, item.span).is_some()
@@ -183,6 +184,7 @@ pub(super) fn lower_clauses(
         open_causes,
         at,
         of_def: site == Site::Def,
+        of_instance: false,
     }))
 }
 
@@ -407,6 +409,9 @@ fn context_requirement(
             ),
         ));
     }
+    if let Some(param) = associated(ty, ctx)? {
+        return clause_param(param, false, ty, item.span);
+    }
     if let Some(param) = ctx.clause_param(&ty.name, item.span) {
         return clause_param(param, false, ty, item.span);
     }
@@ -438,6 +443,9 @@ fn effect(
     ctx: &LoweringContext,
 ) -> Result<Lowered<Effect>, LoweringError> {
     let ty = &item.node;
+    if let Some(param) = associated(ty, ctx)? {
+        return clause_param(param, true, ty, item.span);
+    }
     if let Some(param) = ctx.clause_param(&ty.name, item.span) {
         return clause_param(param, true, ty, item.span);
     }
@@ -471,6 +479,41 @@ fn effect(
                 "`{name}` is not an effect; a `causes` clause lists `Write(x)`, `WriteTxn(x)`, \
                  `Append(f)`, `RunTransaction`, `AffectWorld`, the tops `Effect`, `Write(_)`, \
                  `WriteTxn(_)` and `Append(_)`, `_`, and a type parameter bounded by `Effect`"
+            ),
+        )),
+    }
+}
+
+/// The parameter a requirement in scope gives the associated effect type `ty` names, `s::Writes`,
+/// or `None` for an item no requirement qualifies.
+fn associated(ty: &TraitType, ctx: &LoweringContext) -> Result<Option<ClauseParam>, LoweringError> {
+    let Some(instance) = &ty.instance else {
+        return Ok(None);
+    };
+    let Some(requirement) = ctx.named_requirement(&instance.node) else {
+        return Err(LoweringError::unsupported(
+            instance.span,
+            format!(
+                "`{}` names no requirement in scope; `{}::{}` is an associated effect type of \
+                 the instance a `requires` clause names",
+                instance.node, instance.node, ty.name
+            ),
+        ));
+    };
+    let found = requirement.effect_assoc.iter().find(|(id, _)| {
+        requirement
+            .trait_
+            .effect_assocs
+            .iter()
+            .any(|p| p.param.id == *id && p.param.spelling == ty.name)
+    });
+    match found {
+        Some((_, param)) => Ok(Some(param.clone())),
+        None => Err(LoweringError::unsupported(
+            ty.name_span,
+            format!(
+                "`{}` declares no associated type `{}` bounded by `Effect` or `Context`",
+                requirement.trait_, ty.name
             ),
         )),
     }

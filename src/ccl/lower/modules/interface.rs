@@ -412,7 +412,8 @@ pub struct TraitMember {
 
 impl TraitMember {
     /// The trait as `cambra check` prints it, as the module at `home` writes it: its head
-    /// and what it requires, each associated type with its bound, and each function's type.
+    /// and what it requires, each associated type with its bound, each associated effect type
+    /// with its, and each function's type with its clauses.
     fn written(&self, home: &[SmolStr]) -> String {
         let trait_ = &self.trait_;
         let ty = |ty: &Type| crate::ccl::chl_print::chl_type_in(ty, home);
@@ -448,6 +449,14 @@ impl TraitMember {
                 None => lines.push(format!("    {assoc}")),
             }
         }
+        for assoc in &trait_.effect_assocs {
+            let top = if assoc.of_causes { "Effect" } else { "Context" };
+            lines.push(format!(
+                "    {} <: {top}{}",
+                assoc.param.spelling,
+                crate::ccl::effects::except_text(&assoc.param.clause_except)
+            ));
+        }
         for function in &trait_.functions {
             let signature = &function.signature;
             let domain = match signature.inputs.as_slice() {
@@ -466,11 +475,8 @@ impl TraitMember {
                 function.name,
                 ty(&Type::fun(domain, signature.output.clone()))
             );
-            if !signature.requires.is_empty() {
-                let requires: Vec<String> =
-                    signature.requires.iter().map(|r| requirement(r)).collect();
-                line.push_str(&format!(" requires {}", requires.join(", ")));
-            }
+            let requires: Vec<String> = signature.requires.iter().map(|r| requirement(r)).collect();
+            line.push_str(&crate::ccl::effects::clauses(requires, &signature.effects));
             lines.push(line);
         }
         lines.join("\n")

@@ -332,6 +332,9 @@ pub enum InferError {
     EffectBeyondBound { item: String },
     /// A body requiring or causing `item` beyond its definition's `only` clause.
     EffectBeyondClause { item: String },
+    /// An instance's function requiring or causing `item` beyond its trait's signature
+    /// (`docs/chl-spec.md`, "Effects in traits").
+    EffectBeyondSignature { item: String },
     /// A written clause's `item` names no variable of the kind it takes in scope.
     ClauseNamesNoVariable { item: String },
     /// A type mismatch was detected between two solved types.
@@ -902,6 +905,7 @@ impl InferError {
             | InferError::EffectBeyondBound { .. }
             | InferError::EffectBeyondClause { .. }
             | InferError::ClauseNamesNoVariable { .. }
+            | InferError::EffectBeyondSignature { .. }
             | InferError::Unsupported(_)
             | InferError::EmptyCase { .. }
             | InferError::UnresolvedHole { .. }
@@ -1321,6 +1325,11 @@ impl std::fmt::Debug for InferError {
                 "`{item}` names no variable in scope of the kind it takes: `Write` and `Read` \
                  take an induction variable, `WriteTxn` and `ReadTxn` a transactional one, and \
                  `Append` a feed"
+            ),
+            InferError::EffectBeyondSignature { item } => write!(
+                f,
+                "this has `{item}`, which the trait's signature does not list; an associated \
+                 type bounded by `Effect` lets instances differ"
             ),
             InferError::EffectBeyondClause { item } => write!(
                 f,

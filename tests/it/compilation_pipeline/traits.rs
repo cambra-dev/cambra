@@ -2446,7 +2446,7 @@ fn a_hole_in_a_bound_is_spelled_by_its_member() {
         stock: Mut(Int, Txn) := 10
         type Box = Int
         trait Take(T):
-            def take(t: T, s: Mut(Int, Txn), n: Int) => Int
+            def take(t: T, s: Mut(Int, Txn), n: Int) => Int causes RunTransaction
         instance Take(Box):
             def take(t, s, n):
                 with begin():
@@ -2462,7 +2462,7 @@ fn a_hole_in_a_bound_is_spelled_by_its_member() {
         stock: Mut(Int, Txn) := 10
         type Box = Int
         trait Take(T):
-            def take(t: T, s: Mut(Int, Txn), n: Int) => Int
+            def take(t: T, s: Mut(Int, Txn), n: Int) => Int causes RunTransaction
         instance Take(Box):
             def take(t, s, n):
                 with begin():
@@ -2480,7 +2480,7 @@ fn a_hole_in_a_bound_is_spelled_by_its_member() {
         stock: Mut(Int, Txn) := 10
         type Box = Int
         trait Take(T):
-            def take(t: T, s: Mut(Int, Txn), n: Int) => Int
+            def take(t: T, s: Mut(Int, Txn), n: Int) => Int causes RunTransaction
         instance Take(Box):
             def take(t, s, n):
                 with begin():

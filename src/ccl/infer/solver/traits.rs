@@ -165,6 +165,10 @@ pub struct TraitDecl {
     /// requirement leaving the type unnamed gets a parameter bounded by it
     /// (`docs/chl-spec.md`, "Declaring a trait"). Holes in it are fresh at each use.
     pub assoc_bounds: Vec<(Assoc, Type)>,
+    /// The associated types standing for a clause, `Writes <: Effect`, which each
+    /// instance's functions decide rather than an instance defining them
+    /// (`docs/chl-spec.md`, "Effects in traits"). A signature names each by its parameter.
+    pub effect_assocs: Vec<crate::ccl::effects::ClauseParam>,
     /// In declaration order.
     pub functions: Vec<TraitFunction>,
     /// What every instance of the trait requires of its operands, over `operands` and
@@ -401,11 +405,13 @@ impl CompilerTraits {
                         args: vec![Type::Param(Rc::clone(&t)), Type::Param(Rc::clone(&t))],
                         terms: Vec::new(),
                         assoc: Vec::new(),
+                        effect_assoc: Vec::new(),
                         at: None,
                     })],
                     params: vec![t],
                     bounds: Vec::new(),
                     functions: Vec::new(),
+                    effect_assocs: Vec::new(),
                     declared: None,
                 }),
             );
@@ -453,6 +459,7 @@ impl CompilerTraits {
                 operands: vec![Rc::clone(&c)],
                 term_params: Vec::new(),
                 supplied_by: Supplier::Instances,
+                effect_assocs: Vec::new(),
                 assocs: vec![(
                     Assoc::Declared(ITERABLE_ELEMENTS_ASSOC.into()),
                     Rc::clone(&elements),
@@ -475,6 +482,18 @@ impl CompilerTraits {
                         inputs: vec![Type::Param(c)],
                         output: Type::Param(elements),
                         requires: Vec::new(),
+                        // Exact clauses listing nothing: walking a collection requires
+                        // nothing and causes nothing.
+                        effects: crate::ccl::effects::Effects::written(
+                            crate::ccl::effects::Written {
+                                set: crate::ccl::effects::EffectSet::default(),
+                                open_requires: false,
+                                open_causes: false,
+                                at: Span::new(chl_parser::FileId::ROOT, 0, 0),
+                                of_def: false,
+                                of_instance: false,
+                            },
+                        ),
                     },
                 }],
                 requires: Vec::new(),
@@ -551,6 +570,18 @@ impl OperatorTrait<'_> {
                         inputs: operand_types.clone(),
                         output: Type::Param(Rc::clone(output)),
                         requires: Vec::new(),
+                        // Exact clauses listing nothing: an operator's function requires
+                        // nothing and causes nothing.
+                        effects: crate::ccl::effects::Effects::written(
+                            crate::ccl::effects::Written {
+                                set: crate::ccl::effects::EffectSet::default(),
+                                open_requires: false,
+                                open_causes: false,
+                                at: Span::new(chl_parser::FileId::ROOT, 0, 0),
+                                of_def: false,
+                                of_instance: false,
+                            },
+                        ),
                     },
                 }
             })
@@ -565,6 +596,7 @@ impl OperatorTrait<'_> {
                     args: operand_types.clone(),
                     terms: Vec::new(),
                     assoc: Vec::new(),
+                    effect_assoc: Vec::new(),
                     at: None,
                 })
             })
@@ -576,6 +608,7 @@ impl OperatorTrait<'_> {
             operands,
             term_params: Vec::new(),
             supplied_by: Supplier::Instances,
+            effect_assocs: Vec::new(),
             assocs,
             functions,
             requires,
@@ -611,6 +644,7 @@ impl OperatorTrait<'_> {
                         .map(|(f, p)| (SmolStr::from(f), Implementation::Primitive(p)))
                         .into_iter()
                         .collect(),
+                    effect_assocs: Vec::new(),
                     declared: None,
                 }),
             );
@@ -636,6 +670,7 @@ fn context_trait(name: &str, term_params: &[&str], supplied_by: Supplier) -> Tra
         supplied_by,
         assocs: Vec::new(),
         assoc_bounds: Vec::new(),
+        effect_assocs: Vec::new(),
         functions: Vec::new(),
         requires: Vec::new(),
         named: Vec::new(),
@@ -712,6 +747,7 @@ impl Trait {
             supplied_by: Supplier::Instances,
             assocs: vec![(Assoc::Method, TypeParam::declared("method"))],
             assoc_bounds: Vec::new(),
+            effect_assocs: Vec::new(),
             functions: Vec::new(),
             requires: Vec::new(),
             named: Vec::new(),
@@ -1033,6 +1069,11 @@ pub struct TraitInstance {
     pub bounds: Vec<(Rc<TypeParam>, Type)>,
     /// How it implements each of its trait's functions, by the function's name.
     pub functions: Vec<(SmolStr, Implementation)>,
+    /// Each of the trait's associated effect types at this instance, by the trait's
+    /// parameter for it: what this instance's functions cause beyond what their signatures
+    /// list, which inference collects on one variable per entry
+    /// (`docs/chl-spec.md`, "Effects in traits").
+    pub effect_assocs: Vec<(TypeParamId, crate::ccl::effects::ClauseParam)>,
     /// Where a module declares it; `None` for the compiler's.
     pub declared: Option<DeclaredAt>,
 }
@@ -1422,6 +1463,9 @@ pub struct Signature {
     pub output: Type,
     /// What the function requires, checked at each call's types.
     pub requires: Vec<Rc<TraitRequirement>>,
+    /// What a call requires of its context and causes, as the signature's clauses state
+    /// them: written, and exact (`docs/chl-spec.md`, "Effects in traits").
+    pub effects: crate::ccl::effects::Effects,
 }
 
 /// A program's instances: the compiler's, which every program has, and the instances its
@@ -1555,6 +1599,16 @@ impl InstanceTable {
     }
 
     /// Every instance of `trait_`: the compiler's, then the program's in declaration order.
+    /// Whether `param` is an instance's parameter for one of its associated effect types.
+    pub fn is_instance_effect(&self, param: TypeParamId) -> bool {
+        self.instances.iter().any(|(_, instance)| {
+            instance
+                .effect_assocs
+                .iter()
+                .any(|(_, own)| own.param.id == param)
+        })
+    }
+
     pub fn instances(&self, trait_: &Trait) -> Vec<Rc<TraitInstance>> {
         self.instances
             .iter()
@@ -1901,6 +1955,7 @@ impl TraitObligation {
                     heads: operands.iter().map(InstanceHead::of_pattern).collect(),
                     operands,
                     assoc: Vec::new(),
+                    effect_assocs: Vec::new(),
                     requires: Vec::new(),
                     bounds: Vec::new(),
                     functions: Vec::new(),
@@ -2084,6 +2139,12 @@ impl TraitObligation {
     /// (`src/ccl/design/nominal-types.md`, "Method calls").
     pub fn is_waiting(&self) -> bool {
         self.selected_instance().is_none() && !self.failed.get()
+    }
+
+    /// The assumptions still consistent with everything seen so far: the requirements in
+    /// scope that could answer this obligation.
+    pub fn assumptions(&self) -> Vec<Rc<TraitRequirement>> {
+        self.assumptions.borrow().clone()
     }
 
     /// The candidates still live, for diagnostics and tests.
@@ -2558,6 +2619,7 @@ impl TraitObligation {
             trait_: self.trait_.clone(),
             args,
             terms: Vec::new(),
+            effect_assoc: Vec::new(),
             assoc,
             at: None,
         })
@@ -4572,6 +4634,7 @@ pub fn entailed(
                 trait_: requirement.trait_.clone(),
                 args: args.iter().map(|a| component(a, key)).collect(),
                 terms: Vec::new(),
+                effect_assoc: Vec::new(),
                 assoc: Vec::new(),
                 at: requirement.at,
             };

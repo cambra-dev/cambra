@@ -250,8 +250,9 @@ impl Walk {
                                 &sig.node.type_params,
                                 &sig.node.params,
                                 sig.node.output.as_ref(),
-                                &sig.node.requires,
-                            )
+                                &sig.node.requires.items,
+                            );
+                            w.trait_types(&sig.node.causes.items);
                         }),
                     }
                 }
