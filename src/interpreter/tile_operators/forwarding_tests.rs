@@ -3,6 +3,8 @@
 //! at the projection, and `Everything` where it re-keys or reads the input whole.
 //! See `src/interpreter/design-operators.md`, "The notification contract".
 
+use smol_str::SmolStr;
+
 use super::test_helpers::{InputConsumer, NotifyingOp, RegionLog, keys_between, notify_input};
 use super::*;
 use crate::interpreter::{BaseType, CurryLevel, Extent, Projection, Scheduler, Tiling};
@@ -63,6 +65,22 @@ fn assert_keeps_without_state(build: &dyn Fn() -> Built, notified: usize) {
         received(build, notified, &another_region()),
         [another_region()]
     );
+}
+
+fn record_wrap() -> Built {
+    let (input, consumer) = feed(ints());
+    let op = RecordWrap::new_at(SmolStr::new("a"), input, CurryLevel::new(1));
+    (Box::new(op), vec![consumer])
+}
+
+#[test]
+fn record_wrap_forwards_its_inputs_region() {
+    assert_keeps(&record_wrap, 0);
+}
+
+#[test]
+fn record_wrap_carries_no_region_between_notifications() {
+    assert_keeps_without_state(&record_wrap, 0);
 }
 
 fn map_result_with_source() -> Built {
