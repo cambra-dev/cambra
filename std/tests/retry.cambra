@@ -1,0 +1,18 @@
+# A program that imports `std::retry`: a policy of the default backoff with a classification of its
+# own, applied to each input line read as a status code.
+
+import std::retry
+
+policy = retry::default_retry()
+
+def classify(status: Int) => retry::RetryState(Int):
+    if status == 429 or status >= 500:
+        `retriable(answered=True)
+    else:
+        `ok(status)
+
+states: Mut(Map(String, retry::RetryState(Int)), Txn) := empty_map()
+
+for line in stdin():
+    with begin():
+        states[line] := classify(policy.backoff.attempts)

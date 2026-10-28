@@ -1,0 +1,77 @@
+Error: parse error
+    ╭─[<std>/retry.cambra:39:70]
+    │
+ 39 │ pub RetryState(Ok) = {`ok{Ok} | `retriable{answered: Bool} | `failed}
+    │     ────────────────────────────────┬────────┬───────────────────────┬  
+    │                                     ╰─────────────────────────────────── while parsing statement
+    │                                              │                       │  
+    │                                              ╰────────────────────────── while parsing expression
+    │                                                                      │  
+    │                                                                      ╰── invalid assignment target
+────╯
+Error: parse error
+    ╭─[<std>/retry.cambra:61:2]
+    │
+ 56 │ ╭───▶ pub RetryConfig(Response, Ok) = {
+    │ │                                     ▲   
+    │ │ ╭───────────────────────────────────╯   
+    ┆ ┆ ┆   
+ 61 │ │ ├─▶ }
+    │ │ │   ▲┬  
+    │ │ ╰─────── while parsing expression
+    │ │     ││  
+    │ ╰─────┴─── while parsing statement
+    │        │  
+    │        ╰── invalid assignment target
+────╯
+Error: loading error
+    ╭─[<std>/retry.cambra:32:8]
+    │
+ 32 │ import std::http
+    │        ────┬────  
+    │            ╰────── no module `std::http`: the std root has no module `http`
+────╯
+Error: lowering error
+   ╭─[tests/retry.cambra:8:30]
+   │
+ 8 │ def classify(status: Int) => retry::RetryState(Int):
+   │                              ────────┬────────  
+   │                                      ╰────────── a type application must have a simple name head (e.g. `List(…)`)
+───╯
+Error: lowering error
+    ╭─[tests/retry.cambra:14:25]
+    │
+ 14 │ states: Mut(Map(String, retry::RetryState(Int)), Txn) := empty_map()
+    │                         ────────┬────────  
+    │                                 ╰────────── a type application must have a simple name head (e.g. `List(…)`)
+────╯
+Error: lowering error
+    ╭─[<std>/retry.cambra:70:5]
+    │
+ 70 │ ╭─▶ pub def default_retry(Response, Ok) => RetryConfig(Response, Ok):
+    ┆ ┆   
+ 75 │ ├─▶ # answers a rate limit with 429 and an outage with 5xx.
+    │ │                                                             
+    │ ╰───────────────────────────────────────────────────────────── function/lambda with no parameters not supported
+────╯
+Error: lowering error
+    ╭─[<std>/retry.cambra:76:59]
+    │
+ 76 │ pub def transient_http_retry(Ok, o: http::Outcome(Ok)) => RetryState(Ok):
+    │                                                           ───────┬──────  
+    │                                                                  ╰──────── unknown type application: `RetryState(…)`
+────╯
+Error: lowering error
+    ╭─[<std>/time.cambra:44:5]
+    │
+ 44 │ pub type Instant = Int
+    │     ─────────┬─────────  
+    │              ╰─────────── a nominal type in a module other than the root is not supported yet
+────╯
+Error: lowering error
+    ╭─[<std>/time.cambra:54:5]
+    │
+ 54 │ pub type Duration = Int
+    │     ──────────┬─────────  
+    │               ╰─────────── a nominal type in a module other than the root is not supported yet
+────╯
