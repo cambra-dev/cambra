@@ -260,6 +260,34 @@ fn a_tagged_union_sends_everything_for_any_region() {
     assert_widens(&|| union(false), 1);
 }
 
+fn lookup(keys: Tiling) -> Built {
+    let (collection, table) = feed(ints());
+    let (keys, stream) = feed(keys);
+    let op = CheckedLookup::split(collection, keys, int());
+    (Box::new(op), vec![table, stream])
+}
+
+fn lookup_of_a_stream() -> Built {
+    lookup(ints())
+}
+
+#[test]
+fn a_lookup_forwards_the_region_of_a_stream_of_keys() {
+    assert_keeps(&lookup_of_a_stream, 1);
+}
+
+#[test]
+fn a_lookup_of_a_stream_carries_no_region_between_notifications() {
+    assert_keeps_without_state(&lookup_of_a_stream, 1);
+}
+
+/// One key has no keys to project.
+#[test]
+fn a_lookup_of_one_key_sends_everything_for_any_region() {
+    let one_key = || lookup(Tiling::Scalar(Extent::Base(BaseType::UInt)));
+    assert_widens(&one_key, 1);
+}
+
 fn filter(predicate: Tiling) -> Built {
     let (input, data) = feed(ints());
     let (predicate, mask) = feed(predicate);
