@@ -1030,7 +1030,16 @@ fn a_change_to_the_selected_field_after_one_to_the_other_still_notifies() {
 #[test]
 fn a_consumer_that_pulls_hears_every_field_of_a_record_behind_the_gates() {
     let shapes = [(Values::Ints, None), (Values::Ints, None)];
+    let (repeated_feeds, repeated_steps) = repeated_region_script();
     for through in [Through::Nothing, Through::Memo, Through::FanOutSlot] {
+        // One change announced as everything and the next as the keys it added, with a pull
+        // between them: a gate that a pull does not reset suppresses the second.
+        assert_notifications_survive_the_gates(
+            &select_over_make_record(through),
+            &repeated_feeds,
+            &repeated_steps,
+            &[0],
+        );
         for (seed, steps, growth) in [
             (1, 8, Growth::OneAtATime),
             (2, 6, Growth::Bursts),
@@ -1081,10 +1090,9 @@ fn a_consumer_that_pulls_hears_every_change_to_every_input_behind_the_gates() {
     }
 }
 
-/// A pull opens the gates again: a region inside what passed before the pull, here the keys an
-/// earlier notification of everything covered, must reach the consumer after it.
-#[test]
-fn a_gate_that_a_pull_reopened_passes_a_region_inside_what_passed_before_it() {
+/// The feeds and steps of a script in which one change is announced as everything and the next as
+/// the keys it added, so that after a pull between them the second is inside what passed before.
+fn repeated_region_script() -> (Vec<(Tiling, Vec<Tile>)>, Vec<Step>) {
     let none = Predicate::False;
     let a = vec![
         int_stream(&[], none.clone()),
@@ -1092,15 +1100,22 @@ fn a_gate_that_a_pull_reopened_passes_a_region_inside_what_passed_before_it() {
         int_stream(&[(2, 20), (5, 50)], none.clone()),
     ];
     let b = vec![int_stream(&[], none.clone())];
-    let feeds = [
+    let feeds = vec![
         (stream_tiling(Values::Ints), a),
         (stream_tiling(Values::Ints), b),
     ];
-    // The first change is announced as everything, the second as the keys it added.
     let steps = [(0, Projection::Everything), (0, keys_region(&[5]))]
         .into_iter()
         .map(|(input, changed)| Step { input, changed })
         .collect::<Vec<_>>();
+    (feeds, steps)
+}
+
+/// A pull opens the gates again: a region inside what passed before the pull, here the keys an
+/// earlier notification of everything covered, must reach the consumer after it.
+#[test]
+fn a_gate_that_a_pull_reopened_passes_a_region_inside_what_passed_before_it() {
+    let (feeds, steps) = repeated_region_script();
     for through in [Through::Nothing, Through::Memo, Through::FanOutSlot] {
         assert_notifications_survive_the_gates(
             &select_over_make_record(through),
