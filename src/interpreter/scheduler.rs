@@ -315,15 +315,18 @@ impl Consumer for Forwarding {
         // call in progress may already have pulled past: a cascade can contain a pull, and
         // a wake after one carries what arrived too late for it. Deferred, it is delivered
         // outside any cascade, where it cannot re-enter, and at worst wakes a consumer
-        // whose next pull finds nothing new.
+        // whose next pull finds nothing new. The deferred wake carries `Everything`, so a
+        // cycle goes around once more and the gate then covers what it carries.
         //
-        // A re-entering notification behind a closed gate is dropped instead: nothing has
-        // pulled the operator since the notification in progress passed, so that one already
-        // says everything this would. Deferring it would deliver it again on the next drain,
-        // and around a cycle again on every poll after.
+        // A re-entering notification whose region is inside what the gate passed is dropped
+        // instead: nothing has pulled the operator since, so what passed already says
+        // everything this would. Deferring it would deliver it again on the next drain, and
+        // around a cycle again on every poll after. A region outside it is not said by what
+        // passed: the notification in progress may be for another field of a record, which a
+        // consumer that selects this field would have dropped.
         match shared.try_lock_now() {
             Some(mut consumer) => consumer.notify(region),
-            None if gate.is_set() => {}
+            None if gate.covers(region) => {}
             None => self.wakeups.request(shared.clone()),
         }
     }
@@ -1221,6 +1224,98 @@ mod tests {
         );
         scheduler.check_for_notifications();
         assert_eq!(notified.get(), 1);
+    }
+
+    /// The consumer, its log, and the slot of the arm that feeds the cell it is inside.
+    type Reentering = (
+        Box<dyn Consumer>,
+        Arc<Mutex<Vec<Projection>>>,
+        Arc<Mutex<Option<Box<dyn Consumer>>>>,
+    );
+
+    /// A downstream consumer that logs what it is notified of and, each time, notifies `reentry`
+    /// through the arm that feeds the cell it is inside.
+    fn reentering(reentry: Projection) -> Reentering {
+        let log: Arc<Mutex<Vec<Projection>>> = Arc::default();
+        let arm: Arc<Mutex<Option<Box<dyn Consumer>>>> = Arc::default();
+        let (log_c, arm_c) = (log.clone(), arm.clone());
+        let consumer: Box<dyn Consumer> =
+            Box::new(RegionTap(Box::new(move |region: &Projection| {
+                log_c.lock_now().push(region.clone());
+                if let Some(arm) = arm_c.lock_now().as_mut() {
+                    arm.notify(&reentry);
+                }
+            })));
+        (consumer, log, arm)
+    }
+
+    /// A consumer from a function of the region.
+    struct RegionTap(Box<dyn FnMut(&Projection) + Send>);
+
+    impl Consumer for RegionTap {
+        fn notify(&mut self, arrived: &Projection) {
+            (self.0)(arrived)
+        }
+    }
+
+    /// A cycle reaches both inputs of a `MakeRecord`: the region of field `a` passes, and the
+    /// region of field `b` that re-enters inside it is outside what passed, so it is deferred and
+    /// reaches a consumer that selects `b`.
+    #[test]
+    fn a_reentrant_region_of_another_field_is_not_lost() {
+        let names: Arc<[SmolStr]> = vec![SmolStr::new("a"), SmolStr::new("b")].into();
+        let of = |name: &str| Projection::fields([(SmolStr::new(name), keys(1, 2))]);
+        let (downstream, log, arm) = reentering(keys(1, 2));
+        let (shared, _gate) = shared_consumer(downstream);
+        let mut scheduler = Scheduler::new();
+        let mut input_a = forwarding_consumer_into_field(
+            &shared,
+            &scheduler.wakeup_queue(),
+            SmolStr::new("a"),
+            names.clone(),
+        );
+        *arm.lock_now() = Some(forwarding_consumer_into_field(
+            &shared,
+            &scheduler.wakeup_queue(),
+            SmolStr::new("b"),
+            names,
+        ));
+        input_a.notify(&keys(1, 2));
+        assert_eq!(*log.lock_now(), [of("a")]);
+        scheduler.check_for_notifications();
+        assert_eq!(
+            *log.lock_now(),
+            [of("a"), Projection::Everything],
+            "the re-entrant region of `b` was lost"
+        );
+    }
+
+    /// The deferred wake carries `Everything`, which the gate then covers, so a cycle that keeps
+    /// re-entering goes around once more and stops.
+    #[test]
+    fn a_cycle_that_keeps_reentering_stops_after_one_more_lap() {
+        let names: Arc<[SmolStr]> = vec![SmolStr::new("a"), SmolStr::new("b")].into();
+        let (downstream, log, arm) = reentering(keys(1, 2));
+        let (shared, _gate) = shared_consumer(downstream);
+        let mut scheduler = Scheduler::new();
+        let mut input_a = forwarding_consumer_into_field(
+            &shared,
+            &scheduler.wakeup_queue(),
+            SmolStr::new("a"),
+            names.clone(),
+        );
+        *arm.lock_now() = Some(forwarding_consumer_into_field(
+            &shared,
+            &scheduler.wakeup_queue(),
+            SmolStr::new("b"),
+            names,
+        ));
+        input_a.notify(&keys(1, 2));
+        for _ in 0..5 {
+            scheduler.check_for_notifications();
+        }
+        assert_eq!(log.lock_now().len(), 2, "{:?}", log.lock_now());
+        assert!(scheduler.wakeups.is_empty());
     }
 
     /// A pull that answers what the last one did but queues a wakeup is not quiescence: the

@@ -476,6 +476,23 @@ impl Notified {
         }
     }
 
+    /// Whether a notification of `region` would be suppressed now, without recording anything: for
+    /// a gate, a notification has passed since the last pull and its region is inside what
+    /// passed. `Always` covers every region, and a flag covers any while it is set.
+    pub fn covers(&self, region: &Projection) -> bool {
+        match self {
+            Self::Always => true,
+            Self::Flag(c) => c.load(Ordering::Acquire),
+            Self::Gate(gate) => {
+                let passed = gate
+                    .passed
+                    .lock()
+                    .expect("a gate's region is never poisoned");
+                gate.set.load(Ordering::Acquire) && region.contained_in(&passed)
+            }
+        }
+    }
+
     /// Whether the flag is set, without clearing it. `Always` reads set.
     pub fn is_set(&self) -> bool {
         match self {
