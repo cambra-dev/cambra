@@ -78,7 +78,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ccl::{
     Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS, F_WRITES, FieldKey, HistoryKind,
     Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode, WriterSite,
-    ccl_utils::{free_names_in_value, is_free, is_free_in_value},
+    ccl_utils::{free_names, free_names_in_value, is_free, is_free_in_value},
     feed_nest::LoopFeed,
     mut_elim::{
         FeedSite, WriterParam, WriterWalk, binding, close_recurrence_group, fold_induction_loop,
@@ -657,7 +657,7 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
     // read it. Lift it onto the spine first.
     let expr = crate::ccl::mut_elim::lift_bindings_out_of_effect_position(expr);
     let mut harvest = Stripped::default();
-    let stripped = strip(expr, txn_mut_vars, None, &mut harvest);
+    let stripped = strip(expr, txn_mut_vars, None, &mut harvest)?;
     // Post-strip invariants (release asserts, like the letrec-phase
     // post-conditions): every `Begin` was consumed (stripped into a site or
     // unwrapped), and no transactional write survives outside a block — a
@@ -1109,15 +1109,51 @@ struct Stripped {
     read_only_footprints: Vec<Vec<Name>>,
 }
 
+/// The loop a `with begin():` block sits in, as [`strip`] carries it down the loop body.
+#[derive(Clone, Copy)]
+struct EnclosingLoop<'a> {
+    /// The loop item binder, which the writer reads off its item.
+    target: &'a TypedBinding,
+    /// The loop's `iter`, which becomes the writer's source.
+    source: &'a Expr,
+    /// The loop's own induction accumulators ([`loop_induction_writes`]).
+    writes: &'a HashSet<Name>,
+    /// The innermost binding the loop body has made so far.
+    lets: Option<&'a LoopLet<'a>>,
+}
+
+/// A binding on a loop body, in scope at every block after it in the body. A block's
+/// writer takes a copy of each one the block reads ([`with_loop_lets`]).
+struct LoopLet<'a> {
+    binding: &'a TypedBinding,
+    bound: &'a Expr,
+    /// Why the copy is refused, when it is: see [`with_loop_lets`].
+    refusal: Option<LoopLetRefusal>,
+    /// The binding made before this one, `None` at the loop head.
+    outer: Option<&'a LoopLet<'a>>,
+}
+
+/// Why a loop-body binding cannot be copied into a block's writer.
+enum LoopLetRefusal {
+    /// The definiens holds a statement: a loop, a feed, or a write.
+    Statement,
+    /// The definiens reads this accumulator of the loop, and the loop body writes it after
+    /// the binding.
+    WrittenAfter(Name),
+}
+
 /// Replace every transaction `For` site (`ExprStmt(For{…}, cont)` whose block
 /// writes a transactional mutable variable) with its stripped continuation, accumulating a
 /// [`RawSite`] per site in source order (the commit serialization order).
+///
+/// Fails when a writing block reads a loop-body binding its writer cannot take a copy of
+/// ([`with_loop_lets`]).
 fn strip(
     expr: Expr,
     txn_mut_vars: &HashSet<Name>,
-    enclosing: Option<(&TypedBinding, &Expr, &HashSet<Name>)>,
+    enclosing: Option<EnclosingLoop<'_>>,
     out: &mut Stripped,
-) -> Expr {
+) -> Result<Expr, Located<String>> {
     // A `with begin():` block (a `Begin` marker) on a statement spine.
     if let TypedExprNode::ExprStmt { expr: effect, .. } = &expr.node
         && matches!(&effect.node, TypedExprNode::Begin { .. })
@@ -1166,31 +1202,35 @@ fn strip(
             // position), where `mut_elim` folds it into the loop recurrence.
             // The two domains stay independent — an induction accumulator is
             // never in the atomic commit.
-            let (target, source, enclosing_writes) = enclosing.expect(
+            let lp = enclosing.expect(
                 "a writing `with begin():` block must be inside a loop (lowering wraps a \
                  standalone block in a singleton `For`)",
             );
             let new_rest = {
-                // Recorded here: the source copy the site takes, the statement
-                // wrappers `prepend_effects` mints for the lifted induction
-                // writes, and whatever `partition_block` rebuilds. The block
-                // itself is *not* consumed here — it travels on the site and is
-                // disassembled by `build_writer` under this same parent.
+                // Recorded here: the source copy the site takes, the copies of the
+                // loop-body bindings the block reads, the statement wrappers
+                // `prepend_effects` mints for the lifted induction writes, and
+                // whatever `partition_block` rebuilds. The block itself is *not*
+                // consumed here — it travels on the site and is disassembled by
+                // `build_writer` under this same parent.
                 let g = provenance::enter(stmt_id, "transact.strip", provenance::Nature::Expansion);
                 g.blame(&[begin_id]);
                 let (txn_block, lifted) = partition_block(*block, txn_mut_vars);
+                // Before the footprint and before `cross_domain_reads` scans the site:
+                // an accumulator a copied binding reads is a read the block makes.
+                let txn_block = with_loop_lets(txn_block, lp.lets, begin_id)?;
                 let (read_keys, write_keys) = collect_footprint(&txn_block, txn_mut_vars);
                 out.sites.push(RawSite {
                     parent: stmt_id,
-                    target: target.clone(),
+                    target: lp.target.clone(),
                     // The enclosing `For` keeps its `iter` in the stripped tree while
                     // the site carries the same expression into the writer's source,
                     // so the site's copy is its own.
-                    source: source.clone(),
+                    source: lp.source.clone(),
                     block: txn_block,
                     read_keys,
                     write_keys,
-                    enclosing_writes: enclosing_writes.clone(),
+                    enclosing_writes: lp.writes.clone(),
                 });
                 prepend_effects(lifted, *rest)
             };
@@ -1233,7 +1273,7 @@ fn strip(
         let TypedExprNode::For { target, iter, body } = node else {
             unreachable!("guarded above")
         };
-        let source = strip(*iter, txn_mut_vars, enclosing, out);
+        let source = strip(*iter, txn_mut_vars, enclosing, out)?;
         // The loop's own induction accumulators (direct writes + those lifted
         // from its `with begin():` blocks). A site inside this loop co-indexes a
         // read of one of these; a read of any other accumulator is a completed
@@ -1243,10 +1283,15 @@ fn strip(
         let body = strip(
             *body,
             txn_mut_vars,
-            Some((&target, &source, &enclosing_writes)),
+            Some(EnclosingLoop {
+                target: &target,
+                source: &source,
+                writes: &enclosing_writes,
+                lets: None,
+            }),
             out,
-        );
-        return Expr {
+        )?;
+        return Ok(Expr {
             node: TypedExprNode::For {
                 target,
                 iter: Box::new(source),
@@ -1255,11 +1300,136 @@ fn strip(
             ty,
             user_annotation,
             node_id,
+        });
+    }
+    // A binding inside a loop: in scope at every block in its body, so it joins the
+    // loop's bindings for the strip of the body.
+    if let Some(lp) = enclosing
+        && matches!(&expr.node, TypedExprNode::Let { .. })
+    {
+        let Expr {
+            node,
+            ty,
+            user_annotation,
+            node_id,
+        } = expr;
+        let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } = node
+        else {
+            unreachable!("guarded above")
         };
+        let bound_expr = strip(*bound_expr, txn_mut_vars, enclosing, out)?;
+        let refusal = if holds_statement(&bound_expr) {
+            Some(LoopLetRefusal::Statement)
+        } else {
+            free_names_in_value(&bound_expr)
+                .into_iter()
+                .filter(|n| lp.writes.contains(n))
+                .find(|n| writes_any(&body, &HashSet::from([n.clone()])))
+                .map(LoopLetRefusal::WrittenAfter)
+        };
+        let scope = LoopLet {
+            binding: &binding,
+            bound: &bound_expr,
+            refusal,
+            outer: lp.lets,
+        };
+        let body = strip(
+            *body,
+            txn_mut_vars,
+            Some(EnclosingLoop {
+                lets: Some(&scope),
+                ..lp
+            }),
+            out,
+        )?;
+        return Ok(Expr {
+            node: TypedExprNode::Let {
+                binding,
+                bound_expr: Box::new(bound_expr),
+                body: Box::new(body),
+            },
+            ty,
+            user_annotation,
+            node_id,
+        });
     }
     let mut expr = expr;
-    expr.map_children(|c| strip(c, txn_mut_vars, enclosing, out));
-    expr
+    expr.try_map_children(|c| strip(c, txn_mut_vars, enclosing, out))?;
+    Ok(expr)
+}
+
+/// `block` with a copy of each loop-body binding it reads, transitively, bound ahead of it
+/// in the order the loop body binds them.
+///
+/// A binding's scope runs to the end of its loop body, so a block reads the bindings made
+/// before it. The writer is built from the block alone and placed outside the loop body
+/// ([`splice_stores`]), so it takes a copy, and [`WriterWalk`] reads each copy's loop item
+/// off the writer item as it does for a binding made inside the block. An accumulator a copy
+/// reads is a read the block makes, which zips the accumulator into the writer source
+/// ([`build_writer`]).
+///
+/// Copying is interim (`src/ccl/design/mutability.md`, "A block reads the loop-body bindings
+/// made before it"), and both refusals come from it. The writer reads an accumulator as of the
+/// end of its iteration, not at the block's position as `docs/chl-spec.md`, "8.3 Reads"
+/// requires, so a copy reading one is refused when the loop body writes that accumulator after
+/// the binding: the copy would see the later write. A copy of a definiens holding a statement
+/// is refused too, since the writer would run the statement a second time.
+///
+/// A refusal names `begin`, the block's `Begin` node.
+fn with_loop_lets(
+    block: Expr,
+    lets: Option<&LoopLet<'_>>,
+    begin: NodeId,
+) -> Result<Expr, Located<String>> {
+    let mut block = block;
+    // Everything `block` reads so far, a copy's reads included: the names are α-unique, so a
+    // name read here is the binding itself, never a shadow of it.
+    let mut reads = free_names(&block);
+    let mut scope = lets;
+    while let Some(l) = scope {
+        if reads.contains(&l.binding.name) {
+            if let Some(refusal) = &l.refusal {
+                return Err(Located::new(loop_let_refusal(refusal), begin));
+            }
+            reads.extend(free_names(l.bound));
+            // A sibling: the original stays on the loop body for every other reader.
+            block = Expr::let_in(l.binding.clone(), l.bound.clone(), block);
+        }
+        scope = l.outer;
+    }
+    Ok(block)
+}
+
+fn loop_let_refusal(refusal: &LoopLetRefusal) -> String {
+    match refusal {
+        LoopLetRefusal::Statement => "this `with begin():` block reads a value its loop body \
+             computes with a loop, a feed, or a write, which a block cannot read"
+            .to_string(),
+        LoopLetRefusal::WrittenAfter(acc) => format!(
+            "this `with begin():` block reads a value its loop body computes from `{acc}` before \
+             a later write to `{acc}` in the same iteration, which is not supported yet: the \
+             block would compute the value from `{acc}` as of the end of the iteration, after \
+             that write. Compute the value after the last write to `{acc}` in the loop body"
+        ),
+    }
+}
+
+/// Whether `e` holds a statement: a loop, a block, a feed, a definition, or a write.
+fn holds_statement(e: &Expr) -> bool {
+    matches!(
+        &e.node,
+        TypedExprNode::ExprStmt { .. }
+            | TypedExprNode::For { .. }
+            | TypedExprNode::Begin { .. }
+            | TypedExprNode::Feed { .. }
+            | TypedExprNode::Define { .. }
+            | TypedExprNode::MutDecl { .. }
+            | TypedExprNode::MutWrite { .. }
+    ) || e.any_child(holds_statement)
 }
 
 /// Splice a `with begin():` block's statement chain onto an enclosing spine by

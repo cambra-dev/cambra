@@ -998,6 +998,80 @@ fn a_terminal_read_of_a_transactional_store() {
     "#});
 }
 
+/// A block reads the loop-body bindings made before it, and an in-block reply reads them too.
+#[rstest]
+#[case::from_the_loop_item(indoc! {r#"
+    n: Mut(Int, Txn) := 0
+    for x in [3, 1, 2]:
+        y = x * 10
+        with begin():
+            n := n + y
+    out = test_sink()
+    out << await_final(n)
+"#})]
+#[case::constant(indoc! {r#"
+    n: Mut(Int, Txn) := 0
+    for x in [3, 1, 2]:
+        y = 10
+        with begin():
+            n := n + y
+    out = test_sink()
+    out << await_final(n)
+"#})]
+#[case::from_a_function_call(indoc! {r#"
+    def f(a: Int):
+        a * 10
+    n: Mut(Int, Txn) := 0
+    for x in [3, 1, 2]:
+        y = f(x)
+        with begin():
+            n := n + y
+    out = test_sink()
+    out << await_final(n)
+"#})]
+#[case::from_a_field_of_the_loop_item(indoc! {r#"
+    n: Mut(Int, Txn) := 0
+    for r in [(a=1, b=2), (a=3, b=4)]:
+        y = r.a
+        with begin():
+            n := n + y
+    out = test_sink()
+    out << await_final(n)
+"#})]
+#[case::from_an_accumulator_after_its_write(indoc! {r#"
+    n: Mut(Int, Txn) := 0
+    c: Mut(Int) := 0
+    for x in [3, 1, 2]:
+        c := c + 1
+        y = c * 2
+        with begin():
+            n := n + y
+    out = test_sink()
+    out << await_final(n)
+"#})]
+#[case::through_a_chain(indoc! {r#"
+    n: Mut(Int, Txn) := 0
+    for x in [3, 1, 2]:
+        y = x * 10
+        z = y + 1
+        with begin():
+            n := n + z
+    out = test_sink()
+    out << await_final(n)
+"#})]
+#[case::in_a_reply(indoc! {r#"
+    out = test_sink()
+    n: Mut(Int, Txn) := 0
+    for x in [3, 1, 2]:
+        y = x * 10
+        with begin():
+            n := n + y
+            out << n + y
+"#})]
+fn a_block_reads_a_loop_body_binding_made_before_it(#[case] source: &str) {
+    agree(source);
+}
+
 /// A loop whose body overwrites an accumulator with a value that reads neither the
 /// accumulator nor the loop item. The decision is a constant, so the snapshot scaffold and
 /// the source term are both gone by recognition and the writer's extent is all that is left

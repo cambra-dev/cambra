@@ -294,6 +294,120 @@ fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
     check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![expected])));
 }
 
+/// A block reads the loop-body bindings made before it: a binding's scope runs to the end
+/// of its block (`docs/chl-spec.md`, "5. Scoping and binding"). The writer takes a copy of each
+/// binding the block reads, so each case computes what the same binding written inside the
+/// block computes. The expected values are the differential interpreter's.
+#[rstest]
+#[case::from_the_loop_item(
+    indoc! {r#"
+        n: Mut(Int, Txn) := 0
+        for x in [3, 1, 2]:
+            y = x * 10
+            with begin():
+                n := n + y
+        await_final(n)
+    "#},
+    60
+)]
+#[case::constant(
+    indoc! {r#"
+        n: Mut(Int, Txn) := 0
+        for x in [3, 1, 2]:
+            y = 10
+            with begin():
+                n := n + y
+        await_final(n)
+    "#},
+    30
+)]
+#[case::from_a_function_call(
+    indoc! {r#"
+        def f(a: Int):
+            a * 10
+        n: Mut(Int, Txn) := 0
+        for x in [3, 1, 2]:
+            y = f(x)
+            with begin():
+                n := n + y
+        await_final(n)
+    "#},
+    60
+)]
+#[case::from_a_field_of_the_loop_item(
+    indoc! {r#"
+        n: Mut(Int, Txn) := 0
+        for r in [(a=1, b=2), (a=3, b=4)]:
+            y = r.a
+            with begin():
+                n := n + y
+        await_final(n)
+    "#},
+    4
+)]
+// `y` reads `c` after the iteration's last write to it, so the block reads `c` at its
+// iteration: 2 + 4 + 6.
+#[case::from_an_accumulator_after_its_write(
+    indoc! {r#"
+        n: Mut(Int, Txn) := 0
+        c: Mut(Int) := 0
+        for x in [3, 1, 2]:
+            c := c + 1
+            y = c * 2
+            with begin():
+                n := n + y
+        await_final(n)
+    "#},
+    12
+)]
+// The block reads `z`, and `z` reads `y`: the writer takes both.
+#[case::through_a_chain(
+    indoc! {r#"
+        n: Mut(Int, Txn) := 0
+        for x in [3, 1, 2]:
+            y = x * 10
+            z = y + 1
+            with begin():
+                n := n + z
+        await_final(n)
+    "#},
+    63
+)]
+// Two blocks in one loop body, the second reading a binding made between them as well as
+// one made before both: `n` is 60, `m` is 61 + 21 + 41.
+#[case::by_two_blocks(
+    indoc! {r#"
+        n: Mut(Int, Txn) := 0
+        m: Mut(Int, Txn) := 0
+        for x in [3, 1, 2]:
+            y = x * 10
+            with begin():
+                n := n + y
+            z = y + 1
+            with begin():
+                m := m + z + y
+        await_final(n) * 1000 + await_final(m)
+    "#},
+    60123
+)]
+// The guard reads the snapshot and the arm reads the binding: `n` takes 30 and then 40, and
+// the third block's guard fails at 40.
+#[case::under_a_guard(
+    indoc! {r#"
+        n: Mut(Int, Txn) := 0
+        for x in [3, 1, 2]:
+            y = x * 10
+            with begin():
+                if n < 40:
+                    n := n + y
+        await_final(n)
+    "#},
+    40
+)]
+fn a_block_reads_a_loop_body_binding_made_before_it(#[case] code: &str, #[case] expected: i64) {
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![expected])));
+}
+
 /// A binding whose value is a conditional, reading an earlier binding inside an arm. The
 /// `if`/`else` compiles to a domain restrict, so the earlier binding travels into each arm
 /// rather than being read at the writer's domain. One writer commits its positions in order.
@@ -2755,6 +2869,77 @@ fn induction_keyed_write_reading_past_a_lifted_write_rejected() {
             m
         "#},
         "reads a value bound before `cnt` was written in the same block",
+    );
+}
+
+/// A loop-body binding read by a block may not read an accumulator the loop body writes after
+/// it, because the block's writer reads the accumulator as of the end of the iteration. `y`
+/// reads `c` before the write, at 0, 1, 2, and the writer would read it after, at 1, 2, 3. The
+/// program is valid (`docs/chl-spec.md`, "8.3 Reads") and the differential interpreter gives 6;
+/// the refusal is interim, in place of the wrong value.
+#[rstest]
+#[case::by_a_later_spine_write(indoc! {r#"
+    n: Mut(Int, Txn) := 0
+    c: Mut(Int) := 0
+    for x in [3, 1, 2]:
+        y = c * 2
+        c := c + 1
+        with begin():
+            n := n + y
+    await_final(n)
+"#})]
+#[case::by_a_write_lifted_out_of_the_block(indoc! {r#"
+    n: Mut(Int, Txn) := 0
+    c: Mut(Int) := 0
+    for x in [3, 1, 2]:
+        y = c * 2
+        with begin():
+            c := c + 1
+            n := n + y
+    await_final(n)
+"#})]
+fn a_block_reading_a_binding_of_an_accumulator_written_after_it_rejected(#[case] code: &str) {
+    check_compile_error(
+        code,
+        "reads a value its loop body computes from `c` before a later write to `c`",
+    );
+}
+
+/// A loop-body binding whose value runs a statement, here an inlined write, cannot be copied
+/// into the writer of a block that reads it: the writer would run the write again.
+#[test]
+fn a_block_reading_a_binding_computed_by_a_write_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            def bump(p: Mut(Int)):
+                p := p + 1
+                p * 10
+            n: Mut(Int, Txn) := 0
+            c: Mut(Int) := 0
+            for x in [3, 1, 2]:
+                y = bump(c)
+                with begin():
+                    n := n + y
+            await_final(n)
+        "#},
+        "reads a value its loop body computes with a loop, a feed, or a write",
+    );
+}
+
+/// A loop-body binding read by a block may not read a transactional variable itself: that
+/// read is outside a block, which the read gate rejects (the CHL spec, "8.3 Reads").
+#[test]
+fn a_loop_body_binding_reading_a_txn_mut_var_rejected() {
+    check_compile_error(
+        indoc! {r#"
+            n: Mut(Int, Txn) := 0
+            for x in [3, 1, 2]:
+                y = n + x
+                with begin():
+                    n := y
+            await_final(n)
+        "#},
+        "read transactional variable `n` inside a `with begin():` block",
     );
 }
 

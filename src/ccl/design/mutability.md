@@ -889,6 +889,44 @@ The walk inlines four kinds of binding rather than keeping them:
 - A **literal**: it costs nothing to copy, and a list literal bound to a name reaches op-conversion
   without the `iterate` planning puts before one it meets in place.
 
+#### A block reads the loop-body bindings made before it
+
+A binding's scope runs to the end of its block
+([CHL spec](../../../docs/chl-spec.md#5-scoping-and-binding)), so a `with begin():` block reads the
+bindings its loop body makes before it:
+
+```python
+n: Mut(Int, Txn) := 0
+for x in [3, 1, 2]:
+    y = x * 10
+    with begin():
+        n := n + y
+```
+
+The writer is built from the block and placed with its store, outside the loop body, so the block
+takes a copy of each binding it reads. `transact_phase::strip` carries the bindings it passes on a
+loop body, and `with_loop_lets` binds the ones the block reads, transitively, ahead of the block, in
+the order the loop body binds them. The copies are siblings of the bindings, which stay on the loop
+body for every other reader. The block then reads as if the bindings were written inside it:
+`WriterWalk` reads each copy's loop item off the writer item, and an accumulator a copy reads is a
+read the block makes, which zips the accumulator into the writer source
+([Co-indexed vs. cross-loop (broadcast)](#co-indexed-vs-cross-loop-broadcast)).
+
+**[Interim]** Copying is a stopgap for the writer not receiving the values the block reads as of
+the block's position in the loop body. Two refusals follow from it, and both are compile errors
+naming the block:
+
+- A copy reading an accumulator is refused when the loop body writes that accumulator after the
+  binding, on the loop body or inside a block. The writer reads an accumulator as of the end of its
+  iteration, so the copy would see that write, where the binding saw the value before it.
+- A copy of a binding whose value holds a statement (a loop, a feed, or a write) is refused, since
+  the writer would run the statement a second time.
+
+The end-of-iteration read is itself a gap, not the rule. An in-context read is the value at the
+read's own position ([CHL spec](../../../docs/chl-spec.md#83-reads)), and a block that reads an
+accumulator directly before a later write to it in the same iteration is not refused: it compiles,
+and reads the value after that write.
+
 ## Worked example
 
 A transactional mutable variable and an induction counter shared across two HTTP endpoints:
