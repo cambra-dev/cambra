@@ -539,6 +539,27 @@ fn uncurry_at_the_outermost_level_sends_everything() {
     assert_widens(&|| uncurry(CurryLevel::OUTERMOST), 0);
 }
 
+fn extract_final() -> Built {
+    let (source, keys) = feed(ints());
+    let (default, fallback) = feed(Tiling::Scalar(int()));
+    let op = ExtractFinal::new(source, default);
+    (Box::new(op), vec![keys, fallback])
+}
+
+/// The final value is the last position's, which a region of keys does not name.
+#[test]
+fn extract_final_sends_everything_for_a_region_of_its_source() {
+    assert_widens(&extract_final, 0);
+}
+
+#[test]
+fn extract_final_sends_everything_for_a_later_region() {
+    assert_eq!(
+        received(&extract_final, 0, &another_region()),
+        [Projection::Everything]
+    );
+}
+
 fn two_keys() -> Extent {
     Extent::Record(
         [
@@ -556,17 +577,32 @@ fn permute_record_domain() -> Built {
     (Box::new(op), vec![consumer])
 }
 
-/// The keys are renamed, so a region of the input's keys names none of the output's.
-#[test]
-fn permute_record_domain_sends_everything_for_a_region_of_its_input() {
-    assert_widens(&permute_record_domain, 0);
+/// Tuple keys named field by field: field `i` admits the key `fields[i]`.
+fn tuple_keys(fields: &[Predicate]) -> Predicate {
+    Predicate::Record(
+        fields
+            .iter()
+            .enumerate()
+            .map(|(at, field)| (crate::interpreter::tuple_field(at), field.clone()))
+            .collect(),
+    )
 }
 
+fn position(key: u64) -> Predicate {
+    Predicate::point(Value::UInt(key))
+}
+
+/// The keys are the input's with their fields renamed, so a region of the input's keys is the
+/// same keys renamed: `(1, 2)` is `(2, 1)` with the fields swapped.
 #[test]
-fn permute_record_domain_sends_everything_for_a_later_region() {
+fn permute_record_domain_renames_the_fields_of_a_region_of_its_input() {
+    let sent = Projection::admitting(tuple_keys(&[position(1), position(2)]));
     assert_eq!(
-        received(&permute_record_domain, 0, &another_region()),
-        [Projection::Everything]
+        received(&permute_record_domain, 0, &sent),
+        [Projection::admitting(tuple_keys(&[
+            position(2),
+            position(1)
+        ]))]
     );
 }
 
@@ -581,17 +617,28 @@ fn flatten_tuple_domain() -> Built {
     (Box::new(op), vec![consumer])
 }
 
-/// The keys are re-keyed, so a region of the input's keys names none of the output's.
+/// The keys are the input's with the flattened field's fields spliced in, so a region of the
+/// input's keys is the same keys spliced: `((1, 2))` is `(1, 2)`. A union inside the flattened
+/// field splices each arm.
 #[test]
-fn flatten_tuple_domain_sends_everything_for_a_region_of_its_input() {
-    assert_widens(&flatten_tuple_domain, 0);
-}
-
-#[test]
-fn flatten_tuple_domain_sends_everything_for_a_later_region() {
+fn flatten_tuple_domain_splices_the_fields_of_a_region_of_its_input() {
+    let pair = |a, b| tuple_keys(&[position(a), position(b)]);
     assert_eq!(
-        received(&flatten_tuple_domain, 0, &another_region()),
-        [Projection::Everything]
+        received(
+            &flatten_tuple_domain,
+            0,
+            &Projection::admitting(tuple_keys(&[pair(1, 2)]))
+        ),
+        [Projection::admitting(pair(1, 2))]
+    );
+    let either = pair(1, 2).union(&pair(3, 4));
+    assert_eq!(
+        received(
+            &flatten_tuple_domain,
+            0,
+            &Projection::admitting(tuple_keys(&[either]))
+        ),
+        [Projection::admitting(pair(1, 2).union(&pair(3, 4)))]
     );
 }
 
