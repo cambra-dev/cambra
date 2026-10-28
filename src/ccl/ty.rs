@@ -1572,6 +1572,8 @@ pub struct TraitRequirement {
     pub trait_: crate::ccl::infer::solver::traits::Trait,
     /// One per operand position.
     pub args: Vec<Type>,
+    /// One per term parameter of the trait: the variable `x` in `Read(x)`.
+    pub terms: Vec<crate::ccl::Name>,
     /// The associated types the clause names. One it leaves unnamed is absent, and
     /// leaves that position open.
     pub assoc: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
@@ -1582,7 +1584,10 @@ pub struct TraitRequirement {
 
 impl PartialEq for TraitRequirement {
     fn eq(&self, other: &Self) -> bool {
-        self.trait_ == other.trait_ && self.args == other.args && self.assoc == other.assoc
+        self.trait_ == other.trait_
+            && self.args == other.args
+            && self.terms == other.terms
+            && self.assoc == other.assoc
     }
 }
 impl Eq for TraitRequirement {}
@@ -1590,6 +1595,7 @@ impl std::hash::Hash for TraitRequirement {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         self.trait_.hash(state);
         self.args.hash(state);
+        self.terms.hash(state);
         self.assoc.hash(state);
     }
 }
@@ -1600,6 +1606,7 @@ impl TraitRequirement {
         TraitRequirement {
             trait_: self.trait_.clone(),
             args: self.args.iter().map(&mut f).collect(),
+            terms: self.terms.clone(),
             assoc: self.assoc.iter().map(|(n, t)| (n.clone(), f(t))).collect(),
             at: self.at,
         }

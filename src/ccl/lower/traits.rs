@@ -20,8 +20,8 @@ use smol_str::SmolStr;
 use super::*;
 use crate::ccl::infer::solver::traits::{
     Assoc, DeclaredAt, Implementation, InstanceHead, InstanceTable, ProductReading, Signature,
-    Trait, TraitDecl, TraitFunction, TraitInstance, compares_by_value, entailed, replace_params,
-    unify_all,
+    Supplier, Trait, TraitDecl, TraitFunction, TraitInstance, compares_by_value, entailed,
+    replace_params, unify_all,
 };
 use crate::ccl::nominal::WrittenOrder;
 use crate::ccl::ty::{FieldKey, PolyParam, TraitRequirement, TypeKind, TypeParam, TypeParamId};
@@ -346,6 +346,8 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
         name: name.node.clone(),
         span: name.span,
         operands,
+        term_params: Vec::new(),
+        supplied_by: Supplier::Instances,
         assocs,
         assoc_bounds,
         functions,
