@@ -105,10 +105,9 @@ impl Projection {
 
     /// What `self` names that `other` does not: the region still unread after a read at `other`.
     ///
-    /// # Panics
-    ///
-    /// For a region of fields against anything but `Nothing` and `Everything`: the remainder of
-    /// a region of fields is not spelled.
+    /// Fields minus `Nothing` or `Everything`, and `Nothing` minus anything, are spelled. It
+    /// panics for `Everything` minus fields, keys minus fields, fields minus keys and fields
+    /// minus fields, whose remainder is not spelled.
     pub fn minus(&self, other: &Projection) -> Projection {
         let region = |projection: &Projection| match projection {
             Projection::Everything => Predicate::True,
@@ -742,7 +741,7 @@ mod fields_tests {
     }
 
     #[test]
-    fn subtraction_is_total_where_fields_meet_nothing_or_everything() {
+    fn subtraction_of_fields_by_nothing_and_everything_and_of_nothing_is_spelled() {
         let a = fields(&[("a", keys(1, 2))]);
         assert_eq!(a.minus(&Projection::Nothing), a);
         assert_eq!(Projection::Nothing.minus(&a), Projection::Nothing);

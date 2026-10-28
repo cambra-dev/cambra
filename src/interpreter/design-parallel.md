@@ -268,7 +268,7 @@ or widened, never narrowed or lost.
   The wrappers (`widening`, `Gated`, `FlaggingConsumer`, `Forwarding`) report the flag of the
   consumer they wrap, and `Gated` asserts that a region-driven consumer's gate is `Always`.
   `forwarding_consumer` waits for the cell of a region-driven consumer with `lock_wait`, where the
-  drop or the deferral that serves a consumer that pulls would lose the region.
+  absorption into the notification in progress that serves a consumer that pulls would lose the region.
 - **The invariant.** Every consumer between the notifying producer and a region-driven consumer
   reports `region_driven`, and the notification graph between them is acyclic. A closure and a
   sink's consumer ignore the region, and a fan-out's input consumer drops a second notification, so

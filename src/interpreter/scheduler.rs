@@ -824,13 +824,12 @@ fn pull_counts(
 /// Each operator reachable from `root` whose gate ([`shared_consumer`]) is closed while a
 /// producer that pulls it has been pulled since `before`, with that producer.
 ///
-/// A gate closes when a notification passes and opens when the operator is pulled, so it rests
-/// on a rule nothing else checks: a consumer woken by an operator pulls that operator. While it
-/// has not, every later notification from the operator's inputs whose region is inside what
-/// passed is suppressed. A consumer that no
-/// longer reads the operator owes it nothing (a finished read, a settled seed, a recurrence
-/// whose last reader retired), so only one still pulled counts, and an operator released whole
-/// is never pulled again.
+/// A gate closes when a notification passes and opens when the operator is pulled, so it rests on a
+/// rule nothing else checks: a consumer woken by an operator pulls that operator. While it has not,
+/// every later notification from the operator's inputs whose region is inside what passed is
+/// suppressed. A consumer that no longer reads the operator owes it nothing (a finished read, a
+/// settled seed, a recurrence whose last reader retired), so only one still pulled counts, and an
+/// operator released whole is never pulled again.
 #[cfg(any(test, feature = "test-helpers"))]
 fn ignored_inputs(
     root: &dyn crate::interpreter::tile_operators::TileProducer,

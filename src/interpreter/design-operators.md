@@ -751,10 +751,12 @@ suppression, a change can reach a sink once per path through the graph, and cycl
 paths can continue indefinitely.
 
 A consumer that never pulls (`Consumer::region_driven`) has no gate. No pull is owed to its
-notifications, so a gate it sat behind would pass one notification and hold the rest until a pull
-of the producer behind it, which a worker owes only to a claimed morsel. Its gate is
+notifications, so a gate it sat behind would pass one notification and hold the rest until a pull of
+the producer behind it, which a worker owes only to a claimed morsel. Its gate is
 `Notified::Always`, so no region waits behind one, and `forwarding_consumer` waits for the
-consumer's cell where it would absorb a re-entry into the notification in progress, because a notification that waits for another loses its region to a consumer that pulls nothing.
+consumer's cell instead of absorbing a re-entry. An absorbed region is delivered only if the
+notification in progress returns to this cell, which a region-driven chain cannot rely on, so it
+never absorbs.
 
 **Region-driven chains.** A region reaches a region-driven consumer intact only if every consumer
 between the notifying producer and it reports `region_driven`, and the notification graph between
@@ -771,20 +773,27 @@ idle workers. The worker pool's plan admits only chains for which both hold ([Th
 scheduler](../../docs/parallel-execution.md#the-scheduler)).
 
 `forwarding_consumer` delivers through the gate when its consumer can be locked. A notification that
-re-enters a consumer behind a closed gate is absorbed into the one in progress: the forwarder leaves
-its region with the gate, and the notification in progress delivers it through the gate when it
-returns, until nothing is pending. A region inside what the gate passed is suppressed there, which
-ends a cycle inside the notification that started it, and a region outside it, as the region of
-another field of a record is, reaches the consumer. A pull during the cascade that read past the
-change is woken again by that delivery, which is what the deferred wake that used to carry it did.
-No wake is queued for a re-entry, and the wakeup queue is left to the producers that re-arm
-themselves. Sharing notification handles does not share tile data; tiles still pass through `get`.
+re-enters a consumer already being notified is absorbed into the one in progress: the forwarder
+leaves its region with the gate, and the notification in progress delivers it through the gate when
+it returns, until nothing is pending. That holds after a pull inside the cascade has opened the gate
+as before it: the delivery passes a region outside what the gate then holds. A region inside what
+the gate passed is suppressed there, which ends a cycle inside the notification that started it, and
+a region outside it, as the region of another field of a record is, reaches the consumer. No wake is
+queued for a re-entry, and the wakeup queue is left to the producers that re-arm themselves. A cell
+whose consumer pulls is notified from the scheduler's thread only, which is what lets the
+notification in progress deliver what re-entered it, and a debug build asserts it. A consumer behind
+a gate does not pull its operator inside `notify`: a sink queues its pull, and a pull inside
+`notify` would reset the gate, so that a cascade re-entering the cell each time would pass the same
+region every round. A debug build stops such a cascade after a bounded number of rounds, and a
+consumer that obeys the rule cannot reset the gate, so each round needs a region outside what
+passed. Sharing notification handles does not share tile data; tiles still pass through `get`.
 
-A consumer woken by an operator must pull that operator if it still reads it. Until then,
-the operator suppresses later notifications from its inputs. Finished reads, settled seeds,
-recurrences with no remaining reader and wholly released operators need no further pull.
-When `pull_laps` reaches quiescence, a debug check walks `TileProducer::visit_input_producers`
-and rejects an input whose forwarding flag remains set after its reader was pulled that lap.
+A consumer woken by an operator must pull that operator if it still reads it. Until then, the
+operator suppresses later notifications from its inputs whose region is inside what passed. Finished
+reads, settled seeds, recurrences with no remaining reader and wholly released operators need no
+further pull. When `pull_laps` reaches quiescence, a debug check walks
+`TileProducer::visit_input_producers` and rejects an input whose forwarding flag remains set after
+its reader was pulled that lap.
 
 A sink does not pull when notified. It queues its pull on a queue of its own, which holds it
 once however many notifications arrive. `Scheduler::check_for_notifications` delivers its wakes
