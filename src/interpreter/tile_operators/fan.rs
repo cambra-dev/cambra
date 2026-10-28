@@ -741,6 +741,7 @@ impl TileOperator for MakeRecord {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
+        let names: Arc<[SmolStr]> = self.names.clone().into();
         Box::new(MakeRecordProducer {
             base: ProducerBase::new(
                 MakeRecordProducer::alloc_id(),
@@ -750,10 +751,23 @@ impl TileOperator for MakeRecord {
             )
             .sharing(gate),
             names: self.names.clone(),
+            // Each input is the field its name says, so its region is the region of that field.
             inputs: self
                 .inputs
                 .iter_mut()
-                .map(|i| subscribe_forwarding(&mut **i, &shared, scheduler))
+                .zip(&self.names)
+                .map(|(input, name)| {
+                    input.subscribe(
+                        input.tiling().universal_guard(),
+                        forwarding_consumer_into_field(
+                            &shared,
+                            &scheduler.wakeup_queue(),
+                            name.clone(),
+                            names.clone(),
+                        ),
+                        scheduler,
+                    )
+                })
                 .collect(),
         })
     }

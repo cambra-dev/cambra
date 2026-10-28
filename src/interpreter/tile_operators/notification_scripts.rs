@@ -622,11 +622,15 @@ fn make_record(inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
     Box::new(MakeRecord::new(inputs))
 }
 
-/// A record of values has no keys of its own.
+/// A record of values has no keys of its own: an input's region is the region of its field.
 #[test]
-fn make_record_widens_over_growth() {
+fn make_record_routes_each_inputs_region_to_its_field_over_growth() {
     let shapes = [(Values::Ints, None), (Values::Ints, None)];
-    check_many(&make_record, &shapes, &[Expect::Widens, Expect::Widens]);
+    check_many(
+        &make_record,
+        &shapes,
+        &[Expect::Routed("_0"), Expect::Routed("_1")],
+    );
 }
 
 fn permute_record_domain(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {

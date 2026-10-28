@@ -712,7 +712,7 @@ depends on the input's shape, the operator decides from its tiling when it subsc
 | `VariantWrap` | the payload | keeps where the result is a collection (applied at level 1 or beyond), widens at level 0 | The values at the level become one union column, which has no keys of its own at level 0. |
 | `VariantProject`, `VariantIs` | the input | keeps for a stream, widens for a bare union | A bare union has no keys of its own. |
 | `Zip`, `Product` | every arm, both sides | keeps | Pulled at the projection and aligned row for row. |
-| `MakeRecord` | every field | widens | A record of values has no keys. |
+| `MakeRecord` | every field | routes by field | An input's region is the region of its field, `Fields{name: region}`: a record of values has no keys of its own. A record of one field whose region is everything is `Everything`. |
 | `Filter` | the predicate, the input | keeps for a side that is a collection, else widens | A collection side shares the mask's keys; the other is read whole. |
 | `Uncurry`, `Converse` | the input | keeps beneath a standing level, widens at the outermost | Inverting or pairing the outermost collection re-keys it. |
 | `UnionOperator` | every arm | keeps for a flat union, widens for a tagged one | Flat arms are disjoint slices of one collection; a tagged union keys its rows by arm. |

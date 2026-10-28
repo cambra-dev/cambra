@@ -5,6 +5,8 @@ use std::{
     sync::{Arc, Weak},
 };
 
+use smol_str::SmolStr;
+
 use crate::interpreter::{
     Consumer, DataSourceDomainExtentImpl, Projection, tile_operators::Notified,
     value_probe::ProbeSlot,
@@ -136,7 +138,7 @@ pub fn forwarding_consumer(shared: &GatedConsumer, wakeups: &WakeupQueue) -> Box
     Box::new(Forwarding {
         gated: shared.clone(),
         wakeups: wakeups.clone(),
-        keeps_keys: false,
+        route: Route::Widen,
     })
 }
 
@@ -149,7 +151,23 @@ pub fn forwarding_consumer_keeping_keys(
     Box::new(Forwarding {
         gated: shared.clone(),
         wakeups: wakeups.clone(),
-        keeps_keys: true,
+        route: Route::Keys,
+    })
+}
+
+/// [`forwarding_consumer`] for the input that is the field `name` of the record the operator
+/// makes of its inputs, whose fields are `names`: its region is forwarded as the region of that
+/// field.
+pub fn forwarding_consumer_into_field(
+    shared: &GatedConsumer,
+    wakeups: &WakeupQueue,
+    name: SmolStr,
+    names: Arc<[SmolStr]>,
+) -> Box<dyn Consumer> {
+    Box::new(Forwarding {
+        gated: shared.clone(),
+        wakeups: wakeups.clone(),
+        route: Route::Field { name, names },
     })
 }
 
@@ -200,7 +218,21 @@ impl Consumer for Widening {
 struct Forwarding {
     gated: GatedConsumer,
     wakeups: WakeupQueue,
-    keeps_keys: bool,
+    route: Route,
+}
+
+/// What a forwarding consumer sends for the region its input notified.
+enum Route {
+    /// `Everything`.
+    Widen,
+    /// The region, with a region of fields widened to `Everything` ([`Projection::keys_only`]).
+    Keys,
+    /// The region as the region of one field of the record the operator makes of its inputs.
+    Field {
+        name: SmolStr,
+        /// Every field of the record, so that a region of everything in each is everything.
+        names: Arc<[SmolStr]>,
+    },
 }
 
 impl Consumer for Forwarding {
@@ -210,9 +242,12 @@ impl Consumer for Forwarding {
             gate,
             region_driven,
         } = &self.gated;
-        let region = match self.keeps_keys {
-            true => arrived.keys_only(),
-            false => Projection::Everything,
+        let region = match &self.route {
+            Route::Widen => Projection::Everything,
+            Route::Keys => arrived.keys_only(),
+            Route::Field { name, names } => {
+                Projection::fields([(name.clone(), arrived.clone())]).normalized(names)
+            }
         };
         let region = &region;
         // Dropping or deferring the notification of a consumer that never pulls would lose its

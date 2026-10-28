@@ -697,19 +697,50 @@ fn make_record() -> Built {
     (Box::new(op), vec![first, second])
 }
 
-/// A record of values has no keys of its own.
+fn field(name: &str, region: Projection) -> Projection {
+    Projection::fields([(SmolStr::new(name), region)])
+}
+
+/// A record of values has no keys of its own: an input's region is the region of its field.
 #[test]
-fn make_record_sends_everything_for_a_region_of_either_field() {
-    assert_widens(&make_record, 0);
-    assert_widens(&make_record, 1);
+fn make_record_routes_a_region_of_an_input_to_its_field() {
+    assert_eq!(
+        received(&make_record, 0, &region()),
+        [field("_0", region())]
+    );
+    assert_eq!(
+        received(&make_record, 1, &region()),
+        [field("_1", region())]
+    );
 }
 
 #[test]
-fn make_record_sends_everything_for_a_later_region() {
+fn make_record_routes_each_later_region_to_its_own_field() {
     assert_eq!(
         received(&make_record, 1, &another_region()),
+        [field("_1", another_region())]
+    );
+    assert_eq!(
+        received(&make_record, 0, &Projection::Everything),
+        [field("_0", Projection::Everything)]
+    );
+}
+
+/// A record of one field whose region is everything is everything.
+#[test]
+fn make_record_of_one_field_sends_everything_for_everything() {
+    let one = || {
+        let (a, consumer) = feed(ints());
+        (
+            Box::new(MakeRecord::new(vec![a])) as Box<dyn TileOperator>,
+            vec![consumer],
+        )
+    };
+    assert_eq!(
+        received(&one, 0, &Projection::Everything),
         [Projection::Everything]
     );
+    assert_eq!(received(&one, 0, &region()), [field("_0", region())]);
 }
 
 /// Every key is answered against all of the collection.

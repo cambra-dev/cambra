@@ -162,6 +162,8 @@ pub(crate) enum Expect {
     Exact,
     /// The region is `Everything`: the operator reads this input whole.
     Widens,
+    /// The region is the one the input notified, as the region of this field of a record.
+    Routed(&'static str),
 }
 
 /// One step of a script: input `input` moves to its next state and notifies `changed`.
@@ -263,11 +265,10 @@ pub(crate) fn assert_notification_sound(
                 other => panic!("step {n}: the operator notified keys of {other}"),
             }
         }
-        let outside = Projection::Everything.minus(&notified);
         let mut before_outside = before.clone();
-        before_outside.restrict_to(&outside, &tiling);
+        cut(&mut before_outside, &tiling, &notified, true);
         let mut after_outside = after.clone();
-        after_outside.restrict_to(&outside, &tiling);
+        cut(&mut after_outside, &tiling, &notified, true);
         assert_eq!(
             normal(before_outside),
             normal(after_outside),
@@ -278,9 +279,16 @@ pub(crate) fn assert_notification_sound(
         // check outside the region has covered the step.
         pulled_region = pulled_region.union(&notified);
         if pulled_region != Projection::Nothing {
-            let pulled = normal(producer.get(pulled_region.guard(&tiling)));
+            // A region of fields names no guard: a record is pulled whole and compared whole.
+            let guard = match &pulled_region {
+                Projection::Fields(_) => tiling.universal_guard(),
+                region => region.guard(&tiling),
+            };
+            let pulled = normal(producer.get(guard));
             let mut expected = after;
-            expected.restrict_to(&pulled_region, &tiling);
+            if !matches!(pulled_region, Projection::Fields(_)) {
+                expected.restrict_to(&pulled_region, &tiling);
+            }
             assert_eq!(
                 pulled,
                 normal(expected),
@@ -294,6 +302,11 @@ pub(crate) fn assert_notification_sound(
         }
         match expect[step.input] {
             Expect::Sound => {}
+            Expect::Routed(name) => assert_eq!(
+                notified,
+                Projection::fields([(SmolStr::new(name), step.changed.clone())]),
+                "step {n}: the operator did not route the region to its field"
+            ),
             Expect::Widens => assert_eq!(
                 notified,
                 Projection::Everything,
@@ -309,6 +322,28 @@ pub(crate) fn assert_notification_sound(
                 "step {n}: the operator did not pass the region through"
             ),
         }
+    }
+}
+
+/// Cut `tile`, an answer of `tiling`, to `region`, or to what `region` leaves out where
+/// `complement`. A region of fields cuts a record field by field, and a field it omits is left
+/// whole in the complement.
+fn cut(tile: &mut Tile, tiling: &Tiling, region: &Projection, complement: bool) {
+    match (tile, tiling, region) {
+        (Tile::Record { fields, .. }, Tiling::Record(field_tilings), Projection::Fields(named)) => {
+            for (name, field) in fields.iter_mut() {
+                let field_tiling = &field_tilings[name];
+                match (named.get(name), complement) {
+                    (Some(inner), complement) => cut(field, field_tiling, inner, complement),
+                    (None, true) => {}
+                    (None, false) => *field = field_tiling.empty_tile(),
+                }
+            }
+        }
+        (tile, tiling, region) => match complement {
+            true => tile.restrict_to(&Projection::Everything.minus(region), tiling),
+            false => tile.restrict_to(region, tiling),
+        },
     }
 }
 
