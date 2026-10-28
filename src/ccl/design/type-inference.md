@@ -3612,16 +3612,35 @@ compute function's labels stay in its type. A chain's and a cast's effects are t
 parts' (`Typing::composed_effects`). The kind is the lowering stamp where the node carries one, as
 `emit_node` applies it.
 
-**Levels.** An effect variable is minted at the emission level. `type_level` leaves effects out,
-since an effect variable decides nothing about whether a definition is polymorphic. A type
-becoming a bound of a variable at a shallower level lowers its effect variables to that level
-(`lower_effect_levels`, at bound recording and at extrusion). Instantiation copies an effect
-variable above the scheme's cutoff with its labels and the edges into it
-(`freshen_effect_var`), so two uses of one polymorphic function collect their effects apart.
+**Levels.** An effect variable is minted at the emission level. `type_level` leaves effects out:
+counting the variable of every function body would generalize every function. An effect variable
+at an input, a parameter's function type, decides that a definition is polymorphic as a type
+variable does (`effects::input_effect_level` in `should_generalize`): a body that calls the
+parameter leaves it open. A type becoming a bound of a variable at a shallower level lowers its
+effect variables to that level (`lower_effect_levels`, at bound recording and at extrusion).
+Instantiation copies an effect variable above the scheme's cutoff with its labels, its upper
+bounds and the edges into it (`freshen_effect_var`), so two uses of one polymorphic function
+collect their effects apart. `freshen_level` counts a function type's effect variable, so a type
+whose only quantified part is its effects is copied rather than shared.
+
+**Effects choose no clone.** Uses that differ only in what they require and cause run one body, so
+`SpecKey` leaves effects out and a specialization pin relates none
+(`ConstrainCache::without_effects`). A pin still adds the clone's function type as a bound of the
+use's variables, whose effects then meet the use's at an input, so the walk's read-stability check
+compares types without their effects. Nothing after specialization reads an effect off a
+materialized type.
 
 **Materialization.** Compaction resolves each function position's effects (`CompactFun::effects`).
 A merge takes the union at a positive position and the intersection at a negative one. Coalesce
 writes the set into a compute function's type as `Known`.
+
+**Printing an effect variable.** A rendering of a polymorphic type (`poly_for_display`) compacts
+with `compact_type_for_display`, which also records the effect variables at each function
+position (`EffectSet::vars`): at an input the position's own variable, at an output every variable
+flowing into it. A variable above the cutoff that stands at both an input and an output relates
+them, and is printed: its requirements as a parameter `R <: Context` and its effects as
+`E <: Effect`, each where no exact clause closes that part (`EffectVar::closed`). A variable at
+inputs alone is dropped, as a type variable at one polarity is.
 
 **Statements.** An expression statement a program writes before its block's last statement gets a
 frame of its own, which keeps every label, the enclosing function's own variables' included, and

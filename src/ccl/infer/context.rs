@@ -123,7 +123,8 @@ pub(super) fn should_generalize(
         TypedExprNode::TraitFn { .. } => true,
         _ => false,
     };
-    polymorphic_form && type_level(&def.ty) > level
+    polymorphic_form
+        && (type_level(&def.ty) > level || crate::ccl::effects::input_effect_level(&def.ty) > level)
 }
 
 /// Emission context for Cambra's inference algorithm (Pass 1).

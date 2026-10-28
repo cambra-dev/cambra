@@ -16,7 +16,7 @@ use crate::ccl::ty::{PolyParam, PolyType, TraitRequirement, TypeParam, TypeParam
 use crate::ccl::{InferVarId, Level, Type};
 
 use super::coalesce::{coalesce_compact, coalesce_position};
-use super::compact::{AtomKey, CompactType, CompactTypeKind, compact_type_polarity_only};
+use super::compact::{AtomKey, CompactType, CompactTypeKind, compact_type_for_display};
 use super::simplify_type::simplify_type_pinning;
 use super::traits::TraitObligation;
 
@@ -153,7 +153,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
     // Polarity-correct throughout: where no value reached a positive position, the
     // variable standing there is what it holds, and a fallback to its upper bound
     // would show a demand as a value.
-    let mut compacted = compact_type_polarity_only(&Type::Tuple(parts));
+    let mut compacted = compact_type_for_display(&Type::Tuple(parts));
     // A variable at or below the cutoff is one type of the enclosing scope's, not a
     // parameter, so it is pinned at the position it holds: dropped as polar-only, it
     // would leave that position empty, which reads as a parameter of its own.
@@ -192,9 +192,9 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
         names.visit(part);
     }
     names.visit_bounds();
-    let body = names.rename(&body);
+    let mut body = names.rename(&body);
 
-    let params = names
+    let mut params: Vec<PolyParam> = names
         .order
         .iter()
         .map(|v| {
@@ -243,6 +243,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
             requires.push(Rc::new(requirement));
         }
     }
+    params.extend(name_effect_vars(&mut body, cutoff, &params));
     Some(InferredPoly {
         poly: PolyType {
             params,
@@ -251,6 +252,103 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
         },
         joins: names.joins.into_inner(),
     })
+}
+
+/// Name the effect variables `body` keeps open, and return a parameter for each name
+/// (`src/ccl/design/type-inference.md`, "Effect variables").
+///
+/// A variable above `cutoff` standing at both an input and an output relates them: what a
+/// function given as an argument requires and causes, a call passes on. One standing at
+/// inputs alone states nothing a caller needs, and is dropped, as a type variable at one
+/// polarity is. A kept variable's requirements are written `R`, and its effects `E`, each
+/// where no exact clause closes them, since the two clauses range over different kinds
+/// (`docs/chl-spec.md`, "Kinds and bounds").
+fn name_effect_vars(body: &mut Type, cutoff: Level, taken: &[PolyParam]) -> Vec<PolyParam> {
+    use crate::ccl::effects::{EffectVar, EffectVarId, Effects, Repr};
+    fn occurrences(
+        ty: &Type,
+        pol: bool,
+        order: &mut Vec<Rc<EffectVar>>,
+        seen: &mut HashMap<EffectVarId, (bool, bool)>,
+    ) {
+        if let Type::Fun {
+            domain,
+            codomain,
+            effects,
+            ..
+        } = ty
+        {
+            if let Repr::Known(set) = effects.repr() {
+                for (id, v) in &set.vars {
+                    let entry = seen.entry(*id).or_insert_with(|| {
+                        order.push(Rc::clone(v));
+                        (false, false)
+                    });
+                    if pol {
+                        entry.0 = true;
+                    } else {
+                        entry.1 = true;
+                    }
+                }
+            }
+            occurrences(domain, !pol, order, seen);
+            occurrences(codomain, pol, order, seen);
+            return;
+        }
+        ty.walk_children(|child| occurrences(child, pol, order, seen));
+    }
+    let mut order = Vec::new();
+    let mut seen = HashMap::new();
+    occurrences(body, true, &mut order, &mut seen);
+
+    let mut spelled: HashSet<SmolStr> = taken.iter().map(|p| p.param.spelling.clone()).collect();
+    let mut names: HashMap<EffectVarId, (Option<SmolStr>, Option<SmolStr>)> = HashMap::new();
+    let mut params = Vec::new();
+    for v in &order {
+        if v.level() <= cutoff || seen[&v.uid] != (true, true) {
+            continue;
+        }
+        let (requires_closed, causes_closed) = v.closed();
+        // `R`, `R1`, …, skipping a spelling a parameter already has.
+        let mut name = |stem: &str, bound: &str| {
+            let spelling = (0..)
+                .map(|i| match i {
+                    0 => SmolStr::new(stem),
+                    i => SmolStr::new(format!("{stem}{i}")),
+                })
+                .find(|s| !spelled.contains(s))
+                .expect("an unbounded supply of spellings");
+            spelled.insert(spelling.clone());
+            params.push(PolyParam::with_bound(
+                TypeParam::declared(spelling.as_str()),
+                Some(Type::Param(TypeParam::declared(bound))),
+                None,
+            ));
+            spelling
+        };
+        let r = (!requires_closed).then(|| name("R", "Context"));
+        let e = (!causes_closed).then(|| name("E", "Effect"));
+        names.insert(v.uid, (r, e));
+    }
+
+    fn rename(ty: &mut Type, names: &HashMap<EffectVarId, (Option<SmolStr>, Option<SmolStr>)>) {
+        if let Type::Fun { effects, .. } = ty
+            && let Repr::Known(set) = effects.repr()
+            && !set.vars.is_empty()
+        {
+            let mut set = set.clone();
+            for id in std::mem::take(&mut set.vars).into_keys() {
+                if let Some((r, e)) = names.get(&id) {
+                    set.named_requires.extend(r.clone());
+                    set.named_causes.extend(e.clone());
+                }
+            }
+            *effects = Effects::known(set);
+        }
+        ty.walk_children_mut(|child| rename(child, names));
+    }
+    rename(body, &names);
+    params
 }
 
 /// What a type reaches through variable bounds: each variable's level, and the

@@ -251,6 +251,10 @@ pub struct ConstrainCache {
     /// variable and its index in [`BarrierVar::uppers`], awaiting the report the edge's
     /// caller gives them ([`report_recorded`](Self::report_recorded)).
     unreported: Vec<(Rc<BarrierVar>, usize)>,
+    /// Whether a `Fun`/`Fun` edge relates the two sides' effects. A specialization pin does
+    /// not: uses that differ only in what they cause share one clone, and relating their
+    /// effects through it would give each the others' ([`Self::without_effects`]).
+    relates_effects: bool,
 }
 
 /// The derivation a [`ConstrainCache`] serves: what the solver is doing when it
@@ -294,7 +298,15 @@ impl ConstrainCache {
             origins: (None, None),
             failure: None,
             unreported: Vec::new(),
+            relates_effects: true,
         }
+    }
+
+    /// This cache, relating no effects: each use's effects were collected apart at its
+    /// instantiation, and a pin relates only what chooses its clone.
+    pub fn without_effects(mut self) -> Self {
+        self.relates_effects = false;
+        self
     }
 
     /// Draw the next edge with its value from `value` and its demand from `demand`:
@@ -619,6 +631,9 @@ fn witness_instantiation(
 // `Filter` would otherwise widen each of its frames.
 #[inline(never)]
 fn constrain_effects(e0: &Effects, e1: &Effects, cache: &ConstrainCache) {
+    if !cache.relates_effects {
+        return;
+    }
     match (e0.repr(), e1.repr()) {
         // Each label crossing the edge entered at the value's node: an argument passed where
         // a written function type bounds it is where a label beyond the bound is reported.

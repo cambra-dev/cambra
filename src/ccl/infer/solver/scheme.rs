@@ -434,6 +434,10 @@ fn freshen_level(ty: &Type) -> Level {
         // solver never reads; normalization replaced it where the right-hand side was
         // emitted.
         Type::Param(param) => param.opened_at.unwrap_or(0),
+        // An effect variable is copied like any variable above the cutoff, so a type whose
+        // only quantified content is a function's effects is not returned verbatim: each use
+        // would add its arguments' effects to the definition's own variable.
+        Type::Fun { effects, .. } => effects.level(),
         _ => 0,
     };
     for r in ty.refinements() {

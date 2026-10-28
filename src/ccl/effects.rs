@@ -5,9 +5,10 @@
 //! [`Effects`] rides every [`Type::Fun`](crate::ccl::Type::Fun). A collection is a
 //! data function, and its type's effects are always [`Effects::none`].
 
+use smol_str::SmolStr;
 use std::{
     cell::{Cell, RefCell},
-    collections::{BTreeSet, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fmt,
     hash::{Hash, Hasher},
     rc::Rc,
@@ -111,6 +112,14 @@ pub enum Effect {
 pub struct EffectSet {
     pub requires: BTreeSet<Requirement>,
     pub causes: BTreeSet<Effect>,
+    /// The effect variables standing at this position, which only a rendering of a
+    /// polymorphic type collects (`super::infer::solver::display`): at an input, the
+    /// position's own variable; at an output, every variable flowing into it.
+    pub vars: BTreeMap<EffectVarId, Rc<EffectVar>>,
+    /// The variables a rendering names in each clause: `R` in `requires R` and `E` in
+    /// `causes E` (`docs/chl-spec.md`, "Kinds and bounds").
+    pub named_requires: BTreeSet<SmolStr>,
+    pub named_causes: BTreeSet<SmolStr>,
 }
 
 impl EffectSet {
@@ -131,13 +140,30 @@ impl EffectSet {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.requires.is_empty() && self.causes.is_empty()
+        self.requires.is_empty()
+            && self.causes.is_empty()
+            && self.vars.is_empty()
+            && self.named_requires.is_empty()
+            && self.named_causes.is_empty()
     }
 
     pub fn union(&self, other: &EffectSet) -> EffectSet {
+        let mut vars = self.vars.clone();
+        vars.extend(other.vars.iter().map(|(k, v)| (*k, Rc::clone(v))));
         EffectSet {
             requires: self.requires.union(&other.requires).cloned().collect(),
             causes: self.causes.union(&other.causes).cloned().collect(),
+            vars,
+            named_requires: self
+                .named_requires
+                .union(&other.named_requires)
+                .cloned()
+                .collect(),
+            named_causes: self
+                .named_causes
+                .union(&other.named_causes)
+                .cloned()
+                .collect(),
         }
     }
 
@@ -149,6 +175,22 @@ impl EffectSet {
                 .cloned()
                 .collect(),
             causes: self.causes.intersection(&other.causes).cloned().collect(),
+            vars: self
+                .vars
+                .iter()
+                .filter(|(k, _)| other.vars.contains_key(k))
+                .map(|(k, v)| (*k, Rc::clone(v)))
+                .collect(),
+            named_requires: self
+                .named_requires
+                .intersection(&other.named_requires)
+                .cloned()
+                .collect(),
+            named_causes: self
+                .named_causes
+                .intersection(&other.named_causes)
+                .cloned()
+                .collect(),
         }
     }
 }
@@ -561,6 +603,31 @@ impl EffectVar {
         out
     }
 
+    /// This variable and every variable flowing into it, through edges whose filters hold
+    /// or do not.
+    pub fn reaching(self: &Rc<Self>) -> BTreeMap<EffectVarId, Rc<EffectVar>> {
+        let mut out = BTreeMap::new();
+        let mut stack = vec![Rc::clone(self)];
+        while let Some(v) = stack.pop() {
+            if out.contains_key(&v.uid) {
+                continue;
+            }
+            stack.extend(v.incoming().into_iter().map(|(w, _)| w));
+            out.insert(v.uid, v);
+        }
+        out
+    }
+
+    /// Whether an upper bound closes the requirements, and the effects, this variable
+    /// holds: a written clause without `_` states them exactly.
+    pub fn closed(&self) -> (bool, bool) {
+        let uppers = self.uppers.borrow();
+        (
+            uppers.iter().any(|u| u.of_requires),
+            uppers.iter().any(|u| u.of_causes),
+        )
+    }
+
     /// Whether `pred` holds of this variable or of any variable flowing into it.
     pub fn reaches(&self, pred: &dyn Fn(&EffectVar) -> bool) -> bool {
         let mut seen = std::collections::HashSet::new();
@@ -761,6 +828,7 @@ impl Written {
                     .map(|r| r.map_terms(&mut f))
                     .collect(),
                 causes,
+                ..self.set.clone()
             },
             ..self.clone()
         }
@@ -795,7 +863,11 @@ impl fmt::Display for Effects {
 pub fn clauses(mut traits: Vec<String>, effects: &Effects) -> String {
     let set = effects.set();
     traits.extend(set.requires.iter().map(ToString::to_string));
+    traits.extend(set.named_requires.iter().map(ToString::to_string));
     let mut causes: Vec<String> = set.causes.iter().map(ToString::to_string).collect();
+    causes.extend(set.named_causes.iter().map(ToString::to_string));
+    // A variable a rendering has not named, which only a type printed mid-inference holds.
+    causes.extend(set.vars.values().map(|v| format!("{v:?}")));
     // A written clause ending in `_` prints it, as a type prints its holes.
     if let Repr::Written(w) = effects.repr() {
         if w.open_requires {
@@ -831,6 +903,36 @@ pub fn erase_in_type(ty: &mut crate::ccl::Type) {
 pub fn erase(expr: &mut crate::ccl::Expr) {
     expr.walk_type_slots_mut(erase_in_type);
     expr.walk_children_mut(erase);
+}
+
+/// The highest level of an effect variable standing at an input of `ty`: in a function type
+/// at a negative position, as a parameter's type is. A definition whose parameter's clause is
+/// left open by its body is polymorphic in it, as it is in an open type
+/// (`docs/chl-spec.md`, "Writing requirements and effects"), and `type_level` leaves effects
+/// out.
+pub fn input_effect_level(ty: &crate::ccl::Type) -> Level {
+    fn go(ty: &crate::ccl::Type, positive: bool) -> Level {
+        match ty {
+            crate::ccl::Type::Fun {
+                domain,
+                codomain,
+                effects,
+                ..
+            } => {
+                let own = match effects.repr() {
+                    Repr::Var(v) if !positive => v.level(),
+                    _ => 0,
+                };
+                own.max(go(domain, !positive)).max(go(codomain, positive))
+            }
+            other => {
+                let mut level = 0;
+                other.walk_children(|child| level = level.max(go(child, positive)));
+                level
+            }
+        }
+    }
+    go(ty, true)
 }
 
 /// Lower every effect variable in `ty` to at most `level`: `ty` is becoming a bound of a

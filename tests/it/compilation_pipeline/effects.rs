@@ -196,6 +196,17 @@ fn clauses_of(code: &str, member: &str) -> String {
     "call_taken",
     "causes Write(stock), Commit"
 )]
+// A parameter's `_` is what each call passes.
+#[case(
+    indoc! {"
+        def call_with(f: Int => Int causes _, x: Int):
+            f(x)
+        pub def via_hole(n: Int):
+            call_with(taken, n)
+    "},
+    "via_hole",
+    "causes Write(stock), Commit"
+)]
 // A `let` annotation's `_` is what its value fills.
 #[case(
     indoc! {"
@@ -212,6 +223,36 @@ fn a_contract_states_what_the_function_causes(
     #[case] expected: &str,
 ) {
     assert_eq!(clauses_of(code, member), expected);
+}
+
+/// A function whose effects are what a function argument's are is polymorphic in them, and
+/// its contract names each part a written clause leaves open (`docs/chl-spec.md`, "Writing
+/// requirements and effects").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_called_parameter(
+    "pub def call(f, x):\n    f(x)\n",
+    "pub call: forall (A, B, R <: Context, E <: Effect) {A => B requires R causes E, A} => B \
+     requires R causes E"
+)]
+#[case::a_hole_in_a_written_parameter_type(
+    "pub def call_with(f: Int => Int causes _, x: Int):\n    f(x)\n",
+    "pub call_with: forall (E <: Effect) {Int => Int causes E, Int} => Int causes E"
+)]
+#[case::a_parameter_never_called(
+    "pub def keep(f, x: Int):\n    x\n",
+    "pub keep: forall (A) {A, Int} => Int"
+)]
+#[case::a_returned_function(
+    "pub def compose(f, g):\n    \\x -> g(f(x))\n",
+    "pub compose: forall (A, B, C, R <: Context, E <: Effect, R1 <: Context, E1 <: Effect) \
+     {A => B requires R causes E, B => C requires R1 causes E1} => A => C requires R, R1 causes \
+     E, E1"
+)]
+fn a_contract_names_the_effects_an_argument_brings(#[case] code: &str, #[case] line: &str) {
+    let interface = check_program(&mut GlobalContext::default(), &program(code, &[]))
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert!(interface.lines().any(|l| l == line), "{interface}");
 }
 
 /// A clause bounding what a function may require or cause refuses a body or an argument that
@@ -281,10 +322,6 @@ fn a_clause_refuses_what_exceeds_it(#[case] code: &str, #[case] needle: &str) {
 #[case::a_hole_under_only(
     "def f(n: Int) causes only _:\n    n\n",
     "`only` makes a clause an upper bound"
-)]
-#[case::a_hole_in_a_parameter(
-    "def call_with(f: Int => Int causes _, x: Int):\n    f(x)\n",
-    "a `_` in a parameter's clause"
 )]
 #[case::a_trait_requirement_in_a_function_type(
     "def call_with(f: Int => Int requires Orderable(Int, Int), x: Int):\n    f(x)\n",

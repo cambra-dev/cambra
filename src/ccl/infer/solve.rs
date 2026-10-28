@@ -462,14 +462,14 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
                 fun_kind: k1,
                 domain: d1,
                 codomain: c1,
-                effects: e1,
+                ..
             },
             Type::Fun {
                 name: n2,
                 fun_kind: k2,
                 domain: d2,
                 codomain: c2,
-                effects: e2,
+                ..
             },
         ) => {
             // Two sums agree iff their binders' type kinds agree pairwise, binder by binder
@@ -492,9 +492,13 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
                             .zip(y.children())
                             .all(|(p, q)| types_agree_modulo_unread(p, q, refinements))
                 });
+            // Effects are not compared. A specialization pin relates no effects, since
+            // uses differing only in them share a clone, so a clone's function bound meets a
+            // use's at an input with other effects; and nothing after specialization reads
+            // an effect off a materialized type (`src/ccl/design/type-inference.md`,
+            // "Effect variables").
             slots_agree
                 && n1 == n2
-                && e1 == e2
                 && types_agree_modulo_unread(d1, d2, refinements)
                 && types_agree_modulo_unread(c1, c2, refinements)
         }
@@ -2961,7 +2965,7 @@ pub(super) fn specialize_use(
         unreachable!("lookup_generalized returns indices of Generalized entries only");
     };
     let one_way = frame.bound_at_annotation;
-    let mut cache = ConstrainCache::new();
+    let mut cache = ConstrainCache::new().without_effects();
     let use_origin = Some(crate::ccl::infer_var::Origin::Node(use_expr.node_id()));
     cache.at(use_origin, use_origin);
     let pinned = constrain_subtype_in(

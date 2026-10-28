@@ -195,7 +195,7 @@ pub(super) fn uncurry_params(
                 // rejected at the call site. Without this the annotation was
                 // silently dropped and the param inferred purely from its body (so
                 // `def g(a: int)` with an identity body accepted any argument).
-                param.declare(lower_param_annotation(ann, ctx)?);
+                param.declare(lower_type_annotation(ann, ctx)?);
             }
         }
         return Ok(lam);
@@ -232,7 +232,7 @@ pub(super) fn uncurry_params(
                     // the single-parameter arm: attach it so `emit_lambda` binds the
                     // parameter at its declared type and an ill-typed argument is
                     // rejected at the call site.
-                    (None, Some(ann)) => p.declare(lower_param_annotation(ann, ctx)?),
+                    (None, Some(ann)) => p.declare(lower_type_annotation(ann, ctx)?),
                     (None, None) => {}
                 }
             }
@@ -287,7 +287,7 @@ pub(super) fn uncurry_params(
     let mut elem_anns: Vec<Type> = Vec::with_capacity(params.len());
     for p in params {
         elem_anns.push(match &p.annotation {
-            Some(ann) => lower_param_annotation(ann, ctx)?,
+            Some(ann) => lower_type_annotation(ann, ctx)?,
             None => Type::Hole,
         });
     }
@@ -298,37 +298,6 @@ pub(super) fn uncurry_params(
         param.declare(Type::Tuple(elem_anns));
     }
     Ok(lam)
-}
-
-/// A parameter's annotation. A `_` in a clause of a function type it holds is a variable each
-/// call fills, which makes the function polymorphic in it (`docs/chl-spec.md`, "Writing
-/// requirements and effects"), and is refused until such variables are implemented.
-fn lower_param_annotation(
-    annotation: &chl_parser::ast::TypeAnnotation,
-    ctx: &mut LoweringContext,
-) -> Result<Type, LoweringError> {
-    let ty = lower_type_annotation(annotation, ctx)?;
-    if has_open_clause(&ty) {
-        return Err(LoweringError::unsupported(
-            annotation.ty.span,
-            "a `_` in a parameter's clause stands for what each call passes, which is not \
-             supported yet; write the clause's requirements and effects",
-        ));
-    }
-    Ok(ty)
-}
-
-/// Whether `ty` holds a function type with a written clause ending in `_`.
-fn has_open_clause(ty: &Type) -> bool {
-    if let Type::Fun { effects, .. } = ty
-        && let crate::ccl::effects::Repr::Written(w) = effects.repr()
-        && (w.open_requires || w.open_causes)
-    {
-        return true;
-    }
-    let mut found = false;
-    ty.walk_children(|child| found |= has_open_clause(child));
-    found
 }
 
 /// Whether [`uncurry_params`] curries `params` into one lambda each, which it does for more
