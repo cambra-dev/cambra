@@ -147,6 +147,11 @@ pub struct TraitDecl {
     pub span: Span,
     /// The operand types, declared ([`TypeParam::declared`]); a signature names them.
     pub operands: Vec<Rc<TypeParam>>,
+    /// The term parameters, each a variable a requirement of the trait names: `x` in
+    /// `Read(x)`. Only the compiler's context traits declare one.
+    pub term_params: Vec<SmolStr>,
+    /// Where an instance of the trait comes from.
+    pub supplied_by: Supplier,
     /// The associated types, each with the parameter a signature names it by.
     pub assocs: Vec<(Assoc, Rc<TypeParam>)>,
     /// In declaration order.
@@ -169,6 +174,21 @@ pub struct TraitDecl {
     /// components, and a record's fields carry none. Arithmetic has no product reading at
     /// all, and neither has a module's trait.
     pub structural: bool,
+}
+
+/// Where a requirement of a trait is answered (`docs/chl-spec.md`, "Discharging requirements
+/// and effects").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Supplier {
+    /// Instance search, over the declared instances and the requirements in scope.
+    Instances,
+    /// A `with begin():` block, to its body: `Transaction`.
+    Transaction,
+    /// The run of the module: `Ext`.
+    Run,
+    /// The scope binding the requirement's term argument, to every call inside it:
+    /// `Read(x)`.
+    Scope,
 }
 
 impl TraitDecl {
@@ -218,6 +238,9 @@ struct CompilerTraits {
     equatable: Trait,
     orderable: Trait,
     negatable: Trait,
+    transaction: Trait,
+    ext: Trait,
+    read: Trait,
     /// Every instance of these, which every program has.
     instances: Rc<InstanceTable>,
 }
@@ -299,6 +322,9 @@ impl CompilerTraits {
             &mut instances,
         );
         CompilerTraits {
+            transaction: context_trait("Transaction", &[], Supplier::Transaction),
+            ext: context_trait("Ext", &[], Supplier::Run),
+            read: context_trait("Read", &["x"], Supplier::Scope),
             addable,
             addable_refined,
             subtractable,
@@ -329,6 +355,8 @@ fn operator_trait(
         name: name.into(),
         span: Span::new(chl_parser::FileId::ROOT, 0, 0),
         operands: operands.iter().map(|n| TypeParam::declared(*n)).collect(),
+        term_params: Vec::new(),
+        supplied_by: Supplier::Instances,
         assocs: if output {
             vec![(Assoc::Output, TypeParam::declared("Output"))]
         } else {
@@ -363,6 +391,29 @@ fn operator_trait(
         );
     }
     trait_
+}
+
+/// A trait a call's context supplies, over no types: no instance is declared of it, and a
+/// requirement of it is a function type's, not a polymorphic definition's (`docs/chl-spec.md`,
+/// "Discharging requirements and effects").
+fn context_trait(name: &str, term_params: &[&str], supplied_by: Supplier) -> Trait {
+    debug_assert!(
+        supplied_by != Supplier::Instances,
+        "a context trait is supplied by its context"
+    );
+    Trait::compiler(TraitDecl {
+        module: vec![SmolStr::new_static(COMPILER_MODULE)],
+        name: name.into(),
+        span: Span::new(chl_parser::FileId::ROOT, 0, 0),
+        operands: Vec::new(),
+        term_params: term_params.iter().map(SmolStr::new).collect(),
+        supplied_by,
+        assocs: Vec::new(),
+        functions: Vec::new(),
+        requires: Vec::new(),
+        named: Vec::new(),
+        structural: false,
+    })
 }
 
 impl Trait {
@@ -412,7 +463,23 @@ impl Trait {
         COMPILER_TRAITS.with(|c| c.negatable.clone())
     }
 
-    /// Every trait the compiler provides, `AddableRefined` included.
+    /// The snapshot of a transaction, which a `with begin():` block supplies to its body.
+    pub fn transaction() -> Trait {
+        COMPILER_TRAITS.with(|c| c.transaction.clone())
+    }
+    /// An input from outside the program, which the run supplies: opening a source, or a
+    /// reading.
+    pub fn ext() -> Trait {
+        COMPILER_TRAITS.with(|c| c.ext.clone())
+    }
+    /// A position in the history of an induction variable, which a read of it stands at.
+    /// The scope binding the variable supplies one to every call inside it.
+    pub fn read() -> Trait {
+        COMPILER_TRAITS.with(|c| c.read.clone())
+    }
+
+    /// Every trait the compiler provides that instance search answers, `AddableRefined`
+    /// included.
     pub fn compiler_traits() -> Vec<Trait> {
         COMPILER_TRAITS.with(|c| {
             vec![
@@ -1772,6 +1839,7 @@ impl TraitObligation {
         Some(TraitRequirement {
             trait_: self.trait_.clone(),
             args,
+            terms: Vec::new(),
             assoc,
             at: None,
         })
@@ -3468,6 +3536,7 @@ pub fn entailed(
             let at_field = TraitRequirement {
                 trait_: requirement.trait_.clone(),
                 args: args.iter().map(|a| component(a, key)).collect(),
+                terms: Vec::new(),
                 assoc: Vec::new(),
                 at: requirement.at,
             };

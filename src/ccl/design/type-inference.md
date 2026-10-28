@@ -3529,6 +3529,13 @@ result, its `requires` and `causes` clauses
 The `effects` slot holds an `Effects` (`src/ccl/effects.rs`): `Known` for a set a type states, and
 `Var` for one inference is still collecting. A data function's is always the empty set.
 
+A requirement in an effect set is a `TraitRequirement` of one of the compiler's context traits
+(`Requirement` in `effects.rs`): `Transaction`, `Ext` or `Read`. `TraitDecl::supplied_by` names
+where a trait's instance comes from: a `with begin():` block for `Transaction`, the run for `Ext`,
+the scope binding the variable for `Read`, and instance search for every other trait. `Read` takes
+a term parameter, the variable whose history the read stands in (`TraitDecl::term_params`,
+`TraitRequirement::terms`). A context trait is over no types.
+
 ### Effect variables
 
 An `EffectVar` holds **labels** and **edges**. A label is one requirement or effect, with the

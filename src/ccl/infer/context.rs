@@ -300,7 +300,7 @@ impl EffectFrame {
             when_data: None,
             below: (!self.keeps_own).then_some(self.depth),
             discharges: if self.transactions > 0 {
-                [Requirement::Transaction].into_iter().collect()
+                [Requirement::transaction()].into_iter().collect()
             } else {
                 Default::default()
             },
@@ -1523,17 +1523,17 @@ impl Typing for InferCtx {
             .get(name)
             .is_some_and(|b| b.transactional)
         {
-            self.record_effect(Item::Requires(Requirement::Transaction), None);
+            self.record_effect(Item::Requires(Requirement::transaction()), None);
         }
     }
 
     fn record_read(&mut self, name: &Name) {
         match self.effect_binders.get(name) {
             Some(binder) if binder.transactional => {
-                self.record_effect(Item::Requires(Requirement::Transaction), None);
+                self.record_effect(Item::Requires(Requirement::transaction()), None);
             }
             Some(_) => {
-                self.record_effect(Item::Requires(Requirement::Read(name.clone())), Some(name))
+                self.record_effect(Item::Requires(Requirement::read(name.clone())), Some(name))
             }
             None => {}
         }

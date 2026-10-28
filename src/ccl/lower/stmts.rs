@@ -2160,6 +2160,7 @@ pub(super) fn lower_trait_type(
     Ok(crate::ccl::ty::TraitRequirement {
         trait_,
         args,
+        terms: Vec::new(),
         assoc: Vec::new(),
         at: Some(span),
     })
@@ -2333,6 +2334,7 @@ fn expand_requirement(
             out.push(Rc::new(crate::ccl::ty::TraitRequirement {
                 trait_,
                 args: args.iter().map(Type::canonical).collect(),
+                terms: Vec::new(),
                 assoc,
                 at: Some(span),
             }));
@@ -2364,6 +2366,7 @@ fn expand_requirement(
     out.push(Rc::new(crate::ccl::ty::TraitRequirement {
         trait_,
         args,
+        terms: Vec::new(),
         assoc,
         at: Some(span),
     }));

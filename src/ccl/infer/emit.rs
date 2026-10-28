@@ -269,7 +269,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             let Some(registered) = ctx.sources.get(name).cloned() else {
                 return Err(ctx.raise(InferError::UnboundVariable(name.to_string())));
             };
-            ctx.record_effect(Item::Requires(Requirement::Ext), None);
+            ctx.record_effect(Item::Requires(Requirement::ext()), None);
             registered
         }
 
