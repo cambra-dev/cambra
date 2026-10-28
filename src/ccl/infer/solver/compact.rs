@@ -2674,10 +2674,30 @@ fn compact_go(
             // A substitution that maps no name the walk below can reach leaves the walk as it
             // is under the identity: a refinement it does not act on keeps its predicate
             // (`Subst::force_refinement`), and a witness half is ruled out here.
+            let below = if subst_acc.is_id() || subst_acc.has_witnesses() {
+                None
+            } else {
+                consulted_below(state, pol, (memo_key.3, memo_key.4), st)
+            };
             let memoizable = subst_acc.is_id()
-                || (!subst_acc.has_witnesses()
-                    && consulted_below(state, pol, (memo_key.3, memo_key.4), st)
-                        .is_some_and(|names| !subst_acc.maps_any(&names)));
+                || below
+                    .as_ref()
+                    .is_some_and(|names| !subst_acc.maps_any(names));
+            // Below this variable the walk reads only the entries for the names it can reach,
+            // so it carries only those: the substitution accumulates an entry per binder on
+            // the path, and the walk composes it at every bound.
+            #[cfg(test)]
+            carried_probe::arrive(subst_acc.binder_count());
+            let pruned;
+            let subst_acc = match &below {
+                Some(names) => {
+                    pruned = subst_acc.restricted_to(names);
+                    &pruned
+                }
+                None => subst_acc,
+            };
+            #[cfg(test)]
+            carried_probe::carry(subst_acc.binder_count());
             if memoizable
                 && let Some(done) = st.memo.get(&memo_key)
                 && done.cuts.iter().all(|cut| {
@@ -2971,6 +2991,39 @@ fn compact_go(
     }
 }
 
+/// Counts the substitution entries compaction's walk brings to each variable it reaches, and
+/// those it carries on below the variable once pruned, so a test can assert that the walk
+/// carries only what the names below read
+/// (`a_walk_carries_no_entry_the_names_below_do_not_read`).
+///
+/// Thread-local, because `cargo test` runs tests concurrently in one process.
+#[cfg(test)]
+mod carried_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARRIVED: Cell<usize> = const { Cell::new(0) };
+        static CARRIED: Cell<usize> = const { Cell::new(0) };
+    }
+
+    pub fn arrive(entries: usize) {
+        ARRIVED.with(|c| c.set(c.get() + entries));
+    }
+
+    pub fn carry(entries: usize) {
+        CARRIED.with(|c| c.set(c.get() + entries));
+    }
+
+    /// Run `body`, returning how many entries the walks it ran brought to a variable and how
+    /// many they carried on, each summed over every variable reached.
+    pub fn count(body: impl FnOnce()) -> (usize, usize) {
+        ARRIVED.with(|c| c.set(0));
+        CARRIED.with(|c| c.set(0));
+        body();
+        (ARRIVED.with(Cell::get), CARRIED.with(Cell::get))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2979,6 +3032,45 @@ mod tests {
         CoalesceError, ConstrainCache, coalesce_compact, constrain_subtype, fresh_var,
     };
     use crate::ccl::{BaseType, Lit, Refinement, TypedExpr};
+
+    /// Compacting a chain of `.extract()` calls on a value nested eight deep composes
+    /// substitution entries as the walk crosses bounds, and none acts on a name the walk
+    /// below the variable it arrives at consults. The walk prunes what it carries to the
+    /// entries for the names below, so it carries none. Carrying them, it composed each at
+    /// every bound beneath, and the entries on a path grew with the nesting.
+    #[test]
+    fn a_walk_carries_no_entry_the_names_below_do_not_read() {
+        const DEPTH: usize = 8;
+        let mut program = String::from("type One(T) = T\nc0 = 1\n");
+        for i in 1..=DEPTH {
+            program.push_str(&format!("c{i} = One::new(c{})\n", i - 1));
+        }
+        program.push_str(&format!("c{DEPTH}{}\n", ".extract()".repeat(DEPTH)));
+        let mut lctx = crate::ccl::lower::LoweringContext::default();
+        let module = chl_parser::parse_module(chl_parser::FileId::ROOT, &program)
+            .into_result()
+            .expect("the chain parses");
+        let lowered = crate::ccl::lower::lower_stmts(&module, &mut lctx)
+            .into_result()
+            .expect("the chain lowers");
+        let mut expr = crate::ccl::opaque_output::run(crate::ccl::comprehension::run(
+            crate::ccl::uniquify::run(lowered),
+            lctx.shared_holes(),
+        ));
+        let mut ictx = crate::ccl::infer::TypeInferenceContext::new();
+        let mut typed = false;
+        let (arrived, carried) =
+            carried_probe::count(|| typed = crate::ccl::infer::infer(&mut expr, &mut ictx).is_ok());
+        assert!(typed, "the chain type-checks");
+        assert!(
+            arrived > 0,
+            "the walk composes entries as it crosses the chain's bounds"
+        );
+        assert_eq!(
+            carried, 0,
+            "of {arrived} entries brought to a variable, the walk carried {carried} below it"
+        );
+    }
 
     /// A name reaching a variable round a cycle comes back as its image through the cycle's
     /// edges, last edge first, and the variable consults that image too, until nothing new
