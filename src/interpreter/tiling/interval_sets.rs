@@ -4,20 +4,9 @@
 //! - [`holds`]: whether a canonical set holds a value.
 //! - [`single_interval_set`]: a column of integers as one interval set.
 //!
-//! The crate's `Contains<T>` for a set scans every interval. [`holds`] costs one
-//! binary search over the set's intervals and one interval's containment test.
-//!
-//! `intervalsets` computes `a ∖ b` as `a ∩ complement(b)`, which builds both sets before
-//! [`MaybeEmpty::is_empty`] reads one bit of the answer. [`HasDifference`] answers the question
-//! that `difference(..).is_empty()` is asked for, stops at the first value of `self` that `rhs`
-//! lacks, and builds no [`IntervalSet`].
-//!
-//! The answer is the one `!a.difference(b).is_empty()` gives for every pair of sets, including
-//! sets that hold touching runs unmerged. [`IntervalSet::new`] keeps `[0, 1]` and `[2, 3]` of a
-//! discrete domain as two intervals, and `(-∞, 4)` and `[4, 4]` of any domain, so an interval is
-//! covered by `rhs` when a chain of touching intervals covers it, not only when one interval
-//! does. `Interval::merged` joins the first pair and not the second, so the chain is followed by
-//! comparing bounds.
+//! [`holds`] searches interval right endpoints; its ordering preconditions are stated locally.
+//! [`HasDifference`] tests coverage without constructing a difference set. Coverage can span
+//! several touching intervals, so it compares bounds rather than requiring one covering interval.
 
 use std::borrow::Cow;
 
@@ -31,7 +20,8 @@ use crate::interpreter::Value;
 /// Whether `self ∖ rhs` is not empty.
 ///
 /// Equivalent to `!self.difference(rhs).is_empty()`, without the set that `difference` builds.
-/// The cost is one lookup in `rhs` per interval of `self`, logarithmic in the size of `rhs`.
+/// Each interval in `self` performs a binary search in `rhs`, then scans candidate touching runs.
+/// Returns at the first uncovered interval; the run scans can exceed the search cost.
 pub trait HasDifference {
     fn has_difference(&self, rhs: &Self) -> bool;
 }
@@ -45,19 +35,13 @@ impl<T: Domain> HasDifference for IntervalSet<T> {
 
 /// Whether `set` holds `value`.
 ///
-/// Defined on the canonical sets that [`Predicate::Intervals`](super::Predicate::Intervals)
-/// holds, which `canonical_runs` builds. On each of them the answer is
-/// `Contains::contains(set, value)`, which scans every interval. Two conditions on the intervals of `set` make it so:
+/// Requires intervals ordered by left endpoint and nondecreasing right endpoint.
+/// `Predicate`'s `canonical_runs` supplies these sets and debug-asserts the right-end order.
 ///
-/// - They ascend by left end, as `IntervalSet::new` sorts them.
-/// - Each one ends at or after the end of the one before it (`right_ends_ascend`).
-///
-/// A value above one right end is then above every earlier one, and the first interval whose right
-/// end does not fall below the value starts no later than any other interval that holds it. So
-/// the value lies in the union exactly when it lies in that interval. A set `IntervalSet::new`
-/// builds can break the second condition: over a discrete domain `Interval::open(4, 5)` is the
-/// inverted `[5, 4]`, which holds nothing, and `IntervalSet::new` keeps it nested inside
-/// `[0, 10]`. `canonical_runs` debug-asserts the second condition.
+/// Binary-search the first right endpoint not below `value`, then test that interval.
+/// This agrees with a membership scan under the ordering preconditions. `IntervalSet::new`
+/// alone does not establish them: a discrete open interval can normalize to inverted endpoints
+/// and remain nested in another interval. See [`right_ends_ascend`] and the tests below.
 pub(crate) fn holds<T: Domain>(set: &IntervalSet<T>, value: &T) -> bool {
     let intervals = set.intervals();
     let at = intervals.partition_point(|y| {

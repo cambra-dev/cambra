@@ -135,10 +135,8 @@ portions of a scalar value.
 `is_universal` and `is_empty` test the extremes; there are no separate universal/empty
 guard variants. An empty guard annihilates intersection.
 
-`flatten_or` distributes codomain wrappers over unions and produces arms that are chains of
-`Codomain` steps ending in one guard. It merges arms naming the same place and removes regions
-already covered by shallower whole-key guards. This prevents a sequential release from
-retaining a redundant inner arm for each completed outer row.
+Union normalization and mixed-shape intersection are specified under
+[Guard normalization](#guard-normalization).
 
 `check_from` validates a guard against a tiling. A record guard must have exactly the tiling's
 field names. Codomain recursion retains the enclosing extents so qualified predicates can be
@@ -175,6 +173,56 @@ When every field is whole under 𝑅, `flatten_or` lifts the record guard to `Do
 A record ends a direct collection chain but can still contain collections in its fields.
 `Tile::holds_a_level`'s doc states which question guard construction, `merge` and the chain walks
 each ask there.
+
+### Guard normalization
+
+`TileGuard::flatten_or` normalizes a nonempty list of union arms. It distributes `Codomain`
+wrappers over nested `Or` guards, then calls `lift` on each resulting chain. A region covering
+all values beneath a key can be represented by that key's domain guard:
+`Codomain(Domain(Qualified(𝐸, True)))` lifts to `Domain(𝐸)`. Partial regions remain at their
+original depth. Keyless leaves lift through their enclosing-row predicates. A record lifts
+only the rows covered in full by every field; its remaining field regions stay in a record arm.
+
+Normalization returns a universal arm if one is present. Otherwise it removes empty arms,
+retaining the first if every arm is empty. Arms with the same nesting and leaf shape combine
+through `union_in_place`; record fields combine independently. `without_covered_arms` then
+prunes deeper domain arms where `Predicate::without_covered` can subtract keys already covered
+by shallower domain arms. If that helper cannot express a subtraction, the arm is retained.
+One remaining arm is returned directly; several become `Or`. An empty input list panics.
+This is the implemented normalization procedure, not a guarantee of structural equality for
+every pair of semantically equivalent guards.
+
+`TileGuard::union` and `intersect` require compatible guard shapes. Record operands must have
+identical field sets; mismatches panic. A record guard selects independent field regions,
+unlike `Predicate::Record`, which tests a conjunction over a record value's components.
+Consequently, record-guard union combines fields directly rather than constructing a predicate
+union of products.
+
+Function intersection handles a mixed `Domain`/`Codomain` pair by qualifying the inner region
+with the domain predicate at the current collection depth. It does not discard either
+constraint. Function union combines equal shapes and handles empty/universal operands;
+a remaining mixed pair returns `None`, causing `TileGuard::union` to retain separate arms.
+Intersection distributes across `Or` and normalizes the results.
+
+`covers_path` tests a full path of collection keys. A domain guard covers every deeper path
+through its selected keys. A record path is covered only if all fields cover it. `whole_keys`
+extracts the normalized outer-domain region for producers reclaiming key-indexed state; it
+does not include separately released cells in still-live rows. Those cells remain subject to
+[The release contract](#the-release-contract).
+
+`through_standing_levels` translates a guard across unchanged outer collection levels and
+delegates the region below them to the operator's callback. Empty and universal guards use
+the input tiling's corresponding guard without calling the callback. `through_shared_levels`
+uses this traversal when the values differ. Normalization lifts whole-value regions to domain
+guards on their enclosing shared keys, so whole values pass through as key releases. The callback
+receives only partial value regions and releases no input values for them. This translation is an
+operator retention rule, not an approximation to the output region.
+
+`domain_prefix_over` constructs an inclusive nested-key prefix from one arm per path component.
+Nonfinal components select keys strictly before their bound; the final component includes its
+bound. Inner arms are qualified by the preceding path. The path must be nonempty. Domain
+extents are required for union-key bounds; `domain_prefix` supplies none and therefore cannot
+construct those prefixes.
 
 ### Predicate
 
