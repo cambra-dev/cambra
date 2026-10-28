@@ -601,6 +601,9 @@ impl TileOperator for Uncurry {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // Beneath standing levels the input's outermost keys are the result's; pairing the whole
+        // tile re-keys.
+        let keeps_keys = self.level != CurryLevel::OUTERMOST;
         Box::new(UncurryProducer {
             base: ProducerBase::new(
                 UncurryProducer::alloc_id(),
@@ -610,7 +613,7 @@ impl TileOperator for Uncurry {
             ),
             input: self.input.subscribe(
                 self.tiling().universal_guard(),
-                widening(consumer),
+                consumer_keeping_keys_if(keeps_keys, consumer),
                 scheduler,
             ),
             level: self.level,
