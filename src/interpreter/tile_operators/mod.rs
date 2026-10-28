@@ -33,7 +33,7 @@ use crate::{
     interpreter::value_probe::ProbeSlot,
     interpreter::{
         ColumnValue, Consumer, Extent, Gate, GatedConsumer, Projection, Scheduler, Value,
-        forwarding_consumer, validate_tile, widening,
+        forwarding_consumer, forwarding_consumer_keeping_keys, validate_tile, widening,
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -193,6 +193,33 @@ pub(crate) fn subscribe_forwarding(
         forwarding_consumer(shared, &scheduler.wakeup_queue()),
         scheduler,
     )
+}
+
+/// [`subscribe_forwarding`] for an input whose outermost keys are the operator's: the input's
+/// region reaches the operator's consumer as it is.
+pub(crate) fn subscribe_forwarding_keeping_keys(
+    op: &mut dyn TileOperator,
+    shared: &GatedConsumer,
+    scheduler: &mut Scheduler,
+) -> Box<dyn TileProducer> {
+    op.subscribe(
+        op.tiling().universal_guard(),
+        forwarding_consumer_keeping_keys(shared, &scheduler.wakeup_queue()),
+        scheduler,
+    )
+}
+
+/// [`subscribe_forwarding_keeping_keys`] where `keeps_keys`, and [`subscribe_forwarding`] where not.
+pub(crate) fn subscribe_forwarding_keeping_keys_if(
+    keeps_keys: bool,
+    op: &mut dyn TileOperator,
+    shared: &GatedConsumer,
+    scheduler: &mut Scheduler,
+) -> Box<dyn TileProducer> {
+    match keeps_keys {
+        true => subscribe_forwarding_keeping_keys(op, shared, scheduler),
+        false => subscribe_forwarding(op, shared, scheduler),
+    }
 }
 
 /// The concrete type's name with its module path stripped, e.g. `"MapResult"`.
