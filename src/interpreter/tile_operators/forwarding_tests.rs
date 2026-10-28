@@ -573,6 +573,26 @@ fn uncurry_at_the_outermost_level_sends_everything() {
     assert_widens(&|| uncurry(CurryLevel::OUTERMOST), 0);
 }
 
+fn aggregate() -> Built {
+    let (input, consumer) = feed(ints());
+    let op = Aggregate::new(input, crate::ccl::AggregateKind::Sum);
+    (Box::new(op), vec![consumer])
+}
+
+/// The accumulator has no keys.
+#[test]
+fn an_aggregate_sends_everything_for_a_region_of_its_input() {
+    assert_widens(&aggregate, 0);
+}
+
+#[test]
+fn an_aggregate_sends_everything_for_a_later_region() {
+    assert_eq!(
+        received(&aggregate, 0, &another_region()),
+        [Projection::Everything]
+    );
+}
+
 fn extract_final() -> Built {
     let (source, keys) = feed(ints());
     let (default, fallback) = feed(Tiling::Scalar(int()));
