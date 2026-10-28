@@ -498,19 +498,13 @@ impl Notified {
                 if gate.set.load(Ordering::Acquire) && region.contained_in(passed) {
                     return false;
                 }
-                // One operator's notifications are all regions of keys or all regions of fields,
-                // because its output is a collection or a record: a gate that is given both has
-                // a wiring that is not one, and what it would hold of them is less than their
-                // union.
-                debug_assert!(
-                    !matches!(
-                        (&*passed, region),
-                        (Projection::Keys(_), Projection::Fields(_))
-                            | (Projection::Fields(_), Projection::Keys(_))
-                    ),
-                    "a gate was notified of keys and of fields: {passed:?}, {region:?}"
-                );
                 *passed = passed.passed_with(region);
+                // What passed includes the region, or a notification could pass again for nothing
+                // and a cycle of them would not end.
+                debug_assert!(
+                    region.contained_in(passed),
+                    "a gate's held region lost what it passed: {passed:?} of {region:?}"
+                );
                 gate.everything
                     .store(*passed == Projection::Everything, Ordering::Release);
                 gate.set.store(true, Ordering::Release);

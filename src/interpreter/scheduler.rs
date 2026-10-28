@@ -48,6 +48,10 @@ pub struct GatedConsumer {
 pub struct Gate(pub(crate) Notified);
 
 /// The consumer a gate guards: forwards a notification to `consumer` when the gate passes it.
+/// The rounds of absorbed notifications a [`Gated`] delivers inside one notification before a
+/// debug build says its consumer pulled inside `notify`.
+const MAX_ABSORBED_ROUNDS: usize = 8;
+
 struct Gated {
     admit: Notified,
     consumer: Box<dyn Consumer>,
@@ -73,7 +77,15 @@ impl Consumer for Gated {
         // through the gate, until nothing is left. Only a region outside what the gate passed
         // reaches the consumer, and the gate only grows until a pull, so a cycle of such
         // notifications ends inside the one that started it.
+        //
+        // That holds for a consumer that does not pull this operator inside `notify`: a sink
+        // queues its pull, and a consumer that pulls does so after its wake returns. A pull
+        // inside `notify` resets the gate, so a cascade that re-enters the cell each time would
+        // pass the same region again every round, which the bound below catches in debug builds.
+        // A consumer that obeys the rule cannot reset the gate, so each round needs a region
+        // outside what has passed, and the cascade that makes them is finite.
         let mut region = arrived.clone();
+        let mut rounds = 0;
         loop {
             if self.admit.mark_news_of(&region) {
                 self.consumer.notify(&region);
@@ -82,6 +94,12 @@ impl Consumer for Gated {
             if region == Projection::Nothing {
                 break;
             }
+            rounds += 1;
+            debug_assert!(
+                rounds <= MAX_ABSORBED_ROUNDS,
+                "a consumer behind a gate pulled its operator inside `notify` and its cascade \
+                 re-entered the cell each time: {rounds} rounds, the last of {region:?}"
+            );
         }
     }
 
@@ -1083,15 +1101,6 @@ mod tests {
         );
     }
 
-    /// A gate is given regions of one kind: keys for a collection, fields for a record.
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "notified of keys and of fields")]
-    fn a_gate_notified_of_keys_and_of_fields_is_a_wiring_bug() {
-        let fields = Projection::field_of(&["a", "b"], "a", keys(1, 4));
-        passes(&[keys(1, 4), fields]);
-    }
-
     /// The gate holds what it passed, not what was delivered: a consumer behind it that drops a
     /// region still closes the gate to that region, and the next pull opens it.
     #[test]
@@ -1423,6 +1432,38 @@ mod tests {
             "a pull of a gate that is clear has nothing to reset"
         );
         assert!(gate.mark_news_of(&keys(1, 2)));
+    }
+
+    /// A consumer that pulls its operator inside `notify` resets the gate, and a cascade that
+    /// re-enters the cell each time then passes the same region again every round. The rule is
+    /// that a consumer behind a gate does not pull inside `notify`; a debug build says so rather
+    /// than loop.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "pulled its operator inside `notify`")]
+    fn a_consumer_that_pulls_inside_notify_and_always_reenters_is_caught() {
+        let names: Arc<[SmolStr]> = vec![SmolStr::new("a"), SmolStr::new("b")].into();
+        let arm: Arc<Mutex<Option<Box<dyn Consumer>>>> = Arc::default();
+        let gate_slot: Arc<Mutex<Option<Notified>>> = Arc::default();
+        let (arm_c, gate_c) = (arm.clone(), gate_slot.clone());
+        let consumer: Box<dyn Consumer> = Box::new(RegionTap(Box::new(move |_: &Projection| {
+            // The pull inside `notify`, which opens the gate again.
+            if let Some(gate) = gate_c.lock_now().as_ref() {
+                gate.take();
+            }
+            if let Some(arm) = arm_c.lock_now().as_mut() {
+                arm.notify(&keys(1, 2));
+            }
+        })));
+        let (shared, gate) = shared_consumer(consumer);
+        *gate_slot.lock_now() = Some(gate.0.clone());
+        let mut input_a = forwarding_consumer_into_field(&shared, SmolStr::new("a"), names.clone());
+        *arm.lock_now() = Some(forwarding_consumer_into_field(
+            &shared,
+            SmolStr::new("b"),
+            names,
+        ));
+        input_a.notify(&keys(1, 2));
     }
 
     /// A pull that answers what the last one did but queues a wakeup is not quiescence: the

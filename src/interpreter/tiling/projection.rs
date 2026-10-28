@@ -177,15 +177,11 @@ impl Projection {
         }
     }
 
-    /// What `self` and `other` name together, for a gate recording what it passed: the union,
-    /// except that regions of different kinds keep `other` alone, which is less than their
-    /// union and so only ever passes a later notification that was suppressible.
+    /// What a gate holds after it passed `other` with `self` held: the union, and `Everything`
+    /// where the regions are of different kinds (keys and fields), which have no union of their
+    /// own. The held region always contains `other`, so the gate only grows.
     pub fn passed_with(&self, other: &Projection) -> Projection {
-        match (self, other) {
-            (Projection::Keys(_), Projection::Fields(_))
-            | (Projection::Fields(_), Projection::Keys(_)) => other.clone(),
-            _ => self.union(other),
-        }
+        self.union(other)
     }
 
     /// This region for an operator that keeps its input's keys: a region of fields, which names
@@ -839,20 +835,55 @@ mod containment_tests {
         assert!(!field("a", keys(1, 2)).contained_in(&keys(1, 2)));
     }
 
+    /// The regions the laws are checked over: keys, fields of one record, everything, nothing,
+    /// and so both kinds meet.
+    fn regions() -> Vec<Projection> {
+        vec![
+            Projection::Nothing,
+            Projection::Everything,
+            keys(1, 2),
+            keys(3, 4),
+            keys(1, 4),
+            field("a", keys(1, 2)),
+            field("a", keys(3, 4)),
+            field("b", keys(1, 4)),
+            field("a", Projection::Everything),
+            field("a", keys(1, 2)).union(&field("b", keys(5, 6))),
+        ]
+    }
+
+    /// What a gate holds after a pass contains what passed, whatever it held and whatever kind
+    /// each is: the law that makes a gate only grow.
     #[test]
-    fn what_a_gate_passed_is_the_union_or_the_latest_of_different_kinds() {
+    fn what_a_gate_holds_after_a_pass_contains_what_passed() {
+        for held in regions() {
+            for passed in regions() {
+                let after = held.passed_with(&passed);
+                assert!(
+                    passed.contained_in(&after),
+                    "{passed:?} is not in {after:?}, which a gate holding {held:?} became"
+                );
+                assert!(
+                    held.contained_in(&after),
+                    "{held:?} is not in {after:?}, which a gate holding it became"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn regions_of_different_kinds_widen_to_everything_in_what_a_gate_holds() {
+        assert_eq!(
+            keys(1, 2).passed_with(&field("a", keys(1, 2))),
+            Projection::Everything
+        );
+        assert_eq!(
+            field("a", keys(1, 2)).passed_with(&keys(5, 6)),
+            Projection::Everything
+        );
         assert_eq!(
             keys(1, 2).passed_with(&keys(5, 6)),
             keys(1, 2).union(&keys(5, 6))
-        );
-        assert_eq!(
-            keys(1, 2).passed_with(&field("a", keys(1, 2))),
-            field("a", keys(1, 2))
-        );
-        assert_eq!(field("a", keys(1, 2)).passed_with(&keys(5, 6)), keys(5, 6));
-        assert_eq!(
-            field("a", keys(1, 2)).passed_with(&field("b", keys(1, 2))),
-            field("a", keys(1, 2)).union(&field("b", keys(1, 2)))
         );
     }
 }
