@@ -631,7 +631,7 @@ impl TileOperator for FanOutSlot {
                             .collect::<Vec<_>>()
                     };
                     for c in &consumers {
-                        c.borrow_mut().notify();
+                        c.borrow_mut().notify(&Projection::Everything);
                     }
                 }),
                 scheduler,
@@ -1322,7 +1322,7 @@ mod tests {
             .borrow_mut()
             .as_mut()
             .expect("the memo installed a consumer on its input")
-            .notify();
+            .notify(&Projection::Everything);
     }
 
     impl TileOperator for Scripted {

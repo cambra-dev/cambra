@@ -56,7 +56,7 @@ use std::ops::Bound::{Excluded, Unbounded};
 use crate::ccl::{F_WRITES, Label};
 use crate::interpreter::{
     BaseType, ColumnValue, Consumer, CurryLevel, Extent, FunctionGuard, Gate, GatedConsumer, Path,
-    Position, Predicate, Scheduler, Tile, TileGuard, Tiling, Value, WakeupQueue,
+    Position, Predicate, Projection, Scheduler, Tile, TileGuard, Tiling, Value, WakeupQueue,
     forwarding_consumer, shared_consumer,
     tile_operators::{
         CycleSlot, CyclicSequencingProducer, Memo, ProducerBase, TileOperator, TileProducer,
@@ -1820,7 +1820,7 @@ impl TileOperator for CommitOperator {
         // tap off a live commit store would never be notified and would hang.
         // Kick once immediately to start the drain loop.
         let (consumer, gate) = shared_consumer(consumer);
-        consumer.notify();
+        consumer.notify(&Projection::Everything);
         // A seed forwards, rather than being drained here: it is ordinary dataflow, so a
         // seed computed from a loop settles over as many pulls as that loop takes, and the
         // pull it settles on is the one that opens the store. Draining at subscribe
@@ -2465,7 +2465,7 @@ impl TileOperator for InductionStore {
         // the first pull (a batch/list source is complete on the first pull, so
         // it never needed the wiring — an async source does). Kick once to start.
         let (consumer, gate) = shared_consumer(consumer);
-        consumer.notify();
+        consumer.notify(&Projection::Everything);
         let mut body_op = self.body_input.take().expect(
             "InductionStore: the decision body is unwired at subscribe — either \
                  `body_input_setter` was never called, or this store is being subscribed \
@@ -3072,7 +3072,7 @@ impl TileOperator for StoreValueStream {
         // woken once (the kick) and never again. The store starts at its tick-0
         // value, so kick once to start the drain loop.
         let (consumer, gate) = shared_consumer(consumer);
-        consumer.notify();
+        consumer.notify(&Projection::Everything);
         let store_producer = subscribe_forwarding(&mut *self.store_op, &consumer, scheduler);
         Box::new(StoreValueStreamProducer {
             base: ProducerBase::new(
@@ -3310,7 +3310,7 @@ impl TileOperator for StoreFinalRead {
         // not settled until the store says so, and the consumer has to be woken to
         // re-pull when that happens. Kick once to start the drain loop.
         let (consumer, gate) = shared_consumer(consumer);
-        consumer.notify();
+        consumer.notify(&Projection::Everything);
         let store_producer = subscribe_forwarding(&mut *self.store_op, &consumer, scheduler);
         Box::new(StoreFinalReadProducer {
             base: ProducerBase::new(
@@ -3571,7 +3571,7 @@ impl TileOperator for StoreDenseRead {
         // position to emit and the value to emit there, so it is the only news this
         // read has. Kick once to start.
         let (consumer, gate) = shared_consumer(consumer);
-        consumer.notify();
+        consumer.notify(&Projection::Everything);
         let store_producer = subscribe_forwarding(&mut *self.store_op, &consumer, scheduler);
         Box::new(StoreDenseReadProducer {
             base: ProducerBase::new(

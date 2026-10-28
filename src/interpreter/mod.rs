@@ -45,30 +45,34 @@ use std::rc::Rc;
 // Consumer Protocol
 // ============================================================================
 
-/// Receives a signal to pull a producer again; notifications carry no tile data.
-/// Deferred or coalesced notifications need not correspond one-to-one with changed results.
+/// Receives a signal that a producer's output changed; notifications carry no tile data.
+///
+/// A notification names the region of the producer's outermost keys that changed. A producer
+/// that cannot name it sends [`Projection::Everything`]. Deferred or coalesced notifications
+/// need not correspond one-to-one with changed results, and coalescing unites their regions.
 /// See `src/interpreter/design-operators.md`, "The notification contract".
 pub trait Consumer {
-    /// Notify the consumer that it should pull again.
-    fn notify(&mut self);
+    /// Notify the consumer that the keys `arrived` changed, and that it should pull again if it
+    /// reads this producer.
+    fn notify(&mut self, arrived: &Projection);
 }
 
 /// Blanket implementation: Rc<RefCell<C>> implements Consumer when C does.
 // shared-state-ok: this is what makes a shared *notification* handle a consumer;
 // a wakeup carries no value, so it is not a dataflow edge.
 impl<C: Consumer> Consumer for Rc<RefCell<C>> {
-    fn notify(&mut self) {
-        self.borrow_mut().notify()
+    fn notify(&mut self, arrived: &Projection) {
+        self.borrow_mut().notify(arrived)
     }
 }
 
-/// Blanket implementation: FnMut() implements Consumer.
+/// Blanket implementation: FnMut() implements Consumer, ignoring the region.
 /// This allows closures to be used as consumers.
 impl<F> Consumer for F
 where
     F: FnMut(),
 {
-    fn notify(&mut self) {
+    fn notify(&mut self, _arrived: &Projection) {
         self()
     }
 }

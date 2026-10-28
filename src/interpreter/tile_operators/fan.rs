@@ -189,9 +189,11 @@ impl TileOperator for RecordWrap {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let input =
-            self.input
-                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+        let input = self.input.subscribe(
+            self.input.tiling().universal_guard(),
+            widening(consumer),
+            scheduler,
+        );
         Box::new(RecordWrapProducer {
             base: ProducerBase::new(
                 RecordWrapProducer::alloc_id(),
@@ -938,9 +940,11 @@ impl TileOperator for SelectField {
         // An intent may only widen on its way upstream, so the input is asked for all of
         // it. [`guard_at_field`] narrows, which is sound for a release and not here.
         let input_tiling = self.input.tiling().clone();
-        let input_producer =
-            self.input
-                .subscribe(input_tiling.universal_guard(), consumer, scheduler);
+        let input_producer = self.input.subscribe(
+            input_tiling.universal_guard(),
+            widening(consumer),
+            scheduler,
+        );
         Box::new(SelectFieldProducer {
             base: ProducerBase::new(
                 SelectFieldProducer::alloc_id(),

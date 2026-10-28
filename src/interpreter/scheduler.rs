@@ -5,7 +5,8 @@ use std::{
 };
 
 use crate::interpreter::{
-    Consumer, DataSourceDomainExtentImpl, tile_operators::Notified, value_probe::ProbeSlot,
+    Consumer, DataSourceDomainExtentImpl, Projection, tile_operators::Notified,
+    value_probe::ProbeSlot,
 };
 
 /// A consumer handle shared by notification forwarders and deferred wakeups.
@@ -40,14 +41,30 @@ pub struct GatedConsumer {
               `ProducerBase::sharing`"]
 pub struct Gate(pub(crate) Notified);
 
+/// The consumer a gate guards: forwards a notification to `consumer` when the gate passes it.
+struct Gated {
+    admit: Notified,
+    consumer: Box<dyn Consumer>,
+}
+
+impl Consumer for Gated {
+    fn notify(&mut self, arrived: &Projection) {
+        debug_assert!(
+            *arrived != Projection::Nothing,
+            "no producer notifies of an empty region"
+        );
+        if self.admit.mark_news() {
+            self.consumer.notify(arrived);
+        }
+    }
+}
+
 impl GatedConsumer {
     /// `consumer` behind `gate`, which the operator's producer must clear on every pull.
-    pub fn new(mut consumer: Box<dyn Consumer>, gate: Notified) -> Self {
-        let admit = gate.clone();
-        let shared: SharedConsumer = Rc::new(RefCell::new(move || {
-            if admit.mark_news() {
-                consumer.notify();
-            }
+    pub fn new(consumer: Box<dyn Consumer>, gate: Notified) -> Self {
+        let shared: SharedConsumer = Rc::new(RefCell::new(Gated {
+            admit: gate.clone(),
+            consumer,
         }));
         Self { shared, gate }
     }
@@ -58,8 +75,8 @@ impl GatedConsumer {
     }
 
     /// Notify the operator's consumer now, through the gate.
-    pub fn notify(&self) {
-        self.shared.borrow_mut().notify();
+    pub fn notify(&self, arrived: &Projection) {
+        self.shared.borrow_mut().notify(arrived);
     }
 }
 
@@ -81,10 +98,64 @@ pub fn shared_consumer(consumer: Box<dyn Consumer>) -> (GatedConsumer, Gate) {
 /// `Consumer`, because the blanket impl over `Rc<RefCell<C>>` needs a *sized* `C`,
 /// and `dyn Consumer` is not. Wrapping the wake in a closure gives the blanket
 /// impl something sized to bite on.
+///
+/// The consumer forwards every notification as [`Projection::Everything`]: an input's keys say
+/// nothing of the operator's own unless the operator's outermost keys are its input's, which
+/// [`forwarding_consumer_keeping_keys`] is for.
 pub fn forwarding_consumer(shared: &GatedConsumer, wakeups: &WakeupQueue) -> Box<dyn Consumer> {
-    let GatedConsumer { shared, gate } = shared.clone();
-    let wakeups = wakeups.clone();
-    Box::new(move || {
+    Box::new(Forwarding {
+        gated: shared.clone(),
+        wakeups: wakeups.clone(),
+        keeps_keys: false,
+    })
+}
+
+/// [`forwarding_consumer`] for an input whose outermost keys are the operator's: its region is
+/// forwarded as it is.
+pub fn forwarding_consumer_keeping_keys(
+    shared: &GatedConsumer,
+    wakeups: &WakeupQueue,
+) -> Box<dyn Consumer> {
+    Box::new(Forwarding {
+        gated: shared.clone(),
+        wakeups: wakeups.clone(),
+        keeps_keys: true,
+    })
+}
+
+/// `consumer` behind a consumer that forwards every notification as [`Projection::Everything`].
+///
+/// An operator passes this to its input in place of its own consumer unless its outermost keys
+/// are its input's: the input's region names the input's keys, which say nothing of the
+/// operator's own.
+pub fn widening(consumer: Box<dyn Consumer>) -> Box<dyn Consumer> {
+    Box::new(Widening(consumer))
+}
+
+struct Widening(Box<dyn Consumer>);
+
+impl Consumer for Widening {
+    fn notify(&mut self, _arrived: &Projection) {
+        self.0.notify(&Projection::Everything);
+    }
+}
+
+/// What [`forwarding_consumer`] returns.
+struct Forwarding {
+    gated: GatedConsumer,
+    wakeups: WakeupQueue,
+    keeps_keys: bool,
+}
+
+impl Consumer for Forwarding {
+    fn notify(&mut self, arrived: &Projection) {
+        let GatedConsumer { shared, gate } = &self.gated;
+        let everything = Projection::Everything;
+        let region = if self.keeps_keys {
+            arrived
+        } else {
+            &everything
+        };
         // A notification that re-enters a consumer already being notified is deferred to
         // the next drain of the wakeup queue. A recurrence's notification graph is cyclic,
         // and nesting closes a cycle through *two* inputs of one operator: the inner store
@@ -101,11 +172,11 @@ pub fn forwarding_consumer(shared: &GatedConsumer, wakeups: &WakeupQueue) -> Box
         // says everything this would. Deferring it would deliver it again on the next drain,
         // and around a cycle again on every poll after.
         match shared.try_borrow_mut() {
-            Ok(mut consumer) => consumer.notify(),
+            Ok(mut consumer) => consumer.notify(region),
             Err(_) if gate.is_set() => {}
-            Err(_) => wakeups.request(shared.clone()),
+            Err(_) => self.wakeups.request(shared.clone()),
         }
-    })
+    }
 }
 
 /// Deferred notifications delivered outside the current pull or notification cascade.
@@ -305,19 +376,19 @@ other's subscribers",
     pub fn deliver(&mut self, mut delivery: Delivery) -> bool {
         let mut delivered = false;
         for consumer in std::mem::take(&mut delivery.0) {
-            consumer.borrow_mut().notify();
+            consumer.borrow_mut().notify(&Projection::Everything);
             delivered = true;
         }
         // Take the queue after source delivery, outside its notification cascades.
         // Requests created while this snapshot drains remain queued for the next drain.
         for consumer in self.wakeups.take() {
-            consumer.borrow_mut().notify();
+            consumer.borrow_mut().notify(&Projection::Everything);
             delivered = true;
         }
         // Then pull every sink the wakes above reached, once each, so a change reaches a
         // sink in the call that delivers it.
         for pull in self.sink_pulls.take() {
-            pull.borrow_mut().notify();
+            pull.borrow_mut().notify(&Projection::Everything);
             delivered = true;
         }
         delivered
@@ -468,6 +539,77 @@ fn ignored_inputs(
 mod tests {
     use super::*;
 
+    use crate::interpreter::tile_operators::test_helpers::{RegionLog, keys_between};
+
+    fn keys(first: u64, last: u64) -> Projection {
+        Projection::of(&keys_between(first, last)).expect("keys name a projection")
+    }
+
+    /// A consumer that pulls gets one notification between pulls, and the closed gate delivers
+    /// no region after it.
+    #[test]
+    fn a_closed_gate_passes_one_notification_to_a_consumer_that_pulls() {
+        let (log, regions) = RegionLog::new();
+        let (gated, gate) = shared_consumer(Box::new(log));
+        gated.notify(&keys(0, 3));
+        gated.notify(&keys(10, 12));
+        assert_eq!(*regions.borrow_mut(), [keys(0, 3)]);
+        assert!(gate.0.take());
+        gated.notify(&keys(30, 31));
+        assert_eq!(*regions.borrow_mut(), [keys(0, 3), keys(30, 31)]);
+    }
+
+    /// A forwarder sends `Everything` unless its operator's keys are its input's.
+    #[test]
+    fn a_forwarder_sends_everything_unless_it_keeps_keys() {
+        let (log, regions) = RegionLog::new();
+        let (gated, gate) = shared_consumer(Box::new(log));
+        let wakeups = WakeupQueue::default();
+        forwarding_consumer(&gated, &wakeups).notify(&keys(2, 4));
+        assert!(gate.0.take());
+        forwarding_consumer_keeping_keys(&gated, &wakeups).notify(&keys(2, 4));
+        assert_eq!(*regions.borrow_mut(), [Projection::Everything, keys(2, 4)]);
+    }
+
+    /// A closure consumer takes the notification and ignores its region.
+    #[test]
+    fn a_closure_consumer_ignores_the_region() {
+        let count = Rc::new(RefCell::new(0));
+        let count_c = count.clone();
+        let mut consumer: Box<dyn Consumer> = Box::new(move || *count_c.borrow_mut() += 1);
+        consumer.notify(&keys(2, 4));
+        consumer.notify(&Projection::Everything);
+        assert_eq!(*count.borrow_mut(), 2);
+    }
+
+    /// `widening` sends `Everything` whatever region it is notified of.
+    #[test]
+    fn widening_sends_everything_for_any_region() {
+        let (log, regions) = RegionLog::new();
+        let mut consumer = widening(Box::new(log));
+        consumer.notify(&keys(2, 4));
+        consumer.notify(&Projection::Everything);
+        assert_eq!(
+            *regions.borrow_mut(),
+            [Projection::Everything, Projection::Everything]
+        );
+    }
+
+    /// A forwarder that keeps keys passes each region on as it is, `Everything` included, and
+    /// carries nothing from one notification to the next.
+    #[test]
+    fn a_keeping_forwarder_passes_each_region_unchanged() {
+        let (log, regions) = RegionLog::new();
+        let (gated, gate) = shared_consumer(Box::new(log));
+        let mut input = forwarding_consumer_keeping_keys(&gated, &WakeupQueue::default());
+        let sent = [keys(2, 4), Projection::Everything, keys(6, 7)];
+        for region in &sent {
+            input.notify(region);
+            assert!(gate.0.take());
+        }
+        assert_eq!(*regions.borrow_mut(), sent);
+    }
+
     /// The walk at rest names an operator whose gate is closed while a producer that pulls it
     /// was pulled without pulling it, and only that: not while that producer has not been
     /// pulled, and not once the operator is released whole.
@@ -502,7 +644,7 @@ mod tests {
             input: Box::new(input),
         };
         let before = pull_counts(&consumer);
-        woken.notify();
+        woken.notify(&Projection::Everything);
         assert!(
             ignored_inputs(&consumer, &before).is_empty(),
             "the consumer has not been pulled since"
@@ -542,14 +684,14 @@ mod tests {
             let rest = fb.borrow_mut().take();
             if let Some(mut arm_b) = rest {
                 d.set(d.get() + 1);
-                arm_b.notify();
+                arm_b.notify(&Projection::Everything);
             }
         });
         let shared = GatedConsumer::new(downstream, gate);
         let mut scheduler = Scheduler::new();
         let mut arm_a = forwarding_consumer(&shared, &scheduler.wakeup_queue());
         *feedback.borrow_mut() = Some(forwarding_consumer(&shared, &scheduler.wakeup_queue()));
-        arm_a.notify();
+        arm_a.notify(&Projection::Everything);
         scheduler.check_for_notifications();
         assert_eq!(
             seen.get(),
@@ -569,8 +711,8 @@ mod tests {
         let scheduler = Scheduler::new();
         let mut arm_a = forwarding_consumer(&shared, &scheduler.wakeup_queue());
         let mut arm_b = forwarding_consumer(&shared, &scheduler.wakeup_queue());
-        arm_a.notify();
-        arm_b.notify();
+        arm_a.notify(&Projection::Everything);
+        arm_b.notify(&Projection::Everything);
         assert_eq!(
             notified.get(),
             1,
@@ -578,7 +720,7 @@ mod tests {
         );
         // The operator's pull, as `TileProducer::get` makes it.
         gate.0.take();
-        arm_b.notify();
+        arm_b.notify(&Projection::Everything);
         assert_eq!(
             notified.get(),
             2,
@@ -600,7 +742,7 @@ mod tests {
             // The cycle: arm B's notification re-enters the operator this one is inside.
             let rest = fb.borrow_mut().take();
             if let Some(mut arm_b) = rest {
-                arm_b.notify();
+                arm_b.notify(&Projection::Everything);
             }
         });
         // Nothing pulls the operator here, so its gate is never cleared.
@@ -608,7 +750,7 @@ mod tests {
         let mut scheduler = Scheduler::new();
         let mut arm_a = forwarding_consumer(&shared, &scheduler.wakeup_queue());
         *feedback.borrow_mut() = Some(forwarding_consumer(&shared, &scheduler.wakeup_queue()));
-        arm_a.notify();
+        arm_a.notify(&Projection::Everything);
         assert!(
             scheduler.wakeups.is_empty(),
             "the re-entrant notification was deferred"
@@ -645,7 +787,7 @@ mod tests {
                 }
                 // Nothing until woken: a scalar holding a value is its whole answer, so the
                 // pull before the wakeup answers what the first did by having none.
-                let values = match *self.woken.borrow() {
+                let values = match *self.woken.borrow_mut() {
                     true => vec![2],
                     false => Vec::new(),
                 };
@@ -693,9 +835,9 @@ mod tests {
     fn a_poll_wakes_no_consumer_until_it_is_delivered() {
         let (mut scheduler, count, _consumer) = polled_source();
         let delivery = scheduler.poll_sources();
-        assert_eq!(*count.borrow(), 0, "polling notifies nobody");
+        assert_eq!(*count.borrow_mut(), 0, "polling notifies nobody");
         scheduler.deliver(delivery);
-        assert_eq!(*count.borrow(), 1);
+        assert_eq!(*count.borrow_mut(), 1);
     }
 
     #[test]
@@ -721,14 +863,14 @@ mod tests {
 
         scheduler.wakeup_queue().request(consumer);
         // Deferred: nothing fires until the scheduler is polled.
-        assert_eq!(*count.borrow(), 0);
+        assert_eq!(*count.borrow_mut(), 0);
 
         scheduler.check_for_notifications();
-        assert_eq!(*count.borrow(), 1);
+        assert_eq!(*count.borrow_mut(), 1);
 
         // Drained: a second poll with no new request delivers nothing.
         scheduler.check_for_notifications();
-        assert_eq!(*count.borrow(), 1);
+        assert_eq!(*count.borrow_mut(), 1);
     }
 
     /// A wakeup requested *during* delivery lands in the next drain, not the
@@ -755,10 +897,10 @@ mod tests {
 
         queue.request(a);
         scheduler.check_for_notifications(); // delivers A; A's request for B defers
-        assert_eq!(*log.borrow(), vec!["a"]);
+        assert_eq!(*log.borrow_mut(), vec!["a"]);
         scheduler.check_for_notifications(); // now delivers B
-        assert_eq!(*log.borrow(), vec!["a", "b"]);
+        assert_eq!(*log.borrow_mut(), vec!["a", "b"]);
         scheduler.check_for_notifications(); // nothing left
-        assert_eq!(*log.borrow(), vec!["a", "b"]);
+        assert_eq!(*log.borrow_mut(), vec!["a", "b"]);
     }
 }

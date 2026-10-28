@@ -6169,12 +6169,12 @@ mod variant_ctor_tests {
     use crate::ccl::{
         BaseType as CclBase, BindingTransparency, Lit, Type, TypedExpr, TypedExprNode,
     };
-    use crate::interpreter::UnionArm;
     use crate::interpreter::tile_operators::{
         ProducerBase, Tile, TileProducer, impl_producer_base,
     };
     use crate::interpreter::tiling::{Predicate, TileGuard};
     use crate::interpreter::{ColumnValue, Consumer, Scheduler, Value};
+    use crate::interpreter::{Projection, UnionArm};
     use crate::pretty_graph::VizOptions;
     use crate::pretty_tree::InspectNode;
     use bit_set::BitSet;
@@ -6342,7 +6342,7 @@ mod variant_ctor_tests {
             mut consumer: Box<dyn Consumer>,
             _scheduler: &mut Scheduler,
         ) -> Box<dyn TileProducer> {
-            consumer.notify();
+            consumer.notify(&Projection::Everything);
             Box::new(FixedStreamProducer {
                 base: ProducerBase::unowned(FixedStreamProducer::alloc_id(), &self.tiling),
                 tile: self.tile.clone(),
