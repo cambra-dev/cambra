@@ -107,11 +107,13 @@ they never receive. `MapResult`, `MapResultToConst`, `Zip`, `SelectField` and `C
 use `deleted_keys_guard`; `Memo`, `Aggregate` and `MapAggregate` release the input's
 `to_guard` before compacting.
 
-`deleted_keys_guard` names nested deletions by their complete key paths, preserving an equal
-key under another parent. It returns `None` when no rows are deleted. It panics on a tile that
-has deletions and stands over several enclosing rows: the paths above that tile are unavailable.
-It also panics on deletions inside an aggregate accumulator, for which aggregate guards have no
-representation. These are limits of the guard constructor, not a ban on nested deletions.
+`deleted_keys_guard` and `guard_at_field` are release translations ([Guard
+translation](#guard-translation)). `deleted_keys_guard` names nested deletions by their complete key
+paths, preserving an equal key under another parent. It returns `None` when no rows are deleted. It
+panics on a tile that has deletions and stands over several enclosing rows: the paths above that
+tile are unavailable. It also panics on deletions inside an aggregate accumulator, for which
+aggregate guards have no representation. These are limits of the guard constructor, not a ban on
+nested deletions.
 
 ### TileGuard
 
@@ -450,7 +452,8 @@ specifies forwarding and reentrancy.
 ### Projection guards
 
 A projection guard names the part of a producer's tile that a `get` asks for. The producer
-returns that part and nothing outside it, and states completeness only for that part.
+returns that part and nothing outside it, and states completeness only for that part. It is the
+read translation of [Guard translation](#guard-translation).
 
 A producer restates three shapes (`Projection`): everything, nothing, and `Domain(𝑝)` over the keys
 of the outermost collection. A guard that names a path or steps into a codomain is a release's
@@ -533,6 +536,9 @@ Dropping a producer detaches its probe. The rendered frame is specified by
 [The live model is a separate path](../inspector_model/design.md#the-live-model-is-a-separate-path).
 
 ## The release contract
+
+A release is the for-all translation of [Guard translation](#guard-translation): an input key is
+released when every output that depends on it is.
 
 After `release(𝑅)`, the consumer must not request data in 𝑅 again and the producer must not
 return it. Subsequent pulls remain valid outside the accumulated obsolete region. After a
@@ -625,6 +631,47 @@ be complete. `Zip`, unions and pairing operators therefore intersect their state
 A fully released union arm contributes an empty tile with `True` completeness and imposes
 no further restriction.
 
+## Guard translation
+
+Projection, notification and release are one relation read three ways.
+
+An operator has a dependence relation 𝑅 between its output keys and each input's keys: (𝑘, 𝑖) is in
+𝑅 when output key 𝑘 depends on input key 𝑖. Each translation maps a region of keys across 𝑅, and the
+three differ in direction and quantifier.
+
+| Translation | Direction | Result for a region 𝑆 | Quantifier | Safe approximation |
+| --- | --- | --- | --- | --- |
+| Projection (read) | consumer to producer | the input keys some asked output key depends on: 𝑅⁻¹(𝑆) | exists | A larger region is sound: it reads more. |
+| Notification | producer to consumer | the output keys that depend on a changed input key: 𝑅(𝑆) | exists | A larger region is sound: it wakes more. |
+| Release | consumer to producer | the input keys all of whose dependent outputs are released: {𝑖 \| 𝑅(𝑖) ⊆ 𝑆} | for all | Exact, or smaller. A larger region frees data a reader still needs. |
+
+The release row is the rule of [Guard operations are exact](#guard-operations-are-exact): an
+overstated release discards data, and an understated one only delays reclamation.
+
+`SelectField("a")` over a product `{a, b}` relates output key 𝑘 to input key (a, 𝑘) and relates
+nothing to `b`. For the region [2..3]:
+
+- Read: `a`[2..3].
+- Notify: a change of `a` at [2..3] reaches the consumer as [2..3], and a change of `b` as
+  `Nothing`.
+- Release: `a`[2..3] and `b` whole, since no output depends on `b` and the condition holds
+  vacuously.
+
+A read may exceed the relation. `SelectField` over a product pulls the whole product, because a
+cumulative `Memo` below it would record a partial answer as complete. `Converse`, `Uncurry` and the
+other re-keying operators have a relation that re-keys or depends on the data.
+
+The projection table ([Projection guards](#projection-guards)), the release rules (`guard_at_field`,
+`deleted_keys_guard`) and the keep-or-widen table ([The notification
+contract](#the-notification-contract)) each state a fact about 𝑅. Keeping keys is the identity
+translation, and widening is the top element, `Everything`.
+
+**Not implemented.** The exact translations are missing: the field-select of `SelectField` and the
+rename of `PermuteRecordDomain` widen on notification. A region payload is path-qualified like a
+guard (`TileGuard::Record`) in the intended form, and `Projection`, which names the outermost keys
+only, is the first step toward it. A product widens today because its notification cannot say which
+field changed.
+
 ## The notification contract
 
 An output change discovered during a pull must wake readers that may still hold the previous
@@ -632,7 +679,8 @@ result. That wake is deferred through `WakeupQueue`, not delivered synchronously
 `get`: a feedback path could re-enter a producer while its cell is locked.
 
 A notification carries the region of the notifying producer's outermost keys that changed:
-`Consumer::notify(arrived: &Projection)`. A producer that cannot name the region sends `Everything`, and
+`Consumer::notify(arrived: &Projection)`, the image translation of [Guard
+translation](#guard-translation). A producer that cannot name the region sends `Everything`, and
 none sends `Nothing`. A closure consumer ignores the region. A consumer that pulls on notification
 has no use for it, since its pull reads whatever arrived. A consumer that does not pull acts on the
 region instead: a pipeline's dispatcher takes the work it hands out from it ([The
