@@ -143,6 +143,32 @@ impl Projection {
         }
     }
 
+    /// Whether everything `self` names is inside `other`. Regions of a different kind (keys and
+    /// fields) are not contained in one another, short of `Everything`.
+    pub fn contained_in(&self, other: &Projection) -> bool {
+        match (self, other) {
+            (Projection::Nothing, _) | (_, Projection::Everything) => true,
+            (Projection::Everything, _) | (_, Projection::Nothing) => false,
+            (Projection::Keys(a), Projection::Keys(b)) => a.minus(b).is_false(),
+            (Projection::Fields(a), Projection::Fields(b)) => a
+                .iter()
+                .all(|(name, region)| b.get(name).is_some_and(|held| region.contained_in(held))),
+            (Projection::Keys(_), Projection::Fields(_))
+            | (Projection::Fields(_), Projection::Keys(_)) => false,
+        }
+    }
+
+    /// What `self` and `other` name together, for a gate recording what it passed: the union,
+    /// except that regions of different kinds keep `other` alone, which is less than their
+    /// union and so only ever passes a later notification that was suppressible.
+    pub fn passed_with(&self, other: &Projection) -> Projection {
+        match (self, other) {
+            (Projection::Keys(_), Projection::Fields(_))
+            | (Projection::Fields(_), Projection::Keys(_)) => other.clone(),
+            _ => self.union(other),
+        }
+    }
+
     /// This region for an operator that keeps its input's keys: a region of fields, which names
     /// a change inside a record, becomes [`Everything`](Self::Everything).
     pub fn keys_only(&self) -> Projection {
@@ -723,5 +749,73 @@ mod fields_tests {
         let region = fields(&[("a", keys(1, 2))]);
         let error = tiling.empty_tile().within(&region).expect_err("not within");
         assert!(error.contains("notification's"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod containment_tests {
+    use super::*;
+    use crate::interpreter::Value;
+
+    fn keys(first: u64, last: u64) -> Projection {
+        Projection::admitting(Predicate::intervals(intervalsets::IntervalSet::from(
+            intervalsets::Interval::closed(Value::UInt(first), Value::UInt(last)),
+        )))
+    }
+
+    fn field(name: &str, region: Projection) -> Projection {
+        Projection::fields([(SmolStr::new(name), region)])
+    }
+
+    #[test]
+    fn everything_contains_all_and_nothing_is_in_all() {
+        assert!(keys(1, 2).contained_in(&Projection::Everything));
+        assert!(Projection::Nothing.contained_in(&keys(1, 2)));
+        assert!(!Projection::Everything.contained_in(&keys(1, 2)));
+        assert!(!keys(1, 2).contained_in(&Projection::Nothing));
+    }
+
+    #[test]
+    fn keys_are_contained_when_their_difference_is_empty() {
+        assert!(keys(2, 3).contained_in(&keys(1, 4)));
+        assert!(!keys(3, 6).contained_in(&keys(1, 4)));
+    }
+
+    #[test]
+    fn fields_are_contained_field_by_field_and_a_missing_field_holds_nothing() {
+        let held = Projection::fields([
+            (SmolStr::new("a"), keys(1, 4)),
+            (SmolStr::new("b"), Projection::Everything),
+        ]);
+        assert!(field("a", keys(2, 3)).contained_in(&held));
+        assert!(field("b", keys(0, 9)).contained_in(&held));
+        assert!(!field("c", keys(2, 3)).contained_in(&held));
+        assert!(!field("a", keys(2, 9)).contained_in(&held));
+    }
+
+    #[test]
+    fn keys_and_fields_are_in_each_other_only_through_everything() {
+        assert!(!keys(1, 2).contained_in(&field("a", keys(1, 2))));
+        assert!(!field("a", keys(1, 2)).contained_in(&keys(1, 2)));
+    }
+
+    #[test]
+    fn what_a_gate_passed_is_the_union_or_the_latest_of_different_kinds() {
+        assert_eq!(
+            keys(1, 2).passed_with(&keys(5, 6)),
+            keys(1, 2).union(&keys(5, 6))
+        );
+        assert_eq!(
+            keys(1, 2).passed_with(&field("a", keys(1, 2))),
+            field("a", keys(1, 2))
+        );
+        assert_eq!(field("a", keys(1, 2)).passed_with(&keys(5, 6)), keys(5, 6));
+        assert_eq!(
+            field("a", keys(1, 2)).passed_with(&field("b", keys(1, 2))),
+            Projection::fields([
+                (SmolStr::new("a"), keys(1, 2)),
+                (SmolStr::new("b"), keys(1, 2))
+            ])
+        );
     }
 }

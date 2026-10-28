@@ -64,7 +64,7 @@ impl Consumer for Gated {
             !self.region_driven || matches!(self.admit, Notified::Always),
             "a region-driven consumer has no gate, or a closed one would hold its regions back"
         );
-        if self.admit.mark_news() {
+        if self.admit.mark_news_of(arrived) {
             self.consumer.notify(arrived);
         }
     }
@@ -745,6 +745,7 @@ mod tests {
     use super::*;
 
     use crate::interpreter::tile_operators::test_helpers::{RegionLog, keys_between};
+    use smol_str::SmolStr;
 
     fn keys(first: u64, last: u64) -> Projection {
         Projection::of(&keys_between(first, last)).expect("keys name a projection")
@@ -757,11 +758,22 @@ mod tests {
         let (log, regions) = RegionLog::new(false);
         let (gated, gate) = shared_consumer(Box::new(log));
         gated.notify(&keys(0, 3));
-        gated.notify(&keys(10, 12));
+        gated.notify(&keys(1, 2));
         assert_eq!(*regions.lock_now(), [keys(0, 3)]);
         assert!(gate.0.take());
         gated.notify(&keys(30, 31));
         assert_eq!(*regions.lock_now(), [keys(0, 3), keys(30, 31)]);
+    }
+
+    /// A region outside what the gate passed passes at once, and one inside it waits for a pull.
+    #[test]
+    fn a_gated_consumer_passes_a_region_outside_what_passed() {
+        let (log, regions) = RegionLog::new(false);
+        let (gated, _gate) = shared_consumer(Box::new(log));
+        gated.notify(&keys(0, 3));
+        gated.notify(&keys(10, 12));
+        gated.notify(&keys(11, 11));
+        assert_eq!(*regions.lock_now(), [keys(0, 3), keys(10, 12)]);
     }
 
     /// A consumer that never pulls has no gate to reopen, so every notification reaches it, whole
@@ -814,7 +826,7 @@ mod tests {
     }
 
     fn fields_of(region: Projection) -> Projection {
-        Projection::fields([(smol_str::SmolStr::new("a"), region)])
+        Projection::fields([(SmolStr::new("a"), region)])
     }
 
     /// A region of fields becomes everything where an operator keeps its input's keys, and any
@@ -854,6 +866,102 @@ mod tests {
         assert!(gate.0.take());
         forwarding_consumer_keeping_keys(&gated, &wakeups).notify(&keys(2, 4));
         assert_eq!(*regions.lock_now(), [Projection::Everything, keys(2, 4)]);
+    }
+
+    /// How many of `regions` a fresh gate passes with no pull between them.
+    fn passes(regions: &[Projection]) -> usize {
+        let gate = Notified::clear();
+        regions
+            .iter()
+            .filter(|region| gate.mark_news_of(region))
+            .count()
+    }
+
+    /// With every region `Everything` a gate is the flag it was: the first passes and the rest
+    /// wait for a pull. `a_shared_consumer_passes_one_notification_per_pull`,
+    /// `a_reentrant_wake_with_no_pull_since_is_dropped` and
+    /// `a_reentrant_wake_after_a_pull_in_the_cascade_is_not_lost` run the recurrence's cyclic
+    /// graph through it.
+    #[test]
+    fn a_gate_passes_the_first_everything_and_holds_the_rest_until_a_pull() {
+        let gate = Notified::clear();
+        let passed: Vec<bool> = (0..4)
+            .map(|_| gate.mark_news_of(&Projection::Everything))
+            .collect();
+        assert_eq!(passed, [true, false, false, false]);
+        assert!(gate.take());
+        assert!(gate.mark_news_of(&Projection::Everything));
+    }
+
+    #[test]
+    fn disjoint_regions_both_pass() {
+        assert_eq!(passes(&[keys(1, 2), keys(5, 6)]), 2);
+    }
+
+    /// The gate holds the union of what passed, so a region inside any of it is suppressed.
+    #[test]
+    fn a_region_inside_the_union_of_what_passed_is_suppressed() {
+        assert_eq!(passes(&[keys(1, 2), keys(5, 6), keys(1, 2), keys(5, 6)]), 2);
+    }
+
+    #[test]
+    fn a_region_inside_what_passed_is_suppressed() {
+        assert_eq!(passes(&[keys(1, 6), keys(2, 3), keys(1, 6)]), 1);
+    }
+
+    #[test]
+    fn a_region_that_overlaps_what_passed_without_being_inside_it_passes() {
+        assert_eq!(passes(&[keys(1, 4), keys(3, 6)]), 2);
+    }
+
+    #[test]
+    fn a_pull_resets_what_the_gate_held() {
+        let gate = Notified::clear();
+        assert!(gate.mark_news_of(&keys(1, 4)));
+        assert!(!gate.mark_news_of(&keys(2, 3)));
+        assert!(gate.take());
+        assert!(gate.mark_news_of(&keys(2, 3)));
+        assert!(gate.take());
+        assert!(!gate.take());
+    }
+
+    #[test]
+    fn everything_after_keys_passes_and_keys_after_everything_are_suppressed() {
+        assert_eq!(passes(&[keys(1, 2), Projection::Everything]), 2);
+        assert_eq!(passes(&[Projection::Everything, keys(1, 2)]), 1);
+        assert_eq!(passes(&[keys(1, 2), Projection::Everything, keys(5, 6)]), 2);
+    }
+
+    #[test]
+    fn fields_follow_the_same_containment_rule() {
+        let fields =
+            |name: &str, region: Projection| Projection::fields([(SmolStr::new(name), region)]);
+        assert_eq!(
+            passes(&[fields("a", keys(1, 4)), fields("b", keys(1, 4))]),
+            2
+        );
+        assert_eq!(
+            passes(&[fields("a", keys(1, 4)), fields("a", keys(2, 3))]),
+            1
+        );
+        assert_eq!(
+            passes(&[fields("a", keys(1, 2)), fields("a", keys(5, 6))]),
+            2
+        );
+        assert_eq!(
+            passes(&[fields("a", Projection::Everything), fields("a", keys(1, 2))]),
+            1
+        );
+    }
+
+    /// A region of fields and a region of keys name different things: neither is inside the
+    /// other, so the later passes, and the gate holds only the later one.
+    #[test]
+    fn keys_and_fields_are_not_inside_one_another() {
+        let fields = Projection::fields([(SmolStr::new("a"), keys(1, 4))]);
+        assert_eq!(passes(&[keys(1, 4), fields.clone()]), 2);
+        assert_eq!(passes(&[fields.clone(), keys(1, 4)]), 2);
+        assert_eq!(passes(&[keys(1, 4), fields.clone(), keys(1, 4)]), 3);
     }
 
     /// A forwarder that keeps keys passes each region on as it is, `Everything` included, and

@@ -731,16 +731,22 @@ The rows for a function operand or constant that every row reads whole (the func
 function-valued `Filter` predicate) describe the serial scheduler. A pooled chain cuts them at a
 boundary consumer ([Build sides](../../docs/parallel-execution.md#build-sides)).
 
-`GatedConsumer` forwards at most one notification between pulls to a consumer that pulls.
-`shared_consumer` constructs it with `Notified::clear()`, so the first notification passes,
-including one sent during `subscribe`. Forwarding sets the flag; `ProducerBase::sharing` holds the
-`Gate` token that clears it before each pull. A notification behind a closed gate is not delivered,
-and the consumer's next pull reads the change. `Notified::flag()` instead starts set to permit an
-initial input read. A
-`Notified::Flag` is set by notification and cleared by `take()`. `FanOutShared::forwarded` tracks
-forwarding to fan-out slots. Clearing does not depend on whether the pull reads the notifying input.
-Without this suppression, a change can reach a sink once per path through the graph, and cyclic
-notification paths can continue indefinitely.
+`GatedConsumer` suppresses a notification to a consumer that pulls when its region is inside the
+union of the regions it passed since its operator's producer was last pulled. `shared_consumer`
+constructs it with `Notified::clear()`, so the first notification passes, including one sent during
+`subscribe`. Passing records the region in the gate; `ProducerBase::sharing` holds the `Gate` token
+that clears the gate before each pull, the held region with it. With every region `Everything` the
+first notification passes and the rest wait for a pull, which is what a flag does. A notification
+behind a closed gate is not delivered, and the consumer's next pull reads the change. The held
+region records what the gate passed, not what its consumer delivered: a consumer behind the gate may
+drop a region it has no use for, as `SelectField` drops a region of another field of a product, and
+the gate then suppresses only a later notification inside that region, which the consumer would drop
+too. A region outside it passes, so a notification the consumer needs is not lost behind one it
+dropped. `Notified::flag()` instead starts set to permit an initial input read. A `Notified::Flag` is set by
+notification and cleared by `take()`. `FanOutShared::forwarded` is a gate that tracks forwarding to
+fan-out slots. Clearing does not depend on whether the pull reads the notifying input. Without this
+suppression, a change can reach a sink once per path through the graph, and cyclic notification
+paths can continue indefinitely.
 
 A consumer that never pulls (`Consumer::region_driven`) has no gate. No pull is owed to its
 notifications, so a gate it sat behind would pass one notification and hold the rest until a pull

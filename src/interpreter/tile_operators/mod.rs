@@ -391,6 +391,13 @@ pub(crate) use impl_operator_base;
 /// `FanOut` slot. See `src/interpreter/design-operators.md`, "The notification contract".
 /// [`Self::clear`] starts clear, so the first notification passes, including during `subscribe`.
 /// [`ProducerBase::sharing`] clears it on every pull, even without reading the input.
+///
+/// A gate ([`Self::clear`]) also holds the region the notifications it passed named, so that a
+/// notification is news unless its region is inside that union: with every region `Everything`
+/// the first passes and the rest wait for a pull, as a flag does. The held region records what
+/// was passed, not what was delivered. A downstream consumer may drop a region it has no use
+/// for, and the gate then holds a region nobody acted on; that suppresses only a later
+/// notification inside it, which that consumer would drop as well, and a pull resets it.
 #[derive(Clone)]
 pub enum Notified {
     /// The input's notification does not reach this producer, so every pull reads —
@@ -401,6 +408,22 @@ pub enum Notified {
     /// Set when the input notifies, cleared by a pull.
     // shared-state-ok: see the type doc.
     Flag(Arc<AtomicBool>),
+    /// A gate: a flag, and the region the notifications passed since the last pull named.
+    // shared-state-ok: see the type doc.
+    Gate(Arc<GateState>),
+}
+
+/// What a [`Notified::Gate`] holds.
+pub struct GateState {
+    /// Whether a notification has passed since the last pull.
+    set: AtomicBool,
+    /// Whether that region is `Everything`, which every region is inside: the lock-free answer
+    /// for the notifications that name nothing narrower.
+    everything: AtomicBool,
+    /// The union of the regions passed since the last pull. A region has no atomic form: it is
+    /// an interval set or a map by field, and only this gate's notifications and pulls touch it.
+    // shared-state-ok: see the type doc.
+    passed: Mutex<Projection>,
 }
 
 impl Notified {
@@ -409,18 +432,46 @@ impl Notified {
         Self::Flag(Arc::new(AtomicBool::new(true)))
     }
 
-    /// A live [`Flag`](Self::Flag), starting clear: the gate on an operator's shared consumer,
+    /// A live [`Gate`](Self::Gate), starting clear: the gate on an operator's shared consumer,
     /// or on a fan-out's branches, which has passed nothing on yet.
     pub fn clear() -> Self {
-        Self::Flag(Arc::new(AtomicBool::new(false)))
+        Self::Gate(Arc::new(GateState {
+            set: AtomicBool::new(false),
+            everything: AtomicBool::new(false),
+            passed: Mutex::new(Projection::Nothing),
+        }))
     }
 
     /// Record that the input has new data, and say whether that is news: the flag was clear.
     /// `Always` is always news.
     pub fn mark_news(&self) -> bool {
+        self.mark_news_of(&Projection::Everything)
+    }
+
+    /// Record that the input has new data in `region`, and say whether that is news: for a
+    /// gate, whether `region` is not inside what the notifications passed since the last pull
+    /// named. `Always` is always news.
+    pub fn mark_news_of(&self, region: &Projection) -> bool {
         match self {
             Self::Always => true,
             Self::Flag(c) => !c.swap(true, Ordering::AcqRel),
+            Self::Gate(gate) => {
+                if gate.everything.load(Ordering::Acquire) {
+                    return false;
+                }
+                let mut passed = gate
+                    .passed
+                    .lock()
+                    .expect("a gate's region is never poisoned");
+                if gate.set.load(Ordering::Acquire) && region.contained_in(&passed) {
+                    return false;
+                }
+                *passed = passed.passed_with(region);
+                gate.everything
+                    .store(*passed == Projection::Everything, Ordering::Release);
+                gate.set.store(true, Ordering::Release);
+                true
+            }
         }
     }
 
@@ -429,21 +480,38 @@ impl Notified {
         match self {
             Self::Always => true,
             Self::Flag(c) => c.load(Ordering::Acquire),
+            Self::Gate(gate) => gate.set.load(Ordering::Acquire),
         }
     }
 
     /// Record that the input has new data.
     pub fn mark(&self) {
-        if let Self::Flag(c) = self {
-            c.store(true, Ordering::Release);
+        match self {
+            Self::Always => {}
+            Self::Flag(c) => c.store(true, Ordering::Release),
+            Self::Gate(_) => {
+                self.mark_news();
+            }
         }
     }
 
-    /// Read and clear. `Always` reads set and stays set.
+    /// Read and clear. `Always` reads set and stays set. A gate also forgets the region it held.
     pub fn take(&self) -> bool {
         match self {
             Self::Always => true,
             Self::Flag(c) => c.swap(false, Ordering::AcqRel),
+            Self::Gate(gate) => {
+                let was_set = gate.set.swap(false, Ordering::AcqRel);
+                if was_set {
+                    let mut passed = gate
+                        .passed
+                        .lock()
+                        .expect("a gate's region is never poisoned");
+                    *passed = Projection::Nothing;
+                    gate.everything.store(false, Ordering::Release);
+                }
+                was_set
+            }
         }
     }
 

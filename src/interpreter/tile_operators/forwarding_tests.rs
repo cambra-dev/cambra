@@ -761,16 +761,27 @@ fn a_fan_out_forwards_a_region_to_every_live_slot_unchanged() {
     }
 }
 
-/// One notification passes between pulls; a pull reopens it, and the region of the next one is
-/// delivered.
+/// A notification inside what already passed waits for a pull, which reopens the fan-out, and the
+/// region of the next one is delivered.
 #[test]
-fn a_fan_out_suppresses_a_second_notification_until_a_pull_reopens_it() {
+fn a_fan_out_suppresses_a_notification_inside_what_passed_until_a_pull_reopens_it() {
     fan_out_with_two_slots!(logs, producers, consumer);
+    let inside = Projection::of(&keys_between(3, 3)).expect("keys");
     notify_input(&consumer, &region());
-    notify_input(&consumer, &another_region());
+    notify_input(&consumer, &inside);
     assert_eq!(*logs[0].lock_now(), [region()]);
     let guard = producers[0].tiling().universal_guard();
     producers[0].get(guard);
+    notify_input(&consumer, &inside);
+    assert_eq!(*logs[0].lock_now(), [region(), inside]);
+}
+
+/// A region outside what passed passes at once, which is what keeps a change to another part of
+/// the input from waiting behind one nobody pulled for.
+#[test]
+fn a_fan_out_passes_a_region_outside_what_passed() {
+    fan_out_with_two_slots!(logs, _producers, consumer);
+    notify_input(&consumer, &region());
     notify_input(&consumer, &another_region());
     assert_eq!(*logs[0].lock_now(), [region(), another_region()]);
 }

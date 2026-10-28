@@ -205,7 +205,7 @@ impl Consumer for FanOutInput {
         };
         let consumers = {
             let shared = shared_rc.lock_now();
-            if !shared.forwarded.mark_news() {
+            if !shared.forwarded.mark_news_of(arrived) {
                 return;
             }
             shared
