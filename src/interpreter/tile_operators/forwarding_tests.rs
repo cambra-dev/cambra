@@ -357,6 +357,27 @@ fn variant_is_over_a_bare_union_sends_everything() {
     assert_widens(&|| variant_is(Tiling::Scalar(union_extent())), 0);
 }
 
+fn uncurry(level: CurryLevel) -> Built {
+    let (input, consumer) = feed(match level == CurryLevel::OUTERMOST {
+        true => nested(),
+        false => Tiling::data_function(Extent::uint_range(8), nested()),
+    });
+    (Box::new(Uncurry::new_at(input, level)), vec![consumer])
+}
+
+#[test]
+fn uncurry_beneath_a_standing_level_forwards_the_region() {
+    let beneath = || uncurry(CurryLevel::new(1));
+    assert_keeps(&beneath, 0);
+    assert_keeps_without_state(&beneath, 0);
+}
+
+/// Pairing the whole tile re-keys it.
+#[test]
+fn uncurry_at_the_outermost_level_sends_everything() {
+    assert_widens(&|| uncurry(CurryLevel::OUTERMOST), 0);
+}
+
 fn make_record() -> Built {
     let (a, first) = feed(ints());
     let (b, second) = feed(ints());
