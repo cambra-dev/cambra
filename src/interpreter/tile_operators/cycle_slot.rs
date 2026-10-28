@@ -3,19 +3,15 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-/// An operator input filled once construction is done, so a cycle can be built.
+/// Shared construction-time slot for one late-wired operator input.
 ///
-/// A cyclic graph cannot be assembled bottom-up: the store must exist before the
-/// `FanOut` that wraps it, which must exist before the drive that reads it, which
-/// must exist before the body — and the body is the store's own input. One edge
-/// has to be wired last. `CycleSlot` is that edge.
+/// Construction fills the slot after the input's owner exists. Graph inspection borrows the
+/// operator, and subscription takes it. Clones refer to the same cell, not independent slots.
 ///
-/// **It holds an operator, never a value**, which is what separates it from a back
-/// channel: the graph stays static and complete, and data still crosses it at `get`
-/// time as a tile (see `src/interpreter/CLAUDE.md`, "Core invariant: data flows
-/// between operators as Tiles, nothing else"). Reach for this rather than a
-/// hand-rolled `Rc<RefCell<…>>` — it is the shape `./ci.sh shared_state` recognises
-/// as legitimate, so a hand-rolled one has to justify itself instead.
+/// The slot carries operators, not values exchanged during evaluation. Tile communication follows
+/// `src/interpreter/CLAUDE.md`, "Core invariant: data flows between operators as Tiles, nothing
+/// else".
+/// `./ci.sh shared_state` recognizes this construction-time cell.
 pub struct CycleSlot<T: ?Sized>(
     // shared-state-ok: the single definition of the late-wiring cell. It holds an
     // operator, wired once, not values passed between operators.
@@ -27,10 +23,9 @@ impl<T: ?Sized> CycleSlot<T> {
         Self(Rc::new(RefCell::new(None)))
     }
 
-    /// A one-shot filler for this slot, detached from the operator that owns it
-    /// so the caller can build the rest of the cycle first. `FnOnce` because a
-    /// slot is wired exactly once: a second fill would silently replace a live
-    /// input.
+    /// Return a filler that can outlive the slot's construction scope. Each returned closure
+    /// can be called once. The caller must fill the shared slot only once across all setters;
+    /// a debug assertion rejects replacing an occupied slot.
     pub(crate) fn setter(&self) -> impl FnOnce(Box<T>) + use<T> {
         let slot = self.0.clone();
         move |op: Box<T>| {
@@ -44,8 +39,8 @@ impl<T: ?Sized> CycleSlot<T> {
 
     /// Run `f` on the wired operator, if the slot has been filled.
     ///
-    /// How the graph walk reads a late-wired edge. It runs before `subscribe`,
-    /// which is the only other reader and which empties the slot.
+    /// The borrow lasts for the callback. Graph inspection calls this before subscription
+    /// takes the input; after a take, the callback is not invoked unless the slot is refilled.
     pub(crate) fn peek(&self, f: &mut dyn FnMut(&T)) {
         if let Some(op) = self.0.borrow().as_deref() {
             f(op);
@@ -54,11 +49,8 @@ impl<T: ?Sized> CycleSlot<T> {
 
     /// Take the wired operator, leaving the slot empty.
     ///
-    /// `None` means the slot holds nothing *now*, which covers two construction
-    /// bugs the caller should name in its own panic: the cycle was never closed
-    /// (`setter` was not called), or it is being subscribed a second time (the
-    /// first `take` emptied it). A slot holds an operator, and an operator is
-    /// subscribed once.
+    /// `None` means either the slot was never filled or its input was already taken.
+    /// The subscribing caller is responsible for rejecting either case when an input is required.
     pub fn take(&self) -> Option<Box<T>> {
         self.0.borrow_mut().take()
     }

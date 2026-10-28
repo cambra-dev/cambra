@@ -661,61 +661,69 @@ during compilation; producers are created on demand at runtime.
 
 ### Operator identity and the graph the inspector reads
 
-Every operator carries an `OperatorBase`, holding a `NodeId` minted at construction and the output
-tiling. The id is drawn from the same counter as an expression node's, which is what lets a
-provenance row resolve an operator against the expression it came from
-(`src/ccl/design/provenance.md`, "Operator conversion").
+Production operators carry an `OperatorBase` with a construction-time `NodeId` and output tiling.
+Operator and expression ids use the same counter; provenance attribution is specified in
+[Operator conversion](../ccl/design/provenance.md#operator-conversion).
 
-`OperatorGraph` is the static graph of one compiled program, and it is the content of the
-`post-conversion` pane. It is built by walking the operators from the program's outputs, not
-recorded while they are constructed. The walk runs in `compile_program` between conversion and the
-subscribe loop, which is the only window where it is total: `subscribe` takes every `CycleSlot` and
-every store's keyed inputs, so an operator asked for its inputs afterwards answers without them.
+`OperatorGraph` supplies the inspector's `post-conversion` pane. `BoundarySession::into_graph`
+walks from program outputs through `TileOperator::visit_inputs`, emitting each identified operator
+once in depth-first postorder. A visited-id set terminates shared paths and cycles. Operators
+without ids, including test doubles, are neither emitted nor traversed. Conversion records sink
+identities with `record_sink`; the walk adds each recorded sink and its output edge.
 
-`TileOperator::visit_inputs` is the single statement of what an operator holds, and it has two
-readers: the graph walk, and `TileOperator::inspect`, which renders an operator's children from the
-same answer rather than from a second hand-written list. An input stated nowhere is an edge the pane
-does not have, and — when it is the only path to a subtree — a subtree the pane loses, so the method
-is required rather than defaulted. It is a visitor rather than a returned list because two inputs
-sit behind a `RefCell`: a fan slot's input and a `CycleSlot`'s contents both borrow for the extent
-of the call. What an operator adds beyond its inputs — a constant's value, a variant arm's tag —
-is `inspect_annotation`, so the two questions stay apart.
+`compile_program` walks newly constructed operators before subscribing them. Subscription takes
+`CycleSlot` contents and store inputs, so a later walk cannot recover those edges. Reused operators
+that were already subscribed expose only the inputs they still hold. The implementation is in
+`operator_graph.rs`.
 
-`inspect` follows `Value` edges only. A `Share` edge would draw the shared subtree once per slot,
-and restricting to `Value` is also what makes the recursion terminate without a cycle guard, since
-those edges are acyclic.
+`visit_inputs` is required on every operator. The graph walk and the default `TileOperator::inspect`
+implementation both read it; an omitted input can remove an edge or subtree from both. Its callback
+borrows each target only for the call, permitting inputs held behind `RefCell`, including fan inputs
+and `CycleSlot` contents. `inspect_annotation` supplies non-input metadata such as a constant's
+value or variant tag.
 
-An edge is a **subscription**: the consumer holds the operator the edge names and calls `get` on it.
-`notify` runs the other way along the same edges. Three properties ride each edge:
+Edges are stored on consumers and point to their inputs, opposite the direction of dataflow and
+notifications. They describe held operator inputs, not necessarily distinct runtime subscriptions:
+a fan slot can retain an edge after a sibling has subscribed the shared input. In dataflow terms,
+an inputless operator has in-degree zero and a sink has out-degree zero.
 
-- **Kind.** `Value` for an exclusively owned `Box`, `Share` for a node several consumers may reach:
-  a fan slot's edge to its fan input. The value edges form a forest, which is what lets a renderer
-  follow them with no cycle guard.
-- **`deferred`.** Set on a `Value` edge wired through a `CycleSlot` after its consumer was built.
-  This is a property of the field rather than of the run: a slot is the only way an operator
-  receives an input its constructor did not give it, so every slot-held input is deferred and no
-  other input is. Removing the deferred edges makes every graph acyclic, which is what a layout
-  cuts.
-- **Role.** A field name, a position in a `Vec`, or a store key. The three stay distinct on the
-  wire, because a field named `0` and the first element of a `Vec` render alike.
+| Edge property | Meaning |
+|---|---|
+| `Value` | Exclusively owned input, held in a `Box`. These edges form an ownership forest. |
+| `Share` | A fan slot's reference to its fan input. Several slots may name the same input. |
+| `Value { deferred: true }` | Input wired through a `CycleSlot` after its consumer was constructed. Ownership remains exclusive. |
+| Role | Named field, vector position, or store key. These remain distinct even when their display labels match. |
 
-**What the walk cannot produce.** A sink is a graph node and not an operator, so it has no identity
-a walk could read off an operator. Conversion records sink identity alone (`record_sink`), and
-everything else about the graph comes from the walk: every operator, and every edge including the
-edge into a sink.
+`OperatorGraph::walk_starts` derives the ownership roots: recorded nodes targeted by no `Value`
+edge. Sinks and shared fan inputs qualify. In debug and test builds, `assert_graph_invariants`
+checks that every edge targets a recorded node, each node has at most one incoming `Value` edge,
+and every node is reachable from these roots through `Value` edges. Exclusive ownership and
+root reachability exclude value-edge cycles. The checks do not detect operators absent from the
+recorded graph.
 
-**A data source is not a node.** Two operators read a source: an `IterateExtent` over its domain,
-which the scheduler wakes when the source produces, and a `MapResultWithSource`, which looks up
-values at the keys its `input` carries. That input descends from an `IterateExtent` over the same
-source, because inference admits no literal of a `source(name)` type and iteration is the only
-origin of such a key. The `IterateExtent` holds no input and its tiling names the source, so it is
-where a path from the source starts. Neither operator states an edge for its read of the source.
-`tests/it/inspector_goldens.rs` pins the descent (`a_source_read_descends_from_an_iteration_of_that_source`).
+The default `TileOperator::inspect` recursively follows only `Value` edges. It omits shared inputs
+and needs no cycle guard under the forest invariant. `FanOutSlot` overrides this method: its primary
+slot descends into the shared input, and other slots render as reference leaves.
+Deferred edges identify late wiring; removing them breaks cycles in the complete graph for layout.
+This is separate from the value-edge forest:
+`Share` denotes shared ownership whether or not that edge participates in a cycle.
 
-**Serialization.** `src/inspector_model/design.md`, "A node on the wire" owns the payload shape. An
-operator node ships its label, its tiling, and its `inputs`; a boundary node ships no tiling,
-because only an operator has one. Where a walk of the pane begins is derived on both sides of the
-wire from the edges rather than shipped, so no second channel can disagree with them.
+`CycleSlot` holds an operator during construction, not runtime values. Its clones share one cell.
+The caller fills it once, the graph walk borrows it through `peek`, and subscription consumes it
+through `take`. An empty `take` cannot distinguish a never-filled slot from an already-taken one;
+the subscribing caller must reject either case when it requires an input. Each setter closure is
+`FnOnce`, but separate setters can be obtained; a debug assertion rejects filling an occupied cell.
+
+A data source is not a graph node. `IterateExtent` enumerates its domain and registers scheduler
+wake-ups; `MapResultWithSource` reads values at supplied keys. A source lookup descends from an
+iteration of that source, since inference admits no literal source-domain key. The invariant is
+pinned by `a_source_read_descends_from_an_iteration_of_that_source` in
+`tests/it/inspector_goldens.rs`. Neither operator adds an edge to the source itself.
+`source_nodes` derives source-to-iteration ids from the current graph's iteration-domain tilings.
+
+[A node on the wire](../inspector_model/design.md#a-node-on-the-wire) owns serialization. Operator
+nodes include a label, tiling, and input edges; boundary nodes have no tiling. Walk roots are
+derived from the edges on both sides of the wire rather than serialized separately.
 
 | Operator | Input Tiling(s) | Output Tiling | Description |
 |---|---|---|---|
