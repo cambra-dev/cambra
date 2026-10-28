@@ -357,10 +357,10 @@ pub(crate) fn bool_stream(entries: &[(u64, bool)], complete: Predicate) -> Tile 
 }
 
 /// A deterministic generator: xorshift64, so a failing script reruns from its seed.
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 
 impl Rng {
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
@@ -380,7 +380,7 @@ pub(crate) enum Growth {
 }
 
 /// A generated stream: the keys it holds, and whether it is complete.
-struct Stream {
+pub(crate) struct Stream {
     values: Values,
     /// Keys are drawn from the positions `0..12` that are `residue` modulo `modulus`, so that
     /// the arms of a flat union hold disjoint keys. `None` draws from all of them.
@@ -390,7 +390,7 @@ struct Stream {
 }
 
 impl Stream {
-    fn new(values: Values, key_class: Option<(u64, u64)>) -> Self {
+    pub(crate) fn new(values: Values, key_class: Option<(u64, u64)>) -> Self {
         Self {
             values,
             key_class,
@@ -399,7 +399,7 @@ impl Stream {
         }
     }
 
-    fn tile(&self) -> Tile {
+    pub(crate) fn tile(&self) -> Tile {
         match self.values {
             Values::Ints => int_stream(&self.present, self.complete.clone()),
             Values::Positions => {
@@ -428,7 +428,7 @@ impl Stream {
     /// The stream after one step of `growth`, and the region the step notifies: the keys it
     /// added, everything where it only widened completeness, and nothing where it changed
     /// nothing.
-    fn advance(&mut self, rng: &mut Rng, growth: Growth) -> Projection {
+    pub(crate) fn advance(&mut self, rng: &mut Rng, growth: Growth) -> Projection {
         let action = match growth {
             Growth::OneAtATime => 1,
             Growth::Bursts => 1 + rng.next() % 4,

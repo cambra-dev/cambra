@@ -6,8 +6,8 @@
 use smol_str::SmolStr;
 
 use super::notification_sound::{
-    Expect, Growth, Step, Values, assert_notification_sound, grow, grow_many, int_stream,
-    int_stream_tiling, keys_region, positions_stream,
+    Expect, Growth, Step, Values, assert_notification_sound, assert_release_sound, grow, grow_many,
+    int_stream, int_stream_tiling, keys_region, positions_stream,
 };
 use super::*;
 use crate::interpreter::{BaseType, CurryLevel, Extent, Predicate, Projection, Tiling};
@@ -244,4 +244,127 @@ fn map_result_notifies_everything_for_a_function_key_that_answers_rows_already_r
     );
     // Soundness alone catches a function operand that keeps its keys.
     assert_notification_sound(&map_result, &feeds, &steps, &[Expect::Sound, Expect::Sound]);
+}
+
+/// A stream of records `{a: Int}`: the integer stream with each value wrapped in a record.
+fn as_records(tile: Tile) -> Tile {
+    let Tile::DataFunction {
+        row_starts,
+        domain,
+        codomain,
+        domain_predicate,
+        deleted,
+    } = tile
+    else {
+        panic!("a collection, got {tile:?}");
+    };
+    Tile::DataFunction {
+        row_starts,
+        domain,
+        codomain: Box::new(Tile::record(
+            [(SmolStr::new("a"), *codomain)].into_iter().collect(),
+        )),
+        domain_predicate,
+        deleted,
+    }
+}
+
+fn records_tiling() -> Tiling {
+    Tiling::data_function(
+        Extent::uint_range(16),
+        Tiling::Record(
+            [(
+                SmolStr::new("a"),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            )]
+            .into_iter()
+            .collect(),
+        ),
+    )
+}
+
+fn select_field(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    Box::new(SelectField::new(inputs.remove(0), "a"))
+}
+
+#[test]
+fn select_field_over_a_stream_of_records_notifies_exactly_what_changed_over_growth() {
+    for (seed, steps, growth) in [
+        (1, 10, Growth::OneAtATime),
+        (2, 8, Growth::Bursts),
+        (3, 12, Growth::CompletenessAndEmpty),
+    ] {
+        let (tiles, script) = grow(seed, steps, growth, Values::Ints);
+        let feeds = [(
+            records_tiling(),
+            tiles.into_iter().map(as_records).collect::<Vec<_>>(),
+        )];
+        assert_notification_sound(&select_field, &feeds, &script, &[Expect::Exact]);
+    }
+}
+
+/// The states of a product `{a: Int stream, b: Int stream}` that gains rows in either field in
+/// turn, and the steps that reach them, each notifying the keys the field gained.
+fn product_script(seed: u64, steps: usize) -> (Tiling, Vec<Tile>, Vec<Step>) {
+    use super::notification_sound::{Rng, Stream};
+    let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
+    let mut fields = [
+        Stream::new(Values::Ints, None),
+        Stream::new(Values::Ints, None),
+    ];
+    let state = |fields: &[Stream; 2]| {
+        Tile::record(
+            [
+                (SmolStr::new("a"), fields[0].tile()),
+                (SmolStr::new("b"), fields[1].tile()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    };
+    let mut tiles = vec![state(&fields)];
+    let mut script = Vec::new();
+    for _ in 0..steps {
+        let field = (rng.next() % 2) as usize;
+        let changed = fields[field].advance(&mut rng, Growth::OneAtATime);
+        tiles.push(state(&fields));
+        script.push(Step { input: 0, changed });
+    }
+    let tiling = Tiling::Record(
+        [
+            (SmolStr::new("a"), stream_tiling(Values::Ints)),
+            (SmolStr::new("b"), stream_tiling(Values::Ints)),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    (tiling, tiles, script)
+}
+
+/// A product of collections is read whole and its field cut, so a region of keys named by the
+/// product's feed is a region of the product, not of the field: the selection widens it.
+#[test]
+fn select_field_over_a_product_of_collections_widens_over_growth() {
+    for seed in [1, 2, 3, 4] {
+        let (tiling, tiles, script) = product_script(seed, 12);
+        let feeds = [(tiling, tiles)];
+        assert_notification_sound(&select_field, &feeds, &script, &[Expect::Widens]);
+    }
+}
+
+/// A release of some of the selected field's keys releases every other field whole, and what is
+/// left of the field reads as it did.
+#[test]
+fn select_field_releases_only_what_nothing_beneath_it_reads_again() {
+    let (tiling, tiles, _) = product_script(7, 12);
+    let last = tiles.len() - 1;
+    let feeds = [(tiling, tiles)];
+    assert_release_sound(&select_field, &feeds, &[last], &keys_region(&[1, 2, 3]));
+    let (tiles, _) = grow(5, 12, Growth::OneAtATime, Values::Ints);
+    let last = tiles.len() - 1;
+    let feeds = [(
+        records_tiling(),
+        tiles.into_iter().map(as_records).collect::<Vec<_>>(),
+    )];
+    assert_release_sound(&select_field, &feeds, &[last], &keys_region(&[1, 2, 3]));
 }
