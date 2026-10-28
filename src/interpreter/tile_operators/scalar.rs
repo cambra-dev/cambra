@@ -313,9 +313,11 @@ impl TileOperator for VariantWrap {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // A payload stream is pulled at the projection; a collection payload is one union column.
+        let keeps_keys = self.tiling().is_data_function();
         let input = self.input.subscribe(
             self.input.tiling().universal_guard(),
-            widening(consumer),
+            consumer_keeping_keys_if(keeps_keys, consumer),
             scheduler,
         );
         Box::new(VariantWrapProducer {
