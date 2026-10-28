@@ -968,15 +968,6 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         TypedExprNode::Lambda { param, body } => emit_lambda(param, body, &recorded_ty, ctx)?,
 
         TypedExprNode::Cast { value, target } => emit_cast(value, target, ctx)?,
-        // **The assertion is trusted**, which is the whole difference from `Cast`. The
-        // relation it claims — a gated tagged union realizing a sum — is one no typing rule
-        // can check, so re-deriving from the value would only rediscover that they differ.
-        // The child is still walked: it is an ordinary term and its own subtree must check.
-        TypedExprNode::Realize { value, .. } => {
-            ctx.subexpr(value)?;
-            expr.ty.clone()
-        }
-
         TypedExprNode::Apply { function, argument } => emit_apply(function, argument, ctx)?,
 
         TypedExprNode::BinOp { left, op, right } => {
@@ -1040,6 +1031,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 
         TypedExprNode::Copair(exprs) => emit_copair(exprs, ctx)?,
         TypedExprNode::DisjointJoin(exprs) => emit_disjoint_join(exprs, &recorded_ty, ctx)?,
+        TypedExprNode::Realized { legs, .. } => check_realized(legs, &recorded_ty, ctx)?,
 
         TypedExprNode::Transact {
             keys,
@@ -1122,6 +1114,96 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         }
     }
     Ok(ty)
+}
+
+/// A realized conditional: its gated legs, typed as the sum it realizes
+/// (`src/ccl/design/collections.md`, "Compiling a conditional collection").
+///
+/// Each leg is the sum's body at one of its candidates, its domain further refined by the
+/// leg's gate. Several legs can share a candidate, since arms over one domain make one
+/// candidate. The gates are first-match path conditions, so at most one leg holds rows; no
+/// type records that, and `flat_merge` checks it where it merges.
+fn check_realized(
+    legs: &mut [Expr],
+    recorded: &Type,
+    ctx: &mut CheckCtx,
+) -> Result<Type, LocatedInferError> {
+    let bug = |what: String| InferError::Unsupported(format!("{what}; this is a compiler bug"));
+    let Some(bodies) = candidate_bodies(recorded.peel_refinements()) else {
+        return Err(ctx.raise(bug(format!(
+            "a realized conditional is typed `{recorded}`, not a sum over listed candidates"
+        ))));
+    };
+    if legs.is_empty() {
+        return Err(ctx.raise(bug(format!(
+            "a realized conditional typed `{recorded}` has no leg"
+        ))));
+    }
+    let mut realized = vec![false; bodies.len()];
+    for leg in legs.iter_mut() {
+        let leg_ty = ctx.subexpr(leg)?;
+        // Candidates can share a base, `0..3` and `{0..3 | 𝑝}`, and a leg over the narrower one
+        // refines both; it realizes the one whose refinements it carries most of.
+        let found = leg_ty.domain().and_then(|leg_dom| {
+            bodies
+                .iter()
+                .enumerate()
+                .filter_map(|(i, body)| {
+                    let d = body.domain()?;
+                    (leg_dom.peel_refinements() == d.peel_refinements()
+                        && d.refinements()
+                            .iter()
+                            .all(|r| leg_dom.refinements().contains(r)))
+                    .then(|| (d.refinements().len(), i))
+                })
+                .max()
+                .map(|(_, i)| i)
+        });
+        let Some(i) = found else {
+            return Err(ctx.raise(bug(format!(
+                "a realized leg `{leg_ty}` is the body of none of `{recorded}`'s candidates"
+            ))));
+        };
+        realized[i] = true;
+        let body = &bodies[i];
+        // The leg's own domain, which carries its gate, over the body's codomain.
+        let (Some(leg_dom), Some(codomain)) = (leg_ty.domain(), body.codomain()) else {
+            unreachable!("a leg matched a body by its domain, and both are collections")
+        };
+        let expected = Type::fun_like(body, leg_dom, codomain);
+        ctx.require_sub(&leg_ty, &expected, &|| "realized leg".to_string())?;
+    }
+    // A candidate with no leg is a domain the program can choose whose rows nothing holds.
+    if let Some(i) = realized.iter().position(|r| !r) {
+        return Err(ctx.raise(bug(format!(
+            "the candidate body `{}` of `{recorded}` has no realized leg",
+            bodies[i]
+        ))));
+    }
+    Ok(recorded.clone())
+}
+
+/// `ty`'s body at every combination of its candidates, its binders outermost first; `None`
+/// where `ty` is not a sum whose witnesses list their candidates.
+fn candidate_bodies(ty: &Type) -> Option<Vec<Type>> {
+    let Some([first, ..]) = ty.sum() else {
+        return None;
+    };
+    let crate::ccl::ty::TypeKind::Enumerated(candidates) = first.type_kind() else {
+        return None;
+    };
+    Some(
+        candidates
+            .iter()
+            .flat_map(|d| {
+                let body = ty.instantiate_sum(d);
+                match candidate_bodies(&body) {
+                    Some(bodies) => bodies,
+                    None => vec![body],
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Type every refinement predicate `expr`'s own type slots carry, as the function it denotes.
@@ -1419,6 +1501,52 @@ mod tests {
         assert!(
             check(&dependent_projection(CompareKind::Greater)).is_err(),
             "`.1` equals `p.0`, so it is not greater than it"
+        );
+    }
+
+    /// A realized conditional is typed as the sum it realizes, each leg the sum's body at one of
+    /// its candidates and each candidate a leg's ([`check_realized`]). A leg over a domain no
+    /// candidate is, no leg, a candidate with none, and a type that is not a sum are errors.
+    #[test]
+    fn a_realized_conditional_holds_legs_over_its_sums_candidates() {
+        let int = prim(BaseType::Int);
+        let sum = Type::sum_over(
+            crate::ccl::ty::TypeKind::Enumerated(vec![Type::UIntRange(2), Type::UIntRange(3)]),
+            None,
+            int.clone(),
+        );
+        let leg = |n| {
+            TypedExpr::var(Name::fresh("xs"))
+                .with_ty(Type::data_fun(Type::UIntRange(n), int.clone()))
+        };
+        let join = |legs| {
+            TypedExpr::new(TypedExprNode::Realized {
+                legs,
+                staged: Rc::new(TypedExpr::var(Name::fresh("c")).with_ty(sum.clone())),
+            })
+            .with_ty(sum.clone())
+        };
+        assert_eq!(check(&join(vec![leg(2), leg(3)])), Ok(()));
+        assert!(
+            check(&join(vec![leg(2), leg(4)])).is_err(),
+            "`0..4` is not a candidate of the sum"
+        );
+        assert!(
+            check(&join(vec![])).is_err(),
+            "a realized conditional has a leg"
+        );
+        assert!(
+            check(&join(vec![leg(2)])).is_err(),
+            "the candidate `0..3` has no leg, so its rows would be missing"
+        );
+        let plain = TypedExpr::new(TypedExprNode::Realized {
+            legs: vec![leg(2)],
+            staged: Rc::new(leg(2)),
+        })
+        .with_ty(Type::data_fun(Type::UIntRange(2), int.clone()));
+        assert!(
+            check(&plain).is_err(),
+            "a realized conditional is typed as a sum"
         );
     }
 

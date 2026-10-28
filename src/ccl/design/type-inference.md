@@ -1359,10 +1359,10 @@ give the same value at every argument the term is applied at.
   - a chain `iterate ≫ 𝑓` reads as `𝑓`, unapplied as well;
   - `(𝐹, 𝑔) ▷ curry_over` reads as `𝑔 ▷ curry`, `𝑎 ▷ (𝑓 ▷ strength_over)` as
     `λ 𝑘 → (𝑎, 𝑘 ▷ (𝑎 ▷ 𝑓))`, and `𝑥 ▷ (𝑐 ▷ map(𝑔))` as `(𝑥 ▷ 𝑐) ▷ 𝑔`;
-- a `Realize` reads as the conditional it stages, which realization keeps on the node
-  (`TypedExprNode::Realize`'s `staged`). The gated union it holds is a change of representation
-  rather than a respelling, and constant folding rewrites its gates, so no rule reads the union
-  back;
+- a `Realized` node reads as the conditional it realizes, which realization keeps on the node
+  (`TypedExprNode::Realized`'s `staged`). Its gated legs are not read back: realization changes
+  the representation, from a sum to gated legs, and constant folding rewrites the gates
+  ([A realized conditional is typed as its sum](#a-realized-conditional-is-typed-as-its-sum));
 - a projection out of a tuple or record former reads the component.
 
 The `filter_values` reading is the one rule that is an equivalence only under a condition its term
@@ -3456,18 +3456,21 @@ A leg is the sum's body at its candidate, a plain collection, so realization als
 (`discharge_determined_witnesses`). It does not descend into refinement predicates for this;
 realization replaces conditional predicate copies separately.
 
-#### Planning asserts the type it replaces
+#### A realized conditional is typed as its sum
 
-[`TypedExprNode::Realize`] gives a realized union the original sum type. The union has
-a tagged domain containing each leg, whereas the sum selects one candidate domain.
-The leg restrictions make their runtime values correspond; the ordinary subtyping rule
-does not prove that representation change.
+A realized conditional is a [`TypedExprNode::Realized`] node holding its gated legs, typed as
+the sum `Σ (σ : 𝐾). σ ⤇ 𝑉` the `Case` had, so enclosing compositions, products and projections
+keep that type. The check after planning holds each leg to the sum's body at one candidate:
+the leg's domain is a candidate `𝑑 ∈ 𝐾` further refined by its gate, and its type is a subtype
+of `𝑑 ⤇ 𝑉` over that domain (`check_realized`). A sum over several witnesses has a leg per
+combination of their candidates, and every candidate has at least one leg. A `Realized` with no
+leg, or not typed as a sum over listed candidates, is a compiler bug. The legs' disjointness is
+their first-match gates', which no type records.
 
-An assertion at this node keeps enclosing compositions, products and projections typed
-against the original sum. A [`TypedExprNode::Cast`] cannot perform this operation:
-`emit_cast` derives its type from the value while acquiring domain refinements, so
-casting the union would retain its tagged domain. See the `Realize` node's contract
-for the extent of the assertion.
+The node also keeps the `Case` it replaces as the term it stages. A consumer's type quotes that
+`Case`, and normal form reads the node as it, so the type rebuilt over the realized tree equals
+the recorded one
+([The check after planning reads planning's rewrites back](#the-check-after-planning-reads-plannings-rewrites-back)).
 
 ### Implementation limits
 

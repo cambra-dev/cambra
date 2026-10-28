@@ -547,12 +547,11 @@ The arms have domains `0..2` and `0..3`. The `Case` therefore has type
 `planning/conditionals.rs` realizes a conditional collection as a union of restricted arms,
 `⧺ᵢ (armᵢ | π̂ᵢ)`. Each restriction is the arm's first-match path condition. Exactly one
 condition holds; only that leg can contribute rows, though the selected arm may itself be
-empty. The union's tagged domain differs from the sum's domain, so `Realize` asserts the
-original type rather than deriving it by subtyping. See
-[Planning asserts the type it replaces](type-inference.md#planning-asserts-the-type-it-replaces).
-At runtime the value is the leg holding rows, keyed by its own keys: op-conversion compiles a
-`Realize` over a copairing as a flat merge at the key bound the sum's type declares
-(`UnionOperator::new_flat_over`), so no key carries its leg's tag.
+empty. The union is a `Realized` node typed as the sum, each leg the sum's body at one candidate;
+see [A realized conditional is typed as its sum](type-inference.md#a-realized-conditional-is-typed-as-its-sum).
+At runtime the value is the leg holding rows, keyed by its own keys: op-conversion compiles it as
+a flat merge at the key bound the sum's type declares (`UnionOperator::new_flat_over`), so no key
+carries its leg's tag.
 
 Every other sum is materialized: its `box` stays, and the value carries its keys. `box` is the
 identity at runtime, since a collection carries its own domain, so a sum over one candidate
@@ -572,12 +571,14 @@ A `for` loop over a sum types its history over the source's domain; see
 A row a jagged list literal reads from a mutable variable does not compile: op-conversion converts
 the literal as a constant, and takes a collection-valued element only written out as a list literal.
 
-A conditional is realized where it stands. The `Case` is replaced in place by its union, under a
-`Realize` that asserts the `Case`'s type and keeps the `Case` as the term it stages. Every consumer
-reads the conditional through `unbox`, over the projected domain `σ₁(𝑐)` of the `Case` term `𝑐`, so a
-consumer's types quote the conditional rather than name its witness. Normal form reads a `Realize`
-as the term it stages (`ccl_utils::normal_form`), so those types and the realized tree compare as
-one term. A `let`-bound conditional is realized once, in its binding, and its consumers share it.
+A conditional is realized where it stands. The `Case` is replaced in place by a `Realized` node
+typed as the `Case` was, which keeps the `Case` as the term it stages. Every consumer reads the
+conditional through `unbox`, over the projected domain `σ₁(𝑐)` of the `Case` term `𝑐`, so a
+consumer's types quote the conditional rather than name its witness. The check after planning
+rebuilds a consumer's result from the realized tree, and normal form reads the `Realized` node as
+the `Case` it stages, so the rebuilt result equals the recorded one
+([The check after planning reads planning's rewrites back](type-inference.md#the-check-after-planning-reads-plannings-rewrites-back)).
+A `let`-bound conditional is realized once, in its binding, and its consumers share it.
 
 Unboxed arms sharing a domain need no sum; boxed arms sharing a domain still have a
 one-candidate sum. A same-domain boxed conditional is realized like any other, and the realized

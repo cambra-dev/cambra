@@ -326,7 +326,7 @@ where
         }
         // `target` is a type; its refinement predicate is reached by the
         // caller's type walk, not here (see the module docs).
-        N::Cast { value, .. } | N::Realize { value, .. } => open(f, value),
+        N::Cast { value, .. } => open(f, value),
         N::BinOp { left, right, .. } => {
             open(f, left);
             open(f, right);
@@ -343,7 +343,8 @@ where
         | N::Tuple(elts)
         | N::Compose(elts)
         | N::Copair(elts)
-        | N::DisjointJoin(elts) => {
+        | N::DisjointJoin(elts)
+        | N::Realized { legs: elts, .. } => {
             for c in elts {
                 open(f, c);
             }
@@ -613,7 +614,6 @@ where
         | N::Error
         | N::Apply { .. }
         | N::Cast { .. }
-        | N::Realize { .. }
         | N::BinOp { .. }
         | N::UnaryOp(..)
         | N::Aggregate { .. }
@@ -626,6 +626,7 @@ where
         | N::Compose(_)
         | N::Copair(_)
         | N::DisjointJoin(_)
+        | N::Realized { .. }
         | N::ExprStmt { .. }
         | N::Begin { .. }
         | N::Lambda { .. }
@@ -672,10 +673,6 @@ mod tests {
             var("x"),
             node(N::Builtin(Builtin::Id)),
             TypedExpr::apply(var("f"), var("a")),
-            node(N::Realize {
-                value: Box::new(var("v")),
-                staged: std::rc::Rc::new(var("v")),
-            }),
             node(N::Cast {
                 value: Box::new(var("v")),
                 target: Type::Hole,
@@ -766,6 +763,10 @@ mod tests {
             node(N::Compose(vec![var("c0"), var("c1")])),
             TypedExpr::copair(vec![var("cp0"), var("cp1")]),
             TypedExpr::disjoint_join(vec![var("dj0"), var("dj1")]),
+            node(N::Realized {
+                legs: vec![var("r0"), var("r1")],
+                staged: std::rc::Rc::new(var("r")),
+            }),
             TypedExpr::expr_stmt(var("stmt"), var("rest")),
             node(N::Begin {
                 body: Box::new(var("bg")),
@@ -875,7 +876,6 @@ mod tests {
         N::Apply { .. } => "Apply",
         N::Cast { .. } => "Cast",
         N::Comprehension { .. } => "Comprehension",
-        N::Realize { .. } => "Realize",
         N::BinOp { .. } => "BinOp",
         N::UnaryOp(..) => "UnaryOp",
         N::Lambda { .. } => "Lambda",
@@ -899,6 +899,7 @@ mod tests {
         N::Compose(_) => "Compose",
         N::Copair(_) => "Copair",
         N::DisjointJoin(_) => "DisjointJoin",
+        N::Realized { .. } => "Realized",
         N::ExprStmt { .. } => "ExprStmt",
         N::Begin { .. } => "Begin",
         N::Feed { .. } => "Feed",

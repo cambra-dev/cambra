@@ -383,9 +383,9 @@ the group-by and join recognizers because they inspect inference's pointful pred
 
 A collection-valued guard `Case` carries a sum over its possible domains. For a witness with
 finitely many named candidates, conditional planning restricts each arm by its first-match
-condition and unions the arms. Exactly one arm contributes data. The resulting tagged union
-is an executable representation of the selected collection; it is introduced after type
-inference because its type differs from the source sum. Every other witness is materialized: its
+condition and unions the arms. Exactly one arm contributes data. The result is a `Realized`
+node typed as the source sum, each leg the sum's body at one candidate; it is introduced after
+type inference. Every other witness is materialized: its
 `box` stays standing, the value carries its own keys, and operator conversion bounds the domain
 from the witness's kind. `box` is the identity at runtime, so a sum over one candidate compiles to
 the operators its collection does. A `for` loop over a sum is refused by name, since its history

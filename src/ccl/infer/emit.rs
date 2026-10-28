@@ -216,13 +216,6 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // Cast: rebuild `value`'s function type with `target`'s domain refinements.
         // See [`emit_cast`] (shared with `check_node`).
         TypedExprNode::Cast { value, target } => emit_cast(value, target, ctx)?,
-        // Realization is a planning rewrite, so it is born after inference has finished:
-        // Emit only ever runs on a tree that has none. The post-inference check *does*
-        // meet them, and trusts the assertion ([`check_node_rule`]).
-        TypedExprNode::Realize { .. } => {
-            unreachable!("Realize is born in planning, after inference")
-        }
-
         TypedExprNode::Apply { function, argument } => emit_apply(function, argument, ctx)?,
 
         // Scheme-based rules: the registry lookup (which scheme for this op)
@@ -373,6 +366,9 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
 
         TypedExprNode::Copair(exprs) => emit_copair(exprs, ctx)?,
         TypedExprNode::DisjointJoin(exprs) => emit_disjoint_join(exprs, &recorded_ty, ctx)?,
+        TypedExprNode::Realized { .. } => {
+            unreachable!("Realized is born in planning, after inference")
+        }
 
         // `Transact` is born by `planning::plan_loops`, which runs *after*
         // inference, so constraint emission never sees one. Gathered
