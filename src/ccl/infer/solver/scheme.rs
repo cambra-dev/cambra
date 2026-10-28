@@ -337,6 +337,11 @@ fn freshen_effect_var(
         let source = freshen_effect_var(lim, &source, target, cache);
         f.flows_from(&source, filter);
     }
+    // Each use answers the bounds the definition states: a use's arguments can add labels
+    // its copy holds and the definition's variable never does.
+    for upper in v.uppers() {
+        f.bound_above(upper);
+    }
     f
 }
 
@@ -523,6 +528,9 @@ pub fn freshen_above(
                 effects: match effects.repr() {
                     Repr::Var(v) => Effects::var(freshen_effect_var(lim, v, target, cache)),
                     Repr::Known(_) => effects.clone(),
+                    Repr::Written(_) => {
+                        unreachable!("a scheme's written clauses are normalized when it is bound")
+                    }
                 },
             };
             // A scheme binds its witnesses, so each instantiation owes itself its own —

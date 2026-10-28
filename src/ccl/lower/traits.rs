@@ -1082,12 +1082,28 @@ fn lower_instance_def(
         params,
         output,
         requires,
+        causes,
         body,
         ..
     } = &def.node
     else {
         unreachable!("`declare_instances` admitted only `def`s")
     };
+    // What an instance's function requires and causes is its trait's signature's, which
+    // states none yet (`docs/chl-spec.md`, "Effects in traits").
+    let context = requires
+        .items
+        .iter()
+        .find(|r| clauses::is_context_item(&r.node))
+        .map(|r| r.span);
+    if let Some(span) = causes.span.or(requires.only).or(context) {
+        return Err(LoweringError::unsupported(
+            span,
+            "an instance's function requires and causes what its trait's signature states, \
+             and a clause stating that on an instance is not supported yet",
+        ));
+    }
+    let requires = requires.items.as_slice();
     let name = &name.node;
     let function = trait_
         .function(name)
@@ -1299,6 +1315,7 @@ fn lower_instance_def(
         &spans,
         &params,
         Some(&output),
+        None,
         requires,
         body,
         ctx,

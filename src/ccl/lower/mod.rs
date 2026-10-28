@@ -106,6 +106,7 @@ use smol_str::SmolStr;
 
 use crate::chl_parser::SurfaceBuiltin;
 
+mod clauses;
 mod comprehension;
 mod constants;
 mod exprs;

@@ -9,7 +9,10 @@ use std::collections::HashSet;
 use super::*;
 use crate::{
     ccl::{Expr, Name, Type, TypedExprNode},
-    chl_parser::ast::{AnnotationMode, Param, Requirement, Span, Spanned, TypeParam, is_type_name},
+    chl_parser::ast::{
+        AnnotationMode, Clause, Param, Requirement, Span, Spanned, TraitType, TypeParam,
+        is_type_name,
+    },
 };
 
 /// The binder a `=> T` output annotation introduces to check the body's result.
@@ -192,7 +195,7 @@ pub(super) fn uncurry_params(
                 // rejected at the call site. Without this the annotation was
                 // silently dropped and the param inferred purely from its body (so
                 // `def g(a: int)` with an identity body accepted any argument).
-                param.declare(lower_type_annotation(ann, ctx)?);
+                param.declare(lower_param_annotation(ann, ctx)?);
             }
         }
         return Ok(lam);
@@ -205,10 +208,7 @@ pub(super) fn uncurry_params(
     // functions are always inlined (a `Mut`-param function must reach its call
     // sites), so the curried chain never survives to `lambda_elim`. Call sites
     // apply curried to match (see `lower_call`, keyed on `mut_param_fns`).
-    if params
-        .iter()
-        .any(|p| mut_param_history_type(p, ctx).is_some())
-    {
+    if is_curried(params, ctx) {
         return params.iter().rev().try_fold(body_expr, |acc, param| {
             // A `Mut(…)`/`Feed(…)` annotation names a history carrier rather than
             // an ordinary type, so it lowers here and not through
@@ -232,7 +232,7 @@ pub(super) fn uncurry_params(
                     // the single-parameter arm: attach it so `emit_lambda` binds the
                     // parameter at its declared type and an ill-typed argument is
                     // rejected at the call site.
-                    (None, Some(ann)) => p.declare(lower_type_annotation(ann, ctx)?),
+                    (None, Some(ann)) => p.declare(lower_param_annotation(ann, ctx)?),
                     (None, None) => {}
                 }
             }
@@ -287,7 +287,7 @@ pub(super) fn uncurry_params(
     let mut elem_anns: Vec<Type> = Vec::with_capacity(params.len());
     for p in params {
         elem_anns.push(match &p.annotation {
-            Some(ann) => lower_type_annotation(ann, ctx)?,
+            Some(ann) => lower_param_annotation(ann, ctx)?,
             None => Type::Hole,
         });
     }
@@ -298,6 +298,78 @@ pub(super) fn uncurry_params(
         param.declare(Type::Tuple(elem_anns));
     }
     Ok(lam)
+}
+
+/// A parameter's annotation. A `_` in a clause of a function type it holds is a variable each
+/// call fills, which makes the function polymorphic in it (`docs/chl-spec.md`, "Writing
+/// requirements and effects"), and is refused until such variables are implemented.
+fn lower_param_annotation(
+    annotation: &chl_parser::ast::TypeAnnotation,
+    ctx: &mut LoweringContext,
+) -> Result<Type, LoweringError> {
+    let ty = lower_type_annotation(annotation, ctx)?;
+    if has_open_clause(&ty) {
+        return Err(LoweringError::unsupported(
+            annotation.ty.span,
+            "a `_` in a parameter's clause stands for what each call passes, which is not \
+             supported yet; write the clause's requirements and effects",
+        ));
+    }
+    Ok(ty)
+}
+
+/// Whether `ty` holds a function type with a written clause ending in `_`.
+fn has_open_clause(ty: &Type) -> bool {
+    if let Type::Fun { effects, .. } = ty
+        && let crate::ccl::effects::Repr::Written(w) = effects.repr()
+        && (w.open_requires || w.open_causes)
+    {
+        return true;
+    }
+    let mut found = false;
+    ty.walk_children(|child| found |= has_open_clause(child));
+    found
+}
+
+/// Whether [`uncurry_params`] curries `params` into one lambda each, which it does for more
+/// than one parameter when one is a pass-by-reference `Mut` parameter.
+fn is_curried(params: &[Param], ctx: &mut LoweringContext) -> bool {
+    params.len() > 1
+        && params
+            .iter()
+            .any(|p| mut_param_history_type(p, ctx).is_some())
+}
+
+/// Stamp the lambda whose body is a `def`'s body, the innermost of the chain
+/// [`uncurry_params`] built over `params`, with the `def`'s clauses: inference reads them
+/// off the function type the stamp states (`src/ccl/design/type-inference.md`, "Effect
+/// variables").
+fn stamp_clauses(
+    func: &mut Expr,
+    params: &[Param],
+    written: crate::ccl::effects::Written,
+    ctx: &mut LoweringContext,
+) {
+    let lambdas = if is_curried(params, ctx) {
+        params.len()
+    } else {
+        1
+    };
+    let mut lambda = func;
+    for _ in 1..lambdas {
+        let TypedExprNode::Lambda { body, .. } = &mut lambda.node else {
+            unreachable!("`uncurry_params` curries one lambda per parameter");
+        };
+        lambda = body;
+    }
+    debug_assert!(
+        matches!(lambda.node, TypedExprNode::Lambda { .. }) && lambda.user_annotation.is_none(),
+        "a `def`'s innermost lambda carries no annotation before its clauses"
+    );
+    lambda.user_annotation = Some(
+        Type::fun(Type::Hole, Type::Hole)
+            .with_effects(crate::ccl::effects::Effects::written(written)),
+    );
 }
 
 /// Lower a CHL lambda expression to an [`Expr::Lambda`] via
@@ -400,18 +472,27 @@ pub(super) fn refuse_capitalized_lambda_binder(params: &[Param]) -> Result<(), L
 /// annotation is that `Poly`, or `None` for a `def` with no type parameters. The
 /// type parameters are aliases of their [`Type::Param`]s over the whole definition,
 /// parameter annotations and `=>` result included.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lower_def(
     fn_span: Span,
     type_params: &[TypeParam],
     params: &[Param],
     output: Option<&Spanned<ChlExpr>>,
-    requires: &[Spanned<Requirement>],
+    requires: &Clause<Requirement>,
+    causes: &Clause<TraitType>,
     body: &[Spanned<ChlStmt>],
     ctx: &mut LoweringContext,
 ) -> Result<(Expr, Option<Type>), LoweringError> {
+    let clauses = clauses::lower_clauses(requires, causes, clauses::Site::Def, fn_span)?;
+    let requires: Vec<Spanned<Requirement>> = requires
+        .items
+        .iter()
+        .filter(|r| !clauses::is_context_item(&r.node))
+        .cloned()
+        .collect();
     if type_params.is_empty() && requires.is_empty() {
         return Ok((
-            lower_function_body(fn_span, params, output, body, ctx)?,
+            lower_function_body(fn_span, params, output, clauses, body, ctx)?,
             None,
         ));
     }
@@ -419,11 +500,11 @@ pub(super) fn lower_def(
     let scoped = ctx.type_params_in_scope.len();
     let in_scope = ctx.named_requirements.len();
     let result = declare_type_params(type_params, ctx).and_then(|mut declared| {
-        let (requires, named) = lower_named_requirements(requires, Some(&mut declared), ctx)?;
+        let (requires, named) = lower_named_requirements(&requires, Some(&mut declared), ctx)?;
         ctx.named_requirements.extend(named);
         let spans: Vec<Option<Span>> = type_params.iter().map(|tp| Some(tp.name_span)).collect();
         lower_def_declared(
-            fn_span, declared, &spans, params, output, requires, body, ctx,
+            fn_span, declared, &spans, params, output, clauses, requires, body, ctx,
         )
     });
     ctx.named_requirements.truncate(in_scope);
@@ -444,11 +525,12 @@ pub(super) fn lower_def_declared(
     spans: &[Option<Span>],
     params: &[Param],
     output: Option<&Spanned<ChlExpr>>,
+    clauses: Option<crate::ccl::effects::Written>,
     requires: Vec<Rc<crate::ccl::ty::TraitRequirement>>,
     body: &[Spanned<ChlStmt>],
     ctx: &mut LoweringContext,
 ) -> Result<(Expr, Option<Type>), LoweringError> {
-    let func = lower_function_body(fn_span, params, output, body, ctx)?;
+    let func = lower_function_body(fn_span, params, output, clauses, body, ctx)?;
     if declared.is_empty() && requires.is_empty() {
         return Ok((func, None));
     }
@@ -534,6 +616,7 @@ pub(super) fn lower_function_body(
     fn_span: Span,
     params: &[Param],
     output: Option<&Spanned<ChlExpr>>,
+    clauses: Option<crate::ccl::effects::Written>,
     body: &[Spanned<ChlStmt>],
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
@@ -613,7 +696,10 @@ pub(super) fn lower_function_body(
     // Tag the function's lambda wrapper with the `def` span. (The synthetic
     // tuple-arg lambda for the multi-param case is the user's function node,
     // so the def span is the right blame here.)
-    let func = uncurry_params(params, body_expr, fn_span, ctx)?;
+    let mut func = uncurry_params(params, body_expr, fn_span, ctx)?;
+    if let Some(written) = clauses {
+        stamp_clauses(&mut func, params, written, ctx);
+    }
     Ok(ctx.tag_image(func, fn_span))
 }
 

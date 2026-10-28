@@ -94,6 +94,15 @@ pub enum Token {
     Forall,
     #[token("requires", priority = 3)]
     Requires,
+    /// Begins a `causes` clause (`docs/chl-spec.md`, "Writing requirements and effects").
+    #[token("causes", priority = 3)]
+    Causes,
+    /// Makes a `requires` or `causes` clause an upper bound.
+    #[token("only", priority = 3)]
+    Only,
+    /// The empty clause, an upper bound with no item.
+    #[token("nothing", priority = 3)]
+    Nothing,
     /// Opens a nominal type declaration (`docs/chl-spec.md`, "Declaring a nominal type").
     #[token("type", priority = 3)]
     Type,
@@ -318,6 +327,9 @@ pub const KEYWORDS: &[(&str, Token)] = &[
     ("case", Token::Case),
     ("forall", Token::Forall),
     ("requires", Token::Requires),
+    ("causes", Token::Causes),
+    ("only", Token::Only),
+    ("nothing", Token::Nothing),
     ("type", Token::Type),
     ("impl", Token::Impl),
     ("trait", Token::Trait),
@@ -463,6 +475,9 @@ pub fn highlight_class(token: &Token) -> Option<HighlightClass> {
         | Token::Not
         | Token::Forall
         | Token::Requires
+        | Token::Causes
+        | Token::Only
+        | Token::Nothing
         | Token::Type
         | Token::Impl
         | Token::Trait
@@ -709,6 +724,9 @@ impl fmt::Display for Token {
             Token::Where => "where",
             Token::Forall => "forall",
             Token::Requires => "requires",
+            Token::Causes => "causes",
+            Token::Only => "only",
+            Token::Nothing => "nothing",
             Token::Type => "type",
             Token::Impl => "impl",
             Token::Trait => "trait",
@@ -1816,7 +1834,9 @@ mod tests {
 
     #[test]
     fn keywords_beat_idents() {
-        let toks = tokens("if elif else for in def not and or True False where forall requires");
+        let toks = tokens(
+            "if elif else for in def not and or True False where forall requires causes only nothing",
+        );
         assert_eq!(
             toks,
             vec![
@@ -1834,6 +1854,9 @@ mod tests {
                 Token::Where,
                 Token::Forall,
                 Token::Requires,
+                Token::Causes,
+                Token::Only,
+                Token::Nothing,
                 Token::Newline,
             ]
         );

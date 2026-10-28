@@ -1382,7 +1382,7 @@ impl Interp {
             } => {
                 let name = name.node.to_string();
                 let mut env = self.captured_scopes();
-                env.push(instance_names(requires));
+                env.push(instance_names(&requires.items));
                 let function = Function {
                     params: params
                         .iter()

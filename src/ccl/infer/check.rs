@@ -247,8 +247,11 @@ impl Typing for CheckCtx {
 
     fn normalize(&mut self, ann: &Type) -> Type {
         // A fully-typed tree carries no `Hole`s, so normalization is the
-        // identity; refinements are kept (as everywhere else).
-        ann.clone()
+        // identity; refinements are kept (as everywhere else). Check reads no effects, so
+        // an annotation's written clauses state none here.
+        let mut ann = ann.clone();
+        crate::ccl::effects::erase_in_type(&mut ann);
+        ann
     }
 
     fn require_trait_refined(

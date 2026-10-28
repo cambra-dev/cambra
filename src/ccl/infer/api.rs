@@ -53,6 +53,7 @@ impl InferArena {
     /// [`crate::ccl::arena_enter`]).
     pub fn new() -> Self {
         crate::ccl::arena_enter();
+        crate::ccl::effects::upper_arena_enter();
         // The witness range index is per-run for the same reason the variable capture is:
         // it maps a binder minted by this run to the domains that run found it ranging
         // over. Binder ids are globally unique, so a stale entry is unreachable rather
@@ -100,6 +101,7 @@ impl Drop for InferArena {
             barrier.watches.borrow_mut().clear();
             barrier.checked.borrow_mut().take();
         }
+        crate::ccl::effects::upper_arena_exit();
     }
 }
 
@@ -316,6 +318,13 @@ pub enum InferError {
     /// which no other module may read or write (`docs/chl-spec.md`, "9.10 Induction variables
     /// stay in their module").
     VariablePastItsScope { member: String, item: String },
+    /// A function requiring or causing `item` flowed into a function type whose clauses do
+    /// not state it (`docs/chl-spec.md`, "Writing requirements and effects").
+    EffectNotStated { item: String },
+    /// A body requiring or causing `item` beyond its definition's `only` clause.
+    EffectBeyondClause { item: String },
+    /// A written clause's `item` names no variable of the kind it takes in scope.
+    ClauseNamesNoVariable { item: String },
     /// A type mismatch was detected between two solved types.
     ///
     /// Named for the roles rather than positionally: `constrain_subtype(lhs, rhs)`
@@ -783,6 +792,9 @@ impl InferError {
             InferError::UnboundVariable(_)
             | InferError::InertStatement
             | InferError::VariablePastItsScope { .. }
+            | InferError::EffectNotStated { .. }
+            | InferError::EffectBeyondClause { .. }
+            | InferError::ClauseNamesNoVariable { .. }
             | InferError::Unsupported(_)
             | InferError::EmptyCase { .. }
             | InferError::UnresolvedHole { .. }
@@ -1120,6 +1132,20 @@ impl std::fmt::Debug for InferError {
             InferError::InertStatement => write!(
                 f,
                 "this statement causes nothing and its value is discarded, so it does nothing"
+            ),
+            InferError::EffectNotStated { item } => write!(
+                f,
+                "this has `{item}`, which the function type it must have does not state"
+            ),
+            InferError::ClauseNamesNoVariable { item } => write!(
+                f,
+                "`{item}` names no variable in scope of the kind it takes: `Write` takes a \
+                 mutable variable, `Append` a feed and `Read` an induction variable"
+            ),
+            InferError::EffectBeyondClause { item } => write!(
+                f,
+                "this has `{item}`, which the definition's clause, bounded by `only` or \
+                 `nothing`, does not list"
             ),
             InferError::VariablePastItsScope { member, item } => write!(
                 f,

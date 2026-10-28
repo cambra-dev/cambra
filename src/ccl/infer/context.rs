@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::effects::{
-    Bound, Effect, EffectVar, Effects, Filter, Item, Label, Repr, Requirement,
+    Blame, Bound, Effect, EffectVar, Effects, Filter, Item, Label, Repr, Requirement, Upper,
 };
 use crate::ccl::infer::solver::barrier::EdgeReport;
 use crate::ccl::infer::solver::display::poly_for_display;
@@ -147,6 +147,10 @@ pub(super) struct InferCtx {
     pub(super) expression_statements: HashSet<NodeId>,
     /// Each public function of the module, with its effects and its `let`.
     effect_public: Vec<(Name, Rc<EffectVar>, NodeId)>,
+    /// Each generalized `def` whose `requires` clause is an upper bound: its type, the level
+    /// it generalized at, the trait requirements it writes, where its clauses are written,
+    /// and its node ([`InferCtx::requirements_beyond_clauses`]).
+    bounded_requires: Vec<BoundedRequires>,
     /// The variable of every call site ([`InferCtx::call_effects`]).
     effect_calls: HashSet<crate::ccl::effects::EffectVarId>,
     /// Lexical scope: name → [`Binding`] for in-scope variables and let-bound
@@ -304,8 +308,19 @@ impl EffectFrame {
             } else {
                 Default::default()
             },
+            at: None,
         }
     }
+}
+
+/// A generalized `def` whose `requires` clause is an upper bound, which no trait requirement
+/// inference adds may exceed (`docs/chl-spec.md`, "Writing requirements and effects").
+struct BoundedRequires {
+    ty: Type,
+    level: Level,
+    written: Vec<Rc<TraitRequirement>>,
+    at: chl_parser::ast::Span,
+    node: NodeId,
 }
 
 /// Where a mutable variable or feed is bound, for the [`Label`] naming it.
@@ -319,6 +334,9 @@ struct EffectBinder {
     /// A transactional mutable variable belongs to its run, so no scope's end discharges
     /// its writes, and reading or writing it requires `Transaction`.
     transactional: bool,
+    /// A feed, which a clause names in `Append(f)`; every other binder here is a mutable
+    /// variable.
+    feed: bool,
     /// No scope's end discharges what is done to it: a transactional mutable variable,
     /// and a public feed.
     escapes: bool,
@@ -457,6 +475,7 @@ impl InferCtx {
             expression_statements: HashSet::new(),
             effect_calls: HashSet::new(),
             effect_public: Vec::new(),
+            bounded_requires: Vec::new(),
         }
     }
 
@@ -496,13 +515,14 @@ impl InferCtx {
                     depth,
                     parameter: !declares,
                     transactional,
+                    feed: matches!(history_kind, crate::ccl::ty::HistoryKind::Append),
                     escapes: transactional || public_feed,
                 },
             );
             // Other modules append to a public feed, so declaring one is an output of the
             // top level's, as declaring a transactional variable writes it.
             if public_feed {
-                self.record_effect(Item::Causes(Effect::Append(name.clone())), Some(name));
+                self.record_effect(Item::Causes(Effect::Append(name.clone())));
             }
         }
     }
@@ -512,8 +532,12 @@ impl InferCtx {
     /// call's are. A function's stay latent in its type. A kind still a variable decides
     /// once it resolves.
     fn settle_by_kind(&mut self, var: &Rc<EffectVar>, kind: Option<&crate::ccl::ty::FunKind>) {
+        let at = Some(self.current_node_id);
         let outer = self.effect_frame();
-        let filter = outer.filter();
+        let filter = Filter {
+            at,
+            ..outer.filter()
+        };
         match kind {
             Some(crate::ccl::ty::FunKind::Data(_)) => outer.var.flows_from(var, filter),
             Some(crate::ccl::ty::FunKind::Var(kind)) => outer.var.flows_from(
@@ -548,6 +572,44 @@ impl InferCtx {
         out
     }
 
+    /// An error at each `def` whose bounded `requires` clause a trait requirement inference
+    /// added exceeds, with the clause as the secondary label.
+    pub(super) fn requirements_beyond_clauses(&self) -> Vec<LocatedInferError> {
+        let mut out = Vec::new();
+        for bounded in &self.bounded_requires {
+            let Some(inferred) = poly_for_display(&bounded.ty, bounded.level) else {
+                continue;
+            };
+            let beyond: Vec<_> = inferred
+                .poly
+                .requires
+                .iter()
+                .filter(|r| !bounded.written.iter().any(|w| w == *r))
+                .cloned()
+                .collect();
+            if beyond.is_empty() {
+                continue;
+            }
+            let shown = crate::ccl::ty::PolyType {
+                requires: beyond,
+                ..inferred.poly
+            }
+            .requires_text(|t| t.to_string());
+            out.push(
+                LocatedInferError {
+                    error: InferError::EffectBeyondClause {
+                        item: shown.join(", "),
+                    },
+                    node_id: bounded.node,
+                    also: Box::default(),
+                    related: crate::ccl::infer::api::RelatedPositions::default(),
+                }
+                .with_failure((None, Some(Origin::Written(bounded.at)))),
+            );
+        }
+        out
+    }
+
     /// The statements emitted that cause nothing and so do nothing
     /// (`docs/chl-spec.md`, "4.9 Expression statement").
     ///
@@ -571,13 +633,70 @@ impl InferCtx {
             .collect()
     }
 
+    /// `item` as a label recorded at the current node, bound where the variable it names
+    /// binds.
+    fn label(&self, item: Item) -> Label {
+        Label {
+            at: Some(self.current_node_id),
+            ..self.stated_label(item)
+        }
+    }
+
+    /// `item` as a label a written clause states, bound where the variable it names binds.
+    fn stated_label(&self, item: Item) -> Label {
+        let binder = item
+            .variable()
+            .and_then(|n| self.effect_binders.get(n).copied());
+        Label {
+            item,
+            bound: match binder {
+                Some(b) if b.parameter => Bound::Parameter,
+                Some(b) if !b.escapes => Bound::At(b.depth),
+                _ => Bound::Escaping,
+            },
+            at: None,
+        }
+    }
+
+    /// The effects a written clause states, for the solver: a fresh variable holding the
+    /// set, and bounded by it where a clause is exact, not ending in `_`
+    /// (`docs/chl-spec.md`, "Writing requirements and effects").
+    fn normalize_effects(&self, effects: &Effects) -> Effects {
+        let Repr::Written(written) = effects.repr() else {
+            return effects.clone();
+        };
+        if written.of_def {
+            return Effects::none();
+        }
+        let var = EffectVar::fresh(self.level);
+        for item in written.items() {
+            var.record(self.stated_label(item));
+        }
+        if !written.open_requires || !written.open_causes {
+            var.bound_above(Upper {
+                set: written.set.clone(),
+                of_requires: !written.open_requires,
+                of_causes: !written.open_causes,
+                blame: Blame::Written(written.at),
+            });
+        }
+        Effects::var(var)
+    }
+
     /// The effects a call site expects of its callee: a fresh variable whose labels flow
     /// into the enclosing function body's, through the body's filter.
     fn call_effects(&mut self) -> Effects {
         let call = EffectVar::fresh(self.level);
         self.effect_calls.insert(call.uid);
+        let at = Some(self.current_node_id);
         let frame = self.effect_frame();
-        frame.var.flows_from(&call, frame.filter());
+        frame.var.flows_from(
+            &call,
+            Filter {
+                at,
+                ..frame.filter()
+            },
+        );
         Effects::var(call)
     }
 
@@ -982,7 +1101,7 @@ impl InferCtx {
                     },
                     domain: Box::new(self.normalize_annotation_in(d, telescope)),
                     codomain: Box::new(self.normalize_annotation_in(c, &cod_telescope)),
-                    effects: effects.clone(),
+                    effects: self.normalize_effects(effects),
                 }
             }
             Type::Tuple(ts) => Type::Tuple(
@@ -1470,6 +1589,25 @@ impl Typing for InferCtx {
         f: impl FnOnce(&mut Self) -> R,
     ) -> (R, Effects) {
         let var = EffectVar::fresh(self.level);
+        // A `def`'s clauses, which lowering stamps on the lambda whose body is the `def`'s:
+        // what they list is the function's whatever its body does, and a clause under `only`
+        // bounds what the body may add (`docs/chl-spec.md`, "Writing requirements and
+        // effects").
+        if let Type::Fun { effects, .. } = recorded
+            && let Repr::Written(written) = effects.repr()
+        {
+            for item in written.items() {
+                var.record(self.stated_label(item));
+            }
+            if !written.open_requires || !written.open_causes {
+                var.bound_above(Upper {
+                    set: written.set.clone(),
+                    of_requires: !written.open_requires,
+                    of_causes: !written.open_causes,
+                    blame: Blame::Clause(written.at),
+                });
+            }
+        }
         let depth = self.effect_frame().depth + 1;
         self.effect_frames.push(EffectFrame {
             var: Rc::clone(&var),
@@ -1494,6 +1632,9 @@ impl Typing for InferCtx {
                             var.record(label);
                         }
                     }
+                    Repr::Written(_) => unreachable!(
+                        "a part's written clauses are normalized before its composition is typed"
+                    ),
                 }
             }
         }
@@ -1501,16 +1642,61 @@ impl Typing for InferCtx {
         Effects::var(var)
     }
 
-    fn record_effect(&mut self, item: Item, name: Option<&Name>) {
-        let binder = name.and_then(|n| self.effect_binders.get(n).copied());
-        let label = Label {
-            item,
-            bound: match binder {
-                Some(b) if b.parameter => Bound::Parameter,
-                Some(b) if !b.escapes => Bound::At(b.depth),
-                _ => Bound::Escaping,
-            },
+    fn note_definition(&mut self, ty: &Type, written: Option<&Type>, definition: &Expr) {
+        // The `def`'s clauses ride the lambda whose body is its body, the innermost of the
+        // chain its parameters make.
+        let mut node = definition;
+        let mut clauses = None;
+        while let TypedExprNode::Lambda { body, .. } = &node.node {
+            if let Some(Type::Fun { effects, .. }) = &node.user_annotation
+                && let Repr::Written(w) = effects.repr()
+                && w.of_def
+            {
+                clauses = Some(w.clone());
+                break;
+            }
+            node = body;
+        }
+        let Some(clauses) = clauses.filter(|w| !w.open_requires) else {
+            return;
         };
+        self.bounded_requires.push(BoundedRequires {
+            ty: ty.clone(),
+            level: self.level,
+            written: match written {
+                Some(Type::Poly(poly)) => poly.requires.clone(),
+                _ => Vec::new(),
+            },
+            at: clauses.at,
+            node: definition.node_id(),
+        });
+    }
+
+    fn check_written(&self, effects: &Effects) -> Result<(), LocatedInferError> {
+        let Repr::Written(written) = effects.repr() else {
+            return Ok(());
+        };
+        for item in written.items() {
+            let Some(name) = item.variable() else {
+                continue;
+            };
+            let binder = self.effect_binders.get(name);
+            let fits = match &item {
+                Item::Causes(Effect::Append(_)) => binder.is_some_and(|b| b.feed),
+                Item::Causes(_) => binder.is_some_and(|b| !b.feed),
+                Item::Requires(_) => binder.is_some_and(|b| !b.feed && !b.transactional),
+            };
+            if !fits {
+                return Err(self.raise(InferError::ClauseNamesNoVariable {
+                    item: item.to_string(),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    fn record_effect(&mut self, item: Item) {
+        let label = self.label(item);
         let frame = self.effect_frame();
         if frame.filter().admits(&label) {
             frame.var.record(label);
@@ -1523,18 +1709,16 @@ impl Typing for InferCtx {
             .get(name)
             .is_some_and(|b| b.transactional)
         {
-            self.record_effect(Item::Requires(Requirement::transaction()), None);
+            self.record_effect(Item::Requires(Requirement::transaction()));
         }
     }
 
     fn record_read(&mut self, name: &Name) {
         match self.effect_binders.get(name) {
             Some(binder) if binder.transactional => {
-                self.record_effect(Item::Requires(Requirement::transaction()), None);
+                self.record_effect(Item::Requires(Requirement::transaction()));
             }
-            Some(_) => {
-                self.record_effect(Item::Requires(Requirement::read(name.clone())), Some(name))
-            }
+            Some(_) => self.record_effect(Item::Requires(Requirement::read(name.clone()))),
             None => {}
         }
     }
@@ -1555,7 +1739,13 @@ impl Typing for InferCtx {
         let r = f(self);
         self.effect_frames.pop();
         let outer = self.effect_frame();
-        outer.var.flows_from(&var, outer.filter());
+        outer.var.flows_from(
+            &var,
+            Filter {
+                at: Some(node),
+                ..outer.filter()
+            },
+        );
         self.effect_statements.push((node, var));
         r
     }

@@ -496,6 +496,13 @@ impl Trait {
         })
     }
 
+    /// The context trait a clause names by `name`: `Transaction`, `Ext` or `Read`.
+    pub fn context_named(name: &str) -> Option<Trait> {
+        [Trait::transaction(), Trait::ext(), Trait::read()]
+            .into_iter()
+            .find(|t| t.name == name)
+    }
+
     /// The compiler trait a `requires` clause names by `name`, or `None` for a name that
     /// is none. `AddableRefined` has no surface name (`docs/chl-spec.md`, "Trait
     /// requirements").

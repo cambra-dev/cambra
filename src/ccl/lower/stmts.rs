@@ -982,6 +982,7 @@ pub(super) fn lower_middle_stmt(
             params,
             output,
             requires,
+            causes,
             body: fn_body,
         } => {
             let (func_expr, annotation) = lower_def(
@@ -990,6 +991,7 @@ pub(super) fn lower_middle_stmt(
                 params,
                 output.as_ref(),
                 requires,
+                causes,
                 fn_body,
                 ctx,
             )?;
@@ -2591,10 +2593,37 @@ pub(super) fn lower_type_expr_or_poly(
         // `Type::fun` builds the non-dependent form (`name: None`); the surface
         // has no binder to make it a Pi type, and a data collection (`⤇`) is
         // written with its own constructor, never with `=>`.
-        ChlExpr::FunctionType { domain, codomain } => Ok(Type::fun(
-            lower_type_expr(domain, ctx)?,
-            lower_type_expr(codomain, ctx)?,
-        )),
+        //
+        // A function value's trait requirements are resolved where it is made, so its type's
+        // `requires` clause names only context; a polymorphic type's trait requirements are
+        // split off its body's clause before the body lowers (`split_forall_clause`).
+        ChlExpr::FunctionType {
+            domain,
+            codomain,
+            requires,
+            causes,
+        } => {
+            if let Some(item) = requires
+                .items
+                .iter()
+                .find(|r| !clauses::is_context_item(&r.node))
+            {
+                return Err(LoweringError::unsupported(
+                    item.span,
+                    "a function type's `requires` clause names only `Ext`, `Read(x)` and `_`: \
+                     a function value's trait requirements are resolved where it is made, and \
+                     a polymorphic type `forall (…)` states its own",
+                ));
+            }
+            let ty = Type::fun(
+                lower_type_expr(domain, ctx)?,
+                lower_type_expr(codomain, ctx)?,
+            );
+            let written =
+                clauses::lower_clauses(requires, causes, clauses::Site::Type, annotation.span)?
+                    .expect("a function type's clauses are always stated");
+            Ok(ty.with_effects(crate::ccl::effects::Effects::written(written)))
+        }
         // A parenthesised comma list `(T, U)` is a *term* product; the tuple *type* is
         // written with braces `{T, U}` (`docs/chl-spec.md`). `->` builds the same node, so
         // a function type written with the wrong arrow arrives here too and the message
@@ -2618,14 +2647,19 @@ pub(super) fn lower_type_expr_or_poly(
             body,
             requires,
         } => {
+            // The clause after the body's codomain is the polymorphic type's one clause: its
+            // trait requirements are the `Poly`'s, and its context requirements the
+            // function type's (`docs/chl-spec.md`, "Writing requirements and effects").
+            let (body, requires) = split_forall_clause(body, requires);
             let snapshot = ctx.snapshot_type_aliases();
             let scoped = ctx.type_params_in_scope.len();
             let poly = declare_type_params(type_params, ctx).and_then(|mut params| {
-                let (requires, named) = lower_named_requirements(requires, Some(&mut params), ctx)?;
+                let (requires, named) =
+                    lower_named_requirements(&requires, Some(&mut params), ctx)?;
                 // The body reads the associated types of the requirements the clause names.
                 let in_scope = ctx.named_requirements.len();
                 ctx.named_requirements.extend(named);
-                let body = lower_type_expr(body, ctx);
+                let body = lower_type_expr(&body, ctx);
                 ctx.named_requirements.truncate(in_scope);
                 Ok(Type::Poly(std::rc::Rc::new(crate::ccl::ty::PolyType {
                     params,
@@ -2642,6 +2676,28 @@ pub(super) fn lower_type_expr_or_poly(
             format!("{} is not a type", describe_type_form(other)),
         )),
     }
+}
+
+/// A polymorphic type's body and its trait requirements: those written after the `forall`'s
+/// body, and the trait requirements of the clause after its function type's codomain, which
+/// the parser gives the arrow. The body keeps its context requirements.
+fn split_forall_clause(
+    body: &Spanned<ChlExpr>,
+    requires: &[Spanned<Requirement>],
+) -> (Spanned<ChlExpr>, Vec<Spanned<Requirement>>) {
+    let mut body = body.clone();
+    let mut all = requires.to_vec();
+    if let ChlExpr::FunctionType { requires, .. } = &mut body.node {
+        let (context, traits): (Vec<_>, Vec<_>) = std::mem::take(&mut requires.items)
+            .into_iter()
+            .partition(|r| clauses::is_context_item(&r.node));
+        if context.is_empty() && requires.only.is_none() {
+            requires.span = None;
+        }
+        requires.items = context;
+        all.extend(traits);
+    }
+    (body, all)
 }
 
 /// The error of a Module type, spelled `what`, written at `span` where a value's
