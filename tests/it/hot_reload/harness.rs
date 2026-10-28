@@ -341,6 +341,24 @@ pub(crate) mod fixtures {
             peek_resps << "peek\n"
     "#};
 
+    pub const GUESTBOOK_RETYPES_STATE_ADDS_ROUTE: &str = indoc! {r#"
+        entries := 0
+
+        sign_reqs, sign_resps = http_serve("{PORT}", "POST", "/sign")
+        peek_reqs, peek_resps = http_serve("{PORT}", "GET", "/peek")
+        added_reqs, added_resps = http_serve("{PORT}", "GET", "/added")
+
+        for entry in sign_reqs:
+            entries := entries + 1
+            sign_resps << "signed\n"
+
+        for req in peek_reqs:
+            peek_resps << "peek\n"
+
+        for req in added_reqs:
+            added_resps << "added\n"
+    "#};
+
     pub const GUESTBOOK_STATELESS_EDIT: &str = indoc! {r#"
         entries := ""
 
@@ -898,6 +916,7 @@ pub(crate) fn source(name: &str, port: u16) -> String {
         "guestbook-drops-route" => fixtures::GUESTBOOK_DROPS_ROUTE,
         "guestbook-drops-state" => fixtures::GUESTBOOK_DROPS_STATE,
         "guestbook-retypes-state" => fixtures::GUESTBOOK_RETYPES_STATE,
+        "guestbook-retypes-state-adds-route" => fixtures::GUESTBOOK_RETYPES_STATE_ADDS_ROUTE,
         "guestbook-stateful-edit" => include_str!("../../programs/hot_reload/reloaded.cambra"),
         "guestbook-stateless-edit" => fixtures::GUESTBOOK_STATELESS_EDIT,
         "latest-write" => fixtures::LATEST_WRITE,
