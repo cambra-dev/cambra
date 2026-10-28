@@ -593,6 +593,26 @@ fn an_aggregate_sends_everything_for_a_later_region() {
     );
 }
 
+fn extract_aggregate() -> Built {
+    let (input, consumer) = feed(ints());
+    let op = ExtractAggregate::new(input, crate::ccl::AggregateKind::Sum, true);
+    (Box::new(op), vec![consumer])
+}
+
+/// The accumulator has no keys.
+#[test]
+fn an_extract_aggregate_sends_everything_for_a_region_of_its_input() {
+    assert_widens(&extract_aggregate, 0);
+}
+
+#[test]
+fn an_extract_aggregate_sends_everything_for_a_later_region() {
+    assert_eq!(
+        received(&extract_aggregate, 0, &another_region()),
+        [Projection::Everything]
+    );
+}
+
 fn extract_final() -> Built {
     let (source, keys) = feed(ints());
     let (default, fallback) = feed(Tiling::Scalar(int()));
