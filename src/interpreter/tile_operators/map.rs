@@ -1036,11 +1036,10 @@ impl TileOperator for MapResultWithSource {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let input = self.input.subscribe(
-            self.input.tiling().universal_guard(),
-            widening(consumer),
-            scheduler,
-        );
+        // The input is pulled at the projection, so its output keys are the input's.
+        let input =
+            self.input
+                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(MapResultWithSourceProducer::new(
             ProducerBase::new(
                 MapResultWithSourceProducer::alloc_id(),
