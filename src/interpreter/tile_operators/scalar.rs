@@ -564,9 +564,11 @@ impl TileOperator for VariantProject {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // A union stream is pulled at the projection; a bare union has no keys of its own.
+        let keeps_keys = self.input.tiling().is_data_function();
         let input = self.input.subscribe(
             self.input.tiling().universal_guard(),
-            widening(consumer),
+            consumer_keeping_keys_if(keeps_keys, consumer),
             scheduler,
         );
         Box::new(VariantProjectProducer {
