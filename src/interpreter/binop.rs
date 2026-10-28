@@ -9,7 +9,7 @@ use crate::scalar_ops::{
     zip_arithmetic, zip_bool_compare, zip_bool_logic, zip_compare, zip_concat,
 };
 
-use super::{BaseType, ColumnValue, ColumnView, Extent};
+use super::{BaseType, ColumnValue, ColumnView, Extent, Value};
 
 /// Output [`Extent`] for a [`BinOpKind`].
 pub fn binop_output_extent(op: &BinOpKind) -> Extent {
@@ -127,10 +127,75 @@ fn apply_binop_into(op: BinOpKind, left: &ColumnValue, right: &ColumnValue, out:
             ColumnValue::Records(r),
             ColumnValue::Bools(o),
         ) => o.extend(compare_records(op, l, r)),
+        // A tuple orders lexicographically by position (`docs/chl-spec.md`, "3.4
+        // Comparisons").
+        (
+            BinOpKind::Compare(
+                op @ (CompareKind::Less
+                | CompareKind::LessOrEq
+                | CompareKind::Greater
+                | CompareKind::GreaterOrEq),
+            ),
+            l @ ColumnValue::Records(_),
+            r @ ColumnValue::Records(_),
+            ColumnValue::Bools(o),
+        ) => o.extend(order_rows(op, l, r)),
         _ => match (left.view(), right.view()) {
             (Some(l), Some(r)) => apply_binop_views(op, &l, &r, out),
             _ => panic!("Unsupported binop: {op:?} on {left:?}, {right:?}, into a column {out:?}"),
         },
+    }
+}
+
+/// Order two tuple columns row by row, lexicographically by position ([`compare_values`]),
+/// under an ordering comparator.
+fn order_rows(op: CompareKind, left: &ColumnValue, right: &ColumnValue) -> Vec<bool> {
+    let rows = left.len().min(right.len());
+    (0..rows)
+        .map(|i| {
+            let (l, r) = (left.index_at(i), right.index_at(i));
+            let ord = compare_values(&l, &r).unwrap_or_else(|| {
+                panic!("{l:?} and {r:?} have no order; typing admits an ordered pair")
+            });
+            match op {
+                CompareKind::Less => ord.is_lt(),
+                CompareKind::LessOrEq => ord.is_le(),
+                CompareKind::Greater => ord.is_gt(),
+                CompareKind::GreaterOrEq => ord.is_ge(),
+                CompareKind::Equals | CompareKind::NotEquals => {
+                    unreachable!("equality on records is compared componentwise above")
+                }
+            }
+        })
+        .collect()
+}
+
+/// The order of two values: a base's own, and a tuple's lexicographically by position, its
+/// fields being `_0`, `_1`, …. `None` for values with no order, which typing never compares.
+pub fn compare_values(a: &Value, b: &Value) -> Option<std::cmp::Ordering> {
+    let positions = |fields: &HashMap<SmolStr, Value>| -> Option<Vec<(usize, Value)>> {
+        let mut out: Vec<(usize, Value)> = fields
+            .iter()
+            .map(|(k, v)| Some((k.strip_prefix('_')?.parse().ok()?, v.clone())))
+            .collect::<Option<_>>()?;
+        out.sort_by_key(|(i, _)| *i);
+        Some(out)
+    };
+    match (a, b) {
+        (Value::Record(x), Value::Record(y)) => {
+            let (x, y) = (positions(x)?, positions(y)?);
+            if x.len() != y.len() {
+                return None;
+            }
+            for ((_, l), (_, r)) in x.iter().zip(&y) {
+                match compare_values(l, r)? {
+                    std::cmp::Ordering::Equal => continue,
+                    other => return Some(other),
+                }
+            }
+            Some(std::cmp::Ordering::Equal)
+        }
+        _ => a.partial_cmp(b),
     }
 }
 

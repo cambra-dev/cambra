@@ -3126,9 +3126,10 @@ arriving afterwards has to have the same shape. Applying it records:
 - **Once applied, the rows have no part.** The requirement sweep skips the obligation, and a
   base arriving afterwards contradicts the product rather than narrowing the rows.
 
-Equality is the only trait with a product rule (`Trait::is_structural`). Ordering a product needs
-an order on its components and a record's fields carry none; arithmetic has no product reading
-at all.
+The comparisons have a product rule (`Trait::is_structural`): `Equatable` on any product, and
+`Orderable` on a tuple only, lexicographically (`Trait::admits_product`). A record's fields carry
+no order, so a record reaching an `Orderable` position is rejected; arithmetic has no product
+reading at all.
 
 ### Refinements are transparent
 

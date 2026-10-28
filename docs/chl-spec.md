@@ -862,9 +862,11 @@ beyond the [Boolean-operator rules](#35-short-circuit-not-and-or).
 
 Incompatible operand types produce a compile-time type error. Product equality is componentwise:
 two tuples or records must have the same shape, and every corresponding component must support
-equality. A wider record is not compared only on its shared fields. Products do not support the
-ordering comparators; collection elements are not product fields, so this rule does not provide
-collection equality.
+equality. A wider record is not compared only on its shared fields. A tuple orders
+lexicographically: by its first components, then, where they are equal, by its second, and so on,
+each component supporting the ordering comparators. A record does not order, since its fields have
+no order. Collection elements are not product fields, so these rules do not provide collection
+equality or order.
 
 `is` and `is not` are not operators. Membership `in` and `not in` are specified in
 [Membership expressions](#membership-expressions-decided).
@@ -3317,12 +3319,13 @@ requirement names one as it names these, which are built in:
 | `Exponentiable` | `**` | 2 | `Output` | `Int`, `UInt` |
 | `Negatable` | unary `-` | 1 | `Output` | `Int` |
 | `Equatable` | `==`, `!=`, `in`, `not in` | 2 | none | `Int`, `UInt`, `String`, `Bool`, and a tuple or record whose fields are `Equatable` |
-| `Orderable` | `<`, `<=`, `>`, `>=`, `max`, `min` | 2 | none | `Int`, `UInt`, `String`, `Bool` |
+| `Orderable` | `<`, `<=`, `>`, `>=`, `max`, `min` | 2 | none | `Int`, `UInt`, `String`, `Bool`, and a tuple whose components are `Orderable` |
 
 `max` and `min` place `Orderable(T, T)` on their element type `T`. A binary trait is satisfied by
-two operands of one listed type, and a tuple or record satisfies `Equatable` only against the same
-product ([3.4 Comparisons](#34-comparisons)). A listed instance's `Output` is its operand type, so
-the sum of two `Int`s is an `Int`.
+two operands of one listed type. A tuple or record satisfies `Equatable` only against the same
+product, and a tuple satisfies `Orderable` only against a tuple of the same length
+([3.4 Comparisons](#34-comparisons)). A listed instance's `Output` is its operand type, so the sum
+of two `Int`s is an `Int`.
 
 - **A named requirement binds its instance.** In `def total(S, s: S) => Int requires a: Area(S)`,
   `a` is the instance each call passes, and `a::area(s)` calls its `area`
@@ -3698,10 +3701,12 @@ of built-in functions.
 All three are unary and take a collection-typed argument. Other aggregates
 (`count`, `avg`, `len`) are **[Planned]** but not yet recognised.
 
-Every aggregate's result is to become `Option(T)`, `Option::none` for an empty collection, as §3.9's
-optional lookup is **[Planned]**. A statically proven deref for a collection known to be non-empty
-goes with it, and is not designed yet. Until then `max` of an empty collection is not defined, and
-neither is `min` of one ([Partiality is not yet defined](#partiality-is-not-yet-defined-open)).
+`max` and `min` are to return `Option(T)`, `Option::none` for an empty collection, as §3.9's
+optional lookup is **[Planned]**, and a postfix `!` unwraps the result where the collection is proven
+non-empty, as it unwraps a lookup whose key is proven present
+([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)). Until then `max` of
+an empty collection is not defined, and neither is `min` of one
+([Partiality is not yet defined](#partiality-is-not-yet-defined-open)).
 
 The north-star programs additionally assume non-aggregate built-ins —
 `str`, `open`, `stdout`, and a stream-restriction combinator

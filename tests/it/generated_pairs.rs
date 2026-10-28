@@ -331,6 +331,15 @@ fn skeletons() -> Vec<Skeleton> {
             t = ({}, 2)
             out << t.0 + t.1
         "#}},
+        Skeleton { name: "tuple_extreme", hole: Ty::Int, scope: &[], body: indoc! {r#"
+            out = test_sink()
+            out << min([(x + {}, "b") for x in [1, 2]]).0 + max([(x, "a") for x in [1, 2]]).0
+        "#}},
+        Skeleton { name: "tuple_extreme_per_group", hole: Ty::Int, scope: &[("v", Ty::Int)], body: indoc! {r#"
+            g = groupby([1, 2, 3, 4], \x -> x // 2)
+            out = test_sink()
+            out << sum([min([(v + {}, "a") for v in grp]).0 for grp in g])
+        "#}},
         Skeleton { name: "trait_function_argument", hole: Ty::Int, scope: &[], body: indoc! {r#"
             type Box = Int
             trait Area(S):

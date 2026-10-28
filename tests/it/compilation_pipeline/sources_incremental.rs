@@ -522,6 +522,63 @@ fn test_incremental_global_aggregate() {
     );
 }
 
+/// An extreme with no identity, `min` over `String` or over a tuple holding one, has no value
+/// before its first element, and is pulled then like any aggregate before its source is done:
+/// it answers nothing until the source is, then the least element.
+#[rstest]
+#[case::strings("min(source1())")]
+#[case::tuples_holding_a_string("min([(s, 1) for s in source1()]).0")]
+fn an_extreme_with_no_identity_pulled_before_its_first_element(#[case] code: &str) {
+    let mut ctx = GlobalContext::default();
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::String),
+        Extent::Base(BaseType::String),
+    )));
+    ctx.register_source(test_source.clone());
+    let loaded = LoadedProgram::test(code);
+    let mut compiled =
+        compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    let nothing = producer.tiling().empty_tile();
+
+    assert_eq!(producer.get(producer.tiling().universal_guard()), nothing);
+    test_source.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::String("b".into())),
+        (Value::UInt(1), Value::String("a".into())),
+    ]);
+    assert_eq!(producer.get(producer.tiling().universal_guard()), nothing);
+    test_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::True);
+    assert_eq!(
+        producer.get(producer.tiling().universal_guard()),
+        Tile::Scalar(ColumnValue::Strings(vec!["a".into()])),
+    );
+}
+
+/// The extreme of a complete, empty collection has no value, and stops the program until
+/// `max` and `min` return `Option(T)` (`docs/chl-spec.md`, "7.1 Aggregates").
+#[test]
+#[should_panic(expected = "`min` of an empty collection has no value")]
+fn an_extreme_with_no_identity_of_an_empty_source_stops() {
+    let mut ctx = GlobalContext::default();
+    let test_source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        Type::Base(BaseType::String),
+        Extent::Base(BaseType::String),
+    )));
+    ctx.register_source(test_source.clone());
+    let loaded = LoadedProgram::test("min(source1())");
+    let mut compiled =
+        compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let mut producer = compiled.main_mut().unwrap().producer.take().unwrap();
+    test_source
+        .borrow_mut()
+        .set_yield_predicate(Predicate::True);
+    producer.get(producer.tiling().universal_guard());
+}
+
 /// A projection of a source's values is read from the source.
 ///
 /// `source3` holds pairs `(p + 12, p)`. The join key is its second field and the sum reads its

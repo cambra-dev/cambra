@@ -151,6 +151,14 @@ impl TileProducer for AggregateProducer {
         };
         self.kind.accumulate(accumulator, &values, 0, values.rows());
         terminal[0] = is_terminal;
+        // An extreme with no identity has no value until its first element: an empty
+        // `terminal` says so ([`ExtractAggregate`]), however many pulls come first.
+        if self.kind.awaits_first_element(accumulator) {
+            if is_terminal {
+                self.kind.no_extreme_of_nothing();
+            }
+            return self.tiling().empty_tile();
+        }
         self.accumulator.clone()
     }
 
@@ -723,6 +731,17 @@ impl TileProducer for MapAggregateProducer {
         // Sorted so the outermost column stays ordered and a parent's children sit
         // contiguously, which is what rebuilding the offsets assumes.
         entries.sort_by(|a, b| compare_paths(&a.0, &b.0));
+        // A group whose extreme has no identity has no value until its first element, so
+        // its key waits for one; complete without one, it has none at all.
+        entries.retain(|(path, acc)| {
+            if !kind.awaits_first_element(acc) {
+                return true;
+            }
+            if complete.contains_path(path) {
+                kind.no_extreme_of_nothing();
+            }
+            false
+        });
 
         let terminal: Vec<bool> = entries
             .iter()
