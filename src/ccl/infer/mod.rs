@@ -41,7 +41,7 @@ mod typing;
 #[cfg(debug_assertions)]
 pub use api::debug_assert_no_free_witness;
 pub use api::*;
-pub use check::check;
+pub use check::{RefinementBlind, check};
 pub use schemes::OperatorSchemes;
 
 /// A type parameter of a module checked on its own, and how the check holds it

@@ -1,9 +1,10 @@
 # Optimization & compilation passes
 
 After inference, the compiler rewrites typed CCL into an operator graph. `context.rs` runs
-`inline`, transaction rewriting, `mut_elim`, `channelize`, the as-of-read rewrite,
-`lambda_elim`, `planning::plan_loops`, and `planning::run`, in that order. Lambda elimination
-runs `simplify` internally; planning also runs it before and after iteration-site marking.
+`inline`, transaction rewriting, `mut_elim`, refinement erasure, `channelize`, the as-of-read
+rewrite, `lambda_elim`, `planning::plan_loops`, and `planning::run`, in that order. Lambda
+elimination runs `simplify` internally; planning also runs it before and after iteration-site
+marking.
 `interpreter/operator_conversion.rs` then converts the planned CCL to `TileOperator`s. The
 transaction and mutation phases are described in [mutability.md](mutability.md); the AST is
 described in [ir.md](ir.md).
@@ -139,6 +140,36 @@ domain mismatch.
 - **Body duplication:** An eligible function body is copied at each use in the CCL tree. The pass
   has no use-count or cost test.
 - **Recursive UDFs**: unsupported (already noted in `operator_conversion.rs`).
+
+---
+
+## Refinement Erasure (`ccl/erase_refinements.rs`)
+
+Refinement erasure runs after `mut_elim` and before `channelize`. Its only refinements are those
+inside a data function's domain. Its only opaque `Let`s are binders those refinements name whose
+definiens reads a `LetRec` binder. It applies four rewrites in order:
+
+1. Every type slot drops its refinements, except inside a data function's domain. A data function
+   lambda's parameter is bound at that domain and keeps the same refinements. A domain keeps the
+   refinements on its components, because join planning reads a nested comprehension's guard off
+   the component of the product domain that carries it.
+2. Every opaque `Let` becomes transparent, except a binder that a remaining type names and whose
+   definiens reads a `LetRec` binder, directly or through the definientia of the `Let` binders it
+   reads. `mut_elim` turns a mutable variable's read into a read of its history, a `LetRec`
+   binder, and loop planning refuses a history read it finds in a type. Any other binder has no
+   value left to withhold from a type.
+3. A type that names a transparent `Let` binder outside the binder's scope has the binder discharged
+   to its definiens, repeated until the type names no escaped transparent binder. A type lifted past
+   an opaque binder keeps the binder's name ([type-inference.md, "`let` binders and
+   scope exit"](type-inference.md#let-binders-and-scope-exit)).
+4. The [Inlining Pass](#inlining-pass-cclinliners) runs again over the whole tree. The binders made
+   transparent in step 2 are now eligible for its rewrites. An opaque binder a type spells is not.
+
+Every type check from this phase through planning is refinement-blind. A subtyping edge relates
+the two types with their refinements stripped (`infer::RefinementBlind`), because an argument no
+longer carries the refinement a kept domain demands. The pipeline enters that scope after the
+phase. A scope rather than a parameter is needed because planning type-checks the fragments it
+builds through `typecheck` at each rewrite.
 
 ---
 

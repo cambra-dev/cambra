@@ -1617,77 +1617,164 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
 /// inner lambda over both binders and re-splits it with `curry`, for which
 /// operator conversion has no arm.
 fn try_exponential_eta(expr: &mut Expr) -> bool {
-    let matched = as_curry(expr).is_some_and(|uncurried| {
+    let arm = as_curry(expr).and_then(|uncurried| {
         let TypedExprNode::Compose(elts) = &uncurried.node else {
-            return false;
+            return None;
         };
         let [zip, ap, ..] = elts.as_slice() else {
-            return false;
+            return None;
         };
-        is_builtin(ap, Builtin::Apply)
-            && as_zip(zip)
-                .is_some_and(|(proj1, proj0f)| is_proj_idx(proj1, 1) && is_eta_apply_arm(proj0f))
+        let (proj1, proj0f) = as_zip(zip)?;
+        (is_builtin(ap, Builtin::Apply) && is_proj_idx(proj1, 1) && is_eta_apply_arm(proj0f))
+            .then_some(proj0f)
     });
-    if matched {
-        let curry_ty = expr.ty.clone();
-        let mut inner_elts = into_compose(into_argument(take(expr)));
-        // `𝑔`: everything the curried function's result flows through.
-        let mut suffix = inner_elts.split_off(2);
-        let _apply = inner_elts.pop().unwrap();
-        let (_, proj0f) = into_zip(inner_elts.pop().unwrap());
-        // `𝑓`: the `.0` arm with its projection dropped, absent for a bare `.0`.
-        let f = match proj0f.node {
-            TypedExprNode::Compose(mut compose_elts) => Some(compose_elts.pop().unwrap()),
-            _ => None,
+    let Some(arm) = arm else {
+        return false;
+    };
+    // `map`'s type where 𝑓 is present and the curried collection's narrowing reads the
+    // argument. The rule declines where no type restates that narrowing over 𝑓's result.
+    let restated = match as_compose(arm) {
+        Some((_, f)) => match narrowing_through(&expr.ty, f) {
+            Some(restated) => restated,
+            None => return false,
+        },
+        None => None,
+    };
+    let curry_ty = expr.ty.clone();
+    let mut inner_elts = into_compose(into_argument(take(expr)));
+    // `𝑔`: everything the curried function's result flows through.
+    let mut suffix = inner_elts.split_off(2);
+    let _apply = inner_elts.pop().unwrap();
+    let (_, proj0f) = into_zip(inner_elts.pop().unwrap());
+    // `𝑓`: the `.0` arm with its projection dropped, absent for a bare `.0`.
+    let f = match proj0f.node {
+        TypedExprNode::Compose(mut compose_elts) => Some(compose_elts.pop().unwrap()),
+        _ => None,
+    };
+    // **A curry whose collection is narrower than its argument keeps a node to say so.**
+    // A filtered inner comprehension over the outer binder moves the filter onto the
+    // pair's `.1` binder (`lambda_elim`, the cast-wrapped lambda), so the curried
+    // collection is the argument restricted to `{𝐷 | 𝑝}` and only `curry_ty` records it.
+    // With the suffix absent the rewrite would leave `id` or 𝑓, and the filter would be
+    // gone. `map(id)` carries the narrowing, and planning materializes it as a per-group
+    // filter (`planning/per_group_filter.rs`).
+    //
+    // With 𝑓 absent the test is the one `id` itself would fail: the curry is `𝐴 ⇒ 𝐵`,
+    // and `id` types only where `𝐴` is `𝐵`.
+    let narrows = match &f {
+        None => curry_ty.domain() != curry_ty.codomain(),
+        Some(_) => restated.is_some(),
+    };
+    if narrows && suffix.is_empty() {
+        let Some(elem) = curry_ty.codomain().and_then(|c| c.codomain()) else {
+            unreachable!("a curry's result is a collection, got {curry_ty}")
         };
-        // **A curry whose collection is narrower than its argument keeps a node to say so.**
-        // A filtered inner comprehension over the outer binder moves the filter onto the
-        // pair's `.1` binder (`lambda_elim`, the cast-wrapped lambda), so the curried
-        // collection is the argument restricted to `{𝐷 | 𝑝}` and only `curry_ty` records it.
-        // With 𝑓 and the suffix both absent the rewrite would leave `id`, which
-        // `try_compose_identity` removes, and the filter would be gone. `map(id)` carries the
-        // narrowing, and planning materializes it as a per-group filter
-        // (`planning/per_group_filter.rs`).
-        //
-        // With 𝑓 present the narrowing reads the argument while `map` receives 𝑓's result,
-        // so no type spells it; that shape fails the post-elimination type check as it does
-        // without this rule.
-        //
-        // The test is the one `id` itself would fail: with 𝑓 and the suffix absent the curry
-        // is `𝐴 ⇒ 𝐵`, and `id` types only where `𝐴` is `𝐵`.
-        if f.is_none() && suffix.is_empty() && curry_ty.domain() != curry_ty.codomain() {
-            let Some(elem) = curry_ty.codomain().and_then(|c| c.codomain()) else {
-                unreachable!("a curry's result is a collection, got {curry_ty}")
-            };
-            suffix.push(id().with_ty(Type::fun(elem.clone(), elem)));
-        }
-        // With 𝑓 absent the `.0` arm hands `apply` the curry's argument unchanged,
-        // so `map(𝑔)` is the whole replacement and carries the curry's type as it
-        // stands — rebuilding it would drop the Pi binder a dependent refinement
-        // needs and mint the kind bare. With 𝑓 present the map node is a minted
-        // element behind 𝑓, spanning 𝑓's codomain at 𝑓's kind, and the curry's type
-        // rides the compose that replaces the node.
-        let mapped = (!suffix.is_empty()).then(|| {
-            let map_ty = match &f {
-                None => curry_ty.clone(),
-                Some(f) => match (f.ty.codomain(), curry_ty.codomain()) {
-                    (Some(domain), Some(codomain)) => {
-                        Type::fun_like_or_hole(&f.ty, &domain, &codomain)
-                    }
-                    _ => Type::Hole,
-                },
-            };
-            apply_primitive(collapse_compose(suffix), Builtin::Map, map_ty)
-        });
-        *expr = match (f, mapped) {
-            (Some(f), Some(mapped)) => Expr::compose(vec![f, mapped]).with_ty(curry_ty),
-            (Some(f), None) => f,
-            (None, Some(mapped)) => mapped,
-            (None, None) => id().with_ty(curry_ty),
-        };
-        return true;
+        suffix.push(id().with_ty(Type::fun(elem.clone(), elem)));
     }
-    false
+    // With 𝑓 absent the `.0` arm hands `apply` the curry's argument unchanged,
+    // so `map(𝑔)` is the whole replacement and carries the curry's type as it
+    // stands — rebuilding it would drop the Pi binder a dependent refinement
+    // needs and mint the kind bare. With 𝑓 present the map node is a minted
+    // element behind 𝑓, spanning 𝑓's codomain at 𝑓's kind, and the curry's type
+    // rides the compose that replaces the node.
+    let mapped = (!suffix.is_empty()).then(|| {
+        let map_ty = match (&f, restated) {
+            (None, _) => curry_ty.clone(),
+            (Some(_), Some(restated)) => restated,
+            (Some(f), None) => match (f.ty.codomain(), curry_ty.codomain()) {
+                (Some(domain), Some(codomain)) => Type::fun_like_or_hole(&f.ty, &domain, &codomain),
+                _ => Type::Hole,
+            },
+        };
+        apply_primitive(collapse_compose(suffix), Builtin::Map, map_ty)
+    });
+    *expr = match (f, mapped) {
+        (Some(f), Some(mapped)) => Expr::compose(vec![f, mapped]).with_ty(curry_ty),
+        (Some(f), None) => f,
+        (None, Some(mapped)) => mapped,
+        (None, None) => id().with_ty(curry_ty),
+    };
+    true
+}
+
+/// The type of `map(𝑔)` behind 𝑓 in [`try_exponential_eta`]: the curried collection's
+/// narrowing restated over 𝑓's result rather than over the curry's argument.
+///
+/// The curry is `(𝑥: 𝐴) ⇒ ({𝐷 | 𝑝(𝑥)} ⤇ 𝑉)` and 𝑓 is `𝐴 ⇒ (𝐷 ⤇ 𝑊)`. Where every
+/// read of 𝑥 in the codomain is `𝑥 ▷ 𝑓`, the answer is `(𝑐: 𝐷 ⤇ 𝑊) ⇒ ({𝐷 | 𝑝'(𝑐)} ⤇ 𝑉)`,
+/// with 𝑝' the predicate 𝑝 reading 𝑐 for `𝑥 ▷ 𝑓`. That is the shape planning
+/// materializes as a per-group filter (`planning/per_group_filter.rs`).
+///
+/// `Some(None)` where the codomain does not read 𝑥, and `None` where it reads 𝑥 other
+/// than through 𝑓: `map`'s input then holds too little to state the narrowing, and
+/// rewriting would drop it.
+fn narrowing_through(curry_ty: &Type, f: &Expr) -> Option<Option<Type>> {
+    let (
+        Type::Fun {
+            name: Some(binder),
+            fun_kind,
+            codomain,
+            ..
+        },
+        Some(collection),
+    ) = (curry_ty.peel_refinements(), f.ty.codomain())
+    else {
+        return Some(None);
+    };
+    let opened = crate::ccl::subst::open_codomain(curry_ty, codomain);
+    if !crate::ccl::ccl_utils::is_free_in_type(binder, &opened) {
+        return Some(None);
+    }
+    let restated_binder = Name::fresh_like(binder);
+    let read = Expr::var(&restated_binder).with_ty(collection.clone());
+    let mut restated = opened;
+    walk_refined_predicates_mut(
+        &mut restated,
+        &PredMemo::default(),
+        &(),
+        &mut |predicate, _| replace_application(predicate, binder, f, &read),
+    );
+    if crate::ccl::ccl_utils::is_free_in_type(binder, &restated) {
+        return None;
+    }
+    Some(Some(Type::pi_kinded(
+        restated_binder,
+        collection,
+        restated,
+        fun_kind.clone(),
+    )))
+}
+
+/// Replace every `binder ▷ 𝑓` in `expr` with `replacement`, reading a composite 𝑓
+/// `𝑓₁ ≫ … ≫ 𝑓ₙ` as the application spine `binder ▷ 𝑓₁ ▷ … ▷ 𝑓ₙ`. Answers whether any
+/// was replaced.
+///
+/// Morphisms match by node, not by type: a predicate's copy of 𝑓 is typed where the
+/// predicate was inferred, and 𝑓 where elimination built it.
+fn replace_application(expr: &mut Expr, binder: &Name, f: &Expr, replacement: &Expr) -> bool {
+    fn steps(f: &Expr) -> Vec<&Expr> {
+        match &f.node {
+            TypedExprNode::Compose(elts) => elts.iter().flat_map(steps).collect(),
+            _ => vec![f],
+        }
+    }
+    fn is_spine(expr: &Expr, binder: &Name, steps: &[&Expr]) -> bool {
+        let Some((last, rest)) = steps.split_last() else {
+            return matches!(&expr.node, TypedExprNode::Var(n) if n == binder);
+        };
+        matches!(&expr.node, TypedExprNode::Apply { argument, function }
+            if function.node == last.node && is_spine(argument, binder, rest))
+    }
+    fn walk(expr: &mut Expr, binder: &Name, steps: &[&Expr], replacement: &Expr) -> bool {
+        if is_spine(expr, binder, steps) {
+            *expr = replacement.clone();
+            return true;
+        }
+        let mut replaced = false;
+        expr.walk_children_mut(|child| replaced |= walk(child, binder, steps, replacement));
+        replaced
+    }
+    walk(expr, binder, &steps(f), replacement)
 }
 
 /// Flatten a [`TypedExprNode::Compose`] whose elements contain nested

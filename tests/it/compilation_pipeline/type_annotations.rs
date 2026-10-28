@@ -5,7 +5,7 @@ use bit_set::BitSet;
 use indoc::indoc;
 use rstest::rstest;
 
-use super::helpers::{check_compile_error, check_scalar, check_tile, make_int_list};
+use super::helpers::{check_compile_error, check_scalar, check_sink, check_tile, make_int_list};
 
 use cambra::ccl::infer::{TypeInferenceContext, infer, typecheck};
 use cambra::ccl::lower::{LoweringContext, lower_stmts};
@@ -1076,6 +1076,36 @@ h(7)
     )
 }
 
+/// TODO: Improve the error message in this case. The current message
+/// refers to the type of `set`'s lowering and `__anf`, neither of
+/// which are visible to the user.
+#[test]
+fn set_with_mutable_bare_confusing_error() {
+    check_compile_error(
+        indoc! {r#"
+x := 3
+x += 1
+s = set([x])
+s
+        "#},
+        "this function's result type ({[0, 0] | __elem ▷ [x] ▷ (λ __set_key → __set_key) == __gb_k} ⤇ Int) refines a parameter by `__anf`, which the function body binds opaquely; annotate the function's result type with a type that does not name `__anf`",
+    )
+}
+
+/// TODO: Fix Barendregt violation in lowering of `set`
+#[test]
+fn let_binding_set_arg_barendregt_violation() {
+    check_compile_error(
+        indoc! {r#"
+x = 3
+r = x
+s = set([r])
+s
+        "#},
+        "Barendregt violation",
+    )
+}
+
 /// It is unsound to consider the `r` from `f(1)` and the `r` from
 /// `f(2)` to be the same value, and so `r` should not be present in
 /// the external output type inferred for `f`.
@@ -1094,6 +1124,45 @@ b: {Int where _ == a} = f(2)
 a == b
         "#},
         "Unbound variable: 'r'",
+    )
+}
+
+/// The two branches are collections over different domains, so `s` is a sum, and its
+/// domain carries the arm each row came from.
+#[test]
+fn ite_data_fun() {
+    check_sink(
+        indoc! {r#"
+x := 3
+x += 1
+s = if x == 1:
+        box([1])
+    else:
+        box([1,2])
+out = test_sink()
+out << s
+        "#},
+        "[() -> [`1(0) -> 1, `1(1) -> 2]]",
+    )
+}
+
+/// A comprehension guard refines the domain of the list it builds, so inference gives
+/// `s : {[0, 2] | __elem ▷ [1, 2, 3] ▷ (λ y : Int → y > __anf)} ⤇ Int`, where `__anf`
+/// is the binder for the read of `x`.
+#[test]
+fn data_function_domain_refined_by_opaque_binder_in_guard() {
+    check_tile(
+        indoc! {r#"
+x := 1
+s = [y for y in [1, 2, 3] if y > x]
+s
+        "#},
+        Tile::data_function(
+            ColumnValue::UInts(vec![1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))),
+            Predicate::True,
+            BitSet::new(),
+        ),
     )
 }
 
@@ -1128,19 +1197,18 @@ ys
     )
 }
 
-/// TODO: Post-planning typechecks are still limited to structural
-/// equality, and thus fail for refinements that survive to
-/// post-planning. This is currently blocked by the lack of SMT
-/// encoding rules for point-free expressions.
+/// A refined mutable variable read twice meets a refined annotation. Post-planning type
+/// checks are refinement-blind, so the point-free refinements planning leaves need no
+/// SMT encoding.
 #[test]
 fn post_planning_smt() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
 x: Mut({Int where _ >= 0}) := 0
 y = x ^+ x
 z: {Int where _ >= 0} = y
 z        "#},
-        "post-planning produced an invalid tree",
+        Value::Int(0),
     )
 }
 
@@ -1345,13 +1413,9 @@ fn a_use_meets_a_refined_domain_of_a_function_parameter() {
 /// `y` as `{Int | __elem == __anf ^+ a}`, and meeting `z`'s annotation needs both
 /// `__anf`'s refinement and the parameter `a`'s. Coalescing decides it under the
 /// walk's lexical scope, which supplies `a`.
-///
-/// Currently passes inference but fails post-planning
-/// typecheck. Expect this to be fixed if post-inference refinements
-/// are erased.
 #[test]
 fn an_opaque_let_body_entailed_under_an_enclosing_binder() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
             def f(a: {Int where _ >= 0}):
                 x: Mut({Int where _ >= 0}) := 0
@@ -1361,7 +1425,7 @@ fn an_opaque_let_body_entailed_under_an_enclosing_binder() {
 
             f(1)
         "#},
-        "post-planning produced an invalid tree",
+        Value::Int(1),
     )
 }
 
@@ -1369,22 +1433,16 @@ fn an_opaque_let_body_entailed_under_an_enclosing_binder() {
 /// `let __anf : {Int | __elem >= 0} ^= x in __anf ^+ __anf`, and its body type
 /// `{Int | __elem == __anf ^+ __anf}` entails `{Int | __elem >= 0}` given `__anf`'s
 /// refinement.
-///
-/// TODO: Currently fails at post-planning typecheck due to pointfree
-/// refinements which are not structurally equal, and yet cannot be
-/// compared by SMT due to lack of encoding for pointfree
-/// expressions. Expect to fix this if post-inference refinements are
-/// erased.
 #[test]
 fn two_reads_of_a_refined_mut_meet_a_refined_annotation() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
             x: Mut({Int where _ >= 0}) := 0
             y = x ^+ x
             z: {Int where _ >= 0} = y
             z
         "#},
-        "post-planning produced an invalid tree",
+        Value::Int(0),
     )
 }
 
@@ -1404,27 +1462,15 @@ t
     )
 }
 
-/// TODO: Allow a `^+` in a comprehension element. No mutable variable is
-/// involved — the element's refinement alone trips lambda elimination.
-///
-/// The generator lambda's codomain quotes its own body, which holds the `let`
-/// binding the source lookup. Elimination rewrites that body and rebuilds the
-/// quoting type only at a `Let` node, so the lambda's codomain still quotes the
-/// uneliminated form while the reconstruction quotes the eliminated one, and the
-/// pass's type-preservation assert compares the two structurally. The assert is
-/// `debug_assertions`-gated, so the program compiles under a profile that drops
-/// it.
-#[cfg(debug_assertions)]
+/// A `^+` in a comprehension element, with no mutable variable involved.
 #[test]
-fn refined_add_in_a_comprehension_element_not_supported() {
-    check_compile_error(
+fn refined_add_in_a_comprehension_element() {
+    check_tile(
         indoc! {r#"
 ys = [1 ^+ i for i in [1,2]]
 ys
         "#},
-        "((__iter_record: [0, 1]) ⤇ {Int | __elem == 1 ^+ (let __anf : ([0, 1] ⤇ Int) = [1, 2]
-in __iter_record ▷ __anf)}) vs ((__iter_record: [0, 1]) ⤇ \
-         {Int | __elem == 1 ^+ __iter_record ▷ ((id, [1, 2] ▷ const) ▷ zip ≫ apply)})",
+        make_int_list(&[2, 3]),
     )
 }
 
@@ -1443,39 +1489,30 @@ fn read_captured_mut_inside_comprehension(#[case] decl: &str, #[case] after: &st
     check_tile(&program, make_int_list(&[4, 5]));
 }
 
-/// TODO: Allow a second operation between a comprehension element's mutable
-/// read and the element value.
+/// Two operations between a comprehension element's mutable read and the element value.
 #[test]
-fn two_operations_on_a_mut_read_in_a_comprehension_not_supported() {
-    check_compile_error(
+fn two_operations_on_a_mut_read_in_a_comprehension() {
+    check_tile(
         indoc! {r#"
 x := 3
 ys = [x ^+ x ^+ i for i in [1,2]]
 ys
         "#},
-        // The binder's uid counts from the run, not from the program, so it is left out.
-        "Barendregt violation: substitution range mentions binder `Unique { base: \"i\"",
+        make_int_list(&[7, 8]),
     )
 }
 
-/// TODO: Allow a nested comprehension's element to read a mutable variable.
-///
-/// The same lift
-/// (`two_operations_on_a_mut_read_in_a_comprehension_not_supported`). The outer
-/// generator's binder is the first operation's second operand here, so the inner
-/// element lambda carries the same intermediate transparent `let`, and its
-/// eliminated definition holds the refinement free on the same unnamed `Fun`
-/// slots. The binder reported is the nested pair the enclosing binders merge
-/// into rather than any generator's own parameter.
+/// A nested comprehension's element reads a mutable variable and both generators' binders.
 #[test]
-fn nested_comprehension_reading_a_mut_not_supported() {
-    check_compile_error(
+fn nested_comprehension_reading_a_mut() {
+    check_sink(
         indoc! {r#"
 x := 3
 ys = [[x ^+ i ^+ j for j in [10,20]] for i in [1,2]]
-ys
+out = test_sink()
+out << ys
         "#},
-        "Barendregt violation: substitution range mentions binder `Synthetic { kind: Pair",
+        "[() -> [[14, 24], [15, 25]]]",
     )
 }
 
@@ -1666,15 +1703,15 @@ ys = [x ^+ i for i in [1,2]]
     )
 }
 
-/// TODO: Make comprehension bindings opaque.
+/// A comprehension over a comprehension whose elements read a mutable variable.
 #[test]
 fn nesting_a_comprehension_carries_mut_into_refinement() {
-    check_compile_error(
+    check_tile(
         indoc! {r#"
 x := 3
 [y ^+ 1 for y in [x ^+ i for i in [1,2]]]
         "#},
-        "Barendregt violation: substitution range mentions binder `Synthetic { kind: IterRecord,",
+        make_int_list(&[5, 6]),
     )
 }
 
@@ -1708,34 +1745,27 @@ f(1) ^+ 1
 
 #[test]
 fn refined_op_on_opaque() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
 x := 4
 y = x ^+ 1
 y ^+ 1
         "#},
-        "expected {Int | __elem == __anf ^+ 1 ^+ 1}, found {Int | __elem == (__anf, 1) ▷ add_refined ^+ 1}",
+        Value::Int(6),
     )
 }
 
-/// The refined `y ^+ 1` in `zs` keeps its refinement through lambda
-/// elimination, which rewrites the refinement's free variable and so changes
-/// the node's type. With `debug_assertions` on, lambda elimination's own
-/// type-preservation assertion reports this. Without them, the
-/// post-lambda-elim check does.
+/// The refined `y ^+ 1` in `zs` reads the binder of a comprehension over a let-bound
+/// comprehension.
 #[test]
-fn refined_op_in_nested_comprehension_not_supported() {
-    check_compile_error(
+fn refined_op_in_nested_comprehension() {
+    check_tile(
         indoc! {r#"
 ys = [i for i in [1,2]]
 zs = [y ^+ 1 for y in ys]
 zs
         "#},
-        if cfg!(debug_assertions) {
-            "lambda elimination changed a node's type"
-        } else {
-            "post-lambda-elim produced an invalid tree"
-        },
+        make_int_list(&[2, 3]),
     )
 }
 

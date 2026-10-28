@@ -54,11 +54,6 @@ use panic_message::panic_message;
 const BROKEN: &[(&str, &str, &str)] = &[
     ("function_body", "rows_sum", "CompilerPanics"),
     ("generator_yield", "rows_sum", "CompilerPanics"),
-    (
-        "loop_source_in_loop",
-        "binder_filtered_comp[i]",
-        "CompilerPanics",
-    ),
     ("loop_source_in_loop", "dup_union", "CompilerRejects"),
     ("loop_source_in_loop", "map_arrow", "CompilerPanics"),
     ("loop_source_in_loop", "map_lit", "CompilerPanics"),
@@ -85,7 +80,11 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ("record_in_list", "sum_of_empty", "CompilerRejects"),
     ("record_in_list", "ternary", "CompilerRejects"),
     ("record_in_list", "union_sum", "CompilerRejects"),
+    // Lambda elimination's `debug_assertions`-gated type-preservation assert rejects these two;
+    // without it they agree.
+    #[cfg(debug_assertions)]
     ("rows_comp_source", "rows_filtered", "CompilerPanics"),
+    #[cfg(debug_assertions)]
     ("rows_inner_filter", "rows_filtered", "CompilerPanics"),
     ("rows_loop_feed", "rows_filtered", "CompilerRejects"),
     ("rows_nested_mut", "rows_filtered", "CompilerRejects"),

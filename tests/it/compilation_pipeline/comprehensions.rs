@@ -323,27 +323,19 @@ fn a_filtered_inner_comprehension_over_the_outer_row_keeps_its_filter(
     check_scalar(program, Value::Int(total));
 }
 
-/// A filtered inner comprehension over a **projection of the outer row** does not compile.
-/// The filter reads the row while the collection it narrows is the projection, and no type
-/// relates the two, so the post-elimination type check rejects the program. Pinned as it
-/// fails; `projected_row` answers 9.
-///
-/// Inside a `with begin():` block a mutable variable arrives as a projection of the block's
-/// snapshot tuple, so a filtered comprehension over a map-valued one is the same shape:
-/// `mut_var_in_block` reaches the same rejection, filtering `__txp.0`, and answers 10.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::projected_row("sum([sum([v for v in r.xs if v > 1]) for r in [(xs=[1, 2]), (xs=[3, 4])]])")]
 #[case::mut_var_in_block(indoc! {r"
-    m: Mut(Map(Int, Int), Txn) := box(map([(1, 10)]))
+    m: Mut(Map(Int, Int), Txn) := box(map([(1, 9)]))
     n: Mut(Int, Txn) := 0
     for r in [1, 2]:
         with begin():
             n := sum([v for v in m if v > 0])
     await_final(n)
 "})]
-fn a_filtered_inner_comprehension_over_a_projected_row_does_not_compile(#[case] code: &str) {
-    check_compile_error(code, "post-lambda-elim produced an invalid tree");
+fn a_filtered_inner_comprehension_over_a_projected_row_compiles(#[case] code: &str) {
+    check_scalar(code, Value::Int(9));
 }
 
 /// The same with **no outer aggregate**, so the narrowed collection per row is the answer's
@@ -943,7 +935,7 @@ fn a_correlated_comprehension_over_an_unnamed_map_source_is_unsupported() {
     );
 }
 
-/// A correlated filter with **no aggregate over it** does not compile, where the same filter
+/// A correlated filter with **no aggregate over it** fails a debug build, where the same filter
 /// under a `sum` does (`a_correlated_inner_comprehension_runs_per_outer_row`,
 /// `correlated_filter`). The one predicate ends up spelled two ways — the term reads the outer
 /// list through the iteration record, while the copy in the type reads it through a `let` —
@@ -954,8 +946,10 @@ fn a_correlated_comprehension_over_an_unnamed_map_source_is_unsupported() {
 /// (__iter_record: [0, 1]) ⤇ ({[0, 2] | … v > __iter_record ▷ ((id, [1, 2] ▷ const) ▷ zip ≫ apply)} ⤇ Int)
 /// ```
 ///
-/// That check is `debug_assertions`-gated. Without it the tree reaches the post-lambda-elim
-/// wall, which reports the same disagreement as a collection-domain mismatch.
+/// That check is `debug_assertions`-gated and compares refinements structurally. Without it
+/// the program compiles and answers `[[2, 3], [6]]`, each inner list keyed by its source
+/// positions. The post-lambda-elim check is refinement-blind
+/// (`crate::ccl::infer::RefinementBlind`), so it does not see the disagreement.
 ///
 /// The fault is below the re-basing rewrite rather than in it: the rewrite that reaches one
 /// occurrence does not reach the other (`refinements-dependent-projection-of-a-refined-pair`
@@ -966,15 +960,13 @@ fn a_correlated_comprehension_over_an_unnamed_map_source_is_unsupported() {
     debug_assertions,
     should_panic(expected = "lambda elimination changed a node's type")
 )]
-#[cfg_attr(
-    not(debug_assertions),
-    should_panic(expected = "Type mismatch for collection domain")
-)]
-fn a_correlated_filter_without_an_aggregate_does_not_compile() {
-    check_tile(
-        "[[v * r for v in [1, 2, 3] if v > r] for r in [1, 2]]",
-        // `[[2, 3], [6]]` if it compiled.
-        make_int_list(&[]),
+fn a_correlated_filter_without_an_aggregate_compiles_only_without_debug_assertions() {
+    check_sink(
+        indoc! {r#"
+            out = test_sink()
+            out << [[v * r for v in [1, 2, 3] if v > r] for r in [1, 2]]
+        "#},
+        "[() -> [[1 -> 2, 2 -> 3], [2 -> 6]]]",
     );
 }
 

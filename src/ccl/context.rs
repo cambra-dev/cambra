@@ -17,7 +17,7 @@ use log::debug;
 
 use crate::{
     ccl::{
-        Expr, Home, Name, Type, TypedExprNode, anf, channelize, comprehension,
+        Expr, Home, Name, Type, TypedExprNode, anf, channelize, comprehension, erase_refinements,
         infer::{
             Contract, InferError, LocatedInferError, TypeInferenceContext, check_module,
             check_mut_discipline, check_mut_write_targets, check_pre_channelize,
@@ -1245,7 +1245,7 @@ pub struct CompiledProgram {
     /// Distinct from the planned `ast`; see `src/ccl/design/provenance.md`,
     /// "Retained snapshots".
     pub post_inference_ir: Expr,
-    /// Snapshot after Inline, Transact, Letrec and Channelize.
+    /// Snapshot after Inline, Transact, Letrec, EraseRefinements and Channelize.
     /// Channelization has eliminated Defer/Feed/Define; surviving IDs remain shared
     /// with earlier snapshots. See `src/ccl/design/provenance.md`, "Retained snapshots".
     pub post_channelize_ir: Expr,
@@ -1359,6 +1359,11 @@ pub enum Phase {
     Transact,
     /// Induction-loop lowering by `mut_elim::run`, before channelization.
     Letrec,
+    /// Refinement erasure by `erase_refinements::run`: makes every opaque `Let`
+    /// transparent, drops every refinement but a data function domain's, and
+    /// eliminates `Let`s by the [`Inline`](Self::Inline) rules. Runs after
+    /// `Letrec`, before `Channelize`.
+    EraseRefinements,
     /// Eliminate Defer/Feed/Define through channel construction, recording new
     /// products while preserving IDs for unchanged material.
     Channelize,
@@ -2567,6 +2572,20 @@ fn run_passes(
     settle(&phase_out, "post-letrec", Check::PreChannelize)?;
     audit_letrec.finish(&phase_out);
     if at_phase_output(Phase::Letrec, &phase_out, stop, capture, panes) {
+        return Ok(phase_out);
+    }
+
+    // With every mutable variable eliminated, no binder has a value to withhold from
+    // a type, and no phase below reads a refinement other than a data function's
+    // domain. See `crate::ccl::erase_refinements`.
+    let phase_out = recorded(capture_provenance, Phase::EraseRefinements, || {
+        erase_refinements::run(phase_out)
+    });
+    // Every check from here on relates types up to refinements: the phase kept only a
+    // data function's domain refinements, which no argument carries any longer.
+    let _refinement_blind = crate::ccl::infer::RefinementBlind::enter();
+    settle(&phase_out, "post-erase-refinements", Check::PreChannelize)?;
+    if at_phase_output(Phase::EraseRefinements, &phase_out, stop, capture, panes) {
         return Ok(phase_out);
     }
 

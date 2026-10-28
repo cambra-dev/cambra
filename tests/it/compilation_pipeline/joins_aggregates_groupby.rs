@@ -347,7 +347,7 @@ fn a_bare_groupby_tail_is_driven() {
 // `case_21`); it is a carried refinement that happens to survive to here.
 #[case(
     "1",
-    "1:{Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)}",
+    "1:Int",
     Tile::Scalar(ColumnValue::Ints(vec![1]))
 )]
 // Closed arithmetic reaches op conversion as the literal it computes, a whole chain of it
@@ -385,7 +385,7 @@ fn a_bare_groupby_tail_is_driven() {
 // nothing eliminating a `let` whose body no longer reads it.
 #[case(
     "y = 10; [x + y for x in [1,2,3]]",
-    "let y : {Int | __elem ▷ ((id, 10 ▷ const) ▷ zip ≫ eq)} = 10\nin iterate ≫ [1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add:([0, 2] ⤇ Int)",
+    "let y : Int = 10\nin iterate ≫ [1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add:([0, 2] ⤇ Int)",
     make_int_list(&[11,12,13])
 )]
 #[case(
@@ -1418,13 +1418,16 @@ fn a_per_group_count_that_ignores_the_row() {
     );
 }
 
-/// A `groupby` over a comprehension of records bound to a name first does not compile: the
-/// post-lambda-elim type check rejects the collection domain of the grouping. The same
-/// comprehension written inline as the `groupby` source compiles, which the `groupby_source` row
-/// of `tests/it/generated_pairs.rs` holds for its `rec_comp` and `rec_filtered` fillers.
+/// A `groupby` over a comprehension of records bound to a name first does not compile.
+/// Planning does not rewrite the grouping into a `converse` index, so it iterates the key
+/// domain `{String | __elem ▷ ((rows ≫ (λ r → r.region)) ▷ collection_contains)}` directly, and
+/// op conversion rejects `collection_contains` taking an input operator. The same comprehension
+/// written inline as the `groupby` source compiles, which the `groupby_source` row of
+/// `tests/it/generated_pairs.rs` holds for its `rec_comp` and `rec_filtered` fillers.
 #[test]
 #[should_panic(
-    expected = "post-lambda-elim produced an invalid tree: [Type mismatch for collection domain"
+    expected = "Only higher-order combinators (map, const, zip) can take an input operator; \
+                found input for non-combinator collection_contains"
 )]
 fn a_groupby_over_a_bound_comprehension_of_records() {
     check_tile(

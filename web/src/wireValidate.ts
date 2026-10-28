@@ -99,6 +99,7 @@ const ALLOWED_VIA = [
   "Inline",
   "Transact",
   "Letrec",
+  "EraseRefinements",
   "Channelize",
   "AsOfRead",
   "LambdaElim",
