@@ -10,19 +10,24 @@ use super::notification_sound::{
     int_stream, int_stream_tiling, keys_region, positions_stream,
 };
 use super::*;
-use crate::interpreter::{BaseType, CurryLevel, Extent, Predicate, Projection, Tiling};
+use crate::interpreter::{
+    BaseType, ColumnValue, CurryLevel, Extent, Predicate, Projection, Tiling,
+};
 
 type Build = dyn Fn(Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator>;
 
 fn stream_tiling(values: Values) -> Tiling {
-    Tiling::data_function(
-        Extent::uint_range(16),
-        Tiling::Scalar(match values {
-            Values::Ints => Extent::Base(BaseType::Int),
-            Values::Bools => Extent::Base(BaseType::Bool),
-            Values::Positions => Extent::uint_range(16),
-        }),
-    )
+    let keys = Extent::uint_range(16);
+    let scalar = |extent| Tiling::data_function(keys.clone(), Tiling::Scalar(extent));
+    match values {
+        Values::Ints => scalar(Extent::Base(BaseType::Int)),
+        Values::Bools => scalar(Extent::Base(BaseType::Bool)),
+        Values::Positions => scalar(Extent::uint_range(16)),
+        Values::Nested => Tiling::data_function(
+            keys.clone(),
+            Tiling::data_function(keys, Tiling::Scalar(Extent::Base(BaseType::Int))),
+        ),
+    }
 }
 
 /// Keys that arrive out of order, an `Everything` notification, a step that changes nothing, and
@@ -367,4 +372,158 @@ fn select_field_releases_only_what_nothing_beneath_it_reads_again() {
         tiles.into_iter().map(as_records).collect::<Vec<_>>(),
     )];
     assert_release_sound(&select_field, &feeds, &[last], &keys_region(&[1, 2, 3]));
+}
+
+/// The growth scripts of one nested input: every element added to a group notifies the group's
+/// outer key.
+fn check_nested(build: &Build, expect: Expect) {
+    let expect = [expect];
+    for (seed, steps, growth) in [
+        (1, 12, Growth::OneAtATime),
+        (2, 10, Growth::Bursts),
+        (3, 14, Growth::CompletenessAndEmpty),
+        (4, 14, Growth::OneAtATime),
+    ] {
+        let (tiles, script) = grow(seed, steps, growth, Values::Nested);
+        let feeds = [(stream_tiling(Values::Nested), tiles)];
+        assert_notification_sound(build, &feeds, &script, &expect);
+    }
+}
+
+fn map_aggregate(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    Box::new(MapAggregate::new(
+        inputs.remove(0),
+        crate::ccl::AggregateKind::Sum,
+    ))
+}
+
+#[test]
+fn map_aggregate_notifies_the_outer_key_of_a_group_that_gained_an_element() {
+    check_nested(&map_aggregate, Expect::Exact);
+}
+
+fn map_extract_aggregate(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    let fold = MapAggregate::new(inputs.remove(0), crate::ccl::AggregateKind::Sum);
+    Box::new(MapExtractAggregate::new(
+        Box::new(fold),
+        crate::ccl::AggregateKind::Sum,
+    ))
+}
+
+#[test]
+fn map_extract_aggregate_notifies_the_outer_key_of_a_group_that_gained_an_element() {
+    check_nested(&map_extract_aggregate, Expect::Exact);
+}
+
+fn converse(level: CurryLevel) -> impl Fn(Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    move |mut inputs| Box::new(Converse::new_at(inputs.remove(0), level))
+}
+
+/// Beneath a standing level the outer keys stand, and only the group under one is inverted.
+#[test]
+fn converse_beneath_a_level_notifies_the_outer_key_of_a_group_that_gained_an_element() {
+    check_nested(&converse(CurryLevel::new(1)), Expect::Exact);
+}
+
+/// At the outermost level the values become the keys, so a changed key names none of the output's.
+#[test]
+fn converse_at_the_outermost_level_widens_over_growth() {
+    check(
+        &converse(CurryLevel::OUTERMOST),
+        Values::Ints,
+        Expect::Widens,
+    );
+}
+
+fn uncurry(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    Box::new(Uncurry::new(inputs.remove(0)))
+}
+
+/// Pairing the whole tile re-keys it: an outer key's group becomes pairs keyed by both keys.
+#[test]
+fn uncurry_at_the_outermost_level_widens_over_growth() {
+    check_nested(&uncurry, Expect::Widens);
+}
+
+/// The scripts of an operator over a nested input and a constant that never changes.
+fn check_with_constant(
+    build: &Build,
+    input: Values,
+    constant: Tile,
+    constant_tiling: Tiling,
+    expect: Expect,
+) {
+    for (seed, steps, growth) in [
+        (1, 12, Growth::OneAtATime),
+        (2, 10, Growth::Bursts),
+        (3, 14, Growth::CompletenessAndEmpty),
+    ] {
+        let (tiles, script) = grow(seed, steps, growth, input);
+        let feeds = [
+            (stream_tiling(input), tiles),
+            (constant_tiling.clone(), vec![constant.clone()]),
+        ];
+        assert_notification_sound(build, &feeds, &script, &[expect, Expect::Widens]);
+    }
+}
+
+fn map_result_to_const(
+    level: CurryLevel,
+) -> impl Fn(Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    move |mut inputs| {
+        let constant = inputs.remove(1);
+        Box::new(MapResultToConst::new_at(
+            inputs.remove(0),
+            constant,
+            MapResultToConstMode::Replace,
+            level,
+        ))
+    }
+}
+
+fn int_constant() -> (Tile, Tiling) {
+    (
+        Tile::Scalar(ColumnValue::Ints(vec![7])),
+        Tiling::Scalar(Extent::Base(BaseType::Int)),
+    )
+}
+
+#[test]
+fn map_result_to_const_beneath_a_level_notifies_its_inputs_region() {
+    let (constant, tiling) = int_constant();
+    check_with_constant(
+        &map_result_to_const(CurryLevel::new(1)),
+        Values::Nested,
+        constant,
+        tiling,
+        Expect::Exact,
+    );
+}
+
+/// At the outermost level the constant replaces the whole input.
+#[test]
+fn map_result_to_const_at_the_outermost_level_widens_its_inputs_region() {
+    let (constant, tiling) = int_constant();
+    check_with_constant(
+        &map_result_to_const(CurryLevel::OUTERMOST),
+        Values::Ints,
+        constant,
+        tiling,
+        Expect::Widens,
+    );
+}
+
+fn product(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    let inner = inputs.remove(1);
+    Box::new(Product::per_row_at(
+        inputs.remove(0),
+        inner,
+        CurryLevel::new(1),
+    ))
+}
+
+#[test]
+fn product_notifies_exactly_what_either_side_changed_over_growth() {
+    let shapes = [(Values::Ints, None), (Values::Nested, None)];
+    check_many(&product, &shapes, &[Expect::Exact, Expect::Exact]);
 }

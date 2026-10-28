@@ -248,6 +248,19 @@ pub(crate) fn assert_notification_sound(
             .fold(Projection::Nothing, |all, region| all.union(&region));
         let after = answer(build, feeds, &at, &Projection::Everything);
         let tiling = operator.tiling().clone();
+        // A region of keys names keys of the output's outermost collection, so it has to be one
+        // whose keys positions can name: a record- or value-keyed output, which a re-keying
+        // operator produces, is not named by the positions its input changed at.
+        if let Projection::Keys(_) = &notified {
+            match &tiling {
+                Tiling::DataFunction { domain, .. } => assert!(
+                    domain.includes(&Extent::uint_range(1)),
+                    "step {n}: the operator notified keys {notified:?} of an output keyed by \
+                     {domain:?}"
+                ),
+                other => panic!("step {n}: the operator notified keys of {other}"),
+            }
+        }
         let outside = Projection::Everything.minus(&notified);
         let mut before_outside = before.clone();
         before_outside.restrict_to(&outside, &tiling);
@@ -340,6 +353,9 @@ pub(crate) enum Values {
     Bools,
     /// Positions in `0..12`, the keys of a table the stream's values are looked up in.
     Positions,
+    /// A collection of collections of integers: each step adds an element to the group of an
+    /// outer key, which it creates when it is new.
+    Nested,
 }
 
 /// A stream keyed by position holding the booleans `entries`, complete over `complete`.
@@ -402,6 +418,49 @@ impl Stream {
     pub(crate) fn tile(&self) -> Tile {
         match self.values {
             Values::Ints => int_stream(&self.present, self.complete.clone()),
+            Values::Nested => {
+                let mut sorted = self.present.clone();
+                sorted.sort_by_key(|(key, _)| *key);
+                let mut outer = Vec::new();
+                let mut row_starts = if sorted.is_empty() { vec![] } else { vec![0] };
+                let mut inner = Vec::new();
+                for (key, value) in &sorted {
+                    if outer.last() != Some(key) {
+                        if !outer.is_empty() {
+                            row_starts.push(inner.len());
+                        }
+                        outer.push(*key);
+                    }
+                    inner.push(*value);
+                }
+                let group_keys: Vec<u64> = {
+                    let mut next = 0u64;
+                    let mut last = None;
+                    sorted
+                        .iter()
+                        .map(|(key, _)| {
+                            if last != Some(*key) {
+                                next = 0;
+                                last = Some(*key);
+                            }
+                            next += 1;
+                            next - 1
+                        })
+                        .collect()
+                };
+                Tile::data_function(
+                    ColumnValue::UInts(outer),
+                    Box::new(Tile::grouped(
+                        row_starts,
+                        ColumnValue::UInts(group_keys),
+                        Box::new(Tile::Scalar(ColumnValue::Ints(inner))),
+                        Predicate::False,
+                        BitSet::new(),
+                    )),
+                    self.complete.clone(),
+                    BitSet::new(),
+                )
+            }
             Values::Positions => {
                 let mut sorted = self.present.clone();
                 sorted.sort();
@@ -448,7 +507,9 @@ impl Stream {
             let in_class = self
                 .key_class
                 .is_none_or(|(modulus, residue)| key % modulus == residue);
-            if in_class && self.present.iter().all(|(k, _)| *k != key) {
+            let new = matches!(self.values, Values::Nested)
+                || self.present.iter().all(|(k, _)| *k != key);
+            if in_class && new {
                 self.present.push((key, (rng.next() % 100) as i64));
                 added.push(key);
             }
