@@ -170,6 +170,24 @@ fn zip_forwards_the_region_of_its_second_arm_without_state() {
     assert_keeps_without_state(&zip, 1);
 }
 
+fn product() -> Built {
+    let (outer, first) = feed(ints());
+    let (inner, second) = feed(nested());
+    let op = Product::per_row_at(outer, inner, CurryLevel::new(1));
+    (Box::new(op), vec![first, second])
+}
+
+#[test]
+fn product_forwards_the_region_of_its_outer_side() {
+    assert_keeps(&product, 0);
+}
+
+#[test]
+fn product_forwards_the_region_of_its_inner_side_without_state() {
+    assert_keeps(&product, 1);
+    assert_keeps_without_state(&product, 1);
+}
+
 fn int() -> Extent {
     Extent::Base(BaseType::Int)
 }
