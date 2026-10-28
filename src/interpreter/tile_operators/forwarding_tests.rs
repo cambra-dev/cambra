@@ -164,6 +164,24 @@ fn map_aggregate_carries_no_region_between_notifications() {
     assert_keeps_without_state(&map_aggregate, 0);
 }
 
+/// The extract reads the groups a `MapAggregate` folds, so the region passes both.
+fn map_extract_aggregate() -> Built {
+    let (input, consumer) = feed(nested());
+    let fold = MapAggregate::new(input, crate::ccl::AggregateKind::Sum);
+    let op = MapExtractAggregate::new(Box::new(fold), crate::ccl::AggregateKind::Sum);
+    (Box::new(op), vec![consumer])
+}
+
+#[test]
+fn map_extract_aggregate_forwards_its_inputs_outermost_region() {
+    assert_keeps(&map_extract_aggregate, 0);
+}
+
+#[test]
+fn map_extract_aggregate_carries_no_region_between_notifications() {
+    assert_keeps_without_state(&map_extract_aggregate, 0);
+}
+
 fn memo() -> Built {
     let (input, consumer) = feed(ints());
     (Box::new(Memo::new(input)), vec![consumer])
