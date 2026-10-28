@@ -2049,6 +2049,225 @@ fn a_cross_domain_read_carries_across_the_positions_that_did_not_write_it() {
     check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![3])));
 }
 
+/// BUG: a block that reads a binding its loop body makes before it panics the compiler. A
+/// binding's scope runs to the end of its block (`docs/chl-spec.md`, "5. Scoping and binding"),
+/// so each program is valid, and each expected value is the differential interpreter's. The
+/// writer is built from the block and placed outside the loop body, out of the binding's scope.
+/// The last two cases read, through `y`, an accumulator the loop body writes after `y` is bound:
+/// `y` reads `c` at 0, 1 and 2. These cases pin the panic; the `should_panic` comes off when the
+/// block reads the binding.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::from_the_loop_item(
+    indoc! {r#"
+        n: Mut(Int, Txn) := 0
+        for x in [3, 1, 2]:
+            y = x * 10
+            with begin():
+                n := n + y
+        await_final(n)
+    "#},
+    60
+)]
+#[case::constant(
+    indoc! {r#"
+        n: Mut(Int, Txn) := 0
+        for x in [3, 1, 2]:
+            y = 10
+            with begin():
+                n := n + y
+        await_final(n)
+    "#},
+    30
+)]
+#[case::from_a_function_call(
+    indoc! {r#"
+        def f(a: Int):
+            a * 10
+        n: Mut(Int, Txn) := 0
+        for x in [3, 1, 2]:
+            y = f(x)
+            with begin():
+                n := n + y
+        await_final(n)
+    "#},
+    60
+)]
+#[case::from_a_field_of_the_loop_item(
+    indoc! {r#"
+        n: Mut(Int, Txn) := 0
+        for r in [(a=1, b=2), (a=3, b=4)]:
+            y = r.a
+            with begin():
+                n := n + y
+        await_final(n)
+    "#},
+    4
+)]
+// `y` reads `c` after the iteration's last write to it, so the block reads `c` at its
+// iteration: 2 + 4 + 6.
+#[case::from_an_accumulator_after_its_write(
+    indoc! {r#"
+        n: Mut(Int, Txn) := 0
+        c: Mut(Int) := 0
+        for x in [3, 1, 2]:
+            c := c + 1
+            y = c * 2
+            with begin():
+                n := n + y
+        await_final(n)
+    "#},
+    12
+)]
+// The block reads `z`, and `z` reads `y`: the writer takes both.
+#[case::through_a_chain(
+    indoc! {r#"
+        n: Mut(Int, Txn) := 0
+        for x in [3, 1, 2]:
+            y = x * 10
+            z = y + 1
+            with begin():
+                n := n + z
+        await_final(n)
+    "#},
+    63
+)]
+// Two blocks in one loop body, the second reading a binding made between them as well as
+// one made before both: `n` is 60, `m` is 61 + 21 + 41.
+#[case::by_two_blocks(
+    indoc! {r#"
+        n: Mut(Int, Txn) := 0
+        m: Mut(Int, Txn) := 0
+        for x in [3, 1, 2]:
+            y = x * 10
+            with begin():
+                n := n + y
+            z = y + 1
+            with begin():
+                m := m + z + y
+        await_final(n) * 1000 + await_final(m)
+    "#},
+    60123
+)]
+// The guard reads the snapshot and the arm reads the binding: `n` takes 30 and then 40, and
+// the third block's guard fails at 40.
+#[case::under_a_guard(
+    indoc! {r#"
+        n: Mut(Int, Txn) := 0
+        for x in [3, 1, 2]:
+            y = x * 10
+            with begin():
+                if n < 40:
+                    n := n + y
+        await_final(n)
+    "#},
+    40
+)]
+#[case::reading_an_accumulator_written_after_it_on_the_loop_body(
+    indoc! {r#"
+        n: Mut(Int, Txn) := 0
+        c: Mut(Int) := 0
+        for x in [3, 1, 2]:
+            y = c * 2
+            c := c + 1
+            with begin():
+                n := n + y
+        await_final(n)
+    "#},
+    6
+)]
+#[case::reading_an_accumulator_written_after_it_in_the_block(
+    indoc! {r#"
+        n: Mut(Int, Txn) := 0
+        c: Mut(Int) := 0
+        for x in [3, 1, 2]:
+            y = c * 2
+            with begin():
+                c := c + 1
+                n := n + y
+        await_final(n)
+    "#},
+    6
+)]
+// Pinned on the failure rather than deferred: an `#[ignore]` reports the same green whether
+// the gap closed, regressed, or went away, and nothing runs ignored tests here.
+#[should_panic(expected = "escaped its binder")]
+fn bug_a_block_reading_a_loop_body_binding_panics(#[case] code: &str, #[case] expected: i64) {
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![expected])));
+}
+
+/// BUG: the same panic for a binding whose value runs a write, here through an inlined call.
+/// `c` is 1, 2 and 3 where `y` is bound, so the differential interpreter answers 60.
+#[test]
+#[should_panic(expected = "escaped its binder")]
+fn bug_a_block_reading_a_binding_computed_by_a_write_panics() {
+    check_tile(
+        indoc! {r#"
+            def bump(p: Mut(Int)):
+                p := p + 1
+                p * 10
+            n: Mut(Int, Txn) := 0
+            c: Mut(Int) := 0
+            for x in [3, 1, 2]:
+                y = bump(c)
+                with begin():
+                    n := n + y
+            await_final(n)
+        "#},
+        Tile::Scalar(ColumnValue::Ints(vec![60])),
+    );
+}
+
+/// A commit decision after the iteration's write to an induction accumulator reads the written
+/// value: `cnt` is 1, 2 and 3, so `a` is 12, as the differential interpreter answers.
+#[test]
+fn a_commit_decision_reads_the_accumulator_written_before_it() {
+    check_tile(
+        indoc! {r#"
+            cnt := 0
+            a: Mut(Int, Txn) := 0
+            for x in [3, 1, 2]:
+                cnt := cnt + 1
+                with begin():
+                    a := a + cnt * 2
+            await_final(a)
+        "#},
+        Tile::Scalar(ColumnValue::Ints(vec![12])),
+    );
+}
+
+/// BUG: a commit decision reads an induction accumulator's value at the end of its iteration, so
+/// a read placed before the iteration's write sees that write. An in-context read is "the
+/// previous iteration's value, or, after a write earlier in the same iteration/block, the
+/// just-written value" (`docs/chl-spec.md`, "8.3 Reads"), and the differential interpreter
+/// agrees: each case reads `cnt` as 0, 1 and 2, so `a` is 6. The compiler reads 1, 2 and 3 and
+/// answers 12, the value [`a_commit_decision_reads_the_accumulator_written_before_it`] gets with
+/// the write first. These cases pin the current wrong value; change it to 6 when the read sees the
+/// value before the write.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::written_after_the_block(indoc! {r#"
+    cnt := 0
+    a: Mut(Int, Txn) := 0
+    for x in [3, 1, 2]:
+        with begin():
+            a := a + cnt * 2
+        cnt := cnt + 1
+    await_final(a)
+"#})]
+#[case::written_in_the_block_after_the_read(indoc! {r#"
+    cnt := 0
+    a: Mut(Int, Txn) := 0
+    for x in [3, 1, 2]:
+        with begin():
+            a := a + cnt * 2
+            cnt := cnt + 1
+    await_final(a)
+"#})]
+fn bug_a_commit_decision_reads_an_accumulator_written_after_it(#[case] code: &str) {
+    check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![12])));
+}
+
 /// **Phase separation through a writer's iteration source.** The extent of `b`'s block
 /// is computed from `a`'s final value, so the source binding is carried into `a`'s store
 /// and `b`'s letrec — nested inside it — reads it there. Legal, and the shape the
