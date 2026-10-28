@@ -410,7 +410,7 @@ impl Printer {
                 };
                 let l = self.expr(left, l, env);
                 let r = self.expr(right, r, env);
-                (own, format!("{l} {} {r}", binop_text(op)))
+                (own, format!("{l} {} {r}", op.chl_sym()))
             }
             TypedExprNode::UnaryOp(UnaryOpKind::Neg, operand) => (
                 Prec::Unary,
@@ -597,16 +597,6 @@ fn binop_prec(op: &BinOpKind) -> Option<(Prec, Prec, Prec)> {
         }
         BinOpKind::Arithmetic(A::Mul | A::FloorDiv) => leftward(Prec::Mul),
         BinOpKind::Arithmetic(A::Pow) => Some((Prec::Pow, Prec::Postfix, Prec::Pow)),
-    }
-}
-
-/// An operator's CHL spelling: [`BinOpKind::sym`], except xor, which CHL writes `^`, and
-/// string concatenation, which it writes `+`.
-fn binop_text(op: &BinOpKind) -> &'static str {
-    match op {
-        BinOpKind::BoolLogic(crate::ccl::LogicKind::Xor) => "^",
-        BinOpKind::Concat => "+",
-        _ => op.sym(),
     }
 }
 

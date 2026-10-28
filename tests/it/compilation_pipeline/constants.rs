@@ -687,3 +687,28 @@ fn a_runs_const_argument_over_the_modules_own_parameters_meets_its_refinements(
     )
     .unwrap_or_else(|errors| panic!("{errors:?}"));
 }
+
+/// A constant term prints each operator as CHL writes it, including the two whose CHL spelling
+/// differs from `BinOpKind::sym`: xor `^` and string concatenation `+`.
+#[rstest]
+#[case::xor(
+    cambra::ccl::BinOpKind::BoolLogic(cambra::ccl::LogicKind::Xor),
+    "(p ^ 1)"
+)]
+#[case::concat(cambra::ccl::BinOpKind::Concat, "(p + 1)")]
+#[case::add(
+    cambra::ccl::BinOpKind::Arithmetic(cambra::ccl::ArithmeticKind::Add),
+    "(p + 1)"
+)]
+fn a_constant_term_spells_its_operator_as_chl_does(
+    #[case] op: cambra::ccl::BinOpKind,
+    #[case] expected: &str,
+) {
+    use cambra::ccl::constant::{ConstParam, ConstTerm};
+    let term = ConstTerm::BinOp(
+        op,
+        Box::new(ConstTerm::Param(ConstParam::declared("p"))),
+        Box::new(ConstTerm::Lit(cambra::ccl::Lit::Int(1))),
+    );
+    assert_eq!(term.to_string(), expected);
+}
