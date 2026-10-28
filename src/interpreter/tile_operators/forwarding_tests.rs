@@ -375,6 +375,27 @@ fn variant_is_over_a_bare_union_sends_everything() {
     assert_widens(&|| variant_is(Tiling::Scalar(union_extent())), 0);
 }
 
+fn converse(level: CurryLevel) -> Built {
+    let (input, consumer) = feed(match level == CurryLevel::OUTERMOST {
+        true => ints(),
+        false => nested(),
+    });
+    (Box::new(Converse::new_at(input, level)), vec![consumer])
+}
+
+#[test]
+fn converse_beneath_a_standing_level_forwards_the_region() {
+    let beneath = || converse(CurryLevel::new(1));
+    assert_keeps(&beneath, 0);
+    assert_keeps_without_state(&beneath, 0);
+}
+
+/// Inverting the outermost collection makes its values the keys.
+#[test]
+fn converse_at_the_outermost_level_sends_everything() {
+    assert_widens(&|| converse(CurryLevel::OUTERMOST), 0);
+}
+
 fn uncurry(level: CurryLevel) -> Built {
     let (input, consumer) = feed(match level == CurryLevel::OUTERMOST {
         true => nested(),
