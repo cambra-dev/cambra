@@ -254,7 +254,9 @@ pub(crate) fn assert_notification_sound(
         if let Projection::Keys(_) = &notified {
             match &tiling {
                 Tiling::DataFunction { domain, .. } => assert!(
-                    domain.includes(&Extent::uint_range(1)),
+                    // A source's domain is keyed by its positions.
+                    domain.includes(&Extent::uint_range(1))
+                        || matches!(domain, Extent::DataSourceDomain(_)),
                     "step {n}: the operator notified keys {notified:?} of an output keyed by \
                      {domain:?}"
                 ),
@@ -363,6 +365,9 @@ pub(crate) enum Values {
     PairsInARecord,
     /// Integers tagged as the one arm of a union.
     Variants,
+    /// A collection of collections of collections of integers: the outer key is `k / 4` of the
+    /// generated key and the middle key `k % 4`, and each step adds an element to that group.
+    Nested3,
 }
 
 /// A stream keyed by position holding the booleans `entries`, complete over `complete`.
@@ -472,6 +477,47 @@ impl Stream {
                     BitSet::new(),
                 )
             }
+            Values::Nested3 => {
+                let mut sorted = self.present.clone();
+                sorted.sort_by_key(|(key, _)| *key);
+                let (mut outer, mut outer_starts) = (Vec::new(), Vec::new());
+                let (mut middle, mut middle_starts) = (Vec::new(), Vec::new());
+                let mut inner = Vec::new();
+                let mut inner_keys = Vec::new();
+                let mut last: Option<u64> = None;
+                for (key, value) in &sorted {
+                    if last != Some(*key) {
+                        if outer.last() != Some(&(key / 4)) {
+                            outer.push(key / 4);
+                            outer_starts.push(middle.len());
+                        }
+                        middle.push(key % 4);
+                        middle_starts.push(inner.len());
+                        last = Some(*key);
+                    }
+                    inner_keys
+                        .push(inner.len() as u64 - *middle_starts.last().expect("a row") as u64);
+                    inner.push(*value);
+                }
+                Tile::data_function(
+                    ColumnValue::UInts(outer),
+                    Box::new(Tile::grouped(
+                        outer_starts,
+                        ColumnValue::UInts(middle),
+                        Box::new(Tile::grouped(
+                            middle_starts,
+                            ColumnValue::UInts(inner_keys),
+                            Box::new(Tile::Scalar(ColumnValue::Ints(inner))),
+                            Predicate::False,
+                            BitSet::new(),
+                        )),
+                        Predicate::False,
+                        BitSet::new(),
+                    )),
+                    self.complete.clone(),
+                    BitSet::new(),
+                )
+            }
             Values::Nested => {
                 let mut sorted = self.present.clone();
                 sorted.sort_by_key(|(key, _)| *key);
@@ -561,7 +607,7 @@ impl Stream {
             let in_class = self
                 .key_class
                 .is_none_or(|(modulus, residue)| key % modulus == residue);
-            let new = matches!(self.values, Values::Nested)
+            let new = matches!(self.values, Values::Nested | Values::Nested3)
                 || self.present.iter().all(|(k, _)| *k != key);
             if in_class && new {
                 self.present.push((key, (rng.next() % 100) as i64));
@@ -570,6 +616,8 @@ impl Stream {
         }
         if !added.is_empty() && matches!(self.values, Values::Pairs | Values::PairsInARecord) {
             Projection::Everything
+        } else if !added.is_empty() && matches!(self.values, Values::Nested3) {
+            keys_region(&added.iter().map(|key| key / 4).collect::<Vec<_>>())
         } else if !added.is_empty() {
             keys_region(&added)
         } else if matches!(growth, Growth::CompletenessAndEmpty) && action == 2 {

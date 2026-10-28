@@ -53,6 +53,13 @@ fn stream_tiling(values: Values) -> Tiling {
                 Extent::Base(BaseType::Int),
             )]))),
         ),
+        Values::Nested3 => Tiling::data_function(
+            keys.clone(),
+            Tiling::data_function(
+                keys.clone(),
+                Tiling::data_function(keys, Tiling::Scalar(Extent::Base(BaseType::Int))),
+            ),
+        ),
         Values::Nested => Tiling::data_function(
             keys.clone(),
             Tiling::data_function(keys, Tiling::Scalar(Extent::Base(BaseType::Int))),
@@ -377,7 +384,10 @@ fn product_script(seed: u64, steps: usize) -> (Tiling, Vec<Tile>, Vec<Step>) {
 }
 
 /// A product of collections is read whole and its field cut, so a region of keys named by the
-/// product's feed is a region of the product, not of the field: the selection widens it.
+/// product's feed is a region of the product, not of the field: the selection widens it. A keep
+/// would also be sound here, since a product names no keys of its own, so the `Widens` variant
+/// carries the decision, and `select_field_over_a_product_of_collections_sends_everything` pins
+/// it.
 #[test]
 fn select_field_over_a_product_of_collections_widens_over_growth() {
     for seed in [1, 2, 3, 4] {
@@ -518,6 +528,8 @@ fn int_constant() -> (Tile, Tiling) {
     )
 }
 
+/// The constant never changes in these scripts, and a scalar announces only everything, so its
+/// widening is pinned by `map_result_to_const_sends_everything_for_its_constant`.
 #[test]
 fn map_result_to_const_beneath_a_level_notifies_its_inputs_region() {
     let (constant, tiling) = int_constant();
@@ -580,6 +592,9 @@ fn extract_aggregate(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOper
     ))
 }
 
+/// The aggregate beneath it already widens, which masks a keep in the extract, and a scalar input
+/// announces only everything. The extract's decision is pinned by
+/// `an_extract_aggregate_sends_everything_for_a_region_of_its_input`.
 #[test]
 fn an_extract_aggregate_widens_over_growth() {
     check(&extract_aggregate, Values::Ints, Expect::Widens);
@@ -619,7 +634,8 @@ fn permute_record_domain(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn Tile
 }
 
 /// The keys are renamed. A region of record keys has no spelling, so the input notifies
-/// everything and the check is of soundness only.
+/// everything and the check is of soundness only; the decision is pinned by
+/// `permute_record_domain_sends_everything_for_a_region_of_its_input`.
 #[test]
 fn permute_record_domain_notifies_soundly_over_growth() {
     check(&permute_record_domain, Values::Pairs, Expect::Sound);
@@ -629,14 +645,12 @@ fn flatten_tuple_domain(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileO
     Box::new(FlattenTupleDomain::new(inputs.remove(0), vec![0]))
 }
 
-/// The keys are re-keyed, so a region of the input's keys names none of the output's.
+/// The keys are re-keyed. A region of record keys has no spelling, so the input notifies
+/// everything and the check is of soundness only; the decision is pinned by
+/// `flatten_tuple_domain_sends_everything_for_a_region_of_its_input`.
 #[test]
-fn flatten_tuple_domain_widens_over_growth() {
-    check(
-        &flatten_tuple_domain,
-        Values::PairsInARecord,
-        Expect::Widens,
-    );
+fn flatten_tuple_domain_notifies_soundly_over_growth() {
+    check(&flatten_tuple_domain, Values::PairsInARecord, Expect::Sound);
 }
 
 /// A release of rows the mask rejected, and of rows it kept, leaves the rest answering as a fresh
@@ -828,5 +842,100 @@ fn variant_project_over_a_bare_union_is_sound_over_a_changing_scalar() {
         );
         assert_notification_sound(&variant_project, &feeds, &steps, &[Expect::Widens]);
         assert_notification_sound(&variant_is, &feeds, &steps, &[Expect::Widens]);
+    }
+}
+
+fn uncurry_at(level: CurryLevel) -> impl Fn(Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    move |mut inputs| Box::new(Uncurry::new_at(inputs.remove(0), level))
+}
+
+/// Beneath a standing level the outer keys stand, and the pairing happens inside each group.
+#[test]
+fn uncurry_beneath_a_level_notifies_the_outer_key_of_a_group_that_gained_an_element() {
+    let uncurry = uncurry_at(CurryLevel::new(1));
+    for (seed, steps, growth) in [
+        (1, 14, Growth::OneAtATime),
+        (2, 10, Growth::Bursts),
+        (3, 14, Growth::CompletenessAndEmpty),
+        (4, 14, Growth::OneAtATime),
+    ] {
+        let (tiles, script) = grow(seed, steps, growth, Values::Nested3);
+        let feeds = [(stream_tiling(Values::Nested3), tiles)];
+        assert_notification_sound(&uncurry, &feeds, &script, &[Expect::Exact]);
+    }
+}
+
+fn checked_lookup(mut inputs: Vec<Box<dyn TileOperator>>) -> Box<dyn TileOperator> {
+    let keys = inputs.remove(1);
+    let option = Extent::Union(crate::ccl::TagMap::from_arms(vec![
+        (
+            crate::ccl::FieldKey::Name(crate::ccl::V_NONE),
+            Extent::Base(BaseType::Unit),
+        ),
+        (crate::ccl::FieldKey::Name(crate::ccl::V_SOME), int_extent()),
+    ]));
+    Box::new(CheckedLookup::split(inputs.remove(0), keys, option))
+}
+
+/// The answer takes the keys' shape: each answer sits at its key's position, and the collection is
+/// read whole, so a change to it is a change at every key.
+#[test]
+fn a_lookup_notifies_its_keys_region_and_everything_for_its_collection_over_growth() {
+    let shapes = [(Values::Ints, None), (Values::Positions, None)];
+    check_many(&checked_lookup, &shapes, &[Expect::Widens, Expect::Exact]);
+}
+
+/// The keys of a stream as the function `IterateExtent` over a source's domain answers: each key
+/// maps to itself.
+fn as_identity(tile: Tile) -> Tile {
+    let Tile::DataFunction {
+        domain,
+        domain_predicate,
+        deleted,
+        ..
+    } = tile
+    else {
+        panic!("a collection, got {tile:?}");
+    };
+    Tile::data_function(
+        domain.clone(),
+        Box::new(Tile::Scalar(domain)),
+        domain_predicate,
+        deleted,
+    )
+}
+
+/// The result's keys are the input's, and the rows are read from the source at them.
+#[test]
+fn map_result_with_source_notifies_exactly_what_its_keys_changed_over_growth() {
+    use crate::interpreter::{TestDataSource, Value};
+    use std::sync::{Arc, Mutex};
+    let source = Arc::new(Mutex::new(TestDataSource::new(
+        "source1",
+        crate::ccl::Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    source.lock_now().add_data(
+        &(0..12)
+            .map(|k| (Value::UInt(k), Value::Int(k as i64 * 10)))
+            .collect::<Vec<_>>(),
+    );
+    let tiling = IterateExtent::new(Extent::DataSourceDomain(source.clone()))
+        .tiling()
+        .clone();
+    let build = |mut inputs: Vec<Box<dyn TileOperator>>| -> Box<dyn TileOperator> {
+        Box::new(MapResultWithSource::new(source.clone(), inputs.remove(0)))
+    };
+    for (seed, steps, growth) in [
+        (1, 10, Growth::OneAtATime),
+        (2, 8, Growth::Bursts),
+        (3, 12, Growth::CompletenessAndEmpty),
+    ] {
+        let (tiles, script) = grow(seed, steps, growth, Values::Ints);
+        let feeds = [(
+            tiling.clone(),
+            tiles.into_iter().map(as_identity).collect::<Vec<_>>(),
+        )];
+        assert_notification_sound(&build, &feeds, &script, &[Expect::Exact]);
     }
 }
