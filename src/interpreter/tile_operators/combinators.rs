@@ -893,8 +893,20 @@ impl TileOperator for Filter {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
-        let predicate_producer = subscribe_forwarding(&mut *self.predicate, &shared, scheduler);
-        let input_producer = subscribe_forwarding(&mut *self.input, &shared, scheduler);
+        // A side that is a collection is pulled at the projection and shares the mask's keys; a
+        // side that is not is read whole.
+        let predicate_producer = subscribe_forwarding_keeping_keys_if(
+            self.predicate.tiling().is_data_function(),
+            &mut *self.predicate,
+            &shared,
+            scheduler,
+        );
+        let input_producer = subscribe_forwarding_keeping_keys_if(
+            self.input.tiling().is_data_function(),
+            &mut *self.input,
+            &shared,
+            scheduler,
+        );
         Box::new(FilterProducer {
             base: ProducerBase::new(
                 FilterProducer::alloc_id(),
