@@ -66,7 +66,7 @@
 //! [`Define`]: crate::ccl::TypedExprNode::Define
 
 use crate::ccl::{
-    BindingTransparency, Expr, Lit, Name, Refinement, Type, TypedExprNode,
+    BindingTransparency, Expr, Lit, Name, Refinement, Type, TypedBinding, TypedExprNode,
     ccl_utils::{
         PredMemo, count_free, discharge_transparent_lets, free_names_in_value, is_free,
         refresh_let_binder, spelled_in_a_type, walk_refined_predicates_mut,
@@ -811,6 +811,29 @@ fn inline_impl(expr: Expr) -> Expr {
     }
 }
 
+/// Whether beta reduction should bind `argument` rather than substitute it for `param` in
+/// `body`: it is a computation, not a variable or a literal, and `body` reads `param` more
+/// than once. A copy at each read computes it at each read, and copies compound across
+/// nested inlined calls: a function reading its parameter twice, inlined `𝑛` deep on a
+/// projection of its caller's parameter, computes `2ⁿ` paths from the outermost argument.
+///
+/// Two computations are still substituted. A product former's projections fold only when
+/// the projection meets the former (`simplify::try_literal_tuple_projection`), and a
+/// capability is inlined at its uses ([`should_inline`]) rather than bound.
+fn is_shared_computation(argument: &Expr, param: &Name, body: &Expr) -> bool {
+    !matches!(argument.node, TypedExprNode::Var(_) | TypedExprNode::Lit(_))
+        && !anf_chain_builds_a_product(argument)
+        && !should_inline(&argument.ty)
+        && count_free(param, body) > 1
+}
+
+/// `let 𝑥′ = argument in body[param := 𝑥′]`, for a fresh `𝑥′`: the parameter's binder is
+/// copied with the lambda to every call site, so it cannot name a `let` at each.
+fn bind_argument(mut param: TypedBinding, argument: Expr, body: Expr) -> Expr {
+    let body = refresh_let_binder(&mut param, body);
+    Expr::let_in(param, argument, body)
+}
+
 /// Substitute `lambda` at every free occurrence of `name` in `expr`, and
 /// beta-reduce at each call-site Apply chain — i.e. where `Var(name)` sits in
 /// the function position of an `Apply(arg, …)` (optionally nested for curried
@@ -909,7 +932,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
                 // the substituted argument's copies arrive through `on_copy` as
                 // copies of the argument's own interior, which is what they are.
                 let _g = provenance::enter(node_id, "inline.beta", provenance::Nature::Expansion);
-                return beta_reduce(*body, &param.name, argument);
+                return beta_reduce(*body, param, argument);
             }
             // Not a Lambda (e.g. the bound expression is Var("id") rather
             // than a literal lambda) — skip beta-reduction and reconstruct
@@ -1041,7 +1064,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
 /// specialization clone copies its definition's binders, so a clone's argument and the body
 /// of another clone of the same definition it calls spell one `__anf`. Floated under its own
 /// name, the binder's reads in the argument would be captured by the body's.
-fn beta_reduce(body: Expr, param: &Name, argument: Expr) -> Expr {
+fn beta_reduce(body: Expr, param: TypedBinding, argument: Expr) -> Expr {
     let mut lets = Vec::new();
     let mut value = argument;
     while let Expr {
@@ -1058,7 +1081,11 @@ fn beta_reduce(body: Expr, param: &Name, argument: Expr) -> Expr {
         value = refresh_let_binder(&mut binding, *let_body);
         lets.push((node_id, binding, *bound_expr));
     }
-    let reduced = substitute(body, param, &value);
+    let reduced = if is_shared_computation(&value, &param.name, &body) {
+        bind_argument(param, value, body)
+    } else {
+        substitute(body, &param.name, &value)
+    };
     lets.into_iter()
         .rev()
         .fold(reduced, |body, (node_id, binding, bound_expr)| {
@@ -1187,7 +1214,7 @@ fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type) -> bool {
 mod tests {
     use super::*;
     use crate::ccl::ty::FunKind;
-    use crate::ccl::{BaseType, Lit, Type, TypedExpr, TypedExprNode};
+    use crate::ccl::{ArithmeticKind, BaseType, BinOpKind, Lit, Type, TypedExpr, TypedExprNode};
 
     // -----------------------------------------------------------------------
     // should_inline predicate
@@ -1348,7 +1375,7 @@ mod tests {
         let bound = TypedExpr::lit(Lit::Int(2)).with_ty(int.clone());
         let body = TypedExpr::new(TypedExprNode::BinOp {
             left: Box::new(TypedExpr::var("x").with_ty(int.clone())),
-            op: crate::ccl::BinOpKind::Arithmetic(crate::ccl::ArithmeticKind::Add),
+            op: BinOpKind::Arithmetic(ArithmeticKind::Add),
             right: Box::new(TypedExpr::lit(Lit::Int(1)).with_ty(int.clone())),
         })
         .with_ty(int.clone());
@@ -1456,6 +1483,62 @@ mod tests {
         let expected = TypedExpr::tuple(vec![expected_call3, expected_call4])
             .with_ty(Type::Tuple(vec![int.clone(), int.clone()]));
         assert_eq!(result, expected);
+    }
+
+    /// A computed argument a function reads twice is bound once, not copied to each read:
+    /// copies compound across nested inlined calls (`is_shared_computation`).
+    #[test]
+    fn an_argument_read_twice_is_bound_once() {
+        // let f = λ x → x + x in (f(a + 1), f(a))
+        let int = Type::Base(BaseType::Int);
+        let fun_ty = Type::fun(int.clone(), int.clone());
+        let read = |n: &str| TypedExpr::var(n).with_ty(int.clone());
+        let add = |l: TypedExpr, r: TypedExpr| {
+            TypedExpr::binop(l, BinOpKind::Arithmetic(ArithmeticKind::Add), r).with_ty(int.clone())
+        };
+        let f =
+            TypedExpr::lambda("x", int.clone(), add(read("x"), read("x"))).with_ty(fun_ty.clone());
+        let call = |argument: TypedExpr| {
+            TypedExpr::new(TypedExprNode::Apply {
+                argument: Box::new(argument),
+                function: Box::new(TypedExpr::var("f").with_ty(fun_ty.clone())),
+            })
+            .with_ty(int.clone())
+        };
+        let computed = add(read("a"), TypedExpr::lit(Lit::Int(1)).with_ty(int.clone()));
+        let body = TypedExpr::tuple(vec![call(computed.clone()), call(read("a"))])
+            .with_ty(Type::Tuple(vec![int.clone(), int.clone()]));
+
+        let result = inline_capability_lambdas(TypedExpr::let_bind("f", f, body));
+
+        let TypedExprNode::Tuple(calls) = &result.node else {
+            panic!("expected the tuple of the two calls, got {result:?}");
+        };
+        let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } = &calls[0].node
+        else {
+            panic!("the computed argument is bound, got {:?}", calls[0]);
+        };
+        assert_eq!(**bound_expr, computed);
+        assert_eq!(
+            **body,
+            add(
+                read_name(&binding.name, &int),
+                read_name(&binding.name, &int)
+            )
+        );
+        assert_eq!(
+            calls[1],
+            add(read("a"), read("a")),
+            "a variable is substituted"
+        );
+    }
+
+    fn read_name(name: &Name, ty: &Type) -> TypedExpr {
+        TypedExpr::var(name.clone()).with_ty(ty.clone())
     }
 
     #[test]

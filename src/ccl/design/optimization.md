@@ -67,8 +67,14 @@ rewrite below can copy a bound value into a literal element. The type-level deci
 For an eligible binding, the pass substitutes the bound expression at free occurrences of its
 name and removes the `Let`. At a call whose function position is that name, including a chain of
 applications for a curried call, it reduces an application when the substituted function is a
-lambda: the argument replaces the lambda parameter in its body. If the substituted function is
-not a lambda, the application remains. Substitution respects binders that shadow the function
+lambda: the argument replaces the lambda parameter in its body. An argument that is a
+computation, read more than once in the body, is bound instead, `let 𝑥′ = argument in body[𝑝 :=
+𝑥′]` for a fresh `𝑥′` (`is_shared_computation`): a copy at each read computes it at each read,
+and the copies compound across nested inlined calls, a function reading its parameter twice
+inlined `𝑛` deep computing `2ⁿ` paths. A variable, a literal, a product former and a capability
+are still substituted, the former because its projections fold only where they meet it and the
+capability because it is inlined at its uses. If the substituted function is not a lambda, the
+application remains. Substitution respects binders that shadow the function
 name and also visits refinement predicates stored in type slots, where a use may otherwise be
 missed by the ordinary expression walk.
 
