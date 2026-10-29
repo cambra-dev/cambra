@@ -4033,9 +4033,8 @@ position in the commit order ([6. Types (informal sketch)](#6-types-informal-ske
   correct the system clock: a backward step holds readings at the latest one until the system clock
   passes it, and a forward step is adopted at once.
 - **Each evaluation of a call reads the clock.** A call is evaluated once per iteration of each
-  enclosing loop and once per attempt of an enclosing transaction. Two calls can return different
-  readings, including two calls in one transaction, and a transaction that retries reads the clock
-  again. A binding holds one reading: in `t = time::now()`, every use of `t` is the same instant.
+  enclosing loop. Two calls can return different readings, including two calls in one transaction.
+  A binding holds one reading: in `t = time::now()`, every use of `t` is the same instant.
 - **A call at a module's top level reads the clock once, when the program starts.** A reload keeps
   the reading of a binding it keeps. A binding the reload adds or changes reads the clock when the
   new version starts.
@@ -4050,15 +4049,19 @@ position in the commit order ([6. Types (informal sketch)](#6-types-informal-ske
 #### `time::alarms()`
 
 `time::alarms()` returns a source and a sink. Each row fed to the sink is held, and comes out of
-the source once the clock reads at or after the row's `time::at` field.
+the source once the clock reads at or after the row's `time::at` field. `std::time` declares it as:
+
+```python
+def alarms(R <: {at: Instant}) => {Source(R), Feed(R)}
+```
 
 ```python
 import std::time
 
 expiries, set_expiry = time::alarms()
 
-sessions: Mut(Map(String, time::Instant), Txn) := empty_map()   # session id -> expiry
-expired = defer()
+sessions: Mut(Map(String, time::Instant), Txn) := Map::empty   # session id -> expiry
+expired: Feed(_)
 
 for r in requests:
     with begin():
@@ -4072,18 +4075,24 @@ for r in logouts:
 
 for e in expiries:
     with begin():
-        if sessions[e.session]? == Option::some(e.time::at):
-            expired << (session=e.session)
+        match sessions[e.session]:
+            case Option::some(expiry):
+                if expiry == e.time::at:
+                    expired << (session=e.session)
+            case Option::none:
+                pass
 ```
 
 - **Binding.** The call is bound at a module's top level by tuple destructuring, as `http_serve` is
   ([7.3 Sources](#73-sources)). The call opens a source, so it is IO in the calling module, and
   `std::time` itself stays importable.
-- **Rows.** A row is the caller's own record with a field `time::at: time::Instant`. The label
-  belongs to `std::time` ([9.12 Field labels and tags belong to a
-  module](#912-field-labels-and-tags-belong-to-a-module)), and every other field is the caller's.
-  The rows the program feeds determine the row type, and the source's element type is that row
-  type.
+- **Rows.** `R` is the row type, bounded by `{at: Instant}`
+  ([Kinds and bounds](#kinds-and-bounds)), so a row is the caller's own record with a field
+  `time::at: time::Instant`. The label belongs to `std::time` ([9.12 Field labels and tags belong
+  to a module](#912-field-labels-and-tags-belong-to-a-module)), and every other field is the
+  caller's. The call's uses determine `R`, as any type parameter's uses do
+  ([Type parameters](#type-parameters)): the rows the program feeds the sink and its loops over the
+  source. `Source(R)` is a source whose elements are `R`s.
 - **Holding.** A row fed inside a `with begin():` block is held only if the transaction commits
   ([8.4 Feeds are the second form of mutability](#84-feeds-are-the-second-form-of-mutability)). A
   row whose `at` has passed when it is held comes out at once.

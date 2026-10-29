@@ -20,7 +20,7 @@
 #
 #     import std::time
 #
-#     deadlines: Mut(Map(String, time::Instant), Txn) := empty_map()
+#     deadlines: Mut(Map(String, time::Instant), Txn) := Map::empty
 #
 #     for r in requests:
 #         with begin():
@@ -60,9 +60,8 @@ pub type Duration = Int
 # - A reading is the later of the system wall clock and the latest reading the runtime has handed
 #   out, so readings never decrease within one process. A reading taken after a restart can be
 #   earlier than one taken before it.
-# - Each evaluation of a call reads the clock: once per iteration of each enclosing loop, and once
-#   per attempt of an enclosing transaction. Two calls can return different readings, including two
-#   in one transaction, and a transaction that retries reads the clock again.
+# - Each evaluation of a call reads the clock, once per iteration of each enclosing loop. Two calls
+#   can return different readings, including two in one transaction.
 # - A call at a module's top level reads the clock once, when the program starts. A reload keeps
 #   the reading of a binding it keeps.
 # - A reading orders nothing, and commit order never consults one: a transaction that commits after
@@ -81,7 +80,7 @@ pub def now() => Instant:
 # reaches the row's `at`.
 #
 # The row type `R` is the caller's own record, and `at` is this module's label, so a caller writes
-# `time::at`. `R` is determined by the rows the caller feeds.
+# `time::at`. The call's uses determine `R`, as any type parameter's uses do.
 #
 # - A row fed inside a `with begin():` block is held only if that transaction commits. A row whose
 #   `at` has passed when it is held comes out at once.
@@ -110,8 +109,8 @@ pub def now() => Instant:
 #
 #     expiries, set_expiry = time::alarms()
 #
-#     sessions: Mut(Map(String, time::Instant), Txn) := empty_map()   # session id -> expiry
-#     expired = defer()                                                # Feed({session: String})
+#     sessions: Mut(Map(String, time::Instant), Txn) := Map::empty   # session id -> expiry
+#     expired: Feed(_)
 #
 #     for r in requests:
 #         with begin():
@@ -125,8 +124,12 @@ pub def now() => Instant:
 #
 #     for e in expiries:
 #         with begin():
-#             if sessions[e.session]? == Option::some(e.time::at):
-#                 expired << (session=e.session)
+#             match sessions[e.session]:
+#                 case Option::some(expiry):
+#                     if expiry == e.time::at:
+#                         expired << (session=e.session)
+#                 case Option::none:
+#                     pass
 #
 # [proposed] a builtin source and sink a std module provides, bound by tuple destructuring
 # (docs/chl-spec.md, "9.16 The std root"; docs/chl-spec.md, "7.5 Time [Decided]"), called with

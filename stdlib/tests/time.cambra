@@ -8,8 +8,8 @@ started = time::now()
 
 expiries, set_expiry = time::alarms()
 
-deadlines: Mut(Map(String, time::Instant), Txn) := empty_map()
-expired: Mut(Map(String, time::Duration), Txn) := empty_map()
+deadlines: Mut(Map(String, time::Instant), Txn) := Map::empty
+expired: Mut(Map(String, time::Duration), Txn) := Map::empty
 
 for line in stdin():
     with begin():
@@ -19,5 +19,9 @@ for line in stdin():
 
 for e in expiries:
     with begin():
-        if deadlines[e.line]? == Option::some(e.time::at):
-            expired[e.line] := time::now() - started
+        match deadlines[e.line]:
+            case Option::some(deadline):
+                if deadline == e.time::at:
+                    expired[e.line] := time::now() - started
+            case Option::none:
+                pass

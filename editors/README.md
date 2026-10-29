@@ -103,9 +103,9 @@ in the cases listed under [VS Code](#vs-code); `indent-cases.json` holds a case 
 
 ## Editor highlight check
 
-`./ci.sh editors` checks both grammars against the lexer over every `.cambra` file under `tests/`
-and `editors/`. It needs Node and npm for the TextMate grammar and Neovim 0.11 for the Vim syntax
-file. Without one, it skips that grammar and prints a line saying so; under CI it fails instead.
+`./ci.sh editors` checks both grammars against the lexer over every `.cambra` file under `tests/`,
+`editors/` and `stdlib/`. It needs Node and npm for the TextMate grammar and Neovim 0.11 for the Vim
+syntax file. Without one, it skips that grammar and prints a line saying so; under CI it fails instead.
 The first run installs the extension's npm packages into `vscode/node_modules` from
 `vscode/package-lock.json`; the grammar checker uses `vscode-textmate` and `vscode-oniguruma`.
 
