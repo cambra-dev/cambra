@@ -42,6 +42,7 @@
 //! parameterized by an iteration input that is not part of the term, so the term
 //! does not identify it.
 
+use crate::interpreter::parallel::{Config, PooledRun, Unsupported};
 use crate::interpreter::{LockNow, Projection};
 use std::{
     collections::{HashMap, HashSet},
@@ -596,8 +597,8 @@ impl LiveProgram {
         &mut self,
         name: &str,
         ctx: &mut GlobalContext,
-        config: &crate::interpreter::parallel::Config,
-    ) -> Option<Result<crate::interpreter::Tile, crate::interpreter::parallel::Unsupported>> {
+        config: &Config,
+    ) -> Option<Result<crate::interpreter::Tile, Unsupported>> {
         let at = self.branches.iter().position(|b| b.name == name)?;
         let branch = &mut self.branches[at];
         let result = crate::interpreter::parallel::run_main_holding(
@@ -611,6 +612,38 @@ impl LiveProgram {
             branch.operator_map = OperatorMap::default();
         }
         Some(result)
+    }
+
+    /// Run branch `name`'s `main` output on the pool through the inline driver, or say why the
+    /// program is not one the pool runs. The branch's `main` producer becomes the pool's
+    /// producer of the final breaker's output, which the driver pulls as it pulls a serial one,
+    /// and the caller serves the run with [`PooledRun::lap`] between the scheduler's delivery and
+    /// the pulls. `None` for a branch that does not exist. A refused program keeps its producer.
+    pub fn start_inline(
+        &mut self,
+        name: &str,
+        ctx: &mut GlobalContext,
+        config: &Config,
+    ) -> Option<Result<PooledRun, Unsupported>> {
+        let at = self.branches.iter().position(|b| b.name == name)?;
+        let branch = &mut self.branches[at];
+        let notified = branch.main_notified.clone();
+        let consumer: Box<dyn Consumer> = Box::new(move || notified.store(true, Ordering::Release));
+        let started = PooledRun::start(
+            ctx,
+            &mut branch.program,
+            &mut branch.main_producer,
+            config,
+            consumer,
+        );
+        Some(started.map(|mut run| {
+            branch.main_producer = Some(run.take_main());
+            // The pool took the program, whose fan-outs it cut: a reload cannot offer them on.
+            branch.operator_map = OperatorMap::default();
+            // The pool has subscribed and nothing has pulled it yet.
+            branch.main_notified.store(true, Ordering::Release);
+            run
+        }))
     }
 
     /// Branch `name`'s `main` output's producer, for a driver to pull.

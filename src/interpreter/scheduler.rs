@@ -702,11 +702,20 @@ other's subscribers",
         }
         // Then pull every sink the wakes above reached, once each, so a change reaches a
         // sink in the call that delivers it.
+        self.pull_sinks() || delivered
+    }
+
+    /// Pull every sink that a wake queued a pull for, once each, and say whether there was one.
+    /// [`deliver`](Self::deliver) ends with this, and a loop that serves a pool between the
+    /// delivery and the pulls calls it after the pool's turn, which is where a sink behind a
+    /// breaker is woken.
+    pub fn pull_sinks(&mut self) -> bool {
+        let mut pulled = false;
         for pull in self.sink_pulls.take() {
             pull.lock_now().notify(&Projection::Everything);
-            delivered = true;
+            pulled = true;
         }
-        delivered
+        pulled
     }
 
     /// [`poll_sources`](Self::poll_sources) then [`deliver`](Self::deliver), for

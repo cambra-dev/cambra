@@ -111,6 +111,13 @@ pub trait MorselSource: Send + Sync {
     /// published row is claimed, `claim` answers [`Claim::Exhausted`]. A source that holds every
     /// row from the start ignores it.
     fn close(&self) {}
+
+    /// Every key the source will ever hold is ready to read: its yield predicate covers every key.
+    /// A driver that delivers arrivals closes the source then, since nothing else ends it. A source
+    /// that ends by exhaustion answers `false`.
+    fn is_complete(&self) -> bool {
+        false
+    }
 }
 
 /// The answer to [`MorselSource::claim`].

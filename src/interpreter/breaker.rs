@@ -199,6 +199,26 @@ impl Materialized {
             .complete
     }
 
+    /// How many keys the breaker holds: the rows absorbed and not yet reclaimed.
+    #[cfg(test)]
+    pub(crate) fn held_keys(&self) -> usize {
+        let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
+        match &state.tile {
+            Tile::DataFunction { domain, .. } => domain.len(),
+            other => other.rows(),
+        }
+    }
+
+    /// How many readers are registered with the breaker.
+    #[cfg(test)]
+    pub(crate) fn reader_count(&self) -> usize {
+        self.state
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .readers
+            .len()
+    }
+
     /// The tiling of the rows.
     pub(crate) fn tiling(&self) -> &Tiling {
         &self.tiling

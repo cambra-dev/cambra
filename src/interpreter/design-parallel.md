@@ -346,6 +346,12 @@ park on. The inline driver is that caller; the threaded path, where other thread
 `serve`. `FailOnUnwind` lives in `run_worker`, so the inline driver handles a panic in a worker
 itself. The plan's pipelines are served by `MainWorker`; a test double records what it ran and left.
 
+A parked worker leaves when the epoch has moved or the dispatcher has failed. `fail` moves the
+epoch through `wake_idle`, and the `failed` check matters only when that move is lost. In the lib's
+unit tests and in the `it` tests, which build the lib with `test-helpers`, a park gives up after
+thirty seconds and panics with the epoch it waited on, so a lost wake-up fails a test with that
+message and does not hang the suite.
+
 ### Region-carrying notifications
 
 `Consumer::notify(arrived: &Projection)` names the region of the notifying producer's outermost
@@ -522,6 +528,42 @@ key, and a release compacts the held tile, so each costs in proportion to the ro
 and not to the rows it answers or releases. Dense columns, which a collection of positions would
 hold as a range, are the step that removes this; it is not designed here.
 
+### The inline driver
+
+`PooledRun` serves a program's pipelines from the thread that drives the scheduler loop: one worker,
+no threads. `PooledRun::start` plans the program, reads everything it can refuse, drops the `main`
+producer, cuts the graph and subscribes the pipelines once; it seeds the pipelines over a data
+source. A range ends by exhaustion. A source whose rows arrive from outside stays open, and a lap
+closes it once its yield predicate covers every key (`MorselSource::is_complete`), publishing what
+it holds first: its `main` is not terminal until then, and a fold over it answers only then. `lap` runs
+`Dispatcher::serve_until_wait` with the worker's state: every morsel the arrivals made claimable,
+and nothing parks, because the loop delivers the arrivals. A lap answers `Ran` when a morsel ran,
+`Idle` when nothing was claimable, and `Done` when every pipeline has finished. The lap arms
+`FailOnUnwind`, which `run_worker` does for a pool's threads, so a panic in a chain fails the
+dispatcher and is raised in the loop.
+A lap of a dispatcher that failed elsewhere answers `Failed`. The worker's fold partials belong to the
+run, so a panic in a chain leaves them as they were.
+
+The pipeline that ends in `main` ends in `Materialize` as the others do, and `main` is read through
+a `BreakerOutput` subscribed on the driver thread, with the branch's consumer, so the breaker's
+`publish` wakes the loop as a serial `main` would. The reader registers before the first lap, so no
+row leaves before it has read. A fold ends in the partials of the one worker, and the pipeline's
+`finalize` combines them into a `FoldedResult` that a small producer answers `main` from until it is
+released. The loop is deliver, lap, `Scheduler::pull_sinks`, pull the mains: `pull_sinks` is the
+last block of `deliver`, split out because a sink behind a breaker is woken by the lap and not by
+the delivery. `CAMBRA_DISPATCH=inline` turns the driver on in `src/main.rs` for a run without
+`--inspect` or `--control`; a refused program stays on the plain loop, and
+`LiveProgram::start_inline` swaps the branch's `main` producer for the pool's.
+
+Decision: only `main` is a sink of a pooled run. A sink's consumer and its producer are made when
+the program compiles, and the sinks a program writes (`out << x`) have a feed or record operator at
+their input, which the plan does not stream. No program of the corpus has a sink whose input the
+plan admits, so admitting other sinks would add a path nothing runs, and the plan refuses them. The
+plan's decision to admit all sinks is deferred until one does.
+
+`PooledRun::serve_pass` is the loop's part of a pass: without a run it does nothing, so a program
+the pool refused passes as the plain loop passes it, sink pulls queued for the next delivery.
+
 ### Tests
 
 `tests/it/parallel.rs`: two chains pulled at disjoint guards and merged equal the whole pull, and
@@ -612,6 +654,12 @@ the pool, `run_pipeline` raises that worker's own panic, and the pool's release 
 or the epoch move each fail a test.
 
 ## Not yet implemented
+
+The inline driver's run is held by the loop in `src/main.rs`, which refuses `--control` for a pooled
+run because a reload would compile a program beside a pool that still pins the old one's release
+records. Storing the run on the `Branch`, dropping it in `tear_down`, and having `pull_mains` drive
+the lap lifts that refusal; the lap sits between the delivery and the sink pulls, and `pull_mains`
+runs after both, so the loop's order changes with it.
 
 A breaker other than the sink, a fold into `main` and a `Memo`'s input, a build side, a way to hand
 a morsel back, and the sink pulls the scheduler loop queues. A source over a data-source domain runs

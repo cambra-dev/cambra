@@ -17,12 +17,16 @@ use crate::{
         provenance::NodeId,
     },
     interpreter::{
-        Consumer, LockNow, Materialized, Predicate, Projection, Scheduler, Tile, TileGuard, Tiling,
+        Consumer, LockNow, Materialized, PooledRecords, Predicate, Projection, Scheduler, Tile,
+        TileGuard, Tiling,
         operator_graph::{EdgeKind, EdgeRole, GraphNode, OperatorGraph},
         tile_operators::{
-            BreakerOutput, Claim, Detached, MorselSource, TileOperator, TileProducer,
+            BreakerOutput, Claim, Detached, MorselSource, OperatorBase, ProducerBase, TileOperator,
+            TileProducer, impl_producer_base,
         },
     },
+    pretty_graph::VizOptions,
+    pretty_tree::InspectNode,
 };
 
 /// How many threads run a program's `main` pipeline, and how many rows a morsel holds.
@@ -624,7 +628,8 @@ fn run_planned(
                 let breaker = PoolBreaker::Fold {
                     kind: *kind,
                     seed: kind.initial_accumulator(accumulator),
-                    partials: Mutex::new(Vec::new()),
+                    partials: Arc::new(Mutex::new(Vec::new())),
+                    result: None,
                 };
                 (&mut **chain, breaker)
             }
@@ -735,96 +740,26 @@ struct PipelineRun<'a> {
 /// every row, which is empty and complete: the rows went on to those pipelines.
 fn run_pipelines(
     scheduler: &mut Scheduler,
-    mut runs: Vec<PipelineRun<'_>>,
+    runs: Vec<PipelineRun<'_>>,
     config: &Config,
     delivery: Option<DeliveringThread<'_>>,
 ) -> Vec<Tile> {
-    for (pipeline, run) in runs.iter().enumerate() {
-        assert!(
-            run.head != Head::Source || run.streams_from.is_empty(),
-            "a pipeline over a data source streams from none: {pipeline}"
-        );
-        assert!(
-            run.head != Head::Breaker || !run.streams_from.is_empty(),
-            "a pipeline over a breaker's output streams from the pipeline of that breaker: \
-             {pipeline}"
-        );
-    }
-    assert_pipelines_are_separate(&runs);
-    let tilings: Vec<Tiling> = runs.iter().map(|run| run.chain.tiling().clone()).collect();
     // The delivery reaches the first pipeline that reads a data source.
     let delivered = runs.iter().position(|run| run.head == Head::Source);
-    let specs = runs
-        .iter()
-        .map(|run| {
-            let source = run.source.clone();
-            PipelineSpec {
-                after: run.after.clone(),
-                streams_from: run.streams_from.clone(),
-                source: Box::new(move || source.clone()),
-                finalize: run.breaker.finalize(),
-            }
-        })
+    let notified = (0..runs.len())
+        .map(|pipeline| Some(pipeline) == delivered && delivery.is_some())
         .collect();
-    let dispatcher = Arc::new(Dispatcher::new(specs, config.morsel_rows.max(1)));
-    let handles: Vec<PipelineHandle> = (0..runs.len())
-        .map(|pipeline| PipelineHandle {
-            dispatcher: dispatcher.clone(),
-            pipeline: PipelineId(pipeline),
-        })
+    // Without a delivery no row arrives later, so every source closes at the start.
+    let close_at_start = (0..runs.len())
+        .map(|pipeline| delivery.is_none() || Some(pipeline) != delivered)
         .collect();
-    // One chain per pipeline per worker, indexed by `PipelineId`. Notifications reach the
-    // dispatcher through the first worker's chain of each pipeline. Every chain's source
-    // registration is notified of the same region, and one consumer publishes it: a second would
-    // publish what the source has already claimed. The path from the source to that consumer is
-    // region-driven and acyclic (`plan` admits no shared node or recurrence), so no consumer
-    // on it drops or widens the region.
-    //
-    // The chains hold release records with a source, one per source operator and named for the
-    // pool: each worker releases the morsels it ran, and a source reclaims what every record
-    // releases. The records outlive the chains and retire when `records` drops.
-    let (mut chains, records): (Vec<Vec<Box<dyn TileProducer>>>, _) = scheduler
-        .with_pooled_release_records(pool_release_identity(), |scheduler| {
-            (0..config.threads.max(1))
-                .map(|worker| {
-                    runs.iter_mut()
-                        .enumerate()
-                        .map(|(pipeline, run)| {
-                            let head: Box<dyn Consumer> = match (worker, run.head) {
-                                (0, Head::Breaker) => {
-                                    Box::new(PipelineConsumer(handles[pipeline].clone()))
-                                }
-                                (0, Head::Source)
-                                    if Some(pipeline) == delivered && delivery.is_some() =>
-                                {
-                                    Box::new(PipelineConsumer(handles[pipeline].clone()))
-                                }
-                                _ => Box::new(|| {}),
-                            };
-                            run.chain.subscribe(
-                                tilings[pipeline].universal_guard(),
-                                head,
-                                scheduler,
-                            )
-                        })
-                        .collect()
-                })
-                .collect()
-        });
-    let seeded: Vec<usize> = (0..runs.len())
-        .filter(|&pipeline| runs[pipeline].head == Head::Source)
-        .collect();
-    let breakers: Vec<PoolBreaker> = runs.into_iter().map(|run| run.breaker).collect();
-    // What a source holds when the pool starts is claimable: nothing notifies of rows that
-    // arrived before the chains were subscribed, and a source's own subscription notification
-    // reaches only worker 0's head and says nothing of them. Without a delivery no row arrives
-    // later, so the source closes now.
-    for &pipeline in &seeded {
-        handles[pipeline].publish(&Projection::Everything);
-        if delivery.is_none() || Some(pipeline) != delivered {
-            handles[pipeline].close();
-        }
-    }
+    let Prepared {
+        dispatcher,
+        handles,
+        mut chains,
+        records,
+        breakers,
+    } = prepare(scheduler, runs, config, notified, close_at_start);
     // The chains are lent to the workers and dropped here, after the scope, one at a time:
     // a producer's drop detaches its probe with a lock that must not find the probe table
     // held by another worker's `get`.
@@ -877,6 +812,126 @@ fn run_pipelines(
         "every worker returned, so every pipeline finished"
     );
     breakers.into_iter().map(PoolBreaker::finish).collect()
+}
+
+/// How long a worker in a test may stay parked before the park fails: a worker that waits for a
+/// wake-up that never comes fails with a message instead of hanging the suite. Built for the
+/// lib's unit tests and for the `it` tests, which build the lib with `test-helpers`.
+#[cfg(any(test, feature = "test-helpers"))]
+const TEST_PARK_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A run's pipelines, subscribed and seeded, before any worker serves them.
+struct Prepared {
+    dispatcher: Arc<Dispatcher>,
+    handles: Vec<PipelineHandle>,
+    /// One chain per pipeline per worker, indexed by `PipelineId`.
+    chains: Vec<Vec<Box<dyn TileProducer>>>,
+    /// The release records the chains registered with the sources, retired when this drops, after
+    /// the chains.
+    records: PooledRecords,
+    breakers: Vec<PoolBreaker>,
+}
+
+/// Subscribe every pipeline's chain once per worker and seed the pipelines that read a data
+/// source. `notified[pipeline]` says whether the first worker's chain of a data-source pipeline
+/// carries the consumer that publishes a notification's region to the dispatcher, and
+/// `close_at_start[pipeline]` whether the source closes once it is seeded; a breaker's pipelines
+/// always carry the consumer, and the dispatcher closes them.
+fn prepare(
+    scheduler: &mut Scheduler,
+    mut runs: Vec<PipelineRun<'_>>,
+    config: &Config,
+    notified: Vec<bool>,
+    close_at_start: Vec<bool>,
+) -> Prepared {
+    for (pipeline, run) in runs.iter().enumerate() {
+        assert!(
+            run.head != Head::Source || run.streams_from.is_empty(),
+            "a pipeline over a data source streams from none: {pipeline}"
+        );
+        assert!(
+            run.head != Head::Breaker || !run.streams_from.is_empty(),
+            "a pipeline over a breaker's output streams from the pipeline of that breaker: \
+             {pipeline}"
+        );
+    }
+    assert_pipelines_are_separate(&runs);
+    let tilings: Vec<Tiling> = runs.iter().map(|run| run.chain.tiling().clone()).collect();
+    let specs = runs
+        .iter()
+        .map(|run| {
+            let source = run.source.clone();
+            PipelineSpec {
+                after: run.after.clone(),
+                streams_from: run.streams_from.clone(),
+                source: Box::new(move || source.clone()),
+                finalize: run.breaker.finalize(),
+            }
+        })
+        .collect();
+    let dispatcher = Arc::new(Dispatcher::new(specs, config.morsel_rows.max(1)));
+    let handles: Vec<PipelineHandle> = (0..runs.len())
+        .map(|pipeline| PipelineHandle {
+            dispatcher: dispatcher.clone(),
+            pipeline: PipelineId(pipeline),
+        })
+        .collect();
+    // One chain per pipeline per worker, indexed by `PipelineId`. Notifications reach the
+    // dispatcher through the first worker's chain of each pipeline. Every chain's source
+    // registration is notified of the same region, and one consumer publishes it: a second would
+    // publish what the source has already claimed. The path from the source to that consumer is
+    // region-driven and acyclic (`plan` admits no shared node or recurrence below a head), so no
+    // consumer on it drops or widens the region.
+    //
+    // The chains hold release records with a source, one per source operator and named for the
+    // pool: each worker releases the morsels it ran, and a source reclaims what every record
+    // releases. The records outlive the chains and retire when `records` drops.
+    let (chains, records): (Vec<Vec<Box<dyn TileProducer>>>, _) = scheduler
+        .with_pooled_release_records(pool_release_identity(), |scheduler| {
+            (0..config.threads.max(1))
+                .map(|worker| {
+                    runs.iter_mut()
+                        .enumerate()
+                        .map(|(pipeline, run)| {
+                            let head: Box<dyn Consumer> = match (worker, run.head) {
+                                (0, Head::Breaker) => {
+                                    Box::new(PipelineConsumer(handles[pipeline].clone()))
+                                }
+                                (0, Head::Source) if notified[pipeline] => {
+                                    Box::new(PipelineConsumer(handles[pipeline].clone()))
+                                }
+                                _ => Box::new(|| {}),
+                            };
+                            run.chain.subscribe(
+                                tilings[pipeline].universal_guard(),
+                                head,
+                                scheduler,
+                            )
+                        })
+                        .collect()
+                })
+                .collect()
+        });
+    let seeded: Vec<usize> = (0..runs.len())
+        .filter(|&pipeline| runs[pipeline].head == Head::Source)
+        .collect();
+    let breakers: Vec<PoolBreaker> = runs.into_iter().map(|run| run.breaker).collect();
+    // What a source holds when the pool starts is claimable: nothing notifies of rows that
+    // arrived before the chains were subscribed, and a source's own subscription notification
+    // reaches only worker 0's head and says nothing of them.
+    for &pipeline in &seeded {
+        handles[pipeline].publish(&Projection::Everything);
+        if close_at_start[pipeline] {
+            handles[pipeline].close();
+        }
+    }
+    Prepared {
+        dispatcher,
+        handles,
+        chains,
+        records,
+        breakers,
+    }
 }
 
 /// The invariants of a run's pipelines that a debug build checks, which a plan holds and a
@@ -1001,7 +1056,10 @@ enum PoolBreaker {
         // a collection. A worker hands its partial in once, after its last morsel, and no
         // operator reads it: the combine runs after every worker has returned and answers
         // `main`.
-        partials: Mutex<Vec<Tile>>,
+        partials: Arc<Mutex<Vec<Tile>>>,
+        /// Where an inline run leaves the combined answer when the pipeline finishes, for the
+        /// producer that answers `main` to read; a threaded run combines at the end.
+        result: Option<Arc<FoldedResult>>,
     },
     /// The rows a pipeline behind this one reads: each worker merges the morsel into the shared
     /// output and publishes its region, and the output is completed when the pipeline finishes.
@@ -1017,7 +1075,19 @@ impl PoolBreaker {
                 let output = output.clone();
                 Some(Box::new(move || output.complete()))
             }
-            PoolBreaker::Collect { .. } | PoolBreaker::Fold { .. } => None,
+            PoolBreaker::Fold {
+                kind,
+                seed,
+                partials,
+                result: Some(result),
+            } => {
+                let (kind, seed, partials, result) =
+                    (*kind, seed.clone(), partials.clone(), result.clone());
+                Some(Box::new(move || {
+                    result.set(fold_partials(kind, seed.clone(), &partials.lock_wait()))
+                }))
+            }
+            PoolBreaker::Collect { .. } | PoolBreaker::Fold { result: None, .. } => None,
         }
     }
 
@@ -1043,22 +1113,23 @@ impl PoolBreaker {
                 kind,
                 seed,
                 partials,
-            } => {
-                let partials = partials
-                    .into_inner()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let mut total = seed;
-                for partial in &partials {
-                    kind.accumulate(&mut total, partial, 0, partial.rows());
-                }
-                // What `ExtractAggregate` emits once the fold is terminal.
-                kind.extract(total)
-            }
+                ..
+            } => fold_partials(kind, seed, &partials.lock_wait()),
             PoolBreaker::Materialize { output } => {
                 output.snapshot(&output.tiling().universal_guard())
             }
         }
     }
+}
+
+/// The partials of a fold combined into its seed, as `ExtractAggregate` emits them once the fold
+/// is terminal.
+fn fold_partials(kind: AggregateKind, seed: Tile, partials: &[Tile]) -> Tile {
+    let mut total = seed;
+    for partial in partials {
+        kind.accumulate(&mut total, partial, 0, partial.rows());
+    }
+    kind.extract(total)
 }
 
 /// One pool worker over the plan's pipelines: per pipeline its chain and the breaker the
@@ -1067,8 +1138,12 @@ impl PoolBreaker {
 struct MainWorker<'a> {
     chains: &'a mut [Box<dyn TileProducer>],
     breakers: &'a [PoolBreaker],
-    /// Per pipeline, the partial of a fold.
-    partials: Vec<Option<Tile>>,
+    /// Per pipeline, the partial of a fold, borrowed from the run so that a panic in `work` leaves
+    /// them where they were.
+    partials: &'a mut Vec<Option<Tile>>,
+    /// The morsels this worker has run since it was made: a lap makes one, so this counts the
+    /// lap's.
+    worked: usize,
 }
 
 impl PoolWorker for MainWorker<'_> {
@@ -1076,6 +1151,7 @@ impl PoolWorker for MainWorker<'_> {
     /// release the morsel.
     fn work(&mut self, package: &WorkPackage) {
         let pipeline = package.pipeline.0;
+        self.worked += 1;
         let chain = &mut self.chains[pipeline];
         let mut tile = chain.get(package.guard.clone());
         match (&self.breakers[pipeline], &mut self.partials[pipeline]) {
@@ -1136,7 +1212,7 @@ fn run_worker(
         breakers.len(),
         "a worker holds one chain per pipeline"
     );
-    let partials = breakers
+    let mut partials: Vec<Option<Tile>> = breakers
         .iter()
         .map(|breaker| match breaker {
             PoolBreaker::Collect { .. } | PoolBreaker::Materialize { .. } => None,
@@ -1146,7 +1222,8 @@ fn run_worker(
     dispatcher.serve(&mut MainWorker {
         chains,
         breakers,
-        partials,
+        partials: &mut partials,
+        worked: 0,
     });
 }
 
@@ -1595,11 +1672,31 @@ impl Dispatcher {
     fn park(&self, seen: u64) {
         let mut guard = self.idle.lock_wait();
         self.parked.fetch_add(1, Ordering::AcqRel);
-        while self.epoch.load(Ordering::Acquire) == seen {
-            guard = self
-                .wake
-                .wait(guard)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // `fail` moves the epoch through `wake_idle`. A worker that reads `failed` leaves even
+        // when that move is lost.
+        while self.epoch.load(Ordering::Acquire) == seen && !self.failed.load(Ordering::Acquire) {
+            #[cfg(any(test, feature = "test-helpers"))]
+            {
+                let (woken, timeout) = self
+                    .wake
+                    .wait_timeout(guard, TEST_PARK_DEADLINE)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard = woken;
+                assert!(
+                    !timeout.timed_out()
+                        || self.epoch.load(Ordering::Acquire) != seen
+                        || self.failed.load(Ordering::Acquire),
+                    "a worker stayed parked for {TEST_PARK_DEADLINE:?} while the epoch stood at \
+                     {seen}: a wake-up was lost"
+                );
+            }
+            #[cfg(not(any(test, feature = "test-helpers")))]
+            {
+                guard = self
+                    .wake
+                    .wait(guard)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
         }
         self.parked.fetch_sub(1, Ordering::AcqRel);
     }
@@ -1694,10 +1791,6 @@ impl Dispatcher {
     /// thread publishes, closes, acknowledges or finishes a pipeline of this dispatcher: every
     /// call that moves the epoch is made on the thread that calls this. The threaded path, where
     /// other threads do, is `serve`.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the inline driver is its caller")
-    )]
     fn serve_until_wait(&self, worker: &mut impl PoolWorker, state: &mut ServeState) -> Settled {
         loop {
             let seen = self.epoch.load(Ordering::Acquire);
@@ -1753,6 +1846,330 @@ impl Drop for FailOnUnwind<'_> {
     }
 }
 
+/// Where an inline run's fold leaves its answer, and the consumer that answers `main` to wake.
+struct FoldedResult {
+    // shared-state-ok: the fold's combined answer, set once when its pipeline finishes and read
+    // by the producer that answers `main`.
+    tile: Mutex<Option<Tile>>,
+    // shared-state-ok: the consumer of `main`, woken when the answer is set. It holds no tile.
+    consumer: Mutex<Box<dyn Consumer>>,
+}
+
+impl FoldedResult {
+    fn new(consumer: Box<dyn Consumer>) -> Arc<Self> {
+        Arc::new(Self {
+            tile: Mutex::new(None),
+            consumer: Mutex::new(consumer),
+        })
+    }
+
+    /// Leave the answer and wake the consumer of `main`.
+    fn set(&self, tile: Tile) {
+        *self.tile.lock_wait() = Some(tile);
+        self.consumer.lock_wait().notify(&Projection::Everything);
+    }
+}
+
+/// The producer that answers `main` for a fold of an inline run: nothing before the fold finishes,
+/// then its answer until it is released.
+struct FoldedResultProducer {
+    base: ProducerBase,
+    result: Arc<FoldedResult>,
+}
+
+impl TileProducer for FoldedResultProducer {
+    impl_producer_base!();
+
+    fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
+        node
+    }
+
+    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+        match self.result.tile.lock_wait().clone() {
+            Some(tile) => tile,
+            None => self.tiling().empty_tile(),
+        }
+    }
+
+    fn release_impl(&mut self, _obsolete_guard: TileGuard) {
+        *self.result.tile.lock_wait() = None;
+    }
+}
+
+/// What one [`PooledRun::lap`] did.
+#[derive(PartialEq, Debug)]
+pub enum Lap {
+    /// A worker's turn ran at least one morsel.
+    Ran,
+    /// Nothing is claimable until an arrival is published.
+    Idle,
+    /// Every pipeline has finished.
+    Done,
+    /// The dispatcher failed, so the run's answer is discarded: a worker panicked on another
+    /// thread, or a delivery did.
+    Failed,
+}
+
+/// A program's pipelines on the pool, served by the thread that calls [`lap`](Self::lap): one
+/// worker, no threads. The scheduler loop delivers the arrivals, the lap runs every morsel they
+/// made claimable, and `main` is read through a producer of the final breaker's output on the
+/// driver thread, so the loop pulls `main` as it pulls a serial one.
+/// See `src/interpreter/design-parallel.md`, "The inline driver".
+pub struct PooledRun {
+    /// Answers `main` until [`take_main`](Self::take_main) hands it to the driver.
+    main: Option<Box<dyn TileProducer>>,
+    /// The one worker's chain of each pipeline.
+    chains: Vec<Box<dyn TileProducer>>,
+    dispatcher: Arc<Dispatcher>,
+    breakers: Vec<PoolBreaker>,
+    partials: Vec<Option<Tile>>,
+    state: ServeState,
+    /// The sources of the pipelines that read one and whose arrivals have not ended, with what
+    /// delivers to them. A lap closes one that says it is complete.
+    open_sources: Vec<(PipelineHandle, Arc<dyn MorselSource>)>,
+    // Dropped after the chains, which hold records with the sources, and after the taken chains'
+    // operators, which the pool owns from the cut.
+    _records: PooledRecords,
+    _taken: HashMap<NodeId, Taken>,
+}
+
+impl PooledRun {
+    /// Plan `program`, take it from the scheduler loop, subscribe its pipelines and seed the
+    /// ones that read a data source, or say why the program is not one the pool runs. A refused
+    /// program keeps its producer. `main_consumer` is woken when `main` has something to pull.
+    ///
+    /// A range ends by exhaustion. A pipeline over a source whose rows arrive from outside stays
+    /// open, and its `main` is not terminal, until a lap sees the source's yield predicate cover
+    /// every key ([`MorselSource::is_complete`]).
+    pub fn start(
+        ctx: &mut GlobalContext,
+        program: &mut CompiledProgram,
+        main_producer: &mut Option<Box<dyn TileProducer>>,
+        config: &Config,
+        main_consumer: Box<dyn Consumer>,
+    ) -> Result<Self, Unsupported> {
+        let plan = plan(&program.operator_graph)?;
+        let output = program
+            .main_mut()
+            .ok_or_else(|| Unsupported("the program has no `main` output".into()))?;
+        check_pipelines(&*output.op)?;
+        let dropped = main_producer.take().or_else(|| output.producer.take());
+        debug_assert!(
+            dropped.is_some(),
+            "the pool drops the producer that held the pipeline's record"
+        );
+        drop(dropped);
+        let main_tiling = output.op.tiling().clone();
+        let mut consumer = Some(main_consumer);
+        let mut started = None;
+        let mut start_chain = |chain: &mut Box<dyn TileOperator>| {
+            let mut taken = HashMap::new();
+            cut(chain, &mut taken);
+            started = Some(start_planned(
+                ctx,
+                &plan,
+                chain,
+                taken,
+                config,
+                main_tiling.clone(),
+                consumer.take().expect("the main chain is visited once"),
+            ));
+        };
+        match plan.main().breaker {
+            Breaker::Collect => start_chain(&mut output.op),
+            Breaker::Fold { .. } => output.op.visit_inputs_mut(&mut |fold| {
+                fold.visit_inputs_mut(&mut |input| start_chain(input));
+            }),
+            Breaker::Materialize { .. } => unreachable!("`main` is not a memo's input"),
+        }
+        Ok(started.expect("the main chain was visited"))
+    }
+
+    /// The pool's part of one pass of the scheduler loop, between the delivery and the pulls of the
+    /// mains: a lap of `run` and the sinks it woke, and whether either did anything. Without a run
+    /// it does nothing and leaves the sink pulls queued for the next delivery, so a program the
+    /// pool refused passes as the plain loop passes it.
+    pub fn serve_pass(run: Option<&mut Self>, scheduler: &mut Scheduler) -> bool {
+        match run {
+            Some(run) => {
+                let ran = run.lap() == Lap::Ran;
+                scheduler.pull_sinks() || ran
+            }
+            None => false,
+        }
+    }
+
+    /// The producer that answers `main`, for the driver to pull.
+    pub fn take_main(&mut self) -> Box<dyn TileProducer> {
+        self.main.take().expect("`main` is taken once")
+    }
+
+    /// Serve every morsel the arrivals published so far, on this thread, and say what happened.
+    /// A panic in a worker's chain fails the dispatcher and is raised here.
+    pub fn lap(&mut self) -> Lap {
+        let _fail = FailOnUnwind(&self.dispatcher);
+        // A source whose yield predicate covers every key has delivered everything: what it
+        // holds is published, and nothing else ends it.
+        self.open_sources.retain(|(handle, source)| {
+            let complete = source.is_complete();
+            if complete {
+                handle.publish(&Projection::Everything);
+                handle.close();
+            }
+            !complete
+        });
+        let mut worker = MainWorker {
+            chains: &mut self.chains,
+            breakers: &self.breakers,
+            partials: &mut self.partials,
+            worked: 0,
+        };
+        let settled = self
+            .dispatcher
+            .serve_until_wait(&mut worker, &mut self.state);
+        let worked = worker.worked;
+        match (settled, worked) {
+            (Settled::Done, _) if self.dispatcher.failed.load(Ordering::Acquire) => Lap::Failed,
+            (Settled::Done, _) => Lap::Done,
+            (Settled::Wait, 0) => Lap::Idle,
+            (Settled::Wait, _) => Lap::Ran,
+        }
+    }
+}
+
+/// Subscribe `plan`'s pipelines over the chains the cut left, on one worker, and answer `main`
+/// from the final breaker.
+fn start_planned(
+    ctx: &mut GlobalContext,
+    plan: &Plan,
+    main_chain: &mut Box<dyn TileOperator>,
+    mut taken: HashMap<NodeId, Taken>,
+    config: &Config,
+    main_tiling: Tiling,
+    main_consumer: Box<dyn Consumer>,
+) -> PooledRun {
+    enum Reads {
+        Rows(Arc<Materialized>),
+        Folded(Arc<FoldedResult>),
+    }
+    let mut main_chain = Some(main_chain);
+    let mut main_consumer = Some(main_consumer);
+    let mut reads = None;
+    let (mut runs, mut notified, mut close_at_start) = (Vec::new(), Vec::new(), Vec::new());
+    let mut sources = Vec::new();
+    {
+        let mut upstream: HashMap<NodeId, &mut Taken> =
+            taken.iter_mut().map(|(k, v)| (*k, v)).collect();
+        for pipeline in &plan.pipelines {
+            let (chain, breaker): (&mut dyn TileOperator, PoolBreaker) = match &pipeline.breaker {
+                Breaker::Materialize { memo } => {
+                    let taken = upstream
+                        .remove(memo)
+                        .expect("the cut took the memo's input");
+                    (
+                        &mut *taken.chain,
+                        PoolBreaker::Materialize {
+                            output: taken.output.clone(),
+                        },
+                    )
+                }
+                Breaker::Collect => {
+                    let chain = main_chain.take().expect("one pipeline ends in `main`");
+                    let output = Materialized::new(chain.tiling().clone());
+                    reads = Some(Reads::Rows(output.clone()));
+                    (&mut **chain, PoolBreaker::Materialize { output })
+                }
+                Breaker::Fold { kind, accumulator } => {
+                    let chain = main_chain.take().expect("one pipeline ends in `main`");
+                    let result = FoldedResult::new(
+                        main_consumer.take().expect("the consumer is taken once"),
+                    );
+                    reads = Some(Reads::Folded(result.clone()));
+                    let breaker = PoolBreaker::Fold {
+                        kind: *kind,
+                        seed: kind.initial_accumulator(accumulator),
+                        partials: Arc::new(Mutex::new(Vec::new())),
+                        result: Some(result),
+                    };
+                    (&mut **chain, breaker)
+                }
+            };
+            let source = source_of(&*chain).expect("the pipeline was checked to read one source");
+            notified.push(pipeline.head == Head::Source);
+            // A range ends by exhaustion. A source whose rows arrive from outside stays open
+            // until it says it is complete ([`PooledRun::lap`]).
+            close_at_start.push(false);
+            sources.push(source.clone());
+            runs.push(PipelineRun {
+                chain,
+                source,
+                breaker,
+                head: pipeline.head,
+                after: Vec::new(),
+                streams_from: pipeline
+                    .streams_from
+                    .iter()
+                    .map(|&i| PipelineId(i))
+                    .collect(),
+            });
+        }
+    }
+    let one_worker = Config {
+        threads: 1,
+        morsel_rows: config.morsel_rows,
+    };
+    let Prepared {
+        dispatcher,
+        handles,
+        mut chains,
+        records,
+        breakers,
+    } = prepare(ctx.scheduler(), runs, &one_worker, notified, close_at_start);
+    let open_sources = handles
+        .iter()
+        .zip(sources)
+        .zip(&plan.pipelines)
+        .filter(|(_, pipeline)| pipeline.head == Head::Source)
+        .map(|((handle, source), _)| (handle.clone(), source))
+        .collect();
+    // The reader registers before the first morsel, so no row leaves before it has read.
+    let main = match reads.expect("one pipeline ends in `main`") {
+        Reads::Rows(output) => BreakerOutput::new(output, main_tiling.clone(), false, None)
+            .subscribe(
+                main_tiling.universal_guard(),
+                main_consumer.take().expect("the consumer is taken once"),
+                ctx.scheduler(),
+            ),
+        Reads::Folded(result) => Box::new(FoldedResultProducer {
+            base: ProducerBase::new(
+                FoldedResultProducer::alloc_id(),
+                &main_tiling,
+                &OperatorBase::new(main_tiling.clone()),
+                ctx.scheduler(),
+            ),
+            result,
+        }),
+    };
+    let state = dispatcher.serve_state();
+    PooledRun {
+        main: Some(main),
+        chains: chains.pop().expect("one worker"),
+        partials: breakers
+            .iter()
+            .map(|breaker| match breaker {
+                PoolBreaker::Fold { seed, .. } => Some(seed.clone()),
+                PoolBreaker::Collect { .. } | PoolBreaker::Materialize { .. } => None,
+            })
+            .collect(),
+        dispatcher,
+        breakers,
+        state,
+        open_sources,
+        _records: records,
+        _taken: taken,
+    }
+}
+
 #[cfg(test)]
 #[path = "parallel_live_tests.rs"]
 mod live_tests;
@@ -1760,6 +2177,10 @@ mod live_tests;
 #[cfg(test)]
 #[path = "parallel_source_tests.rs"]
 mod source_tests;
+
+#[cfg(test)]
+#[path = "parallel_inline_tests.rs"]
+mod inline_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2195,13 +2616,14 @@ mod tests {
         assert_eq!(live_morsels(&dispatcher), [(0, 5)]);
     }
 
-    /// Poll `condition` until it holds, failing after ten seconds.
+    /// Poll `condition` until it holds, failing after ten seconds. The limit is under the
+    /// watchdog's `DEADLINE`, so a condition that never holds fails naming itself.
     fn wait_until(condition: impl Fn() -> bool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
         while !condition() {
             assert!(
                 std::time::Instant::now() < deadline,
-                "the condition held in time"
+                "the condition did not hold within ten seconds"
             );
             std::thread::yield_now();
         }
@@ -2213,37 +2635,44 @@ mod tests {
     fn a_parked_worker_wakes_on_a_publish_and_on_a_close() {
         let (source, rows) = live_source();
         let dispatcher = live_dispatcher(&source, 4);
-        std::thread::scope(|scope| {
-            // A failed wait fails the dispatcher, which wakes the parked worker, so the scope
-            // joins it instead of hanging.
-            let _fail = FailOnUnwind(&dispatcher);
-            let worker = scope.spawn(|| {
-                let mut worker = Recorder::default();
-                dispatcher.serve(&mut worker);
-                worker
-            });
-            let claimed = |count: u64| {
-                let source = source.clone();
-                move || uint_keys_in(&source.claimed(), u64::MAX).len() as u64 >= count
-            };
-            arrive(&dispatcher, MAIN_PIPELINE, &rows, 3);
-            wait_until(claimed(3));
-            assert!(
-                !worker.is_finished(),
-                "the source is open, so the worker waits"
-            );
-            arrive(&dispatcher, MAIN_PIPELINE, &rows, 2);
-            wait_until(claimed(5));
-            assert!(!worker.is_finished(), "the source is still open");
-            dispatcher.close(MAIN_PIPELINE);
-            let worker = worker
-                .join()
-                .expect("the worker returns once the source is closed");
-            let ran: Vec<_> = worker.morsels.iter().map(|(_, b)| *b).collect();
-            assert_eq!(ran, [(0, 2), (3, 4)]);
-            assert_eq!(worker.left, [0], "it left the pipeline before it finished");
-            assert!(dispatcher.all_done());
-        });
+        within_deadline_on(
+            "a_parked_worker_wakes_on_a_publish_and_on_a_close",
+            &dispatcher,
+            DEADLINE,
+            || {
+                std::thread::scope(|scope| {
+                    // A failed wait fails the dispatcher, which wakes the parked worker, so the scope
+                    // joins it instead of hanging.
+                    let _fail = FailOnUnwind(&dispatcher);
+                    let worker = scope.spawn(|| {
+                        let mut worker = Recorder::default();
+                        dispatcher.serve(&mut worker);
+                        worker
+                    });
+                    let claimed = |count: u64| {
+                        let source = source.clone();
+                        move || uint_keys_in(&source.claimed(), u64::MAX).len() as u64 >= count
+                    };
+                    arrive(&dispatcher, MAIN_PIPELINE, &rows, 3);
+                    wait_until(claimed(3));
+                    assert!(
+                        !worker.is_finished(),
+                        "the source is open, so the worker waits"
+                    );
+                    arrive(&dispatcher, MAIN_PIPELINE, &rows, 2);
+                    wait_until(claimed(5));
+                    assert!(!worker.is_finished(), "the source is still open");
+                    dispatcher.close(MAIN_PIPELINE);
+                    let worker = worker
+                        .join()
+                        .expect("the worker returns once the source is closed");
+                    let ran: Vec<_> = worker.morsels.iter().map(|(_, b)| *b).collect();
+                    assert_eq!(ran, [(0, 2), (3, 4)]);
+                    assert_eq!(worker.left, [0], "it left the pipeline before it finished");
+                    assert!(dispatcher.all_done());
+                })
+            },
+        );
     }
 
     /// A worker that serves through repeated `serve_until_wait` calls, with the state carried
@@ -2934,26 +3363,33 @@ mod tests {
             ],
             4,
         );
-        std::thread::scope(|scope| {
-            let _fail = FailOnUnwind(&dispatcher);
-            let worker = scope.spawn(|| {
-                let mut worker = Recorder::default();
-                dispatcher.serve(&mut worker);
-                worker
-            });
-            wait_until(|| dispatcher.parked.load(Ordering::Acquire) == 1);
-            arrive(&dispatcher, PipelineId(1), &down_rows, 2);
-            wait_until(|| uint_keys_in(&down_source.claimed(), u64::MAX).len() == 2);
-            assert!(!worker.is_finished(), "the upstream is open");
-            arrive(&dispatcher, PipelineId(0), &up_rows, 1);
-            dispatcher.close(PipelineId(0));
-            wait_until(|| worker.is_finished());
-            let worker = worker
-                .join()
-                .expect("the worker returns once both are closed");
-            assert_eq!(worker.morsels, [(1, (0, 1)), (0, (0, 0))]);
-            assert!(dispatcher.all_done());
-        });
+        within_deadline_on(
+            "a_parked_worker_wakes_when_a_publish_starts_a_streaming_pipeline",
+            &dispatcher,
+            DEADLINE,
+            || {
+                std::thread::scope(|scope| {
+                    let _fail = FailOnUnwind(&dispatcher);
+                    let worker = scope.spawn(|| {
+                        let mut worker = Recorder::default();
+                        dispatcher.serve(&mut worker);
+                        worker
+                    });
+                    wait_until(|| dispatcher.parked.load(Ordering::Acquire) == 1);
+                    arrive(&dispatcher, PipelineId(1), &down_rows, 2);
+                    wait_until(|| uint_keys_in(&down_source.claimed(), u64::MAX).len() == 2);
+                    assert!(!worker.is_finished(), "the upstream is open");
+                    arrive(&dispatcher, PipelineId(0), &up_rows, 1);
+                    dispatcher.close(PipelineId(0));
+                    wait_until(|| worker.is_finished());
+                    let worker = worker
+                        .join()
+                        .expect("the worker returns once both are closed");
+                    assert_eq!(worker.morsels, [(1, (0, 1)), (0, (0, 0))]);
+                    assert!(dispatcher.all_done());
+                })
+            },
+        );
     }
 
     #[test]
@@ -3046,6 +3482,70 @@ mod tests {
         assert!(dispatcher.all_done());
     }
 
+    /// How long a test that parks workers may take before its watchdog fails the dispatcher.
+    const DEADLINE: Duration = Duration::from_secs(30);
+
+    /// Run `body` with a watchdog beside it: when `body` has not returned within `limit`, the
+    /// watchdog fails `dispatcher`, which wakes every worker parked on it, so a body that waits
+    /// to join them returns, and the test then fails with `name` and the limit instead of
+    /// hanging. A body that panics stops the watchdog and is raised again.
+    ///
+    /// The wake is the dispatcher's own epoch move, which a lost wake-up in the code under test
+    /// would defeat; such a defect fails the test only where the workers' own waits end.
+    fn within_deadline_on<R>(
+        name: &str,
+        dispatcher: &Dispatcher,
+        limit: Duration,
+        body: impl FnOnce() -> R,
+    ) -> R {
+        let (stop, stopped) = mpsc::channel::<()>();
+        let expired = AtomicBool::new(false);
+        let expired = &expired;
+        let result = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                if stopped.recv_timeout(limit).is_err() {
+                    expired.store(true, Ordering::Release);
+                    dispatcher.fail();
+                }
+            });
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(body));
+            let _ = stop.send(());
+            result
+        });
+        match (result, expired.load(Ordering::Acquire)) {
+            (Ok(result), false) => result,
+            (_, true) => panic!(
+                "{name} did not finish within {limit:?}: the dispatcher was failed to wake its \
+                 parked workers"
+            ),
+            (Err(panic), false) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    /// The watchdog fails the dispatcher when the body outlasts its limit, and the test fails by
+    /// name: a worker parked on a pipeline nothing ever publishes to is woken by it.
+    #[test]
+    #[should_panic(expected = "a_test_that_parks_forever did not finish")]
+    fn the_deadline_helper_fails_a_body_that_outlasts_its_limit() {
+        let log = Log::default();
+        let (source, _) = live_source();
+        let live: Arc<dyn MorselSource> = source.clone();
+        let dispatcher = Dispatcher::new(
+            vec![logged("only", &log, &[], &[], move || live.clone())],
+            4,
+        );
+        within_deadline_on(
+            "a_test_that_parks_forever",
+            &dispatcher,
+            Duration::from_millis(50),
+            || {
+                std::thread::scope(|scope| {
+                    scope.spawn(|| dispatcher.serve(&mut Recorder::default()));
+                })
+            },
+        );
+    }
+
     /// A worker with nothing to claim parks while another holds a morsel of the pipeline it
     /// waits on, and the finish that morsel allows wakes it to run the next pipeline.
     #[test]
@@ -3053,38 +3553,46 @@ mod tests {
         let log = Log::default();
         let dispatcher = graph(&[1, 4], &[&[], &[0]], &log);
         let (release, gate) = mpsc::channel();
-        std::thread::scope(|scope| {
-            let holder = scope.spawn(|| {
-                let mut worker = Recorder {
-                    gate: Some(gate),
-                    ..Recorder::default()
-                };
-                dispatcher.serve(&mut worker);
-                worker
-            });
-            std::thread::sleep(Duration::from_millis(20));
-            let idle = scope.spawn(|| {
-                let mut worker = Recorder::default();
-                dispatcher.serve(&mut worker);
-                worker
-            });
-            std::thread::sleep(Duration::from_millis(20));
-            assert!(
-                !idle.is_finished(),
-                "nothing is claimable, so the worker parks"
-            );
-            assert!(!dispatcher.is_done(MAIN_PIPELINE));
-            release.send(()).expect("the holder is waiting");
-            let (holder, idle) = (holder.join().expect("holder"), idle.join().expect("idle"));
-            let second: Vec<_> = holder
-                .morsels
-                .iter()
-                .chain(&idle.morsels)
-                .filter(|(p, _)| *p == 1)
-                .collect();
-            assert_eq!(second.len(), 1, "the second pipeline's morsel ran once");
-            assert!(dispatcher.all_done());
-        });
+        within_deadline_on(
+            "an_idle_worker_parks_until_a_pipeline_finishes",
+            &dispatcher,
+            DEADLINE,
+            || {
+                std::thread::scope(|scope| {
+                    let holder = scope.spawn(|| {
+                        let mut worker = Recorder {
+                            gate: Some(gate),
+                            ..Recorder::default()
+                        };
+                        dispatcher.serve(&mut worker);
+                        worker
+                    });
+                    std::thread::sleep(Duration::from_millis(20));
+                    let idle = scope.spawn(|| {
+                        let mut worker = Recorder::default();
+                        dispatcher.serve(&mut worker);
+                        worker
+                    });
+                    std::thread::sleep(Duration::from_millis(20));
+                    assert!(
+                        !idle.is_finished(),
+                        "nothing is claimable, so the worker parks"
+                    );
+                    assert!(!dispatcher.is_done(MAIN_PIPELINE));
+                    release.send(()).expect("the holder is waiting");
+                    let (holder, idle) =
+                        (holder.join().expect("holder"), idle.join().expect("idle"));
+                    let second: Vec<_> = holder
+                        .morsels
+                        .iter()
+                        .chain(&idle.morsels)
+                        .filter(|(p, _)| *p == 1)
+                        .collect();
+                    assert_eq!(second.len(), 1, "the second pipeline's morsel ran once");
+                    assert!(dispatcher.all_done());
+                })
+            },
+        );
     }
 
     /// A failure wakes a parked worker, which returns without claiming.

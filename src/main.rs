@@ -142,6 +142,23 @@ fn run_program(
         }
     }
 
+    // `CAMBRA_DISPATCH=inline` runs the program's pipelines on the pool's dispatcher from this
+    // thread, between the scheduler's delivery and the pulls: no worker threads, and the same
+    // loop. A program the pool refuses stays on the plain loop.
+    let mut pooled = None;
+    if std::env::var("CAMBRA_DISPATCH").as_deref() == Ok("inline") {
+        if inspection.is_some() || control_port.is_some() {
+            eprintln!(
+                "note: CAMBRA_DISPATCH=inline applies to a run without --inspect or --control"
+            );
+        } else if let Some(started) = live.start_inline(MAIN_BRANCH, &mut ctx, &parallel) {
+            match started {
+                Ok(run) => pooled = Some(run),
+                Err(unsupported) => eprintln!("note: {unsupported}; running on the plain loop"),
+            }
+        }
+    }
+
     let control = match control_port.map(ControlPort::new).transpose() {
         Ok(control) => control,
         Err(e) => {
@@ -178,6 +195,11 @@ fn run_program(
             None => Vec::new(),
         };
         let delivered = ctx.scheduler().deliver(delivery);
+        // The pool serves what the delivery published, and a sink behind a breaker is woken by
+        // it, so the sinks it queued are pulled before the `main` pull.
+        let served =
+            cambra::interpreter::parallel::PooledRun::serve_pass(pooled.as_mut(), ctx.scheduler());
+        let delivered = delivered || served;
         live.pull_mains(pull_main);
         if let Some(inspection) = inspection.as_mut() {
             inspection.publish(&sources);

@@ -304,6 +304,10 @@ impl MorselSource for LiveSource {
         Claim::Morsel(TileGuard::Function(FunctionGuard::Domain(morsel)))
     }
 
+    fn is_complete(&self) -> bool {
+        (self.ready)().is_true()
+    }
+
     fn publish(&self, arrived: &Projection) {
         let ready = (self.ready)();
         let region = match arrived {

@@ -96,11 +96,15 @@ EXPECTED_EXCEPTIONS = [
     # only through `BreakerOutput`'s `get`.
     ("src/interpreter/breaker.rs", "cell of `State`"),
     ("src/interpreter/breaker.rs", "cell of `Vec<Box<dyn Consumer>>`"),
+    # An inline run's fold (`parallel.rs`): the partials are shared with the pipeline's `finalize`,
+    # which combines them once every worker has left, and the answer is set once and read by the
+    # producer that answers `main`. Both are the breaker's own state, as the collector is.
+    ("src/interpreter/parallel.rs", "shared cell of `Vec<Tile>`"),
+    ("src/interpreter/parallel.rs", "cell of `Option<Tile>`"),
     # The worker pool's breakers: the collection every worker merges into, and each
     # worker's partial accumulator, handed in once; both answer `main` after every worker
     # has returned, and no operator reads either.
     ("src/interpreter/parallel.rs", "cell of `Tile`"),
-    ("src/interpreter/parallel.rs", "cell of `Vec<Tile>`"),
     # The worker pool's dispatcher, twice. A pipeline's source cannot be built before the
     # pipelines it follows finish, so it is set once, later, and read by every worker; it answers
     # guards that name morsels and holds no tile. The idle lock guards nothing: a worker with

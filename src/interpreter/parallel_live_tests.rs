@@ -394,7 +394,7 @@ mod end_to_end {
     /// Keeps the rows of the even positions: the keys a chain filters out are in the region it
     /// answers and have no row.
     struct EveryOther {
-        base: crate::interpreter::tile_operators::OperatorBase,
+        base: OperatorBase,
         input: Box<dyn TileOperator>,
     }
 
@@ -484,9 +484,7 @@ mod end_to_end {
             true => {
                 let live = LiveRows::new(store.clone());
                 Box::new(EveryOther {
-                    base: crate::interpreter::tile_operators::OperatorBase::new(
-                        live.tiling().clone(),
-                    ),
+                    base: OperatorBase::new(live.tiling().clone()),
                     input: Box::new(live),
                 })
             }
