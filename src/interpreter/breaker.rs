@@ -1,11 +1,6 @@
 //! The output of a pipeline breaker that materializes, shared by the workers that fill it and
 //! the pipelines that read it. See `src/interpreter/design-parallel.md`, "A breaker's output".
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the plan constructs `PoolBreaker::Materialize`")
-)]
-
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 
 use crate::interpreter::tile_operators::{LiveSource, MorselSource};

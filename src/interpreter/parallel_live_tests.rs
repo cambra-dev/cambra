@@ -478,7 +478,7 @@ mod end_to_end {
         morsel_rows: u64,
         readers: usize,
         filtering: bool,
-    ) -> (Vec<Tile>, Arc<LiveStore>, Arc<Materialized>) {
+    ) -> (Tile, Vec<Tile>, Arc<LiveStore>, Arc<Materialized>) {
         let rows: Box<dyn TileOperator> = match filtering {
             false => Box::new(LiveRows::new(store.clone())),
             true => {
@@ -534,8 +534,8 @@ mod end_to_end {
             morsel_rows,
         };
         let mut tiles = run_pipelines(&mut Scheduler::new(), runs, &config, Some(delivery));
-        tiles.remove(0);
-        (tiles, store, output)
+        let upstream = tiles.remove(0);
+        (upstream, tiles, store, output)
     }
 
     /// [`run_breaker`] with one reading pipeline: what its breaker holds.
@@ -545,7 +545,7 @@ mod end_to_end {
         threads: usize,
         morsel_rows: u64,
     ) -> (Tile, Arc<LiveStore>, Arc<Materialized>) {
-        let (mut tiles, store, output) =
+        let (_, mut tiles, store, output) =
             run_breaker(delivery, store, threads, morsel_rows, 1, false);
         (tiles.pop().expect("one reader"), store, output)
     }
@@ -807,7 +807,7 @@ mod end_to_end {
         for threads in WORKERS {
             let rows = chunks(&[30, 0, 7, 100]);
             let expected = rows.clone();
-            let (tiles, store, output) = within_deadline(move || {
+            let (_, tiles, store, output) = within_deadline(move || {
                 run_breaker(
                     move |store, _| setup_delivery(store.clone(), rows, threads, Pace::Flat),
                     LiveStore::new(),
@@ -835,6 +835,90 @@ mod end_to_end {
         }
     }
 
+    /// The result of a pipeline that ends in `Materialize` is its output once the pipelines that
+    /// read it have released every row: empty, and complete.
+    #[test]
+    fn the_result_of_a_materializing_pipeline_is_its_released_output() {
+        let rows = chunks(&[20, 5]);
+        let (upstream, _, _, output) = within_deadline(move || {
+            run_breaker(
+                move |store, _| setup_delivery(store.clone(), rows, 2, Pace::Flat),
+                LiveStore::new(),
+                2,
+                4,
+                1,
+                false,
+            )
+        });
+        assert!(entries(&upstream).is_empty(), "{upstream:?}");
+        assert!(upstream.is_terminal(), "{upstream:?}");
+        assert!(output.is_complete());
+    }
+
+    /// A pipeline over a breaker's output that streams from none is refused, whatever it holds.
+    #[test]
+    #[should_panic(expected = "a pipeline over a breaker's output streams from the pipeline of")]
+    fn a_breaker_headed_pipeline_that_streams_from_none_is_rejected() {
+        let mut map = MapResult::new_at(
+            Box::new(LiveRows::new(LiveStore::new())),
+            Box::new(negate()),
+            CurryLevel::new(1),
+        );
+        let runs = vec![PipelineRun {
+            source: source_of(&map).expect("a source"),
+            breaker: collecting(&map),
+            chain: &mut map,
+            head: Head::Breaker,
+            after: Vec::new(),
+            streams_from: Vec::new(),
+        }];
+        let config = Config {
+            threads: 1,
+            morsel_rows: 4,
+        };
+        run_pipelines(&mut Scheduler::new(), runs, &config, None);
+    }
+
+    /// A pipeline over a data source that streams from another is refused: the dispatcher would
+    /// wait on a region nothing publishes to it.
+    #[test]
+    #[should_panic(expected = "a pipeline over a data source streams from none")]
+    fn a_source_headed_pipeline_that_streams_from_one_is_rejected() {
+        let mut first = MapResult::new_at(
+            Box::new(LiveRows::new(LiveStore::new())),
+            Box::new(negate()),
+            CurryLevel::new(1),
+        );
+        let mut second = MapResult::new_at(
+            Box::new(LiveRows::new(LiveStore::new())),
+            Box::new(negate()),
+            CurryLevel::new(1),
+        );
+        let runs = vec![
+            PipelineRun {
+                source: source_of(&first).expect("a source"),
+                breaker: collecting(&first),
+                chain: &mut first,
+                head: Head::Source,
+                after: Vec::new(),
+                streams_from: Vec::new(),
+            },
+            PipelineRun {
+                source: source_of(&second).expect("a source"),
+                breaker: collecting(&second),
+                chain: &mut second,
+                head: Head::Source,
+                after: Vec::new(),
+                streams_from: vec![PipelineId(0)],
+            },
+        ];
+        let config = Config {
+            threads: 1,
+            morsel_rows: 4,
+        };
+        run_pipelines(&mut Scheduler::new(), runs, &config, None);
+    }
+
     /// An upstream that delivers nothing: the pipeline behind starts when the one before
     /// finishes, reads an empty output, and finishes; the breaker completes.
     #[test]
@@ -853,7 +937,7 @@ mod end_to_end {
         for threads in WORKERS {
             let rows = chunks(&[40, 1, 25]);
             let expected = rows.clone();
-            let (tiles, store, output) = within_deadline(move || {
+            let (_, tiles, store, output) = within_deadline(move || {
                 run_breaker(
                     move |store, _| setup_delivery(store.clone(), rows, threads, Pace::Flat),
                     LiveStore::new(),

@@ -594,6 +594,10 @@ impl TileOperator for FanOutSlot {
         self.hold.with_input_mut(visit);
     }
 
+    fn drop_serial_subscription(&mut self) {
+        self.shared().lock_now().producer = None;
+    }
+
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         let id = self.shared().lock_now().id;
         if self.primary {
@@ -975,10 +979,10 @@ impl TileOperator for Memo {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        // TODO(pipeline breaker): a pooled chain stops notifying at this operator. The region of
-        // its input ends here, and the breaker raises its own region to the dispatcher once a
-        // worker has merged a morsel (`docs/parallel-execution.md`, "Pipeline boundaries"). The
-        // serial scheduler still needs the notification passed on below.
+        // A pool does not subscribe this operator: it cuts the graph at the `FanOutSlot` that
+        // reads it, takes the chain that feeds it, and runs that chain as a pipeline that ends in
+        // a breaker that materializes (`src/interpreter/design-parallel.md`, "The plan"). The
+        // serial scheduler subscribes it as below.
         let arrivals = Arrivals::new();
         let (consumer, gate) = shared_consumer(consumer);
         Box::new(MemoProducer {

@@ -11,10 +11,9 @@ use cambra::{
     interpreter::{
         BaseType, ColumnValue, Consumer, Extent, FunctionGuard, Predicate, Tile, TileGuard, Tiling,
         Value,
-        parallel::{Breaker, Config, plan_main, run_main},
+        parallel::{Breaker, Config, plan, run_main},
     },
 };
-use indoc::indoc;
 
 /// `[x + 1 for x in [0, 1, …, rows - 1]]`: a finite source, two streaming maps, `main`.
 fn program(rows: u64) -> String {
@@ -163,12 +162,13 @@ fn the_plan_reads_the_fold_off_the_extract() {
     let loaded = LoadedProgram::test(folded("sum", 3));
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
-    let pipeline = plan_main(&compiled.operator_graph).expect("a fold is a breaker the pool runs");
-    let Breaker::Fold { kind, accumulator } = pipeline.breaker else {
+    let plan = plan(&compiled.operator_graph).expect("a fold is a breaker the pool runs");
+    assert_eq!(plan.pipeline_count(), 1);
+    let Breaker::Fold { kind, accumulator } = plan.main_breaker() else {
         panic!("a fold, not the sink");
     };
-    assert_eq!(kind, AggregateKind::Sum);
-    assert_eq!(accumulator, Tiling::Scalar(Extent::Base(BaseType::Int)));
+    assert_eq!(*kind, AggregateKind::Sum);
+    assert_eq!(*accumulator, Tiling::Scalar(Extent::Base(BaseType::Int)));
 }
 
 #[test]
@@ -192,7 +192,7 @@ fn a_program_with_another_breaker_is_not_a_morsel_pipeline() {
     let loaded = LoadedProgram::test("[sum(g) for g in groupby([1, 2, 3, 4], \\x -> x // 2)]");
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
-    let refused = plan_main(&compiled.operator_graph)
+    let refused = plan(&compiled.operator_graph)
         .err()
         .expect("a group-by has breakers the pool does not run");
     assert!(
@@ -201,26 +201,56 @@ fn a_program_with_another_breaker_is_not_a_morsel_pipeline() {
     );
 }
 
-/// A chain that reads a shared node would notify the pool through a fan-out, whose input consumer
-/// drops a second notification between pulls, so the plan refuses it.
+/// `xs = [x + 1 for x …]` read by `[a * 2 for a in xs]`: the pipeline that fills the `Memo` and
+/// the pipeline behind it run on the pool, and the answer is the one pull of the whole program.
+fn shared(rows: u64, tail: &str) -> String {
+    let items: Vec<String> = (0..rows).map(|i| i.to_string()).collect();
+    format!("xs = [x + 1 for x in [{}]]\n{tail}", items.join(", "))
+}
+
 #[test]
-fn a_chain_that_reads_a_shared_node_is_not_a_morsel_pipeline() {
+fn a_shared_value_runs_as_two_pipelines_and_equals_the_serial_answer() {
+    for rows in [0, 1, 6, 7, 8, 100, 1000] {
+        let program = shared(rows, "[a * 2 for a in xs]");
+        let tile = four_workers(program.clone());
+        assert!(
+            tile.is_terminal(),
+            "{rows} rows: the collection is complete"
+        );
+        assert_eq!(entries(&tile), entries(&whole_pull(program)), "{rows} rows");
+    }
+}
+
+/// A fold behind the breaker folds what the pipeline before it materialized.
+#[test]
+fn a_fold_behind_a_shared_value_equals_the_serial_answer() {
+    for fold in ["sum", "max", "min"] {
+        for rows in [1, 7, 500] {
+            let program = shared(rows, &format!("{fold}([a * 2 for a in xs])"));
+            let tile = four_workers(program.clone());
+            assert!(
+                tile.is_terminal(),
+                "{fold} over {rows}: the fold is complete"
+            );
+            assert_eq!(tile, whole_pull(program), "{fold} over {rows}");
+        }
+    }
+}
+
+/// One worker serves both pipelines in turn.
+#[test]
+fn one_worker_serves_both_pipelines_of_a_shared_value() {
+    let program = shared(50, "[a * 2 for a in xs]");
     let mut ctx = GlobalContext::default();
-    let loaded = LoadedProgram::test(indoc! {"
-        xs = [x + 1 for x in [1, 2, 3, 4]]
-        [a * 2 for a in xs]
-    "});
+    let loaded = LoadedProgram::test(program.clone());
     let consumer: Box<dyn Consumer> = Box::new(|| {});
-    let compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
-    let refused = plan_main(&compiled.operator_graph)
-        .err()
-        .expect("a shared chain is not a streaming pipeline");
-    assert!(
-        refused
-            .to_string()
-            .contains("`FanOutSlot` is not a streaming operator"),
-        "{refused}"
-    );
+    let mut compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
+    let config = Config {
+        threads: 1,
+        morsel_rows: 4,
+    };
+    let tile = run_main(&mut ctx, &mut compiled, &config).expect("two morsel pipelines");
+    assert_eq!(entries(&tile), entries(&whole_pull(program)));
 }
 
 fn no_main() -> Box<dyn Consumer> {
@@ -288,8 +318,8 @@ fn over_a_source(key_extent: Extent) -> (GlobalContext, cambra::ccl::context::Co
 #[test]
 fn a_chain_over_a_source_is_a_morsel_pipeline() {
     let (_ctx, compiled) = over_a_source(Extent::Base(BaseType::Int));
-    let pipeline = plan_main(&compiled.operator_graph).expect("a source is streamed");
-    assert!(matches!(pipeline.breaker, Breaker::Collect));
+    let plan = plan(&compiled.operator_graph).expect("a source is streamed");
+    assert!(matches!(plan.main_breaker(), Breaker::Collect));
 }
 
 /// A source whose keys are not totally ordered cannot be cut into morsels, so the pool refuses the

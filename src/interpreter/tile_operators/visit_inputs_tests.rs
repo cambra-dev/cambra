@@ -180,7 +180,7 @@ fn context(case: &Case) -> GlobalContext {
 
 /// The kinds the two visitors were compared at, and the kinds with inputs the program's graph
 /// holds through any edge.
-fn survey() -> (BTreeSet<&'static str>, BTreeSet<&'static str>) {
+pub(crate) fn survey() -> (BTreeSet<&'static str>, BTreeSet<&'static str>) {
     let (mut compared, mut held) = (BTreeSet::new(), BTreeSet::new());
     for case in corpus() {
         let mut ctx = context(&case);

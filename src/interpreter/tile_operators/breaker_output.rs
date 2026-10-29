@@ -1,10 +1,5 @@
 //! The operator that serves a breaker's output to the pipeline behind it.
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the plan constructs `PoolBreaker::Materialize`")
-)]
-
 use super::*;
 use crate::interpreter::Materialized;
 
@@ -23,7 +18,8 @@ pub(crate) struct BreakerOutput {
     base: OperatorBase,
     materialized: Arc<Materialized>,
     /// Whether the reader reads every row whole: the build side of a join. Its producers answer
-    /// the universal read and ignore a release that names part of it.
+    /// the universal read and ignore a release that names part of it. No plan builds one yet: a
+    /// build side is admitted by a later change, and the support is here for it.
     whole: bool,
     correlation: Option<Vec<TilePathStep>>,
     source: Arc<LiveSource>,
@@ -98,6 +94,37 @@ impl TileOperator for BreakerOutput {
 
     fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
         self.correlation.clone()
+    }
+}
+
+/// What a pool leaves where it took a chain out of the graph: an operator with the chain's tiling
+/// and no inputs, which nothing subscribes.
+pub(crate) struct Detached {
+    tiling: Tiling,
+}
+
+impl Detached {
+    pub(crate) fn new(tiling: Tiling) -> Self {
+        Self { tiling }
+    }
+}
+
+impl TileOperator for Detached {
+    fn tiling(&self) -> &Tiling {
+        &self.tiling
+    }
+
+    fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+
+    fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
+
+    fn subscribe(
+        &mut self,
+        _intent_guard: TileGuard,
+        _consumer: Box<dyn Consumer>,
+        _scheduler: &mut Scheduler,
+    ) -> Box<dyn TileProducer> {
+        panic!("a chain a pool took out of the graph is not subscribed")
     }
 }
 

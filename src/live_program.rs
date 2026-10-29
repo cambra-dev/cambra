@@ -600,12 +600,17 @@ impl LiveProgram {
     ) -> Option<Result<crate::interpreter::Tile, crate::interpreter::parallel::Unsupported>> {
         let at = self.branches.iter().position(|b| b.name == name)?;
         let branch = &mut self.branches[at];
-        Some(crate::interpreter::parallel::run_main_holding(
+        let result = crate::interpreter::parallel::run_main_holding(
             ctx,
             &mut branch.program,
             &mut branch.main_producer,
             config,
-        ))
+        );
+        if result.is_ok() {
+            // The pool took the program, whose fan-outs it cut: a reload cannot offer them on.
+            branch.operator_map = OperatorMap::default();
+        }
+        Some(result)
     }
 
     /// Branch `name`'s `main` output's producer, for a driver to pull.

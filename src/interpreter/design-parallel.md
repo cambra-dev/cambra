@@ -66,17 +66,41 @@ set.
 
 ### The plan
 
-`plan_main` cuts the operator graph the way [docs/parallel-execution.md, "The pipeline
-plan"](../../docs/parallel-execution.md#the-pipeline-plan) describes, for one chain shape: an
-`IterateExtent`, then any number of `MapResult`s whose function operand is a `Constant`, into the
-breaker, which is the `main` sink or an `ExtractAggregate` over an `Aggregate` into it ([A fold as
-the breaker](#a-fold-as-the-breaker)). Every operator in the chain is streaming, so a worker's chain
-holds no state between morsels. A graph with any other node on the path or a sink besides `main` is
-refused with the reason, which the binary prints. `plan_main` checks the shape of the chain only.
-Which rows the source enumerates is the source's to say ([The dispatcher](#the-dispatcher)), so
-`run_main` refuses a source over anything but a finite range `[0, n)` when it asks the source for
-morsels. The programs this admits are `[x + 1 for x in xs]` over a literal list and a `sum`, `max`
-or `min` of it; a source over a data-source domain is the next shape.
+`plan` cuts the operator graph the way [docs/parallel-execution.md, "The pipeline
+plan"](../../docs/parallel-execution.md#the-pipeline-plan) describes, into pipelines listed upstream
+first. A pipeline's chain is any number of `MapResult`s whose function operand is a `Constant` and
+`MapResultWithSource`s over an `IterateExtent`, from its head to its breaker. A head is an
+`IterateExtent` over a source (`Head::Source`) or a `FanOutSlot` over a `Memo` (`Head::Breaker`).
+The plan cuts at the slot: the pipeline that feeds the `Memo` ends in `Breaker::Materialize`, is
+planned once per `Memo`, and the pipeline behind it streams from it. The last pipeline ends in the
+breaker of the `main` sink, which is the sink or an `ExtractAggregate` over an `Aggregate` into it
+([A fold as the breaker](#a-fold-as-the-breaker)). `classify` is the one table of what the plan does
+with an operator kind (streaming, source, cut, or refuse with the kind named), and its last arm
+refuses, so an operator the plan has not considered is refused. A test classifies every kind the
+corpus of compiled programs holds. Every operator in a chain is streaming, so a worker's chain holds
+no state between morsels. A graph with any other node on the path, a build side, or a sink besides
+`main` is refused with the reason, which the binary prints. Which rows a source enumerates is the
+source's to say ([The dispatcher](#the-dispatcher)), so `run_main` refuses a source over anything
+but a finite range `[0, n)` when it asks the source for morsels. The programs this admits are `[x +
+1 for x in xs]` over a literal list and a `sum`, `max` or `min` of it, and the same behind a value
+that the program names and reads (`xs = [...]; [a * 2 for a in xs]`); a source over a data-source
+domain is the next shape.
+
+`run_main_delivering` reads everything it can refuse before it takes the program: the plan, each
+pipeline's source with the graph cut at the slots (`check_pipelines`), and that a delivery reaches
+one source. It then drops the `main` producer, cuts the graph, and runs. `cut` takes the chain that
+feeds each `Memo` out of the graph, leaving a `Detached`, and replaces every slot with a
+`BreakerOutput` over the output that chain will fill. The graph is the pool's from there: the cut
+leaves it unusable to the scheduler loop, which is why nothing the pool can refuse follows it.
+The fan-out keeps the serial chain the program subscribed when it compiled: `FanOutShared::producer`
+is the serial `Memo`'s producer, and the operator map holds the fan-out for as long as the program,
+so dropping the `main` producer and the slots does not end that subscription, and its release
+records would pin the sources beneath it. `cut` calls `TileOperator::drop_serial_subscription` at
+the slot it takes the chain behind, which drops the producer. `LiveProgram` clears the branch's
+operator map once the pool has taken the program, so a reload compiles afresh and cannot offer the
+fan-out, whose `Memo` now holds a `Detached`, to the next version; a pool takes a program for good.
+A test runs a shared value over a source, with delivery that waits for each chunk to be released and
+with delivery that does not, and asserts that no record and no key is left with the source.
 
 The plan reads the graph through `TileOperator::visit_inputs` and cuts it through
 `TileOperator::visit_inputs_mut`, which states an operator's owned inputs as boxes the visitor may
@@ -253,9 +277,9 @@ source registers every chain's consumer, so one arrival notifies all of them. On
 publishes, and the source takes a region it has already claimed once: the duplicates that remain are
 an `Everything` that covers published rows and a region that reaches the head along two paths of a
 diamond. The path from the source to the `PipelineConsumer` is region-driven and acyclic
-([Region-carrying notifications](#region-carrying-notifications)), which `plan_main` guarantees by
-admitting only `MapResult`s over a `Constant` function operand and refusing a shared node
-(`FanOutSlot`) or a deferred edge. `run_pipeline` is the body of `run_main` for a plan with one
+([Region-carrying notifications](#region-carrying-notifications)), which `plan` guarantees by
+admitting only `MapResult`s over a `Constant` function operand, cutting a pipeline at a `FanOutSlot`
+and refusing a deferred edge. `run_pipeline` is the body of `run_main` for a plan with one
 pipeline, and `run_pipelines` runs several. Once the chains are subscribed it publishes `Everything`
 to the source, so the rows the source holds when the pool starts are claimable, as no notification
 names them. Without a delivery it then closes the source, since no row arrives later. A
@@ -270,7 +294,7 @@ when the closure returns, which can publish nothing more.
 A `PipelineRun` names its head: a data source (`Head::Source`) or a breaker's output
 (`Head::Breaker`). `run_pipelines` seeds and closes every pipeline with a data-source head when the
 run starts, whatever the pipeline waits on, since the dispatcher keeps the region in `Early` until
-the pipeline starts; the first pipeline is closed after its delivery instead when there is one.
+the pipeline starts; the first of them is closed after its delivery instead when there is one.
 Every chain is subscribed the same way, once per worker, and the first worker's chain of a pipeline
 carries the consumer that reaches the dispatcher: the `PipelineConsumer` of a delivery or of a
 breaker's output. `BreakerOutput` registers one consumer per reading operator, its first
@@ -422,7 +446,7 @@ A `main` output that is an `ExtractAggregate` over an `Aggregate` is a fold, and
 fold off those two nodes: `Breaker::Fold` carries the `AggregateKind` and the accumulator's tiling
 from the `Aggregate`'s own. The chain the workers subscribe is the fold's input, reached through
 `TileOperator::pool_input`, which `ExtractAggregate` answers with its fold and `Aggregate` with its
-input; every other operator answers `None`, which `run_main` never consults, since `plan_main`
+input; every other operator answers `None`, which `run_main` never consults, since `plan`
 admits only those two above the chain.
 
 The fold is the per-worker state the target design gives `Aggregate` ([docs/parallel-execution.md,
@@ -589,19 +613,18 @@ or the epoch move each fail a test.
 
 ## Not yet implemented
 
-A breaker other than the sink and a fold into `main` that a plan admits (`PoolBreaker::Materialize`
-runs under a hand-built plan, and `plan_main` cuts one pipeline), a way to hand a morsel back, and
-the sink pulls the scheduler loop queues. A source over a data-source domain runs on the pool when
-it cuts morsels (`cuts_morsels`), and `TestDataSource` is the only one that does: the HTTP and stdio
-sources keep the default, so a program over one stays on the compiling thread. Their arrivals reach
-the pipeline through the scheduler's polling, which a live pool drives from the calling thread
-(`run_main_delivering`), and nothing outside tests starts a pool over a live source: `run_main` has
-no delivery, so it runs the rows a source holds when it starts and closes the source. The
-scheduler's `check_for_notifications` notifies with `Everything`, because `check_for_new_data` says
-that a source has data and not which keys. A thread that knows the keys it wrote names them with
-`Scheduler::notify_source_consumers`, which wakes a consumer whose outermost keys are the source's
-with the region and any other with `Everything`. The end-to-end test names each chunk's keys that
-way, but the poll before it publishes `Everything` too, so it does not show the region reaching the
-head; `a_chain_over_a_source_forwards_the_region_an_arrival_names` does. The sources' own arrival
-regions are not reported. Every program the plan refuses runs on the thread that compiled it,
-through `Scheduler::check_for_notifications` and the sink pulls it queues.
+A breaker other than the sink, a fold into `main` and a `Memo`'s input, a build side, a way to hand
+a morsel back, and the sink pulls the scheduler loop queues. A source over a data-source domain runs
+on the pool when it cuts morsels (`cuts_morsels`), and `TestDataSource` is the only one that does:
+the HTTP and stdio sources keep the default, so a program over one stays on the compiling thread.
+Their arrivals reach the pipeline through the scheduler's polling, which a live pool drives from the
+calling thread (`run_main_delivering`), and nothing outside tests starts a pool over a live source:
+`run_main` has no delivery, so it runs the rows a source holds when it starts and closes the source.
+The scheduler's `check_for_notifications` notifies with `Everything`, because `check_for_new_data`
+says that a source has data and not which keys. A thread that knows the keys it wrote names them
+with `Scheduler::notify_source_consumers`, which wakes a consumer whose outermost keys are the
+source's with the region and any other with `Everything`. The end-to-end test names each chunk's
+keys that way, but the poll before it publishes `Everything` too, so it does not show the region
+reaching the head; `a_chain_over_a_source_forwards_the_region_an_arrival_names` does. The sources'
+own arrival regions are not reported. Every program the plan refuses runs on the thread that
+compiled it, through `Scheduler::check_for_notifications` and the sink pulls it queues.

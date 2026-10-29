@@ -557,10 +557,11 @@ morsels ([The dispatcher](../src/interpreter/design-parallel.md#the-dispatcher))
 
 `BreakerOutput` is that leaf and `Materialized` the shared handle ([A breaker's
 output](../src/interpreter/design-parallel.md#a-breakers-output)). A worker merges a morsel into
-the output and publishes the morsel's region, and the pool runs such a plan when it is built by
-hand.
+the output and publishes the morsel's region, and the pool runs such a plan for a value a
+program names and reads.
 
-**Not implemented.** `plan_main` admits no pipeline behind a breaker.
+**Not implemented.** `plan` admits a pipeline behind a `Memo` only, and none behind another
+breaker.
 
 ### Build sides
 
@@ -573,7 +574,7 @@ pipeline starts after the build pipeline finishes. A morsel's worker pulls its k
 releases, so a row withheld for an unanswered key is never revisited. A static operand's single
 notification at subscribe time is replaced by the seed publish in `run_pipeline`.
 
-**Not implemented.** `plan_main` admits no chain with a build side.
+**Not implemented.** `plan` admits no chain with a build side.
 
 ### Function operands
 

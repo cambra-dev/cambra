@@ -165,9 +165,30 @@ mod source_end_to_end {
         pace: Pace,
         yield_as: Yield,
     ) -> Tile {
+        run_program_over(
+            "[x + 1 for x in source1()]",
+            source,
+            chunks,
+            threads,
+            morsel_rows,
+            pace,
+            yield_as,
+        )
+    }
+
+    /// [`run_over`] for the program `code`, which reads `source1()`.
+    fn run_program_over(
+        code: &str,
+        source: Arc<Mutex<TestDataSource>>,
+        chunks: Vec<Chunk>,
+        threads: usize,
+        morsel_rows: u64,
+        pace: Pace,
+        yield_as: Yield,
+    ) -> Tile {
         let mut ctx = GlobalContext::default();
         ctx.register_source(source.clone());
-        let loaded = LoadedProgram::test("[x + 1 for x in source1()]");
+        let loaded = LoadedProgram::test(code);
         let consumer: Box<dyn Consumer> = Box::new(|| {});
         let mut compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
         let smallest = chunks
@@ -303,6 +324,47 @@ mod source_end_to_end {
             0,
             "the source reclaimed every key the sink acknowledged"
         );
+    }
+
+    /// A value the program names and reads is a breaker between two pipelines, and the serial
+    /// chain the program subscribed when it compiled holds release records with the source: the
+    /// pool drops it when it cuts, so the source ends with no record and no retained key, under
+    /// delivery that waits for the workers to release each chunk as well as under delivery that
+    /// does not.
+    #[test]
+    fn a_shared_value_over_a_source_leaves_no_record_and_no_key() {
+        for pace in [Pace::Flat, Pace::Lockstep] {
+            for threads in [1, 2, 4] {
+                let chunks = vec![int_rows(&[1, 2, 3]), int_rows(&[7, 8]), int_rows(&[5])];
+                let expected = sorted(
+                    chunks
+                        .iter()
+                        .flatten()
+                        .map(|row| (row.key.clone(), (row.value + 1) * 2))
+                        .collect(),
+                );
+                let source = new_source(Extent::Base(BaseType::Int));
+                let held = source.clone();
+                let tile = within_deadline(move || {
+                    run_program_over(
+                        "xs = [x + 1 for x in source1()]\n[a * 2 for a in xs]",
+                        source,
+                        chunks,
+                        threads,
+                        1,
+                        pace,
+                        Yield::Points,
+                    )
+                });
+                assert_eq!(entries(&tile), expected, "{threads} workers");
+                assert_eq!(held.lock_wait().retained_keys(), 0, "{threads} workers");
+                assert_eq!(
+                    held.lock_wait().release_records(),
+                    0,
+                    "{threads} workers: no record is left with the source"
+                );
+            }
+        }
     }
 
     fn reversed(mut chunks: Vec<Chunk>) -> Vec<Chunk> {

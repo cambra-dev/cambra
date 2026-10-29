@@ -722,7 +722,7 @@ depends on the input's shape, the operator decides from its tiling when it subsc
 | `CheckedLookup` | one key | widens | One key has no keys to project. |
 | `CheckedLookup` | the collection | widens | Every key is answered against all of it. |
 | `Memo` | the input | keeps, and passes a region of fields | Read at the projection, and its keys are the input's. A product is the same product, so a region of its fields is the memo's. |
-| `FanOutSlot` | the shared input | keeps, and passes a region of fields | The fan-out forwards the input's region to every live slot, a region of fields included. Its gate suppresses a notification whose region is inside what passed since the last pull, which a slot consumer that pulls does not need: its pull reads whatever arrived. A consumer that needs every region cannot sit behind a fan-out, and the worker pool's plan refuses a chain with one (`plan_main`). |
+| `FanOutSlot` | the shared input | keeps, and passes a region of fields | The fan-out forwards the input's region to every live slot, a region of fields included. Its gate suppresses a notification whose region is inside what passed since the last pull, which a slot consumer that pulls does not need: its pull reads whatever arrived. A consumer that needs every region cannot sit behind a fan-out, and the worker pool's plan refuses a chain with one (`plan` cuts it at the slot and runs the two pipelines). |
 | `ExtractFinal`, `PermuteRecordDomain`, `FlattenTupleDomain` | the input | widens | Read whole; the keys are re-keyed or the last position. |
 | `Aggregate`, `ExtractAggregate` | the input | widens | The accumulator has no keys. |
 | `MapAggregate`, `MapExtractAggregate` | the input | keeps | The groups keep the input's outermost keys. |

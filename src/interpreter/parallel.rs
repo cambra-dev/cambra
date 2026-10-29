@@ -2,7 +2,7 @@
 //! See `src/interpreter/design-parallel.md`, "The morsel prototype".
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fmt,
     sync::{
         Arc, Condvar, Mutex, OnceLock,
@@ -19,7 +19,9 @@ use crate::{
     interpreter::{
         Consumer, LockNow, Materialized, Predicate, Projection, Scheduler, Tile, TileGuard, Tiling,
         operator_graph::{EdgeKind, EdgeRole, GraphNode, OperatorGraph},
-        tile_operators::{Claim, MorselSource, TileOperator, TileProducer},
+        tile_operators::{
+            BreakerOutput, Claim, Detached, MorselSource, TileOperator, TileProducer,
+        },
     },
 };
 
@@ -71,15 +73,48 @@ impl fmt::Display for Unsupported {
     }
 }
 
-/// The pipeline shape the plan admits: any number of `MapResult`s, each applying a `Constant`
-/// function operand to its input, and `MapResultWithSource`s, each reading a source's value at the
-/// keys of an `IterateExtent` directly beneath it, over an `IterateExtent`, into the breaker.
-/// Every operator in the chain is streaming, so a worker's chain holds no state between morsels.
-/// Which rows the source enumerates, and whether it can be cut into morsels, is the source's to
-/// say ([`TileOperator::morsel_source`]).
-pub struct MainPipeline {
-    /// What the chain ends in.
-    pub breaker: Breaker,
+/// The pipelines the plan admits, upstream first: the last is the one that ends in `main`.
+///
+/// A pipeline is a chain of streaming operators, any number of `MapResult`s each applying a
+/// `Constant` function operand to its input and `MapResultWithSource`s each reading a source's
+/// value at the keys of an `IterateExtent` directly beneath it, from its head to its breaker. A
+/// head is an `IterateExtent` over a source ([`Head::Source`]), or a `FanOutSlot` over a `Memo`
+/// ([`Head::Breaker`]): the plan cuts the graph at the slot, and the pipeline that feeds the
+/// `Memo` ends in a breaker that materializes ([`Breaker::Materialize`]). Every operator in a
+/// chain is streaming, so a worker's chain holds no state between morsels. Which rows the source
+/// enumerates, and whether it can be cut into morsels, is the source's to say
+/// ([`TileOperator::morsel_source`]).
+pub struct Plan {
+    /// Every pipeline after the ones it streams from.
+    pipelines: Vec<PipelinePlan>,
+}
+
+impl Plan {
+    /// The pipeline that ends in `main`.
+    pub(crate) fn main(&self) -> &PipelinePlan {
+        self.pipelines.last().expect("a plan holds a pipeline")
+    }
+
+    /// What the pipeline that ends in `main` ends in.
+    pub fn main_breaker(&self) -> &Breaker {
+        &self.main().breaker
+    }
+
+    /// How many pipelines the plan holds.
+    pub fn pipeline_count(&self) -> usize {
+        self.pipelines.len()
+    }
+}
+
+/// One pipeline of a [`Plan`].
+pub(crate) struct PipelinePlan {
+    /// What its chain starts from.
+    pub(crate) head: Head,
+    /// What it ends in.
+    pub(crate) breaker: Breaker,
+    /// The pipelines, by position in the plan, whose output it reads: the pipeline of the `Memo`
+    /// its head slot reads, for a [`Head::Breaker`], and none for a source.
+    pub(crate) streams_from: Vec<usize>,
 }
 
 /// The breaker a morsel pipeline ends in: what the pool keeps between morsels, and how it
@@ -94,10 +129,59 @@ pub enum Breaker {
         /// The accumulator's tiling, which seeds each worker's partial.
         accumulator: Tiling,
     },
+    /// The input of a `Memo`: the rows the pipelines that read it stream from.
+    Materialize {
+        /// The `Memo` the output stands for.
+        memo: NodeId,
+    },
+}
+
+/// The streaming operators the plan admits in a chain.
+enum Streaming {
+    /// Applies a `Constant` function operand to its input.
+    MapResult,
+    /// Reads a source's value at the keys of an `IterateExtent` directly beneath it.
+    MapResultWithSource,
+}
+
+/// What the plan does with an operator, by its kind.
+enum Class {
+    /// A streaming operator the chain passes through.
+    Streaming(Streaming),
+    /// The head of a pipeline over a source.
+    Source,
+    /// The head of a pipeline that reads a breaker's output: the plan cuts here.
+    Cut,
+    /// The `Memo` a slot reads, whose input is the pipeline that feeds it.
+    Memo,
+    /// The function operand a `MapResult` applies.
+    Operand,
+    /// The extract over a fold at the top of `main`.
+    Extract,
+    /// The fold an extract reads.
+    Fold,
+    /// An operator the plan does not admit, and the reason.
+    Refuse(String),
+}
+
+/// How the plan classifies an operator by its kind: the one table of the kinds it meets. It ends
+/// in an arm that refuses, so an operator the plan has not considered is refused rather than run.
+fn classify(kind: &str) -> Class {
+    match kind {
+        "MapResult" => Class::Streaming(Streaming::MapResult),
+        "MapResultWithSource" => Class::Streaming(Streaming::MapResultWithSource),
+        "IterateExtent" => Class::Source,
+        "FanOutSlot" => Class::Cut,
+        "Memo" => Class::Memo,
+        "Constant" => Class::Operand,
+        "ExtractAggregate" => Class::Extract,
+        "Aggregate" => Class::Fold,
+        other => Class::Refuse(format!("`{other}` is not a streaming operator here")),
+    }
 }
 
 /// Cut `graph` into the plan the pool runs, or say why it cannot.
-pub fn plan_main(graph: &OperatorGraph) -> Result<MainPipeline, Unsupported> {
+pub fn plan(graph: &OperatorGraph) -> Result<Plan, Unsupported> {
     let by_id: HashMap<NodeId, &GraphNode> = graph
         .nodes()
         .iter()
@@ -119,18 +203,16 @@ pub fn plan_main(graph: &OperatorGraph) -> Result<MainPipeline, Unsupported> {
     let mut at = main.ok_or_else(|| Unsupported("the program has no `main` output".into()))?;
     // The breaker is read off the top of the chain: an extract over a fold, or the sink.
     let mut breaker = Breaker::Collect;
-    if let Some(GraphNode::Operator {
-        kind: "ExtractAggregate",
-        inputs,
-        ..
-    }) = by_id.get(&at)
+    if let Some(GraphNode::Operator { kind, inputs, .. }) = by_id.get(&at)
+        && matches!(classify(kind), Class::Extract)
         && let [edge] = inputs.as_slice()
         && let Some(GraphNode::Operator {
-            kind: "Aggregate",
+            kind: fold_kind,
             tiling: Tiling::Aggregation { kind, accumulator },
             inputs: fold_inputs,
             ..
         }) = by_id.get(&edge.subscribed)
+        && matches!(classify(fold_kind), Class::Fold)
         && let [fold_edge] = fold_inputs.as_slice()
     {
         breaker = Breaker::Fold {
@@ -139,98 +221,163 @@ pub fn plan_main(graph: &OperatorGraph) -> Result<MainPipeline, Unsupported> {
         };
         at = fold_edge.subscribed;
     }
-    loop {
-        match by_id.get(&at) {
-            Some(GraphNode::Operator {
-                kind: "MapResult",
-                inputs,
-                ..
-            }) => {
-                let edge = |role: &str| {
-                    inputs
-                        .iter()
-                        .find(|edge| matches!(edge.role, EdgeRole::Named(name) if name == role))
-                };
-                let (Some(data), Some(function)) = (edge("input"), edge("fn")) else {
-                    return Err(Unsupported("a `MapResult` without its two inputs".into()));
-                };
-                // The chain is a tree the walk descends once: an edge wired through a
-                // `CycleSlot` closes a cycle, and a `Share` edge reaches a fan, neither of
-                // which the plan admits, so following only owned edges bounds the walk.
-                for edge in [data, function] {
-                    if !matches!(edge.kind, EdgeKind::Value { deferred: false }) {
+    let mut planner = Planner {
+        by_id,
+        pipelines: Vec::new(),
+        memos: HashSet::new(),
+    };
+    planner.pipeline(at, breaker)?;
+    Ok(Plan {
+        pipelines: planner.pipelines,
+    })
+}
+
+/// The plan under construction: the graph, the pipelines planned so far, and the pipeline planned
+/// for each `Memo`, so that every slot that reads one streams from the same pipeline.
+struct Planner<'g> {
+    by_id: HashMap<NodeId, &'g GraphNode>,
+    pipelines: Vec<PipelinePlan>,
+    /// The `Memo`s a slot of the plan reads. A chain is linear, so at most one slot reads each;
+    /// a second is refused.
+    memos: HashSet<NodeId>,
+}
+
+impl Planner<'_> {
+    /// The kind of the operator `id` names, or why the graph holds none.
+    fn kind_of(&self, id: NodeId) -> Option<&'static str> {
+        match self.by_id.get(&id) {
+            Some(GraphNode::Operator { kind, .. }) => Some(kind),
+            Some(GraphNode::Sink { .. }) | None => None,
+        }
+    }
+
+    /// Plan the pipeline whose chain starts at `top` and ends in `breaker`, after the pipelines
+    /// it streams from, and say where it is in the plan.
+    fn pipeline(&mut self, top: NodeId, breaker: Breaker) -> Result<usize, Unsupported> {
+        let mut at = top;
+        let (head, streams_from) = loop {
+            let node = self.by_id.get(&at).copied();
+            let Some(GraphNode::Operator { kind, inputs, .. }) = node else {
+                return Err(Unsupported("the chain reaches no source".into()));
+            };
+            match classify(kind) {
+                Class::Refuse(reason) => return Err(Unsupported(reason)),
+                Class::Memo | Class::Operand | Class::Extract | Class::Fold => {
+                    return Err(Unsupported(format!(
+                        "`{kind}` is not a streaming operator here"
+                    )));
+                }
+                Class::Source => break (Head::Source, Vec::new()),
+                Class::Cut => {
+                    let [edge] = inputs.as_slice() else {
+                        return Err(Unsupported("a `FanOutSlot` without its one input".into()));
+                    };
+                    let memo = edge.subscribed;
+                    let Some(GraphNode::Operator {
+                        kind: memo_kind,
+                        inputs: memo_inputs,
+                        ..
+                    }) = self.by_id.get(&memo).copied()
+                    else {
+                        return Err(Unsupported(
+                            "a `FanOutSlot` reads a node that is not a `Memo`".into(),
+                        ));
+                    };
+                    if !matches!(classify(memo_kind), Class::Memo) {
+                        return Err(Unsupported(
+                            "a `FanOutSlot` reads a node that is not a `Memo`".into(),
+                        ));
+                    }
+                    if !self.memos.insert(memo) {
+                        return Err(Unsupported(
+                            "a `Memo` is read by more than one slot of the plan".into(),
+                        ));
+                    }
+                    let [upstream] = memo_inputs.as_slice() else {
+                        return Err(Unsupported("a `Memo` without its one input".into()));
+                    };
+                    if !matches!(upstream.kind, EdgeKind::Value { deferred: false }) {
                         return Err(Unsupported(
                             "the chain closes a cycle or reads a shared node".into(),
                         ));
                     }
+                    let planned =
+                        self.pipeline(upstream.subscribed, Breaker::Materialize { memo })?;
+                    break (Head::Breaker, vec![planned]);
                 }
-                match by_id.get(&function.subscribed) {
-                    Some(GraphNode::Operator {
-                        kind: "Constant", ..
-                    }) => {}
-                    Some(GraphNode::Operator { kind, .. }) => {
-                        return Err(Unsupported(format!(
-                            "a `MapResult` applies a `{kind}`, and only a `Constant` is streamed"
-                        )));
+                Class::Streaming(Streaming::MapResult) => {
+                    let edge = |role: &str| {
+                        inputs
+                            .iter()
+                            .find(|edge| matches!(edge.role, EdgeRole::Named(name) if name == role))
+                    };
+                    let (Some(data), Some(function)) = (edge("input"), edge("fn")) else {
+                        return Err(Unsupported("a `MapResult` without its two inputs".into()));
+                    };
+                    // The chain is a tree the walk descends once: an edge wired through a
+                    // `CycleSlot` closes a cycle, and a `Share` edge reaches a fan, which a
+                    // chain reads only at its head, so following only owned edges bounds the walk.
+                    for edge in [data, function] {
+                        if !matches!(edge.kind, EdgeKind::Value { deferred: false }) {
+                            return Err(Unsupported(
+                                "the chain closes a cycle or reads a shared node".into(),
+                            ));
+                        }
                     }
-                    Some(GraphNode::Sink { .. }) | None => {
+                    match self.kind_of(function.subscribed) {
+                        Some(kind) if matches!(classify(kind), Class::Operand) => {}
+                        Some(kind) => {
+                            return Err(Unsupported(format!(
+                                "a `MapResult` applies a `{kind}`, and only a `Constant` is \
+                                 streamed"
+                            )));
+                        }
+                        None => {
+                            return Err(Unsupported(
+                                "a `MapResult` applies something the graph holds no operator for"
+                                    .into(),
+                            ));
+                        }
+                    }
+                    at = data.subscribed;
+                }
+                // Reads a source's value at each key of its input: the keys are the input's, so
+                // the chain streams.
+                Class::Streaming(Streaming::MapResultWithSource) => {
+                    let [input] = inputs.as_slice() else {
                         return Err(Unsupported(
-                            "a `MapResult` applies something the graph holds no operator for"
+                            "a `MapResultWithSource` without its one input".into(),
+                        ));
+                    };
+                    if !matches!(input.kind, EdgeKind::Value { deferred: false }) {
+                        return Err(Unsupported(
+                            "the chain closes a cycle or reads a shared node".into(),
+                        ));
+                    }
+                    // It releases its source by correlating the keys it is released at with the
+                    // keys it reads, which only an `IterateExtent` beneath it states: over any
+                    // other input it releases the source on a universal guard alone, and the pool
+                    // releases morsels.
+                    if !self
+                        .kind_of(input.subscribed)
+                        .is_some_and(|kind| matches!(classify(kind), Class::Source))
+                    {
+                        return Err(Unsupported(
+                            "a `MapResultWithSource` reads a source's value at the keys of an \
+                             `IterateExtent` only"
                                 .into(),
                         ));
                     }
+                    at = input.subscribed;
                 }
-                at = data.subscribed;
             }
-            // Reads a source's value at each key of its input: the keys are the input's, so the
-            // chain streams.
-            Some(GraphNode::Operator {
-                kind: "MapResultWithSource",
-                inputs,
-                ..
-            }) => {
-                let [input] = inputs.as_slice() else {
-                    return Err(Unsupported(
-                        "a `MapResultWithSource` without its one input".into(),
-                    ));
-                };
-                if !matches!(input.kind, EdgeKind::Value { deferred: false }) {
-                    return Err(Unsupported(
-                        "the chain closes a cycle or reads a shared node".into(),
-                    ));
-                }
-                // It releases its source by correlating the keys it is released at with the
-                // keys it reads, which only an `IterateExtent` beneath it states: over any other
-                // input it releases the source on a universal guard alone, and the pool releases
-                // morsels.
-                if !matches!(
-                    by_id.get(&input.subscribed),
-                    Some(GraphNode::Operator {
-                        kind: "IterateExtent",
-                        ..
-                    })
-                ) {
-                    return Err(Unsupported(
-                        "a `MapResultWithSource` reads a source's value at the keys of an \
-                         `IterateExtent` only"
-                            .into(),
-                    ));
-                }
-                at = input.subscribed;
-            }
-            Some(GraphNode::Operator {
-                kind: "IterateExtent",
-                ..
-            }) => return Ok(MainPipeline { breaker }),
-            Some(GraphNode::Operator { kind, .. }) => {
-                return Err(Unsupported(format!(
-                    "`{kind}` is not a streaming operator here"
-                )));
-            }
-            Some(GraphNode::Sink { .. }) | None => {
-                return Err(Unsupported("the chain reaches no source".into()));
-            }
-        }
+        };
+        self.pipelines.push(PipelinePlan {
+            head,
+            breaker,
+            streams_from,
+        });
+        Ok(self.pipelines.len() - 1)
     }
 }
 
@@ -274,27 +421,22 @@ pub(crate) fn run_main_delivering(
     config: &Config,
     delivery: Option<DeliveringThread<'_>>,
 ) -> Result<Tile, Unsupported> {
-    let pipeline = plan_main(&program.operator_graph)?;
+    let plan = plan(&program.operator_graph)?;
     let output = program
         .main_mut()
         .ok_or_else(|| Unsupported("the program has no `main` output".into()))?;
-    // The chain the workers subscribe: the whole output for a collection, the fold's input
-    // for a fold, reached through the extract and the fold the plan saw.
-    let chain_op: &mut dyn TileOperator = match pipeline.breaker {
-        Breaker::Collect => &mut *output.op,
-        Breaker::Fold { .. } => output
-            .op
-            .pool_input()
-            .and_then(TileOperator::pool_input)
-            .expect(
-                "the plan saw an extract over a fold, and both reach through to the fold's input",
-            ),
-    };
-    let source = source_of(chain_op)?;
+    // Everything the pool can refuse is read before it takes the program: each pipeline's
+    // source, the pipelines being cut at the slots that start the ones behind a breaker.
+    let source_pipelines = check_pipelines(&*output.op)?;
+    if delivery.is_some() && source_pipelines > 1 {
+        return Err(Unsupported(
+            "the program reads several sources, and a delivery reaches one".into(),
+        ));
+    }
     // The program is the pool's from here: a program the plan or `source_of` refused still has
-    // its producer, and the scheduler loop drives it. The pool owns the pipeline's release
-    // record, so the producer `compile_program` subscribed for `main` goes: it registered a
-    // record that releases nothing, which a source would hold its reclaim at. It is in the
+    // its producer, and the scheduler loop drives it. The pool owns the pipelines' release
+    // records, so the producer `compile_program` subscribed for `main` goes: it registered
+    // records that release nothing, which a source would hold its reclaim at. It is in the
     // program's output, or with the caller that moved it out to drive it.
     let dropped = main_producer.take().or_else(|| output.producer.take());
     debug_assert!(
@@ -302,24 +444,207 @@ pub(crate) fn run_main_delivering(
         "the pool drops the producer that held the pipeline's record"
     );
     drop(dropped);
-    let breaker = match &pipeline.breaker {
-        Breaker::Collect => PoolBreaker::Collect {
-            collector: Mutex::new(chain_op.tiling().empty_tile()),
-        },
-        Breaker::Fold { kind, accumulator } => PoolBreaker::Fold {
-            kind: *kind,
-            seed: kind.initial_accumulator(accumulator),
-            partials: Mutex::new(Vec::new()),
-        },
+    let mut delivery = delivery;
+    let mut tiles = None;
+    let mut run_chain = |chain: &mut Box<dyn TileOperator>| {
+        let mut taken = HashMap::new();
+        cut(chain, &mut taken);
+        tiles = Some(run_planned(
+            ctx,
+            &plan,
+            chain,
+            taken,
+            config,
+            delivery.take(),
+        ));
     };
-    Ok(run_pipeline(
-        ctx.scheduler(),
-        chain_op,
-        source,
-        breaker,
-        config,
-        delivery,
-    ))
+    // The chain the workers subscribe is the whole output for a collection, and the fold's input
+    // for a fold, reached through the extract and the fold the plan saw.
+    match plan.main().breaker {
+        Breaker::Collect => run_chain(&mut output.op),
+        Breaker::Fold { .. } => output.op.visit_inputs_mut(&mut |fold| {
+            fold.visit_inputs_mut(&mut |input| run_chain(input));
+        }),
+        Breaker::Materialize { .. } => unreachable!("`main` is not a memo's input"),
+    }
+    Ok(tiles
+        .expect("the main chain was visited")
+        .pop()
+        .expect("a run holds a pipeline"))
+}
+
+/// The sources of the pipelines of the program whose `main` is `main`, which the plan has
+/// already admitted: each pipeline reads one source that is cut into morsels, or starts at a slot
+/// that reads a breaker. Returns how many pipelines read a source.
+fn check_pipelines(main: &dyn TileOperator) -> Result<usize, Unsupported> {
+    struct Walk {
+        seen: HashSet<NodeId>,
+        sources: usize,
+        refusal: Option<Unsupported>,
+    }
+    fn pipeline(top: &dyn TileOperator, walk: &mut Walk) {
+        fn chain(
+            op: &dyn TileOperator,
+            found: &mut usize,
+            ends_at_a_slot: &mut bool,
+            walk: &mut Walk,
+        ) {
+            if matches!(classify(op.kind()), Class::Cut) {
+                *ends_at_a_slot = true;
+                // The pipeline behind the slot's `Memo` is walked once, however many slots read it.
+                op.visit_inputs(&mut |edge| {
+                    if let Some(memo) = edge.target.operator_id()
+                        && walk.seen.insert(memo)
+                    {
+                        edge.target
+                            .visit_inputs(&mut |upstream| pipeline(upstream.target, walk));
+                    }
+                });
+                return;
+            }
+            match op.morsel_source() {
+                Some(_) => *found += 1,
+                None => {
+                    op.visit_inputs(&mut |edge| chain(edge.target, found, ends_at_a_slot, walk))
+                }
+            }
+        }
+        let (mut found, mut ends_at_a_slot) = (0, false);
+        chain(top, &mut found, &mut ends_at_a_slot, walk);
+        if !ends_at_a_slot {
+            match found {
+                1 => walk.sources += 1,
+                0 => {
+                    walk.refusal.get_or_insert(Unsupported(
+                        "the chain reads no source that is cut into morsels".into(),
+                    ));
+                }
+                _ => {
+                    walk.refusal.get_or_insert(Unsupported(
+                        "the chain reads several sources, and a pipeline is cut at one".into(),
+                    ));
+                }
+            }
+        }
+    }
+    let mut walk = Walk {
+        seen: HashSet::new(),
+        sources: 0,
+        refusal: None,
+    };
+    pipeline(main, &mut walk);
+    match walk.refusal {
+        Some(refusal) => Err(refusal),
+        None => Ok(walk.sources),
+    }
+}
+
+/// An upstream pipeline that the cut took out of the graph: the chain that fed a `Memo`, and the
+/// output the pipelines that read the `Memo` stream from.
+struct Taken {
+    chain: Box<dyn TileOperator>,
+    output: Arc<Materialized>,
+}
+
+/// Cut the graph below `op` at every `FanOutSlot`: the first slot that reads a `Memo` takes the
+/// chain that feeds it out of the graph, leaving a [`Detached`] in its place, and every slot is
+/// replaced by a [`BreakerOutput`] over the output that chain will fill. The taken chains are cut
+/// in turn. The program is the pool's from here, since the cut leaves the graph unusable to the
+/// scheduler loop.
+fn cut(op: &mut Box<dyn TileOperator>, taken: &mut HashMap<NodeId, Taken>) {
+    if !matches!(classify(op.kind()), Class::Cut) {
+        op.visit_inputs_mut(&mut |input| cut(input, taken));
+        return;
+    }
+    let mut memo = None;
+    op.visit_inputs(&mut |edge| memo = edge.target.operator_id());
+    let memo = memo.expect("the plan saw a `Memo`, and an operator has an identity");
+    let (tiling, correlation) = (op.tiling().clone(), op.result_correlation());
+    // The serial chain the program subscribed when it compiled belongs to the scheduler loop,
+    // which the pool replaces: its producer holds release records with the sources beneath it,
+    // and the fan-out, which the operator map keeps, would hold it for as long as the program.
+    op.drop_serial_subscription();
+    let mut upstream = None;
+    op.visit_inputs_mut(&mut |shared| {
+        shared.visit_inputs_mut(&mut |input| {
+            let detached = Box::new(Detached::new(input.tiling().clone()));
+            upstream = Some(std::mem::replace(input, detached));
+        })
+    });
+    let mut chain = upstream.expect("a `Memo` has an input");
+    let output = Materialized::new(chain.tiling().clone());
+    cut(&mut chain, taken);
+    *op = Box::new(BreakerOutput::new(
+        output.clone(),
+        tiling,
+        false,
+        correlation,
+    ));
+    let first = taken.insert(memo, Taken { chain, output });
+    assert!(first.is_none(), "the plan admits one slot per memo");
+}
+
+/// Run the pipelines of `plan` over the chains the cut left: `main_chain` for the pipeline that
+/// ends in `main`, and the taken chains for the pipelines that end in a breaker that
+/// materializes. The tiles are the pipelines' results, in plan order.
+fn run_planned(
+    ctx: &mut GlobalContext,
+    plan: &Plan,
+    main_chain: &mut Box<dyn TileOperator>,
+    mut taken: HashMap<NodeId, Taken>,
+    config: &Config,
+    delivery: Option<DeliveringThread<'_>>,
+) -> Vec<Tile> {
+    let mut main_chain = Some(main_chain);
+    let mut upstream: HashMap<NodeId, &mut Taken> =
+        taken.iter_mut().map(|(k, v)| (*k, v)).collect();
+    let mut runs = Vec::new();
+    for pipeline in &plan.pipelines {
+        let (chain, breaker): (&mut dyn TileOperator, PoolBreaker) = match &pipeline.breaker {
+            Breaker::Materialize { memo } => {
+                let taken = upstream
+                    .remove(memo)
+                    .expect("the cut took the memo's input");
+                (
+                    &mut *taken.chain,
+                    PoolBreaker::Materialize {
+                        output: taken.output.clone(),
+                    },
+                )
+            }
+            Breaker::Collect => {
+                let chain = main_chain.take().expect("one pipeline ends in `main`");
+                let breaker = PoolBreaker::Collect {
+                    collector: Mutex::new(chain.tiling().empty_tile()),
+                };
+                (&mut **chain, breaker)
+            }
+            Breaker::Fold { kind, accumulator } => {
+                let chain = main_chain.take().expect("one pipeline ends in `main`");
+                let breaker = PoolBreaker::Fold {
+                    kind: *kind,
+                    seed: kind.initial_accumulator(accumulator),
+                    partials: Mutex::new(Vec::new()),
+                };
+                (&mut **chain, breaker)
+            }
+        };
+        let source = source_of(&*chain).expect("the pipeline was checked to read one source");
+        runs.push(PipelineRun {
+            chain,
+            source,
+            breaker,
+            head: pipeline.head,
+            // The plan admits no build side, which would make a pipeline wait on one.
+            after: Vec::new(),
+            streams_from: pipeline
+                .streams_from
+                .iter()
+                .map(|&i| PipelineId(i))
+                .collect(),
+        });
+    }
+    run_pipelines(ctx.scheduler(), runs, config, delivery)
 }
 
 /// What delivers a live source's arrivals while the workers run: called once, on the calling
@@ -338,6 +663,7 @@ pub(crate) type DeliveringThread<'a> = Box<dyn FnOnce(PipelineHandle, &mut Sched
 /// a notification carries is published to `source` and wakes a parked worker. When `delivery`
 /// returns, `run_pipeline` closes the source, and the pipeline finishes once the workers have
 /// claimed everything. Without one the source holds every row it will, and it is closed at once.
+#[cfg(test)]
 fn run_pipeline(
     scheduler: &mut Scheduler,
     chain_op: &mut dyn TileOperator,
@@ -360,7 +686,7 @@ fn run_pipeline(
 
 /// What a pipeline's chain starts from.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Head {
+pub(crate) enum Head {
     /// A data source, whose rows arrive from outside the run: the run publishes what it holds
     /// and closes it, however the pipeline waits on others. The dispatcher keeps the region in
     /// `Early` until the pipeline starts.
@@ -390,7 +716,7 @@ struct PipelineRun<'a> {
 /// pipeline's breaker holds once every pipeline has finished, in plan order.
 ///
 /// A pipeline with a data-source head is published `Everything` when the run starts and closed
-/// then, or once `delivery` has returned when it is the first pipeline and there is one. The head
+/// then, or once `delivery` has returned when it is the first of them and there is one. The head
 /// of a pipeline that reads a breaker is notified by the breaker before it, which publishes each
 /// morsel's region once it holds the rows ([`Materialized::publish`]), so the pipeline starts at
 /// the first morsel and ends when the pipeline before it finishes
@@ -400,16 +726,34 @@ struct PipelineRun<'a> {
 /// workers' chains carry a consumer that is never notified.
 ///
 /// A chain does not reach another pipeline's operators, and a pipeline that reads a breaker reads
-/// the output of a pipeline it streams from; both are asserted. Once the chains are dropped the
-/// breakers' readers are retired, so a producer that never released pins no row.
+/// the output of a pipeline it streams from; a debug build asserts both, and every build asserts
+/// that a source pipeline streams from none and a breaker's pipeline from one. Once the chains
+/// are dropped the breakers' readers are retired, so a producer that never released pins no row.
+///
+/// The result of a pipeline that ends in `Collect` or `Fold` is the answer of `main`. The result
+/// of one that ends in `Materialize` is its output once the pipelines that read it have released
+/// every row, which is empty and complete: the rows went on to those pipelines.
 fn run_pipelines(
     scheduler: &mut Scheduler,
     mut runs: Vec<PipelineRun<'_>>,
     config: &Config,
     delivery: Option<DeliveringThread<'_>>,
 ) -> Vec<Tile> {
+    for (pipeline, run) in runs.iter().enumerate() {
+        assert!(
+            run.head != Head::Source || run.streams_from.is_empty(),
+            "a pipeline over a data source streams from none: {pipeline}"
+        );
+        assert!(
+            run.head != Head::Breaker || !run.streams_from.is_empty(),
+            "a pipeline over a breaker's output streams from the pipeline of that breaker: \
+             {pipeline}"
+        );
+    }
     assert_pipelines_are_separate(&runs);
     let tilings: Vec<Tiling> = runs.iter().map(|run| run.chain.tiling().clone()).collect();
+    // The delivery reaches the first pipeline that reads a data source.
+    let delivered = runs.iter().position(|run| run.head == Head::Source);
     let specs = runs
         .iter()
         .map(|run| {
@@ -433,7 +777,7 @@ fn run_pipelines(
     // dispatcher through the first worker's chain of each pipeline. Every chain's source
     // registration is notified of the same region, and one consumer publishes it: a second would
     // publish what the source has already claimed. The path from the source to that consumer is
-    // region-driven and acyclic (`plan_main` admits no shared node or recurrence), so no consumer
+    // region-driven and acyclic (`plan` admits no shared node or recurrence), so no consumer
     // on it drops or widens the region.
     //
     // The chains hold release records with a source, one per source operator and named for the
@@ -450,7 +794,9 @@ fn run_pipelines(
                                 (0, Head::Breaker) => {
                                     Box::new(PipelineConsumer(handles[pipeline].clone()))
                                 }
-                                (0, Head::Source) if pipeline == 0 && delivery.is_some() => {
+                                (0, Head::Source)
+                                    if Some(pipeline) == delivered && delivery.is_some() =>
+                                {
                                     Box::new(PipelineConsumer(handles[pipeline].clone()))
                                 }
                                 _ => Box::new(|| {}),
@@ -475,7 +821,7 @@ fn run_pipelines(
     // later, so the source closes now.
     for &pipeline in &seeded {
         handles[pipeline].publish(&Projection::Everything);
-        if delivery.is_none() || pipeline != 0 {
+        if delivery.is_none() || Some(pipeline) != delivered {
             handles[pipeline].close();
         }
     }
@@ -498,8 +844,9 @@ fn run_pipelines(
             .collect();
         let delivered = delivery.and_then(|delivery| {
             let delivered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                delivery(handles[0].clone(), scheduler);
-                handles[0].close();
+                let handle = &handles[delivered.expect("a delivery reaches a source pipeline")];
+                delivery(handle.clone(), scheduler);
+                handle.close();
             }));
             if delivered.is_err() {
                 dispatcher.fail();
@@ -532,9 +879,9 @@ fn run_pipelines(
     breakers.into_iter().map(PoolBreaker::finish).collect()
 }
 
-/// The invariants of a run's pipelines, which a plan holds and a hand-built run could break: a
-/// chain reaches no operator of another pipeline, a [`Head::Source`] pipeline streams from none,
-/// and a [`Head::Breaker`] pipeline reads the output of a pipeline it streams from.
+/// The invariants of a run's pipelines that a debug build checks, which a plan holds and a
+/// hand-built run could break: a chain reaches no operator of another pipeline, and a
+/// [`Head::Breaker`] pipeline reads the output of a pipeline it streams from.
 fn assert_pipelines_are_separate(runs: &[PipelineRun<'_>]) {
     if !cfg!(debug_assertions) {
         return;
@@ -552,14 +899,6 @@ fn assert_pipelines_are_separate(runs: &[PipelineRun<'_>]) {
     let mut owner = HashMap::new();
     for (pipeline, run) in runs.iter().enumerate() {
         visit(&*run.chain, pipeline, &mut owner);
-        assert!(
-            run.head != Head::Source || run.streams_from.is_empty(),
-            "a pipeline over a data source streams from none: {pipeline}"
-        );
-        assert!(
-            run.head != Head::Breaker || !run.streams_from.is_empty(),
-            "a pipeline over a breaker's output streams from the pipeline of that breaker: {pipeline}"
-        );
         if run.head == Head::Breaker {
             assert!(
                 run.streams_from.iter().any(|upstream| matches!(
@@ -666,7 +1005,6 @@ enum PoolBreaker {
     },
     /// The rows a pipeline behind this one reads: each worker merges the morsel into the shared
     /// output and publishes its region, and the output is completed when the pipeline finishes.
-    #[cfg_attr(not(test), expect(dead_code, reason = "the plan constructs it"))]
     Materialize { output: Arc<Materialized> },
 }
 
@@ -1970,6 +2308,130 @@ mod tests {
         ));
         assert_eq!(worker.morsels, served.morsels);
         assert_eq!(worker.left, served.left);
+    }
+
+    /// The plan classifies every operator kind the corpus of compiled programs holds on purpose:
+    /// exactly four are admitted in a chain, and every other kind is refused with its own name.
+    #[test]
+    fn every_operator_kind_the_corpus_holds_is_classified_on_purpose() {
+        use crate::interpreter::tile_operators::visit_inputs_tests::survey;
+        let (kinds, _) = survey();
+        let mut admitted = Vec::new();
+        for kind in kinds {
+            match classify(kind) {
+                Class::Streaming(_) | Class::Source | Class::Cut => admitted.push(kind),
+                Class::Memo | Class::Operand | Class::Extract | Class::Fold => {}
+                Class::Refuse(reason) => assert!(
+                    reason.contains(kind),
+                    "a refusal names the operator it refuses: {reason}"
+                ),
+            }
+        }
+        assert_eq!(
+            admitted,
+            [
+                "FanOutSlot",
+                "IterateExtent",
+                "MapResult",
+                "MapResultWithSource"
+            ],
+            "only the streaming operators, the sources and the slots are admitted"
+        );
+    }
+
+    /// A chain that reads a value another reads is two pipelines: the one that feeds the `Memo`
+    /// materializes, and the one behind it streams from it.
+    #[test]
+    fn a_chain_that_reads_a_shared_value_is_planned_as_two_pipelines() {
+        use crate::ccl::context::{GlobalContext, compile_program};
+        use crate::ccl::load::LoadedProgram;
+        let mut ctx = GlobalContext::default();
+        let loaded = LoadedProgram::test("xs = [x + 1 for x in [1, 2, 3, 4]]\n[a * 2 for a in xs]");
+        let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).expect("compiles");
+        let planned = plan(&compiled.operator_graph).expect("a shared chain is two pipelines");
+        assert_eq!(planned.pipeline_count(), 2);
+        let (upstream, downstream) = (&planned.pipelines[0], &planned.pipelines[1]);
+        assert!(upstream.head == Head::Source);
+        assert!(matches!(upstream.breaker, Breaker::Materialize { .. }));
+        assert!(upstream.streams_from.is_empty());
+        assert!(downstream.head == Head::Breaker);
+        assert!(matches!(downstream.breaker, Breaker::Collect));
+        assert_eq!(downstream.streams_from, [0]);
+    }
+
+    /// A `Memo` is read by one slot of a plan: planning the chain that reads it again is refused.
+    #[test]
+    fn a_memo_read_by_a_second_slot_of_the_plan_is_refused() {
+        use crate::ccl::context::{GlobalContext, compile_program};
+        use crate::ccl::load::LoadedProgram;
+        let mut ctx = GlobalContext::default();
+        let loaded = LoadedProgram::test("xs = [x + 1 for x in [1, 2, 3, 4]]\n[a * 2 for a in xs]");
+        let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).expect("compiles");
+        let graph = &compiled.operator_graph;
+        let by_id = graph
+            .nodes()
+            .iter()
+            .map(|node| match node {
+                GraphNode::Operator { id, .. } | GraphNode::Sink { id, .. } => (*id, node),
+            })
+            .collect();
+        let top = graph
+            .nodes()
+            .iter()
+            .find_map(|node| match node {
+                GraphNode::Sink { input, .. } => Some(input.subscribed),
+                GraphNode::Operator { .. } => None,
+            })
+            .expect("a main sink");
+        let mut planner = Planner {
+            by_id,
+            pipelines: Vec::new(),
+            memos: HashSet::new(),
+        };
+        planner
+            .pipeline(top, Breaker::Collect)
+            .expect("the first slot");
+        let refused = planner
+            .pipeline(top, Breaker::Collect)
+            .expect_err("the same memo again");
+        assert!(
+            refused.to_string().contains("more than one slot"),
+            "{refused}"
+        );
+    }
+
+    /// The cut replaces the slot with a `BreakerOutput`, takes the chain that fed the `Memo`, and
+    /// leaves no slot in the chains it hands back.
+    #[test]
+    fn the_cut_takes_the_chain_behind_a_memo_and_leaves_a_breaker_output() {
+        use crate::ccl::context::{GlobalContext, compile_program};
+        use crate::ccl::load::LoadedProgram;
+        fn kinds(op: &dyn TileOperator, found: &mut Vec<&'static str>) {
+            found.push(op.kind());
+            op.visit_inputs(&mut |edge| kinds(edge.target, found));
+        }
+        let mut ctx = GlobalContext::default();
+        let loaded = LoadedProgram::test("xs = [x + 1 for x in [1, 2, 3]]\n[a * 2 for a in xs]");
+        let mut compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).expect("compiles");
+        let planned = plan(&compiled.operator_graph).expect("two pipelines");
+        assert_eq!(planned.pipelines.len(), 2);
+        let main = compiled.main_mut().expect("a main output");
+        assert_eq!(check_pipelines(&*main.op).ok(), Some(1));
+
+        let mut taken = HashMap::new();
+        cut(&mut main.op, &mut taken);
+
+        let mut behind = Vec::new();
+        kinds(&*main.op, &mut behind);
+        assert!(behind.contains(&"BreakerOutput"), "{behind:?}");
+        assert!(!behind.contains(&"FanOutSlot"), "{behind:?}");
+        let [taken] = <[_; 1]>::try_from(taken.into_values().collect::<Vec<_>>())
+            .ok()
+            .expect("one memo, one chain");
+        let mut before = Vec::new();
+        kinds(&*taken.chain, &mut before);
+        assert!(before.contains(&"IterateExtent"), "{before:?}");
+        assert!(!before.contains(&"BreakerOutput"), "{before:?}");
     }
 
     /// A serve state names the dispatcher that minted it, so a state of another dispatcher with

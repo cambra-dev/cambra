@@ -64,13 +64,9 @@ mod reshape;
 mod scalar;
 mod union;
 #[cfg(test)]
-mod visit_inputs_tests;
+pub(crate) mod visit_inputs_tests;
 
 pub use aggregate::*;
-#[allow(
-    unused_imports,
-    reason = "the pool's plan reaches `BreakerOutput` once it cuts at a `Memo`"
-)]
 pub(crate) use breaker_output::*;
 pub use combinators::*;
 pub use cycle_slot::*;
@@ -198,13 +194,12 @@ pub trait TileOperator: Send + Sync {
         short_type_name::<Self>()
     }
 
-    /// The next operator on the path from this one to the chain a worker pool subscribes: an
-    /// `ExtractAggregate` answers its fold, an `Aggregate` the input it folds, and every other
-    /// operator `None`, which `run_main` never consults because `plan_main` admits only those
-    /// two above the chain (`src/interpreter/design-parallel.md`, "A fold as the breaker").
-    fn pool_input(&mut self) -> Option<&mut dyn TileOperator> {
-        None
-    }
+    /// Drop the subscription the compiling thread made on this operator's input, which the
+    /// scheduler loop drives: a `FanOutSlot` drops the serial producer of the fan-out it reads,
+    /// whose release records would otherwise pin the sources beneath it. A pool calls it once,
+    /// at the slot that takes the chain behind a `Memo` out of the graph. Every other operator
+    /// holds no such subscription.
+    fn drop_serial_subscription(&mut self) {}
 
     /// The rows this operator enumerates as morsels the workers of a pool claim, or `None` for
     /// an operator that is not a source the pool cuts. `IterateExtent` over a finite range
