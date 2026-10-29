@@ -895,6 +895,20 @@ rows by key, and a group is the rows whose value is the group's key, so no input
 before its rows are read. The two parts together release exactly the region named, as
 [Guard operations are exact](#guard-operations-are-exact) requires.
 
+### ExtractFinal
+
+A consuming `ExtractFinal` merges the source rows it answers at the guard and keeps the row at the
+greatest key, where the values are a column of scalars; any other shape of value keeps every merged
+row. Merged rows are in arrival order, so the last row is not the final one and the key says which
+is. Pull mode takes the last row of a source it reads whole and assumes the source is sorted by key,
+which a consuming `ExtractFinal` does not. Keys of one collection are totally ordered, and a
+collection whose keys do not compare panics. The value is extracted once the source has been
+released whole. A source that held nothing falls back to the default, which `consume_impl` reads
+when the source drains and reads again at each later `consume_impl` until it has converged; until
+then nothing is held and `finalize` returns the empty guard. A source declared total that held
+nothing panics as it does in pull mode. The value is final from then, and stays until the consumer
+releases the output, which is all or nothing.
+
 ## Tile Operators
 
 Each `TileOperator` is a static (compile-time) node in the dataflow graph. It knows its output
