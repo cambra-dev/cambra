@@ -38,6 +38,8 @@ pub(crate) struct Source {
     /// The pulls of a region the input had already been released at whole, which answer
     /// nothing and which a breaker that knows the region is released does not make.
     pub(crate) wasted: usize,
+    /// How many members a key's group holds, for a [`NestedInput`]: three unless named here.
+    pub(crate) members: BTreeMap<u64, usize>,
 }
 
 impl Source {
@@ -388,5 +390,126 @@ impl InputModel {
                 "{trace}: the input is released at {actual:?}, not {expected:?}"
             );
         }
+    }
+}
+
+/// Groups of three values per key: the nested counterpart of [`ints`].
+pub(crate) fn nested_tiling() -> Tiling {
+    Tiling::data_function(
+        Extent::uint_range(KEYS),
+        Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        ),
+    )
+}
+
+/// The three values a key's group holds.
+pub(crate) fn members(key: u64) -> Vec<i64> {
+    members_of(key, 3)
+}
+
+/// The first `count` values a key's group holds.
+pub(crate) fn members_of(key: u64, count: usize) -> Vec<i64> {
+    let base = value(key);
+    (0..count as i64).map(|member| base + member).collect()
+}
+
+/// An input of groups, one per row of the [`Source`], under the same rules as [`Input`]: it
+/// answers the rows it holds less what was released, cut to the guard, each group stated whole.
+pub(crate) struct NestedInput {
+    pub(crate) base: ProducerBase,
+    pub(crate) source: Shared,
+    /// Whether the groups are stated open: neither the keys nor what lies beneath them are
+    /// complete, so more members may still arrive beneath any key.
+    open: bool,
+}
+
+impl NestedInput {
+    pub(crate) fn over(source: &Shared) -> Self {
+        Self {
+            base: ProducerBase::unowned(Self::alloc_id(), &nested_tiling()),
+            source: source.clone(),
+            open: false,
+        }
+    }
+
+    /// An input whose groups are stated open, so no group is complete.
+    pub(crate) fn open_over(source: &Shared) -> Self {
+        Self {
+            open: true,
+            ..Self::over(source)
+        }
+    }
+}
+
+impl TileProducer for NestedInput {
+    impl_producer_base!();
+
+    fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
+        node
+    }
+
+    fn get_impl(&mut self, guard: TileGuard) -> Tile {
+        self.source.borrow_mut().pulled.push(guard.clone());
+        if released_whole(&guard, self.obsolete_guard()) {
+            self.source.borrow_mut().wasted += 1;
+        }
+        let source = self.source.borrow();
+        let keys: Vec<u64> = source.rows.keys().copied().collect();
+        let counts: Vec<usize> = keys
+            .iter()
+            .map(|key| source.members.get(key).copied().unwrap_or(3))
+            .collect();
+        let starts: Vec<usize> = counts
+            .iter()
+            .scan(0, |start, count| {
+                let this = *start;
+                *start += count;
+                Some(this)
+            })
+            .collect();
+        let inner: Vec<u64> = counts.iter().flat_map(|count| 0..*count as u64).collect();
+        let values: Vec<i64> = keys
+            .iter()
+            .zip(&counts)
+            .flat_map(|(key, count)| members_of(*key, *count))
+            .collect();
+        // A group is stated whole only beneath a key the input states complete, so a group that
+        // arrives later at another key is not beneath a path the input called complete.
+        let (outer, beneath) = match self.open {
+            true => (Predicate::False, Predicate::False),
+            false => match source.statement() {
+                Predicate::True => (Predicate::True, Predicate::True),
+                held => (
+                    held.clone(),
+                    Predicate::Qualified {
+                        enclosing: Box::new(held),
+                        here: Box::new(Predicate::True),
+                    },
+                ),
+            },
+        };
+        drop(source);
+        let mut tile = Tile::data_function(
+            ColumnValue::UInts(keys),
+            Box::new(Tile::grouped(
+                starts,
+                ColumnValue::UInts(inner),
+                Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+                beneath,
+                BitSet::new(),
+            )),
+            outer,
+            BitSet::new(),
+        );
+        tile.remove_guarded(self.obsolete_guard().clone());
+        tile.compact();
+        tile.restrict_to(&guard.projection("NestedInput"), self.tiling());
+        tile
+    }
+
+    fn release_impl(&mut self, guard: TileGuard) {
+        self.source.borrow_mut().released.push(guard);
     }
 }

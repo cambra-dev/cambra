@@ -2614,6 +2614,21 @@ mod consuming_tests {
         guard_minus(&ints().universal_guard(), &beneath);
     }
 
+    /// A memo of groups released beneath its keys holds a region the guard algebra cannot take
+    /// exactly out of what it stated, so `finalize` names the gap.
+    #[test]
+    #[should_panic(expected = "the guard algebra has no difference")]
+    fn a_release_beneath_the_groups_of_a_memo_has_no_difference() {
+        use crate::interpreter::tile_operators::growing::{NestedInput, nested_tiling};
+        let mut memo =
+            MemoProducer::over(Box::new(NestedInput::over(&source(0..4))), &nested_tiling());
+        memo.consume_impl(nested_tiling().universal_guard());
+        memo.release(TileGuard::Function(FunctionGuard::Codomain(Box::new(
+            Keys(0, 1).guard(),
+        ))));
+        memo.finalize();
+    }
+
     // ------------------------------------------------------------------------------------
     // Wakes
     // ------------------------------------------------------------------------------------
