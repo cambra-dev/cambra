@@ -733,16 +733,90 @@ wire from the edges rather than shipped, so no second channel can disagree with 
 | `MapDomain` | `DataFunction(A → *)` | `DataFunction(A → Scalar(A))` | Replaces the codomain of a function with a copy of the domain values (identity codomain), producing an identity mapping from domain to itself. |
 | `Filter` | Predicate: a function `A → bool`, or a collection over the input's levels down to some depth with `bool` beneath <br>Data: a collection holding at least the predicate's levels | Same as input | Keeps the entries the predicate maps to `true`, with their values. A function predicate is applied to the outermost keys. A collection predicate's innermost values are the mask over the keys at the level op-conversion states ([The level a node is converted at](#the-level-a-node-is-converted-at)), which is the predicate's innermost level, and `Tile::retain_keys` re-cuts that level's groups and leaves the levels above standing. Its mask is positional: an input holding nothing at that level passes through, and any other difference in count is refused. A deeper predicate filters the inner collections one outer key at a time: the survivors differ per key, which a correlated filter and a per-group filter (`sum([s.amount for s in g if s.qty > 2])`) produce. `filter_values` compiles to it, and under `map` it filters each element collection. <br>TODO the function form can probably be replaced by Restrict |
 | `Restrict` | Predicate: any tiling of type `A → bool` <br>Data: `DataFunction(A → *)` | Same as input | Filters a function tile by a boolean predicate: keeps only domain elements whose predicate evaluates to `true`. |
-| `Aggregate` | `DataFunction(* → Scalar)` | `Aggregation` | Reduces all codomain values of a `DataFunction` input into a single running accumulator via an `AggregateKind` (e.g. Sum, Max, Min). Currently, the aggregation is hardcoded in the graph, but we could add support for aggregate-kinds-as-data |
-| `ExtractAggregate` | `Aggregation` | `Scalar` | Extracts the final value from an `Aggregation` tile. Constructed with an `only_terminal` flag: when `true` it emits only once the aggregation is marked terminal (the `only_terminal: false` path is currently `todo!()`). |
-| `MapAggregate` | `DataFunction(domain → codomain)` | `DataFunction(domain → Aggregation)` | Performs a per-key aggregation |
-| `MapExtractAggregate` | `DataFunction(extent → Aggregation)` | `DataFunction(extent → Scalar)` | Extracts terminal per-key aggregation results from a `DataFunction(D, Aggregation)`, producing `DataFunction(D, Scalar)`. |
+| `Aggregate` | Collection with values supported by the aggregate kind | `Aggregation` | Folds the collection's values into one accumulator; see [Aggregation and extraction](#aggregation-and-extraction). |
+| `ExtractAggregate` | `Aggregation` | `Scalar` | Extracts a terminal result. Partial-result extraction is unsupported. |
+| `MapAggregate` | Collection chain of at least two levels | Enclosing levels ending in `Aggregation` | Folds the innermost collection, preserving the levels above it. |
+| `MapExtractAggregate` | Collection chain ending in `Aggregation` | Enclosing levels ending in the accumulator tiling | Extracts terminal results and removes innermost keys whose aggregates are not terminal. |
 | `FanOut` | `*` | Same as input | Allows multiple operators to consume the output of the same operator. Each consumer subscribes via a `FanOut::slot()` handle; the fan-out forwards `get` requests and tracks the intersection of release guards across slots. Constructed via either `FanOut::new` (no cyclic-mode overhead — the common case) or `FanOut::new_cyclic` (for fan-outs whose slots feed back into their own input, e.g. a commit/induction store whose writer reads the store back before proposing, or a mutation-loop body whose other slot is wired to the cyclic prev-accumulator stream). Cyclic mode adds a per-pull tile-cache and a subscribe-in-progress flag so re-entrant subscribes / pulls skip redundant inner work and serve from the cached snapshot instead of re-entering the inner producer. |
 | `Memo` | `*` | Same as input | Caches the output of an operator so it can be repeatedly read without recomputation. Releases each region as it takes delivery of it, so the input can clear its state; once the input is drained the cache is the sole source of the value. Release builds then skip the upstream pull. A debug build probes the drained input once after it drains and again after each notification, so an input that answers with released data trips the release-contract check at the input; probing on every pull would re-read a shared subgraph once per path to it. A `Memo` is also the one operator wired to `Notified`: after its first pull, while its input has not notified it, the cache is the answer and no pull goes below, in every build, apart from that probe. |
-| `ExtractFinal` | two inputs: `source` (`DataFunction(D → Scalar(T))`) and `default` (`Scalar(T')` for any `T'` that `T` includes) | `Scalar(T)` | Extracts the final codomain value of `source` once it signals terminal.  When `source` is terminal but emits zero values (a stream that closed without delivering), emits the `default` scalar's value instead — keeping post-loop accumulators total.  Every emission is built at the **declared** extent `T`, not from the extracted value alone: a variant value carries only its own tag, so a column built from it would be width-narrower than `T` whenever the collapsed alternatives carry more tags between them — which is also why the `default` need only be *included in* `T` rather than equal to it (a conditional's trailing arm carries its tag and not its siblings').  Returns an empty scalar before `source` is terminal.  On the first terminal pull it releases both `source` and `default` universally — a final-consumer signal that propagates back through `FanOut`/`Memo`/mutation-loop bodies to the underlying data source. |
+| `ExtractFinal` | Collection source and optional default | Source codomain | Extracts the last live position's value after source completion; see [Final-value extraction](#final-value-extraction). |
 | `UnionOperator` | N inputs of `DataFunction(dᵢ → Scalar(C))` tilings | `DataFunction(Union(d₀,…,dₙ₋₁) → Scalar(C'))` | Merges N function operators into one. The domain is the discriminated union of the arms' domains, and the codomain is one the caller declares. The domain keeps the arms apart, and `final_or_default` dispatches on the arm a row came from. The codomain is the arms' join, because the arms are alternative values at one row. A union node is typed `D ⤇ V`, with `V` the join inference computed in the full type lattice, and op-conversion reads `V` off the node and passes its extent in. The operator does not join the operand tilings: `Extent`'s lattice has variant and range rules but no record rule, so it would join two arms at different record widths to an anonymous positional sum where the type is `{a: Int}`, a shape no row holds. Arms that agree on a tiling keep it, because a `Tiling` carries a layout (struct-of-arrays for a record) that an `Extent` cannot express. Arms whose codomain tilings differ must each fit in one column (`Tiling::is_scalar`: a `Scalar`, or a `Record` of such at any depth), and each is rebuilt as one column, keeping its own record fields, before the arms merge. Release is per arm: an incoming `Predicate::Union` guard splits into per-variant predicates, so one arm can be released in full while its siblings still produce. |
 | `VariantWrap` | Payload: `Scalar(Pₜ)` or `DataFunction(D → Scalar(Pₜ))` | `Scalar(Union(P₀,…,Pₙ))` or `DataFunction(D → Scalar(Union))` | **Sum introduction — dual of `VariantProject`.** Wraps the payload under tag `tag`, so that arm holds the payload and every other arm is empty. Arms are keyed by [`FieldKey`], not by position: a tag's *position* is not stable under width subtyping (``{`b} <: {`a | `b}`` renumbers `b`), and an arm set is part of a union column's layout, so a position-keyed arm would need a renumbering coercion at every subsumption. A bare `Scalar` payload (a scalar `VariantCtor`) yields `Scalar(Union)`; a payload *stream* (a `VariantCtor` inside a lambda, `Builtin::VariantWrap(tag)`) is wrapped element-wise **preserving the domain** `D`, so the constructor composes as the RHS of a `≫`. Because the domain is preserved, a domain release forwards to the payload verbatim. A payload that is a collection is one value, held materialized in its arm's cell: an applied `VariantCtor` wraps its whole payload, and a composed one each row's. A cell cannot grow, so a row's cell is emitted once that row's collection is complete. |
 | `VariantProject` | Scrutinee: `Scalar(Union(P₀,…,Pₙ))` or `DataFunction(D → Scalar(Union))` | `DataFunction(UInt → Scalar(Pᵢ))` for a bare scrutinee (implicit `0..N` keys), or `DataFunction(D → Scalar(Pᵢ))` for a stream scrutinee (the real `D` keys preserved) | **Sum elimination — the read-dual of `VariantWrap`.** Projects the arm named `tag` out of a tagged-union stream, *restricting to the sub-domain of rows carrying that tag* and yielding that arm's payload column, keyed by the original `UInt` position. A tag the scrutinee does not carry yields an **empty** projection rather than an error — that is what makes a width-subtype scrutinee, and so a `match` arm the scrutinee can never reach, inert instead of ill-formed. **Restrict and project are one op**: a [`UnionArm`] stores its rows alongside its payloads, so reading the arm *is* the tag restriction — there is no separate boolean `Restrict` step and no tag-discriminating `Predicate` (a domain-`Restrict` could not express it: the tag lives in the scrutinee's codomain, not its domain). Emitted by `lambda_elim` for a scrutinee-`Case`; consumed as a bare `Builtin::VariantProject(tag)` composed onto the fed scrutinee. |
+
+### Aggregation and extraction
+
+`Aggregate` folds a collection into one aggregation. `MapAggregate` folds the innermost collection
+of a chain with at least two levels, leaving its enclosing levels intact. Both choose their
+accumulator tiling through `AggregateKind::output_tiling`; construction fails if the kind does not
+support the input values. The implementation is in `tile_operators/aggregate.rs`.
+
+Each pull reads the input universally, compacts the returned tile, and accumulates its live values.
+The producer releases the received tile's guard, captured before compaction so that it also covers
+deleted rows. `Aggregate` marks its result terminal when the input's accumulated obsolete guard is
+universal. An extremum without an identity emits an empty tile until its first element arrives;
+completion without an element panics through `AggregateKind::no_extreme_of_nothing`. Otherwise it
+re-emits the running accumulator until a universal output release, after which it returns empty
+tiles and releases the input universally. Empty releases have no effect; partial releases of its
+keyless aggregation are rejected.
+
+`MapAggregate` stores one accumulator per complete parent path, not per final key alone: equal keys
+under different parents identify different groups. A group's terminal flag is set when
+`Tile::completion_at` covers its path. Completion at any enclosing level can complete the group;
+the whole outer collection need not be complete. Output levels retain their respective input
+completion predicates. Paths are sorted lexicographically to rebuild contiguous child runs, and
+incomparable keys at the same level cause a panic. An extremum group without an identity is omitted
+until it receives an element; completion of such an empty group panics.
+
+A release removes every accumulator whose complete path it covers. Unreleased ancestor keys remain
+in the output even when they no longer contain an accumulator. Input release is restated through
+the unchanged enclosing levels with `through_shared_levels`, since an output accumulator replaces
+an input collection. A universal release clears the accumulators and retained ancestor keys and
+releases the input universally.
+
+`ExtractAggregate` emits `AggregateKind::extract` only when its input has a terminal flag and that
+flag is true. An empty aggregation tile is not a completed fold of an empty collection.
+Construction with `only_terminal: false` is unsupported and panics. A universal output release
+releases its input universally; an empty release has no effect.
+
+`MapExtractAggregate` accepts a collection chain of any positive depth ending in an aggregation.
+It replaces that aggregation with the extracted value and retains only the innermost keys whose
+terminal flags are true. The enclosing levels remain intact. Releases pass through those shared
+levels; a partial release of an extracted value does not release its input aggregation.
+
+### Final-value extraction
+
+`ExtractFinal` returns the last live position's value once its source collection is terminal. The
+output tiling is the source codomain, which may itself be a collection. The current terminal
+selection uses the last nondeleted row, not the greatest live key. Collection tiles do not require
+key order, so this is an implementation gap for unsorted inputs, not a source precondition.
+Induction histories use `StoreFinalRead` instead. The implementation is in
+`tile_operators/extract_final.rs`.
+
+Before source completion, extraction returns an empty tile. If a nonterminal delivery contains
+live `UInt` keys with maximum 𝑚 greater than zero, it releases the source prefix through 𝑚 − 1 and
+retains the maximum position. This key-value comparison agrees with the terminal row selection
+only when the remaining rows are in key order. On a terminal delivery, it releases the source
+universally. A live position supplies the result; if none remains, extraction pulls the default.
+The default's extent must be included in the source codomain. `without_default` requires a source
+that cannot finish empty, such as an exhaustive tag partition. Extraction panics if that requirement
+is violated.
+
+A collection-valued result retains the selected position's whole sub-tile. A collection default is
+returned once terminal. Non-collection values are normalized through
+`scalar_tile_to_column_value` and rebuilt at the declared output extent, preserving variant arms
+absent from the selected value. Record layouts may differ between the source and default. A default
+without a complete value yields an empty result.
+
+Subscription attaches the consumer to the source. The default is subscribed eagerly with a no-op
+consumer. This is a notification defect: if the source finishes empty before the default is ready,
+the default's completion does not wake downstream readers. A `Memo` downstream can keep returning
+its incomplete cached result without retrying extraction. Defaults are not required to be complete
+at source completion. The default is pulled only for an empty terminal source and released
+universally once it supplies the fallback. A cached result is re-emitted until a universal output
+release. That release suppresses further emissions and releases both inputs universally.
+
+### Pointwise functions
 
 **Pointwise `FunctionDef`s** (applied element-wise via `MapResult(input, Constant(FunctionDef))`,
 not standalone operators): `BinOp(op)` over a `{_0, _1}` record column, `UnaryOp(op)` over one
