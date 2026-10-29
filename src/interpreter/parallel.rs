@@ -146,6 +146,9 @@ enum Streaming {
     MapResult,
     /// Reads a source's value at the keys of an `IterateExtent` directly beneath it.
     MapResultWithSource,
+    /// A unary operator that keeps its input's keys and answers a pull at a guard from the input's
+    /// answer at the same guard: `VariantWrap` and `VariantProject`.
+    KeepsKeys,
 }
 
 /// What the plan does with an operator, by its kind.
@@ -174,6 +177,7 @@ fn classify(kind: &str) -> Class {
     match kind {
         "MapResult" => Class::Streaming(Streaming::MapResult),
         "MapResultWithSource" => Class::Streaming(Streaming::MapResultWithSource),
+        "VariantWrap" | "VariantProject" => Class::Streaming(Streaming::KeepsKeys),
         "IterateExtent" => Class::Source,
         "FanOutSlot" => Class::Cut,
         "Memo" => Class::Memo,
@@ -345,19 +349,13 @@ impl Planner<'_> {
                     }
                     at = data.subscribed;
                 }
+                Class::Streaming(Streaming::KeepsKeys) => {
+                    at = owned_input(kind, inputs)?.subscribed;
+                }
                 // Reads a source's value at each key of its input: the keys are the input's, so
                 // the chain streams.
                 Class::Streaming(Streaming::MapResultWithSource) => {
-                    let [input] = inputs.as_slice() else {
-                        return Err(Unsupported(
-                            "a `MapResultWithSource` without its one input".into(),
-                        ));
-                    };
-                    if !matches!(input.kind, EdgeKind::Value { deferred: false }) {
-                        return Err(Unsupported(
-                            "the chain closes a cycle or reads a shared node".into(),
-                        ));
-                    }
+                    let input = owned_input(kind, inputs)?;
                     // It releases its source by correlating the keys it is released at with the
                     // keys it reads, which only an `IterateExtent` beneath it states: over any
                     // other input it releases the source on a universal guard alone, and the pool
@@ -382,6 +380,24 @@ impl Planner<'_> {
             streams_from,
         });
         Ok(self.pipelines.len() - 1)
+    }
+}
+
+/// The one input of the operator `kind` when the chain owns the edge: an edge wired through a
+/// `CycleSlot` closes a cycle, and a `Share` edge reaches a fan, which a chain reads only at its
+/// head.
+fn owned_input<'g>(
+    kind: &str,
+    inputs: &'g [crate::interpreter::operator_graph::InputEdge],
+) -> Result<&'g crate::interpreter::operator_graph::InputEdge, Unsupported> {
+    let [input] = inputs else {
+        return Err(Unsupported(format!("a `{kind}` without its one input")));
+    };
+    match input.kind {
+        EdgeKind::Value { deferred: false } => Ok(input),
+        _ => Err(Unsupported(
+            "the chain closes a cycle or reads a shared node".into(),
+        )),
     }
 }
 
@@ -2736,7 +2752,7 @@ mod tests {
     }
 
     /// The plan classifies every operator kind the corpus of compiled programs holds on purpose:
-    /// exactly four are admitted in a chain, and every other kind is refused with its own name.
+    /// exactly six are admitted in a chain, and every other kind is refused with its own name.
     #[test]
     fn every_operator_kind_the_corpus_holds_is_classified_on_purpose() {
         use crate::interpreter::tile_operators::visit_inputs_tests::survey;
@@ -2758,7 +2774,9 @@ mod tests {
                 "FanOutSlot",
                 "IterateExtent",
                 "MapResult",
-                "MapResultWithSource"
+                "MapResultWithSource",
+                "VariantProject",
+                "VariantWrap"
             ],
             "only the streaming operators, the sources and the slots are admitted"
         );

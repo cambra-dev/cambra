@@ -27,6 +27,7 @@
 43999f7d1c37bab1	compilation_pipeline::feeds_cases::test_feed_and_define_operators::case_12
 43c92578cdffd4b8	compilation_pipeline::scalars_collections::signed_floor_division_elements_fold::case_4
 4514f5e30a929a9e	compilation_pipeline::joins_aggregates_groupby::test_aggregates::case_05
+46aa99dc48c642d0	compilation_pipeline::variants::test_list_literal_of_variants::case_5
 4865e9000987a31f	compilation_pipeline::scalars_collections::signed_floor_division_elements_fold::case_6
 4caa080ec55af4db	compilation_pipeline::generators_udf_poly::test_generator_function_with_aggregate::case_1
 4db6dcb12a2dd3af	compilation_pipeline::comprehensions::test_comprehensions_tuple_body::case_1
@@ -43,6 +44,7 @@
 6b9219326fef9f27	compilation_pipeline::feeds_cases::test_feed_and_define_operators::case_09_chained_defers_1
 6d1dda7cd9643bbe	compilation_pipeline::scalars_collections::test_list_literals::case_7
 6e9f18141d825c87	compilation_pipeline::scalars_collections::test_folded_collection_elements::case_4
+7c22ff4f075679b5	compilation_pipeline::variants::test_list_literal_of_variants::case_4
 7e8eaa31a3757de2	compilation_pipeline::scalars_collections::test_folded_collection_elements::case_2
 841f6c4d53e1fb3d	compilation_pipeline::generators_udf_poly::test_generator_function::case_4
 87a68dea152b12d2	compilation_pipeline::scalars_collections::signed_floor_division_elements_fold::case_8
@@ -73,6 +75,7 @@ bbd9ee544f18e710	compilation_pipeline::comprehensions::test_comprehensions::case
 bf678d91cf2099ef	compilation_pipeline::comprehensions::test_generator_expressions::case_1
 c000bb07e15f5ef5	compilation_pipeline::scalars_collections::signed_floor_division_elements_fold::case_5
 c0610284382a2a20	compilation_pipeline::scalars_collections::signed_floor_division_elements_fold::case_7
+c2fdead64f25f9b7	compilation_pipeline::variants::test_list_literal_of_variants::case_1
 c5aa10a4b5818c8f	compilation_pipeline::joins_aggregates_groupby::test_new_compile::case_04
 c6689660509f9c02	compilation_pipeline::joins_aggregates_groupby::test_aggregates::case_04
 c6c91798e445a2ea	compilation_pipeline::feeds_cases::test_feed_and_define_operators::case_21_alias_inside_loop

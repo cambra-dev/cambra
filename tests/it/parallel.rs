@@ -2,7 +2,7 @@
 //! merged at the collector equals the same pipeline pulled whole on one thread.
 //! See `src/interpreter/design-parallel.md`, "The morsel prototype".
 
-use indoc::indoc;
+use indoc::{formatdoc, indoc};
 
 use cambra::{
     ccl::{
@@ -489,4 +489,43 @@ fn run_main_over_a_source_that_holds_rows_returns_them_and_finishes() {
 fn rows_held_before_the_pool_starts_are_not_lost() {
     let tile = run_main_over_held_rows("[x for x in source1()]");
     assert_eq!(entries(&tile), [(1, 10), (2, 20), (3, 30)]);
+}
+
+/// A chain of keys-keeping operators over a literal list of variants, run on four workers with a
+/// morsel that divides no row count, equals the serial pull: `VariantWrap` builds each variant
+/// and `VariantProject` reads it back through a `match`.
+#[test]
+fn a_chain_through_variant_wrap_and_project_equals_the_serial_answer() {
+    let rows = 20;
+    let items: Vec<String> = (0..rows).map(|i| format!("`a({i})")).collect();
+    let programs = [
+        // `VariantProject` over a literal list of variants.
+        formatdoc! {"
+            def unwrap(m):
+                match m:
+                    case `a(v):
+                        v
+            xs = [{}]
+            sum([unwrap(m) for m in xs])
+        ", items.join(", ")},
+        // `VariantWrap` over a range, read back by a `match`.
+        formatdoc! {"
+            def unwrap(m):
+                match m:
+                    case `a(v):
+                        v
+            sum([unwrap(`a(x * 2)) for x in {}])
+        ", format!("[{}]", (0..rows).map(|i| i.to_string()).collect::<Vec<_>>().join(", "))},
+    ];
+    for source in programs {
+        let mut ctx = GlobalContext::default();
+        let loaded = LoadedProgram::test(source.clone());
+        let consumer: Box<dyn Consumer> = Box::new(|| {});
+        let compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
+        let kinds = plan(&compiled.operator_graph).expect("variant operators are streamed");
+        assert!(matches!(kinds.main_breaker(), Breaker::Fold { .. }));
+        let pooled = four_workers(source.clone());
+        assert!(pooled.is_terminal(), "the fold is complete");
+        assert_eq!(pooled, whole_pull(source));
+    }
 }

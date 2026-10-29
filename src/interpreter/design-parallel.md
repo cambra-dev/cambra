@@ -68,8 +68,9 @@ set.
 
 `plan` cuts the operator graph the way [docs/parallel-execution.md, "The pipeline
 plan"](../../docs/parallel-execution.md#the-pipeline-plan) describes, into pipelines listed upstream
-first. A pipeline's chain is any number of `MapResult`s whose function operand is a `Constant` and
-`MapResultWithSource`s over an `IterateExtent`, from its head to its breaker. A head is an
+first. A pipeline's chain is any number of `MapResult`s whose function operand is a `Constant`,
+`MapResultWithSource`s over an `IterateExtent`, and `VariantWrap`s and `VariantProject`s, from its
+head to its breaker ([Widening the plan](#widening-the-plan)). A head is an
 `IterateExtent` over a source (`Head::Source`) or a `FanOutSlot` over a `Memo` (`Head::Breaker`).
 The plan cuts at the slot: the pipeline that feeds the `Memo` ends in `Breaker::Materialize`, is
 planned once per `Memo`, and the pipeline behind it streams from it. The last pipeline ends in the
@@ -604,6 +605,33 @@ states for a read of part of the keys. The threaded collector states every level
 workers have returned (`Tile::complete_every_level`, `Tile::complete_inner_levels`). A breaker that
 has not completed states none of them. A collection a variant holds is a value of the variant's
 column and has no level of its own, so it is not affected.
+
+### Widening the plan
+
+The plan admits an operator by kind (`classify`), on one rule: a pull of the operator at a guard
+is answered from its input's answer at the same guard, and the keys it answers are among its
+input's. An operator joins in a change of its own with a `classify` arm, a plan test over a program
+that reaches it, a mutation check that removes the arm, and the differential suite's zero
+differences with the pin updated.
+
+`VariantWrap` and `VariantProject` share `Streaming::KeepsKeys`. `VariantWrap` answers its input's
+keys, and `VariantProject` answers only the keys whose rows carry its tag. Three candidates are not
+admitted.
+
+- `Constant` as a source. A list literal compiles to an `IterateExtent` and a `Constant` operand
+  that a `MapResult` applies, so a collection-valued `Constant` is never a chain's data input in
+  the corpus, and a `morsel_source` for it admits no program. The other `Constant` refusals are
+  scalars, which have no rows to cut.
+- `SelectField`. `selects_a_tile` builds it only over a bare product or a record holding a level.
+  Over a stream, that needs a `MakeRecord` or a source of records holding collections, and the
+  corpus has no program that reaches it with an admitted head. It stays refused until a group with
+  `MakeRecord` gives a program to test.
+- `RecordWrap`. No program of the corpus reaches it (`NOT_REACHED` in `visit_inputs_tests.rs`), so
+  admitting it adds a path nothing runs. It keeps its input's keys and has a projection-guard test,
+  so it joins `Streaming::KeepsKeys` with the first program that reaches it.
+
+A list of variants a hundred elements long overflows the stack when the program compiles, on the
+serial path as well; the plan test uses twenty.
 
 ### Tests
 
