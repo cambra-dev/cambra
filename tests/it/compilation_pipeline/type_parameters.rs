@@ -147,6 +147,16 @@ use super::helpers::{check_compile_error, check_scalar};
     "},
     Value::Int(1),
 )]
+// The types the annotation-mismatch cases below print are annotations a program can write.
+#[case::printed_types_annotate_their_definitions(
+    indoc! {"
+        def both(a):
+            (a.at, a)
+        g: forall (A, B <: {at: A}) B => {A, B} = both
+        g((at=100, sku=1)).0
+    "},
+    Value::Int(100),
+)]
 #[case::polymorphic_annotation_on_a_name(
     indoc! {"
         def first(T, a: T, b: T) => T:
@@ -705,7 +715,7 @@ fn type_parameter_errors(#[case] code: &str, #[case] needle: &str) {
         pick: forall (T) T => T = both
         1
     "},
-    "inferred as forall (A <: {at: B}, B) A => {B, A}",
+    "inferred as forall (A, B <: {at: A}) B => {A, B}",
 )]
 // The notation has no join of a parameter and a concrete type; the printed type
 // marks it rather than dropping either side.

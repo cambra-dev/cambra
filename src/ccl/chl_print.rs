@@ -25,7 +25,7 @@ use crate::ccl::{FieldKey, UnaryOpKind};
 
 /// `ty` written in CHL.
 pub fn chl_type(ty: &Type) -> String {
-    Printer::for_type(ty).ty(ty)
+    Printer::for_type(ty).annotation(ty)
 }
 
 /// `ty` written in CHL as the module at `home` writes it: its own nominal types by their
@@ -39,7 +39,7 @@ fn written_in(ty: &Type, home: Option<&[SmolStr]>) -> String {
         home: home.map(<[SmolStr]>::to_vec),
         ..Printer::for_type(ty)
     }
-    .ty(ty)
+    .annotation(ty)
 }
 
 /// An inferred polymorphic type written in CHL: its `Poly`, or its body alone when it
@@ -136,6 +136,16 @@ impl Printer {
     }
 
     /// Write `ty` in the checker's notation between `‹…›`: a form CHL has no spelling for.
+    /// `ty` as a whole annotation: a bounded one is written as the bound it states, `<: T`
+    /// (`docs/chl-spec.md`, "Two annotation forms: exact and bounded"). Inside another type a
+    /// bound has no form, so [`ty`](Self::ty) writes it in the checker's notation.
+    fn annotation(&mut self, ty: &Type) -> String {
+        match ty {
+            Type::BoundedHole(bound) => format!("<: {}", self.ty(bound)),
+            _ => self.ty(ty),
+        }
+    }
+
     fn fallback(&mut self, ty: &Type) -> String {
         format!("‹{ty}›")
     }

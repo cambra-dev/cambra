@@ -420,8 +420,11 @@ cutoff at the binding's level, so `pick: forall (T) T => T = inc` reports `inc` 
 - **Polarity-correct.** Compaction does not fall back to a variable's upper bound at a positive
   position, so a demand is never shown as a value.
 - **Parameters.** Each variable above the cutoff that survives simplification becomes a parameter,
-  named `A`, `B`, … in order of first appearance, skipping a spelling a type parameter in the type
-  already has. A position no variable and no type reached is a parameter of its own.
+  named `A`, `B`, … in order, skipping a spelling a type parameter in the type already has. The
+  order puts each parameter after the parameters its bound names, as a written `forall` must
+  ([chl-spec.md, "Kinds and bounds"](../../../docs/chl-spec.md#kinds-and-bounds)), and is
+  otherwise the order of first appearance, so a printed type can be written back as an annotation.
+  A position no variable and no type reached is a parameter of its own.
 - **The enclosing scope's variables.** A variable at or below the cutoff is one type of the
   enclosing scope, so it is pinned against polar-only elimination and stays a variable, which
   `chl_print` writes as `‹?𝑛›`. Under `def outer(y)`, `pick: forall (T) T => T = \x -> y` reports
@@ -432,7 +435,7 @@ cutoff at the binding's level, so `pick: forall (T) T => T = inc` reports `inc` 
 - **Bounds.** The type beside a parameter at a negative position is its bound. A parameter that
   occurs once was eliminated by simplification, so its bound is written inline:
   `def at(a): a.at` prints as `forall (A) {at: A} => A`, and `def both(a): (a.at, a)` as
-  `forall (A <: {at: B}, B) A => {B, A}`.
+  `forall (A, B <: {at: A}) B => {A, B}`.
 - **Requirements.** Each obligation becomes a requirement unless every operand is concrete, which
   the definition already answered. Refinements are dropped, since an instance row matches a base
   whatever its refinements. An obligation a product answered is stated by its components.

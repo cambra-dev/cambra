@@ -106,9 +106,10 @@ fn replace_params(ty: &mut Type, with: &impl Fn(&TypeParam) -> Option<Type>) {
 /// `ty` as a polymorphic type over its variables above `cutoff`, with a parameter
 /// for each, its bounds, and a requirement for each trait obligation on one.
 ///
-/// The variables are named `A`, `B`, … in order of first appearance, skipping a
-/// spelling a type parameter in `ty` already has. A part the notation cannot write
-/// is a [`Join`]:
+/// The variables are named `A`, `B`, … in order, skipping a spelling a type parameter
+/// in `ty` already has. The order puts each parameter after the ones its bound names,
+/// as a written `forall` must, and is otherwise the order of first appearance. A part
+/// the notation cannot write is a [`Join`]:
 ///
 /// - `A ∨ Int` at a positive position, where a variable and a concrete type meet
 ///   (`a if c else 1`), and `A ∨ B` where two variables do;
@@ -192,6 +193,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
         names.visit(part);
     }
     names.visit_bounds();
+    names.settle();
     let body = names.rename(&body);
 
     let params = names
@@ -478,12 +480,15 @@ impl Parametrize<'_> {
     }
 }
 
-/// The parameter names, in order of first appearance.
+/// The parameter names: each parameter after the ones its bound names, which is the
+/// order a written `forall` requires (`docs/chl-spec.md`, "Kinds and bounds"), and
+/// otherwise in order of first appearance.
 struct Naming<'a> {
     st: &'a Parametrize<'a>,
     /// Spellings the type's own parameters have, which a name must not repeat.
     taken: HashSet<SmolStr>,
-    /// Each named variable, or a fresh placeholder's id, in naming order.
+    /// Each named variable, or a fresh placeholder's id: in order of first appearance until
+    /// [`settle`](Self::settle), and in parameter order after it.
     order: Vec<Named>,
     names: HashMap<Named, SmolStr>,
     /// The final parameter each named one becomes, minted once so every occurrence is
@@ -525,55 +530,94 @@ impl<'a> Naming<'a> {
     }
 
     fn visit(&mut self, ty: &Type) {
+        for named in self.mentioned(ty) {
+            self.name(named);
+        }
+    }
+
+    /// The parameters `ty` names, in order of first appearance: a join or meet names its
+    /// operands.
+    fn mentioned(&self, ty: &Type) -> Vec<Named> {
         let mut found = Vec::new();
         visit_params(ty, &mut |p| found.push(p.id));
+        let mut out = Vec::new();
         for id in found {
             match self.st.placeholders.get(&id) {
-                Some((_, Placeholder::Var(v))) => self.name(Named::Var(*v)),
-                Some((_, Placeholder::Fresh)) => self.name(Named::Fresh(id)),
+                Some((_, Placeholder::Var(v))) => out.push(Named::Var(*v)),
+                Some((_, Placeholder::Fresh)) => out.push(Named::Fresh(id)),
                 Some((_, Placeholder::Meet(_, vars, content))) => {
-                    for v in vars {
-                        self.name(Named::Var(*v));
-                    }
+                    out.extend(vars.iter().map(|v| Named::Var(*v)));
                     if let Some(c) = content {
-                        self.visit(c);
+                        out.extend(self.mentioned(c));
                     }
                 }
                 None => {}
             }
         }
+        out
+    }
+
+    /// Put each parameter after the parameters its bound names, keeping the order of first
+    /// appearance otherwise, and spell them `A`, `B`, … in that order.
+    fn settle(&mut self) {
+        let mut placed: Vec<Named> = Vec::with_capacity(self.order.len());
+        let mut waiting = std::mem::take(&mut self.order);
+        while !waiting.is_empty() {
+            let next = waiting
+                .iter()
+                .position(|n| {
+                    self.bound(*n).is_none_or(|bound| {
+                        self.mentioned(bound)
+                            .iter()
+                            .all(|m| m == n || placed.contains(m))
+                    })
+                })
+                .expect(
+                    "bounds naming each other in a cycle are a recursive type, which \
+                     `poly_for_display` refuses before naming",
+                );
+            placed.push(waiting.remove(next));
+        }
+        for named in &placed {
+            let spelling = (0..)
+                .map(|n: usize| {
+                    let letter = char::from(b'A' + u8::try_from(n % 26).expect("n % 26 < 26"));
+                    match n / 26 {
+                        0 => SmolStr::from(letter.to_string()),
+                        round => SmolStr::from(format!("{letter}{round}")),
+                    }
+                })
+                .find(|s| !self.taken.contains(s))
+                .expect("the spellings are unbounded");
+            self.taken.insert(spelling.clone());
+            self.names.insert(*named, spelling);
+        }
+        self.order = placed;
     }
 
     /// Name what the named variables' bounds mention, until nothing new appears.
     fn visit_bounds(&mut self) {
         let mut i = 0;
         while i < self.order.len() {
-            if let Named::Var(v) = self.order[i]
-                && let Some(bound) = self.st.bounds.get(&v)
-            {
+            if let Some(bound) = self.bound(self.order[i]) {
                 self.visit(bound);
             }
             i += 1;
         }
     }
 
-    fn name(&mut self, named: Named) {
-        if self.names.contains_key(&named) {
-            return;
+    /// The bound `named` has, before renaming.
+    fn bound(&self, named: Named) -> Option<&'a Type> {
+        match named {
+            Named::Var(v) => self.st.bounds.get(&v),
+            Named::Fresh(_) | Named::Meet(_) => None,
         }
-        let spelling = (0..)
-            .map(|n: usize| {
-                let letter = char::from(b'A' + u8::try_from(n % 26).expect("n % 26 < 26"));
-                match n / 26 {
-                    0 => SmolStr::from(letter.to_string()),
-                    round => SmolStr::from(format!("{letter}{round}")),
-                }
-            })
-            .find(|s| !self.taken.contains(s))
-            .expect("the spellings are unbounded");
-        self.taken.insert(spelling.clone());
-        self.names.insert(named, spelling);
-        self.order.push(named);
+    }
+
+    fn name(&mut self, named: Named) {
+        if !self.order.contains(&named) {
+            self.order.push(named);
+        }
     }
 
     fn spelling(&self, named: Named) -> SmolStr {
