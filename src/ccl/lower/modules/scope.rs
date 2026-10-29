@@ -125,7 +125,7 @@ impl LoweringContext {
         self.nominal_types.clear();
         self.associated_functions.clear();
         self.builtin_members_used.clear();
-        self.mut_param_fns.clear();
+        self.history_param_fns.clear();
         self.declared_sinks.clear();
         self.parameters.clear();
         self.constants = Default::default();
@@ -134,8 +134,8 @@ impl LoweringContext {
         self.run_type_checks.clear();
         // A `use` type name is in scope throughout its module. One whose module
         // has errors of its own names no type, and stands for any. A `use` name
-        // for a function with a `Mut` parameter takes the curried call shape the
-        // function was lowered with.
+        // for a function with a `Mut` or `Feed` parameter takes the curried call shape
+        // the function was lowered with.
         for (name, used) in &scope.uses {
             match &used.reached {
                 Reached::Type(ty) => {
@@ -145,8 +145,8 @@ impl LoweringContext {
                         Some(_) => self.declare_type_alias(name.as_str(), used.item, ty),
                     }
                 }
-                Reached::Value(Some(reference)) if reference.mut_param => {
-                    self.register_mut_param_fn(name.as_str());
+                Reached::Value(Some(reference)) if reference.history_param => {
+                    self.register_history_param_fn(name.as_str());
                 }
                 Reached::Value(_) | Reached::Nominal(None) => {}
                 Reached::Nominal(Some(found)) => {
@@ -528,7 +528,7 @@ impl Qualifier {
             return match view.values.get(member) {
                 Some(spelling) => Ok(Some(Reference {
                     name: self.view_base.then(spelling),
-                    mut_param: false,
+                    history_param: false,
                 })),
                 None if view.modules.contains_key(member) => Err(is_module(name, member)),
                 None => Err(LoweringError::unsupported(
@@ -560,7 +560,7 @@ impl Qualifier {
         }
         Ok(Some(Reference {
             name: self.name.child(member),
-            mut_param: found.mut_param.is_some(),
+            history_param: found.history_param.is_some(),
         }))
     }
 

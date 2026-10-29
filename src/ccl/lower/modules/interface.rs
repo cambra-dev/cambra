@@ -302,9 +302,9 @@ pub struct Member {
     pub public: bool,
     /// The statement that binds it.
     pub declared: Span,
-    /// For a `def` with a `Mut` parameter, whose calls take a curried shape, its
-    /// number of parameters.
-    pub mut_param: Option<usize>,
+    /// For a `def` with a `Mut(…)` or `Feed(…)` parameter, whose calls take a curried
+    /// shape, its number of parameters.
+    pub history_param: Option<usize>,
 }
 
 /// One top-level type alias of a module.
@@ -416,7 +416,7 @@ pub struct AssociatedMember {
 #[derive(Debug, Clone)]
 pub struct Reference {
     pub name: QualifiedName,
-    pub mut_param: bool,
+    pub history_param: bool,
 }
 
 impl Interface {
@@ -520,7 +520,7 @@ impl Interface {
                     )
                 });
                 // A caller writes a curried `def`'s arguments as one call's.
-                let contract = match member.mut_param {
+                let contract = match member.history_param {
                     Some(arity) => contract.uncurried(arity),
                     None => contract.clone(),
                 };
@@ -634,8 +634,8 @@ impl Interface {
                 Member {
                     public: binding.public,
                     declared: binding.span,
-                    mut_param: ctx
-                        .is_mut_param_fn(&binding.name)
+                    history_param: ctx
+                        .is_history_param_fn(&binding.name)
                         .then(|| def_arity(&ast.body, binding.span)),
                 },
             );
@@ -815,6 +815,7 @@ pub fn top_level_bindings(stmts: &[Spanned<ChlStmt>]) -> Vec<TopLevelBinding> {
             ChlStmt::Assign { target, .. }
             | ChlStmt::AnnAssign { target, .. }
             | ChlStmt::MutAssign { target, .. }
+            | ChlStmt::Declare { target, .. }
             | ChlStmt::LoadFrom { target, .. } => names(&target.node, &mut bound),
             ChlStmt::FunctionDef {
                 owner: None, name, ..
@@ -943,9 +944,9 @@ impl Interface {
                     Some(member) if !member.public => {
                         missing.push(format!("`{name}` is private to module `{module}`"));
                     }
-                    Some(member) if member.mut_param.is_some() => missing.push(format!(
-                        "`{name}` takes a `Mut` parameter, and a parameter's Module type does \
-                         not reach one yet"
+                    Some(member) if member.history_param.is_some() => missing.push(format!(
+                        "`{name}` takes a `Mut(…)` or `Feed(…)` parameter, and a parameter's \
+                         Module type does not reach one yet"
                     )),
                     Some(_) => {}
                     None => missing.push(format!("module `{module}` has no member `{name}`")),

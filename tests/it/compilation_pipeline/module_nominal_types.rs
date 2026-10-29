@@ -534,7 +534,7 @@ const INNER: &str = indoc! {"
 )]
 #[case::feed(
     indoc! {"
-        events = defer()
+        events: Feed(_)
         pub type Price = Int
         pub def Price::log(self) => Int:
             events << 1

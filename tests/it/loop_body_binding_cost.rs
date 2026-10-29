@@ -95,7 +95,7 @@ fn a_chain_read_by_a_feed_stays_linear() {
         loop_with_chain(
             d,
             "  ",
-            "out = defer()\nx := 0\nfor i in [1, 2, 3]:\n",
+            "out: Feed(_)\nx := 0\nfor i in [1, 2, 3]:\n",
             "out << {last}\n  x += {last}\nout\n",
         )
     });
@@ -109,7 +109,7 @@ fn a_chain_in_a_read_only_block_stays_linear() {
         loop_with_chain(
             d,
             "        ",
-            "pool: Mut(Int, Txn) := 100\nout = defer()\nfor i in [1, 2, 3]:\n    with begin():\n",
+            "pool: Mut(Int, Txn) := 100\nout: Feed(_)\nfor i in [1, 2, 3]:\n    with begin():\n",
             "out << {last} + pool\nout\n",
         )
     });

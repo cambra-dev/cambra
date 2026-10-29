@@ -19,7 +19,7 @@ use crate::ccl::{
         PredMemo, apply_primitive, commit_payload_ty, count_free, is_free_in_type,
         walk_refined_predicates_mut,
     },
-    letrec::check_letrec_causal,
+    letrec::{check_letrec_causal, group_has_causal},
     mut_elim::{binding, fun_parts, tvar},
     provenance,
     subst::Subst,
@@ -130,14 +130,6 @@ pub(crate) fn plan_loops(expr: Expr) -> Expr {
     }
     expr.map_children(plan_loops);
     expr
-}
-
-/// Whether any binding of the group applies a `get_prev_*` guard — i.e. the
-/// group carries recurrent state. A guard-free group is a channel cluster.
-fn group_has_causal(bindings: &[(TypedBinding, Expr)]) -> bool {
-    bindings.iter().any(|(_, def)| {
-        uses_builtin(def, &Builtin::GetPrevSeq) || uses_builtin(def, &Builtin::GetPrevTxn)
-    })
 }
 
 /// Whether a `LetRec` group is a transaction group — some binding is guarded by

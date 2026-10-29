@@ -78,7 +78,7 @@ pub(super) fn lower_call(
                      is not one",
                 ));
             }
-            if member.mut_param {
+            if member.history_param {
                 return lower_curried_call(member.name.raw(), func.span, args, ctx);
             }
             return lower_application(member.name.raw(), func.span, args, ctx);
@@ -318,15 +318,6 @@ pub(super) fn lower_call(
             }
             Ok(Expr::builtin(Builtin::EmptyMap).with_ty(Type::map_of(Type::Hole, Type::Hole)))
         }
-        Some(b @ SurfaceBuiltin::Defer) => {
-            if !b.arity().accepts(args.len()) {
-                return Err(LoweringError::unsupported(
-                    func.span,
-                    format!("`defer` takes {}", b.arity()),
-                ));
-            }
-            Ok(Expr::new(TypedExprNode::Defer))
-        }
         // An instance stands only before `::`, where the parser reads `summon(T)::f`
         // (`docs/chl-spec.md`, "Summoning an instance").
         Some(SurfaceBuiltin::Summon) => Err(LoweringError::unsupported(
@@ -368,6 +359,14 @@ pub(super) fn lower_call(
                     ),
                 ));
             }
+            // `defer()` was how a program introduced a feed before declarations replaced it.
+            if args.is_empty() && name == "defer" {
+                return Err(LoweringError::unsupported(
+                    func.span,
+                    "`defer()` no longer introduces a feed: declare one with no value, \
+                     `x: Feed(T)`, or `x: Feed(_)` to infer its value type",
+                ));
+            }
             // For zero-argument calls, only registered sources are allowed.
             if args.is_empty() {
                 return Err(LoweringError::unsupported(
@@ -375,13 +374,14 @@ pub(super) fn lower_call(
                     format!("unknown zero-argument function: {name}; register it as a data source"),
                 ));
             }
-            // A `def` with a pass-by-reference `Mut` parameter is lowered
+            // A `def` with a pass-by-reference `Mut` or `Feed` parameter is lowered
             // curried (named lambdas), so its call is a curried application:
             // `f(a, b, c)` → `c ▷ (b ▷ (a ▷ f))` (forward-apply, outermost
             // parameter first). Beta-reduction on inlining then substitutes each
             // argument variable into the named parameter — the route by which a
-            // `MutWrite` to a `Mut` parameter lands on the caller's mutable variable.
-            if ctx.is_mut_param_fn(name) {
+            // `MutWrite` to a `Mut` parameter lands on the caller's mutable variable,
+            // and a feed of a `Feed` parameter on the caller's channel.
+            if ctx.is_history_param_fn(name) {
                 return lower_curried_call(Name::raw(name), func.span, args, ctx);
             }
             lower_application(Name::raw(name), func.span, args, ctx)
@@ -1130,19 +1130,6 @@ mod tests {
             lower_expr(&three_args, &mut LoweringContext::default()),
             Err(LoweringError::Unsupported { .. })
         ));
-    }
-
-    /// `defer` with an argument returns `LoweringError::Unsupported`, and the argument is never
-    /// resolved: `undefined_name` would otherwise be an unbound-name error of its own.
-    #[test]
-    fn test_lower_defer_with_an_argument_is_refused() {
-        let expr = parse_expr("defer(undefined_name)");
-        let err = lower_expr(&expr, &mut LoweringContext::default())
-            .expect_err("expected lowering error");
-        assert!(
-            matches!(&err, LoweringError::Unsupported { message, .. } if message.contains("`defer` takes no arguments")),
-            "expected the defer arity refusal, got {err:?}"
-        );
     }
 
     /// A single-argument call to an unknown (non-builtin, non-source) name lowers

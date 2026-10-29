@@ -19,7 +19,7 @@ reqs, resps = http_serve(8080, 'GET', "/count")
 @LoadFrom(previous)
 total: Mut(Int, Txn)
 
-events = defer()
+events: Feed(_)
 events << `seen(1)
 log <<= [e for e in events if e.ok and not e.skip or True]
 

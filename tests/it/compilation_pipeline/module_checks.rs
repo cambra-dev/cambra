@@ -414,7 +414,7 @@ fn a_contract_qualifies_only_another_modules_types() {
     pub n = 1
 "})]
 #[case::a_feed(indoc! {"
-    events = defer()
+    events: Feed(_)
     events << 1
     pub n = 1
 "})]

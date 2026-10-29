@@ -2078,6 +2078,7 @@ where
         //   `target : ty = value`  → AnnAssign
         //   `target OP= value`     → AugAssign
         //   `target <<= value`     → Define
+        //   `target : ty`          → Declare
         //   `target`               → Expr-statement
         let bare_tuple = expr
             .clone()
@@ -2096,9 +2097,19 @@ where
         // (e.g. `1 + 2 = x`) becomes a parse error rather than a lowering-time
         // rejection. Expression statements (`AssignTail::None`) keep the full
         // `Expr` shape.
+        // A declaration is tried after every assignment form, so `x: T = v` is never read as
+        // `x: T` followed by a stray `= v`. It rides this statement alone: a block value
+        // needs an `=` before it.
+        let declared = annotation_mode()
+            .then(expr.clone())
+            .map(|(mode, ty)| AssignTail::Declared(TypeAnnotation { mode, ty }));
         let expr_or_assign = bare_tuple
             .clone()
-            .then(assign_tail(expr.clone(), expr.clone()).or(empty().to(AssignTail::None)))
+            .then(
+                assign_tail(expr.clone(), expr.clone())
+                    .or(declared)
+                    .or(empty().to(AssignTail::None)),
+            )
             .try_map_with(|(target, tail), e| assign_stmt(target, tail, e.span()));
 
         // `x = if c: … else: …` and `x = match v: …` — a block statement on the
@@ -2295,6 +2306,7 @@ fn pub_refusal(stmt: &Stmt) -> Option<&'static str> {
     let what = match stmt {
         Stmt::Assign { .. }
         | Stmt::AnnAssign { .. }
+        | Stmt::Declare { .. }
         | Stmt::MutAssign { .. }
         | Stmt::FunctionDef { .. }
         | Stmt::TypeDecl(_)
@@ -2350,6 +2362,8 @@ enum AssignTail {
     MutAnnotated(TypeAnnotation, Spanned<Expr>),
     Aug(AugOp, Spanned<Expr>),
     Define(Spanned<Expr>),
+    /// `: ty` / `<: ty` with nothing after it — a declaration.
+    Declared(TypeAnnotation),
     None,
 }
 
@@ -2613,6 +2627,10 @@ fn assign_stmt<'src>(
         AssignTail::Define(value) => Stmt::Define {
             target: to_target(target)?,
             value,
+        },
+        AssignTail::Declared(annotation) => Stmt::Declare {
+            target: to_target(target)?,
+            annotation,
         },
         AssignTail::None => Stmt::Expr(target),
     };
@@ -3845,15 +3863,25 @@ mod tests {
         assert_eq!(annotation.mode, AnnotationMode::Bounded);
     }
 
-    /// A declaration may carry an annotation and no value only under the
-    /// decorator, which is what supplies the value.
+    /// An annotation with no value is a declaration, exact or bounded.
     #[test]
-    fn a_bare_annotation_is_still_a_parse_error() {
-        let r = parse_mod("x: Int\n");
-        assert!(
-            !r.errors.is_empty(),
-            "a declaration with no value and no decorator is a parse error"
-        );
+    fn a_bare_annotation_is_a_declaration() {
+        let m = parse_m("out: Feed(Int)\nout <: Feed(_)\n");
+        let [first, second] = m.body.as_slice() else {
+            panic!("expected two statements");
+        };
+        let Stmt::Declare { annotation, .. } = &first.node else {
+            panic!("expected a declaration, got {:?}", first.node);
+        };
+        assert_eq!(annotation.mode, AnnotationMode::Exact);
+        let Stmt::Declare { annotation, .. } = &second.node else {
+            panic!("expected a declaration, got {:?}", second.node);
+        };
+        assert_eq!(annotation.mode, AnnotationMode::Bounded);
+        assert!(matches!(
+            parse_m("x: Int = 1\n").body[0].node,
+            Stmt::AnnAssign { .. }
+        ));
     }
 
     #[test]

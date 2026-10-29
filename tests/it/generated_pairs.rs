@@ -577,7 +577,7 @@ fn skeletons() -> Vec<Skeleton> {
             out << max(gen_under_test([1, 2, 3]))
         "#}},
         Skeleton { name: "defer_feed", hole: Ty::Int, scope: &[("i", Ty::Int)], body: indoc! {r#"
-            ch = defer()
+            ch: Feed(_)
             for i in [1, 2]:
                 ch << {}
             out = test_sink()
@@ -859,7 +859,7 @@ fn skeletons() -> Vec<Skeleton> {
         // is the fed value, so the deferred collection folds to a scalar. The inner source is
         // named: a literal one is refused before the feed is compiled.
         Skeleton { name: "nested_loop_feed", hole: Ty::Int, scope: &[("i", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"
-            ch = defer()
+            ch: Feed(_)
             ys = [10, 20]
             for i in [1, 2]:
                 for q in ys:
@@ -869,7 +869,7 @@ fn skeletons() -> Vec<Skeleton> {
         "#}},
         Skeleton { name: "nested_feed_in_mut_loop", hole: Ty::Int, scope: &[("i", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"
             t := 0
-            ch = defer()
+            ch: Feed(_)
             for i in [1, 2]:
                 t += i
                 for q in [10, 20]:
@@ -882,7 +882,7 @@ fn skeletons() -> Vec<Skeleton> {
         Skeleton { name: "nested_feed_filter_in_mut_loop", hole: Ty::Bool, scope: &[("q", Ty::Int), ("lim", Ty::Int)], body: indoc! {r#"
             lim = 15
             t := 0
-            ch = defer()
+            ch: Feed(_)
             for i in [1, 2]:
                 t += i
                 for q in [10, 20]:
@@ -895,7 +895,7 @@ fn skeletons() -> Vec<Skeleton> {
         Skeleton { name: "nested_feed_let_filter_in_mut_loop", hole: Ty::Bool, scope: &[("q", Ty::Int), ("n", Ty::Int), ("lim", Ty::Int)], body: indoc! {r#"
             lim = 15
             t := 0
-            ch = defer()
+            ch: Feed(_)
             for i in [1, 2]:
                 t += i
                 for q in [10, 20]:
@@ -908,7 +908,7 @@ fn skeletons() -> Vec<Skeleton> {
         // Four loops deep, so the feed's key splices more than one pair of positions.
         Skeleton { name: "four_loop_feed_in_mut_loop", hole: Ty::Int, scope: &[("i", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"
             t := 0
-            ch = defer()
+            ch: Feed(_)
             for i in [1, 2]:
                 t += i
                 for b in [10, 20]:
@@ -920,7 +920,7 @@ fn skeletons() -> Vec<Skeleton> {
         "#}},
         Skeleton { name: "three_loop_feed_writing_every_loop", hole: Ty::Int, scope: &[("i", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"
             t := 0
-            ch = defer()
+            ch: Feed(_)
             for i in [1, 2]:
                 for b in [10, 20]:
                     for q in [1, 2]:
@@ -933,7 +933,7 @@ fn skeletons() -> Vec<Skeleton> {
         // the row to three cells, as each takes seconds to classify.
         Skeleton { name: "four_loop_feed_writing_every_loop", hole: Ty::Rec, scope: &[], body: indoc! {r#"
             t := 0
-            ch = defer()
+            ch: Feed(_)
             for i in [1, 2]:
                 for b in [10, 20]:
                     for c in [100, 200]:

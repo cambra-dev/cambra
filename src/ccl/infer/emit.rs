@@ -442,7 +442,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // mutable variable read is an explicit operation"). The condition is the
         // annotation's own shape and nothing narrower: reading the generator-source stamp
         // off the term instead would make the rule depend on which stamp lowering used.
-        if annotation.mut_value_type().is_none() {
+        if !annotation.is_handle() {
             ty = read_through(&ty);
         }
         // A **concrete** function kind on the annotation is a *provenance stamp*:
@@ -948,7 +948,7 @@ pub(super) fn emit_cast<C: Typing>(
     target: &mut Type,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    let value_ty = ctx.subexpr(value)?;
+    let value_ty = emit_value_read(value, ctx)?;
     // Re-view `value : D ⇒ V` as `{D | r} ⇒ V` (the refinement on the domain).
     let (d, v) = ctx.as_function(&value_ty, &|| "cast value".to_string())?;
     // Type the domain-refinement's bare predicate with the implicit binder
@@ -1142,8 +1142,10 @@ pub(super) fn emit_apply<C: Typing>(
             })?;
             param
         }
-        // Every other position is a value position, so a mutable variable mention reads.
-        _ => read_through(&raw_arg_ty),
+        // Every other position is a value position, so a mutable variable mention reads. A
+        // feed is passed as the handle it is: the parameter's constraints decide whether
+        // the callee feeds it or reads it.
+        _ => read_mut(&raw_arg_ty),
     };
     // The application's type is the function's codomain with its Pi binder
     // discharged to the argument (dependent application, design §5). `apply`
@@ -1482,8 +1484,10 @@ pub(super) fn emit_tuple<C: Typing>(
         // the dereferenced element type. The element node stays a bare `Var`
         // carrying `Mut` (rule 1 accepts it; the phase erases the type later) —
         // only the *composite type* is dereferenced, so a `Mut` never appears
-        // nested in it. A non-`Mut` element is unchanged.
-        fields.insert(FieldKey::Index(i), emit_value_read(e, ctx)?);
+        // nested in it. A non-`Mut` element is unchanged, a feed included: a tuple passes
+        // its elements along (a function's arguments travel in one), and a reader of the
+        // element reads it.
+        fields.insert(FieldKey::Index(i), read_mut(&ctx.subexpr(e)?));
     }
     Ok(product(fields))
 }
@@ -1497,7 +1501,7 @@ pub(super) fn emit_record<C: Typing>(
     for (n, e) in fs.iter_mut() {
         // Deref a bare mutable read to its value, as in `emit_tuple`: the field
         // takes the dereferenced type so no `Mut` appears in the record type.
-        fields.insert(FieldKey::Name(n.clone()), emit_value_read(e, ctx)?);
+        fields.insert(FieldKey::Name(n.clone()), read_mut(&ctx.subexpr(e)?));
     }
     Ok(product(fields))
 }
@@ -1514,7 +1518,9 @@ pub(super) fn emit_expr_stmt<C: Typing>(
     if let Err(error) = ctx.subexpr(e) {
         ctx.recover(error, reads_before)?;
     }
-    emit_value_read(body, ctx)
+    // The continuation's value is passed along: a mutable variable reads, and a feed stays
+    // the handle a function hands back (`x: Feed(_); x << n; x`).
+    Ok(read_mut(&ctx.subexpr(body)?))
 }
 
 /// Type a `Defer` node: a fresh feed handle. `let d = Defer in body` binds
@@ -1538,10 +1544,22 @@ pub(super) fn emit_defer<C: Typing>(ctx: &mut C) -> Type {
     Type::feed(ctx.fresh(), ctx.fresh())
 }
 
-/// Deref a mutable variable reference to its value type. A no-op on every other
-/// type — a feed channel included, since reading one yields its whole collection
-/// rather than a scalar value ([`Type::mut_value_type`]).
+/// Deref a handle to what a read of it yields: a mutable variable to its value
+/// ([`Type::mut_value_type`]), a feed to the collection `domain ⤇ value` it accumulates. A
+/// no-op on every other type.
 pub(super) fn read_through(ty: &Type) -> Type {
+    if let Some((domain, value)) = ty.as_feed() {
+        return Type::data_fun(domain.clone(), value.clone());
+    }
+    read_mut(ty)
+}
+
+/// Deref a mutable variable reference to its value type, leaving a feed the handle it is:
+/// the read of a position that passes its value along rather than consuming it — a `let`
+/// initializer, an argument, a tuple element or record field, a statement's continuation.
+/// A feed passed along stays a feed, and wherever it lands, the constraints there decide
+/// whether it is fed (a feed meets a feed) or read (a feed is below its collection).
+pub(super) fn read_mut(ty: &Type) -> Type {
     ty.mut_value_type().unwrap_or(ty).clone()
 }
 
@@ -1576,8 +1594,8 @@ fn denoted_expr(e: &Expr) -> &Expr {
     }
 }
 
-/// Emit a **value read**: a mutable variable mention here is a *read*, so its handle
-/// derefs to the value it holds.
+/// Emit a **value read**: a mutable variable or feed mention here is a *read*, so its handle
+/// derefs to the value it holds, or for a feed to its collection ([`read_through`]).
 ///
 /// This is the ordinary case. A mutable variable's handle survives in exactly three
 /// positions — a pass-by-reference argument (see [`emit_apply`]), a `MutWrite` target, which
@@ -1594,6 +1612,11 @@ fn denoted_expr(e: &Expr) -> &Expr {
 /// wearing a subtyping rule's clothes: it makes `Mut(V)` sit below `V` while `Mut` is
 /// invariant in `V`, and it fires against a fresh inference variable, so it cannot tell
 /// a read from a handle being passed along.
+///
+/// A feed is not second-class: it passes along through the positions [`read_mut`] names and
+/// out of a function as its result. So a feed can reach a reader as an inference variable
+/// (a call's result), where the relation's rule that a feed is below its collection reads
+/// it; a reader whose operand is typed as a feed derefs it here.
 fn emit_value_read<C: Typing>(e: &mut Expr, ctx: &mut C) -> Result<Type, LocatedInferError> {
     Ok(read_through(&ctx.subexpr(e)?))
 }
@@ -1639,7 +1662,7 @@ pub(super) fn emit_define<C: Typing>(
     label: &str,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    let value_ty = ctx.subexpr(value)?;
+    let value_ty = emit_value_read(value, ctx)?;
     constrain_into_feed(target_ty, &value_ty, label, ctx)
 }
 
@@ -1727,7 +1750,7 @@ pub(super) fn emit_copair<C: Typing>(
     let cod_var = ctx.fresh();
     let mut tags = BTreeMap::new();
     for (i, e) in exprs.iter_mut().enumerate() {
-        let ty = ctx.subexpr(e)?;
+        let ty = emit_value_read(e, ctx)?;
         // Each operand is a collection (function); its codomain joins into the
         // shared `cod_var`, its domain becomes the variant tag for operand `i`.
         let (dom, cod) = ctx.as_function(&ty, &|| "Copair element".to_string())?;
@@ -1765,7 +1788,7 @@ pub(super) fn emit_disjoint_join<C: Typing>(
     let cod_var = ctx.fresh();
     let dom_var = ctx.fresh();
     for e in exprs.iter_mut() {
-        let ty = ctx.subexpr(e)?;
+        let ty = emit_value_read(e, ctx)?;
         let (dom, cod) = ctx.as_function(&ty, &|| "DisjointJoin element".to_string())?;
         // One shared domain: each operand's domain flows into the same variable, so
         // operands over genuinely different index sets are a type error here rather
@@ -2187,19 +2210,18 @@ fn emit_let_bound<C: Typing>(
     };
     // An initializer that is a mutable variable **reads**: `b = a` off a mutable `a` binds `b`
     // at `a`'s *value*, a snapshot, exactly as `a + 1` or `f(a)` read it — the same
-    // rule [`read_through`] applies to a tuple element, a record field, and a feed
-    // payload. That is the whole reason a `Let` can never bind a mutable variable: the alias
+    // rule [`read_mut`] applies to a tuple element, a record field, and an argument. That is the whole reason a `Let` can never bind a mutable variable: the alias
     // `b = a` would otherwise create is unrepresentable rather than merely
     // forbidden, so no discipline rule has to reject it.
     //
-    // `read_through` keys on `mut_value_type` (an `Overwrite` history) and not `is_handle`,
-    // which is what a `Let` needs: a **feed** channel must stay a handle here
-    // (`let d = Defer in …`), and that is what the `Append` arm above just built.
+    // [`read_mut`] leaves a **feed** the handle it is, which is what a `Let` needs: a feed
+    // channel stays a handle here (`let d = Defer in …`, the `Append` arm above, and an
+    // alias `log = out`).
     //
     // Applying it *before* the annotation arms is what leaves `_` needing no
     // special case: `b: _ = a` completes its unspecified position from an already
     // deref'd `bound_ty`, so it means what `b = a` means.
-    let bound_ty = read_through(&bound_ty);
+    let bound_ty = read_mut(&bound_ty);
     // An exact annotation *is* what the binder binds at (below), so its refinement
     // predicates ride `binding.ty` to the post-inference wall. Type them here —
     // the predicates mention the enclosing scope's bindings, not the binder's own
@@ -2451,7 +2473,9 @@ pub(super) fn emit_mut_decl<C: Typing>(
     // Monomorphic, like every other non-`let` binder: a mutable variable is a single
     // object with one writer set, so there is nothing to generalize and
     // specializing it would duplicate the mutable variable.
-    let body_ty = ctx.scoped(&binding.name, &history, |ctx| emit_value_read(body, ctx))?;
+    let body_ty = ctx.scoped(&binding.name, &history, |ctx| {
+        Ok(read_mut(&ctx.subexpr(body)?))
+    })?;
     // The body type is returned as-is, *not* through `close_let_type`. A `let`'s
     // binder can be discharged into the lifted type because the binder simply *is*
     // its bound expression; a mutable variable is not — its value is the join over the seed
@@ -3245,7 +3269,7 @@ fn compose_chain<C: Typing>(
     ctx: &mut C,
 ) -> Result<ChainEnds, LocatedInferError> {
     let (head, rest) = elts.split_at_mut(1);
-    let ty = ctx.subexpr(&mut head[0])?;
+    let ty = emit_value_read(&mut head[0], ctx)?;
     let (dom, cod) = ctx.as_function(&ty, &|| format!("Compose[{i}]"))?;
     let binders = ty.peel_refinements().sum().unwrap_or(&[]).to_vec();
     if let Some((prev, prev_binders)) = prev_cod {

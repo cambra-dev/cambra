@@ -104,8 +104,6 @@ use crate::{
 };
 use smol_str::SmolStr;
 
-use crate::chl_parser::SurfaceBuiltin;
-
 mod comprehension;
 mod constants;
 mod exprs;
@@ -546,22 +544,22 @@ pub struct LoweringContext {
     /// on entering its body scope, pop on exit (see [`LoweringContext::with_shadowed`]).
     pub(super) shadow_depth: HashMap<String, usize>,
 
-    /// Names of `def`s that carry a pass-by-reference `Mut` parameter. Such a
-    /// function is lowered as a **curried** chain of named lambdas rather than
-    /// the usual single tupled-parameter lambda, because a `Mut` parameter must
-    /// stay a named binder for inlining to rename the callee's `MutWrite` target
-    /// to the caller's mutable variable (a tuple projection cannot be a write target). Its
-    /// call sites must apply curried to match. A block lowers right-to-left, so a
-    /// call lowers before the `def` above it; [`pre_register_txn_decls`] records the
-    /// name on entering the block so [`lower_call`] can pick the matching shape.
+    /// Names of `def`s that carry a pass-by-reference `Mut` or `Feed` parameter. Such a
+    /// function is lowered as a **curried** chain of named lambdas rather than the usual
+    /// single tupled-parameter lambda, because such a parameter must stay a named binder
+    /// for inlining to rename the callee's `MutWrite` or `Feed` target to the caller's
+    /// mutable variable or channel (a tuple projection cannot be either target). Its call
+    /// sites must apply curried to match. A block lowers right-to-left, so a call lowers
+    /// before the `def` above it; [`pre_register_txn_decls`] records the name on entering the
+    /// block so [`lower_call`] can pick the matching shape.
     ///
     /// **Block-scoped.** Keyed on the surface name (lowering precedes uniquify,
     /// so no α-unique name exists yet), the set is snapshot/restored around every
-    /// nested block ([`lower_stmts_inner`]) so a `Mut`-param `def` local to one
-    /// scope cannot leak its curried shape onto a same-named `def`/call in an
-    /// enclosing or sibling scope. Within a block, the *last* definition of a name
-    /// wins (see [`pre_register_txn_decls`]).
-    pub(super) mut_param_fns: HashSet<String>,
+    /// nested block ([`lower_stmts_inner`]) so such a `def` local to one scope cannot
+    /// leak its curried shape onto a same-named `def`/call in an enclosing or sibling
+    /// scope. Within a block, the *last* definition of a name wins (see
+    /// [`pre_register_txn_decls`]).
+    pub(super) history_param_fns: HashSet<String>,
 
     /// Whether lowering is currently inside a refinement predicate `{T where p}`
     /// (§6.4). The predicate's anonymous subject is written `_`, and while this
@@ -1121,24 +1119,24 @@ impl LoweringContext {
         self.type_params_in_scope.iter().any(|n| n == name)
     }
 
-    /// Record that `def name` carries a pass-by-reference `Mut` parameter, so it
-    /// is lowered — and applied — curried (see [`mut_param_fns`](Self::mut_param_fns)).
-    pub(super) fn register_mut_param_fn(&mut self, name: impl Into<String>) {
-        self.mut_param_fns.insert(name.into());
+    /// Record that `def name` carries a pass-by-reference `Mut` or `Feed` parameter, so it
+    /// is lowered — and applied — curried (see [`history_param_fns`](Self::history_param_fns)).
+    pub(super) fn register_history_param_fn(&mut self, name: impl Into<String>) {
+        self.history_param_fns.insert(name.into());
     }
 
-    /// Undo a [`register_mut_param_fn`](Self::register_mut_param_fn): `name`'s
+    /// Undo a [`register_history_param_fn`](Self::register_history_param_fn): `name`'s
     /// calls lower with the ordinary (tupled) shape. Used when a later `def` in a
-    /// block redefines an earlier `Mut`-param `def` with a non-`Mut` signature
-    /// (last definition wins, matching CHL's shadowing).
-    pub(super) fn unregister_mut_param_fn(&mut self, name: &str) {
-        self.mut_param_fns.remove(name);
+    /// block redefines an earlier one with no pass-by-reference parameter (last
+    /// definition wins, matching CHL's shadowing).
+    pub(super) fn unregister_history_param_fn(&mut self, name: &str) {
+        self.history_param_fns.remove(name);
     }
 
-    /// Whether `name` is a `def` with a pass-by-reference `Mut` parameter (so
+    /// Whether `name` is a `def` with a pass-by-reference `Mut` or `Feed` parameter (so
     /// its calls must be lowered as curried applications).
-    pub(super) fn is_mut_param_fn(&self, name: &str) -> bool {
-        self.mut_param_fns.contains(name)
+    pub(super) fn is_history_param_fn(&self, name: &str) -> bool {
+        self.history_param_fns.contains(name)
     }
 
     /// Run `f` with each name in `binders` pushed onto the shadow-depth stack
@@ -1664,7 +1662,7 @@ pub fn sink_site(module: &ChlModule) -> Option<Span> {
 
 /// The first statement at `module`'s top level that declares or writes mutable
 /// state: a mutable variable, a write to one, a loaded declaration, a feed
-/// (`defer()`), or a deferred output's definition. Such a module is run and not
+/// declaration, or a feed's definition. Such a module is run and not
 /// imported (`docs/chl-spec.md`, "9.7 Importing asserts no IO and no state"): a
 /// feed at an import's module would collect what every importer feeds it.
 pub fn state_site(module: &ChlModule) -> Option<Span> {
@@ -1673,25 +1671,16 @@ pub fn state_site(module: &ChlModule) -> Option<Span> {
             ChlStmt::Pub { stmt, .. } => &stmt.node,
             other => other,
         };
-        let state = match inner {
+        let state = matches!(
+            inner,
             ChlStmt::MutAssign { .. }
-            | ChlStmt::AugAssign { .. }
-            | ChlStmt::LoadFrom { .. }
-            | ChlStmt::Define { .. } => true,
-            ChlStmt::Assign { value, .. } | ChlStmt::AnnAssign { value, .. } => {
-                is_defer_call(value)
-            }
-            _ => false,
-        };
+                | ChlStmt::AugAssign { .. }
+                | ChlStmt::LoadFrom { .. }
+                | ChlStmt::Declare { .. }
+                | ChlStmt::Define { .. }
+        );
         state.then_some(stmt.span)
     })
-}
-
-/// Whether `value` is a call of the builtin `defer`, which declares a feed.
-fn is_defer_call(value: &Spanned<ChlExpr>) -> bool {
-    matches!(&value.node, ChlExpr::Call { func, .. }
-        if matches!(&func.node, ChlExpr::Name(id)
-            if SurfaceBuiltin::from_name(id) == Some(SurfaceBuiltin::Defer)))
 }
 
 fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, lowered: Lowered) -> LoweringResult {

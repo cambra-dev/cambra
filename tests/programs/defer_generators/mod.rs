@@ -1,4 +1,4 @@
-//! Two `yield` generators feeding one explicit `defer()` channel from two
+//! Two `yield` generators feeding one declared feed from two
 //! sites.
 //!
 //! The channel's five positions arrive in two shapes: one feed carries `sum`

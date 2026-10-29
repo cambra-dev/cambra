@@ -410,11 +410,12 @@ pub(super) fn lower_stmts_inner(
         return Err(nominal::refuse_nested(last.span, decl));
     }
 
-    // Restore transactional declarations and Mut-parameter call shapes on both success and
-    // error, so local declarations can shadow without leaking into sibling or outer blocks.
-    // Induction mutability has no lowering registry; its history type is checked later.
+    // Restore transactional declarations and `Mut`- and `Feed`-parameter call shapes on both
+    // success and error, so local declarations can shadow without leaking into sibling or
+    // outer blocks. Induction mutability has no lowering registry; its history type is
+    // checked later.
     let snapshot = ctx.snapshot_transactional();
-    let saved_mut_param_fns = ctx.mut_param_fns.clone();
+    let saved_history_param_fns = ctx.history_param_fns.clone();
 
     // Lower the terminal before wrapping preceding statements, innermost first.
     // Alias registration must precede any annotation read by transaction registration.
@@ -429,7 +430,7 @@ pub(super) fn lower_stmts_inner(
         })
     });
     ctx.restore_transactional(snapshot);
-    ctx.mut_param_fns = saved_mut_param_fns;
+    ctx.history_param_fns = saved_history_param_fns;
     result
 }
 
@@ -755,12 +756,18 @@ pub(super) fn lower_middle_stmt(
             if mut_annotation_parts(&annotation.ty, ctx).is_some() {
                 return Err(mut_decl_with_assign_error(stmt.span, &name));
             }
-            let annotation_ty = lower_let_annotation(annotation, value, ctx)?;
+            let annotation_ty = lower_let_annotation(&name, annotation, value, ctx)?;
             let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
             Ok(ctx.tag_image(
                 Expr::let_bind_annotated(name, val, body, annotation_ty),
                 stmt.span,
             ))
+        }
+        // `out: Feed(V)` — a feed declaration, the channel its feeds and its
+        // `<<=` give a value.
+        ChlStmt::Declare { target, annotation } => {
+            let (name, channel, ty) = feed_declaration(target, annotation, stmt.span, ctx)?;
+            Ok(ctx.tag_image(Expr::let_bind_annotated(name, channel, body, ty), stmt.span))
         }
         // `@LoadFrom(x)` / `y: T` — `y` is the value the version this source
         // replaces held for `x`, as a plain binding. The decorator supplies the
@@ -1181,7 +1188,7 @@ pub(super) fn lower_middle_stmt(
             // polymorphic (`docs/chl-spec.md`, "Polymorphic type annotations").
             let annotation = match (annotation, default) {
                 (Some(annotation), Some(default)) => {
-                    Some(lower_let_annotation(annotation, default, ctx)?)
+                    Some(lower_let_annotation(&name.node, annotation, default, ctx)?)
                 }
                 (Some(annotation), None) => Some(lower_type_expr_or_poly(&annotation.ty, ctx)?),
                 (None, _) => None,
@@ -1227,6 +1234,7 @@ pub(super) fn collect_stmt_names(stmts: &[Spanned<ChlStmt>], names: &mut HashSet
             | ChlStmt::AugAssign { target, .. }
             | ChlStmt::MutAssign { target, .. }
             | ChlStmt::LoadFrom { target, .. }
+            | ChlStmt::Declare { target, .. }
             | ChlStmt::Define { target, .. } => {
                 names.extend(target.node.bound_names().into_iter().map(|n| n.to_string()));
             }
@@ -1740,21 +1748,23 @@ pub(super) fn pre_register_txn_decls(stmts: &[Spanned<ChlStmt>], ctx: &mut Lower
                     ctx.register_transactional(id.as_str());
                 }
             }
-            // A `def` with a pass-by-reference `Mut` parameter is lowered and
-            // applied curried. Blocks lower right-to-left, so a call site is
+            // A `def` with a pass-by-reference `Mut` or `Feed` parameter is lowered
+            // and applied curried. Blocks lower right-to-left, so a call site is
             // lowered *before* the `def` preceding it textually — pre-register
             // the name here so [`lower_call`] picks the curried shape. Register
-            // or unregister per the definition's mut-ness so the last `def` of a
-            // name in the block wins (a non-`Mut` redefinition clears an earlier
-            // `Mut` one, so its calls lower tupled).
+            // or unregister per the definition's parameters so the last `def` of a
+            // name in the block wins (a redefinition with no such parameter clears
+            // an earlier one, so its calls lower tupled).
             ChlStmt::FunctionDef { name, params, .. } => {
-                let has_mut_param = params
-                    .iter()
-                    .any(|p| p.annotation.as_ref().is_some_and(is_mut_annotation));
-                if has_mut_param {
-                    ctx.register_mut_param_fn(name.node.as_str());
+                let has_history_param = params.iter().any(|p| {
+                    p.annotation
+                        .as_ref()
+                        .is_some_and(|a| is_mut_annotation(a) || is_feed_type(&a.ty))
+                });
+                if has_history_param {
+                    ctx.register_history_param_fn(name.node.as_str());
                 } else {
-                    ctx.unregister_mut_param_fn(name.node.as_str());
+                    ctx.unregister_history_param_fn(name.node.as_str());
                 }
             }
             _ => {}
@@ -1781,6 +1791,13 @@ fn is_mut_type(ty: &Spanned<ChlExpr>) -> bool {
         if matches!(&func.node, ChlExpr::Name(head) if head.as_str() == "Mut"))
 }
 
+/// Whether `ty` is a `Feed(…)` type, by the head it is written with, as [`is_mut_type`] reads
+/// `Mut(…)`.
+pub(super) fn is_feed_type(ty: &Spanned<ChlExpr>) -> bool {
+    matches!(&ty.node, ChlExpr::Call { func, .. }
+        if matches!(&func.node, ChlExpr::Name(head) if head.as_str() == "Feed"))
+}
+
 /// Lower a binder's type annotation, applying its [`AnnotationMode`].
 ///
 /// `x: T` lowers to `T`; `x <: T` lowers to [`Type::BoundedHole`], the marker
@@ -1800,16 +1817,62 @@ pub(super) fn lower_type_annotation(
     })
 }
 
+/// `out: Feed(V)` declared at `span`: the name, the channel bound to it, and the type the
+/// binding is annotated with.
+///
+/// A feed is the one binding a declaration introduces with no value: the statements that
+/// feed it, or its `<<=`, give it one. Any other annotation without a value is refused, and
+/// a `Mut` one points at the seed a mutable variable is introduced with.
+pub(super) fn feed_declaration(
+    target: &Spanned<AssignTarget>,
+    annotation: &TypeAnnotation,
+    span: Span,
+    ctx: &mut LoweringContext,
+) -> Result<(String, Expr, Type), LoweringError> {
+    let name = extract_name_target(target, "declaration")?;
+    match feed_annotation_type(annotation, &name, target.span, ctx) {
+        // The channel images the annotation, the declaration's counterpart of an
+        // assignment's right-hand side, and the `let` the whole statement.
+        Some(ty) => {
+            let channel = ctx.tag_image(Expr::new(TypedExprNode::Defer), annotation.ty.span);
+            Ok((name, channel, ty?))
+        }
+        None if mut_annotation_parts(&annotation.ty, ctx).is_some() => {
+            Err(LoweringError::unsupported(
+                span,
+                format!(
+                    "`{name}` is declared with no value, and a mutable variable is introduced \
+                     with its first value: `{name}: Mut(…) := e`"
+                ),
+            ))
+        }
+        None => Err(LoweringError::unsupported(
+            span,
+            format!(
+                "`{name}` is declared with no value, which only a feed is: declare it \
+                 `{name}: Feed(T)`, or give the binding its value, `{name}: T = e`"
+            ),
+        )),
+    }
+}
+
 /// Lower a `let` binder's annotation. An exact annotation may be a polymorphic
 /// type, and then the right-hand side must be one that can be polymorphic: a
 /// lambda, or a name, which inference refuses if it names a monomorphic binding
 /// (`docs/chl-spec.md`, "Polymorphic type annotations"). A bounded
-/// polymorphic annotation, whose meaning the spec leaves open, is refused here.
+/// polymorphic annotation, whose meaning the spec leaves open, is refused here. A
+/// `Feed(…)` annotation states a feed's history type ([`feed_annotation_type`]).
 pub(super) fn lower_let_annotation(
+    name: &str,
     annotation: &TypeAnnotation,
     value: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Type, LoweringError> {
+    // `Feed(…)` names a history carrier, which a binder states and no other type position
+    // spells ([`feed_annotation_type`]).
+    if let Some(ty) = feed_annotation_type(annotation, name, annotation.ty.span, ctx) {
+        return ty;
+    }
     let ty = lower_type_expr_or_poly(&annotation.ty, ctx)?;
     if annotation.mode == AnnotationMode::Bounded {
         if matches!(ty, Type::Poly(_)) {
@@ -3288,7 +3351,8 @@ fn sink_rebindings(stmts: &[Spanned<ChlStmt>], sinks: &HashSet<&str>) -> Vec<Low
             ChlStmt::Assign { target, .. }
             | ChlStmt::AnnAssign { target, .. }
             | ChlStmt::MutAssign { target, .. }
-            | ChlStmt::LoadFrom { target, .. } => {
+            | ChlStmt::LoadFrom { target, .. }
+            | ChlStmt::Declare { target, .. } => {
                 bound.extend(target.node.bound_names().into_iter().map(SmolStr::as_str))
             }
             ChlStmt::FunctionDef { name, .. } => bound.push(name.node.as_str()),
@@ -3935,10 +3999,10 @@ x",
 x : Mut(_, _) := 0
 in x := x + 1; x := x + 2; x"
     )]
-    // defer() introduces a Defer node.
+    // A feed declaration introduces a Defer node.
     #[case(
         "\
-x = defer()
+x: Feed(_)
 x",
         "\
 let x = defer
@@ -3947,7 +4011,7 @@ in x"
     // x <<= expr (AugAssign LShift) lowers to ExprStmt(Define(x, expr), body).
     #[case(
         "\
-x = defer()
+x: Feed(_)
 x <<= 1
 x",
         "\
@@ -3957,7 +4021,7 @@ in define(x, 1); x"
     // x << expr as a middle statement lowers to ExprStmt(Feed(x, expr), body).
     #[case(
         "\
-x = defer()
+x: Feed(_)
 x << 1
 x",
         "\
@@ -3967,7 +4031,7 @@ in feed(x, 1); x"
     // defer with an intervening let binding before the define.
     #[case(
         "\
-x = defer()
+x: Feed(_)
 y = 5
 x <<= y + 1
 x",
@@ -3979,8 +4043,8 @@ in define(x, y + 1); x"
     // Two independent defers each get their own Let/Defer node.
     #[case(
         "\
-x = defer()
-y = defer()
+x: Feed(_)
+y: Feed(_)
 x <<= 1
 y <<= 2
 x",

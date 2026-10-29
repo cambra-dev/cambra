@@ -247,7 +247,7 @@ fn copair() {
 #[test]
 fn feed_and_define() {
     must_parse_module(indoc! {"
-        x = defer()
+        x: Feed(_)
         x <<= 1
         x << 1
         for i in [1, 2, 3]:
@@ -310,7 +310,7 @@ fn defer_with_nested_calls() {
         def f(x):
             x
 
-        x = defer()
+        x: Feed(_)
         for i in [1, 2, 3]:
             y = f(f(x))
             y << i

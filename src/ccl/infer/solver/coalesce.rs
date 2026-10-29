@@ -399,15 +399,12 @@ fn coalesce_compact_go(
     polarity: bool,
     scope: &[crate::ccl::ty::Witness],
 ) -> Result<Type, CoalesceError> {
-    // Transparent read at joins: a feed handle meeting *non-feed*
-    // contributions at one position is being read — `x + 1` joins x's
-    // payload with `Int` through a shared join variable, so the handle
-    // dissolves into its payload before the contribution count below
-    // (otherwise `feed(Int)` and `Int` would spuriously collide). A feed
-    // handle alone at a position keeps its constructor; so do two handles
-    // meeting (their `history_slot`s merged upstream). This is the
-    // join-variable counterpart of `constrain_go`'s direct feed read-through
-    // rule (a feed history `<: T` reads through to its read view `domain ⤇ value`).
+    // A feed is below its read view `domain ⤇ value`, which settles a feed meeting other
+    // contributions at one position before the contribution count below
+    // ([`dissolve_read_feeds`]). A feed handle alone at a position keeps its constructor;
+    // so do two handles meeting (their `history_slot`s merged upstream). This is the
+    // join-variable counterpart of `constrain_go`'s rule that a feed reads as its
+    // collection.
     let ct = &dissolve_read_feeds(ct.clone(), polarity);
     let related = relate_params_by_bounds(ct, polarity);
     let ct = related.as_ref().unwrap_or(ct);
@@ -744,8 +741,15 @@ fn coalesce_compact_go(
     Ok(out)
 }
 
-/// Dissolve a position's feed `history_slot` into its other contributions when
-/// both are present — see the transparent-read comment in [`coalesce_compact_go`].
+/// Settle a position's feed `history_slot` against its other contributions, by the rule that
+/// a feed is below its read view `domain ⤇ value`.
+///
+/// At a negative position the bounds meet, and the meet of a feed and the collection it
+/// reads as is the feed: a parameter the body both feeds and reads, or feeds and returns,
+/// is a feed. The collection slot is dropped and anything else stays beside the feed, so
+/// a feed meeting a scalar there still fails as two shapes. At a positive position the
+/// contributions join, and the join of a feed and anything but a feed is above the feed's
+/// read view, so the feed dissolves into it: `x + 1` joins `x`'s read view with `Int`.
 ///
 /// This performs at most one merge per position: reconstructing the channel as a
 /// `fun`-slot type and merging it leaves `history_slot` empty, so the loop
@@ -759,6 +763,11 @@ fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
         // Only a *feed channel* dissolves into a read view; a mutable variable is read as
         // its scalar value, never merged into the surrounding type.
         if kind != HistoryKind::Append {
+            ct.history_slot = Some((value, domain, kind));
+            break;
+        }
+        if !polarity {
+            ct.fun = None;
             ct.history_slot = Some((value, domain, kind));
             break;
         }

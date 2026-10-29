@@ -5,17 +5,14 @@
 //! inference).  Exercises `Feed(_)` types, `<<` feed, and an annotation-only
 //! forward declaration (`h: Feed(_)` with no initializer).
 //!
-//! **Currently blocked.**  `Feed` isn't a supported type constructor yet
-//! (type application resolves `List`, `Mut`; `Feed(_)` is rejected), and the
-//! annotation-only forward declaration doesn't parse.  This pins the
-//! unsupported-`Feed`-type failure.
+//! **Currently blocked at `open`.**  No file sink exists yet, and neither does
+//! `stdout`.  The fan-out itself compiles: with declared feeds in place of the two
+//! sinks it is `a_feed_returned_by_a_function_fans_out` in
+//! `tests/it/compilation_pipeline/feeds_cases.rs`.  This pins the missing `open`.
 
 use super::common::expect_compile_error;
 
 #[test]
 fn fanout_currently_blocked() {
-    expect_compile_error(
-        include_str!("program.cambra"),
-        "unknown type application: `Feed(…)`",
-    );
+    expect_compile_error(include_str!("program.cambra"), "Unbound variable: 'open'");
 }

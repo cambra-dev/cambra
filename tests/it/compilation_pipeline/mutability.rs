@@ -159,7 +159,7 @@ x"#,
 #[case(
     r#"
 x := 0
-o = defer()
+o: Feed(_)
 for i in [1, 2, 3]:
     x := x + i
     o << x
@@ -169,7 +169,7 @@ o"#,
 #[case(
     r#"
 x := 0
-o = defer()
+o: Feed(_)
 o << x
 for i in [1, 2, 3]:
     x := x + i
@@ -240,7 +240,7 @@ for i in [1, 2, 3]:
     r#"
 x := 1
 y := 0
-o = defer()
+o: Feed(_)
 for i in [1, 2, 3]:
     y := y + i
     x := x * i
@@ -257,7 +257,7 @@ o"#,
     r#"
 x := 1
 y := 10
-o = defer()
+o: Feed(_)
 for i in [1, 2, 3]:
     o << x + y
     x := x + i
@@ -276,7 +276,7 @@ o"#,
 #[case(
     r#"
 x := 0
-o = defer()
+o: Feed(_)
 for i in [1, 2, 3]:
     x := x + i
     o << x
@@ -297,7 +297,7 @@ o"#,
 #[case(
     r#"
 x := 0
-o = defer()
+o: Feed(_)
 o << x
 for i in [1, 2, 3]:
     o << x
@@ -430,7 +430,7 @@ x"#,
 // position's delta, and `StoreDenseRead` (non-carry) reads only fired positions.
 #[case(
     r#"
-o = defer()
+o: Feed(_)
 cnt := 0
 for i in [10, 20, 30]:
     cnt := cnt + 1
@@ -446,7 +446,7 @@ o"#,
 // (carry → cnt 0). As a function that is 0 ↦ 0, 1 ↦ 1, 2 ↦ 2.
 #[case(
     r#"
-o = defer()
+o: Feed(_)
 cnt := 0
 for i in [10, 20, 30]:
     if i > 15:
@@ -461,7 +461,7 @@ o"#,
 // function: 0 ↦ 0, 1 ↦ 1, 2 ↦ 101, 3 ↦ 201.
 #[case(
     r#"
-o = defer()
+o: Feed(_)
 x := 0
 for i in [0, 1, 2, 3]:
     if i < 2:
@@ -530,7 +530,7 @@ o"#,
     indoc! {r#"
         kept = [x for x in [1, 2, 3, 4, 5] if x > 2]
         n := 0
-        o = defer()
+        o: Feed(_)
         for l in kept:
             n := n + l
             o << n
@@ -543,7 +543,7 @@ o"#,
 #[case(
     r#"
 x := 0
-o = defer()
+o: Feed(_)
 for i in [1, 2]:
     for j in [10, 20]:
         x := x + i + j
@@ -1003,7 +1003,7 @@ fn plain_equals_to_outer_mutable_in_final_loop_is_rejected() {
 /// than looped on.
 #[test]
 fn cross_channel_cycle_is_rejected() {
-    let code = "x = defer()\ny = defer()\nx <<= y\ny <<= x\nx";
+    let code = "x: Feed(_)\ny: Feed(_)\nx <<= y\ny <<= x\nx";
     expect_compile_error(code, "mutually recursive cycle");
 }
 
@@ -1628,7 +1628,7 @@ fn genuine_mutable_still_accumulates() {
 }
 
 // ---------------------------------------------------------------------------
-// Curried-vs-tupled call-shape scoping (`mut_param_fns`). A `def` with a
+// Curried-vs-tupled call-shape scoping (`history_param_fns`). A `def` with a
 // pass-by-reference `Mut` parameter lowers curried; every other `def` lowers
 // tupled. The registry keying that choice is block-scoped and last-def-wins,
 // so a `Mut`-param `def` cannot force the curried shape onto a same-named
@@ -1982,7 +1982,7 @@ fn a_feed_parameter_annotation_constrains_what_is_fed() {
               o << c
               c += 1
             x := 0
-            out = defer()
+            out: Feed(_)
             for i in [1, 2, 3]:
               fw(x, out)
             out
@@ -1999,12 +1999,12 @@ fn a_feed_parameter_annotation_is_exact_and_takes_one_argument() {
               o << c
               c += 1
             x := 0
-            out = defer()
+            out: Feed(_)
             for i in [1, 2, 3]:
               fw(x, out)
             out
         "#},
-        "bounds a feed parameter by its own type",
+        "bounds a feed by its own type",
     );
     check_compile_error(
         indoc! {r#"
@@ -2012,7 +2012,7 @@ fn a_feed_parameter_annotation_is_exact_and_takes_one_argument() {
               o << c
               c += 1
             x := 0
-            out = defer()
+            out: Feed(_)
             for i in [1, 2, 3]:
               fw(x, out)
             out

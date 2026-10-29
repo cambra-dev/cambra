@@ -178,14 +178,23 @@ pub enum Stmt {
 
     /// Annotated assignment: `target: ty = value` or `target <: ty = value`.
     ///
-    /// CHL (unlike Python) requires a value; a bare annotation is a parse error
-    /// except under `@LoadFrom` ([`Stmt::LoadFrom`]), which supplies one. The
-    /// annotation type is itself an [`Expr`] (type expressions are arbitrary
-    /// expressions); interpretation lives in lowering.
+    /// The annotation type is itself an [`Expr`] (type expressions are arbitrary
+    /// expressions); interpretation lives in lowering. An annotation with no value is a
+    /// [`Stmt::Declare`].
     AnnAssign {
         target: Spanned<AssignTarget>,
         annotation: TypeAnnotation,
         value: Spanned<Expr>,
+    },
+
+    /// A declaration with an annotation and no value: `out: Feed(Int)`.
+    ///
+    /// A feed is the one binding introduced before anything gives it a value: the
+    /// statements that feed it give it one (`docs/chl-spec.md`, "3.7 Feed operator `<<`").
+    /// Which annotations may be declared this way is lowering's to decide.
+    Declare {
+        target: Spanned<AssignTarget>,
+        annotation: TypeAnnotation,
     },
 
     /// Augmented assignment: `target op= value`, e.g. `x += 1`.
@@ -215,10 +224,8 @@ pub enum Stmt {
     /// qty_units: Map(String, Int)
     /// ```
     ///
-    /// The only form in which a declaration carries an annotation and no value
-    /// — the decorator is where the value comes from, so nothing is missing.
-    /// A bare `y: T` is still a parse error
-    /// ([`Stmt::AnnAssign`](Stmt::AnnAssign)).
+    /// The decorator is where the value comes from. Without it, `y: T` is a
+    /// [`Stmt::Declare`].
     ///
     /// `source` names a mutable variable of the **previous** version, which this
     /// one need not declare; lowering resolves it against nothing in this scope.
@@ -363,7 +370,7 @@ pub enum Stmt {
     /// decorator: `@LoadFrom(qty)` above `pub held: Int`.
     ///
     /// **Invariant:** in a parse with no errors, the inner statement is a
-    /// [`Stmt::Assign`], [`Stmt::AnnAssign`], [`Stmt::MutAssign`],
+    /// [`Stmt::Assign`], [`Stmt::AnnAssign`], [`Stmt::Declare`], [`Stmt::MutAssign`],
     /// [`Stmt::LoadFrom`] or [`Stmt::FunctionDef`]. The parser
     /// reports `pub` on any other statement as a parse error. Whether a `:=`
     /// introduces a mutable variable, and whether the statement stands at a

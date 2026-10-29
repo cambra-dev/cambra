@@ -266,7 +266,7 @@ writer's decision as a tap, committed atomically with the write. So it is sequen
 nothing.
 
 ```python
-out = defer()
+out: Feed(_)
 pool: Mut(Int, Txn) := 100
 for r in [70, 50]:
     with begin():
@@ -284,7 +284,7 @@ one element, not two.
 every iteration regardless of what the transaction decided, riding the loop's own domain:
 
 ```python
-resps = defer()
+resps: Feed(_)
 store: Mut(Int, Txn) := 0
 cnt: Mut(Int) := 0
 for r in [10, 20, 30]:
@@ -437,7 +437,7 @@ program actually gives it work to do, and the other is simply unchanged by it.
 
 ```python
 # Example A — an induction accumulator  # Example B — a transactional variable
-x := 0                                  out = defer()
+x := 0                                  out: Feed(_)
 for i in [1, 2, 3]:                     pool: Mut(Int, Txn) := 100
     x += i                              for r in [10, 20, 30]:
 x                                           with begin():

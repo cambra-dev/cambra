@@ -157,7 +157,7 @@ fn test_multi_arg_param_in_filter_predicate() {
 // grammar splits its last statement off before dropping `pass`.
 #[case(
     indoc! {r#"
-        good = defer()
+        good: Feed(_)
         for m in [`a(2), `b(3)]:
             match m:
                 case `a(n):
@@ -207,7 +207,7 @@ fn test_multi_arg_param_in_filter_predicate() {
 // After a feed, so the drop leaves the feed as the body.
 #[case(
     indoc! {r#"
-        g = defer()
+        g: Feed(_)
         for i in [1, 2]:
             g << i
             pass

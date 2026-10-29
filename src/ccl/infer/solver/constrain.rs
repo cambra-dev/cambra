@@ -96,10 +96,9 @@ pub enum ConstrainError {
         in_type: Type,
     },
     /// A non-feed type flowed into a [`Type::History`] requirement — e.g.
-    /// a plain value passed to a function that feeds its parameter. The
-    /// reverse direction is fine (a feed handle is transparently readable
-    /// as its payload); only the write capability cannot be conjured from
-    /// a plain value.
+    /// a plain value or a collection passed to a function that feeds its parameter.
+    /// The reverse direction is fine (a feed reads as its collection); only the
+    /// write capability cannot be conjured from a value.
     NotAFeed {
         /// The non-feed type that was required to be a feed handle.
         found: Box<Type>,
@@ -1811,10 +1810,10 @@ fn constrain_go_impl(
         // not discharged across the handle — out of scope alongside the
         // filter-feed-through-UDF gaps (see design/mutability.md §4 and the
         // `ccl/channelize.rs` module docs).)
-        // Transparent read: a non-mutable consumer of a feed channel consumes its
-        // whole read view `domain ⤇ value` (`sum(d)`, `d + 1`, a `x <<= y` chain
-        // feeding one defer from another). Unlike a mutable variable (dereffed to its scalar
-        // `value` above), a feed reads as the reconstructed channel function.
+        // A feed is below its read view `domain ⤇ value`, the collection it accumulates. A
+        // reader whose operand is typed as a feed derefs it where it is emitted
+        // (`emit::emit_value_read`); this rule reads the feed a call returns, which reaches
+        // its reader as an inference variable whose feed bound arrives later.
         (
             Type::History {
                 value,
@@ -1832,32 +1831,10 @@ fn constrain_go_impl(
             };
             constrain_go(&chan, rhs, sl, sr, cache, scope)
         }
-        // A *channel-shaped* lhs meeting a feed requirement is the read view of
-        // that handle: a use position that both held the handle and was read
-        // coalesces to the bare channel, and monomorphization's two-way pin then
-        // meets that view against the definition's feed channel. Align it with
-        // the reconstructed channel function. Structural validation of *genuine*
-        // misuse (feeding a plain collection) still lands in channelize's checks.
-        (
-            Type::Fun { .. },
-            Type::History {
-                value,
-                domain,
-                history_kind: HistoryKind::Append,
-            },
-        ) => {
-            let chan = Type::Fun {
-                name: None,
-                // A feed's read view is a collection: a data function.
-                fun_kind: FunKind::Data(None),
-                domain: domain.clone(),
-                codomain: value.clone(),
-            };
-            constrain_go(lhs, &chan, sl, sr, cache, scope)
-        }
-        // Any other plain value can never satisfy a feed requirement: reading is
-        // transparent, but the write capability cannot be conjured (`g(5)` where
-        // `g` feeds its parameter). A `<<` targeting a `:=` mutable variable lands here
+        // Nothing but a feed satisfies a feed requirement: a feed reads as its collection,
+        // but the write capability cannot be conjured from a value, a collection included
+        // (`g(5)` or `g([1, 2])` where `g` feeds its parameter, `x = [1, 2]; x << 3`). A
+        // `<<` targeting a `:=` mutable variable lands here
         // too, as the handle it is — the left side matches `_`, so the cross-kind pair
         // the invariance arm above declined needs no rule of its own.
         (
@@ -3216,19 +3193,23 @@ mod tests {
 
     #[test]
     fn plain_value_is_not_a_feed() {
-        // Int </: feed(D, Int) — reading a feed handle is transparent, but the
-        // write capability cannot be conjured from a plain, non-function value.
-        // A `Fun` LHS aligns into the feed (that is how a `<<` contribution works);
-        // only a scalar hits the `NotAFeed` arm.
-        let mut cache = ConstrainCache::new();
-        assert!(matches!(
-            constrain_subtype(
-                &prim(BaseType::Int),
-                &feed_ty(Type::UIntRange(3), prim(BaseType::Int)),
-                &mut cache
-            ),
-            Err(ConstrainError::NotAFeed { .. })
-        ));
+        // Int </: feed(D, Int) and (D ⤇ Int) </: feed(D, Int) — a feed reads as its
+        // collection, but the write capability cannot be conjured from a value, a
+        // collection included.
+        for value in [
+            prim(BaseType::Int),
+            data_fun(Type::UIntRange(3), prim(BaseType::Int)),
+        ] {
+            let mut cache = ConstrainCache::new();
+            assert!(matches!(
+                constrain_subtype(
+                    &value,
+                    &feed_ty(Type::UIntRange(3), prim(BaseType::Int)),
+                    &mut cache
+                ),
+                Err(ConstrainError::NotAFeed { .. })
+            ));
+        }
     }
 
     #[test]

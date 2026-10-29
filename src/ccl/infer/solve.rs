@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{PredMemo, canonical_cast_ty};
 use crate::ccl::infer::InferError;
-use crate::ccl::infer::emit::read_through;
+use crate::ccl::infer::emit::{read_mut, read_through};
 use crate::ccl::infer::solver::barrier::EdgeReport;
 use crate::ccl::infer::solver::traits::{
     Assoc, Implementation, InstanceBody, InstanceTable, OperatorCall, Signature, TraitInstance,
@@ -2312,13 +2312,13 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         //
         // Through the **deref**, because that is what the node's rule reports: an
         // effect statement emits its continuation in a value position
-        // (`emit_expr_stmt`'s `emit_value_read`), so a tail that reads a mutable variable denotes
+        // (`emit_expr_stmt`'s `read_mut`), so a tail that reads a mutable variable denotes
         // the mutable variable's *value*. Lifting `body.ty` verbatim would re-stamp the node
         // with the handle the read just looked through, contradicting the rule that
         // typed it — and the wall that re-runs that rule would then have to accept a
         // value against a handle. A `Let` needs no deref here because it does not
         // deref either (`emit_let` passes its body along; it cannot bind a mutable variable).
-        TypedExprNode::ExprStmt { body, .. } => Some(read_through(&body.ty)),
+        TypedExprNode::ExprStmt { body, .. } => Some(read_mut(&body.ty)),
         // A mutable introduction's result type cannot name its binder: every read that
         // reaches a type is named first (`src/ccl/design/mutability.md`, "A read is named
         // while inference runs"), so one that did would be a compiler bug, which the scope
@@ -2326,7 +2326,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         TypedExprNode::MutDecl { body, .. } => {
             // Dereffed for the same reason as `ExprStmt`: `emit_mut_decl` reports its
             // body in a value position, so `x := 0; …; x` denotes `x`'s value.
-            Some(read_through(&body.ty))
+            Some(read_mut(&body.ty))
         }
         _ => None,
     };
