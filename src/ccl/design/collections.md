@@ -344,7 +344,8 @@ presence at runtime and returns `Option`. The
 A `FullMap(K, V)` parameter with a key of type `K` satisfies ordinary application.
 That typing rule does not construct a value at such a domain. A concrete keyed domain requires
 its own membership evidence; a known source element does not currently acquire it automatically.
-Range-domain list subscripts are also rejected in the tested integer-index cases.
+A range-domain list subscript applies when the key's refinements entail the range's bound
+(`src/ccl/design/type-inference.md`, "A refined `Int` below a range").
 
 ### The checked lookup `𝑐[𝑘]`
 
@@ -356,6 +357,8 @@ Lowering emits `(c, k) ▷ lookup?`. `emit_apply` intercepts that builtin applic
    A concrete function supplies its own domain.
 2. `Typing::keyed_value_at` substitutes the key term into a dependent codomain.
 3. `keyed_access_value` constrains the key below the domain's base, peeling refinements.
+   A range domain's base is `Int`: a range's membership is its bound, so constraining the key
+   below the range would demand the proof the checked form waives.
 4. The rule returns `Option` of the value type and stamps the builtin with the concrete
    pair-to-Option function type.
 
@@ -376,7 +379,8 @@ converted to point-free form. A second discharge could produce a different embed
 `CheckedLookup` accepts either separate collection/key sources or paired rows. It searches
 a streamed collection's domain for each key. A present key can yield `some(value)` before the
 whole collection terminates. A missing key yields `none` only when the collection tile is
-terminal; otherwise the operator emits no answer for that key yet.
+terminal; otherwise the operator emits no answer for that key yet. An `Int` key names the `UInt`
+position of a range domain it equals, and a negative key names none (`key_names`).
 
 An empty nonterminal tile is not proof of absence. A bare live domain can therefore leave a
 missing key unanswered indefinitely. A materialized `Value::Function` differs: its binding

@@ -797,6 +797,41 @@ fn test_grouping_built_once(#[case] code: &str) {
     "},
     Value::Int(0)
 )]
+// A list's domain is a range, so its checked lookup takes any `Int`: an in-range key answers
+// `some`, and a key past either end answers `none`.
+#[case::list_present(
+    indoc! {"
+        xs = [10, 20, 30]
+        match xs[1]?:
+            case Option::some(v):
+                v
+            case Option::none:
+                0
+    "},
+    Value::Int(20)
+)]
+#[case::list_past_the_end(
+    indoc! {"
+        xs = [10, 20, 30]
+        match xs[5]?:
+            case Option::some(v):
+                v
+            case Option::none:
+                0
+    "},
+    Value::Int(0)
+)]
+#[case::list_negative(
+    indoc! {"
+        xs = [10, 20, 30]
+        match xs[-1]?:
+            case Option::some(v):
+                v
+            case Option::none:
+                0
+    "},
+    Value::Int(0)
+)]
 fn checked_lookup_answers_presence(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }

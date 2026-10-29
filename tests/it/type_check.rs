@@ -5693,6 +5693,23 @@ fn checked_lookup_boundaries() {
             "expected a rejection: {why}"
         );
     }
+    // A range's membership is its bound, so the checked lookup relaxes the key to `Int` and
+    // answers a key on either side of the range.
+    for program in [
+        "xs = [10, 20, 30]\nxs[0]?",
+        "xs = [10, 20, 30]\nxs[5]?",
+        "xs = [10, 20, 30]\nxs[-1]?",
+    ] {
+        assert_eq!(
+            infer_program(program).to_string(),
+            "Option(Int)",
+            "{program}"
+        );
+    }
+    assert!(
+        !infer_program_err("xs = [10, 20, 30]\nxs[\"nope\"]?").is_empty(),
+        "a String key must not reach a range"
+    );
     // The exact form binds `m` at `Map(Int, Int)` itself, so the relaxation has a domain
     // to strip the token from and the lookup answers `Option(Int)`.
     assert_eq!(

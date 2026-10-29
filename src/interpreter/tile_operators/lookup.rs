@@ -244,6 +244,19 @@ fn none() -> Value {
     }
 }
 
+/// Whether `key` names the domain position `position`.
+///
+/// A range domain holds `UInt` positions, while a checked lookup's key is an `Int`: the lookup
+/// relaxes a range key to `Int` because it proves no bound (`src/ccl/design/collections.md`,
+/// "The checked lookup `𝑐[𝑘]?`"). An `Int` names the position it equals, and a negative one
+/// names none. Every other pair is compared as it stands.
+fn key_names(key: &Value, position: &Value) -> bool {
+    match (key, position) {
+        (Value::Int(i), Value::UInt(u)) => u64::try_from(*i) == Ok(*u),
+        _ => key == position,
+    }
+}
+
 /// The answer for one key against a **materialized** map value.
 ///
 /// A map value is a binding list, so it carries its own keys: it is complete wherever it is
@@ -253,7 +266,7 @@ fn answer_in_value(key: &Value, m: &Value) -> Value {
     match m {
         Value::Function(bindings) => bindings
             .iter()
-            .find(|b| &b.input == key)
+            .find(|b| key_names(key, &b.input))
             .map_or_else(none, |b| some_of(b.output.clone())),
         other => panic!("CheckedLookup: collection is not a map value: {other:?}"),
     }
@@ -273,7 +286,7 @@ fn answer_for(key: &Value, coll: &Tile) -> Option<Value> {
                 !codomain.holds_a_level(),
                 "a streamed collection maps keys to values, so its keys are one level"
             );
-            match (0..domain.len()).find(|&i| &domain.index_at(i) == key) {
+            match (0..domain.len()).find(|&i| key_names(key, &domain.index_at(i))) {
                 Some(i) => {
                     // `None` here would read as "still deciding" for a shape that will never
                     // change, and the lookup would spin instead of answering. Op-conversion's

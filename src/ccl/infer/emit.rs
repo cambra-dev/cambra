@@ -1210,6 +1210,12 @@ fn emit_lookup_checked<C: Typing>(
         .ok_or_else(|| not_a_keyed_access(collection, "checked lookup `c[k]`"))
         .map_err(|e| ctx.raise(e))?;
     let value = ctx.keyed_value_at(&codomain, binder.as_ref(), key, &function.ty);
+    // A range's membership is its bound, so `Int` is the base a key relaxes to: the range
+    // itself would demand the in-range proof the checked form exists to waive.
+    let keys = match keys.peel_refinements() {
+        Type::UIntRange(_) => Type::Base(BaseType::Int),
+        _ => keys,
+    };
     let at_key = keyed_access_value(
         &keys,
         value,
