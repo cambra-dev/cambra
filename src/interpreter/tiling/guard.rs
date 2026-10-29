@@ -1,5 +1,8 @@
 //! Release/intent guards: [`TileGuard`] (per-[`Tile`](crate::interpreter::Tile) region
 //! descriptor) and [`FunctionGuard`] (its function-shaped arm).
+//!
+//! Region algebra and normalization are specified in `src/interpreter/design-operators.md`,
+//! "Guard normalization". These operations preserve regions; they do not approximate releases.
 
 use smol_str::SmolStr;
 use std::collections::HashMap;
@@ -19,17 +22,9 @@ pub enum TileGuard {
     Function(FunctionGuard),
     /// An aggregate's result, named under the paths that reach it as [`Self::Scalar`] is.
     Aggregation(Predicate),
-    /// The union of multiple guards — matches anything admitted by any arm.
-    ///
-    /// Built where no single variant holds the union. A collection of collections is
-    /// covered partly by its own keys and partly by the inner ones, so
-    /// [`Tile::to_guard`](crate::interpreter::Tile::to_guard) names both and
-    /// [`FunctionGuard::union`] has no `Domain`-with-`Codomain` arm to merge them.
-    /// Every other shape represents its own union directly — a record's union is its
-    /// fields'.
-    ///
-    /// Invariant: arms never directly nest another `Or` (always flattened by
-    /// [`TileGuard::flatten_or`]).
+    /// Union of regions that need separate arms, such as outer keys and partial inner regions.
+    /// Construct through [`TileGuard::flatten_or`] so arms do not directly nest `Or`.
+    /// Record guards instead combine field by field.
     Or(Vec<TileGuard>),
 }
 
@@ -140,21 +135,17 @@ impl TileGuard {
         walk(self, 0, f)
     }
 
-    /// Whether this guard names `path`, one component per level from the outermost.
-    ///
-    /// A guard is a region of paths, and this is the region read at one of them — what a
-    /// consumer holding its own state by path asks before dropping an entry. Reading the
-    /// arms by hand instead gives every such consumer its own partial answer, and each one
-    /// then has to be taught every guard shape.
+    /// Whether the guard covers `path`, with one key per collection level, outermost first.
+    /// A record path is covered only when every field covers it; partial field release
+    /// does not release the row. Use this when reclaiming state indexed by complete paths.
     pub fn covers_path(&self, path: &[Value]) -> bool {
         self.covers_at(path, 0)
     }
 
     /// [`covers_path`](Self::covers_path) at the level this guard has stepped down to.
     ///
-    /// The **whole** path goes down, not the part below the steps taken: a predicate
-    /// naming an enclosing path is read against that path ([`Predicate::contains_path`]),
-    /// so handing it only its own key reads it as unqualified and answers no.
+    /// Keep the full path during recursion: qualified predicates need the enclosing keys,
+    /// not just the suffix below `level`.
     fn covers_at(&self, path: &[Value], level: usize) -> bool {
         match self {
             TileGuard::Or(arms) => arms.iter().any(|arm| arm.covers_at(path, level)),
@@ -181,12 +172,8 @@ impl TileGuard {
         }
     }
 
-    /// The keys of the outermost level this guard names whole: its `Domain` arm, in
-    /// canonical form ([`TileGuard::flatten_or`]), where every region naming a key's whole
-    /// value is spelled as that key.
-    ///
-    /// What a producer whose state is held by key acts on. The rest of the guard names parts
-    /// of values under keys it keeps, which it withholds from its output instead.
+    /// Outermost keys covered in full after normalization, for reclaiming whole-key state.
+    /// Excludes partial value regions; producers must still suppress released cells there.
     pub fn whole_keys(&self) -> Predicate {
         match TileGuard::flatten_or(vec![self.clone()]) {
             TileGuard::Function(FunctionGuard::Domain(pred)) => pred,
@@ -199,11 +186,8 @@ impl TileGuard {
         }
     }
 
-    /// Whether any predicate in this guard names an enclosing path.
-    ///
-    /// What [`Tile::remove_guarded`](crate::interpreter::Tile::remove_guarded) asks before
-    /// walking a level's key paths: a guard that names none is read against the key alone,
-    /// and building the paths for it would allocate on every release.
+    /// Whether any predicate constrains an enclosing path. `Tile::remove_guarded` uses this
+    /// to avoid constructing paths when the guard can be evaluated against keys alone.
     pub fn names_a_path(&self) -> bool {
         match self {
             TileGuard::Function(FunctionGuard::Domain(pred)) => pred.qualifies(),
@@ -215,16 +199,9 @@ impl TileGuard {
     }
 }
 
-/// A chain of codomain steps restated at the highest level it names: an arm naming
-/// everything beneath some keys names those keys, since a key is there only through what it
-/// maps to.
-///
-/// `Codomain(Domain(Qualified(𝐸, True)))` is `Domain(𝐸)`, and a codomain step over a guard
-/// that names everything is `Domain(True)`. A lifted arm is lifted again, so a region whole
-/// at every depth beneath it rises to the level of its outermost keys. What an arm names
-/// only part of stays where it is. This is what gives a region one spelling, so
-/// [`Tile::remove_guarded`](crate::interpreter::Tile::remove_guarded) drops a key only
-/// where a domain guard names it, and [`TileGuard::covers_path`] reads the same region.
+/// Lift whole-value regions to domain guards on their enclosing keys; retain partial regions.
+/// Recurse when a lifted region covers another enclosing level in full.
+/// See `src/interpreter/design-operators.md`, "Guard normalization".
 fn lift(chain: TileGuard) -> Vec<TileGuard> {
     let mut depth: usize = 0;
     let mut leaf = &chain;
@@ -385,16 +362,11 @@ fn without_covered_keys(guard: TileGuard, covered: &[Predicate]) -> TileGuard {
     }
 }
 
-/// `guard`, released against an operator's output, restated for an input that shares the
-/// output's collection levels down to `levels` and holds different values beneath them.
-///
-/// `Domain` and `Codomain` steps through those levels name the same keys on both sides, so
-/// they pass through. Beneath them the two sides hold different things, so only a guard
-/// naming everything there translates, as `input_values`' universal guard: part of an
-/// output value names no part of the input value it came from. In canonical form
-/// ([`TileGuard::flatten_or`]) a region naming everything beneath a key is that key, so a
-/// guard reaching the values here names part of them, and the input's release waits for
-/// the key.
+/// Translate release through `levels` shared collection levels with different values below.
+/// Normalization lifts whole-value regions to domain guards on their enclosing shared keys.
+/// Those key releases pass through unchanged; empty and universal guards return before the walk.
+/// The callback receives only partial value regions, which release no input values. The operator
+/// retains those values until the enclosing key or whole value is released.
 pub(crate) fn through_shared_levels(guard: TileGuard, levels: usize, input: &Tiling) -> TileGuard {
     through_standing_levels(guard, levels, input, &mut |beneath| {
         let values = input.values_at(CurryLevel::new(levels));
@@ -405,16 +377,10 @@ pub(crate) fn through_shared_levels(guard: TileGuard, levels: usize, input: &Til
     })
 }
 
-/// `guard`, released against an operator's output, restated for an input whose keys at the
-/// outermost `levels` collection levels are the output's own: the operator leaves those levels
-/// standing and changes only what lies beneath them.
-///
-/// The keys of a standing level are the same on both sides, so a `Domain` step through one
-/// names the same input rows and passes through as it is. Beneath the standing levels the
-/// guard names what the operator produced, and only the operator can say what part of its
-/// input that is: `beneath` restates it, given one arm of the canonical guard
-/// ([`TileGuard::flatten_or`]) at depth `levels`. With no standing level, that is the whole
-/// guard. An empty guard is the input's empty guard, and a universal one its universal guard.
+/// Translate release through `levels` unchanged collection levels, using `beneath` at their end.
+/// Normalize first and preserve domain guards above that depth. Call `beneath` separately for
+/// each normalized arm that reaches depth `levels`, including depth zero.
+/// Empty and universal guards return the input's corresponding guard without calling `beneath`.
 pub(crate) fn through_standing_levels(
     guard: TileGuard,
     levels: usize,
@@ -635,9 +601,9 @@ fn zip_fields(
 }
 
 impl TileGuard {
-    /// Builds a `TileGuard` from a list of arms, flattening any nested `Or`
-    /// variants.  Returns the single element directly when `arms` has length
-    /// one to avoid gratuitous wrapping.
+    /// Normalize a nonempty union: distribute codomain steps, lift whole regions, combine
+    /// matching shapes and prune covered inner domains. Return one arm without an `Or` wrapper.
+    /// Panics for no arms. See `src/interpreter/design-operators.md`, "Guard normalization".
     pub(crate) fn flatten_or(arms: Vec<TileGuard>) -> TileGuard {
         // Every arm is a chain of codomain steps ending in one guard, so arms naming the same
         // place merge and the covered ones are found. A codomain step over an `Or` is
@@ -715,16 +681,9 @@ impl TileGuard {
         }
     }
 
-    /// Returns the union of two guards — the set of data covered by either guard.
-    ///
-    /// Used to accumulate release guards across multiple incremental deliveries: a
-    /// consumer that has released `[0,1]` and then `[2,3]` has collectively seen
-    /// `[0,3]`, so the stored guard must grow via union rather than replacement.
-    ///
-    /// Note for future implementation: All TileGuards we currently have are compatible with
-    /// union, but future stuff like conditional function guards (e.g. constraints like
-    /// "positive inputs produce positive outputs") are *not* closed under union and need to
-    /// throw an error.
+    /// Accumulate the regions of two guards for the same tiling.
+    /// Panics on incompatible variants or different record field sets.
+    /// Function regions that cannot combine into one arm remain a normalized `Or`.
     pub fn union(&self, other: &TileGuard) -> TileGuard {
         match (self, other) {
             (TileGuard::Scalar(p), TileGuard::Scalar(q)) => TileGuard::Scalar(p.union(q)),
@@ -740,17 +699,8 @@ impl TileGuard {
                 Some(merged) => TileGuard::flatten_or(vec![TileGuard::Function(merged)]),
                 None => TileGuard::flatten_or(vec![self.clone(), other.clone()]),
             },
-            // A record guard covers the cells of each field its map names, so two of
-            // them union field by field, as `intersect` above combines them.
-            //
-            // [`Predicate::Record`](crate::interpreter::Predicate::Record) reads
-            // alike and does not union alike: it admits a record *value* only when
-            // every field admits its component, so it is a product and two products
-            // do not union to one. That is why `Predicate` keeps an `Or` arm for this
-            // and a guard does not need one. Reaching for `TileGuard::Or` here leaves
-            // a guard no record-tiled producer can act on: a consumer releasing one
-            // field twice hands `MakeRecord` two arms naming that field, and the
-            // operand that owns it hears about neither.
+            // Field regions combine independently, unlike Predicate::Record's conjunction
+            // over components of a record value. Keep the per-field shape consumers use.
             (TileGuard::Record(m1), TileGuard::Record(m2)) => {
                 TileGuard::Record(zip_fields(m1, m2, TileGuard::union))
             }
@@ -891,18 +841,9 @@ pub enum FunctionGuard {
     Codomain(Box<TileGuard>),
 }
 
-/// The guard naming everything at or below `path` in the nesting order: the keys before
-/// its head entirely, and within that head key, everything up to the tail.
-///
-/// A **spelling**, not a shape. One arm per level, each naming that level's keys under the
-/// path that reaches it: a domain guard names whole keys, a codomain guard steps one level
-/// in, and [`Predicate::exactly`] pins the levels above so the arm speaks about one row
-/// rather than about every row a codomain read would name. Giving the prefix an arm of its
-/// own would owe the algebra a rule against every other shape.
-///
-/// The path is **non-empty**. A path with no components has two readings that disagree —
-/// nothing, since it names no key, or everything, since a path's end reads as "and all of
-/// this key" — so it is rejected rather than given one of them.
+/// Inclusive prefix in nested-key order: whole keys before each component, including the final
+/// component's whole subtree. Each inner arm is qualified by its enclosing path.
+/// Panics on an empty path. Union keys require domains; use [`domain_prefix_over`].
 pub fn domain_prefix(path: Vec<Value>) -> TileGuard {
     domain_prefix_over(path, &[])
 }
@@ -1002,11 +943,7 @@ impl FunctionGuard {
             (FunctionGuard::Codomain(p1), FunctionGuard::Codomain(p2)) => {
                 FunctionGuard::Codomain(Box::new(p1.intersect_at(p2, level + 1)))
             }
-            // A domain guard names whole keys of this level and a codomain guard a region
-            // one level in, so their meet is that region with those keys additionally
-            // required of it. The requirement goes into the codomain's predicates at this
-            // level's place in their qualification chain — which is what a predicate about
-            // an enclosing path already is, so there is no shape to invent.
+            // Qualify the inner region at this level, not at the root of its path.
             (FunctionGuard::Domain(p), FunctionGuard::Codomain(g))
             | (FunctionGuard::Codomain(g), FunctionGuard::Domain(p)) => {
                 FunctionGuard::Codomain(Box::new(require_at((**g).clone(), p, level, level + 1)))
@@ -1014,11 +951,8 @@ impl FunctionGuard {
         }
     }
 
-    /// The union of two function guards, or `None` where no single arm holds it.
-    ///
-    /// The two arms name two shapes of region — whole keys of this level, and a region one
-    /// level in — and a union across them is neither. Declining is what [`TileGuard::Or`]
-    /// exists for, rather than an arm invented to hold the pair.
+    /// Combine equal shapes after handling empty/universal operands. Return `None` for a
+    /// remaining domain/codomain pair; the caller must represent that union with `TileGuard::Or`.
     pub fn union(&self, other: &FunctionGuard) -> Option<FunctionGuard> {
         Some(match (self, other) {
             (a, b) | (b, a) if a.is_empty() => b.clone(),
@@ -1464,10 +1398,7 @@ mod tests {
 
     // ── TileGuard::Or ─────────────────────────────────────────────────────────
     //
-    // Arms are built here rather than taken from a producer: what is under test is
-    // the algebra, and the one production shape that needs it (`Tile::to_guard` on a
-    // nested collection) mixes a `Domain` arm with a `Codomain` one, whose intersect is
-    // unimplemented.
+    // Construct arms directly to isolate normalization and distribution from producer behavior.
 
     /// Arms stay flat: a union against an existing `Or` appends rather than nests.
     #[test]
