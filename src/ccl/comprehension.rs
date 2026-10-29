@@ -42,8 +42,8 @@
 //! provenance.
 
 use crate::ccl::{
-    BinOpKind, Expr, Generator, LogicKind, Name, SharedHoleMint, Type, TypedBinding, TypedExprNode,
-    anf,
+    BinOpKind, Expr, Generator, LogicKind, Name, Occurrence, SharedHoleMint, Type, TypedBinding,
+    TypedExprNode, anf,
     ccl_utils::{PredMemo, make_cast, refined_data_fun, walk_refined_predicates_mut},
     provenance::{self, Nature, NodeId},
     ty::FunKind,
@@ -182,7 +182,8 @@ fn index_loop(e: &mut Expr) {
     let position = Name::iter_record();
     let read = Expr::apply(Expr::var(position.clone()), source);
     let step = Expr::apply(read, body);
-    let TypedExprNode::Lambda { param, body } = Expr::lambda(position, Type::Hole, step).node
+    let TypedExprNode::Lambda { param, body } =
+        Expr::lambda(position, Occurrence::mint(), Type::Hole, step).node
     else {
         unreachable!("Expr::lambda builds a Lambda")
     };
@@ -321,7 +322,12 @@ fn encode(
             None => read,
         };
         let indexed_source = Expr::apply(position, read);
-        Expr::apply(indexed_source, per_element_lambda(&binding, element))
+        // The lambda is the generator's binder, moved: it keeps the generator's occurrence.
+        let occurrence = Occurrence::preserve(binding.occurrence.id());
+        Expr::apply(
+            indexed_source,
+            per_element_lambda(&binding, occurrence, element),
+        )
     };
     let core = match (pred_op, pred_source) {
         (Some(pred_op), Some(pred_source)) => {
@@ -329,7 +335,9 @@ fn encode(
             // filter is read at; the predicate is a bare boolean expression, not a lambda.
             let pred_expr = Expr::apply(
                 Expr::apply(Expr::var(Name::elem()), unbox(pred_source)),
-                per_element_lambda(&binding, pred_op),
+                // The predicate's lambda is a second binder for the same generator, a copy
+                // of its occurrence.
+                per_element_lambda(&binding, binding.occurrence.clone(), pred_op),
             );
             // A refined parameter is `cast(refined_data_fun, λ outer_var → body_expr)`, a
             // type-level assertion of the predicate-refined domain. The refinement is carried
@@ -342,25 +350,27 @@ fn encode(
             // kind, so a `Compute` lambda underneath is a second, contradictory answer to what
             // this function is, one that survives into elimination, where the point-free form
             // of the collection inherits the lambda's kind and reads as a capability.
-            let unrefined_lambda = Expr::lambda(outer_var, Type::Hole, body_expr)
-                .with_user_annotation(Type::Fun {
-                    name: None,
-                    fun_kind: result_kind.clone(),
-                    domain: Box::new(Type::Hole),
-                    codomain: Box::new(Type::Hole),
-                });
+            let unrefined_lambda =
+                Expr::lambda(outer_var, Occurrence::mint(), Type::Hole, body_expr)
+                    .with_user_annotation(Type::Fun {
+                        name: None,
+                        fun_kind: result_kind.clone(),
+                        domain: Box::new(Type::Hole),
+                        codomain: Box::new(Type::Hole),
+                    });
             let target_ty = refined_data_fun(Type::Hole, pred_expr, Type::Hole, result_kind);
             make_cast(unrefined_lambda, target_ty)
         }
         // A comprehension is a data collection, a map over its source's domain: the
         // `data_fun(_, _)` annotation is a concrete-kind stamp (`emit_node`), the unfiltered
         // counterpart of the filtered branch's `refined_data_fun` cast target.
-        _ => Expr::lambda(outer_var, Type::Hole, body_expr).with_user_annotation(Type::Fun {
-            name: None,
-            fun_kind: result_kind,
-            domain: Box::new(iter_dom.unwrap_or(Type::Hole)),
-            codomain: Box::new(Type::Hole),
-        }),
+        _ => Expr::lambda(outer_var, Occurrence::mint(), Type::Hole, body_expr)
+            .with_user_annotation(Type::Fun {
+                name: None,
+                fun_kind: result_kind,
+                domain: Box::new(iter_dom.unwrap_or(Type::Hole)),
+                codomain: Box::new(Type::Hole),
+            }),
     };
     match comprehension_id {
         Some(id) => at_id(core, id),
@@ -446,12 +456,14 @@ fn encode_curried(
         }
     }
     let ids: Vec<NodeId> = sources.iter().map(Expr::node_id).collect();
-    let pred_sources: Vec<Expr> = if pred_op.is_some() {
-        sources.clone()
+    // The filter's nest binds each generator a second time, so its binders are copies, and the
+    // element's nest takes the generators' own.
+    let (pred_bindings, pred_sources) = if pred_op.is_some() {
+        (bindings.clone(), sources.clone())
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
-    let flat = flattened_nest(&bindings, sources, &ids, element, holes, true);
+    let flat = flattened_nest(bindings, sources, &ids, element, holes, true);
     let core = match pred_op {
         None => flat,
         // **The filter is the same nest over the filter's value, read at the key.** Its keys
@@ -460,7 +472,7 @@ fn encode_curried(
         // read as it types the element: by `uncurry`'s dependent scheme, with no positional
         // projection to type ahead of knowing the domain's shape.
         Some(pred_op) => {
-            let filter = flattened_nest(&bindings, pred_sources, &ids, pred_op, holes, false);
+            let filter = flattened_nest(pred_bindings, pred_sources, &ids, pred_op, holes, false);
             let pred_expr = Expr::apply(Expr::var(Name::elem()), filter);
             make_cast(
                 flat,
@@ -482,7 +494,7 @@ fn encode_curried(
 /// nest's other sources ahead of the whole nest, for the same reason (`crate::ccl::anf`). Not in
 /// a filter, which holds no binding of its own.
 fn flattened_nest(
-    bindings: &[TypedBinding],
+    bindings: Vec<TypedBinding>,
     sources: Vec<Expr>,
     ids: &[NodeId],
     element: Expr,
@@ -491,7 +503,7 @@ fn flattened_nest(
 ) -> Expr {
     let arity = bindings.len();
     let mut body = element;
-    for (i, (binding, source)) in bindings.iter().zip(sources).enumerate().rev() {
+    for (i, (binding, source)) in bindings.into_iter().zip(sources).enumerate().rev() {
         let _generator_frame =
             provenance::enter(ids[i], "comprehension.generator", Nature::Machinery);
         let mut source = source;
@@ -501,7 +513,7 @@ fn flattened_nest(
             None
         };
         let level = Generator {
-            target: binding.clone(),
+            target: binding,
             iter: source,
             guards: Vec::new(),
         };
@@ -509,24 +521,24 @@ fn flattened_nest(
         if let Some((name, bound)) = ahead {
             let _source_frame =
                 provenance::enter(ids[i], "comprehension.source_ahead", Nature::Machinery);
-            body = Expr::let_bind(name, bound, body);
+            body = Expr::let_bind(name, Occurrence::mint(), bound, body);
         }
     }
     Expr::apply(body, Expr::builtin(crate::ccl::Builtin::Uncurry(arity)))
 }
 
-/// `λ target → body` at a generator's binder.
+/// `λ target → body` at a generator's binder, at `occurrence`.
 ///
 /// The binder is the one lowering put on the generator, so the lambda it becomes
 /// binds the same [`Name`] the element and the guards already reference — which
 /// is what keeps this phase from needing to rename anything it did not mint.
-fn per_element_lambda(target: &TypedBinding, body: Expr) -> Expr {
+fn per_element_lambda(target: &TypedBinding, occurrence: Occurrence, body: Expr) -> Expr {
     debug_assert!(
         target.user_annotation.is_none(),
         "a comprehension target is an unannotated binder, found {:?}",
         target.user_annotation
     );
-    Expr::lambda(target.name.clone(), target.ty.clone(), body)
+    Expr::lambda(target.name.clone(), occurrence, target.ty.clone(), body)
 }
 
 #[cfg(test)]

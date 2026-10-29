@@ -161,7 +161,7 @@ Each node carries:
 | `spans` | every source span it traces to, narrowest first, empty when it traces to none |
 | `rewritten` | `null` for a lowering root, else `{ via, nature, label }` |
 | `type` | its type, rendered ([Types on the wire](#types-on-the-wire)) |
-| `children` | `{ id, predicate }` — the child's id in this same table, and whether it is a type-interior subtree |
+| `children` | `{ id, kind }` — the child's id in this same table, and what it is to the node: `value`, `occurrence` or `predicate` ([An occurrence on the wire](#an-occurrence-on-the-wire)) |
 
 A node carries every span its attribution records, so a node several source positions fan into is
 reachable from each of them. `fold` unions blame spans, which is what makes that plural. There is no
@@ -187,11 +187,11 @@ itself.
 
 **A refinement predicate is a child node.** A predicate is an expression tree in its own right
 ([Predicates are nodes](#predicates-are-nodes)), and it reaches the consumer as a child of the node
-whose type carries it. `predicate` is what a consumer branches on.
+whose type carries it, with `kind` `predicate`, which is what a consumer branches on.
 
-A child edge carries no label. Children ship in order — the value children, then the predicates in
-`walk_type_slots` order — so a value child's position in `children` is its positional index, and the
-predicates are the marked tail.
+A child edge carries no label. Children ship in order — the value children, then the occurrences,
+then the predicates in `walk_type_slots` order — so a value child's position in `children` is its
+positional index, and the predicates are the tail marked `predicate`.
 
 One node names one predicate once. The slots overlap: `walk_type_slots` yields a `Lambda`'s own type
 and its binder's type, and for a lambda those are the same `Type`, so a slot-order walk reaches that
@@ -279,14 +279,14 @@ are indistinguishable on the wire. That is enough to display a predicate and not
 anything else with it. Work in this area replaces the shape rather than extending it.
 
 **Shipping one is not drawing one.** The inspector's tree panes render no row for a predicate — a
-node's rendered `type` carries it, and the interiors outnumber the program they annotate — so
-`predicate` is read as the filter the traversals meaning "the program" apply. The wire ships them
+node's rendered `type` carries it, and the interiors outnumber the program they annotate — so `kind`
+`predicate` is the filter the traversals meaning "the program" apply. The wire ships them
 regardless, because the pane links name their ids.
 
 ### An occurrence on the wire
 
-**Planned.** An occurrence is the id the compiler gives a name the IR holds in a field rather than
-as a node, and to the type expression a binder's annotation writes
+An occurrence is the id the compiler gives a name the IR holds in a field rather than as a node, and
+to the type expression a binder's annotation writes
 ([provenance.md](../ccl/design/provenance.md#name-occurrences)). It is one of five kinds:
 
 - a **binding occurrence**, the name a binder introduces: `p` in `def f(p)`;
@@ -306,17 +306,17 @@ binding node for a binding or annotation occurrence, the `Feed`, `Define` or `Mu
 applied occurrence, the `Record` or `VariantCtor` for a label occurrence, and the `Case` for a head
 occurrence.
 
-A child carries a `kind` in place of `predicate`:
+A child carries a `kind`:
 
 | `kind` | the child is |
 |---|---|
-| `value` | a value child, as today's `predicate: false` |
+| `value` | a value child |
 | `occurrence` | an occurrence the parent holds, of any of the five kinds |
-| `predicate` | a refinement predicate riding one of the parent's type slots, as today's `predicate: true` |
+| `predicate` | a refinement predicate riding one of the parent's type slots |
 
-Children ship value children first, then occurrences in `for_each_own_id` order, then predicates in
-`walk_type_slots` order. A value child's position in `children` stays its positional index, so the
-edge label a consumer derives is unchanged.
+Children ship value children first, then occurrences in `walk_occurrences` order, then predicates
+in `walk_type_slots` order. A value child's position in `children` is its positional index, which
+is the edge label a consumer derives for it.
 
 An occurrence entry carries the fields every tree node carries:
 
@@ -325,8 +325,8 @@ An occurrence entry carries the fields every tree node carries:
 | `label` | `Binder(p)` | `Use(out)` |
 | `nodeId` | the occurrence's id | the occurrence's id |
 | `spans` | the span of the name, `p` | the span of the name, `out` |
-| `rewritten` | `{ Machinery, "lower.image" }` in a lowering pane, the copy's tag in a later one | likewise |
-| `type` | the binder's `ty`, rendered | the `ty` of the binder it names, found by `Uid` in the same tree |
+| `rewritten` | `{ Machinery, "lower.image" }` in `pre-inference` for a name the source writes, the tag of the node holding it for one lowering makes, the copy's tag in a later pane | likewise |
+| `type` | the binder's `ty`, rendered | the `ty` of the binder it names, found by `Uid` in the same tree, or `_` for a name no binder in the tree binds |
 | `children` | empty | empty |
 | edge label in a tree pane | `binder` | `use` |
 
@@ -342,15 +342,16 @@ An annotation occurrence appears only in the `pre-inference` pane, because infer
 annotation that holds it.
 
 The type is what makes an occurrence worth drawing. A tree pane draws an occurrence as a row under
-the node that holds it, edge-labelled by its kind rather than by position, so a click on a
-name in the source selects that row, and the row shows the binder's type in that pane. The
-positional queries (`tightestNodeAt`, `typesAt`) include occurrences; a predicate stays excluded
+the node that holds it, so a click on a name in the source selects that row, and the row shows the
+binder's type in that pane. The row's edge label is the leading word of the entry's `label`,
+lowercased: `binder`, `use`, `label`, `head` or `annotation` (`childEdge` in `web/src/treeView.ts`).
+The positional queries (`tightestNodeAt`, `typesAt`) include occurrences; a predicate stays excluded
 from them because the tree draws no row for one.
 
-Both wire validators check that `kind` is `value`, `occurrence` or `predicate`, that an occurrence entry has no
-children, and that one child edge names each occurrence. `IrChild` is a breaking change to the wire
-shape, which the [schema version](#the-schema-version) rule leaves at 1 while no durable consumer
-exists.
+Both wire validators check that `kind` is `value`, `occurrence` or `predicate`, that an occurrence
+entry has no children, and that one child edge names each occurrence. `kind` replaced a boolean
+`predicate` without a [schema version](#the-schema-version) bump, which the rule leaves at 1 while
+no durable consumer exists.
 
 ### Types on the wire
 
@@ -368,62 +369,46 @@ not a settled omission.
 **pre-inference** pane rather than the parsed surface AST.
 
 Uid equality is lexical resolution. Every binder carries a globally-fresh `Uid` after
-uniquification, copies preserve it, and a bound occurrence names its binder — so a use's binder is
-the binder sharing its uid, capture-free by construction (`src/ccl/names.rs`). A binder is not a
-node and has no span of its own, so the site reported is the span of the node that binds it: a use of
-`g` in `g = 10` resolves to the statement rather than to the name, and a call resolves to the whole
-`def`.
-
-**Planned.** A use resolves to its binder's binding occurrence, so `defSpan` is the span of the name
-as written: a use of `g` resolves to the `g` in `g = 10`, and a call to `f` to the `f` in `def f`
-([An occurrence on the wire](#an-occurrence-on-the-wire)).
+uniquification, copies preserve it, and a bound occurrence names its binder, so a use's binder is
+the binder sharing its uid, capture-free by construction (`src/ccl/names.rs`). A use resolves to its
+binder's binding occurrence, so `defSpan` is the span of the name as written: a use of `g` resolves
+to the `g` in `g = 10`, and a call to `f` to the `f` in `def f`
+([An occurrence on the wire](#an-occurrence-on-the-wire)). A binder the source does not write, one
+whose name has no source spelling, contributes no site.
 
 The pane is named, not positional: monomorphization splits a generalized definition into one
 specialization per resolved type, so a later pane holds one copy of a `def` body per specialization
 and would report each use once per copy. Pre-inference is the pane where a source name occurs as
 often as it does in the program.
 
-A multi-argument function's parameters bind nothing — `uncurry_params` substitutes
-`__arg_tuple_N ▷ .i` for every occurrence — so uid equality cannot answer for them. They resolve
-through the projection's two spans instead, the occurrence on the `Apply` and the declaration on its
-`Proj` child
+| A use | `useSpan` | `defSpan` |
+|---|---|---|
+| a `Var` lowering images from the source: `g` in `p + g` | the `Var`'s span, narrowed to its last segment when its name is qualified: `rect` in `Shape::rect(1, 2)` | the binder's binding occurrence |
+| a name a `Feed`, `Define` or `MutWrite` holds: `out` in `out << v` | its applied occurrence | the binder's binding occurrence, `out` in `out: Feed(Int)` |
+| a substituted parameter or constructor field: `w` in `case Shape::rect(w, h): w` | the substituted projection's `Apply` | the projection's `Proj` child, the declared name |
+| a constructor head the source writes: `rect` in `case Shape::rect(w, h)` | its head occurrence | the constructor's declaration, `NominalCtor.span` |
+| a name lowering resolves in a type or a module path: `Shape` in `s: Shape` | the row's use span | the row's target ([lowering.md](../ccl/design/lowering.md#names-lowering-resolves)) |
+
+A multi-argument function's parameters and a constructor pattern's fields bind nothing:
+`uncurry_params` and `bind_parameters` substitute `__arg_tuple_N ▷ .i` for every use. They resolve
+through the projection's two spans, the use on the `Apply` and the declaration on its `Proj` child
 ([ir.md](../ccl/design/ir.md#source-locations-on-substituted-parameter-projections)). The projection is
-identified by its `lower.uncurry_proj` tag, so an author-written `t.0` is not mistaken for one.
+identified by its `lower.param_proj` tag, so an author-written `t.0` is not mistaken for one. The
+name is read back from the source at the declaration.
 
-**Planned.** A constructor pattern's fields in a `match` arm resolve the same way. `bind_parameters`
-substitutes them as `uncurry_params` substitutes parameters, and both tag the substituted
-projection `lower.param_proj` at the span of the declared name, so `w` in
-`case Shape::rect(w, h): w * h` resolves to the `w` in the pattern
-([provenance.md](../ccl/design/provenance.md#the-occurrence-field)).
+A `Var` or a head lowering builds for itself is tagged at a span it does not image, such as the
+whole statement of a constructor assignment `Circle::circle(r) = c`, whose payload it reads, so it
+contributes no row: its use span would contain the rows of the names the statement writes. A label
+occurrence and a tag head contribute no row, because a structural label has no declaration
+([provenance.md](../ccl/design/provenance.md#labels-pattern-heads-and-annotations)). A field access
+`p.x` contributes none for the same reason.
 
-**What does not resolve.** A `Feed`, `Define` or `MutWrite` names a binder bound elsewhere, and that
-name is a field rather than a node, so the only span available is the whole node's. A use span
-covering a statement would contain the narrower uses inside it, and a consumer takes the first
-containing row, so a broad row would shadow them. Those uses contribute none: `out` in
-`out << value` does not resolve to its declaration.
-
-**Planned.** Such a name resolves through its applied occurrence: `useSpan` is the span of the name
-and `defSpan` its binder's binding occurrence, so `out` in `out << value` resolves to the `out` in
-`out: Feed(Int)`.
-
-**Planned.** A head occurrence for a constructor resolves to the constructor's declaration:
-`rect` in `case Shape::rect(w, h)` resolves to `rect` in `type Shape:`, through the pattern's
-`PatternHead::Constructor`. A label occurrence and a tag head contribute no row, because a
-structural label has no declaration
-([provenance.md](../ccl/design/provenance.md#labels-pattern-heads-and-annotations)).
-
-**Planned.** The names lowering resolves in types and module paths join the same rows. Each row of
-lowering's `ResolvedNames` table becomes a `definitions` row: `Shape` in `s: Shape` resolves to
-`Shape` in `type Shape:`, an alias's use to its name, a type parameter's use to its declaration, a
-module qualifier to the module's file, and a `use` item that names a value to the member's binding
-occurrence ([lowering.md](../ccl/design/lowering.md#names-lowering-resolves)). A row whose target is
-in another file carries that file in its `defSpan`. The table describes the program the
-`pre-inference` pane holds, so the two sources of rows agree on which program they answer for.
-
-A qualified use such as `Shape::rect(1, 2)` or `m::f(x)` is one `Var` whose span covers the whole
-path, and its qualifier has a row of its own from the table. The `Var`'s row therefore takes the
-span of the last segment, `rect` or `f`, so no row contains another and a consumer's first
-containing row is the narrowest.
+Rows from lowering's `ResolvedNames` table follow the rows the tree gives. A row whose target is in
+another file carries that file in its `defSpan`, and a module qualifier's target is the empty span
+at the start of the module's file. The table describes the program the `pre-inference` pane holds,
+so the two sources of rows agree on which program they answer for. A qualified `Var` takes the span
+of its last segment because its qualifier has a row of its own from the table, so no row contains
+another and a consumer's first containing row is the narrowest.
 
 This layer implements no scoping of its own. CHL's binding structure is stated in `ccl/scope.rs`
 and minted by `uniquify`, and resolution here reads the result rather than recomputing it, so a
@@ -547,9 +532,3 @@ value domains and carries a `contains` bug on half-bounded intervals (see
   that conversion records what it builds, but an operator is not an expression: it has no type, and
   the positional queries (`tightestNodeAt` and its kin) are defined over the tree panes only. A
   consumer reaches an operator through the pane links, never by asking where the cursor is.
-- **No channel names a binder site.** A binder is not an expression, so nothing attributes it and no
-  field says which node binds the name written at a given span. The payload therefore carries no
-  binder types, and a consumer clicking a binder resolves the node whose span contains it — for
-  `g = "abc"` that is the whole `Let`, whose type is the type of what follows the binding.
-  **Planned:** an occurrence entry closes this
-  ([An occurrence on the wire](#an-occurrence-on-the-wire)).

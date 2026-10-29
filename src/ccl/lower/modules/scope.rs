@@ -38,8 +38,13 @@ pub enum Reached {
     /// The member, as a reference through its qualifier.
     Value(Option<Reference>),
     /// The type or Module type the alias names, spelled through its qualifier
-    /// ([`reroot`]).
-    Type(Option<AliasType>),
+    /// ([`reroot`]), and where its module writes the alias's name, which a use of
+    /// the `use` name resolves to. A type member of a Module type is declared in
+    /// no module, so its `name_span` is `None`.
+    Type {
+        ty: Option<AliasType>,
+        name_span: Option<Span>,
+    },
     /// A nominal type, as the instance the qualifier reaches, with how the module
     /// spells that qualifier, which its members' bindings are reached through.
     Nominal(Option<(NominalMember, QualifiedName)>),
@@ -141,11 +146,13 @@ impl LoweringContext {
         // the function was lowered with.
         for (name, used) in &scope.uses {
             match &used.reached {
-                Reached::Type(ty) => {
+                Reached::Type { ty, name_span } => {
                     let ty = ty.clone().unwrap_or(AliasType::Type(Type::Hole));
                     match used.run {
-                        None => self.declare_type_throughout(name.as_str(), ty),
-                        Some(_) => self.declare_type_alias(name.as_str(), used.item, ty),
+                        None => self.declare_type_throughout(name.as_str(), *name_span, ty),
+                        Some(_) => {
+                            self.declare_type_alias(name.as_str(), used.item, *name_span, ty)
+                        }
                     }
                 }
                 Reached::Value(Some(reference)) if reference.history_param => {
@@ -481,6 +488,10 @@ impl LoweringContext {
             ));
         };
         qualifier.in_scope_at(&name.node, name.span, span)?;
+        // A module is declared by its file, so the name resolves to the file's start.
+        if let Some(file) = qualifier.file {
+            self.resolved(name.span, &name.node, Span::new(file, 0, 0));
+        }
         Ok(qualifier)
     }
 }
@@ -693,6 +704,16 @@ impl Qualifier {
         let mut ty = reroot_alias(&found.ty, &self.name);
         ty.walk_types_mut(&mut |ty| substitute(ty, &self.types));
         Ok(Some(ty))
+    }
+
+    /// Where the module this reaches writes the name of its type alias `member`, or
+    /// `None` when it has none to reach: through a Module type, whose type members
+    /// no module declares, or when the module has errors of its own.
+    pub(super) fn type_member_span(&self, member: &str) -> Option<Span> {
+        if self.view.is_some() {
+            return None;
+        }
+        Some(self.reachable()?.types.get(member)?.name_span)
     }
 
     /// The type this module, passed at `span` as the argument for `parameter`,
@@ -1190,7 +1211,10 @@ pub(super) fn module_scope(
                     &item.name.node,
                     item.name.span,
                 )
-                .map(Reached::Type)
+                .map(|ty| Reached::Type {
+                    ty,
+                    name_span: qualifier.type_member_span(&item.name.node),
+                })
         } else {
             qualifier
                 .reach(

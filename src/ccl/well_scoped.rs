@@ -202,7 +202,7 @@ mod tests {
             p_plus_q,
         )
         .with_ty(Type::Base(BaseType::Bool));
-        let mut target = TypedBinding::new_unannotated("t");
+        let mut target = TypedBinding::new_unannotated("t", crate::ccl::Occurrence::mint());
         target.ty = Type::refined_one(int(), Refinement::born(Rc::new(at)));
         let looped = Expr::new(TypedExprNode::For {
             position: Box::new(p.clone()),

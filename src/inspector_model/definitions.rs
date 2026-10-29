@@ -10,8 +10,8 @@
 //! carries a globally-fresh [`Uid`](crate::ccl::names::Uid), copies preserve it,
 //! and a bound occurrence names the binder that binds it — so "which binder does
 //! this use refer to" is a `uid` lookup, capture-free by construction
-//! (`src/ccl/names.rs`). A binder is not a node and has no span of its own, so
-//! the site reported is the span of the node that binds it — the whole `let`.
+//! (`src/ccl/names.rs`). The site reported is the binder's binding occurrence, the
+//! name as the source writes it (`src/ccl/design/provenance.md`, "Name occurrences").
 //!
 //! Resolving here rather than over the parsed surface AST removes a second
 //! implementation of CHL's scoping. The surface walk carried its own binder
@@ -28,32 +28,29 @@
 //! into one specialization per resolved type, so a later pane holds one copy of a
 //! `def` body per specialization and would report a use once per copy.
 //!
-//! # What does not resolve
+//! # What resolves
 //!
-//! A `Feed`, `Define` or `MutWrite` names a binder bound elsewhere — the `name`
-//! field is a use, not a binding site (`src/ccl/scope.rs`) — and that name is a
-//! field rather than a node, so the only span available is the whole node's. A
-//! use span covering a statement would contain the narrower uses inside it, and a
-//! consumer resolving a position takes the first containing row, so a broad row
-//! would shadow them. Those uses contribute no row: `out` in `out << value` does
-//! not resolve to its declaration. Closing that needs a span on the name field
-//! itself, which is a `ccl` change.
+//! - A `Var` names the binder sharing its uid. A qualified one, `Shape::rect` or
+//!   `m::f`, is resolved at its last segment; the qualifier is a row of lowering's.
+//! - A `Feed`, `Define` or `MutWrite` names its binder through its applied occurrence.
+//! - A substituted parameter, a multi-argument function's or a constructor pattern's
+//!   field, binds nothing — lowering replaces each use with `__arg_tuple_N ▷ .i` — so
+//!   it resolves through the projection's two spans: the `Apply` carries the use and
+//!   its `Proj` child carries the declaration (`src/ccl/design/ir.md`, "Source
+//!   locations on substituted parameter projections"). The name is read back from
+//!   the source at that declaration.
+//! - A `match` arm's constructor head resolves to the constructor's declaration.
+//! - The names lowering resolved in types and module paths, which no tree holds,
+//!   join from its [`ResolvedName`] table.
 //!
-//! # A substituted parameter
-//!
-//! A multi-argument function's parameters bind nothing —  `uncurry_params`
-//! rewrites `Var(p)` to `__arg_tuple_N ▷ .i` — so a use of one is not a `Var` and
-//! has no binder to share a uid with. It resolves through the projection's two
-//! spans instead: the `Apply` carries the occurrence and its `Proj` child carries
-//! the parameter's declaration (`src/ccl/design/ir.md`,
-//! "Source locations on substituted parameter projections"). The bound name is read back from the
-//! source at that declaration, because lowering substituted it out of the tree.
+//! A record label or a tag has no declaration, so it resolves nowhere.
 
 use std::collections::HashMap;
 
+use crate::ccl::lower::ResolvedName;
 use crate::ccl::names::Uid;
-use crate::ccl::provenance::SourceProjection;
-use crate::ccl::{Expr, Name, TypedExprNode};
+use crate::ccl::provenance::{NodeId, SourceProjection};
+use crate::ccl::{Expr, Name, PatternHead, TypedExprNode};
 use crate::chl_parser::SourceMap;
 use crate::chl_parser::ast::Span;
 use smol_str::SmolStr;
@@ -70,60 +67,90 @@ pub(super) struct Definition {
     pub(super) name: SmolStr,
 }
 
-/// Every resolved use→binder pair in `tree`, in first-visit pre-order.
+/// Every resolved use→binder pair in `tree`, in first-visit pre-order, then each of
+/// `resolved`, the names lowering resolved outside the tree.
 ///
-/// A use whose binder carries no site contributes no row, which is how a use of
-/// a compiler-minted binder stays out: those are written nowhere.
+/// A use whose binder the source does not write contributes no row, which is how a
+/// use of a compiler-minted binder stays out.
 pub(super) fn definitions(
     tree: &Expr,
     projection: &SourceProjection,
     sources: &SourceMap,
+    resolved: &[ResolvedName],
 ) -> Vec<Definition> {
     let mut sites: HashMap<Uid, Span> = HashMap::new();
     collect_binder_sites(tree, projection, &mut sites);
 
     let mut out = Vec::new();
     collect_uses(tree, projection, sources, &sites, &mut out);
+    out.extend(resolved.iter().map(|row| Definition {
+        use_span: row.use_span,
+        def_span: row.target,
+        name: row.name.clone(),
+    }));
     out
 }
 
-/// The label `uncurry_params` tags a substituted parameter's projection with.
-/// Matching on it is exact: an author-written `t.0` images its own source and
-/// carries the lowering image label instead.
-const UNCURRY_PROJ: &str = "lower.uncurry_proj";
+/// The label `uncurry_params` and `bind_parameters` tag a substituted parameter's
+/// projection with. Matching on it is exact: an author-written `t.0` images its own
+/// source and carries the lowering image label instead.
+const PARAM_PROJ: &str = "lower.param_proj";
 
-/// Every binder's `uid →` the span of the node that introduces it.
-///
-/// A binder is not a node, so it has no span of its own; the node that binds it
-/// does. `g = 10` lowers to one `Let` spanning the whole statement, so a use of
-/// `g` resolves there rather than to the three bytes the name occupies. That is
-/// the enclosing-binding-site answer, and it is what a consumer can offer
-/// without the IR carrying a second span channel for names.
+/// Every binder's `uid →` the span of its binding occurrence, the name the source
+/// writes.
 fn collect_binder_sites(expr: &Expr, projection: &SourceProjection, out: &mut HashMap<Uid, Span>) {
-    if let Some(span) = node_span(expr, projection) {
-        expr.walk_binders(|b| {
-            // Lowering's own binders are not names a reader can go to
-            // ([`Name::source_spelling`]). Without the test the tupled binder's
-            // own occurrences would emit a second row at a parameter's use span,
-            // competing with the projection's.
-            if let Name::Unique { uid, .. } = &b.name
-                && b.name.source_spelling().is_some()
-            {
-                // A uid may sit at several binding sites: lowering copies
-                // pre-minted subtrees, and each copy keeps the uid. Those copies
-                // are one source binder, so the first write stands.
-                out.entry(*uid).or_insert(span);
-            }
-        });
-    }
+    expr.walk_binders(|b| {
+        // Lowering's own binders are not names a reader can go to
+        // ([`Name::source_spelling`]). Without the test the tupled binder's
+        // own occurrences would emit a second row at a parameter's use span,
+        // competing with the projection's.
+        if let Name::Unique { uid, .. } = &b.name
+            && b.name.source_spelling().is_some()
+            && let Some(span) = id_span(b.occurrence.id(), projection)
+        {
+            // A uid may sit at several binding sites: lowering copies
+            // pre-minted subtrees, and each copy keeps the uid. Those copies
+            // are one source binder, so the first write stands.
+            out.entry(*uid).or_insert(span);
+        }
+    });
     expr.walk_children(|c| collect_binder_sites(c, projection, out));
+}
+
+/// The narrowest span `id` traces to.
+fn id_span(id: NodeId, projection: &SourceProjection) -> Option<Span> {
+    projection
+        .get(&id)
+        .and_then(|attr| attr.spans.iter().min_by_key(|s| s.end - s.start).copied())
 }
 
 /// The narrowest span this node traces to, which is the occurrence's own.
 fn node_span(expr: &Expr, projection: &SourceProjection) -> Option<Span> {
-    projection
-        .get(&expr.node_id())
-        .and_then(|attr| attr.spans.iter().min_by_key(|s| s.end - s.start).copied())
+    id_span(expr.node_id(), projection)
+}
+
+/// Whether lowering recorded `id` as the image of the source text at its span: the root
+/// of a lowered expression, or a name the source writes. A node or an occurrence lowering
+/// builds for itself is tagged at a span it does not image, and resolves no use.
+fn images_source(id: NodeId, projection: &SourceProjection) -> bool {
+    projection.get(&id).is_some_and(|attr| {
+        attr.rewritten.nature.is_source() || attr.rewritten.label == "lower.image"
+    })
+}
+
+/// A qualified use's span narrowed to its last path segment: `rect` of `Shape::rect`. The
+/// name's own spelling says whether it is qualified, so a `::` elsewhere in the span is
+/// not mistaken for a qualifier.
+fn last_segment(span: Span, name: &Name, sources: &SourceMap) -> Span {
+    let qualified = match name {
+        Name::Unique { base, .. } => base.contains("::"),
+        _ => false,
+    };
+    let text = sources.text(span.file).get(span.as_range()).unwrap_or("");
+    match text.rfind("::") {
+        Some(at) if qualified => Span::new(span.file, span.start + at + 2, span.end),
+        _ => span,
+    }
 }
 
 fn collect_uses(
@@ -133,16 +160,42 @@ fn collect_uses(
     sites: &HashMap<Uid, Span>,
     out: &mut Vec<Definition>,
 ) {
+    let mut push = |use_span: Span, uid: &Uid, base: &SmolStr| {
+        if let Some(&def_span) = sites.get(uid) {
+            out.push(Definition {
+                use_span,
+                def_span,
+                name: base.clone(),
+            });
+        }
+    };
     match &expr.node {
         // An ordinary bound occurrence: its binder is the one sharing its uid.
-        TypedExprNode::Var(Name::Unique { uid, base, .. }) => {
-            if let (Some(use_span), Some(&def_span)) = (node_span(expr, projection), sites.get(uid))
+        TypedExprNode::Var(name @ Name::Unique { uid, base, .. }) => {
+            if images_source(expr.node_id(), projection)
+                && let Some(use_span) = node_span(expr, projection)
             {
-                out.push(Definition {
-                    use_span,
-                    def_span,
-                    name: base.clone(),
-                });
+                push(last_segment(use_span, name, sources), uid, base);
+            }
+        }
+        // A use held as a field resolves through its applied occurrence.
+        TypedExprNode::Feed {
+            name: Name::Unique { uid, base, .. },
+            name_occurrence,
+            ..
+        }
+        | TypedExprNode::Define {
+            name: Name::Unique { uid, base, .. },
+            name_occurrence,
+            ..
+        }
+        | TypedExprNode::MutWrite {
+            name: Name::Unique { uid, base, .. },
+            name_occurrence,
+            ..
+        } => {
+            if let Some(use_span) = id_span(name_occurrence.id(), projection) {
+                push(use_span, uid, base);
             }
         }
         // A substituted parameter: `arg ▷ .i`, where the projection names the
@@ -150,10 +203,10 @@ fn collect_uses(
         TypedExprNode::Apply { function, .. }
             if matches!(function.node, TypedExprNode::Proj(_)) =>
         {
-            let is_uncurry = projection
+            let substituted = projection
                 .get(&function.node_id())
-                .is_some_and(|attr| attr.rewritten.label == UNCURRY_PROJ);
-            if is_uncurry
+                .is_some_and(|attr| attr.rewritten.label == PARAM_PROJ);
+            if substituted
                 && let (Some(use_span), Some(def_span)) =
                     (node_span(expr, projection), node_span(function, projection))
                 && let Some(name) = sources.text(def_span.file).get(def_span.as_range())
@@ -163,6 +216,25 @@ fn collect_uses(
                     def_span,
                     name: SmolStr::new(name),
                 });
+            }
+        }
+        // A constructor head the source writes resolves to the constructor's
+        // declaration. A tag head has none, and a `case` lowering builds for itself, as
+        // `N::extract`'s is, writes no head.
+        TypedExprNode::Case { branches, .. } => {
+            for pattern in branches.iter().filter_map(|b| b.pattern.as_ref()) {
+                if let PatternHead::Constructor { decl, ctor } = &pattern.head
+                    && let Some(declared) = decl.ctor(ctor)
+                    && declared.span.start != declared.span.end
+                    && images_source(pattern.head_occurrence.id(), projection)
+                    && let Some(use_span) = id_span(pattern.head_occurrence.id(), projection)
+                {
+                    out.push(Definition {
+                        use_span,
+                        def_span: declared.span,
+                        name: ctor.clone(),
+                    });
+                }
             }
         }
         _ => {}
@@ -198,42 +270,115 @@ mod tests {
             .collect()
     }
 
-    /// A use resolves to the binding that introduces it — the whole `let`, not
-    /// the name.
-    ///
-    /// A binder is not a node and has no span of its own, so the answer is the
-    /// span of the node that binds it. `g = 10` is one `Let` over the statement,
-    /// and a `def` is a `Let` over the whole definition, so jumping to a
-    /// function lands on the function.
+    /// A use resolves to the name its binder writes: the binder's binding occurrence.
     #[test]
-    fn a_use_resolves_to_the_binding_that_introduces_it() {
-        let got = resolved(indoc! {r#"
+    fn a_use_resolves_to_the_name_its_binder_writes() {
+        let code = indoc! {r#"
             g = 10
             def f(p):
               p + g
             f(1)
+        "#};
+        let got = resolved(code);
+        for name in ["g", "f", "p"] {
+            assert!(
+                got.contains(&(name.to_string(), name.to_string(), name.to_string())),
+                "a use of `{name}` lands on the `{name}` its binder writes; got {got:?}"
+            );
+        }
+    }
+
+    /// Every kind of use resolves to the name its declaration writes: binders, a feed's
+    /// target, constructor heads, a type's, an alias's and a constructor pattern's
+    /// fields. A label resolves nowhere.
+    #[test]
+    fn every_kind_of_name_resolves_to_its_declaration() {
+        let code = indoc! {r#"
+            type Shape:
+                circle(radius: Int)
+                rect(w: Int, h: Int)
+
+            Pt = {x: Int, y: Int}
+
+            def area(s: Shape) => Int:
+                match s:
+                    case Shape::circle(r):
+                        r * r * 3
+                    case Shape::rect(w, h):
+                        w * h
+
+            out: Feed(_)
+            p: Pt = (x=1, y=2)
+            out << area(Shape::rect(p.x, 4))
+            out
+        "#};
+        let got = resolved(code);
+        // Each use, by its text and the text of the line it stands in, resolves to a
+        // declaration whose text is the same name.
+        for name in [
+            "s", "r", "w", "h", "area", "out", "p", "Shape", "Pt", "rect", "circle",
+        ] {
+            assert!(
+                got.iter()
+                    .any(|(u, d, n)| u == name && d == name && n == name),
+                "a use of `{name}` resolves to its declaration; got {got:?}"
+            );
+        }
+        for label in ["x", "y"] {
+            assert!(
+                !got.iter().any(|(u, _, _)| u == label),
+                "a label resolves nowhere; got {got:?}"
+            );
+        }
+        // `Shape::rect(…)` is one `Var`, resolved at its last segment; its qualifier is
+        // lowering's row.
+        assert!(
+            !got.iter().any(|(u, _, _)| u.contains("::")),
+            "no row spans a qualified path; got {got:?}"
+        );
+    }
+
+    /// No row's use span contains another's, so a consumer's first containing row is the
+    /// narrowest. A constructor assignment reads its payload through a `Var` lowering
+    /// builds at the whole statement, which resolves nothing.
+    #[test]
+    fn no_use_span_contains_another() {
+        let code = indoc! {r#"
+            type Circle:
+                circle(radius: Int)
+
+            c = Circle::circle(3)
+            Circle::circle(r) = c
+            r + 1
+        "#};
+        let mut ctx = GlobalContext::default();
+        let consumer: Box<dyn Consumer> = Box::new(|| {});
+        let compiled = compile_program(&mut ctx, &LoadedProgram::test(code), consumer)
+            .expect("program compiles");
+        let defs = InspectedProgram::new(&compiled).definitions();
+        for a in &defs {
+            for b in &defs {
+                let contains = a.use_span != b.use_span
+                    && a.use_span.start <= b.use_span.start
+                    && b.use_span.end <= a.use_span.end;
+                assert!(!contains, "{a:?} contains {b:?}");
+            }
+        }
+    }
+
+    /// A name lowering declares for itself resolves no use: the single-constructor form's
+    /// `new` and the `case` its `extract` builds are written nowhere.
+    #[test]
+    fn a_name_lowering_declares_resolves_no_use() {
+        let got = resolved(indoc! {r#"
+            type Price = {amount: Int}
+
+            p = Price::new(amount=3)
+            p.extract().amount
         "#});
-        let def = |use_text: &str| -> String {
-            got.iter()
-                .find(|(u, _, _)| u == use_text)
-                .unwrap_or_else(|| panic!("a use of `{use_text}`; got {got:?}"))
-                .1
-                .clone()
-        };
-        assert_eq!(
-            def("g"),
-            "g = 10",
-            "a use of `g` lands on its binding statement"
-        );
-        assert_eq!(
-            def("f"),
-            "def f(p):\n  p + g\n",
-            "a call lands on the whole definition"
-        );
-        assert_eq!(
-            def("p"),
-            "def f(p):\n  p + g\n",
-            "a single parameter lands on the definition that binds it"
+        assert!(
+            !got.iter().any(|(u, _, n)| n == "new" && u == "Price"),
+            "the `case` `extract` builds contributes no head row; got {got:?}"
         );
     }
 

@@ -31,7 +31,7 @@ import type {
   Snapshot,
   Span,
 } from "./types";
-import { walkStarts } from "./types";
+import { CHILD_KINDS, walkStarts } from "./types";
 
 class WireError extends Error {
   constructor(path: string, expected: string, got: unknown) {
@@ -303,8 +303,9 @@ function validateOperatorEdge(v: unknown, path: string): OperatorEdge {
 function validateChild(v: unknown, path: string): IrChild {
   const o = obj(v, path);
   num(o.id, `${path}.id`);
-  if (typeof o.predicate !== "boolean") {
-    throw new WireError(`${path}.predicate`, "boolean", o.predicate);
+  const kind = str(o.kind, `${path}.kind`);
+  if (!(CHILD_KINDS as readonly string[]).includes(kind)) {
+    throw new WireError(`${path}.kind`, `one of {${CHILD_KINDS.join(", ")}}`, kind);
   }
   return v as IrChild;
 }
@@ -412,6 +413,22 @@ function validatePane(v: unknown, path: string): PaneEntry {
 
   const nodes = rawNodes.map((n, i) => validateNode(n, `${path}.nodes[${i}]`));
   closeOverIds(nodes);
+  // An occurrence belongs to the one node that holds it, and is a leaf.
+  const occurrenceEdges = new Map<number, number>();
+  for (const n of nodes) {
+    for (const c of n.children) {
+      if (c.kind === "occurrence") occurrenceEdges.set(c.id, (occurrenceEdges.get(c.id) ?? 0) + 1);
+    }
+  }
+  nodes.forEach((n, i) => {
+    const edges = occurrenceEdges.get(n.nodeId);
+    if (edges !== undefined && edges !== 1) {
+      throw new WireError(`${path}.nodes[${i}]`, "an occurrence named by one child edge", edges);
+    }
+    if (edges !== undefined && n.children.length > 0) {
+      throw new WireError(`${path}.nodes[${i}].children`, "no children on an occurrence", n.children);
+    }
+  });
   nodes.forEach((n, i) => {
     // One edge per predicate: a node's type slots overlap, so a slot-order walk
     // upstream reaches a shared predicate once per slot, and a second edge to it
@@ -425,7 +442,7 @@ function validatePane(v: unknown, path: string): PaneEntry {
           c.id,
         );
       }
-      if (c.predicate) {
+      if (c.kind === "predicate") {
         if (predicateTargets.has(c.id)) {
           throw new WireError(
             `${path}.nodes[${i}].children[${j}].id`,

@@ -416,7 +416,7 @@ fn is_written(target: &Name, shift: u32, name: &Name) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::{BaseType, BinOpKind, CompareKind, TypedExpr};
+    use crate::ccl::{BaseType, BinOpKind, CompareKind, Occurrence, TypedExpr};
 
     fn int() -> Type {
         Type::Base(BaseType::Int)
@@ -438,7 +438,12 @@ mod tests {
     fn a_shared_predicate_reads_a_name_free_where_nothing_binds_it() {
         let x = Name::fresh("x");
         let refined = equal_to(TypedExpr::var(x.clone()));
-        let under = TypedExpr::lambda(x.clone(), int(), TypedExpr::var("v").with_ty(refined()));
+        let under = TypedExpr::lambda(
+            x.clone(),
+            Occurrence::mint(),
+            int(),
+            TypedExpr::var("v").with_ty(refined()),
+        );
         let outside = TypedExpr::var("w").with_ty(refined());
         let both = TypedExpr::tuple(vec![under, outside]);
         assert!(names(&both, EVERY_READ).contains(&x));
@@ -453,6 +458,7 @@ mod tests {
         let (x, y, z) = (Name::fresh("x"), Name::fresh("y"), Name::fresh("z"));
         let shadowed = TypedExpr::lambda(
             x.clone(),
+            Occurrence::mint(),
             int(),
             TypedExpr::tuple(vec![TypedExpr::var(x.clone()), TypedExpr::var(y.clone())]),
         );
@@ -462,6 +468,7 @@ mod tests {
         );
         let in_its_type = TypedExpr::lambda(
             x.clone(),
+            Occurrence::mint(),
             equal_to(TypedExpr::var(x.clone()))(),
             TypedExpr::var(x.clone()),
         );

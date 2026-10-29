@@ -1,14 +1,14 @@
 import { describe, expect, it } from "vitest";
 
 import { buildIndices } from "./indices";
-import type { Definition, IrNode } from "./types";
+import type { Definition, IrChild, IrNode } from "./types";
 
 function node(
   nodeId: number,
   label: string,
   span: { file: number; start: number; end: number } | null,
   type: string,
-  children: { id: number; predicate: boolean }[] = [],
+  children: IrChild[] = [],
 ): IrNode {
   return {
     label,
@@ -28,9 +28,9 @@ function node(
 //       leaf  #3 [3,4)
 //     dup-shallow #4 [6,7)   (depth 1)
 //       dup-deep  #5 [6,7)   (depth 2)  <- innermost, wins ties
-const value = (id: number) => ({ id, predicate: false });
+const value = (id: number): IrChild => ({ id, kind: "value" });
 const nodes: IrNode[] = [
-  node(1, "Root", { file: 0, start: 0, end: 10 }, "Int", [value(2), { id: 4, predicate: false }]),
+  node(1, "Root", { file: 0, start: 0, end: 10 }, "Int", [value(2), { id: 4, kind: "value" }]),
   node(2, "Inner", { file: 0, start: 2, end: 5 }, "Int", [value(3)]),
   node(3, "Leaf", { file: 0, start: 3, end: 4 }, "Int"),
   node(4, "DupShallow", { file: 0, start: 6, end: 7 }, "Int", [value(5)]),
@@ -62,12 +62,12 @@ describe("buildIndices: predicate interiors", () => {
   // named by two edges, which is what the node table buys. #13 lives inside it.
   const shared: IrNode[] = [
     node(10, "Root", null, "Int", [
-      { id: 11, predicate: false },
-      { id: 12, predicate: true },
+      { id: 11, kind: "value" },
+      { id: 12, kind: "predicate" },
     ]),
-    node(11, "Operand", null, "Int", [{ id: 12, predicate: true }]),
+    node(11, "Operand", null, "Int", [{ id: 12, kind: "predicate" }]),
     node(12, "BinOp(Comparison(Eq))", null, "Bool", [
-      { id: 13, predicate: false },
+      { id: 13, kind: "value" },
     ]),
     node(13, "Lit(Int(2))", null, "Int@2"),
   ];
@@ -312,11 +312,11 @@ describe("nodesInRange: predicate interiors are not seeds", () => {
   // literal and nothing else.
   const withPred: IrNode[] = [
     node(20, "Root", { file: 0, start: 0, end: 6 }, "Int", [
-      { id: 21, predicate: false },
-      { id: 22, predicate: true },
+      { id: 21, kind: "value" },
+      { id: 22, kind: "predicate" },
     ]),
-    node(21, "Lit(Int(1))", { file: 0, start: 4, end: 5 }, "Int@1", [{ id: 22, predicate: true }]),
-    node(22, "BinOp(Eq)", { file: 0, start: 4, end: 5 }, "Bool", [{ id: 23, predicate: false }]),
+    node(21, "Lit(Int(1))", { file: 0, start: 4, end: 5 }, "Int@1", [{ id: 22, kind: "predicate" }]),
+    node(22, "BinOp(Eq)", { file: 0, start: 4, end: 5 }, "Bool", [{ id: 23, kind: "value" }]),
     node(23, "Lit(Int(1))", { file: 0, start: 4, end: 5 }, "Int@1"),
   ];
   const p = buildIndices(20, withPred, [], "");
@@ -422,6 +422,29 @@ describe("nodesInRange (source-selection seeds)", () => {
 
   it("names nothing when the range holds no node and cuts none", () => {
     expect(idx.nodesInRange(20, 30)).toEqual([]);
+  });
+});
+
+describe("an occurrence at a position", () => {
+  // `g = 10` as a `Let` [0,6) holding its binder `g` [0,1) as an occurrence: a position
+  // on the name finds the occurrence, and its type is the binder's.
+  const occurrenceNodes: IrNode[] = [
+    node(20, "Let(g)", { file: 0, start: 0, end: 6 }, "Int", [
+      value(21),
+      { id: 22, kind: "occurrence" },
+    ]),
+    node(21, "Lit(Int(10))", { file: 0, start: 4, end: 6 }, "Int@10"),
+    node(22, "Binder(g)", { file: 0, start: 0, end: 1 }, "Int@10"),
+  ];
+  const occ = buildIndices(20, occurrenceNodes, [], "");
+  it("is the tightest node at a position on the name", () => {
+    expect(occ.tightestNodeAt(0)).toBe(22);
+  });
+  it("answers typesAt with the binder's type", () => {
+    expect(occ.typesAt(0)).toEqual(["Int@10"]);
+  });
+  it("is not a predicate interior", () => {
+    expect(occ.predicateIds.has(22)).toBe(false);
   });
 });
 
