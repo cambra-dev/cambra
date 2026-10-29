@@ -756,10 +756,10 @@ breaker that also answers pulls from that state is a producer: `BreakingProducer
 | `pushes_while_consuming()` | Whether what `held()` names after a consume is final, so a driver may push it before the breaker's pipeline finishes. The default answers `true`. |
 | `offer_impl(guard)` | Answers from the state `consume_impl` built and pulls nothing. The breaker's own `get_impl` calls it once the breaker is consuming. |
 
-`Memo`, `Aggregate`, `ExtractAggregate`, `MapAggregate` and `Converse` are breakers. A breaker
-starts in the pull mode described in [The producer protocol](#the-producer-protocol) and is a
-consuming producer from its first `consume_impl`, which it stays. `finalize` is provided over two
-accessors, `input()` and `held()`: it asserts that the input has been released whole and returns
+`Memo`, `Aggregate`, `ExtractAggregate`, `MapAggregate`, `Converse` and `ExtractFinal` are breakers.
+A breaker starts in the pull mode described in [The producer protocol](#the-producer-protocol) and
+is a consuming producer from its first `consume_impl`, which it stays. `finalize` is provided over
+two accessors, `input()` and `held()`: it asserts that the input has been released whole and returns
 `held()` less the guard released to the breaker. A release removes rows from the state and leaves
 the statement of the tile as it was, so the difference is taken in the guard algebra. `guard_minus`
 (`tile_operators/mod.rs`) spells it for guards of a collection's outermost keys, of a scalar and of
@@ -841,6 +841,20 @@ are read. The two parts together release exactly the region named, as
 row stands in a released group once a consume returns; `finalize` checks this in a debug build by
 removing the released region from the groups the held rows build
 (`ConverseProducer::debug_assert_released_groups_freed`).
+
+### ExtractFinal
+
+A consuming `ExtractFinal` merges the source rows it answers at the guard and keeps the row at the
+greatest key, where the values are a column of scalars; any other shape of value keeps every merged
+row. Merged rows are in arrival order, so the last row is not the final one and the key says which
+is. Pull mode takes the last row of a source it reads whole and assumes the source is sorted by key,
+which a consuming `ExtractFinal` does not. Keys of one collection are totally ordered, and a
+collection whose keys do not compare panics. The value is extracted once the source has been
+released whole. A source that held nothing falls back to the default, which `consume_impl` reads
+when the source drains and reads again at each later `consume_impl` until it has converged; until
+then nothing is held and `finalize` returns the empty guard. A source declared total that held
+nothing panics as it does in pull mode. The value is final from then, and stays until the consumer
+releases the output, which is all or nothing.
 
 ## Tile Operators
 
