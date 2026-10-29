@@ -1307,7 +1307,8 @@ impl TileProducer for RestrictProducer {
 /// only the rows *both* have carry a group. A row the inner side has not delivered has no
 /// domain yet. A row whose collection is still arriving is paired with the keys it holds so
 /// far and left open, so a later tile adds to its group
-/// ([`Tile::append_open_level_beneath`]).
+/// ([`Tile::append_open_level_beneath`]). The pairs state what the inner side states of the
+/// keys under each paired row.
 fn pair_one_level(outer: &Tile, inner: &Tile, pair: &Tiling, second: Paired) -> Tile {
     let (
         Tile::DataFunction {
@@ -1369,8 +1370,28 @@ fn pair_one_level(outer: &Tile, inner: &Tile, pair: &Tiling, second: Paired) -> 
     {
         *domain_predicate = domain_predicate.intersect(inner_complete);
     }
+    // A pair is complete where the inner side calls its key complete under the row, by the
+    // group's statement or the row's (`Tile::completion_at`), and the outer row's value is whole.
+    // A scalar value is whole once its row is there. A value holding a level is whole where the
+    // outer side calls its row complete. A statement about a row this side has not paired would
+    // release pairs before they exist, so it is cut to the paired rows.
+    let mut rows = Predicate::from_column_value(
+        &outer_keys.select_indices(paired.iter().copied(), paired.len()),
+    );
+    if let Tile::DataFunction {
+        codomain,
+        domain_predicate: outer_complete,
+        ..
+    } = outer
+        && codomain.holds_a_level()
+    {
+        rows = rows.intersect(outer_complete);
+    }
+    let stated = inner
+        .completion_at(CurryLevel::new(1))
+        .intersect(&Predicate::qualified(rows, Predicate::True));
     let total: usize = runs.iter().map(|(a, b)| b - a).sum();
-    emitted.append_open_level_beneath(CurryLevel::OUTERMOST, |codomain| {
+    emitted.append_open_level_beneath(CurryLevel::OUTERMOST, stated, |codomain| {
         let key_indices: Vec<usize> = runs.iter().flat_map(|(a, b)| *a..*b).collect();
         let keys = group_keys.select_indices(key_indices.iter().copied(), total);
         let second = match second {
@@ -1439,7 +1460,7 @@ pub enum Paired {
 /// The output tiling is the outer's levels with the inner domain put beneath the rows, over
 /// `{_0: outer value, _1: inner key}`, or the inner value in `_1` for [`Paired::Value`]. A row is complete as soon as both sides call it
 /// complete, and a row whose group is still arriving is paired with what it holds and left
-/// open.
+/// open. A pair is complete where the inner side calls its key complete under the row.
 ///
 /// A collection every row reads, a correlated inner comprehension's inner source, reaches
 /// this as one copy per row: `const` lifts it beside each row (`MapResultToConst`), which
@@ -4061,6 +4082,125 @@ mod product_projection_tests {
             outer_pulled,
             inner_pulled,
         )
+    }
+
+    /// The paired level states what the inner side states of each paired row's keys, and nothing
+    /// of a row the inner side states but the outer side has not paired.
+    #[test]
+    fn a_pairing_states_the_inner_keys_complete_under_the_rows_it_pairs() {
+        let point = |k: u64| Predicate::point(Value::UInt(k));
+        let outer = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![100, 200]))),
+            Predicate::False,
+            BitSet::new(),
+        );
+        // Row 0 holds keys 0 and 1 and is whole; row 1 holds key 0, stated through 0; row 2
+        // is stated whole and has nothing paired with it.
+        let inner = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1, 2]),
+            Box::new(Tile::grouped(
+                vec![0, 2, 3],
+                ColumnValue::UInts(vec![0, 1, 0]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 8, 9]))),
+                Predicate::qualified(point(0), Predicate::True)
+                    .union(&Predicate::qualified(point(1), point(0)))
+                    .union(&Predicate::qualified(point(2), Predicate::True)),
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let pair = Tiling::Scalar(Extent::Record(HashMap::from([
+            (tuple_field(0), Extent::Base(BaseType::Int)),
+            (tuple_field(1), Extent::Base(BaseType::UInt)),
+        ])));
+        let paired = pair_one_level(&outer, &inner, &pair, Paired::Key);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = paired.values_at(CurryLevel::new(1))
+        else {
+            panic!("a level of pairs beneath the rows, got {paired:?}")
+        };
+        let path = |row: u64, key: u64| [Value::UInt(row), Value::UInt(key)];
+        assert!(
+            domain_predicate.contains_path(&path(0, 5)),
+            "{domain_predicate:?}"
+        );
+        assert!(
+            domain_predicate.contains_path(&path(1, 0)),
+            "{domain_predicate:?}"
+        );
+        assert!(
+            !domain_predicate.contains_path(&path(1, 1)),
+            "{domain_predicate:?}"
+        );
+        assert!(
+            !domain_predicate.contains_path(&path(2, 0)),
+            "row 2 pairs nothing, so its pairs are not stated: {domain_predicate:?}"
+        );
+    }
+
+    /// An outer row whose value holds a level leaves its pairs open until the outer side calls
+    /// the row complete, whatever the inner side states of its keys.
+    #[test]
+    fn a_pairing_leaves_the_pairs_of_a_growing_outer_value_open() {
+        let point = |k: u64| Predicate::point(Value::UInt(k));
+        let inner = Tile::data_function(
+            ColumnValue::UInts(vec![0]),
+            Box::new(Tile::grouped(
+                vec![0],
+                ColumnValue::UInts(vec![0]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![7]))),
+                Predicate::qualified(point(0), Predicate::True),
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let pair = Tiling::Record(HashMap::from([
+            (
+                tuple_field(0),
+                Tiling::data_function(
+                    Extent::Base(BaseType::UInt),
+                    Tiling::Scalar(Extent::Base(BaseType::Int)),
+                ),
+            ),
+            (tuple_field(1), Tiling::Scalar(Extent::Base(BaseType::UInt))),
+        ]));
+        // Row 0's value is a collection of one element, stated open or whole by `row`.
+        let outer = |row: Predicate| {
+            Tile::data_function(
+                ColumnValue::UInts(vec![0]),
+                Box::new(Tile::grouped(
+                    vec![0],
+                    ColumnValue::UInts(vec![0]),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![5]))),
+                    Predicate::False,
+                    BitSet::new(),
+                )),
+                row,
+                BitSet::new(),
+            )
+        };
+        let pairs_stated = |outer: Tile| {
+            let paired = pair_one_level(&outer, &inner, &pair, Paired::Key);
+            let Tile::DataFunction {
+                domain_predicate, ..
+            } = paired.values_at(CurryLevel::new(1))
+            else {
+                panic!("a level of pairs beneath the rows, got {paired:?}")
+            };
+            domain_predicate.contains_path(&[Value::UInt(0), Value::UInt(0)])
+        };
+        assert!(
+            !pairs_stated(outer(Predicate::False)),
+            "row 0's value may still grow"
+        );
+        assert!(
+            pairs_stated(outer(Predicate::True)),
+            "row 0's value is whole"
+        );
     }
 
     #[test]

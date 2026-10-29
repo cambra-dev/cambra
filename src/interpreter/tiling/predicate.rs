@@ -133,9 +133,12 @@ impl Componentwise {
     }
 }
 
-/// The one componentwise predicate two predicates' union is, where both are componentwise
-/// predicates and one componentwise predicate is their union.
+/// The one predicate two predicates' union is, where both are intervals of one ordered key, or
+/// both are componentwise predicates and one componentwise predicate is their union.
 fn join(a: &Predicate, b: &Predicate) -> Option<Predicate> {
+    if let (Predicate::Intervals(a), Predicate::Intervals(b)) = (a, b) {
+        return Some(Predicate::intervals(a.union(b)));
+    }
     let (shape, first, second) = Componentwise::of(a, b)?;
     shape.join(&first, &second)
 }
@@ -2120,6 +2123,19 @@ mod tests {
         let unqualified = Predicate::at_or_below(u(1));
         let qualified = Predicate::qualified(only(1), only(0));
         assert_eq!(unqualified.union(&qualified), unqualified);
+    }
+
+    /// Two interval arms of one key are one interval set, so a union covering every key is
+    /// `True` however its arms arrived.
+    #[test]
+    fn a_union_of_interval_arms_is_one_interval_set() {
+        let points = Predicate::flatten_or(vec![Predicate::point(u(0)), Predicate::point(u(1))]);
+        assert_eq!(points, Predicate::at_or_below(u(1)));
+        let rest = Predicate::True.minus(&Predicate::at_or_below(u(1)));
+        assert_eq!(
+            Predicate::flatten_or(vec![rest, Predicate::point(u(0)), Predicate::point(u(1))]),
+            Predicate::True
+        );
     }
 
     #[test]
