@@ -529,3 +529,118 @@ fn a_chain_through_variant_wrap_and_project_equals_the_serial_answer() {
         assert_eq!(pooled, whole_pull(source));
     }
 }
+
+/// `code` is admitted by the plan, and on four workers with a morsel that divides no row count its
+/// answer equals the serial pull.
+fn pooled_equals_serial(code: String) {
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(code.clone());
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
+    plan(&compiled.operator_graph).unwrap_or_else(|why| panic!("{code} is admitted: {why}"));
+    let mut pooled = four_workers(code.clone());
+    let mut serial = whole_pull(code.clone());
+    pooled.compact();
+    serial.compact();
+    assert!(
+        pooled.is_terminal(),
+        "{code}: the pooled answer is complete"
+    );
+    match pooled {
+        Tile::DataFunction { .. } => assert_eq!(entries(&pooled), entries(&serial), "{code}"),
+        _ => assert_eq!(pooled, serial, "{code}"),
+    }
+}
+
+fn range_list(rows: u64) -> String {
+    let items: Vec<String> = (0..rows).map(|i| i.to_string()).collect();
+    format!("[{}]", items.join(", "))
+}
+
+/// `Restrict` keeps the keys whose predicate holds: a morsel's region names keys that were
+/// filtered out, which have no row, and the pooled collection equals the serial one.
+#[test]
+fn a_chain_through_restrict_equals_the_serial_answer() {
+    let list = range_list(100);
+    for code in [
+        format!("[x for x in {list} if x > 70]"),
+        format!("[x + 1 for x in {list} if x > 10 if x < 90]"),
+        format!("[x for x in {list} if x < 0]"),
+        // Every other key is filtered out, so each morsel's region names keys with no row.
+        format!("[x for x in {list} if x // 2 * 2 == x]"),
+        format!("sum([x for x in {list} if x > 70])"),
+    ] {
+        pooled_equals_serial(code);
+    }
+}
+
+/// `MapResultToConst` compares or pairs each row with a constant: the constant is read whole by
+/// every morsel.
+#[test]
+fn a_chain_through_map_result_to_const_equals_the_serial_answer() {
+    let list = range_list(100);
+    for code in [
+        format!("sum([1 for x in {list} if x >= 50])"),
+        format!("sum([1 for x in {list} if x + 1 >= 50])"),
+    ] {
+        pooled_equals_serial(code);
+    }
+}
+
+/// What `plan` says of `code`: the reason it refuses, or `None` when it admits.
+fn refusal(code: &str) -> Option<String> {
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(code.to_string());
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
+    plan(&compiled.operator_graph)
+        .err()
+        .map(|refused| refused.to_string())
+}
+
+/// The operand `MapResultToConst` applies must be a `Constant`: a value that another pipeline
+/// computes, as a sum read by each element, is a build side the plan does not stream, and so is
+/// an operand that is itself a chain.
+#[test]
+fn a_map_result_to_const_applies_a_constant_and_nothing_else() {
+    for (code, reason) in [
+        (
+            indoc! {"
+                n = sum([1, 2, 3])
+                [(x, n) for x in [1, 2, 3]]
+            "},
+            "a `MapResultToConst` applies a `FanOutSlot`",
+        ),
+        (
+            "[(x, sum([1, 2])) for x in [1, 2, 3]]",
+            "a `MapResultToConst` applies a `ExtractAggregate`",
+        ),
+        (
+            "[[(x, 1) for x in [1, 2]] for y in [1, 2]]",
+            "a `MapResultToConst` applies a `MapResult`",
+        ),
+    ] {
+        let refused = refusal(code).unwrap_or_else(|| panic!("{code} is refused"));
+        assert!(refused.contains(reason), "{code}: {refused}");
+    }
+}
+
+/// A streaming operator works on each key of a collection: at the outermost level a `VariantWrap`
+/// wraps a value whole and a `MapResult` applies to a scalar, so the plan refuses them, and the
+/// same operators beneath a level are admitted.
+#[test]
+fn a_streaming_operator_at_the_outermost_level_is_refused() {
+    for (code, operator) in [
+        ("`a(sum([1, 2]))", "VariantWrap"),
+        ("sum([1, 2]) >= 2", "MapResult"),
+    ] {
+        let refused = refusal(code).unwrap_or_else(|| panic!("{code} is refused"));
+        assert!(
+            refused.contains(&format!("a `{operator}` at the outermost level")),
+            "{code}: {refused}"
+        );
+    }
+    for code in ["[`a(x) for x in [1, 2, 3]]", "[x >= 2 for x in [1, 2, 3]]"] {
+        assert_eq!(refusal(code), None, "{code} is admitted");
+    }
+}

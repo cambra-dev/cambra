@@ -68,9 +68,9 @@ set.
 
 `plan` cuts the operator graph the way [docs/parallel-execution.md, "The pipeline
 plan"](../../docs/parallel-execution.md#the-pipeline-plan) describes, into pipelines listed upstream
-first. A pipeline's chain is any number of `MapResult`s whose function operand is a `Constant`,
-`MapResultWithSource`s over an `IterateExtent`, and `VariantWrap`s and `VariantProject`s, from its
-head to its breaker ([Widening the plan](#widening-the-plan)). A head is an
+first. A pipeline's chain is any number of `MapResult`s and `MapResultToConst`s whose operand is a
+`Constant`, `MapResultWithSource`s over an `IterateExtent`, and `Restrict`s, `VariantWrap`s and
+`VariantProject`s, from its head to its breaker ([Widening the plan](#widening-the-plan)). A head is an
 `IterateExtent` over a source (`Head::Source`) or a `FanOutSlot` over a `Memo` (`Head::Breaker`).
 The plan cuts at the slot: the pipeline that feeds the `Memo` ends in `Breaker::Materialize`, is
 planned once per `Memo`, and the pipeline behind it streams from it. The last pipeline ends in the
@@ -614,9 +614,9 @@ input's. An operator joins in a change of its own with a `classify` arm, a plan 
 that reaches it, a mutation check that removes the arm, and the differential suite's zero
 differences with the pin updated.
 
-`VariantWrap` and `VariantProject` share `Streaming::KeepsKeys`. `VariantWrap` answers its input's
-keys, and `VariantProject` answers only the keys whose rows carry its tag. Three candidates are not
-admitted.
+`VariantWrap`, `VariantProject` and `Restrict` share `Streaming::Unary`. `VariantWrap` answers its
+input's keys, `VariantProject` answers only the keys whose rows carry its tag, and `Restrict`
+answers the keys whose predicate holds. Three candidates are not admitted.
 
 - `Constant` as a source. A list literal compiles to an `IterateExtent` and a `Constant` operand
   that a `MapResult` applies, so a collection-valued `Constant` is never a chain's data input in
@@ -628,7 +628,23 @@ admitted.
   `MakeRecord` gives a program to test.
 - `RecordWrap`. No program of the corpus reaches it (`NOT_REACHED` in `visit_inputs_tests.rs`), so
   admitting it adds a path nothing runs. It keeps its input's keys and has a projection-guard test,
-  so it joins `Streaming::KeepsKeys` with the first program that reaches it.
+  so it joins `Streaming::Unary` with the first program that reaches it.
+
+`Restrict` is `Streaming::Unary`: it keeps a row and marks it deleted where its predicate fails
+(`RestrictProducer::get_impl`, `mark_deleted`), so a key it drops is in the morsel's region and has
+no live row, as for a `MapResult` that filters. `MainWorker::work` compacts a morsel before it
+absorbs or folds it. The threaded collector merges morsels without compacting, so its answer carries
+the deleted marks, and the pipeline tests compare after `compact`, as every pipeline test does; the
+differential suite's threaded pass covers the filtered programs. `MapResultToConst` joins
+`MapResult` as `Streaming::Applies`, a data input and an operand named by the edge (`fn`,
+`constant`); the operand must be a `Constant`, which every morsel reads whole, and any other operand
+is a build side, which stays refused (`a_map_result_to_const_applies_a_constant_and_nothing_else`).
+
+Admission also needs the operator to answer a collection over the keys its input's collection has
+(`Planner::keeps_outer_domain`): at the outermost level `MapResultToConst` reads its input whole and
+`VariantWrap` wraps it whole, and a morsel's guard would cut something they do not name. The plan
+compares the operator's tiling with its input's and refuses a mismatch
+(`a_streaming_operator_at_the_outermost_level_is_refused`).
 
 A list of variants a hundred elements long overflows the stack when the program compiles, on the
 serial path as well; the plan test uses twenty.

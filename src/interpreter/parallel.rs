@@ -142,13 +142,16 @@ pub enum Breaker {
 
 /// The streaming operators the plan admits in a chain.
 enum Streaming {
-    /// Applies a `Constant` function operand to its input.
-    MapResult,
+    /// Applies an operand to its `input`, read whole by every morsel: the `Constant` function of
+    /// a `MapResult`, the `Constant` of a `MapResultToConst`. The field is the operand edge's name.
+    Applies(&'static str),
     /// Reads a source's value at the keys of an `IterateExtent` directly beneath it.
     MapResultWithSource,
-    /// A unary operator that keeps its input's keys and answers a pull at a guard from the input's
-    /// answer at the same guard: `VariantWrap` and `VariantProject`.
-    KeepsKeys,
+    /// A unary operator whose keys are the input's, or a subset of them, and which answers a pull
+    /// at a guard from the input's answer at the same guard: `VariantWrap`, `VariantProject` and
+    /// `Restrict`. A key it drops is in the guard's region and has no row, as for a `MapResult`
+    /// that filters.
+    Unary,
 }
 
 /// What the plan does with an operator, by its kind.
@@ -161,7 +164,8 @@ enum Class {
     Cut,
     /// The `Memo` a slot reads, whose input is the pipeline that feeds it.
     Memo,
-    /// The function operand a `MapResult` applies.
+    /// A `Constant`: the operand a `MapResult` or a `MapResultToConst` applies, which every
+    /// morsel reads whole. It is never the head of a chain.
     Operand,
     /// The extract over a fold at the top of `main`.
     Extract,
@@ -175,9 +179,10 @@ enum Class {
 /// in an arm that refuses, so an operator the plan has not considered is refused rather than run.
 fn classify(kind: &str) -> Class {
     match kind {
-        "MapResult" => Class::Streaming(Streaming::MapResult),
+        "MapResult" => Class::Streaming(Streaming::Applies("fn")),
+        "MapResultToConst" => Class::Streaming(Streaming::Applies("constant")),
         "MapResultWithSource" => Class::Streaming(Streaming::MapResultWithSource),
-        "VariantWrap" | "VariantProject" => Class::Streaming(Streaming::KeepsKeys),
+        "VariantWrap" | "VariantProject" | "Restrict" => Class::Streaming(Streaming::Unary),
         "IterateExtent" => Class::Source,
         "FanOutSlot" => Class::Cut,
         "Memo" => Class::Memo,
@@ -259,13 +264,50 @@ impl Planner<'_> {
         }
     }
 
+    /// Admission is by kind, and a streaming operator is a morsel operator only where it works on
+    /// each key of a collection: its answer is a collection over the keys its input's collection
+    /// has. At the outermost level `MapResultToConst` reads its input whole and `VariantWrap`
+    /// wraps it whole, and neither answers a collection over the input's keys, so a morsel's guard
+    /// would cut something it does not name. The operator's tiling and its input's must be
+    /// collections over one extent.
+    fn keeps_outer_domain(
+        &self,
+        kind: &str,
+        own: &Tiling,
+        input: NodeId,
+    ) -> Result<(), Unsupported> {
+        let input_tiling = match self.by_id.get(&input) {
+            Some(GraphNode::Operator { tiling, .. }) => Some(tiling),
+            Some(GraphNode::Sink { .. }) | None => None,
+        };
+        match (own, input_tiling) {
+            (
+                Tiling::DataFunction { domain, .. },
+                Some(Tiling::DataFunction {
+                    domain: input_domain,
+                    ..
+                }),
+            ) if domain == input_domain => Ok(()),
+            _ => Err(Unsupported(format!(
+                "a `{kind}` at the outermost level answers other than a collection over its \
+                 input's keys"
+            ))),
+        }
+    }
+
     /// Plan the pipeline whose chain starts at `top` and ends in `breaker`, after the pipelines
     /// it streams from, and say where it is in the plan.
     fn pipeline(&mut self, top: NodeId, breaker: Breaker) -> Result<usize, Unsupported> {
         let mut at = top;
         let (head, streams_from) = loop {
             let node = self.by_id.get(&at).copied();
-            let Some(GraphNode::Operator { kind, inputs, .. }) = node else {
+            let Some(GraphNode::Operator {
+                kind,
+                inputs,
+                tiling,
+                ..
+            }) = node
+            else {
                 return Err(Unsupported("the chain reaches no source".into()));
             };
             match classify(kind) {
@@ -313,14 +355,14 @@ impl Planner<'_> {
                         self.pipeline(upstream.subscribed, Breaker::Materialize { memo })?;
                     break (Head::Breaker, vec![planned]);
                 }
-                Class::Streaming(Streaming::MapResult) => {
+                Class::Streaming(Streaming::Applies(operand)) => {
                     let edge = |role: &str| {
                         inputs
                             .iter()
                             .find(|edge| matches!(edge.role, EdgeRole::Named(name) if name == role))
                     };
-                    let (Some(data), Some(function)) = (edge("input"), edge("fn")) else {
-                        return Err(Unsupported("a `MapResult` without its two inputs".into()));
+                    let (Some(data), Some(function)) = (edge("input"), edge(operand)) else {
+                        return Err(Unsupported(format!("a `{kind}` without its two inputs")));
                     };
                     // The chain is a tree the walk descends once: an edge wired through a
                     // `CycleSlot` closes a cycle, and a `Share` edge reaches a fan, which a
@@ -332,25 +374,28 @@ impl Planner<'_> {
                             ));
                         }
                     }
+                    self.keeps_outer_domain(kind, tiling, data.subscribed)?;
+                    let applier = kind;
                     match self.kind_of(function.subscribed) {
                         Some(kind) if matches!(classify(kind), Class::Operand) => {}
                         Some(kind) => {
                             return Err(Unsupported(format!(
-                                "a `MapResult` applies a `{kind}`, and only a `Constant` is \
+                                "a `{applier}` applies a `{kind}`, and only a `Constant` is \
                                  streamed"
                             )));
                         }
                         None => {
-                            return Err(Unsupported(
-                                "a `MapResult` applies something the graph holds no operator for"
-                                    .into(),
-                            ));
+                            return Err(Unsupported(format!(
+                                "a `{applier}` applies something the graph holds no operator for"
+                            )));
                         }
                     }
                     at = data.subscribed;
                 }
-                Class::Streaming(Streaming::KeepsKeys) => {
-                    at = owned_input(kind, inputs)?.subscribed;
+                Class::Streaming(Streaming::Unary) => {
+                    let input = owned_input(kind, inputs)?;
+                    self.keeps_outer_domain(kind, tiling, input.subscribed)?;
+                    at = input.subscribed;
                 }
                 // Reads a source's value at each key of its input: the keys are the input's, so
                 // the chain streams.
@@ -2752,7 +2797,7 @@ mod tests {
     }
 
     /// The plan classifies every operator kind the corpus of compiled programs holds on purpose:
-    /// exactly six are admitted in a chain, and every other kind is refused with its own name.
+    /// exactly eight are admitted in a chain, and every other kind is refused with its own name.
     #[test]
     fn every_operator_kind_the_corpus_holds_is_classified_on_purpose() {
         use crate::interpreter::tile_operators::visit_inputs_tests::survey;
@@ -2774,7 +2819,9 @@ mod tests {
                 "FanOutSlot",
                 "IterateExtent",
                 "MapResult",
+                "MapResultToConst",
                 "MapResultWithSource",
+                "Restrict",
                 "VariantProject",
                 "VariantWrap"
             ],
