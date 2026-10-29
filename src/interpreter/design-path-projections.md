@@ -2,10 +2,11 @@
 
 A projection names the part of a producer's tile a pull asks for
 (`src/interpreter/design-operators.md`, "Projection guards"). This note specifies projections that
-name keys at any collection level, each under the path of keys above it. A producer declares the
-levels whose keys it restates (`TileProducer::restates`, a `Restates`), the outermost keys only by
-default, and one that declares more reads its projection with `TileGuard::projection_for`. The `get`
-wrapper of a debug build panics on a pull at a level a producer does not restate.
+name keys at any collection level, each under the path of keys above it, and the guard differences
+they need. A producer declares the levels whose keys it restates (`TileProducer::restates`, a
+`Restates`), the outermost keys only by default, and one that declares more reads its projection
+with `TileGuard::projection_for`. The `get` wrapper of a debug build panics on a pull at a level a
+producer does not restate.
 
 ## Representation
 
@@ -41,3 +42,28 @@ qualified by the paths kept (`within_paths`). A statement above level 𝑛 keeps
 path the predicate admits, which the arms of the projection's guard name above level 𝑛, and states
 the rest of what it said at level 𝑛, cut to the predicate. `Tile::within` checks the same paths.
 
+## Differences of nested guards
+
+`guard_minus` (`tile_operators/mod.rs`) takes the difference of two guards of a collection's keys
+at any levels as their projections differ. A breaker holding the keys `k` and released up to the
+path `(k, j)` holds a guard with arms at two levels, `TileGuard::Or` of the keys not released and
+the paths of row `k` past `j`:
+
+```
+held      = Domain(k ∈ {0, 1})
+released  = Codomain(Domain(Qualified { enclosing: k = 0, here: j ≤ 1 }))
+held − released = Or [ Domain(k = 1), Codomain(Domain(Qualified { enclosing: k = 0, here: j > 1 })) ]
+```
+
+A release can also carry an arm of cells beneath keys. A selector releases every field but its own
+at every path (`guard_at_field`, `fan.rs`), and a `FanOut` releases the meet of its readers'
+releases, which keeps an arm of the fields one reader skipped beneath the keys another released
+whole. `guard_minus` takes the arms of keys out as projections. Where every other arm is a codomain
+guard naming nothing of what the arms of keys leave, the difference is that region, and
+`guard_minus` panics on any other arm:
+
+```
+held      = Domain(True)
+released  = Or [ Domain(k = 0), Codomain(Record { _0: ∅, _1: Domain(Qualified { enclosing: k = 0, here: True }) }) ]
+held − released = Domain(k ≠ 0)
+```
