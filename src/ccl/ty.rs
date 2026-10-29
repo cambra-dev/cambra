@@ -430,6 +430,15 @@ impl FunKind {
         }
     }
 
+    /// Whether a function of this kind has **its domain as its data**: every kind but one
+    /// known to be a capability. A joined binder's refinement on such a domain states the
+    /// collection's keys, which have no join, so it is kept rather than dropped
+    /// ([`crate::ccl::subst::Mapping::Join`]). A kind nothing has settled counts, so an
+    /// undecided domain is reported rather than widened.
+    pub fn has_data_domain(&self) -> bool {
+        !matches!(self.resolved(), KindPin::Compute)
+    }
+
     /// Whether a function of this kind may be **a sum** — its slot is filled, or its
     /// variable has not yet been narrowed away from one.
     ///

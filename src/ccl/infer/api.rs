@@ -12,9 +12,11 @@ use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates, walk_refined_predicates_mut};
+use crate::ccl::infer::solver::compact::JoinedPosition;
 use crate::ccl::infer::solver::display::InferredPoly;
 use crate::ccl::infer::solver::traits::InstanceTable;
 use crate::ccl::provenance::NodeId;
+use crate::ccl::subst::Subst;
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
     Expr, FieldKey, HistoryKind, InferVarId, Name, Type, TypedBinding, TypedExprNode,
@@ -392,6 +394,26 @@ pub enum InferError {
         /// source and once in CCL. A caller that has no span can still reach it.
         origin: String,
     },
+    /// A feed or a mutable variable receives a value whose collection keys or function
+    /// parameter depend on a binder bound between the target's declaration and the write,
+    /// which the contribution's edge joins over (`src/ccl/design/type-inference.md`, "A
+    /// contribution crosses the binders after its target"). The target's type is the join over
+    /// every value written to it. Collections over different keys have no join
+    /// (`docs/chl-spec.md`, "Joining the types of several values"), and the join of functions
+    /// over different parameters accepts only what each one accepts, which inference does not
+    /// state.
+    NoJoinOverBinder {
+        /// The binders the predicate depends on.
+        binders: Vec<Name>,
+        /// The mutable variables whose reads the predicate depends on, each read taking one
+        /// value per iteration or call. Inference reports these among `binders`, as the
+        /// binders naming the reads, and [`InferError::respell`] moves them here.
+        reads: Vec<Name>,
+        /// The predicate stating the keys or the parameter.
+        predicate: Rc<Expr>,
+        /// Whether `predicate` states a collection's keys or a function's parameter.
+        position: JoinedPosition,
+    },
     /// The expression kind is not yet handled by this inference pass.
     Unsupported(String),
     /// A [`crate::ccl::TypedExprNode::Case`] with no branches was encountered.
@@ -691,14 +713,40 @@ impl InferError {
         unsited(self).same_defect(&unsited(other))
     }
 
-    /// Rewrite every type this error renders through `f`.
+    /// Rewrite every binder this error renders through `rename`: each type it
+    /// carries ([`Self::map_types`]), and the binders and predicate a
+    /// [`InferError::NoJoinOverBinder`] names.
     ///
-    /// The one caller is the diagnostic boundary in
-    /// [`compile_program`](crate::ccl::context::compile_program), which respells
+    /// The callers are the diagnostic boundaries in
+    /// [`compile_program`](crate::ccl::context::compile_program), which respell
     /// the binders [`crate::ccl::mut_read`] names a mutable variable's reads with
     /// (see [`read_respelling`](crate::ccl::mut_read::read_respelling)). A
     /// message is the only thing downstream of this: an error has left inference
     /// by the time it arrives, so nothing reasons with the types again.
+    pub(crate) fn respell(&mut self, rename: &Subst) {
+        if let InferError::NoJoinOverBinder {
+            binders,
+            reads,
+            predicate,
+            ..
+        } = self
+        {
+            // A variable read at two places has two read binders, and is listed once.
+            binders.retain(|binder| match rename.renamed(binder) {
+                Some(variable) => {
+                    if !reads.contains(variable) {
+                        reads.push(variable.clone());
+                    }
+                    false
+                }
+                None => true,
+            });
+            *predicate = Rc::new(rename.apply_expr(predicate));
+        }
+        self.map_types(&|ty| rename.apply_type(ty));
+    }
+
+    /// Rewrite every type this error renders through `f`.
     ///
     /// Every type the variants carry is mapped, the trait-instance base types
     /// included. A rewrite that means nothing for a base type costs nothing
@@ -764,8 +812,10 @@ impl InferError {
                 within.iter_mut().for_each(|(_, t)| each(t));
             }
             InferError::UnresolvedMethod { receiver, .. } => receiver.iter_mut().for_each(each),
-            // No type to render: these carry a name, an id, or a rendered label.
+            // No type to render: these carry a name, an id, a rendered label, or (the
+            // binder join) a term `respell` rewrites.
             InferError::UnboundVariable(_)
+            | InferError::NoJoinOverBinder { .. }
             | InferError::Unsupported(_)
             | InferError::EmptyCase { .. }
             | InferError::UnresolvedHole { .. }
@@ -1446,6 +1496,50 @@ impl std::fmt::Debug for InferError {
                      arm in `box` to keep them.",
                     listed.join(" vs ")
                 )
+            }
+            InferError::NoJoinOverBinder {
+                binders,
+                reads,
+                predicate,
+                position,
+            } => {
+                let spelled =
+                    |names: &[Name]| names.iter().map(|n| format!("`{n}`")).collect::<Vec<_>>();
+                let mut depends = Vec::new();
+                if !binders.is_empty() {
+                    depends.push(format!(
+                        "{}, bound between the target's declaration and the write",
+                        spelled(binders).join(", ")
+                    ));
+                }
+                if !reads.is_empty() {
+                    depends.push(format!(
+                        "{}, read between the target's declaration and the write where the read \
+                         takes one value per iteration or call",
+                        spelled(reads).join(", ")
+                    ));
+                }
+                let predicate = symbolic(predicate);
+                let depends = depends.join("; and on ");
+                match position {
+                    JoinedPosition::Keys => write!(
+                        f,
+                        "Type Inference Error: the keys of a collection written to a feed or \
+                         mutable variable depend on {depends}\n\
+                         Keys: {predicate}\n\
+                         The target's type is the join of every value written to it, and \
+                         collections over different keys have no join."
+                    ),
+                    JoinedPosition::Parameter => write!(
+                        f,
+                        "Type Inference Error: the parameter of a function written to a feed or \
+                         mutable variable depends on {depends}\n\
+                         Parameter: {predicate}\n\
+                         The target's type is the join of every value written to it, and the \
+                         join of functions over different parameters accepts only what every \
+                         one of them accepts, which inference does not state."
+                    ),
+                }
             }
             InferError::MutNotBareVariable { at } => {
                 write!(

@@ -447,6 +447,16 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
             domains,
             origin: ctx_label.to_string(),
         },
+        CoalesceError::NoJoinOverBinder {
+            binders,
+            refinement,
+            position,
+        } => InferError::NoJoinOverBinder {
+            binders,
+            reads: Vec::new(),
+            predicate: refinement.predicate,
+            position,
+        },
         // The same violation `check_scope_valid` reports post-inference, caught where it is
         // made: a materialized type carrying a witness reference no binder covers. A
         // compiler bug in whatever built the position, like `KindConflict` below.
@@ -711,11 +721,12 @@ pub(crate) fn run_with_params(
     // state, so nothing needs to be kept in sync across them.
     // Each coalesce error arrives blamed on the node whose rule raised it, so
     // this pass's (potentially several) errors need no post-hoc attribution.
-    let errors = coalesce_pass(
+    let mut errors = coalesce_pass(
         expr,
         std::mem::take(&mut sub_ctx.bound_at_annotation),
         Rc::clone(instances),
     );
+    sub_ctx.name_varying_binders(&mut errors);
     if !errors.is_empty() {
         return Err(errors);
     }

@@ -52,6 +52,8 @@ use panic_message::panic_message;
 /// outside this list and [`UNDEFINED`] to agreement and every cell here to its kind, so a fix
 /// that makes one agree removes it, and a cell that starts failing another way fails the grid.
 const BROKEN: &[(&str, &str, &str)] = &[
+    ("def_feed_called_twice", "rows_sum", "CompilerPanics"),
+    ("def_feed_through_a_def", "rows_sum", "CompilerPanics"),
     ("function_body", "rows_sum", "CompilerPanics"),
     ("generator_yield", "rows_sum", "CompilerPanics"),
     (
@@ -582,6 +584,30 @@ fn skeletons() -> Vec<Skeleton> {
                 ch << {}
             out = test_sink()
             out << sum(ch)
+        "#}},
+        // A `def` feeding a handle declared outside it feeds from each call site naming it.
+        Skeleton { name: "def_feed_called_twice", hole: Ty::Int, scope: &[("y", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            def feed_under_test(y):
+                out << {}
+            feed_under_test(1)
+            feed_under_test(2)
+        "#}},
+        Skeleton { name: "def_feed_through_a_def", hole: Ty::Int, scope: &[("y", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            def feed_under_test(y):
+                out << {}
+            def caller(z):
+                feed_under_test(z)
+            out << 0
+            caller(1)
+        "#}},
+        // A `def` never called feeds from nowhere.
+        Skeleton { name: "def_feed_never_called", hole: Ty::Int, scope: &[("y", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            def feed_under_test(y):
+                out << {}
+            out << 0
         "#}},
         Skeleton { name: "two_feed_sites", hole: Ty::Int, scope: &[("i", Ty::Int)], body: indoc! {r#"
             out = test_sink()

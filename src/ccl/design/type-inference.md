@@ -2225,6 +2225,73 @@ the body's refinements, so a refinement naming a binder bound outside the functi
 (`a_function_s_codomain_drops_its_body_s_opaque_binders`, case `bound_outside`, in
 `tests/it/type_check.rs`).
 
+#### A contribution crosses the binders after its target
+
+A feed (`<<`), a define (`<<=`) and a mutable write (`:=`, keyed or not) contribute to a history
+whose value type stands where the target is bound. The write stands inside every binder entered
+since, so the contribution can name binders the history's type cannot, and no scope exit of the
+value path lies between them. `InferCtx::require_contribution` records the contribution on a
+variable minted in the target's scope, through a lower edge carrying one exit per crossed binder,
+innermost first. The crossed binders are the telescope entries entered after the target's own
+(`Telescope::split_at`); a handle has no surface syntax as a parameter, so a target is always in
+lexical scope at the write.
+
+Emission records each binder's exit as it enters the binder (`ScopeExit`), and `close_let_type`
+reads the same entry when it lifts a `let` body's type past its binding:
+
+| Binder | `ScopeExit` | Exit of a crossing |
+| --- | --- | --- |
+| A transparent `let` whose definition typed | `Discharge` | `[𝑥 ↦ definition]` |
+| An opaque `let`, a `:=` binder or definiens, a failed or poisoned definition | `Keep` | None: the name stays |
+| A lambda's, loop's or pattern's binder, a `letrec` member, a chain's intermediate | `Join` | `Mapping::Join` |
+
+A kept binder inside a joined binder of the crossing holds one value per value of the joined one,
+so it is joined over as well.
+
+A history's type is the join of every value written to it (`docs/chl-spec.md`, "Joining the types
+of several values"). The contribution is joined over the values of each joined binder. A loop's or
+lambda's binder takes one per iteration or call; a pattern's binder takes one per evaluation of its
+`match`. A join mapping has no term. Where the solver forces the edge, compaction composes it into
+the accumulated substitution, and a refinement naming a joined binder is decided by its position:
+
+- On a sum's candidate, the candidate widens to `SubtypesOf` what remains and the candidates' kinds
+  join. A row `box([v for v in xs if v > r])` fed from a loop over `r` contributes
+  `Σ (σ : SubtypesOf(0..3)). σ ⤇ Int`.
+- In a data function's domain, or a function's whose kind is not known to be compute
+  (`FunKind::has_data_domain`), there is no join: each value has its own keys. Compaction records
+  a `JoinViolation` and coalescing reports `NoJoinOverBinder`.
+- Elsewhere at positive polarity, it is dropped: the join keeps what every value establishes.
+- Elsewhere at negative polarity, as in a compute function's domain, dropping it narrows the type:
+  the join of `{𝐷 | 𝑝(𝑟)} ⇒ 𝑉` over `𝑟` accepts only what every value of `𝑟` accepts. Compaction
+  does not compute that refinement, so it records a `JoinViolation` and coalescing reports
+  `NoJoinOverBinder` naming the parameter.
+
+`Subst::apply_type` drops the refinement wherever it is not a data domain, since it has no
+polarity. Its readers of a joined edge, the occurrence sweep and the position lookups, read a
+type's shape; compaction alone materializes one.
+
+A discharge whose definition names a joined binder composes into a join (`Subst::then`), so `k = r`
+inside a loop over `r` is joined over as `r` is, and the error names `r`
+(`InferCtx::name_varying_binders`). The decision is syntactic: a domain naming a joined binder has
+no join even where its keys are the same for every value. Check mode trusts the types recorded at a
+feed or a write, so only emission records the edge.
+
+A `def`'s parameter is joined over however many calls reach the `def`. Inference types the body
+once, before any call site supplies an argument, so `def f(y): out << [v for v in xs if v > y]` is
+refused with `NoJoinOverBinder` when `f` is called once as well.
+
+**[Planned]** A binder that the target's key or a term in scope determines is discharged rather
+than joined over. A loop variable crossed by a feed is the loop's source read at the channel key's
+position, and a pattern binder is the scrutinee's payload. Until then both are joined over, and a
+collection whose keys read one is refused with `NoJoinOverBinder`.
+
+A `def` whose body writes to a handle declared outside it is generalized like any other `def`, so a
+variable its contribution carries must not be quantified. A `let` of a `Defer` binds
+monomorphically, and `emit_let` mints the channel's element variable at the binding's level rather
+than the right-hand side's. The edge from `def f(y): out << y` into `out` then lowers `y`'s variable
+to that level, `f` is monomorphic in `y`, and the channel receives what each call passes rather
+than the generic variable.
+
 #### Discharge is application
 
 A discharge-bearing bound represents applying a type family to a term argument. Its substitution
