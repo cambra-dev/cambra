@@ -57,6 +57,8 @@ mod growing;
 mod helpers;
 mod iterate;
 mod lookup;
+#[cfg(test)]
+mod loop_breaker_tests;
 mod map;
 mod reshape;
 mod scalar;

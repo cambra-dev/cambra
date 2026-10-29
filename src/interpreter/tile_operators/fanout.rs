@@ -397,6 +397,24 @@ impl FanOut {
             .map(|r| r.cached_tile.clone())
     }
 
+    /// Advance a cyclic fan-out's input by one pull at its universal guard and answer what it
+    /// served, which every slot is then answered from while a pull is in flight. A store's
+    /// fan-out decides the positions its body offers by this one pull, so a loop advances one
+    /// step per call however many notifications its cycle raised.
+    ///
+    /// # Panics
+    ///
+    /// When the fan-out is not cyclic, no slot has been subscribed, or a pull of its input is
+    /// in flight.
+    pub fn step(&self) -> Tile {
+        assert!(
+            self.shared.borrow().reentrancy.is_some(),
+            "only a cyclic fan-out steps"
+        );
+        step(&self.shared, self.tiling.universal_guard())
+            .expect("a stepped fan-out has a subscribed input and no pull in flight")
+    }
+
     /// Whether every subscriber has released everything this fan-out could
     /// offer.
     ///
@@ -707,6 +725,31 @@ impl FanOutProducer {
     }
 }
 
+/// One pull of a cyclic fan-out's input at `guard`, kept as the snapshot a re-entrant sibling is
+/// served: the input is taken out of `shared` for the pull, so a slot pulled from inside it finds
+/// none and reads the snapshot, and is put back on every exit. `None` while a pull already holds
+/// the input.
+///
+/// The snapshot is replaced rather than merged: the inputs a recurrence closes through, a store
+/// and a `Memo`, answer cumulative tiles.
+fn step(shared_rc: &Rc<RefCell<FanOutShared>>, guard: TileGuard) -> Option<Tile> {
+    let producer = shared_rc.borrow_mut().producer.take()?;
+    // RAII: the guard puts the producer back into `shared` on any exit, so a panic from the
+    // inner `get` does not leave the fan-out without its input.
+    let mut taken = TakenProducerGuard {
+        shared: shared_rc,
+        producer: Some(producer),
+    };
+    let tile = taken.producer.as_mut().expect("taken above").get(guard);
+    shared_rc
+        .borrow_mut()
+        .reentrancy
+        .as_mut()
+        .expect("a stepped fan-out is cyclic")
+        .cached_tile = tile.clone();
+    Some(tile)
+}
+
 impl TileProducer for FanOutProducer {
     impl_producer_base!();
 
@@ -790,45 +833,25 @@ impl TileProducer for FanOutProducer {
         // non-cyclic mode, the producer stays in `shared` and we pull
         // through a regular borrow.
         let mut result = if cyclic {
-            let producer_opt = shared_rc.borrow_mut().producer.take();
-            if let Some(producer) = producer_opt {
-                // RAII: put the producer back into `shared` on any exit
-                // path (success or panic).  Without this guard, a panic
-                // from `producer.get(...)` would leave `shared.producer
-                // = None` forever, silently breaking every subsequent
-                // pull on this fan-out.
-                let mut guard = TakenProducerGuard {
-                    shared: &shared_rc,
-                    producer: Some(producer),
-                };
-                let tile = guard.producer.as_mut().unwrap().get(projection_guard);
-                trace!("{} received {tile:?}", self.name());
-                // Refresh the re-entrancy cache before the guard drops.
-                // We replace (not merge) — inner producers like `Memo`
-                // already return cumulative tiles, so each pull
-                // supplants the previous cached snapshot.
-                shared_rc
-                    .borrow_mut()
-                    .reentrancy
-                    .as_mut()
-                    .unwrap()
-                    .cached_tile = tile.clone();
-                tile
-                // `guard` drops here, restoring `shared.producer`.
-            } else {
-                // Re-entrant pull: another slot's outer `get_impl` is
-                // currently holding the producer.  Serve the latest known
-                // emission instead of re-entering the inner producer (which
-                // would alias `&mut`).
-                let cached = shared_rc
-                    .borrow()
-                    .reentrancy
-                    .as_ref()
-                    .unwrap()
-                    .cached_tile
-                    .clone();
-                trace!("{} serving cached (re-entrant): {cached:?}", self.name());
-                cached
+            match step(&shared_rc, projection_guard) {
+                Some(tile) => {
+                    trace!("{} received {tile:?}", self.name());
+                    tile
+                }
+                None => {
+                    // Re-entrant pull: another slot's outer `get_impl` is currently holding
+                    // the producer. Serve the latest known emission instead of re-entering the
+                    // inner producer (which would alias `&mut`).
+                    let cached = shared_rc
+                        .borrow()
+                        .reentrancy
+                        .as_ref()
+                        .unwrap()
+                        .cached_tile
+                        .clone();
+                    trace!("{} serving cached (re-entrant): {cached:?}", self.name());
+                    cached
+                }
             }
         } else {
             shared_rc
