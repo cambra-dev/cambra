@@ -735,16 +735,16 @@ its readers from that state. `BreakingProducer`, a subtrait of `TileProducer`
 | `finalize()` | Returns what the breaker holds as a guard of its tiling: the guard of the cached tile less the guard its readers have released. It asserts that the input has stated everything complete, and wakes no one. |
 | `offer_impl(guard)` | Answers from the state `consume_impl` built and pulls nothing. The breaker's own `get_impl` calls it once the breaker is consuming. |
 
-`Memo`, `Aggregate` and `ExtractAggregate` are breakers. A breaker starts in the pull mode described
-in [The producer protocol](#the-producer-protocol) and is a consuming producer from its first
-`consume_impl`, which it stays. `finalize` is provided over two accessors, `input()` and `held()`:
-it asserts that the input has been released whole and returns `held()` less the guard released to
-the breaker. A release removes rows from the state and leaves the statement of the tile as it was,
-so the difference is taken in the guard algebra. `guard_minus` (`tile_operators/mod.rs`) spells it
-for guards of a collection's outermost keys, of a scalar and of an aggregation, none of them
-qualified by an enclosing path, and for a record of such guards field by field. A state of another
-shape, such as a release named beneath the keys of a group, has no spelling, and `finalize` panics
-naming the gap instead of answering a smaller or larger region.
+`Memo`, `Aggregate`, `ExtractAggregate` and `MapAggregate` are breakers. A breaker starts in the
+pull mode described in [The producer protocol](#the-producer-protocol) and is a consuming producer
+from its first `consume_impl`, which it stays. `finalize` is provided over two accessors, `input()`
+and `held()`: it asserts that the input has been released whole and returns `held()` less the guard
+released to the breaker. A release removes rows from the state and leaves the statement of the tile
+as it was, so the difference is taken in the guard algebra. `guard_minus` (`tile_operators/mod.rs`)
+spells it for guards of a collection's outermost keys, of a scalar and of an aggregation, none of
+them qualified by an enclosing path, and for a record of such guards field by field. A state of
+another shape, such as a release named beneath the keys of a group, has no spelling, and `finalize`
+panics naming the gap instead of answering a smaller or larger region.
 
 ### Memo
 
@@ -771,6 +771,17 @@ once the aggregation is terminal. A terminal aggregation states all of itself re
 released; a partial one states nothing releasable, so it is left in place for the next consume and
 the extraction holds nothing. The value is final once the input has been released whole, and stays
 until the consumer releases the output.
+
+### MapAggregate
+
+A consuming `MapAggregate` folds each group the input answers at the guard into the group's
+accumulator and keeps what the answers state about completeness, united across consumes. A group is
+final per key once the input states it complete, and `finalize` asserts that the input has drained,
+so every group it holds is final. The guard it returns is the guard of the output built from the
+accumulators, less the guard released. The input releases a complete group whole and an open one
+only beneath its key, so a group that arrives later in a region already consumed is still the
+input's to answer. A release of the output drops the accumulators it covers and forwards to the
+input, as in pull mode.
 
 Nothing calls the three methods outside unit tests: no scheduler runs pipelines, and how a driver
 reaches a breaker from a program's roots is not decided.
