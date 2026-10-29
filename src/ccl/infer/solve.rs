@@ -12,8 +12,8 @@ use crate::ccl::infer::InferError;
 use crate::ccl::infer::emit::{read_mut, read_through};
 use crate::ccl::infer::solver::barrier::EdgeReport;
 use crate::ccl::infer::solver::traits::{
-    Assoc, Implementation, InstanceBody, InstanceTable, OperatorCall, Signature, TraitInstance,
-    function_over, replace_params,
+    Assoc, Implementation, InstanceBody, InstanceHead, InstanceTable, OperatorCall, Signature,
+    TraitInstance, function_over, replace_params,
 };
 use crate::ccl::infer::solver::{
     CoalesceError, ConstrainCache, FreshenCache, FreshenLevel, SpecKey, coalesce_compact,
@@ -1914,6 +1914,28 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             Ok(None) => {}
         }
     }
+    // A method call emission deferred becomes a use of the method its receiver's type
+    // selected, before anything reads the node, as one resolved where it stands already is
+    // (`src/ccl/design/nominal-types.md`, "Method calls"). Every one is selected: emission
+    // refuses one its definition leaves open, and coalescing follows no error.
+    if let TypedExprNode::Method {
+        candidates,
+        deferred: Some(call),
+        ..
+    } = &mut expr.node
+    {
+        let selected = call
+            .selected_instance()
+            .expect("emission refuses a method call nothing resolves");
+        let [InstanceHead::Nominal(decl)] = selected.heads() else {
+            unreachable!("a method's row is headed by the type declaring it")
+        };
+        let at = candidates
+            .iter()
+            .position(|c| c.decl == *decl)
+            .expect("a deferred call keeps the candidate it reaches for each row it can select");
+        expr.node = candidates.swap_remove(at).function.node;
+    }
     // Specialization stamps the resolved type itself; skip the generic tail.
     // Shadow markers prevent lookup through a same-named inner binder.
     if let TypedExprNode::Var(name) = &expr.node
@@ -2211,7 +2233,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             coalesce_node(payload, level, ctx);
         }
         TypedExprNode::Method { .. } => {
-            unreachable!("emission resolves every method; none reaches coalesce")
+            unreachable!("a method call is a use of its method before its children are walked")
         }
         // A leaf; its instance is chosen once its type and operands resolve, below.
         TypedExprNode::TraitFn { .. } => {}

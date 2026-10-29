@@ -3231,14 +3231,18 @@ segments decides. A qualified field label followed by call parentheses is an err
 belongs to a type and not to a module. Calling the function such a field holds is written
 `(r.mod2::f1)(args)`.
 
-**A method call needs its receiver's type.** `x.m()` resolves `m` from the type of `x`. When
-nothing that precedes the call determines that type to be a nominal type, the call is a type error
-that asks for an annotation on `x`. What precedes a call is the program text before it and the
-clauses of each comprehension the call stands in, which bind the names its element reads
-([3.12 Comprehensions](#312-comprehensions)): in `[p.cents() for p in prices]`, the type of
-`prices` determines the type of `p`. A polymorphic `def` therefore calls no method on a value whose
-type is one of its type parameters. An operation that works across types is a trait's function,
-read from an instance, `summon(Area(_))::area(s)`
+**A method call needs its receiver's type.** `x.m()` resolves `m` from the type of `x`, which
+anything in the program may determine, before or after the call. Where that type is part of a
+polymorphic binding's type, only the binding's definition determines it, since each use instantiates
+the binding's type at its own types ([6.10 Polymorphic types](#610-polymorphic-types)). In
+`[p.cents() for p in prices]`, the type of `prices` determines the type of `p`. In
+`apply_to(\p -> p.cents(), price)`, where the first parameter of `apply_to` is declared
+`Price => Int`, passing the lambda does. A `def inner(u): p.cents()` nested in a `def outer(p)` has
+a type that does not contain the type of `p`, so a statement of `outer` after `inner` may determine
+it. When nothing determines that type to be a nominal type, the call is a type error that asks for
+an annotation on `x`. A polymorphic `def` therefore calls no method on a value whose type is one of
+its type parameters, or on one only its uses would determine. An operation that works across types
+is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 ([Summoning an instance](#summoning-an-instance)).
 
 - **A trait's functions are not methods.** `x.m()` names only a method of `x`'s type, so a type's

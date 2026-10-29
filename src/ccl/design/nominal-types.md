@@ -224,33 +224,77 @@ no type the module declares or its qualifiers reach declares, and that no module
 declares in public (`LoweringContext::reached_methods`), is a lowering error.
 
 Inference resolves the placeholder where it emits the application (`resolve_method`, called from
-`emit_apply`). The argument is emitted first, as for every application, so the receiver is typed by
-everything the program states before the call: the constraints emission has drawn when it reaches
-the call. Those come from the receiver's own expression, the definitions of the bindings it names,
-parameters' annotations, the declared results of the functions it calls, a comprehension's source,
-and an earlier call of a chain, whose function is resolved and emitted first. A function of the same
-`impl` block counts as before the call, since the group emits it before the call is resolved. A use
-after the call does not, so a lambda's parameter typed only by the lambda's application is
-unresolved at a method call in its body. `what_states_a_receivers_type_before_its_call` names each
-case. A lambda applied where it stands has its parameter
-related to the argument before its body is emitted, as a `let` binds its value, and a
-comprehension's generator is one: its element reads each binder's type from the source. The receiver
-is the argument, or the first component of its tuple type when the call passes arguments. That type
-names a nominal head, directly or through the bounds its variable has gathered, or the call is an
-error asking for an annotation on the receiver: no later use decides it (`docs/chl-spec.md`,
-"Associated functions and methods"). The first candidate of the head's declaration whose binding
-is in scope at the call replaces the placeholder (`Typing::binds`), and the application is emitted
-as any call of a `def`. Every copy of a type's method is one function, since an associated function
-reaches nothing a run gives its module, so a run's copy and a shared import's are interchangeable.
-With none in scope, the first candidate lowering found is chosen, and it is unbound there, as a
-module function called above its `def` is. A copy linking added is never chosen out of scope. The
-other candidates are dropped without being emitted, so one whose `def` stands later in the module
-than the call reports nothing. Each candidate records the
-parameters its method declares after `self`, and a call passing another number of arguments is an
-error naming the method and both counts. A head with no candidate is an error naming the type and
-the method, and a type that is not nominal is an error saying it has no methods. No `Method` node
-survives inference. A method no type declares is a lowering error pointing at `(r.f)(…)`, the call
-of a field's function, and a position, `t.0(…)`, names no method.
+`emit_apply`), once the argument is emitted, as for every application. The receiver is the
+argument, or the first component of its tuple type when the call passes arguments. Where that type
+already names a nominal head, directly or through the bounds its variable has gathered, the call is
+resolved where it stands. The constraints emission has drawn by then come from the receiver's own
+expression, the definitions of the bindings it names, parameters' annotations, the declared results
+of the functions it calls, a comprehension's source, and an earlier call of a chain, whose function
+is resolved and emitted first. A lambda applied where it stands has its parameter related to the
+argument before its body is emitted, as a `let` binds its value, and a comprehension's generator is
+one: its element reads each binder's type from the source.
+`what_states_a_receivers_type_before_its_call` names each case. The first candidate of the head's
+declaration whose binding is in scope at the call replaces the placeholder (`Typing::binds`), and
+the application is emitted as any call of a `def`. Every copy of a type's method is one function,
+since an associated function reaches nothing a run gives its module, so a run's copy and a shared
+import's are interchangeable. With none in scope, the first candidate lowering found is chosen, and
+it is unbound there, as a module function called above its `def` is. A copy linking added is never
+chosen out of scope. The other candidates are dropped without being emitted, so one whose `def`
+stands later in the module than the call reports nothing. Each candidate records the parameters its
+method declares after `self`, and a call passing another number of arguments is an error naming the
+method and both counts. A head with no candidate is an error naming the type and the method, and a
+type that is not nominal is an error saying it has no methods.
+
+Where nothing names the receiver's type yet, the call waits for it (`defer_method`), as a trait
+function's call waits for its instance
+([type-inference.md, "Trait functions"](type-inference.md#trait-functions)). A waiting call is an
+obligation of the method's trait, `m(Self ⇝ method)` (`Trait::method`), placed on the receiver as
+an operator's is placed on its operands. Its rows are the types declaring the method, each with the
+candidate the call reaches for it by the rule above (`MethodRow`). A row's target (`MethodTarget`)
+is one of three:
+
+- the method's scheme, where its binding is bound at the call;
+- a function of the block under emission that is not emitted yet, which emission emits only once
+  the row is selected, since emitting it may reach the function the call stands in;
+- the error a call resolved there would raise: a binding not in scope, another number of
+  parameters, or the function under emission, which calling would make a cycle.
+
+The placeholder keeps the reached candidates and the obligation, and is typed by a fresh variable,
+the obligation's associated position, which the application relates to the argument and the
+result.
+
+The receiver's type reaches the obligation as an operand's does, from below, and a nominal type
+bounding the receiver from above reaches it too (`traits::notify_upper`), since only that type is
+below it. The first nominal head selects its row (`TraitObligation::select_method`). A scheme is
+instantiated there (`TraitObligation::instantiate_method`), at the call's level and telescope, as
+the `Var` rule instantiates a use. Each bound it opens is checked, each requirement becomes a
+condition answered by the assumptions in scope at the call, and its type flows into the
+placeholder's variable. A function of a block is left to emission, which emits it and instantiates
+it as the rule that selected it ends (`instantiate_selected_methods`, from `emit_node`), and before
+a definition is generalized. A rule that fails drops the calls it selected, which report nothing,
+as a failed statement's waiting calls do. A type with no row, a type that is not nominal and a type
+parameter fail the obligation where they arrive, with the error the call would raise where it
+stands. A row's error is raised as the row is selected (`ConstrainError::MethodUnreachable`). The
+requirement sweep skips the obligation, whose rows name no base, and no inferred type states it.
+
+A waiting call resolves within the definition whose scheme carries it (`docs/chl-spec.md`,
+"Associated functions and methods"). Each `let`'s right-hand side, `:=` initializer and expression
+statement collects the calls it defers (`Typing::open_method_calls`). At a `let`'s end
+(`Typing::close_method_calls`), a generalized definition refuses each call still waiting that its
+scheme carries (`display::scheme_obligations`), asking for an annotation on the receiver. A
+variable the scheme quantifies watches such a call's obligation, so each use would copy it and
+select its own method, making the definition polymorphic over every type declaring the method,
+which a trait states instead. A call the scheme does not carry waits with the enclosing
+definition's calls, at that definition's level and telescope, and its function's variable gets a
+variable of that level below it (`TraitObligation::pass_method_call`). The selected method's type
+flows into that variable, which no use of the definition copies, so it reaches every use's copy. A
+monomorphic definition's waiting calls wait with the enclosing one's, a failed statement's report
+nothing, and the program's own are refused once emission ends.
+
+Coalescing replaces a waiting call's placeholder with the candidate its selected row reaches,
+before anything reads the node, and the use specializes as any use of a generalized definition
+does. No `Method` node survives inference. A method no type declares is a lowering error pointing at
+`(r.f)(…)`, the call of a field's function, and a position, `t.0(…)`, names no method.
 
 ### The compiler-provided `Option`
 

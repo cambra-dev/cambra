@@ -19,9 +19,11 @@ use crate::ccl::{
 
 use super::context::InferCtx;
 use super::schemes::{OpSignature, OperatorResult};
-use super::typing::{LetScheme, Typing};
+use super::typing::{LetScheme, MethodCallsEnd, Typing};
 use super::{product, variant_type};
-use crate::ccl::infer::solver::traits::{Assoc, Signature, Trait, function_over, replace_params};
+use crate::ccl::infer::solver::traits::{
+    Assoc, MethodRow, MethodTarget, Signature, Trait, function_over, replace_params,
+};
 use crate::ccl::infer_var::Origin;
 use crate::ccl::ty::{TraitRequirement, TypeParamId};
 use std::collections::HashMap;
@@ -54,6 +56,13 @@ pub(super) fn emit_node(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, Loc
     // pass-level walks do.
     let result = stacker::maybe_grow(512 * 1024, 1024 * 1024, || emit_node_inner(expr, ctx));
     ctx.leave_node(prev);
+    if result.is_err() {
+        // A failed rule's selected calls report nothing, as a failed statement's waiting
+        // calls do.
+        ctx.selected_methods.borrow_mut().clear();
+    } else if !ctx.selected_methods.borrow().is_empty() {
+        instantiate_selected_methods(ctx)?;
+    }
     result
 }
 
@@ -81,7 +90,9 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             unreachable!("a Comprehension reached inference; the comprehension phase eliminates it")
         }
         // Lowering builds a `Method` only as an application's function, which
-        // `emit_apply` resolves before emitting it.
+        // `emit_apply` resolves before emitting it, or defers, typing it as the variable
+        // the selected method's type flows into ([`defer_method`]).
+        TypedExprNode::Method { deferred, .. } if deferred.is_some() => recorded_ty.clone(),
         TypedExprNode::Method { name, .. } => {
             unreachable!("method `{name}` reached emission outside the application it resolves in")
         }
@@ -1503,9 +1514,17 @@ pub(super) fn emit_expr_stmt<C: Typing>(
     body: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    // A failed statement is recovered from: its value is discarded either way.
+    // A failed statement is recovered from: its value is discarded either way, and the
+    // method calls it deferred report nothing.
     let reads_before = ctx.poisoned_reads();
-    if let Err(error) = ctx.subexpr(e) {
+    ctx.open_method_calls();
+    let emitted = ctx.subexpr(e);
+    ctx.close_method_calls(if emitted.is_ok() {
+        MethodCallsEnd::Monomorphic
+    } else {
+        MethodCallsEnd::Failed
+    });
+    if let Err(error) = emitted {
         ctx.recover(error, reads_before)?;
     }
     // The continuation's value is passed along: a mutable variable reads, and a feed stays
@@ -1929,7 +1948,9 @@ fn emit_let_definition<C: Typing>(
         _ => None,
     };
     // The `Poly` stays open through the annotation's reconcile, which normalizes
-    // the parameters the annotation names, and is closed on every path out.
+    // the parameters the annotation names, and is closed on every path out. So are the
+    // method calls the right-hand side defers.
+    ctx.open_method_calls();
     let bound = emit_let_bound(
         binding,
         bound_expr,
@@ -1947,7 +1968,9 @@ fn emit_let_definition<C: Typing>(
         opened,
         defined,
         mut poisoned,
-    } = bound?;
+    } = bound.inspect_err(|_| {
+        ctx.close_method_calls(MethodCallsEnd::Failed);
+    })?;
     // The annotation is the `Poly` opened from here on, over the completed body: its
     // parameters and `requires` clause are this binding's own, which its scheme
     // states to each use (`scoped_let`) and the coalesce walk assumes while it checks
@@ -1972,6 +1995,19 @@ fn emit_let_definition<C: Typing>(
     // which all its uses settle.
     let generalize = ctx.is_generalizable(bound_expr)
         || (poly.is_some() && matches!(bound_expr.node, TypedExprNode::Abstract));
+    // A method call waiting for a receiver's type that the scheme quantifies is refused:
+    // each use instantiates its own copy, and a use choosing the method would make the
+    // definition polymorphic over every type declaring it, which is a trait's job
+    // (`docs/chl-spec.md`, "Associated functions and methods").
+    let end = match (defined, generalize) {
+        (false, _) => MethodCallsEnd::Failed,
+        (true, true) => MethodCallsEnd::Generalized(scheme_ty.clone()),
+        (true, false) => MethodCallsEnd::Monomorphic,
+    };
+    for error in ctx.close_method_calls(end) {
+        ctx.recover(error, reads_before)?;
+        poisoned = true;
+    }
     // Lowering refuses a polymorphic annotation on a call or a collection; a name
     // of a monomorphic binding is known only here. A failed right-hand side names
     // nothing, so it is not asked.
@@ -2008,7 +2044,9 @@ fn emit_let_definition<C: Typing>(
 /// not yet emitted emits it first ([`emit_group_member_for`]), from wherever the reference
 /// stands. So each member is bound before the members whose definitions name it, which is
 /// the order of the `Let`s the group becomes. Which function a method call names is decided
-/// as its call is emitted, so this is the order of the calls the program makes.
+/// as its call is emitted, so this is the order of the calls the program makes; a call
+/// waiting for its receiver's type names its function once that type selects it
+/// ([`instantiate_selected_methods`]).
 fn emit_def_group(
     group_id: NodeId,
     bindings: Vec<(TypedBinding, Expr)>,
@@ -2139,24 +2177,43 @@ fn emit_group_member(g: usize, at: usize, ctx: &mut InferCtx) -> Result<(), Loca
 /// a cycle, which no definition reaches (`docs/chl-spec.md`, "Associated functions and
 /// methods").
 fn emit_group_member_for(name: &Name, ctx: &mut InferCtx) -> Result<(), LocatedInferError> {
-    let Some((g, at)) = ctx.groups.iter().enumerate().rev().find_map(|(g, group)| {
+    match group_member_state(name, ctx) {
+        Some(MemberState::Pending(g, at)) => emit_group_member(g, at, ctx),
+        Some(MemberState::InProgress(names)) => {
+            Err(ctx.raise(InferError::DefinitionCycle { names }))
+        }
+        Some(MemberState::Done) | None => Ok(()),
+    }
+}
+
+/// Where a member of an open group stands in its group's emission.
+enum MemberState {
+    /// Not emitted yet: the member `at` of the open group `g`.
+    Pending(usize, usize),
+    /// Under emission, so a reference to it is a cycle through the members named.
+    InProgress(Vec<String>),
+    /// Emitted.
+    Done,
+}
+
+/// Where `name` stands in its group's emission, if it is a member of an open group.
+fn group_member_state(name: &Name, ctx: &InferCtx) -> Option<MemberState> {
+    let (g, at) = ctx.groups.iter().enumerate().rev().find_map(|(g, group)| {
         let at = group.members.iter().position(|m| m.binding.name == *name)?;
         Some((g, at))
-    }) else {
-        return Ok(());
-    };
+    })?;
     let group = &ctx.groups[g];
     if group.done.contains(&at) {
-        return Ok(());
+        return Some(MemberState::Done);
     }
     if let Some(from) = group.in_progress.iter().position(|&m| m == at) {
         let names = group.in_progress[from..]
             .iter()
             .map(|&m| group.members[m].binding.name.base().to_string())
             .collect();
-        return Err(ctx.raise(InferError::DefinitionCycle { names }));
+        return Some(MemberState::InProgress(names));
     }
-    emit_group_member(g, at, ctx)
+    Some(MemberState::Pending(g, at))
 }
 
 /// What [`emit_let_bound`] binds a `let` at.
@@ -2527,7 +2584,14 @@ pub(super) fn emit_mut_decl<C: Typing>(
     // declared history all the same, so its writes still constrain one value type,
     // and only the seed's contribution is missing.
     let reads_before = ctx.poisoned_reads();
-    let init_ty = match ctx.in_let_rhs(|ctx| emit_value_read(init, ctx)) {
+    ctx.open_method_calls();
+    let init_ty = ctx.in_let_rhs(|ctx| emit_value_read(init, ctx));
+    ctx.close_method_calls(if init_ty.is_ok() {
+        MethodCallsEnd::Monomorphic
+    } else {
+        MethodCallsEnd::Failed
+    });
+    let init_ty = match init_ty {
         Ok(ty) => Some(ty),
         Err(error) => {
             ctx.recover(error, reads_before)?;
@@ -3107,18 +3171,14 @@ fn require_stated(
 ///
 /// The receiver is the argument, or the first component of the argument's tuple type. Its type is
 /// what the program has stated before the call: the type itself, or the bounds its
-/// variable has gathered so far. A later use does not decide it.
+/// variable has gathered so far. Where that names no type yet, the call waits for it
+/// ([`Typing::defer_method`]).
 fn resolve_method<C: Typing>(
     function: &mut Expr,
     arg_ty: &Type,
     ctx: &mut C,
 ) -> Result<(), LocatedInferError> {
-    let TypedExprNode::Method {
-        name,
-        args,
-        candidates,
-    } = &mut function.node
-    else {
+    let TypedExprNode::Method { name, args, .. } = &function.node else {
         unreachable!("`resolve_method` is called on a `Method`")
     };
     let receiver_ty = if *args > 0 {
@@ -3130,10 +3190,12 @@ fn resolve_method<C: Typing>(
         method: name.clone(),
         receiver,
     };
-    let head = receiver_ty.map_or(Head::Unknown, |ty| nominal_head(&read_through(&ty)));
-    let decl = match head {
+    let Some(receiver_ty) = receiver_ty else {
+        return Err(ctx.raise(unresolved(None)));
+    };
+    let decl = match nominal_head(&read_through(&receiver_ty)) {
         Head::Nominal(decl) => decl,
-        Head::Unknown => return Err(ctx.raise(unresolved(None))),
+        Head::Unknown => return ctx.defer_method(function, &receiver_ty),
         Head::Other(ty) => return Err(ctx.raise(unresolved(Some(ty)))),
         Head::Two(a, b) => {
             return Err(ctx.raise(InferError::AmbiguousReceiver {
@@ -3142,16 +3204,20 @@ fn resolve_method<C: Typing>(
             }));
         }
     };
-    // The first candidate bound at the call. Failing that, the first one lowering found,
-    // which then reports itself unbound, as a module function called above its `def` does.
-    // A copy linking added is taken only where it is bound.
-    let in_scope = |c: &crate::ccl::MethodCandidate| matches!(&c.function.node, TypedExprNode::Var(name) if ctx.binds(name));
-    let Some(at) = candidates
-        .iter()
-        .position(|c| c.decl == decl && in_scope(c))
-        .or_else(|| candidates.iter().position(|c| c.decl == decl && !c.copy))
+    let TypedExprNode::Method {
+        name,
+        args,
+        candidates,
+        ..
+    } = &mut function.node
     else {
-        return Err(ctx.raise(unresolved(Some(decl.applied_to_params()))));
+        unreachable!("`resolve_method` is called on a `Method`")
+    };
+    let Some(at) = reached_candidate(candidates, &decl, ctx) else {
+        return Err(ctx.raise(InferError::UnresolvedMethod {
+            method: name.clone(),
+            receiver: Some(decl.applied_to_params()),
+        }));
     };
     let chosen = candidates.swap_remove(at);
     if chosen.params != *args {
@@ -3163,6 +3229,155 @@ fn resolve_method<C: Typing>(
     }
     *function = chosen.function;
     Ok(())
+}
+
+/// The candidate among `candidates` a call reaches for `decl`'s method: the first one bound
+/// at the call. Failing that, the first one lowering found, which then reports itself
+/// unbound, as a module function called above its `def` does. A copy linking added is taken
+/// only where it is bound.
+fn reached_candidate<C: Typing>(
+    candidates: &[crate::ccl::MethodCandidate],
+    decl: &crate::ccl::nominal::NominalDecl,
+    ctx: &C,
+) -> Option<usize> {
+    let in_scope = |c: &crate::ccl::MethodCandidate| matches!(&c.function.node, TypedExprNode::Var(name) if ctx.binds(name));
+    candidates
+        .iter()
+        .position(|c| *c.decl == *decl && in_scope(c))
+        .or_else(|| candidates.iter().position(|c| *c.decl == *decl && !c.copy))
+}
+
+/// Defer the method call whose placeholder is `function` until its receiver's type,
+/// `receiver`, is known (`src/ccl/design/nominal-types.md`, "Method calls").
+///
+/// The call reaches one candidate for each type declaring the method, as it would were the
+/// type known here, and each is a row of an obligation of the method's trait on the receiver:
+/// the method's scheme, a function of the block being emitted that is not emitted yet, or the
+/// error the call raises if the type turns out to be that one. The placeholder keeps the
+/// reached candidates and the obligation, by which coalescing replaces it with the selected
+/// candidate, and its type is the one the selected method's type flows into.
+pub(super) fn defer_method(
+    function: &mut Expr,
+    receiver: &Type,
+    ctx: &mut InferCtx,
+) -> Result<(), LocatedInferError> {
+    let node = function.node_id();
+    let TypedExprNode::Method {
+        name,
+        args,
+        candidates,
+        ..
+    } = &mut function.node
+    else {
+        unreachable!("`defer_method` is called on a `Method`")
+    };
+    let (name, args, candidates) = (name.clone(), *args, std::mem::take(candidates));
+    let mut decls: Vec<std::rc::Rc<crate::ccl::nominal::NominalDecl>> = Vec::new();
+    for c in &candidates {
+        if !decls.contains(&c.decl) {
+            decls.push(std::rc::Rc::clone(&c.decl));
+        }
+    }
+    let mut reached_at = Vec::new();
+    let mut rows = Vec::new();
+    for decl in decls {
+        let at = reached_candidate(&candidates, &decl, ctx);
+        let target = match at {
+            Some(at) => reached_target(&candidates[at], &name, args, ctx),
+            None => Err(Box::new(InferError::UnresolvedMethod {
+                method: name.clone(),
+                receiver: Some(decl.applied_to_params()),
+            })),
+        };
+        reached_at.extend(at);
+        rows.push(MethodRow { decl, target });
+    }
+    let mut candidates: Vec<Option<_>> = candidates.into_iter().map(Some).collect();
+    let reached: Vec<_> = reached_at
+        .into_iter()
+        .filter_map(|at| candidates[at].take())
+        .collect();
+    let function_ty = ctx.fresh();
+    let obligation = ctx.require_method(&name, rows, &function_ty, receiver, node)?;
+    let TypedExprNode::Method {
+        candidates,
+        deferred,
+        ..
+    } = &mut function.node
+    else {
+        unreachable!("`defer_method` is called on a `Method`")
+    };
+    *candidates = reached;
+    *deferred = Some(obligation);
+    function.ty = function_ty;
+    Ok(())
+}
+
+/// The method `chosen` references, which a deferred call of `name` passing `args` arguments
+/// after its receiver reaches if its receiver's type is `chosen`'s; otherwise the error that
+/// call raises. A function of a block being emitted is emitted only once its row is
+/// selected ([`instantiate_selected_methods`]): emitting it now may reach the function
+/// the call stands in, which the call reaches only if the type turns out to be that one.
+fn reached_target(
+    chosen: &crate::ccl::MethodCandidate,
+    name: &str,
+    args: usize,
+    ctx: &mut InferCtx,
+) -> Result<MethodTarget, Box<InferError>> {
+    if chosen.params != args {
+        return Err(Box::new(InferError::MethodArity {
+            method: format!("{}::{name}", chosen.decl.name),
+            params: chosen.params,
+            args,
+        }));
+    }
+    let TypedExprNode::Var(binding) = &chosen.function.node else {
+        unreachable!("a method's candidate references its binding")
+    };
+    match group_member_state(binding, ctx) {
+        // The function the call stands in, which calling would make a cycle.
+        Some(MemberState::InProgress(names)) => {
+            return Err(Box::new(InferError::DefinitionCycle { names }));
+        }
+        Some(MemberState::Pending(..)) => return Ok(MethodTarget::Member(binding.clone())),
+        Some(MemberState::Done) | None => {}
+    }
+    ctx.note_use(binding);
+    match ctx.scopes.lookup(binding) {
+        Some(bound) => Ok(MethodTarget::Scheme(bound.scheme.clone())),
+        None => Err(Box::new(InferError::UnboundVariable(binding.to_string()))),
+    }
+}
+
+/// Emit the function of a block each method call selected since the last call reaches, and
+/// instantiate it where the call stands ([`MethodTarget::Member`]). Run as each node's rule
+/// ends, so a call selected while emission is inside a rule has its method's type once that
+/// rule is done, and before a definition is generalized. A failure fails the rule, whose
+/// other selected calls report nothing.
+pub(super) fn instantiate_selected_methods(ctx: &mut InferCtx) -> Result<(), LocatedInferError> {
+    loop {
+        let Some(call) = ({
+            let mut selected = ctx.selected_methods.borrow_mut();
+            (!selected.is_empty()).then(|| selected.remove(0))
+        }) else {
+            return Ok(());
+        };
+        let (member, node) = call.selected_member();
+        let prev = ctx.enter_node(node);
+        let instantiated = emit_group_member_for(&member, ctx).and_then(|()| {
+            ctx.note_use(&member);
+            let scheme = match ctx.scopes.lookup(&member) {
+                Some(bound) => bound.scheme.clone(),
+                None => return Err(ctx.raise(InferError::UnboundVariable(member.to_string()))),
+            };
+            ctx.instantiate_method(&call, &scheme)
+        });
+        ctx.leave_node(prev);
+        if let Err(error) = instantiated {
+            ctx.selected_methods.borrow_mut().clear();
+            return Err(error);
+        }
+    }
 }
 
 /// Visit each bound `var` has gathered so far, following variable-to-variable bounds, with

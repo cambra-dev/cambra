@@ -4971,15 +4971,18 @@ fn eq_term_modulo_ty_slots_go(
                 name: m1,
                 args: a1,
                 candidates: c1,
+                deferred: d1,
             },
             N::Method {
                 name: m2,
                 args: a2,
                 candidates: c2,
+                deferred: d2,
             },
         ) => {
             m1 == m2
                 && a1 == a2
+                && d1 == d2
                 && c1.len() == c2.len()
                 && c1.iter().zip(c2).all(|(x, y)| {
                     x.decl == y.decl

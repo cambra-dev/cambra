@@ -358,7 +358,8 @@ wherever the reference stands. That emission runs as if the enclosing member's h
 (`InferCtx::at_group`): the scopes it opened are set aside, and the level, telescope, open `Poly`
 parameters and assumptions are the group's. Each member is then bound before the members that name
 it, is generalized as a `let` is, and its uses instantiate its scheme, so the members are
-polymorphic to each other.
+polymorphic to each other. A method call waiting for its receiver's type emits the member that type
+selects once it is selected ([nominal-types.md, "Method calls"](nominal-types.md#method-calls)).
 
 A reference to a member still under emission is a cycle, an error naming the members from that one
 to the reference (`InferError::DefinitionCycle`). Once the body is emitted, the group is rewritten
@@ -3193,7 +3194,7 @@ The constraint lattice can state that two positions are **equal** or **related b
 * An **associated type** is a type a trait *names* — `Output`, the type an arithmetic operator's result takes. A trait is a requirement rather than a function, so it associates any number, **including none**. A type is associated only when it *depends* on the types satisfying the trait: a comparison's `Bool` is the same for every pair `Equatable` accepts, so it belongs to the operator's signature and `Equatable` associates nothing — recording it as an association would claim the trait determines something it does not.
 * An **obligation** is what one *use* of a trait records: the demand that some instance fit the type positions at that use — one **operand position** per argument the trait takes, and one **associated position** per type it names. It is a single claim with two halves, and neither alone is the obligation: *the operand positions are types some instance accepts*, **and** *each associated position is what that same instance associates*. Every position is an ordinary inference variable, unrelated to the others.
 
-A signature carries an obligation beside its type — `𝑓 : 𝐴 ⇒ 𝐵 requires MyTrait(𝐴 ⇝ 𝐵)` — and inference must find an instance satisfying it. Nothing about that is operator-specific: obligations ride variables into schemes ([Requirements are generalized](#requirements-are-generalized)), so a function inherits the requirements of the operators in its body, and `λ 𝑎 𝑏 → 𝑎 + 𝑏` is `∀ 𝐴 𝐵 𝑂. 𝐴 ⇒ 𝐵 ⇒ 𝑂 requires Addable(𝐴, 𝐵 ⇝ 𝑂)`. An operator mints one, and so do a `requires` clause at a use ([type-parameters.md](type-parameters.md)) and a call of a trait's function ([Trait functions](#trait-functions)).
+A signature carries an obligation beside its type — `𝑓 : 𝐴 ⇒ 𝐵 requires MyTrait(𝐴 ⇝ 𝐵)` — and inference must find an instance satisfying it. Nothing about that is operator-specific: obligations ride variables into schemes ([Requirements are generalized](#requirements-are-generalized)), so a function inherits the requirements of the operators in its body, and `λ 𝑎 𝑏 → 𝑎 + 𝑏` is `∀ 𝐴 𝐵 𝑂. 𝐴 ⇒ 𝐵 ⇒ 𝑂 requires Addable(𝐴, 𝐵 ⇝ 𝑂)`. An operator mints one, and so do a `requires` clause at a use ([type-parameters.md](type-parameters.md)), a call of a trait's function ([Trait functions](#trait-functions)), and a method call whose receiver's type is unknown where it stands, of the method's own trait ([nominal-types.md, "Method calls"](nominal-types.md#method-calls)).
 
 An operator's own signature is `𝐴₁ ⇒ … ⇒ 𝐴ₙ ⇒ 𝑅` plus its obligation, for the trait's arity `𝑛`, where `𝑅` is either one of the associated positions or a type the operator fixes. The three shapes the current operators take:
 

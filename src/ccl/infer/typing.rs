@@ -29,6 +29,22 @@ pub(super) enum LetScheme {
     Poisoned,
 }
 
+/// What the end of a statement does with the method calls it deferred
+/// ([`Typing::close_method_calls`]).
+#[derive(Clone, Debug)]
+pub(super) enum MethodCallsEnd {
+    /// The statement is a generalized definition bound at this type. A call whose
+    /// receiver's type is still unknown is an error where the type's scheme carries the
+    /// call, since each use would select its own method; otherwise it waits with the
+    /// enclosing definition's.
+    Generalized(Type),
+    /// The statement binds nothing generalized, so the program after it may still settle
+    /// its receivers: its calls wait with the enclosing definition's.
+    Monomorphic,
+    /// The statement failed, and its calls report nothing.
+    Failed,
+}
+
 /// The operations a typing rule needs from its surrounding pass.
 ///
 /// Each per-node rule (`emit_apply`, `emit_let`, …) is written once against
@@ -300,6 +316,29 @@ pub(super) trait Typing {
         _function: NodeId,
     ) -> Result<(), LocatedInferError> {
         Ok(())
+    }
+
+    /// Defer the method call whose `Method` placeholder is `function` until the type of its
+    /// receiver, `receiver`, is known (`src/ccl/design/nominal-types.md`, "Method calls").
+    /// Check meets no method call.
+    fn defer_method(
+        &mut self,
+        _function: &mut Expr,
+        _receiver: &Type,
+    ) -> Result<(), LocatedInferError> {
+        unreachable!("only emission meets a method call")
+    }
+
+    /// Start collecting the method calls a statement defers: a `let`'s right-hand side, a
+    /// `:=` initializer or an expression statement.
+    fn open_method_calls(&mut self) {}
+
+    /// Stop collecting the method calls of the statement [`open_method_calls`] began, and
+    /// settle them as `end` says, returning an error for each that `end` refuses.
+    ///
+    /// [`open_method_calls`]: Typing::open_method_calls
+    fn close_method_calls(&mut self, _end: MethodCallsEnd) -> Vec<LocatedInferError> {
+        Vec::new()
     }
 
     /// Run `f` with a `let` binding in scope over the body, at the type

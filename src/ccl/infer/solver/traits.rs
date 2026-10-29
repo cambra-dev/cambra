@@ -96,8 +96,10 @@ use super::constrain::{ConstrainCache, ConstrainError, constrain_subtype};
 /// lowering builds a module's. A program's instances of either are its [`InstanceTable`]'s.
 ///
 /// Equality, ordering and hashing are the declaration's, by the module that declares it and
-/// its name. `Ord` so a diagnostic can order the requirements it lists; resolution does not
-/// depend on it: a candidate set is a set, and the verdict is an intersection.
+/// its name, and a method's trait ([`Trait::method`]), which no module declares, is equal
+/// to no declared trait of its name. `Ord` so a diagnostic can order the requirements it
+/// lists; resolution does not depend on it: a candidate set is a set, and the verdict is an
+/// intersection.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Trait(Rc<TraitDecl>);
 
@@ -115,6 +117,9 @@ pub enum Assoc {
     Output,
     /// An associated type a declared trait names, `Elem` in `trait Container(C): Elem`.
     Declared(SmolStr),
+    /// The function a method call reaches: the method its receiver's type declares, at the
+    /// types the call instantiates it ([`Trait::method`]).
+    Method,
 }
 
 impl Assoc {
@@ -123,6 +128,7 @@ impl Assoc {
         match self {
             Assoc::Output => "Output",
             Assoc::Declared(name) => name,
+            Assoc::Method => "method",
         }
     }
 }
@@ -175,6 +181,9 @@ pub struct TraitDecl {
     /// Only `Iterable` sets it: a collection iterates itself, so its `Elements` is the
     /// collection and `elements` is the identity, which coalescing drops.
     pub reads_collections: bool,
+    /// Whether the trait is a method's ([`Trait::method`]): what a method call requires of
+    /// its receiver, which no program names.
+    pub method: bool,
 }
 
 /// Which products a trait's product rule reads: a product satisfies the trait when its
@@ -201,8 +210,8 @@ pub enum ProductReading {
 }
 
 impl TraitDecl {
-    fn key(&self) -> (&[SmolStr], &str) {
-        (&self.module, &self.name)
+    fn key(&self) -> (bool, &[SmolStr], &str) {
+        (self.method, &self.module, &self.name)
     }
 }
 
@@ -444,6 +453,7 @@ impl CompilerTraits {
                 named: Vec::new(),
                 products: ProductReading::None,
                 reads_collections: true,
+                method: false,
             })
         };
         CompilerTraits {
@@ -538,6 +548,7 @@ impl OperatorTrait<'_> {
             products: self.products,
             assoc_bounds: Vec::new(),
             reads_collections: false,
+            method: false,
         });
         for (bases, associated, primitive) in rows {
             assert!(
@@ -622,6 +633,34 @@ impl Trait {
     /// The trait a loop's source satisfies: `Iterable(C)`, whose `Elements` is what the loop walks.
     pub fn iterable() -> Trait {
         COMPILER_TRAITS.with(|c| c.iterable.clone())
+    }
+
+    /// The trait a call of the method `name` requires of its receiver
+    /// (`src/ccl/design/nominal-types.md`, "Method calls"): `name(Self ⇝ method)`, whose
+    /// operand is the receiver's type and whose associated type is the function the call
+    /// reaches. Its rows are the types declaring a method `name` that the call can reach,
+    /// which only the call knows, so an obligation of it carries them
+    /// ([`TraitObligation::new_method`]) and the program's table holds none.
+    pub fn method(name: &str) -> Trait {
+        Trait(Rc::new(TraitDecl {
+            module: Vec::new(),
+            name: name.into(),
+            span: Span::new(chl_parser::FileId::ROOT, 0, 0),
+            operands: vec![TypeParam::declared("Self")],
+            assocs: vec![(Assoc::Method, TypeParam::declared("method"))],
+            assoc_bounds: Vec::new(),
+            functions: Vec::new(),
+            requires: Vec::new(),
+            named: Vec::new(),
+            products: ProductReading::None,
+            reads_collections: false,
+            method: true,
+        }))
+    }
+
+    /// Whether this is a method's trait ([`Trait::method`]).
+    pub fn is_method(&self) -> bool {
+        self.0.method
     }
 
     /// Whether a structural collection satisfies this trait as itself.
@@ -1572,6 +1611,46 @@ pub struct TraitObligation {
     /// requirement of a `requires` clause it was instantiated from at a use. A failure
     /// to satisfy it labels this position as its demand.
     required_at: crate::ccl::infer_var::Origin,
+    /// A method call's rows, for an obligation of a method's trait ([`Trait::method`]):
+    /// what selecting each instantiates.
+    method: Option<Rc<MethodCall>>,
+}
+
+/// What a method call `𝑥.m(𝑎…)` reaches once its receiver's type is known
+/// (`src/ccl/design/nominal-types.md`, "Method calls"): for each type declaring `m`, the
+/// method's type as the call reaches it.
+pub struct MethodCall {
+    /// Where the selected method's type is instantiated, as the `Var` rule instantiates a
+    /// use's: the level and telescope of the call, or of the definition enclosing the
+    /// generalized one the call was passed out of ([`TraitObligation::pass_method_call`]).
+    /// The telescope is the one a type parameter the instantiation opens stands in.
+    pub at: RefCell<(crate::ccl::Level, crate::ccl::infer_var::Telescope)>,
+    /// One per type declaring the method, each the obligation's candidate of that head.
+    pub rows: Vec<MethodRow>,
+    /// The call's `Method` placeholder.
+    pub node: provenance::NodeId,
+    /// Where selecting a [`MethodTarget::Member`] row places the call, for emission to bind
+    /// that function and instantiate it.
+    pub selected: Rc<RefCell<Vec<Rc<TraitObligation>>>>,
+}
+
+/// One type's method a [`MethodCall`] may reach.
+pub struct MethodRow {
+    /// The type declaring it.
+    pub decl: Rc<NominalDecl>,
+    /// The method the call reaches; otherwise the error selecting the type raises, which
+    /// names why the call cannot reach it.
+    pub target: Result<MethodTarget, Box<crate::ccl::infer::InferError>>,
+}
+
+/// The method a [`MethodRow`] reaches.
+pub enum MethodTarget {
+    /// The scheme of a method bound where the call stands.
+    Scheme(super::scheme::PolyScheme),
+    /// A function of a block under emission that is not emitted yet, which emission emits
+    /// only once the row is selected, since emitting it may reach the function the call
+    /// stands in.
+    Member(Name),
 }
 
 /// The state of an obligation's product rule, the candidate that answers a product
@@ -1680,9 +1759,73 @@ impl TraitObligation {
         operator_node_id: provenance::NodeId,
         required_at: crate::ccl::infer_var::Origin,
     ) -> Rc<TraitObligation> {
+        let candidates = table.instances(&trait_);
+        Self::with_candidates(
+            table,
+            trait_,
+            candidates,
+            assoc,
+            None,
+            operator_node_id,
+            required_at,
+        )
+    }
+
+    /// Record the method call `call` of the method `name`, whose function stands at
+    /// `function`: an obligation of [`Trait::method`] with a candidate for each of the call's
+    /// rows, which `table`'s conditions answer the selected method's requirements by.
+    pub fn new_method(
+        table: &Rc<InstanceTable>,
+        name: &str,
+        call: MethodCall,
+        function: Type,
+        operator_node_id: provenance::NodeId,
+        required_at: crate::ccl::infer_var::Origin,
+    ) -> Rc<TraitObligation> {
+        // A row's head is its type at any arguments, so the receiver's type picks it, and
+        // selection reads no more of it: the method's own type states what `self` takes.
+        let candidates = call
+            .rows
+            .iter()
+            .map(|row| {
+                let operands = vec![row.decl.applied_to_params()];
+                Rc::new(TraitInstance {
+                    params: row.decl.params.clone(),
+                    heads: operands.iter().map(InstanceHead::of_pattern).collect(),
+                    operands,
+                    assoc: Vec::new(),
+                    requires: Vec::new(),
+                    bounds: Vec::new(),
+                    functions: Vec::new(),
+                    declared: None,
+                })
+            })
+            .collect();
+        Self::with_candidates(
+            table,
+            Trait::method(name),
+            candidates,
+            vec![(Assoc::Method, function)],
+            Some(Rc::new(call)),
+            operator_node_id,
+            required_at,
+        )
+    }
+
+    /// An obligation of `trait_` with `candidates` its rows, whose associated names stand at
+    /// `assoc`, and `method` the rows' methods if `trait_` is a method's.
+    fn with_candidates(
+        table: &Rc<InstanceTable>,
+        trait_: Trait,
+        candidates: Vec<Rc<TraitInstance>>,
+        assoc: Vec<(Assoc, Type)>,
+        method: Option<Rc<MethodCall>>,
+        operator_node_id: provenance::NodeId,
+        required_at: crate::ccl::infer_var::Origin,
+    ) -> Rc<TraitObligation> {
         Rc::new(TraitObligation {
             uid: TraitObligationId(OBLIGATION_COUNTER.fetch_add(1, Ordering::Relaxed)),
-            candidates: RefCell::new(table.instances(&trait_)),
+            candidates: RefCell::new(candidates),
             table: Rc::clone(table),
             assumptions: RefCell::new(Vec::new()),
             context: RefCell::new(Rc::new(Vec::new())),
@@ -1707,6 +1850,7 @@ impl TraitObligation {
             output_refinement: RefCell::new(None),
             operator_node_id,
             required_at,
+            method,
             trait_,
         })
     }
@@ -1752,6 +1896,7 @@ impl TraitObligation {
             output_refinement: RefCell::new(original.output_refinement.borrow().clone()),
             operator_node_id: original.operator_node_id,
             required_at: original.required_at,
+            method: original.method.clone(),
         })
     }
 
@@ -2271,7 +2416,12 @@ impl TraitObligation {
     /// product answered, whose conditions state it instead
     /// ([`narrow_product`](Self::narrow_product)).
     pub(super) fn stated_requirement(&self) -> Option<TraitRequirement> {
-        if self.answered_by_product().is_some() || self.answered_by_collection() {
+        // A method call is no requirement: its definition resolves it, or is refused
+        // (`src/ccl/design/nominal-types.md`, "Method calls").
+        if self.answered_by_product().is_some()
+            || self.answered_by_collection()
+            || self.trait_.is_method()
+        {
             return None;
         }
         let arity = self.trait_.arity();
@@ -2733,7 +2883,7 @@ impl TraitObligation {
             // A compiler row over bases states everything at its operands, and the deposit
             // settles what it associates; one over type variables, `Option(T)`'s, is selected
             // as a module's is.
-            if only.declared.is_none() && !only.has_type_variables() {
+            if self.method.is_none() && only.declared.is_none() && !only.has_type_variables() {
                 return Ok(());
             }
             Rc::clone(only)
@@ -2744,6 +2894,9 @@ impl TraitObligation {
             "infer.select_instance",
             provenance::Nature::Machinery,
         );
+        if let Some(call) = &self.method {
+            return self.select_method(call, &declared, cache);
+        }
         let operands = self.operands.borrow().clone();
         let level = operands
             .iter()
@@ -2774,37 +2927,160 @@ impl TraitObligation {
             constrain_subtype(&open(stated), &target, cache)?;
         }
         for requirement in &declared.requires {
-            let positions: Vec<Type> = requirement
-                .args
-                .iter()
-                .map(|_| crate::ccl::infer::solver::fresh_var(level))
-                .collect();
-            let assoc: Vec<(Assoc, Type)> = requirement
-                .assoc
-                .iter()
-                .map(|(name, _)| (name.clone(), crate::ccl::infer::solver::fresh_var(level)))
-                .collect();
-            let condition = TraitObligation::new_in(
-                &self.table,
-                requirement.trait_.clone(),
-                assoc.clone(),
-                self.operator_node_id,
-                self.required_at,
-            );
-            condition.assume(&self.context.borrow());
-            for (pos, position) in positions.iter().enumerate() {
-                condition.watch(position, pos as u8);
-            }
-            condition.try_deposit(cache)?;
-            for (arg, position) in requirement.args.iter().zip(&positions) {
-                constrain_subtype(&open(arg), position, cache)?;
-            }
-            for ((_, settled), (_, named)) in assoc.iter().zip(&requirement.assoc) {
-                constrain_subtype(settled, &open(named), cache)?;
-            }
+            self.require_condition(&requirement.map_types(&open), level, cache)?;
         }
         for (param, bound) in &declared.bounds {
             constrain_subtype(&open(&Type::Param(Rc::clone(param))), &open(bound), cache)?;
+        }
+        Ok(())
+    }
+
+    /// Select the method of the type `selected` is the row of
+    /// (`src/ccl/design/nominal-types.md`, "Method calls"): instantiate its scheme, or, for a
+    /// function of a block emission has yet to emit, leave that to emission.
+    fn select_method(
+        self: &Rc<Self>,
+        call: &MethodCall,
+        selected: &TraitInstance,
+        cache: &mut ConstrainCache,
+    ) -> Result<(), ConstrainError> {
+        match self.selected_row(selected) {
+            Err(error) => Err(ConstrainError::MethodUnreachable(error.clone())),
+            Ok(MethodTarget::Scheme(scheme)) => self.instantiate_method(scheme, cache),
+            Ok(MethodTarget::Member(_)) => {
+                call.selected.borrow_mut().push(Rc::clone(self));
+                Ok(())
+            }
+        }
+    }
+
+    /// The target of the method call's row that `selected` is.
+    fn selected_row(
+        &self,
+        selected: &TraitInstance,
+    ) -> &Result<MethodTarget, Box<crate::ccl::infer::InferError>> {
+        let [InstanceHead::Nominal(decl)] = selected.heads() else {
+            unreachable!("a method's row is headed by the type declaring it")
+        };
+        &self
+            .method
+            .as_ref()
+            .expect("only a method call's obligation selects a method")
+            .rows
+            .iter()
+            .find(|row| row.decl == *decl)
+            .expect("each candidate of a method call is one of its rows")
+            .target
+    }
+
+    /// The function of a block a selected method call reaches, which emission is to emit
+    /// and instantiate ([`MethodTarget::Member`]), and the call's placeholder.
+    pub fn selected_member(&self) -> (Name, provenance::NodeId) {
+        let selected = self
+            .selected_instance()
+            .expect("a method call is placed for emission once selected");
+        let Ok(MethodTarget::Member(name)) = self.selected_row(&selected) else {
+            unreachable!("only a block's function is left for emission to instantiate")
+        };
+        let call = self.method.as_ref().expect("a method call's obligation");
+        (name.clone(), call.node)
+    }
+
+    /// Instantiate the selected method's scheme where the call stands, as the `Var` rule
+    /// instantiates a use of it, and give the call's function that type. Each bound of a type
+    /// parameter the instantiation opens is checked, and each requirement becomes a
+    /// condition, as an instance's do.
+    pub fn instantiate_method(
+        &self,
+        scheme: &super::scheme::PolyScheme,
+        cache: &mut ConstrainCache,
+    ) -> Result<(), ConstrainError> {
+        let call = self
+            .method
+            .as_ref()
+            .expect("only a method call's obligation instantiates a method");
+        let (level, telescope) = call.at.borrow().clone();
+        let instance = scheme.instantiate_with_params(level, &telescope);
+        for (instantiation, bound, _) in &instance.bounds {
+            constrain_subtype(instantiation, bound, cache)?;
+        }
+        for requirement in &instance.requires {
+            self.require_condition(requirement, level, cache)?;
+        }
+        let [position] = self.assoc.as_slice() else {
+            unreachable!("a method's trait associates the function its call reaches")
+        };
+        position.deposited.set(true);
+        let function = position.ty.borrow().clone();
+        constrain_subtype(&instance.ty, &function, cache)
+    }
+
+    /// The function a method call reaches: the type its selected method's flows into.
+    pub fn method_function(&self) -> Type {
+        let [position] = self.assoc.as_slice() else {
+            unreachable!("a method's trait associates the function its call reaches")
+        };
+        position.ty.borrow().clone()
+    }
+
+    /// Pass a method call still waiting out of the generalized definition it stands in, to
+    /// the one enclosing it, at `level` and `telescope`, with `function` the type its
+    /// selected method's flows into, below the call's own
+    /// (`src/ccl/design/nominal-types.md`, "Method calls").
+    pub fn pass_method_call(
+        &self,
+        level: crate::ccl::Level,
+        telescope: crate::ccl::infer_var::Telescope,
+        function: Type,
+    ) {
+        let call = self
+            .method
+            .as_ref()
+            .expect("only a method call is passed out of its definition");
+        *call.at.borrow_mut() = (level, telescope);
+        let [position] = self.assoc.as_slice() else {
+            unreachable!("a method's trait associates the function its call reaches")
+        };
+        *position.ty.borrow_mut() = function;
+    }
+
+    /// Mint the obligation `requirement` states, at variables of `level`, answered by the
+    /// instances and by the assumptions in scope where this obligation was minted: a
+    /// condition of the instance or method this obligation selects
+    /// (`src/ccl/design/type-inference.md`, "Selecting a declared instance").
+    fn require_condition(
+        &self,
+        requirement: &TraitRequirement,
+        level: crate::ccl::Level,
+        cache: &mut ConstrainCache,
+    ) -> Result<(), ConstrainError> {
+        let positions: Vec<Type> = requirement
+            .args
+            .iter()
+            .map(|_| crate::ccl::infer::solver::fresh_var(level))
+            .collect();
+        let assoc: Vec<(Assoc, Type)> = requirement
+            .assoc
+            .iter()
+            .map(|(name, _)| (name.clone(), crate::ccl::infer::solver::fresh_var(level)))
+            .collect();
+        let condition = TraitObligation::new_in(
+            &self.table,
+            requirement.trait_.clone(),
+            assoc.clone(),
+            self.operator_node_id,
+            self.required_at,
+        );
+        condition.assume(&self.context.borrow());
+        for (pos, position) in positions.iter().enumerate() {
+            condition.watch(position, pos as u8);
+        }
+        condition.try_deposit(cache)?;
+        for (arg, position) in requirement.args.iter().zip(&positions) {
+            constrain_subtype(arg, position, cache)?;
+        }
+        for ((_, settled), (_, named)) in assoc.iter().zip(&requirement.assoc) {
+            constrain_subtype(settled, named, cache)?;
         }
         Ok(())
     }
@@ -3255,8 +3531,11 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
             //
             // An argument position is no requirement on its own: a type variable in a head
             // admits what no row lists, so its accepted heads are no intersection to take.
+            //
+            // A method call's rows are nominal types, which name no base to intersect.
             if obligation.answered_by_product().is_some()
                 || obligation.collection_rule_can_answer()
+                || obligation.trait_.is_method()
                 || !obligation.assumptions.borrow().is_empty()
                 || obligation.is_arg_slot(*pos)
                 || obligation.has_variable_at(*pos)
@@ -3813,7 +4092,7 @@ pub(super) fn link_watches(
     // offered — it arrived before the edge existed. A type parameter is replayed
     // with the bases: missing one would leave an operator on an unbounded parameter
     // unchecked.
-    let (known, params, collections, below, barriers_below) = {
+    let (known, params, collections, nominal_above, below, barriers_below) = {
         let bounds = lower.bounds.borrow();
         let known: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = bounds
             .lower()
@@ -3836,6 +4115,13 @@ pub(super) fn link_watches(
             .filter(|b| is_structural_collection(&b.ty))
             .map(|b| (b.ty.clone(), b.origin))
             .collect();
+        // A method call reads a nominal type from above too ([`notify_upper`]).
+        let nominal_above: Vec<(Type, Option<crate::ccl::infer_var::Origin>)> = bounds
+            .upper()
+            .iter()
+            .filter(|b| matches!(b.ty.peel_refinements(), Type::Nominal(..)))
+            .map(|b| (b.ty.clone(), b.origin))
+            .collect();
         let below: Vec<Rc<InferVar>> = bounds
             .lower()
             .iter()
@@ -3852,7 +4138,14 @@ pub(super) fn link_watches(
                 _ => None,
             })
             .collect();
-        (known, params, collections, below, barriers_below)
+        (
+            known,
+            params,
+            collections,
+            nominal_above,
+            below,
+            barriers_below,
+        )
     };
     for (obligation, pos) in &added {
         for (known, origin) in &known {
@@ -3864,6 +4157,11 @@ pub(super) fn link_watches(
         if obligation.trait_.reads_collections() {
             for (collection, origin) in &collections {
                 deliver(obligation, *pos, collection, *origin, cache)?;
+            }
+        }
+        if obligation.trait_.is_method() {
+            for (nominal, origin) in &nominal_above {
+                deliver(obligation, *pos, nominal, *origin, cache)?;
             }
         }
     }
@@ -3962,26 +4260,33 @@ pub(super) fn notify_lower(
     Ok(())
 }
 
-/// Deliver an upper bound to every obligation watching `var` that reads collections.
+/// Deliver an upper bound to every obligation watching `var` that reads it: one that reads
+/// collections, and a method call's.
 ///
 /// The rows key on what reaches a position, so every other obligation reads lower bounds
 /// only. The collection rule asks only whether the position holds collections, and a
 /// structural collection above `var` settles that as one below it does: only a collection
 /// is below a collection. A bounded annotation `xs <: Map(K, V)` is the case with no lower
-/// bound at all.
+/// bound at all. A method call asks only which type declares the method, and a nominal type
+/// above the receiver settles that the same way: only a nominal type is below it
+/// (`src/ccl/design/nominal-types.md`, "Method calls").
 pub(super) fn notify_upper(
     var: &Rc<InferVar>,
     bound: &Type,
     cache: &mut ConstrainCache,
 ) -> Result<(), ConstrainError> {
-    if !is_structural_collection(bound) {
+    let reads = if is_structural_collection(bound) {
+        Trait::reads_collections
+    } else if matches!(bound.peel_refinements(), Type::Nominal(..)) {
+        Trait::is_method
+    } else {
         return Ok(());
-    }
+    };
     let watches: Vec<(Rc<TraitObligation>, u8)> = var
         .watches
         .borrow()
         .iter()
-        .filter(|(obligation, _)| obligation.trait_.reads_collections())
+        .filter(|(obligation, _)| reads(&obligation.trait_))
         .cloned()
         .collect();
     for (obligation, pos) in watches {

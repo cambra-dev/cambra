@@ -703,6 +703,7 @@ mod tests {
                     function: var("N::m"),
                     copy: false,
                 }],
+                deferred: None,
             }),
             transact_one_key_one_writer(),
             TypedExpr::letrec(vec![(bind("f"), var("g")), (bind("g"), var("f"))], var("f")),

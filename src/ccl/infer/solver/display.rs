@@ -252,6 +252,12 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
     })
 }
 
+/// The trait obligations a scheme of `ty` over its variables above `cutoff` carries: the
+/// ones a variable it quantifies watches, which each use of the scheme copies.
+pub fn scheme_obligations(ty: &Type, cutoff: Level) -> Vec<Rc<TraitObligation>> {
+    Reach::of(ty, cutoff).obligations
+}
+
 /// What a type reaches through variable bounds: each variable's level, and the
 /// obligations watching a variable above the cutoff.
 struct Reach {

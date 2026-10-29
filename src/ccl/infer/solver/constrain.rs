@@ -185,6 +185,11 @@ pub enum ConstrainError {
         /// trait has already been answered at ([`Trait::is_structural`]).
         accepted: Vec<Type>,
     },
+    /// A method call's receiver turned out to be a type whose method the call cannot reach:
+    /// its binding is not in scope at the call, is still being emitted, or declares another
+    /// number of parameters. The error is the one the call would have raised had the type
+    /// been known where the call stands ([`super::traits::MethodRow`]).
+    MethodUnreachable(Box<crate::ccl::infer::InferError>),
     /// An attempt to compare two refinement bodies using an SMT
     /// solver failed, and the bodies could not be semantically
     /// compared.
@@ -1715,7 +1720,8 @@ fn constrain_go_impl(
             };
             // The arriving type may be the answer to a kinding edge this variable holds.
             answer_type_kinds(lv)?;
-            // A collection above a watched operand answers a trait that reads collections.
+            // A collection above a watched operand answers a trait that reads collections,
+            // and a nominal type above a receiver answers a method call.
             notify_upper(lv, rhs, cache)?;
             // **No join here.** A variable's lower bounds are joined where every other
             // join is: at compaction, off these same bounds. Assembling one here as well
