@@ -719,6 +719,31 @@ mutable variables and channels they target. Generators survive inlining because 
 leaves nothing to lose — a generator body is `For` + `Feed` nodes against an implicit result feed,
 substituted wholesale.
 
+**A call in a `with begin():` block joins the block's transaction.** A function that reads or
+writes a transactional mutable variable outside a block of its own, the variable captured or a
+`Mut(_, Txn)` parameter, requires `Transaction`, which only a block's body supplies, so inference
+refuses a call of it that no block encloses (`InferError::TransactionOutsideBlock`). Lowering
+does not decide it: a `:=` to a captured transactional variable in a function body is a
+`MutWrite`, and a block holds call statements. Inlined, the call leaves the callee's body where
+the call stood, in a statement, a binding's definition, an operand or a guard's first condition,
+as a chain of bindings and statements ending in its value; a function passed to another and
+called there leaves a lambda applied where it stands, or projected out of a tuple of arguments.
+`transact_phase` first moves each such chain onto the block's spine in evaluation order
+(`flatten_begin_bodies`), binding each operand's value as it is reached so it reads what the
+variables hold there, reducing an applied lambda to a `let`, turning `a and b` and `a or b` with a
+chain in `b` into the guard they are, walking the left operand of one with none there, and
+dropping a statement left holding only a value. Two calls of one function leave two copies of its
+body binding the same names, so each binding moved out of a chain takes a fresh binder. The block
+is then the flat chain of writes, guards and feeds the rest of the phase reads, and a write
+reached through a call commits with the block's own. A write still off that chain, in a later
+guard's condition, a function value or a comprehension, is refused (`write_off_a_spine`), with
+the block's statement or guard reaching it as a secondary label.
+
+Inlining keeps the order these chains are moved in: its read-once rule moves an A-normalization
+temp to its one use only when the definiens writes no variable the body reads or writes
+(`inline::writes_what_the_body_touches`, read off the two nodes' capabilities), so `stock :=
+take(1) + stock` reads `stock` after the call writes it.
+
 ### How many commit stores a program has
 
 **One per set of mutable variables a `with begin():` block relates** — not one per program, and
@@ -727,7 +752,9 @@ becomes its own `LetRec`, its own `Transact{domain: Txn}`, and its own `CommitOp
 induction path partitions the same way: `mut_elim::transform_loop` emits one letrec per loop.
 
 A block is what forces mutable variables together, for two reasons that coincide on the block's
-footprint. The store is not a user-facing concept: the
+footprint, which its body's type states
+([type-inference.md, "Block footprints"](type-inference.md#block-footprints)). The store is not a
+user-facing concept: the
 [CHL spec's ordering model](../../../docs/chl-spec.md#85-ordering-and-concurrency) says only that
 two blocks are ordered when they mention a mutable variable in common, and that blocks sharing no
 variable are unordered. The partition is how that is realized — a program never has to reason
@@ -753,8 +780,8 @@ Nothing else forces sharing. Two consequences are observable:
   interleaving between transactions that never interact.
 
 A mutable variable **no block writes at all** is not a key of any store, and relates nothing by
-being read. Nothing can advance it — the lowering write gate admits a mutable variable write only
-inside a block, and a block write would put it in a write set — so its history is constant at its
+being read. Nothing can advance it — inference refuses a mutable variable write that no block
+encloses, and a block write would put it in a write set — so its history is constant at its
 seed and every read of it is that seed. It keeps its introduction on the spine. Only a read-only
 footprint reaches this case: `limit` above is unwritten too, but a *writing* block reads it, which
 makes its value a question about a commit snapshot rather than about a constant.
@@ -1404,8 +1431,8 @@ The operand is the mutable variable **handle** — the third position alongside 
 argument and a write target (["A mutable variable read is an explicit
 operation"](#a-mutable-variable-read-is-an-explicit-operation)). `Builtin::AwaitFinal`'s scheme
 `∀ν. Mut(ν, Txn) ⇒ ν` pins the domain, so awaiting an induction accumulator is a type error; and
-lowering resolves 𝑥 by name, as it does a write target, rather than through the value-reading path
-whose out-of-block gate would reject the very read this is.
+lowering resolves 𝑥 by name, as it does a write target, rather than through the value-reading path,
+which would make it a read requiring `Transaction` outside a block.
 
 **Four rules, in three places.** Two are order-independent and belong at lowering: the operand must
 be a `Mut(_, Txn)` mutable variable named bare, and the await may not sit inside a `with begin():`
@@ -1636,10 +1663,13 @@ value reading the payload answers on its own arm's positions only. Under the tag
 `` `fired `` positions and the value is asked for nowhere else, so `` out << v `` inside
 `` case `data(v): `` compiles beside an accumulator the other arms write.
 
-A write key written conditionally and never read (an absolute `k := 𝑒` inside a `Case` arm) is
-finalized into the *read* set by `collect_footprint`, so it has a snapshot to **carry** on the paths
-its arm does not fire; a read-modify-write already reads the key, and a purely spine (unconditional)
-write needs no carry and stays write-only.
+A write key written conditionally and never read (an absolute `k := 𝑒` inside a `Case` arm), or
+written on no path at all (a write a clause declares), joins the *read* set
+(`transact_phase::block_keys`), so it has a snapshot to **carry** on the paths that leave it alone;
+a read-modify-write already reads the key through its type, and a purely spine (unconditional)
+write needs no carry and stays write-only. A keyed write `m[k] := 𝑣` joins it too: its desugared
+`m := insert(m, k, 𝑣)` commits the whole collection, whose other keys come from the snapshot,
+though its type writes `m` and reads none of it.
 
 **A leading deny is ordinary.** A block that denies (matches no writing/feeding guard) at the first
 transaction leaves the store's first commit to a later position, which no read has to accommodate: a

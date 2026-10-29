@@ -4474,13 +4474,13 @@ passed by reference, or to `await_final`, stays a handle and reads nothing. A pa
 its argument's, so a capability naming a parameter is `CapabilityBound::Parameter`, which no
 function body's filter admits: the nodes doing it keep it, a statement's below among them. A
 `MutDecl` binder is declared, not a parameter (`Typing::declare_mutable`).
-`InferCtx::record_capability` records a read or a write of a declared transactional variable as
-`ReadTxn(𝑥)` or `WriteTxn(𝑥)` (`InferCtx::of_family`), which belong to the run, so no scope
-discharges them. `bind_capability_name` marks only a declared variable transactional, so a `Mut`
-parameter's read or write, of a transactional variable or not, is `Read(𝑥)` or `Write(𝑥)` bound at
-the parameter; the call records its argument's. Lowering refuses a transactional variable declared
-in a function body, so every transactional binder is at depth 0. A written `Read(𝑥)` or `Write(𝑥)`
-naming a transactional variable is refused (`InferError::ClauseNamesNoVariable`).
+`InferCtx::record_capability` records a read or a write of a transactional variable, a declared one
+or a `Mut(V, Txn)` parameter, as `ReadTxn(𝑥)` or `WriteTxn(𝑥)` (`InferCtx::of_family`), which belong
+to the run, so no scope discharges them; a `Mut(V)` parameter's is `Read(𝑥)` or `Write(𝑥)`. A
+parameter's capability is bound at the parameter, and the call records its argument's. Lowering
+refuses a transactional variable declared in a function body, so every declared transactional binder
+is at depth 0. A written `Read(𝑥)` or `Write(𝑥)` naming a transactional variable is refused
+(`InferError::ClauseNamesNoVariable`).
 
 **A feed reached through another name is not tracked.** A capability is keyed by the name it is
 recorded through. A `Mut` handle cannot travel, so for a `Mut` that name is always the variable.
@@ -4629,7 +4629,12 @@ is one a write or an append hands a variable bound outside that capability's sco
 (`Typing::note_handed_out`, `InferError::HandsOutItsVariable`): the target's type, read through the
 lower bounds of the inference variables in it, may hold no function with a capability bound below
 the target's scope, which for the run's state is every scope and for a `Mut` or `Feed` parameter the
-function's own.
+function's own. A `Transaction` the top level requires is supplied by nothing, since only a block's
+body supplies one, so each read or write of a transactional variable that no block encloses,
+directly or through a call, is refused at the node it entered the top level at
+(`InferError::TransactionOutsideBlock`). A block whose body causes nothing does nothing, and is
+refused as an inert statement is (`InferCtx::does_nothing`, `InferError::EmptyTransaction`); a
+statement inside such a block is not reported again.
 
 **Statements.** An expression statement a program writes before its block's last statement gets a
 capability variable of its own around its expression's, which keeps every capability, the enclosing
@@ -4724,6 +4729,20 @@ that compile a capability away discharge it from every node and function type at
 `lambda_elim` receives is pure-functional, requiring at most the input a source opens
 (`capabilities::assert_discharged`), and in debug builds each pass's output is checked to state, at
 every node, what its children do and its own effect (`capabilities::assert_monotone`).
+
+### Block footprints
+
+A `with begin():` block's footprint is what its capabilities state it reads and writes of the run's
+transactional state: its `ReadTxn` and `WriteTxn` capabilities, and the tops holding some. Inlining
+gives a call's body what the call's clause states beyond it, and flattening a block's body onto one
+spine gives the block what it drops (`transact_phase::flatten_begin_bodies`), so a block's
+capabilities still hold a write a function's clause declares and its body does not perform.
+`transact_phase` takes each block's keys, store and read set from them
+(`transact_phase::block_keys`), so the stores follow the capabilities `docs/chl-spec.md`,
+"Discharging requirements and effects", states, a top included. A block in a polymorphic definition
+has in each clone what that clone's use brings ([Capabilities on every
+expression](#capabilities-on-every-expression)), which holds no clause variable, and inlining
+renames a `Mut` parameter in it to the argument (`Subst::apply_capabilities`).
 
 ## 5. CCL-specific inference rules
 

@@ -358,7 +358,18 @@ where
             open(f, expr);
             open(f, body);
         }
-        N::Begin { body } => open(f, body),
+        // A block reads and writes the variables its capabilities name, through a call too.
+        N::Begin { body } => {
+            for n in e
+                .capabilities
+                .known_set()
+                .into_iter()
+                .flat_map(|set| set.names())
+            {
+                f(ScopedItem::VarRef(n));
+            }
+            open(f, body);
+        }
         // A type alias binds no value; its type is a type slot, reached by the
         // caller's type walk.
         N::LetType { body, .. } | N::Run { body, .. } => open(f, body),
@@ -607,6 +618,15 @@ where
         N::Feed { name, .. } | N::Define { name, .. } | N::MutWrite { name, .. } => {
             f(ScopedItemMut::VarRef(name));
         }
+        N::Begin { .. } => {
+            if e.capabilities.known_set().is_some() {
+                e.capabilities = e.capabilities.map_known_names(|n| {
+                    let mut n = n.clone();
+                    f(ScopedItemMut::VarRef(&mut n));
+                    n
+                });
+            }
+        }
         N::Transact { keys, writers, .. } => {
             for k in keys {
                 f(ScopedItemMut::KeyRef(&mut k.name));
@@ -644,7 +664,6 @@ where
         | N::DisjointJoin(_)
         | N::Realized { .. }
         | N::ExprStmt { .. }
-        | N::Begin { .. }
         | N::Lambda { .. }
         | N::Let { .. }
         | N::LetType { .. }

@@ -662,9 +662,8 @@ The effecting forms:
 - **Feed `<<`** (§3.7) appends its right-hand side to a feed.
 - **A call to an effecting function** — one that writes a `Mut(…)` parameter (pass-by-reference,
   §6.2) or writes a transactional mutable variable in a `with begin():` block of its own or in the
-  block that calls it (§8, §8.7, **[Decided]**) — performs that function's writes. A function's
-  effects are always visible in its type: its `causes` clause states them, written or inferred.
-  There are **no
+  block that calls it (§8, §8.7) — performs that function's writes. A function's effects are always
+  visible in its type: its `causes` clause states them, written or inferred. There are **no
   implicit-effect functions**, so an inert expression statement (§4.9) stays detectable and
   rejected.
 - **`raise`** (**[Decided]**), a call that may raise, and an output outside the program, such
@@ -1664,7 +1663,7 @@ f(0)          # 20
 A function cannot rebind a captured immutable name. It may read a captured induction variable while
 inside its scope, or read and write a captured transactional variable. A transactional read or write
 requires `Transaction`, which an enclosing `with begin():` block supplies, either in the function or
-at its call (**[Decided]**). The function's contract records its reads and writes
+at its call. The function's contract records its reads and writes
 ([Capabilities](#69-capabilities)).
 
 Recursion through self-reference is **[Planned]**; each function must be definable without referring
@@ -3481,13 +3480,12 @@ is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 
 ### 6.9 Capabilities
 
-**[Decided]** — `Transaction` in a function a block calls ([8.7 Transactions as contextual
-parameters](#87-transactions-as-contextual-parameters)); readings ([Inputs from outside the
-program](#inputs-from-outside-the-program)); exceptions ([Exceptions](#exceptions)); naming another
-module's public transactional variable, `WriteTxn(inv::stock)`; sink functions and calls made
-outside the program ([Output outside the program](#output-outside-the-program)); and keeping
-readings across a reload and a restart ([Inputs from outside the
-program](#inputs-from-outside-the-program)). The rest of this section is implemented.
+**[Decided]** — readings ([Inputs from outside the program](#inputs-from-outside-the-program));
+exceptions ([Exceptions](#exceptions)); naming another module's public transactional variable,
+`WriteTxn(inv::stock)`; sink functions and calls made outside the program ([Output outside the
+program](#output-outside-the-program)); and keeping readings across a reload and a restart ([Inputs
+from outside the program](#inputs-from-outside-the-program)). The rest of this section is
+implemented.
 
 A function's type states what a call reads from its context, in its **`requires` clause**, and what
 the call contributes besides its result, in its **`causes` clause**. A requirement is an input that
@@ -4191,7 +4189,7 @@ instance ([Equality and order](#equality-and-order)).
   satisfiable, and it has no other effect than the associated types it names.
 - **One clause holds every requirement.** `Transaction`
   ([8.7 Transactions as contextual parameters](#87-transactions-as-contextual-parameters))
-  is written in the same clause: `requires Transaction, Orderable(T, T)` (**[Decided]**).
+  is written in the same clause: `requires Transaction, Orderable(T, T)`.
 - **The body uses only what the clause states.** An operator whose operand type involves a type
   parameter is an error unless a requirement or the parameter's bound covers it. Where both do, the
   requirement decides: `x + y` under `T <: Int` and `requires a: Addable(T, T), a::Output <: T` is
@@ -5108,7 +5106,7 @@ for req in incr_reqs:
   at all. There is no partially-visible commit.
 - Writes to a `Txn`-domain mutable variable are legal **only** inside a `with
   begin():` block, or in a function the block calls, which requires
-  `Transaction` for them and gets it from the block (§8.7, **[Decided]**); a write that no
+  `Transaction` for them and gets it from the block (§8.7); a write that no
   block encloses is rejected (§8.3). A call inside a block of a function
   that runs a block of its own is a disguised nested transaction.
 - **Nested transactions are rejected** — a block commits as one unit, so a
@@ -5187,7 +5185,7 @@ for req in withdraw_reqs:
   `def available(): stock` reads `stock`, transactional, so it requires
   `Transaction` and `ReadTxn(stock)`.
 - **A `Txn` mutable variable is read only inside a `with begin():` block,** or in a function
-  the block calls (**[Decided]**), which requires `Transaction` for it
+  the block calls, which requires `Transaction` for it
   ([8.7 Transactions as contextual parameters](#87-transactions-as-contextual-parameters)).
   A bare read that no block encloses is an error, and stays one: the block is what pins a
   **snapshot-consistent** view, so that several mutable variable reads in one
@@ -5379,8 +5377,6 @@ or every transaction denies, the await is `x`'s initializer.
 > variable, and the refusal is a compile error, never a wrong answer.
 
 ### 8.7 Transactions as contextual parameters
-
-**[Decided]** — the rules of this section.
 
 (2026-06-29 §6; the north-star `txn_kv` program is the worked example.)
 

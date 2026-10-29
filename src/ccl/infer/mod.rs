@@ -1460,11 +1460,12 @@ fn run_once(
     // validator does not traverse for witness references. This additional walk is debug-only.
     #[cfg(debug_assertions)]
     debug_assert_no_free_witness(expr, "post-inference");
-    // An expression statement does something only by what it causes.
+    // An expression statement, and a `with begin():` block, does something only by what it
+    // causes.
     let inert: Vec<LocatedInferError> = sub_ctx
-        .inert_statements()
+        .does_nothing()
         .into_iter()
-        .map(|node| LocatedInferError::new(InferError::InertStatement, node))
+        .map(|(node, error)| LocatedInferError::new(error, node))
         .collect();
     // A public function's type naming a variable its module keeps is a type the module's
     // interface cannot state, so it fails inference outright.
@@ -1489,6 +1490,27 @@ fn run_once(
     // A private feed a public function appends to is appended to by other modules, so it is
     // the run's, as a public feed is.
     let mut top_level = sub_ctx.top_level_capabilities();
+    // Only a `with begin():` block's body supplies a transaction, so one a top level requires,
+    // itself or through `Context`, is supplied by nothing.
+    let transaction = crate::ccl::capabilities::Capability::Requires(
+        crate::ccl::capabilities::Requirement::transaction(),
+    );
+    let unsupplied: Vec<LocatedInferError> = top_level
+        .iter()
+        .filter(|l| match &l.item {
+            crate::ccl::capabilities::Capability::Every(every) => every.holds(&transaction),
+            item => *item == transaction,
+        })
+        .map(|l| {
+            let at = l
+                .at
+                .expect("a top-level requirement enters at the node that records or carries it");
+            LocatedInferError::new(InferError::TransactionOutsideBlock, at)
+        })
+        .collect();
+    if !unsupplied.is_empty() {
+        return Err(failed(unsupplied));
+    }
     top_level.extend(exported.appends);
     Ok(Inferred {
         ty: expr.ty.clone(),
