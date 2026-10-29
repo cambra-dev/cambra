@@ -999,12 +999,27 @@ pub struct Upper {
     /// `only` on one clause and leave the other a lower bound.
     pub of_requires: bool,
     pub of_causes: bool,
+    /// Effects the variable may not hold whatever else the bound admits: `RunTransaction` inside a
+    /// `with begin():` body.
+    pub forbidden: BTreeSet<Effect>,
     pub blame: Blame,
 }
 
 impl Upper {
     /// Whether `item` is within this bound.
     pub fn admits(&self, item: &Item) -> bool {
+        let forbidden = match item {
+            Item::Causes(e) => self.forbidden.contains(e),
+            // A top holds what the bound forbids unless it takes it away.
+            Item::Every(every) => self
+                .forbidden
+                .iter()
+                .any(|e| every.holds(&Item::Causes(e.clone()))),
+            _ => false,
+        };
+        if forbidden {
+            return false;
+        }
         let of_causes = item.of_causes();
         let bounded = if of_causes {
             self.of_causes
@@ -1017,12 +1032,14 @@ impl Upper {
 
 /// Where a failed [`Upper`] is written. The first capability beyond it is reported at the node
 /// where it entered the variable, with this as the secondary label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Blame {
     /// A `def`'s `only` clause.
     Clause(chl_parser::ast::Span),
     /// The trait's signature bounding an instance's function.
     Signature(chl_parser::ast::Span),
+    /// A `with begin():` block, at its node, whose body may not commit.
+    NestedTransaction(NodeId),
     /// A written function type, whose clauses are exact.
     Written(chl_parser::ast::Span),
     /// A clause variable's bound, `E <: Effect except RunTransaction`, which each use's
@@ -1101,6 +1118,7 @@ impl EffectVar {
             u.set == upper.set
                 && u.of_requires == upper.of_requires
                 && u.of_causes == upper.of_causes
+                && u.forbidden == upper.forbidden
         }) {
             return;
         }
