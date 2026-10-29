@@ -83,6 +83,43 @@ fn record_wrap_carries_no_region_between_notifications() {
     assert_keeps_without_state(&record_wrap, 0);
 }
 
+fn map_domain() -> Built {
+    let (input, consumer) = feed(ints());
+    (Box::new(MapDomain::new(input)), vec![consumer])
+}
+
+#[test]
+fn map_domain_forwards_its_inputs_region() {
+    assert_keeps(&map_domain, 0);
+}
+
+#[test]
+fn map_domain_carries_no_region_between_notifications() {
+    assert_keeps_without_state(&map_domain, 0);
+}
+
+fn bools() -> Tiling {
+    Tiling::data_function(
+        Extent::uint_range(8),
+        Tiling::Scalar(Extent::Base(BaseType::Bool)),
+    )
+}
+
+fn restrict() -> Built {
+    let (predicate, consumer) = feed(bools());
+    (Box::new(Restrict::new(predicate)), vec![consumer])
+}
+
+#[test]
+fn restrict_forwards_its_predicates_region() {
+    assert_keeps(&restrict, 0);
+}
+
+#[test]
+fn restrict_carries_no_region_between_notifications() {
+    assert_keeps_without_state(&restrict, 0);
+}
+
 fn map_result_with_source() -> Built {
     use crate::interpreter::TestDataSource;
     use std::{cell::RefCell, rc::Rc};
@@ -133,6 +170,24 @@ fn zip_forwards_the_region_of_its_second_arm_without_state() {
     assert_keeps_without_state(&zip, 1);
 }
 
+fn product() -> Built {
+    let (outer, first) = feed(ints());
+    let (inner, second) = feed(nested());
+    let op = Product::per_row_at(outer, inner, CurryLevel::new(1));
+    (Box::new(op), vec![first, second])
+}
+
+#[test]
+fn product_forwards_the_region_of_its_outer_side() {
+    assert_keeps(&product, 0);
+}
+
+#[test]
+fn product_forwards_the_region_of_its_inner_side_without_state() {
+    assert_keeps(&product, 1);
+    assert_keeps_without_state(&product, 1);
+}
+
 fn int() -> Extent {
     Extent::Base(BaseType::Int)
 }
@@ -146,6 +201,34 @@ fn assert_widens(build: &dyn Fn() -> Built, notified: usize) {
             "{sent:?}"
         );
     }
+}
+
+fn filter(predicate: Tiling) -> Built {
+    let (input, data) = feed(ints());
+    let (predicate, mask) = feed(predicate);
+    let op = Filter::new_at(input, predicate, CurryLevel::OUTERMOST);
+    (Box::new(op), vec![data, mask])
+}
+
+#[test]
+fn filter_forwards_the_region_of_each_collection_side() {
+    for side in [0, 1] {
+        assert_keeps(&|| filter(bools()), side);
+    }
+    assert_keeps_without_state(&|| filter(bools()), 1);
+}
+
+/// A predicate that is one function value is read whole.
+#[test]
+fn filter_sends_everything_for_a_function_valued_predicate() {
+    let function = || {
+        filter(Tiling::Scalar(Extent::Function {
+            domain: Box::new(int()),
+            codomain: Box::new(Extent::Base(BaseType::Bool)),
+        }))
+    };
+    assert_widens(&function, 1);
+    assert_keeps(&function, 0);
 }
 
 fn map_result_to_const(level: CurryLevel) -> Built {
@@ -290,6 +373,48 @@ fn variant_is_forwards_the_region_of_a_stream() {
 #[test]
 fn variant_is_over_a_bare_union_sends_everything() {
     assert_widens(&|| variant_is(Tiling::Scalar(union_extent())), 0);
+}
+
+fn converse(level: CurryLevel) -> Built {
+    let (input, consumer) = feed(match level == CurryLevel::OUTERMOST {
+        true => ints(),
+        false => nested(),
+    });
+    (Box::new(Converse::new_at(input, level)), vec![consumer])
+}
+
+#[test]
+fn converse_beneath_a_standing_level_forwards_the_region() {
+    let beneath = || converse(CurryLevel::new(1));
+    assert_keeps(&beneath, 0);
+    assert_keeps_without_state(&beneath, 0);
+}
+
+/// Inverting the outermost collection makes its values the keys.
+#[test]
+fn converse_at_the_outermost_level_sends_everything() {
+    assert_widens(&|| converse(CurryLevel::OUTERMOST), 0);
+}
+
+fn uncurry(level: CurryLevel) -> Built {
+    let (input, consumer) = feed(match level == CurryLevel::OUTERMOST {
+        true => nested(),
+        false => Tiling::data_function(Extent::uint_range(8), nested()),
+    });
+    (Box::new(Uncurry::new_at(input, level)), vec![consumer])
+}
+
+#[test]
+fn uncurry_beneath_a_standing_level_forwards_the_region() {
+    let beneath = || uncurry(CurryLevel::new(1));
+    assert_keeps(&beneath, 0);
+    assert_keeps_without_state(&beneath, 0);
+}
+
+/// Pairing the whole tile re-keys it.
+#[test]
+fn uncurry_at_the_outermost_level_sends_everything() {
+    assert_widens(&|| uncurry(CurryLevel::OUTERMOST), 0);
 }
 
 fn make_record() -> Built {

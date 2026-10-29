@@ -73,6 +73,9 @@ impl TileOperator for Converse {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // Beneath standing levels the input's outermost keys are the result's; inverting the
+        // outermost collection re-keys.
+        let keeps_keys = self.level != CurryLevel::OUTERMOST;
         Box::new(ConverseProducer {
             base: ProducerBase::new(
                 ConverseProducer::alloc_id(),
@@ -82,7 +85,7 @@ impl TileOperator for Converse {
             ),
             input: self.input.subscribe(
                 self.tiling().universal_guard(),
-                widening(consumer),
+                consumer_keeping_keys_if(keeps_keys, consumer),
                 scheduler,
             ),
             held: Vec::new(),
@@ -457,6 +460,7 @@ impl TileOperator for MapDomain {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // Every level's keys stand.
         Box::new(MapDomainProducer {
             base: ProducerBase::new(
                 MapDomainProducer::alloc_id(),
@@ -464,11 +468,9 @@ impl TileOperator for MapDomain {
                 &self.base,
                 scheduler,
             ),
-            input: self.input.subscribe(
-                self.tiling().universal_guard(),
-                widening(consumer),
-                scheduler,
-            ),
+            input: self
+                .input
+                .subscribe(self.tiling().universal_guard(), consumer, scheduler),
             level: self.level,
         })
     }
@@ -602,6 +604,9 @@ impl TileOperator for Uncurry {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // Beneath standing levels the input's outermost keys are the result's; pairing the whole
+        // tile re-keys.
+        let keeps_keys = self.level != CurryLevel::OUTERMOST;
         Box::new(UncurryProducer {
             base: ProducerBase::new(
                 UncurryProducer::alloc_id(),
@@ -611,7 +616,7 @@ impl TileOperator for Uncurry {
             ),
             input: self.input.subscribe(
                 self.tiling().universal_guard(),
-                widening(consumer),
+                consumer_keeping_keys_if(keeps_keys, consumer),
                 scheduler,
             ),
             level: self.level,
@@ -893,8 +898,20 @@ impl TileOperator for Filter {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
-        let predicate_producer = subscribe_forwarding(&mut *self.predicate, &shared, scheduler);
-        let input_producer = subscribe_forwarding(&mut *self.input, &shared, scheduler);
+        // A side that is a collection is pulled at the projection and shares the mask's keys; a
+        // side that is not is read whole.
+        let predicate_producer = subscribe_forwarding_keeping_keys_if(
+            self.predicate.tiling().is_data_function(),
+            &mut *self.predicate,
+            &shared,
+            scheduler,
+        );
+        let input_producer = subscribe_forwarding_keeping_keys_if(
+            self.input.tiling().is_data_function(),
+            &mut *self.input,
+            &shared,
+            scheduler,
+        );
         Box::new(FilterProducer {
             base: ProducerBase::new(
                 FilterProducer::alloc_id(),
@@ -1164,9 +1181,10 @@ impl TileOperator for Restrict {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // The restricted domain is the predicate's keys that pass, so a region of them is a region of the result's.
         let predicate_producer = self.predicate.subscribe(
             self.predicate.tiling().universal_guard(),
-            widening(consumer),
+            consumer,
             scheduler,
         );
         Box::new(RestrictProducer {
@@ -1551,8 +1569,9 @@ impl TileOperator for Product {
                 scheduler,
             )
             .sharing(gate),
-            outer: subscribe_forwarding(&mut *self.outer, &shared, scheduler),
-            inner: subscribe_forwarding(&mut *self.inner, &shared, scheduler),
+            // Both sides are pulled at the projection, aligned row for row.
+            outer: subscribe_forwarding_keeping_keys(&mut *self.outer, &shared, scheduler),
+            inner: subscribe_forwarding_keeping_keys(&mut *self.inner, &shared, scheduler),
             level,
             empty_level,
             pair: self.tiling().deepest_values().clone(),
@@ -3194,7 +3213,6 @@ mod tests {
 #[cfg(test)]
 mod filter_projection_tests {
     use super::*;
-
     use crate::interpreter::BaseType;
     use crate::interpreter::tile_operators::test_helpers::{
         GuardLog, ProjectionSpy, assert_conforms, int_entries, ints_by_position, keys_between,
