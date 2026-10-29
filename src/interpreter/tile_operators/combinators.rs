@@ -105,7 +105,7 @@ impl TileOperator for Converse {
 /// it covers at once (`release_impl`), and each later row of a released group on the read that
 /// first holds it (`release_late_rows`). An input guard names rows by key, so it cannot name a
 /// group before its rows are read. In consuming mode no held row falls in a released group once a
-/// consume returns, which [`BreakingProducer::finalize`] checks (`src/interpreter/design-operators.md`,
+/// consume returns, which [`Breaker::finish`] checks (`src/interpreter/design-operators.md`,
 /// "A release of a converse group").
 struct ConverseProducer {
     base: ProducerBase,
@@ -131,6 +131,21 @@ struct ConverseProducer {
 /// An input row as [`ConverseProducer::held`] records it: the output path it stands at, then
 /// its input path.
 type HeldRow = (Vec<Value>, Vec<Value>);
+
+/// A converse of the outermost level of `input` that nothing subscribed, answering at `tiling`,
+/// for a test that builds a chain of pipelines by hand.
+#[cfg(test)]
+pub(crate) fn converse_of(
+    input: Box<dyn TileProducer>,
+    tiling: &Tiling,
+) -> crate::interpreter::dispatcher::BreakerHandle {
+    Rc::new(RefCell::new(ConverseProducer::new(
+        ProducerBase::unowned(ConverseProducer::alloc_id(), tiling),
+        input,
+        CurryLevel::OUTERMOST,
+        tiling.values_at(CurryLevel::OUTERMOST).empty_at_no_rows(),
+    )))
+}
 
 impl ConverseProducer {
     fn new(
@@ -555,6 +570,23 @@ impl Breaker for ConverseProducer {
         }
         self.input.release(upstream_guard);
     }
+
+    fn input_tiling(&self, _: InputId) -> Tiling {
+        self.input.tiling().clone()
+    }
+
+    fn input_released(&self, _: InputId) -> TileGuard {
+        self.input.obsolete_guard().clone()
+    }
+
+    fn as_producer(&self) -> Option<&dyn BreakingProducer> {
+        Some(self)
+    }
+
+    fn finish(&mut self, pushes: &mut Pushes<'_>, _last: bool) {
+        self.debug_assert_released_groups_freed();
+        pushes.push_final(self);
+    }
 }
 
 impl ConverseProducer {
@@ -584,10 +616,6 @@ impl ConverseProducer {
 }
 
 impl BreakingProducer for ConverseProducer {
-    fn input(&self) -> &dyn TileProducer {
-        &*self.input
-    }
-
     /// It holds groups of rows beneath the groups' keys, and what is left of that after a release
     /// beneath them is a region beneath the outermost keys, and a reader's chain may restate only
     /// the outermost keys (`TileProducer::restates`).
@@ -600,14 +628,12 @@ impl BreakingProducer for ConverseProducer {
         self.invert(self.cached.clone()).0.to_guard()
     }
 
-    fn finalize(&mut self) -> TileGuard {
-        self.debug_assert_released_groups_freed();
-        finalize_guard(
-            &self.name(),
-            self.input(),
-            &self.held(),
-            self.obsolete_guard(),
-        )
+    /// Cut at the outermost keys of what the held rows build: the groups for a converse of the
+    /// outermost level, and the standing rows for one beneath standing levels.
+    fn morsels(&self, guard: &TileGuard, rows: usize) -> Vec<TileGuard> {
+        let groups = self.invert(self.cached.clone()).0;
+        let keys = groups.live_keys().into_iter().flatten();
+        cut_at_keys(guard, keys.map(|(_, key)| key), rows, self.tiling())
     }
 
     fn offer_impl(&mut self, guard: TileGuard) -> Tile {
@@ -5053,11 +5079,11 @@ mod converse_consuming_tests {
         let mut lazy = converse_over(&rows_source(0..10));
         assert_eq!(consuming.get(universal()), lazy.get(universal()));
         // Every group is final once the input has drained, whatever its value.
-        assert_eq!(consuming.finalize(), universal());
+        assert_eq!(consuming.final_guard(), universal());
     }
 
     /// A group released drops its rows from what the converse holds and from the input, and
-    /// `finalize` leaves the group out.
+    /// `final_guard` leaves the group out.
     #[test]
     fn a_released_group_leaves_the_rows_of_the_group_out() {
         let source = rows_source(0..9);
@@ -5072,22 +5098,14 @@ mod converse_consuming_tests {
             cached(&converse),
             (0..9).filter(|k| k % 3 != 1).collect::<Vec<_>>()
         );
-        let TileGuard::Function(FunctionGuard::Domain(kept)) = converse.finalize() else {
+        let TileGuard::Function(FunctionGuard::Domain(kept)) = converse.final_guard() else {
             panic!("a guard of the groups")
         };
         assert!(kept.contains(&Value::Int(0)) && kept.contains(&Value::Int(2)));
         assert!(
             !kept.contains(&Value::Int(1)),
-            "the released group is not finalized"
+            "the released group is not in the final guard"
         );
-    }
-
-    #[test]
-    #[should_panic(expected = "finalizes after its input has stated everything complete")]
-    fn finalize_before_the_input_has_drained_panics() {
-        let mut converse = converse_over(&rows_source(0..10));
-        converse.consume_impl(InputId::ONLY, keys_between(0, 3));
-        converse.finalize();
     }
 
     #[test]
@@ -5315,13 +5333,13 @@ mod converse_consuming_tests {
 
     /// What such a release leaves is every path of the groups but the keys released.
     #[test]
-    fn finalize_after_a_release_beneath_the_groups_names_the_paths_left() {
+    fn final_guard_after_a_release_beneath_the_groups_names_the_paths_left() {
         let mut converse = converse_over(&rows_source(0..10));
         converse.consume_impl(InputId::ONLY, ints().universal_guard());
         let released = TileGuard::Function(FunctionGuard::Codomain(Box::new(keys_between(4, 5))));
         converse.release(released.clone());
         let before = Projection::of(&converse.held()).expect("a region of keys");
-        let held = Projection::of(&converse.finalize()).expect("a region of paths");
+        let held = Projection::of(&converse.final_guard()).expect("a region of paths");
         let released = Projection::of(&released).expect("a region of paths");
         assert_eq!(held.level(), Some(CurryLevel::new(1)));
         assert_eq!(held.intersect(&released), Projection::Nothing);
@@ -5335,11 +5353,11 @@ mod converse_consuming_tests {
 
     /// A release of every group leaves nothing held.
     #[test]
-    fn finalize_after_releasing_everything_holds_nothing() {
+    fn final_guard_after_releasing_everything_holds_nothing() {
         let mut converse = converse_over(&rows_source(0..10));
         converse.consume_impl(InputId::ONLY, ints().universal_guard());
         converse.release(universal());
-        assert_eq!(converse.finalize(), out_tiling().empty_guard());
+        assert_eq!(converse.final_guard(), out_tiling().empty_guard());
     }
 
     /// The model of a run over a growing input: the rows held and the groups released.
@@ -5441,14 +5459,14 @@ mod converse_consuming_tests {
             }
             self.input.check(&self.sut_source, trace);
             if self.input.drained() {
-                let guard = self.sut.finalize();
+                let guard = self.sut.final_guard();
                 match self.released_all {
-                    true => assert_eq!(guard, out_tiling().empty_guard(), "{trace}: finalize"),
+                    true => assert_eq!(guard, out_tiling().empty_guard(), "{trace}: final guard"),
                     false => {
                         let expected = Predicate::True.minus(&self.released_groups);
                         assert!(
                             same_region(&predicate(&guard), &expected),
-                            "{trace}: finalize is {guard:?}, not {expected:?}"
+                            "{trace}: the final guard is {guard:?}, not {expected:?}"
                         );
                     }
                 }
