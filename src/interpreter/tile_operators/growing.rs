@@ -68,6 +68,15 @@ pub(crate) fn growing_source(keys: impl IntoIterator<Item = u64>) -> Shared {
     source
 }
 
+/// A source holding `keys`, each valued by `value`.
+pub(crate) fn source_of(keys: impl IntoIterator<Item = u64>, value: fn(u64) -> i64) -> Shared {
+    let source = Shared::default();
+    for key in keys {
+        source.borrow_mut().rows.insert(key, value(key));
+    }
+    source
+}
+
 pub(crate) fn source(keys: impl IntoIterator<Item = u64>) -> Shared {
     let source = Shared::default();
     for key in keys {
