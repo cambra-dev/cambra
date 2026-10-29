@@ -29,6 +29,9 @@ pub enum PlaceKind {
     Yield,
     /// A call, spelled by the callee's name: `f(x)`, `m::f(x)`, `x.f()`.
     Call,
+    /// The body the compiler supplies for a `@Builtin` function, spelled by the function's name
+    /// (`docs/chl-spec.md`, "9.16 The std root").
+    Builtin,
 }
 
 /// Where a feed or a named call is written.
@@ -57,6 +60,7 @@ impl fmt::Display for Place {
             PlaceKind::Feed => write!(f, "{}<<", self.spelling)?,
             PlaceKind::Yield => write!(f, "{}", self.spelling)?,
             PlaceKind::Call => write!(f, "{}()", self.spelling)?,
+            PlaceKind::Builtin => write!(f, "@Builtin {}", self.spelling)?,
         }
         if self.index > 0 {
             write!(f, "#{}", self.index)?;
@@ -215,12 +219,16 @@ impl Walk {
                 requires,
                 causes,
                 body,
+                builtin,
             } => {
                 let names: Vec<&SmolStr> = owner.iter().chain([name]).map(|n| &n.node).collect();
                 self.within(&names, |w| {
                     w.signature(type_params, params, output.as_ref(), &requires.items);
                     w.trait_types(&causes.items);
                     w.stmts(body);
+                    if let Some(at) = builtin {
+                        w.place(*at, PlaceKind::Builtin, name.node.clone());
+                    }
                 });
             }
             Stmt::TypeDecl(decl) => match &decl.body {
