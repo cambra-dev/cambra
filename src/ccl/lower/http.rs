@@ -152,9 +152,9 @@ pub(super) fn lower_http_serve(
         "lower.http_serve",
     );
     let bound = bindings.wrap(value, body, span, ctx);
-    let channel = ctx.tag_machinery(Expr::new(TypedExprNode::Defer), span, "lower.http_serve");
-    // The channel's `let` and the `Defer` are manufactured plumbing; the bindings `target`
-    // makes image the assignment statement.
+    let channel = ctx.tag_machinery(Expr::new(TypedExprNode::Defer), span, SINK_BINDING);
+    // The channel's `let` is manufactured plumbing, and its `Defer` binds the route's sink; the
+    // bindings `target` makes image the assignment statement.
     Ok(ctx.tag_machinery(
         Expr::let_bind(responses, channel, bound),
         span,

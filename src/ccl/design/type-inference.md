@@ -3913,6 +3913,7 @@ whose body it is. Labels are recorded on the innermost frame:
 | `Feed` or `Define` into 𝑓 | `Append(𝑓)` |
 | `Begin` | `Commit`; its body's frame discharges `Transaction` |
 | `Source` | `Ext` |
+| a sink binding's `Defer` (`lower::SINK_BINDING`) | `Emit` |
 | a value read of a transactional variable 𝑥 | `Transaction` |
 | a value read of an induction variable 𝑥 | `Read(𝑥)` |
 | an `Apply` passing 𝑎 to a `Mut` parameter | `Write(𝑎)` |

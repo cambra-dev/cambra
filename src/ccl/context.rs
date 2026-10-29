@@ -1992,8 +1992,7 @@ fn run_frontend(
         projection
     };
     // The expression statements the program writes are inference's to read.
-    ctx.inference_ctx().expression_statements =
-        crate::ccl::lower::expression_statements(&lowering_projection);
+    ctx.inference_ctx().marks = crate::ccl::lower::marked_nodes(&lowering_projection);
 
     debug!("Lowered (pre-channelize):\n{}", symbolic(&expr));
 
@@ -2114,14 +2113,9 @@ fn check_modules(
         }
         let errors = match checked {
             Ok(found) => {
-                let obstacle = obstacle(
-                    Sites {
-                        sink: check.binds_sink,
-                        statements: &check.statements,
-                    },
-                    &found.top_level,
-                    |node| blame.span(node, Some(&tree)),
-                );
+                let obstacle = obstacle(&check.statements, &found.top_level, |node| {
+                    blame.span(node, Some(&tree))
+                });
                 if contracts_of == Some(check.file) {
                     *run_because = obstacle.as_ref().map(|o| o.phrase.clone());
                 }
@@ -2194,28 +2188,15 @@ struct Obstacle {
     site: Span,
 }
 
-/// The statements of a checked module that make it a run whatever its top level requires and
-/// causes ([`ModuleCheck`]).
-struct Sites<'a> {
-    sink: Option<Span>,
-    statements: &'a [crate::ccl::lower::modules::ModuleStatement],
-}
-
-/// What makes a checked module's top level unshareable: a sink it binds, a module it runs
-/// (`sites`), or a label its top level holds (`top_level`), at the span its
-/// node traces to (`span`). `None` when it is shareable.
+/// What makes a checked module's top level unshareable: a module one of its `statements`
+/// runs, or a label its top level holds (`top_level`), at the span its node traces to
+/// (`span`). `None` when it is shareable.
 fn obstacle(
-    sites: Sites<'_>,
+    statements: &[crate::ccl::lower::modules::ModuleStatement],
     top_level: &[crate::ccl::effects::Label],
     span: impl Fn(NodeId) -> Span,
 ) -> Option<Obstacle> {
-    if let Some(site) = sites.sink {
-        return Some(Obstacle {
-            phrase: "its top level binds a sink, which causes `Emit`".to_string(),
-            site,
-        });
-    }
-    if let Some(run) = sites.statements.iter().find(|s| s.runs) {
+    if let Some(run) = statements.iter().find(|s| s.runs) {
         return Some(Obstacle {
             phrase: "it runs another module".to_string(),
             site: run.span,
@@ -2433,8 +2414,7 @@ pub fn check_program(
         gate_leaks(&leaks, "lowering");
         projection
     };
-    ctx.inference_ctx().expression_statements =
-        crate::ccl::lower::expression_statements(&projection);
+    ctx.inference_ctx().marks = crate::ccl::lower::marked_nodes(&projection);
     for (_name, source) in ctx.lowering_ctx().take_sources() {
         let name = source.borrow().get_id().to_string();
         let output_type = source.borrow().output_type();

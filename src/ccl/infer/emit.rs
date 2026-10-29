@@ -313,7 +313,10 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
 
         TypedExprNode::ExprStmt { expr: e, body } => emit_expr_stmt(e, body, node_id, ctx)?,
 
-        TypedExprNode::Defer => emit_defer(ctx),
+        TypedExprNode::Defer => {
+            ctx.record_sink_binding();
+            emit_defer(ctx)
+        }
         // A value known only by its type, which the `let` binding it states.
         TypedExprNode::Abstract => ctx.fresh(),
 

@@ -1259,18 +1259,35 @@ impl LoweringContext {
 /// (`docs/chl-spec.md`, "4.9 Expression statement"). A statement lowering builds for a loop,
 /// an `if` or a `match` is not one. Every copy of the statement keeps its label, so the
 /// statements of each run and shared import of a module are found by it
-/// ([`expression_statements`]).
+/// ([`marked_nodes`]).
 pub(crate) const EXPRESSION_STATEMENT: RewriteLabel = "lower.expression_statement";
 
-/// The node of each expression statement in the trees `projection` attributes
-/// ([`EXPRESSION_STATEMENT`]).
-pub(crate) fn expression_statements(
+/// The rewrite label of the `Defer` a sink binding lowers to, `out = test_sink()` or the
+/// responses `http_serve` binds, which causes `Emit` (`docs/chl-spec.md`, "Output outside the
+/// program"). Lowering registers the sink by name beside the tree, and every copy of the
+/// binding keeps its label, so inference finds each run's sinks by it ([`marked_nodes`]).
+pub(crate) const SINK_BINDING: RewriteLabel = "lower.sink_binding";
+
+/// What lowering marks a node as, for inference, which reads the node by the mark.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mark {
+    /// An expression statement's `ExprStmt` ([`EXPRESSION_STATEMENT`]).
+    ExpressionStatement,
+    /// A sink binding's `Defer` ([`SINK_BINDING`]).
+    Sink,
+}
+
+/// The mark of each marked node in the trees `projection` attributes.
+pub(crate) fn marked_nodes(
     projection: &crate::ccl::provenance::SourceProjection,
-) -> HashSet<crate::ccl::provenance::NodeId> {
+) -> HashMap<crate::ccl::provenance::NodeId, Mark> {
     projection
         .iter()
-        .filter(|(_, attribution)| attribution.rewritten.label == EXPRESSION_STATEMENT)
-        .map(|(&id, _)| id)
+        .filter_map(|(&id, attribution)| match attribution.rewritten.label {
+            EXPRESSION_STATEMENT => Some((id, Mark::ExpressionStatement)),
+            SINK_BINDING => Some((id, Mark::Sink)),
+            _ => None,
+        })
         .collect()
 }
 
@@ -1699,24 +1716,6 @@ enum Lowered {
     Root,
     /// Any other module, which is run or imported.
     Module,
-}
-
-/// Where `module` binds a sink: the first statement that declares one, which
-/// causes `Emit` and so makes the module a run (`docs/chl-spec.md`, "Shareable
-/// modules \[Decided\]").
-pub fn sink_site(module: &ChlModule) -> Option<Span> {
-    module.body.iter().find_map(|stmt| {
-        let inner = match &stmt.node {
-            ChlStmt::Pub { stmt, .. } => &stmt.node,
-            other => other,
-        };
-        match inner {
-            ChlStmt::Assign { target, value, .. } => {
-                sink_declaration(target, value).map(|_| stmt.span)
-            }
-            _ => None,
-        }
-    })
 }
 
 /// The first statement at `module`'s top level that declares or writes mutable

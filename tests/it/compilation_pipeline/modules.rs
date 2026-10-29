@@ -800,7 +800,7 @@ fn a_misused_import_argument_is_refused(#[case] root: &str, #[case] needle: &str
 #[case::a_sink(indoc! {"
     out = test_sink()
     out << 1
-"}, "its top level binds a sink, which causes `Emit`", "out = test_sink()")]
+"}, "its top level causes `Emit`", "out = test_sink()")]
 #[case::a_source(indoc! {"
     pub xs = stdin()
 "}, "its top level requires `Ext`", "stdin()")]
