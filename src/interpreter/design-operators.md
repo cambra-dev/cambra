@@ -735,16 +735,16 @@ its readers from that state. `BreakingProducer`, a subtrait of `TileProducer`
 | `finalize()` | Returns what the breaker holds as a guard of its tiling: the guard of the cached tile less the guard its readers have released. It asserts that the input has stated everything complete, and wakes no one. |
 | `offer_impl(guard)` | Answers from the state `consume_impl` built and pulls nothing. The breaker's own `get_impl` calls it once the breaker is consuming. |
 
-`Memo`, `Aggregate`, `ExtractAggregate` and `MapAggregate` are breakers. A breaker starts in the
-pull mode described in [The producer protocol](#the-producer-protocol) and is a consuming producer
-from its first `consume_impl`, which it stays. `finalize` is provided over two accessors, `input()`
-and `held()`: it asserts that the input has been released whole and returns `held()` less the guard
-released to the breaker. A release removes rows from the state and leaves the statement of the tile
-as it was, so the difference is taken in the guard algebra. `guard_minus` (`tile_operators/mod.rs`)
-spells it for guards of a collection's outermost keys, of a scalar and of an aggregation, none of
-them qualified by an enclosing path, and for a record of such guards field by field. A state of
-another shape, such as a release named beneath the keys of a group, has no spelling, and `finalize`
-panics naming the gap instead of answering a smaller or larger region.
+`Memo`, `Aggregate`, `ExtractAggregate`, `MapAggregate` and `Converse` are breakers. A breaker
+starts in the pull mode described in [The producer protocol](#the-producer-protocol) and is a
+consuming producer from its first `consume_impl`, which it stays. `finalize` is provided over two
+accessors, `input()` and `held()`: it asserts that the input has been released whole and returns
+`held()` less the guard released to the breaker. A release removes rows from the state and leaves
+the statement of the tile as it was, so the difference is taken in the guard algebra. `guard_minus`
+(`tile_operators/mod.rs`) spells it for guards of a collection's outermost keys, of a scalar and of
+an aggregation, none of them qualified by an enclosing path, and for a record of such guards field
+by field. A state of another shape, such as a release named beneath the keys of a group, has no
+spelling, and `finalize` panics naming the gap instead of answering a smaller or larger region.
 
 ### Memo
 
@@ -782,6 +782,17 @@ accumulators, less the guard released. The input releases a complete group whole
 only beneath its key, so a group that arrives later in a region already consumed is still the
 input's to answer. A release of the output drops the accumulators it covers and forwards to the
 input, as in pull mode.
+
+### Converse
+
+A consuming `Converse` of the outermost level holds the input rows it merged, because which rows
+share a value is known only once the rows are read, and builds the groups from them on each offer. A
+group is final once the input has been released whole. A row whose group the consumer already
+released is dropped when it is merged, and a release of a group removes its rows and forwards to the
+input as in pull mode. The members of a group keep the order the rows arrived in, where a pull in
+pull mode orders them by key. `finalize` returns the guard of the groups built from the held rows,
+less the guard released. A `Converse` beneath standing levels has no consuming mode: releasing part
+of one row's inversion is `todo!` in pull mode, so `consume_impl` panics naming that.
 
 Nothing calls the three methods outside unit tests: no scheduler runs pipelines, and how a driver
 reaches a breaker from a program's roots is not decided.
