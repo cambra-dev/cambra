@@ -36,7 +36,9 @@ def subtypeCheck (lhs rhs : Ty) : Bool :=
       else
         subtypeCheck d1 d0) &&
       subtypeCheck c0 c1
-  | .tuple a, .tuple b => subtypeSeq a b
+  | .tuple a, .tuple b => a.length == b.length && subtypeSeq a b
+  | .tuple a, .openTuple b => subtypeSeq a b
+  | .openTuple a, .openTuple b => subtypeSeq a b
   | .record a, .record b => subtypeFields a b
   | .variant a, .variant b => subtypeTags b a
   | lhs, rhs =>
@@ -54,7 +56,8 @@ decreasing_by
     | omega
     | exact Ty.peel_sum_lt _ _ _h
 
-/-- Tuple positions, in demand (rhs) order. -/
+/-- Tuple positions, in demand (rhs) order: every position `b` lists exists in `a` and is below
+it. The closed-tuple arm adds the equal-width check. -/
 def subtypeSeq (a b : List Ty) : Bool :=
   match a, b with
   | _, [] => true
@@ -128,6 +131,19 @@ the checker refusing to build is the cheapest regression net for the rules' shap
 #guard subtypeCheck
   (.record [("a", .base .int)])
   (.record [("a", .base .int), ("b", .base .bool)]) = false
+
+/- A tuple's width is part of its type: neither a wider nor a narrower closed tuple is below
+another. -/
+#guard subtypeCheck (.tuple [.base .int, .base .bool]) (.tuple [.base .int]) = false
+#guard subtypeCheck (.tuple [.base .int]) (.tuple [.base .int, .base .bool]) = false
+#guard subtypeCheck (.tuple [.base .int, .base .bool]) (.tuple [.base .int, .base .bool]) = true
+
+/- An open tuple is above every tuple listing at least its positions, open or closed, and below no
+closed tuple. -/
+#guard subtypeCheck (.tuple [.base .int, .base .bool]) (.openTuple [.base .int]) = true
+#guard subtypeCheck (.openTuple [.base .int, .base .bool]) (.openTuple [.base .int]) = true
+#guard subtypeCheck (.openTuple [.base .int]) (.openTuple [.base .int, .base .bool]) = false
+#guard subtypeCheck (.openTuple [.base .int]) (.tuple [.base .int]) = false
 
 /- Variant width is the dual: fewer tags flow to more. -/
 #guard subtypeCheck

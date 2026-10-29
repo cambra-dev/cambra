@@ -186,6 +186,9 @@ inductive Ty where
   | txn
   | fn (binder : Option String) (kind : FunKind) (dom cod : Ty)
   | tuple (ts : List Ty)
+  /-- Mirror of `Type::OpenTuple`: every tuple of at least these positions, each position below
+  the one listed (`docs/chl-spec.md`, "Tuple width"). No value has this type; it is a bound. -/
+  | openTuple (ts : List Ty)
   | record (fields : List (String × Ty))
   | variant (tags : List (FieldKey × Ty))
   | refined (base : Ty) (refinements : List Predicate)
@@ -202,6 +205,7 @@ def Ty.beq : Ty → Ty → Bool
   | .fn n0 k0 d0 c0, .fn n1 k1 d1 c1 =>
       n0 == n1 && k0 == k1 && Ty.beq d0 d1 && Ty.beq c0 c1
   | .tuple a, .tuple b => Ty.beqSeq a b
+  | .openTuple a, .openTuple b => Ty.beqSeq a b
   | .record a, .record b => Ty.beqFields a b
   | .variant a, .variant b => Ty.beqTags a b
   | .refined b0 p0, .refined b1 p1 => Ty.beq b0 b1 && p0 == p1
@@ -248,6 +252,9 @@ theorem Ty.beq_iff : (a b : Ty) → (Ty.beq a b = true ↔ a = b)
   | .tuple ts, b => by
       cases b <;> simp [Ty.beq]
       case tuple bs => exact Ty.beqSeq_iff ts bs
+  | .openTuple ts, b => by
+      cases b <;> simp [Ty.beq]
+      case openTuple bs => exact Ty.beqSeq_iff ts bs
   | .record fs, b => by
       cases b <;> simp [Ty.beq]
       case record bs => exact Ty.beqFields_iff fs bs
@@ -330,6 +337,7 @@ inductive Ty.WellFormed : Ty → Prop where
   | txn : Ty.WellFormed .txn
   | fn {n k d c} : Ty.WellFormed d → Ty.WellFormed c → Ty.WellFormed (.fn n k d c)
   | tuple {ts} : (∀ t ∈ ts, Ty.WellFormed t) → Ty.WellFormed (.tuple ts)
+  | openTuple {ts} : (∀ t ∈ ts, Ty.WellFormed t) → Ty.WellFormed (.openTuple ts)
   | record {fs} : (fs.map (·.1)).Nodup → (∀ f ∈ fs, Ty.WellFormed f.2) →
       Ty.WellFormed (.record fs)
   | variant {tags} : (tags.map (·.1)).Nodup → (∀ t ∈ tags, Ty.WellFormed t.2) →
@@ -352,6 +360,10 @@ theorem Ty.WellFormed.fn_codomain {n k d c} (h : Ty.WellFormed (.fn n k d c)) : 
 theorem Ty.WellFormed.tuple_mem {ts t} (h : Ty.WellFormed (.tuple ts)) (hm : t ∈ ts) : t.WellFormed
     := by
   cases h with | tuple hts => exact hts t hm
+
+theorem Ty.WellFormed.openTuple_mem {ts t} (h : Ty.WellFormed (.openTuple ts)) (hm : t ∈ ts) :
+    t.WellFormed := by
+  cases h with | openTuple hts => exact hts t hm
 
 theorem Ty.WellFormed.record_mem {fs : List (String × Ty)} {n t}
     (h : Ty.WellFormed (.record fs)) (hm : (n, t) ∈ fs) : t.WellFormed := by

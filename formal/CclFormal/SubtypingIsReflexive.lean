@@ -37,7 +37,17 @@ theorem Subtyping.refl : (t : Ty) → t.WellFormed → Subtyping t t
   | .tuple ts, hwf => by
       cases hwf with
       | tuple hts =>
-        refine .tuple (Nat.le_refl _) fun i t0 t1 h0 h1 => ?_
+        refine .tuple rfl fun i t0 t1 h0 h1 => ?_
+        rw [h0] at h1
+        injection h1 with h
+        subst h
+        have hm : t0 ∈ ts := List.mem_of_getElem? h0
+        have hsz : sizeOf t0 < sizeOf ts := List.sizeOf_lt_of_mem hm
+        exact Subtyping.refl t0 (hts t0 hm)
+  | .openTuple ts, hwf => by
+      cases hwf with
+      | openTuple hts =>
+        refine .openTuple (Nat.le_refl _) fun i t0 t1 h0 h1 => ?_
         rw [h0] at h1
         injection h1 with h
         subst h

@@ -158,10 +158,29 @@ theorem subtyping_of_subtypeCheck :
           exact hdd (by simp)
         exact Subtyping.fnCompute (kindOkBool_iff.mp hok) hnd
           (subtyping_of_subtypeCheck d1 d0 hdom) hcodS
-    -- Tuple.
+    -- Closed tuples: equal widths, then position by position.
+    · rename_i a b
+      rw [Bool.and_eq_true] at h
+      obtain ⟨-, hpt⟩ := (subtypeSeq_iff a b).mp h.2
+      refine Subtyping.tuple (by simpa using h.1) fun i t0 t1 h0 h1 => ?_
+      have hm0 := List.mem_of_getElem? h0
+      have hm1 := List.mem_of_getElem? h1
+      have hs0 := List.sizeOf_lt_of_mem hm0
+      have hs1 := List.sizeOf_lt_of_mem hm1
+      exact subtyping_of_subtypeCheck t0 t1 (hpt i t0 t1 h0 h1)
+    -- A closed tuple below an open one.
     · rename_i a b
       obtain ⟨hlen, hpt⟩ := (subtypeSeq_iff a b).mp h
-      refine Subtyping.tuple hlen fun i t0 t1 h0 h1 => ?_
+      refine Subtyping.tupleOpen hlen fun i t0 t1 h0 h1 => ?_
+      have hm0 := List.mem_of_getElem? h0
+      have hm1 := List.mem_of_getElem? h1
+      have hs0 := List.sizeOf_lt_of_mem hm0
+      have hs1 := List.sizeOf_lt_of_mem hm1
+      exact subtyping_of_subtypeCheck t0 t1 (hpt i t0 t1 h0 h1)
+    -- Two open tuples.
+    · rename_i a b
+      obtain ⟨hlen, hpt⟩ := (subtypeSeq_iff a b).mp h
+      refine Subtyping.openTuple hlen fun i t0 t1 h0 h1 => ?_
       have hm0 := List.mem_of_getElem? h0
       have hm1 := List.mem_of_getElem? h1
       have hs0 := List.sizeOf_lt_of_mem hm0
@@ -237,6 +256,12 @@ theorem subtypeCheck_of_subtyping {lhs rhs : Ty}
       simp only [subtypeCheck]
       simp [kindOkBool, ih1, ih2, ihcod]
   | tuple hlen hpt ihpt =>
+      simp only [subtypeCheck, Bool.and_eq_true]
+      exact ⟨by simpa using hlen, (subtypeSeq_iff _ _).mpr ⟨Nat.le_of_eq hlen.symm, ihpt⟩⟩
+  | tupleOpen hlen hpt ihpt =>
+      simp only [subtypeCheck]
+      exact (subtypeSeq_iff _ _).mpr ⟨hlen, ihpt⟩
+  | openTuple hlen hpt ihpt =>
       simp only [subtypeCheck]
       exact (subtypeSeq_iff _ _).mpr ⟨hlen, ihpt⟩
   | record hsome hsub ihsub =>

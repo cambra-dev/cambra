@@ -420,6 +420,11 @@ impl Traits {
                     several => self.tells(&TypePattern::Tuple(several.to_vec()), payload, bound),
                 }
             }
+            // A tuple's width is part of its type, so a tuple of another width is not one
+            // of the pattern's (`docs/chl-spec.md`, "Tuple width").
+            (TypePattern::Tuple(parts), Value::Record(fields)) if fields.len() != parts.len() => {
+                Tells::No
+            }
             (TypePattern::Tuple(parts), Value::Record(fields)) => {
                 let mut out = Tells::Yes;
                 for (i, p) in parts.iter().enumerate() {

@@ -34,7 +34,7 @@ the combined position.
 mutual
 
 def kindResolved : CompactTy → Bool
-  | .mk _ r v f _ =>
+  | .mk _ r v f _ _ =>
     (match r with
      | none => true
      | some m => kindResolvedKeys m (m.map Prod.fst))
@@ -110,7 +110,7 @@ refinements attached: the other three helpers answer `none` and
 their `if` drops them, so `combine` sees one entry. -/
 
 theorem coalesce_atoms_only (pol : Bool) (as : List Atom) (c : Option (List Predicate)) :
-    coalesce pol (.mk as none none none c) =
+    coalesce pol (.mk as none none none c wd) =
       combine ((as.map atomTy).eraseDups.map some) c := by
   rw [coalesce, recordShapes_none, variantShapes_none, funShapes_none]
   show combine ((as.map atomTy).eraseDups.map some ++ [] ++ [] ++ []) c = _
@@ -118,12 +118,12 @@ theorem coalesce_atoms_only (pol : Bool) (as : List Atom) (c : Option (List Pred
 
 theorem coalesce_record_only (pol : Bool) (m : List (FieldKey × CompactTy))
     (c : Option (List Predicate)) :
-    coalesce pol (.mk [] (some m) none none c) =
+    coalesce pol (.mk [] (some m) none none c wd) =
       (do
-        let x ← recordShapes pol (.mk [] (some m) none none c)
+        let x ← recordShapes pol (.mk [] (some m) none none c wd)
         .ok (x.map (attachRefinements · c))) := by
   rw [coalesce, variantShapes_none, funShapes_none]
-  rcases h : recordShapes pol (.mk [] (some m) none none c) with e | x
+  rcases h : recordShapes pol (.mk [] (some m) none none c wd) with e | x
   · rfl
   · show combine ([] ++ [x] ++ [] ++ []) c = _
     simp [combine]
@@ -131,12 +131,12 @@ theorem coalesce_record_only (pol : Bool) (m : List (FieldKey × CompactTy))
 
 theorem coalesce_variant_only (pol : Bool) (m : List (FieldKey × CompactTy))
     (c : Option (List Predicate)) :
-    coalesce pol (.mk [] none (some m) none c) =
+    coalesce pol (.mk [] none (some m) none c wd) =
       (do
-        let x ← variantShapes pol (.mk [] none (some m) none c)
+        let x ← variantShapes pol (.mk [] none (some m) none c wd)
         .ok (x.map (attachRefinements · c))) := by
   rw [coalesce, recordShapes_none, funShapes_none]
-  rcases h : variantShapes pol (.mk [] none (some m) none c) with e | x
+  rcases h : variantShapes pol (.mk [] none (some m) none c wd) with e | x
   · rfl
   · show combine ([] ++ [] ++ [x] ++ []) c = _
     simp [combine]
@@ -144,12 +144,12 @@ theorem coalesce_variant_only (pol : Bool) (m : List (FieldKey × CompactTy))
 
 theorem coalesce_fun_only (pol : Bool) (g : KindMerge × CompactTy × CompactTy)
     (c : Option (List Predicate)) :
-    coalesce pol (.mk [] none none (some g) c) =
+    coalesce pol (.mk [] none none (some g) c wd) =
       (do
-        let x ← funShapes pol (.mk [] none none (some g) c)
+        let x ← funShapes pol (.mk [] none none (some g) c wd)
         .ok (x.map (attachRefinements · c))) := by
   rw [coalesce, recordShapes_none, variantShapes_none]
-  rcases h : funShapes pol (.mk [] none none (some g) c) with e | x
+  rcases h : funShapes pol (.mk [] none none (some g) c wd) with e | x
   · rfl
   · show combine ([] ++ [] ++ [] ++ [x]) c = _
     simp [combine]
@@ -163,7 +163,7 @@ the same one on both sides, so each case reasons about a single slot. -/
 
 /-- `coalesce` on a position whose only content is atoms and refinements. -/
 theorem coalesce_atoms (pol : Bool) (as : List Atom) (c : Option (List Predicate)) :
-    coalesce pol (.mk as none none none c) =
+    coalesce pol (.mk as none none none c wd) =
       (match (as.map atomTy).eraseDups with
        | [] => .ok none
        | [t] => .ok (some (attachRefinements t c))
@@ -290,7 +290,7 @@ theorem coalesce_keyed_rel (pol : Bool) :
 /-- `coalesce` on a position whose only content is a variant slot and refinements. -/
 theorem coalesce_variant_ok (pol : Bool) {m : List (FieldKey × CompactTy)}
     {c : Option (List Predicate)} {ty : Ty}
-    (h : coalesce pol (.mk [] none (some m) none c) = .ok (some ty)) :
+    (h : coalesce pol (.mk [] none (some m) none c wd) = .ok (some ty)) :
     ∃ kvs, ty = attachRefinements (.variant kvs) c ∧
       KeyedRelation (fun v t => coalesce pol v = .ok (some t)) m kvs := by
   have hattach : m.attach.mapM (fun vp => coalesce pol vp.val.snd)
@@ -302,7 +302,7 @@ theorem coalesce_variant_ok (pol : Bool) {m : List (FieldKey × CompactTy)}
     exact hgen (fun kv => coalesce pol kv.2)
   -- Case on the slot's contribution first: that reduces the outer bind, so the
   -- contribution's own shape is read off `hv` rather than through it.
-  rcases hv : variantShapes pol (.mk [] none (some m) none c) with e | x <;>
+  rcases hv : variantShapes pol (.mk [] none (some m) none c wd) with e | x <;>
     rw [coalesce_variant_only, hv] at h
   · cases h
   rcases x with _ | base
@@ -322,15 +322,16 @@ theorem coalesce_variant_ok (pol : Bool) {m : List (FieldKey × CompactTy)}
       exact ⟨(m.map Prod.fst).zip ts, rfl, coalesce_keyed_rel pol m payloads ts hpay hts⟩
 
 /-- `coalesce` on a position whose only content is a record slot and refinements: the
-payloads materialize pointwise, and the shape is a tuple when the keys are dense indices and a
-record when they are names. The two refusals — an empty field set and
-mixed keys — do not materialize, and the sparse-index shape is unresolved. -/
+payloads materialize pointwise, and the shape is the tuple the width names when the keys are
+indices and a record when they are names. The refusals — an empty field set, mixed keys, a
+conflicted width, and an index map that is not its width's positions — do not materialize. -/
 theorem coalesce_record_ok (pol : Bool) {m : List (FieldKey × CompactTy)}
-    {c : Option (List Predicate)} {ty : Ty}
-    (h : coalesce pol (.mk [] (some m) none none c) = .ok (some ty)) :
+    {c : Option (List Predicate)} {wd : Option TupleWidth} {ty : Ty}
+    (h : coalesce pol (.mk [] (some m) none none c wd) = .ok (some ty)) :
     m ≠ [] ∧ ∃ (ts : List Ty) (base : Ty), ty = attachRefinements base c ∧
       KeyedRelation (fun v t => coalesce pol v = .ok (some t)) m ((m.map Prod.fst).zip ts) ∧
-      ((∃ idxs, indexKeys m = some idxs ∧ byIndex m.length (idxs.zip ts) = some base) ∨
+      ((∃ idxs us, indexKeys m = some idxs ∧ byIndex m.length (idxs.zip ts) = some us ∧
+          TupleOf wd m.length us base) ∨
        (∃ names, nameKeys m = some names ∧ base = .record (names.zip ts))) := by
   have hattach : m.attach.mapM (fun rp => coalesce pol rp.val.snd)
       = m.mapM (fun kv => coalesce pol kv.2) := by
@@ -339,7 +340,7 @@ theorem coalesce_record_ok (pol : Bool) {m : List (FieldKey × CompactTy)}
       intro f
       simp
     exact hgen (fun kv => coalesce pol kv.2)
-  rcases hr : recordShapes pol (.mk [] (some m) none none c) with e | x <;>
+  rcases hr : recordShapes pol (.mk [] (some m) none none c wd) with e | x <;>
     rw [coalesce_record_only, hr] at h
   · cases h
   rcases x with _ | base
@@ -365,23 +366,14 @@ theorem coalesce_record_ok (pol : Bool) {m : List (FieldKey × CompactTy)}
             Or.inr ⟨names, rfl, rfl⟩⟩
   · rcases hpay : m.mapM (fun kv => coalesce pol kv.2) with e | payloads <;> rw [hpay] at hr
     · cases hr
-    · replace hr : (if (idxs.length == m.length &&
-            (List.range m.length).all (idxs.contains ·)) = true
-          then Except.ok ((payloads.mapM id).bind (fun ts => byIndex m.length (idxs.zip ts)))
-          else Except.ok none : Except CoalesceError (Option Ty)) = .ok (some base) := hr
-      by_cases hd :
-        (idxs.length == m.length && (List.range m.length).all (idxs.contains ·)) = true
-      · rw [if_pos hd] at hr
-        rcases hts : payloads.mapM id with _ | ts <;> rw [hts] at hr <;>
-          try simp only [Option.bind_some] at hr
-        · cases hr
-        · rcases htup : byIndex m.length (idxs.zip ts) with _ | tup <;> rw [htup] at hr
-          · cases hr
-          · cases hr
-            exact ⟨ts, base, rfl, coalesce_keyed_rel pol m payloads ts hpay hts,
-              Or.inl ⟨idxs, rfl, htup⟩⟩
-      · rw [if_neg hd] at hr
-        cases hr
+    · replace hr : tupleShape wd idxs payloads = .ok (some base) := hr
+      obtain ⟨ts, us, hts, hus, hof⟩ := tupleShape_ok hr
+      have hilen : idxs.length = m.length := by
+        have := congrArg List.length (indexKeys_keys hidx)
+        simpa using this.symm
+      rw [hilen] at hus hof
+      exact ⟨ts, base, rfl, coalesce_keyed_rel pol m payloads ts hpay hts,
+        Or.inl ⟨idxs, us, rfl, hus, hof⟩⟩
 
 /-- Dedup keeps a non-empty list non-empty, so a position with atoms contributes
 a shape. -/
@@ -402,17 +394,17 @@ theorem coalesce_shape (pol : Bool) {as : List Atom}
     {r v : Option (List (FieldKey × CompactTy))}
       {f : Option (KindMerge × CompactTy × CompactTy)}
     {c : Option (List Predicate)} {ty : Ty}
-    (h : coalesce pol (.mk as r v f c) = .ok (some ty)) :
+    (h : coalesce pol (.mk as r v f c wd) = .ok (some ty)) :
     (as ≠ [] ∧ r = none ∧ v = none ∧ f = none) ∨
     (as = [] ∧ (∃ m, r = some m) ∧ v = none ∧ f = none) ∨
     (as = [] ∧ r = none ∧ (∃ m, v = some m) ∧ f = none) ∨
     (as = [] ∧ r = none ∧ v = none ∧ ∃ g, f = some g) := by
   rw [coalesce] at h
-  rcases hr : recordShapes pol (.mk as r v f c) with e | rx <;> rw [hr] at h
+  rcases hr : recordShapes pol (.mk as r v f c wd) with e | rx <;> rw [hr] at h
   · cases h
-  rcases hv : variantShapes pol (.mk as r v f c) with e | vx <;> rw [hv] at h
+  rcases hv : variantShapes pol (.mk as r v f c wd) with e | vx <;> rw [hv] at h
   · cases h
-  rcases hf : funShapes pol (.mk as r v f c) with e | fx <;> rw [hf] at h
+  rcases hf : funShapes pol (.mk as r v f c wd) with e | fx <;> rw [hf] at h
   · cases h
   obtain ⟨t, hlen, -⟩ := combine_ok h
   -- One shape survives, so the four contributions' lengths sum to one. The atom
@@ -455,7 +447,7 @@ See `formal/design.md`, "Bound and leastness hypotheses".
 mutual
 
 def DataAgree (pol : Bool) : CompactTy → CompactTy → Bool
-  | .mk _ r₁ v₁ f₁ _, .mk _ r₂ v₂ f₂ _ =>
+  | .mk _ r₁ v₁ f₁ _ _, .mk _ r₂ v₂ f₂ _ _ =>
     (match r₁, r₂ with
      | some m₁, some m₂ => DataAgreeKeys pol m₁ m₂ (m₁.map Prod.fst)
      | _, _ => true)
@@ -529,7 +521,7 @@ outright. The atom lists are the one slot that
 compares by containment rather than presence. -/
 
 theorem absorbedBy_atoms_sub {pol : Bool} {as bs : List Atom} {r v f c r' v' f' c'}
-    (hle : absorbedBy pol (.mk as r v f c) (.mk bs r' v' f' c')) : ∀ x ∈ as, x ∈ bs := by
+    (hle : absorbedBy pol (.mk as r v f c wd) (.mk bs r' v' f' c' wd')) : ∀ x ∈ as, x ∈ bs := by
   rw [absorbedBy, merge.eq_def, equiv.eq_def] at hle
   simp only [Bool.and_eq_true] at hle
   obtain ⟨⟨⟨⟨⟨hat, -⟩, -⟩, -⟩, -⟩, -⟩ := hle
@@ -538,7 +530,7 @@ theorem absorbedBy_atoms_sub {pol : Bool} {as bs : List Atom} {r v f c r' v' f' 
   simpa using this
 
 theorem absorbedBy_record_absurd {pol : Bool} {as bs : List Atom} {mr : List (FieldKey × CompactTy)}
-    {v f c v' f' c'} (hle : absorbedBy pol (.mk as (some mr) v f c) (.mk bs none v' f' c')) : False
+    {v f c v' f' c'} (hle : absorbedBy pol (.mk as (some mr) v f c wd) (.mk bs none v' f' c' wd')) : False
       := by
   rw [absorbedBy, merge.eq_def, equiv.eq_def] at hle
   simp only [Bool.and_eq_true] at hle
@@ -547,7 +539,7 @@ theorem absorbedBy_record_absurd {pol : Bool} {as bs : List Atom} {mr : List (Fi
 
 theorem absorbedBy_variant_absurd {pol : Bool} {as bs : List Atom}
     {mv : List (FieldKey × CompactTy)}
-    {r f c r' f' c'} (hle : absorbedBy pol (.mk as r (some mv) f c) (.mk bs r' none f' c')) : False
+    {r f c r' f' c'} (hle : absorbedBy pol (.mk as r (some mv) f c wd) (.mk bs r' none f' c' wd')) : False
       := by
   rw [absorbedBy, merge.eq_def, equiv.eq_def] at hle
   simp only [Bool.and_eq_true] at hle
@@ -556,7 +548,7 @@ theorem absorbedBy_variant_absurd {pol : Bool} {as bs : List Atom}
 
 theorem absorbedBy_fun_absurd {pol : Bool} {as bs : List Atom}
     {g : KindMerge × CompactTy × CompactTy}
-    {r v c r' v' c'} (hle : absorbedBy pol (.mk as r v (some g) c) (.mk bs r' v' none c')) : False
+    {r v c r' v' c'} (hle : absorbedBy pol (.mk as r v (some g) c wd) (.mk bs r' v' none c' wd')) : False
       := by
   rw [absorbedBy, merge.eq_def, equiv.eq_def] at hle
   simp only [Bool.and_eq_true] at hle
@@ -621,7 +613,7 @@ intersect at a positive position and unite at a negative one — the opposite of
 variant slot, which is what makes their variance opposite. -/
 theorem equiv_record_slot {pol : Bool} {m₁ m₂ : List (FieldKey × CompactTy)}
     {ca cb : Option (List Predicate)}
-    (hle : absorbedBy pol (.mk [] (some m₁) none none ca) (.mk [] (some m₂) none none cb)) :
+    (hle : absorbedBy pol (.mk [] (some m₁) none none ca wda) (.mk [] (some m₂) none none cb wdb)) :
     (if pol then
       subtypeKeys (intersectMap pol m₁ m₂) m₂ ((intersectMap pol m₁ m₂).map Prod.fst) = true ∧
         subtypeKeys m₂ (intersectMap pol m₁ m₂) (m₂.map Prod.fst) = true
@@ -630,17 +622,49 @@ theorem equiv_record_slot {pol : Bool} {m₁ m₂ : List (FieldKey × CompactTy)
         subtypeKeys m₂ (unionMap pol m₁ m₂) (m₂.map Prod.fst) = true) := by
   rw [absorbedBy, merge.eq_def, equiv.eq_def] at hle
   simp only [Bool.and_eq_true] at hle
-  obtain ⟨⟨⟨⟨⟨-, -⟩, hrec⟩, -⟩, -⟩, -⟩ := hle
+  obtain ⟨⟨⟨⟨⟨-, -⟩, ⟨hrec, -⟩⟩, -⟩, -⟩, -⟩ := hle
   cases pol
   · simp only [Bool.false_eq_true, if_false] at hrec
     rw [← unionMap] at hrec
     simpa using hrec
   · simpa only [if_true] using hrec
 
+/-- The width the record slot carries, read off `absorbedBy`: merging the lower operand's width
+into the upper one's leaves the upper one's. -/
+theorem absorbedBy_width {pol : Bool} {as bs : List Atom} {r v f c r' v' f' c'}
+    {wda wdb : Option TupleWidth}
+    (hle : absorbedBy pol (.mk as r v f c wda) (.mk bs r' v' f' c' wdb)) :
+    mergeWidth pol wda wdb = wdb := by
+  rw [absorbedBy, merge.eq_def, equiv.eq_def] at hle
+  simp only [Bool.and_eq_true] at hle
+  obtain ⟨⟨⟨⟨⟨-, -⟩, ⟨-, hw⟩⟩, -⟩, -⟩, -⟩ := hle
+  simpa using hw
+
+/-- Two widths whose tuples relate by subtyping, lower first: the widths are equal when both are
+closed, and the upper one is not closed when the lower one is open. The positions are the record
+slot's question. -/
+def WidthBelow : Option TupleWidth → Option TupleWidth → Prop
+  | some (.exactly m), some (.exactly n) => m = n
+  | some (.atLeast _ _), some (.exactly _) => False
+  | _, _ => True
+
+/-- A width absorbed into another sits below it at a positive position and above it at a negative
+one: a positive merge joins two closed widths only when they are equal and never answers a closed
+width for an open one, and a negative merge meets an open width with a closed one at the closed
+one. -/
+theorem widthBelow_of_absorbed (pol : Bool) {wda wdb : Option TupleWidth}
+    (h : mergeWidth pol wda wdb = wdb) :
+    if pol then WidthBelow wda wdb else WidthBelow wdb wda := by
+  rcases wda with _ | (m | ⟨p, _ | c⟩ | _) <;> rcases wdb with _ | (n | ⟨q, _ | d⟩ | _) <;>
+    cases pol <;>
+    simp only [mergeWidth, TupleWidth.merge, Option.some.injEq, Bool.false_eq_true, if_true,
+      if_false, WidthBelow] at h ⊢ <;>
+    (repeat' split at h) <;> simp_all
+
 /-- The variant slot's two `subtypeKeys` facts, with the merge's shape reduced. -/
 theorem equiv_variant_slot {pol : Bool} {m₁ m₂ : List (FieldKey × CompactTy)}
     {ca cb : Option (List Predicate)}
-    (hle : absorbedBy pol (.mk [] none (some m₁) none ca) (.mk [] none (some m₂) none cb)) :
+    (hle : absorbedBy pol (.mk [] none (some m₁) none ca wda) (.mk [] none (some m₂) none cb wdb)) :
     (if pol then
       subtypeKeys (unionMap pol m₁ m₂) m₂ ((unionMap pol m₁ m₂).map Prod.fst) = true ∧
         subtypeKeys m₂ (unionMap pol m₁ m₂) (m₂.map Prod.fst) = true
@@ -717,20 +741,17 @@ theorem lookup_zip_map_key {α β γ} [BEq α] [LawfulBEq α] [BEq β] [LawfulBE
     · rw [beq_eq_false_iff_ne.mpr hk, beq_eq_false_iff_ne.mpr (fun h => hk (hg _ _ h))]
       exact lookup_zip_map_key g hg ks vs k
 
-/-- A dense index map's tuple, read back: its payloads are the map's, by index. -/
-theorem byIndex_get {n : Nat} {kvs : List (Nat × Ty)} {tup : Ty}
-    (h : byIndex n kvs = some tup) :
-    ∃ ts, tup = .tuple ts ∧ ts.length = n ∧
-      ∀ (i : Nat) (y : Ty), i < n → ts[i]? = some y → List.lookup i kvs = some y := by
+/-- A dense index map's positions, read back: its payloads are the map's, by index. -/
+theorem byIndex_get {n : Nat} {kvs : List (Nat × Ty)} {us : List Ty}
+    (h : byIndex n kvs = some us) :
+    us.length = n ∧ ∀ (i : Nat) (y : Ty), i < n → us[i]? = some y → List.lookup i kvs = some y := by
   rw [byIndex] at h
-  simp only [Option.map_eq_some_iff] at h
-  obtain ⟨ts, hts, rfl⟩ := h
-  obtain ⟨hlen, hget⟩ := mapM_some_get hts
-  refine ⟨ts, rfl, by simpa using hlen, fun i y hi hy => ?_⟩
+  obtain ⟨hlen, hget⟩ := mapM_some_get h
+  refine ⟨by simpa using hlen, fun i y hi hy => ?_⟩
   exact hget i i y (by simp [hi]) hy
 
 /-- `subtypeSeq` from a positional statement: it pairs the tuples off from the front
-and stops at the shorter right-hand side, which is tuple width subtyping. -/
+and stops at the shorter right-hand side, which is the rule for a tuple below an open one. -/
 theorem subtypeSeq_of_get : ∀ {a b : List Ty}, b.length ≤ a.length →
     (∀ (i : Nat) (x y : Ty), a[i]? = some x → b[i]? = some y → subtypeCheck x y = true) →
     subtypeSeq a b = true
@@ -741,6 +762,25 @@ theorem subtypeSeq_of_get : ∀ {a b : List Ty}, b.length ≤ a.length →
     refine ⟨h 0 x y (by simp) (by simp), subtypeSeq_of_get (by simpa using hlen) fun i u v hu hv =>
       ?_⟩
     exact h (i + 1) u v (by simpa using hu) (by simpa using hv)
+
+/-- Two tuples, each closed or open, related position by position: `subtypeCheck` accepts the
+pair when the widths relate (`WidthBelow`) and the lower one lists every position the upper one
+does. -/
+theorem subtypeCheck_tuples {wm ws : Option TupleWidth} {nm ns : Nat} {um us : List Ty}
+    {tm tsub : Ty} (hm : TupleOf wm nm um tm) (hs : TupleOf ws ns us tsub)
+    (hlm : um.length = nm) (hls : us.length = ns) (hwidth : WidthBelow wm ws)
+    (hlen : us.length ≤ um.length)
+    (hpos : ∀ (i : Nat) (x y : Ty), um[i]? = some x → us[i]? = some y → subtypeCheck x y = true) :
+    subtypeCheck tm tsub = true ∧ tm.isRefined = false ∧ tsub.isRefined = false := by
+  have hseq := subtypeSeq_of_get hlen hpos
+  rcases hm with ⟨rfl, rfl⟩ | ⟨c, rfl, rfl⟩ <;> rcases hs with ⟨rfl, rfl⟩ | ⟨d, rfl, rfl⟩
+  · refine ⟨?_, rfl, rfl⟩
+    simp only [WidthBelow] at hwidth
+    simp only [subtypeCheck, Bool.and_eq_true, beq_iff_eq]
+    exact ⟨by omega, hseq⟩
+  · exact ⟨by simpa [subtypeCheck] using hseq, rfl, rfl⟩
+  · simp [WidthBelow] at hwidth
+  · exact ⟨by simpa [subtypeCheck] using hseq, rfl, rfl⟩
 
 /-- `subtypeFields` from a per-field statement: it walks the right type's fields and
 demands each on the left, which is record width subtyping. -/
@@ -814,7 +854,8 @@ map's materialization is the right-hand side, because a record with more fields 
 merge narrows the field set toward whichever operand `absorbedBy` puts
 above. `R` is materialization and `Q` is the payload relation. -/
 theorem subtypeCheck_record_shapes {R : CompactTy → Ty → Prop} {Q : CompactTy → CompactTy → Prop}
-    {ms ss : List (FieldKey × CompactTy)} {tsm tss : List Ty} {tm tsub : Ty}
+    {ms ss : List (FieldKey × CompactTy)} {wm ws : Option TupleWidth} {tsm tss : List Ty}
+    {tm tsub : Ty}
     (hnds : nodupKeys (ss.map Prod.fst) = true)
     (hrelm : KeyedRelation R ms ((ms.map Prod.fst).zip tsm))
     (hrels : KeyedRelation R ss ((ss.map Prod.fst).zip tss))
@@ -822,9 +863,12 @@ theorem subtypeCheck_record_shapes {R : CompactTy → Ty → Prop} {Q : CompactT
     (hsub : ∀ k w, ss.lookup k = some w → ∃ v, ms.lookup k = some v ∧ Q v w)
     (hstep : ∀ k v w tv tw, ms.lookup k = some v → ss.lookup k = some w → Q v w →
       R v tv → R w tw → subtypeCheck tv tw = true)
-    (hm : (∃ idxs, indexKeys ms = some idxs ∧ byIndex ms.length (idxs.zip tsm) = some tm) ∨
+    (hwidth : WidthBelow wm ws)
+    (hm : (∃ idxs us, indexKeys ms = some idxs ∧ byIndex ms.length (idxs.zip tsm) = some us ∧
+            TupleOf wm ms.length us tm) ∨
           (∃ names, nameKeys ms = some names ∧ tm = .record (names.zip tsm)))
-    (hs : (∃ idxs, indexKeys ss = some idxs ∧ byIndex ss.length (idxs.zip tss) = some tsub) ∨
+    (hs : (∃ idxs us, indexKeys ss = some idxs ∧ byIndex ss.length (idxs.zip tss) = some us ∧
+            TupleOf ws ss.length us tsub) ∨
           (∃ names, nameKeys ss = some names ∧ tsub = .record (names.zip tss))) :
     subtypeCheck tm tsub = true ∧ tm.isRefined = false ∧ tsub.isRefined = false := by
   have hkeys : ∀ k ∈ ss.map Prod.fst, k ∈ ms.map Prod.fst := by
@@ -832,18 +876,16 @@ theorem subtypeCheck_record_shapes {R : CompactTy → Ty → Prop} {Q : CompactT
     obtain ⟨w, hw⟩ := Option.isSome_iff_exists.mp (lookup_of_mem_keys hk)
     obtain ⟨v, hv, -⟩ := hsub k w hw
     exact mem_keys_of_lookup hv
-  rcases hm with ⟨idxs₁, hi₁, hb₁⟩ | ⟨names₁, hn₁, rfl⟩ <;>
-    rcases hs with ⟨idxs₂, hi₂, hb₂⟩ | ⟨names₂, hn₂, rfl⟩
-  · -- Both index-keyed: tuples, compared position by position.
-    obtain ⟨u₁, rfl, hlen₁, hget₁⟩ := byIndex_get hb₁
-    obtain ⟨u₂, rfl, hlen₂, hget₂⟩ := byIndex_get hb₂
+  rcases hm with ⟨idxs₁, u₁, hi₁, hb₁, hof₁⟩ | ⟨names₁, hn₁, rfl⟩ <;>
+    rcases hs with ⟨idxs₂, u₂, hi₂, hb₂, hof₂⟩ | ⟨names₂, hn₂, rfl⟩
+  · -- Both index-keyed: tuples, compared width and position by position.
+    obtain ⟨hlen₁, hget₁⟩ := byIndex_get hb₁
+    obtain ⟨hlen₂, hget₂⟩ := byIndex_get hb₂
     have hlen : u₂.length ≤ u₁.length := by
       have hkl := nodupKeys_length_le hnds hkeys
       simp only [List.length_map] at hkl
       omega
-    refine ⟨?_, by simp [Ty.isRefined], by simp [Ty.isRefined]⟩
-    rw [subtypeCheck]
-    refine subtypeSeq_of_get hlen fun i x y hx hy => ?_
+    refine subtypeCheck_tuples hof₁ hof₂ hlen₁ hlen₂ hwidth hlen fun i x y hx hy => ?_
     have hinj : ∀ a b : Nat, FieldKey.idx a = FieldKey.idx b → a = b := by
       intro a b h
       cases h
@@ -896,14 +938,14 @@ one, so in both the contained map's materialization is the
 right-hand side. -/
 theorem coalesce_monotone_record (pol : Bool) {m₁ m₂ : List (FieldKey × CompactTy)}
     {ca cb : Option (List Predicate)} {ta tb : Ty}
-    (hwa : wellFormed (.mk [] (some m₁) none none ca) = true)
-    (hwb : wellFormed (.mk [] (some m₂) none none cb) = true)
+    (hwa : wellFormed (.mk [] (some m₁) none none ca wda) = true)
+    (hwb : wellFormed (.mk [] (some m₂) none none cb wdb) = true)
     (ih : ∀ k v w tv tw, m₁.lookup k = some v → m₂.lookup k = some w → absorbedBy pol v w →
       coalesce pol v = .ok (some tv) → coalesce pol w = .ok (some tw) →
       (if pol then subtypeCheck tv tw else subtypeCheck tw tv) = true)
-    (hle : absorbedBy pol (.mk [] (some m₁) none none ca) (.mk [] (some m₂) none none cb))
-    (ha : coalesce pol (.mk [] (some m₁) none none ca) = .ok (some ta))
-    (hb : coalesce pol (.mk [] (some m₂) none none cb) = .ok (some tb)) :
+    (hle : absorbedBy pol (.mk [] (some m₁) none none ca wda) (.mk [] (some m₂) none none cb wdb))
+    (ha : coalesce pol (.mk [] (some m₁) none none ca wda) = .ok (some ta))
+    (hb : coalesce pol (.mk [] (some m₂) none none cb wdb) = .ok (some tb)) :
     (if pol then subtypeCheck ta tb else subtypeCheck tb ta) = true := by
   obtain ⟨hne₁, ts₁, base₁, rfl, hrel₁, hshape₁⟩ := coalesce_record_ok pol ha
   obtain ⟨hne₂, ts₂, base₂, rfl, hrel₂, hshape₂⟩ := coalesce_record_ok pol hb
@@ -915,6 +957,7 @@ theorem coalesce_monotone_record (pol : Bool) {m₁ m₂ : List (FieldKey × Com
     rw [absorbedBy, merge.eq_def, equiv.eq_def] at hle
     simp only [Bool.and_eq_true] at hle
     exact hle.2
+  have hwidth := widthBelow_of_absorbed pol (absorbedBy_width hle)
   rcases ca with _ | p
   · exact absurd hwa.2 (by simp)
   rcases cb with _ | q
@@ -927,7 +970,7 @@ theorem coalesce_monotone_record (pol : Bool) {m₁ m₂ : List (FieldKey × Com
         (fun k w hw => le_of_unionMap (equiv_record_slot hle).1 k w hw)
         (fun k v w tv tw hv hw hQ hRv hRw => by
           simpa using ih k w v tw tv hw hv hQ hRw hRv)
-        hshape₂ hshape₁
+        (by simpa using hwidth) hshape₂ hshape₁
     exact subtypeCheck_attachRefinements hnr₂ hnr₁ hsc fun x hx =>
       hrefinements.1 x (List.mem_append_left _ hx)
   · simp only [mergeRefinements, refinementsEquiv_iff] at hrefinements
@@ -938,7 +981,7 @@ theorem coalesce_monotone_record (pol : Bool) {m₁ m₂ : List (FieldKey × Com
           le_of_intersectMap (equiv_record_slot hle).1 (equiv_record_slot hle).2 k w hw)
         (fun k v w tv tw hv hw hQ hRv hRw => by
           simpa using ih k v w tv tw hv hw hQ hRv hRw)
-        hshape₁ hshape₂
+        (by simpa using hwidth) hshape₁ hshape₂
     exact subtypeCheck_attachRefinements hnr₁ hnr₂ hsc fun x hx =>
       (List.mem_filter.mp (hrefinements.2 x hx)).1
 
@@ -949,14 +992,14 @@ set is the subtype and the comparison is read with
 one orientation twice. -/
 theorem coalesce_monotone_variant (pol : Bool) {m₁ m₂ : List (FieldKey × CompactTy)}
     {ca cb : Option (List Predicate)} {ta tb : Ty}
-    (hwa : wellFormed (.mk [] none (some m₁) none ca) = true)
-    (hwb : wellFormed (.mk [] none (some m₂) none cb) = true)
+    (hwa : wellFormed (.mk [] none (some m₁) none ca wda) = true)
+    (hwb : wellFormed (.mk [] none (some m₂) none cb wdb) = true)
     (ih : ∀ k v w tv tw, m₁.lookup k = some v → m₂.lookup k = some w → absorbedBy pol v w →
       coalesce pol v = .ok (some tv) → coalesce pol w = .ok (some tw) →
       (if pol then subtypeCheck tv tw else subtypeCheck tw tv) = true)
-    (hle : absorbedBy pol (.mk [] none (some m₁) none ca) (.mk [] none (some m₂) none cb))
-    (ha : coalesce pol (.mk [] none (some m₁) none ca) = .ok (some ta))
-    (hb : coalesce pol (.mk [] none (some m₂) none cb) = .ok (some tb)) :
+    (hle : absorbedBy pol (.mk [] none (some m₁) none ca wda) (.mk [] none (some m₂) none cb wdb))
+    (ha : coalesce pol (.mk [] none (some m₁) none ca wda) = .ok (some ta))
+    (hb : coalesce pol (.mk [] none (some m₂) none cb wdb) = .ok (some tb)) :
     (if pol then subtypeCheck ta tb else subtypeCheck tb ta) = true := by
   obtain ⟨kvs₁, rfl, hrel₁⟩ := coalesce_variant_ok pol ha
   obtain ⟨kvs₂, rfl, hrel₂⟩ := coalesce_variant_ok pol hb
@@ -1009,11 +1052,11 @@ refinements. Both operands materialize to the same atom, because the merge union
 then compare by containment in the polarity's direction. -/
 theorem coalesce_monotone_atoms (pol : Bool) {as bs : List Atom} {ca cb : Option (List Predicate)}
     {ta tb : Ty}
-    (hwa : wellFormed (.mk as none none none ca) = true)
-    (hwb : wellFormed (.mk bs none none none cb) = true)
-    (hle : absorbedBy pol (.mk as none none none ca) (.mk bs none none none cb))
-    (ha : coalesce pol (.mk as none none none ca) = .ok (some ta))
-    (hb : coalesce pol (.mk bs none none none cb) = .ok (some tb)) :
+    (hwa : wellFormed (.mk as none none none ca wda) = true)
+    (hwb : wellFormed (.mk bs none none none cb wdb) = true)
+    (hle : absorbedBy pol (.mk as none none none ca wda) (.mk bs none none none cb wdb))
+    (ha : coalesce pol (.mk as none none none ca wda) = .ok (some ta))
+    (hb : coalesce pol (.mk bs none none none cb wdb) = .ok (some tb)) :
     (if pol then subtypeCheck ta tb else subtypeCheck tb ta) = true := by
   rw [coalesce_atoms] at ha hb
   -- Exactly one atom survives dedup on each side, or the position did not
@@ -1072,9 +1115,9 @@ theorem coalesce_monotone_atoms (pol : Bool) {as bs : List Atom} {ca cb : Option
 /-- The atoms case, as an instance of the gate the sample measures. -/
 theorem coalesce_monotone_at_atoms (pol : Bool) {as bs : List Atom}
     {ca cb : Option (List Predicate)}
-    (hwa : wellFormed (.mk as none none none ca) = true)
-    (hwb : wellFormed (.mk bs none none none cb) = true) :
-    CoalesceMonotoneAt pol (.mk as none none none ca) (.mk bs none none none cb) = true := by
+    (hwa : wellFormed (.mk as none none none ca wda) = true)
+    (hwb : wellFormed (.mk bs none none none cb wdb) = true) :
+    CoalesceMonotoneAt pol (.mk as none none none ca wda) (.mk bs none none none cb wdb) = true := by
   rw [CoalesceMonotoneAt]
   split
   · rename_i hle
@@ -1092,10 +1135,10 @@ empty tail is that alternative. -/
 
 /-- `coalesce` on a position whose only content is a `data` function slot. -/
 theorem coalesce_fun_data_ok (pol : Bool) {d cod : CompactTy} {c : Option (List Predicate)}
-    {ty : Ty} (h : coalesce pol (.mk [] none none (some (.data, d, cod)) c) = .ok (some ty)) :
+    {ty : Ty} (h : coalesce pol (.mk [] none none (some (.data, d, cod)) c wd) = .ok (some ty)) :
     ∃ dt ct, coalesce (!pol) d = .ok (some dt) ∧ coalesce pol cod = .ok (some ct) ∧
       ty = attachRefinements (.fn none .data dt ct) c := by
-  rcases hf : funShapes pol (.mk [] none none (some (KindMerge.data, d, cod)) c) with e | x <;>
+  rcases hf : funShapes pol (.mk [] none none (some (KindMerge.data, d, cod)) c wd) with e | x <;>
     rw [coalesce_fun_only, hf] at h
   · cases h
   rcases x with _ | base
@@ -1133,10 +1176,10 @@ theorem coalesce_fun_data_ok (pol : Bool) {d cod : CompactTy} {c : Option (List 
 /-- `coalesce` on a position whose only content is a `compute` function slot. -/
 theorem coalesce_fun_compute_ok (pol : Bool) {d cod : CompactTy} {c : Option (List Predicate)}
     {ty : Ty}
-    (h : coalesce pol (.mk [] none none (some (.compute, d, cod)) c) = .ok (some ty)) :
+    (h : coalesce pol (.mk [] none none (some (.compute, d, cod)) c wd) = .ok (some ty)) :
     ∃ dt ct, coalesce (!pol) d = .ok (some dt) ∧ coalesce pol cod = .ok (some ct) ∧
       ty = attachRefinements (.fn none .compute dt ct) c := by
-  rcases hf : funShapes pol (.mk [] none none (some (KindMerge.compute, d, cod)) c) with e | x <;>
+  rcases hf : funShapes pol (.mk [] none none (some (KindMerge.compute, d, cod)) c wd) with e | x <;>
     rw [coalesce_fun_only, hf] at h
   · cases h
   rcases x with _ | base
@@ -1180,8 +1223,8 @@ one, where they meet. -/
 theorem equiv_fun_slot {pol : Bool} {k₁ k₂ : KindMerge} {d₁ d₂ cod₁ cod₂ : CompactTy}
     {ca cb : Option (List Predicate)}
     (hk₁ : k₁ ≠ .conflict) (hk₂ : k₂ ≠ .conflict) (hu₁ : k₁ ≠ .unknown)
-    (hle : absorbedBy pol (.mk [] none none (some (k₁, d₁, cod₁)) ca)
-                  (.mk [] none none (some (k₂, d₂, cod₂)) cb)) :
+    (hle : absorbedBy pol (.mk [] none none (some (k₁, d₁, cod₁)) ca wda)
+                  (.mk [] none none (some (k₂, d₂, cod₂)) cb wdb)) :
     k₁ = k₂ ∧ absorbedBy pol cod₁ cod₂ ∧ absorbedBy (!pol) d₁ d₂ := by
   rw [absorbedBy, merge.eq_def, equiv.eq_def] at hle
   simp only [Bool.and_eq_true] at hle
@@ -1212,8 +1255,8 @@ excludes is the one `Ty` gives no
 bound for. -/
 theorem coalesce_monotone_fun (pol : Bool) {k₁ k₂ : KindMerge} {d₁ d₂ cod₁ cod₂ : CompactTy}
     {ca cb : Option (List Predicate)} {ta tb : Ty}
-    (hwa : wellFormed (.mk [] none none (some (k₁, d₁, cod₁)) ca) = true)
-    (hwb : wellFormed (.mk [] none none (some (k₂, d₂, cod₂)) cb) = true)
+    (hwa : wellFormed (.mk [] none none (some (k₁, d₁, cod₁)) ca wda) = true)
+    (hwb : wellFormed (.mk [] none none (some (k₂, d₂, cod₂)) cb wdb) = true)
     (hk₁ : k₁ = .data ∨ k₁ = .compute) (hk₂ : k₂ = .data ∨ k₂ = .compute)
     (hagree : k₁ = .data → equiv d₁ d₂ = true)
     (ihd : ∀ (x y : CompactTy) (tx ty' : Ty), ((x = d₁ ∧ y = d₂) ∨ (x = d₂ ∧ y = d₁)) →
@@ -1223,10 +1266,10 @@ theorem coalesce_monotone_fun (pol : Bool) {k₁ k₂ : KindMerge} {d₁ d₂ co
     (ihc : ∀ (tx ty' : Ty), absorbedBy pol cod₁ cod₂ →
       coalesce pol cod₁ = .ok (some tx) → coalesce pol cod₂ = .ok (some ty') →
       (if pol then subtypeCheck tx ty' else subtypeCheck ty' tx) = true)
-    (hle : absorbedBy pol (.mk [] none none (some (k₁, d₁, cod₁)) ca)
-                  (.mk [] none none (some (k₂, d₂, cod₂)) cb))
-    (ha : coalesce pol (.mk [] none none (some (k₁, d₁, cod₁)) ca) = .ok (some ta))
-    (hb : coalesce pol (.mk [] none none (some (k₂, d₂, cod₂)) cb) = .ok (some tb)) :
+    (hle : absorbedBy pol (.mk [] none none (some (k₁, d₁, cod₁)) ca wda)
+                  (.mk [] none none (some (k₂, d₂, cod₂)) cb wdb))
+    (ha : coalesce pol (.mk [] none none (some (k₁, d₁, cod₁)) ca wda) = .ok (some ta))
+    (hb : coalesce pol (.mk [] none none (some (k₂, d₂, cod₂)) cb wdb) = .ok (some tb)) :
     (if pol then subtypeCheck ta tb else subtypeCheck tb ta) = true := by
   rw [wellFormed.eq_def] at hwa hwb
   simp only [Bool.and_eq_true] at hwa hwb
@@ -1290,7 +1333,7 @@ theorem coalesce_monotone_fun (pol : Bool) {k₁ k₂ : KindMerge} {d₁ d₂ co
 
 /-- `concrete`, projected onto a record slot's key walk. -/
 theorem concrete_record_keys {as : List Atom} {ma : List (FieldKey × CompactTy)} {v f c}
-    (h : concrete (.mk as (some ma) v f c) = true) :
+    (h : concrete (.mk as (some ma) v f c wd) = true) :
     wellFormedKeys ma (ma.map Prod.fst) = true ∧ kindResolvedKeys ma (ma.map Prod.fst) = true := by
   simp only [concrete, Bool.and_eq_true] at h
   obtain ⟨hw, hk⟩ := h
@@ -1301,7 +1344,7 @@ theorem concrete_record_keys {as : List Atom} {ma : List (FieldKey × CompactTy)
 
 /-- `concrete`, projected onto a variant slot's key walk. -/
 theorem concrete_variant_keys {as : List Atom} {ma : List (FieldKey × CompactTy)} {r f c}
-    (h : concrete (.mk as r (some ma) f c) = true) :
+    (h : concrete (.mk as r (some ma) f c wd) = true) :
     wellFormedKeys ma (ma.map Prod.fst) = true ∧ kindResolvedKeys ma (ma.map Prod.fst) = true := by
   simp only [concrete, Bool.and_eq_true] at h
   obtain ⟨hw, hk⟩ := h
@@ -1313,7 +1356,7 @@ theorem concrete_variant_keys {as : List Atom} {ma : List (FieldKey × CompactTy
 /-- `concrete`, projected onto a function slot. One domain is the slot's type now, so this only
 splits the two invariants: `wellFormed` rules out `conflict`, `kindResolved` rules out `unknown`. -/
 theorem concrete_fun {as : List Atom} {k : KindMerge} {d cod : CompactTy} {c}
-    (h : concrete (.mk as none none (some (k, d, cod)) c) = true) :
+    (h : concrete (.mk as none none (some (k, d, cod)) c wd) = true) :
     concrete d = true ∧ concrete cod = true ∧ (k = .data ∨ k = .compute) := by
   simp only [concrete, Bool.and_eq_true] at h
   obtain ⟨hw, hk⟩ := h
@@ -1348,8 +1391,8 @@ theorem coalesce_monotone : ∀ (n : Nat) (pol : Bool) (a b : CompactTy), sizeOf
     exact absurd hfuel (by omega)
   | succ n ih =>
     intro pol a b hfuel hga hgb hagree hle ta tb ha hb
-    obtain ⟨as, ra, va, fa, ca⟩ := a
-    obtain ⟨bs, rb, vb, fb, cb⟩ := b
+    obtain ⟨as, ra, va, fa, ca, wda⟩ := a
+    obtain ⟨bs, rb, vb, fb, cb, wdb⟩ := b
     -- `concrete` and the pair condition, projected onto a shared keyed payload.
     have hkeyed : ∀ (ma mb : List (FieldKey × CompactTy)),
         wellFormedKeys ma (ma.map Prod.fst) = true → wellFormedKeys mb (mb.map Prod.fst) = true →
@@ -1497,7 +1540,13 @@ theorem coalesce_monotone_at_of_monotone (pol : Bool) (a b : CompactTy) (hga : c
 
 /-- **Soundness: the merge is a bound.** Where all three positions materialize, a
 positive merge lands above both operands under `Subtyping` and a negative one below
-both, on concrete positions whose merge did not have to move a data domain. -/
+both, on concrete positions whose merge did not have to move a data domain.
+
+The statement is the same with tuple widths in the model. A tuple join exists only where the widths
+have one: two closed tuples of different widths conflict at either polarity and the merge does not
+materialize, so the statement says nothing of them. Where it materializes, absorption fixes how the
+widths relate (`widthBelow_of_absorbed`): equal when both are closed, and never an open tuple below a
+closed one. -/
 theorem merge_is_a_bound (pol : Bool) (a b : CompactTy) (hga : concrete a = true)
     (hgb : concrete b = true)
     (hgm : concrete (merge pol a b) = true)
@@ -1538,49 +1587,55 @@ theorem merge_is_least_position (pol : Bool) (a b u : CompactTy) (hgu : concrete
 
 Small enough to evaluate and wide enough to reach every arm of `merge`: each slot at its identity
 (`none`), at its absorbing empty shape (`some []`), and populated; the refinement slot at both of
-its `none` readings; and a function slot at
+its `none` readings; a tuple at each width, closed and open; and a function slot at
 each kind over domains that agree and domains that do not. -/
 
-private def intPosition : CompactTy := .mk [.prim .int] none none none (some [])
-private def boolPosition : CompactTy := .mk [.prim .bool] none none none (some [])
+private def intPosition : CompactTy := .mk [.prim .int] none none none (some []) none
+private def boolPosition : CompactTy := .mk [.prim .bool] none none none (some []) none
 
 private def leaves : List CompactTy :=
   [ emptyPosition
-  , .mk [] none none none (some [])
+  , .mk [] none none none (some []) none
   , intPosition
   , boolPosition
-  , .mk [.uintRange 3] none none none (some [])
-  , .mk [.uintRange 4] none none none (some [])
-  , .mk [.source "s"] none none none (some [])
-  , .mk [.txn] none none none (some [])
-  , .mk [.prim .int] none none none (some [.elem])
-  , .mk [] (some []) none none (some [])
-  , .mk [] (some [(.name "a", intPosition)]) none none (some [])
-  , .mk [] (some [(.name "a", intPosition), (.name "b", boolPosition)]) none none (some [])
-  , .mk [] (some [(.idx 0, intPosition)]) none none (some [])
+  , .mk [.uintRange 3] none none none (some []) none
+  , .mk [.uintRange 4] none none none (some []) none
+  , .mk [.source "s"] none none none (some []) none
+  , .mk [.txn] none none none (some []) none
+  , .mk [.prim .int] none none none (some [.elem]) none
+  , .mk [] (some []) none none (some []) none
+  , .mk [] (some [(.name "a", intPosition)]) none none (some []) none
+  , .mk [] (some [(.name "a", intPosition), (.name "b", boolPosition)]) none none (some []) none
+  , .mk [] (some [(.idx 0, intPosition)]) none none (some []) (some (.exactly 1))
+  , .mk [] (some [(.idx 0, intPosition)]) none none (some []) (some (.atLeast 1 none))
   , .mk [] (some [(.idx 0, intPosition), (.idx 1, boolPosition)]) none none (some [])
+      (some (.exactly 2))
+  , .mk [] (some [(.idx 0, intPosition), (.idx 1, boolPosition)]) none none (some [])
+      (some (.atLeast 2 none))
   , .mk [] (some [(.idx 1, boolPosition), (.idx 0, intPosition)]) none none (some [])
-  , .mk [] (some [(.name "b", boolPosition), (.name "a", intPosition)]) none none (some [])
-  , .mk [] none (some [(.name "t1", boolPosition), (.name "t0", intPosition)]) none (some [])
-  , .mk [] none (some [(.name "t0", intPosition), (.name "t0", boolPosition)]) none (some [])
-  , .mk [] (some [(.name "a", intPosition), (.name "a", boolPosition)]) none none (some [])
+      (some (.exactly 2))
+  , .mk [] (some [(.name "b", boolPosition), (.name "a", intPosition)]) none none (some []) none
+  , .mk [] none (some [(.name "t1", boolPosition), (.name "t0", intPosition)]) none (some []) none
+  , .mk [] none (some [(.name "t0", intPosition), (.name "t0", boolPosition)]) none (some []) none
+  , .mk [] (some [(.name "a", intPosition), (.name "a", boolPosition)]) none none (some []) none
   , .mk [] (some [(.idx 0, intPosition), (.idx 0, boolPosition)]) none none (some [])
-  , .mk [] none (some []) none (some [])
-  , .mk [] none (some [(.name "t0", intPosition)]) none (some [])
-  , .mk [] none (some [(.name "t0", intPosition), (.name "t1", boolPosition)]) none (some [])
+      (some (.exactly 1))
+  , .mk [] none (some []) none (some []) none
+  , .mk [] none (some [(.name "t0", intPosition)]) none (some []) none
+  , .mk [] none (some [(.name "t0", intPosition), (.name "t1", boolPosition)]) none (some []) none
   ]
 
 private def funs : List CompactTy :=
   let kinds : List KindMerge := [.data, .compute, .unknown]
   let doms : List CompactTy :=
     [ intPosition
-    , .mk [.prim .int] none none none (some [.elem])
-    , .mk [.uintRange 3] none none none (some [])
-    , .mk [.uintRange 4] none none none (some [])
-    , .mk [] (some [(.name "a", intPosition)]) none none (some [])
-    , .mk [] (some [(.name "a", intPosition), (.name "b", boolPosition)]) none none (some [])
+    , .mk [.prim .int] none none none (some [.elem]) none
+    , .mk [.uintRange 3] none none none (some []) none
+    , .mk [.uintRange 4] none none none (some []) none
+    , .mk [] (some [(.name "a", intPosition)]) none none (some []) none
+    , .mk [] (some [(.name "a", intPosition), (.name "b", boolPosition)]) none none (some []) none
     ]
-  kinds.flatMap fun k => doms.map fun d => .mk [] none none (some (k, d, intPosition)) (some [])
+  kinds.flatMap fun k => doms.map fun d => .mk [] none none (some (k, d, intPosition)) (some []) none
 
 private def sample : List CompactTy := leaves ++ funs
 
@@ -1692,11 +1747,11 @@ private def provedCovered : List (Bool × CompactTy × CompactTy) :=
 
 -- These cases satisfy the theorem's concrete-merge and operand-to-merge
 -- domain-agreement hypotheses. The remaining cases are outside that theorem.
-#guard (provedCovered).length == 1844
+#guard (provedCovered).length == 2108
 #guard (provedCovered.filter fun (pol, a, b) => !MergeIsBoundAt pol a b).isEmpty
 
-#guard (cases wellFormed).length == 2888
-#guard (cases concrete).length == 2048
+#guard (cases wellFormed).length == 3200
+#guard (cases concrete).length == 2312
 
 -- Finite-pool guarded soundness, not an unrestricted existence theorem.
 -- The sample's leastness assertion is proved separately by `leastness_failures_eq_nil`.
@@ -1707,57 +1762,57 @@ private def provedCovered : List (Bool × CompactTy × CompactTy) :=
 #guard (failures concrete).length == 8
 #guard (monotoneFailures concrete).length == 4
 #guard !MergeIsBoundAt false
-  (.mk [] none none (some (.data, .mk [.prim .int] none none none (some []), intPosition))
-    (some []))
+  (.mk [] none none (some (.data, .mk [.prim .int] none none none (some []) none, intPosition))
+    (some []) none)
   (.mk [] none none
-    (some (.data, .mk [.prim .int] none none none (some [.elem]), intPosition)) (some []))
+    (some (.data, .mk [.prim .int] none none none (some [.elem]) none, intPosition)) (some []) none)
 #guard MergeIsBoundGuarded false
-  (.mk [] none none (some (.data, .mk [.prim .int] none none none (some []), intPosition))
-    (some []))
+  (.mk [] none none (some (.data, .mk [.prim .int] none none none (some []) none, intPosition))
+    (some []) none)
   (.mk [] none none
-    (some (.data, .mk [.prim .int] none none none (some [.elem]), intPosition)) (some []))
+    (some (.data, .mk [.prim .int] none none none (some [.elem]) none, intPosition)) (some []) none)
 
 -- Neither a duplicate key nor a content-bearing position without a refinement slot is
 -- `wellFormed`, and each breaks soundness. A duplicate is invisible to `equiv`, which
 -- compares by `lookup`, and visible in the type, which carries every entry.
 #guard !wellFormed
-  (.mk [] none (some [(.name "t0", intPosition), (.name "t0", boolPosition)]) none (some []))
+  (.mk [] none (some [(.name "t0", intPosition), (.name "t0", boolPosition)]) none (some []) none)
 
 -- A position with content and no refinement slot is not `wellFormed`, and this is the pair
 -- that forces the invariant: at a positive position the merge keeps `__elem`,
 -- because the `none` slot is the merge identity rather than a value that
 -- guarantees nothing, so the join of `{Int | __elem}` and `Int` is not `Int`.
-#guard !wellFormed (.mk [.prim .int] none none none none)
-#guard !MergeIsBoundAt true (.mk [.prim .int] none none none (some [.elem]))
-  (.mk [.prim .int] none none none none)
+#guard !wellFormed (.mk [.prim .int] none none none none none)
+#guard !MergeIsBoundAt true (.mk [.prim .int] none none none (some [.elem]) none)
+  (.mk [.prim .int] none none none none none)
 
 -- `kindResolved` is what excludes the artifact: an `unknown` slot materializes by
 -- the capability default, and the merge that pins it to `data` contradicts that
 -- default, so the operand's own type is not what the merge combined.
 #guard !MergeIsBoundAt true
-  (.mk [] none none (some (.data, intPosition, intPosition)) (some []))
-  (.mk [] none none (some (.unknown, intPosition, intPosition)) (some []))
+  (.mk [] none none (some (.data, intPosition, intPosition)) (some []) none)
+  (.mk [] none none (some (.unknown, intPosition, intPosition)) (some []) none)
 
 -- These invariant data domains have no shared lower bound in the candidate pool.
 -- The model does not introduce a dependent sum to reconcile them.
 #guard !MergeIsBoundAt false
   (.mk [] none none
-    (some (.data, .mk [] (some [(.name "a", intPosition)]) none none (some []), intPosition))
-    (some []))
+    (some (.data, .mk [] (some [(.name "a", intPosition)]) none none (some []) none, intPosition))
+    (some []) none)
   (.mk [] none none
     (some (.data,
-      .mk [] (some [(.name "a", intPosition), (.name "b", boolPosition)]) none none (some []),
+      .mk [] (some [(.name "a", intPosition), (.name "b", boolPosition)]) none none (some []) none,
         intPosition))
-    (some []))
+    (some []) none)
 #guard MergeIsBoundGuarded false
   (.mk [] none none
-    (some (.data, .mk [] (some [(.name "a", intPosition)]) none none (some []), intPosition))
-    (some []))
+    (some (.data, .mk [] (some [(.name "a", intPosition)]) none none (some []) none, intPosition))
+    (some []) none)
   (.mk [] none none
     (some (.data,
-      .mk [] (some [(.name "a", intPosition), (.name "b", boolPosition)]) none none (some []),
+      .mk [] (some [(.name "a", intPosition), (.name "b", boolPosition)]) none none (some []) none,
         intPosition))
-    (some []))
+    (some []) none)
 
 end CompactTy
 end CclFormal

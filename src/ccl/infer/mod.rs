@@ -162,7 +162,9 @@ fn blame_node_for_place(
                 domain, codomain, ..
             } => mentions(domain, uid) || mentions(codomain, uid),
             Type::History { function, .. } => mentions(function, uid),
-            Type::Tuple(elems) | Type::Nominal(_, elems) => elems.iter().any(|t| mentions(t, uid)),
+            Type::Tuple(elems) | Type::OpenTuple(elems) | Type::Nominal(_, elems) => {
+                elems.iter().any(|t| mentions(t, uid))
+            }
             Type::Split { input, output } => mentions(input, uid) || mentions(output, uid),
             Type::DepTuple(cs) => cs.iter().any(|(_, t)| mentions(t, uid)),
             Type::Record(fields) => fields.iter().any(|(_, t)| mentions(t, uid)),
@@ -450,6 +452,10 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
             vars,
             origin: ctx_label.to_string(),
             context: vec![],
+        },
+        CoalesceError::TupleWidthConflict { widths, .. } => InferError::TupleWidthConflict {
+            widths,
+            origin: ctx_label.to_string(),
         },
         // A kinding failure *is* an annotation mismatch: the user wrote a collection
         // kind and the value's domain does not inhabit it. Reported with the same

@@ -311,6 +311,14 @@ fn encode(
     // of its source's, and a *multi-generator* one's is a product of all of them.
     // Those keep their `Hole` and stay ordered by the argument edge alone.
     let iter_dom = (single_gen && pred_op.is_none()).then(|| holes.fresh());
+    // A multi-generator comprehension's iteration record has one position per generator,
+    // and the body only projects it, which fixes no width (`docs/chl-spec.md`, "Tuple
+    // width"), so its binder states it.
+    let record_ty = if single_gen {
+        Type::Hole
+    } else {
+        Type::Tuple(vec![Type::Hole; gen_bindings.len()])
+    };
     // **The result is a collection built over its sources.** Each generator's source gets
     // a kind of its own and the result records that it is built over it: a comprehension
     // binds one index position per index position of each source, which is a
@@ -417,7 +425,7 @@ fn encode(
         // is — one that survives into elimination, where the point-free form of
         // the collection inherits the lambda's kind and reads as a capability.
         let unrefined_lambda =
-            Expr::lambda(outer_var, Type::Hole, body_expr).with_user_annotation(Type::Fun {
+            Expr::lambda(outer_var, record_ty, body_expr).with_user_annotation(Type::Fun {
                 name: None,
                 fun_kind: result_kind.clone(),
                 domain: Box::new(Type::Hole),
@@ -434,7 +442,7 @@ fn encode(
         // filtered branch above stamps its own lambda the same way, under a cast
         // whose `refined_data_fun` target then refines the domain.)
         let lambda =
-            Expr::lambda(outer_var, Type::Hole, body_expr).with_user_annotation(Type::Fun {
+            Expr::lambda(outer_var, record_ty, body_expr).with_user_annotation(Type::Fun {
                 name: None,
                 fun_kind: result_kind,
                 domain: Box::new(iter_dom.unwrap_or(Type::Hole)),
@@ -522,7 +530,7 @@ mod tests {
     // join.
     #[case(
         "[x + y for x in [1, 2] for y in [3, 4] if x == y]",
-        "cast(({_ | __elem.0 ▷ ([1, 2] ▷ Iterable::elements) ▷ (λ x → __elem.1 ▷ ([3, 4] ▷ Iterable::elements) ▷ (λ y → x == y))} ⤇ _), λ __iter_record → __iter_record.0 ▷ ([1, 2] ▷ Iterable::elements) ▷ (λ x → __iter_record.1 ▷ ([3, 4] ▷ Iterable::elements) ▷ (λ y → x + y)))"
+        "cast(({_ | __elem.0 ▷ ([1, 2] ▷ Iterable::elements) ▷ (λ x → __elem.1 ▷ ([3, 4] ▷ Iterable::elements) ▷ (λ y → x == y))} ⤇ _), λ __iter_record : (_, _) → __iter_record.0 ▷ ([1, 2] ▷ Iterable::elements) ▷ (λ x → __iter_record.1 ▷ ([3, 4] ▷ Iterable::elements) ▷ (λ y → x + y)))"
     )]
     // A per-element conditional stays a value `Case` in the per-element lambda,
     // which lambda elimination compiles over the element stream.

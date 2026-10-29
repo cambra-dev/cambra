@@ -533,6 +533,11 @@ pub fn freshen_above(
                 .map(|t| freshen_above(lim, t, target, cache))
                 .collect(),
         ),
+        Type::OpenTuple(ts) => Type::OpenTuple(
+            ts.iter()
+                .map(|t| freshen_above(lim, t, target, cache))
+                .collect(),
+        ),
         Type::Nominal(decl, args) => Type::Nominal(
             decl.clone(),
             args.iter()

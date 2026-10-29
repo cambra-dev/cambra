@@ -403,6 +403,7 @@ fn simplify_reconstruct(
         // *position*, so merging away the variable that contributed it must not drop it.
         kinds: ct.kinds,
         rec: new_rec,
+        width: ct.width,
         var: new_var,
         fun: new_fun,
         refinements: ct.refinements,

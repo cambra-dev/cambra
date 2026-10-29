@@ -291,17 +291,21 @@ fn an_unannotated_empty_map_is_rejected(#[case] code: &str) {
 // So a *re-keying* constructor has no empty form. `empty_map()` is the spelling that
 // works, because it states its type rather than deriving one from entries it does not
 // have (CHL spec, "3.11 List, tuple, record literals"). The rejection here is an
-// inference error rather than a diagnosis of the construct.
+// inference error rather than a diagnosis of the construct: `map` reads the positions of
+// each entry, so the literal's width is what nothing fixes.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::map("map([])")]
-#[case::set("set([])")]
-#[case::map_under_an_annotation(indoc! {r#"
-    m: Map(String, Int) = box(map([]))
-    m
-"#})]
-fn a_re_keying_constructor_rejects_an_empty_literal(#[case] code: &str) {
-    check_compile_error(code, "Unresolved inference variable");
+#[case::map("map([])", "is never fixed in []")]
+#[case::set("set([])", "Unresolved inference variable")]
+#[case::map_under_an_annotation(
+    indoc! {r#"
+        m: Map(String, Int) = box(map([]))
+        m
+    "#},
+    "is never fixed in []"
+)]
+fn a_re_keying_constructor_rejects_an_empty_literal(#[case] code: &str, #[case] reported: &str) {
+    check_compile_error(code, reported);
 }
 
 // A collection literal's elements are compile-time values, so an element written as a
@@ -890,11 +894,35 @@ fn test_tuple_patterns(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
-/// A tuple pattern taking apart a value that is no tuple is refused, naming the projection of
-/// the component it takes, which the program never wrote.
+/// A tuple pattern takes apart a tuple of exactly its width, literal or not
+/// (`docs/chl-spec.md`, "Tuple width").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_wider_literal("a, b = (1, 2, 3)\na\n", 2, 3)]
+#[case::a_wider_value("t = (1, 2, 3)\na, b = t\na\n", 2, 3)]
+#[case::a_narrower_value("t = (1, 2)\na, b, c = t\na\n", 3, 2)]
+fn a_tuple_pattern_takes_apart_a_tuple_of_its_width(
+    #[case] code: &str,
+    #[case] pattern: usize,
+    #[case] value: usize,
+) {
+    check_compile_error(
+        code,
+        &format!(
+            "A pattern of {pattern} positions takes apart a {pattern}-tuple, \
+             but the value is a {value}-tuple"
+        ),
+    );
+}
+
+/// A tuple pattern taking apart a value that is no tuple is refused, naming the tuple the
+/// pattern takes apart.
 #[test]
-fn a_tuple_pattern_over_a_scalar_names_its_projection() {
-    check_compile_error("a, b = 5\na\n", "Type mismatch for projection `.0`");
+fn a_tuple_pattern_over_a_scalar_names_the_tuple_it_takes_apart() {
+    check_compile_error(
+        "a, b = 5\na\n",
+        "A pattern of 2 positions takes apart a 2-tuple, but the value is {Int where _ == 5}",
+    );
 }
 
 /// A name a destructuring pattern binds is a binding like any other to a loop's mutation

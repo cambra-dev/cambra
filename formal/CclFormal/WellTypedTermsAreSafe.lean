@@ -29,7 +29,7 @@ namespace CclFormal
 theorem Ty.TermFragment.peel_fst : {t : Ty} → t.TermFragment → t.peel.1.TermFragment
   | .refined _ _, .refined _ hb => by simpa [Ty.peel] using hb.peel_fst
   | .base _, h | .uintRange _, h | .dataSource _, h | .txn, h
-  | .fn .., h | .tuple _, h | .record _, h | .variant _, h => by
+  | .fn .., h | .tuple _, h | .openTuple _, h | .record _, h | .variant _, h => by
       simpa [Ty.peel] using h
 
 theorem Ty.TermFragment.peel_refinements : {t : Ty} → t.TermFragment →
@@ -41,7 +41,7 @@ theorem Ty.TermFragment.peel_refinements : {t : Ty} → t.TermFragment →
       · exact hps p hp
       · exact hb.peel_refinements p hp
   | .base _, h | .uintRange _, h | .dataSource _, h | .txn, h
-  | .fn .., h | .tuple _, h | .record _, h | .variant _, h => by
+  | .fn .., h | .tuple _, h | .openTuple _, h | .record _, h | .variant _, h => by
       simp [Ty.peel]
 
 /-! ## `Subtyping` inversion: peel, then one `cases` per head -/
@@ -61,6 +61,8 @@ theorem Subtyping.refinements_mono {S W : Ty} (h : Subtyping S W) :
   | fnCompute h1 h2 h3 h4 => simp [Ty.peel]
   | fnData h1 h2 h3 => simp [Ty.peel]
   | tuple h1 h2 => simp [Ty.peel]
+  | tupleOpen h1 h2 => simp [Ty.peel]
+  | openTuple h1 h2 => simp [Ty.peel]
   | record h1 h2 => simp [Ty.peel]
   | variant h1 h2 => simp [Ty.peel]
 
@@ -95,11 +97,11 @@ theorem Subtyping.fn_inv {n0 n1 : Option String} {k0 k1 : FunKind}
       obtain ⟨-, hr2⟩ := hr
       simp [hl2, hr2] at hne
 
-/-- An unrefined subtype of a tuple type is a tuple type, at least as wide,
+/-- An unrefined subtype of a tuple type is a tuple type of the same width,
 elementwise below it. -/
 theorem Subtyping.tuple_inv {S : Ty} {Ts : List Ty}
     (h : Subtyping S (.tuple Ts)) (hS : S.isRefined = false) :
-    ∃ Ss, S = .tuple Ss ∧ Ts.length ≤ Ss.length ∧
+    ∃ Ss, S = .tuple Ss ∧ Ss.length = Ts.length ∧
       ∀ (i : Nat) t0 t1, Ss[i]? = some t0 → Ts[i]? = some t1 →
         Subtyping t0 t1 := by
   cases h with
@@ -629,7 +631,7 @@ theorem HasTy.canonical_fn {Γ : List Ty} {v : Term} {W : Ty}
 theorem HasTy.canonical_tuple {Γ : List Ty} {v : Term} {W : Ty}
     (h : HasTy Γ v W) :
     v.IsVal → ∀ Ts, W.peel.1 = .tuple Ts →
-      ∃ es, v = .tuple es ∧ Ts.length ≤ es.length ∧
+      ∃ es, v = .tuple es ∧ es.length = Ts.length ∧
         (∀ (i : Nat) e T, es[i]? = some e → Ts[i]? = some T → HasTy Γ e T) := by
   induction h with
   | lit l =>
@@ -646,7 +648,7 @@ theorem HasTy.canonical_tuple {Γ : List Ty} {v : Term} {W : Ty}
       rw [Ty.peel_of_not_refined (by simp [Ty.isRefined])] at hW
       injection hW with hTs
       subst hTs
-      exact ⟨es, rfl, Nat.le_of_eq hlen.symm, helem⟩
+      exact ⟨es, rfl, hlen, helem⟩
   | proj _ _ _ => intro hv; cases hv
   | variant _ _ _ _ =>
       intro _ Ts hW
@@ -665,7 +667,7 @@ theorem HasTy.canonical_tuple {Γ : List Ty} {v : Term} {W : Ty}
         hpeel.tuple_inv (Ty.peel_fst_not_refined _)
       obtain ⟨es, hes, hlen', hty⟩ := ih hv Ss hS
       have hWp : (Ty.tuple Ts).TermFragment := hW ▸ hfrag.peel_fst
-      refine ⟨es, hes, Nat.le_trans hwidth hlen', ?_⟩
+      refine ⟨es, hes, hlen'.trans hwidth, ?_⟩
       intro i e T h1 h2
       have hiS : i < Ss.length := by
         have := (List.getElem?_eq_some_iff.mp h2).1

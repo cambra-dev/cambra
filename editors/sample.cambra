@@ -13,6 +13,7 @@ pub def quote(item, qty) => Int requires Transaction:
     return this::price(item) * qty
 
 bigger: forall (T <: {at: Int}) {T, T} => T = larger
+first: forall (A, T <: {A, ..}) T => A = head
 
 reqs, resps = http_serve(8080, 'GET', "/count")
 

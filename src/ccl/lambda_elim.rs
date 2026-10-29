@@ -1162,7 +1162,9 @@ fn reads_in_collection_domain(param: &Name, ty: &Type) -> bool {
             data && (crate::ccl::subst::type_free_vars(domain).contains(param)
                 || (name.as_ref() != Some(param) && reads_in_collection_domain(param, codomain)))
         }
-        Type::Tuple(ts) => ts.iter().any(|t| reads_in_collection_domain(param, t)),
+        Type::Tuple(ts) | Type::OpenTuple(ts) => {
+            ts.iter().any(|t| reads_in_collection_domain(param, t))
+        }
         Type::DepTuple(components) => {
             for (name, t) in components {
                 if reads_in_collection_domain(param, t) {

@@ -117,6 +117,8 @@ partial def Ty.toJson : Ty → Json
         ("binder", match n with | some s => Lean.toJson s | none => Json.null),
         ("kind", Lean.toJson k.toWire), ("dom", d.toJson), ("cod", c.toJson)]
   | .tuple ts => Json.mkObj [("k", "tuple"), ("ts", Json.arr (ts.map Ty.toJson).toArray)]
+  | .openTuple ts =>
+      Json.mkObj [("k", "openTuple"), ("ts", Json.arr (ts.map Ty.toJson).toArray)]
   | .record fs =>
       Json.mkObj [("k", "record"),
         ("fields", Json.arr (fs.map fun (n, t) =>
@@ -146,6 +148,9 @@ partial def Ty.fromJson? (j : Json) : Except String Ty := do
   | .ok "tuple" =>
       let ts ← (← (← j.getObjVal? "ts").getArr?).toList.mapM Ty.fromJson?
       return .tuple ts
+  | .ok "openTuple" =>
+      let ts ← (← (← j.getObjVal? "ts").getArr?).toList.mapM Ty.fromJson?
+      return .openTuple ts
   | .ok "record" =>
       let fs ← (← (← j.getObjVal? "fields").getArr?).toList.mapM
         (pairFromJson? Lean.fromJson?)
@@ -174,12 +179,12 @@ instance : FromJson Ty := ⟨Ty.fromJson?⟩
 /-! ## The compact type
 
 `CompactTy` is the merge model's mirror of `CompactType` (`CclFormal/Merge.lean`), and this codec is
-the contract `tests/differential_oracle.rs` serializes a real `CompactType` to. The two abstractions
+the contract `tests/differential_oracle.rs` serializes a real `CompactType` to. The abstractions
 the model makes are applied *by the encoder*, so the wire carries only what the model can express:
-the domain slot is `some d` for a single alternative and `null` for two or more, and a conflicted
-slot's domain payload is `null` because coalesce reads it only for a diagnostic. Variable identities
-and
-history slots have no field — the model drops both. -/
+the domain slot is `some d` for a single alternative and `null` for two or more, a conflicted
+slot's domain payload is `null` because coalesce reads it only for a diagnostic, and a conflicted
+tuple width drops the two widths Rust keeps for its diagnostic. Variable identities and history
+slots have no field — the model drops both. -/
 
 def KindMerge.toWire : KindMerge → String
   | .data => "data"
@@ -211,10 +216,30 @@ def Atom.fromJson? (j : Json) : Except String Atom := do
 instance : ToJson Atom := ⟨Atom.toJson⟩
 instance : FromJson Atom := ⟨Atom.fromJson?⟩
 
+/-- A tuple width, tagged by which of the three it is. A conflict carries nothing: the two widths
+Rust's `Conflict` keeps only feed its diagnostic, and the encoder drops them. -/
+def TupleWidth.toJson : TupleWidth → Json
+  | .exactly n => Json.mkObj [("k", "exactly"), ("n", Lean.toJson n)]
+  | .atLeast p c =>
+      Json.mkObj [("k", "atLeast"), ("listed", Lean.toJson p),
+        ("closed", match c with | none => Json.null | some n => Lean.toJson n)]
+  | .conflict => Json.mkObj [("k", "conflict")]
+
+def TupleWidth.fromJson? (j : Json) : Except String TupleWidth := do
+  match (← j.getObjVal? "k").getStr? with
+  | .ok "exactly" => return .exactly (← Lean.fromJson? (← j.getObjVal? "n"))
+  | .ok "atLeast" =>
+      let closed ← match ← j.getObjVal? "closed" with
+        | Json.null => pure none
+        | n => some <$> Lean.fromJson? n
+      return .atLeast (← Lean.fromJson? (← j.getObjVal? "listed")) closed
+  | .ok "conflict" => return .conflict
+  | _ => throw s!"unknown TupleWidth: {j.compress}"
+
 namespace CompactTy
 
 partial def toJson : CompactTy → Json
-  | .mk atoms recF varT fn refinements =>
+  | .mk atoms recF varT fn refinements width =>
       let mapJson : List (FieldKey × CompactTy) → Json := fun m =>
         Json.arr (m.map fun (k, w) => Json.arr #[Lean.toJson k, toJson w]).toArray
       Json.mkObj
@@ -231,7 +256,8 @@ partial def toJson : CompactTy → Json
                       ("cod", toJson cod)]),
          ("refinements", match refinements with
                     | none => Json.null
-                    | some ps => Json.arr (ps.map Lean.toJson).toArray)]
+                    | some ps => Json.arr (ps.map Lean.toJson).toArray),
+         ("width", match width with | none => Json.null | some w => w.toJson)]
 
 mutual
 
@@ -249,7 +275,10 @@ partial def fromJson? (j : Json) : Except String CompactTy := do
   let refinements ← match ← j.getObjVal? "refinements" with
     | Json.null => pure none
     | c => some <$> Lean.fromJson? c
-  return .mk atoms recF varT fn refinements
+  let width ← match ← j.getObjVal? "width" with
+    | Json.null => pure none
+    | w => some <$> TupleWidth.fromJson? w
+  return .mk atoms recF varT fn refinements width
 
 /-- A `null`-or-array keyed map: the `Option (List (FieldKey × CompactTy))` slots. -/
 partial def optMap (j : Json) : Except String (Option (List (FieldKey × CompactTy))) := do
@@ -334,6 +363,7 @@ private def roundTrips (t : Ty) : Bool :=
 #guard roundTrips (.refined (.base .int)
   [.binop "eq" .elem (.var "x"), .binop "eq" .elem (.var "y")])
 #guard roundTrips (.record [("a", .base .bool), ("b", .tuple [.txn, .dataSource "s"])])
+#guard roundTrips (.openTuple [.base .int, .tuple [.txn]])
 #guard roundTrips (.variant [(.idx 0, .base .unit), (.name "tag", .base .string)])
 
 /-- The same smoke check for the compact type. -/
@@ -344,19 +374,29 @@ private def cRoundTrips (t : CompactTy) : Bool :=
 
 -- `none` refinements (no contribution) and `some []` (a value guaranteeing nothing)
 -- are distinct on the wire, which is the whole point of the slot's sentinel.
-#guard cRoundTrips (.mk [] none none none none)
-#guard cRoundTrips (.mk [] none none none (some []))
-#guard !CompactTy.equiv (.mk [] none none none none) (.mk [] none none none (some []))
+#guard cRoundTrips (.mk [] none none none none none)
+#guard cRoundTrips (.mk [] none none none (some []) none)
+#guard !CompactTy.equiv (.mk [] none none none none none) (.mk [] none none none (some []) none)
 #guard cRoundTrips (.mk [.prim .int, .txn, .uintRange 3, .source "s"] none none none
-  (some [.binop "eq" .elem (.litInt 1)]))
+  (some [.binop "eq" .elem (.litInt 1)]) none)
 -- Every slot at once, including a conflicted kind, whose domain rides along like any other.
 #guard cRoundTrips (.mk [.prim .bool]
-  (some [(.idx 0, .mk [.prim .int] none none none (some []))])
-  (some [(.name "tag", .mk [] none none none none)])
-  (some (.conflict, .mk [] none none none none, .mk [.prim .string] none none none (some [])))
-  (some []))
+  (some [(.idx 0, .mk [.prim .int] none none none (some []) none)])
+  (some [(.name "tag", .mk [] none none none none none)])
+  (some (.conflict, .mk [] none none none none none,
+    .mk [.prim .string] none none none (some []) none))
+  (some []) (some (.exactly 1)))
 #guard cRoundTrips (.mk [] none none
-  (some (.unknown, .mk [.prim .int, .prim .bool] none none none (some []),
-    .mk [] (some []) none none none)) (some []))
+  (some (.unknown, .mk [.prim .int, .prim .bool] none none none (some []) none,
+    .mk [] (some []) none none none none)) (some []) none)
+-- Each width round-trips, and two that differ only in the closed width under an open one are
+-- distinct.
+#guard cRoundTrips (.mk [] (some [(.idx 0, .mk [] none none none none none)]) none none (some [])
+  (some (.atLeast 1 none)))
+#guard cRoundTrips (.mk [] (some [(.idx 0, .mk [] none none none none none)]) none none (some [])
+  (some (.atLeast 1 (some 3))))
+#guard cRoundTrips (.mk [] none none none (some []) (some .conflict))
+#guard !CompactTy.equiv (.mk [] none none none (some []) (some (.atLeast 1 none)))
+  (.mk [] none none none (some []) (some (.atLeast 1 (some 3))))
 
 end CclFormal

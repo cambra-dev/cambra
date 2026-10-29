@@ -135,7 +135,7 @@ def Ty.holdsARefinement : Ty → Bool
   | .refined _ _ => true
   | .base _ | .uintRange _ | .dataSource _ | .txn => false
   | .fn _ _ d c => Ty.holdsARefinement d || Ty.holdsARefinement c
-  | .tuple ts => Ty.holdsARefinementSeq ts
+  | .tuple ts | .openTuple ts => Ty.holdsARefinementSeq ts
   | .record fs => Ty.holdsARefinementFields fs
   | .variant tags => Ty.holdsARefinementTags tags
 termination_by t => sizeOf t
@@ -190,7 +190,8 @@ theorem not_admits_of_refuses : (K : TypeKind) → (d : Ty) → refuses K d = tr
   | .subtypesOf _, _, h => by simp [refuses] at h
   | .uintRanges, .uintRange _, h => by simp [refuses] at h
   | .uintRanges, .base _, _ | .uintRanges, .dataSource _, _ | .uintRanges, .txn, _
-  | .uintRanges, .fn .., _ | .uintRanges, .tuple _, _ | .uintRanges, .record _, _
+  | .uintRanges, .fn .., _ | .uintRanges, .tuple _, _ | .uintRanges, .openTuple _, _
+  | .uintRanges, .record _, _
   | .uintRanges, .variant _, _ | .uintRanges, .refined .., _ => by
       intro ha; cases ha
   | .candidates ds, d, h => by

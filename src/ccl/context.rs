@@ -526,12 +526,36 @@ impl<'a> Blame<'a> {
                     }
                 }
                 CompileError::Infer {
-                    error: located.error,
+                    error: self.as_pattern_mismatch(located.error, located.node_id),
                     span,
                     related,
                 }
             })
             .collect()
+    }
+
+    /// `error`, reported as the pattern's where it is the width annotation lowering put on
+    /// the read that takes `node`'s tuple pattern apart.
+    fn as_pattern_mismatch(&self, error: InferError, node: NodeId) -> InferError {
+        match error {
+            InferError::AnnotationMismatch {
+                annotation,
+                inferred,
+            } if matches!(*annotation, Type::Tuple(_))
+                && self.projection.get(&node).is_some_and(|attr| {
+                    attr.rewritten.label == crate::ccl::lower::TUPLE_ASSIGNMENT_LABEL
+                }) =>
+            {
+                let Type::Tuple(slots) = *annotation else {
+                    unreachable!("matched a tuple annotation")
+                };
+                InferError::PatternWidthMismatch {
+                    positions: slots.len(),
+                    inferred,
+                }
+            }
+            error => error,
+        }
     }
 
     fn unsupported(&self, error: Located<String>, tree: Option<&Expr>) -> Vec<CompileError> {
@@ -1699,12 +1723,13 @@ impl ProvenanceAudit {
 /// pre-channelize check, which permits the transient `Feed` /
 /// `Infer`-channel-domain types only channelization erases.
 ///
-/// A failure is a compiler bug, with one exception: residual `Type::Infer`
+/// A failure is a compiler bug, with two exceptions: residual `Type::Infer`
 /// variables, which inference deliberately tolerates for a generalized
 /// definition the program never exercises at a concrete type (see
-/// `Type::Infer`'s invariant). That residue is an *ambiguous program* — a user
-/// error — so it is rendered as a diagnostic; anything else panics, naming
-/// `boundary`.
+/// `Type::Infer`'s invariant), and open tuples, whose width nothing in the program
+/// fixed (`docs/chl-spec.md`, "Tuple width"). That residue is an *ambiguous
+/// program* — a user error — so it is rendered as a diagnostic; anything else
+/// panics, naming `boundary`.
 fn pre_channelize_wall(
     expr: &Expr,
     boundary: &str,
@@ -1712,10 +1737,12 @@ fn pre_channelize_wall(
     instances: &Rc<InstanceTable>,
 ) -> Result<(), Vec<CompileError>> {
     check_pre_channelize_located(expr, instances).map_err(|errs| {
-        if errs
-            .iter()
-            .all(|e| matches!(e.error, InferError::UnresolvedInfer { .. }))
-        {
+        if errs.iter().all(|e| {
+            matches!(
+                e.error,
+                InferError::UnresolvedInfer { .. } | InferError::UnresolvedTupleWidth { .. }
+            )
+        }) {
             blame.infer(errs, expr)
         } else {
             let errs: Vec<&InferError> = errs.iter().map(|e| &e.error).collect();
