@@ -7,8 +7,8 @@ use crate::interpreter::operator_graph::value;
 use crate::{
     ccl::FieldKey,
     interpreter::{
-        ColumnValue, Consumer, Scheduler, Value, shared_consumer, tiling::FunctionGuard,
-        tuple_field,
+        ColumnValue, Consumer, Projection, Scheduler, Value, shared_consumer,
+        tiling::FunctionGuard, tuple_field,
     },
 };
 
@@ -400,7 +400,64 @@ impl TileProducer for CheckedLookupProducer {
         }
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    /// The answers sit at the keys' own positions, so a stream of keys, or of
+    /// `(collection, key)` rows, is pulled at the projection while the collection is read whole:
+    /// every key is answered against all of it. One answer for one key is a scalar and has no
+    /// keys to project.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        assert!(
+            matches!(self.tiling(), Tiling::DataFunction { .. })
+                || projection == Projection::Everything,
+            "{} answers one key, which has no keys to project: {projection_guard:?}",
+            self.name()
+        );
+
+        self.lookup(&projection)
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        // A **domain** release names positions of the answer, and the answer is one option per
+        // key at the key's own domain position — so it names key positions and passes through
+        // to whatever supplies them. The **collection** is not positional: every key is
+        // answered against the whole of it, so no key being finished releases any part of it.
+        // That asymmetry is why the two legs are released separately rather than together.
+        if let TileGuard::Function(FunctionGuard::Domain(_)) = &obsolete_guard {
+            match &mut self.source {
+                ProducerSource::Split { keys, .. } => keys.release(obsolete_guard),
+                ProducerSource::Paired(pairs) => pairs.release(obsolete_guard),
+            }
+            return;
+        }
+        // A split answer holds the keys' levels path for path, one answer per key, so any
+        // region of it — a group's keys under a row still growing among them — is the same
+        // region of the keys.
+        if !obsolete_guard.is_universal()
+            && !obsolete_guard.is_empty()
+            && let ProducerSource::Split { keys, .. } = &mut self.source
+        {
+            keys.release(obsolete_guard);
+            return;
+        }
+        if obsolete_guard.expect_universal_or_empty(&self.name()) {
+            self.released = true;
+            match &mut self.source {
+                ProducerSource::Split { collection, keys } => {
+                    collection.release(collection.tiling().universal_guard());
+                    keys.release(keys.tiling().universal_guard());
+                }
+                ProducerSource::Paired(pairs) => pairs.release(pairs.tiling().universal_guard()),
+            }
+        }
+    }
+}
+
+impl CheckedLookupProducer {
+    /// The answer to the keys `projection` names.
+    fn lookup(&mut self, projection: &Projection) -> Tile {
         let out_extent = match self.tiling() {
             Tiling::Scalar(e) => e.clone(),
             // One answer per row at one level, and a collection of answers per row —
@@ -422,7 +479,7 @@ impl TileProducer for CheckedLookupProducer {
         // row reaches no consumer and answers no key, so each leg is released through it.
         match &mut self.source {
             ProducerSource::Split { collection, keys } => {
-                let mut key_tile = keys.get(keys.tiling().universal_guard());
+                let mut key_tile = keys.get(projection.guard(keys.tiling()));
                 compact_releasing(&mut key_tile, keys);
                 let mut coll = collection.get(collection.tiling().universal_guard());
                 compact_releasing(&mut coll, collection);
@@ -454,7 +511,7 @@ impl TileProducer for CheckedLookupProducer {
             }
             // An assembled stream of `(collection, key)` rows.
             ProducerSource::Paired(pairs) => {
-                let mut tile = pairs.get(pairs.tiling().universal_guard());
+                let mut tile = pairs.get(projection.guard(pairs.tiling()));
                 compact_releasing(&mut tile, pairs);
                 // Not a shape error: a stream that has produced nothing yet answers with an
                 // empty tile, and this operator does the same until its rows arrive.
@@ -503,43 +560,6 @@ impl TileProducer for CheckedLookupProducer {
         }
     }
 
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // A **domain** release names positions of the answer, and the answer is one option per
-        // key at the key's own domain position — so it names key positions and passes through
-        // to whatever supplies them. The **collection** is not positional: every key is
-        // answered against the whole of it, so no key being finished releases any part of it.
-        // That asymmetry is why the two legs are released separately rather than together.
-        if let TileGuard::Function(FunctionGuard::Domain(_)) = &obsolete_guard {
-            match &mut self.source {
-                ProducerSource::Split { keys, .. } => keys.release(obsolete_guard),
-                ProducerSource::Paired(pairs) => pairs.release(obsolete_guard),
-            }
-            return;
-        }
-        // A split answer holds the keys' levels path for path, one answer per key, so any
-        // region of it — a group's keys under a row still growing among them — is the same
-        // region of the keys.
-        if !obsolete_guard.is_universal()
-            && !obsolete_guard.is_empty()
-            && let ProducerSource::Split { keys, .. } = &mut self.source
-        {
-            keys.release(obsolete_guard);
-            return;
-        }
-        if obsolete_guard.expect_universal_or_empty(&self.name()) {
-            self.released = true;
-            match &mut self.source {
-                ProducerSource::Split { collection, keys } => {
-                    collection.release(collection.tiling().universal_guard());
-                    keys.release(keys.tiling().universal_guard());
-                }
-                ProducerSource::Paired(pairs) => pairs.release(pairs.tiling().universal_guard()),
-            }
-        }
-    }
-}
-
-impl CheckedLookupProducer {
     /// Assemble the answered rows into this producer's own stream tiling.
     ///
     /// `domain` is the input's domain column, which `kept` is a subsequence of.
@@ -775,5 +795,169 @@ mod tests {
         assert_eq!(*domain, ColumnValue::UInts(vec![0]));
         assert!(domain_predicate.contains(&Value::UInt(0)));
         assert!(!domain_predicate.contains(&Value::UInt(1)));
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use crate::ccl::TagMap;
+    use crate::interpreter::BaseType;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, TestTileProducer, assert_conforms, keys_between,
+    };
+
+    const ROWS: u64 = 8;
+
+    fn int() -> Extent {
+        Extent::Base(BaseType::Int)
+    }
+
+    fn option_of_int() -> Extent {
+        Extent::Union(TagMap::from_arms(vec![
+            (
+                FieldKey::Name(crate::ccl::V_NONE),
+                Extent::Base(BaseType::Unit),
+            ),
+            (FieldKey::Name(crate::ccl::V_SOME), int()),
+        ]))
+    }
+
+    fn key_stream_tiling() -> Tiling {
+        Tiling::data_function(Extent::uint_range(ROWS), Tiling::Scalar(int()))
+    }
+
+    /// `[m[k]? for k in ks]` over the keys `0..ROWS`, against the decided map `{0: 100, 2: 102,
+    /// 4: 104, 6: 106}`, with the pulls of the key stream and of the collection logged.
+    fn lookup_over_streams() -> (CheckedLookupProducer, GuardLog, GuardLog) {
+        let keys: Vec<i64> = (0..ROWS as i64).collect();
+        let (key_stream, key_pulls, _) = ProjectionSpy::new(
+            Tile::data_function(
+                ColumnValue::from_uints((0..ROWS).collect()),
+                Box::new(Tile::Scalar(ColumnValue::Ints(keys))),
+                Predicate::True,
+                BitSet::new(),
+            ),
+            key_stream_tiling(),
+        );
+        let collection_tiling = Tiling::data_function(int(), Tiling::Scalar(int()));
+        let (collection, collection_pulls, _) = ProjectionSpy::new(
+            Tile::data_function(
+                ColumnValue::Ints(vec![0, 2, 4, 6]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![100, 102, 104, 106]))),
+                Predicate::True,
+                BitSet::new(),
+            ),
+            collection_tiling,
+        );
+        let tiling = answer_tiling(&key_stream_tiling(), option_of_int());
+        let lookup = CheckedLookupProducer {
+            base: ProducerBase::unowned(CheckedLookupProducer::alloc_id(), &tiling),
+            source: ProducerSource::Split {
+                collection: Box::new(collection),
+                keys: Box::new(key_stream),
+            },
+            released: false,
+        };
+        (lookup, key_pulls, collection_pulls)
+    }
+
+    fn answers(tile: &Tile) -> Vec<(u64, Value)> {
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = tile
+        else {
+            panic!("a stream of answers, got {tile:?}")
+        };
+        let values = scalar_tile_to_column_value((**codomain).clone());
+        (0..domain.len())
+            .map(|i| match domain.index_at(i) {
+                Value::UInt(key) => (key, values.index_at(i)),
+                other => panic!("a position key, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// A morsel of the key stream answers the morsel's keys against the whole collection:
+    /// the keys leg is pulled at the morsel, the collection is not narrowed, and the rows
+    /// outside the morsel are not answered.
+    #[test]
+    fn a_morsel_of_keys_is_answered_against_the_whole_collection() {
+        let (mut lookup, key_pulls, collection_pulls) = lookup_over_streams();
+        let morsel = lookup.get(keys_between(2, 5));
+        assert_eq!(
+            answers(&morsel),
+            vec![
+                (2, some_of(Value::Int(102))),
+                (3, none()),
+                (4, some_of(Value::Int(104))),
+                (5, none()),
+            ]
+        );
+        assert_eq!(*key_pulls.borrow(), vec![keys_between(2, 5)]);
+        let universal = Tiling::data_function(int(), Tiling::Scalar(int())).universal_guard();
+        assert_eq!(*collection_pulls.borrow(), vec![universal]);
+    }
+
+    /// Consecutive morsels, with the first released before the second is taken, as a worker
+    /// that owns the morsel does.
+    #[test]
+    fn consecutive_morsels_are_answered_in_turn() {
+        let (mut lookup, key_pulls, _) = lookup_over_streams();
+        lookup.get(keys_between(0, 3));
+        lookup.release(keys_between(0, 3));
+        let next = lookup.get(keys_between(4, 7));
+        assert_eq!(
+            answers(&next),
+            vec![
+                (4, some_of(Value::Int(104))),
+                (5, none()),
+                (6, some_of(Value::Int(106))),
+                (7, none()),
+            ]
+        );
+        assert_eq!(key_pulls.borrow()[1], keys_between(4, 7));
+    }
+
+    #[test]
+    fn the_morsels_together_are_the_whole_pull() {
+        for guard in [keys_between(0, 3), keys_between(2, 5), keys_between(5, 5)] {
+            assert_conforms(|| Box::new(lookup_over_streams().0), guard);
+        }
+    }
+
+    #[test]
+    fn asking_for_nothing_reads_nothing() {
+        let (mut lookup, key_pulls, collection_pulls) = lookup_over_streams();
+        let tile = lookup.get(lookup.tiling().empty_guard());
+        assert!(answers(&tile).is_empty());
+        assert!(key_pulls.borrow().is_empty() && collection_pulls.borrow().is_empty());
+    }
+
+    /// One key answers one value, which has no keys to project.
+    #[test]
+    #[should_panic(expected = "answers one key")]
+    fn a_single_key_rejects_a_key_projection() {
+        let tiling = answer_tiling(&Tiling::Scalar(int()), option_of_int());
+        let mut lookup = CheckedLookupProducer {
+            base: ProducerBase::unowned(CheckedLookupProducer::alloc_id(), &tiling),
+            source: ProducerSource::Split {
+                collection: Box::new(TestTileProducer::new(
+                    Tile::data_function(
+                        ColumnValue::Ints(vec![1]),
+                        Box::new(Tile::Scalar(ColumnValue::Ints(vec![10]))),
+                        Predicate::True,
+                        BitSet::new(),
+                    ),
+                    Tiling::data_function(int(), Tiling::Scalar(int())),
+                )),
+                keys: Box::new(TestTileProducer::new(
+                    Tile::Scalar(ColumnValue::Ints(vec![1])),
+                    Tiling::Scalar(int()),
+                )),
+            },
+            released: false,
+        };
+        lookup.get(keys_between(0, 1));
     }
 }
