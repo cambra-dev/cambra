@@ -8,10 +8,7 @@ use crate::interpreter::nest_levels;
 use crate::interpreter::operator_graph::value;
 use crate::{
     ccl::AggregateKind,
-    interpreter::{
-        ColumnValue, Consumer, FunctionGuard, GatedConsumer, Predicate, Projection, Scheduler,
-        Value, forwarding_consumer, forwarding_consumer_keeping_keys, shared_consumer,
-    },
+    interpreter::{ColumnValue, Consumer, FunctionGuard, Predicate, Projection, Scheduler, Value},
 };
 
 /// Reduces a `DataFunction` input to a single scalar via an aggregation operation.
@@ -63,10 +60,10 @@ impl TileOperator for Aggregate {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         let arrivals = Arrivals::new();
-        let (consumer, gate) = shared_consumer(consumer);
+        let consumer = Downstream::new(consumer);
         let input_producer = self.input.subscribe(
             self.input.tiling().universal_guard(),
-            arrivals.consumer(forwarding_consumer(&consumer)),
+            arrivals.consumer(widening(Box::new(consumer.clone()))),
             scheduler,
         );
         let producer = AggregateProducer::new(
@@ -75,8 +72,7 @@ impl TileOperator for Aggregate {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            )
-            .sharing(gate),
+            ),
             input_producer,
             arrivals,
             consumer,
@@ -106,7 +102,7 @@ struct AggregateState {
     /// What the input notified since it was last read, which sink mode swallows.
     arrivals: Arrivals,
     /// The operator's own consumer, which `finalize` wakes on the terminal round.
-    consumer: GatedConsumer,
+    consumer: Downstream,
     /// Whether the aggregate is in sink mode: the dispatcher pulls the input, and `get` never does.
     sinking: bool,
 }
@@ -181,7 +177,7 @@ impl AggregateProducer {
         base: ProducerBase,
         input: Box<dyn TileProducer>,
         arrivals: Arrivals,
-        consumer: GatedConsumer,
+        consumer: Downstream,
     ) -> Self {
         let (kind, accumulator) = match &base.tiling {
             Tiling::Aggregation {
@@ -218,8 +214,12 @@ impl AggregateProducer {
     /// A producer over `input` with no consumer to wake, for a test.
     #[cfg(test)]
     fn detached(base: ProducerBase, input: Box<dyn TileProducer>) -> Self {
-        let (consumer, _) = shared_consumer(Box::new(|| {}));
-        Self::new(base, input, Arrivals::new(), consumer)
+        Self::new(
+            base,
+            input,
+            Arrivals::new(),
+            Downstream::new(Box::new(|| {})),
+        )
     }
 }
 
@@ -282,7 +282,7 @@ impl Breaker for AggregateBreaker {
             state.set_terminal(true);
             state.consumer.clone()
         };
-        consumer.notify(&Projection::Everything);
+        consumer.clone().notify(&Projection::Everything);
     }
 
     /// The accumulator has no keys.
@@ -822,10 +822,10 @@ impl TileOperator for MapAggregate {
     ) -> Box<dyn TileProducer> {
         // The groups keep the input's outermost keys.
         let arrivals = Arrivals::new();
-        let (consumer, gate) = shared_consumer(consumer);
+        let consumer = Downstream::new(consumer);
         let input_producer = self.input.subscribe(
             self.input.tiling().universal_guard(),
-            arrivals.consumer(keys_only(forwarding_consumer_keeping_keys(&consumer))),
+            arrivals.consumer(keys_only(Box::new(consumer.clone()))),
             scheduler,
         );
         let producer = MapAggregateProducer::new(
@@ -834,8 +834,7 @@ impl TileOperator for MapAggregate {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            )
-            .sharing(gate),
+            ),
             input_producer,
             self.kind,
             arrivals,
@@ -868,7 +867,7 @@ struct MapAggregateState {
     /// What the input notified since it was last read, which sink mode swallows.
     arrivals: Arrivals,
     /// The operator's own consumer, which `finalize` wakes on the terminal round.
-    consumer: GatedConsumer,
+    consumer: Downstream,
     /// Whether the aggregate is in sink mode: the dispatcher pulls the input, and `get` never does.
     sinking: bool,
     /// Whether the terminal round has run: in sink mode every group is terminal from then, and
@@ -1073,7 +1072,7 @@ impl MapAggregateProducer {
         input: Box<dyn TileProducer>,
         kind: AggregateKind,
         arrivals: Arrivals,
-        consumer: GatedConsumer,
+        consumer: Downstream,
     ) -> Self {
         let state = Arc::new(Mutex::new(MapAggregateState {
             input,
@@ -1099,8 +1098,13 @@ impl MapAggregateProducer {
     /// A producer over `input` with no consumer to wake, for a test.
     #[cfg(test)]
     fn detached(base: ProducerBase, input: Box<dyn TileProducer>, kind: AggregateKind) -> Self {
-        let (consumer, _) = shared_consumer(Box::new(|| {}));
-        Self::new(base, input, kind, Arrivals::new(), consumer)
+        Self::new(
+            base,
+            input,
+            kind,
+            Arrivals::new(),
+            Downstream::new(Box::new(|| {})),
+        )
     }
 }
 
@@ -1158,7 +1162,7 @@ impl Breaker for MapAggregateBreaker {
             state.terminal = true;
             state.consumer.clone()
         };
-        consumer.notify(&Projection::Everything);
+        consumer.clone().notify(&Projection::Everything);
     }
 
     fn held_keys(&self) -> usize {

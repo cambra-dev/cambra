@@ -727,6 +727,31 @@ impl Consumer for RecordingConsumer {
     }
 }
 
+/// The operator's own consumer, shared by the notification path of its input and the breaker that
+/// wakes it from `finalize`. The input's notifications reach it as the operator forwards them, and
+/// it is not gated: the operator has one input that notifies, as it had before it was a breaker.
+#[derive(Clone)]
+pub(crate) struct Downstream(
+    // shared-state-ok: the operator's own consumer, which holds no tile.
+    Arc<Mutex<Box<dyn Consumer>>>,
+);
+
+impl Downstream {
+    pub(crate) fn new(consumer: Box<dyn Consumer>) -> Self {
+        Self(Arc::new(Mutex::new(consumer)))
+    }
+}
+
+impl Consumer for Downstream {
+    fn notify(&mut self, arrived: &Projection) {
+        self.0.lock_now().notify(arrived);
+    }
+
+    fn region_driven(&self) -> bool {
+        self.0.lock_now().region_driven()
+    }
+}
+
 /// One collection level of a tile, keyed in [`completion_view`]'s map by the record fields
 /// walked through to reach it and its collection depth. `complete` is the
 /// region of paths reaching this level the tile calls complete — its own statement, and

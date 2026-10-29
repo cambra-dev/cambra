@@ -118,10 +118,6 @@ impl TileOperator for ExtractFinal {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        // TODO(pipeline breaker): a pooled chain stops notifying at this operator. The region of
-        // its source ends here, and the breaker raises its own region to the dispatcher once a
-        // worker has merged a morsel (`docs/parallel-execution.md`, "Pipeline boundaries"). The
-        // serial scheduler still needs the notification passed on below.
         // Both branches need their own notification path: any progress on
         // either side may unblock the consumer (source becoming terminal,
         // default resolving its scalar value).  We give source the shared
@@ -129,32 +125,40 @@ impl TileOperator for ExtractFinal {
         // no-op notifier because its readiness only matters at the moment
         // we discover an empty source — by then we're already in `get_impl`
         // and will pull it directly.
+        let arrivals = Arrivals::new();
+        let consumer = Downstream::new(consumer);
         let source_producer = self.source.subscribe(
             self.source.tiling().universal_guard(),
-            widening(consumer),
+            arrivals.consumer(widening(Box::new(consumer.clone()))),
             scheduler,
         );
         let default_producer = self
             .default
             .as_mut()
             .map(|d| d.subscribe(d.tiling().universal_guard(), Box::new(|| {}), scheduler));
-        Box::new(ExtractFinalProducer {
-            base: ProducerBase::new(
+        let producer = ExtractFinalProducer::new(
+            ProducerBase::new(
                 ExtractFinalProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 scheduler,
             ),
-            source: source_producer,
-            default: default_producer,
-            final_tile: None,
-            released: false,
-        })
+            source_producer,
+            default_producer,
+            arrivals,
+            consumer,
+        );
+        if let Some(operator) = self.operator_id() {
+            scheduler.register_breaker(operator, &producer.breaker);
+        }
+        Box::new(producer)
     }
 }
 
-struct ExtractFinalProducer {
-    base: ProducerBase,
+/// What an `ExtractFinal` holds between pulls, shared by its producer and its breaker handle: the
+/// producer answers `get`, and the dispatcher drives the breaker. Execution is single-threaded, so
+/// the lock is never contended.
+struct ExtractFinalState {
     source: Box<dyn TileProducer>,
     /// Default-value producer, pulled when `source` becomes terminal
     /// and emits zero values.  Subscribed eagerly alongside `source`;
@@ -177,42 +181,67 @@ struct ExtractFinalProducer {
     /// soon as it has merged the value into its own cache, so
     /// post-release emissions are rare in normal data flow.
     released: bool,
+    /// What the source notified since it was last read, which sink mode swallows.
+    arrivals: Arrivals,
+    /// The operator's own consumer, which `finalize` wakes on the terminal round.
+    consumer: Downstream,
+    /// Whether the operator is in sink mode: the dispatcher pulls the source into `rows`, and `get`
+    /// never does.
+    sinking: bool,
+    /// Whether the terminal round has run: in sink mode the source is complete from then.
+    terminal: bool,
+    /// The source rows the dispatcher's pulls merged, in position order.
+    rows: Option<Tile>,
 }
 
-impl TileProducer for ExtractFinalProducer {
-    fn state_info(&self) -> ProducerStateInfo {
-        ProducerStateInfo::holding(self.final_tile.as_ref().map_or(0, Tile::cell_count))
-    }
+struct ExtractFinalBreaker {
+    // shared-state-ok: the operator's own state, shared between its producer and its breaker on
+    // the dispatcher's one thread; no tile passes between operators through it.
+    state: Arc<Mutex<ExtractFinalState>>,
+}
 
-    impl_producer_base!();
+struct ExtractFinalProducer {
+    base: ProducerBase,
+    // shared-state-ok: the operator's own state, shared with its breaker as `ExtractFinalBreaker`
+    // says.
+    state: Arc<Mutex<ExtractFinalState>>,
+    /// The handle the scheduler's registry holds weakly; the producer owns the state it reaches.
+    breaker: BreakerHandle,
+}
 
-    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
-        visit("source", &*self.source);
-        if let Some(default) = &self.default {
-            visit("default", &**default);
+impl ExtractFinalProducer {
+    fn new(
+        base: ProducerBase,
+        source: Box<dyn TileProducer>,
+        default: Option<Box<dyn TileProducer>>,
+        arrivals: Arrivals,
+        consumer: Downstream,
+    ) -> Self {
+        let state = Arc::new(Mutex::new(ExtractFinalState {
+            source,
+            default,
+            final_tile: None,
+            released: false,
+            arrivals,
+            consumer,
+            sinking: false,
+            terminal: false,
+            rows: None,
+        }));
+        Self {
+            base,
+            breaker: Arc::new(ExtractFinalBreaker {
+                state: state.clone(),
+            }),
+            state,
         }
     }
+}
 
-    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
-        let node = node.child("source", self.source.inspect(opts));
-        match &self.default {
-            Some(d) => node.child("default", d.inspect(opts)),
-            None => node.annotate("total (no default)".to_string()),
-        }
-    }
-
-    /// The final position of a stream is one value, or one collection that a release takes
-    /// whole, so the projection is all of it or none: the source is read whole whatever the
-    /// consumer asks, because the last position is not known before the stream ends.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        match projection_guard.projection(&self.name()) {
-            Projection::Everything => {}
-            Projection::Nothing => return self.tiling().empty_tile(),
-            Projection::Keys(_) | Projection::Fields(_) => panic!(
-                "{} extracts one final value, which has no keys to project: {projection_guard:?}",
-                self.name()
-            ),
-        }
+impl ExtractFinalState {
+    /// The final value of `source_tile`, a terminal answer of the source, or the default when it
+    /// holds no row, which `tiling` is the declared tiling of.
+    fn extract(&mut self, tiling: &Tiling, source_tile: Tile) -> Tile {
         // Every emission below is built at the **declared** extent rather than
         // from the value alone. A variant value carries only the tag it holds, so
         // a column built from it would have just that one arm — narrower than this
@@ -220,60 +249,8 @@ impl TileProducer for ExtractFinalProducer {
         // between them. Building at the declared extent keeps every arm present,
         // with the ones that did not occur empty, which is the shape downstream
         // merges and appends require.
-        let extent = self.tiling().extent();
-        let empty = self.tiling().empty_tile();
-        if self.released {
-            return empty;
-        }
-        // Already extracted: keep re-emitting the same scalar until we
-        // are released.  Downstream `Memo` typically releases on first
-        // sight of a non-empty tile, so this branch only stays active
-        // across pulls when the consumer doesn't release immediately
-        // (e.g. while a sibling pipeline is still converging).
-        if let Some(tile) = &self.final_tile {
-            return tile.clone();
-        }
-        let source_tiling = self.source.tiling().clone();
-        let source_tile = self.source.get(source_tiling.universal_guard());
-        if !source_tile.is_terminal() {
-            // Source hasn't converged yet — emit an empty scalar of the
-            // correct extent.  Our own tiling *is* the source's codomain
-            // (always `Scalar`), so its extent gives us the value-space
-            // directly without going through `Tiling::codomain` (which
-            // would return `None` for a `Scalar`).
-            //
-            // Incremental release: we only ever need the *final* (highest-domain)
-            // value, so every position below the highest one seen so far is dead —
-            // release it. This is a promise never to re-request those positions;
-            // the source decides what upstream storage that frees (for a changelog
-            // dense read, the store prefix below the tail's carry source). Without
-            // it, a never-terminating loop would pin the whole changelog until a
-            // terminal that never comes.
-            if let Some(keys) = source_tile.live_keys() {
-                let max_pos = keys
-                    .filter_map(|(_, key)| match key {
-                        Value::UInt(p) => Some(p),
-                        _ => None,
-                    })
-                    .max();
-                if let Some(max_pos) = max_pos
-                    && max_pos >= 1
-                {
-                    self.source
-                        .release(TileGuard::Function(FunctionGuard::Domain(
-                            Predicate::at_or_below(Value::UInt(max_pos - 1)),
-                        )));
-                }
-            }
-            return empty;
-        }
-        // Source is terminal — we've seen the final tile, so we'll
-        // never need more data from it.  Release universally so
-        // upstream chains (`FanOut`, `Memo`, mutation-loop body
-        // sub-graphs) can in turn release their inputs and ultimately
-        // reach the underlying data source.  Release is idempotent, so
-        // a repeated call from the consumer's outer pull loop is fine.
-        self.source.release(source_tiling.universal_guard());
+        let extent = tiling.extent();
+        let empty = tiling.empty_tile();
         let Tile::DataFunction {
             domain,
             codomain,
@@ -286,8 +263,15 @@ impl TileProducer for ExtractFinalProducer {
         // The position being indexed is this collection's key, and what it holds is
         // everything below it: a value where the values are a column, a whole collection
         // where they are one.
-        // TODO don't assume sorting; we need to sort by the key value instead.
-        let live_outer = (0..domain.len()).rev().find(|i| !deleted.contains(*i));
+        // The last position is the greatest key, whatever order the rows arrived in.
+        let live_outer = (0..domain.len())
+            .filter(|i| !deleted.contains(*i))
+            .max_by(|a, b| {
+                domain
+                    .index_at(*a)
+                    .partial_cmp(&domain.index_at(*b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         if let Some(final_idx) = live_outer {
             let tile = if codomain.is_data_function() {
                 // Keeping one row leaves that key's group standing alone, which is the
@@ -314,7 +298,7 @@ impl TileProducer for ExtractFinalProducer {
                 let cv = scalar_tile_to_column_value(*codomain);
                 column_value_to_tile(
                     ColumnValue::from_values(vec![cv.index_at(final_idx)], &extent),
-                    self.tiling(),
+                    tiling,
                 )
             };
             self.final_tile = Some(tile.clone());
@@ -323,7 +307,7 @@ impl TileProducer for ExtractFinalProducer {
         // Source is terminal *and* empty (the loop body ran zero times).  Pull the
         // default scalar and emit that instead, then release the default so its
         // upstream chain can release too.
-        let yields_a_level = self.tiling().is_data_function();
+        let yields_a_level = tiling.is_data_function();
         let Some(default) = self.default.as_mut() else {
             // No default means the source was declared total — an exhaustive tag
             // partition always covers exactly one position. An empty source here is
@@ -358,13 +342,198 @@ impl TileProducer for ExtractFinalProducer {
             None => empty,
         }
     }
+}
+
+impl Breaker for ExtractFinalBreaker {
+    /// Switches to sink mode, dropping what the source notifies from here. What pull mode read is
+    /// kept: it released nothing the final value needs.
+    fn begin_sinking(&self) {
+        let mut state = self.state.lock_now();
+        assert!(!state.sinking, "an ExtractFinal begins sinking once");
+        state.sinking = true;
+        // What the source notifies from here is not the downstream's business: it learns of the
+        // value from `finalize`, on the terminal round.
+        state.arrivals.swallow();
+    }
+
+    /// Pulls the source at `guard`, merges the rows into the table the final value is read from,
+    /// and releases the source at the guard.
+    fn pull_sink(&self, guard: TileGuard) {
+        let mut state = self.state.lock_now();
+        let st = &mut *state;
+        assert!(
+            st.sinking,
+            "an ExtractFinal is pulled after it begins sinking"
+        );
+        assert!(
+            !st.terminal,
+            "an ExtractFinal is not pulled after its terminal round"
+        );
+        if st.released || guard.is_empty() {
+            return;
+        }
+        let mut rows = st.source.get(guard.clone());
+        rows.compact();
+        match &mut st.rows {
+            Some(held) => held.merge(rows),
+            none => *none = Some(rows),
+        }
+        st.source.release(guard);
+    }
+
+    /// The one value is read through `get`, so there is no key to push.
+    fn first_keys(&self, _region: &Predicate, _rows: u64) -> Vec<Value> {
+        Vec::new()
+    }
+
+    /// On the terminal round the source is complete: the value is final, and the consumer wakes.
+    fn finalize(&self, round: Round, _parents: &mut Pushes<'_>) {
+        if !round.terminal {
+            return;
+        }
+        let consumer = {
+            let mut state = self.state.lock_now();
+            assert!(
+                state.sinking,
+                "an ExtractFinal finalizes after it begins sinking"
+            );
+            state.terminal = true;
+            state.consumer.clone()
+        };
+        consumer.clone().notify(&Projection::Everything);
+    }
+
+    fn held_keys(&self) -> usize {
+        self.state
+            .lock_now()
+            .rows
+            .as_ref()
+            .map_or(0, |rows| rows.cell_count())
+    }
+}
+
+impl TileProducer for ExtractFinalProducer {
+    fn state_info(&self) -> ProducerStateInfo {
+        let state = self.state.lock_now();
+        ProducerStateInfo::holding(
+            state.final_tile.as_ref().map_or(0, Tile::cell_count)
+                + state.rows.as_ref().map_or(0, Tile::cell_count),
+        )
+    }
+
+    impl_producer_base!();
+
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        let state = self.state.lock_now();
+        visit("source", &*state.source);
+        if let Some(default) = &state.default {
+            visit("default", &**default);
+        }
+    }
+
+    fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
+        let state = self.state.lock_now();
+        let node = node.child("source", state.source.inspect(opts));
+        match &state.default {
+            Some(d) => node.child("default", d.inspect(opts)),
+            None => node.annotate("total (no default)".to_string()),
+        }
+    }
+
+    /// The final position of a stream is one value, or one collection that a release takes
+    /// whole, so the projection is all of it or none: the source is read whole whatever the
+    /// consumer asks, because the last position is not known before the stream ends. In sink mode
+    /// the source is not read: the value is cut from the rows the dispatcher's pulls merged, once
+    /// the terminal round has run.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        match projection_guard.projection(&self.name()) {
+            Projection::Everything => {}
+            Projection::Nothing => return self.tiling().empty_tile(),
+            Projection::Keys(_) | Projection::Fields(_) => panic!(
+                "{} extracts one final value, which has no keys to project: {projection_guard:?}",
+                self.name()
+            ),
+        }
+        let tiling = self.tiling().clone();
+        let empty = tiling.empty_tile();
+        let mut state = self.state.lock_now();
+        let st = &mut *state;
+        drop(st.arrivals.take());
+        if st.released {
+            return empty;
+        }
+        // Already extracted: keep re-emitting the same scalar until we
+        // are released.  Downstream `Memo` typically releases on first
+        // sight of a non-empty tile, so this branch only stays active
+        // across pulls when the consumer doesn't release immediately
+        // (e.g. while a sibling pipeline is still converging).
+        if let Some(tile) = &st.final_tile {
+            return tile.clone();
+        }
+        let source_tiling = st.source.tiling().clone();
+        if st.sinking {
+            if !st.terminal {
+                return empty;
+            }
+            let rows = st
+                .rows
+                .clone()
+                .unwrap_or_else(|| source_tiling.empty_tile());
+            return st.extract(&tiling, rows);
+        }
+        let source_tile = st.source.get(source_tiling.universal_guard());
+        if !source_tile.is_terminal() {
+            // Source hasn't converged yet — emit an empty scalar of the
+            // correct extent.  Our own tiling *is* the source's codomain
+            // (always `Scalar`), so its extent gives us the value-space
+            // directly without going through `Tiling::codomain` (which
+            // would return `None` for a `Scalar`).
+            //
+            // Incremental release: we only ever need the *final* (highest-domain)
+            // value, so every position below the highest one seen so far is dead —
+            // release it. This is a promise never to re-request those positions;
+            // the source decides what upstream storage that frees (for a changelog
+            // dense read, the store prefix below the tail's carry source). Without
+            // it, a never-terminating loop would pin the whole changelog until a
+            // terminal that never comes.
+            if let Some(keys) = source_tile.live_keys() {
+                let max_pos = keys
+                    .filter_map(|(_, key)| match key {
+                        Value::UInt(p) => Some(p),
+                        _ => None,
+                    })
+                    .max();
+                if let Some(max_pos) = max_pos
+                    && max_pos >= 1
+                {
+                    st.source.release(TileGuard::Function(FunctionGuard::Domain(
+                        Predicate::at_or_below(Value::UInt(max_pos - 1)),
+                    )));
+                }
+            }
+            return empty;
+        }
+        // Source is terminal — we've seen the final tile, so we'll
+        // never need more data from it.  Release universally so
+        // upstream chains (`FanOut`, `Memo`, mutation-loop body
+        // sub-graphs) can in turn release their inputs and ultimately
+        // reach the underlying data source.  Release is idempotent, so
+        // a repeated call from the consumer's outer pull loop is fine.
+        st.source.release(source_tiling.universal_guard());
+        st.extract(&tiling, source_tile)
+    }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         if obsolete_guard.expect_universal_or_empty(&self.name()) {
-            self.released = true;
-            self.source.release(self.source.tiling().universal_guard());
-            if let Some(d) = self.default.as_mut() {
-                d.release(d.tiling().universal_guard());
+            let mut state = self.state.lock_now();
+            let st = &mut *state;
+            st.released = true;
+            st.rows = None;
+            let universal = st.source.tiling().universal_guard();
+            st.source.release(universal);
+            if let Some(d) = st.default.as_mut() {
+                let universal = d.tiling().universal_guard();
+                d.release(universal);
             }
         }
     }
@@ -664,5 +833,48 @@ mod projection_tests {
     fn a_key_projection_is_rejected() {
         let (mut last, _) = final_of_finished_stream();
         last.get(keys_between(0, 1));
+    }
+
+    /// A sinking `ExtractFinal` pulls and releases its source at each morsel, never reads it from
+    /// `get`, answers nothing before the terminal round,
+    /// and answers nothing before the terminal round (the dispatcher test covers the value after it).
+    #[test]
+    fn a_sinking_extract_final_reads_morsels_and_answers_at_the_terminal_round() {
+        let int = || Extent::Base(BaseType::Int);
+        let tiling = Tiling::data_function(Extent::uint_range(3), Tiling::Scalar(int()));
+        let finished = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1, 2]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30]))),
+            Predicate::True,
+            bit_set::BitSet::new(),
+        );
+        let (stream, pulled, released) = ProjectionSpyOp::new(finished, tiling);
+        let mut op = ExtractFinal::new(
+            Box::new(stream),
+            Box::new(Constant::new(Value::Int(0), int())),
+        );
+        let mut scheduler = Scheduler::new();
+        let mut producer = op.subscribe(
+            op.tiling().universal_guard(),
+            Box::new(|| {}),
+            &mut scheduler,
+        );
+        let handle = scheduler
+            .breaker(op.operator_id().expect("an identity"))
+            .expect("registered");
+        handle.begin_sinking();
+        assert!(producer.get(op.tiling().universal_guard()).is_empty());
+        assert!(pulled.lock_now().is_empty(), "get reads local state");
+        handle.pull_sink(keys_between(0, 1));
+        handle.pull_sink(keys_between(2, 2));
+        assert_eq!(*pulled.lock_now(), [keys_between(0, 1), keys_between(2, 2)]);
+        assert_eq!(
+            *released.lock_now(),
+            [keys_between(0, 1), keys_between(2, 2)]
+        );
+        assert!(
+            producer.get(op.tiling().universal_guard()).is_empty(),
+            "no value before the terminal round"
+        );
     }
 }

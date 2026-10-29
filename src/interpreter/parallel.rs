@@ -139,6 +139,7 @@ impl BreakerKind {
                 Some(*aggregate)
             }
             BreakerKind::Invert { converse } => Some(*converse),
+            BreakerKind::Final { extract } => Some(*extract),
             BreakerKind::Materialize { memo } => Some(*memo),
         }
     }
@@ -165,6 +166,13 @@ pub enum BreakerKind {
     Group {
         /// The `MapAggregate` the pipeline ends in.
         aggregate: NodeId,
+    },
+    /// An `ExtractFinal` at the top of `main`: the operator's own producer, switched to sink mode,
+    /// is the breaker of the pipeline over its source, and `main` stays the program's own
+    /// producer.
+    Final {
+        /// The `ExtractFinal` the pipeline ends in.
+        extract: NodeId,
     },
     /// A `Converse` that a pipeline reads the groups of: the operator's own producer, switched to
     /// sink mode, is the breaker of the pipeline over the rows it inverts, and the group values
@@ -220,6 +228,8 @@ enum Class {
     /// The inversion of a collection: the head of a pipeline that reads the groups, which the
     /// plan cuts at.
     Converse,
+    /// The final value of a stream at the top of `main`.
+    Final,
     /// An operator the plan does not admit, and the reason.
     Refuse(String),
 }
@@ -241,6 +251,7 @@ fn classify(kind: &str) -> Class {
         "MapExtractAggregate" => Class::ExtractGroups,
         "MapAggregate" => Class::Groups,
         "Converse" => Class::Converse,
+        "ExtractFinal" => Class::Final,
         other => Class::Refuse(format!("`{other}` is not a streaming operator here")),
     }
 }
@@ -352,6 +363,17 @@ impl Planner<'_> {
                 aggregate: edge.subscribed,
             };
             return (group, group_edge.subscribed);
+        }
+        if let Some(GraphNode::Operator { kind, inputs, .. }) = self.by_id.get(&top)
+            && matches!(classify(kind), Class::Final)
+            && let Some(source) = inputs
+                .iter()
+                .find(|edge| matches!(edge.role, EdgeRole::Named("source")))
+            && inputs
+                .iter()
+                .all(|edge| matches!(edge.kind, EdgeKind::Value { deferred: false }))
+        {
+            return (BreakerKind::Final { extract: top }, source.subscribed);
         }
         (BreakerKind::Collect, top)
     }
@@ -490,7 +512,8 @@ impl Planner<'_> {
                 | Class::Extract
                 | Class::Fold
                 | Class::ExtractGroups
-                | Class::Groups => {
+                | Class::Groups
+                | Class::Final => {
                     return Err(Unsupported(format!(
                         "`{kind}` is not a streaming operator here"
                     )));
@@ -1994,12 +2017,15 @@ fn sunk_breakers(
         // aggregate's is its input's.
         let pulled = match &pipeline.breaker {
             BreakerKind::Materialize { .. } => node_tiling(&node)?,
-            BreakerKind::Fold { .. } | BreakerKind::Group { .. } | BreakerKind::Invert { .. } => {
+            BreakerKind::Fold { .. }
+            | BreakerKind::Group { .. }
+            | BreakerKind::Invert { .. }
+            | BreakerKind::Final { .. } => {
                 let mut input = None;
                 for graph_node in program.operator_graph.nodes() {
                     if let GraphNode::Operator { id, inputs, .. } = graph_node
                         && *id == node
-                        && let [edge] = inputs.as_slice()
+                        && let Some(edge) = inputs.iter().find(|edge| edge.role.is_breaker_input())
                     {
                         input = Some(edge.subscribed);
                     }
@@ -2019,7 +2045,11 @@ fn sunk_breakers(
             let mut found = None;
             for output in &program.outputs {
                 with_operator(&*output.op, node, &mut |breaker_op| {
-                    breaker_op.visit_inputs(&mut |edge| found = Some(source_of(edge.target)));
+                    breaker_op.visit_inputs(&mut |edge| {
+                        if edge.role.is_breaker_input() {
+                            found = Some(source_of(edge.target));
+                        }
+                    });
                 });
             }
             let source =
@@ -2085,7 +2115,9 @@ impl PooledRun {
             // A fold's pipeline ends in the aggregate's own producer, so `main`'s producer stays
             // the program's; any other `main` is answered from the pool's output.
             match plan.main().breaker {
-                BreakerKind::Fold { .. } | BreakerKind::Group { .. } => kept_main = producer,
+                BreakerKind::Fold { .. }
+                | BreakerKind::Group { .. }
+                | BreakerKind::Final { .. } => kept_main = producer,
                 _ => drop(producer),
             }
         }
@@ -2135,7 +2167,9 @@ impl PooledRun {
                 let tiling = output.op.tiling().clone();
                 match plan.main().breaker {
                     BreakerKind::Collect => start_chain(Some((&mut output.op, tiling))),
-                    BreakerKind::Fold { .. } | BreakerKind::Group { .. } => start_chain(None),
+                    BreakerKind::Fold { .. }
+                    | BreakerKind::Group { .. }
+                    | BreakerKind::Final { .. } => start_chain(None),
                     BreakerKind::Materialize { .. } | BreakerKind::Invert { .. } => {
                         unreachable!("`main` is not a breaker's input")
                     }
@@ -2311,7 +2345,8 @@ fn start_planned(
                 BreakerKind::Materialize { .. }
                 | BreakerKind::Fold { .. }
                 | BreakerKind::Group { .. }
-                | BreakerKind::Invert { .. } => {
+                | BreakerKind::Invert { .. }
+                | BreakerKind::Final { .. } => {
                     let placeholder = placeholder_refs
                         .remove(&position)
                         .expect("a breaker pipeline has its placeholder");
@@ -2887,7 +2922,8 @@ mod tests {
                 | Class::Fold
                 | Class::ExtractGroups
                 | Class::Groups
-                | Class::Converse => {}
+                | Class::Converse
+                | Class::Final => {}
                 Class::Refuse(reason) => assert!(
                     reason.contains(kind),
                     "a refusal names the operator it refuses: {reason}"
@@ -3212,6 +3248,27 @@ mod tests {
             let converse = nodes.add(node("Converse", keys(), vec![edge("input", source)]));
             let mut planner = nodes.planner();
             assert!(refused(&mut planner, converse).contains("read by a collecting pipeline"));
+        }
+
+        /// An `ExtractFinal` at the top of an output is a breaker over its `source`, whatever its
+        /// default is.
+        #[test]
+        fn an_extract_final_is_a_breaker_over_its_source() {
+            let mut nodes = Nodes::default();
+            let source = nodes.filled(keys());
+            let default = nodes.constant();
+            let last = nodes.add(node(
+                "ExtractFinal",
+                keys(),
+                vec![edge("source", source), edge("default", default)],
+            ));
+            let planner = nodes.planner();
+            let (breaker, chain) = planner.breaker_at(last);
+            assert!(matches!(breaker, BreakerKind::Final { extract } if extract == last));
+            assert_eq!(
+                chain, source,
+                "the pipeline runs over the source, not the default"
+            );
         }
 
         /// A `MapAggregate` with no extraction above it is not a group breaker.

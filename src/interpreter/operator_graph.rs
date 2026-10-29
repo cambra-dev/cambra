@@ -85,6 +85,14 @@ pub enum EdgeRole {
     StoreKey(String),
 }
 
+impl EdgeRole {
+    /// Whether the edge carries what a breaker pulls: the `input` of an aggregate, a memo or a
+    /// `Converse`, or the `source` of an `ExtractFinal`, as against the `default` it falls back on.
+    pub(crate) fn is_breaker_input(&self) -> bool {
+        matches!(self, EdgeRole::Named("input" | "source"))
+    }
+}
+
 /// How a role reads as a label — the same rendering the wire's
 /// `OperatorEdgeRole` ships, and what `inspect` names a child by.
 impl std::fmt::Display for EdgeRole {

@@ -1100,7 +1100,23 @@ inline driver has sink mode only.
    equals the serial answer at three morsel sizes. Terminal at every round, not notifying, not
    swallowing, ignoring sink mode, withdrawing a completion, not releasing, keeping `held`, reading a
    `Converse` from a collecting pipeline or twice, and listing no group each fail a named test.
-8. `ExtractFinal`.
+8. `ExtractFinal`. Its producer is a breaker (`ExtractFinalBreaker`) over the rows its pulls merged:
+   `pull_sink` pulls the source at the guard, merges the rows and releases the source at the guard;
+   `get` answers nothing before the terminal round, and at it cuts the last live row's value (or
+   the default) from the table with the extraction pull mode uses; `finalize` on the terminal round
+   wakes the consumer; `first_keys` answers no key, since the one value is read through `get`. An
+   `ExtractFinal` at the top of `main` is `BreakerKind::Final`, as an `ExtractAggregate` over an
+   `Aggregate` is a fold: the pipeline runs over the `source` edge and `main` stays the program's own
+   producer. `EdgeRole::is_breaker_input` names the edge a breaker pulls. The corpus admits no new
+   program from this step: the `ExtractFinal`s it holds sit under stores or inside a chain, which the
+   plan still refuses, and the pin stays at 173. The operators that became breakers hand their
+   consumer to the breaker through `Downstream`, an ungated shared handle, because each has one input
+   that notifies and was never gated. Tests: a sinking `ExtractFinal` reads and releases at each
+   morsel, never reads its source from `get`, answers nothing before the terminal round and the last
+   row's value after it, swallows its source's notification and wakes its consumer at the terminal
+   round only; the plan reads the breaker off the `source` edge. Terminal at every round, not
+   notifying, not swallowing, reading from `get`, not releasing, answering early and recognising
+   neither the operator nor its edge each fail a named test.
 9. The program sink pulls the last breaker's producer; delete `BreakerOutput` and `Materialized`.
 10. Delete the cut, `visit_inputs_mut`, the reader records and `inherits`, and the sections of this
     document they leave stale.

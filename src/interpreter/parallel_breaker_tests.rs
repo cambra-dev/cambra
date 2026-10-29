@@ -864,6 +864,99 @@ mod breakers {
         );
     }
 
+    /// An `ExtractFinal` in sink mode swallows what its source notifies, answers nothing before the
+    /// terminal round, and then answers the last row's value and wakes its consumer.
+    #[test]
+    fn a_sinking_extract_final_answers_at_the_terminal_round_only() {
+        use crate::interpreter::tile_operators::test_helpers::{
+            NotifyingOp, ints_by_position, keys_between, notify_input,
+        };
+        use crate::interpreter::tile_operators::{ExtractFinal, TileOperator};
+        use crate::interpreter::{BaseType, ColumnValue, Extent, Projection};
+        let tiling = Tiling::data_function(
+            Extent::uint_range(4),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let (input, notifier) = NotifyingOp::new(ints_by_position(&[10, 20, 30, 40], true), tiling);
+        let mut last = ExtractFinal::without_default(Box::new(input));
+        let mut scheduler = Scheduler::new();
+        let woken = Arc::new(Mutex::new(0usize));
+        let counter = woken.clone();
+        let mut producer = last.subscribe(
+            last.tiling().empty_guard(),
+            Box::new(move || *counter.lock_now() += 1),
+            &mut scheduler,
+        );
+        let handle = scheduler
+            .breaker(last.operator_id().expect("an identity"))
+            .expect("registered");
+        handle.begin_sinking();
+        notify_input(
+            &notifier,
+            &Projection::of(&keys_between(0, 1)).expect("keys"),
+        );
+        assert_eq!(
+            *woken.lock_now(),
+            0,
+            "the source's notification is swallowed"
+        );
+
+        let arrivals = Arrivals::new();
+        let dispatcher = Dispatcher::new(vec![arrivals.spec(Some(handle))], 2);
+        let mut state = dispatcher.serve_state();
+        arrivals.deliver(&dispatcher, 0, 0, 3);
+        serve(&dispatcher, &mut state);
+        let universal = last.tiling().universal_guard();
+        assert!(
+            producer.get(universal.clone()).is_empty(),
+            "no value before the terminal round"
+        );
+        assert_eq!(*woken.lock_now(), 0);
+        dispatcher.close(PipelineId(0));
+        serve(&dispatcher, &mut state);
+        assert_eq!(*woken.lock_now(), 1, "the terminal round woke the consumer");
+        assert_eq!(
+            producer.get(universal),
+            Tile::Scalar(ColumnValue::Ints(vec![40]))
+        );
+    }
+
+    /// The final value is the one at the greatest key, not at the row that arrived last: morsels
+    /// claimed out of key order merge in arrival order.
+    #[test]
+    fn a_sinking_extract_final_picks_the_greatest_key_whatever_the_arrival_order() {
+        use crate::interpreter::tile_operators::test_helpers::{NotifyingOp, ints_by_position};
+        use crate::interpreter::tile_operators::{ExtractFinal, TileOperator};
+        use crate::interpreter::{BaseType, ColumnValue, Extent};
+        let tiling = Tiling::data_function(
+            Extent::uint_range(4),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let (input, _) = NotifyingOp::new(ints_by_position(&[10, 20, 30, 40], true), tiling);
+        let mut last = ExtractFinal::without_default(Box::new(input));
+        let mut scheduler = Scheduler::new();
+        let mut producer =
+            last.subscribe(last.tiling().empty_guard(), Box::new(|| {}), &mut scheduler);
+        let handle = scheduler
+            .breaker(last.operator_id().expect("an identity"))
+            .expect("registered");
+        handle.begin_sinking();
+        let arrivals = Arrivals::new();
+        let dispatcher = Dispatcher::new(vec![arrivals.spec(Some(handle))], 2);
+        let mut state = dispatcher.serve_state();
+        arrivals.deliver(&dispatcher, 0, 2, 3);
+        serve(&dispatcher, &mut state);
+        arrivals.deliver(&dispatcher, 0, 0, 1);
+        serve(&dispatcher, &mut state);
+        dispatcher.close(PipelineId(0));
+        serve(&dispatcher, &mut state);
+        assert_eq!(
+            producer.get(last.tiling().universal_guard()),
+            Tile::Scalar(ColumnValue::Ints(vec![40])),
+            "key 3 holds the final value, though key 1's row arrived last"
+        );
+    }
+
     /// The keys a memo adopted from its pull-mode cache reach the parent although no morsel is
     /// delivered and the source stays open: the memo's first round pushes them.
     #[test]

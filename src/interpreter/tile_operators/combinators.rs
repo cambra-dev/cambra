@@ -6,8 +6,8 @@ use std::iter::repeat_n;
 use super::*;
 use crate::interpreter::operator_graph::value;
 use crate::interpreter::{
-    ColumnValue, Consumer, Extent, GatedConsumer, Projection, Scheduler, Value,
-    forwarding_consumer, forwarding_consumer_keeping_keys, live_keys, shared_consumer, tuple_field,
+    ColumnValue, Consumer, Extent, Projection, Scheduler, Value, live_keys, shared_consumer,
+    tuple_field,
 };
 
 /// Inverts a function operator, producing a lookup-function from codomain to domain.
@@ -81,13 +81,13 @@ impl TileOperator for Converse {
         // outermost collection re-keys.
         let keeps_keys = self.level != CurryLevel::OUTERMOST;
         let arrivals = Arrivals::new();
-        let (consumer, gate) = shared_consumer(consumer);
+        let consumer = Downstream::new(consumer);
         let input = self.input.subscribe(
             self.tiling().universal_guard(),
-            arrivals.consumer(match keeps_keys {
-                true => forwarding_consumer_keeping_keys(&consumer),
-                false => forwarding_consumer(&consumer),
-            }),
+            arrivals.consumer(consumer_keeping_keys_if(
+                keeps_keys,
+                Box::new(consumer.clone()),
+            )),
             scheduler,
         );
         let producer = ConverseProducer::new(
@@ -96,8 +96,7 @@ impl TileOperator for Converse {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            )
-            .sharing(gate),
+            ),
             input,
             self.level,
             self.tiling().values_at(self.level).empty_at_no_rows(),
@@ -134,7 +133,7 @@ struct ConverseState {
     /// What the input notified since it was last read, which sink mode swallows.
     arrivals: Arrivals,
     /// The operator's own consumer, which `finalize` wakes on the terminal round.
-    consumer: GatedConsumer,
+    consumer: Downstream,
     /// Whether the operator is in sink mode: the dispatcher pulls the input into `rows`, and `get`
     /// never does.
     sinking: bool,
@@ -172,7 +171,7 @@ impl ConverseProducer {
         level: CurryLevel,
         empty_level: Tile,
         arrivals: Arrivals,
-        consumer: GatedConsumer,
+        consumer: Downstream,
     ) -> Self {
         let state = Arc::new(Mutex::new(ConverseState {
             input,
@@ -204,8 +203,14 @@ impl ConverseProducer {
         level: CurryLevel,
         empty_level: Tile,
     ) -> Self {
-        let (consumer, _) = shared_consumer(Box::new(|| {}));
-        Self::new(base, input, level, empty_level, Arrivals::new(), consumer)
+        Self::new(
+            base,
+            input,
+            level,
+            empty_level,
+            Arrivals::new(),
+            Downstream::new(Box::new(|| {})),
+        )
     }
 }
 
@@ -471,7 +476,7 @@ impl Breaker for ConverseBreaker {
         if !keys.is_empty() {
             parents.push(&points(&keys));
         }
-        consumer.notify(&Projection::Everything);
+        consumer.clone().notify(&Projection::Everything);
     }
 
     fn held_keys(&self) -> usize {
