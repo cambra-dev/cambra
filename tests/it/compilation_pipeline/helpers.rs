@@ -307,12 +307,14 @@ pub(crate) fn sort_tile_collections(tile: Tile) -> Tile {
             codomain,
             domain_predicate,
             deleted,
+            absent_keys,
         } => Tile::DataFunction {
             row_starts,
             domain,
             codomain: Box::new(sort_tile_collections(*codomain)),
             domain_predicate,
             deleted,
+            absent_keys,
         },
         other => other,
     }
