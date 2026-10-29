@@ -568,6 +568,7 @@ mod end_to_end {
                 streams_from: Vec::new(),
                 source: Box::new(move || source.clone()),
                 finalize: None,
+                breaker: None,
             }],
             morsel_rows,
         ));

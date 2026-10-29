@@ -106,6 +106,9 @@ EXPECTED_EXCEPTIONS = [
     # producer in it and it schedules the sink's pull, and no tile passes through it between
     # operators.
     ("src/interpreter/parallel.rs", "shared cell of `SinkConsumer`"),
+    # The dispatcher's record of a breaker pipeline's rounds (`parallel.rs`, `Rounds`), driven on
+    # the dispatcher's one thread; no tile passes between operators through it.
+    ("src/interpreter/parallel.rs", "cell of `Rounds`"),
     ("src/interpreter/parallel.rs", "shared cell of `SinkConsumer`"),
     # The worker pool's breakers: the collection every worker merges into, and each
     # worker's partial accumulator, handed in once; both answer `main` after every worker

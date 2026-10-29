@@ -863,6 +863,9 @@ trait Breaker: Send + Sync {
     /// End of a round. Finalize what the round merged and push the keys that are final, which the
     /// parents may now claim. `round.terminal` is set on the last round of the pipeline.
     fn finalize(&self, round: Round, parents: &mut Pushes);
+
+    /// How many keys local state holds, which a release of the output reclaims.
+    fn held_keys(&self) -> usize;
 }
 
 type BreakerHandle = Arc<dyn Breaker>;
@@ -914,8 +917,8 @@ The step of `serve_until_wait` for pipeline `P` changes in three places.
    pipeline the queue of regions pushed to it, cut by the breaker's `first_keys`.
 2. A claimed morsel runs `breaker.pull_sink(guard)`. The dispatcher no longer pulls a chain and
    hands the tile to a breaker's `absorb`.
-3. When `P` has no morsel left to claim and ran at least one since its last round, the dispatcher
-   calls `breaker.finalize(Round { terminal }, pushes)`. `terminal` is set when the source of `P` is
+3. When `P` has no morsel left to claim and either ran one since its last round or has run no
+   round yet, the dispatcher calls `breaker.finalize(Round { terminal }, pushes)`. `terminal` is set when the source of `P` is
    exhausted and every pipeline `P` streams from has finished; the dispatcher marks `P` finished,
    runs the terminal round, closes the pipelines that stream from `P` and starts the pipelines
    waiting on it.
@@ -934,6 +937,17 @@ A pipeline whose chain reads a memo at keys is a parent pipeline of that memo. I
 the push queue regardless of the data source its chain iterates, which supplies the rows the morsel
 names. The rule that the values of the input are keys ([Keyed reads](#keyed-reads)) stays a plan
 rule, since the morsel names keys and the chain must read at them.
+
+The interface lives in `src/interpreter/tile_operators/mod.rs` (`Breaker`, `Round`, `BreakerHandle`),
+and the dispatcher's side in `src/interpreter/parallel.rs` (`Pushes`, `PipelineSpec::breaker`,
+`Dispatcher::drain`, `Dispatcher::round` and `Dispatcher::sink_morsel`, `pushed_source`). The
+registry is `Scheduler::register_breaker` and `Scheduler::breaker`, and holds each breaker by `Weak`;
+a second registration for an operator replaces the first, because a reload subscribes an operator it
+carried forward while the old producer is alive:
+the producer that owns a breaker holds its `BreakerHandle`, an `Arc<dyn Breaker>`, and a pipeline's
+spec holds a clone. The methods of `Breaker` take `&self` and the implementor locks its own state,
+because the handle is shared; the lock is never contended. The enum `parallel::BreakerKind` names
+what a planned pipeline ends in.
 
 #### Completeness and release
 
@@ -1083,8 +1097,7 @@ not regress. From step 3 the run checks every pinned program in pull mode and in
 Asserted where the invariant lives, in debug builds:
 
 - A breaker in sink mode pulls its input only inside `pull_sink`.
-- Each round's pushed keys are disjoint from the keys of every earlier round, and a key is pushed
-  only when it is final.
+- A key is pushed only when it is final.
 - `finalize` is called with `terminal` set at most once, and `pull_sink` is not called after it.
 - A parent's morsel is a subset of the keys pushed to it and not yet claimed.
 - `get_impl` states complete only keys a morsel merged, and every level complete only after the
@@ -1094,6 +1107,11 @@ Asserted where the invariant lives, in debug builds:
   back; a breaker that sinks is a collection.
 - A pipeline that reads pushes streams from one breaker pipeline.
 - Every call of the interface happens on one thread, through `serve_until_wait`.
+
+Checked in every build, because a violation loses rows silently:
+
+- Each round's pushed keys are disjoint from the keys of every earlier round: `Pushes::push` panics
+  on a repeated key, and a parent would never serve the second push of it.
 
 #### Open questions
 

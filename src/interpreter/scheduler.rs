@@ -7,8 +7,10 @@ use std::{
 
 use smol_str::SmolStr;
 
+use crate::ccl::provenance::NodeId;
 use crate::interpreter::{
-    Consumer, DataSourceDomainExtentImpl, Predicate, Projection, tile_operators::Notified,
+    Consumer, DataSourceDomainExtentImpl, Predicate, Projection,
+    tile_operators::{Breaker, BreakerHandle, Notified},
     value_probe::ProbeSlot,
 };
 
@@ -413,6 +415,10 @@ pub struct Scheduler {
     pooled_release_identity: Option<String>,
     /// The record names handed out under that identity.
     pooled_release_names: Vec<String>,
+    /// The pipeline breakers by the operator that made each, registered when the breaker's
+    /// producer is subscribed and held weakly: the producer owns the breaker. The dispatcher finds
+    /// a breaker here.
+    breakers: HashMap<NodeId, Weak<dyn Breaker>>,
 }
 
 /// The release records a pool's chains registered with the sources, retired when it drops: after
@@ -564,12 +570,22 @@ impl Scheduler {
             .collect()
     }
 
+    /// Register the breaker the producer of `operator` is, when it is subscribed. A second
+    /// registration for the operator replaces the first: a reload subscribes an operator it
+    /// carried forward while the old producer is still alive, and the producer subscribed last is
+    /// the one a run drives.
+    pub fn register_breaker(&mut self, operator: NodeId, handle: &BreakerHandle) {
+        self.breakers.insert(operator, Arc::downgrade(handle));
+    }
+
+    /// The breaker the producer of `operator` is, if it registered one that is still alive.
+    pub fn breaker(&self, operator: NodeId) -> Option<BreakerHandle> {
+        self.breakers.get(&operator)?.upgrade()
+    }
+
     /// The name the producer of `operator` holds its release record under while a pool subscribes
     /// its chains ([`Scheduler::with_pooled_release_records`]), or `None` for the producer's own.
-    pub fn pooled_release_record_for(
-        &mut self,
-        operator: Option<crate::ccl::provenance::NodeId>,
-    ) -> Option<String> {
+    pub fn pooled_release_record_for(&mut self, operator: Option<NodeId>) -> Option<String> {
         let identity = self.pooled_release_identity.as_ref()?;
         let name = match operator {
             Some(operator) => format!("{identity}/{operator:?}"),

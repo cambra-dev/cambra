@@ -22,8 +22,8 @@ use crate::{
         operator_graph::{EdgeKind, EdgeRole, GraphNode, OperatorGraph},
         sinks::SinkConsumer,
         tile_operators::{
-            BreakerOutput, Claim, Detached, MorselSource, OperatorBase, ProducerBase, TileOperator,
-            TileProducer, impl_producer_base,
+            BreakerHandle, BreakerOutput, Claim, Detached, LiveSource, MorselSource, OperatorBase,
+            ProducerBase, Round, TileOperator, TileProducer, impl_producer_base,
         },
     },
     pretty_graph::VizOptions,
@@ -87,7 +87,7 @@ impl fmt::Display for Unsupported {
 /// `IterateExtent` directly beneath it, among others. A head is an `IterateExtent` over a source
 /// ([`Head::Source`]), or a `FanOutSlot` over a `Memo` ([`Head::Breaker`]), which the plan cuts
 /// at: the pipeline that feeds the `Memo` ends in a breaker that materializes
-/// ([`Breaker::Materialize`]). A chain with a keyed read is a [`Head::Breaker`] pipeline over the
+/// ([`BreakerKind::Materialize`]). A chain with a keyed read is a [`Head::Breaker`] pipeline over the
 /// memo's output that also reads the source it iterates. Every operator in a
 /// chain is streaming, so a worker's chain holds no state between morsels. Which rows the source
 /// enumerates, and whether it can be cut into morsels, is the source's to say
@@ -112,7 +112,7 @@ impl Plan {
     }
 
     /// What the pipeline that ends in `main` ends in.
-    pub fn main_breaker(&self) -> &Breaker {
+    pub fn main_breaker(&self) -> &BreakerKind {
         &self.main().breaker
     }
 
@@ -127,7 +127,7 @@ pub(crate) struct PipelinePlan {
     /// What its chain starts from.
     pub(crate) head: Head,
     /// What it ends in.
-    pub(crate) breaker: Breaker,
+    pub(crate) breaker: BreakerKind,
     /// The pipelines, by position in the plan, whose output it reads: the pipeline of the `Memo`
     /// its head slot reads, or the one a keyed read reads, for a [`Head::Breaker`], and none for a
     /// source.
@@ -146,7 +146,7 @@ pub(crate) struct PipelinePlan {
 
 /// The breaker a morsel pipeline ends in: what the pool keeps between morsels, and how it
 /// answers the `main` output.
-pub enum Breaker {
+pub enum BreakerKind {
     /// The `main` sink itself: the collection, merged morsel by morsel.
     Collect,
     /// An `Aggregate` read by an `ExtractAggregate` into `main`: a fold the pool keeps as one
@@ -265,7 +265,7 @@ fn plan_outputs(graph: &OperatorGraph, admit_sinks: bool) -> Result<Plan, Unsupp
         // `main` is a fold: a sink dispatches a collection.
         let (breaker, at) = match name == "main" {
             true => planner.breaker_at(top),
-            false => (Breaker::Collect, top),
+            false => (BreakerKind::Collect, top),
         };
         outputs.push((name, planner.pipeline(at, breaker)?));
     }
@@ -292,7 +292,7 @@ impl Planner<'_> {
     /// What the pipeline of the output whose chain tops out at `top` ends in, and where its chain
     /// starts: an `ExtractAggregate` over an `Aggregate` is a fold, and anything else the
     /// collection itself.
-    fn breaker_at(&self, top: NodeId) -> (Breaker, NodeId) {
+    fn breaker_at(&self, top: NodeId) -> (BreakerKind, NodeId) {
         if let Some(GraphNode::Operator { kind, inputs, .. }) = self.by_id.get(&top)
             && matches!(classify(kind), Class::Extract)
             && let [edge] = inputs.as_slice()
@@ -305,13 +305,13 @@ impl Planner<'_> {
             && matches!(classify(fold_kind), Class::Fold)
             && let [fold_edge] = fold_inputs.as_slice()
         {
-            let fold = Breaker::Fold {
+            let fold = BreakerKind::Fold {
                 kind: *kind,
                 accumulator: (**accumulator).clone(),
             };
             return (fold, fold_edge.subscribed);
         }
-        (Breaker::Collect, top)
+        (BreakerKind::Collect, top)
     }
 
     /// The kind of the operator `id` names, or why the graph holds none.
@@ -368,7 +368,7 @@ impl Planner<'_> {
             ));
         }
         if !self.keyed_memos.contains_key(&memo) {
-            let planned = self.pipeline(upstream.subscribed, Breaker::Materialize { memo })?;
+            let planned = self.pipeline(upstream.subscribed, BreakerKind::Materialize { memo })?;
             self.keyed_memos.insert(memo, planned);
         }
         *keyed = Some(memo);
@@ -408,7 +408,7 @@ impl Planner<'_> {
 
     /// Plan the pipeline whose chain starts at `top` and ends in `breaker`, after the pipelines
     /// it streams from, and say where it is in the plan.
-    fn pipeline(&mut self, top: NodeId, breaker: Breaker) -> Result<usize, Unsupported> {
+    fn pipeline(&mut self, top: NodeId, breaker: BreakerKind) -> Result<usize, Unsupported> {
         let mut at = top;
         let mut keyed: Option<NodeId> = None;
         let mut drops_keys = false;
@@ -523,7 +523,7 @@ impl Planner<'_> {
                         ));
                     }
                     let planned =
-                        self.pipeline(upstream.subscribed, Breaker::Materialize { memo })?;
+                        self.pipeline(upstream.subscribed, BreakerKind::Materialize { memo })?;
                     drops_keys |= self.pipelines[planned].drops_keys;
                     break (Head::Breaker, vec![planned]);
                 }
@@ -708,11 +708,11 @@ pub(crate) fn run_main_delivering(
     // The chain the workers subscribe is the whole output for a collection, and the fold's input
     // for a fold, reached through the extract and the fold the plan saw.
     match plan.main().breaker {
-        Breaker::Collect => run_chain(&mut output.op),
-        Breaker::Fold { .. } => output.op.visit_inputs_mut(&mut |fold| {
+        BreakerKind::Collect => run_chain(&mut output.op),
+        BreakerKind::Fold { .. } => output.op.visit_inputs_mut(&mut |fold| {
             fold.visit_inputs_mut(&mut |input| run_chain(input));
         }),
-        Breaker::Materialize { .. } => unreachable!("`main` is not a memo's input"),
+        BreakerKind::Materialize { .. } => unreachable!("`main` is not a memo's input"),
     }
     Ok(tiles
         .expect("the main chain was visited")
@@ -860,7 +860,7 @@ fn run_planned(
     let mut runs = Vec::new();
     for pipeline in &plan.pipelines {
         let (chain, breaker): (&mut dyn TileOperator, PoolBreaker) = match &pipeline.breaker {
-            Breaker::Materialize { memo } => {
+            BreakerKind::Materialize { memo } => {
                 let taken = upstream
                     .remove(memo)
                     .expect("the cut took the memo's input");
@@ -871,14 +871,14 @@ fn run_planned(
                     },
                 )
             }
-            Breaker::Collect => {
+            BreakerKind::Collect => {
                 let chain = main_chain.take().expect("one pipeline ends in `main`");
                 let breaker = PoolBreaker::Collect {
                     collector: Mutex::new(chain.tiling().empty_tile()),
                 };
                 (&mut **chain, breaker)
             }
-            Breaker::Fold { kind, accumulator } => {
+            BreakerKind::Fold { kind, accumulator } => {
                 let chain = main_chain.take().expect("one pipeline ends in `main`");
                 let breaker = PoolBreaker::Fold {
                     kind: *kind,
@@ -1134,6 +1134,7 @@ fn prepare(
                 streams_from: run.streams_from.clone(),
                 source: Box::new(move || source.clone()),
                 finalize: run.breaker.finalize(),
+                breaker: None,
             }
         })
         .collect();
@@ -1631,6 +1632,94 @@ struct PipelineSpec {
     /// Called once, by the worker that completes the pipeline, before any pipeline waiting on
     /// it starts: the breaker's combine.
     finalize: Option<Box<dyn Fn() + Send + Sync>>,
+    /// The pipeline's breaker, when it is a [`Breaker`]: the dispatcher calls its `pull_sink` for
+    /// each morsel in place of a worker, and its `finalize` for each round. A pipeline with none
+    /// runs as before.
+    breaker: Option<BreakerHandle>,
+}
+
+/// What the dispatcher keeps of a breaker pipeline's rounds, which one thread reads and writes.
+struct Rounds {
+    /// Whether a round is owed: a morsel ran since the last round, or no round has run yet. A
+    /// breaker may hold keys before its first morsel (a memo that adopted its pull-mode cache), and
+    /// the first round pushes them.
+    ran: bool,
+    /// Whether the terminal round has run.
+    terminal: bool,
+    /// The thread that drives the pipeline's breaker, which is the first to call it.
+    driver: Option<std::thread::ThreadId>,
+    /// The keys pushed to the parent pipelines in every round so far, which a push is checked
+    /// against.
+    pushed: Predicate,
+}
+
+impl Rounds {
+    /// Every call of a breaker is made on one thread.
+    fn on_driver(&mut self) {
+        let me = std::thread::current().id();
+        assert!(
+            self.driver.get_or_insert(me) == &me,
+            "a breaker pipeline is driven by one thread"
+        );
+    }
+}
+
+/// What a breaker's `finalize` may do to the dispatcher: push keys that are final to the
+/// pipelines that read the breaker, which are the pipelines that list its pipeline in
+/// `streams_from`.
+pub struct Pushes<'d> {
+    dispatcher: &'d Dispatcher,
+    parents: &'d [usize],
+    pushed: &'d mut Predicate,
+}
+
+impl Pushes<'_> {
+    /// Make the keys of `region` claimable by each parent pipeline. A key is pushed once: a parent
+    /// claims each pushed key once, so a later push of it would never be served.
+    ///
+    /// # Panics
+    ///
+    /// When a key of `region` was pushed before. The check runs in every build: a parent that
+    /// claimed the key once would lose the rows of its second push.
+    pub fn push(&mut self, region: &Predicate) {
+        assert!(
+            self.pushed.intersect(region).is_false(),
+            "a key is pushed in one round only: {region:?} against {:?}",
+            self.pushed
+        );
+        *self.pushed = self.pushed.union(region);
+        for &parent in self.parents {
+            self.dispatcher
+                .publish(PipelineId(parent), &Projection::admitting(region.clone()));
+        }
+    }
+}
+
+/// The source of a parent pipeline's morsels: the keys pushed to it, cut by the breaker's
+/// `first_keys`, each claimed once.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "the plan builds a parent pipeline's source with it"
+    )
+)]
+fn pushed_source(breaker: &BreakerHandle) -> Arc<dyn MorselSource> {
+    let breaker = breaker.clone();
+    // A pushed key is ready by being pushed, so the source's ready region is every key.
+    Arc::new(LiveSource::new(
+        || Predicate::True,
+        move |region, rows| {
+            let keys = breaker.first_keys(region, rows);
+            // A pushed key is a key the breaker holds, so a region that is not empty names one,
+            // and a key outside the region would be claimed by nobody.
+            debug_assert!(
+                !keys.is_empty() && keys.iter().all(|key| region.contains(key)),
+                "first_keys answers keys of the region: {keys:?} for {region:?}"
+            );
+            keys
+        },
+    ))
 }
 
 /// What a worker is told by [`Dispatcher::next`].
@@ -1671,6 +1760,8 @@ struct Dispatcher {
     jobs: Vec<Job>,
     /// Rows a morsel holds, which a worker claims at most.
     morsel_rows: u64,
+    /// Whether a pipeline has a breaker, which one thread drives through `serve_until_wait`.
+    has_breakers: bool,
     /// Pipelines not yet finished.
     unfinished: AtomicUsize,
     /// Set when a worker panics: every `next` answers `Done` from then on, so the other
@@ -1699,6 +1790,10 @@ struct Early {
 struct Job {
     build: Box<dyn Fn() -> Arc<dyn MorselSource> + Send + Sync>,
     finalize: Option<Box<dyn Fn() + Send + Sync>>,
+    breaker: Option<BreakerHandle>,
+    // shared-state-ok: the dispatcher's own bookkeeping of a breaker pipeline's rounds, read and
+    // written on its thread. It holds no tile.
+    rounds: Mutex<Rounds>,
     /// Pipelines waiting on this one to finish.
     dependents: Vec<usize>,
     /// Pipelines that read this one's output as it is produced.
@@ -1731,6 +1826,23 @@ struct Job {
 impl Dispatcher {
     /// A dispatcher over `pipelines`, in plan order. A pipeline that waits on none starts now.
     fn new(pipelines: Vec<PipelineSpec>, morsel_rows: u64) -> Self {
+        for (index, spec) in pipelines.iter().enumerate() {
+            let behind_breakers: Vec<usize> = spec
+                .streams_from
+                .iter()
+                .filter(|from| pipelines[from.0].breaker.is_some())
+                .map(|from| from.0)
+                .collect();
+            assert!(
+                behind_breakers.is_empty() || spec.streams_from.len() == 1,
+                "a pipeline streams from one breaker pipeline: {index} streams from {:?}",
+                spec.streams_from
+                    .iter()
+                    .map(|from| from.0)
+                    .collect::<Vec<_>>()
+            );
+        }
+        let has_breakers = pipelines.iter().any(|spec| spec.breaker.is_some());
         let mut dependents = vec![Vec::new(); pipelines.len()];
         let mut stream_readers = vec![Vec::new(); pipelines.len()];
         for (index, spec) in pipelines.iter().enumerate() {
@@ -1779,6 +1891,13 @@ impl Dispatcher {
                 stream_readers,
                 build: spec.source,
                 finalize: spec.finalize,
+                rounds: Mutex::new(Rounds {
+                    ran: spec.breaker.is_some(),
+                    terminal: false,
+                    driver: None,
+                    pushed: Predicate::False,
+                }),
+                breaker: spec.breaker,
                 dependents,
                 source: OnceLock::new(),
                 early: Mutex::new(Early {
@@ -1795,6 +1914,7 @@ impl Dispatcher {
         let dispatcher = Self {
             id: DISPATCHERS.fetch_add(1, Ordering::Relaxed),
             unfinished: AtomicUsize::new(jobs.len()),
+            has_breakers,
             jobs,
             morsel_rows,
             failed: AtomicBool::new(false),
@@ -1924,6 +2044,9 @@ impl Dispatcher {
                 job.outstanding.fetch_add(1, Ordering::AcqRel);
                 match source.claim(self.morsel_rows) {
                     Claim::Morsel(guard) => {
+                        if job.breaker.is_some() {
+                            job.rounds.lock_now().ran = true;
+                        }
                         return Next::Package(WorkPackage {
                             pipeline: PipelineId(index),
                             guard,
@@ -1940,6 +2063,7 @@ impl Dispatcher {
                         if job.exhausted.load(Ordering::Acquire) && self.try_finish(index) {
                             continue 'scan;
                         }
+                        self.drain(index);
                     }
                     Claim::Exhausted => {
                         job.outstanding.fetch_sub(1, Ordering::AcqRel);
@@ -1977,6 +2101,14 @@ impl Dispatcher {
         if let Some(finalize) = &job.finalize {
             finalize();
         }
+        if job.breaker.is_some() {
+            debug_assert_eq!(
+                job.streams_open.load(Ordering::Acquire),
+                0,
+                "the terminal round runs after every pipeline it streams from finished"
+            );
+            self.round(index, true);
+        }
         // The closing follows the finalize and the last publish, which are the breaker's:
         // nothing more reaches a pipeline that reads the stream once its last stream is done. A
         // pipeline that was never published to starts here. Closing first builds it already closed;
@@ -1999,6 +2131,55 @@ impl Dispatcher {
         self.unfinished.fetch_sub(1, Ordering::AcqRel);
         self.wake_idle();
         true
+    }
+
+    /// The pipeline has no morsel left to claim: a breaker pipeline that ran a morsel since its
+    /// last round runs a round.
+    fn drain(&self, index: usize) {
+        let job = &self.jobs[index];
+        if job.breaker.is_none() || job.outstanding.load(Ordering::Acquire) != 0 {
+            return;
+        }
+        if std::mem::take(&mut job.rounds.lock_now().ran) {
+            self.round(index, false);
+        }
+    }
+
+    /// Run a round of the breaker of pipeline `index`: `finalize`, which pushes the keys that are
+    /// final to the pipelines that read it.
+    fn round(&self, index: usize, terminal: bool) {
+        let job = &self.jobs[index];
+        let breaker = job.breaker.as_ref().expect("a round runs for a breaker");
+        let mut rounds = job.rounds.lock_now();
+        rounds.on_driver();
+        debug_assert!(!rounds.terminal, "no round runs after the terminal round");
+        rounds.terminal = terminal;
+        rounds.ran = false;
+        let mut pushes = Pushes {
+            dispatcher: self,
+            parents: &job.stream_readers,
+            pushed: &mut rounds.pushed,
+        };
+        breaker.finalize(Round { terminal }, &mut pushes);
+    }
+
+    /// Run the morsel of `package` through its pipeline's breaker: the breaker pulls its own
+    /// input at the morsel's guard and merges it.
+    fn sink_morsel(&self, package: &WorkPackage) {
+        let job = &self.jobs[package.pipeline.0];
+        {
+            let mut rounds = job.rounds.lock_now();
+            rounds.on_driver();
+            debug_assert!(
+                !rounds.terminal,
+                "pull_sink is not called after the terminal round"
+            );
+        }
+        let breaker = job
+            .breaker
+            .as_ref()
+            .expect("a morsel of a breaker pipeline");
+        breaker.pull_sink(package.guard.clone());
     }
 
     /// Record that `package`'s morsel is in the breaker and released.
@@ -2113,7 +2294,10 @@ impl Dispatcher {
                     state.attached[pipeline.0] = true;
                 }
                 state.last = Some(pipeline);
-                worker.work(&package);
+                match self.jobs[pipeline.0].breaker {
+                    Some(_) => self.sink_morsel(&package),
+                    None => worker.work(&package),
+                }
                 self.ack(package);
                 Step::Ran
             }
@@ -2125,6 +2309,10 @@ impl Dispatcher {
     /// One worker's turn: [`step`](Self::step) until every pipeline has finished or the
     /// dispatcher failed, parking when nothing is claimable.
     fn serve(&self, worker: &mut impl PoolWorker) {
+        debug_assert!(
+            !self.has_breakers,
+            "a dispatcher with a breaker pipeline is driven by `serve_until_wait`"
+        );
         let mut state = self.serve_state();
         loop {
             // Read before the step looks for work: a wake that follows moves the epoch, and the
@@ -2397,13 +2585,13 @@ impl PooledRun {
             Some(output) => {
                 let tiling = output.op.tiling().clone();
                 match plan.main().breaker {
-                    Breaker::Collect => start_chain(Some((&mut output.op, tiling))),
-                    Breaker::Fold { .. } => output.op.visit_inputs_mut(&mut |fold| {
+                    BreakerKind::Collect => start_chain(Some((&mut output.op, tiling))),
+                    BreakerKind::Fold { .. } => output.op.visit_inputs_mut(&mut |fold| {
                         fold.visit_inputs_mut(&mut |input| {
                             start_chain(Some((input, tiling.clone())))
                         });
                     }),
-                    Breaker::Materialize { .. } => unreachable!("`main` is not a memo's input"),
+                    BreakerKind::Materialize { .. } => unreachable!("`main` is not a memo's input"),
                 }
             }
         }
@@ -2550,7 +2738,7 @@ fn start_planned(
                     .expect("a pipeline that is not a memo's ends in an output")
             };
             let (chain, breaker): (&mut dyn TileOperator, PoolBreaker) = match &pipeline.breaker {
-                Breaker::Materialize { memo } => {
+                BreakerKind::Materialize { memo } => {
                     let taken = upstream
                         .remove(memo)
                         .expect("the cut took the memo's input");
@@ -2561,7 +2749,7 @@ fn start_planned(
                         },
                     )
                 }
-                Breaker::Collect => {
+                BreakerKind::Collect => {
                     let name = output_name();
                     let chain = match name == "main" {
                         true => main_chain.take().expect("one pipeline ends in `main`"),
@@ -2573,7 +2761,7 @@ fn start_planned(
                     reads.insert(name, Reads::Rows(output.clone()));
                     (&mut **chain, PoolBreaker::Materialize { output })
                 }
-                Breaker::Fold { kind, accumulator } => {
+                BreakerKind::Fold { kind, accumulator } => {
                     let chain = main_chain.take().expect("one pipeline ends in `main`");
                     let result = FoldedResult::new(
                         main_consumer.take().expect("the consumer is taken once"),
@@ -2684,6 +2872,10 @@ fn start_planned(
 }
 
 #[cfg(test)]
+#[path = "parallel_breaker_tests.rs"]
+mod breaker_tests;
+
+#[cfg(test)]
 #[path = "parallel_live_tests.rs"]
 mod live_tests;
 
@@ -2776,6 +2968,7 @@ mod tests {
                     finalize: Some(Box::new(move || {
                         finished.lock_wait().push(format!("finish {i}"));
                     })),
+                    breaker: None,
                 }
             })
             .collect();
@@ -2789,6 +2982,7 @@ mod tests {
                 streams_from: Vec::new(),
                 source: Box::new(move || Arc::new(RangeSource::new(rows))),
                 finalize: None,
+                breaker: None,
             }],
             morsel_rows,
         )
@@ -3037,6 +3231,7 @@ mod tests {
                 streams_from: Vec::new(),
                 source: Box::new(move || source.clone()),
                 finalize: None,
+                breaker: None,
             }],
             morsel_rows,
         )
@@ -3080,12 +3275,14 @@ mod tests {
                     streams_from: Vec::new(),
                     source: Box::new(|| Arc::new(RangeSource::new(1))),
                     finalize: None,
+                    breaker: None,
                 },
                 PipelineSpec {
                     after: vec![PipelineId(0)],
                     streams_from: Vec::new(),
                     source: Box::new(move || live.clone()),
                     finalize: None,
+                    breaker: None,
                 },
             ],
             morsel_rows,
@@ -3298,10 +3495,10 @@ mod tests {
         assert_eq!(planned.pipeline_count(), 2);
         let (upstream, downstream) = (&planned.pipelines[0], &planned.pipelines[1]);
         assert!(upstream.head == Head::Source);
-        assert!(matches!(upstream.breaker, Breaker::Materialize { .. }));
+        assert!(matches!(upstream.breaker, BreakerKind::Materialize { .. }));
         assert!(upstream.streams_from.is_empty());
         assert!(downstream.head == Head::Breaker);
-        assert!(matches!(downstream.breaker, Breaker::Collect));
+        assert!(matches!(downstream.breaker, BreakerKind::Collect));
         assert_eq!(downstream.streams_from, [0]);
     }
 
@@ -3337,10 +3534,10 @@ mod tests {
             keyed_memos: HashMap::new(),
         };
         planner
-            .pipeline(top, Breaker::Collect)
+            .pipeline(top, BreakerKind::Collect)
             .expect("the first slot");
         let refused = planner
-            .pipeline(top, Breaker::Collect)
+            .pipeline(top, BreakerKind::Collect)
             .expect_err("the same memo again");
         assert!(
             refused.to_string().contains("more than one slot"),
@@ -3499,7 +3696,7 @@ mod tests {
 
         fn refused(planner: &mut Planner<'_>, top: NodeId) -> String {
             planner
-                .pipeline(top, Breaker::Collect)
+                .pipeline(top, BreakerKind::Collect)
                 .expect_err("the plan refuses the chain")
                 .to_string()
         }
@@ -3517,7 +3714,7 @@ mod tests {
             let read = nodes.read(source, slot);
             let mut planner = nodes.planner();
             planner
-                .pipeline(read, Breaker::Collect)
+                .pipeline(read, BreakerKind::Collect)
                 .expect("a keyed read is planned");
             assert!(planner.pipelines.last().is_some_and(|last| last.keyed));
         }
@@ -3577,14 +3774,14 @@ mod tests {
             let read = nodes.read(source, keyed_slot);
             let mut planner = nodes.planner();
             planner
-                .pipeline(head, Breaker::Collect)
+                .pipeline(head, BreakerKind::Collect)
                 .expect("a head slot");
             let reason = refused(&mut planner, read);
             assert!(reason.contains("also read at keys"), "{reason}");
 
             let mut planner = nodes.planner();
             planner
-                .pipeline(read, Breaker::Collect)
+                .pipeline(read, BreakerKind::Collect)
                 .expect("a keyed read");
             let reason = refused(&mut planner, head);
             assert!(
@@ -3778,6 +3975,7 @@ mod tests {
             finalize: Some(Box::new(move || {
                 finished.lock_wait().push(format!("finish {name}"));
             })),
+            breaker: None,
         }
     }
 
@@ -3943,6 +4141,7 @@ mod tests {
                     streams_from: Vec::new(),
                     source: Box::new(|| Arc::new(RangeSource::new(1))),
                     finalize: None,
+                    breaker: None,
                 },
                 PipelineSpec {
                     after: Vec::new(),
@@ -3952,6 +4151,7 @@ mod tests {
                         live.clone()
                     }),
                     finalize: None,
+                    breaker: None,
                 },
             ],
             4,
@@ -4176,6 +4376,7 @@ mod tests {
                 streams_from: Vec::new(),
                 source: Box::new(move || source.clone()),
                 finalize: None,
+                breaker: None,
             }],
             4,
         ));
@@ -4294,12 +4495,14 @@ mod tests {
                     streams_from: Vec::new(),
                     source: Box::new(|| Arc::new(RangeSource::new(2))),
                     finalize: None,
+                    breaker: None,
                 },
                 PipelineSpec {
                     after: vec![PipelineId(0)],
                     streams_from: Vec::new(),
                     source: Box::new(move || live.clone()),
                     finalize: None,
+                    breaker: None,
                 },
             ],
             4,
@@ -4503,6 +4706,7 @@ mod tests {
                             "a morsel was still running"
                         );
                     })),
+                    breaker: None,
                 }],
                 morsel_rows,
             );
@@ -4567,12 +4771,14 @@ mod tests {
                     streams_from: Vec::new(),
                     source: Box::new(|| Arc::new(RangeSource::new(40))),
                     finalize: Some(Box::new(|| panic!("the breaker's combine failed"))),
+                    breaker: None,
                 },
                 PipelineSpec {
                     after: vec![PipelineId(0)],
                     streams_from: Vec::new(),
                     source: Box::new(|| Arc::new(RangeSource::new(40))),
                     finalize: None,
+                    breaker: None,
                 },
             ],
             4,

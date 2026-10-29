@@ -13,7 +13,7 @@ use cambra::{
     interpreter::{
         BaseType, ColumnValue, Consumer, Extent, FunctionGuard, Predicate, Tile, TileGuard, Tiling,
         Value,
-        parallel::{Breaker, Config, PooledRun, plan, run_main},
+        parallel::{BreakerKind, Config, PooledRun, plan, run_main},
     },
 };
 
@@ -166,7 +166,7 @@ fn the_plan_reads_the_fold_off_the_extract() {
     let compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
     let plan = plan(&compiled.operator_graph).expect("a fold is a breaker the pool runs");
     assert_eq!(plan.pipeline_count(), 1);
-    let Breaker::Fold { kind, accumulator } = plan.main_breaker() else {
+    let BreakerKind::Fold { kind, accumulator } = plan.main_breaker() else {
         panic!("a fold, not the sink");
     };
     assert_eq!(*kind, AggregateKind::Sum);
@@ -402,7 +402,7 @@ fn over_a_source(key_extent: Extent) -> (GlobalContext, cambra::ccl::context::Co
 fn a_chain_over_a_source_is_a_morsel_pipeline() {
     let (_ctx, compiled) = over_a_source(Extent::Base(BaseType::Int));
     let plan = plan(&compiled.operator_graph).expect("a source is streamed");
-    assert!(matches!(plan.main_breaker(), Breaker::Collect));
+    assert!(matches!(plan.main_breaker(), BreakerKind::Collect));
 }
 
 /// A source whose keys are not totally ordered cannot be cut into morsels, so the pool refuses the
@@ -542,7 +542,7 @@ fn a_chain_through_variant_wrap_and_project_equals_the_serial_answer() {
         let consumer: Box<dyn Consumer> = Box::new(|| {});
         let compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
         let kinds = plan(&compiled.operator_graph).expect("variant operators are streamed");
-        assert!(matches!(kinds.main_breaker(), Breaker::Fold { .. }));
+        assert!(matches!(kinds.main_breaker(), BreakerKind::Fold { .. }));
         let pooled = four_workers(source.clone());
         assert!(pooled.is_terminal(), "the fold is complete");
         assert_eq!(pooled, whole_pull(source));

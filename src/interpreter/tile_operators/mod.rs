@@ -35,7 +35,7 @@ use crate::{
     interpreter::{
         ColumnValue, Consumer, Extent, Gate, GatedConsumer, Projection, Scheduler, Value,
         forwarding_consumer, forwarding_consumer_into_field, forwarding_consumer_keeping_keys,
-        keys_only, selecting_field, validate_tile, widening,
+        keys_only, parallel::Pushes, selecting_field, validate_tile, widening,
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -1207,6 +1207,44 @@ macro_rules! impl_producer_base {
 // leak it to the crate root.
 pub(crate) use impl_producer_base;
 
+/// A pipeline breaker's side of the dispatcher's interface: the breaker is the sink of its
+/// pipeline, and the dispatcher drives it once per morsel and once per round, on its own thread.
+///
+/// Every call runs on the dispatcher's thread, so a breaker's own locks are never contended. The
+/// methods take `&self` because the handle ([`BreakerHandle`]) is shared by a pipeline's spec and
+/// the producer that owns the breaker.
+/// See `src/interpreter/design-parallel.md`, "Pipeline breakers: sink, finalize and get".
+pub trait Breaker: Send + Sync {
+    /// Switch to sink mode, once, before the first [`pull_sink`](Self::pull_sink).
+    fn begin_sinking(&self);
+
+    /// Pull the breaker's own input at `guard`, merge the answer into local state, and release the
+    /// input at `guard`. Called by the dispatcher for each morsel of the breaker's pipeline.
+    fn pull_sink(&self, guard: TileGuard);
+
+    /// The first `rows` keys of `region` that local state holds, in key order: how a parent
+    /// pipeline's morsel is cut from the keys pushed to it.
+    fn first_keys(&self, region: &Predicate, rows: u64) -> Vec<Value>;
+
+    /// End of a round: finalize what the round merged, and push the keys that are final to the
+    /// parent pipelines. `round.terminal` is set on the last round of the pipeline.
+    fn finalize(&self, round: Round, parents: &mut Pushes<'_>);
+
+    /// How many keys the breaker's local state holds, which a release of the output reclaims.
+    fn held_keys(&self) -> usize;
+}
+
+/// A round of a breaker's pipeline: one drain of the regions pending for it.
+pub struct Round {
+    /// Whether this is the pipeline's last round: its source is exhausted and every pipeline it
+    /// streams from has finished.
+    pub terminal: bool,
+}
+
+/// A shared handle to a breaker. The producer that owns the breaker holds it, a pipeline's spec
+/// holds a clone, and the scheduler's registry holds a `Weak` of it.
+pub type BreakerHandle = Arc<dyn Breaker>;
+
 /// Live runtime counterpart of a [`TileOperator`].
 ///
 /// Created by [`TileOperator::subscribe`], a producer services `get` queries
@@ -2087,6 +2125,7 @@ pub(crate) mod test_helpers {
     /// An input that states a region complete, answers a pull of another region, and then
     /// retracts the first when it is pulled there again has broken the contract, though the
     /// pull before the retraction was at the other region.
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "withdrew completion")]
     fn a_producer_that_retracts_a_region_after_a_pull_of_another_is_reported() {
