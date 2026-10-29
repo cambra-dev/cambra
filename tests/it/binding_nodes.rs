@@ -3,13 +3,12 @@
 //! `bound_expr`, `init` or `iter` sits outside the binder's scope; the binder scopes over `body`.
 
 use std::collections::HashMap;
-use std::rc::Rc;
 use std::sync::Arc;
 
 use cambra::ccl::content_hash::content_hash;
 use cambra::ccl::{
-    BindingTransparency, Expr, Home, Lit, Refinement, SharedImport, Type, TypedBinding, TypedExpr,
-    TypedExprNode, uniquify,
+    BindingTransparency, Expr, Home, Lit, SharedImport, Type, TypedBinding, TypedExpr,
+    TypedExprNode, eq_term_modulo_ty_slots, uniquify,
 };
 use cambra::chl_parser::ModulePath;
 
@@ -48,12 +47,6 @@ fn single_binder_nodes(value: i64, annotation: Option<Type>) -> [TypedExpr; 3] {
     ]
 }
 
-fn refinement(predicate: TypedExpr) -> Refinement {
-    Refinement {
-        predicate: Rc::new(predicate),
-    }
-}
-
 /// Term equality compares each node's `bound_expr`, `init` or `iter`, outside the binder's scope.
 #[test]
 fn term_equality_compares_the_expression_outside_the_binder() {
@@ -61,8 +54,8 @@ fn term_equality_compares_the_expression_outside_the_binder() {
         .into_iter()
         .zip(single_binder_nodes(2, None))
     {
-        assert_eq!(refinement(one.clone()), refinement(one.clone()));
-        assert_ne!(refinement(one), refinement(two));
+        assert!(eq_term_modulo_ty_slots(&one, &one.clone()));
+        assert!(!eq_term_modulo_ty_slots(&one, &two));
     }
 }
 

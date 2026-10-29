@@ -1404,27 +1404,16 @@ t
     )
 }
 
-/// TODO: Allow a `^+` in a comprehension element. No mutable variable is
-/// involved — the element's refinement alone trips lambda elimination.
-///
-/// The generator lambda's codomain quotes its own body, which holds the `let`
-/// binding the source lookup. Elimination rewrites that body and rebuilds the
-/// quoting type only at a `Let` node, so the lambda's codomain still quotes the
-/// uneliminated form while the reconstruction quotes the eliminated one, and the
-/// pass's type-preservation assert compares the two structurally. The assert is
-/// `debug_assertions`-gated, so the program compiles under a profile that drops
-/// it.
-#[cfg(debug_assertions)]
+/// A `^+` in a comprehension element: the element's refinement quotes the generator's own
+/// source lookup, which lambda elimination rewrites with the rest of the body.
 #[test]
-fn refined_add_in_a_comprehension_element_not_supported() {
-    check_compile_error(
+fn refined_add_in_a_comprehension_element() {
+    check_tile(
         indoc! {r#"
 ys = [1 ^+ i for i in [1,2]]
 ys
         "#},
-        "((__iter_record: 0..2) ⤇ {Int | __elem == 1 ^+ (let __anf : (0..2 ⤇ Int) = [1, 2]
-in __iter_record ▷ __anf)}) vs ((__iter_record: 0..2) ⤇ \
-         {Int | __elem == 1 ^+ __iter_record ▷ ((id, [1, 2] ▷ const) ▷ zip ≫ apply)})",
+        make_int_list(&[2, 3]),
     )
 }
 
@@ -1706,36 +1695,30 @@ f(1) ^+ 1
     )
 }
 
+/// A refined `^+` on a binding whose refinement names a mutable variable's read.
 #[test]
 fn refined_op_on_opaque() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
 x := 4
 y = x ^+ 1
 y ^+ 1
         "#},
-        "expected {Int | __elem == __anf ^+ 1 ^+ 1}, found {Int | __elem == (__anf, 1) ▷ add_refined ^+ 1}",
+        Value::Int(6),
     )
 }
 
-/// The refined `y ^+ 1` in `zs` keeps its refinement through lambda
-/// elimination, which rewrites the refinement's free variable and so changes
-/// the node's type. With `debug_assertions` on, lambda elimination's own
-/// type-preservation assertion reports this. Without them, the
-/// post-lambda-elim check does.
+/// The refined `y ^+ 1` in `zs` keeps its refinement through lambda elimination, which
+/// rewrites the refinement's free variable.
 #[test]
-fn refined_op_in_nested_comprehension_not_supported() {
-    check_compile_error(
+fn refined_op_in_nested_comprehension() {
+    check_tile(
         indoc! {r#"
 ys = [i for i in [1,2]]
 zs = [y ^+ 1 for y in ys]
 zs
         "#},
-        if cfg!(debug_assertions) {
-            "lambda elimination changed a node's type"
-        } else {
-            "post-lambda-elim produced an invalid tree"
-        },
+        make_int_list(&[2, 3]),
     )
 }
 

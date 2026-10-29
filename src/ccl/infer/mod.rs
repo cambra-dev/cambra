@@ -161,7 +161,7 @@ fn blame_node_for_place(
             Type::Fun {
                 domain, codomain, ..
             } => mentions(domain, uid) || mentions(codomain, uid),
-            Type::History { value, domain, .. } => mentions(value, uid) || mentions(domain, uid),
+            Type::History { function, .. } => mentions(function, uid),
             Type::Tuple(elems) | Type::Nominal(_, elems) => elems.iter().any(|t| mentions(t, uid)),
             Type::Split { input, output } => mentions(input, uid) || mentions(output, uid),
             Type::DepTuple(cs) => cs.iter().any(|(_, t)| mentions(t, uid)),
@@ -456,6 +456,7 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
             reads: Vec::new(),
             predicate: refinement.predicate,
             position,
+            fed_elsewhere: false,
         },
         // The same violation `check_scope_valid` reports post-inference, caught where it is
         // made: a materialized type carrying a witness reference no binder covers. A
@@ -727,6 +728,7 @@ pub(crate) fn run_with_params(
         Rc::clone(instances),
     );
     sub_ctx.name_varying_binders(&mut errors);
+    sub_ctx.name_other_feed_places(&mut errors);
     if !errors.is_empty() {
         return Err(errors);
     }
