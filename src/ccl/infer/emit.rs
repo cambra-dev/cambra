@@ -1688,7 +1688,7 @@ fn record_value_read<C: Typing>(e: &Expr, ty: &Type, ctx: &mut C) {
     if ty.mut_value_type().is_some()
         && let TypedExprNode::Var(name) = &denoted_expr(e).node
     {
-        ctx.record_read(name);
+        ctx.record_read(name, e.node_id());
     }
 }
 

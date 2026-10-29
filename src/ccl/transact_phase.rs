@@ -76,13 +76,14 @@ use crate::ccl::Label;
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::{
-    Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS, F_WRITES, FieldKey, HistoryKind,
-    Lit, Name, ProjKey, Type, TypedBinding, TypedExprNode, WriterSite,
+    BaseType, BinOpKind, Builtin, Expr, F_DECISION, F_TIME, F_WRITE, F_WRITE_TARGETS, F_WRITES,
+    FieldKey, HistoryKind, Lit, LogicKind, Name, ProjKey, Type, TypedBinding, TypedExprNode,
+    WriterSite,
     ccl_utils::{free_names_in_value, is_free, is_free_in_value},
     feed_nest::LoopFeed,
     mut_elim::{
         FeedSite, WriterParam, WriterWalk, binding, close_recurrence_group, fold_induction_loop,
-        hoist_feeds, mut_var_value_tys, tvar,
+        hoist_feeds, is_writing_case, mut_var_value_tys, tvar,
     },
     provenance,
     provenance::{Located, NodeId},
@@ -656,19 +657,29 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
     // `Case` inside a `with begin():` block, and the letrec phase merges it at the top
     // level; the binding is pushed into the branches only where neither does, the
     // same normalization the letrec phase applies through `flatten_spine`.
+    let expr = flatten_begin_bodies(expr);
     let expr = crate::ccl::mut_elim::push_bindings_into_writing_cases(expr);
     // A statement whose effect is a `Let` hides that binding from the rest of
     // the spine, which is where this phase places the stores' `Transact`s that
     // read it. Lift it onto the spine first.
     let expr = crate::ccl::mut_elim::lift_bindings_out_of_effect_position(expr);
+    if let Some(write) = write_off_a_spine(&expr) {
+        return Err(Located::new(
+            "this write or feed, reached through a call in a `with begin():` block, stands \
+             where the block cannot order it among its own, such as a later `elif`'s condition, \
+             a function value or a comprehension; that is not supported yet"
+                .to_string(),
+            write,
+        ));
+    }
     let mut harvest = Stripped::default();
     let stripped = strip(expr, txn_mut_vars, None, &mut harvest);
     // Post-strip invariants (release asserts, like the letrec-phase
     // post-conditions): every `Begin` was consumed (stripped into a site or
     // unwrapped), and no transactional write survives outside a block — a
-    // survivor is a mutable variable write outside a block that the lowering write gate
-    // (`check_mut_write_context`) should have rejected, and must never
-    // silently become a shadowing `let` that hides committed values.
+    // survivor is a write requiring a `Transaction` no block supplies, which inference
+    // refuses (`InferError::TransactionOutsideBlock`), and must never silently become a
+    // shadowing `let` that hides committed values.
     assert!(
         !contains_begin(&stripped),
         "transact_phase: a `with begin():` block (`Begin`) survived stripping"
@@ -676,7 +687,7 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
     assert!(
         !writes_any(&stripped, txn_mut_vars),
         "transact_phase: a `MutWrite` to a transactional mutable variable survived stripping — an \
-         out-of-block mutable variable write the lowering write gate should have rejected"
+         out-of-block write inference should have refused"
     );
     let Stripped {
         sites,
@@ -1097,6 +1108,387 @@ fn rename_var_uses(e: &mut Expr, from: &Name, to: &Name) {
 }
 
 /// Whether the subtree still contains a `with begin():` block marker.
+/// [`flatten_block`] applied to the body of every `with begin():` block in `expr`.
+fn flatten_begin_bodies(mut expr: Expr) -> Expr {
+    expr.map_children(flatten_begin_bodies);
+    let begin_id = expr.node_id();
+    if let TypedExprNode::Begin { body } = &mut expr.node {
+        let _g = provenance::enter(begin_id, "transact.flatten", provenance::Nature::Machinery);
+        let taken = std::mem::take(&mut **body);
+        **body = flatten_block(taken);
+    }
+    expr
+}
+
+/// `block`, a `with begin():` block's body, with its statements on one spine.
+///
+/// A call the block makes reaches here inlined: where the call stood — a statement's effect
+/// (`take(q)`), a binding's definition (`left = take(q)`), or an operand (`take(1) +
+/// take(2)`) — stands the callee's body, a chain of bindings and statements ending in its
+/// value, which [`walk_block`] and the footprint scans do not walk into. Each such chain is
+/// moved onto the block's spine in evaluation order, ahead of what it stood in, which keeps
+/// the chain's value ([`hoist_onto_spine`]); a statement left holding only a value does
+/// nothing and is dropped. Binders are unique, so a binding moved out of its chain captures
+/// nothing. A guard's branches are spines of their own and are flattened alike.
+fn flatten_block(block: Expr) -> Expr {
+    let mut spine = Vec::new();
+    let tail = hoist_onto_spine(block, &mut spine);
+    spine.into_iter().rev().fold(tail, |rest, step| match step {
+        SpineStep::Let(Some(id), binding, bound) => {
+            Expr::let_in_preserving(id, *binding, bound, rest)
+        }
+        SpineStep::Let(None, binding, bound) => Expr::let_in(*binding, bound, rest),
+        SpineStep::Statement(id, effect) => Expr::expr_stmt_preserving(id, effect, rest),
+    })
+}
+
+/// A binding or a statement [`hoist_onto_spine`] moves onto a block's spine, at the node it
+/// was. A binding it mints has none.
+enum SpineStep {
+    Let(Option<NodeId>, Box<TypedBinding>, Expr),
+    Statement(NodeId, Expr),
+}
+
+/// `e` with each binding and statement it evaluates first appended to `spine`, in order,
+/// and what remains: its value.
+///
+/// Only operands every evaluation of `e` evaluates are walked: an application's, an
+/// operator's, a constructor's, a write's and a feed's, and a guard's first condition. `and`
+/// and `or` with a chain in their right operand become the guard they are, `b if a else
+/// False` and `True if a else b`. A function, a guard's branch, a comprehension and a loop
+/// each evaluate their parts per call, path or element, and keep them. Only an operand holding a chain that writes or
+/// feeds is walked ([`holds_a_chain`]), and each operand ahead of such a one has its value
+/// bound as it is reached, so it reads what the variables hold there and not what the later
+/// chain writes.
+fn hoist_onto_spine(e: Expr, spine: &mut Vec<SpineStep>) -> Expr {
+    let mut e = projected_element(e);
+    if let TypedExprNode::Apply { function, .. } = &mut e.node {
+        let taken = std::mem::take(&mut **function);
+        **function = projected_element(taken);
+    }
+    let id = e.node_id();
+    match e.node {
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => {
+            let bound = hoist_onto_spine(*bound_expr, spine);
+            spine.push(SpineStep::Let(Some(id), Box::new(binding), bound));
+            hoist_onto_spine(*body, spine)
+        }
+        TypedExprNode::ExprStmt { expr: effect, body } => {
+            let effect = hoist_onto_spine(*effect, spine);
+            // What is left of a call once its chain is on the spine is its value, evaluated
+            // for nothing.
+            if acts(&effect) {
+                spine.push(SpineStep::Statement(id, effect));
+            }
+            hoist_onto_spine(*body, spine)
+        }
+        // `a and b` evaluates `b` only where `a` holds, and `a or b` only where it fails: a
+        // guard, whose branches are spines of their own.
+        TypedExprNode::BinOp {
+            left,
+            op: BinOpKind::BoolLogic(kind @ (LogicKind::And | LogicKind::Or)),
+            right,
+        } if holds_a_chain(&right) => {
+            let literal = |b: bool| {
+                let mut lit = Expr::lit(Lit::Bool(b));
+                lit.ty = Type::Base(BaseType::Bool);
+                lit
+            };
+            let branch = |guard: Expr, body: Expr| crate::ccl::Branch {
+                pattern: None,
+                guard,
+                body,
+            };
+            let branches = match kind {
+                LogicKind::And => {
+                    vec![branch(*left, *right), branch(literal(true), literal(false))]
+                }
+                _ => vec![branch(*left, literal(true)), branch(literal(true), *right)],
+            };
+            let case = Expr::preserve(
+                id,
+                TypedExprNode::Case {
+                    scrutinee: None,
+                    branches,
+                },
+            )
+            .with_ty(e.ty);
+            hoist_onto_spine(case, spine)
+        }
+        TypedExprNode::Case {
+            scrutinee: None,
+            branches,
+        } => {
+            // The first guard is evaluated whenever the guard is: on the spine.
+            let mut branches = branches;
+            if let Some(first) = branches.first_mut() {
+                let guard = std::mem::take(&mut first.guard);
+                first.guard = hoist_onto_spine(guard, spine);
+            }
+            let branches = branches
+                .into_iter()
+                .map(|mut branch| {
+                    let taken = std::mem::take(&mut branch.body);
+                    branch.body = flatten_block(taken);
+                    branch
+                })
+                .collect();
+            Expr {
+                node: TypedExprNode::Case {
+                    scrutinee: None,
+                    branches,
+                },
+                ..e
+            }
+        }
+        // A function applied where it stands, `a ▷ (λ x → body)`, is `let x = a in body`:
+        // what inlining a call through a parameter leaves.
+        TypedExprNode::Apply { argument, function }
+            if matches!(function.node, TypedExprNode::Lambda { .. }) =>
+        {
+            let lambda_id = function.node_id();
+            let TypedExprNode::Lambda { param, body } = function.node else {
+                unreachable!("guarded above")
+            };
+            let argument = hoist_onto_spine(*argument, spine);
+            spine.push(SpineStep::Let(Some(lambda_id), Box::new(param), argument));
+            hoist_onto_spine(*body, spine)
+        }
+        TypedExprNode::BinOp {
+            op: BinOpKind::BoolLogic(LogicKind::And | LogicKind::Or),
+            ..
+        } => e,
+        node @ (TypedExprNode::Apply { .. }
+        | TypedExprNode::Cast { .. }
+        | TypedExprNode::BinOp { .. }
+        | TypedExprNode::UnaryOp { .. }
+        | TypedExprNode::Tuple(_)
+        | TypedExprNode::Record(_)
+        | TypedExprNode::List(_)
+        | TypedExprNode::VariantCtor { .. }
+        | TypedExprNode::NominalCtor { .. }
+        | TypedExprNode::MutWrite { .. }
+        | TypedExprNode::Feed { .. }) => {
+            let mut e = Expr { node, ..e };
+            // `walk_children` and `map_children` visit the operands in one order.
+            let mut chains = Vec::new();
+            e.walk_children(|child| chains.push(holds_a_chain(child)));
+            if chains.contains(&true) {
+                let mut i = 0;
+                e.map_children(|child| {
+                    let later = chains[i + 1..].contains(&true);
+                    let holds = chains[i];
+                    i += 1;
+                    let value = if holds {
+                        hoist_onto_spine(child, spine)
+                    } else {
+                        child
+                    };
+                    if later {
+                        bind_on_spine(value, spine)
+                    } else {
+                        value
+                    }
+                });
+            }
+            e
+        }
+        node => Expr { node, ..e },
+    }
+}
+
+/// Whether the statement `effect` does anything: it is a guard, or it writes, feeds,
+/// defines or holds a block or a loop.
+fn acts(effect: &Expr) -> bool {
+    fn marks(e: &Expr) -> bool {
+        matches!(
+            e.node,
+            TypedExprNode::MutWrite { .. }
+                | TypedExprNode::Feed { .. }
+                | TypedExprNode::Define { .. }
+                | TypedExprNode::Begin { .. }
+                | TypedExprNode::For { .. }
+        ) || e.any_child(marks)
+    }
+    matches!(effect.node, TypedExprNode::Case { .. }) || marks(effect)
+}
+
+/// Whether the function `f` of an application is a lambda, written where it stands or
+/// projected out of a tuple of values ([`projected_element`]).
+fn applies_a_lambda(f: &Expr) -> bool {
+    match &f.node {
+        TypedExprNode::Lambda { .. } => true,
+        TypedExprNode::Apply { argument, function } => match (&argument.node, &function.node) {
+            (TypedExprNode::Tuple(elements), TypedExprNode::Proj(ProjKey::Index(i))) => {
+                elements.iter().all(|element| {
+                    matches!(
+                        element.node,
+                        TypedExprNode::Var(_)
+                            | TypedExprNode::Lit(_)
+                            | TypedExprNode::Lambda { .. }
+                    )
+                }) && elements.get(*i).is_some_and(applies_a_lambda)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// The first write or feed in a `with begin():` block of `expr` that is not on the block's
+/// spine as the phase reads it: a statement's write or feed, or a statement of a branch of a
+/// guard or a `match` that stands as a statement, is bound, or ends the block, the three
+/// places [`WriterWalk`] walks one whose branches write ([`is_writing_case`]).
+/// [`flatten_block`] moves every chain a call leaves where the block evaluates it once; what
+/// it leaves is a write the block cannot order.
+fn write_off_a_spine(expr: &Expr) -> Option<NodeId> {
+    fn first_write(e: &Expr) -> Option<NodeId> {
+        if matches!(
+            e.node,
+            TypedExprNode::MutWrite { .. }
+                | TypedExprNode::Feed { .. }
+                | TypedExprNode::Define { .. }
+        ) {
+            return Some(e.node_id());
+        }
+        let mut found = None;
+        e.any_child(|child| {
+            found = first_write(child);
+            found.is_some()
+        });
+        found
+    }
+    // A guard, or a `match`'s dispatch, which the phase reads as guards.
+    fn branches(e: &Expr) -> Option<NodeId> {
+        let TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } = &e.node
+        else {
+            unreachable!("called on a `Case`")
+        };
+        scrutinee.as_deref().and_then(first_write).or_else(|| {
+            branches
+                .iter()
+                .find_map(|b| first_write(&b.guard).or_else(|| spine(&b.body)))
+        })
+    }
+    fn spine(e: &Expr) -> Option<NodeId> {
+        match &e.node {
+            TypedExprNode::Let {
+                bound_expr, body, ..
+            } if is_writing_case(bound_expr) => branches(bound_expr).or_else(|| spine(body)),
+            TypedExprNode::Let {
+                bound_expr, body, ..
+            } => first_write(bound_expr).or_else(|| spine(body)),
+            TypedExprNode::ExprStmt { expr, body } => {
+                let here = match &expr.node {
+                    TypedExprNode::MutWrite { .. } | TypedExprNode::Feed { .. } => {
+                        let mut found = None;
+                        expr.any_child(|child| {
+                            found = first_write(child);
+                            found.is_some()
+                        });
+                        found
+                    }
+                    TypedExprNode::Case { .. } => branches(expr),
+                    // A nested block is refused as a nested transaction before here.
+                    TypedExprNode::Begin { .. } => None,
+                    _ => first_write(expr),
+                };
+                here.or_else(|| spine(body))
+            }
+            _ if is_writing_case(e) => branches(e),
+            _ => first_write(e),
+        }
+    }
+    match &expr.node {
+        TypedExprNode::Begin { body } => spine(body),
+        _ => {
+            let mut found = None;
+            expr.any_child(|child| {
+                found = write_off_a_spine(child);
+                found.is_some()
+            });
+            found
+        }
+    }
+}
+
+/// `e` as the element it projects, when it projects one out of a tuple of values written
+/// where it stands, `(f, x) ▷ .0`: what inlining a call of several arguments leaves for
+/// each argument it passes on, a function among them. Otherwise `e`.
+fn projected_element(e: Expr) -> Expr {
+    let TypedExprNode::Apply { argument, function } = &e.node else {
+        return e;
+    };
+    let (TypedExprNode::Tuple(elements), TypedExprNode::Proj(ProjKey::Index(i))) =
+        (&argument.node, &function.node)
+    else {
+        return e;
+    };
+    let i = *i;
+    let values = elements.iter().all(|element| {
+        matches!(
+            element.node,
+            TypedExprNode::Var(_) | TypedExprNode::Lit(_) | TypedExprNode::Lambda { .. }
+        )
+    });
+    if !values || i >= elements.len() {
+        return e;
+    }
+    let TypedExprNode::Apply { argument, .. } = e.node else {
+        unreachable!("guarded above")
+    };
+    let TypedExprNode::Tuple(mut elements) = argument.node else {
+        unreachable!("guarded above")
+    };
+    projected_element(elements.swap_remove(i))
+}
+
+/// Whether `e` holds a chain [`hoist_onto_spine`] moves that writes or feeds ([`acts`]): a
+/// binding, a statement or an application of a lambda, itself or in an operand it walks.
+fn holds_a_chain(e: &Expr) -> bool {
+    match &e.node {
+        TypedExprNode::Let { .. } | TypedExprNode::ExprStmt { .. } => acts(e),
+        TypedExprNode::Apply { function, .. } if applies_a_lambda(function) => acts(e),
+        // Its left operand is evaluated always, and its right one under a guard.
+        TypedExprNode::BinOp {
+            op: BinOpKind::BoolLogic(LogicKind::And | LogicKind::Or),
+            ..
+        } => e.any_child(holds_a_chain),
+        TypedExprNode::Apply { .. }
+        | TypedExprNode::Cast { .. }
+        | TypedExprNode::BinOp { .. }
+        | TypedExprNode::UnaryOp { .. }
+        | TypedExprNode::Tuple(_)
+        | TypedExprNode::Record(_)
+        | TypedExprNode::List(_)
+        | TypedExprNode::VariantCtor { .. }
+        | TypedExprNode::NominalCtor { .. }
+        | TypedExprNode::MutWrite { .. }
+        | TypedExprNode::Feed { .. } => e.any_child(holds_a_chain),
+        _ => false,
+    }
+}
+
+/// `value` bound on `spine` to a fresh binder, and a reference to it; a literal as it is.
+fn bind_on_spine(value: Expr, spine: &mut Vec<SpineStep>) -> Expr {
+    if matches!(value.node, TypedExprNode::Lit(_)) {
+        return value;
+    }
+    let name = Name::fresh("__operand");
+    let ty = value.ty.clone();
+    let mut binding = TypedBinding::new_unannotated(name.clone());
+    binding.ty = ty.clone();
+    spine.push(SpineStep::Let(None, Box::new(binding), value));
+    tvar(&name, ty)
+}
+
 fn contains_begin(expr: &Expr) -> bool {
     matches!(expr.node, TypedExprNode::Begin { .. }) || expr.any_child(contains_begin)
 }
@@ -1693,8 +2085,8 @@ fn collect_write_targets(expr: &Expr, out: &mut HashSet<Name>) {
 /// `MutWrite` target:
 ///
 /// - A **write** inside a later block is a `MutWrite` targeting `x`; a **read** inside one
-///   is a bare `Var(x)` in the writer body. Outside a block both are already rejected at
-///   lowering (`lower_expr`'s read gate, `check_mut_write_context`).
+///   is a bare `Var(x)` in the writer body. Outside a block both are already refused by
+///   inference, since no block supplies the `Transaction` they require.
 /// - A **pass-by-reference argument** is the one mention lowering lets through — a
 ///   `Mut`-typed argument is a bare `Var` by rule, so `lower_call_arg` bypasses the
 ///   gate — and `inline` beta-reduces it into the callee body, where it becomes one of

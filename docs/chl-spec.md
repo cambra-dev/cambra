@@ -170,8 +170,6 @@ reserved for future use.
 [Polymorphic type annotations](#polymorphic-type-annotations)). `requires` begins a `requires`
 clause and `causes` a `causes` clause, which end a `def` signature or a function type, and `only`
 and `nothing` bound one ([Writing requirements and effects](#writing-requirements-and-effects)).
-`requires Transaction` is **[Planned]**
-([8.7 Direction [Decided]: transactions as contextual parameters](#87-direction-decided-transactions-as-contextual-parameters)).
 
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
 > `rec` (recursive binding — §4.3, **[Decided]**),
@@ -701,9 +699,7 @@ otherwise.
 > **Direction [Decided].** The `requires Transaction` contextual
 > requirement (§8.7) adds a *second* way for a call to be effecting — a
 > function that reads or writes a transactional mutable variable in the
-> block it is called in, rather than through a `Mut(…)` parameter. It is
-> not yet implemented; the `Mut(…)`-parameter and `with begin():`
-> effecting-call forms above are.
+> block it is called in, rather than through a `Mut(…)` parameter.
 
 ### Collections are unordered
 
@@ -3799,7 +3795,7 @@ instance ([Equality and order](#equality-and-order)).
   satisfiable, and it has no other effect than the associated types it names.
 - **One clause holds every requirement.** `Transaction`
   ([8.7 Direction [Decided]: transactions as contextual parameters](#87-direction-decided-transactions-as-contextual-parameters))
-  is written in the same clause: `requires Transaction, Orderable(T, T)` (**[Planned]**).
+  is written in the same clause: `requires Transaction, Orderable(T, T)`.
 - **The body uses only what the clause states.** An operator whose operand type involves a type
   parameter is an error unless a requirement or the parameter's bound covers it. Where both do, the
   requirement decides: `x + y` under `T <: Int` and `requires a: Addable(T, T), a::Output <: T` is
@@ -4652,12 +4648,10 @@ for req in incr_reqs:
   atomically** — the whole block's writes become visible together or not
   at all. There is no partially-visible commit.
 - Writes to a `Txn`-domain mutable variable are legal **only** inside a `with
-  begin():` block; a write outside one is rejected (§8.3), as is a write
-  reached through a transactional-writer function *called* inside a block
-  (a disguised nested transaction). **[Decided]** — a function the block
-  calls may write one too: it requires `Transaction` for the write, and the
-  block supplies it (§8.7). Only a call of a function that runs a block of its
-  own is a nested transaction.
+  begin():` block, or in a function the block calls, which requires
+  `Transaction` for them and gets it from the block (§8.7); a write that no
+  block encloses is rejected (§8.3). A call inside a block of a function
+  that runs a block of its own is a disguised nested transaction.
 - **Nested transactions are rejected** — a block commits as one unit, so a
   `with` inside it has no coherent meaning.
 - **[Decided]** A block causes `Commit`, and its body supplies `Transaction` to what it calls. A
@@ -4708,9 +4702,8 @@ around `reserve` + `quote` + the feed).
 - **Trailing induction read** — after a `for` loop, a bare reference to an
   induction accumulator is its final value (or the pre-loop value if the
   source was empty). The loop has ended, so "latest" is unambiguous.
-- **A `Txn` mutable variable is read only inside a `with begin():` block.**
-  **[Decided]** — or in a function the block calls, which requires
-  `Transaction` for it
+- **A `Txn` mutable variable is read only inside a `with begin():` block,** or in a function
+  the block calls, which requires `Transaction` for it
   ([8.7 Direction [Decided]: transactions as contextual parameters](#87-direction-decided-transactions-as-contextual-parameters)).
   A bare read that no block encloses is an error, and stays one: the block is what pins a
   **snapshot-consistent** view, so that several mutable variable reads in one

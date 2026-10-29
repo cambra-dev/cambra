@@ -48,6 +48,7 @@ inventory: Mut(FullMap(SKU, Qty), Txn) := [
 ]
 
 import std::http
+import std::txn
 
 order_reqs,   order_resps   = http.serve("8080", "POST", "/order")
 restock_reqs, restock_resps = http.serve("8080", "POST", "/restock")
@@ -59,7 +60,7 @@ stats_reqs,   stats_resps   = http.serve("8080", "GET", "/stats")
 # rather than rescanning order history on every quote.
 def is_promo_spent() => Bool requires Transaction:
     promo_budget = 1000
-    now = summon(Transaction).current_time()
+    now = txn::time()
     past = orders.filter(\o -> o.time < now)
     promo_budget <= sum([o.discount for o in past])
 

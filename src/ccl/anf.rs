@@ -305,10 +305,15 @@ fn normalize_inner(e: Expr, muts: &Muts) -> Expr {
             // variable suffices: the comprehension performs no write, so every read
             // in it denotes the value the variable holds where the comprehension
             // stands.
+            // An `await_final` there names the variable without reading it, so the whole
+            // await is bound instead, and its value is what the binder holds.
+            let mut awaits = Vec::new();
             let mut reads = Vec::new();
             for generator in &mut generators {
+                name_awaits(&mut generator.iter, muts, &mut awaits);
                 name_reads(&mut generator.iter, muts, &mut reads);
                 for guard in &mut generator.guards {
+                    name_awaits(guard, muts, &mut awaits);
                     name_reads(guard, muts, &mut reads);
                 }
             }
@@ -319,8 +324,9 @@ fn normalize_inner(e: Expr, muts: &Muts) -> Expr {
             // it in sequence with the writes beside it, and here there are
             // none.
             let element = normalize(*element, &Muts::new());
+            awaits.extend(read_bindings(reads));
             let_chain(
-                read_bindings(reads),
+                awaits,
                 rebuild(TypedExprNode::Comprehension {
                     generators,
                     element: Box::new(element),
@@ -697,6 +703,29 @@ fn name_reads(e: &mut Expr, muts: &Muts, reads: &mut Vec<(Name, Name)>) {
         rename = rename.extended_rename(variable.clone(), temp);
     }
     rename.rewrite_expr(e);
+}
+
+/// Replace each `await_final` of a mutable variable in `muts` within `e` by a reference to
+/// a fresh binder, adding to `awaits` the binding of that binder to the await, for a term
+/// [`name_reads`] names the reads of. The await's operand is the variable's handle, which
+/// no read may replace, and its value is an ordinary value.
+fn name_awaits(e: &mut Expr, muts: &Muts, awaits: &mut Vec<(TypedBinding, Expr)>) {
+    if let TypedExprNode::Apply { argument, function } = &e.node
+        && matches!(
+            function.node,
+            TypedExprNode::Builtin(crate::ccl::Builtin::AwaitFinal)
+        )
+        && is_mut_var(argument, muts)
+    {
+        let temp = Name::anf_temp();
+        let await_ = std::mem::replace(e, Expr::var(temp.clone()));
+        awaits.push((TypedBinding::new_unannotated(temp), await_));
+        return;
+    }
+    e.map_children(|mut child| {
+        name_awaits(&mut child, muts, awaits);
+        child
+    });
 }
 
 /// The bindings [`name_reads`] collected, one read per variable, ahead of the term.

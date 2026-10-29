@@ -3989,7 +3989,12 @@ transaction. The bound is copied at each instantiation, so a call through a poly
 definition's parameter is refused at each use that passes a committing function. Each function
 body's result type is noted (`Typing::note_result`), and a function in it requiring or causing a
 label bound at the body's depth or deeper is refused (`InferCtx::escaping_results`,
-`InferError::EscapesItsVariable`): it would outlive the variable.
+`InferError::EscapesItsVariable`): it would outlive the variable. A `Transaction` the top level
+requires is supplied by nothing, since only a block's body supplies one, so each read or write of
+a transactional variable that no block encloses, directly or through a call, is refused at the node
+it entered the top level at (`InferError::TransactionOutsideBlock`). A block whose body causes
+nothing does nothing, and is refused as an inert statement is (`InferCtx::does_nothing`,
+`InferError::EmptyTransaction`); a statement inside such a block is not reported again.
 
 **Upper bounds are checked once emission is complete.** A variable's labels are known only then,
 so `effects::exceeded_uppers` reads each bounded variable's resolution after the barrier variables'

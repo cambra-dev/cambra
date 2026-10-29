@@ -217,24 +217,20 @@ pub(super) fn uncurry_params(
 ) -> Result<Expr, LoweringError> {
     if params.len() == 1 {
         // A `Mut(…)`-annotated single parameter is a pass-by-reference mutable variable:
-        // bind it at `Mut(V, D)` so body references carry `Mut` (reads deref,
-        // writes lower to `MutWrite`) and inference generalizes its domain per
-        // call site. That binder type *is* the declaration — a `Lambda` param is
-        // one of the two binders that may hold a mutable variable, and nothing asks an
-        // annotation about it. Non-`Mut` params stay `Hole` (inferred), as before.
-        // Multi-arg pass-by-ref lands with transactions.
-        let param_ty = match history_param_type(&params[0], ctx) {
-            Some(ty) => ty?,
-            None => Type::Hole,
-        };
-        let mut lam = Expr::lambda(params[0].name.as_str(), param_ty.clone(), body_expr);
+        // bind it at `Mut(V, D)` so body references carry `Mut` (reads deref, writes lower
+        // to `MutWrite`) and inference fills an induction domain from each call's argument;
+        // `Mut(V)` given a transactional variable is refused there. A `Feed(…)` parameter is
+        // bound at its feed type the same way. Every other parameter stays `Hole` (inferred).
+        let history_ty = history_param_type(&params[0], ctx).transpose()?;
+        let param_ty = history_ty.clone().unwrap_or(Type::Hole);
+        let mut lam = Expr::lambda(params[0].name.as_str(), param_ty, body_expr);
         if let TypedExprNode::Lambda { param, .. } = &mut lam.node {
-            // A `Mut(…)` annotation is already *in* `param.ty` above, and
-            // `emit_lambda` binds at `user_annotation.or(param.ty)`, so restating it
-            // as an annotation would be the same type twice.
-            if let Some(ann) = &params[0].annotation
-                && history_param_type(&params[0], ctx).is_none()
-            {
+            if let Some(history_ty) = history_ty {
+                // The carrier is both the binder type and its declaration, as for a
+                // curried parameter below: the declaration keeps the domain as written,
+                // which inference fills in the binder type.
+                param.declare(history_ty);
+            } else if let Some(ann) = &params[0].annotation {
                 // Any *other* annotation (`int`, `List[T]`, …) is a
                 // **checking-mode** declaration: attach it so `emit_lambda` binds
                 // the param at its declared type and an ill-typed argument is

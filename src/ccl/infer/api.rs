@@ -318,6 +318,14 @@ pub enum InferError {
     /// A statement whose value is discarded and which causes nothing, so it does nothing
     /// (`docs/chl-spec.md`, "4.9 Expression statement").
     InertStatement,
+    /// A requirement of `Transaction`, by a read or a write of a transactional mutable variable
+    /// made here or by a call, that no `with begin():` block's body encloses, so nothing
+    /// supplies it (`docs/chl-spec.md`, "8.2 Transactions: `with begin():`").
+    TransactionOutsideBlock,
+    /// A `with begin():` block whose body writes no transactional mutable variable and feeds
+    /// nothing, directly or through a call, so it does nothing (`docs/chl-spec.md`, "8.2
+    /// Transactions: `with begin():`").
+    EmptyTransaction,
     /// A public function whose type names an induction variable its module's top level binds,
     /// which no other module may read or write (`docs/chl-spec.md`, "9.10 Induction variables
     /// stay in their module").
@@ -705,6 +713,10 @@ pub enum InferError {
         /// Display label for the message (see the type docs — not the location).
         at: String,
     },
+    /// A parameter written `Mut(V)`, a mutable variable, that is passed a transactional
+    /// variable, `Mut(V, Txn)`: two types (`docs/chl-spec.md`, "6.2 Non-purity as type wrappers"). Reported by
+    /// [`check_mut_discipline`].
+    TransactionalArgToMutParam { param: String },
     /// A `MutWrite` (`:=` / `+=`) targets a binding whose resolved type is not
     /// [`Type::History`] — a write to something that was never introduced as a
     /// mutable variable. Writes require a mutable (they never mean "shadow an
@@ -861,6 +873,8 @@ impl InferError {
             | InferError::ClauseNamesNoVariable { .. }
             | InferError::EffectBeyondSignature { .. }
             | InferError::NestedTransaction
+            | InferError::TransactionOutsideBlock
+            | InferError::EmptyTransaction
             | InferError::EscapesItsVariable { .. }
             | InferError::Unsupported(_)
             | InferError::EmptyCase { .. }
@@ -871,6 +885,7 @@ impl InferError {
             | InferError::IncompatibleBounds { .. }
             | InferError::MutNotBareVariable { .. }
             | InferError::MutArgNotMutable { .. }
+            | InferError::TransactionalArgToMutParam { .. }
             | InferError::TypeParamEscapes { .. }
             | InferError::AmbiguousReceiver { .. }
             | InferError::MethodArity { .. }
@@ -1245,6 +1260,17 @@ impl std::fmt::Debug for InferError {
                 f,
                 "`{item}` names no variable in scope of the kind it takes: `Write` takes a \
                  mutable variable, `Append` a feed and `Read` an induction variable"
+            ),
+            InferError::EmptyTransaction => write!(
+                f,
+                "this `with begin():` block does nothing: it writes no transactional (`Mut(_, \
+                 Txn)`) variable and feeds nothing (`out << …`), directly or through a call"
+            ),
+            InferError::TransactionOutsideBlock => write!(
+                f,
+                "this requires `Transaction` outside a `with begin():` block, whose body is what \
+                 supplies one: it reads or writes a transactional variable, or calls a function \
+                 that does; `await_final(x)` reads `x`'s final committed value outside a block"
             ),
             InferError::EscapesItsVariable { item } => write!(
                 f,
@@ -1686,6 +1712,14 @@ impl std::fmt::Debug for InferError {
                      (Mut second-class rule 2): {ty} at {at}"
                 )
             }
+            InferError::TransactionalArgToMutParam { param } => {
+                write!(
+                    f,
+                    "`{param}` is written `Mut(…)`, a mutable variable, and is passed a \
+                     transactional one, whose type is `Mut(…, Txn)`; a parameter that takes a \
+                     transactional variable is written `Mut(…, Txn)`"
+                )
+            }
             InferError::MutArgNotMutable { at } => {
                 write!(
                     f,
@@ -1756,10 +1790,36 @@ pub fn infer(
     }
     let (ty, inert) = ty?;
     ctx.inert = inert;
+    // Read while the annotations that state each parameter's domain are still there.
+    let mut errors = Vec::new();
+    transactional_args_to_mut_params(expr, &mut errors);
+    if !errors.is_empty() {
+        return Err(errors);
+    }
     // Only on success: an error path's tree is reported against, and the
     // annotation is part of what an `AnnotationMismatch` renders.
     clear_annotations(expr);
     Ok(ty)
+}
+
+/// An error at each function whose parameter is written `Mut(V)` and passed a transactional
+/// variable. The annotation leaves the domain to inference, which a transactional argument
+/// fills with `Txn`, and `Mut(V)` is not `Mut(V, Txn)` (`docs/chl-spec.md`, "6.2 Non-purity as type wrappers").
+fn transactional_args_to_mut_params(expr: &Expr, errors: &mut Vec<LocatedInferError>) {
+    if let TypedExprNode::Lambda { param, .. } = &expr.node
+        && let Some((written, _, HistoryKind::Overwrite)) =
+            param.user_annotation.as_ref().and_then(Type::history_parts)
+        && !matches!(written, Type::Txn)
+        && matches!(param.ty.history_parts(), Some((Type::Txn, _, _)))
+    {
+        errors.push(LocatedInferError::new(
+            InferError::TransactionalArgToMutParam {
+                param: param.name.base().to_string(),
+            },
+            expr.node_id(),
+        ));
+    }
+    expr.walk_children(|child| transactional_args_to_mut_params(child, errors));
 }
 
 /// Check `expr`, the check tree of a module checked on its own, with the

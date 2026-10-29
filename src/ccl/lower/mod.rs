@@ -442,27 +442,20 @@ pub struct LoweringContext {
     /// a reference inserted by an outer substitution.
     next_synthetic_id: usize,
 
-    /// Names declared **transactional** via a `Mut(V, Txn)` annotation. A write
-    /// to such a variable is only legal inside
-    /// a `with begin():` block, and so is a *read*: a transactional mutable variable may
-    /// be read only inside a `with begin():` block, which pins a
-    /// snapshot-consistent view (a bare read outside one is rejected — the
-    /// scope-aware read gate in [`lower_expr`], which skips a name a local binder
-    /// shadows via `shadow_depth`).
+    /// Names declared **transactional** via a `Mut(V, Txn)` annotation. Reading or writing
+    /// one requires `Transaction`, which only a `with begin():` block's body supplies;
+    /// inference refuses an access, direct or through a call, that no block encloses.
     ///
-    /// Base-name keyed, and used *only* at lowering time: it decides the `with
-    /// begin():` variable-write shape (a `MutWrite` marker) and the out-of-block
-    /// read diagnostic. Downstream mutable variable *identity* — which mutable variables
+    /// Base-name keyed, and used *only* at lowering time: it decides that a `:=` to one
+    /// is a write (a `MutWrite` marker), in a block or in a function body that captures it,
+    /// and which names `await_final` takes. Downstream mutable variable *identity* — which mutable variables
     /// `transact_phase` folds — is instead the `Mut(_, Txn)` type on the
     /// α-unique binding (see [`crate::ccl::transact_phase::collect_txn_mut_vars`]),
     /// so this set is no longer handed to the phase.
     pub(super) transactional_vars: HashSet<String>,
 
-    /// Whether lowering is currently inside a `with begin():` transaction block.
-    /// Inside one, a bare read of a transactional mutable variable is a snapshot read (fine)
-    /// and an assignment to one is a `MutWrite`; outside one, a bare read is a
-    /// lowering error (reads must happen inside a `with begin():` block). Nested
-    /// transactions are rejected by checking this flag before entering a block.
+    /// Whether lowering is currently inside a `with begin():` transaction block, where
+    /// `await_final` and a nested block are refused.
     pub(super) in_tx_body: bool,
 
     /// Type aliases declared in the blocks being lowered, by the capitalized name
@@ -1368,25 +1361,6 @@ fn lower_expr_inner(
                 return Err(LoweringError::unsupported(
                     expr.span,
                     "`_` binds nothing, so it reads no value: bind the value to a name to read it",
-                ));
-            }
-            // A transactional mutable variable may be read only inside a `with begin():`
-            // block, which pins a snapshot-consistent view (all txn reads in one
-            // block observe one commit snapshot). Inside a transaction
-            // (`in_tx_body`) a bare read is that snapshot and is fine; outside
-            // one it is rejected with a hint to wrap the read in a block.
-            //
-            // `is_shadowed` guards the base-name registry against a false match:
-            // a loop/comprehension/lambda binder spelled like a mutable variable (`for
-            // x in xs: … x …`) is a genuine local, not the mutable variable, so
-            // it is not gated (its α-unique binder wins).
-            if ctx.is_transactional_mut_var(name) && !ctx.in_tx_body && !ctx.is_shadowed(name) {
-                return Err(LoweringError::unsupported(
-                    expr.span,
-                    format!(
-                        "read transactional variable `{name}` inside a `with begin():` block (or \
-                         `await_final({name})` for its final committed value)"
-                    ),
                 ));
             }
             // The reference most likely means the refused binder spelled like it.
