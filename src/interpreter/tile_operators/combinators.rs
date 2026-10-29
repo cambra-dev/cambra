@@ -76,22 +76,21 @@ impl TileOperator for Converse {
         // Beneath standing levels the input's outermost keys are the result's; inverting the
         // outermost collection re-keys.
         let keeps_keys = self.level != CurryLevel::OUTERMOST;
-        Box::new(ConverseProducer {
-            base: ProducerBase::new(
+        Box::new(ConverseProducer::new(
+            ProducerBase::new(
                 ConverseProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 scheduler,
             ),
-            input: self.input.subscribe(
+            self.input.subscribe(
                 self.tiling().universal_guard(),
                 consumer_keeping_keys_if(keeps_keys, consumer),
                 scheduler,
             ),
-            held: Vec::new(),
-            level: self.level,
-            empty_level: self.tiling().values_at(self.level).empty_at_no_rows(),
-        })
+            self.level,
+            self.tiling().values_at(self.level).empty_at_no_rows(),
+        ))
     }
 
     fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
@@ -100,31 +99,152 @@ impl TileOperator for Converse {
 }
 
 /// Producer for [`Converse`]: inverts a collection into a collection of collections.
+///
+/// The groups released are `base.obsolete_guard`, a region of output paths named by value. A
+/// release names that region exactly and is forwarded upstream in two parts: the held input rows
+/// it covers at once (`release_impl`), and each later row of a released group on the read that
+/// first holds it (`release_late_rows`). An input guard names rows by key, so it cannot name a
+/// group before its rows are read. In consuming mode no held row falls in a released group once a
+/// consume returns, which [`BreakingProducer::finalize`] checks (`src/interpreter/design-operators.md`,
+/// "A release of a converse group").
 struct ConverseProducer {
     base: ProducerBase,
     /// The upstream producer whose output is inverted.
     input: Box<dyn TileProducer>,
-    /// Each input row last read, as the path `[value, key]` it stands at in the output. A
-    /// release names output paths, and an input row is released once the path it stands
-    /// at is, which takes its value to read. Kept at the outermost level only.
-    held: Vec<(Value, Value)>,
+    /// Each input row last read, as the output path it stands at and its own input path. A
+    /// row with input path `[𝑠…, key]`, the standing keys `𝑠…` then its key, stands at
+    /// `[𝑠…, value, key]`. A release names output paths, and an input row is released once
+    /// the path it stands at is, which takes its value to read.
+    held: Vec<HeldRow>,
     /// The level inverted — see [`Converse::new_at`].
     level: CurryLevel,
     /// The inverted level to answer with where no enclosing row has been reached.
     empty_level: Tile,
+    /// The input rows [`Breaker::consume_impl`] merged and the consumer has not
+    /// released.
+    cached: Tile,
+    /// Whether `consume_impl` has run: a consuming converse answers from `cached` and never
+    /// pulls its input.
+    consuming: bool,
 }
 
+/// An input row as [`ConverseProducer::held`] records it: the output path it stands at, then
+/// its input path.
+type HeldRow = (Vec<Value>, Vec<Value>);
+
 impl ConverseProducer {
-    /// The keys of the held input rows `guard` covers. An input row stands at exactly one
-    /// output path, under its own value, so it is released where that path is: under a
+    fn new(
+        base: ProducerBase,
+        input: Box<dyn TileProducer>,
+        level: CurryLevel,
+        empty_level: Tile,
+    ) -> Self {
+        let cached = input.tiling().empty_tile();
+        Self {
+            base,
+            input,
+            held: Vec::new(),
+            level,
+            empty_level,
+            cached,
+            consuming: false,
+        }
+    }
+
+    /// The input paths of the input rows of `rows` that `guard` covers. An input row stands at exactly
+    /// one output path, under its own value, so it is released where that path is: under a
     /// released group, or named beneath one.
-    fn held_rows_covered(&self, guard: &TileGuard) -> Vec<Value> {
-        self.held
-            .iter()
-            .filter(|(value, key)| guard.covers_path(&[value.clone(), key.clone()]))
-            .map(|(_, key)| key.clone())
+    fn held_rows_covered(rows: &[HeldRow], guard: &TileGuard) -> Vec<Vec<Value>> {
+        rows.iter()
+            .filter(|(out, _)| guard.covers_path(out))
+            .map(|(_, input)| input.clone())
             .collect()
     }
+
+    /// The input guard naming exactly the input rows at `paths`, each a path through the
+    /// standing levels to a key of the inverted level.
+    fn input_rows(&self, paths: Vec<Vec<Value>>) -> TileGuard {
+        debug_assert!(
+            paths
+                .iter()
+                .all(|path| path.len() == self.level.index() + 1),
+            "an input row's path runs through the standing levels to its key: {paths:?}"
+        );
+        let rows = paths.iter().fold(Predicate::False, |all, path| {
+            all.union(&Predicate::exactly(path))
+        });
+        beneath_standing(self.level, TileGuard::Function(FunctionGuard::Domain(rows)))
+    }
+
+    /// The input rows of `input` inverted at [`Self::level`], with the rows read: each
+    /// enclosing row's group is inverted on its own, as it is for `Uncurry`.
+    fn invert(&self, input: Tile) -> (Tile, Vec<HeldRow>) {
+        let Some(enclosing) = self.level.enclosing() else {
+            debug_assert!(
+                matches!(&input, Tile::DataFunction { row_starts, .. } if row_starts.len() == 1),
+                "converse inverts one mapping, so its input is one collection: {input:?}"
+            );
+            let (out, held) = converse_collection(input);
+            let held = held
+                .into_iter()
+                .map(|(value, key)| (vec![value, key.clone()], vec![key]))
+                .collect();
+            return (out, held);
+        };
+        let paths = input.paths_at(enclosing);
+        let mut held = Vec::new();
+        let out =
+            input.regroup_beneath(self.level, self.empty_level.clone(), &mut |row| match input
+                .group_at(self.level, row)
+            {
+                Some(group) => {
+                    debug_assert!(
+                        row < paths.len(),
+                        "`regroup_beneath` numbers the enclosing rows as `paths_at` lists them: \
+                         row {row} of {}",
+                        paths.len()
+                    );
+                    let (out, rows) = converse_collection(group.into_owned());
+                    held.extend(rows.into_iter().map(|(value, key)| {
+                        let mut out = paths[row].clone();
+                        out.extend([value, key.clone()]);
+                        let mut input = paths[row].clone();
+                        input.push(key);
+                        (out, input)
+                    }));
+                    out
+                }
+                None => self.empty_level.clone(),
+            });
+        (out, held)
+    }
+
+    /// Free the held rows `released`, a region the consumer let go of, covers: drop them from
+    /// `cached` in consuming mode, and release them at the input in pull mode. A row that
+    /// arrives after its group was released is freed here, on the read that first holds it.
+    fn release_late_rows(&mut self, released: &TileGuard) {
+        let late = Self::held_rows_covered(&self.held, released);
+        if late.is_empty() {
+            return;
+        }
+        let rows = self.input_rows(late);
+        match self.consuming {
+            // The consume that read them releases them at the input with the rest it answered.
+            true => {
+                self.cached.remove_guarded(rows);
+                self.cached.compact();
+            }
+            false => self.input.release(rows),
+        }
+    }
+}
+
+/// `guard`, a guard of the inverted level, beneath the `Codomain` steps of the standing levels
+/// above `level`.
+fn beneath_standing(level: CurryLevel, guard: TileGuard) -> TileGuard {
+    (0..level.index()).fold(guard, |inner, _| {
+        TileGuard::Function(FunctionGuard::Codomain(Box::new(inner)))
+    })
 }
 
 /// Sort row indices by typed key, detect group boundaries, and assemble the nested tile
@@ -304,82 +424,72 @@ impl TileProducer for ConverseProducer {
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
+        if self.consuming {
+            return self.offer_impl(projection_guard);
+        }
         let input_guard = match self.level.enclosing() {
             None => self.input.tiling().universal_guard(),
             Some(_) => projection.guard(self.input.tiling()),
         };
         let input_tile = self.input.get(input_guard);
-        let mut out = match self.level.enclosing() {
-            None => {
-                debug_assert!(
-                    matches!(&input_tile, Tile::DataFunction { row_starts, .. } if row_starts.len() == 1),
-                    "converse inverts one mapping, so its input is one collection: {input_tile:?}"
-                );
-                let (out, held) = converse_collection(input_tile);
-                self.held = held;
-                out
-            }
-            // Beneath standing levels each enclosing row's group is inverted on its own:
-            // a row's group is a collection in its own right, as it is for `Uncurry`.
-            Some(_) => {
-                input_tile.regroup_beneath(self.level, self.empty_level.clone(), &mut |row| {
-                    match input_tile.group_at(self.level, row) {
-                        Some(group) => converse_collection(group.into_owned()).0,
-                        None => self.empty_level.clone(),
-                    }
-                })
-            }
-        };
-        // A group can be released while the input still grows, since `release_impl` frees
-        // only the rows held; a row arriving later with a released value would otherwise
-        // put the group back into a region the consumer has let go. That row is released
-        // upstream on the pull that first holds it: the release reached `release_impl`
-        // before the row arrived, so nothing else frees it.
+        let (mut out, held) = self.invert(input_tile);
+        self.held = held;
+        // `release_impl` frees the rows held, the standing keys named, and the input keys
+        // named under every group, so a group can be released while the input still grows. A
+        // row arriving later with a released value would put the group back into a region the
+        // consumer has let go; it is released upstream on the pull that first holds it, since
+        // the release reached `release_impl` before the row arrived.
         if !self.base.obsolete_guard.is_empty() {
             let released = self.base.obsolete_guard.clone();
-            let late = self.held_rows_covered(&released);
-            if !late.is_empty() {
-                let rows = late.into_iter().fold(Predicate::False, |all, key| {
-                    all.union(&Predicate::point(key))
-                });
-                self.input
-                    .release(TileGuard::Function(FunctionGuard::Domain(rows)));
-            }
+            self.release_late_rows(&released);
             out.remove_guarded(released);
         }
         out.restrict_to(&projection, self.tiling());
         out
     }
 
+    /// The levels above the inverted one stand, so a guard naming their keys names the same
+    /// input rows. Beneath them a guard names groups by value, and an input row is released
+    /// where the output path it stands at is: the rows held now, and a row arriving later
+    /// through the late-row release in `get_impl` and `consume_impl`, once its value says which
+    /// group it joins.
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        if self.level != CurryLevel::OUTERMOST {
-            // The levels above 𝐿 stand, and 𝐿's keys become values. Part of an enclosing row's
-            // inversion names input rows by their values, which the outermost converse tracks
-            // as `held` and a nested one does not yet.
-            let input_guard = crate::interpreter::tiling::through_standing_levels(
-                obsolete_guard,
-                self.level.index(),
-                self.input.tiling(),
-                &mut |inverted| {
-                    todo!(
-                        "a nested Converse cannot yet release part of a row's inversion: {inverted:?}"
-                    )
-                },
-            );
-            return self.input.release(input_guard);
+        if obsolete_guard.is_universal() {
+            self.cached = self.input.tiling().empty_tile();
+            self.held.clear();
+            return self.input.release(self.input.tiling().universal_guard());
         }
-        let released = match obsolete_guard {
-            g if g.is_universal() => {
-                return self.input.release(self.input.tiling().universal_guard());
+        // A member `[𝑠…, value, key]` is the smallest region an input row stands at, so a guard
+        // naming a strict part of one covers no held path: releasing it would forward nothing,
+        // a smaller guard than named (`src/interpreter/design-operators.md`, "Guard operations
+        // are exact"). A member's value is a scalar, so a scalar leaf names members' values
+        // whole ([`TileGuard::leaf_rows`]) and covers their paths.
+        fn names_beneath_a_member(guard: &TileGuard) -> bool {
+            match guard {
+                TileGuard::Or(arms) => arms.iter().any(names_beneath_a_member),
+                TileGuard::Function(FunctionGuard::Codomain(inner)) => {
+                    names_beneath_a_member(inner)
+                }
+                TileGuard::Function(FunctionGuard::Domain(_)) => false,
+                TileGuard::Scalar(_) => false,
+                TileGuard::Record(_) | TileGuard::Aggregation(_) => true,
             }
-            ref g => self.held_rows_covered(g),
-        };
-        // A held row the guard covers is released here, and a row arriving later through the
-        // late-row release in `get_impl`, once its value says which group it joins. This adds
-        // the rows a guard names without waiting for that: a statement beneath the groups that
-        // names no group says the same under every one, so it names those input keys whatever
-        // group they land in, arrived or not. Every other shape names an input row only through
-        // its group, so `False` here leaves it to the two paths above rather than dropping it.
+        }
+        assert!(
+            !names_beneath_a_member(&obsolete_guard),
+            "{}: a release names whole members or regions above them; one beneath a member \
+             names no input row exactly: {obsolete_guard:?}",
+            self.name()
+        );
+        if self.consuming {
+            self.held = self.invert(self.cached.clone()).1;
+        }
+        // This adds the rows a guard names without waiting for their values: a statement
+        // beneath the groups that names no group, and no enclosing path, says the same under
+        // every group of every enclosing row, so it names those input keys whatever group they
+        // land in, arrived or not. Every other shape beneath the standing levels names an
+        // input row only through its group, so `False` here leaves it to the `held` release
+        // and `release_late_rows` rather than dropping it.
         fn under_every_group(guard: &TileGuard) -> Predicate {
             match guard {
                 TileGuard::Or(arms) => arms
@@ -393,13 +503,117 @@ impl TileProducer for ConverseProducer {
                 _ => Predicate::False,
             }
         }
-        let rows = released
-            .into_iter()
-            .fold(under_every_group(&obsolete_guard), |all, key| {
-                all.union(&Predicate::point(key))
-            });
-        self.input
-            .release(TileGuard::Function(FunctionGuard::Domain(rows)));
+        let standing = crate::interpreter::tiling::through_standing_levels(
+            obsolete_guard.clone(),
+            self.level.index(),
+            self.input.tiling(),
+            &mut |inverted| {
+                TileGuard::Function(FunctionGuard::Domain(under_every_group(&inverted)))
+            },
+        );
+        let held = self.input_rows(Self::held_rows_covered(&self.held, &obsolete_guard));
+        let rows = TileGuard::flatten_or(vec![standing, held]);
+        self.cached.remove_guarded(rows.clone());
+        self.cached.compact();
+        self.input.release(rows);
+    }
+}
+
+impl Breaker for ConverseProducer {
+    /// Merges the input rows it answers at `guard`, a guard of the input's tiling, into the rows
+    /// it holds, drops those whose group the consumer already released, and releases the input
+    /// at what the answer stated. The input rows are the state: the groups are built from them on
+    /// each offer, since which rows share a value is known only once they are read. Beneath
+    /// standing levels the rows are held under their enclosing rows' paths, and each enclosing
+    /// row's groups are built from its own rows.
+    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
+        debug_assert!(
+            guard.check_from(self.input.tiling()),
+            "{} consumes a guard of its input's tiling: {guard:?}",
+            self.name()
+        );
+        self.consuming = true;
+        if guard.is_empty() {
+            return;
+        }
+        let mut answered = self.input.get(guard);
+        let upstream_guard = answered.to_guard();
+        answered.compact();
+        self.cached.merge(answered);
+        let released = self.base.obsolete_guard.clone();
+        if !released.is_empty() {
+            self.held = self.invert(self.cached.clone()).1;
+            self.release_late_rows(&released);
+        }
+        self.input.release(upstream_guard);
+    }
+}
+
+impl ConverseProducer {
+    /// Checks that the groups the held rows build hold nothing in the released region: removing
+    /// that region from them leaves every member in place. `release_late_rows` frees rows by the
+    /// paths `invert` records and an input guard of their keys; this reads the groups' members
+    /// instead, so a row the recorded paths or the input guard missed shows here.
+    fn debug_assert_released_groups_freed(&self) {
+        if cfg!(debug_assertions) && self.consuming && !self.base.obsolete_guard.is_empty() {
+            let members = CurryLevel::new(self.level.index() + 1);
+            let groups = self.invert(self.cached.clone()).0;
+            let mut left = groups.clone();
+            left.remove_guarded(self.base.obsolete_guard.clone());
+            let (before, after) = (groups.paths_at(members), left.paths_at(members));
+            debug_assert!(
+                before == after,
+                "{}: a release of a converse group frees each later row of the group as it is \
+                 read, yet members {:?} of the held rows' groups stand in a released group",
+                self.name(),
+                before
+                    .iter()
+                    .filter(|path| !after.contains(path))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+impl BreakingProducer for ConverseProducer {
+    fn input(&self) -> &dyn TileProducer {
+        &*self.input
+    }
+
+    /// It holds groups of rows beneath the groups' keys, and what is left of that after a release
+    /// beneath them is a region beneath the outermost keys, and a reader's chain may restate only
+    /// the outermost keys (`TileProducer::restates`).
+    fn pushes_while_consuming(&self) -> bool {
+        false
+    }
+
+    /// The guard of the groups the held rows build.
+    fn held(&self) -> TileGuard {
+        self.invert(self.cached.clone()).0.to_guard()
+    }
+
+    fn finalize(&mut self) -> TileGuard {
+        self.debug_assert_released_groups_freed();
+        finalize_guard(
+            &self.name(),
+            self.input(),
+            &self.held(),
+            self.obsolete_guard(),
+        )
+    }
+
+    fn offer_impl(&mut self, guard: TileGuard) -> Tile {
+        let projection = guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let (mut out, held) = self.invert(self.cached.clone());
+        self.held = held;
+        if !self.base.obsolete_guard.is_empty() {
+            out.remove_guarded(self.base.obsolete_guard.clone());
+        }
+        out.restrict_to(&projection, self.tiling());
+        out
     }
 }
 
@@ -2502,13 +2716,12 @@ mod tests {
                 Tiling::data_function(domain.clone(), Tiling::Scalar(domain)),
             )
         };
-        let mut producer = ConverseProducer {
-            base: ProducerBase::unowned(ConverseProducer::alloc_id(), &output_tiling),
-            input: Box::new(TestTileProducer::new(input_tile, input_tiling)),
-            held: Vec::new(),
-            level: CurryLevel::OUTERMOST,
-            empty_level: output_tiling.empty_at_no_rows(),
-        };
+        let mut producer = ConverseProducer::new(
+            ProducerBase::unowned(ConverseProducer::alloc_id(), &output_tiling),
+            Box::new(TestTileProducer::new(input_tile, input_tiling)),
+            CurryLevel::OUTERMOST,
+            output_tiling.empty_at_no_rows(),
+        );
         producer.get(producer.tiling().universal_guard())
     }
 
@@ -2540,13 +2753,12 @@ mod tests {
             ),
         );
         let (input, next) = ScriptedProducer::new(input_at(vec![0], vec![10]), one_level_tiling());
-        let mut producer = ConverseProducer {
-            base: ProducerBase::unowned(ConverseProducer::alloc_id(), &output_tiling),
-            input: Box::new(input),
-            held: Vec::new(),
-            level: CurryLevel::OUTERMOST,
-            empty_level: output_tiling.empty_at_no_rows(),
-        };
+        let mut producer = ConverseProducer::new(
+            ProducerBase::unowned(ConverseProducer::alloc_id(), &output_tiling),
+            Box::new(input),
+            CurryLevel::OUTERMOST,
+            output_tiling.empty_at_no_rows(),
+        );
         let _ = producer.get(producer.tiling().universal_guard());
         producer.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::point(Value::Int(10)),
@@ -2592,22 +2804,51 @@ mod tests {
         (tile, tiling)
     }
 
-    fn nested_converse() -> ConverseProducer {
+    pub(super) fn nested_converse() -> ConverseProducer {
         let (tile, tiling) = two_rows();
         let int = || Extent::Base(BaseType::Int);
         let output_tiling = Tiling::data_function(
             int(),
             Tiling::data_function(int(), Tiling::data_function(int(), Tiling::Scalar(int()))),
         );
-        ConverseProducer {
-            base: ProducerBase::unowned(ConverseProducer::alloc_id(), &output_tiling),
-            input: Box::new(TestTileProducer::new(tile, tiling)),
-            held: Vec::new(),
-            level: CurryLevel::new(1),
-            empty_level: output_tiling
+        ConverseProducer::new(
+            ProducerBase::unowned(ConverseProducer::alloc_id(), &output_tiling),
+            Box::new(TestTileProducer::new(tile, tiling)),
+            CurryLevel::new(1),
+            output_tiling
                 .values_at(CurryLevel::new(1))
                 .empty_at_no_rows(),
-        }
+        )
+    }
+
+    /// Enclosing rows `1` and `2` holding `row_1` and `row_2` at keys `0, 1, …`, over `Int`s,
+    /// with nothing stated complete, so a pull may find more keys.
+    pub(super) fn growing_rows(row_1: &[i64], row_2: &[i64]) -> Tile {
+        let keys = (0..row_1.len()).chain(0..row_2.len()).map(|key| key as i64);
+        Tile::data_function(
+            ColumnValue::Ints(vec![1, 2]),
+            Box::new(Tile::grouped(
+                vec![0, row_1.len()],
+                ColumnValue::Ints(keys.collect()),
+                Box::new(Tile::Scalar(ColumnValue::Ints(
+                    row_1.iter().chain(row_2).copied().collect(),
+                ))),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        )
+    }
+
+    /// A [`nested_converse`] over a [`ScriptedProducer`] answering [`growing_rows`] of rows
+    /// `1 ↦ [10, 10, 20]` and `2 ↦ [10]`, and the cell its next pull's answer is written into.
+    pub(super) fn growing_nested_converse() -> (ConverseProducer, Rc<RefCell<Tile>>) {
+        use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
+        let (input, next) = ScriptedProducer::new(growing_rows(&[10, 10, 20], &[10]), two_rows().1);
+        let mut converse = nested_converse();
+        converse.input = Box::new(input);
+        (converse, next)
     }
 
     fn nested_map_domain() -> MapDomainProducer {
@@ -2686,15 +2927,98 @@ mod tests {
         assert!(!upstream.covers_path(&[Value::Int(2)]), "{upstream:?}");
     }
 
-    /// A release beneath a nested `Converse`'s standing level names input rows only through
-    /// the groups it rebuilt there, which it cannot release yet, and says so.
+    /// `guard` beneath the standing level of [`nested_converse`].
+    pub(super) fn under_a_row(guard: TileGuard) -> TileGuard {
+        TileGuard::Function(FunctionGuard::Codomain(Box::new(guard)))
+    }
+
+    /// A group of one enclosing row, named by its path, releases at the input exactly the rows
+    /// of that row the group holds: row 1's group 10 is input rows `[1, 0]` and `[1, 1]`, and
+    /// row 2's group 10 stays.
     #[test]
-    #[should_panic(expected = "a nested Converse cannot yet release part of a row's inversion")]
-    fn a_nested_converse_refuses_a_release_beneath_its_standing_level() {
+    fn a_nested_converse_releases_one_rows_group_to_its_input() {
         let mut converse = nested_converse();
-        converse.release(TileGuard::Function(FunctionGuard::Codomain(Box::new(
-            TileGuard::Function(FunctionGuard::Domain(Predicate::point(Value::Int(10)))),
+        converse.get(converse.tiling().universal_guard());
+        converse.release(under_a_row(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::exactly(&[Value::Int(1), Value::Int(10)]),
         ))));
+        let upstream = converse.input.obsolete_guard();
+        let released = |path: [i64; 2]| upstream.covers_path(&path.map(Value::Int));
+        assert!(released([1, 0]) && released([1, 1]), "{upstream:?}");
+        assert!(!released([1, 2]) && !released([2, 0]), "{upstream:?}");
+    }
+
+    /// Part of one group of one enclosing row, a single member, releases that input row alone.
+    #[test]
+    fn a_nested_converse_releases_part_of_a_group_to_its_input() {
+        let mut converse = nested_converse();
+        converse.get(converse.tiling().universal_guard());
+        converse.release(under_a_row(under_a_row(TileGuard::Function(
+            FunctionGuard::Domain(Predicate::exactly(&[
+                Value::Int(1),
+                Value::Int(10),
+                Value::Int(1),
+            ])),
+        ))));
+        let upstream = converse.input.obsolete_guard();
+        let released = |path: [i64; 2]| upstream.covers_path(&path.map(Value::Int));
+        assert!(released([1, 1]), "{upstream:?}");
+        assert!(!released([1, 0]) && !released([2, 0]), "{upstream:?}");
+    }
+
+    /// A group named by its value under every enclosing row releases its rows under each.
+    #[test]
+    fn a_nested_converse_releases_a_group_under_every_row_to_its_input() {
+        let mut converse = nested_converse();
+        converse.get(converse.tiling().universal_guard());
+        converse.release(under_a_row(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::point(Value::Int(10)),
+        ))));
+        let upstream = converse.input.obsolete_guard();
+        let released = |path: [i64; 2]| upstream.covers_path(&path.map(Value::Int));
+        assert!(
+            released([1, 0]) && released([1, 1]) && released([2, 0]),
+            "{upstream:?}"
+        );
+        assert!(!released([1, 2]), "{upstream:?}");
+    }
+
+    /// A row that arrives after its group was released is released at the input by the pull
+    /// that first holds it: row 1's key 3 joins its released group 10.
+    #[test]
+    fn a_nested_converse_releases_a_row_that_joins_a_released_group() {
+        let (mut converse, next) = growing_nested_converse();
+        converse.get(converse.tiling().universal_guard());
+        converse.release(under_a_row(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::exactly(&[Value::Int(1), Value::Int(10)]),
+        ))));
+        *next.borrow_mut() = growing_rows(&[10, 10, 20, 10], &[10]);
+        let mut out = converse.get(converse.tiling().universal_guard());
+        out.compact();
+        assert!(
+            !out.paths_at(CurryLevel::new(2))
+                .contains(&[1, 10, 3].map(Value::Int).to_vec()),
+            "{out:?}"
+        );
+        let upstream = converse.input.obsolete_guard();
+        let released = |path: [i64; 2]| upstream.covers_path(&path.map(Value::Int));
+        assert!(released([1, 3]), "{upstream:?}");
+        assert!(!released([1, 2]) && !released([2, 0]), "{upstream:?}");
+    }
+
+    /// Input keys named beneath every group of every enclosing row name those input rows
+    /// whatever group they land in, so the release reaches the input before any pull reads
+    /// their values.
+    #[test]
+    fn a_nested_converse_releases_keys_beneath_every_group_before_reading_them() {
+        let mut converse = nested_converse();
+        converse.release(under_a_row(under_a_row(TileGuard::Function(
+            FunctionGuard::Domain(Predicate::point(Value::Int(1))),
+        ))));
+        let upstream = converse.input.obsolete_guard();
+        let released = |path: [i64; 2]| upstream.covers_path(&path.map(Value::Int));
+        assert!(released([1, 1]) && released([2, 1]), "{upstream:?}");
+        assert!(!released([1, 0]) && !released([2, 0]), "{upstream:?}");
     }
 
     /// A converse beneath a standing level inverts each enclosing row's collection on its
@@ -4195,15 +4519,14 @@ mod converse_projection_tests {
         let (keys, pulled, released) =
             ProjectionSpy::new(ints_by_position(&GROUPS, true), in_tiling);
         (
-            ConverseProducer {
-                base: ProducerBase::unowned(ConverseProducer::alloc_id(), &groups_tiling()),
-                input: Box::new(keys),
-                held: Vec::new(),
-                level: CurryLevel::OUTERMOST,
-                empty_level: groups_tiling()
+            ConverseProducer::new(
+                ProducerBase::unowned(ConverseProducer::alloc_id(), &groups_tiling()),
+                Box::new(keys),
+                CurryLevel::OUTERMOST,
+                groups_tiling()
                     .values_at(CurryLevel::OUTERMOST)
                     .empty_at_no_rows(),
-            },
+            ),
             pulled,
             released,
         )
@@ -4324,13 +4647,12 @@ mod converse_projection_tests {
         let make = || {
             let (input, pulled, _) = ProjectionSpy::new(rows.clone(), in_tiling.clone());
             (
-                ConverseProducer {
-                    base: ProducerBase::unowned(ConverseProducer::alloc_id(), &out),
-                    input: Box::new(input),
-                    held: Vec::new(),
-                    level: CurryLevel::new(1),
-                    empty_level: out.values_at(CurryLevel::new(1)).empty_at_no_rows(),
-                },
+                ConverseProducer::new(
+                    ProducerBase::unowned(ConverseProducer::alloc_id(), &out),
+                    Box::new(input),
+                    CurryLevel::new(1),
+                    out.values_at(CurryLevel::new(1)).empty_at_no_rows(),
+                ),
                 pulled,
             )
         };
@@ -4346,5 +4668,655 @@ mod converse_projection_tests {
         let nothing = converse.tiling().empty_guard();
         assert_eq!(converse.get(nothing), converse.tiling().empty_tile());
         assert!(pulled.borrow().is_empty());
+    }
+}
+
+/// A consuming `Converse` over an input that grows and is released: the rows it holds, what it
+/// offers and what reaches the input, against a model of the rows consumed and the groups released.
+#[cfg(test)]
+mod converse_consuming_tests {
+    use super::*;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    use crate::interpreter::BaseType;
+    use crate::interpreter::tile_operators::growing::{
+        Input, InputModel, KEYS, Region, Rng, Shared, Step, ints, predicate, same_region, source_of,
+    };
+    use crate::interpreter::tile_operators::test_helpers::{int_entries, keys_between};
+    use Region::{All, Keys};
+    use Step::{Add, Close, Consume, Notify, Release};
+
+    /// The group a key joins: three groups, so rows share a value.
+    fn group_of(key: u64) -> i64 {
+        (key % 3) as i64
+    }
+
+    fn out_tiling() -> Tiling {
+        Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::data_function(
+                Extent::uint_range(KEYS),
+                Tiling::Scalar(Extent::uint_range(KEYS)),
+            ),
+        )
+    }
+
+    fn converse_over(source: &Shared) -> ConverseProducer {
+        ConverseProducer::new(
+            ProducerBase::unowned(ConverseProducer::alloc_id(), &out_tiling()),
+            Box::new(Input::over(source)),
+            CurryLevel::OUTERMOST,
+            out_tiling().empty_at_no_rows(),
+        )
+    }
+
+    fn rows_source(keys: impl IntoIterator<Item = u64>) -> Shared {
+        source_of(keys, group_of)
+    }
+
+    /// A source of rows that states complete only the keys it holds until it is closed.
+    fn growing_rows_source(keys: impl IntoIterator<Item = u64>) -> Shared {
+        let source = rows_source(keys);
+        source.borrow_mut().growing = true;
+        source
+    }
+
+    /// The groups an answer holds: each value with the keys that carry it.
+    fn groups(tile: &Tile) -> BTreeMap<i64, BTreeSet<u64>> {
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = tile
+        else {
+            panic!("a collection of groups, got {tile:?}")
+        };
+        let Tile::DataFunction {
+            row_starts,
+            domain: members,
+            ..
+        } = &**codomain
+        else {
+            panic!("a collection per group, got {codomain:?}")
+        };
+        let mut out = BTreeMap::new();
+        for group in 0..domain.len() {
+            let Value::Int(value) = domain.index_at(group) else {
+                panic!("an integer group, got {:?}", domain.index_at(group))
+            };
+            let end = row_starts.get(group + 1).copied().unwrap_or(members.len());
+            let keys = (row_starts[group]..end)
+                .map(|row| {
+                    let Value::UInt(key) = members.index_at(row) else {
+                        panic!("a key, got {:?}", members.index_at(row))
+                    };
+                    key
+                })
+                .collect();
+            out.insert(value, keys);
+        }
+        out
+    }
+
+    fn grouped(keys: impl IntoIterator<Item = u64>) -> BTreeMap<i64, BTreeSet<u64>> {
+        let mut out: BTreeMap<i64, BTreeSet<u64>> = BTreeMap::new();
+        for key in keys {
+            out.entry(group_of(key)).or_default().insert(key);
+        }
+        out
+    }
+
+    /// The keys of the universe the input has been released at.
+    fn released_keys(source: &Shared) -> BTreeSet<u64> {
+        source
+            .borrow()
+            .released
+            .iter()
+            .flat_map(|guard| {
+                let TileGuard::Function(FunctionGuard::Domain(keys)) = guard else {
+                    panic!("a release of keys, got {guard:?}")
+                };
+                (0..KEYS).filter(|key| keys.contains(&Value::UInt(*key)))
+            })
+            .collect()
+    }
+
+    fn cached(converse: &ConverseProducer) -> Vec<u64> {
+        int_entries(&converse.cached)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect()
+    }
+
+    fn universal() -> TileGuard {
+        out_tiling().universal_guard()
+    }
+
+    /// The guard that names the groups `first` to `last`.
+    fn groups_guard(first: i64, last: i64) -> TileGuard {
+        TileGuard::Function(FunctionGuard::Domain(Predicate::intervals(
+            intervalsets::IntervalSet::from(intervalsets::Interval::closed(
+                Value::Int(first),
+                Value::Int(last),
+            )),
+        )))
+    }
+
+    #[test]
+    fn a_region_is_merged_pulled_and_released_once() {
+        let source = rows_source(0..10);
+        let mut converse = converse_over(&source);
+        converse.consume_impl(InputId::ONLY, keys_between(2, 5));
+        assert_eq!(cached(&converse), vec![2, 3, 4, 5]);
+        assert_eq!(source.borrow().pulled, vec![keys_between(2, 5)]);
+        assert_eq!(source.borrow().released, vec![keys_between(2, 5)]);
+        assert_eq!(groups(&converse.get(universal())), grouped(2..=5));
+    }
+
+    #[test]
+    fn disjoint_and_overlapping_regions_merge_each_row_once() {
+        let source = rows_source(0..10);
+        let mut converse = converse_over(&source);
+        converse.consume_impl(InputId::ONLY, keys_between(1, 2));
+        converse.consume_impl(InputId::ONLY, keys_between(7, 9));
+        assert_eq!(cached(&converse), vec![1, 2, 7, 8, 9]);
+        converse.consume_impl(InputId::ONLY, keys_between(2, 7));
+        assert_eq!(cached(&converse), (1..=9).collect::<Vec<_>>());
+        assert_eq!(groups(&converse.get(universal())), grouped(1..=9));
+    }
+
+    #[test]
+    fn nothing_consumed_pulls_nothing() {
+        let source = rows_source(0..10);
+        let mut converse = converse_over(&source);
+        converse.consume_impl(InputId::ONLY, ints().empty_guard());
+        assert!(source.borrow().pulled.is_empty());
+        assert!(cached(&converse).is_empty());
+    }
+
+    /// Everything consumed drains the input, and the offer is what a pull in pull mode answers.
+    #[test]
+    fn everything_consumed_offers_what_a_lazy_pull_answers() {
+        let mut consuming = converse_over(&rows_source(0..10));
+        consuming.consume_impl(InputId::ONLY, ints().universal_guard());
+        let mut lazy = converse_over(&rows_source(0..10));
+        assert_eq!(consuming.get(universal()), lazy.get(universal()));
+        // Every group is final once the input has drained, whatever its value.
+        assert_eq!(consuming.finalize(), universal());
+    }
+
+    /// A group released drops its rows from what the converse holds and from the input, and
+    /// `finalize` leaves the group out.
+    #[test]
+    fn a_released_group_leaves_the_rows_of_the_group_out() {
+        let source = rows_source(0..9);
+        let mut converse = converse_over(&source);
+        converse.consume_impl(InputId::ONLY, ints().universal_guard());
+        converse.release(groups_guard(1, 1));
+        assert_eq!(
+            groups(&converse.get(universal())),
+            grouped((0..9).filter(|k| k % 3 != 1))
+        );
+        assert_eq!(
+            cached(&converse),
+            (0..9).filter(|k| k % 3 != 1).collect::<Vec<_>>()
+        );
+        let TileGuard::Function(FunctionGuard::Domain(kept)) = converse.finalize() else {
+            panic!("a guard of the groups")
+        };
+        assert!(kept.contains(&Value::Int(0)) && kept.contains(&Value::Int(2)));
+        assert!(
+            !kept.contains(&Value::Int(1)),
+            "the released group is not finalized"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "finalizes after its input has stated everything complete")]
+    fn finalize_before_the_input_has_drained_panics() {
+        let mut converse = converse_over(&rows_source(0..10));
+        converse.consume_impl(InputId::ONLY, keys_between(0, 3));
+        converse.finalize();
+    }
+
+    #[test]
+    fn a_consuming_converse_offers_without_pulling() {
+        let source = rows_source(0..10);
+        let mut converse = converse_over(&source);
+        converse.consume_impl(InputId::ONLY, ints().universal_guard());
+        let pulls = source.borrow().pulled.len();
+        for _ in 0..3 {
+            converse.get(universal());
+        }
+        assert_eq!(source.borrow().pulled.len(), pulls);
+    }
+
+    /// A consuming converse beneath a standing level offers what a pull answers, without pulling
+    /// again, and a release of part of one row's inversion drops it from both its rows and its
+    /// offer.
+    #[test]
+    fn a_nested_converse_consumes_and_releases_part_of_a_row() {
+        let mut consuming = tests::nested_converse();
+        let mut lazy = tests::nested_converse();
+        let input = consuming.input.tiling().universal_guard();
+        consuming.consume_impl(InputId::ONLY, input);
+        assert_eq!(
+            consuming.get(consuming.tiling().universal_guard()),
+            lazy.get(lazy.tiling().universal_guard())
+        );
+        let group = TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+            FunctionGuard::Domain(Predicate::exactly(&[Value::Int(1), Value::Int(10)])),
+        ))));
+        consuming.release(group);
+        let offered = consuming.get(consuming.tiling().universal_guard());
+        assert_eq!(
+            offered.paths_at(CurryLevel::new(2)),
+            vec![
+                [1, 20, 2].map(Value::Int).to_vec(),
+                [2, 10, 0].map(Value::Int).to_vec()
+            ],
+            "row 1's group 10 is gone and row 2's stays: {offered:?}"
+        );
+        assert_eq!(
+            consuming.cached.paths_at(CurryLevel::new(1)),
+            vec![
+                [1, 2].map(Value::Int).to_vec(),
+                [2, 0].map(Value::Int).to_vec()
+            ],
+            "the input rows held"
+        );
+    }
+
+    /// The input rows a nested consuming converse holds, as input paths.
+    fn held_paths(converse: &ConverseProducer) -> Vec<[i64; 2]> {
+        converse
+            .cached
+            .paths_at(CurryLevel::new(1))
+            .into_iter()
+            .map(|path| {
+                [0, 1].map(|at| match path[at] {
+                    Value::Int(value) => value,
+                    ref other => panic!("an Int key: {other:?}"),
+                })
+            })
+            .collect()
+    }
+
+    /// A row merged after its group was released is dropped by the consume that merges it.
+    #[test]
+    fn a_nested_converse_drops_a_row_that_joins_a_released_group() {
+        let (mut converse, next) = tests::growing_nested_converse();
+        let input = converse.input.tiling().universal_guard();
+        converse.consume_impl(InputId::ONLY, input.clone());
+        converse.release(TileGuard::Function(FunctionGuard::Codomain(Box::new(
+            TileGuard::Function(FunctionGuard::Domain(Predicate::exactly(&[
+                Value::Int(1),
+                Value::Int(10),
+            ]))),
+        ))));
+        *next.borrow_mut() = tests::growing_rows(&[10, 10, 20, 10], &[10]);
+        converse.consume_impl(InputId::ONLY, input);
+        assert_eq!(held_paths(&converse), vec![[1, 2], [2, 0]]);
+    }
+
+    /// A release of a standing key drops that enclosing row's input rows and keeps the others.
+    #[test]
+    fn a_nested_converse_consumes_and_releases_a_standing_row() {
+        let mut converse = tests::nested_converse();
+        let input = converse.input.tiling().universal_guard();
+        converse.consume_impl(InputId::ONLY, input);
+        converse.release(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::point(Value::Int(1)),
+        )));
+        assert_eq!(held_paths(&converse), vec![[2, 0]]);
+        let offered = converse.get(converse.tiling().universal_guard());
+        assert_eq!(
+            offered.paths_at(CurryLevel::new(2)),
+            vec![[2, 10, 0].map(Value::Int).to_vec()],
+            "{offered:?}"
+        );
+    }
+
+    /// A release of one member of a group drops that input row alone.
+    #[test]
+    fn a_nested_converse_consumes_and_releases_one_member_of_a_group() {
+        let mut converse = tests::nested_converse();
+        let input = converse.input.tiling().universal_guard();
+        converse.consume_impl(InputId::ONLY, input);
+        converse.release(TileGuard::Function(FunctionGuard::Codomain(Box::new(
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+                FunctionGuard::Domain(Predicate::exactly(&[
+                    Value::Int(1),
+                    Value::Int(10),
+                    Value::Int(1),
+                ])),
+            )))),
+        ))));
+        assert_eq!(held_paths(&converse), vec![[1, 0], [1, 2], [2, 0]]);
+    }
+
+    /// Input keys named beneath every group of every enclosing row are released at the input
+    /// while consuming, including keys no consume has read: key 3 is in neither row yet.
+    #[test]
+    fn a_nested_converse_consuming_releases_keys_beneath_every_group_before_reading_them() {
+        let (mut converse, _) = tests::growing_nested_converse();
+        let input = converse.input.tiling().universal_guard();
+        converse.consume_impl(InputId::ONLY, input);
+        converse.release(tests::under_a_row(tests::under_a_row(TileGuard::Function(
+            FunctionGuard::Domain(Predicate::point(Value::Int(3))),
+        ))));
+        let upstream = converse.input.obsolete_guard();
+        let released = |path: [i64; 2]| upstream.covers_path(&path.map(Value::Int));
+        assert!(released([1, 3]) && released([2, 3]), "{upstream:?}");
+        assert!(!released([1, 4]) && !released([2, 4]), "{upstream:?}");
+    }
+
+    /// A scalar leaf beneath the members names each member's value whole, so it releases the
+    /// members it reaches: here every member of every group of every row.
+    #[test]
+    fn a_nested_converse_releases_members_a_whole_value_leaf_names() {
+        let mut converse = tests::nested_converse();
+        let input = converse.input.tiling().universal_guard();
+        converse.consume_impl(InputId::ONLY, input);
+        converse.release(tests::under_a_row(tests::under_a_row(tests::under_a_row(
+            TileGuard::Scalar(Predicate::True),
+        ))));
+        assert_eq!(held_paths(&converse), Vec::<[i64; 2]>::new());
+        let upstream = converse.input.obsolete_guard();
+        let released = |path: [i64; 2]| upstream.covers_path(&path.map(Value::Int));
+        assert!(
+            released([1, 0]) && released([1, 2]) && released([2, 0]),
+            "{upstream:?}"
+        );
+    }
+
+    /// A growing input withholds a key it does not hold yet: the release leaves it, and a row
+    /// that arrives there later joins its group at the next consume.
+    #[test]
+    fn a_key_the_input_withheld_joins_its_group_at_a_later_consume() {
+        let source = growing_rows_source([0, 1, 2, 4, 5]);
+        let mut converse = converse_over(&source);
+        converse.consume_impl(InputId::ONLY, keys_between(0, 5));
+        assert!(!released_keys(&source).contains(&3));
+        source.borrow_mut().rows.insert(3, group_of(3));
+        converse.consume_impl(InputId::ONLY, keys_between(0, 5));
+        assert_eq!(cached(&converse), (0..=5).collect::<Vec<_>>());
+        assert!(released_keys(&source).contains(&3));
+    }
+
+    /// A released group stays released across morsels: each row of it that a later consume
+    /// merges is freed on that consume.
+    #[test]
+    fn rows_of_a_released_group_in_later_morsels_are_freed_by_their_consume() {
+        let source = rows_source(0..9);
+        let mut converse = converse_over(&source);
+        converse.consume_impl(InputId::ONLY, keys_between(0, 2));
+        converse.release(groups_guard(1, 1));
+        assert_eq!(cached(&converse), vec![0, 2]);
+        converse.consume_impl(InputId::ONLY, keys_between(3, 5));
+        converse.consume_impl(InputId::ONLY, keys_between(6, 8));
+        assert_eq!(cached(&converse), vec![0, 2, 3, 5, 6, 8]);
+        assert_eq!(released_keys(&source), (0..9).collect());
+        assert_eq!(
+            groups(&converse.get(universal())),
+            grouped([0, 2, 3, 5, 6, 8])
+        );
+    }
+
+    /// Part of the input consumed states no group complete: a row of any group may still come.
+    #[test]
+    fn an_offer_after_a_partial_consume_states_no_group_complete() {
+        let mut converse = converse_over(&rows_source(0..10));
+        converse.consume_impl(InputId::ONLY, keys_between(0, 5));
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = converse.get(universal())
+        else {
+            panic!("a collection of groups")
+        };
+        assert!(domain_predicate.is_false(), "{domain_predicate:?}");
+    }
+
+    /// A release named beneath the groups, at input keys, takes those keys out of every group,
+    /// and the input drops them when they arrive again.
+    #[test]
+    fn a_release_beneath_the_groups_takes_its_keys_out_of_every_group() {
+        let source = rows_source(0..10);
+        let mut converse = converse_over(&source);
+        converse.consume_impl(InputId::ONLY, keys_between(0, 3));
+        converse.release(TileGuard::Function(FunctionGuard::Codomain(Box::new(
+            keys_between(4, 5),
+        ))));
+        assert!(
+            [4, 5]
+                .iter()
+                .all(|key| released_keys(&source).contains(key)),
+            "the input is released at the keys, whatever group they join"
+        );
+        source.borrow_mut().rows.insert(4, group_of(4));
+        converse.consume_impl(InputId::ONLY, ints().universal_guard());
+        let held: BTreeSet<u64> = groups(&converse.get(universal()))
+            .into_values()
+            .flatten()
+            .collect();
+        assert_eq!(held, (0..10).filter(|key| ![4, 5].contains(key)).collect());
+    }
+
+    /// What such a release leaves is every path of the groups but the keys released.
+    #[test]
+    fn finalize_after_a_release_beneath_the_groups_names_the_paths_left() {
+        let mut converse = converse_over(&rows_source(0..10));
+        converse.consume_impl(InputId::ONLY, ints().universal_guard());
+        let released = TileGuard::Function(FunctionGuard::Codomain(Box::new(keys_between(4, 5))));
+        converse.release(released.clone());
+        let before = Projection::of(&converse.held()).expect("a region of keys");
+        let held = Projection::of(&converse.finalize()).expect("a region of paths");
+        let released = Projection::of(&released).expect("a region of paths");
+        assert_eq!(held.level(), Some(CurryLevel::new(1)));
+        assert_eq!(held.intersect(&released), Projection::Nothing);
+        let rejoined = held.union(&released);
+        assert_eq!(
+            (rejoined.minus(&before), before.minus(&rejoined)),
+            (Projection::Nothing, Projection::Nothing),
+            "the paths held and the paths released are what was held"
+        );
+    }
+
+    /// A release of every group leaves nothing held.
+    #[test]
+    fn finalize_after_releasing_everything_holds_nothing() {
+        let mut converse = converse_over(&rows_source(0..10));
+        converse.consume_impl(InputId::ONLY, ints().universal_guard());
+        converse.release(universal());
+        assert_eq!(converse.finalize(), out_tiling().empty_guard());
+    }
+
+    /// The model of a run over a growing input: the rows held and the groups released.
+    struct Run {
+        sut: ConverseProducer,
+        sut_source: Shared,
+        input: InputModel,
+        released_groups: Predicate,
+        released_all: bool,
+        cache: BTreeSet<u64>,
+        trace: String,
+    }
+
+    impl Run {
+        fn new(initial: &[u64], trace: String) -> Self {
+            let sut_source = growing_rows_source(initial.iter().copied());
+            Self {
+                sut: converse_over(&sut_source),
+                sut_source,
+                input: InputModel::new(initial),
+                released_groups: Predicate::False,
+                released_all: false,
+                cache: BTreeSet::new(),
+                trace,
+            }
+        }
+
+        fn group_released(&self, key: u64) -> bool {
+            self.released_all || self.released_groups.contains(&Value::Int(group_of(key)))
+        }
+
+        /// The groups the rows held fall in, which a release names half the time.
+        fn groups_held(&self) -> BTreeSet<u64> {
+            self.cache.iter().map(|key| key % 3).collect()
+        }
+
+        fn apply(&mut self, step: Step) {
+            self.trace.push_str(&format!(" {step:?}"));
+            match step {
+                Add(key) => {
+                    if self.input.add(key) {
+                        self.sut_source.borrow_mut().rows.insert(key, group_of(key));
+                    }
+                }
+                Close => {
+                    self.input.closed = true;
+                    self.sut_source.borrow_mut().closed = true;
+                }
+                Notify(_) => unreachable!("a converse listens to no region"),
+                Consume(region) => {
+                    self.sut.consume_impl(InputId::ONLY, region.guard());
+                    let (answered, _) = self.input.pull(region);
+                    let kept: Vec<u64> = answered
+                        .into_iter()
+                        .filter(|key| !self.group_released(*key))
+                        .collect();
+                    self.cache.extend(kept);
+                }
+                Release(All) => {
+                    self.sut.release(universal());
+                    if !self.released_all {
+                        self.released_all = true;
+                        self.cache.clear();
+                        self.input.release(All);
+                    }
+                }
+                Release(Keys(first, last)) => {
+                    let named = predicate(&groups_guard(first as i64, last as i64));
+                    self.sut.release(groups_guard(first as i64, last as i64));
+                    if self.released_all || named.minus(&self.released_groups).is_false() {
+                        return;
+                    }
+                    self.released_groups = self.released_groups.union(&named);
+                    let dropped: BTreeSet<u64> = self
+                        .cache
+                        .iter()
+                        .copied()
+                        .filter(|key| self.group_released(*key))
+                        .collect();
+                    self.cache.retain(|key| !dropped.contains(key));
+                    self.input.release_keys(&dropped);
+                }
+            }
+        }
+
+        fn check(&mut self) {
+            let trace = &self.trace;
+            assert_eq!(
+                cached(&self.sut),
+                self.cache.iter().copied().collect::<Vec<_>>(),
+                "{trace}: the rows held"
+            );
+            if self.sut.consuming {
+                assert_eq!(
+                    groups(&self.sut.get(universal())),
+                    grouped(self.cache.iter().copied()),
+                    "{trace}: the groups offered"
+                );
+            }
+            self.input.check(&self.sut_source, trace);
+            if self.input.drained() {
+                let guard = self.sut.finalize();
+                match self.released_all {
+                    true => assert_eq!(guard, out_tiling().empty_guard(), "{trace}: finalize"),
+                    false => {
+                        let expected = Predicate::True.minus(&self.released_groups);
+                        assert!(
+                            same_region(&predicate(&guard), &expected),
+                            "{trace}: finalize is {guard:?}, not {expected:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        fn finish(&mut self) {
+            if !self.input.closed {
+                self.apply(Close);
+            }
+            self.apply(Consume(All));
+            self.check();
+            // A converse in pull mode over exactly the rows held offers what the consuming one
+            // does.
+            let twin_source = rows_source(self.cache.iter().copied());
+            let mut twin = converse_over(&twin_source);
+            // Rows keep the order they arrived in, so the answers are compared as groups.
+            assert_eq!(
+                groups(&self.sut.get(universal())),
+                groups(&twin.get(universal())),
+                "{}: the answer in pull mode",
+                self.trace
+            );
+        }
+
+        fn run(steps: &[Step], initial: &[u64]) {
+            let mut run = Run::new(initial, format!("initial {initial:?} steps"));
+            for step in steps {
+                run.apply(*step);
+                run.check();
+            }
+            run.finish();
+        }
+    }
+
+    #[test]
+    fn enumerated_interleavings_keep_the_model() {
+        let sequences: &[&[Step]] = &[
+            &[Consume(Keys(0, 3)), Add(3), Add(8), Consume(Keys(0, 11))],
+            &[
+                Consume(Keys(0, 3)),
+                Release(Keys(1, 1)),
+                Add(7),
+                Consume(Keys(4, 11)),
+            ],
+            &[
+                Release(Keys(2, 2)),
+                Add(5),
+                Add(6),
+                Close,
+                Consume(Keys(4, 8)),
+            ],
+            &[
+                Consume(Keys(0, 5)),
+                Consume(Keys(3, 8)),
+                Release(Keys(0, 0)),
+                Close,
+                Consume(All),
+            ],
+            &[Release(All), Add(3), Consume(All)],
+            &[Close, Consume(All), Release(Keys(1, 2))],
+        ];
+        for steps in sequences {
+            Run::run(steps, &[0, 1, 2, 4, 5, 6]);
+        }
+    }
+
+    #[test]
+    fn random_interleavings_keep_the_model() {
+        const SEED: u64 = 0xa54f_f53a_5f1d_36f1;
+        let mut rng = Rng(SEED);
+        for iteration in 0..300 {
+            let initial: Vec<u64> = (0..KEYS).filter(|_| rng.below(2) == 0).collect();
+            let trace = format!("seed {SEED:#x} iteration {iteration} initial {initial:?} steps");
+            let mut run = Run::new(&initial, trace);
+            for _ in 0..12 {
+                let step = rng.step_among(&run.groups_held(), false);
+                run.apply(step);
+                run.check();
+            }
+            run.finish();
+        }
     }
 }

@@ -755,16 +755,20 @@ breaker that also answers pulls from that state is a producer: `BreakingProducer
 | `pushes_while_consuming()` | Whether what `held()` names after a consume is final, so a driver may push it before the breaker's pipeline finishes. The default answers `true`. |
 | `offer_impl(guard)` | Answers from the state `consume_impl` built and pulls nothing. The breaker's own `get_impl` calls it once the breaker is consuming. |
 
-`Memo`, `Aggregate`, `ExtractAggregate` and `MapAggregate` are breakers. A breaker starts in the
-pull mode described in [The producer protocol](#the-producer-protocol) and is a consuming producer
-from its first `consume_impl`, which it stays. `finalize` is provided over two accessors, `input()`
-and `held()`: it asserts that the input has been released whole and returns `held()` less the guard
-released to the breaker. A release removes rows from the state and leaves the statement of the tile
-as it was, so the difference is taken in the guard algebra. `guard_minus` (`tile_operators/mod.rs`)
-spells it for guards of a collection's outermost keys, of a scalar and of an aggregation, none of
-them qualified by an enclosing path, and for a record of such guards field by field. Two guards of a
-collection's keys at any levels differ as their projections do. A state of another shape has no
-spelling, and `finalize` panics naming the gap instead of answering a smaller or larger region.
+`Memo`, `Aggregate`, `ExtractAggregate`, `MapAggregate` and `Converse` are breakers. A breaker
+starts in the pull mode described in [The producer protocol](#the-producer-protocol) and is a
+consuming producer from its first `consume_impl`, which it stays. `finalize` is provided over two
+accessors, `input()` and `held()`: it asserts that the input has been released whole and returns
+`held()` less the guard released to the breaker. A release removes rows from the state and leaves
+the statement of the tile as it was, so the difference is taken in the guard algebra. `guard_minus`
+(`tile_operators/mod.rs`) spells it for guards of a collection's outermost keys, of a scalar and of
+an aggregation, none of them qualified by an enclosing path, and for a record of such guards field
+by field. Two guards of a collection's keys at any levels differ as their projections do. A state of
+another shape has no spelling, and `finalize` panics naming the gap instead of answering a smaller
+or larger region.
+
+Nothing outside unit tests calls `consume_impl`, `finalize` or `pushes_while_consuming`: no
+scheduler runs pipelines, and how a driver reaches a breaker from a program's roots is not decided.
 
 ### Memo
 
@@ -807,8 +811,31 @@ input, as in pull mode. It holds groups beneath their keys, and what a release b
 is a region beneath the outermost keys. A reader's chain may restate only the outermost keys
 (`TileProducer::restates`), so it answers `pushes_while_consuming` with `false`.
 
-Nothing outside unit tests calls `consume_impl`, `finalize` or `pushes_while_consuming`: no
-scheduler runs pipelines, and how a driver reaches a breaker from a program's roots is not decided.
+### Converse
+
+A consuming `Converse` holds the input rows it merged, because which rows share a value is known
+only once the rows are read, and builds the groups from them on each offer. Beneath standing levels
+it holds each enclosing row's input rows under that row's path and inverts each row's rows on their
+own, as pull mode does. A group is final once the input has been released whole. A row whose group
+the consumer already released is dropped when it is merged, and a release of a group removes its
+rows and forwards to the input as in pull mode. The members of a group keep the order the rows
+arrived in, where a pull in pull mode orders them by key. `finalize` returns the guard of the groups
+built from the held rows, less the guard released. The groups sit beneath their keys, and what a
+release beneath them leaves is a region beneath the outermost keys. A reader's chain may restate
+only the outermost keys (`TileProducer::restates`), so a `Converse` answers
+`pushes_while_consuming` with `false`.
+
+#### A release of a converse group
+
+A release of a `Converse` names its output region exactly. Upstream it is forwarded in two parts:
+the held input rows the region covers at once, and each later row of a released group on the read
+that first holds it (`ConverseProducer::release_late_rows`). An input guard names rows by key, and
+a group is the rows whose value is the group's key, so no input guard names a group before its rows
+are read. The two parts together release exactly the region named, as
+[Guard operations are exact](#guard-operations-are-exact) requires. In consuming mode no held input
+row stands in a released group once a consume returns; `finalize` checks this in a debug build by
+removing the released region from the groups the held rows build
+(`ConverseProducer::debug_assert_released_groups_freed`).
 
 ## Tile Operators
 
@@ -1283,9 +1310,11 @@ collection, and op-conversion pairs each row with `𝐹`'s collection for it, `�
 (`src/ccl/design/type-inference.md`, "Iterating a dependent tuple"). A group-by under a loop whose
 key reads the loop's binder has `𝐹 = 𝑀 ≫ converse ≫ map_domain`, the keys of the collection
 `𝑀` builds per row, and `converse` and `map_domain` act at that level, one row's collection at a
-time. A nested `Converse` releases the rows a standing level's guard names and fails loudly on a
-guard naming part of one row's inversion: which input rows that names depends on their values,
-which only the outermost `Converse` tracks.
+time. A nested `Converse` passes a guard naming standing keys to its input as those keys. A guard
+naming part of one row's inversion names input rows through their values, so the `Converse` records
+each input row it read with the output path `[𝑠…, value, key]` it stands at and its input path
+`[𝑠…, key]`, and releases the input rows whose output path the guard covers. A row read after its
+group was released is released on the read that holds it (`ConverseProducer::release_late_rows`).
 
 [`CheckedLookup`] gains a second reading from this, as a consumer now meeting a per-row
 stream: it answers a group of keys per row, keeping the grouping — one answer per key, where
