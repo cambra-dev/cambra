@@ -668,6 +668,67 @@ mod breakers {
         assert_eq!(pulled(&log), [0, 1, 2, 3, 4, 5, 6, 7]);
     }
 
+    /// An aggregate in sink mode swallows what its input notifies, states its result terminal at the
+    /// terminal round only, and wakes its consumer from that round.
+    #[test]
+    fn a_sinking_aggregate_is_terminal_and_notifies_at_the_terminal_round_only() {
+        use crate::ccl::AggregateKind;
+        use crate::interpreter::tile_operators::test_helpers::{
+            NotifyingOp, ints_by_position, keys_between, notify_input,
+        };
+        use crate::interpreter::tile_operators::{Aggregate, TileOperator};
+        use crate::interpreter::{BaseType, Extent, Projection};
+        let tiling = Tiling::data_function(
+            Extent::uint_range(8),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let values: Vec<i64> = (0..8).collect();
+        let (input, notifier) = NotifyingOp::new(ints_by_position(&values, true), tiling.clone());
+        let mut sum = Aggregate::new(Box::new(input), AggregateKind::Sum);
+        let mut scheduler = Scheduler::new();
+        let woken = Arc::new(Mutex::new(0usize));
+        let counter = woken.clone();
+        let mut producer = sum.subscribe(
+            sum.tiling().empty_guard(),
+            Box::new(move || *counter.lock_now() += 1),
+            &mut scheduler,
+        );
+        let handle = scheduler
+            .breaker(sum.operator_id().expect("an identity"))
+            .expect("registered");
+        handle.begin_sinking();
+        notify_input(
+            &notifier,
+            &Projection::of(&keys_between(0, 3)).expect("keys"),
+        );
+        assert_eq!(
+            *woken.lock_now(),
+            0,
+            "the input's notification is swallowed"
+        );
+
+        let arrivals = Arrivals::new();
+        let dispatcher = Dispatcher::new(vec![arrivals.spec(Some(handle))], 2);
+        let mut state = dispatcher.serve_state();
+        arrivals.deliver(&dispatcher, 0, 0, 7);
+        serve(&dispatcher, &mut state);
+        assert_eq!(*woken.lock_now(), 0, "a round before the end wakes nobody");
+        let universal = sum.tiling().universal_guard();
+        assert!(!producer.get(universal.clone()).is_terminal());
+        dispatcher.close(PipelineId(0));
+        serve(&dispatcher, &mut state);
+        assert_eq!(*woken.lock_now(), 1, "the terminal round woke the consumer");
+        let tile = producer.get(universal);
+        assert!(tile.is_terminal());
+        let Tile::Aggregation { accumulator, .. } = tile else {
+            panic!("an aggregation")
+        };
+        assert_eq!(
+            *accumulator,
+            Tile::Scalar(ColumnValue::Ints(vec![28]))
+        );
+    }
+
     /// The keys a memo adopted from its pull-mode cache reach the parent although no morsel is
     /// delivered and the source stays open: the memo's first round pushes them.
     #[test]

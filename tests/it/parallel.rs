@@ -175,7 +175,10 @@ fn the_plan_reads_the_fold_off_the_extract() {
     let compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
     let plan = plan_inline(&compiled.operator_graph).expect("a fold is a breaker the pool runs");
     assert_eq!(plan.pipeline_count(), 1);
-    let BreakerKind::Fold { kind, accumulator } = plan.main_breaker() else {
+    let BreakerKind::Fold {
+        kind, accumulator, ..
+    } = plan.main_breaker()
+    else {
         panic!("a fold, not the sink");
     };
     assert_eq!(*kind, AggregateKind::Sum);

@@ -848,4 +848,37 @@ mod inline {
         drop(ctx);
         assert_eq!(source.lock_wait().release_records(), 0);
     }
+
+    /// A fold into `main` over a live source states its result terminal when the source's arrivals
+    /// have ended, and its value is the serial loop's.
+    #[test]
+    fn a_fold_over_a_live_source_is_terminal_when_the_source_ends() {
+        let (mut ctx, mut program, source) = over_source1("sum([x for x in source1()])");
+        let config = Config { morsel_rows: 2 };
+        let mut run = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
+            .unwrap_or_else(|why| panic!("{why}"));
+        let mut main = run.take_main().expect("a main output");
+        let universal = main.tiling().universal_guard();
+        for (arrived, upto) in [(0..3, 2), (3..5, 4)] {
+            arrive(&source, arrived);
+            source
+                .lock_wait()
+                .set_yield_predicate(Predicate::at_or_below(Value::UInt(upto)));
+            ctx.scheduler().check_for_notifications();
+            for _ in 0..4 {
+                run.lap();
+            }
+            assert!(
+                !main.get(universal.clone()).is_terminal(),
+                "the source can still deliver"
+            );
+        }
+        source.lock_wait().set_yield_predicate(Predicate::True);
+        let tile = drive(&mut ctx, &mut run, &mut *main, 100);
+        assert!(tile.is_terminal());
+        let Tile::Scalar(ColumnValue::Ints(sum)) = tile else {
+            panic!("a scalar sum")
+        };
+        assert_eq!(sum, [100]);
+    }
 }

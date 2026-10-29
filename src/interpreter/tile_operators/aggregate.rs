@@ -8,7 +8,10 @@ use crate::interpreter::nest_levels;
 use crate::interpreter::operator_graph::value;
 use crate::{
     ccl::AggregateKind,
-    interpreter::{ColumnValue, Consumer, Projection, Scheduler, Value},
+    interpreter::{
+        ColumnValue, Consumer, FunctionGuard, GatedConsumer, Predicate, Projection, Scheduler,
+        Value, forwarding_consumer, shared_consumer,
+    },
 };
 
 /// Reduces a `DataFunction` input to a single scalar via an aggregation operation.
@@ -59,44 +62,127 @@ impl TileOperator for Aggregate {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        // TODO(pipeline breaker): a pooled chain stops notifying at this operator. The region of
-        // its input ends here, and the breaker raises its own region to the dispatcher once a
-        // worker has merged a morsel (`docs/parallel-execution.md`, "Pipeline boundaries"). The
-        // serial scheduler still needs the notification passed on below.
+        let arrivals = Arrivals::new();
+        let (consumer, gate) = shared_consumer(consumer);
         let input_producer = self.input.subscribe(
             self.input.tiling().universal_guard(),
-            widening(consumer),
+            arrivals.consumer(forwarding_consumer(&consumer)),
             scheduler,
         );
-        Box::new(AggregateProducer::new(
+        let producer = AggregateProducer::new(
             ProducerBase::new(
                 AggregateProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .sharing(gate),
             input_producer,
-        ))
+            arrivals,
+            consumer,
+        );
+        if let Some(operator) = self.operator_id() {
+            scheduler.register_breaker(operator, &producer.breaker);
+        }
+        Box::new(producer)
     }
 }
 
-struct AggregateProducer {
-    base: ProducerBase,
+/// What an aggregate holds between pulls, shared by its producer and its breaker handle: the
+/// producer answers `get`, and the dispatcher drives the breaker. Execution is single-threaded, so
+/// the lock is never contended.
+struct AggregateState {
     /// The subscribed input producer.
     input: Box<dyn TileProducer>,
     /// The aggregation operation.
     kind: AggregateKind,
-    /// Running accumulation state; updated in place on each `get`.
+    /// Running accumulation state; updated in place on each `get` in pull mode and on each
+    /// `pull_sink` in sink mode.
     accumulator: Tile,
     /// Set once the consumer has released this output universally, after which
     /// the accumulator must never be handed back — it *is* the whole output, so
     /// re-emitting it returns released data.
     released: bool,
+    /// What the input notified since it was last read, which sink mode swallows.
+    arrivals: Arrivals,
+    /// The operator's own consumer, which `finalize` wakes on the terminal round.
+    consumer: GatedConsumer,
+    /// Whether the aggregate is in sink mode: the dispatcher pulls the input, and `get` never does.
+    sinking: bool,
+}
+
+impl AggregateState {
+    /// Fold `input_result`, an answer of the input, into the accumulator.
+    fn accumulate(&mut self, mut input_result: Tile) {
+        input_result.compact();
+        let Tile::DataFunction { codomain, .. } = input_result else {
+            panic!("Aggregate expected a collection, got {input_result:?}");
+        };
+        let values = *codomain;
+        let Tile::Aggregation {
+            ref mut accumulator,
+            ..
+        } = self.accumulator
+        else {
+            panic!("Accumulator must be Aggregation tile")
+        };
+        self.kind.accumulate(accumulator, &values, 0, values.rows());
+    }
+
+    /// State whether the accumulator is the whole result.
+    fn set_terminal(&mut self, is_terminal: bool) {
+        let Tile::Aggregation {
+            terminal: ColumnValue::Bools(ref mut terminal),
+            ..
+        } = self.accumulator
+        else {
+            panic!("Accumulator must be Aggregation tile")
+        };
+        terminal[0] = is_terminal;
+    }
+
+    /// What `get` answers: the accumulator, or nothing while an extreme has no first element,
+    /// which an empty `terminal` says to [`ExtractAggregate`], however many pulls come first.
+    fn answer(&mut self, is_terminal: bool, empty: Tile) -> Tile {
+        let Tile::Aggregation {
+            ref accumulator, ..
+        } = self.accumulator
+        else {
+            panic!("Accumulator must be Aggregation tile")
+        };
+        if self.kind.awaits_first_element(accumulator) {
+            if is_terminal {
+                self.kind.no_extreme_of_nothing();
+            }
+            return empty;
+        }
+        self.accumulator.clone()
+    }
+}
+
+struct AggregateBreaker {
+    // shared-state-ok: the aggregate's own state, shared between its producer and its breaker on
+    // the dispatcher's one thread; no tile passes between operators through it.
+    state: Arc<Mutex<AggregateState>>,
+}
+
+struct AggregateProducer {
+    base: ProducerBase,
+    // shared-state-ok: the aggregate's own state, shared with its breaker as `AggregateBreaker`
+    // says.
+    state: Arc<Mutex<AggregateState>>,
+    /// The handle the scheduler's registry holds weakly; the producer owns the state it reaches.
+    breaker: BreakerHandle,
 }
 
 impl AggregateProducer {
     /// Construct an `AggregateProducer`, seeding the accumulator with the identity element.
-    fn new(base: ProducerBase, input: Box<dyn TileProducer>) -> Self {
+    fn new(
+        base: ProducerBase,
+        input: Box<dyn TileProducer>,
+        arrivals: Arrivals,
+        consumer: GatedConsumer,
+    ) -> Self {
         let (kind, accumulator) = match &base.tiling {
             Tiling::Aggregation {
                 kind,
@@ -111,29 +197,113 @@ impl AggregateProducer {
             ),
             other => panic!("AggregateProducer created with non-Aggregation tiling: {other:?}"),
         };
-        Self {
-            base,
+        let state = Arc::new(Mutex::new(AggregateState {
             input,
             kind,
             accumulator,
             released: false,
+            arrivals,
+            consumer,
+            sinking: false,
+        }));
+        Self {
+            base,
+            breaker: Arc::new(AggregateBreaker {
+                state: state.clone(),
+            }),
+            state,
         }
+    }
+
+    /// A producer over `input` with no consumer to wake, for a test.
+    #[cfg(test)]
+    fn detached(base: ProducerBase, input: Box<dyn TileProducer>) -> Self {
+        let (consumer, _) = shared_consumer(Box::new(|| {}));
+        Self::new(base, input, Arrivals::new(), consumer)
+    }
+}
+
+impl Breaker for AggregateBreaker {
+    /// Adopts the accumulator the aggregate holds: what pull mode folded stays folded, and the
+    /// input released it.
+    fn begin_sinking(&self) {
+        let mut state = self.state.lock_now();
+        assert!(!state.sinking, "an aggregate begins sinking once");
+        state.sinking = true;
+        // What the input notifies from here is not the downstream's business: it learns of the
+        // result from `finalize`, on the terminal round.
+        state.arrivals.swallow();
+    }
+
+    /// Pulls the input at `guard`, folds the answer into the accumulator, and releases the input at
+    /// the guard: the answer states the whole guard complete, so the input keeps nothing of it.
+    fn pull_sink(&self, guard: TileGuard) {
+        let mut state = self.state.lock_now();
+        let st = &mut *state;
+        assert!(st.sinking, "an aggregate is pulled after it begins sinking");
+        if st.released || guard.is_empty() {
+            return;
+        }
+        let input = st.input.get(guard.clone());
+        debug_assert!(
+            match (&input, &guard) {
+                (
+                    Tile::DataFunction {
+                        domain_predicate, ..
+                    },
+                    TileGuard::Function(FunctionGuard::Domain(region)),
+                ) => region.minus(domain_predicate).is_false(),
+                _ => true,
+            },
+            "the input answers a morsel complete over its guard: {input:?} for {guard:?}"
+        );
+        st.accumulate(input);
+        st.input.release(guard);
+    }
+
+    /// An aggregate has no parent pipeline to push keys to.
+    fn first_keys(&self, _region: &Predicate, _rows: u64) -> Vec<Value> {
+        Vec::new()
+    }
+
+    /// States the result complete on the terminal round and wakes the consumer. A round before it
+    /// changes nothing a reader acts on, since the extraction answers nothing until the result is
+    /// terminal.
+    fn finalize(&self, round: Round, _parents: &mut Pushes<'_>) {
+        if !round.terminal {
+            return;
+        }
+        let consumer = {
+            let mut state = self.state.lock_now();
+            assert!(
+                state.sinking,
+                "an aggregate finalizes after it begins sinking"
+            );
+            state.set_terminal(true);
+            state.consumer.clone()
+        };
+        consumer.notify(&Projection::Everything);
+    }
+
+    /// The accumulator has no keys.
+    fn held_keys(&self) -> usize {
+        0
     }
 }
 
 impl TileProducer for AggregateProducer {
     fn state_info(&self) -> ProducerStateInfo {
-        ProducerStateInfo::holding(self.accumulator.cell_count())
+        ProducerStateInfo::holding(self.state.lock_now().accumulator.cell_count())
     }
 
     impl_producer_base!();
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
-        visit("input", &*self.input);
+        visit("input", &*self.state.lock_now().input);
     }
 
-    /// An accumulator has no keys to project, so the projection is all of it or none. The
-    /// input is read whole whatever the consumer asks.
+    /// An accumulator has no keys to project, so the projection is all of it or none. In pull mode
+    /// the input is read whole whatever the consumer asks; in sink mode it is not read.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         match projection_guard.projection(&self.name()) {
             Projection::Everything => {}
@@ -143,43 +313,34 @@ impl TileProducer for AggregateProducer {
                 self.name()
             ),
         }
-        if self.released {
-            return self.tiling().empty_tile();
+        let empty = self.tiling().empty_tile();
+        let mut state = self.state.lock_now();
+        let st = &mut *state;
+        if st.released {
+            return empty;
         }
-        let i_tiling = self.input.tiling().clone();
-        let mut input_result = self.input.get(i_tiling.universal_guard());
+        if st.sinking {
+            drop(st.arrivals.take());
+            let terminal = matches!(
+                &st.accumulator,
+                Tile::Aggregation { terminal: ColumnValue::Bools(t), .. } if t[0]
+            );
+            return st.answer(terminal, empty);
+        }
+        drop(st.arrivals.take());
+        let i_tiling = st.input.tiling().clone();
+        let input_result = st.input.get(i_tiling.universal_guard());
         let upstream_guard = input_result.to_guard();
-        input_result.compact();
-        let Tile::DataFunction { codomain, .. } = input_result else {
-            panic!("Aggregate expected a collection, got {input_result:?}");
-        };
-        self.input.release(upstream_guard);
-        let values = *codomain;
+        st.accumulate(input_result);
+        st.input.release(upstream_guard);
 
-        let is_terminal = self.input.obsolete_guard().is_universal();
+        let is_terminal = st.input.obsolete_guard().is_universal();
         trace!(
             "Aggregate input is_terminal: {is_terminal} from guard {:?}",
-            self.input.obsolete_guard()
+            st.input.obsolete_guard()
         );
-        let Tile::Aggregation {
-            kind: _,
-            ref mut accumulator,
-            terminal: ColumnValue::Bools(ref mut terminal),
-        } = self.accumulator
-        else {
-            panic!("Accumulator must be Aggregation tile")
-        };
-        self.kind.accumulate(accumulator, &values, 0, values.rows());
-        terminal[0] = is_terminal;
-        // An extreme with no identity has no value until its first element: an empty
-        // `terminal` says so ([`ExtractAggregate`]), however many pulls come first.
-        if self.kind.awaits_first_element(accumulator) {
-            if is_terminal {
-                self.kind.no_extreme_of_nothing();
-            }
-            return self.tiling().empty_tile();
-        }
-        self.accumulator.clone()
+        st.set_terminal(is_terminal);
+        st.answer(is_terminal, empty)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -190,8 +351,10 @@ impl TileProducer for AggregateProducer {
         // — this aggregate being done before its source ran dry — would stay
         // stranded upstream.
         if obsolete_guard.expect_universal_or_empty(&self.name()) {
-            self.released = true;
-            self.input.release(self.input.tiling().universal_guard());
+            let mut state = self.state.lock_now();
+            state.released = true;
+            let universal = state.input.tiling().universal_guard();
+            state.input.release(universal);
         }
     }
 }
@@ -932,7 +1095,7 @@ mod tests {
             kind: AggregateKind::Sum,
             accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
         };
-        let mut producer = AggregateProducer::new(
+        let mut producer = AggregateProducer::detached(
             ProducerBase::unowned(AggregateProducer::alloc_id(), &tiling),
             Box::new(spy),
         );
@@ -968,7 +1131,7 @@ mod tests {
             kind: AggregateKind::Sum,
             accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
         };
-        let mut producer = AggregateProducer::new(
+        let mut producer = AggregateProducer::detached(
             ProducerBase::unowned(AggregateProducer::alloc_id(), &tiling),
             Box::new(spy),
         );
@@ -1273,7 +1436,7 @@ mod aggregate_projection_tests {
             accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
         };
         (
-            AggregateProducer::new(
+            AggregateProducer::detached(
                 ProducerBase::unowned(AggregateProducer::alloc_id(), &tiling),
                 Box::new(stream),
             ),
@@ -1354,6 +1517,89 @@ mod aggregate_projection_tests {
     }
 
     /// The fold reads the whole stream, and what it answers is one terminal accumulator.
+    /// The sum of `tile`, an aggregation, and whether it states itself terminal.
+    fn sum_and_terminal(tile: Tile) -> (i64, bool) {
+        let Tile::Aggregation {
+            accumulator,
+            terminal,
+            ..
+        } = tile
+        else {
+            panic!("an aggregation, got {tile:?}")
+        };
+        let Tile::Scalar(ColumnValue::Ints(sum)) = *accumulator else {
+            panic!("an int accumulator")
+        };
+        let ColumnValue::Bools(terminal) = terminal else {
+            panic!("a terminal flag")
+        };
+        (sum[0], terminal[0])
+    }
+
+    /// A sum over `[1, 2, 3, 4]` with the input's pulls and releases logged.
+    fn sum_of_stream() -> (AggregateProducer, GuardLog, GuardLog) {
+        let in_tiling = Tiling::data_function(
+            Extent::uint_range(4),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let (stream, pulled, released) =
+            ProjectionSpy::new(ints_by_position(&[1, 2, 3, 4], true), in_tiling);
+        let tiling = Tiling::Aggregation {
+            kind: AggregateKind::Sum,
+            accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+        };
+        (
+            AggregateProducer::detached(
+                ProducerBase::unowned(AggregateProducer::alloc_id(), &tiling),
+                Box::new(stream),
+            ),
+            pulled,
+            released,
+        )
+    }
+
+    /// A sinking aggregate folds the morsels it is pulled at, in any order, to the sum a pulling
+    /// one reads whole, and states the result terminal only on the terminal round.
+    #[test]
+    fn a_sinking_aggregate_folds_morsels_as_a_pulling_one_does() {
+        let (mut sum, _, _) = sum_of_stream();
+        sum.breaker.begin_sinking();
+        for morsel in [keys_between(3, 3), keys_between(0, 1), keys_between(2, 2)] {
+            sum.breaker.pull_sink(morsel);
+        }
+        let (total, terminal) = sum_and_terminal(sum.get(sum.tiling().universal_guard()));
+        assert_eq!(total, 10);
+        assert!(!terminal, "a result is terminal at the terminal round only");
+    }
+
+    /// A sinking aggregate never pulls its input from `get`, and releases the input at each morsel.
+    #[test]
+    fn a_sinking_aggregate_never_pulls_its_input_from_get() {
+        let (mut sum, pulled, released) = sum_of_stream();
+        sum.breaker.begin_sinking();
+        sum.get(sum.tiling().universal_guard());
+        assert!(pulled.lock_now().is_empty(), "get reads local state");
+        sum.breaker.pull_sink(keys_between(0, 1));
+        assert_eq!(*released.lock_now(), [keys_between(0, 1)]);
+        sum.breaker.pull_sink(keys_between(0, 1));
+        let (total, _) = sum_and_terminal(sum.get(sum.tiling().universal_guard()));
+        assert_eq!(total, 3, "a morsel pulled again adds nothing");
+    }
+
+    /// The accumulator a pulling aggregate holds is adopted at the switch.
+    #[test]
+    fn the_switch_to_sink_mode_adopts_the_accumulator() {
+        let (mut sum, _, _) = sum_of_stream();
+        sum.get(sum.tiling().universal_guard());
+        sum.breaker.begin_sinking();
+        let (total, terminal) = sum_and_terminal(sum.get(sum.tiling().universal_guard()));
+        assert_eq!(
+            (total, terminal),
+            (10, true),
+            "what pull mode folded is kept"
+        );
+    }
+
     #[test]
     fn a_sum_reads_the_whole_stream() {
         let (mut sum, pulled) = sum_of_finished_stream();

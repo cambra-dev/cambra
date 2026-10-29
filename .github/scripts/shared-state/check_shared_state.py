@@ -97,11 +97,6 @@ EXPECTED_EXCEPTIONS = [
     # only through `BreakerOutput`'s `get`.
     ("src/interpreter/breaker.rs", "cell of `State`"),
     ("src/interpreter/breaker.rs", "cell of `Vec<Box<dyn Consumer>>`"),
-    # An inline run's fold (`parallel.rs`): the partials are shared with the pipeline's `finalize`,
-    # which combines them once every worker has left, and the answer is set once and read by the
-    # producer that answers `main`. Both are the breaker's own state, as the collector is.
-    ("src/interpreter/parallel.rs", "shared cell of `Vec<Tile>`"),
-    ("src/interpreter/parallel.rs", "cell of `Option<Tile>`"),
     # A sink's own consumer (`parallel.rs`, `SinkChain` and `start_planned`): the pool installs a
     # producer in it and it schedules the sink's pull, and no tile passes through it between
     # operators.
@@ -112,6 +107,10 @@ EXPECTED_EXCEPTIONS = [
     # the producer also owns, reaches it. Both are used on the dispatcher's one thread.
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `MemoState`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `MemoState`"),
+    # An aggregate's state (`aggregate.rs`, `AggregateState`), shared by its producer and its
+    # breaker as a memo's is.
+    ("src/interpreter/tile_operators/aggregate.rs", "shared cell of `AggregateState`"),
+    ("src/interpreter/tile_operators/aggregate.rs", "shared cell of `AggregateState`"),
     ("src/interpreter/parallel.rs", "cell of `Rounds`"),
     ("src/interpreter/parallel.rs", "shared cell of `SinkConsumer`"),
     # The pool's breakers: the collection the driver merges into, and the fold's partial

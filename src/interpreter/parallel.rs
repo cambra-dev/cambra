@@ -23,12 +23,10 @@ use crate::{
         operator_graph::{EdgeKind, EdgeRole, GraphNode, OperatorGraph},
         sinks::SinkConsumer,
         tile_operators::{
-            BreakerHandle, BreakerOutput, Claim, LiveSource, MorselSource, OperatorBase,
-            ProducerBase, Round, Sunk, TileOperator, TileProducer, impl_producer_base,
+            BreakerHandle, BreakerOutput, Claim, LiveSource, MorselSource, Round, Sunk,
+            TileOperator, TileProducer,
         },
     },
-    pretty_graph::VizOptions,
-    pretty_tree::InspectNode,
 };
 
 /// How many rows a morsel holds.
@@ -131,17 +129,32 @@ pub(crate) struct PipelinePlan {
     pub(crate) drops_keys: bool,
 }
 
+impl BreakerKind {
+    /// The operator whose producer is the breaker of the pipeline, for a pipeline the dispatcher
+    /// runs through the [`Breaker`] interface.
+    pub(crate) fn node(&self) -> Option<NodeId> {
+        match self {
+            BreakerKind::Collect => None,
+            BreakerKind::Fold { aggregate, .. } => Some(*aggregate),
+            BreakerKind::Materialize { memo } => Some(*memo),
+        }
+    }
+}
+
 /// The breaker a morsel pipeline ends in: what the pool keeps between morsels, and how it
 /// answers the `main` output.
 pub enum BreakerKind {
     /// The `main` sink itself: the collection, merged morsel by morsel.
     Collect,
-    /// An `Aggregate` read by an `ExtractAggregate` into `main`: a fold the pool keeps as one
-    /// accumulator per worker and combines once every morsel is folded.
+    /// An `Aggregate` read by an `ExtractAggregate` into `main`: the aggregate's own producer,
+    /// switched to sink mode, is the breaker of the pipeline, and `main` stays the program's own
+    /// producer.
     Fold {
         kind: AggregateKind,
-        /// The accumulator's tiling, which seeds each worker's partial.
+        /// The accumulator's tiling.
         accumulator: Tiling,
+        /// The `Aggregate` the pipeline ends in.
+        aggregate: NodeId,
     },
     /// The input of a `Memo`: the rows the pipelines that read it stream from.
     Materialize {
@@ -289,6 +302,7 @@ impl Planner<'_> {
             let fold = BreakerKind::Fold {
                 kind: *kind,
                 accumulator: (**accumulator).clone(),
+                aggregate: edge.subscribed,
             };
             return (fold, fold_edge.subscribed);
         }
@@ -983,20 +997,6 @@ enum PoolBreaker {
         // reads it: it answers `main` once every worker has returned.
         collector: Mutex<Tile>,
     },
-    /// A fold: each worker folds its morsels into a partial of its own and hands the partial
-    /// in once, so nothing is shared on the morsel path.
-    Fold {
-        kind: AggregateKind,
-        seed: Tile,
-        // shared-state-ok: the breaker's own state, standing where the sink's cell stands for
-        // a collection. A worker hands its partial in once, after its last morsel, and no
-        // operator reads it: the combine runs after every worker has returned and answers
-        // `main`.
-        partials: Arc<Mutex<Vec<Tile>>>,
-        /// Where an inline run leaves the combined answer when the pipeline finishes, for the
-        /// producer that answers `main` to read; a threaded run combines at the end.
-        result: Option<Arc<FoldedResult>>,
-    },
     /// The rows a pipeline behind this one reads: each worker merges the morsel into the shared
     /// output and publishes its region, and the output is completed when the pipeline finishes.
     Materialize { output: Arc<Materialized> },
@@ -1011,42 +1011,16 @@ impl PoolBreaker {
                 let output = output.clone();
                 Some(Box::new(move || output.complete()))
             }
-            PoolBreaker::Fold {
-                kind,
-                seed,
-                partials,
-                result: Some(result),
-            } => {
-                let (kind, seed, partials, result) =
-                    (*kind, seed.clone(), partials.clone(), result.clone());
-                Some(Box::new(move || {
-                    result.set(fold_partials(kind, seed.clone(), &partials.lock_wait()))
-                }))
-            }
-            PoolBreaker::Collect { .. } | PoolBreaker::Fold { result: None, .. } => None,
+            PoolBreaker::Collect { .. } => None,
         }
     }
 }
 
-/// The partials of a fold combined into its seed, as `ExtractAggregate` emits them once the fold
-/// is terminal.
-fn fold_partials(kind: AggregateKind, seed: Tile, partials: &[Tile]) -> Tile {
-    let mut total = seed;
-    for partial in partials {
-        kind.accumulate(&mut total, partial, 0, partial.rows());
-    }
-    kind.extract(total)
-}
-
-/// One pool worker over the plan's pipelines: per pipeline its chain and the breaker the
-/// pipeline feeds, and for a fold the partial the worker folds into. `work` and `leave` index
-/// them by the package's pipeline.
+/// The pool's worker over the plan's pipelines: per pipeline its chain and the breaker the
+/// pipeline feeds. `work` and `leave` index them by the package's pipeline.
 struct MainWorker<'a> {
     chains: &'a mut [Box<dyn TileProducer>],
     breakers: &'a [PoolBreaker],
-    /// Per pipeline, the partial of a fold, borrowed from the run so that a panic in `work` leaves
-    /// them where they were.
-    partials: &'a mut Vec<Option<Tile>>,
     /// The morsels this worker has run since it was made: a lap makes one, so this counts the
     /// lap's.
     worked: usize,
@@ -1060,29 +1034,9 @@ impl PoolWorker for MainWorker<'_> {
         self.worked += 1;
         let chain = &mut self.chains[pipeline];
         let mut tile = chain.get(package.guard.clone());
-        match (&self.breakers[pipeline], &mut self.partials[pipeline]) {
-            (PoolBreaker::Collect { collector }, _) => collector.lock_wait().merge(tile),
-            (PoolBreaker::Fold { kind, .. }, Some(partial)) => {
-                // What `AggregateProducer` folds: the values under the keys, deleted rows
-                // compacted away.
-                tile.compact();
-                let Tile::DataFunction {
-                    domain, codomain, ..
-                } = tile
-                else {
-                    panic!("a fold's input is a collection, got {tile:?}");
-                };
-                // A collection's merge rejects a key answered outside its morsel or twice;
-                // a fold would count it silently, so the check is made here.
-                debug_assert!(
-                    (0..domain.len()).all(|row| package.guard.covers_path(&[domain.index_at(row)])),
-                    "a morsel's chain answers keys inside the morsel only, got {domain:?} for {:?}",
-                    package.guard
-                );
-                kind.accumulate(partial, &codomain, 0, codomain.rows());
-            }
-            (PoolBreaker::Fold { .. }, None) => unreachable!("a fold worker holds a partial"),
-            (PoolBreaker::Materialize { output }, _) => {
+        match &self.breakers[pipeline] {
+            PoolBreaker::Collect { collector } => collector.lock_wait().merge(tile),
+            PoolBreaker::Materialize { output } => {
                 // The rows are readable before the region is published, and the region is the
                 // morsel's: a key the chain filtered out is in it and has no row.
                 tile.compact();
@@ -1096,14 +1050,7 @@ impl PoolWorker for MainWorker<'_> {
         chain.release(package.guard.clone());
     }
 
-    /// A fold worker hands its partial in once, after its last morsel.
-    fn leave(&mut self, pipeline: PipelineId) {
-        if let (PoolBreaker::Fold { partials, .. }, Some(partial)) =
-            (&self.breakers[pipeline.0], self.partials[pipeline.0].take())
-        {
-            partials.lock_wait().push(partial);
-        }
-    }
+    fn leave(&mut self, _pipeline: PipelineId) {}
 }
 
 /// A pipeline of a plan, by its position in the plan.
@@ -1855,56 +1802,6 @@ impl Drop for FailOnUnwind<'_> {
     }
 }
 
-/// Where an inline run's fold leaves its answer, and the consumer that answers `main` to wake.
-struct FoldedResult {
-    // shared-state-ok: the fold's combined answer, set once when its pipeline finishes and read
-    // by the producer that answers `main`.
-    tile: Mutex<Option<Tile>>,
-    // shared-state-ok: the consumer of `main`, woken when the answer is set. It holds no tile.
-    consumer: Mutex<Box<dyn Consumer>>,
-}
-
-impl FoldedResult {
-    fn new(consumer: Box<dyn Consumer>) -> Arc<Self> {
-        Arc::new(Self {
-            tile: Mutex::new(None),
-            consumer: Mutex::new(consumer),
-        })
-    }
-
-    /// Leave the answer and wake the consumer of `main`.
-    fn set(&self, tile: Tile) {
-        *self.tile.lock_wait() = Some(tile);
-        self.consumer.lock_wait().notify(&Projection::Everything);
-    }
-}
-
-/// The producer that answers `main` for a fold of an inline run: nothing before the fold finishes,
-/// then its answer until it is released.
-struct FoldedResultProducer {
-    base: ProducerBase,
-    result: Arc<FoldedResult>,
-}
-
-impl TileProducer for FoldedResultProducer {
-    impl_producer_base!();
-
-    fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
-        node
-    }
-
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        match self.result.tile.lock_wait().clone() {
-            Some(tile) => tile,
-            None => self.tiling().empty_tile(),
-        }
-    }
-
-    fn release_impl(&mut self, _obsolete_guard: TileGuard) {
-        *self.result.tile.lock_wait() = None;
-    }
-}
-
 /// What one [`PooledRun::lap`] did.
 #[derive(PartialEq, Debug)]
 pub enum Lap {
@@ -1931,7 +1828,6 @@ pub struct PooledRun {
     chains: Vec<Box<dyn TileProducer>>,
     dispatcher: Arc<Dispatcher>,
     breakers: Vec<PoolBreaker>,
-    partials: Vec<Option<Tile>>,
     state: ServeState,
     /// The sources of the pipelines that read one and whose arrivals have not ended, with what
     /// delivers to them. A lap closes one that says it is complete.
@@ -1951,9 +1847,10 @@ struct OpenSource {
     poll: bool,
 }
 
-/// The memos a run switches to sink mode: each memo's breaker, its tiling and, for a memo whose
-/// pipeline reads a data source, the source its morsels are cut from.
-struct SunkMemos {
+/// The breakers a run switches to sink mode, by the node of the operator that is the breaker (a
+/// memo, or the aggregate of a fold): the breaker, the tiling of what its pipeline pulls and, for a
+/// pipeline that reads a data source, the source its morsels are cut from.
+struct SunkBreakers {
     handles: HashMap<NodeId, BreakerHandle>,
     tilings: HashMap<NodeId, Tiling>,
     sources: HashMap<NodeId, Arc<dyn MorselSource>>,
@@ -1969,47 +1866,72 @@ fn with_operator(op: &dyn TileOperator, id: NodeId, f: &mut dyn FnMut(&dyn TileO
 }
 
 /// What a run needs of each memo of `plan`, or why the program stays on the plain loop. Read before anything is dropped or switched.
-fn sunk_memos(
+fn sunk_breakers(
     scheduler: &Scheduler,
     program: &CompiledProgram,
     plan: &Plan,
-) -> Result<SunkMemos, Unsupported> {
-    let mut sunk = SunkMemos {
+) -> Result<SunkBreakers, Unsupported> {
+    let mut sunk = SunkBreakers {
         handles: HashMap::new(),
         tilings: HashMap::new(),
         sources: HashMap::new(),
     };
-    for pipeline in &plan.pipelines {
-        let BreakerKind::Materialize { memo } = &pipeline.breaker else {
-            continue;
-        };
-        let handle = scheduler.breaker(*memo).ok_or_else(|| {
-            Unsupported("a memo registered no breaker, or its producer is gone".into())
-        })?;
-        let tiling = program
+    let node_tiling = |wanted: &NodeId| {
+        program
             .operator_graph
             .nodes()
             .iter()
             .find_map(|node| match node {
-                GraphNode::Operator { id, tiling, .. } if id == memo => Some(tiling.clone()),
+                GraphNode::Operator { id, tiling, .. } if id == wanted => Some(tiling.clone()),
                 _ => None,
             })
-            .ok_or_else(|| Unsupported("a memo the graph holds no node for".into()))?;
-        if !matches!(tiling, Tiling::DataFunction { .. }) {
-            return Err(Unsupported("a memo that is not a collection".into()));
+            .ok_or_else(|| Unsupported("a breaker the graph holds no node for".into()))
+    };
+    for pipeline in &plan.pipelines {
+        let Some(node) = pipeline.breaker.node() else {
+            continue;
+        };
+        let handle = scheduler.breaker(node).ok_or_else(|| {
+            Unsupported("a breaker registered none, or its producer is gone".into())
+        })?;
+        // What the breaker's pipeline pulls: a memo's input has the memo's own tiling, and an
+        // aggregate's is its input's.
+        let pulled = match &pipeline.breaker {
+            BreakerKind::Materialize { .. } => node_tiling(&node)?,
+            BreakerKind::Fold { .. } => {
+                let mut input = None;
+                for graph_node in program.operator_graph.nodes() {
+                    if let GraphNode::Operator { id, inputs, .. } = graph_node
+                        && *id == node
+                        && let [edge] = inputs.as_slice()
+                    {
+                        input = Some(edge.subscribed);
+                    }
+                }
+                node_tiling(
+                    &input.ok_or_else(|| Unsupported("an aggregate without its input".into()))?,
+                )?
+            }
+            BreakerKind::Collect => unreachable!("a collecting pipeline has no node"),
+        };
+        if !matches!(pulled, Tiling::DataFunction { .. }) {
+            return Err(Unsupported(
+                "a breaker that does not pull a collection".into(),
+            ));
         }
         if pipeline.head == Head::Source {
             let mut found = None;
             for output in &program.outputs {
-                with_operator(&*output.op, *memo, &mut |memo_op| {
-                    memo_op.visit_inputs(&mut |edge| found = Some(source_of(edge.target)));
+                with_operator(&*output.op, node, &mut |breaker_op| {
+                    breaker_op.visit_inputs(&mut |edge| found = Some(source_of(edge.target)));
                 });
             }
-            let source = found.ok_or_else(|| Unsupported("a memo not in the graph".into()))??;
-            sunk.sources.insert(*memo, source);
+            let source =
+                found.ok_or_else(|| Unsupported("a breaker not in the graph".into()))??;
+            sunk.sources.insert(node, source);
         }
-        sunk.handles.insert(*memo, handle);
-        sunk.tilings.insert(*memo, tiling);
+        sunk.handles.insert(node, handle);
+        sunk.tilings.insert(node, pulled);
     }
     Ok(sunk)
 }
@@ -2042,7 +1964,7 @@ impl PooledRun {
                 )
             })
             .collect();
-        let sunk = sunk_memos(ctx.scheduler(), program, &plan)?;
+        let sunk = sunk_breakers(ctx.scheduler(), program, &plan)?;
         let (mut main, mut sinks) = (None, Vec::new());
         for output in program.outputs.iter_mut() {
             match output.is_main() {
@@ -2057,13 +1979,19 @@ impl PooledRun {
         // producers `compile_program` subscribed for the outputs go: they registered records that
         // release nothing, which a source would hold its reclaim at. `main`'s is in the output or
         // with the caller that moved it out to drive it, and a sink's is its consumer's.
+        let mut kept_main = None;
         if let Some(output) = main.as_mut() {
-            let dropped = main_producer.take().or_else(|| output.producer.take());
+            let producer = main_producer.take().or_else(|| output.producer.take());
             debug_assert!(
-                dropped.is_some(),
-                "the pool drops the producer that held the pipeline's record"
+                producer.is_some(),
+                "the pool takes the producer that held the pipeline's record"
             );
-            drop(dropped);
+            // A fold's pipeline ends in the aggregate's own producer, so `main`'s producer stays
+            // the program's; any other `main` is answered from the pool's output.
+            match plan.main().breaker {
+                BreakerKind::Fold { .. } => kept_main = producer,
+                _ => drop(producer),
+            }
         }
         for output in &sinks {
             let consumer = output
@@ -2101,6 +2029,7 @@ impl PooledRun {
                     config,
                     inherited: &inherited,
                     sunk: &sunk,
+                    kept_main: kept_main.take(),
                 },
             ));
         };
@@ -2110,11 +2039,7 @@ impl PooledRun {
                 let tiling = output.op.tiling().clone();
                 match plan.main().breaker {
                     BreakerKind::Collect => start_chain(Some((&mut output.op, tiling))),
-                    BreakerKind::Fold { .. } => output.op.visit_inputs_mut(&mut |fold| {
-                        fold.visit_inputs_mut(&mut |input| {
-                            start_chain(Some((input, tiling.clone())))
-                        });
-                    }),
+                    BreakerKind::Fold { .. } => start_chain(None),
                     BreakerKind::Materialize { .. } => unreachable!("`main` is not a memo's input"),
                 }
             }
@@ -2144,7 +2069,7 @@ impl PooledRun {
             .iter()
             .map(|breaker| match breaker {
                 PoolBreaker::Materialize { output } => output.held_keys(),
-                PoolBreaker::Collect { .. } | PoolBreaker::Fold { .. } => 0,
+                PoolBreaker::Collect { .. } => 0,
             })
             .sum::<usize>()
             + self.dispatcher.breaker_held_keys()
@@ -2180,7 +2105,6 @@ impl PooledRun {
         let mut worker = MainWorker {
             chains: &mut self.chains,
             breakers: &self.breakers,
-            partials: &mut self.partials,
             worked: 0,
         };
         let settled = self
@@ -2217,7 +2141,9 @@ struct SinkChain<'a> {
 struct StartContext<'a> {
     config: &'a Config,
     inherited: &'a HashMap<String, Vec<Inherited>>,
-    sunk: &'a SunkMemos,
+    sunk: &'a SunkBreakers,
+    /// `main`'s own producer, when its pipeline ends in a breaker the program already holds.
+    kept_main: Option<Box<dyn TileProducer>>,
 }
 
 /// Subscribe `plan`'s pipelines over the chains the cut left, on one worker, answer `main` from
@@ -2231,13 +2157,9 @@ fn start_planned(
         config,
         inherited,
         sunk,
+        kept_main,
     }: StartContext<'_>,
 ) -> PooledRun {
-    /// What an output reads once its pipeline runs.
-    enum Reads {
-        Rows(Arc<Materialized>),
-        Folded(Arc<FoldedResult>),
-    }
     let (mut main_chain, mut main_consumer, main_tiling) = match main {
         Some(main) => (Some(main.chain), Some(main.consumer), Some(main.tiling)),
         None => (None, None, None),
@@ -2264,16 +2186,16 @@ fn start_planned(
             pending.extend(&plan.pipelines[pipeline].streams_from);
         }
     }
-    let mut reads: HashMap<String, Reads> = HashMap::new();
+    let mut reads: HashMap<String, Arc<Materialized>> = HashMap::new();
     let (mut runs, mut notified, mut close_at_start) = (Vec::new(), Vec::new(), Vec::new());
     let mut sources = Vec::new();
-    // A memo in sink mode is its pipeline's breaker, and the pipeline holds a placeholder where a
-    // chain would be.
+    // A memo or an aggregate in sink mode is its pipeline's breaker, and the pipeline holds a
+    // placeholder where a chain would be.
     let mut placeholders: HashMap<usize, Box<dyn TileOperator>> = HashMap::new();
     for (position, pipeline) in plan.pipelines.iter().enumerate() {
-        if let BreakerKind::Materialize { memo } = &pipeline.breaker {
-            placeholders.insert(position, Box::new(Sunk::new(sunk.tilings[memo].clone())));
-            sunk.handles[memo].begin_sinking();
+        if let Some(node) = pipeline.breaker.node() {
+            placeholders.insert(position, Box::new(Sunk::new(sunk.tilings[&node].clone())));
+            sunk.handles[&node].begin_sinking();
         }
     }
     {
@@ -2285,13 +2207,13 @@ fn start_planned(
                     .iter()
                     .find(|(_, at)| *at == position)
                     .map(|(name, _)| name.clone())
-                    .expect("a pipeline that is not a memo's ends in an output")
+                    .expect("a collecting pipeline ends in an output")
             };
             let (chain, breaker): (&mut dyn TileOperator, PoolBreaker) = match &pipeline.breaker {
-                BreakerKind::Materialize { .. } => {
+                BreakerKind::Materialize { .. } | BreakerKind::Fold { .. } => {
                     let placeholder = placeholder_refs
                         .remove(&position)
-                        .expect("a memo pipeline has its placeholder");
+                        .expect("a breaker pipeline has its placeholder");
                     // The dispatcher runs the pipeline through its breaker, so the pool's own
                     // breaker is not read.
                     let unused = PoolBreaker::Collect {
@@ -2308,44 +2230,32 @@ fn start_planned(
                             .expect("one pipeline ends in each sink"),
                     };
                     let output = Materialized::new(chain.tiling().clone());
-                    reads.insert(name, Reads::Rows(output.clone()));
+                    reads.insert(name, output.clone());
                     (&mut **chain, PoolBreaker::Materialize { output })
                 }
-                BreakerKind::Fold { kind, accumulator } => {
-                    let chain = main_chain.take().expect("one pipeline ends in `main`");
-                    let result = FoldedResult::new(
-                        main_consumer.take().expect("the consumer is taken once"),
-                    );
-                    reads.insert("main".into(), Reads::Folded(result.clone()));
-                    let breaker = PoolBreaker::Fold {
-                        kind: *kind,
-                        seed: kind.initial_accumulator(accumulator),
-                        partials: Arc::new(Mutex::new(Vec::new())),
-                        result: Some(result),
-                    };
-                    (&mut **chain, breaker)
-                }
             };
-            let memo_of = |pipeline: usize| match &plan.pipelines[pipeline].breaker {
-                BreakerKind::Materialize { memo } => *memo,
-                _ => unreachable!("a pipeline streams from a memo's pipeline"),
+            let node_of = |pipeline: usize| {
+                plan.pipelines[pipeline]
+                    .breaker
+                    .node()
+                    .expect("a pipeline streams from a breaker's pipeline")
             };
-            let source = match (&pipeline.breaker, pipeline.head) {
-                (BreakerKind::Materialize { memo }, Head::Source) => sunk.sources[memo].clone(),
+            let source = match (pipeline.breaker.node(), pipeline.head) {
+                (Some(node), Head::Source) => sunk.sources[&node].clone(),
                 (_, Head::Breaker) => {
-                    pushed_source(&sunk.handles[&memo_of(pipeline.streams_from[0])])
+                    pushed_source(&sunk.handles[&node_of(pipeline.streams_from[0])])
                 }
-                _ => pipeline_source(&*chain),
+                (None, Head::Source) => pipeline_source(&*chain),
             };
             notified.push(pipeline.head == Head::Source);
             // A range ends by exhaustion. A source whose rows arrive from outside stays open
             // until it says it is complete ([`PooledRun::lap`]).
             close_at_start.push(false);
             sources.push(source.clone());
-            let sink = match &pipeline.breaker {
-                BreakerKind::Materialize { memo } => Some(sunk.handles[memo].clone()),
-                _ => None,
-            };
+            let sink = pipeline
+                .breaker
+                .node()
+                .map(|node| sunk.handles[&node].clone());
             runs.push(PipelineRun {
                 sink,
                 chain,
@@ -2377,38 +2287,33 @@ fn start_planned(
         .map(|((handle, source), pipeline)| OpenSource {
             handle: handle.clone(),
             source,
-            // A memo in sink mode swallows its input's notifications, so the lap tells its
+            // A breaker in sink mode swallows its input's notifications, so the lap tells its
             // pipeline's source what is ready.
-            poll: matches!(pipeline.breaker, BreakerKind::Materialize { .. }),
+            poll: pipeline.breaker.node().is_some(),
         })
         .collect();
-    // The reader registers before the first morsel, so no row leaves before it has read.
-    let main_producer =
-        main_tiling.map(
-            |tiling| match reads.remove("main").expect("`main` has a breaker") {
-                Reads::Rows(output) => BreakerOutput::new(output, tiling.clone(), false, None)
-                    .subscribe(
-                        tiling.universal_guard(),
-                        main_consumer.take().expect("the consumer is taken once"),
-                        ctx.scheduler(),
-                    ),
-                Reads::Folded(result) => Box::new(FoldedResultProducer {
-                    base: ProducerBase::new(
-                        FoldedResultProducer::alloc_id(),
-                        &tiling,
-                        &OperatorBase::new(tiling.clone()),
-                        ctx.scheduler(),
-                    ),
-                    result,
-                }) as Box<dyn TileProducer>,
-            },
-        );
+    // The reader registers before the first morsel, so no row leaves before it has read. A fold's
+    // `main` is the program's own producer.
+    let main_producer = match (kept_main, main_tiling) {
+        (Some(kept), _) => Some(kept),
+        (None, Some(tiling)) => {
+            let output = reads.remove("main").expect("`main` has a breaker");
+            Some(
+                BreakerOutput::new(output, tiling.clone(), false, None).subscribe(
+                    tiling.universal_guard(),
+                    main_consumer.take().expect("the consumer is taken once"),
+                    ctx.scheduler(),
+                ),
+            )
+        }
+        (None, None) => None,
+    };
     // A sink is pulled through a reader of its breaker's output on this thread, so its consumer
     // is woken as `main`'s is, and the pull hands the sink what arrived and releases it.
     for (name, consumer) in sink_consumers {
-        let Some(Reads::Rows(output)) = reads.remove(&name) else {
-            unreachable!("a sink's pipeline collects: {name}")
-        };
+        let output = reads
+            .remove(&name)
+            .unwrap_or_else(|| unreachable!("a sink's pipeline collects: {name}"));
         let tiling = output.tiling().clone();
         let producer = BreakerOutput::new(output, tiling.clone(), false, None).subscribe(
             tiling.universal_guard(),
@@ -2421,13 +2326,6 @@ fn start_planned(
     PooledRun {
         main: main_producer,
         chains,
-        partials: breakers
-            .iter()
-            .map(|breaker| match breaker {
-                PoolBreaker::Fold { seed, .. } => Some(seed.clone()),
-                PoolBreaker::Collect { .. } | PoolBreaker::Materialize { .. } => None,
-            })
-            .collect(),
         dispatcher,
         breakers,
         state,

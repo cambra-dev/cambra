@@ -406,24 +406,20 @@ on three of them:
 ### A fold as the breaker
 
 A `main` output that is an `ExtractAggregate` over an `Aggregate` is a fold, and the plan reads the
-fold off those two nodes: `Breaker::Fold` carries the `AggregateKind` and the accumulator's tiling
-from the `Aggregate`'s own. The chain the driver subscribes is the fold's input, reached through
-`TileOperator::pool_input`, which `ExtractAggregate` answers with its fold and `Aggregate` with its
-input; every other operator answers `None`, which the driver never consults, since the plan
-admits only those two above the chain.
+fold off those two nodes: `BreakerKind::Fold` carries the `AggregateKind`, the accumulator's tiling
+and the `Aggregate`'s node. The aggregate's own producer, switched to sink mode, is the breaker of
+the pipeline ([Pipeline breakers: sink, finalize and get](#pipeline-breakers-sink-finalize-and-get)),
+and `main` stays the program's own producer, so no pool producer answers it. `PooledRun::start`
+finds the aggregate's breaker in the scheduler's registry and the source its input reads, gives the
+pipeline a `Sunk` placeholder for a chain, and drives it as it drives a memo's pipeline: each morsel
+is `pull_sink`, which pulls the aggregate's input at the guard, folds its values with `accumulate`
+(the call the pull path makes) and releases the input at the guard.
 
-The fold is the per-worker state the target design gives `Aggregate` ([docs/parallel-execution.md,
-"Per-breaker state models"](../../docs/parallel-execution.md#per-breaker-state-models)): each worker
-seeds a partial with `AggregateKind::initial_accumulator`, folds every morsel's values into it with
-`accumulate`, the call `AggregateProducer` makes, and hands the partial in once, after its last
-morsel, so nothing is shared on the morsel path. Once every worker has returned, the partials are
-combined into the seed with the same `accumulate`, which is the combine `Tile::merge` performs on
-two aggregation tiles, and `extract` turns the total into the scalar `ExtractAggregate` emits. The
-partials are bare accumulators: the terminal flag `AggregateProducer` sets on its aggregation tile
-is never built on the pool, and the scalar `extract` answers is terminal by holding a value, which
-it does once every worker has returned. Every `AggregateKind` combines in any order, and its seed is
-a unit of the combine, so a worker that takes no package hands in a partial that changes nothing,
-and the partials are pushed in whichever order the workers finish.
+The aggregate states its result terminal on the terminal round only, and wakes its consumer then:
+the extraction answers nothing before. It swallows its input's notifications from the switch, so a
+pipeline over a live source learns of arrivals from the lap's poll, as a memo's does. A pulling
+aggregate's accumulator is adopted at the switch, since the input released what it folded.
+`AggregateBreaker::first_keys` answers no key: a fold has no parent pipeline.
 
 ### A breaker's output
 
@@ -1059,8 +1055,14 @@ inline driver has sink mode only.
    corpus at the pinned count. The threaded passes had been removed by the commit before it, so
    no differential runs a memo through the pool's materializing path. `Materialized`,
    `BreakerOutput` and `PoolBreaker::Materialize` stay for the outputs' own breakers until step 9.
-5. `Aggregate` and `ExtractAggregate`, with the unit tests per kind and the differential run of the
-   folds.
+5. `Aggregate` and `ExtractAggregate`. `Aggregate`'s producer is a breaker (`AggregateBreaker`), and
+   `PoolBreaker::Fold`, `FoldedResult`, the per-worker partials and the combine are deleted. Tests: a
+   sinking aggregate folds morsels in any order as a pulling one does, never pulls its input from
+   `get` and releases it at each morsel, adopts the accumulator at the switch, swallows its input's
+   notifications, is terminal and wakes its consumer at the terminal round only; a fold over a live
+   source is terminal when the source ends. Terminal at every round, not notifying, not swallowing,
+   not releasing, pulling from `get`, not switching and not polling each fail a named test. The
+   corpus runs the folds at the pinned count.
 6. `MapAggregate` and `MapExtractAggregate`, with a test that a group is terminal only at the
    terminal round.
 7. `Converse`, with a test of a probe that reads the table of one round and then of the next.
