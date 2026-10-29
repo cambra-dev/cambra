@@ -475,6 +475,10 @@ of a cyclic fan-out).
   the region pulled, and a pull of one projection states completeness over its keys only, so a pull
   of another region withdraws nothing it said of the first. The debug check keeps the last statement
   of each region.
+- **Check.** A debug build's `TileProducer::get` compares each answer with the projection it was
+  asked for (`Tile::within`) and panics on a key the projection omits, on any cell where the
+  projection names nothing, and on a pull for keys that a non-collection answers. A producer that
+  has not restated projections answers whole and fails the check on the first pull for keys.
 - **Test double.** `ProjectionSpy` answers a fixed tile cut to the guard it is pulled with, and
   logs each projection and release it receives. An operator test pulls the operator over it and
   reads the log to see the guard the operator restated.
@@ -493,7 +497,7 @@ of a cyclic fan-out).
 | `VariantWrap` | A payload stream is pulled at the projection. A payload that is itself a collection becomes one union column and is read whole. |
 | `VariantProject` | A union stream is pulled at the projection. A bare union has no keys of its own, so it is read whole and its positions are cut. |
 | `VariantIs` | The scrutinee is pulled at the projection, since every key in is a key out. |
-| `Filter` | The predicate and the input are pulled at the projection, since they share the keys of the level the mask names. |
+| `Filter` | A predicate or input that is a collection is pulled at the projection, since they share the keys of the level the mask names. A side that is not a collection is read whole. |
 | `Restrict` | The predicate is pulled at the projection, since the restricted domain is the predicate's keys that pass. |
 | `MapDomain` | The input is pulled at the projection, since every level's keys stand. |
 | `Uncurry` | Beneath standing levels the input is pulled at the projection. Pairing the whole tile reads the groups whose first component the projection admits, and the pairs are cut after. |
