@@ -818,11 +818,10 @@ impl LiveProgram {
     ) -> Result<Checked, ReloadError> {
         let diff = difference(ctx, previous, loaded, Phase::AsOfRead)?
             .unwrap_or_else(|| no_difference(Phase::AsOfRead));
-        // This compile binds the ports the new version adds and keeps the
-        // listeners, because binding is the one step it and the compile that
-        // installs the version would otherwise not share: a port already in use
-        // would fail only after the running graph was torn down. Refusing below
-        // hands the ports back.
+        // This compile binds the ports the new version adds, keeps the listeners, and registers
+        // no route. A compile that names its addresses would skip binding, so binding here refuses
+        // a port already in use while the running graph is whole, rather than after it is torn
+        // down. Refusing below hands the ports back.
         let planned = ctx
             .sources_and_sinks_mut()
             .compile_to_opening(loaded, Phase::Planning)
@@ -898,10 +897,15 @@ the lagging branch first"
     /// # Panics
     ///
     /// Panics if the real compile fails after the [`Phase::Planning`] one
-    /// succeeded. The two run the same passes over the same sources and sinks,
-    /// and the `Planning` one has already taken every port the version needs, so
-    /// disagreement is a compiler bug, and one that has already torn the branch
-    /// down, which is not a state to hand back to a caller as a rejection.
+    /// succeeded, because the branch is already torn down, which is not a state
+    /// to hand back to a caller as a rejection. The real compile runs the
+    /// `Planning` one's passes over the same program and then operator
+    /// conversion. In the passes they share, the two differ only in the routes
+    /// the version adds: the `Planning` compile binds their ports and lowers each
+    /// to an `UnopenedRoute`, and the real compile registers each on the listener
+    /// the registry holds, which cannot fail. Operator conversion runs only in
+    /// the real compile, so a program it refuses
+    /// (`ConversionError::Unsupported`) panics here.
     pub fn reload(
         &mut self,
         ctx: &mut GlobalContext,

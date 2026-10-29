@@ -162,17 +162,24 @@ impl SharedHttpServer {
 
 /// An `http_serve` route a compilation named but did not open.
 ///
-/// `/diff` answers a question rather than installing a version, so it runs
-/// against the endpoints the program already holds. A version it is asked about
-/// may name a route the program does not serve, and
-/// opening one would make asking change what the program does: it binds a socket
-/// and registers a route that outlive the throwaway context, so the address
-/// starts answering for a version nobody installed and the real compile then
-/// fails to bind the port it just took.
+/// Lowering declares one for a route that a compilation names and does not open:
 ///
-/// So such a route lowers to this instead. It answers the type questions lowering
-/// and inference put to a source and nothing else, which is all a compile that
-/// stops above operator conversion asks. Reaching a runtime method means one
+/// - A compile that answers a question
+///   ([`Endpoints::Inherited`](crate::ccl::lower::Endpoints::Inherited)), such as rendering a
+///   difference, throws its context away while a socket and a routing-table entry outlive it. Opening the route would bind a socket and register a route for a version nobody
+///   installed, and the real compile would then fail to bind the port it took.
+/// - The compile that precedes installing a version
+///   ([`Endpoints::BindPort`](crate::ccl::lower::Endpoints::BindPort)) binds the route's port
+///   and registers no route. A route it registered would outlive a refusal, with nothing reading
+///   its channel.
+/// - Checking a module alone runs nothing, and reads its requests' type off this source.
+/// - A route whose address reads a `const` parameter has no address until a run gives it one. In
+///   every compilation the module's chain reads its requests off this source, under a name minted
+///   from the statement, and each run's copy is renamed to the route at the address the run gives
+///   (`HttpRoute::at`, `src/ccl/lower/http.rs`).
+///
+/// It answers the type questions lowering and inference put to a source and nothing else, which
+/// is all a compile that stops above operator conversion asks. Reaching a runtime method means one
 /// escaped into an operator graph, so each is [`unreachable`].
 pub struct UnopenedRoute {
     id: String,

@@ -1213,6 +1213,75 @@ fn a_reload_may_not_change_the_type_of_held_state() {
     assert_eq!(still_serving, vec!["alice\nbob\n"], "state intact");
 }
 
+/// A route that a refused version adds on a port the program already serves answers 404.
+///
+/// The compile that precedes installing a version binds the ports it adds and registers no route.
+/// A route it registered would stay in the live listener's routing table after the refusal, with
+/// its channel's receiver dropped along with that compile. The dispatcher would then hand each
+/// request for the address to that channel, and tiny_http answers the dropped request with an empty
+/// 500.
+#[test]
+fn a_refused_version_leaves_the_route_it_adds_unserved() {
+    let port = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&source("guestbook", port));
+
+    let before = exchange(&mut ctx, move || vec![http_post(port, "/sign", "alice")]);
+    assert_eq!(before, vec!["alice\n"]);
+
+    live.reload_text(
+        &mut ctx,
+        MAIN_BRANCH,
+        &source("guestbook-retypes-state-adds-route", port),
+        &no_main,
+    )
+    .err()
+    .expect("`entries` holds a String; the new version declares it an Int");
+
+    let after = exchange(&mut ctx, move || {
+        vec![http_get(port, "/added"), http_post(port, "/sign", "bob")]
+    });
+    assert_eq!(
+        after,
+        vec!["Not Found", "alice\nbob\n"],
+        "the refused version's route is not served, and the running version is intact",
+    );
+}
+
+/// A port that a refused version adds is released.
+///
+/// The compile that precedes installing a version binds the port and registers no route on it, so
+/// the refusal's `release_unrouted_ports` finds no route there and drops the listener.
+#[test]
+fn a_port_a_refused_version_adds_is_released() {
+    let port = reserve_test_port();
+    let added = reserve_test_port();
+    let (mut ctx, mut live) = start_sink(&source("guestbook", port));
+
+    let adds_a_port = source("guestbook-retypes-state", port).replace(
+        "for entry in sign_reqs:",
+        indoc! {r#"
+            other_reqs, other_resps = http_serve("{PORT}", "GET", "/other")
+
+            for req in other_reqs:
+                other_resps << "other\n"
+
+            for entry in sign_reqs:
+        "#}
+        .replace("{PORT}", &added.to_string())
+        .trim_end(),
+    );
+    live.reload_text(&mut ctx, MAIN_BRANCH, &adds_a_port, &no_main)
+        .err()
+        .expect("`entries` holds a String; the new version declares it an Int");
+
+    assert_port_released(added);
+    assert_eq!(
+        exchange(&mut ctx, move || vec![http_get(port, "/peek")]),
+        vec!["peek\n"],
+        "the running program is still serving",
+    );
+}
+
 // ── `@LoadFrom(x)`: seeding a variable from the value the predecessor held ───
 
 /// A version that retires a variable and seeds a new one from the value it held
