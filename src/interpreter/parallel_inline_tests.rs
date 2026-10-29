@@ -531,12 +531,13 @@ mod inline {
         (ctx, program, source, handles)
     }
 
-    /// Run `program` on the pool, deliver the rows `3..5` with the source complete, and serve
+    /// Run `program` on the pool, deliver the rows `more` with the source complete, and serve
     /// until it settles.
     fn finish_over_arrivals(
         ctx: &mut GlobalContext,
         program: &mut CompiledProgram,
         source: &Arc<Mutex<TestDataSource>>,
+        more: std::ops::Range<i64>,
     ) {
         let config = Config {
             threads: 1,
@@ -544,7 +545,7 @@ mod inline {
         };
         let mut run = PooledRun::start(ctx, program, &mut None, &config, Box::new(|| {}))
             .unwrap_or_else(|why| panic!("{why}"));
-        arrive(source, 3..5);
+        arrive(source, more);
         source.lock_wait().set_yield_predicate(Predicate::True);
         for _ in 0..8 {
             ctx.scheduler().check_for_notifications();
@@ -563,7 +564,7 @@ mod inline {
             compiled_over_held_rows(SINK_CODE, &["out"], 0..3);
         ctx.scheduler().pull_sinks();
         assert_eq!(sinks[0].rows_handed(), 3, "compiling pulled the held rows");
-        finish_over_arrivals(&mut ctx, &mut program, &source);
+        finish_over_arrivals(&mut ctx, &mut program, &source, 3..5);
         assert_eq!(sinks[0].rows_handed(), 5, "each row reaches the sink once");
         assert_eq!(
             bindings(sinks[0].value().expect("complete")),
@@ -591,7 +592,7 @@ mod inline {
             [3, 3],
             "compiling pulled the held rows into each sink"
         );
-        finish_over_arrivals(&mut ctx, &mut program, &source);
+        finish_over_arrivals(&mut ctx, &mut program, &source, 3..5);
         assert_eq!(
             [sinks[0].rows_handed(), sinks[1].rows_handed()],
             [5, 5],
@@ -605,7 +606,131 @@ mod inline {
     fn a_pool_over_a_producer_that_released_nothing_starts_at_nothing() {
         let (mut ctx, mut program, source, sinks) =
             compiled_over_held_rows(SINK_CODE, &["out"], 0..0);
-        finish_over_arrivals(&mut ctx, &mut program, &source);
+        finish_over_arrivals(&mut ctx, &mut program, &source, 3..5);
         assert_eq!(sinks[0].rows_handed(), 2, "the rows 3..5");
+    }
+
+    const KEYED_CODE: &str = indoc! {"
+        xs = source1()
+        [y * 2 for y in xs if y > 12]
+    "};
+
+    /// The collection `KEYED_CODE` answers over the rows `0..rows` of `source1()` (the value
+    /// `10 * key`), by key, from the serial loop.
+    fn serial_keyed(rows: i64) -> Vec<(u64, i64)> {
+        let (mut ctx, mut program, source) = over_source1(KEYED_CODE);
+        arrive(&source, 0..rows);
+        source.lock_wait().set_yield_predicate(Predicate::True);
+        let producer = program
+            .main_mut()
+            .and_then(|output| output.producer.as_mut())
+            .expect("a main output");
+        let tile = crate::interpreter::pull_laps(
+            ctx.scheduler(),
+            &mut **producer,
+            1024,
+            Tile::is_terminal,
+        );
+        entries(&tile)
+    }
+
+    /// A chain that reads a memo at its own keys runs behind the pipeline that fills the memo:
+    /// rows that arrive in waves, with morsels of two rows, give the serial answer, every row is
+    /// read and released, and no morsel of the downstream pipeline names a key the memo has not
+    /// merged (it would read a row that is not there).
+    #[test]
+    fn a_keyed_read_runs_behind_the_keys_its_memo_has_merged() {
+        let whole = std::iter::once(0..7).collect::<Vec<_>>();
+        for waves in [whole, vec![0..1, 1..4, 4..7], vec![0..3, 3..4, 4..7]] {
+            let (mut ctx, mut program, source) = over_source1(KEYED_CODE);
+            let config = Config {
+                threads: 1,
+                morsel_rows: 2,
+            };
+            let mut run =
+                PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
+                    .unwrap_or_else(|why| panic!("{why}"));
+            let mut main = run.take_main().expect("a main output");
+            let universal = main.tiling().universal_guard();
+            for wave in waves.iter().cloned() {
+                let upto = wave.end as u64 - 1;
+                arrive(&source, wave);
+                source
+                    .lock_wait()
+                    .set_yield_predicate(Predicate::at_or_below(Value::UInt(upto)));
+                ctx.scheduler().check_for_notifications();
+                run.lap();
+                ctx.scheduler().pull_sinks();
+            }
+            source.lock_wait().set_yield_predicate(Predicate::True);
+            let tile = drive(&mut ctx, &mut run, &mut *main, 100);
+            assert_eq!(entries(&tile), serial_keyed(7), "{waves:?}");
+            main.release(universal);
+            assert_eq!(run.held_keys(), 0, "{waves:?}: every row was released");
+        }
+    }
+
+    /// The arrivals of the source a keyed chain iterates notify its head with the keys that
+    /// arrived, and those keys are not the ones the memo has merged. A keyed head publishes what
+    /// is ready for any notification: a source that reports `Keys [0, 3]` of an arrival the memo's
+    /// pipeline has not run yet must not make the keyed pipeline's source claim key 3 early.
+    #[test]
+    fn a_keyed_head_publishes_what_the_memo_has_ready_for_raw_arrival_keys() {
+        use crate::interpreter::{FunctionGuard, Projection, tiling::Predicate as P};
+        let (mut ctx, mut program, source) = over_source1(KEYED_CODE);
+        let config = Config {
+            threads: 1,
+            morsel_rows: 2,
+        };
+        let mut run = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
+            .unwrap_or_else(|why| panic!("{why}"));
+        let mut main = run.take_main().expect("a main output");
+        arrive(&source, 0..4);
+        source
+            .lock_wait()
+            .set_yield_predicate(Predicate::at_or_below(Value::UInt(3)));
+        // The region names keys the memo's pipeline has not merged: no lap has run.
+        let keys = P::intervals(intervalsets::IntervalSet::from(
+            intervalsets::Interval::closed(Value::UInt(0), Value::UInt(3)),
+        ));
+        let region = Projection::of(&TileGuard::Function(FunctionGuard::Domain(keys)))
+            .expect("keys name a projection");
+        ctx.scheduler().notify_source_consumers("source1", &region);
+        run.lap();
+        source.lock_wait().set_yield_predicate(Predicate::True);
+        let tile = drive(&mut ctx, &mut run, &mut *main, 100);
+        assert_eq!(entries(&tile), serial_keyed(4));
+    }
+
+    /// Two sinks that read one memo at keys share the memo's pipeline, which inherits what both
+    /// serial chains had released: each sink is handed every row it is owed once, though the rows
+    /// they filter out differ.
+    #[test]
+    fn two_sinks_over_one_memo_each_receive_their_rows_once() {
+        let code = indoc! {"
+            first = test_sink()
+            second = test_sink()
+            xs = source1()
+            for x in xs:
+                if x > 12:
+                    first << x
+            for y in xs:
+                if y > 22:
+                    second << y
+        "};
+        let (mut ctx, mut program, source, sinks) =
+            compiled_over_held_rows(code, &["first", "second"], 0..5);
+        ctx.scheduler().pull_sinks();
+        assert_eq!(
+            [sinks[0].rows_handed(), sinks[1].rows_handed()],
+            [3, 2],
+            "compiling pulled the held rows each sink filters in"
+        );
+        finish_over_arrivals(&mut ctx, &mut program, &source, 5..8);
+        assert_eq!(
+            [sinks[0].rows_handed(), sinks[1].rows_handed()],
+            [6, 5],
+            "each sink received the rows it filters in, once"
+        );
     }
 }

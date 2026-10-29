@@ -663,3 +663,38 @@ fn a_streaming_operator_at_the_outermost_level_is_refused() {
         assert_eq!(refusal(code), None, "{code} is admitted");
     }
 }
+
+/// A chain that reads a `Memo` at its own keys is a keyed read: the plan admits it when the memo's
+/// pipeline keeps every key of the source the chain iterates, and refuses the other shapes with the
+/// reason.
+#[test]
+fn a_keyed_read_is_admitted_over_a_memo_that_keeps_every_key() {
+    assert_eq!(
+        refusal(indoc! {"
+            xs = [1, 2, 3, 4]
+            [y * 2 for y in xs if y > 2]
+        "}),
+        None
+    );
+    for (code, reason) in [
+        (
+            indoc! {"
+                x = [z for z in [1, 2, 3] if z > 1]
+                sum([y for y in x if y < 3])
+            "},
+            "whose pipeline can drop a key",
+        ),
+        (
+            indoc! {"
+                k: Int = 1
+                x = box([1, 2, 3])
+                sum([y for y in x if y > k])
+            "},
+            // A constant another pipeline computes is read whole by every row: a build side.
+            "a `MapResultToConst` applies a `FanOutSlot`",
+        ),
+    ] {
+        let refused = refusal(code).unwrap_or_else(|| panic!("{code} is refused"));
+        assert!(refused.contains(reason), "{code}: {refused}");
+    }
+}

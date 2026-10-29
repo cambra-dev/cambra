@@ -81,12 +81,14 @@ impl fmt::Display for Unsupported {
 /// The pipelines the plan admits, upstream first: each ends in the breaker of an output (`main` or
 /// a sink) or in the input of a `Memo`.
 ///
-/// A pipeline is a chain of streaming operators, any number of `MapResult`s each applying a
-/// `Constant` function operand to its input and `MapResultWithSource`s each reading a source's
-/// value at the keys of an `IterateExtent` directly beneath it, from its head to its breaker. A
-/// head is an `IterateExtent` over a source ([`Head::Source`]), or a `FanOutSlot` over a `Memo`
-/// ([`Head::Breaker`]): the plan cuts the graph at the slot, and the pipeline that feeds the
-/// `Memo` ends in a breaker that materializes ([`Breaker::Materialize`]). Every operator in a
+/// A pipeline is a chain of streaming operators from its head to its breaker: `MapResult`s each
+/// applying a `Constant` to its input, or reading a `Memo` at the keys the input iterates (a keyed
+/// read), and `MapResultWithSource`s each reading a source's value at the keys of an
+/// `IterateExtent` directly beneath it, among others. A head is an `IterateExtent` over a source
+/// ([`Head::Source`]), or a `FanOutSlot` over a `Memo` ([`Head::Breaker`]), which the plan cuts
+/// at: the pipeline that feeds the `Memo` ends in a breaker that materializes
+/// ([`Breaker::Materialize`]). A chain with a keyed read is a [`Head::Breaker`] pipeline over the
+/// memo's output that also reads the source it iterates. Every operator in a
 /// chain is streaming, so a worker's chain holds no state between morsels. Which rows the source
 /// enumerates, and whether it can be cut into morsels, is the source's to say
 /// ([`TileOperator::morsel_source`]).
@@ -127,8 +129,19 @@ pub(crate) struct PipelinePlan {
     /// What it ends in.
     pub(crate) breaker: Breaker,
     /// The pipelines, by position in the plan, whose output it reads: the pipeline of the `Memo`
-    /// its head slot reads, for a [`Head::Breaker`], and none for a source.
+    /// its head slot reads, or the one a keyed read reads, for a [`Head::Breaker`], and none for a
+    /// source.
     pub(crate) streams_from: Vec<usize>,
+    /// Whether the chain reads a `Memo` at its own keys (a keyed read): its morsels are the keys
+    /// that memo's pipeline has merged. Such a pipeline is a [`Head::Breaker`] over that memo's
+    /// output, and its chain still reads the source whose keys it iterates.
+    pub(crate) keyed: bool,
+    /// Whether the pipeline, or a pipeline it streams from, holds a `Restrict` or a
+    /// `VariantProject`, which drop keys. A keyed read of such a memo is not admitted yet: the
+    /// morsel can name a key between its first and last that the memo holds no row for, which the
+    /// slot is believed to answer as complete and absent, as the serial memo does, and the
+    /// missing-key rule is not written down.
+    pub(crate) drops_keys: bool,
 }
 
 /// The breaker a morsel pipeline ends in: what the pool keeps between morsels, and how it
@@ -152,15 +165,17 @@ pub enum Breaker {
 
 /// The streaming operators the plan admits in a chain.
 enum Streaming {
-    /// Applies an operand to its `input`, read whole by every morsel: the `Constant` function of
-    /// a `MapResult`, the `Constant` of a `MapResultToConst`. The field is the operand edge's name.
+    /// Applies an operand to its `input`: the `Constant` function of a `MapResult`, read whole by
+    /// every morsel, or the `Constant` of a `MapResultToConst`. A `MapResult` may instead apply a
+    /// slot of a `Memo` (a keyed read, [`Planner::keyed_read`]). The field is the operand edge's
+    /// name.
     Applies(&'static str),
     /// Reads a source's value at the keys of an `IterateExtent` directly beneath it.
     MapResultWithSource,
     /// A unary operator whose keys are the input's, or a subset of them, and which answers a pull
     /// at a guard from the input's answer at the same guard: `VariantWrap`, `VariantProject` and
-    /// `Restrict`. A key it drops is in the guard's region and has no row, as for a `MapResult`
-    /// that filters.
+    /// `Restrict`. A key it drops is in the guard's region and has no row. `VariantProject` and
+    /// `Restrict` are the operators that drop keys ([`PipelinePlan::drops_keys`]).
     Unary,
 }
 
@@ -242,6 +257,7 @@ fn plan_outputs(graph: &OperatorGraph, admit_sinks: bool) -> Result<Plan, Unsupp
         by_id,
         pipelines: Vec::new(),
         memos: HashSet::new(),
+        keyed_memos: HashMap::new(),
     };
     let mut outputs = Vec::new();
     for (name, top) in sinks {
@@ -264,9 +280,12 @@ fn plan_outputs(graph: &OperatorGraph, admit_sinks: bool) -> Result<Plan, Unsupp
 struct Planner<'g> {
     by_id: HashMap<NodeId, &'g GraphNode>,
     pipelines: Vec<PipelinePlan>,
-    /// The `Memo`s a slot of the plan reads. A chain is linear, so at most one slot reads each;
-    /// a second is refused.
+    /// The `Memo`s a slot that starts a chain reads. Such a slot takes the memo's pipeline as the
+    /// chain's own upstream, so a second is refused. A memo read at keys is in `keyed_memos`
+    /// instead, and any number of chains read it.
     memos: HashSet<NodeId>,
+    /// The pipeline planned for each `Memo` that chains read at their own keys.
+    keyed_memos: HashMap<NodeId, usize>,
 }
 
 impl Planner<'_> {
@@ -301,6 +320,59 @@ impl Planner<'_> {
             Some(GraphNode::Operator { kind, .. }) => Some(kind),
             Some(GraphNode::Sink { .. }) | None => None,
         }
+    }
+
+    /// A `MapResult` whose function is the slot `slot` of a `Memo` reads that memo at each key of
+    /// its input (a keyed read). The memo's pipeline is planned once, whichever
+    /// number of reads there are, and every read of one chain is of one memo.
+    fn keyed_read(&mut self, slot: NodeId, keyed: &mut Option<NodeId>) -> Result<(), Unsupported> {
+        let Some(GraphNode::Operator { inputs, .. }) = self.by_id.get(&slot).copied() else {
+            return Err(Unsupported(
+                "a keyed read of something that is not a slot".into(),
+            ));
+        };
+        let [edge] = inputs.as_slice() else {
+            return Err(Unsupported("a `FanOutSlot` without its one input".into()));
+        };
+        let memo = edge.subscribed;
+        let Some(GraphNode::Operator {
+            kind: memo_kind,
+            inputs: memo_inputs,
+            ..
+        }) = self.by_id.get(&memo).copied()
+        else {
+            return Err(Unsupported(
+                "a `FanOutSlot` reads a node that is not a `Memo`".into(),
+            ));
+        };
+        let [upstream] = memo_inputs.as_slice() else {
+            return Err(Unsupported("a `Memo` without its one input".into()));
+        };
+        if !matches!(classify(memo_kind), Class::Memo)
+            || !matches!(upstream.kind, EdgeKind::Value { deferred: false })
+        {
+            return Err(Unsupported(
+                "a keyed read of something that is not a `Memo`'s own input".into(),
+            ));
+        }
+        if keyed.is_some_and(|other| other != memo) {
+            return Err(Unsupported(
+                "a chain keyed-reads more than one `Memo`: its morsels are the keys of one memo, \
+                 and a key of the other may not be merged"
+                    .into(),
+            ));
+        }
+        if self.memos.contains(&memo) {
+            return Err(Unsupported(
+                "a `Memo` read by a slot that starts a chain is also read at keys".into(),
+            ));
+        }
+        if !self.keyed_memos.contains_key(&memo) {
+            let planned = self.pipeline(upstream.subscribed, Breaker::Materialize { memo })?;
+            self.keyed_memos.insert(memo, planned);
+        }
+        *keyed = Some(memo);
+        Ok(())
     }
 
     /// Admission is by kind, and a streaming operator is a morsel operator only where it works on
@@ -338,6 +410,10 @@ impl Planner<'_> {
     /// it streams from, and say where it is in the plan.
     fn pipeline(&mut self, top: NodeId, breaker: Breaker) -> Result<usize, Unsupported> {
         let mut at = top;
+        let mut keyed: Option<NodeId> = None;
+        let mut drops_keys = false;
+        // Set by a keyed read: the operator beneath it must hand it keys as values.
+        let mut values_are_keys = false;
         let (head, streams_from) = loop {
             let node = self.by_id.get(&at).copied();
             let Some(GraphNode::Operator {
@@ -349,6 +425,18 @@ impl Planner<'_> {
             else {
                 return Err(Unsupported("the chain reaches no source".into()));
             };
+            // A keyed `MapResult` reads the memo at the values of its input, so those values must be
+            // the keys of the iteration: an `IterateExtent` answers them, and a `Restrict` answers
+            // the keys that pass. Any other operator answers other values, which are keys of
+            // nothing the memo's claims ordered.
+            if std::mem::take(&mut values_are_keys)
+                && !matches!(*kind, "IterateExtent" | "Restrict")
+            {
+                return Err(Unsupported(format!(
+                    "a keyed read reads the memo at the values of its input, which must be the \
+                     keys, and a `{kind}` answers other values"
+                )));
+            }
             match classify(kind) {
                 Class::Refuse(reason) => return Err(Unsupported(reason)),
                 Class::Operand => {
@@ -361,7 +449,40 @@ impl Planner<'_> {
                         "`{kind}` is not a streaming operator here"
                     )));
                 }
-                Class::Source => break (Head::Source, Vec::new()),
+                Class::Source => match keyed {
+                    None => break (Head::Source, Vec::new()),
+                    Some(memo) => {
+                        let planned = self.keyed_memos[&memo];
+                        let Some(GraphNode::Operator {
+                            tiling:
+                                Tiling::DataFunction {
+                                    domain: memo_keys, ..
+                                },
+                            ..
+                        }) = self.by_id.get(&memo).copied()
+                        else {
+                            return Err(Unsupported("a `Memo` that is not a collection".into()));
+                        };
+                        if !matches!(tiling, Tiling::DataFunction { domain, .. } if domain == memo_keys)
+                        {
+                            return Err(Unsupported(
+                                "a keyed read of a `Memo` over keys that are not the iterated source's"
+                                    .into(),
+                            ));
+                        }
+                        if self.pipelines[planned].drops_keys {
+                            return Err(Unsupported(
+                                "a keyed read of a `Memo` whose pipeline can drop a key".into(),
+                            ));
+                        }
+                        break (Head::Breaker, vec![planned]);
+                    }
+                },
+                Class::Cut if keyed.is_some() => {
+                    return Err(Unsupported(
+                        "a keyed read in a chain that starts at a breaker's output".into(),
+                    ));
+                }
                 Class::Cut => {
                     let [edge] = inputs.as_slice() else {
                         return Err(Unsupported("a `FanOutSlot` without its one input".into()));
@@ -382,6 +503,12 @@ impl Planner<'_> {
                             "a `FanOutSlot` reads a node that is not a `Memo`".into(),
                         ));
                     }
+                    if self.keyed_memos.contains_key(&memo) {
+                        return Err(Unsupported(
+                            "a `Memo` read at keys is also read by a slot that starts a chain"
+                                .into(),
+                        ));
+                    }
                     if !self.memos.insert(memo) {
                         return Err(Unsupported(
                             "a `Memo` is read by more than one slot of the plan".into(),
@@ -397,6 +524,7 @@ impl Planner<'_> {
                     }
                     let planned =
                         self.pipeline(upstream.subscribed, Breaker::Materialize { memo })?;
+                    drops_keys |= self.pipelines[planned].drops_keys;
                     break (Head::Breaker, vec![planned]);
                 }
                 Class::Streaming(Streaming::Applies(operand)) => {
@@ -422,10 +550,14 @@ impl Planner<'_> {
                     let applier = kind;
                     match self.kind_of(function.subscribed) {
                         Some(kind) if matches!(classify(kind), Class::Operand) => {}
+                        Some(kind) if operand == "fn" && matches!(classify(kind), Class::Cut) => {
+                            self.keyed_read(function.subscribed, &mut keyed)?;
+                            values_are_keys = true;
+                        }
                         Some(kind) => {
                             return Err(Unsupported(format!(
                                 "a `{applier}` applies a `{kind}`, and only a `Constant` is \
-                                 streamed"
+                                 streamed, or for a `MapResult` a slot read at keys"
                             )));
                         }
                         None => {
@@ -437,6 +569,7 @@ impl Planner<'_> {
                     at = data.subscribed;
                 }
                 Class::Streaming(Streaming::Unary) => {
+                    drops_keys |= matches!(*kind, "Restrict" | "VariantProject");
                     let input = owned_input(kind, inputs)?;
                     self.keeps_outer_domain(kind, tiling, input.subscribed)?;
                     at = input.subscribed;
@@ -463,10 +596,15 @@ impl Planner<'_> {
                 }
             }
         };
+        if let Some(memo) = keyed {
+            drops_keys |= self.pipelines[self.keyed_memos[&memo]].drops_keys;
+        }
         self.pipelines.push(PipelinePlan {
             head,
             breaker,
             streams_from,
+            keyed: keyed.is_some(),
+            drops_keys,
         });
         Ok(self.pipelines.len() - 1)
     }
@@ -669,6 +807,18 @@ fn cut(op: &mut Box<dyn TileOperator>, taken: &mut HashMap<NodeId, Taken>) {
     op.visit_inputs(&mut |edge| memo = edge.target.operator_id());
     let memo = memo.expect("the plan saw a `Memo`, and an operator has an identity");
     let (tiling, correlation) = (op.tiling().clone(), op.result_correlation());
+    // A memo read at keys has a slot in each read of one chain: the first takes the chain that
+    // feeds it, and the others read the output that chain fills.
+    if let Some(existing) = taken.get(&memo) {
+        op.drop_serial_subscription();
+        *op = Box::new(BreakerOutput::new(
+            existing.output.clone(),
+            tiling,
+            false,
+            correlation,
+        ));
+        return;
+    }
     // The serial chain the program subscribed when it compiled belongs to the scheduler loop,
     // which the pool replaces: its producer holds release records with the sources beneath it,
     // and the fan-out, which the operator map keeps, would hold it for as long as the program.
@@ -690,7 +840,7 @@ fn cut(op: &mut Box<dyn TileOperator>, taken: &mut HashMap<NodeId, Taken>) {
         correlation,
     ));
     let first = taken.insert(memo, Taken { chain, output });
-    assert!(first.is_none(), "the plan admits one slot per memo");
+    assert!(first.is_none(), "the chain of a memo is taken once");
 }
 
 /// Run the pipelines of `plan` over the chains the cut left: `main_chain` for the pipeline that
@@ -739,8 +889,9 @@ fn run_planned(
                 (&mut **chain, breaker)
             }
         };
-        let source = source_of(&*chain).expect("the pipeline was checked to read one source");
+        let source = pipeline_source(&*chain, pipeline.keyed);
         runs.push(PipelineRun {
+            keyed: pipeline.keyed,
             chain,
             source,
             breaker,
@@ -784,6 +935,7 @@ fn run_pipeline(
     delivery: Option<DeliveringThread<'_>>,
 ) -> Tile {
     let run = PipelineRun {
+        keyed: false,
         chain: chain_op,
         source,
         breaker,
@@ -821,6 +973,8 @@ struct PipelineRun<'a> {
     /// See [`PipelineSpec::streams_from`]. A pipeline with a [`Head::Breaker`] streams from the
     /// pipeline of the breaker it reads, and a [`Head::Source`] pipeline streams from none.
     streams_from: Vec<PipelineId>,
+    /// Whether the chain reads a `Memo` at its own keys: its morsels are that memo's merged keys.
+    keyed: bool,
     /// What the serial producers this pipeline replaces had released of each source: the pool's
     /// record for each source operator of the chain starts there. Empty for a run no serial
     /// producer read.
@@ -1009,11 +1163,15 @@ fn prepare(
                         .enumerate()
                         .map(|(pipeline, run)| {
                             let head: Box<dyn Consumer> = match (worker, run.head) {
-                                (0, Head::Breaker) => {
-                                    Box::new(PipelineConsumer(handles[pipeline].clone()))
-                                }
+                                (0, Head::Breaker) => Box::new(PipelineConsumer {
+                                    pipeline: handles[pipeline].clone(),
+                                    keyed: run.keyed,
+                                }),
                                 (0, Head::Source) if notified[pipeline] => {
-                                    Box::new(PipelineConsumer(handles[pipeline].clone()))
+                                    Box::new(PipelineConsumer {
+                                        pipeline: handles[pipeline].clone(),
+                                        keyed: false,
+                                    })
                                 }
                                 _ => Box::new(|| {}),
                             };
@@ -1137,7 +1295,15 @@ impl PipelineHandle {
 
 /// The consumer at the head of a pipeline: a notification publishes the region it carries to the
 /// pipeline's source and never pulls, which is what `region_driven` says.
-struct PipelineConsumer(PipelineHandle);
+///
+/// `keyed` says the chain reads a `Memo` at its keys: the arrivals of the source it iterates also
+/// notify it with the keys that arrived, and its morsels are only the keys the memo has merged, so
+/// it publishes `Projection::Everything` for every notification, which the source resolves to the
+/// keys that are ready and not yet claimed.
+struct PipelineConsumer {
+    pipeline: PipelineHandle,
+    keyed: bool,
+}
 
 impl Consumer for PipelineConsumer {
     fn notify(&mut self, arrived: &Projection) {
@@ -1148,8 +1314,9 @@ impl Consumer for PipelineConsumer {
         // A region of fields names where a change is in a record, and the pipeline's source cuts
         // keys: only everything it has ready is safe to hand out.
         match arrived {
-            Projection::Fields(_) => self.0.publish(&Projection::Everything),
-            keys => self.0.publish(keys),
+            Projection::Fields(_) => self.pipeline.publish(&Projection::Everything),
+            _ if self.keyed => self.pipeline.publish(&Projection::Everything),
+            keys => self.pipeline.publish(keys),
         }
     }
 
@@ -1180,6 +1347,71 @@ fn source_of(chain: &dyn TileOperator) -> Result<Arc<dyn MorselSource>, Unsuppor
             "the chain reads several sources, and a pipeline is cut at one".into(),
         )),
     }
+}
+
+/// What a pipeline serving the outputs `owners` inherits of each source: what every one of their
+/// serial producers had released, so a key an output was not yet handed is offered again to the
+/// outputs that were.
+fn inherited_by(owners: &[&str], inherited: &HashMap<String, Vec<Inherited>>) -> Vec<Inherited> {
+    let mut common: Option<Vec<Inherited>> = None;
+    for owner in owners {
+        let theirs = inherited.get(*owner).cloned().unwrap_or_default();
+        common = Some(match common {
+            None => theirs,
+            Some(so_far) => so_far
+                .into_iter()
+                .filter_map(|(source, released)| {
+                    let (_, other) = theirs.iter().find(|(s, _)| Arc::ptr_eq(s, &source))?;
+                    Some((source, released.intersect(other)))
+                })
+                .collect(),
+        });
+    }
+    common.unwrap_or_default()
+}
+
+/// The source the workers of a pipeline claim morsels from: the one source under the chain, or for
+/// a chain that reads a `Memo` at its keys the source of a slot's `BreakerOutput`, which hands out
+/// the keys the memo's pipeline has merged. The chain also reads the source whose keys it
+/// iterates, which only supplies the rows the morsel names.
+fn pipeline_source(chain: &dyn TileOperator, keyed: bool) -> Arc<dyn MorselSource> {
+    if !keyed {
+        return source_of(chain).expect("the pipeline was checked to read one source");
+    }
+    fn first_output_source(op: &dyn TileOperator) -> Option<Arc<dyn MorselSource>> {
+        if op.kind() == "BreakerOutput" {
+            return op.morsel_source();
+        }
+        let mut found = None;
+        op.visit_inputs(&mut |edge| {
+            if found.is_none() {
+                found = first_output_source(edge.target);
+            }
+        });
+        found
+    }
+    // The invariant the plan checked: a keyed read reads the memo at the values of its input, and
+    // those values are the keys the pipeline's morsels name.
+    debug_assert!(
+        {
+            fn values_are_keys(op: &dyn TileOperator) -> bool {
+                let (mut function, mut input) = (None, None);
+                op.visit_inputs(&mut |edge| match edge.role {
+                    EdgeRole::Named("fn") => function = Some(edge.target.kind()),
+                    EdgeRole::Named("input") => input = Some(edge.target.kind()),
+                    _ => {}
+                });
+                let keyed = op.kind() == "MapResult" && function == Some("BreakerOutput");
+                let mut below = true;
+                op.visit_inputs(&mut |edge| below &= values_are_keys(edge.target));
+                below && (!keyed || matches!(input, Some("IterateExtent" | "Restrict")))
+            }
+            values_are_keys(chain)
+        },
+        "a keyed read's input answers keys as values: only an `IterateExtent` or a `Restrict` \
+         stands beneath it"
+    );
+    first_output_source(chain).expect("a keyed pipeline reads a slot's `BreakerOutput`")
 }
 
 /// The breaker's state while the workers run.
@@ -2291,13 +2523,15 @@ fn start_planned(
     for sink in sinks.iter_mut() {
         sink_chains.insert(sink.name.clone(), &mut *sink.chain);
     }
-    // The output each pipeline serves: the pipelines that stream into an output's pipeline are
-    // its own, since a `Memo` is read by one slot.
-    let mut owners: Vec<Option<&str>> = vec![None; plan.pipelines.len()];
+    // The outputs each pipeline serves: the pipelines that stream into an output's pipeline serve
+    // it. A memo that several outputs read at keys has one pipeline, which serves all of them.
+    let mut owners: Vec<Vec<&str>> = vec![Vec::new(); plan.pipelines.len()];
     for (name, at) in &plan.outputs {
         let mut pending = vec![*at];
         while let Some(pipeline) = pending.pop() {
-            owners[pipeline] = Some(name);
+            if !owners[pipeline].contains(&name.as_str()) {
+                owners[pipeline].push(name);
+            }
             pending.extend(&plan.pipelines[pipeline].streams_from);
         }
     }
@@ -2354,22 +2588,20 @@ fn start_planned(
                     (&mut **chain, breaker)
                 }
             };
-            let source = source_of(&*chain).expect("the pipeline was checked to read one source");
+            let source = pipeline_source(&*chain, pipeline.keyed);
             notified.push(pipeline.head == Head::Source);
             // A range ends by exhaustion. A source whose rows arrive from outside stays open
             // until it says it is complete ([`PooledRun::lap`]).
             close_at_start.push(false);
             sources.push(source.clone());
             runs.push(PipelineRun {
+                keyed: pipeline.keyed,
                 chain,
                 source,
                 breaker,
                 head: pipeline.head,
                 after: Vec::new(),
-                inherits: owners[position]
-                    .and_then(|owner| inherited.get(owner))
-                    .cloned()
-                    .unwrap_or_default(),
+                inherits: inherited_by(&owners[position], inherited),
                 streams_from: pipeline
                     .streams_from
                     .iter()
@@ -3073,7 +3305,8 @@ mod tests {
         assert_eq!(downstream.streams_from, [0]);
     }
 
-    /// A `Memo` is read by one slot of a plan: planning the chain that reads it again is refused.
+    /// A `Memo` is read by one slot that starts a chain: planning another chain that starts at a
+    /// slot of it is refused. A memo read at keys has no such limit.
     #[test]
     fn a_memo_read_by_a_second_slot_of_the_plan_is_refused() {
         use crate::ccl::context::{GlobalContext, compile_program};
@@ -3101,6 +3334,7 @@ mod tests {
             by_id,
             pipelines: Vec::new(),
             memos: HashSet::new(),
+            keyed_memos: HashMap::new(),
         };
         planner
             .pipeline(top, Breaker::Collect)
@@ -3112,6 +3346,324 @@ mod tests {
             refused.to_string().contains("more than one slot"),
             "{refused}"
         );
+    }
+
+    /// A pipeline that serves several outputs inherits what every one of their serial producers had
+    /// released, per source: a key an output was not yet handed is read again for it. Two outputs
+    /// that released different keys give the intersection, whichever is first or last, and an
+    /// output that read a source the other did not leaves that source out.
+    #[test]
+    fn a_pipeline_serving_two_outputs_inherits_the_intersection_of_their_releases() {
+        use crate::interpreter::{BaseType, Extent, TestDataSource};
+        let source = |name: &str| -> Arc<Mutex<dyn DataSourceDomainExtentImpl>> {
+            Arc::new(Mutex::new(TestDataSource::new(
+                name,
+                crate::ccl::Type::Base(BaseType::Int),
+                Extent::Base(BaseType::Int),
+            )))
+        };
+        let upto = |last: u64| Predicate::at_or_below(Value::UInt(last));
+        let (shared, other) = (source("shared"), source("other"));
+        let inherited = HashMap::from([
+            (
+                "first".to_string(),
+                vec![(shared.clone(), upto(4)), (other.clone(), upto(9))],
+            ),
+            ("second".to_string(), vec![(shared.clone(), upto(2))]),
+        ]);
+        for owners in [["first", "second"], ["second", "first"]] {
+            let got = inherited_by(&owners, &inherited);
+            assert_eq!(
+                got.len(),
+                1,
+                "{owners:?}: a source one output did not read drops out"
+            );
+            assert!(Arc::ptr_eq(&got[0].0, &shared), "{owners:?}");
+            assert_eq!(got[0].1, upto(2), "{owners:?}: the intersection of the two");
+        }
+        assert_eq!(inherited_by(&["first"], &inherited).len(), 2);
+        assert!(inherited_by(&[], &inherited).is_empty());
+    }
+
+    /// Hand-built graphs for the refusals of a keyed read that no CHL program reaches, or that the
+    /// compiler reaches only with a refusal of its own first. Each names the property it checks.
+    mod keyed_graphs {
+        use super::*;
+        use crate::interpreter::{BaseType, Extent, operator_graph::InputEdge};
+
+        fn keys() -> Extent {
+            Extent::uint_range(8)
+        }
+
+        fn collection(domain: Extent) -> Tiling {
+            Tiling::data_function(domain, Tiling::Scalar(Extent::Base(BaseType::Int)))
+        }
+
+        fn edge(role: &'static str, to: NodeId) -> InputEdge {
+            InputEdge {
+                role: EdgeRole::Named(role),
+                kind: EdgeKind::Value { deferred: false },
+                subscribed: to,
+            }
+        }
+
+        fn node(kind: &'static str, domain: Extent, inputs: Vec<InputEdge>) -> (NodeId, GraphNode) {
+            let id = NodeId::fresh();
+            (
+                id,
+                GraphNode::Operator {
+                    id,
+                    kind,
+                    tiling: collection(domain),
+                    inputs,
+                },
+            )
+        }
+
+        /// The nodes of a graph, built up.
+        #[derive(Default)]
+        struct Nodes(Vec<GraphNode>);
+
+        impl Nodes {
+            fn add(&mut self, built: (NodeId, GraphNode)) -> NodeId {
+                self.0.push(built.1);
+                built.0
+            }
+
+            fn iterate(&mut self, domain: Extent) -> NodeId {
+                self.add(node("IterateExtent", domain, vec![]))
+            }
+
+            fn filled(&mut self, domain: Extent) -> NodeId {
+                let source = self.iterate(domain.clone());
+                self.add(node(
+                    "MapResultWithSource",
+                    domain,
+                    vec![edge("input", source)],
+                ))
+            }
+
+            fn memo(&mut self, input: NodeId) -> NodeId {
+                self.add(node("Memo", keys(), vec![edge("input", input)]))
+            }
+
+            fn slot(&mut self, memo: NodeId) -> NodeId {
+                self.add(node(
+                    "FanOutSlot",
+                    keys(),
+                    vec![InputEdge {
+                        role: EdgeRole::Named("fan"),
+                        kind: EdgeKind::Share,
+                        subscribed: memo,
+                    }],
+                ))
+            }
+
+            fn read(&mut self, input: NodeId, function: NodeId) -> NodeId {
+                self.read_in(keys(), input, function)
+            }
+
+            fn read_in(&mut self, domain: Extent, input: NodeId, function: NodeId) -> NodeId {
+                self.add(node(
+                    "MapResult",
+                    domain,
+                    vec![edge("input", input), edge("fn", function)],
+                ))
+            }
+
+            fn constant(&mut self) -> NodeId {
+                self.add(node("Constant", keys(), vec![]))
+            }
+
+            fn restrict(&mut self, predicate: NodeId) -> NodeId {
+                self.add(node("Restrict", keys(), vec![edge("predicate", predicate)]))
+            }
+
+            fn planner(&self) -> Planner<'_> {
+                Planner {
+                    by_id: self
+                        .0
+                        .iter()
+                        .map(|node| match node {
+                            GraphNode::Operator { id, .. } | GraphNode::Sink { id, .. } => {
+                                (*id, node)
+                            }
+                        })
+                        .collect(),
+                    pipelines: Vec::new(),
+                    memos: HashSet::new(),
+                    keyed_memos: HashMap::new(),
+                }
+            }
+        }
+
+        fn refused(planner: &mut Planner<'_>, top: NodeId) -> String {
+            planner
+                .pipeline(top, Breaker::Collect)
+                .expect_err("the plan refuses the chain")
+                .to_string()
+        }
+
+        /// A keyed read is admitted over the iterated source's own extent.
+        #[test]
+        fn a_keyed_read_over_the_memos_own_extent_is_planned() {
+            let mut nodes = Nodes::default();
+            let slot = {
+                let filled = nodes.filled(keys());
+                let memo = nodes.memo(filled);
+                nodes.slot(memo)
+            };
+            let source = nodes.iterate(keys());
+            let read = nodes.read(source, slot);
+            let mut planner = nodes.planner();
+            planner
+                .pipeline(read, Breaker::Collect)
+                .expect("a keyed read is planned");
+            assert!(planner.pipelines.last().is_some_and(|last| last.keyed));
+        }
+
+        /// The memo is read at the values of the input, so they must be the keys.
+        #[test]
+        fn a_keyed_read_of_values_that_are_not_the_keys_is_refused() {
+            let mut nodes = Nodes::default();
+            let slot = {
+                let filled = nodes.filled(keys());
+                let memo = nodes.memo(filled);
+                nodes.slot(memo)
+            };
+            let values = nodes.filled(keys());
+            let by_value = nodes.read(values, slot);
+            let source = nodes.iterate(keys());
+            let function = nodes.constant();
+            let mapped = nodes.read(source, function);
+            let by_mapped = nodes.read(mapped, slot);
+            let mut planner = nodes.planner();
+            for top in [by_value, by_mapped] {
+                let reason = refused(&mut planner, top);
+                assert!(reason.contains("which must be the keys"), "{reason}");
+            }
+        }
+
+        /// A chain whose morsels are one memo's merged keys cannot read another memo.
+        #[test]
+        fn a_chain_that_keyed_reads_two_memos_is_refused() {
+            let mut nodes = Nodes::default();
+            let (slot_a, slot_b) = {
+                let first = nodes.filled(keys());
+                let first = nodes.memo(first);
+                let second = nodes.filled(keys());
+                let second = nodes.memo(second);
+                (nodes.slot(first), nodes.slot(second))
+            };
+            let source = nodes.iterate(keys());
+            let inner = nodes.read(source, slot_a);
+            let kept = nodes.restrict(inner);
+            let outer = nodes.read(kept, slot_b);
+            let mut planner = nodes.planner();
+            let reason = refused(&mut planner, outer);
+            assert!(reason.contains("more than one `Memo`"), "{reason}");
+        }
+
+        /// A memo read by a slot that starts a chain, and at keys, in either order.
+        #[test]
+        fn a_memo_read_both_by_a_head_slot_and_at_keys_is_refused() {
+            let mut nodes = Nodes::default();
+            let (head, keyed_slot) = {
+                let filled = nodes.filled(keys());
+                let memo = nodes.memo(filled);
+                (nodes.slot(memo), nodes.slot(memo))
+            };
+            let source = nodes.iterate(keys());
+            let read = nodes.read(source, keyed_slot);
+            let mut planner = nodes.planner();
+            planner
+                .pipeline(head, Breaker::Collect)
+                .expect("a head slot");
+            let reason = refused(&mut planner, read);
+            assert!(reason.contains("also read at keys"), "{reason}");
+
+            let mut planner = nodes.planner();
+            planner
+                .pipeline(read, Breaker::Collect)
+                .expect("a keyed read");
+            let reason = refused(&mut planner, head);
+            assert!(
+                reason.contains("also read by a slot that starts a chain"),
+                "{reason}"
+            );
+        }
+
+        /// The iterated source must have the memo's own keys.
+        #[test]
+        fn a_keyed_read_over_another_extent_is_refused() {
+            let mut nodes = Nodes::default();
+            let slot = {
+                let filled = nodes.filled(keys());
+                let memo = nodes.memo(filled);
+                nodes.slot(memo)
+            };
+            let source = nodes.iterate(Extent::uint_range(9));
+            let read = nodes.read_in(Extent::uint_range(9), source, slot);
+            let mut planner = nodes.planner();
+            let reason = refused(&mut planner, read);
+            assert!(
+                reason.contains("keys that are not the iterated source's"),
+                "{reason}"
+            );
+        }
+
+        /// A keyed read under a chain that starts at a breaker's output has no iterated source.
+        #[test]
+        fn a_keyed_read_in_a_chain_that_starts_at_a_breaker_is_refused() {
+            let mut nodes = Nodes::default();
+            let slot = {
+                let filled = nodes.filled(keys());
+                let memo = nodes.memo(filled);
+                nodes.slot(memo)
+            };
+            let other = {
+                let filled = nodes.filled(keys());
+                let memo = nodes.memo(filled);
+                nodes.slot(memo)
+            };
+            let function = nodes.constant();
+            let mapped = nodes.read(other, function);
+            let kept = nodes.restrict(mapped);
+            let read = nodes.read(kept, slot);
+            let mut planner = nodes.planner();
+            let reason = refused(&mut planner, read);
+            assert!(reason.contains("starts at a breaker's output"), "{reason}");
+        }
+
+        /// The slot must read a `Memo`'s own input.
+        #[test]
+        fn a_keyed_read_of_something_that_is_not_a_memo_is_refused() {
+            let mut nodes = Nodes::default();
+            let not_a_memo = nodes.filled(keys());
+            let slot = nodes.slot(not_a_memo);
+            let source = nodes.iterate(keys());
+            let read = nodes.read(source, slot);
+            let mut planner = nodes.planner();
+            let reason = refused(&mut planner, read);
+            assert!(reason.contains("not a `Memo`'s own input"), "{reason}");
+        }
+
+        /// A memo whose pipeline holds a `Restrict` drops keys, and is not read at keys yet.
+        #[test]
+        fn a_keyed_read_of_a_memo_that_drops_keys_is_refused() {
+            let mut nodes = Nodes::default();
+            let slot = {
+                let filled = nodes.filled(keys());
+                let kept = nodes.restrict(filled);
+                let memo = nodes.memo(kept);
+                nodes.slot(memo)
+            };
+            let source = nodes.iterate(keys());
+            let read = nodes.read(source, slot);
+            let mut planner = nodes.planner();
+            let reason = refused(&mut planner, read);
+            assert!(reason.contains("can drop a key"), "{reason}");
+        }
     }
 
     /// The cut replaces the slot with a `BreakerOutput`, takes the chain that fed the `Memo`, and

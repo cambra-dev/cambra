@@ -367,6 +367,47 @@ mod source_end_to_end {
         }
     }
 
+    /// A filter over a source reads each key's value twice, at the iterated key: a keyed read of
+    /// the memo the source's rows fill. On four workers with one-key morsels and chunks that arrive
+    /// out of order, under both paces, the sink holds the rows the filter keeps, mapped, and the
+    /// source ends with no record and no retained key.
+    #[test]
+    fn a_keyed_read_over_a_source_runs_on_four_workers() {
+        for pace in [Pace::Flat, Pace::Lockstep] {
+            for threads in [1, 4] {
+                let chunks = vec![int_rows(&[1, 2, 3]), int_rows(&[7, 8]), int_rows(&[5])];
+                let expected = sorted(
+                    chunks
+                        .iter()
+                        .flatten()
+                        .filter(|row| row.value > 5)
+                        .map(|row| (row.key.clone(), row.value * 2))
+                        .collect(),
+                );
+                let source = new_source(Extent::Base(BaseType::Int));
+                let held = source.clone();
+                let tile = within_deadline(move || {
+                    run_program_over(
+                        "xs = source1()\n[y * 2 for y in xs if y > 5]",
+                        source,
+                        chunks,
+                        threads,
+                        1,
+                        pace,
+                        Yield::Points,
+                    )
+                });
+                assert_eq!(entries(&tile), expected, "{threads} workers");
+                assert_eq!(held.lock_wait().retained_keys(), 0, "{threads} workers");
+                assert_eq!(
+                    held.lock_wait().release_records(),
+                    0,
+                    "{threads} workers: no record is left with the source"
+                );
+            }
+        }
+    }
+
     fn reversed(mut chunks: Vec<Chunk>) -> Vec<Chunk> {
         chunks.reverse();
         chunks

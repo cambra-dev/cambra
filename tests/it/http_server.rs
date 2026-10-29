@@ -889,12 +889,12 @@ fn source_map_sink_replies_to_each_request_once() {
     );
 }
 
-/// A map with a filter reads each request twice, in the predicate and in the value, and the
-/// compiled program reads the request memo at each key: a build side the plan does not stream. The
-/// inline dispatcher refuses the program, and the serial loop, which then runs it, answers the
-/// admitted requests and leaves the others open.
+/// A map with a filter reads each request twice, in the predicate and in the value: the compiled
+/// program reads the request memo at each key of the iterated source, a keyed read. The inline
+/// dispatcher admits it, and answers as the serial loop does: the admitted requests, and the
+/// others left open.
 #[test]
-fn a_filtered_map_is_refused_by_the_inline_dispatcher_and_served_serially() {
+fn a_filtered_map_replies_to_the_admitted_requests_only() {
     let code = |port: u16| {
         formatdoc! {r#"
             reqs, resps = http_serve("{port}", "POST", "/g")
@@ -903,46 +903,55 @@ fn a_filtered_map_is_refused_by_the_inline_dispatcher_and_served_serially() {
                 resps << k
         "#}
     };
-    let port = reserve_test_port();
-    let mut ctx = GlobalContext::default();
-    let loaded = LoadedProgram::test(code(port));
-    let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
-    let refused = cambra::interpreter::parallel::plan_inline(&compiled.operator_graph)
-        .err()
-        .expect("a build side is not streamed");
-    assert!(refused.to_string().contains("FanOutSlot"), "{refused}");
-    drop((compiled, ctx));
+    let first = [
+        sent("/g", "one"),
+        unanswered("/g", "skip"),
+        sent("/g", "two"),
+        sent("/g", "three"),
+    ];
+    let second = [
+        sent("/g", "four"),
+        sent("/g", "five"),
+        unanswered("/g", "skip"),
+    ];
+    replies_agree(
+        code,
+        &[&first, &second],
+        &[
+            Some("one!"),
+            None,
+            Some("two!"),
+            Some("three!"),
+            Some("four!"),
+            Some("five!"),
+            None,
+        ],
+    );
+}
 
+/// A reply fed under an `if` reads the request at the loop's own key too, and is answered the same
+/// way through both loops.
+#[test]
+fn a_reply_fed_under_an_if_replies_to_the_admitted_requests_only() {
+    let code = |port: u16| {
+        formatdoc! {r#"
+            reqs, resps = http_serve("{port}", "POST", "/g")
+            for req in reqs:
+                if req != "skip":
+                    resps << req
+        "#}
+    };
     let requests = [
         sent("/g", "one"),
         unanswered("/g", "skip"),
         sent("/g", "two"),
+        sent("/g", "three"),
     ];
-    let serial = serve_requests(Mode::Serial, code, &[&requests]);
-    assert_eq!(
-        serial.replies,
-        [Some("one!".to_string()), None, Some("two!".to_string())]
+    replies_agree(
+        code,
+        &[&requests],
+        &[Some("one"), None, Some("two"), Some("three")],
     );
-}
-
-/// A reply fed under an `if` has a build side the plan does not stream yet: the dispatcher
-/// refuses the program, which the serial loop then runs.
-#[test]
-fn a_reply_fed_under_an_if_is_refused_by_the_inline_dispatcher() {
-    let port = reserve_test_port();
-    let code = formatdoc! {r#"
-        reqs, resps = http_serve("{port}", "POST", "/g")
-        for req in reqs:
-            if req != "skip":
-                resps << req
-    "#};
-    let mut ctx = GlobalContext::default();
-    let loaded = LoadedProgram::test(&code);
-    let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
-    let refused = cambra::interpreter::parallel::plan_inline(&compiled.operator_graph)
-        .err()
-        .expect("a build side is not streamed");
-    assert!(refused.to_string().contains("FanOutSlot"), "{refused}");
 }
 
 /// A comprehension read by a loop is a `Memo` between two maps.

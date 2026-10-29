@@ -508,6 +508,7 @@ mod end_to_end {
         let delivery = delivery(&store, &output);
         let up_source = source_of(&upstream).expect("the chain reads one live source");
         let mut runs = vec![PipelineRun {
+            keyed: false,
             inherits: Vec::new(),
             chain: &mut upstream,
             source: up_source,
@@ -520,6 +521,7 @@ mod end_to_end {
         }];
         for downstream in &mut downstreams {
             runs.push(PipelineRun {
+                keyed: false,
                 inherits: Vec::new(),
                 source: source_of(&*downstream).expect("the chain reads the breaker's output"),
                 breaker: collecting(downstream),
@@ -578,7 +580,10 @@ mod end_to_end {
         let mut chains: Vec<Vec<Box<dyn TileProducer>>> = (0..threads)
             .map(|worker| {
                 let head: Box<dyn Consumer> = match worker {
-                    0 => Box::new(PipelineConsumer(handle.clone())),
+                    0 => Box::new(PipelineConsumer {
+                        pipeline: handle.clone(),
+                        keyed: false,
+                    }),
                     _ => Box::new(|| {}),
                 };
                 vec![map.subscribe(tiling.universal_guard(), head, &mut scheduler)]
@@ -865,6 +870,7 @@ mod end_to_end {
             CurryLevel::new(1),
         );
         let runs = vec![PipelineRun {
+            keyed: false,
             inherits: Vec::new(),
             source: source_of(&map).expect("a source"),
             breaker: collecting(&map),
@@ -897,6 +903,7 @@ mod end_to_end {
         );
         let runs = vec![
             PipelineRun {
+                keyed: false,
                 inherits: Vec::new(),
                 source: source_of(&first).expect("a source"),
                 breaker: collecting(&first),
@@ -906,6 +913,7 @@ mod end_to_end {
                 streams_from: Vec::new(),
             },
             PipelineRun {
+                keyed: false,
                 inherits: Vec::new(),
                 source: source_of(&second).expect("a source"),
                 breaker: collecting(&second),
@@ -1030,6 +1038,7 @@ mod end_to_end {
             let tiles = within_deadline(move || {
                 let runs = vec![
                     PipelineRun {
+                        keyed: false,
                         inherits: Vec::new(),
                         source: source_of(&one).expect("a source"),
                         breaker: collecting(&one),
@@ -1039,6 +1048,7 @@ mod end_to_end {
                         streams_from: Vec::new(),
                     },
                     PipelineRun {
+                        keyed: false,
                         inherits: Vec::new(),
                         source: source_of(&two).expect("a source"),
                         breaker: collecting(&two),
