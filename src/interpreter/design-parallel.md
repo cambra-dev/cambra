@@ -396,6 +396,9 @@ or widened, never narrowed or lost.
 
 ### A pool owns its pipeline's release record
 
+
+The pool's reader records and `inherits` are superseded by [Pipeline breakers: sink, finalize and get](#pipeline-breakers-sink-finalize-and-get): the producer that was
+subscribed keeps its release record across the switch to sink mode.
 A data source keeps one release record per producer reading it and reclaims only what every record
 releases. A pool breaks both halves of that: the `main` producer `compile_program` subscribes
 registers a record that releases nothing, and each worker's chain registers a record that releases
@@ -476,6 +479,9 @@ and the partials are pushed in whichever order the workers finish.
 
 ### A breaker's output
 
+
+The `Materialized` output, `BreakerOutput` and the reader records described here are superseded by
+[Pipeline breakers: sink, finalize and get](#pipeline-breakers-sink-finalize-and-get): the breaker holds its state locally and serves `get_impl` from it.
 A breaker that materializes keeps its rows in a `Materialized` (`breaker.rs`), one shared value per
 breaker. The workers of the pipeline before it `absorb` a morsel's rows and `publish` the morsel's
 region; the pipelines behind it read through `BreakerOutput` (`tile_operators/breaker_output.rs`),
@@ -668,6 +674,9 @@ the programs that read one are skipped, and the HTTP programs are compared by th
 
 ### Keyed reads
 
+
+The keyed pipeline's `BreakerOutput` source and reader per slot are superseded by [Pipeline breakers: sink, finalize and get](#pipeline-breakers-sink-finalize-and-get):
+a parent pipeline's morsels are the keys pushed to it. The admission rules below stay.
 Decision: a `MapResult` whose function is a slot of a `Memo` and whose input iterates the memo's own
 source extent is a keyed read, and the plan runs it as a pipeline over the memo's output. A
 comprehension that reads its source twice, as a filter does, compiles to it: `MapResult(function =
@@ -783,6 +792,314 @@ inputs, `UnionOperator` concatenates keys, `Converse` and `MapExtractAggregate` 
 
 A list of variants a hundred elements long overflows the stack when the program compiles, on the
 serial path as well; the plan test uses twenty.
+
+### Pipeline breakers: sink, finalize and get
+
+Decision: each pipeline breaker implements a different interface from a streaming operator. The
+interface has three entry points, and a breaker is the sink of its pipeline.
+
+- `pull_sink(guard)` is called by the dispatcher. It runs everything from the source to persisting
+  the breaker's own state inside the operator itself.
+- `finalize()` is called by the dispatcher once the pipeline has drained. It finalizes any state
+  requirements and notifies the pipelines that read the breaker, by pushing work packages for them
+  onto the dispatcher.
+- `get_impl` is called as it is today, and serves projections out of the state `pull_sink` built and
+  the breaker holds locally, where an aggregation builds its state inside `get_impl` today.
+
+The terms of this section: a **parent pipeline** of a breaker is a pipeline whose head reads that
+breaker's output. A **round** is the dispatcher's drain of the regions pending for one pipeline.
+**Local state** is what the breaker's producer holds between calls.
+
+The decisions taken with the interface:
+
+1. Execution is single-threaded. Every call below runs on the dispatcher's thread.
+2. `finalize` runs per round, and a round is one drain of the regions pending for the pipeline: a
+   round per lap bounds the pushes of a lap to one per pipeline. `finalize` pushes the keys that are
+   final to the parent pipelines. A terminal finish is a flag on the last round, so a pipeline over
+   a source that never ends, an HTTP route, feeds its parents each round with the keys that are
+   final by then.
+3. The breaker owns its input chain. `pull_sink(guard)` pulls the input producer the breaker owns at
+   the morsel guard, merges the answer into local state, and releases the input at the guard after
+   the merge, as a `Memo` releases its input today. The dispatcher neither clones nor reaches into a
+   chain. It reaches a breaker through the handle its pipeline's spec holds.
+4. `get_impl` answers only from local state. It states completeness from what `finalize` has said,
+   and it never pulls the input once the breaker is a sink.
+5. A keyed read needs no structure of its own. A morsel of a parent pipeline exists only for keys a
+   push named, and the breaker holds those keys.
+6. `finalize` pushes through a `Pushes` handle, and does not return a region. The handle pushes to
+   every parent of the breaker, which is a fixed set: a pipeline that reads a breaker's pushes
+   streams from that one breaker pipeline.
+7. A `Memo` switched to sink mode adopts the cache it holds and pushes its keys first, since the
+   serial pull already released them and no sink pull reads them again. Only a collection switches:
+   a parent's morsels are keys.
+8. Several consumers of one breaker keep the per-slot release records of the serial `Memo`, and the
+   breaker reclaims a key when every slot has released it.
+9. A pipeline's breaker pushes keys with rows only, and the refusal of a keyed read of a memo that
+   drops keys is lifted in a later commit, once the missing-key rule is written down.
+10. The scheduler's registry, keyed by `NodeId` and filled at `subscribe`, finds a breaker, because
+    consumers own the producers and a walk would open every consumer. The producer owns the breaker
+    and the registry holds it weakly, so dropping the producer drops the input and retires the
+    release records it registered.
+11. A program with one breaker the plan refuses is refused as a whole, as the plan refuses a program
+    now.
+12. The pinned programs are checked in both pull mode and sink mode from the step that first
+    switches a breaker in a pooled run, which is step 3.
+
+#### The interface
+
+```rust
+trait Breaker: Send + Sync {
+    /// Switch to sink mode. Called once, before the first `pull_sink`.
+    fn begin_sinking(&self);
+
+    /// Pull the owned input at `guard`, merge the answer into local state, release the input at
+    /// `guard`. Called by the dispatcher for each morsel of the breaker's pipeline.
+    fn pull_sink(&self, guard: TileGuard);
+
+    /// The first `rows` keys of `region` that local state holds, in key order: how a parent
+    /// pipeline's morsel is cut.
+    fn first_keys(&self, region: &Predicate, rows: u64) -> Vec<Value>;
+
+    /// End of a round. Finalize what the round merged and push the keys that are final, which the
+    /// parents may now claim. `round.terminal` is set on the last round of the pipeline.
+    fn finalize(&self, round: Round, parents: &mut Pushes);
+}
+
+type BreakerHandle = Arc<dyn Breaker>;
+
+struct Round {
+    terminal: bool,
+}
+
+/// What `finalize` may do to the dispatcher: push final keys to the parent pipelines.
+struct Pushes<'d> { /* the dispatcher and the breaker's parents */ }
+
+impl Pushes<'_> {
+    fn push(&mut self, region: &Predicate);
+}
+```
+
+A breaker is the sink of its pipeline: the pipeline's morsels end in it. The dispatcher driving it
+per morsel is the same act as the scheduler pulling a program sink, since a program's own sink is
+the consumer of the last pipeline's breaker. This is why the entry point is `pull_sink`, in the
+codebase's word for driving a sink (`SinkConsumer::pull_now`, `Scheduler::pull_sinks`). The trait is
+`Breaker`.
+
+The producer that owns a breaker holds its `BreakerHandle`, and the local state lives behind it: the
+operator is a description that outlives one subscription. The methods take `&self` and the
+implementor locks its own state, since the handle is shared by the producer and the pipeline's spec.
+A pipeline's chain holds only streaming producers between its source and its breaker.
+
+`push` names a region of the breaker's output keys that are final. The dispatcher records it as
+claimable by each parent pipeline and cuts morsels from it with `first_keys`, and it claims each
+pushed key once. A parent's source is cut by one breaker's `first_keys`, so a pipeline streams from
+exactly one breaker pipeline when it reads pushes: the dispatcher asserts it when it is built, since
+a second breaker's keys would be claimed as pending of the first and lost. `finalize` pushes keys
+with rows: a key the pipeline dropped, as a `Restrict` does, is not named.
+
+`get_impl` is unchanged in signature. In sink mode it reads local state restricted to the projection
+guard, and the guard checks of the `get` wrapper apply as they do to every producer.
+
+#### The dispatcher
+
+A pipeline is the pair of a breaker and the chain the breaker owns. The plan names the breaker
+operator of each pipeline. A breaker's producer registers its breaker with the scheduler when it is
+subscribed, keyed by its operator's `NodeId`, because consumers own the producers; `PipelineSpec`
+carries the handle of its pipeline's breaker, and the dispatcher calls it directly. One thread
+drives a dispatcher that has a breaker pipeline, through `serve_until_wait`.
+
+The step of `serve_until_wait` for pipeline `P` changes in three places.
+
+1. The source of `P`'s morsels is `P`'s own: the data source's `MorselSource`, or for a parent
+   pipeline the queue of regions pushed to it, cut by the breaker's `first_keys`.
+2. A claimed morsel runs `breaker.pull_sink(guard)`. The dispatcher no longer pulls a chain and
+   hands the tile to a breaker's `absorb`.
+3. When `P` has no morsel left to claim and ran at least one since its last round, the dispatcher
+   calls `breaker.finalize(Round { terminal }, pushes)`. `terminal` is set when the source of `P` is
+   exhausted and every pipeline `P` streams from has finished; the dispatcher marks `P` finished,
+   runs the terminal round, closes the pipelines that stream from `P` and starts the pipelines
+   waiting on it.
+
+`streams_from` is kept. It lists the pipelines whose pushes a pipeline consumes, and it orders start
+and finish: a pipeline finishes after the pipelines it streams from. The push direction is its
+inverse, and the dispatcher computes it once when it builds the specs, so `Pushes` for a breaker
+addresses exactly the pipelines that list it in `streams_from`. Replacing `streams_from` by a
+`feeds` list would state one relation twice, since a finish is ordered by the same edges the pushes
+travel.
+
+`after` keeps its meaning, a pipeline that starts only when another has finished, which a build side
+needs. The region publish that a breaker's `Materialized` performs today is `Pushes::push`.
+
+A pipeline whose chain reads a memo at keys is a parent pipeline of that memo. Its morsel source is
+the push queue regardless of the data source its chain iterates, which supplies the rows the morsel
+names. The rule that the values of the input are keys ([Keyed reads](#keyed-reads)) stays a plan
+rule, since the morsel names keys and the chain must read at them.
+
+#### Completeness and release
+
+While rounds continue, `get_impl` states complete the region of keys merged and final, and states
+every other region incomplete. A collection breaker (`Memo`) states a merged key complete because
+the morsel that supplied it did, and its merged keys are final. A folding breaker states its value
+incomplete until the terminal round, and the terminal round states it complete. A group of a
+grouping breaker is terminal when `finalize` says so, which is the terminal round: a grouping
+breaker pushes a key only when it is final.
+
+A memo in sink mode swallows what its input notifies: those regions are changes the sink has not
+merged. `finalize` notifies the memo's consumer of the keys it pushed, and with `Everything` on the
+terminal round, so a consumer is never woken before the rows it was woken for are merged.
+
+An update of a key a parent pipeline has already claimed is not served, as today: a parent claims
+each pushed key once, so a key pushed with a running value would reach its consumers once and
+incomplete, and would never be updated. A downstream of a grouping breaker over a source that never
+ends therefore waits for the terminal round, which is the semantics until updates can be re-served.
+
+Release has two directions.
+
+- The downstream release is a release at the breaker's `get`. A `Memo` reclaims a cached key when
+  every consumer released it, as today. A folding breaker has one value, and a release of it at the
+  terminal round frees the state.
+- The sink's own release is the release of its input. `pull_sink` asserts the answer states the
+  whole guard complete, merges it, and releases the input at the guard, so the input holds nothing
+  for a merged morsel, and a source reclaims what the breaker's producer released. The producer is
+  the one the serial run subscribed, so its release record with a source is the same record before
+  and after the switch to sink mode.
+
+#### The serial path
+
+A serial run pulls through `get_impl` as today, and every program the plan refuses runs that way. A
+breaker therefore has both behaviours, and one producer serves both.
+
+The producer starts in pull mode, which is the behaviour it has now: `get_impl` pulls the owned
+input at the projection, merges, and answers. `PooledRun::start` plans the program, and for each
+pipeline it plans, it calls `begin_sinking` on the breaker's producer. A producer that has been
+switched is in sink mode until it drops, and no program switches back. A program the plan refuses
+switches nothing and keeps the pull mode of every breaker.
+
+The switch adopts the state the producer holds. A `Memo` keeps its cache, and the keys the cache
+holds are the first it pushes; the region pending for its pipeline is the dispatcher's source, and
+the memo's `dirty` is pull-mode state that sink mode does not read. A fold keeps its accumulator. A
+breaker that is not a collection does not switch: a parent's morsels are keys, and the plan switches
+only the memos it plans as pipelines. A producer switched before it was ever pulled holds an empty
+state, which is the usual case, since `PooledRun::start` runs before the loop's first pull of
+`main`; a sink that `compile_program` pulled at once is the exception, and it is why adoption is
+part of the interface.
+
+The risk is two code paths in each breaker. Each breaker's tests run in both modes and compare the
+answers, and the differential suite compares a whole program's answer through the pull mode and
+through the sink mode at every step of the migration.
+
+#### The per-breaker mapping
+
+`Memo`: the state is the cache. `pull_sink(guard)` pulls the input at the guard, merges the tile
+into the cache, and releases the input at the guard. `finalize` pushes the keys merged since the
+last round, which are final. `get_impl` answers a projection from the cache and states the merged
+region complete. `first_keys` lists and sorts the keys the cache holds on each call, a cost per
+claim that a sorted index would remove.
+
+`Aggregate` and `ExtractAggregate`: the state is the accumulator. `pull_sink` accumulates the
+morsel's values into it (`AggregateKind::accumulate`), which is the work `get_impl` does today.
+`finalize` pushes nothing until the terminal round and then pushes the one key of the result.
+`get_impl` serves the accumulator, incomplete until the terminal round. The `ExtractAggregate` reads
+the fold's value through `get_impl`, so a fold into `main` stays a pipeline whose breaker is the
+aggregate.
+
+`MapAggregate` and `MapExtractAggregate`: the state is the group table. `pull_sink` accumulates the
+morsel into the groups its keys fall in. `finalize` pushes nothing until a group is final, which is
+the terminal round, and then pushes the group keys. A group is terminal when `finalize` says so.
+
+`Converse`: the state is the hash table that regroups the input by value. `pull_sink` extends the
+table with the morsel's rows. A new row can add a key to any group, so no group is final before the
+terminal round, and `finalize` pushes the group keys on that round. A probe pipeline reads the table
+as a function operand through `get_impl`, which is the hash join's build side, once it is final.
+
+`ExtractFinal`: the state is the one value of a store's final read. `pull_sink` merges nothing until
+the input's terminal round, and `finalize` on that round pushes the value's key.
+
+The stores and recurrence operators (`InductionStore`, `TransactWriter`, `CommitOperator`,
+`StoreFinalRead`, and the drivers) stay as they are. They are not breakers of this interface, and
+the plan refuses them as it does today.
+
+#### What the design replaces and keeps
+
+What stays:
+
+- `serve_until_wait`, the dispatcher's epoch protocol, and the inline driver `PooledRun`.
+- The differential suite and its pin of 160 programs.
+- The HTTP source's morsels and the reply sink. A program's sink pulls the last breaker's producer
+  through `get_impl`, where it pulls a `BreakerOutput` today.
+- The admission arms of `classify`, the plan tests and `keeps_outer_domain`.
+- The release record of a pipeline's source operators, owned by the producer that was subscribed for
+  the serial run.
+
+What goes:
+
+- `Materialized`, `BreakerOutput` and `PoolBreaker::Materialize`: local state and `get_impl` replace
+  them.
+- The cut and `TileOperator::visit_inputs_mut`: the breaker keeps its chain, so no chain is taken
+  out of the graph.
+- The pool's reader records and `inherits`: the producer's own record continues across the switch.
+- The threaded passes, `run_main`, `run_main_delivering` and the multi-worker tests: execution is
+  single-threaded.
+
+What is rebuilt:
+
+- Keyed reads: the pipeline's morsel source is the push queue, and the plan keeps the
+  values-are-keys rule.
+- The plan's identification of a pipeline: the plan names the breaker operator in place of the cut
+  chain.
+- The refusal that drops-keys memos are not read at keys: `finalize` pushes keys with rows, so the
+  refusal can be lifted once the missing-key rule is written down.
+
+#### Migration
+
+Each step is a commit with its unit tests and a full differential run, and the pinned programs do
+not regress. From step 3 the run checks every pinned program in pull mode and in sink mode.
+
+1. The interface: `Breaker`, `Round`, `Pushes`, the scheduler's registry, the dispatcher's round and
+   push queues, tested with a breaker double. Tests: rounds run when a pipeline drains, a terminal
+   flag is set once, a push reaches exactly the parents, a parent's morsels are cut from pushed keys
+   only.
+2. `Memo` implements the interface in both modes. Tests: sink and pull answer the same, the switch
+   adopts a cache and its keys reach the parent, completeness follows rounds, release at merge, the
+   consumer is notified from `finalize` only, the sink never pulls its input from `get_impl`. The
+   whole-corpus differential in sink mode starts at step 3, since no pooled run uses a memo's
+   breaker before it.
+3. `PooledRun::start` switches the memos it plans, and the dispatcher runs them as pipelines. The
+   cut still takes the other chains. Tests: the corpus at the pinned count, the HTTP scenarios.
+4. Keyed reads over the push queue; delete the keyed pipeline of the old structure. Tests: the keyed
+   read tests as they stand, a keyed morsel names only pushed keys.
+5. `Aggregate` and `ExtractAggregate`, with the unit tests per kind and the differential run of the
+   folds.
+6. `MapAggregate` and `MapExtractAggregate`, with a test that a group is terminal only at the
+   terminal round.
+7. `Converse`, with a test of a probe that reads the table of one round and then of the next.
+8. `ExtractFinal`.
+9. The program sink pulls the last breaker's producer; delete `BreakerOutput` and `Materialized`.
+10. Delete the cut, `visit_inputs_mut`, the reader records, `inherits`, the threaded passes and the
+    multi-worker tests, and the sections of this document they leave stale.
+
+#### Invariants
+
+Asserted where the invariant lives, in debug builds:
+
+- A breaker in sink mode pulls its input only inside `pull_sink`.
+- Each round's pushed keys are disjoint from the keys of every earlier round, and a key is pushed
+  only when it is final.
+- `finalize` is called with `terminal` set at most once, and `pull_sink` is not called after it.
+- A parent's morsel is a subset of the keys pushed to it and not yet claimed.
+- `get_impl` states complete only keys a morsel merged, and every level complete only after the
+  terminal round. A finite extent whose every key was merged is complete at that round.
+- A morsel's answer states its guard complete, and the input is released at the guard.
+- `begin_sinking` is called once, before the first `pull_sink`, and a breaker is never switched
+  back; a breaker that sinks is a collection.
+- A pipeline that reads pushes streams from one breaker pipeline.
+- Every call of the interface happens on one thread, through `serve_until_wait`.
+
+#### Open questions
+
+None.
+
+
 
 ### Tests
 

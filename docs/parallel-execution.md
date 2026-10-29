@@ -260,6 +260,8 @@ The pull form is the one the protocol already has a slot for, and it keeps the d
 
 ### Thread-confined chains, shared breakers
 
+
+The shared breaker is superseded for single-threaded execution by [The breaker interface](#the-breaker-interface).
 Each worker owns one subscription of the chain between two breakers: its own `Box<dyn
 TileProducer>` instances, its own `ProducerBase` with its own `obsolete_guard`. The producers stay
 `!Sync`; what crosses threads is tiles into and out of the breaker. The breaker is one object
@@ -505,6 +507,33 @@ head](#optional-a-ring-of-segments-at-each-head)).
 
 **Sinks.** One lock per sink around `data`; or, since a sink is pulled once per pass by one
 worker, keep it thread-confined and leave it.
+
+### The breaker interface
+
+The target design gives a pipeline breaker three entry points, and the pool's breakers are rebuilt
+on them for single-threaded execution first. A breaker is the sink of its pipeline.
+`pull_sink(guard)` runs from the source to the breaker's own state, inside the operator. `finalize`
+runs per round, when the pipeline has drained the regions pending for it, and pushes the keys that
+are final to the pipelines that read the breaker: a collection breaker pushes the keys merged since
+the last round, and a grouping breaker pushes a group once, when it is final. `get_impl` serves
+projections out of the state `pull_sink` built. A breaker owns its input chain and releases its
+input at the merge, so the dispatcher never clones or reaches into a chain, and a keyed read needs
+no structure of its own: a morsel of a reading pipeline exists only for keys a push named.
+
+The design replaces the shared breaker of [Thread-confined chains, shared
+breakers](#thread-confined-chains-shared-breakers) by state the breaker holds locally, and the
+per-worker partials of [Per-breaker state models](#per-breaker-state-models) by a single state per
+breaker. It keeps the state models themselves: a `Memo`'s cache and `dirty`, an aggregate's
+accumulator, a group table, a hash join's table. The stores and recurrence operators are not
+breakers of this interface and stay as they are
+([Recurrences under the scheduler](#recurrences-under-the-scheduler)).
+
+The serial scheduler pulls a breaker through `get_impl` as it does today, so a breaker has both
+behaviours: a producer switches from pull mode to sink mode once, when the pool takes a program, and
+a program the plan refuses never switches. `src/interpreter/design-parallel.md`, "Pipeline breakers:
+sink, finalize and get", states the signatures, the dispatcher's rounds, the completeness and
+release rules, the per-breaker mapping, the migration as ordered commits, the invariants and the
+decisions taken with them.
 
 ### Recurrences under the scheduler
 
