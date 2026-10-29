@@ -963,6 +963,51 @@ after the run and learn of the terminal store from its queued notification. Open
 as a parent pipeline, a loop seeded by another loop, morsels over positions a filter removes, which
 the drive does not bound, and nested loops, whose store is one per enclosing row.
 
+### A transaction store as a breaker
+
+`CommitBreaker` (`tile_operators/commit_breaker.rs`) is the breaker of a transaction store's
+pipeline. Like `LoopBreaker`, it holds the cyclic `FanOut` over the store's `CommitOperator` and a
+reader slot of it, and adds no rule to the fan-out. The writers, their drives and their bodies stay
+in pull mode, and the whole cycle is one pipeline, which the dispatcher consumes in order.
+
+A step is one drain of every writer, and each writer decides at most one attempt in it. A step
+therefore commits between zero and one tick per writer: a deny, a grant that writes nothing, and a
+stale proposal commit none. Commit ticks do not bound a morsel. A drive finishes its items in source
+order and releases its source through each finished item, so the writers' sources are the ordered
+input. A drive that is done, every item finished over a source that delivers no more, reads nothing
+more of its source, so it releases the source whole and pulls it no more, as an induction drive
+does. In pull mode the fan-out over that source then reports itself released in full, and a reload
+rebuilds a recomputable source behind a finished transaction rather than keeping it.
+
+The breaker's input is that source for a store of one writer, whose positions the dispatcher cuts
+into morsels. For a store of several writers it is a record of the sources, `_𝑘` for writer `𝑘`. A
+record has no outermost keys to cut, so such a store consumes its input as one morsel and refuses
+any other guard. `consume_impl` calls `FanOut::step` until the source's release covers the morsel,
+or until the store is terminal for a morsel whose right end has no bound. It reads the snapshot and
+the release afresh before each step. Each step decides something: the store's frontier rises, some
+source's release grows, or the store closes. Each of the three is bounded, so a run of steps ends.
+A step that decides none of them panics as a stalled store, and so does a step at a terminal
+snapshot.
+`held` is the commit ticks the store has decided, and everything once it is terminal. `finalize`
+asserts the store is terminal and pushes that guard.
+
+A deny leaves the store's snapshot unchanged. The drive announces its next item only through its
+scheduler re-arm, and the body reads the drive through a `Memo` that answers from its cache until
+notified. A step therefore notifies the recurrence while the snapshot is not terminal
+([One position per pull](#one-position-per-pull)). The drive cannot notify synchronously from the
+release that finishes an item: a non-cyclic `FanOut` holds its shared state borrowed while it pulls
+or releases its input, and the notification would reach that fan-out's `FanOutInput`.
+
+A run's store does not depend on its morsel size. `CommitProducer` rotates the writer it drains
+first on every pull of the store (`drain_start`), and a run pulls the store only through
+`FanOut::step`, so morsels of any size make the same steps. Pull mode also pulls the store through
+its readers, so it can serialize contending writers in another order. A run agrees with pull mode on
+a result every serialization gives.
+
+Open: morsels per writer for a store of several, which needs the dispatcher to cut a record of
+sources; the program's own readers of a store as a parent pipeline, as for a loop; and a live
+source, whose drive is never done.
+
 ## Tile Operators
 
 Each `TileOperator` is a static (compile-time) node in the dataflow graph. It knows its output

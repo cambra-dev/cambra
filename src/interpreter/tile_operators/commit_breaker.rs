@@ -1,5 +1,5 @@
-//! A transaction store as a pipeline breaker. See `src/interpreter/design-operators.md`, "A loop
-//! as a breaker".
+//! A transaction store as a pipeline breaker. See `src/interpreter/design-operators.md`, "A
+//! transaction store as a breaker".
 
 use std::rc::Rc;
 
