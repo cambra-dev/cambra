@@ -1,10 +1,11 @@
 # Cambra Inspector — web frontend
 
-The CodeMirror 6 frontend for the Cambra program inspector. It is a small,
-read-only single-page app: on load it fetches `/api/snapshot` from the
-inspector server (`src/inspector_server/`) and renders the program source
-alongside one IR tree pane per pipeline pane, cross-linked across all panes via
-the pane provenance graph.
+The CodeMirror 6 frontend for the Cambra program inspector. It is a small
+single-page app: on load it fetches `/api/snapshot` from the inspector server
+(`src/inspector_server/`) and renders the program source alongside one IR tree
+pane per pipeline pane, cross-linked across all panes via the pane provenance
+graph. On a run with a control port the source pane is an editor that reloads
+the running program ([Editing the program](#editing-the-program)).
 
 ## Principle: snapshot-first, all client-side
 
@@ -41,6 +42,8 @@ See [Running it](../docs/inspector.md#running-it). No `cargo`? After `npm run bu
 | **Click** a node row in the IR tree | Selects the node — highlights its source span in the editor and scrolls to it. The tree → source cross-link. |
 | **Click the ▸ / ▾ twisty** on a tree row | Expands / collapses that subtree (distinct from selecting the row). |
 | **Read** the source | Syntax highlighting from the VS Code grammar, in the classes the VS Code and Neovim grammars use ([editors/README.md](../editors/README.md#inspector)). `./ci.sh editors` checks it against the lexer over every `.cambra` file in the repository. |
+| **Edit** the source, on a run with `--control` | The pane is editable. While its text differs from the version running, it is *edited*: hover, goto-definition and selection are off, the strip under the editor says so, and the other panes keep describing the running version. `Tab`/`⇧Tab` (or `Mod-]`/`Mod-[`) move the selected lines by two spaces, `Enter` keeps the line's indentation, and `Mod-z` undoes. |
+| **Mod-Enter** in an edited source pane | Reloads `main` with the pane's text. Accepted, the panes redraw on the new version and the strip reports how many operators it kept. Refused, the errors are underlined where they are and the running version keeps running. See [Editing the program](#editing-the-program). |
 | **Hover a squiggle** in the source | The diagnostic message. Type errors underline the offending span — and still render even when the program fails to compile, since the source panel always loads. |
 | **Open the ☰ Panes menu** in the header | A checkbox per pane. Unchecking one hides it and widens the rest; the hidden set persists across reloads. Every pane is listed, Source included — the invariant is that the layout is never empty, so the last visible pane's checkbox is disabled rather than Source being pinned. Panes cannot be reordered. |
 | **Click a pane's Copy button** | Copies that pane's text to the clipboard. The source pane yields the program verbatim; a tree pane yields one indented line per row; the Diagnostics pane yields each card's three lines. The button reports the outcome — a refused write says so rather than looking like it worked. |
@@ -199,6 +202,9 @@ The frontend is vanilla TypeScript (no framework), split into small modules:
   listener carries a `Resolved`, which is the resolution of a *selection*.
 - `paneMenu.ts` — the header's checkbox dropdown. It reads `PaneVisibility`
   rather than caching it, so an external change reaches the boxes.
+- `reload.ts` — reloading from the source pane: whether the server takes a
+  reload, the `POST /api/reload` transport, and the `EditSession` that holds a
+  reload's outcome and the reader's edit across the redraw a reload causes.
 - `main.ts` — fetch `/api/snapshot`, build the store, render the source pane +
   one tree pane per pane entry.
 
@@ -210,6 +216,34 @@ multi-byte character, so **every** crossing between a Cambra span and a CM
 position routes through `OffsetMap.byteToChar` / `charToByte`. The map is built
 once per source (cumulative byte length per code-point boundary) and queried by
 binary search.
+
+## Editing the program
+
+`GET /api/capabilities` answers `{"reload": true}` on a run started with `--inspect --control`.
+The page then holds one `EditSession` (`reload.ts`) for its lifetime, and the source pane is
+editable. `Mod-Enter` posts the pane's text to `POST /api/reload`, which reloads `main` through the
+run's control port (`src/inspector_server/reload.rs`). The panes redraw on the new version the way
+they follow any reload of `main` (`followReloads`).
+
+- **Edited.** The payload's spans are bytes of the compiled text. While the document differs from
+  it, the pane switches hover, goto-definition and selection off, paints no span, and clears the
+  shared selection on entering the state. Undoing back to the compiled text switches them on again.
+- **A refused version** comes back with the compiler's diagnostics as byte spans into the text
+  sent. The pane converts them against that text, clamps them to the document, and underlines
+  them. A refusal with no span, such as removing a variable the running state holds, is reported
+  in the strip.
+- **The redraw carries the editor.** A disposed source pane leaves its caret, its focus and, when
+  it was edited, its text on the session, and the next pane takes them. So the reader's own reload
+  lands with the caret where it was, and a reload from elsewhere (another tab, the control port)
+  leaves text the reader has not sent in place, still edited, over the new version. The undo
+  history does not survive the redraw.
+- **One reload at a time.** A `Mod-Enter` while one is in flight does nothing.
+- **A finished program takes no reload.** On the frame marked `final` the session finishes, the
+  pane turns read-only and the strip says why. The server answers a reload sent after that with
+  409 ([program-evolution.md](../src/ccl/design/program-evolution.md#reload)).
+
+There is no compile-from-scratch: the control port has no verb that restarts `main` with nothing
+kept.
 
 ## Scope: multi-pane (interactive, snapshot-first)
 
@@ -227,7 +261,8 @@ mounted, because tearing one down would leak its store subscription, lose every
 expand/collapse in a tree, and come back blank (the views react to selection
 *changes*, and `setSelection` early-returns on an equal one).
 
-- **Source pane** — read-only CodeMirror editor with:
+- **Source pane** — CodeMirror editor, read-only unless the server takes a
+  reload ([Editing the program](#editing-the-program)), with:
   - **hover tooltips**: hovered position → tightest enclosing IR node → its
     `label`, type set (joined with ` | `), and `provenance`. Anchored on the
     **post-inference** pane (the one carrying resolved types).

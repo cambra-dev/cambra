@@ -91,6 +91,15 @@ fn run_program(
         }
     };
 
+    // Started before the inspector, whose `POST /api/reload` sends to it.
+    let control = match control_port.map(ControlPort::new).transpose() {
+        Ok(control) => control,
+        Err(e) => {
+            eprintln!("error: could not start the control port: {e}");
+            return Err(());
+        }
+    };
+
     // Serve the panes from the same compile that is about to be driven, so a
     // click in a pane names a node the running graph actually built. A reload
     // of `main` replaces both through `Inspection::follow`: see
@@ -101,7 +110,13 @@ fn run_program(
                 .program(MAIN_BRANCH)
                 .expect("the process starts with `main`");
             let src_name = loaded.sources().path(loaded.sources().root());
-            match serve_compiled(program, src_name, port, version) {
+            match serve_compiled(
+                program,
+                src_name,
+                port,
+                version,
+                control.as_ref().map(ControlPort::client),
+            ) {
                 Ok((channel, snapshot)) => Some(Inspection::new(
                     channel,
                     snapshot,
@@ -117,14 +132,6 @@ fn run_program(
             }
         }
         None => None,
-    };
-
-    let control = match control_port.map(ControlPort::new).transpose() {
-        Ok(control) => control,
-        Err(e) => {
-            eprintln!("error: could not start the control port: {e}");
-            return Err(());
-        }
     };
 
     // Pull every branch's `main` output until each has released everything,

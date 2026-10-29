@@ -25,6 +25,10 @@
 //! [`OFFERED_PHASES`]); it must come first when the query also carries the
 //! source.
 //!
+//! The inspector's `POST /api/reload` reaches the same queue through a
+//! [`ControlClient`] (`src/inspector_server/reload.rs`), so a reload from the
+//! page is answered by the same [`service`].
+//!
 //! # Who may send a request
 //!
 //! A `/reload` runs the code it carries, so [`admit`] refuses every request a
@@ -55,6 +59,7 @@ use std::thread;
 
 use crate::ccl::context::{CompileError, GlobalContext, Phase, ReuseTally};
 use crate::ccl::load::{LoadError, LoadedProgram};
+use crate::inspector_model::{Diagnostic, diagnostics_from_compile_errors};
 use crate::live_program::{
     BranchError, LiveProgram, MAIN_BRANCH, MainConsumerFactory, ReloadError, ReloadReport,
     is_branch_name, render_unreadable,
@@ -113,10 +118,10 @@ impl ControlRequest {
 /// prefetch or a stray `GET` cannot reload, create or delete a branch.
 fn require_post(method: &str, request: &ControlRequest) -> Result<(), ControlReply> {
     if request.mutates() && !method.eq_ignore_ascii_case("POST") {
-        return Err(ControlReply {
-            status: 405,
-            body: format!("{method} cannot change a branch; send POST\n"),
-        });
+        return Err(ControlReply::with_status(
+            405,
+            format!("{method} cannot change a branch; send POST\n"),
+        ));
     }
     Ok(())
 }
@@ -129,27 +134,27 @@ pub fn admit(
     fetch_site: Option<&str>,
 ) -> Result<(), ControlReply> {
     if !host.is_some_and(is_loopback_host) {
-        return Err(ControlReply {
-            status: 403,
-            body: format!(
+        return Err(ControlReply::with_status(
+            403,
+            format!(
                 "the Host header {} does not name loopback\n",
                 host.map_or("(absent)".to_string(), |h| format!("`{h}`"))
             ),
-        });
+        ));
     }
     if let Some(origin) = origin {
-        return Err(ControlReply {
-            status: 403,
-            body: format!("a page at `{origin}` cannot use the control port\n"),
-        });
+        return Err(ControlReply::with_status(
+            403,
+            format!("a page at `{origin}` cannot use the control port\n"),
+        ));
     }
     if let Some(site) = fetch_site
         && !site.eq_ignore_ascii_case("none")
     {
-        return Err(ControlReply {
-            status: 403,
-            body: format!("a {site} browser request cannot use the control port\n"),
-        });
+        return Err(ControlReply::with_status(
+            403,
+            format!("a {site} browser request cannot use the control port\n"),
+        ));
     }
     Ok(())
 }
@@ -185,39 +190,56 @@ pub fn header_value(request: &tiny_http::Request, name: &str) -> Option<String> 
         .map(|h| h.value.as_str().to_string())
 }
 
-/// The answer to one [`ControlRequest`], as an HTTP status and a plain-text body.
+/// The answer to one [`ControlRequest`]: an HTTP status and a plain-text body,
+/// and beside them what a client reading JSON is given structured.
+///
+/// The control port sends the status and the body alone. The inspector's
+/// `/api/reload` sends all four, so the page can mark a rejected version's
+/// spans and say how much of the program an accepted one kept.
 #[derive(Debug)]
 pub struct ControlReply {
     pub status: u16,
     pub body: String,
+    /// A posted version's compile errors, against the posted text. Empty for
+    /// every other reply, including a refusal that points at no one span.
+    pub diagnostics: Vec<Diagnostic>,
+    /// How much of the replaced version an accepted reload or branch creation
+    /// kept.
+    pub reuse: Option<ReuseTally>,
 }
 
 impl ControlReply {
+    /// A reply carrying `status` and `body` and nothing structured.
+    fn with_status(status: u16, body: impl Into<String>) -> Self {
+        Self {
+            status,
+            body: body.into(),
+            diagnostics: Vec::new(),
+            reuse: None,
+        }
+    }
+
     /// A `200` carrying `body`.
     pub fn ok(body: impl Into<String>) -> Self {
-        Self {
-            status: 200,
-            body: body.into(),
-        }
+        Self::with_status(200, body)
     }
 
     /// A `400` carrying `body` — the request named a version the running
     /// program cannot compile or cannot take over the running state, or asked
     /// for something the branch table refuses.
     pub fn rejected(body: impl Into<String>) -> Self {
-        Self {
-            status: 400,
-            body: body.into(),
-        }
+        Self::with_status(400, body)
     }
 
     /// A `404` carrying `body` — an unknown path, or a branch name the table
     /// does not hold.
     pub fn not_found(body: impl Into<String>) -> Self {
-        Self {
-            status: 404,
-            body: body.into(),
-        }
+        Self::with_status(404, body)
+    }
+
+    /// A `503` carrying `body`: the request reached no running program.
+    fn unavailable(body: impl Into<String>) -> Self {
+        Self::with_status(503, body)
     }
 }
 
@@ -245,7 +267,13 @@ fn branch_error(error: BranchError, posted: &LoadedProgram) -> ControlReply {
             ControlReply::not_found(format!("no branch named `{name}`\n"))
         }
         BranchError::Refused(why) => ControlReply::rejected(why),
-        BranchError::Reload(e) => ControlReply::rejected(posted_rejection(&e, posted)),
+        BranchError::Reload(e) => {
+            let mut reply = ControlReply::rejected(posted_rejection(&e, posted));
+            if let ReloadError::Compile(errs) = &e {
+                reply.diagnostics = diagnostics_from_compile_errors(errs, posted.sources());
+            }
+            reply
+        }
     }
 }
 
@@ -310,20 +338,26 @@ pub fn service(
         ControlRequest::Reload { branch, code } => {
             let posted = LoadedProgram::from_text(POSTED, code.as_str());
             match live.reload(ctx, branch, &posted, main_consumer) {
-                Ok(report) => ControlReply::ok(render_reload(&report)),
+                Ok(report) => ControlReply {
+                    reuse: Some(report.reuse),
+                    ..ControlReply::ok(render_reload(&report))
+                },
                 Err(e) => branch_error(e, &posted),
             }
         }
         ControlRequest::Branch { name, parent, code } => {
             let posted = LoadedProgram::from_text(POSTED, code.as_str());
             match live.create_branch(ctx, name, parent, &posted, main_consumer) {
-                Ok(created) => ControlReply::ok(format!(
-                    "created `{}@{}` from `{}`\n{}",
-                    created.name,
-                    created.version,
-                    created.from,
-                    render_reload(&created.report),
-                )),
+                Ok(created) => ControlReply {
+                    reuse: Some(created.report.reuse),
+                    ..ControlReply::ok(format!(
+                        "created `{}@{}` from `{}`\n{}",
+                        created.name,
+                        created.version,
+                        created.from,
+                        render_reload(&created.report),
+                    ))
+                },
                 Err(e) => branch_error(e, &posted),
             }
         }
@@ -367,10 +401,9 @@ impl ControlMessage {
 impl Drop for ControlMessage {
     fn drop(&mut self) {
         if let Some(tx) = self.reply.take() {
-            let _ = tx.send(ControlReply {
-                status: 503,
-                body: "control request dropped without an answer\n".to_string(),
-            });
+            let _ = tx.send(ControlReply::unavailable(
+                "control request dropped without an answer\n",
+            ));
         }
     }
 }
@@ -385,12 +418,56 @@ fn bind(port: u16) -> Result<tiny_http::Server, Box<dyn std::error::Error + Send
     tiny_http::Server::http(format!("127.0.0.1:{port}"))
 }
 
+/// A handle that sends a [`ControlRequest`] to the main loop and waits for its
+/// answer.
+///
+/// The control port's server thread holds one, and so does the inspector's
+/// when the run has a control port, so a reload from either reaches the one
+/// queue the main loop services and the one [`service`] that answers it.
+#[derive(Clone)]
+pub struct ControlClient {
+    tx: SyncSender<ControlMessage>,
+}
+
+impl ControlClient {
+    /// Send `request` and block until the main loop answers it.
+    pub fn ask(&self, request: ControlRequest) -> ControlReply {
+        let (reply_tx, reply_rx) = sync_channel::<ControlReply>(0);
+        let message = ControlMessage {
+            request,
+            reply: Some(reply_tx),
+        };
+        // A closed reply channel means the main loop dropped the message
+        // without the `Drop` answer arriving, which is a bug rather than a
+        // state to report differently.
+        match self.tx.send(message) {
+            // A closed channel means the driver loop has ended, which it does
+            // when the program finishes; under `--inspect` the binary goes on
+            // serving. The unsent message is disarmed first: its `Drop` answer
+            // would send on `reply_tx`, whose receiver is this thread's own
+            // `reply_rx`, and the zero-capacity send would wait for it forever.
+            Err(SendError(mut unsent)) => {
+                unsent.reply = None;
+                ControlReply::with_status(
+                    409,
+                    "the program has finished, and a finished program takes no control request\n",
+                )
+            }
+            Ok(()) => reply_rx.recv().unwrap_or(ControlReply::with_status(
+                500,
+                "control request was never answered\n",
+            )),
+        }
+    }
+}
+
 /// The main loop's end of the control port.
 ///
-/// Holding one keeps the server thread's channel open; dropping it makes every
-/// later request fail rather than hang.
+/// Holding one keeps the channel open; dropping it makes every later request
+/// fail rather than hang.
 pub struct ControlPort {
     rx: Receiver<ControlMessage>,
+    client: ControlClient,
 }
 
 impl ControlPort {
@@ -401,6 +478,7 @@ impl ControlPort {
     /// leaves the program running with no control port and nothing saying so.
     pub fn new(port: u16) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (tx, rx) = sync_channel::<ControlMessage>(0);
+        let client = ControlClient { tx };
         let server = bind(port)?;
         // The port bound, not the one asked for: they differ under
         // `--control=0`, where the OS picks a free port, and printing `0` would
@@ -412,6 +490,7 @@ impl ControlPort {
             .map_or(port, |addr| addr.port());
         eprintln!("cambra: control port at http://localhost:{port}");
 
+        let server_client = client.clone();
         thread::spawn(move || {
             for mut request in server.incoming_requests() {
                 let mut body = String::new();
@@ -427,38 +506,7 @@ impl ControlPort {
                 });
                 let reply = match parsed {
                     Err(reply) => reply,
-                    Ok(parsed) => {
-                        let (reply_tx, reply_rx) = sync_channel::<ControlReply>(0);
-                        let message = ControlMessage {
-                            request: parsed,
-                            reply: Some(reply_tx),
-                        };
-                        // A closed reply channel means the main loop dropped the
-                        // message without the `Drop` answer arriving, which is a
-                        // bug rather than a state to report differently.
-                        match tx.send(message) {
-                            // A closed channel means the driver loop has ended,
-                            // which it does when the program finishes; under
-                            // `--inspect` the binary goes on serving. The unsent
-                            // message is disarmed first: its `Drop` answer would
-                            // send on `reply_tx`, whose receiver is this thread's
-                            // own `reply_rx`, and the zero-capacity send would
-                            // wait for it forever.
-                            Err(SendError(mut unsent)) => {
-                                unsent.reply = None;
-                                ControlReply {
-                                    status: 409,
-                                    body: "the program has finished, and a finished program \
-                                           takes no control request\n"
-                                        .to_string(),
-                                }
-                            }
-                            Ok(()) => reply_rx.recv().unwrap_or(ControlReply {
-                                status: 500,
-                                body: "control request was never answered\n".to_string(),
-                            }),
-                        }
-                    }
+                    Ok(parsed) => server_client.ask(parsed),
                 };
                 let header: tiny_http::Header =
                     "Content-Type: text/plain; charset=utf-8".parse().unwrap();
@@ -470,7 +518,13 @@ impl ControlPort {
             }
         });
 
-        Ok(ControlPort { rx })
+        Ok(ControlPort { rx, client })
+    }
+
+    /// A handle that sends requests to this port's main loop, for a server
+    /// other than the control port's own.
+    pub fn client(&self) -> ControlClient {
+        self.client.clone()
     }
 
     /// Take the next pending request, or `None` if none is waiting.

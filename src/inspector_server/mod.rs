@@ -1,5 +1,6 @@
 //! The inspector's transport edge: the read-only model rendered as JSON, a
-//! run's probe frames, and the HTTP server that hands both to the frontend.
+//! run's probe frames, the HTTP server that hands both to the frontend, and the
+//! route through which the frontend reloads the program ([`reload`]).
 //!
 //! The model itself is [`inspector_model`](crate::inspector_model), which owns
 //! the payload shape and the indices it is built from and answers no positional
@@ -30,6 +31,7 @@
 //! workspace member because the Rust half of the inspector is this module.
 
 pub mod live;
+pub mod reload;
 mod serve;
 pub mod wire_check;
 
