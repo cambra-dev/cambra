@@ -252,7 +252,7 @@ fn a_contract_states_what_the_function_causes(
 )]
 #[case::a_parameter_never_called(
     "pub def keep(f, x: Int):\n    x\n",
-    "pub keep: forall (A) {A, Int} => Int"
+    "pub keep: forall (A) {A, Int} => Int  # callable in a constant"
 )]
 #[case::a_returned_function(
     "pub def compose(f, g):\n    \\x -> g(f(x))\n",

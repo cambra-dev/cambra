@@ -306,6 +306,14 @@ a user's `` `some `` builds that module's own tag.
   or why the definition is not one, and reports nothing. A read that requires a constant reports
   the cached reason at the read (`Refused::of_definition`), and the interface records each public
   binding's result, so an importer's read reports the same reason.
+- **A `def` whose body is a constant over its parameters may be called in a constant.**
+  `settle_constants` reads each `def` too (`LoweringContext::const_function`): its parameters are
+  `ConstParam`s, its local `=` bindings and its value are terms over them, and it states no clause
+  and takes no `Mut` parameter. A call in a constant substitutes its arguments' terms into the
+  function's (`ConstFunction::applied`), so `plus(4)` and `5` reach one type. A call of a function
+  that may not be called reports the cached reason at the call (`Refused::of_function`), and the
+  interface records each public `def`'s result, read through `m::f` or a `use` name with the
+  importer's `const` arguments substituted.
 - **A type parameter is an alias of a declared `Type::Param`** from its statement down, as a `def`'s
   is, and binds no `let` (`LoweringContext::declare_type_parameter`). The interface records its
   bound and its default. A `run` statement's type arguments are lowered ahead of the module's

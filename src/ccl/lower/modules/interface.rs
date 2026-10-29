@@ -27,6 +27,10 @@ pub struct Interface {
     /// its term, over the module's `const` parameters, or why its definition is not one,
     /// which a module reading it where a constant is required reports.
     pub(in crate::ccl::lower) constants: HashMap<SmolStr, Result<ConstTerm, Refused>>,
+    /// What each public `def` is as a function a constant may call (`docs/chl-spec.md`, "9.19
+    /// Constants"): its term, or why it may not be called in one.
+    pub(in crate::ccl::lower) const_functions:
+        HashMap<SmolStr, Result<crate::ccl::constant::ConstFunction, Refused>>,
 }
 
 /// One parameter of a module.
@@ -519,6 +523,8 @@ impl Interface {
                 };
                 let constant = if matches!(self.constants.get(name), Some(Ok(_))) {
                     "  # a constant"
+                } else if matches!(self.const_functions.get(name), Some(Ok(_))) {
+                    "  # callable in a constant"
                 } else {
                     ""
                 };
@@ -644,6 +650,14 @@ impl Interface {
                 .filter(|binding| binding.public)
                 .filter_map(|binding| {
                     let settled = ctx.constants.settled(&binding.name)?;
+                    Some((binding.name.clone(), settled))
+                })
+                .collect(),
+            const_functions: bindings
+                .iter()
+                .filter(|binding| binding.public)
+                .filter_map(|binding| {
+                    let settled = ctx.constants.settled_function(&binding.name)?;
                     Some((binding.name.clone(), settled))
                 })
                 .collect(),

@@ -101,7 +101,9 @@ fn a_binding_no_constant_requires_is_any_value() {
 
 /// A binding read where a constant is required is refused at the read when its definition
 /// is not a constant, with what the definition reads beside it: a value parameter without
-/// `const`, a mutable variable, a call, a comprehension, or an operation with no value.
+/// `const`, a mutable variable, a call of a function whose body reads a value the run
+/// computes, states a requirement or takes a mutable variable, a builtin's call, a
+/// comprehension, or an operation with no value.
 #[rstest]
 #[case::parameter(
     indoc! {"
@@ -117,13 +119,33 @@ fn a_binding_no_constant_requires_is_any_value() {
     "},
     "`total` is a mutable variable"
 )]
-#[case::call(
+#[case::call_reading_a_value_the_run_computes(
     indoc! {"
+        n = sum([1, 2])
         def f(x):
+            x + n
+        limit = f(1)
+    "},
+    "`f` may not be called in a constant, since its body is not a constant"
+)]
+#[case::call_of_a_builtin("limit = sum([1, 2])\n", "builtins are not supported yet")]
+#[case::call_of_a_function_stating_a_requirement(
+    indoc! {"
+        def f(x: Int) => Int requires Transaction:
             x
         limit = f(1)
     "},
-    "a call in a constant is not supported yet"
+    "this function requires what its clause states, and a function called in a constant \
+     requires and causes nothing"
+)]
+#[case::call_of_a_function_taking_a_mutable_variable(
+    indoc! {"
+        def f(p: Mut(Int)) => Int:
+            p
+        limit = f(1)
+    "},
+    "`p` is a mutable variable the caller passes, and a function called in a constant reads \
+     only values"
 )]
 #[case::comprehension("limit = [x for x in [1, 2]]\n", "this is not a constant")]
 #[case::no_value("limit = 1 // 0\n", "`1 // 0` has no value")]
@@ -240,7 +262,8 @@ fn a_declaration_refuses_what_its_constant_refuses(
 }
 
 /// A run's `const` argument is the value a constructor's refinement checks against, whether
-/// the run, an import or a constant of another module gives it.
+/// the run, an import or a constant of another module gives it, or a call of a function whose
+/// body is a constant over its parameters, defined above, imported or named through `use`.
 #[rstest]
 #[case::run(
     indoc! {"
@@ -279,6 +302,34 @@ fn a_declaration_refuses_what_its_constant_refuses(
     "},
     5
 )]
+#[case::call(
+    indoc! {"
+        def plus(x: Int) => Int:
+            y = x + 1
+            y
+        def twice_plus(x: Int) => Int:
+            plus(plus(x))
+        run shop(max_rate=twice_plus(3)) as eu
+        eu::Tag::new(1).rate()
+    "},
+    5
+)]
+#[case::imported_function(
+    indoc! {"
+        import cfg
+        run shop(max_rate=cfg::double(3)) as eu
+        eu::Tag::new(1).rate()
+    "},
+    6
+)]
+#[case::used_function(
+    indoc! {"
+        import cfg use double
+        run shop(max_rate=double(3) + 1) as eu
+        eu::Capped::new(14).extract()
+    "},
+    14
+)]
 #[timeout(Duration::from_secs(10))]
 fn a_run_gives_its_constant_a_value(#[case] root: &str, #[case] expected: i64) {
     check_program_scalar(
@@ -287,7 +338,10 @@ fn a_run_gives_its_constant_a_value(#[case] root: &str, #[case] expected: i64) {
             &[
                 ("shop", SHOP),
                 ("library", LIBRARY),
-                ("cfg", "pub rate = 5\n"),
+                (
+                    "cfg",
+                    "pub rate = 5\npub def double(x: Int) => Int:\n    x * 2\n",
+                ),
             ],
         ),
         Value::Int(expected),
@@ -314,12 +368,13 @@ fn a_run_gives_its_constant_a_value(#[case] root: &str, #[case] expected: i64) {
 )]
 #[case::call(
     indoc! {"
+        n = sum([1, 2])
         def f(x):
-            x
+            x + n
         run shop(max_rate=f(5)) as eu
         1
     "},
-    "a call in a constant is not supported yet"
+    "`f` may not be called in a constant, since its body is not a constant"
 )]
 #[timeout(Duration::from_secs(10))]
 fn a_run_refuses_what_its_constant_refuses(#[case] root: &str, #[case] needle: &str) {
@@ -328,12 +383,25 @@ fn a_run_refuses_what_its_constant_refuses(#[case] root: &str, #[case] needle: &
 }
 
 /// Two runs reach one type exactly when their `const` arguments have one value, however each
-/// writes it, and a run of a run compares by the value its arguments compute.
+/// writes it, a call included, and a run of a run compares by the value its arguments compute.
 #[rstest]
 #[case::one_value(
     indoc! {"
         run shop(max_rate=5) as eu
         run shop(max_rate=2 + 3) as us
+        def f(c: eu::Capped) => Int:
+            c.extract()
+        f(us::Capped::new(3))
+    "},
+    &[("shop", SHOP)],
+    3
+)]
+#[case::a_call(
+    indoc! {"
+        def plus(x: Int) => Int:
+            x + 1
+        run shop(max_rate=5) as eu
+        run shop(max_rate=plus(4)) as us
         def f(c: eu::Capped) => Int:
             c.extract()
         f(us::Capped::new(3))
