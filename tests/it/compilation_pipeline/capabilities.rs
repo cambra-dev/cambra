@@ -379,7 +379,7 @@ fn a_feed_reached_through_another_name(
         pub def keep(f, x: Int):
             x
     "},
-    "pub keep: forall (A) {A, Int} => Int"
+    "pub keep: forall (A) {A, Int} => Int  # callable in a constant"
 )]
 #[case::a_returned_function(
     indoc! {"

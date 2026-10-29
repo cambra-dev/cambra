@@ -6211,8 +6211,7 @@ Count`, not with the type `Count` names.
   the type its uses infer. A type parameter is opaque apart from its bound. One with no bound is
   **coupled** to its arguments: the module's uses of it are checked at each argument. The interface
   states which value parameters are `const` and which public bindings are constants
-  ([9.19 Constants](#919-constants)).
-  **[Planned]** — and which public functions may be called in a constant.
+  ([9.19 Constants](#919-constants)), and which public functions may be called in a constant.
 - **Imports are read through contracts.** A module sees each member another module exports through
   its contract, and whether the module is shareable
   ([9.7 Importing asserts a shareable module](#97-importing-asserts-a-shareable-module)).
@@ -6436,22 +6435,19 @@ pub type Capped = {Int where _ <= limit}
 
 - **A constant expression** is built from literals; constant bindings and `const` parameters in
   scope, including another module's public constant binding, `cfg::port`; operators, a ternary,
-  and record, tuple and list literals over constants, and a field or element of one.
-  **[Planned]** — calls, with constant arguments, to functions that may be called in a constant.
-  A type, an import name and a run name are fixed at link time as well, and stand where a type or
-  a module is expected.
+  and record, tuple and list literals over constants, and a field or element of one; and calls,
+  with constant arguments, to functions that may be called in a constant. A type, an import name
+  and a run name are fixed at link time as well, and stand where a type or a module is expected.
 - **A top-level `=` binding is a constant when its definition is a constant expression.** `limit =
   max_rate * 2` is one, and so is `cap = scale(limit)` for a `scale` that may be called in a
-  constant (**[Planned]**). A binding that is not a constant is an ordinary value wherever no
-  constant is required. Read where one is required, it is an error at the read that names what its
-  definition reads. A mutable variable, a value parameter without `const`, and a function are never
-  constants.
+  constant. A binding that is not a constant is an ordinary value wherever no constant is required.
+  Read where one is required, it is an error at the read that names what its definition reads. A
+  mutable variable, a value parameter without `const`, and a function are never constants.
 - **A `const` parameter is the only binding a run gives a constant**, since the obligation falls on
   every `run` and `import` of the module, and a module checked alone states it in its interface
   ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). `const` before any
   other statement is an error.
-- **[Planned]** **A function may be called in a constant when its body reads only its own
-  parameters, constants,
+- **A function may be called in a constant when its body reads only its own parameters, constants,
   and functions that may be, and it requires nothing and causes nothing**
   ([6.9 Capabilities](#69-capabilities)). Requiring and causing nothing is not
   enough alone: a function that captures a value the run computes is not one. A call computes the

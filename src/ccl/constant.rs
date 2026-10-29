@@ -61,6 +61,40 @@ pub enum ConstTerm {
     Element(Box<ConstTerm>, Box<ConstTerm>),
 }
 
+/// A function that may be called in a constant (`docs/chl-spec.md`, "9.19 Constants"): its
+/// body, as a term over its parameters and the `const` parameters of its module. A call is the
+/// body with each parameter replaced by its argument's term.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct ConstFunction {
+    pub params: Vec<ConstParam>,
+    pub body: ConstTerm,
+}
+
+impl ConstFunction {
+    /// The term a call with `args`, one per parameter, computes.
+    pub fn applied(&self, args: Vec<ConstTerm>) -> Result<ConstTerm, NoValue> {
+        debug_assert_eq!(
+            args.len(),
+            self.params.len(),
+            "a call passes each parameter"
+        );
+        let values = self.params.iter().map(|p| p.id).zip(args).collect();
+        self.body.substituted(&values)
+    }
+
+    /// The function with each `const` parameter of its module that `values` maps replaced
+    /// by its term, as [`ConstTerm::substituted`] does.
+    pub fn substituted(
+        &self,
+        values: &HashMap<TypeParamId, ConstTerm>,
+    ) -> Result<ConstFunction, NoValue> {
+        Ok(ConstFunction {
+            params: self.params.clone(),
+            body: self.body.substituted(values)?,
+        })
+    }
+}
+
 /// Why a constant has no value: an operation the runtime gives no result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NoValue(pub String);
