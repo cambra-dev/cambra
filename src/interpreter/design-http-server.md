@@ -81,6 +81,18 @@ front, so a release frees memory only over an unbroken run from the lowest index
 release covering a later region is recorded and withheld from that producer; its memory is reclaimed
 when the front is released.
 
+## Cutting morsels
+
+`HttpServerDataSource` cuts morsels (`cuts_morsels`), so the pool's dispatcher can claim request
+positions from it. `first_keys_in(region, rows)` lists the first `rows` indices, in increasing
+order, of the window the buffer still holds that `region` admits
+(`UIntStreamBuffer::first_keys_in`). Indices are request positions, so increasing order is arrival
+order. A prefix every producer released is outside the window, and an index at or past `ready_size`
+has not arrived and is outside it too. `elements_in(producer, region)` is `get_elements` cut to
+`region` before the indices are listed. `check_for_new_data` is called by the driver thread only:
+the arrivals reach the dispatcher as a notification, and the dispatcher claims what is ready and not
+yet claimed.
+
 ---
 
 ## Multi-endpoint programs

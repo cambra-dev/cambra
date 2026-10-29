@@ -192,6 +192,44 @@ impl UIntStreamBuffer {
         ColumnValue::UInts(indices)
     }
 
+    /// The first `rows` indices, in increasing order, that are buffered and admitted by `region`: what a pool's claim cuts a morsel from. Indices are
+    /// request positions, so increasing order is arrival order. A prefix every producer released
+    /// is not buffered and is not returned. Fewer than `rows`, or none, when `region` admits fewer.
+    pub(crate) fn first_keys_in(&self, region: &Predicate, rows: u64) -> Vec<Value> {
+        // The window is `[start_idx, ready_size)`, which lies inside the yield predicate (everything
+        // pushed, or everything once the stream ended), so the yield predicate adds no bound.
+        let admitted = self.live_window().intersection(&Self::index_set(region));
+        Self::indices(&admitted)
+            .take(usize::try_from(rows).unwrap_or(usize::MAX))
+            .map(Value::UInt)
+            .collect()
+    }
+
+    /// [`get_elements`](Self::get_elements) cut to `region`, before the indices are listed.
+    pub(crate) fn elements_in(&self, producer: &str, region: &Predicate) -> ColumnValue {
+        let obsolete = self
+            .releases
+            .of(producer)
+            .unwrap_or_else(|| panic!("Unknown producer: {producer}"));
+        let live = self
+            .live_window()
+            .difference(&Self::index_set(obsolete))
+            .intersection(&Self::index_set(region));
+        ColumnValue::UInts(Self::indices(&live).collect())
+    }
+
+    /// The indices of a set of closed intervals, in increasing order.
+    fn indices(set: &IntervalSet<Value>) -> impl Iterator<Item = u64> + '_ {
+        set.intervals()
+            .iter()
+            .flat_map(|iv| match (iv.lval(), iv.rval()) {
+                (Some(Value::UInt(lo)), Some(Value::UInt(hi))) => *lo..=*hi,
+                _ => unreachable!(
+                    "intersecting with the live window leaves every interval closed on both sides"
+                ),
+            })
+    }
+
     /// Record where producers registering from now on start: the intersection
     /// of the releases of `predecessor`'s producers on this source, or the
     /// agreement where `predecessor` has no producer on it. See
@@ -296,6 +334,126 @@ mod tests {
             Value::UInt(lo),
             Value::UInt(hi),
         )))
+    }
+
+    fn keys(first: &[u64]) -> Vec<Value> {
+        first.iter().map(|&i| Value::UInt(i)).collect()
+    }
+
+    /// An empty buffer holds no key, whatever the region admits.
+    #[test]
+    fn an_empty_buffer_cuts_no_morsel() {
+        let buf = UIntStreamBuffer::new();
+        assert_eq!(buf.first_keys_in(&Predicate::True, 4), keys(&[]));
+        assert_eq!(buf.first_keys_in(&covering(0, 9), 4), keys(&[]));
+    }
+
+    /// The first `rows` held keys of the region come back in order, and fewer when the region
+    /// admits fewer.
+    #[test]
+    fn a_morsel_is_the_first_rows_of_the_region() {
+        let buf = buffer_with(8);
+        assert_eq!(buf.first_keys_in(&Predicate::True, 3), keys(&[0, 1, 2]));
+        assert_eq!(buf.first_keys_in(&covering(2, 5), 3), keys(&[2, 3, 4]));
+        assert_eq!(buf.first_keys_in(&covering(6, 7), 3), keys(&[6, 7]));
+        assert_eq!(buf.first_keys_in(&Predicate::False, 3), keys(&[]));
+    }
+
+    /// A region that reaches past the buffered window names no key outside it.
+    #[test]
+    fn a_region_partly_outside_the_window_yields_only_held_keys() {
+        let mut buf = buffer_with(6);
+        buf.release("p", covering(0, 1));
+        assert_eq!(buf.start_idx, 2);
+        assert_eq!(
+            buf.first_keys_in(&covering(0, 99), 10),
+            keys(&[2, 3, 4, 5]),
+            "a released prefix and a region past the end are not keys"
+        );
+    }
+
+    /// A region beyond the yield predicate, the keys that have not arrived, holds no key, and the
+    /// predicate of a finished stream does not make keys that never arrived appear.
+    #[test]
+    fn a_region_beyond_the_yield_predicate_yields_nothing() {
+        let mut buf = buffer_with(3);
+        assert_eq!(buf.first_keys_in(&covering(3, 9), 4), keys(&[]));
+        buf.eof_reached = true;
+        assert_eq!(buf.get_yield_predicate(), Predicate::True);
+        assert_eq!(buf.first_keys_in(&Predicate::True, 9), keys(&[0, 1, 2]));
+    }
+
+    /// A pool's claim through a `LiveSource` over the buffer: a region that names a released prefix
+    /// and the keys after it is cut from the window, so no morsel names a key the buffer dropped.
+    #[test]
+    fn a_claim_over_a_released_prefix_is_cut_from_the_window() {
+        use crate::interpreter::tile_operators::{Claim, LiveSource, MorselSource};
+        use std::sync::{Arc, Mutex};
+
+        let mut buf = buffer_with(8);
+        buf.release("p", Predicate::False);
+        buf.release("p", covering(0, 3));
+        assert_eq!(buf.start_idx, 4);
+        let ready = buf.get_yield_predicate();
+        let buf = Arc::new(Mutex::new(buf));
+        let source = LiveSource::new(
+            move || ready.clone(),
+            move |region, rows| buf.lock().unwrap().first_keys_in(region, rows),
+        );
+        source.publish(&crate::interpreter::Projection::Everything);
+        let Claim::Morsel(guard) = source.claim(2) else {
+            panic!("keys 4..=7 are held");
+        };
+        let crate::interpreter::TileGuard::Function(crate::interpreter::FunctionGuard::Domain(
+            morsel,
+        )) = guard
+        else {
+            panic!("a morsel is a domain guard");
+        };
+        assert!(morsel.contains(&Value::UInt(4)) && morsel.contains(&Value::UInt(5)));
+        assert!(!morsel.contains(&Value::UInt(3)), "{morsel:?}");
+        assert!(!morsel.contains(&Value::UInt(6)), "{morsel:?}");
+    }
+
+    /// A released prefix is not offered again, to a producer that released it or to a claim.
+    #[test]
+    fn a_released_prefix_is_not_offered() {
+        let mut buf = buffer_with(8);
+        buf.release("p", Predicate::False);
+        buf.release("p", covering(0, 3));
+        assert_eq!(buf.first_keys_in(&Predicate::True, 3), keys(&[4, 5, 6]));
+        assert_eq!(
+            buf.elements_in("p", &covering(2, 5)),
+            ColumnValue::from_uints(vec![4, 5])
+        );
+    }
+
+    /// The elements in a region are what `get_elements` lists, cut to the region.
+    #[test]
+    fn the_elements_in_a_region_are_the_elements_cut_to_it() {
+        let mut buf = buffer_with(8);
+        buf.release("p", covering(3, 4));
+        for region in [
+            Predicate::True,
+            Predicate::False,
+            covering(0, 2),
+            covering(2, 6),
+            covering(5, 99),
+        ] {
+            let whole = buf.get_elements("p");
+            let expected: Vec<u64> = match whole {
+                ColumnValue::UInts(all) => all
+                    .into_iter()
+                    .filter(|i| region.contains(&Value::UInt(*i)))
+                    .collect(),
+                other => panic!("{other:?}"),
+            };
+            assert_eq!(
+                buf.elements_in("p", &region),
+                ColumnValue::from_uints(expected),
+                "{region:?}"
+            );
+        }
     }
 
     /// A single producer releasing a prefix frees it, whichever of the index

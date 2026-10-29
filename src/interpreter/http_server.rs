@@ -25,7 +25,7 @@ use tiny_http::{Header, Response, Server};
 
 use crate::ccl::Type;
 use crate::interpreter::{
-    BaseType, ColumnValue, DataSink, DataSourceDomainExtentImpl, Extent,
+    BaseType, ColumnValue, DataSink, DataSourceDomainExtentImpl, Extent, Value,
     stream_buffer::UIntStreamBuffer,
     tiling::{Predicate, Tile},
 };
@@ -576,6 +576,19 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
 
     fn element_extent(&self) -> Extent {
         Extent::Base(BaseType::UInt)
+    }
+
+    /// Request positions are totally ordered, so a pool cuts a morsel out of them.
+    fn cuts_morsels(&self) -> bool {
+        true
+    }
+
+    fn first_keys_in(&self, region: &Predicate, rows: u64) -> Vec<Value> {
+        self.buf.first_keys_in(region, rows)
+    }
+
+    fn elements_in(&self, producer: &str, region: &Predicate) -> ColumnValue {
+        self.buf.elements_in(producer, region)
     }
 
     fn get(&self, key: ColumnValue) -> ColumnValue {
