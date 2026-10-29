@@ -454,6 +454,65 @@ still have a one-candidate sum during inference. A same-domain boxed conditional
 not erased: realization records its witness in `realized`, and `collapse_determined_sums`
 preserves it so the `Realize` assertion retains its binder.
 
+### A conditional chosen per row
+
+A conditional whose condition reads a loop's or a comprehension's variable chooses an arm for each
+row:
+
+```
+for i in [1, 2]:
+    out << sum([1, 2] if i > 1 else [3, 4])
+```
+
+Row `i = 1` takes `[3, 4]` and row `i = 2` takes `[1, 2]`, so the sink receives `7` and `3`.
+
+Realization does not compile this conditional. The loop body is a lambda over the row, and lambda
+elimination, which runs before planning, replaces the `Case` in it with one leg per arm:
+
+```
+⊔ᵢ (filter_values(π̂ᵢ) ≫ (armᵢ ▷ const))
+```
+
+A leg keeps the rows that pass its gate `π̂ᵢ`, the arm's first-match path condition, and gives
+each of them its arm. Every row passes exactly one gate, so the union of the legs holds one value
+per row.
+
+A conditional in a filter's predicate compiles the same way, because the predicate is planned as a
+lifted term ([Planning a lifted term](optimization.md#planning-a-lifted-term)):
+
+```
+out << sum([x for x in [1, 2, 3, 4, 5, 6, 7, 8] if x > sum([1, 2] if x > 4 else [3, 4])])
+```
+
+#### Boxed arms
+
+Arms over one domain give every row a collection over that domain. Boxed arms over different
+domains give each row a collection over the domain of the arm it selected:
+
+```
+for i in [1, 2]:
+    out << sum(box([1, 2]) if i > 1 else box([3, 4, 5]))
+```
+
+Each row's value has type `Σ (σ : [0..2, 0..3]). σ ⤇ Int` and carries its own `σ`, so each
+arm keeps its `box`, as a row of a jagged list literal does. `unbox` erases a `box` whose type has
+one candidate unless the type its position requires is a sum. `walk_children_with_demand` passes
+the position's type through each leg to its arm by two rules:
+
+- The last step of a `≫` chain receives the chain's result type.
+- The argument of `𝑎 ▷ const` receives the result type, since `𝑎 ▷ const` returns `𝑎` at every
+  row.
+
+A consumer that iterates a leg's arm finds the list beneath the `box` (`mark_component_source`).
+
+#### At runtime
+
+The legs are one stream of rows, split by their gates. `UnionOperator` merges them back into one
+collection keyed by row, including where each row's value is a collection. Where boxed arms give
+rows different domains, the merged collection keys each row's values by the bound the node's type
+declares, the bound a list literal of boxed rows has
+(`OpConversionContext::witness_domain_extent`).
+
 ### Realization instantiates the witness inside the predicate
 
 Realization substitutes one candidate for the witness at the site, and the predicate of a

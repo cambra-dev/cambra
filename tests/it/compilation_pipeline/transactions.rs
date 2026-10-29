@@ -4046,14 +4046,10 @@ fn a_keyed_write_of_a_conditional_value_inside_a_block() {
     assert_eq!(map_entries_int(&value), vec![(1, 6), (2, 5)]);
 }
 
-/// A keyed write under an `if` inside a block panics at run time, in a flat merge
-/// (`src/interpreter/tile_operators/union.rs`) whose arms carry different extents.
+/// A keyed write under an `if` inside a block, which
 /// `src/ccl/design/mutability.md`, "General in-transaction conditionals (and conditional writes)"
-/// admits writes under a block's `if`. A scalar write under the same `if` and a keyed write of a conditional value (the
-/// sibling above) both run. Writing the key from both arms of a ``match m[r]?`` panics the same
-/// way.
+/// admits.
 #[test]
-#[should_panic(expected = "a flat merge reassembles one domain, but the arms carry different")]
 fn a_keyed_write_under_an_if_inside_a_block() {
     let value = final_mut_var_value(indoc! {r#"
         m: Mut(Map(Int, Int), Txn) := box(map([(1, 10)]))

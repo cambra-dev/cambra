@@ -105,6 +105,26 @@ impl UnionOperator {
                 "the arms agree on a codomain the node's type does not declare"
             );
             codomains[0].clone()
+        } else if let Extent::Function {
+            domain: bound,
+            codomain: declared_inner,
+        } = &declared_codomain
+            && let Some(inner) = Self::jagged_rows(&codomains)
+        {
+            // **Rows of a jagged collection**: each arm's value is a collection over its own
+            // domain, and the node's type bounds them all — a sum, whose witness each row's
+            // value carries in its own keys (`OpConversionContext::witness_domain_extent`).
+            // The merged level is that bound, as a list literal of boxed rows has it.
+            debug_assert_eq!(
+                inner.extent(),
+                **declared_inner,
+                "jagged arms agree beneath their domains on a value the node's type does not \
+                 declare"
+            );
+            Tiling::DataFunction {
+                domain: (**bound).clone(),
+                codomain: Box::new(inner.clone()),
+            }
         } else {
             // Arms whose tilings differ merge into one column at the declared codomain, so
             // each must fit in one: `Tiling::is_scalar`, a `Scalar` or a `Record` of such
@@ -127,6 +147,17 @@ impl UnionOperator {
         Tiling::data_function(Extent::Union(TagMap::from_positional(domains)), codomain)
     }
 
+    /// The tiling every arm agrees on beneath its domain, where every arm is a collection:
+    /// arms that differ only in which keys their rows have.
+    fn jagged_rows<'t>(codomains: &[&'t Tiling]) -> Option<&'t Tiling> {
+        let mut beneath = codomains.iter().map(|t| match t {
+            Tiling::DataFunction { codomain, .. } => Some(codomain.as_ref()),
+            _ => None,
+        });
+        let first = beneath.next()??;
+        beneath.all(|b| b == Some(first)).then_some(first)
+    }
+
     /// Collapse the coproduct domain [`new`](Self::new) built back to the one
     /// extent the arms share.
     ///
@@ -140,10 +171,6 @@ impl UnionOperator {
             Tiling::DataFunction { domain, codomain } => (domain, codomain),
             other => return other,
         };
-        // A nest is not the shape a flat merge reassembles; hand it back untouched.
-        if codomain.as_ref().holds_a_level() {
-            return Tiling::DataFunction { domain, codomain };
-        }
         let mut arms = match domain {
             Extent::Union(ds) => ds.into_values(),
             other => vec![other],
