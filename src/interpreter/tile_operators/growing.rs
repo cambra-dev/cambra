@@ -54,7 +54,8 @@ impl Source {
 }
 
 /// The script of an input, which the test that drives the input writes and the input reads. It
-/// is spelled in full like the other test doubles' cells in `test_helpers`.
+/// is spelled in full like the other test doubles' cells in `test_helpers`, which the
+/// shared-state check reads.
 #[allow(unused_qualifications)]
 pub(crate) type Shared = std::rc::Rc<std::cell::RefCell<Source>>;
 
