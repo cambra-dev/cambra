@@ -3,7 +3,7 @@
 
 use std::sync::{Arc, Mutex, PoisonError, RwLock, Weak};
 
-use crate::interpreter::tile_operators::{LiveSource, MorselSource};
+use crate::interpreter::tile_operators::LiveSource;
 use crate::interpreter::{
     Consumer, FunctionGuard, LockNow, Predicate, Projection, Tile, TileGuard, Tiling, Value,
 };
@@ -248,18 +248,6 @@ impl Materialized {
             .sources
             .push(Arc::downgrade(&source));
         source
-    }
-
-    /// Whether `source` is one this output handed out.
-    pub(crate) fn feeds(&self, source: &Arc<dyn MorselSource>) -> bool {
-        let wanted = Arc::as_ptr(source) as *const ();
-        self.state
-            .read()
-            .unwrap_or_else(PoisonError::into_inner)
-            .sources
-            .iter()
-            .filter_map(Weak::upgrade)
-            .any(|ours| Arc::as_ptr(&ours) as *const () == wanted)
     }
 
     /// Register a reading operator, and say which record is its. Workers that read as one

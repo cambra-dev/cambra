@@ -500,15 +500,9 @@ mod inline {
 
             let (mut ctx, mut program, source, sink) = writes_to_a_sink(code);
             let config = Config { morsel_rows: 2 };
-            let mut run = PooledRun::start_in(
-                MemoMode::Sink,
-                &mut ctx,
-                &mut program,
-                &mut None,
-                &config,
-                Box::new(|| {}),
-            )
-            .unwrap_or_else(|why| panic!("{why}"));
+            let mut run =
+                PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
+                    .unwrap_or_else(|why| panic!("{why}"));
             for (arrived, upto) in [(0..3, 2), (3..7, 6)] {
                 arrive(&source, arrived);
                 source
@@ -677,28 +671,16 @@ mod inline {
     /// A chain that reads a memo at its own keys runs behind the pipeline that fills the memo:
     /// rows that arrive in waves, with morsels of two rows, give the serial answer, every row is
     /// read and released, and no morsel of the downstream pipeline names a key the memo has not
-    /// merged (it would read a row that is not there). The memo is a pool materialization or a
-    /// breaker in sink mode, whose pushes are what name the keys.
+    /// merged (it would read a row that is not there). The memo's pushes are what name the keys.
     #[test]
     fn a_keyed_read_runs_behind_the_keys_its_memo_has_merged() {
         let whole = std::iter::once(0..7).collect::<Vec<_>>();
-        let modes = [MemoMode::Materialize, MemoMode::Sink];
-        let waves = [whole, vec![0..1, 1..4, 4..7], vec![0..3, 3..4, 4..7]];
-        for (mode, waves) in modes
-            .into_iter()
-            .flat_map(|mode| waves.iter().cloned().map(move |waves| (mode, waves)))
-        {
+        for waves in [whole, vec![0..1, 1..4, 4..7], vec![0..3, 3..4, 4..7]] {
             let (mut ctx, mut program, source) = over_source1(KEYED_CODE);
             let config = Config { morsel_rows: 2 };
-            let mut run = PooledRun::start_in(
-                mode,
-                &mut ctx,
-                &mut program,
-                &mut None,
-                &config,
-                Box::new(|| {}),
-            )
-            .unwrap_or_else(|why| panic!("{why}"));
+            let mut run =
+                PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
+                    .unwrap_or_else(|why| panic!("{why}"));
             let mut main = run.take_main().expect("a main output");
             let universal = main.tiling().universal_guard();
             for wave in waves.iter().cloned() {
@@ -713,13 +695,9 @@ mod inline {
             }
             source.lock_wait().set_yield_predicate(Predicate::True);
             let tile = drive(&mut ctx, &mut run, &mut *main, 100);
-            assert_eq!(entries(&tile), serial_keyed(7), "{mode:?} {waves:?}");
+            assert_eq!(entries(&tile), serial_keyed(7), "{waves:?}");
             main.release(universal);
-            assert_eq!(
-                run.held_keys(),
-                0,
-                "{mode:?} {waves:?}: every row was released"
-            );
+            assert_eq!(run.held_keys(), 0, "{waves:?}: every row was released");
         }
     }
 
@@ -784,30 +762,10 @@ mod inline {
         );
     }
 
-    /// `code` on the inline driver with the memos in `mode` and morsels of `morsel_rows` rows.
-    fn inline_in(mode: MemoMode, code: &str, morsel_rows: u64) -> Tile {
-        let mut ctx = GlobalContext::default();
-        let mut program = compiled(&mut ctx, code);
-        let config = Config { morsel_rows };
-        let mut run = PooledRun::start_in(
-            mode,
-            &mut ctx,
-            &mut program,
-            &mut None,
-            &config,
-            Box::new(|| {}),
-        )
-        .unwrap_or_else(|why| panic!("{why}"));
-        let mut main = run.take_main().expect("a main output");
-        let tile = drive(&mut ctx, &mut run, &mut *main, 200);
-        assert_eq!(run.lap(), Lap::Done, "every pipeline finished");
-        tile
-    }
-
     /// A value the program names and reads runs as two pipelines with the memo as the breaker of
-    /// the first, and answers as the pool that materializes it does.
+    /// the first, and answers as the serial loop does.
     #[test]
-    fn a_memo_in_sink_mode_equals_the_materialized_answer() {
+    fn a_memo_pipeline_equals_the_serial_answer() {
         for rows in [0, 1, 9, 100] {
             let code = formatdoc! {"
                 xs = [x + 1 for x in {}]
@@ -815,7 +773,7 @@ mod inline {
             ", list(rows)};
             for morsel_rows in [1, 7] {
                 assert_eq!(
-                    entries(&inline_in(MemoMode::Sink, &code, morsel_rows)),
+                    entries(&inline(&code, morsel_rows)),
                     entries(&serial(&code)),
                     "{rows} rows, {morsel_rows}-row morsels"
                 );
@@ -858,8 +816,8 @@ mod inline {
         assert_eq!(entries(&tile), [(0, 1), (1, 11), (2, 21)]);
     }
 
-    /// A value the program names and reads, over a live source, ends with no release record and
-    /// no retained key at the source once the run is released and dropped.
+    /// A value the program names and reads, over a live source, leaves no retained key at the
+    /// source once the run is released, and no release record once the context is dropped.
     #[test]
     fn a_memo_over_a_source_leaves_no_record_and_no_key() {
         let (mut ctx, mut program, source) = over_source1(indoc! {"
@@ -879,7 +837,15 @@ mod inline {
         main.release(universal);
         drop(main);
         drop(run);
-        assert_eq!(source.lock_wait().retained_keys(), 0);
+        assert_eq!(
+            source.lock_wait().retained_keys(),
+            0,
+            "the memo released the rows it merged"
+        );
+        // The memo's producer, which owns the chain that reads the source, lives in the context's
+        // fan-outs and holds its record, fully released, until the context drops.
+        drop(program);
+        drop(ctx);
         assert_eq!(source.lock_wait().release_records(), 0);
     }
 }

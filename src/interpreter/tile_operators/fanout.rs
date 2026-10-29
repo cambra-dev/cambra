@@ -594,10 +594,6 @@ impl TileOperator for FanOutSlot {
         self.hold.with_input_mut(visit);
     }
 
-    fn drop_serial_subscription(&mut self) {
-        self.shared().lock_now().producer = None;
-    }
-
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
         let id = self.shared().lock_now().id;
         if self.primary {

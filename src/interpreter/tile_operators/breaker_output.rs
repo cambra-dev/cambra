@@ -97,37 +97,6 @@ impl TileOperator for BreakerOutput {
     }
 }
 
-/// What a pool leaves where it took a chain out of the graph: an operator with the chain's tiling
-/// and no inputs, which nothing subscribes.
-pub(crate) struct Detached {
-    tiling: Tiling,
-}
-
-impl Detached {
-    pub(crate) fn new(tiling: Tiling) -> Self {
-        Self { tiling }
-    }
-}
-
-impl TileOperator for Detached {
-    fn tiling(&self) -> &Tiling {
-        &self.tiling
-    }
-
-    fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
-
-    fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
-
-    fn subscribe(
-        &mut self,
-        _intent_guard: TileGuard,
-        _consumer: Box<dyn Consumer>,
-        _scheduler: &mut Scheduler,
-    ) -> Box<dyn TileProducer> {
-        panic!("a chain a pool took out of the graph is not subscribed")
-    }
-}
-
 /// Producer for [`BreakerOutput`]: answers a read from the rows the breaker holds.
 struct BreakerOutputProducer {
     base: ProducerBase,
@@ -603,15 +572,6 @@ mod tests {
         );
         materialized.retire_readers();
         assert!(int_entries(&materialized.snapshot(&keys_between(0, 3))).is_empty());
-    }
-
-    /// The output knows the sources it handed out, and only those.
-    #[test]
-    fn an_output_feeds_the_sources_it_handed_out() {
-        let materialized = Materialized::new(ints());
-        let (mine, other) = (output(&materialized), output(&Materialized::new(ints())));
-        assert!(materialized.feeds(&mine.morsel_source().unwrap()));
-        assert!(!materialized.feeds(&other.morsel_source().unwrap()));
     }
 
     /// The source over the output claims published keys that have rows: a key the pipeline

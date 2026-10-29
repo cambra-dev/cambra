@@ -88,19 +88,15 @@ domain is the next shape.
 
 `PooledRun::start` reads everything it can refuse before it takes the program: the plan and each
 pipeline's source (`check_pipelines`). It then drops the `main` producer and subscribes the
-pipelines. `cut` takes the chain that feeds each `Memo` out of the graph, leaving a `Detached`, and
-replaces every slot with a `BreakerOutput` over the output that chain will fill. The graph is the
-pool's from there: the cut leaves it unusable to the scheduler loop, which is why nothing the pool
-can refuse follows it.
-The fan-out keeps the serial chain the program subscribed when it compiled: `FanOutShared::producer`
-is the serial `Memo`'s producer, and the operator map holds the fan-out for as long as the program,
-so dropping the `main` producer and the slots does not end that subscription, and its release
-records would pin the sources beneath it. `cut` calls `TileOperator::drop_serial_subscription` at
-the slot it takes the chain behind, which drops the producer. `LiveProgram` clears the branch's
-operator map once the pool has taken the program, so a reload compiles afresh and cannot offer the
-fan-out, whose `Memo` now holds a `Detached`, to the next version; a pool takes a program for good.
-A test runs a shared value over a source, with delivery that waits for each chunk to be released and
-with delivery that does not, and asserts that no record and no key is left with the source.
+pipelines. A `Memo` stays in the graph: its own producer, switched to sink mode, is the breaker of the
+pipeline that fills it ([Pipeline breakers: sink, finalize and get](#pipeline-breakers-sink-finalize-and-get)),
+and the program's slots read it. `LiveProgram` clears the branch's operator map once the pool has
+taken the program, so a reload compiles afresh and cannot offer the fan-out to the next version; a
+pool takes a program for good. The memo's producer keeps its release record with each source beneath
+it until the context's fan-outs drop it, and has released everything it merged by then.
+A test runs a shared value over a source and asserts that no key is retained at the source once
+the run is released, and no record once the context drops
+(`a_memo_over_a_source_leaves_no_record_and_no_key`).
 
 The plan reads the graph through `TileOperator::visit_inputs` and cuts it through
 `TileOperator::visit_inputs_mut`, which states an operator's owned inputs as boxes the visitor may
@@ -549,9 +545,7 @@ no test runs any more, and runs in CI's test job. The suite is off by default an
 
 Each admitted program runs through the inline driver at one morsel size per row and at three rows
 (`CAMBRA_MORSEL_ROWS` sets a single size), so a program over a few rows runs as many morsels.
-Every size runs twice, with the memos materialized by the pool and in sink mode
-(`CAMBRA_DISPATCH_MEMOS=pull|sink` limits the run to one); a program the first admits and the
-second refuses fails the run.
+A program admitted at the first size and refused at another fails the run.
 
 A completed collection is complete at every level. A morsel states an inner level correctly, and
 `Tile::merge` drops the statement as covered by the outer level when the breaker absorbs the morsel
@@ -642,8 +636,8 @@ The plan admits the read under these rules, and each refusal states its reason; 
 - The values of the input are its keys. `MapResult` reads the memo at `function(input(k))`, so an
   input that answers anything but the keys, a `MapResultWithSource`, a `MapResult` of a `Constant`,
   another keyed read, would read the memo at a key no claim ordered. Only an `IterateExtent` or a
-  `Restrict`, which answers the keys that pass, stands directly beneath a keyed read, and the cut
-  asserts it.
+  `Restrict`, which answers the keys that pass, stands directly beneath a keyed read, and the planner
+  enforces it.
 - The extent of the `IterateExtent` is the memo's own, by `Extent` equality: the key the row names
   is a key of the memo.
 - A chain reads at most one memo. The chain's morsels are the keys that memo has merged, and a key
@@ -788,9 +782,8 @@ The decisions taken with the interface:
     release records it registered.
 11. A program with one breaker the plan refuses is refused as a whole, as the plan refuses a program
     now.
-12. The pinned programs are checked in both pull mode and sink mode from the step that first
-    switches a breaker in a pooled run, which is step 3. `CAMBRA_DISPATCH_MEMOS=pull|sink` limits
-    the check to one mode.
+12. The pinned programs are checked with every memo in sink mode from step 4, the step that
+    removes the other inline path.
 
 #### The interface
 
@@ -1015,7 +1008,8 @@ What is rebuilt:
 #### Migration
 
 Each step is a commit with its unit tests and a full differential run, and the pinned programs do
-not regress. From step 3 the run checks every pinned program in pull mode and in sink mode.
+not regress. Step 3 checks every pinned program in pull mode and in sink mode; from step 4 the
+inline driver has sink mode only.
 
 1. The interface: `Breaker`, `Round`, `Pushes`, the scheduler's registry, the dispatcher's round and
    push queues, tested with a breaker double. Tests: rounds run when a pipeline drains, a terminal
@@ -1029,22 +1023,20 @@ not regress. From step 3 the run checks every pinned program in pull mode and in
 3. `PooledRun::start` switches the memos it plans, and the dispatcher runs them as pipelines. The
    cut still takes the other chains.
 
-   `MemoMode` selects the mode: `PooledRun::start_in` takes it, and `PooledRun::start` reads
-   `CAMBRA_DISPATCH_MEMOS` (`sink` for sink mode, otherwise materialization through the pool). In
-   sink mode `sunk_memos` finds each planned memo's breaker in the scheduler's registry, and
-   `start_planned` calls `begin_sinking` on it and gives the memo's pipeline a `Sunk` placeholder
-   (`tile_operators/sunk.rs`) where the chain would be, so no chain is cut for a memo. A memo whose
-   tiling is not a data function, or that the registry does not hold, is refused. A pipeline that
-   streams from a memo takes its morsels from `pushed_source` of the memo's handle, and its
-   `PipelineRun` has `pushed` set: the chain's notifications do not reach it and
-   `assert_pipelines_are_separate` skips it. `PipelineRun::sink` is the handle of the memo whose
+   In step 3 `MemoMode` selected the mode: `PooledRun::start_in` took it, and `PooledRun::start` read
+   `CAMBRA_DISPATCH_MEMOS`. `sunk_memos` finds each planned memo's breaker in the scheduler's
+   registry, and `start_planned` calls `begin_sinking` on it and gives the memo's pipeline a `Sunk`
+   placeholder (`tile_operators/sunk.rs`) where the chain would be, so no chain is cut for a memo.
+   A memo whose tiling is not a data function, or that the registry does not hold, is refused. A
+   pipeline that streams from a memo takes its morsels from `pushed_source` of the memo's handle:
+   the chain's notifications do not reach it. `PipelineRun::sink` is the handle of the memo whose
    pipeline it is.
 
    A pipeline that reads pushes ignores the notifications of its chain's source. Its morsels are
    the keys pushed to it, a pushed key is a key the memo merged from that source, and the chain
    reads the source at that key through its own release record, so a row that arrives after its key
    was pushed concerns a later push. `a_keyed_read_runs_behind_the_keys_its_memo_has_merged` runs
-   rows in waves through both modes. The plan ends a chain at one head, so a pipeline streams from
+   rows in waves. The plan ends a chain at one head, so a pipeline streams from
    at most one breaker pipeline; `Dispatcher::new` asserts it for any other spec.
 
    `PooledRun::held_keys` adds the keys the sink memos hold (`Breaker::held_keys`), which a
@@ -1059,8 +1051,14 @@ not regress. From step 3 the run checks every pinned program in pull mode and in
    row once, alone and in a chain; a keyed read behind its memo's merges in both modes; the corpus at
    the pinned count in both modes; the HTTP scenarios through the plain loop, the inline driver and
    the inline driver in sink mode.
-4. Keyed reads over the push queue; delete the keyed pipeline of the old structure. Tests: the keyed
-   read tests as they stand, a keyed morsel names only pushed keys.
+4. Sink mode is the only inline memo mode. The inline driver no longer cuts the graph: `MemoMode`,
+   `PooledRun::start_in`, `CAMBRA_DISPATCH_MEMOS`, the cut and `Taken`, `Detached`,
+   `TileOperator::drop_serial_subscription`, `Materialized::feeds`, the keyed `PipelineConsumer` and
+   the keyed pipeline source are deleted, and a keyed read's morsels are the keys its memo pushed.
+   Tests: the keyed read tests as they stand, run over the push queue; the HTTP scenarios; the
+   corpus at the pinned count. The threaded passes had been removed by the commit before it, so
+   no differential runs a memo through the pool's materializing path. `Materialized`,
+   `BreakerOutput` and `PoolBreaker::Materialize` stay for the outputs' own breakers until step 9.
 5. `Aggregate` and `ExtractAggregate`, with the unit tests per kind and the differential run of the
    folds.
 6. `MapAggregate` and `MapExtractAggregate`, with a test that a group is terminal only at the

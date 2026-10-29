@@ -23,7 +23,7 @@ use crate::{
         operator_graph::{EdgeKind, EdgeRole, GraphNode, OperatorGraph},
         sinks::SinkConsumer,
         tile_operators::{
-            BreakerHandle, BreakerOutput, Claim, Detached, LiveSource, MorselSource, OperatorBase,
+            BreakerHandle, BreakerOutput, Claim, LiveSource, MorselSource, OperatorBase,
             ProducerBase, Round, Sunk, TileOperator, TileProducer, impl_producer_base,
         },
     },
@@ -123,10 +123,6 @@ pub(crate) struct PipelinePlan {
     /// its head slot reads, or the one a keyed read reads, for a [`Head::Breaker`], and none for a
     /// source.
     pub(crate) streams_from: Vec<usize>,
-    /// Whether the chain reads a `Memo` at its own keys (a keyed read): its morsels are the keys
-    /// that memo's pipeline has merged. Such a pipeline is a [`Head::Breaker`] over that memo's
-    /// output, and its chain still reads the source whose keys it iterates.
-    pub(crate) keyed: bool,
     /// Whether the pipeline, or a pipeline it streams from, holds a `Restrict` or a
     /// `VariantProject`, which drop keys. A keyed read of such a memo is not admitted yet: the
     /// morsel can name a key between its first and last that the memo holds no row for, which the
@@ -593,7 +589,6 @@ impl Planner<'_> {
             head,
             breaker,
             streams_from,
-            keyed: keyed.is_some(),
             drops_keys,
         });
         Ok(self.pipelines.len() - 1)
@@ -684,63 +679,6 @@ fn check_pipelines(main: &dyn TileOperator) -> Result<usize, Unsupported> {
     }
 }
 
-/// An upstream pipeline that the cut took out of the graph: the chain that fed a `Memo`, and the
-/// output the pipelines that read the `Memo` stream from.
-struct Taken {
-    chain: Box<dyn TileOperator>,
-    output: Arc<Materialized>,
-}
-
-/// Cut the graph below `op` at every `FanOutSlot`: the first slot that reads a `Memo` takes the
-/// chain that feeds it out of the graph, leaving a [`Detached`] in its place, and every slot is
-/// replaced by a [`BreakerOutput`] over the output that chain will fill. The taken chains are cut
-/// in turn. The program is the pool's from here, since the cut leaves the graph unusable to the
-/// scheduler loop.
-fn cut(op: &mut Box<dyn TileOperator>, taken: &mut HashMap<NodeId, Taken>) {
-    if !matches!(classify(op.kind()), Class::Cut) {
-        op.visit_inputs_mut(&mut |input| cut(input, taken));
-        return;
-    }
-    let mut memo = None;
-    op.visit_inputs(&mut |edge| memo = edge.target.operator_id());
-    let memo = memo.expect("the plan saw a `Memo`, and an operator has an identity");
-    let (tiling, correlation) = (op.tiling().clone(), op.result_correlation());
-    // A memo read at keys has a slot in each read of one chain: the first takes the chain that
-    // feeds it, and the others read the output that chain fills.
-    if let Some(existing) = taken.get(&memo) {
-        op.drop_serial_subscription();
-        *op = Box::new(BreakerOutput::new(
-            existing.output.clone(),
-            tiling,
-            false,
-            correlation,
-        ));
-        return;
-    }
-    // The serial chain the program subscribed when it compiled belongs to the scheduler loop,
-    // which the pool replaces: its producer holds release records with the sources beneath it,
-    // and the fan-out, which the operator map keeps, would hold it for as long as the program.
-    op.drop_serial_subscription();
-    let mut upstream = None;
-    op.visit_inputs_mut(&mut |shared| {
-        shared.visit_inputs_mut(&mut |input| {
-            let detached = Box::new(Detached::new(input.tiling().clone()));
-            upstream = Some(std::mem::replace(input, detached));
-        })
-    });
-    let mut chain = upstream.expect("a `Memo` has an input");
-    let output = Materialized::new(chain.tiling().clone());
-    cut(&mut chain, taken);
-    *op = Box::new(BreakerOutput::new(
-        output.clone(),
-        tiling,
-        false,
-        correlation,
-    ));
-    let first = taken.insert(memo, Taken { chain, output });
-    assert!(first.is_none(), "the chain of a memo is taken once");
-}
-
 /// What a pipeline's chain starts from.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Head {
@@ -766,18 +704,13 @@ struct PipelineRun<'a> {
     /// See [`PipelineSpec::streams_from`]. A pipeline with a [`Head::Breaker`] streams from the
     /// pipeline of the breaker it reads, and a [`Head::Source`] pipeline streams from none.
     streams_from: Vec<PipelineId>,
-    /// Whether the chain reads a `Memo` at its own keys: its morsels are that memo's merged keys.
-    keyed: bool,
     /// What the serial producers this pipeline replaces had released of each source: the pool's
     /// record for each source operator of the chain starts there. Empty for a run no serial
     /// producer read.
     inherits: Vec<Inherited>,
-    /// The breaker that runs the pipeline when it is in sink mode: the dispatcher pulls it for each
+    /// The breaker that runs the pipeline when it ends in a memo: the dispatcher pulls it for each
     /// morsel, and `chain` is a placeholder.
     sink: Option<BreakerHandle>,
-    /// Whether the keys the pipeline claims are pushed to it by a breaker pipeline it streams from,
-    /// which is a notification of nothing else.
-    pushed: bool,
 }
 
 /// What the serial producers a pool replaces had released of one source.
@@ -855,16 +788,11 @@ fn prepare(
                 .enumerate()
                 .map(|(pipeline, run)| {
                     let head: Box<dyn Consumer> = match run.head {
-                        // The keys of a pipeline that streams from a breaker in sink mode are
-                        // pushed to it, and what its chain notifies adds nothing.
-                        Head::Breaker if run.pushed => Box::new(|| {}),
-                        Head::Breaker => Box::new(PipelineConsumer {
-                            pipeline: handles[pipeline].clone(),
-                            keyed: run.keyed,
-                        }),
+                        // The keys of a pipeline that streams from a breaker are pushed to it,
+                        // and what its chain notifies adds nothing.
+                        Head::Breaker => Box::new(|| {}),
                         Head::Source if notified[pipeline] => Box::new(PipelineConsumer {
                             pipeline: handles[pipeline].clone(),
-                            keyed: false,
                         }),
                         Head::Source => Box::new(|| {}),
                     };
@@ -943,15 +871,6 @@ fn assert_pipelines_are_separate(runs: &[PipelineRun<'_>]) {
     let mut owner = HashMap::new();
     for (pipeline, run) in runs.iter().enumerate() {
         visit(&*run.chain, pipeline, &mut owner);
-        if run.head == Head::Breaker && !run.pushed {
-            assert!(
-                run.streams_from.iter().any(|upstream| matches!(
-                    &runs[upstream.0].breaker,
-                    PoolBreaker::Materialize { output } if output.feeds(&run.source)
-                )),
-                "a pipeline over a breaker's output reads the output of a pipeline it streams from: {pipeline}"
-            );
-        }
     }
 }
 
@@ -981,16 +900,10 @@ impl PipelineHandle {
     }
 }
 
-/// The consumer at the head of a pipeline: a notification publishes the region it carries to the
-/// pipeline's source and never pulls, which is what `region_driven` says.
-///
-/// `keyed` says the chain reads a `Memo` at its keys: the arrivals of the source it iterates also
-/// notify it with the keys that arrived, and its morsels are only the keys the memo has merged, so
-/// it publishes `Projection::Everything` for every notification, which the source resolves to the
-/// keys that are ready and not yet claimed.
+/// The consumer at the head of a pipeline over a data source: a notification publishes the region
+/// it carries to the pipeline's source and never pulls, which is what `region_driven` says.
 struct PipelineConsumer {
     pipeline: PipelineHandle,
-    keyed: bool,
 }
 
 impl Consumer for PipelineConsumer {
@@ -1003,7 +916,6 @@ impl Consumer for PipelineConsumer {
         // keys: only everything it has ready is safe to hand out.
         match arrived {
             Projection::Fields(_) => self.pipeline.publish(&Projection::Everything),
-            _ if self.keyed => self.pipeline.publish(&Projection::Everything),
             keys => self.pipeline.publish(keys),
         }
     }
@@ -1058,48 +970,9 @@ fn inherited_by(owners: &[&str], inherited: &HashMap<String, Vec<Inherited>>) ->
     common.unwrap_or_default()
 }
 
-/// The source the workers of a pipeline claim morsels from: the one source under the chain, or for
-/// a chain that reads a `Memo` at its keys the source of a slot's `BreakerOutput`, which hands out
-/// the keys the memo's pipeline has merged. The chain also reads the source whose keys it
-/// iterates, which only supplies the rows the morsel names.
-fn pipeline_source(chain: &dyn TileOperator, keyed: bool) -> Arc<dyn MorselSource> {
-    if !keyed {
-        return source_of(chain).expect("the pipeline was checked to read one source");
-    }
-    fn first_output_source(op: &dyn TileOperator) -> Option<Arc<dyn MorselSource>> {
-        if op.kind() == "BreakerOutput" {
-            return op.morsel_source();
-        }
-        let mut found = None;
-        op.visit_inputs(&mut |edge| {
-            if found.is_none() {
-                found = first_output_source(edge.target);
-            }
-        });
-        found
-    }
-    // The invariant the plan checked: a keyed read reads the memo at the values of its input, and
-    // those values are the keys the pipeline's morsels name.
-    debug_assert!(
-        {
-            fn values_are_keys(op: &dyn TileOperator) -> bool {
-                let (mut function, mut input) = (None, None);
-                op.visit_inputs(&mut |edge| match edge.role {
-                    EdgeRole::Named("fn") => function = Some(edge.target.kind()),
-                    EdgeRole::Named("input") => input = Some(edge.target.kind()),
-                    _ => {}
-                });
-                let keyed = op.kind() == "MapResult" && function == Some("BreakerOutput");
-                let mut below = true;
-                op.visit_inputs(&mut |edge| below &= values_are_keys(edge.target));
-                below && (!keyed || matches!(input, Some("IterateExtent" | "Restrict")))
-            }
-            values_are_keys(chain)
-        },
-        "a keyed read's input answers keys as values: only an `IterateExtent` or a `Restrict` \
-         stands beneath it"
-    );
-    first_output_source(chain).expect("a keyed pipeline reads a slot's `BreakerOutput`")
+/// The source a pipeline's morsels are cut from: the one source under the chain.
+fn pipeline_source(chain: &dyn TileOperator) -> Arc<dyn MorselSource> {
+    source_of(chain).expect("the pipeline was checked to read one source")
 }
 
 /// The breaker's state while the workers run.
@@ -2066,7 +1939,6 @@ pub struct PooledRun {
     // Dropped after the chains, which hold records with the sources, and after the taken chains'
     // operators, which the pool owns from the cut.
     _records: PooledRecords,
-    _taken: HashMap<NodeId, Taken>,
     _placeholders: HashMap<usize, Box<dyn TileOperator>>,
 }
 
@@ -2077,32 +1949,6 @@ struct OpenSource {
     /// Whether each lap publishes what the source has ready to the pipeline, since no
     /// notification does.
     poll: bool,
-}
-
-/// How the inline driver runs the memos it plans.
-///
-/// `CAMBRA_DISPATCH_MEMOS=sink` selects [`Sink`](Self::Sink) for [`PooledRun::start`], and the
-/// differential suite runs every program in both modes
-/// (`src/interpreter/design-parallel.md`, "Pipeline breakers: sink, finalize and get").
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum MemoMode {
-    /// The pool takes the chain behind each memo and runs it as a pipeline into a `Materialized`
-    /// output.
-    Materialize,
-    /// Each memo's own producer, switched to sink mode, is the breaker of its pipeline, and the
-    /// graph is not cut at it.
-    Sink,
-}
-
-impl MemoMode {
-    /// The mode `CAMBRA_DISPATCH_MEMOS` names: [`Sink`](Self::Sink) for `sink`, and otherwise
-    /// [`Materialize`](Self::Materialize).
-    pub fn from_env() -> Self {
-        match std::env::var("CAMBRA_DISPATCH_MEMOS").as_deref() {
-            Ok("sink") => Self::Sink,
-            _ => Self::Materialize,
-        }
-    }
 }
 
 /// The memos a run switches to sink mode: each memo's breaker, its tiling and, for a memo whose
@@ -2122,8 +1968,7 @@ fn with_operator(op: &dyn TileOperator, id: NodeId, f: &mut dyn FnMut(&dyn TileO
     op.visit_inputs(&mut |edge| with_operator(edge.target, id, f));
 }
 
-/// What a run in [`MemoMode::Sink`] needs of each memo of `plan`, or why the program stays on the
-/// plain loop. Read before anything is dropped or switched.
+/// What a run needs of each memo of `plan`, or why the program stays on the plain loop. Read before anything is dropped or switched.
 fn sunk_memos(
     scheduler: &Scheduler,
     program: &CompiledProgram,
@@ -2184,25 +2029,6 @@ impl PooledRun {
         config: &Config,
         main_consumer: Box<dyn Consumer>,
     ) -> Result<Self, Unsupported> {
-        Self::start_in(
-            MemoMode::from_env(),
-            ctx,
-            program,
-            main_producer,
-            config,
-            main_consumer,
-        )
-    }
-
-    /// [`start`](Self::start) with the memos run as `mode` says.
-    pub fn start_in(
-        mode: MemoMode,
-        ctx: &mut GlobalContext,
-        program: &mut CompiledProgram,
-        main_producer: &mut Option<Box<dyn TileProducer>>,
-        config: &Config,
-        main_consumer: Box<dyn Consumer>,
-    ) -> Result<Self, Unsupported> {
         let plan = plan_inline(&program.operator_graph)?;
         // What each output's serial producers had released of each source, read before the
         // producers are dropped and their records retire.
@@ -2216,10 +2042,7 @@ impl PooledRun {
                 )
             })
             .collect();
-        let sunk = match mode {
-            MemoMode::Materialize => None,
-            MemoMode::Sink => Some(sunk_memos(ctx.scheduler(), program, &plan)?),
-        };
+        let sunk = sunk_memos(ctx.scheduler(), program, &plan)?;
         let (mut main, mut sinks) = (None, Vec::new());
         for output in program.outputs.iter_mut() {
             match output.is_main() {
@@ -2249,8 +2072,7 @@ impl PooledRun {
                 .expect("a sink output has its consumer");
             drop(consumer.lock_now().take_producer());
         }
-        let mut taken = HashMap::new();
-        let mut sink_chains: Vec<SinkChain<'_>> = sinks
+        let sink_chains: Vec<SinkChain<'_>> = sinks
             .into_iter()
             .map(|output| SinkChain {
                 name: output.name.clone(),
@@ -2261,35 +2083,24 @@ impl PooledRun {
                 chain: &mut output.op,
             })
             .collect();
-        if sunk.is_none() {
-            for sink in &mut sink_chains {
-                cut(sink.chain, &mut taken);
-            }
-        }
-        let mut pending = Some((taken, sink_chains, main_consumer));
+        let mut pending = Some((sink_chains, main_consumer));
         let mut started = None;
         let mut start_chain = |chain: Option<(&mut Box<dyn TileOperator>, Tiling)>| {
-            let (mut taken, sinks, consumer) = pending.take().expect("the chains are started once");
-            let main = chain.map(|(chain, tiling)| {
-                if sunk.is_none() {
-                    cut(chain, &mut taken);
-                }
-                MainChain {
-                    chain,
-                    tiling,
-                    consumer,
-                }
+            let (sinks, consumer) = pending.take().expect("the chains are started once");
+            let main = chain.map(|(chain, tiling)| MainChain {
+                chain,
+                tiling,
+                consumer,
             });
             started = Some(start_planned(
                 ctx,
                 &plan,
                 main,
                 sinks,
-                taken,
                 StartContext {
                     config,
                     inherited: &inherited,
-                    sunk: sunk.as_ref(),
+                    sunk: &sunk,
                 },
             ));
         };
@@ -2406,7 +2217,7 @@ struct SinkChain<'a> {
 struct StartContext<'a> {
     config: &'a Config,
     inherited: &'a HashMap<String, Vec<Inherited>>,
-    sunk: Option<&'a SunkMemos>,
+    sunk: &'a SunkMemos,
 }
 
 /// Subscribe `plan`'s pipelines over the chains the cut left, on one worker, answer `main` from
@@ -2416,7 +2227,6 @@ fn start_planned(
     plan: &Plan,
     main: Option<MainChain<'_>>,
     sinks: Vec<SinkChain<'_>>,
-    mut taken: HashMap<NodeId, Taken>,
     StartContext {
         config,
         inherited,
@@ -2460,19 +2270,15 @@ fn start_planned(
     // A memo in sink mode is its pipeline's breaker, and the pipeline holds a placeholder where a
     // chain would be.
     let mut placeholders: HashMap<usize, Box<dyn TileOperator>> = HashMap::new();
-    if let Some(sunk) = sunk {
-        for (position, pipeline) in plan.pipelines.iter().enumerate() {
-            if let BreakerKind::Materialize { memo } = &pipeline.breaker {
-                placeholders.insert(position, Box::new(Sunk::new(sunk.tilings[memo].clone())));
-                sunk.handles[memo].begin_sinking();
-            }
+    for (position, pipeline) in plan.pipelines.iter().enumerate() {
+        if let BreakerKind::Materialize { memo } = &pipeline.breaker {
+            placeholders.insert(position, Box::new(Sunk::new(sunk.tilings[memo].clone())));
+            sunk.handles[memo].begin_sinking();
         }
     }
     {
         let mut placeholder_refs: HashMap<usize, &mut Box<dyn TileOperator>> =
             placeholders.iter_mut().map(|(k, v)| (*k, v)).collect();
-        let mut upstream: HashMap<NodeId, &mut Taken> =
-            taken.iter_mut().map(|(k, v)| (*k, v)).collect();
         for (position, pipeline) in plan.pipelines.iter().enumerate() {
             let output_name = || {
                 plan.outputs
@@ -2482,7 +2288,7 @@ fn start_planned(
                     .expect("a pipeline that is not a memo's ends in an output")
             };
             let (chain, breaker): (&mut dyn TileOperator, PoolBreaker) = match &pipeline.breaker {
-                BreakerKind::Materialize { .. } if sunk.is_some() => {
+                BreakerKind::Materialize { .. } => {
                     let placeholder = placeholder_refs
                         .remove(&position)
                         .expect("a memo pipeline has its placeholder");
@@ -2492,17 +2298,6 @@ fn start_planned(
                         collector: Mutex::new(placeholder.tiling().empty_tile()),
                     };
                     (&mut **placeholder, unused)
-                }
-                BreakerKind::Materialize { memo } => {
-                    let taken = upstream
-                        .remove(memo)
-                        .expect("the cut took the memo's input");
-                    (
-                        &mut *taken.chain,
-                        PoolBreaker::Materialize {
-                            output: taken.output.clone(),
-                        },
-                    )
                 }
                 BreakerKind::Collect => {
                     let name = output_name();
@@ -2535,28 +2330,24 @@ fn start_planned(
                 BreakerKind::Materialize { memo } => *memo,
                 _ => unreachable!("a pipeline streams from a memo's pipeline"),
             };
-            let source = match (sunk, &pipeline.breaker, pipeline.head) {
-                (Some(sunk), BreakerKind::Materialize { memo }, Head::Source) => {
-                    sunk.sources[memo].clone()
-                }
-                (Some(sunk), _, Head::Breaker) => {
+            let source = match (&pipeline.breaker, pipeline.head) {
+                (BreakerKind::Materialize { memo }, Head::Source) => sunk.sources[memo].clone(),
+                (_, Head::Breaker) => {
                     pushed_source(&sunk.handles[&memo_of(pipeline.streams_from[0])])
                 }
-                _ => pipeline_source(&*chain, pipeline.keyed && sunk.is_none()),
+                _ => pipeline_source(&*chain),
             };
             notified.push(pipeline.head == Head::Source);
             // A range ends by exhaustion. A source whose rows arrive from outside stays open
             // until it says it is complete ([`PooledRun::lap`]).
             close_at_start.push(false);
             sources.push(source.clone());
-            let sink = match (sunk, &pipeline.breaker) {
-                (Some(sunk), BreakerKind::Materialize { memo }) => Some(sunk.handles[memo].clone()),
+            let sink = match &pipeline.breaker {
+                BreakerKind::Materialize { memo } => Some(sunk.handles[memo].clone()),
                 _ => None,
             };
             runs.push(PipelineRun {
                 sink,
-                pushed: sunk.is_some() && pipeline.head == Head::Breaker,
-                keyed: pipeline.keyed,
                 chain,
                 source,
                 breaker,
@@ -2588,7 +2379,7 @@ fn start_planned(
             source,
             // A memo in sink mode swallows its input's notifications, so the lap tells its
             // pipeline's source what is ready.
-            poll: sunk.is_some() && matches!(pipeline.breaker, BreakerKind::Materialize { .. }),
+            poll: matches!(pipeline.breaker, BreakerKind::Materialize { .. }),
         })
         .collect();
     // The reader registers before the first morsel, so no row leaves before it has read.
@@ -2642,7 +2433,6 @@ fn start_planned(
         state,
         open_sources,
         _records: records,
-        _taken: taken,
         _placeholders: placeholders,
     }
 }
@@ -3350,7 +3140,12 @@ mod tests {
             planner
                 .pipeline(read, BreakerKind::Collect)
                 .expect("a keyed read is planned");
-            assert!(planner.pipelines.last().is_some_and(|last| last.keyed));
+            assert!(
+                planner
+                    .pipelines
+                    .last()
+                    .is_some_and(|last| last.head == Head::Breaker && last.streams_from.len() == 1)
+            );
         }
 
         /// The memo is read at the values of the input, so they must be the keys.
@@ -3495,40 +3290,6 @@ mod tests {
             let reason = refused(&mut planner, read);
             assert!(reason.contains("can drop a key"), "{reason}");
         }
-    }
-
-    /// The cut replaces the slot with a `BreakerOutput`, takes the chain that fed the `Memo`, and
-    /// leaves no slot in the chains it hands back.
-    #[test]
-    fn the_cut_takes_the_chain_behind_a_memo_and_leaves_a_breaker_output() {
-        use crate::ccl::context::{GlobalContext, compile_program};
-        use crate::ccl::load::LoadedProgram;
-        fn kinds(op: &dyn TileOperator, found: &mut Vec<&'static str>) {
-            found.push(op.kind());
-            op.visit_inputs(&mut |edge| kinds(edge.target, found));
-        }
-        let mut ctx = GlobalContext::default();
-        let loaded = LoadedProgram::test("xs = [x + 1 for x in [1, 2, 3]]\n[a * 2 for a in xs]");
-        let mut compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).expect("compiles");
-        let planned = plan_inline(&compiled.operator_graph).expect("two pipelines");
-        assert_eq!(planned.pipelines.len(), 2);
-        let main = compiled.main_mut().expect("a main output");
-        assert_eq!(check_pipelines(&*main.op).ok(), Some(1));
-
-        let mut taken = HashMap::new();
-        cut(&mut main.op, &mut taken);
-
-        let mut behind = Vec::new();
-        kinds(&*main.op, &mut behind);
-        assert!(behind.contains(&"BreakerOutput"), "{behind:?}");
-        assert!(!behind.contains(&"FanOutSlot"), "{behind:?}");
-        let [taken] = <[_; 1]>::try_from(taken.into_values().collect::<Vec<_>>())
-            .ok()
-            .expect("one memo, one chain");
-        let mut before = Vec::new();
-        kinds(&*taken.chain, &mut before);
-        assert!(before.contains(&"IterateExtent"), "{before:?}");
-        assert!(!before.contains(&"BreakerOutput"), "{before:?}");
     }
 
     /// A serve state names the dispatcher that minted it, so a state of another dispatcher with

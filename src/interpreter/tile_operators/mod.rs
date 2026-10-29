@@ -203,13 +203,6 @@ pub trait TileOperator: Send + Sync {
         short_type_name::<Self>()
     }
 
-    /// Drop the subscription the compiling thread made on this operator's input, which the
-    /// scheduler loop drives: a `FanOutSlot` drops the serial producer of the fan-out it reads,
-    /// whose release records would otherwise pin the sources beneath it. A pool calls it once,
-    /// at the slot that takes the chain behind a `Memo` out of the graph. Every other operator
-    /// holds no such subscription.
-    fn drop_serial_subscription(&mut self) {}
-
     /// The rows this operator enumerates as morsels the workers of a pool claim, or `None` for
     /// an operator that is not a source the pool cuts. `IterateExtent` over a finite range
     /// answers one. See `src/interpreter/design-parallel.md`, "The dispatcher".
