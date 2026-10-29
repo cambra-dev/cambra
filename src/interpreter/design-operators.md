@@ -642,9 +642,24 @@ then releases the region upstream. Open collection groups and join-combined
 aggregate or store state can remain unreleased. A debug check uses `holds_a_plain_value` to
 reject an input whose release would leave ordinary values available for duplicate delivery.
 
-`to_guard` includes complete keys by full path and scalar cells at their enclosing rows,
-including cells whose enclosing key is still open. A universal input release latches
-`upstream_drained`. Release builds then return the cache without pulling that input again;
+`to_guard` includes complete keys by full path and scalar cells at their enclosing rows, including
+cells whose enclosing key is still open. A nested tile whose held keys form a prefix is released as
+one staircase (`domain_prefix`) and, at each level whose statement calls keys complete above the
+last key held, an arm naming those keys. For such a tile the guard names exactly what the statement
+makes releasable, and its size grows with the tile's depth, not with the keys it holds. A statement
+that is itself a prefix reaching above the last key held ends the staircase at its greatest key
+instead of adding an arm. A last key the statement calls whole, or whose group's statement calls
+every key complete, ends the staircase at that key. A tile whose held keys form no prefix is
+released key by key (`Tile::held_guard`). At a nested level that guard names each key held and each
+key the level's statement calls complete under a row the tile holds, both by whole path, so a key
+stated absent under an open row is released at that row. The part of a level's statement that names
+its rows by path at every level above is also named under rows the tile does not hold
+(`Tile::stated_by_path`): it names those rows, so it releases nothing under any other. A statement
+unqualified at some level is named only under the rows held. Three tiles whose held keys form a
+prefix still take that path: a last key whose group holds nothing, an earlier key whose own group's
+statement calls every key complete, and a statement about the keys beneath an enclosing key the tile
+does not hold. The guard names all three exactly, the third by path. A universal input release
+latches `upstream_drained`. Release builds then return the cache without pulling that input again;
 debug builds continue pulling to exercise its post-release checks.
 
 ### What a producer holds
