@@ -9,7 +9,9 @@ use crate::interpreter::operator_graph::{share, value};
 use crate::{
     interpreter::{
         Consumer, Position, Projection, Scheduler,
-        scheduler::{GatedConsumer, WakeupQueue, forwarding_consumer, shared_consumer},
+        scheduler::{
+            GatedConsumer, WakeupQueue, forwarding_consumer_keeping_keys, shared_consumer,
+        },
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -182,6 +184,37 @@ fn retain_flagged<T>(v: &mut Vec<T>, keep: &[bool]) {
     debug_assert_eq!(v.len(), keep.len(), "one flag per element");
     let mut flags = keep.iter();
     v.retain(|_| *flags.next().unwrap_or(&false));
+}
+
+/// The consumer a fan-out installs on its input: it forwards the input's region to every live
+/// slot's consumer. One notification passes between pulls and the next is dropped with its region,
+/// which a slot consumer that pulls does not need, since its pull reads whatever arrived.
+struct FanOutInput {
+    shared: Weak<RefCell<FanOutShared>>,
+}
+
+impl Consumer for FanOutInput {
+    fn notify(&mut self, arrived: &Projection) {
+        // Clone the consumer handles while holding a short borrow, then release the borrow before
+        // calling notify(). This prevents a re-entrant panic when a consumer (e.g. SinkConsumer)
+        // calls FanOutProducer::get_impl(), which needs shared.borrow_mut() for the same Rc.
+        let Some(shared_rc) = self.shared.upgrade() else {
+            return;
+        };
+        let consumers = {
+            let shared = shared_rc.borrow();
+            if !shared.forwarded.mark_news() {
+                return;
+            }
+            shared
+                .live_indices()
+                .map(|i| shared.consumers[i].clone())
+                .collect::<Vec<_>>()
+        };
+        for c in &consumers {
+            c.borrow_mut().notify(arrived);
+        }
+    }
 }
 
 /// RAII guard for the cyclic `FanOut` `subscribing_inner` flag.  Created
@@ -611,28 +644,8 @@ impl TileOperator for FanOutSlot {
             scheduler.begin_source_producers();
             let inner = self.hold.subscribe_input(
                 intent_guard,
-                Box::new(move || {
-                    // Clone the consumer handles while holding a short borrow,
-                    // then release the borrow before calling notify().  This
-                    // prevents a re-entrant panic when a consumer (e.g.
-                    // SinkConsumer) calls FanOutProducer::get_impl(), which
-                    // needs shared.borrow_mut() for the same Rc.
-                    let Some(shared_rc) = shared_weak.upgrade() else {
-                        return;
-                    };
-                    let consumers = {
-                        let shared = shared_rc.borrow();
-                        if !shared.forwarded.mark_news() {
-                            return;
-                        }
-                        shared
-                            .live_indices()
-                            .map(|i| shared.consumers[i].clone())
-                            .collect::<Vec<_>>()
-                    };
-                    for c in &consumers {
-                        c.borrow_mut().notify(&Projection::Everything);
-                    }
+                Box::new(FanOutInput {
+                    shared: shared_weak,
                 }),
                 scheduler,
             );
@@ -932,25 +945,29 @@ impl TileOperator for Memo {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let notified = Notified::flag();
+        let arrivals = Arrivals::new();
         let (consumer, gate) = shared_consumer(consumer);
         Box::new(MemoProducer {
-            base: ProducerBase::listening(
+            base: ProducerBase::new(
                 MemoProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 scheduler,
-                notified.clone(),
             )
             .sharing(gate),
             input: self.input.subscribe(
                 intent_guard,
-                notified.consumer(forwarding_consumer(&consumer, &scheduler.wakeup_queue())),
+                // The memo reads its input at the projection and keeps its keys, so the keys that
+                // changed at the input are the keys that changed at the memo.
+                arrivals.consumer(forwarding_consumer_keeping_keys(
+                    &consumer,
+                    &scheduler.wakeup_queue(),
+                )),
                 scheduler,
             ),
             cached_tile: self.tiling().empty_tile(),
-            read: Projection::Nothing,
-            stale: Projection::Nothing,
+            dirty: Projection::Everything,
+            arrivals,
             upstream_drained: false,
             drain_probed: false,
             gate_probed: false,
@@ -968,16 +985,17 @@ struct MemoProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
     cached_tile: Tile,
-    /// The union of the projections this memo has read its input at.
+    /// The region of the input the cache may not hold the answer for: what the memo has not
+    /// read, and what its input has notified since it was read.
     ///
-    /// A notification-free pull answers from the cache only over a region the memo has
-    /// already read: the input's silence says nothing about a region never pulled.
-    read: Projection,
-    /// The part of [`read`](Self::read) whose input has notified since it was read.
-    ///
-    /// One notification stands for news anywhere the memo has read, and a pull at part of that
-    /// region sees only its part: the rest stays here until a pull reads it.
-    stale: Projection,
+    /// A pull answers from the cache over a region outside this one, and reads the input over a
+    /// region inside it. A pull at part of it reads that part: the rest stays until a pull reads
+    /// it. The input's silence says nothing about a region never pulled, so it starts as
+    /// [`Everything`](Projection::Everything).
+    dirty: Projection,
+    /// The regions the input has notified since the last pull, which fold into
+    /// [`dirty`](Self::dirty) at the next one.
+    arrivals: Arrivals,
     /// Set once this producer has released its input **universally**, which it
     /// does as soon as the input hands over a complete tile.
     ///
@@ -1033,13 +1051,12 @@ impl TileProducer for MemoProducer {
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        let covered = self.read.union(&projection) == self.read;
         // Everything the input will ever produce is already cached, so the pull below can
         // only return what was released — which a conforming input answers empty, merging to
         // nothing. A release build skips it.
         //
         // A debug build probes instead, once after the input drains and again after each
-        // notification. A `Memo` sits above most scalar producers, so never pulling a drained
+        // notification of a region the pull reads. A `Memo` sits above most scalar producers, so never pulling a drained
         // input would shield every one of them from the release-contract assertion in
         // `TileProducer::get`; the probe makes an input that answers with released data trip
         // that assertion at the input, where the defect is, instead of corrupting the cache
@@ -1048,25 +1065,24 @@ impl TileProducer for MemoProducer {
         // which grows with the nesting of the fan-outs over it.
         //
         // `cfg!` rather than `#[cfg]` so both configurations stay compiled.
-        if self.base.notified.take() {
-            self.stale = self.read.clone();
-        }
-        // News the pull will see: the input notified since this region was read.
-        let notified = self.stale.intersect(&projection) != Projection::Nothing;
-        if self.upstream_drained && (!cfg!(debug_assertions) || (self.drain_probed && !notified)) {
+        self.dirty = self.dirty.union(&self.arrivals.take());
+        // The cache may not hold this region: it was never read, or the input has notified
+        // since.
+        let must_read = self.dirty.intersect(&projection) != Projection::Nothing;
+        if self.upstream_drained && (!cfg!(debug_assertions) || (self.drain_probed && !must_read)) {
             return self.answer(&projection);
         }
-        // The cache is cumulative, so when nothing has notified since the last pull it is
-        // already the answer, empty or not, and pulling walks the subtree below to merge
-        // nothing. The flag starts set, so the first pull reads: a demand read taken outside
-        // the delivery loop, a store's init op reading a seed or a completion read, arrives
-        // before anything has notified. Every later change to the input notifies (the
-        // notification contract), so an empty cache read since is the input's answer. Under
-        // a fan-out the cache is what keeps each branch's pull from re-reading the shared
-        // input, which on a first lap is mostly empty. A drained input is left to the rule
-        // above rather than gated here, which is what keeps that rule's debug probe: gating
-        // a drained input would shield it in every build.
-        if !notified && !self.upstream_drained && covered {
+        // The cache is cumulative, so over a region outside `dirty` it is already the answer,
+        // empty or not, and pulling walks the subtree below to merge nothing. `dirty` starts as
+        // everything, so the first pull of a region reads: a demand read taken outside the
+        // delivery loop, a store's init op reading a seed or a completion read, arrives before
+        // anything has notified. Every later change to the input notifies (the notification
+        // contract), so an empty cache over a region the input has not notified since is the
+        // input's answer. Under a fan-out the cache is what keeps each branch's pull from
+        // re-reading the shared input, which on a first lap is mostly empty. A drained input is
+        // left to the rule above rather than gated here, which is what keeps that rule's debug
+        // probe: gating a drained input would shield it in every build.
+        if !must_read && !self.upstream_drained {
             // The gate trusts the notification contract, so a debug build checks it, once
             // per read: an input that changed without notifying answers something new.
             if cfg!(debug_assertions) && !self.gate_probed && self.wakeups.is_empty() {
@@ -1075,8 +1091,11 @@ impl TileProducer for MemoProducer {
                 probe.compact();
                 let mut merged = self.cached_tile.clone();
                 merged.merge(probe.clone());
+                // A notification that landed during the probe, from another thread writing rows
+                // before notifying, is the notification the probe asks for: it has not been
+                // taken yet, so the rows are not news the contract missed.
                 debug_assert!(
-                    holds_the_same(&merged, &self.cached_tile),
+                    self.arrivals.pending() || holds_the_same(&merged, &self.cached_tile),
                     "{}'s input {} changed without notifying: {probe:?} is new to {:?}",
                     self.name(),
                     self.input.name(),
@@ -1086,8 +1105,7 @@ impl TileProducer for MemoProducer {
             return self.answer(&projection);
         }
         self.gate_probed = false;
-        self.read = self.read.union(&projection);
-        self.stale = self.stale.minus(&projection);
+        self.dirty = self.dirty.minus(&projection);
         let mut input = self.input.get(projection_guard);
         trace!("{} received {input:?}", self.name());
         let upstream_obsolete = input.to_guard();
@@ -1120,7 +1138,7 @@ impl TileProducer for MemoProducer {
             self.name(),
             self.cached_tile
         );
-        if notified || !covered {
+        if must_read {
             self.cached_tile.merge(input);
         } else {
             let before = self.cached_tile.clone();
@@ -1672,8 +1690,8 @@ mod tests {
             base: ProducerBase::unowned(MemoProducer::alloc_id(), &tiling),
             input: Box::new(upstream),
             cached_tile: tiling.empty_tile(),
-            read: Projection::Nothing,
-            stale: Projection::Nothing,
+            dirty: Projection::Everything,
+            arrivals: Arrivals::new(),
             upstream_drained: false,
             gate_probed: false,
             drain_probed: false,
@@ -1704,7 +1722,8 @@ mod projection_tests {
     use super::*;
     use crate::interpreter::tile_operators::Scheduler;
     use crate::interpreter::tile_operators::test_helpers::{
-        GuardLog, ProjectionSpy, ProjectionSpyOp, int_entries, ints_by_position, keys_between,
+        GuardLog, InputConsumer, NotifyingOp, ProjectionSpy, ProjectionSpyOp, int_entries,
+        ints_by_position, keys_between, notify_input,
     };
     use crate::interpreter::{BaseType, Extent};
 
@@ -1788,8 +1807,8 @@ mod projection_tests {
             base: ProducerBase::unowned(MemoProducer::alloc_id(), &ints()),
             input: Box::new(upstream),
             cached_tile: ints().empty_tile(),
-            read: Projection::Nothing,
-            stale: Projection::Nothing,
+            dirty: Projection::Everything,
+            arrivals: Arrivals::new(),
             upstream_drained: false,
             gate_probed: false,
             drain_probed: false,
@@ -1854,15 +1873,176 @@ mod projection_tests {
         assert!(pulled.borrow().is_empty());
     }
 
+    /// A `Memo` subscribed over an input whose rows a test writes, with the consumer the input
+    /// notifies through and the log of the guards the input was pulled with.
+    fn memo_over_growing_input() -> (
+        Box<dyn TileProducer>,
+        InputConsumer,
+        Rc<RefCell<Tile>>,
+        GuardLog,
+    ) {
+        let (input, notifier, rows, pulled) =
+            NotifyingOp::scripted(ints_by_position(&[], false), ints());
+        let memo = Memo::new(Box::new(input)).subscribe(
+            ints().universal_guard(),
+            Box::new(|| {}),
+            &mut Scheduler::new(),
+        );
+        (memo, notifier, rows, pulled)
+    }
+
+    /// The rows of `keys`, each holding its own key, stated incomplete.
+    fn rows_at(keys: std::ops::RangeInclusive<u64>) -> Tile {
+        Tile::data_function(
+            ColumnValue::from_uints(keys.clone().collect()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(
+                keys.map(|key| key as i64).collect(),
+            ))),
+            Predicate::False,
+            bit_set::BitSet::new(),
+        )
+    }
+
+    fn notify_keys(notifier: &InputConsumer, from: u64, to: u64) {
+        notify_input(
+            notifier,
+            &Projection::of(&keys_between(from, to)).expect("a region of keys"),
+        );
+    }
+
+    /// A notification names the keys it changed, and the memo reads the input again over those
+    /// keys only: a region it read before and that stayed silent is answered from the cache.
+    #[test]
+    fn a_memo_rereads_only_the_keys_its_input_notified() {
+        let (mut memo, notifier, rows, _) = memo_over_growing_input();
+        memo.get(keys_between(0, 2));
+        memo.get(keys_between(3, 5));
+
+        // Rows land at 3..=5 and the input says so; none land at 0..=2.
+        *rows.borrow_mut() = rows_at(3..=5);
+        notify_keys(&notifier, 3, 5);
+        let silent = memo.get(keys_between(0, 2));
+        assert!(int_entries(&silent).is_empty(), "{silent:?}");
+        let notified = memo.get(keys_between(3, 5));
+        assert_eq!(int_entries(&notified), vec![(3, 3), (4, 4), (5, 5)]);
+    }
+
+    /// A notification of everything, which a chain that re-keys delivers, makes every region
+    /// the memo has read stale.
+    #[test]
+    fn a_memo_rereads_every_region_when_its_input_notifies_everything() {
+        let (mut memo, notifier, rows, _) = memo_over_growing_input();
+        memo.get(keys_between(0, 2));
+        memo.get(keys_between(3, 5));
+
+        *rows.borrow_mut() = rows_at(0..=5);
+        notify_input(&notifier, &Projection::Everything);
+        assert_eq!(
+            int_entries(&memo.get(keys_between(0, 2))),
+            vec![(0, 0), (1, 1), (2, 2)]
+        );
+        assert_eq!(
+            int_entries(&memo.get(keys_between(3, 5))),
+            vec![(3, 3), (4, 4), (5, 5)]
+        );
+    }
+
+    /// A region nothing has read reaches the input, whatever the input has notified: the rows
+    /// that were there from the start are read by the first pull of them.
+    #[test]
+    fn a_memo_reads_a_region_nothing_has_read() {
+        let (mut memo, notifier, rows, _) = memo_over_growing_input();
+        *rows.borrow_mut() = rows_at(6..=7);
+        notify_keys(&notifier, 0, 2);
+        assert_eq!(
+            int_entries(&memo.get(keys_between(6, 7))),
+            vec![(6, 6), (7, 7)]
+        );
+    }
+
+    /// A pull of a region read and not notified since answers from the cache: the input is
+    /// pulled to read it and, in a debug build, once to probe it, and no more.
+    #[test]
+    fn a_memo_answers_a_clean_region_from_the_cache() {
+        let (mut memo, _, _, pulled) = memo_over_growing_input();
+        for _ in 0..4 {
+            memo.get(keys_between(0, 2));
+        }
+        assert!(
+            pulled.borrow().len() <= 2,
+            "a read and a probe at most: {:?}",
+            pulled.borrow()
+        );
+    }
+
+    /// An input whose second pull, the memo's probe, lands rows and notifies, as another thread
+    /// writing rows and then notifying does between the memo taking its arrivals and probing.
+    #[cfg(debug_assertions)]
+    struct LandsDuringProbe {
+        base: ProducerBase,
+        pulls: usize,
+        arrivals: Arrivals,
+    }
+
+    #[cfg(debug_assertions)]
+    impl TileProducer for LandsDuringProbe {
+        impl_producer_base!();
+
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            self.pulls += 1;
+            if self.pulls == 2 {
+                self.arrivals
+                    .consumer(Box::new(|| {}))
+                    .notify(&Projection::Everything);
+            }
+            match self.pulls {
+                1 => ints_by_position(&[], false),
+                _ => rows_at(0..=3),
+            }
+        }
+
+        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+    }
+
+    /// The rows land and the notification is recorded while the probe runs, so it is waiting
+    /// when the probe compares: the rows are the change it announces, not one that came without
+    /// it. The next pull takes the notification and reads them.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn the_probe_tolerates_rows_whose_notification_has_not_been_taken_yet() {
+        let arrivals = Arrivals::new();
+        let mut memo = MemoProducer {
+            base: ProducerBase::unowned(MemoProducer::alloc_id(), &ints()),
+            input: Box::new(LandsDuringProbe {
+                base: ProducerBase::unowned(LandsDuringProbe::alloc_id(), &ints()),
+                pulls: 0,
+                arrivals: arrivals.clone(),
+            }),
+            cached_tile: ints().empty_tile(),
+            dirty: Projection::Everything,
+            arrivals,
+            upstream_drained: false,
+            gate_probed: false,
+            drain_probed: false,
+            consumer: shared_consumer(Box::new(|| {})).0,
+            wakeups: WakeupQueue::default(),
+        };
+        memo.get(keys_between(0, 3));
+        assert!(int_entries(&memo.get(keys_between(0, 3))).is_empty());
+        assert_eq!(
+            int_entries(&memo.get(keys_between(0, 3))),
+            vec![(0, 0), (1, 1), (2, 2), (3, 3)]
+        );
+    }
+
     fn wider_keys(tile: &Tile) -> Vec<u64> {
         int_entries(tile).into_iter().map(|(k, _)| k).collect()
     }
 
-    /// One notification stands for news anywhere the memo has read. A pull at one region
-    /// reads that region only, so the news for the other stays pending until it is pulled.
+    /// A notification of everything stands for news anywhere the memo has read. A pull at one
+    /// region reads that region only, so the news for the other stays pending until it is pulled.
     #[test]
     fn a_pull_at_one_region_leaves_the_news_for_another_region_pending() {
-        use crate::interpreter::tile_operators::Notified;
         use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
 
         let (input, rows) = ScriptedProducer::new(ints_by_position(&[], false), ints());
@@ -1870,15 +2050,14 @@ mod projection_tests {
             base: ProducerBase::unowned(MemoProducer::alloc_id(), &ints()),
             input: Box::new(input),
             cached_tile: ints().empty_tile(),
-            read: Projection::Nothing,
-            stale: Projection::Nothing,
+            dirty: Projection::Everything,
+            arrivals: Arrivals::new(),
             upstream_drained: false,
             gate_probed: false,
             drain_probed: false,
             consumer: shared_consumer(Box::new(|| {})).0,
             wakeups: WakeupQueue::default(),
         };
-        memo.base.notified = Notified::clear();
         memo.get(keys_between(0, 3));
         memo.get(keys_between(4, 7));
 
@@ -1894,7 +2073,9 @@ mod projection_tests {
             )
         };
         *rows.borrow_mut() = rows_at(0..=3);
-        memo.base.notified.mark_news();
+        memo.arrivals
+            .consumer(Box::new(|| {}))
+            .notify(&Projection::Everything);
         memo.get(keys_between(0, 3));
         memo.release(keys_between(0, 3));
 
