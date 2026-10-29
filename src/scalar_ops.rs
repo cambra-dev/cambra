@@ -1,15 +1,10 @@
-//! The scalar semantics of CHL's binary operators, as a column kernel.
+//! Binary scalar kernels shared by runtime evaluation and constant folding.
 //!
-//! `crate::interpreter::binop` applies these kernels to a `ColumnValue`.
-//! `crate::ccl::planning::const_fold` calls the same kernels on one-element columns.
+//! `crate::interpreter::binop` dispatches columns to these kernels;
+//! `crate::ccl::planning::const_fold` uses them on one-element operands.
 //!
-//! The vectorized form is the primitive and the single-element call wraps it, rather than
-//! the other way round: folding one pair is not on any hot path.
-//!
-//! Its own module because the layering forbids `ccl` from depending upward on
-//! `interpreter`, so a kernel both import lives below both. That is also why the operator
-//! enums live here, with `crate::ccl::BinOpKind` converting into [`BinOpKind`]
-//! (`impl From`, in `src/ccl/ops.rs`) — the one place the two spellings meet.
+//! Kernels and operator enums live outside the interpreter so CCL does not depend on it.
+//! `src/ccl/ops.rs` converts CCL's binary operator enum into [`BinOpKind`].
 
 use std::iter::repeat_n;
 use std::ops::{AddAssign, MulAssign, SubAssign};
@@ -25,9 +20,6 @@ pub enum BinOpKind {
     BoolLogic(LogicKind),
     Concat,
     Compare(CompareKind),
-    // Other binary operators are either less useful at the
-    // moment (e.g. bitwise ops) or require non-Int extents
-    // to be implmented first (e.g. float division).
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -151,14 +143,8 @@ pub enum LogicKind {
     Xnor,
 }
 
-// Every kernel below reads two operands of one length as views and appends one result per row to
-// `out`. A view is a slice of stored values or one value repeated, and a repeated operand is read
-// as one value, not as a column of copies. The caller owns `out`: it clears the rows it does not
-// want to keep and reserves room for the new ones, and the kernel writes each result once into
-// that room, so no result memory is initialized before the kernel writes it.
-// `apply_binop_views` fixes the length at the operands' common prefix.
-
-/// Append `f(l[i], r[i])` to `out` for every position, reading each operand as its view says.
+/// Append `f(l[i], r[i])` for equal-length operands. The caller clears unwanted rows in `out`
+/// and may reserve capacity. Two constants require one call to `f`, or none at zero length.
 #[inline]
 fn zip_views<T, R: Clone>(
     l: View<'_, T>,

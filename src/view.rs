@@ -1,11 +1,6 @@
 //! A borrowed region of a column: stored values, or one value repeated.
 //!
-//! The kernels in `crate::scalar_ops` take their operands as views, so one kernel serves a stored
-//! column, a region of one, and a literal. A region of the input is read without a copy, and a
-//! repeated operand is read as one value, not as a column of copies.
-//!
-//! A module of its own because `crate::scalar_ops` and `interpreter::types::ColumnView` both use
-//! the type, and neither depends on the other's module for it.
+//! Shared by `crate::scalar_ops` and the interpreter; both import `View` from this module.
 
 use std::ops::Range;
 
@@ -25,7 +20,7 @@ impl<T> Clone for View<'_, T> {
 impl<T> Copy for View<'_, T> {}
 
 impl<'a, T> View<'a, T> {
-    /// A region of `len` copies of `value`.
+    /// Borrow `value` as a sequence of length `len`, without allocating copies.
     pub fn repeated(value: &'a T, len: usize) -> Self {
         View::Constant { value, len }
     }
