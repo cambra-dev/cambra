@@ -27,6 +27,171 @@ fn test_function_def_scalar(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
+// A function passed as an argument reaches its call. In a multi-argument function the
+// parameter is a component of the argument tuple, so the call's callee is a projection of
+// that tuple until the inliner folds it (`src/ccl/design/optimization.md`, "Functions held
+// in products"). Each multi-argument case panicked at run time before the fold.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::sole_parameter(
+    indoc! {"
+        def inc(x):
+            x + 1
+        def apply_to(h):
+            h(1)
+        apply_to(inc)
+    "},
+    Value::Int(2),
+)]
+#[case::function_first(
+    indoc! {"
+        def inc(x):
+            x + 1
+        def apply_to(h, v):
+            h(v)
+        apply_to(inc, 1)
+    "},
+    Value::Int(2),
+)]
+#[case::function_second(
+    indoc! {"
+        def inc(x):
+            x + 1
+        def apply_to(v, h):
+            h(v)
+        apply_to(1, inc)
+    "},
+    Value::Int(2),
+)]
+#[case::lambda_argument(
+    indoc! {r"
+        def apply_to(h, v):
+            h(v)
+        apply_to(\x -> x + 1, 1)
+    "},
+    Value::Int(2),
+)]
+#[case::two_functions(
+    indoc! {"
+        def inc(x):
+            x + 1
+        def dbl(x):
+            x * 2
+        def apply_to(f, g):
+            g(f(3))
+        apply_to(inc, dbl)
+    "},
+    Value::Int(8),
+)]
+fn test_function_passed_as_an_argument(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+// A callee may be an expression that names its function statically: the result of a
+// call, or a lambda.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::curried_chain(
+    indoc! {r"
+        def add(x):
+            \y -> x + y
+        add(1)(2)
+    "},
+    Value::Int(3),
+)]
+#[case::lambda_in_call_position(r"(\x -> x + 1)(41)", Value::Int(42))]
+fn test_expression_callee(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// A callee that is none of a name, a field, a call or a lambda is refused at lowering. A
+/// conditional is one, and it would choose its function at run time, which a function has
+/// no run-time value to do.
+#[test]
+fn a_callee_chosen_by_a_conditional_is_refused() {
+    check_compile_error(
+        indoc! {"
+            def inc(x):
+                x + 1
+            def dbl(x):
+                x * 2
+            c = True
+            (inc if c else dbl)(5)
+        "},
+        "a called expression must be a name, a field (`(r.f)(x)`), a call",
+    );
+}
+
+// A callee lowering accepts by its shape still refers to a function chosen at run time when
+// the function it reaches depends on data: the inliner leaves a conditional, or an element
+// of a collection, in call position. The refusal underlines the call.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::call_result(
+    indoc! {"
+        def pick(c):
+            inc if c else dbl
+        pick(c)(5)
+    "},
+    "pick(c)(5)",
+)]
+#[case::field(
+    indoc! {"
+        r = (f=inc if c else dbl, k=10)
+        (r.f)(r.k)
+    "},
+    "(r.f)(r.k)",
+)]
+#[case::field_of_a_conditional_record(
+    indoc! {"
+        r = (f=inc,) if c else (f=dbl,)
+        (r.f)(5)
+    "},
+    "(r.f)(5)",
+)]
+#[case::bound_name(
+    indoc! {"
+        g = inc if c else dbl
+        g(5)
+    "},
+    "g(5)",
+)]
+#[case::call_result_in_a_comprehension(
+    indoc! {"
+        def pick(c):
+            inc if c else dbl
+        sum([pick(x > 1)(x) for x in [1, 2, 3]])
+    "},
+    "pick(x > 1)(x)",
+)]
+#[case::element_of_a_collection("sum([g(1) for g in [inc, dbl]])", "g(1)")]
+fn a_call_to_a_function_chosen_at_run_time_is_refused(#[case] code: &str, #[case] site: &str) {
+    use cambra::ccl::context::CompileError;
+    let code = format!(
+        "{}{code}",
+        indoc! {"
+            def inc(x):
+                x + 1
+            def dbl(x):
+                x * 2
+            c = True
+        "}
+    );
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let Err(errs) = compile_program(&mut ctx, &LoadedProgram::test(&code), consumer) else {
+        panic!("expected a compile error, but the program compiled");
+    };
+    let [CompileError::Unsupported { message, span, .. }] = errs.as_slice() else {
+        panic!("expected one unsupported-program error, got {errs:?}");
+    };
+    assert!(
+        message.contains("the function this call reaches depends on run-time data"),
+        "{message}"
+    );
+    assert_eq!(&code[span.start..span.end], site);
+}
+
 // A polymorphic UDF applied at two *distinct* argument types in the same
 // program, end-to-end. `x == x` is `∀α. α → Bool`, so the two calls have
 // incompatible domains (Int vs String) — under a monomorphic `let` they would
