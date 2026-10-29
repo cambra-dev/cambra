@@ -460,6 +460,7 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
         named,
         products: ProductReading::None,
         reads_collections: false,
+        method: false,
     }))
 }
 

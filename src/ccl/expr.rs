@@ -476,6 +476,10 @@ pub enum TypedExprNode {
         /// is its first component; otherwise the argument is the receiver.
         args: usize,
         candidates: Vec<MethodCandidate>,
+        /// The obligation of a call emission deferred, its receiver's type unknown where
+        /// the call stands, which selects the candidate once that type arrives. `None`
+        /// before emission.
+        deferred: Option<std::rc::Rc<crate::ccl::infer::solver::traits::TraitObligation>>,
     },
 
     /// A function of an instance not chosen yet: what `summon(Area(_))::area` and `a::area`,
