@@ -283,3 +283,109 @@ impl Released {
         self.beyond |= matches!(region, All);
     }
 }
+
+/// The predicate naming exactly `keys`.
+pub(crate) fn points(keys: impl IntoIterator<Item = u64>) -> Predicate {
+    Predicate::from_column_value(&ColumnValue::UInts(keys.into_iter().collect()))
+}
+
+/// A model of a growing [`Input`]: the rows it holds, whether it is closed, what it has been
+/// released at, and the releases that must have reached it, in order.
+#[derive(Default)]
+pub(crate) struct InputModel {
+    pub(crate) rows: BTreeSet<u64>,
+    pub(crate) closed: bool,
+    pub(crate) released: Released,
+    releases: Vec<Predicate>,
+    /// The pulls of a region the input had been released at whole.
+    wasted: usize,
+}
+
+impl InputModel {
+    pub(crate) fn new(initial: &[u64]) -> Self {
+        Self {
+            rows: initial.iter().copied().collect(),
+            ..Self::default()
+        }
+    }
+
+    /// A row arrives, unless the input is closed. Whether it arrived.
+    pub(crate) fn add(&mut self, key: u64) -> bool {
+        if self.closed {
+            return false;
+        }
+        self.rows.insert(key);
+        true
+    }
+
+    /// A pull at `region`: the keys it answers, and what the answer states complete, which the
+    /// breaker releases the input at.
+    pub(crate) fn pull(&mut self, region: Region) -> (BTreeSet<u64>, Predicate) {
+        if self.released.covers(region) {
+            self.wasted += 1;
+        }
+        let keys = region.keys();
+        let held: BTreeSet<u64> = self
+            .rows
+            .iter()
+            .copied()
+            .filter(|key| keys.contains(key))
+            .collect();
+        let answered = held
+            .iter()
+            .copied()
+            .filter(|key| !self.released.keys.contains(key))
+            .collect();
+        let stated = match self.closed {
+            true => predicate(&region.guard()),
+            false => points(held.iter().copied()),
+        };
+        let grows = match self.closed {
+            true => !self.released.covers(region),
+            false => !held.is_subset(&self.released.keys),
+        };
+        if grows {
+            self.releases.push(stated.clone());
+        }
+        match self.closed {
+            true => self.released.add(region),
+            false => self.released.keys.extend(held),
+        }
+        (answered, stated)
+    }
+
+    /// The input is released at `region`.
+    pub(crate) fn release(&mut self, region: Region) {
+        if !self.released.covers(region) {
+            self.releases.push(predicate(&region.guard()));
+        }
+        self.released.add(region);
+    }
+
+    /// Whether the input has been released whole, which a pipeline finalizes after.
+    pub(crate) fn drained(&self) -> bool {
+        self.released.covers(All)
+    }
+
+    /// The releases that reached `source`, and its pulls of a region it had been released at
+    /// whole, against the model.
+    pub(crate) fn check(&self, source: &Shared, trace: &str) {
+        let source = source.borrow();
+        assert_eq!(
+            source.wasted, self.wasted,
+            "{trace}: pulls of a region released whole"
+        );
+        assert_eq!(
+            source.released.len(),
+            self.releases.len(),
+            "{trace}: the input's releases {:?}",
+            source.released
+        );
+        for (actual, expected) in source.released.iter().zip(&self.releases) {
+            assert!(
+                same_region(&predicate(actual), expected),
+                "{trace}: the input is released at {actual:?}, not {expected:?}"
+            );
+        }
+    }
+}

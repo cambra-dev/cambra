@@ -997,6 +997,19 @@ pub(crate) fn guard_minus(held: &TileGuard, released: &TileGuard) -> TileGuard {
     }
 }
 
+/// The projection of a pull of a producer whose output is one value, which has no keys to project:
+/// all of it or none. `what` completes "`name` ..." in the panic: "is one accumulator".
+///
+/// # Panics
+///
+/// For a projection of keys.
+pub(crate) fn projection_of_one_value(name: &str, what: &str, guard: &TileGuard) -> Projection {
+    match guard.projection(name) {
+        Projection::Keys(_) => panic!("{name} {what}, which has no keys to project: {guard:?}"),
+        projection => projection,
+    }
+}
+
 /// The end of a pipeline: it consumes the input it owns into state of its own. [`consume_impl`]
 /// pulls the breaker's input at a guard, merges the answer, and releases the input at what the
 /// answer stated once it has taken delivery of it, so the driver handles no tile. A breaker that
