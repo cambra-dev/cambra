@@ -279,18 +279,23 @@ publishes, and the source takes a region it has already claimed once: the duplic
 an `Everything` that covers published rows and a region that reaches the head along two paths of a
 diamond. The path from the source to the `PipelineConsumer` is region-driven and acyclic
 ([Region-carrying notifications](#region-carrying-notifications)), which `plan` guarantees by
-admitting only `MapResult`s over a `Constant` function operand, cutting a pipeline at a `FanOutSlot`
-and refusing a deferred edge. `run_pipeline` is the body of `run_main` for a plan with one
-pipeline, and `run_pipelines` runs several. Once the chains are subscribed it publishes `Everything`
-to the source, so the rows the source holds when the pool starts are claimable, as no notification
-names them. Without a delivery it then closes the source, since no row arrives later. A
-`DeliveringThread` is a closure that runs on the calling thread while the workers run. The closure
-receives the handle and the scheduler the chains were subscribed with, writes rows to the source and
-calls `Scheduler::check_for_notifications`, which polls the source (`check_for_new_data`) and
-notifies the consumers registered for it with `Everything`. The head's `PipelineConsumer` publishes
-that, and the live source resolves it to the keys that are ready. A region would add precision and
-not correctness, and the scheduler's serial path is the same call. `run_pipeline` closes the source
-when the closure returns, which can publish nothing more.
+cutting a pipeline at every `FanOutSlot`, so that a slot is the leaf of a `BreakerOutput` and not an
+edge into a shared node, and by refusing a deferred edge. A chain that reads a `Memo` at keys has a
+head reached along several paths of a diamond: the iterated source's path and one path per slot.
+Each path is acyclic, since the slots are leaves, and the keyed head's consumer publishes
+`Projection::Everything` for any of them ([Keyed reads](#keyed-reads)), which the live source
+resolves to the keys that are ready and not yet claimed, so a duplicate publish adds no key.
+`run_pipeline` is the body of `run_main` for a plan with one pipeline, and `run_pipelines` runs
+several. Once the chains are subscribed it publishes `Everything` to the source, so the rows the
+source holds when the pool starts are claimable, as no notification names them. Without a delivery
+it then closes the source, since no row arrives later. A `DeliveringThread` is a closure that runs
+on the calling thread while the workers run. The closure receives the handle and the scheduler the
+chains were subscribed with, writes rows to the source and calls
+`Scheduler::check_for_notifications`, which polls the source (`check_for_new_data`) and notifies the
+consumers registered for it with `Everything`. The head's `PipelineConsumer` publishes that, and the
+live source resolves it to the keys that are ready. A region would add precision and not
+correctness, and the scheduler's serial path is the same call. `run_pipeline` closes the source when
+the closure returns, which can publish nothing more.
 
 A `PipelineRun` names its head: a data source (`Head::Source`) or a breaker's output
 (`Head::Breaker`). `run_pipelines` seeds and closes every pipeline with a data-source head when the
@@ -609,8 +614,9 @@ column and has no level of its own, so it is not affected.
 `plan_inline` plans every `Sink` node of the graph as an output: `main`, and each sink such as the
 reply channel of `http_serve`, ends a pipeline of its own. `plan` keeps `main` as the one output for
 the threaded pool. A sink's pipeline ends in a collection breaker (`Breaker::Collect`); only `main`
-may end in a fold, since a sink dispatches a collection. A `Memo` is still read by one slot, so two
-sinks over one memo are refused.
+may end in a fold, since a sink dispatches a collection. A `Memo` that a slot starts a chain from is
+read by that one slot, so two sinks that each start a chain from one memo are refused, and two
+outputs that read one memo at keys are admitted ([Keyed reads](#keyed-reads)).
 
 `PooledRun::start` takes each sink's serial producer out of its `SinkConsumer`, which drops the
 subscription that registered a release record with the sources, cuts the sink's chain at its memos
@@ -652,14 +658,82 @@ through the serial loop and the inline dispatcher and compares the replies:
 `a_memo_between_two_maps_replies_to_each_request_once`,
 `a_request_that_arrives_after_idle_laps_is_replied_in_a_later_lap` and
 `an_unmatched_or_malformed_request_is_handled_as_in_the_serial_loop`. A map with a filter, and a
-reply fed under an `if`, read their request twice: the compiled program applies the request memo at
-each key, a build side the plan does not stream, so the inline dispatcher refuses both and the
-serial loop runs them (`a_filtered_map_is_refused_by_the_inline_dispatcher_and_served_serially`).
-Each scenario also asserts that the reply sink was handed no index that no request waits on (a reply
-written twice) and that the inline run holds no row once every reply is out (a row never released).
+reply fed under an `if`, read their request at its own key and run as keyed reads ([Keyed
+reads](#keyed-reads)). Each scenario also asserts that the reply sink was handed no index that no
+request waits on (a reply written twice) and that the inline run holds no row once every reply is
+out (a row never released).
 
 The differential suite compiles each program in a context with no sources or sinks registered, so
 the programs that read one are skipped, and the HTTP programs are compared by the scenarios above.
+
+### Keyed reads
+
+Decision: a `MapResult` whose function is a slot of a `Memo` and whose input iterates the memo's own
+source extent is a keyed read, and the plan runs it as a pipeline over the memo's output. A
+comprehension that reads its source twice, as a filter does, compiles to it: `MapResult(function =
+FanOutSlot of the memo, input = IterateExtent)`, and an HTTP program's request stream is such a memo
+(`reqs`). The slot is not a build side, which every row reads whole and which blocks its pipeline
+until it is complete, a state a live route never reaches. A keyed read asks for the one key of the
+row it applies to, and the memo holds that key once the pipeline that fills it has merged the morsel
+that contains it.
+
+The plan admits the read under these rules, and each refusal states its reason; the plan tests
+`a_keyed_read_is_admitted_over_a_memo_that_keeps_every_key` and the hand-built graphs in
+`parallel.rs` (`keyed_graphs`) pin them.
+
+- The values of the input are its keys. `MapResult` reads the memo at `function(input(k))`, so an
+  input that answers anything but the keys, a `MapResultWithSource`, a `MapResult` of a `Constant`,
+  another keyed read, would read the memo at a key no claim ordered. Only an `IterateExtent` or a
+  `Restrict`, which answers the keys that pass, stands directly beneath a keyed read, and the cut
+  asserts it.
+- The extent of the `IterateExtent` is the memo's own, by `Extent` equality: the key the row names
+  is a key of the memo.
+- A chain reads at most one memo. The chain's morsels are the keys that memo has merged, and a key
+  of a second memo may not be merged yet.
+- A memo is read at keys or by a slot that starts a chain, not both. The slot that starts a chain
+  takes the memo's pipeline as the chain's own upstream, and a keyed read gives the memo's output
+  several readers. Any number of chains, and any number of outputs, may read one memo at keys: each
+  slot is a reader of its own, and the shared pipeline inherits what every output that reads it had
+  released.
+- A keyed read does not sit in a chain that starts at a breaker's output, which has no source whose
+  keys it iterates.
+- The memo's own input is a `Memo`'s input edge, and not a deferred or shared one.
+- The memo's pipeline holds no `Restrict` and no `VariantProject`. This refusal is conservative. A
+  keyed morsel may name a key between its first and last for which the memo holds no row, and the
+  slot is believed to answer such a key complete and absent, as the serial memo does:
+  `test_refiltered_let_bound_comprehension` and `a_filter_over_a_box_that_already_carries_one` agree
+  with the serial answer at one and three rows per morsel and on four threads with the refusal
+  removed. Admitting it needs the missing-key rule written down. `drops_keys` counts the operators
+  that drop keys, `Restrict` and `VariantProject`; the function operands the plan admits are total,
+  so a `MapResult` does not.
+
+A keyed pipeline is a `Head::Breaker` pipeline over the memo's output with `keyed` set and the
+memo's pipeline in `streams_from`. Its dispatcher source is the source of a slot's `BreakerOutput`,
+which claims the published keys and no others, so a morsel never names a key the memo does not hold.
+The chain still reads the data source whose keys it iterates, which supplies the rows the morsel
+names, and the pool's record for that operator holds the source's rows until the morsel releases
+them. The arrivals of that source also notify the chain's head with the keys that arrived, and a
+keyed pipeline's consumer publishes `Projection::Everything` for every notification
+(`PipelineConsumer`), since a region of arrivals is not a region the memo has merged.
+
+The ordering is the one of every breaker: the upstream worker absorbs the morsel's rows into the
+memo's output, which makes the rows and their keys visible together, then publishes the morsel's
+region to the readers, then the publish moves the dispatcher's epoch. A claim of the keyed pipeline
+reads the published keys, so by the time it can name key `k` the row at `k` is in the output. Each
+slot of the chain is a reader of the output that is not `whole`: it reads the rows that were merged
+and not yet released by it, and releases the morsel's keys when the morsel is done, so the output
+reclaims a row once every slot released it (`a_keyed_read_runs_behind_the_keys_its_memo_has_merged`
+asserts that no row is held at the end). The answer is complete once the memo's pipeline has
+finished and the keyed pipeline has run its last morsel. The cut gives every slot of a memo a
+`BreakerOutput` over one output, and only the first takes the chain that fills it. Both the inline
+dispatcher and the threaded pool run keyed reads
+(`a_keyed_read_over_a_source_runs_on_four_workers`).
+
+The HTTP programs a filter or an `if` reply compiles to run through the inline dispatcher and answer
+as the serial loop does (`a_filtered_map_replies_to_the_admitted_requests_only`,
+`a_reply_fed_under_an_if_replies_to_the_admitted_requests_only`). A filter over a bare `source1()`,
+which reads the source's value at the keys of a restricted `IterateExtent`, stays refused:
+`MapResultWithSource` is admitted over an `IterateExtent` only.
 
 ### Widening the plan
 
@@ -704,8 +778,8 @@ compares the operator's tiling with its input's and refuses a mismatch
 
 The operators that stay refused need machinery of their own: `MakeRecord` and `Zip` join several
 inputs, `UnionOperator` concatenates keys, `Converse` and `MapExtractAggregate` read inner levels, a
-`MapResult` that applies a `FanOutSlot` has a build side, and `StoreFinalRead` and `ExtractFinal`
-read a recurrence's result.
+`MapResult` that applies a `FanOutSlot` of a `Memo` that drops keys has a build side, and
+`StoreFinalRead` and `ExtractFinal` read a recurrence's result.
 
 A list of variants a hundred elements long overflows the stack when the program compiles, on the
 serial path as well; the plan test uses twenty.
@@ -808,7 +882,7 @@ the lap lifts that refusal; the lap sits between the delivery and the sink pulls
 runs after both, so the loop's order changes with it.
 
 A breaker other than a sink or a `Memo`'s input, a fold into a sink, a build side, a way to hand a
-morsel back, and a `Memo` read by more than one slot. A source over a data-source domain runs on the
+morsel back, and a `Memo` read by more than one slot that starts a chain. A source over a data-source domain runs on the
 pool when it cuts morsels (`cuts_morsels`): `TestDataSource` and `HttpServerDataSource` do, and the
 stdio source keeps the default, so a program over it stays on the compiling thread. Their arrivals
 reach the pipeline through the scheduler's polling, which a live pool drives from the calling

@@ -576,6 +576,20 @@ notification at subscribe time is replaced by the seed publish in `run_pipeline`
 
 **Not implemented.** `plan` admits no chain with a build side.
 
+### Keyed reads
+
+A `MapResult` whose function operand is a slot of a `Memo` and whose input iterates the memo's own
+source domain reads the shared value at the row's own key. It is not a build side: it asks for one
+key, and the memo holds that key once the pipeline that fills it has merged its morsel. The pipeline
+that holds the read takes its morsels from the keys the memo's breaker has published, so a morsel
+names only merged keys; each slot is a reader of the memo's output that is not whole, released per
+morsel. The input's values must be its keys, the memo's pipeline must keep every key of its source
+(a conservative rule for now), and a chain keyed-reads one memo.
+
+`src/interpreter/design-parallel.md`, "Keyed reads", states the rules, the ordering and the release.
+It is how a filter over a request stream that is itself a `Memo`, `[r + "!" for r in reqs if r !=
+"skip"]` over an HTTP route, runs on the pool.
+
 ### Function operands
 
 `MapResult` reads its function operand whole on every pull and releases it only on a universal
@@ -859,9 +873,9 @@ Ordered so that each step is measurable on its own and none is undone by the nex
    (`src/interpreter/design-parallel.md`, "A fold as the breaker"). The inline dispatcher runs the
    same over a data source and writes each sink through a reader of its pipeline's breaker, so an
    HTTP program `source -> map -> sink`, with a `Memo` between maps, runs on the scheduler loop's
-   own thread (`src/interpreter/design-parallel.md`, "Sinks and the HTTP path"). Next: the threaded
-   pool over a source, which is where the chain's scaling with no exchange is measured, and a
-   build side for a filter that reads its input twice.
+   own thread (`src/interpreter/design-parallel.md`, "Sinks and the HTTP path"), and a filter that
+   reads its input twice runs as a keyed read ("Keyed reads" above). Next: the threaded pool over a
+   source, which is where the chain's scaling with no exchange is measured.
 6. **The grouped fold.** The planning rewrite that fuses `converse(c ≫ key) ≫ map(c ≫ v) ≫
    map_aggregate(kind)` into one fold over `pos ↦ (key, v)`, with thread-local tables and the
    sequential merge. This is the group-by's parallel form and removes the second memo reader.
