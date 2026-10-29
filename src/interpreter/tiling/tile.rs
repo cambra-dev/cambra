@@ -1838,27 +1838,40 @@ impl Tile {
     /// A level appended beneath level `at`, in place of the values `at` holds, for groups
     /// that may still gain keys: `level` builds it from those values, as in
     /// [`append_level`](Self::append_level), and level `at`'s `domain_predicate` is left as the
-    /// caller stated it. A later tile adding to a group re-states its key, which
-    /// [`Tile::merge`] merges into the group.
+    /// caller stated it. The new level states `stated`, the keys the caller knows its groups
+    /// will gain no more of, over the paths from level `at`. A later tile adding to a group
+    /// re-states its key, which [`Tile::merge`] merges into the group.
     ///
     /// Beneath a stated level rather than the innermost one, because the values there may be
     /// collections of their own: pairing a row whose value is a collection puts the new level
     /// between the row and that collection.
+    ///
+    /// # Panics
+    ///
+    /// When `level` builds a level that names complete keys or has removed any: what the level
+    /// states is `stated`.
     pub fn append_open_level_beneath(
         mut self,
         at: CurryLevel,
+        stated: Predicate,
         level: impl FnOnce(Tile) -> Tile,
     ) -> Tile {
         let slot = self.values_at_mut(CurryLevel::new(at.index() + 1));
-        let built = level(std::mem::replace(slot, Tile::record(HashMap::new())));
+        let mut built = level(std::mem::replace(slot, Tile::record(HashMap::new())));
+        let Tile::DataFunction {
+            domain_predicate,
+            deleted,
+            ..
+        } = &mut built
+        else {
+            panic!("an appended level is a collection: {built:?}")
+        };
         assert!(
-            matches!(
-                &built,
-                Tile::DataFunction { domain_predicate: Predicate::False, deleted, .. }
-                    if deleted.is_empty()
-            ),
-            "an appended level names no complete keys and has removed nothing: {built:?}"
+            domain_predicate.is_false() && deleted.is_empty(),
+            "an appended level is built naming no complete keys and having removed nothing: \
+             {domain_predicate:?}, {deleted:?}"
         );
+        *domain_predicate = stated;
         *slot = built;
         self
     }
@@ -1879,7 +1892,8 @@ impl Tile {
     /// `domain_predicate` gains each key present: the new level sits beneath it, so each key
     /// is final together with the group opened under it, unioned with the region the arriving
     /// tile already called final. A caller whose groups may still gain keys appends with
-    /// [`append_open_level_beneath`](Self::append_open_level_beneath) instead, which states nothing more.
+    /// [`append_open_level_beneath`](Self::append_open_level_beneath) instead, which states what
+    /// the caller states.
     /// The levels above keep their own predicates: a row of one of them is complete once the
     /// level beneath it will gain no more keys, which appending says nothing about.
     pub fn append_level(mut self, level: impl FnOnce(Tile) -> Tile) -> Tile {
