@@ -17,8 +17,8 @@ use crate::{
         provenance::NodeId,
     },
     interpreter::{
-        Consumer, LockNow, Materialized, PooledRecords, Predicate, Projection, Scheduler, Tile,
-        TileGuard, Tiling,
+        Consumer, LockNow, Materialized, PooledRecords, Projection, Scheduler, Tile, TileGuard,
+        Tiling,
         operator_graph::{EdgeKind, EdgeRole, GraphNode, OperatorGraph},
         tile_operators::{
             BreakerOutput, Claim, Detached, MorselSource, OperatorBase, ProducerBase, TileOperator,
@@ -1100,13 +1100,9 @@ impl PoolBreaker {
                 let mut tile = collector
                     .into_inner()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                // The statement the universal pull makes, `True`, is the collection's.
-                if let Tile::DataFunction {
-                    domain_predicate, ..
-                } = &mut tile
-                {
-                    *domain_predicate = Predicate::True;
-                }
+                // Every worker has returned and every morsel is merged, so the collection is
+                // complete at every level, as the universal pull states it.
+                tile.complete_every_level();
                 tile
             }
             PoolBreaker::Fold {
@@ -2189,7 +2185,7 @@ mod tests {
         IterateExtent, LiveSource, RangeSource, uint_keys_in, uint_range, zip_arms_at,
     };
     use crate::interpreter::{BaseType, CurryLevel, Extent};
-    use crate::interpreter::{FunctionGuard, Value};
+    use crate::interpreter::{FunctionGuard, Predicate, Value};
     use intervalsets::Bounding;
     use std::collections::BTreeSet;
     use std::sync::mpsc;

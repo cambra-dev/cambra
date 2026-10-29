@@ -16,7 +16,7 @@ mod source_end_to_end {
     use crate::ccl::context::{GlobalContext, compile_program};
     use crate::ccl::load::LoadedProgram;
     use crate::interpreter::tile_operators::points;
-    use crate::interpreter::{BaseType, ColumnValue, Extent, TestDataSource, Value};
+    use crate::interpreter::{BaseType, ColumnValue, Extent, Predicate, TestDataSource, Value};
 
     /// The key and the value a row holds.
     #[derive(Clone)]

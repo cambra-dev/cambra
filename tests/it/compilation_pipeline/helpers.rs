@@ -177,7 +177,271 @@ pub(crate) fn run_program_with_ctx(
         after.is_empty(),
         "pull after a universal release returned {after:?}"
     );
+    dispatch::check(loaded, &result);
     (*compiled.ast, result)
+}
+
+/// The differential suite of the pool's inline driver: with `CAMBRA_DISPATCH_CHECK=1` every
+/// program a pipeline test runs is run again through `PooledRun`, and the answers must agree.
+///
+/// A program the plan refuses is counted with its reason, and one that does not compile on a
+/// bare context (it reads a source or sink the test registered) is counted as skipped; the
+/// dispatched run does not rebuild a test's sources, so such a program is not checked. The
+/// programs the plan admits are pinned in `dispatch_admitted.txt`, one line each, a hash of the
+/// program's files and the name of the test that ran it, separated by a tab. An admitted program
+/// that is not listed, or a listed one that is refused, fails, so a plan change that admits less
+/// or more is a diff in that file. `CAMBRA_DISPATCH_BLESS=1` rewrites the file from the programs a
+/// run admits, sorted, so a bless run covers the whole corpus. `CAMBRA_DISPATCH_REPORT=<file>`
+/// appends one line per program: outcome, reason and hash. `./ci.sh dispatch` runs the suite and
+/// compares the report with the pin, so a listed program no test runs any more fails there.
+mod dispatch {
+    use super::*;
+    use cambra::interpreter::parallel::{Config, Lap, PooledRun, run_main};
+    use std::collections::BTreeMap;
+    use std::io::Write;
+
+    const PIN: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/it/compilation_pipeline/dispatch_admitted.txt"
+    );
+
+    /// A 64-bit FNV-1a hash of every file of the program, with its path.
+    fn key(loaded: &LoadedProgram) -> String {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let sources = loaded.sources();
+        for file in sources.files() {
+            for byte in sources.path(file).bytes().chain(sources.text(file).bytes()) {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+            }
+        }
+        format!("{hash:016x}")
+    }
+
+    fn pinned() -> Vec<String> {
+        std::fs::read_to_string(PIN)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| line.split_whitespace().next().map(str::to_string))
+            .collect()
+    }
+
+    /// Append `line` to the file `path` in one write, so that lines from tests on several threads
+    /// do not interleave.
+    fn append(path: &str, line: String) {
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .expect("the file opens");
+        file.write_all(line.as_bytes())
+            .expect("the line is written");
+    }
+
+    fn report(outcome: &str, reason: &str, key: &str) {
+        if let Ok(path) = std::env::var("CAMBRA_DISPATCH_REPORT") {
+            append(&path, format!("{outcome}\t{reason}\t{key}\n"));
+        }
+    }
+
+    /// The programs this run admitted, by hash, with the test that ran each, which a bless run
+    /// writes out whole.
+    static ADMITTED: Mutex<BTreeMap<String, String>> = Mutex::new(BTreeMap::new());
+
+    /// List `key` among the admitted programs and rewrite the pin from the list.
+    fn bless(key: &str) {
+        let test = std::thread::current().name().unwrap_or("").to_string();
+        let mut admitted = ADMITTED
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        admitted
+            .entry(key.to_string())
+            .and_modify(|first| {
+                if test < *first {
+                    *first = test.clone();
+                }
+            })
+            .or_insert(test);
+        let text: String = admitted
+            .iter()
+            .map(|(key, test)| format!("{key}\t{test}\n"))
+            .collect();
+        std::fs::write(PIN, text).expect("the pin file is written");
+    }
+
+    /// The morsel sizes the inline driver runs each program at: `CAMBRA_MORSEL_ROWS` when set, and
+    /// otherwise 1 and 3, so a program over a few rows runs as one morsel per row and as several.
+    fn morsel_sizes() -> Vec<u64> {
+        match std::env::var("CAMBRA_MORSEL_ROWS")
+            .ok()
+            .and_then(|rows| rows.parse().ok())
+        {
+            Some(rows) => vec![rows],
+            None => vec![1, 3],
+        }
+    }
+
+    /// Run `loaded` through the inline driver and compare with `serial`, the answer of the plain
+    /// loop, at each morsel size, then through the threaded pool when its plan admits the program.
+    pub(super) fn check(loaded: &LoadedProgram, serial: &Tile) {
+        if std::env::var("CAMBRA_DISPATCH_CHECK").as_deref() != Ok("1") {
+            return;
+        }
+        let key = key(loaded);
+        let blessing = std::env::var("CAMBRA_DISPATCH_BLESS").as_deref() == Ok("1");
+        let mut ctx = GlobalContext::default();
+        if compile_program(&mut ctx, loaded, Box::new(|| {})).is_err() {
+            report("skipped", "does not compile on a bare context", &key);
+            return;
+        }
+        for (pass, morsel_rows) in morsel_sizes().into_iter().enumerate() {
+            let admitted = inline_pass(loaded, serial, &key, morsel_rows);
+            if pass > 0 {
+                continue;
+            }
+            match admitted {
+                Err(refused) => {
+                    report("refused", &refused, &key);
+                    assert!(
+                        blessing || !pinned().contains(&key),
+                        "{key} is pinned as admitted and the plan refused it: {refused}"
+                    );
+                    return;
+                }
+                Ok(()) => {
+                    report("admitted", "", &key);
+                    if blessing {
+                        bless(&key);
+                    } else {
+                        assert!(
+                            pinned().contains(&key),
+                            "{key} was admitted and is not pinned: run with CAMBRA_DISPATCH_BLESS=1"
+                        );
+                    }
+                }
+            }
+        }
+        threaded_pass(loaded, serial, &key);
+    }
+
+    /// One inline run of `loaded` with morsels of `morsel_rows` rows against `serial`, or the
+    /// plan's reason for refusing the program.
+    fn inline_pass(
+        loaded: &LoadedProgram,
+        serial: &Tile,
+        key: &str,
+        morsel_rows: u64,
+    ) -> Result<(), String> {
+        let mut ctx = GlobalContext::default();
+        let mut program = compile_program(&mut ctx, loaded, Box::new(|| {}))
+            .expect("the program compiled on a bare context");
+        let config = Config {
+            threads: 1,
+            morsel_rows,
+        };
+        let started = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}));
+        let mut run = started.map_err(|refused| refused.to_string())?;
+        let mut main = run.take_main();
+        let universal = main.tiling().universal_guard();
+        let laps = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            for _ in 0..1024 {
+                ctx.scheduler().check_for_notifications();
+                run.lap();
+                ctx.scheduler().pull_sinks();
+                let tile = main.get(universal.clone());
+                if tile.is_terminal() {
+                    return Some(tile);
+                }
+            }
+            None
+        }));
+        let dispatched = match laps {
+            Ok(dispatched) => dispatched,
+            Err(panic) => {
+                let why = panic
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| panic.downcast_ref::<&str>().copied())
+                    .unwrap_or("a panic with no message");
+                panic!("the dispatched run of {key} at {morsel_rows} rows panicked: {why}");
+            }
+        };
+        let mut dispatched = dispatched.unwrap_or_else(|| {
+            panic!(
+                "the dispatched run of {key} at {morsel_rows} rows did not reach a terminal tile \
+                 in 1024 laps"
+            )
+        });
+        assert_eq!(
+            run.lap(),
+            Lap::Done,
+            "the dispatched run of {key} at {morsel_rows} rows has a terminal `main` and every \
+             pipeline finished"
+        );
+        dispatched.compact();
+        assert_eq!(
+            sort_tile_collections(dispatched),
+            sort_tile_collections(serial.clone()),
+            "the dispatched run of {key} at {morsel_rows} rows differs from the serial run"
+        );
+        Ok(())
+    }
+
+    /// A flat collection with its entries in key order, whatever the codomain holds. A tile that is
+    /// not one is returned as it is.
+    fn sorted_by_key(mut tile: Tile) -> Tile {
+        tile.compact();
+        let Tile::DataFunction {
+            row_starts,
+            domain,
+            codomain,
+            domain_predicate,
+            ..
+        } = &tile
+        else {
+            return tile;
+        };
+        if row_starts.len() != 1 {
+            return tile;
+        }
+        let mut order: Vec<usize> = (0..domain.len()).collect();
+        order.sort_by(|a, b| {
+            domain
+                .index_at(*a)
+                .partial_cmp(&domain.index_at(*b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        Tile::data_function(
+            domain.select_indices(order.iter().copied(), order.len()),
+            Box::new(codomain.select_rows(&order)),
+            domain_predicate.clone(),
+            Default::default(),
+        )
+    }
+
+    /// `loaded` on four worker threads with morsels of two rows against `serial`, when the
+    /// threaded plan admits it.
+    fn threaded_pass(loaded: &LoadedProgram, serial: &Tile, key: &str) {
+        let mut ctx = GlobalContext::default();
+        let mut program = compile_program(&mut ctx, loaded, Box::new(|| {}))
+            .expect("the program compiled on a bare context");
+        let config = Config {
+            threads: 4,
+            morsel_rows: 2,
+        };
+        match run_main(&mut ctx, &mut program, &config) {
+            Err(refused) => report("threaded-refused", &refused.to_string(), key),
+            Ok(mut threaded) => {
+                report("threaded", "", key);
+                threaded.compact();
+                // Workers merge morsels in the order they finish, so the rows are compared by key.
+                assert_eq!(
+                    sorted_by_key(sort_tile_collections(threaded)),
+                    sorted_by_key(sort_tile_collections(serial.clone())),
+                    "the threaded run of {key} differs from the serial run"
+                );
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

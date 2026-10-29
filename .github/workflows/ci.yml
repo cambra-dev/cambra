@@ -187,6 +187,14 @@ jobs:
         # step, which is worth paying to keep the next one from doing the same.
         run: CAMBRA_PROVENANCE_GATE=1 ./ci.sh test
 
+      - name: Dispatch differential
+        # The `compilation_pipeline` corpus again through the inline driver and the threaded
+        # pool, against the serial answers and the pinned admitted set
+        # (`src/interpreter/design-parallel.md`, "The differential suite"). Its own step so a
+        # plan change, or a dispatched answer that differs, fails by name. It reuses the
+        # binaries of the step above.
+        run: ./ci.sh dispatch
+
   # The suite with `debug_assertions` off — the configuration a release build
   # compiles, at `dev`'s compile cost (`profile.no-assertions`). Its own
   # `rust-cache` entry, unlike `test_reversed`: that job changes an env var the

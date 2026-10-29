@@ -1516,6 +1516,23 @@ impl Tile {
         walk(self, 0, f);
     }
 
+    /// State every collection level of this tile complete: what a collection is once nothing more
+    /// will be added to it, at the outermost level and at every level beneath, whatever each level
+    /// stated before. A level a tile reaches through a record counts as its own.
+    pub(crate) fn complete_every_level(&mut self) {
+        self.map_level_predicates(&mut |_, _| Predicate::True);
+    }
+
+    /// [`complete_every_level`](Self::complete_every_level) for the levels beneath the outermost,
+    /// which keeps what the outermost states: a tile cut to part of its keys states that part
+    /// complete, and the groups of the keys it kept are whole.
+    pub(crate) fn complete_inner_levels(&mut self) {
+        self.map_level_predicates(&mut |depth, stated| match depth {
+            0 => stated.clone(),
+            _ => Predicate::True,
+        });
+    }
+
     /// How many keys this level holds in total, across every row of it.
     fn level_width(&self) -> usize {
         match self {
@@ -5952,6 +5969,141 @@ mod tests {
             vec![100, 110, 200, 210, 220, 300],
             Predicate::False,
         )
+    }
+
+    /// A completed collection states every level complete, whatever the levels stated: a
+    /// collection of collections, with a group that is empty.
+    #[test]
+    fn completing_every_level_states_a_collection_of_collections_complete() {
+        let mut tile = two_level_uint_int(
+            vec![10, 20, 30],
+            vec![0, 2, 2],
+            vec![0, 1, 0],
+            vec![100, 110, 300],
+            Predicate::False,
+        );
+        tile.complete_every_level();
+        let Tile::DataFunction {
+            domain_predicate,
+            codomain,
+            ..
+        } = &tile
+        else {
+            panic!("a collection, got {tile:?}");
+        };
+        assert_eq!(*domain_predicate, Predicate::True);
+        let Tile::DataFunction {
+            domain_predicate: inner,
+            ..
+        } = &**codomain
+        else {
+            panic!("a collection of collections, got {codomain:?}");
+        };
+        assert_eq!(*inner, Predicate::True, "the empty group among them");
+    }
+
+    /// A level reached through a record, a tuple's components included, is completed too.
+    #[test]
+    fn completing_every_level_reaches_a_collection_held_by_a_record() {
+        let mut tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::record(
+                [
+                    ("a".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 3]))),
+                    (
+                        "b".into(),
+                        Tile::grouped(
+                            vec![0, 2],
+                            ColumnValue::UInts(vec![0, 1, 0, 1]),
+                            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 4, 5]))),
+                            Predicate::False,
+                            BitSet::new(),
+                        ),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        tile.complete_every_level();
+        let Tile::DataFunction {
+            domain_predicate,
+            codomain,
+            ..
+        } = &tile
+        else {
+            panic!("a collection, got {tile:?}");
+        };
+        assert_eq!(*domain_predicate, Predicate::True);
+        let Tile::Record { fields, .. } = &**codomain else {
+            panic!("a record, got {codomain:?}");
+        };
+        let Tile::DataFunction {
+            domain_predicate: inner,
+            ..
+        } = &fields["b"]
+        else {
+            panic!("a collection field, got {:?}", fields["b"]);
+        };
+        assert_eq!(*inner, Predicate::True);
+    }
+
+    /// Completing the inner levels leaves the outermost statement as it was, which a tile cut
+    /// to part of its keys needs: that part is what it states complete.
+    #[test]
+    fn completing_the_inner_levels_keeps_the_outermost_statement() {
+        let kept = Predicate::at_or_below(Value::UInt(20));
+        let mut tile = three_groups();
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &mut tile
+        else {
+            panic!("a collection");
+        };
+        *domain_predicate = kept.clone();
+        tile.complete_inner_levels();
+        let Tile::DataFunction {
+            domain_predicate,
+            codomain,
+            ..
+        } = &tile
+        else {
+            panic!("a collection");
+        };
+        assert_eq!(*domain_predicate, kept);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &**codomain
+        else {
+            panic!("groups");
+        };
+        assert_eq!(*domain_predicate, Predicate::True);
+    }
+
+    /// A collection with no inner collection, and a scalar, have nothing beneath to complete.
+    #[test]
+    fn completing_every_level_changes_only_the_statements_of_collections() {
+        let mut flat = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![5, 6]))),
+            Predicate::False,
+            BitSet::new(),
+        );
+        flat.complete_every_level();
+        assert_eq!(
+            flat,
+            Tile::data_function(
+                ColumnValue::UInts(vec![0, 1]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![5, 6]))),
+                Predicate::True,
+                BitSet::new(),
+            )
+        );
+        let mut scalar = Tile::Scalar(ColumnValue::Ints(vec![1]));
+        scalar.complete_every_level();
+        assert_eq!(scalar, Tile::Scalar(ColumnValue::Ints(vec![1])));
     }
 
     #[test]

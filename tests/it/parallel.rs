@@ -2,6 +2,8 @@
 //! merged at the collector equals the same pipeline pulled whole on one thread.
 //! See `src/interpreter/design-parallel.md`, "The morsel prototype".
 
+use indoc::indoc;
+
 use cambra::{
     ccl::{
         AggregateKind,
@@ -11,7 +13,7 @@ use cambra::{
     interpreter::{
         BaseType, ColumnValue, Consumer, Extent, FunctionGuard, Predicate, Tile, TileGuard, Tiling,
         Value,
-        parallel::{Breaker, Config, plan, run_main},
+        parallel::{Breaker, Config, PooledRun, plan, run_main},
     },
 };
 
@@ -251,6 +253,68 @@ fn one_worker_serves_both_pipelines_of_a_shared_value() {
     };
     let tile = run_main(&mut ctx, &mut compiled, &config).expect("two morsel pipelines");
     assert_eq!(entries(&tile), entries(&whole_pull(program)));
+}
+
+/// `code` run through the inline driver on one thread with a morsel of three rows until `main` is
+/// terminal, and what `main` then holds.
+fn dispatched_inline(code: &str) -> Tile {
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let mut compiled =
+        compile_program(&mut ctx, &LoadedProgram::test(code), consumer).expect("compiles");
+    let config = Config {
+        threads: 1,
+        morsel_rows: 3,
+    };
+    let mut run = PooledRun::start(&mut ctx, &mut compiled, &mut None, &config, Box::new(|| {}))
+        .expect("a pipeline");
+    let mut main = run.take_main();
+    let universal = main.tiling().universal_guard();
+    for _ in 0..100 {
+        ctx.scheduler().check_for_notifications();
+        run.lap();
+        let tile = main.get(universal.clone());
+        if tile.is_terminal() {
+            return tile;
+        }
+    }
+    panic!("the run of {code} finishes");
+}
+
+/// Collections that hold collections, dispatched, equal the serial pull as `Tile ==` compares
+/// them: the inner level states itself complete. A morsel states the inner level correctly
+/// (`Qualified { enclosing: [0, 1], here: True }`), and `Tile::merge` drops that statement as
+/// covered by the outer level when the breaker absorbs the morsel (`drop_covered_completion`). The
+/// two tiles mean the same under the closure rule and differ in representation, so the breaker
+/// states every level complete when it completes (`Materialized::snapshot`, `PoolBreaker::finish`).
+/// The differential suite found the difference in the first shape.
+const NESTED_COLLECTIONS: [&str; 4] = [
+    "xs = [(a=1, b=[1, 2]), (a=3, b=[4, 5])]; xs",
+    "[[1, 2], [3, 4]]",
+    "[(1, [1, 2]), (2, [3, 4])]",
+    indoc! {"
+        xs = [[1, 2], [3, 4]]
+        [a for a in xs]
+    "},
+];
+
+#[test]
+fn a_dispatched_collection_holding_collections_states_its_inner_levels_complete() {
+    for code in NESTED_COLLECTIONS {
+        let mut dispatched = dispatched_inline(code);
+        dispatched.compact();
+        assert_eq!(dispatched, whole_pull(code.to_string()), "{code}");
+    }
+}
+
+/// The threaded collector states the inner levels complete too (`PoolBreaker::finish`).
+#[test]
+fn a_threaded_collection_holding_collections_states_its_inner_levels_complete() {
+    for code in NESTED_COLLECTIONS {
+        let mut pooled = four_workers(code.to_string());
+        pooled.compact();
+        assert_eq!(pooled, whole_pull(code.to_string()), "{code}");
+    }
 }
 
 fn no_main() -> Box<dyn Consumer> {

@@ -20,7 +20,7 @@ mod end_to_end {
     };
     use crate::interpreter::{
         BaseType, ColumnValue, CurryLevel, Extent, FunctionDef, FunctionGuard, Materialized,
-        UnaryOpKind, Value, operator_graph::InputEdgeSpec,
+        Predicate, UnaryOpKind, Value, operator_graph::InputEdgeSpec,
     };
     use crate::{pretty_graph::VizOptions, pretty_tree::InspectNode};
 

@@ -12,7 +12,7 @@ mod inline {
     use crate::ccl::context::{GlobalContext, compile_program};
     use crate::ccl::load::LoadedProgram;
     use crate::interpreter::tile_operators::test_helpers::int_entries;
-    use crate::interpreter::{BaseType, ColumnValue, Extent, TestDataSource, Value};
+    use crate::interpreter::{BaseType, ColumnValue, Extent, Predicate, TestDataSource, Value};
 
     fn compiled(ctx: &mut GlobalContext, code: &str) -> CompiledProgram {
         compile_program(ctx, &LoadedProgram::test(code), Box::new(|| {})).expect("compiles")

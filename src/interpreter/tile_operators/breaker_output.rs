@@ -649,6 +649,100 @@ mod tests {
         source.publish(&Projection::of(&keys_between(0, 3)).unwrap());
     }
 
+    /// A collection of records that hold collections, in two morsels whose inner levels state
+    /// nothing, as a cut to outer keys leaves them.
+    fn records_holding_collections(first: u64) -> Tile {
+        Tile::data_function(
+            ColumnValue::from_uints(vec![first, first + 1]),
+            Box::new(Tile::record(
+                [
+                    ("a".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 3]))),
+                    (
+                        "b".into(),
+                        Tile::grouped(
+                            vec![0, 2],
+                            ColumnValue::UInts(vec![0, 1, 0, 1]),
+                            Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 4, 5]))),
+                            Predicate::False,
+                            BitSet::new(),
+                        ),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            )),
+            region(first, first + 1),
+            BitSet::new(),
+        )
+    }
+
+    fn inner_statement(tile: &Tile) -> Predicate {
+        let Tile::DataFunction { codomain, .. } = tile else {
+            panic!("a collection, got {tile:?}");
+        };
+        let Tile::Record { fields, .. } = &**codomain else {
+            panic!("a record, got {codomain:?}");
+        };
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &fields["b"]
+        else {
+            panic!("a collection field");
+        };
+        domain_predicate.clone()
+    }
+
+    /// A breaker that has not completed states no inner level complete, though its rows are all
+    /// there: more morsels may add keys beneath a row's group only if the morsel is not whole, and
+    /// the output cannot tell until the breaker says so. Once it completes every level is whole.
+    #[test]
+    fn a_completed_breaker_states_every_level_complete_and_an_open_one_does_not() {
+        let materialized = Materialized::new(Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Record(
+                [
+                    ("a".into(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+                    (
+                        "b".into(),
+                        Tiling::data_function(
+                            Extent::Base(BaseType::UInt),
+                            Tiling::Scalar(Extent::Base(BaseType::Int)),
+                        ),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+        ));
+        materialized.absorb(records_holding_collections(0), &keys_between(0, 1));
+        materialized.absorb(records_holding_collections(2), &keys_between(2, 3));
+        let open = materialized.snapshot(&keys_between(0, 3));
+        assert_eq!(inner_statement(&open), Predicate::False);
+        materialized.complete();
+        let whole = materialized.snapshot(&keys_between(0, 3));
+        assert_eq!(inner_statement(&whole), Predicate::True);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &whole
+        else {
+            panic!("a collection");
+        };
+        assert!(domain_predicate.contains(&Value::UInt(3)));
+        // A read of part of the keys states that part complete and the groups beneath whole.
+        let part = materialized.snapshot(&keys_between(0, 1));
+        assert_eq!(inner_statement(&part), Predicate::True);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &part
+        else {
+            panic!("a collection");
+        };
+        assert!(
+            !domain_predicate.contains(&Value::UInt(2)),
+            "{domain_predicate:?}"
+        );
+    }
+
     /// A build side answers the universal read whatever it is pulled at, and a release of part
     /// of it removes nothing.
     #[test]

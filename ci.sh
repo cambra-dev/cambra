@@ -99,6 +99,34 @@ ci_solver() {
     return 1
   fi
 }
+# The differential suite of the pool's inline driver: the `compilation_pipeline`
+# corpus run again through `PooledRun`, whose answers must equal the serial
+# loop's (`src/interpreter/design-parallel.md`, "The differential suite"). The
+# programs the plan admits are pinned in
+# `tests/it/compilation_pipeline/dispatch_admitted.txt`. The run's report must
+# list exactly the pinned programs, which catches a pinned program that no test
+# runs any more; a program that is admitted and not pinned, or pinned and
+# refused, fails in the suite itself.
+ci_dispatch() {
+  local pin="tests/it/compilation_pipeline/dispatch_admitted.txt"
+  local report
+  report="$(mktemp)"
+  CAMBRA_DISPATCH_CHECK=1 CAMBRA_DISPATCH_REPORT="${report}" \
+    cargo test -p cambra -q --test it compilation_pipeline || {
+    rm -f "${report}"
+    return 1
+  }
+  local ran pinned
+  ran="$(awk -F'\t' '$1 == "admitted" { print $3 }' "${report}" | sort -u)"
+  pinned="$(cut -f1 "${pin}" | sort -u)"
+  rm -f "${report}"
+  if [[ "${ran}" != "${pinned}" ]]; then
+    echo "ci_dispatch: the programs the suite admitted differ from ${pin}:" >&2
+    diff <(echo "${pinned}") <(echo "${ran}") >&2 || true
+    echo "  re-pin with CAMBRA_DISPATCH_BLESS=1, over the whole corpus." >&2
+    return 1
+  fi
+}
 # The editor grammars (`editors/`) against the lexer: `dump_tokens` prints the
 # lexer's highlight spans over every `.cambra` file under `tests/` and
 # `editors/`, and one checker per editor requires each span to carry its class's
@@ -427,6 +455,9 @@ ci_all() {
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_test || failed="${failed} test"
+  # shellcheck disable=SC2310
+  # intentional: || captures failure without exiting
+  ci_dispatch || failed="${failed} dispatch"
   # shellcheck disable=SC2310
   # intentional: || captures failure without exiting
   ci_test_no_assertions || failed="${failed} test_no_assertions"

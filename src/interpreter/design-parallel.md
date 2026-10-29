@@ -564,6 +564,47 @@ plan's decision to admit all sinks is deferred until one does.
 `PooledRun::serve_pass` is the loop's part of a pass: without a run it does nothing, so a program
 the pool refused passes as the plain loop passes it, sink pulls queued for the next delivery.
 
+### The differential suite
+
+`CAMBRA_DISPATCH_CHECK=1` makes `run_program_with_ctx`, which every `compilation_pipeline` test runs
+a program through, run the program again through `PooledRun` on a fresh context and compare the
+answer with the serial one (`sort_tile_collections`, after `compact`), after which the run must
+answer `Lap::Done`. A panic in the dispatched run is re-raised naming the program's hash. A program
+that does not compile on a bare context, because it reads a source or sink its test registered, is
+counted as skipped and is not checked: the dispatched context does not rebuild a test's sources, so
+a program over a source has no differential check yet. A program the plan refuses is counted with
+its reason; a program it admits is checked.
+
+The admitted programs are pinned in `tests/it/compilation_pipeline/dispatch_admitted.txt`, a hash
+of the program's files and the name of the test that ran it on each line, separated by a tab. An
+admitted program that is not listed fails, and so does a listed one that is refused, so a plan
+change that admits more or less is a diff in that file. `CAMBRA_DISPATCH_BLESS=1` rewrites the file
+from the programs a run admits, sorted, and so is run over the whole corpus.
+`CAMBRA_DISPATCH_REPORT=<file>` appends one line per program, written at once so that tests on
+several threads do not interleave: outcome, reason and hash. `./ci.sh dispatch` runs the suite
+with a report and compares the admitted hashes with the pin, which fails for a pinned program that
+no test runs any more, and runs in CI's test job. The suite is off by default and is not in
+`./ci.sh fast`: it runs the corpus twice more.
+
+Each admitted program runs through the inline driver at one morsel size per row and at three rows
+(`CAMBRA_MORSEL_ROWS` sets a single size), so a program over a few rows runs as many morsels, and
+through the threaded pool on four workers with two-row morsels when the threaded plan admits it.
+The threaded answers are compared with the rows in key order, since the workers merge morsels as
+they finish.
+
+A completed collection is complete at every level. A morsel states an inner level correctly, and
+`Tile::merge` drops the statement as covered by the outer level when the breaker absorbs the morsel
+(`drop_covered_completion`). The dispatched tile then means the same as the serial one under the
+closure rule and differs in representation, and `Tile ==` compares representations; the first run
+of the suite found it in a list of records holding collections, and `[[1, 2], [3, 4]]`, a list of
+pairs holding lists and a value read back through a second pipeline show it too.
+`Materialized::snapshot` therefore states every level beneath the outermost complete once the
+breaker has completed, after the merges and the cut to the projection, keeping what the outermost
+states for a read of part of the keys. The threaded collector states every level complete when its
+workers have returned (`Tile::complete_every_level`, `Tile::complete_inner_levels`). A breaker that
+has not completed states none of them. A collection a variant holds is a value of the variant's
+column and has no level of its own, so it is not affected.
+
 ### Tests
 
 `tests/it/parallel.rs`: two chains pulled at disjoint guards and merged equal the whole pull, and

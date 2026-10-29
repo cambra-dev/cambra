@@ -136,7 +136,8 @@ impl Materialized {
     }
 
     /// The rows of the region `guard` names that are in the output, stating complete the keys
-    /// that are ready, or every key once the breaker completed.
+    /// that are ready, or every key once the breaker completed, and then every level beneath the
+    /// outermost as well.
     ///
     /// The whole held tile is cloned and then cut, so a snapshot costs in proportion to the rows
     /// the output holds, not to the rows it returns.
@@ -153,6 +154,14 @@ impl Materialized {
             *domain_predicate = if complete { Predicate::True } else { ready };
         }
         tile.restrict_to(&projection, &self.tiling);
+        // Absorbing a morsel drops the statement of an inner level as covered by the outer one
+        // (`Tile::merge`), and cutting to keys cannot restate it. The two tiles mean the same
+        // under the closure rule and differ in representation, which `Tile ==` compares. Once the
+        // breaker completed no level will grow, so every level beneath the outermost is stated
+        // complete, after the merges and the cut.
+        if complete {
+            tile.complete_inner_levels();
+        }
         tile
     }
 
