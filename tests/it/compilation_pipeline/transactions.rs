@@ -290,6 +290,17 @@ fn check_compile_error(code: &str, needle: &str) {
     "#},
     1020
 )]
+// A tuple pattern binds inside a transaction block as it does anywhere.
+#[case::a_tuple_pattern_in_the_block(
+    indoc! {r#"
+        t: Mut(Int, Txn) := 0
+        with begin():
+            a, b = (1, 2)
+            t := a * 10 + b
+        await_final(t)
+    "#},
+    12
+)]
 fn test_transactional_stores(#[case] code: &str, #[case] expected: i64) {
     check_tile(code, Tile::Scalar(ColumnValue::Ints(vec![expected])));
 }

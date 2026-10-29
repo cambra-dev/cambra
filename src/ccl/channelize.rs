@@ -200,48 +200,14 @@ pub enum DeferError {
 
 impl fmt::Display for DeferError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            DeferError::NoFeedOrDefine(name) => {
-                let name = name.base();
-                write!(f, "deferred binding '{name}' has no feed or define")
-            }
-            DeferError::MultipleDefinitions(name) => {
-                let name = name.base();
-                write!(f, "deferred binding '{name}' has multiple definitions")
-            }
-            DeferError::FeedsAndDefinesMixed(name) => {
-                let name = name.base();
-                write!(f, "deferred binding '{name}' has both feeds and a define")
-            }
-            DeferError::NestedDefinition(_) => {
-                write!(f, "<<= must occur as a top-level statement")
-            }
-            DeferError::UnboundDeferHandle(name) => {
-                let name = name.base();
-                write!(f, "feed/define references unbound defer handle '{name}'")
-            }
-            DeferError::MutuallyRecursiveCycle(name) => {
-                let name = name.base();
-                write!(
-                    f,
-                    "deferred bindings form a mutually recursive cycle through '{name}'"
-                )
-            }
-            DeferError::PartialFeedCaseUnsupported(name) => {
-                let name = name.base();
-                write!(
-                    f,
-                    "deferred binding '{name}' is fed from some but not all branches of a \
-                     multi-way conditional; this shape is not supported yet"
-                )
-            }
-        }
+        let subject = format!("deferred binding '{}'", self.defer().base());
+        write!(f, "{}", self.message(&subject))
     }
 }
 
 impl DeferError {
     /// The deferred binding the error is about.
-    fn defer(&self) -> &Name {
+    pub fn defer(&self) -> &Name {
         match self {
             DeferError::NoFeedOrDefine(name)
             | DeferError::MultipleDefinitions(name)
@@ -250,6 +216,30 @@ impl DeferError {
             | DeferError::UnboundDeferHandle(name)
             | DeferError::MutuallyRecursiveCycle(name)
             | DeferError::PartialFeedCaseUnsupported(name) => name,
+        }
+    }
+
+    /// The error's message, naming the deferred binding as `subject`,
+    /// `deferred binding 'out'`.
+    pub fn message(&self, subject: &str) -> String {
+        match self {
+            DeferError::NoFeedOrDefine(_) => format!("{subject} has no feed or define"),
+            DeferError::MultipleDefinitions(_) => format!("{subject} has multiple definitions"),
+            DeferError::FeedsAndDefinesMixed(_) => {
+                format!("{subject} has both feeds and a define")
+            }
+            DeferError::NestedDefinition(_) => "<<= must occur as a top-level statement".into(),
+            DeferError::UnboundDeferHandle(name) => format!(
+                "feed/define references unbound defer handle '{}'",
+                name.base()
+            ),
+            DeferError::MutuallyRecursiveCycle(_) => {
+                format!("deferred bindings form a mutually recursive cycle through {subject}")
+            }
+            DeferError::PartialFeedCaseUnsupported(_) => format!(
+                "{subject} is fed from some but not all branches of a multi-way conditional; \
+                 this shape is not supported yet"
+            ),
         }
     }
 }

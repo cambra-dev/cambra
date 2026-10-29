@@ -109,6 +109,9 @@ pub enum CompileError {
     ChannelizeDefers {
         /// The underlying channelization error.
         error: channelize::DeferError,
+        /// How the message names the deferred binding
+        /// ([`LoweringContext::deferred_subject`](crate::ccl::lower::LoweringContext::deferred_subject)).
+        subject: String,
         /// The declaration of the deferred binding the error is about.
         span: Span,
         /// The `run` and `import` statements that bring in the runs whose copies
@@ -151,7 +154,7 @@ impl CompileError {
             CompileError::Load(e) => e.to_string(),
             CompileError::Lower(e) => e.to_string(),
             CompileError::Infer { error, .. } => format!("{error:?}"),
-            CompileError::ChannelizeDefers { error, .. } => error.to_string(),
+            CompileError::ChannelizeDefers { error, subject, .. } => error.message(subject),
             CompileError::Unsupported { message, .. } | CompileError::Internal { message, .. } => {
                 message.clone()
             }
@@ -2588,8 +2591,10 @@ fn run_passes(
     })
     .map_err(|Located { error, node_id }| {
         let span = blame.span(node_id, None);
+        let subject = ctx.lowering_ctx().deferred_subject(error.defer());
         vec![CompileError::ChannelizeDefers {
             error,
+            subject,
             span,
             related: blame.run_labels(node_id, span, None),
         }]

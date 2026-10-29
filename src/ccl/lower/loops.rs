@@ -903,8 +903,8 @@ fn collect_mutation_loop_vars(
     }
 }
 
-/// The first top-level plain `=` ([`ChlStmt::Assign`]) in `body` that rebinds a
-/// name bound *outside* the loop (`mutation_scope`).
+/// The first name a top-level plain `=` ([`ChlStmt::Assign`]) in `body` binds, through a
+/// destructuring pattern included, that is bound *outside* the loop (`mutation_scope`).
 ///
 /// `=` binds immutably, so such a write is not a mutable-variable mutation — it is a
 /// per-iteration shadow that silently discards each update, almost always a
@@ -917,9 +917,12 @@ pub(super) fn first_outer_plain_assign<'a>(
     mutation_scope: &HashSet<String>,
 ) -> Option<&'a str> {
     body.iter().find_map(|stmt| match &stmt.node {
-        ChlStmt::Assign { target, .. } => {
-            name_target_as_name(target).filter(|n| mutation_scope.contains(*n))
-        }
+        ChlStmt::Assign { target, .. } => target
+            .node
+            .bound_names()
+            .into_iter()
+            .find(|n| mutation_scope.contains(n.as_str()))
+            .map(SmolStr::as_str),
         _ => None,
     })
 }
