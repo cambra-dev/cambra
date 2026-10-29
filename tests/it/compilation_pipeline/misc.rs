@@ -278,7 +278,7 @@ fn a_trailing_pass_leaves_the_statement_above_it_as_the_value() {
     );
 }
 
-// A `with begin():` block of nothing but `pass` has no footprint, which the transaction
+// A `with begin():` block of nothing but `pass` does nothing, which the transaction
 // rule reports rather than the statement grammar — as a loop body's transaction, and
 // standing alone.
 #[rstest]
@@ -301,7 +301,7 @@ fn a_trailing_pass_leaves_the_statement_above_it_as_the_value() {
     "#}
 )]
 fn a_transaction_of_nothing_but_pass_has_no_footprint(#[case] code: &str) {
-    check_compile_error(code, "must do something");
+    check_compile_error(code, "this `with begin():` block does nothing");
 }
 
 // ---------------------------------------------------------------------------

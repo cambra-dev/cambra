@@ -224,6 +224,9 @@ pub(super) struct CoalesceCtx {
     /// error records them, so an error a use causes inside a clone is reported at the
     /// use that clone serves ([`coalesce_generalized_let`]).
     specializing: Vec<ActiveSpecialization>,
+    /// Every `with begin():` block's variable, each use's copies of them, and each block a
+    /// specialization holds, from which the walk's end gives each block its footprint.
+    footprints: crate::ccl::effects::Footprints,
     /// The monomorphic `let`s whose right-hand sides the walk is inside: with
     /// [`specializing`](Self::specializing)'s, the definitions a trait function's call
     /// cannot be answered by, since a definition does not reach itself
@@ -1559,6 +1562,7 @@ pub(super) fn coalesce_pass(
     expr: &mut Expr,
     bound_at_annotation: std::collections::HashSet<Name>,
     instances: Rc<InstanceTable>,
+    footprints: crate::ccl::effects::Footprints,
 ) -> Vec<LocatedInferError> {
     let mut ctx = CoalesceCtx {
         instance_functions: instances.declared_bindings().cloned().collect(),
@@ -1574,6 +1578,7 @@ pub(super) fn coalesce_pass(
         pred_memo: PredMemo::new(),
         discarding: false,
         specializing: Vec::new(),
+        footprints,
         placed: Vec::new(),
         opaque_params_at: Vec::new(),
         assumptions: Vec::new(),
@@ -1609,7 +1614,19 @@ pub(super) fn coalesce_pass(
     if ctx.errors.is_empty() {
         crate::ccl::provenance::run_debug_check(|| assert_reads_stable(&ctx.reads));
     }
+    // Each block in the finished tree, a specialization's included, takes its footprint.
+    write_footprints(expr, &ctx.footprints);
     ctx.errors
+}
+
+/// Give each `with begin():` block in `expr` the footprint its body's variable resolves to
+/// (`effects::Footprints::footprint`).
+fn write_footprints(expr: &mut Expr, footprints: &crate::ccl::effects::Footprints) {
+    let node = expr.node_id();
+    if let TypedExprNode::Begin { footprint, .. } = &mut expr.node {
+        *footprint = footprints.footprint(node);
+    }
+    expr.walk_children_mut(|child| write_footprints(child, footprints));
 }
 
 /// Check term and witness references in each node's type against its enclosing scope.
@@ -2449,7 +2466,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         }
         // A `Begin` block: recurse into its body chain; the block's own `Unit`
         // type needs no resolution and it binds no name.
-        TypedExprNode::Begin { body } => coalesce_node(body, level, ctx),
+        TypedExprNode::Begin { body, .. } => coalesce_node(body, level, ctx),
         TypedExprNode::For { target, iter, body } => {
             coalesce_node(iter, level, ctx);
             // The loop target binds only inside the body.
@@ -3311,7 +3328,7 @@ pub(super) fn specialize_use(
     // exercises at a concrete type) keys as the canonical empty `SpecKey` rather
     // than on fresh `Infer` placeholder ids. Inference deliberately tolerates the
     // residue (`Type::Infer`'s invariant); the strict post-inference typecheck rejects it.
-    let key = spec_key(&use_expr.ty);
+    let key = spec_key(&use_expr.ty).with_blocks(ctx.footprints.key(use_expr.node_id()));
     // A use whose instantiation leaves a variable for the clone's pins shares no clone: the
     // pins give that variable what the join around the use supplies, which the key does not
     // read, so the key does not determine the clone. The test is the pins' own: nothing
@@ -3543,6 +3560,8 @@ pub(super) fn specialize_use(
     let mut clone = frame.def.clone();
     let mut origins = HashMap::new();
     copied_nodes(&frame.def, &clone, &mut origins);
+    // The clone's blocks take this use's copies of their variables (`effects::Footprints`).
+    ctx.footprints.specialize(use_expr.node_id(), &origins);
     let mut fresh = FreshenCache {
         own_params: Some(Rc::clone(&frame.own_params)),
         entered_binders: placement

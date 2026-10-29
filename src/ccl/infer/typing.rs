@@ -368,10 +368,10 @@ pub(super) trait Typing {
     /// mutable variable. Check records nothing.
     fn record_transactional_access(&mut self, _name: &Name) {}
 
-    /// Record what reading the mutable variable `name` as a value requires: a position in
-    /// its history, `Read(name)`, and `Transaction` too for a transactional one. Check records
-    /// nothing.
-    fn record_read(&mut self, _name: &Name) {}
+    /// Record what reading the mutable variable `name` as a value requires, at `at`, the
+    /// variable's mention: a position in its history, `Read(name)`, and `Transaction` too for a
+    /// transactional one. Check records nothing.
+    fn record_read(&mut self, _name: &Name, _at: NodeId) {}
 
     /// Record that the `Defer` whose rule is running binds a sink, when lowering marked it
     /// one, which causes `AffectWorld` (`docs/chl-spec.md`, "Output outside the program"). Check

@@ -2392,7 +2392,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
             TypedExprNode::Cast { value, .. } | TypedExprNode::Realize { value, .. } => {
                 rec(value, bound, out)
             }
-            TypedExprNode::Begin { body } => rec(body, bound, out),
+            TypedExprNode::Begin { body, .. } => rec(body, bound, out),
             TypedExprNode::BinOp { left, right, .. } => {
                 rec(left, bound, out);
                 rec(right, bound, out);

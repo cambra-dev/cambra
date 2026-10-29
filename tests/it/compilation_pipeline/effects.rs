@@ -284,6 +284,14 @@ fn a_contract_states_what_the_function_causes(
     "pub def call_all(E <: Effect, f: Int => Int causes E, x: Int) causes only E:\n    f(x)\n",
     "pub call_all: forall (E <: Effect) {(Int => Int causes E), Int} => Int causes E"
 )]
+#[case::a_requirement_its_block_discharges(
+    "stock: Mut(Int, Txn) := 10\n\
+     pub def with_txn(R <: Context, f: Int => Int requires R, Transaction, x: Int) requires \
+     only R:\n    \
+     with begin():\n        stock := f(x)\n",
+    "pub with_txn: forall (R <: Context) {(Int => Int requires Transaction, R), Int} => {} \
+     requires R causes RunTransaction, WriteTxn(Module::_)"
+)]
 #[case::a_declared_requirement_parameter(
     "pub def with_ctx(R <: Context, f: Int => Int requires R, x: Int) requires only R:\n    \
      f(x)\n",
@@ -1089,6 +1097,20 @@ fn a_runs_state_is_written_where_it_has_one(#[case] code: &str, #[case] needle: 
     "},
     "pub maker: (Int => Int causes Append(_)) => Int => Int causes Append(_)"
 )]
+#[case::a_block_discharging_from_context(
+    indoc! {"
+        pub def apply(f: Int => Int requires Context causes Effect except RunTransaction, x: Int) => Int:
+            with begin():
+                f(x)
+            x
+    "},
+    "pub apply: {(Int => Int requires Context causes Effect except RunTransaction), Int} => Int \
+     requires Context except Transaction causes Effect"
+)]
+#[case::a_top_level_requiring_context_but_a_transaction(
+    "g: Int => Int requires Context except Transaction = \\x -> x\ny = g(1)\n",
+    "run, since its top level requires `Context except Transaction`"
+)]
 fn a_top_is_written(#[case] code: &str, #[case] line: &str) {
     let interface = interface_of(code);
     assert!(interface.lines().any(|l| l == line), "{interface}");
@@ -1124,6 +1146,18 @@ fn a_top_is_written(#[case] code: &str, #[case] line: &str) {
             apply(commits, x)
     "},
     "this has `WriteTxn(stock)`, which the function type it must have does not state"
+)]
+#[case::a_transaction_beyond_every_read(
+    indoc! {"
+        stock: Mut(Int, Txn) := 0
+        def reads(x: Int) => Int requires Transaction:
+            stock + x
+        pub def apply(f: Int => Int requires Read(_), x: Int) => Int:
+            f(x)
+        pub def bad(x: Int) => Int:
+            apply(reads, x)
+    "},
+    "this has `Transaction`, which the function type it must have does not state"
 )]
 #[case::a_commit_the_bound_takes_away(
     indoc! {"
@@ -1220,6 +1254,19 @@ fn a_top_is_written(#[case] code: &str, #[case] line: &str) {
             def size(t: T) => Size
     "},
     "`except` takes capabilities out of a bound of `Effect` or `Context`, and this bound is a type"
+)]
+#[case::a_block_around_effect(
+    indoc! {"
+        pub def apply(f: Int => Int causes Effect, x: Int) => Int:
+            with begin():
+                f(x)
+            x
+    "},
+    "transactions do not nest"
+)]
+#[case::a_top_level_requiring_context(
+    "g: Int => Int requires Context = \\x -> x\ny = g(1)\n",
+    "this requires `Transaction` outside a `with begin():` block"
 )]
 fn a_top_is_checked(#[case] code: &str, #[case] needle: &str) {
     let errors = errors_of(code);

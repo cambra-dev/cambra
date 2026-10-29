@@ -170,8 +170,6 @@ trait, and `trait` a trait ([6.8 Nominal types and methods [Decided]](#68-nomina
 [Polymorphic type annotations](#polymorphic-type-annotations)). `requires` begins a `requires`
 clause and `causes` a `causes` clause, which end a `def` signature or a function type, and `only`
 and `nothing` bound one ([Writing requirements and effects](#writing-requirements-and-effects)).
-`requires Transaction` is **[Planned]**
-([8.7 Transactions as contextual parameters](#87-transactions-as-contextual-parameters)).
 
 > **Direction.** Planned binder/keyword vocabulary, not lexed today:
 > `rec` (recursive binding — §4.3, **[Decided]**),
@@ -660,12 +658,12 @@ program, or an exception
 The effecting forms:
 
 - **Feed `<<`** (§3.7) appends its right-hand side to a feed.
-- **A call to an effecting function** — one that writes a `Mut(…)`
-  parameter (pass-by-reference, §6.2) or writes a transactional mutable variable
-  inside a `with begin():` block (§8) — performs that function's writes.
-  A function's effects are always visible in its type: its `causes` clause states them, written or
-  inferred. There are **no implicit-effect functions**, so an inert expression statement (§4.9)
-  stays detectable and rejected.
+- **A call to an effecting function** — one that writes a `Mut(…)` parameter (pass-by-reference,
+  §6.2) or writes a transactional mutable variable in a `with begin():` block of its own or in the
+  block that calls it (§8, §8.7) — performs that function's writes. A function's effects are always
+  visible in its type: its `causes` clause states them, written or inferred. There are **no
+  implicit-effect functions**, so an inert expression statement (§4.9) stays detectable and
+  rejected.
 - **An output outside the program,** such as binding a sink
   ([6.9 Capabilities](#69-capabilities)).
 - **[Decided]** — **`raise`** and a call that may raise
@@ -691,13 +689,6 @@ sub-expressions that the freedoms below (unordered collections, unspecified eval
 Ordering *between* effects is not free-for-all: it is governed by the dependency-edge model of §8.5
 — effects are ordered exactly by the data dependencies among them, and unordered (freely
 interleaved) otherwise.
-
-> **Direction [Decided].** The `requires Transaction` contextual
-> requirement (§8.7) adds a *second* way for a call to be effecting — a
-> function that reads or writes a transactional mutable variable in the
-> block it is called in, rather than through a `Mut(…)` parameter. It is
-> not yet implemented; the `Mut(…)`-parameter and `with begin():`
-> effecting-call forms above are.
 
 ### Collections are unordered
 
@@ -2186,10 +2177,6 @@ count: a call that only reads the clock is inert. In a polymorphic `def`, a stat
 function parameter causes whatever that function does, which each use decides, so the definition
 does not reject it. See [Mutability, transactions, and feeds](#8-mutability-transactions-and-feeds).
 
-**[Decided]** Contextual transaction parameters add calls that obtain their transaction from
-context rather than a `Mut(…)` argument; its contract is specified under
-[transactions as contextual parameters](#87-transactions-as-contextual-parameters).
-
 ---
 
 ### 4.10 `match` — tag dispatch
@@ -2389,9 +2376,8 @@ marked one carries its status per "How to read this document".)
   [Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided) the checked
   lookup `m[k]` answers `{Option(V) where not _.is_none()}`, which `!` unwraps without a proof at
   the call.
-- `Time` — a position in the commit order, what a transaction handle's
-  `current_time()` answers (**[Tentative]**, §8.2). §8.2 calls the handle
-  itself a `Txn` value, and the two spellings are not reconciled.
+- `Time` — a position in the commit order (**[Tentative]**). A transaction's time is one, which a
+  std function requiring `Transaction` answers (**[Planned]**, §8.7).
 - `{T₀, T₁, …} ⇒ U` — function type. A function takes exactly one
   argument (§3.8): an n-parameter function's domain is the
   corresponding tuple type, and a keyword-argument function's domain
@@ -3377,8 +3363,7 @@ is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 
 ### 6.9 Capabilities
 
-**[Decided]** — a written `Transaction`, a function's `Transaction` supplied by the block that calls
-it, and block footprints; sink functions and calls made outside the program
+**[Decided]** — sink functions and calls made outside the program
 ([Output outside the program](#output-outside-the-program)); readings
 ([Inputs from outside the program](#inputs-from-outside-the-program)); and exceptions
 ([Exceptions](#exceptions)). The rest of this section is implemented.
@@ -4016,16 +4001,14 @@ instance ([Equality and order](#equality-and-order)).
   satisfiable, and it has no other effect than the associated types it names.
 - **One clause holds every requirement.** `Transaction`
   ([8.7 Transactions as contextual parameters](#87-transactions-as-contextual-parameters))
-  is written in the same clause: `requires Transaction, Orderable(T, T)` (**[Planned]**).
+  is written in the same clause: `requires Transaction, Orderable(T, T)`.
 - **The body uses only what the clause states.** An operator whose operand type involves a type
   parameter is an error unless a requirement or the parameter's bound covers it. Where both do, the
   requirement decides: `x + y` under `T <: Int` and `requires a: Addable(T, T), a::Output <: T` is
   an `a::Output`, which is a `T`.
 - **Context requirements stand in the clause too.** `Transaction`, `ObserveWorld`, `ReadTxn(x)` and
   `Read(x)`, a written clause as a lower bound, and `only` and `nothing`, are specified in
-  [Writing requirements and effects](#writing-requirements-and-effects). A written `Transaction` is
-  **[Decided]**
-  ([8.7 Transactions as contextual parameters](#87-transactions-as-contextual-parameters)).
+  [Writing requirements and effects](#writing-requirements-and-effects).
 - **Each call satisfies each requirement at its own instantiation,** and passes the instance that
   satisfies it. A call that does not is rejected at the call. A secondary label at the requirement
   is **[Decided]**.
@@ -4452,9 +4435,9 @@ pick: forall (T) {T, T} => T = first
   and `pick: Pick = first` uses it as a whole annotation
   ([6.7 Type-alias statements](#67-type-alias-statements)). Such an alias inside another type is
   the nested case above.
-- **[Decided]** — **A polymorphic function type has one `requires` clause,** after its codomain,
-  holding the trait requirements on the types it quantifies and the context requirements of a
-  call: `forall (T) {T, T} => T requires Orderable(T, T), Transaction causes AffectWorld`
+- **A polymorphic function type has one `requires` clause,** after its codomain, holding the trait
+  requirements on the types it quantifies and the context requirements of a call:
+  `forall (T) {T, T} => T requires Orderable(T, T), Transaction causes AffectWorld`
   ([Writing requirements and effects](#writing-requirements-and-effects)).
 - **It is never a type constructor.** `forall (T) V` does not denote a function from types to
   types. A parameterised alias, if added, is written in the head form `Pair(T) = {T, T}`
@@ -4937,19 +4920,17 @@ for req in incr_reqs:
   atomically** — the whole block's writes become visible together or not
   at all. There is no partially-visible commit.
 - Writes to a `Txn`-domain mutable variable are legal **only** inside a `with
-  begin():` block; a write outside one is rejected (§8.3), as is a write
-  reached through a transactional-writer function *called* inside a block
-  (a disguised nested transaction). **[Decided]** — a function the block
-  calls may write one too: it requires `Transaction` for the write, and the
-  block supplies it (§8.7). Only a call of a function that runs a block of its
-  own is a nested transaction.
+  begin():` block, or in a function the block calls, which requires
+  `Transaction` for them and gets it from the block (§8.7); a write that no
+  block encloses is rejected (§8.3). A call inside a block of a function
+  that runs a block of its own is a disguised nested transaction.
 - **Nested transactions are rejected** — a block commits as one unit, so a
   `with` inside it has no coherent meaning.
-- A block causes `RunTransaction`. A body that causes `RunTransaction`, directly or through a call,
-  is the nested transaction above
+- A block causes `RunTransaction`, and its body supplies `Transaction` to what it calls. A body that
+  causes `RunTransaction`, directly or through a call, is the nested transaction above
   ([Discharging requirements and effects](#discharging-requirements-and-effects)). **[Decided]** —
-  its body supplies `Transaction` to what it calls, and an exception that escapes the block aborts
-  it: none of its writes commits and no output inside it is sent ([Exceptions](#exceptions)).
+  an exception that escapes the block aborts it: none of its writes commits and no output inside it
+  is sent ([Exceptions](#exceptions)).
 - **Branch guards and tag dispatch.** A block may carry `if`/`elif`/`else`
   guards, more than one of them, and `match` dispatch. Each branch's
   writes are scoped to its own path and the transaction commits on the
@@ -4961,9 +4942,6 @@ for req in incr_reqs:
   block** (rejected with a diagnostic). Write it after the block, or, if
   it should be shared across the transaction, declare it `Mut(…, Txn)`
   and write it on the spine.
-- **Transaction handle — `with t = begin():` [Decided].** Binds `t` to the
-  transaction's commit time (a `Txn` value); designed but rejected at
-  lowering today.
 
 **Scope transactions minimally.** Only the operations that must be atomic
 go inside `with begin():` — input validation before it, response
@@ -4999,9 +4977,8 @@ around `reserve` + `quote` + the feed).
   `def total(xs): s := 0; for x in xs: s += x; s` returns the sum, and
   `def available(): stock` reads `stock`, transactional, so it requires
   `Transaction` and `ReadTxn(stock)`.
-- **A `Txn` mutable variable is read only inside a `with begin():` block.**
-  **[Decided]** — or in a function the block calls, which requires
-  `Transaction` for it
+- **A `Txn` mutable variable is read only inside a `with begin():` block,** or in a function
+  the block calls, which requires `Transaction` for it
   ([8.7 Transactions as contextual parameters](#87-transactions-as-contextual-parameters)).
   A bare read that no block encloses is an error, and stays one: the block is what pins a
   **snapshot-consistent** view, so that several mutable variable reads in one
@@ -5172,12 +5149,12 @@ for r in reqs2:
 An **induction** accumulator may likewise be seeded from an await
 (`x := await_final(pool)`): a different recurrence, so there is no cycle.
 
-**[Decided]** — **the rules hold across modules.** `await_final(x)` requires nothing: its value is
-one value for the whole run, the same wherever it is evaluated
-([6.9 Capabilities](#69-capabilities)). A writer of `x` is any statement that causes `WriteTxn(x)`,
-or a top holding it, directly or through a call, a call of another module's function included, so
-the await waits for every writer of `x` in the program. A writer that depends on `await_final(x)`,
-directly or through another module's public value, is the cycle above and an error at the write.
+**The rules hold across modules.** `await_final(x)` requires nothing: its value is one value for the
+whole run, the same wherever it is evaluated ([6.9 Capabilities](#69-capabilities)). A writer of `x`
+is any statement that causes `WriteTxn(x)`, or a top holding it, directly or through a call, a call
+of another module's function included, so the await waits for every writer of `x` in the program.
+**[Decided]** — a writer that depends on `await_final(x)` through another module's public value is
+the cycle above, and an error at the write.
 
 One restriction unrelated to cycles: `await_final` may not appear inside a `with
 begin():` block, which reads its mutable variables bare as a snapshot; awaiting
@@ -5200,11 +5177,9 @@ or every transaction denies, the await is `x`'s initializer.
 
 (2026-06-29 §6; the north-star `txn_kv` program is the worked example.)
 
-The implemented model above passes a transaction *implicitly by block
-scope* (`with begin():` establishes it; `Mut(…, Txn)` mutable variables are the
-shared state). A **[Decided]** further direction makes the transaction a
-contextual requirement, so a transaction reaches a called function without a `Mut`
-parameter:
+A transaction is passed *implicitly by block scope*: `with begin():` establishes it, and
+`Mut(…, Txn)` mutable variables are the shared state. It is a contextual requirement, so a
+transaction reaches a called function without a `Mut` parameter:
 
 - `def put(…) requires Transaction:` — the function declares it needs a
   transaction from context. A function reading or writing a transactional
@@ -6277,9 +6252,6 @@ pub type Capped = {Int where _ <= limit}
 - **Packages.** Dependencies outside the module root, a search path of roots, versioning, and a
   manifest. The rules of [9.15 Module files](#915-module-files) extend to several roots with a
   collision between roots refused.
-- **Givens and instances across modules.** Transactions as contextual parameters are locally scoped.
-  General typeclass instances will need a rule for which module's instances are visible where, and a
-  coherence rule.
 - **Discarding and redeclaring one address.** A version that both writes `@Discard stock` and
   declares `stock` could mean a reset to the declared initial value, or be an error.
 - **First-class Module values.** A Module value is written only as an argument or as a member

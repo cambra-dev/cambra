@@ -386,7 +386,7 @@ fn operand(mut expr: Expr, muts: &Muts, open: &mut Open, minted: &mut Minted) ->
             expr
         }
 
-        TypedExprNode::Begin { body } => {
+        TypedExprNode::Begin { body, .. } => {
             **body = block(std::mem::take(body), muts);
             expr
         }

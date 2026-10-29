@@ -149,34 +149,7 @@ fn lower_tx_block(
     ctx.in_tx_body = true;
     let result = lower_tx_block_inner(stmts, outer_bindings, span, ctx);
     ctx.in_tx_body = false;
-    let block = result?;
-    // A transaction must *do* something observable: either write a transactional
-    // mutable variable (a committing transaction — a commit-record footprint) or feed a read
-    // (`out << balance`), a read-only transaction whose fed mutable variable read is a live
-    // as-of read indexed by the enclosing loop. A block that does neither has no
-    // footprint at all (its local `let`s are discarded), so reject it — a truly
-    // empty transaction is a program error, not a no-op to silently drop.
-    if !contains_mut_write(&block) && !contains_feed(&block) {
-        return Err(LoweringError::unsupported(
-            span,
-            "a `with begin():` block must do something: write a transactional \
-             (`Mut(_, Txn)`) variable, or feed a read (`out << …`)",
-        ));
-    }
-    Ok(block)
-}
-
-/// Whether the lowered block chain contains a `MutWrite` (i.e. writes a
-/// transactional mutable variable — `write_or_let` emits `MutWrite` only for those).
-fn contains_mut_write(e: &Expr) -> bool {
-    matches!(e.node, TypedExprNode::MutWrite { .. }) || e.any_child(contains_mut_write)
-}
-
-/// Whether the lowered block chain contains a `Feed` (`out << e`) — the
-/// footprint of a read-only transaction, whose fed mutable variable read is a live as-of
-/// read.
-fn contains_feed(e: &Expr) -> bool {
-    matches!(e.node, TypedExprNode::Feed { .. }) || e.any_child(contains_feed)
+    result
 }
 
 /// Build the block's statement chain right-to-left. Assignments to
@@ -327,6 +300,14 @@ fn lower_tx_block_scoped(
                     stmt.span,
                     "nested `with begin():` transactions are not supported",
                 ));
+            }
+            ChlStmt::Expr(value) => {
+                let effect = lower_expr(value, ctx)?;
+                ctx.tag_machinery(
+                    Expr::expr_stmt(effect, chain),
+                    stmt.span,
+                    EXPRESSION_STATEMENT,
+                )
             }
             _ => {
                 return Err(LoweringError::unsupported(
