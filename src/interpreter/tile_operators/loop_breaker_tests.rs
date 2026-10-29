@@ -1,5 +1,6 @@
 //! An induction loop compiled from a program and stepped through its store's fan-out.
 
+use std::cell::Cell;
 use std::rc::Rc;
 
 use indoc::indoc;
@@ -34,7 +35,7 @@ const GUARDED_SUM: &str = indoc! {"
 
 /// A program compiled with no notification delivered, and the cyclic fan-out of its one store.
 struct Compiled {
-    _ctx: GlobalContext,
+    ctx: GlobalContext,
     _program: CompiledProgram,
     operators: OperatorMap,
     fan: Rc<FanOut>,
@@ -55,7 +56,7 @@ impl Compiled {
         let fan = stores.next().expect("a store's fan-out is cyclic");
         assert!(stores.next().is_none(), "one store");
         Self {
-            _ctx: ctx,
+            ctx,
             _program: program,
             operators,
             fan,
@@ -116,8 +117,90 @@ fn a_flat_loop_steps_one_position_per_step() {
 }
 
 #[test]
-#[ignore = "stalls: the Memo on the drive's output answers its cache until a notification the \
-            store's step queues on the scheduler is delivered"]
 fn a_guarded_loop_steps_one_position_per_step() {
     steps_one_position_per_step(GUARDED_SUM, 3);
+}
+
+/// How many notifications a test's consumer received.
+// shared-state-ok: a test consumer counts what it is notified of and the test reads the count; no
+// tile passes between operators through it.
+type Count = Rc<Cell<usize>>;
+
+/// A subscription to `slot` that counts the notifications it receives.
+fn counting(
+    slot: &mut Box<dyn TileOperator>,
+    scheduler: &mut Scheduler,
+) -> (Count, Box<dyn TileProducer>) {
+    let count = Rc::new(Cell::new(0));
+    let counted = count.clone();
+    let guard = slot.tiling().universal_guard();
+    let producer = slot.subscribe(
+        guard,
+        Box::new(move || counted.set(counted.get() + 1)),
+        scheduler,
+    );
+    (count, producer)
+}
+
+/// A step notifies the subscribers of the store's recurrence slots and no reader outside the
+/// loop, and a step once every snapshot is announced notifies no one. The store's own
+/// notification reaches a reader outside the loop once the scheduler delivers it.
+#[test]
+fn a_step_notifies_the_recurrence_and_no_reader() {
+    let mut compiled = Compiled::of(GUARDED_SUM);
+    let mut inside_slot = compiled.fan.recurrence_slot();
+    let mut outside_slot = compiled.fan.slot();
+    let (inside, _inside) = counting(&mut inside_slot, compiled.ctx.scheduler());
+    let (outside, _outside) = counting(&mut outside_slot, compiled.ctx.scheduler());
+    let mut last = compiled.fan.step();
+    for _ in 1..3 {
+        last = compiled.fan.step();
+    }
+    assert!(last.is_terminal());
+    assert_eq!(
+        outside.get(),
+        0,
+        "a reader outside the loop is not notified"
+    );
+    assert!(inside.get() > 0, "the recurrence is notified");
+    compiled.ctx.scheduler().check_for_notifications();
+    assert!(
+        outside.get() > 0,
+        "the store's own notification, delivered by the scheduler, reaches a reader outside the loop"
+    );
+    // The terminal snapshot is announced by the next step, and nothing after it.
+    compiled.fan.step();
+    let notified = inside.get();
+    compiled.fan.step();
+    assert_eq!(
+        inside.get(),
+        notified,
+        "a step that changes nothing notifies no one"
+    );
+}
+
+/// A recurrence subscriber that pulls inside a step's notification would step the store a second
+/// time within the step, which a debug build refuses.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "a recurrence subscriber pulls nothing inside a step's notification")]
+fn a_recurrence_subscriber_pulling_inside_a_notification_is_refused() {
+    let mut compiled = Compiled::of(SUM);
+    let late: Rc<RefCell<Option<Box<dyn TileProducer>>>> = Rc::new(RefCell::new(None));
+    let pulls = late.clone();
+    let mut slot = compiled.fan.recurrence_slot();
+    let guard = slot.tiling().universal_guard();
+    let producer = slot.subscribe(
+        guard.clone(),
+        Box::new(move || {
+            if let Some(producer) = pulls.borrow_mut().as_mut() {
+                producer.get(guard.clone());
+            }
+        }),
+        compiled.ctx.scheduler(),
+    );
+    *late.borrow_mut() = Some(producer);
+    for _ in 0..3 {
+        compiled.fan.step();
+    }
 }

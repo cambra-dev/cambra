@@ -38,6 +38,15 @@ struct FanOutReentrancy {
     /// particular) already return cumulative tiles, so each non-reentrant
     /// pull supplants the previous cache rather than appending to it.
     cached_tile: Tile,
+    /// Whether the subscribers of the recurrence slots have been notified since
+    /// [`cached_tile`](Self::cached_tile) last changed. A pull in pull mode replaces the snapshot
+    /// and leaves them to the input's own notification; [`FanOut::step`] notifies them of any
+    /// snapshot they have not been told of.
+    announced: bool,
+    /// Set while a step notifies the recurrence subscribers ([`notify_recurrence`]): a
+    /// notification of the input arriving then is that notification's echo around the cycle,
+    /// and [`FanOutInput`] drops it.
+    announcing: bool,
     /// Re-entrancy guard for the inner subscribe path.  `FanOutSlot::subscribe`
     /// of one slot can transitively trigger `subscribe` on a sibling
     /// (e.g. an induction loop's drive subscribes to its store slot while
@@ -72,6 +81,10 @@ struct FanOutShared {
     consumers: Vec<Rc<RefCell<Box<dyn Consumer>>>>,
     /// Per-subscriber release guards; intersected before passing upstream.
     release_guards: Vec<TileGuard>,
+    /// Per subscriber, parallel to [`consumers`](Self::consumers): whether it subscribed through
+    /// a [`recurrence_slot`](FanOut::recurrence_slot), and so sits inside the input chain it
+    /// reads. A [`FanOut::step`] notifies these subscribers and no other.
+    recurrence: Vec<bool>,
     /// What every subscriber had agreed to release the last time one released,
     /// and so what this fan-out has already passed upstream.
     ///
@@ -166,6 +179,12 @@ impl FanOutShared {
         retain_flagged(&mut self.subscribers, &keep);
         retain_flagged(&mut self.consumers, &keep);
         retain_flagged(&mut self.release_guards, &keep);
+        retain_flagged(&mut self.recurrence, &keep);
+        debug_assert_eq!(
+            self.recurrence.len(),
+            self.subscribers.len(),
+            "recurrence flags stay parallel to subscribers"
+        );
         debug_assert_eq!(
             self.consumers.len(),
             self.subscribers.len(),
@@ -203,7 +222,8 @@ impl Consumer for FanOutInput {
         };
         let consumers = {
             let shared = shared_rc.borrow();
-            if !shared.forwarded.mark_news() {
+            let echo = shared.reentrancy.as_ref().is_some_and(|re| re.announcing);
+            if echo || !shared.forwarded.mark_news() {
                 return;
             }
             shared
@@ -301,6 +321,8 @@ impl FanOut {
             input,
             Some(FanOutReentrancy {
                 cached_tile,
+                announced: true,
+                announcing: false,
                 subscribing_inner: false,
             }),
         )
@@ -316,6 +338,7 @@ impl FanOut {
             producer: None,
             consumers: Vec::new(),
             release_guards: Vec::new(),
+            recurrence: Vec::new(),
             released: tiling.empty_guard(),
             released_position: None,
             subscribers: Vec::new(),
@@ -402,15 +425,20 @@ impl FanOut {
     /// fan-out decides the positions its body offers by this one pull, so a loop advances one
     /// step per call however many notifications its cycle raised.
     ///
+    /// Before its pull, a step notifies the subscribers of the fan-out's recurrence slots, the
+    /// operators inside its input chain, of a snapshot they have not been told of, and no other
+    /// slot: a recurrence read that answered from an earlier snapshot reads the current one in
+    /// this pull without a scheduler delivering the input's own notification. Notifying before
+    /// the pull rather than after leaves the input's own notification intact: the notification
+    /// travels around the cycle and closes the gate of every operator it passes, the input's
+    /// included, and the pull that follows reopens them.
+    ///
     /// # Panics
     ///
     /// When the fan-out is not cyclic, no slot has been subscribed, or a pull of its input is
     /// in flight.
     pub fn step(&self) -> Tile {
-        assert!(
-            self.shared.borrow().reentrancy.is_some(),
-            "only a cyclic fan-out steps"
-        );
+        announce(&self.shared);
         step(&self.shared, self.tiling.universal_guard())
             .expect("a stepped fan-out has a subscribed input and no pull in flight")
     }
@@ -621,6 +649,9 @@ impl TileOperator for FanOutSlot {
             shared.consumers.push(Rc::new(RefCell::new(consumer)));
             let carried = shared.released.clone();
             shared.release_guards.push(carried);
+            shared
+                .recurrence
+                .push(matches!(self.hold, FanHold::Recurrence { .. }));
             shared.subscribers.push(Rc::downgrade(&slot));
         } // borrow released here before we might call input.subscribe
 
@@ -741,13 +772,90 @@ fn step(shared_rc: &Rc<RefCell<FanOutShared>>, guard: TileGuard) -> Option<Tile>
         producer: Some(producer),
     };
     let tile = taken.producer.as_mut().expect("taken above").get(guard);
-    shared_rc
-        .borrow_mut()
+    let mut shared = shared_rc.borrow_mut();
+    let reentrancy = shared
         .reentrancy
         .as_mut()
-        .expect("a stepped fan-out is cyclic")
-        .cached_tile = tile.clone();
+        .expect("a stepped fan-out is cyclic");
+    if reentrancy.cached_tile != tile {
+        reentrancy.cached_tile = tile.clone();
+        reentrancy.announced = false;
+    }
     Some(tile)
+}
+
+/// Notify the subscribers of the recurrence slots of a snapshot they have not been told of, and
+/// record that they have.
+fn announce(shared_rc: &Rc<RefCell<FanOutShared>>) {
+    let announced = {
+        let mut shared = shared_rc.borrow_mut();
+        let reentrancy = shared
+            .reentrancy
+            .as_mut()
+            .expect("only a cyclic fan-out steps");
+        std::mem::replace(&mut reentrancy.announced, true)
+    };
+    if !announced {
+        notify_recurrence(shared_rc);
+    }
+}
+
+/// Notify every live subscriber of a recurrence slot that the input's whole answer may have
+/// changed. The handles are cloned out first so no borrow of `shared` is held while a consumer
+/// runs, as [`FanOutInput`] does.
+///
+/// The notification travels around the cycle: through the operators inside the input chain it
+/// reaches the input, whose notification reaches [`FanOutInput`] while the first recurrence
+/// subscriber is still being notified. That echo says nothing the step does not, so
+/// [`FanOutInput`] drops it while this runs, and the fan-out's own forwarding gate is untouched.
+///
+/// No subscriber pulls inside its notification: a pull would step the input a second time
+/// within one step, which a debug build checks by the snapshot.
+fn notify_recurrence(shared_rc: &Rc<RefCell<FanOutShared>>) {
+    let consumers = {
+        let mut shared = shared_rc.borrow_mut();
+        shared
+            .reentrancy
+            .as_mut()
+            .expect("only a cyclic fan-out steps")
+            .announcing = true;
+        shared
+            .live_indices()
+            .filter(|i| shared.recurrence[*i])
+            .map(|i| shared.consumers[i].clone())
+            .collect::<Vec<_>>()
+    };
+    // RAII: the flag is cleared on every exit, so a panicking consumer does not leave the
+    // fan-out dropping its input's notifications.
+    let _announcing = Announcing { shared: shared_rc };
+    let snapshot = || {
+        cfg!(debug_assertions).then(|| {
+            let shared = shared_rc.borrow();
+            let reentrancy = shared.reentrancy.as_ref().expect("cyclic");
+            reentrancy.cached_tile.clone()
+        })
+    };
+    let before = snapshot();
+    for consumer in &consumers {
+        consumer.borrow_mut().notify(&Projection::Everything);
+    }
+    debug_assert!(
+        snapshot() == before,
+        "a recurrence subscriber pulls nothing inside a step's notification"
+    );
+}
+
+/// Clears [`FanOutReentrancy::announcing`] when a step's notification is done.
+struct Announcing<'a> {
+    shared: &'a Rc<RefCell<FanOutShared>>,
+}
+
+impl Drop for Announcing<'_> {
+    fn drop(&mut self) {
+        if let Some(re) = self.shared.borrow_mut().reentrancy.as_mut() {
+            re.announcing = false;
+        }
+    }
 }
 
 impl TileProducer for FanOutProducer {

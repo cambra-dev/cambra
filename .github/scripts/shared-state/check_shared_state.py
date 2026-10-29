@@ -121,6 +121,8 @@ EXPECTED_EXCEPTIONS = [
     # a `#[cfg(test)] mod` declared in `tile_operators/mod.rs`, which `_blank_test_items` does
     # not see.
     ("src/interpreter/tile_operators/dispatcher_tests.rs", "shared cell of `T`"),
+    # The loop tests' notification count, out of line like the dispatcher tests.
+    ("src/interpreter/tile_operators/loop_breaker_tests.rs", "shared cell of `usize`"),
     ("src/interpreter/tile_operators/fanout.rs", "cell of `bool`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `usize`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),

@@ -1641,6 +1641,16 @@ Each pull renders the retained changelog, so the cost of a pull follows retentio
 tile into its own fan's memo, so the driver sees the position it just decided, would allow a
 multi-position driver, but it inverts `get`'s direction, and is not done.
 
+`FanOut::step` advances a cyclic fan-out by one such pull without a scheduler. The store's own
+notification goes through the scheduler's wakeup queue, so an operator inside the loop body that
+answers from a cache until notified, such as a `Memo` on the driver's output, would answer the
+snapshot it read before. Before its pull, a step therefore notifies the subscribers of the fan-out's
+recurrence slots, the operators inside the cycle, of a snapshot they have not been told of, and no
+other slot, so a reader outside the loop is not woken. The notification travels around the cycle and
+closes the gate of every operator it passes, the store's included; the fan-out drops the echo that
+reaches it. The step's pull reopens those gates, so the store's own notification, which the
+scheduler delivers later, reaches every reader. A pull in pull mode notifies as before.
+
 ### Reads
 
 **`StoreDenseRead`** folds one key's changelog at every position the store decided, producing
