@@ -5080,7 +5080,6 @@ impl TileOperator for InductionDriver {
             // read a position the source re-offers there as an out-of-order
             // arrival.
             source_released_through: self.resumed_after.clone().map(one_component),
-            source_fully_released: false,
             source_complete: Vec::new(),
             stated: Vec::new(),
             reseeded: None,
@@ -5181,10 +5180,6 @@ struct InductionDriverProducer {
     /// reader keeps its own positions live through the source's cross-producer release
     /// intersection.
     source_released_through: Option<Path>,
-    /// Whether the whole source has been released (`True`) after the loop
-    /// finished — the finite loop's `get_released_predicate() == True`
-    /// end-state; issued once.
-    source_fully_released: bool,
     /// What the source has called complete at each row level, accumulated across pulls.
     /// A complete path stays complete, but the source may stop saying so once this driver
     /// has released it, and the store can fold that row's last position after the
@@ -5270,20 +5265,20 @@ impl InductionDriverProducer {
             self.source.forget_through(&through);
             self.source_released_through = Some(through);
         }
-        if done && !self.source_fully_released {
+        if done && !self.source_producer.obsolete_guard().is_universal() {
             self.source_producer
-                .release(TileGuard::Function(FunctionGuard::Domain(Predicate::True)));
+                .release(self.source_producer.tiling().universal_guard());
             if let Some(nested) = self.nested.as_mut() {
                 for input in std::iter::once(&mut nested.pairs).chain(&mut nested.reseeds) {
                     input.release(input.tiling().universal_guard());
                 }
             }
-            self.source_fully_released = true;
             // The close is itself news, and it is the one transition the re-arm rule does
             // not cover. A consumer that pulled earlier in this same pass has already
             // consumed its notification, and a cache-holding one
             // (`tile_operators::Notified`) answers from that pre-final cache until
-            // something tells it otherwise. `source_fully_released` makes this fire once.
+            // something tells it otherwise. The release makes the source's obsolete guard
+            // universal, so this fires once.
             self.wakeups.request(self.consumer.shared().clone());
         }
     }
@@ -5312,7 +5307,7 @@ impl TileProducer for InductionDriverProducer {
         // again would break that release's promise, and every position has already
         // been emitted, so the live window is the whole remaining answer. The driver
         // owns the source, so the obligation is its to keep.
-        if self.source_fully_released {
+        if self.source_producer.obsolete_guard().is_universal() {
             return self.render(true, &[]);
         }
         let levels_above = self.window.levels_above();
@@ -5921,7 +5916,8 @@ impl TileProducer for TransactDriverProducer {
         // releases a prefix — `release_impl` withdraws each item as it finishes — which is why
         // an item is named by its domain position rather than by a column index. Without the
         // cache each pull decodes and sorts every item not yet released.
-        if self.source_news.take() {
+        // A source released whole is not pulled again: the release promised it nothing more.
+        if self.source_news.take() && !self.source_producer.obsolete_guard().is_universal() {
             let src = self
                 .source_producer
                 .get(self.source_producer.tiling().universal_guard());
@@ -6015,6 +6011,13 @@ impl TileProducer for TransactDriverProducer {
         // window that is momentarily empty over an incomplete source stays
         // non-terminal — the drained-but-live case.
         let done = source_complete && next_item.is_none();
+        // A done drive reads nothing more of its source: every item has finished and the source
+        // can deliver no more. It releases the source whole, as an induction drive does, rather
+        // than through the last finished item, which names positions and not the source.
+        if done && !self.source_producer.obsolete_guard().is_universal() {
+            self.source_producer
+                .release(self.source_producer.tiling().universal_guard());
+        }
         // Re-arm while a transaction remains to attempt. It covers every
         // continuation uniformly: an attempt awaiting its commit-ack, a retry
         // waiting for the frontier to move, and the first pull of all — where the

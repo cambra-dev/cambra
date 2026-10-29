@@ -2999,6 +2999,45 @@ fn a_transaction_over_a_fixed_collection_does_not_replay() {
     );
 }
 
+/// A transaction over a fixed collection that has finished commits nothing again after a reload.
+///
+/// A done drive releases its source whole, so the fan-out over the collection reports itself
+/// released in full, and the reload rebuilds the recomputable collection rather than keeping it.
+/// The variable carries the value the retired version left it holding, and the rebuilt drive
+/// commits no item a second time.
+#[test]
+fn a_finished_transaction_over_a_fixed_collection_does_not_replay() {
+    let program = |step: &str| {
+        format!(
+            indoc! {r#"
+                log: Mut(String, Txn) := ""
+                for m in ["a", "b", "c", "d"]:
+                    with begin():
+                        {step}
+                await_final(log)
+            "#},
+            step = step
+        )
+    };
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start_text(&mut ctx, &program("log := log + m"), &no_main)
+        .expect("v1 compiles");
+    assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "abcd");
+
+    live.reload_text(
+        &mut ctx,
+        MAIN_BRANCH,
+        &program(r#"log := log + m + "!""#),
+        &no_main,
+    )
+    .expect("`log` is still declared, at the same type");
+    assert_eq!(
+        drive_main_to_terminal(&mut ctx, &mut live),
+        "abcd",
+        "each element is committed once, by the version that ran it",
+    );
+}
+
 /// Two writers to one transactional variable each keep their own place across an
 /// reload.
 ///

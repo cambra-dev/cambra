@@ -345,7 +345,7 @@ fn a_morsel_reaches_through_its_highest_position() {
 
 /// A guard that is no run of positions is refused rather than read as reaching everything.
 #[test]
-#[should_panic(expected = "a loop's morsel is a guard of its positions")]
+#[should_panic(expected = "a morsel of positions is a guard of them")]
 fn a_guard_of_no_positions_is_refused_as_a_morsel() {
     reach(&TileGuard::Scalar(Predicate::True));
 }

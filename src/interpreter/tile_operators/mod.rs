@@ -42,6 +42,7 @@ use crate::{
 
 mod aggregate;
 mod combinators;
+mod commit_breaker;
 #[cfg(test)]
 mod commit_breaker_tests;
 mod cycle_slot;
@@ -69,6 +70,7 @@ mod union;
 
 pub use aggregate::*;
 pub use combinators::*;
+pub use commit_breaker::*;
 pub use cycle_slot::*;
 pub use extract_final::*;
 pub use fan::*;

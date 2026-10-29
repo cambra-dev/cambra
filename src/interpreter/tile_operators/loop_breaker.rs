@@ -68,6 +68,18 @@ impl LoopBreaker {
     }
 }
 
+/// What a store of `tiling` holds: the positions `store`, a snapshot of it, has decided, and
+/// everything once it is terminal.
+pub(super) fn store_held(store: &Tile, tiling: &Tiling) -> TileGuard {
+    match (store.is_terminal(), store_frontier(store)) {
+        (true, _) => tiling.universal_guard(),
+        (false, Some(at)) => TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
+            at.value().clone(),
+        ))),
+        (false, None) => tiling.empty_guard(),
+    }
+}
+
 /// How far a morsel of a loop's positions reaches.
 #[cfg_attr(test, derive(Debug))]
 pub(crate) enum Reach {
@@ -77,7 +89,8 @@ pub(crate) enum Reach {
     Unbounded,
 }
 
-/// How far `guard`, a morsel of a loop's positions, reaches.
+/// How far `guard`, a morsel of ordered positions, reaches: a loop's positions, or the positions
+/// of a transaction's source.
 ///
 /// # Panics
 ///
@@ -85,24 +98,24 @@ pub(crate) enum Reach {
 /// is not a position.
 pub(crate) fn reach(guard: &TileGuard) -> Reach {
     let TileGuard::Function(FunctionGuard::Domain(region)) = guard else {
-        panic!("a loop's morsel is a guard of its positions: {guard:?}")
+        panic!("a morsel of positions is a guard of them: {guard:?}")
     };
     let set = match region {
         Predicate::True => return Reach::Unbounded,
         Predicate::Intervals(set) => set,
-        other => panic!("a loop's morsel is a run of positions: {other:?}"),
+        other => panic!("a morsel of positions is a run of them: {other:?}"),
     };
     let last = set
         .intervals()
         .last()
-        .unwrap_or_else(|| panic!("a loop's morsel names a position: {guard:?}"));
+        .unwrap_or_else(|| panic!("a morsel of positions names one: {guard:?}"));
     let Some(end) = last.right() else {
         return Reach::Unbounded;
     };
     let through = match (end.value(), end.is_closed()) {
         (value, true) => value.clone(),
         (Value::UInt(above), false) if *above > 0 => Value::UInt(above - 1),
-        (value, _) => panic!("a loop's morsel ends at a position, not below {value:?}"),
+        (value, _) => panic!("a morsel of positions ends at one, not below {value:?}"),
     };
     Reach::Through(Position::new(through))
 }
@@ -164,14 +177,7 @@ impl BreakingProducer for LoopBreaker {
 
     /// The positions the store has decided, and everything once it is terminal.
     fn held(&self) -> TileGuard {
-        let store = self.snapshot();
-        match (store.is_terminal(), store_frontier(&store)) {
-            (true, _) => self.tiling().universal_guard(),
-            (false, Some(at)) => TileGuard::Function(FunctionGuard::Domain(
-                Predicate::at_or_below(at.value().clone()),
-            )),
-            (false, None) => self.tiling().empty_guard(),
-        }
+        store_held(&self.snapshot(), self.tiling())
     }
 
     /// Pushes the final guard once the loop has run.
