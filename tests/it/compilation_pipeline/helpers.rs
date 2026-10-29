@@ -196,7 +196,7 @@ pub(crate) fn run_program_with_ctx(
 /// compares the report with the pin, so a listed program no test runs any more fails there.
 mod dispatch {
     use super::*;
-    use cambra::interpreter::parallel::{Config, Lap, PooledRun, run_main};
+    use cambra::interpreter::parallel::{Config, Lap, MemoMode, PooledRun, run_main};
     use std::collections::BTreeMap;
     use std::io::Write;
 
@@ -280,8 +280,20 @@ mod dispatch {
         }
     }
 
+    /// The ways the inline driver runs the memos of each program: `CAMBRA_DISPATCH_MEMOS` names
+    /// one (`pull` for the pool that materializes them, `sink` for the memos' own breakers), and
+    /// otherwise a program runs in both.
+    fn memo_modes() -> Vec<MemoMode> {
+        match std::env::var("CAMBRA_DISPATCH_MEMOS").as_deref() {
+            Ok("pull") => vec![MemoMode::Materialize],
+            Ok("sink") => vec![MemoMode::Sink],
+            _ => vec![MemoMode::Materialize, MemoMode::Sink],
+        }
+    }
+
     /// Run `loaded` through the inline driver and compare with `serial`, the answer of the plain
-    /// loop, at each morsel size, then through the threaded pool when its plan admits the program.
+    /// loop, at each morsel size and in each memo mode, then through the threaded pool when its
+    /// plan admits the program.
     pub(super) fn check(loaded: &LoadedProgram, serial: &Tile) {
         if std::env::var("CAMBRA_DISPATCH_CHECK").as_deref() != Ok("1") {
             return;
@@ -293,9 +305,20 @@ mod dispatch {
             report("skipped", "does not compile on a bare context", &key);
             return;
         }
-        for (pass, morsel_rows) in morsel_sizes().into_iter().enumerate() {
-            let admitted = inline_pass(loaded, serial, &key, morsel_rows);
+        for (pass, (mode, morsel_rows)) in memo_modes()
+            .into_iter()
+            .flat_map(|mode| morsel_sizes().into_iter().map(move |rows| (mode, rows)))
+            .enumerate()
+        {
+            let admitted = inline_pass(loaded, serial, &key, mode, morsel_rows);
             if pass > 0 {
+                // A program the plan admits runs in every mode: a refusal after the first pass is
+                // a mode that cannot run what the plan admitted.
+                assert!(
+                    admitted.is_ok(),
+                    "{key} is admitted and {mode:?} refuses it: {:?}",
+                    admitted.err()
+                );
                 continue;
             }
             match admitted {
@@ -329,6 +352,7 @@ mod dispatch {
         loaded: &LoadedProgram,
         serial: &Tile,
         key: &str,
+        mode: MemoMode,
         morsel_rows: u64,
     ) -> Result<(), String> {
         let mut ctx = GlobalContext::default();
@@ -338,7 +362,14 @@ mod dispatch {
             threads: 1,
             morsel_rows,
         };
-        let started = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}));
+        let started = PooledRun::start_in(
+            mode,
+            &mut ctx,
+            &mut program,
+            &mut None,
+            &config,
+            Box::new(|| {}),
+        );
         let mut run = started.map_err(|refused| refused.to_string())?;
         let mut main = run.take_main().expect("a program with a `main` output");
         let universal = main.tiling().universal_guard();
@@ -362,26 +393,28 @@ mod dispatch {
                     .map(String::as_str)
                     .or_else(|| panic.downcast_ref::<&str>().copied())
                     .unwrap_or("a panic with no message");
-                panic!("the dispatched run of {key} at {morsel_rows} rows panicked: {why}");
+                panic!(
+                    "the dispatched run of {key} at {morsel_rows} rows in {mode:?} panicked: {why}"
+                );
             }
         };
         let mut dispatched = dispatched.unwrap_or_else(|| {
             panic!(
-                "the dispatched run of {key} at {morsel_rows} rows did not reach a terminal tile \
+                "the dispatched run of {key} at {morsel_rows} rows in {mode:?} did not reach a terminal tile \
                  in 1024 laps"
             )
         });
         assert_eq!(
             run.lap(),
             Lap::Done,
-            "the dispatched run of {key} at {morsel_rows} rows has a terminal `main` and every \
+            "the dispatched run of {key} at {morsel_rows} rows in {mode:?} has a terminal `main` and every \
              pipeline finished"
         );
         dispatched.compact();
         assert_eq!(
             sort_tile_collections(dispatched),
             sort_tile_collections(serial.clone()),
-            "the dispatched run of {key} at {morsel_rows} rows differs from the serial run"
+            "the dispatched run of {key} at {morsel_rows} rows in {mode:?} differs from the serial run"
         );
         Ok(())
     }

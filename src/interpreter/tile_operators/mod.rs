@@ -62,6 +62,7 @@ mod notification_scripts;
 mod notification_sound;
 mod reshape;
 mod scalar;
+mod sunk;
 mod union;
 #[cfg(test)]
 pub(crate) mod visit_inputs_tests;
@@ -79,6 +80,7 @@ pub use lookup::*;
 pub use map::*;
 pub use reshape::*;
 pub use scalar::*;
+pub(crate) use sunk::Sunk;
 pub use union::*;
 
 /// A source's rows, handed to the workers of a pool as morsels.

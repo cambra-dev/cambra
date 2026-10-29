@@ -599,6 +599,9 @@ no test runs any more, and runs in CI's test job. The suite is off by default an
 Each admitted program runs through the inline driver at one morsel size per row and at three rows
 (`CAMBRA_MORSEL_ROWS` sets a single size), so a program over a few rows runs as many morsels, and
 through the threaded pool on four workers with two-row morsels when the threaded plan admits it.
+Every size runs twice, with the memos materialized by the pool and in sink mode
+(`CAMBRA_DISPATCH_MEMOS=pull|sink` limits the run to one); a program the first admits and the
+second refuses fails the run.
 The threaded answers are compared with the rows in key order, since the workers merge morsels as
 they finish.
 
@@ -843,7 +846,8 @@ The decisions taken with the interface:
 11. A program with one breaker the plan refuses is refused as a whole, as the plan refuses a program
     now.
 12. The pinned programs are checked in both pull mode and sink mode from the step that first
-    switches a breaker in a pooled run, which is step 3.
+    switches a breaker in a pooled run, which is step 3. `CAMBRA_DISPATCH_MEMOS=pull|sink` limits
+    the check to one mode.
 
 #### The interface
 
@@ -1082,7 +1086,39 @@ not regress. From step 3 the run checks every pinned program in pull mode and in
    whole-corpus differential in sink mode starts at step 3, since no pooled run uses a memo's
    breaker before it.
 3. `PooledRun::start` switches the memos it plans, and the dispatcher runs them as pipelines. The
-   cut still takes the other chains. Tests: the corpus at the pinned count, the HTTP scenarios.
+   cut still takes the other chains.
+
+   `MemoMode` selects the mode: `PooledRun::start_in` takes it, and `PooledRun::start` reads
+   `CAMBRA_DISPATCH_MEMOS` (`sink` for sink mode, otherwise materialization through the pool). In
+   sink mode `sunk_memos` finds each planned memo's breaker in the scheduler's registry, and
+   `start_planned` calls `begin_sinking` on it and gives the memo's pipeline a `Sunk` placeholder
+   (`tile_operators/sunk.rs`) where the chain would be, so no chain is cut for a memo. A memo whose
+   tiling is not a data function, or that the registry does not hold, is refused. A pipeline that
+   streams from a memo takes its morsels from `pushed_source` of the memo's handle, and its
+   `PipelineRun` has `pushed` set: the chain's notifications do not reach it and
+   `assert_pipelines_are_separate` skips it. `PipelineRun::sink` is the handle of the memo whose
+   pipeline it is.
+
+   A pipeline that reads pushes ignores the notifications of its chain's source. Its morsels are
+   the keys pushed to it, a pushed key is a key the memo merged from that source, and the chain
+   reads the source at that key through its own release record, so a row that arrives after its key
+   was pushed concerns a later push. `a_keyed_read_runs_behind_the_keys_its_memo_has_merged` runs
+   rows in waves through both modes. The plan ends a chain at one head, so a pipeline streams from
+   at most one breaker pipeline; `Dispatcher::new` asserts it for any other spec.
+
+   `PooledRun::held_keys` adds the keys the sink memos hold (`Breaker::held_keys`), which a
+   release of the output reclaims.
+
+   A memo swallows its input's notifications in sink mode, so a memo pipeline that reads a live
+   source learns of arrivals from the lap: `OpenSource::poll` has the lap publish `Everything` to
+   it, and a finished pipeline is skipped. A lap that sank a morsel counts as work.
+
+   The differential checks every admitted program in both modes at morsel sizes 1 and 3 on the
+   inline driver; the threaded pass runs in pull mode only. Tests: a memo in sink mode answers as
+   the materializing pool does; a memo over a live source delivers each row once, alone and in a
+   chain; a keyed read behind its memo's merges in both modes; the corpus at the pinned count in
+   both modes; the HTTP scenarios through the plain loop, the inline driver and the inline driver
+   in sink mode.
 4. Keyed reads over the push queue; delete the keyed pipeline of the old structure. Tests: the keyed
    read tests as they stand, a keyed morsel names only pushed keys.
 5. `Aggregate` and `ExtractAggregate`, with the unit tests per kind and the differential run of the

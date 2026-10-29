@@ -644,11 +644,13 @@ fn two_runs_serve_the_routes_their_arguments_give() {
 // The inline dispatcher
 // ---------------------------------------------------------------------------
 
-/// How a scenario drives the program: the serial scheduler loop, or the inline dispatcher.
+/// How a scenario drives the program: the serial scheduler loop, or the inline dispatcher with the
+/// memos materialized by the pool or run as the breakers of their own pipelines.
 #[derive(Clone, Copy, Debug)]
 enum Mode {
     Serial,
     Inline,
+    InlineSink,
 }
 
 /// A program compiled for `mode`: the context, the program, and the inline run when there is one.
@@ -668,8 +670,12 @@ impl Served {
             compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
         let run = match mode {
             Mode::Serial => None,
-            Mode::Inline => Some(
-                cambra::interpreter::parallel::PooledRun::start(
+            Mode::Inline | Mode::InlineSink => Some(
+                cambra::interpreter::parallel::PooledRun::start_in(
+                    match mode {
+                        Mode::InlineSink => cambra::interpreter::parallel::MemoMode::Sink,
+                        _ => cambra::interpreter::parallel::MemoMode::Materialize,
+                    },
                     &mut ctx,
                     &mut program,
                     &mut None,
@@ -829,11 +835,16 @@ fn replies_agree(
 ) -> Observed {
     let serial = serve_requests(Mode::Serial, code, waves);
     let inline = serve_requests(Mode::Inline, code, waves);
+    let sunk = serve_requests(Mode::InlineSink, code, waves);
     let expected: Vec<Option<String>> = expected.iter().map(|r| r.map(str::to_string)).collect();
     assert_eq!(serial.replies, expected, "the serial loop");
     assert_eq!(
         inline.replies, serial.replies,
         "the inline dispatcher answers as the serial loop does"
+    );
+    assert_eq!(
+        sunk.replies, serial.replies,
+        "the inline dispatcher with its memos in sink mode answers as the serial loop does"
     );
     inline
 }

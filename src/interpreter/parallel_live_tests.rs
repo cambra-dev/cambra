@@ -509,6 +509,8 @@ mod end_to_end {
         let up_source = source_of(&upstream).expect("the chain reads one live source");
         let mut runs = vec![PipelineRun {
             keyed: false,
+            sink: None,
+            pushed: false,
             inherits: Vec::new(),
             chain: &mut upstream,
             source: up_source,
@@ -522,6 +524,8 @@ mod end_to_end {
         for downstream in &mut downstreams {
             runs.push(PipelineRun {
                 keyed: false,
+                sink: None,
+                pushed: false,
                 inherits: Vec::new(),
                 source: source_of(&*downstream).expect("the chain reads the breaker's output"),
                 breaker: collecting(downstream),
@@ -872,6 +876,8 @@ mod end_to_end {
         );
         let runs = vec![PipelineRun {
             keyed: false,
+            sink: None,
+            pushed: false,
             inherits: Vec::new(),
             source: source_of(&map).expect("a source"),
             breaker: collecting(&map),
@@ -905,6 +911,8 @@ mod end_to_end {
         let runs = vec![
             PipelineRun {
                 keyed: false,
+                sink: None,
+                pushed: false,
                 inherits: Vec::new(),
                 source: source_of(&first).expect("a source"),
                 breaker: collecting(&first),
@@ -915,6 +923,8 @@ mod end_to_end {
             },
             PipelineRun {
                 keyed: false,
+                sink: None,
+                pushed: false,
                 inherits: Vec::new(),
                 source: source_of(&second).expect("a source"),
                 breaker: collecting(&second),
@@ -1040,6 +1050,8 @@ mod end_to_end {
                 let runs = vec![
                     PipelineRun {
                         keyed: false,
+                        sink: None,
+                        pushed: false,
                         inherits: Vec::new(),
                         source: source_of(&one).expect("a source"),
                         breaker: collecting(&one),
@@ -1050,6 +1062,8 @@ mod end_to_end {
                     },
                     PipelineRun {
                         keyed: false,
+                        sink: None,
+                        pushed: false,
                         inherits: Vec::new(),
                         source: source_of(&two).expect("a source"),
                         breaker: collecting(&two),

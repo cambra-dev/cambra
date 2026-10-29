@@ -23,7 +23,7 @@ use crate::{
         sinks::SinkConsumer,
         tile_operators::{
             BreakerHandle, BreakerOutput, Claim, Detached, LiveSource, MorselSource, OperatorBase,
-            ProducerBase, Round, TileOperator, TileProducer, impl_producer_base,
+            ProducerBase, Round, Sunk, TileOperator, TileProducer, impl_producer_base,
         },
     },
     pretty_graph::VizOptions,
@@ -599,6 +599,11 @@ impl Planner<'_> {
         if let Some(memo) = keyed {
             drops_keys |= self.pipelines[self.keyed_memos[&memo]].drops_keys;
         }
+        // The walk ends at one head, so a pipeline reads the pushes of one breaker pipeline.
+        debug_assert!(
+            streams_from.len() <= 1,
+            "a planned pipeline streams from at most one pipeline: {streams_from:?}"
+        );
         self.pipelines.push(PipelinePlan {
             head,
             breaker,
@@ -892,6 +897,8 @@ fn run_planned(
         let source = pipeline_source(&*chain, pipeline.keyed);
         runs.push(PipelineRun {
             keyed: pipeline.keyed,
+            sink: None,
+            pushed: false,
             chain,
             source,
             breaker,
@@ -936,6 +943,8 @@ fn run_pipeline(
 ) -> Tile {
     let run = PipelineRun {
         keyed: false,
+        sink: None,
+        pushed: false,
         chain: chain_op,
         source,
         breaker,
@@ -979,6 +988,12 @@ struct PipelineRun<'a> {
     /// record for each source operator of the chain starts there. Empty for a run no serial
     /// producer read.
     inherits: Vec<Inherited>,
+    /// The breaker that runs the pipeline when it is in sink mode: the dispatcher pulls it for each
+    /// morsel, and `chain` is a placeholder.
+    sink: Option<BreakerHandle>,
+    /// Whether the keys the pipeline claims are pushed to it by a breaker pipeline it streams from,
+    /// which is a notification of nothing else.
+    pushed: bool,
 }
 
 /// What the serial producers a pool replaces had released of one source.
@@ -1134,7 +1149,7 @@ fn prepare(
                 streams_from: run.streams_from.clone(),
                 source: Box::new(move || source.clone()),
                 finalize: run.breaker.finalize(),
-                breaker: None,
+                breaker: run.sink.clone(),
             }
         })
         .collect();
@@ -1164,6 +1179,9 @@ fn prepare(
                         .enumerate()
                         .map(|(pipeline, run)| {
                             let head: Box<dyn Consumer> = match (worker, run.head) {
+                                // The keys of a pipeline that streams from a breaker in sink mode are
+                                // pushed to it, and what its chain notifies adds nothing.
+                                (0, Head::Breaker) if run.pushed => Box::new(|| {}),
                                 (0, Head::Breaker) => Box::new(PipelineConsumer {
                                     pipeline: handles[pipeline].clone(),
                                     keyed: run.keyed,
@@ -1256,7 +1274,7 @@ fn assert_pipelines_are_separate(runs: &[PipelineRun<'_>]) {
     let mut owner = HashMap::new();
     for (pipeline, run) in runs.iter().enumerate() {
         visit(&*run.chain, pipeline, &mut owner);
-        if run.head == Head::Breaker {
+        if run.head == Head::Breaker && !run.pushed {
             assert!(
                 run.streams_from.iter().any(|upstream| matches!(
                     &runs[upstream.0].breaker,
@@ -1644,6 +1662,8 @@ struct Rounds {
     /// breaker may hold keys before its first morsel (a memo that adopted its pull-mode cache), and
     /// the first round pushes them.
     ran: bool,
+    /// How many morsels the breaker has pulled.
+    sunk: usize,
     /// Whether the terminal round has run.
     terminal: bool,
     /// The thread that drives the pipeline's breaker, which is the first to call it.
@@ -1697,13 +1717,6 @@ impl Pushes<'_> {
 
 /// The source of a parent pipeline's morsels: the keys pushed to it, cut by the breaker's
 /// `first_keys`, each claimed once.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the plan builds a parent pipeline's source with it"
-    )
-)]
 fn pushed_source(breaker: &BreakerHandle) -> Arc<dyn MorselSource> {
     let breaker = breaker.clone();
     // A pushed key is ready by being pushed, so the source's ready region is every key.
@@ -1893,6 +1906,7 @@ impl Dispatcher {
                 finalize: spec.finalize,
                 rounds: Mutex::new(Rounds {
                     ran: spec.breaker.is_some(),
+                    sunk: 0,
                     terminal: false,
                     driver: None,
                     pushed: Predicate::False,
@@ -2174,12 +2188,28 @@ impl Dispatcher {
                 !rounds.terminal,
                 "pull_sink is not called after the terminal round"
             );
+            rounds.sunk += 1;
         }
         let breaker = job
             .breaker
             .as_ref()
             .expect("a morsel of a breaker pipeline");
         breaker.pull_sink(package.guard.clone());
+    }
+
+    /// How many keys the breakers of this dispatcher hold.
+    #[cfg(any(test, feature = "test-helpers"))]
+    fn breaker_held_keys(&self) -> usize {
+        self.jobs
+            .iter()
+            .filter_map(|job| job.breaker.as_ref())
+            .map(|breaker| breaker.held_keys())
+            .sum()
+    }
+
+    /// How many morsels the breakers of this dispatcher have pulled.
+    fn sunk_morsels(&self) -> usize {
+        self.jobs.iter().map(|job| job.rounds.lock_now().sunk).sum()
     }
 
     /// Record that `package`'s morsel is in the breaker and released.
@@ -2195,7 +2225,6 @@ impl Dispatcher {
     }
 
     /// Whether `pipeline` has finished.
-    #[cfg(test)]
     fn is_done(&self, pipeline: PipelineId) -> bool {
         self.jobs[pipeline.0].finished.load(Ordering::Acquire)
     }
@@ -2485,11 +2514,111 @@ pub struct PooledRun {
     state: ServeState,
     /// The sources of the pipelines that read one and whose arrivals have not ended, with what
     /// delivers to them. A lap closes one that says it is complete.
-    open_sources: Vec<(PipelineHandle, Arc<dyn MorselSource>)>,
+    open_sources: Vec<OpenSource>,
     // Dropped after the chains, which hold records with the sources, and after the taken chains'
     // operators, which the pool owns from the cut.
     _records: PooledRecords,
     _taken: HashMap<NodeId, Taken>,
+    _placeholders: HashMap<usize, Box<dyn TileOperator>>,
+}
+
+/// A source whose arrivals have not ended, and what delivers to its pipeline.
+struct OpenSource {
+    handle: PipelineHandle,
+    source: Arc<dyn MorselSource>,
+    /// Whether each lap publishes what the source has ready to the pipeline, since no
+    /// notification does.
+    poll: bool,
+}
+
+/// How the inline driver runs the memos it plans.
+///
+/// `CAMBRA_DISPATCH_MEMOS=sink` selects [`Sink`](Self::Sink) for [`PooledRun::start`], and the
+/// differential suite runs every program in both modes
+/// (`src/interpreter/design-parallel.md`, "Pipeline breakers: sink, finalize and get").
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MemoMode {
+    /// The pool takes the chain behind each memo and runs it as a pipeline into a `Materialized`
+    /// output.
+    Materialize,
+    /// Each memo's own producer, switched to sink mode, is the breaker of its pipeline, and the
+    /// graph is not cut at it.
+    Sink,
+}
+
+impl MemoMode {
+    /// The mode `CAMBRA_DISPATCH_MEMOS` names: [`Sink`](Self::Sink) for `sink`, and otherwise
+    /// [`Materialize`](Self::Materialize).
+    pub fn from_env() -> Self {
+        match std::env::var("CAMBRA_DISPATCH_MEMOS").as_deref() {
+            Ok("sink") => Self::Sink,
+            _ => Self::Materialize,
+        }
+    }
+}
+
+/// The memos a run switches to sink mode: each memo's breaker, its tiling and, for a memo whose
+/// pipeline reads a data source, the source its morsels are cut from.
+struct SunkMemos {
+    handles: HashMap<NodeId, BreakerHandle>,
+    tilings: HashMap<NodeId, Tiling>,
+    sources: HashMap<NodeId, Arc<dyn MorselSource>>,
+}
+
+/// `f` on the operator `id` beneath `op`, if there is one.
+fn with_operator(op: &dyn TileOperator, id: NodeId, f: &mut dyn FnMut(&dyn TileOperator)) {
+    if op.operator_id() == Some(id) {
+        f(op);
+        return;
+    }
+    op.visit_inputs(&mut |edge| with_operator(edge.target, id, f));
+}
+
+/// What a run in [`MemoMode::Sink`] needs of each memo of `plan`, or why the program stays on the
+/// plain loop. Read before anything is dropped or switched.
+fn sunk_memos(
+    scheduler: &Scheduler,
+    program: &CompiledProgram,
+    plan: &Plan,
+) -> Result<SunkMemos, Unsupported> {
+    let mut sunk = SunkMemos {
+        handles: HashMap::new(),
+        tilings: HashMap::new(),
+        sources: HashMap::new(),
+    };
+    for pipeline in &plan.pipelines {
+        let BreakerKind::Materialize { memo } = &pipeline.breaker else {
+            continue;
+        };
+        let handle = scheduler.breaker(*memo).ok_or_else(|| {
+            Unsupported("a memo registered no breaker, or its producer is gone".into())
+        })?;
+        let tiling = program
+            .operator_graph
+            .nodes()
+            .iter()
+            .find_map(|node| match node {
+                GraphNode::Operator { id, tiling, .. } if id == memo => Some(tiling.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| Unsupported("a memo the graph holds no node for".into()))?;
+        if !matches!(tiling, Tiling::DataFunction { .. }) {
+            return Err(Unsupported("a memo that is not a collection".into()));
+        }
+        if pipeline.head == Head::Source {
+            let mut found = None;
+            for output in &program.outputs {
+                with_operator(&*output.op, *memo, &mut |memo_op| {
+                    memo_op.visit_inputs(&mut |edge| found = Some(source_of(edge.target)));
+                });
+            }
+            let source = found.ok_or_else(|| Unsupported("a memo not in the graph".into()))??;
+            sunk.sources.insert(*memo, source);
+        }
+        sunk.handles.insert(*memo, handle);
+        sunk.tilings.insert(*memo, tiling);
+    }
+    Ok(sunk)
 }
 
 impl PooledRun {
@@ -2501,6 +2630,25 @@ impl PooledRun {
     /// open, and its `main` is not terminal, until a lap sees the source's yield predicate cover
     /// every key ([`MorselSource::is_complete`]).
     pub fn start(
+        ctx: &mut GlobalContext,
+        program: &mut CompiledProgram,
+        main_producer: &mut Option<Box<dyn TileProducer>>,
+        config: &Config,
+        main_consumer: Box<dyn Consumer>,
+    ) -> Result<Self, Unsupported> {
+        Self::start_in(
+            MemoMode::from_env(),
+            ctx,
+            program,
+            main_producer,
+            config,
+            main_consumer,
+        )
+    }
+
+    /// [`start`](Self::start) with the memos run as `mode` says.
+    pub fn start_in(
+        mode: MemoMode,
         ctx: &mut GlobalContext,
         program: &mut CompiledProgram,
         main_producer: &mut Option<Box<dyn TileProducer>>,
@@ -2520,6 +2668,10 @@ impl PooledRun {
                 )
             })
             .collect();
+        let sunk = match mode {
+            MemoMode::Materialize => None,
+            MemoMode::Sink => Some(sunk_memos(ctx.scheduler(), program, &plan)?),
+        };
         let (mut main, mut sinks) = (None, Vec::new());
         for output in program.outputs.iter_mut() {
             match output.is_main() {
@@ -2561,15 +2713,19 @@ impl PooledRun {
                 chain: &mut output.op,
             })
             .collect();
-        for sink in &mut sink_chains {
-            cut(sink.chain, &mut taken);
+        if sunk.is_none() {
+            for sink in &mut sink_chains {
+                cut(sink.chain, &mut taken);
+            }
         }
         let mut pending = Some((taken, sink_chains, main_consumer));
         let mut started = None;
         let mut start_chain = |chain: Option<(&mut Box<dyn TileOperator>, Tiling)>| {
             let (mut taken, sinks, consumer) = pending.take().expect("the chains are started once");
             let main = chain.map(|(chain, tiling)| {
-                cut(chain, &mut taken);
+                if sunk.is_none() {
+                    cut(chain, &mut taken);
+                }
                 MainChain {
                     chain,
                     tiling,
@@ -2577,7 +2733,16 @@ impl PooledRun {
                 }
             });
             started = Some(start_planned(
-                ctx, &plan, main, sinks, taken, config, &inherited,
+                ctx,
+                &plan,
+                main,
+                sinks,
+                taken,
+                StartContext {
+                    config,
+                    inherited: &inherited,
+                    sunk: sunk.as_ref(),
+                },
             ));
         };
         match main {
@@ -2622,7 +2787,8 @@ impl PooledRun {
                 PoolBreaker::Materialize { output } => output.held_keys(),
                 PoolBreaker::Collect { .. } | PoolBreaker::Fold { .. } => 0,
             })
-            .sum()
+            .sum::<usize>()
+            + self.dispatcher.breaker_held_keys()
     }
 
     /// The producer that answers `main`, for the driver to pull, or none for a program without a
@@ -2637,14 +2803,21 @@ impl PooledRun {
         let _fail = FailOnUnwind(&self.dispatcher);
         // A source whose yield predicate covers every key has delivered everything: what it
         // holds is published, and nothing else ends it.
-        self.open_sources.retain(|(handle, source)| {
-            let complete = source.is_complete();
+        let dispatcher = &self.dispatcher;
+        self.open_sources.retain(|open| {
+            if dispatcher.is_done(open.handle.pipeline) {
+                return false;
+            }
+            let complete = open.source.is_complete();
+            if complete || open.poll {
+                open.handle.publish(&Projection::Everything);
+            }
             if complete {
-                handle.publish(&Projection::Everything);
-                handle.close();
+                open.handle.close();
             }
             !complete
         });
+        let sunk_before = self.dispatcher.sunk_morsels();
         let mut worker = MainWorker {
             chains: &mut self.chains,
             breakers: &self.breakers,
@@ -2654,7 +2827,7 @@ impl PooledRun {
         let settled = self
             .dispatcher
             .serve_until_wait(&mut worker, &mut self.state);
-        let worked = worker.worked;
+        let worked = worker.worked + (self.dispatcher.sunk_morsels() - sunk_before);
         match (settled, worked) {
             (Settled::Done, _) if self.dispatcher.failed.load(Ordering::Acquire) => Lap::Failed,
             (Settled::Done, _) => Lap::Done,
@@ -2681,6 +2854,13 @@ struct SinkChain<'a> {
     consumer: Arc<Mutex<SinkConsumer>>,
 }
 
+/// What [`start_planned`] reads besides the plan and the chains.
+struct StartContext<'a> {
+    config: &'a Config,
+    inherited: &'a HashMap<String, Vec<Inherited>>,
+    sunk: Option<&'a SunkMemos>,
+}
+
 /// Subscribe `plan`'s pipelines over the chains the cut left, on one worker, answer `main` from
 /// its breaker, and pull each sink through a producer of its breaker's output.
 fn start_planned(
@@ -2689,8 +2869,11 @@ fn start_planned(
     main: Option<MainChain<'_>>,
     sinks: Vec<SinkChain<'_>>,
     mut taken: HashMap<NodeId, Taken>,
-    config: &Config,
-    inherited: &HashMap<String, Vec<Inherited>>,
+    StartContext {
+        config,
+        inherited,
+        sunk,
+    }: StartContext<'_>,
 ) -> PooledRun {
     /// What an output reads once its pipeline runs.
     enum Reads {
@@ -2726,7 +2909,20 @@ fn start_planned(
     let mut reads: HashMap<String, Reads> = HashMap::new();
     let (mut runs, mut notified, mut close_at_start) = (Vec::new(), Vec::new(), Vec::new());
     let mut sources = Vec::new();
+    // A memo in sink mode is its pipeline's breaker, and the pipeline holds a placeholder where a
+    // chain would be.
+    let mut placeholders: HashMap<usize, Box<dyn TileOperator>> = HashMap::new();
+    if let Some(sunk) = sunk {
+        for (position, pipeline) in plan.pipelines.iter().enumerate() {
+            if let BreakerKind::Materialize { memo } = &pipeline.breaker {
+                placeholders.insert(position, Box::new(Sunk::new(sunk.tilings[memo].clone())));
+                sunk.handles[memo].begin_sinking();
+            }
+        }
+    }
     {
+        let mut placeholder_refs: HashMap<usize, &mut Box<dyn TileOperator>> =
+            placeholders.iter_mut().map(|(k, v)| (*k, v)).collect();
         let mut upstream: HashMap<NodeId, &mut Taken> =
             taken.iter_mut().map(|(k, v)| (*k, v)).collect();
         for (position, pipeline) in plan.pipelines.iter().enumerate() {
@@ -2738,6 +2934,17 @@ fn start_planned(
                     .expect("a pipeline that is not a memo's ends in an output")
             };
             let (chain, breaker): (&mut dyn TileOperator, PoolBreaker) = match &pipeline.breaker {
+                BreakerKind::Materialize { .. } if sunk.is_some() => {
+                    let placeholder = placeholder_refs
+                        .remove(&position)
+                        .expect("a memo pipeline has its placeholder");
+                    // The dispatcher runs the pipeline through its breaker, so the pool's own
+                    // breaker is not read.
+                    let unused = PoolBreaker::Collect {
+                        collector: Mutex::new(placeholder.tiling().empty_tile()),
+                    };
+                    (&mut **placeholder, unused)
+                }
                 BreakerKind::Materialize { memo } => {
                     let taken = upstream
                         .remove(memo)
@@ -2776,13 +2983,31 @@ fn start_planned(
                     (&mut **chain, breaker)
                 }
             };
-            let source = pipeline_source(&*chain, pipeline.keyed);
+            let memo_of = |pipeline: usize| match &plan.pipelines[pipeline].breaker {
+                BreakerKind::Materialize { memo } => *memo,
+                _ => unreachable!("a pipeline streams from a memo's pipeline"),
+            };
+            let source = match (sunk, &pipeline.breaker, pipeline.head) {
+                (Some(sunk), BreakerKind::Materialize { memo }, Head::Source) => {
+                    sunk.sources[memo].clone()
+                }
+                (Some(sunk), _, Head::Breaker) => {
+                    pushed_source(&sunk.handles[&memo_of(pipeline.streams_from[0])])
+                }
+                _ => pipeline_source(&*chain, pipeline.keyed && sunk.is_none()),
+            };
             notified.push(pipeline.head == Head::Source);
             // A range ends by exhaustion. A source whose rows arrive from outside stays open
             // until it says it is complete ([`PooledRun::lap`]).
             close_at_start.push(false);
             sources.push(source.clone());
+            let sink = match (sunk, &pipeline.breaker) {
+                (Some(sunk), BreakerKind::Materialize { memo }) => Some(sunk.handles[memo].clone()),
+                _ => None,
+            };
             runs.push(PipelineRun {
+                sink,
+                pushed: sunk.is_some() && pipeline.head == Head::Breaker,
                 keyed: pipeline.keyed,
                 chain,
                 source,
@@ -2814,7 +3039,13 @@ fn start_planned(
         .zip(sources)
         .zip(&plan.pipelines)
         .filter(|(_, pipeline)| pipeline.head == Head::Source)
-        .map(|((handle, source), _)| (handle.clone(), source))
+        .map(|((handle, source), pipeline)| OpenSource {
+            handle: handle.clone(),
+            source,
+            // A memo in sink mode swallows its input's notifications, so the lap tells its
+            // pipeline's source what is ready.
+            poll: sunk.is_some() && matches!(pipeline.breaker, BreakerKind::Materialize { .. }),
+        })
         .collect();
     // The reader registers before the first morsel, so no row leaves before it has read.
     let main_producer =
@@ -2868,6 +3099,7 @@ fn start_planned(
         open_sources,
         _records: records,
         _taken: taken,
+        _placeholders: placeholders,
     }
 }
 
