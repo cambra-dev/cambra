@@ -589,31 +589,6 @@ impl LiveProgram {
         Some(&mut self.branches[at].program)
     }
 
-    /// Run `name`'s `main` output on the worker pool, or say why it is not a morsel pipeline.
-    /// `None` for a branch that does not exist. The pool takes the branch's `main` producer once
-    /// the program is accepted, so a program the pool ran is not driven by the scheduler loop
-    /// afterwards, and a refused program keeps its producer.
-    pub fn run_main_on_pool(
-        &mut self,
-        name: &str,
-        ctx: &mut GlobalContext,
-        config: &Config,
-    ) -> Option<Result<crate::interpreter::Tile, Unsupported>> {
-        let at = self.branches.iter().position(|b| b.name == name)?;
-        let branch = &mut self.branches[at];
-        let result = crate::interpreter::parallel::run_main_holding(
-            ctx,
-            &mut branch.program,
-            &mut branch.main_producer,
-            config,
-        );
-        if result.is_ok() {
-            // The pool took the program, whose fan-outs it cut: a reload cannot offer them on.
-            branch.operator_map = OperatorMap::default();
-        }
-        Some(result)
-    }
-
     /// Run branch `name`'s `main` output on the pool through the inline driver, or say why the
     /// program is not one the pool runs. The branch's `main` producer becomes the pool's
     /// producer of the final breaker's output, which the driver pulls as it pulls a serial one,

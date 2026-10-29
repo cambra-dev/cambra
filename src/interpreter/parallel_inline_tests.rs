@@ -55,10 +55,7 @@ mod inline {
     fn inline(code: &str, morsel_rows: u64) -> Tile {
         let mut ctx = GlobalContext::default();
         let mut program = compiled(&mut ctx, code);
-        let config = Config {
-            threads: 1,
-            morsel_rows,
-        };
+        let config = Config { morsel_rows };
         let mut run = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
             .unwrap_or_else(|why| panic!("{why}"));
         let mut main = run.take_main().expect("a main output");
@@ -144,10 +141,7 @@ mod inline {
     fn main_releases_what_it_read_and_a_pull_after_answers_empty() {
         let mut ctx = GlobalContext::default();
         let mut program = compiled(&mut ctx, &format!("[x + 1 for x in {}]", list(20)));
-        let config = Config {
-            threads: 1,
-            morsel_rows: 4,
-        };
+        let config = Config { morsel_rows: 4 };
         let mut run = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
             .expect("admitted");
         let output = main_output(&run);
@@ -179,10 +173,7 @@ mod inline {
             "[sum(g) for g in groupby([1, 2, 3, 4], \\x -> x // 2)]",
         );
         let mut held = program.main_mut().and_then(|o| o.producer.take());
-        let config = Config {
-            threads: 1,
-            morsel_rows: 4,
-        };
+        let config = Config { morsel_rows: 4 };
         let refused = PooledRun::start(&mut ctx, &mut program, &mut held, &config, Box::new(|| {}))
             .err()
             .expect("a group-by is not a pipeline");
@@ -213,10 +204,7 @@ mod inline {
         let mut ctx = GlobalContext::default();
         ctx.register_source(source.clone());
         let mut program = compiled(&mut ctx, "[x + 1 for x in source1()]");
-        let config = Config {
-            threads: 1,
-            morsel_rows: 2,
-        };
+        let config = Config { morsel_rows: 2 };
         let mut run = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
             .expect("a source that cuts morsels is admitted");
         let mut main = run.take_main().expect("a main output");
@@ -288,10 +276,7 @@ mod inline {
             let (mut ctx, mut program, source) = over_source1(code);
             arrive(&source, 0..5);
             source.lock_wait().set_yield_predicate(Predicate::True);
-            let config = Config {
-                threads: 1,
-                morsel_rows: 2,
-            };
+            let config = Config { morsel_rows: 2 };
             let mut run =
                 PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
                     .expect("admitted");
@@ -314,10 +299,7 @@ mod inline {
     #[test]
     fn a_fold_over_a_source_answers_once_the_source_closes() {
         let (mut ctx, mut program, source) = over_source1("sum([x + 1 for x in source1()])");
-        let config = Config {
-            threads: 1,
-            morsel_rows: 2,
-        };
+        let config = Config { morsel_rows: 2 };
         let mut run = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
             .expect("admitted");
         let mut main = run.take_main().expect("a main output");
@@ -360,10 +342,7 @@ mod inline {
         assert_eq!(pulls.load(Ordering::Relaxed), 1);
 
         let mut program = compiled(&mut ctx, "[x + 1 for x in [1, 2, 3]]");
-        let config = Config {
-            threads: 1,
-            morsel_rows: 2,
-        };
+        let config = Config { morsel_rows: 2 };
         let mut run = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
             .expect("admitted");
         ctx.scheduler().sink_pull_queue().request(sink);
@@ -377,10 +356,7 @@ mod inline {
     fn a_lap_of_a_failed_dispatcher_says_so() {
         let mut ctx = GlobalContext::default();
         let mut program = compiled(&mut ctx, "[x + 1 for x in [1, 2, 3]]");
-        let config = Config {
-            threads: 1,
-            morsel_rows: 2,
-        };
+        let config = Config { morsel_rows: 2 };
         let mut run = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
             .expect("admitted");
         run.dispatcher.fail();
@@ -459,10 +435,7 @@ mod inline {
     #[test]
     fn a_sink_receives_each_row_once_and_is_complete_when_the_source_ends() {
         let (mut ctx, mut program, source, sink) = writes_to_a_sink(SINK_CODE);
-        let config = Config {
-            threads: 1,
-            morsel_rows: 2,
-        };
+        let config = Config { morsel_rows: 2 };
         let mut run = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
             .unwrap_or_else(|why| panic!("{why}"));
         assert!(run.take_main().is_none(), "the program has no `main`");
@@ -526,10 +499,7 @@ mod inline {
             let expected = bindings(serial_sink.value().expect("the serial loop completed"));
 
             let (mut ctx, mut program, source, sink) = writes_to_a_sink(code);
-            let config = Config {
-                threads: 1,
-                morsel_rows: 2,
-            };
+            let config = Config { morsel_rows: 2 };
             let mut run = PooledRun::start_in(
                 MemoMode::Sink,
                 &mut ctx,
@@ -612,10 +582,7 @@ mod inline {
         source: &Arc<Mutex<TestDataSource>>,
         more: std::ops::Range<i64>,
     ) {
-        let config = Config {
-            threads: 1,
-            morsel_rows: 2,
-        };
+        let config = Config { morsel_rows: 2 };
         let mut run = PooledRun::start(ctx, program, &mut None, &config, Box::new(|| {}))
             .unwrap_or_else(|why| panic!("{why}"));
         arrive(source, more);
@@ -722,10 +689,7 @@ mod inline {
             .flat_map(|mode| waves.iter().cloned().map(move |waves| (mode, waves)))
         {
             let (mut ctx, mut program, source) = over_source1(KEYED_CODE);
-            let config = Config {
-                threads: 1,
-                morsel_rows: 2,
-            };
+            let config = Config { morsel_rows: 2 };
             let mut run = PooledRun::start_in(
                 mode,
                 &mut ctx,
@@ -767,10 +731,7 @@ mod inline {
     fn a_keyed_head_publishes_what_the_memo_has_ready_for_raw_arrival_keys() {
         use crate::interpreter::{FunctionGuard, Projection, tiling::Predicate as P};
         let (mut ctx, mut program, source) = over_source1(KEYED_CODE);
-        let config = Config {
-            threads: 1,
-            morsel_rows: 2,
-        };
+        let config = Config { morsel_rows: 2 };
         let mut run = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
             .unwrap_or_else(|why| panic!("{why}"));
         let mut main = run.take_main().expect("a main output");
@@ -827,10 +788,7 @@ mod inline {
     fn inline_in(mode: MemoMode, code: &str, morsel_rows: u64) -> Tile {
         let mut ctx = GlobalContext::default();
         let mut program = compiled(&mut ctx, code);
-        let config = Config {
-            threads: 1,
-            morsel_rows,
-        };
+        let config = Config { morsel_rows };
         let mut run = PooledRun::start_in(
             mode,
             &mut ctx,
@@ -863,5 +821,65 @@ mod inline {
                 );
             }
         }
+    }
+
+    /// A source that cannot cut morsels is refused, and the program then runs on the scheduler
+    /// loop and answers as a serial run does.
+    #[test]
+    fn a_source_that_cannot_cut_morsels_is_refused_and_the_program_runs_serially() {
+        let source = Arc::new(Mutex::new(
+            TestDataSource::new(
+                "source1",
+                crate::ccl::Type::Base(BaseType::Int),
+                Extent::Base(BaseType::Int),
+            )
+            .declining_morsels(),
+        ));
+        let mut ctx = GlobalContext::default();
+        ctx.register_source(source.clone());
+        let mut program = compiled(&mut ctx, "[x + 1 for x in source1()]");
+        arrive(&source, 0..3);
+        source.lock_wait().set_yield_predicate(Predicate::True);
+        let config = Config { morsel_rows: 2 };
+        let refused = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
+            .err()
+            .expect("a source that cannot cut morsels is not a morsel pipeline");
+        assert!(
+            refused.to_string().contains("cut into morsels"),
+            "{refused}"
+        );
+        let producer = program
+            .main_mut()
+            .and_then(|output| output.producer.as_mut())
+            .expect("the program keeps the producer the scheduler loop drives");
+        let tile = crate::interpreter::pull_laps(ctx.scheduler(), producer.as_mut(), 8, |tile| {
+            !tile.is_empty()
+        });
+        assert_eq!(entries(&tile), [(0, 1), (1, 11), (2, 21)]);
+    }
+
+    /// A value the program names and reads, over a live source, ends with no release record and
+    /// no retained key at the source once the run is released and dropped.
+    #[test]
+    fn a_memo_over_a_source_leaves_no_record_and_no_key() {
+        let (mut ctx, mut program, source) = over_source1(indoc! {"
+            xs = [x + 1 for x in source1()]
+            [a * 2 for a in xs]
+        "});
+        let config = Config { morsel_rows: 2 };
+        let mut run = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
+            .unwrap_or_else(|why| panic!("{why}"));
+        let mut main = run.take_main().expect("a main output");
+        let universal = main.tiling().universal_guard();
+        arrive(&source, 0..5);
+        source.lock_wait().set_yield_predicate(Predicate::True);
+        ctx.scheduler().check_for_notifications();
+        let tile = drive(&mut ctx, &mut run, &mut *main, 100);
+        assert_eq!(entries(&tile), [(0, 2), (1, 22), (2, 42), (3, 62), (4, 82)]);
+        main.release(universal);
+        drop(main);
+        drop(run);
+        assert_eq!(source.lock_wait().retained_keys(), 0);
+        assert_eq!(source.lock_wait().release_records(), 0);
     }
 }

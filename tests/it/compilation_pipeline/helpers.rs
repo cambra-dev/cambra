@@ -196,7 +196,7 @@ pub(crate) fn run_program_with_ctx(
 /// compares the report with the pin, so a listed program no test runs any more fails there.
 mod dispatch {
     use super::*;
-    use cambra::interpreter::parallel::{Config, Lap, MemoMode, PooledRun, run_main};
+    use cambra::interpreter::parallel::{Config, Lap, MemoMode, PooledRun};
     use std::collections::BTreeMap;
     use std::io::Write;
 
@@ -292,8 +292,7 @@ mod dispatch {
     }
 
     /// Run `loaded` through the inline driver and compare with `serial`, the answer of the plain
-    /// loop, at each morsel size and in each memo mode, then through the threaded pool when its
-    /// plan admits the program.
+    /// loop, at each morsel size and in each memo mode.
     pub(super) fn check(loaded: &LoadedProgram, serial: &Tile) {
         if std::env::var("CAMBRA_DISPATCH_CHECK").as_deref() != Ok("1") {
             return;
@@ -343,7 +342,6 @@ mod dispatch {
                 }
             }
         }
-        threaded_pass(loaded, serial, &key);
     }
 
     /// One inline run of `loaded` with morsels of `morsel_rows` rows against `serial`, or the
@@ -358,10 +356,7 @@ mod dispatch {
         let mut ctx = GlobalContext::default();
         let mut program = compile_program(&mut ctx, loaded, Box::new(|| {}))
             .expect("the program compiled on a bare context");
-        let config = Config {
-            threads: 1,
-            morsel_rows,
-        };
+        let config = Config { morsel_rows };
         let started = PooledRun::start_in(
             mode,
             &mut ctx,
@@ -417,63 +412,6 @@ mod dispatch {
             "the dispatched run of {key} at {morsel_rows} rows in {mode:?} differs from the serial run"
         );
         Ok(())
-    }
-
-    /// A flat collection with its entries in key order, whatever the codomain holds. A tile that is
-    /// not one is returned as it is.
-    fn sorted_by_key(mut tile: Tile) -> Tile {
-        tile.compact();
-        let Tile::DataFunction {
-            row_starts,
-            domain,
-            codomain,
-            domain_predicate,
-            ..
-        } = &tile
-        else {
-            return tile;
-        };
-        if row_starts.len() != 1 {
-            return tile;
-        }
-        let mut order: Vec<usize> = (0..domain.len()).collect();
-        order.sort_by(|a, b| {
-            domain
-                .index_at(*a)
-                .partial_cmp(&domain.index_at(*b))
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        Tile::data_function(
-            domain.select_indices(order.iter().copied(), order.len()),
-            Box::new(codomain.select_rows(&order)),
-            domain_predicate.clone(),
-            Default::default(),
-        )
-    }
-
-    /// `loaded` on four worker threads with morsels of two rows against `serial`, when the
-    /// threaded plan admits it.
-    fn threaded_pass(loaded: &LoadedProgram, serial: &Tile, key: &str) {
-        let mut ctx = GlobalContext::default();
-        let mut program = compile_program(&mut ctx, loaded, Box::new(|| {}))
-            .expect("the program compiled on a bare context");
-        let config = Config {
-            threads: 4,
-            morsel_rows: 2,
-        };
-        match run_main(&mut ctx, &mut program, &config) {
-            Err(refused) => report("threaded-refused", &refused.to_string(), key),
-            Ok(mut threaded) => {
-                report("threaded", "", key);
-                threaded.compact();
-                // Workers merge morsels in the order they finish, so the rows are compared by key.
-                assert_eq!(
-                    sorted_by_key(sort_tile_collections(threaded)),
-                    sorted_by_key(sort_tile_collections(serial.clone())),
-                    "the threaded run of {key} differs from the serial run"
-                );
-            }
-        }
     }
 }
 

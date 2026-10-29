@@ -679,10 +679,7 @@ impl Served {
                     &mut ctx,
                     &mut program,
                     &mut None,
-                    &cambra::interpreter::parallel::Config {
-                        threads: 1,
-                        morsel_rows: 3,
-                    },
+                    &cambra::interpreter::parallel::Config { morsel_rows: 3 },
                     Box::new(|| {}),
                 )
                 .unwrap_or_else(|why| panic!("the inline dispatcher refuses the program: {why}")),

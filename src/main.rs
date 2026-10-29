@@ -120,27 +120,7 @@ fn run_program(
         None => None,
     };
 
-    // A pool of worker threads runs a `main` output that is a morsel pipeline, and prints it
-    // as a pull of `main` would (`src/interpreter/design-parallel.md`, "The morsel
-    // prototype"). The inspector and the control port drive the scheduler loop, so a run
-    // with either stays on it.
     let parallel = cambra::interpreter::parallel::Config::from_env();
-    if parallel.threads > 1 {
-        if inspection.is_some() || control_port.is_some() {
-            eprintln!(
-                "note: {} applies to a run without --inspect or --control; running on one thread",
-                cambra::interpreter::parallel::Config::THREADS
-            );
-        } else if let Some(result) = live.run_main_on_pool(MAIN_BRANCH, &mut ctx, &parallel) {
-            match result {
-                Ok(tile) => {
-                    println!("Got value: {tile:#?}");
-                    return Ok(());
-                }
-                Err(unsupported) => eprintln!("note: {unsupported}; running on one thread"),
-            }
-        }
-    }
 
     // `CAMBRA_DISPATCH=inline` runs the program's pipelines on the pool's dispatcher from this
     // thread, between the scheduler's delivery and the pulls: no worker threads, and the same

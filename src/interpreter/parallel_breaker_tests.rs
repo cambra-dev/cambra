@@ -497,15 +497,6 @@ mod breakers {
         assert_eq!(pulled(&c_log), [0, 1, 2, 3, 4]);
     }
 
-    /// The threaded entry does not drive a dispatcher with a breaker.
-    #[cfg(debug_assertions)]
-    #[test]
-    #[should_panic(expected = "driven by `serve_until_wait`")]
-    fn the_threaded_entry_does_not_drive_a_breaker_pipeline() {
-        let (dispatcher, _arrivals, _log, _double) = alone(Pushing::Merged);
-        dispatcher.serve(&mut NoWork);
-    }
-
     /// A breaker is called from one thread: a second thread's call is refused.
     #[test]
     fn a_breaker_pipeline_is_driven_by_one_thread() {

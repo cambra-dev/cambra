@@ -343,6 +343,7 @@ impl Materialized {
 
     /// The run is over and no producer reads the output: drop the readers' records and every row.
     /// A producer that was dropped without releasing does not pin rows past this call.
+    #[cfg(test)]
     pub(crate) fn retire_readers(&self) {
         let mut state = self.state.write().unwrap_or_else(PoisonError::into_inner);
         state.readers.clear();

@@ -188,8 +188,7 @@ jobs:
         run: CAMBRA_PROVENANCE_GATE=1 ./ci.sh test
 
       - name: Dispatch differential
-        # The `compilation_pipeline` corpus again through the inline driver and the threaded
-        # pool, against the serial answers and the pinned admitted set
+        # The `compilation_pipeline` corpus again through the inline driver, against the serial answers and the pinned admitted set
         # (`src/interpreter/design-parallel.md`, "The differential suite"). Its own step so a
         # plan change, or a dispatched answer that differs, fails by name. It reuses the
         # binaries of the step above.

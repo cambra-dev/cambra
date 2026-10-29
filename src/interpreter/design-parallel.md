@@ -57,12 +57,11 @@ source.
 
 ## The morsel prototype
 
-`src/interpreter/parallel.rs` runs a program's `main` output on a pool of worker threads when
-`CAMBRA_NUM_LOCAL_THREADS` is above one. The binary reads the configuration after it has compiled
-the program, runs the pool if the plan admits the program, and prints the result as a pull of `main`
-prints it; a program the plan refuses, or a run with `--inspect` or `--control`, says so on stderr
-and runs on the scheduler loop as before. `CAMBRA_MORSEL_ROWS` sets the rows per morsel, 4096 unless
-set.
+`src/interpreter/parallel.rs` runs a program's pipelines through the dispatcher on the scheduler
+loop's own thread. Execution is single-threaded: no worker thread exists, and `PooledRun::lap`
+serves what the dispatcher has claimable between the scheduler's delivery and the pulls ([The inline
+driver](#the-inline-driver)). A program the plan refuses runs on the scheduler loop as before.
+`CAMBRA_MORSEL_ROWS` sets the rows per morsel, 4096 unless set.
 
 ### The plan
 
@@ -78,21 +77,21 @@ breaker of the `main` sink, which is the sink or an `ExtractAggregate` over an `
 ([A fold as the breaker](#a-fold-as-the-breaker)). `classify` is the one table of what the plan does
 with an operator kind (streaming, source, cut, or refuse with the kind named), and its last arm
 refuses, so an operator the plan has not considered is refused. A test classifies every kind the
-corpus of compiled programs holds. Every operator in a chain is streaming, so a worker's chain holds
+corpus of compiled programs holds. Every operator in a chain is streaming, so the chain holds
 no state between morsels. A graph with any other node on the path, a build side, or a sink besides
 `main` is refused with the reason, which the binary prints. Which rows a source enumerates is the
-source's to say ([The dispatcher](#the-dispatcher)), so `run_main` refuses a source over anything
+source's to say ([The dispatcher](#the-dispatcher)), so `PooledRun::start` refuses a source over anything
 but a finite range `[0, n)` when it asks the source for morsels. The programs this admits are `[x +
 1 for x in xs]` over a literal list and a `sum`, `max` or `min` of it, and the same behind a value
 that the program names and reads (`xs = [...]; [a * 2 for a in xs]`); a source over a data-source
 domain is the next shape.
 
-`run_main_delivering` reads everything it can refuse before it takes the program: the plan, each
-pipeline's source with the graph cut at the slots (`check_pipelines`), and that a delivery reaches
-one source. It then drops the `main` producer, cuts the graph, and runs. `cut` takes the chain that
-feeds each `Memo` out of the graph, leaving a `Detached`, and replaces every slot with a
-`BreakerOutput` over the output that chain will fill. The graph is the pool's from there: the cut
-leaves it unusable to the scheduler loop, which is why nothing the pool can refuse follows it.
+`PooledRun::start` reads everything it can refuse before it takes the program: the plan and each
+pipeline's source (`check_pipelines`). It then drops the `main` producer and subscribes the
+pipelines. `cut` takes the chain that feeds each `Memo` out of the graph, leaving a `Detached`, and
+replaces every slot with a `BreakerOutput` over the output that chain will fill. The graph is the
+pool's from there: the cut leaves it unusable to the scheduler loop, which is why nothing the pool
+can refuse follows it.
 The fan-out keeps the serial chain the program subscribed when it compiled: `FanOutShared::producer`
 is the serial `Memo`'s producer, and the operator map holds the fan-out for as long as the program,
 so dropping the `main` producer and the slots does not end that subscription, and its release
@@ -119,39 +118,21 @@ that replaces the input of a slot changes what the slot states.
 
 ### The pool
 
-`run_main` subscribes the chain under the breaker once per worker, so each worker owns one producer
-chain, as [docs/parallel-execution.md, "Thread-confined chains, shared
-breakers"](../../docs/parallel-execution.md#thread-confined-chains-shared-breakers) asks. An
-operator is subscribed as many times as there are workers; nothing is cloned, because the chain is a
-tree of boxed operators each subscription walks afresh. A worker holds its chains in a vector
-indexed by `PipelineId`, with one entry per pipeline of the run (`run_pipelines`; `run_pipeline` is
-the run of one). The threads are `std::thread::scope` threads over `run_worker`, and the calling
-thread waits for the scope. For a
-collection the breaker's state is the collector, the sink: a `Mutex<Tile>` the workers merge into
-with `Tile::merge`, which calls the collection complete once every worker has returned, every
-package acknowledged after its rows were merged. For a fold it is the partials of [A fold as the
-breaker](#a-fold-as-the-breaker). For a breaker that materializes (`PoolBreaker::Materialize`) it is
-a `Materialized` ([A breaker's output](#a-breakers-output)): a worker merges the morsel into it with
-`absorb`, publishes the morsel's guard as the region, and then releases the morsel on its chain, so
-the release is at the merge. The pipeline's `finalize` completes the output, before the pipelines
-that stream from it are closed.
+`PooledRun::start` subscribes the chain of each pipeline once, so the run owns one producer chain
+per pipeline, indexed by `PipelineId`. For a collection the breaker's state is the collector: a
+`Mutex<Tile>` the driver merges into with `Tile::merge`, which calls the collection complete once
+every package is acknowledged after its rows were merged. For a fold it is the partial of [A fold
+as the breaker](#a-fold-as-the-breaker). For a breaker that materializes
+(`PoolBreaker::Materialize`) it is a `Materialized` ([A breaker's output](#a-breakers-output)): the
+driver merges the morsel into it with `absorb`, publishes the morsel's guard as the region, and then
+releases the morsel on its chain, so the release is at the merge. The pipeline's `finalize`
+completes the output, before the pipelines that stream from it are closed.
 
-The chains are lent to the workers and dropped after the scope, one at a time on the thread that
-subscribed them: a producer's drop detaches its probe with a lock that must not find the probe table
-held by another worker's `get`.
-
-A worker releases a morsel on its chain only after the breaker holds the morsel's rows: the
-collector's tile, or the worker's own partial for a fold. That release is the breaker's
-acknowledgement ([docs/parallel-execution.md, "A release must mean durably
+The driver releases a morsel on its chain only after the breaker holds the morsel's rows. That
+release is the breaker's acknowledgement ([docs/parallel-execution.md, "A release must mean durably
 consumed"](../../docs/parallel-execution.md#a-release-must-mean-durably-consumed)), and it is also
 what keeps the chain's producers consistent with the completeness contract: a producer's next pull
 states a different interval complete, which it may do only where the previous one was released.
-
-The cells workers contend on take a blocking lock, `LockNow::lock_wait`: the probe table's
-`observe_named`, which every `get` calls, the collector, and the fold's partials. Every other cell
-keeps the panic-on-contention lock, because a worker's chain is its own and never shares a cell with
-another worker's; the probe table's readers are on the thread that runs the inspector, which a
-parallel run refuses.
 
 ### The dispatcher
 
@@ -159,16 +140,15 @@ The dispatcher is the scheduler of [docs/parallel-execution.md, "The
 scheduler"](../../docs/parallel-execution.md#the-scheduler) for the pipelines of a plan. A plan
 gives it one `PipelineSpec` per pipeline: the pipelines it follows, a function that builds its
 `MorselSource`, and an optional `finalize`. A `WorkPackage` is a `PipelineId` and the guard naming
-one morsel. The morsel path takes no lock. The only lock parks idle workers. The calls:
+one morsel. The morsel path of a finite source takes no lock. The calls:
 
 - `next(prefer)` claims a morsel of `CAMBRA_MORSEL_ROWS` rows from a started pipeline, trying
   `prefer` first, and answers `Next::Package`. It answers `Next::Wait` when no started pipeline has
   a morsel and some pipeline has not finished, and `Next::Done` once every pipeline has finished or
   the dispatcher failed.
 - `ack` counts a claimed morsel back, once the breaker holds its rows and the morsel is released.
-- `step(worker, state)` is one pass of a worker's turn, `serve(worker)` repeats it and parks, and
-  `serve_until_wait(worker, state)` repeats it and returns where `serve` would park ([A worker's
-  turn](#a-workers-turn)).
+- `step(worker, state)` is one pass of the driver's turn, and `serve_until_wait(worker, state)`
+  repeats it until nothing is claimable ([The driver's turn](#the-drivers-turn)).
 - `fail` makes every `next` answer `Done` from then on.
 
 A worker pulls its morsel from the source; no structure holds morsels between the two. This is the
@@ -185,7 +165,7 @@ passes `n`. The update is acquire-release, because a claim that answers `Exhaust
 after every claim that answered a morsel (the finish rule below relies on it). A finite source holds
 every row from the start, so its `publish` and `close` do nothing and it never answers `Idle`. The
 data a worker reads under a guard comes from its own chain. `IterateExtent`'s producer knows nothing
-of the dispatcher. `run_main` finds the source by walking the chain's inputs to the first operator
+of the dispatcher. `PooledRun::start` finds the source by walking the chain's inputs to the first operator
 that answers one, and refuses a chain with none or with several.
 
 **A pipeline finishes when three counts agree.** Its source has answered `Exhausted`, no claimed
@@ -226,11 +206,7 @@ is an upstream worker inside `work` or `leave` or a consumer's `notify`. The sou
 inside that publish: it takes no lock the publisher may hold and does not re-enter the breaker's
 notification.
 
-**Idle workers park.** A worker that finds nothing claimable reads the dispatcher's epoch before it
-looks, and parks until the epoch moves. The epoch moves when a pipeline's source is exhausted, when
-a pipeline finishes and when the dispatcher fails. The thread that moves it takes the idle lock
-before it notifies, so a worker between its check and its wait is not missed. Exhaustion moves it
-because a worker parked while attached has to wake and leave before the pipeline can finish.
+**The epoch counts what can end a wait.** It moves when a pipeline's source is exhausted, when a pipeline finishes, on a publish, on a close and when the dispatcher fails. `serve_until_wait` returns `Settled::Wait` when a step answers `Wait` and the epoch has not moved since the step began.
 
 **A live source's arrivals are published to it.** `LiveSource` is the source of keys that receive
 rows, in any order, and any totally ordered values: positions, integers, strings. It holds the keys
@@ -285,78 +261,55 @@ head reached along several paths of a diamond: the iterated source's path and on
 Each path is acyclic, since the slots are leaves, and the keyed head's consumer publishes
 `Projection::Everything` for any of them ([Keyed reads](#keyed-reads)), which the live source
 resolves to the keys that are ready and not yet claimed, so a duplicate publish adds no key.
-`run_pipeline` is the body of `run_main` for a plan with one pipeline, and `run_pipelines` runs
-several. Once the chains are subscribed it publishes `Everything` to the source, so the rows the
-source holds when the pool starts are claimable, as no notification names them. Without a delivery
-it then closes the source, since no row arrives later. A `DeliveringThread` is a closure that runs
-on the calling thread while the workers run. The closure receives the handle and the scheduler the
-chains were subscribed with, writes rows to the source and calls
-`Scheduler::check_for_notifications`, which polls the source (`check_for_new_data`) and notifies the
-consumers registered for it with `Everything`. The head's `PipelineConsumer` publishes that, and the
-live source resolves it to the keys that are ready. A region would add precision and not
-correctness, and the scheduler's serial path is the same call. `run_pipeline` closes the source when
-the closure returns, which can publish nothing more.
+`PooledRun::start` subscribes the chains and publishes `Everything` to each data source, so the rows
+the source holds when the run starts are claimable, as no notification names them. A source whose
+rows arrive stays open until a lap sees its yield predicate cover every key. The driver's loop writes
+rows to the source and calls `Scheduler::check_for_notifications`, which polls the source
+(`check_for_new_data`) and notifies the consumers registered for it with `Everything`. The head's
+`PipelineConsumer` publishes that, and the live source resolves it to the keys that are ready. A
+region would add precision and not correctness, and the scheduler's serial path is the same call.
 
 A `PipelineRun` names its head: a data source (`Head::Source`) or a breaker's output
-(`Head::Breaker`). `run_pipelines` seeds and closes every pipeline with a data-source head when the
-run starts, whatever the pipeline waits on, since the dispatcher keeps the region in `Early` until
-the pipeline starts; the first of them is closed after its delivery instead when there is one.
-Every chain is subscribed the same way, once per worker, and the first worker's chain of a pipeline
-carries the consumer that reaches the dispatcher: the `PipelineConsumer` of a delivery or of a
-breaker's output. `BreakerOutput` registers one consumer per reading operator, its first
-subscription's, so the breaker's `publish` notifies a `PipelineConsumer` from the thread that
-absorbed a morsel and the other workers' consumers are never notified. Debug builds assert that a
-chain reaches no operator of another pipeline, that a data-source pipeline streams from none, and
-that a breaker-headed pipeline reads the output of a pipeline it streams from. When the chains are
-dropped, the breakers' readers retire.
+(`Head::Breaker`). `PooledRun::start` seeds every pipeline with a data-source head when the run
+starts, whatever the pipeline waits on, since the dispatcher keeps the region in `Early` until the
+pipeline starts. The chain of a pipeline carries the consumer that reaches the dispatcher: the
+`PipelineConsumer` of a source or of a breaker's output. `BreakerOutput` registers one consumer per
+reading operator, so the breaker's `publish` notifies a `PipelineConsumer` from the morsel that
+absorbed. Debug builds assert that a chain reaches no operator of another pipeline, that a
+data-source pipeline streams from none, and that a breaker-headed pipeline reads the output of a
+pipeline it streams from.
 
 **Rows are written before their region is published, and the region before the epoch moves.** The
-delivering thread writes the rows under their store's lock, publishes the region under the source's
-lock, then moves the epoch. A worker that claims a morsel locks the source after the publish, and
-the lock it takes on the store when it pulls follows the delivering thread's, so the rows are
-visible to it. A worker reads the epoch before it claims. One that found `Idle` read the epoch
-before the publish moved it, so its park returns at once, and one that read it after found the
-region.
+driver's loop writes the rows under their store's lock, publishes the region under the source's
+lock, then moves the epoch, so a claim that follows the publish finds the region and its rows.
 
-**A worker stays on its pipeline.** `next` tries the pipeline the worker last claimed from first,
-which keeps its chain, the rows it reads and its partial in one cache. A worker moves when that
-pipeline has no morsel.
+**The driver stays on its pipeline.** `next` tries the pipeline the driver last claimed from first,
+which keeps its chain and the rows it reads in one cache. The driver moves when that pipeline has no
+morsel.
 
-A worker that panics fails the dispatcher on its way out (`FailOnUnwind`): `next` answers `Done`
-from then on, parked workers wake, the other workers stop claiming, and the scope re-raises the
-panic.
+A panic in a chain fails the dispatcher (`FailOnUnwind` in `PooledRun::lap`): `next` answers `Done`
+from then on and the panic is re-raised.
 
-#### A worker's turn
+#### The driver's turn
 
-`Dispatcher::step` is one pass of a worker's turn. It leaves the pipelines whose source is
-exhausted, asks `next`, and runs the package through `PoolWorker::work`, which pulls the chain,
-hands the tile to the breaker and releases the morsel, before `ack`. It answers `Step::Ran` after a
-morsel, `Step::Wait` when `next` did, and `Step::Done` when `next` did, and it answers `Done` before
-it leaves anything once the dispatcher has failed. What a worker holds between passes is a
-`ServeState`: the pipelines it is attached to and the pipeline it ran last.
-`Dispatcher::serve_state` mints one, naming its dispatcher by a per-dispatcher id, and a debug build
-asserts on every step that the state is this dispatcher's and that one thread uses it.
+`Dispatcher::step` is one pass of the driver's turn. It leaves the pipelines whose source is
+exhausted, asks `next`, and runs the package: through the breaker's `pull_sink` for a pipeline with
+a breaker, otherwise through `PoolWorker::work`, which pulls the chain, hands the tile to the breaker
+and releases the morsel, before `ack`. It answers `Step::Ran` after a morsel, `Step::Wait` when
+`next` did, and `Step::Done` when `next` did, and it answers `Done` before it leaves anything once
+the dispatcher has failed. What the driver holds between passes is a `ServeState`: the pipelines it
+is attached to and the pipeline it ran last. `Dispatcher::serve_state` mints one, naming its
+dispatcher by a per-dispatcher id, and a debug build asserts on every step that the state is this
+dispatcher's and that one thread uses it.
 
-`Dispatcher::serve` runs one worker until every pipeline has finished: it reads the epoch, takes a
-step, and parks on the epoch it read when the step answers `Wait`. `serve_until_wait` takes steps
-until one answers `Done`, or `Wait` with the epoch where it was before the step, and returns
-`Settled::Wait` or `Settled::Done`. It parks nowhere: the caller delivers the arrivals that end the
-wait and calls again with the same state. A step that answers `Wait` after the epoch moved is not a
-wait. The claim that finds a source exhausted moves the epoch, and the worker's next step leaves the
-pipeline and finishes it. Both entry points run `step`, so they give one worker the same packages
-and `leave` calls.
-
-The `Wait` of `serve_until_wait` is a wait only when every `publish`, `close`, `ack` and finish of
-the dispatcher's pipelines happens on the thread that calls it, because the caller has no epoch to
-park on. The inline driver is that caller; the threaded path, where other threads publish, is
-`serve`. `FailOnUnwind` lives in `run_worker`, so the inline driver handles a panic in a worker
-itself. The plan's pipelines are served by `MainWorker`; a test double records what it ran and left.
-
-A parked worker leaves when the epoch has moved or the dispatcher has failed. `fail` moves the
-epoch through `wake_idle`, and the `failed` check matters only when that move is lost. In the lib's
-unit tests and in the `it` tests, which build the lib with `test-helpers`, a park gives up after
-thirty seconds and panics with the epoch it waited on, so a lost wake-up fails a test with that
-message and does not hang the suite.
+`serve_until_wait` takes steps until one answers `Done`, or `Wait` with the epoch where it was
+before the step, and returns `Settled::Wait` or `Settled::Done`. It parks nowhere: the caller
+delivers the arrivals that end the wait and calls again with the same state. A step that answers
+`Wait` after the epoch moved is not a wait. The claim that finds a source exhausted moves the epoch,
+and the next step leaves the pipeline and finishes it. Every `publish`, `close`, `ack` and finish
+of the dispatcher's pipelines happens on the thread that calls it. The plan's pipelines are served
+by `MainWorker`; a test double records what it ran and left. `FailOnUnwind` in `PooledRun::lap`
+fails the dispatcher when a chain panics.
 
 ### Region-carrying notifications
 
@@ -389,7 +342,7 @@ or widened, never narrowed or lost.
   one cell twice, and a cell downstream of a region-driven consumer is itself region-driven. It
   orders the cells' locks only. The thread that notifies holds no lock the cascade takes (the
   dispatcher's lock on what reached a pipeline before it started, the `LiveSource` state lock, the
-  lock its yield-predicate function reads, and the lock that parks idle workers).
+  lock its yield-predicate function reads).
 - **Pipeline boundary.** The invariant holds per pipeline: a pipeline behind a breaker has its own
   leaf consumer ([Pipeline boundaries](../../docs/parallel-execution.md#pipeline-boundaries)).
 - **Closures.** A closure consumer ignores the region, and the scheduler's drains send `Everything`.
@@ -406,15 +359,14 @@ only the morsels that worker ran. Either holds the agreement at nothing.
 
 The pool takes the pipeline's records as its own in two steps. The program's `main` producer goes
 once the plan and the source are accepted, which retires its record. It sits in the program's
-output, or with a `LiveProgram` that moved it out to drive it, which `LiveProgram::run_main_on_pool`
-hands to `run_main_holding`; the pool asserts in debug builds that it dropped one. A program the
-pool refuses keeps the producer and stays on the compiling thread. `run_pipeline` then subscribes
-every worker's chain inside `Scheduler::with_pooled_release_records`, and a source producer
-subscribed there (`IterateExtent`'s, and `MapResultWithSource`'s, which releases into the source as
-well) holds its record under `pool#n/<operator id>`, with `n` counting runs. The workers' producers
-of one operator share a record, which accumulates the union of what they released. The records of
-different operators are intersected by the source, so a key is reclaimed once every operator that
-reads the source has released it, as it is in a serial run.
+output, or with a `LiveProgram` that moved it out to drive it, which `LiveProgram::start_inline`
+hands to `PooledRun::start`; the pool asserts in debug builds that it dropped one. A program the
+pool refuses keeps the producer and stays on the plain loop. `PooledRun::start` then subscribes
+every chain inside `Scheduler::with_pooled_release_records`, and a source producer subscribed there
+(`IterateExtent`'s, and `MapResultWithSource`'s, which releases into the source as well) holds its
+record under `pool#n/<operator id>`, with `n` counting runs. The records of different operators are
+intersected by the source, so a key is reclaimed once every operator that reads the source has
+released it, as it is in a serial run.
 
 The pool retires its records itself. A producer whose record is under a pool's name does not retire
 it when it drops, so the first chain to drop does not take the others' record with it.
@@ -459,9 +411,9 @@ on three of them:
 
 A `main` output that is an `ExtractAggregate` over an `Aggregate` is a fold, and the plan reads the
 fold off those two nodes: `Breaker::Fold` carries the `AggregateKind` and the accumulator's tiling
-from the `Aggregate`'s own. The chain the workers subscribe is the fold's input, reached through
+from the `Aggregate`'s own. The chain the driver subscribes is the fold's input, reached through
 `TileOperator::pool_input`, which `ExtractAggregate` answers with its fold and `Aggregate` with its
-input; every other operator answers `None`, which `run_main` never consults, since `plan`
+input; every other operator answers `None`, which the driver never consults, since the plan
 admits only those two above the chain.
 
 The fold is the per-worker state the target design gives `Aggregate` ([docs/parallel-execution.md,
@@ -502,10 +454,10 @@ as claimed. `snapshot` answers the rows of a guard and states complete the keys 
 every key once the breaker completed: the statement is the output's own, because a morsel's
 statement says nothing of keys of other morsels.
 
-**Order.** A worker `absorb`s, then `publish`es with no lock held, and the dispatcher moves its
+**Order.** The driver `absorb`s, then `publish`es with no lock held, and the dispatcher moves its
 epoch inside the publish after the source took the region (`Dispatcher::publish`). The rows are
-visible before the region is published, and the region before the epoch moves, so a worker that
-finds no morsel in its claim has read the epoch before the move and its park returns at once. A
+visible before the region is published, and the region before the epoch moves, so a claim that
+finds no morsel has read the epoch after the move. A
 region published before its rows fails the assertion in `Materialized::publish` and in
 `LiveSource::publish`. The locks, outermost first, are the consumer list (`downstream`), the gated
 cell of a consumer's chain, a pipeline's early state, a `LiveSource`'s state and the output's
@@ -568,8 +520,7 @@ the delivery. `CAMBRA_DISPATCH=inline` turns the driver on in `src/main.rs` for 
 `LiveProgram::start_inline` swaps the branch's `main` producer for the pool's.
 
 Every sink of the program is an output of the inline driver ([Sinks and the HTTP
-path](#sinks-and-the-http-path)); the threaded `run_main` runs `main` only and refuses a program
-that writes a sink.
+path](#sinks-and-the-http-path)).
 
 `PooledRun::serve_pass` is the loop's part of a pass: without a run it does nothing, so a program
 the pool refused passes as the plain loop passes it, sink pulls queued for the next delivery.
@@ -597,13 +548,10 @@ no test runs any more, and runs in CI's test job. The suite is off by default an
 `./ci.sh fast`: it runs the corpus twice more.
 
 Each admitted program runs through the inline driver at one morsel size per row and at three rows
-(`CAMBRA_MORSEL_ROWS` sets a single size), so a program over a few rows runs as many morsels, and
-through the threaded pool on four workers with two-row morsels when the threaded plan admits it.
+(`CAMBRA_MORSEL_ROWS` sets a single size), so a program over a few rows runs as many morsels.
 Every size runs twice, with the memos materialized by the pool and in sink mode
 (`CAMBRA_DISPATCH_MEMOS=pull|sink` limits the run to one); a program the first admits and the
 second refuses fails the run.
-The threaded answers are compared with the rows in key order, since the workers merge morsels as
-they finish.
 
 A completed collection is complete at every level. A morsel states an inner level correctly, and
 `Tile::merge` drops the statement as covered by the outer level when the breaker absorbs the morsel
@@ -613,16 +561,14 @@ of the suite found it in a list of records holding collections, and `[[1, 2], [3
 pairs holding lists and a value read back through a second pipeline show it too.
 `Materialized::snapshot` therefore states every level beneath the outermost complete once the
 breaker has completed, after the merges and the cut to the projection, keeping what the outermost
-states for a read of part of the keys. The threaded collector states every level complete when its
-workers have returned (`Tile::complete_every_level`, `Tile::complete_inner_levels`). A breaker that
+states for a read of part of the keys. A breaker that
 has not completed states none of them. A collection a variant holds is a value of the variant's
 column and has no level of its own, so it is not affected.
 
 ### Sinks and the HTTP path
 
 `plan_inline` plans every `Sink` node of the graph as an output: `main`, and each sink such as the
-reply channel of `http_serve`, ends a pipeline of its own. `plan` keeps `main` as the one output for
-the threaded pool. A sink's pipeline ends in a collection breaker (`Breaker::Collect`); only `main`
+reply channel of `http_serve`, ends a pipeline of its own. A sink's pipeline ends in a collection breaker (`Breaker::Collect`); only `main`
 may end in a fold, since a sink dispatches a collection. A `Memo` that a slot starts a chain from is
 read by that one slot, so two sinks that each start a chain from one memo are refused, and two
 outputs that read one memo at keys are admitted ([Keyed reads](#keyed-reads)).
@@ -737,9 +683,8 @@ and not yet released by it, and releases the morsel's keys when the morsel is do
 reclaims a row once every slot released it (`a_keyed_read_runs_behind_the_keys_its_memo_has_merged`
 asserts that no row is held at the end). The answer is complete once the memo's pipeline has
 finished and the keyed pipeline has run its last morsel. The cut gives every slot of a memo a
-`BreakerOutput` over one output, and only the first takes the chain that fills it. Both the inline
-dispatcher and the threaded pool run keyed reads
-(`a_keyed_read_over_a_source_runs_on_four_workers`).
+`BreakerOutput` over one output, and only the first takes the chain that fills it. The inline driver runs keyed reads
+(`a_keyed_read_runs_behind_the_keys_its_memo_has_merged`).
 
 The HTTP programs a filter or an `if` reply compiles to run through the inline dispatcher and answer
 as the serial loop does (`a_filtered_map_replies_to_the_admitted_requests_only`,
@@ -775,9 +720,7 @@ answers the keys whose predicate holds. Three candidates are not admitted.
 `Restrict` is `Streaming::Unary`: it keeps a row and marks it deleted where its predicate fails
 (`RestrictProducer::get_impl`, `mark_deleted`), so a key it drops is in the morsel's region and has
 no live row, as for a `MapResult` that filters. `MainWorker::work` compacts a morsel before it
-absorbs or folds it. The threaded collector merges morsels without compacting, so its answer carries
-the deleted marks, and the pipeline tests compare after `compact`, as every pipeline test does; the
-differential suite's threaded pass covers the filtered programs. `MapResultToConst` joins
+absorbs or folds it. The pipeline tests compare after `compact`, as every pipeline test does. `MapResultToConst` joins
 `MapResult` as `Streaming::Applies`, a data input and an operand named by the edge (`fn`,
 `constant`); the operand must be a `Constant`, which every morsel reads whole, and any other operand
 is a build side, which stays refused (`a_map_result_to_const_applies_a_constant_and_nothing_else`).
@@ -1059,8 +1002,6 @@ What goes:
 - The cut and `TileOperator::visit_inputs_mut`: the breaker keeps its chain, so no chain is taken
   out of the graph.
 - The pool's reader records and `inherits`: the producer's own record continues across the switch.
-- The threaded passes, `run_main`, `run_main_delivering` and the multi-worker tests: execution is
-  single-threaded.
 
 What is rebuilt:
 
@@ -1113,12 +1054,11 @@ not regress. From step 3 the run checks every pinned program in pull mode and in
    source learns of arrivals from the lap: `OpenSource::poll` has the lap publish `Everything` to
    it, and a finished pipeline is skipped. A lap that sank a morsel counts as work.
 
-   The differential checks every admitted program in both modes at morsel sizes 1 and 3 on the
-   inline driver; the threaded pass runs in pull mode only. Tests: a memo in sink mode answers as
-   the materializing pool does; a memo over a live source delivers each row once, alone and in a
-   chain; a keyed read behind its memo's merges in both modes; the corpus at the pinned count in
-   both modes; the HTTP scenarios through the plain loop, the inline driver and the inline driver
-   in sink mode.
+   The differential checks every admitted program in both modes at morsel sizes 1 and 3. Tests: a
+   memo in sink mode answers as the materializing pool does; a memo over a live source delivers each
+   row once, alone and in a chain; a keyed read behind its memo's merges in both modes; the corpus at
+   the pinned count in both modes; the HTTP scenarios through the plain loop, the inline driver and
+   the inline driver in sink mode.
 4. Keyed reads over the push queue; delete the keyed pipeline of the old structure. Tests: the keyed
    read tests as they stand, a keyed morsel names only pushed keys.
 5. `Aggregate` and `ExtractAggregate`, with the unit tests per kind and the differential run of the
@@ -1128,8 +1068,8 @@ not regress. From step 3 the run checks every pinned program in pull mode and in
 7. `Converse`, with a test of a probe that reads the table of one round and then of the next.
 8. `ExtractFinal`.
 9. The program sink pulls the last breaker's producer; delete `BreakerOutput` and `Materialized`.
-10. Delete the cut, `visit_inputs_mut`, the reader records, `inherits`, the threaded passes and the
-    multi-worker tests, and the sections of this document they leave stale.
+10. Delete the cut, `visit_inputs_mut`, the reader records and `inherits`, and the sections of this
+    document they leave stale.
 
 #### Invariants
 
@@ -1160,92 +1100,21 @@ None.
 
 ### Tests
 
-`tests/it/parallel.rs`: two chains pulled at disjoint guards and merged equal the whole pull, and
-each chain's next pull past its released interval answers the rest; four workers over a thousand
-rows with a morsel size that does not divide them equal the whole pull and are terminal, for the
-collection and for `sum`, `max` and `min` over it, and the folds again over three rows, where a
-worker takes no package; one worker equals the whole pull; the plan reads a fold off the extract; a
-group-by is refused. The three producers each have a unit test of the interval they hand out and the
-release that follows (`map.rs`, `scalar.rs`, `iterate.rs`). `iterate.rs` also tests `RangeSource`:
-its morsels are disjoint and end in `Exhausted`, a morsel holds at least one row, and a finite range
-from zero is the one extent that answers a source. The dispatcher's unit tests in `parallel.rs`:
-morsels are disjoint and cover the range; an empty range finishes its pipeline when first asked; a
-claimed morsel keeps its pipeline open until it is acknowledged; a failed dispatcher hands out
-nothing; a panicking worker stops the others claiming; a pipeline waits for the one it follows, an
-empty pipeline starts the ones behind it, and a pipeline behind two starts after both; a dependency
-on a later pipeline is refused; a worker stays on its pipeline; eight workers over a chain of two
-pipelines claim every position of each once, start each pipeline once and leave each pipeline they
-claimed from; an idle worker parks while another holds a morsel and wakes when the pipeline
-finishes; a failure wakes a parked worker; a claim that ends `Idle` after another found the source
-exhausted finishes the pipeline. A worker's turn is the same through `serve` and through
-repeated `serve_until_wait` calls with one `ServeState`: the same packages and the same `leave`
-calls, with a wait at each unpublished arrival over a live source. A pipeline that streams from
-another starts at the first publish to it while the other has a morsel running, starts at the
-other's finish with its source closed when nothing was published, stays blocked on a build side
-although published and starts when the build side finishes with the region it was published, is
-closed only when the last of two upstreams finishes, with a region published after the first
-finished still claimed, builds its source on the publishing thread, and starts a parked worker; a
-stream from a later pipeline and a pipeline listed twice, in `after` or in `streams_from`, or in
-both, are refused. Eight workers over 200 rounds, with the upstream's workers publishing per morsel
-or all at once when they leave, claim every downstream position once, and the downstream finishes
-after the upstream. A panicking upstream worker fails the dispatcher and no worker stays parked.
-`source_of` finds the one source, and refuses a chain
-with none and a chain with two.
+The dispatcher's unit tests run against hand-built `PipelineSpec`s and a recording worker
+(`parallel.rs`, `mod tests`; `parallel_breaker_tests.rs`): morsels are disjoint and cover the range;
+a pipeline starts after the pipelines it follows and at the first publish of a pipeline it streams
+from, and a region published before it starts is kept; an empty pipeline starts the ones behind it;
+a dependency on a later pipeline, a repeated dependency and a pipeline that both follows and streams
+from one are refused; a pipeline finishes only when its claimed morsels are acknowledged and every
+attached claim has left; `finalize` runs before the pipelines behind it start; a failed dispatcher
+hands out nothing; `serve_until_wait` waits on a live source and resumes from its state.
 
-`LiveSource` has unit tests in `iterate.rs`: it claims only what was published, a region published
-twice is claimed once, `Everything` is cut to the keys that are ready, a region that becomes
-ready ahead of an earlier one is claimed first, the earlier one is not claimable until it is ready,
-and an `Everything` sent while it is missing claims nothing from it, a region outside `ready` is
-refused, a region with open bounds names the keys it contains, and a closed source is exhausted
-after its published rows. The dispatcher has five more: a live pipeline waits for an arrival and
-finishes once closed and drained, a parked worker wakes on a publish and on a close, regions
-published before the pipeline starts are united and kept for its source, and an `Everything`
-published before it starts is resolved when the source is built.
-
-**A live source through the pool, end to end** (`parallel_live_tests.rs`). `LiveRows` is a test
-operator over a store of rows with a `LiveSource`. The delivering thread writes a chunk of rows,
-adds its positions to the source's yield predicate and notifies every chain's consumer with the
-chunk's positions (`Everything` for an empty chunk). It returns when the chunks are delivered, and
-`run_pipeline` closes the source. Workers claim the arrivals and run `LiveRows → MapResult(negate)`
-into the collecting breaker through `run_pipeline`. Each run checks that the breaker holds every row
-once with its mapped value, as the serial answer computes it; that the source's producer saw every
-position pulled once and released once, a release only after the claim and the pull, and reclaimed
-every row; and that only the first chain's consumer is region-driven. The chunks arrive in bursts,
-one row at a time, empty, and in lockstep, where every worker is parked (`Dispatcher::parked`)
-before each arrival and the next waits until the workers have pulled the rows so far, so that a
-parked worker has to be woken by the publish and not by the close. They also arrive out of order,
-last to first and shuffled with fixed seeds. Before the delivering thread delivers the chunk at
-position 0 after another, it waits for the workers to pull every row that arrived, and fails with
-that cause after thirty seconds, so the workers must consume rows of a later chunk while an earlier
-one is missing. Each pattern runs on one, two, four and eight workers, and the in-order and out-of-
-order patterns each repeat two hundred times in one test. A test in which the first worker never
-serves checks that its chain's notifications still reach the pipeline. A run that does not finish
-within a minute fails as a lost wake-up, and a panic in a worker fails as that panic. Removing the
-epoch move from `Dispatcher::publish`, the `Notified::Always` gate of a region-driven consumer, the
-subtraction of claimed positions in `LiveSource::publish`, or the cut to the yield predicate (a row
-count instead) each fail a test.
-
-**A real data source through the pool, end to end** (`parallel_source_tests.rs`). `[x + 1 for x in
-source1()]` is compiled over a `TestDataSource` and run with `run_main_delivering`. Its keys are
-sparse integers (10, 20, 35, 41, 90, 120, 7000) or strings, and they arrive in chunks, in order,
-last to first and shuffled with fixed seeds. The calling thread delivers a chunk in two steps, as a
-real source's rows precede its yield predicate: it writes the rows and calls
-`check_for_notifications`, and then adds the chunk's keys to the yield predicate and calls it again.
-The yield predicate is the keys that arrived, or, for chunks that arrive in order, the interval from
-the smallest key to the largest. Each run checks that the sink holds every row once with its mapped
-value, as the serial answer computes it, and that the source reclaimed every key: the pool's release
-records are the only ones left, so a key is reclaimed only once a worker claimed, pulled, merged and
-released it. In lockstep, every worker is parked before a delivery and the rows written before their
-keys are ready must stay unclaimed. Before the chunk of the smallest key is delivered after another,
-the delivering thread waits for the source to hold nothing, which a worker can only bring about by
-claiming a later chunk while the earlier one is missing, and fails with that cause after thirty
-seconds, or at once when the pool failed. Each pattern runs on one, two, four and eight workers, and
-one test repeats a run two hundred times. A source that says it cannot cut morsels is refused and
-the program then answers through the scheduler loop. A worker that fails reading the source stops
-the pool, `run_pipeline` raises that worker's own panic, and the pool's release records are gone.
-`run_main` over a source that already holds rows, with no delivery, returns them and finishes
-(`tests/it/parallel.rs`). Removing the subtraction of claimed keys, the cut to the yield predicate
-or the epoch move each fail a test.
+The inline driver's tests (`parallel_inline_tests.rs`, `tests/it/parallel.rs`) run programs through
+`PooledRun` and compare with the serial answer: collections and folds over literal lists at morsel
+sizes that do and do not divide the rows, a shared value as two pipelines, variants, `Restrict`
+and `MapResultToConst`, rows delivered in waves to a live source, a source that cannot cut morsels,
+a source that holds rows when the run starts, and no release record or retained key left at the
+source once the run is released. The differential suite covers the rest of the corpus.
 
 ## Not yet implemented
 
@@ -1259,10 +1128,8 @@ A breaker other than a sink or a `Memo`'s input, a fold into a sink, a build sid
 morsel back, and a `Memo` read by more than one slot that starts a chain. A source over a data-source domain runs on the
 pool when it cuts morsels (`cuts_morsels`): `TestDataSource` and `HttpServerDataSource` do, and the
 stdio source keeps the default, so a program over it stays on the compiling thread. Their arrivals
-reach the pipeline through the scheduler's polling, which a live pool drives from the calling
-thread: `run_main_delivering` for the threaded pool, which nothing outside tests starts over a live
-source (`run_main` has no delivery, so it runs the rows a source holds when it starts and closes the
-source), and the loop of the inline driver. The scheduler's `check_for_notifications` notifies with
+reach the pipeline through the scheduler's polling, which the loop of the inline driver drives from
+the calling thread. The scheduler's `check_for_notifications` notifies with
 `Everything`, because `check_for_new_data` says that a source has data and not which keys. A thread
 that knows the keys it wrote names them with `Scheduler::notify_source_consumers`, which wakes a
 consumer whose outermost keys are the source's with the region and any other with `Everything`. The

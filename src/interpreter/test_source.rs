@@ -107,12 +107,6 @@ impl TestDataSource {
         self
     }
 
-    /// Make `get` panic, so that a worker that reads a value fails.
-    #[cfg(test)]
-    pub(crate) fn fail_to_get(&mut self) {
-        self.fails_to_get = true;
-    }
-
     /// How many producers hold a release record with the source.
     #[cfg(test)]
     pub(crate) fn release_records(&self) -> usize {

@@ -114,16 +114,13 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `MemoState`"),
     ("src/interpreter/parallel.rs", "cell of `Rounds`"),
     ("src/interpreter/parallel.rs", "shared cell of `SinkConsumer`"),
-    # The worker pool's breakers: the collection every worker merges into, and each
-    # worker's partial accumulator, handed in once; both answer `main` after every worker
-    # has returned, and no operator reads either.
+    # The pool's breakers: the collection the driver merges into, and the fold's partial
+    # accumulator, handed in once; both answer `main` after the pipeline has finished, and no
+    # operator reads either.
     ("src/interpreter/parallel.rs", "cell of `Tile`"),
-    # The worker pool's dispatcher, twice. A pipeline's source cannot be built before the
-    # pipelines it follows finish, so it is set once, later, and read by every worker; it answers
-    # guards that name morsels and holds no tile. The idle lock guards nothing: a worker with
-    # nothing to claim parks on its condition variable, which needs a mutex to pair with.
+    # The dispatcher. A pipeline's source cannot be built before the pipelines it follows finish,
+    # so it is set once, later; it answers guards that name morsels and holds no tile.
     ("src/interpreter/parallel.rs", "cell of `Arc<dyn MorselSource>`"),
-    ("src/interpreter/parallel.rs", "cell of `()`"),
     # A live source's arrivals, twice: the positions published and not claimed, and what reached a
     # pipeline before its source was built. Both are interval sets of positions, which have no
     # atomic form, and both name morsels without holding a tile. The source's lock orders every
