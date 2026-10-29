@@ -1105,8 +1105,8 @@ pub trait BreakingProducer: TileProducer + Breaker {
     /// the pipeline that reads this producer before the producer's own pipeline has finished, and
     /// not only at [`finalize`](Self::finalize). The default answers `true`. A producer whose held
     /// guard names state a later consume still changes, or groups beneath its outermost keys,
-    /// answers `false`: a release beneath those keys leaves a region no reader restates
-    /// (`TileGuard::projection`).
+    /// answers `false`: a release beneath those keys leaves a region beneath the outermost keys, and
+    /// a reader's chain may restate only the outermost keys (`TileProducer::restates`).
     fn pushes_while_consuming(&self) -> bool {
         true
     }
