@@ -662,7 +662,6 @@ pub(crate) fn uint_range(first: u64, last: u64) -> Predicate {
 
 /// The region naming exactly `keys`, as one set of intervals, so that adjacent keys are one
 /// interval and a union of two such regions stays canonical.
-#[cfg(test)]
 pub(crate) fn points(keys: &[Value]) -> Predicate {
     Predicate::intervals(IntervalSet::from_iter(
         keys.iter()

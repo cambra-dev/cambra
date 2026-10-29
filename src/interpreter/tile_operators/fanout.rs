@@ -985,30 +985,30 @@ impl TileOperator for Memo {
         // serial scheduler subscribes it as below.
         let arrivals = Arrivals::new();
         let (consumer, gate) = shared_consumer(consumer);
-        Box::new(MemoProducer {
-            base: ProducerBase::new(
+        let input = self.input.subscribe(
+            intent_guard,
+            // The memo reads its input at the projection and keeps its keys, so the keys that
+            // changed at the input are the keys that changed at the memo.
+            arrivals.consumer(forwarding_consumer_passing_regions(&consumer)),
+            scheduler,
+        );
+        let producer = MemoProducer::new(
+            ProducerBase::new(
                 MemoProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 scheduler,
             )
             .sharing(gate),
-            input: self.input.subscribe(
-                intent_guard,
-                // The memo reads its input at the projection and keeps its keys, so the keys that
-                // changed at the input are the keys that changed at the memo.
-                arrivals.consumer(forwarding_consumer_passing_regions(&consumer)),
-                scheduler,
-            ),
-            cached_tile: self.tiling().empty_tile(),
-            dirty: Projection::Everything,
+            input,
             arrivals,
-            upstream_drained: false,
-            drain_probed: false,
-            gate_probed: false,
             consumer,
-            wakeups: scheduler.wakeup_queue(),
-        })
+            scheduler.wakeup_queue(),
+        );
+        if let Some(operator) = self.operator_id() {
+            scheduler.register_breaker(operator, &producer.breaker);
+        }
+        Box::new(producer)
     }
 
     fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
@@ -1016,8 +1016,10 @@ impl TileOperator for Memo {
     }
 }
 
-struct MemoProducer {
-    base: ProducerBase,
+/// What a memo holds between pulls, shared by its producer and its breaker handle: the producer
+/// answers `get`, and the dispatcher drives the breaker. Execution is single-threaded, so the lock
+/// is never contended.
+struct MemoState {
     input: Box<dyn TileProducer>,
     cached_tile: Tile,
     /// The region of the input the cache may not hold the answer for: what the memo has not
@@ -1048,6 +1050,48 @@ struct MemoProducer {
     /// build reads. A probe asks whether the input still answers empty for what it released;
     /// until the input notifies, the answer cannot have changed.
     drain_probed: bool,
+    /// The tiling of the memo's output, which is its input's.
+    tiling: Tiling,
+    /// The producer's name, for assertions.
+    name: String,
+    /// Whether the memo is in sink mode: the dispatcher pulls the input through
+    /// [`Breaker::pull_sink`], and `get` answers from the cache alone.
+    sinking: bool,
+    /// The keys with rows that sink pulls merged since the last round, which the next round
+    /// pushes.
+    merged_since_round: Predicate,
+    /// Whether the terminal round has run.
+    terminal: bool,
+    /// The memo's consumer, which `finalize` notifies of the keys it pushes.
+    consumer: GatedConsumer,
+}
+
+impl MemoState {
+    /// The cache cut to `projection`: it holds whatever was read, which can be more than the
+    /// pull asks for.
+    fn answer(&self, projection: &Projection) -> Tile {
+        let mut tile = self.cached_tile.clone();
+        tile.restrict_to(projection, &self.tiling);
+        tile
+    }
+}
+
+/// A memo's side of the breaker interface (`src/interpreter/design-parallel.md`, "Pipeline
+/// breakers: sink, finalize and get"). The producer owns the breaker and the state it reaches, so
+/// dropping the producer drops the input and retires the release records the input registered with
+/// its sources; the scheduler's registry holds the breaker weakly.
+struct MemoBreaker {
+    // shared-state-ok: the memo's own state, shared between its producer and its breaker on the
+    // dispatcher's one thread; no tile passes between operators through it.
+    state: Arc<Mutex<MemoState>>,
+}
+
+struct MemoProducer {
+    base: ProducerBase,
+    // shared-state-ok: the memo's own state, shared with its breaker as `MemoBreaker` says.
+    state: Arc<Mutex<MemoState>>,
+    /// The breaker the scheduler's registry holds weakly, which lives as long as this producer.
+    breaker: BreakerHandle,
     /// This memo's consumer, woken through [`wakeups`](Self::wakeups) when a pull nothing
     /// notified finds data the cache did not hold.
     ///
@@ -1061,30 +1105,181 @@ struct MemoProducer {
 }
 
 impl MemoProducer {
-    /// The cache cut to `projection`: it holds whatever was read, which can be more than the
-    /// pull asks for.
-    fn answer(&self, projection: &Projection) -> Tile {
-        let mut tile = self.cached_tile.clone();
-        tile.restrict_to(projection, self.tiling());
-        tile
+    fn new(
+        base: ProducerBase,
+        input: Box<dyn TileProducer>,
+        arrivals: Arrivals,
+        consumer: GatedConsumer,
+        wakeups: WakeupQueue,
+    ) -> Self {
+        let state = Arc::new(Mutex::new(MemoState {
+            input,
+            tiling: base.tiling.clone(),
+            name: String::new(),
+            cached_tile: base.tiling.empty_tile(),
+            dirty: Projection::Everything,
+            arrivals,
+            upstream_drained: false,
+            drain_probed: false,
+            gate_probed: false,
+            sinking: false,
+            merged_since_round: Predicate::False,
+            terminal: false,
+            consumer: consumer.clone(),
+        }));
+        let breaker: BreakerHandle = Arc::new(MemoBreaker {
+            state: state.clone(),
+        });
+        let producer = Self {
+            base,
+            state,
+            breaker,
+            consumer,
+            wakeups,
+        };
+        producer.state.lock_now().name = producer.name();
+        producer
+    }
+}
+
+/// The keys with a row in the outermost collection of `tile`, which is a collection's own keys; a
+/// tile that is not a collection holds none.
+fn row_keys(tile: &Tile) -> Vec<Value> {
+    match tile {
+        Tile::DataFunction {
+            domain, deleted, ..
+        } => (0..domain.len())
+            .filter(|row| !deleted.contains(*row))
+            .map(|row| domain.index_at(row))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+impl Breaker for MemoBreaker {
+    /// Adopts the state the memo holds: the cache stays, and its keys are the first the memo
+    /// pushes, since the input released them when they were merged and no sink pull will read them
+    /// again. The memo is a collection, since a parent pipeline's morsels are keys.
+    fn begin_sinking(&self) {
+        let mut state = self.state.lock_now();
+        assert!(!state.sinking, "a memo begins sinking once");
+        assert!(
+            matches!(state.tiling, Tiling::DataFunction { .. }),
+            "a memo that sinks is a collection: {}",
+            state.tiling
+        );
+        state.sinking = true;
+        // What the input notifies from here is not the memo's downstream's business: it learns of
+        // a change from `finalize`.
+        state.arrivals.swallow();
+        let adopted = row_keys(&state.cached_tile);
+        if !adopted.is_empty() {
+            state.merged_since_round = points(&adopted);
+        }
+    }
+
+    /// Pulls the memo's input at `guard`, merges the answer into the cache, and releases the input
+    /// at the guard: the answer states the whole guard complete, so the input keeps nothing of it.
+    fn pull_sink(&self, guard: TileGuard) {
+        let mut state = self.state.lock_now();
+        let st = &mut *state;
+        assert!(st.sinking, "a memo is pulled after it begins sinking");
+        assert!(
+            !st.terminal,
+            "a memo is not pulled after its terminal round"
+        );
+        if guard.projection(&st.name) == Projection::Nothing {
+            return;
+        }
+        let mut input = st.input.get(guard.clone());
+        input.compact();
+        debug_assert!(
+            match (&input, &guard) {
+                (
+                    Tile::DataFunction {
+                        domain_predicate, ..
+                    },
+                    TileGuard::Function(FunctionGuard::Domain(region)),
+                ) => region.minus(domain_predicate).is_false(),
+                _ => true,
+            },
+            "the input answers a morsel complete over its guard: {input:?} for {guard:?}"
+        );
+        let keys = row_keys(&input);
+        st.cached_tile.merge(input);
+        if !keys.is_empty() {
+            st.merged_since_round = st.merged_since_round.union(&points(&keys));
+        }
+        st.input.release(guard);
+    }
+
+    fn held_keys(&self) -> usize {
+        row_keys(&self.state.lock_now().cached_tile).len()
+    }
+
+    /// The keys the cache holds inside `region`, in key order. Known cost: the cache's keys are
+    /// listed and sorted per call.
+    fn first_keys(&self, region: &Predicate, rows: u64) -> Vec<Value> {
+        let state = self.state.lock_now();
+        let mut keys: Vec<Value> = row_keys(&state.cached_tile)
+            .into_iter()
+            .filter(|key| region.contains(key))
+            .collect();
+        keys.sort_by(|a, b| {
+            a.partial_cmp(b)
+                .expect("the keys of one collection compare")
+        });
+        keys.truncate(usize::try_from(rows).unwrap_or(usize::MAX));
+        keys
+    }
+
+    /// Pushes the keys merged since the last round, which are final, tells the memo's consumer of
+    /// them, and on the terminal round states the whole output complete.
+    fn finalize(&self, round: Round, parents: &mut Pushes<'_>) {
+        let mut state = self.state.lock_now();
+        let st = &mut *state;
+        assert!(st.sinking, "a memo finalizes after it begins sinking");
+        assert!(!st.terminal, "a memo has one terminal round");
+        st.terminal = round.terminal;
+        if round.terminal {
+            st.cached_tile.complete_every_level();
+        }
+        let merged = std::mem::replace(&mut st.merged_since_round, Predicate::False);
+        if !merged.is_false() {
+            parents.push(&merged);
+        }
+        let consumer = st.consumer.clone();
+        drop(state);
+        match (round.terminal, merged.is_false()) {
+            (true, _) => consumer.notify(&Projection::Everything),
+            (false, false) => consumer.notify(&Projection::admitting(merged)),
+            (false, true) => {}
+        }
     }
 }
 
 impl TileProducer for MemoProducer {
     fn state_info(&self) -> ProducerStateInfo {
-        ProducerStateInfo::holding(self.cached_tile.cell_count())
+        ProducerStateInfo::holding(self.state.lock_now().cached_tile.cell_count())
     }
 
     impl_producer_base!();
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
-        visit("input", &*self.input);
+        visit("input", &*self.state.lock_now().input);
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
+        }
+        let mut state = self.state.lock_now();
+        let st = &mut *state;
+        // A sinking memo answers from what its sink pulls merged: it never pulls its input.
+        if st.sinking {
+            drop(st.arrivals.take());
+            return st.answer(&projection);
         }
         // Everything the input will ever produce is already cached, so the pull below can
         // only return what was released — which a conforming input answers empty, merging to
@@ -1100,12 +1295,12 @@ impl TileProducer for MemoProducer {
         // which grows with the nesting of the fan-outs over it.
         //
         // `cfg!` rather than `#[cfg]` so both configurations stay compiled.
-        self.dirty = self.dirty.union(&self.arrivals.take());
+        st.dirty = st.dirty.union(&st.arrivals.take());
         // The cache may not hold this region: it was never read, or the input has notified
         // since.
-        let must_read = self.dirty.intersect(&projection) != Projection::Nothing;
-        if self.upstream_drained && (!cfg!(debug_assertions) || (self.drain_probed && !must_read)) {
-            return self.answer(&projection);
+        let must_read = st.dirty.intersect(&projection) != Projection::Nothing;
+        if st.upstream_drained && (!cfg!(debug_assertions) || (st.drain_probed && !must_read)) {
+            return st.answer(&projection);
         }
         // The cache is cumulative, so over a region outside `dirty` it is already the answer,
         // empty or not, and pulling walks the subtree below to merge nothing. `dirty` starts as
@@ -1117,31 +1312,39 @@ impl TileProducer for MemoProducer {
         // re-reading the shared input, which on a first lap is mostly empty. A drained input is
         // left to the rule above rather than gated here, which is what keeps that rule's debug
         // probe: gating a drained input would shield it in every build.
-        if !must_read && !self.upstream_drained {
+        if !must_read && !st.upstream_drained {
             // The gate trusts the notification contract, so a debug build checks it, once
             // per read: an input that changed without notifying answers something new.
-            if cfg!(debug_assertions) && !self.gate_probed && self.wakeups.is_empty() {
-                self.gate_probed = true;
-                let mut probe = self.input.get(projection_guard);
+            if cfg!(debug_assertions) && !st.gate_probed && self.wakeups.is_empty() {
+                st.gate_probed = true;
+                debug_assert!(
+                    !st.sinking,
+                    "a sinking memo never pulls its input from `get`"
+                );
+                let mut probe = st.input.get(projection_guard);
                 probe.compact();
-                let mut merged = self.cached_tile.clone();
+                let mut merged = st.cached_tile.clone();
                 merged.merge(probe.clone());
                 // A notification that landed during the probe, from another thread writing rows
                 // before notifying, is the notification the probe asks for: it has not been
                 // taken yet, so the rows are not news the contract missed.
                 debug_assert!(
-                    self.arrivals.pending() || holds_the_same(&merged, &self.cached_tile),
+                    st.arrivals.pending() || holds_the_same(&merged, &st.cached_tile),
                     "{}'s input {} changed without notifying: {probe:?} is new to {:?}",
                     self.name(),
-                    self.input.name(),
-                    self.cached_tile,
+                    st.input.name(),
+                    st.cached_tile,
                 );
             }
-            return self.answer(&projection);
+            return st.answer(&projection);
         }
-        self.gate_probed = false;
-        self.dirty = self.dirty.minus(&projection);
-        let mut input = self.input.get(projection_guard);
+        st.gate_probed = false;
+        st.dirty = st.dirty.minus(&projection);
+        debug_assert!(
+            !st.sinking,
+            "a sinking memo never pulls its input from `get`"
+        );
+        let mut input = st.input.get(projection_guard);
         trace!("{} received {input:?}", self.name());
         let upstream_obsolete = input.to_guard();
         input.compact();
@@ -1162,39 +1365,41 @@ impl TileProducer for MemoProducer {
         }
         trace!("{} releasing {upstream_obsolete:?}", self.name());
         // A pull of an input already drained is the probe.
-        self.drain_probed = self.upstream_drained;
+        st.drain_probed = st.upstream_drained;
         // Latch: once the input has handed over everything, a later pull answering
         // empty (as a conforming input does for a region it released) must not
         // read as "not drained after all".
-        self.upstream_drained |= upstream_obsolete.is_universal();
-        self.input.release(upstream_obsolete);
+        st.upstream_drained |= upstream_obsolete.is_universal();
+        st.input.release(upstream_obsolete);
         trace!(
             "{} merging {input:?} into {:?}",
             self.name(),
-            self.cached_tile
+            st.cached_tile
         );
         if must_read {
-            self.cached_tile.merge(input);
+            st.cached_tile.merge(input);
         } else {
-            let before = self.cached_tile.clone();
-            self.cached_tile.merge(input);
-            if self.cached_tile != before {
+            let before = st.cached_tile.clone();
+            st.cached_tile.merge(input);
+            if st.cached_tile != before {
                 self.wakeups.request(self.consumer.shared().clone());
             }
         }
-        self.answer(&projection)
+        st.answer(&projection)
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        let mut state = self.state.lock_now();
+        let st = &mut *state;
         // Remove any released data from the cached tile since the consumer
         // is no longer interested.
-        self.cached_tile.remove_guarded(obsolete_guard.clone());
+        st.cached_tile.remove_guarded(obsolete_guard.clone());
         // Compact so that logically-deleted entries are physically gone.
-        self.cached_tile.compact();
+        st.cached_tile.compact();
         // Also release upstream to handle the case where the consumer releases
         // data that was never produced.
-        self.input.release(obsolete_guard.clone());
-        trace!("{} now has cached {:?}", self.name(), self.cached_tile);
+        st.input.release(obsolete_guard.clone());
+        trace!("{} now has cached {:?}", self.name(), st.cached_tile);
     }
 }
 
@@ -1722,21 +1927,13 @@ mod tests {
         let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
         let (upstream, _released) =
             QuietSpy::new(Tile::Scalar(ColumnValue::Ints(vec![-5])), tiling.clone());
-        let mut memo = MemoProducer {
-            base: ProducerBase::unowned(MemoProducer::alloc_id(), &tiling),
-            input: Box::new(upstream),
-            cached_tile: tiling.empty_tile(),
-            dirty: Projection::Everything,
-            arrivals: Arrivals::new(),
-            upstream_drained: false,
-            gate_probed: false,
-            drain_probed: false,
-            // The gate is dropped, so nothing clears it: this producer is pulled by hand and
-            // nothing reads its gate. A producer an operator builds passes it to
-            // `ProducerBase::sharing`.
-            consumer: shared_consumer(Box::new(|| {})).0,
-            wakeups: WakeupQueue::default(),
-        };
+        let mut memo = MemoProducer::new(
+            ProducerBase::unowned(MemoProducer::alloc_id(), &tiling),
+            Box::new(upstream),
+            Arrivals::new(),
+            shared_consumer(Box::new(|| {})).0,
+            WakeupQueue::default(),
+        );
 
         for pull in 1..=3 {
             let tile = memo.get(tiling.universal_guard());
@@ -1747,7 +1944,7 @@ mod tests {
             );
         }
         assert!(
-            memo.upstream_drained,
+            memo.state.lock_now().upstream_drained,
             "the complete tile should have been released universally on the first pull"
         );
     }
@@ -1761,7 +1958,8 @@ mod projection_tests {
         GuardLog, InputConsumer, NotifyingOp, ProjectionSpy, ProjectionSpyOp, int_entries,
         ints_by_position, keys_between, notify_input,
     };
-    use crate::interpreter::{BaseType, Extent};
+    use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
+    use bit_set::BitSet;
 
     const ROWS: u64 = 8;
 
@@ -1839,18 +2037,13 @@ mod projection_tests {
         let values: Vec<i64> = (0..ROWS as i64).collect();
         let (upstream, pulled, released) =
             ProjectionSpy::new(ints_by_position(&values, true), ints());
-        let memo = MemoProducer {
-            base: ProducerBase::unowned(MemoProducer::alloc_id(), &ints()),
-            input: Box::new(upstream),
-            cached_tile: ints().empty_tile(),
-            dirty: Projection::Everything,
-            arrivals: Arrivals::new(),
-            upstream_drained: false,
-            gate_probed: false,
-            drain_probed: false,
-            consumer: shared_consumer(Box::new(|| {})).0,
-            wakeups: WakeupQueue::default(),
-        };
+        let memo = MemoProducer::new(
+            ProducerBase::unowned(MemoProducer::alloc_id(), &ints()),
+            Box::new(upstream),
+            Arrivals::new(),
+            shared_consumer(Box::new(|| {})).0,
+            WakeupQueue::default(),
+        );
         (memo, pulled, released)
     }
 
@@ -1935,7 +2128,7 @@ mod projection_tests {
                 keys.map(|key| key as i64).collect(),
             ))),
             Predicate::False,
-            bit_set::BitSet::new(),
+            BitSet::new(),
         )
     }
 
@@ -2047,22 +2240,17 @@ mod projection_tests {
     #[test]
     fn the_probe_tolerates_rows_whose_notification_has_not_been_taken_yet() {
         let arrivals = Arrivals::new();
-        let mut memo = MemoProducer {
-            base: ProducerBase::unowned(MemoProducer::alloc_id(), &ints()),
-            input: Box::new(LandsDuringProbe {
+        let mut memo = MemoProducer::new(
+            ProducerBase::unowned(MemoProducer::alloc_id(), &ints()),
+            Box::new(LandsDuringProbe {
                 base: ProducerBase::unowned(LandsDuringProbe::alloc_id(), &ints()),
                 pulls: 0,
                 arrivals: arrivals.clone(),
             }),
-            cached_tile: ints().empty_tile(),
-            dirty: Projection::Everything,
             arrivals,
-            upstream_drained: false,
-            gate_probed: false,
-            drain_probed: false,
-            consumer: shared_consumer(Box::new(|| {})).0,
-            wakeups: WakeupQueue::default(),
-        };
+            shared_consumer(Box::new(|| {})).0,
+            WakeupQueue::default(),
+        );
         memo.get(keys_between(0, 3));
         assert!(int_entries(&memo.get(keys_between(0, 3))).is_empty());
         assert_eq!(
@@ -2082,18 +2270,13 @@ mod projection_tests {
         use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
 
         let (input, rows) = ScriptedProducer::new(ints_by_position(&[], false), ints());
-        let mut memo = MemoProducer {
-            base: ProducerBase::unowned(MemoProducer::alloc_id(), &ints()),
-            input: Box::new(input),
-            cached_tile: ints().empty_tile(),
-            dirty: Projection::Everything,
-            arrivals: Arrivals::new(),
-            upstream_drained: false,
-            gate_probed: false,
-            drain_probed: false,
-            consumer: shared_consumer(Box::new(|| {})).0,
-            wakeups: WakeupQueue::default(),
-        };
+        let mut memo = MemoProducer::new(
+            ProducerBase::unowned(MemoProducer::alloc_id(), &ints()),
+            Box::new(input),
+            Arrivals::new(),
+            shared_consumer(Box::new(|| {})).0,
+            WakeupQueue::default(),
+        );
         memo.get(keys_between(0, 3));
         memo.get(keys_between(4, 7));
 
@@ -2105,11 +2288,13 @@ mod projection_tests {
                     keys.map(|key| key as i64).collect(),
                 ))),
                 Predicate::False,
-                bit_set::BitSet::new(),
+                BitSet::new(),
             )
         };
         *rows.lock_now() = rows_at(0..=3);
-        memo.arrivals
+        memo.state
+            .lock_now()
+            .arrivals
             .consumer(Box::new(|| {}))
             .notify(&Projection::Everything);
         memo.get(keys_between(0, 3));
@@ -2174,5 +2359,222 @@ mod projection_tests {
             panic!("a collection, got {tile:?}")
         };
         codomain
+    }
+
+    /// A memo over `tile`, a collection of integers keyed `0..ROWS`, with the input's logs.
+    fn memo_over(tile: Tile) -> (MemoProducer, GuardLog, GuardLog) {
+        let (upstream, pulled, released) = ProjectionSpy::new(tile, ints());
+        let memo = MemoProducer::new(
+            ProducerBase::unowned(MemoProducer::alloc_id(), &ints()),
+            Box::new(upstream),
+            Arrivals::new(),
+            shared_consumer(Box::new(|| {})).0,
+            WakeupQueue::default(),
+        );
+        (memo, pulled, released)
+    }
+
+    /// Integers at the keys `rows`, which are not every key of the collection.
+    fn at_keys(rows: &[u64]) -> Tile {
+        Tile::data_function(
+            ColumnValue::UInts(rows.to_vec()),
+            Box::new(Tile::Scalar(ColumnValue::Ints(
+                rows.iter().map(|row| *row as i64 * 10).collect(),
+            ))),
+            Predicate::True,
+            BitSet::new(),
+        )
+    }
+
+    fn sorted_entries(tile: &Tile) -> Vec<(u64, i64)> {
+        let mut entries = int_entries(tile);
+        entries.sort_unstable();
+        entries
+    }
+
+    /// Morsels in any order, an empty one, and one whose rows are not every key of its region
+    /// give a sinking memo the answer a pulling memo gives, and release the input at the same
+    /// guards.
+    #[test]
+    fn a_sinking_memo_answers_as_a_pulling_memo_does() {
+        let morsels = [(4, 5), (0, 1), (6, 7), (2, 3)];
+        for tile in [
+            ints_by_position(&(0..ROWS as i64).collect::<Vec<_>>(), true),
+            at_keys(&[0, 2, 3, 6]),
+            at_keys(&[]),
+        ] {
+            let (mut pulling, _, pulling_released) = memo_over(tile.clone());
+            let (mut sinking, _, sinking_released) = memo_over(tile);
+            sinking.breaker.begin_sinking();
+            for (first, last) in morsels {
+                pulling.get(keys_between(first, last));
+                sinking.breaker.pull_sink(keys_between(first, last));
+            }
+            assert_eq!(*sinking_released.lock_now(), *pulling_released.lock_now());
+            let universal = ints().universal_guard();
+            assert_eq!(
+                sorted_entries(&sinking.get(universal.clone())),
+                sorted_entries(&pulling.get(universal)),
+            );
+        }
+    }
+
+    /// The switch adopts the cache a pulling memo filled, so the keys it holds are not read
+    /// again, and the sink adds the rest.
+    #[test]
+    fn the_switch_to_sink_mode_adopts_the_cache() {
+        let (mut memo, pulled, _) = memo_over(ints_by_position(
+            &(0..ROWS as i64).collect::<Vec<_>>(),
+            true,
+        ));
+        memo.get(keys_between(0, 3));
+        memo.breaker.begin_sinking();
+        memo.breaker.pull_sink(keys_between(4, 7));
+        assert_eq!(
+            sorted_entries(&memo.get(ints().universal_guard())),
+            (0..ROWS).map(|k| (k, k as i64)).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            *pulled.lock_now(),
+            [keys_between(0, 3), keys_between(4, 7)],
+            "the keys the cache held are not read again"
+        );
+        let held = memo.breaker.first_keys(&Predicate::True, 100);
+        assert_eq!(
+            held,
+            (0..ROWS).map(Value::UInt).collect::<Vec<_>>(),
+            "the cache holds the adopted keys and the sink's"
+        );
+    }
+
+    /// A sinking memo never pulls its input from `get`: a pull of a region no sink merged answers
+    /// from the cache, which holds nothing there.
+    #[test]
+    fn a_sinking_memo_never_pulls_its_input_from_get() {
+        let (mut memo, pulled, _) = memo_over(ints_by_position(
+            &(0..ROWS as i64).collect::<Vec<_>>(),
+            true,
+        ));
+        memo.breaker.begin_sinking();
+        let answer = memo.get(keys_between(0, 3));
+        assert!(int_entries(&answer).is_empty());
+        assert!(pulled.lock_now().is_empty(), "the input was not pulled");
+        memo.breaker.pull_sink(keys_between(0, 3));
+        assert_eq!(pulled.lock_now().len(), 1, "only the sink pulled it");
+        let answer = memo.get(keys_between(0, 3));
+        assert_eq!(sorted_entries(&answer).len(), 4);
+        assert_eq!(pulled.lock_now().len(), 1);
+    }
+
+    /// The sink releases the input at what it merged: the input holds nothing for a merged morsel,
+    /// and a morsel with no rows releases nothing to it.
+    #[test]
+    fn the_sink_releases_its_input_at_the_merge() {
+        let (memo, pulled, released) = memo_over(at_keys(&[1, 2, 5]));
+        memo.breaker.begin_sinking();
+        memo.breaker.pull_sink(keys_between(0, 3));
+        assert_eq!(pulled.lock_now().len(), 1);
+        assert_eq!(
+            *released.lock_now(),
+            [keys_between(0, 3)],
+            "released at the morsel's guard, which the answer stated complete, not at its rows"
+        );
+        let held = memo.breaker.first_keys(&Predicate::True, 10);
+        assert_eq!(held, [Value::UInt(1), Value::UInt(2)]);
+        memo.breaker.pull_sink(keys_between(4, 7));
+        assert_eq!(
+            *released.lock_now(),
+            [keys_between(0, 3), keys_between(4, 7)],
+            "a morsel with rows between the keys released is released whole"
+        );
+    }
+
+    /// A morsel pulled again adds no row: the input released it and answers empty, so the cache
+    /// keeps one row per key and the input has nothing new to release.
+    #[test]
+    fn a_morsel_pulled_again_adds_no_row() {
+        let (memo, _, released) = memo_over(at_keys(&[1, 2, 5]));
+        memo.breaker.begin_sinking();
+        memo.breaker.pull_sink(keys_between(0, 3));
+        memo.breaker.pull_sink(keys_between(0, 3));
+        assert_eq!(memo.breaker.held_keys(), 2);
+        assert_eq!(
+            memo.breaker.first_keys(&Predicate::True, 10),
+            [Value::UInt(1), Value::UInt(2)]
+        );
+        assert_eq!(
+            *released.lock_now(),
+            [keys_between(0, 3)],
+            "the second pull has nothing left to release: the input answered it empty"
+        );
+    }
+
+    /// A sinking memo holds the keys it merged, and its consumer's release reclaims them.
+    #[test]
+    fn a_sinking_memo_reclaims_the_keys_its_consumer_releases() {
+        let (mut memo, _, _) = memo_over(at_keys(&[1, 2, 5]));
+        assert_eq!(memo.breaker.held_keys(), 0);
+        memo.breaker.begin_sinking();
+        memo.breaker.pull_sink(keys_between(0, 7));
+        assert_eq!(memo.breaker.held_keys(), 3);
+        memo.release(keys_between(0, 3));
+        assert_eq!(
+            memo.breaker.held_keys(),
+            1,
+            "the keys 1 and 2 are reclaimed"
+        );
+        memo.release(keys_between(4, 7));
+        assert_eq!(memo.breaker.held_keys(), 0);
+    }
+
+    /// A morsel is cut from the keys the cache holds, in order, inside the region and at most
+    /// `rows`.
+    #[test]
+    fn a_sinking_memo_lists_the_keys_it_holds_inside_a_region() {
+        let (memo, _, _) = memo_over(at_keys(&[1, 2, 5, 6]));
+        memo.breaker.begin_sinking();
+        memo.breaker.pull_sink(keys_between(5, 6));
+        memo.breaker.pull_sink(keys_between(0, 2));
+        let region = |a, b| match keys_between(a, b) {
+            TileGuard::Function(FunctionGuard::Domain(region)) => region,
+            other => panic!("{other:?}"),
+        };
+        let keys = |keys: Vec<Value>| -> Vec<u64> {
+            keys.into_iter()
+                .map(|key| match key {
+                    Value::UInt(key) => key,
+                    other => panic!("{other:?}"),
+                })
+                .collect()
+        };
+        assert_eq!(keys(memo.breaker.first_keys(&region(0, 7), 3)), [1, 2, 5]);
+        assert_eq!(keys(memo.breaker.first_keys(&region(2, 5), 9)), [2, 5]);
+        assert!(memo.breaker.first_keys(&region(3, 4), 9).is_empty());
+    }
+
+    /// The scheduler's registry holds a memo's breaker without owning its state: dropping the
+    /// producer drops the input it holds, which is what retires the input's release records.
+    #[test]
+    fn the_registry_does_not_keep_a_dropped_memo_alive() {
+        let values: Vec<i64> = (0..ROWS as i64).collect();
+        let (input, pulled, _) = ProjectionSpyOp::new(ints_by_position(&values, true), ints());
+        let mut memo = Memo::new(Box::new(input));
+        let mut scheduler = Scheduler::new();
+        let producer = memo.subscribe(ints().empty_guard(), Box::new(|| {}), &mut scheduler);
+        let operator = memo.operator_id().expect("an identity");
+        assert!(
+            scheduler.breaker(operator).is_some(),
+            "registered at subscribe"
+        );
+        let holders = Arc::strong_count(&pulled);
+        drop(producer);
+        assert!(
+            Arc::strong_count(&pulled) < holders,
+            "the input producer was dropped with the memo's producer"
+        );
+        assert!(
+            scheduler.breaker(operator).is_none(),
+            "the registry's entry is dead"
+        );
     }
 }

@@ -947,7 +947,10 @@ carried forward while the old producer is alive:
 the producer that owns a breaker holds its `BreakerHandle`, an `Arc<dyn Breaker>`, and a pipeline's
 spec holds a clone. The methods of `Breaker` take `&self` and the implementor locks its own state,
 because the handle is shared; the lock is never contended. The enum `parallel::BreakerKind` names
-what a planned pipeline ends in.
+what a planned pipeline ends in. `Memo` implements the interface in
+`src/interpreter/tile_operators/fanout.rs`: `MemoState` holds the cache, `dirty` and the input, and
+the producer owns it and the `MemoBreaker` that reaches it, so the registry's weak entry lives as
+long as the producer.
 
 #### Completeness and release
 

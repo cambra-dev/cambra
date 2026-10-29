@@ -664,24 +664,41 @@ impl Consumer for FlaggingConsumer {
 #[derive(Clone)]
 pub struct Arrivals(
     // shared-state-ok: see the type doc.
-    Arc<Mutex<Projection>>,
+    Arc<Mutex<ArrivalState>>,
 );
+
+/// What an [`Arrivals`] holds: the regions that arrived, and whether it still records and forwards
+/// them.
+struct ArrivalState {
+    region: Projection,
+    /// Set when the operator stops listening to its input's notifications, as a breaker in sink
+    /// mode does: the recorder then drops them.
+    swallowing: bool,
+}
 
 impl Arrivals {
     /// No region arrived yet.
     pub(crate) fn new() -> Self {
-        Self(Arc::new(Mutex::new(Projection::Nothing)))
+        Self(Arc::new(Mutex::new(ArrivalState {
+            region: Projection::Nothing,
+            swallowing: false,
+        })))
     }
 
     /// The union of the regions that arrived since the last call, which resets it.
     pub fn take(&self) -> Projection {
-        std::mem::replace(&mut *self.0.lock_now(), Projection::Nothing)
+        std::mem::replace(&mut self.0.lock_now().region, Projection::Nothing)
     }
 
     /// Whether a region has arrived since the last [`take`](Self::take), which it leaves
     /// recorded.
     pub fn pending(&self) -> bool {
-        *self.0.lock_now() != Projection::Nothing
+        self.0.lock_now().region != Projection::Nothing
+    }
+
+    /// Stop recording and forwarding what the input notifies: the recorder drops it from now on.
+    pub(crate) fn swallow(&self) {
+        self.0.lock_now().swallowing = true;
     }
 
     /// An input consumer that records the region before forwarding it downstream.
@@ -702,7 +719,10 @@ struct RecordingConsumer {
 impl Consumer for RecordingConsumer {
     fn notify(&mut self, arrived: &Projection) {
         let mut held = self.arrivals.0.lock_now();
-        *held = held.union(&arrived.keys_only());
+        if held.swallowing {
+            return;
+        }
+        held.region = held.region.union(&arrived.keys_only());
         drop(held);
         self.downstream.notify(arrived);
     }

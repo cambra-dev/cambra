@@ -10,8 +10,10 @@ mod breakers {
 
     use super::super::*;
     use crate::ccl::provenance::NodeId;
-    use crate::interpreter::tile_operators::{Breaker, points, uint_keys_in, uint_range};
-    use crate::interpreter::{FunctionGuard, Value};
+    use crate::interpreter::tile_operators::{
+        Breaker, TileProducer, points, uint_keys_in, uint_range,
+    };
+    use crate::interpreter::{ColumnValue, FunctionGuard, Tile, Tiling, Value};
 
     /// What a double was asked to do, in order.
     #[derive(Debug, PartialEq)]
@@ -520,5 +522,274 @@ mod breakers {
                 .is_err()
         });
         assert!(refused);
+    }
+
+    /// A `Memo` over a scripted input, subscribed, switched to sink mode and reached through the
+    /// scheduler's registry; its producer answers `get`.
+    fn memo_over(tile: Tile) -> (BreakerHandle, Box<dyn TileProducer>, Tiling) {
+        use crate::interpreter::tile_operators::test_helpers::ProjectionSpyOp;
+        use crate::interpreter::tile_operators::{Memo, TileOperator};
+        use crate::interpreter::{BaseType, Extent};
+        let tiling = Tiling::data_function(
+            Extent::uint_range(8),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let (input, _, _) = ProjectionSpyOp::new(tile, tiling.clone());
+        let mut memo = Memo::new(Box::new(input));
+        let mut scheduler = Scheduler::new();
+        let producer = memo.subscribe(tiling.empty_guard(), Box::new(|| {}), &mut scheduler);
+        let handle = scheduler
+            .breaker(memo.operator_id().expect("an operator has an identity"))
+            .expect("a memo registers its breaker when it is subscribed");
+        handle.begin_sinking();
+        (handle, producer, tiling)
+    }
+
+    /// A memo pipeline over a live source and a parent over the memo's pushed keys.
+    fn memo_and_parent(tile: Tile) -> (Dispatcher, Arrivals, Log, Box<dyn TileProducer>, Tiling) {
+        let (handle, producer, tiling) = memo_over(tile);
+        let arrivals = Arrivals::new();
+        let (parent, log) = Double::new(Pushing::Merged);
+        parent.begin_sinking();
+        let parent: BreakerHandle = parent;
+        let source = pushed_source(&handle);
+        let spec = PipelineSpec {
+            after: Vec::new(),
+            streams_from: vec![PipelineId(0)],
+            source: Box::new(move || source.clone()),
+            finalize: None,
+            breaker: Some(parent),
+        };
+        let dispatcher = Dispatcher::new(vec![arrivals.spec(Some(handle)), spec], 2);
+        (dispatcher, arrivals, log, producer, tiling)
+    }
+
+    fn complete_at(tile: &Tile, key: u64) -> bool {
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = tile
+        else {
+            panic!("a collection, got {tile:?}");
+        };
+        domain_predicate.contains(&Value::UInt(key))
+    }
+
+    /// A memo pipeline pushes the keys it merged each round, its parent claims them, and the
+    /// whole output is complete only after the terminal round.
+    #[test]
+    fn a_memo_pipeline_pushes_each_round_and_completes_at_the_terminal_round() {
+        use crate::interpreter::tile_operators::test_helpers::ints_by_position;
+        let values: Vec<i64> = (0..8).collect();
+        let (dispatcher, arrivals, log, mut memo, tiling) =
+            memo_and_parent(ints_by_position(&values, true));
+        let mut state = dispatcher.serve_state();
+        arrivals.deliver(&dispatcher, 0, 0, 3);
+        serve(&dispatcher, &mut state);
+        serve(&dispatcher, &mut state);
+        assert_eq!(
+            pulled(&log),
+            [0, 1, 2, 3],
+            "the parent reads the first round's keys"
+        );
+        let first = memo.get(tiling.universal_guard());
+        assert!(
+            complete_at(&first, 3) && !complete_at(&first, 5),
+            "{first:?}"
+        );
+
+        arrivals.deliver(&dispatcher, 0, 4, 7);
+        dispatcher.close(PipelineId(0));
+        serve(&dispatcher, &mut state);
+        serve(&dispatcher, &mut state);
+        serve(&dispatcher, &mut state);
+        assert_eq!(
+            pulled(&log),
+            [0, 1, 2, 3, 4, 5, 6, 7],
+            "each pushed key once"
+        );
+        let whole = memo.get(tiling.universal_guard());
+        assert!(
+            whole.is_terminal(),
+            "complete after the terminal round: {whole:?}"
+        );
+        assert!(dispatcher.all_done());
+    }
+
+    /// A memo pushes keys with rows only: a key of its input that has none is not pushed.
+    #[test]
+    fn a_memo_pipeline_pushes_keys_with_rows_only() {
+        let sparse = Tile::data_function(
+            ColumnValue::UInts(vec![0, 2, 5]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 20, 50]))),
+            Predicate::True,
+            Default::default(),
+        );
+        let (dispatcher, arrivals, log, _memo, _tiling) = memo_and_parent(sparse);
+        let mut state = dispatcher.serve_state();
+        arrivals.deliver(&dispatcher, 0, 0, 7);
+        serve(&dispatcher, &mut state);
+        serve(&dispatcher, &mut state);
+        assert_eq!(pulled(&log), [0, 2, 5]);
+    }
+
+    /// A memo that pulled keys before it switched pushes them to its parent with the keys the
+    /// sink merges: the input released those keys, so no sink pull reads them again.
+    #[test]
+    fn review_adopted_keys_reach_the_parent() {
+        use crate::interpreter::tile_operators::test_helpers::{ProjectionSpyOp, keys_between};
+        use crate::interpreter::tile_operators::{Memo, TileOperator};
+        use crate::interpreter::{BaseType, Extent};
+        let tiling = Tiling::data_function(
+            Extent::uint_range(8),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let values: Vec<i64> = (0..8).collect();
+        let (input, _, _) = ProjectionSpyOp::new(
+            crate::interpreter::tile_operators::test_helpers::ints_by_position(&values, true),
+            tiling.clone(),
+        );
+        let mut memo = Memo::new(Box::new(input));
+        let mut scheduler = Scheduler::new();
+        let mut producer = memo.subscribe(tiling.empty_guard(), Box::new(|| {}), &mut scheduler);
+        producer.get(keys_between(0, 3));
+        let handle = scheduler
+            .breaker(memo.operator_id().expect("an identity"))
+            .expect("registered");
+        handle.begin_sinking();
+
+        let arrivals = Arrivals::new();
+        let (parent, log) = Double::new(Pushing::Merged);
+        parent.begin_sinking();
+        let parent: BreakerHandle = parent;
+        let source = pushed_source(&handle);
+        let spec = PipelineSpec {
+            after: Vec::new(),
+            streams_from: vec![PipelineId(0)],
+            source: Box::new(move || source.clone()),
+            finalize: None,
+            breaker: Some(parent),
+        };
+        let dispatcher = Dispatcher::new(vec![arrivals.spec(Some(handle)), spec], 2);
+        let mut state = dispatcher.serve_state();
+        arrivals.deliver(&dispatcher, 0, 0, 7);
+        serve(&dispatcher, &mut state);
+        serve(&dispatcher, &mut state);
+        assert_eq!(pulled(&log), [0, 1, 2, 3, 4, 5, 6, 7]);
+    }
+
+    /// The keys a memo adopted from its pull-mode cache reach the parent although no morsel is
+    /// delivered and the source stays open: the memo's first round pushes them.
+    #[test]
+    fn adopted_keys_reach_the_parent_with_no_morsel_delivered() {
+        use crate::interpreter::tile_operators::test_helpers::{ProjectionSpyOp, keys_between};
+        use crate::interpreter::tile_operators::{Memo, TileOperator};
+        use crate::interpreter::{BaseType, Extent};
+        let tiling = Tiling::data_function(
+            Extent::uint_range(8),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let values: Vec<i64> = (0..8).collect();
+        let (input, _, _) = ProjectionSpyOp::new(
+            crate::interpreter::tile_operators::test_helpers::ints_by_position(&values, true),
+            tiling.clone(),
+        );
+        let mut memo = Memo::new(Box::new(input));
+        let mut scheduler = Scheduler::new();
+        let mut producer = memo.subscribe(tiling.empty_guard(), Box::new(|| {}), &mut scheduler);
+        producer.get(keys_between(0, 3));
+        let handle = scheduler
+            .breaker(memo.operator_id().expect("an identity"))
+            .expect("registered");
+        handle.begin_sinking();
+
+        let arrivals = Arrivals::new();
+        let (parent, log) = Double::new(Pushing::Merged);
+        parent.begin_sinking();
+        let parent: BreakerHandle = parent;
+        let source = pushed_source(&handle);
+        let spec = PipelineSpec {
+            after: Vec::new(),
+            streams_from: vec![PipelineId(0)],
+            source: Box::new(move || source.clone()),
+            finalize: None,
+            breaker: Some(parent),
+        };
+        let dispatcher = Dispatcher::new(vec![arrivals.spec(Some(handle)), spec], 2);
+        let mut state = dispatcher.serve_state();
+        for _ in 0..3 {
+            serve(&dispatcher, &mut state);
+        }
+        assert_eq!(
+            pulled(&log),
+            [0, 1, 2, 3],
+            "the pull-mode cache, no morsel delivered"
+        );
+    }
+
+    /// A memo in sink mode swallows what its input notifies, and tells its consumer of a change
+    /// when it finalizes, after the rows are merged.
+    #[test]
+    fn a_sinking_memo_notifies_its_consumer_from_finalize_only() {
+        use crate::interpreter::tile_operators::test_helpers::{
+            NotifyingOp, ints_by_position, keys_between, notify_input,
+        };
+        use crate::interpreter::tile_operators::{Memo, TileOperator};
+        use crate::interpreter::{BaseType, Extent, Projection};
+        let tiling = Tiling::data_function(
+            Extent::uint_range(8),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let values: Vec<i64> = (0..8).collect();
+        let (input, notifier) = NotifyingOp::new(ints_by_position(&values, true), tiling.clone());
+        let mut memo = Memo::new(Box::new(input));
+        let mut scheduler = Scheduler::new();
+        let woken = Arc::new(Mutex::new(0usize));
+        let counter = woken.clone();
+        let _producer = memo.subscribe(
+            tiling.empty_guard(),
+            Box::new(move || *counter.lock_now() += 1),
+            &mut scheduler,
+        );
+        let handle = scheduler
+            .breaker(memo.operator_id().expect("an identity"))
+            .expect("registered");
+        handle.begin_sinking();
+        let region = Projection::of(&keys_between(0, 3)).expect("keys");
+        notify_input(&notifier, &region);
+        assert_eq!(
+            *woken.lock_now(),
+            0,
+            "the input's notification is swallowed"
+        );
+
+        let arrivals = Arrivals::new();
+        let dispatcher = Dispatcher::new(vec![arrivals.spec(Some(handle))], 2);
+        let mut state = dispatcher.serve_state();
+        arrivals.deliver(&dispatcher, 0, 0, 3);
+        serve(&dispatcher, &mut state);
+        assert_eq!(
+            *woken.lock_now(),
+            1,
+            "the round notified once, after the merge"
+        );
+    }
+
+    /// A memo that is not a collection has no keys to push and is refused when it switches.
+    #[test]
+    #[should_panic(expected = "a memo that sinks is a collection")]
+    fn a_memo_that_is_not_a_collection_does_not_sink() {
+        use crate::interpreter::tile_operators::test_helpers::ProjectionSpyOp;
+        use crate::interpreter::tile_operators::{Memo, TileOperator};
+        use crate::interpreter::{BaseType, Extent};
+        let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let (input, _, _) =
+            ProjectionSpyOp::new(Tile::Scalar(ColumnValue::Ints(vec![3])), tiling.clone());
+        let mut memo = Memo::new(Box::new(input));
+        let mut scheduler = Scheduler::new();
+        let _producer = memo.subscribe(tiling.empty_guard(), Box::new(|| {}), &mut scheduler);
+        scheduler
+            .breaker(memo.operator_id().expect("an identity"))
+            .expect("registered")
+            .begin_sinking();
     }
 }

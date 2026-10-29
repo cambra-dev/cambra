@@ -90,7 +90,7 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/mod.rs", "shared cell of `C`"),
     # `Arrivals`, the regions an input has notified since a `Memo` last took them; see its
     # type doc. The notification carries a region, which a one-bit flag cannot hold.
-    ("src/interpreter/tile_operators/mod.rs", "shared cell of `Projection`"),
+    ("src/interpreter/tile_operators/mod.rs", "shared cell of `ArrivalState`"),
     # A breaker's materialized output (`breaker.rs`): the merged rows, the keys that are ready and
     # the per-operator release records under one lock, and the consumers behind the breaker. The
     # rows are the breaker's own state, as the collector's are, and they reach a pipeline behind it
@@ -108,6 +108,10 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/parallel.rs", "shared cell of `SinkConsumer`"),
     # The dispatcher's record of a breaker pipeline's rounds (`parallel.rs`, `Rounds`), driven on
     # the dispatcher's one thread; no tile passes between operators through it.
+    # A memo's state (`fanout.rs`, `MemoState`): the producer owns it, and the memo's breaker, which
+    # the producer also owns, reaches it. Both are used on the dispatcher's one thread.
+    ("src/interpreter/tile_operators/fanout.rs", "shared cell of `MemoState`"),
+    ("src/interpreter/tile_operators/fanout.rs", "shared cell of `MemoState`"),
     ("src/interpreter/parallel.rs", "cell of `Rounds`"),
     ("src/interpreter/parallel.rs", "shared cell of `SinkConsumer`"),
     # The worker pool's breakers: the collection every worker merges into, and each
