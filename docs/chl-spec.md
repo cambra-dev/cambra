@@ -1204,7 +1204,9 @@ A direct call `c(k)` remains function application, not an optional membership te
 
 `x.m(args)` calls a method of `x`'s type. Calling a function stored in a field takes parentheses
 around the projection: `(r.f)(args)`. See
-[Nominal types and methods](#68-nominal-types-and-methods-decided).
+[Nominal types and methods](#68-nominal-types-and-methods-decided). A structural record's methods
+are `replacing` and `merging` (**[Tentative]**,
+[Copying a record with changed fields](#copying-a-record-with-changed-fields-tentative)).
 
 #### Absence at a cut [Open]
 
@@ -1341,6 +1343,158 @@ The delimiter split retains `(…)` for products, `[…]` for collections and `{
 Whether a future empty constructor can cover all collection kinds remains open; `empty_map()`
 is the current keyed constructor, not a general empty-collection term. The values `Set::empty`
 and `Map::empty` replace it ([3.8 Function calls](#38-function-calls)).
+
+#### Copying a record with changed fields [Tentative]
+
+Every structural record has two methods that build a copy of it with some fields changed:
+`replacing` and `merging`. In `r.replacing(p)`, `r` is the receiver and `p` the argument: a record
+built by the call's parentheses as for any call ([3.8 Function calls](#38-function-calls)), or a
+record value, as in `r.replacing(patch)`. Recorded here only (2026-10-29 and 2026-10-30, no
+brainstorm writeup yet).
+
+```python
+r = (a=1, b=(c=3, e=0))
+r.replacing(a=2)             # (a=2, b=(c=3, e=0))
+r.replacing(b=(c=5))         # (a=1, b=(c=5, e=0))
+r.replacing(b=(d=4))         # type error: `b` has no field `d`
+r.merging(b=(d=4))           # (a=1, b=(c=3, e=0, d=4))
+```
+
+- **Both methods descend into records.** Where the field of `r` and the field of `p` with one label
+  both hold records, the copy holds the first changed by the second, by the same method. Any other
+  field of `p` replaces the field of `r` whole, whether it holds a tuple, a collection, a variant, a
+  nominal value, a function or a base value. No spelling replaces a nested record without
+  descending into it: a field of `p` that gives every field of the nested record changes each one.
+- **`r.replacing(p)` adds no field.** A label that `p` gives at a place where the record of `r`
+  lacks it is a type error at that label. A field that `p` replaces whole keeps its type, so a
+  longer tuple or a wider record put in its place adds nothing.
+- **`r.merging(p)` adds the labels `r` lacks.** A label that `p` gives at a place where the record
+  of `r` lacks it is added there.
+- **A new value fits the field it replaces whole, in both methods.** A value **fits** a field when,
+  with refinements removed from both types, its type is below the field's type. A value that does
+  not fit is a type error at its label. A new tuple therefore fits when it has every position of
+  the old one: `(pt=(1, 2)).replacing(pt=(3, 4, 5))` is well-typed and gives `(pt=(3, 4))`, and
+  `(pt=(1, 2)).replacing(pt=(3,))` is a type error. A new variant fits when the field's type has
+  every tag of the new value's type. A constructor's type has only its own tag
+  ([3.15 Variant constructors](#315-variant-constructors)), so
+  `` (state=`draft).replacing(state=`sent) `` is a type error. An exact annotation states the tags
+  a field may hold:
+
+  ```python
+  d: {state: {`draft | `sent}} = (state=`draft)
+  d2 = d.replacing(state=`sent)    # (state=`sent), at type {state: {`draft | `sent}}
+  d2.replacing(state=`draft)       # (state=`draft)
+  d.replacing(state=`void)         # type error: {`draft | `sent} has no `void
+  ```
+- **A field that `p` replaces whole keeps its type, with the new value's refinements in place of
+  its own.** It keeps the tags, positions and labels its type has, and the copy discards a position
+  or a label the new value has beyond them. A record that holds a changed field is changed.
+  `(f=1).replacing(f=9)` has type `{f: {Int where _ == 9}}`, although the literal gives `f` the type
+  `{Int where _ == 1}` ([3.1 Literals](#31-literals)). With `Key = {String where _ in ks}` and
+  `e: {k: Key, v: Int}`, the `k` of `e.replacing(k=s)` is a `String` refined as `s` is, not a `Key`.
+- **The copy keeps no refinement of a record, at any depth, that reads a changed field.** With
+  `ItemPricing = {{price: Int, cost: Int} where _.price >= _.cost}` and `item: ItemPricing`,
+  `item.replacing(price=p)` has no refinement on the record. A refinement that reads only unchanged
+  fields is kept.
+- **A use checks the refinements it requires.** The copy's `k` passed where a `Key` is required, or
+  the copy passed where an `ItemPricing` is, is checked there. An annotation checks the copy where
+  it is built: `i2: ItemPricing = item.replacing(price=p)`.
+- **The copy's type is below the type of `r` where the new values establish every refinement that
+  type states**, those of each changed field and those of each record that reads one.
+
+  ```python
+  Qty = {Int where _ >= 0}
+  x: {n: Qty, tag: String} = (n=1, tag="x")
+  y: {n: Qty, tag: String} = x.replacing(n=0)        # the new `n` is {Int where _ == 0}, a Qty
+  z: {n: Qty, tag: String} = x.replacing(n=x.n - 1)  # type error: `x.n - 1` is an Int
+  ```
+- **A label is qualified as in any record.** An unqualified label is the current module's
+  ([9.12 Field labels and tags belong to a module](#912-field-labels-and-tags-belong-to-a-module)),
+  so changing a field another module declares names that module, at every depth:
+  `cfg.replacing(lib::server=(lib::port=8080))`. When `replacing` rejects a label and the record at
+  that place has a field of that name under another module, the error names the qualified label:
+  `cfg.replacing(lib::server=(port=8080))` names `lib::port`.
+- **The argument has at least one field.** `r.replacing()` is an error, since `()` is unit and not a
+  record ([6.6 The empty product is unit](#66-the-empty-product-is-unit)).
+- **The receiver is a structural record.** A nominal value has no fields
+  ([A nominal type is opaque](#a-nominal-type-is-opaque)), so `n.replacing(…)` on one names a method
+  its type declares or is an error. A value of the single-constructor form is copied through the
+  record it holds, `lib::Config::new(c.extract().replacing(lib::port=8080))`, which discharges the
+  constructor's refinements again.
+- **A field computed from another is not recomputed.** `(port=80, url=url_of(80))` holds two
+  values, and `.replacing(port=8080)` leaves `url` as it was. A value that follows from other fields
+  is written as a function of the record.
+- **A program declares no method on a structural record**, so `r.replacing(…)` and `r.merging(…)`
+  always name these two. A field named `replacing` that holds a function is called as
+  `(r.replacing)(…)` ([Associated functions and methods](#associated-functions-and-methods)).
+
+**The `Replaces` and `Merges` traits.** `r.replacing(p)` is
+`summon(Replaces(_, _))::replace(r, p)`, and `r.merging(p)` is `summon(Merges(_, _))::merge(r, p)`,
+as `a + b` is `summon(Addable(_, _))::add(a, b)` ([Trait requirements](#trait-requirements)). The
+compiler declares both traits, as it declares `Addable`:
+
+```python
+trait Replaces(R, P):
+    Output
+    def replace(r: R, p: P) => Output
+
+trait Merges(R, P):
+    Output
+    def merge(r: R, p: P) => Output
+```
+
+- **Two records satisfy them by their fields, with no `impl`,** as two records satisfy
+  `Equatable`. `Replaces(R, P)` holds when each label of `P` is a label of `R`, and at each label
+  the two fields are records that satisfy `Replaces` in turn or the field of `P` fits the field of
+  `R`. `Merges(R, P)` holds when, at each label both have, the two fields are records that satisfy
+  `Merges` in turn or the field of `P` fits the field of `R`. A requirement of either that no two
+  records could satisfy is an error at the requirement.
+- **`Output` is the copy's type,** as the rules above give it, and each call's types decide it.
+- **`replacing` and `merging` are the only methods that call a trait's function.** A declared
+  trait's function is read from an instance and is no method
+  ([Declaring a trait](#declaring-a-trait)).
+- **No module declares an instance of either.** The compiler's rule for two records answers every
+  requirement of either. **[Open]** — an instance for a nominal type, whose `replace` builds the
+  copy through the type's constructor. Its generic form, `impl forall (P) Replaces(Config, P)`,
+  would also need an exception to the rule that refuses a type variable standing as a whole operand
+  outside the trait's module
+  ([Traits and instances across modules [Decided]](#traits-and-instances-across-modules-decided)).
+- **`Replacing(R, P)` and `Merging(R, P)` name an `Output`.** In a signature, `=> Replacing(R, P)`
+  is `=> a::Output` with `a: Replaces(R, P)` added to the `requires` clause, and
+  `=> Merging(R, P)` is the same with `Merges`.
+- **The receiver's bound bounds `Output`.** Under `R <: B`, the `Output` of `Replaces(R, P)` and of
+  `Merges(R, P)` is below `B` with each field that `B` and `P` both have changed as the copy
+  changes it. A field of `P` that `B` lacks is not in the bound, since its type in the copy is the
+  type `R` gives it. A trait's declared bound bounds its associated type the same way
+  ([Declaring a trait](#declaring-a-trait)). A generic definition reads on a copy the fields that
+  `B` names and no others, as it reads only those on a value of type `R`
+  ([Kinds and bounds](#kinds-and-bounds)).
+
+```python
+def bump(R <: {n: Int}, r: R) => Replacing(R, {n: Int}):
+    r.replacing(n=r.n + 1)
+
+def bump_twice(R <: {n: Int}, r: R) => Replacing(Replacing(R, {n: Int}), {n: Int}):
+    bump(bump(r))   # bump(r) is below {n: Int}, so it is bump's argument again
+
+bump_twice((n=1, tag="x"))   # (n=3, tag="x"), with `tag` at its own type
+```
+
+**[Open]** — `R` with a changed field's refinements replaced. The copy keeps every field of `R` and
+the tags, positions and labels `R` gives them. Where the new values do not establish a refinement
+that `R` states, `Replacing(R, P)` is not below `R`, and nothing a generic definition writes says
+that the copy is `R` with that refinement replaced.
+`def keep(R <: {n: Int}, r: R) => R: bump(r)` is an error at the definition. A bound on `Output`
+states that the copy keeps the type of `R`, and each call is checked against it:
+
+```python
+def keep(R <: {n: Int}, r: R) => R requires a: Replaces(R, {n: Int}), a::Output <: R:
+    bump(r)
+
+w: {n: Int, tag: String} = (n=1, tag="x")
+keep(w)                # (n=2, tag="x")
+keep((n=1, tag="x"))   # type error: the copy's `n` is an Int, not {Int where _ == 1}
+```
 
 ### 3.12 Comprehensions
 
@@ -3208,8 +3362,10 @@ impl Option(T):
 
 **Methods and fields are separate namespaces, and the parentheses decide which is meant.**
 `r.f(args)` is a method call, and `r.f` is a field and never a method. A nominal value has no
-fields, and a structural record has no methods, so `r.f(args)` on a record whose field `f` holds a
-function is an error. Calling the function a field holds is written `(r.f)(args)`
+fields. A structural record has only the methods `replacing` and `merging` (**[Tentative]**,
+[Copying a record with changed fields](#copying-a-record-with-changed-fields-tentative)). On a
+record whose field `f` holds a function, `r.f(args)` with any other `f` is an error. Calling the
+function a field holds is written `(r.f)(args)`
 ([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)).
 
 **A type in scope brings its methods into scope.** `x.m()` resolves `m` among the methods
@@ -3230,12 +3386,14 @@ belongs to a type and not to a module. Calling the function such a field holds i
 
 **A method call needs its receiver's type.** `x.m()` resolves `m` from the type of `x`. When
 nothing that precedes the call determines that type to be a nominal type, the call is a type error
-that asks for an annotation on `x`. What precedes a call is the program text before it and the
-clauses of each comprehension the call stands in, which bind the names its element reads
-([3.12 Comprehensions](#312-comprehensions)): in `[p.cents() for p in prices]`, the type of
-`prices` determines the type of `p`. A polymorphic `def` therefore calls no method on a value whose
-type is one of its type parameters. An operation that works across types is a trait's function,
-read from an instance, `summon(Area(_))::area(s)`
+that asks for an annotation on `x`. The exceptions are `replacing` and `merging`, which a
+requirement types on a receiver of any other type (**[Tentative]**,
+[Copying a record with changed fields](#copying-a-record-with-changed-fields-tentative)). What
+precedes a call is the program text before it and the clauses of each comprehension the call stands
+in, which bind the names its element reads ([3.12 Comprehensions](#312-comprehensions)): in
+`[p.cents() for p in prices]`, the type of `prices` determines the type of `p`. A polymorphic `def`
+therefore calls no other method on a value whose type is one of its type parameters. An operation
+that works across types is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 ([Summoning an instance](#summoning-an-instance)).
 
 - **A trait's functions are not methods.** `x.m()` names only a method of `x`'s type, so a type's
@@ -3411,6 +3569,10 @@ product, and a tuple satisfies `Orderable` only against a tuple of the same leng
 ([3.4 Comparisons](#34-comparisons)). A listed instance's `Output` is its operand type, so the sum
 of two `Int`s is an `Int`. A nominal type satisfies these traits where its module declares an
 instance ([Equality and order](#equality-and-order)).
+
+The compiler also declares `Replaces` and `Merges`, the traits `replacing` and `merging` call
+(**[Tentative]**,
+[Copying a record with changed fields](#copying-a-record-with-changed-fields-tentative)).
 
 - **An operator calls its trait's function.** `a + b` is `summon(Addable(_, _))::add(a, b)`, and
   `-a` is `summon(Negatable(_))::neg(a)`. The compiler's instances run the built-in operation:
