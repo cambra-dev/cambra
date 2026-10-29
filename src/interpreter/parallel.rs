@@ -138,6 +138,7 @@ impl BreakerKind {
             BreakerKind::Fold { aggregate, .. } | BreakerKind::Group { aggregate } => {
                 Some(*aggregate)
             }
+            BreakerKind::Invert { converse } => Some(*converse),
             BreakerKind::Materialize { memo } => Some(*memo),
         }
     }
@@ -164,6 +165,13 @@ pub enum BreakerKind {
     Group {
         /// The `MapAggregate` the pipeline ends in.
         aggregate: NodeId,
+    },
+    /// A `Converse` that a pipeline reads the groups of: the operator's own producer, switched to
+    /// sink mode, is the breaker of the pipeline over the rows it inverts, and the group values
+    /// are pushed at the terminal round.
+    Invert {
+        /// The `Converse` the pipeline ends in.
+        converse: NodeId,
     },
     /// The input of a `Memo`: the rows the pipelines that read it stream from.
     Materialize {
@@ -209,6 +217,9 @@ enum Class {
     ExtractGroups,
     /// The grouped fold an `ExtractGroups` reads.
     Groups,
+    /// The inversion of a collection: the head of a pipeline that reads the groups, which the
+    /// plan cuts at.
+    Converse,
     /// An operator the plan does not admit, and the reason.
     Refuse(String),
 }
@@ -229,6 +240,7 @@ fn classify(kind: &str) -> Class {
         "Aggregate" => Class::Fold,
         "MapExtractAggregate" => Class::ExtractGroups,
         "MapAggregate" => Class::Groups,
+        "Converse" => Class::Converse,
         other => Class::Refuse(format!("`{other}` is not a streaming operator here")),
     }
 }
@@ -267,6 +279,7 @@ fn plan_outputs(graph: &OperatorGraph, admit_sinks: bool) -> Result<Plan, Unsupp
         pipelines: Vec::new(),
         memos: HashSet::new(),
         keyed_memos: HashMap::new(),
+        converses: HashSet::new(),
     };
     let mut outputs = Vec::new();
     for (name, top) in sinks {
@@ -295,6 +308,9 @@ struct Planner<'g> {
     memos: HashSet<NodeId>,
     /// The pipeline planned for each `Memo` that chains read at their own keys.
     keyed_memos: HashMap<NodeId, usize>,
+    /// The `Converse`s the plan has cut at: each is read once, since the pipeline that ends in it
+    /// pushes its groups to one parent.
+    converses: HashSet<NodeId>,
 }
 
 impl Planner<'_> {
@@ -508,6 +524,51 @@ impl Planner<'_> {
                         break (Head::Breaker, vec![planned]);
                     }
                 },
+                Class::Converse => {
+                    // The chain of a pipeline that ends in a breaker is the breaker's own, which
+                    // reads the `Converse`'s producer; a collecting pipeline subscribes its chain
+                    // afresh, which would invert a second time.
+                    if matches!(breaker, BreakerKind::Collect) {
+                        return Err(Unsupported(
+                            "a `Converse` read by a collecting pipeline".into(),
+                        ));
+                    }
+                    if keyed.is_some() {
+                        return Err(Unsupported(
+                            "a keyed read in a chain that starts at a breaker's output".into(),
+                        ));
+                    }
+                    let [edge] = inputs.as_slice() else {
+                        return Err(Unsupported("a `Converse` without its one input".into()));
+                    };
+                    if !matches!(edge.kind, EdgeKind::Value { deferred: false }) {
+                        return Err(Unsupported(
+                            "the chain closes a cycle or reads a shared node".into(),
+                        ));
+                    }
+                    // Only the outermost collection is inverted by a breaker: its input is one
+                    // mapping to scalars, and a deeper level stands beneath enclosing rows.
+                    let inverts_the_outermost = matches!(
+                        self.by_id.get(&edge.subscribed),
+                        Some(GraphNode::Operator {
+                            tiling: Tiling::DataFunction { codomain, .. },
+                            ..
+                        }) if matches!(**codomain, Tiling::Scalar(_))
+                    );
+                    if !inverts_the_outermost {
+                        return Err(Unsupported(
+                            "a `Converse` of a level beneath enclosing rows".into(),
+                        ));
+                    }
+                    if !self.converses.insert(at) {
+                        return Err(Unsupported(
+                            "a `Converse` is read by more than one pipeline".into(),
+                        ));
+                    }
+                    let planned =
+                        self.pipeline(edge.subscribed, BreakerKind::Invert { converse: at })?;
+                    break (Head::Breaker, vec![planned]);
+                }
                 Class::Cut if keyed.is_some() => {
                     return Err(Unsupported(
                         "a keyed read in a chain that starts at a breaker's output".into(),
@@ -1933,7 +1994,7 @@ fn sunk_breakers(
         // aggregate's is its input's.
         let pulled = match &pipeline.breaker {
             BreakerKind::Materialize { .. } => node_tiling(&node)?,
-            BreakerKind::Fold { .. } | BreakerKind::Group { .. } => {
+            BreakerKind::Fold { .. } | BreakerKind::Group { .. } | BreakerKind::Invert { .. } => {
                 let mut input = None;
                 for graph_node in program.operator_graph.nodes() {
                     if let GraphNode::Operator { id, inputs, .. } = graph_node
@@ -2075,7 +2136,9 @@ impl PooledRun {
                 match plan.main().breaker {
                     BreakerKind::Collect => start_chain(Some((&mut output.op, tiling))),
                     BreakerKind::Fold { .. } | BreakerKind::Group { .. } => start_chain(None),
-                    BreakerKind::Materialize { .. } => unreachable!("`main` is not a memo's input"),
+                    BreakerKind::Materialize { .. } | BreakerKind::Invert { .. } => {
+                        unreachable!("`main` is not a breaker's input")
+                    }
                 }
             }
         }
@@ -2247,7 +2310,8 @@ fn start_planned(
             let (chain, breaker): (&mut dyn TileOperator, PoolBreaker) = match &pipeline.breaker {
                 BreakerKind::Materialize { .. }
                 | BreakerKind::Fold { .. }
-                | BreakerKind::Group { .. } => {
+                | BreakerKind::Group { .. }
+                | BreakerKind::Invert { .. } => {
                     let placeholder = placeholder_refs
                         .remove(&position)
                         .expect("a breaker pipeline has its placeholder");
@@ -2822,7 +2886,8 @@ mod tests {
                 | Class::Extract
                 | Class::Fold
                 | Class::ExtractGroups
-                | Class::Groups => {}
+                | Class::Groups
+                | Class::Converse => {}
                 Class::Refuse(reason) => assert!(
                     reason.contains(kind),
                     "a refusal names the operator it refuses: {reason}"
@@ -2896,6 +2961,7 @@ mod tests {
             pipelines: Vec::new(),
             memos: HashSet::new(),
             keyed_memos: HashMap::new(),
+            converses: HashSet::new(),
         };
         planner
             .pipeline(top, BreakerKind::Collect)
@@ -3054,6 +3120,7 @@ mod tests {
                     pipelines: Vec::new(),
                     memos: HashSet::new(),
                     keyed_memos: HashMap::new(),
+                    converses: HashSet::new(),
                 }
             }
         }
@@ -3087,6 +3154,64 @@ mod tests {
                 chain, source,
                 "the pipeline starts at the aggregate's input"
             );
+        }
+
+        /// A `Converse` under a grouped fold is a pipeline of its own that the fold's pipeline
+        /// streams from.
+        #[test]
+        fn a_converse_under_a_grouped_fold_is_a_pipeline_the_fold_streams_from() {
+            let mut nodes = Nodes::default();
+            let source = nodes.filled(keys());
+            let converse = nodes.add(node("Converse", keys(), vec![edge("input", source)]));
+            let groups = nodes.add(node("MapAggregate", keys(), vec![edge("input", converse)]));
+            let extract = nodes.add(node(
+                "MapExtractAggregate",
+                keys(),
+                vec![edge("input", groups)],
+            ));
+            let mut planner = nodes.planner();
+            let (breaker, chain) = planner.breaker_at(extract);
+            let last = planner.pipeline(chain, breaker).expect("planned");
+            assert_eq!(planner.pipelines.len(), 2);
+            let (inversion, folding) = (&planner.pipelines[0], &planner.pipelines[last]);
+            assert!(
+                matches!(inversion.breaker, BreakerKind::Invert { converse: c } if c == converse)
+            );
+            assert!(inversion.head == Head::Source);
+            assert!(matches!(folding.breaker, BreakerKind::Group { .. }));
+            assert!(folding.head == Head::Breaker);
+            assert_eq!(folding.streams_from, [0]);
+        }
+
+        /// The pipeline that ends in a `Converse` pushes its groups to one parent, so a second read
+        /// of the same `Converse` is refused.
+        #[test]
+        fn a_converse_read_by_two_pipelines_is_refused() {
+            let mut nodes = Nodes::default();
+            let source = nodes.filled(keys());
+            let converse = nodes.add(node("Converse", keys(), vec![edge("input", source)]));
+            let groups = nodes.add(node("MapAggregate", keys(), vec![edge("input", converse)]));
+            let mut planner = nodes.planner();
+            planner
+                .pipeline(converse, BreakerKind::Group { aggregate: groups })
+                .expect("the first read");
+            let second = planner
+                .pipeline(converse, BreakerKind::Group { aggregate: groups })
+                .err()
+                .expect("a second read")
+                .to_string();
+            assert!(second.contains("more than one pipeline"), "{second}");
+        }
+
+        /// A collecting pipeline subscribes its chain afresh, which would invert a second time, so
+        /// it does not start at a `Converse`.
+        #[test]
+        fn a_converse_read_by_a_collecting_pipeline_is_refused() {
+            let mut nodes = Nodes::default();
+            let source = nodes.filled(keys());
+            let converse = nodes.add(node("Converse", keys(), vec![edge("input", source)]));
+            let mut planner = nodes.planner();
+            assert!(refused(&mut planner, converse).contains("read by a collecting pipeline"));
         }
 
         /// A `MapAggregate` with no extraction above it is not a group breaker.

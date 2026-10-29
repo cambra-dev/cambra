@@ -6,8 +6,8 @@ use std::iter::repeat_n;
 use super::*;
 use crate::interpreter::operator_graph::value;
 use crate::interpreter::{
-    ColumnValue, Consumer, Extent, Projection, Scheduler, Value, live_keys, shared_consumer,
-    tuple_field,
+    ColumnValue, Consumer, Extent, GatedConsumer, Projection, Scheduler, Value,
+    forwarding_consumer, forwarding_consumer_keeping_keys, live_keys, shared_consumer, tuple_field,
 };
 
 /// Inverts a function operator, producing a lookup-function from codomain to domain.
@@ -77,29 +77,37 @@ impl TileOperator for Converse {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        // TODO(pipeline breaker): a pooled chain stops notifying at this operator. The region of
-        // its input ends here, and the breaker raises its own region to the dispatcher once a
-        // worker has merged a morsel (`docs/parallel-execution.md`, "Pipeline boundaries"). The
-        // serial scheduler still needs the notification passed on below.
         // Beneath standing levels the input's outermost keys are the result's; inverting the
         // outermost collection re-keys.
         let keeps_keys = self.level != CurryLevel::OUTERMOST;
-        Box::new(ConverseProducer {
-            base: ProducerBase::new(
+        let arrivals = Arrivals::new();
+        let (consumer, gate) = shared_consumer(consumer);
+        let input = self.input.subscribe(
+            self.tiling().universal_guard(),
+            arrivals.consumer(match keeps_keys {
+                true => forwarding_consumer_keeping_keys(&consumer),
+                false => forwarding_consumer(&consumer),
+            }),
+            scheduler,
+        );
+        let producer = ConverseProducer::new(
+            ProducerBase::new(
                 ConverseProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
-            input: self.input.subscribe(
-                self.tiling().universal_guard(),
-                consumer_keeping_keys_if(keeps_keys, consumer),
-                scheduler,
-            ),
-            held: Vec::new(),
-            level: self.level,
-            empty_level: self.tiling().values_at(self.level).empty_at_no_rows(),
-        })
+            )
+            .sharing(gate),
+            input,
+            self.level,
+            self.tiling().values_at(self.level).empty_at_no_rows(),
+            arrivals,
+            consumer,
+        );
+        if let Some(operator) = self.operator_id() {
+            scheduler.register_breaker(operator, &producer.breaker);
+        }
+        Box::new(producer)
     }
 
     fn result_correlation(&self) -> Option<Vec<TilePathStep>> {
@@ -108,21 +116,100 @@ impl TileOperator for Converse {
 }
 
 /// Producer for [`Converse`]: inverts a collection into a collection of collections.
-struct ConverseProducer {
-    base: ProducerBase,
+/// What a `Converse` holds between pulls, shared by its producer and its breaker handle: the
+/// producer answers `get`, and the dispatcher drives the breaker. Execution is single-threaded, so
+/// the lock is never contended.
+struct ConverseState {
     /// The upstream producer whose output is inverted.
     input: Box<dyn TileProducer>,
     /// Each input row last read, as the path `[value, key]` it stands at in the output. A
     /// release names output paths, and an input row is released once the path it stands
-    /// at is, which takes its value to read. Kept at the outermost level only.
+    /// at is, which takes its value to read. Kept at the outermost level only, and only in pull
+    /// mode: a sinking `Converse` has released its input's rows as it merged them.
     held: Vec<(Value, Value)>,
     /// The level inverted — see [`Converse::new_at`].
     level: CurryLevel,
     /// The inverted level to answer with where no enclosing row has been reached.
     empty_level: Tile,
+    /// What the input notified since it was last read, which sink mode swallows.
+    arrivals: Arrivals,
+    /// The operator's own consumer, which `finalize` wakes on the terminal round.
+    consumer: GatedConsumer,
+    /// Whether the operator is in sink mode: the dispatcher pulls the input into `rows`, and `get`
+    /// never does.
+    sinking: bool,
+    /// Whether the terminal round has run: in sink mode the input is complete from then, and no
+    /// group is final before.
+    terminal: bool,
+    /// The input rows the dispatcher's pulls merged, a collection over the input's keys.
+    rows: Option<Tile>,
+    /// What the input stated complete when pull mode last answered, which sink mode states again:
+    /// a producer does not withdraw a completion it stated.
+    stated: Predicate,
+    /// The group values, in order, once the terminal round has made every group final.
+    group_keys: Vec<Value>,
+}
+
+struct ConverseBreaker {
+    // shared-state-ok: the operator's own state, shared between its producer and its breaker on
+    // the dispatcher's one thread; no tile passes between operators through it.
+    state: Arc<Mutex<ConverseState>>,
+}
+
+struct ConverseProducer {
+    base: ProducerBase,
+    // shared-state-ok: the operator's own state, shared with its breaker as `ConverseBreaker`
+    // says.
+    state: Arc<Mutex<ConverseState>>,
+    /// The handle the scheduler's registry holds weakly; the producer owns the state it reaches.
+    breaker: BreakerHandle,
 }
 
 impl ConverseProducer {
+    fn new(
+        base: ProducerBase,
+        input: Box<dyn TileProducer>,
+        level: CurryLevel,
+        empty_level: Tile,
+        arrivals: Arrivals,
+        consumer: GatedConsumer,
+    ) -> Self {
+        let state = Arc::new(Mutex::new(ConverseState {
+            input,
+            held: Vec::new(),
+            level,
+            empty_level,
+            arrivals,
+            consumer,
+            sinking: false,
+            terminal: false,
+            rows: None,
+            stated: Predicate::False,
+            group_keys: Vec::new(),
+        }));
+        Self {
+            base,
+            breaker: Arc::new(ConverseBreaker {
+                state: state.clone(),
+            }),
+            state,
+        }
+    }
+
+    /// A producer over `input` with no consumer to wake, for a test.
+    #[cfg(test)]
+    fn detached(
+        base: ProducerBase,
+        input: Box<dyn TileProducer>,
+        level: CurryLevel,
+        empty_level: Tile,
+    ) -> Self {
+        let (consumer, _) = shared_consumer(Box::new(|| {}));
+        Self::new(base, input, level, empty_level, Arrivals::new(), consumer)
+    }
+}
+
+impl ConverseState {
     /// The keys of the held input rows `guard` covers. An input row stands at exactly one
     /// output path, under its own value, so it is released where that path is: under a
     /// released group, or named beneath one.
@@ -132,6 +219,22 @@ impl ConverseProducer {
             .filter(|(value, key)| guard.covers_path(&[value.clone(), key.clone()]))
             .map(|(_, key)| key.clone())
             .collect()
+    }
+
+    /// The input rows a sinking `Converse` inverts: those the dispatcher's pulls merged, stated
+    /// complete as the pulls stated them, as pull mode had, and wholly at the terminal round.
+    fn sunk_input(&self, empty: Tile) -> Tile {
+        let mut rows = self.rows.clone().unwrap_or(empty);
+        if let Tile::DataFunction {
+            domain_predicate, ..
+        } = &mut rows
+        {
+            *domain_predicate = match self.terminal {
+                true => Predicate::True,
+                false => domain_predicate.union(&self.stated),
+            };
+        }
+        rows
     }
 }
 
@@ -291,50 +394,164 @@ fn converse_collection(input_tile: Tile) -> (Tile, Vec<(Value, Value)>) {
     (out, held)
 }
 
+impl Breaker for ConverseBreaker {
+    /// Switches to sink mode. Rows pull mode read stay unreleased at the input until their group is
+    /// released, so the dispatcher's pulls read them again, and `held` is dropped. Only the
+    /// outermost collection is inverted by a breaker.
+    fn begin_sinking(&self) {
+        let mut state = self.state.lock_now();
+        assert!(!state.sinking, "a Converse begins sinking once");
+        assert!(
+            state.level == CurryLevel::OUTERMOST,
+            "only a Converse of the outermost level is a breaker"
+        );
+        state.sinking = true;
+        state.held.clear();
+        // What the input notifies from here is not the downstream's business: it learns of the
+        // groups from `finalize`, on the terminal round.
+        state.arrivals.swallow();
+    }
+
+    /// Pulls the input at `guard`, merges the rows into the table the groups are cut from, and
+    /// releases the input at the guard.
+    fn pull_sink(&self, guard: TileGuard) {
+        let mut state = self.state.lock_now();
+        let st = &mut *state;
+        assert!(st.sinking, "a Converse is pulled after it begins sinking");
+        assert!(
+            !st.terminal,
+            "a Converse is not pulled after its terminal round"
+        );
+        if guard.is_empty() {
+            return;
+        }
+        let mut input = st.input.get(guard.clone());
+        input.compact();
+        match &mut st.rows {
+            Some(rows) => rows.merge(input),
+            none => *none = Some(input),
+        }
+        st.input.release(guard);
+    }
+
+    /// The group values the table holds inside `region`, in order. No group is final before the
+    /// terminal round, so there are none before it.
+    fn first_keys(&self, region: &Predicate, rows: u64) -> Vec<Value> {
+        let state = self.state.lock_now();
+        state
+            .group_keys
+            .iter()
+            .filter(|key| region.contains(key))
+            .take(usize::try_from(rows).unwrap_or(usize::MAX))
+            .cloned()
+            .collect()
+    }
+
+    /// On the terminal round the input is complete: every group is final, so their values are
+    /// pushed, and the consumer wakes. A round before it pushes nothing.
+    fn finalize(&self, round: Round, parents: &mut Pushes<'_>) {
+        if !round.terminal {
+            return;
+        }
+        let (keys, consumer) = {
+            let mut state = self.state.lock_now();
+            assert!(
+                state.sinking,
+                "a Converse finalizes after it begins sinking"
+            );
+            state.terminal = true;
+            let empty = state.input.tiling().empty_tile();
+            let (groups, _) = converse_collection(state.sunk_input(empty));
+            let Tile::DataFunction { domain, .. } = &groups else {
+                panic!("a Converse inverts to a collection, got {groups:?}")
+            };
+            state.group_keys = (0..domain.len()).map(|row| domain.index_at(row)).collect();
+            (state.group_keys.clone(), state.consumer.clone())
+        };
+        if !keys.is_empty() {
+            parents.push(&points(&keys));
+        }
+        consumer.notify(&Projection::Everything);
+    }
+
+    fn held_keys(&self) -> usize {
+        self.state
+            .lock_now()
+            .rows
+            .as_ref()
+            .map_or(0, |rows| rows.cell_count())
+    }
+}
+
 impl TileProducer for ConverseProducer {
     fn state_info(&self) -> ProducerStateInfo {
-        ProducerStateInfo::holding(2 * self.held.len())
+        let state = self.state.lock_now();
+        ProducerStateInfo::holding(
+            2 * state.held.len() + state.rows.as_ref().map_or(0, |rows| rows.cell_count()),
+        )
     }
 
     impl_producer_base!();
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
-        visit("input", &*self.input);
+        visit("input", &*self.state.lock_now().input);
     }
 
     /// Inverting the outermost collection makes the values it holds the keys, and which rows
-    /// carry which value is known only once the rows are read: the input is read whole and the
-    /// groups cut after. The rows a cut group does not name stay unreleased at the input, so a
-    /// later pull reads them again. Beneath standing levels the projection names keys the
+    /// carry which value is known only once the rows are read: in pull mode the input is read
+    /// whole and the groups cut after, and in sink mode the groups are cut from the rows the
+    /// dispatcher's pulls merged. The rows a cut group does not name stay unreleased at the input,
+    /// so a later pull reads them again. Beneath standing levels the projection names keys the
     /// inversion leaves standing, so the input is pulled at it.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        let input_guard = match self.level.enclosing() {
-            None => self.input.tiling().universal_guard(),
-            Some(_) => projection.guard(self.input.tiling()),
+        let tiling = self.tiling().clone();
+        let mut state = self.state.lock_now();
+        let st = &mut *state;
+        drop(st.arrivals.take());
+        if st.sinking {
+            let empty = st.input.tiling().empty_tile();
+            let (mut out, _) = converse_collection(st.sunk_input(empty));
+            if !self.base.obsolete_guard.is_empty() {
+                out.remove_guarded(self.base.obsolete_guard.clone());
+            }
+            out.restrict_to(&projection, &tiling);
+            return out;
+        }
+        let input_guard = match st.level.enclosing() {
+            None => st.input.tiling().universal_guard(),
+            Some(_) => projection.guard(st.input.tiling()),
         };
-        let input_tile = self.input.get(input_guard);
-        let mut out = match self.level.enclosing() {
+        let input_tile = st.input.get(input_guard);
+        let mut out = match st.level.enclosing() {
             None => {
                 debug_assert!(
                     matches!(&input_tile, Tile::DataFunction { row_starts, .. } if row_starts.len() == 1),
                     "converse inverts one mapping, so its input is one collection: {input_tile:?}"
                 );
+                if let Tile::DataFunction {
+                    domain_predicate, ..
+                } = &input_tile
+                {
+                    st.stated = domain_predicate.clone();
+                }
                 let (out, held) = converse_collection(input_tile);
-                self.held = held;
+                st.held = held;
                 out
             }
             // Beneath standing levels each enclosing row's group is inverted on its own:
             // a row's group is a collection in its own right, as it is for `Uncurry`.
             Some(_) => {
-                input_tile.regroup_beneath(self.level, self.empty_level.clone(), &mut |row| {
-                    match input_tile.group_at(self.level, row) {
-                        Some(group) => converse_collection(group.into_owned()).0,
-                        None => self.empty_level.clone(),
-                    }
+                let empty_level = st.empty_level.clone();
+                let level = st.level;
+                input_tile.regroup_beneath(level, empty_level.clone(), &mut |row| match input_tile
+                    .group_at(level, row)
+                {
+                    Some(group) => converse_collection(group.into_owned()).0,
+                    None => empty_level.clone(),
                 })
             }
         };
@@ -345,42 +562,52 @@ impl TileProducer for ConverseProducer {
         // before the row arrived, so nothing else frees it.
         if !self.base.obsolete_guard.is_empty() {
             let released = self.base.obsolete_guard.clone();
-            let late = self.held_rows_covered(&released);
+            let late = st.held_rows_covered(&released);
             if !late.is_empty() {
                 let rows = late.into_iter().fold(Predicate::False, |all, key| {
                     all.union(&Predicate::point(key))
                 });
-                self.input
+                st.input
                     .release(TileGuard::Function(FunctionGuard::Domain(rows)));
             }
             out.remove_guarded(released);
         }
-        out.restrict_to(&projection, self.tiling());
+        out.restrict_to(&projection, &tiling);
         out
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        if self.level != CurryLevel::OUTERMOST {
+        let mut state = self.state.lock_now();
+        let st = &mut *state;
+        if st.level != CurryLevel::OUTERMOST {
             // The levels above 𝐿 stand, and 𝐿's keys become values. Part of an enclosing row's
             // inversion names input rows by their values, which the outermost converse tracks
             // as `held` and a nested one does not yet.
             let input_guard = crate::interpreter::tiling::through_standing_levels(
                 obsolete_guard,
-                self.level.index(),
-                self.input.tiling(),
+                st.level.index(),
+                st.input.tiling(),
                 &mut |inverted| {
                     todo!(
                         "a nested Converse cannot yet release part of a row's inversion: {inverted:?}"
                     )
                 },
             );
-            return self.input.release(input_guard);
+            return st.input.release(input_guard);
+        }
+        if st.sinking {
+            // The input released its rows as the pulls merged them, and what is cut from the table
+            // is the producer's own `obsolete_guard`. Nothing more is held for a universal release.
+            if obsolete_guard.is_universal() {
+                st.rows = None;
+            }
+            return;
         }
         let released = match obsolete_guard {
             g if g.is_universal() => {
-                return self.input.release(self.input.tiling().universal_guard());
+                return st.input.release(st.input.tiling().universal_guard());
             }
-            ref g => self.held_rows_covered(g),
+            ref g => st.held_rows_covered(g),
         };
         // A held row the guard covers is released here, and a row arriving later through the
         // late-row release in `get_impl`, once its value says which group it joins. This adds
@@ -406,7 +633,7 @@ impl TileProducer for ConverseProducer {
             .fold(under_every_group(&obsolete_guard), |all, key| {
                 all.union(&Predicate::point(key))
             });
-        self.input
+        st.input
             .release(TileGuard::Function(FunctionGuard::Domain(rows)));
     }
 }
@@ -2428,13 +2655,12 @@ mod tests {
                 Tiling::data_function(domain.clone(), Tiling::Scalar(domain)),
             )
         };
-        let mut producer = ConverseProducer {
-            base: ProducerBase::unowned(ConverseProducer::alloc_id(), &output_tiling),
-            input: Box::new(TestTileProducer::new(input_tile, input_tiling)),
-            held: Vec::new(),
-            level: CurryLevel::OUTERMOST,
-            empty_level: output_tiling.empty_at_no_rows(),
-        };
+        let mut producer = ConverseProducer::detached(
+            ProducerBase::unowned(ConverseProducer::alloc_id(), &output_tiling),
+            Box::new(TestTileProducer::new(input_tile, input_tiling)),
+            CurryLevel::OUTERMOST,
+            output_tiling.empty_at_no_rows(),
+        );
         producer.get(producer.tiling().universal_guard())
     }
 
@@ -2466,13 +2692,12 @@ mod tests {
             ),
         );
         let (input, next) = ScriptedProducer::new(input_at(vec![0], vec![10]), one_level_tiling());
-        let mut producer = ConverseProducer {
-            base: ProducerBase::unowned(ConverseProducer::alloc_id(), &output_tiling),
-            input: Box::new(input),
-            held: Vec::new(),
-            level: CurryLevel::OUTERMOST,
-            empty_level: output_tiling.empty_at_no_rows(),
-        };
+        let mut producer = ConverseProducer::detached(
+            ProducerBase::unowned(ConverseProducer::alloc_id(), &output_tiling),
+            Box::new(input),
+            CurryLevel::OUTERMOST,
+            output_tiling.empty_at_no_rows(),
+        );
         let _ = producer.get(producer.tiling().universal_guard());
         producer.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::point(Value::Int(10)),
@@ -2487,7 +2712,7 @@ mod tests {
         assert_eq!(domain, &ColumnValue::Ints(vec![20]), "{out:?}");
         // The release of group 10 reached `release_impl` before row 1 arrived, so the pull
         // that first holds row 1 is what releases it, and row 2's group is still live.
-        let upstream = producer.input.obsolete_guard();
+        let upstream = producer.state.lock_now().input.obsolete_guard().clone();
         assert!(
             upstream.covers_path(&[Value::Int(1)]) && !upstream.covers_path(&[Value::Int(2)]),
             "{upstream:?}"
@@ -2525,15 +2750,14 @@ mod tests {
             int(),
             Tiling::data_function(int(), Tiling::data_function(int(), Tiling::Scalar(int()))),
         );
-        ConverseProducer {
-            base: ProducerBase::unowned(ConverseProducer::alloc_id(), &output_tiling),
-            input: Box::new(TestTileProducer::new(tile, tiling)),
-            held: Vec::new(),
-            level: CurryLevel::new(1),
-            empty_level: output_tiling
+        ConverseProducer::detached(
+            ProducerBase::unowned(ConverseProducer::alloc_id(), &output_tiling),
+            Box::new(TestTileProducer::new(tile, tiling)),
+            CurryLevel::new(1),
+            output_tiling
                 .values_at(CurryLevel::new(1))
                 .empty_at_no_rows(),
-        }
+        )
     }
 
     fn nested_map_domain() -> MapDomainProducer {
@@ -2607,7 +2831,7 @@ mod tests {
         converse.release(TileGuard::Function(FunctionGuard::Domain(
             Predicate::point(Value::Int(1)),
         )));
-        let upstream = converse.input.obsolete_guard();
+        let upstream = converse.state.lock_now().input.obsolete_guard().clone();
         assert!(upstream.covers_path(&[Value::Int(1)]), "{upstream:?}");
         assert!(!upstream.covers_path(&[Value::Int(2)]), "{upstream:?}");
     }
@@ -3985,18 +4209,125 @@ mod converse_projection_tests {
         let (keys, pulled, released) =
             ProjectionSpy::new(ints_by_position(&GROUPS, true), in_tiling);
         (
-            ConverseProducer {
-                base: ProducerBase::unowned(ConverseProducer::alloc_id(), &groups_tiling()),
-                input: Box::new(keys),
-                held: Vec::new(),
-                level: CurryLevel::OUTERMOST,
-                empty_level: groups_tiling()
+            ConverseProducer::detached(
+                ProducerBase::unowned(ConverseProducer::alloc_id(), &groups_tiling()),
+                Box::new(keys),
+                CurryLevel::OUTERMOST,
+                groups_tiling()
                     .values_at(CurryLevel::OUTERMOST)
                     .empty_at_no_rows(),
-            },
+            ),
             pulled,
             released,
         )
+    }
+
+    /// A sinking `Converse` over the morsels `ranges`, with the terminal round run, answers the
+    /// groups a pulling one answers over the whole input.
+    fn sunk(ranges: &[(u64, u64)]) -> (ConverseProducer, GuardLog, GuardLog) {
+        let (producer, pulled, released) = bucketize();
+        producer.breaker.begin_sinking();
+        for (first, last) in ranges {
+            producer.breaker.pull_sink(keys_between(*first, *last));
+        }
+        (producer, pulled, released)
+    }
+
+    /// The terminal round's effect on the state, which a `Pushes` handle would drive: the groups
+    /// are final.
+    fn make_terminal(producer: &ConverseProducer) {
+        let mut state = producer.state.lock_now();
+        state.terminal = true;
+    }
+
+    /// A sinking `Converse` inverts the rows its pulls merged, in any order, to the groups a pulling
+    /// one reads whole, once the input is complete.
+    #[test]
+    fn a_sinking_converse_inverts_the_merged_morsels_as_a_pulling_one_does() {
+        let (mut pulling, _, _) = bucketize();
+        let mut whole = pulling.get(pulling.tiling().universal_guard());
+        whole.compact();
+        let (mut sinking, _, _) = sunk(&[(4, 7), (0, 3)]);
+        make_terminal(&sinking);
+        let mut inverted = sinking.get(sinking.tiling().universal_guard());
+        inverted.compact();
+        assert_eq!(members_by_group(&inverted), members_by_group(&whole));
+        assert!(inverted.is_terminal() && whole.is_terminal());
+    }
+
+    /// No group is final before the terminal round: the outermost level states nothing complete,
+    /// though the members the pulls merged are there.
+    #[test]
+    fn a_sinking_converse_states_no_group_final_before_the_terminal_round() {
+        let (mut sinking, _, _) = sunk(&[(0, 3)]);
+        let early = sinking.get(sinking.tiling().universal_guard());
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &early
+        else {
+            panic!("a collection")
+        };
+        assert!(!domain_predicate.is_true(), "no group is final yet");
+        assert!(!early.is_terminal());
+    }
+
+    /// A sinking `Converse` never pulls its input from `get`, and pulls and releases it at each
+    /// morsel.
+    #[test]
+    fn a_sinking_converse_never_pulls_its_input_from_get() {
+        let (mut sinking, pulled, released) = sunk(&[(0, 3)]);
+        sinking.get(sinking.tiling().universal_guard());
+        assert_eq!(*pulled.lock_now(), [keys_between(0, 3)]);
+        assert_eq!(*released.lock_now(), [keys_between(0, 3)]);
+    }
+
+    /// The group values a sinking `Converse` pushes are those of the rows it merged, in order, and
+    /// are listed only from the terminal round.
+    #[test]
+    fn a_sinking_converse_lists_its_group_values_once_the_groups_are_final() {
+        let (sinking, _, _) = sunk(&[(0, 7)]);
+        let region = Predicate::True;
+        assert!(sinking.breaker.first_keys(&region, 10).is_empty());
+        let mut state = sinking.state.lock_now();
+        state.terminal = true;
+        let empty = state.input.tiling().empty_tile();
+        let (groups, _) = converse_collection(state.sunk_input(empty));
+        let Tile::DataFunction { domain, .. } = &groups else {
+            panic!("a collection")
+        };
+        state.group_keys = (0..domain.len()).map(|row| domain.index_at(row)).collect();
+        drop(state);
+        assert_eq!(
+            sinking.breaker.first_keys(&region, 2),
+            [Value::Int(1), Value::Int(2)]
+        );
+        assert_eq!(
+            sinking.breaker.first_keys(&groups_region(&[3]), 5),
+            [Value::Int(3)]
+        );
+    }
+
+    fn groups_region(keys: &[i64]) -> Predicate {
+        keys.iter()
+            .map(|k| Predicate::point(Value::Int(*k)))
+            .fold(Predicate::False, |all, one| all.union(&one))
+    }
+
+    /// What a pulling `Converse` read is read again by the pulls after the switch, and a completion
+    /// it stated is not withdrawn.
+    #[test]
+    fn the_switch_to_sink_mode_reads_the_rows_again_and_withdraws_no_completion() {
+        let (mut converse, _, _) = bucketize();
+        converse.get(converse.tiling().universal_guard());
+        converse.breaker.begin_sinking();
+        converse.breaker.pull_sink(keys_between(0, 7));
+        let answer = converse.get(converse.tiling().universal_guard());
+        assert_eq!(members_by_group(&answer).len(), 3);
+        assert!(answer.is_terminal(), "the input had stated itself complete");
+        assert!(
+            converse.state.lock_now().held.is_empty(),
+            "the rows pull mode held are read again, not kept"
+        );
     }
 
     fn groups(keys: &[i64]) -> TileGuard {
@@ -4051,7 +4382,7 @@ mod converse_projection_tests {
         );
         assert_eq!(
             *pulled.lock_now(),
-            [converse.input.tiling().universal_guard()]
+            [converse.state.lock_now().input.tiling().universal_guard()]
         );
     }
 
@@ -4114,13 +4445,12 @@ mod converse_projection_tests {
         let make = || {
             let (input, pulled, _) = ProjectionSpy::new(rows.clone(), in_tiling.clone());
             (
-                ConverseProducer {
-                    base: ProducerBase::unowned(ConverseProducer::alloc_id(), &out),
-                    input: Box::new(input),
-                    held: Vec::new(),
-                    level: CurryLevel::new(1),
-                    empty_level: out.values_at(CurryLevel::new(1)).empty_at_no_rows(),
-                },
+                ConverseProducer::detached(
+                    ProducerBase::unowned(ConverseProducer::alloc_id(), &out),
+                    Box::new(input),
+                    CurryLevel::new(1),
+                    out.values_at(CurryLevel::new(1)).empty_at_no_rows(),
+                ),
                 pulled,
             )
         };

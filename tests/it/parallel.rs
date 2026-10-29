@@ -188,12 +188,12 @@ fn the_plan_reads_the_fold_off_the_extract() {
 #[test]
 fn a_program_with_another_breaker_is_not_a_morsel_pipeline() {
     let mut ctx = GlobalContext::default();
-    let loaded = LoadedProgram::test("[sum(g) for g in groupby([1, 2, 3, 4], \\x -> x // 2)]");
+    let loaded = LoadedProgram::test("[y + 1 for y in [1, 5] ++ [3, 4]]");
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     let compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
     let refused = plan_inline(&compiled.operator_graph)
         .err()
-        .expect("a group-by has breakers the pool does not run");
+        .expect("a union is an operator the pool does not run");
     assert!(
         refused.to_string().contains("is not a streaming operator"),
         "{refused}"
@@ -317,13 +317,13 @@ fn a_refused_live_program_keeps_its_producer_and_an_admitted_one_is_driven_by_th
     assert_eq!(entries(&tile), pulled_whole(8));
 
     let mut ctx = GlobalContext::default();
-    let grouped = "[sum(g) for g in groupby([1, 2, 3, 4], \\x -> x // 2)]";
+    let grouped = "[y + 1 for y in [1, 5] ++ [3, 4]]";
     let mut live =
         LiveProgram::start(&mut ctx, &LoadedProgram::test(grouped), &no_main).expect("compiles");
     live.start_inline(MAIN_BRANCH, &mut ctx, &config)
         .expect("the branch exists")
         .err()
-        .expect("a group-by is not a morsel pipeline");
+        .expect("a union is not a morsel pipeline");
     assert!(
         live.main_producer_mut(MAIN_BRANCH).is_some(),
         "a refused program keeps the producer the scheduler loop drives"

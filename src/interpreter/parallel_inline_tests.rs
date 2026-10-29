@@ -168,18 +168,15 @@ mod inline {
     #[test]
     fn a_refused_program_keeps_its_producer() {
         let mut ctx = GlobalContext::default();
-        let mut program = compiled(
-            &mut ctx,
-            "[sum(g) for g in groupby([1, 2, 3, 4], \\x -> x // 2)]",
-        );
+        let mut program = compiled(&mut ctx, "3 + 1");
         let mut held = program.main_mut().and_then(|o| o.producer.take());
         let config = Config { morsel_rows: 4 };
         let refused = PooledRun::start(&mut ctx, &mut program, &mut held, &config, Box::new(|| {}))
             .err()
-            .expect("a group-by is not a pipeline");
-        assert!(refused.to_string().contains("is not a streaming operator"));
+            .expect("a constant is not a pipeline");
+        assert!(refused.to_string().contains("no source of rows"));
         let mut held = held.expect("the producer the loop drives is kept");
-        let code = "[sum(g) for g in groupby([1, 2, 3, 4], \\x -> x // 2)]";
+        let code = "3 + 1";
         let mut tile =
             crate::interpreter::pull_laps(ctx.scheduler(), &mut *held, 1024, Tile::is_terminal);
         let mut expected = serial(code);
@@ -880,5 +877,41 @@ mod inline {
             panic!("a scalar sum")
         };
         assert_eq!(sum, [100]);
+    }
+
+    /// A group-by is two pipelines that end in the `Converse` and in the grouped fold, and `main`
+    /// answers as the serial loop does at morsel sizes that do and do not divide the groups.
+    #[test]
+    fn a_group_by_equals_the_serial_answer() {
+        for items in [1, 4, 9, 20] {
+            let code = formatdoc! {"
+                [sum(g) for g in groupby({}, \\x -> x // 3)]
+            ", list(items)};
+            for morsel_rows in [1, 2, 7] {
+                assert_eq!(
+                    entries_by_group(&inline(&code, morsel_rows)),
+                    entries_by_group(&serial(&code)),
+                    "{items} items, {morsel_rows}-row morsels"
+                );
+            }
+        }
+    }
+
+    /// The groups of a collection of sums as `(key, sum)` pairs, whatever order they are held in.
+    fn entries_by_group(tile: &Tile) -> Vec<(Value, i64)> {
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = tile
+        else {
+            panic!("a collection, got {tile:?}")
+        };
+        let Tile::Scalar(crate::interpreter::ColumnValue::Ints(sums)) = codomain.as_ref() else {
+            panic!("sums, got {tile:?}")
+        };
+        let mut pairs: Vec<(Value, i64)> = (0..domain.len())
+            .map(|row| (domain.index_at(row), sums[row]))
+            .collect();
+        pairs.sort_by(|a, b| a.partial_cmp(b).expect("keys compare"));
+        pairs
     }
 }

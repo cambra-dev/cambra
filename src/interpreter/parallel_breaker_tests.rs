@@ -801,6 +801,69 @@ mod breakers {
         assert_eq!(flags(&producer.get(universal)), [true; 4]);
     }
 
+    /// A `Converse` in sink mode swallows what its input notifies, lists its group values and wakes
+    /// its consumer from the terminal round only: no group is final before it.
+    #[test]
+    fn a_sinking_converse_lists_groups_and_notifies_at_the_terminal_round_only() {
+        use crate::interpreter::tile_operators::test_helpers::{
+            NotifyingOp, ints_by_position, keys_between, notify_input,
+        };
+        use crate::interpreter::tile_operators::{Converse, TileOperator};
+        use crate::interpreter::{BaseType, Extent, Projection};
+        let tiling = Tiling::data_function(
+            Extent::uint_range(8),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let (input, notifier) = NotifyingOp::new(
+            ints_by_position(&[1, 2, 1, 3, 2, 1, 3, 2], true),
+            tiling.clone(),
+        );
+        let mut converse = Converse::new(Box::new(input));
+        let mut scheduler = Scheduler::new();
+        let woken = Arc::new(Mutex::new(0usize));
+        let counter = woken.clone();
+        let _producer = converse.subscribe(
+            converse.tiling().empty_guard(),
+            Box::new(move || *counter.lock_now() += 1),
+            &mut scheduler,
+        );
+        let handle = scheduler
+            .breaker(converse.operator_id().expect("an identity"))
+            .expect("registered");
+        handle.begin_sinking();
+        notify_input(
+            &notifier,
+            &Projection::of(&keys_between(0, 3)).expect("keys"),
+        );
+        assert_eq!(
+            *woken.lock_now(),
+            0,
+            "the input's notification is swallowed"
+        );
+
+        let arrivals = Arrivals::new();
+        let dispatcher = Dispatcher::new(vec![arrivals.spec(Some(handle.clone()))], 4);
+        let mut state = dispatcher.serve_state();
+        arrivals.deliver(&dispatcher, 0, 0, 7);
+        serve(&dispatcher, &mut state);
+        assert_eq!(*woken.lock_now(), 0, "a round before the end wakes nobody");
+        assert!(
+            handle.first_keys(&Predicate::True, 9).is_empty(),
+            "no group is final before the terminal round"
+        );
+        dispatcher.close(PipelineId(0));
+        serve(&dispatcher, &mut state);
+        assert_eq!(*woken.lock_now(), 1, "the terminal round woke the consumer");
+        assert_eq!(
+            handle.first_keys(&Predicate::True, 9),
+            [
+                crate::interpreter::Value::Int(1),
+                crate::interpreter::Value::Int(2),
+                crate::interpreter::Value::Int(3)
+            ]
+        );
+    }
+
     /// The keys a memo adopted from its pull-mode cache reach the parent although no morsel is
     /// delivered and the source stays open: the memo's first round pushes them.
     #[test]

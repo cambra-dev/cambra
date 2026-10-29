@@ -1079,7 +1079,27 @@ inline driver has sink mode only.
    grouped fold off the two nodes. Terminal at every round, not notifying, not swallowing, pulling
    from `get`, withdrawing a completion, not releasing and not recognising the group each fail a
    named test.
-7. `Converse`, with a test of a probe that reads the table of one round and then of the next.
+7. `Converse`. The outermost `Converse`'s producer is a breaker (`ConverseBreaker`) over the table of
+   rows its pulls merged: `pull_sink` pulls the input at the guard, merges the rows and releases
+   the input at the guard; `get` inverts the table with the same `converse_collection` pull mode
+   uses, states no group final before the terminal round and every group final at it; `finalize`
+   on the terminal round lists the group values, pushes them to the parent pipeline and wakes the
+   consumer; `first_keys` cuts the parent's morsels from that list. A switch from pull mode drops
+   `held`, since the rows pull mode read are still unreleased at the input and the pulls read them
+   again, and the next answer does not withdraw what pull mode stated complete. The plan cuts at a
+   `Converse` as it cuts at a `FanOutSlot`: the pipeline that ends in it is `BreakerKind::Invert`,
+   and the pipeline that reads its groups is a `Head::Breaker` pipeline over it. A `Converse` is
+   refused when a collecting pipeline reads it, because that pipeline subscribes its chain afresh and
+   would invert a second time; when it is read by more than one pipeline; and when it inverts a level
+   beneath enclosing rows. Programs the plan now admits are pinned; the corpus grows from 160 to 173
+   programs, and `dispatch_admitted.txt` lists each. Tests: a sinking `Converse` inverts merged
+   morsels in any order as a pulling one does, states no group final before the terminal round, never
+   pulls its input from `get` and releases it at each morsel, lists its group values and wakes its
+   consumer at the terminal round only, and re-reads at the switch without withdrawing a completion;
+   the plan cuts a grouped fold at its `Converse` and refuses the three shapes above; a group-by
+   equals the serial answer at three morsel sizes. Terminal at every round, not notifying, not
+   swallowing, ignoring sink mode, withdrawing a completion, not releasing, keeping `held`, reading a
+   `Converse` from a collecting pipeline or twice, and listing no group each fail a named test.
 8. `ExtractFinal`.
 9. The program sink pulls the last breaker's producer; delete `BreakerOutput` and `Materialized`.
 10. Delete the cut, `visit_inputs_mut`, the reader records and `inherits`, and the sections of this
