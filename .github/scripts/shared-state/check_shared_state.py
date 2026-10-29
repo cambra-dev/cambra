@@ -111,6 +111,8 @@ EXPECTED_EXCEPTIONS = [
     # breaker as a memo's is.
     ("src/interpreter/tile_operators/aggregate.rs", "shared cell of `AggregateState`"),
     ("src/interpreter/tile_operators/aggregate.rs", "shared cell of `AggregateState`"),
+    ("src/interpreter/tile_operators/aggregate.rs", "shared cell of `MapAggregateState`"),
+    ("src/interpreter/tile_operators/aggregate.rs", "shared cell of `MapAggregateState`"),
     ("src/interpreter/parallel.rs", "cell of `Rounds`"),
     ("src/interpreter/parallel.rs", "shared cell of `SinkConsumer`"),
     # The pool's breakers: the collection the driver merges into, and the fold's partial

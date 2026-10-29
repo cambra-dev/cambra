@@ -723,10 +723,82 @@ mod breakers {
         let Tile::Aggregation { accumulator, .. } = tile else {
             panic!("an aggregation")
         };
-        assert_eq!(
-            *accumulator,
-            Tile::Scalar(ColumnValue::Ints(vec![28]))
+        assert_eq!(*accumulator, Tile::Scalar(ColumnValue::Ints(vec![28])));
+    }
+
+    /// A `MapAggregate` in sink mode swallows what its input notifies, states a group terminal at
+    /// the terminal round and not before, and wakes its consumer from that round.
+    #[test]
+    fn a_sinking_map_aggregate_is_terminal_and_notifies_at_the_terminal_round_only() {
+        use crate::ccl::AggregateKind;
+        use crate::interpreter::tile_operators::test_helpers::{
+            NotifyingOp, keys_between, notify_input,
+        };
+        use crate::interpreter::tile_operators::{MapAggregate, TileOperator};
+        use crate::interpreter::{BaseType, ColumnValue, CurryLevel, Extent, Projection};
+        use bit_set::BitSet;
+        let (uint, int) = (
+            || Extent::Base(BaseType::UInt),
+            || Extent::Base(BaseType::Int),
         );
+        let in_tiling = Tiling::data_function(
+            Extent::uint_range(4),
+            Tiling::data_function(uint(), Tiling::Scalar(int())),
+        );
+        let groups = Tile::data_function(
+            ColumnValue::from_uints(vec![0, 1, 2, 3]),
+            Box::new(Tile::grouped(
+                vec![0, 2, 3, 5],
+                ColumnValue::from_uints(vec![0, 1, 0, 0, 1, 0]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 4, 5, 6]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let (input, notifier) = NotifyingOp::new(groups, in_tiling);
+        let mut sums = MapAggregate::new(Box::new(input), AggregateKind::Sum);
+        let mut scheduler = Scheduler::new();
+        let woken = Arc::new(Mutex::new(0usize));
+        let counter = woken.clone();
+        let mut producer = sums.subscribe(
+            sums.tiling().empty_guard(),
+            Box::new(move || *counter.lock_now() += 1),
+            &mut scheduler,
+        );
+        let handle = scheduler
+            .breaker(sums.operator_id().expect("an identity"))
+            .expect("registered");
+        handle.begin_sinking();
+        notify_input(
+            &notifier,
+            &Projection::of(&keys_between(0, 1)).expect("keys"),
+        );
+        assert_eq!(
+            *woken.lock_now(),
+            0,
+            "the input's notification is swallowed"
+        );
+
+        let arrivals = Arrivals::new();
+        let dispatcher = Dispatcher::new(vec![arrivals.spec(Some(handle))], 2);
+        let mut state = dispatcher.serve_state();
+        arrivals.deliver(&dispatcher, 0, 0, 3);
+        serve(&dispatcher, &mut state);
+        assert_eq!(*woken.lock_now(), 0, "a round before the end wakes nobody");
+        let universal = sums.tiling().universal_guard();
+        let flags = |tile: &Tile| {
+            let Tile::Aggregation { terminal, .. } = tile.values_at(CurryLevel::new(1)) else {
+                panic!("an aggregation beneath the keys")
+            };
+            terminal.as_bools().expect("bools").to_vec()
+        };
+        assert_eq!(flags(&producer.get(universal.clone())), [false; 4]);
+        dispatcher.close(PipelineId(0));
+        serve(&dispatcher, &mut state);
+        assert_eq!(*woken.lock_now(), 1, "the terminal round woke the consumer");
+        assert_eq!(flags(&producer.get(universal)), [true; 4]);
     }
 
     /// The keys a memo adopted from its pull-mode cache reach the parent although no morsel is

@@ -1063,8 +1063,22 @@ inline driver has sink mode only.
    source is terminal when the source ends. Terminal at every round, not notifying, not swallowing,
    not releasing, pulling from `get`, not switching and not polling each fail a named test. The
    corpus runs the folds at the pinned count.
-6. `MapAggregate` and `MapExtractAggregate`, with a test that a group is terminal only at the
-   terminal round.
+6. `MapAggregate` and `MapExtractAggregate`. `MapAggregate`'s producer is a breaker
+   (`MapAggregateBreaker`) over a group table: `pull_sink` pulls the input at the guard, folds each
+   group and releases the input at the guard; `get` builds the answer from the table, and states
+   every group terminal at the terminal round and none before, keeping what pull mode had stated at
+   the switch; `finalize` wakes the consumer on the terminal round; `first_keys` answers no key, since
+   a group is final only with the input and what reads the groups reads them through `get`. A
+   `MapExtractAggregate` over a `MapAggregate` at the top of `main` is `BreakerKind::Group`, as an
+   `ExtractAggregate` over an `Aggregate` is a fold: `main` stays the program's own producer. The
+   corpus admits no new program from this step alone, because every program that groups reads a
+   `Converse`, which step 7 admits. Tests: a sinking `MapAggregate` sums its morsels as a pulling one
+   does and states no group terminal; never pulls its input from `get` and releases it at each
+   morsel; adopts the groups at the switch without withdrawing a completion; swallows its input's
+   notification and is terminal and wakes its consumer at the terminal round only; the plan reads a
+   grouped fold off the two nodes. Terminal at every round, not notifying, not swallowing, pulling
+   from `get`, withdrawing a completion, not releasing and not recognising the group each fail a
+   named test.
 7. `Converse`, with a test of a probe that reads the table of one round and then of the next.
 8. `ExtractFinal`.
 9. The program sink pulls the last breaker's producer; delete `BreakerOutput` and `Materialized`.

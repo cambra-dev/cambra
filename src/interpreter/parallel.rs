@@ -135,7 +135,9 @@ impl BreakerKind {
     pub(crate) fn node(&self) -> Option<NodeId> {
         match self {
             BreakerKind::Collect => None,
-            BreakerKind::Fold { aggregate, .. } => Some(*aggregate),
+            BreakerKind::Fold { aggregate, .. } | BreakerKind::Group { aggregate } => {
+                Some(*aggregate)
+            }
             BreakerKind::Materialize { memo } => Some(*memo),
         }
     }
@@ -154,6 +156,13 @@ pub enum BreakerKind {
         /// The accumulator's tiling.
         accumulator: Tiling,
         /// The `Aggregate` the pipeline ends in.
+        aggregate: NodeId,
+    },
+    /// A `MapAggregate` read by a `MapExtractAggregate` into `main`: the operator's own producer,
+    /// switched to sink mode, is the breaker of the pipeline, and `main` stays the program's own
+    /// producer.
+    Group {
+        /// The `MapAggregate` the pipeline ends in.
         aggregate: NodeId,
     },
     /// The input of a `Memo`: the rows the pipelines that read it stream from.
@@ -196,6 +205,10 @@ enum Class {
     Extract,
     /// The fold an extract reads.
     Fold,
+    /// The `MapExtractAggregate` over a grouped fold at the top of `main`.
+    ExtractGroups,
+    /// The grouped fold an `ExtractGroups` reads.
+    Groups,
     /// An operator the plan does not admit, and the reason.
     Refuse(String),
 }
@@ -214,6 +227,8 @@ fn classify(kind: &str) -> Class {
         "Constant" => Class::Operand,
         "ExtractAggregate" => Class::Extract,
         "Aggregate" => Class::Fold,
+        "MapExtractAggregate" => Class::ExtractGroups,
+        "MapAggregate" => Class::Groups,
         other => Class::Refuse(format!("`{other}` is not a streaming operator here")),
     }
 }
@@ -305,6 +320,22 @@ impl Planner<'_> {
                 aggregate: edge.subscribed,
             };
             return (fold, fold_edge.subscribed);
+        }
+        if let Some(GraphNode::Operator { kind, inputs, .. }) = self.by_id.get(&top)
+            && matches!(classify(kind), Class::ExtractGroups)
+            && let [edge] = inputs.as_slice()
+            && let Some(GraphNode::Operator {
+                kind: group_kind,
+                inputs: group_inputs,
+                ..
+            }) = self.by_id.get(&edge.subscribed)
+            && matches!(classify(group_kind), Class::Groups)
+            && let [group_edge] = group_inputs.as_slice()
+        {
+            let group = BreakerKind::Group {
+                aggregate: edge.subscribed,
+            };
+            return (group, group_edge.subscribed);
         }
         (BreakerKind::Collect, top)
     }
@@ -439,7 +470,11 @@ impl Planner<'_> {
                         "a `Constant` is read whole by the operator that applies it and is no source of rows".into(),
                     ));
                 }
-                Class::Memo | Class::Extract | Class::Fold => {
+                Class::Memo
+                | Class::Extract
+                | Class::Fold
+                | Class::ExtractGroups
+                | Class::Groups => {
                     return Err(Unsupported(format!(
                         "`{kind}` is not a streaming operator here"
                     )));
@@ -1898,7 +1933,7 @@ fn sunk_breakers(
         // aggregate's is its input's.
         let pulled = match &pipeline.breaker {
             BreakerKind::Materialize { .. } => node_tiling(&node)?,
-            BreakerKind::Fold { .. } => {
+            BreakerKind::Fold { .. } | BreakerKind::Group { .. } => {
                 let mut input = None;
                 for graph_node in program.operator_graph.nodes() {
                     if let GraphNode::Operator { id, inputs, .. } = graph_node
@@ -1989,7 +2024,7 @@ impl PooledRun {
             // A fold's pipeline ends in the aggregate's own producer, so `main`'s producer stays
             // the program's; any other `main` is answered from the pool's output.
             match plan.main().breaker {
-                BreakerKind::Fold { .. } => kept_main = producer,
+                BreakerKind::Fold { .. } | BreakerKind::Group { .. } => kept_main = producer,
                 _ => drop(producer),
             }
         }
@@ -2039,7 +2074,7 @@ impl PooledRun {
                 let tiling = output.op.tiling().clone();
                 match plan.main().breaker {
                     BreakerKind::Collect => start_chain(Some((&mut output.op, tiling))),
-                    BreakerKind::Fold { .. } => start_chain(None),
+                    BreakerKind::Fold { .. } | BreakerKind::Group { .. } => start_chain(None),
                     BreakerKind::Materialize { .. } => unreachable!("`main` is not a memo's input"),
                 }
             }
@@ -2210,7 +2245,9 @@ fn start_planned(
                     .expect("a collecting pipeline ends in an output")
             };
             let (chain, breaker): (&mut dyn TileOperator, PoolBreaker) = match &pipeline.breaker {
-                BreakerKind::Materialize { .. } | BreakerKind::Fold { .. } => {
+                BreakerKind::Materialize { .. }
+                | BreakerKind::Fold { .. }
+                | BreakerKind::Group { .. } => {
                     let placeholder = placeholder_refs
                         .remove(&position)
                         .expect("a breaker pipeline has its placeholder");
@@ -2780,7 +2817,12 @@ mod tests {
         for kind in kinds {
             match classify(kind) {
                 Class::Streaming(_) | Class::Source | Class::Cut => admitted.push(kind),
-                Class::Memo | Class::Operand | Class::Extract | Class::Fold => {}
+                Class::Memo
+                | Class::Operand
+                | Class::Extract
+                | Class::Fold
+                | Class::ExtractGroups
+                | Class::Groups => {}
                 Class::Refuse(reason) => assert!(
                     reason.contains(kind),
                     "a refusal names the operator it refuses: {reason}"
@@ -3021,6 +3063,42 @@ mod tests {
                 .pipeline(top, BreakerKind::Collect)
                 .expect_err("the plan refuses the chain")
                 .to_string()
+        }
+
+        /// A `MapExtractAggregate` over a `MapAggregate` at the top of an output is a grouped fold
+        /// whose pipeline ends in the `MapAggregate` and starts at its input.
+        #[test]
+        fn a_map_extract_over_a_map_aggregate_is_a_group_breaker() {
+            let mut nodes = Nodes::default();
+            let source = nodes.filled(keys());
+            let groups = nodes.add(node("MapAggregate", keys(), vec![edge("input", source)]));
+            let extract = nodes.add(node(
+                "MapExtractAggregate",
+                keys(),
+                vec![edge("input", groups)],
+            ));
+            let planner = nodes.planner();
+            let (breaker, chain) = planner.breaker_at(extract);
+            assert!(
+                matches!(breaker, BreakerKind::Group { aggregate } if aggregate == groups),
+                "the group breaker names the `MapAggregate`"
+            );
+            assert_eq!(
+                chain, source,
+                "the pipeline starts at the aggregate's input"
+            );
+        }
+
+        /// A `MapAggregate` with no extraction above it is not a group breaker.
+        #[test]
+        fn a_map_aggregate_alone_is_not_a_group_breaker() {
+            let mut nodes = Nodes::default();
+            let source = nodes.filled(keys());
+            let groups = nodes.add(node("MapAggregate", keys(), vec![edge("input", source)]));
+            let planner = nodes.planner();
+            let (breaker, chain) = planner.breaker_at(groups);
+            assert!(matches!(breaker, BreakerKind::Collect));
+            assert_eq!(chain, groups);
         }
 
         /// A keyed read is admitted over the iterated source's own extent.
