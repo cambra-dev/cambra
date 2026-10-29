@@ -3,6 +3,9 @@
 VS Code and Neovim support syntax highlighting, indentation, and the language server for CHL
 (`.cambra`). Both use language id `cambra`; the TextMate grammar uses scope `source.cambra`.
 
+The program inspector's source pane is a third editor. It runs the VS Code grammar in the page
+([Inspector](#inspector)), and the editor highlight check checks it beside the other two.
+
 | Directory | Contents |
 | --- | --- |
 | `vscode/` | A VS Code extension: the language, its comment and bracket configuration, the TextMate grammar `syntaxes/cambra.tmLanguage.json`, and the language server client `extension.js`. |
@@ -207,12 +210,12 @@ for `mapfile`; macOS's bundled Bash 3 cannot run it. Put a suitable Bash on `PAT
 | Command | Coverage | Requirements |
 | --- | --- | --- |
 | `cargo test editor_grammars` | Keyword/builtin lists, class coverage, sample parsing, and indentation-case parsing | Rust toolchain |
-| `./ci.sh editors` | TextMate and Vim highlighting, both indentation checkers, Neovim language client | Rust toolchain, Node/npm, and Neovim 0.11 |
+| `./ci.sh editors` | TextMate, Vim and inspector highlighting, both indentation checkers, Neovim language client | Rust toolchain, Node/npm, and Neovim 0.11 |
 | `./ci.sh vscode` | VS Code extension and language client | Rust toolchain and Node/npm; downloads VS Code unless `CAMBRA_VSCODE` names an installed executable |
 
 `./ci.sh editors` skips unavailable editor dependencies locally with a diagnostic; missing
 dependencies fail under CI. It installs npm packages from `vscode/package-lock.json` when
-`vscode/node_modules` is absent. `./ci.sh vscode` runs `npm ci` on each invocation.
+`vscode/node_modules` is absent, and the inspector's into `web/node_modules`. `./ci.sh vscode` runs `npm ci` on each invocation.
 
 The local full gate includes `editors`, but not `vscode`; `fast` includes neither. GitHub's
 `editors` job runs both. The VS Code download occupies about 1 GB unpacked in
@@ -228,7 +231,7 @@ with only this extension. Linux uses Chromium's headless Ozone platform unless
 splitting strings into string/escape spans and comments into comment/todo spans. Newline tokens
 have no span. Input lex errors fail the dump.
 
-Both checkers validate every byte of each span against `highlight-classes.json`:
+All three checkers validate every byte of each span against `highlight-classes.json`:
 
 - `vscode/test/check-grammar.mjs` uses `vscode-textmate` and `vscode-oniguruma`. A relevant scope
   must equal the expected `textmate` prefix or extend it with `.`. Delimiter scopes
@@ -238,6 +241,11 @@ Both checkers validate every byte of each span against `highlight-classes.json`:
   links until the group name leaves the `cambra` namespace, then compares it with the expected
   `vim` group. Following standard-group links further would conflate `Boolean` and `Number` as
   `Constant`. A `null` expectation requires no syntax item.
+- `web/scripts/check-highlight.ts` classifies each file as the inspector's source pane does
+  ([Inspector](#inspector)). Every byte must get the span's class, or no class when the class's
+  `textmate` prefix is `null`. This is exact where the TextMate check takes a prefix: a
+  `keyword-other` span scoped `keyword.other.mutation` passes the TextMate check and fails here,
+  because the pane colors it as `mutation`.
 
 A span containing a newline byte fails. Each checker rejects an empty span set, and the shell gate
 rejects an empty file corpus.
@@ -251,6 +259,10 @@ variants. A new operator therefore fails `cargo test` until the sample uses it, 
 `./ci.sh editors` until both grammars highlight it. `sample-lexes-only.cambra` holds the inputs that
 must lex but cannot parse.
 
+The web bundle `web/dist/index.html` embeds the TextMate grammar and `highlight-classes.json`, so a
+change to either fails `ci_web`'s bundle comparison until `(cd web && npm run build)` regenerates
+it.
+
 ### Adding a class
 
 1. Add the variant to `HighlightClass`, to `HighlightClass::ALL` and to `HighlightClass::name`, and
@@ -258,6 +270,9 @@ must lex but cannot parse.
 2. Add its entry to `highlight-classes.json`.
 3. Add a construct of that class to `sample.cambra`.
 4. Add the rule to both grammars.
+5. If its `vim` group is new, add a `.cm-cambra-<Group>` rule to `web/src/style.css`; a test in
+   `web/src/cambraSyntax.test.ts` fails until the palette has one.
+6. Rebuild the web bundle: `(cd web && npm run build)`.
 
 ### When it fails
 
@@ -266,7 +281,10 @@ the Vim equivalent, and every mismatching span is reported. Decide which side is
 
 - The grammar is wrong when its rule disagrees with how the lexer tokenizes the text. Fix the
   rule. Inspect a scope in VS Code with **Developer: Inspect Editor Tokens and Scopes**, and a group
-  in Neovim with `:Inspect`.
+  in Neovim with `:Inspect`. In the inspector, a token's element carries the class as
+  `cm-cambra-<class>`.
+- The inspector alone fails when its regex engine reads a pattern differently from Oniguruma
+  ([Inspector](#inspector)). Rewrite the pattern in the syntax both engines read the same way.
 - The class is wrong when the lexer change was intended to highlight differently. Change
   `highlight_class` or `highlight-classes.json`.
 
@@ -278,6 +296,7 @@ cargo run -q -p chl-parser --example dump_tokens -- editors/sample.cambra > targ
 node editors/vscode/test/check-grammar.mjs target/editor-check/spans.jsonl editors/highlight-classes.json
 nvim --headless -u NONE -i NONE -n --cmd 'set rtp^=editors/nvim' \
   -l editors/nvim/test/check_syntax.lua target/editor-check/spans.jsonl editors/highlight-classes.json
+web/node_modules/.bin/vite-node --root web web/scripts/check-highlight.ts target/editor-check/spans.jsonl
 ```
 
 ## Indentation tests
@@ -304,6 +323,38 @@ marked `vscode`; no case is marked `nvim`.
 `next` is the text of the line Enter opens and `rest` the lines after it.
 `tests/it/editor_grammars.rs` requires each case's `lines`, `next` at `indent`, and `rest` to form a
 program `parse_module` accepts.
+
+## Inspector
+
+The program inspector's source pane ([docs/inspector.md](../docs/inspector.md)) highlights with
+`web/src/cambraSyntax.ts`. It imports `vscode/syntaxes/cambra.tmLanguage.json` and
+`highlight-classes.json` into the bundle and restates no keyword, builtin or operator:
+
+- `vscode-textmate`, the tokenizer VS Code runs, tokenizes each line in the page, so the pane
+  re-highlights text as it changes.
+- A token's class is the class whose `textmate` prefix is the longest one its relevant scope starts
+  with, the relevant scope being the one [Editor highlight check](#editor-highlight-check) defines.
+  The prefix of `mutation`, `keyword.other.mutation`, extends that of `keyword-other`, and the
+  longer one wins.
+- The token's element carries `cm-cambra-<class>` and `cm-cambra-<Group>`, the class's `vim` group.
+  `web/src/style.css` colors the groups, so the pane draws the families Neovim draws.
+
+VS Code runs the grammar's regular expressions under Oniguruma, compiled to WebAssembly. The pane
+compiles them as JavaScript `RegExp`s with the `m` flag, so `^` and `$` match at line ends as in
+Oniguruma, and keeps the WebAssembly out of the bundle. Where the two engines read a pattern
+differently:
+
+- `\b` and `\w` are ASCII in a `RegExp` without the `u` flag and Unicode in Oniguruma. They
+  disagree only where a non-ASCII letter touches a word outside a string or comment, which the lexer
+  reports as an error.
+- The pane refuses a pattern holding `\A`, `\G`, `\z`, `\Z`, `\h`, `\H`, `\K`, `\R`, `\X`,
+  `\O`, `\p`, `\P` or a POSIX bracket such as `[[:alpha:]]`, which a `RegExp` would read as
+  something else.
+- Possessive quantifiers, atomic groups and the other Oniguruma-only constructs fail to compile as a
+  `RegExp`.
+
+`web/src/cambraSyntax.test.ts` compiles every pattern in the grammar, so a pattern the pane cannot
+run fails `./ci.sh fast` before it reaches the corpus check.
 
 ## Language server checks
 

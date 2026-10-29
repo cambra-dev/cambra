@@ -40,6 +40,7 @@ See [Running it](../docs/inspector.md#running-it). No `cargo`? After `npm run bu
 | **Ctrl/Cmd-click** a variable use in the source | Goto-definition: jumps + scrolls to the def-site and selects its node in both panels. The IDE/LSP-standard gesture (Ctrl, or ⌘ on macOS); the hover-tooltip link does the same thing for discoverability. |
 | **Click** a node row in the IR tree | Selects the node — highlights its source span in the editor and scrolls to it. The tree → source cross-link. |
 | **Click the ▸ / ▾ twisty** on a tree row | Expands / collapses that subtree (distinct from selecting the row). |
+| **Read** the source | Syntax highlighting from the VS Code grammar, in the classes the VS Code and Neovim grammars use ([editors/README.md](../editors/README.md#inspector)). `./ci.sh editors` checks it against the lexer over every `.cambra` file in the repository. |
 | **Hover a squiggle** in the source | The diagnostic message. Type errors underline the offending span — and still render even when the program fails to compile, since the source panel always loads. |
 | **Open the ☰ Panes menu** in the header | A checkbox per pane. Unchecking one hides it and widens the rest; the hidden set persists across reloads. Every pane is listed, Source included — the invariant is that the layout is never empty, so the last visible pane's checkbox is disabled rather than Source being pinned. Panes cannot be reordered. |
 | **Click a pane's Copy button** | Copies that pane's text to the clipboard. The source pane yields the program verbatim; a tree pane yields one indented line per row; the Diagnostics pane yields each card's three lines. The button reports the outcome — a refused write says so rather than looking like it worked. |
@@ -57,8 +58,13 @@ to the browser — hijacking it would also remove copy/inspect and is unreliable
 
 - **Vite** (build + dev server)
 - **TypeScript** (strict)
-- **CodeMirror 6** (`codemirror`, `@codemirror/state`, `@codemirror/view`) for
-  the read-only source editor
+- **CodeMirror 6** (`codemirror`, `@codemirror/state`, `@codemirror/view`,
+  `@codemirror/language`, `@lezer/highlight`) for the read-only source editor
+- **vscode-textmate** — the tokenizer VS Code runs, which runs the VS Code
+  grammar in the source pane (`src/cambraSyntax.ts`). It takes the grammar's
+  regular expressions as JavaScript `RegExp`s, so Oniguruma's WebAssembly stays
+  out of the bundle
+  ([editors/README.md](../editors/README.md#inspector)).
 - **`vite-plugin-singlefile`** — inlines all JS and CSS into one
   `dist/index.html` with zero external requests (no CDN, no external fonts), so
   the page is offline-capable and embeddable.
@@ -125,6 +131,15 @@ CI via `./ci.sh web`):
 - `wireValidate.test.ts` — `validateSnapshot` accepts every real fixture and
   throws (naming the path) on malformed payloads; this is the runtime
   replacement for the old unchecked `as Snapshot` cast.
+- `cambraSyntax.test.ts` — the source pane's highlighting: every grammar regex
+  compiles as a `RegExp`, the scanner's match order, the scope-to-class rule, a
+  mounted editor colouring each class and re-colouring an edit, and a
+  `style.css` rule for every Vim group.
+
+`scripts/check-highlight.ts` is not a vitest test. It needs the lexer's spans,
+which `cargo run -p chl-parser --example dump_tokens` prints, so
+`./ci.sh editors` runs it under `vite-node`
+([Editor highlight check](../editors/README.md#editor-highlight-check)).
 
 `offsets.ts` and `indices.ts` are slated for a Rust port (see below), so their
 tests double as the behavioural spec for that port.
@@ -137,7 +152,9 @@ so a plain `cargo build` produces a working inspector **without requiring
 Node**. The
 `.gitignore` here keeps `node_modules/` and Vite caches out of the tree but
 explicitly tracks `dist/index.html`. After changing anything under `src/`, rerun
-`npm run build` and commit the regenerated bundle.
+`npm run build` and commit the regenerated bundle. The bundle also embeds
+`editors/vscode/syntaxes/cambra.tmLanguage.json` and
+`editors/highlight-classes.json`, so a change to either needs the rebuild too.
 
 ## Module layout
 
@@ -157,6 +174,9 @@ The frontend is vanilla TypeScript (no framework), split into small modules:
   to a per-pane highlight set; that resolved state **is** the cross-pane link.
 - `sourceView.ts` — the CodeMirror editor plus hover/goto-def/squiggles and the
   resolved source-span highlight (primary vs. linked).
+- `cambraSyntax.ts` — the source pane's syntax highlighting: the VS Code
+  grammar under `vscode-textmate`, each token's scope mapped to its class in
+  `editors/highlight-classes.json`, as a CodeMirror `StreamLanguage`.
 - `treeView.ts` — one collapsible IR tree pane, parameterized by `paneId`,
   rendered by walking the pane's node table from `root`, cross-linked to every
   other pane.

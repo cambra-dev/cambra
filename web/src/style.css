@@ -21,6 +21,13 @@
      glyph and the word, so the flag carries on three channels rather than on
      colour alone. */
   --deleted: #8a8a8a;
+  /* Source syntax ink. Hues outside the bands the roles above own (red and
+     amber for errors and the caret, blue for selection, green for types), so a
+     coloured token never reads as a resolved span or a diagnostic. */
+  --syn-comment: #767676;
+  --syn-keyword: #6f3fb3;
+  --syn-literal: #00707f;
+  --syn-special: #b0247a;
   --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
 }
 
@@ -41,6 +48,10 @@
     --err: #ff6b5b;
     --warn: #e0b34a;
     --deleted: #7d7d7d;
+    --syn-comment: #8c8c8c;
+    --syn-keyword: #c3a0f0;
+    --syn-literal: #5ec8d6;
+    --syn-special: #f07ac0;
   }
 }
 
@@ -603,6 +614,55 @@ body {
   background: var(--sel-elsewhere);
   border-radius: 2px;
   box-shadow: inset 0 -1px 0 var(--caret);
+}
+
+/* Source syntax, one rule per Vim group in `editors/highlight-classes.json`
+   (`cambraSyntax.ts`, `cssClasses`). Literals share one ink, and keywords
+   another. Types take `--type`, the ink the tree panes give a node's type.
+   `:=`, `<<`, `<<=` and the lambda `\` are Special: the places a program
+   moves a value into a store, a feed or a function body. */
+.cm-cambra-Comment {
+  color: var(--syn-comment);
+  font-style: italic;
+}
+.cm-cambra-Todo {
+  color: var(--syn-comment);
+  font-style: italic;
+  font-weight: 700;
+}
+.cm-cambra-String,
+.cm-cambra-Number,
+.cm-cambra-Boolean,
+.cm-cambra-Constant {
+  color: var(--syn-literal);
+}
+.cm-cambra-SpecialChar {
+  color: var(--syn-literal);
+  font-weight: 700;
+}
+.cm-cambra-Statement,
+.cm-cambra-Keyword {
+  color: var(--syn-keyword);
+  font-weight: 600;
+}
+.cm-cambra-Function {
+  font-weight: 600;
+}
+.cm-cambra-Type {
+  color: var(--type);
+}
+.cm-cambra-PreProc {
+  color: var(--syn-special);
+}
+.cm-cambra-Special {
+  color: var(--syn-special);
+  font-weight: 700;
+}
+.cm-cambra-Operator {
+  color: inherit;
+}
+.cm-cambra-Delimiter {
+  color: var(--fg-muted);
 }
 
 /* `drawSelection` renders the caret and the selection itself, which the native
