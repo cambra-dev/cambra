@@ -1046,7 +1046,7 @@ pub trait Breaker {
     /// # Panics
     ///
     /// When the breaker has no consuming mode for its shape, which is the only way a caller
-    /// learns it.
+    /// learns it: a `Converse` beneath standing levels is one.
     fn consume_impl(&mut self, guard: TileGuard);
 }
 
