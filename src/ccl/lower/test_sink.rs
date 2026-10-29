@@ -49,6 +49,6 @@ pub(super) fn lower_test_sink(
         name: name.clone(),
         span,
     });
-    let defer = ctx.tag_machinery(Expr::new(TypedExprNode::Defer), span, "lower.test_sink");
+    let defer = ctx.tag_machinery(Expr::new(TypedExprNode::Defer), span, super::SINK_BINDING);
     Ok(ctx.tag_image(Expr::let_bind(name, defer, body), span))
 }

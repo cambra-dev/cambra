@@ -4186,6 +4186,7 @@ whose body it is. Capabilities are recorded on the innermost frame:
 | `Feed` or `Define` into 𝑓 | `Append(𝑓)` |
 | `Begin` | `RunTransaction`; its body's frame discharges `Transaction` |
 | `Source` | `ObserveWorld` |
+| a sink binding's `Defer` (`lower::SINK_BINDING`) | `AffectWorld` |
 | a value read of a transactional variable 𝑥 | `ReadTxn(𝑥)` and `Transaction` |
 | a value read of an induction variable 𝑥 | `Read(𝑥)` |
 | an `Apply` passing 𝑎 to a `Mut` parameter | `Write(𝑎)`, or `WriteTxn(𝑎)` when 𝑎 is transactional |
@@ -4323,14 +4324,14 @@ function's own.
 
 **Statements.** An expression statement a program writes before its block's last statement gets a
 frame of its own, which keeps every capability, the enclosing function's own variables' included,
-and flows into the enclosing frame through that frame's filter (`Typing::statement`; lowering labels
-each one `lower::EXPRESSION_STATEMENT`, which `lower::expression_statements` reads). A parameter's
-capability is `Bound::Parameter`: it reaches the statement's frame and no function body's. A
-statement whose frame causes nothing is inert (`InferError::InertStatement`), unless it reaches a
-call variable with nothing flowing into it, the call of a function a polymorphic definition takes as
-a parameter, which only each use determines (`InferCtx::inert_statements`). Inference returns the
-inert statements, and the compile reports them after the `Mut` discipline checks, which diagnose a
-wrongly passed argument more precisely.
+and flows into the enclosing frame through that frame's filter (`Typing::statement`; lowering
+labels each one `lower::EXPRESSION_STATEMENT`, which `lower::marked_nodes` reads). A
+parameter's capability is `Bound::Parameter`: it reaches the statement's frame and no function
+body's. A statement whose frame causes nothing is inert (`InferError::InertStatement`), unless it
+reaches a call variable with nothing flowing into it, the call of a function a polymorphic
+definition takes as a parameter, which only each use determines (`InferCtx::inert_statements`).
+Inference returns the inert statements, and the compile reports them after the `Mut` discipline
+checks, which diagnose a wrongly passed argument more precisely.
 
 **Public functions.** A public function's effects naming an induction variable of the top level,
 `Bound::At(0)`, are an error at its `let` (`InferError::VariablePastItsScope`). An append to a

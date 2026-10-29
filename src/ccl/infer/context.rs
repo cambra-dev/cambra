@@ -147,9 +147,9 @@ pub(super) struct InferCtx {
     effect_binders: HashMap<Name, EffectBinder>,
     /// Each statement emitted, with the variable collecting what it causes.
     effect_statements: Vec<(NodeId, Rc<EffectVar>)>,
-    /// The `ExprStmt` of each expression statement the program writes, the statements an
-    /// inert one is refused among.
-    pub(super) expression_statements: HashSet<NodeId>,
+    /// What lowering marks each marked node as: an expression statement, which an inert one
+    /// is refused among, or a sink binding, which causes `AffectWorld`.
+    pub(super) marks: HashMap<NodeId, crate::ccl::lower::Mark>,
     /// Each public function of the module, with its effects and its `let`.
     effect_public: Vec<(Name, Rc<EffectVar>, NodeId)>,
     /// Each generalized `def` whose `requires` clause is an upper bound: its type, the level
@@ -656,7 +656,7 @@ impl InferCtx {
             }],
             effect_binders: HashMap::new(),
             effect_statements: Vec::new(),
-            expression_statements: HashSet::new(),
+            marks: HashMap::new(),
             effect_calls: HashSet::new(),
             effect_public: Vec::new(),
             bounded_requires: Vec::new(),
@@ -665,8 +665,8 @@ impl InferCtx {
 
     /// What the module's top level requires and causes, less what its scopes discharge
     /// (`docs/chl-spec.md`, "Shareable modules").
-    pub(super) fn top_level_effects(&self) -> EffectSet {
-        crate::ccl::effects::set_of(&self.effect_frames[0].var.resolved())
+    pub(super) fn top_level_effects(&self) -> Vec<Capability> {
+        self.effect_frames[0].var.resolved().into_iter().collect()
     }
 
     fn effect_frame(&self) -> &EffectFrame {
@@ -715,8 +715,12 @@ impl InferCtx {
                     escapes: public_feed || (declares && transactional),
                 },
             );
-            // Other modules append to a public feed, so declaring one is an output of the
-            // top level's, as declaring a transactional variable writes it.
+            // Declaring a transactional variable writes it, and other modules append to a
+            // public feed, so declaring one is an output of the top level's too. Neither
+            // capability is discharged where the variable's scope ends.
+            if transactional {
+                self.record_effect(Item::Causes(Effect::Write(name.clone())));
+            }
             if public_feed {
                 self.record_effect(Item::Causes(Effect::Append(name.clone())));
             }
@@ -3043,6 +3047,12 @@ impl Typing for InferCtx {
         }
     }
 
+    fn record_sink_binding(&mut self) {
+        if self.marks.get(&self.current_node_id) == Some(&crate::ccl::lower::Mark::Sink) {
+            self.record_effect(Item::Causes(Effect::AffectWorld));
+        }
+    }
+
     fn record_read(&mut self, name: &Name) {
         if let Some(transactional) = self.effect_binders.get(name).map(|b| b.transactional) {
             if transactional {
@@ -3053,7 +3063,7 @@ impl Typing for InferCtx {
     }
 
     fn statement<R>(&mut self, node: NodeId, f: impl FnOnce(&mut Self) -> R) -> R {
-        if !self.expression_statements.contains(&node) {
+        if self.marks.get(&node) != Some(&crate::ccl::lower::Mark::ExpressionStatement) {
             return f(self);
         }
         let outer = self.effect_frame();
