@@ -80,9 +80,11 @@ impl TileOperator for Converse {
                 &self.base,
                 scheduler,
             ),
-            input: self
-                .input
-                .subscribe(self.tiling().universal_guard(), consumer, scheduler),
+            input: self.input.subscribe(
+                self.tiling().universal_guard(),
+                widening(consumer),
+                scheduler,
+            ),
             held: Vec::new(),
             level: self.level,
             empty_level: self.tiling().values_at(self.level).empty_at_no_rows(),
@@ -462,9 +464,11 @@ impl TileOperator for MapDomain {
                 &self.base,
                 scheduler,
             ),
-            input: self
-                .input
-                .subscribe(self.tiling().universal_guard(), consumer, scheduler),
+            input: self.input.subscribe(
+                self.tiling().universal_guard(),
+                widening(consumer),
+                scheduler,
+            ),
             level: self.level,
         })
     }
@@ -605,9 +609,11 @@ impl TileOperator for Uncurry {
                 &self.base,
                 scheduler,
             ),
-            input: self
-                .input
-                .subscribe(self.tiling().universal_guard(), consumer, scheduler),
+            input: self.input.subscribe(
+                self.tiling().universal_guard(),
+                widening(consumer),
+                scheduler,
+            ),
             level: self.level,
             empty_pair: self.tiling().values_at(self.level).empty_at_no_rows(),
         })
@@ -1160,7 +1166,7 @@ impl TileOperator for Restrict {
     ) -> Box<dyn TileProducer> {
         let predicate_producer = self.predicate.subscribe(
             self.predicate.tiling().universal_guard(),
-            consumer,
+            widening(consumer),
             scheduler,
         );
         Box::new(RestrictProducer {
@@ -3188,6 +3194,7 @@ mod tests {
 #[cfg(test)]
 mod filter_projection_tests {
     use super::*;
+
     use crate::interpreter::BaseType;
     use crate::interpreter::tile_operators::test_helpers::{
         GuardLog, ProjectionSpy, assert_conforms, int_entries, ints_by_position, keys_between,

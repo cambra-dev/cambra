@@ -32,8 +32,8 @@ use crate::{
     interpreter::operator_graph::{EdgeKind, InputEdgeSpec},
     interpreter::value_probe::ProbeSlot,
     interpreter::{
-        ColumnValue, Consumer, Extent, Gate, GatedConsumer, Scheduler, Value, forwarding_consumer,
-        validate_tile,
+        ColumnValue, Consumer, Extent, Gate, GatedConsumer, Projection, Scheduler, Value,
+        forwarding_consumer, validate_tile, widening,
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -328,12 +328,23 @@ impl Notified {
 
     /// An input consumer that sets this flag before forwarding the notification downstream.
     pub fn consumer(&self, downstream: Box<dyn Consumer>) -> Box<dyn Consumer> {
-        let flag = self.clone();
-        let mut downstream = downstream;
-        Box::new(move || {
-            flag.mark();
-            downstream.notify();
+        Box::new(FlaggingConsumer {
+            flag: self.clone(),
+            downstream,
         })
+    }
+}
+
+/// What [`Notified::consumer`] returns: sets the flag, then forwards the region unchanged.
+struct FlaggingConsumer {
+    flag: Notified,
+    downstream: Box<dyn Consumer>,
+}
+
+impl Consumer for FlaggingConsumer {
+    fn notify(&mut self, arrived: &Projection) {
+        self.flag.mark();
+        self.downstream.notify(arrived);
     }
 }
 
@@ -953,7 +964,7 @@ pub trait TileProducer {
         if let Some(asked) = &asked {
             // A guard that is not a projection is left to a producer that restates projections,
             // which panics on it in `get_impl`; one that is, bounds the answer.
-            if let Ok(projection) = crate::interpreter::Projection::of(asked)
+            if let Ok(projection) = Projection::of(asked)
                 && let Err(outside) = result.within(&projection)
             {
                 panic!(
@@ -966,9 +977,7 @@ pub trait TileProducer {
             // A pull states completeness only for the region it returns, so the last output
             // is compared inside that region: a producer asked for one region after another
             // withdraws nothing it said of the first.
-            let region = asked
-                .as_ref()
-                .and_then(|asked| crate::interpreter::Projection::of(asked).ok());
+            let region = asked.as_ref().and_then(|asked| Projection::of(asked).ok());
             let last_in_region = self.base().last_output.as_ref().map(|last| {
                 let mut last = last.clone();
                 if let Some(region) = &region {
@@ -991,12 +1000,9 @@ pub trait TileProducer {
             // The statement a later pull is held to holds each region's last answer: this pull
             // replaces its own region and leaves the others as they were.
             let stated = match (&region, self.base_mut().last_output.take()) {
-                (Some(crate::interpreter::Projection::Nothing), Some(last)) => last,
-                (Some(region @ crate::interpreter::Projection::Keys(_)), Some(mut last)) => {
-                    last.restrict_to(
-                        &crate::interpreter::Projection::Everything.minus(region),
-                        self.tiling(),
-                    );
+                (Some(Projection::Nothing), Some(last)) => last,
+                (Some(region @ Projection::Keys(_)), Some(mut last)) => {
+                    last.restrict_to(&Projection::Everything.minus(region), self.tiling());
                     let mut answered = result.clone();
                     answered.restrict_to(region, self.tiling());
                     last.merge(answered);
@@ -1159,7 +1165,7 @@ pub(crate) mod test_helpers {
     use super::{
         InspectNode, ProducerBase, Tile, TileGuard, TileOperator, TileProducer, Tiling, VizOptions,
     };
-    use crate::interpreter::{ColumnValue, FunctionGuard, Predicate, Value};
+    use crate::interpreter::{ColumnValue, FunctionGuard, Predicate, Projection, Value};
     use bit_set::BitSet;
     use intervalsets::{Interval, IntervalSet};
 
@@ -1340,7 +1346,7 @@ pub(crate) mod test_helpers {
             mut consumer: Box<dyn super::Consumer>,
             _scheduler: &mut super::Scheduler,
         ) -> Box<dyn TileProducer> {
-            consumer.notify();
+            consumer.notify(&Projection::Everything);
             let (mut spy, _, _) = ProjectionSpy::new(self.tile.clone(), self.tiling.clone());
             spy.pulled = self.pulled.clone();
             spy.released = self.released.clone();
@@ -1458,11 +1464,34 @@ pub(crate) mod test_helpers {
             mut consumer: Box<dyn super::Consumer>,
             _scheduler: &mut super::Scheduler,
         ) -> Box<dyn TileProducer> {
-            consumer.notify();
+            consumer.notify(&Projection::Everything);
             Box::new(ScriptedProducer {
                 base: ProducerBase::unowned(ScriptedProducer::alloc_id(), &self.tiling),
                 tile: self.cell.clone(),
             })
+        }
+    }
+
+    /// A consumer that logs the region of each notification it receives.
+    pub(crate) struct RegionLog {
+        regions: std::rc::Rc<std::cell::RefCell<Vec<Projection>>>,
+    }
+
+    impl RegionLog {
+        pub(crate) fn new() -> (Self, std::rc::Rc<std::cell::RefCell<Vec<Projection>>>) {
+            let regions = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            (
+                Self {
+                    regions: regions.clone(),
+                },
+                regions,
+            )
+        }
+    }
+
+    impl super::Consumer for RegionLog {
+        fn notify(&mut self, arrived: &Projection) {
+            self.regions.borrow_mut().push(arrived.clone());
         }
     }
 

@@ -193,7 +193,7 @@ impl TileOperator for CheckedLookup {
             LookupSource::Paired(pairs) => (
                 ProducerSource::Paired(pairs.subscribe(
                     pairs.tiling().universal_guard(),
-                    consumer,
+                    widening(consumer),
                     scheduler,
                 )),
                 None,
