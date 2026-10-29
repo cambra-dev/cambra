@@ -340,3 +340,30 @@ fn a_store_of_several_writers_refuses_part_of_its_input() {
     );
     breaker.borrow_mut().consume_impl(TileGuard::Record(fields));
 }
+
+/// A transaction store that is terminal is not stepped again.
+#[test]
+#[should_panic(expected = "a transaction store is not stepped once terminal")]
+fn a_terminal_transaction_store_is_not_stepped() {
+    let mut compiled = Compiled::of(COUNTER);
+    let mut breaker = CommitBreaker::new(compiled.fan.clone(), compiled.ctx.scheduler());
+    breaker.consume_impl(breaker.input_tiling().universal_guard());
+    breaker.step();
+}
+
+/// A transaction store over a source that delivers nothing decides nothing once it has opened,
+/// which the breaker reports as a stall.
+#[test]
+#[should_panic(expected = "a step of a transaction store decides something short of terminal")]
+fn a_transaction_store_that_decides_nothing_is_a_stall() {
+    let mut compiled = Compiled::over_an_empty_source(indoc! {"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in source1():
+            with begin():
+                pool := pool - r
+        out << await_final(pool)
+    "});
+    let mut breaker = CommitBreaker::new(compiled.fan.clone(), compiled.ctx.scheduler());
+    breaker.consume_impl(breaker.input_tiling().universal_guard());
+}

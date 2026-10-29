@@ -66,6 +66,7 @@ mod loop_breaker_tests;
 mod map;
 mod reshape;
 mod scalar;
+mod store_breaker;
 mod union;
 
 pub use aggregate::*;
@@ -82,6 +83,7 @@ pub use loop_breaker::*;
 pub use map::*;
 pub use reshape::*;
 pub use scalar::*;
+pub use store_breaker::*;
 pub use union::*;
 
 /// Static descriptor of a computation node in the tile dataflow graph.
@@ -194,6 +196,16 @@ pub trait TileOperator {
 // operator reads anything another operator computed, so the producer graph still
 // describes the whole dataflow.
 static PRODUCER_COUNTERS: OnceLock<Mutex<HashMap<&'static str, usize>>> = OnceLock::new();
+
+/// The next instance ID of the producers counted under `key`: a producer type's name, which
+/// [`TileProducer::alloc_id`] derives, or one a generic producer names itself by.
+pub(crate) fn next_producer_id(key: &'static str) -> usize {
+    let map = PRODUCER_COUNTERS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut counters = map.lock().unwrap();
+    let counter = counters.entry(key).or_insert(0);
+    *counter += 1;
+    *counter
+}
 
 /// Subscribe `op` at its universal guard with a consumer that forwards to `shared`, the
 /// consumer every input of one operator wakes
@@ -1225,12 +1237,7 @@ pub trait TileProducer {
         Self: Sized,
     {
         let raw: &'static str = short_type_name::<Self>();
-        let key: &'static str = raw.strip_suffix("Producer").unwrap_or(raw);
-        let map = PRODUCER_COUNTERS.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut counters = map.lock().unwrap();
-        let counter = counters.entry(key).or_insert(0);
-        *counter += 1;
-        *counter
+        next_producer_id(raw.strip_suffix("Producer").unwrap_or(raw))
     }
 
     /// Return the name of the concrete producer type, disambiguated by instance.

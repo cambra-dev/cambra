@@ -7,15 +7,15 @@ use indoc::indoc;
 
 use crate::ccl::context::{CompiledProgram, GlobalContext, compile_program};
 use crate::ccl::load::LoadedProgram;
-use crate::interpreter::commit_operator::store_frontier;
+use crate::interpreter::commit_operator::{InductionStore, nested_store_tiling, store_frontier};
 use crate::interpreter::dispatcher::{
     BreakerHandle, Dispatcher, PipelineId, consume, finalize, run, start,
 };
 use crate::interpreter::operator_conversion::OperatorMap;
-use crate::interpreter::{Position, TestSink, Value};
+use crate::interpreter::{BaseType, Extent, Position, TestDataSource, TestSink, Value};
 
 use super::growing::ints;
-use super::loop_breaker::{Reach, reach};
+use super::store_breaker::{Reach, reach};
 use super::test_helpers::keys_between;
 use super::*;
 
@@ -50,8 +50,25 @@ pub(super) struct Compiled {
 
 impl Compiled {
     pub(super) fn of(source: &str) -> Self {
+        Self::with(source, |_| {})
+    }
+
+    /// `source` compiled over `source1()`, a source of integers that delivers nothing and never
+    /// completes.
+    pub(super) fn over_an_empty_source(source: &str) -> Self {
+        Self::with(source, |ctx| {
+            ctx.register_source(Rc::new(RefCell::new(TestDataSource::new(
+                "source1",
+                crate::ccl::Type::Base(BaseType::Int),
+                Extent::Base(BaseType::Int),
+            ))));
+        })
+    }
+
+    fn with(source: &str, setup: impl FnOnce(&mut GlobalContext)) -> Self {
         let mut ctx = GlobalContext::default();
         let sink = ctx.register_test_sink("out");
+        setup(&mut ctx);
         let loaded = LoadedProgram::test(source);
         let program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
             .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
@@ -308,7 +325,7 @@ fn a_morsel_steps_the_loop_to_its_highest_position() {
 
 /// A loop is finalized only once its store is terminal: nothing steps it after.
 #[test]
-#[should_panic(expected = "a loop finalizes after its store is terminal")]
+#[should_panic(expected = "an induction store finalizes after it is terminal")]
 fn a_loop_finalized_before_its_store_is_terminal_panics() {
     let mut compiled = Compiled::of(SUM);
     let breaker = breaker_of(&mut compiled);
@@ -348,4 +365,92 @@ fn a_morsel_reaches_through_its_highest_position() {
 #[should_panic(expected = "a morsel of positions is a guard of them")]
 fn a_guard_of_no_positions_is_refused_as_a_morsel() {
     reach(&TileGuard::Scalar(Predicate::True));
+}
+
+/// A loop nested in another has one store per enclosing row, whose frontier a breaker cannot
+/// read as one, so a breaker refuses it.
+#[test]
+#[should_panic(expected = "a store breaker steps a flat store, and an induction store is nested")]
+fn a_nested_induction_store_is_refused() {
+    let positions = Extent::UIntRange(intervalsets::IntervalSet::from(
+        intervalsets::Interval::closed(0, 1),
+    ));
+    let values = HashMap::from([(
+        SmolStr::from("acc"),
+        Tiling::Scalar(Extent::Base(BaseType::Int)),
+    )]);
+    let store = InductionStore::new(
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        nested_store_tiling(positions.clone(), positions, values),
+        None,
+    );
+    let fan = Rc::new(FanOut::new_cyclic(Box::new(store)));
+    LoopBreaker::new(fan, GlobalContext::default().scheduler());
+}
+
+/// A loop whose store is terminal is not stepped again.
+#[test]
+#[should_panic(expected = "an induction store is not stepped once terminal")]
+fn a_terminal_loop_is_not_stepped() {
+    let mut compiled = Compiled::of(SUM);
+    let mut breaker = LoopBreaker::new(compiled.fan.clone(), compiled.ctx.scheduler());
+    breaker.consume_impl(breaker.input_tiling().universal_guard());
+    breaker.step();
+}
+
+/// A loop over a source that delivers nothing decides nothing on a step, which the breaker
+/// reports as a stall.
+#[test]
+#[should_panic(expected = "a step of an induction store decides something short of terminal")]
+fn a_loop_that_decides_nothing_is_a_stall() {
+    let mut compiled = Compiled::over_an_empty_source(indoc! {"
+        out = test_sink()
+        total := 0
+        for x in source1():
+            total += x
+        out << total
+    "});
+    let mut breaker = LoopBreaker::new(compiled.fan.clone(), compiled.ctx.scheduler());
+    breaker.consume_impl(breaker.input_tiling().universal_guard());
+}
+
+/// Snapshots of [`SUM`]'s store after each of its three steps, with a reader that releases
+/// nothing so the store reclaims no decided position.
+fn sum_snapshots() -> Vec<Tile> {
+    let mut compiled = Compiled::of(SUM);
+    let mut slot = compiled.fan.slot();
+    let guard = slot.tiling().universal_guard();
+    let _pinned = slot.subscribe(guard, Box::new(|| {}), compiled.ctx.scheduler());
+    (0..3).map(|_| compiled.fan.step()).collect()
+}
+
+/// An induction step progresses by deciding a position, and a release of its body that decides
+/// none is no progress.
+#[test]
+fn an_induction_step_progresses_by_a_position() {
+    let snapshots = sum_snapshots();
+    let (none, all) = (ints().empty_guard(), ints().universal_guard());
+    assert!(Induction::progressed(
+        &snapshots[0],
+        &snapshots[1],
+        &none,
+        &none
+    ));
+    assert!(!Induction::progressed(
+        &snapshots[0],
+        &snapshots[0],
+        &none,
+        &all
+    ));
+}
+
+/// A step that decided two positions is more than an induction step decides.
+#[test]
+#[should_panic(expected = "a step of an induction store decides one position, and it decided 2")]
+fn an_induction_step_deciding_two_positions_is_refused() {
+    let snapshots = sum_snapshots();
+    let none = ints().empty_guard();
+    Induction::progressed(&snapshots[0], &snapshots[2], &none, &none);
 }

@@ -934,23 +934,164 @@ in any order, except that its last epoch finishes after every earlier one: there
 pipeline runs its epochs one after another: it has at most one package in flight, takes it from the
 oldest epoch it has not finished, and finishes each epoch after the one before.
 
+#### Claiming from several threads
+
+`Dispatcher` is `Sync`, and a claim takes no lock beyond a read lock on each epoch's slot, which it
+holds only to clone the epoch's handle. A pipeline's queue in an epoch is appended to while it is
+open, and a closed queue takes nothing more. A source's queue grows at each `notify` and closes at
+the epoch's seal or the source's close. A parent's queue in an epoch is filled and closed at the
+`finish` of the pipeline it reads in that epoch, since a pipeline reads at most one other and
+finishes each epoch once.
+
+A queue's slots sit in buckets that double in size, each allocated by the first append that reaches
+it, so a slot never moves. An append reserves its indices together, by compare and exchange on
+`reserved`, and then writes each slot, once. The top bit of `reserved` says the queue is closed, so
+an append reserves only while the queue is open, and one read gives both the count and the close. A
+claim reads a slot only once it is written. The queue keeps the region its packages partition under
+a lock that appends and the move of the pipeline's epoch to finalizing take, and a claim of a
+package never does. Two counters per pipeline per epoch only grow: `claimed`, the index of the
+next package to claim, and `acknowledged`, how many packages
+have been acknowledged. Each pipeline's phase in each epoch (running, finalizing, finished), a
+failure flag and the generation, the count of changes a waiting worker waits on, are atomics too. A
+worker takes a lock only to sleep while there is nothing to claim, and a change that can end a sleep
+takes it to wake the sleepers, only while there are some. A seal and a close take a lock that orders
+them, since both move the current epoch or close a source's queues. The graph, the morsel size, the
+window, the limits and the ordered pipelines are fixed before the dispatcher is shared, since the
+methods that set them take `&mut self`; every other method takes `&self`. The breakers stay
+`Rc<RefCell<…>>` and are not `Send`. `run` claims on the calling thread, and nothing outside the
+unit tests in `tile_operators/dispatcher_thread_tests.rs` drives the dispatcher from more than one
+thread. Those tests run scripted work, plain data rather than breakers, on up to 16 threads; some
+feed a source and seal its epochs from a thread of their own while workers claim.
+
+A worker asks `Dispatcher::try_claim` what to do next, and the answer (`Next`) is one of five:
+
+| Answer | The worker |
+|---|---|
+| `Package(package)` | hands the package to its pipeline's breaker, then calls `acknowledge` |
+| `Finalize { pipeline, epoch, consumed, last }` | finishes the pipeline's epoch, pushing through `pushes_in(pipeline, epoch)`, through the breaker's `finalize` where `last` and `push_final` otherwise, then calls `finish` with the pushes |
+| `Wait(generation)` | calls `wait(generation)` and asks again |
+| `Done` | stops: every pipeline has finished the last epoch |
+| `Failed` | stops: the run failed, whatever has not finished |
+
+`claim` is `try_claim` and `wait` in a loop, and never answers `Wait`. A claim takes the package at
+the front of the queue of the pipeline the worker prefers, where it may, and otherwise that of the
+lowest pipeline whose queue it may take from, each pipeline's oldest epoch first. With no package to
+take, it finishes the oldest epoch's lowest pipeline that may finish it. Single-threaded, with no
+preferred pipeline, this is the order `run` follows, and a `Wait` there panics, because an acyclic
+graph with every source closed and nothing queued has a pipeline that may finish.
+
+A source pipeline may finish an epoch only once its queue there is closed and the epoch is sealed or
+known to be the last, so workers may start claiming before the sources start: they wait until then,
+and no source finishes before its input of the epoch has stopped arriving. A closed source refuses a
+`notify`, a second `close` and a second `start_source`.
+
+A claim reads `claimed`, and takes that index's package where its slot is written, by moving
+`claimed` on with a compare and exchange. A claim that loses the exchange reads `claimed` again, so
+no two claims take one package and none skips a package an append writes later: `claimed` never
+passes `reserved`. A claimed package is in flight until the worker acknowledges it. `acknowledge`
+refuses a package whose epoch the window no longer holds, whose index no claim has handed out, whose
+guard is not the queued one, or that was acknowledged before, the last through a flag per package
+that the first acknowledgement sets. A pipeline may finish an epoch when it is running in it, its
+queue there is closed and every package in it acknowledged, and the epoch is sealed or known to be
+the last. A claim reads the count and the close in one read, and nothing is reserved after the
+close, so the count of a closed queue is its last. The counters only grow, so a pipeline that may
+finish an epoch stays so until it does. Its packages there partition the region its queue was filled
+with, and the finish gets that region as `consumed`: the regions notified to a source in the epoch,
+or the union of the guards pushed to the pipeline in it.
+
+The claim that finds a pipeline that may finish an epoch moves its phase there from running to
+finalizing with a compare and exchange, so exactly one claim finishes each pipeline in each epoch.
+`Dispatcher::begin_finalize` makes the same move for the oldest epoch of a pipeline the caller names
+and asserts each condition; `dispatcher::finalize` calls it. A finish's pushes collect in its
+`Pushes`. `finish` moves the pipeline from finalizing to finished in the epoch with a compare and
+exchange, so a second finish is refused, and then appends the pushes to the parent's queue for the
+epoch and closes it. A parent claims and finishes an epoch only from a closed queue, so its packages
+become claimable only once the child's finish of the epoch has returned, and the parent's chain
+never reads the child's breaker during that finish. `finish` asserts that the parent has not begun
+to finish the epoch, and dropping a `Pushes` whose morsels never landed panics.
+
+An ordered pipeline has at most one package in flight across its epochs. A flag per pipeline, taken
+by compare and exchange before a claim of it looks and kept for the package it takes, admits one
+claim at a time, and its acknowledgement drops the flag. Its morsels are therefore consumed one at a
+time, in each epoch in the order they were queued.
+
+A claim reads the generation before it scans the pipelines, and one that finds nothing to do while a
+pipeline has not finished answers `Wait` with that generation. The generation advances after each
+change that can let a claim succeed: an append (`notify`, `start_source`, `finish`), a seal, a
+close, an acknowledgement of an ordered pipeline's package, of a limited source's package or of the
+last package reserved in a queue, a finish, and a failure. A change the scan missed therefore
+advanced the generation past the one the claim answers, and `wait` returns at once instead of
+missing it. `wait` sleeps on a `Condvar` under a `Mutex` that guards no data, counting itself as a
+sleeper under that lock before it reads the generation. An advance writes the generation before it
+reads the count of sleepers, and takes the lock to wake every sleeper only when the count is not
+zero; all four accesses are sequentially consistent, so either the sleeper reads the new generation
+or the advance wakes it. Waking every sleeper at each advance costs spurious wake-ups and needs no
+choice of which one to wake. A `notify` waiting at its limit and a `seal` waiting for a slot wait
+the same way.
+
+`Dispatcher::fail` sets the failure flag and advances the generation: every claim from then answers
+`Failed`, and every waiter wakes. A worker thread holds the handle `Dispatcher::worker` returns for
+as long as it claims, and dropping that handle while the thread panics calls `fail`, so no worker
+waits for a package the panicking one claimed and never acknowledged. A dispatcher method refuses a
+caller that breaks the protocol through one check, which calls `fail` before it panics, so the run
+fails with or without a worker handle. That includes a pipeline the dispatcher does not have. The
+debug-build assertions on a breaker's morsels and on a `Pushes` finishing through its own dispatcher
+panic without failing the run. After a failure, `acknowledge` and `finish` record nothing, and
+`notify` and `seal` return at once.
+
+Every claim reads the generation and writes the `claimed` counter of the pipeline it takes from, and
+an acknowledgement writes `acknowledged`, so those cache lines move between the cores that claim
+from one pipeline.
+
+Claiming without a lock matters only for pipelines whose work packages are short, up to about 100 µs
+of work each. Above that, a package's own work hides the dispatcher's cost, and the morsel size
+rather than the lock sets the overhead. Measured on 16 threads of an 18-core Mac, one pipeline in
+one-row morsels, with a scratch benchmark that is not in the tree:
+
+| Work per package | One `Mutex` | Lock-free |
+|---|---|---|
+| 1 µs | 188 thousand packages/s | 9.9 million packages/s |
+| 100 µs | 89% of the ideal rate | 98% of the ideal rate |
+| 1 ms | 98% of the ideal rate | 98% of the ideal rate |
+
+A claim hands out a finish only when no package anywhere is claimable, so a pipeline ready to finish
+an epoch waits behind the packages of every other pipeline, which delays its parent when the parent
+is on the run's longest path. A parent's queue in an epoch is filled only when the pipeline it reads
+finishes the epoch, so a parent does not start on its child's first push; the epochs are what
+streams.
+
+### A store as a breaker
+
+`StoreBreaker<𝐾>` (`tile_operators/store_breaker.rs`) is the breaker of a store's pipeline. It holds
+the cyclic `FanOut` over the store and a reader slot of it, and adds no rule to the fan-out. The
+fan-out owns the store, keeps the snapshot the store's recurrence reads, and takes the store out for
+the length of a pull, so a step has to go through it: a breaker holding the store directly would
+re-enter it through the recurrence's pull. The operators inside the cycle stay in pull mode, and the
+whole cycle is one pipeline, whose morsels the dispatcher consumes in order (`Dispatcher::order`).
+
+The kind `𝐾` (`StoreKind`) supplies what differs between stores: the input's tiling and release,
+which the breaker reads through its reader slot, the goal a morsel steps the store to, and what a
+step has to decide. A goal (`StoreGoal`) is a position the store has decided, a guard of the input
+the store has released, or the store's terminal. `consume_impl` reads the snapshot afresh and calls
+`FanOut::step` until the store reaches the goal or is terminal. Each step has to decide what the
+kind says, and what it decides is bounded, so a run of steps ends. A step that decides nothing
+panics as a stalled store, and so does a step at a terminal snapshot. `held` is the positions the
+store has decided, and everything once it is terminal. `finalize` asserts the store is terminal,
+since nothing steps the store after it, and pushes that guard.
+
+A breaker steps a flat store only, and refuses a nested one at construction. A nested induction
+store is one store per enclosing row, and its frontier, which `held`, a goal and a step's progress
+read, is the running row's watermark: it falls when a new row opens and is not a position of the
+outer keys.
+
 ### A loop as a breaker
 
-`LoopBreaker` (`tile_operators/loop_breaker.rs`) is the breaker of an induction loop's pipeline. It
-holds the cyclic `FanOut` over the loop's store and a reader slot of it, and adds no rule to the
-fan-out. The fan-out owns the store, keeps the snapshot the loop's recurrence reads, and takes the
-store out for the length of a pull, so a step has to go through it: a breaker holding the store
-directly would re-enter it through the recurrence's pull. The operators inside the loop stay in pull
-mode, and the whole cycle is one pipeline. Its morsels are positions of the loop's iteration, which
-the dispatcher consumes in order (`Dispatcher::order`).
-
-`consume_impl` calls `FanOut::step` until the store has decided the morsel's highest position, or
-until the store is terminal for a morsel whose right end has no bound. A guard that is not a run of
-positions is refused. A step that leaves the store's frontier where it was, short of terminal,
-panics as a stalled loop. `held` is the positions the store has decided, and everything once it is
-terminal. `finalize` asserts the store is terminal, since nothing steps the loop after it, and
-pushes that guard. The breaker's input is the store's body, the decision stream, whose tiling and
-release it reads through the fan-out's producer.
+`LoopBreaker` (`tile_operators/loop_breaker.rs`) is `StoreBreaker<Induction>`, the breaker of an
+induction loop's pipeline. Its morsels are positions of the loop's iteration. Its input is the
+store's body, the decision stream. A step decides one position, so a morsel's goal is its highest
+position, or the store's terminal for a morsel whose right end has no bound. A guard that is not a
+run of positions is refused. A step progresses when the store's frontier rises or the store closes,
+and a step that decides more than one position panics.
 
 A store whose body is terminal and has decided every decision it offered releases the body whole, in
 pull mode as in a run. A release through the decided positions alone never names a position the
@@ -965,10 +1106,9 @@ the drive does not bound, and nested loops, whose store is one per enclosing row
 
 ### A transaction store as a breaker
 
-`CommitBreaker` (`tile_operators/commit_breaker.rs`) is the breaker of a transaction store's
-pipeline. Like `LoopBreaker`, it holds the cyclic `FanOut` over the store's `CommitOperator` and a
-reader slot of it, and adds no rule to the fan-out. The writers, their drives and their bodies stay
-in pull mode, and the whole cycle is one pipeline, which the dispatcher consumes in order.
+`CommitBreaker` (`tile_operators/commit_breaker.rs`) is `StoreBreaker<Transaction>`, the breaker of
+a transaction store's pipeline, over the cyclic `FanOut` of its `CommitOperator`. The writers, their
+drives and their bodies stay in pull mode inside the pipeline.
 
 A step is one drain of every writer, and each writer decides at most one attempt in it. A step
 therefore commits between zero and one tick per writer: a deny, a grant that writes nothing, and a
@@ -982,14 +1122,11 @@ rebuilds a recomputable source behind a finished transaction rather than keeping
 The breaker's input is that source for a store of one writer, whose positions the dispatcher cuts
 into morsels. For a store of several writers it is a record of the sources, `_𝑘` for writer `𝑘`. A
 record has no outermost keys to cut, so such a store consumes its input as one morsel and refuses
-any other guard. `consume_impl` calls `FanOut::step` until the source's release covers the morsel,
-or until the store is terminal for a morsel whose right end has no bound. It reads the snapshot and
-the release afresh before each step. Each step decides something: the store's frontier rises, some
-source's release grows, or the store closes. Each of the three is bounded, so a run of steps ends.
-A step that decides none of them panics as a stalled store, and so does a step at a terminal
-snapshot.
-`held` is the commit ticks the store has decided, and everything once it is terminal. `finalize`
-asserts the store is terminal and pushes that guard.
+any other guard. A morsel's goal is the source's release covering it, or the store's terminal for a
+morsel whose right end has no bound and for a store of several writers. A step progresses when the
+store's frontier rises, some source's release grows, or the store closes: a deny finishes an item
+and commits nothing, so it progresses through the release alone. `held` is the commit ticks the
+store has decided.
 
 A deny leaves the store's snapshot unchanged. The drive announces its next item only through its
 scheduler re-arm, and the body reads the drive through a `Memo` that answers from its cache until
