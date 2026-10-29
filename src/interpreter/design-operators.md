@@ -265,6 +265,17 @@ tag's input. A flat union instead forwards the whole predicate over the domain s
 arms, even when that domain is itself union-keyed. Prefix construction over union keys is
 specified under [Componentwise predicates and prefixes](#componentwise-predicates-and-prefixes).
 
+### Absent keys
+
+A collection level records apart from its statement the paths it knows absent everywhere
+(`absent_keys`). A statement covers the region a tile answers, so a cut to a projection keeps only
+what it says of the region kept; an absent key has no path in any region, so a cut keeps the record
+whole, and a merge unites the two sides'. A key in it is complete wherever completeness is read for
+that level. `Converse` writes it: once every input key it has read is complete, a value no row
+carried has no group ([Converse](#converse)). `MapAggregate` reads it with the outer statement, so
+a group no answer holds is stated absent after any cut beneath the groups' keys. A key held is
+never recorded absent.
+
 ### Qualified predicates
 
 `Qualified { enclosing, here }` admits a path when `enclosing` admits its prefix and `here`
@@ -527,10 +538,10 @@ tile at a level beneath the outermost (`src/interpreter/design-path-projections.
   equals the whole answer cut to 𝑝. An operator that builds its answer from anything else cuts:
   accumulators held across pulls (`MapAggregate`), arms already released (`UnionOperator`), or a
   cache read at a wider region (`Memo`, and the `FanOutSlot` of a cyclic fan-out). An operator whose
-  output keys are not its input's keys, such as a `Converse` inverting its outermost collection,
-  pulls the input in full and cuts its own output. An operator that cannot restate 𝑝 for an input
-  pulls the input in full and still cuts its output: pulling more is sound for a `get`, where a
-  release that names more is not.
+  output keys are not its input's keys, such as a `Converse` pulled at its values, pulls the input
+  in full and cuts its own output. An operator that cannot restate 𝑝 for an input pulls the input in
+  full and still cuts its output: pulling more is sound for a `get`, where a release that names more
+  is not.
 - **Completeness between pulls.** The completeness contract compares a producer's answers inside the
   region pulled, and a pull of one projection states completeness over its keys only, so a pull of
   another region withdraws nothing it said of the first. The debug check keeps the last statement of
@@ -561,7 +572,7 @@ Each operator answers a projection as its row of this table states.
 | `MapDomain` | The input is pulled at the projection, since every level's keys stand. |
 | `Uncurry` | Beneath standing levels the input is pulled at the projection. Pairing the whole tile reads the groups whose first component the projection admits, and the pairs are cut after. |
 | `Product` | Both sides are pulled at the projection, since they are aligned row for row. The outer side has no paired level, so a projection at or beneath it pulls both sides at the rows its paths run through (`Projection::above`), and the pairs are cut. |
-| `Converse` | Every level is restated (`Restates::Every`). Beneath standing levels the input is pulled at the standing keys the projection names (`Projection::above`), and the groups are cut to it. Inverting the outermost collection reads the whole input and cuts the groups, and the rows of a group the projection does not name stay unreleased at the input. |
+| `Converse` | Every level is restated (`Restates::Every`). A projection of the input's keys one level beneath the inverted one under every value pulls the input at those keys ([Converse](#converse)). Otherwise, beneath standing levels the input is pulled at the standing keys the projection names (`Projection::above`), and inverting the outermost collection reads the whole input; the groups are cut to the projection, and the rows of a group the projection does not name stay unreleased at the input. |
 | `FanOutSlot` | Pulls the shared input at its own projection and cuts its answer to it. A producer states completeness only for the region it returns, so slots at different regions each pull the one input at their own and a pull of one region retracts nothing it said of another (the debug check compares the last output inside the region pulled). A cyclic fan-out reads its input whole, because a sibling that re-enters mid-pull is answered from the cache of the last completed pull, which has to cover whatever region that sibling asks for. A projection beneath the outermost keys is read and cut as one of the outermost keys is. |
 | `Memo` | Reads its input at the projection and caches what it read; a pull over a region it has read answers from the cache cut to the projection, and a region it has not read reaches the input however quiet the input has been. The regions it has read and must read again are projections at any level, so a projection beneath the outermost keys is read and cached as one of the outermost keys is. |
 | `UnionOperator` | A flat union pulls every arm at the projection and cuts the merge to it: the arms are disjoint slices of one collection, and an arm the consumer has released contributes an empty tile that states every key decided, which the cut brings back to the projection. A tagged union keys its rows by arm, admits only `Everything` and `Nothing`, and panics on a key projection. |
@@ -728,7 +739,8 @@ depends on the input's shape, the operator decides from its tiling when it subsc
 | `Zip`, `Product` | every arm, both sides | keeps | Pulled at the projection and aligned row for row. |
 | `MakeRecord` | every field | widens | A record of values has no keys. |
 | `Filter` | the predicate, the input | keeps for a side that is a collection, else widens | A collection side shares the mask's keys; the other is read whole. |
-| `Uncurry`, `Converse` | the input | keeps beneath a standing level, widens at the outermost | Inverting or pairing the outermost collection re-keys it. |
+| `Uncurry` | the input | keeps beneath a standing level, widens at the outermost | Pairing the outermost collection re-keys it. |
+| `Converse` | the input | keeps the standing keys, and restates the inverted level's keys one level in, beneath every value (`scheduler::one_level_in`) | Each input key stands beneath exactly one value. |
 | `UnionOperator` | every arm | keeps for a flat union, widens for a tagged one | Flat arms are disjoint slices of one collection; a tagged union keys its rows by arm. |
 | `CheckedLookup` | a stream of keys, or the pairs | keeps | Each answer sits at its key's position. |
 | `CheckedLookup` | one key | widens | One key has no keys to project. |
@@ -859,6 +871,30 @@ covers and forwards to the input, as in pull mode. It holds groups beneath their
 release beneath them leaves is a region beneath the outermost keys. A reader's chain may restate
 only the outermost keys (`TileProducer::restates`), so it answers `pushes_while_consuming` with
 `false`.
+
+### Converse
+
+`Converse` is no breaker: it consumes no input into state it answers from. Inverting a level puts
+the input's keys at that level one level in, beneath the values that become the keys there, and each
+input key stands beneath exactly one value. So a region of the input's keys names exactly the output
+paths it changed, with the value step admitting anything: `Converse` passes its input a consumer
+that restates the region there (`scheduler::one_level_in`), and a pull at such a region pulls the
+input at the same keys (`Predicate::without_open_level`) and inverts only those rows. A region of
+the standing keys above the inverted level passes through as it is. It keeps the input rows it read
+and has not released, which a release of a group names by their values. At the outermost level it
+also keeps the input keys its answers stated complete and the values those answers held, and once
+every input key is complete it records every other value absent ([Absent keys](#absent-keys)): such
+a value has no group, and a cut beneath the values keeps no statement of the groups it does not
+hold.
+
+#### A release of a converse group
+
+A release of a `Converse` names its output region exactly. Upstream it is forwarded in two parts:
+the input rows the region covers among those it holds, at once, and each later row of a released
+group on the read that first holds it (`ConverseProducer::release_late_rows`). An input guard names
+rows by key, and a group is the rows whose value is the group's key, so no input guard names a group
+before its rows are read. The two parts together release exactly the region named, as
+[Guard operations are exact](#guard-operations-are-exact) requires.
 
 ## Tile Operators
 
@@ -1437,9 +1473,11 @@ collection, and op-conversion pairs each row with `𝐹`'s collection for it, `�
 (`src/ccl/design/type-inference.md`, "Iterating a dependent tuple"). A group-by under a loop whose
 key reads the loop's binder has `𝐹 = 𝑀 ≫ converse ≫ map_domain`, the keys of the collection
 `𝑀` builds per row, and `converse` and `map_domain` act at that level, one row's collection at a
-time. A nested `Converse` releases the rows a standing level's guard names and fails loudly on a
-guard naming part of one row's inversion: which input rows that names depends on their values,
-which only the outermost `Converse` tracks.
+time. A nested `Converse` passes a guard naming standing keys to its input as those keys. A guard
+naming part of one row's inversion names input rows through their values, so the `Converse` records
+each input row it read with the output path `[𝑠…, value, key]` it stands at and its input path
+`[𝑠…, key]`, and releases the input rows whose output path the guard covers. A row read after its
+group was released is released on the read that holds it (`ConverseProducer::release_late_rows`).
 
 [`CheckedLookup`] gains a second reading from this, as a consumer now meeting a per-row
 stream: it answers a group of keys per row, keeping the grouping — one answer per key, where
