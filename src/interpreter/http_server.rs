@@ -13,8 +13,9 @@
 use std::{
     collections::HashMap,
     sync::{
-        Arc, Mutex,
-        mpsc::{self, Receiver, Sender},
+        Arc, Mutex, PoisonError,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender, TryRecvError},
     },
     thread,
 };
@@ -34,16 +35,34 @@ use crate::interpreter::{
 // Per-port shared server
 // ---------------------------------------------------------------------------
 
+/// What the dispatcher thread sends a route.
+pub enum RouteMessage {
+    /// A request for the route, with its body read off.
+    Request(SmolStr, tiny_http::Request),
+    /// The dispatcher stopped for a reason other than the program releasing the port, so no
+    /// request reaches the route again. Two causes stop it. tiny_http's accept thread exits on
+    /// its first `accept` error and closes the listener. A panic on the dispatcher thread ends
+    /// the dispatcher and leaves the listener open, with nothing reading its requests.
+    Failed(String),
+}
+
 /// Channel sender for a single `(method, path)` route.
-///
-/// Each item is either `Some((body, request))` for a matched incoming request
-/// or `None` to signal server shutdown.
-type RouteSender = Sender<Option<(SmolStr, tiny_http::Request)>>;
+type RouteSender = Sender<RouteMessage>;
 
 /// Routing table shared between the dispatcher thread and the [`SharedHttpServer`] handle.
 // shared-state-ok: the I/O boundary, not the operator graph — side effects live
 // at the edge, and no operator reads this.
-type RouteMap = Arc<Mutex<HashMap<(String, String), RouteSender>>>;
+type RouteMap = Arc<Mutex<RouteTable>>;
+
+/// Each route's channel, and the dispatcher's failure once it has failed.
+struct RouteTable {
+    /// `(method, path)` → sender half of each route's channel.
+    senders: HashMap<(String, String), RouteSender>,
+    /// The reason the dispatcher sent its routes as [`RouteMessage::Failed`]. It sits under the
+    /// lock that guards `senders`, so [`SharedHttpServer::register`] sends it to a route
+    /// registered after the failure, which no request reaches either.
+    failure: Option<String>,
+}
 
 /// A single `tiny_http::Server` shared by all `http_serve` calls on the same port.
 ///
@@ -57,20 +76,22 @@ type RouteMap = Arc<Mutex<HashMap<(String, String), RouteSender>>>;
 /// socket rather than leaving the address answering 404 forever (see
 /// [`SourceSinkRegistry`](crate::ccl::context::SourceSinkRegistry)).
 pub struct SharedHttpServer {
-    /// Routing table: `(method, path)` → sender half of each route's channel.
-    ///
-    /// Protected by a `Mutex` so that new routes can be registered after the
-    /// dispatcher thread is already running.
+    /// The routing table, behind a `Mutex` so that routes can be registered after the
+    /// dispatcher thread is running.
     routes: RouteMap,
 
     /// The listener, shared with the dispatcher thread.
     ///
-    /// Held here as well as there so that dropping this handle can end the
-    /// thread: `unblock` makes its `recv` return an error, which is the shutdown
-    /// the loop already handles by telling every route `None`. Moving the server
-    /// into the thread alone would leave the port bound for the life of the
-    /// process, since nothing else can reach it to stop the loop.
+    /// Held here as well as there so that dropping this handle can end the thread: `unblock`
+    /// makes its `recv` return an error. Moving the server into the thread alone would leave
+    /// the port bound for the life of the process, since nothing else can reach it to stop the
+    /// loop.
     server: Arc<Server>,
+
+    /// Set by [`Drop`] before it unblocks the dispatcher. The dispatcher reads an error from
+    /// `recv` with this set as the program releasing the port, and sends no route anything;
+    /// any other error is a listener failure ([`RouteMessage::Failed`]).
+    releasing: Arc<AtomicBool>,
 }
 
 impl SharedHttpServer {
@@ -83,12 +104,18 @@ impl SharedHttpServer {
         let server = Arc::new(Server::http(format!("0.0.0.0:{port}"))?);
         debug!("HTTP server listening on 0.0.0.0:{port}");
 
-        let routes: RouteMap = Arc::new(Mutex::new(HashMap::new()));
+        let routes: RouteMap = Arc::new(Mutex::new(RouteTable {
+            senders: HashMap::new(),
+            failure: None,
+        }));
+        let releasing = Arc::new(AtomicBool::new(false));
         let routes_bg = routes.clone();
         let server_bg = server.clone();
+        let releasing_bg = releasing.clone();
 
         thread::spawn(move || {
             let server = server_bg;
+            let _report = ReportPanic(routes_bg.clone());
             loop {
                 match server.recv() {
                     Ok(mut request) => {
@@ -99,6 +126,7 @@ impl SharedHttpServer {
                         let sender = routes_bg
                             .lock()
                             .unwrap()
+                            .senders
                             .get(&(req_method.clone(), req_url.clone()))
                             .cloned();
 
@@ -107,40 +135,57 @@ impl SharedHttpServer {
                                 let mut body_bytes = Vec::new();
                                 let _ = request.as_reader().read_to_end(&mut body_bytes);
                                 let body = SmolStr::new(String::from_utf8_lossy(&body_bytes));
-                                if tx.send(Some((body, request))).is_err() {
+                                if tx.send(RouteMessage::Request(body, request)).is_err() {
                                     debug!("HTTP route {req_method} {req_url}: receiver dropped");
                                 }
                             }
                             None => respond_not_found(request),
                         }
                     }
+                    // `unblock` from `Drop`. The registry drops the handle only once no route
+                    // remains on the port (`release_unrouted_ports`) or with its whole context,
+                    // so no source reads these channels.
+                    Err(_) if releasing_bg.load(Ordering::Acquire) => break,
                     Err(e) => {
                         debug!("SharedHttpServer recv error: {e}");
-                        // Notify all registered routes of server shutdown.
-                        let senders: Vec<_> = routes_bg.lock().unwrap().values().cloned().collect();
-                        for tx in senders {
-                            let _ = tx.send(None);
-                        }
+                        fail_routes(
+                            &routes_bg,
+                            &format!("the listener on port {port} stopped accepting: {e}"),
+                        );
                         break;
                     }
                 }
             }
         });
 
-        Ok(Self { routes, server })
+        Ok(Self {
+            routes,
+            server,
+            releasing,
+        })
     }
 
     /// Register a new `(method, path)` route and return the `Receiver` for incoming requests.
     ///
-    /// Requests matching this route will be sent on the returned channel.  A value of `None`
-    /// signals server shutdown.
-    pub fn register(
-        &self,
-        method: String,
-        path: String,
-    ) -> Receiver<Option<(SmolStr, tiny_http::Request)>> {
+    /// Each request matching the route arrives on the returned channel as a
+    /// [`RouteMessage::Request`]. A route registered after the dispatcher failed receives that
+    /// failure at once.
+    pub fn register(&self, method: String, path: String) -> Receiver<RouteMessage> {
         let (tx, rx) = mpsc::channel();
-        self.routes.lock().unwrap().insert((method, path), tx);
+        let mut table = self.routes.lock().unwrap();
+        if let Some(reason) = &table.failure {
+            let _ = tx.send(RouteMessage::Failed(reason.clone()));
+        }
+        let address = (method, path);
+        debug_assert!(
+            !table.senders.contains_key(&address),
+            "`{} {}` is registered while a route holds it: an address is unregistered before it \
+             is registered again, or the source of the route it replaces polls a channel with no \
+             sender",
+            address.0,
+            address.1,
+        );
+        table.senders.insert(address, tx);
         rx
     }
 
@@ -152,10 +197,16 @@ impl SharedHttpServer {
     /// operator graph — so a version that stops serving one has to say so.
     /// Without this the route still matches, still buffers, and the client waits
     /// on a reply nobody will compute.
+    ///
+    /// This drops the route's sender, and a poll of a channel with no sender panics. The caller
+    /// stops the scheduler polling the route's source in the same step, as
+    /// [`GlobalContext::retire_routes_absent_from`](crate::ccl::context::GlobalContext::retire_routes_absent_from)
+    /// does.
     pub fn unregister(&self, method: &str, path: &str) {
         self.routes
             .lock()
             .unwrap()
+            .senders
             .remove(&(method.to_string(), path.to_string()));
     }
 }
@@ -262,11 +313,39 @@ impl DataSink for UnopenedRouteSink {
 
 impl Drop for SharedHttpServer {
     fn drop(&mut self) {
-        // Ends the dispatcher thread, which is what drops its `Arc<Server>` and
-        // so closes the listener. `recv` returns an error, and the loop's error
-        // arm already sends `None` to every remaining route — the shutdown signal
-        // [`register`] documents.
+        // Ends the dispatcher thread, which drops its `Arc<Server>` and so closes the listener.
+        // `releasing` is set first, so the loop reads the error `unblock` makes `recv` return as
+        // this release rather than as a listener failure.
+        self.releasing.store(true, Ordering::Release);
         self.server.unblock();
+    }
+}
+
+/// Record `reason` as the dispatcher's failure, and send it to every route in `routes` as
+/// [`RouteMessage::Failed`].
+///
+/// Reads a poisoned table too: [`ReportPanic`] calls this while the dispatcher unwinds, and the
+/// panic it reports may be the one that poisoned the lock.
+fn fail_routes(routes: &RouteMap, reason: &str) {
+    let mut table = routes.lock().unwrap_or_else(PoisonError::into_inner);
+    table.failure = Some(reason.to_string());
+    for tx in table.senders.values() {
+        let _ = tx.send(RouteMessage::Failed(reason.to_string()));
+    }
+}
+
+/// Reports a panic on the dispatcher thread to every route, as [`RouteMessage::Failed`].
+///
+/// The routing table holds every route's sender for as long as [`SharedHttpServer`] lives, so a
+/// dispatcher that dies without reporting leaves each channel open and empty, and a source
+/// polling it reads no request and no failure.
+struct ReportPanic(RouteMap);
+
+impl Drop for ReportPanic {
+    fn drop(&mut self) {
+        if thread::panicking() {
+            fail_routes(&self.0, "the HTTP dispatcher thread panicked");
+        }
     }
 }
 
@@ -494,9 +573,9 @@ pub struct HttpServerDataSource {
     /// Shared buffer, indexing, and predicate bookkeeping.
     buf: UIntStreamBuffer,
 
-    /// Request bodies (and their `tiny_http::Request` handles) arriving from the
-    /// background thread.  `None` signals server shutdown.
-    receiver: Receiver<Option<(SmolStr, tiny_http::Request)>>,
+    /// Requests, with their `tiny_http::Request` handles, from the dispatcher thread, or the
+    /// dispatcher's failure.
+    receiver: Receiver<RouteMessage>,
 
     /// Shared state for routing responses back to clients.
     shared: Arc<HttpServerSharedState>,
@@ -545,29 +624,36 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
     /// and the shared pending map, after. Both are answered, so the stage a
     /// request happened to be at does not decide what its client sees.
     fn answer_in_flight(&mut self) {
-        while let Ok(Some((_, request))) = self.receiver.try_recv() {
+        while let Ok(RouteMessage::Request(_, request)) = self.receiver.try_recv() {
             respond_not_found(request);
         }
         self.shared.answer_not_found();
     }
 
-    /// Drain any requests the background thread has queued.  Returns `true` if
-    /// at least one new request (or server shutdown) was received.
+    /// Drain the requests the dispatcher thread has queued. Returns `true` if at least one
+    /// arrived.
+    ///
+    /// Panics when the dispatcher has failed or the route's channel has no sender. Either way no
+    /// request reaches the route again, and the program has no way to go on serving it.
     fn check_for_new_data(&mut self) -> bool {
         let mut got_data = false;
         loop {
             match self.receiver.try_recv() {
-                Ok(Some((body, request))) => {
+                Ok(RouteMessage::Request(body, request)) => {
                     self.add(body, request);
                     got_data = true;
                 }
-                Ok(None) => {
-                    debug!("HTTP server shut down");
-                    self.buf.eof_reached = true;
-                    got_data = true;
-                    break;
+                Ok(RouteMessage::Failed(reason)) => {
+                    panic!("route `{}` receives no more requests: {reason}", self.id)
                 }
-                Err(_) => break,
+                Err(TryRecvError::Empty) => break,
+                // The routing table holds the sender until the route is unregistered, and
+                // retirement forgets the route's source in the step that unregisters it.
+                Err(TryRecvError::Disconnected) => panic!(
+                    "route `{}` was polled after its sender was dropped: it was unregistered or \
+                     replaced while its source was still registered with the scheduler",
+                    self.id
+                ),
             }
         }
         got_data
@@ -622,5 +708,113 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
 
     fn retire_producer(&mut self, producer: &str) {
         self.buf.retire_producer(producer);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        io::{Read, Write},
+        net::TcpStream,
+        sync::mpsc::RecvTimeoutError,
+        time::Duration,
+    };
+
+    use super::*;
+
+    /// A source named `route` reading the channel `messages` were sent on, with no listener.
+    fn source_reading(messages: Vec<RouteMessage>) -> HttpServerDataSource {
+        let (sender, receiver) = mpsc::channel();
+        for message in messages {
+            let _ = sender.send(message);
+        }
+        HttpServerDataSource {
+            buf: UIntStreamBuffer::new(),
+            receiver,
+            shared: Arc::new(HttpServerSharedState::new()),
+            id: "route".to_string(),
+        }
+    }
+
+    /// A poll that reads the dispatcher's failure panics rather than reading an empty channel.
+    #[test]
+    #[should_panic(expected = "route `route` receives no more requests: the listener stopped")]
+    fn a_failed_dispatcher_panics_the_poll() {
+        let mut source = source_reading(vec![RouteMessage::Failed(
+            "the listener stopped".to_string(),
+        )]);
+        source.check_for_new_data();
+    }
+
+    /// A poll of a channel with no sender panics: its route was unregistered while the scheduler
+    /// still held its source.
+    #[test]
+    #[should_panic(expected = "route `route` was polled after its sender was dropped")]
+    fn a_poll_of_a_route_with_no_sender_panics() {
+        source_reading(Vec::new()).check_for_new_data();
+    }
+
+    /// A route registered after the dispatcher failed reads that failure, since no request
+    /// reaches it either.
+    #[test]
+    fn a_route_registered_after_a_failure_reads_it() {
+        let server = SharedHttpServer::new(reserve_test_port()).expect("the reserved port binds");
+        fail_routes(&server.routes, "the listener stopped");
+        let requests = server.register("GET".to_string(), "/x".to_string());
+        assert!(
+            matches!(
+                requests.try_recv(),
+                Ok(RouteMessage::Failed(reason)) if reason == "the listener stopped"
+            ),
+            "the failure is on the channel before any request could be",
+        );
+    }
+
+    /// Releasing a port ends the dispatcher without a message to the routes on it.
+    #[test]
+    fn releasing_a_port_sends_its_routes_nothing() {
+        let server = SharedHttpServer::new(reserve_test_port()).expect("the reserved port binds");
+        let requests = server.register("GET".to_string(), "/x".to_string());
+        drop(server);
+        assert!(
+            matches!(
+                requests.recv_timeout(Duration::from_secs(5)),
+                Err(RecvTimeoutError::Disconnected)
+            ),
+            "the dispatcher returns without sending, and the routing table's sender goes with it",
+        );
+    }
+
+    /// A panic on the dispatcher thread reaches every route as a failure.
+    ///
+    /// Poisoning the routing table makes the dispatcher's next lookup panic.
+    #[test]
+    fn a_dispatcher_that_panics_fails_its_routes() {
+        let port = reserve_test_port();
+        let server = SharedHttpServer::new(port).expect("the reserved port binds");
+        let requests = server.register("GET".to_string(), "/x".to_string());
+        let routes = server.routes.clone();
+        let _ = thread::spawn(move || {
+            let _held = routes.lock().unwrap();
+            panic!("poisoning the routing table");
+        })
+        .join();
+
+        thread::spawn(move || {
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+            stream
+                .write_all(b"GET /x HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n")
+                .unwrap();
+            let _ = stream.read_to_end(&mut Vec::new());
+        });
+
+        let failed = requests.recv_timeout(Duration::from_secs(5));
+        assert!(
+            matches!(
+                &failed,
+                Ok(RouteMessage::Failed(reason)) if reason == "the HTTP dispatcher thread panicked"
+            ),
+            "the route reads the panic as the dispatcher's failure",
+        );
     }
 }

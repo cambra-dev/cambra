@@ -1244,9 +1244,13 @@ impl LoweringContext {
 }
 
 /// Return the canonical data-source name for the requests side of
-/// `http_serve(port, method, path)`.
-pub fn http_requests_source_name(port: &str, method: &str, path: &str) -> String {
-    format!("__http_requests_{}", http_route_id(port, method, path))
+/// `http_serve(port, method, path)`. A route is keyed by this name, and the listener by the port
+/// as a number, so the name takes the number: `"8080"` and `"08080"` name one route.
+pub fn http_requests_source_name(port: u16, method: &str, path: &str) -> String {
+    format!(
+        "__http_requests_{}",
+        http_route_id(&port.to_string(), method, path)
+    )
 }
 
 /// The name the response channel of `http_serve(port, method, path)` is bound under, and the
@@ -1255,10 +1259,11 @@ pub(super) fn http_responses_sink_name(port: &str, method: &str, path: &str) -> 
     format!("__http_responses_{}", http_route_id(port, method, path))
 }
 
-/// The part of a name minted for `http_serve(port, method, path)` that identifies its route,
-/// one identifier for each route and a different one for every other: each argument keeps
-/// its ASCII letters and digits and writes every other character as its code point in hex
-/// between two `_`, `_` included, and `_s_`, which no code point spells, separates them.
+/// The part of a name minted for `http_serve(port, method, path)` from its arguments as
+/// strings, one identifier for each triple of strings and a different one for every other: each
+/// argument keeps its ASCII letters and digits and writes every other character as its code
+/// point in hex between two `_`, `_` included, and `_s_`, which no code point spells,
+/// separates them.
 fn http_route_id(port: &str, method: &str, path: &str) -> String {
     let id = |part: &str| -> String {
         part.chars()

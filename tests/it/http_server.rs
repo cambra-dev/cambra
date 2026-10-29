@@ -418,6 +418,27 @@ fn paths_differing_only_in_punctuation_are_two_routes() {
     );
 }
 
+/// Two spellings of one port are one route, so serving it under both is refused.
+#[test]
+fn spellings_of_one_port_are_one_route() {
+    for spelled in ["0PORT", "+PORT"] {
+        let errors = http_serve_lowering_errors(&formatdoc! {r#"
+            reqs1, resps1 = http_serve("PORT", "GET", "/x")
+            for req in reqs1:
+                resps1 << "one"
+            reqs2, resps2 = http_serve("{spelled}", "GET", "/x")
+            for req in reqs2:
+                resps2 << "two"
+        "#});
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("duplicate http_serve registration")),
+            "expected `{spelled}` to be refused as a duplicate route, got: {errors:?}"
+        );
+    }
+}
+
 /// A call of `http_serve` inside an expression opens no route, and says where the call goes.
 #[test]
 fn test_http_serve_inside_an_expression_is_error() {
