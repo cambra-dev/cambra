@@ -172,6 +172,21 @@ struct ExtractFinalProducer {
     consuming: bool,
 }
 
+/// The final value of `source`, falling back to `default`, that nothing subscribed, answering at
+/// `tiling`, for a test that builds a chain of pipelines by hand.
+#[cfg(test)]
+pub(crate) fn extract_final_of(
+    source: Box<dyn TileProducer>,
+    default: Option<Box<dyn TileProducer>>,
+    tiling: &Tiling,
+) -> crate::interpreter::dispatcher::BreakerHandle {
+    Rc::new(RefCell::new(ExtractFinalProducer::new(
+        ProducerBase::unowned(ExtractFinalProducer::alloc_id(), tiling),
+        source,
+        default,
+    )))
+}
+
 impl ExtractFinalProducer {
     fn new(
         base: ProducerBase,
@@ -440,13 +455,39 @@ impl Breaker for ExtractFinalProducer {
             None => self.pull_default(),
         };
     }
+
+    fn input_tiling(&self, _: InputId) -> Tiling {
+        self.source.tiling().clone()
+    }
+
+    fn input_released(&self, _: InputId) -> TileGuard {
+        self.source.obsolete_guard().clone()
+    }
+
+    /// Pushes the extracted value, as every breaker pushes its final guard.
+    ///
+    /// # Panics
+    ///
+    /// When `last` and the output is unreleased and no value has been extracted: the source has
+    /// not been released whole, or the default it fell back to has not converged. A dispatcher
+    /// issues no `consume_impl` after the last epoch, so nothing would read that default again,
+    /// and pushing nothing would leave the reader with no value.
+    fn finish(&mut self, pushes: &mut Pushes<'_>, last: bool) {
+        assert!(
+            !last || self.released || self.final_tile.is_some(),
+            "{} finishes after it extracted its value: the source released whole and any \
+             default it fell back to converged",
+            self.name()
+        );
+        pushes.push_final(self);
+    }
+
+    fn as_producer(&self) -> Option<&dyn BreakingProducer> {
+        Some(self)
+    }
 }
 
 impl BreakingProducer for ExtractFinalProducer {
-    fn input(&self) -> &dyn TileProducer {
-        &*self.source
-    }
-
     /// The extracted value, once there is one: none while the source has not drained, or while a
     /// default it fell back to has not converged. The next `consume_impl` reads the default again.
     fn held(&self) -> TileGuard {
@@ -812,16 +853,18 @@ mod projection_tests {
 }
 
 /// A consuming `ExtractFinal` over an input that grows and is released: the value it extracts, what
-/// it finalizes and what reaches the source, against a model of the keys consumed.
+/// its final guard names and what reaches the source, against a model of the keys consumed.
 #[cfg(test)]
 mod consuming_tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    use crate::interpreter::dispatcher::{Dispatcher, PipelineId};
     use crate::interpreter::tile_operators::growing::{
         Input, InputModel, KEYS, Region, Rng, Shared, Step, growing_source, ints, predicate,
         source, value,
     };
+    use crate::interpreter::tile_operators::test_helpers::push_to;
     use crate::interpreter::tile_operators::test_helpers::{
         ScriptedProducer, TestTileProducer, keys_between,
     };
@@ -921,7 +964,7 @@ mod consuming_tests {
         let mut extract = final_over(&source, default_of(7));
         extract.consume_impl(InputId::ONLY, ints().universal_guard());
         assert_eq!(offer(&mut extract), Some(7));
-        assert_eq!(extract.finalize(), int().universal_guard());
+        assert_eq!(extract.final_guard(), int().universal_guard());
     }
 
     /// A default that has not converged when the source drains leaves nothing held; the next
@@ -934,7 +977,7 @@ mod consuming_tests {
         extract.consume_impl(InputId::ONLY, ints().universal_guard());
         assert_eq!(offer(&mut extract), None, "the default has not converged");
         assert_eq!(
-            extract.finalize(),
+            extract.final_guard(),
             int().empty_guard(),
             "nothing is held yet"
         );
@@ -942,7 +985,51 @@ mod consuming_tests {
         *cell.borrow_mut() = Tile::Scalar(ColumnValue::Ints(vec![7]));
         extract.consume_impl(InputId::ONLY, ints().universal_guard());
         assert_eq!(offer(&mut extract), Some(7));
-        assert_eq!(extract.finalize(), int().universal_guard());
+        assert_eq!(extract.final_guard(), int().universal_guard());
+    }
+
+    /// An epoch before the last finishes with no value extracted yet: a later epoch's consume may
+    /// still extract it.
+    #[test]
+    fn an_epoch_before_the_last_finishes_without_a_value() {
+        let source = source([]);
+        let (default, _) = ScriptedProducer::new(Tile::Scalar(ColumnValue::Ints(vec![])), int());
+        let mut extract = final_over(&source, Some(Box::new(default)));
+        extract.consume_impl(InputId::ONLY, ints().universal_guard());
+        push_to(&mut extract, &[1]);
+        let dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
+        let mut pushes = dispatcher.pushes(PipelineId(0));
+        extract.finish(&mut pushes, false);
+        dispatcher.land(pushes);
+        assert!(dispatcher.pop().is_none(), "nothing to push");
+    }
+
+    /// A default that has not converged by the last epoch's `finish` is never read again: the
+    /// dispatcher issues no later `consume_impl`.
+    #[test]
+    #[should_panic(expected = "finishes after it extracted its value")]
+    fn finish_with_an_unconverged_default_panics() {
+        let source = source([]);
+        let (default, _) = ScriptedProducer::new(Tile::Scalar(ColumnValue::Ints(vec![])), int());
+        let mut extract = final_over(&source, Some(Box::new(default)));
+        extract.consume_impl(InputId::ONLY, ints().universal_guard());
+        extract.finish(
+            &mut Dispatcher::new(vec![vec![]], usize::MAX).pushes(PipelineId(0)),
+            true,
+        );
+    }
+
+    /// An output released before the value was extracted pushes nothing, and that is no error.
+    #[test]
+    fn finish_after_the_output_was_released_pushes_nothing() {
+        let source = growing_source(0..4);
+        let mut extract = final_over(&source, None);
+        extract.consume_impl(InputId::ONLY, keys_between(0, 1));
+        extract.release(int().universal_guard());
+        push_to(&mut extract, &[1]);
+        let dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
+        dispatcher.finish_by_hand(PipelineId(0), |pushes| extract.finish(pushes, true));
+        assert!(dispatcher.pop().is_none());
     }
 
     /// A total source that is empty is an invariant violation, as in pull mode.
@@ -955,22 +1042,14 @@ mod consuming_tests {
     }
 
     #[test]
-    fn finalize_holds_the_value_until_it_is_released() {
+    fn final_guard_holds_the_value_until_it_is_released() {
         let source = source(0..4);
         let mut extract = final_over(&source, None);
         extract.consume_impl(InputId::ONLY, ints().universal_guard());
-        assert_eq!(extract.finalize(), int().universal_guard());
+        assert_eq!(extract.final_guard(), int().universal_guard());
         extract.release(int().universal_guard());
-        assert_eq!(extract.finalize(), int().empty_guard());
+        assert_eq!(extract.final_guard(), int().empty_guard());
         assert_eq!(offer(&mut extract), None);
-    }
-
-    #[test]
-    #[should_panic(expected = "finalizes after its input has stated everything complete")]
-    fn finalize_before_the_source_has_drained_panics() {
-        let mut extract = final_over(&source(0..10), None);
-        extract.consume_impl(InputId::ONLY, keys_between(0, 3));
-        extract.finalize();
     }
 
     #[test]
@@ -1090,7 +1169,7 @@ mod consuming_tests {
                     true => int().universal_guard(),
                     false => int().empty_guard(),
                 };
-                assert_eq!(self.sut.finalize(), expected, "{trace}: finalize");
+                assert_eq!(self.sut.final_guard(), expected, "{trace}: final guard");
             }
         }
 
