@@ -30,6 +30,9 @@ pub enum FunctionDef {
     /// where it was absent. Applied to a `Records` column of the tupled argument
     /// ([`crate::ccl::Builtin::Insert`]), pointwise: one map in, one map out.
     Insert,
+    /// The range key each `Int` names ([`crate::ccl::Builtin::ToUInt`]). Inference proved every
+    /// argument lies in the range, so a negative one is a compiler bug.
+    ToUInt,
     /// A value read as the tuple it orders by ([`OrderKey`]).
     ToOrderKey(std::sync::Arc<OrderKey>),
     /// The value an [`OrderKey`] tuple is read from: [`Self::ToOrderKey`]'s inverse.
@@ -146,6 +149,15 @@ impl FunctionDef {
             ),
             (FunctionDef::Scalar(program), cv) => program.eval(&cv),
             (FunctionDef::UnaryOp(op), cv) => apply_unaryop_column(*op, &cv),
+            (FunctionDef::ToUInt, ColumnValue::Ints(ints)) => ColumnValue::UInts(
+                ints.into_iter()
+                    .map(|i| {
+                        u64::try_from(i).unwrap_or_else(|_| {
+                            panic!("to_uint: {i} is outside every range inference proved it in")
+                        })
+                    })
+                    .collect(),
+            ),
             (FunctionDef::ToOrderKey(key), cv) => key.key(cv),
             (FunctionDef::FromOrderKey(key), cv) => key.from_key(cv),
             (FunctionDef::CompareByKey(op, key), ColumnValue::Records(mut fields)) => {
@@ -290,6 +302,7 @@ impl std::fmt::Display for FunctionDef {
             FunctionDef::Scalar(program) => write!(f, "Scalar({program})"),
             FunctionDef::RecordField(field) => write!(f, ".{field}"),
             FunctionDef::Insert => write!(f, "insert"),
+            FunctionDef::ToUInt => write!(f, "to_uint"),
             FunctionDef::ToOrderKey(_) => write!(f, "order_key"),
             FunctionDef::FromOrderKey(_) => write!(f, "from_order_key"),
             FunctionDef::CompareByKey(op, _) => write!(f, "compare_by_key({op:?})"),

@@ -2512,6 +2512,14 @@ fn run_passes(
     // mutable reference.
     check_mut_rules(&expr, &blame)?;
 
+    // An `Int` key applied to a range-keyed function becomes the range key it names. After the
+    // post-inference check, which decides each such edge: the conversion's type is stamped, so
+    // no later check decides the edge again. Before `unbind`, so the stamped types are rewritten
+    // with the rest of the tree.
+    recorded(capture_provenance, Phase::Infer, || {
+        crate::ccl::infer::range_keys::coerce_range_keys(&mut expr)
+    });
+
     // Give each named read its position back, now that inference has run and no
     // refinement needs a binder to mention (`crate::ccl::mut_read::unbind`).
     // Before the pane below, so one phase sits on one side of it; before

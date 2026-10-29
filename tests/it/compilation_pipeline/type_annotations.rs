@@ -2130,16 +2130,17 @@ x = Option::some(1)
 x!
         "#},
         "found '!', expected binary operator",
-/// TODO Fails in later-phase SMT check because SMT encoding does not
-/// cover point-free syntax.
+
+/// The key `1` is typed `Int@1`, which entails `0 <= __elem < 3`, so `c : 0..3 ⤇ Int` applies
+/// to it through `to_uint`, which converts it to the range key `1`.
 #[test]
 fn proven_lookup_1() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
 c = [1,2,3]
 c[1] == 2
         "#},
-        "post-planning produced an invalid tree: [Type mismatch for Apply: expected 0..3, found {Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)}]",
+        Value::Bool(true),
     )
 }
 

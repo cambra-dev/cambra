@@ -2941,6 +2941,28 @@ fn convert_impl_inner(
                         ctx.level(),
                     )))
                 }
+                // The range key each `Int` names. The output extent is the node's own codomain,
+                // the range `0..n`, so the function the key is applied to takes it.
+                Builtin::ToUInt => {
+                    let range = expr.ty.codomain().ok_or_else(|| {
+                        ConversionError::TypeError(format!(
+                            "to_uint must have function type, got {}",
+                            expr.ty
+                        ))
+                    })?;
+                    let fn_extent = Extent::Function {
+                        domain: Box::new(value_extent_at(input.tiling(), ctx.level())),
+                        codomain: Box::new(ctx.extent_of(&range)?),
+                    };
+                    Ok(Box::new(MapResult::new_at(
+                        input,
+                        Box::new(Constant::new(
+                            Value::ComputableFunction(FunctionDef::ToUInt),
+                            fn_extent,
+                        )),
+                        ctx.level(),
+                    )))
+                }
                 // `lookup?` over an assembled collection of `(collection, key)` rows — what the
                 // point-free form of a lookup inside an iteration composes to. The two
                 // collection representations arrive as two shapes of field 0 and

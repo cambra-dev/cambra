@@ -840,6 +840,19 @@ pub enum Builtin {
     /// scheme: its type `Union ⇒ Bool` is stamped on the node and the post-phase
     /// CHECK-mode `typecheck` trusts it (like [`Self::VariantProject`]).
     VariantIs(FieldKey),
+    /// `to_uint : {Int | 𝑆} ⇒ 0..𝑛` — the key an `Int` names in a range, for an `Int` whose
+    /// refinements `𝑆` entail `0 <= __elem < 𝑛`.
+    ///
+    /// Inference accepts `{Int | 𝑆} <: 0..𝑛` without changing the value, but an `Int` and a
+    /// range key are different runtime values.
+    /// [`crate::ccl::infer::range_keys::coerce_range_keys`] wraps an application's argument
+    /// in `to_uint` wherever that edge types it (`src/ccl/design/type-inference.md`, "A refined
+    /// `Int` below a range").
+    ///
+    /// Minted after inference, so it carries no [`crate::ccl::infer::OperatorSchemes`]
+    /// scheme: its type is stamped per site and the post-phase CHECK-mode `typecheck` trusts
+    /// it (like [`Self::VariantIs`]).
+    ToUInt,
 }
 
 impl Builtin {
@@ -894,6 +907,7 @@ impl Builtin {
             Self::LookupChecked => "lookup?",
             Self::Insert => "insert",
             Self::VariantIs(_) => "variant_is",
+            Self::ToUInt => "to_uint",
         }
     }
 

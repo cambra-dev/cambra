@@ -27,6 +27,7 @@ mod api;
 mod check;
 mod context;
 mod emit;
+pub(crate) mod range_keys;
 mod schemes;
 pub(crate) mod solve;
 pub mod solver;

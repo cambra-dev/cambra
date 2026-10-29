@@ -1583,10 +1583,17 @@ The rule applies in one direction. `0..𝑛 ⊀ Int`, and `0..𝑚 <: 0..𝑛` o
 `Int` has no predicate to prove the bound from, and a `SkipSmtScope` caller rejects the pair.
 
 It types a list subscript whose key carries a proof of its position: in `c = [1,2,3]`, `c[1]`
-applies `0..3 ⤇ Int` to a key typed `Int@1`. The post-planning check decides the same edge with
-the key's point-free predicate. The kind lattice
-(`compact.rs`, `CompactTypeKind::merge`), the compact merge of an `Int` and a `UIntRange` bound,
-and the Lean model (`formal/CclFormal/Subtyping.lean`) still relate a range only to itself.
+applies `0..3 ⤇ Int` to a key typed `Int@1`. The kind lattice (`compact.rs`,
+`CompactTypeKind::merge`), the compact merge of an `Int` and a `UIntRange` bound, and the Lean
+model (`formal/CclFormal/Subtyping.lean`) still relate a range only to itself.
+
+The edge changes the value's runtime representation: an `Int` and a range key are different
+values. After the post-inference check, `coerce_range_keys` in `infer/range_keys.rs` rewrites
+each application `𝑎 ▷ 𝑓` with `𝑎 : {Int | 𝑆}` and `𝑓 : 0..𝑛 ⤇ 𝑉` to `𝑎 ▷ to_uint ▷ 𝑓`. The
+builtin's type `{Int | 𝑆} ⇒ 0..𝑛` is stamped, so no later check decides the edge again. An
+application is the only site rewritten. An `Int` reaching a range anywhere else, such as through
+an annotation or a tuple field, keeps its `Int` representation, and operator conversion rejects
+the mismatch (`Map::new` in `src/interpreter/tile_operators/map.rs`).
 
 ##### A product is reached through its fields
 
