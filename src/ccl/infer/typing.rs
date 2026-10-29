@@ -433,6 +433,11 @@ pub(super) trait Typing {
     /// transactional one. Check records nothing.
     fn record_read(&mut self, _name: &Name, _mention: &Expr) {}
 
+    /// Record that the `Defer` whose rule is running binds a sink, when lowering marked it
+    /// one, which causes `AffectWorld` (`docs/chl-spec.md`, "Output outside the program"). Check
+    /// records nothing.
+    fn record_sink_binding(&mut self) {}
+
     /// Note that the `let` of `name` at `node` binds `ty`, for the check that no public
     /// function's type names a variable of its module's own. Check notes nothing.
     fn note_binding(&mut self, _name: &Name, _ty: &Type, _node: NodeId) {}

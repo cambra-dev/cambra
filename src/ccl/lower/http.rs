@@ -99,11 +99,17 @@ pub(super) fn lower_http_serve(
             ConstTerm::Lit(Lit::String(port)),
             ConstTerm::Lit(Lit::String(method)),
             ConstTerm::Lit(Lit::String(path)),
-        ] => (
-            HttpRoute::fixed(port, method, path)
-                .map_err(|e| LoweringError::unsupported(args_span, e))?,
-            http_responses_sink_name(port, method, path),
-        ),
+        ] => {
+            let route = HttpRoute::fixed(port, method, path)
+                .map_err(|e| LoweringError::unsupported(args_span, e))?;
+            // A module checked alone reads its requests' type off the source by this name, which
+            // a run of it then opens; a module only imported is never run.
+            if !ctx.sources.contains_key(&route.source_name) {
+                ctx.declare_unopened_route(&route.source_name);
+                ctx.checked_routes.insert(route.source_name.clone());
+            }
+            (route, http_responses_sink_name(port, method, path))
+        }
         // An argument that reads no parameter is the same in every run, so one that is no
         // string is refused here, once, rather than at each run.
         _ if let Some(other) = terms
@@ -152,9 +158,9 @@ pub(super) fn lower_http_serve(
         "lower.http_serve",
     );
     let bound = bindings.wrap(value, body, span, ctx);
-    let channel = ctx.tag_machinery(Expr::new(TypedExprNode::Defer), span, "lower.http_serve");
-    // The channel's `let` and the `Defer` are manufactured plumbing; the bindings `target`
-    // makes image the assignment statement.
+    let channel = ctx.tag_machinery(Expr::new(TypedExprNode::Defer), span, SINK_BINDING);
+    // The channel's `let` is manufactured plumbing, and its `Defer` binds the route's sink; the
+    // bindings `target` makes image the assignment statement.
     Ok(ctx.tag_machinery(
         Expr::let_bind(responses, Occurrence::mint(), channel, bound),
         span,
@@ -312,7 +318,9 @@ impl LoweringContext {
         // mints from the address, and no other source is named that way, so
         // the only collision this could be is a route's own — caught above.
         debug_assert!(
-            self.http_routes.contains_key(source_name) || !self.sources.contains_key(source_name),
+            self.http_routes.contains_key(source_name)
+                || self.checked_routes.contains(source_name)
+                || !self.sources.contains_key(source_name),
             "http_serve source name {source_name} is already a source that is not a route",
         );
         // A route the source/sink registry already holds is inherited: reusing its

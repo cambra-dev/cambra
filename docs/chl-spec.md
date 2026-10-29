@@ -5850,10 +5850,6 @@ access](#39-subscript-and-attribute-access)). With `import shop::cart`, `run sho
 
 ### 9.7 Importing asserts a shareable module
 
-**[Decided]** — importing a module whose only state is induction variables and private feeds: the
-compiler refuses to import a module that declares mutable state, performs IO, runs another module,
-or has a top-level loop, `if`, `match` or `with`.
-
 Importing a module asserts that it is **shareable**: its top level reads nothing from outside
 the program, and leaves behind no output and no state another module could reach
 ([Shareable modules](#shareable-modules)).

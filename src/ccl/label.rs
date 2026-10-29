@@ -1,6 +1,6 @@
 //! Record field labels and variant tags.
 
-use crate::ccl::names::RunPath;
+use crate::ccl::names::{RunPath, SharedImport};
 use crate::chl_parser::ModulePath;
 use smol_str::SmolStr;
 use std::fmt;
@@ -19,8 +19,10 @@ use std::fmt;
 ///   only its own type's constructors and patterns, which all build them there.
 ///
 /// A run's top-level mutable variable is labeled in its run instead
-/// ([`Label::in_run`]). That label is the variable's field in its store, which no
-/// source writes, and it keeps the variables of two runs of one module apart.
+/// ([`Label::in_run`]), and a shared import's in the shared import
+/// ([`Label::in_import`]). That label is the variable's field in its store or its
+/// loop's history, which no source writes, and it keeps the variables of two runs,
+/// or two shared imports, of one module apart.
 ///
 /// Labels order by spelling, then by module, so a record or variant written in
 /// one module keeps the order of its spellings.
@@ -35,6 +37,47 @@ pub struct Label {
 enum Space {
     Module(ModulePath),
     Run(RunPath),
+    Import(std::sync::Arc<ImportSpace>),
+}
+
+/// The shared import a label belongs to: its spelling, which is its identity, and
+/// the shared import itself for a label compilation built.
+///
+/// A store keys its variables by [`Label::runtime_key`], which a store resumed by
+/// another version reads back ([`Label::from_runtime_key`]), and a type argument
+/// has no identity across compilations but its spelling ([`SharedImport`]'s
+/// arguments). So the spelling is what the label is, and a label read back from a
+/// key has no shared import.
+#[derive(Clone)]
+struct ImportSpace {
+    spelled: SmolStr,
+    shared: Option<SharedImport>,
+}
+
+impl PartialEq for ImportSpace {
+    fn eq(&self, other: &Self) -> bool {
+        self.spelled == other.spelled
+    }
+}
+
+impl Eq for ImportSpace {}
+
+impl PartialOrd for ImportSpace {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ImportSpace {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.spelled.cmp(&other.spelled)
+    }
+}
+
+impl std::hash::Hash for ImportSpace {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.spelled.hash(state);
+    }
 }
 
 impl Label {
@@ -75,11 +118,33 @@ impl Label {
         }
     }
 
+    /// The label spelled `name` of a top-level induction variable of the shared import
+    /// `shared` ([`crate::ccl::Name::field_key`]).
+    pub fn in_import(shared: SharedImport, name: impl Into<SmolStr>) -> Self {
+        let name = name.into();
+        debug_assert_spelling(&name);
+        Label {
+            name,
+            space: Some(Space::Import(std::sync::Arc::new(ImportSpace {
+                spelled: smol_str::format_smolstr!("{shared}"),
+                shared: Some(shared),
+            }))),
+        }
+    }
+
     /// The label whose [`runtime_key`](Self::runtime_key) is `key`. A spelling holds
-    /// no `::`, so the key's last `::` separates the module or the run from the
-    /// spelling, a leading `@` marks a run, and a key without `::` is a root label's.
+    /// no `::`, so the key's last `::` separates the module, the run or the shared
+    /// import from the spelling, a leading `@@` marks a shared import and a leading `@`
+    /// a run, and a key without `::` is a root label's.
     pub fn from_runtime_key(key: &SmolStr) -> Self {
         match key.rsplit_once("::") {
+            Some((space, name)) if space.starts_with("@@") => Label {
+                name: SmolStr::from(name),
+                space: Some(Space::Import(std::sync::Arc::new(ImportSpace {
+                    spelled: SmolStr::from(&space[2..]),
+                    shared: None,
+                }))),
+            },
             Some((space, name)) => match space.strip_prefix('@') {
                 Some(run) => Label::in_run(
                     run.split("::")
@@ -104,7 +169,7 @@ impl Label {
     pub fn module(&self) -> Option<&ModulePath> {
         match &self.space {
             Some(Space::Module(module)) => Some(module),
-            Some(Space::Run(_)) | None => None,
+            Some(Space::Run(_) | Space::Import(_)) | None => None,
         }
     }
 
@@ -113,19 +178,35 @@ impl Label {
     pub fn run(&self) -> Option<&RunPath> {
         match &self.space {
             Some(Space::Run(run)) => Some(run),
-            Some(Space::Module(_)) | None => None,
+            Some(Space::Module(_) | Space::Import(_)) | None => None,
+        }
+    }
+
+    /// The shared import whose top-level induction variable the label is the history
+    /// field of, or `None` for any other label ([`Label::in_import`]). A label read
+    /// back from a run-time key has none ([`ImportSpace`]), and nothing asks one.
+    pub fn import(&self) -> Option<&SharedImport> {
+        match &self.space {
+            Some(Space::Import(space)) => Some(space.shared.as_ref().unwrap_or_else(|| {
+                panic!("`{self}` was read back from a run-time key, which keeps no shared import")
+            })),
+            Some(Space::Module(_) | Space::Run(_)) | None => None,
         }
     }
 
     /// The label as run time keys records by: its [`Display`](fmt::Display)
-    /// spelling for a root or a module's label, and `@run::name` for a run's, since
-    /// no module path begins with `@`. A spelling holds no `::`, so no two labels
+    /// spelling for a root or a module's label, `@run::name` for a run's, and
+    /// `@@shared::name` for a shared import's, since no module path or run path begins
+    /// with `@`. A spelling holds no `::`, so no two labels
     /// share a key, and [`Label::from_runtime_key`] inverts it. A root label's key
     /// is its spelling, shared rather than copied.
     pub fn runtime_key(&self) -> SmolStr {
         match &self.space {
             Some(Space::Module(module)) => smol_str::format_smolstr!("{module}::{}", self.name),
             Some(Space::Run(run)) => smol_str::format_smolstr!("@{run}::{}", self.name),
+            Some(Space::Import(space)) => {
+                smol_str::format_smolstr!("@@{}::{}", space.spelled, self.name)
+            }
             None => self.name.clone(),
         }
     }
@@ -141,14 +222,15 @@ fn debug_assert_spelling(name: &str) {
 }
 
 /// `name` for a label of the root's namespace, `module::name` for another
-/// module's, and `run::name` for a run's, as a source reads the run's member. A
-/// run's label and a module's can print alike; [`Label::runtime_key`] tells them
-/// apart.
+/// module's, `run::name` for a run's, as a source reads the run's member, and
+/// `shared::name` for a shared import's. A run's label, a shared import's and a
+/// module's can print alike; [`Label::runtime_key`] tells them apart.
 impl fmt::Display for Label {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.space {
             Some(Space::Module(module)) => write!(f, "{module}::{}", self.name),
             Some(Space::Run(run)) => write!(f, "{run}::{}", self.name),
+            Some(Space::Import(space)) => write!(f, "{}::{}", space.spelled, self.name),
             None => f.write_str(&self.name),
         }
     }
@@ -247,9 +329,40 @@ mod tests {
             Label::in_module(module("shop::cart"), "price"),
             Label::in_run(RunPath::default().child("eu"), "price"),
             Label::in_run(RunPath::default().child("t").child("a"), "price"),
+            Label::in_import(SharedImport::of(module("shop::cart")), "price"),
+            Label::in_import(scaled(), "price"),
         ] {
             assert_eq!(Label::from_runtime_key(&label.runtime_key()), label);
         }
+    }
+
+    /// `scaled(region="a::b")`, a shared import whose argument's spelling holds `::`.
+    fn scaled() -> SharedImport {
+        SharedImport {
+            module: module("scaled"),
+            arguments: std::sync::Arc::new([(
+                SmolStr::from("region"),
+                crate::ccl::names::KeyArgument::Lit(crate::ccl::Lit::String("a::b".into())),
+            )]),
+        }
+    }
+
+    #[test]
+    fn a_shared_import_label_keys_apart_from_a_runs_and_a_modules() {
+        let shared = Label::in_import(scaled(), "total");
+        assert_eq!(shared.to_string(), "scaled(region=\"a::b\")::total");
+        assert_eq!(shared.runtime_key(), "@@scaled(region=\"a::b\")::total");
+        assert_ne!(shared, Label::in_module(module("scaled"), "total"));
+        assert_ne!(
+            shared,
+            Label::in_run(RunPath::default().child("scaled"), "total")
+        );
+        // Read back, it is the same label, and keeps no shared import to mint a binder from.
+        assert_eq!(
+            Label::from_runtime_key(&shared.runtime_key()).runtime_key(),
+            shared.runtime_key()
+        );
+        assert_eq!(shared.import(), Some(&scaled()));
     }
 
     #[test]
