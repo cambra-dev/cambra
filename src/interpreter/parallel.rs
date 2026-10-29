@@ -2192,6 +2192,19 @@ impl PooledRun {
         }
     }
 
+    /// How many keys the breakers of this run hold: rows absorbed and not yet released by every
+    /// reader. Zero once every row has been read and released, which a test asserts.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn held_keys(&self) -> usize {
+        self.breakers
+            .iter()
+            .map(|breaker| match breaker {
+                PoolBreaker::Materialize { output } => output.held_keys(),
+                PoolBreaker::Collect { .. } | PoolBreaker::Fold { .. } => 0,
+            })
+            .sum()
+    }
+
     /// The producer that answers `main`, for the driver to pull, or none for a program without a
     /// `main`.
     pub fn take_main(&mut self) -> Option<Box<dyn TileProducer>> {

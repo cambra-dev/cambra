@@ -645,6 +645,19 @@ source whose agreement another reader holds back offers the rows again
 operators whose serial producers registered the names, which holds because the pool cuts the same
 graph the program compiled.
 
+A request the route table does not match is answered by the dispatcher thread, and a malformed one
+by the HTTP parser, before either reaches the program. `tests/it/http_server.rs` runs scenarios
+through the serial loop and the inline dispatcher and compares the replies:
+`source_map_sink_replies_to_each_request_once` (eight requests in two waves, so more than one lap),
+`a_memo_between_two_maps_replies_to_each_request_once`,
+`a_request_that_arrives_after_idle_laps_is_replied_in_a_later_lap` and
+`an_unmatched_or_malformed_request_is_handled_as_in_the_serial_loop`. A map with a filter, and a
+reply fed under an `if`, read their request twice: the compiled program applies the request memo at
+each key, a build side the plan does not stream, so the inline dispatcher refuses both and the
+serial loop runs them (`a_filtered_map_is_refused_by_the_inline_dispatcher_and_served_serially`).
+Each scenario also asserts that the reply sink was handed no index that no request waits on (a reply
+written twice) and that the inline run holds no row once every reply is out (a row never released).
+
 The differential suite compiles each program in a context with no sources or sinks registered, so
 the programs that read one are skipped, and the HTTP programs are compared by the scenarios above.
 

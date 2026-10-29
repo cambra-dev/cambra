@@ -415,6 +415,20 @@ fn respond_not_found(request: tiny_http::Request) {
     }
 }
 
+// shared-state-ok: a test tally, per thread, of the indices a reply sink was handed that no
+// pending request waits on. Nothing reads it back into the graph.
+#[cfg(any(test, feature = "test-helpers"))]
+thread_local! {
+    static UNMATCHED_REPLIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many indices the reply sinks run on this thread were handed that no pending request waited
+/// on: a reply handed twice, or to a request already answered. A test asserts it is zero.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn unmatched_replies_on_this_thread() -> usize {
+    UNMATCHED_REPLIES.with(std::cell::Cell::get)
+}
+
 impl DataSink for HttpServerSharedState {
     /// Dispatch HTTP responses for all live `(UInt index, String body)` entries in `tile`.
     ///
@@ -454,7 +468,12 @@ impl DataSink for HttpServerSharedState {
                     if deleted.contains(j) {
                         return None;
                     }
-                    pending.remove(idx).map(|req| (req, body.clone()))
+                    let request = pending.remove(idx);
+                    #[cfg(any(test, feature = "test-helpers"))]
+                    if request.is_none() {
+                        UNMATCHED_REPLIES.with(|count| count.set(count.get() + 1));
+                    }
+                    request.map(|req| (req, body.clone()))
                 })
                 .collect()
         };

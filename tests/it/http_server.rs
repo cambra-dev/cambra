@@ -639,3 +639,422 @@ fn two_runs_serve_the_routes_their_arguments_give() {
     let responses = drive_until(&mut ctx, &rx, Duration::from_secs(5));
     assert_eq!(responses, vec!["hello from eu", "hello from us"]);
 }
+
+// ---------------------------------------------------------------------------
+// The inline dispatcher
+// ---------------------------------------------------------------------------
+
+/// How a scenario drives the program: the serial scheduler loop, or the inline dispatcher.
+#[derive(Clone, Copy, Debug)]
+enum Mode {
+    Serial,
+    Inline,
+}
+
+/// A program compiled for `mode`: the context, the program, and the inline run when there is one.
+struct Served {
+    ctx: GlobalContext,
+    _program: cambra::ccl::context::CompiledProgram,
+    run: Option<cambra::interpreter::parallel::PooledRun>,
+}
+
+impl Served {
+    /// Compile `code`, and start the inline dispatcher over it for [`Mode::Inline`], which
+    /// refuses a program the plan does not admit.
+    fn start(mode: Mode, code: &str) -> Self {
+        let mut ctx = GlobalContext::default();
+        let loaded = LoadedProgram::test(code);
+        let mut program =
+            compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+        let run = match mode {
+            Mode::Serial => None,
+            Mode::Inline => Some(
+                cambra::interpreter::parallel::PooledRun::start(
+                    &mut ctx,
+                    &mut program,
+                    &mut None,
+                    &cambra::interpreter::parallel::Config {
+                        threads: 1,
+                        morsel_rows: 3,
+                    },
+                    Box::new(|| {}),
+                )
+                .unwrap_or_else(|why| panic!("the inline dispatcher refuses the program: {why}")),
+            ),
+        };
+        Self {
+            ctx,
+            _program: program,
+            run,
+        }
+    }
+
+    /// One pass of the loop the binary runs: deliver, serve the pool, pull the sinks. Says whether
+    /// a lap ran a morsel.
+    fn pump(&mut self) -> bool {
+        self.ctx.scheduler().check_for_notifications();
+        let Some(run) = self.run.as_mut() else {
+            return false;
+        };
+        let ran = run.lap() == cambra::interpreter::parallel::Lap::Ran;
+        self.ctx.scheduler().pull_sinks();
+        ran
+    }
+}
+
+/// What one request of a scenario sends and whether the program answers it.
+struct Sent {
+    path: &'static str,
+    body: &'static str,
+    answered: bool,
+}
+
+fn sent(path: &'static str, body: &'static str) -> Sent {
+    Sent {
+        path,
+        body,
+        answered: true,
+    }
+}
+
+fn unanswered(path: &'static str, body: &'static str) -> Sent {
+    Sent {
+        path,
+        body,
+        answered: false,
+    }
+}
+
+/// What a scenario observed: the reply to each request, and how many laps ran a morsel.
+struct Observed {
+    replies: Vec<Option<String>>,
+    laps_that_ran: usize,
+}
+
+/// Send `requests` from threads of their own, one wave at a time: the requests of a wave are sent
+/// at once, and the next wave once every answered request of the waves before has its reply.
+/// Pump the program in `mode` throughout. A request that is not answered stays `None` and is
+/// checked to be left open after further passes; every reply is checked to have been written
+/// once, and an inline run to hold no row afterwards.
+fn serve_requests(mode: Mode, code: impl Fn(u16) -> String, waves: &[&[Sent]]) -> Observed {
+    let port = reserve_test_port();
+    let mut served = Served::start(mode, &code(port));
+    let (tx, rx) = mpsc::channel::<(usize, String)>();
+    let (open_tx, open_rx) = mpsc::channel::<(usize, TcpStream)>();
+    let mut replies: Vec<Option<String>> = Vec::new();
+    let mut laps_that_ran = 0;
+    let mut expected = 0;
+    let mut got = 0;
+    for wave in waves {
+        for request in *wave {
+            let index = replies.len();
+            replies.push(None);
+            expected += usize::from(request.answered);
+            let (path, body, answered) = (request.path, request.body, request.answered);
+            let (tx, open_tx) = (tx.clone(), open_tx.clone());
+            thread::spawn(move || {
+                if answered {
+                    let _ = tx.send((index, http_post(port, path, body)));
+                } else {
+                    let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+                    let head = format!(
+                        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(head.as_bytes()).unwrap();
+                    stream.flush().unwrap();
+                    let _ = open_tx.send((index, stream));
+                }
+            });
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while got < expected {
+            laps_that_ran += usize::from(served.pump());
+            match rx.recv_timeout(Duration::from_millis(5)) {
+                Ok((index, reply)) => {
+                    assert!(replies[index].replace(reply).is_none(), "one reply each");
+                    got += 1;
+                }
+                Err(_) => assert!(
+                    Instant::now() < deadline,
+                    "{mode:?}: {got} of {expected} replies after 10 s"
+                ),
+            }
+        }
+    }
+    drop((tx, open_tx));
+    // Further passes: a reply written twice, or to a request the program does not answer, would
+    // show on the sockets by now.
+    for _ in 0..50 {
+        served.pump();
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        rx.try_recv().is_err(),
+        "{mode:?}: a request was answered twice"
+    );
+    for (index, stream) in open_rx.try_iter() {
+        stream.set_nonblocking(true).unwrap();
+        let mut buf = [0u8; 64];
+        assert!(
+            matches!((&stream).read(&mut buf), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+            "{mode:?}: request {index} is not answered by the program"
+        );
+    }
+    assert_eq!(
+        cambra::interpreter::http_server::unmatched_replies_on_this_thread(),
+        0,
+        "{mode:?}: the reply sink was handed an index no request waits on"
+    );
+    if let Some(run) = &served.run {
+        assert_eq!(
+            run.held_keys(),
+            0,
+            "{mode:?}: every row was read and released"
+        );
+    }
+    Observed {
+        replies,
+        laps_that_ran,
+    }
+}
+
+/// The replies of `requests` to `code` are the same through the serial loop and the inline
+/// dispatcher, and are `expected`. The inline run takes the requests in the waves given.
+fn replies_agree(
+    code: impl Fn(u16) -> String + Copy,
+    waves: &[&[Sent]],
+    expected: &[Option<&str>],
+) -> Observed {
+    let serial = serve_requests(Mode::Serial, code, waves);
+    let inline = serve_requests(Mode::Inline, code, waves);
+    let expected: Vec<Option<String>> = expected.iter().map(|r| r.map(str::to_string)).collect();
+    assert_eq!(serial.replies, expected, "the serial loop");
+    assert_eq!(
+        inline.replies, serial.replies,
+        "the inline dispatcher answers as the serial loop does"
+    );
+    inline
+}
+
+fn echo_program(port: u16) -> String {
+    formatdoc! {r#"
+        requests, responses = http_serve("{port}", "POST", "/echo")
+        for req in requests:
+            responses << "Received: " + req
+    "#}
+}
+
+/// Source, map, sink: one request, and eight in two waves, each answered once with its own body.
+/// The second wave arrives after the first was answered, so the dispatcher runs more than one lap
+/// and more than one morsel of three rows.
+#[test]
+fn source_map_sink_replies_to_each_request_once() {
+    replies_agree(
+        echo_program,
+        &[&[sent("/echo", "hello")]],
+        &[Some("Received: hello")],
+    );
+    let first = [
+        sent("/echo", "a"),
+        sent("/echo", "b"),
+        sent("/echo", "c"),
+        sent("/echo", "d"),
+    ];
+    let second = [
+        sent("/echo", "e"),
+        sent("/echo", "f"),
+        sent("/echo", "g"),
+        sent("/echo", "h"),
+    ];
+    let expected: Vec<Option<&str>> = [
+        "Received: a",
+        "Received: b",
+        "Received: c",
+        "Received: d",
+        "Received: e",
+        "Received: f",
+        "Received: g",
+        "Received: h",
+    ]
+    .into_iter()
+    .map(Some)
+    .collect();
+    let observed = replies_agree(echo_program, &[&first, &second], &expected);
+    assert!(
+        observed.laps_that_ran >= 2,
+        "the waves ran in {} laps",
+        observed.laps_that_ran
+    );
+}
+
+/// A map with a filter reads each request twice, in the predicate and in the value, and the
+/// compiled program reads the request memo at each key: a build side the plan does not stream. The
+/// inline dispatcher refuses the program, and the serial loop, which then runs it, answers the
+/// admitted requests and leaves the others open.
+#[test]
+fn a_filtered_map_is_refused_by_the_inline_dispatcher_and_served_serially() {
+    let code = |port: u16| {
+        formatdoc! {r#"
+            reqs, resps = http_serve("{port}", "POST", "/g")
+            kept = [r + "!" for r in reqs if r != "skip"]
+            for k in kept:
+                resps << k
+        "#}
+    };
+    let port = reserve_test_port();
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(code(port));
+    let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let refused = cambra::interpreter::parallel::plan_inline(&compiled.operator_graph)
+        .err()
+        .expect("a build side is not streamed");
+    assert!(refused.to_string().contains("FanOutSlot"), "{refused}");
+    drop((compiled, ctx));
+
+    let requests = [
+        sent("/g", "one"),
+        unanswered("/g", "skip"),
+        sent("/g", "two"),
+    ];
+    let serial = serve_requests(Mode::Serial, code, &[&requests]);
+    assert_eq!(
+        serial.replies,
+        [Some("one!".to_string()), None, Some("two!".to_string())]
+    );
+}
+
+/// A reply fed under an `if` has a build side the plan does not stream yet: the dispatcher
+/// refuses the program, which the serial loop then runs.
+#[test]
+fn a_reply_fed_under_an_if_is_refused_by_the_inline_dispatcher() {
+    let port = reserve_test_port();
+    let code = formatdoc! {r#"
+        reqs, resps = http_serve("{port}", "POST", "/g")
+        for req in reqs:
+            if req != "skip":
+                resps << req
+    "#};
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(&code);
+    let compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
+    let refused = cambra::interpreter::parallel::plan_inline(&compiled.operator_graph)
+        .err()
+        .expect("a build side is not streamed");
+    assert!(refused.to_string().contains("FanOutSlot"), "{refused}");
+}
+
+/// A comprehension read by a loop is a `Memo` between two maps.
+#[test]
+fn a_memo_between_two_maps_replies_to_each_request_once() {
+    let code = |port: u16| {
+        formatdoc! {r#"
+            reqs, resps = http_serve("{port}", "POST", "/m")
+            shouted = [r + "!" for r in reqs]
+            for s in shouted:
+                resps << s + "?"
+        "#}
+    };
+    let requests = [
+        sent("/m", "a"),
+        sent("/m", "b"),
+        sent("/m", "c"),
+        sent("/m", "d"),
+        sent("/m", "e"),
+    ];
+    replies_agree(
+        code,
+        &[&requests],
+        &[
+            Some("a!?"),
+            Some("b!?"),
+            Some("c!?"),
+            Some("d!?"),
+            Some("e!?"),
+        ],
+    );
+}
+
+/// A request that arrives after laps that found nothing to run is answered by a later lap, and a
+/// request after that is answered too.
+#[test]
+fn a_request_that_arrives_after_idle_laps_is_replied_in_a_later_lap() {
+    use cambra::interpreter::parallel::Lap;
+
+    let port = reserve_test_port();
+    let mut served = Served::start(Mode::Inline, &echo_program(port));
+    for _ in 0..3 {
+        served.ctx.scheduler().check_for_notifications();
+        let run = served.run.as_mut().expect("an inline run");
+        assert_eq!(run.lap(), Lap::Idle, "no request has arrived");
+        served.ctx.scheduler().pull_sinks();
+    }
+    for body in ["late", "later"] {
+        let (tx, rx) = mpsc::channel::<String>();
+        thread::spawn(move || {
+            tx.send(http_post(port, "/echo", body)).unwrap();
+        });
+        let mut ran = 0;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let reply = loop {
+            ran += usize::from(served.pump());
+            match rx.recv_timeout(Duration::from_millis(5)) {
+                Ok(reply) => break reply,
+                Err(_) => assert!(Instant::now() < deadline, "no reply to {body}"),
+            }
+        };
+        assert_eq!(reply, format!("Received: {body}"));
+        assert_eq!(ran, 1, "the request is one morsel of one lap");
+    }
+}
+
+/// `payload` written to the echo program's port as bytes, and what comes back before the
+/// connection closes, with the program pumped in `mode`.
+fn exchange_raw(mode: Mode, payload: &'static str) -> String {
+    let port = reserve_test_port();
+    let mut served = Served::start(mode, &echo_program(port));
+    let (tx, rx) = mpsc::channel::<String>();
+    thread::spawn(move || {
+        let mut stream = TcpStream::connect(format!("127.0.0.1:{port}")).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        stream.write_all(payload.as_bytes()).unwrap();
+        let mut raw = String::new();
+        let _ = stream.read_to_string(&mut raw);
+        tx.send(raw).unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        served.pump();
+        match rx.recv_timeout(Duration::from_millis(5)) {
+            // The `Date` header is the second the server wrote it in.
+            Ok(raw) => {
+                return raw
+                    .lines()
+                    .filter(|line| !line.starts_with("Date:"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+            }
+            Err(_) => assert!(Instant::now() < deadline, "{mode:?}: no answer"),
+        }
+    }
+}
+
+/// A request for another path and a malformed one are answered as they are in the serial loop:
+/// the route table and the HTTP parser answer them, and the program is not asked.
+#[test]
+fn an_unmatched_or_malformed_request_is_handled_as_in_the_serial_loop() {
+    let unmatched =
+        "POST /wrong HTTP/1.1\r\nHost: x\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+    for payload in [unmatched, "NOT HTTP AT ALL\r\n\r\n"] {
+        let serial = exchange_raw(Mode::Serial, payload);
+        let inline = exchange_raw(Mode::Inline, payload);
+        assert_eq!(inline, serial, "{payload:?}");
+    }
+    assert!(
+        exchange_raw(Mode::Inline, unmatched).starts_with("HTTP/1.1 404"),
+        "an unmatched path is a 404"
+    );
+}

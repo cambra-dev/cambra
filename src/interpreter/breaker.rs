@@ -209,7 +209,7 @@ impl Materialized {
     }
 
     /// How many keys the breaker holds: the rows absorbed and not yet reclaimed.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-helpers"))]
     pub(crate) fn held_keys(&self) -> usize {
         let state = self.state.read().unwrap_or_else(PoisonError::into_inner);
         match &state.tile {
