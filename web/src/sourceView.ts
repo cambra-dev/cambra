@@ -8,6 +8,7 @@
 //   - diagnostic squiggles: `diagnostics[]`, set on the view once at mount
 //   - selection highlight: a StateField that marks the resolved source spans,
 //     distinguishing the primary anchor span from transitively-linked spans
+//   - syntax highlighting: the VS Code grammar, run in the page (cambraSyntax.ts)
 //
 // A source selection is `{ kind: "source", from, to }` over source bytes, taken
 // from CodeMirror's own selection: a click leaves a caret (`from === to`) and a
@@ -27,6 +28,7 @@ import {
 } from "@codemirror/view";
 import { type Diagnostic as CMDiagnostic, setDiagnostics } from "@codemirror/lint";
 
+import { cambraSyntax, highlightNow } from "./cambraSyntax";
 import type { Indices } from "./indices";
 import type { OffsetMap } from "./offsets";
 import { SOURCE_PANE, type Resolved, type Selection, type Store } from "./store";
@@ -354,6 +356,7 @@ export class SourceView {
         EditorState.readOnly.of(true),
         EditorView.editable.of(false),
         EditorView.lineWrapping,
+        cambraSyntax,
         highlightField,
         hover,
         interactions,
@@ -361,6 +364,7 @@ export class SourceView {
       ],
     });
     this.view = new EditorView({ state, parent });
+    highlightNow(this.view);
     // `setDiagnostics` installs the lint state field alongside the diagnostics,
     // so this one synchronous dispatch is the whole squiggle mechanism.
     this.view.dispatch(setDiagnostics(this.view.state, diagnostics));

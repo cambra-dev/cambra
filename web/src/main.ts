@@ -3,9 +3,9 @@
 // On load it fetches `/api/snapshot` once and builds a `Store` (the source +
 // per-pane indices + a shared, cross-pane selection). It then renders an
 // N-pane layout:
-//   - the program source in a read-only CodeMirror 6 editor, with hover types,
-//     Ctrl/Cmd-click goto-def, diagnostic squiggles, and the resolved selection
-//     highlight (see sourceView.ts);
+//   - the program source in a read-only CodeMirror 6 editor, with syntax
+//     highlighting, hover types, Ctrl/Cmd-click goto-def, diagnostic
+//     squiggles, and the resolved selection highlight (see sourceView.ts);
 //   - one collapsible, cross-linked IR tree per tree-shaped pipeline pane
 //     (treeView.ts), ordered upstream -> downstream;
 //   - or — on a degraded/failed snapshot — a diagnostics list in place of the

@@ -103,13 +103,15 @@ ci_solver() {
 # lexer's highlight spans over every `.cambra` file under `tests/` and
 # `editors/`, and one checker per editor requires each span to carry its class's
 # scope or group from `editors/highlight-classes.json` (`editors/README.md`,
-# "Editor highlight check"). The same harness checks each editor's indentation
-# against `editors/indent-cases.json` (`editors/README.md`, "Indentation
-# tests"), and runs the language server through Neovim's client
+# "Editor highlight check"). The inspector's source pane is the third editor: it
+# runs the VS Code grammar in the page, and `web/scripts/check-highlight.ts`
+# checks the class it gives each span. The same harness checks each editor's
+# indentation against `editors/indent-cases.json` (`editors/README.md`,
+# "Indentation tests"), and runs the language server through Neovim's client
 # (`editors/README.md`, "Language server checks"). Each checker needs its
-# editor's toolchain: Node for VS Code, Neovim for Neovim. A machine without one
-# skips that editor's checkers, loudly; under CI a missing toolchain fails, for
-# the reason `ci_formal` gives. The VS Code client check downloads VS Code, so
+# editor's toolchain: Node for VS Code and the inspector, Neovim for Neovim. A
+# machine without one skips that editor's checkers, loudly; under CI a missing
+# toolchain fails, for the reason `ci_formal` gives. The VS Code client check downloads VS Code, so
 # it is `ci_vscode`, which CI's `editors` job runs and the local gate does not.
 ci_editors() {
   local missing=""
@@ -133,7 +135,7 @@ ci_editors() {
     cargo run -q -p chl-parser --example dump_tokens -- "${corpus[@]}" >"${tmp}/spans.jsonl" || exit 1
     failed=0
     if [[ "${missing}" == *node* ]]; then
-      echo "ci_editors: node/npm not found — VS Code grammar and indentation not checked" >&2
+      echo "ci_editors: node/npm not found — VS Code grammar and indentation, and the inspector's highlighting, not checked" >&2
     else
       # Installs only what is missing, like `ci_web_tests`; the lockfile pins the tree.
       [[ -d editors/vscode/node_modules ]] ||
@@ -141,6 +143,12 @@ ci_editors() {
       node editors/vscode/test/check-grammar.mjs "${tmp}/spans.jsonl" \
         editors/highlight-classes.json || failed=1
       node editors/vscode/test/check-indent.mjs editors/indent-cases.json || failed=1
+      [[ -d web/node_modules ]] ||
+        (cd web && npm ci --prefer-offline --no-audit) || exit 1
+      # `--root web`, so Vite resolves the script's packages from
+      # `web/node_modules`; the dump's paths still resolve against the checkout.
+      web/node_modules/.bin/vite-node --root web web/scripts/check-highlight.ts \
+        "${tmp}/spans.jsonl" || failed=1
     fi
     if [[ "${missing}" == *nvim* ]]; then
       echo "ci_editors: nvim not found — Vim syntax file and indentation not checked" >&2
@@ -236,6 +244,7 @@ ci_web() {
       echo "ci_web FAILED: vendored dist/index.html differs from a fresh build" >&2
       echo "  sizes: vendored ${vendored_size} bytes vs built ${built_size} bytes" >&2
       echo "  re-vendor via: (cd web && npm run build), then commit dist/index.html" >&2
+      echo "  (the bundle also embeds editors/vscode/syntaxes/cambra.tmLanguage.json and editors/highlight-classes.json)" >&2
       exit 1
     fi
   )
