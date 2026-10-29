@@ -350,6 +350,7 @@ fn run_pipeline(
     let dispatcher = Arc::new(Dispatcher::new(
         vec![PipelineSpec {
             after: Vec::new(),
+            streams_from: Vec::new(),
             source: Box::new(move || source.clone()),
             finalize: None,
         }],
@@ -657,9 +658,17 @@ struct PipelineSpec {
     /// Pipelines that finish before this one starts. Each is earlier in the plan, so the
     /// dependencies form no cycle.
     after: Vec<PipelineId>,
+    /// Pipelines whose output this one reads as it is produced. The pipeline starts once a
+    /// region is published to it, or once every pipeline in `streams_from` has finished with
+    /// nothing published, whichever comes first, and it is closed when the last of them
+    /// finishes. Each is earlier in the plan, and none is also in `after`.
+    streams_from: Vec<PipelineId>,
     /// The source the pipeline's workers claim from, built once every pipeline in `after` has
-    /// finished: a pipeline downstream of a breaker reads what the breaker produced. Called
-    /// once, by the thread that finishes the last of them.
+    /// finished and the stream, if any, has started: a pipeline downstream of a breaker reads
+    /// what the breaker produced. Called once, by the thread that releases the last wait. That
+    /// can be a thread inside a [`publish`](Dispatcher::publish), an upstream worker in `work` or
+    /// `leave` or a consumer's `notify`, so the builder takes no lock the publisher may hold and
+    /// does not re-enter the breaker's notification.
     source: Box<dyn Fn() -> Arc<dyn MorselSource> + Send + Sync>,
     /// Called once, by the worker that completes the pipeline, before any pipeline waiting on
     /// it starts: the breaker's combine.
@@ -732,10 +741,18 @@ struct Early {
 struct Job {
     build: Box<dyn Fn() -> Arc<dyn MorselSource> + Send + Sync>,
     finalize: Option<Box<dyn Fn() + Send + Sync>>,
-    /// Pipelines waiting on this one.
+    /// Pipelines waiting on this one to finish.
     dependents: Vec<usize>,
-    /// Pipelines this one still waits on.
+    /// Pipelines that read this one's output as it is produced.
+    stream_readers: Vec<usize>,
+    /// What this pipeline still waits on: each pipeline in `after` that has not finished, and
+    /// one for the stream when `streams_from` is not empty and nothing has released it.
     waiting: AtomicUsize,
+    /// Pipelines in `streams_from` that have not finished.
+    streams_open: AtomicUsize,
+    /// Whether the stream's count in `waiting` is released, which the first publish to the
+    /// pipeline or the finish of its last stream does once.
+    stream_released: AtomicBool,
     // shared-state-ok: the pipeline's source, set once when it starts and read by every worker
     // that claims. It answers guards that name morsels and holds no tile.
     source: OnceLock<Arc<dyn MorselSource>>,
@@ -757,22 +774,51 @@ impl Dispatcher {
     /// A dispatcher over `pipelines`, in plan order. A pipeline that waits on none starts now.
     fn new(pipelines: Vec<PipelineSpec>, morsel_rows: u64) -> Self {
         let mut dependents = vec![Vec::new(); pipelines.len()];
+        let mut stream_readers = vec![Vec::new(); pipelines.len()];
         for (index, spec) in pipelines.iter().enumerate() {
-            for earlier in &spec.after {
+            for (at, earlier) in spec.after.iter().enumerate() {
                 assert!(
                     earlier.0 < index,
                     "a pipeline waits on earlier pipelines only, got {} after {}",
                     index,
                     earlier.0
                 );
+                assert!(
+                    !spec.after[..at].iter().any(|a| a.0 == earlier.0),
+                    "a pipeline depends on another once, got {} on {}",
+                    index,
+                    earlier.0
+                );
                 dependents[earlier.0].push(index);
+            }
+            for (at, earlier) in spec.streams_from.iter().enumerate() {
+                assert!(
+                    earlier.0 < index,
+                    "a pipeline streams from earlier pipelines only, got {} from {}",
+                    index,
+                    earlier.0
+                );
+                assert!(
+                    !spec.after.iter().any(|a| a.0 == earlier.0)
+                        && !spec.streams_from[..at].iter().any(|s| s.0 == earlier.0),
+                    "a pipeline depends on another once, got {} on {}",
+                    index,
+                    earlier.0
+                );
+                stream_readers[earlier.0].push(index);
             }
         }
         let jobs: Vec<Job> = pipelines
             .into_iter()
-            .zip(dependents)
-            .map(|(spec, dependents)| Job {
-                waiting: AtomicUsize::new(spec.after.len()),
+            .zip(dependents.into_iter().zip(stream_readers))
+            .map(|(spec, (dependents, stream_readers))| Job {
+                waiting: AtomicUsize::new(
+                    spec.after.len() + usize::from(!spec.streams_from.is_empty()),
+                ),
+                streams_open: AtomicUsize::new(spec.streams_from.len()),
+                // A pipeline with no stream has none to release.
+                stream_released: AtomicBool::new(spec.streams_from.is_empty()),
+                stream_readers,
                 build: spec.source,
                 finalize: spec.finalize,
                 dependents,
@@ -814,6 +860,11 @@ impl Dispatcher {
     /// before the source reads it or finds the source set.
     fn start(&self, index: usize) {
         let job = &self.jobs[index];
+        debug_assert_eq!(
+            job.waiting.load(Ordering::Acquire),
+            0,
+            "a pipeline starts once it waits on nothing"
+        );
         let early = job.early.lock_wait();
         let source = (job.build)();
         source.publish(&early.region);
@@ -821,6 +872,23 @@ impl Dispatcher {
             source.close();
         }
         assert!(job.source.set(source).is_ok(), "a pipeline starts once");
+    }
+
+    /// Release the wait of pipeline `index` for its stream, once: the first publish to it, or
+    /// the finish of the last pipeline it streams from, whichever comes first. The thread that
+    /// releases its last wait starts it.
+    fn release_stream(&self, index: usize) {
+        let job = &self.jobs[index];
+        // A pipeline whose stream is released, or that has none, is published to without an
+        // atomic update.
+        if job.stream_released.load(Ordering::Acquire)
+            || job.stream_released.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        if job.waiting.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.start(index);
+        }
     }
 
     /// The keys `arrived` have been added to the pipeline's source: unite the region into what
@@ -831,6 +899,10 @@ impl Dispatcher {
     /// source's yield-predicate function reads, and the lock that parks idle workers. The source
     /// takes the region under its own lock, and the epoch moves after that, so a worker that finds
     /// no morsel in its claim read the epoch before the move and its park returns at once.
+    ///
+    /// A publish that releases a pipeline's last wait starts it on the publishing thread: the
+    /// pipeline's source builder runs inside this call, under the contract stated at
+    /// [`PipelineSpec::source`].
     fn publish(&self, pipeline: PipelineId, arrived: &Projection) {
         let job = &self.jobs[pipeline.0];
         debug_assert!(
@@ -847,6 +919,9 @@ impl Dispatcher {
                 None => early.region = early.region.union(arrived),
             }
         }
+        // The region is in the early state before the wait is released, so the source built
+        // by the release is handed it.
+        self.release_stream(pipeline.0);
         self.wake_idle();
     }
 
@@ -900,6 +975,13 @@ impl Dispatcher {
                     // wakes the worker that parks on it.
                     Claim::Idle => {
                         job.outstanding.fetch_sub(1, Ordering::AcqRel);
+                        // Another worker's claim can have found the source exhausted while
+                        // this one was in flight and counted, and its finish attempt then saw
+                        // this claim outstanding. This decrement is the last event that can
+                        // complete the pipeline, so the attempt is made here.
+                        if job.exhausted.load(Ordering::Acquire) && self.try_finish(index) {
+                            continue 'scan;
+                        }
                     }
                     Claim::Exhausted => {
                         job.outstanding.fetch_sub(1, Ordering::AcqRel);
@@ -936,6 +1018,20 @@ impl Dispatcher {
         }
         if let Some(finalize) = &job.finalize {
             finalize();
+        }
+        // The closing follows the finalize and the last publish, which are the breaker's:
+        // nothing more reaches a pipeline that reads the stream once its last stream is done. A
+        // pipeline that was never published to starts here. Closing first builds it already closed;
+        // the order is not otherwise observable at the source.
+        for &reader in &job.stream_readers {
+            if self.jobs[reader]
+                .streams_open
+                .fetch_sub(1, Ordering::AcqRel)
+                == 1
+            {
+                self.close(PipelineId(reader));
+                self.release_stream(reader);
+            }
         }
         for &dependent in &job.dependents {
             if self.jobs[dependent].waiting.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -1228,6 +1324,7 @@ mod tests {
                 let (started, finished) = (log.clone(), log.clone());
                 PipelineSpec {
                     after: after[i].iter().map(|&a| PipelineId(a)).collect(),
+                    streams_from: Vec::new(),
                     source: Box::new(move || {
                         started.lock_wait().push(format!("start {i}"));
                         Arc::new(RangeSource::new(n))
@@ -1245,6 +1342,7 @@ mod tests {
         Dispatcher::new(
             vec![PipelineSpec {
                 after: Vec::new(),
+                streams_from: Vec::new(),
                 source: Box::new(move || Arc::new(RangeSource::new(rows))),
                 finalize: None,
             }],
@@ -1492,6 +1590,7 @@ mod tests {
         Dispatcher::new(
             vec![PipelineSpec {
                 after: Vec::new(),
+                streams_from: Vec::new(),
                 source: Box::new(move || source.clone()),
                 finalize: None,
             }],
@@ -1534,11 +1633,13 @@ mod tests {
             vec![
                 PipelineSpec {
                     after: Vec::new(),
+                    streams_from: Vec::new(),
                     source: Box::new(|| Arc::new(RangeSource::new(1))),
                     finalize: None,
                 },
                 PipelineSpec {
                     after: vec![PipelineId(0)],
+                    streams_from: Vec::new(),
                     source: Box::new(move || live.clone()),
                     finalize: None,
                 },
@@ -1757,6 +1858,522 @@ mod tests {
         assert!(worker.left.is_empty(), "nothing is left on a failed run");
     }
 
+    /// A pipeline over a source that logs `start {name}` when it starts and `finish {name}` when it
+    /// finishes.
+    fn logged(
+        name: &'static str,
+        log: &Log,
+        after: &[usize],
+        streams_from: &[usize],
+        source: impl Fn() -> Arc<dyn MorselSource> + Send + Sync + 'static,
+    ) -> PipelineSpec {
+        let (started, finished) = (log.clone(), log.clone());
+        PipelineSpec {
+            after: after.iter().map(|&a| PipelineId(a)).collect(),
+            streams_from: streams_from.iter().map(|&a| PipelineId(a)).collect(),
+            source: Box::new(move || {
+                started.lock_wait().push(format!("start {name}"));
+                source()
+            }),
+            finalize: Some(Box::new(move || {
+                finished.lock_wait().push(format!("finish {name}"));
+            })),
+        }
+    }
+
+    fn started(log: &Log, name: &str) -> bool {
+        log.lock_wait().contains(&format!("start {name}"))
+    }
+
+    /// A pipeline that streams from a finite one starts at the first publish to it, while the
+    /// pipeline it streams from has a morsel running.
+    #[test]
+    fn a_streaming_pipeline_starts_at_the_first_publish_before_the_upstream_finishes() {
+        let log = Log::default();
+        let (source, rows) = live_source();
+        let live: Arc<dyn MorselSource> = source.clone();
+        let dispatcher = Dispatcher::new(
+            vec![
+                logged("up", &log, &[], &[], || Arc::new(RangeSource::new(1))),
+                logged("down", &log, &[], &[0], move || live.clone()),
+            ],
+            4,
+        );
+        let running = package(dispatcher.next(None));
+        assert_eq!(running.pipeline.0, 0);
+        assert!(!started(&log, "down"), "nothing was published");
+        arrive(&dispatcher, PipelineId(1), &rows, 2);
+        assert!(started(&log, "down"));
+        assert!(
+            !dispatcher.is_done(PipelineId(0)),
+            "the upstream still has a morsel running"
+        );
+        let down = package(dispatcher.next(Some(PipelineId(1))));
+        assert_eq!((down.pipeline.0, bounds(&down.guard)), (1, (0, 1)));
+        dispatcher.ack(running);
+        dispatcher.ack(down);
+    }
+
+    /// A pipeline that streams from one that publishes nothing starts when that one finishes,
+    /// with its source closed, and finishes without a morsel.
+    #[test]
+    fn a_streaming_pipeline_starts_at_the_upstream_finish_when_nothing_was_published() {
+        let log = Log::default();
+        let (source, _) = live_source();
+        let live: Arc<dyn MorselSource> = source.clone();
+        let dispatcher = Dispatcher::new(
+            vec![
+                logged("up", &log, &[], &[], || Arc::new(RangeSource::new(0))),
+                logged("down", &log, &[], &[0], move || live.clone()),
+            ],
+            4,
+        );
+        assert!(!started(&log, "down"));
+        // Not `serve`: a pipeline that is not closed would park the worker for good.
+        assert!(matches!(dispatcher.next(None), Next::Done));
+        assert!(
+            position(&log, "finish up") < position(&log, "start down"),
+            "{:?}",
+            log.lock_wait()
+        );
+        assert!(dispatcher.all_done());
+    }
+
+    /// A pipeline that streams from one upstream and follows a build side does not start while
+    /// the build side is unfinished, though a region was published to it and its upstream
+    /// finished. It starts when the build side finishes, and its source holds the region.
+    #[test]
+    fn a_published_pipeline_stays_blocked_while_a_build_side_is_unfinished() {
+        let log = Log::default();
+        let (source, rows) = live_source();
+        let live: Arc<dyn MorselSource> = source.clone();
+        let dispatcher = Dispatcher::new(
+            vec![
+                logged("build", &log, &[], &[], || Arc::new(RangeSource::new(1))),
+                logged("up", &log, &[], &[], || Arc::new(RangeSource::new(1))),
+                logged("probe", &log, &[0], &[1], move || live.clone()),
+            ],
+            4,
+        );
+        let build = package(dispatcher.next(Some(PipelineId(0))));
+        let up = package(dispatcher.next(Some(PipelineId(1))));
+        assert_eq!((build.pipeline.0, up.pipeline.0), (0, 1));
+        arrive(&dispatcher, PipelineId(2), &rows, 3);
+        dispatcher.ack(up);
+        assert!(matches!(dispatcher.next(None), Next::Wait));
+        assert!(
+            dispatcher.is_done(PipelineId(1)),
+            "the stream's upstream finished"
+        );
+        assert!(
+            !started(&log, "probe"),
+            "the build side is unfinished: {:?}",
+            log.lock_wait()
+        );
+        dispatcher.ack(build);
+        assert!(started(&log, "probe"));
+        assert!(
+            position(&log, "finish build") < position(&log, "start probe"),
+            "{:?}",
+            log.lock_wait()
+        );
+        let mut worker = Recorder::default();
+        dispatcher.serve(&mut worker);
+        assert_eq!(
+            worker.morsels,
+            [(2, (0, 2))],
+            "the region published while blocked"
+        );
+    }
+
+    /// A pipeline streaming from two upstreams is closed when the last of them finishes, and not
+    /// when the first does: a region published after the first finished is claimed, and the
+    /// pipeline stays open until the second finishes.
+    #[test]
+    fn a_stream_from_two_pipelines_closes_when_the_last_finishes() {
+        let log = Log::default();
+        let (source, rows) = live_source();
+        let live: Arc<dyn MorselSource> = source.clone();
+        let dispatcher = Dispatcher::new(
+            vec![
+                logged("a", &log, &[], &[], || Arc::new(RangeSource::new(1))),
+                logged("b", &log, &[], &[], || Arc::new(RangeSource::new(1))),
+                logged("down", &log, &[], &[0, 1], move || live.clone()),
+            ],
+            4,
+        );
+        arrive(&dispatcher, PipelineId(2), &rows, 2);
+        let a = package(dispatcher.next(Some(PipelineId(0))));
+        let b = package(dispatcher.next(Some(PipelineId(1))));
+        let down = package(dispatcher.next(Some(PipelineId(2))));
+        dispatcher.ack(a);
+        dispatcher.ack(down);
+        assert!(matches!(dispatcher.next(None), Next::Wait), "b is running");
+        assert!(dispatcher.is_done(PipelineId(0)));
+        assert!(
+            !dispatcher.is_done(PipelineId(2)),
+            "the second upstream is running"
+        );
+
+        arrive(&dispatcher, PipelineId(2), &rows, 2);
+        let later = package(dispatcher.next(Some(PipelineId(2))));
+        assert_eq!(
+            (later.pipeline.0, bounds(&later.guard)),
+            (2, (2, 3)),
+            "a region published after the first upstream finished"
+        );
+        dispatcher.ack(later);
+        dispatcher.ack(b);
+        assert!(matches!(dispatcher.next(None), Next::Done));
+        assert!(dispatcher.all_done());
+    }
+
+    /// The source builder of a pipeline runs on the thread whose publish released the pipeline's
+    /// last wait, so the builder is under the contract of a publisher.
+    #[test]
+    fn the_builder_of_a_streaming_pipeline_runs_on_the_publishing_thread() {
+        let built_on = Arc::new(Mutex::new(None));
+        let (source, rows) = live_source();
+        let live: Arc<dyn MorselSource> = source.clone();
+        let recorded = built_on.clone();
+        let dispatcher = Dispatcher::new(
+            vec![
+                PipelineSpec {
+                    after: Vec::new(),
+                    streams_from: Vec::new(),
+                    source: Box::new(|| Arc::new(RangeSource::new(1))),
+                    finalize: None,
+                },
+                PipelineSpec {
+                    after: Vec::new(),
+                    streams_from: vec![PipelineId(0)],
+                    source: Box::new(move || {
+                        *recorded.lock_wait() = Some(std::thread::current().id());
+                        live.clone()
+                    }),
+                    finalize: None,
+                },
+            ],
+            4,
+        );
+        let publisher = std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    arrive(&dispatcher, PipelineId(1), &rows, 1);
+                    std::thread::current().id()
+                })
+                .join()
+                .expect("the publisher returns")
+        });
+        assert_eq!(*built_on.lock_wait(), Some(publisher));
+        assert_ne!(publisher, std::thread::current().id());
+    }
+
+    /// Make the keys `first..=last` ready at a live source and publish them to `pipeline`.
+    fn arrive_keys(dispatcher: &Dispatcher, pipeline: PipelineId, ready: &Ready, keys: (u64, u64)) {
+        let region = uint_range(keys.0, keys.1);
+        {
+            let mut all = ready.ready.lock_wait();
+            *all = all.union(&region);
+        }
+        dispatcher.publish(pipeline, &Projection::admitting(region));
+    }
+
+    /// An upstream worker that publishes the keys of each morsel it ran to the pipeline behind
+    /// it, either as it runs them or all at once when it leaves, and records what the downstream
+    /// pipeline's morsels held.
+    struct Publishing<'a> {
+        dispatcher: &'a Dispatcher,
+        ready: &'a Ready,
+        per_morsel: bool,
+        held: Vec<(u64, u64)>,
+        downstream: Vec<(u64, u64)>,
+    }
+
+    impl PoolWorker for Publishing<'_> {
+        fn work(&mut self, package: &WorkPackage) {
+            let keys = bounds(&package.guard);
+            match package.pipeline.0 {
+                0 if self.per_morsel => {
+                    arrive_keys(self.dispatcher, PipelineId(1), self.ready, keys)
+                }
+                0 => self.held.push(keys),
+                _ => self.downstream.push(keys),
+            }
+        }
+
+        fn leave(&mut self, pipeline: PipelineId) {
+            if pipeline.0 == 0 {
+                for keys in self.held.drain(..) {
+                    arrive_keys(self.dispatcher, PipelineId(1), self.ready, keys);
+                }
+            }
+        }
+    }
+
+    /// Run `body` on a thread of its own and fail if it does not finish within a minute, which
+    /// is how a lost wake-up shows.
+    fn finishes_within_a_minute<T: Send + 'static>(body: impl FnOnce() -> T + Send + 'static) -> T {
+        let (done, finished) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(body());
+        });
+        finished
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the run finished: a lost wake-up leaves a worker parked")
+    }
+
+    /// One round: `threads` workers over an upstream of `rows` positions and a downstream that
+    /// streams from it. Every downstream position is claimed once, and the downstream finishes
+    /// after the upstream.
+    fn stream_round(threads: usize, rows: u64, per_morsel: bool) {
+        let log = Log::default();
+        let (source, ready) = live_source();
+        let live: Arc<dyn MorselSource> = source.clone();
+        let dispatcher = Dispatcher::new(
+            vec![
+                logged("up", &log, &[], &[], move || {
+                    Arc::new(RangeSource::new(rows))
+                }),
+                logged("down", &log, &[], &[0], move || live.clone()),
+            ],
+            4,
+        );
+        let claimed: Vec<(u64, u64)> = std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    scope.spawn(|| {
+                        let _fail = FailOnUnwind(&dispatcher);
+                        let mut worker = Publishing {
+                            dispatcher: &dispatcher,
+                            ready: &ready,
+                            per_morsel,
+                            held: Vec::new(),
+                            downstream: Vec::new(),
+                        };
+                        dispatcher.serve(&mut worker);
+                        worker.downstream
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .flat_map(|worker| worker.join().expect("a worker returns"))
+                .collect()
+        });
+        let mut positions: Vec<u64> = claimed.iter().flat_map(|&(a, b)| a..=b).collect();
+        positions.sort_unstable();
+        assert_eq!(
+            positions,
+            (0..rows).collect::<Vec<_>>(),
+            "each position once"
+        );
+        assert!(dispatcher.all_done());
+        assert!(
+            position(&log, "finish up") < position(&log, "finish down"),
+            "the downstream finishes last: {:?}",
+            log.lock_wait()
+        );
+    }
+
+    /// Eight workers, 200 rounds: the upstream's workers publish per morsel, and the downstream
+    /// starts at the first publish and claims every position once.
+    #[test]
+    fn a_stream_published_per_morsel_is_claimed_once_across_threads() {
+        finishes_within_a_minute(|| (0..200).for_each(|_| stream_round(8, 64, true)));
+    }
+
+    /// The same when each upstream worker publishes everything it ran when it leaves.
+    #[test]
+    fn a_stream_published_when_the_workers_leave_is_claimed_once_across_threads() {
+        finishes_within_a_minute(|| (0..200).for_each(|_| stream_round(8, 64, false)));
+    }
+
+    /// A worker of the upstream panics while a pipeline streams from it and nothing was
+    /// published: the dispatcher fails, every other worker gets `Done`, and none stays parked.
+    #[test]
+    fn a_panicking_upstream_worker_fails_a_streaming_dispatcher() {
+        struct PanicsOnce<'a>(&'a AtomicBool);
+        impl PoolWorker for PanicsOnce<'_> {
+            fn work(&mut self, _package: &WorkPackage) {
+                assert!(
+                    self.0.swap(true, Ordering::AcqRel),
+                    "the first morsel panics"
+                );
+            }
+
+            fn leave(&mut self, _pipeline: PipelineId) {}
+        }
+        finishes_within_a_minute(|| {
+            let log = Log::default();
+            let (source, _) = live_source();
+            let live: Arc<dyn MorselSource> = source.clone();
+            let dispatcher = Dispatcher::new(
+                vec![
+                    logged("up", &log, &[], &[], || Arc::new(RangeSource::new(64))),
+                    logged("down", &log, &[], &[0], move || live.clone()),
+                ],
+                4,
+            );
+            let panicked = AtomicBool::new(false);
+            let results: Vec<_> = std::thread::scope(|scope| {
+                let workers: Vec<_> = (0..4)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            let _fail = FailOnUnwind(&dispatcher);
+                            dispatcher.serve(&mut PanicsOnce(&panicked));
+                        })
+                    })
+                    .collect();
+                workers.into_iter().map(|worker| worker.join()).collect()
+            });
+            assert_eq!(results.iter().filter(|r| r.is_err()).count(), 1);
+            assert!(!dispatcher.all_done(), "the run did not complete");
+            assert!(matches!(dispatcher.next(None), Next::Done));
+        });
+    }
+
+    /// A source that answers its first claim `Idle` after `hook` ran, and `Exhausted` from then
+    /// on: the claim of one worker that is in flight while another worker's claim finds the
+    /// source exhausted.
+    struct IdleOnce {
+        hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    }
+
+    impl MorselSource for IdleOnce {
+        fn claim(&self, _rows: u64) -> Claim {
+            let hook = self.hook.lock_wait().take();
+            match hook {
+                Some(hook) => {
+                    hook();
+                    Claim::Idle
+                }
+                None => Claim::Exhausted,
+            }
+        }
+    }
+
+    /// A claim that answers `Idle` while another worker's claim answers `Exhausted` leaves the
+    /// pipeline complete when its in-flight count drops, and it is that decrement that finishes
+    /// it: the other worker's attempt saw the claim outstanding.
+    #[test]
+    fn an_idle_claim_that_ends_after_the_source_was_found_exhausted_finishes_the_pipeline() {
+        let handle = Arc::new(OnceLock::<Arc<Dispatcher>>::new());
+        let other_worker = handle.clone();
+        let source: Arc<dyn MorselSource> = Arc::new(IdleOnce {
+            hook: Mutex::new(Some(Box::new(move || {
+                let dispatcher = other_worker.get().expect("the dispatcher is set");
+                assert!(matches!(dispatcher.next(None), Next::Wait));
+                assert!(
+                    !dispatcher.is_done(MAIN_PIPELINE),
+                    "the first claim is still in flight"
+                );
+            }))),
+        });
+        let dispatcher = Arc::new(Dispatcher::new(
+            vec![PipelineSpec {
+                after: Vec::new(),
+                streams_from: Vec::new(),
+                source: Box::new(move || source.clone()),
+                finalize: None,
+            }],
+            4,
+        ));
+        assert!(handle.set(dispatcher.clone()).is_ok());
+        assert!(matches!(dispatcher.next(None), Next::Done));
+        assert!(dispatcher.is_done(MAIN_PIPELINE));
+    }
+
+    /// A worker parked with nothing claimable wakes when a publish starts a pipeline that
+    /// streams from a live one, runs its morsel, and returns when the upstream closes.
+    #[test]
+    fn a_parked_worker_wakes_when_a_publish_starts_a_streaming_pipeline() {
+        let log = Log::default();
+        let (up_source, up_rows) = live_source();
+        let (down_source, down_rows) = live_source();
+        let (up, down): (Arc<dyn MorselSource>, Arc<dyn MorselSource>) =
+            (up_source.clone(), down_source.clone());
+        let dispatcher = Dispatcher::new(
+            vec![
+                logged("up", &log, &[], &[], move || up.clone()),
+                logged("down", &log, &[], &[0], move || down.clone()),
+            ],
+            4,
+        );
+        std::thread::scope(|scope| {
+            let _fail = FailOnUnwind(&dispatcher);
+            let worker = scope.spawn(|| {
+                let mut worker = Recorder::default();
+                dispatcher.serve(&mut worker);
+                worker
+            });
+            wait_until(|| dispatcher.parked.load(Ordering::Acquire) == 1);
+            arrive(&dispatcher, PipelineId(1), &down_rows, 2);
+            wait_until(|| uint_keys_in(&down_source.claimed(), u64::MAX).len() == 2);
+            assert!(!worker.is_finished(), "the upstream is open");
+            arrive(&dispatcher, PipelineId(0), &up_rows, 1);
+            dispatcher.close(PipelineId(0));
+            wait_until(|| worker.is_finished());
+            let worker = worker
+                .join()
+                .expect("the worker returns once both are closed");
+            assert_eq!(worker.morsels, [(1, (0, 1)), (0, (0, 0))]);
+            assert!(dispatcher.all_done());
+        });
+    }
+
+    #[test]
+    #[should_panic(expected = "a pipeline streams from earlier pipelines only")]
+    fn a_pipeline_streaming_from_a_later_one_is_rejected() {
+        let log = Log::default();
+        Dispatcher::new(
+            vec![
+                logged("a", &log, &[], &[1], || Arc::new(RangeSource::new(1))),
+                logged("b", &log, &[], &[], || Arc::new(RangeSource::new(1))),
+            ],
+            4,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a pipeline depends on another once")]
+    fn a_pipeline_that_follows_and_streams_from_one_pipeline_is_rejected() {
+        let log = Log::default();
+        Dispatcher::new(
+            vec![
+                logged("a", &log, &[], &[], || Arc::new(RangeSource::new(1))),
+                logged("b", &log, &[0], &[0], || Arc::new(RangeSource::new(1))),
+            ],
+            4,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a pipeline depends on another once")]
+    fn a_pipeline_that_follows_one_pipeline_twice_is_rejected() {
+        let log = Log::default();
+        Dispatcher::new(
+            vec![
+                logged("a", &log, &[], &[], || Arc::new(RangeSource::new(1))),
+                logged("b", &log, &[0, 0], &[], || Arc::new(RangeSource::new(1))),
+            ],
+            4,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "a pipeline depends on another once")]
+    fn a_pipeline_that_streams_from_one_pipeline_twice_is_rejected() {
+        let log = Log::default();
+        Dispatcher::new(
+            vec![
+                logged("a", &log, &[], &[], || Arc::new(RangeSource::new(1))),
+                logged("b", &log, &[], &[0, 0], || Arc::new(RangeSource::new(1))),
+            ],
+            4,
+        );
+    }
+
     /// What reaches a pipeline before it starts is kept for its source: an arrival published to
     /// a pipeline behind another is claimed once the first finishes.
     #[test]
@@ -1767,11 +2384,13 @@ mod tests {
             vec![
                 PipelineSpec {
                     after: Vec::new(),
+                    streams_from: Vec::new(),
                     source: Box::new(|| Arc::new(RangeSource::new(2))),
                     finalize: None,
                 },
                 PipelineSpec {
                     after: vec![PipelineId(0)],
+                    streams_from: Vec::new(),
                     source: Box::new(move || live.clone()),
                     finalize: None,
                 },
@@ -1896,6 +2515,7 @@ mod tests {
             let dispatcher = Dispatcher::new(
                 vec![PipelineSpec {
                     after: Vec::new(),
+                    streams_from: Vec::new(),
                     source: Box::new(move || Arc::new(RangeSource::new(rows))),
                     finalize: Some(Box::new(move || {
                         assert_eq!(
@@ -1965,11 +2585,13 @@ mod tests {
             vec![
                 PipelineSpec {
                     after: Vec::new(),
+                    streams_from: Vec::new(),
                     source: Box::new(|| Arc::new(RangeSource::new(40))),
                     finalize: Some(Box::new(|| panic!("the breaker's combine failed"))),
                 },
                 PipelineSpec {
                     after: vec![PipelineId(0)],
+                    streams_from: Vec::new(),
                     source: Box::new(|| Arc::new(RangeSource::new(40))),
                     finalize: None,
                 },

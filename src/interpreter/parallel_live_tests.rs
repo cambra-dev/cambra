@@ -376,6 +376,7 @@ mod end_to_end {
         let dispatcher = Arc::new(Dispatcher::new(
             vec![PipelineSpec {
                 after: Vec::new(),
+                streams_from: Vec::new(),
                 source: Box::new(move || source.clone()),
                 finalize: None,
             }],

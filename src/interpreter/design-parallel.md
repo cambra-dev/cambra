@@ -149,15 +149,38 @@ morsel is outstanding, and no worker is still attached. A claim counts itself ou
 asks the source and takes the count back when the source answers `Idle` or `Exhausted`. A worker
 attaches when it receives its first package of the pipeline and leaves once the source is exhausted,
 handing in what it holds for the pipeline through `PoolWorker::leave`. The worker that completes the
-pipeline, by its last `ack`, its `Exhausted` claim or its leaving, runs `finalize` and finishes it.
-Nothing is outstanding and no worker is attached only after every claim that answered a morsel was
-acknowledged: a claim attaches before it acknowledges.
+pipeline, by its last `ack`, its `Exhausted` claim, its `Idle` claim that ends after another
+claim found the source exhausted, or its leaving, runs `finalize` and finishes it. Each of those
+events is followed by a finish attempt, because the last of them is the one that makes the counts
+agree, and a claim that ends `Idle` is the last when another worker's `Exhausted` claim saw it
+outstanding. Nothing is outstanding and no worker is attached only after every claim that answered
+a morsel was acknowledged: a claim attaches before it acknowledges.
 
 **A pipeline starts when the pipelines it follows have finished.** Finishing a pipeline decrements
 the wait count of each pipeline behind it, and the one that reaches zero builds its source. The
 source is built then because a pipeline behind a breaker reads what the breaker produced. A plan
 lists a pipeline after every pipeline it follows, so the dependencies form no cycle, and the
 dispatcher refuses a plan that does not.
+
+**A pipeline can read a pipeline's output as it is produced.** `PipelineSpec::streams_from` lists
+the pipelines whose output a pipeline reads, which is the pipeline behind a breaker that
+materializes. The pipeline has one more wait than it has `after` entries, and a worker's publish to
+it releases that wait once (`Job::stream_released`): the pipeline starts at the first region
+published to it, before the pipeline it streams from has finished, when nothing else is awaited. A
+pipeline in `streams_from` that finishes decrements `streams_open` of each pipeline in its
+`stream_readers`, and the last of them closes the pipeline and releases the wait if no publish did,
+after its `finalize`. The pipeline behind a breaker that published nothing therefore starts at the
+upstream's finish with its source closed, and finishes without a morsel. The closing goes before the
+release, which builds that pipeline closed; the order is not otherwise observable at the source. A
+region published while the pipeline waits on a build side or on a pipeline in `after` is kept in
+`Early` and handed to the source when it is built, so the dependencies compose: the pipeline starts
+when both are satisfied, and no published region is lost. A pipeline lists each earlier pipeline
+once, in `after` or in `streams_from`, which the dispatcher checks.
+
+The publish that releases a pipeline's last wait builds its source on the publishing thread, which
+is an upstream worker inside `work` or `leave` or a consumer's `notify`. The source builder runs
+inside that publish: it takes no lock the publisher may hold and does not re-enter the breaker's
+notification.
 
 **Idle workers park.** A worker that finds nothing claimable reads the dispatcher's epoch before it
 looks, and parks until the epoch moves. The epoch moves when a pipeline's source is exhausted, when
@@ -402,7 +425,20 @@ empty pipeline starts the ones behind it, and a pipeline behind two starts after
 on a later pipeline is refused; a worker stays on its pipeline; eight workers over a chain of two
 pipelines claim every position of each once, start each pipeline once and leave each pipeline they
 claimed from; an idle worker parks while another holds a morsel and wakes when the pipeline
-finishes; a failure wakes a parked worker. `source_of` finds the one source, and refuses a chain
+finishes; a failure wakes a parked worker; a claim that ends `Idle` after another found the source
+exhausted finishes the pipeline. A worker's turn is the same through `serve` and through
+repeated `serve_until_wait` calls with one `ServeState`: the same packages and the same `leave`
+calls, with a wait at each unpublished arrival over a live source. A pipeline that streams from
+another starts at the first publish to it while the other has a morsel running, starts at the
+other's finish with its source closed when nothing was published, stays blocked on a build side
+although published and starts when the build side finishes with the region it was published, is
+closed only when the last of two upstreams finishes, with a region published after the first
+finished still claimed, builds its source on the publishing thread, and starts a parked worker; a
+stream from a later pipeline and a pipeline listed twice, in `after` or in `streams_from`, or in
+both, are refused. Eight workers over 200 rounds, with the upstream's workers publishing per morsel
+or all at once when they leave, claim every downstream position once, and the downstream finishes
+after the upstream. A panicking upstream worker fails the dispatcher and no worker stays parked.
+`source_of` finds the one source, and refuses a chain
 with none and a chain with two.
 
 `LiveSource` has unit tests in `iterate.rs`: it claims only what was published, a region published

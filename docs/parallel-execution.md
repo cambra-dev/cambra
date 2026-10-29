@@ -551,8 +551,12 @@ the breaker, so no consumer of one pipeline is notified by an operator of anothe
 on a chain's notification path ([The scheduler](#the-scheduler)) applies to one pipeline at a time.
 The breaker raises its own region when a worker has merged a morsel.
 
+The dispatcher starts a pipeline that streams from another at the first region published to it,
+so the pipeline behind a breaker that materializes can run while the pipeline before it still has
+morsels ([The dispatcher](../src/interpreter/design-parallel.md#the-dispatcher)).
+
 **Not implemented.** No breaker raises a region, and `plan_main` admits no pipeline behind a
-breaker: the pipeline behind one starts when the pipeline before it finishes.
+breaker.
 
 ### Build sides
 
