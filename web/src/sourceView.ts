@@ -1,4 +1,12 @@
-// The read-only CodeMirror 6 source editor plus its interactivity.
+// The CodeMirror 6 source editor plus its interactivity.
+//
+// Read-only unless the page holds an `EditSession` (reload.ts), which it does
+// when the server takes a reload. Then the reader edits the program and
+// `Mod-Enter` reloads `main` with it. Every lookup below is over the payload's
+// byte spans, which describe the compiled text, so while the document differs
+// from it the pane is "edited": hover, goto-definition and selection are off,
+// and no span is painted, rather than pointing at whatever text now sits at
+// those bytes.
 //
 // All interactivity is a pure client-side lookup over the snapshot, routed
 // through the store's offset bridge and per-pane indices:
@@ -16,23 +24,40 @@
 // up. Squiggles work on the degraded snapshot too (no IR, but diagnostics
 // present).
 
-import { EditorState, StateEffect, StateField } from "@codemirror/state";
+import {
+  Compartment,
+  EditorSelection,
+  EditorState,
+  type Extension,
+  StateEffect,
+  StateField,
+} from "@codemirror/state";
 import {
   Decoration,
   type DecorationSet,
   EditorView,
   drawSelection,
   hoverTooltip,
+  keymap,
   lineNumbers,
   type Tooltip,
 } from "@codemirror/view";
+import {
+  history,
+  historyKeymap,
+  indentLess,
+  indentMore,
+  insertNewlineAndIndent,
+} from "@codemirror/commands";
+import { indentUnit } from "@codemirror/language";
 import { type Diagnostic as CMDiagnostic, setDiagnostics } from "@codemirror/lint";
 
 import { cambraSyntax, highlightNow } from "./cambraSyntax";
 import type { Indices } from "./indices";
-import type { OffsetMap } from "./offsets";
+import { OffsetMap } from "./offsets";
+import type { EditSession, EditStatus } from "./reload";
 import { SOURCE_PANE, type Resolved, type Selection, type Store } from "./store";
-import type { RewriteInfo } from "./types";
+import type { Diagnostic, RewriteInfo } from "./types";
 
 // The data a hover tooltip renders at a byte offset: the tightest enclosing
 // node's label, its type set (`typesAt`), its rewrite tag, and — if the position
@@ -175,9 +200,94 @@ const highlightField = StateField.define<DecorationSet>({
   provide: (f) => EditorView.decorations.from(f),
 });
 
+/**
+ * `diagnostics`, as byte spans into `text`, converted to CodeMirror's char
+ * offsets and clamped to a document `length` long.
+ *
+ * The clamp is for a document that has changed since `text` was taken from it:
+ * the reader keeps typing while a reload is in flight, and CodeMirror throws on
+ * a mark past the end.
+ */
+export function editorDiagnostics(
+  diagnostics: readonly Diagnostic[],
+  text: string,
+  length: number,
+): CMDiagnostic[] {
+  const offsets = new OffsetMap(text);
+  const out: CMDiagnostic[] = [];
+  for (const d of diagnostics) {
+    if (!d.span) continue;
+    const from = Math.min(offsets.byteToChar(d.span.start), length);
+    const to = Math.min(offsets.byteToChar(d.span.end), length);
+    out.push({
+      from,
+      to: to > from ? to : Math.min(from + 1, length),
+      severity: d.severity === "error" ? "error" : "warning",
+      message: d.message,
+    });
+  }
+  return out;
+}
+
+/** How the reload chord is written on this platform. */
+function chordLabel(): string {
+  return /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘⏎" : "Ctrl+Enter";
+}
+
+/**
+ * The status strip's text, and the modifier class that colours it.
+ *
+ * A reload in flight or its refusal outranks an edit, because those are the
+ * answer to the last thing the reader asked for; an edit outranks an accepted
+ * reload, because the text on screen is then no longer the version that was
+ * accepted.
+ */
+export function statusLine(
+  status: EditStatus,
+  edited: boolean,
+): { text: string; kind: string; title?: string } {
+  const chord = chordLabel();
+  switch (status.kind) {
+    case "reloading":
+      return { text: "reloading…", kind: "busy" };
+    case "rejected": {
+      const marked = status.diagnostics.filter((d) => d.span !== null).length;
+      if (marked > 0) {
+        const errors = marked === 1 ? "1 error" : `${marked} errors`;
+        return {
+          text: `rejected · ${errors} underlined · the running version is unchanged`,
+          kind: "error",
+          title: status.message,
+        };
+      }
+      const first = status.message.split("\n").find((l) => l.trim() !== "") ?? status.message;
+      return { text: `rejected · ${first.replace(/^error: /, "")}`, kind: "error", title: status.message };
+    }
+    case "failed":
+      return { text: `reload failed · ${status.message}`, kind: "error", title: status.message };
+    case "finished":
+      return { text: "the program has finished · a finished program takes no reload", kind: "idle" };
+    default:
+      break;
+  }
+  if (edited) return { text: `edited · not compiled · ${chord} reloads`, kind: "edited" };
+  if (status.kind === "reloaded") {
+    return { text: `reloaded · ${status.kept} of ${status.bound} operators kept`, kind: "ok" };
+  }
+  return { text: `${chord} reloads the running program with this text`, kind: "idle" };
+}
+
 export class SourceView {
   readonly view: EditorView;
   private readonly store: Store;
+  // The text the payload describes. The document is `edited` while it differs.
+  private readonly compiled: string;
+  private edited: boolean;
+  private readonly session: EditSession | undefined;
+  private readonly status: HTMLElement | null = null;
+  private readonly releases: (() => void)[] = [];
+  // Holds the editing extensions, so a run that ends can take them away.
+  private readonly editability = new Compartment();
   // The post-inference pane's indices, used for hover types + goto-def. May be
   // undefined on a degraded snapshot (no panes); interactions then degrade.
   private readonly anchor: Indices | undefined;
@@ -190,9 +300,18 @@ export class SourceView {
     // it, because `--inspect-only` holds the socket open and silent rather than
     // refusing it, and the pane says so itself.
     onInspect?: (nodeId: number, operators: readonly number[]) => void,
+    // Present when the server takes a reload, and then the pane is editable.
+    session?: EditSession,
   ) {
     this.store = store;
+    this.session = session;
     const { offsets, snapshot } = store;
+    this.compiled = snapshot.source.text;
+    // A redraw carries the previous pane's edit, when it had one.
+    const carried = session?.carried ?? null;
+    if (session) session.carried = null;
+    const doc = carried?.text ?? this.compiled;
+    this.edited = doc !== this.compiled;
     this.anchor = store.sourceAnchorPaneId
       ? store.indicesFor(store.sourceAnchorPaneId)
       : undefined;
@@ -219,7 +338,7 @@ export class SourceView {
     // Hover tooltip: hovered pos -> tightest node -> label / type set / prov,
     // over the post-inference pane.
     const hover = hoverTooltip((_view, pos): Tooltip | null => {
-      if (!anchor) return null;
+      if (!anchor || this.edited) return null;
       const byte = offsets.charToByte(pos);
       const payload = hoverPayloadAt(anchor, offsets, byte);
       if (!payload) return null;
@@ -303,7 +422,7 @@ export class SourceView {
     // ordinary CodeMirror selection, which `selectionSync` below picks up.
     const interactions = EditorView.domEventHandlers({
       mousedown: (event, view) => {
-        if (event.button !== 0) return false;
+        if (event.button !== 0 || this.edited) return false;
         if (!event.ctrlKey && !event.metaKey) return false;
         const pos = view.posAtCoords({ x: event.clientX, y: event.clientY });
         if (pos === null) return false;
@@ -338,23 +457,43 @@ export class SourceView {
     // rewriting the reader's own range mid-drag would move the end they are
     // still dragging.
     const selectionSync = EditorView.updateListener.of((update) => {
-      if (!update.selectionSet) return;
+      if (!update.selectionSet || this.edited) return;
       const range = update.state.selection.main;
       const from = offsets.charToByte(range.from);
       const to = offsets.charToByte(range.to);
       queueMicrotask(() => store.setSelection({ kind: "source", from, to }, SOURCE_PANE));
     });
 
+    // Entering or leaving the edited state. Entering clears the selection in
+    // every pane, since what it resolved is a span of the compiled text.
+    const editTracking = EditorView.updateListener.of((update) => {
+      if (!update.docChanged) return;
+      const edited = update.state.doc.toString() !== this.compiled;
+      if (edited === this.edited) return;
+      this.edited = edited;
+      queueMicrotask(() => {
+        if (edited) store.setSelection(null, SOURCE_PANE);
+        this.renderSelection(store.getResolved());
+        this.renderStatus();
+      });
+    });
+
     const state = EditorState.create({
-      doc: snapshot.source.text,
+      doc,
+      selection: carried
+        ? EditorSelection.single(
+            Math.min(carried.anchor, doc.length),
+            Math.min(carried.head, doc.length),
+          )
+        : undefined,
       extensions: [
         lineNumbers(),
         // CodeMirror draws no caret in non-editable content, so nothing showed
         // where the reader clicked; `drawSelection` draws both the caret and
         // the selection itself, and puts their colours under this app's CSS.
         drawSelection(),
-        EditorState.readOnly.of(true),
-        EditorView.editable.of(false),
+        this.editability.of(editable(session)),
+        ...(session ? [editTracking] : []),
         EditorView.lineWrapping,
         cambraSyntax,
         highlightField,
@@ -371,6 +510,44 @@ export class SourceView {
 
     // Re-highlight the resolved source spans whenever the selection changes.
     store.subscribe((resolved) => this.renderSelection(resolved));
+
+    if (session) {
+      parent.classList.add("editable");
+      this.status = parent.appendChild(document.createElement("div"));
+      this.status.className = "edit-status";
+      this.releases.push(session.subscribe((status) => this.onStatus(status)));
+      // A refusal outlives the redraw a reload from elsewhere causes, so its
+      // marks are put back when the document is still the text refused.
+      this.onStatus(session.get());
+      if (carried?.focused) this.view.focus();
+    }
+  }
+
+  /** Whether the document differs from the text the payload describes. */
+  get isEdited(): boolean {
+    return this.edited;
+  }
+
+  private onStatus(status: EditStatus): void {
+    if (status.kind === "finished" && this.view.state.facet(EditorView.editable)) {
+      this.view.dispatch({ effects: this.editability.reconfigure(editable(undefined)) });
+    }
+    if (status.kind === "rejected" && status.diagnostics.length > 0) {
+      const marks = editorDiagnostics(status.diagnostics, status.source, this.view.state.doc.length);
+      if (this.view.state.doc.toString() === status.source || marks.length > 0) {
+        this.view.dispatch(setDiagnostics(this.view.state, marks));
+      }
+    }
+    this.renderStatus();
+  }
+
+  private renderStatus(): void {
+    if (!this.status || !this.session) return;
+    const line = statusLine(this.session.get(), this.edited);
+    this.status.textContent = line.text;
+    this.status.dataset.kind = line.kind;
+    if (line.title) this.status.title = line.title;
+    else this.status.removeAttribute("title");
   }
 
   /**
@@ -379,11 +556,27 @@ export class SourceView {
    * it this store's snapshot, after the view leaves the page.
    */
   dispose(): void {
+    for (const release of this.releases) release();
+    if (this.session) {
+      const { anchor, head } = this.view.state.selection.main;
+      this.session.carried = {
+        text: this.edited ? this.view.state.doc.toString() : null,
+        anchor,
+        head,
+        focused: this.view.hasFocus,
+      };
+    }
     this.view.destroy();
   }
 
   /** Reflect the resolved selection as source-span highlights. */
   private renderSelection(resolved: Resolved): void {
+    // The spans are bytes of the compiled text, which an edited document no
+    // longer is.
+    if (this.edited) {
+      this.view.dispatch({ effects: setHighlights.of(null) });
+      return;
+    }
     const spans = resolved.result.sourceSpans;
     const pointedAt = resolved.pointedAt;
     if (spans.length === 0 && pointedAt === null) {
@@ -421,4 +614,49 @@ export class SourceView {
     this.view.dispatch({ effects });
   }
 
+}
+
+/**
+ * Whether the pane takes typing, and what it adds when it does: editable while
+ * `session` is present and its run has not ended.
+ */
+function editable(session: EditSession | undefined): Extension {
+  const live = session !== undefined && !session.finished;
+  return [
+    EditorState.readOnly.of(!live),
+    EditorView.editable.of(live),
+    ...(live ? [editing(session)] : []),
+  ];
+}
+
+/**
+ * What an editable pane adds: indentation, undo, and the reload chord.
+ *
+ * `indentUnit` is two spaces, as the gallery is written. CHL is off-side-rule,
+ * so a block's indentation is part of the program: `Tab` and `Shift-Tab` move
+ * the selected lines by one unit, and `Enter` keeps the line's indentation.
+ * `Mod-]` and `Mod-[` do the same as `Tab` and `Shift-Tab`, because `Tab` is
+ * also how a keyboard leaves the editor. `defaultKeymap` is not taken: it binds
+ * `Mod-Enter` to `insertBlankLine`, and `Mod-Enter` is the reload.
+ */
+function editing(session: EditSession): Extension {
+  return [
+    indentUnit.of("  "),
+    history(),
+    keymap.of([
+      {
+        key: "Mod-Enter",
+        preventDefault: true,
+        run: (view) => {
+          void session.reload(view.state.doc.toString());
+          return true;
+        },
+      },
+      { key: "Enter", run: insertNewlineAndIndent },
+      { key: "Tab", run: indentMore, shift: indentLess, preventDefault: true },
+      { key: "Mod-]", run: indentMore, preventDefault: true },
+      { key: "Mod-[", run: indentLess, preventDefault: true },
+      ...historyKeymap,
+    ]),
+  ];
 }

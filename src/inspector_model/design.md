@@ -115,6 +115,12 @@ and the cache would outgrow the operator count. A tag is kept only if the new pa
 span, the same source text under it and the same label (`resolveTag`). Any other tag is dropped: an
 edit above a construct shifts its bytes and an edit inside it changes its text.
 
+The source pane reloads `main` itself on such a run: `POST /api/reload` hands its text to the
+driver as the control port's `/reload` of `main` (`src/inspector_server/reload.rs`), and the page
+follows the result like any other reload. Its text is not the payload's while the reader edits
+it, so the pane's span lookups are off until the two agree again
+([web/README.md](../../web/README.md#editing-the-program)).
+
 Only `main` is followed. Every branch's producers hold the same `ProbeSlot`, because every branch
 subscribes under the one `Scheduler`
 ([program-evolution.md](../ccl/design/program-evolution.md#the-branch-table)). An operator another
