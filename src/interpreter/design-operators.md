@@ -802,6 +802,41 @@ no notification, returns the previous tile, and leaves both wakeup and sink-pull
 That last case is quiescence relative to the current inputs, not proof that no source can change
 later.
 
+## Pipeline breakers
+
+A pipeline breaker is the end of a pipeline: it consumes the input it owns into state of its own.
+`Breaker` (`src/interpreter/tile_operators/mod.rs`) holds `consume_impl`, which a driver calls. A
+breaker that also answers pulls from that state is a producer: `BreakingProducer`, a subtrait of
+`TileProducer` and `Breaker`, adds `input` (the producer `consume_impl` pulls), `held`, `finalize`,
+`pushes_while_consuming` and `offer_impl`.
+
+| Call | What it does |
+|---|---|
+| `consume_impl(guard)` | Pulls the input at `guard`, merges the answer into the breaker's state, and releases the input at the guard the answer states once it has taken delivery of the answer. The caller handles no tile. |
+| `finalize()` | Returns what the breaker holds as a guard of its tiling: `held()` less the guard its readers have released. It asserts that the input has stated everything complete, and wakes no one. |
+| `pushes_while_consuming()` | Whether what `held()` names after a consume is final, so a driver may push it before the breaker's pipeline finishes. The default answers `true`. |
+| `offer_impl(guard)` | Answers from the state `consume_impl` built and pulls nothing. The breaker's own `get_impl` calls it once the breaker is consuming. |
+
+An operator that consumes its input into state of its own is a breaker. `Memo` starts in the pull
+mode described in [The producer protocol](#the-producer-protocol) and is a consuming memo from its
+first `consume_impl`, which it stays. A consuming memo answers from its cache, and the cache's
+statement says which region that answer covers. A consume over a memo whose input has drained pulls
+nothing.
+
+A release removes rows from the cache and leaves the cached tile's statement as it was, so the guard
+`finalize` returns is the tile's guard less the memo's released guard. `guard_minus` spells that
+difference for guards of a collection's outermost keys, of a scalar and of an aggregation, none of
+them qualified by an enclosing path, and for a record of such guards field by field. Two guards of a
+collection's keys at any levels differ as their projections do. A state of another shape has no
+spelling, and `finalize` panics naming the gap instead of answering a smaller or larger region.
+
+The memo's consumer is woken by the input's notifications, which reach it as they do for a memo in
+pull mode, and by the rule that wakes it when a pull finds rows no notification announced. A consume
+that changes the cache wakes it as well: the notification that made a region dirty may have been
+answered by a pull of the cache before the consume, and no later notification follows. `finalize`
+queues no wake. A breaker with no handle on its consumer announces nothing, so the caller of its
+`consume_impl` announces a change to its consumer.
+
 ## Tile Operators
 
 Each `TileOperator` is a static (compile-time) node in the dataflow graph. It knows its output
@@ -897,7 +932,7 @@ derived from the edges on both sides of the wire rather than serialized separate
 | `MapAggregate` | Collection chain of at least two levels | Enclosing levels ending in `Aggregation` | Folds the innermost collection, preserving the levels above it. |
 | `MapExtractAggregate` | Collection chain ending in `Aggregation` | Enclosing levels ending in the accumulator tiling | Extracts terminal results and removes innermost keys whose aggregates are not terminal. |
 | `FanOut` | `*` | Same as input | Allows multiple operators to consume the output of the same operator. Each consumer subscribes via a `FanOut::slot()` handle; the fan-out forwards `get` requests and tracks the intersection of release guards across slots. Constructed via either `FanOut::new` (no cyclic-mode overhead — the common case) or `FanOut::new_cyclic` (for fan-outs whose slots feed back into their own input, e.g. a commit/induction store whose writer reads the store back before proposing, or a mutation-loop body whose other slot is wired to the cyclic prev-accumulator stream). Cyclic mode adds a per-pull tile-cache and a subscribe-in-progress flag so re-entrant subscribes / pulls skip redundant inner work and serve from the cached snapshot instead of re-entering the inner producer. |
-| `Memo` | `*` | Same as input | Caches the output of an operator so it can be repeatedly read without recomputation. Releases each region as it takes delivery of it, so the input can clear its state; once the input is drained the cache is the sole source of the value. Release builds then skip the upstream pull. A debug build probes the drained input once after it drains and again after each notification of a region the pull reads, so an input that answers with released data trips the release-contract check at the input; probing on every pull would re-read a shared subgraph once per path to it. A `Memo` keeps a dirty region of its input, which starts as everything and takes each region the input notifies (`Arrivals`): a pull outside the dirty region answers from the cache and no pull goes below, in every build, apart from that probe, and a pull inside it reads the input and removes what it read. |
+| `Memo` | `*` | Same as input | Caches the output of an operator so it can be repeatedly read without recomputation. Releases each region as it takes delivery of it, so the input can clear its state; once the input is drained the cache is the sole source of the value. Release builds then skip the upstream pull. A debug build probes the drained input once after it drains and again after each notification of a region the pull reads, so an input that answers with released data trips the release-contract check at the input; probing on every pull would re-read a shared subgraph once per path to it. A `Memo` keeps a dirty region of its input, which starts as everything and takes each region the input notifies (`Arrivals`): a pull outside the dirty region answers from the cache and no pull goes below, in every build, apart from that probe, and a pull inside it reads the input and removes what it read. A `Memo` is also a [pipeline breaker](#pipeline-breakers): a consuming memo answers from its cache and pulls nothing. |
 | `ExtractFinal` | Collection source and optional default | Source codomain | Extracts the last live position's value after source completion; see [Final-value extraction](#final-value-extraction). |
 | `UnionOperator` | N inputs of `DataFunction(dᵢ → 𝑇ᵢ)` tilings | `DataFunction(Union(d₀,…,dₙ₋₁) → Scalar(C'))`, or `DataFunction(Union(d₀,…,dₙ₋₁) → DataFunction(𝐵 → 𝑇))` for jagged rows | Merges N function operators into one. The domain is the discriminated union of the arms' domains, and the codomain is one the caller declares. The domain keeps the arms apart, and `final_or_default` dispatches on the arm a row came from. The codomain is the arms' join, because the arms are alternative values at one row. A union node is typed `D ⤇ V`, with `V` the join inference computed in the full type lattice, and op-conversion reads `V` off the node and passes its extent in. The operator does not join the operand tilings: `Extent`'s lattice has variant and range rules but no record rule, so it would join two arms at different record widths to an anonymous positional sum where the type is `{a: Int}`, a shape no row holds. Arms that agree on a tiling keep it, because a `Tiling` carries a layout (struct-of-arrays for a record) that an `Extent` cannot express. Arms whose codomains are collections over different domains, the rows of a jagged collection, merge at the bound `𝐵` the declared codomain gives their domains, beneath which they share the tiling `𝑇`, as a list literal of boxed rows has it (`OpConversionContext::witness_domain_extent`). Other arms whose codomain tilings differ must each fit in one column (`Tiling::is_scalar`: a `Scalar`, or a `Record` of such at any depth), and each is rebuilt as one column, keeping its own record fields, before the arms merge. A flat union (`new_flat`) collapses the arms' domain to the one they share whatever each row holds, a collection included. A realized conditional's legs are over different domains and disjoint only by their gates, so they flat-merge under the domain bound the sum's type declares (`new_flat_over`), which must include every leg's domain. Release is per arm: an incoming `Predicate::Union` guard splits into per-variant predicates, so one arm can be released in full while its siblings still produce. |
 | `VariantWrap` | Payload: `Scalar(Pₜ)` or `DataFunction(D → Scalar(Pₜ))` | `Scalar(Union(P₀,…,Pₙ))` or `DataFunction(D → Scalar(Union))` | **Sum introduction — dual of `VariantProject`.** Wraps the payload under tag `tag`, so that arm holds the payload and every other arm is empty. Arms are keyed by [`FieldKey`], not by position: a tag's *position* is not stable under width subtyping (``{`b} <: {`a | `b}`` renumbers `b`), and an arm set is part of a union column's layout, so a position-keyed arm would need a renumbering coercion at every subsumption. A bare `Scalar` payload (a scalar `VariantCtor`) yields `Scalar(Union)`; a payload *stream* (a `VariantCtor` inside a lambda, `Builtin::VariantWrap(tag)`) is wrapped element-wise **preserving the domain** `D`, so the constructor composes as the RHS of a `≫`. Because the domain is preserved, a domain release forwards to the payload verbatim. A payload that is a collection is one value, held materialized in its arm's cell: an applied `VariantCtor` wraps its whole payload, and a composed one each row's. A cell cannot grow, so a row's cell is emitted once that row's collection is complete. |
