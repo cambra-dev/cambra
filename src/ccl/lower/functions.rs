@@ -155,25 +155,6 @@ pub(super) fn feed_annotation_type(
     Some(lower_type_expr(value, ctx).map(|t| Type::feed(Type::Hole, t)))
 }
 
-/// Validate that the function or lambda has at least one parameter.
-///
-/// The CHL parser already rejects `*args`, `**kwargs`, keyword-only and
-/// default arguments at the syntactic level, so the only remaining check
-/// is that there is at least one positional parameter. Shared between
-/// [`lower_lambda`] and [`lower_function_body`].
-pub(super) fn validate_function_params(
-    fn_span: Span,
-    params: &[Param],
-) -> Result<(), LoweringError> {
-    if params.is_empty() {
-        return Err(LoweringError::unsupported(
-            fn_span,
-            "function/lambda with no parameters not supported",
-        ));
-    }
-    Ok(())
-}
-
 /// Wrap `body_expr` in a single uncurried lambda over `args`.
 ///
 /// Single-arg `(x): body` → `λ x → body`.
@@ -337,11 +318,12 @@ pub(super) fn uncurry_params(
             None => Type::Hole,
         });
     }
+    // No parameter declares the unit, the one empty product a call with no arguments applies.
     let mut lam = Expr::lambda(&tuple_name, Type::Hole, body_with_subs);
-    if elem_anns.iter().any(|t| !matches!(t, Type::Hole))
+    if (elem_anns.is_empty() || elem_anns.iter().any(|t| !matches!(t, Type::Hole)))
         && let TypedExprNode::Lambda { param, .. } = &mut lam.node
     {
-        param.declare(Type::Tuple(elem_anns));
+        param.declare(Type::tuple(elem_anns));
     }
     Ok(lam)
 }
@@ -390,17 +372,12 @@ fn stamp_clauses(
 /// Explicitly nested lambdas can produce the internal `curry` combinator when
 /// they survive inlining. Operator conversion does not compile arbitrary
 /// curried lambda bodies. CHL has no built-in surface `curry` function.
-///
-/// `validate_function_params` only checks for at least one parameter; the
-/// CHL parser already rejects `*args`, `**kwargs`, defaults, and keyword-only
-/// arguments at parse time.
 pub(super) fn lower_lambda(
     lambda_span: Span,
     params: &[Param],
     body: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    validate_function_params(lambda_span, params)?;
     // Mutability of a `Mut(…)`-annotated parameter is its *type* (stamped by
     // `uncurry_params`), checked post-inference — there is no induction registry
     // to mask here. But a plain parameter spelled like an outer transactional
@@ -669,7 +646,6 @@ pub(super) fn lower_function_body(
     body: &[Spanned<ChlStmt>],
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    validate_function_params(fn_span, params)?;
     let outer_bindings: HashSet<String> =
         params.iter().map(|p| p.name.as_str().to_string()).collect();
 

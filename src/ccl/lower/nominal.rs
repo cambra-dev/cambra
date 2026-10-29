@@ -1605,7 +1605,7 @@ pub(super) fn lower_member_call(
     let decl = &named.decl;
     let name = &q.name.node;
     match member.arity() {
-        0 => Err(LoweringError::unsupported(
+        0 if matches!(member, Member::Constructor { .. }) => Err(LoweringError::unsupported(
             span,
             format!(
                 "`{0}::{name}` declares no parameters, so it is a value and not a function: \
@@ -2029,16 +2029,6 @@ fn declare_one(def: &AssociatedDef, ctx: &mut LoweringContext) -> Result<(), Low
         )
         .with_related(first, "first declared here"));
     }
-    let Some(first) = params.first() else {
-        return Err(LoweringError::unsupported(
-            span,
-            format!(
-                "`{}::{name}` declares no parameters; a function of no argument is a constant, \
-                 and an associated value has no spelling yet",
-                decl.name
-            ),
-        ));
-    };
     if let Some(p) = params
         .iter()
         .find(|p| p.annotation.as_ref().is_some_and(is_mut_annotation))
@@ -2062,11 +2052,16 @@ fn declare_one(def: &AssociatedDef, ctx: &mut LoweringContext) -> Result<(), Low
             ),
         ));
     }
-    let is_method = first.name == "self";
-    if is_method && let Some(annotation) = &first.annotation {
+    let receiver = params.first().filter(|p| p.name == "self");
+    let is_method = receiver.is_some();
+    if let Some(annotation) = receiver.and_then(|p| p.annotation.as_ref()) {
         check_self_annotation(&decl, name, annotation, def)?;
     }
-    if is_method && first.annotation.is_none() && !decl.params.is_empty() && block.is_none() {
+    if let Some(first) = receiver
+        && first.annotation.is_none()
+        && !decl.params.is_empty()
+        && block.is_none()
+    {
         return Err(LoweringError::unsupported(
             first.name_span,
             format!(

@@ -480,15 +480,6 @@ fn declare_function(
         }
     }
     let own = declare_type_params(type_params, ctx)?;
-    if params.is_empty() {
-        return Err(LoweringError::unsupported(
-            sig.span,
-            format!(
-                "`{qualified}` declares no parameters; a function of no argument is a \
-                 constant, and a trait's constant has no spelling yet"
-            ),
-        ));
-    }
     // The requirements come first: a parameter's type and the result read the associated
     // types of the ones the clause names, `r::Output`.
     let mut members = Vec::new();

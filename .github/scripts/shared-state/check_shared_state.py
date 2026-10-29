@@ -17,7 +17,7 @@ way to build one impossible to add without writing down why.
 
 Legitimate shared state falls into a few named kinds, listed in `ALLOWED_INNER`:
 notification handles, late-wired operator slots, a fan-out's own branch state,
-and external source handles. Anything else needs a justification comment:
+and external source handles and reading records. Anything else needs a justification comment:
 
     // shared-state-ok: <why this is not an operator-to-operator back channel>
     some_field: Rc<RefCell<Whatever>>,
@@ -136,6 +136,11 @@ ALLOWED_INNER = {
     # The external-world boundary: a data source's arrival state, shared with the
     # scheduler that feeds it. Side effects live at the boundary by design.
     "dyn DataSourceDomainExtentImpl": "external source handle",
+    # The same boundary for a reading (a clock or random value): what the run has read at
+    # one call path, by position. Every operator reading a copy of the call asks it for the
+    # positions its own input carries, so copies of one evaluation agree; no operator's
+    # output reaches another through it.
+    "ReadingSource": "external reading record",
 }
 
 

@@ -74,12 +74,14 @@ fn in_run(e: &mut Expr, run: &RunPath) {
     {
         e.site = Some(site.in_run(run));
     }
-    if let TypedExprNode::Feed {
-        site: Some(site), ..
-    } = &mut e.node
-        && site.run == RunPath::default()
-    {
-        *site = site.in_run(run);
+    match &mut e.node {
+        TypedExprNode::Feed {
+            site: Some(site), ..
+        } if site.run == RunPath::default() => *site = site.in_run(run),
+        TypedExprNode::Reading(reading) if reading.site.run == RunPath::default() => {
+            reading.site = reading.site.in_run(run)
+        }
+        _ => {}
     }
     e.walk_children_mut(|child| in_run(child, run));
 }

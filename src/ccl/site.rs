@@ -101,3 +101,16 @@ impl Naming {
         Site::written(place.clone())
     }
 }
+
+/// The site of the `index`th place of `kind` spelled `spelling` in the root, outside every
+/// binding: what a test builds a node's site from.
+#[cfg(test)]
+pub(crate) fn root_site(kind: PlaceKind, spelling: &str, index: u32) -> Rc<Site> {
+    Site::written(Place {
+        module: Arc::from([]),
+        bindings: Arc::from([]),
+        kind,
+        spelling: SmolStr::new(spelling),
+        index,
+    })
+}

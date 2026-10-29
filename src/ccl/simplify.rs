@@ -1016,6 +1016,7 @@ fn builtin_preserves_domain(builtin: &Builtin) -> bool {
         | Builtin::NotFn
         | Builtin::VariantWrap(_)
         | Builtin::VariantIs(_)
+        | Builtin::Reading(_)
         | Builtin::CollectionContains => true,
         Builtin::EmptyMap
         | Builtin::Curry

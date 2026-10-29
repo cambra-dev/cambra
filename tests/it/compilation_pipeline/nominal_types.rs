@@ -1633,17 +1633,6 @@ fn method_errors_name_what_is_wrong() {
         ),
         (
             indoc! {r#"
-                type Price = Int
-
-                def Price::zero() => Price:
-                    Price::new(0)
-
-                1
-            "#},
-            "`Price::zero` declares no parameters",
-        ),
-        (
-            indoc! {r#"
                 type Box(T):
                     boxed(T)
 
