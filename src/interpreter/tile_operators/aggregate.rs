@@ -363,11 +363,10 @@ impl TileOperator for MapExtractAggregate {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let input_producer = self.input.subscribe(
-            self.input.tiling().universal_guard(),
-            widening(consumer),
-            scheduler,
-        );
+        // The groups keep the input's outermost keys.
+        let input_producer =
+            self.input
+                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(MapExtractAggregateProducer {
             base: ProducerBase::new(
                 MapExtractAggregateProducer::alloc_id(),
@@ -628,11 +627,10 @@ impl TileOperator for MapAggregate {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let input_producer = self.input.subscribe(
-            self.input.tiling().universal_guard(),
-            widening(consumer),
-            scheduler,
-        );
+        // The groups keep the input's outermost keys.
+        let input_producer =
+            self.input
+                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(MapAggregateProducer {
             base: ProducerBase::new(
                 MapAggregateProducer::alloc_id(),
