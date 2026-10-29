@@ -41,7 +41,7 @@ struct FanOutReentrancy {
     /// Whether the subscribers of the recurrence slots have been notified since
     /// [`cached_tile`](Self::cached_tile) last changed. A pull in pull mode replaces the snapshot
     /// and leaves them to the input's own notification; [`FanOut::step`] notifies them of any
-    /// snapshot they have not been told of.
+    /// snapshot they have not been told of, and of every snapshot that is not terminal.
     announced: bool,
     /// Set while a step notifies the recurrence subscribers ([`notify_recurrence`]): a
     /// notification of the input arriving then is that notification's echo around the cycle,
@@ -433,6 +433,13 @@ impl FanOut {
     /// travels around the cycle and closes the gate of every operator it passes, the input's
     /// included, and the pull that follows reopens them.
     ///
+    /// A step also notifies them while the snapshot is not terminal, whether or not it changed.
+    /// A drive inside the cycle requests its own re-pull through the scheduler's wakeup queue on
+    /// every pull while it has an item to attempt, and a step delivers no wakeup, so the step
+    /// notifies in its place. A transaction's denied item needs it: the deny leaves the store
+    /// unchanged, and the drive's next item reaches the body's `Memo` only through a
+    /// notification. See `src/interpreter/design-operators.md`, "One position per pull".
+    ///
     /// # Panics
     ///
     /// When the fan-out is not cyclic, no slot has been subscribed, or a pull of its input is
@@ -784,18 +791,18 @@ fn step(shared_rc: &Rc<RefCell<FanOutShared>>, guard: TileGuard) -> Option<Tile>
     Some(tile)
 }
 
-/// Notify the subscribers of the recurrence slots of a snapshot they have not been told of, and
-/// record that they have.
+/// Notify the subscribers of the recurrence slots of a snapshot they have not been told of or
+/// that is not terminal ([`FanOut::step`]), and record that they have.
 fn announce(shared_rc: &Rc<RefCell<FanOutShared>>) {
-    let announced = {
+    let settled = {
         let mut shared = shared_rc.borrow_mut();
         let reentrancy = shared
             .reentrancy
             .as_mut()
             .expect("only a cyclic fan-out steps");
-        std::mem::replace(&mut reentrancy.announced, true)
+        std::mem::replace(&mut reentrancy.announced, true) && reentrancy.cached_tile.is_terminal()
     };
-    if !announced {
+    if !settled {
         notify_recurrence(shared_rc);
     }
 }

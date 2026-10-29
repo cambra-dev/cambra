@@ -42,6 +42,8 @@ use crate::{
 
 mod aggregate;
 mod combinators;
+#[cfg(test)]
+mod commit_breaker_tests;
 mod cycle_slot;
 #[cfg(test)]
 mod dispatcher_tests;

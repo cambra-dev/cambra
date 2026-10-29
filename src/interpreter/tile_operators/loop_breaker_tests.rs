@@ -40,16 +40,16 @@ const GUARDED_SUM: &str = indoc! {"
 "};
 
 /// A program compiled with no notification delivered, and the cyclic fan-out of its one store.
-struct Compiled {
-    ctx: GlobalContext,
+pub(super) struct Compiled {
+    pub(super) ctx: GlobalContext,
     program: CompiledProgram,
     sink: std::sync::Arc<TestSink>,
     operators: OperatorMap,
-    fan: Rc<FanOut>,
+    pub(super) fan: Rc<FanOut>,
 }
 
 impl Compiled {
-    fn of(source: &str) -> Self {
+    pub(super) fn of(source: &str) -> Self {
         let mut ctx = GlobalContext::default();
         let sink = ctx.register_test_sink("out");
         let loaded = LoadedProgram::test(source);
@@ -72,7 +72,7 @@ impl Compiled {
     }
 
     /// The value the store holds for its one variable.
-    fn value(&self) -> Value {
+    pub(super) fn value(&self) -> Value {
         let state = self.operators.live_state();
         assert_eq!(state.len(), 1, "one variable: {state:?}");
         state.into_values().next().expect("one variable")
@@ -81,7 +81,7 @@ impl Compiled {
 
 /// The one value `out` receives when the program runs in pull mode, the scheduler delivering
 /// every notification between pulls.
-fn pulled(source: &str) -> Value {
+pub(super) fn pulled(source: &str) -> Value {
     let mut ctx = GlobalContext::default();
     let sink = ctx.register_test_sink("out");
     let loaded = LoadedProgram::test(source);
@@ -137,10 +137,10 @@ fn a_guarded_loop_steps_one_position_per_step() {
 /// How many notifications a test's consumer received.
 // shared-state-ok: a test consumer counts what it is notified of and the test reads the count; no
 // tile passes between operators through it.
-type Count = Rc<Cell<usize>>;
+pub(super) type Count = Rc<Cell<usize>>;
 
 /// A subscription to `slot` that counts the notifications it receives.
-fn counting(
+pub(super) fn counting(
     slot: &mut Box<dyn TileOperator>,
     scheduler: &mut Scheduler,
 ) -> (Count, Box<dyn TileProducer>) {
@@ -156,7 +156,7 @@ fn counting(
 }
 
 /// A step notifies the subscribers of the store's recurrence slots and no reader outside the
-/// loop, and a step once every snapshot is announced notifies no one. The store's own
+/// loop, and a step once the terminal snapshot is announced notifies no one. The store's own
 /// notification reaches a reader outside the loop once the scheduler delivers it.
 #[test]
 fn a_step_notifies_the_recurrence_and_no_reader() {
@@ -188,7 +188,7 @@ fn a_step_notifies_the_recurrence_and_no_reader() {
     assert_eq!(
         inside.get(),
         notified,
-        "a step that changes nothing notifies no one"
+        "a step at an announced terminal snapshot notifies no one"
     );
 }
 
@@ -220,7 +220,7 @@ fn a_recurrence_subscriber_pulling_inside_a_notification_is_refused() {
 
 /// The value the program's own sink chain writes when a scheduler pulls it after a run: its
 /// `StoreFinalRead` learns of the terminal store from the store's own queued notification.
-fn written_after(compiled: &mut Compiled, source: &str) -> Value {
+pub(super) fn written_after(compiled: &mut Compiled, source: &str) -> Value {
     let done = (0..1000).any(|_| {
         compiled.ctx.scheduler().check_for_notifications();
         compiled.program.done.try_recv().is_ok()

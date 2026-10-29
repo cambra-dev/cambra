@@ -1689,6 +1689,13 @@ closes the gate of every operator it passes, the store's included; the fan-out d
 reaches it. The step's pull reopens those gates, so the store's own notification, which the
 scheduler delivers later, reaches every reader. A pull in pull mode notifies as before.
 
+A step also notifies those subscribers while the snapshot is not terminal, whether or not it
+changed. A drive requests its own re-pull through the scheduler's wakeup queue on every pull while
+it has an item to attempt, and a step delivers no wakeup, so the step notifies in its place. A
+transaction's denied item depends on it: the deny leaves the store unchanged, and the drive's next
+item reaches the `Memo` over the drive only through a notification. A step at a terminal snapshot
+the subscribers have been told of notifies no one.
+
 ### Reads
 
 **`StoreDenseRead`** folds one key's changelog at every position the store decided, producing
