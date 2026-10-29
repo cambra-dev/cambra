@@ -697,6 +697,9 @@ trait PoolWorker {
 /// its own state lock. The lock that parks idle workers is the only one the dispatcher itself
 /// takes on the claim path. See `src/interpreter/design-parallel.md`, "The dispatcher".
 struct Dispatcher {
+    /// Names this dispatcher in the [`ServeState`]s it mints, so a state of another dispatcher
+    /// is recognized whatever its size.
+    id: u64,
     /// Per pipeline, by `PipelineId`.
     jobs: Vec<Job>,
     /// Rows a morsel holds, which a worker claims at most.
@@ -784,7 +787,9 @@ impl Dispatcher {
                 attached: AtomicUsize::new(0),
             })
             .collect();
+        static DISPATCHERS: AtomicU64 = AtomicU64::new(0);
         let dispatcher = Self {
+            id: DISPATCHERS.fetch_add(1, Ordering::Relaxed),
             unfinished: AtomicUsize::new(jobs.len()),
             jobs,
             morsel_rows,
@@ -993,42 +998,141 @@ impl Dispatcher {
         self.parked.fetch_sub(1, Ordering::AcqRel);
     }
 
-    /// One worker's turn: claim morsels, run each through `worker`, leave a pipeline once its
-    /// source is exhausted, park when nothing is claimable, and return once every pipeline has
-    /// finished or the dispatcher failed.
-    fn serve(&self, worker: &mut impl PoolWorker) {
-        let mut attached = vec![false; self.jobs.len()];
-        let mut last = None;
-        loop {
-            let seen = self.epoch.load(Ordering::Acquire);
-            // A pipeline finishes only when its workers have left it, so a worker leaves as
-            // soon as the source is exhausted and not when it next has nothing to do.
-            for (index, held) in attached.iter_mut().enumerate() {
-                if *held && self.jobs[index].exhausted.load(Ordering::Acquire) {
-                    worker.leave(PipelineId(index));
-                    *held = false;
-                    self.jobs[index].attached.fetch_sub(1, Ordering::AcqRel);
-                    self.try_finish(index);
-                }
+    /// One step of a worker's turn: leave each pipeline whose source is exhausted, then claim
+    /// a morsel and run it through `worker`. It never parks.
+    ///
+    /// A pipeline finishes only when its workers have left it, so a worker leaves as soon as
+    /// the source is exhausted and not when it next has nothing to do. A failed dispatcher
+    /// answers `Done` before the worker leaves anything: the run's result is discarded.
+    ///
+    /// `state` is minted by [`serve_state`](Self::serve_state) of this dispatcher and used on one
+    /// thread, which a debug build checks.
+    fn step(&self, worker: &mut impl PoolWorker, state: &mut ServeState) -> Step {
+        debug_assert_eq!(
+            state.dispatcher, self.id,
+            "a serve state belongs to the dispatcher that minted it"
+        );
+        let me = std::thread::current().id();
+        debug_assert!(
+            state.owner.get_or_insert(me) == &me,
+            "a serve state belongs to the thread that first stepped with it"
+        );
+        if self.failed.load(Ordering::Acquire) {
+            return Step::Done;
+        }
+        for (index, held) in state.attached.iter_mut().enumerate() {
+            if *held && self.jobs[index].exhausted.load(Ordering::Acquire) {
+                worker.leave(PipelineId(index));
+                *held = false;
+                let before = self.jobs[index].attached.fetch_sub(1, Ordering::AcqRel);
+                debug_assert!(before > 0, "a worker leaves a pipeline it is attached to");
+                self.try_finish(index);
             }
-            match self.next(last) {
-                Next::Package(package) => {
-                    let pipeline = package.pipeline;
-                    if !attached[pipeline.0] {
-                        self.jobs[pipeline.0]
-                            .attached
-                            .fetch_add(1, Ordering::AcqRel);
-                        attached[pipeline.0] = true;
-                    }
-                    last = Some(pipeline);
-                    worker.work(&package);
-                    self.ack(package);
+        }
+        match self.next(state.last) {
+            Next::Package(package) => {
+                let pipeline = package.pipeline;
+                if !state.attached[pipeline.0] {
+                    self.jobs[pipeline.0]
+                        .attached
+                        .fetch_add(1, Ordering::AcqRel);
+                    state.attached[pipeline.0] = true;
                 }
-                Next::Wait => self.park(seen),
-                Next::Done => return,
+                state.last = Some(pipeline);
+                worker.work(&package);
+                self.ack(package);
+                Step::Ran
+            }
+            Next::Wait => Step::Wait,
+            Next::Done => Step::Done,
+        }
+    }
+
+    /// One worker's turn: [`step`](Self::step) until every pipeline has finished or the
+    /// dispatcher failed, parking when nothing is claimable.
+    fn serve(&self, worker: &mut impl PoolWorker) {
+        let mut state = self.serve_state();
+        loop {
+            // Read before the step looks for work: a wake that follows moves the epoch, and the
+            // park returns at once.
+            let seen = self.epoch.load(Ordering::Acquire);
+            match self.step(worker, &mut state) {
+                Step::Ran => {}
+                Step::Wait => self.park(seen),
+                Step::Done => return,
             }
         }
     }
+
+    /// A fresh state for a worker of this dispatcher, which has run nothing.
+    fn serve_state(&self) -> ServeState {
+        ServeState {
+            dispatcher: self.id,
+            owner: None,
+            attached: vec![false; self.jobs.len()],
+            last: None,
+        }
+    }
+
+    /// [`step`](Self::step) until nothing is claimable or the run is over: the turn of a worker
+    /// that parks nowhere, because the caller delivers the arrivals that end a wait. `state`
+    /// outlives the call, so a worker that is attached to a pipeline leaves it when a later
+    /// call finds the source exhausted.
+    ///
+    /// A step that answers `Wait` after the epoch moved has already seen what ends a wait, which
+    /// is what makes [`serve`](Self::serve)'s park return at once: the claim that finds a source
+    /// exhausted moves the epoch, and the worker's next step leaves the pipeline and finishes
+    /// it. The call takes that step instead of returning.
+    ///
+    /// The caller has no epoch to park on, so the `Wait` it gets is a wait only if no other
+    /// thread publishes, closes, acknowledges or finishes a pipeline of this dispatcher: every
+    /// call that moves the epoch is made on the thread that calls this. The threaded path, where
+    /// other threads do, is `serve`.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "the inline driver is its caller")
+    )]
+    fn serve_until_wait(&self, worker: &mut impl PoolWorker, state: &mut ServeState) -> Settled {
+        loop {
+            let seen = self.epoch.load(Ordering::Acquire);
+            match self.step(worker, state) {
+                Step::Wait if self.epoch.load(Ordering::Acquire) == seen => return Settled::Wait,
+                Step::Done => return Settled::Done,
+                Step::Ran | Step::Wait => {}
+            }
+        }
+    }
+}
+
+/// What a worker keeps between its steps on a [`Dispatcher`]: the pipelines it claimed from and
+/// has not left, and the pipeline it ran last, which it tries first.
+struct ServeState {
+    /// The [`Dispatcher::id`] of the dispatcher that minted it.
+    dispatcher: u64,
+    /// The thread that first stepped with it. A state is one worker's, and a worker is a thread.
+    owner: Option<std::thread::ThreadId>,
+    /// Per pipeline, by `PipelineId`.
+    attached: Vec<bool>,
+    last: Option<PipelineId>,
+}
+
+/// What one [`Dispatcher::step`] did.
+enum Step {
+    /// The worker ran one morsel.
+    Ran,
+    /// Nothing is claimable now: a publish, a close, or a pipeline that finishes or starts may
+    /// change that.
+    Wait,
+    /// Every pipeline has finished, or the dispatcher failed.
+    Done,
+}
+
+/// What [`Dispatcher::serve_until_wait`] ends on.
+enum Settled {
+    /// Nothing is claimable until the caller delivers an arrival.
+    Wait,
+    /// Every pipeline has finished, or the dispatcher failed.
+    Done,
 }
 
 /// Fails the [`Dispatcher`] when the thread holding it unwinds, so the other workers stop
@@ -1529,6 +1633,128 @@ mod tests {
             assert_eq!(worker.left, [0], "it left the pipeline before it finished");
             assert!(dispatcher.all_done());
         });
+    }
+
+    /// A worker that serves through repeated `serve_until_wait` calls, with the state carried
+    /// between them, runs the morsels `serve` runs and leaves the pipelines `serve` leaves, in
+    /// the same order.
+    #[test]
+    fn serve_until_wait_runs_what_serve_runs() {
+        let served = {
+            let dispatcher = dispatcher(10, 4);
+            let mut worker = Recorder::default();
+            dispatcher.serve(&mut worker);
+            worker
+        };
+        let dispatcher = dispatcher(10, 4);
+        let (mut worker, mut state) = (Recorder::default(), dispatcher.serve_state());
+        assert!(matches!(
+            dispatcher.serve_until_wait(&mut worker, &mut state),
+            Settled::Done
+        ));
+        assert_eq!(worker.morsels, served.morsels);
+        assert_eq!(worker.left, served.left);
+        assert!(dispatcher.all_done());
+    }
+
+    /// Over a live source one worker stops at each `Wait`, resumes when an arrival is published,
+    /// and leaves the pipeline in the call that finds the source closed, which is the sequence
+    /// `serve` gives for the same arrivals.
+    #[test]
+    fn serve_until_wait_waits_on_a_live_source_and_resumes_from_its_state() {
+        let served = {
+            let (source, rows) = live_source();
+            let dispatcher = live_dispatcher(&source, 4);
+            arrive(&dispatcher, MAIN_PIPELINE, &rows, 4);
+            arrive(&dispatcher, MAIN_PIPELINE, &rows, 4);
+            dispatcher.close(MAIN_PIPELINE);
+            let mut worker = Recorder::default();
+            dispatcher.serve(&mut worker);
+            worker
+        };
+        let (source, rows) = live_source();
+        let dispatcher = live_dispatcher(&source, 4);
+        let (mut worker, mut state) = (Recorder::default(), dispatcher.serve_state());
+        assert!(
+            matches!(
+                dispatcher.serve_until_wait(&mut worker, &mut state),
+                Settled::Wait
+            ),
+            "nothing is published"
+        );
+        for _ in 0..2 {
+            arrive(&dispatcher, MAIN_PIPELINE, &rows, 4);
+            assert!(matches!(
+                dispatcher.serve_until_wait(&mut worker, &mut state),
+                Settled::Wait
+            ));
+        }
+        assert!(worker.left.is_empty(), "the source is open");
+        dispatcher.close(MAIN_PIPELINE);
+        assert!(matches!(
+            dispatcher.serve_until_wait(&mut worker, &mut state),
+            Settled::Done
+        ));
+        assert_eq!(worker.morsels, served.morsels);
+        assert_eq!(worker.left, served.left);
+    }
+
+    /// A serve state names the dispatcher that minted it, so a state of another dispatcher with
+    /// as many pipelines is rejected, and not stepped as if its attachments were this one's.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a serve state belongs to the dispatcher that minted it")]
+    fn a_serve_state_of_another_dispatcher_of_the_same_size_is_rejected() {
+        let (a, b) = (dispatcher(4, 4), dispatcher(4, 4));
+        let mut state = a.serve_state();
+        b.step(&mut Recorder::default(), &mut state);
+    }
+
+    /// A serve state is one worker's, and a worker is a thread.
+    #[test]
+    #[cfg(debug_assertions)]
+    fn a_serve_state_stepped_on_a_second_thread_is_rejected() {
+        let dispatcher = dispatcher(8, 4);
+        let mut state = dispatcher.serve_state();
+        dispatcher.step(&mut Recorder::default(), &mut state);
+        let panic = match std::thread::scope(|scope| {
+            scope
+                .spawn(|| dispatcher.step(&mut Recorder::default(), &mut state))
+                .join()
+        }) {
+            Err(panic) => panic,
+            Ok(_) => panic!("the second thread's step panics"),
+        };
+        let message = match panic.downcast_ref::<String>() {
+            Some(message) => message.as_str(),
+            None => panic
+                .downcast_ref::<&str>()
+                .copied()
+                .expect("an assertion message"),
+        };
+        assert!(
+            message.contains("belongs to the thread that first stepped"),
+            "{message}"
+        );
+    }
+
+    /// A failed dispatcher answers `Done` before the worker leaves anything or claims a morsel.
+    #[test]
+    fn a_failed_dispatcher_ends_the_turn_before_the_worker_leaves() {
+        let dispatcher = dispatcher(4, 4);
+        let (mut worker, mut state) = (Recorder::default(), dispatcher.serve_state());
+        // One morsel, run; the source is exhausted at the next claim, and the worker is attached.
+        assert!(matches!(
+            dispatcher.step(&mut worker, &mut state),
+            Step::Ran
+        ));
+        assert!(matches!(dispatcher.next(None), Next::Wait));
+        dispatcher.fail();
+        assert!(matches!(
+            dispatcher.serve_until_wait(&mut worker, &mut state),
+            Settled::Done
+        ));
+        assert!(worker.left.is_empty(), "nothing is left on a failed run");
     }
 
     /// What reaches a pipeline before it starts is kept for its source: an arrival published to

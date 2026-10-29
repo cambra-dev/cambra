@@ -122,7 +122,9 @@ one morsel. The morsel path takes no lock. The only lock parks idle workers. The
   a morsel and some pipeline has not finished, and `Next::Done` once every pipeline has finished or
   the dispatcher failed.
 - `ack` counts a claimed morsel back, once the breaker holds its rows and the morsel is released.
-- `serve(worker)` is one worker's loop over those calls ([A worker's turn](#a-workers-turn)).
+- `step(worker, state)` is one pass of a worker's turn, `serve(worker)` repeats it and parks, and
+  `serve_until_wait(worker, state)` repeats it and returns where `serve` would park ([A worker's
+  turn](#a-workers-turn)).
 - `fail` makes every `next` answer `Done` from then on.
 
 A worker pulls its morsel from the source; no structure holds morsels between the two. This is the
@@ -241,10 +243,30 @@ panic.
 
 #### A worker's turn
 
-`Dispatcher::serve` runs one worker until every pipeline has finished. Each pass leaves the
-pipelines whose source is exhausted, asks `next`, and runs the package through `PoolWorker::work`,
-which pulls the chain, hands the tile to the breaker and releases the morsel, before `ack`. The
-plan's one pipeline is served by `MainWorker`; a test double records what it ran and left.
+`Dispatcher::step` is one pass of a worker's turn. It leaves the pipelines whose source is
+exhausted, asks `next`, and runs the package through `PoolWorker::work`, which pulls the chain,
+hands the tile to the breaker and releases the morsel, before `ack`. It answers `Step::Ran` after a
+morsel, `Step::Wait` when `next` did, and `Step::Done` when `next` did, and it answers `Done`
+before it leaves anything once the dispatcher has failed. What a worker holds between passes is a
+`ServeState`: the pipelines it is attached to and the pipeline it ran last. `Dispatcher::serve_state`
+mints one, naming its dispatcher by a per-dispatcher id, and a debug build asserts on every step
+that the state is this dispatcher's and that one thread uses it.
+
+`Dispatcher::serve` runs one worker until every pipeline has finished: it reads the epoch, takes a
+step, and parks on the epoch it read when the step answers `Wait`. `serve_until_wait` takes steps
+until one answers `Done`, or `Wait` with the epoch where it was before the step, and returns
+`Settled::Wait` or `Settled::Done`. It parks nowhere: the caller delivers the arrivals that end
+the wait and calls again with the same state. A step that answers `Wait` after the epoch moved is
+not a wait. The claim that finds a source exhausted moves the epoch, and the worker's next step
+leaves the pipeline and finishes it. Both entry points run `step`, so they give one worker the
+same packages and `leave` calls.
+
+The `Wait` of `serve_until_wait` is a wait only when every `publish`, `close`, `ack` and finish of
+the dispatcher's pipelines happens on the thread that calls it, because the caller has no epoch
+to park on. The inline driver is that caller; the threaded path, where other threads publish, is
+`serve`. `FailOnUnwind` lives in `run_worker`, so the inline driver handles a panic in a worker
+itself. The plan's pipelines are served by `MainWorker`; a test double records what it ran and
+left.
 
 ### Region-carrying notifications
 
