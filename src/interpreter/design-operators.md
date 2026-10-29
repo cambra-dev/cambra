@@ -581,10 +581,22 @@ then releases the region upstream. Open collection groups and join-combined
 aggregate or store state can remain unreleased. A debug check uses `holds_a_plain_value` to
 reject an input whose release would leave ordinary values available for duplicate delivery.
 
-`to_guard` includes complete keys by full path and scalar cells at their enclosing rows,
-including cells whose enclosing key is still open. A universal input release latches
-`upstream_drained`. Release builds then return the cache without pulling that input again;
-debug builds continue pulling to exercise its post-release checks.
+`to_guard` includes complete keys by full path and scalar cells at their enclosing rows, including
+cells whose enclosing key is still open. A nested tile whose held keys form a prefix is released as
+one staircase (`domain_prefix`) and, at each level whose statement calls keys complete above the
+last key held, an arm naming those keys. For such a tile the guard names exactly what the statement
+makes releasable, and its size grows with the tile's depth, not with the keys it holds. A statement
+that is itself a prefix reaching above the last key held ends the staircase at its greatest key
+instead of adding an arm. A last key the statement calls whole, or whose group's statement calls
+every key complete, ends the staircase at that key. A tile whose held keys form no prefix is
+released key by key; at a nested level that guard names only the keys held (`Tile::held_guard`),
+which leaves out the keys the statement calls complete and the tile does not hold. Three tiles whose
+held keys form a prefix still take that path: a last key whose group holds nothing, an earlier key
+whose own group's statement calls every key complete, and a statement about the keys beneath an
+enclosing key the tile does not hold. Naming those exactly needs `held_guard` to carry each open
+key's statement, which it does not yet. A universal input release latches `upstream_drained`.
+Release builds then return the cache without pulling that input again; debug builds continue pulling
+to exercise its post-release checks.
 
 ### What a producer holds
 
