@@ -91,9 +91,10 @@ when its values can grow. Under scalar values a repeated key stays as two entrie
 `append_level` replaces the innermost collection's values with a newly constructed collection
 level. Each appended group must be whole, so its parent key becomes complete. Completion at
 higher levels is unchanged. `append_open_level_beneath` is the operation for groups that may
-still grow. Both require the new level to have no logical deletions and a `False` completion
-predicate; existing levels retain their own deletion sets. `Tiling::append_level` performs the
-corresponding transformation on the static shape.
+still grow, and the new level states the completion predicate its caller passes. Both require the
+new level to be built with no logical deletions and a `False` completion predicate; existing levels
+retain their own deletion sets. `Tiling::append_level` performs the corresponding transformation on
+the static shape.
 
 Each collection level has its own `deleted` bitset, indexed by positions in that level's
 domain column. Removing an outer key removes its subtree; removing an inner key affects only
@@ -235,7 +236,7 @@ Tiles use predicates to state domain completeness; guards use them to select reg
 | `False` | No values. Empty predicate; annihilator under `intersect`. |
 | `Intervals(IntervalSet<Value>)` | A scalar key's admitted values, clamped to the type's range. `Predicate::at_or_below(v)` builds the prefix `≤ v`, the upper-bound streaming signal, and `Predicate::below(v)` the strict one. Never built over records. |
 | `Record(fields)` | A componentwise predicate over a record key: one predicate per field, with AND semantics. |
-| `Or(arms)` | Union of the arms' regions. `flatten_or` removes nested `Or` nodes and joins pairs of componentwise arms where possible. |
+| `Or(arms)` | Union of the arms' regions. `flatten_or` removes nested `Or` nodes, joins two `Intervals` arms into one, and joins pairs of componentwise arms where possible. |
 | `Qualified { enclosing, here }` | Keys admitted by `here` under paths admitted by `enclosing`. See [Qualified predicates](#qualified-predicates). |
 | `Union { tags, rest }` | Predicate for each named tag of an `Extent::Union`; Boolean `rest` applies to every unnamed tag. |
 
@@ -572,7 +573,7 @@ of a cyclic fan-out).
 | `FlattenTupleDomain` | Reads its input whole and cuts the answer to the projection over the flat keys, as `PermuteRecordDomain` does: the nested keys are restated flat, so the projection is not forwarded. |
 | `Aggregate` | Admits `Everything` and `Nothing`: the accumulator has no keys, and the input is read whole whatever the consumer asks. A key projection panics. |
 | `ExtractAggregate` | Admits `Everything` and `Nothing`: one extracted value has no keys. A key projection panics. |
-| `MapAggregate` | Pulls the input at the projection, at any level (`Restates::Every`), and cuts the answer to it: the answer is built from every accumulator held, including those of keys pulled earlier, and each group beneath a key is whole. |
+| `MapAggregate` | Pulls the input at the projection, at any level (`Restates::Every`), and cuts the answer to it: the answer is built from every accumulator held, including those of keys pulled earlier, and from what every pull's answer stated, and each group beneath a key is whole. |
 | `MapExtractAggregate` | Pulls the input at the projection, at any level of the input (`Restates::Above`). The answer keeps the input's keys, and only unfinished groups drop. |
 
 ### Producer attribution and probes
@@ -803,14 +804,14 @@ breaker that also answers pulls from that state is a producer: `BreakingProducer
 | `pushes_while_consuming()` | Whether what `held()` names after a consume is final, so a driver may push it before the breaker's pipeline finishes. The default answers `true`. |
 | `offer_impl(guard)` | Answers from the state `consume_impl` built and pulls nothing. The breaker's own `get_impl` calls it once the breaker is consuming. |
 
-`Memo`, `Aggregate` and `ExtractAggregate` are breakers. A breaker starts in the pull mode described
-in [The producer protocol](#the-producer-protocol) and is a consuming producer from its first
-`consume_impl`, which it stays. `finalize` is provided over two accessors, `input()` and `held()`:
-it asserts that the input has been released whole and returns `held()` less the guard released to
-the breaker. A release removes rows from the state and leaves the statement of the tile as it was,
-so the difference is taken in the guard algebra. `guard_minus` (`tile_operators/mod.rs`) spells it
-for guards of a collection's outermost keys, of a scalar and of an aggregation, none of them
-qualified by an enclosing path, and for a record of such guards field by field. Two guards of a
+`Memo`, `Aggregate`, `ExtractAggregate` and `MapAggregate` are breakers. A breaker starts in the
+pull mode described in [The producer protocol](#the-producer-protocol) and is a consuming producer
+from its first `consume_impl`, which it stays. `finalize` is provided over two accessors, `input()`
+and `held()`: it asserts that the input has been released whole and returns `held()` less the guard
+released to the breaker. A release removes rows from the state and leaves the statement of the tile
+as it was, so the difference is taken in the guard algebra. `guard_minus` (`tile_operators/mod.rs`)
+spells it for guards of a collection's outermost keys, of a scalar and of an aggregation, none of
+them qualified by an enclosing path, and for a record of such guards field by field. Two guards of a
 collection's keys at any levels differ as their projections do. A state of another shape has no
 spelling, and `finalize` panics naming the gap instead of answering a smaller or larger region.
 
@@ -841,6 +842,23 @@ once the aggregation is terminal. A terminal aggregation states all of itself re
 released; a partial one states nothing releasable, so it is left in place for the next consume and
 the extraction holds nothing. The value is final once the input has been released whole, and stays
 until the consumer releases the output.
+
+### MapAggregate
+
+A consuming `MapAggregate` folds each group the input answers at the guard into the group's
+accumulator and keeps what the answers state about completeness, united across consumes. A group is
+final per key once the input states it complete, at a level on its path or at the folded level
+under its key. An answer of a pull beneath the groups' keys states only the elements it reads, so
+the folded level's statements are united too, and a group is final once they cover every element
+under its key (`Stated::settled`). `finalize` asserts that the input has drained, so every group it
+holds is final. The guard it returns is the guard of the output built from the accumulators, less
+every group whose accumulator is not terminal, less the guard released. The input releases a
+complete group whole and an open one only beneath its key, so a group that arrives later in a region
+already consumed is still the input's to answer. A release of the output drops the accumulators it
+covers and forwards to the input, as in pull mode. It holds groups beneath their keys, and what a
+release beneath them leaves is a region beneath the outermost keys. A reader's chain may restate
+only the outermost keys (`TileProducer::restates`), so it answers `pushes_while_consuming` with
+`false`.
 
 Nothing outside unit tests calls `consume_impl`, `finalize` or `pushes_while_consuming`: no
 scheduler runs pipelines, and how a driver reaches a breaker from a program's roots is not decided.
