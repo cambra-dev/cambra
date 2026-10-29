@@ -127,18 +127,16 @@ impl TileOperator for ExtractFinal {
             .default
             .as_mut()
             .map(|d| d.subscribe(d.tiling().universal_guard(), Box::new(|| {}), scheduler));
-        Box::new(ExtractFinalProducer {
-            base: ProducerBase::new(
+        Box::new(ExtractFinalProducer::new(
+            ProducerBase::new(
                 ExtractFinalProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 scheduler,
             ),
-            source: source_producer,
-            default: default_producer,
-            final_tile: None,
-            released: false,
-        })
+            source_producer,
+            default_producer,
+        ))
     }
 }
 
@@ -166,6 +164,103 @@ struct ExtractFinalProducer {
     /// soon as it has merged the value into its own cache, so
     /// post-release emissions are rare in normal data flow.
     released: bool,
+    /// The source rows [`BreakingProducer::consume_impl`] merged, kept to the row at the
+    /// greatest key where the values are a column, and empty before the first consume.
+    merged: Tile,
+    /// Whether `consume_impl` has run: a consuming extraction answers from `final_tile`, and only
+    /// `consume_impl` pulls its source and its default.
+    consuming: bool,
+}
+
+impl ExtractFinalProducer {
+    fn new(
+        base: ProducerBase,
+        source: Box<dyn TileProducer>,
+        default: Option<Box<dyn TileProducer>>,
+    ) -> Self {
+        let merged = source.tiling().empty_tile();
+        Self {
+            base,
+            source,
+            default,
+            final_tile: None,
+            released: false,
+            merged,
+            consuming: false,
+        }
+    }
+
+    /// The value at row `final_idx` of a source whose keys are `domain`: the position being
+    /// indexed is this collection's key, and what it holds is everything below it, a value where
+    /// the values are a column and a whole collection where they are one.
+    fn value_at(&self, domain: &ColumnValue, codomain: Tile, final_idx: usize) -> Tile {
+        let extent = self.tiling().extent();
+        if codomain.is_data_function() {
+            // Keeping one row leaves that key's group standing alone, which is the
+            // value at this position. The source is terminal and this is its last
+            // position, so what it holds is the whole collection.
+            let mut sub = codomain;
+            sub.retain_rows(
+                &(0..domain.len())
+                    .map(|i| i == final_idx)
+                    .collect::<Vec<bool>>(),
+            );
+            let Tile::DataFunction {
+                domain_predicate, ..
+            } = &mut sub
+            else {
+                unreachable!("retain keeps a collection a collection")
+            };
+            *domain_predicate = Predicate::True;
+            sub
+        } else {
+            // Built at the *declared* extent: a tag `match` collapses its arms to their
+            // join, and the arm that answers carries only its own tag. Laid out as this
+            // operator's tiling, which keeps a product a record of columns.
+            let cv = scalar_tile_to_column_value(codomain);
+            column_value_to_tile(
+                ColumnValue::from_values(vec![cv.index_at(final_idx)], &extent),
+                self.tiling(),
+            )
+        }
+    }
+
+    /// The default's value once it has converged, which is when it is terminal, and `None`
+    /// before. The default is released once it has been read.
+    ///
+    /// # Panics
+    ///
+    /// For a source declared total that emitted no value.
+    fn pull_default(&mut self) -> Option<Tile> {
+        let extent = self.tiling().extent();
+        let yields_a_level = self.tiling().is_data_function();
+        let Some(default) = self.default.as_mut() else {
+            // No default means the source was declared total — an exhaustive tag
+            // partition always covers exactly one position. An empty source here is
+            // that invariant being wrong, so fail rather than invent a value.
+            panic!(
+                "ExtractFinal over a source declared total emitted no value; the \
+                 partition feeding it was not exhaustive"
+            );
+        };
+        let default_tiling = default.tiling().clone();
+        let default_tile = default.get(default_tiling.universal_guard());
+        // A collection-valued position falls back to the whole collection, so the default
+        // is the tile it is rather than a value to rebuild a column from. It has converged
+        // once it is terminal, which is what `as_single` says for the scalar case.
+        if yields_a_level {
+            if !default_tile.is_terminal() {
+                return None;
+            }
+            default.release(default_tiling.universal_guard());
+            return Some(default_tile);
+        }
+        // Default hasn't converged yet when there is no single value: the outer pull loop
+        // retries, and once the default resolves it is cached.
+        let value = scalar_tile_to_column_value(default_tile).as_single()?;
+        default.release(default_tiling.universal_guard());
+        Some(Tile::Scalar(ColumnValue::from_values(vec![value], &extent)))
+    }
 }
 
 impl TileProducer for ExtractFinalProducer {
@@ -194,13 +289,10 @@ impl TileProducer for ExtractFinalProducer {
     /// whole, so the projection is all of it or none: the source is read whole whatever the
     /// consumer asks, because the last position is not known before the stream ends.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        match projection_guard.projection(&self.name()) {
-            Projection::Everything => {}
-            Projection::Nothing => return self.tiling().empty_tile(),
-            Projection::Keys(_) => panic!(
-                "{} extracts one final value, which has no keys to project: {projection_guard:?}",
-                self.name()
-            ),
+        if projection_of_one_value(&self.name(), "extracts one final value", &projection_guard)
+            == Projection::Nothing
+        {
+            return self.tiling().empty_tile();
         }
         // Every emission below is built at the **declared** extent rather than
         // from the value alone. A variant value carries only the tag it holds, so
@@ -209,10 +301,12 @@ impl TileProducer for ExtractFinalProducer {
         // between them. Building at the declared extent keeps every arm present,
         // with the ones that did not occur empty, which is the shape downstream
         // merges and appends require.
-        let extent = self.tiling().extent();
         let empty = self.tiling().empty_tile();
         if self.released {
             return empty;
+        }
+        if self.consuming {
+            return self.offer_impl(projection_guard);
         }
         // Already extracted: keep re-emitting the same scalar until we
         // are released.  Downstream `Memo` typically releases on first
@@ -278,72 +372,18 @@ impl TileProducer for ExtractFinalProducer {
         // TODO don't assume sorting; we need to sort by the key value instead.
         let live_outer = (0..domain.len()).rev().find(|i| !deleted.contains(*i));
         if let Some(final_idx) = live_outer {
-            let tile = if codomain.is_data_function() {
-                // Keeping one row leaves that key's group standing alone, which is the
-                // value at this position. The source is terminal and this is its last
-                // position, so what it holds is the whole collection.
-                let mut sub = *codomain;
-                sub.retain_rows(
-                    &(0..domain.len())
-                        .map(|i| i == final_idx)
-                        .collect::<Vec<bool>>(),
-                );
-                let Tile::DataFunction {
-                    domain_predicate, ..
-                } = &mut sub
-                else {
-                    unreachable!("retain keeps a collection a collection")
-                };
-                *domain_predicate = Predicate::True;
-                sub
-            } else {
-                // Built at the *declared* extent: a tag `match` collapses its arms to their
-                // join, and the arm that answers carries only its own tag. Laid out as this
-                // operator's tiling, which keeps a product a record of columns.
-                let cv = scalar_tile_to_column_value(*codomain);
-                column_value_to_tile(
-                    ColumnValue::from_values(vec![cv.index_at(final_idx)], &extent),
-                    self.tiling(),
-                )
-            };
+            let tile = self.value_at(&domain, *codomain, final_idx);
             self.final_tile = Some(tile.clone());
             return tile;
         }
         // Source is terminal *and* empty (the loop body ran zero times).  Pull the
         // default scalar and emit that instead, then release the default so its
         // upstream chain can release too.
-        let yields_a_level = self.tiling().is_data_function();
-        let Some(default) = self.default.as_mut() else {
-            // No default means the source was declared total — an exhaustive tag
-            // partition always covers exactly one position. An empty source here is
-            // that invariant being wrong, so fail rather than invent a value.
-            panic!(
-                "ExtractFinal over a source declared total emitted no value; the \
-                 partition feeding it was not exhaustive"
-            );
-        };
-        let default_tiling = default.tiling().clone();
-        let default_tile = default.get(default_tiling.universal_guard());
-        // A collection-valued position falls back to the whole collection, so the default
-        // is the tile it is rather than a value to rebuild a column from. It has converged
-        // once it is terminal, which is what `as_single` says for the scalar case.
-        if yields_a_level {
-            if !default_tile.is_terminal() {
-                return empty;
-            }
-            default.release(default_tiling.universal_guard());
-            self.final_tile = Some(default_tile.clone());
-            return default_tile;
-        }
-        match scalar_tile_to_column_value(default_tile).as_single() {
-            Some(value) => {
-                default.release(default_tiling.universal_guard());
-                let tile = Tile::Scalar(ColumnValue::from_values(vec![value], &extent));
+        match self.pull_default() {
+            Some(tile) => {
                 self.final_tile = Some(tile.clone());
                 tile
             }
-            // Default hasn't converged yet — emit empty.  Outer pull
-            // loop will retry; once default resolves, we'll cache it.
             None => empty,
         }
     }
@@ -351,12 +391,126 @@ impl TileProducer for ExtractFinalProducer {
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         if obsolete_guard.expect_universal_or_empty(&self.name()) {
             self.released = true;
+            self.final_tile = None;
+            self.merged = self.source.tiling().empty_tile();
             self.source.release(self.source.tiling().universal_guard());
             if let Some(d) = self.default.as_mut() {
                 d.release(d.tiling().universal_guard());
             }
         }
     }
+}
+
+impl BreakingProducer for ExtractFinalProducer {
+    /// Merges the source rows it answers at `guard`, a guard of the source's tiling, keeps the
+    /// row at the greatest key, and releases the source at what the answer stated. Rows merge in
+    /// the order they arrive, so the last row is not the final one: the key says which is. Once
+    /// the source has been released whole the value is extracted, or the default read when the
+    /// source held nothing.
+    fn consume_impl(&mut self, guard: TileGuard) {
+        debug_assert!(
+            guard.check_from(self.source.tiling()),
+            "{} consumes a guard of its source's tiling: {guard:?}",
+            self.name()
+        );
+        self.consuming = true;
+        if self.released || self.final_tile.is_some() || guard.is_empty() {
+            return;
+        }
+        let mut answered = self.source.get(guard);
+        let upstream_guard = answered.to_guard();
+        answered.compact();
+        self.merged.merge(answered);
+        self.keep_greatest_key();
+        self.source.release(upstream_guard);
+        if !self.source.obsolete_guard().is_universal() {
+            return;
+        }
+        let Tile::DataFunction {
+            domain,
+            codomain,
+            deleted,
+            ..
+        } = &self.merged
+        else {
+            panic!("ExtractFinal source must be a collection tile");
+        };
+        self.final_tile = match greatest_live_key(domain, deleted) {
+            Some(final_idx) => Some(self.value_at(domain, (**codomain).clone(), final_idx)),
+            None => self.pull_default(),
+        };
+    }
+
+    fn input(&self) -> &dyn TileProducer {
+        &*self.source
+    }
+
+    /// The extracted value, once there is one: none while the source has not drained, or while a
+    /// default it fell back to has not converged. The next `consume_impl` reads the default again.
+    fn held(&self) -> TileGuard {
+        match self.final_tile {
+            Some(_) => self.tiling().universal_guard(),
+            None => self.tiling().empty_guard(),
+        }
+    }
+
+    fn offer_impl(&mut self, guard: TileGuard) -> Tile {
+        match guard.projection(&self.name()) {
+            Projection::Nothing => self.tiling().empty_tile(),
+            _ => self
+                .final_tile
+                .clone()
+                .unwrap_or_else(|| self.tiling().empty_tile()),
+        }
+    }
+}
+
+impl ExtractFinalProducer {
+    /// Drop every merged row but the one at the greatest key, which is the only one an
+    /// extraction can still need, where the values are a column of scalars. Any other shape of
+    /// value keeps every merged row.
+    fn keep_greatest_key(&mut self) {
+        let Tile::DataFunction {
+            domain,
+            codomain,
+            deleted,
+            ..
+        } = &self.merged
+        else {
+            return;
+        };
+        let Tile::Scalar(values) = &**codomain else {
+            return;
+        };
+        let Some(idx) = greatest_live_key(domain, deleted) else {
+            return;
+        };
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &self.merged
+        else {
+            return;
+        };
+        self.merged = Tile::data_function(
+            domain.select_indices(std::iter::once(idx), 1),
+            Box::new(Tile::Scalar(values.select_indices(std::iter::once(idx), 1))),
+            domain_predicate.clone(),
+            bit_set::BitSet::new(),
+        );
+    }
+}
+
+/// The row at the greatest key among the rows `deleted` does not name. Merged rows are in the
+/// order they arrived, which is not the order of their keys.
+fn greatest_live_key(domain: &ColumnValue, deleted: &bit_set::BitSet) -> Option<usize> {
+    (0..domain.len())
+        .filter(|row| !deleted.contains(*row))
+        .max_by(|a, b| {
+            domain
+                .index_at(*a)
+                .partial_cmp(&domain.index_at(*b))
+                .expect("the keys of one collection compare")
+        })
 }
 
 #[cfg(test)]
@@ -652,5 +806,360 @@ mod projection_tests {
     fn a_key_projection_is_rejected() {
         let (mut last, _) = final_of_finished_stream();
         last.get(keys_between(0, 1));
+    }
+}
+
+/// A consuming `ExtractFinal` over an input that grows and is released: the value it extracts, what
+/// it finalizes and what reaches the source, against a model of the keys consumed.
+#[cfg(test)]
+mod consuming_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    use crate::interpreter::tile_operators::growing::{
+        Input, InputModel, KEYS, Region, Rng, Shared, Step, growing_source, ints, predicate,
+        source, value,
+    };
+    use crate::interpreter::tile_operators::test_helpers::{
+        ScriptedProducer, TestTileProducer, keys_between,
+    };
+    use crate::interpreter::{BaseType, Extent};
+    use Region::{All, Keys};
+    use Step::{Add, Close, Consume, Notify, Release};
+
+    fn int() -> Tiling {
+        Tiling::Scalar(Extent::Base(BaseType::Int))
+    }
+
+    fn default_of(value: i64) -> Option<Box<dyn TileProducer>> {
+        Some(Box::new(TestTileProducer::new(
+            Tile::Scalar(ColumnValue::Ints(vec![value])),
+            int(),
+        )))
+    }
+
+    fn final_over(source: &Shared, default: Option<Box<dyn TileProducer>>) -> ExtractFinalProducer {
+        ExtractFinalProducer::new(
+            ProducerBase::unowned(ExtractFinalProducer::alloc_id(), &int()),
+            Box::new(Input::over(source)),
+            default,
+        )
+    }
+
+    fn scalar_of(tile: &Tile) -> Option<i64> {
+        match tile {
+            Tile::Scalar(ColumnValue::Ints(values)) => values.first().copied(),
+            other if other.is_empty() => None,
+            other => panic!("an integer, got {other:?}"),
+        }
+    }
+
+    fn offer(extract: &mut ExtractFinalProducer) -> Option<i64> {
+        scalar_of(&extract.get(int().universal_guard()))
+    }
+
+    /// Rows arrive in the order they are consumed, so the final value is the one at the greatest
+    /// key, not the last to arrive.
+    #[test]
+    fn the_greatest_key_is_final_whatever_arrived_last() {
+        let source = source(0..12);
+        let mut extract = final_over(&source, None);
+        extract.consume_impl(keys_between(8, 11));
+        assert_eq!(
+            offer(&mut extract),
+            None,
+            "the source has not stated everything complete"
+        );
+        // The rows below arrive after the row at key 11, which stays final.
+        extract.consume_impl(ints().universal_guard());
+        assert_eq!(offer(&mut extract), Some(value(11)));
+        assert_eq!(source.borrow().pulled.len(), 2);
+    }
+
+    /// Out-of-order morsels that end below the key a first morsel held leave that key final.
+    #[test]
+    fn a_later_morsel_with_smaller_keys_does_not_replace_the_final_row() {
+        let source = source([1, 2, 9, 10]);
+        let mut extract = final_over(&source, None);
+        extract.consume_impl(keys_between(9, 11));
+        extract.consume_impl(keys_between(0, 3));
+        extract.consume_impl(ints().universal_guard());
+        assert_eq!(offer(&mut extract), Some(value(10)));
+    }
+
+    /// A region is pulled and released once, and a partial source yields no value.
+    #[test]
+    fn a_region_is_pulled_and_released_and_yields_no_value_yet() {
+        let source = source(0..10);
+        let mut extract = final_over(&source, None);
+        extract.consume_impl(keys_between(2, 5));
+        assert_eq!(source.borrow().pulled, vec![keys_between(2, 5)]);
+        assert_eq!(source.borrow().released, vec![keys_between(2, 5)]);
+        assert_eq!(offer(&mut extract), None);
+        extract.consume_impl(keys_between(7, 9));
+        extract.consume_impl(keys_between(4, 8));
+        assert_eq!(
+            source.borrow().released,
+            vec![keys_between(2, 5), keys_between(7, 9), keys_between(4, 8)]
+        );
+    }
+
+    #[test]
+    fn nothing_consumed_pulls_nothing() {
+        let source = source(0..10);
+        let mut extract = final_over(&source, None);
+        extract.consume_impl(ints().empty_guard());
+        assert!(source.borrow().pulled.is_empty());
+    }
+
+    /// An empty source that has drained falls back to the default, read once.
+    #[test]
+    fn an_empty_drained_source_yields_the_default() {
+        let source = source([]);
+        let mut extract = final_over(&source, default_of(7));
+        extract.consume_impl(ints().universal_guard());
+        assert_eq!(offer(&mut extract), Some(7));
+        assert_eq!(extract.finalize(), int().universal_guard());
+    }
+
+    /// A default that has not converged when the source drains leaves nothing held; the next
+    /// consume reads it again, as every pull does in pull mode.
+    #[test]
+    fn an_unconverged_default_is_read_again_by_the_next_consume() {
+        let source = source([]);
+        let (default, cell) = ScriptedProducer::new(Tile::Scalar(ColumnValue::Ints(vec![])), int());
+        let mut extract = final_over(&source, Some(Box::new(default)));
+        extract.consume_impl(ints().universal_guard());
+        assert_eq!(offer(&mut extract), None, "the default has not converged");
+        assert_eq!(
+            extract.finalize(),
+            int().empty_guard(),
+            "nothing is held yet"
+        );
+
+        *cell.borrow_mut() = Tile::Scalar(ColumnValue::Ints(vec![7]));
+        extract.consume_impl(ints().universal_guard());
+        assert_eq!(offer(&mut extract), Some(7));
+        assert_eq!(extract.finalize(), int().universal_guard());
+    }
+
+    /// A total source that is empty is an invariant violation, as in pull mode.
+    #[test]
+    #[should_panic(expected = "declared total emitted no value")]
+    fn an_empty_total_source_fails_loudly() {
+        let source = source([]);
+        let mut extract = final_over(&source, None);
+        extract.consume_impl(ints().universal_guard());
+    }
+
+    #[test]
+    fn finalize_holds_the_value_until_it_is_released() {
+        let source = source(0..4);
+        let mut extract = final_over(&source, None);
+        extract.consume_impl(ints().universal_guard());
+        assert_eq!(extract.finalize(), int().universal_guard());
+        extract.release(int().universal_guard());
+        assert_eq!(extract.finalize(), int().empty_guard());
+        assert_eq!(offer(&mut extract), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "finalizes after its input has stated everything complete")]
+    fn finalize_before_the_source_has_drained_panics() {
+        let mut extract = final_over(&source(0..10), None);
+        extract.consume_impl(keys_between(0, 3));
+        extract.finalize();
+    }
+
+    #[test]
+    fn a_consuming_extraction_offers_without_pulling() {
+        let source = source(0..10);
+        let mut extract = final_over(&source, None);
+        extract.consume_impl(ints().universal_guard());
+        let pulls = source.borrow().pulled.len();
+        for _ in 0..3 {
+            offer(&mut extract);
+        }
+        assert_eq!(source.borrow().pulled.len(), pulls);
+    }
+
+    /// A growing source withholds a key it does not hold yet: the release leaves it, and a row
+    /// that arrives there later is the final one once the source closes.
+    #[test]
+    fn a_key_the_source_withheld_is_merged_by_a_later_consume() {
+        let source = growing_source([0, 1, 2]);
+        let mut extract = final_over(&source, None);
+        extract.consume_impl(keys_between(0, 5));
+        assert!(!predicate(&source.borrow().released[0]).contains(&Value::UInt(3)));
+        source.borrow_mut().rows.insert(3, value(3));
+        source.borrow_mut().closed = true;
+        extract.consume_impl(ints().universal_guard());
+        assert_eq!(offer(&mut extract), Some(value(3)));
+    }
+
+    /// A consume after the output was released pulls nothing: the source was released whole.
+    #[test]
+    fn a_consume_after_a_release_pulls_nothing() {
+        let source = growing_source(0..4);
+        let mut extract = final_over(&source, None);
+        extract.consume_impl(keys_between(0, 1));
+        extract.release(int().universal_guard());
+        let pulls = source.borrow().pulled.len();
+        extract.consume_impl(ints().universal_guard());
+        assert_eq!(source.borrow().pulled.len(), pulls);
+        assert_eq!(source.borrow().wasted, 0);
+    }
+
+    /// The model of a run over a growing source: the keys answered, whether the output was
+    /// released, and the source.
+    struct Run {
+        sut: ExtractFinalProducer,
+        sut_source: Shared,
+        input: InputModel,
+        answered: BTreeSet<u64>,
+        /// Whether the value is extracted: the source drained by a consume, after which the
+        /// extraction reads no more.
+        extracted: bool,
+        released: bool,
+        trace: String,
+    }
+
+    impl Run {
+        fn new(initial: &[u64], trace: String) -> Self {
+            let sut_source = growing_source(initial.iter().copied());
+            Self {
+                sut: final_over(&sut_source, default_of(-1)),
+                sut_source,
+                input: InputModel::new(initial),
+                answered: BTreeSet::new(),
+                extracted: false,
+                released: false,
+                trace,
+            }
+        }
+
+        fn apply(&mut self, step: Step) {
+            self.trace.push_str(&format!(" {step:?}"));
+            match step {
+                Add(key) => {
+                    if self.input.add(key) {
+                        self.sut_source.borrow_mut().rows.insert(key, value(key));
+                    }
+                }
+                Close => {
+                    self.input.closed = true;
+                    self.sut_source.borrow_mut().closed = true;
+                }
+                Notify(_) => unreachable!("an extraction listens to no region"),
+                Consume(region) => {
+                    self.sut.consume_impl(region.guard());
+                    if self.released || self.extracted {
+                        return;
+                    }
+                    self.answered.extend(self.input.pull(region).0);
+                    self.extracted = self.input.drained();
+                }
+                Release(_) => {
+                    self.sut.release(int().universal_guard());
+                    if !self.released {
+                        self.released = true;
+                        self.input.release(All);
+                    }
+                }
+            }
+        }
+
+        /// The value a drained source leaves: the greatest key answered, or the default.
+        fn expected(&self) -> Option<i64> {
+            match (self.released, self.extracted) {
+                (true, _) | (_, false) => None,
+                (false, true) => Some(self.answered.iter().max().map_or(-1, |key| value(*key))),
+            }
+        }
+
+        fn check(&mut self) {
+            let trace = self.trace.clone();
+            self.input.check(&self.sut_source, &trace);
+            if self.sut.consuming {
+                assert_eq!(offer(&mut self.sut), self.expected(), "{trace}: the value");
+            }
+            if self.input.drained() {
+                let expected = match self.extracted && !self.released {
+                    true => int().universal_guard(),
+                    false => int().empty_guard(),
+                };
+                assert_eq!(self.sut.finalize(), expected, "{trace}: finalize");
+            }
+        }
+
+        fn run(steps: &[Step], initial: &[u64]) {
+            let mut run = Run::new(initial, format!("initial {initial:?} steps"));
+            for step in steps {
+                run.apply(*step);
+                run.check();
+            }
+            run.finish();
+        }
+
+        fn finish(&mut self) {
+            if !self.input.closed {
+                self.apply(Close);
+            }
+            self.apply(Consume(All));
+            self.check();
+            if self.released {
+                return;
+            }
+            // An extraction in pull mode over the keys that were answered yields the same value.
+            let twin_source = source(self.answered.iter().copied());
+            let mut twin = final_over(&twin_source, default_of(-1));
+            assert_eq!(
+                scalar_of(&twin.get(int().universal_guard())),
+                offer(&mut self.sut),
+                "{}: the answer in pull mode",
+                self.trace
+            );
+        }
+    }
+
+    #[test]
+    fn enumerated_interleavings_keep_the_model() {
+        let sequences: &[&[Step]] = &[
+            &[
+                Consume(Keys(6, 9)),
+                Consume(Keys(0, 3)),
+                Add(10),
+                Consume(Keys(4, 11)),
+            ],
+            &[Consume(Keys(0, 3)), Add(3), Add(9), Close, Consume(All)],
+            &[Add(11), Consume(Keys(0, 5)), Release(All), Consume(All)],
+            &[
+                Consume(Keys(8, 11)),
+                Add(9),
+                Consume(Keys(8, 11)),
+                Consume(Keys(0, 7)),
+            ],
+            &[Close, Consume(All), Add(11), Consume(All)],
+        ];
+        for steps in sequences {
+            Run::run(steps, &[0, 1, 2, 4, 5, 6]);
+        }
+    }
+
+    #[test]
+    fn random_interleavings_keep_the_model() {
+        const SEED: u64 = 0xd1b5_4a32_d192_ed03;
+        let mut rng = Rng(SEED);
+        for iteration in 0..300 {
+            let initial: Vec<u64> = (0..KEYS).filter(|_| rng.below(2) == 0).collect();
+            let trace = format!("seed {SEED:#x} iteration {iteration} initial {initial:?} steps");
+            let mut run = Run::new(&initial, trace);
+            for _ in 0..12 {
+                let step = rng.step_among(&run.answered, false);
+                run.apply(step);
+                run.check();
+            }
+            run.finish();
+        }
     }
 }
