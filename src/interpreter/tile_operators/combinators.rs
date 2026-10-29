@@ -119,6 +119,21 @@ struct ConverseProducer {
     consuming: bool,
 }
 
+/// A converse of the outermost level of `input` that nothing subscribed, answering at `tiling`,
+/// for a test that builds a chain of pipelines by hand.
+#[cfg(test)]
+pub(crate) fn converse_of(
+    input: Box<dyn TileProducer>,
+    tiling: &Tiling,
+) -> crate::interpreter::dispatcher::BreakerHandle {
+    Rc::new(RefCell::new(ConverseProducer::new(
+        ProducerBase::unowned(ConverseProducer::alloc_id(), tiling),
+        input,
+        CurryLevel::OUTERMOST,
+        tiling.values_at(CurryLevel::OUTERMOST).empty_at_no_rows(),
+    )))
+}
+
 impl ConverseProducer {
     fn new(
         base: ProducerBase,
@@ -481,13 +496,24 @@ impl BreakingProducer for ConverseProducer {
         self.input.release(upstream_guard);
     }
 
-    fn input(&self) -> &dyn TileProducer {
-        &*self.input
+    fn input_tiling(&self) -> Tiling {
+        self.input.tiling().clone()
+    }
+
+    fn input_released(&self) -> TileGuard {
+        self.input.obsolete_guard().clone()
     }
 
     /// The guard of the groups the held rows build.
     fn held(&self) -> TileGuard {
         converse_collection(self.cached.clone()).0.to_guard()
+    }
+
+    /// Cut at the groups the held rows build.
+    fn morsels(&self, guard: &TileGuard, rows: usize) -> Vec<TileGuard> {
+        let groups = converse_collection(self.cached.clone()).0;
+        let keys = groups.live_keys().into_iter().flatten();
+        cut_at_keys(guard, keys.map(|(_, key)| key), rows, self.tiling())
     }
 
     fn offer_impl(&mut self, guard: TileGuard) -> Tile {
@@ -4370,7 +4396,7 @@ mod converse_consuming_tests {
         let mut lazy = converse_over(&rows_source(0..10));
         assert_eq!(consuming.get(universal()), lazy.get(universal()));
         // Every group is final once the input has drained, whatever its value.
-        assert_eq!(consuming.finalize(), universal());
+        assert_eq!(consuming.final_guard(), universal());
     }
 
     /// A group released drops its rows from what the converse holds and from the input, and
@@ -4389,7 +4415,7 @@ mod converse_consuming_tests {
             cached(&converse),
             (0..9).filter(|k| k % 3 != 1).collect::<Vec<_>>()
         );
-        let TileGuard::Function(FunctionGuard::Domain(kept)) = converse.finalize() else {
+        let TileGuard::Function(FunctionGuard::Domain(kept)) = converse.final_guard() else {
             panic!("a guard of the groups")
         };
         assert!(kept.contains(&Value::Int(0)) && kept.contains(&Value::Int(2)));
@@ -4397,14 +4423,6 @@ mod converse_consuming_tests {
             !kept.contains(&Value::Int(1)),
             "the released group is not finalized"
         );
-    }
-
-    #[test]
-    #[should_panic(expected = "finalizes after its input has stated everything complete")]
-    fn finalize_before_the_input_has_drained_panics() {
-        let mut converse = converse_over(&rows_source(0..10));
-        converse.consume_impl(keys_between(0, 3));
-        converse.finalize();
     }
 
     #[test]
@@ -4496,7 +4514,7 @@ mod converse_consuming_tests {
         converse.release(TileGuard::Function(FunctionGuard::Codomain(Box::new(
             keys_between(4, 5),
         ))));
-        converse.finalize();
+        converse.final_guard();
     }
 
     /// A release of every group leaves nothing held.
@@ -4505,7 +4523,7 @@ mod converse_consuming_tests {
         let mut converse = converse_over(&rows_source(0..10));
         converse.consume_impl(ints().universal_guard());
         converse.release(universal());
-        assert_eq!(converse.finalize(), out_tiling().empty_guard());
+        assert_eq!(converse.final_guard(), out_tiling().empty_guard());
     }
 
     /// The model of a run over a growing input: the rows held and the groups released.
@@ -4607,7 +4625,7 @@ mod converse_consuming_tests {
             }
             self.input.check(&self.sut_source, trace);
             if self.input.drained() {
-                let guard = self.sut.finalize();
+                let guard = self.sut.final_guard();
                 match self.released_all {
                     true => assert_eq!(guard, out_tiling().empty_guard(), "{trace}: finalize"),
                     false => {

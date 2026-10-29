@@ -529,3 +529,36 @@ impl TileProducer for NestedInput {
         self.source.borrow_mut().released.push(guard);
     }
 }
+
+/// An input that reads a breaker through its handle, as the chain of a parent pipeline reads the
+/// breaker of a pipeline it reads.
+pub(crate) struct ReadsBreaker {
+    base: ProducerBase,
+    breaker: crate::interpreter::dispatcher::BreakerHandle,
+}
+
+impl ReadsBreaker {
+    pub(crate) fn of(breaker: &crate::interpreter::dispatcher::BreakerHandle) -> Self {
+        let tiling = breaker.borrow().tiling().clone();
+        Self {
+            base: ProducerBase::unowned(Self::alloc_id(), &tiling),
+            breaker: breaker.clone(),
+        }
+    }
+}
+
+impl TileProducer for ReadsBreaker {
+    impl_producer_base!();
+
+    fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
+        node
+    }
+
+    fn get_impl(&mut self, guard: TileGuard) -> Tile {
+        self.breaker.borrow_mut().get(guard)
+    }
+
+    fn release_impl(&mut self, guard: TileGuard) {
+        self.breaker.borrow_mut().release(guard);
+    }
+}

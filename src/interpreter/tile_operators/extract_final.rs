@@ -172,6 +172,21 @@ struct ExtractFinalProducer {
     consuming: bool,
 }
 
+/// The final value of `source`, falling back to `default`, that nothing subscribed, answering at
+/// `tiling`, for a test that builds a chain of pipelines by hand.
+#[cfg(test)]
+pub(crate) fn extract_final_of(
+    source: Box<dyn TileProducer>,
+    default: Option<Box<dyn TileProducer>>,
+    tiling: &Tiling,
+) -> crate::interpreter::dispatcher::BreakerHandle {
+    Rc::new(RefCell::new(ExtractFinalProducer::new(
+        ProducerBase::unowned(ExtractFinalProducer::alloc_id(), tiling),
+        source,
+        default,
+    )))
+}
+
 impl ExtractFinalProducer {
     fn new(
         base: ProducerBase,
@@ -441,8 +456,12 @@ impl BreakingProducer for ExtractFinalProducer {
         };
     }
 
-    fn input(&self) -> &dyn TileProducer {
-        &*self.source
+    fn input_tiling(&self) -> Tiling {
+        self.source.tiling().clone()
+    }
+
+    fn input_released(&self) -> TileGuard {
+        self.source.obsolete_guard().clone()
     }
 
     /// The extracted value, once there is one: none while the source has not drained, or while a
@@ -452,6 +471,24 @@ impl BreakingProducer for ExtractFinalProducer {
             Some(_) => self.tiling().universal_guard(),
             None => self.tiling().empty_guard(),
         }
+    }
+
+    /// Pushes the extracted value, as every breaker pushes its final guard.
+    ///
+    /// # Panics
+    ///
+    /// When the output is unreleased and no value has been extracted: the source has not been
+    /// released whole, or the default it fell back to has not converged. A dispatcher finalizes
+    /// a pipeline once and issues no `consume_impl` after it, so nothing would read that default
+    /// again, and pushing nothing would leave the reader with no value.
+    fn finalize(&mut self, pushes: &mut Pushes<'_>) {
+        assert!(
+            self.released || self.final_tile.is_some(),
+            "{} finalizes after it extracted its value: the source released whole and any \
+             default it fell back to converged",
+            self.name()
+        );
+        pushes.push_final(self);
     }
 
     fn offer_impl(&mut self, guard: TileGuard) -> Tile {
@@ -816,6 +853,7 @@ mod consuming_tests {
     use super::*;
     use std::collections::BTreeSet;
 
+    use crate::interpreter::dispatcher::{Dispatcher, PipelineId};
     use crate::interpreter::tile_operators::growing::{
         Input, InputModel, KEYS, Region, Rng, Shared, Step, growing_source, ints, predicate,
         source, value,
@@ -919,7 +957,7 @@ mod consuming_tests {
         let mut extract = final_over(&source, default_of(7));
         extract.consume_impl(ints().universal_guard());
         assert_eq!(offer(&mut extract), Some(7));
-        assert_eq!(extract.finalize(), int().universal_guard());
+        assert_eq!(extract.final_guard(), int().universal_guard());
     }
 
     /// A default that has not converged when the source drains leaves nothing held; the next
@@ -932,7 +970,7 @@ mod consuming_tests {
         extract.consume_impl(ints().universal_guard());
         assert_eq!(offer(&mut extract), None, "the default has not converged");
         assert_eq!(
-            extract.finalize(),
+            extract.final_guard(),
             int().empty_guard(),
             "nothing is held yet"
         );
@@ -940,7 +978,31 @@ mod consuming_tests {
         *cell.borrow_mut() = Tile::Scalar(ColumnValue::Ints(vec![7]));
         extract.consume_impl(ints().universal_guard());
         assert_eq!(offer(&mut extract), Some(7));
-        assert_eq!(extract.finalize(), int().universal_guard());
+        assert_eq!(extract.final_guard(), int().universal_guard());
+    }
+
+    /// A default that has not converged by `finalize` is never read again: the dispatcher issues
+    /// no later `consume_impl`.
+    #[test]
+    #[should_panic(expected = "finalizes after it extracted its value")]
+    fn finalize_with_an_unconverged_default_panics() {
+        let source = source([]);
+        let (default, _) = ScriptedProducer::new(Tile::Scalar(ColumnValue::Ints(vec![])), int());
+        let mut extract = final_over(&source, Some(Box::new(default)));
+        extract.consume_impl(ints().universal_guard());
+        extract.finalize(&mut Dispatcher::new(vec![vec![]], usize::MAX).pushes(PipelineId(0)));
+    }
+
+    /// An output released before the value was extracted pushes nothing, and that is no error.
+    #[test]
+    fn finalize_after_the_output_was_released_pushes_nothing() {
+        let source = growing_source(0..4);
+        let mut extract = final_over(&source, None);
+        extract.consume_impl(keys_between(0, 1));
+        extract.release(int().universal_guard());
+        let dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
+        dispatcher.finalize_by_hand(PipelineId(0), |pushes| extract.finalize(pushes));
+        assert!(dispatcher.pop().is_none());
     }
 
     /// A total source that is empty is an invariant violation, as in pull mode.
@@ -957,18 +1019,10 @@ mod consuming_tests {
         let source = source(0..4);
         let mut extract = final_over(&source, None);
         extract.consume_impl(ints().universal_guard());
-        assert_eq!(extract.finalize(), int().universal_guard());
+        assert_eq!(extract.final_guard(), int().universal_guard());
         extract.release(int().universal_guard());
-        assert_eq!(extract.finalize(), int().empty_guard());
+        assert_eq!(extract.final_guard(), int().empty_guard());
         assert_eq!(offer(&mut extract), None);
-    }
-
-    #[test]
-    #[should_panic(expected = "finalizes after its input has stated everything complete")]
-    fn finalize_before_the_source_has_drained_panics() {
-        let mut extract = final_over(&source(0..10), None);
-        extract.consume_impl(keys_between(0, 3));
-        extract.finalize();
     }
 
     #[test]
@@ -1088,7 +1142,7 @@ mod consuming_tests {
                     true => int().universal_guard(),
                     false => int().empty_guard(),
                 };
-                assert_eq!(self.sut.finalize(), expected, "{trace}: finalize");
+                assert_eq!(self.sut.final_guard(), expected, "{trace}: finalize");
             }
         }
 

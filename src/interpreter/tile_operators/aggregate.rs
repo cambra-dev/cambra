@@ -89,6 +89,19 @@ struct AggregateProducer {
     consuming: bool,
 }
 
+/// An aggregate over `input` that nothing subscribed, for a test that builds a chain of pipelines
+/// by hand.
+#[cfg(test)]
+pub(crate) fn aggregate_over(
+    input: Box<dyn TileProducer>,
+    tiling: &Tiling,
+) -> crate::interpreter::dispatcher::BreakerHandle {
+    Rc::new(RefCell::new(AggregateProducer::new(
+        ProducerBase::unowned(AggregateProducer::alloc_id(), tiling),
+        input,
+    )))
+}
+
 impl AggregateProducer {
     /// Construct an `AggregateProducer`, seeding the accumulator with the identity element.
     fn new(base: ProducerBase, input: Box<dyn TileProducer>) -> Self {
@@ -228,8 +241,12 @@ impl BreakingProducer for AggregateProducer {
         self.fold_input(guard);
     }
 
-    fn input(&self) -> &dyn TileProducer {
-        &*self.input
+    fn input_tiling(&self) -> Tiling {
+        self.input.tiling().clone()
+    }
+
+    fn input_released(&self) -> TileGuard {
+        self.input.obsolete_guard().clone()
     }
 
     /// The accumulator is one value, held unless an extreme has not seen its first element.
@@ -419,8 +436,12 @@ impl BreakingProducer for ExtractAggregateProducer {
         self.input.release(upstream_guard);
     }
 
-    fn input(&self) -> &dyn TileProducer {
-        &*self.input
+    fn input_tiling(&self) -> Tiling {
+        self.input.tiling().clone()
+    }
+
+    fn input_released(&self) -> TileGuard {
+        self.input.obsolete_guard().clone()
     }
 
     /// The extracted value, once there is one.
@@ -803,6 +824,21 @@ struct MapAggregateProducer {
     stated: Option<Stated>,
 }
 
+/// A map-aggregate over `input` that nothing subscribed, folding each group with `kind` into the
+/// output `tiling`, for a test that builds a chain of pipelines by hand.
+#[cfg(test)]
+pub(crate) fn map_aggregate_over(
+    input: Box<dyn TileProducer>,
+    tiling: &Tiling,
+    kind: AggregateKind,
+) -> crate::interpreter::dispatcher::BreakerHandle {
+    Rc::new(RefCell::new(MapAggregateProducer::new(
+        ProducerBase::unowned(MapAggregateProducer::alloc_id(), tiling),
+        input,
+        kind,
+    )))
+}
+
 impl MapAggregateProducer {
     fn new(base: ProducerBase, input: Box<dyn TileProducer>, kind: AggregateKind) -> Self {
         Self {
@@ -1102,8 +1138,12 @@ impl BreakingProducer for MapAggregateProducer {
         });
     }
 
-    fn input(&self) -> &dyn TileProducer {
-        &*self.input
+    fn input_tiling(&self) -> Tiling {
+        self.input.tiling().clone()
+    }
+
+    fn input_released(&self) -> TileGuard {
+        self.input.obsolete_guard().clone()
     }
 
     /// The guard of the output the accumulators build, empty before the first consume.
@@ -1112,6 +1152,16 @@ impl BreakingProducer for MapAggregateProducer {
             Some(stated) => self.build(stated, &Projection::Everything).to_guard(),
             None => self.tiling().empty_guard(),
         }
+    }
+
+    /// Cut at the groups the accumulators hold.
+    fn morsels(&self, guard: &TileGuard, rows: usize) -> Vec<TileGuard> {
+        let Some(stated) = &self.stated else {
+            return vec![guard.clone()];
+        };
+        let output = self.build(stated, &Projection::Everything);
+        let keys = output.live_keys().into_iter().flatten();
+        cut_at_keys(guard, keys.map(|(_, key)| key), rows, self.tiling())
     }
 
     fn offer_impl(&mut self, guard: TileGuard) -> Tile {
@@ -1973,7 +2023,7 @@ mod aggregate_consuming_tests {
         let mut aggregate = sum_over(&source);
         aggregate.consume_impl(ints().universal_guard());
         assert_eq!(held(&aggregate), (sum_of(0..10), true));
-        assert_eq!(aggregate.finalize(), sum_tiling().universal_guard());
+        assert_eq!(aggregate.final_guard(), sum_tiling().universal_guard());
         assert_eq!(
             aggregate.get(sum_tiling().universal_guard()),
             aggregate.accumulator,
@@ -1998,17 +2048,8 @@ mod aggregate_consuming_tests {
         let mut aggregate = sum_over(&source);
         aggregate.consume_impl(ints().universal_guard());
         aggregate.release(sum_tiling().universal_guard());
-        assert_eq!(aggregate.finalize(), sum_tiling().empty_guard());
+        assert_eq!(aggregate.final_guard(), sum_tiling().empty_guard());
         assert!(aggregate.get(sum_tiling().universal_guard()).is_empty());
-    }
-
-    /// A pipeline finalizes after its input has drained, which is the invariant of the protocol.
-    #[test]
-    #[should_panic(expected = "finalizes after its input has stated everything complete")]
-    fn finalize_before_the_input_has_drained_panics() {
-        let mut aggregate = sum_over(&source(0..10));
-        aggregate.consume_impl(keys_between(0, 3));
-        aggregate.finalize();
     }
 
     /// A consuming aggregate answers from its accumulator and pulls nothing.
@@ -2120,7 +2161,7 @@ mod aggregate_consuming_tests {
                     true => sum_tiling().empty_guard(),
                     false => sum_tiling().universal_guard(),
                 };
-                assert_eq!(self.sut.finalize(), expected, "{trace}: finalize");
+                assert_eq!(self.sut.final_guard(), expected, "{trace}: finalize");
             }
         }
 
@@ -2210,7 +2251,7 @@ mod aggregate_consuming_tests {
         let mut memo = MemoProducer::over(Box::new(Input::over(&source)), &ints());
         memo.consume_impl(ints().universal_guard());
         memo.release(keys_between(2, 3));
-        let handed = memo.finalize();
+        let handed = memo.final_guard();
         let mut aggregate = AggregateProducer::new(
             ProducerBase::unowned(AggregateProducer::alloc_id(), &sum_tiling()),
             Box::new(memo),
@@ -2257,7 +2298,7 @@ mod aggregate_consuming_tests {
             Some(sum_of(0..10))
         );
         assert!(extract.input.obsolete_guard().is_universal());
-        assert_eq!(extract.finalize(), scalar_tiling().universal_guard());
+        assert_eq!(extract.final_guard(), scalar_tiling().universal_guard());
         let pulls = source.borrow().pulled.len();
         extract.get(scalar_tiling().universal_guard());
         assert_eq!(
@@ -2280,18 +2321,6 @@ mod aggregate_consuming_tests {
             None
         );
         assert!(!extract.input.obsolete_guard().is_universal());
-    }
-
-    /// A pipeline does not finalize over an aggregation that is not terminal.
-    #[test]
-    #[should_panic(expected = "finalizes after its input has stated everything complete")]
-    fn finalize_over_a_partial_aggregation_panics() {
-        let source = source(0..10);
-        let mut sum = sum_over(&source);
-        sum.consume_impl(keys_between(0, 3));
-        let mut extract = extract_over_input(Box::new(sum));
-        extract.consume_impl(sum_tiling().universal_guard());
-        extract.finalize();
     }
 
     /// Once the value is extracted, a second consume pulls nothing.
@@ -2341,7 +2370,7 @@ mod aggregate_consuming_tests {
         let mut extract = extract_over(&source);
         extract.consume_impl(sum_tiling().universal_guard());
         extract.release(scalar_tiling().universal_guard());
-        assert_eq!(extract.finalize(), scalar_tiling().empty_guard());
+        assert_eq!(extract.final_guard(), scalar_tiling().empty_guard());
         assert_eq!(
             scalar_of(&extract.get(scalar_tiling().universal_guard())),
             None
@@ -2464,7 +2493,7 @@ mod aggregate_consuming_tests {
                     true => scalar_tiling().empty_guard(),
                     false => scalar_tiling().universal_guard(),
                 };
-                assert_eq!(self.sut.finalize(), guard, "{trace}: finalize");
+                assert_eq!(self.sut.final_guard(), guard, "{trace}: finalize");
             }
         }
 
@@ -2659,7 +2688,7 @@ mod map_aggregate_consuming_tests {
         let mut lazy = sums_over(&self::source(0..10));
         let guard = out_tiling().universal_guard();
         assert_eq!(consuming.get(guard.clone()), lazy.get(guard.clone()));
-        assert_eq!(consuming.finalize(), out_tiling().universal_guard());
+        assert_eq!(consuming.final_guard(), out_tiling().universal_guard());
     }
 
     #[test]
@@ -2669,17 +2698,9 @@ mod map_aggregate_consuming_tests {
         map.consume_impl(nested_tiling().universal_guard());
         map.release(output_guard(Keys(2, 3)));
         assert_eq!(held(&map), sums_of([0, 1, 4, 5, 6, 7, 8, 9]));
-        let guard = map.finalize();
+        let guard = map.final_guard();
         let kept: BTreeSet<u64> = outer_keys(&guard);
         assert_eq!(kept, (0..KEYS).filter(|k| ![2, 3].contains(k)).collect());
-    }
-
-    #[test]
-    #[should_panic(expected = "finalizes after its input has stated everything complete")]
-    fn finalize_before_the_input_has_drained_panics() {
-        let mut map = sums_over(&source(0..10));
-        map.consume_impl(input_guard(Keys(0, 3)));
-        map.finalize();
     }
 
     #[test]
@@ -2749,7 +2770,7 @@ mod map_aggregate_consuming_tests {
         let source = source(0..10);
         let mut memo = MemoProducer::over(Box::new(NestedInput::over(&source)), &nested_tiling());
         memo.consume_impl(nested_tiling().universal_guard());
-        let handed = memo.finalize();
+        let handed = memo.final_guard();
         let mut map = sums_over_input(Box::new(memo));
         map.consume_impl(handed);
         assert_eq!(held(&map), sums_of(0..10));
@@ -2796,7 +2817,7 @@ mod map_aggregate_consuming_tests {
         let mut map = sums_over(&source(0..6));
         map.consume_impl(nested_tiling().universal_guard());
         map.release(out_tiling().universal_guard());
-        assert_eq!(map.finalize(), out_tiling().empty_guard());
+        assert_eq!(map.final_guard(), out_tiling().empty_guard());
     }
 
     /// A release of nothing changes neither the groups nor what `finalize` returns.
@@ -2804,9 +2825,9 @@ mod map_aggregate_consuming_tests {
     fn a_release_of_nothing_changes_nothing() {
         let mut map = sums_over(&source(0..6));
         map.consume_impl(nested_tiling().universal_guard());
-        let before = (held(&map), map.finalize());
+        let before = (held(&map), map.final_guard());
         map.release(out_tiling().empty_guard());
-        assert_eq!((held(&map), map.finalize()), before);
+        assert_eq!((held(&map), map.final_guard()), before);
     }
 
     /// A consuming map aggregate and a twin in pull mode over growing inputs that receive the

@@ -24,6 +24,7 @@ use std::{
 
 use log::trace;
 
+use crate::interpreter::dispatcher::Pushes;
 pub use crate::interpreter::tiling::{
     CurryLevel, FunctionGuard, Predicate, Tile, TileGuard, Tiling,
 };
@@ -42,6 +43,10 @@ use crate::{
 mod aggregate;
 mod combinators;
 mod cycle_slot;
+#[cfg(test)]
+mod dispatcher_tests;
+#[cfg(test)]
+mod dispatcher_thread_tests;
 mod extract_final;
 mod fan;
 mod fanout;
@@ -940,22 +945,6 @@ macro_rules! impl_producer_base {
 // leak it to the crate root.
 pub(crate) use impl_producer_base;
 
-/// What a breaker's `finalize` returns: `held`, the guard of the state it keeps, less `released`,
-/// the guard its readers have released. A pipeline finalizes only after its input has stated
-/// everything complete, so this panics before the input has been released whole.
-pub(crate) fn finalize_guard(
-    name: &str,
-    input: &dyn TileProducer,
-    held: &TileGuard,
-    released: &TileGuard,
-) -> TileGuard {
-    assert!(
-        input.obsolete_guard().is_universal(),
-        "{name} finalizes after its input has stated everything complete"
-    );
-    guard_minus(held, released)
-}
-
 /// `held` less `released`, exactly. A guard of a collection's outermost keys, of a scalar and of an
 /// aggregation, none of them qualified by an enclosing path, each have a spelling for the
 /// difference, and so has a record of such guards, field by field. A shape that has none, such as
@@ -997,6 +986,109 @@ pub(crate) fn guard_minus(held: &TileGuard, released: &TileGuard) -> TileGuard {
     }
 }
 
+/// `guard`, a guard of `tiling`, cut into morsels of at most `rows` of the `held` keys each, for
+/// a breaker that holds a collection: a cut falls before every `rows`-th held key `guard` names,
+/// in key order. The morsels partition `guard` exactly, so a key the breaker states absent rides
+/// in the morsel that covers it, and a released key is in none because `guard`, a final guard,
+/// excludes it. A guard naming no more than `rows` held keys, or one that is not of a
+/// collection's outermost keys unqualified, is one morsel.
+///
+/// # Panics
+///
+/// When a cut is needed and a held key has no order, such as a function value.
+pub(crate) fn cut_at_keys(
+    guard: &TileGuard,
+    held: impl IntoIterator<Item = Value>,
+    rows: usize,
+    tiling: &Tiling,
+) -> Vec<TileGuard> {
+    assert!(rows > 0, "a morsel holds at least one row");
+    let (TileGuard::Function(FunctionGuard::Domain(region)), Some(domain)) =
+        (guard, tiling.domain_extent())
+    else {
+        return vec![guard.clone()];
+    };
+    if region.qualifies() {
+        return vec![guard.clone()];
+    }
+    let mut keys: Vec<Value> = held
+        .into_iter()
+        .filter(|key| region.contains(key))
+        .collect();
+    if keys.len() <= rows {
+        return vec![guard.clone()];
+    }
+    if let Some(key) = keys.iter().find(|key| !has_order(key)) {
+        panic!("a collection is cut into morsels in key order, which the key {key:?} has none of");
+    }
+    keys.sort_by(|a, b| {
+        a.partial_cmp(b)
+            .unwrap_or_else(|| panic!("the keys of one collection compare: {a:?} and {b:?}"))
+    });
+    keys.dedup();
+    let cuts: Vec<Value> = keys.into_iter().skip(rows).step_by(rows).collect();
+    cut_before(region, &cuts, &domain)
+}
+
+/// Whether `key` has an order among the keys of its type: every value but a function, as
+/// `Value`'s `partial_cmp` orders them.
+fn has_order(key: &Value) -> bool {
+    match key {
+        Value::Function(_) | Value::ComputableFunction(_) => false,
+        Value::Record(fields) => fields.values().all(has_order),
+        Value::Union { inner, .. } => has_order(inner),
+        _ => true,
+    }
+}
+
+/// The region `region` of a collection's outermost keys over `domain`, cut before each of `cuts`,
+/// which ascend: the keys below the first cut, then from each cut up to the next, then from the
+/// last cut up. Every cut lies in `region`, so each morsel is non-empty but the first, which is
+/// non-empty when `region` names a key below the first cut.
+pub(crate) fn cut_before(region: &Predicate, cuts: &[Value], domain: &Extent) -> Vec<TileGuard> {
+    let mut morsels = Vec::with_capacity(cuts.len() + 1);
+    let mut below_last = Predicate::False;
+    for cut in cuts {
+        let below = Predicate::below_in(cut.clone(), domain);
+        morsels.push(region.intersect(&below).minus(&below_last));
+        below_last = below;
+    }
+    morsels.push(region.minus(&below_last));
+    morsels
+        .into_iter()
+        .map(|morsel| TileGuard::Function(FunctionGuard::Domain(morsel)))
+        .collect()
+}
+
+/// Why `morsels` do not partition `guard`, or `None` when they do: each morsel is non-empty, no
+/// two intersect, and their union is `guard`. One morsel partitions `guard` when it is `guard`;
+/// several are guards of a collection's outermost keys.
+pub(crate) fn partition_gap(guard: &TileGuard, morsels: &[TileGuard]) -> Option<String> {
+    if let [only] = morsels {
+        return (only != guard).then(|| format!("one morsel {only:?} that is not {guard:?}"));
+    }
+    let TileGuard::Function(FunctionGuard::Domain(region)) = guard else {
+        return Some(format!(
+            "several morsels of {guard:?}, which has no keys to cut"
+        ));
+    };
+    let mut union = Predicate::False;
+    for morsel in morsels {
+        let TileGuard::Function(FunctionGuard::Domain(keys)) = morsel else {
+            return Some(format!("a morsel {morsel:?} not of outermost keys"));
+        };
+        if keys.is_false() {
+            return Some("an empty morsel".to_string());
+        }
+        if !union.intersect(keys).is_false() {
+            return Some(format!("a morsel {keys:?} that intersects one before it"));
+        }
+        union = union.union(keys);
+    }
+    (!(union.subsumes(region) && region.subsumes(&union)))
+        .then(|| format!("morsels whose union {union:?} is not {region:?}"))
+}
+
 /// The projection of a pull of a producer whose output is one value, which has no keys to project:
 /// all of it or none. `what` completes "`name` ..." in the panic: "is one accumulator".
 ///
@@ -1015,14 +1107,15 @@ pub(crate) fn projection_of_one_value(name: &str, what: &str, guard: &TileGuard)
 ///
 /// A driver makes three calls. [`consume_impl`] pulls the producer's input at a guard, merges the
 /// answer, and releases the input at what the answer stated once it has taken delivery of it, so
-/// the driver handles no tile. [`finalize`] says what the producer holds once its input has stated
-/// everything complete. [`offer_impl`] is what the producer's `get_impl` answers with once it is
-/// consuming: it reads the state `consume_impl` built and never pulls the input.
+/// the driver handles no tile. [`finalize`] pushes what the producer holds to the pipeline that
+/// reads it, once its own pipeline has finished. [`offer_impl`] is what the producer's `get_impl`
+/// answers with once it is consuming: it reads the state `consume_impl` built and never pulls the
+/// input.
 ///
-/// A producer wakes its consumer through the notification path, as in pull mode. A consume that
-/// changes the state of a producer with no handle on its consumer is not announced by the producer:
-/// the consumer that pulled between the input's notification and the consume does not hear of it,
-/// and the caller of `consume_impl` has to announce it. `Memo` has the handle and announces it.
+/// A consuming producer's only reader is the pipeline the dispatcher pushes its packages to, so a
+/// consuming producer wakes no consumer: the work package `finalize` pushes is how its reader
+/// learns what it holds. Pull mode wakes its consumer as it always has. When a pipeline may
+/// finalize is the dispatcher's to decide (`crate::interpreter::dispatcher`).
 /// See `src/interpreter/design-operators.md`, "Pipeline breakers".
 ///
 /// [`consume_impl`]: Self::consume_impl
@@ -1039,27 +1132,44 @@ pub trait BreakingProducer: TileProducer {
     /// learns it: a `Converse` beneath standing levels is one.
     fn consume_impl(&mut self, guard: TileGuard);
 
-    /// The input `consume_impl` pulls, which `finalize` checks has been released whole.
-    fn input(&self) -> &dyn TileProducer;
+    /// The tiling of the input `consume_impl` pulls: what a package's guard is a guard of, and
+    /// what a source pipeline's first packages cut.
+    fn input_tiling(&self) -> Tiling;
+
+    /// The guard this producer has released of its input, which a finalize checks covers every
+    /// guard its pipeline consumed.
+    fn input_released(&self) -> TileGuard;
 
     /// The guard of what the producer holds: the state's own statement, before what a release
     /// removed is taken out of it. Empty when it holds nothing.
     fn held(&self) -> TileGuard;
 
-    /// What the producer holds: [`held`](Self::held) less the guard its readers have released. It
+    /// What the producer holds: [`held`](Self::held) less the guard its readers have released.
+    ///
+    /// # Panics
+    ///
+    /// Where the guard algebra has no exact difference of the two ([`guard_minus`]).
+    fn final_guard(&self) -> TileGuard {
+        guard_minus(&self.held(), self.obsolete_guard())
+    }
+
+    /// `guard`, a guard of this producer's tiling it pushes, cut into morsels of at most `rows`
+    /// held rows each, which partition `guard` exactly. The default answers `guard` whole, as a
+    /// producer whose output is one value does; a producer that holds a collection cuts at its
+    /// held outermost keys ([`cut_at_keys`]).
+    fn morsels(&self, guard: &TileGuard, _rows: usize) -> Vec<TileGuard> {
+        vec![guard.clone()]
+    }
+
+    /// Push [`final_guard`](Self::final_guard) to the pipeline that reads this producer, as one
+    /// work package per morsel ([`morsels`](Self::morsels)); an empty guard pushes nothing. It
     /// wakes no one.
     ///
     /// # Panics
     ///
-    /// Before the input has stated everything complete, and where the guard algebra has no exact
-    /// difference of the two ([`guard_minus`]).
-    fn finalize(&mut self) -> TileGuard {
-        finalize_guard(
-            &self.name(),
-            self.input(),
-            &self.held(),
-            self.obsolete_guard(),
-        )
+    /// As [`final_guard`](Self::final_guard).
+    fn finalize(&mut self, pushes: &mut Pushes<'_>) {
+        pushes.push_final(self);
     }
 
     /// The answer to a pull at `guard`, from the state `consume_impl` built. It pulls nothing.

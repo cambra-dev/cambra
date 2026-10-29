@@ -99,6 +99,28 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/operator_graph.rs", "ambient mutable state"),
     ("src/interpreter/operator_graph.rs", "ambient mutable state"),
     ("src/interpreter/tile_operators/cycle_slot.rs", "shared cell of `Option<Box<T>>`"),
+    # `BreakerHandle`, the dispatcher's handle on a pipeline's breaker; see its type doc. The
+    # driver calls the breaker through it, and what crosses it is a call, never a tile.
+    ("src/interpreter/dispatcher.rs", "shared cell of `dyn BreakingProducer`"),
+    # A slot of a pipeline's queue of work packages in one epoch, written once by the append that
+    # reserved it and read by the threads that claim from it. What crosses it is a guard naming a
+    # region, never a tile.
+    ("src/interpreter/dispatcher.rs", "cell of `TileGuard`"),
+    # The region a pipeline's queued packages partition in one epoch, which appends grow and its
+    # finish reads; no claim takes it. What crosses it is a guard naming a region, never a tile.
+    ("src/interpreter/dispatcher.rs", "cell of `Option<TileGuard>`"),
+    # The region a pipeline's breaker has pushed to its reader. A push of the breaker's final
+    # guard pushes what is not in it and grows it in one step, so two threads pushing for one
+    # pipeline push disjoint regions. What crosses it is a guard naming a region, never a tile.
+    ("src/interpreter/dispatcher.rs", "cell of `Option<TileGuard>`"),
+    # The lock that orders a dispatcher's seals and closes; it guards no data.
+    ("src/interpreter/dispatcher.rs", "cell of `()`"),
+    # The lock a dispatcher's sleeping worker waits under; it guards no data.
+    ("src/interpreter/dispatcher.rs", "cell of `()`"),
+    # The dispatcher tests' typed handle on a breaker they also pass to the driver. The file is
+    # a `#[cfg(test)] mod` declared in `tile_operators/mod.rs`, which `_blank_test_items` does
+    # not see.
+    ("src/interpreter/tile_operators/dispatcher_tests.rs", "shared cell of `T`"),
     ("src/interpreter/tile_operators/fanout.rs", "cell of `bool`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `usize`"),
     ("src/interpreter/tile_operators/fanout.rs", "shared cell of `Box<dyn TileOperator>`"),
