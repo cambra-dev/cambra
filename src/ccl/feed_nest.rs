@@ -15,6 +15,7 @@
 //! keys depend on the enclosing position, so the nest is keyed by a dependent tuple, which the
 //! indexed form builds a level at a time.
 
+use crate::ccl::Occurrence;
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{
@@ -63,7 +64,13 @@ pub(crate) fn contribution_lambda(
             codomain: Box::new(codomain),
         }
     };
-    Expr::lambda(&param.name, param.ty.clone(), body).with_ty(ty)
+    Expr::lambda(
+        &param.name,
+        param.occurrence.clone(),
+        param.ty.clone(),
+        body,
+    )
+    .with_ty(ty)
 }
 
 /// A feed's contribution from under `levels` loops, keyed by the tuple of their positions:
@@ -619,12 +626,15 @@ fn read_level(
         return crate::ccl::subst::Subst::discharge(param.name, read).apply_expr(&inner);
     }
     let ty = inner.ty.clone();
+    // The step's binder is the loop's, so it keeps the loop binder's occurrence
+    // (`contribution_lambda`).
     let lambda = contribution_lambda(&param, inner, None);
     Expr::apply(read, lambda).with_ty(ty)
 }
 
 /// `λ position : domain → body`, a collection over `domain`, keyed where `body`'s type reads
-/// `position`.
+/// `position`. The position is a binder the pass makes for itself, so its occurrence is
+/// minted.
 fn collection_over(position: &Name, domain: Type, body: Expr) -> Expr {
     let value = body.ty.clone();
     let ty = if crate::ccl::subst::type_free_vars(&value).contains(position) {
@@ -632,7 +642,7 @@ fn collection_over(position: &Name, domain: Type, body: Expr) -> Expr {
     } else {
         Type::data_fun(domain.clone(), value)
     };
-    Expr::lambda(position, domain, body).with_ty(ty)
+    Expr::lambda(position, Occurrence::mint(), domain, body).with_ty(ty)
 }
 
 /// A feed's contribution from under `levels` loops, each level indexed by its own position:

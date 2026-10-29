@@ -10,6 +10,7 @@
 //! [`crate::ccl::letrec::check_letrec_causal`].
 
 use crate::ccl::Label;
+use crate::ccl::RecordEntry;
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::{
@@ -534,13 +535,13 @@ fn recover_writer(site_dom: &Type, def: Expr) -> WriterSite {
     };
     let mut write_targets = None;
     let mut decision = None;
-    for (name, val) in fields {
+    for RecordEntry { label, value, .. } in fields {
         // `time` records the commit clock for the model; recognition ignores
         // it.
-        if name == F_WRITE_TARGETS {
-            write_targets = Some(val);
-        } else if name == F_DECISION {
-            decision = Some(val);
+        if label == F_WRITE_TARGETS {
+            write_targets = Some(value);
+        } else if label == F_DECISION {
+            decision = Some(value);
         }
     }
     let write_targets = unwrap_const(write_targets.expect("commit record carries write_targets"));
@@ -780,12 +781,16 @@ fn collapse_snapshot_sources(
         && let [_, source] = elts.as_mut_slice()
         && let TypedExprNode::Record(fields) = &source.node
         && !fields.is_empty()
-        && fields.iter().all(|(f, v)| {
-            matches!(&v.node,
+        && fields.iter().all(
+            |RecordEntry {
+                 label: f, value: v, ..
+             }| {
+                matches!(&v.node,
                 TypedExprNode::Apply { argument: sv, function: proj }
                     if matches!(&sv.node, TypedExprNode::Var(n) if n == hist)
                         && matches!(&proj.node, TypedExprNode::Proj(ProjKey::Field(pf)) if pf == f))
-        })
+            },
+        )
     {
         // Stamp the source with the mutable variable's *own* type (all keys + taps), not
         // just the read subset — the `Var(__hist)` must agree with its binder,
@@ -989,6 +994,10 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
     let TypedExprNode::Record(inits) = defaults.node else {
         panic!("letrec recognition: guard defaults are not the accumulators' inits record");
     };
+    let inits: Vec<(Label, Expr)> = inits
+        .into_iter()
+        .map(|entry| (entry.label, entry.value))
+        .collect();
 
     let (prev_slots, source, writer_body, parameter) =
         split_decision(*applied, &domain_ty, &decision_ty, enclosing.as_ref());

@@ -3468,6 +3468,7 @@ fn projection_diagnostics_name_the_shape() {
 /// because nothing in the pipeline emits `LetRec` yet (the unified phase of
 /// `src/ccl/design/mutability.md` lands it later).
 mod letrec_typing {
+    use cambra::ccl::Occurrence;
     use cambra::ccl::infer::{TypeInferenceContext, infer, typecheck};
     use cambra::ccl::{
         ArithmeticKind, BinOpKind, BindingTransparency, Builtin, Expr, Lit, Type, TypedBinding,
@@ -3490,6 +3491,7 @@ mod letrec_typing {
 
     fn typed_binding(name: &str, ty: Type) -> TypedBinding {
         TypedBinding {
+            occurrence: Occurrence::mint(),
             name: name.into(),
             ty,
             user_annotation: None,
@@ -3513,6 +3515,7 @@ mod letrec_typing {
         let cnt_ty = Type::data_fun(Type::UIntRange(3), int());
         let def = Expr::lambda(
             "r",
+            Occurrence::mint(),
             Type::UIntRange(3),
             Expr::binop(
                 get_prev_seq(Expr::var("cnt"), Expr::var("r"), Expr::lit(Lit::Int(0))),

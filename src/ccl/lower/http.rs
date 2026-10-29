@@ -156,7 +156,7 @@ pub(super) fn lower_http_serve(
     // The channel's `let` and the `Defer` are manufactured plumbing; the bindings `target`
     // makes image the assignment statement.
     Ok(ctx.tag_machinery(
-        Expr::let_bind(responses, channel, bound),
+        Expr::let_bind(responses, Occurrence::mint(), channel, bound),
         span,
         "lower.http_serve",
     ))

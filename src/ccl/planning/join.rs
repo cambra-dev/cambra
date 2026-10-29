@@ -6,6 +6,7 @@
 //! ([`plan_loop_join`] / [`convert_loop_join`]) and emits a [`JoinPlan`] tree
 //! ([`join_plan_to_expr`]) whose leaves are iteration-bearing.
 
+use crate::ccl::Occurrence;
 use std::collections::{BTreeSet, HashSet, VecDeque};
 use std::fmt::Debug;
 use std::mem::take;
@@ -101,8 +102,8 @@ fn compile_join_side(side: &Expr, env: &[(Name, Expr)], rec_name: &Name, rec_ty:
         body = lambda_elim::substitute(body, var, morph);
     }
     let side_ty = body.ty.clone();
-    let lam =
-        Expr::lambda(rec_name, rec_ty.clone(), body).with_ty(Type::fun(rec_ty.clone(), side_ty));
+    let lam = Expr::lambda(rec_name, Occurrence::mint(), rec_ty.clone(), body)
+        .with_ty(Type::fun(rec_ty.clone(), side_ty));
     predicates::eliminate_lifted(lam).expect("lambda-elim of join-condition side")
 }
 
@@ -1504,11 +1505,11 @@ mod tests {
             var("x").with_ty(scalar.clone()),
             var("y").with_ty(scalar.clone()),
         );
-        let inner =
-            Expr::lambda("y", scalar.clone(), body).with_ty(fun_ty(scalar.clone(), b.clone()));
+        let inner = Expr::lambda("y", Occurrence::mint(), scalar.clone(), body)
+            .with_ty(fun_ty(scalar.clone(), b.clone()));
         let mid = Expr::apply(rec_arm(1), inner).with_ty(b.clone());
-        let outer =
-            Expr::lambda("x", scalar.clone(), mid).with_ty(fun_ty(scalar.clone(), b.clone()));
+        let outer = Expr::lambda("x", Occurrence::mint(), scalar.clone(), mid)
+            .with_ty(fun_ty(scalar.clone(), b.clone()));
         Expr::apply(rec_arm(0), outer).with_ty(b)
     }
 

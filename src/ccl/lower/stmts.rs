@@ -1,6 +1,9 @@
 //! Statement-block lowering: `Let` chains, `if`/`else`, sink-declaration dispatch, and
 //! mutation-loop dispatch.
 
+use crate::ccl::Annotation;
+use crate::ccl::Occurrence;
+use crate::ccl::RecordEntry;
 use crate::ccl::module_type::{AliasType, ModuleEntry, ModuleType, TypeEntry, TypeEntryForm};
 use std::{collections::HashSet, rc::Rc};
 
@@ -278,9 +281,9 @@ pub(super) fn finish_program(
             let var = ctx.tag_machinery(Expr::var(name), program_span, "lower.sink_outputs");
             (label, var)
         })
-        .collect();
+        .collect::<Vec<_>>();
     let outputs = ctx.tag_machinery(
-        Expr::new(TypedExprNode::Record(outs)),
+        Expr::new(TypedExprNode::Record(RecordEntry::minted(outs))),
         program_span,
         "lower.sink_outputs",
     );
@@ -553,7 +556,8 @@ pub(super) fn lower_final_stmt(
             check_mut_write_context(&name, last.span, ctx)?;
             let rhs = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
             let val = lower_aug_binop(&name, *op, rhs, last.span, ctx)?;
-            Ok(ctx.tag_image(Expr::mut_write(name, val), last.span))
+            let occurrence = ctx.occurrence_at(target.span);
+            Ok(ctx.tag_image(Expr::mut_write(name, occurrence, val), last.span))
         }
         // A bare `x := e` as the final statement is a mutable-variable *write* when `x` is
         // already in scope (a mutation-loop body's terminal write, an inlined
@@ -574,7 +578,8 @@ pub(super) fn lower_final_stmt(
             let name = extract_name_target(target, "mutable assignment")?;
             check_mut_write_context(&name, last.span, ctx)?;
             let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
-            Ok(ctx.tag_image(Expr::mut_write(name, val), last.span))
+            let occurrence = ctx.occurrence_at(target.span);
+            Ok(ctx.tag_image(Expr::mut_write(name, occurrence, val), last.span))
         }
         // A keyed write as the final statement, the `m[k] := v` sibling of the bare write
         // above. It needs no in-scope guard: a subscript declares nothing, so the form is a
@@ -700,7 +705,7 @@ pub(super) fn lower_middle_stmt(
             }
             match decl {
                 #[cfg(any(test, feature = "test-helpers"))]
-                SinkDecl::Test { name } => lower_test_sink(name, stmt.span, body, ctx),
+                SinkDecl::Test { name } => lower_test_sink(name, target.span, stmt.span, body, ctx),
                 SinkDecl::Http(decl) => lower_http_serve(
                     *decl,
                     target,
@@ -762,18 +767,26 @@ pub(super) fn lower_middle_stmt(
             if mut_annotation_parts(&annotation.ty, ctx).is_some() {
                 return Err(mut_decl_with_assign_error(stmt.span, &name));
             }
-            let annotation_ty = lower_let_annotation(&name, annotation, value, ctx)?;
+            let annotation_ty = Annotation::new(
+                lower_let_annotation(&name, annotation, value, ctx)?,
+                ctx.occurrence_at(annotation.ty.span),
+            );
             let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
+            let occurrence = ctx.occurrence_at(target.span);
             Ok(ctx.tag_image(
-                Expr::let_bind_annotated(name, val, body, annotation_ty),
+                Expr::let_bind_annotated(name, occurrence, val, body, annotation_ty),
                 stmt.span,
             ))
         }
         // `out: Feed(V)` — a feed declaration, the channel its feeds and its
         // `<<=` give a value.
         ChlStmt::Declare { target, annotation } => {
-            let (name, channel, ty) = feed_declaration(target, annotation, stmt.span, ctx)?;
-            Ok(ctx.tag_image(Expr::let_bind_annotated(name, channel, body, ty), stmt.span))
+            let (name, occurrence, channel, ty) =
+                feed_declaration(target, annotation, stmt.span, ctx)?;
+            Ok(ctx.tag_image(
+                Expr::let_bind_annotated(name, occurrence, channel, body, ty),
+                stmt.span,
+            ))
         }
         // `@LoadFrom(x)` / `y: T` — `y` is the value the version this source
         // replaces held for `x`, as a plain binding. The decorator supplies the
@@ -804,7 +817,10 @@ pub(super) fn lower_middle_stmt(
                     ),
                 ));
             }
-            let annotation_ty = lower_type_annotation(annotation, ctx)?;
+            let annotation_ty = Annotation::new(
+                lower_type_annotation(annotation, ctx)?,
+                ctx.occurrence_at(annotation.ty.span),
+            );
             // The source names a variable of the previous version, so it is
             // resolved against what that version *declared* rather than against
             // this scope, and not against what it currently holds a value for —
@@ -812,8 +828,9 @@ pub(super) fn lower_middle_stmt(
             // site addresses". It is a spelling here, not a reference, which is
             // why it never goes through `lower_expr`.
             let val = ctx.tag_image(Expr::load_from(source.node.as_str()), source.span);
+            let occurrence = ctx.occurrence_at(target.span);
             Ok(ctx.tag_image(
-                Expr::let_bind_annotated(name, val, body, annotation_ty),
+                Expr::let_bind_annotated(name, occurrence, val, body, annotation_ty),
                 stmt.span,
             ))
         }
@@ -888,7 +905,8 @@ pub(super) fn lower_middle_stmt(
                     // manufactured — the user wrote no sequencing operator. Two
                     // `"lower.image"` tags at one `stmt.span` would have two
                     // nodes each claiming to be the image of one statement.
-                    let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
+                    let occurrence = ctx.occurrence_at(target.span);
+                    let write = ctx.tag_image(Expr::mut_write(name, occurrence, val), stmt.span);
                     return Ok(ctx.tag_machinery(
                         Expr::expr_stmt(write, body),
                         stmt.span,
@@ -923,7 +941,11 @@ pub(super) fn lower_middle_stmt(
                 Type::Hole
             };
             let mut_ty = Type::mutable(domain, value_ty);
-            Ok(ctx.tag_image(Expr::mut_decl(name, mut_ty, val, body), stmt.span))
+            let occurrence = ctx.occurrence_at(target.span);
+            Ok(ctx.tag_image(
+                Expr::mut_decl(name, occurrence, mut_ty, val, body),
+                stmt.span,
+            ))
         }
         // Desugar `x op= e` → `MutWrite(x, x op e)`. `+=` is a mutable write: the
         // check requires `x` to be a mutable variable (never a shadowing rebind of
@@ -939,13 +961,14 @@ pub(super) fn lower_middle_stmt(
             check_mut_write_context(&name, stmt.span, ctx)?;
             let rhs = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
             let val = lower_aug_binop(&name, *op, rhs, stmt.span, ctx)?;
-            let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
+            let occurrence = ctx.occurrence_at(target.span);
+            let write = ctx.tag_image(Expr::mut_write(name, occurrence, val), stmt.span);
             Ok(ctx.tag_image(Expr::expr_stmt(write, body), stmt.span))
         }
         // `x <<= e` — defer-define statement, distinct from AugAssign.
         ChlStmt::Define { target, value } => {
             let rhs = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
-            let lowered = lower_define(target, rhs)?;
+            let lowered = lower_define(target, rhs, ctx)?;
             let define = ctx.tag_image(lowered, stmt.span);
             Ok(ctx.tag_image(Expr::expr_stmt(define, body), stmt.span))
         }
@@ -976,9 +999,15 @@ pub(super) fn lower_middle_stmt(
                     .expect("`declare_associated_functions` checked the owner");
                 let (name, func_expr, annotation) =
                     nominal::lower_associated_def(&decl, &def, ctx)?;
+                // The binder is `N::f` while the source writes `f`, at `def.name`.
+                let occurrence = ctx.occurrence_at(def.name.span);
                 let binding = match annotation {
-                    Some(poly) => TypedBinding::new_annotated(name, poly),
-                    None => TypedBinding::new_unannotated(name),
+                    Some(poly) => TypedBinding::new_annotated(
+                        name,
+                        occurrence,
+                        Annotation::new(poly, Occurrence::mint()),
+                    ),
+                    None => TypedBinding::new_unannotated(name, occurrence),
                 };
                 lowered.push((binding, func_expr));
             }
@@ -1016,11 +1045,20 @@ pub(super) fn lower_middle_stmt(
                 fn_body,
                 ctx,
             )?;
+            let occurrence = ctx.occurrence_at(name.span);
             let name = name.node.as_str().to_string();
+            // A `def`'s polymorphic annotation is built from its signature rather than
+            // written as one type, so its occurrence records at the statement.
             Ok(ctx.tag_image(
                 match annotation {
-                    Some(poly) => Expr::let_bind_annotated(name, func_expr, body, poly),
-                    None => Expr::let_bind(name, func_expr, body),
+                    Some(poly) => Expr::let_bind_annotated(
+                        name,
+                        occurrence,
+                        func_expr,
+                        body,
+                        Annotation::new(poly, Occurrence::mint()),
+                    ),
+                    None => Expr::let_bind(name, occurrence, func_expr, body),
                 },
                 stmt.span,
             ))
@@ -1166,7 +1204,15 @@ pub(super) fn lower_middle_stmt(
                 let lets = parameter.entry_lets();
                 return Ok(lets.into_iter().rev().fold(body, |body, (binder, ty)| {
                     let value = ctx.tag_image(Expr::new(TypedExprNode::Abstract), stmt.span);
-                    let bound = Expr::let_bind_annotated(binder.raw(), value, body, ty);
+                    // Each member is a binder the parameter's Module type names, not
+                    // one the statement writes, so it records at the statement.
+                    let bound = Expr::let_bind_annotated(
+                        binder.raw(),
+                        Occurrence::mint(),
+                        value,
+                        body,
+                        Annotation::new(ty, Occurrence::mint()),
+                    );
                     ctx.tag_image(bound, stmt.span)
                 }));
             }
@@ -1196,6 +1242,7 @@ pub(super) fn lower_middle_stmt(
                 }
                 None => None,
             };
+            let annotation_span = annotation.as_ref().map(|a| a.ty.span);
             // The annotation is the whole annotation of the parameter's `let`, so it may be
             // polymorphic (`docs/chl-spec.md`, "Polymorphic type annotations").
             let annotation = match (annotation, default) {
@@ -1214,9 +1261,19 @@ pub(super) fn lower_middle_stmt(
                     constant,
                 },
             });
-            let bound = match annotation {
-                Some(ty) => Expr::let_bind_annotated(name.node.as_str(), value, body, ty),
-                None => Expr::let_bind(name.node.as_str(), value, body),
+            let occurrence = ctx.occurrence_at(name.span);
+            let bound = match (annotation, annotation_span) {
+                (Some(ty), Some(span)) => {
+                    let annotation = Annotation::new(ty, ctx.occurrence_at(span));
+                    Expr::let_bind_annotated(
+                        name.node.as_str(),
+                        occurrence,
+                        value,
+                        body,
+                        annotation,
+                    )
+                }
+                _ => Expr::let_bind(name.node.as_str(), occurrence, value, body),
             };
             Ok(ctx.tag_image(bound, stmt.span))
         }
@@ -1267,6 +1324,8 @@ pub(super) fn collect_stmt_names(stmts: &[Spanned<ChlStmt>], names: &mut HashSet
 pub(super) enum AssignmentBindings {
     Name {
         name: String,
+        /// Where the target writes the name, or `None` for the name lowering mints for `_`.
+        span: Option<Span>,
         transparency: BindingTransparency,
     },
     Constructor(Box<nominal::ConstructorAssignment>),
@@ -1300,7 +1359,7 @@ impl TupleAssignment {
         value: Expr,
         span: Span,
         ctx: &mut LoweringContext,
-    ) -> Vec<(String, Expr, BindingTransparency)> {
+    ) -> Vec<(AssignedBinder, Expr)> {
         let mut out = Vec::new();
         let mut leaves = Vec::new();
         self.split(value, span, ctx, &mut out, &mut leaves);
@@ -1317,7 +1376,7 @@ impl TupleAssignment {
         value: Expr,
         span: Span,
         ctx: &mut LoweringContext,
-        minted: &mut Vec<(String, Expr, BindingTransparency)>,
+        minted: &mut Vec<(AssignedBinder, Expr)>,
         leaves: &mut Vec<(AssignmentBindings, Expr)>,
     ) {
         let label = "lower.tuple_assignment";
@@ -1330,7 +1389,13 @@ impl TupleAssignment {
         let values = match value.node {
             TypedExprNode::Tuple(values) if values.len() == elements.len() => values,
             node => {
-                minted.push((payload.clone(), Expr { node, ..value }, transparency));
+                // The payload's and the components' names are minted, written nowhere.
+                let binder = AssignedBinder {
+                    name: payload.clone(),
+                    span: None,
+                    transparency,
+                };
+                minted.push((binder, Expr { node, ..value }));
                 (0..elements.len())
                     .map(|i| {
                         let read = ctx.tag_machinery(Expr::var(payload.as_str()), span, label);
@@ -1344,7 +1409,12 @@ impl TupleAssignment {
             match element {
                 AssignmentBindings::Tuple(inner) => inner.split(value, span, ctx, minted, leaves),
                 leaf => {
-                    minted.push((component.clone(), value, transparency));
+                    let binder = AssignedBinder {
+                        name: component.clone(),
+                        span: None,
+                        transparency,
+                    };
+                    minted.push((binder, value));
                     let read = ctx.tag_machinery(Expr::var(component.as_str()), span, label);
                     leaves.push((leaf, read));
                 }
@@ -1402,6 +1472,7 @@ impl AssignmentBindings {
             // computed, and a call writing through a `Mut` parameter still writes.
             AssignTarget::Name(n) if n.as_str() == WILDCARD => AssignmentBindings::Name {
                 name: ctx.fresh_ignored_payload(),
+                span: None,
                 transparency: binding_transparency(transparency),
             },
             AssignTarget::Constructor(pattern) => AssignmentBindings::Constructor(Box::new(
@@ -1422,6 +1493,7 @@ impl AssignmentBindings {
             }
             _ => AssignmentBindings::Name {
                 name: extract_name_target(target, "assignment")?,
+                span: Some(target.span),
                 transparency: binding_transparency(transparency),
             },
         })
@@ -1441,20 +1513,40 @@ impl AssignmentBindings {
         }
     }
 
-    /// The bindings the assignment means once its value is lowered, in order, each a name,
-    /// its value and its transparency. A constructor pattern's are transparent.
+    /// The bindings the assignment means once its value is lowered, in order, each a
+    /// binder and its value. A constructor pattern's are transparent.
     pub(super) fn bindings(
         self,
         value: Expr,
         span: Span,
         ctx: &mut LoweringContext,
-    ) -> Vec<(String, Expr, BindingTransparency)> {
+    ) -> Vec<(AssignedBinder, Expr)> {
         match self {
-            AssignmentBindings::Name { name, transparency } => vec![(name, value, transparency)],
+            AssignmentBindings::Name {
+                name,
+                span,
+                transparency,
+            } => vec![(
+                AssignedBinder {
+                    name,
+                    span,
+                    transparency,
+                },
+                value,
+            )],
             AssignmentBindings::Constructor(a) => a
                 .bindings(value, span, ctx)
                 .into_iter()
-                .map(|(name, value)| (name, value, BindingTransparency::Transparent))
+                .map(|(name, span, value)| {
+                    (
+                        AssignedBinder {
+                            name,
+                            span,
+                            transparency: BindingTransparency::Transparent,
+                        },
+                        value,
+                    )
+                })
                 .collect(),
             AssignmentBindings::Tuple(t) => t.bindings(value, span, ctx),
         }
@@ -1472,9 +1564,32 @@ impl AssignmentBindings {
         bindings
             .into_iter()
             .rev()
-            .fold(body, |acc, (name, value, transparency)| {
-                ctx.tag_image(Expr::let_bind_with(name, value, acc, transparency), span)
+            .fold(body, |acc, (binder, value)| {
+                let occurrence = binder.occurrence(ctx);
+                ctx.tag_image(
+                    Expr::let_bind_with(binder.name, occurrence, value, acc, binder.transparency),
+                    span,
+                )
             })
+    }
+}
+
+/// One name an assignment binds: its spelling, where the target writes it, and its
+/// transparency. A constructor pattern of several parameters binds its payload under a
+/// minted name, which the source writes nowhere.
+pub(super) struct AssignedBinder {
+    pub(super) name: String,
+    pub(super) span: Option<Span>,
+    pub(super) transparency: BindingTransparency,
+}
+
+impl AssignedBinder {
+    /// The binding occurrence: recorded at the name, or minted for lowering's own name.
+    pub(super) fn occurrence(&self, ctx: &mut LoweringContext) -> Occurrence {
+        match self.span {
+            Some(span) => ctx.occurrence_at(span),
+            None => Occurrence::mint(),
+        }
     }
 }
 
@@ -1576,7 +1691,8 @@ pub(super) fn lower_keyed_write(
     check_mut_write_context(&name, span, ctx)?;
     let key = lower_expr(index, ctx)?;
     let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
-    Ok(ctx.tag_image(Expr::mut_write_keyed(name, key, val), span))
+    let occurrence = ctx.occurrence_at(target.span);
+    Ok(ctx.tag_image(Expr::mut_write_keyed(name, occurrence, key, val), span))
 }
 
 /// Infallible variant of [`extract_name_target`]: returns the name when
@@ -1883,14 +1999,15 @@ pub(super) fn feed_declaration(
     annotation: &TypeAnnotation,
     span: Span,
     ctx: &mut LoweringContext,
-) -> Result<(String, Expr, Type), LoweringError> {
+) -> Result<(String, Occurrence, Expr, Annotation), LoweringError> {
     let name = extract_name_target(target, "declaration")?;
     match feed_annotation_type(annotation, &name, target.span, ctx) {
         // The channel images the annotation, the declaration's counterpart of an
         // assignment's right-hand side, and the `let` the whole statement.
         Some(ty) => {
             let channel = ctx.tag_image(Expr::new(TypedExprNode::Defer), annotation.ty.span);
-            Ok((name, channel, ty?))
+            let annotation = Annotation::new(ty?, ctx.occurrence_at(annotation.ty.span));
+            Ok((name, ctx.occurrence_at(target.span), channel, annotation))
         }
         None if mut_annotation_parts(&annotation.ty, ctx).is_some() => {
             Err(LoweringError::unsupported(
@@ -1978,7 +2095,11 @@ pub(super) fn declare_type_params(
         }
         let kind = lower_kind(tp, &type_params[i..], ctx)?;
         let param = crate::ccl::ty::TypeParam::declared(name);
-        ctx.declare_type_throughout(name, AliasType::Type(Type::Param(Rc::clone(&param))));
+        ctx.declare_type_throughout(
+            name,
+            Some(tp.name_span),
+            AliasType::Type(Type::Param(Rc::clone(&param))),
+        );
         ctx.type_params_in_scope.push(name.to_string());
         declared.push(crate::ccl::ty::PolyParam {
             param,
@@ -2054,6 +2175,7 @@ fn lower_bound(
             let p = crate::ccl::ty::TypeParam::declared(tp.name.as_str());
             ctx.declare_type_throughout(
                 tp.name.as_str(),
+                Some(tp.name_span),
                 AliasType::Type(Type::Param(Rc::clone(&p))),
             );
             (p.id, tp.name.as_str())
@@ -2777,7 +2899,10 @@ pub(super) fn lower_type_expr_or_poly(
                     ),
                 )),
                 AliasAt::Undeclared => match ctx.nominal_type(id.as_str()) {
-                    Some(decl) => nominal_application(annotation.span, decl, &[], ctx),
+                    Some(decl) => {
+                        ctx.resolved_nominal(annotation.span, id, &decl);
+                        nominal_application(annotation.span, decl, &[], ctx)
+                    }
                     None => Err(LoweringError::unsupported(
                         annotation.span,
                         format!("unknown type annotation: {id}"),
@@ -2839,7 +2964,10 @@ pub(super) fn lower_type_expr_or_poly(
             }
             let head = type_ctor_head(func)?;
             match ctx.nominal_type(head) {
-                Some(decl) => nominal_application(annotation.span, decl, args, ctx),
+                Some(decl) => {
+                    ctx.resolved_nominal(func.span, head, &decl);
+                    nominal_application(annotation.span, decl, args, ctx)
+                }
                 None => lower_type_application(annotation.span, head, args, ctx),
             }
         }
@@ -3057,7 +3185,11 @@ fn lower_module_type(
                 name: field.name.clone(),
                 form,
             };
-            ctx.declare_type_throughout(field.name.as_str(), AliasType::Type(entry.written()));
+            ctx.declare_type_throughout(
+                field.name.as_str(),
+                Some(field.name_span),
+                AliasType::Type(entry.written()),
+            );
             module.types.push(entry);
             continue;
         }
@@ -3522,7 +3654,7 @@ fn pre_declare_type_alias<'a>(
     }
     match lower_alias_type(rhs, ctx) {
         Ok(ty) => {
-            ctx.declare_type_alias(name, stmt.span, ty);
+            ctx.declare_type_alias(name, stmt.span, Some(target.span), ty);
             None
         }
         // The inner error names the form in surface words
@@ -3931,13 +4063,12 @@ pub(super) fn lower_match_over(
             // Every name the arm binds shadows an outer one in its body, as a tag arm's
             // binder does: the payload's, which is the parameter's own name for a
             // constructor of one parameter, and each projected parameter's.
-            let mut names: Vec<String> = binds.iter().map(|(name, _)| name.clone()).collect();
+            let mut names: Vec<String> = binds.iter().map(|bind| bind.name.clone()).collect();
             names.push(pattern.binding.name.base().to_string());
             let mut arm_scope = outer_bindings.clone();
             arm_scope.extend(names.iter().cloned());
             let body = ctx.with_shadowed(names, |ctx| lower_body(&arm.body, &arm_scope, ctx))?;
-            let body =
-                nominal::bind_parameters(&pattern.binding.name, binds, body, match_span, ctx);
+            let body = nominal::bind_parameters(&pattern.binding.name, binds, body, ctx);
             branches.push(Branch {
                 pattern: Some(pattern),
                 guard: ctx.tag_machinery(
@@ -3970,9 +4101,13 @@ pub(super) fn lower_match_over(
         };
         // Every Pattern needs a payload binder. Reserve an inaccessible name for absent
         // or ignored payloads so source code cannot refer to them.
-        let binder = match &pat.payload {
-            PayloadPattern::Named(name) => name.as_str().to_string(),
-            PayloadPattern::Ignored | PayloadPattern::Absent => ctx.fresh_ignored_payload(),
+        let (binder, binder_occurrence) = match &pat.payload {
+            PayloadPattern::Named(name) => {
+                (name.node.as_str().to_string(), ctx.occurrence_at(name.span))
+            }
+            PayloadPattern::Ignored | PayloadPattern::Absent => {
+                (ctx.fresh_ignored_payload(), Occurrence::mint())
+            }
         };
         // `emit_case` constrains an absent payload to Unit. An ignored payload has no
         // such constraint: declining to read it does not require its absence.
@@ -3982,11 +4117,14 @@ pub(super) fn lower_match_over(
         let body = ctx.with_shadowed(vec![binder.clone()], |ctx| {
             lower_body(&arm.body, &arm_scope, ctx)
         })?;
+        let head = PatternHead::Tag(ctx.label(&pat.tag_qualifier, &pat.tag, pat.tag_span)?);
         branches.push(Branch {
             pattern: Some(Pattern {
-                head: PatternHead::Tag(ctx.label(&pat.tag_qualifier, &pat.tag, pat.tag_span)?),
+                head,
+                head_occurrence: ctx.occurrence_at(pat.tag_span),
                 binding: TypedBinding {
                     name: binder.into(),
+                    occurrence: binder_occurrence,
                     ty: Type::Hole,
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
@@ -4674,8 +4812,7 @@ x";
             panic!("expected a top-level Let, got {:?}", ccl.node);
         };
         let ann = binding
-            .user_annotation
-            .as_ref()
+            .annotation_ty()
             .expect("an annotated assignment must carry a user annotation");
         assert!(
             matches!(ann, Type::Refinement(..)),

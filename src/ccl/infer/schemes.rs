@@ -470,6 +470,8 @@ impl Default for OperatorSchemes {
 mod tests {
     use super::super::test_helpers::*;
     use super::OperatorSchemes;
+    use crate::ccl::Occurrence;
+    use crate::ccl::RecordEntry;
     use crate::ccl::{
         AggregateKind, BindingTransparency, Builtin, Type, TypedBinding, TypedExpr, TypedExprNode,
     };
@@ -556,14 +558,15 @@ mod tests {
         // rejects it on *kind* before the codomain orderability under test.
         let lam = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
+                occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
             },
             body: Box::new(TypedExpr::new(TypedExprNode::Record(vec![
-                ("a".into(), lit_int(1)),
-                ("b".into(), lit_int(2)),
+                RecordEntry::new("a", Occurrence::mint(), lit_int(1)),
+                RecordEntry::new("b", Occurrence::mint(), lit_int(2)),
             ]))),
         })
         .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole));

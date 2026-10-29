@@ -7,7 +7,9 @@
 //! integration — without depending on CHL surface syntax for variants
 //! (which is a separate workstream).
 
+use cambra::ccl::Annotation;
 use cambra::ccl::ArithmeticKind;
+use cambra::ccl::Occurrence;
 use cambra::ccl::{
     BindingTransparency, Branch, FieldKey, Lit, Pattern, Type, TypedBinding, TypedExpr,
     TypedExprNode,
@@ -53,8 +55,10 @@ fn variant(tags: &[(&str, Type)]) -> Type {
 fn arm(tag: &str, binding: &str, guard: Option<TypedExpr>, body: TypedExpr) -> Branch {
     Branch {
         pattern: Some(Pattern {
+            head_occurrence: Occurrence::mint(),
             head: cambra::ccl::PatternHead::Tag(tag.into()),
             binding: TypedBinding {
+                occurrence: Occurrence::mint(),
                 name: binding.into(),
                 ty: Type::Hole,
                 user_annotation: None,
@@ -114,14 +118,24 @@ fn run_full(expr: TypedExpr) -> Result<TypedExpr, Vec<InferError>> {
 /// `` `some(5) `` infers to `` {`some{Int}} ``.
 #[test]
 fn variant_ctor_int() {
-    let ty = run(TypedExpr::variant_ctor("some", lit_int(5))).expect("inference ok");
+    let ty = run(TypedExpr::variant_ctor(
+        "some",
+        Occurrence::mint(),
+        lit_int(5),
+    ))
+    .expect("inference ok");
     assert_eq!(ty, variant(&[("some", int_lit(5))]));
 }
 
 /// `` `none(()) `` infers to `` {`none} ``.
 #[test]
 fn variant_ctor_unit() {
-    let ty = run(TypedExpr::variant_ctor("none", lit_unit())).expect("inference ok");
+    let ty = run(TypedExpr::variant_ctor(
+        "none",
+        Occurrence::mint(),
+        lit_unit(),
+    ))
+    .expect("inference ok");
     assert_eq!(ty, variant(&[("none", unit_ty())]));
 }
 
@@ -129,7 +143,8 @@ fn variant_ctor_unit() {
 #[test]
 fn variant_ctor_nested_payload() {
     let payload = TypedExpr::tuple(vec![lit_int(1), lit_string("x")]);
-    let ty = run(TypedExpr::variant_ctor("pair", payload)).expect("inference ok");
+    let ty =
+        run(TypedExpr::variant_ctor("pair", Occurrence::mint(), payload)).expect("inference ok");
     assert_eq!(
         ty,
         variant(&[("pair", Type::Tuple(vec![int_lit(1), str_lit_ty_local("x")]))])
@@ -156,14 +171,15 @@ fn variant_param_accepts_subtype() {
     let param_ty = variant(&[("some", int()), ("none", unit_ty())]);
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
         param: TypedBinding {
+            occurrence: Occurrence::mint(),
             name: "v".into(),
             ty: param_ty.clone(),
-            user_annotation: Some(param_ty.clone()),
+            user_annotation: Some(Annotation::new(param_ty.clone(), Occurrence::mint())),
             transparency: BindingTransparency::Transparent,
         },
         body: Box::new(var("v")),
     });
-    let arg = TypedExpr::variant_ctor("some", lit_int(5));
+    let arg = TypedExpr::variant_ctor("some", Occurrence::mint(), lit_int(5));
     let app = TypedExpr::apply(arg, lambda);
     let ty = run(app).expect("inference ok");
     assert_eq!(ty, param_ty);
@@ -176,14 +192,15 @@ fn variant_extra_tag_rejected() {
     let param_ty = variant(&[("some", int())]);
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
         param: TypedBinding {
+            occurrence: Occurrence::mint(),
             name: "v".into(),
             ty: param_ty.clone(),
-            user_annotation: Some(param_ty),
+            user_annotation: Some(Annotation::new(param_ty, Occurrence::mint())),
             transparency: BindingTransparency::Transparent,
         },
         body: Box::new(var("v")),
     });
-    let arg = TypedExpr::variant_ctor("other", lit_int(5));
+    let arg = TypedExpr::variant_ctor("other", Occurrence::mint(), lit_int(5));
     let app = TypedExpr::apply(arg, lambda);
     assert!(
         run(app).is_err(),
@@ -257,12 +274,16 @@ fn open_variant_admits_extra_tags_and_still_constrains_shared_payloads() {
 fn value_ascription_accepts_widening() {
     let expr = TypedExpr::new(TypedExprNode::Let {
         binding: TypedBinding {
+            occurrence: Occurrence::mint(),
             name: "x".into(),
             ty: Type::Hole,
-            user_annotation: Some(variant(&[("A", unit_ty()), ("B", unit_ty())])),
+            user_annotation: Some(Annotation::new(
+                variant(&[("A", unit_ty()), ("B", unit_ty())]),
+                Occurrence::mint(),
+            )),
             transparency: BindingTransparency::Transparent,
         },
-        bound_expr: Box::new(TypedExpr::variant_ctor("A", lit_unit())),
+        bound_expr: Box::new(TypedExpr::variant_ctor("A", Occurrence::mint(), lit_unit())),
         body: Box::new(var("x")),
     });
     run(expr).expect("value ascription must accept a narrower (widenable) value");
@@ -295,7 +316,7 @@ fn match_unifies_arm_bodies() {
         ),
         arm("none", "_", None, lit_int(0)),
     ];
-    let scrutinee = TypedExpr::variant_ctor("some", lit_int(7));
+    let scrutinee = TypedExpr::variant_ctor("some", Occurrence::mint(), lit_int(7));
     let ty = run(TypedExpr::match_expr(scrutinee, arms)).expect("match unification ok");
     assert_eq!(ty, int());
 }
@@ -320,7 +341,7 @@ fn match_per_arm_payload_narrowing() {
         ),
         arm("none", "_", None, lit_int(42)),
     ];
-    let scrutinee = TypedExpr::variant_ctor("some", lit_int(3));
+    let scrutinee = TypedExpr::variant_ctor("some", Occurrence::mint(), lit_int(3));
     let ty = run(TypedExpr::match_expr(scrutinee, arms)).expect("payload narrowing ok");
     assert_eq!(ty, int());
 }
@@ -347,7 +368,7 @@ fn match_fills_arm_binding_and_body_var_types() {
         ),
         arm("none", "_", None, lit_int(42)),
     ];
-    let scrutinee = TypedExpr::variant_ctor("some", lit_int(3));
+    let scrutinee = TypedExpr::variant_ctor("some", Occurrence::mint(), lit_int(3));
     let expr = run_full(TypedExpr::match_expr(scrutinee, arms)).expect("inference ok");
 
     let TypedExprNode::Case { branches, .. } = &expr.node else {
@@ -405,7 +426,7 @@ fn match_with_guard() {
         )),
         var("n"),
     )];
-    let scrutinee = TypedExpr::variant_ctor("some", lit_int(3));
+    let scrutinee = TypedExpr::variant_ctor("some", Occurrence::mint(), lit_int(3));
     // The arm returns its binding, and the binding is the scrutinee's payload — so
     // the match's type is the payload's own, singleton included.
     let ty = run(TypedExpr::match_expr(scrutinee, arms)).expect("guarded match ok");
@@ -417,7 +438,7 @@ fn match_with_guard() {
 fn match_with_non_bool_guard_rejected() {
     // Int-typed guard — should be rejected.
     let arms = vec![arm("some", "n", Some(lit_int(1)), var("n"))];
-    let scrutinee = TypedExpr::variant_ctor("some", lit_int(3));
+    let scrutinee = TypedExpr::variant_ctor("some", Occurrence::mint(), lit_int(3));
     assert!(
         run(TypedExpr::match_expr(scrutinee, arms)).is_err(),
         "non-Bool guard should be rejected"
@@ -427,7 +448,7 @@ fn match_with_non_bool_guard_rejected() {
 /// Empty `Match` arms should fail.
 #[test]
 fn match_empty_arms_rejected() {
-    let scrutinee = TypedExpr::variant_ctor("some", lit_int(1));
+    let scrutinee = TypedExpr::variant_ctor("some", Occurrence::mint(), lit_int(1));
     let expr = TypedExpr::match_expr(scrutinee, vec![]);
     assert!(run(expr).is_err(), "empty arm list should be rejected");
 }
@@ -441,12 +462,17 @@ fn match_empty_arms_rejected() {
 fn lambda_returns_variant() {
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
         param: TypedBinding {
+            occurrence: Occurrence::mint(),
             name: "x".into(),
             ty: int(),
-            user_annotation: Some(int()),
+            user_annotation: Some(Annotation::new(int(), Occurrence::mint())),
             transparency: BindingTransparency::Transparent,
         },
-        body: Box::new(TypedExpr::variant_ctor("some", var("x"))),
+        body: Box::new(TypedExpr::variant_ctor(
+            "some",
+            Occurrence::mint(),
+            var("x"),
+        )),
     });
     let app = TypedExpr::apply(lit_int(5), lambda);
     let ty = run(app).expect("inference ok");
@@ -466,12 +492,12 @@ fn if_returns_variant() {
         Branch {
             pattern: None,
             guard: lit_bool(true),
-            body: TypedExpr::variant_ctor("some", lit_int(1)),
+            body: TypedExpr::variant_ctor("some", Occurrence::mint(), lit_int(1)),
         },
         Branch {
             pattern: None,
             guard: lit_bool(true),
-            body: TypedExpr::variant_ctor("none", lit_unit()),
+            body: TypedExpr::variant_ctor("none", Occurrence::mint(), lit_unit()),
         },
     ];
     let expr = TypedExpr::new(TypedExprNode::Case {
@@ -499,14 +525,15 @@ fn payload_covariance_accept() {
     let param_ty = variant(&[("a", int()), ("b", string())]);
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
         param: TypedBinding {
+            occurrence: Occurrence::mint(),
             name: "v".into(),
             ty: param_ty.clone(),
-            user_annotation: Some(param_ty.clone()),
+            user_annotation: Some(Annotation::new(param_ty.clone(), Occurrence::mint())),
             transparency: BindingTransparency::Transparent,
         },
         body: Box::new(var("v")),
     });
-    let arg = TypedExpr::variant_ctor("a", lit_int(5));
+    let arg = TypedExpr::variant_ctor("a", Occurrence::mint(), lit_int(5));
     let ty = run(TypedExpr::apply(arg, lambda)).expect("payload variance ok");
     assert_eq!(ty, param_ty);
 }
@@ -517,14 +544,15 @@ fn payload_mismatch_reject() {
     let param_ty = variant(&[("a", string())]);
     let lambda = TypedExpr::new(TypedExprNode::Lambda {
         param: TypedBinding {
+            occurrence: Occurrence::mint(),
             name: "v".into(),
             ty: param_ty.clone(),
-            user_annotation: Some(param_ty),
+            user_annotation: Some(Annotation::new(param_ty, Occurrence::mint())),
             transparency: BindingTransparency::Transparent,
         },
         body: Box::new(var("v")),
     });
-    let arg = TypedExpr::variant_ctor("a", lit_int(5));
+    let arg = TypedExpr::variant_ctor("a", Occurrence::mint(), lit_int(5));
     assert!(
         run(TypedExpr::apply(arg, lambda)).is_err(),
         "Int payload should not satisfy String payload slot"
@@ -576,9 +604,13 @@ fn unobservable_arm_payload_resolves_everywhere() {
             arm("b", "w", None, lit_int(0)),
         ],
     });
-    let lambda = TypedExpr::lambda("x", Type::Hole, body);
-    let call = TypedExpr::apply(TypedExpr::variant_ctor("a", lit_int(1)), var("f"));
-    let full = run_full(TypedExpr::let_bind("f", lambda, call)).expect("inference ok");
+    let lambda = TypedExpr::lambda("x", Occurrence::mint(), Type::Hole, body);
+    let call = TypedExpr::apply(
+        TypedExpr::variant_ctor("a", Occurrence::mint(), lit_int(1)),
+        var("f"),
+    );
+    let full =
+        run_full(TypedExpr::let_bind("f", Occurrence::mint(), lambda, call)).expect("inference ok");
 
     assert_eq!(arm_payload_ty(&full, "b"), unit_ty());
     // The wall the residual variable used to fail: no `Infer` left anywhere,
@@ -602,9 +634,13 @@ fn ignored_arm_payload_still_takes_its_argument_type() {
             arm("b", "w", None, lit_int(0)),
         ],
     });
-    let lambda = TypedExpr::lambda("x", Type::Hole, body);
-    let call = TypedExpr::apply(TypedExpr::variant_ctor("b", lit_int(2)), var("f"));
-    let full = run_full(TypedExpr::let_bind("f", lambda, call)).expect("inference ok");
+    let lambda = TypedExpr::lambda("x", Occurrence::mint(), Type::Hole, body);
+    let call = TypedExpr::apply(
+        TypedExpr::variant_ctor("b", Occurrence::mint(), lit_int(2)),
+        var("f"),
+    );
+    let full =
+        run_full(TypedExpr::let_bind("f", Occurrence::mint(), lambda, call)).expect("inference ok");
 
     assert_eq!(arm_payload_ty(&full, "b"), int_lit(2));
     cambra::ccl::infer::check_fully_typed(&full).expect("fully typed");
@@ -635,9 +671,13 @@ fn read_arm_payload_is_pinned_to_where_it_flows() {
         scrutinee: Some(Box::new(var("x"))),
         branches: vec![arm("a", "v", None, var("v")), arm("b", "w", None, var("w"))],
     });
-    let lambda = TypedExpr::lambda("x", Type::Hole, body);
-    let call = TypedExpr::apply(TypedExpr::variant_ctor("a", lit_int(1)), var("f"));
-    let full = run_full(TypedExpr::let_bind("f", lambda, call)).expect("inference ok");
+    let lambda = TypedExpr::lambda("x", Occurrence::mint(), Type::Hole, body);
+    let call = TypedExpr::apply(
+        TypedExpr::variant_ctor("a", Occurrence::mint(), lit_int(1)),
+        var("f"),
+    );
+    let full =
+        run_full(TypedExpr::let_bind("f", Occurrence::mint(), lambda, call)).expect("inference ok");
 
     assert_eq!(arm_payload_ty(&full, "b"), int_lit(1));
     cambra::ccl::infer::check_fully_typed(&full).expect("fully typed");
@@ -695,9 +735,13 @@ fn read_arm_payload_is_pinned_to_a_type_its_reads_accept(
         scrutinee: Some(Box::new(var("x"))),
         branches: vec![arm("a", "v", None, var("v")), arm("b", "w", None, read)],
     });
-    let lambda = TypedExpr::lambda("x", Type::Hole, body);
-    let call = TypedExpr::apply(TypedExpr::variant_ctor("a", lit_int(1)), var("f"));
-    let full = run_full(TypedExpr::let_bind("f", lambda, call)).expect("inference ok");
+    let lambda = TypedExpr::lambda("x", Occurrence::mint(), Type::Hole, body);
+    let call = TypedExpr::apply(
+        TypedExpr::variant_ctor("a", Occurrence::mint(), lit_int(1)),
+        var("f"),
+    );
+    let full =
+        run_full(TypedExpr::let_bind("f", Occurrence::mint(), lambda, call)).expect("inference ok");
 
     assert_eq!(arm_payload_ty(&full, "b"), Type::Base(expected));
     cambra::ccl::infer::check_fully_typed(&full)
@@ -728,9 +772,10 @@ fn a_bounded_variant_annotation_does_not_become_the_binders_type() {
     let ann = Type::BoundedHole(Box::new(variant(&[("some", int()), ("none", unit_ty())])));
     let mut e = TypedExpr::let_bind_annotated(
         "x",
-        TypedExpr::variant_ctor("some", lit_int(1)),
+        Occurrence::mint(),
+        TypedExpr::variant_ctor("some", Occurrence::mint(), lit_int(1)),
         var("x"),
-        ann,
+        Annotation::new(ann, Occurrence::mint()),
     );
     let mut ctx = TypeInferenceContext::new();
     let ty = infer(&mut e, &mut ctx).expect("bounded annotation admits the value");
@@ -770,8 +815,13 @@ fn an_upper_bound_alone_does_not_count_as_a_value_reaching_a_payload() {
         scrutinee: Some(Box::new(var("m"))),
         branches: vec![arm("a", "v", None, var("v")), arm("b", "w", None, var("w"))],
     });
-    let unwrap = TypedExpr::lambda("m", Type::Hole, body);
-    let call = |n: i64| TypedExpr::apply(TypedExpr::variant_ctor("a", lit_int(n)), var("f"));
+    let unwrap = TypedExpr::lambda("m", Occurrence::mint(), Type::Hole, body);
+    let call = |n: i64| {
+        TypedExpr::apply(
+            TypedExpr::variant_ctor("a", Occurrence::mint(), lit_int(n)),
+            var("f"),
+        )
+    };
     let sum = TypedExpr::binop(
         var("p"),
         cambra::ccl::BinOpKind::Arithmetic(ArithmeticKind::Add),
@@ -779,8 +829,14 @@ fn an_upper_bound_alone_does_not_count_as_a_value_reaching_a_payload() {
     );
     let mut e = TypedExpr::let_bind(
         "f",
+        Occurrence::mint(),
         unwrap,
-        TypedExpr::let_bind("p", call(1), TypedExpr::let_bind("q", call(2), sum)),
+        TypedExpr::let_bind(
+            "p",
+            Occurrence::mint(),
+            call(1),
+            TypedExpr::let_bind("q", Occurrence::mint(), call(2), sum),
+        ),
     );
     let mut ctx = TypeInferenceContext::new();
     assert_eq!(

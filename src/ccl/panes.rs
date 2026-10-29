@@ -282,7 +282,7 @@ mod tests {
     use crate::ccl::load::LoadedProgram;
     use std::{collections::HashSet, env::VarError, num::NonZeroUsize};
 
-    use indoc::indoc;
+    use indoc::{formatdoc, indoc};
 
     use super::*;
 
@@ -291,8 +291,10 @@ mod tests {
         GlobalContext, PERF_REPS_ENV, compile_program, predicate_id_collisions,
         provenance_capture_enabled,
     };
+    use crate::ccl::load::{InMemory, RootFile};
     use crate::ccl::provenance::Link;
     use crate::ccl::test_corpus::pipeline_corpus as corpus;
+    use crate::chl_parser::ast::Span;
     use crate::interpreter::Consumer;
 
     /// Compile `code` through the full pipeline, panicking on error.
@@ -714,6 +716,438 @@ mod tests {
                 want,
                 "{name}: distinct predicates blamed by planning.hash_join",
             );
+        }
+    }
+
+    /// The occurrences of `code`'s compiled program that resolve somewhere other than the
+    /// name they spell, and how many were checked (`src/ccl/design/provenance.md`,
+    /// "Checking occurrences").
+    ///
+    /// Every binding and applied occurrence of a name the source spells is checked in
+    /// every IR pane, predicates included; every label, tag and head occurrence in the
+    /// `pre-inference` pane; and every annotation occurrence in that pane must be
+    /// lowering's. A name lowering declares for itself is not checked: its
+    /// `pre-inference` occurrence is recorded at its holder's tag under a label other than
+    /// `lower.image`, as `N::extract` and the single-constructor form's `N::new` are.
+    fn occurrence_spelling_failures(program_name: &str, code: &str) -> (usize, Vec<String>) {
+        use crate::ccl::names::{SyntheticKind, Uid};
+        use crate::ccl::{Name, OccurrenceOf, PatternHead};
+
+        /// The binder `name` stands for: its own, or a specialization's source binding.
+        fn source_name(name: &Name) -> &Name {
+            match name {
+                Name::Synthetic {
+                    kind: SyntheticKind::Mono(source),
+                    ..
+                } => source_name(source),
+                _ => name,
+            }
+        }
+        /// The name as the source writes it, if it does: the part after a member's
+        /// qualifier, `f` for `N::f`.
+        fn spelling(name: &Name) -> Option<String> {
+            source_name(name)
+                .source_spelling()
+                .map(|s| s.rsplit("::").next().unwrap_or(s).to_string())
+        }
+        fn uid(name: &Name) -> Option<Uid> {
+            match source_name(name) {
+                Name::Unique { uid, .. } => Some(*uid),
+                _ => None,
+            }
+        }
+        /// `tree`'s nodes, the terms its types quote included.
+        fn nodes(tree: &Expr) -> Vec<&Expr> {
+            let mut out = Vec::new();
+            let mut stack = vec![tree];
+            while let Some(e) = stack.pop() {
+                out.push(e);
+                e.walk_children(|c| stack.push(c));
+                e.walk_type_slots(|t| {
+                    t.walk_quoted_terms(&mut |q| stack.push(q.as_ref()));
+                });
+            }
+            out
+        }
+
+        let program = compile_ok(code);
+        let panes = program.materialize_panes();
+        let trees = program.pane_trees();
+        let lowerings_own = |occurrence: &crate::ccl::Occurrence| {
+            panes.projections[0]
+                .get(&occurrence.id())
+                .is_some_and(|a| a.rewritten.label != "lower.image")
+        };
+        // The binders lowering declares for itself, by uid.
+        let mut own: HashSet<Uid> = HashSet::new();
+        for e in nodes(trees[0]) {
+            e.walk_binders(|b| {
+                if lowerings_own(&b.occurrence)
+                    && let Some(uid) = uid(&b.name)
+                {
+                    own.insert(uid);
+                }
+            });
+        }
+
+        let mut wrong = Vec::new();
+        let mut checked = 0usize;
+        for (i, tree) in trees.into_iter().enumerate() {
+            let projection = &panes.projections[i];
+            let pane = PANES[i].name;
+            for e in nodes(tree) {
+                e.walk_occurrences(|occurrence, of| {
+                    let attr = projection.get(&occurrence.id());
+                    let (kind, expected) = match of {
+                        OccurrenceOf::Binder(b) => {
+                            if uid(&b.name).is_some_and(|u| own.contains(&u)) {
+                                return;
+                            }
+                            ("binder", spelling(&b.name))
+                        }
+                        OccurrenceOf::Use(name) => {
+                            if uid(name).is_some_and(|u| own.contains(&u)) {
+                                return;
+                            }
+                            ("use", spelling(name))
+                        }
+                        OccurrenceOf::Label(entry) => {
+                            ("label", Some(entry.label.name().to_string()))
+                        }
+                        OccurrenceOf::Tag { tag, .. } => ("tag", Some(tag.name().to_string())),
+                        OccurrenceOf::Head(pattern) => {
+                            if i == 0 && lowerings_own(occurrence) {
+                                return;
+                            }
+                            (
+                                "head",
+                                Some(match &pattern.head {
+                                    PatternHead::Tag(tag) => tag.name().to_string(),
+                                    PatternHead::Constructor { ctor, .. } => ctor.to_string(),
+                                }),
+                            )
+                        }
+                        OccurrenceOf::Annotation(_) => {
+                            if i == 0 {
+                                checked += 1;
+                                if !attr.is_some_and(|a| a.rewritten.via == Phase::Lower) {
+                                    wrong.push(format!(
+                                        "{program_name} / {pane}: annotation {:?} via {:?}",
+                                        occurrence.id(),
+                                        attr.map(|a| (a.rewritten.via, a.rewritten.label)),
+                                    ));
+                                }
+                            }
+                            return;
+                        }
+                    };
+                    let Some(expected) = expected else {
+                        return;
+                    };
+                    // A label, tag or head a pass builds is one the compiler writes:
+                    // `writes`, `commit`, a store's field per variable. Nothing tells
+                    // it from a source label copied wrongly, so those are checked
+                    // where every one is lowering's.
+                    if i != 0 && !matches!(kind, "binder" | "use") {
+                        return;
+                    }
+                    checked += 1;
+                    let text = attr
+                        .and_then(|a| a.spans.iter().min_by_key(|s| s.end - s.start))
+                        .map(|s| &code[s.start..s.end]);
+                    if text != Some(expected.as_str()) {
+                        wrong.push(format!(
+                            "{program_name} / {pane}: {kind} `{expected}` resolves to {text:?} \
+                             ({:?})",
+                            attr.map(|a| (a.rewritten.via, a.rewritten.label)),
+                        ));
+                    }
+                });
+            }
+        }
+        (checked, wrong)
+    }
+
+    /// Every occurrence of the pipeline corpus resolves to the name it spells
+    /// ([`occurrence_spelling_failures`]). A pass that mints a binder where it should copy
+    /// its source binder's occurrence resolves to the span of the node its recording
+    /// names, and fails here; no leak class can tell the two apart.
+    #[test]
+    fn every_occurrence_resolves_to_its_spelling() {
+        let mut checked = 0;
+        let mut wrong = Vec::new();
+        for (program_name, code) in corpus() {
+            let (n, w) = occurrence_spelling_failures(program_name, &code);
+            checked += n;
+            wrong.extend(w);
+        }
+        assert!(checked > 0, "the corpus holds occurrences");
+        assert!(
+            wrong.is_empty(),
+            "{} of {checked} occurrences resolve elsewhere:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+
+    /// The shapes whose rebuilt binders the corpus holds none of: a `let` inside an
+    /// eliminated lambda, nested feeding loops, a feed under `with begin():`, a
+    /// constructor assignment, a nominal type's parameter and the single-constructor
+    /// form.
+    #[rstest::rstest]
+    #[case::let_in_an_eliminated_lambda(indoc! {"
+        xs = [1, 2, 3]
+        def f(x):
+            y = x * 2
+            z = y + x
+            z + 1
+        sum([f(v) for v in xs])
+    "})]
+    #[case::nested_feeding_loops(indoc! {"
+        xs = [1, 2, 3]
+        ys = [10, 20]
+        out: Feed(_)
+        for x in xs:
+            for y in ys:
+                out << x + y
+        out
+    "})]
+    #[case::nested_feeding_loops_with_an_accumulator(indoc! {"
+        out: Feed(_)
+        n := 0
+        for x in [1, 2, 3]:
+            for y in [4, 5]:
+                out << x + y
+            n := n + x
+        out
+    "})]
+    #[case::a_feed_in_a_transaction(indoc! {"
+        out: Feed(_)
+        for x in [1, 2, 3]:
+            with begin():
+                out << x * 2
+        out
+    "})]
+    #[case::a_guarded_feed_in_a_transaction(indoc! {"
+        out: Feed(_)
+        for x in [1, 2, 3]:
+            with begin():
+                if x > 1:
+                    out << x
+        out
+    "})]
+    #[case::constructor_assignments(indoc! {"
+        type Circle:
+            circle(radius: Int)
+        type Rect:
+            rect(w: Int, h: Int)
+
+        c = Circle::circle(3)
+        Circle::circle(r) = c
+        s = Rect::rect(1, 2)
+        Rect::rect(w, h) = s
+        r + w + h
+    "})]
+    #[case::a_nominal_types_parameter(indoc! {"
+        type Pair(T):
+            pair(a: T, b: T)
+
+        def first(U, p: Pair(U)) => U:
+            match p:
+                case Pair::pair(a, b):
+                    a
+
+        first(Pair::pair(1, 2))
+    "})]
+    #[case::the_single_constructor_form(indoc! {"
+        type Price = {amount: Int}
+
+        p = Price::new(amount=3)
+        p.extract().amount
+    "})]
+    #[case::a_loop_over_a_pattern_binder(indoc! {"
+        total := 0
+        for (a, b) in [(1, 2), (3, 4)]:
+            total := total + a * b
+        total
+    "})]
+    // A comprehension's pattern names are read through the minted element and bind no
+    // name, so these two check the occurrences around the binder.
+    #[case::a_comprehension_over_a_pattern_binder(indoc! {"
+        pairs = [(1, 2), (3, 4)]
+        sum([a + b for (a, b) in pairs if a > 0])
+    "})]
+    #[case::a_wildcard_binder(indoc! {"
+        xs = [5, 6, 7]
+        sum([1 for _ in xs])
+    "})]
+    fn every_occurrence_of_a_rebuilt_binder_resolves_to_its_spelling(#[case] code: &str) {
+        let (checked, wrong) = occurrence_spelling_failures("case", code);
+        assert!(checked > 0, "the program holds occurrences");
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// Each name lowering resolves in a type or a module path is written at its row's
+    /// use span, and declared at its row's target, except a module's, whose target is
+    /// the empty span at its file's start (`src/ccl/design/lowering.md`, "Names lowering
+    /// resolves").
+    #[test]
+    fn every_resolved_name_spans_its_spelling() {
+        let mut wrong = Vec::new();
+        for (program_name, code) in corpus() {
+            let program = compile_ok(&code);
+            for row in &program.resolved_names {
+                let at = |s: Span| &code[s.start..s.end];
+                if at(row.use_span) != row.name {
+                    wrong.push(format!(
+                        "{program_name}: use of `{}` at {:?}",
+                        row.name,
+                        at(row.use_span)
+                    ));
+                }
+                if row.target.start != row.target.end && at(row.target) != row.name {
+                    wrong.push(format!(
+                        "{program_name}: `{}` declared at {:?}",
+                        row.name,
+                        at(row.target)
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// A type alias, a type parameter, a nominal type's parameter and a nominal type each
+    /// resolve to the name its declaration writes, in an annotation, a `match` arm's pattern
+    /// and a qualified constructor.
+    #[test]
+    fn lowering_resolves_the_names_written_in_types() {
+        let code = indoc! {r#"
+            type Shape:
+                circle(radius: Int)
+                rect(w: Int, h: Int)
+
+            Pt = {x: Int, y: Int}
+
+            def area(s: Shape) => Int:
+                match s:
+                    case Shape::circle(r):
+                        r * r * 3
+                    case Shape::rect(w, h):
+                        w * h
+
+            def first(T, a: T, b: T) => T:
+                a
+
+            type Pair(U):
+                pair(a: U, b: U)
+
+            p: Pt = (x=1, y=2)
+            area(Shape::rect(first(p.x, 2), 4))
+        "#};
+        let program = compile_ok(code);
+        let mut rows: Vec<(usize, &str, usize)> = program
+            .resolved_names
+            .iter()
+            .map(|r| (r.use_span.start, r.name.as_str(), r.target.start))
+            .collect();
+        rows.sort();
+        let at = |name: &str, nth: usize| {
+            code.match_indices(name)
+                .nth(nth)
+                .unwrap_or_else(|| panic!("`{name}` is written {} times", nth + 1))
+                .0
+        };
+        let shape = at("Shape", 0);
+        let pt = at("Pt", 0);
+        let t = at("T", 0);
+        let u = at("U", 0);
+        for (name, nth, target) in [
+            ("Shape", 1, shape),
+            ("Shape", 2, shape),
+            ("Shape", 3, shape),
+            ("Shape", 4, shape),
+            ("Pt", 1, pt),
+            ("T", 1, t),
+            ("T", 2, t),
+            ("T", 3, t),
+            ("U", 1, u),
+            ("U", 2, u),
+        ] {
+            let row = (at(name, nth), name, target);
+            assert!(rows.contains(&row), "no row {row:?} among {rows:?}");
+        }
+    }
+
+    /// A type a `use` item brings in resolves to the name its declaration writes in the
+    /// module that declares it, through an import's `use` clause and a run's, for an alias
+    /// and a nominal type alike, and under a name `as` gives it
+    /// (`src/ccl/design/lowering.md`, "Names lowering resolves").
+    #[rstest::rstest]
+    #[case::an_import("import shop use Item, Shape", "Item", "Shape")]
+    #[case::a_run("run shop as sh use Item, Shape", "Item", "Shape")]
+    #[case::renamed("import shop use Item as Entry, Shape as Form", "Entry", "Form")]
+    fn a_type_a_use_item_brings_in_resolves_into_its_module(
+        #[case] clause: &str,
+        #[case] item: &str,
+        #[case] shape: &str,
+    ) {
+        let shop = indoc! {"
+            pub Item = Int
+            pub type Shape:
+                circle(Int)
+                dot
+        "};
+        let root = formatdoc! {"
+            {clause}
+            i: {item} = 3
+            s: {shape} = {shape}::circle(i)
+            match s:
+                case {shape}::circle(r):
+                    r
+                case {shape}::dot:
+                    0
+        "};
+        let loaded = LoadedProgram::load(
+            RootFile {
+                path: "main.cambra".to_owned(),
+                module: None,
+                text: root.clone(),
+            },
+            &mut InMemory::default().with("shop", shop),
+        );
+        let mut ctx = GlobalContext::default();
+        let consumer: Box<dyn Consumer> = Box::new(|| {});
+        let program = match compile_program(&mut ctx, &loaded, consumer) {
+            Ok(p) => p,
+            Err(errs) => panic!("expected a successful compile, got {errs:?}"),
+        };
+        let sources = loaded.sources();
+        let root_file = sources.root();
+        let shop_file = sources
+            .files()
+            .find(|&file| file != root_file)
+            .expect("the program loads `shop`");
+        let rows: Vec<(usize, &str, Span)> = program
+            .resolved_names
+            .iter()
+            .filter(|r| r.use_span.file == root_file)
+            .map(|r| (r.use_span.start, r.name.as_str(), r.target))
+            .collect();
+        // Every use below the clause, each resolving to where `shop` writes the name.
+        let below = clause.len();
+        for (written, declared) in [(item, "Item"), (shape, "Shape")] {
+            let start = shop.find(declared).expect("`shop` declares it");
+            let target = Span::new(shop_file, start, start + declared.len());
+            let uses: Vec<usize> = root[below..]
+                .match_indices(written)
+                .map(|(at, _)| below + at)
+                .collect();
+            assert!(!uses.is_empty(), "the root uses `{written}`");
+            for at in uses {
+                let row = (at, written, target);
+                assert!(rows.contains(&row), "no row {row:?} among {rows:?}");
+            }
         }
     }
 

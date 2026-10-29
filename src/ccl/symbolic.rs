@@ -506,7 +506,10 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         TypedExprNode::Record(fields) => {
             let items: Vec<_> = fields
                 .iter()
-                .map(|(k, e)| format!("{k}: {}", fmt(e, Precedence::Lowest, opts)))
+                .map(|entry| {
+                    let k = &entry.label;
+                    format!("{k}: {}", fmt(&entry.value, Precedence::Lowest, opts))
+                })
                 .collect();
             (Precedence::Atom, format!("({})", items.join(", ")))
         }
@@ -585,7 +588,11 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         // and the `Unit`-valued expression sitting there is a real node — unlike
         // an arm's *type*, where "stores nothing" is the whole content and the
         // surface spells it `` `tag ``.
-        TypedExprNode::VariantCtor { tag, payload } => (
+        TypedExprNode::VariantCtor {
+            tag_occurrence: _,
+            tag,
+            payload,
+        } => (
             Precedence::Atom,
             format!("`{tag}({})", fmt(payload, Precedence::Lowest, opts)),
         ),
@@ -655,7 +662,12 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
 
         // Mutable-variable write: `x := e` — distinct from let-binding `=`
         // (the name references its introduction; it is not a fresh binder).
-        TypedExprNode::MutWrite { name, key, value } => (
+        TypedExprNode::MutWrite {
+            name_occurrence: _,
+            name,
+            key,
+            value,
+        } => (
             Precedence::Lowest,
             match key {
                 Some(k) => format!(
@@ -698,12 +710,20 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (Precedence::Lowest, format!("{expr_str}; {body_str}"))
         }
 
-        TypedExprNode::Feed { name, value } => {
+        TypedExprNode::Feed {
+            name_occurrence: _,
+            name,
+            value,
+        } => {
             let val_str = fmt(value, Precedence::Lowest, opts);
             (Precedence::Atom, format!("feed({name}, {val_str})"))
         }
 
-        TypedExprNode::Define { name, value } => {
+        TypedExprNode::Define {
+            name_occurrence: _,
+            name,
+            value,
+        } => {
             let val_str = fmt(value, Precedence::Lowest, opts);
             (Precedence::Atom, format!("define({name}, {val_str})"))
         }
@@ -851,6 +871,8 @@ fn binop_binding(op: &BinOpKind) -> Binding {
 mod tests {
     use super::symbolic;
     use crate::ccl::BaseType;
+    use crate::ccl::Occurrence;
+    use crate::ccl::RecordEntry;
     use crate::ccl::{
         AggregateKind, ArithmeticKind, BinOpKind, BindingTransparency, Branch, Expr, Lit,
         LogicKind, Refinement, TransactKey, Type, TypedBinding, TypedExpr, TypedExprNode,
@@ -1034,7 +1056,10 @@ mod tests {
     )]
     // Apply: Lambda in func position gets parens
     #[case(
-        Expr::apply(Expr::var("v"), Expr::lambda("x", Type::infer(), Expr::var("x")),),
+        Expr::apply(
+            Expr::var("v"),
+            Expr::lambda("x", Occurrence::mint(), Type::infer(), Expr::var("x")),
+        ),
         "v ▷ (λ x → x)"
     )]
     // Apply: Compose in func position gets parens (Compose < Apply so the
@@ -1119,20 +1144,26 @@ mod tests {
     )]
     // Apply: Let in func position gets parens (Let is Lowest).
     #[case(
-        Expr::apply(Expr::var("x"), Expr::let_bind("f", Expr::var("g"), Expr::var("f")),),
+        Expr::apply(
+            Expr::var("x"),
+            Expr::let_bind("f", Occurrence::mint(), Expr::var("g"), Expr::var("f")),
+        ),
         "x ▷ (let f = g\nin f)"
     )]
     // Lambda (unannotated)
-    #[case(Expr::lambda("x", Type::infer(), Expr::var("x")), "λ x → x")]
+    #[case(
+        Expr::lambda("x", Occurrence::mint(), Type::infer(), Expr::var("x")),
+        "λ x → x"
+    )]
     // Lambda (annotated)
     #[case(
-        Expr::lambda("x", Type::Base(BaseType::Int), Expr::var("x")),
+        Expr::lambda("x", Occurrence::mint(), Type::Base(BaseType::Int), Expr::var("x")),
         "λ x : Int → x"
     )]
     // Lambda with function type annotation
     #[case(
         Expr::lambda(
-            "x",
+            "x", Occurrence::mint(),
             Type::Fun { name: None, fun_kind: crate::ccl::ty::FunKind::Compute, domain: Box::new(Type::Base(BaseType::Int)), codomain: Box::new(Type::Base(BaseType::Bool)) },
             Expr::var("x"),
         ),
@@ -1140,14 +1171,14 @@ mod tests {
     )]
     // Let (unannotated — bound_expr.ty is Unknown so no annotation printed)
     #[case(
-        Expr::let_bind("x", Expr::lit(Lit::Int(1)), Expr::var("x")),
+        Expr::let_bind("x", Occurrence::mint(), Expr::lit(Lit::Int(1)), Expr::var("x")),
         "\
 let x = 1
 in x"
     )]
     // Let (annotated — set bound_expr.ty to Bool so annotation is printed)
     #[case(
-        Expr::let_bind("x", Expr::lit(Lit::Bool(true)).with_ty(Type::Base(BaseType::Bool)), Expr::var("x")),
+        Expr::let_bind("x", Occurrence::mint(), Expr::lit(Lit::Bool(true)).with_ty(Type::Base(BaseType::Bool)), Expr::var("x")),
         "\
 let x : Bool = true
 in x"
@@ -1166,8 +1197,8 @@ in x"
     // Record
     #[case(
         TypedExpr::new(TypedExprNode::Record(vec![
-            ("a".into(), Expr::lit(Lit::Int(1))),
-            ("b".into(), Expr::lit(Lit::Int(2))),
+            RecordEntry::new("a", Occurrence::mint(), Expr::lit(Lit::Int(1))),
+            RecordEntry::new("b", Occurrence::mint(), Expr::lit(Lit::Int(2))),
         ])),
         "(a: 1, b: 2)"
     )]
@@ -1195,6 +1226,7 @@ in x"
     #[case(
         Expr::lambda(
             "x",
+            Occurrence::mint(),
             Type::refined_one(
                 Type::Base(BaseType::Int),
                 Refinement::born(Rc::new(Expr::lit(Lit::Bool(true))))
@@ -1273,8 +1305,8 @@ in x"
     #[case(
         Expr::letrec(
             vec![
-                (TypedBinding::new_unannotated("x"), Expr::lit(Lit::Int(0))),
-                (TypedBinding::new_unannotated("y"), Expr::var("x")),
+                (TypedBinding::new_unannotated("x", Occurrence::mint()), Expr::lit(Lit::Int(0))),
+                (TypedBinding::new_unannotated("y", Occurrence::mint()), Expr::var("x")),
             ],
             Expr::var("y"),
         ),
@@ -1286,7 +1318,7 @@ in y"
     #[case(
         Expr::letrec(
             vec![(
-                TypedBinding {
+                TypedBinding { occurrence: Occurrence::mint(),
                     name: "x".into(),
                     ty: Type::Base(BaseType::Int),
                     user_annotation: None,
@@ -1347,6 +1379,7 @@ in x"
         // in x ▷ (λ y → y + 1 * 2)
         let expr = Expr::let_bind(
             "x",
+            Occurrence::mint(),
             Expr::binop(
                 Expr::unary(UnaryOpKind::Not, Expr::var("a")),
                 BinOpKind::BoolLogic(LogicKind::Or),
@@ -1356,6 +1389,7 @@ in x"
                 Expr::var("x"),
                 Expr::lambda(
                     "y",
+                    Occurrence::mint(),
                     Type::infer(),
                     Expr::binop(
                         Expr::var("y"),

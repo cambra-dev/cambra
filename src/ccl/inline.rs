@@ -252,7 +252,7 @@ fn product_components(expr: &Expr) -> Option<Vec<(ProjKey, &Expr)>> {
         TypedExprNode::Record(fields) => Some(
             fields
                 .iter()
-                .map(|(k, e)| (ProjKey::Field(k.clone()), e))
+                .map(|entry| (ProjKey::Field(entry.label.clone()), &entry.value))
                 .collect(),
         ),
         _ => None,
@@ -280,7 +280,7 @@ fn into_product_components(expr: Expr) -> Vec<(ProjKey, Expr)> {
             .collect(),
         TypedExprNode::Record(fields) => fields
             .into_iter()
-            .map(|(k, e)| (ProjKey::Field(k), e))
+            .map(|entry| (ProjKey::Field(entry.label), entry.value))
             .collect(),
         other => unreachable!("into_product_components: not a product literal: {other:?}"),
     }
@@ -430,8 +430,10 @@ fn split_product_let(binding: &TypedBinding, product: Expr, body: Expr) -> Expr 
         .zip(binders)
         .rev()
         .fold(body, |body, ((_, component), (_, binder))| {
+            // A component's binder stands for no name the source writes.
             let component_binding = TypedBinding {
                 name: binder,
+                occurrence: crate::ccl::Occurrence::mint(),
                 ty: component.ty.clone(),
                 user_annotation: None,
                 transparency: binding.transparency,
@@ -824,7 +826,7 @@ fn stands_in_a_value_former(name: &Name, body: &Expr) -> bool {
         TypedExprNode::Tuple(elts) | TypedExprNode::List(elts) => holds(elts),
         TypedExprNode::Record(fields) => fields
             .iter()
-            .any(|(_, e)| matches!(&e.node, TypedExprNode::Var(n) if n == name)),
+            .any(|entry| matches!(&entry.value.node, TypedExprNode::Var(n) if n == name)),
         _ => false,
     };
     here || body.any_child(|c| stands_in_a_value_former(name, c))
@@ -1680,6 +1682,7 @@ fn refinement_discharged_by(arg_ty: &Type, param_ty: &Type) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Occurrence;
     use crate::ccl::ty::FunKind;
     use crate::ccl::{ArithmeticKind, BaseType, BinOpKind, Lit, Type, TypedExpr, TypedExprNode};
 
@@ -1846,7 +1849,7 @@ mod tests {
             right: Box::new(TypedExpr::lit(Lit::Int(1)).with_ty(int.clone())),
         })
         .with_ty(int.clone());
-        TypedExpr::let_bind("x", bound, body)
+        TypedExpr::let_bind("x", Occurrence::mint(), bound, body)
     }
 
     #[test]
@@ -1866,7 +1869,7 @@ mod tests {
         let fun_ty = Type::fun(domain.clone(), codomain.clone());
         let id_expr = TypedExpr::var("id").with_ty(fun_ty.clone());
         let body = TypedExpr::var("f").with_ty(fun_ty.clone());
-        let expr = TypedExpr::let_bind("f", id_expr.clone(), body);
+        let expr = TypedExpr::let_bind("f", Occurrence::mint(), id_expr.clone(), body);
         let result = inline_capability_lambdas(expr);
         // Alias `f → id` is substituted; result is just `id`.
         assert_eq!(result, id_expr);
@@ -1881,7 +1884,7 @@ mod tests {
         let curried_ty = Type::fun(int.clone(), Type::fun(int.clone(), int.clone()));
         let curry_expr = TypedExpr::var("curry_add").with_ty(curried_ty.clone());
         let body = TypedExpr::var("f").with_ty(curried_ty.clone());
-        let expr = TypedExpr::let_bind("f", curry_expr.clone(), body);
+        let expr = TypedExpr::let_bind("f", Occurrence::mint(), curry_expr.clone(), body);
         let result = inline_capability_lambdas(expr);
         assert_eq!(result, curry_expr);
     }
@@ -1898,7 +1901,7 @@ mod tests {
             function: Box::new(TypedExpr::var("f").with_ty(fun_ty.clone())),
         })
         .with_ty(int.clone());
-        let expr = TypedExpr::let_bind("f", id_expr.clone(), apply);
+        let expr = TypedExpr::let_bind("f", Occurrence::mint(), id_expr.clone(), apply);
 
         let result = inline_capability_lambdas(expr);
 
@@ -1933,7 +1936,7 @@ mod tests {
         .with_ty(int.clone());
         let body = TypedExpr::tuple(vec![call3, call4])
             .with_ty(Type::Tuple(vec![int.clone(), int.clone()]));
-        let expr = TypedExpr::let_bind("f", id_expr.clone(), body);
+        let expr = TypedExpr::let_bind("f", Occurrence::mint(), id_expr.clone(), body);
 
         let result = inline_capability_lambdas(expr);
 
@@ -1963,8 +1966,13 @@ mod tests {
         let add = |l: TypedExpr, r: TypedExpr| {
             TypedExpr::binop(l, BinOpKind::Arithmetic(ArithmeticKind::Add), r).with_ty(int.clone())
         };
-        let f =
-            TypedExpr::lambda("x", int.clone(), add(read("x"), read("x"))).with_ty(fun_ty.clone());
+        let f = TypedExpr::lambda(
+            "x",
+            Occurrence::mint(),
+            int.clone(),
+            add(read("x"), read("x")),
+        )
+        .with_ty(fun_ty.clone());
         let call = |argument: TypedExpr| {
             TypedExpr::new(TypedExprNode::Apply {
                 argument: Box::new(argument),
@@ -1976,7 +1984,8 @@ mod tests {
         let body = TypedExpr::tuple(vec![call(computed.clone()), call(read("a"))])
             .with_ty(Type::Tuple(vec![int.clone(), int.clone()]));
 
-        let result = inline_capability_lambdas(TypedExpr::let_bind("f", f, body));
+        let result =
+            inline_capability_lambdas(TypedExpr::let_bind("f", Occurrence::mint(), f, body));
 
         let TypedExprNode::Tuple(calls) = &result.node else {
             panic!("expected the tuple of the two calls, got {result:?}");
@@ -2016,7 +2025,7 @@ mod tests {
         let fun_ty = Type::fun(int.clone(), int.clone());
         let id_expr = TypedExpr::var("id").with_ty(fun_ty);
         let body = TypedExpr::lit(Lit::Int(42)).with_ty(int.clone());
-        let expr = TypedExpr::let_bind("f", id_expr, body);
+        let expr = TypedExpr::let_bind("f", Occurrence::mint(), id_expr, body);
 
         let result = inline_capability_lambdas(expr);
         let expected = TypedExpr::lit(Lit::Int(42)).with_ty(int);
@@ -2043,8 +2052,8 @@ mod tests {
         })
         .with_ty(int.clone());
 
-        let inner_let = TypedExpr::let_bind("g", id_g.clone(), outer_apply);
-        let expr = TypedExpr::let_bind("f", id_f.clone(), inner_let);
+        let inner_let = TypedExpr::let_bind("g", Occurrence::mint(), id_g.clone(), outer_apply);
+        let expr = TypedExpr::let_bind("f", Occurrence::mint(), id_f.clone(), inner_let);
 
         let result = inline_capability_lambdas(expr);
 
@@ -2125,8 +2134,13 @@ mod tests {
         // `Var("f")` in a non-call position is substituted literally (the
         // Lambda value), no beta reduction.
         let int = Type::Base(BaseType::Int);
-        let lambda = TypedExpr::lambda("x", int.clone(), TypedExpr::var("x").with_ty(int.clone()))
-            .with_ty(fn_ty(int.clone(), int.clone()));
+        let lambda = TypedExpr::lambda(
+            "x",
+            Occurrence::mint(),
+            int.clone(),
+            TypedExpr::var("x").with_ty(int.clone()),
+        )
+        .with_ty(fn_ty(int.clone(), int.clone()));
         let body = TypedExpr::var("f").with_ty(fn_ty(int.clone(), int));
         let result = inline_and_beta_reduce(body, &Name::raw("f"), &lambda, &PredMemo::new());
         assert_eq!(result, lambda);
@@ -2136,8 +2150,13 @@ mod tests {
     fn inline_and_beta_reduce_single_arg_call() {
         // `Apply(lit(3), Var("f"))` with `f = λ x → x` beta-reduces to `3`.
         let int = Type::Base(BaseType::Int);
-        let lambda = TypedExpr::lambda("x", int.clone(), TypedExpr::var("x").with_ty(int.clone()))
-            .with_ty(fn_ty(int.clone(), int.clone()));
+        let lambda = TypedExpr::lambda(
+            "x",
+            Occurrence::mint(),
+            int.clone(),
+            TypedExpr::var("x").with_ty(int.clone()),
+        )
+        .with_ty(fn_ty(int.clone(), int.clone()));
         let arg = TypedExpr::lit(Lit::Int(3)).with_ty(int.clone());
         let call = TypedExpr::apply(arg.clone(), TypedExpr::var("f").with_ty(lambda.ty.clone()))
             .with_ty(int);
@@ -2151,9 +2170,14 @@ mod tests {
         // reduces to `1` (first argument wins). Mirrors the multi-arg
         // curried UDF call site.
         let int = Type::Base(BaseType::Int);
-        let inner = TypedExpr::lambda("b", int.clone(), TypedExpr::var("a").with_ty(int.clone()))
-            .with_ty(fn_ty(int.clone(), int.clone()));
-        let lambda = TypedExpr::lambda("a", int.clone(), inner)
+        let inner = TypedExpr::lambda(
+            "b",
+            Occurrence::mint(),
+            int.clone(),
+            TypedExpr::var("a").with_ty(int.clone()),
+        )
+        .with_ty(fn_ty(int.clone(), int.clone()));
+        let lambda = TypedExpr::lambda("a", Occurrence::mint(), int.clone(), inner)
             .with_ty(fn_ty(int.clone(), fn_ty(int.clone(), int.clone())));
         let call = TypedExpr::apply(
             TypedExpr::lit(Lit::Int(2)).with_ty(int.clone()),
@@ -2174,12 +2198,17 @@ mod tests {
         // param, so substitution must not replace it. The input binding of
         // `f` to the lambda we pass in is irrelevant here.
         let int = Type::Base(BaseType::Int);
-        let shadowed =
-            TypedExpr::lambda("f", int.clone(), TypedExpr::var("f").with_ty(int.clone()))
-                .with_ty(fn_ty(int.clone(), int.clone()));
+        let shadowed = TypedExpr::lambda(
+            "f",
+            Occurrence::mint(),
+            int.clone(),
+            TypedExpr::var("f").with_ty(int.clone()),
+        )
+        .with_ty(fn_ty(int.clone(), int.clone()));
         // Some arbitrary lambda we'd otherwise inline if `f` weren't shadowed.
         let replacement = TypedExpr::lambda(
             "x",
+            Occurrence::mint(),
             int.clone(),
             TypedExpr::lit(Lit::Int(42)).with_ty(int.clone()),
         )
@@ -2218,21 +2247,24 @@ mod tests {
         // λ k : {Int | __elem == 5} → λ __iter_record : 0..3 → k
         let inner = TypedExpr::lambda(
             "__iter_record",
+            Occurrence::mint(),
             range.clone(),
             TypedExpr::var("k").with_ty(int.clone()),
         )
         .with_ty(list.clone());
-        let outer = TypedExpr::lambda("k", singleton.clone(), inner).with_ty(udf_ty.clone());
+        let outer = TypedExpr::lambda("k", Occurrence::mint(), singleton.clone(), inner)
+            .with_ty(udf_ty.clone());
 
         // 5 ▷ rep, with the argument carrying its singleton.
         let arg = TypedExpr::lit(Lit::Int(5)).with_ty(singleton);
         let call = TypedExpr::apply(arg.clone(), TypedExpr::var("rep").with_ty(udf_ty))
             .with_ty(list.clone());
-        let expr = TypedExpr::let_bind("rep", outer, call);
+        let expr = TypedExpr::let_bind("rep", Occurrence::mint(), outer, call);
 
         let result = inline_capability_lambdas(expr);
 
-        let expected = TypedExpr::lambda("__iter_record", range, arg).with_ty(list);
+        let expected =
+            TypedExpr::lambda("__iter_record", Occurrence::mint(), range, arg).with_ty(list);
         assert_eq!(result, expected);
     }
 
@@ -2252,11 +2284,16 @@ mod tests {
         let handle = Type::mutable(Type::Txn, singleton.clone());
         let udf_ty = fn_ty(singleton.clone(), int.clone());
 
-        let lambda = TypedExpr::lambda("v", singleton, TypedExpr::var("v").with_ty(int.clone()))
-            .with_ty(udf_ty.clone());
+        let lambda = TypedExpr::lambda(
+            "v",
+            Occurrence::mint(),
+            singleton,
+            TypedExpr::var("v").with_ty(int.clone()),
+        )
+        .with_ty(udf_ty.clone());
         let arg = TypedExpr::var("x").with_ty(handle);
         let call = TypedExpr::apply(arg.clone(), TypedExpr::var("id").with_ty(udf_ty)).with_ty(int);
-        let expr = TypedExpr::let_bind("id", lambda, call);
+        let expr = TypedExpr::let_bind("id", Occurrence::mint(), lambda, call);
 
         assert_eq!(inline_capability_lambdas(expr), arg);
     }
@@ -2271,15 +2308,21 @@ mod tests {
         let handle = Type::mutable(Type::Txn, crate::ccl::infer::lit_singleton(&Lit::Int(7)));
         let udf_ty = fn_ty(demanded.clone(), int.clone());
 
-        let lambda = TypedExpr::lambda("v", demanded, TypedExpr::var("v").with_ty(int.clone()))
-            .with_ty(udf_ty.clone());
+        let lambda = TypedExpr::lambda(
+            "v",
+            Occurrence::mint(),
+            demanded,
+            TypedExpr::var("v").with_ty(int.clone()),
+        )
+        .with_ty(udf_ty.clone());
         let call = TypedExpr::apply(
             TypedExpr::var("x").with_ty(handle),
             TypedExpr::var("id").with_ty(udf_ty),
         )
         .with_ty(int);
 
-        let _ = inline_capability_lambdas(TypedExpr::let_bind("id", lambda, call));
+        let _ =
+            inline_capability_lambdas(TypedExpr::let_bind("id", Occurrence::mint(), lambda, call));
     }
 
     /// The complement: a parameter refinement the argument does *not* carry is a
@@ -2298,11 +2341,16 @@ mod tests {
         let supplied = crate::ccl::infer::lit_singleton(&Lit::Int(7));
         let udf_ty = fn_ty(demanded.clone(), int.clone());
 
-        let lambda = TypedExpr::lambda("k", demanded, TypedExpr::var("k").with_ty(int.clone()))
-            .with_ty(udf_ty.clone());
+        let lambda = TypedExpr::lambda(
+            "k",
+            Occurrence::mint(),
+            demanded,
+            TypedExpr::var("k").with_ty(int.clone()),
+        )
+        .with_ty(udf_ty.clone());
         let arg = TypedExpr::lit(Lit::Int(7)).with_ty(supplied);
         let call = TypedExpr::apply(arg, TypedExpr::var("f").with_ty(udf_ty)).with_ty(int.clone());
-        let expr = TypedExpr::let_bind("f", lambda, call);
+        let expr = TypedExpr::let_bind("f", Occurrence::mint(), lambda, call);
 
         let _ = inline_capability_lambdas(expr);
     }
@@ -2317,7 +2365,7 @@ mod tests {
         let int = Type::Base(BaseType::Int);
         let ident = TypedExpr::var("id").with_ty(fn_ty(int.clone(), int.clone()));
         let body = TypedExpr::var("f").with_ty(fn_ty(int.clone(), int.clone()));
-        let expr = TypedExpr::let_bind("f", ident.clone(), body);
+        let expr = TypedExpr::let_bind("f", Occurrence::mint(), ident.clone(), body);
         let result = inline_capability_lambdas(expr);
         assert_eq!(result, ident);
     }
@@ -2331,7 +2379,7 @@ mod tests {
         let curried = fn_ty(int.clone(), fn_ty(int.clone(), int.clone()));
         let ident = TypedExpr::var("g").with_ty(curried.clone());
         let body = TypedExpr::var("f").with_ty(curried);
-        let expr = TypedExpr::let_bind("f", ident.clone(), body);
+        let expr = TypedExpr::let_bind("f", Occurrence::mint(), ident.clone(), body);
         let result = inline_capability_lambdas(expr);
         assert_eq!(result, ident);
     }
@@ -2356,15 +2404,24 @@ mod tests {
                 TypedExpr::var("xs").with_ty(list.clone()),
             )
             .with_ty(int.clone()),
-            TypedExpr::lambda("x", int.clone(), TypedExpr::var("x").with_ty(int.clone()))
-                .with_ty(fn_ty(int.clone(), int.clone())),
+            TypedExpr::lambda(
+                "x",
+                Occurrence::mint(),
+                int.clone(),
+                TypedExpr::var("x").with_ty(int.clone()),
+            )
+            .with_ty(fn_ty(int.clone(), int.clone())),
         )
         .with_ty(int.clone());
-        let inner_lambda =
-            TypedExpr::lambda("__iter_record", range.clone(), inner_lambda_body.clone())
-                .with_ty(list.clone());
-        let outer_lambda =
-            TypedExpr::lambda("xs", list.clone(), inner_lambda).with_ty(udf_ty.clone());
+        let inner_lambda = TypedExpr::lambda(
+            "__iter_record",
+            Occurrence::mint(),
+            range.clone(),
+            inner_lambda_body.clone(),
+        )
+        .with_ty(list.clone());
+        let outer_lambda = TypedExpr::lambda("xs", Occurrence::mint(), list.clone(), inner_lambda)
+            .with_ty(udf_ty.clone());
 
         let list_literal = TypedExpr::new(TypedExprNode::List(vec![
             TypedExpr::lit(Lit::Int(1)).with_ty(int.clone()),
@@ -2377,7 +2434,7 @@ mod tests {
             TypedExpr::var("doubles").with_ty(udf_ty.clone()),
         )
         .with_ty(list.clone());
-        let expr = TypedExpr::let_bind("doubles", outer_lambda, call);
+        let expr = TypedExpr::let_bind("doubles", Occurrence::mint(), outer_lambda, call);
 
         let result = inline_capability_lambdas(expr);
 
@@ -2389,11 +2446,17 @@ mod tests {
                 list_literal,
             )
             .with_ty(int.clone()),
-            TypedExpr::lambda("x", int.clone(), TypedExpr::var("x").with_ty(int.clone()))
-                .with_ty(fn_ty(int.clone(), int.clone())),
+            TypedExpr::lambda(
+                "x",
+                Occurrence::mint(),
+                int.clone(),
+                TypedExpr::var("x").with_ty(int.clone()),
+            )
+            .with_ty(fn_ty(int.clone(), int.clone())),
         )
         .with_ty(int);
-        let expected = TypedExpr::lambda("__iter_record", range, expected_body).with_ty(list);
+        let expected = TypedExpr::lambda("__iter_record", Occurrence::mint(), range, expected_body)
+            .with_ty(list);
         assert_eq!(result, expected);
     }
 
@@ -2427,14 +2490,29 @@ mod tests {
                 pair_proj,
             )
             .with_ty(int.clone()),
-            TypedExpr::lambda("x", int.clone(), TypedExpr::var("x").with_ty(int.clone()))
-                .with_ty(fn_ty(int.clone(), int.clone())),
+            TypedExpr::lambda(
+                "x",
+                Occurrence::mint(),
+                int.clone(),
+                TypedExpr::var("x").with_ty(int.clone()),
+            )
+            .with_ty(fn_ty(int.clone(), int.clone())),
         )
         .with_ty(int.clone());
-        let inner_lambda =
-            TypedExpr::lambda("__iter_record", range.clone(), inner_body).with_ty(list.clone());
-        let outer_lambda = TypedExpr::lambda("__arg_pair", arg_pair_ty.clone(), inner_lambda)
-            .with_ty(udf_ty.clone());
+        let inner_lambda = TypedExpr::lambda(
+            "__iter_record",
+            Occurrence::mint(),
+            range.clone(),
+            inner_body,
+        )
+        .with_ty(list.clone());
+        let outer_lambda = TypedExpr::lambda(
+            "__arg_pair",
+            Occurrence::mint(),
+            arg_pair_ty.clone(),
+            inner_lambda,
+        )
+        .with_ty(udf_ty.clone());
 
         let list_literal = TypedExpr::new(TypedExprNode::List(vec![
             TypedExpr::lit(Lit::Int(1)).with_ty(int.clone()),
@@ -2449,7 +2527,7 @@ mod tests {
         .with_ty(arg_pair_ty.clone());
         let call = TypedExpr::apply(arg.clone(), TypedExpr::var("f").with_ty(udf_ty))
             .with_ty(list.clone());
-        let expr = TypedExpr::let_bind("f", outer_lambda, call);
+        let expr = TypedExpr::let_bind("f", Occurrence::mint(), outer_lambda, call);
 
         let result = inline_capability_lambdas(expr);
 
@@ -2463,11 +2541,17 @@ mod tests {
                 folded_pair_proj,
             )
             .with_ty(int.clone()),
-            TypedExpr::lambda("x", int.clone(), TypedExpr::var("x").with_ty(int.clone()))
-                .with_ty(fn_ty(int.clone(), int.clone())),
+            TypedExpr::lambda(
+                "x",
+                Occurrence::mint(),
+                int.clone(),
+                TypedExpr::var("x").with_ty(int.clone()),
+            )
+            .with_ty(fn_ty(int.clone(), int.clone())),
         )
         .with_ty(int);
-        let expected = TypedExpr::lambda("__iter_record", range, expected_body).with_ty(list);
+        let expected = TypedExpr::lambda("__iter_record", Occurrence::mint(), range, expected_body)
+            .with_ty(list);
         assert_eq!(result, expected);
     }
 
@@ -2479,6 +2563,7 @@ mod tests {
         let int = Type::Base(BaseType::Int);
         let lambda = TypedExpr::lambda(
             "x",
+            Occurrence::mint(),
             int.clone(),
             TypedExpr::lit(Lit::Int(42)).with_ty(int.clone()),
         )
@@ -2488,7 +2573,7 @@ mod tests {
             TypedExpr::var("f").with_ty(fn_ty(int.clone(), int.clone())),
         )
         .with_ty(int.clone());
-        let expr = TypedExpr::let_bind("f", lambda, call);
+        let expr = TypedExpr::let_bind("f", Occurrence::mint(), lambda, call);
 
         let result = inline_capability_lambdas(expr);
         let expected = TypedExpr::lit(Lit::Int(42)).with_ty(int);
@@ -2536,7 +2621,8 @@ mod tests {
         .with_ty(int.clone());
 
         // λ __pair → body
-        let lambda = TypedExpr::lambda("__pair", pair_ty.clone(), body).with_ty(udf_ty.clone());
+        let lambda = TypedExpr::lambda("__pair", Occurrence::mint(), pair_ty.clone(), body)
+            .with_ty(udf_ty.clone());
 
         // arg: Tuple(Lit(1), Lit(2))
         let lit1 = TypedExpr::lit(Lit::Int(1)).with_ty(int.clone());
@@ -2550,7 +2636,7 @@ mod tests {
         })
         .with_ty(int.clone());
 
-        let expr = TypedExpr::let_bind("add", lambda, call);
+        let expr = TypedExpr::let_bind("add", Occurrence::mint(), lambda, call);
         let result = inline_capability_lambdas(expr);
 
         // Expected: Tuple(1,2).0 + Tuple(1,2).1 — projections unfolded here.
@@ -2600,10 +2686,16 @@ mod tests {
             TypedExpr::var("a").with_ty(int.clone()),
         )
         .with_ty(int.clone());
-        let lambda = TypedExpr::lambda("p", pair_ty.clone(), TypedExpr::let_bind("a", lit(1), sum))
-            .with_ty(udf_ty.clone());
+        let lambda = TypedExpr::lambda(
+            "p",
+            Occurrence::mint(),
+            pair_ty.clone(),
+            TypedExpr::let_bind("a", Occurrence::mint(), lit(1), sum),
+        )
+        .with_ty(udf_ty.clone());
         let argument = TypedExpr::let_bind(
             "a",
+            Occurrence::mint(),
             lit(2),
             TypedExpr::tuple(vec![TypedExpr::var("a").with_ty(int.clone()), lit(3)])
                 .with_ty(pair_ty.clone()),
@@ -2614,7 +2706,8 @@ mod tests {
         })
         .with_ty(int.clone());
 
-        let result = inline_capability_lambdas(TypedExpr::let_bind("add", lambda, call));
+        let result =
+            inline_capability_lambdas(TypedExpr::let_bind("add", Occurrence::mint(), lambda, call));
 
         let TypedExprNode::Let {
             binding: floated,

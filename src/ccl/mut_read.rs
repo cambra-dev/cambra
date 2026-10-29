@@ -159,6 +159,7 @@
 //! starts fresh, so a read in a `with begin():` body stays inside the
 //! transaction that performs it.
 
+use crate::ccl::Occurrence;
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::{
@@ -566,7 +567,7 @@ fn wrap(minted: Minted, body: Expr) -> Expr {
         .into_iter()
         .rev()
         .fold(body, |body, (binder, source)| {
-            let mut binding = TypedBinding::new_unannotated(binder);
+            let mut binding = TypedBinding::new_unannotated(binder, Occurrence::mint());
             binding.transparency = BindingTransparency::Opaque;
             Expr::let_in(binding, Expr::var(source), body)
         })
@@ -719,6 +720,7 @@ mod tests {
     fn accumulator(name: &Name, body: Expr) -> Expr {
         Expr::mut_decl(
             name.clone(),
+            Occurrence::mint(),
             Type::mutable(Type::Hole, Type::Base(BaseType::Int)),
             Expr::lit(Lit::Int(0)),
             body,
@@ -732,9 +734,17 @@ mod tests {
     /// `x := x + 1; x := x + 2; unit` — a write between two reads.
     fn two_segments(x: &Name) -> Expr {
         Expr::expr_stmt(
-            Expr::mut_write(x.clone(), Expr::binop(Expr::var(x.clone()), ADD, lit(1))),
+            Expr::mut_write(
+                x.clone(),
+                Occurrence::mint(),
+                Expr::binop(Expr::var(x.clone()), ADD, lit(1)),
+            ),
             Expr::expr_stmt(
-                Expr::mut_write(x.clone(), Expr::binop(Expr::var(x.clone()), ADD, lit(2))),
+                Expr::mut_write(
+                    x.clone(),
+                    Occurrence::mint(),
+                    Expr::binop(Expr::var(x.clone()), ADD, lit(2)),
+                ),
                 Expr::lit(Lit::Unit),
             ),
         )
@@ -765,6 +775,7 @@ mod tests {
         let body = Expr::expr_stmt(
             Expr::mut_write(
                 x.clone(),
+                Occurrence::mint(),
                 Expr::binop(Expr::var(x.clone()), ADD, Expr::var(x.clone())),
             ),
             Expr::lit(Lit::Unit),
@@ -782,10 +793,10 @@ mod tests {
         let x = Name::fresh("x");
         let (first, second) = (Name::anf_temp(), Name::anf_temp());
         let body = Expr::let_in(
-            TypedBinding::new_unannotated(first.clone()),
+            TypedBinding::new_unannotated(first.clone(), Occurrence::mint()),
             Expr::var(x.clone()),
             Expr::let_in(
-                TypedBinding::new_unannotated(second.clone()),
+                TypedBinding::new_unannotated(second.clone(), Occurrence::mint()),
                 Expr::var(x.clone()),
                 Expr::tuple(vec![Expr::var(first), Expr::var(second)]),
             ),
@@ -810,7 +821,12 @@ mod tests {
     /// `for r in xs: body` in statement position, over a fresh source.
     fn a_loop(body: Expr) -> Expr {
         Expr::expr_stmt(
-            Expr::for_loop(Name::fresh("r"), Expr::var(Name::fresh("xs")), body),
+            Expr::for_loop(
+                Name::fresh("r"),
+                Occurrence::mint(),
+                Expr::var(Name::fresh("xs")),
+                body,
+            ),
             Expr::lit(Lit::Unit),
         )
     }
@@ -821,7 +837,7 @@ mod tests {
     fn a_loop_reads_what_it_does_not_write_once() {
         let x = Name::fresh("x");
         let read = Expr::let_in(
-            TypedBinding::new_unannotated(Name::fresh("y")),
+            TypedBinding::new_unannotated(Name::fresh("y"), Occurrence::mint()),
             Expr::binop(Expr::var(x.clone()), ADD, lit(1)),
             Expr::lit(Lit::Unit),
         );

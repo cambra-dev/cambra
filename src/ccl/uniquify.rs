@@ -102,7 +102,7 @@ fn distinct_predicate_terms(expr: &Expr) -> Vec<Vec<crate::ccl::provenance::Node
     use std::collections::{HashMap, HashSet};
 
     fn ids_of(e: &Expr, out: &mut Vec<NodeId>) {
-        out.push(e.node_id());
+        e.for_each_own_id(|id| out.push(id));
         e.walk_children(|c| ids_of(c, out));
     }
     fn from_ty(t: &Type, acc: &mut HashMap<usize, Vec<NodeId>>, seen: &mut HashSet<usize>) {
@@ -312,14 +312,28 @@ impl Uniquifier {
 
             // The target name is a use of the defer-handle binder
             // (Feed/Define) or of the mutable variable's `let` (MutWrite).
-            TypedExprNode::Feed { name, value } | TypedExprNode::Define { name, value } => {
+            TypedExprNode::Feed {
+                name_occurrence: _,
+                name,
+                value,
+            }
+            | TypedExprNode::Define {
+                name_occurrence: _,
+                name,
+                value,
+            } => {
                 if let Some(m) = self.resolve(name) {
                     *name = m;
                 }
                 self.expr(value);
             }
 
-            TypedExprNode::MutWrite { name, key, value } => {
+            TypedExprNode::MutWrite {
+                name_occurrence: _,
+                name,
+                key,
+                value,
+            } => {
                 if let Some(m) = self.resolve(name) {
                     *name = m;
                 }
@@ -562,7 +576,7 @@ impl Uniquifier {
     fn binding_tys(&mut self, b: &mut TypedBinding) {
         self.ty(&mut b.ty);
         if let Some(ann) = &mut b.user_annotation {
-            self.ty(ann);
+            self.ty(&mut ann.ty);
         }
     }
 
@@ -681,7 +695,7 @@ fn collect_node_ids(expr: &Expr) -> Vec<crate::ccl::provenance::NodeId> {
         if let TypedExprNode::LetType { body, .. } = &e.node {
             return from_expr(body, out);
         }
-        out.push(e.node_id());
+        e.for_each_own_id(|id| out.push(id));
         // Every type slot, including a binder's: uniquify rebuilds the predicates
         // on a binder's type and annotation too (`binding_tys`). A slot it does
         // not rebuild keeps its ids, so it counts alike on both sides.
@@ -726,6 +740,7 @@ fn assert_all_binders_minted(expr: &Expr) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Occurrence;
     use crate::ccl::lower::{LoweringContext, lower_stmts};
     use crate::ccl::{Expr, Lit, Refinement};
     use crate::chl_parser::ModulePath;
@@ -900,8 +915,16 @@ mod tests {
     // Feed/Define target names are uses of the defer-handle binder.
     #[test]
     fn feed_target_resolves_to_defer_binder() {
-        let inner = Expr::expr_stmt(Expr::feed("d", Expr::lit(Lit::Int(1))), Expr::var("d"));
-        let expr = run(Expr::let_bind("d", Expr::new(TypedExprNode::Defer), inner));
+        let inner = Expr::expr_stmt(
+            Expr::feed("d", Occurrence::mint(), Expr::lit(Lit::Int(1))),
+            Expr::var("d"),
+        );
+        let expr = run(Expr::let_bind(
+            "d",
+            Occurrence::mint(),
+            Expr::new(TypedExprNode::Defer),
+            inner,
+        ));
         let TypedExprNode::Let { binding, body, .. } = &expr.node else {
             panic!("expected let");
         };
@@ -980,7 +1003,7 @@ mod tests {
         }
         fn binder_predicate_ids(e: &Expr, out: &mut Vec<NodeId>) {
             e.walk_binders(|b| {
-                for r in b.user_annotation.iter().flat_map(Type::refinements) {
+                for r in b.annotation_ty().into_iter().flat_map(Type::refinements) {
                     ids_of(&r.predicate, out);
                 }
             });
@@ -1032,10 +1055,17 @@ mod tests {
         let expr = run_in(
             Expr::let_bind(
                 "a",
-                Expr::let_bind("b", Expr::lit(Lit::Int(1)), Expr::var("b")),
+                Occurrence::mint(),
+                Expr::let_bind(
+                    "b",
+                    Occurrence::mint(),
+                    Expr::lit(Lit::Int(1)),
+                    Expr::var("b"),
+                ),
                 Expr::let_bind(
                     "f",
-                    Expr::lambda("x", Type::Hole, Expr::var("x")),
+                    Occurrence::mint(),
+                    Expr::lambda("x", Occurrence::mint(), Type::Hole, Expr::var("x")),
                     Expr::var("f"),
                 ),
             ),
@@ -1066,7 +1096,7 @@ mod tests {
         let expr = run_in(
             Expr::tuple(vec![
                 Expr::var("f"),
-                Expr::lambda("f", Type::Hole, Expr::var("f")),
+                Expr::lambda("f", Occurrence::mint(), Type::Hole, Expr::var("f")),
             ]),
             &scope,
             None,
@@ -1100,16 +1130,17 @@ mod tests {
         // letrec f = g ▷ f; g = λ x → f in f
         let expr = run(Expr::let_bind(
             "f",
+            Occurrence::mint(),
             Expr::lit(Lit::Int(1)),
             Expr::letrec(
                 vec![
                     (
-                        TypedBinding::new_unannotated("f"),
+                        TypedBinding::new_unannotated("f", Occurrence::mint()),
                         Expr::apply(Expr::var("g"), Expr::var("f")),
                     ),
                     (
-                        TypedBinding::new_unannotated("g"),
-                        Expr::lambda("x", Type::Hole, Expr::var("f")),
+                        TypedBinding::new_unannotated("g", Occurrence::mint()),
+                        Expr::lambda("x", Occurrence::mint(), Type::Hole, Expr::var("f")),
                     ),
                 ],
                 Expr::var("f"),
@@ -1179,7 +1210,11 @@ mod tests {
             found
         }
         let ty = alias_type(&expr).expect("the alias lowers to a `LetType`");
-        let above = TypedBinding::new_annotated("y", ty);
+        let above = TypedBinding::new_annotated(
+            "y",
+            Occurrence::mint(),
+            crate::ccl::Annotation::new(ty, Occurrence::mint()),
+        );
         run(Expr::let_in(above, Expr::lit(Lit::Int(1)), expr));
     }
 }

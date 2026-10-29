@@ -2,6 +2,8 @@
 //! structure: α-uniquification's home assignment, type-blind term equality, and the content hash.
 //! `bound_expr`, `init` or `iter` sits outside the binder's scope; the binder scopes over `body`.
 
+use cambra::ccl::Annotation;
+use cambra::ccl::Occurrence;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -15,9 +17,10 @@ use cambra::chl_parser::ModulePath;
 /// A binding of `name` with no type and the given annotation.
 fn binding(name: &str, user_annotation: Option<Type>) -> TypedBinding {
     TypedBinding {
+        occurrence: Occurrence::mint(),
         name: name.into(),
         ty: Type::Hole,
-        user_annotation,
+        user_annotation: user_annotation.map(|ty| Annotation::new(ty, Occurrence::mint())),
         transparency: BindingTransparency::Transparent,
     }
 }
@@ -82,9 +85,15 @@ fn a_top_level_mut_decl_is_minted_with_its_home() {
     let expr = uniquify::run_in(
         Expr::mut_decl(
             "m",
+            Occurrence::mint(),
             Type::mutable(Type::Hole, Type::Hole),
-            Expr::let_bind("b", Expr::lit(Lit::Int(1)), Expr::var("b")),
-            Expr::let_bind("f", Expr::var("m"), Expr::var("f")),
+            Expr::let_bind(
+                "b",
+                Occurrence::mint(),
+                Expr::lit(Lit::Int(1)),
+                Expr::var("b"),
+            ),
+            Expr::let_bind("f", Occurrence::mint(), Expr::var("m"), Expr::var("f")),
         ),
         &HashMap::new(),
         Some(catalog.clone()),

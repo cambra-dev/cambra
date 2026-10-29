@@ -7,6 +7,7 @@
 //! module and leaves some items unused; those items carry an `allow(dead_code)`
 //! naming the binary that uses them.
 
+use cambra::ccl::Occurrence;
 use std::rc::Rc;
 
 use cambra::ccl::{
@@ -117,7 +118,12 @@ fn gen_pred_at(rng: &mut Rng, depth: u32) -> Rc<TypedExpr> {
             } else {
                 (*gen_pred_at(rng, depth - 1)).clone()
             };
-            Rc::new(TypedExpr::lambda(name, Type::Base(BaseType::Int), body))
+            Rc::new(TypedExpr::lambda(
+                name,
+                Occurrence::mint(),
+                Type::Base(BaseType::Int),
+                body,
+            ))
         }
         // A cast whose target refines its domain — the embedded-collection shape
         // whose target predicates `eq_term_modulo_ty_slots` compares.

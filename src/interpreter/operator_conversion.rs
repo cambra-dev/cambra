@@ -1,4 +1,5 @@
 use crate::ccl::Label;
+use crate::ccl::RecordEntry;
 use bit_set::BitSet;
 use log::trace;
 use smol_str::SmolStr;
@@ -224,17 +225,23 @@ pub fn convert_outputs_to_operators(
         }
         TypedExprNode::Record(outs) => outs
             .iter()
-            .map(|(name, elt)| {
-                let op = convert_impl(elt, None, ctx)?;
-                // The sink is the program's output boundary, so it belongs to the
-                // output expression rather than to the record or the program root.
-                let _scope = crate::ccl::provenance::converting(elt.node_id());
-                // An output is named as its author reads the sink, `a::out` for a
-                // run's, which is how the sink registry keys it.
-                let name = SmolStr::from(name.to_string());
-                record_sink(&name);
-                Ok((name, op))
-            })
+            .map(
+                |RecordEntry {
+                     label: name,
+                     value: elt,
+                     ..
+                 }| {
+                    let op = convert_impl(elt, None, ctx)?;
+                    // The sink is the program's output boundary, so it belongs to the
+                    // output expression rather than to the record or the program root.
+                    let _scope = crate::ccl::provenance::converting(elt.node_id());
+                    // An output is named as its author reads the sink, `a::out` for a
+                    // run's, which is how the sink registry keys it.
+                    let name = SmolStr::from(name.to_string());
+                    record_sink(&name);
+                    Ok((name, op))
+                },
+            )
             .collect(),
         other => Err(ConversionError::Unsupported(format!(
             "convert_outputs_to_operators: expected Let* Record, got {other:?}"
@@ -2154,13 +2161,20 @@ fn convert_impl_inner(
                     // zip(Record({f1: e1, ..., fn: en})) — produced by Record lambda elimination.
                     // Fan the shared input out to each field morphism, then combine into a named Record.
                     // A **leaf** field takes none, on the same rule the tuple arms follow.
-                    let mut readers = ZipReaders::new(input, fields.iter().map(|(_, e)| e), ctx);
+                    let mut readers =
+                        ZipReaders::new(input, fields.iter().map(|entry| &entry.value), ctx);
                     let ops: Result<Vec<_>, _> = fields
                         .iter()
-                        .map(|(name, elt)| {
-                            let arm_input = readers.input_for(elt, ctx);
-                            Ok((name.runtime_key(), convert_impl(elt, arm_input, ctx)?))
-                        })
+                        .map(
+                            |RecordEntry {
+                                 label: name,
+                                 value: elt,
+                                 ..
+                             }| {
+                                let arm_input = readers.input_for(elt, ctx);
+                                Ok((name.runtime_key(), convert_impl(elt, arm_input, ctx)?))
+                            },
+                        )
                         .collect();
                     let ops = ops?;
                     Ok(zip_arms_named_at(ops, level))
@@ -3177,7 +3191,13 @@ fn convert_impl_inner(
             expect_no_input(input, "record literal")?;
             let ops: Result<Vec<_>, _> = fields
                 .iter()
-                .map(|(name, elt)| Ok((name.runtime_key(), convert_impl(elt, None, ctx)?)))
+                .map(
+                    |RecordEntry {
+                         label: name,
+                         value: elt,
+                         ..
+                     }| Ok((name.runtime_key(), convert_impl(elt, None, ctx)?)),
+                )
                 .collect();
             build_product(ops?, expr, ctx)
         }
@@ -3199,7 +3219,11 @@ fn convert_impl_inner(
         // type's representation (`Type::structure`).
         ctor @ (TypedExprNode::VariantCtor { .. } | TypedExprNode::NominalCtor { .. }) => {
             let (tag, payload) = match ctor {
-                TypedExprNode::VariantCtor { tag, payload } => (tag.clone(), payload),
+                TypedExprNode::VariantCtor {
+                    tag_occurrence: _,
+                    tag,
+                    payload,
+                } => (tag.clone(), payload),
                 TypedExprNode::NominalCtor { ctor, payload, .. } => {
                     (crate::ccl::nominal::ctor_tag(ctor), payload)
                 }
@@ -3494,8 +3518,8 @@ fn record_field<'a>(elt: &'a Expr, name: &str) -> Result<&'a Expr, ConversionErr
             .map(|(_, part)| part),
         TypedExprNode::Record(parts) => parts
             .iter()
-            .find(|(field, _)| field.runtime_key() == name)
-            .map(|(_, part)| part),
+            .find(|RecordEntry { label: field, .. }| field.runtime_key() == name)
+            .map(|entry| &entry.value),
         _ => None,
     }
     .ok_or_else(|| {
@@ -3619,7 +3643,13 @@ pub(super) fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
         TypedExprNode::Record(fields) => {
             let map: Result<HashMap<SmolStr, Value>, _> = fields
                 .iter()
-                .map(|(name, e)| Ok((name.runtime_key(), expr_to_value(e)?)))
+                .map(
+                    |RecordEntry {
+                         label: name,
+                         value: e,
+                         ..
+                     }| Ok((name.runtime_key(), expr_to_value(e)?)),
+                )
                 .collect();
             Ok(Value::Record(map?))
         }
@@ -3628,7 +3658,11 @@ pub(super) fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
         // Without it, a list literal of variants (``[`a(1), `b(2)]``) is rejected even
         // though `ColumnValue::from_values` builds a union column from a `Union`
         // extent perfectly well.
-        TypedExprNode::VariantCtor { tag, payload } => Ok(Value::Union {
+        TypedExprNode::VariantCtor {
+            tag_occurrence: _,
+            tag,
+            payload,
+        } => Ok(Value::Union {
             tag: FieldKey::Name(tag.clone()),
             inner: Box::new(expr_to_value(payload)?),
         }),
@@ -6309,6 +6343,7 @@ fn convert_flatten_domain(
 #[cfg(test)]
 mod recomputability_tests {
     use super::*;
+    use crate::ccl::Occurrence;
     use crate::ccl::{Lit, TypedExpr};
 
     fn source(name: &str) -> TypedExpr {
@@ -6319,8 +6354,14 @@ mod recomputability_tests {
     fn a_term_built_from_literals_is_recomputable() {
         let e = TypedExpr::let_bind(
             "a",
+            Occurrence::mint(),
             TypedExpr::lit(Lit::Int(1)),
-            TypedExpr::let_bind("b", TypedExpr::var("a"), TypedExpr::var("b")),
+            TypedExpr::let_bind(
+                "b",
+                Occurrence::mint(),
+                TypedExpr::var("a"),
+                TypedExpr::var("b"),
+            ),
         );
         assert!(
             nodes_reaching(&e, [reads_a_source])[0].is_empty(),
@@ -6333,7 +6374,7 @@ mod recomputability_tests {
         let bound = source("orders");
         let use_in_body = TypedExpr::var("a");
         let (bound_id, use_id) = (bound.node_id(), use_in_body.node_id());
-        let e = TypedExpr::let_bind("a", bound, use_in_body);
+        let e = TypedExpr::let_bind("a", Occurrence::mint(), bound, use_in_body);
 
         let [out] = nodes_reaching(&e, [reads_a_source]);
         assert!(out.contains(&bound_id), "the source itself");
@@ -6353,9 +6394,10 @@ mod recomputability_tests {
         let outer_use = TypedExpr::var("a");
         let inner_use = TypedExpr::var("a");
         let (outer_id, inner_id) = (outer_use.node_id(), inner_use.node_id());
-        let inner = TypedExpr::let_bind("a", source("orders"), inner_use);
+        let inner = TypedExpr::let_bind("a", Occurrence::mint(), source("orders"), inner_use);
         let e = TypedExpr::let_bind(
             "a",
+            Occurrence::mint(),
             TypedExpr::lit(Lit::Int(1)),
             TypedExpr::tuple(vec![inner, outer_use]),
         );
@@ -6375,6 +6417,7 @@ mod recomputability_tests {
 #[cfg(test)]
 mod variant_ctor_tests {
     use super::*;
+    use crate::ccl::Occurrence;
     use crate::ccl::{
         BaseType as CclBase, BindingTransparency, Lit, Type, TypedExpr, TypedExprNode,
     };
@@ -6418,6 +6461,7 @@ mod variant_ctor_tests {
         let payload = typed(TypedExprNode::Lit(Lit::Int(7)), Type::Base(CclBase::Int));
         let vc = typed(
             TypedExprNode::VariantCtor {
+                tag_occurrence: Occurrence::mint(),
                 tag: "commit".into(),
                 payload: Box::new(payload),
             },
@@ -6448,6 +6492,7 @@ mod variant_ctor_tests {
         let payload = typed(TypedExprNode::Lit(Lit::Unit), Type::Base(CclBase::Unit));
         let vc = typed(
             TypedExprNode::VariantCtor {
+                tag_occurrence: Occurrence::mint(),
                 tag: "abort".into(),
                 payload: Box::new(payload),
             },
@@ -6478,6 +6523,7 @@ mod variant_ctor_tests {
         let payload = typed(TypedExprNode::Lit(Lit::Int(3)), Type::Base(CclBase::Int));
         let vc = typed(
             TypedExprNode::VariantCtor {
+                tag_occurrence: Occurrence::mint(),
                 tag: "commit".into(),
                 payload: Box::new(payload),
             },
@@ -6520,6 +6566,7 @@ mod variant_ctor_tests {
 
     fn binding(name: &str, ty: Type) -> TypedBinding {
         TypedBinding {
+            occurrence: Occurrence::mint(),
             name: name.into(),
             ty,
             user_annotation: None,
@@ -6632,9 +6679,10 @@ mod variant_ctor_tests {
         // {out_t: __c.time, out_w: w} — reads outer (__c.time) and payload (w).
         let arm_body = typed(
             TypedExprNode::Record(vec![
-                ("out_t".into(), c_time),
-                (
-                    "out_w".into(),
+                RecordEntry::new("out_t", Occurrence::mint(), c_time),
+                RecordEntry::new(
+                    "out_w",
+                    Occurrence::mint(),
                     typed(TypedExprNode::Var("w".into()), int_ty.clone()),
                 ),
             ]),
@@ -6645,6 +6693,7 @@ mod variant_ctor_tests {
                 scrutinee: Some(Box::new(c_decision)),
                 branches: vec![Branch {
                     pattern: Some(Pattern {
+                        head_occurrence: Occurrence::mint(),
                         head: crate::ccl::PatternHead::Tag("commit".into()),
                         binding: binding("w", int_ty.clone()),
                         empty_payload: false,
@@ -6766,6 +6815,7 @@ mod variant_ctor_tests {
         );
         let commit_body = typed(
             TypedExprNode::VariantCtor {
+                tag_occurrence: Occurrence::mint(),
                 tag: "commit".into(),
                 payload: Box::new(p_plus_1),
             },
@@ -6773,6 +6823,7 @@ mod variant_ctor_tests {
         );
         let abort_body = typed(
             TypedExprNode::VariantCtor {
+                tag_occurrence: Occurrence::mint(),
                 tag: "abort".into(),
                 payload: Box::new(typed(
                     TypedExprNode::Lit(Lit::Unit),

@@ -15,6 +15,7 @@
 //! trailing sibling `<<` feeds are request-indexed replies (see
 //! `lower_transaction_loop`).
 
+use crate::ccl::Occurrence;
 use smol_str::SmolStr;
 
 use super::*;
@@ -122,6 +123,7 @@ fn for_over(iter_var: String, source: Expr, block: Expr) -> Expr {
     Expr::new(TypedExprNode::For {
         target: TypedBinding {
             name: iter_var.into(),
+            occurrence: Occurrence::mint(),
             ty: Type::Hole,
             user_annotation: None,
             transparency: BindingTransparency::Transparent,
@@ -243,14 +245,14 @@ fn lower_tx_block_scoped(
             ChlStmt::MutAssign { target, value, .. } => {
                 let name = extract_name_target(target, "mutable assignment")?;
                 let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;
-                write_or_let(name, val, chain, stmt.span, ctx)?
+                write_or_let(name, target.span, val, chain, stmt.span, ctx)?
             }
             // `balance += value` — the compound-write shorthand, likewise a write.
             ChlStmt::AugAssign { target, op, value } => {
                 let name = extract_name_target(target, "augmented assignment")?;
                 let rhs = lower_assigned_value(value, &[], outer_bindings, ctx)?;
                 let val = lower_aug_binop(&name, *op, rhs, stmt.span, ctx)?;
-                write_or_let(name, val, chain, stmt.span, ctx)?
+                write_or_let(name, target.span, val, chain, stmt.span, ctx)?
             }
             ChlStmt::Assign { target, value, .. } if type_alias_decl(target, value).is_some() => {
                 lower_type_alias_decl(target, stmt.span, chain, ctx)
@@ -354,15 +356,17 @@ fn lower_tx_block_scoped(
 /// post-inference (`check_mut_write_targets`), not here.
 fn write_or_let(
     name: String,
+    name_span: Span,
     val: Expr,
     chain: Expr,
     stmt_span: Span,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
+    let occurrence = ctx.occurrence_at(name_span);
     if ctx.is_shadowed(&name) {
-        return Ok(ctx.tag_image(Expr::let_bind(name, val, chain), stmt_span));
+        return Ok(ctx.tag_image(Expr::let_bind(name, occurrence, val, chain), stmt_span));
     }
-    let write = ctx.tag_image(Expr::mut_write(name, val), stmt_span);
+    let write = ctx.tag_image(Expr::mut_write(name, occurrence, val), stmt_span);
     Ok(ctx.tag_image(Expr::expr_stmt(write, chain), stmt_span))
 }
 

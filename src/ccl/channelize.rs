@@ -113,6 +113,8 @@
 //! channelization algorithm, per-shape extraction paths, defer-returning lift,
 //! alias inlining, error modes); this module comment is the entry point.
 
+use crate::ccl::Occurrence;
+use crate::ccl::RecordEntry;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 
@@ -376,7 +378,11 @@ fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, 
             return None;
         }
         match &b.body.node {
-            TypedExprNode::Feed { name, value } if name == defer_name => {
+            TypedExprNode::Feed {
+                name_occurrence,
+                name,
+                value,
+            } if name == defer_name => {
                 any_feed = true;
                 arms.push((b.guard.clone(), Some((**value).clone())));
             }
@@ -493,7 +499,12 @@ fn is_lift_shape(bound_expr: &Expr) -> bool {
 /// Also handles an optional `ExprStmt` prefix on `bound_expr`: the
 /// heads of any leading ExprStmts become a prefix that's prepended to
 /// the lifted body, with stale Feed/Define target names renamed to `y`.
-fn lift_defer(binding_name: &Name, bound_expr: Expr, body: &Expr) -> DeferLift {
+fn lift_defer(
+    binding_name: &Name,
+    binding_occurrence: Occurrence,
+    bound_expr: Expr,
+    body: &Expr,
+) -> DeferLift {
     let mut prefix: Vec<Expr> = Vec::new();
     let mut current = bound_expr;
     loop {
@@ -546,9 +557,14 @@ fn lift_defer(binding_name: &Name, bound_expr: Expr, body: &Expr) -> DeferLift {
     let mut new_outer_body = body.clone();
     for head in prefix.into_iter().rev() {
         let renamed_head = match head.node {
-            TypedExprNode::Feed { name: _, value } => TypedExpr {
+            TypedExprNode::Feed {
+                name_occurrence,
+                name: _,
+                value,
+            } => TypedExpr {
                 ty: head.ty,
                 node: TypedExprNode::Feed {
+                    name_occurrence,
                     name: binding_name.clone(),
                     value,
                 },
@@ -558,9 +574,14 @@ fn lift_defer(binding_name: &Name, bound_expr: Expr, body: &Expr) -> DeferLift {
                 // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                 node_id: head.node_id,
             },
-            TypedExprNode::Define { name: _, value } => TypedExpr {
+            TypedExprNode::Define {
+                name_occurrence,
+                name: _,
+                value,
+            } => TypedExpr {
                 ty: head.ty,
                 node: TypedExprNode::Define {
+                    name_occurrence,
                     name: binding_name.clone(),
                     value,
                 },
@@ -583,7 +604,7 @@ fn lift_defer(binding_name: &Name, bound_expr: Expr, body: &Expr) -> DeferLift {
     let out_ty = spliced.ty.clone();
     let mut defer_node = Expr::new(TypedExprNode::Defer);
     defer_node.ty = inner_handle_ty;
-    let mut lifted = Expr::let_bind(binding_name, defer_node, spliced);
+    let mut lifted = Expr::let_bind(binding_name, binding_occurrence, defer_node, spliced);
     lifted.ty = out_ty;
     DeferLift {
         expr: lifted,
@@ -719,9 +740,16 @@ fn contains_feed_or_define_for(expr: &Expr, name: &Name) -> bool {
         // Hit: the Feed/Define's target name matches.  Also recurse into
         // the value (a Feed value could itself contain another
         // Feed/Define of the same name).
-        TypedExprNode::Feed { name: t, value } | TypedExprNode::Define { name: t, value } => {
-            t == name || contains_feed_or_define_for(value, name)
+        TypedExprNode::Feed {
+            name_occurrence: _,
+            name: t,
+            value,
         }
+        | TypedExprNode::Define {
+            name_occurrence: _,
+            name: t,
+            value,
+        } => t == name || contains_feed_or_define_for(value, name),
         // Binder variants need shadowing-aware recursion: descend into
         // bodies only when the binder doesn't shadow `name`.  The
         // bound_expr / init_args / source positions are outside the
@@ -1184,7 +1212,7 @@ fn erase_chan_domains(
     expr.walk_binders_mut(|b| {
         erase_chan_domains_in_slot(&mut b.ty, map, kinds, predicates);
         if let Some(ann) = &mut b.user_annotation {
-            erase_chan_domains_in_slot(ann, map, kinds, predicates);
+            erase_chan_domains_in_slot(&mut ann.ty, map, kinds, predicates);
         }
     });
     if let TypedExprNode::Let {
@@ -1633,7 +1661,9 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
                     }
                 };
             record(&binding.name, [&binding.ty, &bound_expr.ty], node_id, ctx);
-            let mut defer_names = vec![binding.name];
+            // Each defer binder with its occurrence, which its channel's binder in the
+            // cluster's group keeps.
+            let mut defer_names = vec![(binding.name, binding.occurrence)];
             let mut current_body = *body;
             loop {
                 let cur_let_id = current_body.node_id;
@@ -1644,7 +1674,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
                         body: inner,
                     } if matches!(be.node, TypedExprNode::Defer) => {
                         record(&b.name, [&b.ty, &be.ty], cur_let_id, ctx);
-                        defer_names.push(b.name);
+                        defer_names.push((b.name, b.occurrence));
                         current_body = *inner;
                     }
                     _ => break,
@@ -1660,7 +1690,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
             // defer whose handle survives in a type does not.
             let _g =
                 provenance::enter(node_id, "channelize.cluster", provenance::Nature::Expansion);
-            channelize_cluster(&defer_names, &chan_names, &elements, body_rewritten, ctx)
+            channelize_cluster(defer_names, &chan_names, &elements, body_rewritten, ctx)
         }
         TypedExprNode::Let {
             binding,
@@ -1697,7 +1727,14 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
                         "channelize.defer_lift",
                         provenance::Nature::Machinery,
                     );
-                    lift_defer(&binding.name, *bound_expr, &body)
+                    // The lifted `let` stands for the outer one, so its binder copies the
+                    // outer binder's occurrence.
+                    lift_defer(
+                        &binding.name,
+                        binding.occurrence.clone(),
+                        *bound_expr,
+                        &body,
+                    )
                 };
                 // The lift renames the inner defer binder to the outer name,
                 // but *consumer types outside the lifted subtree* may carry
@@ -1765,7 +1802,14 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
                     ctx.resolved_domains
                         .push((inner_key, Type::ChanDom(outer, lvl)));
                 }
-                let collapsed = Expr::let_bind(binding.name.clone(), inner_be, renamed);
+                // The collapsed `let` stands for the outer one, so its binder copies
+                // the outer binder's occurrence.
+                let collapsed = Expr::let_bind(
+                    binding.name.clone(),
+                    binding.occurrence.clone(),
+                    inner_be,
+                    renamed,
+                );
                 drop(_g);
                 return channelize_expr(collapsed, ctx);
             }
@@ -1844,7 +1888,7 @@ fn handle_element(ty: &Type) -> Option<Type> {
 /// used directly, and top-level scalar feeds are lifted to `Fun(Unit,
 /// T)` via the `λ __unused → V` wrap inside `extract_for_defer`.
 fn channelize_cluster(
-    defer_names: &[Name],
+    defer_names: Vec<(Name, Occurrence)>,
     chan_names: &HashMap<Name, Name>,
     elements: &HashMap<Name, Type>,
     body: Expr,
@@ -1854,7 +1898,7 @@ fn channelize_cluster(
     // body's Feed/Define replacements as we process each defer in turn.
     let mut channels: HashMap<Name, Expr> = HashMap::new();
     let mut rewritten = body;
-    for name in defer_names.iter().rev() {
+    for (name, _) in defer_names.iter().rev() {
         // Process innermost defer first so its feeds are picked up before
         // the outer defer's walk; the outer walk wouldn't see them anyway
         // since extract_for_defer matches by name.  Processing order is
@@ -1903,7 +1947,7 @@ fn channelize_cluster(
     // that is itself a defer read (`x <<= y` leaves `Var(y) : feed(…)`) — off
     // the read's handle type, whose domain is the referenced channel's own
     // `ChanDom` (closed later).
-    for name in defer_names {
+    for (name, _) in &defer_names {
         if let Some(ch) = channels.get(name) {
             let key = chan_names
                 .get(name)
@@ -1934,11 +1978,12 @@ fn channelize_cluster(
     // (`x <<= y; y <<= x`) has no well-founded solution — the same law that
     // governs overwrite recursion, applied by the same checker.
     let mut group: Vec<(TypedBinding, Expr)> = Vec::with_capacity(defer_names.len());
-    for name in defer_names {
-        if let Some(channel) = channels.remove(name) {
+    for (name, occurrence) in defer_names {
+        if let Some(channel) = channels.remove(&name) {
             group.push((
                 TypedBinding {
-                    name: name.clone(),
+                    name,
+                    occurrence,
                     ty: channel.ty.clone(),
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
@@ -2164,7 +2209,16 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
             TypedExprNode::Abstract => unreachable!(
                 "the linked program holds no `Abstract`: each run binds its module's parameters"
             ),
-            TypedExprNode::Feed { name, value } | TypedExprNode::Define { name, value } => {
+            TypedExprNode::Feed {
+                name_occurrence: _,
+                name,
+                value,
+            }
+            | TypedExprNode::Define {
+                name_occurrence: _,
+                name,
+                value,
+            } => {
                 if !bound.iter().any(|b| b == name) {
                     out.insert(name.clone());
                 }
@@ -2210,8 +2264,8 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
                 }
             }
             TypedExprNode::Record(fields) => {
-                for (_, e) in fields {
-                    rec(e, bound, out);
+                for entry in fields {
+                    rec(&entry.value, bound, out);
                 }
             }
             TypedExprNode::Case {
@@ -2436,7 +2490,11 @@ fn extract_for_defer_impl(
         TypedExprNode::MutDecl { .. } => {
             unreachable!("a MutDecl reached channelize; mut_elim must have eliminated it")
         }
-        TypedExprNode::Feed { name, value } if &name == defer_name => {
+        TypedExprNode::Feed {
+            name_occurrence: _,
+            name,
+            value,
+        } if &name == defer_name => {
             // A feed outside any iteration contributes one element, keyed by the unit: its
             // value is lifted to `Unit ⤇ 𝑉`, whatever 𝑉 is, a collection included
             // (`docs/chl-spec.md`, "3.7 Feed operator `<<`": the stream's element type is the
@@ -2458,8 +2516,13 @@ fn extract_for_defer_impl(
                 // restate what the thing being wrapped is.
                 let vty = value.ty.clone();
                 Contribution {
-                    value: Expr::lambda("__unused", Type::Base(BaseType::Unit), value)
-                        .with_ty(Type::data_fun(Type::Base(BaseType::Unit), vty)),
+                    value: Expr::lambda(
+                        "__unused",
+                        Occurrence::mint(),
+                        Type::Base(BaseType::Unit),
+                        value,
+                    )
+                    .with_ty(Type::data_fun(Type::Base(BaseType::Unit), vty)),
                     levels: 1,
                     feed,
                 }
@@ -2470,7 +2533,11 @@ fn extract_for_defer_impl(
             // discard.
             TypedExprNode::Lit(Lit::Unit)
         }
-        TypedExprNode::Define { name, value } if &name == defer_name => {
+        TypedExprNode::Define {
+            name_occurrence: _,
+            name,
+            value,
+        } if &name == defer_name => {
             if in_inner_scope {
                 return Err(Located::new(
                     DeferError::NestedDefinition(defer_name.clone()),
@@ -2881,8 +2948,12 @@ fn extract_for_defer_impl(
                                     let elem = Expr::var(Name::elem()).with_ty(src_domain.clone());
                                     let source_at_elem = Expr::apply(elem, source_prefix.clone())
                                         .with_ty(src_item.clone());
-                                    let pred_lambda =
-                                        Expr::lambda(&param.name, param.ty.clone(), pred);
+                                    let pred_lambda = Expr::lambda(
+                                        &param.name,
+                                        param.occurrence.clone(),
+                                        param.ty.clone(),
+                                        pred,
+                                    );
                                     let pred_on_source = Expr::apply(source_at_elem, pred_lambda)
                                         .with_ty(Type::Base(BaseType::Bool));
                                     let refinement_struct =
@@ -3006,11 +3077,17 @@ fn extract_for_defer_impl(
         ),
         TypedExprNode::Record(fields) => {
             let mut new_fields = Vec::with_capacity(fields.len());
-            for (n, e) in fields {
-                new_fields.push((
-                    n,
-                    extract_for_defer(e, defer_name, feeds, define, in_inner_scope)?,
-                ));
+            for RecordEntry {
+                label,
+                label_occurrence,
+                value,
+            } in fields
+            {
+                new_fields.push(RecordEntry {
+                    label,
+                    label_occurrence,
+                    value: extract_for_defer(value, defer_name, feeds, define, in_inner_scope)?,
+                });
             }
             TypedExprNode::Record(new_fields)
         }
@@ -3157,8 +3234,13 @@ fn extract_for_defer_impl(
                         // The gated unit is one more level, as the unconditional lift's is.
                         let vty = v.ty.clone();
                         feeds.push(Contribution {
-                            value: Expr::lambda("__unused", refined.clone(), v.clone())
-                                .with_ty(Type::data_fun(refined.clone(), vty)),
+                            value: Expr::lambda(
+                                "__unused",
+                                Occurrence::mint(),
+                                refined.clone(),
+                                v.clone(),
+                            )
+                            .with_ty(Type::data_fun(refined.clone(), vty)),
                             levels: levels + 1,
                             feed: *feed,
                         });
@@ -3194,7 +3276,12 @@ fn extract_for_defer_impl(
         | TypedExprNode::LoadFrom(_)
         | TypedExprNode::Defer) => node,
         TypedExprNode::Error => crate::unexpected_error_node!(),
-        TypedExprNode::VariantCtor { tag, payload } => TypedExprNode::VariantCtor {
+        TypedExprNode::VariantCtor {
+            tag_occurrence,
+            tag,
+            payload,
+        } => TypedExprNode::VariantCtor {
+            tag_occurrence,
             tag,
             payload: Box::new(extract_for_defer(
                 *payload,
@@ -3341,14 +3428,22 @@ mod tests {
         // one-statement prefix ahead of the inner defer. Typed throughout, as a
         // post-inference tree is — the retype only matters in typed mode, and an
         // under-typed fixture would report its own `Hole`s as the failure.
-        let inner_body = Expr::expr_stmt(Expr::feed("x", lit(2)), var("x").with_ty(int.clone()));
-        let inner =
-            Expr::let_bind("x", Expr::new(TypedExprNode::Defer), inner_body).with_ty(int.clone());
-        let bound_expr = Expr::expr_stmt(Expr::feed("x", lit(1)), inner);
+        let inner_body = Expr::expr_stmt(
+            Expr::feed("x", Occurrence::mint(), lit(2)),
+            var("x").with_ty(int.clone()),
+        );
+        let inner = Expr::let_bind(
+            "x",
+            Occurrence::mint(),
+            Expr::new(TypedExprNode::Defer),
+            inner_body,
+        )
+        .with_ty(int.clone());
+        let bound_expr = Expr::expr_stmt(Expr::feed("x", Occurrence::mint(), lit(1)), inner);
         let body = var("y").with_ty(int.clone());
 
         assert!(is_lift_shape(&bound_expr), "the fixture has the lift shape");
-        let lift = lift_defer(&Name::raw("y"), bound_expr, &body);
+        let lift = lift_defer(&Name::raw("y"), Occurrence::mint(), bound_expr, &body);
         assert_eq!(lift.inner_name, Name::raw("x"));
 
         // Every `ExprStmt` on the spine carries a type. Checking for the absence
@@ -3369,8 +3464,13 @@ mod tests {
 
     #[test]
     fn run_single_feed() {
-        let body = Expr::expr_stmt(Expr::feed("d", lit(1)), var("d"));
-        let expr = Expr::let_bind("d", Expr::new(TypedExprNode::Defer), body);
+        let body = Expr::expr_stmt(Expr::feed("d", Occurrence::mint(), lit(1)), var("d"));
+        let expr = Expr::let_bind(
+            "d",
+            Occurrence::mint(),
+            Expr::new(TypedExprNode::Defer),
+            body,
+        );
         let result = run(typed(expr)).unwrap();
         // After channelize: let __scope_out_d_0 = (Unit; Record({result: d, to_d: 1})) in
         //                let d = __scope_out_d_0.to_d in
@@ -3387,8 +3487,16 @@ mod tests {
     /// `let d = Defer in define(d, 42); d` — Define path: bind d to V directly.
     #[test]
     fn run_define_replaces_directly() {
-        let body = Expr::expr_stmt(Expr::define("d", Expr::list(vec![lit(42)])), var("d"));
-        let expr = Expr::let_bind("d", Expr::new(TypedExprNode::Defer), body);
+        let body = Expr::expr_stmt(
+            Expr::define("d", Occurrence::mint(), Expr::list(vec![lit(42)])),
+            var("d"),
+        );
+        let expr = Expr::let_bind(
+            "d",
+            Occurrence::mint(),
+            Expr::new(TypedExprNode::Defer),
+            body,
+        );
         let result = run(typed(expr)).unwrap();
         let s = symbolic(&result);
         assert!(
@@ -3408,6 +3516,7 @@ mod tests {
     #[should_panic(expected = "a For/MutWrite/Begin reached channelize")]
     fn marker_in_statement_effect_panics() {
         let write = Expr::new(TypedExprNode::MutWrite {
+            name_occurrence: Occurrence::mint(),
             name: Name::raw("x"),
             key: None,
             value: Box::new(lit(1)),
@@ -3419,7 +3528,12 @@ mod tests {
     #[test]
     fn run_no_feed_is_error() {
         let body = var("d");
-        let expr = typed(Expr::let_bind("d", Expr::new(TypedExprNode::Defer), body));
+        let expr = typed(Expr::let_bind(
+            "d",
+            Occurrence::mint(),
+            Expr::new(TypedExprNode::Defer),
+            body,
+        ));
         let decl = expr.node_id();
         let err = run(expr).unwrap_err();
         assert!(
@@ -3433,10 +3547,15 @@ mod tests {
     #[test]
     fn run_multiple_feeds_use_copair() {
         let body = Expr::expr_stmt(
-            Expr::feed("d", lit(1)),
-            Expr::expr_stmt(Expr::feed("d", lit(2)), var("d")),
+            Expr::feed("d", Occurrence::mint(), lit(1)),
+            Expr::expr_stmt(Expr::feed("d", Occurrence::mint(), lit(2)), var("d")),
         );
-        let expr = Expr::let_bind("d", Expr::new(TypedExprNode::Defer), body);
+        let expr = Expr::let_bind(
+            "d",
+            Occurrence::mint(),
+            Expr::new(TypedExprNode::Defer),
+            body,
+        );
         let result = run(typed(expr)).unwrap();
         let s = symbolic(&result);
         assert!(
@@ -3469,18 +3588,33 @@ mod tests {
         // a
         // ```
         let inner = Expr::expr_stmt(
-            Expr::define("a", var("b")),
+            Expr::define("a", Occurrence::mint(), var("b")),
             Expr::expr_stmt(
-                Expr::define("b", var("c")),
+                Expr::define("b", Occurrence::mint(), var("c")),
                 Expr::expr_stmt(
-                    Expr::define("c", Expr::list(vec![lit(0), lit(1)])),
+                    Expr::define("c", Occurrence::mint(), Expr::list(vec![lit(0), lit(1)])),
                     var("a"),
                 ),
             ),
         );
-        let with_c = Expr::let_bind("c", Expr::new(TypedExprNode::Defer), inner);
-        let with_b = Expr::let_bind("b", Expr::new(TypedExprNode::Defer), with_c);
-        let with_a = Expr::let_bind("a", Expr::new(TypedExprNode::Defer), with_b);
+        let with_c = Expr::let_bind(
+            "c",
+            Occurrence::mint(),
+            Expr::new(TypedExprNode::Defer),
+            inner,
+        );
+        let with_b = Expr::let_bind(
+            "b",
+            Occurrence::mint(),
+            Expr::new(TypedExprNode::Defer),
+            with_c,
+        );
+        let with_a = Expr::let_bind(
+            "a",
+            Occurrence::mint(),
+            Expr::new(TypedExprNode::Defer),
+            with_b,
+        );
         let result = run(typed(with_a)).expect("cluster resolution should succeed");
         let s = symbolic(&result);
         assert!(
@@ -3504,11 +3638,21 @@ mod tests {
     #[test]
     fn run_mutual_cycle_is_error() {
         let inner = Expr::expr_stmt(
-            Expr::define("a", var("b")),
-            Expr::expr_stmt(Expr::define("b", var("a")), var("a")),
+            Expr::define("a", Occurrence::mint(), var("b")),
+            Expr::expr_stmt(Expr::define("b", Occurrence::mint(), var("a")), var("a")),
         );
-        let with_b = Expr::let_bind("b", Expr::new(TypedExprNode::Defer), inner);
-        let with_a = Expr::let_bind("a", Expr::new(TypedExprNode::Defer), with_b);
+        let with_b = Expr::let_bind(
+            "b",
+            Occurrence::mint(),
+            Expr::new(TypedExprNode::Defer),
+            inner,
+        );
+        let with_a = Expr::let_bind(
+            "a",
+            Occurrence::mint(),
+            Expr::new(TypedExprNode::Defer),
+            with_b,
+        );
         let err = run(typed(with_a)).unwrap_err();
         assert!(
             matches!(err.error, DeferError::MutuallyRecursiveCycle(_)),

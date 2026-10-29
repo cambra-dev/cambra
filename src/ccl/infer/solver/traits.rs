@@ -69,6 +69,7 @@
 //! functions"). Which operators state which requirement, and which take a fixed result
 //! rather than an associated one, is `schemes.rs`'s business, not this module's.
 
+use crate::ccl::Occurrence;
 use crate::ccl::ty::TraitRequirement;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -1072,7 +1073,7 @@ impl InstanceBody {
                         TypedExpr::proj_index(i).with_ty(super::fun(domain.clone(), part.clone())),
                     )
                     .with_ty(part);
-                    body = TypedExpr::let_bind(name.clone(), projection, body)
+                    body = TypedExpr::let_bind(name.clone(), Occurrence::mint(), projection, body)
                         .with_ty(codomain.clone());
                 }
                 body
@@ -1085,7 +1086,7 @@ impl InstanceBody {
                 panic!("`{op:?}` is over a pair of operands, got {other}")
             }
         };
-        TypedExpr::lambda(param, domain, body).with_ty(ty.clone())
+        TypedExpr::lambda(param, Occurrence::mint(), domain, body).with_ty(ty.clone())
     }
 }
 

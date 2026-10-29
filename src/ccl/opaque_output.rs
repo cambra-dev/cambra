@@ -29,6 +29,8 @@
 //!   whose own opaque binders this pass hides behind that lambda's own
 //!   `__output`.
 
+use crate::ccl::Annotation;
+use crate::ccl::Occurrence;
 use std::rc::Rc;
 
 use crate::ccl::{
@@ -77,7 +79,7 @@ pub fn is_annotated_result(expr: &Expr) -> bool {
 fn has_concrete_result_annotation(expr: &Expr) -> bool {
     match &expr.node {
         TypedExprNode::Let { binding, .. } if is_annotated_result(expr) => {
-            binding.user_annotation.as_ref().is_some_and(is_concrete)
+            binding.annotation_ty().is_some_and(is_concrete)
         }
         _ => false,
     }
@@ -158,7 +160,11 @@ fn wrap(body: Expr, opaque: Rc<[Name]>) -> Expr {
     // Minted without bounds: normalizing the annotation replaces it with a fresh
     // barrier variable, which gathers the bounds during inference.
     let barrier = Type::BarrierVar(BarrierVar::fresh(opaque, Vec::new(), Vec::new()));
-    let binding = TypedBinding::new_annotated(output.clone(), barrier);
+    let binding = TypedBinding::new_annotated(
+        output.clone(),
+        Occurrence::mint(),
+        Annotation::new(barrier, Occurrence::mint()),
+    );
     Expr::let_in(binding, body, Expr::var(output))
 }
 
@@ -168,13 +174,13 @@ mod tests {
     use crate::ccl::{BaseType, Lit};
 
     fn opaque_let(name: &Name, body: Expr) -> Expr {
-        let mut binding = TypedBinding::new_unannotated(name.clone());
+        let mut binding = TypedBinding::new_unannotated(name.clone(), Occurrence::mint());
         binding.transparency = BindingTransparency::Opaque;
         Expr::let_in(binding, Expr::lit(Lit::Int(1)), body)
     }
 
     fn lambda(body: Expr) -> Expr {
-        Expr::lambda(Name::fresh("x"), Type::Hole, body)
+        Expr::lambda(Name::fresh("x"), Occurrence::mint(), Type::Hole, body)
     }
 
     /// The lambda's body, which must be a `Lambda`.
@@ -195,7 +201,7 @@ mod tests {
         else {
             return false;
         };
-        matches!(binding.user_annotation, Some(Type::BarrierVar(_)))
+        matches!(binding.annotation_ty(), Some(Type::BarrierVar(_)))
             && matches!(&tail.node, TypedExprNode::Var(n) if *n == binding.name)
             && matches!(
                 &binding.name,
@@ -217,7 +223,7 @@ mod tests {
     fn a_body_binding_no_opaque_variable_is_left_alone() {
         let y = Name::fresh("y");
         let body = Expr::let_in(
-            TypedBinding::new_unannotated(y.clone()),
+            TypedBinding::new_unannotated(y.clone(), Occurrence::mint()),
             Expr::lit(Lit::Int(1)),
             Expr::var(y),
         );
@@ -230,7 +236,11 @@ mod tests {
         let y = Name::fresh("y");
         let r = Name::fresh("r");
         let body = Expr::let_in(
-            TypedBinding::new_annotated(y.clone(), Type::Base(BaseType::Int)),
+            TypedBinding::new_annotated(
+                y.clone(),
+                Occurrence::mint(),
+                Annotation::new(Type::Base(BaseType::Int), Occurrence::mint()),
+            ),
             opaque_let(&r, Expr::var(r.clone())),
             Expr::var(y),
         );
@@ -238,7 +248,13 @@ mod tests {
         let TypedExprNode::Let { binding, .. } = &body_of(&out).node else {
             panic!("the body stays a let");
         };
-        assert_eq!(binding.user_annotation, Some(Type::Base(BaseType::Int)));
+        assert_eq!(
+            binding.user_annotation,
+            Some(Annotation::new(
+                Type::Base(BaseType::Int),
+                Occurrence::mint()
+            ))
+        );
     }
 
     /// `λ x → let y : (Int, _) = (let r ^= 1 in r) in y`: the `_` is left to
@@ -250,7 +266,11 @@ mod tests {
         let r = Name::fresh("r");
         let annotation = Type::Tuple(vec![Type::Base(BaseType::Int), Type::Hole]);
         let body = Expr::let_in(
-            TypedBinding::new_annotated(y.clone(), annotation.clone()),
+            TypedBinding::new_annotated(
+                y.clone(),
+                Occurrence::mint(),
+                Annotation::new(annotation.clone(), Occurrence::mint()),
+            ),
             opaque_let(&r, Expr::var(r.clone())),
             Expr::var(y),
         );
@@ -261,7 +281,10 @@ mod tests {
         let TypedExprNode::Let { binding, .. } = &inner.node else {
             panic!("the annotated let stays inside the wrap");
         };
-        assert_eq!(binding.user_annotation, Some(annotation));
+        assert_eq!(
+            binding.user_annotation,
+            Some(Annotation::new(annotation, Occurrence::mint()))
+        );
     }
 
     /// `λ x → let y : Int = 1 in (let r ^= 1 in r)`: the annotation covers only
@@ -271,7 +294,11 @@ mod tests {
         let y = Name::fresh("y");
         let r = Name::fresh("r");
         let body = Expr::let_in(
-            TypedBinding::new_annotated(y, Type::Base(BaseType::Int)),
+            TypedBinding::new_annotated(
+                y,
+                Occurrence::mint(),
+                Annotation::new(Type::Base(BaseType::Int), Occurrence::mint()),
+            ),
             Expr::lit(Lit::Int(1)),
             opaque_let(&r, Expr::var(r.clone())),
         );

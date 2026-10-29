@@ -2,6 +2,8 @@
 //! lowers (`docs/chl-spec.md`, "9.4 Parameters").
 
 use super::*;
+use crate::ccl::Annotation;
+use crate::ccl::Occurrence;
 
 impl LoweringContext {
     /// Declare the Module-typed parameter `stmt` declares, if it declares one,
@@ -236,7 +238,7 @@ impl LoweringContext {
                 Reached::Value(Some(reference)) => {
                     Some((bound.clone(), reference.name.clone(), used.item))
                 }
-                Reached::Value(None) | Reached::Type(_) | Reached::Nominal(_) => None,
+                Reached::Value(None) | Reached::Type { .. } | Reached::Nominal(_) => None,
             })
             .collect();
         used.sort_by(|l, r| l.0.cmp(&r.0));
@@ -247,7 +249,7 @@ impl LoweringContext {
             .rev()
             .fold(body, |body, (bound, member, item)| {
                 let member = self.tag_image(Expr::var(member.raw()), item);
-                let bound = Expr::let_bind(bound.as_str(), member, body);
+                let bound = Expr::let_bind(bound.as_str(), Occurrence::mint(), member, body);
                 self.tag_image(bound, item)
             });
         let run = Expr::new(TypedExprNode::Run {
@@ -292,8 +294,14 @@ impl LoweringContext {
             .fold(run, |body, (parameter, span, value)| {
                 let bound = argument_name(name, &QualifiedName::new(parameter.clone()));
                 let bound = match parameters.get(&parameter).cloned().flatten() {
-                    Some(ty) => Expr::let_bind_annotated(bound, value, body, ty),
-                    None => Expr::let_bind(bound, value, body),
+                    Some(ty) => Expr::let_bind_annotated(
+                        bound,
+                        Occurrence::mint(),
+                        value,
+                        body,
+                        Annotation::new(ty, Occurrence::mint()),
+                    ),
+                    None => Expr::let_bind(bound, Occurrence::mint(), value, body),
                 };
                 self.tag_image(bound, span)
             })
@@ -334,7 +342,7 @@ impl LoweringContext {
         let default = default.map(|default| lower(default, self));
         let param = TypeParam::declared(name.node.as_str());
         let alias = AliasType::Type(Type::Param(Rc::clone(&param)));
-        self.declare_type_alias(name.node.as_str(), statement, alias);
+        self.declare_type_alias(name.node.as_str(), statement, Some(name.span), alias);
         self.parameters.push(Parameter {
             name: name.node.clone(),
             declared: statement,
@@ -558,13 +566,13 @@ impl LoweringContext {
                     &item.name.node,
                     item.name.span,
                 );
+                let name_span = qualifier.type_member_span(&item.name.node);
                 if let Ok(ty) = &reached {
                     let ty = ty.clone().unwrap_or(AliasType::Type(Type::Hole));
-                    self.declare_type_alias(bound.node.as_str(), bound.span, ty);
+                    self.declare_type_alias(bound.node.as_str(), bound.span, name_span, ty);
                 }
-                if let (Ok(reached), Some(used)) = (reached, self.module.uses.get_mut(&bound.node))
-                {
-                    used.reached = Reached::Type(reached);
+                if let (Ok(ty), Some(used)) = (reached, self.module.uses.get_mut(&bound.node)) {
+                    used.reached = Reached::Type { ty, name_span };
                 }
             } else if let Some(Ok(module)) = qualifier.used_module(&item.name.node)
                 && self.module.qualifiers.contains_key(&bound.node)
@@ -623,7 +631,7 @@ pub(super) fn rebind_entry(
     let ty = binding
         .user_annotation
         .expect("an entry's `let` carries the entry's type");
-    let bound = Expr::let_bind_annotated(binder.raw(), member, *body, ty);
+    let bound = Expr::let_bind_annotated(binder.raw(), Occurrence::mint(), member, *body, ty);
     *at = ctx.tag_image(bound, span);
 }
 

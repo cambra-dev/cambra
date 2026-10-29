@@ -353,7 +353,7 @@ fn refuse_a_union_applied_at_the_input(term: &Expr) -> Result<(), String> {
             | TypedExprNode::DisjointJoin(_)
             | TypedExprNode::Realize(_) => e.ty.is_collection().then_some(e),
             TypedExprNode::Compose(elts) | TypedExprNode::Tuple(elts) => elts.iter().find_map(find),
-            TypedExprNode::Record(fields) => fields.iter().find_map(|(_, f)| find(f)),
+            TypedExprNode::Record(fields) => fields.iter().find_map(|entry| find(&entry.value)),
             TypedExprNode::Cast { value, .. } => find(value),
             TypedExprNode::Apply { argument, function } => {
                 if is_builtin(function, Builtin::Zip) {
@@ -611,6 +611,8 @@ mod tests {
     use super::test_helpers::*;
     use super::*;
     use crate::ccl::Expr;
+    use crate::ccl::Occurrence;
+    use crate::ccl::RecordEntry;
     use crate::ccl::infer::typecheck;
     use crate::ccl::symbolic::symbolic;
     // `super::*` also glob-imports `lambda_elim::compose` into scope; name the
@@ -906,7 +908,8 @@ mod tests {
         ])
         .with_ty(list_ty.clone());
 
-        let mut expr = Expr::let_bind("xs".to_string(), list_123(), body_chain).with_ty(list_ty);
+        let mut expr = Expr::let_bind("xs".to_string(), Occurrence::mint(), list_123(), body_chain)
+            .with_ty(list_ty);
 
         insert_iterate_markers(&mut expr, &mut Default::default(), &PredMemo::new()).unwrap();
 
@@ -969,9 +972,13 @@ mod tests {
         let int = int_ty();
         let out_ty = data_fun_ty(Type::UIntRange(3), int.clone());
         let mut expr = Expr::new(TypedExprNode::Record(vec![
-            ("out_a".into(), list_123()),
-            ("out_b".into(), list_123()),
-            ("n".into(), Expr::lit(Lit::Int(0)).with_ty(int.clone())),
+            RecordEntry::new("out_a", Occurrence::mint(), list_123()),
+            RecordEntry::new("out_b", Occurrence::mint(), list_123()),
+            RecordEntry::new(
+                "n",
+                Occurrence::mint(),
+                Expr::lit(Lit::Int(0)).with_ty(int.clone()),
+            ),
         ]))
         .with_ty(Type::Record(vec![
             ("out_a".into(), out_ty.clone()),
@@ -984,7 +991,10 @@ mod tests {
         let TypedExprNode::Record(outs) = &expr.node else {
             panic!("expected a record, got: {}", symbolic(&expr));
         };
-        for (name, value) in outs {
+        for RecordEntry {
+            label: name, value, ..
+        } in outs
+        {
             let expected = name.name() != "n";
             assert_eq!(
                 is_iterate_apply(chain_head(value)),

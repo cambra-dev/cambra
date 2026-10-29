@@ -317,6 +317,9 @@ pub struct TypeMember {
     pub public: bool,
     /// The statement that declares it.
     pub declared: Span,
+    /// Where that statement writes the alias's name, which a use of a `use` name
+    /// for it resolves to.
+    pub name_span: Span,
 }
 
 /// One nominal type a module declares (`docs/chl-spec.md`, "9.5 Visibility"). Its
@@ -656,6 +659,7 @@ impl Interface {
                         ty: (*ty).clone(),
                         public: alias.public,
                         declared: alias.span,
+                        name_span: alias_name_span(&ast.body, alias.span),
                     },
                 )
             })
@@ -834,6 +838,22 @@ pub fn top_level_bindings(stmts: &[Spanned<ChlStmt>]) -> Vec<TopLevelBinding> {
         }
     }
     out
+}
+
+/// Where the type alias statement at `span`, one of `stmts`, writes the alias's name.
+fn alias_name_span(stmts: &[Spanned<ChlStmt>], span: Span) -> Span {
+    let stmt = stmts
+        .iter()
+        .find(|stmt| stmt.span == span)
+        .unwrap_or_else(|| panic!("a top-level alias's statement stands at {span:?}"));
+    let inner = match &stmt.node {
+        ChlStmt::Pub { stmt, .. } => &stmt.node,
+        other => other,
+    };
+    let ChlStmt::Assign { target, .. } = inner else {
+        panic!("a type alias is an assignment");
+    };
+    target.span
 }
 
 /// The type aliases `stmts`, a module's top level, declares, in order.

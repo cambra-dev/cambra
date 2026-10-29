@@ -534,8 +534,8 @@ pub struct MatchPattern {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PayloadPattern {
     /// `` case `tag(v): `` — the tag carries a payload, bound to `v` for the arm's
-    /// body.
-    Named(SmolStr),
+    /// body. The span is the name's.
+    Named(Spanned<SmolStr>),
     /// `` case `tag(_): `` — the tag carries a payload the arm does not read. `_` is
     /// the unused-binder spelling, in the same sense `case _:` uses it for an arm
     /// whose tag is not named; it is not a name, so the body cannot refer to it.

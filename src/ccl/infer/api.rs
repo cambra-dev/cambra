@@ -977,6 +977,21 @@ impl LocatedInferError {
         }
     }
 
+    /// An annotation mismatch raised at the annotation's occurrence instead, so it
+    /// reports at the type the source writes: `String` in `x: String = 5`. Any other
+    /// error, or a binder with no annotation, is unchanged
+    /// (`src/ccl/design/provenance.md`, "Labels, pattern heads and annotations").
+    pub(crate) fn at_annotation(mut self, annotation: Option<&crate::ccl::Annotation>) -> Self {
+        if let Some(annotation) = annotation
+            && matches!(
+                self.error,
+                InferError::AnnotationMismatch { .. } | InferError::PolyAnnotationMismatch { .. }
+            )
+        {
+            self.node_id = annotation.occurrence.id();
+        }
+        self
+    }
     /// Name what a [`InferError::TypeParamEscapes`] reaches, for the typing rule that
     /// knows it; any other error, or one already naming its target, is unchanged.
     pub(crate) fn with_escape_target(mut self, named: EscapeTarget) -> Self {
@@ -1983,7 +1998,7 @@ pub fn debug_assert_no_free_witness(expr: &Expr, stage: &str) {
         }
         e.walk_binders(|b| {
             check(&b.ty, scope, e, stage);
-            if let Some(a) = &b.user_annotation {
+            if let Some(a) = b.annotation_ty() {
                 check(a, scope, e, stage);
             }
         });
@@ -2846,7 +2861,10 @@ fn check_mut_write_targets_go(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Annotation;
     use crate::ccl::BaseType;
+    use crate::ccl::Occurrence;
+    use crate::ccl::RecordEntry;
     use crate::ccl::infer::{bool_lit_ty, int_lit_ty, str_lit_ty};
     use crate::ccl::symbolic::symbolic;
     use crate::ccl::{
@@ -2919,16 +2937,18 @@ mod tests {
         assert!(matches!(errors[0].error, InferError::UnboundVariable(_)));
 
         // An annotation conflict: `bind_annotation` raises while the annotated
-        // `let`'s rule is running, so the `let` node owns it.
+        // `let`'s rule is running, and the error moves to the annotation's occurrence,
+        // which locates the type the source writes.
+        let annotation = Annotation::new(Type::Base(BaseType::String), Occurrence::mint());
+        let annotation_id = annotation.occurrence.id();
         let mut expr = Expr::new(TypedExprNode::Let {
-            binding: TypedBinding::new_annotated("x", Type::Base(BaseType::String)),
+            binding: TypedBinding::new_annotated("x", Occurrence::mint(), annotation),
             bound_expr: Box::new(Expr::lit(Lit::Int(1))),
             body: Box::new(Expr::var("x")),
         });
-        let let_id = expr.node_id();
         let errors = infer(&mut expr, &mut TypeInferenceContext::new())
             .expect_err("Int bound to a String annotation");
-        assert_eq!(errors[0].node_id, let_id);
+        assert_eq!(errors[0].node_id, annotation_id);
         assert!(matches!(
             errors[0].error,
             InferError::AnnotationMismatch { .. }
@@ -2976,7 +2996,12 @@ mod tests {
     fn test_infer_annotated_lambda() {
         let mut ctx = TypeInferenceContext::new();
         // λ x : Int → x  =>  Fun(Int, Int)
-        let mut expr = Expr::lambda("x", Type::Base(BaseType::Int), Expr::var("x"));
+        let mut expr = Expr::lambda(
+            "x",
+            Occurrence::mint(),
+            Type::Base(BaseType::Int),
+            Expr::var("x"),
+        );
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(
             ty,
@@ -2996,7 +3021,7 @@ mod tests {
         // returns its argument, so the argument's own type flows all the way out.
         let mut expr = Expr::apply(
             Expr::lit(Lit::Int(42)),
-            Expr::lambda("x", Type::infer(), Expr::var("x")),
+            Expr::lambda("x", Occurrence::mint(), Type::infer(), Expr::var("x")),
         );
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(ty, int_lit_ty(42));
@@ -3053,9 +3078,9 @@ mod tests {
     #[test]
     fn test_infer_unbound_handle_target() {
         let cases = [
-            Expr::feed("ghost", Expr::lit(Lit::Int(1))),
-            Expr::define("ghost", Expr::lit(Lit::Int(1))),
-            Expr::mut_write("ghost", Expr::lit(Lit::Int(1))),
+            Expr::feed("ghost", Occurrence::mint(), Expr::lit(Lit::Int(1))),
+            Expr::define("ghost", Occurrence::mint(), Expr::lit(Lit::Int(1))),
+            Expr::mut_write("ghost", Occurrence::mint(), Expr::lit(Lit::Int(1))),
         ];
         for mut expr in cases {
             let mut ctx = TypeInferenceContext::new();
@@ -3076,7 +3101,7 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         // λ x → x  — standalone; x is referenced but never used as an Apply argument.
         // inference permits unconstrained lambdas; returns Fun(Infer, Infer).
-        let mut expr = Expr::lambda("x", Type::infer(), Expr::var("x"));
+        let mut expr = Expr::lambda("x", Occurrence::mint(), Type::infer(), Expr::var("x"));
         let ty = infer(&mut expr, &mut ctx).expect("inference allows unconstrained λ x → x");
         assert!(
             matches!(ty, Type::Fun { .. }),
@@ -3100,6 +3125,7 @@ mod tests {
         let body = Expr::apply(Expr::var("p"), Expr::proj_index(0));
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
+                occurrence: Occurrence::mint(),
                 name: "p".into(),
                 ty: Type::Tuple(vec![Type::Hole, Type::Hole]),
                 user_annotation: None,
@@ -3125,10 +3151,11 @@ mod tests {
     fn list_comp_unannotated(source: Expr, var: &str, elt: Expr) -> Expr {
         Expr::lambda(
             "__list_comp_var",
+            Occurrence::mint(),
             Type::infer(),
             Expr::apply(
                 Expr::apply(Expr::var("__list_comp_var"), source),
-                Expr::lambda(var, Type::infer(), elt),
+                Expr::lambda(var, Occurrence::mint(), Type::infer(), elt),
             ),
         )
     }
@@ -3217,10 +3244,11 @@ mod tests {
     /// Builds `λ x → BinOp(Apply(f, Var(x)), op, Apply(g, Var(x)))` where `f`
     /// and `g` are annotated lambdas with the given param types.
     fn double_apply_lambda(f_param_ty: Type, g_param_ty: Type) -> Expr {
-        let f = Expr::lambda("a", f_param_ty, Expr::var("a"));
-        let g = Expr::lambda("b", g_param_ty, Expr::var("b"));
+        let f = Expr::lambda("a", Occurrence::mint(), f_param_ty, Expr::var("a"));
+        let g = Expr::lambda("b", Occurrence::mint(), g_param_ty, Expr::var("b"));
         Expr::lambda(
             "x",
+            Occurrence::mint(),
             Type::infer(),
             Expr::binop(
                 Expr::apply(Expr::var("x"), f),
@@ -3291,9 +3319,13 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
+                occurrence: Occurrence::mint(),
                 name: "xs".into(),
                 ty: Type::infer(),
-                user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+                user_annotation: Some(Annotation::new(
+                    Type::list_of(Type::Base(BaseType::Int)),
+                    Occurrence::mint(),
+                )),
                 transparency: BindingTransparency::Transparent,
             },
             body: Box::new(Expr::aggregate(Expr::var("xs"), AggregateKind::Sum)),
@@ -3319,16 +3351,21 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
+                occurrence: Occurrence::mint(),
                 name: "xs".into(),
                 ty: Type::infer(),
-                user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+                user_annotation: Some(Annotation::new(
+                    Type::list_of(Type::Base(BaseType::Int)),
+                    Occurrence::mint(),
+                )),
                 transparency: BindingTransparency::Transparent,
             },
             body: Box::new(Expr::let_bind_annotated(
                 "ys",
+                Occurrence::mint(),
                 Expr::var("xs"),
                 Expr::var("ys"),
-                Type::list_of(Type::Base(BaseType::Int)),
+                Annotation::new(Type::list_of(Type::Base(BaseType::Int)), Occurrence::mint()),
             )),
         });
         infer(&mut expr, &mut ctx).expect("list-to-list ascription type-checks via the Σ rule");
@@ -3337,16 +3374,24 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut bad = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
+                occurrence: Occurrence::mint(),
                 name: "xs".into(),
                 ty: Type::infer(),
-                user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+                user_annotation: Some(Annotation::new(
+                    Type::list_of(Type::Base(BaseType::Int)),
+                    Occurrence::mint(),
+                )),
                 transparency: BindingTransparency::Transparent,
             },
             body: Box::new(Expr::let_bind_annotated(
                 "ys",
+                Occurrence::mint(),
                 Expr::var("xs"),
                 Expr::var("ys"),
-                Type::list_of(Type::Base(BaseType::String)),
+                Annotation::new(
+                    Type::list_of(Type::Base(BaseType::String)),
+                    Occurrence::mint(),
+                ),
             )),
         });
         assert!(
@@ -3364,9 +3409,13 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
+                occurrence: Occurrence::mint(),
                 name: "xs".into(),
                 ty: Type::infer(),
-                user_annotation: Some(Type::list_of(Type::Base(BaseType::Int))),
+                user_annotation: Some(Annotation::new(
+                    Type::list_of(Type::Base(BaseType::Int)),
+                    Occurrence::mint(),
+                )),
                 transparency: BindingTransparency::Transparent,
             },
             body: Box::new(Expr::var("xs")),
@@ -3402,9 +3451,10 @@ mod tests {
             let mut ctx = TypeInferenceContext::new();
             let mut expr = TypedExpr::new(TypedExprNode::Lambda {
                 param: TypedBinding {
+                    occurrence: Occurrence::mint(),
                     name: "m".into(),
                     ty: Type::infer(),
-                    user_annotation: Some(ann),
+                    user_annotation: Some(Annotation::new(ann, Occurrence::mint())),
                     transparency: BindingTransparency::Transparent,
                 },
                 body: Box::new(Expr::var("m")),
@@ -3461,9 +3511,13 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut ident = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
+                occurrence: Occurrence::mint(),
                 name: "xs".into(),
                 ty: Type::infer(),
-                user_annotation: Some(Type::collection_of(Type::Base(BaseType::Int))),
+                user_annotation: Some(Annotation::new(
+                    Type::collection_of(Type::Base(BaseType::Int)),
+                    Occurrence::mint(),
+                )),
                 transparency: BindingTransparency::Transparent,
             },
             body: Box::new(Expr::var("xs")),
@@ -3481,9 +3535,13 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut consume = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
+                occurrence: Occurrence::mint(),
                 name: "xs".into(),
                 ty: Type::infer(),
-                user_annotation: Some(Type::collection_of(Type::Base(BaseType::Int))),
+                user_annotation: Some(Annotation::new(
+                    Type::collection_of(Type::Base(BaseType::Int)),
+                    Occurrence::mint(),
+                )),
                 transparency: BindingTransparency::Transparent,
             },
             body: Box::new(Expr::aggregate(Expr::var("xs"), AggregateKind::Sum)),
@@ -3554,9 +3612,13 @@ mod tests {
         // let x : String = 42 in x  =>  AnnotationMismatch
         let mut expr = TypedExpr::new(TypedExprNode::Let {
             binding: TypedBinding {
+                occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::infer(),
-                user_annotation: Some(Type::Base(BaseType::String)),
+                user_annotation: Some(Annotation::new(
+                    Type::Base(BaseType::String),
+                    Occurrence::mint(),
+                )),
                 transparency: BindingTransparency::Transparent,
             },
             bound_expr: Box::new(Expr::lit(Lit::Int(42))),
@@ -3577,10 +3639,11 @@ mod tests {
     #[test]
     fn mut_write_to_non_mutable_rejected() {
         // let x : Int = 0 in (x := 5)  =>  MutWriteToNonMutable, at the write
-        let write = Expr::mut_write("x", Expr::lit(Lit::Int(5)));
+        let write = Expr::mut_write("x", Occurrence::mint(), Expr::lit(Lit::Int(5)));
         let write_id = write.node_id();
         let expr = TypedExpr::new(TypedExprNode::Let {
             binding: TypedBinding {
+                occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Base(BaseType::Int),
                 user_annotation: None,
@@ -3606,13 +3669,18 @@ mod tests {
         // let x : Mut(Int, _) = 0 in (x := 5)  =>  Ok
         let expr = TypedExpr::new(TypedExprNode::Let {
             binding: TypedBinding {
+                occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::mutable(Type::Hole, Type::Base(BaseType::Int)),
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
             },
             bound_expr: Box::new(Expr::lit(Lit::Int(0))),
-            body: Box::new(Expr::mut_write("x", Expr::lit(Lit::Int(5)))),
+            body: Box::new(Expr::mut_write(
+                "x",
+                Occurrence::mint(),
+                Expr::lit(Lit::Int(5)),
+            )),
         });
         assert_eq!(check_mut_write_targets(&expr), Ok(()));
     }
@@ -3624,6 +3692,7 @@ mod tests {
         let mut expr = TypedExpr::new(TypedExprNode::Apply {
             function: Box::new(Expr::lambda(
                 "x",
+                Occurrence::mint(),
                 Type::Base(BaseType::String),
                 Expr::var("x"),
             )),
@@ -3644,7 +3713,12 @@ mod tests {
         // the lambda parameter must be popped even on error; otherwise "x"
         // remains visible in `ctx` after the call returns.
         let mut ctx = TypeInferenceContext::new();
-        let mut expr = Expr::lambda("x", Type::Base(BaseType::Int), Expr::var("unbound_var"));
+        let mut expr = Expr::lambda(
+            "x",
+            Occurrence::mint(),
+            Type::Base(BaseType::Int),
+            Expr::var("unbound_var"),
+        );
         let result = infer_bare(&mut expr, &mut ctx);
         assert_eq!(
             result,
@@ -3664,12 +3738,19 @@ mod tests {
         // Since `(λ b:String → b)(Int)` is a type error, inference returns
         // TypeMismatch. The outer lambda param is never constrained — but the
         // body type error surfaces first.
-        let f_string = Expr::lambda("b", Type::Base(BaseType::String), Expr::var("b"));
+        let f_string = Expr::lambda(
+            "b",
+            Occurrence::mint(),
+            Type::Base(BaseType::String),
+            Expr::var("b"),
+        );
         let mut expr = Expr::lambda(
             "x",
+            Occurrence::mint(),
             Type::infer(),
             Expr::let_bind(
                 "x",
+                Occurrence::mint(),
                 Expr::lit(Lit::Int(42)),
                 TypedExpr::new(TypedExprNode::Apply {
                     function: Box::new(f_string),
@@ -3823,8 +3904,13 @@ mod tests {
         // bare Bool over the implicit refinement binder.
         let mut ctx = TypeInferenceContext::new();
         let int = || Type::Base(BaseType::Int);
-        let value = Expr::lambda("x", int(), Expr::var("x").with_ty(int()))
-            .with_ty(Type::fun(int(), int()));
+        let value = Expr::lambda(
+            "x",
+            Occurrence::mint(),
+            int(),
+            Expr::var("x").with_ty(int()),
+        )
+        .with_ty(Type::fun(int(), int()));
         let predicate = Expr::lit(Lit::Bool(true));
         let target = crate::ccl::ccl_utils::refined_data_fun(
             int(),
@@ -3987,6 +4073,7 @@ mod tests {
         // let total = λ xs → sum(xs) in total([1, 2, 3])
         let total_fn = Expr::lambda(
             "xs",
+            Occurrence::mint(),
             Type::infer(),
             Expr::aggregate(Expr::var("xs"), AggregateKind::Sum),
         );
@@ -3998,7 +4085,7 @@ mod tests {
             ]),
             Expr::var("total"),
         );
-        let mut expr = Expr::let_bind("total", total_fn, call);
+        let mut expr = Expr::let_bind("total", Occurrence::mint(), total_fn, call);
         assert_eq!(infer(&mut expr, &mut ctx), Ok(Type::Base(BaseType::Int)));
     }
 
@@ -4013,10 +4100,21 @@ mod tests {
     /// with a type error from the `BoolLogic(And)` operator (Int vs Bool).
     #[test]
     fn test_tuple_field_gap_infers_from_projections() {
-        let f = Expr::lambda("a", Type::Base(BaseType::Int), Expr::var("a"));
-        let g = Expr::lambda("b", Type::Base(BaseType::Bool), Expr::var("b"));
+        let f = Expr::lambda(
+            "a",
+            Occurrence::mint(),
+            Type::Base(BaseType::Int),
+            Expr::var("a"),
+        );
+        let g = Expr::lambda(
+            "b",
+            Occurrence::mint(),
+            Type::Base(BaseType::Bool),
+            Expr::var("b"),
+        );
         let mut expr = Expr::lambda(
             "p",
+            Occurrence::mint(),
             Type::infer(),
             Expr::binop(
                 Expr::apply(Expr::apply(Expr::var("p"), Expr::proj_index(0)), f),
@@ -4039,10 +4137,21 @@ mod tests {
     /// TypeMismatch.
     #[test]
     fn test_tuple_field_conflict_returns_mismatch() {
-        let f = Expr::lambda("a", Type::Base(BaseType::Int), Expr::var("a"));
-        let g = Expr::lambda("b", Type::Base(BaseType::String), Expr::var("b"));
+        let f = Expr::lambda(
+            "a",
+            Occurrence::mint(),
+            Type::Base(BaseType::Int),
+            Expr::var("a"),
+        );
+        let g = Expr::lambda(
+            "b",
+            Occurrence::mint(),
+            Type::Base(BaseType::String),
+            Expr::var("b"),
+        );
         let mut expr = Expr::lambda(
             "p",
+            Occurrence::mint(),
             Type::infer(),
             Expr::binop(
                 Expr::apply(Expr::apply(Expr::var("p"), Expr::proj_index(0)), f),
@@ -4070,7 +4179,7 @@ mod tests {
     #[test]
     fn test_lambda_type_inferred_from_call_site() {
         let mut ctx = TypeInferenceContext::new();
-        let g_lambda = Expr::lambda("x", Type::infer(), Expr::var("x"));
+        let g_lambda = Expr::lambda("x", Occurrence::mint(), Type::infer(), Expr::var("x"));
         let t0g = Expr::apply(
             Expr::apply(Expr::var("t"), Expr::proj_index(0)),
             Expr::var("g"),
@@ -4079,14 +4188,24 @@ mod tests {
             Expr::apply(Expr::var("t"), Expr::proj_index(2)),
             Expr::var("g"),
         );
-        let f_lambda = Expr::lambda("t", Type::infer(), Expr::tuple(vec![t0g, t2g]));
+        let f_lambda = Expr::lambda(
+            "t",
+            Occurrence::mint(),
+            Type::infer(),
+            Expr::tuple(vec![t0g, t2g]),
+        );
         let tuple_012 = Expr::tuple(vec![
             Expr::lit(Lit::Int(0)),
             Expr::lit(Lit::Int(1)),
             Expr::lit(Lit::Int(2)),
         ]);
-        let inner = Expr::let_bind("f", f_lambda, Expr::apply(tuple_012, Expr::var("f")));
-        let mut expr = Expr::let_bind("g", g_lambda, inner);
+        let inner = Expr::let_bind(
+            "f",
+            Occurrence::mint(),
+            f_lambda,
+            Expr::apply(tuple_012, Expr::var("f")),
+        );
+        let mut expr = Expr::let_bind("g", Occurrence::mint(), g_lambda, inner);
         let ty = infer(&mut expr, &mut ctx).expect("should infer successfully");
         assert_eq!(
             ty,
@@ -4115,12 +4234,18 @@ mod tests {
     fn test_infer_param_annotation_conflict() {
         let param_annotation = |ann: Type| {
             let mut ctx = TypeInferenceContext::new();
-            let inner = Expr::lambda("s", Type::Base(BaseType::String), Expr::var("s"));
+            let inner = Expr::lambda(
+                "s",
+                Occurrence::mint(),
+                Type::Base(BaseType::String),
+                Expr::var("s"),
+            );
             let mut expr = TypedExpr::new(TypedExprNode::Lambda {
                 param: TypedBinding {
+                    occurrence: Occurrence::mint(),
                     name: "x".into(),
                     ty: Type::infer(),
-                    user_annotation: Some(ann),
+                    user_annotation: Some(Annotation::new(ann, Occurrence::mint())),
                     transparency: BindingTransparency::Transparent,
                 },
                 body: Box::new(Expr::apply(Expr::var("x"), inner)),
@@ -4162,9 +4287,13 @@ mod tests {
         let mut expr = TypedExpr::new(TypedExprNode::Apply {
             function: Box::new(TypedExpr::new(TypedExprNode::Lambda {
                 param: TypedBinding {
+                    occurrence: Occurrence::mint(),
                     name: "x".into(),
                     ty: Type::infer(),
-                    user_annotation: Some(Type::Base(BaseType::String)),
+                    user_annotation: Some(Annotation::new(
+                        Type::Base(BaseType::String),
+                        Occurrence::mint(),
+                    )),
                     transparency: BindingTransparency::Transparent,
                 },
                 body: Box::new(Expr::var("x")),
@@ -4193,9 +4322,13 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = TypedExpr::new(TypedExprNode::Lambda {
             param: TypedBinding {
+                occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::infer(),
-                user_annotation: Some(Type::Base(BaseType::Int)),
+                user_annotation: Some(Annotation::new(
+                    Type::Base(BaseType::Int),
+                    Occurrence::mint(),
+                )),
                 transparency: BindingTransparency::Transparent,
             },
             body: Box::new(Expr::lit(Lit::Unit)),
@@ -4479,8 +4612,8 @@ mod tests {
     fn test_infer_record_literal() {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = Expr::new(TypedExprNode::Record(vec![
-            ("x".into(), Expr::lit(Lit::Int(1))),
-            ("y".into(), Expr::lit(Lit::String("hi".into()))),
+            RecordEntry::new("x", Occurrence::mint(), Expr::lit(Lit::Int(1))),
+            RecordEntry::new("y", Occurrence::mint(), Expr::lit(Lit::String("hi".into()))),
         ]));
         let ty = infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(
@@ -4536,6 +4669,7 @@ mod tests {
                 guard: Expr::lit(Lit::Bool(true)),
                 body: Expr::let_bind(
                     "x",
+                    Occurrence::mint(),
                     Expr::lit(Lit::Int(42)),
                     Expr::binop(
                         Expr::var("x"),
@@ -4607,6 +4741,7 @@ mod tests {
     fn test_check_fully_typed_ok_nested() {
         let lambda = Expr::new(TypedExprNode::Lambda {
             param: TypedBinding {
+                occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Base(BaseType::Int),
                 user_annotation: None,
@@ -4692,6 +4827,7 @@ mod tests {
         let arg = Expr::lit(Lit::Int(42)); // ty: Hole
         let func = Expr::new(TypedExprNode::Lambda {
             param: TypedBinding {
+                occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Hole,
                 user_annotation: None,
@@ -4746,6 +4882,7 @@ mod tests {
         // After removing CannotInferParam, collect_type_errors reports UnresolvedInfer.
         let expr = Expr::new(TypedExprNode::Lambda {
             param: TypedBinding {
+                occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Infer(var), // unsolved
                 user_annotation: None,
@@ -4816,8 +4953,8 @@ mod tests {
         // whole, singleton included.
         let mut expr = Expr::apply(
             Expr::new(TypedExprNode::Record(vec![
-                ("x".into(), Expr::lit(Lit::Int(42))),
-                ("y".into(), Expr::lit(Lit::String("hi".into()))),
+                RecordEntry::new("x", Occurrence::mint(), Expr::lit(Lit::Int(42))),
+                RecordEntry::new("y", Occurrence::mint(), Expr::lit(Lit::String("hi".into()))),
             ])),
             Expr::proj_field("x"),
         );
@@ -4907,7 +5044,12 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = Expr::apply(
             Expr::lit(Lit::Int(42)),
-            Expr::lambda("x", Type::Base(BaseType::Int), Expr::var("x")),
+            Expr::lambda(
+                "x",
+                Occurrence::mint(),
+                Type::Base(BaseType::Int),
+                Expr::var("x"),
+            ),
         );
         infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(typecheck(&expr), Ok(()));
@@ -5037,6 +5179,7 @@ mod tests {
         // domain is String — typecheck must detect this.
         let lambda = Expr::new(TypedExprNode::Lambda {
             param: TypedBinding {
+                occurrence: Occurrence::mint(),
                 name: "x".into(),
                 ty: Type::Base(BaseType::String),
                 user_annotation: None,
@@ -5073,7 +5216,12 @@ mod tests {
         let mut ctx = TypeInferenceContext::new();
         let mut expr = Expr::apply(
             Expr::lit(Lit::String("hello".into())),
-            Expr::lambda("s", Type::Base(BaseType::String), Expr::var("s")),
+            Expr::lambda(
+                "s",
+                Occurrence::mint(),
+                Type::Base(BaseType::String),
+                Expr::var("s"),
+            ),
         );
         infer(&mut expr, &mut ctx).unwrap();
         assert_eq!(typecheck(&expr), Ok(()));
@@ -5096,7 +5244,7 @@ mod tests {
             }),
             Expr::apply(Expr::var("p"), Expr::proj_index(1)),
         ]));
-        let mut expr = Expr::lambda("p", Type::infer(), body);
+        let mut expr = Expr::lambda("p", Occurrence::mint(), Type::infer(), body);
         let ty = infer(&mut expr, &mut ctx).unwrap();
         if let Type::Fun { domain, .. } = ty {
             match *domain {
@@ -5212,12 +5360,18 @@ mod tests {
         let feed = Type::feed(Type::UIntRange(3), Type::Base(BaseType::Int));
         let defer = Expr::new(TypedExprNode::Defer).with_ty(feed);
         let truth = Expr::lit(Lit::Bool(true)).with_ty(Type::Base(BaseType::Bool));
-        let predicate = Expr::let_bind("d", defer, truth).with_ty(Type::Base(BaseType::Bool));
+        let predicate = Expr::let_bind("d", Occurrence::mint(), defer, truth)
+            .with_ty(Type::Base(BaseType::Bool));
         let refined = Type::refined_one(
             Type::UIntRange(3),
             crate::ccl::ty::Refinement::born(Rc::new(predicate)),
         );
-        let tree = Expr::lambda("x", refined, Expr::lit(Lit::Int(1)).with_ty(int_lit_ty(1)));
+        let tree = Expr::lambda(
+            "x",
+            Occurrence::mint(),
+            refined,
+            Expr::lit(Lit::Int(1)).with_ty(int_lit_ty(1)),
+        );
         typecheck(&tree).expect("before planning, a predicate holding a `defer` is source form");
         let errs = typecheck_planned(&tree, &HashMap::new(), &InstanceTable::builtin())
             .expect_err("a feed handle in a predicate passed");

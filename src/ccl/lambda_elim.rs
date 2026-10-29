@@ -40,7 +40,8 @@
 //! | `add`/`sub`/… (and compares / logic) | `Builtin(BinOp(op))` for `op: BinOpKind` | binary scalar ops |
 //! | `neg`, `not_fn` | `Builtin(Neg)`, `Builtin(NotFn)` | unary scalar ops |
 
-use crate::ccl::Label;
+use crate::ccl::Occurrence;
+use crate::ccl::RecordEntry;
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{
@@ -260,12 +261,25 @@ struct ElimContext {
     /// bare product: one memo for the pass, so the occurrences of one filter that shared an
     /// `Rc` share its rebuild ([`crate::ccl::ccl_utils::PredMemo`]).
     pair_lifts: crate::ccl::ccl_utils::PredMemo<(Name, Type)>,
+    /// The binding occurrence of each lambda parameter being eliminated, by name: a binder
+    /// the pass builds to stand for one, as a lifted filter's `λ param`, copies it.
+    param_occurrences: std::collections::HashMap<Name, provenance::NodeId>,
 }
 
 impl ElimContext {
     fn new() -> Self {
         Self {
             pair_lifts: crate::ccl::ccl_utils::PredMemo::new(),
+            param_occurrences: std::collections::HashMap::new(),
+        }
+    }
+
+    /// An occurrence for a binder standing for the parameter `param`: a copy of the
+    /// parameter's, or a mint where the pass eliminates a parameter it has no lambda for.
+    fn param_occurrence(&self, param: &Name) -> Occurrence {
+        match self.param_occurrences.get(param) {
+            Some(&id) => Occurrence::copied_from(id),
+            None => Occurrence::mint(),
         }
     }
 
@@ -1613,7 +1627,12 @@ fn elim_lambda_impl(
                         let ty = on_element.ty.clone();
                         Expr::apply(
                             at(0, param_ty),
-                            Expr::lambda(param.clone(), param_ty.clone(), on_element),
+                            Expr::lambda(
+                                param.clone(),
+                                ctx.param_occurrence(param),
+                                param_ty.clone(),
+                                on_element,
+                            ),
                         )
                         .with_ty(ty)
                     } else {
@@ -1937,16 +1956,17 @@ fn elim_lambda_impl(
         // This keeps the same structural invariant: the Record node always has type
         // Record([..., Fun(D, Ti), ...]) and the Fun wrapper lives on the Apply/Zip node.
         TypedExprNode::Record(fields) => {
-            let elim_fields: Vec<(Label, Expr)> = fields
+            let elim_fields: Vec<RecordEntry> = fields
                 .into_iter()
-                .map(|(k, e)| {
-                    elim_lambda_kinded(ctx, param, param_ty, e, fun_kind.clone()).map(|r| (k, r))
+                .map(|entry| {
+                    elim_lambda_kinded(ctx, param, param_ty, entry.value, fun_kind.clone())
+                        .map(|value| RecordEntry { value, ..entry })
                 })
                 .collect::<Result<_, _>>()?;
             let inner_ty = Type::Record(
                 elim_fields
                     .iter()
-                    .map(|(k, e)| (k.clone(), e.ty.clone()))
+                    .map(|entry| (entry.label.clone(), entry.value.ty.clone()))
                     .collect(),
             );
             let inner_record = TypedExpr::new(TypedExprNode::Record(elim_fields)).with_ty(inner_ty);
@@ -1971,7 +1991,12 @@ fn elim_lambda_impl(
             bound_expr: def,
             body: let_body,
         } => {
-            let v = binding.name;
+            // The rebuilt `let` replaces this one, so its binder keeps the occurrence.
+            let crate::ccl::TypedBinding {
+                name: v,
+                occurrence: v_occurrence,
+                ..
+            } = binding;
             let new_def = elim_lambda_kinded(ctx, param, param_ty, *def, fun_kind.clone())?;
             // In the let body, each free occurrence of v is replaced by x ▷ v
             // (i.e. the renamed function v applied to the current argument x).
@@ -2013,7 +2038,7 @@ fn elim_lambda_impl(
             } else {
                 result_ty
             };
-            Ok(Expr::let_bind(v, new_def, new_body).with_ty(let_ty))
+            Ok(Expr::let_bind(v, v_occurrence, new_def, new_body).with_ty(let_ty))
         }
 
         // A nested recurrence inside a writer body — an inner loop's history, bound
@@ -2086,8 +2111,11 @@ fn elim_lambda_impl(
                 .iter()
                 .zip(defs)
                 .map(|((b, _), def)| {
+                    // The rebuilt group replaces the one it is built from, so each
+                    // binder keeps its occurrence, as each definition keeps its ids.
                     let binding = crate::ccl::TypedBinding {
                         name: b.name.clone(),
+                        occurrence: Occurrence::preserve(b.occurrence.id()),
                         ty: def.ty.clone(),
                         user_annotation: b.user_annotation.clone(),
                         transparency: b.transparency,
@@ -2256,7 +2284,11 @@ fn elim_lambda_impl(
         // type's representation, tagged by the constructor's name.
         ctor @ (TypedExprNode::VariantCtor { .. } | TypedExprNode::NominalCtor { .. }) => {
             let (tag, payload) = match ctor {
-                TypedExprNode::VariantCtor { tag, payload } => (tag, payload),
+                TypedExprNode::VariantCtor {
+                    tag_occurrence: _,
+                    tag,
+                    payload,
+                } => (tag, payload),
                 TypedExprNode::NominalCtor { ctor, payload, .. } => {
                     (crate::ccl::nominal::ctor_tag(&ctor), payload)
                 }
@@ -2587,15 +2619,17 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         // lattice via `cast`; the cast-wrapped-lambda arm below handles the
         // dependent case.)
         TypedExprNode::Lambda { param, body } => {
+            ctx.param_occurrences
+                .insert(param.name.clone(), param.occurrence.id());
             // Render the pre-elimination lambda only in debug builds — the string
             // feeds just the assert below. Built as a `throwaway` over an
-            // id-preserving body copy, so the render mints nothing: a node minted
+            // id-preserving copy, so the render mints nothing: a node minted
             // here would advance the global id counter in debug builds alone, and
             // every id the rest of the compile mints would differ from the release
             // one for the same program.
             #[cfg(debug_assertions)]
             let original = symbolic(&Expr::throwaway(TypedExprNode::Lambda {
-                param: param.clone(),
+                param: param.clone_preserving_ids(),
                 body: Box::new(body.clone_preserving_ids()),
             }));
             let mut result = elim_lambda_at(
@@ -3050,12 +3084,14 @@ mod tests {
         )
         .with_ty(int.clone());
         for fun_kind in [FunKind::Data(None), FunKind::Compute] {
-            let lambda = Expr::lambda("x", int.clone(), body.clone()).with_ty(Type::Fun {
-                name: None,
-                fun_kind: fun_kind.clone(),
-                domain: Box::new(int.clone()),
-                codomain: Box::new(int.clone()),
-            });
+            let lambda = Expr::lambda("x", Occurrence::mint(), int.clone(), body.clone()).with_ty(
+                Type::Fun {
+                    name: None,
+                    fun_kind: fun_kind.clone(),
+                    domain: Box::new(int.clone()),
+                    codomain: Box::new(int.clone()),
+                },
+            );
             let out = run(lambda).expect("elimination succeeds");
             let Type::Fun { fun_kind: got, .. } = &out.ty else {
                 panic!(
@@ -3144,7 +3180,7 @@ mod tests {
             Expr::proj_index(0).with_ty(fun_ty(param_ty.clone(), int_ty())),
         )
         .with_ty(int_ty());
-        let expr = Expr::lambda("x", param_ty, body);
+        let expr = Expr::lambda("x", Occurrence::mint(), param_ty, body);
         let result = run(expr).unwrap();
         assert_expr_eq(result, Expr::proj_index(0));
     }
@@ -3236,9 +3272,14 @@ mod tests {
     #[test]
     fn nested_lambda_uses_first() {
         // Typed: x: Int, y: Int; inner lambda type Int → Int
-        let inner = Expr::lambda("y", int_ty(), var("x").with_ty(int_ty()))
-            .with_ty(fun_ty(int_ty(), int_ty()));
-        let expr = Expr::lambda("x", int_ty(), inner);
+        let inner = Expr::lambda(
+            "y",
+            Occurrence::mint(),
+            int_ty(),
+            var("x").with_ty(int_ty()),
+        )
+        .with_ty(fun_ty(int_ty(), int_ty()));
+        let expr = Expr::lambda("x", Occurrence::mint(), int_ty(), inner);
         let result = run(expr).unwrap();
         assert_expr_eq(result, curry_at(Expr::proj_index(0), Type::Hole));
     }
@@ -3253,14 +3294,16 @@ mod tests {
         let param_ty = int_ty();
         let let_expr = Expr::let_bind(
             "v",
+            Occurrence::mint(),
             var("x").with_ty(param_ty.clone()),
             var("v").with_ty(int_ty()),
         )
         .with_ty(int_ty());
-        let expr = Expr::lambda("x", param_ty, let_expr);
+        let expr = Expr::lambda("x", Occurrence::mint(), param_ty, let_expr);
         let result = run(expr).unwrap();
         let expected = Expr::let_bind(
             "v",
+            Occurrence::mint(),
             id().with_ty(fun_ty(int_ty(), int_ty())),
             var("v").with_ty(fun_ty(int_ty(), int_ty())),
         )
@@ -3290,8 +3333,13 @@ mod tests {
         // (via `substitute_in_type`) into the predicate body.
         let refinement = Refinement::born(Rc::new(refinement_pred));
         let refined_param = Type::refined_one(int_ty(), refinement);
-        let expr = Expr::lambda("x", int_ty(), Expr::var("x").with_ty(int_ty()))
-            .with_ty(fun_ty(refined_param, int_ty()));
+        let expr = Expr::lambda(
+            "x",
+            Occurrence::mint(),
+            int_ty(),
+            Expr::var("x").with_ty(int_ty()),
+        )
+        .with_ty(fun_ty(refined_param, int_ty()));
 
         // Substitute "y" with a literal value in the expression
         let replacement = Expr::lit(Lit::Int(42)).with_ty(int_ty());
@@ -3324,7 +3372,7 @@ mod tests {
         let g_ty = fun_ty(int_ty(), int_ty());
         let if_ = app(var("i").with_ty(param_ty.clone()), var("f").with_ty(f_ty)).with_ty(int_ty());
         let body = app(if_, var("g").with_ty(g_ty)).with_ty(int_ty());
-        let expr = Expr::lambda("i", param_ty, body);
+        let expr = Expr::lambda("i", Occurrence::mint(), param_ty, body);
         let result = run(expr).unwrap();
         assert_expr_eq(result, compose(var("f"), var("g")));
     }
@@ -3359,7 +3407,7 @@ mod tests {
                 .with_ty(add_ty.clone()),
         )
         .with_ty(int_ty());
-        let expr = Expr::lambda("r", r_ty.clone(), body);
+        let expr = Expr::lambda("r", Occurrence::mint(), r_ty.clone(), body);
         let result = run(expr).unwrap();
         // Expected: zip(.0 ≫ c1, .1 ≫ c2) ≫ add
         let r_to_int = fun_ty(r_ty.clone(), int_ty());
@@ -3393,7 +3441,7 @@ mod tests {
         ])
         .with_ty(Type::Tuple(vec![int_ty(), int_ty()]));
         let body = app(tuple_body, var("f").with_ty(f_ty.clone())).with_ty(int_ty());
-        let expr = Expr::lambda("i", param_ty, body);
+        let expr = Expr::lambda("i", Occurrence::mint(), param_ty, body);
         let result = run(expr).unwrap();
         let int_to_int = fun_ty(int_ty(), int_ty());
         let tuple_ty = Type::Tuple(vec![int_ty(), int_ty()]);
@@ -3517,8 +3565,10 @@ mod tests {
         use crate::ccl::{Pattern, TypedBinding};
         Branch {
             pattern: Some(Pattern {
+                head_occurrence: Occurrence::mint(),
                 head: crate::ccl::PatternHead::Tag(tag.into()),
                 binding: TypedBinding {
+                    occurrence: Occurrence::mint(),
                     name: binder.into(),
                     ty: binder_ty,
                     user_annotation: None,
@@ -3541,7 +3591,8 @@ mod tests {
     /// itself: the pass-boundary walls in `compile_program` do, and a unit test
     /// calling `run` directly sits below them.
     fn elim_and_typecheck(binder: &str, binder_ty: Type, body: Expr) -> String {
-        let result = run(Expr::lambda(binder, binder_ty, body)).expect("lambda elimination");
+        let result = run(Expr::lambda(binder, Occurrence::mint(), binder_ty, body))
+            .expect("lambda elimination");
         assert_eq!(
             crate::ccl::infer::check_pre_channelize(&result),
             Ok(()),

@@ -943,7 +943,11 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             branches,
         } => emit_case(scrutinee.as_deref_mut(), branches, &label, ctx)?,
 
-        TypedExprNode::VariantCtor { tag, payload } => emit_variant_ctor(tag, payload, ctx)?,
+        TypedExprNode::VariantCtor {
+            tag_occurrence: _,
+            tag,
+            payload,
+        } => emit_variant_ctor(tag, payload, ctx)?,
 
         TypedExprNode::NominalCtor {
             decl,
@@ -1081,6 +1085,7 @@ fn check_slot_predicates(expr: &Expr, ctx: &mut CheckCtx) {
                 let mut bound = Expr::throwaway(TypedExprNode::Lambda {
                     param: TypedBinding {
                         name: Name::elem(),
+                        occurrence: crate::ccl::Occurrence::PLACEHOLDER,
                         ty: (**base).clone(),
                         user_annotation: None,
                         transparency: BindingTransparency::Transparent,
@@ -1259,6 +1264,7 @@ fn check_located_memoized(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Occurrence;
     use crate::ccl::{BinOpKind, CompareKind, Lit, TypedExpr};
     use std::rc::Rc;
 
@@ -1345,7 +1351,7 @@ mod tests {
             .with_ty(Type::fun(non_negative.clone(), prim(BaseType::Int)));
         let call = TypedExpr::apply(TypedExpr::var(a.clone()).with_ty(equals_a), f)
             .with_ty(prim(BaseType::Int));
-        let tree = TypedExpr::lambda(a, non_negative, call);
+        let tree = TypedExpr::lambda(a, Occurrence::mint(), non_negative, call);
 
         assert_eq!(check(&tree), Ok(()), "`__elem == a` entails `__elem >= 0`");
     }

@@ -320,8 +320,8 @@ where
             }
         }
         N::Record(fields) => {
-            for (_, c) in fields {
-                open(f, c);
+            for entry in fields {
+                open(f, &entry.value);
             }
         }
         N::ExprStmt { expr, body } => {
@@ -335,14 +335,28 @@ where
 
         // The write target is a *use* of the binder that introduced the defer
         // handle / mutable variable, so it resolves like any variable.
-        N::Feed { name, value } | N::Define { name, value } => {
+        N::Feed {
+            name_occurrence: _,
+            name,
+            value,
+        }
+        | N::Define {
+            name_occurrence: _,
+            name,
+            value,
+        } => {
             f(ScopedItem::VarRef(name));
             open(f, value);
         }
 
         // As above, plus the key: a keyed write's key is an ordinary expression
         // evaluated in the enclosing scope, so its free variables are uses too.
-        N::MutWrite { name, key, value } => {
+        N::MutWrite {
+            name_occurrence: _,
+            name,
+            key,
+            value,
+        } => {
             f(ScopedItem::VarRef(name));
             if let Some(k) = key {
                 open(f, k);
@@ -603,6 +617,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Occurrence;
+    use crate::ccl::RecordEntry;
     use crate::ccl::{
         Branch, Builtin, Generator, Lit, Pattern, ProjKey, Type, TypedBinding, TypedExprNode as N,
         WriterSite,
@@ -615,7 +631,7 @@ mod tests {
         TypedExpr::lit(Lit::Int(n))
     }
     fn bind(n: &str) -> TypedBinding {
-        TypedBinding::new_unannotated(n)
+        TypedBinding::new_unannotated(n, Occurrence::mint())
     }
     fn node(n: N) -> TypedExpr {
         TypedExpr::new(n)
@@ -643,12 +659,12 @@ mod tests {
                 var("r"),
             ),
             node(N::UnaryOp(crate::ccl::UnaryOpKind::Neg, Box::new(var("u")))),
-            TypedExpr::lambda("p", Type::Hole, var("p")),
+            TypedExpr::lambda("p", Occurrence::mint(), Type::Hole, var("p")),
             node(N::Aggregate {
                 input: Box::new(var("agg")),
                 kind: crate::ccl::AggregateKind::Sum,
             }),
-            TypedExpr::let_bind("l", var("bound"), var("l")),
+            TypedExpr::let_bind("l", Occurrence::mint(), var("bound"), var("l")),
             TypedExpr::let_type(
                 "Alias",
                 crate::ccl::module_type::AliasType::Type(Type::Hole),
@@ -666,13 +682,14 @@ mod tests {
             }),
             TypedExpr::mut_decl(
                 "md",
+                Occurrence::mint(),
                 Type::mutable(Type::Hole, Type::Hole),
                 var("seed"),
                 var("md"),
             ),
             node(N::List(vec![var("e0"), var("e1")])),
             case_with_two_branches(),
-            TypedExpr::variant_ctor("T", var("pl")),
+            TypedExpr::variant_ctor("T", Occurrence::mint(), var("pl")),
             TypedExpr::nominal_ctor(
                 crate::ccl::nominal::NominalDecl::declared(
                     "N".into(),
@@ -714,8 +731,8 @@ mod tests {
             }),
             TypedExpr::tuple(vec![var("t0"), var("t1")]),
             node(N::Record(vec![
-                ("a".into(), var("ra")),
-                ("b".into(), var("rb")),
+                RecordEntry::new("a", Occurrence::mint(), var("ra")),
+                RecordEntry::new("b", Occurrence::mint(), var("rb")),
             ])),
             node(N::Compose(vec![var("c0"), var("c1")])),
             TypedExpr::copair(vec![var("cp0"), var("cp1")]),
@@ -724,12 +741,14 @@ mod tests {
             node(N::Begin {
                 body: Box::new(var("bg")),
             }),
-            TypedExpr::feed("d", var("fv")),
+            TypedExpr::feed("d", Occurrence::mint(), var("fv")),
             node(N::Define {
+                name_occurrence: Occurrence::mint(),
                 name: Name::raw("d"),
                 value: Box::new(var("dv")),
             }),
             node(N::MutWrite {
+                name_occurrence: Occurrence::mint(),
                 name: Name::raw("m"),
                 key: None,
                 value: Box::new(var("mv")),
@@ -772,6 +791,7 @@ mod tests {
             branches: vec![
                 Branch {
                     pattern: Some(Pattern {
+                        head_occurrence: Occurrence::mint(),
                         head: crate::ccl::PatternHead::Tag("T".into()),
                         binding: bind("payload"),
                         empty_payload: false,
@@ -1089,12 +1109,22 @@ mod tests {
 
         // Let: `bound_expr` outside, `body` inside.
         assert_eq!(
-            binders_of(&TypedExpr::let_bind("l", var("a"), var("b"))),
+            binders_of(&TypedExpr::let_bind(
+                "l",
+                Occurrence::mint(),
+                var("a"),
+                var("b")
+            )),
             vec![Vec::<String>::new(), vec!["l".to_string()]],
         );
         // Lambda: the one child is under the param.
         assert_eq!(
-            binders_of(&TypedExpr::lambda("p", Type::Hole, var("p"))),
+            binders_of(&TypedExpr::lambda(
+                "p",
+                Occurrence::mint(),
+                Type::Hole,
+                var("p")
+            )),
             vec![vec!["p".to_string()]],
         );
         // For: `iter` outside, `body` under the target.
@@ -1142,7 +1172,7 @@ mod tests {
                 ScopedItem::Child { .. } => {}
             });
         };
-        record(&TypedExpr::feed("d", var("v")));
+        record(&TypedExpr::feed("d", Occurrence::mint(), var("v")));
         record(&transact_one_key_one_writer());
         assert_eq!(vars, vec!["d".to_string()]);
         assert_eq!(

@@ -73,6 +73,9 @@ pub struct InspectedProgram<'a> {
     /// ([`CompiledProgram::materialize_panes`]). Drives the `paneLinks` payload
     /// (shipped dense, self-edges included). Empty for a single-pane model.
     pane_maps: Vec<ProvenanceMap<NodeId, NodeId>>,
+    /// The names lowering resolved in types and module paths, which no pane's tree
+    /// holds ([`CompiledProgram::resolved_names`]). Empty for a single-pane model.
+    resolved_names: &'a [crate::ccl::lower::ResolvedName],
 }
 
 /// A pane's display label — its declared name, rendered for a pane header.
@@ -186,6 +189,7 @@ impl<'a> InspectedProgram<'a> {
             // Aligned with `panes.windows(2)` — `MaterializedPanes::pairs` is
             // already one shorter than its projections, in the same order.
             pane_maps: materialized.pairs.into_iter().map(|p| p.map).collect(),
+            resolved_names: &compiled.resolved_names,
         }
     }
 
@@ -219,6 +223,7 @@ impl<'a> InspectedProgram<'a> {
             sources,
             panes,
             pane_maps: Vec::new(),
+            resolved_names: &[],
         }
     }
 
@@ -262,7 +267,7 @@ impl<'a> InspectedProgram<'a> {
             .content
             .ir()
             .unwrap_or_else(|| unreachable!("{DEFINITIONS_PANE} is an IR pane"));
-        super::definitions::definitions(ir, &pane.projection, self.sources)
+        super::definitions::definitions(ir, &pane.projection, self.sources, self.resolved_names)
     }
 }
 

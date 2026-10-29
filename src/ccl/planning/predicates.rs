@@ -7,6 +7,7 @@
 //! [`crate::ccl::ccl_utils::bare_predicate_of_fn`] that the iterate/restrict and
 //! op-conversion lowering consume.
 
+use crate::ccl::Occurrence;
 use std::collections::HashSet;
 
 use super::*;
@@ -223,7 +224,7 @@ pub(crate) fn fn_of_bare_predicate(
     };
     // Only the *kind* is declared. The shape is whatever the η-expansion built, so a bare
     // predicate that is already function-valued keeps the codomain it has.
-    let lam = Expr::lambda(Name::elem(), base.clone(), bare.clone());
+    let lam = Expr::lambda(Name::elem(), Occurrence::mint(), base.clone(), bare.clone());
     let lam = match &lam.ty {
         Type::Fun {
             name,

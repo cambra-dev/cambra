@@ -213,7 +213,9 @@ fn is_causal_history_slot(history: &TypedExpr, live: &BTreeSet<Name>) -> bool {
             match &argument.node {
                 TypedExprNode::Record(fields) => {
                     !fields.is_empty()
-                        && fields.iter().all(|(_, e)| is_causal_history_slot(e, live))
+                        && fields
+                            .iter()
+                            .all(|entry| is_causal_history_slot(&entry.value, live))
                 }
                 TypedExprNode::Tuple(elts) => {
                     !elts.is_empty() && elts.iter().all(|e| is_causal_history_slot(e, live))
@@ -350,6 +352,8 @@ fn with_shadowed(live: &BTreeSet<Name>, names: &[Name], f: impl FnOnce(&BTreeSet
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Occurrence;
+    use crate::ccl::RecordEntry;
     use crate::ccl::{ArithmeticKind, BinOpKind, Expr, Lit, Type};
 
     fn int(n: i64) -> Expr {
@@ -379,7 +383,7 @@ mod tests {
     }
 
     fn binding(name: &str, def: Expr) -> (TypedBinding, Expr) {
-        (TypedBinding::new_unannotated(name), def)
+        (TypedBinding::new_unannotated(name, Occurrence::mint()), def)
     }
 
     /// The design's induction-recurrence shape:
@@ -389,6 +393,7 @@ mod tests {
     fn causal_self_recursion_is_ok() {
         let def = Expr::lambda(
             "r",
+            Occurrence::mint(),
             Type::Hole,
             add(
                 get_prev_seq(Expr::var("cnt"), Expr::var("r"), int(0)),
@@ -416,11 +421,13 @@ mod tests {
     fn two_binding_cycle_with_one_causal_edge_is_ok() {
         let balance = Expr::lambda(
             "t",
+            Occurrence::mint(),
             Type::Hole,
             get_prev_seq(Expr::var("incr_commits"), Expr::var("t"), int(0)),
         );
         let incr_commits = Expr::lambda(
             "r",
+            Occurrence::mint(),
             Type::Hole,
             add(Expr::apply(Expr::var("r"), Expr::var("balance")), int(1)),
         );
@@ -444,11 +451,13 @@ mod tests {
     fn get_prev_txn_two_binding_cycle_is_causal() {
         let balance = Expr::lambda(
             "t",
+            Occurrence::mint(),
             Type::Hole,
             get_prev_txn(Expr::var("incr_commits"), Expr::var("t"), int(0)),
         );
         let incr_commits = Expr::lambda(
             "r",
+            Occurrence::mint(),
             Type::Hole,
             add(Expr::apply(Expr::var("r"), Expr::var("balance")), int(1)),
         );
@@ -510,10 +519,11 @@ mod tests {
         // neither creates an edge.
         let f = Expr::lambda(
             "r",
+            Occurrence::mint(),
             Type::Hole,
             add(
                 Expr::apply(Expr::var("r"), Expr::var("ext")),
-                Expr::let_bind("a", int(1), Expr::var("a")),
+                Expr::let_bind("a", Occurrence::mint(), int(1), Expr::var("a")),
             ),
         );
         let bindings = vec![binding("f", f), binding("a", int(0))];
@@ -531,20 +541,27 @@ mod tests {
                 Expr::var(commits),
                 Expr::lambda(
                     "r",
+                    Occurrence::mint(),
                     Type::Hole,
-                    Expr::new(TypedExprNode::Record(vec![("time".into(), Expr::var("r"))])),
+                    Expr::new(TypedExprNode::Record(vec![RecordEntry::new(
+                        "time",
+                        Occurrence::mint(),
+                        Expr::var("r"),
+                    )])),
                 ),
             ])
         };
         let merged = Expr::copair(vec![view("c1"), view("c2")]);
         let balance = Expr::lambda(
             "t",
+            Occurrence::mint(),
             Type::Hole,
             get_prev_txn(merged, Expr::var("t"), int(0)),
         );
         let commit = |src: &str| {
             Expr::lambda(
                 "r",
+                Occurrence::mint(),
                 Type::Hole,
                 Expr::apply(
                     Expr::apply(Expr::var("r"), Expr::var(src)),
@@ -569,9 +586,19 @@ mod tests {
         // reads the group binding `x` itself.
         let view = Expr::compose(vec![
             Expr::var("c"),
-            Expr::lambda("r", Type::Hole, Expr::apply(Expr::var("r"), Expr::var("x"))),
+            Expr::lambda(
+                "r",
+                Occurrence::mint(),
+                Type::Hole,
+                Expr::apply(Expr::var("r"), Expr::var("x")),
+            ),
         ]);
-        let x = Expr::lambda("t", Type::Hole, get_prev_txn(view, Expr::var("t"), int(0)));
+        let x = Expr::lambda(
+            "t",
+            Occurrence::mint(),
+            Type::Hole,
+            get_prev_txn(view, Expr::var("t"), int(0)),
+        );
         let bindings = vec![binding("x", x), binding("c", int(0))];
         let errs = check_letrec_causal(&bindings).expect_err("map body reads x non-causal");
         assert_eq!(errs[0].cycle, vec![Name::raw("x")]);

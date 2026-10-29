@@ -4,6 +4,8 @@
 //! lambda whose body substitutes each named argument with a projection of the
 //! synthetic tuple — keeping the tree free of curried `Lambda` chains.
 
+use crate::ccl::Annotation;
+use crate::ccl::Occurrence;
 use std::collections::HashSet;
 
 use super::*;
@@ -79,10 +81,12 @@ fn feeds_name(body: &Expr, name: &Name) -> bool {
         TypedExprNode::Feed {
             name: target,
             value,
+            ..
         }
         | TypedExprNode::Define {
             name: target,
             value,
+            ..
         } => target == name || feeds_name(value, name),
         TypedExprNode::Let {
             binding,
@@ -225,7 +229,13 @@ pub(super) fn uncurry_params(
             Some(ty) => ty?,
             None => Type::Hole,
         };
-        let mut lam = Expr::lambda(params[0].name.as_str(), param_ty.clone(), body_expr);
+        let occurrence = ctx.occurrence_at(params[0].name_span);
+        let mut lam = Expr::lambda(
+            params[0].name.as_str(),
+            occurrence,
+            param_ty.clone(),
+            body_expr,
+        );
         if let TypedExprNode::Lambda { param, .. } = &mut lam.node {
             // A `Mut(…)` annotation is already *in* `param.ty` above, and
             // `emit_lambda` binds at `user_annotation.or(param.ty)`, so restating it
@@ -239,7 +249,10 @@ pub(super) fn uncurry_params(
                 // rejected at the call site. Without this the annotation was
                 // silently dropped and the param inferred purely from its body (so
                 // `def g(a: int)` with an identity body accepted any argument).
-                param.declare(lower_type_annotation(ann, ctx)?);
+                param.declare(Annotation::new(
+                    lower_type_annotation(ann, ctx)?,
+                    ctx.occurrence_at(ann.ty.span),
+                ));
             }
         }
         return Ok(lam);
@@ -262,16 +275,23 @@ pub(super) fn uncurry_params(
             // `lower_function_body`; a malformed `Feed(…)` surfaces here.
             let history_ty = history_param_type(param, ctx).transpose()?;
             let param_ty = history_ty.clone().unwrap_or(Type::Hole);
-            let mut lam = Expr::lambda(param.name.as_str(), param_ty.clone(), acc);
+            let occurrence = ctx.occurrence_at(param.name_span);
+            let mut lam = Expr::lambda(param.name.as_str(), occurrence, param_ty.clone(), acc);
             if let TypedExprNode::Lambda { param: p, .. } = &mut lam.node {
                 match (history_ty, &param.annotation) {
                     // The carrier is both the binder type and its declaration.
-                    (Some(_), _) => p.declare(param_ty),
+                    (Some(_), Some(ann)) => {
+                        p.declare(Annotation::new(param_ty, ctx.occurrence_at(ann.ty.span)))
+                    }
+                    (Some(_), None) => p.declare(Annotation::new(param_ty, Occurrence::mint())),
                     // Every other annotation is a checking-mode declaration, as in
                     // the single-parameter arm: attach it so `emit_lambda` binds the
                     // parameter at its declared type and an ill-typed argument is
                     // rejected at the call site.
-                    (None, Some(ann)) => p.declare(lower_type_annotation(ann, ctx)?),
+                    (None, Some(ann)) => p.declare(Annotation::new(
+                        lower_type_annotation(ann, ctx)?,
+                        ctx.occurrence_at(ann.ty.span),
+                    )),
                     (None, None) => {}
                 }
             }
@@ -289,7 +309,7 @@ pub(super) fn uncurry_params(
     // substitution's inserted `Var(outer_name)` never collides with an
     // inner binder.
     let tuple_name = ctx.fresh_tuple_arg();
-    let up = "lower.uncurry_proj";
+    let up = "lower.param_proj";
     let body_with_subs = params.iter().enumerate().fold(body_expr, |acc, (i, arg)| {
         // The projection plumbing is manufactured per *occurrence*: the
         // substitution deep-freshens this template's INTERIOR into every
@@ -324,7 +344,8 @@ pub(super) fn uncurry_params(
         // channelization follows (`src/ccl/design/lowering.md`, "Feed declarations and
         // operators — `x: Feed(V)` / `<<` / `<<=`").
         if feeds_name(&acc, &name) {
-            return ctx.tag_machinery(Expr::let_bind(name, proj, acc), site, up);
+            let occurrence = ctx.occurrence_at(site);
+            return ctx.tag_machinery(Expr::let_bind(name, occurrence, proj, acc), site, up);
         }
         substitute_param_in_body(acc, &name, &proj, up)
     });
@@ -339,11 +360,13 @@ pub(super) fn uncurry_params(
             None => Type::Hole,
         });
     }
-    let mut lam = Expr::lambda(&tuple_name, Type::Hole, body_with_subs);
+    // The tuple binder and its annotation are lowering's own: no one place in the
+    // source writes either, so both record where the function is tagged.
+    let mut lam = Expr::lambda(&tuple_name, Occurrence::mint(), Type::Hole, body_with_subs);
     if elem_anns.iter().any(|t| !matches!(t, Type::Hole))
         && let TypedExprNode::Lambda { param, .. } = &mut lam.node
     {
-        param.declare(Type::Tuple(elem_anns));
+        param.declare(Annotation::new(Type::Tuple(elem_anns), Occurrence::mint()));
     }
     Ok(lam)
 }
@@ -586,7 +609,7 @@ fn parameter_annotation_params(func: &Expr) -> HashSet<crate::ccl::ty::TypeParam
     let mut node = func;
     while let TypedExprNode::Lambda { param, body } = &node.node {
         collect(&param.ty, &mut out);
-        if let Some(annotation) = &param.user_annotation {
+        if let Some(annotation) = param.annotation_ty() {
             collect(annotation, &mut out);
         }
         node = body;
@@ -672,10 +695,13 @@ pub(super) fn lower_function_body(
     // tuple projections along with the rest of the body.
     let mut body_expr = body_result?;
     if let Some(output) = output {
-        let output_ty = lower_type_expr(output, ctx)?;
+        let output_ty = Annotation::new(
+            lower_type_expr(output, ctx)?,
+            ctx.occurrence_at(output.span),
+        );
         let ret = ctx.tag_image(Expr::var(OUTPUT_BINDER), output.span);
         body_expr = ctx.tag_image(
-            Expr::let_bind_annotated(OUTPUT_BINDER, body_expr, ret, output_ty),
+            Expr::let_bind_annotated(OUTPUT_BINDER, Occurrence::mint(), body_expr, ret, output_ty),
             output.span,
         );
     }

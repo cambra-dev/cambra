@@ -4,7 +4,7 @@
 // survive id churn in the compiler.
 
 import { isIrPane } from "../types";
-import type { IrNode, IrPane, OperatorPane, PaneEntry, Snapshot } from "../types";
+import type { IrChild, IrNode, IrPane, OperatorPane, PaneEntry, Snapshot } from "../types";
 import { validateSnapshot } from "../wireValidate";
 
 /**
@@ -69,7 +69,7 @@ export function operatorPaneById(snap: Snapshot, id: string): OperatorPane {
  * Use `allNodesWithPredicates` when the predicates are the point.
  */
 export function allNodes(pane: IrPane): IrNode[] {
-  return walk(pane, (child) => !child.predicate);
+  return walk(pane, (child) => child.kind !== "predicate");
 }
 
 /** Every node of a pane's table, predicate interiors included. */
@@ -80,7 +80,7 @@ export function allNodesWithPredicates(pane: IrPane): IrNode[] {
 // Pre-order from the pane's one root, following the child edges `follow` admits. The table is
 // a DAG — a shared predicate hangs off several parents — so a visited set keeps
 // each node to one appearance in the result.
-function walk(pane: IrPane, follow: (child: { predicate: boolean }) => boolean): IrNode[] {
+function walk(pane: IrPane, follow: (child: IrChild) => boolean): IrNode[] {
   const byId = new Map(pane.nodes.map((n) => [n.nodeId, n]));
   const out: IrNode[] = [];
   const seen = new Set<number>();

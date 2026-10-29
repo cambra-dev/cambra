@@ -48,8 +48,11 @@
 //!   exist, a field stays off the wire until something reads it.
 //! * `payloadKind` is `"program"`; `schema` is [`SCHEMA_VERSION`].
 
-use crate::ccl::Expr;
+use std::collections::HashMap;
+
+use crate::ccl::names::Uid;
 use crate::ccl::provenance::{NodeId, ProvenanceMap, SourceProjection};
+use crate::ccl::{Expr, Name, OccurrenceOf, PatternHead, Type};
 use crate::chl_parser::SourceMap;
 use crate::chl_parser::ast::Span;
 use crate::interpreter::operator_graph::{EdgeKind, EdgeRole, GraphNode, InputEdge, OperatorGraph};
@@ -269,28 +272,40 @@ pub struct IrNode {
     /// `src/inspector_model/design.md`, "Types on the wire".
     #[serde(rename = "type")]
     pub ty: String,
-    /// The node's children by id: the value children in positional order,
-    /// then every refinement predicate riding one of its type slots, each
-    /// marked [`predicate`](IrChild::predicate).
+    /// The node's children by id: the value children in positional order, then
+    /// each occurrence the node holds, then every refinement predicate riding one of
+    /// its type slots, each marked by its [`kind`](IrChild::kind).
     pub children: Vec<IrChild>,
 }
 
-/// One `{ id, predicate }` child of an [`IrNode`] — an edge into the pane's
-/// node table.
+/// One `{ id, kind }` child of an [`IrNode`] — an edge into the pane's node table.
 ///
 /// The edge carries no label. Children ship in order — value children under
-/// their positional index, then the parent's predicates — so the position in
-/// [`children`](IrNode::children) is the label a consumer would read, and
-/// [`predicate`](Self::predicate) is what it branches on.
+/// their positional index, then the occurrences the parent holds, then its
+/// predicates — so the position in [`children`](IrNode::children) is the label a
+/// consumer reads for a value child, and [`kind`](Self::kind) is what it branches on.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct IrChild {
     /// The child node's id — an entry of the same pane's
     /// [`nodes`](PaneEntry::nodes).
     pub id: u64,
-    /// Whether the child is a type-interior subtree: `true` for a refinement
-    /// predicate, `false` for a value child. See
-    /// `src/inspector_model/design.md`, "Predicates are nodes".
-    pub predicate: bool,
+    /// What the child is to its parent. See `src/inspector_model/design.md`, "An
+    /// occurrence on the wire".
+    pub kind: ChildKind,
+}
+
+/// What an [`IrChild`] is to the node that lists it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ChildKind {
+    /// A value child, at its positional index.
+    Value,
+    /// An occurrence the parent holds: a binding, applied, label, head or annotation
+    /// occurrence (`src/ccl/design/provenance.md`, "Name occurrences").
+    Occurrence,
+    /// A refinement predicate riding one of the parent's type slots
+    /// (`src/inspector_model/design.md`, "Predicates are nodes").
+    Predicate,
 }
 
 /// A node's rewrite tag — the
@@ -590,10 +605,80 @@ fn wire_edge(edge: &InputEdge) -> OperatorEdge {
     }
 }
 
+/// The node-table entry of an occurrence: a leaf labelled by what it is the
+/// occurrence of, at the occurrence's own attribution, typed as the name it locates
+/// (`src/inspector_model/design.md`, "An occurrence on the wire").
+fn occurrence_entry(
+    id: NodeId,
+    of: OccurrenceOf<'_>,
+    projection: &SourceProjection,
+    binders: &HashMap<Uid, String>,
+) -> IrNode {
+    let (label, ty) = match of {
+        OccurrenceOf::Binder(b) => (format!("Binder({})", b.name), b.ty.to_string()),
+        OccurrenceOf::Annotation(b) => (
+            "Annotation".to_string(),
+            b.annotation_ty().map(Type::to_string).unwrap_or_default(),
+        ),
+        // A use's type is its binder's, found by the uid the two share. A name with
+        // no binder in the tree, a run's member before linking, shows a hole.
+        OccurrenceOf::Use(name) => (
+            format!("Use({name})"),
+            match name {
+                Name::Unique { uid, .. } => binders.get(uid).cloned(),
+                _ => None,
+            }
+            .unwrap_or_else(|| Type::Hole.to_string()),
+        ),
+        OccurrenceOf::Label(entry) => (
+            format!("Label({})", entry.label),
+            entry.value.ty.to_string(),
+        ),
+        OccurrenceOf::Tag { tag, payload } => (format!("Label({tag})"), payload.ty.to_string()),
+        OccurrenceOf::Head(pattern) => {
+            let head = match &pattern.head {
+                PatternHead::Tag(tag) => tag.to_string(),
+                PatternHead::Constructor { ctor, .. } => ctor.to_string(),
+            };
+            (format!("Head({head})"), pattern.binding.ty.to_string())
+        }
+    };
+    let mut node = IrNode {
+        label,
+        node_id: id.as_u64(),
+        spans: Vec::new(),
+        rewritten: None,
+        ty,
+        children: Vec::new(),
+    };
+    if let Some(attr) = projection.get(&id) {
+        node.rewritten = rewrite_info(attr);
+        node.spans = wire_spans(&attr.spans);
+    }
+    node
+}
+
+/// Each binder's type in `tree`, by uid, rendered: the type an applied occurrence of
+/// it shows. The first binder of a uid stands, as `definitions` takes it.
+fn binder_types(tree: &Expr) -> HashMap<Uid, String> {
+    fn go(e: &Expr, out: &mut HashMap<Uid, String>) {
+        e.walk_binders(|b| {
+            if let Name::Unique { uid, .. } = &b.name {
+                out.entry(*uid).or_insert_with(|| b.ty.to_string());
+            }
+        });
+        e.walk_children(|c| go(c, out));
+    }
+    let mut out = HashMap::new();
+    go(tree, &mut out);
+    out
+}
+
 fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u64, Vec<IrNode>) {
     fn visit(
         expr: &Expr,
         projection: &SourceProjection,
+        binders: &HashMap<Uid, String>,
         visited: &mut std::collections::HashSet<NodeId>,
         out: &mut Vec<IrNode>,
     ) -> u64 {
@@ -623,17 +708,27 @@ fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u64, Vec<IrN
         let mut children = Vec::new();
         for child in expr.child_exprs() {
             children.push(IrChild {
-                id: visit(child, projection, visited, out),
-                predicate: false,
+                id: visit(child, projection, binders, visited, out),
+                kind: ChildKind::Value,
             });
         }
-        // Predicate subtrees come after the value children, so a value child's
-        // index in `children` is its positional index; `predicate` is what marks
+        // Occurrences and then predicate subtrees come after the value children, so
+        // a value child's index in `children` is its positional index; `kind` marks
         // the rest (see [`predicate_children`]).
+        expr.walk_occurrences(|occurrence, of| {
+            let id = occurrence.id();
+            if visited.insert(id) {
+                out.push(occurrence_entry(id, of, projection, binders));
+            }
+            children.push(IrChild {
+                id: id.as_u64(),
+                kind: ChildKind::Occurrence,
+            });
+        });
         for predicate in predicate_children(expr) {
             children.push(IrChild {
-                id: visit(predicate, projection, visited, out),
-                predicate: true,
+                id: visit(predicate, projection, binders, visited, out),
+                kind: ChildKind::Predicate,
             });
         }
         out[slot].children = children;
@@ -641,9 +736,10 @@ fn build_node_table(expr: &Expr, projection: &SourceProjection) -> (u64, Vec<IrN
         id.as_u64()
     }
 
+    let binders = binder_types(expr);
     let mut visited = std::collections::HashSet::new();
     let mut nodes = Vec::new();
-    let root = visit(expr, projection, &mut visited, &mut nodes);
+    let root = visit(expr, projection, &binders, &mut visited, &mut nodes);
     debug_assert_eq!(
         nodes.len(),
         visited.len(),
@@ -1127,6 +1223,17 @@ mod tests {
                         spans.dedup();
                         out.insert(id.as_u64(), spans);
                     }
+                    expr.walk_occurrences(|occurrence, _| {
+                        let id = occurrence.id();
+                        if seen.insert(id.as_u64())
+                            && let Some(attr) = projection.get(&id)
+                        {
+                            let mut spans = attr.spans.clone();
+                            spans.sort_by_key(|s| (s.start, s.end));
+                            spans.dedup();
+                            out.insert(id.as_u64(), spans);
+                        }
+                    });
                     expr.walk_children(|c| collect(c, projection, seen, out));
                     for predicate in predicate_children(expr) {
                         collect(predicate, projection, seen, out);
@@ -1179,13 +1286,17 @@ mod tests {
         for node in ir_nodes(pane) {
             assert!(!node.ty.is_empty(), "{} ships a type", node.label);
 
-            // The value children come first and the predicates follow, so a
-            // value child's index in `children` is its positional index and the
-            // marked ones are one contiguous tail.
-            let positional = node.children.iter().take_while(|c| !c.predicate).count();
+            // The value children come first, then the occurrences, then the
+            // predicates, so a value child's index in `children` is its positional
+            // index and each other kind is one contiguous run after it.
+            let kinds: Vec<ChildKind> = node.children.iter().map(|c| c.kind).collect();
             assert!(
-                node.children[positional..].iter().all(|c| c.predicate),
-                "{}'s predicate children are the tail",
+                kinds.is_sorted_by_key(|k| match k {
+                    ChildKind::Value => 0,
+                    ChildKind::Occurrence => 1,
+                    ChildKind::Predicate => 2,
+                }),
+                "{}'s children run value, occurrence, predicate; got {kinds:?}",
                 node.label
             );
         }
@@ -1210,8 +1321,8 @@ mod tests {
         // the filter sits in the `Cast`'s own type and in its target, and the
         // two slots reach one predicate node.
         let cast = node_named(pane, "Cast");
-        let marks: Vec<bool> = cast.children.iter().map(|c| c.predicate).collect();
-        assert_eq!(marks, [false, true]);
+        let marks: Vec<ChildKind> = cast.children.iter().map(|c| c.kind).collect();
+        assert_eq!(marks, [ChildKind::Value, ChildKind::Predicate]);
         let predicate = node_with_id(pane, cast.children[1].id);
         assert_ne!(
             predicate.node_id, cast.node_id,
@@ -1227,7 +1338,81 @@ mod tests {
         );
     }
 
-    /// Every child id, every operator input id, and every walk start of every
+    /// Each occurrence ships as a leaf entry labelled by its kind, typed as the name it
+    /// locates, under the node that holds it (`src/inspector_model/design.md`, "An
+    /// occurrence on the wire"). An annotation's ships only in `pre-inference`, the one
+    /// pane whose binders still hold their annotations.
+    #[test]
+    fn an_occurrence_ships_labelled_and_typed_under_its_holder() {
+        let code = indoc! {r#"
+            def f(p: Int) => Int:
+                p + 1
+            out: Feed(_)
+            r = (x=1)
+            v = `ok(5)
+            w = match v:
+                case `ok(n):
+                    n
+            out << f(r.x) + w
+            out
+        "#};
+        let payload = InspectedProgram::new(&compile(code)).build_payload("test");
+        let pane = |id: &str| {
+            payload
+                .panes
+                .iter()
+                .find(|p| p.id == id)
+                .unwrap_or_else(|| panic!("the payload ships {id}"))
+        };
+        let pre = pane("pre-inference");
+        let post = pane("post-inference");
+
+        for label in [
+            "Binder(p)",
+            "Binder(out)",
+            "Use(out)",
+            "Label(x)",
+            "Label(ok)",
+            "Head(ok)",
+            "Annotation",
+        ] {
+            let entry = node_named(pre, label);
+            assert!(entry.children.is_empty(), "{label} is a leaf");
+            let holders: Vec<&IrNode> = ir_nodes(pre)
+                .iter()
+                .filter(|n| {
+                    n.children
+                        .iter()
+                        .any(|c| c.id == entry.node_id && c.kind == ChildKind::Occurrence)
+                })
+                .collect();
+            assert_eq!(holders.len(), 1, "one node holds {label}");
+        }
+        assert!(
+            !ir_nodes(post).iter().any(|n| n.label == "Annotation"),
+            "inference clears the annotations that hold annotation occurrences"
+        );
+
+        // Typed as the name each locates, in a typed pane.
+        assert_eq!(node_named(post, "Binder(p)").ty, "Int");
+        assert_eq!(
+            node_named(post, "Use(out)").ty,
+            node_named(post, "Binder(out)").ty,
+            "a use is typed as its binder"
+        );
+        assert_eq!(
+            node_named(post, "Head(ok)").ty,
+            node_named(post, "Binder(n)").ty,
+            "a head is typed as its payload binding"
+        );
+        assert!(
+            node_named(post, "Label(x)").ty.starts_with("Int"),
+            "a label is typed as its value; got {}",
+            node_named(post, "Label(x)").ty
+        );
+    }
+
+    /// Every child id, every operator input id, and every walk start of every    /// Every child id, every operator input id, and every walk start of every
     /// pane names a node of that pane's own table. A dangling id is the failure
     /// the node table makes possible and a nested tree could not express.
     #[test]
@@ -1427,7 +1612,11 @@ mod tests {
                 };
                 for node in nodes {
                     let mut seen = HashSet::new();
-                    for child in node.children.iter().filter(|c| c.predicate) {
+                    for child in node
+                        .children
+                        .iter()
+                        .filter(|c| c.kind == ChildKind::Predicate)
+                    {
                         assert!(
                             seen.insert(child.id),
                             "{} in {} names predicate {} twice",
@@ -1478,7 +1667,11 @@ mod tests {
 
         let mut edges: HashMap<u64, usize> = HashMap::new();
         for node in ir_nodes(pane) {
-            for child in node.children.iter().filter(|c| c.predicate) {
+            for child in node
+                .children
+                .iter()
+                .filter(|c| c.kind == ChildKind::Predicate)
+            {
                 *edges.entry(child.id).or_default() += 1;
             }
         }

@@ -38,8 +38,8 @@ the checks and switches; enabling capture and asserting the absence of leaks are
 counter for binder `Uid`s. `TypedExpr` stores it inline. Provenance rows and source attribution
 are keyed by this identity; equal expression values may have different IDs.
 
-**Planned:** a `NodeId` also names a name's occurrence, the place the name is written
-([Name occurrences](#name-occurrences)).
+A `NodeId` also names a name's occurrence, the place the name is written ([Name
+occurrences](#name-occurrences)).
 
 `TypedExpr::PartialEq` compares `ty`, `node` and `user_annotation`, excluding `node_id`.
 `TypedExpr` has no `Hash` implementation. `NodeId` has `Hash` and `Ord` for keyed collections
@@ -75,8 +75,8 @@ separate from `Transact` even though both are implemented in `transact_phase`.
 predicates' own types. This is the ID domain used by expression-pane folds and source projections.
 `collect_main_tree_ids` excludes predicates and supports the narrower audit mode.
 
-**Planned:** every id walk reaches name occurrences through one enumeration
-([Walking the ids with occurrences](#walking-the-ids-with-occurrences)).
+Every id walk reaches name occurrences through one enumeration ([Walking the ids with
+occurrences](#walking-the-ids-with-occurrences)).
 
 `assert_unique_node_ids` checks the same two domains with different sharing rules:
 
@@ -183,12 +183,11 @@ for that checked tree, not for every intermediate tree built within the phase.
 
 ## Name occurrences
 
-**Planned.** Each name the source writes that a term holds in a field rather than as a node carries
-a `NodeId` of its own, an `Occurrence`, recorded at the span of the name as the source writes it. A
-binder's annotation carries one too, recorded at the span of the type expression it writes.
-Provenance mints, copies, enumerates, folds and gates an occurrence as it does an expression node's
-id, so a `NodeId` names an expression node or an occurrence. Nothing in provenance reads which of
-the two an id names.
+Each name the source writes that a term holds in a field rather than as a node carries a `NodeId` of
+its own, an `Occurrence`, recorded at the span of the name as the source writes it. A binder's
+annotation carries one too, recorded at the span of the type expression it writes. Provenance mints,
+copies, enumerates, folds and gates an occurrence as it does an expression node's id, so a `NodeId`
+names an expression node or an occurrence. Nothing in provenance reads which of the two an id names.
 
 A name appears in a term in seven ways, and the first four carry an `Occurrence`:
 
@@ -200,7 +199,7 @@ A name appears in a term in seven ways, and the first four carry an `Occurrence`
 | **head occurrence**: the tag or constructor a `match` arm matches | `ok` in `` case `ok(v) ``, `rect` in `case Shape::rect(w, h)` | `Pattern.head_occurrence` | an `Occurrence` |
 | applied occurrence held as a node | `g` in `p + g`, `Shape::rect` in `Shape::rect(1, 2)` | a `Var` | the `Var`'s own `NodeId` |
 | field or method name | `x` in `p.x`, `m` in `v.m(a)` | a `Proj` or `Method`, tagged at the name | the node's own `NodeId` |
-| substituted parameter or field: a use of a name lowering binds to no binder | `q` in `def f(p, q): q`, `w` in `case Shape::rect(w, h): w` | a projection tagged `lower.param_proj` | the projection's own `NodeId` |
+| substituted parameter or field: a use of a name lowering binds to no binder | `q` in `def f(p, q): q`, `w` in `case Shape::rect(w, h): w`, `a` in `[a for (a, b) in ps]` | a projection tagged `lower.param_proj`, or `lower.comprehension_pattern` for a comprehension's pattern binder | the projection's own `NodeId` |
 
 The **annotation occurrence** is the fifth kind of `Occurrence`: `String` in `x: String = 5`, held
 in `Annotation.occurrence` inside `TypedBinding.user_annotation`. In this doc, "an occurrence" means
@@ -321,13 +320,12 @@ the pattern's `PatternHead::Constructor` reaches through its `decl`.
 
 | Where | What the occurrence gets |
 |---|---|
-| Lowering, a binder the source writes | A `LoweringStep::Leaf` at the name's span, labelled `lower.image`. The binder helpers (`let_bind*`, `lambda`, `for_loop`, `mut_decl`, `AssignmentBindings`, `PrefixStmt::Bind`) take the name with its span in place of a `String`. |
-| Lowering, an applied occurrence, a label, a tag, a pattern head or an annotation | A `LoweringStep::Leaf` at the span the source writes it at, labelled `lower.image`. |
-| Lowering, a binder the source does not write | A `tag_machinery` leaf at the span its node is tagged with: `__arg_tuple_N`, `__result_N`, the group-by and set binders, `OUTPUT_BINDER`, a constructor's argument, an absent payload. |
+| Lowering, a name the source writes: a binder, an applied occurrence, a label, a tag, a pattern head or an annotation | A `LoweringStep::Leaf` at the span the source writes it at, labelled `lower.image`, from `LoweringContext::occurrence_at`. `AssignmentBindings` and `PrefixStmt::Bind` carry each binder's span to the site that builds its node. |
+| Lowering, a binder or an annotation the source does not write | The leaf of the tag that records its holding node (`tag_source`, `tag_image`, `tag_machinery`, `tag_predicate`), at that tag's span and label, unless the occurrence is already recorded: `__arg_tuple_N`, `__result_N`, the group-by and set binders, `OUTPUT_BINDER`, a constructor's argument, an absent payload, a `def`'s polymorphic annotation, the members and checks a module's parameters bind, the element a `for` or comprehension pattern binder takes apart, the name `_` binds. |
 | `uniquify` | Nothing new. It renames binders in place, so every occurrence survives, and mints none. |
 | A copy of a subtree | A fresh id and a copy row, from `Occurrence::clone`. `subst`'s transport, monomorphization and inlining need no change. |
 | A binder a pass makes | A mint under the open recording, which becomes its parent: `__anf_N`, the reads `mut_read` names, `mut_elim`'s history and writer binders. |
-| A binder a pass makes to stand for a source binder | A copy of the source binder's occurrence through `copy_id`, so it resolves to the written name rather than to the recording's node. |
+| A binder a pass makes to stand for a source binder | A copy of the source binder's occurrence, by `Occurrence::clone` or `Occurrence::copied_from`, so it resolves to the written name rather than to the recording's node. |
 | A throwaway (`Expr::throwaway`, `mem::take`) | `NodeId::PLACEHOLDER`, which the recorder ignores. |
 
 The construction helpers outside lowering (`Expr::lambda`, `let_bind`, `mut_decl`,
@@ -342,17 +340,30 @@ A binder that stands for a source binder copies that binder's occurrence:
 - `comprehension`'s `per_element_lambda` builds `λ target` twice per generator, in the main tree and
   in the loop-join predicate. One keeps the generator's occurrence and the other copies it.
 - Each `channelize` companion lambda copies the original lambda's occurrence, and
-  `mono.coalesce_let`'s per-specialization `let`s copy the generalized binder's.
-- `mut_elim`'s final-value binder (`Name::fresh_like(&acc.name)`) copies the `MutDecl` binder's
-  occurrence, which `AccumulatorVariable` carries. `channelize_cluster` keeps the defer binders'
-  occurrences with their names, and `normalize_bare_write` receives a `MutWrite`'s
-  `name_occurrence` with its name.
+  `mono.coalesce_let`'s per-specialization `let`s copy the generalized binder's. The `let` a defer
+  lift or a defer collapse builds copies the outer binder's.
+- `mut_elim`'s final-value binder (`Name::fresh_like(&acc.name)`) copies the applied occurrence of
+  the variable's first write, which `AccumulatorVariable` carries: the variable's `MutDecl` stands
+  outside the loop the pass rewrites. `channelize_cluster` keeps the defer binders' occurrences with
+  their names, and `normalize_bare_write` gives a `MutWrite`'s `name_occurrence` to the shadowing
+  binder it builds.
+- `transact_phase`'s history binding and the rebind of a key's as-of read copy the occurrence of the
+  key's declaration, which `MutVarDecl` carries.
+- `lambda_elim`'s rebuilt `LetRec` group and rebuilt `let` replace what they are built from, so each
+  binder keeps its occurrence. The `λ param` a filter lifted onto a pair binds copies the eliminated
+  parameter's occurrence, which `ElimContext` holds by name.
+- `feed_nest`'s `read_level` keeps the loop binder it rebuilds a level from. `mut_elim`'s
+  accumulator-free `with begin():` paths build `iter ≫ (λ target → …)` with a copy of the `For`
+  target's occurrence, and move each feed's `name_occurrence` onto the feed they rebuild.
+- `transact_phase`'s as-of reply `λ read → …` copies the occurrence of the `let` binder its
+  parameter replaces, which `BoundRead` carries.
 
 `transact_phase`'s `walk_spine` clones store bindings before the `transact.store` recording opens,
 and `emit_group_member` clones a group member's binder only to write it back. Neither places a copy
-beside its source, so both are preserving clones. Lowering's `MintedTerm::copy` copies group-by
-terms with no `copy_frame`, and `tag_predicate`'s sweep explains those copies: it records the
-occurrences it reaches as well as the expression ids.
+beside its source, so both copy through `TypedBinding::clone_preserving_ids`. Lowering's
+`MintedTerm::copy` copies group-by terms with no `copy_frame`. `tag_predicate`'s sweep attributes
+the copied expression nodes, and `copy` records each copied occurrence as a lowering copy of the
+term's, so the `x` of a key `\x -> x.k` resolves to its name in the copy too.
 
 `PayloadPattern::Named` holds the span of a `` case `tag(v) `` payload's name, so the payload's
 binder records at its name like any other binder the source writes.
@@ -371,10 +382,10 @@ key predicate holds `λ x → x`.
 | Walk | Route |
 |---|---|
 | `collect_tree_ids` | The tree-level walk, with predicates. It is the domain of the fold, of every pane's id set and deaths, of the lowering projection and of the leak gate, so each covers occurrences through it. |
-| `collect_main_tree_ids`, `duplicate_node_ids`, the placeholder check in `assert_unique_node_ids` | The tree-level walk, without predicates. |
+| `collect_main_tree_ids`, `duplicate_node_ids`, the placeholder check in `assert_unique_node_ids` | The tree-level walk, without predicates. `duplicate_node_ids` walks a node's id and its occurrences apart, so it names a repeated occurrence as one. |
 | `predicate_id_collisions`, `uniquify`'s `distinct_predicate_terms` | `for_each_own_id` within each term, under their own `Rc` dedup. |
 | `uniquify::collect_node_ids` | The tree-level walk, keeping its `LetType` skip. |
-| `enclosing`, `context.rs`'s fallback for `traced` | `for_each_own_id` per node, so an occurrence's enclosing node is the node that holds it. A blamed occurrence resolves through the projection first, so an annotation mismatch reports at the annotation. |
+| `enclosing`, `context.rs`'s fallback for `traced` | Each node's own id and its `walk_occurrences`, so an occurrence's enclosing node is the node that holds it. A blamed occurrence resolves through the projection first, so an annotation mismatch reports at the annotation. |
 | `copied_nodes` (monomorphization's pairing of a clone with its definition) | The two nodes' `for_each_own_id` sequences, zipped. |
 | `build_node_table` | Ships each occurrence as an entry of the pane's node table, a child of the node that holds it ([An occurrence on the wire](../../inspector_model/design.md#an-occurrence-on-the-wire)). |
 
@@ -391,20 +402,35 @@ The existing checks cover occurrences once the walks reach them. An unrecorded o
 `Unrecorded`, a copy no row explains is `DanglingParent`, and two binders on one id fail
 `assert_unique_node_ids` at every boundary.
 
-One check is new, because none of the existing ones can tell a carried occurrence from a fresh
-mint. At every retained pane, each occurrence whose name has a source spelling resolves through the
-pane's projection to a span whose text is that spelling. A name's source spelling is
+One check is new, because none of the existing ones can tell a carried occurrence from a fresh mint.
+It is `occurrence_spelling_failures` in `src/ccl/panes.rs`, which
+`every_occurrence_resolves_to_its_spelling` runs over the pipeline corpus and
+`every_occurrence_of_a_rebuilt_binder_resolves_to_its_spelling` over the program shapes whose
+binders a pass rebuilds and the corpus does not hold. At every retained IR pane, refinement
+predicates included, each binding or applied occurrence whose name has a source spelling resolves
+through the pane's projection to a span whose text is that spelling. A name's source spelling is
 `Name::source_spelling`, read through the source `Name` that a `SyntheticKind::Mono` carries. A name
 with no source spelling, such as the `__result_N` a loop's `feed` names, is not checked. An
 associated `def`'s binder and a constructor's binder are `N::f` while the source writes `f`, so the
 check compares the part after `N::`. A binder minted under a recording where it should have copied
 its source binder's occurrence resolves to the recording node's span, and the check reports it.
 
+A name lowering declares for itself is not checked, nor are its uses: `N::extract`, the
+single-constructor form's `N::new`, `Option::is_none`, and the head of a `case` lowering builds for
+one of them. The source writes none of these names, so each is recorded at its holding node's tag,
+under a label other than `lower.image`. The check reads that label off the `pre-inference`
+projection and exempts the binder's `Uid` in every pane. A name the source writes and a lowering
+site records through `tag_image` instead of `occurrence_at` keeps the `lower.image` label, so the
+check still reports it.
+
 A label occurrence and a tag's occurrence compare the `Label`'s name, and a head occurrence the
-tag's name or the constructor's name. An annotation occurrence has no spelling to compare: lowering
-substitutes an alias by the type it names, so `Annotation.ty` does not render as the text the source
-wrote. At `pre-inference`, the one pane that holds annotation occurrences, each one's row must have
-`via` `Lower`: lowering minted it, and no pass between lowering and inference copies or rebuilds an
+tag's name or the constructor's name, at `pre-inference` only. A pass builds records and variants of
+its own, `writes`, `` `commit `` and one field per stored variable among them, and nothing marks a
+label the compiler writes apart from a source label a pass re-minted; at `pre-inference` every label
+is lowering's. An annotation occurrence has no spelling to compare: lowering substitutes an alias by
+the type it names, so `Annotation.ty` does not render as the text the source wrote. At
+`pre-inference`, the one pane that holds annotation occurrences, each one's row must have `via`
+`Lower`: lowering minted it, and no pass between lowering and inference copies or rebuilds an
 annotated binder. A re-mint under a later recording carries that recording's phase, and the check
 reports it.
 
@@ -970,8 +996,8 @@ The wire therefore does not distinguish ancestry from blame. Endpoint membership
 producer tests and payload validation. Predicate interiors are node-table entries and relation
 endpoints, following the [ID traversal contract](#walking-the-ids).
 
-**Planned:** name occurrences are node-table entries and relation endpoints too
-([Name occurrences](#name-occurrences)).
+Name occurrences are node-table entries and relation endpoints too ([Name
+occurrences](#name-occurrences)).
 
 The payload's `meta.schema` belongs to the inspector protocol. The CCL layer supplies identities,
 attributions and relations without depending on that version number.

@@ -135,6 +135,11 @@ parameter declaration span from the substitution template. A definition lookup c
 distinguish the use site from the declaration. The test
 `a_substituted_parameter_carries_occurrence_and_declaration_spans` checks both spans.
 
+`bind_parameters` substitutes the named fields of a constructor pattern of several parameters the
+same way: `w` in `case Shape::rect(w, h): w` becomes a projection of the arm's payload binder. Both
+tag the template `lower.param_proj` at the name the parameter or field declares, which is the label
+a definition lookup identifies a substituted projection by.
+
 Replacing each parameter with an inner `let p = __arg_tuple_0.0` would introduce `Let` nodes
 that lambda elimination lifts to function-valued bindings. The resulting `zip(.0, .1)`-shaped
 morphisms need reductions that simplification does not implement. Direct projection substitution

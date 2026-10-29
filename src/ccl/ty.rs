@@ -4879,11 +4879,13 @@ fn eq_term_modulo_ty_slots_go(
         }
         (
             N::MutWrite {
+                name_occurrence: _,
                 name: n1,
                 key: k1,
                 value: v1,
             },
             N::MutWrite {
+                name_occurrence: _,
                 name: n2,
                 key: k2,
                 value: v2,
@@ -4946,10 +4948,12 @@ fn eq_term_modulo_ty_slots_go(
         }
         (
             N::VariantCtor {
+                tag_occurrence: _,
                 tag: t1,
                 payload: p1,
             },
             N::VariantCtor {
+                tag_occurrence: _,
                 tag: t2,
                 payload: p2,
             },
@@ -4989,8 +4993,8 @@ fn eq_term_modulo_ty_slots_go(
         }
         (N::Record(f1), N::Record(f2)) => {
             f1.len() == f2.len()
-                && f1.iter().zip(f2).all(|((n1, e1), (n2, e2))| {
-                    n1 == n2 && eq_term_modulo_ty_slots_go(e1, e2, pairs)
+                && f1.iter().zip(f2).all(|(x, y)| {
+                    x.label == y.label && eq_term_modulo_ty_slots_go(&x.value, &y.value, pairs)
                 })
         }
         (N::ExprStmt { expr: e1, body: b1 }, N::ExprStmt { expr: e2, body: b2 }) => {
@@ -4998,20 +5002,24 @@ fn eq_term_modulo_ty_slots_go(
         }
         (
             N::Feed {
+                name_occurrence: _,
                 name: n1,
                 value: v1,
             },
             N::Feed {
+                name_occurrence: _,
                 name: n2,
                 value: v2,
             },
         )
         | (
             N::Define {
+                name_occurrence: _,
                 name: n1,
                 value: v1,
             },
             N::Define {
+                name_occurrence: _,
                 name: n2,
                 value: v2,
             },
@@ -5625,6 +5633,8 @@ impl From<Refinement> for RefinementSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Annotation;
+    use crate::ccl::Occurrence;
 
     #[test]
     fn uint_range_display_uses_exclusive_length() {
@@ -5782,16 +5792,18 @@ mod tests {
                 TypedExpr::lit(Lit::Int(1)),
             );
             match form {
-                0 => TypedExpr::lambda(b, Type::Base(BaseType::Int), cmp),
-                1 => TypedExpr::let_bind(b, TypedExpr::lit(Lit::Int(1)), cmp),
+                0 => TypedExpr::lambda(b, Occurrence::mint(), Type::Base(BaseType::Int), cmp),
+                1 => TypedExpr::let_bind(b, Occurrence::mint(), TypedExpr::lit(Lit::Int(1)), cmp),
                 _ => TypedExpr::match_expr(
                     TypedExpr::lit(Lit::Unit),
                     vec![crate::ccl::Branch {
                         pattern: Some(crate::ccl::Pattern {
+                            head_occurrence: Occurrence::mint(),
                             head: crate::ccl::PatternHead::Tag("some".into()),
                             binding: crate::ccl::TypedBinding::new_annotated(
                                 b,
-                                Type::Base(BaseType::Int),
+                                Occurrence::mint(),
+                                Annotation::new(Type::Base(BaseType::Int), Occurrence::mint()),
                             ),
                             empty_payload: false,
                         }),
@@ -5818,13 +5830,16 @@ mod tests {
             let (acc, item) = (Name::raw(acc), Name::raw(item));
             TypedExpr::mut_decl(
                 acc.clone(),
+                Occurrence::mint(),
                 Type::mutable(Type::Hole, Type::Base(BaseType::Int)),
                 TypedExpr::lit(Lit::Int(0)),
                 TypedExpr::for_loop(
                     item.clone(),
+                    Occurrence::mint(),
                     TypedExpr::var(Name::raw(source)),
                     TypedExpr::mut_write(
                         acc.clone(),
+                        Occurrence::mint(),
                         TypedExpr::binop(
                             TypedExpr::var(acc),
                             BinOpKind::Arithmetic(crate::ccl::ops::ArithmeticKind::Add),
@@ -5861,6 +5876,7 @@ mod tests {
             let (acc, item) = (Name::raw(acc), Name::raw(item));
             TypedExpr::mut_decl(
                 acc.clone(),
+                Occurrence::mint(),
                 Type::history(
                     Type::Hole,
                     Type::Base(BaseType::Int),
@@ -5869,9 +5885,11 @@ mod tests {
                 TypedExpr::lit(Lit::Int(0)),
                 TypedExpr::begin(TypedExpr::for_loop(
                     item.clone(),
+                    Occurrence::mint(),
                     TypedExpr::var(Name::raw("xs")),
                     TypedExpr::mut_write_keyed(
                         acc,
+                        Occurrence::mint(),
                         TypedExpr::lit(Lit::Int(key)),
                         TypedExpr::var(item),
                     ),
@@ -5903,8 +5921,13 @@ mod tests {
     fn a_statement_shape_in_a_predicate_is_reported_at_the_boundary() {
         let offending = TypedExpr::for_loop(
             Name::raw("x"),
+            Occurrence::mint(),
             TypedExpr::var(Name::raw("xs")),
-            TypedExpr::mut_write(Name::raw("acc"), TypedExpr::lit(Lit::Int(1))),
+            TypedExpr::mut_write(
+                Name::raw("acc"),
+                Occurrence::mint(),
+                TypedExpr::lit(Lit::Int(1)),
+            ),
         );
         let _ = Refinement::born(Rc::new(offending));
     }
@@ -5919,8 +5942,13 @@ mod tests {
     fn a_statement_shape_under_a_cast_target_is_reported_too() {
         let offending = Rc::new(TypedExpr::for_loop(
             Name::raw("x"),
+            Occurrence::mint(),
             TypedExpr::var(Name::raw("xs")),
-            TypedExpr::mut_write(Name::raw("acc"), TypedExpr::lit(Lit::Int(1))),
+            TypedExpr::mut_write(
+                Name::raw("acc"),
+                Occurrence::mint(),
+                TypedExpr::lit(Lit::Int(1)),
+            ),
         ));
         let target = Type::Fun {
             name: None,
@@ -5946,9 +5974,11 @@ mod tests {
             let int = || Type::Base(BaseType::Int);
             TypedExpr::lambda(
                 Name::raw(outer),
+                Occurrence::mint(),
                 int(),
                 TypedExpr::lambda(
                     Name::raw(inner),
+                    Occurrence::mint(),
                     int(),
                     TypedExpr::var(Name::raw(referenced)),
                 ),
@@ -5975,6 +6005,7 @@ mod tests {
         let refinement = |free: &str| {
             TypedExpr::lambda(
                 Name::raw("p"),
+                Occurrence::mint(),
                 Type::Base(BaseType::Int),
                 TypedExpr::binop(
                     TypedExpr::var(Name::raw("p")),
@@ -6010,9 +6041,18 @@ mod tests {
                 TypedExpr::lit(Lit::Int(1)),
             )
         };
-        let binds_it = TypedExpr::lambda(Name::raw("p"), Type::Base(BaseType::Int), gt_one("p"));
-        let leaves_it_free =
-            TypedExpr::lambda(Name::raw("q"), Type::Base(BaseType::Int), gt_one("p"));
+        let binds_it = TypedExpr::lambda(
+            Name::raw("p"),
+            Occurrence::mint(),
+            Type::Base(BaseType::Int),
+            gt_one("p"),
+        );
+        let leaves_it_free = TypedExpr::lambda(
+            Name::raw("q"),
+            Occurrence::mint(),
+            Type::Base(BaseType::Int),
+            gt_one("p"),
+        );
         assert!(
             !eq_term_modulo_ty_slots(&binds_it, &leaves_it_free),
             "a bound reference and a free one of the same spelling are two restrictions"

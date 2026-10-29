@@ -11,6 +11,7 @@
 //! `src/ccl/design/type-inference.md`,
 //! "Sharing is an invariant, not an optimization detail".
 
+use cambra::ccl::Occurrence;
 use cambra::ccl::ccl_utils::{distinct_predicate_rcs, reachable_refinements};
 use cambra::ccl::comprehension;
 use cambra::ccl::context::{GlobalContext, compile_program};
@@ -223,7 +224,8 @@ fn metric_counts_predicate_on_cast_target() {
 /// traversed — so the node type is cleared to isolate the binder slot.
 #[test]
 fn metric_counts_predicate_on_lambda_param_slot() {
-    let expr = Expr::lambda("x", refined_int(), Expr::var("x")).with_ty(Type::Hole);
+    let expr =
+        Expr::lambda("x", Occurrence::mint(), refined_int(), Expr::var("x")).with_ty(Type::Hole);
     assert_eq!(distinct_predicate_rcs(&expr), 1);
 }
 
@@ -234,6 +236,7 @@ fn metric_counts_predicate_on_lambda_param_slot() {
 fn metric_counts_predicate_on_let_binding_slot() {
     let mut expr = Expr::let_bind(
         "x",
+        Occurrence::mint(),
         Expr::lit(Lit::Int(1)).with_ty(refined_int()),
         Expr::var("x"),
     );

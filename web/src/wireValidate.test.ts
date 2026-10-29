@@ -243,8 +243,8 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     // ships.
     const bad = minimalSuccess();
     paneNodes(bad)[0].children = [
-      { id: 0, predicate: true },
-      { id: 0, predicate: true },
+      { id: 0, kind: "predicate" },
+      { id: 0, kind: "predicate" },
     ];
     expect(() => validateSnapshot(bad)).toThrow(
       /nodes\[0\]\.children\[1\]\.id.*not already named by this node/,
@@ -281,7 +281,7 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
 
   it("throws when a child edge names an id the pane's table does not hold", () => {
     const bad = minimalSuccess();
-    paneNodes(bad)[0].children = [{ id: 99, predicate: false }];
+    paneNodes(bad)[0].children = [{ id: 99, kind: "value" }];
     expect(() => validateSnapshot(bad)).toThrow(
       /panes\[0\]\.nodes\[0\]\.children\[0\]\.id.*present in this pane/,
     );
@@ -381,12 +381,39 @@ describe("validateSnapshot: rejects malformed payloads with a path", () => {
     );
   });
 
-  it("throws when a child edge carries no `predicate` flag", () => {
+  it("throws when a child edge carries no `kind`", () => {
     const bad = minimalSuccess();
     paneNodes(bad)[0].children = [{ id: 0 }];
     expect(() => validateSnapshot(bad)).toThrow(
-      /panes\[0\]\.nodes\[0\]\.children\[0\]\.predicate/,
+      /panes\[0\]\.nodes\[0\]\.children\[0\]\.kind/,
     );
+  });
+
+  it("throws when two edges name one occurrence", () => {
+    const bad = minimalSuccess();
+    const nodes = paneNodes(bad);
+    const leaf = { ...nodes[0], nodeId: 1000, label: "Binder(x)", children: [] };
+    nodes.push(leaf);
+    nodes[0].children = [
+      { id: 1000, kind: "occurrence" },
+      { id: 1000, kind: "occurrence" },
+    ];
+    expect(() => validateSnapshot(bad)).toThrow(/an occurrence named by one child edge/);
+  });
+
+  it("throws when an occurrence has children", () => {
+    const bad = minimalSuccess();
+    const nodes = paneNodes(bad);
+    const leaf = { ...nodes[0], nodeId: 1000, label: "Binder(x)", children: [{ id: 0, kind: "value" }] };
+    nodes.push(leaf);
+    nodes[0].children = [{ id: 1000, kind: "occurrence" }];
+    expect(() => validateSnapshot(bad)).toThrow(/no children on an occurrence/);
+  });
+
+  it("throws on a child kind outside value, occurrence and predicate", () => {
+    const bad = minimalSuccess();
+    paneNodes(bad)[0].children = [{ id: 0, kind: "binder" }];
+    expect(() => validateSnapshot(bad)).toThrow(/children\[0\]\.kind/);
   });
 
   it("throws on a rewrite-tag via outside the pinned vocabulary", () => {

@@ -2709,7 +2709,7 @@ where
     let match_ident = select! { Token::Ident(s) => s }.map_with(|s, e| (s, e.span()));
     let case_binder = choice((
         select! { Token::Ident(s) if s.as_str() == "_" => s }.map(|_| None),
-        match_ident.map(|(name, _)| Some(name)),
+        match_ident.map(|(name, span)| Some(Spanned::new(span, name))),
     ));
     let tag_arm = tag_name()
         .then(
@@ -4326,7 +4326,7 @@ mod tests {
                     .and_then(ArmPattern::as_tag)
                     .expect("tagged arm");
                 assert_eq!(p0.tag.as_str(), "some");
-                assert_eq!(p0.payload, PayloadPattern::Named("v".into()));
+                assert!(matches!(&p0.payload, PayloadPattern::Named(v) if v.node == "v"));
                 let p1 = arms[1]
                     .pattern
                     .as_ref()
@@ -4464,15 +4464,15 @@ mod tests {
         };
         assert!(matches!(scrutinee.node, Expr::Name(_)));
         assert_eq!(arms.len(), 2);
-        assert_eq!(
-            arms[0]
+        assert!(matches!(
+            &arms[0]
                 .pattern
                 .as_ref()
                 .and_then(ArmPattern::as_tag)
                 .expect("tagged arm")
                 .payload,
-            PayloadPattern::Named("n".into())
-        );
+            PayloadPattern::Named(n) if n.node == "n"
+        ));
         assert_eq!(
             arms[1]
                 .pattern

@@ -447,7 +447,10 @@ impl Printer {
             TypedExprNode::Record(fields) => {
                 let parts: Vec<String> = fields
                     .iter()
-                    .map(|(k, x)| format!("{k}={}", self.expr(x, Prec::Lowest, env)))
+                    .map(|entry| {
+                        let k = &entry.label;
+                        format!("{k}={}", self.expr(&entry.value, Prec::Lowest, env))
+                    })
                     .collect();
                 (Prec::Atom, format!("({})", parts.join(", ")))
             }
@@ -644,9 +647,10 @@ fn project<'a>(
     use crate::ccl::ProjKey;
     match (node, key) {
         (TypedExprNode::Tuple(elts), ProjKey::Index(i)) => elts.get(*i).map(|x| (x, depth)),
-        (TypedExprNode::Record(fields), ProjKey::Field(n)) => {
-            fields.iter().find(|(k, _)| k == n).map(|(_, x)| (x, depth))
-        }
+        (TypedExprNode::Record(fields), ProjKey::Field(n)) => fields
+            .iter()
+            .find(|entry| entry.label == *n)
+            .map(|entry| (&entry.value, depth)),
         _ => None,
     }
 }

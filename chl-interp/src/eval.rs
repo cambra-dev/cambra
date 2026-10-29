@@ -2448,7 +2448,7 @@ impl Interp {
         let names = |arm: &chl_parser::ast::MatchArm| -> Vec<String> {
             match &arm.pattern {
                 Some(ArmPattern::Tag(p)) => match &p.payload {
-                    PayloadPattern::Named(n) => vec![n.to_string()],
+                    PayloadPattern::Named(n) => vec![n.node.to_string()],
                     PayloadPattern::Ignored | PayloadPattern::Absent => Vec::new(),
                 },
                 Some(ArmPattern::Constructor(p)) => p
