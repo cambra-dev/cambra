@@ -888,6 +888,7 @@ pub(super) fn emit_lambda<C: Typing>(
         })
     });
     let body_ty = body_ty?;
+    ctx.note_result(&body_ty);
 
     // Emit a *named* Pi: the parameter binds in the codomain, so a refinement
     // predicate nested in `body_ty` that closes over the parameter (the

@@ -364,7 +364,7 @@ fn freshen_effect_var(
                 upper.of_requires = false;
             }
         }
-        if upper.of_requires || upper.of_causes {
+        if upper.of_requires || upper.of_causes || !upper.forbidden.is_empty() {
             f.bound_above(upper);
         }
     }

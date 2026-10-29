@@ -296,6 +296,11 @@ pub(super) trait Typing {
         }
     }
 
+    /// Note the type a function body of the node being emitted results in: a function it
+    /// returns may not require or cause anything naming a variable the body binds, which it
+    /// would outlive. Check notes nothing.
+    fn note_result(&mut self, _ty: &Type) {}
+
     /// How many links of associated effect types wait on their obligations
     /// ([`InferCtx::settle_effect_links`](super::context::InferCtx::settle_effect_links)).
     /// Check links none.

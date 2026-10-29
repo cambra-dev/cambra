@@ -3982,6 +3982,15 @@ its uses, a requirement inference adds: its variable holds what every instance a
 answering it does, which is at least what any use's does. A parameter variable with no rigid label
 leaves its part of a bound open: it is what flows there.
 
+**Checks that read a body's effects.** A `with begin():` body collects on a variable of its own
+(`Typing::transaction_body`), bounded by an upper bound that forbids `Commit` (`Upper::forbidden`,
+`Blame::NestedTransaction`), so a commit reaching it, directly or through a call, is a nested
+transaction. The bound is copied at each instantiation, so a call through a polymorphic
+definition's parameter is refused at each use that passes a committing function. Each function
+body's result type is noted (`Typing::note_result`), and a function in it requiring or causing a
+label bound at the body's depth or deeper is refused (`InferCtx::escaping_results`,
+`InferError::EscapesItsVariable`): it would outlive the variable.
+
 **Upper bounds are checked once emission is complete.** A variable's labels are known only then,
 so `effects::exceeded_uppers` reads each bounded variable's resolution after the barrier variables'
 checks. The first label beyond a bound is reported at the node where it entered: the statement
