@@ -665,3 +665,67 @@ registry makes names available while constructing the tree; `compile_program` re
 with inference and conversion after lowering has discovered them. The conversion registry
 shares a materialized source extent across references to the same registered source. Sink
 bindings remain outside the expression tree as described by the purity invariant.
+
+## Readings
+
+`Reading(kind)` is the body of a `@Builtin` std function whose value comes from outside the program,
+`std::time::clock` or `std::random::next` (`docs/chl-spec.md`, "Inputs from outside the program").
+Lowering supplies it as the function's body, chosen by the function's path, and refuses `@Builtin`
+outside a std module's top level (`builtin_body`). Inference types it `Int` and records
+`ObserveWorld`.
+
+A reading has one value per position and call path. The call path is the call's site
+([sites.md](sites.md)): its place, reached through each call of a function inlining copied it
+through, outermost first (`Reading::site`). Its place is the `@Builtin` function's. Inlining extends
+it at each call of a named function and of a function value a beta reduction substitutes
+(`reached_through`, `substitute_function`), because each call is a call of its own. A copy of a data
+value is the same evaluation, so every other pass copies the site with the term, and the copies
+mutability elimination makes of one evaluation are one reading.
+
+The position is the positions of the loops around the call, outermost first, and a loop's position
+is its key. `ObserveWorld` elimination (`src/ccl/observe_world.rs`) makes it the reading's operand.
+It runs at the end of inlining, once the loops around each reading are the loops around its
+evaluation, and before a let-bound collection's definition is substituted where the collection is
+read (`inline_list_element_reads`). A loop is a collection over its source's positions,
+`λ 𝑟 → (𝑟 ▷ 𝑠) ▷ step`, and a `For` binds its `position`, so under the loops with positions
+`𝑟₁ … 𝑟ₙ` a reading becomes `(𝑟₁, …, 𝑟ₙ) ▷ reading(std::time::clock)`. A loop's source is evaluated
+outside the loop, so a reading in the source does not take the loop's position. A compute lambda is
+not a loop: after inlining it stands where it is applied, and its body runs at the position of the
+application. A reading under no loop keeps no operand and has the one position outside every loop.
+
+After the rewrite a reading's value depends on its operand's value and its site alone, so every
+later pass copies, moves and merges it as any term, and `lambda_elim` needs no rule of its own:
+`reading(std::time::clock)` is a morphism like any builtin.
+
+A comprehension's filter is a refinement of its loop's domain, whose element `__elem` is the loop's
+position, so a reading in a filter takes `__elem` as its operand. One rewrite of the predicate
+serves every type that carries it. A filter under another loop would also take that loop's position,
+which would make the filtered domain's type depend on it. Inference gave no type that dependence,
+so the elimination refuses such a filter as an internal error. A group's membership refinement
+holds its key function under the loop over the groups, so a reading in a key function is refused
+the same way.
+
+A `For` body that reads its position reads it off the writer's item. Mutability elimination's
+induction writer takes `(𝑟, 𝑟 ▷ iter)` as its item (`fold_induction_loop`), and the transaction
+phase zips the position into a block's source (`build_zip_source`).
+
+Equality of terms includes the site, so two calls are unequal terms and nothing that merges equal
+terms makes them one call. `content_hash` hashes only the kind: a reload pairs readings by
+where they sit in the tree, as it pairs any other leaf.
+
+Operator conversion compiles `reading` to `Readings` over its operand, and a `Reading` with no
+operand to `Readings` at the one position with no keys. Every `Readings` of one site reads one
+`ReadingSource`, which holds the value taken the first time any of them asks for a position, keyed
+by the position's components: a record's fields in order, and any other value itself. Copies of a
+call agree at whichever rows each evaluates them. A reload keeps a call's readings where it keeps
+the operator the `Readings` stands in, an unchanged binding, output or store
+(`src/ccl/design/program-evolution.md`, "2. Keep the operator at a corresponding node"); a
+rebuilt `Readings` reads a source of its own, which has taken none.
+
+A copy may be evaluated under more loops than its call stands in: channelize evaluates a binding
+fed under an inner loop at the inner loop's rows. A row's key path, read component by component,
+then begins with the position's components, and `Readings` asserts it at every row. The source
+drops a position once each reader's releases cover every key of its rows that begins with the
+position's components (`Extensions`), so a position stays while any inner row extending it may
+still be read.
+

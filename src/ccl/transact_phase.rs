@@ -616,6 +616,9 @@ struct RawSite {
     /// The loop item binder (`for r in xs`); the synthetic singleton binder for a
     /// standalone transaction.
     target: TypedBinding,
+    /// The loop's position, which the block reads where a reading in it takes its operand
+    /// (`src/ccl/observe_world.rs`).
+    position: Name,
     /// The writer's iteration source `Fun(D, item)` (the loop's `iter`, or the
     /// synthesized `[unit]` for a standalone transaction).
     source: Expr,
@@ -1615,7 +1618,7 @@ struct Stripped {
 fn strip(
     expr: Expr,
     txn_mut_vars: &HashSet<Name>,
-    enclosing: Option<(&TypedBinding, &Expr, &HashSet<Name>)>,
+    enclosing: Option<(&Name, &TypedBinding, &Expr, &HashSet<Name>)>,
     out: &mut Stripped,
 ) -> Expr {
     // A `with begin():` block (a `Begin` marker) on a statement spine.
@@ -1670,7 +1673,7 @@ fn strip(
             // position), where `mut_elim` folds it into the loop recurrence.
             // The two domains stay independent — an induction accumulator is
             // never in the atomic commit.
-            let (target, source, enclosing_writes) = enclosing.expect(
+            let (position, target, source, enclosing_writes) = enclosing.expect(
                 "a writing `with begin():` block must be inside a loop (lowering wraps a \
                  standalone block in a singleton `For`)",
             );
@@ -1693,6 +1696,7 @@ fn strip(
                 out.sites.push(RawSite {
                     parent: stmt_id,
                     target: target.clone(),
+                    position: position.clone(),
                     // The enclosing `For` keeps its `iter` in the stripped tree while
                     // the site carries the same expression into the writer's source,
                     // so the site's copy is its own.
@@ -1762,7 +1766,7 @@ fn strip(
         let body = strip(
             *body,
             txn_mut_vars,
-            Some((&target, &source, &enclosing_writes)),
+            Some((&position, &target, &source, &enclosing_writes)),
             out,
         );
         return Expr {
@@ -2755,10 +2759,13 @@ fn build_writer(
     site_accs.sort_by(|a, b| a.0.cmp(&b.0));
     broadcasts.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let (source, item_ty) = if site_accs.is_empty() {
+    // A block that reads the loop's position takes it from the item too, in the slot after the
+    // accumulators.
+    let reads_position = block_reads_var(&site.block, &site.position);
+    let (source, item_ty) = if site_accs.is_empty() && !reads_position {
         (site.source.clone(), orig_item_ty.clone())
     } else {
-        build_zip_source(&site.source, &orig_item_ty, &site_accs)
+        build_zip_source(&site.source, &orig_item_ty, &site_accs, reads_position)
     };
 
     // Seed the read-your-writes environment: each read key at its snapshot slot, the
@@ -2769,7 +2776,7 @@ fn build_writer(
         env.insert(rk.clone(), param.snapshot(i));
     }
     let item = param.item();
-    if site_accs.is_empty() {
+    if site_accs.is_empty() && !reads_position {
         env.insert(site.target.name.clone(), item);
     } else {
         // The item is `(loop_item, acc(r), …)`: the loop var reads slot 0, each
@@ -2780,6 +2787,18 @@ fn build_writer(
         );
         for (i, (acc, _, vty)) in site_accs.iter().enumerate() {
             env.insert(acc.clone(), proj_item(&item, &item_ty, i + 1, vty));
+        }
+        if reads_position {
+            let domain = site
+                .source
+                .ty
+                .domain()
+                .expect("transact_phase: writer source must have function type");
+            let slot = site_accs.len() + 1;
+            env.insert(
+                site.position.clone(),
+                proj_item(&item, &item_ty, slot, &domain),
+            );
         }
     }
     // A cross-domain (different-loop) accumulator read is its completed final
@@ -2845,17 +2864,26 @@ fn proj_item(item: &Expr, item_ty: &Type, i: usize, elt_ty: &Type) -> Expr {
 }
 
 /// The writer source extended to carry each cross-read accumulator at its request
-/// position: `λ x → (source(x), acc-view(x), …) : dom ⇒ (item, v0, …)`.
+/// position, and the position itself where `position` holds:
+/// `λ x → (source(x), acc-view(x), …, x) : dom ⇒ (item, v0, …, dom)`.
 /// `lambda_elim` point-frees it to a `zip`; recognition lifts it verbatim as the
 /// writer source, and op-conversion (`build_commit_store`) destructures the `zip`
 /// to co-iterate the accumulator streams alongside the loop source.
-fn build_zip_source(source: &Expr, item_ty: &Type, accs: &[(Name, Expr, Type)]) -> (Expr, Type) {
+fn build_zip_source(
+    source: &Expr,
+    item_ty: &Type,
+    accs: &[(Name, Expr, Type)],
+    position: bool,
+) -> (Expr, Type) {
     let dom = source
         .ty
         .domain()
         .expect("transact_phase: writer source is a function");
     let mut elt_tys = vec![item_ty.clone()];
     elt_tys.extend(accs.iter().map(|(_, _, t)| t.clone()));
+    if position {
+        elt_tys.push(dom.clone());
+    }
     let new_item_ty = Type::Tuple(elt_tys);
 
     let x = Name::fresh("__zx");
@@ -2866,6 +2894,9 @@ fn build_zip_source(source: &Expr, item_ty: &Type, accs: &[(Name, Expr, Type)]) 
     )];
     for (_, view, vty) in accs {
         elts.push(apply_ty(tvar(&x, dom.clone()), view.clone(), vty.clone()));
+    }
+    if position {
+        elts.push(tvar(&x, dom.clone()));
     }
     let mut tup = Expr::tuple(elts);
     tup.ty = new_item_ty.clone();
@@ -3974,6 +4005,7 @@ mod tests {
             // nothing here records.
             parent: unit.node_id(),
             target: binding(Name::fresh("__r"), Type::Base(BaseType::Unit)),
+            position: Name::fresh("__pos"),
             source: unit.clone(),
             block: unit,
             read_keys: read_keys.iter().map(|n| (*n).clone()).collect(),

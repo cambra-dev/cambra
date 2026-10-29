@@ -1,0 +1,8 @@
+# A program that imports `std::random`: each input line takes a token of its own.
+
+import std::random
+
+tokens: Feed(_)
+
+for line in stdin():
+    tokens << random::next()

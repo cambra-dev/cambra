@@ -1503,8 +1503,8 @@ pub fn is_curried(by_reference: &[bool]) -> bool {
     by_reference.len() > 1 && by_reference.iter().any(|b| *b)
 }
 
-/// The type of a function over `inputs`, as a `def` over them lowers: over the one input,
-/// over the tuple of several, or one at a time where [`is_curried`].
+/// The type of a function over `inputs`, as a `def` over them lowers: over the one input, over
+/// the tuple of several, which for none is the unit, or one at a time where [`is_curried`].
 pub fn function_over(inputs: &[Type], output: Type) -> Type {
     let by_reference: Vec<bool> = inputs.iter().map(|t| t.history_parts().is_some()).collect();
     if is_curried(&by_reference) {
@@ -1514,7 +1514,7 @@ pub fn function_over(inputs: &[Type], output: Type) -> Type {
     }
     let domain = match inputs {
         [one] => one.clone(),
-        several => Type::Tuple(several.to_vec()),
+        several => Type::tuple(several.to_vec()),
     };
     crate::ccl::infer::solver::fun(domain, output)
 }

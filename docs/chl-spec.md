@@ -285,8 +285,7 @@ why the refinement separator moved off `|`.
 ([9.18 Reloading a program of modules](#918-reloading-a-program-of-modules)), `Discard`
 ([8.9 `@Discard` [Decided]](#89-discard-decided)) and `Builtin`
 ([9.16 The std root](#916-the-std-root)), so `@` never appears in any other position.
-`@RenamedFrom` and `@Discard` parse, and lowering refuses them. `@Builtin` is **[Decided]**
-and does not parse yet.
+`@RenamedFrom` and `@Discard` parse, and lowering refuses them.
 
 **[Decided]** — `@RenamedFrom` also decorates a `type` declaration and a constructor line inside
 one ([Reloading a nominal type](#reloading-a-nominal-type)). Its argument there is a path:
@@ -1193,8 +1192,7 @@ A call that mixes expressions and fields is an error.
 > product with both anonymous and named fields) is **[Open]**.
 > Recorded here only (2026-07-07, no brainstorm writeup yet).
 
-A function may declare no parameters (**[Decided]**), and a call of it passes no arguments:
-`f()` applies `f` to
+A function may declare no parameters, and a call of it passes no arguments: `f()` applies `f` to
 the unit, the product of no components. `def zero() => Int:`, `\ -> 3`, an associated function
 `def Price::zero() => Price:` and a trait's `def one() => S` each take the unit. A call with no
 arguments also opens a registered **data source**, `stdin()` (§7.3), and builds the empty map,
@@ -3387,9 +3385,9 @@ method it means, and the method as an unapplied value has no other spelling.
 - **A type's constructors, its associated functions, and the `new` and `extract` of the
   single-constructor form share one namespace.** Two entries of one type with one name are an error
   naming both sites. Two types in one module may each have a `discounted`.
-- **An associated function may declare no parameters** (**[Decided]**). `def Price::zero() =>
-  Price:` is called `Price::zero()` ([3.8 Function calls](#38-function-calls)). A constructor that
-  declares no parameters is a value instead, written without parentheses.
+- **An associated function may declare no parameters.** `def Price::zero() => Price:` is called
+  `Price::zero()` ([3.8 Function calls](#38-function-calls)). A constructor that declares no
+  parameters is a value instead, written without parentheses.
 - **An associated function reaches nothing a run gives its module.** Every run of a module shares a
   type that reaches none of the module's parameters
   ([Nominal type identity](#nominal-type-identity)), so each run's copy of the type's functions must
@@ -3480,11 +3478,10 @@ is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 
 ### 6.9 Capabilities
 
-**[Decided]** — readings ([Inputs from outside the program](#inputs-from-outside-the-program));
-exceptions ([Exceptions](#exceptions)); naming another module's public transactional variable,
-`WriteTxn(inv::stock)`; sink functions and calls made outside the program ([Output outside the
-program](#output-outside-the-program)); and keeping readings across a reload and a restart ([Inputs
-from outside the program](#inputs-from-outside-the-program)). The rest of this section is
+**[Decided]** — exceptions ([Exceptions](#exceptions)); naming another module's public transactional
+variable, `WriteTxn(inv::stock)`; sink functions and calls made outside the program ([Output outside
+the program](#output-outside-the-program)); and keeping readings across a reload and a restart
+([Inputs from outside the program](#inputs-from-outside-the-program)). The rest of this section is
 implemented.
 
 A function's type states what a call reads from its context, in its **`requires` clause**, and what
@@ -4351,8 +4348,8 @@ trait Scales(V, F):
 - **A trait's function is no method.** No parameter of one is named `self`, in the trait or in an
   instance, and a call reads it from an instance: `summon(Scales(_, _))::scale_vec(2, v)`, not
   `2.scale_vec(v)` ([Associated functions and methods](#associated-functions-and-methods)).
-- **A function may declare no parameters** (**[Decided]**). A call reads it from an instance like
-  any trait function: `summon(One(Circle))::one()` ([3.8 Function calls](#38-function-calls)).
+- **A function may declare no parameters.** A call reads it from an instance like any trait
+  function: `summon(One(Circle))::one()` ([3.8 Function calls](#38-function-calls)).
 - **Neither the trait's name nor a type's reaches a function.** `Area::area(c)` is an error, and
   `Circle::area(c)` names only a function `Circle` declares
   ([Summoning an instance](#summoning-an-instance)).
@@ -6279,7 +6276,7 @@ failure status. An omitted definition with no complete declaration supplies no e
 
 ### 9.16 The std root
 
-**[Planned]** — the rules of this section, apart from `@Builtin` below, which is **[Decided]**.
+**[Planned]** — the rules of this section, apart from `@Builtin` below, which is implemented.
 
 The compiler's own modules live under a **std root**, and every std module's path begins with `std`:
 `import std::http` binds `http`, then `http::serve(…)` and `http::ok(…)` ([7.3

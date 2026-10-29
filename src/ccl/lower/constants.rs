@@ -323,11 +323,21 @@ impl LoweringContext {
             requires,
             causes,
             body,
+            builtin,
             ..
         } = def
         else {
             unreachable!("a function binding is a `def`");
         };
+        // The compiler supplies a `@Builtin` function's body, which is no constant term.
+        if let Some(at) = builtin {
+            return Err(refused(
+                *at,
+                "this function's body is the compiler's, and a function called in a constant \
+                 has a body of constants",
+            )
+            .into());
+        }
         for (clause, stated, what) in [
             (requires.span, !requires.items.is_empty(), "requires"),
             (causes.span, !causes.items.is_empty(), "causes"),

@@ -290,6 +290,9 @@ pub enum Stmt {
         requires: Box<Clause<Requirement>>,
         causes: Box<Clause<TraitType>>,
         body: Vec<Spanned<Stmt>>,
+        /// The `@Builtin` decorator on the line above: the compiler supplies the body, which is
+        /// empty (`docs/chl-spec.md`, "9.16 The std root").
+        builtin: Option<Span>,
     },
 
     /// `type N(P…):` over constructor lines, or `type N(P…) = R` (`docs/chl-spec.md`,

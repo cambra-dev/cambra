@@ -16,6 +16,7 @@ load the modules ([Tests](#tests)).
 
 | Module | File | Used by | Holds |
 | -- | -- | -- | -- |
+| `std::random` | [src/std/random.cambra](src/std/random.cambra) | `import std::random` | `next()`, a random `Int` read once per position |
 | `std::time` | [src/std/time.cambra](src/std/time.cambra) | `import std::time` | `Instant`, `Duration`, `now()`, `alarms`, durations, and conversions to integer counts and Unix time |
 
 - **A module whose top level requires or causes something is run; every other module is imported.**

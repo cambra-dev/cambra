@@ -1324,7 +1324,9 @@ fn elim_lambda_impl(
 
     // Constant: λ x → e  ⟹  const(e)  when x ∉ fv(e)
     // Checked before pattern-matching because a nested lambda that does not
-    // reference param should also be treated as a constant.
+    // reference param should also be treated as a constant. A reading under a loop's `λ 𝑟` names
+    // `𝑟` in its position operand (`src/ccl/observe_world.rs`), so it is never constant in a
+    // loop's position.
     if !is_free(param, &body) {
         // const: T → (A → T) where T = body.ty and result_ty = A → T
         let const_fn_ty = Type::compute_fun_or_hole(&body.ty, &result_ty);

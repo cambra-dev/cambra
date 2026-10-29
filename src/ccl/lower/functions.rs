@@ -160,25 +160,6 @@ pub(super) fn feed_annotation_type(
     Some(lower_type_expr(value, ctx).map(|t| Type::feed(Type::Hole, t)))
 }
 
-/// Validate that the function or lambda has at least one parameter.
-///
-/// The CHL parser already rejects `*args`, `**kwargs`, keyword-only and
-/// default arguments at the syntactic level, so the only remaining check
-/// is that there is at least one positional parameter. Shared between
-/// [`lower_lambda`] and [`lower_function_body`].
-pub(super) fn validate_function_params(
-    fn_span: Span,
-    params: &[Param],
-) -> Result<(), LoweringError> {
-    if params.is_empty() {
-        return Err(LoweringError::unsupported(
-            fn_span,
-            "function/lambda with no parameters not supported",
-        ));
-    }
-    Ok(())
-}
-
 /// Wrap `body_expr` in a single uncurried lambda over `args`.
 ///
 /// Single-arg `(x): body` → `λ x → body`.
@@ -360,16 +341,17 @@ pub(super) fn uncurry_params(
             None => Type::Hole,
         });
     }
-    // The tuple has one position per parameter. The body only projects it, which fixes no
-    // width (`docs/chl-spec.md`, "Tuple width"), so the binder states it. The tuple binder is
+    // The tuple has one position per parameter, and no parameter makes it the unit, the one
+    // empty product a call with no arguments applies. The body only projects it, which fixes
+    // no width (`docs/chl-spec.md`, "Tuple width"), so the binder states it. The tuple binder is
     // lowering's own: no one place in the source writes it, so it records where the function
     // is tagged.
-    let arity = Type::Tuple(vec![Type::Hole; params.len()]);
+    let arity = Type::tuple(vec![Type::Hole; params.len()]);
     let mut lam = Expr::lambda(tuple_name, Occurrence::mint(), arity, body_with_subs);
     if elem_anns.iter().any(|t| !matches!(t, Type::Hole))
         && let TypedExprNode::Lambda { param, .. } = &mut lam.node
     {
-        param.declare(Annotation::new(Type::Tuple(elem_anns), Occurrence::mint()));
+        param.declare(Annotation::new(Type::tuple(elem_anns), Occurrence::mint()));
     }
     Ok(lam)
 }
@@ -422,17 +404,12 @@ fn stamp_clauses(
 /// Explicitly nested lambdas can produce the internal `curry` combinator when
 /// they survive inlining. Operator conversion does not compile arbitrary
 /// curried lambda bodies. CHL has no built-in surface `curry` function.
-///
-/// `validate_function_params` only checks for at least one parameter; the
-/// CHL parser already rejects `*args`, `**kwargs`, defaults, and keyword-only
-/// arguments at parse time.
 pub(super) fn lower_lambda(
     lambda_span: Span,
     params: &[Param],
     body: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    validate_function_params(lambda_span, params)?;
     // Mutability of a `Mut(…)`-annotated parameter is its *type* (stamped by
     // `uncurry_params`), checked post-inference — there is no induction registry
     // to mask here. But a plain parameter spelled like an outer transactional
@@ -551,6 +528,13 @@ pub(super) fn refuse_misannotated_type_binder(
     refuse_kind_on_value_binder(&name.node, Some(ty))
 }
 
+/// A `def`'s body: the statements it writes, or the expression the compiler supplies for a
+/// `@Builtin` function (`docs/chl-spec.md`, "9.16 The std root").
+#[derive(Clone, Copy)]
+pub(super) enum DefBody<'a> {
+    Written(&'a [Spanned<ChlStmt>]),
+    Supplied(&'a Expr),
+}
 /// A `def` with type parameters is a `let` annotated with a polymorphic type that
 /// binds them, over a `Hole` body: the lambda's own annotations already state the
 /// signature (`src/ccl/design/type-parameters.md`, "Lowering"). The returned
@@ -565,7 +549,7 @@ pub(super) fn lower_def(
     output: Option<&Spanned<ChlExpr>>,
     requires: &Clause<Requirement>,
     causes: &Clause<TraitType>,
-    body: &[Spanned<ChlStmt>],
+    body: DefBody<'_>,
     ctx: &mut LoweringContext,
 ) -> Result<(Expr, Option<Type>), LoweringError> {
     refuse_kind_on_value_params(params)?;
@@ -637,7 +621,7 @@ pub(super) fn lower_def_declared(
     output: Option<&Spanned<ChlExpr>>,
     clauses: Option<crate::ccl::capabilities::Written>,
     requires: Vec<Rc<crate::ccl::ty::TraitRequirement>>,
-    body: &[Spanned<ChlStmt>],
+    body: DefBody<'_>,
     ctx: &mut LoweringContext,
 ) -> Result<(Expr, Option<Type>), LoweringError> {
     let func = lower_function_body(fn_span, params, output, clauses, body, ctx)?;
@@ -752,10 +736,9 @@ pub(super) fn lower_function_body(
     params: &[Param],
     output: Option<&Spanned<ChlExpr>>,
     clauses: Option<crate::ccl::capabilities::Written>,
-    body: &[Spanned<ChlStmt>],
+    body: DefBody<'_>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    validate_function_params(fn_span, params)?;
     let outer_bindings: HashSet<String> =
         params.iter().map(|p| p.name.as_str().to_string()).collect();
 
@@ -803,9 +786,13 @@ pub(super) fn lower_function_body(
         .collect();
 
     // A sink declaration is not permitted inside function bodies.
-    let body_result = ctx.with_shadowed(shadowed_params, |ctx| {
-        lower_stmts_inner(body, &outer_bindings, ctx, false)
-    });
+    let body_result = match body {
+        DefBody::Written(body) => ctx.with_shadowed(shadowed_params, |ctx| {
+            lower_stmts_inner(body, &outer_bindings, ctx, false)
+        }),
+        // The supplied body stands in the lambda once, under the ids lowering recorded for it.
+        DefBody::Supplied(body) => Ok(body.clone_preserving_ids()),
+    };
 
     // Revert the transactional registry — drop every `Mut(_, Txn)` param
     // registration and any `Mut(_, Txn)` local the body declared, keyed on the

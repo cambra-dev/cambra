@@ -42,6 +42,7 @@ mod mutability;
 mod nested_loops;
 mod nominal_types;
 mod probes;
+mod readings;
 mod records;
 mod runs;
 mod scalars_collections;

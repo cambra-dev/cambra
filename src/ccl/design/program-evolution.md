@@ -27,8 +27,8 @@ Three questions decide a reload:
   a value for must be one the new version declares or loads, at a type the value fits, and one the
   source tells apart from its siblings. Otherwise the reload is refused and every branch is left
   serving, per [State takeover](#state-takeover).
-- **What survives.** Every `Let` binding, `Transact` store and iteration input whose computation is
-  unchanged, and every variable's value whether or not its store was rebuilt.
+- **What survives.** Every `Let` binding, output, `Transact` store and iteration input whose
+  computation is unchanged, and every variable's value whether or not its store was rebuilt.
 
 ## Vocabulary
 
@@ -452,12 +452,19 @@ structural diff pairs](#the-agreed-region-is-the-region-a-structural-diff-pairs)
 
 ### 2. Keep the operator at a corresponding node
 
-Conversion consults the correspondence at three places: every `Let` binding
-(`OpConversionContext::bind_let`), every store (`OpConversionContext::bind_store`) and every
+Conversion consults the correspondence at four places: every `Let` binding
+(`OpConversionContext::bind_let`), every output, the program's value and each sink's
+(`OpConversionContext::bind_output`), every store (`OpConversionContext::bind_store`) and every
 writer's iteration input (`OpConversionContext::iteration_input`). Each records what it built under
 the node it built it from, so the replacement finds the predecessor's operator at its own node's
 correspondent and opens a fan-out slot behind it instead of building one. Those are the nodes where
 a fan-out sits, per [A split sits at a fan-out](#a-split-sits-at-a-fan-out).
+
+An output is one because what an operator holds may be all there is of what it computed. A memo
+inside a term, such as the one a zip's arms share where a loop's step reads its item from inside
+another loop, releases each row of its source once it holds it, so a source keeps only what no
+retired producer finished with. A rebuilt output would start from there and lose the rows the
+retired one held; the kept one holds them.
 
 Keeping an operator keeps the whole subgraph under it, including its stores and their accumulated
 values. Two conditions bound that: every binding the term reads was kept too ([Reuse is
