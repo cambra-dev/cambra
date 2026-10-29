@@ -1061,6 +1061,19 @@ fn names_collection_keys(guard: &TileGuard) -> bool {
     }
 }
 
+/// The projection of a pull of a producer whose output is one value, which has no keys to project:
+/// all of it or none. `what` completes "`name` ..." in the panic: "is one accumulator".
+///
+/// # Panics
+///
+/// For a projection of keys.
+pub(crate) fn projection_of_one_value(name: &str, what: &str, guard: &TileGuard) -> Projection {
+    match guard.projection(name) {
+        Projection::Keys { .. } => panic!("{name} {what}, which has no keys to project: {guard:?}"),
+        projection => projection,
+    }
+}
+
 /// The index, from 0, of one of a breaker's inputs, which [`Breaker::consume_impl`],
 /// [`Breaker::input_tiling`] and [`Breaker::input_released`] act on. A breaker of one input is
 /// called only with [`InputId::ONLY`].
