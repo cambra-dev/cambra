@@ -7,8 +7,8 @@ use std::{
 use crate::ccl::FieldKey;
 use crate::interpreter::CurryLevel;
 use crate::interpreter::{
-    Consumer, DataSourceDomainExtentImpl, Projection, tile_operators::Notified,
-    value_probe::ProbeSlot,
+    Consumer, DataSourceDomainExtentImpl, Projection, dispatcher::Landing,
+    tile_operators::Notified, value_probe::ProbeSlot,
 };
 
 /// A consumer handle shared by notification forwarders and deferred wakeups.
@@ -112,6 +112,12 @@ impl Consumer for Gated {
             self.consumer.notify(arrived);
         }
     }
+
+    /// A push passes the gate whatever it says, and leaves it as it is: every pushed region is a
+    /// work package, which no pull replaces.
+    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        self.consumer.push(region, landing);
+    }
 }
 
 impl GatedConsumer {
@@ -200,6 +206,13 @@ impl Consumer for Widening {
     fn notify(&mut self, _arrived: &Projection) {
         self.0.notify(&Projection::Everything);
     }
+
+    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        match region {
+            Projection::Everything => self.0.push(region, landing),
+            _ => landing.widened(|landing| self.0.push(&Projection::Everything, landing)),
+        }
+    }
 }
 
 /// `consumer` behind a consumer that forwards each notification as the same keys under `tag`
@@ -215,6 +228,10 @@ impl Consumer for Tagging {
     fn notify(&mut self, arrived: &Projection) {
         self.1.notify(&arrived.tagged(&self.0));
     }
+
+    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        self.1.push(&region.tagged(&self.0), landing);
+    }
 }
 
 /// What [`forwarding_consumer_keeping_keys`] returns: it passes each region on as it arrives,
@@ -226,6 +243,15 @@ struct Forwarding {
 }
 
 impl Consumer for Forwarding {
+    /// A push is passed on at once, past the gate. A push climbs from one breaker to the next, so
+    /// one that re-enters a consumer it is passing through has met a cycle, which fails the run.
+    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        match self.gated.shared.try_borrow_mut() {
+            Ok(mut consumer) => consumer.push(region, landing),
+            Err(_) => landing.reentered(),
+        }
+    }
+
     fn notify(&mut self, arrived: &Projection) {
         let GatedConsumer { shared, admission } = &self.gated;
         // A notification that re-enters a consumer already being notified is deferred to
@@ -285,6 +311,13 @@ impl Consumer for OneLevelIn {
     fn notify(&mut self, arrived: &Projection) {
         let restated = self.restated(arrived).unwrap_or(Projection::Everything);
         self.consumer.notify(&restated);
+    }
+
+    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        match self.restated(region) {
+            Some(restated) => self.consumer.push(&restated, landing),
+            None => landing.widened(|landing| self.consumer.push(&Projection::Everything, landing)),
+        }
     }
 }
 
