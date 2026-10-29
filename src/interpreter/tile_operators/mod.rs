@@ -44,6 +44,7 @@ use crate::{
 use crate::interpreter::LockNow;
 
 mod aggregate;
+mod breaker_output;
 mod combinators;
 mod cycle_slot;
 mod extract_final;
@@ -64,6 +65,11 @@ mod scalar;
 mod union;
 
 pub use aggregate::*;
+#[allow(
+    unused_imports,
+    reason = "the pool's plan reaches `BreakerOutput` once it cuts at a `Memo`"
+)]
+pub(crate) use breaker_output::*;
 pub use combinators::*;
 pub use cycle_slot::*;
 pub use extract_final::*;

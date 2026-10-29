@@ -90,6 +90,12 @@ EXPECTED_EXCEPTIONS = [
     # `Arrivals`, the regions an input has notified since a `Memo` last took them; see its
     # type doc. The notification carries a region, which a one-bit flag cannot hold.
     ("src/interpreter/tile_operators/mod.rs", "shared cell of `Projection`"),
+    # A breaker's materialized output (`breaker.rs`): the merged rows, the keys that are ready and
+    # the per-operator release records under one lock, and the consumers behind the breaker. The
+    # rows are the breaker's own state, as the collector's are, and they reach a pipeline behind it
+    # only through `BreakerOutput`'s `get`.
+    ("src/interpreter/breaker.rs", "cell of `State`"),
+    ("src/interpreter/breaker.rs", "cell of `Vec<Box<dyn Consumer>>`"),
     # The worker pool's breakers: the collection every worker merges into, and each
     # worker's partial accumulator, handed in once; both answer `main` after every worker
     # has returned, and no operator reads either.

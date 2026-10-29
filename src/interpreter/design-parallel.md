@@ -269,27 +269,26 @@ panic.
 `Dispatcher::step` is one pass of a worker's turn. It leaves the pipelines whose source is
 exhausted, asks `next`, and runs the package through `PoolWorker::work`, which pulls the chain,
 hands the tile to the breaker and releases the morsel, before `ack`. It answers `Step::Ran` after a
-morsel, `Step::Wait` when `next` did, and `Step::Done` when `next` did, and it answers `Done`
-before it leaves anything once the dispatcher has failed. What a worker holds between passes is a
-`ServeState`: the pipelines it is attached to and the pipeline it ran last. `Dispatcher::serve_state`
-mints one, naming its dispatcher by a per-dispatcher id, and a debug build asserts on every step
-that the state is this dispatcher's and that one thread uses it.
+morsel, `Step::Wait` when `next` did, and `Step::Done` when `next` did, and it answers `Done` before
+it leaves anything once the dispatcher has failed. What a worker holds between passes is a
+`ServeState`: the pipelines it is attached to and the pipeline it ran last.
+`Dispatcher::serve_state` mints one, naming its dispatcher by a per-dispatcher id, and a debug build
+asserts on every step that the state is this dispatcher's and that one thread uses it.
 
 `Dispatcher::serve` runs one worker until every pipeline has finished: it reads the epoch, takes a
 step, and parks on the epoch it read when the step answers `Wait`. `serve_until_wait` takes steps
 until one answers `Done`, or `Wait` with the epoch where it was before the step, and returns
-`Settled::Wait` or `Settled::Done`. It parks nowhere: the caller delivers the arrivals that end
-the wait and calls again with the same state. A step that answers `Wait` after the epoch moved is
-not a wait. The claim that finds a source exhausted moves the epoch, and the worker's next step
-leaves the pipeline and finishes it. Both entry points run `step`, so they give one worker the
-same packages and `leave` calls.
+`Settled::Wait` or `Settled::Done`. It parks nowhere: the caller delivers the arrivals that end the
+wait and calls again with the same state. A step that answers `Wait` after the epoch moved is not a
+wait. The claim that finds a source exhausted moves the epoch, and the worker's next step leaves the
+pipeline and finishes it. Both entry points run `step`, so they give one worker the same packages
+and `leave` calls.
 
 The `Wait` of `serve_until_wait` is a wait only when every `publish`, `close`, `ack` and finish of
-the dispatcher's pipelines happens on the thread that calls it, because the caller has no epoch
-to park on. The inline driver is that caller; the threaded path, where other threads publish, is
+the dispatcher's pipelines happens on the thread that calls it, because the caller has no epoch to
+park on. The inline driver is that caller; the threaded path, where other threads publish, is
 `serve`. `FailOnUnwind` lives in `run_worker`, so the inline driver handles a panic in a worker
-itself. The plan's pipelines are served by `MainWorker`; a test double records what it ran and
-left.
+itself. The plan's pipelines are served by `MainWorker`; a test double records what it ran and left.
 
 ### Region-carrying notifications
 
@@ -406,6 +405,66 @@ is never built on the pool, and the scalar `extract` answers is terminal by hold
 it does once every worker has returned. Every `AggregateKind` combines in any order, and its seed is
 a unit of the combine, so a worker that takes no package hands in a partial that changes nothing,
 and the partials are pushed in whichever order the workers finish.
+
+### A breaker's output
+
+A breaker that materializes keeps its rows in a `Materialized` (`breaker.rs`), one shared value per
+breaker. The workers of the pipeline before it `absorb` a morsel's rows and `publish` the morsel's
+region; the pipelines behind it read through `BreakerOutput` (`tile_operators/breaker_output.rs`),
+an operator with no inputs whose producers answer from `Materialized::snapshot` and whose
+`morsel_source` is a `LiveSource` over it. The consumer graph of the pipeline behind therefore ends
+at `BreakerOutput`: no operator of the pipeline before the breaker is its input, and the only
+notification that crosses is the region `publish` raises. Both types are crate-private.
+
+**What is kept.** The state is the merged morsels (`tile`), the keys that are ready (`ready`), the
+keys every reader released and that were removed (`reclaimed`), whether the breaker completed, and
+the readers' records, in one `RwLock`, so a key is ready only once its rows are in the tile, and a
+release reads and writes the records and the rows together. `absorb` merges and extends `ready`
+under one write lock; the rows and their keys become visible together. A morsel states its whole
+region complete, which `absorb` asserts, so a key the region names and the morsel lacks is decided
+absent. A key the pipeline before the breaker filtered out is therefore in the region and has no
+row, `first_keys` answers the keys that have rows, and `LiveSource` marks a region that names none
+as claimed. `snapshot` answers the rows of a guard and states complete the keys that are ready, or
+every key once the breaker completed: the statement is the output's own, because a morsel's
+statement says nothing of keys of other morsels.
+
+**Order.** A worker `absorb`s, then `publish`es with no lock held, and the dispatcher moves its
+epoch inside the publish after the source took the region (`Dispatcher::publish`). The rows are
+visible before the region is published, and the region before the epoch moves, so a worker that
+finds no morsel in its claim has read the epoch before the move and its park returns at once. A
+region published before its rows fails the assertion in `Materialized::publish` and in
+`LiveSource::publish`. The locks, outermost first, are the consumer list (`downstream`), the gated
+cell of a consumer's chain, a pipeline's early state, a `LiveSource`'s state and the output's
+`state`. `publish` and `add_downstream` hold the consumer list while they notify, so a consumer's
+`notify` takes no lock that precedes the consumer list in that order and does not register a
+consumer; it reaches the locks that follow it, the pipeline's early state and the source's state,
+which is why they come after it. A source builder that runs inside a notification takes none of the
+locks above it: it only builds the source. `claim` reads `state` through `first_keys` while it holds
+its source's state, and `release` takes `state` alone. A consumer registered after rows were
+absorbed hears of them at once: `add_downstream` holds the consumer list from reading `ready` to
+pushing the consumer, so a publish before the push is inside what it read and a publish after it
+reaches the consumer.
+
+**Readers.** A reading operator is one reader across the workers of a pool, and its record is the
+union of the morsels they released: the workers subscribe one `BreakerOutput` once each, and
+`Scheduler::pooled_release_record_for` gives their subscriptions one name, which `register_reader`
+maps to one record. The rows leave when every reader has released them: the intersection of the
+records, restricted to the keys that are ready and less what already left. A reader releases only
+rows that are ready, except a release of everything, which says the reader is done with the output
+and does not reclaim keys absorbed afterwards: those are held until a later release names them.
+Every reader registers before a row leaves, which `register_reader` asserts, because a reader that
+registered after a release would find reclaimed keys stated complete and absent. The output holds
+one consumer per reading operator, the first subscription's, so a publish notifies operators and not
+workers. A build side (`whole`) is read whole by every worker, so each worker is a reader of its own
+and the rows leave once every worker has released them all; its producers ignore a release that
+names part of it. A producer subscribed outside a pool is a reader of its own. A producer that is
+dropped without releasing does not pin rows past the end of the run: the run calls `retire_readers`
+once its chains are gone, which drops the records and the rows.
+
+**Known costs.** A `snapshot` clones the held tile before it cuts it, `first_keys` reads every held
+key, and a release compacts the held tile, so each costs in proportion to the rows the output holds
+and not to the rows it answers or releases. Dense columns, which a collection of positions would
+hold as a range, are the step that removes this; it is not designed here.
 
 ### Tests
 
