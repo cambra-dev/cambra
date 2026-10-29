@@ -33,7 +33,7 @@ use crate::{
     interpreter::value_probe::ProbeSlot,
     interpreter::{
         ColumnValue, Consumer, Extent, Gate, GatedConsumer, Projection, Scheduler, Value,
-        forwarding_consumer, validate_tile, widening,
+        forwarding_consumer, forwarding_consumer_keeping_keys, validate_tile, widening,
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -45,6 +45,8 @@ mod cycle_slot;
 mod extract_final;
 mod fan;
 mod fanout;
+#[cfg(test)]
+mod forwarding_tests;
 mod helpers;
 mod iterate;
 mod lookup;
@@ -191,6 +193,33 @@ pub(crate) fn subscribe_forwarding(
         forwarding_consumer(shared, &scheduler.wakeup_queue()),
         scheduler,
     )
+}
+
+/// [`subscribe_forwarding`] for an input whose outermost keys are the operator's: the input's
+/// region reaches the operator's consumer as it is.
+pub(crate) fn subscribe_forwarding_keeping_keys(
+    op: &mut dyn TileOperator,
+    shared: &GatedConsumer,
+    scheduler: &mut Scheduler,
+) -> Box<dyn TileProducer> {
+    op.subscribe(
+        op.tiling().universal_guard(),
+        forwarding_consumer_keeping_keys(shared, &scheduler.wakeup_queue()),
+        scheduler,
+    )
+}
+
+/// [`subscribe_forwarding_keeping_keys`] where `keeps_keys`, and [`subscribe_forwarding`] where not.
+pub(crate) fn subscribe_forwarding_keeping_keys_if(
+    keeps_keys: bool,
+    op: &mut dyn TileOperator,
+    shared: &GatedConsumer,
+    scheduler: &mut Scheduler,
+) -> Box<dyn TileProducer> {
+    match keeps_keys {
+        true => subscribe_forwarding_keeping_keys(op, shared, scheduler),
+        false => subscribe_forwarding(op, shared, scheduler),
+    }
 }
 
 /// The concrete type's name with its module path stripped, e.g. `"MapResult"`.
@@ -1493,6 +1522,61 @@ pub(crate) mod test_helpers {
         fn notify(&mut self, arrived: &Projection) {
             self.regions.borrow_mut().push(arrived.clone());
         }
+    }
+
+    /// The consumer a [`NotifyingOp`] was subscribed with, which a test notifies through.
+    pub(crate) type InputConsumer =
+        std::rc::Rc<std::cell::RefCell<Option<Box<dyn super::Consumer>>>>;
+
+    /// An operator over a fixed tile that keeps the consumer it is subscribed with, so a test
+    /// notifies an operator above it from where the operator's input would.
+    pub(crate) struct NotifyingOp {
+        tile: Tile,
+        tiling: Tiling,
+        consumer: InputConsumer,
+    }
+
+    impl NotifyingOp {
+        pub(crate) fn new(tile: Tile, tiling: Tiling) -> (Self, InputConsumer) {
+            let consumer = InputConsumer::default();
+            (
+                Self {
+                    tile,
+                    tiling,
+                    consumer: consumer.clone(),
+                },
+                consumer,
+            )
+        }
+    }
+
+    impl TileOperator for NotifyingOp {
+        // A test double holds no operator, and no session walks one.
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(super::InputEdgeSpec<'_>)) {}
+
+        fn tiling(&self) -> &Tiling {
+            &self.tiling
+        }
+
+        fn subscribe(
+            &mut self,
+            _intent_guard: TileGuard,
+            consumer: Box<dyn super::Consumer>,
+            _scheduler: &mut super::Scheduler,
+        ) -> Box<dyn TileProducer> {
+            *self.consumer.borrow_mut() = Some(consumer);
+            let (spy, _, _) = ProjectionSpy::new(self.tile.clone(), self.tiling.clone());
+            Box::new(spy)
+        }
+    }
+
+    /// Notify through the consumer a [`NotifyingOp`] was subscribed with.
+    pub(crate) fn notify_input(consumer: &InputConsumer, arrived: &Projection) {
+        consumer
+            .borrow_mut()
+            .as_mut()
+            .expect("the operator was subscribed")
+            .notify(arrived);
     }
 
     /// A store's parts are collections held to the contract like any other: a decided set

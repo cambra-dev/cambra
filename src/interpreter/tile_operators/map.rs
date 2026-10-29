@@ -198,7 +198,15 @@ impl TileOperator for MapResult {
                 Tiling::DataFunction { codomain, .. } if !codomain.holds_a_level()
             );
         let function_producer = subscribe_forwarding(&mut *self.function, &shared, scheduler);
-        let input_producer = subscribe_forwarding(&mut *self.input, &shared, scheduler);
+        // The result's outermost keys are the input's where the function applies to the input's
+        // values, one level in, so the input's region is the result's. Applied to the input
+        // itself, or to a scalar, the function's own keys are the result's. The function operand
+        // is read at every key, so a change to it is a change to all of them, which
+        // `subscribe_forwarding` sends as `Everything`.
+        let keeps_keys =
+            self.level != CurryLevel::OUTERMOST && self.input.tiling().is_data_function();
+        let input_producer =
+            subscribe_forwarding_keeping_keys_if(keeps_keys, &mut *self.input, &shared, scheduler);
         Box::new(MapResultProducer {
             base: ProducerBase::new(
                 MapResultProducer::alloc_id(),
@@ -727,7 +735,12 @@ impl TileOperator for MapResultToConst {
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
         let constant_producer = subscribe_forwarding(&mut *self.constant, &shared, scheduler);
-        let input_producer = subscribe_forwarding(&mut *self.input, &shared, scheduler);
+        // The constant is read whole, since every row reads all of it, so its notification
+        // widens; the input is pulled at the projection.
+        let keeps_keys =
+            self.level != CurryLevel::OUTERMOST && self.input.tiling().is_data_function();
+        let input_producer =
+            subscribe_forwarding_keeping_keys_if(keeps_keys, &mut *self.input, &shared, scheduler);
         Box::new(MapResultToConstProducer {
             base: ProducerBase::new(
                 MapResultToConstProducer::alloc_id(),
@@ -863,8 +876,10 @@ impl MapResultToConstProducer {
             "MapResultToConst broadcasts a value, got {c_tiling:?}"
         );
         let i_tiling = self.input.tiling().clone();
-        // A scalar input has no keys to project, so it is read whole and the answer cut.
-        let input_guard = match i_tiling.is_data_function() {
+        // A scalar input has no keys to project, so it is read whole and the answer cut. Applied
+        // at the outermost level the constant replaces the whole input, so the output's keys are
+        // the constant's and the projection names none of the input's.
+        let input_guard = match i_tiling.is_data_function() && self.level != CurryLevel::OUTERMOST {
             true => projection.guard(&i_tiling),
             false => i_tiling.universal_guard(),
         };
@@ -1036,11 +1051,10 @@ impl TileOperator for MapResultWithSource {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let input = self.input.subscribe(
-            self.input.tiling().universal_guard(),
-            widening(consumer),
-            scheduler,
-        );
+        // The input is pulled at the projection, so its output keys are the input's.
+        let input =
+            self.input
+                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(MapResultWithSourceProducer::new(
             ProducerBase::new(
                 MapResultWithSourceProducer::alloc_id(),
@@ -2099,6 +2113,111 @@ mod projection_tests {
             Extent::uint_range(ROWS),
             Tiling::Scalar(Extent::Base(BaseType::Int)),
         )
+    }
+
+    /// The region a notification from the input reaches the consumer with is the input's, since
+    /// the result's keys are the input's. A notification from the function operand is a change
+    /// to the lookup at every key, which reaches the consumer as everything.
+    #[test]
+    fn a_map_result_forwards_its_inputs_region_and_everything_for_its_function() {
+        use crate::interpreter::tile_operators::test_helpers::{
+            NotifyingOp, RegionLog, notify_input,
+        };
+        let morsel = Projection::of(&keys_between(2, 4)).expect("keys");
+        // One consumer notifies once between pulls, so each operand gets a subscription.
+        let notified = |through_input: bool| {
+            let (table_tile, table_tiling) = table();
+            let positions = Tiling::data_function(
+                Extent::uint_range(ROWS),
+                Tiling::Scalar(Extent::uint_range(ROWS)),
+            );
+            let (input, input_consumer) =
+                NotifyingOp::new(stream((0..ROWS).collect()).0, positions);
+            let (function, function_consumer) = NotifyingOp::new(table_tile, table_tiling);
+            let mut map =
+                MapResult::new_at(Box::new(input), Box::new(function), CurryLevel::new(1));
+            let (log, regions) = RegionLog::new();
+            let _producer = map.subscribe(
+                map.tiling().universal_guard(),
+                Box::new(log),
+                &mut Scheduler::new(),
+            );
+            let operand = if through_input {
+                &input_consumer
+            } else {
+                &function_consumer
+            };
+            notify_input(operand, &morsel);
+            let seen = regions.borrow_mut();
+            seen.clone()
+        };
+        assert_eq!(notified(true), std::slice::from_ref(&morsel));
+        assert_eq!(notified(false), [Projection::Everything]);
+    }
+
+    /// Applied to a whole collection at the outermost level, the function's keys are the
+    /// result's, so a region of the collection's keys names none of them, though the input is a
+    /// data function.
+    #[test]
+    fn a_map_result_at_the_outermost_level_sends_everything_for_a_region_of_its_input() {
+        use crate::interpreter::tile_operators::test_helpers::{
+            NotifyingOp, RegionLog, notify_input,
+        };
+        let positions = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::uint_range(ROWS)),
+        );
+        let (input, input_consumer) =
+            NotifyingOp::new(stream((0..ROWS).collect()).0, positions.clone());
+        let function = Constant::new(
+            Value::Function(Vec::new()),
+            Extent::Function {
+                domain: Box::new(positions.extent()),
+                codomain: Box::new(Extent::Base(BaseType::Int)),
+            },
+        );
+        // A constant notifies its consumer when it is subscribed, which closes the gate, so a
+        // stand-in of its tiling that does not notify takes its place.
+        let function_tiling = function.tiling().clone();
+        let (function, _) = NotifyingOp::new(function_tiling.empty_tile(), function_tiling);
+        let mut map = MapResult::new_at(Box::new(input), Box::new(function), CurryLevel::OUTERMOST);
+        let (log, regions) = RegionLog::new();
+        let _producer = map.subscribe(
+            map.tiling().universal_guard(),
+            Box::new(log),
+            &mut Scheduler::new(),
+        );
+        notify_input(
+            &input_consumer,
+            &Projection::of(&keys_between(2, 4)).expect("keys"),
+        );
+        assert_eq!(*regions.borrow_mut(), [Projection::Everything]);
+    }
+
+    /// Applied to a scalar at the outermost level, the function's keys are the result's, so a
+    /// region of the input names none of them.
+    #[test]
+    fn a_map_result_over_a_scalar_sends_everything_for_a_region_of_its_input() {
+        use crate::interpreter::tile_operators::test_helpers::{
+            NotifyingOp, RegionLog, notify_input,
+        };
+        let (table_tile, table_tiling) = table();
+        let scalar = Tiling::Scalar(Extent::uint_range(ROWS));
+        let (input, input_consumer) =
+            NotifyingOp::new(Tile::Scalar(ColumnValue::single(Value::UInt(3))), scalar);
+        let (function, _) = NotifyingOp::new(table_tile, table_tiling);
+        let mut map = MapResult::new_at(Box::new(input), Box::new(function), CurryLevel::OUTERMOST);
+        let (log, regions) = RegionLog::new();
+        let _producer = map.subscribe(
+            map.tiling().universal_guard(),
+            Box::new(log),
+            &mut Scheduler::new(),
+        );
+        notify_input(
+            &input_consumer,
+            &Projection::of(&keys_between(2, 4)).expect("keys"),
+        );
+        assert_eq!(*regions.borrow_mut(), [Projection::Everything]);
     }
 
     /// The logs of a `MapResult` over two spies: the guards its input and its function operand
