@@ -1,41 +1,14 @@
 //! The static structure of the dataflow operator graph.
 //!
-//! The graph is built by walking the operators from the program's outputs, in
-//! [`BoundarySession::into_graph`]. Each operator states what it holds through
-//! [`TileOperator::visit_inputs`], which is the single statement of its inputs:
-//! the walk reads it, and so does `TileOperator::inspect`, which renders an
-//! operator's children from the same answer.
+//! [`BoundarySession::into_graph`] walks from program outputs through
+//! [`TileOperator::visit_inputs`]. Conversion records sink identities separately.
 //!
-//! The walk runs between conversion and the subscribe loop, which is the only
-//! window in which it is total. `subscribe` takes every [`CycleSlot`] and every
-//! store's keyed inputs, so an operator asked for its inputs after that answers
-//! without them.
+//! Walk newly constructed operators before subscription: subscribing consumes late-wired
+//! inputs. Stored edges point from consumers to inputs; dataflow runs in the reverse direction.
 //!
-//! An edge is a **subscription**: the consumer holds the operator the edge names
-//! and calls `get` on it. `notify` runs the other way along the same edges, so an
-//! edge is the pull direction rather than dataflow as a whole. One edge is held
-//! without being subscribed: a fan slot that lost `should_subscribe` while its
-//! sibling drove the subscribe for all of them.
+//! Edge ownership, traversal, and source attribution are specified in
+//! `src/interpreter/design-operators.md`, "Operator identity and the graph the inspector reads".
 //!
-//! Degrees are counted in dataflow direction — an operator holding no input has
-//! in-degree 0, a sink out-degree 0 — while an edge is stored on the consumer and
-//! names the node it subscribes, so the stored relation runs the other way.
-//!
-//! A data source is not a node. The operators that read one are an
-//! `IterateExtent` over its domain, which the scheduler wakes when the source
-//! produces, and a `MapResultWithSource` downstream of that iteration. A key of a
-//! source's domain has no other origin, because inference admits no literal of a
-//! `source(name)` type. Both carry the source in their tilings, and the
-//! `IterateExtent` holds no input, so it is where a path from the source starts.
-//!
-//! What the walk cannot produce is the sink. A sink is a graph node rather than an
-//! operator, so it has no identity to read off an operator. Conversion records
-//! that much and nothing else; see [`Boundaries`].
-//!
-//! `src/interpreter/design-operators.md`, "Operator identity and the graph the
-//! inspector reads" owns the design.
-//!
-//! [`CycleSlot`]: crate::interpreter::tile_operators::CycleSlot
 //! [`TileOperator::visit_inputs`]: crate::interpreter::tile_operators::TileOperator::visit_inputs
 
 use smol_str::SmolStr;
@@ -46,33 +19,23 @@ use crate::interpreter::tile_operators::TileOperator;
 use crate::interpreter::tiling::Tiling;
 
 /// How a downstream operator holds one of its inputs.
-///
-/// Exhaustive over the operator-to-operator edges the production operators have,
-/// measured from their fields. The plan note under
-/// `projects/program-inspector` in the internal vault carries the survey.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum EdgeKind {
     /// An exclusively owned `Box<dyn TileOperator>`.
     ///
-    /// `deferred` marks one wired through a [`CycleSlot`] after the owner was
-    /// constructed, which is an attribute of *when* rather than of ownership:
-    /// every ownership question answers the same as an ordinary `Box`.
+    /// `deferred` marks an input wired through a [`CycleSlot`] after its owner was constructed.
+    /// It does not change exclusive ownership.
     ///
     /// [`CycleSlot`]: crate::interpreter::tile_operators::CycleSlot
     Value { deferred: bool },
-    /// An edge to a node more than one consumer may reach: a `FanOutSlot`'s
-    /// edge to its fan input.
-    ///
-    /// What separates this from [`Value`](Self::Value) is exclusivity, not
-    /// indirection. A node several consumers subscribe has no single owner,
-    /// which is why the forest invariant ranges over value edges alone.
+    /// A `FanOutSlot`'s edge to its fan input, which other slots may also reach.
+    /// Excluded from the exclusive-ownership forest.
     Share,
 }
 
 /// What names an input at its consumer.
 ///
-/// Three shapes, because operator arity is not uniform: a named field, a position
-/// in a `Vec`, or a store key.
+/// Named fields, vector positions, and store keys remain distinct even when their labels match.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EdgeRole {
     /// The field the consumer stores the input under, e.g. `"input"`,
@@ -84,8 +47,7 @@ pub enum EdgeRole {
     StoreKey(String),
 }
 
-/// How a role reads as a label — the same rendering the wire's
-/// `OperatorEdgeRole` ships, and what `inspect` names a child by.
+/// Display label used by operator inspection and the wire's `OperatorEdgeRole`.
 impl std::fmt::Display for EdgeRole {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -143,10 +105,6 @@ pub(crate) fn value_keyed<'a>(
 
 /// An owned input wired through a [`CycleSlot`] after its holder was built.
 ///
-/// Deferred is a property of the field rather than of the run: a slot is the only
-/// way an operator receives an input it did not get from its constructor, so
-/// every slot-held input is deferred and no other input is.
-///
 /// [`CycleSlot`]: crate::interpreter::tile_operators::CycleSlot
 pub(crate) fn value_late<'a>(role: EdgeRole, op: &'a dyn TileOperator) -> InputEdgeSpec<'a> {
     InputEdgeSpec {
@@ -156,11 +114,7 @@ pub(crate) fn value_late<'a>(role: EdgeRole, op: &'a dyn TileOperator) -> InputE
     }
 }
 
-/// A slot's edge to its fan input.
-///
-/// Whether the fan closes a cycle is not this edge's business. Every cycle in
-/// the graph runs through an input wired late — see [`EdgeKind::Value`]'s
-/// `deferred` — and a store's remaining slots serve its downstream reads.
+/// A slot's shared edge to its fan input, whether or not the edge belongs to a cycle.
 pub(crate) fn share<'a>(fan_input: &'a dyn TileOperator) -> InputEdgeSpec<'a> {
     InputEdgeSpec {
         role: EdgeRole::Named("fan"),
@@ -169,11 +123,7 @@ pub(crate) fn share<'a>(fan_input: &'a dyn TileOperator) -> InputEdgeSpec<'a> {
     }
 }
 
-/// One node of the graph.
-///
-/// Operators, plus the program's output boundary. Without the sink the graph ends
-/// in the middle of nothing: an output is a field name the boundary holds rather
-/// than an operator itself.
+/// An operator or compiled output boundary. An output field has a sink node but no operator.
 #[derive(Clone, Debug)]
 pub enum GraphNode {
     /// An operator, with the inputs it holds.
@@ -193,9 +143,9 @@ pub enum GraphNode {
 
 /// The static operator graph of one compiled program.
 ///
-/// Each output's operators with a holder after everything it holds, then that
-/// output's sink. Deterministic: the walk visits an operator's
-/// inputs in the order the operator states them.
+/// Nodes are emitted in depth-first postorder, visiting outputs and inputs in their supplied
+/// order. A visited set prevents repeated emission and recursion through cycles. Each output's
+/// sink follows the traversal of its input.
 #[derive(Clone, Debug, Default)]
 pub struct OperatorGraph {
     nodes: Vec<GraphNode>,
@@ -207,21 +157,9 @@ impl OperatorGraph {
         &self.nodes
     }
 
-    /// The nodes no `Value` edge subscribes, which is where a walk of the
-    /// subscription forest starts.
-    ///
-    /// Derived from the edges rather than recorded. A node's owner is the one
-    /// `Value` edge that names it, so the edge table already answers this and a
-    /// stored copy could only disagree with it.
-    ///
-    /// Two kinds of node qualify. A **sink**: nothing subscribes it. A **fan
-    /// input**: the `Rc<FanOut>` holding it is dropped when conversion ends, so
-    /// only its slots survive, and each names it with a `Share` — and a
-    /// binding whose variable is never used has a fan with no slots at all,
-    /// so nothing names it.
-    ///
-    /// Every node of the graph is reachable from here along `Value` edges alone,
-    /// which is what [`assert_graph_invariants`] pins.
+    /// Nodes that no `Value` edge targets, in node order: roots of the ownership forest.
+    /// Sinks and shared fan inputs qualify. [`assert_graph_invariants`] checks that these
+    /// roots reach every recorded node through `Value` edges alone.
     pub(crate) fn walk_starts(&self) -> Vec<NodeId> {
         let owned: std::collections::HashSet<NodeId> = self
             .edges()
@@ -253,25 +191,14 @@ impl OperatorGraph {
     }
 }
 
-/// Assert the graph's structural invariants, at the conversion boundary.
+/// In debug and test builds, check edge targets, exclusive ownership, and reachability from
+/// [`OperatorGraph::walk_starts`] through `Value` edges. Together these require a value-edge
+/// forest.
+/// A value-edge cycle has no root and cannot be entered by another value edge without violating
+/// exclusive ownership. The check covers recorded nodes, not operators omitted from the graph.
 ///
-/// Gated as an expression rather than a `#[cfg]` item, mirroring
-/// [`assert_unique_node_ids`](crate::ccl::context::assert_unique_node_ids), so
-/// the same call site compiles under every clippy pass.
-///
-/// Two invariants, neither type-enforced:
-///
-/// * **The value edges form a forest.** Ownership is single because every owned
-///   input is a `Box`. Acyclicity follows from the other two assertions rather
-///   than standing on its own: a value cycle's members each have their only
-///   value parent inside the cycle, so none is a walk start and no value edge
-///   enters from outside, which the reachability check reports as stranded. The
-///   renderer's absence of a cycle guard rests on this.
-/// * **Every node is reachable from [`OperatorGraph::walk_starts`] along the `Value`
-///   edges.** That relation is the one every consumer walks — the renderer draws
-///   value edges as the child relation and share edges as reference leaves — so a
-///   node it misses is a node nothing draws. An unreachable node is one a
-///   construction site built and dropped, which nothing else notices.
+/// The item exists in every build so release callers compile; the body returns immediately when
+/// neither `debug_assertions` nor `test` is enabled.
 pub(crate) fn assert_graph_invariants(graph: &OperatorGraph) {
     if !cfg!(any(debug_assertions, test)) {
         return;
@@ -356,13 +283,8 @@ thread_local! {
     static BOUNDARIES: RefCell<Option<Boundaries>> = const { RefCell::new(None) };
 }
 
-/// The program's boundary nodes, which no walk of the operators can produce.
-///
-/// A sink is a graph node rather than an operator, so it has no identity or
-/// provenance row that a walk could read off an operator.
-///
-/// Everything else comes from the walk — every operator, and every edge,
-/// including the edge into a sink.
+/// Per-compilation sink identities and the set of reused operators already attributed.
+/// Sink edges and operator nodes are obtained by walking the outputs.
 #[derive(Default)]
 struct Boundaries {
     /// Each compiled output field's node.
@@ -397,9 +319,9 @@ impl BoundarySession {
 
     /// Walk `outputs` into the graph, ending the session.
     ///
-    /// Runs before `subscribe`, which is what makes the walk total: `subscribe`
-    /// takes every [`CycleSlot`] and every store's keyed inputs, so an operator
-    /// asked for its inputs afterwards would answer without them.
+    /// Call before subscribing newly constructed operators: subscription consumes
+    /// [`CycleSlot`] contents and store inputs. Already-subscribed reused operators expose
+    /// only the inputs they still hold.
     ///
     /// [`CycleSlot`]: crate::interpreter::tile_operators::CycleSlot
     pub(crate) fn into_graph(self, outputs: &[(SmolStr, Box<dyn TileOperator>)]) -> OperatorGraph {
@@ -441,11 +363,9 @@ impl Drop for BoundarySession {
     }
 }
 
-/// Emit `op` and everything it holds, children before their holder.
+/// Emit reachable operators in depth-first postorder, skipping previously visited ids.
 ///
-/// An operator answering no id is a test double, which the walk neither emits
-/// nor descends into — nothing installs a session around a test that builds
-/// operators by hand.
+/// An operator with no id is neither emitted nor traversed. Test doubles can omit identities.
 fn walk_operator(
     op: &dyn TileOperator,
     seen: &mut std::collections::HashSet<NodeId>,
@@ -518,8 +438,7 @@ pub(crate) fn record_kept_operators(op: &dyn TileOperator) {
 /// produces. Read off each iteration's tiling, whose domain is the extent it
 /// iterates. A source the program iterates nowhere has no entry.
 ///
-/// Re-derived per version rather than cached across one, because every compile
-/// mints its operators' ids afresh.
+/// Derived from the current graph, including any operators reused from an earlier version.
 pub fn source_nodes(graph: &OperatorGraph) -> std::collections::HashMap<String, Vec<NodeId>> {
     use crate::interpreter::tile_operators::{IterateExtent, short_type_name};
 
