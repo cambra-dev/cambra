@@ -172,6 +172,16 @@ impl TileOperator for CheckedLookup {
         }
     }
 
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        match &mut self.source {
+            LookupSource::Split { collection, keys } => {
+                visit(collection);
+                visit(keys);
+            }
+            LookupSource::Paired(pairs) => visit(pairs),
+        }
+    }
+
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,

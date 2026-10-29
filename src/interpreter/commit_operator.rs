@@ -1806,6 +1806,12 @@ impl TileOperator for CommitOperator {
         }
     }
 
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        for (_, op) in &mut self.seed_ops {
+            visit(op);
+        }
+    }
+
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -2456,6 +2462,12 @@ impl TileOperator for InductionStore {
             .peek(&mut |op| visit(value_late(EdgeRole::Named("body"), op)));
     }
 
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        for (_, op) in &mut self.seed_ops {
+            visit(op);
+        }
+    }
+
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -3067,6 +3079,10 @@ impl TileOperator for StoreValueStream {
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("store_op", &*self.store_op));
     }
+
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.store_op);
+    }
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -3307,6 +3323,10 @@ impl TileOperator for StoreFinalRead {
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("store_op", &*self.store_op));
+    }
+
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.store_op);
     }
     fn subscribe(
         &mut self,
@@ -3568,6 +3588,10 @@ impl TileOperator for StoreDenseRead {
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("store_op", &*self.store_op));
+    }
+
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.store_op);
     }
     fn subscribe(
         &mut self,
@@ -4022,6 +4046,11 @@ impl TileOperator for AsOf {
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("trigger", &*self.trigger));
         visit(value("source", &*self.source));
+    }
+
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.trigger);
+        visit(&mut self.source);
     }
 
     fn subscribe(
@@ -5028,6 +5057,17 @@ impl TileOperator for InductionDriver {
         }
     }
 
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.store_op);
+        visit(&mut self.source_op);
+        if let Some(nested) = &mut self.nested {
+            visit(&mut nested.pairs);
+            for seed in &mut nested.reseeds {
+                visit(seed);
+            }
+        }
+    }
+
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -5743,6 +5783,11 @@ impl TileOperator for TransactDriver {
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("store_op", &*self.store_op));
         visit(value("source_op", &*self.source_op));
+    }
+
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.store_op);
+        visit(&mut self.source_op);
     }
 
     fn subscribe(
@@ -6526,6 +6571,12 @@ impl TileOperator for TransactWriter {
         visit(value("store_op", &*self.store_op));
         visit(value("body_op", &*self.body_op));
         visit(value("driver_op", &*self.driver_op));
+    }
+
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.store_op);
+        visit(&mut self.body_op);
+        visit(&mut self.driver_op);
     }
     fn subscribe(
         &mut self,
@@ -7399,6 +7450,7 @@ mod tests {
     impl TileOperator for ItemSource {
         // A test double holds no operator, and no session walks one.
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -7448,6 +7500,7 @@ mod tests {
     impl TileOperator for FilteredLiveSource {
         // A test double holds no operator, and no session walks one.
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -7616,6 +7669,7 @@ mod tests {
     impl TileOperator for AddIfBody {
         // A test double holds no operator, and no session walks one.
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -8598,6 +8652,7 @@ mod tests {
     impl TileOperator for ProposalSource {
         // A test double holds no operator, and no session walks one.
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -8736,6 +8791,7 @@ mod tests {
     impl TileOperator for CounterBody {
         // A test double holds no operator, and no session walks one.
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -8852,6 +8908,7 @@ mod tests {
     impl TileOperator for DriverProbe {
         // A test double holds no operator, and no session walks one.
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
         fn tiling(&self) -> &Tiling {
             self.inner.tiling()
         }
@@ -9133,6 +9190,7 @@ mod tests {
     impl TileOperator for TokenWriter {
         // A test double holds no operator, and no session walks one.
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -9324,6 +9382,7 @@ mod tests {
     impl TileOperator for StoreReadAsOf {
         // A test double holds no operator, and no session walks one.
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -9435,6 +9494,7 @@ mod tests {
     impl TileOperator for BankWriter {
         // A test double holds no operator, and no session walks one.
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -9585,6 +9645,7 @@ mod tests {
     impl TileOperator for FixedSource {
         // A test double holds no operator, and no session walks one.
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -9842,6 +9903,7 @@ mod tests {
     }
     impl TileOperator for RecordingSource {
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -10353,6 +10415,7 @@ mod tests {
     }
     impl TileOperator for SharedSource {
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -10759,6 +10822,7 @@ mod tests {
     }
     impl TileOperator for CountingSeed {
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }

@@ -531,6 +531,17 @@ impl FanHold {
         }
     }
 
+    /// Visit the fan-out's input operator mutably, under its write lock. The visitor is where a
+    /// pool replaces the fan-out's input, which every slot of the fan-out reads.
+    fn with_input_mut(&self, f: impl FnOnce(&mut Box<dyn TileOperator>)) {
+        match self {
+            FanHold::Reader { input, .. } => f(&mut input.write_now()),
+            FanHold::Recurrence { input, .. } => {
+                f(&mut input.upgrade().expect(DEAD_RECURRENCE).write_now())
+            }
+        }
+    }
+
     /// Subscribe to the fan-out's input operator, the one use that needs it
     /// mutably.
     fn subscribe_input(
@@ -577,6 +588,10 @@ impl TileOperator for FanOutSlot {
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         self.hold.with_input(|op| visit(share(op)));
+    }
+
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        self.hold.with_input_mut(visit);
     }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
@@ -948,6 +963,10 @@ impl TileOperator for Memo {
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("input", &*self.input));
+    }
+
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.input);
     }
 
     fn subscribe(
@@ -1359,6 +1378,7 @@ mod tests {
         impl_operator_base!();
 
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
 
         fn subscribe(
             &mut self,

@@ -68,6 +68,7 @@ impl TileOperator for IterateExtent {
     impl_operator_base!();
 
     fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+    fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
 
     /// A finite range `[0, n)` reads no source, so its rows are cut into morsels by position. A
     /// data-source domain of a source that cuts morsels is a [`LiveSource`] over the source's

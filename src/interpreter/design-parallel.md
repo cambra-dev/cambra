@@ -78,6 +78,20 @@ Which rows the source enumerates is the source's to say ([The dispatcher](#the-d
 morsels. The programs this admits are `[x + 1 for x in xs]` over a literal list and a `sum`, `max`
 or `min` of it; a source over a data-source domain is the next shape.
 
+The plan reads the graph through `TileOperator::visit_inputs` and cuts it through
+`TileOperator::visit_inputs_mut`, which states an operator's owned inputs as boxes the visitor may
+replace. It visits what `visit_inputs` states as a value edge, in the same order, and the shared
+input of a `FanOutSlot` under the fan-out's write lock, so a visitor at a slot reaches the `Memo`
+and below it the chain of the pipeline before the breaker. An edge wired after the operator was
+built, which a store's writers are, is not reached: a plan that cuts a graph refuses a program with
+such an edge. The method is required, as `visit_inputs` is: an operator states its inputs, and a
+leaf states that it holds none. A test compiles a corpus of programs, each of which has to compile,
+and checks at every operator the mutable visitor reaches that the two visitors state the same
+inputs. It lists the kinds that state an input and that the corpus reaches through any edge,
+deferred ones included, and the kinds it does not reach, which the commit stores, their drivers and
+writers, `AsOf` and a few others are, and it fails when a kind moves between the lists. A visitor
+that replaces the input of a slot changes what the slot states.
+
 ### The pool
 
 `run_main` subscribes the chain under the breaker once per worker, so each worker owns one producer

@@ -67,6 +67,10 @@ impl TileOperator for Converse {
         visit(value("input", &*self.input));
     }
 
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.input);
+    }
+
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -458,6 +462,10 @@ impl TileOperator for MapDomain {
         visit(value("input", &*self.input));
     }
 
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.input);
+    }
+
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -602,6 +610,10 @@ impl TileOperator for Uncurry {
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("input", &*self.input));
+    }
+
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.input);
     }
 
     fn subscribe(
@@ -897,6 +909,11 @@ impl TileOperator for Filter {
         visit(value("predicate", &*self.predicate));
     }
 
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.input);
+        visit(&mut self.predicate);
+    }
+
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -1179,6 +1196,10 @@ impl TileOperator for Restrict {
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("predicate", &*self.predicate));
+    }
+
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.predicate);
     }
 
     fn subscribe(
@@ -1553,6 +1574,11 @@ impl TileOperator for Product {
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("outer", &*self.outer));
         visit(value("inner", &*self.inner));
+    }
+
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.outer);
+        visit(&mut self.inner);
     }
 
     fn subscribe(

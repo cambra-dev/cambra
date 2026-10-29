@@ -56,6 +56,7 @@ impl TileOperator for BreakerOutput {
     impl_operator_base!();
 
     fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+    fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
 
     fn morsel_source(&self) -> Option<Arc<dyn MorselSource>> {
         Some(self.source.clone())

@@ -6333,6 +6333,7 @@ mod variant_ctor_tests {
             _visit: &mut dyn FnMut(crate::interpreter::operator_graph::InputEdgeSpec<'_>),
         ) {
         }
+        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }

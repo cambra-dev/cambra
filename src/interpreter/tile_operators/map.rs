@@ -183,6 +183,11 @@ impl TileOperator for MapResult {
         visit(value("fn", &*self.function));
     }
 
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.input);
+        visit(&mut self.function);
+    }
+
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -731,6 +736,11 @@ impl TileOperator for MapResultToConst {
         visit(value("constant", &*self.constant));
     }
 
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.input);
+        visit(&mut self.constant);
+    }
+
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -1048,6 +1058,10 @@ impl TileOperator for MapResultWithSource {
         // The source is read here and states no edge: it is not a node of the
         // graph, and `input` descends from the `IterateExtent` over its domain.
         visit(value("input", &*self.input));
+    }
+
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.input);
     }
 
     fn subscribe(

@@ -49,6 +49,10 @@ impl TileOperator for Aggregate {
         visit(value("input", &*self.input));
     }
 
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.input);
+    }
+
     fn pool_input(&mut self) -> Option<&mut dyn TileOperator> {
         Some(&mut *self.input)
     }
@@ -226,6 +230,10 @@ impl TileOperator for ExtractAggregate {
         visit(value("input", &*self.input));
     }
 
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.input);
+    }
+
     fn pool_input(&mut self) -> Option<&mut dyn TileOperator> {
         Some(&mut *self.input)
     }
@@ -371,6 +379,10 @@ impl TileOperator for MapExtractAggregate {
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("input", &*self.input));
+    }
+
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.input);
     }
 
     fn subscribe(
@@ -641,6 +653,10 @@ impl TileOperator for MapAggregate {
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("input", &*self.input));
+    }
+
+    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+        visit(&mut self.input);
     }
 
     fn subscribe(

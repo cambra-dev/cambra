@@ -134,6 +134,7 @@ mod end_to_end {
 
     impl TileOperator for LiveRows {
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
 
         fn tiling(&self) -> &Tiling {
             &self.tiling
@@ -405,6 +406,10 @@ mod end_to_end {
                 "input",
                 &*self.input,
             ));
+        }
+
+        fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
+            visit(&mut self.input);
         }
 
         fn subscribe(
