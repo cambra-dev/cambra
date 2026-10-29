@@ -1637,6 +1637,42 @@ the compilation declined outlives it here"
         self.transactional_stores.get(name)
     }
 
+    /// The extent bounding a sum's `domain`: each witness it names by its kind's bound
+    /// ([`Self::witness_domain_extent`]), inside the products the domain builds of them. One
+    /// generator's sum is its witness alone; a product of conditional generators is a tuple of
+    /// one witness per generator, and its keys are records of theirs.
+    fn sum_domain_extent(
+        &self,
+        domain: &Type,
+        kinds: &HashMap<crate::ccl::WitnessId, crate::ccl::TypeKind>,
+        ty: &Type,
+    ) -> Result<Extent, ConversionError> {
+        match domain.peel_refinements() {
+            Type::WitnessRef(w) => match kinds.get(w) {
+                Some(kind) => self.witness_domain_extent(kind, ty),
+                None => Err(ConversionError::TypeError(format!(
+                    "a sum's domain names a witness its binders do not: {ty}; this is a \
+                     compiler bug"
+                ))),
+            },
+            Type::Tuple(ts) => Ok(Extent::record(
+                ts.iter()
+                    .enumerate()
+                    .map(|(i, t)| Ok((tuple_field(i), self.sum_domain_extent(t, kinds, ty)?)))
+                    .collect::<Result<HashMap<_, _>, ConversionError>>()?,
+            )),
+            Type::Record(named) => Ok(Extent::record(
+                named
+                    .iter()
+                    .map(|(name, t)| {
+                        Ok((name.runtime_key(), self.sum_domain_extent(t, kinds, ty)?))
+                    })
+                    .collect::<Result<HashMap<_, _>, ConversionError>>()?,
+            )),
+            other => self.extent_of(other),
+        }
+    }
+
     /// The extent **bounding** a witness's domain — what the type says about a domain the
     /// value holds.
     ///
@@ -1747,12 +1783,19 @@ the compilation declined outlives it here"
             // A sum, whose witness the value carries. The domain converts through
             // [`Self::witness_domain_extent`]; the general function arm below would meet the
             // witness reference standing in the domain and have nothing to convert it to.
-            Type::Fun { codomain, .. } if ty.witness_kind().is_some() => {
-                let Some(kind) = ty.witness_kind() else {
-                    unreachable!("guarded by the arm")
-                };
+            Type::Fun {
+                fun_kind,
+                domain,
+                codomain,
+                ..
+            } if ty.witness_kind().is_some() => {
+                let kinds: HashMap<crate::ccl::WitnessId, crate::ccl::TypeKind> = fun_kind
+                    .witnesses()
+                    .iter()
+                    .map(|w| (*w.id(), w.type_kind()))
+                    .collect();
                 Ok(Extent::Function {
-                    domain: Box::new(self.witness_domain_extent(&kind, ty)?),
+                    domain: Box::new(self.sum_domain_extent(domain, &kinds, ty)?),
                     codomain: Box::new(self.extent_of(codomain)?),
                 })
             }
@@ -2152,7 +2195,7 @@ fn convert_impl_inner(
             }
             union_operand_ops(
                 operands,
-                UnionShape::DisjointJoin,
+                UnionShape::DisjointJoin { over: None },
                 union_codomain_extent(&expr.ty, ctx)?,
                 input,
                 ctx,
@@ -2354,7 +2397,48 @@ fn convert_impl_inner(
         // the *type* above it stay unchanged while the value below became the executable
         // form. Op-conversion wants the executable form, so the wrapper is dropped and the
         // value compiled — its own type, not the asserted one, is what extents read from.
-        TypedExprNode::Realize(value) => convert_impl(value, input, ctx),
+        // **A realized sum keeps the keys of the leg that holds its rows.** Realization builds
+        // a copairing of gated legs, one per arm, and asserts the sum back on top; the
+        // copairing's tags tell the legs apart, but at most one leg holds rows, so the value
+        // the sum denotes is that leg keyed by its own keys. Merging flat at the bound the
+        // sum's type declares is that, where a tagged merge would show every key wearing its
+        // leg's tag (`src/ccl/design/collections.md`, "Compiling a conditional collection").
+        TypedExprNode::Realize(value) => match &value.node {
+            TypedExprNode::Copair(operands) if expr.ty.witness_kind().is_some() => {
+                // A fed union merges one level above its input, where the arms split the
+                // input's rows. A realized leg is a whole collection per row, so that merge
+                // would put each leg's keys at the wrong level. No program feeds one: a
+                // realized conditional stands where its witness is bound, outside any row.
+                if input.is_some() {
+                    return Err(ConversionError::Unsupported(
+                        "a fed realized conditional: its legs are whole collections per row, \
+                         and the fed union merges rows the arms split"
+                            .to_string(),
+                    ));
+                }
+                let Extent::Function { domain, codomain } = ctx.extent_of(&expr.ty)? else {
+                    unreachable!("a sum converts to a function extent: {}", expr.ty)
+                };
+                union_operand_ops(
+                    operands,
+                    UnionShape::DisjointJoin {
+                        over: Some(*domain),
+                    },
+                    *codomain,
+                    input,
+                    ctx,
+                )
+            }
+            // An opened sum, the function view `σ ⤇ V` a `Case` inside a predicate has after
+            // `lambda_elim`, carries no binder, so its kind is not here to bound the legs'
+            // keys, and converting the copairing as itself would key each row by its leg.
+            TypedExprNode::Copair(_) if expr.ty.is_witness_indexed() => unreachable!(
+                "a realized copairing typed by an opened sum reached op-conversion, with no \
+                 witness kind to bound its legs' keys: {}",
+                expr.ty
+            ),
+            _ => convert_impl(value, input, ctx),
+        },
 
         // If we are applying an aggregate, then it is a global aggregate that should use the Aggregate operator.
         TypedExprNode::Apply { argument, function }
@@ -5642,10 +5726,15 @@ fn map_order_key(
 /// **join of partial maps over one domain** (result on that domain, defined only
 /// where the operands are disjoint). Input-presence does not distinguish them — it
 /// decides only *how* the operands are wired.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum UnionShape {
     Copair,
-    DisjointJoin,
+    /// `over` is the bound the merged keys range over where the operands' domains differ,
+    /// the legs of a realized sum ([`UnionOperator::new_flat_over`]); `None` merges over
+    /// the domain they share.
+    DisjointJoin {
+        over: Option<Extent>,
+    },
 }
 
 /// The merged column's value extent, read off the union **node's** type.
@@ -5685,9 +5774,12 @@ fn union_operand_ops(
                 UnionShape::Copair => {
                     Box::new(UnionOperator::new(ops, declared_codomain)) as Box<dyn TileOperator>
                 }
-                UnionShape::DisjointJoin => {
-                    Box::new(UnionOperator::new_flat(ops, declared_codomain))
-                }
+                UnionShape::DisjointJoin { over } => Box::new(UnionOperator::new_flat_over(
+                    ops,
+                    over,
+                    declared_codomain,
+                    CurryLevel::OUTERMOST,
+                )),
             })
         }
         // A **fed** union: fan the input to every operand (each restricts its own
@@ -5708,14 +5800,14 @@ fn union_operand_ops(
         // inside a lambda over the parameter, which fails upstream at the post-elim
         // typecheck.
         Some(inp) => {
-            if shape == UnionShape::Copair {
+            let UnionShape::DisjointJoin { over } = shape else {
                 return Err(ConversionError::Unsupported(
                     "a fed copairing: its arms are over distinct index sets, so they \
                      cannot flat-merge back onto one domain, and no tagged fed form \
                      is built yet"
                         .to_string(),
                 ));
-            }
+            };
             // `Memo` the shared fed input so the fan's slots (one per arm) stay
             // consistent under a re-entrant pull — the transaction writer pulls the
             // body once per proposal.
@@ -5730,8 +5822,9 @@ fn union_operand_ops(
                 .iter()
                 .map(|e| convert_impl(e, Some(fan.slot()), ctx))
                 .collect::<Result<Vec<_>, _>>()?;
-            Ok(Box::new(UnionOperator::new_flat_at(
+            Ok(Box::new(UnionOperator::new_flat_over(
                 ops,
+                over,
                 declared_codomain,
                 level,
             )))
