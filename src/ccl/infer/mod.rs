@@ -739,8 +739,14 @@ pub(crate) fn run(
 fn push_capability_failures(errors: &mut Vec<LocatedInferError>, expr: &Expr) {
     use crate::ccl::capabilities::Blame;
     use crate::ccl::infer_var::Origin;
+    // Each use of a polymorphic definition checks its own copy of the definition's bounds,
+    // and the copies name the definition's nodes, so one failure is reported once.
+    let mut reported = HashSet::new();
     for failure in crate::ccl::capabilities::exceeded_uppers() {
         let item = failure.capability.item.to_string();
+        if !reported.insert((failure.capability.at, item.clone(), failure.blame)) {
+            continue;
+        }
         // A compiler trait's signature is written nowhere, so it labels nothing.
         let (error, written) = match failure.blame {
             Blame::Clause(at) => (InferError::CapabilityBeyondClause { item }, Some(at)),
@@ -751,6 +757,15 @@ fn push_capability_failures(errors: &mut Vec<LocatedInferError>, expr: &Expr) {
                 },
                 at,
             ),
+            Blame::NestedTransaction(_) => {
+                errors.push(LocatedInferError {
+                    error: InferError::NestedTransaction,
+                    node_id: failure.capability.at.unwrap_or_else(|| expr.node_id()),
+                    also: Box::default(),
+                    related: RelatedPositions::default(),
+                });
+                continue;
+            }
             Blame::Written(at) => (InferError::CapabilityNotStated { item }, Some(at)),
             Blame::Bound(at) => (InferError::CapabilityBeyondBound { item }, Some(at)),
         };
@@ -1284,6 +1299,7 @@ fn run_once(
     sub_ctx.settle_effect_links();
     push_capability_failures(&mut errors, expr);
     errors.extend(sub_ctx.requirements_beyond_clauses());
+    errors.extend(sub_ctx.escaping_results());
     if !errors.is_empty() {
         return Err(sub_ctx.failure(errors));
     }

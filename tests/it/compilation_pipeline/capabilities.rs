@@ -1171,6 +1171,100 @@ fn a_module_argument_beyond_its_entry_is_refused() {
     );
 }
 
+/// A function returning a function that requires or causes something naming a variable the
+/// returning function binds is refused: the returned function would outlive the variable.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_read(
+    indoc! {"
+        def counter(start: Int):
+            c := start
+            \\x -> c + x
+    "},
+    "this returns a function that has `Read(c)`"
+)]
+#[case::through_a_record(
+    indoc! {"
+        def counter(start: Int):
+            c := start
+            (get=\\x -> c + x, n=1)
+    "},
+    "this returns a function that has `Read(c)`"
+)]
+fn a_function_returning_a_closure_over_its_variable_is_refused(
+    #[case] code: &str,
+    #[case] needle: &str,
+) {
+    let errors = super::modules::compile_errors(&program(&format!("{code}\n0\n"), &[]));
+    assert!(errors.contains(needle), "{errors}");
+}
+
+/// A write or an append handing a variable a function that names a variable whose scope ends
+/// first is refused: the variable would hold the function past that scope
+/// (`docs/chl-spec.md`, "Discharging requirements and effects").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::written_to_a_parameter(
+    indoc! {"
+        def stash(m: Mut(_)):
+            c := 1
+            m := \\x -> c + x
+        f := \\x -> x
+        stash(f)
+    "},
+    "this writes to `m` a function that has `Read(c)`"
+)]
+#[case::appended_to_a_feed(
+    indoc! {"
+        fs: Feed(_)
+        def push(n: Int):
+            c := n
+            fs << (\\x -> c + x)
+        push(1)
+    "},
+    "this appends to `fs` a function that has `Read(c)`"
+)]
+fn a_function_handed_to_an_outer_variable_is_refused(#[case] code: &str, #[case] needle: &str) {
+    let errors = super::modules::compile_errors(&program(&format!("{code}\n0\n"), &[]));
+    assert!(errors.contains(needle), "{errors}");
+}
+
+/// A returned function naming only what outlives the returning function, a parameter's
+/// value, is kept.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_parameter(indoc! {"
+    def adder(n: Int):
+        \\x -> x + n
+    f = adder(1)
+    f(2)
+"})]
+fn a_returned_closure_over_what_outlives_it_is_kept(#[case] root: &str) {
+    super::helpers::check_program_scalar(&program(root, &[]), cambra::interpreter::Value::Int(3));
+}
+
+/// A commit inside a `with begin():` block's body is refused, directly or through a call,
+/// including a call of a function a polymorphic definition takes as a parameter, which each
+/// use decides (`docs/chl-spec.md`, "8.2 Transactions: `with begin():`").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::through_a_parameter(indoc! {"
+    stock: Mut(Int, Txn) := 10
+    def taken(n: Int) => Int:
+        with begin():
+            stock := stock - n
+        n
+    def in_txn(f, x: Int):
+        with begin():
+            stock := stock - f(x)
+    in_txn(taken, 1)
+    0
+"})]
+fn a_commit_inside_a_transaction_is_refused(#[case] root: &str) {
+    let errors = super::modules::compile_errors(&program(root, &[]));
+    assert!(errors.contains("transactions do not nest"), "{errors}");
+}
+
 /// A transactional variable belongs to the run, so its capabilities name no variable, and it is
 /// declared at a module's top level (`docs/chl-spec.md`, "Discharging requirements and
 /// effects").
@@ -1563,6 +1657,27 @@ fn a_runs_state_is_written_where_it_has_one(#[case] code: &str, #[case] needle: 
     "},
     "pub go: Int => Int"
 )]
+#[case::returned_naming_no_variable(
+    indoc! {"
+        pub def maker(f: (Int => Int causes Effect except (Write(*), Append(*)))) => Int => Int causes Effect except (Write(*), Append(*)):
+            c := 0
+            for x in [1, 2]:
+                c += x
+            \\x -> f(x) + 1
+    "},
+    "pub maker: (Int => Int causes Effect except (Write(*), Append(*))) => Int => Int causes \
+     Effect except (Write(*), Append(*))"
+)]
+#[case::returned_naming_only_feeds(
+    indoc! {"
+        pub def maker(f: (Int => Int causes Append(*))) => Int => Int causes Append(*):
+            c := 0
+            for x in [1, 2]:
+                c += x
+            \\x -> f(x) + 1
+    "},
+    "pub maker: (Int => Int causes Append(*)) => Int => Int causes Append(*)"
+)]
 fn a_top_is_written(#[case] code: &str, #[case] line: &str) {
     let interface = interface_of(code);
     assert!(interface.lines().any(|l| l == line), "{interface}");
@@ -1790,6 +1905,36 @@ fn a_capability_list_is_checked(#[case] code: &str, #[case] needle: &str) {
 /// binding one, or a module whose top level binds an induction variable (`docs/chl-spec.md`,
 /// "Discharging requirements and effects").
 #[rstest]
+#[case::effect_returned_from_a_body_binding_a_variable(
+    indoc! {"
+        def maker(f: (Int => Int causes Effect)) => Int => Int causes Effect:
+            c := 0
+            for x in [1, 2]:
+                c += x
+            \\x -> f(x) + 1
+    "},
+    "which names every variable, a variable this function binds among them"
+)]
+#[case::every_write_returned_from_a_body_binding_a_variable(
+    indoc! {"
+        def maker(f: (Int => Int causes Write(*))) => Int => Int causes Write(*):
+            c := 0
+            for x in [1, 2]:
+                c += x
+            \\x -> f(x) + 1
+    "},
+    "this returns a function that has `Write(*)`, which names every variable"
+)]
+#[case::every_read_returned_from_a_body_binding_a_variable(
+    indoc! {"
+        def maker(f: (Int => Int requires Read(*))) => Int => Int requires Read(*):
+            c := 0
+            for x in [1, 2]:
+                c += x
+            \\x -> f(x) + 1
+    "},
+    "this returns a function that has `Read(*)`, which names every variable"
+)]
 #[case::effect_public_beside_an_induction_variable(
     "cnt := 0\nfor x in [1, 2]:\n    cnt += x\npub g: Int => Int causes Effect = \\x -> x\n",
     "`g` is public and its type has `Effect`"

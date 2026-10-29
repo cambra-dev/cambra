@@ -375,6 +375,20 @@ pub enum InferError {
     /// (`docs/chl-spec.md`, "Effects in traits"). `compiler` is set for a compiler trait's
     /// signature, which a program writes nowhere and which takes no associated type.
     CapabilityBeyondSignature { item: String, compiler: bool },
+    /// A commit inside a `with begin():` block's body, directly or through a call.
+    NestedTransaction,
+    /// A function returning a function that has `item`, which names a variable the
+    /// returning function binds.
+    EscapesItsVariable { item: String, every: bool },
+    /// A write (or, with `appends`, an append) handing `target` a function that has `item`,
+    /// which names a variable whose scope ends before `target`'s.
+    HandsOutItsVariable {
+        item: String,
+        /// The function has `Effect` or `Context`, which names every variable.
+        every: bool,
+        target: String,
+        appends: bool,
+    },
     /// A written clause's `item` names no variable of the kind it takes in scope.
     ClauseNamesNoVariable {
         item: String,
@@ -1084,6 +1098,9 @@ impl InferError {
             | InferError::CapabilityBeyondClause { .. }
             | InferError::ClauseNamesNoVariable { .. }
             | InferError::CapabilityBeyondSignature { .. }
+            | InferError::NestedTransaction
+            | InferError::EscapesItsVariable { .. }
+            | InferError::HandsOutItsVariable { .. }
             | InferError::Unsupported(_)
             | InferError::EmptyCase { .. }
             | InferError::UnresolvedHole { .. }
@@ -1573,6 +1590,37 @@ impl std::fmt::Debug for InferError {
                 "`{item}` names no variable in scope of the kind it takes: `Write` and `Read` \
                  take an induction variable, `WriteTxn` and `ReadTxn` a transactional one, and \
                  `Append` a feed"
+            ),
+            InferError::EscapesItsVariable { item, every: false } => write!(
+                f,
+                "this returns a function that has `{item}`, whose variable this function binds; \
+                 the returned function would outlive it"
+            ),
+            InferError::EscapesItsVariable { item, every: true } => write!(
+                f,
+                "this returns a function that has `{item}`, which names every variable, a \
+                 variable this function binds among them; the returned function would outlive it"
+            ),
+            InferError::HandsOutItsVariable {
+                item,
+                every,
+                target,
+                appends,
+            } => write!(
+                f,
+                "this {} to `{target}` a function that has `{item}`, {} ends before `{target}` \
+                 does; `{target}` would hold the function past it",
+                if *appends { "appends" } else { "writes" },
+                if *every {
+                    "which names every variable, and one of them"
+                } else {
+                    "whose variable"
+                }
+            ),
+            InferError::NestedTransaction => write!(
+                f,
+                "this commits a transaction inside a `with begin():` block's body, directly or \
+                 through a call; transactions do not nest"
             ),
             // A compiler trait takes no associated type, so the hint is for a program's trait.
             InferError::CapabilityBeyondSignature { item, compiler } => {

@@ -379,6 +379,17 @@ pub(super) trait Typing {
         }
     }
 
+    /// Note the type a function body of the node being emitted results in: a function it
+    /// returns may not require or cause anything naming a variable the body binds, which it
+    /// would outlive. Check notes nothing.
+    fn note_result(&mut self, _ty: &Type) {}
+
+    /// Note that a write (or, with `appends`, an append) of the node being emitted hands a
+    /// value to `target`, whose type is `ty`: a function `target` holds may not require or
+    /// cause anything naming a variable whose scope ends before `target`'s. Check notes
+    /// nothing.
+    fn note_handed_out(&mut self, _target: &Name, _ty: &Type, _appends: bool) {}
+
     /// How many links of associated effect types wait on their obligations
     /// ([`InferCtx::settle_effect_links`](super::context::InferCtx::settle_effect_links)).
     /// Check links none.
