@@ -2772,6 +2772,29 @@ mod consuming_tests {
         guard_minus(&ints().universal_guard(), &scalar);
     }
 
+    /// A memo of groups released beneath its keys holds every path of its groups but the ones
+    /// released.
+    #[test]
+    fn a_release_beneath_the_groups_of_a_memo_leaves_the_paths_unreleased() {
+        use crate::interpreter::tile_operators::growing::{NestedInput, nested_tiling};
+        let mut memo =
+            MemoProducer::over(Box::new(NestedInput::over(&source(0..4))), &nested_tiling());
+        memo.consume_impl(InputId::ONLY, nested_tiling().universal_guard());
+        let released = TileGuard::Function(FunctionGuard::Codomain(Box::new(Keys(0, 1).guard())));
+        memo.release(released.clone());
+        let before = Projection::of(&memo.held()).expect("a region of keys");
+        let held = Projection::of(&memo.finalize()).expect("a region of paths");
+        let released = Projection::of(&released).expect("a region of paths");
+        assert_eq!(held.level(), Some(CurryLevel::new(1)));
+        assert_eq!(held.intersect(&released), Projection::Nothing);
+        let rejoined = held.union(&released);
+        assert_eq!(
+            (rejoined.minus(&before), before.minus(&rejoined)),
+            (Projection::Nothing, Projection::Nothing),
+            "the paths held and the paths released are what was held"
+        );
+    }
+
     // ------------------------------------------------------------------------------------
     // Wakes
     // ------------------------------------------------------------------------------------
