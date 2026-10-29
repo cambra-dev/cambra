@@ -833,6 +833,14 @@ does not answer it again. Its guards are `Aggregation` guards, which are all or 
 names the accumulator only once it is final, when the input has been released whole, so no guard
 names a partial aggregation.
 
+### ExtractAggregate
+
+A consuming `ExtractAggregate` pulls its input, an aggregation, at the guard and extracts the value
+once the aggregation is terminal. A terminal aggregation states all of itself releasable and is
+released; a partial one states nothing releasable, so it is left in place for the next consume and
+the extraction holds nothing. The value is final once the input has been released whole, and stays
+until the consumer releases the output.
+
 ## Tile Operators
 
 Each `TileOperator` is a static (compile-time) node in the dataflow graph. It knows its output
