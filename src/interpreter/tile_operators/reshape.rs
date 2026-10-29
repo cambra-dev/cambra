@@ -145,6 +145,7 @@ impl TileProducer for PermuteRecordDomainProducer {
             codomain,
             domain_predicate,
             deleted,
+            ..
         } = input_tile
         else {
             unreachable!();
@@ -570,6 +571,7 @@ impl TileProducer for FlattenTupleDomainProducer {
             mut codomain,
             domain_predicate,
             deleted,
+            ..
         } = input_tile
         else {
             panic!("FlattenTupleDomain expected a collection");

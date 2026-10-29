@@ -583,6 +583,23 @@ impl TileProducer for ZipProducer {
                     }
                     codomains.push(aligned);
                 }
+                // A key an arm knows absent is absent from the pair, which holds a row only where
+                // every arm does, so each level above the pair knows absent what any arm does.
+                let absent_keys: Vec<Predicate> = (0..self.level.index())
+                    .map(|depth| {
+                        Predicate::union_all(
+                            filtered_tiles
+                                .iter()
+                                .filter_map(|tile| match tile.values_at(CurryLevel::new(depth)) {
+                                    Tile::DataFunction { absent_keys, .. } => {
+                                        Some(absent_keys.clone())
+                                    }
+                                    _ => None,
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect();
                 let skeleton = filtered_tiles.swap_remove(skeleton_at);
 
                 let names = &self.names;
@@ -601,6 +618,13 @@ impl TileProducer for ZipProducer {
                 }
                 let mut out = skeleton;
                 *out.values_at_mut(self.level) = codomain_record;
+                for (depth, known) in absent_keys.into_iter().enumerate() {
+                    if let Tile::DataFunction { absent_keys, .. } =
+                        out.values_at_mut(CurryLevel::new(depth))
+                    {
+                        *absent_keys = known;
+                    }
+                }
                 for (at, meet) in standing.into_iter().enumerate() {
                     let Tile::DataFunction {
                         domain_predicate, ..
@@ -1685,6 +1709,50 @@ mod tests {
             ColumnValue::UInts(vec![20, 21]),
             "branch b's values should remain [0, 1] (already its full presence)",
         );
+    }
+
+    /// A key one arm records absent is absent from the pair, which holds a row only where every
+    /// arm does, whichever arm the output's keys are taken from.
+    #[test]
+    fn a_pair_records_absent_what_any_arm_records_absent() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let arm_tiling = Tiling::data_function(uint(), Tiling::Scalar(int()));
+        let arm = |values: Vec<i64>, absent: Predicate| {
+            let mut tile = Tile::data_function(
+                ColumnValue::from_uints((0..values.len() as u64).collect()),
+                Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+                Predicate::False,
+                BitSet::new(),
+            );
+            let Tile::DataFunction { absent_keys, .. } = &mut tile else {
+                unreachable!("a collection")
+            };
+            *absent_keys = absent;
+            tile
+        };
+        let out_tiling = Tiling::data_function(
+            uint(),
+            Tiling::Record(HashMap::from([
+                (tuple_field(0), Tiling::Scalar(int())),
+                (tuple_field(1), Tiling::Scalar(int())),
+            ])),
+        );
+        let (spy0, _) = QuietSpy::new(
+            arm(vec![5, 6], Predicate::point(Value::UInt(7))),
+            arm_tiling.clone(),
+        );
+        let (spy1, _) = QuietSpy::new(arm(vec![50, 60], Predicate::False), arm_tiling);
+        let mut zip = ZipProducer {
+            base: ProducerBase::unowned(ZipProducer::alloc_id(), &out_tiling),
+            names: vec![tuple_field(0), tuple_field(1)],
+            inputs: vec![Box::new(spy0), Box::new(spy1)],
+            level: CurryLevel::new(1),
+        };
+        let Tile::DataFunction { absent_keys, .. } = zip.get(out_tiling.universal_guard()) else {
+            panic!("the zip is a collection")
+        };
+        assert!(absent_keys.contains(&Value::UInt(7)), "{absent_keys:?}");
     }
 
     /// A release naming part of the pair record reaches each arm as that arm's field, spelled

@@ -858,12 +858,15 @@ impl MapAggregateProducer {
     /// Fold the groups of `input_tile` into the accumulators.
     fn fold(&mut self, input_tile: &Tile) -> Stated {
         let Tile::DataFunction {
-            domain_predicate, ..
+            domain_predicate,
+            absent_keys,
+            ..
         } = input_tile
         else {
             panic!("MapAggregate requires a collection tile, got {input_tile:?}")
         };
-        let domain_predicate = domain_predicate.clone();
+        // A group known absent is complete: it has no element to fold, in any region.
+        let domain_predicate = domain_predicate.union(absent_keys);
 
         // The collection being folded is the innermost one, and the rows it stands over
         // are the groups: `parent_paths` names them, one path per group.
@@ -1699,6 +1702,54 @@ mod tests {
             Tile::Scalar(ColumnValue::Ints(vec![330])),
             "each element counted once"
         );
+    }
+
+    /// A group the input records absent has no element to fold, in any region, so the output
+    /// states it complete as a group the input states complete.
+    #[test]
+    fn a_group_recorded_absent_is_complete() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let in_tiling =
+            Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int())));
+        let mut tile = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::grouped(
+                vec![0],
+                ColumnValue::from_uints(vec![0, 1]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20]))),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let Tile::DataFunction { absent_keys, .. } = &mut tile else {
+            unreachable!("a collection")
+        };
+        *absent_keys = Predicate::point(Value::UInt(5));
+        let (spy, _released) = QuietSpy::new(tile, in_tiling);
+        let out_tiling = Tiling::data_function(
+            uint(),
+            Tiling::Aggregation {
+                kind: AggregateKind::Sum,
+                accumulator: Box::new(Tiling::Scalar(int())),
+            },
+        );
+        let mut producer = MapAggregateProducer::new(
+            ProducerBase::unowned(MapAggregateProducer::alloc_id(), &out_tiling),
+            Box::new(spy),
+            AggregateKind::Sum,
+        );
+        let out = producer.get(out_tiling.universal_guard());
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &out
+        else {
+            panic!("a collection of sums, got {out:?}")
+        };
+        assert!(domain_predicate.contains(&Value::UInt(5)), "{out:?}");
+        assert!(!domain_predicate.contains(&Value::UInt(0)), "{out:?}");
     }
 
     /// A group the input settles at an inner level is stated settled at the same level of
