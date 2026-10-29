@@ -11,20 +11,21 @@
 //! instead: a predicate reads one by projection, and the [`Path`] that read
 //! addresses is what an SMT constant is minted for.
 //!
-//! The fragment is over **surface-syntax** predicate shapes: a variable, a field
-//! read, a literal, a unary or a binary operator ([`Encode::expr`]). `lambda_elim`
-//! rewrites every predicate point-free — `__elem == 1` becomes
-//! `__elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)` — so no predicate at or after that pass
-//! is encodable, and every check from there on decides its deficits structurally.
-//! The reach of the fallback is therefore inference and [`crate::ccl::inline`], not
-//! the whole pipeline.
+//! A predicate is encoded in either of the two forms the pipeline gives it. The
+//! surface form is a variable, a field read, a literal, a unary or a binary
+//! operator ([`Encode::expr`]). The point-free form is what `lambda_elim` and
+//! planning rewrite every predicate to: `__elem == 1` becomes
+//! `__elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)`. [`Encode::apply`] reads it by applying
+//! each combinator's equation to the argument, so a check after planning decides a
+//! deficit as inference does.
 //!
 //! `smt_sub` answers `false` for one reason: the solver found a model of
 //! `⋀lhs ∧ ¬⋀rhs`, a value of the base satisfying every lhs predicate and
 //! violating an rhs one. Every other outcome is an [`SmtError`] naming what
 //! happened — a query outside the fragment (a base that is neither a scalar nor a
-//! product, floor division, a product of two unknowns, a predicate mentioning an
-//! application that is not a projection), a solver that will not start or breaks
+//! product, floor division, a product of two unknowns, a predicate applying a
+//! function that is neither a projection nor one of [`Encode::apply`]'s
+//! combinators), a solver that will not start or breaks
 //! mid-query, an `unknown`. An `Err` is not a mismatch: nothing decided the
 //! entailment.
 
@@ -35,8 +36,8 @@ use easy_smt::{Context, ContextBuilder, Response, SExpr};
 
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
-    ArithmeticKind, BaseType, BinOpKind, CompareKind, Lit, LogicKind, Name, ProjKey, Refinement,
-    Type, TypedExpr, TypedExprNode, UnaryOpKind,
+    ArithmeticKind, BaseType, BinOpKind, Builtin, CompareKind, Lit, LogicKind, Name, ProjKey,
+    Refinement, Type, TypedExpr, TypedExprNode, UnaryOpKind,
 };
 
 /// The solver subprocess `easy_smt`'s z3 defaults spawn. Named by every
@@ -594,12 +595,16 @@ impl<'a> Encode<'a> {
                 self.ctx.false_()
             }),
             // A name, or a field read through one: both address a leaf of the value
-            // the root denotes, and the path is what names that leaf. An `Apply`
-            // that is not a projection chain addresses no leaf and falls through.
-            TypedExprNode::Var(_) | TypedExprNode::Apply { .. } => match Path::of(e) {
+            // the root denotes, and the path is what names that leaf.
+            TypedExprNode::Var(_) => match Path::of(e) {
                 Some(path) => self.leaf(path, &e.ty),
                 None => Err(unencodable(e)),
             },
+            // Any other `Apply` is a point-free morphism applied to its argument.
+            TypedExprNode::Apply { .. } => {
+                let value = self.value(e)?;
+                self.scalar(value, &e.ty)
+            }
             TypedExprNode::UnaryOp(op, operand) => {
                 let operand = self.expr(operand)?;
                 Ok(match op {
@@ -609,32 +614,155 @@ impl<'a> Encode<'a> {
             }
             TypedExprNode::BinOp { left, op, right } => {
                 let (l, r) = (self.expr(left)?, self.expr(right)?);
-                self.binop(*op, left, right, l, r)
+                let literal_factor = is_int_literal(left) || is_int_literal(right);
+                self.binop(*op, l, r, literal_factor).ok_or_else(|| {
+                    format!(
+                        "{} {} {} has no SMT encoding",
+                        symbolic(left),
+                        op.sym(),
+                        symbolic(right)
+                    )
+                })
             }
             _ => Err(unencodable(e)),
         }
     }
 
-    fn binop(
-        &self,
-        op: BinOpKind,
-        left: &TypedExpr,
-        right: &TypedExpr,
-        l: SExpr,
-        r: SExpr,
-    ) -> Result<SExpr, String> {
+    /// What a pointful term denotes, as a [`Value`] a morphism can be applied to.
+    ///
+    /// A path stays a path and a tuple stays a tuple, so a projection a morphism
+    /// applies later reads the leaf rather than a constant minted for the whole.
+    fn value<'e>(&mut self, e: &'e TypedExpr) -> Result<Value<'e>, String> {
+        if let Some(path) = Path::of(e) {
+            return Ok(Value::Path(path, e.ty.clone()));
+        }
+        match &e.node {
+            TypedExprNode::Tuple(elems) => elems
+                .iter()
+                .map(|elem| self.value(elem))
+                .collect::<Result<_, _>>()
+                .map(Value::Tuple),
+            TypedExprNode::Apply { function, argument } => {
+                let argument = self.value(argument)?;
+                self.apply(function, argument)
+            }
+            _ => Ok(Value::Term(e)),
+        }
+    }
+
+    /// `x ▷ f` for a point-free morphism `f`, the form `lambda_elim` gives every
+    /// predicate (`__elem == 1` becomes `__elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)`).
+    ///
+    /// Each combinator is applied by its equation: `x ▷ id = x`,
+    /// `x ▷ (c ▷ const) = c`, `x ▷ ((f, g) ▷ zip) = (x ▷ f, x ▷ g)`,
+    /// `x ▷ (f ≫ g) = (x ▷ f) ▷ g`, and a projection reads its key. A scalar
+    /// operator applies to the tuple of its operands. Any other morphism is outside
+    /// the fragment.
+    fn apply<'e>(&mut self, f: &'e TypedExpr, x: Value<'e>) -> Result<Value<'e>, String> {
+        match &f.node {
+            TypedExprNode::Builtin(Builtin::Id) => Ok(x),
+            TypedExprNode::Compose(stages) => {
+                stages.iter().try_fold(x, |x, stage| self.apply(stage, x))
+            }
+            TypedExprNode::Proj(key) => self.project(x, key, f),
+            TypedExprNode::Apply { function, argument } => match (&function.node, &argument.node) {
+                (TypedExprNode::Builtin(Builtin::Const), _) => self.value(argument),
+                (TypedExprNode::Builtin(Builtin::Zip), TypedExprNode::Tuple(fs)) => fs
+                    .iter()
+                    .map(|g| self.apply(g, x.clone()))
+                    .collect::<Result<_, _>>()
+                    .map(Value::Tuple),
+                _ => Err(unencodable(f)),
+            },
+            TypedExprNode::Builtin(Builtin::BinOp(op)) => {
+                let Value::Tuple(operands) = x else {
+                    return Err(format!("{} is applied to a non-pair", symbolic(f)));
+                };
+                let [left, right]: [Value<'e>; 2] = operands
+                    .try_into()
+                    .map_err(|_| format!("{} is applied to a non-pair", symbolic(f)))?;
+                let literal_factor = left.is_int_literal() || right.is_int_literal();
+                let operand_ty = f.ty.domain();
+                let operand_ty = |i: usize| match &operand_ty {
+                    Some(Type::Tuple(elems)) => elems.get(i).cloned().unwrap_or(Type::Hole),
+                    _ => Type::Hole,
+                };
+                let l = self.scalar(left, &operand_ty(0))?;
+                let r = self.scalar(right, &operand_ty(1))?;
+                self.binop(*op, l, r, literal_factor)
+                    .map(Value::Scalar)
+                    .ok_or_else(|| format!("{} has no SMT encoding", symbolic(f)))
+            }
+            TypedExprNode::Builtin(op @ (Builtin::Neg | Builtin::NotFn)) => {
+                let operand = self.scalar(x, &f.ty.domain().unwrap_or(Type::Hole))?;
+                Ok(Value::Scalar(match op {
+                    Builtin::Neg => self.ctx.negate(operand),
+                    _ => self.ctx.not(operand),
+                }))
+            }
+            _ => Err(unencodable(f)),
+        }
+    }
+
+    /// `x ▷ .key`. A tuple yields its component; a path reads one key further,
+    /// typed by the slot the projection `proj` produces.
+    fn project<'e>(
+        &mut self,
+        x: Value<'e>,
+        key: &ProjKey,
+        proj: &TypedExpr,
+    ) -> Result<Value<'e>, String> {
+        match (x, key) {
+            (Value::Tuple(mut elems), ProjKey::Index(i)) if *i < elems.len() => {
+                Ok(elems.swap_remove(*i))
+            }
+            (Value::Path(mut path, _), _) => {
+                path.keys.push(key.clone());
+                Ok(Value::Path(path, proj.ty.codomain().unwrap_or(Type::Hole)))
+            }
+            (Value::Term(e), _) => match Path::of(e) {
+                Some(mut path) => {
+                    path.keys.push(key.clone());
+                    Ok(Value::Path(path, proj.ty.codomain().unwrap_or(Type::Hole)))
+                }
+                None => Err(unencodable(proj)),
+            },
+            _ => Err(format!(
+                "{} reads no component of its argument",
+                symbolic(proj)
+            )),
+        }
+    }
+
+    /// The s-expression a scalar [`Value`] denotes. `ty` is the slot it fills, the
+    /// sort a path falls back to when nothing settles its own type.
+    fn scalar(&mut self, value: Value<'_>, ty: &Type) -> Result<SExpr, String> {
+        match value {
+            Value::Scalar(e) => Ok(e),
+            Value::Term(e) => self.expr(e),
+            Value::Path(path, slot) => {
+                let slot = if matches!(slot, Type::Hole) {
+                    ty
+                } else {
+                    &slot
+                };
+                self.leaf(path, slot)
+            }
+            Value::Tuple(_) => Err("a tuple has no SMT sort".to_string()),
+        }
+    }
+
+    /// `l op r`, or `None` when `op` is outside the fragment. `literal_factor` says
+    /// whether either operand is an integer literal, which keeps a product linear.
+    fn binop(&self, op: BinOpKind, l: SExpr, r: SExpr, literal_factor: bool) -> Option<SExpr> {
         let c = self.ctx;
-        Ok(match op {
+        Some(match op {
             // `^+` computes what `+` computes and differs only in the trait it
             // states (`src/ccl/ops.rs`), so both are SMT's `+`.
             BinOpKind::Arithmetic(ArithmeticKind::Add | ArithmeticKind::AddRefined) => c.plus(l, r),
             BinOpKind::Arithmetic(ArithmeticKind::Sub) => c.sub(l, r),
             // A product stays linear when one factor is a constant.
-            BinOpKind::Arithmetic(ArithmeticKind::Mul)
-                if is_int_literal(left) || is_int_literal(right) =>
-            {
-                c.times(l, r)
-            }
+            BinOpKind::Arithmetic(ArithmeticKind::Mul) if literal_factor => c.times(l, r),
             BinOpKind::Compare(CompareKind::Equals) => c.eq(l, r),
             BinOpKind::Compare(CompareKind::NotEquals) => c.not(c.eq(l, r)),
             BinOpKind::Compare(CompareKind::Less) => c.lt(l, r),
@@ -656,14 +784,7 @@ impl<'a> Encode<'a> {
             BinOpKind::Arithmetic(
                 ArithmeticKind::Mul | ArithmeticKind::FloorDiv | ArithmeticKind::Pow,
             )
-            | BinOpKind::Concat => {
-                return Err(format!(
-                    "{} {} {} has no SMT encoding",
-                    symbolic(left),
-                    op.sym(),
-                    symbolic(right)
-                ));
-            }
+            | BinOpKind::Concat => return None,
         })
     }
 
@@ -768,6 +889,26 @@ impl<'a> Encode<'a> {
         self.decls.push((sym, sort));
         self.vars.insert(path, e);
         e
+    }
+}
+
+/// A predicate term's meaning while a point-free morphism is applied to it
+/// ([`Encode::apply`]).
+#[derive(Clone)]
+enum Value<'e> {
+    /// A pointful term, encoded by [`Encode::expr`] when read as a scalar.
+    Term(&'e TypedExpr),
+    /// A leaf address, with the type of the slot that read it.
+    Path(Path, Type),
+    /// A scalar already encoded.
+    Scalar(SExpr),
+    /// A product `zip` built, one value per component.
+    Tuple(Vec<Value<'e>>),
+}
+
+impl Value<'_> {
+    fn is_int_literal(&self) -> bool {
+        matches!(self, Value::Term(e) if is_int_literal(e))
     }
 }
 
@@ -903,6 +1044,54 @@ mod tests {
         assert!(smt_sub_range(&int(), &between, 3, &NoScope).unwrap());
         assert!(!smt_sub_range(&int(), &between, 2, &NoScope).unwrap());
         assert!(!smt_sub_range(&int(), &[], 3, &NoScope).unwrap());
+    }
+
+    /// `r` as planning leaves it: `__elem ▷ 𝑝` with `𝑝` the point-free function
+    /// `lambda_elim` compiles the bare predicate to.
+    fn point_free(r: &Refinement) -> Refinement {
+        let f = crate::ccl::planning::fn_of_bare_predicate(&int(), &r.predicate, &[]);
+        let bare = crate::ccl::ccl_utils::bare_predicate_of_fn(&int(), f);
+        assert!(
+            !matches!(&bare.node, TypedExprNode::Apply { function, .. }
+                if matches!(function.node, TypedExprNode::BinOp { .. })),
+            "the compiled predicate is point-free: {}",
+            symbolic(&bare)
+        );
+        Refinement::born(Rc::new(bare))
+    }
+
+    /// A point-free predicate means what its pointful source means: each query
+    /// answers the same with either spelling on either side.
+    #[test]
+    fn a_point_free_predicate_encodes_as_its_source() {
+        let at_one = elem_cmp(CompareKind::Equals, lit(1));
+        let doubled = elem_cmp(
+            CompareKind::Less,
+            TypedExpr::binop(
+                TypedExpr::var(Name::elem()).with_ty(int()),
+                BinOpKind::Arithmetic(ArithmeticKind::Mul),
+                lit(2),
+            )
+            .with_ty(int()),
+        );
+        let negated = Refinement::born(Rc::new(
+            TypedExpr::unary(
+                UnaryOpKind::Not,
+                elem_cmp(CompareKind::Greater, lit(5))
+                    .predicate
+                    .as_ref()
+                    .clone(),
+            )
+            .with_ty(Type::Base(BaseType::Bool)),
+        ));
+        for source in [at_one.clone(), doubled, negated] {
+            let (source, compiled) = ([source.clone()], [point_free(&source)]);
+            assert!(smt_sub(&int(), &compiled, &source, &NoScope).unwrap());
+            assert!(smt_sub(&int(), &source, &compiled, &NoScope).unwrap());
+        }
+        let compiled = [point_free(&at_one)];
+        assert!(smt_sub_range(&int(), &compiled, 3, &NoScope).unwrap());
+        assert!(!smt_sub_range(&int(), &compiled, 1, &NoScope).unwrap());
     }
 
     /// A singleton entails every bound it satisfies, and no bound it violates.

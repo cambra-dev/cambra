@@ -253,14 +253,10 @@ a general nominal-type system (`infer/schemes.rs`, `infer/solver/traits.rs`).
 `ccl::Type` quantifies only a whole `let` annotation, `Type::Poly`
 ([type-parameters.md](type-parameters.md)); a polymorphic type inside another type is not
 implemented, and the spec leaves it **[Open]**. The SMT fallback handles linear integer
-arithmetic over supported `Int`/`Bool` predicate forms. Both inference and `inline` use `smt_sub`;
-inlining uses it to check a refined parameter's precondition before beta-reduction. A predicate
-it cannot encode falls back to the structural mismatch, and point-free predicates after
-`lambda_elim` do not reach that fallback
-(`infer/solver/smt.rs`, `infer/solver/constrain.rs`). These are limits of the implemented paths,
-not additional inference passes.
-Post-planning checks use structural predicate equality; supporting semantic entailment there
-requires an SMT encoding for the point-free forms.
+arithmetic over supported `Int`/`Bool` predicate forms, pointful or point-free. Inference, `inline`,
+and the post-inference and post-planning checks use `smt_sub`; inlining uses it to check a refined
+parameter's precondition before beta-reduction. A predicate it cannot encode falls back to the
+structural mismatch (`infer/solver/smt.rs`, `infer/solver/constrain.rs`).
 
 ---
 
@@ -798,9 +794,6 @@ The post-inference checks retain refinements in both relation checks and reconci
 They do not justify a transformation by erasing its predicates first. A pass that introduces a
 refined type must leave the node reconstructable under the checking rules; see
 [Refinements on the lattice](#refinements-on-the-lattice).
-
-Post-planning checks use structural predicate equality. Semantic entailment at that stage requires
-an SMT encoding for point-free expressions.
 
 ---
 
@@ -1564,7 +1557,11 @@ assumptions. `unknown`, process failures, and solver errors return `SmtError`, n
 
 The expression encoder accepts integer and boolean literals, scalar variables and projected
 fields, unary negation and boolean negation, addition and subtraction, multiplication with a
-literal factor, comparisons, and boolean connectives. Supported sorts include `Int`, `UInt`,
+literal factor, comparisons, and boolean connectives. It accepts each of them in the point-free
+form `lambda_elim` gives a predicate, `__elem ▷ 𝑓`, by applying the equations of the combinators
+`𝑓` is built from: `𝑥 ▷ id = 𝑥`, `𝑥 ▷ (𝑐 ▷ const) = 𝑐`, `𝑥 ▷ ((𝑓, 𝑔) ▷ zip) = (𝑥 ▷ 𝑓, 𝑥 ▷ 𝑔)`,
+`𝑥 ▷ (𝑓 ≫ 𝑔) = (𝑥 ▷ 𝑓) ▷ 𝑔`, a projection reading its key, and an operator builtin applied to
+the tuple of its operands. Supported sorts include `Int`, `UInt`,
 `UIntRange`, and `Bool`; unsigned sorts add range constraints. A named string sort does not provide
 string-literal or concatenation encoding. General function applications, nonlinear multiplication,
 floor division, and exponentiation are outside this fragment.
@@ -1586,8 +1583,8 @@ The rule applies in one direction. `0..𝑛 ⊀ Int`, and `0..𝑚 <: 0..𝑛` o
 `Int` has no predicate to prove the bound from, and a `SkipSmtScope` caller rejects the pair.
 
 It types a list subscript whose key carries a proof of its position: in `c = [1,2,3]`, `c[1]`
-applies `0..3 ⤇ Int` to a key typed `Int@1`. The post-planning checks decide the same edge
-structurally, because the key's predicate is point-free by then, and reject it. The kind lattice
+applies `0..3 ⤇ Int` to a key typed `Int@1`. The post-planning check decides the same edge with
+the key's point-free predicate. The kind lattice
 (`compact.rs`, `CompactTypeKind::merge`), the compact merge of an `Int` and a `UIntRange` bound,
 and the Lean model (`formal/CclFormal/Subtyping.lean`) still relate a range only to itself.
 

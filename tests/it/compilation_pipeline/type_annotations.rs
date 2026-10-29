@@ -1128,19 +1128,18 @@ ys
     )
 }
 
-/// TODO: Post-planning typechecks are still limited to structural
-/// equality, and thus fail for refinements that survive to
-/// post-planning. This is currently blocked by the lack of SMT
-/// encoding rules for point-free expressions.
+/// A refinement that survives to the post-planning check is decided there by the solver,
+/// reading the predicates in their point-free form.
 #[test]
 fn post_planning_smt() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
 x: Mut({Int where _ >= 0}) := 0
 y = x ^+ x
 z: {Int where _ >= 0} = y
-z        "#},
-        "post-planning produced an invalid tree",
+z
+        "#},
+        Value::Int(0),
     )
 }
 
@@ -1344,14 +1343,11 @@ fn a_use_meets_a_refined_domain_of_a_function_parameter() {
 /// An opaque `let`'s body type names an enclosing binder: the read of `x` types
 /// `y` as `{Int | __elem == __anf ^+ a}`, and meeting `z`'s annotation needs both
 /// `__anf`'s refinement and the parameter `a`'s. Coalescing decides it under the
-/// walk's lexical scope, which supplies `a`.
-///
-/// Currently passes inference but fails post-planning
-/// typecheck. Expect this to be fixed if post-inference refinements
-/// are erased.
+/// walk's lexical scope, which supplies `a`. The post-planning check decides the same
+/// edge with the predicates in point-free form.
 #[test]
 fn an_opaque_let_body_entailed_under_an_enclosing_binder() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
             def f(a: {Int where _ >= 0}):
                 x: Mut({Int where _ >= 0}) := 0
@@ -1361,7 +1357,7 @@ fn an_opaque_let_body_entailed_under_an_enclosing_binder() {
 
             f(1)
         "#},
-        "post-planning produced an invalid tree",
+        Value::Int(1),
     )
 }
 
@@ -1369,22 +1365,16 @@ fn an_opaque_let_body_entailed_under_an_enclosing_binder() {
 /// `let __anf : {Int | __elem >= 0} ^= x in __anf ^+ __anf`, and its body type
 /// `{Int | __elem == __anf ^+ __anf}` entails `{Int | __elem >= 0}` given `__anf`'s
 /// refinement.
-///
-/// TODO: Currently fails at post-planning typecheck due to pointfree
-/// refinements which are not structurally equal, and yet cannot be
-/// compared by SMT due to lack of encoding for pointfree
-/// expressions. Expect to fix this if post-inference refinements are
-/// erased.
 #[test]
 fn two_reads_of_a_refined_mut_meet_a_refined_annotation() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
             x: Mut({Int where _ >= 0}) := 0
             y = x ^+ x
             z: {Int where _ >= 0} = y
             z
         "#},
-        "post-planning produced an invalid tree",
+        Value::Int(0),
     )
 }
 
@@ -1695,7 +1685,8 @@ f(1) ^+ 1
     )
 }
 
-/// A refined `^+` on a binding whose refinement names a mutable variable's read.
+/// The two sides of the edge spell `__anf ^+ 1` pointful and point-free
+/// (`(__anf, 1) ▷ add_refined`), and the solver reads both.
 #[test]
 fn refined_op_on_opaque() {
     check_scalar(
