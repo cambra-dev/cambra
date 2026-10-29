@@ -287,7 +287,7 @@ fn dispatched_inline(code: &str) -> Tile {
     };
     let mut run = PooledRun::start(&mut ctx, &mut compiled, &mut None, &config, Box::new(|| {}))
         .expect("a pipeline");
-    let mut main = run.take_main();
+    let mut main = run.take_main().expect("a main output");
     let universal = main.tiling().universal_guard();
     for _ in 0..100 {
         ctx.scheduler().check_for_notifications();

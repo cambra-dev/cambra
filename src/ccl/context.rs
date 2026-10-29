@@ -1195,6 +1195,9 @@ pub struct CompiledOutput {
     /// `Some` for sink outputs — the [`SinkConsumer`] subscribed to the
     /// operator that dispatches to the registered [`crate::interpreter::DataSink`].
     pub sink_consumer: Option<Arc<Mutex<SinkConsumer>>>,
+    /// The release records the producers of this output hold with the sources, by name: what a
+    /// pool that replaces this output's producers inherits the releases of.
+    pub source_producers: HashSet<String>,
 }
 
 impl CompiledOutput {
@@ -2930,7 +2933,10 @@ fn compile_version(
             let main_consumer = main_consumer
                 .take()
                 .expect("multiple `main` outputs in the program's trailing record");
+            ctx.scheduler().begin_source_producers();
             let producer = op.subscribe(universal, main_consumer, ctx.scheduler());
+            let source_producers: HashSet<String> =
+                ctx.scheduler().end_source_producers().into_iter().collect();
             debug!(
                 "Main producer:\n{}",
                 pretty_tile_producer_with(
@@ -2946,6 +2952,7 @@ fn compile_version(
                 op,
                 producer: Some(producer),
                 sink_consumer: None,
+                source_producers,
             });
         } else {
             let sink = sink_bindings_registry
@@ -2957,8 +2964,11 @@ fn compile_version(
             let (sink_consumer, producer_slot) =
                 SinkConsumer::new(sink, notifier, ctx.scheduler().sink_pull_queue());
             let consumer_rc = Arc::new(Mutex::new(sink_consumer));
+            ctx.scheduler().begin_source_producers();
             let sink_producer =
                 op.subscribe(universal, Box::new(consumer_rc.clone()), ctx.scheduler());
+            let source_producers: HashSet<String> =
+                ctx.scheduler().end_source_producers().into_iter().collect();
             debug!(
                 "Sink producer for {name}:\n{}",
                 pretty_tile_producer_with(
@@ -2981,6 +2991,7 @@ fn compile_version(
                 op,
                 producer: None,
                 sink_consumer: Some(consumer_rc),
+                source_producers,
             });
         }
     }

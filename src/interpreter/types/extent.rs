@@ -342,6 +342,12 @@ pub fn project_leaves(mut values: ColumnValue, paths: &[FieldPath]) -> ColumnVal
 pub trait DataSourceDomainExtentImpl: Send {
     fn get_id(&self) -> &str;
     fn check_for_new_data(&mut self) -> bool;
+    /// What the producers named in `producers` have all released of this source's keys, or
+    /// nothing for a source that keeps no per-producer record. A pool that replaces those
+    /// producers starts its own record there, so a key they were handed is not offered again.
+    fn released_by(&self, _producers: &std::collections::HashSet<String>) -> Predicate {
+        Predicate::False
+    }
     /// Returns the current yield predicate: the region of domain values
     /// available to consume.
     fn get_yield_predicate(&self) -> Predicate;

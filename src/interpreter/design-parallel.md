@@ -556,11 +556,9 @@ the delivery. `CAMBRA_DISPATCH=inline` turns the driver on in `src/main.rs` for 
 `--inspect` or `--control`; a refused program stays on the plain loop, and
 `LiveProgram::start_inline` swaps the branch's `main` producer for the pool's.
 
-Decision: only `main` is a sink of a pooled run. A sink's consumer and its producer are made when
-the program compiles, and the sinks a program writes (`out << x`) have a feed or record operator at
-their input, which the plan does not stream. No program of the corpus has a sink whose input the
-plan admits, so admitting other sinks would add a path nothing runs, and the plan refuses them. The
-plan's decision to admit all sinks is deferred until one does.
+Every sink of the program is an output of the inline driver ([Sinks and the HTTP
+path](#sinks-and-the-http-path)); the threaded `run_main` runs `main` only and refuses a program
+that writes a sink.
 
 `PooledRun::serve_pass` is the loop's part of a pass: without a run it does nothing, so a program
 the pool refused passes as the plain loop passes it, sink pulls queued for the next delivery.
@@ -605,6 +603,50 @@ states for a read of part of the keys. The threaded collector states every level
 workers have returned (`Tile::complete_every_level`, `Tile::complete_inner_levels`). A breaker that
 has not completed states none of them. A collection a variant holds is a value of the variant's
 column and has no level of its own, so it is not affected.
+
+### Sinks and the HTTP path
+
+`plan_inline` plans every `Sink` node of the graph as an output: `main`, and each sink such as the
+reply channel of `http_serve`, ends a pipeline of its own. `plan` keeps `main` as the one output for
+the threaded pool. A sink's pipeline ends in a collection breaker (`Breaker::Collect`); only `main`
+may end in a fold, since a sink dispatches a collection. A `Memo` is still read by one slot, so two
+sinks over one memo are refused.
+
+`PooledRun::start` takes each sink's serial producer out of its `SinkConsumer`, which drops the
+subscription that registered a release record with the sources, cuts the sink's chain at its memos
+as `main`'s, and installs in the consumer a `BreakerOutput` producer over the sink pipeline's output
+(`SinkConsumer::install_producer`). The `BreakerOutput` is subscribed on the driver thread with the
+sink consumer, so the breaker's `publish` requests a pull on the scheduler's sink queue as a serial
+change would, and `PooledRun::serve_pass` drains it after the lap. The pull is the consumer's own:
+it reads the rows that arrived, hands them to the `DataSink`, and releases them, so a row reaches
+the sink once. A program with no `main` has no `main` producer (`PooledRun::take_main` answers
+`None`).
+
+The HTTP source is cut by `UIntStreamBuffer::first_keys_in` (see `design-http-server.md`, "Cutting
+morsels"). `check_for_new_data` runs on the driver thread, in the delivery, and its notification
+reaches the dispatcher as a region that resolves to the keys ready and not yet claimed. The reply
+sink (`HttpServerSharedState::process`) stays on the driver thread behind its `BreakerOutput`: it
+removes each answered request from its `pending` map and needs a reply per request exactly once, in
+any order, with the request index as the key. Decision: the order of replies is the order the sink's
+pulls see rows, which is the arrival order within a lap and the lap order across laps; no client
+observes more, because each reply goes to its own connection. Decision: a sink reads its breaker
+while the breaker is incomplete, since an HTTP route never completes; a pull hands over the rows
+published so far and the terminal tile arrives when the source ends.
+
+Compiling a program pulls each sink once, which hands it the rows its sources held and releases them
+under the serial producer's record. `PooledRun::start` reads, before it drops the serial producers,
+what each output's producers released of each source (`DataSourceDomainExtentImpl::released_by`,
+over the names the output's subscription registered, `CompiledOutput::source_producers`), and starts
+the pool's record of each source operator in that output's pipelines there. Each output inherits
+from its own chain, not from the intersection across outputs, and the pipelines behind a `Memo`
+inherit from the output that reads it. Without this the pool's records start at nothing, and a
+source whose agreement another reader holds back offers the rows again
+(`rows_held_at_compile_reach_the_sink_once`). The precondition is that the pool's operators are the
+operators whose serial producers registered the names, which holds because the pool cuts the same
+graph the program compiled.
+
+The differential suite compiles each program in a context with no sources or sinks registered, so
+the programs that read one are skipped, and the HTTP programs are compared by the scenarios above.
 
 ### Widening the plan
 
@@ -752,18 +794,19 @@ records. Storing the run on the `Branch`, dropping it in `tear_down`, and having
 the lap lifts that refusal; the lap sits between the delivery and the sink pulls, and `pull_mains`
 runs after both, so the loop's order changes with it.
 
-A breaker other than the sink, a fold into `main` and a `Memo`'s input, a build side, a way to hand
-a morsel back, and the sink pulls the scheduler loop queues. A source over a data-source domain runs
-on the pool when it cuts morsels (`cuts_morsels`), and `TestDataSource` is the only one that does:
-the HTTP and stdio sources keep the default, so a program over one stays on the compiling thread.
-Their arrivals reach the pipeline through the scheduler's polling, which a live pool drives from the
-calling thread (`run_main_delivering`), and nothing outside tests starts a pool over a live source:
-`run_main` has no delivery, so it runs the rows a source holds when it starts and closes the source.
-The scheduler's `check_for_notifications` notifies with `Everything`, because `check_for_new_data`
-says that a source has data and not which keys. A thread that knows the keys it wrote names them
-with `Scheduler::notify_source_consumers`, which wakes a consumer whose outermost keys are the
-source's with the region and any other with `Everything`. The end-to-end test names each chunk's
-keys that way, but the poll before it publishes `Everything` too, so it does not show the region
-reaching the head; `a_chain_over_a_source_forwards_the_region_an_arrival_names` does. The sources'
-own arrival regions are not reported. Every program the plan refuses runs on the thread that
-compiled it, through `Scheduler::check_for_notifications` and the sink pulls it queues.
+A breaker other than a sink or a `Memo`'s input, a fold into a sink, a build side, a way to hand a
+morsel back, and a `Memo` read by more than one slot. A source over a data-source domain runs on the
+pool when it cuts morsels (`cuts_morsels`): `TestDataSource` and `HttpServerDataSource` do, and the
+stdio source keeps the default, so a program over it stays on the compiling thread. Their arrivals
+reach the pipeline through the scheduler's polling, which a live pool drives from the calling
+thread: `run_main_delivering` for the threaded pool, which nothing outside tests starts over a live
+source (`run_main` has no delivery, so it runs the rows a source holds when it starts and closes the
+source), and the loop of the inline driver. The scheduler's `check_for_notifications` notifies with
+`Everything`, because `check_for_new_data` says that a source has data and not which keys. A thread
+that knows the keys it wrote names them with `Scheduler::notify_source_consumers`, which wakes a
+consumer whose outermost keys are the source's with the region and any other with `Everything`. The
+end-to-end test names each chunk's keys that way, but the poll before it publishes `Everything` too,
+so it does not show the region reaching the head;
+`a_chain_over_a_source_forwards_the_region_an_arrival_names` does. The sources' own arrival regions
+are not reported. Every program the plan refuses runs on the thread that compiled it, through
+`Scheduler::check_for_notifications` and the sink pulls it queues.

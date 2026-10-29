@@ -17,9 +17,10 @@ use crate::{
         provenance::NodeId,
     },
     interpreter::{
-        Consumer, LockNow, Materialized, PooledRecords, Projection, Scheduler, Tile, TileGuard,
-        Tiling,
+        Consumer, DataSourceDomainExtentImpl, LockNow, Materialized, PooledRecords, Predicate,
+        Projection, Scheduler, Tile, TileGuard, Tiling,
         operator_graph::{EdgeKind, EdgeRole, GraphNode, OperatorGraph},
+        sinks::SinkConsumer,
         tile_operators::{
             BreakerOutput, Claim, Detached, MorselSource, OperatorBase, ProducerBase, TileOperator,
             TileProducer, impl_producer_base,
@@ -62,8 +63,8 @@ impl Config {
     }
 }
 
-/// Why a program's `main` output cannot run on the worker pool: the plan supports one
-/// pipeline shape, and this names what the graph has instead.
+/// Why a program's outputs cannot run on the worker pool: the plan supports one pipeline shape,
+/// and this names what the graph has instead.
 #[derive(Debug)]
 pub struct Unsupported(String);
 
@@ -71,13 +72,14 @@ impl fmt::Display for Unsupported {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "the program's `main` output is not a morsel pipeline: {}",
+            "the program's outputs are not morsel pipelines: {}",
             self.0
         )
     }
 }
 
-/// The pipelines the plan admits, upstream first: the last is the one that ends in `main`.
+/// The pipelines the plan admits, upstream first: each ends in the breaker of an output (`main` or
+/// a sink) or in the input of a `Memo`.
 ///
 /// A pipeline is a chain of streaming operators, any number of `MapResult`s each applying a
 /// `Constant` function operand to its input and `MapResultWithSource`s each reading a source's
@@ -91,12 +93,20 @@ impl fmt::Display for Unsupported {
 pub struct Plan {
     /// Every pipeline after the ones it streams from.
     pipelines: Vec<PipelinePlan>,
+    /// The output each final pipeline answers: `main` and the sinks the plan admits, by name and
+    /// by position in `pipelines`.
+    outputs: Vec<(String, usize)>,
 }
 
 impl Plan {
     /// The pipeline that ends in `main`.
     pub(crate) fn main(&self) -> &PipelinePlan {
-        self.pipelines.last().expect("a plan holds a pipeline")
+        let (_, pipeline) = self
+            .outputs
+            .iter()
+            .find(|(name, _)| name == "main")
+            .expect("a plan that runs `main` holds its pipeline");
+        &self.pipelines[*pipeline]
     }
 
     /// What the pipeline that ends in `main` ends in.
@@ -193,8 +203,20 @@ fn classify(kind: &str) -> Class {
     }
 }
 
-/// Cut `graph` into the plan the pool runs, or say why it cannot.
+/// Cut `graph` into the plan the threaded pool runs, or say why it cannot: `main` is its one
+/// output.
 pub fn plan(graph: &OperatorGraph) -> Result<Plan, Unsupported> {
+    plan_outputs(graph, false)
+}
+
+/// Cut `graph` into the plan the inline driver runs: `main` and every sink are outputs, each
+/// ending a pipeline. A sink reads its pipeline's breaker through a `BreakerOutput`
+/// ([`PooledRun::start`]).
+pub fn plan_inline(graph: &OperatorGraph) -> Result<Plan, Unsupported> {
+    plan_outputs(graph, true)
+}
+
+fn plan_outputs(graph: &OperatorGraph, admit_sinks: bool) -> Result<Plan, Unsupported> {
     let by_id: HashMap<NodeId, &GraphNode> = graph
         .nodes()
         .iter()
@@ -202,46 +224,38 @@ pub fn plan(graph: &OperatorGraph) -> Result<Plan, Unsupported> {
             GraphNode::Operator { id, .. } | GraphNode::Sink { id, .. } => (*id, node),
         })
         .collect();
-    let mut main = None;
+    let mut sinks = Vec::new();
     for node in graph.nodes() {
         if let GraphNode::Sink { name, input, .. } = node {
-            if name != "main" {
+            if name != "main" && !admit_sinks {
                 return Err(Unsupported(format!(
                     "the program also writes the sink `{name}`"
                 )));
             }
-            main = Some(input.subscribed);
+            sinks.push((name.clone(), input.subscribed));
         }
     }
-    let mut at = main.ok_or_else(|| Unsupported("the program has no `main` output".into()))?;
-    // The breaker is read off the top of the chain: an extract over a fold, or the sink.
-    let mut breaker = Breaker::Collect;
-    if let Some(GraphNode::Operator { kind, inputs, .. }) = by_id.get(&at)
-        && matches!(classify(kind), Class::Extract)
-        && let [edge] = inputs.as_slice()
-        && let Some(GraphNode::Operator {
-            kind: fold_kind,
-            tiling: Tiling::Aggregation { kind, accumulator },
-            inputs: fold_inputs,
-            ..
-        }) = by_id.get(&edge.subscribed)
-        && matches!(classify(fold_kind), Class::Fold)
-        && let [fold_edge] = fold_inputs.as_slice()
-    {
-        breaker = Breaker::Fold {
-            kind: *kind,
-            accumulator: (**accumulator).clone(),
-        };
-        at = fold_edge.subscribed;
+    if sinks.is_empty() || (!admit_sinks && sinks.iter().all(|(name, _)| name != "main")) {
+        return Err(Unsupported("the program has no `main` output".into()));
     }
     let mut planner = Planner {
         by_id,
         pipelines: Vec::new(),
         memos: HashSet::new(),
     };
-    planner.pipeline(at, breaker)?;
+    let mut outputs = Vec::new();
+    for (name, top) in sinks {
+        // The breaker is read off the top of the chain: an extract over a fold, or the sink. Only
+        // `main` is a fold: a sink dispatches a collection.
+        let (breaker, at) = match name == "main" {
+            true => planner.breaker_at(top),
+            false => (Breaker::Collect, top),
+        };
+        outputs.push((name, planner.pipeline(at, breaker)?));
+    }
     Ok(Plan {
         pipelines: planner.pipelines,
+        outputs,
     })
 }
 
@@ -256,6 +270,31 @@ struct Planner<'g> {
 }
 
 impl Planner<'_> {
+    /// What the pipeline of the output whose chain tops out at `top` ends in, and where its chain
+    /// starts: an `ExtractAggregate` over an `Aggregate` is a fold, and anything else the
+    /// collection itself.
+    fn breaker_at(&self, top: NodeId) -> (Breaker, NodeId) {
+        if let Some(GraphNode::Operator { kind, inputs, .. }) = self.by_id.get(&top)
+            && matches!(classify(kind), Class::Extract)
+            && let [edge] = inputs.as_slice()
+            && let Some(GraphNode::Operator {
+                kind: fold_kind,
+                tiling: Tiling::Aggregation { kind, accumulator },
+                inputs: fold_inputs,
+                ..
+            }) = self.by_id.get(&edge.subscribed)
+            && matches!(classify(fold_kind), Class::Fold)
+            && let [fold_edge] = fold_inputs.as_slice()
+        {
+            let fold = Breaker::Fold {
+                kind: *kind,
+                accumulator: (**accumulator).clone(),
+            };
+            return (fold, fold_edge.subscribed);
+        }
+        (Breaker::Collect, top)
+    }
+
     /// The kind of the operator `id` names, or why the graph holds none.
     fn kind_of(&self, id: NodeId) -> Option<&'static str> {
         match self.by_id.get(&id) {
@@ -708,6 +747,7 @@ fn run_planned(
             head: pipeline.head,
             // The plan admits no build side, which would make a pipeline wait on one.
             after: Vec::new(),
+            inherits: Vec::new(),
             streams_from: pipeline
                 .streams_from
                 .iter()
@@ -750,6 +790,7 @@ fn run_pipeline(
         head: Head::Source,
         after: Vec::new(),
         streams_from: Vec::new(),
+        inherits: Vec::new(),
     };
     let mut tiles = run_pipelines(scheduler, vec![run], config, delivery);
     tiles.pop().expect("one pipeline, one result")
@@ -780,7 +821,14 @@ struct PipelineRun<'a> {
     /// See [`PipelineSpec::streams_from`]. A pipeline with a [`Head::Breaker`] streams from the
     /// pipeline of the breaker it reads, and a [`Head::Source`] pipeline streams from none.
     streams_from: Vec<PipelineId>,
+    /// What the serial producers this pipeline replaces had released of each source: the pool's
+    /// record for each source operator of the chain starts there. Empty for a run no serial
+    /// producer read.
+    inherits: Vec<Inherited>,
 }
+
+/// What the serial producers a pool replaces had released of one source.
+type Inherited = (Arc<Mutex<dyn DataSourceDomainExtentImpl>>, Predicate);
 
 /// Run the pipelines of a plan on `config.threads` workers, each of which subscribes every
 /// pipeline's chain once and serves whichever pipeline has a morsel. The results are what each
@@ -952,8 +1000,9 @@ fn prepare(
     // The chains hold release records with a source, one per source operator and named for the
     // pool: each worker releases the morsels it ran, and a source reclaims what every record
     // releases. The records outlive the chains and retire when `records` drops.
+    let identity = pool_release_identity();
     let (chains, records): (Vec<Vec<Box<dyn TileProducer>>>, _) = scheduler
-        .with_pooled_release_records(pool_release_identity(), |scheduler| {
+        .with_pooled_release_records(identity.clone(), |scheduler| {
             (0..config.threads.max(1))
                 .map(|worker| {
                     runs.iter_mut()
@@ -978,6 +1027,28 @@ fn prepare(
                 })
                 .collect()
         });
+    // The records start where the serial producers they replace had released, per source
+    // operator: a key already handed to a reader is not offered again.
+    for run in &runs {
+        if run.inherits.is_empty() {
+            continue;
+        }
+        let mut names = Vec::new();
+        visit_operators(&*run.chain, &mut |op| {
+            if let Some(id) = op.operator_id() {
+                let name = format!("{identity}/{id:?}");
+                if records.holds(&name) {
+                    names.push(name);
+                }
+            }
+        });
+        for (source, released) in &run.inherits {
+            let mut source = source.lock_wait();
+            for name in &names {
+                source.release(name, released.clone());
+            }
+        }
+    }
     let seeded: Vec<usize> = (0..runs.len())
         .filter(|&pipeline| runs[pipeline].head == Head::Source)
         .collect();
@@ -998,6 +1069,12 @@ fn prepare(
         records,
         breakers,
     }
+}
+
+/// `f` on `op` and on every operator beneath it.
+fn visit_operators(op: &dyn TileOperator, f: &mut dyn FnMut(&dyn TileOperator)) {
+    f(op);
+    op.visit_inputs(&mut |edge| visit_operators(edge.target, f));
 }
 
 /// The invariants of a run's pipelines that a debug build checks, which a plan holds and a
@@ -2010,41 +2087,95 @@ impl PooledRun {
         config: &Config,
         main_consumer: Box<dyn Consumer>,
     ) -> Result<Self, Unsupported> {
-        let plan = plan(&program.operator_graph)?;
-        let output = program
-            .main_mut()
-            .ok_or_else(|| Unsupported("the program has no `main` output".into()))?;
-        check_pipelines(&*output.op)?;
-        let dropped = main_producer.take().or_else(|| output.producer.take());
-        debug_assert!(
-            dropped.is_some(),
-            "the pool drops the producer that held the pipeline's record"
-        );
-        drop(dropped);
-        let main_tiling = output.op.tiling().clone();
-        let mut consumer = Some(main_consumer);
+        let plan = plan_inline(&program.operator_graph)?;
+        // What each output's serial producers had released of each source, read before the
+        // producers are dropped and their records retire.
+        let inherited: HashMap<String, Vec<Inherited>> = program
+            .outputs
+            .iter()
+            .map(|output| {
+                (
+                    output.name.clone(),
+                    ctx.scheduler().released_by(&output.source_producers),
+                )
+            })
+            .collect();
+        let (mut main, mut sinks) = (None, Vec::new());
+        for output in program.outputs.iter_mut() {
+            match output.is_main() {
+                true => main = Some(output),
+                false => sinks.push(output),
+            }
+        }
+        for output in main.iter().chain(sinks.iter()) {
+            check_pipelines(&*output.op)?;
+        }
+        // Everything the pool can refuse is read; the program is the pool's from here. The
+        // producers `compile_program` subscribed for the outputs go: they registered records that
+        // release nothing, which a source would hold its reclaim at. `main`'s is in the output or
+        // with the caller that moved it out to drive it, and a sink's is its consumer's.
+        if let Some(output) = main.as_mut() {
+            let dropped = main_producer.take().or_else(|| output.producer.take());
+            debug_assert!(
+                dropped.is_some(),
+                "the pool drops the producer that held the pipeline's record"
+            );
+            drop(dropped);
+        }
+        for output in &sinks {
+            let consumer = output
+                .sink_consumer
+                .as_ref()
+                .expect("a sink output has its consumer");
+            drop(consumer.lock_now().take_producer());
+        }
+        let mut taken = HashMap::new();
+        let mut sink_chains: Vec<SinkChain<'_>> = sinks
+            .into_iter()
+            .map(|output| SinkChain {
+                name: output.name.clone(),
+                consumer: output
+                    .sink_consumer
+                    .clone()
+                    .expect("a sink output has its consumer"),
+                chain: &mut output.op,
+            })
+            .collect();
+        for sink in &mut sink_chains {
+            cut(sink.chain, &mut taken);
+        }
+        let mut pending = Some((taken, sink_chains, main_consumer));
         let mut started = None;
-        let mut start_chain = |chain: &mut Box<dyn TileOperator>| {
-            let mut taken = HashMap::new();
-            cut(chain, &mut taken);
+        let mut start_chain = |chain: Option<(&mut Box<dyn TileOperator>, Tiling)>| {
+            let (mut taken, sinks, consumer) = pending.take().expect("the chains are started once");
+            let main = chain.map(|(chain, tiling)| {
+                cut(chain, &mut taken);
+                MainChain {
+                    chain,
+                    tiling,
+                    consumer,
+                }
+            });
             started = Some(start_planned(
-                ctx,
-                &plan,
-                chain,
-                taken,
-                config,
-                main_tiling.clone(),
-                consumer.take().expect("the main chain is visited once"),
+                ctx, &plan, main, sinks, taken, config, &inherited,
             ));
         };
-        match plan.main().breaker {
-            Breaker::Collect => start_chain(&mut output.op),
-            Breaker::Fold { .. } => output.op.visit_inputs_mut(&mut |fold| {
-                fold.visit_inputs_mut(&mut |input| start_chain(input));
-            }),
-            Breaker::Materialize { .. } => unreachable!("`main` is not a memo's input"),
+        match main {
+            None => start_chain(None),
+            Some(output) => {
+                let tiling = output.op.tiling().clone();
+                match plan.main().breaker {
+                    Breaker::Collect => start_chain(Some((&mut output.op, tiling))),
+                    Breaker::Fold { .. } => output.op.visit_inputs_mut(&mut |fold| {
+                        fold.visit_inputs_mut(&mut |input| {
+                            start_chain(Some((input, tiling.clone())))
+                        });
+                    }),
+                    Breaker::Materialize { .. } => unreachable!("`main` is not a memo's input"),
+                }
+            }
         }
-        Ok(started.expect("the main chain was visited"))
+        Ok(started.expect("the chains were started"))
     }
 
     /// The pool's part of one pass of the scheduler loop, between the delivery and the pulls of the
@@ -2061,9 +2192,10 @@ impl PooledRun {
         }
     }
 
-    /// The producer that answers `main`, for the driver to pull.
-    pub fn take_main(&mut self) -> Box<dyn TileProducer> {
-        self.main.take().expect("`main` is taken once")
+    /// The producer that answers `main`, for the driver to pull, or none for a program without a
+    /// `main`.
+    pub fn take_main(&mut self) -> Option<Box<dyn TileProducer>> {
+        self.main.take()
     }
 
     /// Serve every morsel the arrivals published so far, on this thread, and say what happened.
@@ -2099,30 +2231,77 @@ impl PooledRun {
     }
 }
 
-/// Subscribe `plan`'s pipelines over the chains the cut left, on one worker, and answer `main`
-/// from the final breaker.
+/// The chain that ends in `main`, with `main`'s tiling and the consumer woken when it has
+/// something to pull.
+struct MainChain<'a> {
+    chain: &'a mut Box<dyn TileOperator>,
+    tiling: Tiling,
+    consumer: Box<dyn Consumer>,
+}
+
+/// The chain that ends in a sink, and the consumer that pulls the sink.
+struct SinkChain<'a> {
+    name: String,
+    chain: &'a mut Box<dyn TileOperator>,
+    // shared-state-ok: the sink's own consumer. The pool installs a producer in it and it
+    // schedules the sink's pull; no tile passes through it between operators.
+    consumer: Arc<Mutex<SinkConsumer>>,
+}
+
+/// Subscribe `plan`'s pipelines over the chains the cut left, on one worker, answer `main` from
+/// its breaker, and pull each sink through a producer of its breaker's output.
 fn start_planned(
     ctx: &mut GlobalContext,
     plan: &Plan,
-    main_chain: &mut Box<dyn TileOperator>,
+    main: Option<MainChain<'_>>,
+    sinks: Vec<SinkChain<'_>>,
     mut taken: HashMap<NodeId, Taken>,
     config: &Config,
-    main_tiling: Tiling,
-    main_consumer: Box<dyn Consumer>,
+    inherited: &HashMap<String, Vec<Inherited>>,
 ) -> PooledRun {
+    /// What an output reads once its pipeline runs.
     enum Reads {
         Rows(Arc<Materialized>),
         Folded(Arc<FoldedResult>),
     }
-    let mut main_chain = Some(main_chain);
-    let mut main_consumer = Some(main_consumer);
-    let mut reads = None;
+    let (mut main_chain, mut main_consumer, main_tiling) = match main {
+        Some(main) => (Some(main.chain), Some(main.consumer), Some(main.tiling)),
+        None => (None, None, None),
+    };
+    let mut sink_chains: HashMap<String, &mut Box<dyn TileOperator>> = HashMap::new();
+    let mut sinks = sinks;
+    // shared-state-ok: the sinks' own consumers, as `SinkChain::consumer`.
+    let sink_consumers: Vec<(String, Arc<Mutex<SinkConsumer>>)> = sinks
+        .iter()
+        .map(|sink| (sink.name.clone(), sink.consumer.clone()))
+        .collect();
+    for sink in sinks.iter_mut() {
+        sink_chains.insert(sink.name.clone(), &mut *sink.chain);
+    }
+    // The output each pipeline serves: the pipelines that stream into an output's pipeline are
+    // its own, since a `Memo` is read by one slot.
+    let mut owners: Vec<Option<&str>> = vec![None; plan.pipelines.len()];
+    for (name, at) in &plan.outputs {
+        let mut pending = vec![*at];
+        while let Some(pipeline) = pending.pop() {
+            owners[pipeline] = Some(name);
+            pending.extend(&plan.pipelines[pipeline].streams_from);
+        }
+    }
+    let mut reads: HashMap<String, Reads> = HashMap::new();
     let (mut runs, mut notified, mut close_at_start) = (Vec::new(), Vec::new(), Vec::new());
     let mut sources = Vec::new();
     {
         let mut upstream: HashMap<NodeId, &mut Taken> =
             taken.iter_mut().map(|(k, v)| (*k, v)).collect();
-        for pipeline in &plan.pipelines {
+        for (position, pipeline) in plan.pipelines.iter().enumerate() {
+            let output_name = || {
+                plan.outputs
+                    .iter()
+                    .find(|(_, at)| *at == position)
+                    .map(|(name, _)| name.clone())
+                    .expect("a pipeline that is not a memo's ends in an output")
+            };
             let (chain, breaker): (&mut dyn TileOperator, PoolBreaker) = match &pipeline.breaker {
                 Breaker::Materialize { memo } => {
                     let taken = upstream
@@ -2136,9 +2315,15 @@ fn start_planned(
                     )
                 }
                 Breaker::Collect => {
-                    let chain = main_chain.take().expect("one pipeline ends in `main`");
+                    let name = output_name();
+                    let chain = match name == "main" {
+                        true => main_chain.take().expect("one pipeline ends in `main`"),
+                        false => sink_chains
+                            .remove(&name)
+                            .expect("one pipeline ends in each sink"),
+                    };
                     let output = Materialized::new(chain.tiling().clone());
-                    reads = Some(Reads::Rows(output.clone()));
+                    reads.insert(name, Reads::Rows(output.clone()));
                     (&mut **chain, PoolBreaker::Materialize { output })
                 }
                 Breaker::Fold { kind, accumulator } => {
@@ -2146,7 +2331,7 @@ fn start_planned(
                     let result = FoldedResult::new(
                         main_consumer.take().expect("the consumer is taken once"),
                     );
-                    reads = Some(Reads::Folded(result.clone()));
+                    reads.insert("main".into(), Reads::Folded(result.clone()));
                     let breaker = PoolBreaker::Fold {
                         kind: *kind,
                         seed: kind.initial_accumulator(accumulator),
@@ -2168,6 +2353,10 @@ fn start_planned(
                 breaker,
                 head: pipeline.head,
                 after: Vec::new(),
+                inherits: owners[position]
+                    .and_then(|owner| inherited.get(owner))
+                    .cloned()
+                    .unwrap_or_default(),
                 streams_from: pipeline
                     .streams_from
                     .iter()
@@ -2195,26 +2384,43 @@ fn start_planned(
         .map(|((handle, source), _)| (handle.clone(), source))
         .collect();
     // The reader registers before the first morsel, so no row leaves before it has read.
-    let main = match reads.expect("one pipeline ends in `main`") {
-        Reads::Rows(output) => BreakerOutput::new(output, main_tiling.clone(), false, None)
-            .subscribe(
-                main_tiling.universal_guard(),
-                main_consumer.take().expect("the consumer is taken once"),
-                ctx.scheduler(),
-            ),
-        Reads::Folded(result) => Box::new(FoldedResultProducer {
-            base: ProducerBase::new(
-                FoldedResultProducer::alloc_id(),
-                &main_tiling,
-                &OperatorBase::new(main_tiling.clone()),
-                ctx.scheduler(),
-            ),
-            result,
-        }),
-    };
+    let main_producer =
+        main_tiling.map(
+            |tiling| match reads.remove("main").expect("`main` has a breaker") {
+                Reads::Rows(output) => BreakerOutput::new(output, tiling.clone(), false, None)
+                    .subscribe(
+                        tiling.universal_guard(),
+                        main_consumer.take().expect("the consumer is taken once"),
+                        ctx.scheduler(),
+                    ),
+                Reads::Folded(result) => Box::new(FoldedResultProducer {
+                    base: ProducerBase::new(
+                        FoldedResultProducer::alloc_id(),
+                        &tiling,
+                        &OperatorBase::new(tiling.clone()),
+                        ctx.scheduler(),
+                    ),
+                    result,
+                }) as Box<dyn TileProducer>,
+            },
+        );
+    // A sink is pulled through a reader of its breaker's output on this thread, so its consumer
+    // is woken as `main`'s is, and the pull hands the sink what arrived and releases it.
+    for (name, consumer) in sink_consumers {
+        let Some(Reads::Rows(output)) = reads.remove(&name) else {
+            unreachable!("a sink's pipeline collects: {name}")
+        };
+        let tiling = output.tiling().clone();
+        let producer = BreakerOutput::new(output, tiling.clone(), false, None).subscribe(
+            tiling.universal_guard(),
+            Box::new(consumer.clone()),
+            ctx.scheduler(),
+        );
+        consumer.lock_now().install_producer(producer);
+    }
     let state = dispatcher.serve_state();
     PooledRun {
-        main: Some(main),
+        main: main_producer,
         chains: chains.pop().expect("one worker"),
         partials: breakers
             .iter()

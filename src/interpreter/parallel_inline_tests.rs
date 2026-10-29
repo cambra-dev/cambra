@@ -61,7 +61,7 @@ mod inline {
         };
         let mut run = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
             .unwrap_or_else(|why| panic!("{why}"));
-        let mut main = run.take_main();
+        let mut main = run.take_main().expect("a main output");
         let tile = drive(&mut ctx, &mut run, &mut *main, 100);
         assert_eq!(run.lap(), Lap::Done, "every pipeline finished");
         tile
@@ -152,7 +152,7 @@ mod inline {
             .expect("admitted");
         let output = main_output(&run);
         assert_eq!(output.reader_count(), 1, "`main` reads the breaker");
-        let mut main = run.take_main();
+        let mut main = run.take_main().expect("a main output");
         let tile = drive(&mut ctx, &mut run, &mut *main, 100);
         assert_eq!(entries(&tile).len(), 20);
         assert_eq!(
@@ -219,7 +219,7 @@ mod inline {
         };
         let mut run = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
             .expect("a source that cuts morsels is admitted");
-        let mut main = run.take_main();
+        let mut main = run.take_main().expect("a main output");
         let universal = main.tiling().universal_guard();
         ctx.scheduler().check_for_notifications();
         assert_eq!(run.lap(), Lap::Idle, "nothing has arrived");
@@ -295,7 +295,7 @@ mod inline {
             let mut run =
                 PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
                     .expect("admitted");
-            let mut main = run.take_main();
+            let mut main = run.take_main().expect("a main output");
             let inline = drive(&mut ctx, &mut run, &mut *main, 100);
             assert_eq!(run.lap(), Lap::Done, "{code}: the pipeline finished");
             assert!(inline.is_terminal() && serial.is_terminal(), "{code}");
@@ -320,7 +320,7 @@ mod inline {
         };
         let mut run = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
             .expect("admitted");
-        let mut main = run.take_main();
+        let mut main = run.take_main().expect("a main output");
         let universal = main.tiling().universal_guard();
         for (arrived, upto) in [(0..3, 2), (3..5, 4)] {
             arrive(&source, arrived);
@@ -401,5 +401,211 @@ mod inline {
         );
         let main = program.outputs.iter().find(|o| o.is_main()).expect("main");
         assert_eq!(check_pipelines(&*main.op).ok(), Some(1));
+    }
+
+    /// A program that writes `x + 1` of every row of `source1()` to the sink `out`, with the source
+    /// and the sink registered.
+    fn writes_to_a_sink(
+        code: &str,
+    ) -> (
+        GlobalContext,
+        CompiledProgram,
+        Arc<Mutex<TestDataSource>>,
+        Arc<crate::interpreter::TestSink>,
+    ) {
+        let source = Arc::new(Mutex::new(TestDataSource::new(
+            "source1",
+            crate::ccl::Type::Base(BaseType::Int),
+            Extent::Base(BaseType::Int),
+        )));
+        let mut ctx = GlobalContext::default();
+        ctx.register_source(source.clone());
+        let sink = ctx.register_test_sink("out");
+        let program = compiled(&mut ctx, code);
+        (ctx, program, source, sink)
+    }
+
+    /// The bindings of a collection value, in an order that does not depend on arrival.
+    fn bindings(value: Value) -> Vec<String> {
+        let Value::Function(bindings) = value else {
+            panic!("a collection, got {value:?}");
+        };
+        let mut rendered: Vec<String> = bindings.iter().map(|b| format!("{b:?}")).collect();
+        rendered.sort();
+        rendered
+    }
+
+    const SINK_CODE: &str = indoc! {"
+        out = test_sink()
+        for x in source1():
+            out << x + 1
+    "};
+
+    /// The value the sink holds after the serial loop ran the program over the rows `0..rows` of
+    /// `source1()`, the source closed.
+    fn serial_sink_value(rows: i64) -> Value {
+        let (mut ctx, _program, source, sink) = writes_to_a_sink(SINK_CODE);
+        arrive(&source, 0..rows);
+        source.lock_wait().set_yield_predicate(Predicate::True);
+        for _ in 0..16 {
+            ctx.scheduler().check_for_notifications();
+        }
+        sink.value().expect("the serial loop completed the sink")
+    }
+
+    /// A sink is pulled through a reader of its pipeline's breaker: rows that arrive across laps
+    /// reach it once each, and it is complete when the source ends, holding what the serial loop's
+    /// sink holds.
+    #[test]
+    fn a_sink_receives_each_row_once_and_is_complete_when_the_source_ends() {
+        let (mut ctx, mut program, source, sink) = writes_to_a_sink(SINK_CODE);
+        let config = Config {
+            threads: 1,
+            morsel_rows: 2,
+        };
+        let mut run = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
+            .unwrap_or_else(|why| panic!("{why}"));
+        assert!(run.take_main().is_none(), "the program has no `main`");
+        for (arrived, upto) in [(0..3, 2), (3..7, 6)] {
+            arrive(&source, arrived);
+            source
+                .lock_wait()
+                .set_yield_predicate(Predicate::at_or_below(Value::UInt(upto)));
+            ctx.scheduler().check_for_notifications();
+            assert_eq!(run.lap(), Lap::Ran);
+            ctx.scheduler().pull_sinks();
+            assert!(
+                sink.value().is_err(),
+                "the sink is not complete while the source can still deliver"
+            );
+        }
+        source.lock_wait().set_yield_predicate(Predicate::True);
+        for _ in 0..8 {
+            ctx.scheduler().check_for_notifications();
+            run.lap();
+            ctx.scheduler().pull_sinks();
+        }
+        assert_eq!(
+            bindings(sink.value().expect("complete")),
+            bindings(serial_sink_value(7))
+        );
+        assert_eq!(sink.rows_handed(), 7, "each row is handed to the sink once");
+    }
+
+    /// `code` compiled over a source that already holds the keys `held`, with its yield predicate
+    /// at the last of them and a reader `lagging` that has released nothing, so the source keeps
+    /// every row. Compiling pulls each sink, which hands it the held rows.
+    fn compiled_over_held_rows(
+        code: &str,
+        sinks: &[&str],
+        held: std::ops::Range<i64>,
+    ) -> (
+        GlobalContext,
+        CompiledProgram,
+        Arc<Mutex<TestDataSource>>,
+        Vec<Arc<crate::interpreter::TestSink>>,
+    ) {
+        use crate::interpreter::DataSourceDomainExtentImpl;
+        let source = Arc::new(Mutex::new(TestDataSource::new(
+            "source1",
+            crate::ccl::Type::Base(BaseType::Int),
+            Extent::Base(BaseType::Int),
+        )));
+        let mut ctx = GlobalContext::default();
+        ctx.register_source(source.clone());
+        let handles = sinks
+            .iter()
+            .map(|name| ctx.register_test_sink(*name))
+            .collect();
+        let last = held.end - 1;
+        let some = !held.is_empty();
+        arrive(&source, held);
+        {
+            let mut source = source.lock_wait();
+            if some {
+                source.set_yield_predicate(Predicate::at_or_below(Value::UInt(last as u64)));
+            }
+            source.release("lagging", Predicate::False);
+        }
+        let program = compiled(&mut ctx, code);
+        (ctx, program, source, handles)
+    }
+
+    /// Run `program` on the pool, deliver the rows `3..5` with the source complete, and serve
+    /// until it settles.
+    fn finish_over_arrivals(
+        ctx: &mut GlobalContext,
+        program: &mut CompiledProgram,
+        source: &Arc<Mutex<TestDataSource>>,
+    ) {
+        let config = Config {
+            threads: 1,
+            morsel_rows: 2,
+        };
+        let mut run = PooledRun::start(ctx, program, &mut None, &config, Box::new(|| {}))
+            .unwrap_or_else(|why| panic!("{why}"));
+        arrive(source, 3..5);
+        source.lock_wait().set_yield_predicate(Predicate::True);
+        for _ in 0..8 {
+            ctx.scheduler().check_for_notifications();
+            run.lap();
+            ctx.scheduler().pull_sinks();
+        }
+    }
+
+    /// The rows a source held when the program compiled were handed to the sink then, and the pool
+    /// that replaces the serial producer starts its records where that producer had released:
+    /// another reader holds the source's agreement back, so nothing else keeps the held rows from
+    /// being offered again.
+    #[test]
+    fn rows_held_at_compile_reach_the_sink_once() {
+        let (mut ctx, mut program, source, sinks) =
+            compiled_over_held_rows(SINK_CODE, &["out"], 0..3);
+        ctx.scheduler().pull_sinks();
+        assert_eq!(sinks[0].rows_handed(), 3, "compiling pulled the held rows");
+        finish_over_arrivals(&mut ctx, &mut program, &source);
+        assert_eq!(sinks[0].rows_handed(), 5, "each row reaches the sink once");
+        assert_eq!(
+            bindings(sinks[0].value().expect("complete")),
+            bindings(serial_sink_value(5))
+        );
+    }
+
+    /// Two sinks over two chains each inherit what their own serial chain had released, and each
+    /// receives every row once.
+    #[test]
+    fn each_sink_inherits_what_its_own_chain_released() {
+        let code = indoc! {"
+            first = test_sink()
+            second = test_sink()
+            for x in source1():
+                first << x + 1
+            for y in source1():
+                second << y + 2
+        "};
+        let (mut ctx, mut program, source, sinks) =
+            compiled_over_held_rows(code, &["first", "second"], 0..3);
+        ctx.scheduler().pull_sinks();
+        assert_eq!(
+            [sinks[0].rows_handed(), sinks[1].rows_handed()],
+            [3, 3],
+            "compiling pulled the held rows into each sink"
+        );
+        finish_over_arrivals(&mut ctx, &mut program, &source);
+        assert_eq!(
+            [sinks[0].rows_handed(), sinks[1].rows_handed()],
+            [5, 5],
+            "each sink received every row once"
+        );
+    }
+
+    /// A serial producer that had released nothing leaves the pool's records at nothing: rows that
+    /// arrive after the pool starts are the only rows, and each arrives once.
+    #[test]
+    fn a_pool_over_a_producer_that_released_nothing_starts_at_nothing() {
+        let (mut ctx, mut program, source, sinks) =
+            compiled_over_held_rows(SINK_CODE, &["out"], 0..0);
+        finish_over_arrivals(&mut ctx, &mut program, &source);
+        assert_eq!(sinks[0].rows_handed(), 2, "the rows 3..5");
     }
 }

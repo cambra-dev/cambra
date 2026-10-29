@@ -637,7 +637,7 @@ impl LiveProgram {
             consumer,
         );
         Some(started.map(|mut run| {
-            branch.main_producer = Some(run.take_main());
+            branch.main_producer = run.take_main();
             // The pool took the program, whose fan-outs it cut: a reload cannot offer them on.
             branch.operator_map = OperatorMap::default();
             // The pool has subscribed and nothing has pulled it yet.

@@ -138,6 +138,19 @@ impl SinkConsumer {
         self.pull.lock_now().notify(&Projection::Everything);
     }
 
+    /// The producer the sink is pulled through, taken out of the consumer: the serial chain a
+    /// pool replaces. Dropping it ends that chain's subscription and its release records.
+    pub(crate) fn take_producer(&self) -> Option<Box<dyn TileProducer>> {
+        self.producer.lock_now().take()
+    }
+
+    /// Pull the sink through `producer` from now on, and schedule a pull: what the pool installs
+    /// once its pipelines are subscribed.
+    pub(crate) fn install_producer(&self, producer: Box<dyn TileProducer>) {
+        *self.producer.lock_now() = Some(producer);
+        self.wakeups.request(self.pull.clone());
+    }
+
     /// Stop dispatching and release the producer chain behind this consumer.
     ///
     /// A [`DataSink`] outlives any one version of a program; the subscription

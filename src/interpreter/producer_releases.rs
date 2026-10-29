@@ -121,6 +121,24 @@ impl ProducerReleases {
         };
     }
 
+    /// What the producers named in `producers` have all released: the intersection of their
+    /// records, and nothing when none of them is registered here. The part of a source a
+    /// replacement of those producers need not be offered again.
+    pub(crate) fn released_by(&self, producers: &HashSet<String>) -> Predicate {
+        let mut theirs = self
+            .per_producer
+            .iter()
+            .filter(|(name, _)| producers.contains(*name))
+            .map(|(_, released)| released)
+            .peekable();
+        if theirs.peek().is_none() {
+            return Predicate::False;
+        }
+        theirs.fold(Predicate::True, |agreed, released| {
+            agreed.intersect(released)
+        })
+    }
+
     /// What a producer registering now is recorded as having already released.
     pub(crate) fn on_registration(&self) -> &Predicate {
         &self.on_registration

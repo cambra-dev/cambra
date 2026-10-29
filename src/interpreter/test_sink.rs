@@ -6,7 +6,10 @@
 //! two apart.
 
 use smol_str::SmolStr;
-use std::sync::Mutex;
+use std::sync::{
+    Mutex,
+    atomic::{AtomicUsize, Ordering},
+};
 
 use crate::interpreter::{DataSink, FuncBinding, Tile, Value, validate_tile};
 
@@ -55,9 +58,18 @@ pub struct TestSink {
     // between operators — and `DataSink::process` takes `&self`, so a cell is what lets a
     // sink hold what it was handed. Same category as the HTTP sink's pending map.
     accumulated: Mutex<Option<Tile>>,
+    // shared-state-ok: the sink's own tally of what it was handed, for a test that checks each
+    // row is handed over once. Nothing reads it back into the graph.
+    rows_handed: AtomicUsize,
 }
 
 impl TestSink {
+    /// How many keys of a collection the sink has been handed, over every tile: a row handed over
+    /// twice is counted twice.
+    pub fn rows_handed(&self) -> usize {
+        self.rows_handed.load(Ordering::Relaxed)
+    }
+
     /// What the program wrote, once it is complete.
     pub fn value(&self) -> Result<Value, SinkReadError> {
         let guard = self.accumulated.lock().unwrap();
@@ -74,6 +86,13 @@ impl TestSink {
 
 impl DataSink for TestSink {
     fn process(&self, tile: &Tile) {
+        if let Tile::DataFunction {
+            domain, deleted, ..
+        } = tile
+        {
+            self.rows_handed
+                .fetch_add(domain.len() - deleted.len(), Ordering::Relaxed);
+        }
         let mut slot = self.accumulated.lock().unwrap();
         match slot.as_mut() {
             None => *slot = Some(tile.clone()),

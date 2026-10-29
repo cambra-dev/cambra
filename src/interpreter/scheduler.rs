@@ -8,7 +8,7 @@ use std::{
 use smol_str::SmolStr;
 
 use crate::interpreter::{
-    Consumer, DataSourceDomainExtentImpl, Projection, tile_operators::Notified,
+    Consumer, DataSourceDomainExtentImpl, Predicate, Projection, tile_operators::Notified,
     value_probe::ProbeSlot,
 };
 
@@ -422,6 +422,13 @@ pub(crate) struct PooledRecords {
     sources: Vec<Arc<Mutex<dyn DataSourceDomainExtentImpl>>>,
 }
 
+impl PooledRecords {
+    /// Whether a producer named `name` holds one of the records.
+    pub(crate) fn holds(&self, name: &str) -> bool {
+        self.names.iter().any(|held| held == name)
+    }
+}
+
 impl Drop for PooledRecords {
     fn drop(&mut self) {
         for source in &self.sources {
@@ -540,6 +547,21 @@ impl Scheduler {
                 std::panic::resume_unwind(panic)
             }
         }
+    }
+
+    /// What the producers named in `producers` have released of each source the scheduler holds,
+    /// for the sources where it is something: what a pool that replaces them inherits.
+    pub(crate) fn released_by(
+        &self,
+        producers: &std::collections::HashSet<String>,
+    ) -> Vec<(Arc<Mutex<dyn DataSourceDomainExtentImpl>>, Predicate)> {
+        self.source_handles
+            .values()
+            .filter_map(|(source, _)| {
+                let released = source.lock_wait().released_by(producers);
+                (!released.is_false()).then(|| (source.clone(), released))
+            })
+            .collect()
     }
 
     /// The name the producer of `operator` holds its release record under while a pool subscribes

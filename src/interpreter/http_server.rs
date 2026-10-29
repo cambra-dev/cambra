@@ -578,6 +578,10 @@ impl DataSourceDomainExtentImpl for HttpServerDataSource {
         Extent::Base(BaseType::UInt)
     }
 
+    fn released_by(&self, producers: &std::collections::HashSet<String>) -> Predicate {
+        self.buf.releases.released_by(producers)
+    }
+
     /// Request positions are totally ordered, so a pool cuts a morsel out of them.
     fn cuts_morsels(&self) -> bool {
         true

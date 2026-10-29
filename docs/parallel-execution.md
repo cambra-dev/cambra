@@ -844,8 +844,8 @@ Ordered so that each step is measurable on its own and none is undone by the nex
    pulling it at the universal guard. This is the morsel mechanism, exercised single-threaded.
    Landed for every tile operator (`src/interpreter/design-operators.md`, "Projection guards"),
    and the morsel pipeline cuts a finite `IterateExtent` range and a collection `Constant`
-   (`src/interpreter/design-parallel.md`, "Projection guards"). The `UIntStreamBuffer` is not
-   yet cut by interval.
+   (`src/interpreter/design-parallel.md`, "Projection guards"). The `UIntStreamBuffer` is cut by
+   interval: the HTTP source answers `first_keys_in` and `elements_in` from it.
 3. **The pipeline plan and a chain per worker.** The pass over `OperatorGraph` that classifies
    breakers and emits pipelines, and the cloning of a streaming producer chain per worker,
    exercised single-threaded with two chains over disjoint guards into one breaker.
@@ -856,8 +856,12 @@ Ordered so that each step is measurable on its own and none is undone by the nex
 5. **A worker pool and the first breaker.** The pool, the dispatcher over a range source's cursor,
    and the sink as the breaker landed for `[x + 1 for x in xs]` over a literal list, and `Aggregate`
    over it as the first folding breaker, with a partial per worker combined at the end
-   (`src/interpreter/design-parallel.md`, "A fold as the breaker"). Next: the same over a source,
-   which is where the chain's scaling with no exchange is measured.
+   (`src/interpreter/design-parallel.md`, "A fold as the breaker"). The inline dispatcher runs the
+   same over a data source and writes each sink through a reader of its pipeline's breaker, so an
+   HTTP program `source -> map -> sink`, with a `Memo` between maps, runs on the scheduler loop's
+   own thread (`src/interpreter/design-parallel.md`, "Sinks and the HTTP path"). Next: the threaded
+   pool over a source, which is where the chain's scaling with no exchange is measured, and a
+   build side for a filter that reads its input twice.
 6. **The grouped fold.** The planning rewrite that fuses `converse(c ≫ key) ≫ map(c ≫ v) ≫
    map_aggregate(kind)` into one fold over `pos ↦ (key, v)`, with thread-local tables and the
    sequential merge. This is the group-by's parallel form and removes the second memo reader.

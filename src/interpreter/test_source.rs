@@ -198,6 +198,10 @@ impl DataSourceDomainExtentImpl for TestDataSource {
         self.key_extent.clone()
     }
 
+    fn released_by(&self, producers: &std::collections::HashSet<String>) -> Predicate {
+        self.releases.released_by(producers)
+    }
+
     fn cuts_morsels(&self) -> bool {
         !self.declines_morsels
             && matches!(

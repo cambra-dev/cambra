@@ -340,7 +340,7 @@ mod dispatch {
         };
         let started = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}));
         let mut run = started.map_err(|refused| refused.to_string())?;
-        let mut main = run.take_main();
+        let mut main = run.take_main().expect("a program with a `main` output");
         let universal = main.tiling().universal_guard();
         let laps = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             for _ in 0..1024 {

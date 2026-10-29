@@ -101,6 +101,11 @@ EXPECTED_EXCEPTIONS = [
     # producer that answers `main`. Both are the breaker's own state, as the collector is.
     ("src/interpreter/parallel.rs", "shared cell of `Vec<Tile>`"),
     ("src/interpreter/parallel.rs", "cell of `Option<Tile>`"),
+    # A sink's own consumer (`parallel.rs`, `SinkChain` and `start_planned`): the pool installs a
+    # producer in it and it schedules the sink's pull, and no tile passes through it between
+    # operators.
+    ("src/interpreter/parallel.rs", "shared cell of `SinkConsumer`"),
+    ("src/interpreter/parallel.rs", "shared cell of `SinkConsumer`"),
     # The worker pool's breakers: the collection every worker merges into, and each
     # worker's partial accumulator, handed in once; both answer `main` after every worker
     # has returned, and no operator reads either.
