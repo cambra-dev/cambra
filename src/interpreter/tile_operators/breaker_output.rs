@@ -2,7 +2,7 @@
 
 #![cfg_attr(
     not(test),
-    expect(dead_code, reason = "the pool's materializing breaker is its caller")
+    expect(dead_code, reason = "the plan constructs `PoolBreaker::Materialize`")
 )]
 
 use super::*;

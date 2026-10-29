@@ -85,12 +85,17 @@ chain, as [docs/parallel-execution.md, "Thread-confined chains, shared
 breakers"](../../docs/parallel-execution.md#thread-confined-chains-shared-breakers) asks. An
 operator is subscribed as many times as there are workers; nothing is cloned, because the chain is a
 tree of boxed operators each subscription walks afresh. A worker holds its chains in a vector
-indexed by `PipelineId`, which holds one entry, since the plan holds one pipeline. The threads are
-`std::thread::scope` threads over `run_worker`, and the calling thread waits for the scope. For a
+indexed by `PipelineId`, with one entry per pipeline of the run (`run_pipelines`; `run_pipeline` is
+the run of one). The threads are `std::thread::scope` threads over `run_worker`, and the calling
+thread waits for the scope. For a
 collection the breaker's state is the collector, the sink: a `Mutex<Tile>` the workers merge into
 with `Tile::merge`, which calls the collection complete once every worker has returned, every
 package acknowledged after its rows were merged. For a fold it is the partials of [A fold as the
-breaker](#a-fold-as-the-breaker).
+breaker](#a-fold-as-the-breaker). For a breaker that materializes (`PoolBreaker::Materialize`) it is
+a `Materialized` ([A breaker's output](#a-breakers-output)): a worker merges the morsel into it with
+`absorb`, publishes the morsel's guard as the region, and then releases the morsel on its chain, so
+the release is at the merge. The pipeline's `finalize` completes the output, before the pipelines
+that stream from it are closed.
 
 The chains are lent to the workers and dropped after the scope, one at a time on the thread that
 subscribed them: a producer's drop detaches its probe with a lock that must not find the probe table
@@ -237,16 +242,29 @@ diamond. The path from the source to the `PipelineConsumer` is region-driven and
 ([Region-carrying notifications](#region-carrying-notifications)), which `plan_main` guarantees by
 admitting only `MapResult`s over a `Constant` function operand and refusing a shared node
 (`FanOutSlot`) or a deferred edge. `run_pipeline` is the body of `run_main` for a plan with one
-pipeline. Once the chains are subscribed it publishes `Everything` to the source, so the rows the
-source holds when the pool starts are claimable, as no notification names them. Without a delivery
-it then closes the source, since no row arrives later. it takes the breaker and the source, and with
-a `DeliveringThread` runs that closure on the calling thread while the workers run. The closure
+pipeline, and `run_pipelines` runs several. Once the chains are subscribed it publishes `Everything`
+to the source, so the rows the source holds when the pool starts are claimable, as no notification
+names them. Without a delivery it then closes the source, since no row arrives later. A
+`DeliveringThread` is a closure that runs on the calling thread while the workers run. The closure
 receives the handle and the scheduler the chains were subscribed with, writes rows to the source and
 calls `Scheduler::check_for_notifications`, which polls the source (`check_for_new_data`) and
 notifies the consumers registered for it with `Everything`. The head's `PipelineConsumer` publishes
 that, and the live source resolves it to the keys that are ready. A region would add precision and
 not correctness, and the scheduler's serial path is the same call. `run_pipeline` closes the source
 when the closure returns, which can publish nothing more.
+
+A `PipelineRun` names its head: a data source (`Head::Source`) or a breaker's output
+(`Head::Breaker`). `run_pipelines` seeds and closes every pipeline with a data-source head when the
+run starts, whatever the pipeline waits on, since the dispatcher keeps the region in `Early` until
+the pipeline starts; the first pipeline is closed after its delivery instead when there is one.
+Every chain is subscribed the same way, once per worker, and the first worker's chain of a pipeline
+carries the consumer that reaches the dispatcher: the `PipelineConsumer` of a delivery or of a
+breaker's output. `BreakerOutput` registers one consumer per reading operator, its first
+subscription's, so the breaker's `publish` notifies a `PipelineConsumer` from the thread that
+absorbed a morsel and the other workers' consumers are never notified. Debug builds assert that a
+chain reaches no operator of another pipeline, that a data-source pipeline streams from none, and
+that a breaker-headed pipeline reads the output of a pipeline it streams from. When the chains are
+dropped, the breakers' readers retire.
 
 **Rows are written before their region is published, and the region before the epoch moves.** The
 delivering thread writes the rows under their store's lock, publishes the region under the source's
@@ -557,13 +575,12 @@ or the epoch move each fail a test.
 
 ## Not yet implemented
 
-A breaker other than the sink and a fold into `main`, a pipeline plan over more than one pipeline
-(the dispatcher runs dependent pipelines, and `plan_main` cuts one), the operator that serves a
-breaker's output to the pipeline behind it, a way to hand a morsel back, and the sink pulls the
-scheduler loop queues. A source over a data-source domain runs on the pool when it cuts morsels
-(`cuts_morsels`), and `TestDataSource` is the only one that does: the HTTP and stdio sources keep
-the default, so a program over one stays on the compiling thread. Their arrivals reach the pipeline
-through the scheduler's polling, which a live pool drives from the calling thread
+A breaker other than the sink and a fold into `main` that a plan admits (`PoolBreaker::Materialize`
+runs under a hand-built plan, and `plan_main` cuts one pipeline), a way to hand a morsel back, and
+the sink pulls the scheduler loop queues. A source over a data-source domain runs on the pool when
+it cuts morsels (`cuts_morsels`), and `TestDataSource` is the only one that does: the HTTP and stdio
+sources keep the default, so a program over one stays on the compiling thread. Their arrivals reach
+the pipeline through the scheduler's polling, which a live pool drives from the calling thread
 (`run_main_delivering`), and nothing outside tests starts a pool over a live source: `run_main` has
 no delivery, so it runs the rows a source holds when it starts and closes the source. The
 scheduler's `check_for_notifications` notifies with `Everything`, because `check_for_new_data` says

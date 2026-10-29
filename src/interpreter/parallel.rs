@@ -17,7 +17,7 @@ use crate::{
         provenance::NodeId,
     },
     interpreter::{
-        Consumer, LockNow, Predicate, Projection, Scheduler, Tile, TileGuard, Tiling,
+        Consumer, LockNow, Materialized, Predicate, Projection, Scheduler, Tile, TileGuard, Tiling,
         operator_graph::{EdgeKind, EdgeRole, GraphNode, OperatorGraph},
         tile_operators::{Claim, MorselSource, TileOperator, TileProducer},
     },
@@ -346,26 +346,95 @@ fn run_pipeline(
     config: &Config,
     delivery: Option<DeliveringThread<'_>>,
 ) -> Tile {
-    let tiling = chain_op.tiling().clone();
-    let dispatcher = Arc::new(Dispatcher::new(
-        vec![PipelineSpec {
-            after: Vec::new(),
-            streams_from: Vec::new(),
-            source: Box::new(move || source.clone()),
-            finalize: None,
-        }],
-        config.morsel_rows.max(1),
-    ));
-    let handle = PipelineHandle {
-        dispatcher: dispatcher.clone(),
-        pipeline: PipelineId(0),
+    let run = PipelineRun {
+        chain: chain_op,
+        source,
+        breaker,
+        head: Head::Source,
+        after: Vec::new(),
+        streams_from: Vec::new(),
     };
-    // One chain per pipeline per worker, indexed by `PipelineId`: the plan has one pipeline.
-    // Notifications reach the dispatcher through the first worker's chain. Every chain's
-    // source registration is notified of the same region, and one consumer publishes it: a
-    // second would publish what the source has already claimed. The path from the source to
-    // that consumer is region-driven and acyclic (`plan_main` admits no shared node or
-    // recurrence), so no consumer on it drops or widens the region.
+    let mut tiles = run_pipelines(scheduler, vec![run], config, delivery);
+    tiles.pop().expect("one pipeline, one result")
+}
+
+/// What a pipeline's chain starts from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Head {
+    /// A data source, whose rows arrive from outside the run: the run publishes what it holds
+    /// and closes it, however the pipeline waits on others. The dispatcher keeps the region in
+    /// `Early` until the pipeline starts.
+    Source,
+    /// A breaker's output ([`BreakerOutput`]): the pipeline streams from the pipeline whose
+    /// breaker it reads.
+    Breaker,
+}
+
+/// A pipeline of a run: the chain its workers subscribe, the source they claim from, and the
+/// breaker it ends in. The pipelines of a run are numbered by their position, each after the
+/// ones it waits on and streams from.
+struct PipelineRun<'a> {
+    chain: &'a mut dyn TileOperator,
+    source: Arc<dyn MorselSource>,
+    breaker: PoolBreaker,
+    head: Head,
+    /// See [`PipelineSpec::after`].
+    after: Vec<PipelineId>,
+    /// See [`PipelineSpec::streams_from`]. A pipeline with a [`Head::Breaker`] streams from the
+    /// pipeline of the breaker it reads, and a [`Head::Source`] pipeline streams from none.
+    streams_from: Vec<PipelineId>,
+}
+
+/// Run the pipelines of a plan on `config.threads` workers, each of which subscribes every
+/// pipeline's chain once and serves whichever pipeline has a morsel. The results are what each
+/// pipeline's breaker holds once every pipeline has finished, in plan order.
+///
+/// A pipeline with a data-source head is published `Everything` when the run starts and closed
+/// then, or once `delivery` has returned when it is the first pipeline and there is one. The head
+/// of a pipeline that reads a breaker is notified by the breaker before it, which publishes each
+/// morsel's region once it holds the rows ([`Materialized::publish`]), so the pipeline starts at
+/// the first morsel and ends when the pipeline before it finishes
+/// ([`PipelineSpec::streams_from`]). The first worker's chain of each pipeline carries the
+/// consumer that reaches the dispatcher. The breaker's output registers one consumer per reading
+/// operator, its first subscription's, so a publish notifies operators and not workers; the other
+/// workers' chains carry a consumer that is never notified.
+///
+/// A chain does not reach another pipeline's operators, and a pipeline that reads a breaker reads
+/// the output of a pipeline it streams from; both are asserted. Once the chains are dropped the
+/// breakers' readers are retired, so a producer that never released pins no row.
+fn run_pipelines(
+    scheduler: &mut Scheduler,
+    mut runs: Vec<PipelineRun<'_>>,
+    config: &Config,
+    delivery: Option<DeliveringThread<'_>>,
+) -> Vec<Tile> {
+    assert_pipelines_are_separate(&runs);
+    let tilings: Vec<Tiling> = runs.iter().map(|run| run.chain.tiling().clone()).collect();
+    let specs = runs
+        .iter()
+        .map(|run| {
+            let source = run.source.clone();
+            PipelineSpec {
+                after: run.after.clone(),
+                streams_from: run.streams_from.clone(),
+                source: Box::new(move || source.clone()),
+                finalize: run.breaker.finalize(),
+            }
+        })
+        .collect();
+    let dispatcher = Arc::new(Dispatcher::new(specs, config.morsel_rows.max(1)));
+    let handles: Vec<PipelineHandle> = (0..runs.len())
+        .map(|pipeline| PipelineHandle {
+            dispatcher: dispatcher.clone(),
+            pipeline: PipelineId(pipeline),
+        })
+        .collect();
+    // One chain per pipeline per worker, indexed by `PipelineId`. Notifications reach the
+    // dispatcher through the first worker's chain of each pipeline. Every chain's source
+    // registration is notified of the same region, and one consumer publishes it: a second would
+    // publish what the source has already claimed. The path from the source to that consumer is
+    // region-driven and acyclic (`plan_main` admits no shared node or recurrence), so no consumer
+    // on it drops or widens the region.
     //
     // The chains hold release records with a source, one per source operator and named for the
     // pool: each worker releases the morsels it ran, and a source reclaims what every record
@@ -374,21 +443,41 @@ fn run_pipeline(
         .with_pooled_release_records(pool_release_identity(), |scheduler| {
             (0..config.threads.max(1))
                 .map(|worker| {
-                    let head: Box<dyn Consumer> = match (&delivery, worker) {
-                        (Some(_), 0) => Box::new(PipelineConsumer(handle.clone())),
-                        _ => Box::new(|| {}),
-                    };
-                    vec![chain_op.subscribe(tiling.universal_guard(), head, scheduler)]
+                    runs.iter_mut()
+                        .enumerate()
+                        .map(|(pipeline, run)| {
+                            let head: Box<dyn Consumer> = match (worker, run.head) {
+                                (0, Head::Breaker) => {
+                                    Box::new(PipelineConsumer(handles[pipeline].clone()))
+                                }
+                                (0, Head::Source) if pipeline == 0 && delivery.is_some() => {
+                                    Box::new(PipelineConsumer(handles[pipeline].clone()))
+                                }
+                                _ => Box::new(|| {}),
+                            };
+                            run.chain.subscribe(
+                                tilings[pipeline].universal_guard(),
+                                head,
+                                scheduler,
+                            )
+                        })
+                        .collect()
                 })
                 .collect()
         });
-    // What the source holds when the pool starts is claimable: nothing notifies of rows that
+    let seeded: Vec<usize> = (0..runs.len())
+        .filter(|&pipeline| runs[pipeline].head == Head::Source)
+        .collect();
+    let breakers: Vec<PoolBreaker> = runs.into_iter().map(|run| run.breaker).collect();
+    // What a source holds when the pool starts is claimable: nothing notifies of rows that
     // arrived before the chains were subscribed, and a source's own subscription notification
     // reaches only worker 0's head and says nothing of them. Without a delivery no row arrives
     // later, so the source closes now.
-    handle.publish(&Projection::Everything);
-    if delivery.is_none() {
-        handle.close();
+    for &pipeline in &seeded {
+        handles[pipeline].publish(&Projection::Everything);
+        if delivery.is_none() || pipeline != 0 {
+            handles[pipeline].close();
+        }
     }
     // The chains are lent to the workers and dropped here, after the scope, one at a time:
     // a producer's drop detaches its probe with a lock that must not find the probe table
@@ -403,14 +492,14 @@ fn run_pipeline(
         let workers: Vec<_> = chains
             .iter_mut()
             .map(|worker_chains| {
-                let (dispatcher, breaker) = (&dispatcher, &breaker);
-                scope.spawn(move || run_worker(worker_chains, dispatcher, breaker))
+                let (dispatcher, breakers) = (&dispatcher, &breakers);
+                scope.spawn(move || run_worker(worker_chains, dispatcher, breakers))
             })
             .collect();
         let delivered = delivery.and_then(|delivery| {
             let delivered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                delivery(handle.clone(), scheduler);
-                handle.close();
+                delivery(handles[0].clone(), scheduler);
+                handles[0].close();
             }));
             if delivered.is_err() {
                 dispatcher.fail();
@@ -424,16 +513,63 @@ fn run_pipeline(
             .collect();
         worker_panics.into_iter().next().or(delivered)
     });
+    // The chains are gone, so no producer reads an output: its readers retire once, here, and a
+    // producer that never released pins no row.
+    drop(chains);
+    for breaker in &breakers {
+        if let PoolBreaker::Materialize { output } = breaker {
+            output.retire_readers();
+        }
+    }
+    drop(records);
     if let Some(panic) = panic {
         std::panic::resume_unwind(panic);
     }
-    drop(chains);
-    drop(records);
     debug_assert!(
         dispatcher.all_done(),
         "every worker returned, so every pipeline finished"
     );
-    breaker.finish()
+    breakers.into_iter().map(PoolBreaker::finish).collect()
+}
+
+/// The invariants of a run's pipelines, which a plan holds and a hand-built run could break: a
+/// chain reaches no operator of another pipeline, a [`Head::Source`] pipeline streams from none,
+/// and a [`Head::Breaker`] pipeline reads the output of a pipeline it streams from.
+fn assert_pipelines_are_separate(runs: &[PipelineRun<'_>]) {
+    if !cfg!(debug_assertions) {
+        return;
+    }
+    fn visit(op: &dyn TileOperator, pipeline: usize, owner: &mut HashMap<NodeId, usize>) {
+        if let Some(id) = op.operator_id() {
+            let first = *owner.entry(id).or_insert(pipeline);
+            assert_eq!(
+                first, pipeline,
+                "a chain reaches no operator of another pipeline: {id:?} is in {first} and {pipeline}"
+            );
+        }
+        op.visit_inputs(&mut |edge| visit(edge.target, pipeline, owner));
+    }
+    let mut owner = HashMap::new();
+    for (pipeline, run) in runs.iter().enumerate() {
+        visit(&*run.chain, pipeline, &mut owner);
+        assert!(
+            run.head != Head::Source || run.streams_from.is_empty(),
+            "a pipeline over a data source streams from none: {pipeline}"
+        );
+        assert!(
+            run.head != Head::Breaker || !run.streams_from.is_empty(),
+            "a pipeline over a breaker's output streams from the pipeline of that breaker: {pipeline}"
+        );
+        if run.head == Head::Breaker {
+            assert!(
+                run.streams_from.iter().any(|upstream| matches!(
+                    &runs[upstream.0].breaker,
+                    PoolBreaker::Materialize { output } if output.feeds(&run.source)
+                )),
+                "a pipeline over a breaker's output reads the output of a pipeline it streams from: {pipeline}"
+            );
+        }
+    }
 }
 
 /// The name a pool's chains hold their release record under, one per run.
@@ -528,9 +664,25 @@ enum PoolBreaker {
         // `main`.
         partials: Mutex<Vec<Tile>>,
     },
+    /// The rows a pipeline behind this one reads: each worker merges the morsel into the shared
+    /// output and publishes its region, and the output is completed when the pipeline finishes.
+    #[cfg_attr(not(test), expect(dead_code, reason = "the plan constructs it"))]
+    Materialize { output: Arc<Materialized> },
 }
 
 impl PoolBreaker {
+    /// What runs when the pipeline that ends in this breaker finishes, before any pipeline that
+    /// waits on it starts or is closed: the output of a breaker that materializes is complete.
+    fn finalize(&self) -> Option<Box<dyn Fn() + Send + Sync>> {
+        match self {
+            PoolBreaker::Materialize { output } => {
+                let output = output.clone();
+                Some(Box::new(move || output.complete()))
+            }
+            PoolBreaker::Collect { .. } | PoolBreaker::Fold { .. } => None,
+        }
+    }
+
     /// The answer once every worker has returned: complete, since the source answered every row
     /// it has, every package was acknowledged after its rows reached the breaker, and every
     /// fold worker has handed in its partial.
@@ -564,26 +716,31 @@ impl PoolBreaker {
                 // What `ExtractAggregate` emits once the fold is terminal.
                 kind.extract(total)
             }
+            PoolBreaker::Materialize { output } => {
+                output.snapshot(&output.tiling().universal_guard())
+            }
         }
     }
 }
 
-/// One pool worker over the plan's one pipeline: its chain, the breaker it feeds, and for a
-/// fold the partial it folds into. A plan with several pipelines needs a partial and a chain per
-/// pipeline, which `leave` and `work` would index by the package's pipeline.
+/// One pool worker over the plan's pipelines: per pipeline its chain and the breaker the
+/// pipeline feeds, and for a fold the partial the worker folds into. `work` and `leave` index
+/// them by the package's pipeline.
 struct MainWorker<'a> {
     chains: &'a mut [Box<dyn TileProducer>],
-    breaker: &'a PoolBreaker,
-    partial: Option<Tile>,
+    breakers: &'a [PoolBreaker],
+    /// Per pipeline, the partial of a fold.
+    partials: Vec<Option<Tile>>,
 }
 
 impl PoolWorker for MainWorker<'_> {
-    /// Pull the morsel through the package's pipeline, hand the tile to the breaker, release
-    /// the morsel.
+    /// Pull the morsel through the package's pipeline, hand the tile to the pipeline's breaker,
+    /// release the morsel.
     fn work(&mut self, package: &WorkPackage) {
-        let chain = &mut self.chains[package.pipeline.0];
+        let pipeline = package.pipeline.0;
+        let chain = &mut self.chains[pipeline];
         let mut tile = chain.get(package.guard.clone());
-        match (self.breaker, &mut self.partial) {
+        match (&self.breakers[pipeline], &mut self.partials[pipeline]) {
             (PoolBreaker::Collect { collector }, _) => collector.lock_wait().merge(tile),
             (PoolBreaker::Fold { kind, .. }, Some(partial)) => {
                 // What `AggregateProducer` folds: the values under the keys, deleted rows
@@ -605,17 +762,24 @@ impl PoolWorker for MainWorker<'_> {
                 kind.accumulate(partial, &codomain, 0, codomain.rows());
             }
             (PoolBreaker::Fold { .. }, None) => unreachable!("a fold worker holds a partial"),
+            (PoolBreaker::Materialize { output }, _) => {
+                // The rows are readable before the region is published, and the region is the
+                // morsel's: a key the chain filtered out is in it and has no row.
+                tile.compact();
+                output.absorb(tile, &package.guard);
+                output
+                    .publish(&Projection::of(&package.guard).expect("a morsel's guard names keys"));
+            }
         }
         // The release is the breaker's acknowledgement: the source may reclaim the morsel
-        // only once the collector or the worker's partial holds its rows.
+        // only once the collector, the worker's partial or the output holds its rows.
         chain.release(package.guard.clone());
     }
 
     /// A fold worker hands its partial in once, after its last morsel.
     fn leave(&mut self, pipeline: PipelineId) {
-        debug_assert_eq!(pipeline.0, 0, "this worker serves the plan's one pipeline");
         if let (PoolBreaker::Fold { partials, .. }, Some(partial)) =
-            (self.breaker, self.partial.take())
+            (&self.breakers[pipeline.0], self.partials[pipeline.0].take())
         {
             partials.lock_wait().push(partial);
         }
@@ -626,17 +790,25 @@ impl PoolWorker for MainWorker<'_> {
 fn run_worker(
     chains: &mut [Box<dyn TileProducer>],
     dispatcher: &Dispatcher,
-    breaker: &PoolBreaker,
+    breakers: &[PoolBreaker],
 ) {
     let _fail = FailOnUnwind(dispatcher);
-    let partial = match breaker {
-        PoolBreaker::Collect { .. } => None,
-        PoolBreaker::Fold { seed, .. } => Some(seed.clone()),
-    };
+    debug_assert_eq!(
+        chains.len(),
+        breakers.len(),
+        "a worker holds one chain per pipeline"
+    );
+    let partials = breakers
+        .iter()
+        .map(|breaker| match breaker {
+            PoolBreaker::Collect { .. } | PoolBreaker::Materialize { .. } => None,
+            PoolBreaker::Fold { seed, .. } => Some(seed.clone()),
+        })
+        .collect();
     dispatcher.serve(&mut MainWorker {
         chains,
-        breaker,
-        partial,
+        breakers,
+        partials,
     });
 }
 

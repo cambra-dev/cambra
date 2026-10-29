@@ -555,8 +555,12 @@ The dispatcher starts a pipeline that streams from another at the first region p
 so the pipeline behind a breaker that materializes can run while the pipeline before it still has
 morsels ([The dispatcher](../src/interpreter/design-parallel.md#the-dispatcher)).
 
-**Not implemented.** No breaker raises a region, and `plan_main` admits no pipeline behind a
-breaker.
+`BreakerOutput` is that leaf and `Materialized` the shared handle ([A breaker's
+output](../src/interpreter/design-parallel.md#a-breakers-output)). A worker merges a morsel into
+the output and publishes the morsel's region, and the pool runs such a plan when it is built by
+hand.
+
+**Not implemented.** `plan_main` admits no pipeline behind a breaker.
 
 ### Build sides
 

@@ -15,11 +15,12 @@ mod end_to_end {
     use super::super::*;
     use crate::interpreter::tile_operators::test_helpers::{int_entries, keys_between};
     use crate::interpreter::tile_operators::{
-        Constant, LiveSource, MapResult, ProducerBase, impl_producer_base, uint_keys_in, uint_range,
+        BreakerOutput, Constant, LiveSource, MapResult, ProducerBase, impl_producer_base,
+        uint_keys_in, uint_range,
     };
     use crate::interpreter::{
-        BaseType, ColumnValue, CurryLevel, Extent, FunctionDef, UnaryOpKind, Value,
-        operator_graph::InputEdgeSpec,
+        BaseType, ColumnValue, CurryLevel, Extent, FunctionDef, FunctionGuard, Materialized,
+        UnaryOpKind, Value, operator_graph::InputEdgeSpec,
     };
     use crate::{pretty_graph::VizOptions, pretty_tree::InspectNode};
 
@@ -38,6 +39,8 @@ mod end_to_end {
         /// Positions a release named.
         released: Mutex<BTreeSet<u64>>,
         closed: AtomicBool,
+        /// Makes the next `get` panic, as a worker that fails does.
+        explodes: AtomicBool,
     }
 
     impl LiveStore {
@@ -55,6 +58,7 @@ mod end_to_end {
                 served: Mutex::new(BTreeSet::new()),
                 released: Mutex::new(BTreeSet::new()),
                 closed: AtomicBool::new(false),
+                explodes: AtomicBool::new(false),
             })
         }
 
@@ -169,6 +173,10 @@ mod end_to_end {
         /// stating the positions that have arrived complete, or all of them once the source is
         /// closed.
         fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+            assert!(
+                !self.store.explodes.load(Ordering::Acquire),
+                "a worker panicked"
+            );
             let projection = projection_guard.projection(&self.name());
             let rows = self.store.rows.lock_wait();
             let wanted = self.store.positions(&projection);
@@ -267,8 +275,18 @@ mod end_to_end {
             Box::new(negate()),
             CurryLevel::new(1),
         );
-        let delivered = store.clone();
-        let delivery: DeliveringThread<'static> = Box::new(move |handle, _scheduler| {
+        let delivery = setup_delivery(store.clone(), chunks, threads, pace);
+        (store, map, delivery)
+    }
+
+    /// The delivering thread of `setup`, over an existing store.
+    fn setup_delivery(
+        delivered: Arc<LiveStore>,
+        chunks: Vec<Chunk>,
+        threads: usize,
+        pace: Pace,
+    ) -> DeliveringThread<'static> {
+        Box::new(move |handle, _scheduler| {
             for (n, chunk) in chunks.iter().enumerate() {
                 if let Pace::Lockstep = pace {
                     // Every worker waits, so the publish below has to wake one.
@@ -277,6 +295,7 @@ mod end_to_end {
                 if chunk.first == 0 && !chunk.values.is_empty() && delivered.ready_rows() > 0 {
                     wait_until_pulled(
                         &delivered,
+                        &handle.dispatcher,
                         "no later chunk was claimable while position 0 was missing",
                     );
                 }
@@ -298,36 +317,44 @@ mod end_to_end {
                     }
                     Pace::Lockstep => wait_until_pulled(
                         &delivered,
+                        &handle.dispatcher,
                         "the workers did not pull the rows that arrived: a lost wake-up",
                     ),
                 }
             }
             // `run_pipeline` closes the source once this returns.
             delivered.closed.store(true, Ordering::Release);
-        });
-        (store, map, delivery)
+        })
     }
 
-    /// Wait until the workers have pulled every row that is ready, failing with `cause` when
-    /// they do not within thirty seconds.
-    fn wait_until_pulled(store: &LiveStore, cause: &str) {
+    /// Poll `condition` until it holds, failing with `cause` after thirty seconds, or at once when
+    /// the dispatcher failed: a worker panicked, and nothing will make the condition hold.
+    fn wait_for(cause: &str, dispatcher: &Dispatcher, condition: impl Fn() -> bool) {
         let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while store.served.lock_wait().len() < store.ready_rows() {
+        while !condition() {
+            assert!(
+                !dispatcher.failed.load(Ordering::Acquire),
+                "a worker failed while waiting: {cause}"
+            );
             assert!(std::time::Instant::now() < deadline, "{cause}");
             std::thread::yield_now();
         }
     }
 
+    /// Wait until the workers have pulled every row that is ready.
+    fn wait_until_pulled(store: &LiveStore, dispatcher: &Dispatcher, cause: &str) {
+        wait_for(cause, dispatcher, || {
+            store.served.lock_wait().len() >= store.ready_rows()
+        });
+    }
+
     /// Wait until `threads` workers are parked: none is running a morsel or looking for one.
     fn wait_for_every_worker_to_park(dispatcher: &Dispatcher, threads: usize) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
-        while dispatcher.parked.load(Ordering::Acquire) < threads {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "every worker parked: a worker is stuck outside `park`"
-            );
-            std::thread::yield_now();
-        }
+        wait_for(
+            "every worker parked: a worker is stuck outside `park`",
+            dispatcher,
+            || dispatcher.parked.load(Ordering::Acquire) >= threads,
+        );
     }
 
     fn collecting(map: &MapResult) -> PoolBreaker {
@@ -361,6 +388,161 @@ mod end_to_end {
             Some(delivery),
         );
         (tile, store)
+    }
+
+    /// Keeps the rows of the even positions: the keys a chain filters out are in the region it
+    /// answers and have no row.
+    struct EveryOther {
+        base: crate::interpreter::tile_operators::OperatorBase,
+        input: Box<dyn TileOperator>,
+    }
+
+    impl TileOperator for EveryOther {
+        crate::interpreter::tile_operators::impl_operator_base!();
+
+        fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
+            visit(crate::interpreter::operator_graph::value(
+                "input",
+                &*self.input,
+            ));
+        }
+
+        fn subscribe(
+            &mut self,
+            _intent_guard: TileGuard,
+            consumer: Box<dyn Consumer>,
+            scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            let input =
+                self.input
+                    .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+            Box::new(EveryOtherProducer {
+                base: ProducerBase::new(
+                    EveryOtherProducer::alloc_id(),
+                    self.tiling(),
+                    &self.base,
+                    scheduler,
+                ),
+                input,
+            })
+        }
+    }
+
+    struct EveryOtherProducer {
+        base: ProducerBase,
+        input: Box<dyn TileProducer>,
+    }
+
+    impl TileProducer for EveryOtherProducer {
+        impl_producer_base!();
+
+        fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+            visit("input", &*self.input);
+        }
+
+        fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+            let mut tile = self.input.get(projection_guard);
+            let odd = match &tile {
+                Tile::DataFunction { domain, .. } => (0..domain.len())
+                    .map(|row| domain.index_at(row))
+                    .filter(|key| key.as_uint() % 2 == 1)
+                    .fold(Predicate::False, |all, key| {
+                        all.union(&Predicate::point(key))
+                    }),
+                other => panic!("a collection, got {other:?}"),
+            };
+            tile.remove_guarded(TileGuard::Function(FunctionGuard::Domain(odd)));
+            tile.compact();
+            tile
+        }
+
+        fn release_impl(&mut self, obsolete_guard: TileGuard) {
+            self.input.release(obsolete_guard);
+        }
+    }
+
+    /// `LiveRows → MapResult(negate) → Materialize` into `readers` pipelines
+    /// `BreakerOutput → MapResult(negate) → Collect`, over `store`, on `threads` workers: the
+    /// rows as delivered, negated twice. With `filtering` the first pipeline keeps the even
+    /// positions only. Returns what each reading pipeline's breaker holds, the store and the
+    /// breaker's output once every worker returned.
+    fn run_breaker(
+        delivery: impl FnOnce(&Arc<LiveStore>, &Arc<Materialized>) -> DeliveringThread<'static>,
+        store: Arc<LiveStore>,
+        threads: usize,
+        morsel_rows: u64,
+        readers: usize,
+        filtering: bool,
+    ) -> (Vec<Tile>, Arc<LiveStore>, Arc<Materialized>) {
+        let rows: Box<dyn TileOperator> = match filtering {
+            false => Box::new(LiveRows::new(store.clone())),
+            true => {
+                let live = LiveRows::new(store.clone());
+                Box::new(EveryOther {
+                    base: crate::interpreter::tile_operators::OperatorBase::new(
+                        live.tiling().clone(),
+                    ),
+                    input: Box::new(live),
+                })
+            }
+        };
+        let mut upstream = MapResult::new_at(rows, Box::new(negate()), CurryLevel::new(1));
+        let output = Materialized::new(upstream.tiling().clone());
+        let mut downstreams: Vec<MapResult> = (0..readers)
+            .map(|_| {
+                MapResult::new_at(
+                    Box::new(BreakerOutput::new(
+                        output.clone(),
+                        upstream.tiling().clone(),
+                        false,
+                        None,
+                    )),
+                    Box::new(negate()),
+                    CurryLevel::new(1),
+                )
+            })
+            .collect();
+        let delivery = delivery(&store, &output);
+        let up_source = source_of(&upstream).expect("the chain reads one live source");
+        let mut runs = vec![PipelineRun {
+            chain: &mut upstream,
+            source: up_source,
+            breaker: PoolBreaker::Materialize {
+                output: output.clone(),
+            },
+            head: Head::Source,
+            after: Vec::new(),
+            streams_from: Vec::new(),
+        }];
+        for downstream in &mut downstreams {
+            runs.push(PipelineRun {
+                source: source_of(&*downstream).expect("the chain reads the breaker's output"),
+                breaker: collecting(downstream),
+                chain: downstream,
+                head: Head::Breaker,
+                after: Vec::new(),
+                streams_from: vec![PipelineId(0)],
+            });
+        }
+        let config = Config {
+            threads,
+            morsel_rows,
+        };
+        let mut tiles = run_pipelines(&mut Scheduler::new(), runs, &config, Some(delivery));
+        tiles.remove(0);
+        (tiles, store, output)
+    }
+
+    /// [`run_breaker`] with one reading pipeline: what its breaker holds.
+    fn run_two_pipelines(
+        delivery: impl FnOnce(&Arc<LiveStore>, &Arc<Materialized>) -> DeliveringThread<'static>,
+        store: Arc<LiveStore>,
+        threads: usize,
+        morsel_rows: u64,
+    ) -> (Tile, Arc<LiveStore>, Arc<Materialized>) {
+        let (mut tiles, store, output) =
+            run_breaker(delivery, store, threads, morsel_rows, 1, false);
+        (tiles.pop().expect("one reader"), store, output)
     }
 
     /// `run` with the first worker never serving: its chain still carries the pipeline's
@@ -400,8 +582,8 @@ mod end_to_end {
         std::thread::scope(|scope| {
             let _fail = FailOnUnwind(&dispatcher);
             for worker_chains in chains.iter_mut().skip(1) {
-                let (dispatcher, breaker) = (&dispatcher, &breaker);
-                scope.spawn(move || run_worker(worker_chains, dispatcher, breaker));
+                let (dispatcher, breakers) = (&dispatcher, std::slice::from_ref(&breaker));
+                scope.spawn(move || run_worker(worker_chains, dispatcher, breakers));
             }
             delivery(handle.clone(), &mut scheduler);
             handle.close();
@@ -441,7 +623,7 @@ mod end_to_end {
     /// every row once, mapped, and the source reclaimed every row a worker finished with, none
     /// before. Only the first chain's consumer is region-driven, which is the invariant of the
     /// path from the source to the pipeline's consumer.
-    fn verify(chunks: &[Chunk], tile: &Tile, store: &LiveStore, context: &str) {
+    fn verify(chunks: &[Chunk], tile: &Tile, store: &LiveStore, sign: i64, context: &str) {
         let rows: BTreeMap<u64, i64> = chunks
             .iter()
             .flat_map(|chunk| {
@@ -452,7 +634,10 @@ mod end_to_end {
                     .map(|(offset, value)| (chunk.first + offset as u64, *value))
             })
             .collect();
-        let serial: Vec<(u64, i64)> = rows.iter().map(|(&position, v)| (position, -v)).collect();
+        let serial: Vec<(u64, i64)> = rows
+            .iter()
+            .map(|(&position, v)| (position, sign * v))
+            .collect();
         assert_eq!(entries(tile), serial, "{context}");
         let everything: BTreeSet<u64> = rows.keys().copied().collect();
         assert_eq!(
@@ -498,6 +683,7 @@ mod end_to_end {
             &expected,
             &tile,
             &store,
+            -1,
             &format!("{threads} workers, {morsel_rows}-row morsels"),
         );
     }
@@ -542,6 +728,300 @@ mod end_to_end {
     }
 
     const WORKERS: [usize; 4] = [1, 2, 4, 8];
+
+    /// The answer of a two-pipeline run against the serial composition, and what the output owes:
+    /// every row it held was released by the pipeline that read it, and it is complete.
+    fn check_two_pipelines(chunks: Vec<Chunk>, threads: usize, morsel_rows: u64, pace: Pace) {
+        let expected = chunks.clone();
+        let (tile, store, output) = within_deadline(move || {
+            run_two_pipelines(
+                move |store, _| setup_delivery(store.clone(), chunks, threads, pace),
+                LiveStore::new(),
+                threads,
+                morsel_rows,
+            )
+        });
+        verify(
+            &expected,
+            &tile,
+            &store,
+            1,
+            &format!("{threads} workers, {morsel_rows}-row morsels, two pipelines"),
+        );
+        assert!(
+            output.is_complete(),
+            "the breaker completed when its pipeline finished"
+        );
+        assert!(
+            entries(&output.snapshot(&output.tiling().universal_guard())).is_empty(),
+            "the pipeline behind the breaker released every row"
+        );
+    }
+
+    /// `LiveRows → MapResult → Materialize → BreakerOutput → MapResult → Collect`, on one to
+    /// eight workers, with arrivals in bursts: the answer is the serial composition, the source
+    /// reclaimed every row once, and the breaker's output is empty and complete.
+    #[test]
+    fn a_pipeline_behind_a_breaker_equals_the_serial_composition() {
+        for threads in WORKERS {
+            for morsel_rows in [1, 4, 64] {
+                check_two_pipelines(
+                    chunks(&[50, 0, 1, 1, 200, 0, 3]),
+                    threads,
+                    morsel_rows,
+                    Pace::Flat,
+                );
+            }
+        }
+    }
+
+    /// The same under paced and out-of-order arrivals, where a key arrives ahead of an earlier
+    /// one and the pipeline behind claims the keys the breaker has published, in any order.
+    #[test]
+    fn a_pipeline_behind_a_breaker_reads_arrivals_in_any_order() {
+        for threads in WORKERS {
+            check_two_pipelines(
+                reversed(chunks(&[8, 8, 8, 8, 8])),
+                threads,
+                4,
+                Pace::Interleaved,
+            );
+            check_two_pipelines(
+                shuffled(chunks(&[5, 3, 9, 1, 12]), 7),
+                threads,
+                2,
+                Pace::Flat,
+            );
+        }
+    }
+
+    /// Two operators read one breaker's output, each with a source and a consumer of its own:
+    /// both answer the serial composition, and the rows leave once both have released them.
+    #[test]
+    fn two_pipelines_reading_one_breaker_each_see_every_row() {
+        for threads in WORKERS {
+            let rows = chunks(&[30, 0, 7, 100]);
+            let expected = rows.clone();
+            let (tiles, store, output) = within_deadline(move || {
+                run_breaker(
+                    move |store, _| setup_delivery(store.clone(), rows, threads, Pace::Flat),
+                    LiveStore::new(),
+                    threads,
+                    4,
+                    2,
+                    false,
+                )
+            });
+            assert_eq!(tiles.len(), 2);
+            for tile in &tiles {
+                verify(
+                    &expected,
+                    tile,
+                    &store,
+                    1,
+                    &format!("{threads} workers, two readers"),
+                );
+            }
+            assert!(output.is_complete());
+            assert!(
+                entries(&output.snapshot(&output.tiling().universal_guard())).is_empty(),
+                "both readers released every row"
+            );
+        }
+    }
+
+    /// An upstream that delivers nothing: the pipeline behind starts when the one before
+    /// finishes, reads an empty output, and finishes; the breaker completes.
+    #[test]
+    fn a_pipeline_behind_an_empty_breaker_reads_nothing_and_finishes() {
+        for threads in WORKERS {
+            check_two_pipelines(Vec::new(), threads, 4, Pace::Flat);
+            check_two_pipelines(chunks(&[0, 0]), threads, 4, Pace::Flat);
+        }
+    }
+
+    /// A chain that filters keys out publishes a region that names them: they have no row in the
+    /// output, no morsel names them, and the pipeline behind reads exactly the rows that passed.
+    /// The source reclaims every row it held, the filtered ones included.
+    #[test]
+    fn a_region_naming_filtered_out_keys_publishes_only_the_rows_that_passed() {
+        for threads in WORKERS {
+            let rows = chunks(&[40, 1, 25]);
+            let expected = rows.clone();
+            let (tiles, store, output) = within_deadline(move || {
+                run_breaker(
+                    move |store, _| setup_delivery(store.clone(), rows, threads, Pace::Flat),
+                    LiveStore::new(),
+                    threads,
+                    4,
+                    1,
+                    true,
+                )
+            });
+            let serial: Vec<(u64, i64)> = expected
+                .iter()
+                .flat_map(|chunk| {
+                    chunk
+                        .values
+                        .iter()
+                        .enumerate()
+                        .map(|(offset, value)| (chunk.first + offset as u64, *value))
+                })
+                .filter(|(position, _)| position % 2 == 0)
+                .collect();
+            assert_eq!(entries(&tiles[0]), serial, "{threads} workers");
+            assert_eq!(
+                store.released.lock_wait().len(),
+                66,
+                "the source reclaimed every row it held"
+            );
+            assert!(output.is_complete());
+        }
+    }
+
+    /// A worker of the pipeline before the breaker panics: the dispatcher fails, every worker
+    /// returns, and the run re-raises the panic instead of hanging.
+    #[test]
+    fn a_panicking_worker_fails_a_two_pipeline_run() {
+        for threads in WORKERS {
+            let message = within_deadline(move || {
+                let store = LiveStore::new();
+                store.explodes.store(true, Ordering::Release);
+                let rows = chunks(&[16, 16]);
+                let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_two_pipelines(
+                        move |store, _| setup_delivery(store.clone(), rows, threads, Pace::Flat),
+                        store,
+                        threads,
+                        4,
+                    )
+                }));
+                match outcome {
+                    Ok(_) => None,
+                    Err(panic) => panic.downcast_ref::<&str>().map(|m| m.to_string()),
+                }
+            });
+            assert_eq!(
+                message.as_deref(),
+                Some("a worker panicked"),
+                "{threads} workers"
+            );
+        }
+    }
+
+    /// A pipeline that waits on another and reads a source of its own is seeded and closed when
+    /// the run starts, though it follows the other: the dispatcher keeps what was published until
+    /// the pipeline starts, and the run finishes with every row of both.
+    #[test]
+    fn a_pipeline_that_follows_another_over_its_own_source_is_seeded_and_closed() {
+        for threads in WORKERS {
+            let (first_rows, second_rows) = (chunks(&[20, 5]), chunks(&[3, 40]));
+            let (first, second) = (LiveStore::new(), LiveStore::new());
+            for (store, rows) in [(&first, &first_rows), (&second, &second_rows)] {
+                for chunk in rows {
+                    store.append(chunk);
+                }
+                store.closed.store(true, Ordering::Release);
+            }
+            let (mut one, mut two) = (
+                MapResult::new_at(
+                    Box::new(LiveRows::new(first.clone())),
+                    Box::new(negate()),
+                    CurryLevel::new(1),
+                ),
+                MapResult::new_at(
+                    Box::new(LiveRows::new(second.clone())),
+                    Box::new(negate()),
+                    CurryLevel::new(1),
+                ),
+            );
+            let tiles = within_deadline(move || {
+                let runs = vec![
+                    PipelineRun {
+                        source: source_of(&one).expect("a source"),
+                        breaker: collecting(&one),
+                        chain: &mut one,
+                        head: Head::Source,
+                        after: Vec::new(),
+                        streams_from: Vec::new(),
+                    },
+                    PipelineRun {
+                        source: source_of(&two).expect("a source"),
+                        breaker: collecting(&two),
+                        chain: &mut two,
+                        head: Head::Source,
+                        after: vec![PipelineId(0)],
+                        streams_from: Vec::new(),
+                    },
+                ];
+                let config = Config {
+                    threads,
+                    morsel_rows: 4,
+                };
+                run_pipelines(&mut Scheduler::new(), runs, &config, None)
+            });
+            for (tile, rows) in tiles.iter().zip([first_rows, second_rows]) {
+                let serial: Vec<(u64, i64)> = rows
+                    .iter()
+                    .flat_map(|chunk| {
+                        chunk
+                            .values
+                            .iter()
+                            .enumerate()
+                            .map(|(offset, value)| (chunk.first + offset as u64, -value))
+                    })
+                    .collect();
+                assert_eq!(entries(tile), serial, "{threads} workers");
+            }
+        }
+    }
+
+    /// A morsel of the pipeline behind the breaker runs, and its rows are released, while the
+    /// pipeline before it is still open: the first chunk passes through both pipelines before
+    /// the delivering thread closes the source, and the breaker is not complete until then.
+    #[test]
+    fn a_morsel_behind_the_breaker_runs_before_the_pipeline_before_it_finishes() {
+        let chunk = chunks(&[16]).remove(0);
+        let last = chunk.values.len() as u64 - 1;
+        let expected = vec![chunk.clone()];
+        let (tile, store, output) = within_deadline(move || {
+            run_two_pipelines(
+                move |store, output| {
+                    let (store, output) = (store.clone(), output.clone());
+                    Box::new(move |handle, _scheduler| {
+                        let region = store.append(&chunk).expect("a chunk with rows");
+                        store.notify_all(
+                            &Projection::of(&keys_between(region.0, region.1)).unwrap(),
+                        );
+                        wait_for(
+                            "the pipeline behind the breaker released the first chunk",
+                            &handle.dispatcher,
+                            || {
+                                output.ready().contains(&Value::UInt(last))
+                                    && entries(&output.snapshot(&keys_between(0, last))).is_empty()
+                            },
+                        );
+                        assert!(
+                            !output.is_complete(),
+                            "the pipeline before the breaker is still open"
+                        );
+                        store.closed.store(true, Ordering::Release);
+                    })
+                },
+                LiveStore::new(),
+                2,
+                4,
+            )
+        });
+        verify(
+            &expected,
+            &tile,
+            &store,
+            1,
+            "the first chunk, then the close",
+        );
+        assert!(output.is_complete());
+    }
 
     #[test]
     fn rows_that_arrive_in_bursts_are_mapped_once_and_released() {
@@ -655,6 +1135,7 @@ mod end_to_end {
                 &rows,
                 &tile,
                 &store,
+                -1,
                 &format!("{threads} chains, the first idle"),
             );
         }
