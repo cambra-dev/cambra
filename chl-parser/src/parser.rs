@@ -330,7 +330,11 @@ where
         // because it is the token that distinguishes the form. Whether a
         // *missing* one is an error depends on the position, so that judgment is
         // the caller's (see `brace_type`) and rides out as the `bool`.
-        let brace_item = bracketed_expr.clone().then(
+        let brace_item = choice((
+            just(Token::DotDot).map_with(|_, e| Spanned::new(e.span(), Expr::Rest)),
+            bracketed_expr.clone(),
+        ))
+        .then(
             just(Token::Colon)
                 .ignore_then(bracketed_expr.clone())
                 .or_not(),
@@ -356,6 +360,32 @@ where
             .then_ignore(just(Token::RBrace))
             .validate(|((items, trailing_comma), refinement), e, emitter| {
                 let span = e.span();
+                // `..` is the rest of an open tuple type's positions: last, after at
+                // least one position, in a colon-free group.
+                let rests = items
+                    .iter()
+                    .filter(|(k, _)| matches!(k.node, Expr::Rest))
+                    .count();
+                if rests > 0 {
+                    let last_is_rest = items
+                        .last()
+                        .is_some_and(|(k, v)| matches!(k.node, Expr::Rest) && v.is_none());
+                    if rests > 1
+                        || !last_is_rest
+                        || items.len() < 2
+                        || refinement.is_some()
+                        || items.iter().any(|(_, v)| v.is_some())
+                    {
+                        emitter.emit(Rich::custom(
+                            span,
+                            "`..` is the rest of an open tuple type, written last after at \
+                             least one position: `{T, ..}`",
+                        ));
+                        return (Spanned::new(span, Expr::Error), false);
+                    }
+                    let elts = items.into_iter().map(|(k, _)| k).collect();
+                    return (Spanned::new(span, Expr::BraceGroup(elts)), false);
+                }
                 let with_value = items.iter().filter(|(_, v)| v.is_some()).count();
                 let all_idents = !items.is_empty()
                     && items
@@ -4520,6 +4550,29 @@ mod tests {
         assert!(matches!(payload_of("`some(1,)"), Some(Expr::Tuple(v)) if v.len() == 1));
         assert!(payload_of("`a()").is_none());
         assert!(payload_of("`a").is_none());
+    }
+
+    /// `..` last in a colon-free brace group makes it an open tuple type, after at least one
+    /// position (`docs/chl-spec.md`, "Tuple width").
+    #[test]
+    fn rest_ends_an_open_tuple_type() {
+        let Expr::BraceGroup(parts) = parse_e("{Int, String, ..}").node else {
+            panic!("expected a brace group")
+        };
+        assert_eq!(parts.len(), 3);
+        assert!(matches!(parts[2].node, Expr::Rest));
+        for src in [
+            "x <: {..} = t",
+            "x <: {.., Int} = t",
+            "x <: {Int, .., Int} = t",
+            "x <: {a: Int, ..} = t",
+            "x <: {Int, .. where _ > 0} = t",
+        ] {
+            assert!(
+                custom_error(src).contains("`..` is the rest of an open tuple type"),
+                "{src}"
+            );
+        }
     }
 
     // ---- Type parameters and `requires` (`docs/chl-spec.md`, "6.10 Polymorphic types") ----

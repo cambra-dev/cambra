@@ -144,6 +144,30 @@ theorem subtyping_trans_fn {n : Nat} {n0 k0 d0 c0 nm km dm cm : _} {z : Ty}
             hcod1 hcod2
           exact Subtyping.fnData hdomA hdomB hcod
 
+/-- The positional half of every tuple chain: the middle tuple lists at least the positions the
+last one does, so each position of the outer pair composes through the middle one. -/
+theorem subtyping_trans_positions {n : Nat} (IH : TransitivityIH n) {as bs cs : List Ty}
+    (hsz : sizeOf as + sizeOf bs + sizeOf cs ≤ n)
+    (hwa : ∀ t ∈ as, t.WellFormed) (hwb : ∀ t ∈ bs, t.WellFormed) (hwc : ∀ t ∈ cs, t.WellFormed)
+    (hlen2 : cs.length ≤ bs.length)
+    (hpt1 : ∀ (i : Nat) t0 t1, as[i]? = some t0 → bs[i]? = some t1 → Subtyping t0 t1)
+    (hpt2 : ∀ (i : Nat) t0 t1, bs[i]? = some t0 → cs[i]? = some t1 → Subtyping t0 t1) :
+    ∀ (i : Nat) t0 t1, as[i]? = some t0 → cs[i]? = some t1 → Subtyping t0 t1 := by
+  intro i t0 t1 h0 h1'
+  have hi1 : i < cs.length := by
+    obtain ⟨hlt, -⟩ := List.getElem?_eq_some_iff.mp h1'
+    exact hlt
+  have hi2 : i < bs.length := Nat.lt_of_lt_of_le hi1 hlen2
+  have hb : bs[i]? = some bs[i] := List.getElem?_eq_getElem hi2
+  have hm0 : t0 ∈ as := List.mem_of_getElem? h0
+  have hmm : bs[i] ∈ bs := List.getElem_mem hi2
+  have hm1 : t1 ∈ cs := List.mem_of_getElem? h1'
+  have s0 := List.sizeOf_lt_of_mem hm0
+  have sm := List.sizeOf_lt_of_mem hmm
+  have s1 := List.sizeOf_lt_of_mem hm1
+  exact IH t0 bs[i] t1 (by omega) (hwa _ hm0) (hwb _ hmm) (hwc _ hm1) (hpt1 i t0 bs[i] h0 hb)
+    (hpt2 i bs[i] t1 hb h1')
+
 /-- Fuel-bounded transitivity. -/
 theorem subtyping_trans_aux : (n : Nat) → TransitivityIH n
   | 0 => by
@@ -209,27 +233,57 @@ theorem subtyping_trans_aux : (n : Nat) → TransitivityIH n
           exact subtyping_trans_fn IH (by omega) hx hy hz hzb
             (.fnData a b c) h2
       | tuple hlen1 hpt1 =>
+          rename_i as bs
           cases h2 with
           | tuple hlen2 hpt2 =>
-              refine Subtyping.tuple (Nat.le_trans hlen2 hlen1) ?_
-              intro i t0 t1 h0 h1'
-              rename_i as bs cs
-              have hi1 : i < cs.length := by
-                obtain ⟨hlt, -⟩ := List.getElem?_eq_some_iff.mp h1'
-                exact hlt
-              have hi2 : i < bs.length := Nat.lt_of_lt_of_le hi1 hlen2
-              have hb : bs[i]? = some bs[i] := List.getElem?_eq_getElem hi2
-              have hm0 : t0 ∈ as := List.mem_of_getElem? h0
-              have hmm : bs[i] ∈ bs := List.getElem_mem hi2
-              have hm1 : t1 ∈ cs := List.mem_of_getElem? h1'
-              have s0 := List.sizeOf_lt_of_mem hm0
-              have sm := List.sizeOf_lt_of_mem hmm
-              have s1 := List.sizeOf_lt_of_mem hm1
-              refine IH t0 bs[i] t1 ?_ (hx.tuple_mem hm0) (hy.tuple_mem hmm)
-                (hz.tuple_mem hm1) (hpt1 i t0 bs[i] h0 hb)
-                (hpt2 i bs[i] t1 hb h1')
+              rename_i cs
               simp only [Ty.tuple.sizeOf_spec] at hn
-              omega
+              exact Subtyping.tuple (hlen1.trans hlen2)
+                (subtyping_trans_positions IH (by omega) (fun _ h => hx.tuple_mem h)
+                  (fun _ h => hy.tuple_mem h) (fun _ h => hz.tuple_mem h)
+                  (Nat.le_of_eq hlen2.symm) hpt1 hpt2)
+          | tupleOpen hlen2 hpt2 =>
+              rename_i cs
+              simp only [Ty.tuple.sizeOf_spec, Ty.openTuple.sizeOf_spec] at hn
+              exact Subtyping.tupleOpen (Nat.le_trans hlen2 (Nat.le_of_eq hlen1.symm))
+                (subtyping_trans_positions IH (by omega) (fun _ h => hx.tuple_mem h)
+                  (fun _ h => hy.tuple_mem h) (fun _ h => hz.openTuple_mem h) hlen2 hpt1 hpt2)
+          | refined hpl hpr hg _ _ =>
+              rw [hpr] at hzb
+              simp only [Ty.peel, Prod.mk.injEq] at hpl hzb
+              obtain ⟨-, hl⟩ := hpl
+              subst hl
+              rcases hg with hg | hg
+              · exact absurd rfl hg
+              · exact absurd hzb hg
+      | tupleOpen hlen1 hpt1 =>
+          rename_i as bs
+          cases h2 with
+          | openTuple hlen2 hpt2 =>
+              rename_i cs
+              simp only [Ty.tuple.sizeOf_spec, Ty.openTuple.sizeOf_spec] at hn
+              exact Subtyping.tupleOpen (Nat.le_trans hlen2 hlen1)
+                (subtyping_trans_positions IH (by omega) (fun _ h => hx.tuple_mem h)
+                  (fun _ h => hy.openTuple_mem h) (fun _ h => hz.openTuple_mem h) hlen2 hpt1
+                  hpt2)
+          | refined hpl hpr hg _ _ =>
+              rw [hpr] at hzb
+              simp only [Ty.peel, Prod.mk.injEq] at hpl hzb
+              obtain ⟨-, hl⟩ := hpl
+              subst hl
+              rcases hg with hg | hg
+              · exact absurd rfl hg
+              · exact absurd hzb hg
+      | openTuple hlen1 hpt1 =>
+          rename_i as bs
+          cases h2 with
+          | openTuple hlen2 hpt2 =>
+              rename_i cs
+              simp only [Ty.openTuple.sizeOf_spec] at hn
+              exact Subtyping.openTuple (Nat.le_trans hlen2 hlen1)
+                (subtyping_trans_positions IH (by omega) (fun _ h => hx.openTuple_mem h)
+                  (fun _ h => hy.openTuple_mem h) (fun _ h => hz.openTuple_mem h) hlen2 hpt1
+                  hpt2)
           | refined hpl hpr hg _ _ =>
               rw [hpr] at hzb
               simp only [Ty.peel, Prod.mk.injEq] at hpl hzb

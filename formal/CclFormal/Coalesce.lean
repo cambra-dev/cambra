@@ -20,7 +20,8 @@ inductive CoalesceError where
   /-- Bounds with no common shape at one position (`IncompatibleBounds`). Two or
   more concrete contributions is one way; a product with no fields is the same thing read one level
   down, since a positive merge intersects field sets and
-  there is no zero-field product for the empty map to be. -/
+  there is no zero-field product for the empty map to be. A conflicted tuple width is a third: two
+  closed tuples of different widths have no merge. -/
   | incompatible
   /-- A `Data` slot whose alternatives do not reconcile (`DomainJoinConflict`). -/
   | domainJoin
@@ -28,6 +29,10 @@ inductive CoalesceError where
   | conflictedSlot
   /-- A record with mixed `Index`/`Name` keys (`UnresolvedPartial`). -/
   | partialRecord
+  /-- An index-keyed position whose keys are not the dense prefix its width names, or which has no
+  width. `materialize_record` asserts both away (`debug_assert!`, `unreachable!`), so no Rust
+  outcome agrees with this one and the differential reports it if it is ever reached. -/
+  | malformedTuple
 deriving Repr, DecidableEq
 
 /-- The type an atom contributes (`AtomKey::to_type`). -/
@@ -46,14 +51,36 @@ def attachRefinements (t : Ty) : Option (List Predicate) → Ty
     | .refined b qs => .refined b (qs ++ ps)
     | _ => .refined t ps
 
-/-- A dense index-keyed map's payloads in *index* order, as a tuple.
+/-- A dense index-keyed map's payloads in *index* order.
 
-`Ty.tuple` is positional and the map's list order carries no information — `equiv` compares maps as
+A tuple is positional and the map's list order carries no information — `equiv` compares maps as
 sets, mirroring the `BTreeMap` the Rust holds, whose iteration order is the key order. So the
-payloads are read by index rather than by
-position. -/
-def byIndex (n : Nat) (kvs : List (Nat × Ty)) : Option Ty :=
-  ((List.range n).mapM (fun i => List.lookup i kvs)).map Ty.tuple
+payloads are read by index rather than by position. -/
+def byIndex (n : Nat) (kvs : List (Nat × Ty)) : Option (List Ty) :=
+  (List.range n).mapM (fun i => List.lookup i kvs)
+
+/-- The tuple a width names, over its positions: `Ty.tuple` for a closed width and `Ty.openTuple`
+for an open one. `none` for a conflict, which has no type. -/
+def _root_.CclFormal.TupleWidth.shape : TupleWidth → Option (Nat × (List Ty → Ty))
+  | .exactly n => some (n, Ty.tuple)
+  | .atLeast n _ => some (n, Ty.openTuple)
+  | .conflict => none
+
+/-- Mirror of `materialize_record`'s index-keyed branch, given the payloads: a conflicted width is
+`IncompatibleBounds`, and otherwise the keys must be exactly the positions `0..𝑛` the width lists,
+which the Rust asserts. -/
+def tupleShape (width : Option TupleWidth) (idxs : List Nat) (payloads : List (Option Ty)) :
+    Except CoalesceError (Option Ty) :=
+  match width with
+  | some .conflict => .error .incompatible
+  | none => .error .malformedTuple
+  | some w =>
+    match w.shape with
+    | none => .error .malformedTuple
+    | some (n, mkShape) =>
+      if idxs.length == n && (List.range n).all (idxs.contains ·) then
+        pure ((payloads.mapM id).bind fun ts => (byIndex n (idxs.zip ts)).map mkShape)
+      else .error .malformedTuple
 
 /-- The index keys of a map, if every key is one. -/
 def indexKeys : List (FieldKey × CompactTy) → Option (List Nat)
@@ -75,7 +102,7 @@ decrease the second component of the lexicographic termination measure.
 
 theorem depth_cod_lt {a : List Atom} {r v : Option (List (FieldKey × CompactTy))}
     {c : Option (List Predicate)} {k : KindMerge} {ds cod : CompactTy} :
-    depth cod < depth (CompactTy.mk a r v (some (k, ds, cod)) c) := by
+    depth cod < depth (CompactTy.mk a r v (some (k, ds, cod)) c wd) := by
   have h1 : depth cod ≤ optFnDepth (some (k, ds, cod)) := by
     simp only [optFnDepth]
     exact Nat.le_max_right _ _
@@ -87,7 +114,7 @@ theorem depth_cod_lt {a : List Atom} {r v : Option (List (FieldKey × CompactTy)
 
 theorem depth_dom_lt {a : List Atom} {r v : Option (List (FieldKey × CompactTy))}
     {c : Option (List Predicate)} {k : KindMerge} {cod d : CompactTy} :
-    depth d < depth (CompactTy.mk a r v (some (k, d, cod)) c) := by
+    depth d < depth (CompactTy.mk a r v (some (k, d, cod)) c wd) := by
   have h1 : depth d ≤ optFnDepth (some (k, d, cod)) := by
     simp only [optFnDepth]
     exact Nat.le_max_left _ _
@@ -100,7 +127,7 @@ theorem depth_dom_lt {a : List Atom} {r v : Option (List (FieldKey × CompactTy)
 theorem depth_recordPayload_lt {a : List Atom} {m : List (FieldKey × CompactTy)}
     {v : Option (List (FieldKey × CompactTy))} {f : Option (KindMerge × CompactTy × CompactTy)}
     {c : Option (List Predicate)} {p : FieldKey × CompactTy} (h : p ∈ m) :
-    depth p.2 < depth (CompactTy.mk a (some m) v f c) := by
+    depth p.2 < depth (CompactTy.mk a (some m) v f c wd) := by
   have h1 : depth p.2 ≤ optMapDepth (some m) := by
     simp only [optMapDepth]
     exact le_mapDepth h
@@ -113,7 +140,7 @@ theorem depth_recordPayload_lt {a : List Atom} {m : List (FieldKey × CompactTy)
 theorem depth_variantPayload_lt {a : List Atom} {m : List (FieldKey × CompactTy)}
     {r : Option (List (FieldKey × CompactTy))} {f : Option (KindMerge × CompactTy × CompactTy)}
     {c : Option (List Predicate)} {p : FieldKey × CompactTy} (h : p ∈ m) :
-    depth p.2 < depth (CompactTy.mk a r (some m) f c) := by
+    depth p.2 < depth (CompactTy.mk a r (some m) f c wd) := by
   have h1 : depth p.2 ≤ optMapDepth (some m) := by
     simp only [optMapDepth]
     exact le_mapDepth h
@@ -129,13 +156,13 @@ find them without naming the lambda's binder. -/
 theorem depth_recordAttach_lt {a : List Atom} {m : List (FieldKey × CompactTy)}
     {v : Option (List (FieldKey × CompactTy))} {f : Option (KindMerge × CompactTy × CompactTy)}
     {c : Option (List Predicate)} (rp : {x : FieldKey × CompactTy // x ∈ m}) :
-    depth rp.1.2 < depth (CompactTy.mk a (some m) v f c) :=
+    depth rp.1.2 < depth (CompactTy.mk a (some m) v f c wd) :=
   depth_recordPayload_lt rp.2
 
 theorem depth_variantAttach_lt {a : List Atom} {m : List (FieldKey × CompactTy)}
     {r : Option (List (FieldKey × CompactTy))} {f : Option (KindMerge × CompactTy × CompactTy)}
     {c : Option (List Predicate)} (vp : {x : FieldKey × CompactTy // x ∈ m}) :
-    depth vp.1.2 < depth (CompactTy.mk a r (some m) f c) :=
+    depth vp.1.2 < depth (CompactTy.mk a r (some m) f c wd) :=
   depth_variantPayload_lt vp.2
 
 /-- Build a function type from two materialized halves, unresolved if either is. -/
@@ -167,7 +194,7 @@ def coalesce (pol : Bool) : CompactTy → Except CoalesceError (Option Ty)
     let varShape ← variantShapes pol t
     let funShape ← funShapes pol t
     match t with
-    | .mk atoms recF varT fn refinements =>
+    | .mk atoms recF varT fn refinements _ =>
       -- Whether a contribution is read is the *slot's* question, so the list's
       -- length is manifest here rather than something a lemma has to recover
       -- from the helper's branches. An absent slot's helper answers `none` and
@@ -180,20 +207,17 @@ termination_by t => (depth t, 1)
 decreasing_by all_goals (apply Prod.Lex.right; omega)
 
 /-- Empty or mixed-key records are rejected before payload traversal.
-Dense index keys produce a tuple; sparse keys remain unresolved; names produce a record.
-Payload failures propagate before the sparse-key result is selected. -/
+Index keys produce the tuple the width names (`tupleShape`); names produce a record and ignore the
+width, as `materialize_record` does. Payload failures propagate before the width is read. -/
 def recordShapes (pol : Bool) : CompactTy → Except CoalesceError (Option Ty)
-  | .mk _ none _ _ _ => pure none
-  | .mk _ (some m) _ _ _ =>
+  | .mk _ none _ _ _ _ => pure none
+  | .mk _ (some m) _ _ _ width =>
     if m.isEmpty then .error .incompatible
     else
       match indexKeys m with
       | some idxs => do
         let payloads ← m.attach.mapM fun rp => coalesce pol rp.1.2
-        if idxs.length == m.length && (List.range m.length).all (idxs.contains ·) then
-          pure ((payloads.mapM id).bind (fun ts => byIndex m.length (idxs.zip ts)))
-        else
-          pure none
+        tupleShape width idxs payloads
       | none =>
         match nameKeys m with
         | some names => do
@@ -205,8 +229,8 @@ decreasing_by all_goals (apply Prod.Lex.left; exact depth_recordAttach_lt _)
 
 /-- The variant slot's contribution: its arms, materialized in the map's order. -/
 def variantShapes (pol : Bool) : CompactTy → Except CoalesceError (Option Ty)
-  | .mk _ _ none _ _ => pure none
-  | .mk _ _ (some m) _ _ => do
+  | .mk _ _ none _ _ _ => pure none
+  | .mk _ _ (some m) _ _ _ => do
     let payloads ← m.attach.mapM fun vp => coalesce pol vp.1.2
     pure ((payloads.mapM id).map (fun ts => Ty.variant ((m.map Prod.fst).zip ts)))
 termination_by t => (depth t, 0)
@@ -217,15 +241,15 @@ A `data` domain's atoms are alternatives, one candidate each, so several is the 
 Mirrors `denoted_domains` and `denotes_several_domains_ty` (`compact.rs`), including the shape
 they read it on — atoms and nothing else. -/
 def denotesSeveralDomains : CompactTy → Bool
-  | .mk atoms none none none _ => atoms.eraseDups.length > 1
+  | .mk atoms none none none _ _ => atoms.eraseDups.length > 1
   | _ => false
 
 /-- Materialize the codomain, check the kind, then materialize the domain.
 Data functions reject bare domains with multiple distinct atoms. Rust's operand-level
 disagreement flag is omitted; see `formal/design.md`, "The fn slot holds one domain". -/
 def funShapes (pol : Bool) : CompactTy → Except CoalesceError (Option Ty)
-  | .mk _ _ _ none _ => pure none
-  | .mk _ _ _ (some (k, d, cod)) _ => do
+  | .mk _ _ _ none _ _ => pure none
+  | .mk _ _ _ (some (k, d, cod)) _ _ => do
     let c ← coalesce pol cod
     match k with
     | .conflict => .error .conflictedSlot
@@ -265,17 +289,17 @@ theorem combine_ok : ∀ {shapes : List (Option Ty)} {refinements : Option (List
       exact h.symm
   | _ :: _ :: _, _, _, h => by simp [combine] at h
 
-theorem recordShapes_none (pol : Bool) {as v f c} : recordShapes pol (.mk as none v f c) = .ok none
+theorem recordShapes_none (pol : Bool) {as v f c} : recordShapes pol (.mk as none v f c wd) = .ok none
     := by
   rw [recordShapes]
   rfl
 
-theorem variantShapes_none (pol : Bool) {as r f c} : variantShapes pol (.mk as r none f c) = .ok
+theorem variantShapes_none (pol : Bool) {as r f c} : variantShapes pol (.mk as r none f c wd) = .ok
     none := by
   rw [variantShapes]
   rfl
 
-theorem funShapes_none (pol : Bool) {as r v c} : funShapes pol (.mk as r v none c) = .ok none := by
+theorem funShapes_none (pol : Bool) {as r v c} : funShapes pol (.mk as r v none c wd) = .ok none := by
   rw [funShapes]
   rfl
 
@@ -340,6 +364,51 @@ theorem mapM_some_get {α β} {f : α → Option β} :
       simp only [List.getElem?_cons_succ] at hx hy
       exact hget n x y hx hy
 
+/-! ## Reading a tuple back
+
+`tupleShape` succeeds only on an index-keyed map whose keys are the positions its width lists, so
+what it returns is a tuple of exactly those positions: closed at a closed width and open at an open
+one. -/
+
+/-- The tuple a width names over positions `us`: closed at `exactly n`, open at `atLeast n _`. -/
+def TupleOf (wd : Option TupleWidth) (n : Nat) (us : List Ty) (base : Ty) : Prop :=
+  (wd = some (.exactly n) ∧ base = .tuple us) ∨ (∃ c, wd = some (.atLeast n c) ∧ base = .openTuple us)
+
+theorem tupleShape_ok {wd : Option TupleWidth} {idxs : List Nat} {payloads : List (Option Ty)}
+    {base : Ty} (h : tupleShape wd idxs payloads = .ok (some base)) :
+    ∃ ts us, payloads.mapM id = some ts ∧ byIndex idxs.length (idxs.zip ts) = some us ∧
+      TupleOf wd idxs.length us base := by
+  have hgen : ∀ (n : Nat) (mkShape : List Ty → Ty),
+      (if (idxs.length == n && (List.range n).all (idxs.contains ·)) = true then
+        (pure ((payloads.mapM id).bind fun ts => (byIndex n (idxs.zip ts)).map mkShape) :
+          Except CoalesceError (Option Ty))
+      else .error .malformedTuple) = .ok (some base) →
+      n = idxs.length ∧ ∃ ts us, payloads.mapM id = some ts ∧ byIndex n (idxs.zip ts) = some us ∧
+        base = mkShape us := by
+    intro n mkShape hn
+    by_cases hd : (idxs.length == n && (List.range n).all (idxs.contains ·)) = true
+    · rw [if_pos hd] at hn
+      have hlen : idxs.length = n := by
+        simp only [Bool.and_eq_true, beq_iff_eq] at hd
+        exact hd.1
+      refine ⟨hlen.symm, ?_⟩
+      rcases hts : payloads.mapM id with _ | ts <;> rw [hts] at hn
+      · cases hn
+      · rcases hus : byIndex n (idxs.zip ts) with _ | us <;>
+          simp only [hus, Option.bind_some, Option.map_none, Option.map_some] at hn
+        · cases hn
+        · cases hn
+          exact ⟨ts, us, rfl, hus, rfl⟩
+    · rw [if_neg hd] at hn
+      cases hn
+  rcases wd with _ | (n | ⟨n, c⟩ | _)
+  · cases h
+  · obtain ⟨rfl, ts, us, hts, hus, rfl⟩ := hgen n .tuple h
+    exact ⟨ts, us, hts, hus, .inl ⟨rfl, rfl⟩⟩
+  · obtain ⟨rfl, ts, us, hts, hus, rfl⟩ := hgen n .openTuple h
+    exact ⟨ts, us, hts, hus, .inr ⟨c, rfl, rfl⟩⟩
+  · cases h
+
 /-! ## Keys of a materialized map
 
 `indexKeys`/`nameKeys` succeed exactly when every key is of one kind, so the map's
@@ -380,6 +449,7 @@ def tyEquiv : Ty → Ty → Bool
   | .txn, .txn => true
   | .fn n0 k0 d0 c0, .fn n1 k1 d1 c1 => n0 == n1 && k0 == k1 && tyEquiv d0 d1 && tyEquiv c0 c1
   | .tuple a, .tuple b => tyEquivSeq a b
+  | .openTuple a, .openTuple b => tyEquivSeq a b
   | .record a, .record b => tyEquivRec a b
   | .variant a, .variant b => tyEquivVar a b
   | .refined b1 p1, .refined b2 p2 =>
@@ -429,6 +499,7 @@ def coalesceAgrees (want : Except CoalesceError (Option Ty)) (got : CoalesceOutc
           kind == "KindConflict" || kind == "DomainJoinConflict"
             || kind == "IncompatibleBounds"
       | .partialRecord => kind == "UnresolvedPartial"
+      | .malformedTuple => false
   | _, _ => false
 
 end CompactTy

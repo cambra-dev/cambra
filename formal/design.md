@@ -23,7 +23,7 @@ equivalence, rather than comparing complete inference runs.
 | --- | --- | --- |
 | `constrain_subtype` | `Subtyping` / `subtypeCheck`; generated pairs in the modeled concrete fragment. | Reflexivity and transitivity for well-formed types; checker soundness and completeness. |
 | The Σ subtyping premise | `SigmaBelow` relates a candidate list, element types and a kind. No differential of the full Σ rule. | `sigma_below_iff_elementwise` and `swapped_premise_is_unsound` specify the kind-premise direction. Binder correspondence and sums nested in types are not modeled. |
-| `CompactType::merge` | `CompactTy.merge`; each generated fold step is compared. | Commutativity, idempotence, associativity and congruence; leastness and uniqueness for the induced absorption order. |
+| `CompactType::merge` | `CompactTy.merge`, including the tuple width; each generated fold step is compared. | Commutativity, idempotence, associativity and congruence; leastness and uniqueness for the induced absorption order. |
 | `TypeKind::refuses` | `refuses`; generated concrete types and kinds. | `not_admits_of_refuses`: refusal implies non-membership, not the converse. |
 | `CompactTypeKind::merge` | `mergeTypeKind`; encodable generated fold steps are compared. | Commutativity, idempotence and join associativity. Meet associativity is checked over a finite universe, not proved generally. |
 | `coalesce_compact` | `coalesce`; generated compact bounds are materialized and compared. | Total result computation, well-formedness of successful results, and the conditional bound/leastness results described under [Materialization](#materialization-the-merge-is-a-bound-and-the-least-one). |
@@ -47,8 +47,9 @@ prove it for all Rust inputs.
 ## The concrete type grammar
 
 [`CclFormal/Ty.lean`](CclFormal/Ty.lean) defines `Ty`: base types, unsigned index ranges, data
-source domains, `Txn`, functions, tuples, records, closed variants and refinements.
-Function kinds are the two fixed values `compute` and `data`.
+source domains, `Txn`, functions, closed tuples, open tuples, records, closed variants and
+refinements. Function kinds are the two fixed values `compute` and `data`. An open tuple is a
+bound only, so the term calculus never types a value with one.
 
 The grammar is a subset of concrete Rust types, not every type a fully inferred program can
 contain. It has no Σ or witness-reference constructor and no open variant form. It also excludes
@@ -79,6 +80,12 @@ representation is specified in
 [`SubtypeChecker.lean`](CclFormal/SubtypeChecker.lean) implements its terminating checker.
 `subtyping_of_subtypeCheck` and `subtypeCheck_of_subtyping` establish the two directions of
 agreement. Rule examples are checked by `#guard` declarations.
+
+A tuple's width is part of its type
+([Tuple width](../src/ccl/design/type-inference.md#tuple-width)). The `tuple` rule relates two
+closed tuples of equal width, `tupleOpen` a closed tuple below an open one listing at most its
+positions, and `openTuple` two open tuples the same way. No rule puts an open tuple below a closed
+one.
 
 The relation differs from the Rust implementation in three recorded ways: it has no trivial-equality
 shortcut, compares closed function codomains without binder correspondence, and has no
@@ -136,10 +143,19 @@ The principal representation laws are:
 | `foldMerge_dup` | The duplicated contribution is `wellFormed`. |
 | `merge_is_least_absorber`, `least_absorber_unique` | Both operands are `wellFormed`; leastness and uniqueness use `absorbedBy`, not `Subtyping`. |
 
+The record slot carries a tuple width beside its keys, mirroring Rust's `TupleWidth`
+([Tuple width](../src/ccl/design/type-inference.md#tuple-width)). `TupleWidth.merge` mirrors
+`TupleWidth::merge` at both polarities, and `mergeWidth` lifts it with an absent width as the
+identity. Its commutativity, associativity and idempotence laws are exact equalities
+(`TupleWidth.merge_comm`, `TupleWidth.merge_assoc`, `TupleWidth.merge_idem`), so the record slot's
+laws carry over with no width hypothesis. The model's `conflict` carries no payload; Rust's keeps
+the two widths that met, for its diagnostic only.
+
 `equiv` compares atoms and refinements by membership, maps by key lookup and recursive payload
-equivalence, and function slots componentwise. `wellFormed` requires unique map keys,
-recursively well-formed children, no conflicting function kind, and a present refinement slot
-at every content-bearing position.
+equivalence, the tuple width by equality, and function slots componentwise. `wellFormed`
+requires unique map keys, recursively well-formed children, no conflicting function kind, and a
+present refinement slot at every content-bearing position. It places no condition on the tuple
+width.
 
 An absent refinement slot means no contribution and is the merge identity. A present empty
 set means a value with no predicates. At positive polarity, intersecting with that set removes
@@ -182,10 +198,10 @@ materialized types. Fixed-polarity permutation and duplication laws are also rep
 properties. Agreement after materialization alone would not prove those laws.
 
 The comparison boundary matters. Rust carries inference-variable sets, kinding constraints,
-history and nominal slots, function names, sum binders, `domains_disagree` and a `combined`
-diagnostic snapshot that this `CompactTy` does not model. The encoder also maps Rust's `Plain` and
-`Data` kinds to the model's `data`. Model equivalence is therefore not equality of complete
-Rust `CompactType` values.
+history and nominal slots, function names, sum binders, `domains_disagree`, a `combined`
+diagnostic snapshot and a width conflict's two widths, which this `CompactTy` does not model.
+The encoder also maps Rust's `Plain` and `Data` kinds to the model's `data`. Model equivalence
+is therefore not equality of complete Rust `CompactType` values.
 
 The absent domain-disagreement fields are particularly relevant to acceptance: Rust can retain
 evidence about the two pre-merge domains that is no longer recoverable from the merged domain.
@@ -201,8 +217,8 @@ That gap is specified under [The fn slot holds one domain](#the-fn-slot-holds-on
 | `ok none` | A component remains unresolved; no modeled type is available. |
 | `error e` | The modeled materializer rejected the position. |
 
-An unresolved result need not be an entirely empty position. A function with an unresolved child
-or a sparse index-keyed product can also remain unresolved. The Rust comparison records this
+An unresolved result need not be an entirely empty position. A function or product with an
+unresolved child also remains unresolved. The Rust comparison records this
 category rather than an inference-variable identity or its attached predicates.
 
 Each occupied shape contributes an entry to `combine`, even when that entry is unresolved.
@@ -211,10 +227,13 @@ produce `incompatible`. Error propagation from the shape helpers occurs before t
 
 The slot rules are:
 
-- A record slot with no fields is incompatible, not unit. Dense index keys materialize a tuple
-  in index order; sparse index keys remain unresolved. Name keys materialize a record.
-  Mixed index/name keys give `partialRecord` before payload traversal. Otherwise payload
-  errors propagate even if the shape will remain unresolved.
+- A record slot with no fields is incompatible, not unit. Index keys materialize the tuple the
+  width names, in index order: closed at `exactly`, open at `atLeast`. A conflicted width is
+  incompatible. Index keys that are not the positions `0..𝑛` the width lists, or that carry no
+  width, give `malformedTuple`; `materialize_record` asserts both away, so no Rust outcome
+  agrees with it. Name keys materialize a record and ignore the width. Mixed index/name keys
+  give `partialRecord` before payload traversal. Otherwise payload errors propagate before the
+  width is read.
 - Variant payloads materialize recursively. An empty closed variant is distinct from an
   empty record slot.
 - A function first materializes its codomain. `conflict` then gives `conflictedSlot`.
@@ -270,6 +289,12 @@ The off-diagonal cases support function domains, where polarity and subtype dire
 and data-function domains require both directions. The proof reasons about materialized types
 rather than assuming that `Subtyping` reflects into `absorbedBy`.
 
+Tuple widths leave both statements unchanged. Two closed tuples of different widths conflict at
+either polarity, so their merge does not materialize and neither theorem says anything of it.
+Where a tuple merge materializes, the bound proof reads how the widths relate off absorption
+(`widthBelow_of_absorbed`), and the leastness proof reads the operands' widths off a closed
+merged width (`TupleWidth.merge_eq_exactly`) and off a closed bound (`ClosedBelow`).
+
 ### Rust absorption checks
 
 `CompactType::is_below(a, b)` tests whether the positive merge of `a` and `b` is `equiv` to `b`.
@@ -315,9 +340,9 @@ This is reachability evidence from that corpus, not a standing assertion or a pr
 
 `MaterializedMergeIsABound.lean` contains executable `#guard` assertions for:
 
-- 2,888 well-formed cases and 2,048 concrete cases.
-- 1,844 concrete cases satisfying the bound theorem's additional hypotheses.
-- No failures among those 1,844 cases.
+- 3,200 well-formed cases and 2,312 concrete cases.
+- 2,108 concrete cases satisfying the bound theorem's additional hypotheses.
+- No failures among those 2,108 cases.
 - Eight unguarded bound failures and four monotonicity failures among the concrete cases.
 - No failures of `MergeIsBoundGuarded` on that finite sample.
 
@@ -342,11 +367,14 @@ The compared fragment is bounded by the encoders, not just by whether Rust accep
 - `ty_json` encodes closed variant arm sets and functions without sum binders. It has no
   representation for inference unknowns, histories, channel domains or witness references.
 - `cty_json` omits inference-variable identity, the Pi binder name, variant openness and
-  diagnostic domain-conflict payloads. It rejects a history slot, a function with binders, a
-  sum-kind pin, and unsupported atoms or predicates.
+  diagnostic domain-conflict and width-conflict payloads. It rejects a history slot, a function
+  with binders, a sum-kind pin, and unsupported atoms or predicates.
 - `KindPin::Data` and `KindPin::Plain` both encode as the model's data kind. Their distinction
   is therefore not checked by that comparison. The active
   `bug_plain_and_data_pins_have_the_same_wire_encoding` test pins this missing distinction.
+- `gen_ty` builds no open tuple, since it stands for a value's type. The subtype and merge
+  generators reopen some generated tuples (`open_some_tuples`, and the tuple arm of `gen_pair`)
+  so every tuple arm of `constrain_go` and every width merge is reached.
 - The subtype generator excludes duplicate record/variant keys, which violate
   `Ty.WellFormed`. The model's find-first field rules and Rust's equality shortcut must not be
   assumed equivalent for duplicate-keyed inputs.

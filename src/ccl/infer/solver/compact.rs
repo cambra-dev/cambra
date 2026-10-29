@@ -8,6 +8,7 @@
 
 use crate::ccl::nominal::{DeclMap, NominalDecl, Variance};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt;
 use std::rc::Rc;
 
 use smol_str::SmolStr;
@@ -582,6 +583,7 @@ impl CompactType {
             kinds: _,
             atoms,
             rec,
+            width: _,
             var,
             fun,
             refinements,
@@ -684,7 +686,7 @@ fn data_domains_disagree(a: &CompactType, b: &CompactType) -> bool {
             .as_ref()
             .map(|r| r.keys().cloned().collect::<Vec<_>>())
     };
-    a.refinements != b.refinements || a.atoms != b.atoms || keys(a) != keys(b)
+    a.refinements != b.refinements || a.atoms != b.atoms || keys(a) != keys(b) || a.width != b.width
 }
 
 /// Merge binder kinds positionally, retaining the lesser existing ID at each position.
@@ -807,6 +809,11 @@ pub struct CompactType {
     /// `BTreeMap` would conflate the two, and the intersect identity (⊤)
     /// has no finite-map representation anyway.
     pub rec: Option<BTreeMap<FieldKey, CompactType>>,
+    /// The width of the tuple whose positions `rec` holds, present exactly when `rec` is
+    /// index-keyed. The key sets already merge as the positions do (a negative merge's union
+    /// of two prefixes is the longer prefix, a positive merge's intersection the shorter), so
+    /// the width is what `rec` cannot say: whether those positions are all of the tuple's.
+    pub width: Option<TupleWidth>,
     /// Variant tags, if any. The polarities are the **dual** of `rec`:
     /// at positive polarity tags are *unioned* (a producer of `[A]` or
     /// `[B]` could emit `[A, B]`); at negative polarity tags are
@@ -880,6 +887,120 @@ pub struct CompactType {
     /// so "check it where the variable resolves" is a local question at coalesce
     /// rather than a list to be drained afterwards.
     pub kinds: Vec<crate::ccl::ty::TypeKind>,
+}
+
+/// How many positions a tuple contribution has: exactly its listed ones (a [`Type::Tuple`]),
+/// or at least them (a [`Type::OpenTuple`]). See `docs/chl-spec.md`, "Tuple width".
+///
+/// A negative merge is the meet of the types the widths come from. An open tuple is above
+/// every closed tuple at least as wide, so the meet of an open width with a closed one is the
+/// closed one, and two open widths meet at the longer.
+///
+/// A positive merge joins, except that two closed tuples of different widths have no join
+/// (`docs/chl-spec.md`, "Tuple width"). An open width therefore records the closed width
+/// joined under it, so that a second, different closed width conflicts whatever order the
+/// three arrive in. A positive merge is the componentwise combination of the shortest width
+/// listed, whether any width is open, and the closed widths seen, which is associative and
+/// commutative; it is [`Conflict`](Self::Conflict) exactly when two closed widths differ.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TupleWidth {
+    /// A closed tuple of this many positions.
+    Exactly(usize),
+    /// An open tuple listing `listed` positions. `closed` is the closed width a positive
+    /// merge joined under it, if one did; a negative merge keeps it only where both sides
+    /// agree on it.
+    AtLeast {
+        listed: usize,
+        closed: Option<usize>,
+    },
+    /// The first two widths found to have no merge. Absorbing.
+    Conflict(Box<[TupleWidth; 2]>),
+}
+
+impl TupleWidth {
+    /// The width of `ty`, a [`Type::Tuple`] or [`Type::OpenTuple`] of `len` positions.
+    fn of(open: bool, len: usize) -> Self {
+        if open {
+            TupleWidth::AtLeast {
+                listed: len,
+                closed: None,
+            }
+        } else {
+            TupleWidth::Exactly(len)
+        }
+    }
+
+    /// Merge two widths at polarity `pol`.
+    pub(super) fn merge(pol: bool, a: TupleWidth, b: TupleWidth) -> TupleWidth {
+        use TupleWidth::{AtLeast, Conflict, Exactly};
+        let conflict = |a, b| Conflict(Box::new([a, b]));
+        match (a, b) {
+            (c @ Conflict(_), _) | (_, c @ Conflict(_)) => c,
+            (Exactly(m), Exactly(n)) if m == n => Exactly(m),
+            (a @ Exactly(_), b @ Exactly(_)) => conflict(a, b),
+            (
+                AtLeast {
+                    listed: p,
+                    closed: c,
+                },
+                AtLeast {
+                    listed: q,
+                    closed: d,
+                },
+            ) if pol => match (c, d) {
+                (Some(m), Some(n)) if m != n => conflict(Exactly(m), Exactly(n)),
+                _ => AtLeast {
+                    listed: p.min(q),
+                    closed: c.or(d),
+                },
+            },
+            // `closed` meets flat, so the merge stays idempotent on a width a positive merge
+            // built.
+            (
+                AtLeast {
+                    listed: p,
+                    closed: c,
+                },
+                AtLeast {
+                    listed: q,
+                    closed: d,
+                },
+            ) => AtLeast {
+                listed: p.max(q),
+                closed: if c == d { c } else { None },
+            },
+            (Exactly(n), AtLeast { listed: p, closed })
+            | (AtLeast { listed: p, closed }, Exactly(n))
+                if pol =>
+            {
+                match closed {
+                    Some(m) if m != n => conflict(Exactly(m), Exactly(n)),
+                    _ => AtLeast {
+                        listed: n.min(p),
+                        closed: Some(n),
+                    },
+                }
+            }
+            (Exactly(n), AtLeast { listed: p, .. }) | (AtLeast { listed: p, .. }, Exactly(n))
+                if n >= p =>
+            {
+                Exactly(n)
+            }
+            (a, b) => conflict(a, b),
+        }
+    }
+}
+
+impl fmt::Display for TupleWidth {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TupleWidth::Exactly(n) => write!(f, "a {n}-tuple"),
+            TupleWidth::AtLeast { listed, .. } => {
+                write!(f, "a tuple of at least {listed} positions")
+            }
+            TupleWidth::Conflict(pair) => write!(f, "{} and {}", pair[0], pair[1]),
+        }
+    }
 }
 
 /// A variant contribution: the tag map, and whether the arm set is the whole one.
@@ -1078,6 +1199,7 @@ impl CompactType {
             kinds: _,
             atoms,
             rec,
+            width: _,
             var,
             fun,
             refinements: _,
@@ -1098,6 +1220,7 @@ impl CompactType {
     /// Does this position, or any below it, name two shapes where coalesce admits one?
     fn conflicted(&self) -> bool {
         self.shapes() > 1
+            || matches!(self.width, Some(TupleWidth::Conflict(_)))
             || self.rec.iter().flatten().any(|(_, t)| t.conflicted())
             || self
                 .var
@@ -1164,6 +1287,7 @@ impl CompactType {
             kinds: _,
             atoms,
             rec,
+            width,
             var,
             fun,
             refinements,
@@ -1180,6 +1304,7 @@ impl CompactType {
         };
         atoms == &other.atoms
             && refinements == &other.refinements
+            && width == &other.width
             && match (rec, &other.rec) {
                 (None, None) => true,
                 (Some(x), Some(y)) => keyed(x, y),
@@ -1260,6 +1385,10 @@ impl CompactType {
             (None, r) | (r, None) => r,
             (Some(a), Some(b)) => Some(Self::merge_records(pol, a, b)),
         };
+        let width = match (lhs.width, rhs.width) {
+            (None, w) | (w, None) => w,
+            (Some(a), Some(b)) => Some(TupleWidth::merge(pol, a, b)),
+        };
         let var = match (lhs.var, rhs.var) {
             (None, v) | (v, None) => v,
             (Some(a), Some(b)) => Some(Self::merge_variants(pol, a, b)),
@@ -1336,6 +1465,7 @@ impl CompactType {
             atoms,
             kinds,
             rec,
+            width,
             var,
             fun,
             refinements,
@@ -1361,6 +1491,7 @@ impl CompactType {
             vars: _,
             atoms,
             rec,
+            width: _,
             var,
             fun,
             refinements,
@@ -2705,8 +2836,8 @@ fn compact_go(
             }
         }
         // Tuples and records share the structural `rec` representation,
-        // keyed by `Index` and `Name` respectively.
-        Type::Tuple(ts) => {
+        // keyed by `Index` and `Name` respectively; a tuple adds its width.
+        Type::Tuple(ts) | Type::OpenTuple(ts) => {
             let mut compacted = BTreeMap::new();
             for (i, v) in ts.iter().enumerate() {
                 compacted.insert(
@@ -2716,6 +2847,7 @@ fn compact_go(
             }
             CompactType {
                 rec: Some(compacted),
+                width: Some(TupleWidth::of(matches!(ty, Type::OpenTuple(_)), ts.len())),
                 ..CompactType::value()
             }
         }
@@ -3009,6 +3141,7 @@ fn compact_go(
                 let CompactType {
                     atoms,
                     rec,
+                    width: _,
                     fun,
                     history_slot,
                     nominal,
@@ -3196,6 +3329,50 @@ mod carried_probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A width merge is associative, commutative and idempotent at both polarities, so a
+    /// position's width does not depend on the order its bounds arrive in: in particular two
+    /// closed widths conflict in a join whatever open width arrives between them. A conflict
+    /// is compared by kind, its pair being the first two widths found, for the diagnostic.
+    #[test]
+    fn tuple_width_merge_is_order_independent() {
+        let same = |a: &TupleWidth, b: &TupleWidth| match (a, b) {
+            (TupleWidth::Conflict(_), TupleWidth::Conflict(_)) => true,
+            _ => a == b,
+        };
+        // The widths merges at either polarity produce from these, closed under merging.
+        let mut universe: Vec<TupleWidth> = (1..=3)
+            .flat_map(|n| [TupleWidth::of(false, n), TupleWidth::of(true, n)])
+            .collect();
+        let mut i = 0;
+        while i < universe.len() {
+            for j in 0..=i {
+                for pol in [true, false] {
+                    let m = TupleWidth::merge(pol, universe[i].clone(), universe[j].clone());
+                    if !universe.iter().any(|w| same(w, &m)) {
+                        universe.push(m);
+                    }
+                }
+            }
+            i += 1;
+        }
+        for pol in [true, false] {
+            let merge =
+                |a: &TupleWidth, b: &TupleWidth| TupleWidth::merge(pol, a.clone(), b.clone());
+            for a in &universe {
+                assert!(same(&merge(a, a), a), "{pol}: {a:?}");
+                for b in &universe {
+                    assert!(same(&merge(a, b), &merge(b, a)), "{pol}: {a:?} {b:?}");
+                    for c in &universe {
+                        assert!(
+                            same(&merge(&merge(a, b), c), &merge(a, &merge(b, c))),
+                            "{pol}: ({a:?} {b:?}) {c:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
     use crate::ccl::Label;
     use crate::ccl::infer::solver::{
         CoalesceError, ConstrainCache, coalesce_compact, constrain_subtype, fresh_var,

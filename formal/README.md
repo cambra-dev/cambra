@@ -51,6 +51,10 @@ Thus a record with `a: Int` and `b: Bool` is below a record requiring only `a: I
 conversely. Unique field keys are part of the modeled well-formed fragment; duplicate-key behavior
 is not generalized from this example.
 
+A closed tuple's width is part of its type, so the `tuple` constructor relates two closed tuples
+of equal width only. An open tuple is above every tuple listing at least its positions
+(`tupleOpen`, `openTuple`); see [Tuple width](../src/ccl/design/type-inference.md#tuple-width).
+
 ## The differential oracles
 
 [`Main.lean`](Main.lean) reads one JSON object per line and returns one verdict line.

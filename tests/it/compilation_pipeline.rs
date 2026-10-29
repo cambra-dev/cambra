@@ -45,6 +45,7 @@ mod sources_incremental;
 mod sums;
 mod traits;
 mod transactions;
+mod tuple_width;
 mod type_aliases;
 mod type_annotations;
 mod type_parameters;

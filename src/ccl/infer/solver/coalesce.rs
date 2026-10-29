@@ -490,7 +490,13 @@ fn coalesce_compact_go(
 
     if let Some(rec) = &ct.rec {
         let vars: Vec<InferVarId> = ct.vars.iter().copied().collect();
-        shapes.push(materialize_record(rec, polarity, &vars, scope)?);
+        shapes.push(materialize_record(
+            rec,
+            ct.width.as_ref(),
+            polarity,
+            &vars,
+            scope,
+        )?);
     }
     if let Some(var) = &ct.var {
         shapes.push(materialize_variant(var, polarity, scope)?);
@@ -866,6 +872,7 @@ fn materialize_variant(
 
 fn materialize_record(
     rec: &BTreeMap<FieldKey, CompactType>,
+    width: Option<&super::compact::TupleWidth>,
     polarity: bool,
     vars: &[InferVarId],
     scope: &[crate::ccl::ty::Witness],
@@ -888,39 +895,35 @@ fn materialize_record(
     let all_name = rec.keys().all(|k| matches!(k, FieldKey::Name(_)));
 
     if all_index {
-        let mut indexed: Vec<(usize, &CompactType)> = rec
-            .iter()
-            .map(|(k, v)| match k {
-                FieldKey::Index(i) => (*i, v),
-                _ => unreachable!(),
-            })
-            .collect();
-        indexed.sort_by_key(|(i, _)| *i);
-        let dense = indexed
-            .iter()
-            .enumerate()
-            .all(|(pos, (idx, _))| pos == *idx);
-        if dense {
-            // Closed dense tuple.
-            let mut out = Vec::with_capacity(indexed.len());
-            for (_, v) in indexed {
-                out.push(coalesce_compact_go(v, polarity, scope)?);
+        use super::compact::TupleWidth;
+        // Tuple positions are dense: a tuple contribution lists `0..𝑛`, and the merges
+        // intersect or union prefixes, which are prefixes.
+        debug_assert!(
+            rec.keys()
+                .enumerate()
+                .all(|(pos, k)| *k == FieldKey::Index(pos)),
+            "tuple positions are a dense prefix: {:?}",
+            rec.keys().collect::<Vec<_>>()
+        );
+        let mut out = Vec::with_capacity(rec.len());
+        for v in rec.values() {
+            out.push(coalesce_compact_go(v, polarity, scope)?);
+        }
+        match width {
+            Some(TupleWidth::Exactly(n)) => {
+                debug_assert_eq!(*n, out.len(), "a closed tuple lists all its positions");
+                Ok(Type::Tuple(out))
             }
-            Ok(Type::Tuple(out))
-        } else {
-            // Sparse indices — an open record-var (e.g. an isolated
-            // index-projection domain) that never got pinned to a closed
-            // tuple shape during inference. It is genuinely
-            // under-determined and unconstructable by the runtime, so it
-            // coalesces to a fresh `Type::Infer` (an ambiguous-type
-            // condition, reported by `check_fully_typed` if it survives to
-            // the program's output). Note: still recurse the payloads so
-            // any nested var bounds are visited even though we discard the
-            // shape.
-            for (_, v) in indexed {
-                coalesce_compact_go(v, polarity, scope)?;
+            Some(TupleWidth::AtLeast { listed, .. }) => {
+                debug_assert_eq!(*listed, out.len(), "an open tuple lists its prefix");
+                Ok(Type::OpenTuple(out))
             }
-            Ok(Type::Infer(InferVar::fresh(0)))
+            Some(conflict @ TupleWidth::Conflict(_)) => Err(CoalesceError::IncompatibleBounds {
+                polarity,
+                vars: vars.to_vec(),
+                details: format!("tuples of different widths meet: {conflict}"),
+            }),
+            None => unreachable!("an index-keyed product carries its tuple width"),
         }
     } else if all_name {
         let mut out = Vec::with_capacity(rec.len());
@@ -960,7 +963,7 @@ mod tests {
     use std::rc::Rc;
 
     use super::*;
-    use crate::ccl::infer::solver::compact::{AtomKey, CompactGraph, CompactType};
+    use crate::ccl::infer::solver::compact::{CompactGraph, CompactType};
     use crate::ccl::infer::solver::test_helpers::{record, refined, variant};
     use crate::ccl::infer::solver::{
         ConstrainCache, compact_type, constrain_subtype, fresh_var, fun, prim, simplify_type,
@@ -1142,33 +1145,52 @@ mod tests {
         );
     }
 
+    /// Two closed tuples of different widths have no join: the positive merge is a
+    /// conflict, never their common prefix (`docs/chl-spec.md`, "Tuple width").
     #[test]
-    fn coalesce_sparse_index_emits_infer() {
-        // A sparse Index record (e.g. an isolated index-projection domain
-        // that never closed to a dense tuple) is under-determined and
-        // unconstructable, so coalesce emits a fresh `Type::Infer`. There
-        // is no `ccl::Type` for a sparse-index product, so build the
-        // `CompactType` directly (the input the solver would produce
-        // internally).
-        let mut rec = BTreeMap::new();
-        rec.insert(
-            FieldKey::Index(0),
-            CompactType::from_atom(AtomKey::Prim(BaseType::Int)),
+    fn a_join_of_two_tuple_widths_is_incompatible() {
+        let v = fresh_var(0);
+        let mut cache = ConstrainCache::new();
+        let int = || prim(BaseType::Int);
+        constrain_subtype(&Type::Tuple(vec![int(), int()]), &v, &mut cache).unwrap();
+        constrain_subtype(&Type::Tuple(vec![int(), int(), int()]), &v, &mut cache).unwrap();
+        let err = coalesce_compact(&compact_type(&v)).unwrap_err();
+        assert!(
+            matches!(&err, CoalesceError::IncompatibleBounds { details, .. }
+                if details.contains("a 2-tuple and a 3-tuple")),
+            "{err:?}"
         );
-        rec.insert(
-            FieldKey::Index(2),
-            CompactType::from_atom(AtomKey::Prim(BaseType::String)),
+    }
+
+    /// A projection's open demand meets the closed argument at a parameter: the
+    /// parameter reads the argument's width.
+    #[test]
+    fn an_open_demand_meets_a_closed_tuple_at_its_width() {
+        let v = fresh_var(0);
+        let mut cache = ConstrainCache::new();
+        let int = || prim(BaseType::Int);
+        let wide = Type::Tuple(vec![int(), prim(BaseType::String), int()]);
+        constrain_subtype(&wide, &v, &mut cache).unwrap();
+        constrain_subtype(&v, &Type::OpenTuple(vec![int()]), &mut cache).unwrap();
+        let param = fun(v, int());
+        assert_eq!(
+            coalesce_compact(&compact_type(&param)).unwrap(),
+            fun(wide, int())
         );
-        let graph = CompactGraph {
-            term: CompactType {
-                rec: Some(rec),
-                ..Default::default()
-            },
-            rec_vars: BTreeMap::new(),
-            join_violations: Vec::new(),
-        };
-        let t = coalesce_compact(&graph).unwrap();
-        assert!(matches!(t, Type::Infer(_)), "expected Infer, got {t:?}");
+    }
+
+    /// An open demand nothing closes stays open: its width was never fixed.
+    #[test]
+    fn an_open_demand_alone_stays_open() {
+        let v = fresh_var(0);
+        let mut cache = ConstrainCache::new();
+        let open = Type::OpenTuple(vec![prim(BaseType::Int)]);
+        constrain_subtype(&v, &open, &mut cache).unwrap();
+        let param = fun(v, prim(BaseType::Int));
+        assert_eq!(
+            coalesce_compact(&compact_type(&param)).unwrap(),
+            fun(open, prim(BaseType::Int))
+        );
     }
 
     #[test]

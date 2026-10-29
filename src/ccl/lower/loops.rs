@@ -1854,7 +1854,7 @@ def add_to(xs, n):
         yield x + n
 add_to",
         "\
-let add_to : (_ ⇒ _) = λ __arg_tuple_1 → let __result_0 = defer
+let add_to : ((_, _) ⇒ _) = λ __arg_tuple_1 : (_, _) → let __result_0 = defer
 in __arg_tuple_1.0 ≫ (λ x → feed(__result_0, x + __arg_tuple_1.1)); __result_0
 in add_to"
     )]
@@ -1880,7 +1880,7 @@ def cross(xs, ys):
             yield x + y
 cross",
         "\
-let cross : (_ ⇒ _) = λ __arg_tuple_1 → let __result_0 = defer
+let cross : ((_, _) ⇒ _) = λ __arg_tuple_1 : (_, _) → let __result_0 = defer
 in __arg_tuple_1.0 ≫ (λ x → __arg_tuple_1.1 ≫ (λ y → feed(__result_0, x + y))); __result_0
 in cross"
     )]
@@ -1894,7 +1894,7 @@ def triple(xs, ys, zs):
                 yield x + y + z
 triple",
         "\
-let triple : (_ ⇒ _) = λ __arg_tuple_1 → let __result_0 = defer
+let triple : ((_, _, _) ⇒ _) = λ __arg_tuple_1 : (_, _, _) → let __result_0 = defer
 in __arg_tuple_1.0 ≫ (λ x → __arg_tuple_1.1 ≫ (λ y → __arg_tuple_1.2 ≫ (λ z → feed(__result_0, x + y + z)))); __result_0
 in triple"
     )]
@@ -1908,7 +1908,7 @@ def cross_filtered(xs, ys):
                 yield y
 cross_filtered",
         "\
-let cross_filtered : (_ ⇒ _) = λ __arg_tuple_1 → let __result_0 = defer
+let cross_filtered : ((_, _) ⇒ _) = λ __arg_tuple_1 : (_, _) → let __result_0 = defer
 in __arg_tuple_1.0 ≫ (λ x → { x > 0 → __arg_tuple_1.1 ≫ (λ y → feed(__result_0, y)); true → unit }); __result_0
 in cross_filtered"
     )]

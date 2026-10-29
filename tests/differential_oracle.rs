@@ -15,7 +15,7 @@ use std::rc::Rc;
 mod type_gen;
 
 use cambra::ccl::infer::solver::compact::{
-    AtomKey, CompactType, CompactTypeKind, KindPin, compact_type,
+    AtomKey, CompactType, CompactTypeKind, KindPin, TupleWidth, compact_type,
 };
 use cambra::ccl::infer::solver::{
     CoalesceError, CompactGraph, ConstrainCache, coalesce_compact, constrain_subtype,
@@ -119,7 +119,17 @@ fn gen_pair(rng: &mut Rng, depth: u32) -> (Type, Type) {
                     rs.push(r);
                 }
             }
-            (Type::Tuple(ls), Type::Tuple(rs))
+            // Either side may be open, so every tuple arm of `constrain_go` is reached: two
+            // closed widths, a closed tuple under an open one, two open ones, and an open one
+            // under a closed one, which no width admits.
+            let wrap = |rng: &mut Rng, ts: Vec<Type>| {
+                if !ts.is_empty() && rng.chance(1, 3) {
+                    Type::OpenTuple(ts)
+                } else {
+                    Type::Tuple(ts)
+                }
+            };
+            (wrap(rng, ls), wrap(rng, rs))
         }
         2 => {
             let mut ls = Vec::new();
@@ -340,6 +350,7 @@ fn close_all(ty: &Type) -> Type {
         }
         Type::Refinement(base, r) => Type::Refinement(Box::new(close_all(base)), r.clone()),
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(close_all).collect()),
+        Type::OpenTuple(ts) => Type::OpenTuple(ts.iter().map(close_all).collect()),
         Type::Record(fs) => {
             Type::Record(fs.iter().map(|(n, t)| (n.clone(), close_all(t))).collect())
         }
@@ -388,6 +399,10 @@ fn ty_json(t: &Type) -> Option<String> {
         Type::Tuple(ts) => {
             let ts: Option<Vec<_>> = ts.iter().map(ty_json).collect();
             format!(r#"{{"k":"tuple","ts":[{}]}}"#, ts?.join(","))
+        }
+        Type::OpenTuple(ts) => {
+            let ts: Option<Vec<_>> = ts.iter().map(ty_json).collect();
+            format!(r#"{{"k":"openTuple","ts":[{}]}}"#, ts?.join(","))
         }
         Type::Record(fields) => {
             let fs: Option<Vec<_>> = fields
@@ -580,10 +595,27 @@ fn cty_json(ct: &CompactType) -> Option<String> {
             format!("[{}]", preds?.join(","))
         }
     };
+    let width = match &ct.width {
+        None => "null".to_string(),
+        Some(w) => width_json(w),
+    };
     Some(format!(
-        r#"{{"atoms":[{}],"rec":{rec},"var":{var},"fn":{fun},"refinements":{refinements}}}"#,
+        r#"{{"atoms":[{}],"rec":{rec},"var":{var},"fn":{fun},"refinements":{refinements},"width":{width}}}"#,
         atoms?.join(",")
     ))
+}
+
+/// A tuple width in the model's `TupleWidth` schema. A conflict drops the two widths it keeps:
+/// coalesce reads them only for its diagnostic.
+fn width_json(w: &TupleWidth) -> String {
+    match w {
+        TupleWidth::Exactly(n) => format!(r#"{{"k":"exactly","n":{n}}}"#),
+        TupleWidth::AtLeast { listed, closed } => {
+            let closed = closed.map_or("null".to_string(), |n| n.to_string());
+            format!(r#"{{"k":"atLeast","listed":{listed},"closed":{closed}}}"#)
+        }
+        TupleWidth::Conflict(_) => r#"{"k":"conflict"}"#.to_string(),
+    }
 }
 
 /// One merge operand: a bound as `compact_go` builds it, or the empty
@@ -595,7 +627,48 @@ fn gen_bound(rng: &mut Rng) -> CompactType {
         return compact_type(&Type::Hole).term;
     }
     let ty = gen_ty(rng, 3, Fragment::Modelled);
+    let ty = open_some_tuples(rng, ty);
     compact_type(&maybe_kind_var(rng, ty)).term
+}
+
+/// Reopen some of a generated type's non-empty tuples, so the bounds carry open widths too. A
+/// bound stands for a demand as well as a value's type, and an open tuple is only ever a demand,
+/// so `gen_ty` (which stands for values) never builds one.
+fn open_some_tuples(rng: &mut Rng, ty: Type) -> Type {
+    match ty {
+        Type::Tuple(ts) => {
+            let ts: Vec<Type> = ts.into_iter().map(|t| open_some_tuples(rng, t)).collect();
+            if !ts.is_empty() && rng.chance(1, 3) {
+                Type::OpenTuple(ts)
+            } else {
+                Type::Tuple(ts)
+            }
+        }
+        Type::Fun {
+            name,
+            fun_kind,
+            domain,
+            codomain,
+        } => Type::Fun {
+            name,
+            fun_kind,
+            domain: Box::new(open_some_tuples(rng, *domain)),
+            codomain: Box::new(open_some_tuples(rng, *codomain)),
+        },
+        Type::Record(fs) => Type::Record(
+            fs.into_iter()
+                .map(|(n, t)| (n, open_some_tuples(rng, t)))
+                .collect(),
+        ),
+        Type::Variant(tags, o) => Type::Variant(
+            tags.into_iter()
+                .map(|(k, t)| (k, open_some_tuples(rng, t)))
+                .collect(),
+            o,
+        ),
+        Type::Refinement(b, r) => Type::Refinement(Box::new(open_some_tuples(rng, *b)), r),
+        other => other,
+    }
 }
 
 /// Erase every function binder. `CompactTy` has no binder slot, so the model always
@@ -616,6 +689,7 @@ fn strip_binders(t: &Type) -> Type {
             codomain: Box::new(strip_binders(codomain)),
         },
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(strip_binders).collect()),
+        Type::OpenTuple(ts) => Type::OpenTuple(ts.iter().map(strip_binders).collect()),
         Type::Record(fs) => Type::Record(
             fs.iter()
                 .map(|(n, t)| (n.clone(), strip_binders(t)))
@@ -1021,6 +1095,7 @@ fn differential_concrete_subtype_vs_lean_model() {
         let (lhs, rhs) = match rng.below(8) {
             0 => {
                 let t = gen_ty(&mut rng, 3, Fragment::Modelled);
+                let t = open_some_tuples(&mut rng, t);
                 (t.clone(), t)
             }
             1 | 2 => {

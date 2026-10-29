@@ -193,6 +193,10 @@ impl Printer {
                     format!("{{{}}}", parts.join(", "))
                 }
             },
+            Type::OpenTuple(ts) => {
+                let parts: Vec<String> = ts.iter().map(|t| self.ty(t)).collect();
+                format!("{{{}, ..}}", parts.join(", "))
+            }
             Type::Record(fields) => {
                 let parts: Vec<String> = fields
                     .iter()

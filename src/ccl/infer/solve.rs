@@ -506,7 +506,9 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
                 && types_agree_modulo_unread(d1, d2, refinements)
                 && types_agree_modulo_unread(c1, c2, refinements)
         }
-        (Type::Tuple(xs), Type::Tuple(ys)) => {
+        // An open tuple read and a closed one resolved later is a width the walk read
+        // before it was fixed, so the two shapes never agree.
+        (Type::Tuple(xs), Type::Tuple(ys)) | (Type::OpenTuple(xs), Type::OpenTuple(ys)) => {
             xs.len() == ys.len()
                 && xs
                     .iter()
@@ -1071,7 +1073,7 @@ fn for_each_positioned_var(
             step(domain, PositionStep::Domain, path);
             step(codomain, PositionStep::Codomain, path);
         }
-        Type::Tuple(ts) => {
+        Type::Tuple(ts) | Type::OpenTuple(ts) => {
             for (i, t) in ts.iter().enumerate() {
                 step(t, PositionStep::Component(i), path);
             }
@@ -1131,7 +1133,7 @@ fn read_at<'a>(ty: &'a Type, path: &[PositionStep]) -> Option<&'a Type> {
     let inner = match (ty.peel_refinements(), first) {
         (Type::Fun { domain, .. }, PositionStep::Domain) => domain.as_ref(),
         (Type::Fun { codomain, .. }, PositionStep::Codomain) => codomain.as_ref(),
-        (Type::Tuple(ts), PositionStep::Component(i)) => ts.get(*i)?,
+        (Type::Tuple(ts) | Type::OpenTuple(ts), PositionStep::Component(i)) => ts.get(*i)?,
         (Type::DepTuple(cs), PositionStep::Component(i)) => &cs.get(*i)?.1,
         (Type::Record(fs), PositionStep::Field(name)) => &fs.iter().find(|(n, _)| n == name)?.1,
         (Type::Variant(arms, _), PositionStep::Arm(key)) => &arms.iter().find(|(k, _)| k == key)?.1,
@@ -2856,7 +2858,7 @@ fn coalesce_type_predicates_go(
             coalesce_type_predicates_go(c, level, ctx, scope);
             scope.exit();
         }
-        Type::Tuple(ts) | Type::Nominal(_, ts) => ts
+        Type::Tuple(ts) | Type::OpenTuple(ts) | Type::Nominal(_, ts) => ts
             .iter_mut()
             .for_each(|t| coalesce_type_predicates_go(t, level, ctx, scope)),
         Type::Split { input, output } => {
@@ -3227,6 +3229,46 @@ pub(super) fn specialize_use(
             Ok(())
         } else {
             constrain_subtype(&use_expr.ty, &clone.ty, &mut cache)
+        }
+    });
+    // Each of the binding's own type parameters that has a bound is below it in the clone,
+    // as at an instantiation (`src/ccl/design/type-parameters.md`, "Specialization").
+    // Checking the definition alone discharged an edge through a parameter's bound
+    // without naming the parameter, so a parameter that stands only in another's bound
+    // reaches the use's types through this edge and no other.
+    let pinned = pinned.and_then(|()| {
+        let ScopeEntry::Generalized(frame) = &ctx.scope[frame_idx] else {
+            unreachable!("lookup_generalized returns indices of Generalized entries only");
+        };
+        let own = Rc::clone(&frame.own_params);
+        // A bound can name a parameter nothing freshened yet, which its own freshening
+        // then maps, so the parameters are drained until none is new.
+        let mut done = std::collections::HashSet::new();
+        loop {
+            let mut pending: Vec<_> = fresh
+                .params
+                .values()
+                .filter(|(param, _)| own.contains(&param.id) && !done.contains(&param.id))
+                .cloned()
+                .collect();
+            if pending.is_empty() {
+                return Ok(());
+            }
+            pending.sort_by(|a, b| a.0.cmp(&b.0));
+            for (param, standing) in pending {
+                done.insert(param.id);
+                // Under `NoScope`, as the outward pin is, so the solver decides a refined
+                // bound the use's types meet.
+                if let Some(bound) = &param.bound {
+                    let bound = freshen_above(cutoff, bound, target, &mut fresh);
+                    constrain_subtype_in(
+                        &standing,
+                        &bound,
+                        &mut cache,
+                        &crate::ccl::infer::solver::smt::NoScope,
+                    )?;
+                }
+            }
         }
     });
     // An obligation the copy reset, having assumed one of the binding's own type

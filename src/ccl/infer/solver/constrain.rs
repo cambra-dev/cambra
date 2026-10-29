@@ -1417,9 +1417,26 @@ fn constrain_go_impl(
         // on the kind, which is why a new kind needs no new arm: containment is the only
         // kind-dependent question, and it is asked in one place.)
 
-        // Tuple: positional width-subtyping. A longer/equal tuple is a
-        // subtype, so every position rhs requires must exist in lhs.
+        // Tuple: the width is part of the type, so two closed tuples relate only at
+        // equal width, position by position (`docs/chl-spec.md`, "Tuple width").
         (Type::Tuple(a), Type::Tuple(b)) => {
+            if a.len() != b.len() {
+                return Err(ConstrainError::Mismatch {
+                    lhs: Box::new(lhs.clone()),
+                    rhs: Box::new(rhs.clone()),
+                });
+            }
+            for (t0, t1) in a.iter().zip(b) {
+                constrain_go(t0, t1, sl, sr, cache, scope)?;
+            }
+            Ok(())
+        }
+
+        // An open tuple `{𝐵₀, …, 𝐵ₖ, ..}` is above every tuple, open or closed, that lists
+        // at least its positions, each below the one it lists. An open left side is a
+        // type parameter's bound, met while its definition is checked with the
+        // parameter opaque.
+        (Type::Tuple(a) | Type::OpenTuple(a), Type::OpenTuple(b)) => {
             for (i, t1) in b.iter().enumerate() {
                 match a.get(i) {
                     Some(t0) => constrain_go(t0, t1, sl, sr, cache, scope)?,
@@ -1450,6 +1467,13 @@ fn constrain_go_impl(
             }
             Ok(())
         }
+
+        // An open tuple fixes no width, so it is below no closed tuple: a type parameter
+        // bounded by `{𝐴, ..}` cannot be taken apart as a tuple of any one width.
+        (Type::OpenTuple(_), Type::Tuple(_)) => Err(ConstrainError::Mismatch {
+            lhs: Box::new(lhs.clone()),
+            rhs: Box::new(rhs.clone()),
+        }),
 
         // Record: named width-subtyping. rhs's fields must all appear in lhs.
         (Type::Record(a), Type::Record(b)) => {
@@ -1906,7 +1930,8 @@ fn constrain_go_impl(
         //   - a source-domained contribution: `ChanDom(d)` vs a
         //     `DataSource`/`Variant` (union-of-sources) domain;
         //   - a feed under nested loops, keyed by the tuple of their positions: a
-        //     projection out of the channel's key, `𝑘 ▷ .𝑖`, against a tuple.
+        //     projection out of the channel's key, `𝑘 ▷ .𝑖`, against the open tuple it
+        //     demands, or a tuple.
         // A structurally non-domain meet — a channel domain against a scalar,
         // function, record, or history — is a genuine type error and falls
         // through to the mismatch arm, so an ill-domained feed program gets
@@ -1918,6 +1943,7 @@ fn constrain_go_impl(
             | Type::Variant(..)
             | Type::Refinement(..)
             | Type::Tuple(_)
+            | Type::OpenTuple(_)
             | Type::DepTuple(_)
             | Type::ChanDom(..)
             | Type::Hole,
@@ -2215,6 +2241,11 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
             codomain: Box::new(extrude(c, pol, target_level, cache)),
         },
         Type::Tuple(ts) => Type::Tuple(
+            ts.iter()
+                .map(|t| extrude(t, pol, target_level, cache))
+                .collect(),
+        ),
+        Type::OpenTuple(ts) => Type::OpenTuple(
             ts.iter()
                 .map(|t| extrude(t, pol, target_level, cache))
                 .collect(),

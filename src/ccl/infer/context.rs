@@ -869,6 +869,11 @@ impl InferCtx {
                     .map(|t| self.normalize_annotation_in(t, telescope))
                     .collect(),
             ),
+            Type::OpenTuple(ts) => Type::OpenTuple(
+                ts.iter()
+                    .map(|t| self.normalize_annotation_in(t, telescope))
+                    .collect(),
+            ),
             // Born after inference with its references closed, so the
             // telescope needs no extension: no component spells an earlier one by name.
             Type::DepTuple(cs) => Type::DepTuple(

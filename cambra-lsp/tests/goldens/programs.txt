@@ -468,30 +468,31 @@ symbols:
   variable ceiling 10:1-10:30 (name 10:13-10:20)
   function quote 12:1-13:35 (name 12:9-12:14)
   variable bigger 15:1-15:53 (name 15:1-15:7)
-  variable reqs 17:1-17:48 (name 17:1-17:5)
-  variable resps 17:1-17:48 (name 17:7-17:12)
-  variable total 19:1-20:21 (name 20:1-20:6)
-  variable events 22:1-22:16 (name 22:1-22:7)
-  function bump 26:1-35:29 (name 26:5-26:9)
-  function evens 37:1-39:16 (name 37:5-37:10)
-  variable opaque 48:1-48:16 (name 48:1-48:7)
-  variable pairs 49:1-49:59 (name 49:1-49:6)
-  variable escapes 50:1-50:29 (name 50:1-50:8)
-  variable totals 51:1-51:46 (name 51:1-51:7)
-  variable inc 52:1-52:18 (name 52:1-52:4)
-  variable held 53:1-53:28 (name 53:1-53:5)
-  variable apply 54:1-54:22 (name 54:1-54:6)
-  variable n 69:1-69:42 (name 69:1-69:2)
+  variable first 16:1-16:46 (name 16:1-16:6)
+  variable reqs 18:1-18:48 (name 18:1-18:5)
+  variable resps 18:1-18:48 (name 18:7-18:12)
+  variable total 20:1-21:21 (name 21:1-21:6)
+  variable events 23:1-23:16 (name 23:1-23:7)
+  function bump 27:1-36:29 (name 27:5-27:9)
+  function evens 38:1-40:16 (name 38:5-38:10)
+  variable opaque 49:1-49:16 (name 49:1-49:7)
+  variable pairs 50:1-50:59 (name 50:1-50:6)
+  variable escapes 51:1-51:29 (name 51:1-51:8)
+  variable totals 52:1-52:46 (name 52:1-52:7)
+  variable inc 53:1-53:18 (name 53:1-53:4)
+  variable held 54:1-54:28 (name 54:1-54:5)
+  variable apply 55:1-55:22 (name 55:1-55:6)
+  variable n 70:1-70:42 (name 70:1-70:2)
 folds:
   1-5 comment
   12-13
-  26-35
-  27-28
-  29-30
-  31-32
-  37-39
-  38-39
-  41-46
-  42-46
-  43-44
-  45-46
+  27-36
+  28-29
+  30-31
+  32-33
+  38-40
+  39-40
+  42-47
+  43-47
+  44-45
+  46-47

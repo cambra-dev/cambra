@@ -1794,6 +1794,9 @@ per declared parameter, in order, so `Shape::rect(w, h)` binds `rect`'s two para
 is the type's name, qualified as anywhere else (`shop::Shape`). A constructor that declares no
 parameters takes no parentheses, `Option::none`.
 
+A **tuple** pattern takes apart a tuple of exactly its width ([Tuple width](#tuple-width)):
+`a, b = (1, 2, 3)` is an error.
+
 Patterns are still **static** — which names a binding introduces is
 decidable from the syntax alone (§2.2). A variant pattern and a constructor pattern are the forms
 that can *fail* to match, which is why they appear only in a `case` arm or where the match is
@@ -2287,7 +2290,10 @@ marked one carries its status per "How to read this document".)
 - `{T₀, T₁, …}` — tuple type (structural `{…}` type syntax — §6.1). The
   one-element case is `{T,}`, with the comma required, and a comma-free
   `{T}` is a parse error (§2.4, §3.11). The zero-element case is `{}`
-  itself — the unit type (§6.6).
+  itself — the unit type (§6.6). Its width is part of the type
+  ([Tuple width](#tuple-width)).
+- `{T₀, …, Tₖ, ..}` — open tuple: every tuple of at least these positions. It is written only
+  as a bound ([Tuple width](#tuple-width)).
 - `{name: T, …}` — record type. Two records are the same type iff they
   have the same field names with the same field types.
 - ``{ `tag₀{…} | `tag₁{…} | … }`` — variant type (§6.5). Two variants are the
@@ -2839,6 +2845,57 @@ program to mark the loss. Unit is a **base** type instead, and a base type
 accepts only itself: getting from a product to unit takes an operation that
 says so.
 
+### Tuple width
+
+A tuple's width is part of its type. `{T₀, …, Tₙ₋₁}` is a subtype of `{U₀, …, Uₘ₋₁}` exactly when
+`n = m` and each `Tᵢ` is a subtype of `Uᵢ`. Tuples differ from records here: a record with extra
+fields is a subtype of one without them (§6.6), and a tuple with extra positions is not a subtype
+of a shorter one.
+
+- A tuple pattern takes apart a tuple of its own width
+  ([4.3.1 Destructuring patterns](#431-destructuring-patterns)). `a, b = (1, 2, 3)` is an error.
+- Tuples of two widths have no join ([Joining the types of several values](#joining-the-types-of-several-values)).
+  `(1, 2) if c else (1, 2, 3)` and `[(1, 2), (1, 2, 3)]` are errors.
+- A key of a map keyed by pairs is a pair. `m[(1, 2, 3)]?` on a `Map({Int, Int}, V)` is an error.
+
+**An open tuple** `{T₀, …, Tₖ, ..}` is every tuple of at least `k + 1` positions whose position `i`
+is a subtype of `Tᵢ` for each `i ≤ k`. It lists at least one position: `{..}` is an error. An open
+tuple is a subtype of another when it lists at least the other's positions, each a subtype of the
+one listed there, and it is a subtype of no tuple of a fixed width.
+
+No value has an open tuple type, because a tuple value has one width. An open tuple is written
+only as an upper bound, after `<:`:
+
+- on a value parameter, `t <: {A, ..}`, or a binding, `x <: {Int, ..} = e`
+  ([Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded)). Inside
+  that bound it may also be a tuple or record component or a function's result:
+  `r <: {p: {Int, ..}}`.
+- as a type parameter's bound, `T <: {A, ..}` ([Kinds and bounds](#kinds-and-bounds)). There it
+  is the whole bound. A definition reads a value of a type parameter through its bound, so with
+  `R <: {p: {Int, ..}}`, `r.p` on `r: R` would have an open tuple's type, which no value has. A
+  nested open tuple bounds a type parameter of its own instead: `B <: {Int, ..}, R <: {p: B}`.
+
+Anywhere else it is an error: an exact annotation, a result annotation, a function's domain, a
+`Mut(…)`, a collection's element.
+
+A projection `t.i` requires a tuple of at least `i + 1` positions, so its type is
+`forall (A₀, …, Aᵢ, T <: {A₀, …, Aᵢ, ..}) T => Aᵢ`. Each use fixes `T`, and with it the width:
+
+```python
+def first(A, t <: {A, ..}) => A:
+    t.0
+
+first((1, 2)) + first((10, 20, 30))   # 11
+```
+
+**The program fixes every width.** A tuple has the width it is built with, and a parameter has the
+width of its argument at each call. A tuple that only projections reach, such as the parameter of
+`\t -> t.0` where nothing applies the lambda, has no width, and the program is an error.
+
+A diagnostic printing an inferred polymorphic type
+([Polymorphic type annotations](#polymorphic-type-annotations)) writes an open tuple as a type
+parameter's bound: `def first(t): t.0` prints as `forall (A, B <: {A, ..}) B => A`.
+
 ### 6.7 Type-alias statements
 
 A **type alias** binds a capitalized name to a type expression with plain `=`,
@@ -3289,9 +3346,11 @@ first("a", "b")   # T = String
   component in an otherwise positional call, which
   [3.8 Function calls](#38-function-calls) leaves open.
 - **Every type parameter is determined by the arguments.** It appears in a value parameter's
-  annotation, or it is the associated type of a requirement whose other positions are determined
+  annotation, or in the bound of a determined type parameter, or it is the associated type of a
+  requirement whose other positions are determined
   ([Trait requirements](#trait-requirements)). Any other type parameter is an
-  error at the definition.
+  error at the definition. In `def stamp(B, T <: {at: B}, a: T) => {B, T}`, `a` determines `T`
+  and `T`'s bound determines `B`.
 
   > **Direction [Decided] — determined by the use.** A type parameter may instead appear only in
   > the result, and each use determines it from the type the use requires. `Map::empty` has type
@@ -3321,7 +3380,8 @@ in the kind `K`:
 
 - `Type` is every type. `T` alone is `T: Type`.
 - `SubtypesOf(U)` is every subtype of `U`, `U` included. `T <: U`, the **bound** form, is
-  `T: SubtypesOf(U)`.
+  `T: SubtypesOf(U)`. An open tuple `U` is not itself among them, no value having its type
+  ([Tuple width](#tuple-width)).
 
 Any other kind, such as a listing `T: [Int, String]`, is **[Open]** and an error. A type written as
 a kind, as in `T: Int`, is an error.

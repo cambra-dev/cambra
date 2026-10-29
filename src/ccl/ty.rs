@@ -48,9 +48,9 @@ impl std::hash::Hash for ChanLevel {
 /// Identifies a field inside a structural record/tuple, or a variant tag.
 ///
 /// `Index` is used for tuple-shaped records (positional projection);
-/// `Name` for named-field records. The `constrain_subtype` solver treats them
-/// uniformly under width-subtyping; the closed-tuple-vs-record
-/// distinction is materialized only at coalesce time.
+/// `Name` for named-field records. Compaction keeps both in one keyed slot, with a
+/// tuple's width beside it, and the tuple-vs-record distinction is materialized at
+/// coalesce time.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FieldKey {
     /// Positional field (tuple index).
@@ -1119,8 +1119,22 @@ pub enum Type {
         /// The result type. Covariant position; may reference `name`.
         codomain: Box<Type>,
     },
-    /// An ordered product type with unnamed fields (tuple).
+    /// An ordered product type with unnamed fields (tuple). Its width is part of the
+    /// type: two tuples relate only at equal width (`docs/chl-spec.md`, "Tuple width").
     Tuple(Vec<Type>),
+    /// An **open tuple** `{𝐴₀, …, 𝐴ₖ, ..}`: every tuple of at least these positions,
+    /// each below the one listed.
+    ///
+    /// **No value has this type.** It is a bound: what a projection `.𝑘` requires of its
+    /// input ([`proj_requirement`](crate::ccl::infer)), and what a program writes after
+    /// `<:` to name a tuple without fixing its width (`T <: {A, ..}`). A value's tuple is
+    /// a [`Tuple`](Self::Tuple), and its width is fixed when its position materializes;
+    /// an open tuple reaching a node or a binder is an unresolved width
+    /// ([`InferError::UnresolvedTupleWidth`](crate::ccl::infer::InferError::UnresolvedTupleWidth)).
+    ///
+    /// The listed positions are never empty: `{..}` says nothing a tuple's own bound
+    /// would not, and lowering refuses it.
+    OpenTuple(Vec<Type>),
     /// A **dependent tuple**: a telescope whose component `𝑘` may reference
     /// every earlier component, `(𝑖 : 𝐴) × (𝑗 : 𝐵(𝑖)) × 𝐶(𝑖, 𝑗)`. Each component
     /// is a binder in the shape of a `Fun`'s, scoping over the components after
@@ -2473,6 +2487,10 @@ fn fmt_type(
             let parts: Vec<_> = ts.iter().map(|t| at(t, binders).to_string()).collect();
             write!(f, "({})", parts.join(", "))
         }
+        Type::OpenTuple(ts) => {
+            let parts: Vec<_> = ts.iter().map(|t| at(t, binders).to_string()).collect();
+            write!(f, "({}, ..)", parts.join(", "))
+        }
         // `(𝑖 : 𝐴) × (𝑗 : 𝐵(𝑖)) × 𝐶(𝑖, 𝑗)`: each component renders inside the
         // binders of the components before it. A component that is itself a
         // dependent tuple renders in parentheses, since it is a different type
@@ -3636,6 +3654,9 @@ impl Type {
             },
             Type::BoundedHole(t) => Type::BoundedHole(Box::new(t.without_pi_names())),
             Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| t.without_pi_names()).collect()),
+            Type::OpenTuple(ts) => {
+                Type::OpenTuple(ts.iter().map(|t| t.without_pi_names()).collect())
+            }
             Type::DepTuple(cs) => Type::DepTuple(
                 cs.iter()
                     .map(|(_, t)| (None, t.without_pi_names()))
@@ -3798,7 +3819,7 @@ impl Type {
                 f(domain);
                 f(codomain);
             }
-            Type::Tuple(ts) => {
+            Type::Tuple(ts) | Type::OpenTuple(ts) => {
                 for t in ts {
                     f(t);
                 }
@@ -3863,7 +3884,7 @@ impl Type {
                 f(domain);
                 f(codomain);
             }
-            Type::Tuple(ts) => {
+            Type::Tuple(ts) | Type::OpenTuple(ts) => {
                 for t in ts {
                     f(t);
                 }

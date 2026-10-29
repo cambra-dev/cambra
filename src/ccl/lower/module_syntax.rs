@@ -470,7 +470,7 @@ impl Refusals {
                     self.expr(&entry.value);
                 }
             }
-            ChlExpr::Lit(_) | ChlExpr::Name(_) | ChlExpr::Error => {}
+            ChlExpr::Lit(_) | ChlExpr::Name(_) | ChlExpr::Error | ChlExpr::Rest => {}
             ChlExpr::BinOp { left, right, .. } => {
                 self.expr(left);
                 self.expr(right);

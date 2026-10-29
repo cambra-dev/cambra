@@ -1009,7 +1009,7 @@ mod tests {
     #[case("\\x -> x + 1", "λ x → x + 1")]
     #[case(
         "\\x, y -> x + y",
-        "λ __arg_tuple_0 → __arg_tuple_0.0 + __arg_tuple_0.1"
+        "λ __arg_tuple_0 : (_, _) → __arg_tuple_0.0 + __arg_tuple_0.1"
     )]
     // Nested multi-arg lambdas: the outer lambda's substitution inserts a
     // reference to its tuple parameter into the inner lambda's body.  Each
@@ -1018,7 +1018,7 @@ mod tests {
     // outer takes id 1 because the inner is lowered first and consumes id 0.
     #[case(
         "\\x, y -> \\a, b -> x + a",
-        "λ __arg_tuple_1 → λ __arg_tuple_0 → __arg_tuple_1.0 + __arg_tuple_0.0"
+        "λ __arg_tuple_1 : (_, _) → λ __arg_tuple_0 : (_, _) → __arg_tuple_1.0 + __arg_tuple_0.0"
     )]
     fn test_lower_expr(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);

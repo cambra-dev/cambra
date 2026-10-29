@@ -598,6 +598,14 @@ pub enum InferError {
         /// Display label for the message (see the type docs — not the location).
         at: String,
     },
+    /// A node or binder's tuple stayed open: the program reads positions of it and
+    /// nothing fixes its width (`docs/chl-spec.md`, "Tuple width").
+    UnresolvedTupleWidth {
+        /// The open tuple, rendered.
+        open: String,
+        /// Display label for the message (see the type docs — not the location).
+        at: String,
+    },
     /// A node's coalesced type references a term binder that is not in scope
     /// at that node — a violation of the scope-validity invariant (design
     /// §6.2). Like [`InferError::UnresolvedHole`], treat as a compiler bug
@@ -710,7 +718,8 @@ impl InferError {
             match &mut e {
                 InferError::IncompatibleBounds { origin, .. }
                 | InferError::DomainJoinConflict { origin, .. } => origin.clear(),
-                InferError::UnresolvedPartial { at, .. } => at.clear(),
+                InferError::UnresolvedPartial { at, .. }
+                | InferError::UnresolvedTupleWidth { at, .. } => at.clear(),
                 _ => {}
             }
             e
@@ -827,6 +836,7 @@ impl InferError {
             | InferError::UnresolvedBoundedHole { .. }
             | InferError::UnresolvedInfer { .. }
             | InferError::UnresolvedPartial { .. }
+            | InferError::UnresolvedTupleWidth { .. }
             | InferError::IncompatibleBounds { .. }
             | InferError::MutNotBareVariable { .. }
             | InferError::MutArgNotMutable { .. }
@@ -1126,12 +1136,28 @@ fn option_variant_hint(type_a: &Type, type_b: &Type) -> Option<&'static str> {
     )
 }
 
-fn product_keying_hint(type_a: &Type, type_b: &Type) -> Option<&'static str> {
-    match (type_a, type_b) {
-        (Type::Record(_), Type::Tuple(_)) | (Type::Tuple(_), Type::Record(_)) => Some(
+/// The hint for a product `found` where the product `expected` is required. A type
+/// parameter found is read as its bound, which is what the definition knows of it.
+fn product_keying_hint(expected: &Type, found: &Type) -> Option<&'static str> {
+    let found = match found {
+        Type::Param(p) => p.bound.as_ref().unwrap_or(found),
+        _ => found,
+    };
+    match (expected, found) {
+        (Type::Record(_), Type::Tuple(_) | Type::OpenTuple(_))
+        | (Type::Tuple(_) | Type::OpenTuple(_), Type::Record(_)) => Some(
             "hint: a record is keyed by field *name* and a tuple by *position* — a record \
              has no `.0` and a tuple has no named fields, so project a record with \
              `.name` and a tuple with `.0`",
+        ),
+        (Type::Tuple(a), Type::Tuple(b)) if a.len() != b.len() => Some(
+            "hint: a tuple's width is part of its type, so tuples of different widths \
+             are different types",
+        ),
+        // An open tuple found is a type parameter's bound.
+        (Type::Tuple(_), Type::OpenTuple(_)) => Some(
+            "hint: an open tuple `{A, ..}` fixes no width, so a value bounded by one \
+             cannot be taken apart as a tuple of any one width",
         ),
         _ => None,
     }
@@ -1446,6 +1472,9 @@ impl std::fmt::Debug for InferError {
                     crate::ccl::chl_print::chl_type(annotation),
                     crate::ccl::chl_print::chl_type(inferred)
                 )?;
+                if let Some(hint) = product_keying_hint(annotation, inferred) {
+                    write!(f, "\n  {hint}")?;
+                }
                 if let Some(hint) = option_variant_hint(annotation, inferred) {
                     write!(f, "\n  {hint}")?;
                 }
@@ -1478,6 +1507,12 @@ impl std::fmt::Debug for InferError {
             InferError::UnresolvedPartial { kind, at } => {
                 write!(f, "Unresolved partial {kind} in expression: {at}")
             }
+            InferError::UnresolvedTupleWidth { open, at } => write!(
+                f,
+                "The width of the tuple {open} is never fixed in {at}: the program reads its \
+                 positions, and nothing gives it a width\n  hint: a tuple value has one \
+                 width; pass this a tuple, or annotate it with a tuple type"
+            ),
             InferError::OpaqueEscape { names, ty } => {
                 let names = names
                     .iter()
@@ -2022,11 +2057,91 @@ fn check_annotated(expr: &Expr, strictness: Strictness) -> Result<(), Vec<Locate
     let mut errors = Vec::new();
     let mut seen: HashSet<crate::ccl::PredicateId> = HashSet::new();
     collect_expr_errors(expr, strictness, &mut errors, &mut seen);
+    // An unfixed width reaches every node and binder its tuple's type does, so it is
+    // reported once per tuple.
+    let (open, mut errors): (Vec<_>, Vec<_>) = errors
+        .into_iter()
+        .partition(|e| matches!(e.error, InferError::UnresolvedTupleWidth { .. }));
+    errors.extend(one_per_unfixed_width(expr, open));
     if errors.is_empty() {
         Ok(())
     } else {
         Err(errors)
     }
+}
+
+/// The reports of `open`, each an [`InferError::UnresolvedTupleWidth`] raised at a node or
+/// binder of `expr`, one per tuple whose width nothing fixed. Its open type reaches every
+/// node and binder that holds the tuple, so a report is kept only at the innermost: one whose
+/// subtree raises no other. A projection's open domain is its argument's tuple, so it is
+/// dropped where its argument reports, and a variable is reported once, at its first read,
+/// however often the program reads it. Every subtree raising one keeps one.
+fn one_per_unfixed_width(expr: &Expr, open: Vec<LocatedInferError>) -> Vec<LocatedInferError> {
+    struct Walk<'a> {
+        raised: HashSet<NodeId>,
+        scope: Vec<(&'a Name, NodeId)>,
+        reported: HashSet<NodeId>,
+        kept: HashSet<NodeId>,
+    }
+    impl<'a> Walk<'a> {
+        /// Whether `e`'s subtree raises a report, keeping the innermost ones.
+        fn go(&mut self, e: &'a Expr) -> bool {
+            let mut below = false;
+            match &e.node {
+                TypedExprNode::Lambda { param, body } => {
+                    self.scope.push((&param.name, e.node_id()));
+                    below |= self.go(body);
+                    self.scope.pop();
+                }
+                TypedExprNode::Let {
+                    binding,
+                    bound_expr,
+                    body,
+                } => {
+                    below |= self.go(bound_expr);
+                    self.scope.push((&binding.name, e.node_id()));
+                    below |= self.go(body);
+                    self.scope.pop();
+                }
+                TypedExprNode::Apply { function, argument }
+                    if matches!(function.node, TypedExprNode::Proj(_)) =>
+                {
+                    below |= self.go(argument);
+                    if !below {
+                        below |= self.go(function);
+                    }
+                }
+                _ => e.walk_children(|child| below |= self.go(child)),
+            }
+            let raised = self.raised.contains(&e.node_id());
+            if raised && !below {
+                let tuple = match &e.node {
+                    TypedExprNode::Var(name) => self
+                        .scope
+                        .iter()
+                        .rev()
+                        .find(|(bound, _)| *bound == name)
+                        .map_or(e.node_id(), |(_, binder)| *binder),
+                    _ => e.node_id(),
+                };
+                if self.reported.insert(tuple) {
+                    self.kept.insert(e.node_id());
+                }
+            }
+            below || raised
+        }
+    }
+    let mut walk = Walk {
+        raised: open.iter().map(|e| e.node_id).collect(),
+        scope: Vec::new(),
+        reported: HashSet::new(),
+        kept: HashSet::new(),
+    };
+    walk.go(expr);
+    let mut once = HashSet::new();
+    open.into_iter()
+        .filter(|e| walk.kept.contains(&e.node_id) && once.insert(e.node_id))
+        .collect()
 }
 
 /// Recursively collect all type errors from `expr` into `errors`.
@@ -2246,6 +2361,25 @@ fn collect_type_errors(
                 "empty Tuple type at `{context_sym}`: the empty product is Unit \
                  (build products with Type::tuple)"
             );
+        }
+        // A position is open until its width is fixed, and a value has one width
+        // (`docs/chl-spec.md`, "Tuple width"). Reported once, not again for its positions;
+        // `check_annotated` then keeps one report per tuple (`one_per_unfixed_width`). A
+        // position nothing reached is written `_`, as a reader would.
+        Type::OpenTuple(_) => {
+            let mut open = ty.clone();
+            fn hole_for_infer(ty: &mut Type) {
+                if let Type::Infer(_) = ty {
+                    *ty = Type::Hole;
+                }
+                ty.walk_children_mut(hole_for_infer);
+            }
+            hole_for_infer(&mut open);
+            errors.push(InferError::UnresolvedTupleWidth {
+                open: crate::ccl::chl_print::chl_type(&open),
+                at: context_sym.to_string(),
+            });
+            return;
         }
         Type::DepTuple(components) => {
             debug_assert!(
@@ -5086,7 +5220,8 @@ mod tests {
         // λ p → ((p ► .0) + 0, p ► .1)
         // p ► .0 feeds into Int addition → p[0] : Int
         // p ► .1 is unconstrained
-        // Expected domain: (Int, ?b)
+        // Expected domain: (Int, ?b, ..) — projections fix no width, and nothing
+        // applies the lambda, so the domain stays open.
         let body = Expr::new(TypedExprNode::Tuple(vec![
             Expr::new(TypedExprNode::BinOp {
                 op: BinOpKind::Arithmetic(ArithmeticKind::Add),
@@ -5099,7 +5234,7 @@ mod tests {
         let ty = infer(&mut expr, &mut ctx).unwrap();
         if let Type::Fun { domain, .. } = ty {
             match *domain {
-                Type::Tuple(ref elts) if elts.len() == 2 => {
+                Type::OpenTuple(ref elts) if elts.len() == 2 => {
                     assert_eq!(
                         elts[0],
                         Type::Base(BaseType::Int),
@@ -5108,7 +5243,7 @@ mod tests {
                     );
                     // elts[1] remains as an unconstrained infer variable
                 }
-                ref other => panic!("expected 2-element Tuple domain for p, got {other}"),
+                ref other => panic!("expected an open 2-position domain for p, got {other}"),
             }
         } else {
             panic!("expected Fun type for lambda");

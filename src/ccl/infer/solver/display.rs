@@ -16,7 +16,9 @@ use crate::ccl::ty::{PolyParam, PolyType, TraitRequirement, TypeParam, TypeParam
 use crate::ccl::{InferVarId, Level, Type};
 
 use super::coalesce::{coalesce_compact, coalesce_position};
-use super::compact::{AtomKey, CompactType, CompactTypeKind, compact_type_polarity_only};
+use super::compact::{
+    AtomKey, CompactType, CompactTypeKind, TupleWidth, compact_type_polarity_only,
+};
 use super::simplify_type::simplify_type_pinning;
 use super::traits::TraitObligation;
 
@@ -203,8 +205,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
             PolyParam::with_bound(
                 names.param(*v),
                 match v {
-                    Named::Var(v) => st.bounds.get(v).map(|b| names.rename(b)),
-                    Named::Fresh(_) => None,
+                    Named::Var(_) | Named::Fresh(_) => names.bound(*v).map(|b| names.rename(b)),
                     Named::Meet(_) => {
                         unreachable!("a join or meet is not a parameter of its own")
                     }
@@ -374,8 +375,10 @@ fn for_each_child(
 enum Placeholder {
     /// A variable above the cutoff.
     Var(InferVarId),
-    /// A position no variable and no type reached: a parameter of its own.
-    Fresh,
+    /// A parameter of its own: at a position no variable and no type reached, or at an
+    /// open tuple, its bound. An open tuple is written only as a bound (`docs/chl-spec.md`,
+    /// "Tuple width"), so the position it holds is a parameter below it.
+    Fresh(Option<Type>),
     /// Variables, and possibly a type, meeting where the notation has no form for it:
     /// `true` for a join (a positive position), `false` for a meet.
     Meet(bool, Vec<InferVarId>, Option<Type>),
@@ -414,7 +417,12 @@ impl Parametrize<'_> {
             // Nothing reached this position: it is unconstrained, which a parameter
             // of its own states.
             if !has_content && ct.vars.is_empty() {
-                let placeholder = self.mint(Placeholder::Fresh);
+                let placeholder = self.mint(Placeholder::Fresh(None));
+                *ct = Self::param_position(placeholder);
+            }
+            if matches!(ct.width, Some(TupleWidth::AtLeast { .. })) {
+                let bound = coalesce_position(ct, pol).ok()?;
+                let placeholder = self.mint(Placeholder::Fresh(Some(bound)));
                 *ct = Self::param_position(placeholder);
             }
             return Some(());
@@ -544,7 +552,7 @@ impl<'a> Naming<'a> {
         for id in found {
             match self.st.placeholders.get(&id) {
                 Some((_, Placeholder::Var(v))) => out.push(Named::Var(*v)),
-                Some((_, Placeholder::Fresh)) => out.push(Named::Fresh(id)),
+                Some((_, Placeholder::Fresh(_))) => out.push(Named::Fresh(id)),
                 Some((_, Placeholder::Meet(_, vars, content))) => {
                     out.extend(vars.iter().map(|v| Named::Var(*v)));
                     if let Some(c) = content {
@@ -610,7 +618,11 @@ impl<'a> Naming<'a> {
     fn bound(&self, named: Named) -> Option<&'a Type> {
         match named {
             Named::Var(v) => self.st.bounds.get(&v),
-            Named::Fresh(_) | Named::Meet(_) => None,
+            Named::Fresh(id) => match &self.st.placeholders.get(&id)?.1 {
+                Placeholder::Fresh(bound) => bound.as_ref(),
+                _ => None,
+            },
+            Named::Meet(_) => None,
         }
     }
 
@@ -654,7 +666,7 @@ impl<'a> Naming<'a> {
         {
             let named = match placeholder {
                 Placeholder::Var(v) => Named::Var(*v),
-                Placeholder::Fresh => Named::Fresh(p.id),
+                Placeholder::Fresh(_) => Named::Fresh(p.id),
                 Placeholder::Meet(..) => Named::Meet(p.id),
             };
             let fresh = !self.params.borrow().contains_key(&named);

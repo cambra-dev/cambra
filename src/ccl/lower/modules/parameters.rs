@@ -324,14 +324,19 @@ impl LoweringContext {
         // A bound or a default in error is a hole, and the parameter is still
         // declared, so its uses report nothing more.
         let mut error = None;
-        let mut lower = |ty: &Spanned<ChlExpr>, ctx: &mut Self| {
-            crate::ccl::lower::stmts::lower_type_expr(ty, ctx).unwrap_or_else(|e| {
+        let mut lower = |lowered: Result<Type, LoweringError>| {
+            lowered.unwrap_or_else(|e| {
                 error.get_or_insert(e);
                 Type::Hole
             })
         };
-        let bound = bound.map(|bound| lower(bound, self));
-        let default = default.map(|default| lower(default, self));
+        let bound = bound.map(|bound| {
+            lower(crate::ccl::lower::stmts::lower_type_parameter_bound(
+                bound, self,
+            ))
+        });
+        let default =
+            default.map(|default| lower(crate::ccl::lower::stmts::lower_type_expr(default, self)));
         let param = TypeParam::declared(name.node.as_str());
         let alias = AliasType::Type(Type::Param(Rc::clone(&param)));
         self.declare_type_alias(name.node.as_str(), statement, alias);

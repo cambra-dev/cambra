@@ -972,7 +972,13 @@ pub enum Expr {
     ///   product (`docs/chl-spec.md`, "6.6 The empty product is unit"). Lowering
     ///   maps the empty group there; it does *not* build an empty
     ///   `cambra::ccl::Type::Tuple`, which is not a valid type.
+    /// - **A last [`Expr::Rest`]** makes it an open tuple type `{T, ..}`, listing at
+    ///   least one position before the `..` (`docs/chl-spec.md`, "Tuple width").
     BraceGroup(Vec<Spanned<Expr>>),
+
+    /// `..`, the rest of a tuple's positions. The parser builds it only as the last item
+    /// of a [`Expr::BraceGroup`], where it makes the group an open tuple type.
+    Rest,
 
     /// A refinement type `{ T where p }`: the base type `T`, the keyword
     /// `where`, and a predicate `p` over the anonymous subject `_`
