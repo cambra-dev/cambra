@@ -288,21 +288,22 @@ impl TileOperator for ExtractAggregate {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        Box::new(ExtractAggregateProducer {
-            base: ProducerBase::new(
+        let mut producer = ExtractAggregateProducer::new(
+            ProducerBase::new(
                 ExtractAggregateProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 scheduler,
             ),
-            input: self.input.subscribe(
+            self.input.subscribe(
                 self.input.tiling().universal_guard(),
                 widening(consumer),
                 scheduler,
             ),
-            kind: self.kind,
-            only_terminal: self.only_terminal,
-        })
+            self.kind,
+        );
+        producer.only_terminal = self.only_terminal;
+        Box::new(producer)
     }
 }
 
@@ -311,26 +312,29 @@ struct ExtractAggregateProducer {
     input: Box<dyn TileProducer>,
     kind: AggregateKind,
     only_terminal: bool,
+    /// The value a consume extracted from a terminal input, until the consumer releases the
+    /// output. Empty before then.
+    extracted: Tile,
+    /// Whether [`BreakingProducer::consume_impl`] has run: a consuming extraction answers from
+    /// what it extracted and never pulls its input.
+    consuming: bool,
 }
 
-impl TileProducer for ExtractAggregateProducer {
-    impl_producer_base!();
-
-    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
-        visit("input", &*self.input);
+impl ExtractAggregateProducer {
+    fn new(base: ProducerBase, input: Box<dyn TileProducer>, kind: AggregateKind) -> Self {
+        let extracted = base.tiling.empty_tile();
+        Self {
+            base,
+            input,
+            kind,
+            only_terminal: true,
+            extracted,
+            consuming: false,
+        }
     }
 
-    /// One extracted value has no keys to project: the projection is all of it or none.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        match projection_guard.projection(&self.name()) {
-            Projection::Everything => {}
-            Projection::Nothing => return self.tiling().empty_tile(),
-            Projection::Keys(_) => panic!(
-                "{} extracts one value, which has no keys to project: {projection_guard:?}",
-                self.name()
-            ),
-        }
-        let input_result = self.input.get(self.input.tiling().universal_guard());
+    /// The value `input_result` extracts to, or nothing while the input is not terminal.
+    fn extract(&self, input_result: Tile) -> Tile {
         let Tile::Aggregation {
             kind: _,
             accumulator,
@@ -358,10 +362,80 @@ impl TileProducer for ExtractAggregateProducer {
             todo!()
         }
     }
+}
+
+impl TileProducer for ExtractAggregateProducer {
+    impl_producer_base!();
+
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("input", &*self.input);
+    }
+
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection =
+            projection_of_one_value(&self.name(), "extracts one value", &projection_guard);
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        if self.consuming {
+            return self.offer_impl(projection_guard);
+        }
+        let input_result = self.input.get(self.input.tiling().universal_guard());
+        self.extract(input_result)
+    }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         if obsolete_guard.expect_universal_or_empty(&self.name()) {
+            self.extracted = self.tiling().empty_tile();
             self.input.release(self.input.tiling().universal_guard());
+        }
+    }
+}
+
+impl BreakingProducer for ExtractAggregateProducer {
+    /// Pulls the input at `guard`, a guard of the aggregation, and extracts its value once the
+    /// input is terminal. A terminal input is released at what it stated, which is all of it. A
+    /// partial one states nothing releasable, so it is left for the next consume. Once the value
+    /// is extracted, or the output released, the input is not pulled again.
+    fn consume_impl(&mut self, guard: TileGuard) {
+        debug_assert!(
+            guard.check_from(self.input.tiling()),
+            "{} consumes a guard of its input's tiling: {guard:?}",
+            self.name()
+        );
+        self.consuming = true;
+        if !self.extracted.is_empty()
+            || self.obsolete_guard().is_universal()
+            || guard.projection(&self.input.name()) == Projection::Nothing
+        {
+            return;
+        }
+        let input_result = self.input.get(guard);
+        let upstream_guard = input_result.to_guard();
+        let value = self.extract(input_result);
+        if !value.is_empty() {
+            self.extracted = value;
+        }
+        self.input.release(upstream_guard);
+    }
+
+    fn input(&self) -> &dyn TileProducer {
+        &*self.input
+    }
+
+    /// The extracted value, once there is one.
+    fn held(&self) -> TileGuard {
+        match self.extracted.is_empty() {
+            true => self.tiling().empty_guard(),
+            false => self.tiling().universal_guard(),
+        }
+    }
+
+    fn offer_impl(&mut self, guard: TileGuard) -> Tile {
+        let projection = projection_of_one_value(&self.name(), "extracts one value", &guard);
+        match projection {
+            Projection::Nothing => self.tiling().empty_tile(),
+            _ => self.extracted.clone(),
         }
     }
 }
@@ -1437,12 +1511,11 @@ mod extract_aggregate_projection_tests {
         let (input, pulled, _) = ProjectionSpy::new(finished, in_tiling);
         let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
         (
-            ExtractAggregateProducer {
-                base: ProducerBase::unowned(ExtractAggregateProducer::alloc_id(), &tiling),
-                input: Box::new(input),
-                kind: AggregateKind::Sum,
-                only_terminal: true,
-            },
+            ExtractAggregateProducer::new(
+                ProducerBase::unowned(ExtractAggregateProducer::alloc_id(), &tiling),
+                Box::new(input),
+                AggregateKind::Sum,
+            ),
             pulled,
         )
     }
@@ -2037,5 +2110,304 @@ mod aggregate_consuming_tests {
         );
         aggregate.consume_impl(handed);
         assert_eq!(held(&aggregate), (sum_of([0, 1, 4, 5, 6, 7, 8, 9]), true));
+    }
+
+    fn scalar_tiling() -> Tiling {
+        Tiling::Scalar(Extent::Base(BaseType::Int))
+    }
+
+    fn extract_over_input(input: Box<dyn TileProducer>) -> ExtractAggregateProducer {
+        ExtractAggregateProducer::new(
+            ProducerBase::unowned(ExtractAggregateProducer::alloc_id(), &scalar_tiling()),
+            input,
+            AggregateKind::Sum,
+        )
+    }
+
+    fn extract_over(source: &Shared) -> ExtractAggregateProducer {
+        extract_over_input(Box::new(sum_over(source)))
+    }
+
+    fn scalar_of(tile: &Tile) -> Option<i64> {
+        match tile {
+            Tile::Scalar(ColumnValue::Ints(values)) => values.first().copied(),
+            other if other.is_empty() => None,
+            other => panic!("an integer, got {other:?}"),
+        }
+    }
+
+    /// A terminal aggregation is extracted, and its input is released at what it stated: all of
+    /// it. Nothing is pulled from the source for an answer after that.
+    #[test]
+    fn a_terminal_aggregation_is_extracted_and_released() {
+        let source = source(0..10);
+        let mut sum = sum_over(&source);
+        sum.consume_impl(ints().universal_guard());
+        let mut extract = extract_over_input(Box::new(sum));
+        extract.consume_impl(sum_tiling().universal_guard());
+        assert_eq!(
+            scalar_of(&extract.get(scalar_tiling().universal_guard())),
+            Some(sum_of(0..10))
+        );
+        assert!(extract.input.obsolete_guard().is_universal());
+        assert_eq!(extract.finalize(), scalar_tiling().universal_guard());
+        let pulls = source.borrow().pulled.len();
+        extract.get(scalar_tiling().universal_guard());
+        assert_eq!(
+            source.borrow().pulled.len(),
+            pulls,
+            "the offer pulls nothing"
+        );
+    }
+
+    /// An aggregation that is not terminal yields no value and releases nothing.
+    #[test]
+    fn a_partial_aggregation_extracts_nothing() {
+        let source = source(0..10);
+        let mut sum = sum_over(&source);
+        sum.consume_impl(keys_between(0, 3));
+        let mut extract = extract_over_input(Box::new(sum));
+        extract.consume_impl(sum_tiling().universal_guard());
+        assert_eq!(
+            scalar_of(&extract.get(scalar_tiling().universal_guard())),
+            None
+        );
+        assert!(!extract.input.obsolete_guard().is_universal());
+    }
+
+    /// A pipeline does not finalize over an aggregation that is not terminal.
+    #[test]
+    #[should_panic(expected = "finalizes after its input has stated everything complete")]
+    fn finalize_over_a_partial_aggregation_panics() {
+        let source = source(0..10);
+        let mut sum = sum_over(&source);
+        sum.consume_impl(keys_between(0, 3));
+        let mut extract = extract_over_input(Box::new(sum));
+        extract.consume_impl(sum_tiling().universal_guard());
+        extract.finalize();
+    }
+
+    /// Once the value is extracted, a second consume pulls nothing.
+    #[test]
+    fn a_second_consume_after_extraction_pulls_nothing() {
+        let source = source(0..4);
+        let mut extract = extract_over(&source);
+        extract.consume_impl(sum_tiling().universal_guard());
+        let pulls = (extract.input.base().pulls, source.borrow().pulled.len());
+        extract.consume_impl(sum_tiling().universal_guard());
+        assert_eq!(
+            (extract.input.base().pulls, source.borrow().pulled.len()),
+            pulls
+        );
+    }
+
+    /// A released output is not extracted again either: the input is not pulled.
+    #[test]
+    fn an_extraction_after_a_release_pulls_nothing() {
+        let source = source(0..4);
+        let mut extract = extract_over(&source);
+        extract.consume_impl(sum_tiling().universal_guard());
+        extract.release(scalar_tiling().universal_guard());
+        let pulls = extract.input.base().pulls;
+        extract.consume_impl(sum_tiling().universal_guard());
+        assert_eq!(extract.input.base().pulls, pulls);
+    }
+
+    /// `Nothing` consumed pulls nothing.
+    #[test]
+    fn an_extraction_of_nothing_pulls_nothing() {
+        let source = source(0..10);
+        let mut extract = extract_over(&source);
+        extract.consume_impl(sum_tiling().empty_guard());
+        assert!(source.borrow().pulled.is_empty());
+        assert_eq!(
+            extract.input.base().pulls,
+            0,
+            "the input is not pulled either"
+        );
+    }
+
+    /// Releasing the extracted value leaves nothing held.
+    #[test]
+    fn finalize_after_a_release_holds_nothing_extracted() {
+        let source = source(0..4);
+        let mut extract = extract_over(&source);
+        extract.consume_impl(sum_tiling().universal_guard());
+        extract.release(scalar_tiling().universal_guard());
+        assert_eq!(extract.finalize(), scalar_tiling().empty_guard());
+        assert_eq!(
+            scalar_of(&extract.get(scalar_tiling().universal_guard())),
+            None
+        );
+    }
+
+    /// An aggregation that is not terminal yields nothing and is not released; the next consume,
+    /// once the input has closed, extracts the sum and releases the aggregation whole.
+    #[test]
+    fn a_partial_then_terminal_aggregation_is_extracted_once_terminal() {
+        let source = growing_source(0..4);
+        let mut extract = extract_over(&source);
+        extract.consume_impl(sum_tiling().universal_guard());
+        assert_eq!(
+            scalar_of(&extract.get(scalar_tiling().universal_guard())),
+            None
+        );
+        assert!(
+            extract.input.obsolete_guard().is_empty(),
+            "nothing is released"
+        );
+
+        source.borrow_mut().closed = true;
+        extract.consume_impl(sum_tiling().universal_guard());
+        assert_eq!(
+            scalar_of(&extract.get(scalar_tiling().universal_guard())),
+            Some(sum_of(0..4))
+        );
+        assert!(extract.input.obsolete_guard().is_universal());
+    }
+
+    /// A consuming extraction and one in pull mode over the same growing script answer alike at
+    /// every consume. The model: the sum the first consume after the close extracts.
+    struct ExtractRun {
+        sut: ExtractAggregateProducer,
+        sut_source: Shared,
+        twin: ExtractAggregateProducer,
+        twin_source: Shared,
+        input: InputModel,
+        taken: Option<i64>,
+        released: bool,
+        trace: String,
+    }
+
+    impl ExtractRun {
+        fn new(initial: &[u64], trace: String) -> Self {
+            let (sut_source, twin_source) = (
+                growing_source(initial.iter().copied()),
+                growing_source(initial.iter().copied()),
+            );
+            Self {
+                sut: extract_over(&sut_source),
+                sut_source,
+                twin: extract_over(&twin_source),
+                twin_source,
+                input: InputModel::new(initial),
+                taken: None,
+                released: false,
+                trace,
+            }
+        }
+
+        fn apply(&mut self, step: Step) {
+            self.trace.push_str(&format!(" {step:?}"));
+            match step {
+                Add(key) => {
+                    if self.input.add(key) {
+                        for source in [&self.sut_source, &self.twin_source] {
+                            source.borrow_mut().rows.insert(key, value(key));
+                        }
+                    }
+                }
+                Close => {
+                    self.input.closed = true;
+                    for source in [&self.sut_source, &self.twin_source] {
+                        source.borrow_mut().closed = true;
+                    }
+                }
+                Notify(_) => unreachable!("an extraction listens to no region"),
+                // An aggregation has no keys: a consume and a release name all of it.
+                Consume(_) => {
+                    self.sut.consume_impl(sum_tiling().universal_guard());
+                    let lazy = self.twin.get(scalar_tiling().universal_guard());
+                    let offered = self.sut.get(scalar_tiling().universal_guard());
+                    assert_eq!(
+                        offered, lazy,
+                        "{}: the offer is the answer in pull mode",
+                        self.trace
+                    );
+                    // The aggregation is terminal once the input has closed, and the first
+                    // consume then reads every row there is.
+                    if self.taken.is_none() && !self.released && self.input.closed {
+                        self.taken = Some(sum_of(self.input.rows.iter().copied()));
+                    }
+                }
+                Release(_) => {
+                    self.sut.release(scalar_tiling().universal_guard());
+                    self.twin.release(scalar_tiling().universal_guard());
+                    self.released = true;
+                }
+            }
+        }
+
+        fn check(&mut self) {
+            let trace = &self.trace;
+            let expected = match self.released {
+                true => None,
+                false => self.taken,
+            };
+            // A pull before the first consume is a pull in pull mode, which reads the input.
+            if self.sut.consuming {
+                assert_eq!(
+                    scalar_of(&self.sut.get(scalar_tiling().universal_guard())),
+                    expected,
+                    "{trace}: the extracted value"
+                );
+            }
+            if self.taken.is_some() || self.released {
+                let guard = match self.released {
+                    true => scalar_tiling().empty_guard(),
+                    false => scalar_tiling().universal_guard(),
+                };
+                assert_eq!(self.sut.finalize(), guard, "{trace}: finalize");
+            }
+        }
+
+        fn run(steps: &[Step], initial: &[u64]) {
+            let mut run = ExtractRun::new(initial, format!("initial {initial:?} steps"));
+            for step in steps {
+                run.apply(*step);
+                run.check();
+            }
+        }
+    }
+
+    #[test]
+    fn enumerated_extraction_interleavings_keep_the_model() {
+        let sequences: &[&[Step]] = &[
+            &[Consume(All), Close, Consume(All)],
+            &[Add(8), Consume(All), Add(9), Close, Consume(All)],
+            &[Close, Consume(All), Release(All), Consume(All), Add(3)],
+            &[Release(All), Add(3), Close, Consume(All)],
+            &[
+                Add(1),
+                Add(2),
+                Consume(All),
+                Release(All),
+                Close,
+                Consume(All),
+            ],
+        ];
+        for steps in sequences {
+            ExtractRun::run(steps, &[0, 4, 5]);
+        }
+    }
+
+    #[test]
+    fn random_extraction_interleavings_keep_the_model() {
+        const SEED: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut rng = Rng(SEED);
+        for iteration in 0..300 {
+            let initial: Vec<u64> = (0..KEYS).filter(|_| rng.below(2) == 0).collect();
+            let trace = format!("seed {SEED:#x} iteration {iteration} initial {initial:?} steps");
+            let mut run = ExtractRun::new(&initial, trace);
+            for _ in 0..10 {
+                let step = match rng.step_among(&BTreeSet::new(), false) {
+                    Consume(_) => Consume(All),
+                    Release(_) => Release(All),
+                    other => other,
+                };
+                run.apply(step);
+                run.check();
+            }
+        }
     }
 }
