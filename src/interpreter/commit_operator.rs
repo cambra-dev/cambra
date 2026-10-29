@@ -2915,20 +2915,27 @@ impl TileProducer for InductionStoreProducer {
         // decode as a decision, so a terminal stream with an undecodable row and decisions
         // past it would close the frontier early and drop them without a sound. The check
         // reads paths, since an inner position repeats across rows; `decided_paths` is in
-        // drive order, so the first past the cursor is the lowest. It re-reads every
-        // decision, so it is compiled only where the assertion is.
-        #[cfg(debug_assertions)]
-        {
+        // drive order, so the first past the cursor is the lowest.
+        //
+        // A terminal body whose every decision this store has stepped offers nothing more, so
+        // it is released whole rather than through the decided path alone: a position its
+        // source filtered out was never decided, and a decided-path release never names it. A
+        // body released whole answers nothing, so neither the scan nor the release runs again.
+        if body_tile.is_terminal() && !self.body_producer.obsolete_guard().is_universal() {
             let through = self.decided_path();
             let undecided = decided_paths(&body_tile)
                 .into_iter()
                 .map(|(path, _)| path)
                 .find(|path| through.as_ref().is_none_or(|d| path > d));
             debug_assert!(
-                !body_tile.is_terminal() || undecided.is_none(),
+                undecided.is_none(),
                 "induction store: the body's decision stream is terminal but still decides \
                  {undecided:?}, past the watermark {through:?}"
             );
+            if undecided.is_none() {
+                self.body_producer
+                    .release(self.body_producer.tiling().universal_guard());
+            }
         }
         // A nested store's rows open as they are decided and release their seeds as they
         // go (`release_seeds_through`); the rest go once the body is done, since a row that

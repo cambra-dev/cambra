@@ -57,6 +57,7 @@ mod growing;
 mod helpers;
 mod iterate;
 mod lookup;
+mod loop_breaker;
 #[cfg(test)]
 mod loop_breaker_tests;
 mod map;
@@ -73,6 +74,7 @@ pub use fanout::*;
 pub use helpers::*;
 pub use iterate::*;
 pub use lookup::*;
+pub use loop_breaker::*;
 pub use map::*;
 pub use reshape::*;
 pub use scalar::*;

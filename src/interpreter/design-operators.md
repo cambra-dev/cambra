@@ -882,13 +882,22 @@ pushing breaker's tiling, so a package fits only a parent whose breaker's input 
 and `run` asserts that in a debug build.
 
 `dispatcher::finalize` finishes a pipeline's oldest unfinished epoch. It asserts six invariants
-before it calls the breaker: the pipeline has not finished the epoch, its queue there is closed and
-empty, the pipeline it reads has finished the epoch, the epoch is sealed or known to be the last,
-and its breaker's input has released every guard the pipeline consumed in the epoch. A source's
-input releases the regions queued for it; a parent pipeline's input releases only what the guards
-pushed to it name, and nothing at all when the pipeline it reads pushed nothing. A debug build also
-asserts that the morsels of a pushed guard partition it (`partition_gap`) and that a pipeline
-consumes each region once in an epoch.
+before it calls the breaker: the pipeline has not begun to finish the epoch, its queue there is
+closed and empty, no package claimed for it there is in flight, the pipeline it reads has finished
+the epoch, the epoch is sealed or known to be the last, and its breaker's input has released every
+guard the pipeline consumed in the epoch. A source's input releases the regions queued for it; a
+parent pipeline's input releases only what the guards pushed to it name, and nothing at all when the
+pipeline it reads pushed nothing. A debug build also asserts that the morsels of a pushed guard
+partition it (`partition_gap`), and that a pipeline consumes each region once in an epoch: a guard
+pushed to a pipeline meets none pushed to it before.
+
+The dispatcher reads a breaker's input through `input_tiling` and `input_released`, the tiling a
+package's guard is a guard of and the guard the breaker has released of its input, so a breaker
+whose input sits inside a shared cell can answer both.
+
+A dispatcher run delivers no wake-up queued on the scheduler. A breaker's parent learns of what it
+holds through the push, and a producer's notifications queue on the scheduler as in pull mode
+(`WakeupQueue`), to be delivered by a scheduler that pulls the program afterwards.
 
 Nothing calls the dispatcher or the breakers' methods outside unit tests: no scheduler runs
 pipelines, and how a driver reaches a breaker from a program's roots is not decided.
@@ -924,6 +933,35 @@ in any order, except that its last epoch finishes after every earlier one: there
 `finalize` runs, its last call, and every other epoch pushes through `push_final`. An ordered
 pipeline runs its epochs one after another: it has at most one package in flight, takes it from the
 oldest epoch it has not finished, and finishes each epoch after the one before.
+
+### A loop as a breaker
+
+`LoopBreaker` (`tile_operators/loop_breaker.rs`) is the breaker of an induction loop's pipeline. It
+holds the cyclic `FanOut` over the loop's store and a reader slot of it, and adds no rule to the
+fan-out. The fan-out owns the store, keeps the snapshot the loop's recurrence reads, and takes the
+store out for the length of a pull, so a step has to go through it: a breaker holding the store
+directly would re-enter it through the recurrence's pull. The operators inside the loop stay in pull
+mode, and the whole cycle is one pipeline. Its morsels are positions of the loop's iteration, which
+the dispatcher consumes in order (`Dispatcher::order`).
+
+`consume_impl` calls `FanOut::step` until the store has decided the morsel's highest position, or
+until the store is terminal for a morsel whose right end has no bound. A guard that is not a run of
+positions is refused. A step that leaves the store's frontier where it was, short of terminal,
+panics as a stalled loop. `held` is the positions the store has decided, and everything once it is
+terminal. `finalize` asserts the store is terminal, since nothing steps the loop after it, and
+pushes that guard. The breaker's input is the store's body, the decision stream, whose tiling and
+release it reads through the fan-out's producer.
+
+A store whose body is terminal and has decided every decision it offered releases the body whole, in
+pull mode as in a run. A release through the decided positions alone never names a position the
+loop's source filtered out, so the dispatcher's check that a source pipeline's input was released
+whole would not hold.
+
+A loop's readers stay outside the dispatcher: a `StoreFinalRead` answers one scalar, whose tiling
+the guard the store pushes does not fit, so the program's own readers are pulled by a scheduler
+after the run and learn of the terminal store from its queued notification. Open: a reader of a loop
+as a parent pipeline, a loop seeded by another loop, morsels over positions a filter removes, which
+the drive does not bound, and nested loops, whose store is one per enclosing row.
 
 ## Tile Operators
 
