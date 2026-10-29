@@ -189,11 +189,10 @@ impl TileOperator for RecordWrap {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        let input = self.input.subscribe(
-            self.input.tiling().universal_guard(),
-            widening(consumer),
-            scheduler,
-        );
+        // The input is pulled at the projection.
+        let input =
+            self.input
+                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
         Box::new(RecordWrapProducer {
             base: ProducerBase::new(
                 RecordWrapProducer::alloc_id(),
@@ -286,7 +285,8 @@ impl TileOperator for Zip {
             inputs: self
                 .inputs
                 .iter_mut()
-                .map(|i| subscribe_forwarding(&mut **i, &shared, scheduler))
+                // Every arm is pulled at the projection: the arms share the pair's keys.
+                .map(|i| subscribe_forwarding_keeping_keys(&mut **i, &shared, scheduler))
                 .collect(),
         })
     }
@@ -937,12 +937,14 @@ impl TileOperator for SelectField {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        // A stream of records is pulled at the projection; a product of collections is read whole.
+        let keeps_keys = self.input.tiling().is_data_function();
         // An intent may only widen on its way upstream, so the input is asked for all of
         // it. [`guard_at_field`] narrows, which is sound for a release and not here.
         let input_tiling = self.input.tiling().clone();
         let input_producer = self.input.subscribe(
             input_tiling.universal_guard(),
-            widening(consumer),
+            consumer_keeping_keys_if(keeps_keys, consumer),
             scheduler,
         );
         Box::new(SelectFieldProducer {

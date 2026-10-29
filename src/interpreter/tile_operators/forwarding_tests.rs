@@ -3,6 +3,8 @@
 //! at the projection, and `Everything` where it re-keys or reads the input whole.
 //! See `src/interpreter/design-operators.md`, "The notification contract".
 
+use smol_str::SmolStr;
+
 use super::test_helpers::{InputConsumer, NotifyingOp, RegionLog, keys_between, notify_input};
 use super::*;
 use crate::interpreter::{BaseType, CurryLevel, Extent, Projection, Scheduler, Tiling};
@@ -65,6 +67,22 @@ fn assert_keeps_without_state(build: &dyn Fn() -> Built, notified: usize) {
     );
 }
 
+fn record_wrap() -> Built {
+    let (input, consumer) = feed(ints());
+    let op = RecordWrap::new_at(SmolStr::new("a"), input, CurryLevel::new(1));
+    (Box::new(op), vec![consumer])
+}
+
+#[test]
+fn record_wrap_forwards_its_inputs_region() {
+    assert_keeps(&record_wrap, 0);
+}
+
+#[test]
+fn record_wrap_carries_no_region_between_notifications() {
+    assert_keeps_without_state(&record_wrap, 0);
+}
+
 fn map_result_with_source() -> Built {
     use crate::interpreter::TestDataSource;
     use std::{cell::RefCell, rc::Rc};
@@ -91,6 +109,28 @@ fn map_result_with_source_carries_no_region_between_notifications() {
 
 fn nested() -> Tiling {
     Tiling::data_function(Extent::uint_range(8), ints())
+}
+
+fn zip() -> Built {
+    let (a, first) = feed(ints());
+    let (b, second) = feed(ints());
+    let op = Zip::new_at(
+        vec![SmolStr::new("_0"), SmolStr::new("_1")],
+        vec![a, b],
+        CurryLevel::new(1),
+    );
+    (Box::new(op), vec![first, second])
+}
+
+#[test]
+fn zip_forwards_the_region_of_its_first_arm() {
+    assert_keeps(&zip, 0);
+}
+
+#[test]
+fn zip_forwards_the_region_of_its_second_arm_without_state() {
+    assert_keeps(&zip, 1);
+    assert_keeps_without_state(&zip, 1);
 }
 
 fn int() -> Extent {
@@ -139,4 +179,137 @@ fn map_result_to_const_sends_everything_for_its_constant() {
 #[test]
 fn map_result_to_const_at_the_outermost_level_sends_everything_for_its_inputs_region() {
     assert_widens(&|| map_result_to_const(CurryLevel::OUTERMOST), 0);
+}
+
+fn select_field(input: Tiling) -> Built {
+    let (input, consumer) = feed(input);
+    (Box::new(SelectField::new(input, "a")), vec![consumer])
+}
+
+fn a_stream_of_records() -> Built {
+    select_field(Tiling::data_function(
+        Extent::uint_range(8),
+        Tiling::Record(
+            [(SmolStr::new("a"), Tiling::Scalar(int()))]
+                .into_iter()
+                .collect(),
+        ),
+    ))
+}
+
+#[test]
+fn select_field_forwards_the_region_of_a_stream_of_records() {
+    assert_keeps(&a_stream_of_records, 0);
+    assert_keeps_without_state(&a_stream_of_records, 0);
+}
+
+/// A product of collections is read whole and its field cut, so a region of one collection's keys
+/// is not a region of the field's.
+#[test]
+fn select_field_over_a_product_of_collections_sends_everything() {
+    let product = || {
+        select_field(Tiling::Record(
+            [(SmolStr::new("a"), ints())].into_iter().collect(),
+        ))
+    };
+    assert_widens(&product, 0);
+}
+
+fn variant_wrap(input: Tiling, level: CurryLevel) -> Built {
+    let (input, consumer) = feed(input);
+    let wrap = VariantWrap::new_at(
+        input,
+        crate::ccl::FieldKey::Index(0),
+        crate::ccl::TagMap::from_arms(vec![(crate::ccl::FieldKey::Index(0), int())]),
+        level,
+    );
+    (Box::new(wrap), vec![consumer])
+}
+
+fn wrapped_stream() -> Built {
+    variant_wrap(ints(), CurryLevel::new(1))
+}
+
+#[test]
+fn variant_wrap_forwards_the_region_of_a_stream() {
+    assert_keeps(&wrapped_stream, 0);
+    assert_keeps_without_state(&wrapped_stream, 0);
+}
+
+/// At the outermost level the payload becomes one union value, which has no keys.
+#[test]
+fn variant_wrap_at_the_outermost_level_sends_everything() {
+    assert_widens(
+        &|| variant_wrap(Tiling::Scalar(int()), CurryLevel::OUTERMOST),
+        0,
+    );
+}
+
+fn union_extent() -> Extent {
+    Extent::Union(crate::ccl::TagMap::from_arms(vec![(
+        crate::ccl::FieldKey::Index(0),
+        int(),
+    )]))
+}
+
+fn union_stream() -> Tiling {
+    Tiling::data_function(Extent::uint_range(8), Tiling::Scalar(union_extent()))
+}
+
+fn variant_project(input: Tiling) -> Built {
+    let (input, consumer) = feed(input);
+    let op = VariantProject::new(input, crate::ccl::FieldKey::Index(0), int());
+    (Box::new(op), vec![consumer])
+}
+
+#[test]
+fn variant_project_forwards_the_region_of_a_stream() {
+    assert_keeps(&|| variant_project(union_stream()), 0);
+    assert_keeps_without_state(&|| variant_project(union_stream()), 0);
+}
+
+/// A bare union has no keys of its own.
+#[test]
+fn variant_project_over_a_bare_union_sends_everything() {
+    assert_widens(&|| variant_project(Tiling::Scalar(union_extent())), 0);
+}
+
+fn variant_is(input: Tiling) -> Built {
+    let (input, consumer) = feed(input);
+    let op = VariantIs::new(input, crate::ccl::FieldKey::Index(0));
+    (Box::new(op), vec![consumer])
+}
+
+#[test]
+fn variant_is_forwards_the_region_of_a_stream() {
+    assert_keeps(&|| variant_is(union_stream()), 0);
+    assert_keeps_without_state(&|| variant_is(union_stream()), 0);
+}
+
+/// A bare union has no keys of its own.
+#[test]
+fn variant_is_over_a_bare_union_sends_everything() {
+    assert_widens(&|| variant_is(Tiling::Scalar(union_extent())), 0);
+}
+
+fn make_record() -> Built {
+    let (a, first) = feed(ints());
+    let (b, second) = feed(ints());
+    let op = MakeRecord::new(vec![a, b]);
+    (Box::new(op), vec![first, second])
+}
+
+/// A record of values has no keys of its own.
+#[test]
+fn make_record_sends_everything_for_a_region_of_either_field() {
+    assert_widens(&make_record, 0);
+    assert_widens(&make_record, 1);
+}
+
+#[test]
+fn make_record_sends_everything_for_a_later_region() {
+    assert_eq!(
+        received(&make_record, 1, &another_region()),
+        [Projection::Everything]
+    );
 }
