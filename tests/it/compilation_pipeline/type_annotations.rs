@@ -2139,5 +2139,48 @@ x = Option::some(1)
 x!
         "#},
         "found '!', expected binary operator",
+/// TODO Fails in later-phase SMT check because SMT encoding does not
+/// cover point-free syntax.
+#[test]
+fn proven_lookup_1() {
+    check_compile_error(
+        indoc! {r#"
+c = [1,2,3]
+c[1] == 2
+        "#},
+        "post-planning produced an invalid tree: [Type mismatch for Apply: expected 0..3, found {Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)}]",
+    )
+}
+
+/// The codomain of `c` has `Int@1`, `Int@2`, and `Int@3` as lower
+/// bounds. Each is checked against the domain of `c` for the lookup
+/// `c[k]` during type inference, and the check against `Int@3`
+/// specifically fails.
+#[test]
+fn proven_lookup_2() {
+    check_compile_error(
+        indoc! {r#"
+c = [1,2,3]
+k = c[1]
+c[k] == 3
+        "#},
+        "expected 0..3, found Int@3",
+    )
+}
+
+/// The codomain of `c` has `Int@1`, `Int@2`, and `Int@2` as lower
+/// bounds. Each is checked against the domain of `c` for the lookup
+/// `c[k]` during type inference, and they all pass, so inference
+/// passes. However, the codomain type of `c` is settled as simply
+/// `Int`. And so the check after inference fails.
+#[test]
+fn proven_lookup_3() {
+    check_compile_error(
+        indoc! {r#"
+c = [1,2,2]
+k = c[1]
+c[k] == 3
+        "#},
+        "post-inference produced an invalid tree: [Type mismatch for Apply: expected 0..3, found Int]",
     )
 }

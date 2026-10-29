@@ -118,26 +118,15 @@ pub enum Sort {
 }
 
 impl Sort {
-    /// Declare a constant of the given sort, and assert any relevant
-    /// constraint (such as that the constant is `>= 0`, for a
-    /// `UInt`).
+    /// Declare a constant of the given sort, and assert its
+    /// [`constraint`](Self::constraint).
     fn declare(self, sym: String, ctx: &mut Context) -> Result<(), SmtError> {
         let sym_atom = ctx.atom(sym.clone());
-        let zero = || ctx.numeral(0);
-        let non_neg = |x: SExpr| ctx.gte(x, zero());
-        let lt = |x: SExpr, y: u64| ctx.lt(x, ctx.numeral(y));
-        let (sort_atom, constraint) = match self {
-            Self::Bool => (ctx.bool_sort(), None),
-            Self::Int => (ctx.int_sort(), None),
-            Self::UInt => {
-                let c = non_neg(sym_atom);
-                (ctx.int_sort(), Some(c))
-            }
-            Self::UIntRange(n) => {
-                let c = ctx.and(non_neg(sym_atom), lt(sym_atom, n));
-                (ctx.int_sort(), Some(c))
-            }
-            Self::Named(s) => (ctx.atom(s), None),
+        let constraint = self.constraint(sym_atom, ctx);
+        let sort_atom = match self {
+            Self::Bool => ctx.bool_sort(),
+            Self::Int | Self::UInt | Self::UIntRange(_) => ctx.int_sort(),
+            Self::Named(s) => ctx.atom(s),
         };
         ctx.declare_const(sym, sort_atom)
             .map_err(exchange_failure)?;
@@ -146,6 +135,28 @@ impl Sort {
         }
         Ok(())
     }
+
+    /// What `x` satisfies when it is a value of this sort's Cambra type, beyond
+    /// the SMT sort it is declared at: `x >= 0` for a `UInt`, `0 <= x < n` for a
+    /// `UIntRange(n)`, and nothing for a sort whose SMT sort is exact.
+    fn constraint(&self, x: SExpr, ctx: &Context) -> Option<SExpr> {
+        let non_neg = ctx.gte(x, ctx.numeral(0));
+        match self {
+            Self::Bool | Self::Int | Self::Named(_) => None,
+            Self::UInt => Some(non_neg),
+            Self::UIntRange(n) => Some(ctx.and(non_neg, ctx.lt(x, ctx.numeral(*n)))),
+        }
+    }
+}
+
+/// What a query asks the antecedent to entail.
+#[derive(Clone, Copy)]
+enum Demand<'r> {
+    /// Every refinement in the slice, stated about the query's subject.
+    Refinements(&'r [Refinement]),
+    /// That the query's subject is a value of the sort's Cambra type: the sort's
+    /// [`constraint`](Sort::constraint), stated about the subject.
+    Member(&'r Sort),
 }
 
 /// The lexical scope a solver query runs in — the `Γ` of `Γ ⊢ ⋀lhs ⇒ ⋀rhs`.
@@ -310,7 +321,21 @@ pub fn smt_sub(
     if rhs.is_empty() {
         return Ok(true);
     }
-    with_solver(|ctx| check(ctx, base, lhs, rhs, scope))
+    with_solver(|ctx| check(ctx, base, lhs, Demand::Refinements(rhs), scope))
+}
+
+/// Whether every value of `base` satisfying all of `lhs` lies in `0..n`: the
+/// query `∀ __elem. ⋀lhs ⇒ 0 <= __elem < n`, with `scope` read as in [`smt_sub`].
+///
+/// `base` must have a scalar sort, since the demand is stated about the subject
+/// as a whole.
+pub fn smt_sub_range(
+    base: &Type,
+    lhs: &[Refinement],
+    n: u64,
+    scope: &dyn ScopeEnv,
+) -> Result<bool, SmtError> {
+    with_solver(|ctx| check(ctx, base, lhs, Demand::Member(&Sort::UIntRange(n)), scope))
 }
 
 /// One query: build it, then run it inside a `push`/`pop` scope so the constants
@@ -319,13 +344,13 @@ fn check(
     ctx: &mut Context,
     base: &Type,
     lhs: &[Refinement],
-    rhs: &[Refinement],
+    demand: Demand<'_>,
     scope: &dyn ScopeEnv,
 ) -> Result<bool, SmtError> {
     // Encoding is pure and can bail; bailing before the `push` leaves no scope to
     // unwind.
     let mut enc = Encode::new(ctx, scope, base);
-    let formula = enc.query(lhs, rhs)?;
+    let formula = enc.query(lhs, demand)?;
     let decls = enc.decls;
 
     ctx.push().map_err(exchange_failure)?;
@@ -421,11 +446,23 @@ impl<'a> Encode<'a> {
         }
     }
 
-    /// `⋀Γ ∧ ⋀lhs ∧ ¬⋀rhs` — unsatisfiable exactly when the entailment holds.
-    fn query(&mut self, lhs: &[Refinement], rhs: &[Refinement]) -> Result<SExpr, SmtError> {
+    /// `⋀Γ ∧ ⋀lhs ∧ ¬demand` — unsatisfiable exactly when the entailment holds.
+    fn query(&mut self, lhs: &[Refinement], demand: Demand<'_>) -> Result<SExpr, SmtError> {
+        let rhs = match demand {
+            Demand::Refinements(rhs) => rhs,
+            Demand::Member(_) => &[],
+        };
         self.declare_subject(lhs, rhs)?;
         let mut conjuncts = self.conjuncts(lhs)?;
-        let goals = self.conjuncts(rhs)?;
+        let goals = match demand {
+            Demand::Refinements(rhs) => self.conjuncts(rhs)?,
+            Demand::Member(sort) => {
+                let subject = *self.vars.get(&Path::subject()).expect(
+                    "a membership demand is asked of a scalar base, which declares the subject",
+                );
+                sort.constraint(subject, self.ctx).into_iter().collect()
+            }
+        };
         let goal = self.ctx.not(self.ctx.and_many(goals));
         // Gathered after both sides are translated: `Γ` covers a binder first met
         // in the goal as much as one the antecedent mentions.
@@ -845,6 +882,27 @@ mod tests {
         let rhs = [elem_cmp(CompareKind::Equals, add(lit(1), lit(5)))];
         assert!(!smt_sub(&int(), &lhs, &rhs, &NoScope).unwrap());
         assert!(!smt_sub(&int(), &rhs, &lhs, &NoScope).unwrap());
+    }
+
+    /// `0..n` excludes `n` and every negative value, and a refinement that leaves
+    /// either possible is outside it.
+    #[test]
+    fn range_membership_needs_both_bounds() {
+        let at = |n| [elem_cmp(CompareKind::Equals, lit(n))];
+        assert!(smt_sub_range(&int(), &at(0), 3, &NoScope).unwrap());
+        assert!(smt_sub_range(&int(), &at(2), 3, &NoScope).unwrap());
+        assert!(!smt_sub_range(&int(), &at(3), 3, &NoScope).unwrap());
+        assert!(!smt_sub_range(&int(), &at(-1), 3, &NoScope).unwrap());
+        assert!(!smt_sub_range(&int(), &at(0), 0, &NoScope).unwrap());
+        let below_three = [elem_cmp(CompareKind::Less, lit(3))];
+        assert!(!smt_sub_range(&int(), &below_three, 3, &NoScope).unwrap());
+        let between = [
+            elem_cmp(CompareKind::GreaterOrEq, lit(0)),
+            elem_cmp(CompareKind::Less, lit(3)),
+        ];
+        assert!(smt_sub_range(&int(), &between, 3, &NoScope).unwrap());
+        assert!(!smt_sub_range(&int(), &between, 2, &NoScope).unwrap());
+        assert!(!smt_sub_range(&int(), &[], 3, &NoScope).unwrap());
     }
 
     /// A singleton entails every bound it satisfies, and no bound it violates.

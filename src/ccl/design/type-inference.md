@@ -1533,7 +1533,11 @@ It computes the consumer predicates missing from the producer, then takes one of
 2. If the producer base is an inference variable, constrain it against the consumer base with the
    missing predicates attached. That variable can still acquire the required information.
 3. For a concrete producer with a deficit, use the caller's SMT policy. A structural-only caller
-   rejects; an SMT-enabled caller can establish entailment as described below.
+   rejects; an SMT-enabled caller can establish entailment as described below, then constrains
+   the peeled base types.
+
+Constraining the peeled bases is structural except for an `Int` producer and a `0..𝑛` consumer,
+which [A refined `Int` below a range](#a-refined-int-below-a-range) decides.
 
 An unrefined concrete type does not acquire an arbitrary predicate through subtyping. A successful
 semantic proof can establish a required predicate already implied by its type. `Cast` is instead
@@ -1569,6 +1573,23 @@ An unsupported predicate produces `SmtError::Encoding`. The subtype deficit rule
 outcome as a mismatch: failure to encode is not evidence of entailment. Other SMT errors reach
 `map_constrain_err`, which currently panics. `TODO(smt-undecided)` records a proposed change to
 some of that policy; it is not implemented error recovery.
+
+##### A refined `Int` below a range
+
+`{Int | 𝑆} <: 0..𝑛` holds when `⋀𝑆` entails `0 <= __elem < 𝑛`. The refinement arm of
+`constrain_go` decides it in place of the base edge `Int <: 0..𝑛`, which is a mismatch. The query
+is `smt_sub_range` in `infer/solver/smt.rs`, under the same `Γ`, encoding fragment, and error
+policy as `smt_sub`. Its goal is the constraint `Sort::UIntRange(𝑛)` asserts of a declared
+constant, so the range bound has one spelling.
+
+The rule applies in one direction. `0..𝑛 ⊀ Int`, and `0..𝑚 <: 0..𝑛` only when `𝑚 = 𝑛`. A bare
+`Int` has no predicate to prove the bound from, and a `SkipSmtScope` caller rejects the pair.
+
+It types a list subscript whose key carries a proof of its position: in `c = [1,2,3]`, `c[1]`
+applies `0..3 ⤇ Int` to a key typed `Int@1`. The post-planning checks decide the same edge
+structurally, because the key's predicate is point-free by then, and reject it. The kind lattice
+(`compact.rs`, `CompactTypeKind::merge`), the compact merge of an `Int` and a `UIntRange` bound,
+and the Lean model (`formal/CclFormal/Subtyping.lean`) still relate a range only to itself.
 
 ##### A product is reached through its fields
 

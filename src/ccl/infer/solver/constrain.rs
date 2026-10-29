@@ -23,8 +23,8 @@ use crate::ccl::infer_var::Origin;
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::{FunKind, KindPin, TypeKind};
 use crate::ccl::{
-    BarrierUpper, BarrierVar, BarrierVarId, Bound, HistoryKind, InferVar, InferVarId, Level, Name,
-    Refinement, RefinementSet, Type,
+    BarrierUpper, BarrierVar, BarrierVarId, BaseType, Bound, HistoryKind, InferVar, InferVarId,
+    Level, Name, Refinement, RefinementSet, Type,
 };
 
 use super::barrier::EdgeReport;
@@ -2027,9 +2027,48 @@ fn constrain_go_impl(
                 .filter(|(_, forced)| !lrefs_in_ambient.contains(forced))
                 .map(|(r, _)| r.clone())
                 .collect();
+            let mismatch = || ConstrainError::Mismatch {
+                lhs: Box::new(lhs.clone()),
+                rhs: Box::new(rhs.clone()),
+            };
+            // A predicate the encoder cannot read leaves the entailment undecided,
+            // and undecided is the answer structural matching already gave: a
+            // mismatch. Reporting the encoder's limit instead would turn an ill-typed
+            // program's diagnostic into a note about this module.
+            let entailed = |answer: Result<bool, SmtError>| match answer {
+                Ok(holds) => Ok(holds),
+                Err(SmtError::Encoding { .. }) => Ok(false),
+                Err(error) => Err(ConstrainError::SmtError {
+                    lhs: Box::new(lhs.clone()),
+                    rhs: Box::new(rhs.clone()),
+                    error: Box::new(error),
+                }),
+            };
+            // The base edge, once the refinements are settled. A refined `Int` is below
+            // `0..n` when its refinements entail `0 <= __elem < n`, so that pair is a
+            // solver query over the lhs refinements rather than the leaf mismatch
+            // `constrain_go` gives a bare `Int` and a range
+            // (`src/ccl/design/type-inference.md`, "A refined `Int` below a range").
+            let bases = |cache: &mut ConstrainCache| match (lbase, rbase) {
+                (Type::Base(BaseType::Int), Type::UIntRange(n)) => {
+                    if !scope.is_skip_smt()
+                        && entailed(super::smt::smt_sub_range(
+                            lbase,
+                            &lrefs_in_ambient,
+                            *n,
+                            scope,
+                        ))?
+                    {
+                        Ok(())
+                    } else {
+                        Err(mismatch())
+                    }
+                }
+                _ => constrain_go(lbase, rbase, sl, sr, cache, scope),
+            };
             if deficit.is_empty() {
                 // lhs's explicit layers already supply every refinement rhs requires.
-                constrain_go(lbase, rbase, sl, sr, cache, scope)
+                bases(cache)
             } else if matches!(lbase, Type::Infer(_)) {
                 // Variable base: flow the deficit onto it (`b₁ <: {b₂ | deficit}`)
                 // rather than rejecting; it fails later iff the variable
@@ -2037,30 +2076,16 @@ fn constrain_go_impl(
                 let demanded = Type::refined(rbase.clone(), deficit);
                 constrain_go(lbase, &demanded, sl, sr, cache, scope)
             } else if scope.is_skip_smt() {
-                Err(ConstrainError::Mismatch {
-                    lhs: Box::new(lhs.clone()),
-                    rhs: Box::new(rhs.clone()),
-                })
-            } else if super::smt::smt_sub(lbase, &lrefs_in_ambient, &rrefs_in_ambient, scope)
-                .or_else(|error| match error {
-                    // A predicate the encoder cannot read leaves the deficit undecided,
-                    // and undecided is the answer structural matching already gave:
-                    // a mismatch. Reporting the encoder's limit instead would turn an
-                    // ill-typed program's diagnostic into a note about this module.
-                    SmtError::Encoding { .. } => Ok(false),
-                    error => Err(ConstrainError::SmtError {
-                        lhs: Box::new(lhs.clone()),
-                        rhs: Box::new(rhs.clone()),
-                        error: Box::new(error),
-                    }),
-                })?
-            {
-                constrain_go(lbase, rbase, sl, sr, cache, scope)
+                Err(mismatch())
+            } else if entailed(super::smt::smt_sub(
+                lbase,
+                &lrefs_in_ambient,
+                &rrefs_in_ambient,
+                scope,
+            ))? {
+                bases(cache)
             } else {
-                Err(ConstrainError::Mismatch {
-                    lhs: Box::new(lhs.clone()),
-                    rhs: Box::new(rhs.clone()),
-                })
+                Err(mismatch())
             }
         }
 
@@ -3789,6 +3814,58 @@ mod tests {
             constrain_subtype(&prim(BaseType::Int), &m, &mut cache),
             Err(ConstrainError::Mismatch { .. })
         ));
+    }
+
+    /// `{Int | __elem <op> n}`, typed as inference leaves it, so the solver can read it.
+    fn int_cmp(op: CompareKind, n: i64) -> Type {
+        let int = || Type::Base(BaseType::Int);
+        let pred = TypedExpr::binop(
+            TypedExpr::var(Name::elem()).with_ty(int()),
+            BinOpKind::Compare(op),
+            TypedExpr::lit(Lit::Int(n)).with_ty(int()),
+        )
+        .with_ty(Type::Base(BaseType::Bool));
+        Type::refined_one(int(), Refinement::born(Rc::new(pred)))
+    }
+
+    /// `{Int | 𝑝} <: 0..n` when `𝑝` entails `0 <= __elem < n`, and only then.
+    #[test]
+    fn refined_int_is_below_a_range_it_lies_in() {
+        let below = |lhs: &Type, rhs: &Type| {
+            constrain_subtype_in(
+                lhs,
+                rhs,
+                &mut ConstrainCache::new(),
+                &super::super::smt::NoScope,
+            )
+        };
+        let range = Type::UIntRange(3);
+        assert!(below(&int_cmp(CompareKind::Equals, 1), &range).is_ok());
+        assert!(matches!(
+            below(&int_cmp(CompareKind::Equals, 3), &range),
+            Err(ConstrainError::Mismatch { .. })
+        ));
+        assert!(matches!(
+            below(&int_cmp(CompareKind::Less, 3), &range),
+            Err(ConstrainError::Mismatch { .. })
+        ));
+        assert!(
+            below(&prim(BaseType::Int), &range).is_err(),
+            "a bare Int has nothing to prove the bound from"
+        );
+        assert!(
+            below(&range, &int_cmp(CompareKind::Less, 3)).is_err(),
+            "a range is not below an Int"
+        );
+        // Under `SkipSmtScope` nothing asks the solver, so the bound goes unproven.
+        assert!(
+            constrain_subtype(
+                &int_cmp(CompareKind::Equals, 1),
+                &range,
+                &mut ConstrainCache::new()
+            )
+            .is_err()
+        );
     }
 
     /// Build a refinement whose predicate is the **bare** `__elem > <rhs>` —
