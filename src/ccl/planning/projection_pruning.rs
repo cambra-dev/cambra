@@ -331,7 +331,7 @@ mod tests {
         Type::UIntRange(3)
     }
 
-    /// `source(s, paths)`: `[0, 3) ⤇ value`.
+    /// `source(s, paths)`: `0..3 ⤇ value`.
     fn source(paths: Vec<Vec<usize>>, value: Type) -> Expr {
         let paths = paths
             .into_iter()

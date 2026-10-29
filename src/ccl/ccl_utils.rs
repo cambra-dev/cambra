@@ -2228,7 +2228,7 @@ mod tests {
         debug_assert_no_iteration_markers_in_type(&ty);
     }
 
-    /// `{[0, 2] | __elem}` — a refined range. The predicate's content is irrelevant
+    /// `{0..3 | __elem}` — a refined range. The predicate's content is irrelevant
     /// here; only that the two sides carry *different* ones.
     fn refined(base: Type, tag: &str) -> Type {
         Type::refined_one(base, Refinement::born(Rc::new(Expr::var(Name::from(tag)))))

@@ -474,7 +474,7 @@ o"#,
 )]
 // A `mut` accumulator over a **filtered** source. `restrict` keeps an element at
 // its original position, so `kept`'s domain is the subset `{1, 2}` of the
-// extent `[0, 2]` — the recurrence runs over exactly those two positions and
+// extent `0..3` — the recurrence runs over exactly those two positions and
 // never over the filtered-out 0. The iteration ticks are the positions' (a
 // position `p` decides tick `p + 1`), so the changelog skips tick 1 the way the
 // domain skips position 0.

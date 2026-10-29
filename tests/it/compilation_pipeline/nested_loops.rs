@@ -1411,7 +1411,7 @@ fn a_long_nest_holds_the_same_store_state_at_any_length() {
     "#},
     indoc! {r#"
         let s : Int = 0
-        in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [1, 2] do let __hist : ((Int, Int) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, Int), [0, 1]) (s = .0) { [s]⇒[s] over iterate ▷ const ▷ strength_over ≫ (.1 ≫ [10, 20]) ▷ map do (writes: (s: (.1 ≫ .0, (.1 ≫ .1, .0 ≫ .0 ≫ .1) ▷ zip ≫ mul) ▷ zip ≫ add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) }
+        in let __hist : {s: (0..2 ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [1, 2] do let __hist : ((Int, Int) ⇒ {s: (0..2 ⤇ Int)}) = transact under ((Int, Int), 0..2) (s = .0) { [s]⇒[s] over iterate ▷ const ▷ strength_over ≫ (.1 ≫ [10, 20]) ▷ map do (writes: (s: (.1 ≫ .0, (.1 ≫ .1, .0 ≫ .0 ≫ .1) ▷ zip ≫ mul) ▷ zip ≫ add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) }
         in let s : ((Int, Int) ⇒ Int) = __hist ≫ .s ≫ final_read
         in (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) }
         in let s : Int = __hist.s ▷ final_read
@@ -1428,8 +1428,8 @@ fn a_long_nest_holds_the_same_store_state_at_any_length() {
     "#},
     indoc! {r#"
         let s : Int = 0
-        in let __hist : {s: ([0, 1] ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [[1, 2], [3, 4]] do let __hist : ((Int, ([0, 1] ⤇ Int)) ⇒ {s: ([0, 1] ⤇ Int)}) = transact under ((Int, ([0, 1] ⤇ Int)), [0, 1]) (s = .0) { [s]⇒[s] over .1 do .1 ≫ (writes: (s: add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) }
-        in let s : ((Int, ([0, 1] ⤇ Int)) ⇒ Int) = __hist ≫ .s ≫ final_read
+        in let __hist : {s: (0..2 ⤇ Int)} = transact (s = 0) { [s]⇒[s] over iterate ≫ [[1, 2], [3, 4]] do let __hist : ((Int, (0..2 ⤇ Int)) ⇒ {s: (0..2 ⤇ Int)}) = transact under ((Int, (0..2 ⤇ Int)), 0..2) (s = .0) { [s]⇒[s] over .1 do .1 ≫ (writes: (s: add) ▷ zip) ▷ zip ≫ variant_wrap(`commit) }
+        in let s : ((Int, (0..2 ⤇ Int)) ⇒ Int) = __hist ≫ .s ≫ final_read
         in (writes: (s: s) ▷ zip) ▷ zip ≫ variant_wrap(`commit) }
         in let s : Int = __hist.s ▷ final_read
         in s
@@ -1445,7 +1445,7 @@ fn a_long_nest_holds_the_same_store_state_at_any_length() {
     "},
     indoc! {"
         let total : Int = 0
-        in let __hist : {total: ([0, 2] ⤇ Int)} = transact (total = 0) { [total]⇒[total] over iterate ≫ [1, 2, 3] do ((.1, 1 ▷ const) ▷ zip ≫ gt) ▷ filter_values ≫ (writes: (total: ((.1, 1 ▷ const) ▷ zip ≫ gt) ▷ filter_values ≫ add ⊔ ((.1, 1 ▷ const) ▷ zip ≫ gt ≫ not_fn) ▷ filter_values ≫ .0) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ ((.1, 1 ▷ const) ▷ zip ≫ gt ≫ not_fn) ▷ filter_values ≫ `abort(unit) ▷ const }
+        in let __hist : {total: (0..3 ⤇ Int)} = transact (total = 0) { [total]⇒[total] over iterate ≫ [1, 2, 3] do ((.1, 1 ▷ const) ▷ zip ≫ gt) ▷ filter_values ≫ (writes: (total: ((.1, 1 ▷ const) ▷ zip ≫ gt) ▷ filter_values ≫ add ⊔ ((.1, 1 ▷ const) ▷ zip ≫ gt ≫ not_fn) ▷ filter_values ≫ .0) ▷ zip) ▷ zip ≫ variant_wrap(`commit) ⊔ ((.1, 1 ▷ const) ▷ zip ≫ gt ≫ not_fn) ▷ filter_values ≫ `abort(unit) ▷ const }
         in let total : Int = __hist.total ▷ final_read
         in total
     "}

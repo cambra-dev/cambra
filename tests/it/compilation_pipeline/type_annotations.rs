@@ -1422,8 +1422,8 @@ fn refined_add_in_a_comprehension_element_not_supported() {
 ys = [1 ^+ i for i in [1,2]]
 ys
         "#},
-        "((__iter_record: [0, 1]) ⤇ {Int | __elem == 1 ^+ (let __anf : ([0, 1] ⤇ Int) = [1, 2]
-in __iter_record ▷ __anf)}) vs ((__iter_record: [0, 1]) ⤇ \
+        "((__iter_record: 0..2) ⤇ {Int | __elem == 1 ^+ (let __anf : (0..2 ⤇ Int) = [1, 2]
+in __iter_record ▷ __anf)}) vs ((__iter_record: 0..2) ⤇ \
          {Int | __elem == 1 ^+ __iter_record ▷ ((id, [1, 2] ▷ const) ▷ zip ≫ apply)})",
     )
 }

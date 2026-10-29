@@ -717,11 +717,10 @@ mod tests {
 
     #[test]
     fn display_two_levels() {
-        // The whole rendering, not a substring: a `[` test passes on the range
-        // domain whichever way the brackets fall, which is how an unbalanced
-        // one survived here.
+        // The whole rendering, not a substring: a substring test passes with an
+        // unbalanced delimiter.
         let s = two_level(range(4), int(), bool_ext()).to_string();
-        assert_eq!(s, "Fn({[0, 3]} → Int → Bool)");
+        assert_eq!(s, "Fn(0..4 → Int → Bool)");
     }
 
     #[test]

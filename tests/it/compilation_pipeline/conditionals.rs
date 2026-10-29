@@ -360,10 +360,10 @@ n: Int = 3
 sum(box([1]) if n == 1 else box([2, 2]) if n == 2 else box([3, 3, 3]))",
     Value::Int(9)
 )]
-// **Repeated domain across branches.** `[1]` and `[2]` share domain `[0,1)`, so
-// the Σ has *two* candidates (`{[0,1), [0,2)}`) but the fan-out has *three*
+// **Repeated domain across branches.** `[1]` and `[2]` share domain `0..1`, so
+// the Σ has *two* candidates (`[0..1, 0..2]`) but the fan-out has *three*
 // legs. This is why leg↔candidate is a **surjection**: two legs realize the
-// shared `[0,1)` candidate, their gates partitioning "branch a or b was taken".
+// shared `0..1` candidate, their gates partitioning "branch a or b was taken".
 // A rule demanding one leg per candidate would reject it.
 #[case(
     r"
@@ -785,7 +785,7 @@ fn a_conditional_source_compiles_however_it_reaches_the_generator(
 /// The witness here is *not* determined, so nothing erases it: the sum has two or more
 /// candidates (or one candidate over two realized legs — the same-domain pair below), and the
 /// site's domain stays `{𝜎 | 𝑝}` with 𝜎 a real witness. The comprehension types as
-/// `Σ (𝜎 : [[0, 1], [0, 2]]). ({𝜎 | 𝑝} ⤇ Int)`, the restriction riding the witness exactly as
+/// `Σ (𝜎 : [0..2, 0..3]). ({𝜎 | 𝑝} ⤇ Int)`, the restriction riding the witness exactly as
 /// `src/ccl/design/type-inference.md`, "Consuming a sum: pinning the consumer's kind" says — a fact
 /// about whichever domain the witness turns out to name, which the site can do nothing with.
 ///
@@ -1380,7 +1380,7 @@ fn a_conditional_generator_beside_another(#[case] code: &str, #[case] expected: 
 ///
 /// The restriction rides the *product*: with one generator a consuming filter types as
 /// `Σ (σ : 𝐾). ({σ | 𝑝} ⤇ 𝑉)`, and with a second the site is indexed by a product, so the
-/// same filter lands on `{(σ, [0, 1]) | 𝑝}` — the witness one position of the domain rather
+/// same filter lands on `{(σ, 0..2) | 𝑝}` — the witness one position of the domain rather
 /// than the whole of it. Every rule that reads "the witness the domain names" therefore has
 /// to match a *mention*: reading only the whole makes the product case a different case,
 /// silently, at each place that does it.

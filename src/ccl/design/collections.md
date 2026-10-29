@@ -14,6 +14,19 @@ A witness is a binder whose candidate domains are classified by a `TypeKind`. Th
 rules are owned by [Subtyping for sums](type-inference.md#subtyping-for-sums); this document
 specifies how the collection constructors use them.
 
+## Index range notation
+
+`Type::UIntRange(n)` renders as `0..n`: the unsigned indices from zero up to, but not including,
+`n`. The empty domain is `0..0`, and the domain holding only zero is `0..1`. The rendering has no
+brackets, so a range domain never reads as a list literal: `0..3 ⤇ Int` is a collection of three
+integers, and `[0, 3]` is a two-element list. These are rendered types, not CHL expressions; a
+source annotation writes `Array(n, T)` for a collection over `0..n`.
+
+A runtime `Extent::UIntRange` renders in the same notation. Released indices can leave several
+intervals, rendered as `1..3 ∪ 5..8`. An interval holding `u64::MAX` renders with an inclusive
+endpoint, `start..=end`, because its exclusive endpoint does not fit in `u64`. Interval
+predicates (`src/interpreter/tiling/predicate.rs`) keep their bracket notation.
+
 ## The six collection types
 
 The annotation forms lower through `lower_type_application` in `lower/stmts.rs`:
@@ -400,8 +413,8 @@ c: Bool = True
 sum(box([1, 2]) if c else box([1, 2, 3]))
 ```
 
-The arms have domains `[0, 1]` and `[0, 2]`. The `Case` therefore has type
-`Σ (𝜎 : [[0, 1], [0, 2]]). 𝜎 ⤇ Int`, retaining the selected arm's domain; see
+The arms have domains `0..2` and `0..3`. The `Case` therefore has type
+`Σ (𝜎 : [0..2, 0..3]). 𝜎 ⤇ Int`, retaining the selected arm's domain; see
 [The domain join needs `box`](type-inference.md#the-domain-join-needs-box).
 
 `planning/conditionals.rs` realizes a conditional collection as a union of restricted arms,

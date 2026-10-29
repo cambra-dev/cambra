@@ -175,7 +175,7 @@
             }
           ],
           "rewritten": null,
-          "type": "([0, 1] ⤇ Int)",
+          "type": "(0..2 ⤇ Int)",
           "children": [
             {
               "id": 16,
@@ -248,7 +248,7 @@
             }
           ],
           "rewritten": null,
-          "type": "([0, 1] ⤇ Int)",
+          "type": "(0..2 ⤇ Int)",
           "children": [
             {
               "id": 1,
@@ -466,7 +466,7 @@
             "nature": "machinery",
             "label": "anf.hoist"
           },
-          "type": "([0, 1] ⤇ Int)",
+          "type": "(0..2 ⤇ Int)",
           "children": []
         },
         {
@@ -484,7 +484,7 @@
             "nature": "machinery",
             "label": "comprehension.generator"
           },
-          "type": "[0, 1]",
+          "type": "0..2",
           "children": []
         },
         {
@@ -630,7 +630,7 @@
             }
           ],
           "rewritten": null,
-          "type": "([0, 1] ⤇ Int)",
+          "type": "(0..2 ⤇ Int)",
           "children": [
             {
               "id": 11,
@@ -845,7 +845,7 @@
             }
           ],
           "rewritten": null,
-          "type": "([0, 1] ⤇ Int)",
+          "type": "(0..2 ⤇ Int)",
           "children": [
             {
               "id": 1,
@@ -973,7 +973,7 @@
             "nature": "machinery",
             "label": "comprehension.generator"
           },
-          "type": "[0, 1]",
+          "type": "0..2",
           "children": []
         }
       ]
@@ -995,7 +995,7 @@
             }
           ],
           "rewritten": null,
-          "type": "([0, 1] ⤇ Int)",
+          "type": "(0..2 ⤇ Int)",
           "children": [
             {
               "id": 11,
@@ -1210,7 +1210,7 @@
             }
           ],
           "rewritten": null,
-          "type": "([0, 1] ⤇ Int)",
+          "type": "(0..2 ⤇ Int)",
           "children": [
             {
               "id": 1,
@@ -1338,7 +1338,7 @@
             "nature": "machinery",
             "label": "comprehension.generator"
           },
-          "type": "[0, 1]",
+          "type": "0..2",
           "children": []
         }
       ]
@@ -1364,7 +1364,7 @@
             "nature": "machinery",
             "label": "simplify.flatten_compose"
           },
-          "type": "([0, 1] ⤇ Int)",
+          "type": "(0..2 ⤇ Int)",
           "children": [
             {
               "id": 75,
@@ -1395,7 +1395,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "([0, 1] ⤇ Int)",
+          "type": "(0..2 ⤇ Int)",
           "children": [
             {
               "id": 76,
@@ -1805,7 +1805,7 @@
             "nature": "machinery",
             "label": "planning.iterate"
           },
-          "type": "([0, 1] ⤇ Int)",
+          "type": "(0..2 ⤇ Int)",
           "children": [
             {
               "id": 251,
@@ -1840,7 +1840,7 @@
             "nature": "machinery",
             "label": "planning.iterate"
           },
-          "type": "([0, 1] ⤇ [0, 1])",
+          "type": "(0..2 ⤇ 0..2)",
           "children": [
             {
               "id": 250,
@@ -1867,7 +1867,7 @@
             "nature": "machinery",
             "label": "planning.iterate"
           },
-          "type": "(([0, 1] ⇒ Bool) ⇒ ([0, 1] ⤇ [0, 1]))",
+          "type": "((0..2 ⇒ Bool) ⇒ (0..2 ⤇ 0..2))",
           "children": []
         },
         {
@@ -1885,7 +1885,7 @@
             "nature": "machinery",
             "label": "planning.iterate"
           },
-          "type": "([0, 1] ⇒ Bool)",
+          "type": "(0..2 ⇒ Bool)",
           "children": [
             {
               "id": 248,
@@ -1912,7 +1912,7 @@
             "nature": "machinery",
             "label": "planning.iterate"
           },
-          "type": "(Bool ⇒ ([0, 1] ⇒ Bool))",
+          "type": "(Bool ⇒ (0..2 ⇒ Bool))",
           "children": []
         },
         {
@@ -1948,7 +1948,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "([0, 1] ⤇ Int)",
+          "type": "(0..2 ⤇ Int)",
           "children": [
             {
               "id": 76,
@@ -2706,7 +2706,7 @@
           "label": "IterateExtent",
           "nodeId": 319,
           "role": "operator",
-          "tiling": "Fn({[0, 1]} → {[0, 1]})",
+          "tiling": "Fn(0..2 → 0..2)",
           "spans": [
             {
               "file": 0,
@@ -2725,7 +2725,7 @@
           "label": "Constant",
           "nodeId": 320,
           "role": "operator",
-          "tiling": "Fn({[0, 1]} → Int)",
+          "tiling": "Fn(0..2 → Int)",
           "spans": [
             {
               "file": 0,
@@ -2744,7 +2744,7 @@
           "label": "MapResult",
           "nodeId": 321,
           "role": "operator",
-          "tiling": "Fn({[0, 1]} → Int)",
+          "tiling": "Fn(0..2 → Int)",
           "spans": [
             {
               "file": 0,
@@ -2801,7 +2801,7 @@
           "label": "MapResult",
           "nodeId": 323,
           "role": "operator",
-          "tiling": "Fn({[0, 1]} → Int)",
+          "tiling": "Fn(0..2 → Int)",
           "spans": [
             {
               "file": 0,

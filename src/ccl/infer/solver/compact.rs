@@ -48,7 +48,7 @@ pub use crate::ccl::ty::KindPin;
 pub enum AtomKey {
     /// Primitive (Int, UInt, String, Bool, Unit).
     Prim(BaseType),
-    /// Finite index range `[0, n)`.
+    /// Finite index range `0..n`.
     UIntRange(u64),
     /// Externally-registered data source.
     Source(SmolStr),
