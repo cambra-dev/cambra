@@ -686,7 +686,8 @@ impl Name {
 
     /// Return the uid-free label of the record field a binder names: a mutable
     /// variable's in its store, and a sink's in the program's outputs. A top-level
-    /// binder of a run is labeled in its run ([`crate::ccl::Label::in_run`]).
+    /// binder of a run is labeled in its run ([`crate::ccl::Label::in_run`]), and one
+    /// of a shared import in the shared import ([`crate::ccl::Label::in_import`]).
     ///
     /// Labels must be distinct within the consuming history record. Generated reply taps
     /// use `defer_tap_field`'s reserved namespace; record/key-map construction sites
@@ -702,27 +703,29 @@ impl Name {
             Name::PiBound(_) => {
                 unreachable!("a PiBound is a reference, not a binder; it labels no field")
             }
-            // A member of a run is labeled in its run, `eu::stock`, so the
-            // variables of two runs of one module keep distinct histories.
+            // A member of a run is labeled in its run, `eu::stock`, and one of a
+            // shared import in it, `scaled(scale=3)::total`, so the variables of two
+            // runs or two shared imports of one module keep distinct histories.
             Name::Unique {
                 base,
                 home: Some(home),
                 ..
             } => match &**home {
                 Home::Run(run) => crate::ccl::Label::in_run(run.clone(), base.clone()),
-                Home::Import(shared) => unreachable!(
-                    "`{base}` of the shared import `{shared}` is no mutable variable: an import of \
-                     a module that declares state is refused"
-                ),
+                Home::Import(shared) => crate::ccl::Label::in_import(shared.clone(), base.clone()),
             },
             _ => crate::ccl::Label::new(self.base()),
         }
     }
 
     /// A fresh binder whose [`Self::field_key`] is `label`: one spelled as the label,
-    /// homed in the label's run when it has one.
+    /// homed in the label's run or shared import when it has one.
     pub fn fresh_for_field(label: &crate::ccl::Label) -> Self {
-        let home = label.run().map(|run| Arc::new(Home::Run(run.clone())));
+        let home = label
+            .run()
+            .map(|run| Home::Run(run.clone()))
+            .or_else(|| label.import().map(|shared| Home::Import(shared.clone())))
+            .map(Arc::new);
         Self::fresh_in(label.name(), home)
     }
 

@@ -132,8 +132,8 @@ pub struct TypeInferenceContext {
     /// The program's trait instances, which lowering builds.
     pub(crate) instances: Rc<InstanceTable>,
 
-    /// The `ExprStmt` of each expression statement the program writes, which lowering
-    /// records ([`crate::ccl::lower::LoweringContext`]).
+    /// The `ExprStmt` of each expression statement the program writes
+    /// ([`crate::ccl::lower::expression_statements`]).
     pub(crate) expression_statements: HashSet<NodeId>,
 
     /// The expression statements [`infer`] found to cause nothing, which the compile reports
@@ -1820,8 +1820,9 @@ pub fn check_module(
 pub struct ModuleChecked {
     /// The contract of each binding the check reports.
     pub contracts: HashMap<Name, Contract>,
-    /// What the module's top level requires and causes, less what its scopes discharge.
-    pub top_level: crate::ccl::effects::EffectSet,
+    /// What the module's top level requires and causes, less what its scopes discharge, each
+    /// label at the node where it entered.
+    pub top_level: Vec<crate::ccl::effects::Label>,
 }
 
 /// The contract a module's check infers for one of its public members

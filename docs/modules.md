@@ -53,14 +53,15 @@ root file
   → graph    build the module graph; refuse cycles; compute link order
   → lower    once per module, in link order, against the interfaces of the modules it imports and
              runs, each import's shared import decided before its importer lowers. Produces a chain,
-             with each `run` statement a `Run` node, and an interface. An import of a module that
-             performs IO or declares state is refused here
+             with each `run` statement a `Run` node, and an interface
   → link     create each shared import, one per imported module and distinct set of arguments, in
              link order, and the root's run, which creates each run it declares at its `run`
              statement; each run a uniquified copy of its module's chain
   → check    once per module: its check tree, its chain with its parameters abstract, its runs,
              the shared imports it reaches, and its arguments' checks, inferred alone, as
-             chl-spec.md's "9.14 Checking a module on its own" requires
+             chl-spec.md's "9.14 Checking a module on its own" requires; once every module is
+             checked, an import of a module that is run, or a run of one that is imported, is
+             refused
   → infer …  over the linked tree, once every check passes: specialization and refinement
              propagation
 ```
@@ -209,13 +210,19 @@ a user's `` `some `` builds that module's own tag.
   an error, and so is a `use` name spelled like an import name, another `use` name, a builtin, or a
   built-in type. A builtin call resolves by its spelling before scope (`lower_call`), so a `use`
   name spelled like one would never reach its member.
-- **IO and state.** A module that declares a sink or mutable state (`sink_site`, `state_site`), or
-  reads a registered source, which lowering records, has no shared import. Each `import` of it is an
-  error, labeled at the site (`Unimportable`). Lowering declares a sink without opening anything, so
-  lowering such a module is harmless; a run of it registers the sink.
-- **What an import may hold.** A `run` and an expression statement in an imported module are
-  errors. A top-level `for`, `if`, `match`, or `with` in one is not supported yet. Each is
-  reported once, where the module is first imported (`ProgramLowering::importable`).
+- **What an import may hold.** Lowering refuses no statement of an imported module: a shared
+  import performs its module's whole top level, as a run does, loops and induction variables
+  included. Whether the module may be imported at all is decided once every module is checked,
+  from what its top level requires and causes ([Checking a module on its own](#checking-a-module-on-its-own)).
+  Lowering declares a sink without opening anything, so creating a shared import of a module that
+  binds one is harmless; its import is refused before the program runs.
+- **State.** A shared import's top-level induction variable is labeled in the shared import
+  (`Label::in_import`), so each shared import keeps its own history, as each run does. A store keys
+  a variable by the label's run-time key, `@@scaled(scale=3)::total`, which a store resumed by
+  another version reads back, and a type argument's only identity across compilations is its
+  spelling, so the label is the shared import's spelling. Two shared imports of a module that
+  declares state whose type arguments are distinct types spelled alike are refused at the second
+  `import` (`ProgramLowering::shared_import`).
 - **`Mut` parameters.** A call to an imported `def` with a `Mut` parameter, qualified or through
   `use`, takes the curried shape the `def` lowers to.
 - **Labels.** An unqualified label belongs to the module that writes it, `this::` spells the same
@@ -244,7 +251,6 @@ a user's `` `some `` builds that module's own tag.
   error at the argument. This restriction is temporary: link-time constants lift it ([Link-time
   constants](#dependencies)). The module's copy for the import takes each type argument as a run's
   copy does ([Runs](#runs)).
-- **Refused:** an imported module's top-level `if`, `match` and `with` statements.
 
 ### Runs
 
@@ -263,9 +269,8 @@ a user's `` `some `` builds that module's own tag.
   binder the run's chain minted (`LoweringContext::run_sink_names`). A run's mutable variables are
   labeled by run path in history records, so two runs keep two histories.
 - **A run's feed is fed through its run name.** `a::events << e` feeds the run's public feed, as
-  `events << e` does inside it: a feed's target may be qualified (`feed_target`). A feed is state,
-  so a module that declares one is run and not imported (`state_site`), and no import name reaches
-  a feed.
+  `events << e` does inside it: a feed's target may be qualified (`feed_target`). Declaring a
+  public feed makes its module a run, so no import name reaches a feed.
 - **Routes are unique across runs.** Creating a run registers its routes. A route two runs serve is
   an error at the second `run` statement, with a note at the first. A route's address is a
   constant, so a module takes it from a `const` parameter and each run serves the address its
@@ -320,9 +325,8 @@ a user's `` `some `` builds that module's own tag.
 
 ### The module interface
 
-Lowering records each module's `Interface` (`Interface::of_lowered`): whether the module performs
-IO or declares mutable state, with the site that does, each parameter, and each top-level member,
-public and private, so that `m::hidden` can say the member is private and point at it:
+Lowering records each module's `Interface` (`Interface::of_lowered`): each parameter, and each
+top-level member, public and private, so that `m::hidden` can say the member is private and point at it:
 
 | Member | Recorded |
 | --- | --- |
@@ -639,11 +643,14 @@ discharge (`ModuleChecked::top_level`; [chl-spec.md, "Shareable modules
 `import_and_run_errors` in `src/ccl/context.rs` reads it for each module's `import` and `run`
 statements (`ModuleCheck::statements`), and for the root's, which lowering keeps on the context
 because the root usually has no check of its own (`LoweringContext::root_statements`). A module is
-shareable when its top level requires and causes nothing, binds no sink, and runs no module. A
+shareable when its top level requires and causes nothing, binds no sink, and runs no module.
+`@LoadFrom` is outside the effects model, so a load bears on none of this. A
 statement whose module is shareable and whose arguments an import could pass, each a constant, an
 import name, or a type written over imports (`ModuleStatement::importable_arguments`), must be an
-`import`; any other must be a `run`. A module lowering refuses to import (`Unimportable`) is run,
-and no `run` of it is refused.
+`import`; any other must be a `run`. The error at an `import` names what makes the module a run,
+with a label at the statement it comes from: the sink, the `run`, or the node where the first label
+its top level holds entered (`obstacle`). `cambra check` prints that reason as the interface's last
+line (`Interface::written`).
 
 An error of a `run` statement or of its arguments, such as a missing argument, depends on the
 statement and the interface it runs alone. Creating a run raises it only when the statement is the
@@ -718,10 +725,9 @@ span are computed from the map when a diagnostic renders.
 source cache is keyed by `FileId`, so a single report can label several files. Several errors do:
 
 - a private or missing member: primary label at the reference, secondary at the declaration;
-- an import of a module that performs IO or declares mutable state: primary label at the `import`,
-  secondary at the IO site or the state;
-- an import of a module whose top level requires or causes something, and a run of a shareable
-  module whose arguments an import could pass: at the statement;
+- an import of a module that is run: primary label at the `import`, secondary at the statement
+  that makes it a run;
+- a run of a shareable module whose arguments an import could pass: at the statement;
 - a module-graph cycle: one label per statement in the cycle;
 - a public name bound twice, and a conflict between an import, run, or parameter name and a member:
   both sites;

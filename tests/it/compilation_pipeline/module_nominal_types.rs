@@ -33,9 +33,9 @@ const SHOP: &str = indoc! {"
     pub type Amount = {amount: Int}
 "};
 
-/// [`SHOP`] with mutable state, so it is run and not imported.
+/// [`SHOP`] with a transactional variable, so it is run and not imported.
 fn store() -> String {
-    format!("{SHOP}\nvisits := 0\n")
+    format!("{SHOP}\nvisits: Mut(Int, Txn) := 0\n")
 }
 
 /// A module with a public type, its public method, and a private one.
@@ -47,9 +47,9 @@ const SHOP_PRICE: &str = indoc! {"
         1
 "};
 
-/// [`SHOP_PRICE`] with mutable state, so it is run and not imported.
+/// [`SHOP_PRICE`] with a transactional variable, so it is run and not imported.
 const STATEFUL_SHOP_PRICE: &str = indoc! {"
-    visits := 0
+    visits: Mut(Int, Txn) := 0
     pub type Price = Int
     pub def Price::doubled(self) => Int:
         self.extract() * 2
@@ -69,7 +69,7 @@ const STATEFUL_SHOP_PRICE: &str = indoc! {"
         run shop as s
         s::p
     "},
-    "visits := 0\n"
+    "visits: Mut(Int, Txn) := 0\n"
 )]
 #[timeout(Duration::from_secs(10))]
 fn a_module_uses_the_types_it_declares(#[case] root: &str, #[case] state: &str) {
@@ -285,10 +285,10 @@ fn a_method_call_through_another_module_takes_the_values_instance(
     #[case] root: &str,
     #[case] mid: &str,
 ) {
-    // `lib` declares state, so it is run.
+    // `lib` declares a transactional variable, so it is run.
     let lib = indoc! {"
         param T
-        visits := 0
+        visits: Mut(Int, Txn) := 0
         pub type Box = Int
         pub def Box::wrap(self, x: T) => T:
             x
@@ -511,9 +511,9 @@ fn a_method_call_takes_its_receivers_copy() {
     );
 }
 
-/// A module with mutable state, so it is run and not imported.
+/// A module with a transactional variable, so it is run and not imported.
 const INNER: &str = indoc! {"
-    visits := 0
+    visits: Mut(Int, Txn) := 0
     pub n = 2
 "};
 
@@ -767,7 +767,7 @@ const RECEIPT_WITH_TYPE_ARGUMENTS: &str = indoc! {"
             Receipt::new(x)
         pub def amount(r: Receipt(Int)) => Int:
             r.extract()
-        visits := 0
+        visits: Mut(Int, Txn) := 0
     "},
     indoc! {"
         run stripe as st

@@ -155,7 +155,6 @@ impl LoweringContext {
             }
         }
         self.module = scope;
-        self.io_site = None;
         self.transactional_vars.clear();
         self.in_tx_body = false;
         self.type_params_in_scope.clear();
@@ -844,11 +843,9 @@ impl Qualifier {
     }
 
     /// The interface whose members a reference reaches, or `None` when the module
-    /// has errors of its own or performs IO, each reported where it stands.
+    /// has errors of its own, reported where they stand.
     pub(in crate::ccl::lower) fn reachable(&self) -> Option<&Interface> {
-        self.interface.as_deref().filter(|interface| {
-            interface.unimportable.is_none() || self.kind != QualifierKind::Import
-        })
+        self.interface.as_deref()
     }
 }
 
@@ -923,8 +920,7 @@ pub(super) fn bound_name(module: &ModulePath, alias: Option<&Spanned<SmolStr>>) 
 /// An import name reaches what `imports` holds for its statement. A run's type
 /// arguments are lowered with the module ([`LoweringContext::declare_run_types`]).
 ///
-/// An import of a module that performs IO or declares state is an error at the
-/// statement, and so is a second import or run binding one name. A `use` item
+/// A second import or run binding one name is an error at the statement. A `use` item
 /// is an error when its member is not one the module reaches, or when its name
 /// is an import name, a run name, another `use` name, a builtin's, or a
 /// built-in type's.
@@ -951,24 +947,6 @@ pub(super) fn module_scope(
                 let name = bound_name(&module, alias.as_ref());
                 let file = program.file_of(&module);
                 let interface = interfaces.get(&stmt.span).cloned().flatten();
-                if let Some(why) = interface.as_ref().and_then(|i| i.unimportable) {
-                    let (does, site, note) = match why {
-                        Unimportable::Io(site) => ("performs IO", site, "the IO it performs"),
-                        Unimportable::State(site) => {
-                            ("declares mutable state", site, "the state it declares")
-                        }
-                    };
-                    errors.push(
-                        LoweringError::unsupported(
-                            stmt.span,
-                            format!(
-                                "module `{module}` {does}, so importing it is an error: run it \
-                                 instead"
-                            ),
-                        )
-                        .with_related(site, note),
-                    );
-                }
                 let qualifier = Qualifier {
                     module,
                     file,

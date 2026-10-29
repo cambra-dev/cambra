@@ -276,6 +276,30 @@ fn a_checked_module_prints_its_interface() {
     );
 }
 
+/// A checked module that is run says what makes it one, and a module whose only state is
+/// induction variables says nothing, since it is imported (`docs/chl-spec.md`, "Shareable
+/// modules [Decided]").
+#[rstest]
+#[case::transactional(
+    "stock: Mut(Int, Txn) := 0\npub n = 1\n",
+    "module main\npub n: {Int where _ == 1}  # a constant\nrun, since its top level causes `Write(stock)`\n"
+)]
+#[case::induction(
+    indoc! {"
+        total := 0
+        for x in [1, 2]:
+            total += x
+        pub n = total
+    "},
+    "module main\npub n: Int\n"
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_checked_module_says_whether_it_is_run(#[case] module: &str, #[case] expected: &str) {
+    let interface = check_program(&mut GlobalContext::default(), &program(module, &[]))
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert_eq!(interface, expected);
+}
+
 /// A public nominal type prints as its module declares it, with each type parameter's
 /// variance and the module's type parameters whose arguments tell its instances apart,
 /// and each public associated function prints with its contract.
