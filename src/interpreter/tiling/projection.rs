@@ -86,6 +86,16 @@ impl Projection {
         }
     }
 
+    /// The guard this projection names for a collection, whose universal guard is the domain
+    /// guard admitting every key ([`guard`](Self::guard) where no tiling is at hand).
+    pub(crate) fn collection_guard(&self) -> TileGuard {
+        match self {
+            Projection::Everything => TileGuard::Function(FunctionGuard::Domain(Predicate::True)),
+            Projection::Nothing => TileGuard::Function(FunctionGuard::Domain(Predicate::False)),
+            Projection::Keys { level, keys } => spell(*level, keys),
+        }
+    }
+
     /// The keys above `level` that this projection names, for an operator whose input lacks
     /// `level`: itself where it names keys above `level`, and otherwise the keys of the level just
     /// above that its paths run through, or everything where `level` is the outermost.
@@ -1004,6 +1014,17 @@ mod tests {
         assert_eq!(
             codomain(domain(under(key(2), Predicate::True))).projection("Producer"),
             Projection::admitting(key(2))
+        );
+    }
+
+    /// A difference of a collection's keys and a scalar's names no region, though each reads as
+    /// a projection where it is universal or empty.
+    #[test]
+    #[should_panic(expected = "the guard algebra has no difference")]
+    fn a_difference_of_keys_and_a_scalar_panics() {
+        crate::interpreter::tile_operators::guard_minus(
+            &TileGuard::Scalar(Predicate::True),
+            &domain(key(1)),
         );
     }
 
