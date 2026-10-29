@@ -60,7 +60,7 @@ mod inline {
             .unwrap_or_else(|why| panic!("{why}"));
         let mut main = run.take_main().expect("a main output");
         let tile = drive(&mut ctx, &mut run, &mut *main, 100);
-        assert_eq!(run.lap(), Lap::Done, "every pipeline finished");
+        assert!(run.lap() == Lap::Done, "every pipeline finished");
         tile
     }
 
@@ -95,7 +95,7 @@ mod inline {
         }
     }
 
-    /// A fold is answered once its pipeline finishes, from the partials combined.
+    /// A fold into `main` is answered once its pipeline finishes.
     #[test]
     fn a_fold_is_answered_when_its_pipeline_finishes() {
         for fold in ["sum", "max", "min"] {
@@ -125,18 +125,8 @@ mod inline {
         }
     }
 
-    /// The output of the pipeline that ends in `main`: the one breaker an inline run of a
-    /// collection has.
-    fn main_output(run: &PooledRun) -> Arc<Materialized> {
-        match run.breakers.last() {
-            Some(PoolBreaker::Materialize { output }) => output.clone(),
-            _ => panic!("the last pipeline of a collection materializes `main`"),
-        }
-    }
-
-    /// `main` reads the final breaker's output through a reader of its own, which is registered
-    /// before the first morsel, and releases what it read: after the run the output holds no key,
-    /// and a pull after answers empty.
+    /// `main` is the cache of the breaker that ends its pipeline: the rows are held until `main`
+    /// releases them, the release reclaims them, and a pull after answers empty.
     #[test]
     fn main_releases_what_it_read_and_a_pull_after_answers_empty() {
         let mut ctx = GlobalContext::default();
@@ -144,23 +134,17 @@ mod inline {
         let config = Config { morsel_rows: 4 };
         let mut run = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
             .expect("admitted");
-        let output = main_output(&run);
-        assert_eq!(output.reader_count(), 1, "`main` reads the breaker");
         let mut main = run.take_main().expect("a main output");
         let tile = drive(&mut ctx, &mut run, &mut *main, 100);
         assert_eq!(entries(&tile).len(), 20);
         assert_eq!(
-            output.held_keys(),
+            run.held_keys(),
             20,
             "nothing was released before `main` did"
         );
         let universal = main.tiling().universal_guard();
         main.release(universal.clone());
-        assert_eq!(
-            output.held_keys(),
-            0,
-            "the release reclaims what `main` read"
-        );
+        assert_eq!(run.held_keys(), 0, "the release reclaims what `main` read");
         assert!(main.get(universal).is_empty());
     }
 
@@ -207,7 +191,7 @@ mod inline {
         let mut main = run.take_main().expect("a main output");
         let universal = main.tiling().universal_guard();
         ctx.scheduler().check_for_notifications();
-        assert_eq!(run.lap(), Lap::Idle, "nothing has arrived");
+        assert!(run.lap() == Lap::Idle, "nothing has arrived");
 
         let rows: Vec<(Value, Value)> = (0..5)
             .map(|k| (Value::UInt(k as u64), Value::Int(k * 10)))
@@ -217,12 +201,12 @@ mod inline {
             .lock_wait()
             .set_yield_predicate(Predicate::at_or_below(Value::UInt(4)));
         ctx.scheduler().check_for_notifications();
-        assert_eq!(run.lap(), Lap::Ran);
+        assert!(run.lap() == Lap::Ran);
         ctx.scheduler().pull_sinks();
         let tile = main.get(universal.clone());
         assert_eq!(entries(&tile).len(), 5, "{tile:?}");
         assert!(!tile.is_terminal(), "the source can still deliver");
-        assert_eq!(run.lap(), Lap::Idle);
+        assert!(run.lap() == Lap::Idle);
     }
 
     /// A program over `source1()` with a context that holds the source, and the source.
@@ -279,7 +263,7 @@ mod inline {
                     .expect("admitted");
             let mut main = run.take_main().expect("a main output");
             let inline = drive(&mut ctx, &mut run, &mut *main, 100);
-            assert_eq!(run.lap(), Lap::Done, "{code}: the pipeline finished");
+            assert!(run.lap() == Lap::Done, "{code}: the pipeline finished");
             assert!(inline.is_terminal() && serial.is_terminal(), "{code}");
             match inline {
                 Tile::DataFunction { .. } => {
@@ -307,7 +291,7 @@ mod inline {
                 .lock_wait()
                 .set_yield_predicate(Predicate::at_or_below(Value::UInt(upto)));
             ctx.scheduler().check_for_notifications();
-            assert_eq!(run.lap(), Lap::Ran);
+            assert!(run.lap() == Lap::Ran);
             ctx.scheduler().pull_sinks();
             let tile = main.get(universal.clone());
             assert!(
@@ -357,7 +341,7 @@ mod inline {
         let mut run = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
             .expect("admitted");
         run.dispatcher.fail();
-        assert_eq!(run.lap(), Lap::Failed);
+        assert!(run.lap() == Lap::Failed);
     }
 
     /// A shared value over a literal list is two pipelines, and the check counts one that reads a
@@ -442,7 +426,7 @@ mod inline {
                 .lock_wait()
                 .set_yield_predicate(Predicate::at_or_below(Value::UInt(upto)));
             ctx.scheduler().check_for_notifications();
-            assert_eq!(run.lap(), Lap::Ran);
+            assert!(run.lap() == Lap::Ran);
             ctx.scheduler().pull_sinks();
             assert!(
                 sink.value().is_err(),
@@ -463,7 +447,7 @@ mod inline {
     }
 
     /// A memo that reads a live source runs in sink mode behind the rows as they arrive: a lap
-    /// polls the memo's pipeline for the arrivals its input no longer reports, so the sink behind
+    /// polls the memo's pipeline for the arrivals its input does not report, so the sink behind
     /// the memo receives each row once and holds what the serial loop's sink holds. Two memos in a
     /// chain do the same.
     #[test]
@@ -585,10 +569,9 @@ mod inline {
         }
     }
 
-    /// The rows a source held when the program compiled were handed to the sink then, and the pool
-    /// that replaces the serial producer starts its records where that producer had released:
-    /// another reader holds the source's agreement back, so nothing else keeps the held rows from
-    /// being offered again.
+    /// The rows a source held when the program compiled were handed to the sink then. The memo that
+    /// wraps the serial producer keeps its release records, so a reader that holds the source's
+    /// agreement back does not make the held rows offered again.
     #[test]
     fn rows_held_at_compile_reach_the_sink_once() {
         let (mut ctx, mut program, source, sinks) =
@@ -905,7 +888,7 @@ mod inline {
         else {
             panic!("a collection, got {tile:?}")
         };
-        let Tile::Scalar(crate::interpreter::ColumnValue::Ints(sums)) = codomain.as_ref() else {
+        let Tile::Scalar(ColumnValue::Ints(sums)) = codomain.as_ref() else {
             panic!("sums, got {tile:?}")
         };
         let mut pairs: Vec<(Value, i64)> = (0..domain.len())
@@ -913,5 +896,43 @@ mod inline {
             .collect();
         pairs.sort_by(|a, b| a.partial_cmp(b).expect("keys compare"));
         pairs
+    }
+
+    /// The consumer given to the run is woken by the breaker of `main`'s pipeline: its rounds say
+    /// `main` has rows to read, and the terminal round says it is complete.
+    #[test]
+    fn the_consumer_of_main_is_woken_from_the_breakers_rounds() {
+        let mut ctx = GlobalContext::default();
+        let mut program = compiled(&mut ctx, &format!("[x + 1 for x in {}]", list(6)));
+        let woken = Arc::new(Mutex::new(0usize));
+        let counter = woken.clone();
+        let config = Config { morsel_rows: 2 };
+        let mut run = PooledRun::start(
+            &mut ctx,
+            &mut program,
+            &mut None,
+            &config,
+            Box::new(move || *counter.lock_now() += 1),
+        )
+        .expect("admitted");
+        let mut main = run.take_main().expect("a main output");
+        assert_eq!(*woken.lock_now(), 0, "nothing ran yet");
+        drive(&mut ctx, &mut run, &mut *main, 100);
+        assert!(*woken.lock_now() >= 1, "a round woke the consumer");
+    }
+
+    /// A program whose output has no producer to wrap is refused before anything is taken, not
+    /// by a panic.
+    #[test]
+    fn an_output_without_a_producer_is_refused() {
+        let mut ctx = GlobalContext::default();
+        let mut program = compiled(&mut ctx, &format!("[x + 1 for x in {}]", list(4)));
+        let held = program.main_mut().and_then(|output| output.producer.take());
+        let config = Config { morsel_rows: 2 };
+        let refused = PooledRun::start(&mut ctx, &mut program, &mut None, &config, Box::new(|| {}))
+            .err()
+            .expect("no producer for `main`");
+        assert!(refused.to_string().contains("no producer"), "{refused}");
+        drop(held);
     }
 }

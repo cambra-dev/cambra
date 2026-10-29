@@ -373,9 +373,8 @@ mod dispatch {
                  in 1024 laps"
             )
         });
-        assert_eq!(
-            run.lap(),
-            Lap::Done,
+        assert!(
+            run.lap() == Lap::Done,
             "the dispatched run of {key} at {morsel_rows} rows has a terminal `main` and every \
              pipeline finished"
         );

@@ -9,7 +9,7 @@ use smol_str::SmolStr;
 
 use crate::ccl::provenance::NodeId;
 use crate::interpreter::{
-    Consumer, DataSourceDomainExtentImpl, Predicate, Projection,
+    Consumer, DataSourceDomainExtentImpl, Projection,
     tile_operators::{Breaker, BreakerHandle, Notified},
     value_probe::ProbeSlot,
 };
@@ -410,40 +410,10 @@ pub struct Scheduler {
     producer_frames: Vec<Vec<String>>,
     /// Sinks' pulls, run after the wakes that queued them in the same call.
     sink_pulls: WakeupQueue,
-    /// The pool's name for release records, while it subscribes its workers' chains
-    /// ([`Scheduler::with_pooled_release_records`]).
-    pooled_release_identity: Option<String>,
-    /// The record names handed out under that identity.
-    pooled_release_names: Vec<String>,
     /// The pipeline breakers by the operator that made each, registered when the breaker's
     /// producer is subscribed and held weakly: the producer owns the breaker. The dispatcher finds
     /// a breaker here.
     breakers: HashMap<NodeId, Weak<dyn Breaker>>,
-}
-
-/// The release records a pool's chains registered with the sources, retired when it drops: after
-/// the chains, whose producers leave a record under a pool's name to the pool.
-pub(crate) struct PooledRecords {
-    names: Vec<String>,
-    sources: Vec<Arc<Mutex<dyn DataSourceDomainExtentImpl>>>,
-}
-
-impl PooledRecords {
-    /// Whether a producer named `name` holds one of the records.
-    pub(crate) fn holds(&self, name: &str) -> bool {
-        self.names.iter().any(|held| held == name)
-    }
-}
-
-impl Drop for PooledRecords {
-    fn drop(&mut self) {
-        for source in &self.sources {
-            let mut source = source.lock_wait();
-            for name in &self.names {
-                source.retire_producer(name);
-            }
-        }
-    }
 }
 
 /// A consumer registered for a source, and whether the outermost keys of what it wakes are the
@@ -513,66 +483,9 @@ impl Scheduler {
         producers
     }
 
-    /// Subscribe the chains of a worker pool with `subscribe`, which receives this scheduler, so
-    /// that a source producer holds its release record under the pool's name for its operator:
-    /// `identity/<operator id>`. The workers' producers of one operator share a record, the union
-    /// of what they released, and a source reclaims only what the records of every operator
-    /// release. A source reclaims only what every record releases, and each worker releases only
-    /// the morsels it ran, so one record per worker would reclaim nothing, and one record for
-    /// every operator would reclaim what any operator released. `IterateExtent` and
-    /// `MapResultWithSource` are the two operators that read the name
-    /// ([`Scheduler::pooled_release_record_for`]).
-    ///
-    /// Returns what `subscribe` returned and the records the chains registered, which retire
-    /// when they drop, after the chains do. A panic in `subscribe` retires them too.
-    pub(crate) fn with_pooled_release_records<R>(
-        &mut self,
-        identity: String,
-        subscribe: impl FnOnce(&mut Scheduler) -> R,
-    ) -> (R, PooledRecords) {
-        debug_assert!(
-            self.pooled_release_identity.is_none(),
-            "one pool subscribes at a time"
-        );
-        self.pooled_release_identity = Some(identity);
-        self.pooled_release_names.clear();
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| subscribe(self)));
-        self.pooled_release_identity = None;
-        let records = PooledRecords {
-            names: std::mem::take(&mut self.pooled_release_names),
-            sources: self
-                .source_handles
-                .values()
-                .map(|(s, _)| s.clone())
-                .collect(),
-        };
-        match result {
-            Ok(result) => (result, records),
-            Err(panic) => {
-                drop(records);
-                std::panic::resume_unwind(panic)
-            }
-        }
-    }
-
-    /// What the producers named in `producers` have released of each source the scheduler holds,
-    /// for the sources where it is something: what a pool that replaces them inherits.
-    pub(crate) fn released_by(
-        &self,
-        producers: &std::collections::HashSet<String>,
-    ) -> Vec<(Arc<Mutex<dyn DataSourceDomainExtentImpl>>, Predicate)> {
-        self.source_handles
-            .values()
-            .filter_map(|(source, _)| {
-                let released = source.lock_wait().released_by(producers);
-                (!released.is_false()).then(|| (source.clone(), released))
-            })
-            .collect()
-    }
-
     /// Register the breaker the producer of `operator` is, when it is subscribed. A second
     /// registration for the operator replaces the first: a reload subscribes an operator it
-    /// carried forward while the old producer is still alive, and the producer subscribed last is
+    /// carried forward while the previous producer is alive, and the producer subscribed last is
     /// the one a run drives.
     pub fn register_breaker(&mut self, operator: NodeId, handle: &BreakerHandle) {
         self.breakers.insert(operator, Arc::downgrade(handle));
@@ -581,20 +494,6 @@ impl Scheduler {
     /// The breaker the producer of `operator` is, if it registered one that is still alive.
     pub fn breaker(&self, operator: NodeId) -> Option<BreakerHandle> {
         self.breakers.get(&operator)?.upgrade()
-    }
-
-    /// The name the producer of `operator` holds its release record under while a pool subscribes
-    /// its chains ([`Scheduler::with_pooled_release_records`]), or `None` for the producer's own.
-    pub fn pooled_release_record_for(&mut self, operator: Option<NodeId>) -> Option<String> {
-        let identity = self.pooled_release_identity.as_ref()?;
-        let name = match operator {
-            Some(operator) => format!("{identity}/{operator:?}"),
-            None => format!("{identity}/-"),
-        };
-        if !self.pooled_release_names.contains(&name) {
-            self.pooled_release_names.push(name.clone());
-        }
-        Some(name)
     }
 
     /// Record that the producer named `producer` registered with a data source.

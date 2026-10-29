@@ -239,7 +239,7 @@ fn a_shared_value_runs_as_two_pipelines_and_equals_the_serial_answer() {
     }
 }
 
-/// A fold behind the breaker folds what the pipeline before it materialized.
+/// A fold behind a memo folds what the pipeline before it merged.
 #[test]
 fn a_fold_behind_a_shared_value_equals_the_serial_answer() {
     for fold in ["sum", "max", "min"] {

@@ -856,11 +856,7 @@ mod breakers {
         assert_eq!(*woken.lock_now(), 1, "the terminal round woke the consumer");
         assert_eq!(
             handle.first_keys(&Predicate::True, 9),
-            [
-                crate::interpreter::Value::Int(1),
-                crate::interpreter::Value::Int(2),
-                crate::interpreter::Value::Int(3)
-            ]
+            [Value::Int(1), Value::Int(2), Value::Int(3)]
         );
     }
 

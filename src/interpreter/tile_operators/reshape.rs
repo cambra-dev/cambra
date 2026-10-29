@@ -60,10 +60,6 @@ impl TileOperator for PermuteRecordDomain {
         visit(value("input", &*self.input));
     }
 
-    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
-        visit(&mut self.input);
-    }
-
     fn subscribe(
         &mut self,
         intent_guard: TileGuard,
@@ -429,10 +425,6 @@ impl TileOperator for FlattenTupleDomain {
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("input", &*self.input));
-    }
-
-    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
-        visit(&mut self.input);
     }
 
     fn subscribe(

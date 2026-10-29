@@ -68,7 +68,6 @@ impl TileOperator for IterateExtent {
     impl_operator_base!();
 
     fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
-    fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
 
     /// A finite range `[0, n)` reads no source, so its rows are cut into morsels by position. A
     /// data-source domain of a source that cuts morsels is a [`LiveSource`] over the source's
@@ -122,11 +121,10 @@ impl TileOperator for IterateExtent {
             extent: self.extent.clone(),
             released: Predicate::False,
             _source_wakeup: source_wakeup.as_ref().map(|w| w.shared().clone()),
-            shared_release_record: scheduler.pooled_release_record_for(self.operator_id()),
         });
         if let Some(source_wakeup) = source_wakeup {
             Self::add_all_source_handles(&self.extent, source_wakeup.shared().clone(), scheduler);
-            let name = producer.releaser();
+            let name = producer.name();
             // Register this producer with any data sources in the extent by calling release with
             // a false predicate.  This way the sources knows about all producers that read it
             //before execution starts.
@@ -364,21 +362,6 @@ struct IterateExtentProducer {
     /// [`check_for_notifications`](Scheduler::check_for_notifications).
     /// `None` when the extent needs no source subscription.
     _source_wakeup: Option<Arc<Mutex<dyn Consumer>>>,
-    /// The name the producer holds its release record under, when it is not its own: the
-    /// identity the pool gives every worker's chain, so a source sees one reader of the
-    /// pipeline and not one per worker
-    /// (`src/interpreter/design-parallel.md`, "A pool owns its pipeline's release record").
-    shared_release_record: Option<String>,
-}
-
-impl IterateExtentProducer {
-    /// The name the source knows this producer by: where its releases and its elements are
-    /// recorded.
-    fn releaser(&self) -> String {
-        self.shared_release_record
-            .clone()
-            .unwrap_or_else(|| self.name())
-    }
 }
 
 fn get_iterate_extent_predicate(extent: &Extent) -> Predicate {
@@ -584,11 +567,7 @@ impl Drop for IterateExtentProducer {
     /// forward keeps both, which is what stops the source dropping data that
     /// operator has not finished with.
     fn drop(&mut self) {
-        // A record under a pool's name belongs to the pool, which retires it once its chains are
-        // gone: the first chain to drop must not take the others' record with it.
-        if self.shared_release_record.is_none() {
-            retire_producer_from_extent(&self.extent, &self.name());
-        }
+        retire_producer_from_extent(&self.extent, &self.name());
     }
 }
 
@@ -617,9 +596,9 @@ impl TileProducer for IterateExtentProducer {
         // A data-source domain is cut to the morsel before it is rendered, by the source.
         let values = match (&extent, &projection) {
             (Extent::DataSourceDomain(source), Projection::Keys(admitted)) => {
-                source.lock_wait().elements_in(&self.releaser(), admitted)
+                source.lock_wait().elements_in(&self.name(), admitted)
             }
-            _ => iterate_extent(&extent, &self.releaser()),
+            _ => iterate_extent(&extent, &self.name()),
         };
         let mut tile = Tile::data_function(
             values.clone(),
@@ -638,7 +617,7 @@ impl TileProducer for IterateExtentProducer {
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        let name = self.releaser();
+        let name = self.name();
         let TileGuard::Function(FunctionGuard::Domain(pred)) = obsolete_guard else {
             panic!("IterateExtent::release expected Domain guard, got {obsolete_guard:?}")
         };
@@ -842,7 +821,6 @@ mod tests {
             extent,
             released: Predicate::False,
             _source_wakeup: None,
-            shared_release_record: None,
         };
         let interval = |first: u64, last: u64| {
             let at_or_below = |v: u64| Predicate::at_or_below(Value::UInt(v));
@@ -891,7 +869,6 @@ mod tests {
             extent,
             released: Predicate::False,
             _source_wakeup: None,
-            shared_release_record: None,
         };
         let tile = producer.get(producer.tiling().universal_guard());
         let Tile::DataFunction { domain, .. } = tile else {
@@ -1338,60 +1315,6 @@ mod projection_tests {
         source.lock_wait().get_released_predicate()
     }
 
-    /// The chains of a pool hold one release record with the source: each releases the morsels it
-    /// ran, and the source reclaims their union. One record per chain would reclaim only what
-    /// every chain released, which is nothing.
-    #[test]
-    fn the_chains_of_a_pool_release_into_one_record() {
-        let source = source_of_four_keys();
-        let mut operator = IterateExtent::new(Extent::DataSourceDomain(source.clone()));
-        let mut scheduler = Scheduler::new();
-        let guard = operator.tiling().universal_guard();
-        let ([mut first, mut second], _records) =
-            scheduler.with_pooled_release_records("pool#test".to_string(), |scheduler| {
-                [(); 2].map(|()| operator.subscribe(guard.clone(), Box::new(|| {}), scheduler))
-            });
-
-        first.release(keys_between(0, 1));
-        second.release(keys_between(2, 3));
-        let released = released_by(&source);
-        assert!(
-            (0..4).all(|key| released.contains(&Value::UInt(key))),
-            "the source reclaims what the two chains released between them: {released:?}"
-        );
-    }
-
-    /// A chain of a pool that drops does not take the pool's record with it: the other chains
-    /// are still reading, and the pool retires the record when its chains are gone.
-    #[test]
-    fn a_dropped_chain_leaves_the_pools_record_to_the_pool() {
-        let source = source_of_four_keys();
-        let mut operator = IterateExtent::new(Extent::DataSourceDomain(source.clone()));
-        let mut scheduler = Scheduler::new();
-        let guard = operator.tiling().universal_guard();
-        let ([first, mut second], records) =
-            scheduler.with_pooled_release_records("pool#test".to_string(), |scheduler| {
-                [(); 2].map(|()| operator.subscribe(guard.clone(), Box::new(|| {}), scheduler))
-            });
-        drop(first);
-        second.release(keys_between(0, 3));
-        assert!(
-            (0..4).all(|key| released_by(&source).contains(&Value::UInt(key))),
-            "the record outlives the chain that dropped"
-        );
-        drop(second);
-        assert!(
-            (0..4).all(|key| released_by(&source).contains(&Value::UInt(key))),
-            "and the last chain's drop leaves it too"
-        );
-        drop(records);
-        assert_eq!(
-            released_by(&source),
-            Predicate::False,
-            "the pool retires its records, and no record agrees to nothing"
-        );
-    }
-
     /// A source's keys are the outermost keys of an `IterateExtent` over its domain, and not of one
     /// over a record that holds it: the second is told `Everything` of any region of the source's
     /// keys.
@@ -1445,33 +1368,6 @@ mod projection_tests {
         first.release(keys_between(0, 1));
         second.release(keys_between(2, 3));
         assert_eq!(released_by(&source), Predicate::False);
-    }
-
-    /// A producer that releases nothing holds the source's reclaim at nothing until it is
-    /// dropped, and the pool's record is the whole agreement after.
-    #[test]
-    fn a_dropped_idle_producer_stops_pinning_the_source() {
-        let source = source_of_four_keys();
-        let mut operator = IterateExtent::new(Extent::DataSourceDomain(source.clone()));
-        let mut scheduler = Scheduler::new();
-        let guard = operator.tiling().universal_guard();
-        let idle = operator.subscribe(guard.clone(), Box::new(|| {}), &mut scheduler);
-        let (mut worker, _records) = scheduler
-            .with_pooled_release_records("pool#test".to_string(), |scheduler| {
-                operator.subscribe(guard, Box::new(|| {}), scheduler)
-            });
-
-        worker.release(keys_between(0, 3));
-        assert_eq!(
-            released_by(&source),
-            Predicate::False,
-            "the idle one pins it"
-        );
-        drop(idle);
-        assert!(
-            (0..4).all(|key| released_by(&source).contains(&Value::UInt(key))),
-            "the pool's record is the agreement once the idle producer is gone"
-        );
     }
 
     /// A source holding `keys`, whose keys are of `key_extent`.
@@ -1561,7 +1457,6 @@ mod projection_tests {
             extent,
             released: Predicate::False,
             _source_wakeup: None,
-            shared_release_record: None,
         }
     }
 

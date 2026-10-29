@@ -531,17 +531,6 @@ impl FanHold {
         }
     }
 
-    /// Visit the fan-out's input operator mutably, under its write lock. The visitor is where a
-    /// pool replaces the fan-out's input, which every slot of the fan-out reads.
-    fn with_input_mut(&self, f: impl FnOnce(&mut Box<dyn TileOperator>)) {
-        match self {
-            FanHold::Reader { input, .. } => f(&mut input.write_now()),
-            FanHold::Recurrence { input, .. } => {
-                f(&mut input.upgrade().expect(DEAD_RECURRENCE).write_now())
-            }
-        }
-    }
-
     /// Subscribe to the fan-out's input operator, the one use that needs it
     /// mutably.
     fn subscribe_input(
@@ -588,10 +577,6 @@ impl TileOperator for FanOutSlot {
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         self.hold.with_input(|op| visit(share(op)));
-    }
-
-    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
-        self.hold.with_input_mut(visit);
     }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
@@ -958,15 +943,41 @@ impl Memo {
     }
 }
 
+impl Memo {
+    /// A memo over `input`, the producer a program subscribed for an output that collects, in sink
+    /// mode's place: the collecting pipeline's breaker. Its cache is what the output reads, and the
+    /// breaker merges the morsels of the pipeline into it, so a plain collecting output is a breaker
+    /// as any other pipeline's end is. `consumer` is woken as the output has rows to read.
+    pub(crate) fn collecting(
+        input: Box<dyn TileProducer>,
+        consumer: Box<dyn Consumer>,
+        scheduler: &mut Scheduler,
+    ) -> (Box<dyn TileProducer>, BreakerHandle) {
+        let tiling = input.tiling().clone();
+        let (consumer, gate) = shared_consumer(consumer);
+        let producer = MemoProducer::new(
+            ProducerBase::new(
+                MemoProducer::alloc_id(),
+                &tiling,
+                &OperatorBase::new(tiling.clone()),
+                scheduler,
+            )
+            .sharing(gate),
+            input,
+            Arrivals::new(),
+            consumer,
+            scheduler.wakeup_queue(),
+        );
+        let handle = producer.breaker.clone();
+        (Box::new(producer), handle)
+    }
+}
+
 impl TileOperator for Memo {
     impl_operator_base!();
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("input", &*self.input));
-    }
-
-    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
-        visit(&mut self.input);
     }
 
     fn subscribe(
@@ -1583,7 +1594,6 @@ mod tests {
         impl_operator_base!();
 
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
-        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
 
         fn subscribe(
             &mut self,
@@ -2521,6 +2531,32 @@ mod projection_tests {
         );
         memo.release(keys_between(4, 7));
         assert_eq!(memo.breaker.held_keys(), 0);
+    }
+
+    /// A collecting memo wraps the producer a program subscribed for an output: it answers what the
+    /// pulls merged, never pulls the producer from `get`, and releases the producer at each morsel.
+    #[test]
+    fn a_collecting_memo_merges_the_morsels_of_the_producer_it_wraps() {
+        let (producer, pulled, released) = ProjectionSpy::new(at_keys(&[1, 2, 5]), ints());
+        let mut scheduler = Scheduler::new();
+        let (mut memo, handle) =
+            Memo::collecting(Box::new(producer), Box::new(|| {}), &mut scheduler);
+        handle.begin_sinking();
+        let universal = memo.tiling().universal_guard();
+        assert!(memo.get(universal.clone()).is_empty());
+        assert!(pulled.lock_now().is_empty(), "get reads the cache");
+        handle.pull_sink(keys_between(0, 3));
+        assert_eq!(*pulled.lock_now(), [keys_between(0, 3)]);
+        assert_eq!(*released.lock_now(), [keys_between(0, 3)]);
+        assert_eq!(handle.held_keys(), 2);
+        let answer = memo.get(universal.clone());
+        assert_eq!(int_entries(&answer), vec![(1, 10), (2, 20)]);
+        memo.release(universal);
+        assert_eq!(
+            handle.held_keys(),
+            0,
+            "the output's release reclaims the cache"
+        );
     }
 
     /// A morsel is cut from the keys the cache holds, in order, inside the region and at most

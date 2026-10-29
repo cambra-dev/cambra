@@ -4,7 +4,6 @@
 //! Execution proceeds via the tile producer/consumer protocol using guards and tilings.
 
 mod binop;
-pub(crate) mod breaker;
 pub mod commit_operator;
 pub mod http_server;
 pub mod operator_conversion;
@@ -29,7 +28,6 @@ mod unary_op;
 pub mod value_probe;
 
 pub use binop::*;
-pub(crate) use breaker::Materialized;
 pub use http_server::HttpServerDataSource;
 pub use scalar_expr::ScalarProgram;
 pub use scheduler::*;

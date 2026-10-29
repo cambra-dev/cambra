@@ -1523,16 +1523,6 @@ impl Tile {
         self.map_level_predicates(&mut |_, _| Predicate::True);
     }
 
-    /// [`complete_every_level`](Self::complete_every_level) for the levels beneath the outermost,
-    /// which keeps what the outermost states: a tile cut to part of its keys states that part
-    /// complete, and the groups of the keys it kept are whole.
-    pub(crate) fn complete_inner_levels(&mut self) {
-        self.map_level_predicates(&mut |depth, stated| match depth {
-            0 => stated.clone(),
-            _ => Predicate::True,
-        });
-    }
-
     /// How many keys this level holds in total, across every row of it.
     fn level_width(&self) -> usize {
         match self {
@@ -6048,38 +6038,6 @@ mod tests {
             panic!("a collection field, got {:?}", fields["b"]);
         };
         assert_eq!(*inner, Predicate::True);
-    }
-
-    /// Completing the inner levels leaves the outermost statement as it was, which a tile cut
-    /// to part of its keys needs: that part is what it states complete.
-    #[test]
-    fn completing_the_inner_levels_keeps_the_outermost_statement() {
-        let kept = Predicate::at_or_below(Value::UInt(20));
-        let mut tile = three_groups();
-        let Tile::DataFunction {
-            domain_predicate, ..
-        } = &mut tile
-        else {
-            panic!("a collection");
-        };
-        *domain_predicate = kept.clone();
-        tile.complete_inner_levels();
-        let Tile::DataFunction {
-            domain_predicate,
-            codomain,
-            ..
-        } = &tile
-        else {
-            panic!("a collection");
-        };
-        assert_eq!(*domain_predicate, kept);
-        let Tile::DataFunction {
-            domain_predicate, ..
-        } = &**codomain
-        else {
-            panic!("groups");
-        };
-        assert_eq!(*domain_predicate, Predicate::True);
     }
 
     /// A collection with no inner collection, and a scalar, have nothing beneath to complete.

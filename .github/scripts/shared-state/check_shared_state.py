@@ -91,12 +91,6 @@ EXPECTED_EXCEPTIONS = [
     # `Arrivals`, the regions an input has notified since a `Memo` last took them; see its
     # type doc. The notification carries a region, which a one-bit flag cannot hold.
     ("src/interpreter/tile_operators/mod.rs", "shared cell of `ArrivalState`"),
-    # A breaker's materialized output (`breaker.rs`): the merged rows, the keys that are ready and
-    # the per-operator release records under one lock, and the consumers behind the breaker. The
-    # rows are the breaker's own state, as the collector's are, and they reach a pipeline behind it
-    # only through `BreakerOutput`'s `get`.
-    ("src/interpreter/breaker.rs", "cell of `State`"),
-    ("src/interpreter/breaker.rs", "cell of `Vec<Box<dyn Consumer>>`"),
     # A sink's own consumer (`parallel.rs`, `SinkChain` and `start_planned`): the pool installs a
     # producer in it and it schedules the sink's pull, and no tile passes through it between
     # operators.
@@ -118,11 +112,6 @@ EXPECTED_EXCEPTIONS = [
     ("src/interpreter/tile_operators/extract_final.rs", "shared cell of `ExtractFinalState`"),
     ("src/interpreter/tile_operators/extract_final.rs", "shared cell of `ExtractFinalState`"),
     ("src/interpreter/parallel.rs", "cell of `Rounds`"),
-    ("src/interpreter/parallel.rs", "shared cell of `SinkConsumer`"),
-    # The pool's breakers: the collection the driver merges into, and the fold's partial
-    # accumulator, handed in once; both answer `main` after the pipeline has finished, and no
-    # operator reads either.
-    ("src/interpreter/parallel.rs", "cell of `Tile`"),
     # The dispatcher. A pipeline's source cannot be built before the pipelines it follows finish,
     # so it is set once, later; it answers guards that name morsels and holds no tile.
     ("src/interpreter/parallel.rs", "cell of `Arc<dyn MorselSource>`"),

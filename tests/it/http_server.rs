@@ -993,7 +993,7 @@ fn a_request_that_arrives_after_idle_laps_is_replied_in_a_later_lap() {
     for _ in 0..3 {
         served.ctx.scheduler().check_for_notifications();
         let run = served.run.as_mut().expect("an inline run");
-        assert_eq!(run.lap(), Lap::Idle, "no request has arrived");
+        assert!(run.lap() == Lap::Idle, "no request has arrived");
         served.ctx.scheduler().pull_sinks();
     }
     for body in ["late", "later"] {

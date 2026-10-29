@@ -114,7 +114,6 @@ impl TileOperator for Constant {
     }
 
     fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
-    fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
 
     fn subscribe(
         &mut self,
@@ -306,10 +305,6 @@ impl TileOperator for VariantWrap {
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("input", &*self.input));
-    }
-
-    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
-        visit(&mut self.input);
     }
 
     fn subscribe(
@@ -561,10 +556,6 @@ impl TileOperator for VariantProject {
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("scrutinee", &*self.input));
-    }
-
-    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
-        visit(&mut self.input);
     }
 
     fn subscribe(
@@ -856,10 +847,6 @@ impl TileOperator for VariantIs {
         visit(value("scrutinee", &*self.input));
     }
 
-    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
-        visit(&mut self.input);
-    }
-
     fn subscribe(
         &mut self,
         intent_guard: TileGuard,
@@ -1008,7 +995,6 @@ mod tests {
     impl TileOperator for FixedOp {
         // A test double holds no operator, and no session walks one.
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
-        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }

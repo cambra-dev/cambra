@@ -183,10 +183,6 @@ impl TileOperator for RecordWrap {
         visit(value("input", &*self.input));
     }
 
-    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
-        visit(&mut self.input);
-    }
-
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -268,12 +264,6 @@ impl TileOperator for Zip {
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         for (i, input) in self.inputs.iter().enumerate() {
             visit(value_at(i, &**input));
-        }
-    }
-
-    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
-        for input in &mut self.inputs {
-            visit(input);
         }
     }
 
@@ -744,12 +734,6 @@ impl TileOperator for MakeRecord {
         }
     }
 
-    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
-        for input in &mut self.inputs {
-            visit(input);
-        }
-    }
-
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -960,10 +944,6 @@ impl TileOperator for SelectField {
 
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {
         visit(value("input", &*self.input));
-    }
-
-    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
-        visit(&mut self.input);
     }
 
     fn subscribe(
@@ -1354,7 +1334,6 @@ mod tests {
         }
 
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
-        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
 
         fn subscribe(
             &mut self,

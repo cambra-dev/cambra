@@ -105,13 +105,6 @@ impl TileOperator for ExtractFinal {
         }
     }
 
-    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {
-        visit(&mut self.source);
-        if let Some(default) = &mut self.default {
-            visit(default);
-        }
-    }
-
     fn subscribe(
         &mut self,
         _intent_guard: TileGuard,
@@ -563,7 +556,6 @@ mod tests {
     impl TileOperator for PartialSource {
         // A test double holds no operator, and no session walks one.
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
-        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }
@@ -616,7 +608,6 @@ mod tests {
     impl TileOperator for TerminalSource {
         // A test double holds no operator, and no session walks one.
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
-        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
         fn tiling(&self) -> &Tiling {
             &self.tiling
         }

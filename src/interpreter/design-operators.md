@@ -733,10 +733,9 @@ The rows for a function operand or constant that every row reads whole (the func
 function-valued `Filter` predicate) describe the serial scheduler. A pooled chain cuts them at a
 boundary consumer ([Build sides](../../docs/parallel-execution.md#build-sides)).
 
-`BreakerOutput` has no inputs, so it forwards no notification. The consumers behind it are notified
-by `Materialized::publish` with the region of a morsel the breaker's workers absorbed, after the
-morsel's rows are readable, and by `Materialized::complete` with `Everything`. The lock order of
-the output is stated at [A breaker's output](design-parallel.md#a-breakers-output).
+A breaker in sink mode swallows the notifications of its input. The consumers behind it are notified
+from its `finalize`, with the keys the round merged and `Everything` on the terminal round ([Pipeline
+breakers: sink, finalize and get](design-parallel.md#pipeline-breakers-sink-finalize-and-get)).
 
 `GatedConsumer` suppresses a notification to a consumer that pulls when its region is inside the
 union of the regions it passed since its operator's producer was last pulled. `shared_consumer`

@@ -138,6 +138,11 @@ impl SinkConsumer {
         self.pull.lock_now().notify(&Projection::Everything);
     }
 
+    /// Whether the sink is pulled through a producer.
+    pub(crate) fn has_producer(&self) -> bool {
+        self.producer.lock_now().is_some()
+    }
+
     /// The producer the sink is pulled through, taken out of the consumer: the serial chain a
     /// pool replaces. Dropping it ends that chain's subscription and its release records.
     pub(crate) fn take_producer(&self) -> Option<Box<dyn TileProducer>> {

@@ -44,7 +44,6 @@ use crate::{
 use crate::interpreter::LockNow;
 
 mod aggregate;
-mod breaker_output;
 mod combinators;
 mod cycle_slot;
 mod extract_final;
@@ -62,13 +61,11 @@ mod notification_scripts;
 mod notification_sound;
 mod reshape;
 mod scalar;
-mod sunk;
 mod union;
 #[cfg(test)]
 pub(crate) mod visit_inputs_tests;
 
 pub use aggregate::*;
-pub(crate) use breaker_output::*;
 pub use combinators::*;
 pub use cycle_slot::*;
 pub use extract_final::*;
@@ -80,7 +77,6 @@ pub use lookup::*;
 pub use map::*;
 pub use reshape::*;
 pub use scalar::*;
-pub(crate) use sunk::Sunk;
 pub use union::*;
 
 /// A source's rows, handed to the workers of a pool as morsels.
@@ -181,18 +177,6 @@ pub trait TileOperator: Send + Sync {
     /// it. Required rather than defaulted so that a new operator states its
     /// inputs or fails to compile.
     fn visit_inputs(&self, visit: &mut dyn FnMut(InputEdgeSpec<'_>));
-
-    /// State this operator's owned inputs to `visit`, mutably, as boxes the visitor may replace.
-    /// It visits what [`visit_inputs`](Self::visit_inputs) states as a value edge, in the same
-    /// order, and the shared input of a `FanOutSlot`, under the fan-out's write lock. An edge
-    /// wired after the operator was built (a store's writers) is not reached: its cell holds
-    /// the operator for the cycle's sake, and a plan that cuts a graph refuses a program with
-    /// such an edge.
-    ///
-    /// A pool reads the graph through `visit_inputs` and cuts it through this method, once it has
-    /// accepted the plan. Required, as `visit_inputs` is, so that an operator that holds an input
-    /// states it, and a leaf states that it holds none.
-    fn visit_inputs_mut(&mut self, visit: &mut dyn FnMut(&mut Box<dyn TileOperator>));
 
     /// The concrete type's short name, e.g. `"MapResult"`.
     ///
@@ -1770,7 +1754,6 @@ pub(crate) mod test_helpers {
     impl TileOperator for ProjectionSpyOp {
         // A test double holds no operator, and no session walks one.
         fn visit_inputs(&self, _visit: &mut dyn FnMut(super::InputEdgeSpec<'_>)) {}
-        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
 
         fn tiling(&self) -> &Tiling {
             &self.tiling
@@ -1883,7 +1866,6 @@ pub(crate) mod test_helpers {
     impl TileOperator for ScriptedOp {
         // A test double holds no operator, and no session walks one.
         fn visit_inputs(&self, _visit: &mut dyn FnMut(super::InputEdgeSpec<'_>)) {}
-        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
 
         fn tiling(&self) -> &Tiling {
             &self.tiling
@@ -1994,7 +1976,6 @@ pub(crate) mod test_helpers {
     impl TileOperator for NotifyingOp {
         // A test double holds no operator, and no session walks one.
         fn visit_inputs(&self, _visit: &mut dyn FnMut(super::InputEdgeSpec<'_>)) {}
-        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
 
         fn tiling(&self) -> &Tiling {
             &self.tiling
@@ -2313,7 +2294,6 @@ mod tests {
         impl_operator_base!();
 
         fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
-        fn visit_inputs_mut(&mut self, _visit: &mut dyn FnMut(&mut Box<dyn TileOperator>)) {}
 
         fn subscribe(
             &mut self,

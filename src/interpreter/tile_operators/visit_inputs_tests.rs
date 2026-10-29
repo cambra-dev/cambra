@@ -1,5 +1,4 @@
-//! `visit_inputs_mut` states what `visit_inputs` states as an owned or shared input, at every
-//! operator a compiled program holds. See `TileOperator::visit_inputs_mut`.
+//! The operator kinds a corpus of compiled programs reaches through `TileOperator::visit_inputs`.
 
 use std::collections::{BTreeSet, HashSet};
 use std::sync::{Arc, Mutex};
@@ -13,34 +12,18 @@ use crate::ccl::load::LoadedProgram;
 use crate::interpreter::operator_graph::EdgeKind;
 use crate::interpreter::{BaseType, Extent, TestDataSource};
 
-/// The owned and shared inputs `op` states through `visit_inputs`, as kind and identity.
-fn stated(op: &dyn TileOperator) -> Vec<(&'static str, Option<NodeId>)> {
-    let mut inputs = Vec::new();
+/// Record the kind of `op` and of everything below it through the owned and shared inputs it
+/// states.
+fn reached_by_value_edges(op: &dyn TileOperator, kinds: &mut BTreeSet<&'static str>) {
+    kinds.insert(op.kind());
     op.visit_inputs(&mut |edge| {
         if matches!(
             edge.kind,
             EdgeKind::Value { deferred: false } | EdgeKind::Share
         ) {
-            inputs.push((edge.target.kind(), edge.target.operator_id()));
+            reached_by_value_edges(edge.target, kinds);
         }
     });
-    inputs
-}
-
-/// Compare the two visitors at `op` and at everything below it that the mutable visitor reaches,
-/// recording the kinds met.
-fn compare(op: &mut Box<dyn TileOperator>, kinds: &mut BTreeSet<&'static str>) {
-    kinds.insert(op.kind());
-    let stated = stated(&**op);
-    let mut visited = Vec::new();
-    op.visit_inputs_mut(&mut |input| visited.push((input.kind(), input.operator_id())));
-    assert_eq!(
-        stated,
-        visited,
-        "`{}` visits the inputs it states",
-        op.kind()
-    );
-    op.visit_inputs_mut(&mut |input| compare(input, kinds));
 }
 
 /// The kinds of the operators that state an input, reached through every edge `visit_inputs`
@@ -178,27 +161,26 @@ fn context(case: &Case) -> GlobalContext {
     ctx
 }
 
-/// The kinds the two visitors were compared at, and the kinds with inputs the program's graph
-/// holds through any edge.
+/// The kinds reached through the owned and shared inputs, and the kinds with inputs the program's
+/// graph holds through any edge.
 pub(crate) fn survey() -> (BTreeSet<&'static str>, BTreeSet<&'static str>) {
-    let (mut compared, mut held) = (BTreeSet::new(), BTreeSet::new());
+    let (mut reached, mut held) = (BTreeSet::new(), BTreeSet::new());
     for case in corpus() {
         let mut ctx = context(&case);
         let loaded = LoadedProgram::test(case.code);
-        let mut program =
-            compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_else(|why| {
-                panic!(
-                    "`{}` compiles: {why:?}",
-                    case.code.lines().next().unwrap_or("")
-                )
-            });
+        let program = compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_else(|why| {
+            panic!(
+                "`{}` compiles: {why:?}",
+                case.code.lines().next().unwrap_or("")
+            )
+        });
         let mut seen = HashSet::new();
-        for output in &mut program.outputs {
+        for output in &program.outputs {
             kinds_with_inputs(&*output.op, &mut seen, &mut held);
-            compare(&mut output.op, &mut compared);
+            reached_by_value_edges(&*output.op, &mut reached);
         }
     }
-    (compared, held)
+    (reached, held)
 }
 
 /// The production kinds that state an input, which the corpus reaches through some edge.
@@ -247,11 +229,10 @@ const NOT_REACHED: &[&str] = &[
     "VariantIs",
 ];
 
-/// At every operator the mutable visitor reaches, both visitors state the same inputs, and the
-/// corpus reaches the kinds listed.
+/// The corpus reaches the kinds listed.
 #[test]
-fn every_operator_of_a_compiled_program_visits_the_inputs_it_states() {
-    let (compared, held) = survey();
+fn the_corpus_reaches_the_operator_kinds_listed() {
+    let (reached_through_values, held) = survey();
     let reached: BTreeSet<&str> = REACHED.iter().copied().collect();
     let missing: Vec<_> = reached.difference(&held).collect();
     assert!(
@@ -272,48 +253,7 @@ fn every_operator_of_a_compiled_program_visits_the_inputs_it_states() {
         "the corpus reaches {moved:?}: move it to `REACHED`"
     );
     assert!(
-        reached.is_subset(&compared.iter().copied().collect()),
-        "both visitors were compared at every kind reached: {compared:?}"
-    );
-}
-/// A `FanOutSlot` visits the fan-out's input under its write lock, and the visitor can replace
-/// it: the slot then states the replacement as its input.
-#[test]
-fn a_fan_out_slot_lets_its_visitor_replace_the_shared_input() {
-    use crate::interpreter::{BaseType, Extent, Value};
-    fn replace_below_the_first_slot(op: &mut Box<dyn TileOperator>) -> bool {
-        if op.kind() == "FanOutSlot" {
-            op.visit_inputs_mut(&mut |input| {
-                *input = Box::new(Constant::new(Value::Int(1), Extent::Base(BaseType::Int)));
-            });
-            return true;
-        }
-        let mut done = false;
-        op.visit_inputs_mut(&mut |input| done = done || replace_below_the_first_slot(input));
-        done
-    }
-    let mut ctx = GlobalContext::default();
-    let loaded = LoadedProgram::test(indoc! {r#"
-        xs = [1, 2, 3]
-        [a + b for a in xs for b in xs]
-    "#});
-    let mut compiled = compile_program(&mut ctx, &loaded, Box::new(|| {})).expect("compiles");
-    let main = compiled.main_mut().expect("a main output");
-    assert!(
-        replace_below_the_first_slot(&mut main.op),
-        "the program reads a value twice, through a `FanOutSlot`"
-    );
-    let mut slots_stating_the_constant = 0;
-    fn count(op: &mut Box<dyn TileOperator>, found: &mut usize) {
-        if op.kind() == "FanOutSlot" && stated(&**op).iter().map(|(kind, _)| *kind).eq(["Constant"])
-        {
-            *found += 1;
-        }
-        op.visit_inputs_mut(&mut |input| count(input, found));
-    }
-    count(&mut main.op, &mut slots_stating_the_constant);
-    assert!(
-        slots_stating_the_constant >= 1,
-        "a slot states what replaced its input"
+        reached.is_subset(&reached_through_values.iter().copied().collect()),
+        "every kind listed is reached through the owned and shared inputs: {reached_through_values:?}"
     );
 }
