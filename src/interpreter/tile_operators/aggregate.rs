@@ -84,6 +84,9 @@ struct AggregateProducer {
     /// the accumulator must never be handed back — it *is* the whole output, so
     /// re-emitting it returns released data.
     released: bool,
+    /// Whether [`BreakingProducer::consume_impl`] has run: a consuming aggregate answers from its
+    /// accumulator and never pulls its input.
+    consuming: bool,
 }
 
 impl AggregateProducer {
@@ -109,37 +112,15 @@ impl AggregateProducer {
             kind,
             accumulator,
             released: false,
+            consuming: false,
         }
     }
-}
 
-impl TileProducer for AggregateProducer {
-    fn state_info(&self) -> ProducerStateInfo {
-        ProducerStateInfo::holding(self.accumulator.cell_count())
-    }
-
-    impl_producer_base!();
-
-    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
-        visit("input", &*self.input);
-    }
-
-    /// An accumulator has no keys to project, so the projection is all of it or none. The
-    /// input is read whole whatever the consumer asks.
-    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        match projection_guard.projection(&self.name()) {
-            Projection::Everything => {}
-            Projection::Nothing => return self.tiling().empty_tile(),
-            Projection::Keys(_) => panic!(
-                "{} is one accumulator, which has no keys to project: {projection_guard:?}",
-                self.name()
-            ),
-        }
-        if self.released {
-            return self.tiling().empty_tile();
-        }
-        let i_tiling = self.input.tiling().clone();
-        let mut input_result = self.input.get(i_tiling.universal_guard());
+    /// Pull the input at `guard`, fold what it answers into the accumulator, and release the
+    /// input at what the answer stated. The accumulator is terminal once the input is released
+    /// whole.
+    fn fold_input(&mut self, guard: TileGuard) {
+        let mut input_result = self.input.get(guard);
         let upstream_guard = input_result.to_guard();
         input_result.compact();
         let Tile::DataFunction { codomain, .. } = input_result else {
@@ -163,15 +144,57 @@ impl TileProducer for AggregateProducer {
         };
         self.kind.accumulate(accumulator, &values, 0, values.rows());
         terminal[0] = is_terminal;
-        // An extreme with no identity has no value until its first element: an empty
-        // `terminal` says so ([`ExtractAggregate`]), however many pulls come first.
+    }
+
+    /// The accumulator, or nothing while an extreme with no identity has no element. An
+    /// extreme with no identity has no value until its first element: an empty `terminal` says
+    /// so ([`ExtractAggregate`]), however many pulls come first.
+    fn answer(&self) -> Tile {
+        let Tile::Aggregation {
+            ref accumulator,
+            terminal: ColumnValue::Bools(ref terminal),
+            ..
+        } = self.accumulator
+        else {
+            panic!("Accumulator must be Aggregation tile")
+        };
         if self.kind.awaits_first_element(accumulator) {
-            if is_terminal {
+            if terminal[0] {
                 self.kind.no_extreme_of_nothing();
             }
             return self.tiling().empty_tile();
         }
         self.accumulator.clone()
+    }
+}
+
+impl TileProducer for AggregateProducer {
+    fn state_info(&self) -> ProducerStateInfo {
+        ProducerStateInfo::holding(self.accumulator.cell_count())
+    }
+
+    impl_producer_base!();
+
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("input", &*self.input);
+    }
+
+    /// An accumulator has no keys to project, so the projection is all of it or none. The
+    /// input is read whole whatever the consumer asks.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection =
+            projection_of_one_value(&self.name(), "is one accumulator", &projection_guard);
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        if self.released {
+            return self.tiling().empty_tile();
+        }
+        if self.consuming {
+            return self.offer_impl(projection_guard);
+        }
+        self.fold_input(self.input.tiling().universal_guard());
+        self.answer()
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -185,6 +208,47 @@ impl TileProducer for AggregateProducer {
             self.released = true;
             self.input.release(self.input.tiling().universal_guard());
         }
+    }
+}
+
+impl BreakingProducer for AggregateProducer {
+    /// Folds what the input answers at `guard`, a guard of the input's tiling, into the
+    /// accumulator, and releases the input at what the answer stated. The aggregate stays
+    /// consuming.
+    fn consume_impl(&mut self, guard: TileGuard) {
+        debug_assert!(
+            guard.check_from(self.input.tiling()),
+            "{} consumes a guard of its input's tiling: {guard:?}",
+            self.name()
+        );
+        self.consuming = true;
+        if self.released || guard.projection(&self.input.name()) == Projection::Nothing {
+            return;
+        }
+        self.fold_input(guard);
+    }
+
+    fn input(&self) -> &dyn TileProducer {
+        &*self.input
+    }
+
+    /// The accumulator is one value, held unless an extreme has not seen its first element.
+    fn held(&self) -> TileGuard {
+        let Tile::Aggregation { accumulator, .. } = &self.accumulator else {
+            panic!("Accumulator must be Aggregation tile")
+        };
+        match self.kind.awaits_first_element(accumulator) {
+            true => self.tiling().empty_guard(),
+            false => self.tiling().universal_guard(),
+        }
+    }
+
+    fn offer_impl(&mut self, guard: TileGuard) -> Tile {
+        let projection = projection_of_one_value(&self.name(), "is one accumulator", &guard);
+        if projection == Projection::Nothing || self.released {
+            return self.tiling().empty_tile();
+        }
+        self.answer()
     }
 }
 
@@ -1638,5 +1702,340 @@ mod map_extract_aggregate_projection_tests {
         for guard in [keys_between(0, 3), keys_between(2, 5), keys_between(5, 5)] {
             assert_conforms(|| Box::new(finished_sums().0), guard);
         }
+    }
+}
+
+/// A consuming `Aggregate` over an input that grows and is released: what its accumulator holds,
+/// what it finalizes and what reaches the input, against a model of the rows consumed.
+#[cfg(test)]
+mod aggregate_consuming_tests {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    use crate::interpreter::BaseType;
+    use crate::interpreter::tile_operators::fanout::MemoProducer;
+    use crate::interpreter::tile_operators::growing::{
+        Input, InputModel, KEYS, Region, Rng, Shared, Step, growing_source, ints, predicate,
+        source, value,
+    };
+    use crate::interpreter::tile_operators::test_helpers::keys_between;
+    use Region::{All, Keys};
+    use Step::{Add, Close, Consume, Notify, Release};
+
+    fn sum_tiling() -> Tiling {
+        Tiling::Aggregation {
+            kind: AggregateKind::Sum,
+            accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+        }
+    }
+
+    fn sum_over(source: &Shared) -> AggregateProducer {
+        AggregateProducer::new(
+            ProducerBase::unowned(AggregateProducer::alloc_id(), &sum_tiling()),
+            Box::new(Input::over(source)),
+        )
+    }
+
+    /// The accumulator's sum and whether it is terminal.
+    fn held(aggregate: &AggregateProducer) -> (i64, bool) {
+        let Tile::Aggregation {
+            accumulator,
+            terminal: ColumnValue::Bools(terminal),
+            ..
+        } = &aggregate.accumulator
+        else {
+            panic!("an accumulator, got {:?}", aggregate.accumulator)
+        };
+        let Tile::Scalar(ColumnValue::Ints(sum)) = accumulator.as_ref() else {
+            panic!("an integer sum, got {accumulator:?}")
+        };
+        (sum[0], terminal[0])
+    }
+
+    fn sum_of(keys: impl IntoIterator<Item = u64>) -> i64 {
+        keys.into_iter().map(value).sum()
+    }
+
+    /// A consume at a region folds the rows of that region, pulls the input at it and releases
+    /// the input at it; the accumulator is not terminal until the input is released whole.
+    #[test]
+    fn a_region_is_folded_pulled_and_released_once() {
+        let source = source(0..10);
+        let mut aggregate = sum_over(&source);
+        aggregate.consume_impl(keys_between(2, 5));
+        assert_eq!(held(&aggregate), (sum_of(2..=5), false));
+        assert_eq!(source.borrow().pulled, vec![keys_between(2, 5)]);
+        assert_eq!(source.borrow().released, vec![keys_between(2, 5)]);
+    }
+
+    /// A second disjoint region adds its rows, and an overlapping one adds only the rows the
+    /// input still holds, so no row is folded twice.
+    #[test]
+    fn disjoint_and_overlapping_regions_fold_each_row_once() {
+        let source = source(0..10);
+        let mut aggregate = sum_over(&source);
+        aggregate.consume_impl(keys_between(1, 2));
+        aggregate.consume_impl(keys_between(7, 9));
+        assert_eq!(held(&aggregate).0, sum_of([1, 2, 7, 8, 9]));
+        aggregate.consume_impl(keys_between(2, 7));
+        assert_eq!(
+            held(&aggregate).0,
+            sum_of(1..=9),
+            "rows 2 and 7 are not folded again"
+        );
+    }
+
+    /// Everything consumed drains the input: the accumulator is terminal and `finalize` holds
+    /// the whole value.
+    #[test]
+    fn everything_consumed_is_terminal_and_finalizes_the_value() {
+        let source = source(0..10);
+        let mut aggregate = sum_over(&source);
+        aggregate.consume_impl(ints().universal_guard());
+        assert_eq!(held(&aggregate), (sum_of(0..10), true));
+        assert_eq!(aggregate.finalize(), sum_tiling().universal_guard());
+        assert_eq!(
+            aggregate.get(sum_tiling().universal_guard()),
+            aggregate.accumulator,
+            "the offer is the accumulator"
+        );
+    }
+
+    /// Nothing consumed pulls nothing.
+    #[test]
+    fn nothing_consumed_pulls_nothing() {
+        let source = source(0..10);
+        let mut aggregate = sum_over(&source);
+        aggregate.consume_impl(ints().empty_guard());
+        assert!(source.borrow().pulled.is_empty());
+        assert_eq!(held(&aggregate), (0, false));
+    }
+
+    /// A release of the whole output leaves nothing held, and the input is released whole.
+    #[test]
+    fn finalize_after_a_release_holds_nothing() {
+        let source = source(0..4);
+        let mut aggregate = sum_over(&source);
+        aggregate.consume_impl(ints().universal_guard());
+        aggregate.release(sum_tiling().universal_guard());
+        assert_eq!(aggregate.finalize(), sum_tiling().empty_guard());
+        assert!(aggregate.get(sum_tiling().universal_guard()).is_empty());
+    }
+
+    /// A pipeline finalizes after its input has drained, which is the invariant of the protocol.
+    #[test]
+    #[should_panic(expected = "finalizes after its input has stated everything complete")]
+    fn finalize_before_the_input_has_drained_panics() {
+        let mut aggregate = sum_over(&source(0..10));
+        aggregate.consume_impl(keys_between(0, 3));
+        aggregate.finalize();
+    }
+
+    /// A consuming aggregate answers from its accumulator and pulls nothing.
+    #[test]
+    fn a_consuming_aggregate_offers_without_pulling() {
+        let source = source(0..10);
+        let mut aggregate = sum_over(&source);
+        aggregate.consume_impl(ints().universal_guard());
+        let pulls = source.borrow().pulled.len();
+        for _ in 0..3 {
+            aggregate.get(sum_tiling().universal_guard());
+        }
+        assert_eq!(source.borrow().pulled.len(), pulls);
+    }
+
+    /// A growing input withholds a key it does not hold yet: the release leaves it, and a row that
+    /// arrives there later is folded by the next consume and released.
+    #[test]
+    fn a_key_the_input_withheld_is_folded_by_a_later_consume() {
+        let source = growing_source([0, 1, 2, 4, 5]);
+        let mut aggregate = sum_over(&source);
+        aggregate.consume_impl(keys_between(0, 5));
+        assert!(!predicate(&source.borrow().released[0]).contains(&Value::UInt(3)));
+        source.borrow_mut().rows.insert(3, value(3));
+        aggregate.consume_impl(keys_between(0, 5));
+        assert_eq!(held(&aggregate).0, sum_of(0..=5));
+        assert!(predicate(source.borrow().released.last().unwrap()).contains(&Value::UInt(3)));
+    }
+
+    /// A consume after the output was released pulls nothing: the input was released whole.
+    #[test]
+    fn a_consume_after_a_release_pulls_nothing() {
+        let source = growing_source(0..4);
+        let mut aggregate = sum_over(&source);
+        aggregate.consume_impl(keys_between(0, 1));
+        aggregate.release(sum_tiling().universal_guard());
+        let pulls = source.borrow().pulled.len();
+        aggregate.consume_impl(ints().universal_guard());
+        assert_eq!(source.borrow().pulled.len(), pulls);
+        assert_eq!(source.borrow().wasted, 0);
+    }
+
+    /// The model of a run over a growing input: which rows were folded, whether the output was
+    /// released, and the input.
+    struct Run {
+        sut: AggregateProducer,
+        sut_source: Shared,
+        input: InputModel,
+        folded: BTreeSet<u64>,
+        released: bool,
+        trace: String,
+    }
+
+    impl Run {
+        fn new(initial: &[u64], trace: String) -> Self {
+            let sut_source = growing_source(initial.iter().copied());
+            Self {
+                sut: sum_over(&sut_source),
+                sut_source,
+                input: InputModel::new(initial),
+                folded: BTreeSet::new(),
+                released: false,
+                trace,
+            }
+        }
+
+        fn apply(&mut self, step: Step) {
+            self.trace.push_str(&format!(" {step:?}"));
+            match step {
+                Add(key) => {
+                    if self.input.add(key) {
+                        self.sut_source.borrow_mut().rows.insert(key, value(key));
+                    }
+                }
+                Close => {
+                    self.input.closed = true;
+                    self.sut_source.borrow_mut().closed = true;
+                }
+                // The aggregate listens to no region: its input's notifications reach its
+                // consumer widened.
+                Notify(_) => unreachable!("the steps of an aggregate carry no notification"),
+                Consume(region) => {
+                    self.sut.consume_impl(region.guard());
+                    if !self.released {
+                        self.folded.extend(self.input.pull(region).0);
+                    }
+                }
+                // An accumulator has no sub-regions, so only the whole output is released.
+                Release(_) => {
+                    self.sut.release(sum_tiling().universal_guard());
+                    if !self.released {
+                        self.released = true;
+                        self.input.release(All);
+                    }
+                }
+            }
+        }
+
+        fn check(&mut self) {
+            let trace = &self.trace;
+            if !self.released {
+                let (sum, terminal) = held(&self.sut);
+                assert_eq!(sum, sum_of(self.folded.iter().copied()), "{trace}: the sum");
+                assert_eq!(terminal, self.input.drained(), "{trace}: the terminal flag");
+            }
+            self.input.check(&self.sut_source, trace);
+            if self.input.drained() {
+                let expected = match self.released {
+                    true => sum_tiling().empty_guard(),
+                    false => sum_tiling().universal_guard(),
+                };
+                assert_eq!(self.sut.finalize(), expected, "{trace}: finalize");
+            }
+        }
+
+        /// Close the input and consume everything: an aggregate in pull mode over exactly the
+        /// rows the consuming one folded answers what it offers.
+        fn finish(&mut self) {
+            if !self.input.closed {
+                self.apply(Close);
+            }
+            self.apply(Consume(All));
+            self.check();
+            if self.released {
+                return;
+            }
+            let twin_source = source(self.folded.iter().copied());
+            let mut twin = sum_over(&twin_source);
+            assert_eq!(
+                self.sut.get(sum_tiling().universal_guard()),
+                twin.get(sum_tiling().universal_guard()),
+                "{}: the offer is the answer of an aggregate in pull mode",
+                self.trace
+            );
+        }
+
+        fn run(steps: &[Step], initial: &[u64]) {
+            let mut run = Run::new(initial, format!("initial {initial:?} steps"));
+            for step in steps {
+                run.apply(*step);
+                run.check();
+            }
+            run.finish();
+        }
+    }
+
+    #[test]
+    fn enumerated_interleavings_keep_the_model() {
+        let sequences: &[&[Step]] = &[
+            &[Consume(Keys(0, 3)), Add(3), Add(8), Consume(Keys(0, 11))],
+            &[
+                Consume(Keys(0, 3)),
+                Add(2),
+                Add(9),
+                Close,
+                Consume(Keys(0, 11)),
+            ],
+            &[
+                Add(3),
+                Consume(Keys(2, 4)),
+                Add(3),
+                Consume(Keys(2, 4)),
+                Release(All),
+            ],
+            &[
+                Consume(Keys(0, 5)),
+                Consume(Keys(3, 8)),
+                Release(All),
+                Consume(All),
+            ],
+            &[Close, Consume(All), Add(4), Consume(Keys(0, 6))],
+        ];
+        for steps in sequences {
+            Run::run(steps, &[0, 1, 2, 4, 5, 6]);
+        }
+    }
+
+    #[test]
+    fn random_interleavings_keep_the_model() {
+        const SEED: u64 = 0x5851_f42d_4c95_7f2d;
+        let mut rng = Rng(SEED);
+        for iteration in 0..300 {
+            let initial: Vec<u64> = (0..KEYS).filter(|_| rng.below(2) == 0).collect();
+            let trace = format!("seed {SEED:#x} iteration {iteration} initial {initial:?} steps");
+            let mut run = Run::new(&initial, trace);
+            for _ in 0..14 {
+                let step = rng.step_among(&run.folded, false);
+                run.apply(step);
+                run.check();
+            }
+            run.finish();
+        }
+    }
+
+    /// An aggregate over a memo: the memo's finalized guard is the aggregate's consume guard.
+    #[test]
+    fn an_aggregate_consumes_the_guard_a_memo_finalized() {
+        let source = source(0..10);
+        let mut memo = MemoProducer::over(Box::new(Input::over(&source)), &ints());
+        memo.consume_impl(ints().universal_guard());
+        memo.release(keys_between(2, 3));
+        let handed = memo.finalize();
+        let mut aggregate = AggregateProducer::new(
+            ProducerBase::unowned(AggregateProducer::alloc_id(), &sum_tiling()),
+            Box::new(memo),
+        );
+        aggregate.consume_impl(handed);
+        assert_eq!(held(&aggregate), (sum_of([0, 1, 4, 5, 6, 7, 8, 9]), true));
     }
 }

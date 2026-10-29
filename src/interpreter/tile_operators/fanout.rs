@@ -2333,8 +2333,8 @@ mod consuming_tests {
 
     use crate::interpreter::tile_operators::Scheduler;
     use crate::interpreter::tile_operators::growing::{
-        Input, KEYS, Region, Released, Rng, Shared, Step, entries, growing_source, ints, keys_of,
-        keys_predicate, predicate, rows_of, same_region, source, value,
+        Input, InputModel, KEYS, Region, Released, Rng, Shared, Step, entries, growing_source,
+        ints, keys_of, keys_predicate, predicate, rows_of, same_region, source, value,
     };
     use crate::interpreter::tile_operators::test_helpers::keys_between;
     use crate::interpreter::{Predicate, Value};
@@ -2712,11 +2712,7 @@ mod consuming_tests {
         lazy: MemoProducer,
         lazy_notifier: Box<dyn Consumer>,
         lazy_source: Shared,
-        /// Every row added.
-        rows: BTreeSet<u64>,
-        closed: bool,
-        /// The keys the input holds released: what was answered and what was released.
-        input_released: Released,
+        input: InputModel,
         /// What the memo's output was released at.
         memo_released: Released,
         memo_released_predicate: Predicate,
@@ -2724,8 +2720,8 @@ mod consuming_tests {
         stated: Predicate,
         /// The keys the cache holds.
         cache: BTreeSet<u64>,
-        /// What the input must have been released at, in order.
-        releases: Vec<Predicate>,
+        /// Whether an answer stated everything complete, after which the memo reads no more.
+        drained: bool,
         /// The seed, the iteration, the initial rows and the steps so far, for a failure.
         trace: String,
     }
@@ -2745,14 +2741,12 @@ mod consuming_tests {
                 lazy,
                 lazy_notifier,
                 lazy_source,
-                rows: initial.iter().copied().collect(),
-                closed: false,
-                input_released: Released::default(),
+                input: InputModel::new(initial),
                 memo_released: Released::default(),
                 memo_released_predicate: Predicate::False,
                 stated: Predicate::False,
                 cache: BTreeSet::new(),
-                releases: Vec::new(),
+                drained: false,
                 trace,
             }
         }
@@ -2765,18 +2759,17 @@ mod consuming_tests {
         fn apply(&mut self, step: Step) {
             self.trace.push_str(&format!(" {step:?}"));
             match step {
-                // A closed input receives no row.
-                Add(_) if self.closed => {}
                 Add(key) => {
-                    self.rows.insert(key);
-                    for source in [&self.consuming_source, &self.lazy_source] {
-                        source.borrow_mut().rows.insert(key, value(key));
+                    if self.input.add(key) {
+                        for source in [&self.consuming_source, &self.lazy_source] {
+                            source.borrow_mut().rows.insert(key, value(key));
+                        }
+                        self.notify(Keys(key, key).projection());
                     }
-                    self.notify(Keys(key, key).projection());
                 }
                 Notify(region) => self.notify(region.projection()),
                 Close => {
-                    self.closed = true;
+                    self.input.closed = true;
                     for source in [&self.consuming_source, &self.lazy_source] {
                         source.borrow_mut().closed = true;
                     }
@@ -2784,37 +2777,11 @@ mod consuming_tests {
                 }
                 Consume(region) => {
                     self.consuming.consume_impl(region.guard());
-                    let keys = region.keys();
-                    let answered: BTreeSet<u64> = self
-                        .rows
-                        .iter()
-                        .filter(|key| keys.contains(key) && !self.input_released.keys.contains(key))
-                        .copied()
-                        .collect();
-                    // A growing input states complete the keys it holds, a closed one the region.
-                    let stated = match self.closed {
-                        true => predicate(&region.guard()),
-                        false => points(self.rows.iter().copied().filter(|key| keys.contains(key))),
-                    };
-                    self.cache.extend(answered);
-                    self.stated = self.stated.union(&stated);
-                    let covered = match self.closed {
-                        true => self.input_released.covers(region),
-                        false => self
-                            .rows
-                            .iter()
-                            .filter(|key| keys.contains(key))
-                            .all(|key| self.input_released.keys.contains(key)),
-                    };
-                    if !covered {
-                        self.releases.push(stated);
-                    }
-                    match self.closed {
-                        true => self.input_released.add(region),
-                        false => self
-                            .input_released
-                            .keys
-                            .extend(self.rows.iter().copied().filter(|key| keys.contains(key))),
+                    if !self.drained {
+                        let (answered, stated) = self.input.pull(region);
+                        self.cache.extend(answered);
+                        self.stated = self.stated.union(&stated);
+                        self.drained = self.input.closed && matches!(region, All);
                     }
                 }
                 Release(region) => {
@@ -2827,10 +2794,7 @@ mod consuming_tests {
                         self.memo_released_predicate = self
                             .memo_released_predicate
                             .union(&predicate(&region.guard()));
-                        if !self.input_released.covers(region) {
-                            self.releases.push(predicate(&region.guard()));
-                        }
-                        self.input_released.add(region);
+                        self.input.release(region);
                     }
                 }
             }
@@ -2844,19 +2808,8 @@ mod consuming_tests {
                 rows_of(self.cache.iter().copied()),
                 "{trace}: the cache"
             );
-            let released = self.consuming_source.borrow().released.clone();
-            assert_eq!(
-                released.len(),
-                self.releases.len(),
-                "{trace}: the input's releases"
-            );
-            for (actual, expected) in released.iter().zip(&self.releases) {
-                assert!(
-                    same_region(&predicate(actual), expected),
-                    "{trace}: the input is released at {actual:?}, not {expected:?}"
-                );
-            }
-            if self.input_released.covers(All) {
+            self.input.check(&self.consuming_source, trace);
+            if self.input.drained() {
                 let guard = predicate(&self.consuming.finalize());
                 let expected = self.stated.minus(&self.memo_released_predicate);
                 assert!(
@@ -2870,7 +2823,7 @@ mod consuming_tests {
         /// Close the input, consume everything, and compare what the consuming memo offers with
         /// what the twin in pull mode answers for the same script.
         fn finish(&mut self) {
-            if !self.closed {
+            if !self.input.closed {
                 self.apply(Close);
             }
             self.apply(Consume(All));
@@ -2898,11 +2851,6 @@ mod consuming_tests {
             }
             run.finish();
         }
-    }
-
-    /// The predicate naming exactly `keys`.
-    fn points(keys: impl IntoIterator<Item = u64>) -> Predicate {
-        Predicate::from_column_value(&ColumnValue::UInts(keys.into_iter().collect()))
     }
 
     use Region::{All, Keys};
