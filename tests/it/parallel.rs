@@ -203,6 +203,25 @@ fn a_program_with_another_breaker_is_not_a_morsel_pipeline() {
     );
 }
 
+/// A scalar `main` is a `Constant` with no rows to cut, and the plan says so.
+#[test]
+fn a_constant_main_is_refused_as_no_source_of_rows() {
+    let mut ctx = GlobalContext::default();
+    let loaded = LoadedProgram::test(indoc! {"
+        a = 3
+        a + 1
+    "});
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let compiled = compile_program(&mut ctx, &loaded, consumer).expect("compiles");
+    let refused = plan(&compiled.operator_graph)
+        .err()
+        .expect("a constant is not streamed");
+    assert!(
+        refused.to_string().contains("no source of rows"),
+        "{refused}"
+    );
+}
+
 /// `xs = [x + 1 for x …]` read by `[a * 2 for a in xs]`: the pipeline that fills the `Memo` and
 /// the pipeline behind it run on the pool, and the answer is the one pull of the whole program.
 fn shared(rows: u64, tail: &str) -> String {

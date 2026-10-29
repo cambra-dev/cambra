@@ -312,7 +312,12 @@ impl Planner<'_> {
             };
             match classify(kind) {
                 Class::Refuse(reason) => return Err(Unsupported(reason)),
-                Class::Memo | Class::Operand | Class::Extract | Class::Fold => {
+                Class::Operand => {
+                    return Err(Unsupported(
+                        "a `Constant` is read whole by the operator that applies it and is no source of rows".into(),
+                    ));
+                }
+                Class::Memo | Class::Extract | Class::Fold => {
                     return Err(Unsupported(format!(
                         "`{kind}` is not a streaming operator here"
                     )));

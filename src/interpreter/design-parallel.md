@@ -620,8 +620,9 @@ answers the keys whose predicate holds. Three candidates are not admitted.
 
 - `Constant` as a source. A list literal compiles to an `IterateExtent` and a `Constant` operand
   that a `MapResult` applies, so a collection-valued `Constant` is never a chain's data input in
-  the corpus, and a `morsel_source` for it admits no program. The other `Constant` refusals are
-  scalars, which have no rows to cut.
+  the corpus, and a `morsel_source` for it admits no program. The `Constant` refusals are scalars,
+  which have no rows to cut, and the plan refuses a `Constant` at the head of a chain as "no source
+  of rows".
 - `SelectField`. `selects_a_tile` builds it only over a bare product or a record holding a level.
   Over a stream, that needs a `MakeRecord` or a source of records holding collections, and the
   corpus has no program that reaches it with an admitted head. It stays refused until a group with
@@ -645,6 +646,11 @@ Admission also needs the operator to answer a collection over the keys its input
 `VariantWrap` wraps it whole, and a morsel's guard would cut something they do not name. The plan
 compares the operator's tiling with its input's and refuses a mismatch
 (`a_streaming_operator_at_the_outermost_level_is_refused`).
+
+The operators that stay refused need machinery of their own: `MakeRecord` and `Zip` join several
+inputs, `UnionOperator` concatenates keys, `Converse` and `MapExtractAggregate` read inner levels, a
+`MapResult` that applies a `FanOutSlot` has a build side, and `StoreFinalRead` and `ExtractFinal`
+read a recurrence's result.
 
 A list of variants a hundred elements long overflows the stack when the program compiles, on the
 serial path as well; the plan test uses twenty.
