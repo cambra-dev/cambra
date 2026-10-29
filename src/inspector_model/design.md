@@ -283,6 +283,54 @@ node's rendered `type` carries it, and the interiors outnumber the program they 
 `predicate` is read as the filter the traversals meaning "the program" apply. The wire ships them
 regardless, because the pane links name their ids.
 
+### An occurrence on the wire
+
+**Planned.** An occurrence is the id the compiler gives a name the IR holds in a field rather than
+as a node ([provenance.md](../ccl/design/provenance.md#name-occurrences)). It is one of two kinds:
+
+- a **binding occurrence**, the name a binder introduces: `p` in `def f(p)`;
+- an **applied occurrence** held as a field, a use of a binder bound elsewhere: `out` in `out << v`,
+  which a `Feed`, `Define` or `MutWrite` holds.
+
+A use held as a node, the `g` in `p + g`, is a `Var` and ships as one already. Every pane ships
+each of its occurrences as an entry of the node table, because the pane links name their ids. An
+occurrence entry is a child of the node that holds it: the binding node for a binding occurrence,
+the `Feed`, `Define` or `MutWrite` for an applied occurrence.
+
+A child carries a `kind` in place of `predicate`:
+
+| `kind` | the child is |
+|---|---|
+| `value` | a value child, as today's `predicate: false` |
+| `occurrence` | a binding occurrence or an applied occurrence the parent holds |
+| `predicate` | a refinement predicate riding one of the parent's type slots, as today's `predicate: true` |
+
+Children ship value children first, then occurrences in `for_each_own_id` order, then predicates in
+`walk_type_slots` order. A value child's position in `children` stays its positional index, so the
+edge label a consumer derives is unchanged.
+
+An occurrence entry carries the fields every tree node carries:
+
+| field | binding occurrence (`p` in `def f(p)`) | applied occurrence (`out` in `out << v`) |
+|---|---|---|
+| `label` | `Binder(p)` | `Use(out)` |
+| `nodeId` | the occurrence's id | the occurrence's id |
+| `spans` | the span of the name, `p` | the span of the name, `out` |
+| `rewritten` | `{ Machinery, "lower.image" }` in a lowering pane, the copy's tag in a later one | likewise |
+| `type` | the binder's `ty`, rendered | the `ty` of the binder it names, found by `Uid` in the same tree |
+| `children` | empty | empty |
+
+The type is what makes an occurrence worth drawing. A tree pane draws an occurrence as a row under
+the node that holds it, edge-labelled `binder` or `use` rather than by position, so a click on a
+name in the source selects that row, and the row shows the binder's type in that pane. The
+positional queries (`tightestNodeAt`, `typesAt`) include occurrences; a predicate stays excluded
+from them because the tree draws no row for one.
+
+Both wire validators check that `kind` is one of the three, that an occurrence entry has no
+children, and that one child edge names each occurrence. `IrChild` is a breaking change to the wire
+shape, which the [schema version](#the-schema-version) rule leaves at 1 while no durable consumer
+exists.
+
 ### Types on the wire
 
 A node's `type` is rendered by `Display for Type`, and `Type`'s `Serialize` impl delegates to that
@@ -305,6 +353,10 @@ node and has no span of its own, so the site reported is the span of the node th
 `g` in `g = 10` resolves to the statement rather than to the name, and a call resolves to the whole
 `def`.
 
+**Planned.** A use resolves to its binder's binding occurrence, so `defSpan` is the span of the name
+as written: a use of `g` resolves to the `g` in `g = 10`, and a call to `f` to the `f` in `def f`
+([An occurrence on the wire](#an-occurrence-on-the-wire)).
+
 The pane is named, not positional: monomorphization splits a generalized definition into one
 specialization per resolved type, so a later pane holds one copy of a `def` body per specialization
 and would report each use once per copy. Pre-inference is the pane where a source name occurs as
@@ -317,12 +369,21 @@ through the projection's two spans instead, the occurrence on the `Apply` and th
 ([ir.md](../ccl/design/ir.md#source-locations-on-substituted-parameter-projections)). The projection is
 identified by its `lower.uncurry_proj` tag, so an author-written `t.0` is not mistaken for one.
 
+**Planned.** A constructor pattern's fields in a `match` arm resolve the same way. `bind_parameters`
+substitutes them as `uncurry_params` substitutes parameters, and both tag the substituted
+projection `lower.param_proj` at the span of the declared name, so `w` in
+`case Shape::rect(w, h): w * h` resolves to the `w` in the pattern
+([provenance.md](../ccl/design/provenance.md#the-occurrence-field)).
+
 **What does not resolve.** A `Feed`, `Define` or `MutWrite` names a binder bound elsewhere, and that
 name is a field rather than a node, so the only span available is the whole node's. A use span
 covering a statement would contain the narrower uses inside it, and a consumer takes the first
 containing row, so a broad row would shadow them. Those uses contribute none: `out` in
-`out << value` does not resolve to its declaration. Closing it needs a span on the name field, which
-is a `ccl` change.
+`out << value` does not resolve to its declaration.
+
+**Planned.** Such a name resolves through its applied occurrence: `useSpan` is the span of the name
+and `defSpan` its binder's binding occurrence, so `out` in `out << value` resolves to the `out` in
+`out = defer()`.
 
 This layer implements no scoping of its own. CHL's binding structure is stated in `ccl/scope.rs`
 and minted by `uniquify`, and resolution here reads the result rather than recomputing it, so a
@@ -447,6 +508,6 @@ value domains and carries a `contains` bug on half-bounded intervals (see
 - **No channel names a binder site.** A binder is not an expression, so nothing attributes it and no
   field says which node binds the name written at a given span. The payload therefore carries no
   binder types, and a consumer clicking a binder resolves the node whose span contains it — for
-  `g = "abc"` that is the whole `Let`, whose type is the type of what follows the binding. Closing
-  the gap means a source span on `TypedBinding`, after which the binder's type is a read; that is a
-  `ccl` change, carried as `TODO(binder-site)`.
+  `g = "abc"` that is the whole `Let`, whose type is the type of what follows the binding.
+  **Planned:** an occurrence entry closes this
+  ([An occurrence on the wire](#an-occurrence-on-the-wire)).
