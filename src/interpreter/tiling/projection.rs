@@ -1017,6 +1017,34 @@ mod tests {
         );
     }
 
+    /// Closing drops an arm only where its level's extent is a finite range of positions none of
+    /// which the arm names, and keeps the others as they are.
+    #[test]
+    fn closing_drops_only_the_arms_naming_no_key_of_their_level() {
+        let ints = || Tiling::Scalar(Extent::Base(BaseType::Int));
+        let finite = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::data_function(
+                Extent::uint_range(2),
+                Tiling::data_function(Extent::uint_range(1), ints()),
+            ),
+        );
+        let open = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::data_function(
+                Extent::uint_range(2),
+                Tiling::data_function(Extent::Base(BaseType::UInt), ints()),
+            ),
+        );
+        let past_the_end =
+            CurryLevel::new(2).wrap_guard(domain(under(under(key(0), key(1)), positions(1, 5))));
+        let inside = codomain(domain(under(key(1), key(0))));
+        let both = TileGuard::flatten_or(vec![past_the_end.clone(), inside.clone()]);
+        assert_eq!(both.clone().closed_over(&finite), inside);
+        assert_eq!(both.clone().closed_over(&open), both);
+        assert!(past_the_end.closed_over(&finite).is_empty());
+    }
+
     /// A difference of a collection's keys and a scalar's names no region, though each reads as
     /// a projection where it is universal or empty.
     #[test]
@@ -1025,6 +1053,43 @@ mod tests {
         crate::interpreter::tile_operators::guard_minus(
             &TileGuard::Scalar(Predicate::True),
             &domain(key(1)),
+        );
+    }
+
+    /// The design's example: a breaker holding the keys 0 and 1 and released up to the path
+    /// `(0, 1)` holds key 1 and row 0's paths past 1, and row 0 has none past 1 where its
+    /// positions are `0..2`.
+    #[test]
+    fn a_difference_of_nested_guards_closes_over_the_row_s_extent() {
+        use crate::interpreter::tile_operators::guard_minus;
+        let held = domain(positions(0, 1));
+        let released = codomain(domain(under(key(0), positions(0, 1))));
+        let left = guard_minus(&held, &released);
+        let region = Projection::of(&left).expect("a difference of keys is keys");
+        for (path, named) in [
+            ([0, 1], false),
+            ([0, 2], true),
+            ([1, 0], true),
+            ([2, 0], false),
+        ] {
+            assert_eq!(names(&region, &path), named, "{path:?} in {left:?}");
+        }
+        let two_positions = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::data_function(
+                Extent::uint_range(2),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        assert_eq!(left.clone().closed_over(&two_positions), domain(key(1)));
+        assert_eq!(
+            left.clone().closed_over(&nested_tiling()),
+            left,
+            "row 0 of positions 0..3 has the path (0, 2) left"
+        );
+        assert!(
+            guard_minus(&codomain(domain(under(key(0), key(1)))), &released).is_empty(),
+            "a released position is held no more"
         );
     }
 
