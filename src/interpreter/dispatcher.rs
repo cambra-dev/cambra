@@ -20,6 +20,8 @@ use std::thread;
 
 use intervalsets::Bounding;
 
+use crate::ccl::{FieldKey, TagMap};
+
 use crate::interpreter::tile_operators::{
     BreakingProducer, FunctionGuard, Tiling, cut_before, guard_minus, partition_gap,
 };
@@ -260,6 +262,39 @@ impl Queue {
     }
 }
 
+/// How a pipeline's queue is filled from what the pipeline it reads pushes.
+enum Reading {
+    /// The pushed morsels as they are.
+    Pushed,
+    /// Its breaker's input whole, as that input's morsels ([`Dispatcher::read_whole`]).
+    Whole(Vec<TileGuard>),
+    /// The pushed morsels restated in its breaker's input keys ([`Dispatcher::read_mapped`]).
+    Mapped(Mapped),
+}
+
+/// How a reader's packages restate the pushes of the pipeline it reads
+/// ([`Dispatcher::read_mapped`]).
+struct Mapped {
+    /// The tags a pushed guard is restated under, innermost first.
+    tags: Vec<FieldKey>,
+    /// The regions of the reader's input no pipeline pushes, one package each.
+    uncovered: Vec<TileGuard>,
+}
+
+impl Mapped {
+    /// `guard`, a guard of the pushing breaker's outermost keys, under each tag in turn; `None`
+    /// for a guard that names more than the outermost keys.
+    fn restate(&self, guard: &TileGuard) -> Option<TileGuard> {
+        let TileGuard::Function(FunctionGuard::Domain(keys)) = guard else {
+            return None;
+        };
+        let keys = self.tags.iter().fold(keys.clone(), |keys, tag| {
+            Predicate::tagged(TagMap::from_arms(vec![(tag.clone(), keys)]), false)
+        });
+        Some(TileGuard::Function(FunctionGuard::Domain(keys)))
+    }
+}
+
 /// One pipeline's queue and progress in one epoch. A claim reads it without a lock.
 struct EpochPipeline {
     queue: Queue,
@@ -337,10 +372,9 @@ pub struct Dispatcher {
     /// Per pipeline, whether it consumes its morsels in queue order one at a time
     /// ([`order`](Dispatcher::order)). Set before the dispatcher is shared.
     ordered: Vec<bool>,
-    /// Per pipeline that reads its breaker's input whole rather than what the pipeline it reads
-    /// pushes ([`read_whole`](Dispatcher::read_whole)), that input's morsels. Set before the
-    /// dispatcher is shared.
-    whole: Vec<Option<Vec<TileGuard>>>,
+    /// Per pipeline, how its queue is filled from what the pipeline it reads pushes. Set before
+    /// the dispatcher is shared.
+    reading: Vec<Reading>,
     /// Per source pipeline, the most packages queued for it and not yet acknowledged that a
     /// notify finds before it queues more ([`limit`](Dispatcher::limit)); `usize::MAX` for none.
     /// Set before the dispatcher is shared.
@@ -432,7 +466,7 @@ impl Dispatcher {
             reads,
             readers,
             ordered: vec![false; count],
-            whole: vec![None; count],
+            reading: (0..count).map(|_| Reading::Pushed).collect(),
             credit: vec![usize::MAX; count],
             pipelines,
             window: Self::slots(DEFAULT_WINDOW, count),
@@ -486,8 +520,8 @@ impl Dispatcher {
 
     /// Mark `pipeline`, which reads a pipeline, as consuming its breaker's input whole, `input`
     /// cut one package per morsel ([`seed`]), in the run's last epoch, in place of what the
-    /// pipeline it reads pushes: a pushed guard names the pushing breaker's keys, which are the
-    /// reader's only where the reader's breaker reads the pushing one directly. Its input is whole
+    /// pipeline it reads pushes: a pushed guard names the pushing breaker's keys, which the
+    /// producers between the two breakers can read in other keys. Its input is whole
     /// only once every epoch has run, so its queue in an earlier epoch closes empty.
     ///
     /// # Panics
@@ -500,7 +534,46 @@ impl Dispatcher {
              from its start",
             pipeline.0
         );
-        self.whole[pipeline.0] = Some(seed(input, self.morsel_rows));
+        self.read(pipeline, Reading::Whole(seed(input, self.morsel_rows)));
+    }
+
+    /// Mark `pipeline`, which reads a pipeline, as consuming that pipeline's pushed morsels
+    /// restated in its own breaker's input keys, in each epoch, and `uncovered` besides, in the
+    /// run's last epoch. A pushed guard of the pushing breaker's outermost keys is restated under
+    /// each tag of `tags` in turn, innermost first, as the producers between the two breakers tag
+    /// the pushing breaker's keys, a union's arm for each. `uncovered` are the regions of the
+    /// reader's input no pipeline pushes, each a guard of the reader's breaker's input, consumed
+    /// as one package each.
+    ///
+    /// # Panics
+    ///
+    /// When `pipeline` reads no pipeline.
+    pub fn read_mapped(
+        &mut self,
+        pipeline: PipelineId,
+        tags: Vec<FieldKey>,
+        uncovered: Vec<TileGuard>,
+    ) {
+        assert!(
+            !self.reads[pipeline.0].is_empty(),
+            "pipeline {} reads mapped pushes only from a pipeline it reads",
+            pipeline.0
+        );
+        self.read(pipeline, Reading::Mapped(Mapped { tags, uncovered }));
+    }
+
+    /// Set how `pipeline`'s queue is filled.
+    ///
+    /// # Panics
+    ///
+    /// When it is set already: a pipeline reads its input whole or the pushes restated, not both.
+    fn read(&mut self, pipeline: PipelineId, reading: Reading) {
+        assert!(
+            matches!(self.reading[pipeline.0], Reading::Pushed),
+            "pipeline {} reads its input whole or the pushes restated, once",
+            pipeline.0
+        );
+        self.reading[pipeline.0] = reading;
     }
 
     /// Mark `pipeline` as consuming its morsels one at a time, epoch by epoch: every morsel of an
@@ -1135,12 +1208,30 @@ impl Dispatcher {
             self.ensure(queue.phase.load() == Phase::Running, || {
                 format!("pipeline {reader} receives packages before it finalizes")
             });
-            let queued = match &self.whole[reader] {
-                Some(input) if epoch.number == self.last.load(Ordering::Acquire) => input,
-                Some(_) => &Vec::new(),
-                None => &morsels,
+            let last = epoch.number == self.last.load(Ordering::Acquire);
+            let queued = match &self.reading[reader] {
+                Reading::Whole(input) if last => input.clone(),
+                Reading::Whole(_) => Vec::new(),
+                Reading::Mapped(mapped) => {
+                    let restated = |guard: &TileGuard| {
+                        let restated = mapped.restate(guard);
+                        self.ensure(restated.is_some(), || {
+                            format!(
+                                "pipeline {reader} reads restated pushes, and a restated guard \
+                                 names its breaker's outermost keys: {guard:?}"
+                            )
+                        });
+                        restated.expect("refused above")
+                    };
+                    let mut queued: Vec<TileGuard> = morsels.iter().map(restated).collect();
+                    if last {
+                        queued.extend(mapped.uncovered.iter().cloned());
+                    }
+                    queued
+                }
+                Reading::Pushed => morsels.clone(),
             };
-            let landed = queue.queue.append(reader, queued) && queue.queue.close();
+            let landed = queue.queue.append(reader, &queued) && queue.queue.close();
             self.ensure(landed, || {
                 format!("pipeline {reader} receives packages once")
             });
@@ -1287,13 +1378,15 @@ pub struct Pushes<'d> {
 }
 
 impl Pushes<'_> {
-    /// Push what `breaker` has decided and the pipeline has not pushed before, its final guard
-    /// less the region pushed, for the pipelines that read it: one package per morsel the breaker
-    /// cuts it into, in the breaker's order; each reader is queued every morsel, except a reader
-    /// that reads its input whole ([`Dispatcher::read_whole`]). A push of nothing new pushes
-    /// nothing, and so does a breaker no pipeline reads. The difference and the region's growth are one step under the
-    /// region's lock, so two pushes of one pipeline from two threads push disjoint regions, and an
-    /// epoch's finish pushes only what no earlier finish pushed.
+    /// Push what `breaker` has decided and the pipeline has not pushed before, its final guard less
+    /// the region pushed, for the pipelines that read it: one package per morsel the breaker cuts
+    /// it into, in the breaker's order; each reader is queued every morsel, except a reader that
+    /// reads its input whole ([`Dispatcher::read_whole`]), which is queued none, and a reader that
+    /// reads the pushes restated ([`Dispatcher::read_mapped`]), which is queued each morsel
+    /// restated in its own keys. A push of nothing new pushes nothing, and so does a breaker no
+    /// pipeline reads. The difference and the region's growth are one step under the region's lock,
+    /// so two pushes of one pipeline from two threads push disjoint regions, and an epoch's finish
+    /// pushes only what no earlier finish pushed.
     ///
     /// # Panics
     ///
@@ -1647,10 +1740,11 @@ fn finalize_with(
 /// ([`TileProducer::as_breaking_mut`]), and a store breaker over each fan-out of `stores` a chain
 /// reads. A breaker's pipeline reads the pipelines of the nearest breakers beneath it. A walk
 /// stops at a store's fan-out: what its cycle holds runs inside the store, in pull mode. A
-/// pipeline whose breaker reads the breaker below through other producers reads its own input
-/// whole ([`Dispatcher::read_whole`]). The run
+/// pipeline reads the pushes of the one it reads restated in its own input's keys where the
+/// producers between the two say how (`TileProducer::input_keys`), and its input whole
+/// otherwise. The run
 /// pulls only the breakers' inputs; the roots' consumers pull the breakers afterwards. It answers
-/// each pipeline's breaker by name and the pipelines it reads, in pipeline order.
+/// each pipeline it ran, in pipeline order.
 ///
 /// # Panics
 ///
@@ -1662,13 +1756,14 @@ pub(crate) fn run_program(
     stores: &[Rc<crate::interpreter::tile_operators::FanOut>],
     scheduler: &mut crate::interpreter::Scheduler,
     morsel_rows: usize,
-) -> Vec<(String, Vec<usize>)> {
+) -> Vec<RanPipeline> {
     let mut planner = Planner {
         stores,
         scheduler,
         reads: Vec::new(),
         located: Vec::new(),
-        whole: Vec::new(),
+        plans: Vec::new(),
+        tilings: Vec::new(),
         direct: Vec::new(),
         names: Vec::new(),
         store_breakers: stores.iter().map(|_| None).collect(),
@@ -1681,7 +1776,7 @@ pub(crate) fn run_program(
     let Planner {
         reads,
         located,
-        whole,
+        plans,
         direct,
         names,
         store_breakers,
@@ -1698,16 +1793,19 @@ pub(crate) fn run_program(
              each of several readers reads through a fan-out slot of its own"
         );
     }
-    let planned = names.into_iter().zip(reads.iter().cloned()).collect();
     let mut dispatcher = Dispatcher::new(reads, morsel_rows);
     for (pipeline, at) in located.iter().enumerate() {
         if let Located::Store(_) = at {
             dispatcher.order(PipelineId(pipeline));
         }
     }
-    for (pipeline, input) in whole.iter().enumerate() {
-        if let Some(input) = input {
-            dispatcher.read_whole(PipelineId(pipeline), input);
+    for (pipeline, plan) in plans.into_iter().enumerate() {
+        match plan {
+            Plan::Pushed => {}
+            Plan::Whole(input) => dispatcher.read_whole(PipelineId(pipeline), &input),
+            Plan::Mapped(Mapped { tags, uncovered }) => {
+                dispatcher.read_mapped(PipelineId(pipeline), tags, uncovered);
+            }
         }
     }
     drive(
@@ -1732,7 +1830,208 @@ pub(crate) fn run_program(
             }
         },
     );
-    planned
+    let events = dispatcher.into_events();
+    names
+        .into_iter()
+        .enumerate()
+        .map(|(at, name)| RanPipeline {
+            name,
+            consumed: events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Consume { pipeline, guard } if pipeline.0 == at => Some(guard.clone()),
+                    _ => None,
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// A pipeline [`run_program`] ran: its breaker's name and the guards it consumed, in order.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct RanPipeline {
+    pub(crate) name: String,
+    pub(crate) consumed: Vec<TileGuard>,
+}
+
+/// How [`run_program`] fills a pipeline's queue from the pipelines it reads.
+#[cfg(test)]
+enum Plan {
+    /// The pushed morsels as they are.
+    Pushed,
+    /// Its breaker's input whole, which answers this tiling ([`Dispatcher::read_whole`]).
+    Whole(Tiling),
+    /// The pushed morsels restated ([`Dispatcher::read_mapped`]).
+    Mapped(Mapped),
+}
+
+/// What a subtree of a reader's chain reads of the pipelines in it, as [`run_program`] plans the
+/// reader's packages.
+#[cfg(test)]
+enum Under {
+    /// The subtree's outermost keys are named by what pipelines push, restated, and by regions
+    /// no pipeline pushes; it reads the pipelines of `waits` at other keys.
+    Mapped {
+        pushes: Vec<Push>,
+        /// Guards of the subtree's outermost keys no pipeline pushes.
+        uncovered: Vec<Predicate>,
+        waits: Vec<usize>,
+    },
+    /// The subtree's keys are not named from the pipelines it reads.
+    Unmapped(Vec<usize>),
+}
+
+/// A pipeline whose pushes name a subtree's keys ([`Under::Mapped`]).
+#[cfg(test)]
+struct Push {
+    pipeline: usize,
+    /// The tags its pushed guard is restated under, innermost first.
+    tags: Vec<FieldKey>,
+    /// Whether the subtree's root is the pipeline's breaker itself, or a slot of its store, so
+    /// the reader reads the breaker's keys as they are. A store's slot is one of its reader's own
+    /// and still counts, so `run_program` refuses two breakers that each read a slot of one store
+    /// directly, as it refuses two that read one breaker, though neither release reaches the
+    /// other's slot: an over-refusal.
+    direct: bool,
+}
+
+#[cfg(test)]
+impl Under {
+    /// A subtree that is the breaker of `pipeline`, or a slot of its store.
+    fn pushed_by(pipeline: usize) -> Under {
+        Under::Mapped {
+            pushes: vec![Push {
+                pipeline,
+                tags: Vec::new(),
+                direct: true,
+            }],
+            uncovered: Vec::new(),
+            waits: Vec::new(),
+        }
+    }
+
+    /// A subtree read at other keys than its reader's, which waits for `reads` and takes no
+    /// packages from them.
+    fn waiting_on(reads: Vec<usize>) -> Under {
+        Under::Mapped {
+            pushes: Vec::new(),
+            uncovered: Vec::new(),
+            waits: reads,
+        }
+    }
+
+    /// A subtree that reads nothing, adding nothing to another.
+    fn nothing() -> Under {
+        Under::Mapped {
+            pushes: Vec::new(),
+            uncovered: Vec::new(),
+            waits: Vec::new(),
+        }
+    }
+
+    /// The pipelines the subtree reads, each once.
+    fn reads(&self) -> Vec<usize> {
+        let all: Vec<usize> = match self {
+            Under::Mapped { pushes, waits, .. } => pushes
+                .iter()
+                .map(|push| push.pipeline)
+                .chain(waits.iter().copied())
+                .collect(),
+            Under::Unmapped(reads) => reads.clone(),
+        };
+        let mut reads = Vec::new();
+        for read in all {
+            if !reads.contains(&read) {
+                reads.push(read);
+            }
+        }
+        reads
+    }
+
+    /// Two subtrees whose keys together name a producer's.
+    fn and(self, other: Under) -> Under {
+        match (self, other) {
+            (
+                Under::Mapped {
+                    mut pushes,
+                    mut uncovered,
+                    mut waits,
+                },
+                Under::Mapped {
+                    pushes: more,
+                    uncovered: also,
+                    waits: then,
+                },
+            ) => {
+                pushes.extend(more);
+                uncovered.extend(also);
+                waits.extend(then);
+                Under::Mapped {
+                    pushes,
+                    uncovered,
+                    waits,
+                }
+            }
+            (one, other) => Under::Unmapped(one.reads().into_iter().chain(other.reads()).collect()),
+        }
+    }
+
+    /// The subtree at `producer`, a producer that is no breaker, whose inputs hold `inputs` by
+    /// role, restated in `producer`'s keys ([`TileProducer::input_keys`]). A producer with no
+    /// input names its keys from nothing a pipeline pushes.
+    fn through(
+        producer: &dyn crate::interpreter::tile_operators::TileProducer,
+        inputs: Vec<(String, Under)>,
+    ) -> Under {
+        use crate::interpreter::tile_operators::InputKeys;
+        if inputs.is_empty() {
+            return Under::Mapped {
+                pushes: Vec::new(),
+                uncovered: vec![Predicate::True],
+                waits: Vec::new(),
+            };
+        }
+        inputs
+            .into_iter()
+            .map(|(role, under)| match (producer.input_keys(&role), under) {
+                (_, Under::Unmapped(reads)) => Under::Unmapped(reads),
+                (None, under) => Under::Unmapped(under.reads()),
+                (Some(InputKeys::NotKeys), under) => Under::waiting_on(under.reads()),
+                (
+                    Some(keys),
+                    Under::Mapped {
+                        pushes,
+                        uncovered,
+                        waits,
+                    },
+                ) => {
+                    let tag = match keys {
+                        InputKeys::Tagged(tag) => Some(tag),
+                        _ => None,
+                    };
+                    let under_tag = |keys: Predicate| match &tag {
+                        Some(tag) => {
+                            Predicate::tagged(TagMap::from_arms(vec![(tag.clone(), keys)]), false)
+                        }
+                        None => keys,
+                    };
+                    Under::Mapped {
+                        pushes: pushes
+                            .into_iter()
+                            .map(|mut push| {
+                                push.tags.extend(tag.clone());
+                                push.direct = false;
+                                push
+                            })
+                            .collect(),
+                        uncovered: uncovered.into_iter().map(under_tag).collect(),
+                        waits,
+                    }
+                }
+            })
+            .fold(Under::nothing(), Under::and)
+    }
 }
 
 /// Where [`run_program`] finds a pipeline's breaker.
@@ -1752,9 +2051,10 @@ struct Planner<'p> {
     scheduler: &'p mut crate::interpreter::Scheduler,
     reads: Vec<Vec<usize>>,
     located: Vec<Located>,
-    /// Per pipeline, the tiling its breaker's input answers, where it reads that input whole
-    /// ([`Dispatcher::read_whole`]).
-    whole: Vec<Option<Tiling>>,
+    /// Per pipeline, how its queue is filled from the pipelines it reads.
+    plans: Vec<Plan>,
+    /// Per pipeline, its breaker's tiling.
+    tilings: Vec<Tiling>,
     /// The edges `(read, reader)` whose reader's breaker reads the breaker of `read` directly.
     direct: Vec<(usize, usize)>,
     names: Vec<String>,
@@ -1764,53 +2064,111 @@ struct Planner<'p> {
 
 #[cfg(test)]
 impl Planner<'_> {
-    /// The pipelines of the nearest breakers at or beneath `producer`, each numbered after the
-    /// pipelines it reads, and whether its breaker is `producer` itself, or a store `producer` is
-    /// a slot of, rather than beneath it.
+    /// What the chain at `producer` reads of the pipelines at or beneath it, planning each
+    /// breaker reached; a pipeline is numbered after the pipelines it reads.
     fn pipelines_under(
         &mut self,
         producer: &mut dyn crate::interpreter::tile_operators::TileProducer,
-    ) -> Vec<(usize, bool)> {
+    ) -> Under {
         if let Some(store) = store_of(producer, self.stores) {
-            return vec![(self.store_pipeline(store, producer), true)];
+            return Under::pushed_by(self.store_pipeline(store, producer));
         }
         // A breaker reached a second time, through a fan-out slot of its own, is planned already,
         // along with the pipelines it reads; its pipeline gains this reader.
         if producer.as_breaking_mut().is_some()
             && let Some(planned) = self.planned(&Located::Chain(address(producer)))
         {
-            return vec![(planned, true)];
+            return Under::pushed_by(planned);
         }
-        let mut below = Vec::new();
-        producer.visit_input_producers_mut(&mut |_, input| {
-            below.extend(self.pipelines_under(input));
+        let mut inputs = Vec::new();
+        producer.visit_input_producers_mut(&mut |role, input| {
+            inputs.push((role.to_string(), self.pipelines_under(input)));
         });
         let Some(breaker) = producer.as_breaking_mut() else {
-            return below.into_iter().map(|(read, _)| (read, false)).collect();
+            return Under::through(&*producer, inputs);
         };
-        // A pipeline reads the pushed guard only from a breaker its own breaker reads directly:
-        // anything between the two can read the pushing breaker in other keys.
-        let whole = below
-            .iter()
-            .any(|(_, direct)| !direct)
-            .then(|| breaker.input_tiling());
+        let input_tiling = breaker.input_tiling();
+        let input_role = breaker.input_role();
+        // A breaker reads the keys of the input it consumes as they are; it reads any other
+        // operand beside it, whose pipelines it waits for and takes no packages from.
+        let under = inputs
+            .into_iter()
+            .map(|(role, under)| match role == input_role {
+                true => under,
+                false => Under::waiting_on(under.reads()),
+            })
+            .fold(Under::nothing(), Under::and);
         self.located.push(Located::Chain(address(producer)));
         self.names.push(producer.name());
-        // One reader may reach the breaker beneath it along several paths, each through a
-        // fan-out slot of its own, as a filter reads its input for the values and the predicate.
+        self.tilings.push(producer.tiling().clone());
         let pipeline = self.located.len() - 1;
-        let mut reads: Vec<usize> = Vec::new();
-        for (read, direct) in below {
-            if direct {
-                self.direct.push((read, pipeline));
-            }
-            if !reads.contains(&read) {
-                reads.push(read);
+        let (reads, plan) = self.reader_plan(pipeline, under, &input_tiling);
+        self.reads.push(reads);
+        self.plans.push(plan);
+        Under::pushed_by(pipeline)
+    }
+
+    /// The pipelines `pipeline` reads, and how its queue is filled from them.
+    fn reader_plan(&mut self, pipeline: usize, under: Under, input: &Tiling) -> (Vec<usize>, Plan) {
+        let reads = under.reads();
+        let Under::Mapped {
+            pushes, uncovered, ..
+        } = under
+        else {
+            let plan = match reads.is_empty() {
+                true => Plan::Pushed,
+                false => Plan::Whole(input.clone()),
+            };
+            return (reads, plan);
+        };
+        for push in &pushes {
+            if push.direct {
+                self.direct.push((push.pipeline, pipeline));
             }
         }
-        self.reads.push(reads);
-        self.whole.push(whole);
-        vec![(self.located.len() - 1, true)]
+        if reads.is_empty() {
+            return (reads, Plan::Pushed);
+        }
+        // A pushed guard names the pushing breaker's keys, its outermost ones alone once anything
+        // stands between the two breakers, so a push read through other producers comes from a
+        // breaker that holds one level.
+        let one_level = |push: &Push| {
+            matches!(&self.tilings[push.pipeline], Tiling::DataFunction { codomain, .. }
+                if !codomain.holds_a_level())
+        };
+        let [push] = pushes.as_slice() else {
+            return (reads, Plan::Whole(input.clone()));
+        };
+        if push.tags.is_empty() && uncovered.is_empty() && (push.direct || one_level(push)) {
+            return (reads, Plan::Pushed);
+        }
+        // A region no pipeline pushes that is the whole of the keys a push is read in leaves the
+        // two to overlap.
+        if !one_level(push) || uncovered.iter().any(Predicate::is_true) {
+            return (reads, Plan::Whole(input.clone()));
+        }
+        // The keys no push is restated under, spelled as that difference: the regions an arm
+        // holds no pipeline in are among them, and keys outside the domain are no key at all.
+        let pushed = push.tags.iter().fold(Predicate::True, |keys, tag| {
+            Predicate::tagged(TagMap::from_arms(vec![(tag.clone(), keys)]), false)
+        });
+        let rest = Predicate::True.minus(&pushed);
+        debug_assert!(
+            uncovered.iter().all(|region| rest.subsumes(region)),
+            "the keys no push is restated under hold every region no pipeline pushes: {rest:?} \
+             against {uncovered:?}"
+        );
+        let uncovered = match uncovered.is_empty() {
+            true => Vec::new(),
+            false => vec![TileGuard::Function(FunctionGuard::Domain(rest))],
+        };
+        (
+            reads,
+            Plan::Mapped(Mapped {
+                tags: push.tags.clone(),
+                uncovered,
+            }),
+        )
     }
 
     /// The pipeline already planned at `at`, where there is one.
@@ -1848,7 +2206,8 @@ impl Planner<'_> {
         self.store_breakers[store] = Some(breaker);
         self.located.push(Located::Store(store));
         self.reads.push(Vec::new());
-        self.whole.push(None);
+        self.plans.push(Plan::Pushed);
+        self.tilings.push(self.stores[store].tiling().clone());
         self.located.len() - 1
     }
 }

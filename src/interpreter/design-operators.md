@@ -880,23 +880,26 @@ covers it, so the releases of a reader's input at its morsels add up to the whol
 reader that is final once its input is released whole, such as `Aggregate`, becomes final. A
 released key is in no morsel, because the final guard already excludes it. A guard naming no more
 than `morsel_rows` held keys is one morsel. The guard is of the pushing breaker's tiling and names
-its keys, so a package fits only a reader whose breaker reads the pushing breaker directly, and
-`run` asserts in a debug build that a package fits its breaker's input. A pipeline whose breaker
-reads through other producers is marked with `Dispatcher::read_whole` before the dispatcher is
-shared: in the run's last epoch its queue is its own breaker's input whole, one package per morsel
-(`seed`), in place of the push, and in every earlier epoch it closes empty, since its input is whole
-only once every epoch has run.
+its keys, so a pushed package fits a reader whose breaker reads the pushing breaker directly or
+through producers that keep its keys, and `run` asserts in a debug build that a package fits its
+breaker's input. A pipeline can be marked before the dispatcher is shared to fill its queue
+otherwise. With `Dispatcher::read_mapped`, each pushed morsel is restated under tags, the way a
+union keys an arm's rows, and the regions no pipeline pushes follow as one package each, in the
+run's last epoch. With `Dispatcher::read_whole`, its queue in the run's last epoch is its own
+breaker's input whole, one package per morsel (`seed`), in place of the push, and in every earlier
+epoch it closes empty, since its input is whole only once every epoch has run.
 
 `dispatcher::finalize` finishes a pipeline's oldest unfinished epoch. It asserts six invariants
 before it calls the breaker: the pipeline has not begun to finish the epoch, its queue there is
 closed and empty, no package claimed for it there is in flight, the pipeline it reads has finished
 the epoch, the epoch is sealed or known to be the last, and its breaker's input has released every
 guard the pipeline consumed in the epoch. A source's input releases the regions queued for it; a
-reading pipeline's input releases only what the guards pushed to it name, and nothing at all when
-the pipeline it reads pushed nothing; a pipeline that reads its input whole releases all of it. A
-debug build also asserts that the morsels of a pushed guard partition it (`partition_gap`), and that
-a pipeline consumes each region once in an epoch: a guard pushed to a pipeline meets none pushed to
-it before.
+reading pipeline's input releases only what its packages name: the guards pushed to it, nothing at
+all when the pipeline it reads pushed nothing, those guards restated together with the regions no
+pipeline pushes for a pipeline that reads them restated, and all of it for a pipeline that reads its
+input whole. A debug build also asserts that the morsels of a pushed guard partition it
+(`partition_gap`), and that a pipeline consumes each region once in an epoch: a guard pushed to a
+pipeline meets none pushed to it before.
 
 The dispatcher reads a breaker's input through `input_tiling` and `input_released`, the tiling a
 package's guard is a guard of and the guard the breaker has released of its input, so a breaker
@@ -919,17 +922,27 @@ the pipelines of the nearest breakers beneath it, which are numbered before it. 
 slot of a store's cyclic fan-out. That store's pipeline is a `StoreBreaker` over the fan-out, a
 `CommitBreaker` where the store lists writers and a `LoopBreaker` where it lists a body, and what
 the cycle holds stays in pull mode. A producer is identified by its address, since `producer_id`
-counts per producer type. A pipeline whose breaker reads the breaker beneath it through other
-producers reads its input whole (`Dispatcher::read_whole`), since those producers can read the
-breaker beneath in other keys than the pushed guard names. A breaker or store a second reader
-reaches is not walked again: its pipeline is read by each reader that reaches it, and a reader that
-reaches it along several paths, as a filter reads its input for the values and the predicate, reads
-it once. A pipeline that reads directly a pipeline another pipeline reads is refused, since only a
-fan-out slot keeps one reader's release from removing what another still reads. A pipeline that
-reads two pipelines is refused too: a breaker whose chain reaches two breakers, as a `groupby`'s
-memo reaches its input's memo and the `Converse` keying it, and as the output's memo reaches two
-aggregates of one binding. Each sink's output is compiled on its own, so two sinks read no binding
-in common. Each package reaches its breaker by walking the chains again.
+counts per producer type. A reader's packages restate the pushes of the pipeline beneath it in its
+own input's keys where every producer between the two breakers says how its input's keys become its
+own (`TileProducer::input_keys`): the same keys, as a fan-out slot and `MapResult`'s input do, or
+the keys under a tag, as a tagged union's arm does. `MapResult`'s function contributes no keys,
+since it is read at the values it is applied to. A breaker's keys are those of the input it consumes
+(`BreakingProducer::input_role`); another operand, such as `ExtractFinal`'s default, is waited for
+and pushes no package. The reader reads the pushed guard under the tags (`Dispatcher::read_mapped`),
+together with one package holding every key not under the tags. That package covers the arms no
+pipeline holds, as the debug check against the regions the walk found asserts, and names nothing
+outside the domain. A reader reads its input whole (`Dispatcher::read_whole`) when it reads the
+breaker beneath through any other producer, reads two breakers' keys, or reads through other
+producers a breaker that holds more than one level, since past the outermost level a pushed guard
+names the pushing breaker's keys. A breaker or store a second reader reaches is not walked again:
+its pipeline is read by each reader that reaches it, and a reader that reaches it along several
+paths, as a filter reads its input for the values and the predicate, reads it once. A pipeline that
+reads directly a pipeline another pipeline reads is refused, since only a fan-out slot keeps one
+reader's release from removing what another still reads. A pipeline that reads two pipelines is
+refused too: a breaker whose chain reaches two breakers, as a `groupby`'s memo reaches its input's
+memo and the `Converse` keying it, and as the output's memo reaches two aggregates of one binding.
+Each sink's output is compiled on its own, so two sinks read no binding in common. Each package
+reaches its breaker by walking the chains again.
 
 The run pulls only the breakers' inputs. A test compiles the program with
 `GlobalContext::defer_sink_pulls`, which leaves out the pull each sink takes once subscribed, runs

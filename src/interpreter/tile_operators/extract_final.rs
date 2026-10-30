@@ -513,6 +513,12 @@ impl BreakingProducer for ExtractFinalProducer {
                 .unwrap_or_else(|| self.tiling().empty_tile()),
         }
     }
+
+    /// The source is what a consume pulls; the default is read beside it.
+    #[cfg(test)]
+    fn input_role(&self) -> &'static str {
+        "source"
+    }
 }
 
 impl ExtractFinalProducer {

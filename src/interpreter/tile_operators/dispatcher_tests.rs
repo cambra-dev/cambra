@@ -1561,3 +1561,72 @@ fn a_notify_below_the_limit_queues_all_its_morsels() {
 fn a_limited_reader_is_refused() {
     Dispatcher::new(vec![vec![], vec![0]], 1).limit(PipelineId(1), 2);
 }
+
+/// A pipeline that reads mapped pushes is queued each pushed morsel restated under the tags, then
+/// the regions no pipeline pushes.
+#[test]
+fn a_mapped_reader_is_queued_the_pushes_restated_and_the_uncovered_regions() {
+    use crate::ccl::{FieldKey, TagMap};
+    let under = |tag: usize, keys: Predicate| {
+        Predicate::tagged(TagMap::from_arms(vec![(FieldKey::Index(tag), keys)]), false)
+    };
+    let domain = |keys: Predicate| TileGuard::Function(FunctionGuard::Domain(keys));
+    let (low, high) = (
+        keys_predicate(0, 1),
+        Predicate::True.minus(&keys_predicate(0, 1)),
+    );
+    let child = Scripted::cutting(
+        ints().universal_guard(),
+        vec![domain(low.clone()), domain(high.clone())],
+    );
+    let rest = domain(Predicate::True.minus(&under(1, under(0, Predicate::True))));
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    dispatcher.read_mapped(
+        PipelineId(1),
+        vec![FieldKey::Index(0), FieldKey::Index(1)],
+        vec![rest.clone()],
+    );
+    dispatcher.finalize_by_hand(PipelineId(0), |pushes| child.borrow_mut().finalize(pushes));
+    let queued: Vec<TileGuard> = std::iter::from_fn(|| dispatcher.pop())
+        .map(|package| package.guard)
+        .collect();
+    assert_eq!(
+        queued,
+        vec![
+            domain(under(1, under(0, low))),
+            domain(under(1, under(0, high))),
+            rest
+        ]
+    );
+}
+
+/// A mapped push restates a guard of the pushing breaker's outermost keys, so a guard beneath
+/// them is refused.
+#[test]
+#[should_panic(expected = "a restated guard names its breaker's outermost keys")]
+fn a_mapped_push_beneath_the_outermost_keys_is_refused() {
+    use crate::ccl::FieldKey;
+    let beneath = TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Scalar(
+        Predicate::True,
+    ))));
+    let child = Scripted::cutting(beneath.clone(), vec![beneath]);
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    dispatcher.read_mapped(PipelineId(1), vec![FieldKey::Index(0)], Vec::new());
+    dispatcher.finalize_by_hand(PipelineId(0), |pushes| child.borrow_mut().finalize(pushes));
+}
+
+/// A source reads its own input, so it has no pushes to restate.
+#[test]
+#[should_panic(expected = "pipeline 0 reads mapped pushes only from a pipeline it reads")]
+fn a_source_read_mapped_is_refused() {
+    Dispatcher::new(vec![vec![]], UNBOUNDED).read_mapped(PipelineId(0), Vec::new(), Vec::new());
+}
+
+/// A pipeline reads its input whole or the pushes restated, not both.
+#[test]
+#[should_panic(expected = "reads its input whole or the pushes restated, once")]
+fn reading_whole_and_restated_is_refused() {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    dispatcher.read_whole(PipelineId(1), &ints());
+    dispatcher.read_mapped(PipelineId(1), Vec::new(), Vec::new());
+}

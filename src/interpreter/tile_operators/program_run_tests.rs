@@ -8,19 +8,18 @@ use indoc::indoc;
 use crate::ccl::context::{GlobalContext, compile_program};
 use crate::ccl::load::LoadedProgram;
 use crate::interpreter::Value;
-use crate::interpreter::dispatcher::{run_program, store_of};
+use crate::interpreter::dispatcher::{RanPipeline, run_program, store_of};
 
 use std::rc::Rc;
 
 use super::loop_breaker_tests::pulled;
-use super::{FanOut, TileProducer};
-
-/// Each pipeline `run_program` planned: its breaker's name and the pipelines it reads.
-type Planned = (String, Vec<usize>);
+use super::{FanOut, FunctionGuard, TileGuard, TileProducer};
+use crate::ccl::{FieldKey, TagMap};
+use crate::interpreter::Predicate;
 
 /// `source` compiled with a test sink `out`, its pipelines run through the dispatcher at morsels
 /// of `rows`, then its sink pulled by the scheduler: the value `out` receives, and the pipelines.
-fn dispatched(source: &str, rows: usize) -> (Value, Vec<Planned>) {
+fn dispatched(source: &str, rows: usize) -> (Value, Vec<RanPipeline>) {
     let mut ctx = GlobalContext::default();
     ctx.defer_sink_pulls();
     let sink = ctx.register_test_sink("out");
@@ -103,7 +102,7 @@ fn answers_as_pull_mode_does(source: &str, kinds: &[&str]) {
         );
         for kind in kinds {
             assert!(
-                breakers.iter().any(|(name, _)| name.starts_with(kind)),
+                breakers.iter().any(|ran| ran.name.starts_with(kind)),
                 "{source} runs a {kind} pipeline: {breakers:?}"
             );
         }
@@ -169,6 +168,113 @@ fn a_filtered_sum() {
             out << sum([x for x in xs if x > 1])
         "},
         &["Memo", "Aggregate"],
+    );
+}
+
+/// `keys` under `tags`, innermost first.
+fn under_tags(tags: &[usize], keys: Predicate) -> Predicate {
+    tags.iter().fold(keys, |keys, tag| {
+        Predicate::tagged(
+            TagMap::from_arms(vec![(FieldKey::Index(*tag), keys)]),
+            false,
+        )
+    })
+}
+
+/// How many guards `ran` consumed under `tags`, and how many that are every key not under them.
+fn consumed_under(ran: &RanPipeline, tags: &[usize]) -> (usize, usize) {
+    let rest = TileGuard::Function(FunctionGuard::Domain(
+        Predicate::True.minus(&under_tags(tags, Predicate::True)),
+    ));
+    let mut pushed = 0;
+    let mut others = 0;
+    for guard in &ran.consumed {
+        let TileGuard::Function(FunctionGuard::Domain(keys)) = guard else {
+            panic!(
+                "{} consumes guards of its input's outermost keys: {guard:?}",
+                ran.name
+            )
+        };
+        if *guard == rest {
+            others += 1;
+        } else {
+            assert!(
+                under_tags(tags, Predicate::True).subsumes(keys),
+                "{} consumes a push restated under {tags:?}: {guard:?}",
+                ran.name
+            );
+            pushed += 1;
+        }
+    }
+    (pushed, others)
+}
+
+fn breaker<'r>(ran: &'r [RanPipeline], kind: &str) -> &'r RanPipeline {
+    ran.iter()
+        .find(|ran| ran.name.starts_with(kind))
+        .unwrap_or_else(|| panic!("a {kind} pipeline: {ran:?}"))
+}
+
+/// A sum over a union of a comprehension and a literal: the comprehension's memo is a pipeline
+/// under arm `0`, so the sum consumes the memo's morsels restated under tag `0`, and the literal
+/// arm `1`, which no pipeline pushes, as one package of its own.
+#[test]
+fn a_sum_over_a_union_consumes_each_arm_by_tag() {
+    let source = indoc! {"
+        out = test_sink()
+        xs = [1, 2, 3]
+        out << sum([x * 2 for x in xs] ++ [7, 8])
+    "};
+    answers_as_pull_mode_does(source, &["Memo", "Aggregate"]);
+    for (rows, memo_morsels) in [(1, 3), (2, 2), (usize::MAX, 1)] {
+        let (_, ran) = dispatched(source, rows);
+        let consumed = consumed_under(breaker(&ran, "Aggregate"), &[0]);
+        assert_eq!(consumed, (memo_morsels, 1), "at morsels of {rows}");
+    }
+}
+
+/// The comprehension under the second arm: its morsels are restated under tag `1`.
+#[test]
+fn a_sum_over_a_union_with_the_comprehension_second() {
+    let source = indoc! {"
+        out = test_sink()
+        xs = [1, 2, 3]
+        out << sum([7, 8] ++ [x * 2 for x in xs])
+    "};
+    answers_as_pull_mode_does(source, &["Memo", "Aggregate"]);
+    let (_, ran) = dispatched(source, 1);
+    assert_eq!(consumed_under(breaker(&ran, "Aggregate"), &[1]), (3, 1));
+}
+
+/// A chain of concatenations compiles to one union of three arms: the comprehension's morsels
+/// are restated under tag `0`, and both literal arms are the one package of every other key.
+#[test]
+fn a_sum_over_a_chain_of_unions_restates_under_the_first_tag() {
+    let source = indoc! {"
+        out = test_sink()
+        xs = [1, 2, 3]
+        out << sum(([x * 2 for x in xs] ++ [7]) ++ [8])
+    "};
+    answers_as_pull_mode_does(source, &["Memo", "Aggregate"]);
+    let (_, ran) = dispatched(source, 1);
+    assert_eq!(consumed_under(breaker(&ran, "Aggregate"), &[0]), (3, 1));
+}
+
+/// A union written out whole: the output's memo reads it beneath a `Unit` key, which no guard of
+/// the union's keys names, so that memo reads its input whole.
+#[test]
+fn a_union_written_out_whole() {
+    let source = indoc! {"
+        out = test_sink()
+        xs = [1, 2, 3]
+        out << [x * 2 for x in xs] ++ [7, 8]
+    "};
+    answers_as_pull_mode_does(source, &["Memo"]);
+    let (_, ran) = dispatched(source, 1);
+    let output = ran.last().expect("the output's memo");
+    assert!(
+        matches!(output.consumed.as_slice(), [whole] if whole.is_universal()),
+        "{output:?}"
     );
 }
 

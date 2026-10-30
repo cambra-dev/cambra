@@ -868,6 +868,12 @@ impl Drop for Announcing<'_> {
 impl TileProducer for FanOutProducer {
     impl_producer_base!();
 
+    /// A slot serves the fan-out's tile as its input answers it.
+    #[cfg(test)]
+    fn input_keys(&self, role: &str) -> Option<InputKeys> {
+        (role == "input").then_some(InputKeys::Same)
+    }
+
     /// The fan-out's input, which every slot pulls through the shared state. Nothing is
     /// visited while a pull holds that state, or after a recurrence's fan-out has gone.
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {

@@ -596,6 +596,21 @@ impl MapResultProducer {
 impl TileProducer for MapResultProducer {
     impl_producer_base!();
 
+    /// Applied one level in, beneath the input's keys, the function's result takes the place of
+    /// each value and the keys stay the input's, as `MapResult::subscribe` forwards them; applied
+    /// to the input itself, the keys are the function's. The function is read at the values it is
+    /// applied to.
+    #[cfg(test)]
+    fn input_keys(&self, role: &str) -> Option<InputKeys> {
+        let keeps_keys =
+            self.level != CurryLevel::OUTERMOST && self.input.tiling().is_data_function();
+        match role {
+            "input" => keeps_keys.then_some(InputKeys::Same),
+            "fn" => Some(InputKeys::NotKeys),
+            _ => None,
+        }
+    }
+
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("fn", &*self.function);
         visit("input", &*self.input);

@@ -1196,6 +1196,13 @@ pub trait BreakingProducer: TileProducer {
 
     /// The answer to a pull at `guard`, from the state `consume_impl` built. It pulls nothing.
     fn offer_impl(&mut self, guard: TileGuard) -> Tile;
+
+    /// The role [`TileProducer::visit_input_producers`] names the input `consume_impl` pulls by;
+    /// any other input is an operand read beside it.
+    #[cfg(test)]
+    fn input_role(&self) -> &'static str {
+        "input"
+    }
 }
 
 /// Live runtime counterpart of a [`TileOperator`].
@@ -1446,6 +1453,15 @@ pub trait TileProducer {
         None
     }
 
+    /// How the outermost keys of the input named `role` (as
+    /// [`visit_input_producers`](Self::visit_input_producers) names it) become this producer's:
+    /// `None`, the default, where a guard of them has no restatement here. A test driver restates
+    /// a breaker's pushed guard through them ([`InputKeys`]).
+    #[cfg(test)]
+    fn input_keys(&self, _role: &str) -> Option<InputKeys> {
+        None
+    }
+
     /// Hook for adding any children to the InspectNode: by default, each producer
     /// [`visit_input_producers`](Self::visit_input_producers) visits, under its role.
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
@@ -1457,6 +1473,19 @@ pub trait TileProducer {
             .into_iter()
             .fold(node, |node, (role, child)| node.child(role, child))
     }
+}
+
+/// How the outermost keys of one input of a producer become the producer's own
+/// ([`TileProducer::input_keys`]).
+#[cfg(test)]
+pub enum InputKeys {
+    /// The input's keys are the producer's: a guard of them is a guard of the producer's.
+    Same,
+    /// The input's keys, each under this tag of the producer's union keys.
+    Tagged(crate::ccl::FieldKey),
+    /// The input contributes no keys: the producer reads it at other keys, as a function is read
+    /// at the values it is applied to.
+    NotKeys,
 }
 
 /// Values retained by one producer between pulls, excluding its inputs' retained state.

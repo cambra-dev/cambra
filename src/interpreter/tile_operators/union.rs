@@ -585,6 +585,18 @@ impl UnionProducer {
 impl TileProducer for UnionProducer {
     impl_producer_base!();
 
+    /// A tagged union at the outermost level keys arm `_𝑘`'s rows under tag `𝑘`. A flat union's
+    /// arms are disjoint slices of one domain, which no arm's guard names apart from the others',
+    /// and a union beneath standing levels tags keys an outermost guard does not reach.
+    #[cfg(test)]
+    fn input_keys(&self, role: &str) -> Option<InputKeys> {
+        if self.flat || self.level != CurryLevel::OUTERMOST {
+            return None;
+        }
+        let arm = role.strip_prefix('_')?.parse().ok()?;
+        Some(InputKeys::Tagged(crate::ccl::FieldKey::Index(arm)))
+    }
+
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         for (i, p) in self.inputs.iter().enumerate() {
             visit(&format!("_{i}"), &**p);
