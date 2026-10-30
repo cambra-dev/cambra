@@ -76,6 +76,8 @@ pub(super) fn node_label(node: &TypedExprNode) -> String {
         Let { binding, .. } => format!("Let({})", binding.name),
         List(_) => "List".to_string(),
         Case { .. } => "Case".to_string(),
+        Raise { .. } => "Raise".to_string(),
+        Try { .. } => "Try".to_string(),
         VariantCtor { tag, .. } => format!("VariantCtor(.{tag})"),
         NominalCtor { decl, ctor, .. } => format!("NominalCtor({}::{ctor})", decl.name),
         Method { name, .. } => format!("Method({name})"),

@@ -212,3 +212,27 @@ fn a_loop_of_blocks_over_a_concatenation_runs() {
         Value::Int(30),
     );
 }
+
+/// An exception escaping the body orders the loop, a block beside it or not.
+#[test]
+fn an_escaping_raise_orders_a_loop_of_blocks() {
+    check_compile_error(
+        indoc! {"
+            hits: Mut(Int, Txn) := 0
+            def f(a, b):
+                for x in a ++ b:
+                    with begin():
+                        hits := hits + x
+                    if x < 0:
+                        raise x
+                0
+            r = try:
+                    f([1], [2])
+                except Int as e:
+                    e
+            r
+        "},
+        "since an exception may escape its body, but this source has the positions of a \
+         concatenation",
+    );
+}

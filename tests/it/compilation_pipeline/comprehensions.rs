@@ -396,6 +396,11 @@ fn a_filter_over_a_union_source_is_applied(#[case] code: &str) {
     "},
     9
 )]
+// The collection is a projection of the row, which the filter reads too.
+#[case::over_a_projection_of_the_row(
+    "sum([sum([v for v in r.xs if v > 1]) for r in [(xs=[1, 2]), (xs=[3, 4])]])",
+    9
+)]
 fn a_filtered_inner_comprehension_over_the_outer_row_keeps_its_filter(
     #[case] program: &str,
     #[case] total: i64,
@@ -449,14 +454,15 @@ fn a_filtered_comprehension_over_a_mutable_map_in_a_block_does_not_compile() {
 }
 
 /// A filter reading the outer row other than through the projection it narrows has no
-/// spelling as a filter on the projected values: the values alone do not say `r.lim`. It is
-/// refused by name rather than compiled without its filter.
+/// spelling as a filter on the projected values: the values alone do not say `r.lim`. The
+/// curry keeps answering the narrowed collection (`simplify::narrows_what_f_answers`), so the
+/// filter reads the row where it stands.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-fn a_filter_reading_the_row_beside_its_projection_is_refused() {
-    check_compile_error(
+fn a_filter_reading_the_row_beside_its_projection_keeps_its_filter() {
+    check_scalar(
         "sum([sum([v for v in r.xs if v > r.lim]) for r in [(xs=[1, 2], lim=1), (xs=[3, 4], lim=3)]])",
-        "a filter on an inner collection that planning cannot materialize",
+        Value::Int(6),
     );
 }
 

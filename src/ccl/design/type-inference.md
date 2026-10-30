@@ -4204,6 +4204,7 @@ whose body it is. Capabilities are recorded on the innermost frame:
 | a value read of an induction variable 𝑥 | `Read(𝑥)` |
 | an `Apply` passing 𝑎 to a `Mut` parameter | `Read(𝑎)` and `Write(𝑎)`, or `ReadTxn(𝑎)` and `WriteTxn(𝑎)` when 𝑎 is transactional |
 | an `Apply` passing a feed 𝑎 to a `Feed` parameter | `Append(𝑎)` |
+| `Raise` of a value of type 𝐸 | `Raise(𝐸)`, identified by the `Raise` node and an instance each use's copy renews (`Raised`) |
 
 A value read is a mention whose handle becomes its value (`read_value` in `emit.rs`). A mention
 passed by reference, or to `await_final`, stays a handle and reads nothing. A parameter's history is
@@ -4242,8 +4243,10 @@ Lowering writes a function type's clauses as `Repr::Written`: the items, which c
 and where the clauses are written (`lower/clauses.rs`). A function type with no clause is written
 too, with no item and neither clause open, since a written type's clauses are exact.
 `normalize_annotation` turns written clauses into a fresh variable holding the items, with an upper
-bound of the items over each clause not ending in `_` (`InferCtx::normalize_effects`). `uniquify`
-resolves the variables a clause names in the scope the clause is written in, and
+bound of the items over each clause not ending in `_` (`InferCtx::normalize_effects`). A stated
+`Raise(𝑇)` bounds by subtyping, since `Raise` is covariant: an upper bound admits a `Raise(𝑆)` with
+𝑆 a subtype of a 𝑇 it states (`Upper::admits`), checked once inference is done and the types
+resolve. `uniquify` resolves the variables a clause names in the scope the clause is written in, and
 `Typing::check_written` refuses one that names no variable of the kind its item takes
 (`InferError::ClauseNamesNoVariable`). The Check mode reads no effects, and normalizes a written
 clause to none.
@@ -4283,9 +4286,11 @@ than what the rest of its clause shares prints in parentheses (`effects::clauses
 writes or reads names every mutable variable, and one holding appends every feed
 (`Every::names_mutable_variables`, `Every::names_feeds`), so a function whose type holds one leaves
 no body that declares what it names (`InferCtx::body_binds`) and is no public member of a module
-whose top level binds one. A top holding writes orders a loop running it. A clause variable's bound,
-and an associated effect type's, may take capabilities away (`TypeParam::clause_except`): opening
-the parameter, or an instance's variable for the associated type, bounds it by `Effect` or `Context`
+whose top level binds one. A top holding writes or exceptions orders a loop running it, and one
+holding `Raise(_)` raises every type, so a `try` around it is refused
+(`InferError::ExceptAroundEveryRaise`, `Every::raises_anything`). A clause variable's bound, and an
+associated effect type's, may take capabilities away (`TypeParam::clause_except`): opening the
+parameter, or an instance's variable for the associated type, bounds it by `Effect` or `Context`
 less them, which each use's copy keeps (`Blame::Bound`).
 
 **Upper bounds are checked once emission is complete.** A variable's capabilities are known only
@@ -4361,15 +4366,35 @@ the function (`InferCtx::exported_effects`).
 **A loop whose iterations interact requires an order of its positions** (`docs/chl-spec.md`,
 "Ordered loops"). A `for` body is emitted on a frame of its own that keeps what names the enclosing
 function's own variables (`Typing::loop_body`). Where what it collects holds `Write(𝑥)` for an `𝑥`
-the body does not declare, the loop is ordered, and `emit_for` requires `Orderable(𝑃, 𝑃)` of its
-source's position type `𝑃`, during emission, so a definition's scheme states it.
-`WriteTxn(𝑥)` orders nothing: the run's transactions commit in commit order. A body that
-interacts only through a function passed to it is found to after emission, too late for the scheme;
-`check_loop_orders` asserts no loop is. A keyed collection's positions are its sum's binder `σ`,
-whose kind `SubtypesOf(𝐾)` gives them `𝐾`'s order, and which no instance answers or refuses, so
-once emission is done `InferCtx::order_keyed_loops` resolves each ordered loop's source and
-requires `Orderable(𝐾, 𝐾)` of its keys. A refusal names the capability that ordered the loop and
-what the source's positions are (`InferError::UnorderedLoop`), at the expression the loop walks.
+the body does not declare, or a `Raise` that escapes the body, the loop is ordered, and `emit_for`
+requires `Orderable(𝑃, 𝑃)` of its source's position type `𝑃`, during emission, so a definition's
+scheme states it. `WriteTxn(𝑥)` orders nothing: the run's transactions commit in commit
+order. A body that interacts only through a function passed to it is found to after emission, too
+late for the scheme; `check_loop_orders` asserts no loop is. A keyed collection's positions are its
+sum's binder `σ`, whose kind `SubtypesOf(𝐾)` gives them `𝐾`'s order, and which no instance answers
+or refuses, so once emission is done `InferCtx::order_keyed_loops` resolves each ordered loop's
+source and requires `Orderable(𝐾, 𝐾)` of its keys. A refusal names the capability that ordered the
+loop and what the source's positions are (`InferError::UnorderedLoop`), at the expression the loop
+walks.
+
+### Exceptions
+
+**A `try` catches by type.** A `try` body collects on a frame of its own, and the edge out of it
+stops each `Raise(𝑆)` whose 𝑆 resolves to a subtype of a type a clause catches (`effects::Catch`).
+The first clause whose type does not exclude 𝑆 must cover it (`effects::sent`). Each edge out of a
+`try` body is registered with the variable collecting the body's capabilities, a use's copy
+included, and once the types settle `effects::partly_caught` reports a clause taking part of an 𝑆
+(`InferError::ExceptTakesPart`). A type with a part that is not data is refused at the `raise`, in
+an `except` and in a clause (`InferError::NotRaisable`). The edge reads the type each time it is
+crossed, so an exception reaching the body through a function a use of the definition is passed is
+decided as one raised in it is. A type still open lets the exception through, and
+`InferCtx::settle_catches`, once emission is done, marks the types settled and refuses a clause that
+catches nothing (`InferError::ExceptCatchesNothing`). A `try` whose body reaches a call of a
+function no value of the definition flows into, such as an unannotated parameter's, raises what each
+use passes, so none of its clauses is refused at the definition: `Typing::apply` records each call
+whose callee is an inference variable, and the check skips a `try` reaching one whose variable
+receives no value. Each use of a polymorphic definition copies its `Raise` capabilities at its own
+instance of the types (`Raised::instantiated`).
 
 ### Polymorphism and materialization
 

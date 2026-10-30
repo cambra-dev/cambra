@@ -809,6 +809,19 @@ pub(crate) fn run_with_params(
     // checked here (`src/ccl/design/type-inference.md`, "Written clauses"), after each
     // associated effect type is given what the obligation standing for it selected.
     sub_ctx.settle_effect_links();
+    // Which exceptions each `try` catches depends on their types, which emission has now
+    // finished constraining; every check reading labels below sees what is left.
+    errors.extend(sub_ctx.unraisable_exceptions());
+    errors.extend(sub_ctx.settle_catches());
+    errors.extend(crate::ccl::effects::partly_caught().into_iter().map(|p| {
+        LocatedInferError::new(
+            InferError::ExceptTakesPart {
+                clause: crate::ccl::chl_print::chl_type(&p.clause),
+                raised: crate::ccl::chl_print::chl_type(&p.raised),
+            },
+            p.node,
+        )
+    }));
     push_effect_failures(&mut errors, expr);
     errors.extend(sub_ctx.requirements_beyond_clauses());
     errors.extend(sub_ctx.escaping_results());
@@ -1025,6 +1038,39 @@ pub(crate) fn run_with_params(
         .collect();
     if !unsupplied.is_empty() {
         return Err(unsupplied);
+    }
+    // No exception escapes the program: one the top level raises is an error at the
+    // statement it escapes from, with a label at the `raise`.
+    let escaping_exceptions: Vec<LocatedInferError> = top_level
+        .iter()
+        .filter_map(|l| match &l.item {
+            crate::ccl::effects::Item::Causes(crate::ccl::effects::Effect::Raise(raised)) => {
+                let ty = raised.resolved().unwrap_or_else(|| raised.ty.clone());
+                let at = l.at.unwrap_or(raised.site);
+                Some(
+                    LocatedInferError::new(
+                        InferError::ExceptionEscapes {
+                            ty: crate::ccl::chl_print::chl_type(&ty),
+                        },
+                        at,
+                    )
+                    .with_failure((Some(crate::ccl::infer_var::Origin::Node(raised.site)), None)),
+                )
+            }
+            // `Effect` raises every type unless it takes `Raise(_)` away.
+            crate::ccl::effects::Item::Every(every) if every.raises_anything() => {
+                Some(LocatedInferError::new(
+                    InferError::ExceptionEscapes {
+                        ty: l.item.to_string(),
+                    },
+                    l.at.unwrap_or(expr.node_id()),
+                ))
+            }
+            _ => None,
+        })
+        .collect();
+    if !escaping_exceptions.is_empty() {
+        return Err(escaping_exceptions);
     }
     top_level.extend(exported.appends);
     Ok(Inferred {

@@ -348,6 +348,20 @@ pub enum InferError {
     /// An ordered loop whose source's positions have no order: `why` says what orders the
     /// loop, and `detail` what its positions are (`docs/chl-spec.md`, "Ordered loops").
     UnorderedLoop { why: String, detail: String },
+    /// An exception a module's top level raises, which nothing catches: no exception escapes
+    /// the program (`docs/chl-spec.md`, "Exceptions").
+    ExceptionEscapes { ty: String },
+    /// An `except` clause around a call that may cause a top raising every type, `Effect` or
+    /// `Raise(_)`.
+    ExceptAroundEveryRaise { clause: String, top: String },
+    /// An `except` clause catching nothing its `try` block raises.
+    ExceptCatchesNothing { ty: String },
+    /// An `except` clause, the first not to exclude the type of an exception its `try` block
+    /// raises, that does not cover that type either.
+    ExceptTakesPart { clause: String, raised: String },
+    /// A `raise`, an `except` clause or a `Raise(T)` in a clause whose type is no type an
+    /// exception may have.
+    NotRaisable { ty: String },
     /// A function returning a function that has `item`, which names a variable the
     /// returning function binds.
     EscapesItsVariable { item: String, every: bool },
@@ -937,6 +951,11 @@ impl InferError {
             | InferError::EffectBeyondSignature { .. }
             | InferError::NestedTransaction
             | InferError::UnorderedLoop { .. }
+            | InferError::ExceptionEscapes { .. }
+            | InferError::ExceptCatchesNothing { .. }
+            | InferError::ExceptAroundEveryRaise { .. }
+            | InferError::ExceptTakesPart { .. }
+            | InferError::NotRaisable { .. }
             | InferError::TransactionOutsideBlock
             | InferError::EmptyTransaction
             | InferError::EscapesItsVariable { .. }
@@ -1413,6 +1432,30 @@ impl std::fmt::Debug for InferError {
                 f,
                 "this has `{item}`, which the trait's signature does not list; an associated \
                  type bounded by `Effect` lets instances differ"
+            ),
+            InferError::ExceptionEscapes { ty } => write!(
+                f,
+                "this raises `{ty}`, which nothing catches: no exception may escape the program"
+            ),
+            InferError::NotRaisable { ty } => write!(
+                f,
+                "`{ty}` is no type an exception may have: an exception is data, of a base type, \
+                 a tuple, record or variant of such types, or a nominal type over them"
+            ),
+            InferError::ExceptTakesPart { clause, raised } => write!(
+                f,
+                "this `except {clause}` would catch some exceptions of type `{raised}` and not \
+                 others; catch a type holding all of `{raised}`, and test the value in the clause"
+            ),
+            InferError::ExceptAroundEveryRaise { clause, top } => write!(
+                f,
+                "this `except {clause}` is around a call that may cause `{top}`, which raises \
+                 every type, so a clause would catch some exceptions of a type and not others; \
+                 state the types the call raises instead, taking `Raise(_)` away"
+            ),
+            InferError::ExceptCatchesNothing { ty } => write!(
+                f,
+                "this `except {ty}` catches nothing its `try` block raises"
             ),
             InferError::EffectBeyondClause { item } => write!(
                 f,

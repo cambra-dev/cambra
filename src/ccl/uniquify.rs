@@ -487,6 +487,18 @@ impl Uniquifier {
                 self.expr(value);
             }
 
+            // Each clause's binder scopes over its own body only, as a `Case` pattern's does.
+            TypedExprNode::Try { body, handlers } => {
+                self.expr(body);
+                for h in handlers.iter_mut() {
+                    self.ty(&mut h.catches);
+                    self.binding_tys(&mut h.binding);
+                    let base = self.bind(&mut h.binding);
+                    self.expr(&mut h.body);
+                    self.unbind(base);
+                }
+            }
+
             // Everything else introduces no binders and no type anchors of
             // its own: plain structural recursion.
             _ => e.walk_children_mut(|c| self.expr(c)),
