@@ -283,7 +283,36 @@ Any other requirement is refused at the requirement, since no use could satisfy 
 is refused until
 [chl-spec.md, "8.7 Direction [Decided]: transactions as contextual parameters"](../../../docs/chl-spec.md#87-direction-decided-transactions-as-contextual-parameters)
 is implemented. For the check that every parameter is determined, a member parameter of a
-requirement whose operands are determined counts as determined.
+requirement whose operands are determined counts as determined, and so does a parameter a hole in
+a member's bound became.
+
+### Bounded associated types
+
+A trait's associated type may carry a bound (`TraitDecl::assoc_bounds`), `Size <: Int`.
+`Iterable`'s `Elements` is bounded `<: _ |=> _`. A bound may name the trait's operands and its
+other associated types, and a bound naming the type it bounds is refused where the trait is
+declared. The bound holds in three places:
+
+- **An instance.** An `impl`'s choice of the type must be below the bound, with the instance's
+  operands and other choices substituted into it, as far as their forms decide (`may_be_below`
+  in `lower/traits.rs`): a function where the bound is one, its domain compared by its kind's
+  variance (a compute domain contravariantly, a data domain both ways), the base or nominal type
+  the bound is. A refined bound has no instance yet, since a choice carries no refinement.
+- **An obligation.** `require_trait_obligation` bounds each associated position it mints by the
+  trait's bound at the obligation's own operand and associated variables. Each function layer of
+  the bound gets a binder of its own first (`name_function_binders`), so a dependent collection
+  reaching the position keeps its codomain in its binder's scope.
+- **A requirement.** A member parameter the clause does not bound takes the trait's bound at the
+  requirement's operands and member parameters (`bound_members_by_their_trait`), and an unnamed
+  requirement gets a member parameter, spelled `_::Name`, for each associated type its trait
+  bounds and each one such a bound names. A hole in a bound, the trait's or the clause's, becomes
+  a parameter of the definition, spelled `_𝑛 of 𝑚` after the member `𝑚` it bounds, and placed
+  before that member, so every bound names only parameters opened before it.
+
+The collection rule is a candidate beside the rows when a requirement is checked for
+satisfiability (`Trait::collection_rule_admits`), as it is at inference: a requirement of
+`Iterable` on a type parameter is satisfiable by a structural collection whatever instances the
+module declares.
 
 ---
 

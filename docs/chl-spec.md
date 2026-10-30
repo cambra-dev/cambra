@@ -887,10 +887,8 @@ equality or order. A nominal type compares as its declaration states
 and equality requirements ([Trait requirements](#trait-requirements)):
 
 ```
-_ in _ : forall (C, E) {e: E, c: C} => Bool requires Iterable(C), Equatable(E, E)
+_ in _ : forall (C, E) {e: E, c: C} => Bool requires r: Iterable(C), r::Elements <: _ |=> E, Equatable(E, E)
 ```
-
-where `E` is the type of each value of `C`'s `Elements`.
 
 - **`in` tests what iteration binds** ([4.6 `for` — iteration](#46-for--iteration)): the key of a
   `Set`, the value of an `Array`, `List` or `Collection`, and the entry `(k, v)` of a `Map` or
@@ -3439,6 +3437,19 @@ instance ([Equality and order](#equality-and-order)).
   under `requires a: Addable(T, T), a::Output <: T` is a `T`. A call whose instance's `Output` is
   not below `T` is rejected at the call. A bound no instance's associated type meets is an error
   at the bound.
+- **A trait's bound holds of its associated type in every requirement.** Where the trait declares
+  one with a bound ([Declaring a trait](#declaring-a-trait)), a requirement's associated type is
+  below that bound at the requirement's operands, unless the clause bounds it itself. A
+  requirement with no name has it too, so under `requires Iterable(C)`, `C`'s collection is some
+  collection of some type, and a loop over a `C` types. A hole in a bound, the trait's or the
+  clause's, is a type parameter of the definition. Under
+  `requires i: Iterable(C), i::Elements <: _ |=> T`, `C`'s collection has values of type `T`,
+  whatever its domain.
+
+  ```python
+  def largest(C, T, c: C) => T requires i: Iterable(C), i::Elements <: _ |=> T, Orderable(T, T):
+      max([x for x in c])
+  ```
 - **A requirement's arguments are any types.** `Equatable` reads a product componentwise, as `==`
   does ([3.4 Comparisons](#34-comparisons)), so `requires Equatable({T, U}, {T, U})` also states
   `Equatable(T, T)` and `Equatable(U, U)`. `requires Describe(Two(T))` states `Describe` of the
@@ -3554,7 +3565,7 @@ def total(S, s: S) => Int requires a: Area(S):
 ```ebnf
 trait_stmt  ::= "trait" Ident "(" Ident ( "," Ident )* [ "," ] ")" [ requires_clause ] ":"
                 NEWLINE INDENT trait_item+ DEDENT
-trait_item  ::= Ident NEWLINE
+trait_item  ::= Ident [ "<:" expression ] NEWLINE
              |  "def" ident "(" params ")" "=>" expression [ requires_clause ] NEWLINE
 ```
 
@@ -3604,6 +3615,11 @@ trait Scales(V, F):
 - **[Open] — an associated type the trait defines.** `Elem = Int` in a trait, which every instance
   would take, is not part of the language, as a default function is not: every instance defines
   each of its trait's associated types.
+- **An associated type may be bounded.** `Size <: Int` states that every instance's choice of the
+  type is below `Int`, and may name the trait's operands and its other associated types. An
+  `impl Measured(Box2)` whose block defines `Size = String` is an error at the `impl`. A hole in
+  the bound is any type, chosen afresh at each use: `Iterable`'s `Elements` is bounded
+  `<: _ |=> _`, every collection.
 - **A trait may require traits of its types.** `trait Ranked(A, B) requires s: Same(A, B):` states
   that every instance of `Ranked` is at types `Same` holds of: an instance whose types `Same` does
   not hold of, by the instances declared above it and its own `requires` clause, is an error. Each

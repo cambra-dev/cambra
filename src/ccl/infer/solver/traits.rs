@@ -149,6 +149,11 @@ pub struct TraitDecl {
     pub operands: Vec<Rc<TypeParam>>,
     /// The associated types, each with the parameter a signature names it by.
     pub assocs: Vec<(Assoc, Rc<TypeParam>)>,
+    /// The bound of each associated type declared with one, `Elements <: 𝐵`, over
+    /// `operands` and `assocs`. Every instance's choice of the type is below it, and a
+    /// requirement leaving the type unnamed gets a parameter bounded by it
+    /// (`docs/chl-spec.md`, "Declaring a trait"). Holes in it are fresh at each use.
+    pub assoc_bounds: Vec<(Assoc, Type)>,
     /// In declaration order.
     pub functions: Vec<TraitFunction>,
     /// What every instance of the trait requires of its operands, over `operands` and
@@ -415,6 +420,16 @@ impl CompilerTraits {
                     Assoc::Declared(ITERABLE_ELEMENTS_ASSOC.into()),
                     Rc::clone(&elements),
                 )],
+                // `Elements <: _ |=> _`: a loop walks a collection.
+                assoc_bounds: vec![(
+                    Assoc::Declared(ITERABLE_ELEMENTS_ASSOC.into()),
+                    Type::Fun {
+                        name: None,
+                        fun_kind: crate::ccl::ty::FunKind::data_hole(),
+                        domain: Box::new(Type::Hole),
+                        codomain: Box::new(Type::Hole),
+                    },
+                )],
                 functions: vec![TraitFunction {
                     name: ITERABLE_ELEMENTS.into(),
                     signature: Signature {
@@ -520,6 +535,7 @@ impl OperatorTrait<'_> {
             requires,
             named: Vec::new(),
             products: self.products,
+            assoc_bounds: Vec::new(),
             reads_collections: false,
         });
         for (bases, associated, primitive) in rows {
@@ -612,6 +628,34 @@ impl Trait {
         self.0.reads_collections
     }
 
+    /// Whether the collection rule could answer a requirement of this trait at `args`, with
+    /// the associated types `assoc` names: the operand could be a structural collection, a
+    /// type parameter or a function, and a named `Elements` unifies with it, since the rule
+    /// makes a collection its own `Elements`.
+    pub fn collection_rule_admits(&self, args: &[Type], assoc: &[(Assoc, Type)]) -> bool {
+        if !self.reads_collections() {
+            return false;
+        }
+        let [operand] = args else {
+            return false;
+        };
+        if !matches!(
+            operand.peel_refinements(),
+            Type::Param(_) | Type::Fun { .. }
+        ) {
+            return false;
+        }
+        assoc
+            .iter()
+            .filter(|(name, _)| *name == Assoc::Declared(ITERABLE_ELEMENTS_ASSOC.into()))
+            .all(|(_, elements)| {
+                unify_all(
+                    std::slice::from_ref(operand),
+                    std::slice::from_ref(elements),
+                )
+            })
+    }
+
     /// Every trait the compiler provides, `AddableRefined` included.
     pub fn compiler_traits() -> Vec<Trait> {
         COMPILER_TRAITS.with(|c| {
@@ -697,6 +741,30 @@ impl Trait {
     /// The associated type this trait names `name`.
     pub fn assoc_named(&self, name: &str) -> Option<Assoc> {
         self.assocs().into_iter().find(|a| a.name() == name)
+    }
+
+    /// The bound the associated type `name` is declared with, if it has one, over the
+    /// trait's own operand and associated parameters ([`TraitDecl::assoc_bounds`]).
+    pub fn assoc_bound(&self, name: &Assoc) -> Option<&Type> {
+        self.assoc_bounds
+            .iter()
+            .find(|(a, _)| a == name)
+            .map(|(_, b)| b)
+    }
+
+    /// Whether no associated type of this trait has a bound.
+    pub fn assoc_bounds_empty(&self) -> bool {
+        self.assoc_bounds.is_empty()
+    }
+
+    /// The parameters the trait's operands are named by in its own types.
+    pub fn operand_params(&self) -> &[Rc<TypeParam>] {
+        &self.operands
+    }
+
+    /// The parameter the associated type `name` is named by in the trait's own types.
+    pub fn assoc_param(&self, name: &Assoc) -> Option<&Rc<TypeParam>> {
+        self.assocs.iter().find(|(a, _)| a == name).map(|(_, p)| p)
     }
 
     /// Whether some product satisfies this trait when its components do
