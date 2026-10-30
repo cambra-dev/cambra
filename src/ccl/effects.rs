@@ -106,6 +106,81 @@ pub enum Effect {
     Commit,
     /// An output outside the program.
     Emit,
+    /// An exception, raised at one site and of one type (`docs/chl-spec.md`, "Exceptions").
+    Raise(Raised),
+}
+
+/// The exception a `raise` makes: where it is raised, and its type.
+///
+/// Equality, ordering and hashing read the site and the instance alone. The type may still be
+/// an inference variable when the label is recorded, and two labels from one site are two
+/// labels only where they are two instances: each use of a polymorphic function copies its
+/// labels, the type freshened with the rest of its type, and the copy is a new instance
+/// ([`Raised::instantiated`]).
+#[derive(Debug, Clone)]
+pub struct Raised {
+    pub site: NodeId,
+    pub instance: u32,
+    pub ty: crate::ccl::Type,
+}
+
+impl Raised {
+    /// The exception raised at `site`, of type `ty`, as the definition holding it records it.
+    pub fn at(site: NodeId, ty: crate::ccl::Type) -> Self {
+        Self {
+            site,
+            instance: 0,
+            ty,
+        }
+    }
+
+    /// This exception as one use of its definition raises it: at the freshened type `ty`, and
+    /// a label of its own.
+    pub fn instantiated(&self, ty: crate::ccl::Type) -> Self {
+        thread_local! {
+            static NEXT: Cell<u32> = const { Cell::new(1) };
+        }
+        let instance = NEXT.with(|n| {
+            let i = n.get();
+            n.set(i + 1);
+            i
+        });
+        Self {
+            site: self.site,
+            instance,
+            ty,
+        }
+    }
+
+    fn key(&self) -> (NodeId, u32) {
+        (self.site, self.instance)
+    }
+}
+
+impl PartialEq for Raised {
+    fn eq(&self, other: &Self) -> bool {
+        self.key() == other.key()
+    }
+}
+
+impl Eq for Raised {}
+
+impl PartialOrd for Raised {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Raised {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.key().cmp(&other.key())
+    }
+}
+
+impl Hash for Raised {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.key().hash(state);
+    }
 }
 
 /// A declared type parameter standing for a clause (`docs/chl-spec.md`, "Kinds and bounds"):
@@ -341,6 +416,61 @@ pub struct Filter {
     /// The node the edge stands for, a call: each label crossing it entered the receiving
     /// variable there.
     pub at: Option<NodeId>,
+    /// The exceptions a `try` catches, where the edge leaves a `try`'s body.
+    pub catches: Option<Rc<Catch>>,
+}
+
+/// The exceptions one `try` catches (`docs/chl-spec.md`, "Exceptions"): each whose type is a
+/// subtype of a type one of its clauses catches.
+///
+/// It is decided by type rather than by label, so an exception that reaches the `try` through
+/// a function an instance of its definition is passed is decided as one raised in its body
+/// is. The types resolve as emission constrains them, and an exception whose type does not
+/// resolve yet passes; [`exceptions_settled`] marks the point after which every one does.
+#[derive(Debug)]
+pub struct Catch {
+    clauses: Vec<crate::ccl::Type>,
+}
+
+impl PartialEq for Catch {
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self, other)
+    }
+}
+
+impl Eq for Catch {}
+
+/// Mark the exceptions' types resolved: a resolution of an effect variable computed before
+/// now may have let through an exception a [`Catch`] stops.
+pub fn exceptions_settled() {
+    effect_fact_written();
+}
+
+impl Catch {
+    /// The catch of a `try` whose clauses catch `clauses`.
+    pub fn new(clauses: Vec<crate::ccl::Type>) -> Self {
+        Catch { clauses }
+    }
+
+    /// Whether `raised`'s type resolves to a subtype of a type a clause catches. One that does
+    /// not resolve is not caught; inference reports it where its type is.
+    fn catches(&self, raised: &Raised) -> bool {
+        let Some(ty) = crate::ccl::infer::solve::resolve_var_type(&raised.ty)
+            .ok()
+            .filter(|ty| !crate::ccl::subst::type_contains_infer(ty))
+        else {
+            return false;
+        };
+        self.clauses.iter().any(|catches| {
+            crate::ccl::infer::solver::constrain::constrain_subtype_in(
+                &ty,
+                catches,
+                &mut crate::ccl::infer::solver::constrain::ConstrainCache::new().without_effects(),
+                &crate::ccl::infer::solver::smt::NoScope,
+            )
+            .is_ok()
+        })
+    }
 }
 
 impl Filter {
@@ -355,6 +485,11 @@ impl Filter {
     pub fn admits(&self, label: &Label) -> bool {
         if let Item::Requires(r) = &label.item
             && self.discharges.contains(r)
+        {
+            return false;
+        }
+        if let (Item::Causes(Effect::Raise(raised)), Some(catch)) = (&label.item, &self.catches)
+            && catch.catches(raised)
         {
             return false;
         }
@@ -432,7 +567,32 @@ impl Upper {
         } else {
             self.of_requires
         };
-        !bounded || self.set.states(item)
+        !bounded || self.set.states(item) || self.states_a_wider_raise(item)
+    }
+
+    /// Whether `item` raises an exception whose type is a subtype of one this bound's
+    /// `Raise(T)` states: `Raise` is covariant (`docs/chl-spec.md`, "Exceptions"). Read once
+    /// inference is done, when the types resolve.
+    fn states_a_wider_raise(&self, item: &Item) -> bool {
+        let Item::Causes(Effect::Raise(raised)) = item else {
+            return false;
+        };
+        let resolve = |ty: &crate::ccl::Type| {
+            crate::ccl::infer::solve::resolve_var_type(ty).unwrap_or_else(|_| ty.clone())
+        };
+        let raised = resolve(&raised.ty);
+        self.set.causes.iter().any(|e| {
+            let Effect::Raise(stated) = e else {
+                return false;
+            };
+            crate::ccl::infer::solver::constrain::constrain_subtype_in(
+                &raised,
+                &resolve(&stated.ty),
+                &mut crate::ccl::infer::solver::constrain::ConstrainCache::new().without_effects(),
+                &crate::ccl::infer::solver::smt::NoScope,
+            )
+            .is_ok()
+        })
     }
 }
 
@@ -837,6 +997,7 @@ impl fmt::Display for Effect {
             Effect::Append(x) => write!(f, "Append({x})"),
             Effect::Commit => f.write_str("Commit"),
             Effect::Emit => f.write_str("Emit"),
+            Effect::Raise(raised) => write!(f, "Raise({})", raised.ty),
         }
     }
 }
@@ -847,13 +1008,18 @@ impl Item {
         match self {
             Item::Requires(r) => r.requirement().terms.first(),
             Item::Causes(Effect::Write(x) | Effect::Append(x)) => Some(x),
-            Item::Causes(Effect::Commit | Effect::Emit) | Item::Param(_) => None,
+            Item::Causes(Effect::Commit | Effect::Emit | Effect::Raise(_)) | Item::Param(_) => None,
         }
     }
 }
 
 impl Written {
     /// These clauses with `f` applied to each variable they name.
+    #[expect(
+        clippy::mutable_key_type,
+        reason = "an `Effect` reaches a `Type` only through a `Raised`, which hashes and orders \
+                  by its site and instance"
+    )]
     pub fn map_names(&self, mut f: impl FnMut(&Name) -> Name) -> Written {
         let causes = self
             .set
@@ -862,7 +1028,7 @@ impl Written {
             .map(|e| match e {
                 Effect::Write(x) => Effect::Write(f(x)),
                 Effect::Append(x) => Effect::Append(f(x)),
-                Effect::Commit | Effect::Emit => e.clone(),
+                Effect::Commit | Effect::Emit | Effect::Raise(_) => e.clone(),
             })
             .collect();
         Written {

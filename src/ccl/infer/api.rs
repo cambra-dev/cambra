@@ -340,6 +340,11 @@ pub enum InferError {
     EffectBeyondSignature { item: String },
     /// A commit inside a `with begin():` block's body, directly or through a call.
     NestedTransaction,
+    /// An exception a module's top level raises, which nothing catches: no exception escapes
+    /// the program (`docs/chl-spec.md`, "Exceptions").
+    ExceptionEscapes { ty: String },
+    /// An `except` clause catching nothing its `try` block raises.
+    ExceptCatchesNothing { ty: String },
     /// A function returning a function that has `item`, which names a variable the
     /// returning function binds.
     EscapesItsVariable { item: String },
@@ -873,6 +878,8 @@ impl InferError {
             | InferError::ClauseNamesNoVariable { .. }
             | InferError::EffectBeyondSignature { .. }
             | InferError::NestedTransaction
+            | InferError::ExceptionEscapes { .. }
+            | InferError::ExceptCatchesNothing { .. }
             | InferError::TransactionOutsideBlock
             | InferError::EmptyTransaction
             | InferError::EscapesItsVariable { .. }
@@ -1286,6 +1293,14 @@ impl std::fmt::Debug for InferError {
                 f,
                 "this has `{item}`, which the trait's signature does not list; an associated \
                  type bounded by `Effect` lets instances differ"
+            ),
+            InferError::ExceptionEscapes { ty } => write!(
+                f,
+                "this raises `{ty}`, which nothing catches: no exception may escape the program"
+            ),
+            InferError::ExceptCatchesNothing { ty } => write!(
+                f,
+                "this `except {ty}` catches nothing its `try` block raises"
             ),
             InferError::EffectBeyondClause { item } => write!(
                 f,

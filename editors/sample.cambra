@@ -45,6 +45,11 @@ with begin():
         case `none:
             total := 0
 
+try:
+    raise Overdrawn::new((by=total))
+except Overdrawn as e:
+    total := 0
+
 opaque ^= False
 pairs = [k -> v for k in keys] ++ [x for x in "a\tb\"c\d"]
 escapes = ["\n\r\\\0", '\'']

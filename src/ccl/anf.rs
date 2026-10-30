@@ -195,11 +195,70 @@ pub fn run(expr: Expr) -> Expr {
     let root_id = expr.node_id();
     let out = {
         let _g = provenance::enter(root_id, "anf.hoist", Nature::Machinery);
+        let mut expr = expr;
+        if holds_raise(&expr) {
+            short_circuits_as_branches(&mut expr);
+        }
         normalize(expr, &Muts::new())
     };
     #[cfg(debug_assertions)]
     debug_assert_flat_spines(&out);
     out
+}
+
+/// Whether `e` holds a `raise` anywhere.
+fn holds_raise(e: &Expr) -> bool {
+    matches!(e.node, TypedExprNode::Raise { .. }) || e.any_child(holds_raise)
+}
+
+/// Make each `𝑎 and 𝑏` and `𝑎 or 𝑏` whose `𝑏` is compound an `if` with `𝑏` as a branch.
+///
+/// `𝑏` is evaluated only where `𝑎` decides it is, and A-normalization would name it ahead of
+/// the operator, evaluating it everywhere. That changes nothing a pure `𝑏` denotes, so it is
+/// done only in a tree that raises, where `𝑏` may hold a call that raises
+/// (`docs/chl-spec.md`, "Exceptions").
+fn short_circuits_as_branches(e: &mut Expr) {
+    e.walk_children_mut(short_circuits_as_branches);
+    let TypedExprNode::BinOp {
+        op:
+            crate::ccl::BinOpKind::BoolLogic(
+                logic @ (crate::ccl::LogicKind::And | crate::ccl::LogicKind::Or),
+            ),
+        right,
+        ..
+    } = &e.node
+    else {
+        return;
+    };
+    if matches!(right.node, TypedExprNode::Var(_) | TypedExprNode::Lit(_)) {
+        return;
+    }
+    let logic = *logic;
+    let TypedExprNode::BinOp { left, right, .. } =
+        std::mem::replace(&mut e.node, TypedExprNode::Error)
+    else {
+        unreachable!("matched above")
+    };
+    let literal = |b: bool| Expr::lit(crate::ccl::Lit::Bool(b));
+    let (then, otherwise) = match logic {
+        crate::ccl::LogicKind::And => (*right, literal(false)),
+        _ => (literal(true), *right),
+    };
+    e.node = TypedExprNode::Case {
+        scrutinee: None,
+        branches: vec![
+            Branch {
+                pattern: None,
+                guard: *left,
+                body: then,
+            },
+            Branch {
+                pattern: None,
+                guard: literal(true),
+                body: otherwise,
+            },
+        ],
+    };
 }
 
 /// Is `e` already atomic — safe to leave directly in a position ANF requires
@@ -665,6 +724,22 @@ fn normalize_inner(e: Expr, muts: &Muts) -> Expr {
                 }),
             )
         }
+
+        // A raised value is evaluated where the `raise` stands, and each block of a `try` is a
+        // scope of its own, as a branch body is.
+        TypedExprNode::Raise { value } => rebuild(TypedExprNode::Raise {
+            value: Box::new(normalize(*value, muts)),
+        }),
+        TypedExprNode::Try { body, handlers } => rebuild(TypedExprNode::Try {
+            body: Box::new(normalize(*body, muts)),
+            handlers: handlers
+                .into_iter()
+                .map(|h| crate::ccl::expr::Handler {
+                    body: normalize(h.body, muts),
+                    ..h
+                })
+                .collect(),
+        }),
 
         TypedExprNode::Realize(_)
         | TypedExprNode::LetRec { .. }

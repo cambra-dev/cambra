@@ -21,8 +21,8 @@ use super::*;
 /// compile with `input=None` and the expression is function-typed —
 /// aggregate arguments, the stream side of `FinalOrDefault`, mutation-loop
 /// sources, product components and program outputs, `Copair` operands,
-/// the program's top-level function-valued result, top-level let-bound
-/// function values, and a few other shapes enumerated by
+/// the program's top-level function-valued result, let-bound function values
+/// at the top level and under a `const`, and a few other shapes enumerated by
 /// [`insert_iterate_recurse`].  At each site the pass dispatches via
 /// [`wrap_with_iterate`]:
 ///
@@ -252,8 +252,14 @@ pub(super) fn insert_iterate_recurse(
         // `𝑐 ▷ const` compiles `𝑐` with `input=None` and broadcasts what it produces over
         // the input (`MapResultToConst`), so `𝑐` is an iteration site exactly when it holds
         // a collection, as a product's component is.
+        // A `let` there is compiled with `input=None` as one at the program's root is, so its
+        // bound collections are iteration sites too.
         TypedExprNode::Apply { argument, function } if is_builtin(function, Builtin::Const) => {
-            mark_component_source(argument, ctx, memo)?;
+            if matches!(argument.node, TypedExprNode::Let { .. }) {
+                wrap_with_iterate(argument, ctx, memo, "const-let")?;
+            } else {
+                mark_component_source(argument, ctx, memo)?;
+            }
         }
         // The remaining input-internalising builtins all compile their
         // (single) argument with `input=None` — wrap it uniformly.

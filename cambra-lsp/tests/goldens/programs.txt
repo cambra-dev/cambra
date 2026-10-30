@@ -306,7 +306,7 @@ diagnostics:
   62:12-62:18 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
     62:5-62:11 while parsing statement
     62:5-62:11 while parsing expression
-  76:14-76:18 found 'with', expected 'if', or 'match'
+  76:14-76:18 found 'with', expected 'if', 'match', or 'try'
     76:5-76:13 while parsing statement
 symbols:
   variable Dollars 30:1-30:14 (name 30:1-30:8)
@@ -355,7 +355,7 @@ diagnostics:
   76:12-76:18 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^+', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
     76:5-76:11 while parsing statement
     76:5-76:11 while parsing expression
-  90:14-90:18 found 'with', expected 'if', or 'match'
+  90:14-90:18 found 'with', expected 'if', 'match', or 'try'
     90:5-90:13 while parsing statement
 symbols:
   variable Dollars 27:1-27:14 (name 27:1-27:8)
@@ -486,15 +486,15 @@ symbols:
   variable events 22:1-22:16 (name 22:1-22:7)
   function bump 26:1-35:29 (name 26:5-26:9)
   function evens 37:1-39:16 (name 37:5-37:10)
-  variable opaque 48:1-48:16 (name 48:1-48:7)
-  variable pairs 49:1-49:59 (name 49:1-49:6)
-  variable escapes 50:1-50:29 (name 50:1-50:8)
-  variable totals 51:1-51:46 (name 51:1-51:7)
-  variable inc 52:1-52:18 (name 52:1-52:4)
-  variable held 53:1-53:28 (name 53:1-53:5)
-  variable apply 54:1-54:22 (name 54:1-54:6)
-  variable evens 55:1-55:43 (name 55:1-55:6)
-  variable n 70:1-70:42 (name 70:1-70:2)
+  variable opaque 53:1-53:16 (name 53:1-53:7)
+  variable pairs 54:1-54:59 (name 54:1-54:6)
+  variable escapes 55:1-55:29 (name 55:1-55:8)
+  variable totals 56:1-56:46 (name 56:1-56:7)
+  variable inc 57:1-57:18 (name 57:1-57:4)
+  variable held 58:1-58:28 (name 58:1-58:5)
+  variable apply 59:1-59:22 (name 59:1-59:6)
+  variable evens 60:1-60:43 (name 60:1-60:6)
+  variable n 75:1-75:42 (name 75:1-75:2)
 folds:
   1-5 comment
   12-13

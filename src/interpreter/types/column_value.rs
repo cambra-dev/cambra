@@ -992,6 +992,15 @@ impl ColumnValue {
                     mk.into_iter().enumerate().map(|(i, k)| (k, i)).collect();
                 take(v).into_iter().map(|k| pos[&k]).collect()
             }
+            // A tuple key, such as the positions of a comprehension over two generators: keyed
+            // by each row's value.
+            (s @ ColumnValue::Records(_), mk @ ColumnValue::Records(_)) => {
+                let pos: HashMap<Value, usize> =
+                    (0..mk.len()).map(|i| (mk.index_at(i), i)).collect();
+                let indices = (0..s.len()).map(|i| pos[&s.index_at(i)]).collect();
+                s.clear();
+                indices
+            }
             (s, mk) => panic!(
                 "transform_by_map: key type mismatch or unsupported: {:?} vs {:?}",
                 s, mk

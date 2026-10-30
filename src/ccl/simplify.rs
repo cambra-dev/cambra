@@ -1744,6 +1744,19 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
     )
 }
 
+/// Whether the curry typed `curry_ty`, whose zip's `.0` arm is `proj0f`, answers a collection
+/// narrower than the one that arm's 𝑓 answers: a filtered comprehension reading a collection
+/// 𝑓 computes from the curry's argument, `[k ▷ c for k in D if 𝑃]` with `c` a function of it.
+/// The narrowing reads the argument, which `map(𝑔)` behind 𝑓 no longer has, so the curry
+/// stays the node that answers the narrowed collection.
+fn narrows_what_f_answers(proj0f: &Expr, curry_ty: &Type) -> bool {
+    let Some((_, f)) = as_compose(proj0f) else {
+        return false;
+    };
+    let domain = |collection: Option<Type>| collection.and_then(|c| c.domain());
+    domain(f.ty.codomain()) != domain(curry_ty.codomain())
+}
+
 /// Exponential eta: `curry(⟨.1, .0 ≫ 𝑓⟩ ≫ apply ≫ 𝑔)  ⟹  𝑓 ≫ map(𝑔)`
 ///
 /// The inner compose must begin with `⟨.1, .0 ≫ 𝑓⟩` then `apply`; any element
@@ -1751,7 +1764,8 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
 /// `.0` arm is `𝑓 = id`, an empty suffix is `𝑔 = id` — so the rule also covers
 /// the degenerate forms `curry(⟨.1, .0 ≫ 𝑓⟩ ≫ apply) ⟹ 𝑓` and
 /// `curry(⟨.1, .0⟩ ≫ apply) ⟹ id`. Where the curried collection is narrower than the
-/// argument, the last form is `map(id)` instead.
+/// argument, the last form is `map(id)` instead. Where it is narrower than the collection 𝑓
+/// answers, the rule does not fire ([`narrows_what_f_answers`]).
 ///
 /// 𝑔 leaves the curry as `map(𝑔)`, the internal hom's action on 𝑔
 /// (`map(𝑔)(k) = k ≫ 𝑔`), post-composed onto the curried function's result. The
@@ -1773,8 +1787,11 @@ fn try_exponential_eta(expr: &mut Expr) -> bool {
             return false;
         };
         is_builtin(ap, Builtin::Apply)
-            && as_zip(zip)
-                .is_some_and(|(proj1, proj0f)| is_proj_idx(proj1, 1) && is_eta_apply_arm(proj0f))
+            && as_zip(zip).is_some_and(|(proj1, proj0f)| {
+                is_proj_idx(proj1, 1)
+                    && is_eta_apply_arm(proj0f)
+                    && !narrows_what_f_answers(proj0f, &expr.ty)
+            })
     });
     if matched {
         let curry_ty = expr.ty.clone();
@@ -1797,9 +1814,9 @@ fn try_exponential_eta(expr: &mut Expr) -> bool {
         // narrowing, and planning materializes it as a per-group filter
         // (`planning/per_group_filter.rs`).
         //
-        // With 𝑓 present the narrowing reads the argument while `map` receives 𝑓's result,
-        // so no type spells it; that shape fails the post-elimination type check as it does
-        // without this rule.
+        // With 𝑓 present the rule does not fire on a narrowed curry
+        // ([`narrows_what_f_answers`]): the narrowing reads the argument, which `map` behind
+        // 𝑓 does not receive, so the curry stays the node answering the narrowed collection.
         //
         // The test is the one `id` itself would fail: with 𝑓 and the suffix absent the curry
         // is `𝐴 ⇒ 𝐵`, and `id` types only where `𝐴` is `𝐵`.

@@ -12,11 +12,11 @@ use smol_str::SmolStr;
 use crate::ast::{
     AnnotationMode, ArmPattern, Arrow, AssignTarget, AssocArg, AugOp, BinOp, BindingTransparency,
     BoolOp, Clause, CmpOp, CompClause, Comprehension, Constructor, ConstructorParam,
-    ConstructorPattern, DiscardHead, EntryForm, Expr, FileId, FunctionSignature, IfBranch,
-    ImplBlock, KeywordArg, KindAnnotation, Lit, MatchArm, MatchPattern, Module, ModuleTypeEntry,
-    Param, PayloadPattern, QualifiedName, RecordField, Requirement, Span, Spanned, Stmt, TraitDecl,
-    TraitItem, TraitType, TypeAnnotation, TypeDecl, TypeDeclBody, TypeParam, UnaryOp, UseItem,
-    VariantPayload, WrittenPath, is_type_name,
+    ConstructorPattern, DiscardHead, EntryForm, ExceptClause, Expr, FileId, FunctionSignature,
+    IfBranch, ImplBlock, KeywordArg, KindAnnotation, Lit, MatchArm, MatchPattern, Module,
+    ModuleTypeEntry, Param, PayloadPattern, QualifiedName, RecordField, Requirement, Span, Spanned,
+    Stmt, TraitDecl, TraitItem, TraitType, TypeAnnotation, TypeDecl, TypeDeclBody, TypeParam,
+    UnaryOp, UseItem, VariantPayload, WrittenPath, is_type_name,
 };
 use crate::builtins::SurfaceBuiltin;
 use crate::lexer::{self, Token};
@@ -1413,6 +1413,28 @@ where
                 )
             });
 
+        // ---- try: body / except T as e: body ------------------------
+        let except_binding = just(Token::As)
+            .ignore_then(
+                select! { Token::Ident(s) => s }.map_with(|s, e| Spanned::new(e.span(), s)),
+            )
+            .or_not();
+        let try_stmt = just(Token::Try)
+            .ignore_then(just(Token::Colon))
+            .ignore_then(block.clone())
+            .then(
+                just(Token::Except)
+                    .ignore_then(expr.clone())
+                    .then(except_binding)
+                    .then_ignore(just(Token::Colon))
+                    .then(block.clone())
+                    .map(|((ty, binding), body)| ExceptClause { ty, binding, body })
+                    .repeated()
+                    .at_least(1)
+                    .collect::<Vec<_>>(),
+            )
+            .map_with(|(body, handlers), e| Spanned::new(e.span(), Stmt::Try { body, handlers }));
+
         // ---- match scrutinee: case `tag(binder): body ---------------
         //
         // The arm list is itself an indented block, so a `match` is two levels
@@ -2096,6 +2118,9 @@ where
             .map_with(|value, e| Spanned::new(e.span(), Stmt::Return(value)));
 
         let pass_stmt = just(Token::Pass).map_with(|_, e| Spanned::new(e.span(), Stmt::Pass));
+        let raise_stmt = just(Token::Raise)
+            .ignore_then(expr.clone())
+            .map_with(|value, e| Spanned::new(e.span(), Stmt::Raise(value)));
 
         // Statement-level rules that begin with an expression. We parse
         // a comma-separated *list* of expressions first (so bare-tuple
@@ -2159,7 +2184,7 @@ where
         // `BlockValueDedent`. Consuming the closer here ends the statement, and
         // it is what a chain written at the statement's own column fails on:
         // that spelling closes the level before the chain's first line.
-        let block_value = choice((if_stmt.clone(), match_stmt.clone()))
+        let block_value = choice((if_stmt.clone(), match_stmt.clone(), try_stmt.clone()))
             .then_ignore(just(Token::BlockValueDedent))
             .map(|stmt: Spanned<Stmt>| {
                 let span = stmt.span;
@@ -2181,6 +2206,7 @@ where
         let simple_stmt = choice((
             return_stmt,
             pass_stmt,
+            raise_stmt,
             import_stmt,
             run_stmt,
             param_stmt,
@@ -2256,7 +2282,7 @@ where
         .at_least(1)
         .then_ignore(just(Token::Newline).or_not());
         let skip_line_and_block = skip_to_newline.then(skip_indented_block.clone().or_not());
-        let skip_chain = choice((just(Token::Elif), just(Token::Else)))
+        let skip_chain = choice((just(Token::Elif), just(Token::Else), just(Token::Except)))
             .then(skip_line_and_block.clone())
             .repeated();
         let stmt_recovery = choice((
@@ -2269,6 +2295,7 @@ where
         choice((
             if_stmt,
             match_stmt,
+            try_stmt,
             for_stmt,
             with_stmt,
             def_stmt,
@@ -2363,6 +2390,8 @@ fn pub_refusal(stmt: &Stmt) -> Option<&'static str> {
         Stmt::Expr(_)
         | Stmt::If { .. }
         | Stmt::Match { .. }
+        | Stmt::Try { .. }
+        | Stmt::Raise(_)
         | Stmt::For { .. }
         | Stmt::With { .. }
         | Stmt::Return(_)
@@ -3089,6 +3118,48 @@ mod tests {
         parse_mod(src)
             .into_result()
             .unwrap_or_else(|errs| panic!("parse errors: {errs:#?}"))
+    }
+
+    /// `raise` is a statement, and `try` holds its clauses in source order, each with the type
+    /// it catches and the name it binds where one is written (`docs/chl-spec.md`,
+    /// "Exceptions").
+    #[test]
+    fn try_holds_its_clauses_in_order() {
+        let m = parse_m(indoc! {"
+            try:
+                raise Negative::new((qty=1))
+            except Negative as e:
+                0
+            except Int:
+                1
+        "});
+        let Stmt::Try { body, handlers } = &m.body[0].node else {
+            panic!("expected a try, got {:?}", m.body[0].node)
+        };
+        assert!(matches!(body[0].node, Stmt::Raise(_)), "{body:?}");
+        let names: Vec<_> = handlers
+            .iter()
+            .map(|h| (h.binding.as_ref().map(|b| b.node.clone()), h.body.len()))
+            .collect();
+        assert_eq!(names, vec![(Some("e".into()), 1), (None, 1)]);
+    }
+
+    /// A `try` stands on an assignment's right-hand side, as an `if` does.
+    #[test]
+    fn try_is_a_block_value() {
+        let m = parse_m(indoc! {"
+            y = try:
+                    f(1)
+                except Negative:
+                    0
+        "});
+        let Stmt::Assign { value, .. } = &m.body[0].node else {
+            panic!("expected an assignment, got {:?}", m.body[0].node)
+        };
+        let Expr::Block(stmt) = &value.node else {
+            panic!("expected a block value, got {:?}", value.node)
+        };
+        assert!(matches!(stmt.node, Stmt::Try { .. }), "{stmt:?}");
     }
 
     /// The constructor-list form keeps each line's name and parameters in source order, with

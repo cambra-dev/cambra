@@ -25,16 +25,8 @@ pub(super) fn for_body_has_yield(stmts: &[Spanned<ChlStmt>]) -> bool {
 fn stmt_has_yield(stmt: &Spanned<ChlStmt>) -> bool {
     match &stmt.node {
         ChlStmt::Expr(value) => matches!(&value.node, ChlExpr::Yield(_)),
-        ChlStmt::If {
-            branches,
-            else_body,
-        } => {
-            branches.iter().any(|b| for_body_has_yield(&b.body))
-                || else_body.as_deref().is_some_and(for_body_has_yield)
-        }
         ChlStmt::For { body, .. } => for_body_has_yield(body),
-        ChlStmt::Match { arms, .. } => arms.iter().any(|a| for_body_has_yield(&a.body)),
-        _ => false,
+        node => node.branch_blocks().into_iter().any(for_body_has_yield),
     }
 }
 
@@ -53,16 +45,8 @@ pub(super) fn for_body_has_feed(stmts: &[Spanned<ChlStmt>]) -> bool {
 fn stmt_has_feed(stmt: &Spanned<ChlStmt>) -> bool {
     match &stmt.node {
         ChlStmt::Expr(value) => matches!(&value.node, ChlExpr::Feed { .. }),
-        ChlStmt::If {
-            branches,
-            else_body,
-        } => {
-            branches.iter().any(|b| for_body_has_feed(&b.body))
-                || else_body.as_deref().is_some_and(for_body_has_feed)
-        }
         ChlStmt::For { body, .. } => for_body_has_feed(body),
-        ChlStmt::Match { arms, .. } => arms.iter().any(|a| for_body_has_feed(&a.body)),
-        _ => false,
+        node => node.branch_blocks().into_iter().any(for_body_has_feed),
     }
 }
 
@@ -76,6 +60,22 @@ fn stmt_has_feed(stmt: &Spanned<ChlStmt>) -> bool {
 /// it.)
 pub(super) fn for_body_has_with(stmts: &[Spanned<ChlStmt>]) -> bool {
     stmts.iter().any(|s| matches!(s.node, ChlStmt::With { .. }))
+}
+
+/// Whether the loop body holds a `raise` or a `try` anywhere beneath it.
+///
+/// A routing predicate, like [`for_body_has_with`]: such a loop takes the direct-mirror `For`
+/// path, whose body is a statement chain exception elimination rewrites, and which carries the
+/// loop state it adds when an exception escapes the body.
+pub(super) fn for_body_has_exceptions(stmts: &[Spanned<ChlStmt>]) -> bool {
+    stmts.iter().any(|stmt| match &stmt.node {
+        ChlStmt::Raise(_) | ChlStmt::Try { .. } => true,
+        ChlStmt::For { body, .. } => for_body_has_exceptions(body),
+        node => node
+            .branch_blocks()
+            .into_iter()
+            .any(for_body_has_exceptions),
+    })
 }
 
 /// Return `true` if the loop body's **terminal** statement is a bare *effect*
@@ -979,8 +979,8 @@ pub(super) fn find_mutation_loop_vars(
     vars
 }
 
-/// Recurse the accumulator scan into `if`/`elif`/`else` branches, `match` arms and inner
-/// `for` loops: a `+=` / `:=` under a conditional is still a loop-carried accumulator
+/// Recurse the accumulator scan into `if`/`elif`/`else` branches, `match` arms, `try` blocks
+/// and inner `for` loops: a `+=` / `:=` under a conditional is still a loop-carried accumulator
 /// (`mut_elim::WriterWalk` merges the paths into one writer decision), and one inside an
 /// inner loop is a write the nested recurrence carries. `with begin()` blocks are not entered:
 /// they carry their own transactional keys.
@@ -998,25 +998,13 @@ fn collect_mutation_loop_vars(
             vars.push(name.to_string());
         }
         match &stmt.node {
-            ChlStmt::If {
-                branches,
-                else_body,
-            } => {
-                for branch in branches {
-                    collect_mutation_loop_vars(&branch.body, scope, vars, seen);
-                }
-                if let Some(else_body) = else_body {
-                    collect_mutation_loop_vars(else_body, scope, vars, seen);
-                }
-            }
             // An inner `for` writing an outer accumulator makes the enclosing loop a
             // mutation loop too: the write is one the nested recurrence carries.
             ChlStmt::For { body, .. } => collect_mutation_loop_vars(body, scope, vars, seen),
-            _ => {}
-        }
-        if let ChlStmt::Match { arms, .. } = &stmt.node {
-            for arm in arms {
-                collect_mutation_loop_vars(&arm.body, scope, vars, seen);
+            node => {
+                for block in node.branch_blocks() {
+                    collect_mutation_loop_vars(block, scope, vars, seen);
+                }
             }
         }
         if let Some(inner) = block_value_stmt(stmt) {
@@ -1080,15 +1068,7 @@ fn body_has_with(stmts: &[Spanned<ChlStmt>]) -> bool {
     stmts.iter().any(|stmt| match &stmt.node {
         ChlStmt::With { .. } => true,
         ChlStmt::For { body, .. } => body_has_with(body),
-        ChlStmt::If {
-            branches,
-            else_body,
-        } => {
-            branches.iter().any(|b| body_has_with(&b.body))
-                || else_body.as_deref().is_some_and(body_has_with)
-        }
-        ChlStmt::Match { arms, .. } => arms.iter().any(|a| body_has_with(&a.body)),
-        _ => false,
+        node => node.branch_blocks().into_iter().any(body_has_with),
     })
 }
 
@@ -1098,16 +1078,8 @@ fn body_has_with(stmts: &[Spanned<ChlStmt>]) -> bool {
 fn body_has_bare_call(body: &[Spanned<ChlStmt>]) -> bool {
     body.iter().any(|stmt| match &stmt.node {
         ChlStmt::Expr(value) => !matches!(&value.node, ChlExpr::Yield(_) | ChlExpr::Feed { .. }),
-        ChlStmt::If {
-            branches,
-            else_body,
-        } => {
-            branches.iter().any(|b| body_has_bare_call(&b.body))
-                || else_body.as_deref().is_some_and(body_has_bare_call)
-        }
-        ChlStmt::Match { arms, .. } => arms.iter().any(|a| body_has_bare_call(&a.body)),
         ChlStmt::For { body, .. } => body_has_bare_call(body),
-        _ => false,
+        node => node.branch_blocks().into_iter().any(body_has_bare_call),
     })
 }
 
@@ -1264,14 +1236,7 @@ fn body_has_match(stmts: &[Spanned<ChlStmt>]) -> bool {
     stmts.iter().any(|stmt| match &stmt.node {
         ChlStmt::Match { .. } => true,
         ChlStmt::For { body, .. } => body_has_match(body),
-        ChlStmt::If {
-            branches,
-            else_body,
-        } => {
-            branches.iter().any(|b| body_has_match(&b.body))
-                || else_body.as_deref().is_some_and(body_has_match)
-        }
-        _ => false,
+        node => node.branch_blocks().into_iter().any(body_has_match),
     })
 }
 
@@ -1747,6 +1712,41 @@ fn lower_loop_body_chain_scoped(
                     },
                 )?;
                 ctx.tag_machinery(Expr::expr_stmt(case, chain), stmt.span, "lower.stmt_seq")
+            }
+            // `raise e` — the rest of the iteration runs only where it does not raise, which
+            // exception elimination decides; here it is one statement of the chain.
+            ChlStmt::Raise(value) => {
+                let value = lower_expr(value, ctx)?;
+                let raise = ctx.tag_image(
+                    Expr::new(TypedExprNode::Raise {
+                        value: Box::new(value),
+                    }),
+                    stmt.span,
+                );
+                ctx.tag_machinery(Expr::expr_stmt(raise, chain), stmt.span, "lower.stmt_seq")
+            }
+            // `try: … except T as e: …` — its blocks are write paths of this body, as a
+            // `match`'s arms are.
+            ChlStmt::Try { body, handlers } => {
+                let attempt = lower_try_over(
+                    stmt.span,
+                    body,
+                    handlers,
+                    outer_bindings,
+                    ctx,
+                    |body, scope, ctx| {
+                        lower_loop_body_chain(
+                            body,
+                            acc_names,
+                            yield_defer,
+                            true,
+                            scope,
+                            stmt.span,
+                            ctx,
+                        )
+                    },
+                )?;
+                ctx.tag_machinery(Expr::expr_stmt(attempt, chain), stmt.span, "lower.stmt_seq")
             }
             // `if p: … [else: …]` — a conditional write path. Lowered to a
             // statement-position filter-`Case` (`[gᵢ → branchᵢ; true → else|unit]`).

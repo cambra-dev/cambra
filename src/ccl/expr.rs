@@ -466,6 +466,21 @@ pub enum TypedExprNode {
         branches: Vec<Branch>,
     },
 
+    /// `raise value`: the exception `value`, which ends the path it stands on
+    /// (`docs/chl-spec.md`, "Exceptions"). It has no value of its own: it stands at whatever
+    /// type its position expects and contributes nothing to a join. Exception elimination
+    /// replaces every one after inlining (`src/ccl/design/ir.md`, "Exceptions").
+    Raise { value: Box<TypedExpr> },
+
+    /// `try: body except 𝑇₁ as 𝑒₁: handler₁ …`: `body`'s value, or, where it raises an
+    /// exception whose type is a subtype of some `𝑇ᵢ`, the first such handler's value with the
+    /// exception bound (`docs/chl-spec.md`, "Exceptions"). Exception elimination replaces every
+    /// one after inlining.
+    Try {
+        body: Box<TypedExpr>,
+        handlers: Vec<Handler>,
+    },
+
     /// A method not yet resolved: the function of the application
     /// `(𝑥, 𝑎…) ▷ method(m; N₁::m, …)` that a method call `𝑥.m(𝑎…)` lowers to
     /// (`src/ccl/design/nominal-types.md`, "Method calls"). Each candidate is a nominal type
@@ -958,6 +973,8 @@ impl TypedExprNode {
             TypedExprNode::MutDecl { .. } => "MutDecl",
             TypedExprNode::List(_) => "List",
             TypedExprNode::Case { .. } => "Case",
+            TypedExprNode::Raise { .. } => "Raise",
+            TypedExprNode::Try { .. } => "Try",
             TypedExprNode::VariantCtor { .. } => "VariantCtor",
             TypedExprNode::NominalCtor { .. } => "NominalCtor",
             TypedExprNode::Method { .. } => "Method",
@@ -1787,6 +1804,11 @@ impl TypedExpr {
                     f(&b.body);
                 }
             }
+            TypedExprNode::Raise { value } => f(value.as_ref()),
+            TypedExprNode::Try { body, handlers } => {
+                f(body.as_ref());
+                handlers.iter().for_each(|h| f(&h.body));
+            }
             TypedExprNode::VariantCtor { payload, .. }
             | TypedExprNode::NominalCtor { payload, .. } => f(payload.as_ref()),
             TypedExprNode::Method { candidates, .. } => {
@@ -1998,6 +2020,11 @@ impl TypedExpr {
                     f(&mut b.body);
                 }
             }
+            TypedExprNode::Raise { value } => f(value.as_mut()),
+            TypedExprNode::Try { body, handlers } => {
+                f(body.as_mut());
+                handlers.iter_mut().for_each(|h| f(&mut h.body));
+            }
             TypedExprNode::VariantCtor { payload, .. }
             | TypedExprNode::NominalCtor { payload, .. } => f(payload.as_mut()),
             TypedExprNode::Method { candidates, .. } => {
@@ -2080,6 +2107,7 @@ impl TypedExpr {
                     }
                 }
             }
+            TypedExprNode::Try { handlers, .. } => handlers.iter().for_each(|h| f(&h.binding)),
             // Declares no binder. Enumerated rather than wildcarded — see above.
             TypedExprNode::Lit(_)
             | TypedExprNode::Var(_)
@@ -2094,6 +2122,7 @@ impl TypedExpr {
             | TypedExprNode::Apply { .. }
             | TypedExprNode::Cast { .. }
             | TypedExprNode::Realize(_)
+            | TypedExprNode::Raise { .. }
             | TypedExprNode::BinOp { .. }
             | TypedExprNode::UnaryOp(..)
             | TypedExprNode::Aggregate { .. }
@@ -2139,6 +2168,9 @@ impl TypedExpr {
                     }
                 }
             }
+            TypedExprNode::Try { handlers, .. } => {
+                handlers.iter_mut().for_each(|h| f(&mut h.binding));
+            }
             // Declares no binder. Enumerated rather than wildcarded — see
             // [`walk_binders`](Self::walk_binders).
             TypedExprNode::Lit(_)
@@ -2154,6 +2186,7 @@ impl TypedExpr {
             | TypedExprNode::Apply { .. }
             | TypedExprNode::Cast { .. }
             | TypedExprNode::Realize(_)
+            | TypedExprNode::Raise { .. }
             | TypedExprNode::BinOp { .. }
             | TypedExprNode::UnaryOp(..)
             | TypedExprNode::Aggregate { .. }
@@ -2230,6 +2263,7 @@ impl TypedExpr {
             TypedExprNode::Cast { target, .. } => f(target),
             TypedExprNode::LetType { ty, .. } => ty.walk_types(&mut f),
             TypedExprNode::Run { types, .. } => types.iter().for_each(|(_, _, ty)| f(ty)),
+            TypedExprNode::Try { handlers, .. } => handlers.iter().for_each(|h| f(&h.catches)),
             _ => {}
         }
         if let TypedExprNode::TraitFn {
@@ -2270,6 +2304,9 @@ impl TypedExpr {
             TypedExprNode::Cast { target, .. } => f(target),
             TypedExprNode::LetType { ty, .. } => ty.walk_types_mut(&mut f),
             TypedExprNode::Run { types, .. } => types.iter_mut().for_each(|(_, _, ty)| f(ty)),
+            TypedExprNode::Try { handlers, .. } => {
+                handlers.iter_mut().for_each(|h| f(&mut h.catches));
+            }
             _ => {}
         }
         if let TypedExprNode::TraitFn {
@@ -2481,6 +2518,18 @@ pub struct Branch {
     /// the "first branch whose guard holds" rule is uniform.
     pub guard: TypedExpr,
     /// Value expression; evaluated when the branch wins.
+    pub body: TypedExpr,
+}
+
+/// One clause of a [`TypedExprNode::Try`]: the type it catches, the exception's binder,
+/// and the value it gives in place of the body's.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Handler {
+    /// The type the clause catches: each exception whose type is a subtype of it.
+    pub catches: Type,
+    /// The caught exception, at `catches`. A clause that names none binds a fresh name
+    /// nothing reads.
+    pub binding: TypedBinding,
     pub body: TypedExpr,
 }
 

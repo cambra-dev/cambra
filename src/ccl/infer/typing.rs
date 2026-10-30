@@ -369,8 +369,8 @@ pub(super) trait Typing {
 
     /// Run `f` as the body of the `for` loop `node`, and answer whether its iterations
     /// interact: whether the body causes `Write(𝑥)` for a variable `𝑥` it does not declare
-    /// itself, `declared` being every mutable variable it declares (`docs/chl-spec.md`,
-    /// "Ordered loops"). Check runs `f` and answers `false`.
+    /// itself, `declared` being every mutable variable it declares, or a `Raise` that escapes
+    /// it (`docs/chl-spec.md`, "Ordered loops"). Check runs `f` and answers `false`.
     fn loop_body<R>(
         &mut self,
         _node: NodeId,
@@ -381,6 +381,27 @@ pub(super) trait Typing {
         Self: Sized,
     {
         (f(self), false)
+    }
+
+    /// The type a `raise` stands at, `recorded` being the one inference wrote on it. Emit
+    /// answers a fresh variable, which only the position's expectation bounds, so the
+    /// `raise` adds nothing to a join; Check reads `recorded`.
+    fn raise_type(&mut self, recorded: &Type) -> Type {
+        recorded.clone()
+    }
+
+    /// Record that the enclosing function body raises the exception of type `ty` raised at
+    /// `site`. Check records nothing.
+    fn record_raise(&mut self, _site: NodeId, _ty: &Type) {}
+
+    /// Run `f` as the body of the `try` at `node`, whose clauses catch the types `catches`:
+    /// Emit collects what the body causes on a variable of its own, and the exceptions a
+    /// clause catches stop there once inference decides which those are. Check runs `f`.
+    fn try_body<R>(&mut self, _node: NodeId, _catches: &[Type], f: impl FnOnce(&mut Self) -> R) -> R
+    where
+        Self: Sized,
+    {
+        f(self)
     }
 
     /// Run `f` as the body of a `with begin():` block, which supplies `Transaction` to

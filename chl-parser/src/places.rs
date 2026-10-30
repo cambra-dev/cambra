@@ -149,7 +149,14 @@ impl Walk {
 
     fn stmt(&mut self, stmt: &Spanned<Stmt>) {
         match &stmt.node {
-            Stmt::Expr(e) | Stmt::Return(Some(e)) => self.expr(e),
+            Stmt::Expr(e) | Stmt::Return(Some(e)) | Stmt::Raise(e) => self.expr(e),
+            Stmt::Try { body, handlers } => {
+                self.stmts(body);
+                for h in handlers {
+                    self.expr(&h.ty);
+                    self.stmts(&h.body);
+                }
+            }
             Stmt::Assign { target, value, .. } | Stmt::Define { target, value } => {
                 self.target(target);
                 self.within_target(target, |w| w.expr(value));

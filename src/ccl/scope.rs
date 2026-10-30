@@ -29,6 +29,8 @@
 //! - [`Case`](TypedExprNode::Case) — each branch's `pattern.binding` scopes
 //!   over that branch's `guard` and `body`, and nothing else; the scrutinee and
 //!   the other branches are outside it.
+//! - [`Try`](TypedExprNode::Try) — each clause's `binding` scopes over that clause's
+//!   `body`, and nothing else; the `try`'s own body and the other clauses are outside it.
 //! - [`Comprehension`](TypedExprNode::Comprehension) — each generator's
 //!   `target` scopes over its own `guards`, every later generator, and
 //!   `element`; its own `iter` sits outside it. The covering scope is therefore
@@ -406,6 +408,14 @@ where
             }
         }
 
+        N::Raise { value } => open(f, value),
+        N::Try { body, handlers } => {
+            open(f, body);
+            for h in handlers {
+                under(f, &h.body, Binders::One(&h.binding));
+            }
+        }
+
         // Post-planning `Transact`. No binder: a writer body is already point-free
         // and receives its mutable variable snapshots positionally, so the keys are
         // field labels rather than binders (see the module docs).
@@ -598,6 +608,8 @@ where
         | N::DefGroup { .. }
         | N::For { .. }
         | N::Case { .. }
+        | N::Raise { .. }
+        | N::Try { .. }
         | N::Comprehension { .. } => {}
     }
 }
@@ -743,6 +755,17 @@ mod tests {
                 intrinsic: crate::ccl::Intrinsic::Now,
                 site: crate::ccl::site::root_site(crate::ccl::site::PlaceKind::Call, "__now", 0),
             })),
+            node(N::Raise {
+                value: Box::new(var("raised")),
+            }),
+            node(N::Try {
+                body: Box::new(var("tried")),
+                handlers: vec![crate::ccl::expr::Handler {
+                    catches: Type::Hole,
+                    binding: bind("caught"),
+                    body: var("caught"),
+                }],
+            }),
             node(N::Defer),
             node(N::Abstract),
             node(N::Error),
@@ -846,6 +869,8 @@ mod tests {
         N::MutDecl { .. } => "MutDecl",
         N::List(_) => "List",
         N::Case { .. } => "Case",
+        N::Raise { .. } => "Raise",
+        N::Try { .. } => "Try",
         N::VariantCtor { .. } => "VariantCtor",
         N::NominalCtor { .. } => "NominalCtor",
         N::Method { .. } => "Method",

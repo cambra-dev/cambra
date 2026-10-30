@@ -90,6 +90,13 @@ pub enum Token {
     Match,
     #[token("case", priority = 3)]
     Case,
+    // Exceptions (`docs/chl-spec.md`, "Exceptions").
+    #[token("raise", priority = 3)]
+    Raise,
+    #[token("try", priority = 3)]
+    Try,
+    #[token("except", priority = 3)]
+    Except,
     #[token("forall", priority = 3)]
     Forall,
     #[token("requires", priority = 3)]
@@ -330,6 +337,9 @@ pub const KEYWORDS: &[(&str, Token)] = &[
     ("with", Token::With),
     ("match", Token::Match),
     ("case", Token::Case),
+    ("raise", Token::Raise),
+    ("try", Token::Try),
+    ("except", Token::Except),
     ("forall", Token::Forall),
     ("requires", Token::Requires),
     ("causes", Token::Causes),
@@ -472,7 +482,10 @@ pub fn highlight_class(token: &Token) -> Option<HighlightClass> {
         | Token::Pass
         | Token::With
         | Token::Match
-        | Token::Case => C::KeywordControl,
+        | Token::Case
+        | Token::Raise
+        | Token::Try
+        | Token::Except => C::KeywordControl,
         Token::Def
         | Token::Where
         | Token::And
@@ -757,6 +770,9 @@ impl fmt::Display for Token {
             Token::With => "with",
             Token::Match => "match",
             Token::Case => "case",
+            Token::Raise => "raise",
+            Token::Try => "try",
+            Token::Except => "except",
             Token::Import => "import",
             Token::Use => "use",
             Token::As => "as",
@@ -1201,6 +1217,8 @@ fn opens_block_at_line_start(tok: &Token) -> bool {
             | Token::With
             | Token::Match
             | Token::Case
+            | Token::Try
+            | Token::Except
     )
 }
 
