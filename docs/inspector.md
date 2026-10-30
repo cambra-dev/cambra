@@ -2,21 +2,21 @@
 
 A web view of a compiled Cambra program: the source alongside one IR tree pane
 per retained compiler pane, cross-linked by true node→node provenance. On a run
-with a control port, the source pane also edits the program and reloads it. It is served by the `cambra` binary itself — `cambra --inspect-only
+with a control port, the source pane also edits the program and reloads or restarts it. It is served by the `cambra` binary itself — `cambra --inspect-only
 <program>` — and this directory holds the CodeMirror frontend it embeds and
 serves.
 
 > **Milestone 1 — static, no values.** The inspector shows the *program*, not an
-> execution: types and structure, no runtime values or ticks. Its one mutation
-> endpoint, `POST /api/reload`, exists only under `--control` and hands the
-> version to the control port.
+> execution: types and structure, no runtime values or ticks. Its mutation
+> endpoints, `POST /api/reload` and `POST /api/restart`, exist only under
+> `--control` and hand the version to the control port.
 
 ## What it shows
 
 - **Source pane** — the CHL source in an editor, with syntax highlighting,
   hover types, Ctrl/Cmd-click goto-definition, and diagnostic squiggles. It is
   read-only unless the run has a control port; then `Mod-Enter` reloads `main`
-  with the edited text ([web/README.md](../web/README.md#editing-the-program)). The highlighting is the VS Code grammar run in the page, and
+  with the edited text and `Mod-Shift-Enter` restarts the program from it ([web/README.md](../web/README.md#editing-the-program)). The highlighting is the VS Code grammar run in the page, and
   `./ci.sh editors` checks it against the lexer beside the VS Code and Neovim
   grammars ([editors/README.md](../editors/README.md#inspector)).
 - **Values pane** — the rows the operators a reader pinned currently hold, over
@@ -97,8 +97,9 @@ Then open <http://localhost:8080> — the server binds loopback only.
 Routes: `GET /` (the frontend), `GET /api/snapshot` (the full model — degrades
 gracefully to source + diagnostics on a compile failure), `GET /api/diagnostics`,
 `GET /api/live` (a websocket carrying a run's recorded values),
-`GET /api/capabilities` (`{"reload": bool}`), and `POST /api/reload` (reload
-`main` with `{"source": …}`, under `--control` only).
+`GET /api/capabilities` (`{"reload": bool, "restart": bool}`), `POST
+/api/reload` (reload `main` with `{"source": …}`) and `POST /api/restart`
+(restart the program from it), the last two under `--control` only.
 
 `--inspect-only` compiles the program and does not run it, so `/api/live`
 completes its handshake and carries nothing. `--inspect` runs the program, and
@@ -125,7 +126,11 @@ port's own `/reload` of `main`, so the two are one operation, and the page
 follows the result as above. It admits only a JSON `POST` whose `Host` names
 loopback and whose `Origin`, when present, is the page's own
 ([`reload.rs`](../src/inspector_server/reload.rs)). A posted version is one file,
-as on the control port.
+as on the control port. `Mod-Shift-Enter` posts it to `POST /api/restart`
+instead, the control port's `/restart`: every branch is discarded and the text
+runs from a fresh compile with no state kept. A finished program takes a restart
+and no reload, so a run that has ended can be edited and run again
+([program-evolution.md](../src/ccl/design/program-evolution.md#restart)).
 
 ### One-shot snapshot dump
 

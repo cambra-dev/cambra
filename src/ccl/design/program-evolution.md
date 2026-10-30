@@ -74,16 +74,17 @@ Three questions decide a reload:
 > reply by `tests/it/hot_reload/branching.rs`.
 
 `--control` (default 8081, `--control=PORT` to change it) serves the verbs below on loopback
-(`127.0.0.1`) only, because `/reload` runs the source it carries. For the same reason it refuses a
+(`127.0.0.1`) only, because `/reload` and `/restart` run the source they carry. For the same reason it refuses a
 request a web page could have sent: one carrying `Origin`, one whose `Sec-Fetch-Site` is not
-`none`, and one whose `Host` does not name loopback (`control_port::admit`). Dispatch is on the path. `/reload`
-and the `/branch` forms that create or delete change what runs, so they require `POST` and answer
+`none`, and one whose `Host` does not name loopback (`control_port::admit`). Dispatch is on the path. `/reload`,
+`/restart` and the `/branch` forms that create or delete change what runs, so they require `POST` and answer
 405 to any other method (`ControlRequest::mutates`); the other verbs accept any method. A verb that
 takes a source reads it from the request body when the body is non-blank, and otherwise from the
 query string, percent-decoded. Every reply is `text/plain; charset=utf-8`. The inspector's
-`POST /api/reload` is a second door onto the same queue, for `/reload` of `main` alone: it sends a
-`ControlRequest::Reload` through a `ControlClient` and replies in JSON, with the posted version's
-compile errors as spans and the reuse tally (`src/inspector_server/reload.rs`).
+`POST /api/reload` and `POST /api/restart` are a second door onto the same queue, for `/reload` of
+`main` and for `/restart`: each sends its `ControlRequest` through a `ControlClient` and replies in
+JSON, with the posted version's compile errors as spans and a reload's reuse tally
+(`src/inspector_server/reload.rs`).
 
 A `<source>` is one file, the version's root. A version that imports or runs a module therefore
 fails to load it, and the 400 says that a program of several modules cannot be reloaded yet.
@@ -100,6 +101,7 @@ answers 404.
 | `/diff[/<branch>]` | `[phase=<p>&]<source>` | Reports how `<source>` differs from the branch's current version, at phase `<p>`, and changes nothing |
 | `/diff/<branch>/<branch>` | `[phase=<p>]` | Reports how the second branch's current version differs from the first's, at phase `<p>`, and changes nothing |
 | `/reload[/<branch>]` | `<source>` | Replaces the branch's version with `<source>` |
+| `/restart` | `<source>` | Discards every branch and runs `<source>` from a fresh compile as `main` |
 | `/branch/<name>[/from/<parent>]` | `<source>` | Creates branch `<name>` from `<parent>`'s current version and reloads it with `<source>`, as one step |
 | `/branch/<name>/delete` | nothing | Deletes branch `<name>` |
 | `/branch/<name>/info` | nothing | Reports branch `<name>`'s branch origin, its versions, and its current source |
@@ -143,9 +145,28 @@ A 200 reply reads `reloaded: <kept>/<bound> operators kept`, a blank line, the d
 `ReuseTally`'s counts. A 400 carries the compile errors or the state conflicts. A branch the table
 does not hold answers 404. Every other refusal is [State takeover](#state-takeover)'s.
 
-A finished program takes no reload. Once every branch's outputs have finished, the driver loop ends
-and the control port answers every verb with 409. The process exits, or under `--inspect` goes on
-serving the inspector.
+A finished program takes no reload: a reload carries state into a run that has none left to carry.
+Once every branch's outputs have finished, the process exits. Under `--inspect` it goes on serving
+the inspector, and then with a control port it waits for a [`/restart`](#restart) and answers every
+other verb with 409; without one the control port answers every verb with 409.
+
+### `/restart`
+
+A restart discards every branch and runs `<source>` from a fresh compile as `main`, the only branch
+in the table. Where a reload carries a branch's state forward, a restart keeps none: no operator is
+offered to the compile, so every store starts from its declaration and every loop from the first
+element its source still offers. What persists is what the process owns rather than a branch: its
+sources, the routes the new version still binds, and `main`'s version count, which goes on rising so
+that every version a reader saw keeps the number it was seen under. A discarded branch leaves a
+tombstone, as a deleted one does.
+
+`/restart` names no branch, because it discards them all, and `/restart/<branch>` is an unknown
+path. A compile error is a 400 that leaves every branch serving: the version is compiled to
+`Phase::Planning`, binding the ports it adds, before anything is torn down. No state guard runs,
+because there is no state to take over. A 200 reply reads ``restarted: `main@<n>` from a fresh
+compile``, and a second line ``discarded branches `<name>`, …`` when there were others.
+
+A finished program takes a restart, under `--inspect --control`, and runs again.
 
 ### `/branch`
 

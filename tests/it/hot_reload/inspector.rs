@@ -14,8 +14,12 @@ use super::harness::{RunningProgram, launch_under_control_with};
 use super::serving::{http_get, raw_http, raw_http_response, reserve_test_port};
 
 /// The served `/api/snapshot`, parsed.
+///
+/// Asked over HTTP/1.0, because `tiny_http` chunks an HTTP/1.1 response over
+/// 32 KiB, and the raw read hands back the chunk framing with the body.
 fn snapshot(port: u16) -> Value {
-    serde_json::from_str(&http_get(port, "/api/snapshot")).expect("the snapshot is JSON")
+    let request = format!("GET /api/snapshot HTTP/1.0\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+    serde_json::from_str(&raw_http(port, &request)).expect("the snapshot is JSON")
 }
 
 fn version(snapshot: &Value) -> u64 {
@@ -235,11 +239,20 @@ fn a_reload_of_main_publishes_a_frame_before_any_input() {
 /// the page sends it: JSON, from the page's own origin. Answers the status and
 /// the parsed body.
 fn post_reload(port: u16, source: &str) -> (u16, Value) {
+    post_version(port, "/api/reload", source)
+}
+
+/// [`post_reload`], to `POST /api/restart`.
+fn post_restart(port: u16, source: &str) -> (u16, Value) {
+    post_version(port, "/api/restart", source)
+}
+
+fn post_version(port: u16, route: &str, source: &str) -> (u16, Value) {
     let body = serde_json::json!({ "source": source }).to_string();
     let response = raw_http_response(
         port,
         &format!(
-            "POST /api/reload HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+            "POST {route} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
              Origin: http://127.0.0.1:{port}\r\nContent-Type: application/json\r\n\
              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
@@ -273,6 +286,10 @@ fn the_inspector_reloads_main_with_a_posted_version() {
     assert_eq!(
         capabilities["reload"], true,
         "a run with a control port reloads"
+    );
+    assert_eq!(
+        capabilities["restart"], true,
+        "a run with a control port restarts"
     );
 
     let edited = "[\"C\" + line for line in stdin()]\n";
@@ -348,6 +365,9 @@ fn an_inspector_without_a_control_port_takes_no_reload() {
     assert_eq!(capabilities["reload"], false);
     let (status, reply) = post_reload(inspect, "[\"B\" + line for line in stdin()]\n");
     assert_eq!(status, 404, "{reply}");
+    assert_eq!(capabilities["restart"], false);
+    let (status, reply) = post_restart(inspect, "[\"B\" + line for line in stdin()]\n");
+    assert_eq!(status, 404, "{reply}");
 }
 
 /// A page on another origin cannot reload the program, whatever it sends.
@@ -374,8 +394,8 @@ fn a_reload_from_another_origin_is_refused() {
     assert_eq!(version(&settled_snapshot(inspect, launched.control)), 1);
 }
 
-/// A finished program takes no reload: the driver loop has ended, and the
-/// inspector goes on serving with nothing behind the control port.
+/// A finished program takes no reload: there is no run left to carry state
+/// into, and the driver answers everything but a restart with 409.
 #[test]
 fn a_finished_program_takes_no_reload() {
     use std::process::{Command, Stdio};
@@ -491,4 +511,87 @@ fn port_zero_prints_the_port_the_os_picked() {
     assert_eq!(version(&snapshot(inspect)), 1);
     let branches = control(control_port, "/branches", "");
     assert!(branches.contains("main"), "{branches}");
+}
+
+/// A finished program takes a restart from the page: the version runs from a
+/// fresh compile, prints its value, and the payload follows it.
+#[test]
+fn a_finished_program_restarts_from_the_inspector() {
+    use std::process::{Command, Stdio};
+
+    let inspect = reserve_test_port();
+    let control = reserve_test_port();
+    let dir = std::env::temp_dir().join(format!("cambra-restart-{inspect}"));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let file = dir.join("prog.cambra");
+    std::fs::write(&file, "[x + 1 for x in [1, 2, 3]]\n").expect("write the program");
+    let mut program = RunningProgram {
+        child: Command::new(env!("CARGO_BIN_EXE_cambra"))
+            .arg(format!("--inspect={inspect}"))
+            .arg(format!("--control={control}"))
+            .arg(&file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cambra"),
+        dir,
+    };
+    await_inspector(inspect);
+    let (tx, rx) = std::sync::mpsc::channel();
+    let out = program.child.stdout.take().expect("piped stdout");
+    thread::spawn(move || {
+        use std::io::BufRead;
+        for line in std::io::BufReader::new(out).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+
+    // Finished once a reload is refused.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let (status, reply) = post_reload(inspect, "[x + 1 for x in [1, 2, 3]]\n");
+        if status == 409 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the program never finished: {reply}"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    let printed_before: Vec<String> = rx.try_iter().collect();
+    let restarted_at = version(&snapshot(inspect)) + 1;
+
+    let restarted = "[x * 100 for x in [1, 2, 3]]\n";
+    let (status, reply) = post_restart(inspect, restarted);
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(
+        reply["message"],
+        format!("restarted: `main@{restarted_at}` from a fresh compile\n"),
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut printed = String::new();
+    while !printed.contains("300") {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let line = rx
+            .recv_timeout(left)
+            .unwrap_or_else(|_| panic!("the restarted version prints its value: {printed}"));
+        printed.push_str(&line);
+        printed.push('\n');
+    }
+    assert!(
+        !printed_before.join("\n").contains("300"),
+        "the value is the restarted version's"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while version(&snapshot(inspect)) != restarted_at {
+        assert!(
+            Instant::now() < deadline,
+            "the payload never followed the restart"
+        );
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(snapshot(inspect)["source"]["text"], restarted);
 }

@@ -4,9 +4,9 @@ import { LiveStore } from "./liveStore";
 import {
   EditSession,
   type ReloadOutcome,
-  finishWithRun,
+  followRun,
   outcomeOf,
-  postReload,
+  postVersion,
   serverReloads,
 } from "./reload";
 
@@ -16,6 +16,10 @@ function answering(status: number, body: unknown): typeof fetch & { mock: { call
 }
 
 describe("outcomeOf", () => {
+  it("reads an accepted restart", () => {
+    expect(outcomeOf(200, { message: "restarted" }, "src", "restart")).toEqual({ kind: "restarted" });
+  });
+
   it("reads an accepted reload's tally", () => {
     expect(outcomeOf(200, { message: "reloaded", kept: 3, bound: 5 }, "src")).toEqual({
       kind: "reloaded",
@@ -37,19 +41,19 @@ describe("outcomeOf", () => {
   // A run without a control port, an admission refusal and a stopped program
   // are the request not reaching a program, not the program refusing a version.
   it("reads every other status as a failure, with the server's message", () => {
-    for (const status of [403, 404, 415, 503]) {
+    for (const status of [403, 404, 409, 415, 503]) {
       expect(outcomeOf(status, { message: "why" }, "src")).toEqual({ kind: "failed", message: "why" });
     }
     expect(outcomeOf(500, {}, "src")).toEqual({ kind: "failed", message: "HTTP 500" });
   });
 });
 
-describe("postReload", () => {
+describe("postVersion", () => {
   // JSON is what keeps a cross-site form or `no-cors` fetch out, so the page has
   // to send it.
   it("posts the source as JSON to this page's own server", async () => {
     const fetchImpl = answering(200, { kept: 1, bound: 1 });
-    await postReload(fetchImpl)("x = 1\n");
+    await postVersion(fetchImpl)("reload", "x = 1\n");
 
     const [url, init] = fetchImpl.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/api/reload");
@@ -58,9 +62,15 @@ describe("postReload", () => {
     expect(JSON.parse(init.body as string)).toEqual({ source: "x = 1\n" });
   });
 
+  it("posts a restart to its own route", async () => {
+    const fetchImpl = answering(200, { message: "restarted" });
+    expect(await postVersion(fetchImpl)("restart", "x = 1\n")).toEqual({ kind: "restarted" });
+    expect((fetchImpl.mock.calls[0] as [string])[0]).toBe("/api/restart");
+  });
+
   it("reports a body that is not JSON by its status", async () => {
     const fetchImpl = vi.fn(async () => new Response("<html>", { status: 502 })) as never;
-    expect(await postReload(fetchImpl)("x")).toEqual({ kind: "failed", message: "HTTP 502" });
+    expect(await postVersion(fetchImpl)("reload", "x")).toEqual({ kind: "failed", message: "HTTP 502" });
   });
 });
 
@@ -118,25 +128,33 @@ describe("EditSession", () => {
     expect(await session.reload("x")).toEqual({ kind: "failed", message: "Error: network down" });
   });
 
-  // A finished program takes no reload, so the session sends nothing.
-  it("sends nothing once the run has finished", async () => {
-    const send = vi.fn(async (): Promise<ReloadOutcome> => ({ kind: "reloaded", kept: 0, bound: 0 }));
+  // A finished program takes no reload, so the session sends none; it takes a
+  // restart, which is what runs it again.
+  it("sends a restart and no reload once the run has finished", async () => {
+    const send = vi.fn(async (): Promise<ReloadOutcome> => ({ kind: "restarted" }));
     const session = new EditSession(send);
     session.finish();
 
     expect(await session.reload("x")).toBeNull();
     expect(send).not.toHaveBeenCalled();
     expect(session.get().kind).toBe("finished");
+
+    expect(await session.restart("y")).toEqual({ kind: "restarted" });
+    expect(send).toHaveBeenCalledWith("restart", "y");
+    expect(session.get().kind).toBe("restarted");
   });
 
-  it("finishes with the run, on the frame marked final", () => {
+  it("follows the run: finished on the frame marked final, going again after", () => {
     const live = new LiveStore();
     const session = new EditSession(async () => ({ kind: "reloaded", kept: 0, bound: 0 }));
-    finishWithRun(live, session);
+    followRun(live, session);
 
     live.apply({ version: 1, published: 1, final: false, nodes: [], sources: [] });
     expect(session.finished).toBe(false);
     live.apply({ version: 1, published: 2, final: true, nodes: [], sources: [] });
     expect(session.finished).toBe(true);
+    // A restart's version runs, and its frames are not final.
+    live.apply({ version: 2, published: 3, final: false, nodes: [], sources: [] });
+    expect(session.finished).toBe(false);
   });
 });
