@@ -422,15 +422,8 @@ fn rebuild_let(
     body: Expr,
 ) -> Expr {
     TypedExpr {
-        ty: closed_let_type(&binding, &bound_expr, body.ty.clone()),
-        node: TypedExprNode::Let {
-            binding,
-            bound_expr,
-            body: Box::new(body),
-        },
         user_annotation,
-        // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
-        node_id,
+        ..Expr::let_in_preserving(node_id, binding, *bound_expr, body)
     }
 }
 
