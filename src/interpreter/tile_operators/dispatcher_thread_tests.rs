@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
-use std::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -1618,4 +1618,242 @@ fn a_notify_at_its_limit_returns_once_the_run_fails() {
         });
         assert_eq!(dispatcher.outstanding(PipelineId(0)), 1);
     });
+}
+
+/// A breaker of a source whose held keys are every key its pipeline's workers have consumed, so a
+/// finish of one epoch pushes what the workers decided in every epoch so far.
+struct SharedHeld {
+    base: ProducerBase,
+    consumed: Arc<AtomicU64>,
+}
+
+impl SharedHeld {
+    fn new(consumed: Arc<AtomicU64>) -> Self {
+        Self {
+            base: ProducerBase::unowned(Self::alloc_id(), &keys_tiling(UNIVERSE)),
+            consumed,
+        }
+    }
+}
+
+impl TileProducer for SharedHeld {
+    impl_producer_base!();
+
+    fn get_impl(&mut self, _guard: TileGuard) -> Tile {
+        self.tiling().empty_tile()
+    }
+
+    fn release_impl(&mut self, _guard: TileGuard) {}
+}
+
+impl BreakingProducer for SharedHeld {
+    fn consume_impl(&mut self, guard: TileGuard) {
+        self.consumed.fetch_or(mask_of(&guard), SeqCst);
+    }
+
+    fn input_tiling(&self) -> Tiling {
+        keys_tiling(UNIVERSE)
+    }
+
+    fn input_released(&self) -> TileGuard {
+        keys_tiling(UNIVERSE).universal_guard()
+    }
+
+    fn held(&self) -> TileGuard {
+        guard_of(self.consumed.load(SeqCst))
+    }
+
+    fn morsels(&self, guard: &TileGuard, rows: usize) -> Vec<TileGuard> {
+        cut(guard, rows)
+    }
+
+    fn offer_impl(&mut self, _guard: TileGuard) -> Tile {
+        self.tiling().empty_tile()
+    }
+}
+
+/// A source whose epochs are sealed every few runs, finished in parallel on several threads:
+/// each epoch's finish pushes the held keys less what any earlier finish pushed, so the reader
+/// consumes every key once, whichever epoch's finish pushed it.
+#[test]
+fn parallel_epoch_finishes_of_one_pipeline_push_each_key_once() {
+    for iteration in 1..=60u64 {
+        for threads in [2, 8, 16] {
+            let what = format!("iteration {iteration}, {threads} threads");
+            within(what, move || {
+                pushed_from_parallel_epochs(iteration, threads)
+            });
+        }
+    }
+}
+
+fn pushed_from_parallel_epochs(seed: u64, threads: usize) {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], 1 + (seed % 3) as usize);
+    dispatcher.window(2 + (seed % 3) as usize);
+    let held = Arc::new(AtomicU64::new(0));
+    let read = AtomicU64::new(0);
+    thread::scope(|scope| {
+        let (dispatcher, held, read) = (&dispatcher, &held, &read);
+        scope.spawn(move || {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            let mut key = 0;
+            while key < UNIVERSE {
+                let last = (key + rng.below(6)).min(UNIVERSE - 1);
+                dispatcher.notify(PipelineId(0), &keys_between(key, last));
+                key = last + 1;
+                if rng.below(2) == 0 {
+                    dispatcher.seal();
+                }
+                jitter(&mut rng);
+            }
+            dispatcher.close(PipelineId(0));
+        });
+        for at in 0..threads {
+            scope.spawn(move || {
+                let _worker = dispatcher.worker();
+                let mut breaker = SharedHeld::new(held.clone());
+                let mut rng = Rng(seed ^ (at as u64 + 1) << 32);
+                loop {
+                    match dispatcher.claim(None) {
+                        Next::Package(package) if package.pipeline == PipelineId(0) => {
+                            breaker.consume_impl(package.guard.clone());
+                            jitter(&mut rng);
+                            dispatcher.acknowledge(package);
+                        }
+                        Next::Package(package) => {
+                            let mask = mask_of(&package.guard);
+                            assert_eq!(read.fetch_or(mask, SeqCst) & mask, 0, "read once");
+                            dispatcher.acknowledge(package);
+                        }
+                        Next::Finalize {
+                            pipeline, epoch, ..
+                        } => {
+                            let mut pushes = dispatcher.pushes_in(pipeline, epoch);
+                            if pipeline == PipelineId(0) {
+                                jitter(&mut rng);
+                                pushes.push_final(&breaker);
+                            }
+                            dispatcher.finish(pushes);
+                        }
+                        Next::Done => return,
+                        Next::Failed => panic!("the run failed"),
+                        Next::Wait(_) => unreachable!("a blocking claim waits itself"),
+                    }
+                }
+            });
+        }
+    });
+    assert_eq!(read.load(SeqCst), u64::MAX, "the reader read every key");
+}
+
+/// Two sources, one of the even keys and one of the odd, notified and sealed by one thread while
+/// workers claim, read restated by one pipeline: the reader takes each epoch's packages once both
+/// sources finished it, and consumes each key once.
+#[test]
+fn a_restated_reader_of_two_sealed_sources() {
+    for iteration in 1..=60u64 {
+        for threads in [1, 2, 8, 16] {
+            let what = format!("iteration {iteration}, {threads} threads");
+            within(what, move || read_restated_from_two(iteration, threads));
+        }
+    }
+}
+
+fn read_restated_from_two(seed: u64, threads: usize) {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![0, 1]], 1 + (seed % 4) as usize);
+    dispatcher.window(2);
+    dispatcher.read_mapped(
+        PipelineId(2),
+        vec![(PipelineId(0), Vec::new()), (PipelineId(1), Vec::new())],
+        Vec::new(),
+    );
+    let consumed = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
+    let finishes = Mutex::new(Vec::new());
+    // Each claim of a package, logged after the claim returns, and each finish, logged before
+    // the finish lets a reader claim: (pipeline, epoch, whether it is a finish).
+    let log = Mutex::new(Vec::new());
+    let sealed = AtomicU64::new(0);
+    thread::scope(|scope| {
+        let (dispatcher, consumed, finishes, log, sealed) =
+            (&dispatcher, &consumed, &finishes, &log, &sealed);
+        scope.spawn(move || {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            for key in 0..UNIVERSE {
+                dispatcher.notify(PipelineId((key % 2) as usize), &keys_between(key, key));
+                if rng.below(5) == 0 {
+                    dispatcher.seal();
+                    sealed.fetch_add(1, SeqCst);
+                }
+                jitter(&mut rng);
+            }
+            dispatcher.close(PipelineId(0));
+            dispatcher.close(PipelineId(1));
+        });
+        for at in 0..threads {
+            scope.spawn(move || {
+                let _worker = dispatcher.worker();
+                let mut rng = Rng(seed ^ (at as u64 + 1) << 32);
+                loop {
+                    match dispatcher.claim(None) {
+                        Next::Package(package) => {
+                            let p = package.pipeline.0;
+                            log.lock()
+                                .expect("no worker panics")
+                                .push((p, package.epoch, false));
+                            let mask = mask_of(&package.guard);
+                            jitter(&mut rng);
+                            let before = consumed[p].fetch_or(mask, SeqCst);
+                            assert_eq!(before & mask, 0, "pipeline {p} consumes each key once");
+                            dispatcher.acknowledge(package);
+                        }
+                        Next::Finalize {
+                            pipeline,
+                            epoch,
+                            consumed: region,
+                            ..
+                        } => {
+                            finishes
+                                .lock()
+                                .expect("no worker panics")
+                                .push((pipeline.0, epoch));
+                            log.lock()
+                                .expect("no worker panics")
+                                .push((pipeline.0, epoch, true));
+                            let mut pushes = dispatcher.pushes_in(pipeline, epoch);
+                            if let (true, Some(region)) = (pipeline.0 < 2, &region) {
+                                pushes.push(region, cut);
+                            }
+                            dispatcher.finish(pushes);
+                        }
+                        Next::Done => return,
+                        Next::Failed => panic!("the run failed"),
+                        Next::Wait(_) => unreachable!("a blocking claim waits itself"),
+                    }
+                }
+            });
+        }
+    });
+    assert_eq!(
+        consumed[2].load(SeqCst),
+        u64::MAX,
+        "the reader read every key"
+    );
+    let mut finishes = finishes.into_inner().expect("no worker panics");
+    finishes.sort();
+    let expected: Vec<_> = (0..3)
+        .flat_map(|p| (0..sealed.load(SeqCst) + 1).map(move |epoch| (p, epoch)))
+        .collect();
+    assert_eq!(
+        finishes, expected,
+        "every pipeline finishes every epoch once"
+    );
+    let log = log.into_inner().expect("no worker panics");
+    for (at, &(p, epoch, finish)) in log.iter().enumerate() {
+        if p == 2 && !finish {
+            assert!(
+                (0..2).all(|source| log[..at].contains(&(source, epoch, true))),
+                "the reader claims a package of epoch {epoch} after both sources finished it"
+            );
+        }
+    }
 }

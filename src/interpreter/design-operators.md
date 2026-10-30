@@ -1028,19 +1028,20 @@ it, so a slot never moves. An append reserves its indices together, by compare a
 an append reserves only while the queue is open, and one read gives both the count and the close. A
 claim reads a slot only once it is written. The queue keeps the region its packages partition under
 a lock that appends and the move of the pipeline's epoch to finalizing take, and a claim of a
-package never does. Two counters per pipeline per epoch only grow: `claimed`, the index of the
-next package to claim, and `acknowledged`, how many packages
-have been acknowledged. Each pipeline's phase in each epoch (running, finalizing, finished), a
-failure flag and the generation, the count of changes a waiting worker waits on, are atomics too. A
-worker takes a lock only to sleep while there is nothing to claim, and a change that can end a sleep
-takes it to wake the sleepers, only while there are some. A seal and a close take a lock that orders
-them, since both move the current epoch or close a source's queues. The graph, the morsel size, the
-window, the limits and the ordered pipelines are fixed before the dispatcher is shared, since the
-methods that set them take `&mut self`; every other method takes `&self`. The breakers stay
-`Rc<RefCell<…>>` and are not `Send`. `run` claims on the calling thread, and nothing outside the
-unit tests in `tile_operators/dispatcher_thread_tests.rs` drives the dispatcher from more than one
-thread. Those tests run scripted work, plain data rather than breakers, on up to 16 threads; some
-feed a source and seal its epochs from a thread of their own while workers claim.
+package never does. Two counters per pipeline per epoch only grow: `claimed`, the index of the next
+package to claim, and `acknowledged`, how many packages have been acknowledged. Each pipeline's
+phase in each epoch (running, finalizing, finished), a failure flag and the generation, the count of
+changes a waiting worker waits on, are atomics too. A worker takes a lock only to sleep while there
+is nothing to claim, and a change that can end a sleep takes it to wake the sleepers, only while
+there are some. A seal and a close take a lock that orders them, since both move the current epoch
+or close a source's queues. The graph, the morsel size, the window, the limits and the ordered
+pipelines are fixed before the dispatcher is shared, since the methods that set them take `&mut
+self`; every other method takes `&self`. The breakers stay `Rc<RefCell<…>>` and are not `Send`.
+`run` claims on the calling thread, and nothing outside the unit tests in
+`tile_operators/dispatcher_thread_tests.rs` drives the dispatcher from more than one thread. Those
+tests run scripted work on up to 16 threads, plain data rather than breakers except for one breaker
+whose held keys are an atomic that the workers set. Some feed a source and seal its epochs from a
+thread of their own while workers claim.
 
 A worker asks `Dispatcher::try_claim` what to do next, and the answer (`Next`) is one of five:
 
