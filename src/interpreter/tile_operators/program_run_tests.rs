@@ -30,8 +30,20 @@ fn dispatched(source: &str, rows: usize) -> (Value, Vec<Planned>) {
 /// pull mode, reaches no producer beneath a breaker, since the breakers answer from what they
 /// consumed; it changes no sink's value, and it finds every sink done.
 fn dispatched_into(source: &str, rows: usize, names: &[&str]) -> (Vec<Value>, Vec<Planned>) {
+    dispatched_with(source, rows, names, |_| {})
+}
+
+/// [`dispatched_into`] with `setup` run on the context before `source` compiles, as a test
+/// registers a source there.
+fn dispatched_with(
+    source: &str,
+    rows: usize,
+    names: &[&str],
+    setup: impl FnOnce(&mut GlobalContext),
+) -> (Vec<Value>, Vec<Planned>) {
     let mut ctx = GlobalContext::default();
     ctx.defer_sink_pulls();
+    setup(&mut ctx);
     let sinks: Vec<_> = names
         .iter()
         .map(|name| ctx.register_test_sink(*name))
@@ -39,12 +51,8 @@ fn dispatched_into(source: &str, rows: usize, names: &[&str]) -> (Vec<Value>, Ve
     let loaded = LoadedProgram::test(source);
     let program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
         .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
-    let operators = ctx.take_operator_map();
-    let stores: Vec<_> = operators
-        .operators()
-        .into_iter()
-        .filter(|fan| fan.cached_tile().is_some())
-        .collect();
+    // The operators stay alive through the run: the map holds the fan-outs the chains share.
+    let _operators = ctx.take_operator_map();
     let consumers: Vec<_> = names
         .iter()
         .map(|name| {
@@ -61,7 +69,7 @@ fn dispatched_into(source: &str, rows: usize, names: &[&str]) -> (Vec<Value>, Ve
         .zip(&sinks)
         .map(|(consumer, sink)| (consumer.clone(), sink.clone() as Arc<dyn DataSink>))
         .collect();
-    let planned = run_program(&targets, &stores, rows);
+    let planned = run_program(&targets, rows);
     let roots: Vec<_> = consumers
         .iter()
         .map(|consumer| consumer.borrow().producer_slot().clone())
@@ -450,11 +458,53 @@ fn pulled(source: &str) -> Value {
     binding.output.clone()
 }
 
-/// A loop's store is no pipeline breaker, so a program that reads one is refused.
+/// A loop's store is the breaker of a pipeline of its own: the loop over a literal is a source
+/// pipeline, cut into morsels of positions, and the sink reads the store once it is terminal.
 #[test]
-#[should_panic(expected = "reads a store, and a store is no pipeline breaker")]
-fn a_program_reading_a_store_is_refused() {
-    dispatched(
+fn a_loop_over_a_literal() {
+    answers_as_pull_mode_does(
+        indoc! {"
+            out = test_sink()
+            total := 0
+            for x in [1, 2, 3]:
+                total += x
+            out << total
+        "},
+        &["LoopScope", "SinkBreaker"],
+    );
+}
+
+/// The inner pipelines of the one loop scope `planned` holds.
+fn rounds(planned: &[Planned]) -> &[Planned] {
+    let scopes: Vec<_> = planned
+        .iter()
+        .filter(|plan| plan.name.starts_with("LoopScope"))
+        .collect();
+    assert_eq!(scopes.len(), 1, "one loop scope: {planned:?}");
+    &scopes[0].rounds
+}
+
+/// A guarded loop puts `Memo`s inside the store's cycle, which are inner pipelines of the loop's
+/// scope, as the drive's is.
+#[test]
+fn a_guarded_loop() {
+    let source = indoc! {"
+        out = test_sink()
+        total := 0
+        for x in [1, 2, 3]:
+            if x > 1:
+                total += x
+        out << total
+    "};
+    answers_as_pull_mode_does(source, &["LoopScope", "SinkBreaker"]);
+    let (_, planned) = dispatched(source, 1);
+    let kinds = |planned: &[Planned], kind: &str| {
+        rounds(planned)
+            .iter()
+            .filter(|plan| plan.name.starts_with(kind))
+            .count()
+    };
+    let (_, unguarded) = dispatched(
         indoc! {"
             out = test_sink()
             total := 0
@@ -463,5 +513,490 @@ fn a_program_reading_a_store_is_refused() {
             out << total
         "},
         1,
+    );
+    assert_eq!(
+        (
+            kinds(&unguarded, "InductionDriver"),
+            kinds(&unguarded, "Memo")
+        ),
+        (1, 0),
+        "a plain loop's one inner pipeline is its drive's: {unguarded:?}"
+    );
+    assert!(
+        kinds(&planned, "InductionDriver") == 1 && kinds(&planned, "Memo") >= 1,
+        "the drive and the guard's `Memo`s are inner pipelines: {planned:?}"
+    );
+}
+
+/// A loop over a filtered list runs a round per position its source delivers: the positions
+/// the filter drops run none, and a loop whose source delivers none runs no round.
+#[rstest_log::rstest]
+#[case::keeping_the_last(indoc! {"
+    out = test_sink()
+    total := 0
+    for x in [x for x in [1, 2, 3] if x > 2]:
+        total += x
+    out << total
+"})]
+#[case::dropping_one_between(indoc! {"
+    out = test_sink()
+    total := 0
+    for x in [x for x in [1, 2, 3, 4] if x > 1 and x != 3]:
+        total += x
+    out << total
+"})]
+#[case::dropping_the_last(indoc! {"
+    out = test_sink()
+    total := 0
+    for x in [x for x in [1, 2, 3] if x < 3]:
+        total += x
+    out << total
+"})]
+#[case::dropping_every_one(indoc! {"
+    out = test_sink()
+    total := 0
+    for x in [x for x in [1, 2, 3] if x > 5]:
+        total += x
+    out << total
+"})]
+#[case::over_an_empty_list(indoc! {"
+    out = test_sink()
+    total := 0
+    for i in []:
+        total += 1
+    out << total
+"})]
+fn a_loop_over_a_filtered_list(#[case] source: &str) {
+    answers_as_pull_mode_does(source, &["LoopScope", "SinkBreaker"]);
+}
+
+/// A loop over a let-bound list reads the list's memo, a pipeline beneath the store's cycle,
+/// and its scope reads its input whole once that pipeline has finished.
+#[test]
+fn a_loop_over_a_let_bound_list() {
+    let source = indoc! {"
+        out = test_sink()
+        xs = [1, 2, 3]
+        total := 0
+        for x in xs:
+            total += x
+        out << total
+    "};
+    answers_as_pull_mode_does(source, &["Memo", "LoopScope", "SinkBreaker"]);
+    let (_, planned) = dispatched(source, 1);
+    assert!(
+        planned
+            .iter()
+            .any(|plan| plan.name.starts_with("LoopScope") && plan.whole),
+        "the loop's scope reads the list's memo whole: {planned:?}"
+    );
+}
+
+/// A loop's total and a sum both feed the sink.
+#[test]
+fn a_loop_beside_a_sum() {
+    answers_as_pull_mode_does(
+        indoc! {"
+            out = test_sink()
+            ys = [4, 5]
+            total := 0
+            for x in [1, 2, 3]:
+                total += x
+            out << total + sum(ys)
+        "},
+        &["LoopScope", "Aggregate", "SinkBreaker"],
+    );
+}
+
+/// The inner loop of a nested pair runs as a scope inside the outer loop's scope, which queues it
+/// one row of its store per round of the outer loop.
+#[test]
+fn a_nested_loop() {
+    let source = indoc! {"
+        out = test_sink()
+        total := 0
+        for x in [1, 2, 3]:
+            for y in [1, 2]:
+                total += x * y
+        out << total
+    "};
+    answers_as_pull_mode_does(source, &["LoopScope", "SinkBreaker"]);
+    let (_, planned) = dispatched(source, 1);
+    assert!(
+        rounds(&planned).iter().any(
+            |plan| plan.name.starts_with("LoopScope(InductionStore") && !plan.rounds.is_empty()
+        ),
+        "the inner loop is a scope inside the outer loop's scope: {planned:?}"
+    );
+}
+
+/// The second loop's seed reads the first loop's store: a scope reads a scope.
+#[test]
+fn two_loops_in_sequence() {
+    answers_as_pull_mode_does(
+        indoc! {"
+            out = test_sink()
+            a := 0
+            for x in [1, 2, 3]:
+                a += x
+            b := a
+            for y in [1, 2]:
+                b += y
+            out << b
+        "},
+        &["LoopScope", "SinkBreaker"],
+    );
+}
+
+/// The inner loop's seed reads the outer loop's position, so the nested store's seed reads a
+/// pipeline of the outer scope.
+#[test]
+fn a_nested_loop_seeded_from_the_outer_position() {
+    answers_as_pull_mode_does(
+        indoc! {"
+            out = test_sink()
+            total := 0
+            for x in [1, 2, 3]:
+                count := x
+                for y in [1, 2]:
+                    count += y
+                total += count
+            out << total
+        "},
+        &["LoopScope", "SinkBreaker"],
+    );
+}
+
+#[rstest_log::rstest]
+#[case::over_let_bound_lists(indoc! {"
+    out = test_sink()
+    xs = [1, 2, 3]
+    ys = [1, 2]
+    total := 0
+    for x in xs:
+        for y in ys:
+            total += x * y
+    out << total
+"})]
+#[case::with_an_accumulator_of_its_own(indoc! {"
+    out = test_sink()
+    total := 0
+    for x in [1, 2, 3]:
+        count := 0
+        for y in [1, 2]:
+            count += y
+        total += x * count
+    out << total
+"})]
+#[case::over_rows_of_no_position(indoc! {"
+    out = test_sink()
+    total := 0
+    for x in [1, 2, 3]:
+        for y in [y for y in [1, 2] if y > 5]:
+            total += x * y
+    out << total
+"})]
+#[case::guarded(indoc! {"
+    out = test_sink()
+    total := 0
+    for x in [1, 2, 3]:
+        for y in [1, 2]:
+            if x > y:
+                total += x * y
+    out << total
+"})]
+#[case::two_inner_loops_on_one_accumulator(indoc! {"
+    out = test_sink()
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            total += x * y
+        for y in [3, 4]:
+            total += x + y
+    out << total
+"})]
+#[case::nested_twice_over_one_let_bound_list(indoc! {"
+    out = test_sink()
+    xs = [1, 2, 3]
+    total := 0
+    for x in xs:
+        for y in xs:
+            for z in xs:
+                total := total + x * y - z
+    out << total
+"})]
+fn a_nested_loop_answers_as_pull_mode_does(#[case] source: &str) {
+    answers_as_pull_mode_does(source, &["LoopScope", "SinkBreaker"]);
+}
+
+/// A loop nested in a nested loop runs as a scope inside the scope of the loop around it, itself
+/// inside the outermost loop's.
+#[test]
+fn a_loop_nested_twice() {
+    answers_as_pull_mode_does(
+        indoc! {"
+            out = test_sink()
+            total := 0
+            for x in [1, 2]:
+                for y in [1, 2]:
+                    for z in [1, 2]:
+                        total += x * y * z
+            out << total
+        "},
+        &["LoopScope", "SinkBreaker"],
+    );
+}
+
+/// A nested loop whose body aggregates a map of the inner position pulls the `MapAggregate` at each
+/// position's path, which it restates: every level of its output is a level of its input.
+#[rstest_log::rstest]
+#[case::a_sum(indoc! {"
+    out = test_sink()
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            total += sum([z * y for z in [1, 2]])
+    out << total
+"})]
+#[case::a_max_beside_the_outer_position(indoc! {"
+    out = test_sink()
+    xs = [1, 2, 3]
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            total += max([z * y for z in xs]) + x
+    out << total
+"})]
+fn a_nested_loop_aggregating_a_map_of_its_position(#[case] source: &str) {
+    answers_as_pull_mode_does(source, &["LoopScope", "SinkBreaker"]);
+}
+
+/// A nested loop with a condition in its body, on the inner and on the outer position, plans a
+/// loop scope and answers as pull mode does.
+#[rstest_log::rstest]
+#[case::on_the_inner_position(indoc! {"
+    out = test_sink()
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            if y > 1:
+                total += y
+    out << total
+"})]
+#[case::on_the_outer_position(indoc! {"
+    out = test_sink()
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            if x > 1:
+                total += y
+    out << total
+"})]
+fn a_nested_loop_with_a_condition(#[case] source: &str) {
+    answers_as_pull_mode_does(source, &["LoopScope", "SinkBreaker"]);
+}
+
+/// Nested-loop bodies of the shapes the cases name: each plans a loop scope and answers as pull
+/// mode does.
+#[rstest_log::rstest]
+#[case::an_aggregate_of_a_list_outside_the_loops(indoc! {"
+    out = test_sink()
+    xs = [1, 2, 3]
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            total += sum(xs) * y
+    out << total
+"})]
+#[case::a_record_of_two_aggregates(indoc! {"
+    out = test_sink()
+    xs = [1, 2, 3]
+    ws = [4, 5]
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            total += max([z for z in xs]) - min([w for w in ws]) + y
+    out << total
+"})]
+#[case::a_tuple_of_the_positions(indoc! {"
+    out = test_sink()
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            t = (x, y)
+            total += t.0 * t.1
+    out << total
+"})]
+#[case::two_generators(indoc! {"
+    out = test_sink()
+    xs = [1, 2, 3]
+    ws = [4, 5]
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            total += sum([z * w * y for z in xs for w in ws])
+    out << total
+"})]
+#[case::a_sum_of_sums(indoc! {"
+    out = test_sink()
+    xs = [1, 2, 3]
+    ws = [4, 5]
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            total += sum([sum([z * w for w in ws]) for z in xs]) * y
+    out << total
+"})]
+#[case::an_inner_loop_with_a_condition(indoc! {"
+    out = test_sink()
+    xs = [1, 2, 3]
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            acc := 0
+            for z in xs:
+                if z > y:
+                    acc += z
+            total += acc
+    out << total
+"})]
+#[case::a_comprehension_of_tuples(indoc! {"
+    out = test_sink()
+    xs = [1, 2, 3]
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            total += sum([q.0 for q in [(y, z) for z in xs] if q.1 > 1])
+    out << total
+"})]
+fn a_nested_loop_body_reading(#[case] source: &str) {
+    answers_as_pull_mode_does(source, &["LoopScope", "SinkBreaker"]);
+}
+
+/// A transaction store is the breaker of a pipeline of its own; its input is its one writer's
+/// source, cut into morsels of items, and the sink reads the store once it is terminal.
+#[rstest_log::rstest]
+#[case::a_counter(indoc! {"
+    out = test_sink()
+    pool: Mut(Int, Txn) := 100
+    for r in [10, 20, 30]:
+        with begin():
+            pool := pool - r
+    out << await_final(pool)
+"})]
+// The last item is denied: a deny commits nothing and progresses through the source's release.
+#[case::a_grant_then_a_deny(indoc! {"
+    out = test_sink()
+    pool: Mut(Int, Txn) := 100
+    for r in [70, 50]:
+        with begin():
+            if pool >= r:
+                pool := pool - r
+    out << await_final(pool)
+"})]
+// An item after the denied one, which the deny leaves the store unchanged for.
+#[case::a_deny_then_an_item(indoc! {"
+    out = test_sink()
+    pool: Mut(Int, Txn) := 100
+    for r in [50, 70, 10]:
+        with begin():
+            if pool >= r:
+                pool := pool - r
+    out << await_final(pool)
+"})]
+// No item reaches the writer.
+#[case::over_no_item(indoc! {"
+    out = test_sink()
+    pool: Mut(Int, Txn) := 100
+    for r in [r for r in [10, 20] if r > 50]:
+        with begin():
+            pool := pool - r
+    out << await_final(pool)
+"})]
+fn a_transaction(#[case] source: &str) {
+    answers_as_pull_mode_does(source, &["Commit", "SinkBreaker"]);
+}
+
+/// A store of two writers has no consuming mode: a morsel names positions of one source.
+#[test]
+#[should_panic(expected = "a transaction store of 2 writers has no consuming mode")]
+fn a_transaction_store_of_two_writers_is_refused() {
+    dispatched(
+        indoc! {"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            for r in [60]:
+                with begin():
+                    if pool >= r:
+                        pool := pool - r
+            for r in [60]:
+                with begin():
+                    if pool >= r:
+                        pool := pool - r
+            out << await_final(pool)
+        "},
+        1,
+    );
+}
+
+/// A loop over a live source runs in no pipeline: no run notifies the source's arrivals.
+#[test]
+#[should_panic(expected = "a store over a live source")]
+fn a_loop_over_a_live_source_is_refused() {
+    dispatched_with(
+        indoc! {"
+            out = test_sink()
+            total := 0
+            for x in source1():
+                total += x
+            out << total
+        "},
+        1,
+        &["out"],
+        |ctx| {
+            ctx.register_source(std::rc::Rc::new(std::cell::RefCell::new(
+                crate::interpreter::TestDataSource::new(
+                    "source1",
+                    crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+                    crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+                ),
+            )));
+        },
+    );
+}
+
+/// A transaction over a let-bound list reads the list's memo along two paths inside its cycle,
+/// the writer's and the body's, and reads it once.
+#[test]
+fn a_transaction_over_a_let_bound_list() {
+    answers_as_pull_mode_does(
+        indoc! {"
+            out = test_sink()
+            rs = [10, 20, 30]
+            pool: Mut(Int, Txn) := 100
+            for r in rs:
+                with begin():
+                    pool := pool - r
+            out << await_final(pool)
+        "},
+        &["Memo", "Commit", "SinkBreaker"],
+    );
+}
+
+/// A guarded loop over a let-bound list reads the list's memo along every path its filter reads
+/// the drive by, and reads it once.
+#[test]
+fn a_guarded_loop_over_a_let_bound_list() {
+    answers_as_pull_mode_does(
+        indoc! {"
+            out = test_sink()
+            xs = [1, 2, 3]
+            total := 0
+            for x in xs:
+                if x > 1:
+                    total += x
+            out << total
+        "},
+        &["Memo", "LoopScope", "SinkBreaker"],
     );
 }
