@@ -1479,14 +1479,21 @@ fn expected_per_region_record() -> Tile {
     )
 }
 
-/// A nested `for` over a group's rows, `[r for g in groupby(xs, \s -> s) for r in g]`, overflows
-/// the compiler's stack. Iterating `[x for x in g]` instead of `g` overflows the same way.
+/// A nested `for` over a group's rows, `[r for g in groupby(xs, \s -> s) for r in g]`, recurses
+/// without bound while coalescing. Coalescing grows its stack on the heap (`stacker`), so the
+/// recursion runs until memory runs out rather than overflowing the stack.
 ///
-/// A stack overflow aborts the whole test process rather than unwinding, so the program runs in
-/// a `cambra` child process and the assertion reads its exit status and stderr.
+/// The program runs in a `cambra` child process with a time limit, since unbounded recursion
+/// aborts or exhausts the process rather than unwinding. The assertion reads its exit status and
+/// stderr.
 #[test]
-#[should_panic(expected = "has overflowed its stack")]
+#[should_panic(expected = "did not finish within")]
 fn a_nested_for_over_a_groups_rows() {
+    // A healthy run of a program this size takes well under a second, so a few seconds already
+    // shows it does not finish. The child's address space is capped as well, so a runaway
+    // recursion fails this test rather than exhausting the machine.
+    const LIMIT: Duration = Duration::from_secs(5);
+    const ADDRESS_SPACE_KIB: u32 = 1_500_000;
     let path = std::env::temp_dir().join(format!(
         "cambra_nested_for_over_a_group_{}.cambra",
         std::process::id()
@@ -1496,14 +1503,40 @@ fn a_nested_for_over_a_groups_rows() {
         "xs = [1, 2]\n[r for g in groupby(xs, \\s -> s) for r in g]\n",
     )
     .expect("the program file is written");
-    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cambra"))
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(format!("ulimit -v {ADDRESS_SPACE_KIB}; exec \"$0\" \"$1\""))
+        .arg(env!("CARGO_BIN_EXE_cambra"))
         .arg(&path)
-        .output()
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
         .expect("the cambra binary spawns");
+    // Drained while the child runs, so a child that fills the pipe is not blocked writing it.
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let reader = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stderr, &mut bytes);
+        bytes
+    });
+    let started = std::time::Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait on cambra") {
+            break status;
+        }
+        if started.elapsed() > LIMIT {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = std::fs::remove_file(&path);
+            panic!("the program did not finish within {LIMIT:?}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    let stderr = reader.join().expect("cambra's stderr is read");
     let _ = std::fs::remove_file(&path);
     assert!(
-        output.status.success(),
+        status.success(),
         "the program runs to completion; stderr:\n{}",
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&stderr)
     );
 }
