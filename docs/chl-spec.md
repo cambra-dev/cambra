@@ -1143,12 +1143,11 @@ any other name is a compile-time error.
 
 ### 3.9 Subscript and attribute access
 
-Subscript syntax distinguishes proven application from checked lookup:
+Lookup and projection use the following syntax forms:
 
 | Form | Meaning | Result |
 |---|---|---|
-| `c[k]` | Check a compatible key for membership in a keyed collection. | `Option` of the value type. |
-| `c[k]!` | Apply the collection to a key accepted by its domain type. | The value at `k`. |
+| `c[k]` | Check a compatible key for membership and return the value if present. | `Option` of the value type. |
 | `r.name` | Project a record field. | The named field's type. |
 | `t.0` | Project a tuple field. | The positional field's type. |
 
@@ -1156,16 +1155,16 @@ A missing product field is a type error. Product projection and collection looku
 `t[0]` is rejected, not interpreted as `t.0`. Projections compose, as in `r.p.1` and `t.0.b`.
 An identifier cannot begin with a digit, so named and positional field syntax do not collide.
 
-`c[k]!` evaluates a finite function at a point and requires a proof that `k` is in its domain.  A
-`FullMap(K, V)` accepts a key of type `K`; a refined present-key domain instead requires membership
-in that refinement. Proven lookup does not define an absent-key runtime result. `!` can be used
-generally as a postfix operator to unwrap `Option` when it can be proven that it is an
-`Option::some`.
-
 Checked lookup `c[k]` returns `Option::some` with the value when the key is present and `Option::none`
 when absent. For a set, the value is unit. Presence can be established before the domain is final;
 absence requires the final domain. A live feed with no final domain may never answer an absent-key
 lookup.
+
+The `!` operator can be used with lookup (as `c[k]!`) to return a non-option-wrapped value,
+requiring a proof that `k` is in the domain of `c`.  A `FullMap(K, V)` accepts a key of type `K`; a
+refined present-key domain instead requires membership in that refinement. Proven lookup does not
+define an absent-key runtime result. `!` can be used generally as a postfix operator to unwrap
+`Option` when it can be proven that it is an `Option::some`.
 
 #### Subscript and unwrap syntax [Decided]
 
