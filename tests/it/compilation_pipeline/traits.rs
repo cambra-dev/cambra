@@ -1638,7 +1638,7 @@ fn an_operator_trait_function_by_name(#[case] code: &str, #[case] expected: i64)
 #[case::a_lookup(
     indoc! {"
         m = map([(Money::new(1), 10), (Money::new(2), 20)])
-        a: Option(Int) = m[Money::new(2)]?
+        a: Option(Int) = m[Money::new(2)]
         match a:
             case Option::some(v):
                 v == 20

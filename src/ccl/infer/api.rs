@@ -1210,7 +1210,7 @@ fn product_keying_hint(expected: &Type, found: &Type) -> Option<&'static str> {
 /// the edge — and the raw mismatch reads as an internal confusion rather than as what it
 /// is, a lookup whose proof obligation cannot be discharged. An `Array(3, 𝑇)`'s range
 /// domain `0..3` is left to its own message, which already says it wanted an index in the
-/// range. Named here rather than at the subscript form because `c[k]` lowers to
+/// range. Named here rather than at the subscript form because `c[k]!` lowers to
 /// exactly the application `c(k)`, so the diagnosis has to be type-directed to cover both
 /// spellings.
 ///
@@ -1248,7 +1248,7 @@ fn undischarged_index_hint(type_a: &Type, type_b: &Type) -> Option<String> {
     Some(format!(
         "hint: `{index}` is not known to lie in the collection's domain `{domain}`, so this \
          lookup is not provably total. A proven lookup needs an index whose type carries \
-         that proof (one drawn from the collection itself); write `c[k]?` for the checked \
+         that proof (one drawn from the collection itself); write `c[k]` for the checked \
          form, which answers `some(v)`/`none` for any key."
     ))
 }
@@ -5371,7 +5371,7 @@ mod tests {
     fn test_infer_lambda_two_proj_on_same_param() {
         let mut ctx = TypeInferenceContext::new();
         // λ p → ((p ► .0) + 0, p ► .1)
-        // p ► .0 feeds into Int addition → p[0] : Int
+        // p ► .0 feeds into Int addition → p.0 : Int
         // p ► .1 is unconstrained
         // Expected domain: (Int, ?b, ..) — projections fix no width, and nothing
         // applies the lambda, so the domain stays open.
@@ -5476,7 +5476,7 @@ mod tests {
         let hint = undischarged_index_hint(&key_domain, &Type::Base(BaseType::Int))
             .expect("a bare index against a present-key domain is an undischarged lookup");
         assert!(
-            hint.contains("c[k]?"),
+            hint.contains("write `c[k]` for the checked"),
             "the hint names the checked form: {hint}"
         );
 

@@ -63,7 +63,7 @@ def quote(item: ItemPricing, qty: Qty) => Dollars:
     p
 
 def reserve(sku: SKU, qty: Qty) => Bool requires Transaction:
-    stock = inventory[sku] # Always present because of the `SKU` type.
+    stock = inventory[sku]! # Always present because of the `SKU` type.
     if stock >= qty:
         inventory[sku] := stock - qty # Typechecks only under the check above.
         true
@@ -75,7 +75,7 @@ def reserve(sku: SKU, qty: Qty) => Bool requires Transaction:
 for req in restock_reqs:
     result = with begin():
         # `req.body.sku` is inferred to be in the catalog, checked by HTTP lib.
-        stock = inventory[req.body.sku]
+        stock = inventory[req.body.sku]!
         # `qty` is inferred to be a non-neg int, checked by HTTP lib.
         inventory[req.body.sku] := stock + req.body.qty
         http.ok("restocked")

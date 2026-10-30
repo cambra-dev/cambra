@@ -261,7 +261,7 @@ fn a_checked_lookup_on_the_empty_map_is_none() {
     check_scalar(
         indoc! {r#"
             m: Map(String, Int) = empty_map()
-            match m["x"]?:
+            match m["x"]:
                 case Option::some(v):
                     v
                 case Option::none:

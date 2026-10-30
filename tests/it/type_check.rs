@@ -1672,12 +1672,12 @@ fn full_map_lookup_needs_no_presence_proof() {
     // The lookup yields the value type outright. An `Option` here would mean the
     // membership question was asked, which is exactly what totality removes.
     assert_eq!(
-        infer_program(&format!("{f}    m[1]\nf")).to_string(),
+        infer_program(&format!("{f}    m[1]!\nf")).to_string(),
         "((Int ⤇ Int) ⇒ Int)"
     );
     // Total does not mean unchecked: the key still has to be a key.
     assert!(
-        !infer_program_err(&format!("{f}    m[\"a\"]\nf")).is_empty(),
+        !infer_program_err(&format!("{f}    m[\"a\"]!\nf")).is_empty(),
         "a String key must not reach an Int-keyed full map"
     );
     // The storefront shape — totality earned by refining the key type — keeps the
@@ -1718,9 +1718,9 @@ fn full_map_annotations_are_satisfiable() {
 #[test]
 fn a_key_from_the_source_does_not_yet_carry_its_key_domain() {
     for program in [
-        "c = [1,1,2]\ng = groupby(c, \\v -> v)\nsum([sum(g[x]) for x in c])",
-        "k = \\v -> v\nc = [1,1,2]\ng = groupby(c, k)\nsum([sum(g[k(x)]) for x in c])",
-        "c = [(a=1,b=2),(a=2,b=3)]\ng = groupby(c, \\r -> r.a)\nsum([sum([y.b for y in g[r.a]]) for r in c])",
+        "c = [1,1,2]\ng = groupby(c, \\v -> v)\nsum([sum(g[x]!) for x in c])",
+        "k = \\v -> v\nc = [1,1,2]\ng = groupby(c, k)\nsum([sum(g[k(x)]!) for x in c])",
+        "c = [(a=1,b=2),(a=2,b=3)]\ng = groupby(c, \\r -> r.a)\nsum([sum([y.b for y in g[r.a]!]) for r in c])",
     ] {
         let errs = infer_program_err(program);
         assert!(
@@ -3335,7 +3335,7 @@ fn dot_projects_and_brackets_look_up() {
 
     // A tuple is a heterogeneous product, not a finite function, so it has no domain to
     // look up in — however the index is spelled, literal or not.
-    for program in ["t = (1, \"a\")\nt[0]", "t = (1, 2)\ni = 0\nt[i]"] {
+    for program in ["t = (1, \"a\")\nt[0]!", "t = (1, 2)\ni = 0\nt[i]!"] {
         let errs = infer_program_err(program);
         assert!(
             errs.iter()
@@ -4055,11 +4055,8 @@ mod annotation_kinds {
     /// A literal is typed by its own value, so the two forms differ on whether the
     /// annotation discards that: only the bounded form keeps the singleton.
     ///
-    /// This is the difference that matters for proofs — an index-range obligation
-    /// discharges only when the index's type says *which* index it is — though a
-    /// variable subscript is not yet accepted by the surface (`x[i]` is "only
-    /// integer subscripts are supported"), so that consequence is not assertable
-    /// here yet.
+    /// This is the difference that matters for proofs: the index-range obligation of a
+    /// proven lookup `x[i]!` discharges only when the index's type says which index it is.
     #[test]
     fn only_bounded_keeps_a_literals_singleton() {
         assert_eq!(
@@ -5562,20 +5559,21 @@ fn option_is_a_nominal_type() {
     );
 }
 
-/// An integer-*literal* subscript keeps meaning tuple projection. A tuple is a
-/// heterogeneous product rather than a finite function, and lowering has no types
-/// with which to tell `t[0]` from `xs[0]`, so this case is unchanged.
+/// Tuple projection `t.0` answers the element's own type. A tuple is a heterogeneous
+/// product rather than a finite function, so `t[0]` is rejected
+/// ([`checked_lookup_boundaries`]).
 #[test]
-fn integer_literal_subscript_is_still_tuple_projection() {
+fn tuple_projection_keeps_the_elements_singleton() {
     // Projection selects an element rather than computing one, so the element's
     // own singleton survives the projection.
     assert_eq!(infer_program("t = (1, \"a\")\nt.0"), int_lit(1));
     assert_eq!(infer_program("t = (1, \"a\")\nt.1"), str_lit("a"));
 }
 
-/// A non-literal subscript is **application** — subscript and call are one
-/// operation, evaluating a finite function at a point (chl-spec §3.9) — so it
-/// inherits the proof obligation: the index must be in the collection's domain.
+/// A proven lookup `c[k]!` is **application**: subscript and call are one operation,
+/// evaluating a finite function at a point (`docs/chl-spec.md`, "3.9 Subscript and
+/// attribute access"). It inherits the proof obligation: the index must be in the
+/// collection's domain.
 /// An unconstrained index is not, and that is the whole point of the pair.
 ///
 /// Checked **at the call site**. A parameter annotation is a *bound* on the param
@@ -5586,9 +5584,9 @@ fn integer_literal_subscript_is_still_tuple_projection() {
 fn total_subscript_demands_a_provable_index() {
     for program in [
         // A bare `Int` is not provably a member of `0..3`.
-        "def f(a: Array(3, Int), i: Int):\n    a[i]\nf([1,2,3], 5)",
+        "def f(a: Array(3, Int), i: Int):\n    a[i]!\nf([1,2,3], 5)",
         // Nor is a bare key provably present in a map's key domain.
-        "def f(m: Map(Int, Int), k: Int):\n    m[k]\nf(groupby([1,2,3], \\x -> x), 5)",
+        "def f(m: Map(Int, Int), k: Int):\n    m[k]!\nf(groupby([1,2,3], \\x -> x), 5)",
     ] {
         assert!(
             !infer_program_err(program).is_empty(),
@@ -5619,15 +5617,15 @@ fn subscript_is_lookup_and_dot_is_projection() {
     // Subscripting a tuple is *not* projection: a tuple is a heterogeneous product,
     // not a finite function.
     assert!(
-        !infer_program_err("t = (1, \"a\")\nt[0]").is_empty(),
+        !infer_program_err("t = (1, \"a\")\nt[0]!").is_empty(),
         "a tuple has no domain to look up in"
     );
 
     // BUG: these valid lookups should have type Int and evaluate to 10. All three spellings
     // fail the same undischarged-membership edge. Replace rejection with success when fixed.
     for program in [
-        "xs = [10, 20, 30]\nxs[0]",
-        "xs = [10, 20, 30]\ni = 0\nxs[i]",
+        "xs = [10, 20, 30]\nxs[0]!",
+        "xs = [10, 20, 30]\ni = 0\nxs[i]!",
         "xs = [10, 20, 30]\nxs(0)",
     ] {
         assert!(
@@ -5639,13 +5637,13 @@ fn subscript_is_lookup_and_dot_is_projection() {
 
 /// Checked lookup accepts an absent key of the correct base type, rejects a wrong-base
 /// key, and does not inherit application's presence obligation.
-/// See `src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]?`".
+/// See `src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]`".
 #[test]
 fn a_checked_lookup_is_not_an_application() {
     let m = "m = map([(1, 10), (2, 20)])\n";
     // A key that is certainly absent still type-checks: presence is not a typing question.
     assert_eq!(
-        infer_program(&format!("{m}m[9]?")).to_string(),
+        infer_program(&format!("{m}m[9]")).to_string(),
         "Option(Int)"
     );
     // The proven form is the pair to it, and it still demands the membership its domain
@@ -5657,7 +5655,7 @@ fn a_checked_lookup_is_not_an_application() {
     // Only membership is waived. The key's base type is the collection's, and a `String`
     // does not become one by being looked up carefully.
     assert!(
-        !infer_program_err(&format!("{m}m[\"nope\"]?")).is_empty(),
+        !infer_program_err(&format!("{m}m[\"nope\"]")).is_empty(),
         "a String key must not reach an Int-keyed map"
     );
 }
@@ -5668,7 +5666,7 @@ fn a_checked_lookup_is_not_an_application() {
 #[test]
 fn a_key_dependent_lookup_discharges_the_key_binder() {
     assert_eq!(
-        infer_program("g = groupby([1, 2, 3], \\x -> x)\ng[1]?").to_string(),
+        infer_program("g = groupby([1, 2, 3], \\x -> x)\ng[1]").to_string(),
         "Option(({0..3 | __elem \u{25b7} [1, 2, 3] \u{25b7} (\u{3bb} x : Int \u{2192} x) == 1} \u{2907} Int))",
         "the group's predicate must name the key it was looked up at"
     );
@@ -5676,19 +5674,19 @@ fn a_key_dependent_lookup_discharges_the_key_binder() {
 
 /// Range domains and tuple targets are rejected. A bounded parameter remains unresolved
 /// at emission, whereas the exact Map annotation exposes its keyed type.
-/// See `src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]?`".
+/// See `src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]`".
 #[test]
 fn checked_lookup_boundaries() {
     for (program, why) in [
         (
-            "xs = [10, 20, 30]\nxs[0]?",
+            "xs = [10, 20, 30]\nxs[0]",
             "a range domain has no membership refinement",
         ),
         (
-            "def f(m <: Map(Int, Int)):\n    m[1]?\nf",
+            "def f(m <: Map(Int, Int)):\n    m[1]\nf",
             "a bounded parameter is unresolved where the relaxation runs",
         ),
-        ("t = (1, \"a\")\nt[0]?", "a tuple is not a finite function"),
+        ("t = (1, \"a\")\nt[0]", "a tuple is not a finite function"),
     ] {
         assert!(
             !infer_program_err(program).is_empty(),
@@ -5698,7 +5696,7 @@ fn checked_lookup_boundaries() {
     // The exact form binds `m` at `Map(Int, Int)` itself, so the relaxation has a domain
     // to strip the token from and the lookup answers `Option(Int)`.
     assert_eq!(
-        infer_program("def f(m: Map(Int, Int)):\n    m[1]?\nf")
+        infer_program("def f(m: Map(Int, Int)):\n    m[1]\nf")
             .codomain()
             .expect("f is a function")
             .to_string(),
@@ -5707,16 +5705,16 @@ fn checked_lookup_boundaries() {
 }
 /// A `Set(K)` is `Map(K, unit)`, so its checked lookup answers `Option(unit)` —
 /// membership as a value, which is what `k in s` will be built on. The set half of the
-/// pair [`checked_lookup_on_a_map_answers_the_value`] completes: the two constructors
+/// pair [`checked_lookup_on_a_map_answers_an_option_of_the_value`] completes: the two constructors
 /// differ only in the codomain their collapse leaves.
 #[test]
 fn checked_lookup_on_a_set_is_membership_as_a_value() {
     assert_eq!(
-        infer_program("s = set([1, 2, 3])\ns[1]?").to_string(),
+        infer_program("s = set([1, 2, 3])\ns[1]").to_string(),
         "Option(Unit)"
     );
     assert!(
-        !infer_program_err("s = set([1, 2, 3])\ns[\"nope\"]?").is_empty(),
+        !infer_program_err("s = set([1, 2, 3])\ns[\"nope\"]").is_empty(),
         "a String key must not reach an Int-keyed set"
     );
 }
@@ -5734,7 +5732,7 @@ fn a_product_keys_a_collection() {
     assert_eq!(
         infer_program(indoc! {r#"
             m = map([((1, 2), 10), ((3, 4), 20)])
-            m[(1, 2)]?
+            m[(1, 2)]
         "#})
         .to_string(),
         "Option(Int)"
@@ -5742,7 +5740,7 @@ fn a_product_keys_a_collection() {
     assert_eq!(
         infer_program(indoc! {r#"
             m = map([((a=1, b=2), 10), ((a=3, b=4), 20)])
-            m[(a=1, b=2)]?
+            m[(a=1, b=2)]
         "#})
         .to_string(),
         "Option(Int)"
@@ -5750,7 +5748,7 @@ fn a_product_keys_a_collection() {
     assert_eq!(
         infer_program(indoc! {r#"
             s = set([(1, 2), (3, 4)])
-            s[(1, 2)]?
+            s[(1, 2)]
         "#})
         .to_string(),
         "Option(Unit)"
@@ -5759,7 +5757,7 @@ fn a_product_keys_a_collection() {
     assert!(
         !infer_program_err(indoc! {r#"
             m = map([((1, 2), 10), ((3, 4), 20)])
-            m[1]?
+            m[1]
         "#})
         .is_empty(),
         "a bare Int key must not reach a pair-keyed map"
@@ -5767,7 +5765,7 @@ fn a_product_keys_a_collection() {
     // A tuple's width is part of its type, so a wider key is not the key type.
     let errs = infer_program_err(indoc! {r#"
         m = map([((1, 2), 10), ((3, 4), 20)])
-        m[(1, 2, 3)]?
+        m[(1, 2, 3)]
     "#});
     assert!(
         errs.iter()
@@ -5775,17 +5773,17 @@ fn a_product_keys_a_collection() {
         "a 3-tuple key must not reach a pair-keyed map, got {errs:?}"
     );
 }
-/// A checked lookup on a `map` answers the value type, where the same lookup on a `set`
-/// answers `Option(unit)` — the two constructors differing only in the codomain their
+/// A checked lookup on a `map` answers `Option` of the value type, where the same lookup on
+/// a `set` answers `Option(unit)` — the two constructors differing only in the codomain their
 /// collapse leaves.
 #[test]
-fn checked_lookup_on_a_map_answers_the_value() {
+fn checked_lookup_on_a_map_answers_an_option_of_the_value() {
     assert_eq!(
-        infer_program("m = map([(1, 10), (2, 20)])\nm[1]?").to_string(),
+        infer_program("m = map([(1, 10), (2, 20)])\nm[1]").to_string(),
         "Option(Int)"
     );
     assert!(
-        !infer_program_err("m = map([(1, 10), (2, 20)])\nm[\"nope\"]?").is_empty(),
+        !infer_program_err("m = map([(1, 10), (2, 20)])\nm[\"nope\"]").is_empty(),
         "a String key must not reach an Int-keyed map"
     );
 }

@@ -2566,7 +2566,7 @@ fn a_checked_lookup_answers_an_option() {
     check_scalar(
         indoc! {r#"
             m = map([(1, 10), (2, 20)])
-            a: Option(Int) = m[1]?
+            a: Option(Int) = m[1]
             match a:
                 case Option::some(v):
                     v
@@ -2583,7 +2583,7 @@ fn option_declares_is_none() {
     check_scalar(
         indoc! {r#"
             m = map([(1, 10)])
-            (m[2]?.is_none(), Option::is_none(m[1]?))
+            (m[2].is_none(), Option::is_none(m[1]))
         "#},
         make_tuple(&[Value::Bool(true), Value::Bool(false)]),
     );
@@ -2592,15 +2592,12 @@ fn option_declares_is_none() {
 /// `.is_none()` as an `if` condition: the `match` it is puts a value-selecting `Case`'s form in
 /// the gate predicate of each of the `if`'s arms.
 #[rstest_log::rstest]
-#[case::absent("1 if m[2]?.is_none() else 0", Value::Int(1))]
-#[case::present("1 if m[1]?.is_none() else 0", Value::Int(0))]
-#[case::elif(
-    "5 if m[1]?.is_none() else (7 if m[4]?.is_none() else 9)",
-    Value::Int(7)
-)]
-#[case::conjunction("1 if m[2]?.is_none() and 2 > 1 else 0", Value::Int(1))]
+#[case::absent("1 if m[2].is_none() else 0", Value::Int(1))]
+#[case::present("1 if m[1].is_none() else 0", Value::Int(0))]
+#[case::elif("5 if m[1].is_none() else (7 if m[4].is_none() else 9)", Value::Int(7))]
+#[case::conjunction("1 if m[2].is_none() and 2 > 1 else 0", Value::Int(1))]
 #[case::per_element(
-    "sum([100 if m[k]?.is_none() else k for k in [1, 2, 3]])",
+    "sum([100 if m[k].is_none() else k for k in [1, 2, 3]])",
     Value::Int(104)
 )]
 fn is_none_as_a_condition(#[case] tail: &str, #[case] expected: Value) {
@@ -2625,7 +2622,7 @@ fn a_type_s_own_is_none_beside_option_s() {
                         True
 
             m = map([(1, 10)])
-            (Light::off.is_none(), m[1]?.is_none(), Light::on.is_none(), m[2]?.is_none())
+            (Light::off.is_none(), m[1].is_none(), Light::on.is_none(), m[2].is_none())
         "#},
         make_tuple(&[
             Value::Bool(true),
@@ -2656,7 +2653,7 @@ fn option_errors_name_what_is_wrong() {
         (
             indoc! {r#"
                 m = map([(1, 10)])
-                match m[1]?:
+                match m[1]:
                     case `some(v):
                         v
                     case `none:

@@ -23,9 +23,9 @@ holds.
 | Inferred | Written | Lowers back |
 | --- | --- | --- |
 | a list literal, or a comprehension over one | `Array(3, Int)` | yes |
-| a filtered comprehension | `{UInt where _ < 3 and xs[_] > 1} \|=> Int` | no |
+| a filtered comprehension | `{UInt where _ < 3 and xs[_]! > 1} \|=> Int` | no |
 | a map or set literal | `{String where _ in ["a", "b"]} \|=> Int` | no |
-| `groupby(xs, key)` | `(k: {Bool where _ in [key(x) for x in xs]}) \|=> {UInt where _ < 3 and key(xs[_]) == k} \|=> Int` | no |
+| `groupby(xs, key)` | `(k: {Bool where _ in [key(x) for x in xs]}) \|=> {UInt where _ < 3 and key(xs[_]!) == k} \|=> Int` | no |
 | a `List`, `Map`, `Set` or `Collection` | `List(Int)`, `Map(String, Int)`, … | yes |
 | `box(a) if c else box(b)` | `Box(Array(2, Int) \| Array(3, Int))` | no |
 | `stdin()` | `Source(stdin, String)` | no |
@@ -40,8 +40,8 @@ holds.
   parameter is `(x: 𝑇) => 𝑈`. A binder the compiler minted is spelled `k` (a key) or `x` (a
   parameter or a comprehension's variable), numbered where another name in the type already reads
   as that.
-- **A read of a collection is an index, `xs[_]`; any other application is a call, `f(x)`.** The
-  two differ only in the function's kind, so the types inside a predicate are resolved when the
+- **A read of a collection is a proven lookup, `xs[_]!`; any other application is a call, `f(x)`.**
+  The two differ only in the function's kind, so the types inside a predicate are resolved when the
   error is raised (`coalesce_for_error`), while their variables still hold their bounds. A function
   whose type names no kind is marked.
 - **A sum over named alternatives is a `Box`** of each alternative, as `box` built it

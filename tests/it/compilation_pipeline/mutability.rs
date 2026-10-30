@@ -1188,7 +1188,7 @@ fn a_refinement_may_depend_on_a_read(#[case] code: &str, #[case] expected: Vec<i
         n: Int = ys
         n
     "#},
-    "[1, 2, 3][_] < x}"
+    "[1, 2, 3][_]! < x}"
 )]
 fn a_diagnostic_spells_a_read_as_its_variable(#[case] code: &str, #[case] expected: &str) {
     let rendered = compile_errors(code);

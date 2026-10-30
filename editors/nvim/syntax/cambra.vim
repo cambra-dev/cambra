@@ -19,7 +19,7 @@ syn keyword cambraKeywordOther def where and or not forall requires type impl in
 " Ordinary operators. Among matches starting at one column, Vim prefers the one
 " defined last, so the mutation, feed and define operators below win over the
 " `:`, `<` and `<=` prefixes matched here.
-syn match cambraOperator "[-+*&|^=<>?]"
+syn match cambraOperator "[-+*&|^=<>!]"
 syn match cambraOperator "\*\*\|//=\=\|++\|\^[+=]\|[-+*]=\|[=!<>]=\|<:\|->\|=>\||=>"
 syn match cambraPunctuation "[,;:.]"
 syn match cambraMutation ":="

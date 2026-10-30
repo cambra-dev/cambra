@@ -338,7 +338,7 @@ eliminator, stated by content rather than by a "mirrors CHL" adjective.)
   left of the assignment: the key is checked against the collection's key type and the value
   against the codomain that key names, a dependent codomain being discharged to the key term.
   So `m[k]` denotes one type whether it is read or written. The key owes the key domain's
-  base, its refinements peeled as they are for `m[k]?` — a write is what makes a key present,
+  base, its refinements peeled as they are for `m[k]` — a write is what makes a key present,
   so demanding a presence proof of the key being written would be backwards. Peeling takes
   the domain's whole refinement set, membership predicate and any other alike, so a domain
   refinement that is not about presence is not enforced at a write either.
@@ -456,9 +456,9 @@ per-position reconciliation — nothing has to relate a write's domain to the se
 **The type does not name the domain at a position, and cannot be made to.** A sum is what a
 collection type says when it forgets its domain — the same job `List(𝑇)` does for a length —
 so every use opens it to a fresh opaque domain and no sentence relates `𝐷` at two positions.
-The proven lookup `m[k]` and read-your-writes as a type fact both need `𝐷(s⁻) ⊆ 𝐷(s)`, which
+The proven lookup `m[k]!` and read-your-writes as a type fact both need `𝐷(s⁻) ⊆ 𝐷(s)`, which
 has no subject here. Reaching them replaces this type rather than extending it. Reads are the
-checked `m[k]?`, answering `Option(𝑉)` with no membership proof.
+checked `m[k]`, answering `Option(𝑉)` with no membership proof.
 
 Two forms that would name it are rejected on what they require. A **position-indexed
 family**, `Σ (𝐷 : 𝑆 ⇒ SubtypesOf(𝐾)). ((s: 𝑆) ⇒ 𝐷(s) ⤇ 𝑉)`, needs the witness to range over

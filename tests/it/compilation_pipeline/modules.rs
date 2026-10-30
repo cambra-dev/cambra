@@ -567,7 +567,7 @@ fn option_is_one_type_in_every_module() {
                 indoc! {"
                     table = map([(1, 10), (2, 20)])
                     pub def find(k):
-                        table[k]?
+                        table[k]
                 "},
             )],
         ),

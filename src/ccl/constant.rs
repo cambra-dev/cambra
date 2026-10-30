@@ -17,7 +17,7 @@ use std::fmt;
 use smol_str::SmolStr;
 
 use crate::ccl::{
-    ArithmeticKind, BinOpKind, CompareKind, Label, Lit, LogicKind, TypeParam, TypeParamId,
+    ArithmeticKind, BinOpKind, CompareKind, Label, Lit, LogicKind, ProjKey, TypeParam, TypeParamId,
 };
 
 /// A `const` value parameter of a module (`docs/chl-spec.md`, "9.4 Parameters").
@@ -55,9 +55,9 @@ pub enum ConstTerm {
     Not(Box<ConstTerm>),
     /// `then if cond else otherwise`, as `If(cond, then, otherwise)`.
     If(Box<ConstTerm>, Box<ConstTerm>, Box<ConstTerm>),
-    /// A record's field, `r.f`.
-    Field(Box<ConstTerm>, Label),
-    /// A tuple's or a list's element, `xs[i]`.
+    /// A tuple's position or a record's field, `t.0` or `r.f`.
+    Field(Box<ConstTerm>, ProjKey),
+    /// A list's element, `xs[i]!`.
     Element(Box<ConstTerm>, Box<ConstTerm>),
 }
 
@@ -190,16 +190,22 @@ impl ConstTerm {
                 ConstTerm::Lit(Lit::Bool(false)) => Ok(*e),
                 c => Ok(ConstTerm::If(Box::new(c), t, e)),
             },
-            ConstTerm::Field(t, f) => match *t {
-                ConstTerm::Record(fields) => fields
+            ConstTerm::Field(t, key) => match (*t, key) {
+                (ConstTerm::Record(fields), ProjKey::Field(f)) => fields
                     .into_iter()
                     .find(|(l, _)| *l == f)
                     .map(|(_, t)| t)
                     .ok_or_else(|| NoValue(format!("the record has no field `{}`", f.name()))),
-                t => Ok(ConstTerm::Field(Box::new(t), f)),
+                (ConstTerm::Tuple(items), ProjKey::Index(i)) => {
+                    let len = items.len();
+                    items.into_iter().nth(i).ok_or_else(|| {
+                        NoValue(format!("position {i} is past the end of {len} components"))
+                    })
+                }
+                (t, key) => Ok(ConstTerm::Field(Box::new(t), key)),
             },
             ConstTerm::Element(t, i) => match (*t, *i) {
-                (ConstTerm::Tuple(items) | ConstTerm::List(items), ConstTerm::Lit(Lit::Int(i))) => {
+                (ConstTerm::List(items), ConstTerm::Lit(Lit::Int(i))) => {
                     let len = items.len();
                     usize::try_from(i)
                         .ok()
@@ -318,8 +324,9 @@ impl fmt::Display for ConstTerm {
             ConstTerm::Neg(t) => write!(f, "-{t}"),
             ConstTerm::Not(t) => write!(f, "not {t}"),
             ConstTerm::If(c, t, e) => write!(f, "({t} if {c} else {e})"),
-            ConstTerm::Field(t, l) => write!(f, "{t}.{}", l.name()),
-            ConstTerm::Element(t, i) => write!(f, "{t}[{i}]"),
+            ConstTerm::Field(t, ProjKey::Index(i)) => write!(f, "{t}.{i}"),
+            ConstTerm::Field(t, ProjKey::Field(l)) => write!(f, "{t}.{}", l.name()),
+            ConstTerm::Element(t, i) => write!(f, "{t}[{i}]!"),
         }
     }
 }

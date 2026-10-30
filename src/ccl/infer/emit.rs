@@ -1022,7 +1022,7 @@ pub(super) fn emit_apply<C: Typing>(
     argument: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    // The **checked** lookup `c[k]?`, intercepted rather than given a scheme. A scheme
+    // The **checked** lookup `c[k]`, intercepted rather than given a scheme. A scheme
     // would have to name the key type, and only a `SubtypesOf(𝐾)` kind states one — so it
     // would read `(Σ (σ : SubtypesOf(𝑘)). σ ⤇ 𝑣, 𝑘) ⇒ Option(𝑣)` and every concrete
     // collection would need an entry term first, which is a term only a typed pass can
@@ -1191,7 +1191,7 @@ pub(super) fn emit_apply<C: Typing>(
 
 /// Check the key against the collection domain's base and return the supplied value type.
 /// Presence is not a typing obligation here: reads check it at runtime, and writes can add keys.
-/// See `src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]?`".
+/// See `src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]`".
 fn keyed_access_value<C: Typing>(
     keys: &Type,
     value: Type,
@@ -1218,7 +1218,7 @@ fn emit_lookup_checked<C: Typing>(
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let (keys, binder, codomain) = keyed_access_types(collection)
-        .ok_or_else(|| not_a_keyed_access(collection, "checked lookup `c[k]?`"))
+        .ok_or_else(|| not_a_keyed_access(collection, "checked lookup `c[k]`"))
         .map_err(|e| ctx.raise(e))?;
     let value = ctx.keyed_value_at(&codomain, binder.as_ref(), key, &function.ty);
     let at_key = keyed_access_value(
@@ -1324,7 +1324,7 @@ fn not_a_keyed_access(collection: &Type, what: &str) -> InferError {
 /// A sum must begin with a `SubtypesOf(K)` witness; instantiate it at `K`.
 /// Return the binder without discharging it: `Typing::keyed_value_at` owns that step.
 /// This helper checks the function shape, not the function kind or runtime answer extent.
-/// See `src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]?`".
+/// See `src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]`".
 fn keyed_access_types(collection: &Type) -> Option<(Type, Option<Name>, Type)> {
     let collection = collection.peel_refinements();
     let viewed = match collection.sum() {
@@ -2445,7 +2445,7 @@ fn emit_let_bound<C: Typing>(
 ///
 /// Generalized, every use of the name instantiates its own copy, so two uses
 /// that would demand different types of the definition never meet. A use can
-/// still fail where its rule needs the value's shape as it emits (`m[k]?` on the
+/// still fail where its rule needs the value's shape as it emits (`m[k]` on the
 /// bare variable), so the binding is [`LetScheme::Poisoned`] and a statement that
 /// reads it reports nothing: a failed definition reports once, at the definition.
 /// The program is already rejected, so nothing downstream reads what the

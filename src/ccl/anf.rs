@@ -149,7 +149,7 @@
 //! which are renamed in both copies at once (below); an unrefined one, carrying
 //! no predicate to hold a copy, normalizes like any other operand.
 //!
-//! **A value-position `Case`'s scrutinee.** `match c[k]?:` dispatches on a
+//! **A value-position `Case`'s scrutinee.** `match c[k]:` dispatches on a
 //! *dependent* result — the checked lookup's codomain discharges its key
 //! binder to the key — so the scrutinee's type spells the collection's own
 //! binders. Naming the scrutinee makes lifting the `match`'s type past that
@@ -621,7 +621,7 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
             branches,
         } => {
             // The scrutinee is **not** named. A `match` on a dependent result
-            // — `match c[k]?:` — carries the key's discharge in its own type,
+            // — `match c[k]:` — carries the key's discharge in its own type,
             // and lifting that type past a binder discharges the definiens into
             // it, putting the collection's own binders in a type that then
             // passes under them (`crate::ccl::subst`'s Barendregt check). The
@@ -774,7 +774,7 @@ fn peel(mut e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
 /// reads at all (`src/ccl/design/mutability.md`, "A mutable variable read is an
 /// explicit operation"): an application's argument, where `emit_apply` relates
 /// a bare reference to a `Mut` parameter, and an application's function, which
-/// is where a keyed read `m[k]` puts the collection. A feed's value is the
+/// is where a proven keyed read `m[k]!` puts the collection. A feed's value is the
 /// third — `transact_phase::rewrite_as_of_reads` turns a history read fed out
 /// of a read-only block into an as-of join, and it is the bare reference that
 /// says so. Naming any of them leaves the recognizer a `Var` it cannot read
