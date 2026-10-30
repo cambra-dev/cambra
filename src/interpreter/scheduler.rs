@@ -85,9 +85,13 @@ impl Admission {
     }
 
     /// Whether `arrived` would stop at the gate: the gate is closed, and what passed since the
-    /// last pull names every key `arrived` names. Records nothing.
+    /// last pull names every key `arrived` names. Records nothing. A gate that passes every
+    /// notification (`Notified::Always`) records nothing that says it was told, so it covers
+    /// none.
     pub(crate) fn covers(&self, arrived: &Projection) -> bool {
-        self.gate.is_set() && arrived.minus(&self.passed.borrow()) == Projection::Nothing
+        matches!(self.gate, Notified::Flag(_))
+            && self.gate.is_set()
+            && arrived.minus(&self.passed.borrow()) == Projection::Nothing
     }
 
     /// Clear the gate, as a pull of the operator does.
@@ -786,6 +790,14 @@ mod tests {
             crate::interpreter::tile_operators::impl_producer_base!();
             fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
                 visit("input", &*self.input);
+            }
+
+            #[cfg(test)]
+            fn visit_input_producers_mut(
+                &mut self,
+                visit: &mut dyn FnMut(&str, &mut dyn TileProducer),
+            ) {
+                visit("input", &mut *self.input);
             }
             fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
                 self.tiling().empty_tile()

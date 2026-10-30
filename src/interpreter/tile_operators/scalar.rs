@@ -352,6 +352,11 @@ impl TileProducer for VariantWrapProducer {
         visit("payload", &*self.input);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("payload", &mut *self.input);
+    }
+
     /// It keeps its input's keys above its level and computes the values beneath it.
     fn restates(&self) -> Restates {
         Restates::Above(self.level)
@@ -665,6 +670,11 @@ impl TileProducer for VariantProjectProducer {
         visit("scrutinee", &*self.input);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("scrutinee", &mut *self.input);
+    }
+
     /// A union stream keeps its keys at the rows carrying the tag, so the scrutinee is pulled at
     /// the projection. A bare union has implicit positions for keys, so it is read whole and
     /// the positions cut after.
@@ -909,6 +919,11 @@ impl TileProducer for VariantIsProducer {
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("scrutinee", &*self.input);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("scrutinee", &mut *self.input);
     }
 
     /// Every key in is a key out, so the scrutinee is pulled at the projection.
