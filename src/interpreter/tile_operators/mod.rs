@@ -1187,6 +1187,12 @@ pub trait BreakingProducer: TileProducer {
         vec![guard.clone()]
     }
 
+    /// Finish the work the producer held back, once its pipeline has consumed every package of
+    /// an epoch: the driver calls it before it checks what the input released and before it
+    /// pushes, with `last` where the epoch is the run's last. The default holds nothing back; a
+    /// store steps towards the goals of morsels that arrived before the input that decides them.
+    fn settle(&mut self, _last: bool) {}
+
     /// Push [`final_guard`](Self::final_guard) to the pipelines that read this producer, as one
     /// work package per morsel ([`morsels`](Self::morsels)); an empty guard pushes nothing. It
     /// wakes no one.

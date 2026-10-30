@@ -351,10 +351,13 @@ fn a_terminal_transaction_store_is_not_stepped() {
     breaker.step();
 }
 
-/// A transaction store over a source that delivers nothing decides nothing once it has opened,
-/// which the breaker reports as a stall.
+/// A transaction store over a source that delivers nothing decides nothing once it has opened:
+/// the breaker holds the morsel back, and a finalize that finds it still held back reports the
+/// stall.
 #[test]
-#[should_panic(expected = "a step of a transaction store decides something short of terminal")]
+#[should_panic(
+    expected = "a transaction store finalizes after it is terminal: a step decides nothing"
+)]
 fn a_transaction_store_that_decides_nothing_is_a_stall() {
     let mut compiled = Compiled::over_an_empty_source(indoc! {"
         out = test_sink()
@@ -364,6 +367,10 @@ fn a_transaction_store_that_decides_nothing_is_a_stall() {
                 pool := pool - r
         out << await_final(pool)
     "});
-    let mut breaker = CommitBreaker::new(compiled.fan.clone(), compiled.ctx.scheduler());
-    breaker.consume_impl(breaker.input_tiling().universal_guard());
+    let breaker: BreakerHandle = Rc::new(RefCell::new(CommitBreaker::new(
+        compiled.fan.clone(),
+        compiled.ctx.scheduler(),
+    )));
+    let dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
+    run(&dispatcher, &[breaker]);
 }

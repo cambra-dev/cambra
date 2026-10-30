@@ -894,16 +894,17 @@ last epoch is its own breaker's input whole, one package per morsel (`seed`), in
 and in every earlier epoch it closes empty, since its input is whole only once every epoch has run.
 
 `dispatcher::finalize` finishes a pipeline's oldest unfinished epoch. It asserts six invariants
-before it calls the breaker: the pipeline has not begun to finish the epoch, its queue there is
-closed and empty, no package claimed for it there is in flight, every pipeline it reads has finished
-the epoch, the epoch is sealed or known to be the last, and its breaker's input has released every
-guard the pipeline consumed in the epoch. A source's input releases the regions queued for it; a
-reading pipeline's input releases only what its packages name: the guards pushed to it, nothing at
-all when the pipelines it reads pushed nothing, those guards restated together with the regions no
-pipeline pushes for a pipeline that reads them restated, and all of it for a pipeline that reads its
-input whole. A debug build also asserts that the morsels of a pushed guard partition it
-(`partition_gap`), and that a pipeline consumes each region once in an epoch: a guard pushed to a
-pipeline meets none pushed to it before in the epoch, whichever pipeline pushed it.
+before it calls the breaker, calling the breaker's `settle` before the last of them: the pipeline
+has not begun to finish the epoch, its queue there is closed and empty, no package claimed for it
+there is in flight, every pipeline it reads has finished the epoch, the epoch is sealed or known to
+be the last, and its breaker's input has released every guard the pipeline consumed in the epoch. A
+source's input releases the regions queued for it; a reading pipeline's input releases only what its
+packages name: the guards pushed to it, nothing at all when the pipelines it reads pushed nothing,
+those guards restated together with the regions no pipeline pushes for a pipeline that reads them
+restated, and all of it for a pipeline that reads its input whole. A debug build also asserts that
+the morsels of a pushed guard partition it (`partition_gap`), and that a pipeline consumes each
+region once in an epoch: a guard pushed to a pipeline meets none pushed to it before in the epoch,
+whichever pipeline pushed it.
 
 The dispatcher reads a breaker's input through `input_tiling` and `input_released`, the tiling a
 package's guard is a guard of and the guard the breaker has released of its input, so a breaker
@@ -1153,14 +1154,24 @@ whole cycle is one pipeline, whose morsels the dispatcher consumes in order (`Di
 The kind `𝐾` (`StoreKind`) supplies what differs between stores: the input's tiling and release,
 which the breaker reads through its reader slot, the goal a morsel steps the store to, and what a
 step has to decide. A goal (`StoreGoal`) is a position the store has decided, a guard of the input
-the store has released, or the store's terminal. `consume_impl` reads the snapshot afresh and calls
-`FanOut::step` until the store reaches the goal or is terminal. Each step has to decide what the
-kind says, and what it decides is bounded, so a run of steps ends. The first step of a store no pull
-has reached reads its seeds and decides nothing, and counts as progress, since seeds arrive once.
-Any other step that decides nothing panics as a stalled store, and so does a step at a terminal
-snapshot. `held` is the positions the store has decided, and everything once it is terminal.
-`finalize` asserts the store is terminal, since nothing steps the store after it, and pushes that
-guard.
+the store has released, or the store's terminal. `consume_impl` adds the morsel's goal to the goals
+the breaker holds back and steps the store with `FanOut::step` until it reaches every goal held
+back, is terminal, or a step decides nothing. Each step has to decide what the kind says, and what
+it decides is bounded, so a run of steps ends. The first step of a store no pull has reached reads
+its seeds and decides nothing, and counts as progress, since seeds arrive once. Any other step that
+decides nothing ends the run of steps: the store's input has not delivered what decides the goals
+left, and a later morsel steps the store towards them again. A morsel that arrives before the input
+that decides it is therefore consumed out of order, and its goal is reached by the steps of a later
+morsel of the same epoch, or by the epoch's `settle`. A step at a terminal snapshot panics. `held`
+is the positions the store has decided, and everything once it is terminal. `settle`
+(`BreakingProducer::settle`), which the driver calls once the pipeline has consumed every package of
+an epoch and before it checks what the input released, steps the store towards the goals held back,
+and at the run's last epoch asserts it is terminal, since nothing steps the store after its
+finalize. A store mid-stream is not terminal, and its later epochs step it further. It reaches each
+goal within the epoch its morsel is consumed in, since the epoch's finish checks that the input
+released every morsel consumed in it, and a goal still held back at the end of an earlier epoch
+panics. At the last epoch, a store not terminal then is stalled, and the panic names the goals it
+holds back. `finalize` pushes that guard.
 
 A breaker steps a flat store only, and refuses a nested one at construction. A nested induction
 store is one store per enclosing row, and its frontier, which `held`, a goal and a step's progress

@@ -65,7 +65,7 @@ impl Compiled {
         })
     }
 
-    fn with(source: &str, setup: impl FnOnce(&mut GlobalContext)) -> Self {
+    pub(super) fn with(source: &str, setup: impl FnOnce(&mut GlobalContext)) -> Self {
         let mut ctx = GlobalContext::default();
         let sink = ctx.register_test_sink("out");
         setup(&mut ctx);
@@ -400,10 +400,12 @@ fn a_terminal_loop_is_not_stepped() {
     breaker.step();
 }
 
-/// A loop over a source that delivers nothing decides nothing on a step, which the breaker
-/// reports as a stall.
+/// A loop over a source that delivers nothing decides nothing on a step: the breaker holds the
+/// morsel back, and a finalize that finds it still held back reports the stall.
 #[test]
-#[should_panic(expected = "a step of an induction store decides something short of terminal")]
+#[should_panic(
+    expected = "an induction store finalizes after it is terminal: a step decides nothing"
+)]
 fn a_loop_that_decides_nothing_is_a_stall() {
     let mut compiled = Compiled::over_an_empty_source(indoc! {"
         out = test_sink()
@@ -412,8 +414,71 @@ fn a_loop_that_decides_nothing_is_a_stall() {
             total += x
         out << total
     "});
+    let breaker: BreakerHandle = Rc::new(RefCell::new(LoopBreaker::new(
+        compiled.fan.clone(),
+        compiled.ctx.scheduler(),
+    )));
+    let dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
+    run(&dispatcher, &[breaker]);
+}
+
+/// A morsel of positions its source has not delivered is held back, and a later morsel steps
+/// the store to it once the source has: the morsels are consumed out of order.
+#[test]
+fn a_loop_holds_a_morsel_back_until_its_source_delivers() {
+    let source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        crate::ccl::Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    let registered = source.clone();
+    let mut compiled = Compiled::with(
+        indoc! {"
+            out = test_sink()
+            total := 0
+            for x in source1():
+                total += x
+            out << total
+        "},
+        move |ctx| ctx.register_source(registered),
+    );
     let mut breaker = LoopBreaker::new(compiled.fan.clone(), compiled.ctx.scheduler());
-    breaker.consume_impl(breaker.input_tiling().universal_guard());
+    let decided_through = |at: u64| {
+        TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(Value::UInt(
+            at,
+        ))))
+    };
+    breaker.consume_impl(keys_between(2, 3));
+    assert!(
+        breaker.held().is_empty(),
+        "nothing delivered, nothing decided"
+    );
+    let deliver = |data: &[(u64, i64)], through: u64| {
+        let data: Vec<_> = data
+            .iter()
+            .map(|(at, value)| (Value::UInt(*at), Value::Int(*value)))
+            .collect();
+        source.borrow_mut().add_data(&data);
+        source
+            .borrow_mut()
+            .set_yield_predicate(Predicate::at_or_below(Value::UInt(through)));
+    };
+    deliver(&[(0, 5), (1, 7)], 1);
+    compiled.ctx.scheduler().check_for_notifications();
+    breaker.consume_impl(keys_between(0, 1));
+    assert_eq!(
+        breaker.held(),
+        decided_through(1),
+        "the second morsel is decided, the first still held back"
+    );
+    deliver(&[(2, 11), (3, 13)], 3);
+    compiled.ctx.scheduler().check_for_notifications();
+    breaker.consume_impl(keys_between(4, 4));
+    assert_eq!(
+        breaker.held(),
+        decided_through(3),
+        "the first morsel is decided once its positions arrive"
+    );
 }
 
 /// Snapshots of [`SUM`]'s store after each of its three steps, with a reader that releases
@@ -453,4 +518,95 @@ fn an_induction_step_deciding_two_positions_is_refused() {
     let snapshots = sum_snapshots();
     let none = ints().empty_guard();
     Induction::progressed(&snapshots[0], &snapshots[2], &none, &none);
+}
+
+/// Through the dispatcher, a loop's ordered pipeline notified its later positions first holds
+/// that morsel back, and steps to it once the earlier positions and then the later ones have
+/// arrived; the store ends at its close with the sum of every position.
+#[test]
+fn a_loop_notified_out_of_order_runs_through_the_dispatcher() {
+    let source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        crate::ccl::Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    let registered = source.clone();
+    let mut compiled = Compiled::with(
+        indoc! {"
+            out = test_sink()
+            total := 0
+            for x in source1():
+                total += x
+            out << total
+        "},
+        move |ctx| ctx.register_source(registered),
+    );
+    let breaker: BreakerHandle = Rc::new(RefCell::new(LoopBreaker::new(
+        compiled.fan.clone(),
+        compiled.ctx.scheduler(),
+    )));
+    let breakers = [breaker];
+    let mut dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
+    dispatcher.order(PipelineId(0));
+    let mut deliver = |data: &[(u64, i64)], through: Predicate| {
+        let data: Vec<_> = data
+            .iter()
+            .map(|(at, value)| (Value::UInt(*at), Value::Int(*value)))
+            .collect();
+        source.borrow_mut().add_data(&data);
+        source.borrow_mut().set_yield_predicate(through);
+        compiled.ctx.scheduler().check_for_notifications();
+    };
+    let consume_queued = |dispatcher: &Dispatcher| {
+        while let Some(package) = dispatcher.claim_of(PipelineId(0)) {
+            consume(dispatcher, &breakers, package);
+        }
+    };
+    dispatcher.notify(PipelineId(0), &keys_between(2, 3));
+    consume_queued(&dispatcher);
+    deliver(&[(0, 5), (1, 7)], Predicate::at_or_below(Value::UInt(1)));
+    dispatcher.notify(PipelineId(0), &keys_between(0, 1));
+    consume_queued(&dispatcher);
+    deliver(&[(2, 11), (3, 13)], Predicate::True);
+    dispatcher.close(PipelineId(0));
+    finalize(&dispatcher, &breakers, PipelineId(0));
+    assert_eq!(compiled.value(), Value::Int(36));
+}
+
+/// A loop's morsel whose positions its source has not delivered by the end of its epoch is
+/// refused at the epoch's finish: the store reaches each morsel's goal within its epoch.
+#[test]
+#[should_panic(
+    expected = "an induction store reaches the goal of each morsel within the epoch it is consumed in"
+)]
+fn a_loop_holding_a_morsel_back_past_its_epoch_is_refused() {
+    let source = Rc::new(RefCell::new(TestDataSource::new(
+        "source1",
+        crate::ccl::Type::Base(BaseType::Int),
+        Extent::Base(BaseType::Int),
+    )));
+    let registered = source.clone();
+    let mut compiled = Compiled::with(
+        indoc! {"
+            out = test_sink()
+            total := 0
+            for x in source1():
+                total += x
+            out << total
+        "},
+        move |ctx| ctx.register_source(registered),
+    );
+    let breaker: BreakerHandle = Rc::new(RefCell::new(LoopBreaker::new(
+        compiled.fan.clone(),
+        compiled.ctx.scheduler(),
+    )));
+    let breakers = [breaker];
+    let mut dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
+    dispatcher.order(PipelineId(0));
+    dispatcher.notify(PipelineId(0), &keys_between(2, 3));
+    dispatcher.seal();
+    while let Some(package) = dispatcher.claim_of(PipelineId(0)) {
+        consume(&dispatcher, &breakers, package);
+    }
+    finalize(&dispatcher, &breakers, PipelineId(0));
 }

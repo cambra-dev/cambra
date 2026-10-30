@@ -1755,9 +1755,9 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
 ///
 /// When the pipeline has finished every epoch, its queue in the epoch is not closed or not empty,
 /// a package claimed for it is in flight, a pipeline it reads has not finished the epoch, or its
-/// breaker's input has not released every guard the pipeline consumed in the epoch. Also where the
-/// guard algebra has no exact difference of a consumed guard and the guard the input released
-/// ([`guard_minus`]).
+/// breaker's input has not released, once the breaker settled ([`BreakingProducer::settle`]),
+/// every guard the pipeline consumed in the epoch. Also where the guard algebra has no exact
+/// difference of a consumed guard and the guard the input released ([`guard_minus`]).
 pub fn finalize(dispatcher: &Dispatcher, breakers: &[BreakerHandle], pipeline: PipelineId) {
     let (epoch, consumed) = dispatcher.begin_finalize(pipeline);
     let last = epoch == dispatcher.last.load(Ordering::Acquire);
@@ -1788,6 +1788,7 @@ fn finalize_with(
         let consumed = consumed
             .take()
             .expect("a reach calls the breaker it reaches once");
+        breaker.settle(last);
         let released = breaker.input_released();
         assert!(
             consumed.is_none_or(|consumed| {
