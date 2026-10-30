@@ -399,6 +399,21 @@ pub enum InferError {
         detail: String,
         at_use: bool,
     },
+    /// An exception a module's top level raises, which nothing catches: no exception escapes
+    /// the program (`docs/chl-spec.md`, "Exceptions").
+    ExceptionEscapes { ty: String },
+    /// An `except` clause around a call that may cause a top raising every type, `Effect` or
+    /// `Raise(*)`.
+    ExceptAroundEveryRaise { clause: String, top: String },
+    /// An `except` clause catching nothing its `try` block raises.
+    ExceptCatchesNothing { ty: String },
+    /// An `except` clause, the first not to exclude the type of an exception its `try` block
+    /// raises, that does not cover that type either.
+    ExceptTakesPart { clause: String, raised: String },
+    /// A `raise`, an `except` clause or a `Raise(T)` in a clause whose type holds a function that
+    /// is not a collection, which the compiler does not carry as an exception yet
+    /// ([`crate::ccl::capabilities::uncompiled_exception_part`]).
+    ExceptionHoldsAFunction { ty: String },
     /// A function returning a function that has `item`, which names a variable the
     /// returning function binds.
     EscapesItsVariable { item: String, every: bool },
@@ -1126,6 +1141,11 @@ impl InferError {
             | InferError::CapabilityBeyondSignature { .. }
             | InferError::NestedTransaction { .. }
             | InferError::UnorderedLoop { .. }
+            | InferError::ExceptionEscapes { .. }
+            | InferError::ExceptCatchesNothing { .. }
+            | InferError::ExceptAroundEveryRaise { .. }
+            | InferError::ExceptTakesPart { .. }
+            | InferError::ExceptionHoldsAFunction { .. }
             | InferError::TransactionOutsideBlock
             | InferError::EmptyTransaction
             | InferError::EscapesItsVariable { .. }
@@ -1724,6 +1744,29 @@ impl std::fmt::Debug for InferError {
                 }
                 Ok(())
             }
+            InferError::ExceptionEscapes { ty } => write!(
+                f,
+                "this raises `{ty}`, which nothing catches: no exception may escape the program"
+            ),
+            InferError::ExceptionHoldsAFunction { ty } => write!(
+                f,
+                "an exception of type `{ty}`, which holds a function, is not compiled yet"
+            ),
+            InferError::ExceptTakesPart { clause, raised } => write!(
+                f,
+                "this `except {clause}` would catch some exceptions of type `{raised}` and not \
+                 others; catch a type holding all of `{raised}`, and test the value in the clause"
+            ),
+            InferError::ExceptAroundEveryRaise { clause, top } => write!(
+                f,
+                "this `except {clause}` is around a call that may cause `{top}`, which raises \
+                 every type, so a clause would catch some exceptions of a type and not others; \
+                 state the types the call raises instead, taking `Raise(*)` away"
+            ),
+            InferError::ExceptCatchesNothing { ty } => write!(
+                f,
+                "this `except {ty}` catches nothing its `try` block raises"
+            ),
             InferError::CapabilityBeyondClause { item } => write!(
                 f,
                 "this has `{item}`, which the definition's clause, bounded by `only` or \

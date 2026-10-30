@@ -109,7 +109,13 @@ use std::rc::Rc;
 /// ([`fold_product_projection`]); `crate::ccl::simplify` folds the rest as a
 /// general rule so it fires consistently throughout the tree.
 pub fn inline_compute_lambdas(expr: Expr) -> Expr {
-    let expr = inline_impl(expr, &mut BinderScope::default(), &mut HashSet::new());
+    let raises = Raises::of(&expr);
+    let expr = inline_impl(
+        expr,
+        &mut BinderScope::default(),
+        &mut HashSet::new(),
+        &raises,
+    );
     let expr = crate::ccl::observe_world::eliminate(expr);
     inline_list_element_reads(expr, &PredMemo::new()).0
 }
@@ -950,16 +956,26 @@ fn anf_chain_builds_a_product(e: &Expr) -> bool {
 /// visits a node before its children, records a channel before reaching any tuple that holds
 /// it. A defer-mediating function's parameter is replaced by the caller's handle when the
 /// function is inlined, so the handles a tuple holds by then are channel names.
-fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>) -> Expr {
+fn inline_impl(
+    expr: Expr,
+    scope: &mut BinderScope,
+    channels: &mut HashSet<Name>,
+    raises: &Raises,
+) -> Expr {
     // One stack frame per node over the whole tree; grow on demand, as the other pass-level
     // walks do.
     stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
-        inline_node(expr, scope, channels)
+        inline_node(expr, scope, channels, raises)
     })
 }
 
 /// [`inline_impl`] at one node.
-fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>) -> Expr {
+fn inline_node(
+    expr: Expr,
+    scope: &mut BinderScope,
+    channels: &mut HashSet<Name>,
+    raises: &Raises,
+) -> Expr {
     if let TypedExprNode::Let {
         binding,
         bound_expr,
@@ -988,9 +1004,9 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
             bound_expr,
             body,
         } => {
-            let bound_expr = inline_impl(*bound_expr, scope, channels);
+            let bound_expr = inline_impl(*bound_expr, scope, channels, raises);
             let body = scope.under_let(&binding, &bound_expr, |scope| {
-                inline_impl(*body, scope, channels)
+                inline_impl(*body, scope, channels, raises)
             });
 
             // Alias: `let y = x` is pure α-renaming — substitute y → x in body
@@ -1046,7 +1062,7 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                         provenance::enter(node_id, "inline.split", provenance::Nature::Machinery);
                     split_product_let(&binding, bound_expr, body)
                 };
-                return inline_impl(split, scope, channels);
+                return inline_impl(split, scope, channels, raises);
             }
 
             if !binder_spelled_in_a_type
@@ -1098,6 +1114,7 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                 && !writes_what_the_body_touches(&bound_expr, &body)
                 && !writes_a_variable_bound_outside(&bound_expr)
                 && !stands_in_a_value_former(&binding.name, &body)
+                && !may_raise(&bound_expr, raises)
             {
                 let _g =
                     provenance::enter(node_id, "inline.anf_temp", provenance::Nature::Machinery);
@@ -1112,7 +1129,7 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                 // inside a refinement predicate, an `Rc` no term walk rebuilds.
                 // Leave the binding standing.
                 return match unplaced {
-                    None => inline_impl(body, scope, channels),
+                    None => inline_impl(body, scope, channels, raises),
                     Some(bound_expr) => Expr {
                         node_id,
                         site,
@@ -1158,6 +1175,7 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                 && !reads_a_variable_written_in(&bound_expr, &body)
                 && !writes_what_the_body_touches(&bound_expr, &body)
                 && !writes_a_variable_bound_outside(&bound_expr)
+                && !may_raise(&bound_expr, raises)
             {
                 let _g =
                     provenance::enter(node_id, "inline.anf_product", provenance::Nature::Machinery);
@@ -1165,7 +1183,12 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                 // the substitution and land between the projection and the
                 // former again, one level in.
                 let former = flatten_anf_bindings(bound_expr);
-                return inline_impl(substitute(body, &binding.name, &former), scope, channels);
+                return inline_impl(
+                    substitute(body, &binding.name, &former),
+                    scope,
+                    channels,
+                    raises,
+                );
             }
 
             if !binder_spelled_in_a_type && should_inline(&bound_expr.ty) {
@@ -1195,7 +1218,7 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                     // `Rc` to a different result.
                     &PredMemo::new(),
                 );
-                return inline_impl(reduced, scope, channels);
+                return inline_impl(reduced, scope, channels, raises);
             }
 
             // **A projection of a bound tuple literal** reads the element it lands on, when
@@ -1213,10 +1236,10 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                         if count_free(&binding.name, &body) == 0
                             && !crate::ccl::subst::type_free_vars(&ty).contains(&binding.name) =>
                     {
-                        return inline_impl(body, scope, channels);
+                        return inline_impl(body, scope, channels, raises);
                     }
                     (body, true) => scope.under_let(&binding, &bound_expr, |scope| {
-                        inline_impl(body, scope, channels)
+                        inline_impl(body, scope, channels, raises)
                     }),
                     (body, false) => body,
                 }
@@ -1240,13 +1263,13 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
         TypedExprNode::Compose(terms) => TypedExprNode::Compose(
             terms
                 .into_iter()
-                .map(|term| inline_impl(term, scope, channels))
+                .map(|term| inline_impl(term, scope, channels, raises))
                 .collect(),
         ),
 
         TypedExprNode::Lambda { param, body } => {
             let body = scope.under(&param.name, param.ty.clone(), |scope| {
-                inline_impl(*body, scope, channels)
+                inline_impl(*body, scope, channels, raises)
             });
             TypedExprNode::Lambda {
                 param,
@@ -1272,7 +1295,7 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                 capabilities,
                 own_capabilities,
             };
-            expr.map_children(|child| inline_impl(child, scope, channels));
+            expr.map_children(|child| inline_impl(child, scope, channels, raises));
             let expr = expr.absorbing_children_capabilities();
             // **A projection of a tuple literal holding a feed handle** is the element it
             // lands on. Beta reduction leaves this shape where a function of several
@@ -1296,7 +1319,12 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                 return element.clone();
             }
             if calls_a_projection && calls_a_lambda(&expr) {
-                return inline_impl(beta_reduce_folded_call(expr, scope), scope, channels);
+                return inline_impl(
+                    beta_reduce_folded_call(expr, scope),
+                    scope,
+                    channels,
+                    raises,
+                );
             }
             return fold_product_projection(expr);
         }
@@ -1312,6 +1340,96 @@ fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
         own_capabilities,
     }
     .absorbing_children_capabilities()
+}
+
+/// What inlining knows of which calls may raise an exception ([`may_raise`]).
+struct Raises {
+    /// Whether the tree raises anywhere. Where it does not, nothing may raise, and inlining
+    /// rewrites as it would without exceptions.
+    any: bool,
+    /// The let-bound capabilities known not to raise: whose bodies hold no `raise` and call
+    /// only capabilities known not to. A capability not listed, a parameter's included, may.
+    quiet: HashSet<Name>,
+}
+
+impl Raises {
+    fn of(expr: &Expr) -> Self {
+        let mut any = false;
+        let mut capabilities = Vec::new();
+        collect_capabilities(expr, &mut any, &mut capabilities);
+        let mut raises = Raises {
+            any,
+            quiet: HashSet::new(),
+        };
+        if !any {
+            return raises;
+        }
+        loop {
+            let before = raises.quiet.len();
+            for (name, body) in &capabilities {
+                if !raises.quiet.contains(*name) && !may_raise(body, &raises) {
+                    raises.quiet.insert((*name).clone());
+                }
+            }
+            if raises.quiet.len() == before {
+                return raises;
+            }
+        }
+    }
+}
+
+/// Every `let`-bound capability in `e`, with the body its calls evaluate, under however many
+/// parameters; and whether `e` holds a `raise` at all.
+fn collect_capabilities<'a>(e: &'a Expr, any: &mut bool, out: &mut Vec<(&'a Name, &'a Expr)>) {
+    match &e.node {
+        TypedExprNode::Raise { .. } => *any = true,
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } if should_inline(&bound_expr.ty) => {
+            let mut body: &Expr = bound_expr;
+            while let TypedExprNode::Lambda { body: inner, .. } = &body.node {
+                body = inner;
+            }
+            out.push((&binding.name, body));
+        }
+        _ => {}
+    }
+    e.walk_children(|c| collect_capabilities(c, any, out));
+}
+
+/// Whether evaluating `e` may raise an exception, so that a rewrite must neither drop it, copy
+/// it, nor move it to where it would be evaluated under a condition or in another order
+/// (`docs/chl-spec.md`, "Exceptions": an exception is raised whether its value is used or
+/// not, and the first in written order escapes).
+///
+/// A `raise` may, unless it stands in a function nothing applies here: a lambda's body raises
+/// where the lambda is applied. A call of a capability may unless [`Raises`] knows it does not:
+/// the pass meets a call before the body it substitutes there.
+fn may_raise(e: &Expr, raises: &Raises) -> bool {
+    if !raises.any {
+        return false;
+    }
+    match &e.node {
+        TypedExprNode::Raise { .. } => true,
+        TypedExprNode::Lambda { .. } => false,
+        TypedExprNode::Apply { argument, function } => {
+            may_raise(argument, raises)
+                || match &function.node {
+                    TypedExprNode::Lambda { body, .. } => may_raise(body, raises),
+                    TypedExprNode::Var(name) => {
+                        should_inline(&function.ty) && !raises.quiet.contains(name)
+                    }
+                    _ => may_raise(function, raises),
+                }
+        }
+        _ => {
+            let mut found = false;
+            e.walk_children(|c| found = found || may_raise(c, raises));
+            found
+        }
+    }
 }
 
 /// Whether beta reduction should bind `argument` rather than substitute it for `param` in

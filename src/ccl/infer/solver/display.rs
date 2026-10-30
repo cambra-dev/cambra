@@ -14,6 +14,7 @@ use std::rc::Rc;
 use smol_str::SmolStr;
 
 use crate::ccl::capabilities::CapabilityVarId;
+use crate::ccl::provenance::NodeId;
 use crate::ccl::ty::{PolyParam, PolyType, TraitRequirement, TypeParam, TypeParamId};
 use crate::ccl::{InferVarId, Level, Type};
 
@@ -155,6 +156,12 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
     if !positions.is_empty() {
         parts.push(Type::fun(Type::Tuple(positions), unit()));
     }
+    // What the function raises is an output, so its types stand at a positive position, the
+    // last part, where their variables take the names the rest of the type gives them.
+    let raised = raised_types(ty);
+    if !raised.is_empty() {
+        parts.push(Type::Tuple(raised.iter().map(|(_, t)| t.clone()).collect()));
+    }
     let mut pinned: BTreeSet<InferVarId> = BTreeSet::new();
     let mut compacted = compact_type_for_display(&Type::Tuple(parts));
     // A variable at or below the cutoff is one type of the enclosing scope's, not a
@@ -252,6 +259,19 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
         ty.walk_children_mut(|c| name_ordering(c, positions));
     }
     name_ordering(&mut body, &ordered_positions);
+    let raised_named: Vec<((NodeId, u32), Type)> = if raised.is_empty() {
+        Vec::new()
+    } else {
+        let Some(Type::Tuple(named)) = parts.last() else {
+            unreachable!("the raised types are compacted as the last part, a tuple");
+        };
+        let named: Vec<((NodeId, u32), Type)> = raised
+            .iter()
+            .map(|(k, _)| *k)
+            .zip(named.iter().map(|t| names.rename(t)))
+            .collect();
+        named
+    };
     // The variables standing for a carried requirement's associated effect types, as the
     // requirement's members: `r::Writes` ([`TraitObligation::effects`]).
     let mut members: HashMap<CapabilityVarId, crate::ccl::capabilities::ClauseParam> =
@@ -324,6 +344,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
     }
     name_members(&mut body, &members);
     params.extend(name_capability_vars(&mut body, cutoff, &params));
+    name_raises(&mut body, &raised_named);
     Some(InferredPoly {
         poly: PolyType {
             params,
@@ -613,6 +634,65 @@ impl Reach {
 }
 
 /// The polarities each variable occurs at in `ct`.
+/// Each exception a function in `ty` may raise whose type still holds an inference variable, by
+/// the `raise` and the instance raising it, once each, in the order the walk meets them.
+fn raised_types(ty: &Type) -> Vec<((NodeId, u32), Type)> {
+    fn go(ty: &Type, out: &mut Vec<((NodeId, u32), Type)>) {
+        if let Type::Fun { capabilities, .. } = ty {
+            for effect in capabilities.set().causes {
+                if let crate::ccl::capabilities::Effect::Raise(raised) = effect
+                    && crate::ccl::subst::type_contains_infer(&raised.ty)
+                    && !out
+                        .iter()
+                        .any(|(k, _)| *k == (raised.site, raised.instance))
+                {
+                    out.push(((raised.site, raised.instance), raised.ty.clone()));
+                }
+            }
+        }
+        ty.walk_children(|c| go(c, out));
+    }
+    let mut out = Vec::new();
+    go(ty, &mut out);
+    out
+}
+
+/// `ty` with the type of each exception its functions may raise that `named` holds, by the
+/// `raise` and the instance raising it, replaced by the type `named` gives it. Materializing the
+/// type mints a fresh variable for one still open, so the exception is found by where it is
+/// raised, not by its type.
+fn name_raises(ty: &mut Type, named: &[((NodeId, u32), Type)]) {
+    use crate::ccl::capabilities::{Capabilities, Effect, Raised};
+    let named_at = |r: &Raised| {
+        named
+            .iter()
+            .find(|(k, _)| *k == (r.site, r.instance))
+            .map(|(_, t)| t.clone())
+    };
+    if let Type::Fun { capabilities, .. } = ty {
+        let mut set = capabilities.set();
+        if set
+            .causes
+            .iter()
+            .any(|e| matches!(e, Effect::Raise(r) if named_at(r).is_some()))
+        {
+            set.causes = set
+                .causes
+                .into_iter()
+                .map(|e| match e {
+                    Effect::Raise(r) => match named_at(&r) {
+                        Some(to) => Effect::Raise(Raised { ty: to, ..r }),
+                        None => Effect::Raise(r),
+                    },
+                    other => other,
+                })
+                .collect();
+            *capabilities = Capabilities::known(set);
+        }
+    }
+    ty.walk_children_mut(|c| name_raises(c, named));
+}
+
 /// The variables standing for a requirement's associated type and nothing else, each with the
 /// member spelling it prints as, `_::Output`.
 ///

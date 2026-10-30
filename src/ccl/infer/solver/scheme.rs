@@ -458,6 +458,17 @@ fn freshen_capability_var(
     for capability in v.own() {
         match &capability.item {
             Capability::Param(_) => {}
+            // A use raises the exception at its own instance of the definition's types, and as
+            // an exception of its own: two uses at two types are two exceptions.
+            Capability::Causes(crate::ccl::capabilities::Effect::Raise(raised)) => {
+                let ty = freshen_above(lim, &raised.ty, target, cache);
+                f.record(crate::ccl::capabilities::ScopedCapability {
+                    item: Capability::Causes(crate::ccl::capabilities::Effect::Raise(
+                        raised.instantiated(ty),
+                    )),
+                    ..capability.clone()
+                });
+            }
             Capability::Requires(r) if r.ordering().is_some_and(|o| o.satisfied.get()) => {}
             Capability::Requires(r) if r.ordering().is_some() => {
                 let requirement = freshen_requirement(lim, r, target, cache);
@@ -471,6 +482,16 @@ fn freshen_capability_var(
     }
     for (source, mut filter) in v.incoming() {
         let source = freshen_capability_var(lim, &source, target, cache);
+        // A use's `try` catches the use's instances of the types its clauses name, as its
+        // exceptions are the use's instances of the types they are raised at.
+        if let Some(catch) = &filter.catches {
+            let clauses = catch
+                .clauses()
+                .iter()
+                .map(|c| freshen_above(lim, c, target, cache))
+                .collect();
+            filter.catches = Some(Rc::new(catch.instantiated(clauses)));
+        }
         filter.stated = filter
             .stated
             .into_iter()

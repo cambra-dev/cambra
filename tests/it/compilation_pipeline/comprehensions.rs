@@ -400,6 +400,11 @@ fn a_filter_over_a_union_source_is_applied(#[case] code: &str) {
     "},
     9
 )]
+// The collection is a projection of the row, which the filter reads too.
+#[case::over_a_projection_of_the_row(
+    "sum([sum([v for v in r.xs if v > 1]) for r in [(xs=[1, 2]), (xs=[3, 4])]])",
+    9
+)]
 fn a_filtered_inner_comprehension_over_the_outer_row_keeps_its_filter(
     #[case] program: &str,
     #[case] total: i64,

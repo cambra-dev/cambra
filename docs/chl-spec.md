@@ -138,7 +138,8 @@ with
 match  case
 pass
 where
-forall requires causes only   nothing except
+forall requires causes only   nothing
+raise  try    except
 type   impl   instance   trait
 import use    as     pub    run    param  const  this
 ```
@@ -152,10 +153,9 @@ syntax itself is parsed, in every annotation position that takes a type (§6.4).
 
 A lambda is written `\x -> body` (§3.10); `\` and `->` are punctuation
 (§1.8), not keywords, so `lambda` is an ordinary identifier — it, along with
-`while`, `class`, `try`, `global`, `nonlocal`,
-`del`, `assert`, `raise`, `is`, are **not** keywords in CHL today. Some are
-reserved for future use. `raise` and `try` are **[Decided]** keywords
-([Exceptions](#exceptions)), not lexed yet.
+`while`, `class`, `global`, `nonlocal`,
+`del`, `assert`, `is`, are **not** keywords in CHL today. Some are
+reserved for future use.
 
 `import`, `use`, `as`, `pub`, `run`, `param` and `this` are the module keywords
 ([9. Modules](#9-modules)). `const` marks a parameter whose argument is a link-time constant
@@ -179,13 +179,13 @@ or a function type, and `only` and `nothing` bound one
 > `assert` and its `static assert` form (function contracts — §6, **[Decided]** as the
 > surface, **[Open]** as to what `static` demands). Avoid taking these names for other purposes.
 > (`with`, `:=`, `match`, `case`, `where`, `forall`, `requires`, `causes`, `only`, `nothing`,
-> `except`, `type`, `impl`, `instance`, `trait` and the module keywords are **already** lexed —
-> the first two carry today's transactions and mutation, §8, `match`/`case` carry tag dispatch,
-> §4.10, `where` separates a refinement's predicate, §6.4, `forall` and `requires` begin a
-> polymorphic type and a `requires` clause, §6.10, `causes`, `only`, `nothing` and `except`
-> write the other clause, bound both and take capabilities out of one, §6.9, and `type`,
-> `impl`, `instance` and `trait` declare nominal types, their functions, instances and traits,
-> §6.8 and §6.10 — so they are not in this list.)
+> `raise`, `try`, `except`, `type`, `impl`, `instance`, `trait` and the module keywords are
+> **already** lexed — the first two carry today's transactions and mutation, §8, `match`/`case`
+> carry tag dispatch, §4.10, `where` separates a refinement's predicate, §6.4, `forall` and
+> `requires` begin a polymorphic type and a `requires` clause, §6.10, `causes`, `only` and `nothing`
+> write the other clause and bound both, §6.9, `raise`, `try` and `except` write and catch
+> exceptions, §6.9, and `type`, `impl`, `instance` and `trait` declare nominal types, their
+> functions, instances and traits, §6.8 and §6.10 — so they are not in this list.)
 
 ### 1.7 Literals
 
@@ -432,8 +432,8 @@ production is shared with pre-`:=` code shapes.
 `expression` in the grammar, but lowering accepts only `begin()`. The optional `ident "="`
 prefix names the block's transaction, which a program uses only before `::` (§8.7,
 **[Decided]**). `with` does
-**not** provide Python's general context-manager statement. A `try_stmt` and a `with_stmt`
-as a `block_value` are **[Decided]**.
+**not** provide Python's general context-manager statement. A `with_stmt` as a
+`block_value` is **[Decided]**.
 
 `decl_stmt` declares a feed with no value, `h: Feed(V)`
 ([Declaring a feed](#declaring-a-feed)); every other binding takes a value.
@@ -665,8 +665,7 @@ The effecting forms:
   visible in its type: its `causes` clause states them, written or inferred. There are **no
   implicit-effect functions**, so an inert expression statement (§4.9) stays detectable and
   rejected.
-- **`raise`** (**[Decided]**), a call that may raise, and an output outside the program, such
-  as binding a
+- **`raise`**, a call that may raise, and an output outside the program, such as binding a
   sink ([6.9 Capabilities](#69-capabilities)).
 
 `yield` (§3.13) is not an effect in this sense: it adds its operand to the
@@ -720,8 +719,8 @@ a finite function from `0..n` to values, so `xs[i]` is well-defined
 
 ### Ordered loops
 
-**[Decided]** — an exception escaping the body ([Exceptions](#exceptions)), and refusing an ordered
-loop over a feed fed from more than one `<<`. The rest of this section is implemented.
+**[Decided]** — refusing an ordered loop over a feed fed from more than one `<<`. The rest of this
+section is implemented.
 
 A loop is **ordered** when its iterations interact: its body causes `Write(x)` for an induction
 variable `x` bound outside the loop, an accumulator update made directly or by a call (§4.6), or a
@@ -1643,8 +1642,8 @@ rest of this section apply to **non-generator** functions, whose body
 must produce a value explicitly.
 
 A non-generator function's body is a non-empty block whose last contributing statement supplies its
-result. That statement may be an expression, `return`, a terminal `if`, `match` or `try`
-(**[Decided]**), or a value-producing `with begin():` block (**[Decided]**). Each follows the
+result. That statement may be an expression, `return`, a terminal `if`, `match` or `try`, or a
+value-producing `with begin():` block (**[Decided]**). Each follows the
 [block-value rule](#a-block-is-also-the-value-it-computes).
 
 A function value captures the values of free names in its surrounding
@@ -3479,10 +3478,10 @@ is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 
 ### 6.9 Capabilities
 
-**[Decided]** — exceptions ([Exceptions](#exceptions)); naming another module's public transactional
-variable, `WriteTxn(inv::stock)`; sink functions and calls made outside the program ([Output outside
-the program](#output-outside-the-program)); and keeping readings across a reload and a restart
-([Inputs from outside the program](#inputs-from-outside-the-program)). The rest of this section is
+**[Decided]** — naming another module's public transactional variable, `WriteTxn(inv::stock)`; sink
+functions and calls made outside the program ([Output outside the
+program](#output-outside-the-program)); and keeping readings across a reload and a restart ([Inputs
+from outside the program](#inputs-from-outside-the-program)). The rest of this section is
 implemented.
 
 A function's type states what a call reads from its context, in its **`requires` clause**, and what

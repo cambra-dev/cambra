@@ -285,6 +285,24 @@ impl TileOperator for Zip {
     }
 }
 
+/// `tile`, which stands beneath the rows `rows` admits, with each collection level in it
+/// complete only beneath those rows.
+fn qualify_beneath(tile: &mut Tile, rows: &Predicate) {
+    match tile {
+        Tile::Record { fields, .. } => fields.values_mut().for_each(|f| qualify_beneath(f, rows)),
+        Tile::DataFunction {
+            domain_predicate,
+            codomain,
+            ..
+        } => {
+            let beneath = Predicate::qualified(rows.clone(), Predicate::True);
+            *domain_predicate = domain_predicate.intersect(&beneath);
+            qualify_beneath(codomain, &beneath);
+        }
+        _ => {}
+    }
+}
+
 /// Producer for [`Zip`]: pulls each input and assembles a record-codomain tile.
 struct ZipProducer {
     base: ProducerBase,
@@ -616,6 +634,37 @@ impl TileProducer for ZipProducer {
                     unreachable!("the skeleton is one of the collection inputs")
                 };
                 *domain_predicate = intersect_pred;
+                // An arm's statement about the levels beneath the pair holds beneath the rows
+                // that arm holds, and the pair holds only the rows every arm does: beneath a
+                // row one arm has reached and another has not, the pair has promised nothing
+                // yet (`src/interpreter/design-operators.md`, "The completeness contract").
+                // So each level beneath the pair is complete only beneath the rows the pair
+                // holds or calls complete.
+                if self
+                    .inputs
+                    .iter()
+                    .any(|i| i.tiling().values_at(self.level).holds_a_level())
+                {
+                    let Tile::DataFunction {
+                        domain,
+                        domain_predicate,
+                        ..
+                    } = out.values_at(rows_level)
+                    else {
+                        unreachable!("the pair stands beneath a collection")
+                    };
+                    let held = match rows_level.index() {
+                        0 => Predicate::from_column_value(domain),
+                        _ => Predicate::union_all(
+                            out.paths_at(rows_level)
+                                .iter()
+                                .map(|path| Predicate::exactly(path))
+                                .collect(),
+                        ),
+                    };
+                    let vouched = held.union(domain_predicate);
+                    qualify_beneath(out.values_at_mut(self.level), &vouched);
+                }
                 self.held = held;
                 // The arms keep the rows a consumer released only a field of
                 // ([`ZipProducer::release_impl`]), so those cells are taken back out here.
@@ -1768,6 +1817,7 @@ mod tests {
             );
         }
     }
+
     /// A release of one field reaches an arm only at the pairs the zip has emitted. A consumer
     /// done with a field may name it at every row, and an arm releasing a row's cells gives the
     /// row back, so a row one arm holds and another has not reached stays with the arm.

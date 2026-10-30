@@ -3077,7 +3077,9 @@ fn capabilities_at(
     pol: bool,
     st: &CompactState,
 ) -> crate::ccl::capabilities::CapabilitySet {
-    let mut set = capabilities.set();
+    // Each exception stands at the type its bounds resolve to, whether or not the walk records
+    // variables: a monomorphic function's contract states it too.
+    let mut set = capabilities.set().with_raises_resolved();
     if st.capability_vars
         && let crate::ccl::capabilities::Repr::Var(v) = capabilities.repr()
     {
