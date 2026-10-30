@@ -390,29 +390,13 @@ fn declare_function(
     ctx.named_requirements.truncate(in_scope);
     let (inputs, output) = typed?;
     // A call opens the function's own type parameters afresh, so its arguments determine
-    // each: it appears in a parameter's type, or is the associated type of a requirement on
-    // types they determine.
-    let mut determined = HashSet::new();
+    // each: it appears in a parameter's type, in a determined parameter's bound, or is the
+    // associated type of a requirement on types they determine.
+    let mut in_inputs = HashSet::new();
     for t in &inputs {
-        collect_params(t, &mut determined);
+        collect_params(t, &mut in_inputs);
     }
-    loop {
-        let before = determined.len();
-        for r in &requires {
-            let mut in_operands = HashSet::new();
-            for a in &r.args {
-                collect_params(a, &mut in_operands);
-            }
-            if in_operands.is_subset(&determined) {
-                for (_, t) in &r.assoc {
-                    collect_params(t, &mut determined);
-                }
-            }
-        }
-        if determined.len() == before {
-            break;
-        }
-    }
+    let determined = determined_params(in_inputs, &own, &requires);
     if let Some((tp, _)) = type_params
         .iter()
         .zip(&own)
@@ -421,8 +405,8 @@ fn declare_function(
         return Err(LoweringError::unsupported(
             tp.name_span,
             format!(
-                "type parameter `{}` of `{qualified}` appears in no parameter's type, so no \
-                 call's arguments determine it",
+                "type parameter `{}` of `{qualified}` appears in no parameter's type and in no \
+                 determined type parameter's bound, so no call's arguments determine it",
                 tp.name
             ),
         ));

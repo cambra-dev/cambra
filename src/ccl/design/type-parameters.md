@@ -331,6 +331,12 @@ a bound, as for a parameter `x <: T`, the variable takes the types flowing in th
 parameter. No per-use table is kept: cloning re-mints node identities, so a table keyed by a use's
 `NodeId` would miss the uses inside a clone.
 
+Each of the binding's own parameters with a bound is below it in the clone, `𝛼 <: 𝐵[𝛼/𝑃]`, as at an
+instantiation. The definition checked alone discharges an edge through a parameter's bound without
+naming the parameter: `a.at` on `a: T` with `T <: {at: B}` relates `B` to the projection and not
+`T`. A parameter that stands only in another's bound, `B` there, reaches the use's types through
+this edge and no other. It is decided under `NoScope`, as the outward pin is.
+
 Each use substitutes its own types, so an error that only the opaque parameters expose, such as
 two unrelated parameters meeting at one position, never shows in a clone.
 `coalesce_generalized_let` checks every definition alone once its last use is specialized, with
@@ -435,7 +441,10 @@ cutoff at the binding's level, so `pick: forall (T) T => T = inc` reports `inc` 
 - **Bounds.** The type beside a parameter at a negative position is its bound. A parameter that
   occurs once was eliminated by simplification, so its bound is written inline:
   `def at(a): a.at` prints as `forall (A) {at: A} => A`, and `def both(a): (a.at, a)` as
-  `forall (A, B <: {at: A}) B => {A, B}`.
+  `forall (A, B <: {at: A}) B => {A, B}`. An open tuple is the exception: it is written only as a
+  bound ([chl-spec.md, "Tuple width"](../../../docs/chl-spec.md#tuple-width)), so a position
+  holding one is a parameter of its own bounded by it, and `def first(t): t.0` prints as
+  `forall (A, B <: {A, ..}) B => A`.
 - **Requirements.** Each obligation becomes a requirement unless every operand is concrete, which
   the definition already answered. Refinements are dropped, since an instance row matches a base
   whatever its refinements. An obligation a product answered is stated by its components.

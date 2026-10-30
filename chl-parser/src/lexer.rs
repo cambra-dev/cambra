@@ -244,6 +244,11 @@ pub enum Token {
     ColonColon,
     #[token(".")]
     Dot,
+    /// The rest of a tuple's positions, `..`: last in a tuple type, `{A, ..}`, it makes
+    /// the type an open tuple (`docs/chl-spec.md`, "Tuple width"). Longer-match wins over
+    /// two `Dot`s.
+    #[token("..")]
+    DotDot,
     /// Variant-arm introducer `` ` `` (`` `some(1) ``, `` { `some{Int} | `none } ``).
     /// One token marks the form in every position — term, pattern and type —
     /// so a tag never has to be told apart from a name by context.
@@ -503,9 +508,12 @@ pub fn highlight_class(token: &Token) -> Option<HighlightClass> {
         | Token::Lt
         | Token::Gt
         | Token::Question => C::Operator,
-        Token::Comma | Token::Colon | Token::ColonColon | Token::Dot | Token::Semi => {
-            C::Punctuation
-        }
+        Token::Comma
+        | Token::Colon
+        | Token::ColonColon
+        | Token::Dot
+        | Token::DotDot
+        | Token::Semi => C::Punctuation,
         Token::LParen
         | Token::RParen
         | Token::LBracket
@@ -776,6 +784,7 @@ impl fmt::Display for Token {
             Token::ColonEq => ":=",
             Token::ColonColon => "::",
             Token::Dot => ".",
+            Token::DotDot => "..",
             Token::Backtick => "`",
             Token::Semi => ";",
             Token::At => "@",

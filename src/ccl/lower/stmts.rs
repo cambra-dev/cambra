@@ -1319,9 +1319,14 @@ impl TupleAssignment {
             TypedExprNode::Tuple(values) if values.len() == elements.len() => values,
             node => {
                 minted.push((payload.clone(), Expr { node, ..value }, transparency));
+                // The pattern takes apart a tuple of exactly its width, and a projection
+                // fixes no width (`docs/chl-spec.md`, "Tuple width"), so each read states it.
+                let width = Type::Tuple(vec![Type::Hole; elements.len()]);
                 (0..elements.len())
                     .map(|i| {
-                        let read = ctx.tag_machinery(Expr::var(payload.as_str()), span, label);
+                        let read = ctx
+                            .tag_machinery(Expr::var(payload.as_str()), span, label)
+                            .with_user_annotation(width.clone());
                         let proj = ctx.tag_machinery(Expr::proj_index(i), span, label);
                         ctx.tag_machinery(Expr::apply(read, proj), span, label)
                     })
@@ -1810,11 +1815,34 @@ pub(super) fn lower_type_annotation(
     annotation: &TypeAnnotation,
     ctx: &mut LoweringContext,
 ) -> Result<Type, LoweringError> {
-    let ty = lower_type_expr(&annotation.ty, ctx)?;
     Ok(match annotation.mode {
-        AnnotationMode::Exact => ty,
-        AnnotationMode::Bounded => Type::BoundedHole(Box::new(ty)),
+        AnnotationMode::Exact => lower_type_expr(&annotation.ty, ctx)?,
+        AnnotationMode::Bounded => {
+            Type::BoundedHole(Box::new(lower_type_bound(&annotation.ty, ctx)?))
+        }
     })
+}
+
+/// Lower `bound`, the type written after `<:` on a value parameter or a binding: an ordinary
+/// type, or one with an open tuple `{A, ..}` at a position that stays on the right of the
+/// bound's check, a tuple or record component or a function's result (`docs/chl-spec.md`,
+/// "Tuple width").
+pub(super) fn lower_type_bound(
+    bound: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Type, LoweringError> {
+    ctx.open_tuples = OpenTuples::Bound;
+    lower_type_expr(bound, ctx)
+}
+
+/// Lower `bound`, a type parameter's bound: an ordinary type, or an open tuple `{A, ..}` as
+/// the whole bound (`docs/chl-spec.md`, "Tuple width").
+pub(super) fn lower_type_parameter_bound(
+    bound: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Type, LoweringError> {
+    ctx.open_tuples = OpenTuples::TypeParameterBound;
+    lower_type_expr(bound, ctx)
 }
 
 /// `out: Feed(V)` declared at `span`: the name, the channel bound to it, and the type the
@@ -1873,6 +1901,10 @@ pub(super) fn lower_let_annotation(
     if let Some(ty) = feed_annotation_type(annotation, name, annotation.ty.span, ctx) {
         return ty;
     }
+    ctx.open_tuples = match annotation.mode {
+        AnnotationMode::Bounded => OpenTuples::Bound,
+        AnnotationMode::Exact => OpenTuples::Refused,
+    };
     let ty = lower_type_expr_or_poly(&annotation.ty, ctx)?;
     if annotation.mode == AnnotationMode::Bounded {
         if matches!(ty, Type::Poly(_)) {
@@ -2004,7 +2036,7 @@ fn lower_bound(
             (p.id, tp.name.as_str())
         })
         .collect();
-    let lowered = lower_type_expr(bound, ctx);
+    let lowered = lower_type_parameter_bound(bound, ctx);
     ctx.restore_type_aliases(snapshot);
     let lowered = lowered?;
     fn named(ty: &Type, ids: &[(crate::ccl::ty::TypeParamId, &str)]) -> Option<usize> {
@@ -2580,6 +2612,18 @@ pub(super) fn lower_type_expr_or_poly(
     annotation: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Type, LoweringError> {
+    let open_tuples = std::mem::take(&mut ctx.open_tuples);
+    // A position that keeps the bound on the right of its check.
+    let covariant = |child: &Spanned<ChlExpr>, ctx: &mut LoweringContext| {
+        ctx.open_tuples = match open_tuples {
+            OpenTuples::Refused => OpenTuples::Refused,
+            OpenTuples::Bound => OpenTuples::Bound,
+            OpenTuples::TypeParameterBound | OpenTuples::UnderTypeParameterBound => {
+                OpenTuples::UnderTypeParameterBound
+            }
+        };
+        lower_type_expr(child, ctx)
+    };
     match &annotation.node {
         // A primitive (`Int`), a type alias, or the wildcard `_`. A lone name is
         // never a variant: a tag is written with its backtick wherever it appears.
@@ -2675,7 +2719,7 @@ pub(super) fn lower_type_expr_or_poly(
             for field in fields {
                 out.push((
                     ctx.label(&field.qualifier, &field.name, field.name_span)?,
-                    lower_type_expr(&field.value, ctx)?,
+                    covariant(&field.value, ctx)?,
                 ));
             }
             Ok(Type::Record(out))
@@ -2702,10 +2746,41 @@ pub(super) fn lower_type_expr_or_poly(
                 annotation.span,
                 "a variant type separates its arms with `|`: `` {`a | `b{Int}} ``",
             )),
+            // An open tuple `{T, ..}`: the parser puts `..` last, after a position.
+            [positions @ .., rest] if matches!(rest.node, ChlExpr::Rest) => {
+                match open_tuples {
+                    OpenTuples::Bound | OpenTuples::TypeParameterBound => {}
+                    OpenTuples::Refused => {
+                        return Err(LoweringError::unsupported(
+                            annotation.span,
+                            "an open tuple `{T, ..}` is a bound, not a type: no value has it, \
+                             because a tuple value has one width. Write it after `<:`: as a \
+                             type parameter's bound (`U <: {T, ..}`), or on a parameter or a \
+                             binding (`t <: {T, ..}`), where it may also be a tuple or record \
+                             component or a function's result",
+                        ));
+                    }
+                    OpenTuples::UnderTypeParameterBound => {
+                        return Err(LoweringError::unsupported(
+                            annotation.span,
+                            "in a type parameter's bound, an open tuple `{T, ..}` is the whole \
+                             bound: what the definition reads through the parameter has the \
+                             bound's types, and no value has an open tuple's. Bound a type \
+                             parameter of its own by it and name that here: \
+                             `B <: {T, ..}, U <: {p: B}`",
+                        ));
+                    }
+                }
+                let mut out = Vec::with_capacity(positions.len());
+                for part in positions {
+                    out.push(covariant(part, ctx)?);
+                }
+                Ok(Type::OpenTuple(out))
+            }
             _ => {
                 let mut out = Vec::with_capacity(parts.len());
                 for part in parts {
-                    out.push(lower_type_expr(part, ctx)?);
+                    out.push(covariant(part, ctx)?);
                 }
                 Ok(Type::Tuple(out))
             }
@@ -2752,7 +2827,7 @@ pub(super) fn lower_type_expr_or_poly(
         // written with its own constructor, never with `=>`.
         ChlExpr::FunctionType { domain, codomain } => Ok(Type::fun(
             lower_type_expr(domain, ctx)?,
-            lower_type_expr(codomain, ctx)?,
+            covariant(codomain, ctx)?,
         )),
         // A parenthesised comma list `(T, U)` is a *term* product; the tuple *type* is
         // written with braces `{T, U}` (`docs/chl-spec.md`). `->` builds the same node, so
@@ -2988,6 +3063,7 @@ fn describe_type_form(e: &ChlExpr) -> &'static str {
         ChlExpr::Error => "a malformed expression",
         ChlExpr::Qualified(_) => "a qualified name",
         ChlExpr::MethodCall { .. } => "a method call",
+        ChlExpr::Rest => unreachable!("the parser builds `..` only last in a brace group"),
         // The forms with their own arms in `lower_type_expr` never reach here.
         ChlExpr::Name(_)
         | ChlExpr::BraceRecord(_)

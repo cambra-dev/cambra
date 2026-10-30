@@ -550,7 +550,7 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
             emit_annotation_predicates(d, ctx)?;
             emit_annotation_predicates(c, ctx)
         }
-        Type::Tuple(ts) | Type::Nominal(_, ts) => {
+        Type::Tuple(ts) | Type::OpenTuple(ts) | Type::Nominal(_, ts) => {
             for t in ts.iter_mut() {
                 emit_annotation_predicates(t, ctx)?;
             }
@@ -2621,18 +2621,17 @@ pub(super) fn emit_begin<C: Typing>(
 /// Build the open-product shape a projection of `key` requires its input to
 /// satisfy: the input must carry field/position `key` typed `field_ty`.
 ///
-/// `ccl::Type` has no sparse-index product, so an *index* projection pads to a
-/// dense `Tuple` of length `i+1` with fresh vars in positions `0..i` and
-/// `field_ty` at `i`; tuple width-subtyping (a longer tuple is a subtype) then
-/// admits any tuple with at least `i+1` positions. A *named* projection uses an
-/// open `Record{name: field_ty}`; record width-subtyping admits any record
-/// carrying that field.
+/// An *index* projection `.𝑖` requires the open tuple of `𝑖 + 1` positions, fresh
+/// variables in positions `0..𝑖` and `field_ty` at `𝑖`. It fixes no width: the input's
+/// own tuple does (`docs/chl-spec.md`, "Tuple width"). A *named* projection uses
+/// `Record{name: field_ty}`; record width-subtyping admits any record carrying that
+/// field.
 fn proj_requirement<C: Typing>(key: &ProjKey, field_ty: Type, ctx: &mut C) -> Type {
     match key {
         ProjKey::Index(i) => {
             let mut positions: Vec<Type> = (0..*i).map(|_| ctx.fresh()).collect();
             positions.push(field_ty);
-            Type::Tuple(positions)
+            Type::OpenTuple(positions)
         }
         ProjKey::Field(name) => Type::Record(vec![(name.clone(), field_ty)]),
     }

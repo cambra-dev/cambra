@@ -349,6 +349,24 @@ pub struct LoweredRoute {
     pub(super) path: String,
 }
 
+/// Where the type being lowered may be an open tuple `{A, ..}`, which is written only as an
+/// upper bound (`docs/chl-spec.md`, "Tuple width").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum OpenTuples {
+    /// Nowhere: every type outside a bound, and a contravariant position inside one.
+    #[default]
+    Refused,
+    /// A value parameter's or a binding's bound: the type, and the tuple and record
+    /// components and function results below it.
+    Bound,
+    /// A type parameter's bound: the type itself only.
+    TypeParameterBound,
+    /// A tuple or record component or a function's result below a type parameter's bound.
+    /// What a definition reads through the parameter has the bound's types, and no value
+    /// has an open tuple's, so one here is refused with a hint to name it.
+    UnderTypeParameterBound,
+}
+
 /// Context for CHL → CCL lowering that carries registered data sources and sinks.
 ///
 /// Zero-argument function calls whose name appears in `sources` are lowered to
@@ -485,6 +503,13 @@ pub struct LoweringContext {
     /// same-named alias in the body is an error rather than a shadow
     /// (`docs/chl-spec.md`, "Type parameters"), which is what this answers.
     pub(super) type_params_in_scope: Vec<String>,
+
+    /// Whether the type [`lower_type_expr`](stmts::lower_type_expr) lowers next may be an
+    /// open tuple `{A, ..}`: set by [`lower_type_bound`](stmts::lower_type_bound) and
+    /// [`lower_type_parameter_bound`](stmts::lower_type_parameter_bound), passed down to the
+    /// positions that stay on the right of the bound's check, and cleared on entry, so
+    /// every other position refuses one (`docs/chl-spec.md`, "Tuple width").
+    pub(super) open_tuples: OpenTuples,
 
     /// The nominal types the module declares, by name (`docs/chl-spec.md`, "Declaring a
     /// nominal type"). Unlike an alias, a nominal type survives lowering as a
@@ -1441,6 +1466,7 @@ fn lower_expr_inner(
             "`{…}` is type syntax (a tuple type `{T, U}`); \
              use `[…]` for a collection or `(…)` for a tuple value",
         )),
+        ChlExpr::Rest => unreachable!("the parser builds `..` only last in a brace group"),
         // A brace record `{name: T}` is structural *type* syntax (a record
         // type); a record *value* is written with parentheses. (Accepted in
         // annotation position — see `lower_type_annotation`.)

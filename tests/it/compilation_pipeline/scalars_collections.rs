@@ -890,11 +890,25 @@ fn test_tuple_patterns(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
-/// A tuple pattern taking apart a value that is no tuple is refused, naming the projection of
-/// the component it takes, which the program never wrote.
+/// A tuple pattern takes apart a tuple of exactly its width, literal or not
+/// (`docs/chl-spec.md`, "Tuple width").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_wider_literal("a, b = (1, 2, 3)\na\n")]
+#[case::a_wider_value("t = (1, 2, 3)\na, b = t\na\n")]
+#[case::a_narrower_value("t = (1, 2)\na, b, c = t\na\n")]
+fn a_tuple_pattern_takes_apart_a_tuple_of_its_width(#[case] code: &str) {
+    check_compile_error(code, "tuples of different widths are different types");
+}
+
+/// A tuple pattern taking apart a value that is no tuple is refused, naming the tuple the
+/// pattern takes apart.
 #[test]
-fn a_tuple_pattern_over_a_scalar_names_its_projection() {
-    check_compile_error("a, b = 5\na\n", "Type mismatch for projection `.0`");
+fn a_tuple_pattern_over_a_scalar_names_the_tuple_it_takes_apart() {
+    check_compile_error(
+        "a, b = 5\na\n",
+        "annotated as {_, _}, but inferred as {Int where _ == 5}",
+    );
 }
 
 /// A name a destructuring pattern binds is a binding like any other to a loop's mutation

@@ -382,8 +382,8 @@ edges above are not a complete specification of those cases.
 
 The rule does not emit a reverse `domain <: arg_ty` edge to determine a projection's width.
 A projection such as `.0` imposes a requirement on one field, not a closed arity. Its emitted
-tuple requirement is a dense prefix with fresh fillers before the selected field
-(`proj_requirement`), because `Type::Tuple` has no sparse, minimum-arity form.
+tuple requirement is an open tuple, fresh fillers before the selected field
+(`proj_requirement`), which fixes no width ([Tuple width](#tuple-width)).
 
 Projection width is supplied during coalescing, not by reversing the application constraint.
 See [Closing the single-sided blind spots](#closing-the-single-sided-blind-spots-no-separate-pass)
@@ -459,13 +459,58 @@ original bound-graph variable identities as output type variables.
 
 Product materialization in `materialize_record` additionally distinguishes field keys:
 
-- Dense index keys produce `Type::Tuple`.
+- Index keys are a dense prefix and materialize by the position's `TupleWidth`
+  ([Tuple width](#tuple-width)): `Exactly` as a `Type::Tuple`, `AtLeast` as a
+  `Type::OpenTuple`, and `Conflict` as `IncompatibleBounds`.
 - Name keys produce `Type::Record`; open versus closed named width is not represented at this layer.
-- Sparse index keys leave a fresh `Infer`. Their children are still visited before the shape is
-  discarded, so nested materialization errors are not skipped.
 - Mixed index and name keys produce `UnresolvedPartial`.
 
 The solver does not invent an untagged sum to resolve incompatible concrete shapes.
+
+#### Tuple width
+
+A tuple's width is part of its type ([chl-spec.md, "Tuple width"](../../../docs/chl-spec.md#tuple-width)).
+`Type::Tuple` is a closed tuple, and `Type::OpenTuple` lists a prefix of positions and fixes no
+width. `constrain_go` relates them as the lattice the spec states:
+
+| Left | Right | Rule |
+| --- | --- | --- |
+| `Tuple` | `Tuple` | equal widths, then position by position; otherwise `Mismatch` |
+| `Tuple` or `OpenTuple` | `OpenTuple` | the left lists at least the right's positions, each compared; otherwise `MissingField` at the widest position demanded |
+| `OpenTuple` | `Tuple` | `Mismatch` |
+
+An open tuple reaches the left side only as a type parameter's bound, met while its definition is
+checked with the parameter opaque.
+
+Compaction keeps a tuple's positions in the `rec` slot beside a `TupleWidth`: `Exactly(𝑛)` for a
+`Tuple`, `AtLeast { listed: 𝑛, closed: None }` for an `OpenTuple`. The key sets already merge as
+positions do, a positive merge's intersection of two prefixes being the shorter and a negative
+merge's union the longer, so the width is the one fact `rec` cannot carry.
+
+A negative merge is the meet: `Exactly(𝑛)` with `AtLeast(𝑝)` is `Exactly(𝑛)` when `𝑛 ≥ 𝑝`, two
+open widths meet at the longer, and anything else is `Conflict`. A positive merge joins, except
+that two closed widths that differ conflict, so an open width records the closed width a join put
+under it (`closed`). A positive merge is then the componentwise combination of the shortest width
+listed, whether any width is open, and the closed widths seen, and is `Conflict` exactly when two
+closed widths differ. Both merges are associative and commutative
+and idempotent (`tuple_width_merge_is_order_independent`), so a position's width does not depend on
+the order of its bounds. For idempotence a negative merge keeps a recorded `closed` width only where
+both sides record the same one.
+
+A `Conflict` is absorbing and materializes as `IncompatibleBounds` naming both widths, so
+`(1, 2) if c else (1, 2, 3)` is refused at the join rather than read as its common positions.
+
+A width is fixed where a position materializes. A parameter that projections reach reads its
+argument's closed tuple from the opposite side
+([Closing the single-sided blind spots](#closing-the-single-sided-blind-spots-no-separate-pass)),
+and a specialization fixes it per use. An open tuple left on a node or a binder after coalescing
+is `InferError::UnresolvedTupleWidth`, which the post-inference wall reports as a user error, once
+per tuple: at the innermost node holding it, and once per variable however often it is read
+(`one_per_unfixed_width`).
+Lowering states the width wherever it builds a tuple that the program only projects: a
+multi-parameter `def`'s argument tuple binder (`lower::functions`), a multi-generator
+comprehension's iteration record binder (`comprehension::encode`), and each read of a tuple
+pattern's payload (`TupleAssignment`).
 
 ### Closing the single-sided blind spots (no separate pass)
 
@@ -1091,7 +1136,9 @@ over-splitting costs one redundant clone. Keying on a materialized type narrows 
 clone typed `.1` as `2`. Undetermined positions use a canonical empty view, not a fresh
 placeholder identity. Conflicting contributions can coexist in a key; ordinary resolution, not the
 key, reports type conflicts. Refinement comparisons are type-blind and compare sets rather than
-insertion order.
+insertion order. A tuple contribution keys its width beside its positions, closed or open, as
+compaction keeps it ([Tuple width](#tuple-width)), so a closed tuple and an open one listing the
+same positions do not share a clone.
 
 A barrier variable keys as its resolution in both reads: its lower bounds, each read at positive
 polarity, with the refinements at their covariant positions dropped (`KeyView`'s
@@ -3954,15 +4001,16 @@ uses the projected field type as its codomain.
 
 | Key | Requirement |
 | --- | --- |
-| Position `𝑛` | A tuple of width `𝑛+1`, with fresh variables before the projected position |
+| Position `𝑛` | The open tuple of `𝑛+1` positions, fresh variables before the projected one |
 | Field `x` | A single-field record `{x: ?a}`, with result `?a` |
 
-There is no partial-product type constructor. Width subtyping accepts a larger tuple or
-record with the required field. A dependent projection opens its recorded codomain before
-using that type in the domain requirement.
+An open tuple accepts every tuple listing at least its positions
+([Tuple width](#tuple-width)), and record width subtyping accepts a record with the required
+field. A dependent projection opens its recorded codomain before using that type in the domain
+requirement.
 
-Tuple requirements are dense, so demanding position `𝑛` also allocates preceding slots.
-Diagnostics account for this representation:
+An open tuple lists every position up to the projected one, so demanding position `𝑛` also
+allocates preceding slots. Diagnostics account for this representation:
 
 - An out-of-range projection reports the widest demanded position, not the first absent
   padding position. Thus `t.99` on a three-element tuple reports position 99, not 3.

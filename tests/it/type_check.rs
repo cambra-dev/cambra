@@ -3444,9 +3444,9 @@ fn projection_through_an_inferred_parameter() {
 /// The diagnostics for a projection that cannot land say what the shape actually has.
 ///
 /// Both failures otherwise report a shape the program never had, because a positional
-/// requirement is a *dense* tuple (`.99` demands 100 positions) and a named one is a
-/// one-field record — partial shapes that read as internal machinery next to the value's
-/// own type.
+/// requirement is an open tuple of every position up to the one asked for (`.99` demands
+/// 100 positions) and a named one is a one-field record — partial shapes that read as
+/// internal machinery next to the value's own type.
 #[test]
 fn projection_diagnostics_name_the_shape() {
     // Past the end of a tuple: the position asked for, and the width there is.
@@ -5776,19 +5776,15 @@ fn a_product_keys_a_collection() {
         .is_empty(),
         "a bare Int key must not reach a pair-keyed map"
     );
-    // A **wider** key is below that type, records being width-subtyped, so it types and
-    // can never be present: a key is found by value identity, and a three-field value
-    // equals no two-field one. Pinned rather than asserted as right — what would reject it
-    // is the shape agreement the trait states, delivered incrementally at a keyed access
-    // the way `Equatable` states it between two operands.
-    assert_eq!(
-        infer_program(indoc! {r#"
-            m = map([((1, 2), 10), ((3, 4), 20)])
-            m[(1, 2, 3)]?
-        "#})
-        .to_string(),
-        "Option(Int)",
-        "a wider key types; it is the absent case at runtime"
+    // A tuple's width is part of its type, so a wider key is not the key type.
+    let errs = infer_program_err(indoc! {r#"
+        m = map([((1, 2), 10), ((3, 4), 20)])
+        m[(1, 2, 3)]?
+    "#});
+    assert!(
+        errs.iter()
+            .any(|e| format!("{e:?}").contains("tuples of different widths")),
+        "a 3-tuple key must not reach a pair-keyed map, got {errs:?}"
     );
 }
 /// A checked lookup on a `map` answers the value type, where the same lookup on a `set`

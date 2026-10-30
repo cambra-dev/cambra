@@ -498,6 +498,7 @@ pub(super) fn mentioned_names(expr: &ChlExpr, names: &mut HashSet<SmolStr>) {
         // None of these is a type. Lowering the argument as one refuses it.
         ChlExpr::Lit(_)
         | ChlExpr::Error
+        | ChlExpr::Rest
         | ChlExpr::Forall { .. }
         | ChlExpr::Lambda { .. }
         | ChlExpr::IfExp { .. }

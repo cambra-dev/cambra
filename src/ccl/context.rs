@@ -1699,12 +1699,13 @@ impl ProvenanceAudit {
 /// pre-channelize check, which permits the transient `Feed` /
 /// `Infer`-channel-domain types only channelization erases.
 ///
-/// A failure is a compiler bug, with one exception: residual `Type::Infer`
+/// A failure is a compiler bug, with two exceptions: residual `Type::Infer`
 /// variables, which inference deliberately tolerates for a generalized
 /// definition the program never exercises at a concrete type (see
-/// `Type::Infer`'s invariant). That residue is an *ambiguous program* — a user
-/// error — so it is rendered as a diagnostic; anything else panics, naming
-/// `boundary`.
+/// `Type::Infer`'s invariant), and open tuples, whose width nothing in the program
+/// fixed (`docs/chl-spec.md`, "Tuple width"). That residue is an *ambiguous
+/// program* — a user error — so it is rendered as a diagnostic; anything else
+/// panics, naming `boundary`.
 fn pre_channelize_wall(
     expr: &Expr,
     boundary: &str,
@@ -1712,10 +1713,12 @@ fn pre_channelize_wall(
     instances: &Rc<InstanceTable>,
 ) -> Result<(), Vec<CompileError>> {
     check_pre_channelize_located(expr, instances).map_err(|errs| {
-        if errs
-            .iter()
-            .all(|e| matches!(e.error, InferError::UnresolvedInfer { .. }))
-        {
+        if errs.iter().all(|e| {
+            matches!(
+                e.error,
+                InferError::UnresolvedInfer { .. } | InferError::UnresolvedTupleWidth { .. }
+            )
+        }) {
             blame.infer(errs, expr)
         } else {
             let errs: Vec<&InferError> = errs.iter().map(|e| &e.error).collect();

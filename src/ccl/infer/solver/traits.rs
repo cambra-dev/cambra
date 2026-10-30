@@ -3012,7 +3012,7 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
             // bound must not hide the structure underneath it.
             match peel_refinements(&bound.ty) {
                 Type::Infer(up) => frontier.push((Rc::clone(up), path.clone())),
-                Type::Tuple(elems) => {
+                Type::Tuple(elems) | Type::OpenTuple(elems) => {
                     for (i, elem) in elems.iter().enumerate() {
                         descend(elem, &path, Step::Field(FieldKey::Index(i)), &mut frontier);
                     }

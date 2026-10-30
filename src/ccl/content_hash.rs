@@ -308,7 +308,7 @@ fn hash_type<'a>(
                 depth.hash(state);
             }
         }
-        T::Tuple(tys) => {
+        T::Tuple(tys) | T::OpenTuple(tys) => {
             tys.len().hash(state);
             for t in tys {
                 hash_type(t, env, wenv, free, state);

@@ -107,7 +107,7 @@ describe("T1: B5 hole -> downstream-type stitch (resolvedTypesFor)", () => {
     expect(store.resolvedTypesFor("pre-inference", lit.nodeId)).toEqual(["Int@10"]);
 
     const lambda = theNode(pre, "Lambda(__arg_tuple_0)");
-    expect(lambda.type).toBe("(_ ⇒ _)"); // a function-shaped hole
+    expect(lambda.type).toBe("((_, _) ⇒ _)"); // a function of two parameters, types still holes
     expect(store.resolvedTypesFor("pre-inference", lambda.nodeId)).toEqual([
       "((Int@1, Int@2) ⇒ Int)",
     ]);

@@ -100,7 +100,7 @@ def refinementSlotEmpty : Option (List Predicate) → Bool
 
 /-- See [`atomsOneRange`] for why the atom condition is spelled the way it is. -/
 def denotesAUIntRange : CompactTy → Bool
-  | .mk atoms recF varT fn refinements =>
+  | .mk atoms recF varT fn refinements _ =>
     atomsOneRange atoms
       && recF.isNone && varT.isNone && fn.isNone
       && refinementSlotEmpty refinements
@@ -148,7 +148,7 @@ two, which is all any caller asks.
 rather than reconciling them. Refinements are not a shape: they ride the one shape there is, so
 `{Int | p}` names one. -/
 def shapes : CompactTy → Nat
-  | .mk atoms rec var fn _ =>
+  | .mk atoms rec var fn _ _ =>
     let a := if atoms.isEmpty then 0 else if atomsNameAtMostOne atoms then 1 else 2
     min 2 (a + (if rec.isSome then 1 else 0) + (if var.isSome then 1 else 0)
              + (if fn.isSome then 1 else 0))
@@ -157,8 +157,9 @@ mutual
 
 /-- Does this position, or any below it, name two shapes where coalesce admits one? -/
 def conflicted : CompactTy → Bool
-  | .mk atoms rec var fn r =>
-    shapes (.mk atoms rec var fn r) > 1
+  | .mk atoms rec var fn r width =>
+    shapes (.mk atoms rec var fn r width) > 1
+      || width == some .conflict
       || (match rec with
           | none => false
           | some m => conflictedKeys m (m.map Prod.fst))
@@ -442,7 +443,7 @@ theorem mem_atoms_congr {a1 a2 : List Atom}
     {r1 r2 v1 v2 : Option (List (FieldKey × CompactTy))}
     {f1 f2 : Option (KindMerge × CompactTy × CompactTy)}
     {c1 c2 : Option (List Predicate)}
-    (h : CompactTy.equiv (.mk a1 r1 v1 f1 c1) (.mk a2 r2 v2 f2 c2) = true) :
+    (h : CompactTy.equiv (.mk a1 r1 v1 f1 c1 wd1) (.mk a2 r2 v2 f2 c2 wd2) = true) :
     ∀ a, a ∈ a1 ↔ a ∈ a2 := by
   rw [CompactTy.equiv.eq_def] at h
   simp only [Bool.and_eq_true] at h
@@ -504,7 +505,7 @@ theorem refinementSlotEmpty_congr : (c1 c2 : Option (List Predicate)) →
 it. -/
 theorem denotesAUIntRange_congr : (x y : CompactTy) → CompactTy.equiv x y = true →
     denotesAUIntRange x = denotesAUIntRange y
-  | .mk a1 r1 v1 f1 c1, .mk a2 r2 v2 f2 c2 => by
+  | .mk a1 r1 v1 f1 c1 wd1, .mk a2 r2 v2 f2 c2 wd2 => by
     intro hEq
     have h := hEq
     rw [CompactTy.equiv.eq_def] at h
@@ -688,12 +689,12 @@ instance that `#guard` computes outright.
 -/
 
 /-- The merge's identity: no shape, so no type and no constraint either. -/
-def wEmpty : CompactTy := .mk [] none none none (some [])
+def wEmpty : CompactTy := .mk [] none none none (some []) none
 
 /-- Three positions that name a type, no two of them comparable. -/
-def wInt : CompactTy := .mk [.prim .int] none none none (some [])
-def wBool : CompactTy := .mk [.prim .bool] none none none (some [])
-def wR3 : CompactTy := .mk [.uintRange 3] none none none (some [])
+def wInt : CompactTy := .mk [.prim .int] none none none (some []) none
+def wBool : CompactTy := .mk [.prim .bool] none none none (some []) none
+def wR3 : CompactTy := .mk [.uintRange 3] none none none (some []) none
 
 #guard [wEmpty, wInt, wBool, wR3].all CompactTy.wellFormed
 
@@ -1080,8 +1081,8 @@ record or a function.
 
 /-- Six positions: the two degenerate readings and four that name a type. -/
 def checkTys : List CompactTy :=
-  [wEmpty, wInt, wBool, wR3, .mk [.uintRange 4] none none none (some []),
-    .mk [.prim .int, .uintRange 3] none none none (some [])]
+  [wEmpty, wInt, wBool, wR3, .mk [.uintRange 4] none none none (some []) none,
+    .mk [.prim .int, .uintRange 3] none none none (some []) none]
 
 /-- Every kind over [`checkTys`] that the grammar spells. -/
 def checkKinds : List CompactTypeKind :=

@@ -339,7 +339,10 @@ pub(super) fn uncurry_params(
             None => Type::Hole,
         });
     }
-    let mut lam = Expr::lambda(&tuple_name, Type::Hole, body_with_subs);
+    // The tuple has one position per parameter. The body only projects it, which fixes no
+    // width (`docs/chl-spec.md`, "Tuple width"), so the binder states it.
+    let arity = Type::Tuple(vec![Type::Hole; params.len()]);
+    let mut lam = Expr::lambda(&tuple_name, arity, body_with_subs);
     if elem_anns.iter().any(|t| !matches!(t, Type::Hole))
         && let TypedExprNode::Lambda { param, .. } = &mut lam.node
     {
@@ -500,31 +503,7 @@ pub(super) fn lower_def_declared(
     if declared.is_empty() && requires.is_empty() {
         return Ok((func, None));
     }
-    // Every type parameter is determined by a call's arguments: it appears in a
-    // value parameter's annotation, or it is the associated type of a requirement
-    // whose operands are determined (`docs/chl-spec.md`, "Type parameters").
-    let mut mentioned = parameter_annotation_params(&func);
-    loop {
-        let before = mentioned.len();
-        for r in &requires {
-            // An operand can be a product; every parameter in it has to be known.
-            let mut in_operands = HashSet::new();
-            for a in &r.args {
-                collect_params(a, &mut in_operands);
-            }
-            let operands_known = in_operands.is_subset(&mentioned);
-            if operands_known {
-                for (_, t) in &r.assoc {
-                    if let Type::Param(param) = t {
-                        mentioned.insert(param.id);
-                    }
-                }
-            }
-        }
-        if mentioned.len() == before {
-            break;
-        }
-    }
+    let mentioned = determined_params(parameter_annotation_params(&func), &declared, &requires);
     if let Some((Some(span), d)) = spans
         .iter()
         .zip(&declared)
@@ -533,8 +512,8 @@ pub(super) fn lower_def_declared(
         return Err(LoweringError::unsupported(
             *span,
             format!(
-                "type parameter `{}` appears in no parameter's annotation, so no call's \
-                 arguments determine it",
+                "type parameter `{}` appears in no parameter's annotation and in no determined \
+                 type parameter's bound, so no call's arguments determine it",
                 d.param.spelling
             ),
         ));
@@ -547,9 +526,42 @@ pub(super) fn lower_def_declared(
     Ok((func, Some(poly)))
 }
 
-/// The type parameters the annotations on `func`'s parameters name: the binders of
-/// the lambda chain `uncurry_params` builds, one lambda for an uncurried definition
-/// and one per parameter for a `Mut`-parameter one.
+/// The type parameters a call's arguments determine (`docs/chl-spec.md`, "Type
+/// parameters"): `determined`, those the parameters' types name, then, until nothing is
+/// added, those in the bound of a determined one of `params`, and the associated types of
+/// each requirement whose operands are all determined.
+pub(super) fn determined_params(
+    mut determined: HashSet<crate::ccl::ty::TypeParamId>,
+    params: &[crate::ccl::ty::PolyParam],
+    requires: &[Rc<crate::ccl::ty::TraitRequirement>],
+) -> HashSet<crate::ccl::ty::TypeParamId> {
+    loop {
+        let before = determined.len();
+        for p in params {
+            if determined.contains(&p.param.id)
+                && let Some(bound) = p.bound()
+            {
+                collect_params(bound, &mut determined);
+            }
+        }
+        for r in requires {
+            // An operand can be a product; every parameter in it has to be known.
+            let mut in_operands = HashSet::new();
+            for a in &r.args {
+                collect_params(a, &mut in_operands);
+            }
+            if in_operands.is_subset(&determined) {
+                for (_, t) in &r.assoc {
+                    collect_params(t, &mut determined);
+                }
+            }
+        }
+        if determined.len() == before {
+            return determined;
+        }
+    }
+}
+
 /// Every type parameter `ty` names, into `out`.
 pub(super) fn collect_params(ty: &Type, out: &mut HashSet<crate::ccl::ty::TypeParamId>) {
     if let Type::Param(param) = ty {
@@ -558,6 +570,9 @@ pub(super) fn collect_params(ty: &Type, out: &mut HashSet<crate::ccl::ty::TypePa
     ty.walk_children(|child| collect_params(child, out));
 }
 
+/// The type parameters the annotations on `func`'s parameters name: the binders of
+/// the lambda chain `uncurry_params` builds, one lambda for an uncurried definition
+/// and one per parameter for a `Mut`-parameter one.
 fn parameter_annotation_params(func: &Expr) -> HashSet<crate::ccl::ty::TypeParamId> {
     let collect = collect_params;
     let mut out = HashSet::new();
@@ -719,7 +734,7 @@ def add(x, y):
     x + y
 add",
         "\
-let add : (_ ⇒ _) = λ __arg_tuple_0 → __arg_tuple_0.0 + __arg_tuple_0.1
+let add : ((_, _) ⇒ _) = λ __arg_tuple_0 : (_, _) → __arg_tuple_0.0 + __arg_tuple_0.1
 in add"
     )]
     fn test_lower_function_def(#[case] code: &str, #[case] expected: &str) {

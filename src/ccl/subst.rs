@@ -1656,7 +1656,9 @@ impl Subst {
                 self.rewrite_type_go(base, memo);
             }
 
-            Type::Tuple(ts) => ts.iter_mut().for_each(|t| self.rewrite_type_go(t, memo)),
+            Type::Tuple(ts) | Type::OpenTuple(ts) => {
+                ts.iter_mut().for_each(|t| self.rewrite_type_go(t, memo))
+            }
             // A component's name binds the components after it, as a `Fun`'s binds
             // its codomain.
             Type::DepTuple(cs) => {
@@ -1954,6 +1956,7 @@ impl Subst {
             }
 
             Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| self.apply_type(t)).collect()),
+            Type::OpenTuple(ts) => Type::OpenTuple(ts.iter().map(|t| self.apply_type(t)).collect()),
             Type::DepTuple(cs) => {
                 let mut restricted = self.clone();
                 let mut out = Vec::with_capacity(cs.len());
@@ -2252,7 +2255,7 @@ fn collect_type_fv(
             }
             collect_type_fv(base, bound, visited, out);
         }
-        Type::Tuple(ts) => ts
+        Type::Tuple(ts) | Type::OpenTuple(ts) => ts
             .iter()
             .for_each(|t| collect_type_fv(t, bound, visited, out)),
         // A component's name is bound in the components after it.
@@ -2873,7 +2876,7 @@ impl<'a> PiWalk<'a> {
                 self.ty(base, depth);
                 refinements.rewrite_each(|_, r| self.refinement(r, depth));
             }
-            Type::Tuple(ts) => ts.iter_mut().for_each(|t| self.ty(t, depth)),
+            Type::Tuple(ts) | Type::OpenTuple(ts) => ts.iter_mut().for_each(|t| self.ty(t, depth)),
             // Component `𝑘` sits inside the scopes of the `𝑘` components before it.
             Type::DepTuple(cs) => {
                 let base = self.shadowed.len();
@@ -3131,7 +3134,9 @@ pub fn references_binder_within(ty: &Type, within: u32) -> bool {
                         && expr_scan(&r.predicate, depth, within, visited)
                 }) || ty_scan(base, depth, within, visited)
             }
-            Type::Tuple(ts) => ts.iter().any(|t| ty_scan(t, depth, within, visited)),
+            Type::Tuple(ts) | Type::OpenTuple(ts) => {
+                ts.iter().any(|t| ty_scan(t, depth, within, visited))
+            }
             Type::DepTuple(cs) => cs
                 .iter()
                 .enumerate()
