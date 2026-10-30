@@ -745,6 +745,42 @@ fn the_control_port_answers_a_diff_request() {
     );
 }
 
+/// A web page cannot reload the program: the cross-site `POST` a page can send
+/// without a preflight carries `Origin`, and the control port refuses it.
+#[test]
+fn the_control_port_refuses_a_request_from_a_web_page() {
+    const V1: &str = "[\"> \" + line for line in stdin()]\n";
+    const V2: &str = "[\">> \" + line for line in stdin()]\n";
+
+    let launched = launch_under_control(V1);
+    let control = launched.control;
+    let reload = |headers: &str| {
+        raw_http_response(
+            control,
+            &format!(
+                "POST /reload HTTP/1.1\r\nHost: 127.0.0.1:{control}\r\n{headers}\
+                 Content-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{V2}",
+                V2.len()
+            ),
+        )
+    };
+
+    let from_a_page = reload("Origin: http://example.com\r\nSec-Fetch-Site: cross-site\r\n");
+    assert!(from_a_page.starts_with("HTTP/1.1 403"), "{from_a_page}");
+    let info = raw_http(
+        control,
+        &format!(
+            "GET /branch/main/info HTTP/1.1\r\nHost: 127.0.0.1:{control}\r\n\
+             Connection: close\r\n\r\n"
+        ),
+    );
+    assert!(info.contains("> \""), "main still runs v1: {info}");
+    assert!(!info.contains(">> \""), "main still runs v1: {info}");
+
+    let from_curl = reload("");
+    assert!(from_curl.starts_with("HTTP/1.1 200"), "{from_curl}");
+}
+
 /// A program whose output is its `main` value rather than a sink reloads too.
 ///
 /// Its source is `stdin`, which is unbounded, so the program keeps running and

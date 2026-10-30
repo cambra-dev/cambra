@@ -74,7 +74,9 @@ Three questions decide a reload:
 > reply by `tests/it/hot_reload/branching.rs`.
 
 `--control` (default 8081, `--control=PORT` to change it) serves the verbs below on loopback
-(`127.0.0.1`) only, because `/reload` runs the source it carries. Dispatch is on the path. `/reload`
+(`127.0.0.1`) only, because `/reload` runs the source it carries. For the same reason it refuses a
+request a web page could have sent: one carrying `Origin`, one whose `Sec-Fetch-Site` is not
+`none`, and one whose `Host` does not name loopback (`control_port::admit`). Dispatch is on the path. `/reload`
 and the `/branch` forms that create or delete change what runs, so they require `POST` and answer
 405 to any other method (`ControlRequest::mutates`); the other verbs accept any method. A verb that
 takes a source reads it from the request body when the body is non-blank, and otherwise from the
