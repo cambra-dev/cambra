@@ -779,10 +779,12 @@ impl VariantIs {
     pub fn new(input: Box<dyn TileOperator>, tag: FieldKey) -> Self {
         let tiling = match input.tiling() {
             Tiling::Scalar(Extent::Union(_)) => Tiling::Scalar(Extent::Base(BaseType::Bool)),
-            t @ Tiling::DataFunction { codomain, .. } => {
+            // The union sits under the levels the scrutinee stands at, however many: a match
+            // inside a nested loop tests one value per innermost position.
+            t @ Tiling::DataFunction { .. } => {
                 assert!(
-                    matches!(codomain.as_ref(), Tiling::Scalar(Extent::Union(_))),
-                    "VariantIs: a scrutinee must have a Scalar(Union) codomain, got {codomain:?}"
+                    matches!(t.deepest_values(), Tiling::Scalar(Extent::Union(_))),
+                    "VariantIs: a scrutinee's values must be a Scalar(Union), got {t:?}"
                 );
                 change_tiling_result(t, |_| Tiling::Scalar(Extent::Base(BaseType::Bool)))
             }
@@ -848,59 +850,29 @@ impl TileProducer for VariantIsProducer {
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let tile = self.input.get(projection_guard);
-        let (domain_col, domain_predicate, deleted, cv) = match tile {
-            Tile::Scalar(cv) => (None, Predicate::True, BitSet::new(), cv),
-            Tile::DataFunction {
-                domain,
-                codomain,
-                domain_predicate,
-                deleted,
-                ..
-            } => {
-                assert!(
-                    !codomain.holds_a_level(),
-                    "VariantIs rebuilds its domain from the positions it keeps, which has \
-                     no meaning above one level"
-                );
-                (
-                    Some(domain),
-                    domain_predicate,
-                    deleted,
-                    scalar_tile_to_column_value(*codomain),
-                )
-            }
-            other => panic!("VariantIs expects a union input, got {other:?}"),
-        };
-        let ColumnValue::Union(arms) = cv else {
-            panic!("VariantIs expects a Union codomain, got {cv:?}");
+        // A test answers every position, so the scrutinee's levels, keys, groupings and
+        // deletions stand as they are, and only its values change: each union value becomes
+        // whether it carries the tag.
+        let mut tile = self.input.get(projection_guard);
+        let values = tile.deepest_values_mut();
+        let Tile::Scalar(ColumnValue::Union(arms)) = &*values else {
+            panic!("VariantIs expects a union input, got {values:?}")
         };
         // The arm records which rows carry the tag, so the test is a membership
-        // check per surviving position rather than a walk over the payloads.
+        // check per position rather than a walk over the payloads.
         let carried: BitSet = arms
             .get(&self.tag)
             .map(|arm| arm.row_slots().map(|(pos, _)| pos).collect())
             .unwrap_or_default();
-        let positions: Vec<usize> = match &domain_col {
-            Some(d) => (0..d.len()).filter(|p| !deleted.contains(*p)).collect(),
-            None => (0..arms
-                .values()
-                .flat_map(|a| a.rows())
-                .max()
-                .map_or(0, |m| m + 1))
-                .filter(|p| !deleted.contains(*p))
-                .collect(),
-        };
-        let answers = ColumnValue::Bools(positions.iter().map(|p| carried.contains(*p)).collect());
-        match domain_col {
-            Some(d) => Tile::data_function(
-                d.select_indices(positions.iter().copied(), positions.len()),
-                Box::new(Tile::Scalar(answers)),
-                domain_predicate,
-                BitSet::new(),
-            ),
-            None => Tile::Scalar(answers),
-        }
+        let rows = arms
+            .values()
+            .flat_map(|a| a.rows())
+            .max()
+            .map_or(0, |m| m + 1);
+        *values = Tile::Scalar(ColumnValue::Bools(
+            (0..rows).map(|p| carried.contains(p)).collect(),
+        ));
+        tile
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {

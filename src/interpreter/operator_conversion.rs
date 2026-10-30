@@ -3082,8 +3082,8 @@ fn convert_impl_inner(
                 Builtin::VariantIs(tag) => {
                     let ok = match input.tiling() {
                         Tiling::Scalar(Extent::Union(_)) => true,
-                        Tiling::DataFunction { codomain, .. } => {
-                            matches!(codomain.as_ref(), Tiling::Scalar(Extent::Union(_)))
+                        t @ Tiling::DataFunction { .. } => {
+                            matches!(t.deepest_values(), Tiling::Scalar(Extent::Union(_)))
                         }
                         _ => false,
                     };
