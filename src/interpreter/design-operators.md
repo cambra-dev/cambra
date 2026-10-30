@@ -532,6 +532,13 @@ of a restatement with no spelling.
 | `MapResult` | A keyed input is pulled at the projection; a scalar input is a key looked up in the function, has no keys to project, and is read whole. A function operand that is a collection is pulled at the projection too where the input's values are its keys, the arguments stand at the first level, and the operand is a data function; its keys are released with the data's. Any other function operand is read whole. |
 | `MapResultToConst` | The input is pulled at the projection. The constant is read whole, since every row reads all of it. |
 | `MapResultWithSource` | The input is pulled at the projection, so a morsel reads only its own keys from the source. |
+| `RecordWrap` | The input is pulled at the projection. |
+| `SelectField` | A stream of records is pulled at the projection. A product of collections is pulled whole and the selected field is cut. |
+| `Zip` | Every arm is pulled at the projection, since the arms share the pair's keys. The pair is complete only where every arm is. |
+| `MakeRecord` | A record of values has no keys: the projection is the whole record or nothing, and a guard naming keys panics. |
+| `VariantWrap` | A payload stream is pulled at the projection. A payload that is itself a collection becomes one union column and is read whole. |
+| `VariantProject` | A union stream is pulled at the projection. A bare union has no keys of its own, so it is read whole and its positions are cut. |
+| `VariantIs` | The scrutinee is pulled at the projection, since every key in is a key out. |
 
 ### Producer attribution and probes
 

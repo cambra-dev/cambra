@@ -5,7 +5,9 @@ use bit_set::BitSet;
 
 use super::*;
 use crate::interpreter::operator_graph::{value, value_at};
-use crate::interpreter::{Consumer, RowIndex, Scheduler, Value, shared_consumer, tuple_field};
+use crate::interpreter::{
+    Consumer, Projection, RowIndex, Scheduler, Value, shared_consumer, tuple_field,
+};
 
 /// Pairs its operands at `level`, producing a collection carrying the levels standing above it
 /// whose values are a record of what each operand holds there.
@@ -218,8 +220,13 @@ impl TileProducer for RecordWrapProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let mut tile = self.input.get(self.input.tiling().universal_guard());
+    /// Wrapping keeps the input's keys, so the input is pulled at the projection.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let mut tile = self.input.get(projection.guard(self.input.tiling()));
         assert!(
             tile.is_data_function(),
             "RecordWrap: the input must be a function tile, got {tile:?}"
@@ -303,7 +310,12 @@ impl TileProducer for ZipProducer {
         }
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    /// The arms share the pair's keys, so each arm is pulled at the projection.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
         // The presence intersection below runs on every pull, inputs that already agree
         // included: N predicate intersections, N `to_remove` minuses and one `remove_guarded`
         // per input.
@@ -315,7 +327,7 @@ impl TileProducer for ZipProducer {
             .inputs
             .iter_mut()
             .map(|i| {
-                let mut tile = i.get(i.tiling().universal_guard());
+                let mut tile = i.get(projection.guard(i.tiling()));
                 let dropped = tile.deleted_keys_guard();
                 // Presence is read off the key columns, so a key an arm has dropped is gone
                 // from them first.
@@ -760,10 +772,20 @@ impl TileProducer for MakeRecordProducer {
         }
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        // Every operand is pulled whole ([`SelectFieldProducer`] says why a narrowed pull
-        // is unsound). An operand withholds what [`Self::release_impl`] told it a consumer
-        // finished with, so a field that settled early is not re-delivered.
+    /// A record of values has no keys to project: the projection is the whole record or
+    /// nothing, and a guard naming keys is a consumer's bug.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        match projection_guard.projection(&self.name()) {
+            Projection::Everything => {}
+            Projection::Nothing => return self.tiling().empty_tile(),
+            Projection::Keys(_) => panic!(
+                "{} is a record of values, which has no keys to project: {projection_guard:?}",
+                self.name()
+            ),
+        }
+        // Every operand is pulled whole ([`SelectFieldProducer`] says why a pull naming one
+        // field is unsound). An operand withholds what [`Self::release_impl`] told it a
+        // consumer finished with, so a field that settled early is not re-delivered.
         let fields: HashMap<SmolStr, Tile> = self
             .names
             .iter()
@@ -943,11 +965,12 @@ impl TileOperator for SelectField {
 
 /// Producer for [`SelectField`].
 ///
-/// **A pull reads the whole product.** A narrowed pull is unsound through a cumulative
-/// cache: [`Memo`] merges what a pull returned and answers later pulls from it without going
-/// below, so a pull naming one field would record a partial answer as the whole one, and a
-/// sibling selector would read a field never fetched. A release names this field's part and
-/// every other field whole ([`guard_at_field`]).
+/// **A pull reads every field of the product.** A pull that names one field is unsound through
+/// a cumulative cache: [`Memo`] merges what a pull returned and answers later pulls from it
+/// without going below, so a pull naming one field would record a partial answer as the
+/// whole one, and a sibling selector would read a field never fetched. A pull may name keys
+/// of the stream the field sits under, since a key brings every field of its record. A
+/// release names this field's part and every other field whole ([`guard_at_field`]).
 struct SelectFieldProducer {
     base: ProducerBase,
     input: Box<dyn TileProducer>,
@@ -969,8 +992,19 @@ impl TileProducer for SelectFieldProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let mut tile = self.input.get(self.input.tiling().universal_guard());
+    /// A stream of records keeps its keys under the field, so the input is pulled at the
+    /// projection. A product of collections has no projection guard of its own: it is pulled
+    /// whole, and the field cut after.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let input_guard = match self.input.tiling().is_data_function() {
+            true => projection.guard(self.input.tiling()),
+            false => self.input.tiling().universal_guard(),
+        };
+        let mut tile = self.input.get(input_guard);
         // A row holding no cell of this field gave that cell back to this reader's release
         // (`Tile::Record`'s `absent`), and the field is the whole value here, so the row
         // leaves with it. The record gathers its other fields' cells along.
@@ -1011,6 +1045,7 @@ impl TileProducer for SelectFieldProducer {
             let at_field = self.at_field(dropped);
             self.input.release(at_field);
         }
+        tile.restrict_to(&projection, self.tiling());
         tile
     }
 
@@ -1679,5 +1714,323 @@ mod tests {
                 log.borrow()
             );
         }
+    }
+}
+
+/// How the operators of this module are pulled in the shapes they are built for: a record
+/// literal over a stream (`(a: x for x in xs)`), a pair of streams zipped by key, and a field
+/// read out of a record stream.
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms, int_entries, ints_by_position, keys_between,
+    };
+    use crate::interpreter::{BaseType, Extent};
+
+    const ROWS: u64 = 8;
+
+    fn ints() -> Tiling {
+        Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        )
+    }
+
+    fn stream(offset: i64) -> (ProjectionSpy, GuardLog) {
+        let values: Vec<i64> = (0..ROWS as i64).map(|i| i + offset).collect();
+        let (spy, pulled, _) = ProjectionSpy::new(ints_by_position(&values, true), ints());
+        (spy, pulled)
+    }
+
+    /// `(a: x for x in xs)`: one field over a stream.
+    fn wrapped() -> (RecordWrapProducer, GuardLog) {
+        let (input, pulled) = stream(0);
+        let out = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Record(
+                [(
+                    SmolStr::new("a"),
+                    Tiling::Scalar(Extent::Base(BaseType::Int)),
+                )]
+                .into_iter()
+                .collect(),
+            ),
+        );
+        (
+            RecordWrapProducer {
+                base: ProducerBase::unowned(RecordWrapProducer::alloc_id(), &out),
+                name: SmolStr::new("a"),
+                level: CurryLevel::new(1),
+                input: Box::new(input),
+            },
+            pulled,
+        )
+    }
+
+    #[test]
+    fn a_wrapped_stream_pulls_its_input_at_the_morsel() {
+        let (mut wrap, pulled) = wrapped();
+        let morsel = wrap.get(keys_between(2, 4));
+        let Tile::DataFunction { domain, .. } = &morsel else {
+            panic!("a collection")
+        };
+        assert_eq!(domain.len(), 3);
+        assert_eq!(*pulled.borrow(), [keys_between(2, 4)]);
+    }
+
+    #[test]
+    fn a_wrapped_morsel_is_the_whole_pull_cut_to_it() {
+        for guard in [keys_between(0, 2), keys_between(6, 20)] {
+            assert_conforms(|| Box::new(wrapped().0), guard);
+        }
+    }
+
+    /// `[r.amount for r in rows]`: a field read out of a stream of records.
+    fn amounts_of_records() -> (SelectFieldProducer, GuardLog) {
+        let rows = Tile::data_function(
+            ColumnValue::UInts((0..ROWS).collect()),
+            Box::new(Tile::record(HashMap::from([
+                (
+                    SmolStr::new("amount"),
+                    Tile::Scalar(ColumnValue::Ints(
+                        (0..ROWS as i64).map(|i| 100 + i).collect(),
+                    )),
+                ),
+                (
+                    SmolStr::new("qty"),
+                    Tile::Scalar(ColumnValue::Ints((0..ROWS as i64).collect())),
+                ),
+            ]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let in_tiling = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Record(
+                ["amount", "qty"]
+                    .into_iter()
+                    .map(|name| {
+                        (
+                            SmolStr::new(name),
+                            Tiling::Scalar(Extent::Base(BaseType::Int)),
+                        )
+                    })
+                    .collect(),
+            ),
+        );
+        let (input, pulled, _) = ProjectionSpy::new(rows, in_tiling.clone());
+        (
+            SelectFieldProducer {
+                base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &ints()),
+                input: Box::new(input),
+                name: SmolStr::new("amount"),
+                input_tiling: in_tiling,
+            },
+            pulled,
+        )
+    }
+
+    #[test]
+    fn a_field_of_a_record_stream_is_read_at_the_morsel() {
+        let (mut select, pulled) = amounts_of_records();
+        let morsel = select.get(keys_between(1, 3));
+        assert_eq!(int_entries(&morsel), [(1, 101), (2, 102), (3, 103)]);
+        assert_eq!(*pulled.borrow(), [keys_between(1, 3)]);
+    }
+
+    #[test]
+    fn a_field_morsel_is_the_whole_pull_cut_to_it() {
+        for guard in [keys_between(0, 1), keys_between(6, 20)] {
+            assert_conforms(|| Box::new(amounts_of_records().0), guard);
+        }
+    }
+
+    /// A product of two collections, as a `Let` or a record of comprehensions makes it, has no
+    /// projection guard of its own: the field is read whole from the product and cut after.
+    #[test]
+    fn a_field_of_a_product_is_pulled_whole_and_cut() {
+        let product_tiling = Tiling::Record(
+            ["a", "b"]
+                .into_iter()
+                .map(|name| (SmolStr::new(name), ints()))
+                .collect(),
+        );
+        let make = || {
+            let product = Tile::record(HashMap::from([
+                (
+                    SmolStr::new("a"),
+                    ints_by_position(&(0..ROWS as i64).collect::<Vec<_>>(), true),
+                ),
+                (
+                    SmolStr::new("b"),
+                    ints_by_position(&(100..100 + ROWS as i64).collect::<Vec<_>>(), true),
+                ),
+            ]));
+            let (input, pulled, _) = ProjectionSpy::new(product, product_tiling.clone());
+            (
+                SelectFieldProducer {
+                    base: ProducerBase::unowned(SelectFieldProducer::alloc_id(), &ints()),
+                    input: Box::new(input),
+                    name: SmolStr::new("a"),
+                    input_tiling: product_tiling.clone(),
+                },
+                pulled,
+            )
+        };
+        let (mut select, pulled) = make();
+        let morsel = select.get(keys_between(2, 3));
+        assert_eq!(int_entries(&morsel), [(2, 2), (3, 3)]);
+        assert_eq!(*pulled.borrow(), [product_tiling.universal_guard()]);
+        assert_conforms(|| Box::new(make().0), keys_between(2, 3));
+    }
+
+    /// `[(x, y) for ...]`: two arms over the same positions, the second holding only what has
+    /// been delivered of `delivered` positions.
+    fn pair(delivered: usize) -> (ZipProducer, GuardLog, GuardLog) {
+        let (a, a_pulled) = stream(0);
+        let values: Vec<i64> = (0..delivered as i64).map(|i| 100 + i).collect();
+        let (b, b_pulled, _) =
+            ProjectionSpy::new(ints_by_position(&values, delivered as u64 == ROWS), ints());
+        let out = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Record(
+                [0, 1]
+                    .into_iter()
+                    .map(|i| (tuple_field(i), Tiling::Scalar(Extent::Base(BaseType::Int))))
+                    .collect(),
+            ),
+        );
+        (
+            ZipProducer {
+                base: ProducerBase::unowned(ZipProducer::alloc_id(), &out),
+                names: vec![tuple_field(0), tuple_field(1)],
+                inputs: vec![Box::new(a), Box::new(b)],
+                level: CurryLevel::new(1),
+            },
+            a_pulled,
+            b_pulled,
+        )
+    }
+
+    /// Both arms are pulled at the morsel, so neither reads the other's rows.
+    #[test]
+    fn a_pair_of_streams_pulls_each_arm_at_the_morsel() {
+        let (mut zip, a_pulled, b_pulled) = pair(ROWS as usize);
+        let morsel = zip.get(keys_between(2, 4));
+        let Tile::DataFunction {
+            domain,
+            domain_predicate,
+            ..
+        } = &morsel
+        else {
+            panic!("a collection")
+        };
+        assert_eq!(domain.len(), 3);
+        let TileGuard::Function(FunctionGuard::Domain(stated)) = keys_between(2, 4) else {
+            unreachable!("a morsel is a domain guard")
+        };
+        assert_eq!(*domain_predicate, stated);
+        assert_eq!(*a_pulled.borrow(), [keys_between(2, 4)]);
+        assert_eq!(*b_pulled.borrow(), [keys_between(2, 4)]);
+    }
+
+    /// An arm that has delivered less pairs only the keys both hold, and the pair is complete
+    /// only where both arms are: the morsel past the slower arm is not stated complete.
+    #[test]
+    fn a_morsel_past_a_lagging_arm_pairs_the_common_keys_and_states_them_complete() {
+        let (mut zip, _, _) = pair(4);
+        let morsel = zip.get(keys_between(2, 6));
+        let Tile::DataFunction {
+            domain,
+            domain_predicate,
+            ..
+        } = &morsel
+        else {
+            panic!("a collection")
+        };
+        assert_eq!(*domain, ColumnValue::UInts(vec![2, 3]));
+        let TileGuard::Function(FunctionGuard::Domain(stated)) = keys_between(2, 3) else {
+            unreachable!("a morsel is a domain guard")
+        };
+        assert_eq!(*domain_predicate, stated);
+    }
+
+    #[test]
+    fn a_paired_morsel_is_the_whole_pull_cut_to_it() {
+        for delivered in [ROWS as usize, 5] {
+            for guard in [keys_between(0, 2), keys_between(3, 20)] {
+                assert_conforms(|| Box::new(pair(delivered).0), guard);
+            }
+        }
+    }
+
+    #[test]
+    fn nothing_pairs_nothing() {
+        let (mut zip, a_pulled, b_pulled) = pair(ROWS as usize);
+        let nothing = zip.tiling().empty_guard();
+        assert_eq!(zip.get(nothing), zip.tiling().empty_tile());
+        assert!(a_pulled.borrow().is_empty() && b_pulled.borrow().is_empty());
+    }
+
+    /// `(a: 1, b: 2)`: a record of two values, each pulled whole.
+    fn two_values() -> (MakeRecordProducer, GuardLog, GuardLog) {
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let spy = |value: i64| {
+            ProjectionSpy::new(Tile::Scalar(ColumnValue::Ints(vec![value])), scalar.clone())
+        };
+        let ((a, a_pulled, _), (b, b_pulled, _)) = (spy(1), spy(2));
+        let out = Tiling::Record(
+            ["a", "b"]
+                .into_iter()
+                .map(|name| (SmolStr::new(name), scalar.clone()))
+                .collect(),
+        );
+        (
+            MakeRecordProducer {
+                base: ProducerBase::unowned(MakeRecordProducer::alloc_id(), &out),
+                names: vec![SmolStr::new("a"), SmolStr::new("b")],
+                inputs: vec![Box::new(a), Box::new(b)],
+            },
+            a_pulled,
+            b_pulled,
+        )
+    }
+
+    #[test]
+    fn a_record_of_values_pulls_each_value_whole() {
+        let (mut record, a_pulled, b_pulled) = two_values();
+        let whole = record.tiling().universal_guard();
+        let tile = record.get(whole);
+        let Tile::Record { fields, .. } = &tile else {
+            panic!("a record")
+        };
+        assert_eq!(fields.len(), 2);
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int)).universal_guard();
+        assert_eq!(*a_pulled.borrow(), std::slice::from_ref(&scalar));
+        assert_eq!(*b_pulled.borrow(), [scalar]);
+    }
+
+    #[test]
+    fn nothing_makes_no_record_and_pulls_no_value() {
+        let (mut record, a_pulled, b_pulled) = two_values();
+        let nothing = record.tiling().empty_guard();
+        assert_eq!(record.get(nothing), record.tiling().empty_tile());
+        assert!(a_pulled.borrow().is_empty() && b_pulled.borrow().is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "a record of values, which has no keys to project")]
+    fn a_projection_of_keys_is_refused_by_a_record_of_values() {
+        let (mut record, _, _) = two_values();
+        record.get(keys_between(0, 1));
+    }
+
+    #[test]
+    fn nothing_wraps_nothing() {
+        let (mut wrap, pulled) = wrapped();
+        let nothing = wrap.tiling().empty_guard();
+        assert_eq!(wrap.get(nothing), wrap.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
     }
 }
