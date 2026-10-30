@@ -777,7 +777,7 @@ fn a_refined_map_key_no_key_satisfies() {
 m: Map({String where _ != ""}, Int) = map([("a", 1), ("z", 2)])
 m
 "#,
-        r#"Annotation mismatch: annotated as Map({String where _ != ""}, Int), but inferred as FullMap({String where _ in ["a", "z"]}, Int)"#,
+        r#"Annotation mismatch: annotated as Map({String where _ != ""}, Int), but inferred as {String where _ in ["a", "z"]} |=> Int"#,
     )
 }
 
@@ -1958,4 +1958,147 @@ i = f(1)
         "#},
         Value::Int(7),
     )
+}
+
+/// A data-function type whose domain is a bare `_` admits a plain collection and a sum alike
+/// (`docs/chl-spec.md`, "6.3 Direction: collection types [Decided]").
+#[rstest]
+#[case::a_plain_collection("xs: _ |=> Int = [1, 2, 3]\nsum(xs)", 6)]
+#[case::a_sum("xs: _ |=> Int = box([1, 2, 3])\nsum([x for x in xs])", 6)]
+#[case::a_parameter(
+    indoc! {"
+        def total(xs: _ |=> Int) => Int:
+            sum([x for x in xs])
+        total([1, 2]) + total(box([3, 4]))
+    "},
+    10
+)]
+#[case::each_use_of_an_alias(
+    indoc! {"
+        Ints = _ |=> Int
+        a: Ints = [1, 2]
+        b: Ints = box([3, 4])
+        sum(a) + sum(b)
+    "},
+    10
+)]
+#[case::a_codomain("f: Int => _ |=> Int = \\n -> [n, n]\nsum(f(3))", 6)]
+// A group-by's codomain reads its key, and a hole in the annotation's codomain is filled under
+// the annotation's binder.
+#[case::a_group_by(
+    indoc! {"
+        xs = [1, 2, 3]
+        g: _ |=> _ = groupby(xs, \\x -> x > 1)
+        sum([sum(v) for v in g])
+    "},
+    6
+)]
+fn a_data_function_type_admits_both_collections(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+/// A written domain, a type parameter included, names a plain collection, so a type parameter
+/// at several positions relates plain collections over one domain.
+#[rstest]
+#[case::a_type_parameter_domain(
+    indoc! {"
+        def total(D, xs: D |=> Int) => Int:
+            sum(xs)
+        total([1, 2]) + total([3, 4])
+    "},
+    10
+)]
+#[case::a_polymorphic_annotation(
+    "f: forall (D) (D |=> Int) => Int = \\xs -> sum(xs)\nf([1, 2]) + f([3])",
+    6
+)]
+#[case::a_shared_domain_over_one_plain_domain(
+    indoc! {"
+        def both(D, a: D |=> Int, b: D |=> Int) => Int:
+            sum(a) + sum(b)
+        both([1, 2], [3, 4])
+    "},
+    10
+)]
+#[case::a_nominal_types_domain(
+    indoc! {"
+        type Keyed(D) = D |=> Int
+        k = Keyed::new([1, 2])
+        sum(k.extract())
+    "},
+    3
+)]
+#[case::a_domain_shared_with_a_requirement(
+    indoc! {"
+        def total(D, xs: D |=> Int) => Int requires Equatable(D, D):
+            sum(xs)
+        total([1, 2])
+    "},
+    3
+)]
+fn a_written_domain_admits_a_plain_collection(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+/// A written domain admits no sum, whether it is a type, a type parameter at one position or at
+/// several, and two plain domains a type parameter names are one.
+#[rstest]
+#[case::a_written_type(
+    "xs: Int |=> Int = box([1, 2])\nsum(xs)",
+    "annotated as Int |=> Int, but inferred as Box(Array(2, Int))"
+)]
+#[case::a_type_parameter(
+    indoc! {"
+        def total(D, xs: D |=> Int) => Int:
+            sum(xs)
+        total(box([3, 4]))
+    "},
+    SUM_REACHED_PLAIN
+)]
+#[case::a_polymorphic_annotation(
+    "f: forall (D) (D |=> Int) => Int = \\xs -> sum(xs)\nf(box([1, 2]))",
+    SUM_REACHED_PLAIN
+)]
+#[case::two_sums(
+    indoc! {"
+        def both(D, a: D |=> Int, b: D |=> Int) => Int:
+            sum(a) + sum(b)
+        both(box([1, 2]), box([3, 4, 5]))
+    "},
+    SUM_REACHED_PLAIN
+)]
+#[case::a_sum_and_its_result(
+    indoc! {"
+        def ident(D, a: D |=> Int) => D |=> Int:
+            a
+        sum(ident(box([1, 2])))
+    "},
+    SUM_REACHED_PLAIN
+)]
+#[case::two_plain_domains(
+    indoc! {"
+        def both(D, a: D |=> Int, b: D |=> Int) => Int:
+            sum(a) + sum(b)
+        both([1, 2], [3, 4, 5])
+    "},
+    "collection domains have no common answer"
+)]
+#[case::a_sum_in_a_nominal_type(
+    indoc! {"
+        type Keyed(D) = D |=> Int
+        k = Keyed::new(box([1, 2]))
+        sum(k.extract())
+    "},
+    SUM_REACHED_PLAIN
+)]
+fn a_written_domain_admits_no_sum(#[case] code: &str, #[case] needle: &str) {
+    check_compile_error(code, needle);
+}
+
+const SUM_REACHED_PLAIN: &str = "a sum reached a plain collection";
+
+/// A data-function type is written in annotation position, as `T => U` is.
+#[test]
+fn a_data_function_type_is_no_value() {
+    check_compile_error("x = Int |=> Int\n1", "`T |=> U` is a data-function *type*");
 }

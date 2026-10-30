@@ -478,9 +478,9 @@ pub(super) fn mentioned_names(expr: &ChlExpr, names: &mut HashSet<SmolStr>) {
         ChlExpr::BraceRefinement { base, predicate } => {
             each(&mut [&**base, &**predicate].into_iter())
         }
-        ChlExpr::FunctionType { domain, codomain } => {
-            each(&mut [&**domain, &**codomain].into_iter())
-        }
+        ChlExpr::FunctionType {
+            domain, codomain, ..
+        } => each(&mut [&**domain, &**codomain].into_iter()),
         ChlExpr::Subscript { target, index, .. } => each(&mut [&**target, &**index].into_iter()),
         ChlExpr::BinOp { left, right, .. } => each(&mut [&**left, &**right].into_iter()),
         ChlExpr::UnaryOp { operand, .. } => each(&mut std::iter::once(&**operand)),

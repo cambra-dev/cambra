@@ -1962,6 +1962,35 @@ const BAG: &str = indoc! {"
     "},
     6
 )]
+#[case::a_mutation_loop_over_a_type_whose_elements_is_a_plain_collection(
+    indoc! {"
+        type Row(D) = D |=> Int
+        impl forall (D) Iterable(Row(D)):
+            Elements = D |=> Int
+            def elements(r):
+                r.extract()
+        total := 0
+        for x in Row::new([1, 2, 3]):
+            total += x
+        total
+    "},
+    6
+)]
+#[case::a_mutation_loop_over_the_type_around_another(
+    indoc! {"
+        type Row(D) = D |=> Int
+        impl forall (D) Iterable(Row(D)):
+            Elements = D |=> Int
+            def elements(r):
+                r.extract()
+        total := 0
+        for x in Row::new([1, 2, 3]):
+            for y in [10, 20, 30]:
+                total += x * y
+        total
+    "},
+    360
+)]
 fn a_loop_walks_its_sources_elements(#[case] code: &str, #[case] expected: i64) {
     check_scalar(&format!("{BAG}\n{code}"), Value::Int(expected));
 }
@@ -1981,6 +2010,30 @@ fn a_loop_over_a_type_without_an_iterable_instance(#[case] code: &str) {
     check_compile_error(
         code,
         "No Iterable instance for Iterable::elements: operand 1 is",
+    );
+}
+
+/// An instance's associated type is one type at every use, so a `_ |=> V` there is a plain
+/// collection, and an `elements` returning a sum is refused against it, as against
+/// `FullMap(_, V)`.
+#[rstest]
+#[case::a_data_function_type("_ |=> Int")]
+#[case::a_full_map("FullMap(_, Int)")]
+fn an_associated_data_function_type_admits_no_sum(#[case] elements: &str) {
+    check_compile_error(
+        &formatdoc! {"
+            type Bag = Int
+            impl Iterable(Bag):
+                Elements = {elements}
+                def elements(b):
+                    n = b.extract()
+                    box([n, n])
+            total := 0
+            for x in Bag::new(3):
+                total += x
+            total
+        "},
+        "but inferred as Box(Array(2, Int))",
     );
 }
 

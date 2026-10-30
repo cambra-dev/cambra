@@ -3,7 +3,7 @@
 //!
 //! Each program annotates a collection as `Int` so the mismatch prints its inferred type.
 //! A collection over an index range is an `Array`; one over any other domain is a
-//! `FullMap` over that domain, written as a type; a sum is the collection type its kind
+//! data-function type `D |=> V` over that domain; a sum is the collection type its funkind
 //! names, or the `Box` of the alternatives it holds.
 
 use std::time::Duration;
@@ -29,14 +29,14 @@ use super::panic_message::panic_message;
         xs = [1, 2, 3]
         ys = [x for x in xs if x > 1]
     "},
-    "FullMap({UInt where _ < 3 and xs[_] > 1}, Int)"
+    "{UInt where _ < 3 and xs[_] > 1} |=> Int"
 )]
 #[case::filtered_tuples(
     indoc! {"
         xs = [(1, 2), (3, 4)]
         ys = [p for p in xs if p.0 > 1]
     "},
-    "FullMap({UInt where _ < 2 and xs[_].0 > 1}, {Int, Int})"
+    "{UInt where _ < 2 and xs[_].0 > 1} |=> {Int, Int}"
 )]
 // A function the filter calls is a call; the collection it reads is an index.
 #[case::filter_calling_a_function(
@@ -46,7 +46,7 @@ use super::panic_message::panic_message;
         xs = [1, 2, 3]
         ys = [x for x in xs if big(x)]
     "},
-    "FullMap({UInt where _ < 3 and big(xs[_])}, Int)"
+    "{UInt where _ < 3 and big(xs[_])} |=> Int"
 )]
 #[case::nested_comprehension(
     indoc! {"
@@ -54,19 +54,19 @@ use super::panic_message::panic_message;
         ys = [10, 20]
         ps = [(x, y) for x in xs for y in ys]
     "},
-    "FullMap({{UInt where _ < 2}, {UInt where _ < 2}}, {Int, Int})"
+    "{{UInt where _ < 2}, {UInt where _ < 2}} |=> {Int, Int}"
 )]
 #[case::map_literal(
     r#"m = map(["a" -> 1, "b" -> 2])"#,
-    r#"FullMap({String where _ in ["a", "b"]}, Int)"#
+    r#"{String where _ in ["a", "b"]} |=> Int"#
 )]
-#[case::set_literal("s = set([1, 2])", "FullMap({Int where _ in [1, 2]}, {})")]
+#[case::set_literal("s = set([1, 2])", "{Int where _ in [1, 2]} |=> {}")]
 #[case::group_by(
     indoc! {"
         xs = [1, 2, 3]
         g = groupby(xs, \\x -> x > 1)
     "},
-    "FullMap(k: {Bool where _ in [x > 1 for x in xs]}, FullMap({UInt where _ < 3 and (xs[_] > 1) == k}, Int))"
+    "(k: {Bool where _ in [x > 1 for x in xs]}) |=> {UInt where _ < 3 and (xs[_] > 1) == k} |=> Int"
 )]
 // A key the compiler names is spelled apart from the program's own `k`.
 #[case::group_by_beside_k(
@@ -75,7 +75,7 @@ use super::panic_message::panic_message;
         xs = [1, 2, 3]
         g = groupby(xs, \\x -> x + k)
     "},
-    "FullMap(k1: {Int where _ in [x + k for x in xs]}, FullMap({UInt where _ < 3 and xs[_] + k == k1}, Int))"
+    "(k1: {Int where _ in [x + k for x in xs]}) |=> {UInt where _ < 3 and xs[_] + k == k1} |=> Int"
 )]
 #[case::boxed_literal("b = box([1, 2, 3])", "Box(Array(3, Int))")]
 #[case::boxed_alternatives(
