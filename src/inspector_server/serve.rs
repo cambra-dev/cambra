@@ -6,7 +6,9 @@
 //! requests that read them. [`serve`] compiles `code` itself and renders once;
 //! [`serve_compiled`] takes the compile a driver is about to run, and hands back
 //! a [`ServedSnapshot`] the driver replaces when a reload installs another
-//! version. There is no per-request recompilation and no mutation endpoint.
+//! version. There is no per-request recompilation. The one route that changes
+//! anything is `POST /api/reload`, on a run with a control port, and it hands
+//! the change to the driver rather than making it ([`super::reload`]).
 //!
 //! # Routes
 //!
@@ -20,6 +22,10 @@
 //!   [`LiveServer::accept`]; it carries the probe frames a driver publishes
 //!   through the [`LiveChannel`], and nothing under [`serve`], which runs no
 //!   program.
+//! - `GET /api/capabilities` — `{"reload": bool}`: whether this server takes
+//!   `POST /api/reload`. `application/json`.
+//! - `POST /api/reload` — reload `main` with the posted source, through the
+//!   run's control port ([`super::reload`]). `application/json`.
 //! - `GET /` and `GET /index.html` — the CodeMirror frontend: the built,
 //!   self-contained `web/dist/index.html` bundle, which
 //!   fetches `/api/snapshot` and renders the source + IR tree. `text/html`.
@@ -45,8 +51,10 @@ use std::sync::{Arc, RwLock};
 use std::{io, thread};
 
 use crate::ccl::context::{CompiledProgram, GlobalContext, compile_program};
+use crate::control_port::ControlClient;
 use crate::inspector_model::{Diagnostic, InspectorPayload, diagnostics_from_compile_errors};
 use crate::inspector_server::live::{LIVE_PATH, LiveChannel, LiveServer};
+use crate::inspector_server::reload::{self, RELOAD_PATH, capabilities_body};
 use crate::interpreter::Consumer;
 
 use super::{snapshot_json, snapshot_json_at_version, snapshot_json_pretty};
@@ -69,6 +77,23 @@ const INDEX_HTML: &str = include_str!("../../web/dist/index.html");
 struct Bodies {
     snapshot: ServedSnapshot,
     diagnostics: String,
+    /// The run's control port, which `POST /api/reload` sends to. `None` under
+    /// `--inspect-only` and on a run without `--control`.
+    control: Option<ControlClient>,
+    /// The `/api/capabilities` body, which follows from `control`.
+    capabilities: String,
+}
+
+impl Bodies {
+    fn new(snapshot: ServedSnapshot, diagnostics: String, control: Option<ControlClient>) -> Self {
+        let capabilities = capabilities_body(control.is_some());
+        Self {
+            snapshot,
+            diagnostics,
+            control,
+            capabilities,
+        }
+    }
 }
 
 /// The `/api/snapshot` body being served, which the driver replaces when a
@@ -113,20 +138,18 @@ fn build_bodies(program: &LoadedProgram) -> Bodies {
     let mut ctx = GlobalContext::default();
     let consumer: Box<dyn Consumer> = Box::new(|| {});
     match compile_program(&mut ctx, program, consumer) {
-        Ok(compiled) => Bodies {
-            snapshot: ServedSnapshot::new(snapshot_json(&compiled, name)),
-            diagnostics: diagnostics_body(&[]),
-        },
+        Ok(compiled) => Bodies::new(
+            ServedSnapshot::new(snapshot_json(&compiled, name)),
+            diagnostics_body(&[]),
+            None,
+        ),
         Err(errors) => {
             let diagnostics = diagnostics_from_compile_errors(&errors, program.sources());
-            Bodies {
-                snapshot: ServedSnapshot::new(degraded_snapshot_json(
-                    name,
-                    code,
-                    diagnostics.clone(),
-                )),
-                diagnostics: diagnostics_body(&diagnostics),
-            }
+            Bodies::new(
+                ServedSnapshot::new(degraded_snapshot_json(name, code, diagnostics.clone())),
+                diagnostics_body(&diagnostics),
+                None,
+            )
         }
     }
 }
@@ -230,6 +253,9 @@ pub fn serve(program: &LoadedProgram, port: u16) -> io::Result<()> {
 /// by the driver, through [`ServedSnapshot::replace`] and [`LiveChannel::follow`];
 /// see `src/inspector_model/design.md`, "A reload of main is followed".
 ///
+/// `control` is the run's control port, when it has one; `POST /api/reload`
+/// sends to it.
+///
 /// The port is bound before the server thread starts, so a port already in use
 /// is this call's `Err` rather than a run with no server behind it. The server
 /// thread is detached, and outlives this call by design — a run finishes long
@@ -240,15 +266,13 @@ pub fn serve_compiled(
     name: &str,
     port: u16,
     version: u64,
+    control: Option<ControlClient>,
 ) -> io::Result<(LiveChannel, ServedSnapshot)> {
     let live = LiveServer::start();
     let channel = live.channel();
     channel.follow(version);
     let snapshot = ServedSnapshot::new(snapshot_json_at_version(compiled, name, version));
-    let bodies = Bodies {
-        snapshot: snapshot.clone(),
-        diagnostics: diagnostics_body(&[]),
-    };
+    let bodies = Bodies::new(snapshot.clone(), diagnostics_body(&[]), control);
     let server = bind(name, port)?;
     thread::Builder::new()
         .name("cambra-inspector".to_string())
@@ -298,6 +322,13 @@ fn serve_bodies(server: &tiny_http::Server, bodies: Bodies, live: &LiveServer) {
             }
             continue;
         }
+        // Answered on a thread of its own: the main loop compiles the version
+        // before it answers, and the routes below keep serving meanwhile.
+        if route(request.url()) == RELOAD_PATH {
+            let control = bodies.control.clone();
+            thread::spawn(move || reload::answer(request, control));
+            continue;
+        }
         // A response borrows its body: the snapshot is megabytes on a large
         // program and the bundle is a quarter of one, and every request would
         // otherwise copy it. `snapshot` is this request's own reference, so a
@@ -306,6 +337,7 @@ fn serve_bodies(server: &tiny_http::Server, bodies: Bodies, live: &LiveServer) {
         let (body, status, header) = match route(request.url()) {
             "/api/snapshot" => (snapshot.as_bytes(), 200, json_header()),
             "/api/diagnostics" => (bodies.diagnostics.as_bytes(), 200, json_header()),
+            "/api/capabilities" => (bodies.capabilities.as_bytes(), 200, json_header()),
             "/" | "/index.html" => (INDEX_HTML.as_bytes(), 200, html_header()),
             _ => (NOT_FOUND, 404, text_header()),
         };
@@ -493,6 +525,6 @@ mod tests {
         ) else {
             panic!("the program compiles");
         };
-        assert!(serve_compiled(&compiled, "prog.chl", port, 1).is_err());
+        assert!(serve_compiled(&compiled, "prog.chl", port, 1, None).is_err());
     }
 }

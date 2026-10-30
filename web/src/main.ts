@@ -3,9 +3,11 @@
 // On load it fetches `/api/snapshot` once and builds a `Store` (the source +
 // per-pane indices + a shared, cross-pane selection). It then renders an
 // N-pane layout:
-//   - the program source in a read-only CodeMirror 6 editor, with syntax
-//     highlighting, hover types, Ctrl/Cmd-click goto-def, diagnostic
-//     squiggles, and the resolved selection highlight (see sourceView.ts);
+//   - the program source in a CodeMirror 6 editor, with syntax highlighting,
+//     hover types, Ctrl/Cmd-click goto-def, diagnostic squiggles, and the
+//     resolved selection highlight (see sourceView.ts). It is read-only unless
+//     the server takes a reload, and then the reader edits the program and
+//     reloads `main` with it (reload.ts);
 //   - one collapsible, cross-linked IR tree per tree-shaped pipeline pane
 //     (treeView.ts), ordered upstream -> downstream;
 //   - or — on a degraded/failed snapshot — a diagnostics list in place of the
@@ -37,6 +39,7 @@ import { type LiveTag, LiveStore, connectLive } from "./liveStore";
 import { renderLiveMenu } from "./liveMenu";
 import { LiveView, livePanelState, serializeLivePanel } from "./liveView";
 import { validateSnapshot } from "./wireValidate";
+import { EditSession, finishWithRun, postReload, serverReloads } from "./reload";
 import { isIrPane } from "./types";
 import type { Diagnostic, Snapshot, Span } from "./types";
 import { el } from "./dom";
@@ -231,19 +234,25 @@ export function describePanes(
   // `live` subscription, or the editor's `window` and `document` listeners. So a
   // redraw after a reload leaves nothing of the previous panes listening.
   disposers: (() => void)[] = [],
+  // Present when the server takes a reload, which makes the source pane
+  // editable (reload.ts).
+  session?: EditSession,
 ): PaneDescriptor[] {
   const snap = store.snapshot;
+  let source: SourceView | undefined;
   const panes: PaneDescriptor[] = [
     {
       id: "source",
       label: "Source",
       paneClass: "source",
-      // The editor's document is built from this same string, but read it from
-      // the snapshot: `Text` normalizes line breaks on construction, so a CRLF
-      // source would come back from CodeMirror with the CRs stripped.
-      copyText: () => snap.source.text,
+      // The snapshot's text unless the reader has edited it. Not the editor's
+      // document otherwise: `Text` normalizes line breaks on construction, so a
+      // CRLF source would come back from CodeMirror with the CRs stripped.
+      copyText: () =>
+        source?.isEdited ? source.view.state.doc.toString() : snap.source.text,
       mount: (body) => {
-        const view = new SourceView(body, store, onInspect);
+        const view = new SourceView(body, store, onInspect, session);
+        source = view;
         disposers.push(() => view.dispose());
         // A revealed editor has never measured against a real box, and it does
         // not reliably measure itself: CodeMirror's ResizeObserver path drops a
@@ -408,7 +417,12 @@ function renderPane(panels: HTMLElement, pane: PaneDescriptor): MountedPane {
  * Draw every pane for `store`'s payload, and answer the function that stops the
  * ones subscribed to `live`. A redraw calls it first.
  */
-export function renderApp(root: HTMLElement, store: Store, live?: LiveStore): () => void {
+export function renderApp(
+  root: HTMLElement,
+  store: Store,
+  live?: LiveStore,
+  session?: EditSession,
+): () => void {
   const disposers: (() => void)[] = [];
   // Set once the visibility controller exists, because pinning has to reveal
   // the pane and the controller is built from the pane list this produces.
@@ -427,7 +441,7 @@ export function renderApp(root: HTMLElement, store: Store, live?: LiveStore): ()
         reveal?.("values");
       }
     : undefined;
-  const panes = describePanes(store, live, onInspect, disposers);
+  const panes = describePanes(store, live, onInspect, disposers, session);
 
   // A storage that throws on access degrades the filter to one session.
   const storage = browserStorage();
@@ -490,15 +504,19 @@ export function renderApp(root: HTMLElement, store: Store, live?: LiveStore): ()
  * The payload is fetched again rather than patched: a reload rebuilds operators
  * under fresh ids, so the node tables are the new version's or wrong. At most one
  * fetch is in flight, and a version that advanced while it was is fetched next.
+ *
+ * `session` carries the source pane's editor across the redraw: the caret and
+ * the focus always, and the reader's edit when the pane held one.
  */
 export function followReloads(
   root: HTMLElement,
   live: LiveStore,
   shown: Snapshot,
   fetchSnapshot: () => Promise<Snapshot>,
+  session?: EditSession,
 ): void {
   let drawn = shown.meta.version;
-  let dispose = renderApp(root, new Store(shown), live);
+  let dispose = renderApp(root, new Store(shown), live, session);
   let fetching = false;
   const follow = async (): Promise<void> => {
     if (fetching || live.get().version <= drawn) return;
@@ -508,7 +526,7 @@ export function followReloads(
       dispose();
       const store = new Store(snap);
       live.retag((tag) => resolveTag(store, tag));
-      dispose = renderApp(root, store, live);
+      dispose = renderApp(root, store, live, session);
       drawn = snap.meta.version;
     } catch (e) {
       // The panes keep describing the previous version, which is stale but
@@ -538,11 +556,19 @@ async function main(): Promise<void> {
     // all.
     const live = new LiveStore();
     connectLive(live);
-    followReloads(root, live, snap, async () => {
-      const again = await fetch("/api/snapshot");
-      if (!again.ok) throw new Error(`HTTP ${again.status}`);
-      return validateSnapshot(await again.json());
-    });
+    const session = (await serverReloads()) ? new EditSession(postReload()) : undefined;
+    if (session) finishWithRun(live, session);
+    followReloads(
+      root,
+      live,
+      snap,
+      async () => {
+        const again = await fetch("/api/snapshot");
+        if (!again.ok) throw new Error(`HTTP ${again.status}`);
+        return validateSnapshot(await again.json());
+      },
+      session,
+    );
   } catch (e) {
     root.replaceChildren(el("div", "fatal", `Failed to load /api/snapshot: ${String(e)}`));
   }
