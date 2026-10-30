@@ -763,29 +763,14 @@ impl TileProducer for LookupProducer {
         let rows_level = CurryLevel::new(self.level.index() - 1);
         let decided: Vec<bool> = answers.iter().map(Option::is_some).collect();
         if !decided.iter().all(|&d| d) {
-            let undecided: Vec<Vec<Value>> = tile
-                .paths_at(rows_level)
-                .into_iter()
+            let paths = tile.paths_at(rows_level);
+            let withheld: Vec<&[Value]> = paths
+                .iter()
                 .zip(&answers)
                 .filter(|(_, answer)| answer.is_none())
-                .map(|(path, _)| path)
+                .map(|(path, _)| path.as_slice())
                 .collect();
-            for level in 0..self.level.index() {
-                let missing = Predicate::flatten_or(
-                    undecided
-                        .iter()
-                        .map(|path| Predicate::exactly(&path[..=level]))
-                        .collect(),
-                );
-                let Tile::DataFunction {
-                    domain_predicate, ..
-                } = tile.values_at_mut(CurryLevel::new(level))
-                else {
-                    unreachable!("every level above the rows is a collection")
-                };
-                *domain_predicate = domain_predicate.minus(&missing);
-            }
-            tile.values_at_mut(rows_level).retain_keys(&decided);
+            tile.withhold(rows_level, &decided, &withheld);
         }
         *tile.values_at_mut(self.level) = Tile::Scalar(ColumnValue::from_values(
             answers.into_iter().flatten().collect(),
@@ -1035,11 +1020,11 @@ mod tests {
             ]),
             absent: HashMap::new(),
         };
-        // The rows' collections are still growing, so no row is complete.
+        // The outer collection holds exactly rows 0 and 1, and each row's collection still grows.
         let tile = Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(record),
-            Predicate::False,
+            Predicate::from_column_value(&ColumnValue::UInts(vec![0, 1])),
             BitSet::new(),
         );
         let tiling = Tiling::data_function(
