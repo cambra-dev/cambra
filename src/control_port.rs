@@ -50,7 +50,7 @@
 //! a channel, and blocks on the reply — the main loop services it between ticks,
 //! where it already holds the program exclusively.
 
-use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
+use std::sync::mpsc::{Receiver, SendError, SyncSender, sync_channel};
 use std::thread;
 
 use crate::ccl::context::{CompileError, GlobalContext, Phase, ReuseTally};
@@ -433,15 +433,26 @@ impl ControlPort {
                             request: parsed,
                             reply: Some(reply_tx),
                         };
-                        // A closed channel means the program is gone; a closed
-                        // reply channel means the main loop dropped the message
-                        // without the `Drop` answer arriving, which is a bug
-                        // rather than a state to report differently.
+                        // A closed reply channel means the main loop dropped the
+                        // message without the `Drop` answer arriving, which is a
+                        // bug rather than a state to report differently.
                         match tx.send(message) {
-                            Err(_) => ControlReply {
-                                status: 503,
-                                body: "program is not accepting control requests\n".to_string(),
-                            },
+                            // A closed channel means the driver loop has ended,
+                            // which it does when the program finishes; under
+                            // `--inspect` the binary goes on serving. The unsent
+                            // message is disarmed first: its `Drop` answer would
+                            // send on `reply_tx`, whose receiver is this thread's
+                            // own `reply_rx`, and the zero-capacity send would
+                            // wait for it forever.
+                            Err(SendError(mut unsent)) => {
+                                unsent.reply = None;
+                                ControlReply {
+                                    status: 409,
+                                    body: "the program has finished, and a finished program \
+                                           takes no control request\n"
+                                        .to_string(),
+                                }
+                            }
                             Ok(()) => reply_rx.recv().unwrap_or(ControlReply {
                                 status: 500,
                                 body: "control request was never answered\n".to_string(),

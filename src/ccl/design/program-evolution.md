@@ -140,6 +140,10 @@ A 200 reply reads `reloaded: <kept>/<bound> operators kept`, a blank line, the d
 `ReuseTally`'s counts. A 400 carries the compile errors or the state conflicts. A branch the table
 does not hold answers 404. Every other refusal is [State takeover](#state-takeover)'s.
 
+A finished program takes no reload. Once every branch's outputs have finished, the driver loop ends
+and the control port answers every verb with 409. The process exits, or under `--inspect` goes on
+serving the inspector.
+
 ### `/branch`
 
 **Create** is branch-and-reload. It copies `<parent>`'s entry, `main`'s by default, under `<name>`,
