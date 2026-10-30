@@ -3132,7 +3132,8 @@ impl Interp {
                 | SurfaceBuiltin::Begin
                 | SurfaceBuiltin::HttpServe
                 | SurfaceBuiltin::TestSink
-                | SurfaceBuiltin::Stdin,
+                | SurfaceBuiltin::Stdin
+                | SurfaceBuiltin::EnvVar,
             )
             | None => err(format!(
                 "unknown function `{name}` of {} argument(s)",
