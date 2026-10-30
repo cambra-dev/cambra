@@ -123,7 +123,6 @@ impl TileProducer for PermuteRecordDomainProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }
@@ -477,7 +476,6 @@ impl TileProducer for FlattenTupleDomainProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }

@@ -65,6 +65,8 @@ mod reshape;
 mod scalar;
 #[cfg(test)]
 mod sink_breaker;
+#[cfg(test)]
+mod store_breaker_tests;
 mod union;
 
 pub use aggregate::*;
@@ -482,6 +484,12 @@ impl Arrivals {
         *self.0.borrow() != Projection::Nothing
     }
 
+    /// Record that `arrived` has arrived.
+    pub(crate) fn record(&self, arrived: &Projection) {
+        let mut held = self.0.borrow_mut();
+        *held = held.union(arrived);
+    }
+
     /// An input consumer that records the region before forwarding it downstream.
     pub fn consumer(&self, downstream: Box<dyn Consumer>) -> Box<dyn Consumer> {
         Box::new(RecordingConsumer {
@@ -499,9 +507,7 @@ struct RecordingConsumer {
 
 impl Consumer for RecordingConsumer {
     fn notify(&mut self, arrived: &Projection) {
-        let mut held = self.arrivals.0.borrow_mut();
-        *held = held.union(arrived);
-        drop(held);
+        self.arrivals.record(arrived);
         self.downstream.notify(arrived);
     }
 
@@ -995,6 +1001,16 @@ impl ProducerBase {
         self
     }
 
+    /// Clear the gate on the shared consumer, before a read of the inputs: a pull clears it,
+    /// and so does a breaker's consume that reads its inputs as a pull would. A notification
+    /// that arrives while the read runs then passes, since the read may already have read past
+    /// the input that sent it.
+    pub(crate) fn clear_gate(&self) {
+        if let Some(gate) = &self.gate {
+            gate.take();
+        }
+    }
+
     /// A producer no operator built, for a test double constructing one
     /// directly. It names no operator and is never probed.
     #[cfg(test)]
@@ -1045,6 +1061,61 @@ macro_rules! impl_producer_base {
 // with `use super::impl_producer_base;` — avoiding a `#[macro_export]` that would
 // leak it to the crate root.
 pub(crate) use impl_producer_base;
+
+/// Walk the chain under `producer` toward the producers `target` picks, have every producer on a
+/// path to one read again the input that leads there ([`TileProducer::read_again`]), and answer
+/// whether `producer` is on such a path. `target` answers `Some(true)` at a producer to walk
+/// toward, `Some(false)` at one the walk does not descend beneath, and `None` to descend.
+///
+/// It reaches the producers in `producer`'s chain that a notification of `Everything` climbing the
+/// consumers from a picked producer passes. A notification also reaches consumers outside the
+/// chain, and a store whose cell is borrowed is not walked into (`FanOutSlot`'s
+/// `visit_input_producers_mut`). A producer two paths reach is walked once.
+///
+/// # Panics
+///
+/// Where the chain reaches a producer from inside itself: a recurrence slot, the one edge that
+/// closes a cycle, visits nothing.
+pub(crate) fn read_again_toward(
+    producer: &mut dyn TileProducer,
+    target: &dyn Fn(&dyn TileProducer) -> Option<bool>,
+) -> bool {
+    fn walk(
+        producer: &mut dyn TileProducer,
+        target: &dyn Fn(&dyn TileProducer) -> Option<bool>,
+        walked: &mut HashMap<usize, Option<bool>>,
+    ) -> bool {
+        let address = std::ptr::from_ref::<dyn TileProducer>(producer).cast::<()>() as usize;
+        match walked.get(&address) {
+            Some(Some(reads)) => return *reads,
+            Some(None) => panic!(
+                "the walk toward a producer reached {} from inside itself: a chain closes a cycle \
+                 only through a recurrence slot, which visits nothing",
+                producer.name()
+            ),
+            None => {}
+        }
+        walked.insert(address, None);
+        let reads = match target(producer) {
+            Some(reads) => reads,
+            None => {
+                let mut inputs = Vec::new();
+                producer.visit_input_producers_mut(&mut |input, under| {
+                    if walk(under, target, walked) {
+                        inputs.push(input.to_owned());
+                    }
+                });
+                for input in &inputs {
+                    producer.read_again(input);
+                }
+                !inputs.is_empty()
+            }
+        };
+        walked.insert(address, Some(reads));
+        reads
+    }
+    walk(producer, target, &mut HashMap::new())
+}
 
 /// `held` less `released`, exactly. A guard of a collection's outermost keys, of a scalar and of an
 /// aggregation, none of them qualified by an enclosing path, each have a spelling for the
@@ -1454,11 +1525,7 @@ pub trait TileProducer {
     /// projection names keys at a level [`restates`](Self::restates) refuses.
     /// See `src/interpreter/design-operators.md`, "The producer protocol".
     fn get(&mut self, projection_guard: TileGuard) -> Tile {
-        // Cleared before the pull, so a notification arriving while it runs passes: the
-        // pull may already have read past the input that sent it.
-        if let Some(gate) = &self.base().gate {
-            gate.take();
-        }
+        self.base().clear_gate();
         self.base_mut().pulls += 1;
         let asked = cfg!(debug_assertions).then(|| projection_guard.clone());
         // A producer has no exact answer to a pull at keys it does not restate, so the pull is
@@ -1581,7 +1648,9 @@ pub trait TileProducer {
     /// The level a pull of this producer at a projection of the keys of `level` pulls its input
     /// `role` at, where `level` is beneath the outermost keys; `None` where it reads that input
     /// whole. The default passes `level` to every input, which holds for an operator that keeps its
-    /// input's keys level for level; an operator that shifts levels overrides it.
+    /// input's keys level for level; an operator that shifts levels overrides it. The planner walks
+    /// a loop's scope with it to find what a round pulls beneath the outermost keys (`unrestated`
+    /// in `dispatcher.rs`).
     fn input_level(&self, _role: &str, level: CurryLevel) -> Option<CurryLevel> {
         Some(level)
     }
@@ -1652,7 +1721,6 @@ pub trait TileProducer {
     /// [`visit_input_producers`](Self::visit_input_producers) with each producer mutable: the
     /// same producers, in the same order, under the same roles. A test driver walks it to reach
     /// the pipeline breakers inside a chain ([`as_breaking_mut`](Self::as_breaking_mut)).
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, _visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {}
 
     /// This producer as a pipeline breaker, where it is one.
@@ -1660,6 +1728,56 @@ pub trait TileProducer {
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         None
     }
+
+    /// The id of the cyclic fan-out this producer reads through a recurrence slot, where it is
+    /// one: an operator inside that fan-out's store's cycle reads the store through it.
+    fn recurrence_of(&self) -> Option<usize> {
+        None
+    }
+
+    /// The cyclic fan-out this producer reads through a reader slot, where it is one: a reader
+    /// of that fan-out's store.
+    #[cfg(test)]
+    fn store_read(&self) -> Option<StoreRead> {
+        None
+    }
+
+    /// Whether this producer, a store, runs in rounds as a pipeline breaker where no loop's scope
+    /// encloses it: one round of the pipelines inside its cycle per position, in a nested
+    /// dispatcher. A store that answers `false`, or one inside a loop's scope, steps itself until
+    /// its input has released a morsel.
+    #[cfg(test)]
+    fn runs_in_rounds(&self) -> bool {
+        false
+    }
+
+    /// Have every operator inside this producer's cycle read again at its next pull
+    /// ([`read_again_toward`]), where it is a store that holds its cycle. A loop's scope has them
+    /// read again at the start of each round: the store's last step pulled the operators in pull
+    /// mode there, before the round's pipelines took its position.
+    #[cfg(test)]
+    fn read_cycle_again(&mut self) {}
+
+    /// Read the input `input` (a role [`visit_input_producers`](Self::visit_input_producers)
+    /// names) again at the next pull, where this producer caches what it read of it: a store's
+    /// step, or a live source's arrivals, changed what that input answers. A no-op for a producer
+    /// that caches nothing.
+    fn read_again(&mut self, _input: &str) {}
+
+    /// Where this producer is the drive of a loop run in rounds, the path of the position it emits
+    /// next, the next its source delivers, from the outermost level down, and `None` once the
+    /// source delivers no more; `None` for any other producer. A loop's scope runs a round per
+    /// position the drive emits.
+    #[cfg(test)]
+    fn next_position(&self) -> Option<Option<Vec<Value>>> {
+        None
+    }
+
+    /// Take `cycle`, the handle on the cyclic fan-out whose input this producer is. A store
+    /// keeps it to publish its snapshot and have its cycle read again while it steps itself as a
+    /// pipeline breaker; every other producer ignores it. A cyclic fan-out calls this once, when
+    /// its input is subscribed.
+    fn enter_cycle(&mut self, _cycle: Cycle) {}
 
     /// Hook for adding any children to the InspectNode: by default, each producer
     /// [`visit_input_producers`](Self::visit_input_producers) visits, under its role.
