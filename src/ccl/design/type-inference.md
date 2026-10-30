@@ -4234,6 +4234,18 @@ A delivery also tightens what the obligation's other positions accept: `Addable`
 
 This is the gap [Checking a definition alone](#checking-a-definition-alone) names. The two are complementary. That walk resolves a definition's recorded bounds, which catches `λ 𝑎 → (𝑎.0, 𝑎.foo)`; this pass needs no delivery, and does not depend on whether anything calls the definition.
 
+#### An operand nothing reaches is judged by its resolution
+
+Narrowing acts on what flows into an operand, so an operand bounded only from above is offered
+nothing and its obligations stay undecided, while coalesce resolves the variable to its upper bound.
+A loop's positions are such an operand: inference sees them only as the domain of the collection the
+loop iterates, so the key type reaches the position variable as an upper bound. After the sweep,
+`deliver_resolutions` offers each watched variable with no lower bound the type it resolves to, and
+the obligation judges it as one that arrived: a record the loop's positions resolve to fails
+`Orderable` there. A variable that stays a variable is offered nothing. The pass runs after the
+sweep, whose deposits are upper bounds too, and before the emission seal, since it narrows a
+definition's obligations.
+
 #### The unit is a place, not a variable
 
 Every position of a requirement is an ordinary inference variable, but a requirement is *about* a value, and one value is generally several variables. A **place** is that value. It is named by a root variable plus the path of field selections reaching it — each element of the path a **step** — and the empty path names the root's own value. `places_under` returns, per place, the variables standing at it together with the requirements they carry; it is one *place*'s requirements that are read together.
@@ -4561,10 +4573,10 @@ or a top taking away other than what the rest of its clause shares prints in par
 (`capabilities::clauses`). A top holding writes or reads names every mutable variable, and one
 holding appends every feed (`Every::names_mutable_variables`, `Every::names_feeds`), so a function
 whose type holds one leaves no body that declares what it names (`InferCtx::body_binds`) and is no
-public member of a module whose top level binds one. A clause variable's bound, and an associated
-effect type's, may take capabilities away (`TypeParam::clause_except`): opening the parameter, or an
-instance's variable for the associated type, bounds it by `Effect` or `Context` less them, which
-each use's copy keeps (`Blame::Bound`).
+public member of a module whose top level binds one. A top holding writes orders a loop running it.
+A clause variable's bound, and an associated effect type's, may take capabilities away
+(`TypeParam::clause_except`): opening the parameter, or an instance's variable for the associated
+type, bounds it by `Effect` or `Context` less them, which each use's copy keeps (`Blame::Bound`).
 
 **Upper bounds are checked once emission is complete.** A variable's capabilities are known only
 then, so `capabilities::exceeded_uppers` reads each bounded variable's resolution after the barrier
@@ -4653,6 +4665,21 @@ in products and returned functions. Its capabilities naming an induction variabl
 `Bound::At(0)`, are an error at its `let` (`InferError::VariablePastItsScope`). An append to a
 private feed instead joins the top level's capabilities, since other modules append to the feed
 through the function (`InferCtx::exported_capabilities`).
+
+### Ordered loops
+
+**A loop whose iterations interact requires an order of its positions** (`docs/chl-spec.md`,
+"Ordered loops"). A `for` body is emitted on a frame of its own that keeps what names the enclosing
+function's own variables (`Typing::loop_body`). Where what it collects holds `Write(𝑥)` for an `𝑥`
+the body does not declare, the loop is ordered, and `emit_for` requires `Orderable(𝑃, 𝑃)` of its
+source's position type `𝑃`, during emission, so a definition's scheme states it.
+`WriteTxn(𝑥)` orders nothing: the run's transactions commit in commit order. A body that
+interacts only through a function passed to it is found to after emission, too late for the scheme;
+`check_loop_orders` asserts no loop is. A keyed collection's positions are its sum's binder `σ`,
+whose kind `SubtypesOf(𝐾)` gives them `𝐾`'s order, and which no instance answers or refuses, so
+once emission is done `InferCtx::order_keyed_loops` resolves each ordered loop's source and
+requires `Orderable(𝐾, 𝐾)` of its keys. A refusal names the capability that ordered the loop and
+what the source's positions are (`InferError::UnorderedLoop`), at the expression the loop walks.
 
 ### Polymorphism and materialization
 

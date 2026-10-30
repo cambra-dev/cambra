@@ -457,6 +457,46 @@ pub(super) trait Typing {
         f(self)
     }
 
+    /// Run `f` as the body of the `for` loop `node`, and answer whether its iterations
+    /// interact: whether the body causes `Write(𝑥)` for a variable `𝑥` it does not declare
+    /// itself, `declared` being every mutable variable it declares (`docs/chl-spec.md`,
+    /// "Ordered loops"). Check runs `f` and answers `false`.
+    fn loop_body<R>(
+        &mut self,
+        _node: NodeId,
+        _declared: &std::collections::HashSet<Name>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> (R, bool)
+    where
+        Self: Sized,
+    {
+        (f(self), false)
+    }
+
+    /// Record the ordered loop `node` over `iter`, the source at `source`, whose positions are
+    /// `positions`, for the check of its keys' order once types are resolved. Check keeps
+    /// nothing.
+    fn note_ordered_loop(
+        &mut self,
+        _node: NodeId,
+        _source: NodeId,
+        _iter: &Type,
+        _positions: &Type,
+    ) {
+    }
+
+    /// The refusal of the ordered loop `node` over the source at `source`, whose positions
+    /// `positions` have no order, or `None` to keep the error inference raised. Check keeps
+    /// it.
+    fn unordered_loop(
+        &self,
+        _node: NodeId,
+        _source: NodeId,
+        _positions: &Type,
+    ) -> Option<LocatedInferError> {
+        None
+    }
+
     /// Run `f` as the body of a `with begin():` block, which supplies `Transaction` to
     /// what it calls.
     fn transaction_body<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R

@@ -720,7 +720,8 @@ a finite function from `0..n` to values, so `xs[i]` is well-defined
 
 ### Ordered loops
 
-**[Decided]** — the rules of this section.
+**[Decided]** — an exception escaping the body ([Exceptions](#exceptions)). The rest of this section
+is implemented.
 
 A loop is **ordered** when its iterations interact: its body causes `Write(x)` for an induction
 variable `x` bound outside the loop, an accumulator update made directly or by a call (§4.6), or a
@@ -776,14 +777,14 @@ value of the map's greatest key. A write to a variable bound outside two nested 
 
 #### Conditional ordering requirements
 
-**[Decided]** Each loop places `OrderableFor(P, E)` on its source position type `P` and the
-capabilities `E` of its body that escape an iteration. This built-in requirement is satisfied when
-`E` excludes every effect that orders the loop. Otherwise it requires `Orderable(P, P)`.
-`OrderableFor` has no user-declared instances and cannot be summoned. A contract may state it in a
-`requires` clause. Its second argument is an effect clause, including clause variables and
-`except`, rather than a value type.
+Each loop places `OrderableIfRequiredBy(P, E)` on its source position type `P` and the capabilities
+`E` of its body that escape an iteration. This built-in requirement is satisfied when `E` excludes
+every effect that orders the loop. Otherwise it requires `Orderable(P, P)`. `OrderableIfRequiredBy`
+has no user-declared instances and cannot be summoned. A contract may state it in a `requires`
+clause. Its second argument is an effect clause, including clause variables and `except`, rather
+than a value type.
 
-An abstract clause that may contain an ordering effect retains `OrderableFor(P, E)` in the
+An abstract clause that may contain an ordering effect retains `OrderableIfRequiredBy(P, E)` in the
 function's inferred requirements. Each use substitutes its position type and effect clause into
 the requirement. A callback that only appends admits unordered positions; one that may raise an
 exception escaping the iteration requires orderable positions. Forwarding a callback retains the
@@ -1424,11 +1425,11 @@ xsₙ ⟨guards…⟩`, the result contains one `element` value for each tuple
 `(x₁, …, xₙ) ∈ xs₁ × xs₂ × … × xsₙ` such that every interspersed `if`
 guard holds.
 
-The result's **positions** (**[Decided]**) are those of the tuples it is taken over: the tuple `(p₁,
-…, pₙ)` of the position `pᵢ` of each `xᵢ` in `xsᵢ`, or `p₁` alone for one `for` clause. A guard
-drops a position and leaves the others as they are. The output's elements are a bag (§3), and
-downstream consumers must not rely on the order in which the tuples were enumerated. An ordered loop
-over the result runs in the lexicographic order of its positions ([Ordered loops](#ordered-loops)).
+The result's **positions** are those of the tuples it is taken over: the tuple `(p₁, …, pₙ)` of
+the position `pᵢ` of each `xᵢ` in `xsᵢ`, or `p₁` alone for one `for` clause. A guard drops a
+position and leaves the others as they are. The output's elements are a bag (§3), and downstream
+consumers must not rely on the order in which the tuples were enumerated. An ordered loop over the
+result runs in the lexicographic order of its positions ([Ordered loops](#ordered-loops)).
 
 A guard depending only on outer iteration variables (e.g. `if c(x₁)`
 sitting between `for x₁` and `for x₂`) acts as a *prune* on the outer
@@ -3323,9 +3324,9 @@ none.
 - **A value identifies its constructor by name.** A value is held as the name of its constructor
   and that constructor's arguments. The name, and not the constructor's position in the
   declaration, identifies the constructor, so reordering a declaration's lines changes nothing.
-- **A value names its declaration** (**[Decided]**). A value of a declared nominal type carries the
-  declaration its constructor belongs to, as the version of the program that built it defines it,
-  and compares in that declaration's order ([Equality and order](#equality-and-order)).
+- **A value names its declaration.** A value of a declared nominal type carries the declaration its
+  constructor belongs to, as the version of the program that built it defines it, and compares in
+  that declaration's order ([Equality and order](#equality-and-order)).
 - **[Open] — erasure after inference.** The first implementation keeps a declared nominal type
   until operator conversion, which reads a value's shape off its constructors' parameter types, and
   erases the nominal builtins once inference has resolved their operations. Whether a value keeps
@@ -4101,7 +4102,7 @@ With `a: {at: Int}` and a `{Int, {at: Int}}` result instead, `pair.1` is `{at: I
 ```ebnf
 requires_clause ::= "requires" requirement ( "," requirement )*
 requirement     ::= [ ident ":" ] trait_type | ident "::" Ident "<:" expression
-                 | "OrderableFor" "(" expression "," effect_clause ")"   (* [Decided] *)
+                 | "OrderableIfRequiredBy" "(" expression "," effect_clause ")"
 effect_clause   ::= "nothing" | causes_item ( "," causes_item )* [ except_causes ]
 trait_type      ::= trait_name [ "(" expression ( "," expression )* ")" ]
 trait_name      ::= ( ident "::" )* Ident   (* a qualified name is [Decided] *)

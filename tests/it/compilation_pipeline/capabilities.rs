@@ -1741,6 +1741,17 @@ fn a_runs_state_is_written_where_it_has_one(#[case] code: &str, #[case] needle: 
     "},
     "pub maker: (Int => Int causes Append(*)) => Int => Int causes Append(*)"
 )]
+#[case::a_loop_running_appends(
+    indoc! {"
+        def loop_over(f: (Int => Int causes Append(*)), xs):
+            for x in xs:
+                f(x)
+            0
+        pub def go(a, b) => Int:
+            loop_over(\\y -> y, a ++ b)
+    "},
+    "pub go: forall (A, B) {A => Int, B => Int} => Int causes Append(*)"
+)]
 #[case::a_block_discharging_from_context(
     indoc! {"
         pub def apply(f: (Int => Int requires Context causes Effect except RunTransaction), x: Int) => Int:
@@ -2052,4 +2063,22 @@ fn a_capability_list_is_checked(#[case] code: &str, #[case] needle: &str) {
 fn a_top_names_every_variable(#[case] code: &str, #[case] needle: &str) {
     let errors = errors_of(code);
     assert!(errors.contains(needle), "{errors}");
+}
+
+/// A top holding what makes iterations interact orders a loop running it, so a loop over a
+/// concatenation is refused (`docs/chl-spec.md`, "Ordered loops").
+#[rstest]
+#[case::effect("Effect")]
+#[case::every_write("Write(*)")]
+fn a_top_orders_a_loop(#[case] top: &str) {
+    let errors = errors_of(&format!(
+        "def loop_over(f: (Int => Int causes {top}), xs):\n    for x in xs:\n        f(x)\n    \
+         0\npub def go(a, b) => Int:\n    loop_over(\\y -> y, a ++ b)\n"
+    ));
+    assert!(
+        errors.contains(&format!(
+            "since its body causes `{top}`, but this source has the positions of a concatenation"
+        )),
+        "{errors}"
+    );
 }

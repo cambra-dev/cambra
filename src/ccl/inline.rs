@@ -951,6 +951,15 @@ fn anf_chain_builds_a_product(e: &Expr) -> bool {
 /// it. A defer-mediating function's parameter is replaced by the caller's handle when the
 /// function is inlined, so the handles a tuple holds by then are channel names.
 fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>) -> Expr {
+    // One stack frame per node over the whole tree; grow on demand, as the other pass-level
+    // walks do.
+    stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
+        inline_node(expr, scope, channels)
+    })
+}
+
+/// [`inline_impl`] at one node.
+fn inline_node(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>) -> Expr {
     if let TypedExprNode::Let {
         binding,
         bound_expr,

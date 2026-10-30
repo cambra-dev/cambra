@@ -391,6 +391,9 @@ pub enum InferError {
         through_use: bool,
         top: Option<String>,
     },
+    /// An ordered loop whose source's positions have no order: `why` says what orders the
+    /// loop, and `detail` what its positions are (`docs/chl-spec.md`, "Ordered loops").
+    UnorderedLoop { why: String, detail: String },
     /// A function returning a function that has `item`, which names a variable the
     /// returning function binds.
     EscapesItsVariable { item: String, every: bool },
@@ -1117,6 +1120,7 @@ impl InferError {
             | InferError::ClauseNamesNoVariable { .. }
             | InferError::CapabilityBeyondSignature { .. }
             | InferError::NestedTransaction { .. }
+            | InferError::UnorderedLoop { .. }
             | InferError::TransactionOutsideBlock
             | InferError::EmptyTransaction
             | InferError::EscapesItsVariable { .. }
@@ -1683,6 +1687,11 @@ impl std::fmt::Debug for InferError {
                     )
                 }
             }
+            InferError::UnorderedLoop { why, detail } => write!(
+                f,
+                "this loop runs in its source's position order, since {why}, but this source has \
+                 {detail}"
+            ),
             // A compiler trait takes no associated type, so the hint is for a program's trait.
             InferError::CapabilityBeyondSignature { item, compiler } => {
                 write!(
