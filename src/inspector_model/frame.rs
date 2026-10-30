@@ -307,6 +307,29 @@ mod tests {
         );
     }
 
+    /// A probe ships only its last flow, so a producer that was pulled and
+    /// answered empty every time is absent from the frame, the same as one
+    /// nothing pulled. The live pane's silent label rests on this.
+    #[test]
+    fn a_probe_whose_every_reading_is_empty_ships_no_node() {
+        let mut probes = ProbeTable::with_defaults();
+        let node = NodeId::fresh();
+        let empty = Tile::data_function(
+            ColumnValue::UInts(Vec::new()),
+            Box::new(Tile::Scalar(strings(&[]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        probes.observe(Some(node), 1, "IterateExtent#1", &empty, &released(None));
+        probes.observe(Some(node), 1, "IterateExtent#1", &empty, &released(None));
+
+        let frame = probe_frame(&probes, &[], 0, 1, true);
+        assert!(
+            frame.nodes.is_empty(),
+            "a pulled producer that answered empty reads as silent"
+        );
+    }
+
     /// One frame covering every row shape the pane renders: a stale probe, a
     /// deleted row, a record codomain, a store's changelog, a reading truncated
     /// past the row cap, two probes on one node, and a source window.
