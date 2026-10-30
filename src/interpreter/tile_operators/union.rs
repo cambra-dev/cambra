@@ -667,7 +667,6 @@ impl TileProducer for UnionProducer {
         }
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         for (i, p) in self.inputs.iter_mut().enumerate() {
             visit(&format!("_{i}"), &mut **p);
