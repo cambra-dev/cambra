@@ -1805,15 +1805,21 @@ fn finalize_with(
     });
 }
 
-/// Run a compiled program's pipelines through a dispatcher of `morsel_rows` on the calling
-/// thread. The breakers are the producers in the chains under `roots` that are pipeline breakers
-/// ([`TileProducer::as_breaking_mut`]), and a store breaker over each fan-out of `stores` a chain
-/// reads. A breaker's pipeline reads the pipelines of the nearest breakers beneath it. A walk
-/// stops at a store's fan-out: what its cycle holds runs inside the store, in pull mode. A
-/// pipeline reads the pushes of the pipelines it reads restated in its own input's keys where
-/// the producers between them say how (`TileProducer::input_keys`) and the restated pushes are
-/// apart, and its input whole otherwise. The run pulls only the breakers' inputs; the roots'
-/// consumers pull the breakers afterwards. It answers each pipeline it ran, in pipeline order.
+/// Run a compiled program's pipelines through a dispatcher of `morsel_rows` on the calling thread.
+/// `sinks` pairs each sink's producer slot with the sink it writes to. The breakers are the
+/// producers in the chains under those producers that are pipeline breakers
+/// ([`TileProducer::as_breaking_mut`]), a store breaker over each fan-out of `stores` a chain
+/// reads, and each sink's own ([`SinkBreaker`]), whose pipeline no pipeline reads. A breaker's
+/// pipeline reads the pipelines of the nearest breakers beneath it. A walk stops at a store's
+/// fan-out: what its cycle holds runs inside the store, in pull mode. A pipeline reads the pushes
+/// of the pipelines it reads restated in its own input's keys where the producers between them say
+/// how (`TileProducer::input_keys`) and the restated pushes are apart, and its input whole
+/// otherwise. A pipeline pulls only its breaker's input, and a sink's pipeline pulls the sink's
+/// producer, so a sink receives its producer's answer one package at a time. A sink is done once
+/// its producer is released whole, which the run leaves to its caller to read. It answers each
+/// pipeline it ran, in pipeline order.
+///
+/// [`SinkBreaker`]: crate::interpreter::tile_operators::SinkBreaker
 ///
 /// # Panics
 ///
@@ -1821,7 +1827,10 @@ fn finalize_with(
 /// panics.
 #[cfg(test)]
 pub(crate) fn run_program(
-    roots: &[crate::interpreter::sinks::ProducerSlot],
+    sinks: &[(
+        crate::interpreter::sinks::ProducerSlot,
+        Arc<dyn crate::interpreter::DataSink>,
+    )],
     stores: &[Rc<crate::interpreter::tile_operators::FanOut>],
     scheduler: &mut crate::interpreter::Scheduler,
     morsel_rows: usize,
@@ -1837,10 +1846,29 @@ pub(crate) fn run_program(
         names: Vec::new(),
         store_breakers: stores.iter().map(|_| None).collect(),
     };
-    for root in roots {
-        let mut root = root.borrow_mut();
-        let producer = root.as_mut().expect("a root holds the producer it pulls");
-        planner.pipelines_under(&mut **producer);
+    let roots: Vec<_> = sinks.iter().map(|(root, _)| root.clone()).collect();
+    let mut sink_breakers = Vec::new();
+    for (at, (root, sink)) in sinks.iter().enumerate() {
+        let breaker =
+            crate::interpreter::tile_operators::SinkBreaker::new(root.clone(), sink.clone());
+        let input = breaker.input_tiling();
+        let under = {
+            let mut root = root.borrow_mut();
+            let producer = root.as_mut().expect("a root holds the producer it pulls");
+            planner.pipelines_under(&mut **producer)
+        };
+        planner.located.push(Located::Sink(at));
+        planner
+            .names
+            .push(crate::interpreter::tile_operators::TileProducer::name(
+                &breaker,
+            ));
+        planner.tilings.push(input.clone());
+        let pipeline = planner.located.len() - 1;
+        let (reads, plan) = planner.reader_plan(pipeline, under, &input);
+        planner.reads.push(reads);
+        planner.plans.push(plan);
+        sink_breakers.push(RefCell::new(breaker));
     }
     let Planner {
         reads,
@@ -1864,6 +1892,8 @@ pub(crate) fn run_program(
     }
     let mut dispatcher = Dispatcher::new(reads, morsel_rows);
     for (pipeline, at) in located.iter().enumerate() {
+        // A store's cycle steps one package at a time. A sink reads its packages in any order,
+        // since a tile carries its keys and the sink takes each answer by key.
         if let Located::Store(_) = at {
             dispatcher.order(PipelineId(pipeline));
         }
@@ -1895,9 +1925,10 @@ pub(crate) fn run_program(
                     .expect("a store's pipeline holds its breaker");
                 call(&mut *breaker.borrow_mut())
             }
+            Located::Sink(sink) => call(&mut *sink_breakers[sink].borrow_mut()),
             Located::Chain(id) => {
                 let mut call = Some(call);
-                for root in roots {
+                for root in &roots {
                     let mut root = root.borrow_mut();
                     let producer = root.as_mut().expect("a root holds the producer it pulls");
                     if reach_in_chain(&mut **producer, id, stores, &mut call) {
@@ -2124,6 +2155,8 @@ enum Located {
     Chain(usize),
     /// The store breaker over the fan-out of this index in `stores`.
     Store(usize),
+    /// The breaker of the sink of this index in `sinks`.
+    Sink(usize),
 }
 
 /// The pipelines [`run_program`] reads off a program's producer chains.

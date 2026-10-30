@@ -951,10 +951,29 @@ than through tags, as a `groupby`'s memo reaches its input's memo and the `Conve
 as the output's memo reaches two aggregates of one binding, reads its input whole once both have
 finished. Each package reaches its breaker by walking the chains again.
 
+Each sink is the breaker of a pipeline of its own (`SinkBreaker`), planned after the pipelines its
+producer's chain reads and read by no pipeline. A `SinkBreaker` consumes a package by pulling the
+sink's producer at the package's guard, handing the answer to the `DataSink`, and releasing the
+producer at what the answer states. Pull mode makes the same pull, hand-off and release at the
+universal guard. The sink's pipeline is not ordered: a tile carries its keys, and a `DataSink` takes
+each answer by key, as `TestSink` merges it and the HTTP sink answers each request by its index. It
+holds nothing and pushes nothing. A package's answer states only its own region complete, so it is
+terminal only where the package is the producer's whole input. A sink is done once its producer is
+released whole, however many packages that took. The run leaves that to its caller to read, and a
+pull of the sink afterwards finds it done (`DoneNotifier::signal`), since its producer answers from
+what its breakers consumed.
+
+A sink's producer is a fan-out slot over the output memo, keyed by the binding the sink writes and
+then by the value's keys. The output memo of a collection therefore holds two levels, and the output
+memo and the sink each read their input whole, one package however many rows the collection holds.
+The output memo of a value holds one level, and the sink reads its pushes.
+
 The run pulls only the breakers' inputs. A test compiles the program with
-`GlobalContext::defer_sink_pulls`, which leaves out the pull each sink takes once subscribed, runs
-the pipelines, and then pulls the sinks. `tile_operators/program_run_tests.rs` checks that those
-pulls reach no producer beneath a breaker and that each program answers what pull mode answers.
+`GlobalContext::defer_sink_pulls`, which leaves out the pull each sink takes once subscribed, and
+runs the pipelines, the sinks' among them. `tile_operators/program_run_tests.rs` checks that the run
+releases each sink's producer whole, that a pull of each sink afterwards reaches no producer beneath
+a breaker, changes no sink's value and finds every sink done, and that each program answers what
+pull mode answers.
 
 #### Epochs
 

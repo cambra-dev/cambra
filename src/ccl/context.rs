@@ -953,7 +953,7 @@ pub struct GlobalContext {
     /// version of it.
     sources_and_sinks: SourceSinkRegistry,
     /// Whether a compile leaves each sink unpulled, for a test that runs the
-    /// program's pipelines before the sinks pull ([`Self::defer_sink_pulls`]).
+    /// sinks as pipelines of the program ([`Self::defer_sink_pulls`]).
     #[cfg(test)]
     sink_pulls_deferred: bool,
 }
@@ -1145,8 +1145,8 @@ impl GlobalContext {
     }
 
     /// Compile without the pull each sink takes once it is subscribed, so a
-    /// test runs the program's pipelines first and then pulls the sinks itself
-    /// ([`crate::interpreter::SinkConsumer::pull_now`]).
+    /// test runs the sinks as pipelines of the program
+    /// (`crate::interpreter::dispatcher::run_program`).
     #[cfg(test)]
     pub(crate) fn defer_sink_pulls(&mut self) {
         self.sink_pulls_deferred = true;

@@ -68,6 +68,8 @@ mod map;
 mod program_run_tests;
 mod reshape;
 mod scalar;
+#[cfg(test)]
+mod sink_breaker;
 mod store_breaker;
 mod union;
 
@@ -85,6 +87,8 @@ pub use loop_breaker::*;
 pub use map::*;
 pub use reshape::*;
 pub use scalar::*;
+#[cfg(test)]
+pub(crate) use sink_breaker::SinkBreaker;
 pub use store_breaker::*;
 pub use union::*;
 

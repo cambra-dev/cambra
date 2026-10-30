@@ -1,28 +1,44 @@
 //! Compiled programs run end to end through `crate::interpreter::dispatcher::run_program`: the
 //! dispatcher drives every pipeline breaker in the sink's producer chain on one thread, and the
-//! sink pulls once the run has finished. Each answer is checked against the program's pull-mode
-//! answer.
+//! sink's own pipeline pulls its producer one package at a time. Each answer is checked against
+//! the program's pull-mode answer.
 
 use indoc::indoc;
 
 use crate::ccl::context::{GlobalContext, compile_program};
 use crate::ccl::load::LoadedProgram;
-use crate::interpreter::Value;
 use crate::interpreter::dispatcher::{RanPipeline, run_program, store_of};
+use crate::interpreter::{DataSink, Value};
 
 use std::rc::Rc;
+use std::sync::Arc;
 
 use super::loop_breaker_tests::pulled;
 use super::{FanOut, FunctionGuard, TileGuard, TileProducer};
 use crate::ccl::{FieldKey, TagMap};
 use crate::interpreter::Predicate;
 
-/// `source` compiled with a test sink `out`, its pipelines run through the dispatcher at morsels
-/// of `rows`, then its sink pulled by the scheduler: the value `out` receives, and the pipelines.
+/// `source` compiled with a test sink `out` and its pipelines run through the dispatcher at
+/// morsels of `rows`, the sink's among them: the value `out` receives, and the pipelines.
 fn dispatched(source: &str, rows: usize) -> (Value, Vec<RanPipeline>) {
+    let (mut values, ran) = dispatched_into(source, rows, &["out"]);
+    (values.remove(0), ran)
+}
+
+/// `source` compiled with a test sink of each of `names` and its pipelines run through the
+/// dispatcher at morsels of `rows`, the sinks' among them: the value each sink receives, in the
+/// order of `names`, and the pipelines.
+///
+/// Each sink's producer is released whole by the run's end. A pull of each sink afterwards, in
+/// pull mode, reaches no producer beneath a breaker, since the breakers answer from what they
+/// consumed; it changes no sink's value, and it finds every sink done.
+fn dispatched_into(source: &str, rows: usize, names: &[&str]) -> (Vec<Value>, Vec<RanPipeline>) {
     let mut ctx = GlobalContext::default();
     ctx.defer_sink_pulls();
-    let sink = ctx.register_test_sink("out");
+    let sinks: Vec<_> = names
+        .iter()
+        .map(|name| ctx.register_test_sink(*name))
+        .collect();
     let loaded = LoadedProgram::test(source);
     let program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
         .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
@@ -32,35 +48,67 @@ fn dispatched(source: &str, rows: usize) -> (Value, Vec<RanPipeline>) {
         .into_iter()
         .filter(|fan| fan.cached_tile().is_some())
         .collect();
-    let consumers: Vec<_> = program
-        .outputs
+    let consumers: Vec<_> = names
         .iter()
-        .filter_map(|output| output.sink_consumer.clone())
+        .map(|name| {
+            program
+                .outputs
+                .iter()
+                .find(|output| output.name == *name)
+                .and_then(|output| output.sink_consumer.clone())
+                .unwrap_or_else(|| panic!("{source} writes to sink {name}"))
+        })
         .collect();
     let roots: Vec<_> = consumers
         .iter()
         .map(|consumer| consumer.borrow().producer_slot().clone())
         .collect();
-    let planned = run_program(&roots, &stores, ctx.scheduler(), rows);
+    let targets: Vec<(_, Arc<dyn DataSink>)> = roots
+        .iter()
+        .zip(&sinks)
+        .map(|(root, sink)| (root.clone(), sink.clone() as Arc<dyn DataSink>))
+        .collect();
+    let planned = run_program(&targets, &stores, ctx.scheduler(), rows);
+    for (name, root) in names.iter().zip(&roots) {
+        let root = root.borrow();
+        let producer = root.as_ref().expect("a root holds its producer");
+        assert!(
+            producer.obsolete_guard().is_universal(),
+            "{source}: the run releases sink {name}'s producer whole: {planned:?}"
+        );
+    }
+    let values = |what: &str| -> Vec<Value> {
+        sinks
+            .iter()
+            .zip(names)
+            .map(|(sink, name)| {
+                let written = sink
+                    .value()
+                    .unwrap_or_else(|error| panic!("{source}: sink {name} {what}: {error:?}"));
+                let [binding] = written.as_function().as_slice() else {
+                    panic!("{source} writes one value to {name}: {written:?}")
+                };
+                binding.output.clone()
+            })
+            .collect()
+    };
+    let delivered = values("holds a value once the run returns");
     let beneath = pulls_beneath_breakers(&roots, &stores);
     for consumer in &consumers {
         consumer.borrow().pull_now();
     }
-    let done = (0..1000).any(|_| {
-        ctx.scheduler().check_for_notifications();
-        program.done.try_recv().is_ok()
-    });
-    assert!(done, "{source}: the program completes once its sink pulls");
+    ctx.scheduler().check_for_notifications();
     assert_eq!(
         pulls_beneath_breakers(&roots, &stores),
         beneath,
-        "{source}: the sink's pulls stop at the breakers, which answer from what they consumed"
+        "{source}: a pull after the run stops at the breakers"
     );
-    let written = sink.value().expect("the sink holds a value");
-    let [binding] = written.as_function().as_slice() else {
-        panic!("{source} writes one value: {written:?}")
-    };
-    (binding.output.clone(), planned)
+    assert_eq!(values("holds a value after a later pull"), delivered);
+    assert!(
+        program.done.try_recv().is_ok(),
+        "{source}: a pull after the run finds every sink done"
+    );
+    (delivered, planned)
 }
 
 /// The pulls of every producer beneath a pipeline breaker in the chains under `roots`, a store's
@@ -464,4 +512,78 @@ fn a_transaction_store_of_two_writers() {
         "},
         &["CommitBreaker", "Memo"],
     );
+}
+
+/// A sink is a pipeline of its own, ordered and read by no pipeline: it reads the pushes of the
+/// output memo of a value, one package at its morsels.
+#[test]
+fn a_sink_reads_the_pushes_of_a_values_output_memo() {
+    let source = indoc! {"
+        out = test_sink()
+        out << 1 + 2
+    "};
+    answers_as_pull_mode_does(source, &["Memo", "Sink"]);
+    let (_, ran) = dispatched(source, 1);
+    let sink = breaker(&ran, "Sink");
+    assert_eq!(sink.reading, "pushed", "{sink:?}");
+    assert_eq!(sink.consumed.len(), 1, "{sink:?}");
+}
+
+/// The output memo of a collection is keyed by its binding and then by the collection's keys, so
+/// a push of the collection's memo names keys beneath a standing level: the output memo and the
+/// sink each read their input whole, one package however many rows the collection holds.
+#[test]
+fn a_sink_of_a_collection_reads_its_input_whole() {
+    let source = indoc! {"
+        out = test_sink()
+        xs = [1, 2, 3]
+        out << [x + 1 for x in xs]
+    "};
+    answers_as_pull_mode_does(source, &["Memo", "Sink"]);
+    let (_, ran) = dispatched(source, 1);
+    let sink = breaker(&ran, "Sink");
+    assert_eq!(
+        (sink.reading, sink.consumed.len()),
+        ("whole", 1),
+        "{sink:?}"
+    );
+}
+
+/// Two sinks each run as a pipeline of their own, and the program is done once both are.
+#[test]
+fn two_sinks_each_run_as_a_pipeline_of_their_own() {
+    let source = indoc! {"
+        out = test_sink()
+        other = test_sink()
+        xs = [1, 2, 3]
+        out << sum(xs)
+        other << max(xs)
+    "};
+    for rows in [1, usize::MAX] {
+        let (values, ran) = dispatched_into(source, rows, &["out", "other"]);
+        assert_eq!(values, vec![Value::Int(6), Value::Int(3)], "{ran:?}");
+        let sinks = ran
+            .iter()
+            .filter(|ran| ran.name.starts_with("Sink"))
+            .count();
+        assert_eq!(sinks, 2, "{ran:?}");
+    }
+}
+
+/// Two sinks that read one loop's result each receive it.
+#[test]
+fn two_sinks_of_one_loop() {
+    let source = indoc! {"
+        out = test_sink()
+        other = test_sink()
+        total := 0
+        for x in [1, 2, 3]:
+            total += x
+        out << total
+        other << total + 1
+    "};
+    for rows in [1, usize::MAX] {
+        let (values, ran) = dispatched_into(source, rows, &["out", "other"]);
+        assert_eq!(values, vec![Value::Int(6), Value::Int(7)], "{ran:?}");
+    }
 }
