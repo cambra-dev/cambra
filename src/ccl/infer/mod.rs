@@ -1170,8 +1170,7 @@ fn drop_met_downstream(tree: &Expr, errors: &mut Vec<LocatedInferError>) {
 /// Whether `expr` holds the [`Error`](crate::ccl::TypedExprNode::Error) placeholder of a
 /// statement lowering failed in.
 fn holds_stand_in(expr: &Expr) -> bool {
-    matches!(expr.node, crate::ccl::TypedExprNode::Error)
-        || !expr.all_children(|c| !holds_stand_in(c))
+    matches!(expr.node, crate::ccl::TypedExprNode::Error) || expr.any_child(holds_stand_in)
 }
 
 /// Why one run of inference ([`run_once`]) failed.
