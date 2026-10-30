@@ -107,7 +107,6 @@ pub(crate) fn tag_case_to_guard_case(case: Expr) -> Expr {
         unreachable!("caller guarantees a Case")
     };
     let scrut = *scrutinee.expect("caller guarantees a tag-dispatching Case");
-    let scrut_ty = scrut.ty.clone();
     let bool_ty = Type::Base(BaseType::Bool);
     let mut has_default = false;
     let mut out: Vec<Branch> = Vec::with_capacity(branches.len() + 1);
@@ -123,18 +122,12 @@ pub(crate) fn tag_case_to_guard_case(case: Expr) -> Expr {
             });
             continue;
         };
-        let tag = FieldKey::Name(pat.tag());
+        let guard = tag_test(&scrut, pat.tag());
         let payload_ty = pat.binding.ty.clone();
-        let mut guard = Expr::apply(
-            scrut.clone(),
-            Expr::builtin(Builtin::VariantIs(tag.clone()))
-                .with_ty(Type::fun(scrut_ty.clone(), bool_ty.clone())),
-        );
-        guard.ty = bool_ty.clone();
         let mut payload = Expr::apply(
             scrut.clone(),
-            Expr::builtin(Builtin::VariantProject(tag))
-                .with_ty(Type::fun(scrut_ty.clone(), payload_ty.clone())),
+            Expr::builtin(Builtin::VariantProject(FieldKey::Name(pat.tag())))
+                .with_ty(Type::fun(scrut.ty.clone(), payload_ty.clone())),
         );
         payload.ty = payload_ty;
         let payload_subst = Subst::discharge(pat.binding.name.clone(), payload);
@@ -159,6 +152,18 @@ pub(crate) fn tag_case_to_guard_case(case: Expr) -> Expr {
     });
     rebuilt.ty = case_ty;
     rebuilt
+}
+
+/// `scrut ▷ variant_is(tag)`: the guard a tag-dispatching arm reads as.
+pub(crate) fn tag_test(scrut: &Expr, tag: Label) -> Expr {
+    let bool_ty = Type::Base(BaseType::Bool);
+    let mut test = Expr::apply(
+        scrut.clone(),
+        Expr::builtin(Builtin::VariantIs(FieldKey::Name(tag)))
+            .with_ty(Type::fun(scrut.ty.clone(), bool_ty.clone())),
+    );
+    test.ty = bool_ty;
+    test
 }
 
 /// Assemble a writer **decision record** `{commit, writes, __to_<feed>, …}` — the
