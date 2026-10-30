@@ -878,8 +878,12 @@ breaker states absent rides in the morsel that covers it, so the releases of a p
 morsels add up to the whole guard, and a parent that is final once its input is released whole, such
 as `Aggregate`, becomes final. A released key is in no morsel, because the final guard already
 excludes it. A guard naming no more than `morsel_rows` held keys is one morsel. The guard is of the
-pushing breaker's tiling, so a package fits only a parent whose breaker's input answers that tiling,
-and `run` asserts that in a debug build.
+pushing breaker's tiling and names its keys, so a package fits only a parent whose breaker reads the
+pushing breaker directly, and `run` asserts in a debug build that a package fits its breaker's
+input. A pipeline whose breaker reads through other producers is marked with
+`Dispatcher::read_whole` before the dispatcher is shared: in the run's last epoch its queue is its
+own breaker's input whole, one package per morsel (`seed`), in place of the push, and in every
+earlier epoch it closes empty, since its input is whole only once every epoch has run.
 
 `dispatcher::finalize` finishes a pipeline's oldest unfinished epoch. It asserts six invariants
 before it calls the breaker: the pipeline has not begun to finish the epoch, its queue there is
@@ -887,9 +891,10 @@ closed and empty, no package claimed for it there is in flight, the pipeline it 
 the epoch, the epoch is sealed or known to be the last, and its breaker's input has released every
 guard the pipeline consumed in the epoch. A source's input releases the regions queued for it; a
 parent pipeline's input releases only what the guards pushed to it name, and nothing at all when the
-pipeline it reads pushed nothing. A debug build also asserts that the morsels of a pushed guard
-partition it (`partition_gap`), and that a pipeline consumes each region once in an epoch: a guard
-pushed to a pipeline meets none pushed to it before.
+pipeline it reads pushed nothing; a pipeline that reads its input whole releases all of it. A debug
+build also asserts that the morsels of a pushed guard partition it (`partition_gap`), and that a
+pipeline consumes each region once in an epoch: a guard pushed to a pipeline meets none pushed to it
+before.
 
 The dispatcher reads a breaker's input through `input_tiling` and `input_released`, the tiling a
 package's guard is a guard of and the guard the breaker has released of its input, so a breaker
@@ -899,8 +904,29 @@ A dispatcher run delivers no wake-up queued on the scheduler. A breaker's parent
 holds through the push, and a producer's notifications queue on the scheduler as in pull mode
 (`WakeupQueue`), to be delivered by a scheduler that pulls the program afterwards.
 
-Nothing calls the dispatcher or the breakers' methods outside unit tests: no scheduler runs
-pipelines, and how a driver reaches a breaker from a program's roots is not decided.
+Nothing calls the dispatcher or the breakers' methods outside unit tests, and no scheduler runs
+pipelines.
+
+#### Running a compiled program
+
+`dispatcher::run_program`, a test-only driver, runs a compiled program's pipelines on the calling
+thread. It walks the producer chains under the program's sinks with
+`TileProducer::visit_input_producers_mut`, the mutable twin of `visit_input_producers`, and takes
+each producer whose `as_breaking_mut` answers one as a pipeline breaker. A breaker's pipeline reads
+the pipelines of the nearest breakers beneath it, which are numbered before it. The walk stops at a
+slot of a store's cyclic fan-out. That store's pipeline is a `StoreBreaker` over the fan-out, a
+`CommitBreaker` where the store lists writers and a `LoopBreaker` where it lists a body, and what
+the cycle holds stays in pull mode. A producer is identified by its address, since `producer_id`
+counts per producer type. A pipeline whose breaker reads the breaker beneath it through other
+producers reads its input whole (`Dispatcher::read_whole`), since those producers can read the
+breaker beneath in other keys than the pushed guard names. A breaker or store reached twice, as a
+filter's input is, and a pipeline that reads two pipelines are refused. Each package reaches its
+breaker by walking the chains again.
+
+The run pulls only the breakers' inputs. A test compiles the program with
+`GlobalContext::defer_sink_pulls`, which leaves out the pull each sink takes once subscribed, runs
+the pipelines, and then pulls the sinks. `tile_operators/program_run_tests.rs` checks that those
+pulls reach no producer beneath a breaker and that each program answers what pull mode answers.
 
 #### Epochs
 
@@ -997,7 +1023,8 @@ the last. A claim reads the count and the close in one read, and nothing is rese
 close, so the count of a closed queue is its last. The counters only grow, so a pipeline that may
 finish an epoch stays so until it does. Its packages there partition the region its queue was filled
 with, and the finish gets that region as `consumed`: the regions notified to a source in the epoch,
-or the union of the guards pushed to the pipeline in it.
+its input whole in the last epoch for a pipeline that reads its input whole, or the union of the
+guards pushed to the pipeline in it.
 
 The claim that finds a pipeline that may finish an epoch moves its phase there from running to
 finalizing with a compare and exchange, so exactly one claim finishes each pipeline in each epoch.
@@ -1074,10 +1101,12 @@ which the breaker reads through its reader slot, the goal a morsel steps the sto
 step has to decide. A goal (`StoreGoal`) is a position the store has decided, a guard of the input
 the store has released, or the store's terminal. `consume_impl` reads the snapshot afresh and calls
 `FanOut::step` until the store reaches the goal or is terminal. Each step has to decide what the
-kind says, and what it decides is bounded, so a run of steps ends. A step that decides nothing
-panics as a stalled store, and so does a step at a terminal snapshot. `held` is the positions the
-store has decided, and everything once it is terminal. `finalize` asserts the store is terminal,
-since nothing steps the store after it, and pushes that guard.
+kind says, and what it decides is bounded, so a run of steps ends. The first step of a store no pull
+has reached reads its seeds and decides nothing, and counts as progress, since seeds arrive once.
+Any other step that decides nothing panics as a stalled store, and so does a step at a terminal
+snapshot. `held` is the positions the store has decided, and everything once it is terminal.
+`finalize` asserts the store is terminal, since nothing steps the store after it, and pushes that
+guard.
 
 A breaker steps a flat store only, and refuses a nested one at construction. A nested induction
 store is one store per enclosing row, and its frontier, which `held`, a goal and a step's progress
@@ -1098,11 +1127,12 @@ pull mode as in a run. A release through the decided positions alone never names
 loop's source filtered out, so the dispatcher's check that a source pipeline's input was released
 whole would not hold.
 
-A loop's readers stay outside the dispatcher: a `StoreFinalRead` answers one scalar, whose tiling
-the guard the store pushes does not fit, so the program's own readers are pulled by a scheduler
-after the run and learn of the terminal store from its queued notification. Open: a reader of a loop
-as a parent pipeline, a loop seeded by another loop, morsels over positions a filter removes, which
-the drive does not bound, and nested loops, whose store is one per enclosing row.
+A `StoreFinalRead` answers one scalar, whose tiling the guard the store pushes does not fit, so a
+breaker that reads a store through it reads its own input whole once the store finishes
+(`Dispatcher::read_whole`). A reader that is no breaker is pulled after the run and learns of the
+terminal store from its queued notification. Open: a loop seeded by another loop, morsels over
+positions a filter removes, which the drive does not bound, and nested loops, whose store is one per
+enclosing row.
 
 ### A transaction store as a breaker
 
@@ -1142,8 +1172,7 @@ its readers, so it can serialize contending writers in another order. A run agre
 a result every serialization gives.
 
 Open: morsels per writer for a store of several, which needs the dispatcher to cut a record of
-sources; the program's own readers of a store as a parent pipeline, as for a loop; and a live
-source, whose drive is never done.
+sources, and a live source, whose drive is never done.
 
 ## Tile Operators
 

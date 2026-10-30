@@ -332,6 +332,16 @@ impl TileProducer for ConverseProducer {
         visit("input", &*self.input);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
+    }
+
+    #[cfg(test)]
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        Some(self)
+    }
+
     /// Inverting the outermost collection makes the values it holds the keys, and which rows
     /// carry which value is known only once the rows are read: the input is read whole and the
     /// groups cut after. The rows a cut group does not name stay unreleased at the input, so a
@@ -624,6 +634,11 @@ impl TileProducer for MapDomainProducer {
         visit("input", &*self.input);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
+    }
+
     /// Every level's keys stand, so the input is pulled at the projection.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
@@ -769,6 +784,11 @@ impl TileProducer for UncurryProducer {
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
     }
 
     /// Beneath standing levels the projection names keys the pairing leaves standing, so the
@@ -1074,6 +1094,12 @@ impl TileProducer for FilterProducer {
         visit("predicate", &*self.predicate);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
+        visit("predicate", &mut *self.predicate);
+    }
+
     /// The predicate and the input share the keys of the level the mask names, so both are
     /// pulled at the projection.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
@@ -1341,6 +1367,11 @@ impl TileProducer for RestrictProducer {
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("predicate", &*self.predicate);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("predicate", &mut *self.predicate);
     }
 
     /// A restricted domain is the predicate's keys that pass, so the predicate is pulled at the
@@ -1734,6 +1765,12 @@ impl TileProducer for ProductProducer {
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("outer", &*self.outer);
         visit("inner", &*self.inner);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("outer", &mut *self.outer);
+        visit("inner", &mut *self.inner);
     }
 
     /// The two sides are aligned row for row, so a projection of the rows is a projection of

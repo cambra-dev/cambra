@@ -386,6 +386,34 @@ fn a_package_of_another_tiling_is_refused() {
     );
 }
 
+/// A pipeline that reads its input whole consumes that input in morsels that partition it once
+/// the pipeline it reads finishes, whatever that pipeline pushes: here a guard of a sum, while
+/// the scripted breaker's input answers rows.
+#[test]
+fn a_pipeline_reading_its_input_whole_consumes_it_in_morsels() {
+    let breakers: Vec<BreakerHandle> = vec![
+        aggregate_over(Box::new(Input::over(&source(0..6))), &sum_tiling()),
+        Scripted::holding(ints().universal_guard()),
+    ];
+    let input = breakers[1].borrow().input_tiling();
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], 2);
+    dispatcher.read_whole(PipelineId(1), &input);
+    run(&dispatcher, &breakers);
+    let consumed = consumed_by(&dispatcher.into_events(), 1);
+    assert!(
+        consumed.len() > 1,
+        "the rows in morsels of two: {consumed:?}"
+    );
+    assert_eq!(partition_gap(&input.universal_guard(), &consumed), None);
+}
+
+/// A source starts from its input, so it has no pipeline to read whole after.
+#[test]
+#[should_panic(expected = "pipeline 0 reads its input whole only after a pipeline it reads")]
+fn a_source_read_whole_is_refused() {
+    Dispatcher::new(vec![vec![]], UNBOUNDED).read_whole(PipelineId(0), &ints());
+}
+
 #[test]
 #[should_panic(expected = "cycle")]
 fn pipelines_that_read_each_other_are_refused() {

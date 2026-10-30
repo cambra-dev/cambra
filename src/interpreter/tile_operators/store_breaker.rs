@@ -128,8 +128,8 @@ impl<K: StoreKind> StoreBreaker<K> {
     /// # Panics
     ///
     /// When the store is terminal before the step, which a caller checks, or when the step
-    /// decides nothing: the store is stalled. As [`StoreKind::progressed`] for a step that
-    /// decides more than one can.
+    /// neither reads the store's seeds nor decides anything: the store is stalled. As
+    /// [`StoreKind::progressed`] for a step that decides more than one can.
     pub(super) fn step(&self) {
         let before = self.snapshot();
         assert!(
@@ -140,8 +140,15 @@ impl<K: StoreKind> StoreBreaker<K> {
         let released = self.input_released();
         let after = self.fan.step();
         let now_released = self.input_released();
+        // The first step of a store no pull has reached reads its seeds and decides nothing yet.
+        // A store's seeds only grow and are finite, so counting their growth as progress keeps the
+        // measure well-founded.
+        let seeded = matches!(
+            (&before, &after),
+            (Tile::Store { seed: was, .. }, Tile::Store { seed: is, .. }) if was != is
+        );
         assert!(
-            K::progressed(&before, &after, &released, &now_released),
+            K::progressed(&before, &after, &released, &now_released) || seeded,
             "a step of {} decides something short of terminal: it stayed at {:?}, its input \
              released at {released:?}",
             K::STORE,
@@ -166,6 +173,11 @@ impl<K: StoreKind> TileProducer for StoreBreaker<K> {
 
     fn release_impl(&mut self, guard: TileGuard) {
         self.reader.release(guard);
+    }
+
+    #[cfg(test)]
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        Some(self)
     }
 }
 

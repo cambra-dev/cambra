@@ -292,6 +292,19 @@ impl TileProducer for ExtractFinalProducer {
         }
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("source", &mut *self.source);
+        if let Some(default) = &mut self.default {
+            visit("default", &mut **default);
+        }
+    }
+
+    #[cfg(test)]
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        Some(self)
+    }
+
     fn add_inspect_children(&self, node: InspectNode, opts: &VizOptions) -> InspectNode {
         let node = node.child("source", self.source.inspect(opts));
         match &self.default {

@@ -952,6 +952,10 @@ pub struct GlobalContext {
     /// The sources and sinks the program holds open, which outlive any one
     /// version of it.
     sources_and_sinks: SourceSinkRegistry,
+    /// Whether a compile leaves each sink unpulled, for a test that runs the
+    /// program's pipelines before the sinks pull ([`Self::defer_sink_pulls`]).
+    #[cfg(test)]
+    sink_pulls_deferred: bool,
 }
 
 impl GlobalContext {
@@ -967,6 +971,8 @@ impl GlobalContext {
             conversion: OpConversionContext::new(),
             scheduler: Scheduler::new(),
             sources_and_sinks: SourceSinkRegistry::default(),
+            #[cfg(test)]
+            sink_pulls_deferred: false,
         };
         let stdin = Rc::new(RefCell::new(StdinDataSource::new()));
         result.register_source(stdin);
@@ -986,6 +992,8 @@ impl GlobalContext {
             conversion: OpConversionContext::new(),
             scheduler: Scheduler::new(),
             sources_and_sinks: SourceSinkRegistry::default(),
+            #[cfg(test)]
+            sink_pulls_deferred: false,
         }
     }
 
@@ -1134,6 +1142,22 @@ impl GlobalContext {
         let name = source.borrow().get_id().to_string();
         self.lowering.register_source(name.clone(), source.clone());
         self.sources_and_sinks.sources.insert(name, source);
+    }
+
+    /// Compile without the pull each sink takes once it is subscribed, so a
+    /// test runs the program's pipelines first and then pulls the sinks itself
+    /// ([`crate::interpreter::SinkConsumer::pull_now`]).
+    #[cfg(test)]
+    pub(crate) fn defer_sink_pulls(&mut self) {
+        self.sink_pulls_deferred = true;
+    }
+
+    /// Whether a compile pulls each sink once it is subscribed.
+    fn pulls_sinks(&self) -> bool {
+        #[cfg(test)]
+        return !self.sink_pulls_deferred;
+        #[cfg(not(test))]
+        true
     }
 
     /// Supply the sink that `name = test_sink()` binds, and keep a handle on it.
@@ -2975,7 +2999,9 @@ fn compile_version(
             // because the version it replaces has already taken that report, so
             // without this pull a reload lands with unfinished work and nothing
             // pulls it until the next arrival.
-            consumer_rc.borrow().pull_now();
+            if ctx.pulls_sinks() {
+                consumer_rc.borrow().pull_now();
+            }
             outputs.push(CompiledOutput {
                 name,
                 op,

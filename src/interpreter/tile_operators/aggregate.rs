@@ -192,6 +192,16 @@ impl TileProducer for AggregateProducer {
         visit("input", &*self.input);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
+    }
+
+    #[cfg(test)]
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        Some(self)
+    }
+
     /// An accumulator has no keys to project, so the projection is all of it or none. The
     /// input is read whole whatever the consumer asks.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
@@ -388,6 +398,16 @@ impl TileProducer for ExtractAggregateProducer {
         visit("input", &*self.input);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
+    }
+
+    #[cfg(test)]
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        Some(self)
+    }
+
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let projection =
             projection_of_one_value(&self.name(), "extracts one value", &projection_guard);
@@ -553,6 +573,11 @@ impl TileProducer for MapExtractAggregateProducer {
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
     }
 
     /// Every level keeps the input's keys and only the unfinished ones drop, so the input is
@@ -1052,6 +1077,16 @@ impl TileProducer for MapAggregateProducer {
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
+    }
+
+    #[cfg(test)]
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        Some(self)
     }
 
     /// The outermost keys are the input's, with each group beneath one whole, so the input is

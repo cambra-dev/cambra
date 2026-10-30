@@ -591,6 +591,13 @@ impl TileProducer for UnionProducer {
         }
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        for (i, p) in self.inputs.iter_mut().enumerate() {
+            visit(&format!("_{i}"), &mut **p);
+        }
+    }
+
     /// A flat union's arms are disjoint slices of one collection, so each is pulled at the
     /// projection and the merge is cut to it. A tagged union's keys carry the arm's tag: a
     /// projection of its outermost keys reaches each arm as what it names under that arm's tag,

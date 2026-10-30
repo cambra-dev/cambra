@@ -337,6 +337,10 @@ pub struct Dispatcher {
     /// Per pipeline, whether it consumes its morsels in queue order one at a time
     /// ([`order`](Dispatcher::order)). Set before the dispatcher is shared.
     ordered: Vec<bool>,
+    /// Per pipeline that reads its breaker's input whole rather than what the pipeline it reads
+    /// pushes ([`read_whole`](Dispatcher::read_whole)), that input's morsels. Set before the
+    /// dispatcher is shared.
+    whole: Vec<Option<Vec<TileGuard>>>,
     /// Per source pipeline, the most packages queued for it and not yet acknowledged that a
     /// notify finds before it queues more ([`limit`](Dispatcher::limit)); `usize::MAX` for none.
     /// Set before the dispatcher is shared.
@@ -432,6 +436,7 @@ impl Dispatcher {
             reads,
             parent,
             ordered: vec![false; count],
+            whole: vec![None; count],
             credit: vec![usize::MAX; count],
             pipelines,
             window: Self::slots(DEFAULT_WINDOW, count),
@@ -481,6 +486,25 @@ impl Dispatcher {
             "a window is set before any notify, seal or close"
         );
         self.window = Self::slots(epochs, self.reads.len());
+    }
+
+    /// Mark `pipeline`, which reads a pipeline, as consuming its breaker's input whole, `input`
+    /// cut one package per morsel ([`seed`]), in the run's last epoch, in place of what the
+    /// pipeline it reads pushes: a pushed guard names the pushing breaker's keys, which are the
+    /// parent's only where the parent's breaker reads the pushing one directly. Its input is whole
+    /// only once every epoch has run, so its queue in an earlier epoch closes empty.
+    ///
+    /// # Panics
+    ///
+    /// When `pipeline` reads no pipeline.
+    pub fn read_whole(&mut self, pipeline: PipelineId, input: &Tiling) {
+        assert!(
+            !self.reads[pipeline.0].is_empty(),
+            "pipeline {} reads its input whole only after a pipeline it reads; a source does so \
+             from its start",
+            pipeline.0
+        );
+        self.whole[pipeline.0] = Some(seed(input, self.morsel_rows));
     }
 
     /// Mark `pipeline` as consuming its morsels one at a time, epoch by epoch: every morsel of an
@@ -1113,7 +1137,12 @@ impl Dispatcher {
             self.ensure(queue.phase.load() == Phase::Running, || {
                 format!("pipeline {parent} receives packages before it finalizes")
             });
-            let landed = queue.queue.append(parent, &morsels) && queue.queue.close();
+            let queued = match &self.whole[parent] {
+                Some(input) if epoch.number == self.last.load(Ordering::Acquire) => input,
+                Some(_) => &Vec::new(),
+                None => &morsels,
+            };
+            let landed = queue.queue.append(parent, queued) && queue.queue.close();
             self.ensure(landed, || {
                 format!("pipeline {parent} receives packages once")
             });
@@ -1475,16 +1504,33 @@ pub fn run(dispatcher: &Dispatcher, breakers: &[BreakerHandle]) {
         dispatcher.reads.len(),
         "one breaker per pipeline"
     );
-    start(dispatcher, breakers);
+    drive(dispatcher, &mut handles(breakers));
+}
+
+/// Each pipeline's breaker, reached for one call at a time: through a handle ([`handles`]), or,
+/// in a test, by walking a compiled program's producer chains ([`run_program`]).
+type Reach<'r> = dyn FnMut(PipelineId, &mut Call<'_>) + 'r;
+
+/// One call on a pipeline's breaker, which a [`Reach`] makes.
+type Call<'c> = dyn FnMut(&mut dyn BreakingProducer) + 'c;
+
+/// The breakers `breakers` holds, by pipeline, each borrowed for one call.
+fn handles(breakers: &[BreakerHandle]) -> impl FnMut(PipelineId, &mut Call<'_>) {
+    move |pipeline, call| call(&mut *breakers[pipeline.0].borrow_mut())
+}
+
+/// [`run`] over the breakers `reach` reaches.
+fn drive(dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
+    start_with(dispatcher, reach);
     loop {
         match dispatcher.try_claim(None) {
-            Next::Package(package) => consume(dispatcher, breakers, package),
+            Next::Package(package) => consume_with(dispatcher, reach, package),
             Next::Finalize {
                 pipeline,
                 epoch,
                 consumed,
                 last,
-            } => finalize_begun(dispatcher, breakers, pipeline, epoch, consumed, last),
+            } => finalize_with(dispatcher, reach, pipeline, epoch, consumed, last),
             Next::Wait(_) => {
                 panic!("an acyclic graph with nothing queued has a pipeline that may finish")
             }
@@ -1496,10 +1542,19 @@ pub fn run(dispatcher: &Dispatcher, breakers: &[BreakerHandle]) {
 
 /// Queue each source pipeline's input whole, as one package per morsel ([`seed`]), and close it.
 /// [`run`] starts here.
+#[cfg(test)]
 pub(crate) fn start(dispatcher: &Dispatcher, breakers: &[BreakerHandle]) {
+    start_with(dispatcher, &mut handles(breakers));
+}
+
+fn start_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
     for (pipeline, read) in dispatcher.reads.iter().enumerate() {
         if read.is_empty() {
-            let input = breakers[pipeline].borrow().input_tiling();
+            let mut input = None;
+            reach(PipelineId(pipeline), &mut |breaker| {
+                input = Some(breaker.input_tiling());
+            });
+            let input = input.expect("a reach calls the breaker it reaches");
             dispatcher.start_source(PipelineId(pipeline), &input);
         }
     }
@@ -1511,20 +1566,24 @@ pub(crate) fn start(dispatcher: &Dispatcher, breakers: &[BreakerHandle]) {
 ///
 /// As [`Dispatcher::acknowledge`] says of a package; in a debug build, as [`run`] says of a
 /// package.
+#[cfg(test)]
 pub(crate) fn consume(dispatcher: &Dispatcher, breakers: &[BreakerHandle], package: WorkPackage) {
+    consume_with(dispatcher, &mut handles(breakers), package);
+}
+
+fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPackage) {
     let p = package.pipeline.0;
-    {
-        let mut breaker = breakers[p].borrow_mut();
+    reach(package.pipeline, &mut |breaker| {
         // A package carries a guard of the tiling of the pipeline that pushed it, or of this
-        // breaker's own input for a source, so it fits only a breaker whose input answers that
-        // tiling.
+        // breaker's own input for a source or a pipeline that reads it whole, so it fits only a
+        // breaker whose input answers that tiling.
         debug_assert!(
             package.guard.check_from(&breaker.input_tiling()),
             "pipeline {p} consumes a guard of the tiling its breaker's input answers: {:?}",
             package.guard
         );
         breaker.consume_impl(package.guard.clone());
-    }
+    });
     dispatcher.acknowledge(package);
 }
 
@@ -1540,35 +1599,282 @@ pub(crate) fn consume(dispatcher: &Dispatcher, breakers: &[BreakerHandle], packa
 pub fn finalize(dispatcher: &Dispatcher, breakers: &[BreakerHandle], pipeline: PipelineId) {
     let (epoch, consumed) = dispatcher.begin_finalize(pipeline);
     let last = epoch == dispatcher.last.load(Ordering::Acquire);
-    finalize_begun(dispatcher, breakers, pipeline, epoch, consumed, last);
+    finalize_with(
+        dispatcher,
+        &mut handles(breakers),
+        pipeline,
+        epoch,
+        consumed,
+        last,
+    );
 }
 
 /// Finish `pipeline`'s `epoch`, which has begun after consuming `consumed`: push what the epoch
 /// decided, through the breaker's `finalize` where `last` says it is the run's last epoch and
 /// through [`Pushes::push_final`] otherwise, then mark it finished.
-fn finalize_begun(
+fn finalize_with(
     dispatcher: &Dispatcher,
-    breakers: &[BreakerHandle],
+    reach: &mut Reach<'_>,
     pipeline: PipelineId,
     epoch: u64,
     consumed: Option<TileGuard>,
     last: bool,
 ) {
     let p = pipeline.0;
-    let mut breaker = breakers[p].borrow_mut();
-    let released = breaker.input_released();
-    assert!(
-        consumed.is_none_or(|consumed| {
-            released.is_universal() || guard_minus(&consumed, &released).is_empty()
-        }),
-        "pipeline {p} finalizes after its input has released every guard the pipeline consumed"
-    );
-    let mut pushes = dispatcher.pushes_in(pipeline, epoch);
-    match last {
-        true => breaker.finalize(&mut pushes),
-        false => pushes.push_final(&*breaker),
+    let mut consumed = Some(consumed);
+    reach(pipeline, &mut |breaker| {
+        let consumed = consumed
+            .take()
+            .expect("a reach calls the breaker it reaches once");
+        let released = breaker.input_released();
+        assert!(
+            consumed.is_none_or(|consumed| {
+                released.is_universal() || guard_minus(&consumed, &released).is_empty()
+            }),
+            "pipeline {p} finalizes after its input has released every guard the pipeline \
+             consumed"
+        );
+        let mut pushes = dispatcher.pushes_in(pipeline, epoch);
+        match last {
+            true => breaker.finalize(&mut pushes),
+            false => pushes.push_final(&*breaker),
+        }
+        dispatcher.finish(pushes);
+    });
+}
+
+/// Run a compiled program's pipelines through a dispatcher of `morsel_rows` on the calling
+/// thread. The breakers are the producers in the chains under `roots` that are pipeline breakers
+/// ([`TileProducer::as_breaking_mut`]), and a store breaker over each fan-out of `stores` a chain
+/// reads. A breaker's pipeline reads the pipelines of the nearest breakers beneath it. A walk
+/// stops at a store's fan-out: what its cycle holds runs inside the store, in pull mode. A
+/// pipeline whose breaker reads the breaker below through other producers reads its own input
+/// whole ([`Dispatcher::read_whole`]). The run
+/// pulls only the breakers' inputs; the roots' consumers pull the breakers afterwards. It answers
+/// each pipeline's breaker by name, in pipeline order.
+///
+/// # Panics
+///
+/// When two pipelines read one breaker or one store, or a pipeline reads two pipelines; and where
+/// [`run`] panics.
+#[cfg(test)]
+pub(crate) fn run_program(
+    roots: &[crate::interpreter::sinks::ProducerSlot],
+    stores: &[Rc<crate::interpreter::tile_operators::FanOut>],
+    scheduler: &mut crate::interpreter::Scheduler,
+    morsel_rows: usize,
+) -> Vec<String> {
+    let mut planner = Planner {
+        stores,
+        scheduler,
+        reads: Vec::new(),
+        located: Vec::new(),
+        whole: Vec::new(),
+        names: Vec::new(),
+        store_breakers: stores.iter().map(|_| None).collect(),
+    };
+    for root in roots {
+        let mut root = root.borrow_mut();
+        let producer = root.as_mut().expect("a root holds the producer it pulls");
+        planner.pipelines_under(&mut **producer);
     }
-    dispatcher.finish(pushes);
+    let Planner {
+        reads,
+        located,
+        whole,
+        names,
+        store_breakers,
+        ..
+    } = planner;
+    let mut dispatcher = Dispatcher::new(reads, morsel_rows);
+    for (pipeline, at) in located.iter().enumerate() {
+        if let Located::Store(_) = at {
+            dispatcher.order(PipelineId(pipeline));
+        }
+    }
+    for (pipeline, input) in whole.iter().enumerate() {
+        if let Some(input) = input {
+            dispatcher.read_whole(PipelineId(pipeline), input);
+        }
+    }
+    drive(
+        &dispatcher,
+        &mut |pipeline, call| match located[pipeline.0] {
+            Located::Store(store) => {
+                let breaker = store_breakers[store]
+                    .as_ref()
+                    .expect("a store's pipeline holds its breaker");
+                call(&mut *breaker.borrow_mut())
+            }
+            Located::Chain(id) => {
+                let mut call = Some(call);
+                for root in roots {
+                    let mut root = root.borrow_mut();
+                    let producer = root.as_mut().expect("a root holds the producer it pulls");
+                    if reach_in_chain(&mut **producer, id, stores, &mut call) {
+                        return;
+                    }
+                }
+                panic!("pipeline {} has its breaker in a root's chain", pipeline.0)
+            }
+        },
+    );
+    names
+}
+
+/// Where [`run_program`] finds a pipeline's breaker.
+#[cfg(test)]
+enum Located {
+    /// In a root's producer chain, by its address ([`address`]).
+    Chain(usize),
+    /// The store breaker over the fan-out of this index in `stores`.
+    Store(usize),
+}
+
+/// The pipelines [`run_program`] reads off a program's producer chains.
+#[cfg(test)]
+struct Planner<'p> {
+    stores: &'p [Rc<crate::interpreter::tile_operators::FanOut>],
+    scheduler: &'p mut crate::interpreter::Scheduler,
+    reads: Vec<Vec<usize>>,
+    located: Vec<Located>,
+    /// Per pipeline, the tiling its breaker's input answers, where it reads that input whole
+    /// ([`Dispatcher::read_whole`]).
+    whole: Vec<Option<Tiling>>,
+    names: Vec<String>,
+    /// Per fan-out of `stores`, the breaker over it, once a chain reads it.
+    store_breakers: Vec<Option<BreakerHandle>>,
+}
+
+#[cfg(test)]
+impl Planner<'_> {
+    /// The pipelines of the nearest breakers at or beneath `producer`, each numbered after the
+    /// pipelines it reads, and whether its breaker is `producer` itself, or a store `producer` is
+    /// a slot of, rather than beneath it.
+    fn pipelines_under(
+        &mut self,
+        producer: &mut dyn crate::interpreter::tile_operators::TileProducer,
+    ) -> Vec<(usize, bool)> {
+        if let Some(store) = store_of(producer, self.stores) {
+            return vec![(self.store_pipeline(store, producer), true)];
+        }
+        let mut below = Vec::new();
+        producer.visit_input_producers_mut(&mut |_, input| {
+            below.extend(self.pipelines_under(input));
+        });
+        let Some(breaker) = producer.as_breaking_mut() else {
+            return below.into_iter().map(|(read, _)| (read, false)).collect();
+        };
+        // A pipeline reads the pushed guard only from a breaker its own breaker reads directly:
+        // anything between the two can read the pushing breaker in other keys.
+        let whole = below
+            .iter()
+            .any(|(_, direct)| !direct)
+            .then(|| breaker.input_tiling());
+        let id = address(producer);
+        assert!(
+            !self
+                .located
+                .iter()
+                .any(|at| matches!(at, Located::Chain(seen) if *seen == id)),
+            "{} is read by two pipelines; a breaker read by two pipelines is not supported",
+            producer.name()
+        );
+        self.located.push(Located::Chain(id));
+        self.names.push(producer.name());
+        self.reads
+            .push(below.into_iter().map(|(read, _)| read).collect());
+        self.whole.push(whole);
+        vec![(self.located.len() - 1, true)]
+    }
+
+    /// The pipeline of the store breaker over `self.stores[store]`, read through `slot`, a slot of
+    /// its fan-out. An induction store lists its body as `"body"` and a transaction store its
+    /// writers as `"writer"`, which picks the breaker.
+    fn store_pipeline(
+        &mut self,
+        store: usize,
+        slot: &dyn crate::interpreter::tile_operators::TileProducer,
+    ) -> usize {
+        use crate::interpreter::tile_operators::{CommitBreaker, LoopBreaker};
+        assert!(
+            self.store_breakers[store].is_none(),
+            "a store is read twice; a store read by two readers is not supported"
+        );
+        let mut roles = Vec::new();
+        slot.visit_input_producers(&mut |name, input| {
+            if name == "input" {
+                input.visit_input_producers(&mut |role, _| roles.push(role.to_string()));
+            }
+        });
+        let fan = self.stores[store].clone();
+        let breaker: BreakerHandle = if roles.iter().any(|role| role == "writer") {
+            Rc::new(RefCell::new(CommitBreaker::new(fan, self.scheduler)))
+        } else if roles.iter().any(|role| role == "body") {
+            Rc::new(RefCell::new(LoopBreaker::new(fan, self.scheduler)))
+        } else {
+            panic!("a store's fan-out holds an induction store or a transaction store: {roles:?}")
+        };
+        self.names.push(breaker.borrow().name());
+        self.store_breakers[store] = Some(breaker);
+        self.located.push(Located::Store(store));
+        self.reads.push(Vec::new());
+        self.whole.push(None);
+        self.located.len() - 1
+    }
+}
+
+/// A producer's identity in its chain: the address of its boxed state, which does not move while
+/// the chain stands. [`TileProducer::producer_id`] counts per producer type, so two producers of
+/// different types share one.
+#[cfg(test)]
+fn address(producer: &dyn crate::interpreter::tile_operators::TileProducer) -> usize {
+    std::ptr::from_ref(producer).cast::<()>() as usize
+}
+
+/// The index in `stores` of the fan-out `producer` is a slot of, where it is one: a slot lists
+/// its fan-out's input as `"input"`, here the store, built by the operator the fan-out wraps.
+#[cfg(test)]
+pub(crate) fn store_of(
+    producer: &dyn crate::interpreter::tile_operators::TileProducer,
+    stores: &[Rc<crate::interpreter::tile_operators::FanOut>],
+) -> Option<usize> {
+    let mut store = None;
+    producer.visit_input_producers(&mut |name, input| {
+        if name == "input" {
+            store = input.operator_id();
+        }
+    });
+    let store = store?;
+    stores
+        .iter()
+        .position(|fan| fan.with_input(|operator| operator.operator_id()) == Some(store))
+}
+
+/// Call `call` with the breaker at address `id` in the chain under `producer`, stopping at a
+/// store's fan-out, and answer whether it was found.
+#[cfg(test)]
+fn reach_in_chain(
+    producer: &mut dyn crate::interpreter::tile_operators::TileProducer,
+    id: usize,
+    stores: &[Rc<crate::interpreter::tile_operators::FanOut>],
+    call: &mut Option<&mut Call<'_>>,
+) -> bool {
+    if store_of(producer, stores).is_some() {
+        return false;
+    }
+    if address(producer) == id {
+        let breaker = producer
+            .as_breaking_mut()
+            .expect("a pipeline's producer is a breaker");
+        (call.take().expect("a breaker is reached once"))(breaker);
+        return true;
+    }
+    let mut found = false;
+    producer.visit_input_producers_mut(&mut |_, input| {
+        found = found || reach_in_chain(input, id, stores, call);
+    });
+    found
 }
 
 #[cfg(test)]

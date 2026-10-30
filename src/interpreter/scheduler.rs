@@ -629,6 +629,14 @@ mod tests {
             fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
                 visit("input", &*self.input);
             }
+
+            #[cfg(test)]
+            fn visit_input_producers_mut(
+                &mut self,
+                visit: &mut dyn FnMut(&str, &mut dyn TileProducer),
+            ) {
+                visit("input", &mut *self.input);
+            }
             fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
                 self.tiling().empty_tile()
             }

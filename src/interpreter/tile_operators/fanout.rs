@@ -883,6 +883,23 @@ impl TileProducer for FanOutProducer {
         }
     }
 
+    /// A slot whose fan-out is borrowed visits nothing: a walk that reaches the fan-out again
+    /// through its cycle, or while another reader holds it. Unlike the shared walk, a shared
+    /// borrow stops this one too.
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        let shared = match &self.hold {
+            FanHold::Reader { shared, .. } => Some(shared.clone()),
+            FanHold::Recurrence { shared, .. } => shared.upgrade(),
+        };
+        if let Some(shared) = shared
+            && let Ok(mut shared) = shared.try_borrow_mut()
+            && let Some(input) = &mut shared.producer
+        {
+            visit("input", &mut **input);
+        }
+    }
+
     /// No children: a fan-out's input is one producer however many slots read it, so a
     /// slot does not list it.
     fn add_inspect_children(&self, node: InspectNode, _opts: &VizOptions) -> InspectNode {
@@ -1319,6 +1336,16 @@ impl TileProducer for MemoProducer {
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
+    }
+
+    #[cfg(test)]
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        Some(self)
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {

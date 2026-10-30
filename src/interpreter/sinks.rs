@@ -155,6 +155,12 @@ impl SinkConsumer {
     pub fn detach(&mut self) {
         *self.producer.borrow_mut() = None;
     }
+
+    /// The slot holding the producer this consumer pulls, which a test driver walks.
+    #[cfg(test)]
+    pub(crate) fn producer_slot(&self) -> &ProducerSlot {
+        &self.producer
+    }
 }
 
 impl Consumer for SinkConsumer {

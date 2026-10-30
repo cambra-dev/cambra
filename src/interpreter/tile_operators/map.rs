@@ -601,6 +601,12 @@ impl TileProducer for MapResultProducer {
         visit("input", &*self.input);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("fn", &mut *self.function);
+        visit("input", &mut *self.input);
+    }
+
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
@@ -832,6 +838,12 @@ impl TileProducer for MapResultToConstProducer {
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
         visit("constant", &*self.constant);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
+        visit("constant", &mut *self.constant);
     }
 
     /// The input is pulled at the projection, since each output row is the input's row paired
@@ -1221,6 +1233,11 @@ impl TileProducer for MapResultWithSourceProducer {
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
     }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {

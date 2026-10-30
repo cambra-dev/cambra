@@ -1967,6 +1967,16 @@ impl TileProducer for CommitProducer {
         }
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        for writer in &mut self.writer_producers {
+            visit("writer", &mut **writer);
+        }
+        for (key, seed) in &mut self.seed_producers {
+            visit(&format!("seed {key}"), &mut **seed);
+        }
+    }
+
     fn state_info(&self) -> ProducerStateInfo {
         ProducerStateInfo::holding(
             self.engine.as_ref().map_or(0, CommitEngine::held_values) + self.seed.len(),
@@ -2748,6 +2758,14 @@ impl TileProducer for InductionStoreProducer {
         }
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("body", &mut *self.body_producer);
+        for (key, seed) in &mut self.seed_producers {
+            visit(&format!("seed {key}"), &mut **seed);
+        }
+    }
+
     fn state_info(&self) -> ProducerStateInfo {
         ProducerStateInfo::holding(self.engines.held_values())
     }
@@ -3124,6 +3142,11 @@ impl TileProducer for StoreValueStreamProducer {
         visit("store", &*self.store_producer);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("store", &mut *self.store_producer);
+    }
+
     fn base(&self) -> &ProducerBase {
         &self.base
     }
@@ -3350,6 +3373,11 @@ struct StoreFinalReadProducer {
 impl TileProducer for StoreFinalReadProducer {
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("store", &*self.store_producer);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("store", &mut *self.store_producer);
     }
 
     fn base(&self) -> &ProducerBase {
@@ -3755,6 +3783,11 @@ impl TileProducer for StoreDenseReadProducer {
         visit("store", &*self.store_producer);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("store", &mut *self.store_producer);
+    }
+
     impl_producer_base!();
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -4145,6 +4178,12 @@ impl TileProducer for AsOfProducer {
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("trigger", &*self.trigger);
         visit("source", &*self.source);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("trigger", &mut *self.trigger);
+        visit("source", &mut *self.source);
     }
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
@@ -5296,6 +5335,18 @@ impl TileProducer for InductionDriverProducer {
         }
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("store", &mut *self.store_producer);
+        visit("source", &mut *self.source_producer);
+        if let Some(nested) = &mut self.nested {
+            visit("pairs", &mut *nested.pairs);
+            for reseed in &mut nested.reseeds {
+                visit("reseed", &mut **reseed);
+            }
+        }
+    }
+
     fn state_info(&self) -> ProducerStateInfo {
         ProducerStateInfo::holding(self.window.held_values())
     }
@@ -5900,6 +5951,12 @@ impl TileProducer for TransactDriverProducer {
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("store", &*self.store_producer);
         visit("source", &*self.source_producer);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("store", &mut *self.store_producer);
+        visit("source", &mut *self.source_producer);
     }
 
     fn state_info(&self) -> ProducerStateInfo {
@@ -6750,6 +6807,13 @@ impl TileProducer for TransactWriterProducer {
         visit("store", &*self.store_producer);
         visit("body", &*self.body_producer);
         visit("driver", &*self.driver_producer);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("store", &mut *self.store_producer);
+        visit("body", &mut *self.body_producer);
+        visit("driver", &mut *self.driver_producer);
     }
 
     fn state_info(&self) -> ProducerStateInfo {

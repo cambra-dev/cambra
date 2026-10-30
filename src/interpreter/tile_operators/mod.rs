@@ -64,6 +64,8 @@ mod loop_breaker;
 #[cfg(test)]
 mod loop_breaker_tests;
 mod map;
+#[cfg(test)]
+mod program_run_tests;
 mod reshape;
 mod scalar;
 mod store_breaker;
@@ -1431,6 +1433,18 @@ pub trait TileProducer {
     /// `scheduler::pull_laps`'s debug check that a woken
     /// consumer pulls walks. A producer that pulls nothing visits nothing.
     fn visit_input_producers(&self, _visit: &mut dyn FnMut(&str, &dyn TileProducer)) {}
+
+    /// [`visit_input_producers`](Self::visit_input_producers) with each producer mutable: the
+    /// same producers, in the same order, under the same roles. A test driver walks it to reach
+    /// the pipeline breakers inside a chain ([`as_breaking_mut`](Self::as_breaking_mut)).
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, _visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {}
+
+    /// This producer as a pipeline breaker, where it is one.
+    #[cfg(test)]
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        None
+    }
 
     /// Hook for adding any children to the InspectNode: by default, each producer
     /// [`visit_input_producers`](Self::visit_input_producers) visits, under its role.

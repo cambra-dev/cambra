@@ -221,6 +221,11 @@ impl TileProducer for RecordWrapProducer {
         visit("input", &*self.input);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
+    }
+
     /// Wrapping keeps the input's keys, so the input is pulled at the projection.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
@@ -309,6 +314,13 @@ impl TileProducer for ZipProducer {
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         for (i, input) in self.inputs.iter().enumerate() {
             visit(&format!("_{i}"), &**input);
+        }
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        for (i, input) in self.inputs.iter_mut().enumerate() {
+            visit(&format!("_{i}"), &mut **input);
         }
     }
 
@@ -774,6 +786,13 @@ impl TileProducer for MakeRecordProducer {
         }
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        for (i, input) in self.inputs.iter_mut().enumerate() {
+            visit(&format!("{i}"), &mut **input);
+        }
+    }
+
     /// A record of values has no keys to project: the projection is the whole record or
     /// nothing, and a guard naming keys is a consumer's bug.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
@@ -996,6 +1015,11 @@ impl TileProducer for SelectFieldProducer {
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
     }
 
     /// A stream of records keeps its keys under the field, so the input is pulled at the

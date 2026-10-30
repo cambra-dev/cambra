@@ -352,6 +352,11 @@ impl TileProducer for VariantWrapProducer {
         visit("payload", &*self.input);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("payload", &mut *self.input);
+    }
+
     /// A payload stream keeps its keys, so the input is pulled at the projection. A payload
     /// that is itself a collection becomes one union column with no keys, so it is read whole.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
@@ -643,6 +648,11 @@ impl TileProducer for VariantProjectProducer {
         visit("scrutinee", &*self.input);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("scrutinee", &mut *self.input);
+    }
+
     /// A union stream keeps its keys at the rows carrying the tag, so the scrutinee is pulled at
     /// the projection. A bare union has implicit positions for keys, so it is read whole and
     /// the positions cut after.
@@ -892,6 +902,11 @@ impl TileProducer for VariantIsProducer {
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("scrutinee", &*self.input);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("scrutinee", &mut *self.input);
     }
 
     /// Every key in is a key out, so the scrutinee is pulled at the projection.
