@@ -7,12 +7,13 @@
 //! | `/diff[/<branch>]` | `[phase=<p>&]<source>` | How `<source>` differs from the branch's current version |
 //! | `/diff/<a>/<b>` | `[phase=<p>]` | How `<b>`'s current version differs from `<a>`'s |
 //! | `/reload[/<branch>]` | `<source>` | Replace the branch's version with `<source>` |
+//! | `/restart` | `<source>` | Discard every branch and run `<source>` from a fresh compile as `main` |
 //! | `/branch/<name>[/from/<parent>]` | `<source>` | Create `<name>` from `<parent>` and reload it with `<source>` |
 //! | `/branch/<name>/delete` | nothing | Delete `<name>` |
 //! | `/branch/<name>/info` | nothing | Report `<name>`'s origin, versions and source |
 //! | `/branches` | nothing | List every branch |
 //!
-//! `/reload` and both `/branch` forms that change the table require `POST`,
+//! `/reload`, `/restart` and both `/branch` forms that change the table require `POST`,
 //! and any other method answers 405. An omitted `<branch>` or `<parent>`
 //! means `main`. A segment in a name position that is not a branch name is an
 //! unknown path, and answers 404.
@@ -62,7 +63,7 @@ use crate::ccl::load::{LoadError, LoadedProgram};
 use crate::inspector_model::{Diagnostic, diagnostics_from_compile_errors};
 use crate::live_program::{
     BranchError, LiveProgram, MAIN_BRANCH, MainConsumerFactory, ReloadError, ReloadReport,
-    is_branch_name, render_unreadable,
+    Restarted, is_branch_name, render_unreadable,
 };
 
 /// What a control-port client asked for.
@@ -84,6 +85,8 @@ pub enum ControlRequest {
     },
     /// Replace `branch`'s version with `code`.
     Reload { branch: String, code: String },
+    /// Discard every branch and run `code` from a fresh compile as `main`.
+    Restart { code: String },
     /// Create `name` from `parent`'s current version and reload it with `code`.
     Branch {
         name: String,
@@ -104,6 +107,7 @@ impl ControlRequest {
     pub fn mutates(&self) -> bool {
         match self {
             ControlRequest::Reload { .. }
+            | ControlRequest::Restart { .. }
             | ControlRequest::Branch { .. }
             | ControlRequest::Delete { .. } => true,
             ControlRequest::Diff { .. }
@@ -237,10 +241,36 @@ impl ControlReply {
         Self::with_status(404, body)
     }
 
+    /// The `409` a finished program waiting for a restart answers every other
+    /// request with.
+    pub fn finished() -> Self {
+        Self::with_status(
+            409,
+            "the program has finished; it takes no request but `/restart`\n",
+        )
+    }
+
     /// A `503` carrying `body`: the request reached no running program.
     fn unavailable(body: impl Into<String>) -> Self {
         Self::with_status(503, body)
     }
+}
+
+/// A restart's `200` body: `main`'s new version, and the branches it discarded.
+fn render_restart(restarted: &Restarted) -> String {
+    let mut reply = format!(
+        "restarted: `{MAIN_BRANCH}@{}` from a fresh compile\n",
+        restarted.version
+    );
+    if !restarted.discarded.is_empty() {
+        let names: Vec<String> = restarted
+            .discarded
+            .iter()
+            .map(|n| format!("`{n}`"))
+            .collect();
+        reply.push_str(&format!("discarded branches {}\n", names.join(", ")));
+    }
+    reply
 }
 
 /// A reload's `200` body: the tally, a blank line, the difference at
@@ -342,6 +372,15 @@ pub fn service(
                     reuse: Some(report.reuse),
                     ..ControlReply::ok(render_reload(&report))
                 },
+                Err(e) => branch_error(e, &posted),
+            }
+        }
+        // Every operator is built anew, so each takes the scheduler's probe slot
+        // as the first compile's did.
+        ControlRequest::Restart { code } => {
+            let posted = LoadedProgram::from_text(POSTED, code.as_str());
+            match live.restart(ctx, &posted, main_consumer) {
+                Ok(restarted) => ControlReply::ok(render_restart(&restarted)),
                 Err(e) => branch_error(e, &posted),
             }
         }
@@ -534,6 +573,18 @@ impl ControlPort {
     pub fn poll(&self) -> Option<ControlMessage> {
         self.rx.try_recv().ok()
     }
+
+    /// Wait for the next request.
+    ///
+    /// For a main loop with nothing left to run but a request to wait on: a
+    /// finished program under `--inspect`, which takes a `/restart`. Never
+    /// returns `None` while the port is alive, since the port holds a sender of
+    /// its own.
+    pub fn wait(&self) -> ControlMessage {
+        self.rx
+            .recv()
+            .expect("the port's own client keeps its queue open")
+    }
 }
 
 /// Every pipeline position `/diff` offers, with the `phase=` spelling that names
@@ -685,6 +736,10 @@ fn parse_request(url: &str, body: &str) -> Result<ControlRequest, ControlReply> 
                 branch: rest.first().copied().unwrap_or(MAIN_BRANCH).to_string(),
                 code,
             })
+        }
+        ("restart", []) => {
+            require_code(&code)?;
+            Ok(ControlRequest::Restart { code })
         }
         ("branch", [name]) => {
             require_code(&code)?;
@@ -1068,6 +1123,7 @@ mod tests {
     fn a_malformed_name_or_path_answers_404() {
         assert_eq!(status_of("/branch/no.dots?x"), 404);
         assert_eq!(status_of("/reload/?x"), 404);
+        assert_eq!(status_of("/restart/main?x"), 404);
         assert_eq!(status_of("/diff/a/b/c?x"), 404);
         assert_eq!(status_of("/branch/a/rename"), 404);
         assert_eq!(status_of("/branches/list"), 404);
@@ -1089,6 +1145,11 @@ mod tests {
             require_post("GET", &reload).expect_err("refused").status,
             405
         );
+        let restart = parse_request("/restart", "x = 1; x").expect("parses");
+        assert_eq!(
+            require_post("GET", &restart).expect_err("refused").status,
+            405
+        );
         let create = parse_request("/branch/qa", "x = 1; x").expect("parses");
         assert_eq!(
             require_post("PUT", &create).expect_err("refused").status,
@@ -1098,6 +1159,16 @@ mod tests {
             let request = parse_request(read, "").expect("parses");
             assert!(require_post("GET", &request).is_ok(), "{read} only reads");
         }
+    }
+
+    /// `/restart` names no branch, because it discards them all.
+    #[test]
+    fn restart_takes_a_source_and_no_branch() {
+        match parse_request("/restart", "y = 2; y").expect("parses") {
+            ControlRequest::Restart { code } => assert_eq!(code, "y = 2; y"),
+            other => panic!("expected a restart request, got {other:?}"),
+        }
+        assert_eq!(status_of("/restart"), 400, "a restart carries its version");
     }
 
     /// The sourceless verbs ignore the request body.

@@ -7,7 +7,7 @@
 //     hover types, Ctrl/Cmd-click goto-def, diagnostic squiggles, and the
 //     resolved selection highlight (see sourceView.ts). It is read-only unless
 //     the server takes a reload, and then the reader edits the program and
-//     reloads `main` with it (reload.ts);
+//     reloads `main` with it or restarts the program from it (reload.ts);
 //   - one collapsible, cross-linked IR tree per tree-shaped pipeline pane
 //     (treeView.ts), ordered upstream -> downstream;
 //   - or — on a degraded/failed snapshot — a diagnostics list in place of the
@@ -39,7 +39,7 @@ import { type LiveTag, LiveStore, connectLive } from "./liveStore";
 import { renderLiveMenu } from "./liveMenu";
 import { LiveView, livePanelState, serializeLivePanel } from "./liveView";
 import { validateSnapshot } from "./wireValidate";
-import { EditSession, finishWithRun, postReload, serverReloads } from "./reload";
+import { EditSession, followRun, postVersion, serverReloads } from "./reload";
 import { isIrPane } from "./types";
 import type { Diagnostic, Snapshot, Span } from "./types";
 import { el } from "./dom";
@@ -556,8 +556,8 @@ async function main(): Promise<void> {
     // all.
     const live = new LiveStore();
     connectLive(live);
-    const session = (await serverReloads()) ? new EditSession(postReload()) : undefined;
-    if (session) finishWithRun(live, session);
+    const session = (await serverReloads()) ? new EditSession(postVersion()) : undefined;
+    if (session) followRun(live, session);
     followReloads(
       root,
       live,

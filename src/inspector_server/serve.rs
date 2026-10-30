@@ -6,9 +6,10 @@
 //! requests that read them. [`serve`] compiles `code` itself and renders once;
 //! [`serve_compiled`] takes the compile a driver is about to run, and hands back
 //! a [`ServedSnapshot`] the driver replaces when a reload installs another
-//! version. There is no per-request recompilation. The one route that changes
-//! anything is `POST /api/reload`, on a run with a control port, and it hands
-//! the change to the driver rather than making it ([`super::reload`]).
+//! version. There is no per-request recompilation. The two routes that change
+//! anything are `POST /api/reload` and `POST /api/restart`, on a run with a
+//! control port, and they hand the change to the driver rather than making it
+//! ([`super::reload`]).
 //!
 //! # Routes
 //!
@@ -22,10 +23,13 @@
 //!   [`LiveServer::accept`]; it carries the probe frames a driver publishes
 //!   through the [`LiveChannel`], and nothing under [`serve`], which runs no
 //!   program.
-//! - `GET /api/capabilities` — `{"reload": bool}`: whether this server takes
-//!   `POST /api/reload`. `application/json`.
+//! - `GET /api/capabilities` — `{"reload": bool, "restart": bool}`: whether
+//!   this server takes `POST /api/reload` and `POST /api/restart`.
+//!   `application/json`.
 //! - `POST /api/reload` — reload `main` with the posted source, through the
 //!   run's control port ([`super::reload`]). `application/json`.
+//! - `POST /api/restart` — discard every branch and run the posted source from
+//!   a fresh compile, through the run's control port. `application/json`.
 //! - `GET /` and `GET /index.html` — the CodeMirror frontend: the built,
 //!   self-contained `web/dist/index.html` bundle, which
 //!   fetches `/api/snapshot` and renders the source + IR tree. `text/html`.
@@ -54,7 +58,7 @@ use crate::ccl::context::{CompiledProgram, GlobalContext, compile_program};
 use crate::control_port::ControlClient;
 use crate::inspector_model::{Diagnostic, InspectorPayload, diagnostics_from_compile_errors};
 use crate::inspector_server::live::{LIVE_PATH, LiveChannel, LiveServer};
-use crate::inspector_server::reload::{self, RELOAD_PATH, capabilities_body};
+use crate::inspector_server::reload::{self, Verb, capabilities_body};
 use crate::interpreter::Consumer;
 
 use super::{snapshot_json, snapshot_json_at_version, snapshot_json_pretty};
@@ -324,9 +328,9 @@ fn serve_bodies(server: &tiny_http::Server, bodies: Bodies, live: &LiveServer) {
         }
         // Answered on a thread of its own: the main loop compiles the version
         // before it answers, and the routes below keep serving meanwhile.
-        if route(request.url()) == RELOAD_PATH {
+        if let Some(verb) = Verb::at(route(request.url())) {
             let control = bodies.control.clone();
-            thread::spawn(move || reload::answer(request, control));
+            thread::spawn(move || reload::answer(request, control, verb));
             continue;
         }
         // A response borrows its body: the snapshot is megabytes on a large

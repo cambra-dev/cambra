@@ -1,8 +1,9 @@
 // The CodeMirror 6 source editor plus its interactivity.
 //
 // Read-only unless the page holds an `EditSession` (reload.ts), which it does
-// when the server takes a reload. Then the reader edits the program and
-// `Mod-Enter` reloads `main` with it. Every lookup below is over the payload's
+// when the server takes a reload. Then the reader edits the program,
+// `Mod-Enter` reloads `main` with it, and `Mod-Shift-Enter` restarts the
+// program from it. Every lookup below is over the payload's
 // byte spans, which describe the compiled text, so while the document differs
 // from it the pane is "edited": hover, goto-definition and selection are off,
 // and no span is painted, rather than pointing at whatever text now sits at
@@ -25,7 +26,6 @@
 // present).
 
 import {
-  Compartment,
   EditorSelection,
   EditorState,
   type Extension,
@@ -230,26 +230,30 @@ export function editorDiagnostics(
 }
 
 /** How the reload chord is written on this platform. */
-function chordLabel(): string {
-  return /Mac|iPhone|iPad/.test(navigator.platform) ? "⌘⏎" : "Ctrl+Enter";
+/** How this platform spells `Mod-Enter`, and `Mod-Shift-Enter` with `shift`. */
+function chordLabel(shift = false): string {
+  const mac = /Mac|iPhone|iPad/.test(navigator.platform);
+  if (shift) return mac ? "⌘⇧⏎" : "Ctrl+Shift+Enter";
+  return mac ? "⌘⏎" : "Ctrl+Enter";
 }
 
 /**
  * The status strip's text, and the modifier class that colours it.
  *
- * A reload in flight or its refusal outranks an edit, because those are the
+ * A version in flight or its refusal outranks an edit, because those are the
  * answer to the last thing the reader asked for; an edit outranks an accepted
- * reload, because the text on screen is then no longer the version that was
- * accepted.
+ * version, because the text on screen is then no longer the one that was
+ * accepted. A finished run outranks both, because only a restart is left.
  */
 export function statusLine(
   status: EditStatus,
   edited: boolean,
 ): { text: string; kind: string; title?: string } {
   const chord = chordLabel();
+  const restart = chordLabel(true);
   switch (status.kind) {
     case "reloading":
-      return { text: "reloading…", kind: "busy" };
+      return { text: "sending…", kind: "busy" };
     case "rejected": {
       const marked = status.diagnostics.filter((d) => d.span !== null).length;
       if (marked > 0) {
@@ -264,17 +268,23 @@ export function statusLine(
       return { text: `rejected · ${first.replace(/^error: /, "")}`, kind: "error", title: status.message };
     }
     case "failed":
-      return { text: `reload failed · ${status.message}`, kind: "error", title: status.message };
+      return { text: `not sent · ${status.message}`, kind: "error", title: status.message };
     case "finished":
-      return { text: "the program has finished · a finished program takes no reload", kind: "idle" };
+      return { text: `the program has finished · ${restart} restarts it with this text`, kind: "idle" };
     default:
       break;
   }
-  if (edited) return { text: `edited · not compiled · ${chord} reloads`, kind: "edited" };
+  if (edited) {
+    return { text: `edited · not compiled · ${chord} reloads · ${restart} restarts`, kind: "edited" };
+  }
   if (status.kind === "reloaded") {
     return { text: `reloaded · ${status.kept} of ${status.bound} operators kept`, kind: "ok" };
   }
-  return { text: `${chord} reloads the running program with this text`, kind: "idle" };
+  if (status.kind === "restarted") return { text: "restarted from a fresh compile", kind: "ok" };
+  return {
+    text: `${chord} reloads the running program with this text · ${restart} restarts it`,
+    kind: "idle",
+  };
 }
 
 export class SourceView {
@@ -286,8 +296,6 @@ export class SourceView {
   private readonly session: EditSession | undefined;
   private readonly status: HTMLElement | null = null;
   private readonly releases: (() => void)[] = [];
-  // Holds the editing extensions, so a run that ends can take them away.
-  private readonly editability = new Compartment();
   // The post-inference pane's indices, used for hover types + goto-def. May be
   // undefined on a degraded snapshot (no panes); interactions then degrade.
   private readonly anchor: Indices | undefined;
@@ -492,7 +500,7 @@ export class SourceView {
         // where the reader clicked; `drawSelection` draws both the caret and
         // the selection itself, and puts their colours under this app's CSS.
         drawSelection(),
-        this.editability.of(editable(session)),
+        editable(session),
         ...(session ? [editTracking] : []),
         EditorView.lineWrapping,
         cambraSyntax,
@@ -529,9 +537,6 @@ export class SourceView {
   }
 
   private onStatus(status: EditStatus): void {
-    if (status.kind === "finished" && this.view.state.facet(EditorView.editable)) {
-      this.view.dispatch({ effects: this.editability.reconfigure(editable(undefined)) });
-    }
     if (status.kind === "rejected" && status.diagnostics.length > 0) {
       const marks = editorDiagnostics(status.diagnostics, status.source, this.view.state.doc.length);
       if (this.view.state.doc.toString() === status.source || marks.length > 0) {
@@ -618,19 +623,20 @@ export class SourceView {
 
 /**
  * Whether the pane takes typing, and what it adds when it does: editable while
- * `session` is present and its run has not ended.
+ * `session` is present. A finished run stays editable, because it takes a
+ * restart.
  */
 function editable(session: EditSession | undefined): Extension {
-  const live = session !== undefined && !session.finished;
   return [
-    EditorState.readOnly.of(!live),
-    EditorView.editable.of(live),
-    ...(live ? [editing(session)] : []),
+    EditorState.readOnly.of(session === undefined),
+    EditorView.editable.of(session !== undefined),
+    ...(session ? [editing(session)] : []),
   ];
 }
 
 /**
- * What an editable pane adds: indentation, undo, and the reload chord.
+ * What an editable pane adds: indentation, undo, and the reload and restart
+ * chords.
  *
  * `indentUnit` is two spaces, as the gallery is written. CHL is off-side-rule,
  * so a block's indentation is part of the program: `Tab` and `Shift-Tab` move
@@ -649,6 +655,14 @@ function editing(session: EditSession): Extension {
         preventDefault: true,
         run: (view) => {
           void session.reload(view.state.doc.toString());
+          return true;
+        },
+      },
+      {
+        key: "Mod-Shift-Enter",
+        preventDefault: true,
+        run: (view) => {
+          void session.restart(view.state.doc.toString());
           return true;
         },
       },

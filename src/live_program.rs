@@ -340,6 +340,14 @@ pub struct Created {
     pub report: ReloadReport,
 }
 
+/// What one accepted [`LiveProgram::restart`] did.
+pub struct Restarted {
+    /// `main`'s version number after the restart.
+    pub version: u64,
+    /// The other branches the restart discarded, in creation order.
+    pub discarded: Vec<String>,
+}
+
 /// What one [`LiveProgram::diff_against`] question answered.
 ///
 /// The two answers a [`ReloadReport`] carries, minus what only a reload can say,
@@ -1092,5 +1100,79 @@ the lagging branch first"
         let still_bound = self.routes_bound_except(None);
         ctx.retire_routes_absent_from(&still_bound);
         Ok(version)
+    }
+
+    /// Discard every branch and run `loaded` from a fresh compile as `main`'s
+    /// next version, the only branch in the table
+    /// (`src/ccl/design/program-evolution.md`, "`/restart`").
+    ///
+    /// Where a reload carries a branch's state forward, a restart keeps none: no
+    /// operator is offered to the compile, so every store starts from its
+    /// declaration and every loop from the first element its source still
+    /// offers. What persists is what the process owns rather than a branch: the
+    /// sources and the routes the new version still binds, and `main`'s version
+    /// count, which goes on rising so that every version a reader saw keeps the
+    /// number it was seen under. A discarded branch leaves a tombstone, as a
+    /// deleted one does.
+    ///
+    /// On `Err` every branch is untouched and still serving: the compile to
+    /// [`Phase::Planning`], which binds the ports the new version adds, runs
+    /// before anything is torn down. No state guard runs, because there is no
+    /// state to take over.
+    ///
+    /// # Panics
+    ///
+    /// As [`reload`](Self::reload).
+    pub fn restart(
+        &mut self,
+        ctx: &mut GlobalContext,
+        loaded: &LoadedProgram,
+        main_consumer: MainConsumerFactory<'_>,
+    ) -> Result<Restarted, BranchError> {
+        ctx.sources_and_sinks_mut()
+            .compile_to_opening(loaded, Phase::Planning)
+            .inspect_err(|_| ctx.sources_and_sinks_mut().release_unrouted_ports())?;
+
+        let version = match self.index_of(MAIN_BRANCH) {
+            Ok(at) => self.branches[at].version,
+            Err(_) => self.tombstones.get(MAIN_BRANCH).copied().unwrap_or(0),
+        } + 1;
+        let mut discarded = Vec::new();
+        for mut branch in std::mem::take(&mut self.branches) {
+            branch.tear_down();
+            if branch.name != MAIN_BRANCH {
+                self.tombstones.insert(branch.name.clone(), branch.version);
+                discarded.push(branch.name.clone());
+            }
+        }
+        self.tombstones.remove(MAIN_BRANCH);
+        // Every operator is gone with the entries that held it, so a new
+        // producer starts where its source's buffer does rather than where a
+        // discarded one had read to, and the conversion context offers nothing.
+        ctx.carry_release_from(&HashSet::new());
+        ctx.offer_predecessor(&OperatorMap::default());
+
+        let main_notified = Rc::new(Cell::new(false));
+        let program = compile_program(
+            ctx,
+            loaded,
+            branch_main_consumer(&main_notified, main_consumer),
+        )
+        .expect("a version that compiled to Planning must compile to operators");
+        let (program, main_producer) = driving(program);
+        main_notified.set(true);
+        self.branches.push(Branch {
+            name: MAIN_BRANCH.to_string(),
+            origin: None,
+            version,
+            history: vec![(version, ctx.reuse())],
+            program,
+            main_producer,
+            main_notified,
+            main_finished: false,
+            sinks_done: false,
+            operator_map: ctx.take_operator_map(),
+        });
+        Ok(Restarted { version, discarded })
     }
 }

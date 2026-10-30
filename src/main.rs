@@ -6,7 +6,7 @@ use cambra::{
         load::LoadedProgram,
         provenance::NodeId,
     },
-    control_port::{ControlPort, service},
+    control_port::{ControlPort, ControlReply, ControlRequest, service},
     inspector_server::{ServedSnapshot, live::LiveChannel, serve_compiled},
     interpreter::{
         ColumnValue, Consumer, Scheduler,
@@ -167,7 +167,18 @@ fn run_program(
             inspection.publish(&sources);
         }
         if live.poll_finished() {
-            break;
+            if let Some(inspection) = inspection.as_ref() {
+                inspection.publish_final(ctx.scheduler());
+            }
+            // A finished program under `--inspect` keeps its process, so with a
+            // control port it can be restarted; without one, or without
+            // `--inspect`, nothing is left to do.
+            // The pass after a restart follows its version like any other.
+            match (control.as_ref(), inspection.is_some()) {
+                (Some(port), true) => await_restart(port, &mut ctx, &mut live, &main_consumer),
+                _ => break,
+            }
+            continue;
         }
         // A `main` output is pulled as soon as it is notified, so while one is
         // running the loop spins; a sink program is woken by its sources. A pass that
@@ -180,10 +191,35 @@ fn run_program(
         }
     }
 
-    if let Some(inspection) = inspection.as_ref() {
-        inspection.publish_final(ctx.scheduler());
-    }
     Ok(())
+}
+
+/// Answer control requests to a finished program until one restarts it.
+///
+/// A finished program takes no request but `/restart`
+/// (`src/ccl/design/program-evolution.md`, "`/restart`"): a reload carries
+/// state forward into a run that has none left to carry, so every other verb is
+/// answered `409`, as the control port answers once the driver loop is gone.
+fn await_restart(
+    port: &ControlPort,
+    ctx: &mut GlobalContext,
+    live: &mut LiveProgram,
+    main_consumer: &dyn Fn() -> Box<dyn Consumer>,
+) {
+    eprintln!("cambra: the program has finished; a `/restart` runs it again");
+    loop {
+        let message = port.wait();
+        if !matches!(message.request(), ControlRequest::Restart { .. }) {
+            message.answer(ControlReply::finished());
+            continue;
+        }
+        let reply = service(message.request(), ctx, live, main_consumer);
+        let restarted = reply.status == 200;
+        message.answer(reply);
+        if restarted {
+            return;
+        }
+    }
 }
 
 /// What the driver has taken delivery of in `tile`, to release back.
