@@ -690,6 +690,9 @@ const COMPILE_FAILS: &[&str] = &[
     "nonneg_inventory",
     "reachability",
     "refinement",
+    // A program of two modules: the dump refuses a program of several files,
+    // and `lines.cambra`, a module, ends in no program value.
+    "source_two_runs",
     "storefront",
     "txn_kv",
     "type_error",

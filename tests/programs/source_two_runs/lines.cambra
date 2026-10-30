@@ -1,0 +1,1 @@
+pub lines = [line for line in stdin()]

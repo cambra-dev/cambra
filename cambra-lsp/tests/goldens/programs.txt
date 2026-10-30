@@ -287,6 +287,17 @@ symbols:
   variable tagged 1:1-1:43 (name 1:1-1:7)
   variable shouted 2:1-2:43 (name 2:1-2:8)
 folds:
+== tests/programs/source_two_runs/lines.cambra
+diagnostics:
+symbols:
+  variable lines 1:1-1:39 (name 1:5-1:10)
+folds:
+== tests/programs/source_two_runs/program.cambra
+diagnostics:
+symbols:
+  module a 1:1-1:15 (name 1:14-1:15)
+  module b 2:1-2:15 (name 2:14-2:15)
+folds:
 == tests/programs/storefront/v0.cambra
 diagnostics:
   41:23-41:25 found 'in', expected binary operator, comparison operator, boolean operator, postfix operation, 'if', '<<', '^+', '->', '=>', '|=>', '**', '}', or '::'
