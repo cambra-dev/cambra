@@ -3,6 +3,9 @@
 // builtins
 // ---------------------------------------------------------------------------
 
+use crate::ccl::Annotation;
+use crate::ccl::Occurrence;
+use crate::ccl::lower::ResolvedName;
 use smol_str::SmolStr;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
@@ -651,14 +654,20 @@ fn enclosing(tree: &Expr, node: NodeId) -> Option<Vec<NodeId>> {
     let mut parents: HashMap<NodeId, NodeId> = HashMap::new();
     let mut stack: Vec<&Expr> = vec![tree];
     while let Some(e) = stack.pop() {
-        if e.node_id() == node {
+        // An occurrence is enclosed by the node that holds it.
+        let mut holds = false;
+        e.walk_occurrences(|occurrence, _| holds |= occurrence.id() == node);
+        if e.node_id() == node || holds {
             let mut chain = Vec::new();
-            let mut at = node;
+            let mut at = e.node_id();
             while let Some(&p) = parents.get(&at) {
                 chain.push(p);
                 at = p;
             }
             chain.reverse();
+            if holds {
+                chain.push(e.node_id());
+            }
             return Some(chain);
         }
         let mut children: Vec<&Expr> = Vec::new();
@@ -1234,6 +1243,9 @@ pub struct CompiledProgram {
     /// checks, not release validation. See `src/ccl/design/provenance.md`,
     /// "Lowering attribution" and "The lowering fold".
     pub lowering_projection: SourceProjection,
+    /// The names lowering resolved in types and module paths, which no tree holds
+    /// (`src/ccl/design/lowering.md`, "Names lowering resolves").
+    pub resolved_names: Vec<ResolvedName>,
     /// Snapshot after uniquification and before A-normalization and inference.
     /// IDs are preserved; types remain unresolved. See `src/ccl/design/provenance.md`,
     /// "Retained snapshots".
@@ -1392,7 +1404,9 @@ pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)
     // One entry per *distinct* predicate term, keyed by `Rc` pointer: a term
     // riding many type slots is one term and shares its ids with itself.
     fn ids_of(e: &Expr, out: &mut HashSet<NodeId>) {
-        out.insert(e.node_id());
+        e.for_each_own_id(|id| {
+            out.insert(id);
+        });
         e.walk_children(|c| ids_of(c, out));
     }
     fn from_ty(t: &Type, acc: &mut HashMap<usize, HashSet<NodeId>>) {
@@ -1441,7 +1455,9 @@ pub(crate) fn predicate_id_collisions(expr: &Expr) -> Vec<(NodeId, &'static str)
 /// Expression-pane folds use [`collect_tree_ids`] instead.
 pub(crate) fn collect_main_tree_ids(expr: &Expr) -> HashSet<NodeId> {
     fn go(e: &Expr, acc: &mut HashSet<NodeId>) {
-        acc.insert(e.node_id());
+        e.for_each_own_id(|id| {
+            acc.insert(id);
+        });
         e.walk_children(|c| go(c, acc));
     }
     let mut acc = HashSet::new();
@@ -1464,7 +1480,11 @@ pub(crate) fn collect_tree_ids(expr: &Expr) -> HashSet<NodeId> {
     }
 
     fn from_expr(e: &Expr, acc: &mut HashSet<NodeId>) {
-        acc.insert(e.node_id());
+        // The node's id and every occurrence it holds
+        // (`src/ccl/design/provenance.md`, "Walking the ids with occurrences").
+        e.for_each_own_id(|id| {
+            acc.insert(id);
+        });
         // Delegating to `walk_type_slots` is what keeps the two in step, and they
         // must be: the rewriting passes reach predicates through that walk, so a
         // slot it covers and this does not is a predicate a pass may rebuild while
@@ -1490,6 +1510,11 @@ fn duplicate_node_ids(expr: &Expr) -> Vec<(NodeId, &'static str)> {
         if !seen.insert(e.node_id()) {
             dups.push((e.node_id(), e.node.kind_name()));
         }
+        e.walk_occurrences(|occurrence, _| {
+            if !seen.insert(occurrence.id()) {
+                dups.push((occurrence.id(), "occurrence"));
+            }
+        });
         e.walk_children(|c| walk(c, seen, dups));
     }
     let mut seen = HashSet::new();
@@ -1534,9 +1559,11 @@ pub(crate) fn assert_unique_node_ids(expr: &Expr, boundary: &str) {
     // phase boundary; a persisted placeholder means a `mem::take` slot was left
     // unfilled, which would silently corrupt provenance.
     fn walk_placeholder(e: &Expr, found: &mut bool) {
-        if e.node_id() == NodeId::PLACEHOLDER {
-            *found = true;
-        }
+        e.for_each_own_id(|id| {
+            if id == NodeId::PLACEHOLDER {
+                *found = true;
+            }
+        });
         e.walk_children(|c| walk_placeholder(c, found));
     }
     let mut placeholder = false;
@@ -1872,6 +1899,9 @@ struct Frontend {
     /// bottoms out in and the source every post-lowering diagnostic resolves
     /// against (`Blame`).
     lowering_projection: SourceProjection,
+    /// The names lowering resolved in types and module paths
+    /// (`src/ccl/design/lowering.md`, "Names lowering resolves").
+    resolved_names: Vec<ResolvedName>,
     /// Open when the run recorded. The caller drains it once nothing else will
     /// record, so the timing matches a compile that never split.
     table_session: Option<TableSession>,
@@ -1953,6 +1983,7 @@ fn run_frontend(
     let lower_result = lower_program(program, ctx.lowering_ctx());
     let checks = std::mem::take(&mut ctx.lowering_ctx().module_checks);
     let run_sites = std::mem::take(&mut ctx.lowering_ctx().run_sites);
+    let resolved_names = ctx.lowering_ctx().take_resolved_names();
     errors.extend(lower_result.errors.into_iter().map(CompileError::Lower));
     let Some(mut expr) = lower_result.value else {
         return Err(errors);
@@ -2004,6 +2035,7 @@ fn run_frontend(
             panes,
             sink_bindings,
             lowering_projection,
+            resolved_names,
             table_session,
         });
     }
@@ -2031,6 +2063,7 @@ fn run_frontend(
         panes,
         sink_bindings,
         lowering_projection,
+        resolved_names,
         table_session,
     })
 }
@@ -2252,7 +2285,7 @@ fn annotate_arguments(
         })
         && let Some(ty) = inferred.get(&(argument.module.clone(), argument.parameter.clone()))
     {
-        binding.user_annotation = Some(ty.clone());
+        binding.user_annotation = Some(Annotation::new(ty.clone(), Occurrence::mint()));
     }
     tree.walk_children_mut(|child| annotate_arguments(child, arguments, inferred));
 }
@@ -2832,6 +2865,7 @@ fn compile_version(
         mut panes,
         sink_bindings: sink_bindings_registry,
         lowering_projection,
+        resolved_names,
         table_session,
     } = run_frontend(ctx, program, Phase::Planning, &PANES, true)?;
     // A route the registry holds and this version did not bind is one the version
@@ -3004,6 +3038,7 @@ fn compile_version(
         outputs,
         done: done_rx,
         lowering_projection,
+        resolved_names,
         pre_inference_ir,
         post_inference_ir,
         post_channelize_ir,
@@ -3479,7 +3514,8 @@ Error: lowering error
             z = 2 + "t"
             y
         "#},
-        &["x: Int = \"s\"", "2 + \"t\""]
+        // The mismatch reports at the annotation the statement writes.
+        &["Int", "2 + \"t\""]
     )]
     #[case::a_mutable_seed(
         indoc::indoc! {r#"
@@ -3747,7 +3783,7 @@ x = (1 +)
 
         let (target, in_target) = refined();
         let cast = Expr::cast(Expr::lit(Lit::Int(5)), target);
-        let root = Expr::let_bind("x", Expr::lit(Lit::Int(1)), cast);
+        let root = Expr::let_bind("x", Occurrence::mint(), Expr::lit(Lit::Int(1)), cast);
         let TypedExprNode::Let { body, .. } = &root.node else {
             unreachable!()
         };

@@ -447,12 +447,12 @@ fn walk_children_with_demand(
     }
     match (effective.peel_refinements(), &mut expr.node) {
         (Type::Record(field_tys), TypedExprNode::Record(fields)) => {
-            for (name, child) in fields.iter_mut() {
+            for entry in fields.iter_mut() {
                 let field = field_tys
                     .iter()
-                    .find(|(n, _)| n == name)
+                    .find(|(n, _)| *n == entry.label)
                     .map(|(_, t)| t.clone());
-                visit(child, field, materialized);
+                visit(&mut entry.value, field, materialized);
             }
         }
         (Type::Tuple(elt_tys), TypedExprNode::Tuple(elts)) if elt_tys.len() == elts.len() => {
@@ -1387,6 +1387,7 @@ fn erase_determined_boxes(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Occurrence;
     use crate::ccl::infer_var::fresh_witness_binder_id;
     use crate::ccl::ty::{TypeKind, Witness};
     use crate::ccl::{Branch, Lit, Name};
@@ -1568,6 +1569,7 @@ mod tests {
             let ty = Type::sum_binding(wit, Type::data_fun(occurrence, int.clone()));
             Expr::let_bind(
                 "x",
+                Occurrence::mint(),
                 Expr::new(TypedExprNode::Case {
                     scrutinee: None,
                     branches: arms

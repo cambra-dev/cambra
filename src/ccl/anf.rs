@@ -175,6 +175,8 @@
 //! buried under a `Let` again, which this pass cannot prevent since it runs
 //! before that substitution exists.
 
+use crate::ccl::Occurrence;
+use crate::ccl::RecordEntry;
 use crate::ccl::{
     Branch, Expr, Name, TypedBinding, TypedExprNode,
     ccl_utils::is_free,
@@ -449,10 +451,19 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
         TypedExprNode::Record(fields) => {
             let mut binds = Vec::new();
             let mut out = Vec::with_capacity(fields.len());
-            for (name, value) in fields {
+            for RecordEntry {
+                label,
+                label_occurrence,
+                value,
+            } in fields
+            {
                 let (value_binds, value) = atomize(value, muts);
                 binds.extend(value_binds);
-                out.push((name, value));
+                out.push(RecordEntry {
+                    label,
+                    label_occurrence,
+                    value,
+                });
             }
             let_chain(binds, rebuild(TypedExprNode::Record(out)))
         }
@@ -460,11 +471,16 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
         // The candidates are references, already atoms.
         node @ TypedExprNode::Method { .. } => rebuild(node),
 
-        TypedExprNode::VariantCtor { tag, payload } => {
+        TypedExprNode::VariantCtor {
+            tag_occurrence,
+            tag,
+            payload,
+        } => {
             let (binds, payload) = atomize(*payload, muts);
             let_chain(
                 binds,
                 rebuild(TypedExprNode::VariantCtor {
+                    tag_occurrence,
                     tag,
                     payload: Box::new(payload),
                 }),
@@ -488,29 +504,44 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
             )
         }
 
-        TypedExprNode::Feed { name, value } => {
+        TypedExprNode::Feed {
+            name_occurrence,
+            name,
+            value,
+        } => {
             let (binds, value) = atomize_handle(*value, muts);
             let_chain(
                 binds,
                 rebuild(TypedExprNode::Feed {
+                    name_occurrence,
                     name,
                     value: Box::new(value),
                 }),
             )
         }
 
-        TypedExprNode::Define { name, value } => {
+        TypedExprNode::Define {
+            name_occurrence,
+            name,
+            value,
+        } => {
             let (binds, value) = atomize_handle(*value, muts);
             let_chain(
                 binds,
                 rebuild(TypedExprNode::Define {
+                    name_occurrence,
                     name,
                     value: Box::new(value),
                 }),
             )
         }
 
-        TypedExprNode::MutWrite { name, key, value } => {
+        TypedExprNode::MutWrite {
+            name_occurrence,
+            name,
+            key,
+            value,
+        } => {
             let mut binds = Vec::new();
             let key = match key {
                 Some(key) => {
@@ -525,6 +556,7 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
             let_chain(
                 binds,
                 rebuild(TypedExprNode::MutWrite {
+                    name_occurrence,
                     name,
                     key,
                     value: Box::new(value),
@@ -694,7 +726,12 @@ fn name_reads(e: &mut Expr, muts: &Muts, reads: &mut Vec<(Name, Name)>) {
 fn read_bindings(reads: Vec<(Name, Name)>) -> Vec<(TypedBinding, Expr)> {
     reads
         .into_iter()
-        .map(|(variable, temp)| (TypedBinding::new_unannotated(temp), Expr::var(variable)))
+        .map(|(variable, temp)| {
+            (
+                TypedBinding::new_unannotated(temp, Occurrence::mint()),
+                Expr::var(variable),
+            )
+        })
         .collect()
 }
 
@@ -710,7 +747,7 @@ fn atomize(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
         return (binds, core);
     }
     let name = Name::anf_temp();
-    let binding = TypedBinding::new_unannotated(name.clone());
+    let binding = TypedBinding::new_unannotated(name.clone(), Occurrence::mint());
     // The read stands where `core` stood, and a later pass that inlines the binding again
     // leaves this read's identity in the tree, so it is attributed to `core`, not the root.
     let var_ref = {
@@ -841,7 +878,12 @@ fn atomize_stmt_effect(expr: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, E
         out
     };
     match expr.node {
-        TypedExprNode::MutWrite { name, key, value } => {
+        TypedExprNode::MutWrite {
+            name_occurrence,
+            name,
+            key,
+            value,
+        } => {
             let mut binds = Vec::new();
             let key = match key {
                 Some(key) => {
@@ -856,6 +898,7 @@ fn atomize_stmt_effect(expr: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, E
             (
                 binds,
                 rebuild(TypedExprNode::MutWrite {
+                    name_occurrence,
                     name,
                     key,
                     value: Box::new(value),
@@ -900,21 +943,31 @@ fn atomize_stmt_effect(expr: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, E
                 }),
             )
         }
-        TypedExprNode::Feed { name, value } => {
+        TypedExprNode::Feed {
+            name_occurrence,
+            name,
+            value,
+        } => {
             let (binds, value) = atomize_handle(*value, muts);
             (
                 binds,
                 rebuild(TypedExprNode::Feed {
+                    name_occurrence,
                     name,
                     value: Box::new(value),
                 }),
             )
         }
-        TypedExprNode::Define { name, value } => {
+        TypedExprNode::Define {
+            name_occurrence,
+            name,
+            value,
+        } => {
             let (binds, value) = atomize_handle(*value, muts);
             (
                 binds,
                 rebuild(TypedExprNode::Define {
+                    name_occurrence,
                     name,
                     value: Box::new(value),
                 }),
@@ -1069,6 +1122,7 @@ fn debug_assert_flat_spines(e: &Expr) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Annotation;
     use crate::ccl::symbolic::symbolic;
     use crate::ccl::{ArithmeticKind, BaseType, BinOpKind, Lit, Type};
 
@@ -1154,7 +1208,12 @@ mod tests {
 
     #[test]
     fn lambda_is_atomic_as_a_value() {
-        let lam = Expr::lambda(Name::Raw("x".into()), Type::Hole, var("x"));
+        let lam = Expr::lambda(
+            Name::Raw("x".into()),
+            Occurrence::mint(),
+            Type::Hole,
+            var("x"),
+        );
         let e = Expr::apply(lam.clone(), var("map"));
         let out = run(e);
         // The lambda argument needs no naming; it stays inline.
@@ -1168,6 +1227,7 @@ mod tests {
     fn accumulator(name: &Name, body: Expr) -> Expr {
         Expr::mut_decl(
             name.clone(),
+            Occurrence::mint(),
             Type::mutable(Type::Hole, Type::Base(BaseType::Int)),
             lit(0),
             body,
@@ -1205,13 +1265,17 @@ mod tests {
         let y = Name::fresh("y");
         let call = Expr::apply(Expr::var(x.clone()), var("f"));
         let body = Expr::let_in(
-            TypedBinding::new_annotated(y.clone(), Type::Base(BaseType::Int)),
+            TypedBinding::new_annotated(
+                y.clone(),
+                Occurrence::mint(),
+                Annotation::new(Type::Base(BaseType::Int), Occurrence::mint()),
+            ),
             Expr::tuple(vec![Expr::var(x.clone()), call]),
             Expr::var(y),
         );
         let out = run(accumulator(
             &x,
-            Expr::lambda(Name::fresh("p"), Type::Hole, body),
+            Expr::lambda(Name::fresh("p"), Occurrence::mint(), Type::Hole, body),
         ));
         let TypedExprNode::MutDecl { body, .. } = &out.node else {
             panic!("expected the MutDecl, got {}", out.node.kind_name());

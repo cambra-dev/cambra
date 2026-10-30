@@ -193,7 +193,9 @@ fn collect_reads(e: &Expr, reads: &mut Vec<Vec<Step>>) -> bool {
             collect_reads(argument, reads)
         }
         TypedExprNode::Tuple(elts) => elts.iter().all(|elt| collect_reads(elt, reads)),
-        TypedExprNode::Record(entries) => entries.iter().all(|(_, f)| collect_reads(f, reads)),
+        TypedExprNode::Record(entries) => entries
+            .iter()
+            .all(|entry| collect_reads(&entry.value, reads)),
         _ => false,
     }
 }
@@ -273,8 +275,8 @@ fn retarget(e: &mut Expr, plan: &Plan) {
                     set_domain_ty(ty, value);
                 }
             }
-            for (_, entry) in entries {
-                retarget(entry, plan);
+            for entry in entries {
+                retarget(&mut entry.value, plan);
             }
         }
         other => unreachable!("collect_reads admitted {other:?}"),
@@ -308,6 +310,7 @@ fn is_identity(head: &Expr, plan: &Plan) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::RecordEntry;
     use crate::ccl::lambda_elim::zip_pair;
     use crate::ccl::planning::test_helpers::{compose, data_fun_ty, fun_ty, int_ty, tuple_ty};
     use crate::ccl::ty::FunKind;
@@ -651,7 +654,7 @@ mod tests {
             );
             let result = Type::Record(vec![("x".into(), int_ty()), ("y".into(), int_ty())]);
             Expr::apply(
-                Expr::new(TypedExprNode::Record(fields)).with_ty(ty.clone()),
+                Expr::new(TypedExprNode::Record(RecordEntry::minted(fields))).with_ty(ty.clone()),
                 Expr::builtin(Builtin::Zip)
                     .with_ty(fun_ty(ty, fun_ty(domain.clone(), result.clone()))),
             )

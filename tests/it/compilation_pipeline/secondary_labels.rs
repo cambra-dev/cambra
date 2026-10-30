@@ -48,7 +48,8 @@ fn labels(code: &str) -> (String, Vec<(String, String)>) {
         at((sku=2))
     "},
     "at((sku=2))",
-    &[("a.at", "required here")],
+    // The field read is tagged at the field's name.
+    &[("at", "required here")],
 )]
 #[case::operator_an_unannotated_body_uses(
     indoc! {"
@@ -69,7 +70,7 @@ fn labels(code: &str) -> (String, Vec<(String, String)>) {
         f((sku=1))
     "},
     "f((sku=1))",
-    &[("p.at", "required here")],
+    &[("at", "required here")],
 )]
 #[case::requirement_of_a_requires_clause(
     indoc! {"
@@ -97,7 +98,7 @@ fn labels(code: &str) -> (String, Vec<(String, String)>) {
         pick: forall (T) T => T = inc
         1
     "},
-    "pick: forall (T) T => T = inc",
+    "forall (T) T => T",
     &[("a + 1", "required here")],
 )]
 // A generator binds its element as a `let` binds its value, so the operator the element

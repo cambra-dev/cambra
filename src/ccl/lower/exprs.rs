@@ -2,6 +2,7 @@
 //! operators, function calls (aggregates, `groupby`, sources, general
 //! application), unary ops, feeds, defines, and literal constants.
 
+use crate::ccl::Occurrence;
 use std::rc::Rc;
 
 use super::*;
@@ -133,7 +134,7 @@ pub(super) fn lower_call(
             let sc = "lower.set";
             let key_var = ctx.tag_machinery(Expr::var("__set_key"), func.span, sc);
             let id_key = ctx.tag_machinery(
-                Expr::lambda("__set_key", Type::Hole, key_var),
+                Expr::lambda("__set_key", Occurrence::mint(), Type::Hole, key_var),
                 func.span,
                 sc,
             );
@@ -175,7 +176,7 @@ pub(super) fn lower_call(
             let key_proj = ctx.tag_machinery(Expr::proj_index(0), func.span, sc);
             let key_read = ctx.tag_machinery(Expr::apply(kv_var, key_proj), func.span, sc);
             let fst_key = ctx.tag_machinery(
-                Expr::lambda("__map_kv", Type::Hole, key_read),
+                Expr::lambda("__map_kv", Occurrence::mint(), Type::Hole, key_read),
                 func.span,
                 sc,
             );
@@ -461,7 +462,7 @@ fn lower_expression_call(
         // The call is no longer the expression's root, which `lower_expr` tags, so
         // it is recorded here.
         let call = ctx.tag_machinery(call, func.span, "lower.lambda_call");
-        let bound = Expr::let_bind(callee_name, lambda, call);
+        let bound = Expr::let_bind(callee_name, Occurrence::mint(), lambda, call);
         return Ok(ctx.tag_machinery(bound, func.span, "lower.lambda_call"));
     }
     apply_to_args(args, ctx, |ctx| lower_expr(func, ctx))
@@ -523,8 +524,31 @@ impl MintedTerm {
     }
 
     /// A copy to place.
+    ///
+    /// The copy's expression nodes are attributed by `tag_predicate`'s sweep where they
+    /// land in a predicate. Its occurrences are recorded as copies of the term's, so a
+    /// binder the term writes, the `x` of a key `\x -> x.k`, resolves to its name in the
+    /// copy too.
     fn copy(&self) -> Expr {
-        self.0.clone()
+        fn record(original: &Expr, copy: &Expr) {
+            let mut originals = Vec::new();
+            original.walk_occurrences(|o, _| originals.push(o.id()));
+            let mut copies = Vec::new();
+            copy.walk_occurrences(|o, _| copies.push(o.id()));
+            for (origin, produced) in originals.into_iter().zip(copies) {
+                crate::ccl::provenance::lowering_copy(origin, produced);
+            }
+            let mut children = Vec::new();
+            original.walk_children(|c| children.push(c));
+            let mut copied = Vec::new();
+            copy.walk_children(|c| copied.push(c));
+            for (o, c) in children.into_iter().zip(copied) {
+                record(o, c);
+            }
+        }
+        let copy = self.0.clone();
+        record(&self.0, &copy);
+        copy
     }
 
     /// The term itself, for its last placement.
@@ -573,7 +597,7 @@ fn lower_groupby(
     // unstamped lambda underneath is a second, contradictory answer about what this
     // function is, and it is the one elimination reads when it point-frees the group.
     let unrefined_inner = ctx.tag_machinery(
-        Expr::lambda("__gb_i", Type::Hole, inner_body)
+        Expr::lambda("__gb_i", Occurrence::mint(), Type::Hole, inner_body)
             .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
         span,
         gb,
@@ -591,7 +615,7 @@ fn lower_groupby(
     // `emit_node` stamps onto the function type `emit_lambda` builds — one already carrying
     // this binder and its domain.
     let keyed = ctx.tag_machinery(
-        Expr::lambda("__gb_k", key_domain.clone(), inner)
+        Expr::lambda("__gb_k", Occurrence::mint(), key_domain.clone(), inner)
             .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
         span,
         gb,
@@ -618,14 +642,17 @@ fn lower_rekeyed(
 
     let group_var = ctx.tag_machinery(Expr::var(group_binder), span, sc);
     let collapsed = collapse(group_var, span, ctx);
-    let collapse_fn =
-        ctx.tag_machinery(Expr::lambda(group_binder, Type::Hole, collapsed), span, sc);
+    let collapse_fn = ctx.tag_machinery(
+        Expr::lambda(group_binder, Occurrence::mint(), Type::Hole, collapsed),
+        span,
+        sc,
+    );
 
     let idx_var = ctx.tag_machinery(Expr::var("__iter_record"), span, sc);
     let read = ctx.tag_machinery(Expr::apply(idx_var, keyed), span, sc);
     let iter_record = ctx.tag_machinery(Expr::apply(read, collapse_fn), span, sc);
     ctx.tag_machinery(
-        Expr::lambda("__iter_record", key_domain, iter_record)
+        Expr::lambda("__iter_record", Occurrence::mint(), key_domain, iter_record)
             .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
         span,
         sc,
@@ -852,7 +879,17 @@ pub(super) fn lower_feed(
     let Some(name) = feed_target(target, "handle binding", ctx)? else {
         return Ok(Expr::error());
     };
-    Ok(Expr::feed(name, lower_expr(value, ctx)?))
+    let occurrence = ctx.occurrence_at(feed_target_span(target));
+    Ok(Expr::feed(name, occurrence, lower_expr(value, ctx)?))
+}
+
+/// Where a feed target writes the name it feeds: the whole target for a name, and the
+/// member's own segment for another module's, `events` in `a::events`.
+pub(super) fn feed_target_span(target: &Spanned<ChlExpr>) -> Span {
+    match &target.node {
+        ChlExpr::Qualified(q) => q.name.span,
+        _ => target.span,
+    }
 }
 
 /// The feed `target` names: a name, or another module's member, `a::events`
@@ -878,9 +915,11 @@ pub(super) fn feed_target(
 pub(super) fn lower_define(
     target: &Spanned<AssignTarget>,
     value: Expr,
+    ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let name = extract_name_target(target, "handle defining")?;
-    Ok(Expr::define(name, value))
+    let occurrence = ctx.occurrence_at(target.span);
+    Ok(Expr::define(name, occurrence, value))
 }
 
 /// Lower a CHL unary expression to a CCL [`Expr::UnaryOp`].

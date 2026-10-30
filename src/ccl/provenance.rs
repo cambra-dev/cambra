@@ -1046,6 +1046,46 @@ pub(crate) fn lowering_predicate_leaf(id: NodeId, span: Span, nature: Nature, la
     });
 }
 
+/// Record `produced` as a copy of `origin` in the active lowering log, mirroring
+/// `origin`'s folded attribution, for a copy lowering makes outside a [`copy_frame`].
+pub(crate) fn lowering_copy(origin: NodeId, produced: NodeId) {
+    if origin == NodeId::PLACEHOLDER || produced == NodeId::PLACEHOLDER {
+        return;
+    }
+    ACTIVE_LOWERING_LOG.with(|slot| {
+        if let Some(rec) = slot.borrow_mut().as_mut() {
+            rec.recorded.insert(produced);
+            rec.log.push(LoweringStep::Copy {
+                origin,
+                produced: vec![produced],
+            });
+        }
+    });
+}
+
+/// Record an occurrence at the span its holding node is tagged with, unless it is
+/// already recorded. A name the source writes is recorded at its own span when it is
+/// minted ([`LoweringContext::occurrence_at`](crate::ccl::lower::LoweringContext)); a
+/// binder or label lowering makes for itself reaches its node's tag here instead
+/// (`src/ccl/design/provenance.md`, "Minting and recording occurrences").
+pub(crate) fn lowering_occurrence_fallback(id: NodeId, span: Span, label: RewriteLabel) {
+    if id == NodeId::PLACEHOLDER {
+        return;
+    }
+    ACTIVE_LOWERING_LOG.with(|slot| {
+        if let Some(rec) = slot.borrow_mut().as_mut()
+            && rec.recorded.insert(id)
+        {
+            rec.log.push(LoweringStep::Leaf {
+                id,
+                anchor: span,
+                nature: Nature::Machinery,
+                label,
+            });
+        }
+    });
+}
+
 /// Append a [`LoweringStep::Leaf`] to the active lowering log — the leaf-grain
 /// recording that `tag_source`/`tag_machinery` route through. A no-op when no
 /// [`LoweringSession`] is installed (the lower submodules' unit tests, which
@@ -2495,12 +2535,7 @@ mod tests {
         // Unrecorded checks outputs only).
         let [template, occ_interior] = ids();
         let log = vec![
-            leaf(
-                template,
-                span(4, 9),
-                Nature::Machinery,
-                "lower.uncurry_proj",
-            ),
+            leaf(template, span(4, 9), Nature::Machinery, "lower.param_proj"),
             lowering_copy(template, vec![occ_interior]),
         ];
         // Output = only the copied interior; the template is discarded.
@@ -2559,7 +2594,7 @@ mod tests {
                 tmpl_child,
                 span(3, 6),
                 Nature::Machinery,
-                "lower.uncurry_proj",
+                "lower.param_proj",
             ),
             // The occurrence's interior is a freshened copy of the template child.
             lowering_copy(tmpl_child, vec![occ_child]),

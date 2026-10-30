@@ -62,7 +62,7 @@ function table(...nodes: IrNode[]): Map<number, IrNode> {
   return new Map(nodes.map((n) => [n.nodeId, n]));
 }
 
-const value = (id: number): IrChild => ({ id, predicate: false });
+const value = (id: number): IrChild => ({ id, kind: "value" });
 
 describe("serializeTree", () => {
   it("renders the position, node label, type, and node id of a row", () => {
@@ -95,10 +95,43 @@ describe("serializeTree", () => {
     // pane it claims to reproduce. The literal keeps its own row, and its
     // synthesized `__elem == 1` interior contributes none.
     const nodes = table(
-      node("Lit(Int(1))", "Int@1", 5, [{ id: 6, predicate: true }]),
+      node("Lit(Int(1))", "Int@1", 5, [{ id: 6, kind: "predicate" }]),
       node("BinOp(Eq)", "Bool", 6),
     );
     expect(serializeTree(5, nodes)).toBe("Lit(Int(1)) : Int@1 #5");
+  });
+
+  it("labels an occurrence by what it locates, after the value children", () => {
+    // `λ p → p`: the binder is a row under the lambda, edge-labelled `binder`
+    // rather than by position, and the value child keeps its positional index.
+    const nodes = table(
+      node("Lambda", "(Int ⇒ Int)", 1, [value(2), { id: 3, kind: "occurrence" }]),
+      node("Var(p)", "Int", 2),
+      node("Binder(p)", "Int", 3),
+    );
+    expect(serializeTree(1, nodes)).toBe(
+      "Lambda : (Int ⇒ Int) #1\n  0: Var(p) : Int #2\n  binder: Binder(p) : Int #3",
+    );
+  });
+
+  it("names each kind of occurrence by its entry's label", () => {
+    const occurrence = (id: number): IrChild => ({ id, kind: "occurrence" });
+    const nodes = table(
+      node("Feed", "Unit", 1, [occurrence(2), occurrence(3), occurrence(4), occurrence(5), occurrence(6)]),
+      node("Use(out)", "Feed(Int)", 2),
+      node("Label(x)", "Int", 3),
+      node("Head(rect)", "{w: Int, h: Int}", 4),
+      node("Annotation", "String", 5),
+      node("Binder(p)", "Int", 6),
+    );
+    expect(serializeTree(1, nodes).split("\n").map((l) => l.trim().split(":")[0])).toEqual([
+      "Feed ",
+      "use",
+      "label",
+      "head",
+      "annotation",
+      "binder",
+    ]);
   });
 
   it("gives a shared node one row per position that reaches it", () => {

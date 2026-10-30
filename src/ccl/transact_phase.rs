@@ -73,6 +73,8 @@
 //! `src/ccl/design/mutability.md`, "`Mut` is a CCL type").
 
 use crate::ccl::Label;
+use crate::ccl::Occurrence;
+use crate::ccl::RecordEntry;
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::{
@@ -237,6 +239,9 @@ fn first_unpaired_as_of_read(e: &Expr) -> Option<Name> {
 /// and the mutable variable's value type.
 struct BoundRead {
     name: Name,
+    /// The `let` binder's occurrence, which the reply's lambda copies: the lambda's
+    /// parameter stands for that binder.
+    occurrence: NodeId,
     hist_read: Expr,
     field: Label,
     value_ty: Type,
@@ -264,6 +269,7 @@ fn as_of_join(expr: &Expr) -> Option<Expr> {
         };
         reads.push(BoundRead {
             name: binding.name.clone(),
+            occurrence: binding.occurrence.id(),
             hist_read: hist_read.clone(),
             field,
             value_ty: hist_read.ty.codomain()?,
@@ -346,11 +352,9 @@ fn build_zip_read(
                 .map(|r| (r.field.clone(), r.hist_read.ty.clone()))
                 .collect(),
         );
-        let source = Expr::new(TypedExprNode::Record(
-            used.iter()
-                .map(|r| (r.field.clone(), r.hist_read.clone()))
-                .collect(),
-        ))
+        let source = Expr::new(TypedExprNode::Record(RecordEntry::minted(
+            used.iter().map(|r| (r.field.clone(), r.hist_read.clone())),
+        )))
         .with_ty(source_ty);
         (source, record_ty)
     };
@@ -387,7 +391,7 @@ fn build_zip_read(
         }
     }
     let body = Subst::discharge_env_in_place(lam_body.clone(), &reads);
-    let reply = Expr::lambda(p, pair_ty, body);
+    let reply = Expr::lambda(p, Occurrence::mint(), pair_ty, body);
     Some(crate::ccl::ccl_utils::chain_typed(vec![zip, reply], out_ty))
 }
 
@@ -448,7 +452,12 @@ fn build_single(trigger: &Expr, read: &BoundRead, lam_body: &Expr, out_ty: Type)
     if matches!(&lam_body.node, TypedExprNode::Var(n) if *n == read.name) {
         return Some(as_of);
     }
-    let reply = Expr::lambda(read.name.clone(), read.value_ty.clone(), lam_body.clone());
+    let reply = Expr::lambda(
+        read.name.clone(),
+        Occurrence::copied_from(read.occurrence),
+        read.value_ty.clone(),
+        lam_body.clone(),
+    );
     Some(crate::ccl::ccl_utils::chain_typed(
         vec![as_of, reply],
         out_ty,
@@ -478,17 +487,15 @@ fn build_snapshot(
             .map(|r| (r.field.clone(), r.hist_read.ty.clone()))
             .collect(),
     );
-    let source = Expr::new(TypedExprNode::Record(
-        used.iter()
-            .map(|r| (r.field.clone(), r.hist_read.clone()))
-            .collect(),
-    ))
+    let source = Expr::new(TypedExprNode::Record(RecordEntry::minted(
+        used.iter().map(|r| (r.field.clone(), r.hist_read.clone())),
+    )))
     .with_ty(source_ty);
     let as_of = build_as_of(trigger, &source, record_ty.clone())?;
     let snap = Name::fresh("__snap");
     let mut body = lam_body.clone();
     project_reads(&mut body, used, &snap, &record_ty);
-    let reply = Expr::lambda(snap, record_ty, body);
+    let reply = Expr::lambda(snap, Occurrence::mint(), record_ty, body);
     Some(crate::ccl::ccl_utils::chain_typed(
         vec![as_of, reply],
         out_ty,
@@ -1677,7 +1684,12 @@ fn induction_write_reading_past_a_write(
                 spine = body;
             }
             TypedExprNode::ExprStmt { expr: effect, body } => {
-                if let TypedExprNode::MutWrite { name, key, value } = &effect.node
+                if let TypedExprNode::MutWrite {
+                    name_occurrence: _,
+                    name,
+                    key,
+                    value,
+                } = &effect.node
                     && !txn_mut_vars.contains(name)
                 {
                     let mut free = free_names_in_value(value);
@@ -2296,7 +2308,7 @@ fn build_writer(
             (wk.field_key(), val)
         })
         .collect();
-    let mut writes = Expr::new(TypedExprNode::Record(write_fields));
+    let mut writes = Expr::new(TypedExprNode::Record(RecordEntry::minted(write_fields)));
     writes.ty = Type::Record(
         site.write_keys
             .iter()
@@ -2330,7 +2342,7 @@ fn build_writer(
     let decision = crate::ccl::ccl_utils::wrap_decision_variant(decision);
     let decision_ty = decision.ty.clone();
 
-    let mut body = Expr::lambda(p, tuple_ty.clone(), decision);
+    let mut body = Expr::lambda(p, Occurrence::mint(), tuple_ty.clone(), decision);
     body.ty = Type::fun(tuple_ty, decision_ty);
 
     (
@@ -2388,7 +2400,7 @@ fn build_zip_source(source: &Expr, item_ty: &Type, accs: &[(Name, Expr, Type)]) 
     }
     let mut tup = Expr::tuple(elts);
     tup.ty = new_item_ty.clone();
-    let mut lam = Expr::lambda(x, dom.clone(), tup);
+    let mut lam = Expr::lambda(x, Occurrence::mint(), dom.clone(), tup);
     // The extended source is the source: a collection, at whatever kind `source`
     // states. `Expr::lambda` stamps `Compute`, and the writer source is the one slot
     // planning asserts is swept.
@@ -2497,7 +2509,11 @@ fn walk_block(
                 // commit — so the feed records its own `path`, and the decision
                 // assembler makes that path the tap's `` `fired `` condition,
                 // unless the path *is* the commit (then it wraps unconditionally).
-                TypedExprNode::Feed { name, value } => {
+                TypedExprNode::Feed {
+                    name_occurrence: _,
+                    name,
+                    value,
+                } => {
                     let val = Subst::discharge_env_in_place(value.as_ref().clone(), env);
                     let field = name.defer_tap_field(*feed_counter);
                     *feed_counter += 1;
@@ -2631,6 +2647,9 @@ struct MutVarDecl {
     /// the key's history binding is what stands in its place — so it is the
     /// parent for everything built for this key.
     decl: NodeId,
+    /// The declaration's binding occurrence, which each binder standing for the key
+    /// copies: its history binding and the rebind of its as-of read.
+    occurrence: NodeId,
     /// The tick-0 initial value, which carries the key's value type (its `.ty`).
     /// It reaches the output **once**, as the `get_prev_txn` default: the
     /// trailing read is an [`as_of_read`], which carries no seed operand because
@@ -2674,6 +2693,7 @@ fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, MutVarD
             binding.name.clone(),
             MutVarDecl {
                 decl: expr.node_id(),
+                occurrence: binding.occurrence.id(),
                 init: (**init).clone(),
                 value_ty: mut_var_value_ty(&binding.ty),
             },
@@ -2809,10 +2829,10 @@ fn per_key_view(
         (F_TIME, time_view.ty.clone()),
         (F_WRITE, write_view.ty.clone()),
     ]);
-    let mut views = Expr::new(TypedExprNode::Record(vec![
+    let mut views = Expr::new(TypedExprNode::Record(RecordEntry::minted([
         (F_TIME, time_view),
         (F_WRITE, write_view),
-    ]));
+    ])));
     views.ty = views_rec_ty.clone();
     let tap_ty = Type::fun_like(&commits_ty, dom.clone(), view_rec_ty.clone());
     let mut zip = Expr::builtin(Builtin::Zip);
@@ -2990,17 +3010,17 @@ fn plan_store(
             (F_WRITE_TARGETS, wt_tuple.ty.clone()),
             (F_DECISION, decision_ty.clone()),
         ]);
-        let mut rec = Expr::new(TypedExprNode::Record(vec![
+        let mut rec = Expr::new(TypedExprNode::Record(RecordEntry::minted([
             (F_TIME, tvar(&t, Type::Txn)),
             (F_WRITE_TARGETS, wt_tuple),
             (F_DECISION, decision),
-        ]));
+        ])));
         rec.ty = rec_ty.clone();
         commit_rec_ty.push(rec_ty.clone());
 
         // commits_j = λ r → let t = begin(r) in {time, write_targets, decision}
         let commit_body = Expr::let_in(binding(t, Type::Txn), begin, rec);
-        let mut commit_lambda = Expr::lambda(r, dom.clone(), commit_body);
+        let mut commit_lambda = Expr::lambda(r, Occurrence::mint(), dom.clone(), commit_body);
         commit_lambda.ty = Type::data_fun(dom.clone(), rec_ty.clone());
         commit_bindings.push((
             binding(
@@ -3155,9 +3175,13 @@ fn plan_store(
             builtin_ty(Builtin::GetPrevTxn, Type::fun(arg_ty, v.clone())),
             v.clone(),
         );
-        let mut lam = Expr::lambda(t, Type::Txn, gpt);
+        let mut lam = Expr::lambda(t, Occurrence::mint(), Type::Txn, gpt);
         lam.ty = history_ty(&v);
-        hist_bindings.push((binding(hist_k, history_ty(&v)), lam));
+        // The history binding stands for the key's declaration, so it copies the
+        // declaration's occurrence.
+        let mut history = binding(hist_k, history_ty(&v));
+        history.occurrence = Occurrence::copied_from(key_init[k].occurrence);
+        hist_bindings.push((history, lam));
     }
 
     // History bindings first, then commit records, then tap views — order is
@@ -3245,7 +3269,9 @@ impl StorePlan {
                     provenance::Nature::Expansion,
                 );
                 let v = key_init[k].value_ty.clone();
-                (binding(k.clone(), v.clone()), as_of_read(&self.hist[k], v))
+                let mut rebind = binding(k.clone(), v.clone());
+                rebind.occurrence = Occurrence::copied_from(key_init[k].occurrence);
+                (rebind, as_of_read(&self.hist[k], v))
             })
             .collect()
     }
@@ -3423,7 +3449,7 @@ fn walk_spine(
                 let bindings: Vec<(TypedBinding, Expr)> = store
                     .bindings
                     .iter()
-                    .map(|(b, e)| (b.clone(), e.clone_preserving_ids()))
+                    .map(|(b, e)| (b.clone_preserving_ids(), e.clone_preserving_ids()))
                     .collect();
                 let _g = provenance::enter(
                     store.transact_parent(key_init, &inner),
@@ -3667,7 +3693,9 @@ fn wrap_cross_domain(txn_letrec: Expr, cross: CrossDomain) -> Expr {
             provenance::Nature::Machinery,
         );
         for (b, def) in reads.into_iter().rev() {
-            inner = Expr::let_in(binding(b.name, b.ty), def, inner);
+            let mut read = binding(b.name, b.ty);
+            read.occurrence = b.occurrence;
+            inner = Expr::let_in(read, def, inner);
         }
         inner = hoist_feeds(inner, feeds);
     }
@@ -3822,7 +3850,7 @@ mod tests {
             right: Box::new(tvar(&r, int.clone())),
         });
         sub.ty = int.clone();
-        let mut write = Expr::mut_write(pool.clone(), sub);
+        let mut write = Expr::mut_write(pool.clone(), Occurrence::mint(), sub);
         write.ty = Type::Base(BaseType::Unit);
         let mut unit = Expr::new(TypedExprNode::Lit(Lit::Unit));
         unit.ty = Type::Base(BaseType::Unit);
@@ -3855,6 +3883,7 @@ mod tests {
         // without asking whether a `let` happens to carry a `Mut` annotation.
         let mut tree = Expr::mut_decl(
             pool.clone(),
+            Occurrence::mint(),
             Type::mutable(Type::Txn, Type::Base(BaseType::Int)),
             init,
             stmt,

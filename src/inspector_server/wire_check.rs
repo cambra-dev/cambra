@@ -472,15 +472,32 @@ fn assert_node_table(pane: &Value, at: &str) {
             "{at}.root {root} names an entry of {at}.nodes"
         );
     }
+    // Each occurrence, by id, with the edges that name it.
+    let mut occurrence_edges: std::collections::HashMap<u64, usize> =
+        std::collections::HashMap::new();
     for (i, n) in nodes.iter().enumerate() {
         let node_at = format!("{at}.nodes[{i}]");
         if kind == OPERATOR_PANE_KIND {
             assert_operator_node(n, &node_at, &ids);
         } else {
-            assert_ir_node(n, &node_at, &ids);
+            assert_ir_node(n, &node_at, &ids, &mut occurrence_edges);
         }
         // The rewrite tag is one channel with one meaning on both shapes.
         assert_rewrite_shape(n, &node_at);
+    }
+    // An occurrence belongs to the one node that holds it, and is a leaf.
+    for n in nodes {
+        let id = n["nodeId"].as_u64().unwrap_or_default();
+        if let Some(&edges) = occurrence_edges.get(&id) {
+            assert_eq!(
+                edges, 1,
+                "{at}: occurrence {id} is named by {edges} child edges"
+            );
+            assert!(
+                n["children"].as_array().is_some_and(Vec::is_empty),
+                "{at}: occurrence {id} has no children"
+            );
+        }
     }
 }
 
@@ -647,9 +664,14 @@ fn assert_spans(v: &Value, at: &str) {
 }
 
 /// Assert one entry of an **IR** pane's node table: the scalar fields, the
-/// retired fields' absence, and `{id, predicate}` children resolving
-/// within `ids`.
-fn assert_ir_node(v: &Value, at: &str, ids: &std::collections::HashSet<u64>) {
+/// retired fields' absence, and `{id, kind}` children resolving within `ids`. Each
+/// occurrence child is counted into `occurrence_edges`.
+fn assert_ir_node(
+    v: &Value,
+    at: &str,
+    ids: &std::collections::HashSet<u64>,
+    occurrence_edges: &mut std::collections::HashMap<u64, usize>,
+) {
     assert!(v["label"].is_string(), "{at}.label is a string");
     assert!(v["nodeId"].is_number(), "{at}.nodeId is a number");
     // `annotations` and `tiling` were tile-producer fields on the renderer's
@@ -677,12 +699,20 @@ fn assert_ir_node(v: &Value, at: &str, ids: &std::collections::HashSet<u64>) {
         .unwrap_or_else(|| panic!("{at}.children is an array"));
     let mut predicate_targets = std::collections::HashSet::new();
     for (i, c) in children.iter().enumerate() {
-        let is_predicate = c["predicate"]
-            .as_bool()
-            .unwrap_or_else(|| panic!("{at}.children[{i}].predicate is a boolean"));
+        let kind = c["kind"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{at}.children[{i}].kind is a string"));
+        assert!(
+            matches!(kind, "value" | "occurrence" | "predicate"),
+            "{at}.children[{i}].kind is `value`, `occurrence` or `predicate`; got {kind}"
+        );
+        let is_predicate = kind == "predicate";
         let id = c["id"]
             .as_u64()
             .unwrap_or_else(|| panic!("{at}.children[{i}].id is a number"));
+        if kind == "occurrence" {
+            *occurrence_edges.entry(id).or_default() += 1;
+        }
         assert!(
             ids.contains(&id),
             "{at}.children[{i}].id {id} names an entry of this pane's nodes"

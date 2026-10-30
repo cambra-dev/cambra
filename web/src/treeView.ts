@@ -10,7 +10,7 @@
 
 import type { Resolved, Store } from "./store";
 import { el } from "./dom";
-import type { IrNode } from "./types";
+import type { IrChild, IrNode } from "./types";
 
 // Auto-expand the tree to this depth; deeper nodes start collapsed but usable.
 const DEFAULT_EXPAND_DEPTH = 2;
@@ -32,6 +32,43 @@ export function resolvedTypeTooltip(
 
 // Indentation per depth level in `serializeTree`.
 const TREE_INDENT = "  ";
+
+/**
+ * The edge label a tree row draws for `child`, the `index`th child of its parent,
+ * or `null` for a child the tree draws no row for.
+ *
+ * Children arrive in order — the value children, then the occurrences, then the
+ * predicates — so a value child's index in `children` is its positional index. An
+ * occurrence is labelled by what it locates, the word its entry's label leads
+ * with: `binder`, `use`, `label`, `head` or `annotation`
+ * (`src/inspector_model/design.md`, "An occurrence on the wire"). A predicate
+ * draws no row.
+ */
+export function childEdge(
+  child: IrChild,
+  index: number,
+  nodeById: Map<number, IrNode>,
+): string | null {
+  switch (child.kind) {
+    case "value":
+      return String(index);
+    case "occurrence": {
+      const label = nodeById.get(child.id)?.label ?? "";
+      const word = /^[A-Za-z]+/.exec(label)?.[0] ?? "";
+      return OCCURRENCE_EDGES[word] ?? "occurrence";
+    }
+    case "predicate":
+      return null;
+  }
+}
+
+const OCCURRENCE_EDGES: Record<string, string> = {
+  Binder: "binder",
+  Use: "use",
+  Label: "label",
+  Head: "head",
+  Annotation: "annotation",
+};
 
 /**
  * A pane's node table as plain text — one line per rendered row, `TREE_INDENT`
@@ -64,11 +101,12 @@ export function serializeTree(root: number, nodeById: Map<number, IrNode>): stri
     lines.push(TREE_INDENT.repeat(depth) + parts.join(" "));
     const childPath = new Set(onPath).add(id);
     // The same derived label `renderNode` draws: a value child's index in
-    // `children`, with the predicates dropped after indexing.
+    // `children`, an occurrence's kind, and no row for a predicate.
     for (const [i, child] of node.children.entries()) {
-      if (child.predicate) continue;
+      const edge = childEdge(child, i, nodeById);
+      if (edge === null) continue;
       if (onPath.has(child.id)) continue;
-      walk(child.id, String(i), depth + 1, childPath);
+      walk(child.id, edge, depth + 1, childPath);
     }
   };
   walk(root, null, 0, new Set());
@@ -166,16 +204,13 @@ export class TreeView {
     // A refinement predicate is not drawn: it rides a type slot, and the type
     // column already shows it (`{Int | __elem == 7}`), so a row for its
     // interior doubles the tree without adding anything the reader is looking
-    // for. It stays on the wire for the links (`IrChild.predicate`).
+    // for. It stays on the wire for the links (`IrChild.kind`).
     //
-    // The edge label is computed here, not shipped. Children arrive in order —
-    // the value children, then the predicates — so a value child's index in
-    // `children` is its positional index, and dropping the predicates after
-    // indexing leaves those indices alone.
+    // The edge label is computed here, not shipped (`childEdge`).
     const childNodes = hasChildren
       ? node.children
-          .map((c, i) => ({ edge: String(i), child: c }))
-          .filter(({ child }) => !child.predicate)
+          .map((c, i) => ({ edge: childEdge(c, i, this.nodeById), child: c }))
+          .filter((c): c is { edge: string; child: IrChild } => c.edge !== null)
           .filter(({ child }) => !onPath.has(child.id))
           .map(({ edge, child }) => ({ edge, node: this.nodeById.get(child.id) }))
           .filter((c): c is { edge: string; node: IrNode } => c.node !== undefined)

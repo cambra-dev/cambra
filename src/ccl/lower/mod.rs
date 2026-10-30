@@ -79,6 +79,8 @@
 //! - `test_sink` — `out = test_sink()` recognition and lowering, built only under
 //!   `cfg(test)` or the `test-helpers` feature.
 
+use crate::ccl::Occurrence;
+use crate::ccl::RecordEntry;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashMap, HashSet},
@@ -626,6 +628,10 @@ pub struct LoweringContext {
     /// Where each run of the linked program is brought in
     /// ([`modules::RunSites`]).
     pub(crate) run_sites: modules::RunSites,
+    /// Each name resolved in a type or a module path, in resolution order
+    /// ([`ResolvedName`]). Behind a cell because the lookups that resolve them borrow
+    /// the context immutably.
+    resolved_names: RefCell<Vec<ResolvedName>>,
     /// Every binder the module being lowered writes, with its span, for the rule
     /// that none takes a name that denotes a module ([`module_name_binders`]).
     pub(super) module_binders: Vec<(SmolStr, Span)>,
@@ -724,7 +730,22 @@ pub(super) struct DeclaredAlias {
     /// name in scope throughout: a type parameter in its definition, or a `use`
     /// type name in its module.
     statement: Option<Span>,
+    /// Where the declaration writes the name, which a use resolves to; `None` for
+    /// a name the compiler declares.
+    name_span: Option<Span>,
     ty: AliasType,
+}
+
+/// One name lowering resolved in a type or a module path: where the use writes it,
+/// the name, and where the name is declared (`src/ccl/design/lowering.md`, "Names
+/// lowering resolves"). Lowering erases the name, so no tree holds it; the inspector
+/// reads these rows beside the tree's binders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedName {
+    pub use_span: Span,
+    pub name: SmolStr,
+    /// The declared name's span, or the empty span at the start of a module's file.
+    pub target: Span,
 }
 
 /// What a capitalized name means as a type at a use
@@ -949,6 +970,7 @@ impl LoweringContext {
     /// "Lowering attribution".
     pub(super) fn tag_source(&mut self, expr: Expr, span: Span) -> Expr {
         crate::ccl::provenance::lowering_leaf(expr.node_id(), span, Nature::Source, "lower.image");
+        tag_held_occurrences(&expr, span, "lower.image");
         expr
     }
 
@@ -963,6 +985,7 @@ impl LoweringContext {
             Nature::Machinery,
             "lower.image",
         );
+        tag_held_occurrences(&expr, span, "lower.image");
         expr
     }
 
@@ -971,7 +994,22 @@ impl LoweringContext {
     /// also covers interior source images; nature alone does not distinguish them.
     pub(super) fn tag_machinery(&mut self, expr: Expr, span: Span, label: RewriteLabel) -> Expr {
         crate::ccl::provenance::lowering_leaf(expr.node_id(), span, Nature::Machinery, label);
+        tag_held_occurrences(&expr, span, label);
         expr
+    }
+
+    /// A fresh occurrence of a name the source writes at `span`, recorded there. Every
+    /// binder, use, label, head and annotation the source writes is minted through this,
+    /// so it resolves to the name rather than to the node that holds it.
+    pub(super) fn occurrence_at(&mut self, span: Span) -> Occurrence {
+        let occurrence = Occurrence::mint();
+        crate::ccl::provenance::lowering_leaf(
+            occurrence.id(),
+            span,
+            Nature::Machinery,
+            "lower.image",
+        );
+        occurrence
     }
 
     /// Supply fallback leaf attribution throughout a finished predicate's term tree.
@@ -989,6 +1027,7 @@ impl LoweringContext {
                 Nature::Machinery,
                 label,
             );
+            tag_held_occurrences(e, span, label);
             e.walk_children(|c| go(c, span, label));
         }
         go(pred, span, label);
@@ -1061,6 +1100,7 @@ impl LoweringContext {
         &mut self,
         name: impl Into<String>,
         statement: Span,
+        name_span: Option<Span>,
         ty: AliasType,
     ) {
         self.type_aliases
@@ -1068,6 +1108,7 @@ impl LoweringContext {
             .or_default()
             .push(DeclaredAlias {
                 statement: Some(statement),
+                name_span,
                 ty,
             });
     }
@@ -1075,14 +1116,49 @@ impl LoweringContext {
     /// Bind `name` to `ty` throughout the scope being lowered: a type parameter
     /// throughout its definition (`docs/chl-spec.md`, "Type parameters"), or a
     /// `use` type name throughout its module.
-    pub(super) fn declare_type_throughout(&mut self, name: impl Into<String>, ty: AliasType) {
+    pub(super) fn declare_type_throughout(
+        &mut self,
+        name: impl Into<String>,
+        name_span: Option<Span>,
+        ty: AliasType,
+    ) {
         self.type_aliases
             .entry(name.into())
             .or_default()
             .push(DeclaredAlias {
                 statement: None,
+                name_span,
                 ty,
             });
+    }
+
+    /// Record that the use of `name` at `use_span` resolves to `target`.
+    pub(super) fn resolved(&self, use_span: Span, name: &str, target: Span) {
+        self.resolved_names.borrow_mut().push(ResolvedName {
+            use_span,
+            name: name.into(),
+            target,
+        });
+    }
+
+    /// Record that `name`, a nominal type's name or a `use` name for it, written at
+    /// `use_span`, resolves to the type's declaration. A compiler-provided type is
+    /// declared in no source and has no row.
+    pub(super) fn resolved_nominal(&self, use_span: Span, name: &str, decl: &NominalDecl) {
+        if decl.span.start != decl.span.end {
+            self.resolved(use_span, name, decl.span);
+        }
+    }
+
+    /// Every name resolved so far, leaving none.
+    ///
+    /// A name lowering resolves twice, as an annotation does when it is checked for a
+    /// Module type before it lowers as a type, is one row.
+    pub(crate) fn take_resolved_names(&mut self) -> Vec<ResolvedName> {
+        let mut names = self.resolved_names.take();
+        let mut seen = HashSet::new();
+        names.retain(|row| seen.insert((row.use_span, row.target)));
+        names
     }
 
     /// What `name` means as a type at `at`, the span of a use.
@@ -1095,7 +1171,12 @@ impl LoweringContext {
             .rev()
             .find(|alias| alias.statement.is_none_or(|s| s.end <= at.start))
         {
-            Some(alias) => AliasAt::InScope(&alias.ty),
+            Some(alias) => {
+                if let Some(target) = alias.name_span {
+                    self.resolved(at, name, target);
+                }
+                AliasAt::InScope(&alias.ty)
+            }
             None => AliasAt::Below,
         }
     }
@@ -1431,13 +1512,21 @@ fn lower_expr_inner(
             } in fields
             {
                 let field_name = ctx.label(qualifier, name, *name_span)?;
-                if out.iter().any(|(k, _)| k == field_name) {
+                if out
+                    .iter()
+                    .any(|entry: &RecordEntry| entry.label == field_name)
+                {
                     return Err(LoweringError::unsupported(
                         *name_span,
                         format!("duplicate key `{field_name}` in record literal"),
                     ));
                 }
-                out.push((field_name, lower_expr(value, ctx)?));
+                let label_occurrence = ctx.occurrence_at(*name_span);
+                out.push(RecordEntry::new(
+                    field_name,
+                    label_occurrence,
+                    lower_expr(value, ctx)?,
+                ));
             }
             Ok(Expr::new(TypedExprNode::Record(out)))
         }
@@ -1519,7 +1608,10 @@ fn lower_expr_inner(
                 Expr::proj_field(ctx.label(attr_qualifier, attr, *attr_span)?)
             };
             let target_expr = lower_expr(target, ctx)?;
-            let proj = ctx.tag_image(key, expr.span);
+            // The projection is tagged at the field's name, `x` in `p.x`, and the
+            // `Apply` `lower_expr` returns at the whole access, so a position on the name
+            // finds the projection and its type.
+            let proj = ctx.tag_image(key, *attr_span);
             Ok(Expr::apply(target_expr, proj))
         }
         // Variant constructor `` `tag(payload) `` → `VariantCtor`. The bare form
@@ -1553,7 +1645,8 @@ fn lower_expr_inner(
                     ctx.tag_machinery(Expr::lit(Lit::Unit), expr.span, "lower.variant_ctor_unit")
                 }
             };
-            Ok(Expr::variant_ctor(label, payload))
+            let tag_occurrence = ctx.occurrence_at(*tag_span);
+            Ok(Expr::variant_ctor(label, tag_occurrence, payload))
         }
         ChlExpr::Lambda { params, body } => {
             refuse_capitalized_lambda_binder(params)?;
@@ -2034,6 +2127,15 @@ pub(crate) mod test_helpers {
         );
         errs.into_iter().next().unwrap()
     }
+}
+
+/// Record each occurrence `expr` holds that nothing recorded yet at `span`, the span its
+/// node is tagged with: a binder or label lowering makes for itself rather than one the
+/// source writes, which [`LoweringContext::occurrence_at`] records at its own span.
+fn tag_held_occurrences(expr: &Expr, span: Span, label: RewriteLabel) {
+    expr.walk_occurrences(|occurrence, _| {
+        crate::ccl::provenance::lowering_occurrence_fallback(occurrence.id(), span, label)
+    });
 }
 
 #[cfg(test)]

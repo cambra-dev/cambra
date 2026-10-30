@@ -1,6 +1,8 @@
 //! `for`-loop lowering: side-effecting / generator (`yield`) loops lowering to
 //! `For` nodes, and mutation-accumulation loops lowering to `Loop` nodes.
 
+use crate::ccl::Annotation;
+use crate::ccl::Occurrence;
 use std::collections::HashSet;
 
 use super::*;
@@ -174,7 +176,7 @@ pub(super) fn lower_generator_for(
                 ctx,
             )
         })?;
-        let for_node = tagged_for_loop(iter_var, source, for_body, for_span, ctx);
+        let for_node = tagged_for_loop(iter_var, target.span, source, for_body, for_span, ctx);
         let handle = ctx.tag_machinery(
             Expr::var(defer_name.clone()),
             for_span,
@@ -193,7 +195,14 @@ pub(super) fn lower_generator_for(
         let for_body = ctx.with_shadowed([iter_var.clone()], |ctx| {
             lower_for_body_stmts(body, None, outer_bindings, frame_introduced, ctx)
         })?;
-        Ok(tagged_for_loop(iter_var, source, for_body, for_span, ctx))
+        Ok(tagged_for_loop(
+            iter_var,
+            target.span,
+            source,
+            for_body,
+            for_span,
+            ctx,
+        ))
     }
 }
 
@@ -207,12 +216,17 @@ pub(super) fn lower_generator_for(
 /// as a capability.
 fn tagged_for_loop(
     iter_var: String,
+    target_span: Span,
     source: Expr,
     body: Expr,
     for_span: Span,
     ctx: &mut LoweringContext,
 ) -> Expr {
-    let lambda = ctx.tag_image(Expr::lambda(iter_var, Type::Hole, body), for_span);
+    let occurrence = ctx.occurrence_at(target_span);
+    let lambda = ctx.tag_image(
+        Expr::lambda(iter_var, occurrence, Type::Hole, body),
+        for_span,
+    );
     ctx.tag_image(
         Expr::compose(vec![source, lambda])
             .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
@@ -235,7 +249,7 @@ fn generator_defer_binding(
         "lower.generator_defer",
     );
     ctx.tag_machinery(
-        Expr::let_bind(defer_name, defer, inner),
+        Expr::let_bind(defer_name, Occurrence::mint(), defer, inner),
         for_span,
         "lower.generator_defer",
     )
@@ -495,12 +509,14 @@ fn lower_for_body_stmts_scoped(
                 let scope = body_scope(mutation_scope, &frame_introduced);
                 let val = lower_assigned_value(value, &[], &scope, ctx)?;
                 frame_introduced.extend(names);
-                for (name, value, transparency) in assignment.bindings(val, stmt.span, ctx) {
+                for (binder, value) in assignment.bindings(val, stmt.span, ctx) {
+                    let occurrence = binder.occurrence(ctx);
                     prefix.push(PrefixStmt::Bind {
-                        name,
+                        name: binder.name,
+                        occurrence,
                         value,
                         annotation: None,
-                        transparency,
+                        transparency: binder.transparency,
                         span: stmt.span,
                     });
                 }
@@ -517,12 +533,16 @@ fn lower_for_body_stmts_scoped(
                 if mut_annotation_parts(&annotation.ty, ctx).is_some() {
                     return Err(mut_decl_with_assign_error(stmt.span, &name));
                 }
-                let ann = lower_let_annotation(&name, annotation, value, ctx)?;
+                let ann = Annotation::new(
+                    lower_let_annotation(&name, annotation, value, ctx)?,
+                    ctx.occurrence_at(annotation.ty.span),
+                );
                 let scope = body_scope(mutation_scope, &frame_introduced);
                 let val = lower_assigned_value(value, &[], &scope, ctx)?;
                 frame_introduced.insert(name.clone());
                 prefix.push(PrefixStmt::Bind {
                     name,
+                    occurrence: ctx.occurrence_at(target.span),
                     value: val,
                     annotation: Some(ann),
                     span: stmt.span,
@@ -530,13 +550,15 @@ fn lower_for_body_stmts_scoped(
                 });
             }
             ChlStmt::Declare { target, annotation } => {
-                let (name, channel, ty) = feed_declaration(target, annotation, stmt.span, ctx)?;
+                let (name, occurrence, channel, ty) =
+                    feed_declaration(target, annotation, stmt.span, ctx)?;
                 if mutation_scope.contains(&name) {
                     return Err(outer_binding_write_error(stmt.span, &name));
                 }
                 frame_introduced.insert(name.clone());
                 prefix.push(PrefixStmt::Bind {
                     name,
+                    occurrence,
                     value: channel,
                     annotation: Some(ty),
                     span: stmt.span,
@@ -596,8 +618,10 @@ fn lower_for_body_stmts_scoped(
                 frame_introduced.insert(name_str.clone());
                 prefix.push(PrefixStmt::Bind {
                     name: name_str,
+                    occurrence: ctx.occurrence_at(name.span),
                     value: func_expr,
-                    annotation,
+                    // A `def`'s polymorphic annotation is built from its signature.
+                    annotation: annotation.map(|poly| Annotation::new(poly, Occurrence::mint())),
                     span: stmt.span,
                     transparency: BindingTransparency::Transparent,
                 });
@@ -666,6 +690,7 @@ fn lower_for_body_stmts_scoped(
         let (wrapped, span) = match item {
             PrefixStmt::Bind {
                 name,
+                occurrence,
                 value,
                 annotation: Some(a),
                 transparency,
@@ -680,15 +705,22 @@ fn lower_for_body_stmts_scoped(
                     BindingTransparency::Transparent,
                     "an annotated binding is transparent"
                 );
-                (Expr::let_bind_annotated(name, value, body, a), span)
+                (
+                    Expr::let_bind_annotated(name, occurrence, value, body, a),
+                    span,
+                )
             }
             PrefixStmt::Bind {
                 name,
+                occurrence,
                 value,
                 annotation: None,
                 transparency,
                 span,
-            } => (Expr::let_bind_with(name, value, body, transparency), span),
+            } => (
+                Expr::let_bind_with(name, occurrence, value, body, transparency),
+                span,
+            ),
             PrefixStmt::Effect { effect, span } => (Expr::expr_stmt(effect, body), span),
             // Imaged by `lower_type_alias_decl` itself.
             PrefixStmt::Alias { target, span } => {
@@ -704,8 +736,9 @@ fn lower_for_body_stmts_scoped(
 enum PrefixStmt<'a> {
     Bind {
         name: String,
+        occurrence: Occurrence,
         value: Expr,
-        annotation: Option<Type>,
+        annotation: Option<Annotation>,
         transparency: BindingTransparency,
         span: Span,
     },
@@ -757,7 +790,7 @@ fn lower_for_body_stmt(
                         "yield outside a generator for-loop context",
                     )
                 })?;
-                let feed = Expr::feed(name.to_string(), lower_expr(y, ctx)?);
+                let feed = Expr::feed(name.to_string(), Occurrence::mint(), lower_expr(y, ctx)?);
                 Ok(ctx.tag_image(feed, stmt.span))
             }
             // `r << e` — direct feed into a named defer handle.
@@ -862,6 +895,7 @@ fn lower_for_body_stmt(
             })?;
             Ok(tagged_for_loop(
                 inner_var,
+                target.span,
                 inner_source,
                 inner_body,
                 stmt.span,
@@ -1361,7 +1395,14 @@ fn lower_nested_loop(
             "a feed-only nested loop lowered a body holding a bare call: a by-reference write \
              in it would be dropped, since this route folds no recurrence"
         );
-        return Ok(tagged_for_loop(iter_var, source, for_body, for_span, ctx));
+        return Ok(tagged_for_loop(
+            iter_var,
+            target.span,
+            source,
+            for_body,
+            for_span,
+            ctx,
+        ));
     }
     let chain = ctx.with_shadowed([iter_var.clone()], |ctx| {
         // A `yield` in the inner body feeds the generator the enclosing loop is in, one
@@ -1376,10 +1417,12 @@ fn lower_nested_loop(
             ctx,
         )
     })?;
+    let occurrence = ctx.occurrence_at(target.span);
     Ok(ctx.tag_image(
         Expr::new(TypedExprNode::For {
             target: TypedBinding {
                 name: iter_var.into(),
+                occurrence,
                 ty: Type::Hole,
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
@@ -1471,10 +1514,12 @@ pub(super) fn lower_direct_mirror_loop(
 
     // The direct-mirror `For` images the for statement; the sequencing
     // `ExprStmt` splicing it before the continuation is manufactured.
+    let occurrence = ctx.occurrence_at(target.span);
     let for_node = ctx.tag_image(
         Expr::new(TypedExprNode::For {
             target: TypedBinding {
                 name: iter_var.into(),
+                occurrence,
                 ty: Type::Hole,
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
@@ -1605,7 +1650,8 @@ fn lower_loop_body_chain_scoped(
                 check_mut_write_context(&name, stmt.span, ctx)?;
                 let rhs = lower_assigned_value(value, &[], outer_bindings, ctx)?;
                 let val = lower_aug_binop(&name, *op, rhs, stmt.span, ctx)?;
-                let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
+                let occurrence = ctx.occurrence_at(target.span);
+                let write = ctx.tag_image(Expr::mut_write(name, occurrence, val), stmt.span);
                 ctx.tag_image(Expr::expr_stmt(write, chain), stmt.span)
             }
             // `x := value` — a write to an accumulator, lowered to the `MutWrite` the
@@ -1642,7 +1688,11 @@ fn lower_loop_body_chain_scoped(
                     // it does for one declared before a top-level loop.
                     let mut_ty = Type::mutable(Type::Hole, value_ty);
                     let init = lower_assigned_value(value, &[], outer_bindings, ctx)?;
-                    ctx.tag_image(Expr::mut_decl(name, mut_ty, init, chain), stmt.span)
+                    let occurrence = ctx.occurrence_at(target.span);
+                    ctx.tag_image(
+                        Expr::mut_decl(name, occurrence, mut_ty, init, chain),
+                        stmt.span,
+                    )
                 } else {
                     if !acc_names.contains(&name) {
                         return Err(in_loop_mut_var_error(stmt.span, &name));
@@ -1663,7 +1713,8 @@ fn lower_loop_body_chain_scoped(
                         _ => {
                             check_mut_write_context(&name, stmt.span, ctx)?;
                             let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;
-                            ctx.tag_image(Expr::mut_write(name, val), stmt.span)
+                            let occurrence = ctx.occurrence_at(target.span);
+                            ctx.tag_image(Expr::mut_write(name, occurrence, val), stmt.span)
                         }
                     };
                     ctx.tag_image(Expr::expr_stmt(write, chain), stmt.span)
@@ -1683,14 +1734,22 @@ fn lower_loop_body_chain_scoped(
                 if mut_annotation_parts(&annotation.ty, ctx).is_some() {
                     return Err(mut_decl_with_assign_error(stmt.span, &name));
                 }
-                let ann = lower_let_annotation(&name, annotation, value, ctx)?;
+                let ann = Annotation::new(
+                    lower_let_annotation(&name, annotation, value, ctx)?,
+                    ctx.occurrence_at(annotation.ty.span),
+                );
                 let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;
-                ctx.tag_image(Expr::let_bind_annotated(name, val, chain, ann), stmt.span)
+                let occurrence = ctx.occurrence_at(target.span);
+                ctx.tag_image(
+                    Expr::let_bind_annotated(name, occurrence, val, chain, ann),
+                    stmt.span,
+                )
             }
             ChlStmt::Declare { target, annotation } => {
-                let (name, channel, ty) = feed_declaration(target, annotation, stmt.span, ctx)?;
+                let (name, occurrence, channel, ty) =
+                    feed_declaration(target, annotation, stmt.span, ctx)?;
                 ctx.tag_image(
-                    Expr::let_bind_annotated(name, channel, chain, ty),
+                    Expr::let_bind_annotated(name, occurrence, channel, chain, ty),
                     stmt.span,
                 )
             }
@@ -1707,7 +1766,8 @@ fn lower_loop_body_chain_scoped(
                     return Ok(Expr::error());
                 };
                 let lowered = lower_expr(feed_value, ctx)?;
-                let feed = ctx.tag_image(Expr::feed(defer_name, lowered), value.span);
+                let occurrence = ctx.occurrence_at(feed_target_span(target));
+                let feed = ctx.tag_image(Expr::feed(defer_name, occurrence, lowered), value.span);
                 ctx.tag_machinery(Expr::expr_stmt(feed, chain), stmt.span, "lower.stmt_seq")
             }
             // `yield value` — a feed into the surrounding generator's defer.
@@ -1719,7 +1779,10 @@ fn lower_loop_body_chain_scoped(
                     )
                 })?;
                 let lowered = lower_expr(y, ctx)?;
-                let feed = ctx.tag_image(Expr::feed(defer_name.to_string(), lowered), value.span);
+                let feed = ctx.tag_image(
+                    Expr::feed(defer_name.to_string(), Occurrence::mint(), lowered),
+                    value.span,
+                );
                 ctx.tag_machinery(Expr::expr_stmt(feed, chain), stmt.span, "lower.stmt_seq")
             }
             // ``match m: case `tag(w): …`` — tag dispatch over a conditional

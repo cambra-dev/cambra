@@ -146,8 +146,8 @@ pub(super) fn insert_iterate_recurse(
                 }
             }
             TypedExprNode::Record(fields) => {
-                for (_, field) in fields.iter_mut() {
-                    insert_iterate_recurse(field, ctx, memo)?;
+                for entry in fields.iter_mut() {
+                    insert_iterate_recurse(&mut entry.value, ctx, memo)?;
                 }
             }
             _ => insert_iterate_recurse(argument, ctx, memo)?,
@@ -288,8 +288,8 @@ pub(super) fn insert_iterate_recurse(
             }
         }
         TypedExprNode::Record(fields) => {
-            for (_, field) in fields.iter_mut() {
-                mark_component_source(field, ctx, memo)?;
+            for entry in fields.iter_mut() {
+                mark_component_source(&mut entry.value, ctx, memo)?;
             }
         }
         // A constructor's payload is a component of the nominal value, as a product's is. A
@@ -791,6 +791,8 @@ mod tests {
     use super::super::test_helpers::*;
     use super::*;
     use crate::ccl::FieldKey;
+    use crate::ccl::Occurrence;
+    use crate::ccl::RecordEntry;
     use crate::ccl::ccl_utils::is_trivially_true_predicate;
     use crate::ccl::symbolic::symbolic;
     use rstest::rstest;
@@ -960,9 +962,15 @@ mod tests {
         // `Record` arm under `input=None`; wrapping the chain would
         // feed an unwanted upstream stream in.
         let int = int_ty();
-        let record = Expr::new(TypedExprNode::Record(vec![("f".into(), list_123())])).with_ty(
-            Type::Record(vec![("f".into(), fun_ty(Type::UIntRange(3), int))]),
-        );
+        let record = Expr::new(TypedExprNode::Record(vec![RecordEntry::new(
+            "f",
+            Occurrence::mint(),
+            list_123(),
+        )]))
+        .with_ty(Type::Record(vec![(
+            "f".into(),
+            fun_ty(Type::UIntRange(3), int),
+        )]));
         assert!(is_iteration_bearing(&record));
     }
 
@@ -974,8 +982,12 @@ mod tests {
         // wrap-then-fail trap.
         let int = int_ty();
         let record_ty = Type::Record(vec![("f".into(), fun_ty(Type::UIntRange(3), int.clone()))]);
-        let record = Expr::new(TypedExprNode::Record(vec![("f".into(), list_123())]))
-            .with_ty(record_ty.clone());
+        let record = Expr::new(TypedExprNode::Record(vec![RecordEntry::new(
+            "f",
+            Occurrence::mint(),
+            list_123(),
+        )]))
+        .with_ty(record_ty.clone());
         let proj = Expr::proj_field("f")
             .with_ty(fun_ty(record_ty, fun_ty(Type::UIntRange(3), int.clone())));
         let apply = Expr::apply(record, proj).with_ty(fun_ty(Type::UIntRange(3), int));
@@ -1163,6 +1175,7 @@ mod tests {
         let list_ty = data_fun_ty(Type::UIntRange(3), int);
         let mut expr = Expr::let_bind(
             "xs".to_string(),
+            Occurrence::mint(),
             list_123(),
             var("xs").with_ty(list_ty.clone()),
         )
@@ -1195,9 +1208,10 @@ mod tests {
         let int = int_ty();
         let field_ty = fun_ty(Type::UIntRange(3), int.clone());
         let mut expr = Expr::new(TypedExprNode::Record(vec![
-            ("xs".into(), list_123()),
-            (
-                "constant".into(),
+            RecordEntry::new("xs", Occurrence::mint(), list_123()),
+            RecordEntry::new(
+                "constant",
+                Occurrence::mint(),
                 Expr::lit(Lit::Int(42)).with_ty(int.clone()),
             ),
         ]))
@@ -1432,17 +1446,21 @@ mod tests {
         #[case] expect_site: bool,
     ) {
         let component = list_123().with_ty(component_ty.clone());
-        let mut expr = Expr::new(TypedExprNode::Record(vec![("out".into(), component)]))
-            .with_ty(Type::Record(vec![("out".into(), component_ty.clone())]));
+        let mut expr = Expr::new(TypedExprNode::Record(vec![RecordEntry::new(
+            "out",
+            Occurrence::mint(),
+            component,
+        )]))
+        .with_ty(Type::Record(vec![("out".into(), component_ty.clone())]));
         insert_iterate_recurse(&mut expr, &mut Default::default(), &PredMemo::new()).unwrap();
         let TypedExprNode::Record(fields) = &expr.node else {
             panic!("still a record: {}", symbolic(&expr));
         };
         assert_eq!(
-            is_iterate_apply(chain_head(&fields[0].1)),
+            is_iterate_apply(chain_head(&fields[0].value)),
             expect_site,
             "{component_ty} as a product component: got {}",
-            symbolic(&fields[0].1),
+            symbolic(&fields[0].value),
         );
     }
 
@@ -1451,8 +1469,12 @@ mod tests {
     fn test_insert_iterate_recurse_wraps_a_collection_record_field() {
         let int = int_ty();
         let mut expr = Expr::new(TypedExprNode::Record(vec![
-            ("xs".into(), list_123()),
-            ("n".into(), Expr::lit(Lit::Int(0)).with_ty(int.clone())),
+            RecordEntry::new("xs", Occurrence::mint(), list_123()),
+            RecordEntry::new(
+                "n",
+                Occurrence::mint(),
+                Expr::lit(Lit::Int(0)).with_ty(int.clone()),
+            ),
         ]))
         .with_ty(Type::Record(vec![
             ("xs".into(), fun_ty(Type::UIntRange(3), int.clone())),
@@ -1462,13 +1484,17 @@ mod tests {
         let TypedExprNode::Record(fields) = &expr.node else {
             panic!("expected Record, got: {}", symbolic(&expr));
         };
-        let xs = &fields.iter().find(|(n, _)| n.name() == "xs").unwrap().1;
+        let xs = &fields
+            .iter()
+            .find(|f| f.label.name() == "xs")
+            .unwrap()
+            .value;
         assert!(
             is_iterate_apply(chain_head(xs)),
             "the collection field `xs` is a site: {}",
             symbolic(xs)
         );
-        let n = &fields.iter().find(|(n, _)| n.name() == "n").unwrap().1;
+        let n = &fields.iter().find(|f| f.label.name() == "n").unwrap().value;
         assert!(
             matches!(n.node, TypedExprNode::Lit(_)),
             "the scalar field `n` is untouched: {}",

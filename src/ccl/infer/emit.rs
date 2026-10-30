@@ -3,6 +3,7 @@
 // ---------------------------------------------------------------------------
 
 use crate::ccl::Label;
+use crate::ccl::RecordEntry;
 use std::collections::BTreeMap;
 
 use crate::ccl::FieldKey;
@@ -239,7 +240,11 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             branches,
         } => emit_case(scrutinee.as_deref_mut(), branches, &label, ctx)?,
 
-        TypedExprNode::VariantCtor { tag, payload } => emit_variant_ctor(tag, payload, ctx)?,
+        TypedExprNode::VariantCtor {
+            tag_occurrence: _,
+            tag,
+            payload,
+        } => emit_variant_ctor(tag, payload, ctx)?,
 
         TypedExprNode::NominalCtor {
             decl,
@@ -317,7 +322,11 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // as a `Var` use would. Instantiation is a no-op for the common
         // monomorphic defer binding; for a feed-typed lambda param it
         // returns the param type verbatim.
-        TypedExprNode::Feed { name, value } => {
+        TypedExprNode::Feed {
+            name_occurrence: _,
+            name,
+            value,
+        } => {
             let target_ty = ctx.instantiate_binding(name)?;
             emit_feed(name, &target_ty, value, &label, ctx).map_err(|e| {
                 e.with_escape_target(EscapeTarget::Feed {
@@ -326,7 +335,11 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             })?
         }
 
-        TypedExprNode::Define { name, value } => {
+        TypedExprNode::Define {
+            name_occurrence: _,
+            name,
+            value,
+        } => {
             let target_ty = ctx.instantiate_binding(name)?;
             emit_define(name, &target_ty, value, &label, ctx)?
         }
@@ -363,7 +376,12 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // Instantiation is a no-op for the monomorphic accumulator bindings
         // lowering produces (a polymorphic init would under-constrain the
         // write and surface as `UnresolvedInfer`).
-        TypedExprNode::MutWrite { name, key, value } => {
+        TypedExprNode::MutWrite {
+            name_occurrence: _,
+            name,
+            key,
+            value,
+        } => {
             let var_ty = ctx.instantiate_binding(name)?;
             // The written value flows into the mutable variable's *value* type, not
             // the `Mut` handle itself — which is what a write means: it updates `V`.
@@ -808,7 +826,7 @@ pub(super) fn emit_lambda<C: Typing>(
     // User annotation on the param might contain a predicate, so we
     // call emit_annotation_predicates on it.
     if let Some(annotation) = &mut param.user_annotation {
-        emit_annotation_predicates(annotation, ctx)?;
+        emit_annotation_predicates(&mut annotation.ty, ctx)?;
     }
     // The parameter binds at its **declared** type when there is one, and at its
     // slot otherwise. Normalizing does the work of both annotation forms with no
@@ -832,7 +850,7 @@ pub(super) fn emit_lambda<C: Typing>(
     // `coalesce_node` resolves the binding slot in place. Domain refinements ride
     // the type lattice (introduced by `cast`), not the lambda node, so the param
     // binds under its bare type here.
-    let declared = param.user_annotation.clone().unwrap_or(param.ty.clone());
+    let declared = param.annotation_ty().unwrap_or(&param.ty).clone();
     let mut param_simple = ctx.normalize(&declared);
     // A refinement riding `param.ty` rather than a `user_annotation` — the shape
     // lowering gives a re-keying producer's key binder,
@@ -1484,14 +1502,17 @@ pub(super) fn emit_tuple<C: Typing>(
 
 /// Record literal: each field value type becomes a named product field.
 pub(super) fn emit_record<C: Typing>(
-    fs: &mut [(Label, Expr)],
+    fs: &mut [RecordEntry],
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let mut fields = BTreeMap::new();
-    for (n, e) in fs.iter_mut() {
+    for entry in fs.iter_mut() {
         // Deref a bare mutable read to its value, as in `emit_tuple`: the field
         // takes the dereferenced type so no `Mut` appears in the record type.
-        fields.insert(FieldKey::Name(n.clone()), read_mut(&ctx.subexpr(e)?));
+        fields.insert(
+            FieldKey::Name(entry.label.clone()),
+            read_mut(&ctx.subexpr(&mut entry.value)?),
+        );
     }
     Ok(product(fields))
 }
@@ -1924,7 +1945,7 @@ fn emit_let_definition<C: Typing>(
     // generalized at the binding site (`scoped_let`). A polymorphic annotation is
     // opened at that level first, so its type parameters sit with the right-hand
     // side's own variables and are quantified with them.
-    let poly = match &binding.user_annotation {
+    let poly = match binding.annotation_ty() {
         Some(Type::Poly(poly)) => Some(std::rc::Rc::clone(poly)),
         _ => None,
     };
@@ -1952,11 +1973,13 @@ fn emit_let_definition<C: Typing>(
     // parameters and `requires` clause are this binding's own, which its scheme
     // states to each use (`scoped_let`) and the coalesce walk assumes while it checks
     // the definition alone.
-    if let Some(opened) = opened {
-        binding.user_annotation = Some(Type::Poly(std::rc::Rc::new(crate::ccl::ty::PolyType {
+    if let Some(opened) = opened
+        && let Some(annotation) = &mut binding.user_annotation
+    {
+        annotation.ty = Type::Poly(std::rc::Rc::new(crate::ccl::ty::PolyType {
             body: scheme_ty.clone(),
             ..opened
-        })));
+        }));
     }
     // The binder slot records the type the variable is *bound at*, not its
     // initializer's type — an exact annotation binds at the annotation, not at
@@ -1990,7 +2013,7 @@ fn emit_let_definition<C: Typing>(
         LetScheme::Monomorphic
     };
     if defined && generalize {
-        let noted = match &binding.user_annotation {
+        let noted = match binding.annotation_ty() {
             Some(poly @ Type::Poly(_)) => poly,
             _ => &scheme_ty,
         };
@@ -2104,7 +2127,8 @@ fn emit_def_group(
 /// Emit member `at` of group `g` and bind it in the group's scope.
 fn emit_group_member(g: usize, at: usize, ctx: &mut InferCtx) -> Result<(), LocatedInferError> {
     let member = &mut ctx.groups[g].members[at];
-    let mut binding = member.binding.clone();
+    // The member's binder is written back where it stands, not duplicated.
+    let mut binding = member.binding.clone_preserving_ids();
     let mut def = member.def.take().expect("a member is emitted once");
     ctx.groups[g].in_progress.push(at);
     // The definition is the node that binds the member, as a `let` is for a `let`: its rule
@@ -2284,7 +2308,7 @@ fn emit_let_bound<C: Typing>(
     // name, so this is the scope they belong in.
     let mut annotation_typed = true;
     if let Some(ann) = &mut binding.user_annotation
-        && let Err(error) = emit_annotation_predicates(ann, ctx)
+        && let Err(error) = emit_annotation_predicates(&mut ann.ty, ctx)
     {
         ctx.recover(error, reads_before)?;
         annotation_typed = false;
@@ -2295,7 +2319,8 @@ fn emit_let_bound<C: Typing>(
     // Whether it is bound at the annotation rather than at the right-hand side's type.
     let mut at_annotation = false;
     // The type the variable is bound at over the body.
-    let scheme_ty = match &binding.user_annotation {
+    let annotation = binding.user_annotation.as_ref();
+    let scheme_ty = match annotation.map(|a| &a.ty) {
         // An annotation whose predicates did not type declares nothing usable.
         Some(_) if !annotation_typed => {
             poisoned = true;
@@ -2344,7 +2369,7 @@ fn emit_let_bound<C: Typing>(
             match ctx.in_let_rhs(|ctx| ctx.bind_poly_annotation(&bound_ty, &declared, &shown)) {
                 Ok(ty) => ty,
                 Err(error) => {
-                    ctx.recover(error, reads_before)?;
+                    ctx.recover(error.at_annotation(annotation), reads_before)?;
                     poisoned = true;
                     poison(ctx)
                 }
@@ -2363,7 +2388,7 @@ fn emit_let_bound<C: Typing>(
             match ctx.bind_annotation(&bound_ty, &declared) {
                 Ok(ty) => ty,
                 Err(error) => {
-                    ctx.recover(error, reads_before)?;
+                    ctx.recover(error.at_annotation(annotation), reads_before)?;
                     poisoned = true;
                     poison(ctx)
                 }
@@ -2474,7 +2499,8 @@ pub(super) fn emit_letrec<C: Typing>(
         .collect();
     for ((b, _), (_, ty)) in bindings.iter().zip(&declared) {
         if let Some(ann) = &b.user_annotation {
-            ctx.bind_annotation(ty, ann)?;
+            ctx.bind_annotation(ty, &ann.ty)
+                .map_err(|error| error.at_annotation(Some(ann)))?;
         }
     }
     scoped_group(ctx, &declared, &mut |ctx| {
@@ -2606,8 +2632,9 @@ pub(super) fn emit_for<C: Typing>(
     ctx.require_sub_under(&item_ty, &source_binders, &target_simple, &[], &|| {
         format!("for-loop target `{target_label}`")
     })?;
-    if let Some(ann) = target.user_annotation.clone() {
-        ctx.bind_annotation(&target_simple, &ann)?;
+    if let Some(ann) = &target.user_annotation {
+        ctx.bind_annotation(&target_simple, &ann.ty)
+            .map_err(|error| error.at_annotation(Some(ann)))?;
     }
 
     // A `for` reaching inference as a loop node writes mutable variables declared outside

@@ -1,3 +1,4 @@
+use cambra::ccl::Occurrence;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -1524,7 +1525,12 @@ fn pi_typed_collection() -> Type {
 /// the reference reaches the `Var` lookup unbound. Inference reports `Unbound
 /// variable: 'i'` (the `PiBound` prints its hint), and every caller pins it.
 fn check_over_pi_typed_collection(body: Expr) {
-    let mut expr = uniquify::run(Expr::lambda("c", pi_typed_collection(), body));
+    let mut expr = uniquify::run(Expr::lambda(
+        "c",
+        Occurrence::mint(),
+        pi_typed_collection(),
+        body,
+    ));
     infer(&mut expr, &mut TypeInferenceContext::new())
         .unwrap_or_else(|errs| panic!("inference must succeed: {errs:?}"));
     typecheck(&expr).unwrap_or_else(|errs| panic!("the tree must type-check: {errs:?}"));
@@ -1605,11 +1611,13 @@ fn collection_contains_of_an_inferred_pi_typed_collection() {
 fn dependent_function_composition() {
     let fc = Expr::lambda(
         "f1",
+        Occurrence::mint(),
         Type::fun(Type::Base(BaseType::String), Type::Base(BaseType::Int)),
         Expr::compose(vec![
             Expr::var("f1"),
             Expr::lambda(
                 "i",
+                Occurrence::mint(),
                 Type::Hole,
                 Expr::binop(
                     Expr::var("i"),
@@ -1624,11 +1632,11 @@ fn dependent_function_composition() {
     let call = Expr::apply(
         Expr::lit(Lit::String("Hello".into())),
         Expr::apply(
-            Expr::lambda("s", Type::Hole, Expr::lit(Lit::Int(1))),
+            Expr::lambda("s", Occurrence::mint(), Type::Hole, Expr::lit(Lit::Int(1))),
             Expr::var("fc"),
         ),
     );
-    let mut expr = uniquify::run(Expr::let_bind("fc", fc, call));
+    let mut expr = uniquify::run(Expr::let_bind("fc", Occurrence::mint(), fc, call));
     infer(&mut expr, &mut TypeInferenceContext::new())
         .unwrap_or_else(|errs| panic!("inference must succeed: {errs:?}"));
     typecheck(&expr).unwrap_or_else(|errs| panic!("the tree must type-check: {errs:?}"));

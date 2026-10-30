@@ -42,6 +42,7 @@
 //! ([`Builtin::CurryOver`]), and op-conversion builds the operators the chain compiles to.
 
 use super::*;
+use crate::ccl::Occurrence;
 use std::rc::Rc;
 
 use crate::ccl::TypedExpr;
@@ -317,8 +318,10 @@ fn keys_family(components: &[(Option<Name>, Type)], ctx: &mut PlanningCtx) -> Re
     let per_row = predicates::eliminate_lifted(
         Expr::lambda(
             &x,
+            Occurrence::mint(),
             enclosing.clone(),
-            Expr::lambda(&r, indices.clone(), indexed).with_ty(image_ty.clone()),
+            Expr::lambda(&r, Occurrence::mint(), indices.clone(), indexed)
+                .with_ty(image_ty.clone()),
         )
         .with_ty(Type::pi(x.clone(), enclosing.clone(), image_ty.clone())),
     )
@@ -387,7 +390,7 @@ fn row_keys_family(
         (unboxed, unboxed_ty)
     };
     let per_row = predicates::eliminate_lifted(
-        Expr::lambda(x, enclosing.clone(), unboxed).with_ty(Type::pi(
+        Expr::lambda(x, Occurrence::mint(), enclosing.clone(), unboxed).with_ty(Type::pi(
             x.clone(),
             enclosing.clone(),
             unboxed_ty.clone(),
@@ -658,7 +661,7 @@ fn emit_component_filter(g: &mut Expr, ctx: &mut PlanningCtx) -> Result<bool, St
             let ty = on_element.ty.clone();
             Expr::apply(
                 at(0, first),
-                Expr::lambda(a.clone(), first.clone(), on_element),
+                Expr::lambda(a.clone(), Occurrence::mint(), first.clone(), on_element),
             )
             .with_ty(ty)
         } else {

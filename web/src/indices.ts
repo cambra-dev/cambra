@@ -103,7 +103,7 @@ export function buildIndices(
       stack.push({
         id: child.id,
         depth: depth + 1,
-        inPredicate: inPredicate || child.predicate,
+        inPredicate: inPredicate || child.kind === "predicate",
       });
     }
   }

@@ -39,6 +39,7 @@ pub(super) fn test_sink_name(
 /// so the sink record's field for it is the name the program already wrote to.
 pub(super) fn lower_test_sink(
     name: String,
+    name_span: Span,
     span: Span,
     body: Expr,
     ctx: &mut LoweringContext,
@@ -50,5 +51,6 @@ pub(super) fn lower_test_sink(
         span,
     });
     let defer = ctx.tag_machinery(Expr::new(TypedExprNode::Defer), span, "lower.test_sink");
-    Ok(ctx.tag_image(Expr::let_bind(name, defer, body), span))
+    let occurrence = ctx.occurrence_at(name_span);
+    Ok(ctx.tag_image(Expr::let_bind(name, occurrence, defer, body), span))
 }

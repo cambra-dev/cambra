@@ -1197,22 +1197,48 @@ impl Subst {
             // the stale handle is kept for channelize's own
             // `UnboundDeferHandle` boundary to report (feeding a lambda
             // parameter is user-reachable: `\d, v -> d << v`).
-            Feed { name, value } => {
+            Feed {
+                name_occurrence,
+                name,
+                value,
+            } => {
                 let (name, value) = self.apply_handle_use(name, value);
-                Feed { name, value }
+                Feed {
+                    name_occurrence: name_occurrence.clone(),
+                    name,
+                    value,
+                }
             }
-            Define { name, value } => {
+            Define {
+                name_occurrence,
+                name,
+                value,
+            } => {
                 let (name, value) = self.apply_handle_use(name, value);
-                Define { name, value }
+                Define {
+                    name_occurrence: name_occurrence.clone(),
+                    name,
+                    value,
+                }
             }
             // The write target is a use of the mutable variable's binding,
             // renamed exactly like a Feed target (a discharge to a
             // non-variable term keeps the stale name for the phase's own
             // residue checks to report).
-            MutWrite { name, key, value } => {
+            MutWrite {
+                name_occurrence,
+                name,
+                key,
+                value,
+            } => {
                 let key = key.as_ref().map(|k| Box::new(self.apply_expr(k)));
                 let (name, value) = self.apply_handle_use(name, value);
-                MutWrite { name, key, value }
+                MutWrite {
+                    name_occurrence: name_occurrence.clone(),
+                    name,
+                    key,
+                    value,
+                }
             }
 
             Lambda { param, body } => {
@@ -1334,8 +1360,8 @@ impl Subst {
         }
         e.walk_binders_mut(|b| {
             b.ty = self.apply_type(&b.ty);
-            if let Some(annotation) = &b.user_annotation {
-                b.user_annotation = Some(self.apply_type(annotation));
+            if let Some(annotation) = &mut b.user_annotation {
+                annotation.ty = self.apply_type(&annotation.ty);
             }
         });
     }
@@ -1428,9 +1454,7 @@ impl Subst {
             .iter()
             .filter(|(name, _)| {
                 is_free_in_type(name, &b.ty)
-                    || b.user_annotation
-                        .as_ref()
-                        .is_some_and(|a| is_free_in_type(name, a))
+                    || b.annotation_ty().is_some_and(|a| is_free_in_type(name, a))
             })
             .map(|(name, term)| (name.clone(), Mapping::Discharge(Rc::new(term.clone()))))
             .collect();
@@ -1439,8 +1463,8 @@ impl Subst {
         }
         let subst = Subst::of_binders(live);
         b.ty = subst.apply_type(&b.ty);
-        if let Some(annotation) = &b.user_annotation {
-            b.user_annotation = Some(subst.apply_type(annotation));
+        if let Some(annotation) = &mut b.user_annotation {
+            annotation.ty = subst.apply_type(&annotation.ty);
         }
     }
 
@@ -3364,6 +3388,7 @@ mod capture_assert_probe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Occurrence;
     use crate::ccl::{BinOpKind, CompareKind, Lit, Refinement, TypedBinding};
 
     fn var(s: &str) -> TypedExpr {
@@ -3581,7 +3606,7 @@ mod tests {
     // free.
     #[test]
     fn scenario_f_context_check() {
-        let pred = TypedExpr::lambda("y", Type::Hole, gt(var("y"), var("k")));
+        let pred = TypedExpr::lambda("y", Occurrence::mint(), Type::Hole, gt(var("y"), var("k")));
         let bad = Type::refined_one(Type::infer(), Refinement::born(Rc::new(pred)));
         let only_x: BTreeSet<Binder> = [Name::raw("x")].into_iter().collect();
         let only_k: BTreeSet<Binder> = [Name::raw("k")].into_iter().collect();
@@ -3599,7 +3624,7 @@ mod tests {
     #[should_panic(expected = "Barendregt violation")]
     fn scenario_g_capture_panics() {
         // body: λ x → (x > k); apply [k ↦ x] — the raw names collide.
-        let lam = TypedExpr::lambda("x", Type::Hole, gt(var("x"), var("k")));
+        let lam = TypedExpr::lambda("x", Occurrence::mint(), Type::Hole, gt(var("x"), var("k")));
         let _ = Subst::rename("k", "x").apply_expr(&lam);
     }
 
@@ -3891,7 +3916,7 @@ mod tests {
 
     #[test]
     fn a_lambda_keeps_its_param_name() {
-        let e = TypedExpr::lambda("x", Type::Hole, TypedExpr::var("k"));
+        let e = TypedExpr::lambda("x", Occurrence::mint(), Type::Hole, TypedExpr::var("k"));
         let TypedExprNode::Lambda { param, body } = live_rename().apply_expr(&e).node else {
             panic!("expected a lambda");
         };
@@ -3902,7 +3927,7 @@ mod tests {
     #[test]
     fn a_for_keeps_its_target_name() {
         let e = TypedExpr::new(TypedExprNode::For {
-            target: TypedBinding::new_unannotated("y"),
+            target: TypedBinding::new_unannotated("y", Occurrence::mint()),
             iter: Box::new(TypedExpr::var("xs")),
             body: Box::new(TypedExpr::var("k")),
         });
@@ -3916,7 +3941,7 @@ mod tests {
     #[test]
     fn a_let_keeps_its_binding_name() {
         let e = TypedExpr::let_in(
-            TypedBinding::new_unannotated("z"),
+            TypedBinding::new_unannotated("z", Occurrence::mint()),
             TypedExpr::var("k"),
             TypedExpr::var("k"),
         );
@@ -3946,6 +3971,7 @@ mod tests {
 #[cfg(test)]
 mod rewrite_tests {
     use super::*;
+    use crate::ccl::Occurrence;
     use crate::ccl::ccl_utils::is_free;
     use crate::ccl::{BinOpKind, CompareKind, Lit, Refinement, TypedBinding};
     use std::rc::Rc;
@@ -4011,7 +4037,7 @@ mod rewrite_tests {
     fn transport_discharges_a_binder_s_declared_type() {
         let refined =
             Type::refined_one(Type::Hole, Refinement::born(Rc::new(gt(var("k"), int(0)))));
-        let e = TypedExpr::lambda("p", refined, var("p"));
+        let e = TypedExpr::lambda("p", Occurrence::mint(), refined, var("p"));
 
         let out = Subst::discharge("k", int(5)).apply_expr(&e);
 
@@ -4037,10 +4063,15 @@ mod rewrite_tests {
     #[test]
     fn rewrite_respects_shadowing_copies() {
         let a = Name::fresh("a");
-        let inner = TypedExpr::lambda(a.clone(), Type::Hole, gt(var("x"), int(0)));
+        let inner = TypedExpr::lambda(
+            a.clone(),
+            Occurrence::mint(),
+            Type::Hole,
+            gt(var("x"), int(0)),
+        );
         let mut e = TypedExpr::apply(
             TypedExpr::var(a.clone()),
-            TypedExpr::lambda("w", Type::Hole, inner),
+            TypedExpr::lambda("w", Occurrence::mint(), Type::Hole, inner),
         );
         Subst::discharge(a.clone(), int(3)).rewrite_expr(&mut e);
         let TypedExprNode::Apply { function, argument } = &e.node else {
@@ -4069,11 +4100,11 @@ mod rewrite_tests {
         let letrec = TypedExpr::letrec(
             vec![
                 (
-                    TypedBinding::new_unannotated(x.clone()),
+                    TypedBinding::new_unannotated(x.clone(), Occurrence::mint()),
                     gt(TypedExpr::var(x.clone()), int(1)),
                 ),
                 (
-                    TypedBinding::new_unannotated(Name::fresh("y")),
+                    TypedBinding::new_unannotated(Name::fresh("y"), Occurrence::mint()),
                     TypedExpr::var(x.clone()),
                 ),
             ],
@@ -4092,7 +4123,7 @@ mod rewrite_tests {
         let z = Name::fresh("z");
         let mut open = TypedExpr::letrec(
             vec![(
-                TypedBinding::new_unannotated(z.clone()),
+                TypedBinding::new_unannotated(z.clone(), Occurrence::mint()),
                 gt(TypedExpr::var(x.clone()), int(0)),
             )],
             TypedExpr::var(x.clone()),
@@ -4105,15 +4136,15 @@ mod rewrite_tests {
     // non-variable discharge for channelize's own boundary to diagnose.
     #[test]
     fn rewrite_renames_feed_handles() {
-        let mut e = TypedExpr::feed("d", var("d"));
+        let mut e = TypedExpr::feed("d", Occurrence::mint(), var("d"));
         Subst::rename("d", "q").rewrite_expr(&mut e);
-        let TypedExprNode::Feed { name, value } = &e.node else {
+        let TypedExprNode::Feed { name, value, .. } = &e.node else {
             panic!("feed preserved");
         };
         assert_eq!(name, &Name::raw("q"));
         assert_eq!(value.node, TypedExprNode::Var(Name::raw("q")));
 
-        let mut stale = TypedExpr::feed("d", int(1));
+        let mut stale = TypedExpr::feed("d", Occurrence::mint(), int(1));
         Subst::discharge("d", int(2)).rewrite_expr(&mut stale);
         let TypedExprNode::Feed { name, .. } = &stale.node else {
             panic!("feed preserved");
@@ -4143,7 +4174,7 @@ mod rewrite_tests {
             let bindings: Vec<_> = (0..n)
                 .map(|i| {
                     (
-                        TypedBinding::new_unannotated(format!("f{i}")),
+                        TypedBinding::new_unannotated(format!("f{i}"), Occurrence::mint()),
                         int(i as i64),
                     )
                 })
@@ -4169,8 +4200,9 @@ mod rewrite_tests {
     fn case_pays_the_capture_check_once_per_branch_not_once_per_child() {
         let branch = |tag: &str, payload: &str| Branch {
             pattern: Some(crate::ccl::Pattern {
+                head_occurrence: Occurrence::mint(),
                 head: crate::ccl::PatternHead::Tag(tag.into()),
-                binding: TypedBinding::new_unannotated(payload),
+                binding: TypedBinding::new_unannotated(payload, Occurrence::mint()),
                 empty_payload: false,
             }),
             guard: int(1),
@@ -4200,7 +4232,7 @@ mod rewrite_tests {
     #[should_panic(expected = "Barendregt violation")]
     fn a_binder_crossing_is_checked_even_when_the_body_is_inert() {
         let mut e = TypedExpr::new(TypedExprNode::For {
-            target: TypedBinding::new_unannotated("y"),
+            target: TypedBinding::new_unannotated("y", Occurrence::mint()),
             iter: Box::new(var("x")),
             body: Box::new(int(1)),
         });
@@ -4217,14 +4249,17 @@ mod rewrite_tests {
 
         let handle_nodes = [
             TypedExpr::new(TypedExprNode::Feed {
+                name_occurrence: Occurrence::mint(),
                 name: Name::raw("h"),
                 value: Box::new(int(1)),
             }),
             TypedExpr::new(TypedExprNode::Define {
+                name_occurrence: Occurrence::mint(),
                 name: Name::raw("h"),
                 value: Box::new(int(1)),
             }),
             TypedExpr::new(TypedExprNode::MutWrite {
+                name_occurrence: Occurrence::mint(),
                 name: Name::raw("h"),
                 key: None,
                 value: Box::new(int(1)),
@@ -4265,6 +4300,7 @@ mod rewrite_tests {
 #[cfg(test)]
 mod locally_nameless_tests {
     use super::*;
+    use crate::ccl::Occurrence;
     use crate::ccl::{BaseType, Lit, Refinement, RefinementSet};
 
     fn int() -> Type {
@@ -4652,6 +4688,7 @@ mod locally_nameless_tests {
         // {Int | (λ k → k) …} — the body's `k` is the lambda's parameter.
         let shadowing = refined(TypedExpr::lambda(
             k.clone(),
+            Occurrence::mint(),
             int(),
             TypedExpr::var(k.clone()),
         ));

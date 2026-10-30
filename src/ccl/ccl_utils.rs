@@ -1,6 +1,7 @@
 //! Miscellaneous utilities for working with CCL.
 
 use crate::ccl::Label;
+use crate::ccl::{Occurrence, RecordEntry};
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
@@ -208,7 +209,7 @@ pub fn writer_decision_record(commit: Expr, writes: Expr, feeds: &[(Label, Expr,
             .map(|(k, v)| (k.clone(), v.ty.clone()))
             .collect(),
     );
-    Expr::new(TypedExprNode::Record(fields)).with_ty(ty)
+    Expr::new(TypedExprNode::Record(RecordEntry::minted(fields))).with_ty(ty)
 }
 
 /// The tap variant type `` {`fired{𝑉} | `idle} `` over a fed value type `𝑉`.
@@ -430,28 +431,30 @@ pub fn wrap_decision_variant(decision: Expr) -> Expr {
             // Split the `commit` selector out from the payload fields (everything
             // else — `writes` and the `__to_<defer>*` taps, in order).
             let mut commit: Option<Expr> = None;
-            let mut payload_fields: Vec<(Label, Expr)> = Vec::with_capacity(fields.len());
-            for (k, v) in fields {
-                if k == COMMIT_SELECTOR {
-                    commit = Some(v);
+            let mut payload_fields: Vec<RecordEntry> = Vec::with_capacity(fields.len());
+            for entry in fields {
+                if entry.label == COMMIT_SELECTOR {
+                    commit = Some(entry.value);
                 } else {
-                    payload_fields.push((k, v));
+                    payload_fields.push(entry);
                 }
             }
             let commit = commit.expect("a writer decision record carries a `commit` selector");
             let payload_ty = Type::Record(
                 payload_fields
                     .iter()
-                    .map(|(k, v)| (k.clone(), v.ty.clone()))
+                    .map(|entry| (entry.label.clone(), entry.value.ty.clone()))
                     .collect(),
             );
             let payload =
                 Expr::new(TypedExprNode::Record(payload_fields)).with_ty(payload_ty.clone());
             let variant_ty = decision_variant_ty(payload_ty);
 
-            let commit_ctor = Expr::variant_ctor(V_COMMIT, payload).with_ty(variant_ty.clone());
+            let commit_ctor = Expr::variant_ctor(V_COMMIT, Occurrence::mint(), payload)
+                .with_ty(variant_ty.clone());
             let unit = Expr::new(TypedExprNode::Lit(Lit::Unit)).with_ty(unit_ty.clone());
-            let abort_ctor = Expr::variant_ctor(V_ABORT, unit).with_ty(variant_ty.clone());
+            let abort_ctor =
+                Expr::variant_ctor(V_ABORT, Occurrence::mint(), unit).with_ty(variant_ty.clone());
             let true_lit = Expr::new(TypedExprNode::Lit(Lit::Bool(true))).with_ty(bool_ty.clone());
 
             let mut case = Expr::new(TypedExprNode::Case {
@@ -752,6 +755,7 @@ fn reduce_application(
                     Expr::throwaway(TypedExprNode::Tuple(vec![a(), element])).with_ty(Type::Hole);
                 let param = TypedBinding {
                     name: k,
+                    occurrence: Occurrence::PLACEHOLDER,
                     ty: Type::Hole,
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
@@ -784,6 +788,7 @@ fn reduce_application(
                 let body = applied(both, inner, Type::Hole, fuel);
                 let param = TypedBinding {
                     name: y,
+                    occurrence: Occurrence::PLACEHOLDER,
                     ty: Type::Hole,
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
@@ -843,8 +848,8 @@ fn reduce_application(
         TypedExprNode::Proj(ProjKey::Field(field)) => match &argument.node {
             TypedExprNode::Record(fields) => fields
                 .iter()
-                .find(|(n, _)| n == field)
-                .map(|(_, v)| v.clone_preserving_ids()),
+                .find(|entry| entry.label == *field)
+                .map(|entry| entry.value.clone_preserving_ids()),
             _ => None,
         },
         _ => None,
@@ -2919,6 +2924,7 @@ mod tests {
             let xs = Expr::var(Name::from("xs")).with_ty(Type::data_fun(uint.clone(), int()));
             let filtered = Expr::let_bind(
                 t,
+                Occurrence::mint(),
                 Expr::lit(Lit::Int(bound)).with_ty(int()),
                 make_cast(xs, target),
             );
@@ -3038,6 +3044,7 @@ mod tests {
         };
         let named = Refinement::born(Rc::new(eq(Expr::let_bind(
             Name::from("__anf"),
+            Occurrence::mint(),
             sum(),
             Expr::var(Name::from("__anf")).with_ty(Type::Base(BaseType::Int)),
         ))));
@@ -3059,6 +3066,7 @@ mod tests {
     fn an_opaque_binding_is_left_standing() {
         let read = Expr::let_bind_with(
             Name::from("__read"),
+            Occurrence::mint(),
             Expr::var(Name::from("x")).with_ty(Type::Base(BaseType::Int)),
             Expr::var(Name::from("__read")).with_ty(Type::Base(BaseType::Int)),
             BindingTransparency::Opaque,

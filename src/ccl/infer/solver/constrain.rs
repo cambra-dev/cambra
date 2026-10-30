@@ -2565,6 +2565,7 @@ fn extrude_invariant(ty: &Type, target_level: Level, cache: &mut ExtrudeCache) -
 
 #[cfg(test)]
 mod tests {
+    use crate::ccl::Occurrence;
     use crate::ccl::ty::FunKindVar;
     use std::rc::Rc;
 
@@ -4064,7 +4065,7 @@ mod tests {
         // Binder slots are blind too: identical lambda captures whose param
         // slots differ compare equal.
         let lam = || {
-            let mut l = TypedExpr::lambda("w", Type::Hole, TypedExpr::var("w"));
+            let mut l = TypedExpr::lambda("w", Occurrence::mint(), Type::Hole, TypedExpr::var("w"));
             if let TypedExprNode::Lambda { param, .. } = &mut l.node {
                 param.ty = fresh_var(0);
             }

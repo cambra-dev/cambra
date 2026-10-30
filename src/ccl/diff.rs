@@ -1249,6 +1249,8 @@ fn collect_deleted_roots<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ccl::Occurrence;
+    use crate::ccl::RecordEntry;
     use crate::ccl::content_hash::content_hash;
     use crate::ccl::context::{GlobalContext, compile_program};
     use crate::ccl::{
@@ -1276,7 +1278,7 @@ mod tests {
         TypedExpr::binop(l, BinOpKind::Arithmetic(ArithmeticKind::Mul), r)
     }
     fn let_in(name: &str, value: TypedExpr, body: TypedExpr) -> TypedExpr {
-        TypedExpr::let_bind(name, value, body)
+        TypedExpr::let_bind(name, Occurrence::mint(), value, body)
     }
 
     /// The src sides of the matches whose content changed, as a convenience for
@@ -1475,7 +1477,10 @@ mod tests {
     fn record_field_reorder_is_not_a_move() {
         let rec = |fields: Vec<(&str, TypedExpr)>| {
             TypedExpr::new(TypedExprNode::Record(
-                fields.into_iter().map(|(n, e)| (n.into(), e)).collect(),
+                fields
+                    .into_iter()
+                    .map(|(n, e)| RecordEntry::new(n, Occurrence::mint(), e))
+                    .collect(),
             ))
         };
         // Records are order-insensitive, so a field swap is a no-op to the diff
@@ -1537,13 +1542,13 @@ mod tests {
     fn variant_ctor_changes_are_detected() {
         // `VariantCtor` has no surface syntax (later passes introduce it), so
         // build it directly.
-        let some1 = TypedExpr::variant_ctor("Some", int(1));
+        let some1 = TypedExpr::variant_ctor("Some", Occurrence::mint(), int(1));
 
         // Payload change `1 -> 2`. Nothing under the ctor is isomorphic, so
         // there is no seed for container recovery — but the two ctors are the
         // two programs' *roots*, which correspond by construction, and phase 3
         // then aligns the payloads. The edit reads as an update, not a rebuild.
-        let some2 = TypedExpr::variant_ctor("Some", int(2));
+        let some2 = TypedExpr::variant_ctor("Some", Occurrence::mint(), int(2));
         let r = diff(&some1, &some2);
         assert!(r.deleted.is_empty() && r.new.is_empty(), "{r:?}");
         assert!(r.updated().any(|m| {
@@ -1553,8 +1558,12 @@ mod tests {
 
         // Same one level down, where the ctor is not itself a root: the tuple
         // roots correspond, and recovery reaches the payload through them.
-        let nested =
-            |n: i64| TypedExpr::tuple(vec![int(0), TypedExpr::variant_ctor("Some", int(n))]);
+        let nested = |n: i64| {
+            TypedExpr::tuple(vec![
+                int(0),
+                TypedExpr::variant_ctor("Some", Occurrence::mint(), int(n)),
+            ])
+        };
         let (n1, n2) = (nested(1), nested(2));
         let r = diff(&n1, &n2);
         assert!(r.deleted.is_empty() && r.new.is_empty(), "{r:?}");
@@ -1566,7 +1575,7 @@ mod tests {
         // Tag change `Some -> None`: the payload `1` stays shared and seeds
         // bottom-up recovery, so the ctor is recognized as *updated* (the tag
         // changed in place) rather than rebuilt.
-        let none1 = TypedExpr::variant_ctor("None", int(1));
+        let none1 = TypedExpr::variant_ctor("None", Occurrence::mint(), int(1));
         let r = diff(&some1, &none1);
         assert!(
             r.shared()
@@ -2381,7 +2390,10 @@ mod tests {
         // things to say, and both are reported.
         let rec = |fields: Vec<(&str, TypedExpr)>| {
             TypedExpr::new(N::Record(
-                fields.into_iter().map(|(n, e)| (n.into(), e)).collect(),
+                fields
+                    .into_iter()
+                    .map(|(n, e)| RecordEntry::new(n, Occurrence::mint(), e))
+                    .collect(),
             ))
         };
         let v1 = rec(vec![("a", var("x"))]);
@@ -2406,7 +2418,10 @@ mod tests {
         // literal is a site of its own, and the record's own change — its
         // labels — must not be swallowed by it.
         let rec = |a: &str, n: i64| {
-            TypedExpr::new(N::Record(vec![(a.into(), var("x")), ("c".into(), int(n))]))
+            TypedExpr::new(N::Record(vec![
+                RecordEntry::new(a, Occurrence::mint(), var("x")),
+                RecordEntry::new("c", Occurrence::mint(), int(n)),
+            ]))
         };
         let (v1, v2) = (rec("a", 1), rec("b", 2));
         let sites = diff(&v1, &v2).divergences();
@@ -2561,8 +2576,14 @@ mod tests {
         let group = |body: TypedExpr| {
             TypedExpr::letrec(
                 vec![
-                    (TypedBinding::new_unannotated("p"), int(1)),
-                    (TypedBinding::new_unannotated("q"), int(2)),
+                    (
+                        TypedBinding::new_unannotated("p", Occurrence::mint()),
+                        int(1),
+                    ),
+                    (
+                        TypedBinding::new_unannotated("q", Occurrence::mint()),
+                        int(2),
+                    ),
                 ],
                 body,
             )

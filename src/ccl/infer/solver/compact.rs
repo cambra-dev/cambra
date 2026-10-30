@@ -3203,6 +3203,7 @@ mod carried_probe {
 mod tests {
     use super::*;
     use crate::ccl::Label;
+    use crate::ccl::Occurrence;
     use crate::ccl::infer::solver::{
         CoalesceError, ConstrainCache, coalesce_compact, constrain_subtype, fresh_var,
     };
@@ -3527,6 +3528,7 @@ mod tests {
         };
         let shadowed = refined(TypedExpr::lambda(
             binder.clone(),
+            Occurrence::mint(),
             Type::Base(BaseType::Int),
             TypedExpr::var(binder.clone()),
         ));

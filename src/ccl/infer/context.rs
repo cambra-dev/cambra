@@ -566,7 +566,7 @@ impl InferCtx {
             // (`specialize_use`). A binding annotated with a polymorphic type, which
             // `emit_let` has opened in place, also states its `requires` clause, which
             // each use instantiates.
-            let requires = match &binding.user_annotation {
+            let requires = match binding.annotation_ty() {
                 Some(Type::Poly(poly)) => poly.requires.clone(),
                 _ => Vec::new(),
             };

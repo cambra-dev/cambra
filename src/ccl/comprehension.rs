@@ -41,6 +41,7 @@
 //! records resolve an error to a span whether or not the compile captures
 //! provenance.
 
+use crate::ccl::Occurrence;
 use std::rc::Rc;
 
 use crate::ccl::{
@@ -373,7 +374,10 @@ fn encode(
             codomain: Box::new(Type::Hole),
         });
         let indexed_source = Expr::apply(idx_arg, source);
-        let per_elem = per_element_lambda(binding, body_expr);
+        // The main tree's lambda is the generator's binder, moved: it keeps the
+        // generator's occurrence.
+        let occurrence = Occurrence::preserve(binding.occurrence.id());
+        let per_elem = per_element_lambda(binding, occurrence, body_expr);
         body_expr = Expr::apply(indexed_source, per_elem);
     }
     // One contribution per generator, which is what makes position *i* of the result the
@@ -399,7 +403,9 @@ fn encode(
         {
             pred_expr = Expr::apply(
                 Expr::apply(make_idx_arg(Name::elem(), i), pred_source),
-                per_element_lambda(binding, pred_expr),
+                // The predicate's lambda is a second binder for the same generator,
+                // a copy of its occurrence.
+                per_element_lambda(binding, binding.occurrence.clone(), pred_expr),
             );
         }
         // A refined parameter is a `cast(refined_data_fun, λ outer_var →
@@ -416,8 +422,8 @@ fn encode(
         // lambda underneath is a second, contradictory answer to what this function
         // is — one that survives into elimination, where the point-free form of
         // the collection inherits the lambda's kind and reads as a capability.
-        let unrefined_lambda =
-            Expr::lambda(outer_var, Type::Hole, body_expr).with_user_annotation(Type::Fun {
+        let unrefined_lambda = Expr::lambda(outer_var, Occurrence::mint(), Type::Hole, body_expr)
+            .with_user_annotation(Type::Fun {
                 name: None,
                 fun_kind: result_kind.clone(),
                 domain: Box::new(Type::Hole),
@@ -433,8 +439,8 @@ fn encode(
         // comprehension is data-by-construction, not by a domain guess. (The
         // filtered branch above stamps its own lambda the same way, under a cast
         // whose `refined_data_fun` target then refines the domain.)
-        let lambda =
-            Expr::lambda(outer_var, Type::Hole, body_expr).with_user_annotation(Type::Fun {
+        let lambda = Expr::lambda(outer_var, Occurrence::mint(), Type::Hole, body_expr)
+            .with_user_annotation(Type::Fun {
                 name: None,
                 fun_kind: result_kind,
                 domain: Box::new(iter_dom.unwrap_or(Type::Hole)),
@@ -444,18 +450,18 @@ fn encode(
     }
 }
 
-/// `λ target → body` at a generator's binder.
+/// `λ target → body` at a generator's binder, at `occurrence`.
 ///
 /// The binder is the one lowering put on the generator, so the lambda it becomes
 /// binds the same [`Name`] the element and the guards already reference — which
 /// is what keeps this phase from needing to rename anything it did not mint.
-fn per_element_lambda(target: &TypedBinding, body: Expr) -> Expr {
+fn per_element_lambda(target: &TypedBinding, occurrence: Occurrence, body: Expr) -> Expr {
     debug_assert!(
         target.user_annotation.is_none(),
         "a comprehension target is an unannotated binder, found {:?}",
         target.user_annotation
     );
-    Expr::lambda(target.name.clone(), target.ty.clone(), body)
+    Expr::lambda(target.name.clone(), occurrence, target.ty.clone(), body)
 }
 
 #[cfg(test)]
