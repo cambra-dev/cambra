@@ -3499,6 +3499,18 @@ A delivery also tightens what the obligation's other positions accept: `Addable`
 
 This is the gap [Checking a definition alone](#checking-a-definition-alone) names. The two are complementary. That walk resolves a definition's recorded bounds, which catches `λ 𝑎 → (𝑎.0, 𝑎.foo)`; this pass needs no delivery, and does not depend on whether anything calls the definition.
 
+#### An operand nothing reaches is judged by its resolution
+
+Narrowing acts on what flows into an operand, so an operand bounded only from above is offered
+nothing and its obligations stay undecided, while coalesce resolves the variable to its upper bound.
+A loop's positions are such an operand: inference sees them only as the domain of the collection the
+loop iterates, so the key type reaches the position variable as an upper bound. After the sweep,
+`deliver_resolutions` offers each watched variable with no lower bound the type it resolves to, and
+the obligation judges it as one that arrived: a record the loop's positions resolve to fails
+`Orderable` there. A variable that stays a variable is offered nothing. The pass runs after the
+sweep, whose deposits are upper bounds too, and before the emission seal, since it narrows a
+definition's obligations.
+
 #### The unit is a place, not a variable
 
 Every position of a requirement is an ordinary inference variable, but a requirement is *about* a value, and one value is generally several variables. A **place** is that value. It is named by a root variable plus the path of field selections reaching it — each element of the path a **step** — and the empty path names the root's own value. `places_under` returns, per place, the variables standing at it together with the requirements they carry; it is one *place*'s requirements that are read together.
@@ -3931,6 +3943,14 @@ frame passes when the variable it names is bound outside the frame's body: its d
 frame's. Inside a `Begin` body the filter also drops `Transaction`. A label naming no variable
 always passes. `Read(𝑥)` is filtered as `Write(𝑥)` is: inside the scope binding 𝑥, every call
 has a position in its history.
+
+**A loop whose iterations interact requires an order of its positions** (`docs/chl-spec.md`,
+"Ordered loops"). A `for` body is emitted on a frame of its own that keeps what names the enclosing
+function's own variables (`Typing::loop_body`). Where what it collects holds `Write(𝑥)` for an `𝑥`
+the body does not declare, the loop is ordered, and `emit_for` requires `Orderable(𝑃, 𝑃)` of its
+source's position type `𝑃`, during emission, so a definition's scheme states it. A body that
+interacts only through a function passed to it is found to after emission, too late for the scheme;
+`check_loop_orders` asserts no loop is.
 
 **A call relates the callee's effects to the caller's.** `InferCtx::apply` puts a fresh call
 variable on the expected function type and an edge from it into the innermost frame. The

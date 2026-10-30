@@ -72,9 +72,10 @@ closes a cycle well-founded by monotone lattice convergence rather than causal d
 A loop runs in its source's key order, because the store is keyed by the source's positions. A
 comprehension across two sources (`[e for x in xs for y in ys]`, join or not) is keyed by
 `(𝑖, 𝑗)`, so a loop over one runs its pairs lexicographically. A concatenation `xs ++ ys` is keyed
-by a tagged union, so a loop over one runs each part in turn. A source that delivers out of that
-order, as a product or a concatenation with a streamed part does, is still run in it
-(`src/interpreter/design-operators.md`, "The driver").
+by a tagged union, whose parts have no order between them, so a loop that must run in order is
+refused over one (`docs/chl-spec.md`, "Ordered loops"). A source that delivers out of its order, as
+a product with a streamed part does, is still run in it (`src/interpreter/design-operators.md`, "The
+driver").
 
 A mutable variable's domain is the domain of the context that **writes** it (`Txn` excepted — never
 inferred, always spelled at the introduction). A `:=` inside a `for` body introduces one whose

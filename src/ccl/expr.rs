@@ -2530,11 +2530,11 @@ impl std::fmt::Display for PatternHead {
 
 impl PatternHead {
     /// The tag a matching row carries: the tag itself, or the constructor's
-    /// ([`crate::ccl::nominal::ctor_tag`]).
+    /// ([`crate::ccl::nominal::NominalDecl::tag`]).
     pub fn tag(&self) -> Label {
         match self {
             PatternHead::Tag(tag) => tag.clone(),
-            PatternHead::Constructor { ctor, .. } => crate::ccl::nominal::ctor_tag(ctor),
+            PatternHead::Constructor { decl, ctor } => decl.tag(ctor),
         }
     }
 }

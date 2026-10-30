@@ -3274,6 +3274,43 @@ pub fn resolve_operand_requirements(cache: &mut ConstrainCache) -> Result<(), Op
     }
 }
 
+/// Offer each watched variable that no contribution reached the type it resolves to, and
+/// answer the first obligation that refuses it with the node that placed it.
+///
+/// **The check delivery cannot make.** Narrowing acts on what flows into an operand, so an
+/// operand bounded only from above is never offered anything and its obligations stay
+/// undecided, while coalesce resolves the variable to its upper bound. A loop's positions are
+/// such an operand: inference sees them only as the domain of the collection the loop
+/// iterates, so the key type reaches the position variable as an upper bound
+/// (`docs/chl-spec.md`, "Ordered loops"). A variable that resolves to a determined type is
+/// offered it here as a contribution, and the obligation judges it as it would one that
+/// arrived; one that stays a variable is offered nothing.
+///
+/// Runs after [`resolve_operand_requirements`], whose deposits are upper bounds too, and before
+/// the emission seal, since it narrows a definition's obligations.
+pub fn deliver_resolutions(
+    cache: &mut ConstrainCache,
+    resolve: impl Fn(&Type) -> Option<Type>,
+) -> Result<(), (ConstrainError, provenance::NodeId)> {
+    for var in crate::ccl::infer_var::arena_vars() {
+        let watches = var.watches.borrow().clone();
+        if watches.is_empty() || !var.bounds.borrow().lower().is_empty() {
+            continue;
+        }
+        let Some(resolved) = resolve(&Type::Infer(Rc::clone(&var))) else {
+            continue;
+        };
+        if matches!(offered(&resolved), Offered::Unknown) {
+            continue;
+        }
+        for (obligation, pos) in watches {
+            deliver(&obligation, pos, &resolved, None, cache)
+                .map_err(|e| (e, obligation.operator_node_id))?;
+        }
+    }
+    Ok(())
+}
+
 /// One step into a value: how a sub-place is reached from the place above it.
 ///
 /// Distinguished rather than collapsed onto [`FieldKey`] because a record field and a

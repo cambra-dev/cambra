@@ -367,6 +367,22 @@ pub(super) trait Typing {
         f(self)
     }
 
+    /// Run `f` as the body of the `for` loop `node`, and answer whether its iterations
+    /// interact: whether the body causes `Write(𝑥)` for a variable `𝑥` it does not declare
+    /// itself, `declared` being every mutable variable it declares (`docs/chl-spec.md`,
+    /// "Ordered loops"). Check runs `f` and answers `false`.
+    fn loop_body<R>(
+        &mut self,
+        _node: NodeId,
+        _declared: &std::collections::HashSet<Name>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> (R, bool)
+    where
+        Self: Sized,
+    {
+        (f(self), false)
+    }
+
     /// Run `f` as the body of a `with begin():` block, which supplies `Transaction` to
     /// what it calls.
     fn transaction_body<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R

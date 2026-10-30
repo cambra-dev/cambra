@@ -371,6 +371,15 @@ copies the declaration holds are untyped. A refinement inside an argument `𝑎`
 that wrote it typed it.
 
 A runtime value is held in that representation, as the union value its constructor's tag names.
+A declared type's tag carries the declaration as one version of the program defines it
+(`NominalDecl::tag`, a `DeclId` in the tag's label), which equality, hashing and the tag's own order
+leave out. A process-wide table records, under that id, each constructor's payload order: a record
+the declaration writes by its fields as listed, a tuple by position. `Value`'s comparison of a union
+reads it, so every ordering of a nominal value, a store's positions and the release predicates over
+them included, is the declaration's (`docs/chl-spec.md`, "Equality and order"). The id is one per
+identity and definition, spans left out, so versions agreeing on a definition share it and a changed
+definition takes a new one. A compiler-provided type, such as `Option`, which the runtime builds
+values of too, keeps plain tags.
 The reload guard compares extents, which leave out the type's name and its declaration's
 refinements, so it refuses every variable whose type mentions a nominal type
 ([program-evolution.md, "Six refusals"](program-evolution.md#six-refusals)).

@@ -971,7 +971,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 
         TypedExprNode::LetRec { bindings, body } => emit_letrec(bindings, body, ctx)?,
 
-        TypedExprNode::For { target, iter, body } => emit_for(target, iter, body, ctx)?,
+        TypedExprNode::For { target, iter, body } => emit_for(node_id, target, iter, body, ctx)?,
 
         // A `Defer` leaf's type was minted during inference (`Feed(ρ)`);
         // like `Var`, the recorded type carries the full load — trust it.
