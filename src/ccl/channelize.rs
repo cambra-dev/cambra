@@ -122,9 +122,7 @@ use crate::ccl::ccl_utils::compose_typed_or_hole;
 use crate::ccl::ccl_utils::{
     PredMemo, make_cast, walk_refined_predicates, walk_refined_predicates_mut,
 };
-use crate::ccl::feed_nest::{
-    LoopFeed, contribution_lambda, indexed_nest, key_by_positions, lifted_past,
-};
+use crate::ccl::feed_nest::{LoopFeed, contribution_lambda, indexed_nest, key_by_positions};
 use crate::ccl::{
     BaseType, BindingTransparency, Branch, Expr, FunKind, HistoryKind, Lit, Name, Pattern,
     PredicateId, Refinement, Type, TypedBinding, TypedExpr, TypedExprNode,
@@ -2548,16 +2546,11 @@ fn extract_for_defer_impl(
                         // would log a birth for a node no tree ever holds.
                         let placeholder = Expr::throwaway(TypedExprNode::Lit(Lit::Unit));
                         let original = std::mem::replace(feed, placeholder);
-                        // Stamp the wrap at construction: the let's type is its body's
-                        // as it reads outside the binder ([`lifted_past`]), and no
-                        // re-derivation pass fills a `Hole` in.
-                        let let_ty = lifted_past(&binding, &bound_expr, &original.ty);
                         // The `Let` this walk is rebuilding keeps the original
                         // `bound_expr` in the body, and each extracted feed that
                         // captures the binder gets its own re-binding of the same
                         // definition, opacity included, so every wrap is a copy.
-                        *feed = Expr::let_in(binding.clone(), bound_expr.clone(), original)
-                            .with_ty(let_ty);
+                        *feed = Expr::let_in(binding.clone(), bound_expr.clone(), original);
                     }
                 }
                 new_body
