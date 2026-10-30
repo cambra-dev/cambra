@@ -1245,9 +1245,11 @@ pub trait TileProducer {
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile;
 
     /// Permanently release a region after checking its shape and normalizing it.
-    /// Accumulate the region in [`obsolete_guard`](Self::obsolete_guard); call
-    /// [`release_impl`](Self::release_impl) with the normalized argument only if accumulation
-    /// changes the stored guard. See `src/interpreter/design-operators.md`, "The release contract".
+    /// Accumulate the region in [`obsolete_guard`](Self::obsolete_guard), closed over the tiling
+    /// ([`TileGuard::closed_over`]), and call [`release_impl`](Self::release_impl) only if
+    /// accumulation changes the stored guard: with the universal guard when the closure makes the
+    /// stored guard universal, and with the normalized argument otherwise. See
+    /// `src/interpreter/design-operators.md`, "The release contract".
     fn release(&mut self, obsolete_guard: TileGuard) {
         trace!("{} release: {obsolete_guard:?}", self.name());
         assert!(
@@ -1258,10 +1260,18 @@ pub trait TileProducer {
         // Released in canonical form (`TileGuard::flatten_or`), so a region naming everything
         // beneath some keys reaches `release_impl` as those keys.
         let obsolete_guard = TileGuard::flatten_or(vec![obsolete_guard]);
-        let new_guard = self.base().obsolete_guard.union(&obsolete_guard);
+        // Closed over the tiling, so releases of a union's arms one by one add up to its whole.
+        let accumulated = self.base().obsolete_guard.union(&obsolete_guard);
+        let new_guard = accumulated.clone().closed_over(self.tiling());
         if new_guard != self.base().obsolete_guard {
+            // The closure can make the stored guard universal while the argument names only the
+            // last arm, and `release_impl` reclaims everything only on a universal guard.
+            let released = match new_guard.is_universal() && !accumulated.is_universal() {
+                true => self.tiling().universal_guard(),
+                false => obsolete_guard,
+            };
             self.base_mut().obsolete_guard = new_guard;
-            self.release_impl(obsolete_guard);
+            self.release_impl(released);
         }
     }
 

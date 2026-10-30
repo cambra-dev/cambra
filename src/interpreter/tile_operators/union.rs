@@ -592,24 +592,38 @@ impl TileProducer for UnionProducer {
     }
 
     /// A flat union's arms are disjoint slices of one collection, so each is pulled at the
-    /// projection and the merge is cut to it. A tagged union's keys carry the arm's tag, and
-    /// splitting a projection per arm is not implemented: only `Everything` and `Nothing`
-    /// reach it.
+    /// projection and the merge is cut to it. A tagged union's keys carry the arm's tag: a
+    /// projection of its outermost keys reaches each arm as what it names under that arm's tag,
+    /// as a release does, and an arm it names nothing of is not pulled.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        // Closed first, so a pull of every arm reads as the pull of everything it is.
+        let projection_guard = projection_guard.closed_over(self.tiling());
         let projection = projection_guard.projection(&self.name());
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
-        assert!(
-            self.flat || projection == Projection::Everything,
-            "{} keys its rows by arm, which a projection over the keys cannot name: \
-             {projection_guard:?}",
-            self.name()
-        );
+        let tags = match (&projection_guard, self.flat) {
+            (_, true) => None,
+            (_, false) if projection == Projection::Everything => None,
+            (TileGuard::Function(FunctionGuard::Domain(pred @ Predicate::Union { .. })), false) => {
+                debug_assert_eq!(
+                    self.level,
+                    CurryLevel::OUTERMOST,
+                    "a tagged union merges at the outermost level"
+                );
+                Some(pred.clone())
+            }
+            _ => panic!(
+                "{} keys its rows by arm, and a projection reaches an arm only as a guard of its \
+                 outermost keys by tag: {projection_guard:?}",
+                self.name()
+            ),
+        };
         let tiles: Vec<Tile> = self
             .inputs
             .iter_mut()
-            .map(|p| {
+            .enumerate()
+            .map(|(arm, p)| {
                 // An arm the consumer has fully released contributes nothing.
                 // `release_impl` below splits a per-variant guard, so one arm can be
                 // universally released while its siblings are still producing — and
@@ -627,9 +641,21 @@ impl TileProducer for UnionProducer {
                     {
                         *domain_predicate = Predicate::True;
                     }
-                    released
-                } else {
-                    p.get(projection.guard(p.tiling()))
+                    return released;
+                }
+                match &tags {
+                    None => p.get(projection.guard(p.tiling())),
+                    Some(pred) => {
+                        let under = pred
+                            .under_tag(&crate::ccl::FieldKey::Index(arm))
+                            .unwrap_or_else(|| unreachable!("matched as a union predicate"));
+                        match under.is_false() {
+                            // The arms are positional, so an arm the guard names nothing of
+                            // still appears, as an empty tile that states nothing complete.
+                            true => p.tiling().empty_tile(),
+                            false => p.get(TileGuard::Function(FunctionGuard::Domain(under))),
+                        }
+                    }
                 }
             })
             .collect();
@@ -690,6 +716,7 @@ impl TileProducer for UnionProducer {
 mod tests {
     use super::*;
     use crate::ccl::FieldKey;
+    use crate::interpreter::tile_operators::test_helpers::{GuardLog, ProjectionSpy};
     use crate::interpreter::{BaseType, ColumnValue, Extent};
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -1271,6 +1298,204 @@ mod tests {
             TileGuard::Function(FunctionGuard::Domain(pred1)),
             "input 1 should receive pred1"
         );
+    }
+
+    // ── UnionProducer::get_impl at a tagged guard ─────────────────────────────
+
+    /// A tagged union of two arms over `{1 ↦ 10, 2 ↦ 20}` whose arms log the guards they are
+    /// pulled with, answer at each, and log the guards released to them.
+    fn union_logging_pulls() -> (UnionProducer, [GuardLog; 2], [GuardLog; 2]) {
+        let union_tiling = Tiling::data_function(
+            Extent::Union(TagMap::from_positional(vec![
+                Extent::Base(BaseType::Int),
+                Extent::Base(BaseType::Int),
+            ])),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let spy = || ProjectionSpy::new(int_function_tile(), int_function_tiling());
+        let ((arm0, pulled0, released0), (arm1, pulled1, released1)) = (spy(), spy());
+        let producer = UnionProducer {
+            level: CurryLevel::OUTERMOST,
+            base: ProducerBase::unowned(UnionProducer::alloc_id(), &union_tiling),
+            inputs: vec![Box::new(arm0), Box::new(arm1)],
+            flat: false,
+        };
+        (producer, [pulled0, pulled1], [released0, released1])
+    }
+
+    fn tagged_guard(arms: Vec<Predicate>) -> TileGuard {
+        TileGuard::Function(FunctionGuard::Domain(Predicate::tagged(
+            TagMap::from_positional(arms),
+            false,
+        )))
+    }
+
+    fn keys_of(tile: &Tile) -> Vec<Value> {
+        entries_of(tile).into_iter().map(|(key, _)| key).collect()
+    }
+
+    /// Each key of a union of `Int ⤇ Int` arms with the value at it.
+    fn entries_of(tile: &Tile) -> Vec<(Value, Value)> {
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = tile
+        else {
+            panic!("a union answers a collection: {tile:?}")
+        };
+        let Tile::Scalar(values) = codomain.as_ref() else {
+            panic!("a union of `Int ⤇ Int` arms answers scalar values: {codomain:?}")
+        };
+        (0..domain.len())
+            .map(|i| (domain.index_at(i), values.index_at(i)))
+            .collect()
+    }
+
+    fn tagged_int(arm: usize, key: i64) -> Value {
+        Value::Union {
+            tag: FieldKey::Index(arm),
+            inner: Box::new(Value::Int(key)),
+        }
+    }
+
+    /// A pull naming keys of one arm pulls that arm at what it names there, and not the other.
+    #[test]
+    fn a_tagged_pull_reaches_only_the_arm_it_names() {
+        let (mut producer, logs, _) = union_logging_pulls();
+        let only_two = Predicate::from_column_value(&ColumnValue::Ints(vec![2]));
+        let tile = producer.get(tagged_guard(vec![Predicate::False, only_two.clone()]));
+        assert!(logs[0].borrow().is_empty(), "arm 0 is named nothing of");
+        assert_eq!(
+            *logs[1].borrow(),
+            vec![TileGuard::Function(FunctionGuard::Domain(only_two))]
+        );
+        assert_eq!(keys_of(&tile), vec![tagged_int(1, 2)]);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &tile
+        else {
+            panic!("a collection")
+        };
+        let under_zero = domain_predicate.under_tag(&FieldKey::Index(0));
+        assert_eq!(under_zero, Some(Predicate::False), "arm 0 states nothing");
+    }
+
+    /// A pull naming keys of both arms pulls each at what it names under its own tag.
+    #[test]
+    fn a_tagged_pull_reaches_each_arm_at_its_own_keys() {
+        let (mut producer, logs, _) = union_logging_pulls();
+        let one = Predicate::from_column_value(&ColumnValue::Ints(vec![1]));
+        let two = Predicate::from_column_value(&ColumnValue::Ints(vec![2]));
+        let tile = producer.get(tagged_guard(vec![one.clone(), two.clone()]));
+        assert_eq!(
+            *logs[0].borrow(),
+            vec![TileGuard::Function(FunctionGuard::Domain(one))]
+        );
+        assert_eq!(
+            *logs[1].borrow(),
+            vec![TileGuard::Function(FunctionGuard::Domain(two))]
+        );
+        assert_eq!(keys_of(&tile), vec![tagged_int(0, 1), tagged_int(1, 2)]);
+    }
+
+    /// Tagged pulls add up, arm by arm, to the pull of everything: the same keys, at the same
+    /// values.
+    #[test]
+    fn tagged_pulls_of_each_arm_answer_what_everything_does() {
+        let (mut whole, _, _) = union_logging_pulls();
+        let everything = whole.get(whole.tiling().universal_guard());
+        let (mut by_arm, _, _) = union_logging_pulls();
+        let mut entries =
+            entries_of(&by_arm.get(tagged_guard(vec![Predicate::True, Predicate::False])));
+        entries.extend(entries_of(
+            &by_arm.get(tagged_guard(vec![Predicate::False, Predicate::True])),
+        ));
+        assert_eq!(entries, entries_of(&everything));
+    }
+
+    /// A tagged pull of every arm is the pull of everything, and its answer is terminal.
+    #[test]
+    fn a_tagged_pull_of_every_arm_answers_everything() {
+        let (mut producer, pulled, _) = union_logging_pulls();
+        let tile = producer.get(tagged_guard(vec![Predicate::True, Predicate::True]));
+        for log in &pulled {
+            assert!(log.borrow().iter().all(TileGuard::is_universal), "{log:?}");
+        }
+        assert!(tile.is_terminal(), "{tile:?}");
+    }
+
+    /// A tagged pull naming an arm released whole answers nothing of it, and states it decided.
+    #[test]
+    fn a_tagged_pull_of_a_released_arm_answers_it_decided_and_empty() {
+        let (mut producer, pulled, _) = union_logging_pulls();
+        producer.release(tagged_guard(vec![Predicate::True, Predicate::False]));
+        let tile = producer.get(tagged_guard(vec![Predicate::True, Predicate::False]));
+        assert!(pulled[0].borrow().is_empty(), "{:?}", pulled[0]);
+        assert!(keys_of(&tile).is_empty(), "{tile:?}");
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &tile
+        else {
+            panic!("a collection")
+        };
+        let under_zero = domain_predicate.under_tag(&FieldKey::Index(0));
+        assert_eq!(under_zero, Some(Predicate::True), "arm 0 is decided");
+    }
+
+    /// Releases of each arm add up to the whole union whichever comes first, and release each
+    /// arm whole. An arm and the rest add up to the literal `True`; two arms add up to it once
+    /// the accumulated release is closed over the union's arms.
+    #[test]
+    fn an_arm_and_the_rest_release_everything_in_either_order() {
+        let arm_zero = tagged_guard(vec![Predicate::True, Predicate::False]);
+        let rest = TileGuard::Function(FunctionGuard::Domain(Predicate::True.minus(
+            &Predicate::tagged(TagMap::from_positional(vec![Predicate::True]), false),
+        )));
+        let arm_one = tagged_guard(vec![Predicate::False, Predicate::True]);
+        for order in [
+            [arm_zero.clone(), rest.clone()],
+            [rest.clone(), arm_zero.clone()],
+            [arm_zero.clone(), arm_one.clone()],
+            [arm_one.clone(), arm_zero.clone()],
+        ] {
+            let (mut producer, _, _) = union_logging_pulls();
+            for guard in &order {
+                let answered = producer.get(guard.clone()).to_guard();
+                producer.release(answered);
+            }
+            assert!(
+                producer.obsolete_guard().is_universal(),
+                "{order:?}: {:?}",
+                producer.obsolete_guard()
+            );
+            for input in &producer.inputs {
+                assert!(input.obsolete_guard().is_universal(), "{order:?}");
+            }
+        }
+    }
+
+    /// A release that closes the accumulated guard over the arms reaches `release_impl` as the
+    /// universal guard, so a producer that reclaims everything only on a universal release does.
+    #[test]
+    fn a_release_closing_the_guard_reaches_release_impl_whole() {
+        let (union, _, _) = union_logging_pulls();
+        let (mut spy, _, released) =
+            ProjectionSpy::new(union.tiling().empty_tile(), union.tiling().clone());
+        spy.release(tagged_guard(vec![Predicate::True, Predicate::False]));
+        spy.release(tagged_guard(vec![Predicate::False, Predicate::True]));
+        spy.release(spy.tiling().universal_guard());
+        let released = released.borrow();
+        assert_eq!(released.len(), 2, "{released:?}");
+        assert!(released[1].is_universal(), "{released:?}");
+    }
+
+    /// A guard of a union's keys that is no tagged guard of its outermost keys is refused.
+    #[test]
+    #[should_panic(expected = "a projection reaches an arm only as a guard of its outermost keys")]
+    fn a_pull_at_keys_no_tag_names_is_refused() {
+        let (mut producer, _, _) = union_logging_pulls();
+        producer.get(TileGuard::Function(FunctionGuard::Domain(
+            Predicate::from_column_value(&ColumnValue::Ints(vec![1])),
+        )));
     }
 
     /// Beneath each key, a flat merge states what the arm holding that key says, not what
