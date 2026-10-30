@@ -411,6 +411,17 @@ impl TileProducer for CheckedLookupProducer {
         }
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        match &mut self.source {
+            ProducerSource::Split { collection, keys } => {
+                visit("collection", &mut **collection);
+                visit("keys", &mut **keys);
+            }
+            ProducerSource::Paired(pairs) => visit("pairs", &mut **pairs),
+        }
+    }
+
     /// The answers sit at the keys' own positions, so a stream of keys, or of
     /// `(collection, key)` rows, is pulled at the projection while the collection is read whole:
     /// every key is answered against all of it. One answer for one key is a scalar and has no

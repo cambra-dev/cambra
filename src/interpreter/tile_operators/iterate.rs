@@ -63,7 +63,18 @@ impl TileOperator for IterateExtent {
         // The producer owns the registration: the scheduler holds only a `Weak`, so this
         // handle is what keeps the source waking this producer, and dropping the producer
         // deregisters it.
-        let (source_wakeup, gate) = subscribe.then(|| shared_consumer(consumer)).unzip();
+        // A planner pushes the range's region once through the consumer it was subscribed with.
+        let (source_wakeup, gate, leaf) = match subscribe {
+            true => {
+                let (wakeup, gate) = shared_consumer(consumer);
+                let leaf = wakeup.shared().clone();
+                (Some(wakeup), Some(gate), leaf)
+            }
+            false => {
+                let leaf: SharedConsumer = Rc::new(RefCell::new(consumer));
+                (None, None, leaf)
+            }
+        };
         let mut producer = Box::new(IterateExtentProducer {
             base: ProducerBase::new(
                 IterateExtentProducer::alloc_id(),
@@ -71,7 +82,8 @@ impl TileOperator for IterateExtent {
                 &self.base,
                 scheduler,
             )
-            .sharing(gate),
+            .sharing(gate)
+            .leaf(leaf),
             extent: self.extent.clone(),
             released: Predicate::False,
             _source_wakeup: source_wakeup.as_ref().map(|w| w.shared().clone()),
