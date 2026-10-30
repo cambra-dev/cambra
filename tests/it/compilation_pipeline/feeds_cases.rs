@@ -292,6 +292,78 @@ fn test_feed_and_define_operators(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
 
+/// A feed inside a binding's value, in a loop that carries an accumulator. Inlining a
+/// function that feeds and returns a value puts its feed in the `let` the call is bound by,
+/// and a conditional value puts it in a `Case` arm; the letrec phase lifts each onto the loop
+/// body's spine, where its tap is read, as it lifts a write.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::in_a_bound_body(indoc! {"
+    o: Feed(_)
+    t := 0
+    def f(x):
+        o << x
+        x + 1
+    for i in [1, 2, 3]:
+        t := t + 1
+        y = f(i)
+        t := t + y
+    sum(o) * 100 + t
+"}, Value::Int(612))]
+#[case::in_a_bound_conditional(indoc! {"
+    o: Feed(_)
+    t := 0
+    def f(x):
+        o << x
+        x + 1
+    for i in [1, 2, 3]:
+        t := t + 1
+        y = f(i) if i > 1 else 0
+        t := t + y
+    sum(o) * 100 + t
+"}, Value::Int(510))]
+#[case::in_a_bound_match(indoc! {"
+    o: Feed(_)
+    t := 0
+    for m in [`a(1), `b(2)]:
+        t := t + 1
+        y = match m:
+            case `a(n):
+                o << n
+                n * 10
+            case `b(k):
+                k
+        t := t + y
+    sum(o) * 100 + t
+"}, Value::Int(114))]
+#[case::in_a_nested_loop(indoc! {"
+    o: Feed(_)
+    t := 0
+    def f(x):
+        o << x
+        x + 1
+    for i in [1, 2]:
+        for j in [10, 20]:
+            y = f(i * j)
+            t := t + y
+    sum(o) * 1000 + t
+"}, Value::Int(90094))]
+#[case::under_an_if(indoc! {"
+    o: Feed(_)
+    t := 0
+    def f(x):
+        o << x
+        x + 1
+    for i in [1, 2, 3]:
+        if i > 1:
+            y = f(i)
+            t := t + y
+    sum(o) * 100 + t
+"}, Value::Int(507))]
+fn feed_in_a_binding_in_an_accumulator_loop(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
 /// Multi-arm `if`/`elif` inside a for-loop body, feeding the defer in some
 /// arms and not others. Each feeding arm fans out to its own refined-source
 /// channel — arm `i`'s source restricted to the element predicate
