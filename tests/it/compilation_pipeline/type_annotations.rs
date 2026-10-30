@@ -1998,3 +1998,21 @@ i = f(1)
         Value::Int(7),
     )
 }
+
+#[test]
+fn loop_and_then_comprehension() {
+    check_tile(
+        indoc! {r#"
+acc := 0
+for r in [0]:
+    acc += 1
+[z for z in [1, 2, 3, 4] if z > acc]
+        "#},
+        Tile::data_function(
+            ColumnValue::UInts(vec![1, 2, 3]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 4]))),
+            Predicate::True,
+            BitSet::new(),
+        ),
+    )
+}
