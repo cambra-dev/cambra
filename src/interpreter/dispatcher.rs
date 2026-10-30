@@ -21,6 +21,8 @@ use std::thread;
 
 use intervalsets::Bounding;
 
+#[cfg(test)]
+use crate::interpreter::CurryLevel;
 use crate::interpreter::tile_operators::InputId;
 use crate::interpreter::tile_operators::{
     Breaker, BreakingProducer, FunctionGuard, Tiling, cut_before, guard_minus, partition_gap,
@@ -28,6 +30,9 @@ use crate::interpreter::tile_operators::{
 use crate::interpreter::{
     Consumer, Extent, Predicate, Projection, SharedConsumer, TileGuard, Value,
 };
+
+#[cfg(test)]
+mod loop_scope;
 
 /// A pipeline, by its index in the [`Dispatcher`].
 #[derive(Clone, Copy)]
@@ -364,6 +369,9 @@ struct PipelineInfo {
     /// Where it reads its breaker's input whole rather than what the pipelines it reads push
     /// ([`read_whole`](Dispatcher::read_whole)), that input's morsels.
     whole: Option<Vec<TileGuard>>,
+    /// The pipelines it reads that it takes no push from, and whose finish of an epoch it waits
+    /// for before it takes a package there ([`follow`](Dispatcher::follow)).
+    follows: Vec<usize>,
     /// Whether it parks the rows pushes bring until the pipelines it reads have decided them
     /// ([`park`](Dispatcher::park)).
     parks: bool,
@@ -374,6 +382,15 @@ struct PipelineInfo {
     /// For a source, the most packages queued for it and not yet acknowledged that a notify finds
     /// before it queues more ([`limit`](Dispatcher::limit)); `usize::MAX` for none.
     limit: usize,
+}
+
+/// A region a pipeline parked ([`Dispatcher::park`]), and whether a release may hand out the part
+/// of it that is decided and keep the rest. A row a loop's round queues is read for the row's end,
+/// which its reads state only once they have decided all of it, so it is released whole.
+#[derive(Debug)]
+struct Parked {
+    guard: TileGuard,
+    splits: bool,
 }
 
 /// What the dispatcher keeps of one pipeline across epochs.
@@ -394,7 +411,7 @@ struct PipelineState {
     /// pipelines it reads have not decided yet.
     // shared-state-ok: guards naming regions of the pipeline's input, which the pushes and the
     // decided pushes that release them read and write under the lock; never a tile.
-    parked: Mutex<Vec<TileGuard>>,
+    parked: Mutex<Vec<Parked>>,
     /// For a pipeline that parks, every row a push has brought it, queued or parked, in any epoch,
     /// `None` for none: two pushes can name one row, and the pipeline reads each row once
     /// ([`queue_or_park`](Dispatcher::queue_or_park)).
@@ -530,6 +547,7 @@ impl Dispatcher {
                 readers,
                 ordered: false,
                 whole: None,
+                follows: Vec::new(),
                 parks: false,
                 reach: Vec::new(),
                 limit: usize::MAX,
@@ -602,23 +620,82 @@ impl Dispatcher {
     }
 
     /// Queue `guard`, a guard of the input of `reader`'s breaker, as a package of `reader` in the
-    /// current epoch, less what is queued for it there already: what a range brings that no push
-    /// names ([`run_program`]).
+    /// current epoch, less what is queued for it there already: at the start, what a range brings
+    /// that no push names ([`run_program`]), and in a loop's round, the row of a nested loop's
+    /// store, which follows the pipelines inside the cycle around it ([`follow`](Self::follow),
+    /// `loop_scope::LoopScope`).
+    ///
+    /// # Panics
+    ///
+    /// When `reader`'s queue in the current epoch has closed: every pipeline it reads has
+    /// finished the epoch.
     #[cfg(test)]
-    pub(crate) fn queue_at_start(&self, reader: PipelineId, guard: &TileGuard) {
+    pub(crate) fn queue_for(&self, reader: PipelineId, guard: &TileGuard) {
+        self.queue_in_current(reader, guard, false);
+    }
+
+    /// [`queue_for`](Self::queue_for) for a loop's round: the row of a nested loop's store, which
+    /// follows the pipelines inside the cycle around it ([`follow`](Self::follow)), or a row the
+    /// closing round has every inner pipeline read again (`loop_scope::LoopScope`). A reader that
+    /// parks takes the row again whatever it took before, and only once the pipelines it reads
+    /// have decided all of it, the row's end with its rows ([`Parked`]).
+    #[cfg(test)]
+    pub(crate) fn queue_round(&self, reader: PipelineId, guard: &TileGuard) {
+        self.queue_in_current(reader, guard, true);
+    }
+
+    #[cfg(test)]
+    fn queue_in_current(&self, reader: PipelineId, guard: &TileGuard, round: bool) {
         let current = self.current.load(Ordering::Acquire);
         let epoch = self
             .epoch(current)
             .expect("the window holds the current epoch");
         if self.infos[reader.0].parks {
-            self.queue_or_park(&epoch, reader.0, guard);
+            self.queue_or_park(&epoch, reader.0, guard, round);
+            self.advance();
             return;
         }
+        let appended = epoch.pipelines[reader.0].queue.append_unqueued(guard);
         assert!(
-            epoch.pipelines[reader.0].queue.append_unqueued(guard),
+            appended,
             "pipeline {} takes packages before the last pipeline it reads finishes",
             reader.0
         );
+        self.advance();
+    }
+
+    /// Whether `pipeline` is a source, one that reads no pipeline.
+    #[cfg(test)]
+    pub(crate) fn is_source(&self, pipeline: PipelineId) -> bool {
+        self.infos[pipeline.0].reads.is_empty()
+    }
+
+    /// Order `reader`'s rounds after `read`'s, a pipeline it reads, in a loop's scope: `reader`
+    /// takes no push of `read`'s, and takes a package in an epoch, a round, only once `read` has
+    /// finished it. A scope's planner orders two edges so, where a pipeline cannot park: a nested
+    /// loop's scope after the pipelines its rounds pull, and a reader after a nested loop's scope,
+    /// which pushes its store only once it is terminal.
+    ///
+    /// # Panics
+    ///
+    /// When `reader` does not read `read`.
+    pub fn follow(&mut self, reader: PipelineId, read: PipelineId) {
+        assert!(
+            self.infos[reader.0].reads.contains(&read.0),
+            "pipeline {} follows pipeline {}, which it reads",
+            reader.0,
+            read.0
+        );
+        self.infos[reader.0].follows.push(read.0);
+    }
+
+    /// Whether a claim may take `pipeline`'s packages in `epoch`: once every pipeline it follows
+    /// ([`follow`](Self::follow)) has finished the epoch.
+    fn takes_from(&self, pipeline: usize, epoch: &EpochState) -> bool {
+        self.infos[pipeline]
+            .follows
+            .iter()
+            .all(|read| epoch.pipelines[*read].phase.load() == Phase::Finished)
     }
 
     /// Mark `pipeline`, which reads a pipeline, as consuming its breaker's input whole, `input`
@@ -718,6 +795,12 @@ impl Dispatcher {
         info.reach[at] = Some(region);
     }
 
+    /// Whether every pipeline `reader` reads has decided what of `guard`, a region of its input,
+    /// it reaches ([`reaches`](Self::reaches)).
+    fn reads_decided(&self, reader: usize, guard: &TileGuard) -> bool {
+        guard_minus(guard, &self.decided_part(reader, guard)).is_empty()
+    }
+
     /// The part of `guard`, a region of `reader`'s input, that every pipeline `reader` reads has
     /// decided: per read, the rows it reaches that it has decided, and the rows it does not reach
     /// ([`reaches`](Self::reaches)).
@@ -741,10 +824,12 @@ impl Dispatcher {
         })
     }
 
-    /// Queue `guard`, rows a push brings `reader`, which parks, in `epoch` where every pipeline it
-    /// reads has decided them, and park the rest ([`park`](Self::park)). Only what of `guard` no
-    /// push brought before, in any epoch, is new.
-    fn queue_or_park(&self, epoch: &EpochState, reader: usize, guard: &TileGuard) {
+    /// Queue `guard`, rows a push or the dispatcher's caller brings `reader`, which parks, in
+    /// `epoch` where every pipeline it reads has decided them, and park the rest
+    /// ([`park`](Self::park)). Of a push, only what no push or queue brought before, in any epoch,
+    /// is new. What the caller queues is queued whole (`again`): a loop's closing round has each
+    /// inner pipeline read its row again, which then states the row complete.
+    fn queue_or_park(&self, epoch: &EpochState, reader: usize, guard: &TileGuard, again: bool) {
         let mut parked = self.states[reader]
             .parked
             .lock()
@@ -754,9 +839,9 @@ impl Dispatcher {
                 .brought
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            let fresh = match brought.as_ref() {
-                Some(brought) => guard_minus(guard, brought),
-                None => guard.clone(),
+            let fresh = match (again, brought.as_ref()) {
+                (false, Some(brought)) => guard_minus(guard, brought),
+                _ => guard.clone(),
             };
             if fresh.is_empty() {
                 return;
@@ -767,10 +852,19 @@ impl Dispatcher {
             });
             fresh
         };
-        let decided = self.decided_part(reader, &fresh);
+        let decided = match again {
+            // A row a loop's round queues is consumed whole: its rows' values can be decided
+            // before the row's end is, which only the closing round's reads state.
+            true if !self.reads_decided(reader, &fresh) => guard_minus(&fresh, &fresh),
+            true => fresh.clone(),
+            false => self.decided_part(reader, &fresh),
+        };
         let rest = guard_minus(&fresh, &decided);
         if !rest.is_empty() {
-            parked.push(rest);
+            parked.push(Parked {
+                guard: rest,
+                splits: !again,
+            });
         }
         drop(parked);
         if decided.is_empty() {
@@ -784,26 +878,34 @@ impl Dispatcher {
         });
     }
 
-    /// Append the part of what `reader` parked that the pipelines it reads have now decided to its
-    /// queue in `epoch`, and keep the rest parked ([`park`](Self::park)). A decided push lands
-    /// before the pushing pipeline counts its finish toward `reader`'s close, so `reader`'s queue
-    /// in `epoch` is open.
+    /// Append the morsels `reader` parked that the pipelines it reads have now decided to its
+    /// queue in `epoch` ([`park`](Self::park)). A decided push lands before the pushing pipeline
+    /// counts its finish toward `reader`'s close, so `reader`'s queue in `epoch` is open.
     fn release_parked(&self, epoch: &EpochState, reader: usize) {
         let released: Vec<TileGuard> = {
             let mut parked = self.states[reader]
                 .parked
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
+            // A region that splits releases the part the pipelines it reads have decided. Any
+            // other region waits until they have decided all of it ([`Parked`]).
             let mut released = Vec::new();
             let mut kept = Vec::new();
             for morsel in std::mem::take(&mut *parked) {
-                let part = self.decided_part(reader, &morsel);
-                let rest = guard_minus(&morsel, &part);
+                let part = match morsel.splits {
+                    true => self.decided_part(reader, &morsel.guard),
+                    false if self.reads_decided(reader, &morsel.guard) => morsel.guard.clone(),
+                    false => guard_minus(&morsel.guard, &morsel.guard),
+                };
+                let rest = guard_minus(&morsel.guard, &part);
                 if !part.is_empty() {
                     released.push(part);
                 }
                 if !rest.is_empty() {
-                    kept.push(rest);
+                    kept.push(Parked {
+                        guard: rest,
+                        splits: morsel.splits,
+                    });
                 }
             }
             *parked = kept;
@@ -1207,6 +1309,7 @@ impl Dispatcher {
         if !self.infos[pipeline].ordered {
             return epochs
                 .iter()
+                .filter(|epoch| self.takes_from(pipeline, epoch))
                 .find_map(|epoch| Self::claim_in(pipeline, epoch));
         }
         let state = &self.states[pipeline];
@@ -1219,8 +1322,9 @@ impl Dispatcher {
         {
             return None;
         }
-        let package =
-            Self::unfinished(pipeline, epochs).and_then(|epoch| Self::claim_in(pipeline, epoch));
+        let package = Self::unfinished(pipeline, epochs)
+            .filter(|epoch| self.takes_from(pipeline, epoch))
+            .and_then(|epoch| Self::claim_in(pipeline, epoch));
         if package.is_none() {
             state.in_flight.store(false, Ordering::SeqCst);
             // A claim that found the flag held answered nothing for the pipeline, and may wait on
@@ -1229,9 +1333,9 @@ impl Dispatcher {
             // after the release sees that package's advance and every write before it, and a
             // second look finds the package and wakes that claim.
             self.generation.load(Ordering::SeqCst);
-            if Self::unfinished(pipeline, &self.epochs())
-                .is_some_and(|epoch| Self::claimable(pipeline, epoch))
-            {
+            if Self::unfinished(pipeline, &self.epochs()).is_some_and(|epoch| {
+                self.takes_from(pipeline, epoch) && Self::claimable(pipeline, epoch)
+            }) {
                 self.advance();
             }
         }
@@ -2001,7 +2105,8 @@ impl Landing<'_> {
         dispatcher.ensure(dispatcher.infos[r].reads.contains(&from), || {
             format!("pipeline {from} pushes to pipeline {r}, which reads it")
         });
-        if dispatcher.infos[r].whole.is_some() {
+        let info = &dispatcher.infos[r];
+        if info.whole.is_some() || info.follows.contains(&from) {
             return;
         }
         let queue = &epoch.pipelines[r];
@@ -2012,7 +2117,7 @@ impl Landing<'_> {
         // push brings the rows it names, widened or not, less what a push brought before, and the
         // decided pushes release them ([`Dispatcher::park`]).
         if dispatcher.infos[r].parks {
-            dispatcher.queue_or_park(epoch, r, guard);
+            dispatcher.queue_or_park(epoch, r, guard, false);
             return;
         }
         dispatcher.ensure(!self.widened, || {
@@ -2476,13 +2581,20 @@ fn finish_with(
 /// Run a compiled program's pipelines through a dispatcher of `morsel_rows` on the calling
 /// thread. `sinks` pairs each sink's consumer with the sink it writes to. The breakers are the
 /// producers in the chains under the sinks' producers that are pipeline breakers
-/// (`TileProducer::as_breaking_mut`), and each sink's own ([`SinkBreaker`]), whose pipeline no
-/// pipeline reads. A breaker's pipeline reads the pipelines of the nearest breakers beneath it,
-/// and the [`Entry`] at the breaker's input, or the sink's consumer, is placed in the pipeline. A
-/// pipeline pulls only its breaker's input, and a sink's pipeline pulls the sink's producer, so a
-/// sink receives its producer's answer one package at a time. A sink is done once its producer is
-/// released whole, which the run leaves to its caller to read. It answers what it planned for
-/// each pipeline, in pipeline order.
+/// (`TileProducer::as_breaking_mut`), each store a reader slot reaches, and each sink's own
+/// ([`SinkBreaker`]), whose pipeline no pipeline reads. A breaker's pipeline reads the pipelines
+/// of the nearest breakers beneath it, and the [`Entry`] at the breaker's input, or the sink's
+/// consumer, is placed in the pipeline. A pipeline pulls only its breaker's input, and a sink's
+/// pipeline pulls the sink's producer, so a sink receives its producer's answer one package at a
+/// time. A sink is done once its producer is released whole, which the run leaves to its caller
+/// to read. It answers what it planned for each pipeline, in pipeline order.
+///
+/// A store that runs in rounds (`TileProducer::runs_in_rounds`) is the breaker of no pipeline. Its
+/// loop's scope is one ([`loop_scope::LoopScope`]), and the breakers inside the store's cycle are
+/// the pipelines of the scope's own dispatcher, with the scope of each loop nested in the loop
+/// among them. A read between two dispatchers is a read of the scope that stands for the inner one
+/// in the outer: a pipeline inside a cycle that reads one beneath it is its scope reading that
+/// pipeline.
 ///
 /// [`SinkBreaker`]: crate::interpreter::tile_operators::SinkBreaker
 ///
@@ -2500,22 +2612,12 @@ fn finish_with(
 ///
 /// # Panics
 ///
-/// When a producer in the chains reads one of `stores`, or a pipeline reads directly a pipeline
-/// that another pipeline reads; and where [`run`] panics.
+/// When a pipeline reads directly a pipeline that another pipeline reads; where
+/// `Planner::store_pipeline` refuses a store; where a nested loop's rounds pull an operator beneath
+/// the keys it restates (`Planner::refusal_of_nested`); and where [`run`] panics.
 #[cfg(test)]
-pub(crate) fn run_program(
-    sinks: &[SinkTarget],
-    stores: &[Rc<crate::interpreter::tile_operators::FanOut>],
-    morsel_rows: usize,
-) -> Vec<Planned> {
-    let mut planner = Planner {
-        stores,
-        reads: Vec::new(),
-        located: Vec::new(),
-        names: Vec::new(),
-        leaves: Vec::new(),
-        direct: Vec::new(),
-    };
+pub(crate) fn run_program(sinks: &[SinkTarget], morsel_rows: usize) -> Vec<Planned> {
+    let mut planner = Planner::default();
     let roots: Vec<_> = sinks
         .iter()
         .map(|(consumer, _)| consumer.borrow().producer_slot().clone())
@@ -2529,48 +2631,126 @@ pub(crate) fn run_program(
             let producer = root.as_mut().expect("a root holds the producer it pulls");
             planner.pipelines_under(&mut **producer, "sink")
         };
-        let pipeline = planner.located.len();
-        consumer
-            .borrow_mut()
-            .place(PipelineId(pipeline), breaker.input_tiling(InputId::ONLY));
-        planner.located.push(Located::Sink(at));
-        planner.names.push(format!("SinkBreaker#{at}"));
-        planner.place(pipeline, under);
+        let pipeline = planner.add(Located::Sink(at), format!("SinkBreaker#{at}"), None, under);
+        consumer.borrow_mut().place(
+            PipelineId(planner.local[pipeline]),
+            breaker.input_tiling(InputId::ONLY),
+        );
         sink_breakers.push(RefCell::new(breaker));
     }
-    let Planner {
-        reads,
-        located,
-        names,
-        leaves,
-        direct,
-        ..
-    } = planner;
-    for &(read, reader) in &direct {
-        let readers = reads.iter().filter(|reads| reads.contains(&read)).count();
-        assert!(
-            readers == 1,
-            "{} reads {} directly, which another pipeline reads too; only a fan-out slot keeps \
-             one reader's release from removing what another still reads",
-            names[reader],
-            names[read]
-        );
+    planner.check_direct();
+    let members = planner.members(None);
+    let mut kept = Vec::new();
+    let scopes: Vec<Option<RefCell<loop_scope::LoopScope>>> = members
+        .located
+        .iter()
+        .map(|located| match located {
+            Located::Scope { scope, .. } => Some(RefCell::new(planner.build_scope(
+                *scope,
+                morsel_rows,
+                &mut kept,
+            ))),
+            _ => None,
+        })
+        .collect();
+    if let Some(why) = planner.refusal_of_nested(&kept) {
+        panic!("{why}");
     }
-    let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| match located[pipeline.0] {
-        Located::Sink(sink) => call(&mut *sink_breakers[sink].borrow_mut()),
+    let scope_at = |pipeline: PipelineId| {
+        scopes[pipeline.0]
+            .as_ref()
+            .expect("a scope's pipeline holds its scope")
+    };
+    let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| match &members.located[pipeline.0] {
+        Located::Sink(sink) => call(&mut *sink_breakers[*sink].borrow_mut()),
+        Located::Store { store, .. } => {
+            let mut store = store.borrow_mut();
+            call(
+                store
+                    .as_breaking_mut()
+                    .expect("a planned store is a pipeline breaker"),
+            )
+        }
+        Located::Scope { .. } => call(&mut *scope_at(pipeline).borrow_mut()),
         Located::Chain(id) => {
             let mut call = Some(call);
             for root in &roots {
                 let mut root = root.borrow_mut();
                 let producer = root.as_mut().expect("a root holds the producer it pulls");
-                if reach_in_chain(&mut **producer, id, &mut call) {
+                if reach_in_chain(&mut **producer, *id, &mut call) {
                     return;
                 }
             }
             panic!("pipeline {} has its breaker in a root's chain", pipeline.0)
         }
     };
-    let mut dispatcher = Dispatcher::new(reads.clone(), morsel_rows);
+    // A scope is no producer: its pipeline pushes the store's.
+    let mut end_of = |pipeline: PipelineId| match &members.located[pipeline.0] {
+        Located::Scope { .. } => Some(scope_at(pipeline).borrow().pushing_end()),
+        _ => None,
+    };
+    let (dispatcher, mut planned) = plan_edges(
+        &members.reads,
+        &members.names,
+        &members.leaves,
+        &members.kinds,
+        morsel_rows,
+        &mut reach,
+        &mut end_of,
+    );
+    // The run drives every breaker it planned, so each takes its consuming mode here, before any
+    // package, and keeps it for the run; a loop's scope passes it to the breakers it keeps.
+    for pipeline in 0..members.names.len() {
+        reach(PipelineId(pipeline), &mut |breaker| {
+            breaker.enter_consuming_mode()
+        });
+    }
+    drive(&dispatcher, &mut reach);
+    for (plan, scope) in planned.iter_mut().zip(&scopes) {
+        if let Some(scope) = scope {
+            plan.rounds = std::mem::take(&mut scope.borrow_mut().planned);
+        }
+    }
+    planned
+}
+
+/// How a pipeline takes its packages, which [`plan_edges`] plans its edges by.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq)]
+enum Consumes {
+    /// What the pipelines it reads push, as its edges' probes plan.
+    Pushes,
+    /// Its input whole, in order, once every pipeline it reads has finished: a store that steps
+    /// itself, or a loop's scope.
+    Whole,
+    /// One region per epoch, which the scope it runs in queues it, once every pipeline it reads
+    /// has finished the epoch: the scope of a loop nested in the scope's loop, one row per round.
+    Rounds,
+}
+
+/// The dispatcher over the pipelines `reads` describes, with every pipeline that reads another
+/// parking the rows its pushes bring until the pipelines it reads have decided them, reading its
+/// input whole where a pipeline it reads reaches it along no route, and queued at the start the
+/// regions no push names ([`run_program`] says how). `kinds` says how each
+/// pipeline takes its packages; `end_of` answers the consumer a pipeline pushes to where its
+/// breaker is no producer that answers it.
+#[cfg(test)]
+fn plan_edges(
+    reads: &[Vec<usize>],
+    names: &[String],
+    leaves: &[Vec<SharedConsumer>],
+    kinds: &[Consumes],
+    morsel_rows: usize,
+    reach: &mut Reach<'_>,
+    end_of: &mut dyn FnMut(PipelineId) -> Option<(SharedConsumer, bool)>,
+) -> (Dispatcher, Vec<Planned>) {
+    let mut dispatcher = Dispatcher::new(reads.to_vec(), morsel_rows);
+    // A store decides its positions in order; a scope steps its store in order.
+    for (pipeline, kind) in kinds.iter().enumerate() {
+        if *kind != Consumes::Pushes {
+            dispatcher.order(PipelineId(pipeline));
+        }
+    }
     let mut planned: Vec<Planned> = names
         .iter()
         .map(|name| Planned {
@@ -2578,6 +2758,8 @@ pub(crate) fn run_program(
             whole: false,
             started: false,
             held: false,
+            follows: Vec::new(),
+            rounds: Vec::new(),
         })
         .collect();
     let mut starts = Vec::new();
@@ -2590,12 +2772,41 @@ pub(crate) fn run_program(
             input = Some(breaker.input_tiling(InputId::ONLY))
         });
         let input = input.expect("a reach calls the breaker it reaches");
+        match kinds[reader] {
+            // A store's pipeline reads its input whole once the pipelines beneath its cycle have
+            // finished: a push from beneath stops at the store's entry rather than reach the
+            // cycle.
+            Consumes::Whole => {
+                dispatcher.read_whole(PipelineId(reader), &input);
+                planned[reader].whole = true;
+                continue;
+            }
+            // A nested loop's scope takes the row the scope around it queues it once the pipelines
+            // it reads have finished the round, since its rounds pull them.
+            Consumes::Rounds => {
+                for &follow in read {
+                    dispatcher.follow(PipelineId(reader), PipelineId(follow));
+                    planned[reader].follows.push(follow);
+                }
+                continue;
+            }
+            Consumes::Pushes => {}
+        }
+        // The nested loops' scopes it reads, whose finish of each round it waits for.
+        let mut follows = Vec::new();
         // What the pushes of the pipelines it reads name of its input, `None` before any.
         let mut pushed: Option<TileGuard> = None;
         // Whether a pipeline it reads pushes nothing that reaches it, so it reads that one by pull.
         let mut unreached = false;
         for &read in read {
-            let (pusher, _) = pushing_end(&mut reach, PipelineId(read));
+            // A nested loop's scope pushes its store once it is terminal, at the run's last epoch,
+            // so a reader inside the cycle around it waits for its finish of each round instead.
+            if kinds[read] == Consumes::Rounds {
+                follows.push(read);
+                continue;
+            }
+            let (pusher, _) =
+                end_of(PipelineId(read)).unwrap_or_else(|| pushing_end(reach, PipelineId(read)));
             let named = probe(&pusher, PipelineId(read), &Projection::Everything, reader);
             if named.is_empty() {
                 unreached = true;
@@ -2633,6 +2844,10 @@ pub(crate) fn run_program(
             planned[reader].whole = true;
             continue;
         }
+        for &follow in &follows {
+            dispatcher.follow(PipelineId(reader), PipelineId(follow));
+            planned[reader].follows.push(follow);
+        }
         dispatcher.park(PipelineId(reader));
         planned[reader].held = true;
         if !left.is_empty() {
@@ -2641,17 +2856,9 @@ pub(crate) fn run_program(
         }
     }
     for (reader, guard) in &starts {
-        dispatcher.queue_at_start(*reader, guard);
+        dispatcher.queue_for(*reader, guard);
     }
-    // The run drives every breaker it planned, so each takes its consuming mode here, before any
-    // package, and keeps it for the run.
-    for pipeline in 0..names.len() {
-        reach(PipelineId(pipeline), &mut |breaker| {
-            breaker.enter_consuming_mode()
-        });
-    }
-    drive(&dispatcher, &mut reach);
-    planned
+    (dispatcher, planned)
 }
 
 /// A sink's consumer and the sink it writes to, as [`run_program`] takes them.
@@ -2675,6 +2882,12 @@ pub(crate) struct Planned {
     /// Whether it parks the rows pushes bring until the pipelines it reads have decided them
     /// ([`Dispatcher::park`]).
     pub(crate) held: bool,
+    /// The nested loops' scopes it reads, whose finish of each round it waits for, taking no push
+    /// of theirs ([`Dispatcher::follow`]).
+    pub(crate) follows: Vec<usize>,
+    /// For a loop's scope, what its nested dispatcher planned for each inner pipeline, and
+    /// nothing otherwise.
+    pub(crate) rounds: Vec<Planned>,
 }
 
 /// The consumer `pipeline`'s breaker pushes to, and whether its output has keys of its own, so a
@@ -2722,26 +2935,78 @@ fn probe(
 /// Where [`run_program`] finds a pipeline's breaker.
 #[cfg(test)]
 enum Located {
-    /// In a sink's producer chain, by its address ([`address`]).
+    /// In a sink's producer chain, or a store's, by its address ([`address`]).
     Chain(usize),
     /// The breaker of the sink of this index in `sinks` ([`SinkBreaker`]).
     ///
     /// [`SinkBreaker`]: crate::interpreter::tile_operators::SinkBreaker
     Sink(usize),
+    /// The store of the cyclic fan-out `fan`, which steps itself.
+    Store {
+        fan: usize,
+        store: crate::interpreter::tile_operators::StoreCell,
+    },
+    /// The scope of the store of the cyclic fan-out `fan`, which runs in rounds: the planner's
+    /// scope of index `scope`.
+    Scope { fan: usize, scope: usize },
 }
 
-/// The pipelines [`run_program`] reads off a program's producer chains.
+/// A loop's scope as the planner walks it.
 #[cfg(test)]
-struct Planner<'p> {
-    stores: &'p [Rc<crate::interpreter::tile_operators::FanOut>],
+struct PlannedScope {
+    store: crate::interpreter::tile_operators::StoreCell,
+    /// The id of the store's cyclic fan-out, which the breakers inside its cycle read through a
+    /// recurrence slot.
+    fan: usize,
+    /// The scope's pipeline, in the dispatcher of the scope around it, or the run's for an
+    /// outermost loop; `None` until the walk of the store's chain has planned the pipelines it
+    /// reads.
+    pipeline: Option<usize>,
+    /// How many pipelines its own dispatcher has.
+    count: usize,
+    /// How many scopes it runs inside: its rounds run at paths of `depth + 1` keys.
+    depth: usize,
+}
+
+/// The pipelines of one dispatcher, in its pipeline order, with what [`plan_edges`] plans them
+/// by.
+#[cfg(test)]
+struct Members<'p> {
+    located: Vec<&'p Located>,
+    reads: Vec<Vec<usize>>,
+    names: Vec<String>,
+    leaves: Vec<Vec<SharedConsumer>>,
+    kinds: Vec<Consumes>,
+    /// The placements of the entries of the breakers in chains.
+    placements: Vec<Option<Placement>>,
+}
+
+/// The pipelines [`run_program`] reads off a program's producer chains, every dispatcher's: the
+/// run's, and each loop scope's. A pipeline's index here is its id in the planner; `local` gives
+/// its id in its dispatcher.
+#[cfg(test)]
+#[derive(Default)]
+struct Planner {
+    /// Per pipeline, the pipelines it reads, as the walk finds them, in whichever dispatcher.
     reads: Vec<Vec<usize>>,
     located: Vec<Located>,
     names: Vec<String>,
     /// Per pipeline, the consumers of the ranges in its chain (`ProducerBase::leaf`), above
     /// every breaker beneath it.
     leaves: Vec<Vec<SharedConsumer>>,
+    /// Per pipeline, the scope whose dispatcher it runs in; `None` for the run's.
+    within: Vec<Option<usize>>,
+    /// Per pipeline, its id in its dispatcher.
+    local: Vec<usize>,
+    /// Per pipeline, the placement of its breaker's entry, where the breaker is in a chain.
+    placements: Vec<Option<Placement>>,
     /// The edges `(read, reader)` whose reader's breaker reads the breaker of `read` directly.
     direct: Vec<(usize, usize)>,
+    scopes: Vec<PlannedScope>,
+    /// How many pipelines the run's dispatcher has.
+    count: usize,
+    /// The scopes whose store's chain the walk is in, outermost first.
+    walking: Vec<usize>,
 }
 
 /// What a chain holds beneath a producer, up to the nearest breakers.
@@ -2759,20 +3024,39 @@ struct Beneath {
 }
 
 #[cfg(test)]
-impl Planner<'_> {
+impl Beneath {
+    /// Add `pipelines` to the pipelines beneath, each once: a reader that reaches a pipeline
+    /// along two paths, as a filter reads its input for the values and the predicate, reads it
+    /// once.
+    fn read_once(&mut self, pipelines: Vec<(usize, bool)>) {
+        for (pipeline, direct) in pipelines {
+            if !self.pipelines.iter().any(|(seen, _)| *seen == pipeline) {
+                self.pipelines.push((pipeline, direct));
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl Planner {
     /// What the chain at `producer` holds up to the nearest breakers, planning each breaker
-    /// reached; a pipeline is numbered after the pipelines it reads, and a breaker a second
-    /// reader reaches keeps its pipeline.
+    /// reached in the dispatcher it runs in ([`dispatcher_of`](Self::dispatcher_of)); a pipeline
+    /// is numbered after the pipelines it reads, and a breaker a second reader reaches keeps its
+    /// pipeline. A recurrence slot holds nothing beneath it: its reader pulls the store.
     fn pipelines_under(
         &mut self,
         producer: &mut dyn crate::interpreter::tile_operators::TileProducer,
         role: &str,
     ) -> Beneath {
-        assert!(
-            store_of(producer, self.stores).is_none(),
-            "{} reads a store, and a store is no pipeline breaker, so no pipeline runs it",
-            producer.name()
-        );
+        if producer.recurrence_of().is_some() {
+            return Beneath::default();
+        }
+        if let Some(read) = producer.store_read() {
+            return Beneath {
+                pipelines: vec![(self.store_pipeline(read), false)],
+                ..Beneath::default()
+            };
+        }
         let id = address(producer);
         if let Some(pipeline) = self
             .located
@@ -2791,11 +3075,7 @@ impl Planner<'_> {
         producer.visit_input_producers_mut(&mut |role, input| {
             inputs += 1;
             let under = self.pipelines_under(input, role);
-            for (pipeline, direct) in under.pipelines {
-                if !below.pipelines.iter().any(|(seen, _)| *seen == pipeline) {
-                    below.pipelines.push((pipeline, direct));
-                }
-            }
+            below.read_once(under.pipelines);
             below.leaves.extend(under.leaves);
             below.unprobed.extend(under.unprobed);
         });
@@ -2815,40 +3095,236 @@ impl Planner<'_> {
         if inputs == 0 && leaf.is_none() && role != "fn" && producer.tiling().is_data_function() {
             below.unprobed.push(producer.name());
         }
-        let Some(breaker) = producer.as_breaking_mut() else {
+        if producer.as_breaking_mut().is_none() {
             below.leaves.extend(leaf);
             for (_, direct) in &mut below.pipelines {
                 *direct = false;
             }
             return below;
-        };
-        let pipeline = self.located.len();
-        placement
-            .unwrap_or_else(|| panic!("{} is placed in a pipeline by its entry", breaker.name()))
-            .set(Some(PipelineId(pipeline)));
-        self.located.push(Located::Chain(id));
-        self.names.push(breaker.name());
-        self.place(pipeline, below);
+        }
+        let within = self.dispatcher_of(&*producer);
+        let name = producer.name();
+        let placement =
+            placement.unwrap_or_else(|| panic!("{name} is placed in a pipeline by its entry"));
+        let pipeline = self.add(Located::Chain(id), name, within, below);
+        placement.set(Some(PipelineId(self.local[pipeline])));
+        self.placements[pipeline] = Some(placement);
         Beneath {
             pipelines: vec![(pipeline, true)],
             ..Beneath::default()
         }
     }
 
-    /// Record that `pipeline`, the last one located, reads what `below` holds.
-    fn place(&mut self, pipeline: usize, below: Beneath) {
-        debug_assert_eq!(
-            pipeline + 1,
-            self.located.len(),
-            "a pipeline reads the pipelines beneath it once it is located, and before any other is"
+    /// The scope whose dispatcher a breaker at `producer` runs in: the innermost scope being
+    /// walked whose cycle `producer` is inside, and `None`, the run's, where it is inside none.
+    fn dispatcher_of(
+        &self,
+        producer: &dyn crate::interpreter::tile_operators::TileProducer,
+    ) -> Option<usize> {
+        self.walking
+            .iter()
+            .rev()
+            .copied()
+            .find(|&scope| reaches_recurrence(producer, self.scopes[scope].fan))
+    }
+
+    /// The pipeline of the store `read` names, planning it the first time a reader reaches it:
+    /// the scope's of a store that runs in rounds ([`scope_pipeline`](Self::scope_pipeline)),
+    /// and otherwise the store's own. A store's own pipeline reads the pipelines beneath the
+    /// store's cycle; the operators inside the cycle, its own breakers among them, stay in pull
+    /// mode within it.
+    ///
+    /// # Panics
+    ///
+    /// For a store over a live source, whose arrivals no run notifies. For a store that steps
+    /// itself outside a loop's scope: one nested in another, one per enclosing row, and one whose
+    /// seed reads a pipeline. For a store inside the cycle of a store that steps itself.
+    fn store_pipeline(&mut self, read: crate::interpreter::tile_operators::StoreRead) -> usize {
+        if let Some(pipeline) = self.located.iter().position(|located| {
+            matches!(
+                located,
+                Located::Store { fan, .. } | Located::Scope { fan, .. } if *fan == read.fan
+            )
+        }) {
+            return pipeline;
+        }
+        assert!(
+            read.sources.is_empty(),
+            "a store over a live source {:?} runs in no pipeline: no run notifies its arrivals",
+            read.sources
         );
+        let within = self.dispatcher_of(&**read.store.borrow());
+        // A nested store runs in the scope of the loop around it, a row of its store per round of
+        // that loop.
+        assert!(
+            within.is_some() || matches!(read.store.borrow().tiling(), Tiling::Store { .. }),
+            "a nested store, one per enclosing row, runs in no pipeline outside its loop's scope: \
+             its frontier is per row: {}",
+            read.store.borrow().tiling()
+        );
+        if read.store.borrow().runs_in_rounds() {
+            return self.scope_pipeline(read, within);
+        }
+        let cell = read.store.clone();
+        let mut store = cell.borrow_mut();
+        let name = store.name();
+        assert!(
+            within.is_none(),
+            "{name} steps itself and runs in no loop's scope: only an induction store, which runs \
+             in rounds, sits inside one"
+        );
+        // The store's input is what its pipeline consumes, and a store with no consuming mode
+        // says so here, before anything is planned for it.
+        store
+            .as_breaking_mut()
+            .unwrap_or_else(|| panic!("{name} is a pipeline breaker"))
+            .input_tiling(InputId::ONLY);
+        let mut below = Beneath::default();
+        store.visit_input_producers_mut(&mut |role, input| {
+            let under = match role.starts_with("seed") {
+                true => {
+                    let under = self.pipelines_under(input, role);
+                    // A nested loop's pipeline waits for the pipelines it reads to finish the
+                    // round, its seed's among them; one in the run's dispatcher reads its input
+                    // whole, which a seed is not part of.
+                    assert!(
+                        within.is_some() || under.pipelines.is_empty(),
+                        "{name}'s {role} reads a pipeline; a store outside every loop's scope \
+                         reads its seed from none"
+                    );
+                    under
+                }
+                false => self.beneath_cycle(input, read.fan),
+            };
+            below.read_once(under.pipelines);
+        });
+        let breaker = store
+            .as_breaking_mut()
+            .unwrap_or_else(|| panic!("{name} is a pipeline breaker"));
+        let placement = breaker
+            .base()
+            .placement
+            .clone()
+            .unwrap_or_else(|| panic!("{name} is placed in a pipeline by its entry"));
+        // A store reads its input whole once the pipelines beneath it have finished, so neither
+        // ranges nor constants beneath it bring a key no push names.
+        let pipeline = self.add(
+            Located::Store {
+                fan: read.fan,
+                store: read.store,
+            },
+            name,
+            within,
+            Beneath {
+                pipelines: below.pipelines,
+                ..Beneath::default()
+            },
+        );
+        placement.set(Some(PipelineId(self.local[pipeline])));
+        self.placements[pipeline] = Some(placement);
+        pipeline
+    }
+
+    /// The pipeline of the scope of the store `read` names, which runs in rounds, in the
+    /// dispatcher of the scope `within` (`None` for the run's). The walk of the store's chain
+    /// plans the breakers inside its cycle as the pipelines of the scope's own dispatcher. The
+    /// store is in none, and its entry stays unplaced, so a push to it queues nothing. The
+    /// scope's pipeline reads the pipelines beneath the cycle.
+    fn scope_pipeline(
+        &mut self,
+        read: crate::interpreter::tile_operators::StoreRead,
+        within: Option<usize>,
+    ) -> usize {
+        let scope = self.scopes.len();
+        self.scopes.push(PlannedScope {
+            store: read.store.clone(),
+            fan: read.fan,
+            pipeline: None,
+            count: 0,
+            depth: self.walking.len(),
+        });
+        self.walking.push(scope);
+        let mut below = Beneath::default();
+        let name = {
+            let mut store = read.store.borrow_mut();
+            store.visit_input_producers_mut(&mut |role, input| {
+                below.read_once(self.pipelines_under(input, role).pipelines);
+            });
+            store.name()
+        };
+        self.walking.pop();
+        let pipeline = self.add(
+            Located::Scope {
+                fan: read.fan,
+                scope,
+            },
+            format!("LoopScope({name})"),
+            within,
+            Beneath {
+                pipelines: below.pipelines,
+                ..Beneath::default()
+            },
+        );
+        self.scopes[scope].pipeline = Some(pipeline);
+        pipeline
+    }
+
+    /// What a store's input `producer`, inside the cycle of the fan-out `fan`, holds beneath it:
+    /// the pipelines beneath the cycle. A subtree that reaches no recurrence slot of `fan` is
+    /// outside the cycle and planned as any chain is; inside it, a breaker is no pipeline.
+    ///
+    /// # Panics
+    ///
+    /// Where another store's fan-out is read inside the cycle.
+    fn beneath_cycle(
+        &mut self,
+        producer: &mut dyn crate::interpreter::tile_operators::TileProducer,
+        fan: usize,
+    ) -> Beneath {
+        if !reaches_recurrence(producer, fan) {
+            return self.pipelines_under(producer, "input");
+        }
+        assert!(
+            producer.store_read().is_none(),
+            "{} reads a store inside another store's cycle, one that steps itself, which no round \
+             reaches: a store there runs in no pipeline",
+            producer.name()
+        );
+        let mut below = Beneath::default();
+        let (mut inputs, mut seen) = (0, 0);
+        producer.visit_input_producers(&mut |_, _| seen += 1);
+        producer.visit_input_producers_mut(&mut |_, input| {
+            inputs += 1;
+            let under = self.beneath_cycle(input, fan);
+            below.read_once(under.pipelines);
+        });
+        debug_assert_eq!(
+            inputs,
+            seen,
+            "{} visits as many inputs mutably as it lists, so the walk of a store's cycle reaches \
+             every pipeline beneath it",
+            producer.name()
+        );
+        below
+    }
+
+    /// Plan a pipeline at `located`, named `name`, in the dispatcher of the scope `within`
+    /// (`None` for the run's), reading what `below` holds, and answer its id in the planner. Its
+    /// id in its dispatcher is the count of the pipelines planned there before it.
+    fn add(
+        &mut self,
+        located: Located,
+        name: String,
+        within: Option<usize>,
+        below: Beneath,
+    ) -> usize {
+        let pipeline = self.located.len();
         // A source reads its input whole, so it consumes whatever keys a constant brings. A
         // reader of pushes takes only what the pushes and the ranges' probes name.
         debug_assert!(
             below.pipelines.is_empty() || below.unprobed.is_empty(),
-            "{} reads pushes, and {:?} beneath it bring keys no push or probe names: a constant \
-             collection beneath a reader of pushes is a function operand",
-            self.names[pipeline],
+            "{name} reads pushes, and {:?} beneath it bring keys no push or probe names: a \
+             constant collection beneath a reader of pushes is a function operand",
             below.unprobed
         );
         for &(read, direct) in &below.pipelines {
@@ -2856,9 +3332,217 @@ impl Planner<'_> {
                 self.direct.push((read, pipeline));
             }
         }
+        let count = match within {
+            None => &mut self.count,
+            Some(scope) => &mut self.scopes[scope].count,
+        };
+        self.local.push(*count);
+        *count += 1;
+        self.located.push(located);
+        self.names.push(name);
+        self.within.push(within);
+        self.placements.push(None);
         self.reads
             .push(below.pipelines.iter().map(|(read, _)| *read).collect());
         self.leaves.push(below.leaves);
+        pipeline
+    }
+
+    /// Check that no pipeline is read directly by two: only a fan-out slot keeps one reader's
+    /// release from removing what another still reads.
+    fn check_direct(&self) {
+        for &(read, reader) in &self.direct {
+            let readers = self
+                .reads
+                .iter()
+                .filter(|reads| reads.contains(&read))
+                .count();
+            assert!(
+                readers == 1,
+                "{} reads {} directly, which another pipeline reads too; only a fan-out slot \
+                 keeps one reader's release from removing what another still reads",
+                self.names[reader],
+                self.names[read]
+            );
+        }
+    }
+
+    /// The pipeline of the planner's scope `scope`.
+    fn scope_pipeline_of(&self, scope: usize) -> usize {
+        self.scopes[scope]
+            .pipeline
+            .expect("a scope's pipeline is planned once the walk of its store's chain returns")
+    }
+
+    /// The dispatcher `pipeline` runs in, then each dispatcher around it, out to the run's.
+    fn dispatchers_around(&self, pipeline: usize) -> Vec<Option<usize>> {
+        let mut around = vec![self.within[pipeline]];
+        while let Some(Some(scope)) = around.last() {
+            around.push(self.within[self.scope_pipeline_of(*scope)]);
+        }
+        around
+    }
+
+    /// The pipeline of `dispatcher` that stands for `pipeline`, which runs in it or inside a
+    /// scope it runs: `pipeline` itself, or the pipeline of the scope around it in `dispatcher`.
+    fn stand_in(&self, mut pipeline: usize, dispatcher: Option<usize>) -> usize {
+        while self.within[pipeline] != dispatcher {
+            let scope = self.within[pipeline].unwrap_or_else(|| {
+                panic!(
+                    "{} runs inside the dispatcher of scope {dispatcher:?}",
+                    self.names[pipeline]
+                )
+            });
+            pipeline = self.scope_pipeline_of(scope);
+        }
+        pipeline
+    }
+
+    /// The pipelines of the dispatcher of the scope `within` (`None` for the run's), in its
+    /// pipeline order. A read between two dispatchers is a read, in the innermost dispatcher
+    /// around both, between the pipelines that stand for them there; a scope's pipeline reads
+    /// none of its own pipelines.
+    fn members(&self, within: Option<usize>) -> Members<'_> {
+        let ids: Vec<usize> = (0..self.located.len())
+            .filter(|pipeline| self.within[*pipeline] == within)
+            .collect();
+        debug_assert!(
+            ids.iter()
+                .enumerate()
+                .all(|(local, pipeline)| self.local[*pipeline] == local),
+            "a dispatcher numbers its pipelines in the order the planner plans them"
+        );
+        let mut reads = vec![Vec::new(); ids.len()];
+        for (reader, pipeline_reads) in self.reads.iter().enumerate() {
+            for &read in pipeline_reads {
+                let around = self.dispatchers_around(read);
+                let common = self
+                    .dispatchers_around(reader)
+                    .into_iter()
+                    .find(|dispatcher| around.contains(dispatcher))
+                    .expect("every dispatcher runs inside the run's");
+                if common != within {
+                    continue;
+                }
+                let (reader, read) = (self.stand_in(reader, common), self.stand_in(read, common));
+                let at = &mut reads[self.local[reader]];
+                if reader != read && !at.contains(&self.local[read]) {
+                    at.push(self.local[read]);
+                }
+            }
+        }
+        Members {
+            located: ids
+                .iter()
+                .map(|pipeline| &self.located[*pipeline])
+                .collect(),
+            reads,
+            names: ids
+                .iter()
+                .map(|pipeline| self.names[*pipeline].clone())
+                .collect(),
+            leaves: ids
+                .iter()
+                .map(|pipeline| self.leaves[*pipeline].clone())
+                .collect(),
+            kinds: ids
+                .iter()
+                .map(|pipeline| match &self.located[*pipeline] {
+                    Located::Store { .. } => {
+                        debug_assert!(
+                            within.is_none(),
+                            "a store that steps itself runs in the run's dispatcher; an induction \
+                             store inside a loop's scope is a nested loop's scope"
+                        );
+                        Consumes::Whole
+                    }
+                    Located::Scope { .. } if within.is_none() => Consumes::Whole,
+                    Located::Scope { .. } => Consumes::Rounds,
+                    Located::Chain(_) | Located::Sink(_) => Consumes::Pushes,
+                })
+                .collect(),
+            placements: ids
+                .iter()
+                .map(|pipeline| self.placements[*pipeline].clone())
+                .collect(),
+        }
+    }
+
+    /// The loop scope of the planner's scope `scope`.
+    /// Each scope's address and the breakers it keeps are added to `kept`: the inner pipelines
+    /// its rounds queue or push packages to ([`refusal_of_nested`](Self::refusal_of_nested)).
+    fn build_scope(
+        &self,
+        scope: usize,
+        morsel_rows: usize,
+        kept: &mut Vec<(usize, Vec<usize>)>,
+    ) -> loop_scope::LoopScope {
+        let members = self.members(Some(scope));
+        let at = members
+            .located
+            .iter()
+            .map(|located| match located {
+                Located::Chain(id) => loop_scope::Member::Chain(*id),
+                Located::Scope { scope, .. } => loop_scope::Member::Scope(Box::new(RefCell::new(
+                    self.build_scope(*scope, morsel_rows, kept),
+                ))),
+                Located::Store { .. } | Located::Sink(_) => unreachable!(
+                    "a scope's pipelines are the breakers inside its cycle and the scopes of the \
+                     loops nested in it"
+                ),
+            })
+            .collect();
+        let built =
+            loop_scope::LoopScope::new(self.scopes[scope].store.clone(), at, members, morsel_rows);
+        kept.push((scope, built.chain_breakers()));
+        built
+    }
+
+    /// Why the run cannot run a loop nested in another in rounds, or `None` where it can:
+    /// an operator a round of the loop's scope pulls beneath the outermost keys restates no
+    /// projection at the level it is pulled at ([`unrestated`]). `kept` holds each scope's
+    /// breakers, as [`build_scope`](Self::build_scope) gathers them. The walk starts at each
+    /// breaker a nested scope keeps, at the level of its rounds, and ends at every breaker that
+    /// consumes, in any dispatcher, since that breaker's consume pulls its inputs; a breaker
+    /// whose pipeline its dispatcher would read whole runs in pull mode and passes the pull on.
+    fn refusal_of_nested(&self, kept: &[(usize, Vec<usize>)]) -> Option<String> {
+        let consuming: Vec<usize> = (0..self.located.len())
+            .filter(|&pipeline| self.within[pipeline].is_none())
+            .filter_map(|pipeline| match self.located[pipeline] {
+                Located::Chain(id) => Some(id),
+                _ => None,
+            })
+            .chain(kept.iter().flat_map(|(_, ids)| ids.iter().copied()))
+            .collect();
+        kept.iter().find_map(|(scope, breakers)| {
+            let planned = &self.scopes[*scope];
+            if planned.depth == 0 {
+                return None;
+            }
+            let level = CurryLevel::new(planned.depth);
+            let store = planned.store.borrow();
+            breakers.iter().find_map(|&id| {
+                let mut found = None;
+                store.visit_input_producers(&mut |_, input| {
+                    if found.is_none() {
+                        found = at_address(
+                            input,
+                            id,
+                            &mut Some(
+                                |breaker: &dyn crate::interpreter::tile_operators::TileProducer| {
+                                    unrestated(breaker, Some(level), &consuming, true)
+                                },
+                            ),
+                        );
+                    }
+                });
+                debug_assert!(
+                    found.is_some(),
+                    "a breaker scope {scope} keeps sits in its store's chain, inside the cycle"
+                );
+                found.flatten()
+            })
+        })
     }
 }
 
@@ -2870,23 +3554,88 @@ fn address(producer: &dyn crate::interpreter::tile_operators::TileProducer) -> u
     std::ptr::from_ref(producer).cast::<()>() as usize
 }
 
-/// The index in `stores` of the fan-out `producer` is a slot of, where it is one: a slot lists
-/// its fan-out's input as `"input"`, here the store, built by the operator the fan-out wraps.
+/// Why a round of a loop's scope cannot pull the chain at `producer`, or `None` where every
+/// operator it pulls beneath the outermost keys restates the keys it is pulled at. `pulled` is the
+/// level `producer` is pulled at, `None` where it is pulled whole or at the outermost keys, and
+/// each operator passes its level to its inputs as it declares (`TileProducer::input_level`). The
+/// walk ends at a recurrence slot or another store's read, whose store answers from its snapshot,
+/// and, past the breaker it starts at (`start`), at every breaker in `consuming`, whose consume
+/// pulls its inputs and whose own scope checks them.
 #[cfg(test)]
-fn store_of(
+fn unrestated(
     producer: &dyn crate::interpreter::tile_operators::TileProducer,
-    stores: &[Rc<crate::interpreter::tile_operators::FanOut>],
-) -> Option<usize> {
-    let mut store = None;
-    producer.visit_input_producers(&mut |name, input| {
-        if name == "input" {
-            store = input.operator_id();
+    pulled: Option<CurryLevel>,
+    consuming: &[usize],
+    start: bool,
+) -> Option<String> {
+    if producer.recurrence_of().is_some() || producer.store_read().is_some() {
+        return None;
+    }
+    let pulled = pulled.filter(|&pulled| pulled != CurryLevel::OUTERMOST);
+    if let Some(pulled) = pulled
+        && producer.restates().refuses(pulled)
+    {
+        let name = producer.name();
+        let kind = name.split('#').next().unwrap_or(&name);
+        return Some(format!(
+            "{kind} in a nested loop's cycle is pulled at the keys of {pulled} and restates {}",
+            producer.restates()
+        ));
+    }
+    if pulled.is_none() || (!start && consuming.contains(&address(producer))) {
+        return None;
+    }
+    let mut why = None;
+    producer.visit_input_producers(&mut |role, input| {
+        let beneath = pulled.and_then(|pulled| producer.input_level(role, pulled));
+        why = why
+            .take()
+            .or_else(|| unrestated(input, beneath, consuming, false));
+    });
+    why
+}
+
+/// Call `f` with the producer at address `id` ([`address`]) in the chain under `producer`, and
+/// answer what it answers; `None` where the chain holds no such producer. The walk crosses a
+/// nested store's read, since a scope's breakers include the ones its nested loop's source is
+/// read through, and stops at a recurrence slot, which closes a store's cycle.
+#[cfg(test)]
+fn at_address<R>(
+    producer: &dyn crate::interpreter::tile_operators::TileProducer,
+    id: usize,
+    f: &mut Option<impl FnOnce(&dyn crate::interpreter::tile_operators::TileProducer) -> R>,
+) -> Option<R> {
+    if address(producer) == id {
+        return f.take().map(|f| f(producer));
+    }
+    if producer.recurrence_of().is_some() {
+        return None;
+    }
+    let mut found = None;
+    producer.visit_input_producers(&mut |_, input| {
+        if found.is_none() {
+            found = at_address(input, id, f);
         }
     });
-    let store = store?;
-    stores
-        .iter()
-        .position(|fan| fan.with_input(|operator| operator.operator_id()) == Some(store))
+    found
+}
+
+/// Whether the chain under `producer` reads the fan-out `fan` through a recurrence slot: whether
+/// it is inside that fan-out's store's cycle. The walk stops at every recurrence slot, the one
+/// edge that closes a cycle.
+#[cfg(test)]
+fn reaches_recurrence(
+    producer: &dyn crate::interpreter::tile_operators::TileProducer,
+    fan: usize,
+) -> bool {
+    if let Some(through) = producer.recurrence_of() {
+        return through == fan;
+    }
+    let mut reaches = false;
+    producer.visit_input_producers(&mut |_, input| {
+        reaches = reaches || reaches_recurrence(input, fan);
+    });
+    reaches
 }
 
 /// Call `call` with the breaker at address `id` in the chain under `producer`, and answer whether
@@ -2959,5 +3708,105 @@ mod tests {
             })
             .collect();
         assert_eq!(held, vec![vec![0, 1], vec![2, 3], vec![6, 7], vec![8]]);
+    }
+}
+
+#[cfg(test)]
+mod planner_walk_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::{TestTileProducer, two_levels_of_ints};
+    use crate::interpreter::tile_operators::{
+        MemoProducer, ProducerBase, TileProducer, impl_producer_base,
+    };
+
+    /// A memo over a producer that restates the outermost keys only.
+    fn memo_over_outermost() -> MemoProducer {
+        let (tile, tiling) = two_levels_of_ints();
+        MemoProducer::over(
+            Box::new(TestTileProducer::new(tile, tiling.clone())),
+            &tiling,
+        )
+    }
+
+    /// An inner pipeline's breaker is pulled at the paths of its scope's rounds and pulls its
+    /// input there, so an input that restates only the outermost keys refuses the scope.
+    #[test]
+    fn a_breaker_pulled_beneath_the_outermost_keys_refuses_an_input_that_restates_none() {
+        let memo = memo_over_outermost();
+        let why = unrestated(&memo, Some(CurryLevel::new(1)), &[address(&memo)], true);
+        assert_eq!(
+            why.as_deref(),
+            Some(
+                "TestTile in a nested loop's cycle is pulled at the keys of level 1 and restates \
+                 the outermost keys only"
+            )
+        );
+    }
+
+    /// A breaker that consumes ends the walk: its consume pulls its inputs, and its own scope
+    /// checks them. One in pull mode passes the pull on to its inputs.
+    #[test]
+    fn a_consuming_breaker_ends_the_walk_and_one_in_pull_mode_passes_it_on() {
+        let (_, tiling) = two_levels_of_ints();
+        let outer = MemoProducer::over(Box::new(memo_over_outermost()), &tiling);
+        let mut inner = 0;
+        outer.visit_input_producers(&mut |_, input| inner = address(input));
+        let level = Some(CurryLevel::new(1));
+        assert_eq!(unrestated(&outer, level, &[inner], true), None);
+        assert!(
+            unrestated(&outer, level, &[], true)
+                .is_some_and(|why| why.starts_with("TestTile in a nested loop's cycle"))
+        );
+    }
+
+    /// A breaker in no inner pipeline is pulled whole, so nothing beneath it is pulled at a
+    /// round's paths.
+    #[test]
+    fn a_breaker_pulled_whole_refuses_nothing_beneath_it() {
+        let memo = memo_over_outermost();
+        assert_eq!(unrestated(&memo, None, &[], true), None);
+    }
+
+    /// A producer that restates every level and reads its one input whole
+    /// (`TileProducer::input_level` answers `None`).
+    struct ReadsWhole {
+        base: ProducerBase,
+        input: Box<dyn TileProducer>,
+    }
+
+    impl TileProducer for ReadsWhole {
+        impl_producer_base!();
+
+        fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+            visit("input", &*self.input);
+        }
+
+        fn restates(&self) -> crate::interpreter::Restates {
+            crate::interpreter::Restates::Every
+        }
+
+        fn input_level(&self, _role: &str, _level: CurryLevel) -> Option<CurryLevel> {
+            None
+        }
+
+        fn get_impl(&mut self, _guard: TileGuard) -> crate::interpreter::Tile {
+            self.tiling().empty_tile()
+        }
+
+        fn release_impl(&mut self, _guard: TileGuard) {}
+    }
+
+    /// An input a producer reads whole is pulled at no level beneath the outermost keys, so one
+    /// that restates the outermost keys only does not refuse the scope.
+    #[test]
+    fn an_input_read_whole_refuses_nothing() {
+        let (tile, tiling) = two_levels_of_ints();
+        let reads_whole = ReadsWhole {
+            base: ProducerBase::unowned(ReadsWhole::alloc_id(), &tiling),
+            input: Box::new(TestTileProducer::new(tile, tiling.clone())),
+        };
+        let memo = MemoProducer::over(Box::new(reads_whole), &tiling);
+        let why = unrestated(&memo, Some(CurryLevel::new(1)), &[address(&memo)], true);
+        assert_eq!(why, None);
     }
 }
