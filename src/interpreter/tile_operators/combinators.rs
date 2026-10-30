@@ -428,7 +428,6 @@ impl TileProducer for ConverseProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }
@@ -745,7 +744,6 @@ impl TileProducer for MapDomainProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }
@@ -897,7 +895,6 @@ impl TileProducer for UncurryProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }
@@ -1211,7 +1208,6 @@ impl TileProducer for FilterProducer {
         visit("predicate", &*self.predicate);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
         visit("predicate", &mut *self.predicate);
@@ -1520,7 +1516,6 @@ impl TileProducer for RestrictProducer {
         visit("predicate", &*self.predicate);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("predicate", &mut *self.predicate);
     }
@@ -1939,7 +1934,6 @@ impl TileProducer for ProductProducer {
         visit("inner", &*self.inner);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("outer", &mut *self.outer);
         visit("inner", &mut *self.inner);
