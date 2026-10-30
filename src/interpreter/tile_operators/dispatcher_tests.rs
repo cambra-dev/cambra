@@ -233,12 +233,47 @@ fn a_partly_released_breaker_pushes_only_what_is_left() {
     assert_eq!(dispatcher.pop(), None, "one package");
 }
 
-/// Two pipelines reading one breaker need a `FanOut`: the release of one would remove rows the
-/// other has still to read.
+/// Every pipeline reading a breaker is queued each morsel the breaker pushes, and finalizes
+/// after the breaker; one that reads its input whole is queued that input instead.
 #[test]
-#[should_panic(expected = "pipeline 0 is read by pipelines 1 and 2")]
-fn a_breaker_read_by_two_pipelines_is_refused() {
-    Dispatcher::new(vec![vec![], vec![0], vec![0]], UNBOUNDED);
+fn a_breaker_read_by_several_pipelines_pushes_to_each() {
+    let (low, high) = (
+        keys_between(0, 1),
+        TileGuard::Function(FunctionGuard::Domain(
+            Predicate::True.minus(&keys_predicate(0, 1)),
+        )),
+    );
+    let child = Scripted::cutting(ints().universal_guard(), vec![low.clone(), high.clone()]);
+    let readers: Vec<BreakerHandle> = (0..3)
+        .map(|_| -> BreakerHandle { Scripted::holding(ints().universal_guard()) })
+        .collect();
+    let breakers: Vec<BreakerHandle> = std::iter::once(child as BreakerHandle)
+        .chain(readers)
+        .collect();
+    let whole = breakers[3].borrow().input_tiling();
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0], vec![0], vec![0]], UNBOUNDED);
+    dispatcher.read_whole(PipelineId(3), &whole);
+    run(&dispatcher, &breakers);
+    let events = dispatcher.into_events();
+    let finalized_at = |p: usize| {
+        events
+            .iter()
+            .position(|event| *event == finalized(p))
+            .expect("every pipeline finalizes")
+    };
+    for reader in 1..=3 {
+        assert!(
+            finalized_at(0) < finalized_at(reader),
+            "{reader} after the breaker it reads"
+        );
+    }
+    for reader in [1, 2] {
+        assert_eq!(
+            consumed_by(&events, reader),
+            vec![low.clone(), high.clone()]
+        );
+    }
+    assert_eq!(consumed_by(&events, 3), vec![whole.universal_guard()]);
 }
 
 /// A breaker has one input, so a pipeline reads at most one other.
@@ -817,7 +852,7 @@ fn overlapping_morsels_are_refused() {
 /// twice.
 #[test]
 #[cfg(debug_assertions)]
-#[should_panic(expected = "the reader of pipeline 0 consumes each region once")]
+#[should_panic(expected = "the readers of pipeline 0 consume each region once")]
 fn a_region_consumed_twice_is_refused() {
     let all = ints().universal_guard();
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);

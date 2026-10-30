@@ -299,7 +299,7 @@ impl EpochState {
 
 /// What the dispatcher keeps of one pipeline across epochs.
 struct PipelineState {
-    /// The region this pipeline's breaker has pushed to its reader, which each push grows by
+    /// The region this pipeline's breaker has pushed to its readers, which each push grows by
     /// what it pushes. A push of a breaker's final guard pushes what is not in it.
     // shared-state-ok: the region a pipeline has pushed, which its pushes read and grow under the
     // lock; what crosses it is a guard naming a region, never a tile.
@@ -332,8 +332,8 @@ pub struct Dispatcher {
     morsel_rows: usize,
     /// The pipelines each pipeline reads: the breakers its chain pulls.
     reads: Vec<Vec<usize>>,
-    /// The pipeline that reads each pipeline, if any: its parent, which its push reaches.
-    parent: Vec<Option<usize>>,
+    /// The pipelines that read each pipeline, which its push reaches.
+    readers: Vec<Vec<usize>>,
     /// Per pipeline, whether it consumes its morsels in queue order one at a time
     /// ([`order`](Dispatcher::order)). Set before the dispatcher is shared.
     ordered: Vec<bool>,
@@ -389,17 +389,18 @@ impl Dispatcher {
     /// reads. A work package names at most `morsel_rows` held rows. Epoch 0 is open, and the
     /// window holds [`DEFAULT_WINDOW`] epochs.
     ///
+    /// Several pipelines may read one pipeline, each through a `FanOut` slot of its own: without
+    /// one, the release of one reader would remove what another has still to read.
+    ///
     /// # Panics
     ///
-    /// When `morsel_rows` is zero, when a pipeline reads one that does not exist, reads more than
-    /// one pipeline, or is read by two, or when the graph has a cycle. A breaker has one input, so
-    /// its pipeline reads at most one other. Two readers of one breaker need a `FanOut` between
-    /// them: the release of one would remove what the other has still to read. A pipeline in a
-    /// cycle would wait for itself to finish.
+    /// When `morsel_rows` is zero, when a pipeline reads one that does not exist or reads more
+    /// than one pipeline, or when the graph has a cycle. A breaker has one input, so its pipeline
+    /// reads at most one other. A pipeline in a cycle would wait for itself to finish.
     pub fn new(reads: Vec<Vec<usize>>, morsel_rows: usize) -> Self {
         assert!(morsel_rows > 0, "a morsel holds at least one row");
         let count = reads.len();
-        let mut parent = vec![None; count];
+        let mut readers = vec![Vec::new(); count];
         for (pipeline, read) in reads.iter().enumerate() {
             assert!(
                 read.len() <= 1,
@@ -410,12 +411,7 @@ impl Dispatcher {
                     child < count,
                     "pipeline {pipeline} reads {child}, which is not one"
                 );
-                if let Some(other) = parent[child].replace(pipeline) {
-                    panic!(
-                        "pipeline {child} is read by pipelines {other} and {pipeline}; a breaker \
-                         read by two pipelines needs a FanOut"
-                    );
-                }
+                readers[child].push(pipeline);
             }
         }
         assert!(
@@ -434,7 +430,7 @@ impl Dispatcher {
         Self {
             morsel_rows,
             reads,
-            parent,
+            readers,
             ordered: vec![false; count],
             whole: vec![None; count],
             credit: vec![usize::MAX; count],
@@ -491,7 +487,7 @@ impl Dispatcher {
     /// Mark `pipeline`, which reads a pipeline, as consuming its breaker's input whole, `input`
     /// cut one package per morsel ([`seed`]), in the run's last epoch, in place of what the
     /// pipeline it reads pushes: a pushed guard names the pushing breaker's keys, which are the
-    /// parent's only where the parent's breaker reads the pushing one directly. Its input is whole
+    /// reader's only where the reader's breaker reads the pushing one directly. Its input is whole
     /// only once every epoch has run, so its queue in an earlier epoch closes empty.
     ///
     /// # Panics
@@ -1099,16 +1095,18 @@ impl Dispatcher {
         (epoch.number, state.queue.region())
     }
 
-    /// Mark the pipeline `pushes` belongs to finished in its epoch, land what it pushed in its
-    /// parent's queue for that epoch, and close that queue. The parent may claim and finish the
-    /// epoch only once its queue there is closed. The finish that is the last of the epoch's
-    /// retires it, and the window's slot takes the epoch a window later. After a failure it
-    /// records nothing.
+    /// Mark the pipeline `pushes` belongs to finished in its epoch, land what it pushed in the
+    /// queue for that epoch of each pipeline that reads it, and close those queues. A reader may
+    /// claim and finish the epoch only once its queue there is closed. The finish that is the last
+    /// of the epoch's retires it, and the window's slot takes the epoch a window later. After a
+    /// failure it records nothing.
     ///
     /// # Panics
     ///
-    /// When the pipeline is not finalizing in the epoch, which a second finish of it finds, or its
-    /// parent has begun to finish the epoch.
+    /// When the pipeline is not finalizing in the epoch, which a second finish of it finds, or a
+    /// reader has begun to finish the epoch. When a reader reads the pushes restated and a pushed
+    /// morsel names no outermost keys of the breaker to restate, and when a reader of several
+    /// pipelines reads neither the pushes restated nor its input whole.
     pub fn finish(&self, mut pushes: Pushes<'_>) {
         debug_assert!(
             std::ptr::eq(pushes.dispatcher, self),
@@ -1129,22 +1127,22 @@ impl Dispatcher {
             format!("pipeline {p} finishes after its finalize began")
         });
         let epoch = epoch.expect("refused above");
-        // Recorded before the parent's queue is closed, which lets the parent claim.
+        // Recorded before the readers' queues are closed, which lets them claim.
         #[cfg(test)]
         self.record(Event::Finalize(PipelineId(p)));
-        if let Some(parent) = self.parent[p] {
-            let queue = &epoch.pipelines[parent];
+        for &reader in &self.readers[p] {
+            let queue = &epoch.pipelines[reader];
             self.ensure(queue.phase.load() == Phase::Running, || {
-                format!("pipeline {parent} receives packages before it finalizes")
+                format!("pipeline {reader} receives packages before it finalizes")
             });
-            let queued = match &self.whole[parent] {
+            let queued = match &self.whole[reader] {
                 Some(input) if epoch.number == self.last.load(Ordering::Acquire) => input,
                 Some(_) => &Vec::new(),
                 None => &morsels,
             };
-            let landed = queue.queue.append(parent, queued) && queue.queue.close();
+            let landed = queue.queue.append(reader, queued) && queue.queue.close();
             self.ensure(landed, || {
-                format!("pipeline {parent} receives packages once")
+                format!("pipeline {reader} receives packages once")
             });
         }
         if epoch.unfinished.fetch_sub(1, Ordering::AcqRel) == 1 {
@@ -1278,9 +1276,9 @@ impl Drop for Worker<'_> {
     }
 }
 
-/// What a breaker pushes through in one epoch: one work package per morsel for the pipeline that
+/// What a breaker pushes through in one epoch: one work package per morsel for each pipeline that
 /// reads it. The packages land when the dispatcher [finishes](Dispatcher::finish) the pipeline's
-/// epoch, in its reader's queue for that epoch.
+/// epoch, in each reader's queue for that epoch.
 pub struct Pushes<'d> {
     dispatcher: &'d Dispatcher,
     pipeline: usize,
@@ -1290,9 +1288,10 @@ pub struct Pushes<'d> {
 
 impl Pushes<'_> {
     /// Push what `breaker` has decided and the pipeline has not pushed before, its final guard
-    /// less the region pushed, for the pipeline that reads it: one package per morsel the breaker
-    /// cuts it into, in the breaker's order. A push of nothing new pushes nothing, and so does a
-    /// breaker no pipeline reads. The difference and the region's growth are one step under the
+    /// less the region pushed, for the pipelines that read it: one package per morsel the breaker
+    /// cuts it into, in the breaker's order; each reader is queued every morsel, except a reader
+    /// that reads its input whole ([`Dispatcher::read_whole`]). A push of nothing new pushes
+    /// nothing, and so does a breaker no pipeline reads. The difference and the region's growth are one step under the
     /// region's lock, so two pushes of one pipeline from two threads push disjoint regions, and an
     /// epoch's finish pushes only what no earlier finish pushed.
     ///
@@ -1301,7 +1300,7 @@ impl Pushes<'_> {
     /// Where the guard algebra has no exact difference of the two ([`guard_minus`]); in a debug
     /// build, when the morsels do not partition what is pushed ([`partition_gap`]).
     pub fn push_final<B: BreakingProducer + ?Sized>(&mut self, breaker: &B) {
-        if self.dispatcher.parent[self.pipeline].is_none() {
+        if self.dispatcher.readers[self.pipeline].is_empty() {
             return;
         }
         let decided = breaker.final_guard();
@@ -1324,7 +1323,7 @@ impl Pushes<'_> {
             pushed
                 .as_ref()
                 .is_none_or(|pushed| pushed.intersect(&guard).is_empty()),
-            "the reader of pipeline {} consumes each region once: {guard:?} meets {pushed:?}",
+            "the readers of pipeline {} consume each region once: {guard:?} meets {pushed:?}",
             self.pipeline
         );
         if !guard.is_empty() {
@@ -1344,7 +1343,7 @@ impl Pushes<'_> {
         guard: &TileGuard,
         cut: impl FnOnce(&TileGuard, usize) -> Vec<TileGuard>,
     ) {
-        if self.dispatcher.parent[self.pipeline].is_none() || guard.is_empty() {
+        if self.dispatcher.readers[self.pipeline].is_empty() || guard.is_empty() {
             return;
         }
         self.record(|_| guard.clone());
@@ -1367,7 +1366,7 @@ impl Pushes<'_> {
 }
 
 impl Drop for Pushes<'_> {
-    /// Refuses to drop pushes that never landed, which would lose the parent's packages.
+    /// Refuses to drop pushes that never landed, which would lose the readers' packages.
     fn drop(&mut self) {
         if !thread::panicking() {
             assert!(
@@ -1469,9 +1468,9 @@ fn cuts_every(runs: Vec<(u128, u128)>, rows: usize) -> Vec<Value> {
     cuts
 }
 
-/// A shared handle on a pipeline's breaker. A parent's chain reads the breaker through another
+/// A shared handle on a pipeline's breaker. A reader's chain reads the breaker through another
 /// handle, so the driver borrows it for one call at a time.
-// shared-state-ok: the driver's handle on a breaker it calls, and in a test the handle a parent's
+// shared-state-ok: the driver's handle on a breaker it calls, and in a test the handle a reader's
 // input reads the breaker through; no tile passes between operators through it.
 pub type BreakerHandle = Rc<RefCell<dyn BreakingProducer>>;
 
@@ -1651,25 +1650,26 @@ fn finalize_with(
 /// pipeline whose breaker reads the breaker below through other producers reads its own input
 /// whole ([`Dispatcher::read_whole`]). The run
 /// pulls only the breakers' inputs; the roots' consumers pull the breakers afterwards. It answers
-/// each pipeline's breaker by name, in pipeline order.
+/// each pipeline's breaker by name and the pipelines it reads, in pipeline order.
 ///
 /// # Panics
 ///
-/// When two pipelines read one breaker or one store, or a pipeline reads two pipelines; and where
-/// [`run`] panics.
+/// When a pipeline reads two pipelines, or reads directly a pipeline that another pipeline reads;
+/// and where [`run`] panics.
 #[cfg(test)]
 pub(crate) fn run_program(
     roots: &[crate::interpreter::sinks::ProducerSlot],
     stores: &[Rc<crate::interpreter::tile_operators::FanOut>],
     scheduler: &mut crate::interpreter::Scheduler,
     morsel_rows: usize,
-) -> Vec<String> {
+) -> Vec<(String, Vec<usize>)> {
     let mut planner = Planner {
         stores,
         scheduler,
         reads: Vec::new(),
         located: Vec::new(),
         whole: Vec::new(),
+        direct: Vec::new(),
         names: Vec::new(),
         store_breakers: stores.iter().map(|_| None).collect(),
     };
@@ -1682,10 +1682,23 @@ pub(crate) fn run_program(
         reads,
         located,
         whole,
+        direct,
         names,
         store_breakers,
         ..
     } = planner;
+    // Several readers of one pipeline each read its breaker through a fan-out slot of their own,
+    // which the dispatcher cannot see: a reader that reads the breaker directly would release
+    // rows another reader has still to read.
+    for (read, reader) in &direct {
+        let readers = reads.iter().filter(|r| r.contains(read)).count();
+        assert_eq!(
+            readers, 1,
+            "pipeline {reader} reads pipeline {read} directly, which {readers} pipelines read; \
+             each of several readers reads through a fan-out slot of its own"
+        );
+    }
+    let planned = names.into_iter().zip(reads.iter().cloned()).collect();
     let mut dispatcher = Dispatcher::new(reads, morsel_rows);
     for (pipeline, at) in located.iter().enumerate() {
         if let Located::Store(_) = at {
@@ -1719,11 +1732,12 @@ pub(crate) fn run_program(
             }
         },
     );
-    names
+    planned
 }
 
 /// Where [`run_program`] finds a pipeline's breaker.
 #[cfg(test)]
+#[derive(PartialEq)]
 enum Located {
     /// In a root's producer chain, by its address ([`address`]).
     Chain(usize),
@@ -1741,6 +1755,8 @@ struct Planner<'p> {
     /// Per pipeline, the tiling its breaker's input answers, where it reads that input whole
     /// ([`Dispatcher::read_whole`]).
     whole: Vec<Option<Tiling>>,
+    /// The edges `(read, reader)` whose reader's breaker reads the breaker of `read` directly.
+    direct: Vec<(usize, usize)>,
     names: Vec<String>,
     /// Per fan-out of `stores`, the breaker over it, once a chain reads it.
     store_breakers: Vec<Option<BreakerHandle>>,
@@ -1758,6 +1774,13 @@ impl Planner<'_> {
         if let Some(store) = store_of(producer, self.stores) {
             return vec![(self.store_pipeline(store, producer), true)];
         }
+        // A breaker reached a second time, through a fan-out slot of its own, is planned already,
+        // along with the pipelines it reads; its pipeline gains this reader.
+        if producer.as_breaking_mut().is_some()
+            && let Some(planned) = self.planned(&Located::Chain(address(producer)))
+        {
+            return vec![(planned, true)];
+        }
         let mut below = Vec::new();
         producer.visit_input_producers_mut(&mut |_, input| {
             below.extend(self.pipelines_under(input));
@@ -1771,21 +1794,28 @@ impl Planner<'_> {
             .iter()
             .any(|(_, direct)| !direct)
             .then(|| breaker.input_tiling());
-        let id = address(producer);
-        assert!(
-            !self
-                .located
-                .iter()
-                .any(|at| matches!(at, Located::Chain(seen) if *seen == id)),
-            "{} is read by two pipelines; a breaker read by two pipelines is not supported",
-            producer.name()
-        );
-        self.located.push(Located::Chain(id));
+        self.located.push(Located::Chain(address(producer)));
         self.names.push(producer.name());
-        self.reads
-            .push(below.into_iter().map(|(read, _)| read).collect());
+        // One reader may reach the breaker beneath it along several paths, each through a
+        // fan-out slot of its own, as a filter reads its input for the values and the predicate.
+        let pipeline = self.located.len() - 1;
+        let mut reads: Vec<usize> = Vec::new();
+        for (read, direct) in below {
+            if direct {
+                self.direct.push((read, pipeline));
+            }
+            if !reads.contains(&read) {
+                reads.push(read);
+            }
+        }
+        self.reads.push(reads);
         self.whole.push(whole);
         vec![(self.located.len() - 1, true)]
+    }
+
+    /// The pipeline already planned at `at`, where there is one.
+    fn planned(&self, at: &Located) -> Option<usize> {
+        self.located.iter().position(|seen| seen == at)
     }
 
     /// The pipeline of the store breaker over `self.stores[store]`, read through `slot`, a slot of
@@ -1797,10 +1827,9 @@ impl Planner<'_> {
         slot: &dyn crate::interpreter::tile_operators::TileProducer,
     ) -> usize {
         use crate::interpreter::tile_operators::{CommitBreaker, LoopBreaker};
-        assert!(
-            self.store_breakers[store].is_none(),
-            "a store is read twice; a store read by two readers is not supported"
-        );
+        if let Some(planned) = self.planned(&Located::Store(store)) {
+            return planned;
+        }
         let mut roles = Vec::new();
         slot.visit_input_producers(&mut |name, input| {
             if name == "input" {

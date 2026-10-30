@@ -106,8 +106,11 @@ impl Script {
         self.reads.len()
     }
 
-    fn parent(&self, pipeline: usize) -> Option<usize> {
-        (0..self.count()).find(|p| self.reads[*p].contains(&pipeline))
+    /// The pipelines that read `pipeline`.
+    fn readers(&self, pipeline: usize) -> Vec<usize> {
+        (0..self.count())
+            .filter(|p| self.reads[*p].contains(&pipeline))
+            .collect()
     }
 
     fn dispatcher(&self) -> Dispatcher {
@@ -162,6 +165,29 @@ impl Script {
                 reads[pair[1]] = vec![pair[0]];
             }
         }
+        Self::random_over(rng, reads)
+    }
+
+    /// A random forest of trees over up to `most` pipelines, numbered in a random order: each
+    /// pipeline reads at most one that comes before it, and a pipeline may have several readers.
+    fn random_trees(rng: &mut Rng, most: u64) -> Self {
+        let count = 1 + rng.below(most) as usize;
+        let mut order: Vec<usize> = (0..count).collect();
+        for at in (1..count).rev() {
+            order.swap(at, rng.below(at as u64 + 1) as usize);
+        }
+        let mut reads = vec![Vec::new(); count];
+        for at in 1..count {
+            if rng.below(3) > 0 {
+                reads[order[at]] = vec![order[rng.below(at as u64) as usize]];
+            }
+        }
+        Self::random_over(rng, reads)
+    }
+
+    /// A script over the pipelines `reads` describes, with random morsels, order, inputs and keys.
+    fn random_over(rng: &mut Rng, reads: Vec<Vec<usize>>) -> Self {
+        let count = reads.len();
         let rows = match rng.below(6) {
             0 => UNIVERSE as usize,
             rows => rows as usize,
@@ -352,9 +378,9 @@ fn finalize(
         pushed = cut(guard, rows);
         pushed.clone()
     });
-    if let Some(parent) = script.parent(p) {
-        let keys = pushed.iter().fold(0, |keys, morsel| keys | mask_of(morsel));
-        observed.queued[parent].store(keys, SeqCst);
+    let keys = pushed.iter().fold(0, |keys, morsel| keys | mask_of(morsel));
+    for reader in script.readers(p) {
+        observed.queued[reader].store(keys, SeqCst);
     }
     observed.finished[p].store(true, SeqCst);
     dispatcher.finish(pushes);
@@ -578,23 +604,22 @@ fn assert_ordered_events(script: &Script, events: &[Event], records: &[Record]) 
         else {
             continue;
         };
-        let Some(parent) = script.parent(*pipeline) else {
-            continue;
-        };
-        let consumed: Vec<TileGuard> = events
-            .iter()
-            .filter_map(|event| match event {
-                Event::Consume {
-                    pipeline: at,
-                    guard,
-                } if *at == PipelineId(parent) => Some(guard.clone()),
-                _ => None,
-            })
-            .collect();
-        assert!(
-            same_guards(&consumed, pushed),
-            "pipeline {parent} consumes exactly the morsels pipeline {pipeline} pushed"
-        );
+        for reader in script.readers(*pipeline) {
+            let consumed: Vec<TileGuard> = events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Consume {
+                        pipeline: at,
+                        guard,
+                    } if *at == PipelineId(reader) => Some(guard.clone()),
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                same_guards(&consumed, pushed),
+                "pipeline {reader} consumes exactly the morsels pipeline {pipeline} pushed"
+            );
+        }
     }
 }
 
@@ -781,6 +806,44 @@ fn one_pipeline_finished_on_two_threads_at_once_finishes_once() {
                 .count();
             assert_eq!(finished, 1, "one finish is recorded");
         });
+    }
+}
+
+/// Random forests of trees, where a pipeline may have several readers, at every thread count:
+/// each reader consumes exactly what the pipeline it reads pushed, after it finalized.
+#[test]
+fn random_trees_match_the_single_threaded_run() {
+    let mut fanned = 0;
+    for seed in 1..=40u64 {
+        let script = Script::random_trees(&mut Rng(seed.wrapping_mul(0x5851_f42d_4c95_7f2d)), 10);
+        fanned += usize::from((0..script.count()).any(|p| script.readers(p).len() > 1));
+        for threads in THREADS {
+            let workers = workers(threads, seed, script.count(), seed % 2 == 0);
+            let what = format!("seed {seed}, {threads} threads, {script:?}");
+            agrees_with_the_single_threaded_run(script.clone(), workers, what);
+        }
+    }
+    assert!(
+        fanned >= 10,
+        "the trees read a pipeline twice in {fanned} of 40 scripts"
+    );
+}
+
+/// One source read by six pipelines, two of them ordered, at morsels of one row: the readers'
+/// claims race each other on every thread count.
+#[test]
+fn a_pipeline_read_by_six_runs_on_many_threads() {
+    for seed in 1..=10 {
+        for threads in THREADS {
+            let mut script = Script::chains(&[1], 1, 30);
+            script.reads.extend((0..6).map(|_| vec![0]));
+            script.ordered = vec![false, true, false, false, true, false, false];
+            script.positions = vec![30; 7];
+            script.keep = vec![1, 1, 2, 1, 3, 1, 0];
+            let workers = workers(threads, seed, script.count(), seed % 2 == 0);
+            let what = format!("seed {seed}, {threads} threads");
+            agrees_with_the_single_threaded_run(script, workers, what);
+        }
     }
 }
 

@@ -15,10 +15,12 @@ use std::rc::Rc;
 use super::loop_breaker_tests::pulled;
 use super::{FanOut, TileProducer};
 
+/// Each pipeline `run_program` planned: its breaker's name and the pipelines it reads.
+type Planned = (String, Vec<usize>);
+
 /// `source` compiled with a test sink `out`, its pipelines run through the dispatcher at morsels
-/// of `rows`, then its sink pulled by the scheduler: the value `out` receives, and the breaker of
-/// each pipeline by name.
-fn dispatched(source: &str, rows: usize) -> (Value, Vec<String>) {
+/// of `rows`, then its sink pulled by the scheduler: the value `out` receives, and the pipelines.
+fn dispatched(source: &str, rows: usize) -> (Value, Vec<Planned>) {
     let mut ctx = GlobalContext::default();
     ctx.defer_sink_pulls();
     let sink = ctx.register_test_sink("out");
@@ -40,7 +42,7 @@ fn dispatched(source: &str, rows: usize) -> (Value, Vec<String>) {
         .iter()
         .map(|consumer| consumer.borrow().producer_slot().clone())
         .collect();
-    let breakers = run_program(&roots, &stores, ctx.scheduler(), rows);
+    let planned = run_program(&roots, &stores, ctx.scheduler(), rows);
     let beneath = pulls_beneath_breakers(&roots, &stores);
     for consumer in &consumers {
         consumer.borrow().pull_now();
@@ -59,7 +61,7 @@ fn dispatched(source: &str, rows: usize) -> (Value, Vec<String>) {
     let [binding] = written.as_function().as_slice() else {
         panic!("{source} writes one value: {written:?}")
     };
-    (binding.output.clone(), breakers)
+    (binding.output.clone(), planned)
 }
 
 /// The pulls of every producer beneath a pipeline breaker in the chains under `roots`, a store's
@@ -101,7 +103,7 @@ fn answers_as_pull_mode_does(source: &str, kinds: &[&str]) {
         );
         for kind in kinds {
             assert!(
-                breakers.iter().any(|name| name.starts_with(kind)),
+                breakers.iter().any(|(name, _)| name.starts_with(kind)),
                 "{source} runs a {kind} pipeline: {breakers:?}"
             );
         }
@@ -156,16 +158,47 @@ fn a_sum_inside_an_expression() {
     );
 }
 
-/// A filter reads its input's memo twice, as the values and as the predicate, so two pipelines
-/// would read one breaker.
+/// A filter reads its input's memo along two paths, the values and the predicate, each through a
+/// fan-out slot of its own: the aggregate's pipeline reads the memo's pipeline once.
 #[test]
-#[should_panic(expected = "is read by two pipelines")]
-fn a_filtered_sum_is_refused() {
-    dispatched(
+fn a_filtered_sum() {
+    answers_as_pull_mode_does(
         indoc! {"
             out = test_sink()
             xs = [1, 2, 3, 4]
             out << sum([x for x in xs if x > 1])
+        "},
+        &["Memo", "Aggregate"],
+    );
+}
+
+/// Two aggregates of one binding: their pipelines both read its memo, and the planner plans that,
+/// but the output's memo reads both aggregates, so a pipeline reads two and the dispatcher refuses
+/// it. Each sink's output is compiled on its own, so two sinks read no binding in common.
+#[test]
+#[should_panic(expected = "reads pipelines")]
+fn two_aggregates_of_one_binding_are_refused_where_they_meet() {
+    dispatched(
+        indoc! {"
+            out = test_sink()
+            xs = [1, 2, 3, 4]
+            out << sum(xs) * 10 + max(xs)
+        "},
+        1,
+    );
+}
+
+/// A group-by's memo reads its input's memo and the `Converse` that keys the groups, which reads
+/// that input's memo too: the input's memo has two readers, and the group-by's memo reads two.
+#[test]
+#[should_panic(expected = "reads pipelines")]
+fn a_group_by_is_refused() {
+    dispatched(
+        indoc! {"
+            out = test_sink()
+            xs = [1, 2, 3, 4]
+            g = groupby(xs, \\x -> x > 2)
+            out << sum([sum(v) for v in g])
         "},
         1,
     );

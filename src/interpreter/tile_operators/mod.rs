@@ -1129,16 +1129,16 @@ pub(crate) fn projection_of_one_value(name: &str, what: &str, guard: &TileGuard)
 ///
 /// A driver makes three calls. [`consume_impl`] pulls the producer's input at a guard, merges the
 /// answer, and releases the input at what the answer stated once it has taken delivery of it, so
-/// the driver handles no tile. [`finalize`] pushes what the producer holds to the pipeline that
-/// reads it, once its own pipeline has finished. [`offer_impl`] is what the producer's `get_impl`
+/// the driver handles no tile. [`finalize`] pushes what the producer holds to the pipelines that
+/// read it, once its own pipeline has finished. [`offer_impl`] is what the producer's `get_impl`
 /// answers with once it is consuming: it reads the state `consume_impl` built and never pulls the
 /// input.
 ///
-/// A consuming producer's only reader is the pipeline the dispatcher pushes its packages to, so a
-/// consuming producer wakes no consumer: the work package `finalize` pushes is how its reader
-/// learns what it holds. Pull mode wakes its consumer as it always has. When a pipeline may
-/// finalize is the dispatcher's to decide (`crate::interpreter::dispatcher`).
-/// See `src/interpreter/design-operators.md`, "Pipeline breakers".
+/// A consuming producer wakes no consumer. A pipeline that reads it learns what it holds through
+/// the work packages `finalize` pushes, and a reader outside every pipeline pulls it after the
+/// run. Pull mode wakes its consumer as it always has. When a pipeline may finalize is the
+/// dispatcher's to decide (`crate::interpreter::dispatcher`). See
+/// `src/interpreter/design-operators.md`, "Pipeline breakers".
 ///
 /// [`consume_impl`]: Self::consume_impl
 /// [`finalize`]: Self::finalize
@@ -1183,7 +1183,7 @@ pub trait BreakingProducer: TileProducer {
         vec![guard.clone()]
     }
 
-    /// Push [`final_guard`](Self::final_guard) to the pipeline that reads this producer, as one
+    /// Push [`final_guard`](Self::final_guard) to the pipelines that read this producer, as one
     /// work package per morsel ([`morsels`](Self::morsels)); an empty guard pushes nothing. It
     /// wakes no one.
     ///

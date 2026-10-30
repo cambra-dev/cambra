@@ -1282,9 +1282,9 @@ impl MemoProducer {
 
 impl BreakingProducer for MemoProducer {
     /// Reads the input at `guard` whether or not the cache holds the region, since the caller
-    /// asks for the pipeline to run, and leaves the memo consuming. It wakes no consumer: a
-    /// consuming memo's only reader is the pipeline the dispatcher pushes to, and what the consume
-    /// merged reaches it through the package `finalize` pushes.
+    /// asks for the pipeline to run, and leaves the memo consuming. It wakes no consumer: what the
+    /// consume merged reaches a pipeline that reads the memo through the packages `finalize`
+    /// pushes, and a reader outside every pipeline pulls the memo after the run.
     fn consume_impl(&mut self, guard: TileGuard) {
         debug_assert!(
             guard.check_from(self.input.tiling()),
