@@ -56,11 +56,12 @@ use std::ops::Bound::{Excluded, Unbounded};
 use crate::ccl::{F_WRITES, Label};
 use crate::interpreter::{
     BaseType, ColumnValue, Consumer, CurryLevel, Extent, FunctionGuard, Gate, GatedConsumer, Path,
-    Position, Predicate, Projection, Scheduler, Tile, TileGuard, Tiling, Value, WakeupQueue,
-    forwarding_consumer, shared_consumer,
+    Position, Predicate, Projection, Restates, Scheduler, Tile, TileGuard, Tiling, Value,
+    WakeupQueue, forwarding_consumer, shared_consumer,
     tile_operators::{
-        CycleSlot, CyclicSequencingProducer, Memo, ProducerBase, TileOperator, TileProducer,
-        materialize_collections, materialized_row, subscribe_forwarding,
+        Breaker, BreakingProducer, Cycle, CycleSlot, CyclicSequencingProducer, Memo, ProducerBase,
+        TileOperator, TileProducer, guard_minus, materialize_collections, materialized_row,
+        subscribe_forwarding,
     },
     tuple_field, uint_of_row,
 };
@@ -799,6 +800,374 @@ fn empty_engines_tile(tiling: &Tiling, complete: &[Predicate], terminal: bool) -
         *t = terminal;
     }
     tile
+}
+
+/// What a store keeps to run as a pipeline breaker: the handle on its cyclic fan-out, whether a
+/// dispatcher drives it, and the store as its last step rendered it.
+/// See `src/interpreter/design-operators.md`, "A store as a breaker".
+#[derive(Default)]
+struct BreakerState {
+    /// The handle on the cyclic fan-out the store is the input of, which a consume announces
+    /// each step to the cycle through and publishes each step's snapshot through.
+    cycle: Option<Cycle>,
+    /// Whether a dispatcher drives the store, from its first consume; a pull then answers from
+    /// [`snapshot`](Self::snapshot) and steps nothing.
+    consuming: bool,
+    /// The store as the last consumed step rendered it.
+    snapshot: Option<Tile>,
+}
+
+impl BreakerState {
+    fn enter_cycle(&mut self, cycle: Cycle) {
+        debug_assert!(
+            self.cycle.is_none(),
+            "a store is the input of one cyclic fan-out, which hands it its cycle once"
+        );
+        self.cycle = Some(cycle);
+    }
+
+    fn terminal(&self) -> bool {
+        self.snapshot.as_ref().is_some_and(Tile::is_terminal)
+    }
+
+    /// Everything once the store is terminal, and nothing before: a reader pulls the store tile,
+    /// which `restrict_to` cannot cut to the positions decided so far.
+    fn held(&self, tiling: &Tiling) -> TileGuard {
+        match self.terminal() {
+            true => tiling.universal_guard(),
+            false => tiling.empty_guard(),
+        }
+    }
+
+    fn offer(&self) -> Tile {
+        self.snapshot
+            .clone()
+            .expect("a store is consuming from its first consume, which renders it")
+    }
+}
+
+/// A store that steps itself as a pipeline breaker, an induction store or a transaction store:
+/// its own step, and the state [`consume_store`] and [`finish_store`] keep for it.
+trait SteppedStore: BreakingProducer {
+    /// The store, as panic messages name it.
+    const STORE: &'static str;
+
+    fn breaker(&self) -> &BreakerState;
+
+    fn breaker_mut(&mut self) -> &mut BreakerState;
+
+    /// One step of the store, as a pull of it in pull mode makes, rendering the store.
+    fn step_store(&mut self) -> Tile;
+
+    /// The queue the store's consumer is woken through, the scheduler's.
+    fn wakeups(&self) -> &WakeupQueue;
+
+    /// What wakes the store's readers when a step changes what it answers.
+    fn notifier(&mut self) -> &mut ChangeNotifier;
+
+    /// Whether a step closed a row since the last call: released a row of the body whole, which
+    /// gives the row its final value.
+    fn take_closed_row(&mut self) -> bool {
+        false
+    }
+}
+
+/// Announce a step through `cycle`, then deliver the scheduler's queued wakeups, the ones the
+/// announcement deferred among them. A notification that re-enters a consumer it is passing
+/// through waits for the scheduler's next drain, which a store stepping itself does not reach, and
+/// a nested loop's cycle closes through such a consumer: its store's read feeds the body around
+/// it.
+fn announce(cycle: &Cycle, wakeups: &WakeupQueue) {
+    cycle.announce();
+    wakeups.deliver();
+}
+
+/// Step `store` until its input has released `guard`. Before each step the store announces it to
+/// the operators inside its cycle, which no scheduler wakes while the store steps itself, and
+/// after it publishes the snapshot a re-entrant pull reads. The first consume makes the store
+/// consuming with a step, so a pull answers from the snapshot from then on, whatever the morsel
+/// names.
+///
+/// # Panics
+///
+/// For a store that is no cyclic fan-out's input, which no step can announce or publish, and for
+/// a step that changes neither the store nor its input's release: the positions `guard` names
+/// have not arrived, and a store is queued a morsel only once its input can release it.
+fn consume_store<S: SteppedStore>(store: &mut S, guard: TileGuard) {
+    let cycle = store.breaker().cycle.clone().unwrap_or_else(|| {
+        panic!(
+            "{} steps itself only as its cyclic fan-out's input",
+            S::STORE
+        )
+    });
+    let step = |store: &mut S| {
+        announce(&cycle, store.wakeups());
+        // A step reads the store's inputs as a pull would, and no pull of the store clears its
+        // gate while it steps itself: a read of it through the recurrence is answered from the
+        // snapshot.
+        store.base().clear_gate();
+        let tile = store.step_store();
+        cycle.publish(&tile);
+        // A reader in pull mode outside the cycle, such as the loop around a nested one, reads a
+        // row's final value, so it learns of a step that closed a row from a wakeup the next
+        // announcement delivers, before anything pulls it again.
+        match store.take_closed_row() {
+            true => store.notifier().notify_if_changed(tile),
+            false => tile,
+        }
+    };
+    if !store.breaker().consuming {
+        // Consuming from before the first step, which a step reads: a consuming nested store
+        // releases its body by whole rows too, from its first step on.
+        store.breaker_mut().consuming = true;
+        let tile = step(store);
+        store.breaker_mut().snapshot = Some(tile);
+    }
+    loop {
+        let released = store.input_released();
+        if guard_minus(&guard, &released).is_empty() {
+            return;
+        }
+        let tile = step(store);
+        let progressed =
+            store.breaker().snapshot.as_ref() != Some(&tile) || store.input_released() != released;
+        assert!(
+            progressed,
+            "{} is consumed only for positions its input releases: {guard:?} names positions \
+             beyond {released:?}, which a step does not reach",
+            S::STORE
+        );
+        store.breaker_mut().snapshot = Some(tile);
+    }
+}
+
+/// Finish `store`'s epoch: push the store once it is terminal.
+///
+/// # Panics
+///
+/// At the run's last epoch, where the store is not terminal: nothing steps the store after it.
+fn finish_store<S: SteppedStore>(
+    store: &mut S,
+    pushes: &mut crate::interpreter::dispatcher::Pushes<'_>,
+    last: bool,
+) {
+    let state = store.breaker();
+    assert!(
+        !last || state.terminal(),
+        "{} finishes the run terminal: it stands at {:?}",
+        S::STORE,
+        state.snapshot.as_ref().and_then(store_frontier)
+    );
+    pushes.push_final(&*store);
+}
+
+impl SteppedStore for InductionStoreProducer {
+    const STORE: &'static str = "an induction store";
+
+    fn breaker(&self) -> &BreakerState {
+        &self.breaker
+    }
+
+    fn breaker_mut(&mut self) -> &mut BreakerState {
+        &mut self.breaker
+    }
+
+    fn step_store(&mut self) -> Tile {
+        self.step()
+    }
+
+    fn wakeups(&self) -> &WakeupQueue {
+        &self.notifier.wakeups
+    }
+
+    fn notifier(&mut self) -> &mut ChangeNotifier {
+        &mut self.notifier
+    }
+
+    fn take_closed_row(&mut self) -> bool {
+        std::mem::take(&mut self.closed_row)
+    }
+}
+
+/// An induction store driven as a pipeline breaker: its input is the body, its decision stream.
+/// A loop's scope runs one round of the pipelines inside its cycle per position and then consumes
+/// the position, which one step releases. A loop nested in another runs as a scope inside the
+/// scope of the loop around it, which queues it one row of its store per round: its rounds
+/// consume the row's positions, and a round at the row closes it
+/// (`src/interpreter/design-operators.md`, "A loop in rounds").
+impl Breaker for InductionStoreProducer {
+    /// Steps the store until the body has released `guard` ([`consume_store`]).
+    ///
+    /// # Panics
+    ///
+    /// As [`consume_store`].
+    fn consume_impl(&mut self, guard: TileGuard) {
+        consume_store(self, guard);
+    }
+
+    fn input_tiling(&self) -> Tiling {
+        self.body_producer.tiling().clone()
+    }
+
+    fn input_released(&self) -> TileGuard {
+        self.body_producer.obsolete_guard().clone()
+    }
+
+    fn as_producer(&self) -> Option<&dyn BreakingProducer> {
+        Some(self)
+    }
+
+    /// As [`finish_store`].
+    fn finish(&mut self, pushes: &mut crate::interpreter::dispatcher::Pushes<'_>, last: bool) {
+        finish_store(self, pushes, last);
+    }
+}
+
+impl BreakingProducer for InductionStoreProducer {
+    fn held(&self) -> TileGuard {
+        self.breaker.held(self.tiling())
+    }
+
+    /// What the store holds. A release of a store with no rows above it names the positions a
+    /// reader reads no more and removes nothing from the tile it reads; a nested store's offer
+    /// cuts the rows its readers released.
+    fn final_guard(&self) -> TileGuard {
+        self.held()
+    }
+
+    /// The store pushes once, at the finish where it is terminal.
+    fn pushes_while_consuming(&self) -> bool {
+        false
+    }
+
+    /// The snapshot of the last step. A nested store's readers release its rows as they finish
+    /// with them, and a step drops a released row, so a row released since the last step is
+    /// cut from the snapshot.
+    fn offer_impl(&mut self, _guard: TileGuard) -> Tile {
+        let mut tile = self.breaker.offer();
+        if matches!(self.engines, Engines::Rows(_)) && !self.base().obsolete_guard.is_empty() {
+            tile.remove_guarded(self.base().obsolete_guard.clone());
+        }
+        tile
+    }
+}
+
+/// The source of the transaction drive under `producer`, a writer of a transaction store: the
+/// collection the transaction iterates. The walk follows the writer's drive, through the fan-out
+/// slot the writer reads it through, to the drive's `source`.
+fn drive_source<R>(
+    producer: &dyn TileProducer,
+    f: &mut Option<impl FnOnce(&dyn TileProducer) -> R>,
+) -> Option<R> {
+    let mut found = None;
+    producer.visit_input_producers(&mut |role, input| {
+        if found.is_some() {
+            return;
+        }
+        found = match role {
+            "source" => f.take().map(|f| f(input)),
+            "driver" | "input" => drive_source(input, f),
+            _ => None,
+        };
+    });
+    found
+}
+
+impl CommitProducer {
+    /// Call `f` with the source of the store's one writer's drive, which the store consumes as a
+    /// pipeline breaker.
+    ///
+    /// # Panics
+    ///
+    /// For a store of any number of writers but one: a morsel names positions of one source.
+    fn writer_source<R>(&self, f: impl FnOnce(&dyn TileProducer) -> R) -> R {
+        let [writer] = self.writer_producers.as_slice() else {
+            panic!(
+                "a transaction store of {} writers has no consuming mode: a morsel names positions \
+                 of one writer's source",
+                self.writer_producers.len()
+            )
+        };
+        drive_source(&**writer, &mut Some(f))
+            .expect("a transaction writer reads its drive, which reads a source")
+    }
+}
+
+impl SteppedStore for CommitProducer {
+    const STORE: &'static str = "a transaction store";
+
+    fn breaker(&self) -> &BreakerState {
+        &self.breaker
+    }
+
+    fn breaker_mut(&mut self) -> &mut BreakerState {
+        &mut self.breaker
+    }
+
+    fn step_store(&mut self) -> Tile {
+        self.drain()
+    }
+
+    fn wakeups(&self) -> &WakeupQueue {
+        &self.notifier.wakeups
+    }
+
+    fn notifier(&mut self) -> &mut ChangeNotifier {
+        &mut self.notifier
+    }
+}
+
+/// A transaction store driven as a pipeline breaker: its input is its one writer's source, and a
+/// morsel of it is a run of the transaction's items. The whole cycle, the store, the writer, its
+/// drive and its body, is one pipeline; the operators inside it stay in pull mode. A deny commits
+/// nothing and progresses through the source's release alone.
+impl Breaker for CommitProducer {
+    /// Drains the store until the writer's drive has released `guard` ([`consume_store`]).
+    ///
+    /// # Panics
+    ///
+    /// For a store of any number of writers but one ([`writer_source`](Self::writer_source)), and
+    /// as [`consume_store`].
+    fn consume_impl(&mut self, guard: TileGuard) {
+        consume_store(self, guard);
+    }
+
+    fn input_tiling(&self) -> Tiling {
+        self.writer_source(|source| source.tiling().clone())
+    }
+
+    fn input_released(&self) -> TileGuard {
+        self.writer_source(|source| source.obsolete_guard().clone())
+    }
+
+    fn as_producer(&self) -> Option<&dyn BreakingProducer> {
+        Some(self)
+    }
+
+    /// As [`finish_store`].
+    fn finish(&mut self, pushes: &mut crate::interpreter::dispatcher::Pushes<'_>, last: bool) {
+        finish_store(self, pushes, last);
+    }
+}
+
+impl BreakingProducer for CommitProducer {
+    fn held(&self) -> TileGuard {
+        self.breaker.held(self.tiling())
+    }
+
+    /// What the store holds, whatever its readers released.
+    fn final_guard(&self) -> TileGuard {
+        self.held()
+    }
+
+    /// The store pushes once, at the finish where it is terminal.
+    fn pushes_while_consuming(&self) -> bool {
+        false
+    }
+
+    fn offer_impl(&mut self, _guard: TileGuard) -> Tile {
+        self.breaker.offer()
+    }
 }
 
 /// A recurrence's engines, nested one node per collection level above the store.
@@ -1830,6 +2199,10 @@ impl TileOperator for CommitOperator {
             .into_iter()
             .map(|(key, mut op)| (key, subscribe_forwarding(&mut *op, &consumer, scheduler)))
             .collect();
+        // A writer is the store's input as a pipeline breaker, so it is subscribed behind an
+        // entry, as an induction store's body is: the entry stops every push from beneath before
+        // a planner places the store's pipeline.
+        let mut placements = Vec::new();
         let writer_producers = self
             .writer_inputs
             .iter()
@@ -1842,18 +2215,27 @@ impl TileOperator for CommitOperator {
                          being subscribed twice (the first subscribe takes the slot)"
                     )
                 });
-                subscribe_forwarding(&mut *input, &consumer, scheduler)
+                let forward = forwarding_consumer(&consumer, &scheduler.wakeup_queue());
+                let (producer, placement) = subscribe_behind_entry(&mut *input, forward, scheduler);
+                placements.push(placement);
+                producer
             })
             .collect::<Vec<_>>();
         let n = writer_producers.len();
+        let base = ProducerBase::new(
+            CommitProducer::alloc_id(),
+            self.tiling(),
+            &self.base,
+            scheduler,
+        )
+        .sharing(gate);
+        // A store of one writer runs as a pipeline breaker, placed through its writer's entry.
+        let base = match placements.into_iter().next() {
+            Some(placement) if n == 1 => base.breaking(consumer.shared().clone(), placement),
+            _ => base,
+        };
         Box::new(CommitProducer {
-            base: ProducerBase::new(
-                CommitProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            )
-            .sharing(gate),
+            base,
             writer_producers,
             consumed: vec![0; n],
             writer_terminal: vec![false; n],
@@ -1864,6 +2246,7 @@ impl TileOperator for CommitOperator {
             output_tiling: self.tiling().clone(),
             drain_start: 0,
             notifier: ChangeNotifier::new(consumer, scheduler),
+            breaker: BreakerState::default(),
             #[cfg(debug_assertions)]
             reported_closed: HashSet::new(),
         })
@@ -1907,6 +2290,8 @@ struct CommitProducer {
     drain_start: usize,
     /// Wakes this store's readers when a pull changes what it answers.
     notifier: ChangeNotifier,
+    /// What the store keeps to run as a pipeline breaker.
+    breaker: BreakerState,
     /// Every key a render has reported in `closed_keys`, for the check that no commit
     /// writes one afterwards.
     #[cfg(debug_assertions)]
@@ -1980,9 +2365,31 @@ impl TileProducer for CommitProducer {
         &mut self.base
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        if self.breaker.consuming {
+            return self.offer_impl(projection_guard);
+        }
         let store = self.drain();
         self.notifier.notify_if_changed(store)
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        for writer in &mut self.writer_producers {
+            visit("writer", &mut **writer);
+        }
+        for (key, seed) in &mut self.seed_producers {
+            visit(&format!("seed {key}"), &mut **seed);
+        }
+    }
+
+    #[cfg(test)]
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        Some(self)
+    }
+
+    fn enter_cycle(&mut self, cycle: Cycle) {
+        self.breaker.enter_cycle(cycle);
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -2471,15 +2878,21 @@ impl TileOperator for InductionStore {
                  `body_input_setter` was never called, or this store is being subscribed \
                  twice (the first subscribe takes the slot)",
         );
-        let body_producer = subscribe_forwarding(&mut *body_op, &consumer, scheduler);
+        // The body is the store's input as a pipeline breaker: the entry in front of it queues
+        // what a pipeline beneath pushes for the store's pipeline once a planner places it, and
+        // stops every push before then.
+        let forward = forwarding_consumer(&consumer, &scheduler.wakeup_queue());
+        let (body_producer, placement) = subscribe_behind_entry(&mut *body_op, forward, scheduler);
         // A seed forwards, rather than being drained here: it is ordinary dataflow, so a
         // seed computed from a loop settles over as many pulls as that loop takes, and the
         // pull it settles on is the one that opens the store. Draining at subscribe
         // instead bounds a seed by how many positions its input can deliver before the
-        // runtime has started.
+        // runtime has started. The store reads a seed by pull at a step, so a push from a
+        // pipeline beneath the seed stops in front of it rather than climb to the store's
+        // readers.
         let seed_producers = std::mem::take(&mut self.seed_ops)
             .into_iter()
-            .map(|(key, mut op)| (key, subscribe_forwarding(&mut *op, &consumer, scheduler)))
+            .map(|(key, mut op)| (key, subscribe_pulled(&mut *op, &consumer, scheduler)))
             .collect();
         Box::new(InductionStoreProducer {
             base: ProducerBase::new(
@@ -2488,9 +2901,11 @@ impl TileOperator for InductionStore {
                 &self.base,
                 scheduler,
             )
-            .sharing(gate),
+            .sharing(gate)
+            .breaking(consumer.shared().clone(), placement),
             seed_producers,
             complete_rows: vec![Predicate::False; self.tiling().levels() + 1],
+            closed_row: false,
             // Each store holds its accumulators' seeds as its own, so the changelog is
             // self-describing: `read_as_of`/`store_value_at` fold to the seed below
             // the first change (a leading carry) without an external default. The
@@ -2505,6 +2920,7 @@ impl TileOperator for InductionStore {
             tap_fields: self.tap_fields.clone(),
             output_tiling: self.tiling().clone(),
             notifier: ChangeNotifier::new(consumer, scheduler),
+            breaker: BreakerState::default(),
             #[cfg(debug_assertions)]
             stepped_through: None,
         })
@@ -2554,6 +2970,9 @@ struct InductionStoreProducer {
     /// drive is what knows, from its source; the store carries it to the read. An induction store
     /// with no rows above it has the one entry — its positions.
     complete_rows: Vec<Predicate>,
+    /// Whether a step released a row of the body whole since the last consume step read it: the
+    /// row's final value is the store's news for its readers outside the cycle.
+    closed_row: bool,
     /// One engine per store, nested one level per collection level above it. An induction store
     /// with no rows above it is [`Engines::Store`]; a nested one is [`Engines::Rows`],
     /// each row holding its own seed and changelog rather than a share of one flat log.
@@ -2569,6 +2988,8 @@ struct InductionStoreProducer {
     /// The full-store output tiling — for a debug-time shape check on the rendered
     /// store tile.
     output_tiling: Tiling,
+    /// What the store keeps to run as a pipeline breaker.
+    breaker: BreakerState,
     /// The highest path this induction store has stepped, for the check that rows open in
     /// ascending path order and never reopen. Survives [`Engines::remove_covered`], which
     /// moves [`decided_path`](Self::decided_path) back when it drops the rows it names.
@@ -2724,37 +3145,11 @@ impl InductionStoreProducer {
         )
     }
 
-    /// This induction store's engines as a tile, each store `terminal` once the recurrence is final
-    /// (the accumulator can no longer change, so a downstream `StoreFinalRead` resolves).
-    ///
-    /// A store waiting for its seed contributes nothing: an undecided frontier, no change,
-    /// and no value before any position. That is what it holds, and it is what the driver
-    /// reads to know not to emit yet.
-    fn render_store(&self) -> Tile {
-        let store = render_engines(&self.engines, self.tiling(), &self.complete_rows);
-        debug_assert!(
-            store.check_from(&self.output_tiling),
-            "rendered induction store tile does not match the induction store's tiling"
-        );
-        store
-    }
-}
-
-impl TileProducer for InductionStoreProducer {
-    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
-        visit("body", &*self.body_producer);
-        for (key, seed) in &self.seed_producers {
-            visit(&format!("seed {key}"), &**seed);
-        }
-    }
-
-    fn state_info(&self) -> ProducerStateInfo {
-        ProducerStateInfo::holding(self.engines.held_values())
-    }
-
-    impl_producer_base!();
-
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    /// One step of the store: read the seeds and the body, open the rows and decide the
+    /// positions the body has decided, release what the store has consumed, and render the
+    /// store. A pull in pull mode is one step; a consume as a pipeline breaker makes as many as
+    /// its morsel takes.
+    fn step(&mut self) -> Tile {
         // Read the seeds before the body. A store opens the moment both its row and its
         // seed are known, and for the store at the empty path, an induction store with no rows
         // above it, the row is known from the start, so it opens here. It has to: the driver reads the
@@ -2818,7 +3213,7 @@ impl TileProducer for InductionStoreProducer {
         // has paths of one component, which is the whole of that statement at depth zero:
         // one store, at the empty path.
         let Tile::Scalar(union_col) = body_tile.deepest_values().clone() else {
-            return self.notifier.notify_if_changed(self.render_store());
+            return self.render_store();
         };
         for (path, idx) in decided_paths(&body_tile) {
             let Some((rows, inner)) = path.split_position() else {
@@ -2882,6 +3277,8 @@ impl TileProducer for InductionStoreProducer {
         // the body to the driver, which compacts its emitted window and releases
         // the loop source in turn — the whole reclamation chain, on ordinary
         // edges.
+        // A consuming nested store also releases its body by whole rows (below).
+        let by_rows = self.breaker.consuming && matches!(self.engines, Engines::Rows(_));
         if let Some(decided) = self.decided_path()
             && Some(&decided) != started_at.as_ref()
         {
@@ -2915,20 +3312,72 @@ impl TileProducer for InductionStoreProducer {
         // decode as a decision, so a terminal stream with an undecodable row and decisions
         // past it would close the frontier early and drop them without a sound. The check
         // reads paths, since an inner position repeats across rows; `decided_paths` is in
-        // drive order, so the first past the cursor is the lowest. It re-reads every
-        // decision, so it is compiled only where the assertion is.
-        #[cfg(debug_assertions)]
-        {
+        // drive order, so the first past the cursor is the lowest. It re-reads every decision,
+        // and runs on each step while the body is terminal and not yet released whole, which is
+        // one step once every decision is stepped.
+        //
+        // A terminal body whose every decision is stepped offers nothing more, so the store
+        // releases it whole. Its release through the decided path alone never names a position
+        // the loop's source filtered out, and a dispatcher's finish checks that the body has
+        // released every morsel the store consumed.
+        if body_tile.is_terminal() && !self.body_producer.obsolete_guard().is_universal() {
             let through = self.decided_path();
             let undecided = decided_paths(&body_tile)
                 .into_iter()
                 .map(|(path, _)| path)
                 .find(|path| through.as_ref().is_none_or(|d| path > d));
             debug_assert!(
-                !body_tile.is_terminal() || undecided.is_none(),
+                undecided.is_none(),
                 "induction store: the body's decision stream is terminal but still decides \
                  {undecided:?}, past the watermark {through:?}"
             );
+            if undecided.is_none() {
+                self.body_producer
+                    .release(self.body_producer.tiling().universal_guard());
+            }
+        }
+        // A consuming nested store releases whole each row the body calls complete, a row of no
+        // position among them, once it holds no decision the store has not stepped. A loop's
+        // scope closes a row by stepping the store until its body has released the row
+        // (`src/interpreter/design-operators.md`, "A loop in rounds"), and the release through
+        // the decided path names the row's positions only, not the keys past them.
+        if by_rows {
+            // A loop's scope queues this store rows of the level directly above its positions,
+            // and a scope around that one rows of a level above, so the release covers every
+            // level above the positions.
+            let through = self.decided_path();
+            let unstepped: Vec<Path> = decided_paths(&body_tile)
+                .into_iter()
+                .map(|(path, _)| path)
+                .filter(|path| through.as_ref().is_none_or(|decided| path > decided))
+                .collect();
+            let rows: Vec<TileGuard> = (0..self.complete_rows.len() - 1)
+                .filter_map(|level| {
+                    let complete = &self.complete_rows[level];
+                    debug_assert!(
+                        unstepped
+                            .iter()
+                            .all(|path| !complete.contains_path(&path[..=level])),
+                        "induction store: the body calls rows complete that still decide \
+                         positions past the watermark {through:?}: {unstepped:?}"
+                    );
+                    let rows = unstepped.iter().fold(complete.clone(), |rows, path| {
+                        match Projection::of_path(&path[..=level]) {
+                            Projection::Keys { keys, .. } => rows.minus(&keys),
+                            other => unreachable!("a path's projection names its keys: {other:?}"),
+                        }
+                    });
+                    (!rows.is_false()).then(|| {
+                        CurryLevel::new(level)
+                            .wrap_guard(TileGuard::Function(FunctionGuard::Domain(rows)))
+                    })
+                })
+                .collect();
+            if !rows.is_empty() {
+                let before = self.body_producer.obsolete_guard().clone();
+                self.body_producer.release(TileGuard::flatten_or(rows));
+                self.closed_row |= *self.body_producer.obsolete_guard() != before;
+            }
         }
         // A nested store's rows open as they are decided and release their seeds as they
         // go (`release_seeds_through`); the rest go once the body is done, since a row that
@@ -2939,7 +3388,77 @@ impl TileProducer for InductionStoreProducer {
                 producer.release(producer.tiling().universal_guard());
             }
         }
-        self.notifier.notify_if_changed(self.render_store())
+        self.render_store()
+    }
+
+    /// This induction store's engines as a tile, each store `terminal` once the recurrence is final
+    /// (the accumulator can no longer change, so a downstream `StoreFinalRead` resolves).
+    ///
+    /// A store waiting for its seed contributes nothing: an undecided frontier, no change,
+    /// and no value before any position. That is what it holds, and it is what the driver
+    /// reads to know not to emit yet.
+    fn render_store(&self) -> Tile {
+        let store = render_engines(&self.engines, self.tiling(), &self.complete_rows);
+        debug_assert!(
+            store.check_from(&self.output_tiling),
+            "rendered induction store tile does not match the induction store's tiling"
+        );
+        store
+    }
+}
+
+impl TileProducer for InductionStoreProducer {
+    fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
+        visit("body", &*self.body_producer);
+        for (key, seed) in &self.seed_producers {
+            visit(&format!("seed {key}"), &**seed);
+        }
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("body", &mut *self.body_producer);
+        for (key, seed) in &mut self.seed_producers {
+            visit(&format!("seed {key}"), &mut **seed);
+        }
+    }
+
+    fn state_info(&self) -> ProducerStateInfo {
+        ProducerStateInfo::holding(self.engines.held_values())
+    }
+
+    impl_producer_base!();
+
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        if self.breaker.consuming {
+            return self.offer_impl(projection_guard);
+        }
+        let store = self.step();
+        self.notifier.notify_if_changed(store)
+    }
+
+    #[cfg(test)]
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        Some(self)
+    }
+
+    #[cfg(test)]
+    fn runs_in_rounds(&self) -> bool {
+        true
+    }
+
+    #[cfg(test)]
+    fn announce_step(&self) {
+        let cycle = self
+            .breaker
+            .cycle
+            .as_ref()
+            .expect("an induction store announces a round as its cyclic fan-out's input");
+        announce(cycle, &self.notifier.wakeups);
+    }
+
+    fn enter_cycle(&mut self, cycle: Cycle) {
+        self.breaker.enter_cycle(cycle);
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -4803,11 +5322,43 @@ struct DriverInputs {
     consumer: GatedConsumer,
     /// The gate on `consumer`, for the drive's producer to clear on every pull.
     gate: Gate,
+    /// The placement of the entry in front of the source, which a planner sets where the drive
+    /// is a pipeline breaker ([`InductionDriverProducer`]).
+    placement: crate::interpreter::dispatcher::Placement,
     store_producer: Box<dyn TileProducer>,
     source_producer: Box<dyn TileProducer>,
     /// Set by every notification the source sends, for a driver that pulls the source
     /// only when it has news ([`InductionDriverProducer`], [`TransactDriverProducer`]).
     source_news: Notified,
+}
+
+/// `op` subscribed in front of `consumer` behind an entry no planner places: an input its
+/// producer reads only by pull, as a store reads its seed at a step, so a push from a pipeline
+/// beneath it stops there and notifications pass on.
+fn subscribe_pulled(
+    op: &mut dyn TileOperator,
+    consumer: &GatedConsumer,
+    scheduler: &mut Scheduler,
+) -> Box<dyn TileProducer> {
+    let forward = forwarding_consumer(consumer, &scheduler.wakeup_queue());
+    subscribe_behind_entry(op, forward, scheduler).0
+}
+
+/// `op` subscribed whole in front of `consumer` behind an unplaced entry
+/// ([`Entry::unplaced`](crate::interpreter::dispatcher::Entry::unplaced)), and the entry's
+/// placement, which a planner sets to place it in a pipeline.
+fn subscribe_behind_entry(
+    op: &mut dyn TileOperator,
+    consumer: Box<dyn Consumer>,
+    scheduler: &mut Scheduler,
+) -> (
+    Box<dyn TileProducer>,
+    crate::interpreter::dispatcher::Placement,
+) {
+    let (entry, placement) =
+        crate::interpreter::dispatcher::Entry::unplaced(op.tiling().clone(), consumer);
+    let producer = op.subscribe(op.tiling().universal_guard(), Box::new(entry), scheduler);
+    (producer, placement)
 }
 
 fn subscribe_driver_inputs(
@@ -4820,11 +5371,12 @@ fn subscribe_driver_inputs(
     // The flag is set ahead of the forward, which drops a notification that re-enters a
     // consumer behind a closed gate: the flag records every arrival the gate hides.
     let source_news = Notified::flag();
-    let source_producer = source_op.subscribe(
-        source_op.tiling().universal_guard(),
-        source_news.consumer(forwarding_consumer(&consumer, &scheduler.wakeup_queue())),
-        scheduler,
-    );
+    // An unplaced entry stops a push from a pipeline beneath the source, since a drive reads its
+    // source by pull. A loop's scope places it for its rounds, where an induction drive takes the
+    // positions it emits as a pipeline breaker's packages, and the pipelines beneath the source
+    // have finished.
+    let forward = source_news.consumer(forwarding_consumer(&consumer, &scheduler.wakeup_queue()));
+    let (source_producer, placement) = subscribe_behind_entry(source_op, forward, scheduler);
     // The store's progress changes what the drive renders — the next position it may
     // emit, and which rows it calls complete — so the store's wakes reach the drive's
     // consumer like the source's arrivals do.
@@ -4832,6 +5384,7 @@ fn subscribe_driver_inputs(
     DriverInputs {
         consumer,
         gate,
+        placement,
         store_producer,
         source_producer,
         source_news,
@@ -5052,13 +5605,14 @@ impl TileOperator for InductionDriver {
         let consumer = inputs.consumer;
         let nested = self.nested.as_mut().map(|n| NestedDrive {
             body: n.body.clone(),
-            pairs: subscribe_forwarding(&mut *n.pairs, &consumer, scheduler),
+            pairs: subscribe_pulled(&mut *n.pairs, &consumer, scheduler),
             reseeds: n
                 .reseeds
                 .iter_mut()
-                .map(|op| subscribe_forwarding(&mut **op, &consumer, scheduler))
+                .map(|op| subscribe_pulled(&mut **op, &consumer, scheduler))
                 .collect(),
         });
+        let rendered = self.tiling().empty_tile();
         Box::new(InductionDriverProducer {
             base: ProducerBase::new(
                 InductionDriverProducer::alloc_id(),
@@ -5066,7 +5620,8 @@ impl TileOperator for InductionDriver {
                 &self.base,
                 scheduler,
             )
-            .sharing(inputs.gate),
+            .sharing(inputs.gate)
+            .breaking(consumer.shared().clone(), inputs.placement),
             store_producer: inputs.store_producer,
             source_producer: inputs.source_producer,
             source_news: inputs.source_news,
@@ -5098,6 +5653,8 @@ impl TileOperator for InductionDriver {
             source_complete: Vec::new(),
             stated: Vec::new(),
             reseeded: None,
+            consuming: false,
+            rendered,
         })
     }
 }
@@ -5212,6 +5769,11 @@ struct InductionDriverProducer {
     /// store's frontier enters that row, for the check that the reseed is the store's seed
     /// there. Checked once per row, so it costs a seed read per row.
     reseeded: Option<(Path, Vec<Value>)>,
+    /// Whether a dispatcher drives the drive as a pipeline breaker, from its first consume; a
+    /// pull then answers from [`rendered`](Self::rendered) and emits nothing.
+    consuming: bool,
+    /// What the last consume rendered.
+    rendered: Tile,
 }
 
 impl InductionDriverProducer {
@@ -5315,13 +5877,119 @@ impl TileProducer for InductionDriverProducer {
         }
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("store", &mut *self.store_producer);
+        visit("source", &mut *self.source_producer);
+        if let Some(nested) = &mut self.nested {
+            visit("pairs", &mut *nested.pairs);
+            for reseed in &mut nested.reseeds {
+                visit("reseed", &mut **reseed);
+            }
+        }
+    }
+
     fn state_info(&self) -> ProducerStateInfo {
         ProducerStateInfo::holding(self.window.held_values())
     }
 
     impl_producer_base!();
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    #[cfg(test)]
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        Some(self)
+    }
+
+    /// A loop run in rounds asks it for one position's path, at the level of the position.
+    fn restates(&self) -> Restates {
+        Restates::Every
+    }
+
+    /// A step reads its source, the store and the nested inputs whole, whatever a round asks.
+    fn input_level(&self, _role: &str, _level: CurryLevel) -> Option<CurryLevel> {
+        None
+    }
+
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        if self.consuming {
+            return self.offer_impl(projection_guard);
+        }
+        self.step(&Projection::Everything)
+    }
+
+    #[cfg(test)]
+    fn next_position(&self) -> Option<Option<Vec<Value>>> {
+        let next = self
+            .source
+            .next_delivered(self.emitted_through.as_ref())
+            .map(|path| path.to_vec());
+        Some(next)
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        // Retention only: this driver's cursor is the store's frontier, so a
+        // release says nothing about progress — it only reclaims rows the body
+        // has consumed and the store has decided.
+        self.window.reclaim(&obsolete_guard);
+    }
+}
+
+/// The drive of a loop run in rounds is the pipeline breaker a round starts: a package names
+/// the position the round runs, the next its source delivers, and a consume emits it where the
+/// store has decided the position before it. A pull in pull mode emits the next position once
+/// the store has decided the one before. See `src/interpreter/design-operators.md`, "A loop in
+/// rounds".
+impl Breaker for InductionDriverProducer {
+    /// One step at `guard`, emitting a position only inside the region it names: a drive with
+    /// rows above it is asked for a path of every level.
+    fn consume_impl(&mut self, guard: TileGuard) {
+        self.consuming = true;
+        let asked = guard.projection_for(self);
+        // A consume at no position is a loop's scope asking the drive to read its source: the
+        // source of a loop nested in another is read through pipelines of the scope around it,
+        // which take their packages by the dispatcher and notify no one.
+        if asked == Projection::Nothing {
+            self.source_news.mark();
+        }
+        self.rendered = self.step(&asked);
+    }
+
+    /// The source's tiling, which the entry in front of the source and the drive's release of the
+    /// source are of. A package names one position's path, or nothing.
+    fn input_tiling(&self) -> Tiling {
+        self.source_producer.tiling().clone()
+    }
+
+    /// What the drive has released of its source: every position it has emitted or read past.
+    fn input_released(&self) -> TileGuard {
+        self.source_producer.obsolete_guard().clone()
+    }
+
+    fn as_producer(&self) -> Option<&dyn BreakingProducer> {
+        Some(self)
+    }
+}
+
+impl BreakingProducer for InductionDriverProducer {
+    /// The region the last step's rendering states.
+    fn held(&self) -> TileGuard {
+        self.rendered.to_guard()
+    }
+
+    fn offer_impl(&mut self, guard: TileGuard) -> Tile {
+        let projection = guard.projection_for(self);
+        let mut tile = self.rendered.clone();
+        tile.remove_guarded(self.base().obsolete_guard.clone());
+        tile.restrict_to(&projection, self.tiling());
+        tile
+    }
+}
+
+impl InductionDriverProducer {
+    /// One step of the drive: read the source where it has news, the store and the nested
+    /// inputs, emit the next position where `asked` names it and the store has decided the one
+    /// before, release what the store has consumed, and render the body's input.
+    fn step(&mut self, asked: &Projection) -> Tile {
         // The driver is over once it has universally released the source: pulling it
         // again would break that release's promise, and every position has already
         // been emitted, so the live window is the whole remaining answer. The driver
@@ -5472,12 +6140,22 @@ impl TileProducer for InductionDriverProducer {
         let settled = (0..=levels_above)
             .map(|level| source_complete_at(CurryLevel::new(level)).descend(levels_above - level))
             .fold(Predicate::False, |all, level| all.union(&level));
+        // A position is emitted only inside the region `asked` names, keys of the positions' own
+        // level read on the position's path. Pull mode asks for everything; a loop run in rounds
+        // asks for one position per round, and a round at a row of a nested loop emits none.
         let mut emitted_now = false;
         if frontier == self.emitted_through
             && let Some(pos) = self
                 .source
                 .next_delivered(self.emitted_through.as_ref())
                 .cloned()
+            && match asked {
+                Projection::Everything => true,
+                Projection::Nothing => false,
+                Projection::Keys { level, keys } => {
+                    level.index() + 1 == pos.len() && keys.contains_path(&pos)
+                }
+            }
         {
             // **The reseed.** A position whose enclosing components differ from the last
             // one emitted opens a new row, so the accumulator restarts where that row's
@@ -5624,7 +6302,8 @@ impl TileProducer for InductionDriverProducer {
                 .iter()
                 .zip(&stated)
                 .any(|(was, now)| !was.subsumes(now));
-        if emitted_now || states_more {
+        // A consuming drive wakes no one: its readers learn of a position from its push.
+        if (emitted_now || states_more) && !self.consuming {
             self.wakeups.request(self.consumer.shared().clone());
         }
         self.stated = stated;
@@ -5644,14 +6323,26 @@ impl TileProducer for InductionDriverProducer {
             })
             .cloned();
         self.reclaim_consumed(frontier.as_ref(), read_through, done);
+        // A row the drive calls complete has every position emitted and decided, so the drive reads
+        // no more of it and releases it from its source whole, in pull mode as when consuming. A
+        // loop's scope closes a row of a nested loop by a round at the row
+        // (`src/interpreter/design-operators.md`, "A loop in rounds").
+        let rows: Vec<TileGuard> = complete_rows
+            .iter()
+            .enumerate()
+            .filter(|(_, rows)| !rows.is_false())
+            .map(|(level, rows)| {
+                CurryLevel::new(level)
+                    .wrap_guard(TileGuard::Function(FunctionGuard::Domain(rows.clone())))
+            })
+            .collect();
+        if !rows.is_empty() {
+            let rows = TileGuard::flatten_or(rows);
+            if !guard_minus(&rows, self.source_producer.obsolete_guard()).is_empty() {
+                self.source_producer.release(rows);
+            }
+        }
         self.render(done, &complete_rows)
-    }
-
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        // Retention only: this driver's cursor is the store's frontier, so a
-        // release says nothing about progress — it only reclaims rows the body
-        // has consumed and the store has decided.
-        self.window.reclaim(&obsolete_guard);
     }
 }
 
@@ -5921,6 +6612,12 @@ impl TileProducer for TransactDriverProducer {
         visit("source", &*self.source_producer);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("store", &mut *self.store_producer);
+        visit("source", &mut *self.source_producer);
+    }
+
     fn state_info(&self) -> ProducerStateInfo {
         ProducerStateInfo::holding(self.window.held_values())
     }
@@ -5935,7 +6632,8 @@ impl TileProducer for TransactDriverProducer {
         // releases a prefix — `release_impl` withdraws each item as it finishes — which is why
         // an item is named by its domain position rather than by a column index. Without the
         // cache each pull decodes and sorts every item not yet released.
-        if self.source_news.take() {
+        // A source released whole is not pulled again: the release promised it nothing more.
+        if self.source_news.take() && !self.source_producer.obsolete_guard().is_universal() {
             let src = self
                 .source_producer
                 .get(self.source_producer.tiling().universal_guard());
@@ -6029,6 +6727,13 @@ impl TileProducer for TransactDriverProducer {
         // window that is momentarily empty over an incomplete source stays
         // non-terminal — the drained-but-live case.
         let done = source_complete && next_item.is_none();
+        // A done drive reads nothing more of its source: every item has finished and the source
+        // can deliver no more. It releases the source whole, as an induction drive does, rather
+        // than through the last finished item, which names positions and not the source.
+        if done && !self.source_producer.obsolete_guard().is_universal() {
+            self.source_producer
+                .release(self.source_producer.tiling().universal_guard());
+        }
         // Re-arm while a transaction remains to attempt. It covers every
         // continuation uniformly: an attempt awaiting its commit-ack, a retry
         // waiting for the frontier to move, and the first pull of all — where the
@@ -6761,6 +7466,13 @@ impl TileProducer for TransactWriterProducer {
         visit("store", &*self.store_producer);
         visit("body", &*self.body_producer);
         visit("driver", &*self.driver_producer);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("store", &mut *self.store_producer);
+        visit("body", &mut *self.body_producer);
+        visit("driver", &mut *self.driver_producer);
     }
 
     fn state_info(&self) -> ProducerStateInfo {

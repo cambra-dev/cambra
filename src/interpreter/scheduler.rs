@@ -300,6 +300,19 @@ impl WakeupQueue {
         queued.push(consumer);
     }
 
+    /// Notify every queued consumer of `Everything`, outside the cascade that queued it, and say
+    /// whether one was queued: a [`Scheduler::deliver`] does so, and so does a store stepping
+    /// itself as a pipeline breaker after it announces a step, since no scheduler runs then. A
+    /// request made during the drain waits for the next one ([`take`](Self::take)).
+    pub(crate) fn deliver(&self) -> bool {
+        let mut delivered = false;
+        for consumer in self.take() {
+            consumer.borrow_mut().notify(&Projection::Everything);
+            delivered = true;
+        }
+        delivered
+    }
+
     /// Take the currently-queued wakeups, leaving the queue empty. A wakeup
     /// fired during the drain may enqueue a fresh request (a still-converging
     /// producer re-arming); that lands in the now-empty queue and is delivered
@@ -482,11 +495,7 @@ other's subscribers",
             delivered = true;
         }
         // Take the queue after source delivery, outside its notification cascades.
-        // Requests created while this snapshot drains remain queued for the next drain.
-        for consumer in self.wakeups.take() {
-            consumer.borrow_mut().notify(&Projection::Everything);
-            delivered = true;
-        }
+        delivered |= self.wakeups.deliver();
         // Then pull every sink the wakes above reached, once each, so a change reaches a
         // sink in the call that delivers it.
         for pull in self.sink_pulls.take() {

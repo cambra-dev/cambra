@@ -38,6 +38,10 @@ struct FanOutReentrancy {
     /// particular) already return cumulative tiles, so each non-reentrant
     /// pull supplants the previous cache rather than appending to it.
     cached_tile: Tile,
+    /// Set while the store announces a step to the operators inside its cycle
+    /// ([`Cycle::announce`]), so the announcement's echo, which comes back round the cycle to
+    /// the fan-out's input consumer, stops there and passes no gate.
+    announcing: bool,
     /// Re-entrancy guard for the inner subscribe path.  `FanOutSlot::subscribe`
     /// of one slot can transitively trigger `subscribe` on a sibling
     /// (e.g. an induction loop's drive subscribes to its store slot while
@@ -56,12 +60,7 @@ struct FanOutShared {
     /// Instance ID shared by all [`FanOutProducer`]s from the same fan-out group.
     id: usize,
     /// Inner producer, set on the first [`FanOutSlot::subscribe`] call.
-    ///
-    /// In cyclic mode (see [`FanOutReentrancy`]), this is also **taken out**
-    /// during the inner pull in `FanOutProducer::get_impl` so that
-    /// re-entrant calls from cyclic op graphs can detect re-entrance by
-    /// finding `None` and fall back to the cached tile.
-    producer: Option<Box<dyn TileProducer>>,
+    producer: Option<Inner>,
     /// Every consumer registered via [`FanOutSlot::subscribe`], in order.
     ///
     /// Stored as `Rc<RefCell<...>>` so that the notification closure can clone the
@@ -72,6 +71,10 @@ struct FanOutShared {
     consumers: Vec<Rc<RefCell<Box<dyn Consumer>>>>,
     /// Per-subscriber release guards; intersected before passing upstream.
     release_guards: Vec<TileGuard>,
+    /// Whether each subscriber reads through a [`recurrence_slot`](FanOut::recurrence_slot),
+    /// parallel to [`consumers`](Self::consumers): an operator inside the store's cycle, which
+    /// a step's announcement reaches and a push skips.
+    recurrence: Vec<bool>,
     /// What every subscriber had agreed to release the last time one released,
     /// and so what this fan-out has already passed upstream.
     ///
@@ -167,6 +170,7 @@ impl FanOutShared {
         retain_flagged(&mut self.subscribers, &keep);
         retain_flagged(&mut self.consumers, &keep);
         retain_flagged(&mut self.release_guards, &keep);
+        retain_flagged(&mut self.recurrence, &keep);
         debug_assert_eq!(
             self.consumers.len(),
             self.subscribers.len(),
@@ -177,6 +181,104 @@ impl FanOutShared {
             self.subscribers.len(),
             "release guards stay parallel to subscribers"
         );
+    }
+}
+
+/// A fan-out's input producer, as [`FanOutShared::producer`] holds it.
+enum Inner {
+    /// An ordinary fan-out's input, which a slot pulls under the fan-out's shared state.
+    Owned(Box<dyn TileProducer>),
+    /// A cyclic fan-out's input, a store, in a cell of its own. A slot pulls it under that
+    /// cell's borrow alone, with the fan-out's shared state free, so a pull that re-enters
+    /// through the store's recurrence finds the cell borrowed and is answered from the snapshot,
+    /// and the store can publish its snapshot and announce its steps through the shared state
+    /// while it steps itself ([`Cycle`]).
+    // shared-state-ok: a cyclic fan-out's input producer, held apart from the fan-out's state
+    // so the two borrow separately; what crosses it is the producer, never a tile passed
+    // between operators.
+    Store(Rc<RefCell<Box<dyn TileProducer>>>),
+}
+
+/// The cell a cyclic fan-out holds its store in ([`Inner::Store`]), which a test reaches.
+#[cfg(test)]
+pub(crate) type StoreCell = Rc<RefCell<Box<dyn TileProducer>>>;
+
+/// A cyclic fan-out as a reader slot of it names it to a test driver
+/// (`TileProducer::store_read`).
+#[cfg(test)]
+pub struct StoreRead {
+    /// The fan-out's id, which every slot's producer names.
+    pub(crate) fan: usize,
+    /// The store, the fan-out's input.
+    pub(crate) store: StoreCell,
+    /// The producers registered with a data source inside the store's chain
+    /// ([`FanOut::source_producers`]).
+    pub(crate) sources: Vec<String>,
+}
+
+/// A store's handle on the cyclic fan-out whose input it is ([`TileProducer::enter_cycle`]).
+/// It does what a pull of the fan-out does around the store's own step: it publishes the snapshot
+/// a re-entrant pull is answered from, and before a step it notifies the operators inside the
+/// cycle of a snapshot they have not read, which no scheduler delivers while a store steps
+/// itself.
+#[derive(Clone)]
+pub struct Cycle {
+    shared: Weak<RefCell<FanOutShared>>,
+}
+
+impl Cycle {
+    /// Make `tile` the snapshot a re-entrant pull of the fan-out is answered from, as a
+    /// completed pull of the store does.
+    pub(crate) fn publish(&self, tile: &Tile) {
+        let shared = self.shared.upgrade().expect(DEAD_RECURRENCE);
+        shared
+            .borrow_mut()
+            .reentrancy
+            .as_mut()
+            .expect("a store's fan-out is cyclic")
+            .cached_tile = tile.clone();
+    }
+
+    /// Notify every live subscriber that reads through a recurrence slot, the operators inside
+    /// the store's cycle, of `Everything`. The notification travels round the cycle and closes
+    /// the gates it passes; the step's pull reopens them. Its echo stops at the fan-out's input
+    /// consumer, so no reader outside the cycle hears of it.
+    pub(crate) fn announce(&self) {
+        let shared_rc = self.shared.upgrade().expect(DEAD_RECURRENCE);
+        let consumers = {
+            let mut shared = shared_rc.borrow_mut();
+            let re = shared
+                .reentrancy
+                .as_mut()
+                .expect("a store's fan-out is cyclic");
+            debug_assert!(
+                !re.announcing,
+                "a store announces one step at a time: its step runs after the announcement"
+            );
+            re.announcing = true;
+            shared
+                .live_indices()
+                .filter(|&i| shared.recurrence[i])
+                .map(|i| shared.consumers[i].clone())
+                .collect::<Vec<_>>()
+        };
+        // Cleared on every way out, a notification that panics included, so a later
+        // notification is not taken for an echo.
+        let _announced = Announced(&shared_rc);
+        for consumer in &consumers {
+            consumer.borrow_mut().notify(&Projection::Everything);
+        }
+    }
+}
+
+/// Clears [`FanOutReentrancy::announcing`] when an announcement ends.
+struct Announced<'a>(&'a Rc<RefCell<FanOutShared>>);
+
+impl Drop for Announced<'_> {
+    fn drop(&mut self) {
+        if let Some(re) = self.0.borrow_mut().reentrancy.as_mut() {
+            re.announcing = false;
+        }
     }
 }
 
@@ -204,6 +306,10 @@ impl Consumer for FanOutInput {
         };
         let consumers = {
             let shared = shared_rc.borrow();
+            // The echo of a store's announcement to its own cycle, which no reader asked for.
+            if shared.reentrancy.as_ref().is_some_and(|re| re.announcing) {
+                return;
+            }
             if !shared.admission.admits(arrived) {
                 return;
             }
@@ -217,8 +323,10 @@ impl Consumer for FanOutInput {
         }
     }
 
-    /// A push reaches every live slot's consumer, past the gate that holds back a second
+    /// A push reaches every live reader slot's consumer, past the gate that holds back a second
     /// notification, since every pushed region is a work package of a pipeline that reads a slot.
+    /// It skips a recurrence slot: the operators inside a store's cycle read the store in pull
+    /// mode, within its own pipeline.
     fn push(
         &mut self,
         region: &Projection,
@@ -231,6 +339,7 @@ impl Consumer for FanOutInput {
             let shared = shared_rc.borrow();
             shared
                 .live_indices()
+                .filter(|&i| !shared.recurrence[i])
                 .map(|i| shared.consumers[i].clone())
                 .collect::<Vec<_>>()
         };
@@ -256,28 +365,6 @@ impl<'a> Drop for SubscribingInnerGuard<'a> {
     fn drop(&mut self) {
         if let Some(re) = self.shared.borrow_mut().reentrancy.as_mut() {
             re.subscribing_inner = false;
-        }
-    }
-}
-
-/// RAII guard for the cyclic `FanOut`'s "producer taken out" pattern in
-/// `FanOutProducer::get_impl`.  Owns the temporarily-extracted inner
-/// producer and on `Drop` puts it back into `shared.producer`, so a
-/// panic from the inner `producer.get(...)` doesn't leave
-/// `shared.producer = None` forever (which would break every later
-/// pull on this fan-out).
-struct TakenProducerGuard<'a> {
-    shared: &'a Rc<RefCell<FanOutShared>>,
-    /// Wrapped in `Option` so the destructor can `take()` the producer
-    /// and move it back into `shared` (you can't move out of `&mut self`
-    /// fields in `Drop`, but `Option::take` swaps the value).
-    producer: Option<Box<dyn TileProducer>>,
-}
-
-impl<'a> Drop for TakenProducerGuard<'a> {
-    fn drop(&mut self) {
-        if let Some(producer) = self.producer.take() {
-            self.shared.borrow_mut().producer = Some(producer);
         }
     }
 }
@@ -327,6 +414,7 @@ impl FanOut {
             input,
             Some(FanOutReentrancy {
                 cached_tile,
+                announcing: false,
                 subscribing_inner: false,
             }),
         )
@@ -342,6 +430,7 @@ impl FanOut {
             producer: None,
             consumers: Vec::new(),
             release_guards: Vec::new(),
+            recurrence: Vec::new(),
             released: tiling.empty_guard(),
             released_position: None,
             subscribers: Vec::new(),
@@ -421,6 +510,22 @@ impl FanOut {
             .reentrancy
             .as_ref()
             .map(|r| r.cached_tile.clone())
+    }
+
+    /// The id every slot's producer of this fan-out names.
+    #[cfg(test)]
+    pub(crate) fn id(&self) -> usize {
+        self.shared.borrow().id
+    }
+
+    /// A cyclic fan-out's store, which a test drives as a pipeline breaker. `None` for an
+    /// ordinary fan-out, and before the store is subscribed.
+    #[cfg(test)]
+    pub(crate) fn store(&self) -> Option<StoreCell> {
+        match &self.shared.borrow().producer {
+            Some(Inner::Store(cell)) => Some(cell.clone()),
+            _ => None,
+        }
     }
 
     /// Whether every subscriber has released everything this fan-out could
@@ -511,8 +616,8 @@ impl FanOut {
 /// means every retired version's operators are retained and the release
 /// records their producers hold are never handed back.
 ///
-/// Reading through a `Weak` is sound in that position because the read happens
-/// only while the fan-out is pulling the chain the reader is part of, so the
+/// Reading through a `Weak` is sound in that position because the read happens only while the
+/// fan-out's store is pulled or steps itself ([`Cycle`]), by a caller holding the fan-out, so the
 /// fan-out is alive for the whole of it.
 #[derive(Clone)]
 enum FanHold {
@@ -533,7 +638,7 @@ enum FanHold {
 
 /// Why a recurrence's `Weak` is always upgradable where it is read.
 const DEAD_RECURRENCE: &str = "a recurrence reads the fan-out whose input chain it sits in, and \
-     that read happens only while the fan-out is pulling that chain";
+     that read happens only while the fan-out's store is pulled or steps itself";
 
 impl FanHold {
     fn shared(&self) -> Rc<RefCell<FanOutShared>> {
@@ -629,6 +734,9 @@ impl TileOperator for FanOutSlot {
             shared.consumers.push(Rc::new(RefCell::new(consumer)));
             let carried = shared.released.clone();
             shared.release_guards.push(carried);
+            shared
+                .recurrence
+                .push(matches!(self.hold, FanHold::Recurrence { .. }));
             shared.subscribers.push(Rc::downgrade(&slot));
         } // borrow released here before we might call input.subscribe
 
@@ -677,9 +785,21 @@ impl TileOperator for FanOutSlot {
             );
             let producers = scheduler.end_source_producers();
             let mut shared = shared_rc.borrow_mut();
-            shared.producer = Some(inner);
+            let (held, cell) = match shared.reentrancy.is_some() {
+                true => {
+                    let cell = Rc::new(RefCell::new(inner));
+                    (Inner::Store(cell.clone()), Some(cell))
+                }
+                false => (Inner::Owned(inner), None),
+            };
+            shared.producer = Some(held);
             shared.source_producers = producers;
             drop(shared);
+            if let Some(cell) = cell {
+                cell.borrow_mut().enter_cycle(Cycle {
+                    shared: Rc::downgrade(&shared_rc),
+                });
+            }
             // `_guard` drops here, resetting `subscribing_inner`.
         }
 
@@ -743,24 +863,66 @@ impl TileProducer for FanOutProducer {
             FanHold::Reader { shared, .. } => Some(shared.clone()),
             FanHold::Recurrence { shared, .. } => shared.upgrade(),
         };
-        if let Some(shared) = shared
-            && let Ok(shared) = shared.try_borrow()
-            && let Some(input) = &shared.producer
-        {
-            visit("input", &**input);
+        let Some(shared) = shared else {
+            return;
+        };
+        let Ok(shared) = shared.try_borrow() else {
+            return;
+        };
+        match &shared.producer {
+            Some(Inner::Owned(input)) => visit("input", &**input),
+            Some(Inner::Store(cell)) => {
+                if let Ok(input) = cell.try_borrow() {
+                    visit("input", &**input);
+                }
+            }
+            None => {}
         }
     }
 
     /// A reader slot visits its fan-out's input. A recurrence slot visits nothing: it sits in a
-    /// store's cycle, beneath the store's reader slot, and the walk refuses a store
-    /// (`dispatcher::store_of`).
+    /// store's cycle, and the walk reaches the store through a reader slot
+    /// (`TileProducer::store_read`).
     #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         let FanHold::Reader { shared, .. } = &self.hold else {
             return;
         };
-        if let Some(input) = &mut shared.borrow_mut().producer {
+        let cell = match &mut shared.borrow_mut().producer {
+            Some(Inner::Owned(input)) => {
+                visit("input", &mut **input);
+                return;
+            }
+            Some(Inner::Store(cell)) => cell.clone(),
+            None => return,
+        };
+        if let Ok(mut input) = cell.try_borrow_mut() {
             visit("input", &mut **input);
+        }
+    }
+
+    #[cfg(test)]
+    fn store_read(&self) -> Option<StoreRead> {
+        let FanHold::Reader { shared, .. } = &self.hold else {
+            return None;
+        };
+        let shared = shared.borrow();
+        shared.reentrancy.as_ref()?;
+        let Some(Inner::Store(store)) = &shared.producer else {
+            return None;
+        };
+        Some(StoreRead {
+            fan: shared.id,
+            store: store.clone(),
+            sources: shared.source_producers.clone(),
+        })
+    }
+
+    #[cfg(test)]
+    fn recurrence_of(&self) -> Option<usize> {
+        match &self.hold {
+            FanHold::Recurrence { shared, .. } => shared.upgrade().map(|shared| shared.borrow().id),
+            FanHold::Reader { .. } => None,
         }
     }
 
@@ -792,15 +954,21 @@ impl TileProducer for FanOutProducer {
                 0 => node,
                 held => node.with_held_values(held),
             };
-            node.child(
-                "input",
-                self.shared()
-                    .borrow()
-                    .producer
-                    .as_ref()
-                    .unwrap()
-                    .inspect(opts),
-            )
+            let shared = self.shared();
+            let shared = shared.borrow();
+            let input = match shared
+                .producer
+                .as_ref()
+                .expect("an inspected slot is subscribed")
+            {
+                Inner::Owned(input) => input.inspect(opts),
+                // A store stepping itself has its cell borrowed, and is drawn as a leaf then.
+                Inner::Store(cell) => match cell.try_borrow() {
+                    Ok(store) => store.inspect(opts),
+                    Err(_) => InspectNode::leaf("store, stepping".to_string()),
+                },
+            };
+            node.child("input", input)
         } else {
             InspectNode::leaf(format!("→ {}", self.name()))
         }
@@ -827,59 +995,50 @@ impl TileProducer for FanOutProducer {
             true => self.tiling().universal_guard(),
             false => projection.guard(self.tiling()),
         };
-        // In cyclic mode, take the inner producer out during the pull so
-        // sibling-slot re-entrance can detect re-entrance by finding
-        // `producer == None` and serve from the cached tile.  In
-        // non-cyclic mode, the producer stays in `shared` and we pull
-        // through a regular borrow.
-        let mut result = if cyclic {
-            let producer_opt = shared_rc.borrow_mut().producer.take();
-            if let Some(producer) = producer_opt {
-                // RAII: put the producer back into `shared` on any exit
-                // path (success or panic).  Without this guard, a panic
-                // from `producer.get(...)` would leave `shared.producer
-                // = None` forever, silently breaking every subsequent
-                // pull on this fan-out.
-                let mut guard = TakenProducerGuard {
-                    shared: &shared_rc,
-                    producer: Some(producer),
-                };
-                let tile = guard.producer.as_mut().unwrap().get(projection_guard);
-                trace!("{} received {tile:?}", self.name());
-                // Refresh the re-entrancy cache before the guard drops.
-                // We replace (not merge) — inner producers like `Memo`
-                // already return cumulative tiles, so each pull
-                // supplants the previous cached snapshot.
-                shared_rc
-                    .borrow_mut()
-                    .reentrancy
-                    .as_mut()
-                    .unwrap()
-                    .cached_tile = tile.clone();
-                tile
-                // `guard` drops here, restoring `shared.producer`.
-            } else {
-                // Re-entrant pull: another slot's outer `get_impl` is
-                // currently holding the producer.  Serve the latest known
-                // emission instead of re-entering the inner producer (which
-                // would alias `&mut`).
-                let cached = shared_rc
-                    .borrow()
-                    .reentrancy
-                    .as_ref()
-                    .unwrap()
-                    .cached_tile
-                    .clone();
-                trace!("{} serving cached (re-entrant): {cached:?}", self.name());
-                cached
-            }
-        } else {
-            shared_rc
+        // A cyclic fan-out's store is pulled under its own cell's borrow, with the shared state
+        // free. A sibling slot that re-enters mid-pull finds the cell borrowed and is served the
+        // latest snapshot instead of re-entering the store, which would alias `&mut`; so is a
+        // pull while the store steps itself as a pipeline breaker.
+        let store = match &shared_rc.borrow().producer {
+            Some(Inner::Store(cell)) => Some(cell.clone()),
+            _ => None,
+        };
+        let mut result = match store {
+            Some(cell) => match cell.try_borrow_mut() {
+                Ok(mut producer) => {
+                    let tile = producer.get(projection_guard);
+                    trace!("{} received {tile:?}", self.name());
+                    // Replace, not merge: inner producers like `Memo` already return cumulative
+                    // tiles, so each pull supplants the previous snapshot.
+                    shared_rc
+                        .borrow_mut()
+                        .reentrancy
+                        .as_mut()
+                        .expect("a fan-out holding a store is cyclic")
+                        .cached_tile = tile.clone();
+                    tile
+                }
+                Err(_) => {
+                    let cached = shared_rc
+                        .borrow()
+                        .reentrancy
+                        .as_ref()
+                        .expect("a fan-out holding a store is cyclic")
+                        .cached_tile
+                        .clone();
+                    trace!("{} serving cached (re-entrant): {cached:?}", self.name());
+                    cached
+                }
+            },
+            None => match shared_rc
                 .borrow_mut()
                 .producer
                 .as_mut()
-                .unwrap()
-                .get(projection_guard)
+                .expect("a pulled slot is subscribed")
+            {
+                Inner::Owned(producer) => producer.get(projection_guard),
+                Inner::Store(_) => unreachable!("matched above"),
+            },
         };
 
         // Filter by the stored obsolete guard. Because upstream retains data according to the
@@ -940,17 +1099,22 @@ impl TileProducer for FanOutProducer {
             shared.released_position = shared.released_position.clone().max(Some(position));
         }
         shared.released = intersection.clone();
-        // In cyclic mode the inner producer can be temporarily taken out
-        // by a sibling-slot `get_impl`; skip the inner release in that
-        // case (the next non-reentrant release will recompute and
-        // forward).  Non-cyclic mode always has `producer = Some(_)`.
-        if let Some(producer) = shared.producer.as_mut() {
+        let cell = match shared
+            .producer
+            .as_mut()
+            .expect("a released slot is subscribed")
+        {
+            Inner::Owned(producer) => {
+                producer.release(intersection);
+                return;
+            }
+            Inner::Store(cell) => cell.clone(),
+        };
+        drop(shared);
+        // A store pulled or stepping right now has its cell borrowed; the inner release is
+        // skipped, and the next release recomputes the intersection and forwards it.
+        if let Ok(mut producer) = cell.try_borrow_mut() {
             producer.release(intersection);
-        } else {
-            debug_assert!(
-                shared.reentrancy.is_some(),
-                "non-cyclic FanOut's producer should never be absent during release"
-            );
         }
     }
 }
@@ -3256,5 +3420,234 @@ mod consuming_tests {
             }
             run.finish();
         }
+    }
+}
+
+/// A cyclic fan-out's store held in a cell of its own: a pull that re-enters it, a step's
+/// announcement to the cycle, and a push through the fan-out.
+#[cfg(test)]
+mod cycle_tests {
+    use super::*;
+    use crate::interpreter::dispatcher::{Entry, Landing, PipelineId};
+    use crate::interpreter::scheduler::SharedConsumer;
+    use crate::interpreter::tile_operators::Scheduler;
+    use crate::interpreter::tile_operators::test_helpers::RegionLog;
+    use crate::interpreter::{BaseType, ColumnValue, Extent};
+
+    fn ints() -> Tiling {
+        Tiling::Scalar(Extent::Base(BaseType::Int))
+    }
+
+    fn int(value: i64) -> Tile {
+        Tile::Scalar(ColumnValue::Ints(vec![value]))
+    }
+
+    /// What a test shares with a [`StoreDouble`]: the recurrence slot it reads, the consumer
+    /// that recurrence slot's subscription notifies, the cycle its fan-out hands it, the
+    /// consumer it was subscribed with, and what each of its pulls read of its recurrence.
+    #[derive(Default)]
+    struct Wiring {
+        recurrence: Option<Box<dyn TileOperator>>,
+        inside: Option<Box<dyn Consumer>>,
+        cycle: Option<Cycle>,
+        own: Option<SharedConsumer>,
+        read: Vec<Tile>,
+    }
+
+    // shared-state-ok: a test's handle on the double's wiring; no tile passes between
+    // operators through it.
+    type Wired = Rc<RefCell<Wiring>>;
+
+    /// A store that reads its own fan-out through a recurrence slot on every pull, as a store's
+    /// body reads its prior value, and answers `answer`.
+    struct StoreDouble {
+        base: OperatorBase,
+        wiring: Wired,
+        answer: Tile,
+    }
+
+    impl TileOperator for StoreDouble {
+        impl_operator_base!();
+
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+
+        fn subscribe(
+            &mut self,
+            intent_guard: TileGuard,
+            consumer: Box<dyn Consumer>,
+            scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            let own: SharedConsumer = Rc::new(RefCell::new(consumer));
+            let (mut recurrence, inside) = {
+                let mut wiring = self.wiring.borrow_mut();
+                wiring.own = Some(own);
+                (
+                    wiring
+                        .recurrence
+                        .take()
+                        .expect("a test wires the recurrence slot"),
+                    wiring
+                        .inside
+                        .take()
+                        .expect("a test wires the cycle's consumer"),
+                )
+            };
+            let recurrence = recurrence.subscribe(intent_guard, inside, scheduler);
+            Box::new(StoreDoubleProducer {
+                base: ProducerBase::new(
+                    StoreDoubleProducer::alloc_id(),
+                    self.tiling(),
+                    &self.base,
+                    scheduler,
+                ),
+                wiring: self.wiring.clone(),
+                recurrence,
+                answer: self.answer.clone(),
+            })
+        }
+    }
+
+    struct StoreDoubleProducer {
+        base: ProducerBase,
+        wiring: Wired,
+        recurrence: Box<dyn TileProducer>,
+        answer: Tile,
+    }
+
+    impl TileProducer for StoreDoubleProducer {
+        impl_producer_base!();
+
+        fn get_impl(&mut self, _guard: TileGuard) -> Tile {
+            let read = self
+                .recurrence
+                .get(self.recurrence.tiling().universal_guard());
+            self.wiring.borrow_mut().read.push(read);
+            self.answer.clone()
+        }
+
+        fn release_impl(&mut self, _guard: TileGuard) {}
+
+        fn enter_cycle(&mut self, cycle: Cycle) {
+            self.wiring.borrow_mut().cycle = Some(cycle);
+        }
+    }
+
+    /// A cyclic fan-out over a [`StoreDouble`] answering `answer`, whose recurrence slot's
+    /// subscription notifies the consumer `inside` builds from the wiring.
+    fn cyclic(answer: Tile, inside: impl FnOnce(&Wired) -> Box<dyn Consumer>) -> (FanOut, Wired) {
+        let wiring = Wired::default();
+        let fan = FanOut::new_cyclic(Box::new(StoreDouble {
+            base: OperatorBase::new(ints()),
+            wiring: wiring.clone(),
+            answer,
+        }));
+        let consumer = inside(&wiring);
+        {
+            let mut wired = wiring.borrow_mut();
+            wired.recurrence = Some(fan.recurrence_slot());
+            wired.inside = Some(consumer);
+        }
+        (fan, wiring)
+    }
+
+    fn cycle_of(wiring: &Wired) -> Cycle {
+        let cycle = wiring.borrow_mut().cycle.take();
+        cycle.expect("the fan-out hands its store a cycle when the store is subscribed")
+    }
+
+    /// A pull of the store reads its recurrence slot, which finds the store's cell borrowed and
+    /// is answered the snapshot the store published; the completed pull then replaces it.
+    #[test]
+    fn a_pull_that_re_enters_the_store_reads_the_published_snapshot() {
+        let (fan, wiring) = cyclic(int(2), |_| Box::new(|| {}));
+        let mut scheduler = Scheduler::new();
+        let mut reader =
+            fan.slot()
+                .subscribe(ints().universal_guard(), Box::new(|| {}), &mut scheduler);
+        cycle_of(&wiring).publish(&int(1));
+        assert_eq!(reader.get(ints().universal_guard()), int(2));
+        assert_eq!(wiring.borrow().read, vec![int(1)]);
+        assert_eq!(fan.cached_tile(), Some(int(2)));
+    }
+
+    /// The operator inside the cycle that passes what it hears to the store's own consumer, as a
+    /// store's body does, and logs it.
+    struct Echo {
+        log: RegionLog,
+        wiring: Wired,
+    }
+
+    impl Consumer for Echo {
+        fn notify(&mut self, arrived: &Projection) {
+            self.log.notify(arrived);
+            // A store's own notification reaches the cycle too. The double has no gate to stop
+            // its echo, so it skips the store's consumer while that consumer is passing the
+            // notification, which holds the borrow.
+            let own = self.wiring.borrow().own.clone();
+            if let Some(own) = own
+                && let Ok(mut own) = own.try_borrow_mut()
+            {
+                own.notify(arrived);
+            }
+        }
+    }
+
+    /// An announcement reaches the subscribers inside the cycle and no reader: its echo stops at
+    /// the fan-out, whose gate stays open for the store's next notification.
+    #[test]
+    fn an_announcement_reaches_the_cycle_and_no_reader() {
+        let (inside, inside_regions) = RegionLog::new();
+        let (fan, wiring) = cyclic(int(2), |wiring| {
+            Box::new(Echo {
+                log: inside,
+                wiring: wiring.clone(),
+            })
+        });
+        let mut scheduler = Scheduler::new();
+        let (outside, reader_regions) = RegionLog::new();
+        let _reader =
+            fan.slot()
+                .subscribe(ints().universal_guard(), Box::new(outside), &mut scheduler);
+        cycle_of(&wiring).announce();
+        assert_eq!(*inside_regions.borrow(), [Projection::Everything]);
+        assert!(
+            reader_regions.borrow().is_empty(),
+            "the echo stops at the fan-out"
+        );
+        let own = wiring
+            .borrow()
+            .own
+            .clone()
+            .expect("the store was subscribed");
+        own.borrow_mut().notify(&Projection::Everything);
+        assert_eq!(*reader_regions.borrow(), [Projection::Everything]);
+    }
+
+    /// A push through a cyclic fan-out reaches its reader slots and skips its recurrence slots,
+    /// whose operators read the store within its own pipeline.
+    #[test]
+    fn a_push_through_a_cyclic_fan_out_skips_its_recurrence_slots() {
+        let (fan, wiring) = cyclic(int(2), |_| {
+            Box::new(Entry::new(PipelineId(2), ints(), Box::new(|| {})))
+        });
+        let mut scheduler = Scheduler::new();
+        let _reader = fan.slot().subscribe(
+            ints().universal_guard(),
+            Box::new(Entry::new(PipelineId(1), ints(), Box::new(|| {}))),
+            &mut scheduler,
+        );
+        let own = wiring
+            .borrow()
+            .own
+            .clone()
+            .expect("the store was subscribed");
+        let mut landing = Landing::probe(PipelineId(0));
+        own.borrow_mut().push(&Projection::Everything, &mut landing);
+        let reached: Vec<_> = landing
+            .arrivals()
+            .into_iter()
+            .map(|arrival| arrival.pipeline)
+            .collect();
+        assert_eq!(reached, [PipelineId(1)]);
     }
 }
