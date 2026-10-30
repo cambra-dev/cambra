@@ -7,7 +7,7 @@ How an inference diagnostic writes the types it reports, and the source position
 ## How a diagnostic writes a type
 
 An annotation mismatch writes both types in CHL with `chl_print::chl_type`: the annotation as
-written, and the inferred type as the annotation that would state it. A `requires` clause lowering
+written, a bounded one as `<: T`, and the inferred type as the annotation that would state it. A `requires` clause lowering
 refuses (`lower_named_requirements` and `expand_requirement` in `lower/stmts.rs`) writes the types
 it names the same way. Every other diagnostic writes types with `Display for Type`.
 
