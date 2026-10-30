@@ -76,18 +76,17 @@ impl TileOperator for Converse {
         // Beneath standing levels the input's outermost keys are the result's; inverting the
         // outermost collection re-keys.
         let keeps_keys = self.level != CurryLevel::OUTERMOST;
+        let input = BreakerInput::new(consumer, self.input.tiling(), keeps_keys, scheduler);
         Box::new(ConverseProducer::new(
             ProducerBase::new(
                 ConverseProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
-            self.input.subscribe(
-                self.tiling().universal_guard(),
-                consumer_keeping_keys_if(keeps_keys, consumer),
-                scheduler,
-            ),
+            )
+            .breaking(input.downstream, input.placement),
+            self.input
+                .subscribe(self.tiling().universal_guard(), input.consumer, scheduler),
             self.level,
             self.tiling().values_at(self.level).empty_at_no_rows(),
         ))
@@ -429,6 +428,16 @@ impl TileProducer for ConverseProducer {
         visit("input", &*self.input);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
+    }
+
+    #[cfg(test)]
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        Some(self)
+    }
+
     /// Inverting the outermost collection makes the values it holds the keys, and which rows
     /// carry which value is known only once the rows are read: the input is read whole and the
     /// groups cut after. The rows a cut group does not name stay unreleased at the input, so a
@@ -736,6 +745,11 @@ impl TileProducer for MapDomainProducer {
         visit("input", &*self.input);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
+    }
+
     /// Every level's keys stand, so the input is pulled at the projection.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection(&self.name());
@@ -881,6 +895,11 @@ impl TileProducer for UncurryProducer {
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
     }
 
     /// Beneath standing levels the projection names keys the pairing leaves standing, so the
@@ -1192,6 +1211,12 @@ impl TileProducer for FilterProducer {
         visit("predicate", &*self.predicate);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
+        visit("predicate", &mut *self.predicate);
+    }
+
     /// The levels down to the masked one with a collection predicate, and every level with a
     /// function predicate. A collection predicate holds no level beneath the masked one, so it
     /// cannot be pulled at a projection there; a function predicate masks the outermost keys and
@@ -1493,6 +1518,11 @@ impl TileProducer for RestrictProducer {
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("predicate", &*self.predicate);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("predicate", &mut *self.predicate);
     }
 
     /// A restricted domain is the predicate's keys that pass, so the predicate is pulled at the
@@ -1886,6 +1916,12 @@ impl TileProducer for ProductProducer {
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("outer", &*self.outer);
         visit("inner", &*self.inner);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("outer", &mut *self.outer);
+        visit("inner", &mut *self.inner);
     }
 
     fn restates(&self) -> Restates {
