@@ -913,6 +913,7 @@ impl InferCtx {
             | Type::DataSource(_)
             | Type::ChanDom(..)
             | Type::WitnessRef(_)
+            | Type::WitnessProjection(_)
             | Type::Txn
             // An opened type parameter stands for itself in its definition's body.
             | Type::Param(_)

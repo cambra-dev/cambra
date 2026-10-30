@@ -1194,6 +1194,9 @@ fn reads_in_collection_domain(param: &Name, ty: &Type) -> bool {
         | Type::ChanDom(..)
         | Type::Txn
         | Type::WitnessRef(_)
+        // A key type, not a collection: a domain it stands in is read through
+        // `type_free_vars` in the `Fun` arm above.
+        | Type::WitnessProjection(_)
         | Type::Param(_)
         | Type::BarrierVar(_)
         | Type::Poly(_) => false,

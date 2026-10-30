@@ -2717,20 +2717,19 @@ sum(m)
     )
 }
 
-/// The boxed version joins, as a sum over every subtype of the row's domain, and inference
-/// accepts it. A boxed collection written to a mutable variable does not compile yet, loop or
-/// not: planning leaves a list literal without the `iterate` op-conversion needs as its input.
-/// Pinned on that failure.
+/// The boxed version joins, as a sum over every subtype of the row's domain. The seed keeps
+/// its `box`, and planning iterates the collection the standing `box` holds, which is the
+/// identity at runtime.
 #[test]
-fn a_boxed_write_whose_keys_vary_with_the_loop_reaches_a_planning_gap() {
-    check_compile_error(
+fn a_boxed_write_whose_keys_vary_with_the_loop_joins_as_a_sum() {
+    check_scalar(
         indoc! {r#"
 m := box([1, 2, 3])
 for r in [1, 2]:
     m := box([v for v in [1, 2, 3] if v > r])
 sum(m)
 "#},
-        "list literal reached op-conversion without an input",
+        Value::Int(3),
     )
 }
 

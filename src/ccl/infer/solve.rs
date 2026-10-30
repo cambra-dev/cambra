@@ -1118,6 +1118,7 @@ fn for_each_positioned_var(
         | Type::SharedHole(_)
         | Type::Param(_)
         | Type::WitnessRef(_)
+        | Type::WitnessProjection(_)
         | Type::Poly(_) => {}
     }
 }
@@ -2888,6 +2889,7 @@ fn coalesce_type_predicates_go(
         | Type::DataSource(_)
         | Type::ChanDom(..)
         | Type::WitnessRef(_)
+        | Type::WitnessProjection(_)
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_)
