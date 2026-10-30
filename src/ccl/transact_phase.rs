@@ -82,8 +82,8 @@ use crate::ccl::{
     ccl_utils::{free_names_in_value, is_free, is_free_in_value},
     feed_nest::LoopFeed,
     mut_elim::{
-        FeedSite, WriterParam, WriterWalk, binding, close_recurrence_group, fold_induction_loop,
-        hoist_feeds, is_writing_case, mut_var_value_tys, tvar,
+        Declared, FeedSite, WriterParam, WriterWalk, binding, close_recurrence_group,
+        fold_induction_loop, hoist_feeds, is_writing_case, tvar,
     },
     provenance,
     provenance::{Located, NodeId},
@@ -672,6 +672,8 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
             write,
         ));
     }
+    // Over the tree before its blocks are stripped, which leaves each block's body outside it.
+    let mut declared = Declared::of(&expr);
     let mut harvest = Stripped::default();
     let stripped = strip(expr, txn_mut_vars, None, &mut harvest);
     // Post-strip invariants (release asserts, like the letrec-phase
@@ -760,7 +762,7 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
     // `mut_elim`.
     let cross_reads = cross_domain_reads(&sites, txn_mut_vars);
     let mut cross = CrossDomain::default();
-    let mut stripped = fold_cross_domain_loops(stripped, &cross_reads, &mut cross);
+    let mut stripped = fold_cross_domain_loops(stripped, &cross_reads, &mut declared, &mut cross);
 
     // Fresh history-binding name per key, distinct from the surface variable so a read
     // of the history is not a self-reference; recognition keys the `Transact` off these.
@@ -836,7 +838,8 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
         let store = store_of(&s);
         let parent = s.parent;
         let g = provenance::enter(parent, "transact.writer", provenance::Nature::Expansion);
-        let (writer, feeds) = build_writer(s, &key_init, &mut feed_counter, &cross.acc_views);
+        let (writer, feeds) =
+            build_writer(s, &key_init, &mut feed_counter, &cross.acc_views, &declared);
         drop(g);
         per_store[store].0.push((parent, writer));
         per_store[store].1.push(feeds);
@@ -998,7 +1001,12 @@ fn cross_domain_reads(sites: &[RawSite], txn_mut_vars: &HashSet<Name>) -> HashSe
 /// Fold each residual induction `For` that writes a cross-read accumulator into
 /// `out` (see [`CrossDomain`]), removing the `For` from the tree and re-pointing
 /// its continuation's trailing reads at the extracted finals.
-fn fold_cross_domain_loops(expr: Expr, cross_reads: &HashSet<Name>, out: &mut CrossDomain) -> Expr {
+fn fold_cross_domain_loops(
+    expr: Expr,
+    cross_reads: &HashSet<Name>,
+    declared: &mut Declared,
+    out: &mut CrossDomain,
+) -> Expr {
     if let TypedExprNode::ExprStmt { expr: effect, .. } = &expr.node
         && let TypedExprNode::For { body, .. } = &effect.node
         && writes_any(body, cross_reads)
@@ -1026,11 +1034,7 @@ fn fold_cross_domain_loops(expr: Expr, cross_reads: &HashSet<Name>, out: &mut Cr
             provenance::Nature::Expansion,
         );
         g.blame(&[effect_id]);
-        // The loop body and the continuation between them carry every reference to
-        // this loop's accumulators, so their `Mut(V, D)`s give each one the value
-        // type inference joined for it.
-        let value_tys = mut_var_value_tys([&*body, &*cont]);
-        let fold = fold_induction_loop(&target, &iter, *body, &value_tys);
+        let fold = fold_induction_loop(&target, &iter, *body, declared);
         for (i, acc) in fold.accs.iter().enumerate() {
             if cross_reads.contains(&acc.name) {
                 let final_var = fold
@@ -1053,15 +1057,16 @@ fn fold_cross_domain_loops(expr: Expr, cross_reads: &HashSet<Name>, out: &mut Cr
         let mut cont = *cont;
         for (acc, x_final) in &fold.renames {
             rename_var_uses(&mut cont, acc, x_final);
+            declared.advance(acc, x_final);
         }
         out.bindings.push(fold.binding);
         out.parents.push(stmt_id);
         out.reads.extend(fold.reads);
         out.feeds.extend(fold.feed_views);
-        return fold_cross_domain_loops(cont, cross_reads, out);
+        return fold_cross_domain_loops(cont, cross_reads, declared, out);
     }
     let mut expr = expr;
-    expr.map_children(|c| fold_cross_domain_loops(c, cross_reads, out));
+    expr.map_children(|c| fold_cross_domain_loops(c, cross_reads, declared, out));
     expr
 }
 
@@ -2527,6 +2532,7 @@ fn build_writer(
     key_init: &HashMap<Name, MutVarDecl>,
     feed_counter: &mut usize,
     acc_views: &HashMap<Name, CrossAcc>,
+    declared: &Declared,
 ) -> (WriterSite, Vec<FeedSite>) {
     let value_ty = |k: &Name| {
         key_init
@@ -2619,7 +2625,7 @@ fn build_writer(
         .iter()
         .map(|wk| (wk.clone(), value_ty(wk)))
         .collect();
-    let mut walk = WriterWalk::new(env, feed_counter, Some(&allowed_writes), writes);
+    let mut walk = WriterWalk::new(env, feed_counter, Some(&allowed_writes), writes, declared);
     let mut kept = Vec::new();
     walk.walk(site.block, &mut kept);
 
