@@ -19,11 +19,11 @@ use crate::ccl::Occurrence;
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{
-    apply_primitive, cast_target_refinement, compose_typed_or_hole, count_free,
+    apply_primitive, cast_target_refinement, closed_let_type, compose_typed_or_hole, count_free,
 };
 use crate::ccl::{
-    BindingTransparency, Builtin, Expr, FunKind, Name, Refinement, Type, TypedBinding, TypedExpr,
-    TypedExprNode, provenance::NodeId,
+    Builtin, Expr, FunKind, Name, Refinement, Type, TypedBinding, TypedExpr, TypedExprNode,
+    provenance::NodeId,
 };
 
 /// A feed out of a loop, lifted out of the loop with the values it fed: `view` holds them,
@@ -326,7 +326,7 @@ fn rebuild_let(
     let capabilities =
         crate::ccl::capabilities::of_parts(&[&bound_expr.capabilities, &body.capabilities]);
     TypedExpr {
-        ty: lifted_past(&binding, &bound_expr, &body.ty),
+        ty: closed_let_type(&binding, &bound_expr, body.ty.clone()),
         node: TypedExprNode::Let {
             binding,
             bound_expr,
@@ -339,22 +339,6 @@ fn rebuild_let(
         node_id,
         site: None,
     }
-}
-
-/// `ty`, written under the binder `binding` of a `let` defining it as `bound_expr`, as it reads
-/// outside it: a transparent binder discharged to its definition, as inference's
-/// `close_let_type` lifts a `let`'s type. An opaque binder's name stays.
-pub(crate) fn lifted_past(binding: &TypedBinding, bound_expr: &Expr, ty: &Type) -> Type {
-    if binding.transparency == BindingTransparency::Opaque
-        || !crate::ccl::subst::type_free_vars(ty).contains(&binding.name)
-    {
-        return ty.clone();
-    }
-    crate::ccl::subst::Subst::discharge(
-        &binding.name,
-        crate::ccl::ccl_utils::predicate_term(bound_expr),
-    )
-    .apply_type(ty)
 }
 
 /// One generator of a nest, as [`generator_nest`] reads it: the term the loop iterates and
@@ -675,7 +659,7 @@ fn lets_into_position(expr: Expr) -> Expr {
     let body = lets_into_position(*body);
     // The position lambda moves out from under the `let`, so its type reads the binding as the
     // `let`'s own type would.
-    let lambda_ty = lifted_past(&binding, &bound_expr, &body.ty);
+    let lambda_ty = closed_let_type(&binding, &bound_expr, body.ty.clone());
     let name = binding.name.clone();
     let rebind = |body: Expr| rebuild_let(binding, bound_expr, user_annotation, node_id, body);
     match body.node {
