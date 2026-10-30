@@ -11,8 +11,8 @@
 
 use super::*;
 use crate::{
-    ccl::{Expr, Generator, TypedBinding, TypedExprNode},
-    chl_parser::ast::{CompClause, Comprehension, Expr as ChlExpr, Spanned},
+    ccl::{Expr, Generator, Name, TypedBinding, TypedExprNode},
+    chl_parser::ast::{AssignTarget, CompClause, Comprehension, Expr as ChlExpr, Spanned},
 };
 
 /// Lower a CHL list comprehension or generator expression to the CCL
@@ -57,13 +57,79 @@ fn lower_clauses(
     match clause {
         CompClause::For { target, iter } => {
             let iter = lower_expr(iter, ctx)?;
-            let name = extract_name_target(target, "comprehension target")?;
+            let leaves = match &target.node {
+                AssignTarget::Name(n) if n.as_str() != WILDCARD => {
+                    let name = extract_name_target(target, "comprehension target")?;
+                    out.push(Generator {
+                        target: TypedBinding::new_unannotated(name.clone()),
+                        iter,
+                        guards: Vec::new(),
+                    });
+                    return ctx.with_shadowed([name], |ctx| lower_clauses(rest, element, out, ctx));
+                }
+                _ => AssignmentBindings::of(
+                    target,
+                    chl_parser::ast::BindingTransparency::Transparent,
+                    target.span,
+                    ctx,
+                )?,
+            };
+            // A pattern binder binds each element to a minted name, which the pattern takes
+            // apart as an assignment does (`AssignmentBindings`). Every name it binds reads
+            // what the assignment would bind it to, and the binder takes the value apart where
+            // each name is read.
+            let element_name = ctx.fresh_tuple_payload();
+            let index = out.len();
             out.push(Generator {
-                target: TypedBinding::new_unannotated(name.clone()),
+                target: TypedBinding::new_unannotated(element_name.clone()),
                 iter,
                 guards: Vec::new(),
             });
-            ctx.with_shadowed([name], |ctx| lower_clauses(rest, element, out, ctx))
+            let names = leaves.names();
+            let lowered_element =
+                ctx.with_shadowed(names.clone(), |ctx| lower_clauses(rest, element, out, ctx))?;
+            // Each binding's value reads the names bound before it, which are substituted in
+            // turn, so every read is of the element alone.
+            let element_read =
+                ctx.tag_machinery(Expr::var(element_name.as_str()), target.span, LABEL);
+            let mut reads: Vec<(Name, Expr)> = Vec::new();
+            for (name, value, _) in leaves.bindings(element_read, target.span, ctx) {
+                let value = reads
+                    .iter()
+                    .fold(value, |v, (n, r)| substitute_param_in_body(v, n, r, LABEL));
+                reads.push((Name::raw(name.as_str()), value));
+            }
+            // The substitution reaches what the binder scopes over: its own guards, the
+            // generators after it, and the element. Those last two are a comprehension of
+            // their own, so a later generator rebinding a name shadows it as it would anywhere.
+            let mut later: Vec<Generator> = out.drain(index + 1..).collect();
+            let mut lowered_element = lowered_element;
+            for (name, read) in &reads {
+                let guards = std::mem::take(&mut out[index].guards);
+                out[index].guards = guards
+                    .into_iter()
+                    .map(|g| substitute_param_in_body(g, name, read, LABEL))
+                    .collect();
+                if later.is_empty() {
+                    lowered_element = substitute_param_in_body(lowered_element, name, read, LABEL);
+                    continue;
+                }
+                let scoped = Expr::new(TypedExprNode::Comprehension {
+                    generators: std::mem::take(&mut later),
+                    element: Box::new(lowered_element),
+                });
+                let TypedExprNode::Comprehension {
+                    generators,
+                    element,
+                } = substitute_param_in_body(scoped, name, read, LABEL).node
+                else {
+                    unreachable!("substitution rebuilds the comprehension it was given")
+                };
+                later = generators;
+                lowered_element = *element;
+            }
+            out.extend(later);
+            Ok(lowered_element)
         }
         CompClause::If(guard) => {
             // A guard attaches to the generator before it, so one standing
@@ -84,6 +150,9 @@ fn lower_clauses(
         }
     }
 }
+
+/// The label the nodes a pattern binder's projections mint are recorded under.
+const LABEL: &str = "lower.comprehension_pattern";
 
 #[cfg(test)]
 mod tests {

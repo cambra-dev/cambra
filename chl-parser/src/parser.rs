@@ -195,7 +195,7 @@ where
 
         let comp_clauses = {
             let for_clause = just(Token::For)
-                .ignore_then(expr.clone().try_map(|t, _| {
+                .ignore_then(bare_target(expr.clone()).try_map(|t, _| {
                     expr_to_assign_target(t)
                         .map_err(|bad| Rich::custom(bad, "invalid comprehension target"))
                 }))
@@ -1426,7 +1426,7 @@ where
 
         // ---- for x in iter: body ------------------------------------
         let for_stmt = just(Token::For)
-            .ignore_then(expr.clone().try_map(|t, _| {
+            .ignore_then(bare_target(expr.clone()).try_map(|t, _| {
                 expr_to_assign_target(t).map_err(|bad| Rich::custom(bad, "invalid for-loop target"))
             }))
             .then_ignore(just(Token::In))
@@ -2609,6 +2609,15 @@ fn assign_stmt<'src>(
             annotation: ann,
             value: val,
         },
+        // `_` binds nothing, so `_ := e` declares no mutable variable: it is `_ = e`
+        // (`docs/chl-spec.md`, "4.3.1 Destructuring patterns").
+        AssignTail::MutPlain(value) if matches!(&target.node, Expr::Name(n) if n == "_") => {
+            Stmt::Assign {
+                target: to_target(target)?,
+                value,
+                transparency: BindingTransparency::Transparent,
+            }
+        }
         AssignTail::MutPlain(value) => Stmt::MutAssign {
             target: to_target(target)?,
             annotation: None,
@@ -2738,6 +2747,28 @@ where
         .repeated()
         .at_least(1)
         .collect::<Vec<_>>()
+}
+
+/// A `for` binder: one expression, or several separated by commas, which is the tuple
+/// pattern written without its parentheses (`docs/chl-spec.md`, "4.3.1 Destructuring
+/// patterns"). The binder ends at `in`, so the comma is unambiguous inside brackets too.
+fn bare_target<'src, I, E>(expr: E) -> impl Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone
+where
+    I: ValueInput<'src, Token = Token, Span = Span>,
+    E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
+{
+    expr.separated_by(just(Token::Comma))
+        .at_least(1)
+        .collect::<Vec<_>>()
+        .then(just(Token::Comma).or_not())
+        .map_with(|(mut elts, trailing): (Vec<Spanned<Expr>>, _), e| {
+            // A trailing comma makes even one expression a tuple, as `a, = (1,)` is.
+            if elts.len() == 1 && trailing.is_none() {
+                elts.pop().expect("at least one element")
+            } else {
+                Spanned::new(e.span(), Expr::Tuple(elts))
+            }
+        })
 }
 
 /// Convert an [`Expr`] parsed in target position into an [`AssignTarget`].
@@ -3684,6 +3715,69 @@ mod tests {
         };
         assert!(matches!(comp.element.node, Expr::Tuple(ref kv) if kv.len() == 2));
         assert_eq!(comp.clauses.len(), 1);
+    }
+
+    /// A `for` binder and a comprehension binder take a tuple pattern without its parentheses,
+    /// ending at `in`.
+    #[test]
+    fn a_bare_tuple_binds_a_for_target() {
+        let m = parse_m(indoc! {r#"
+            for a, (b, c) in m:
+                [x for x, y in a]
+        "#});
+        let Stmt::For { target, body, .. } = &m.body[0].node else {
+            panic!("expected a For");
+        };
+        let AssignTarget::Tuple(parts) = &target.node else {
+            panic!("expected a tuple target, got {:?}", target.node);
+        };
+        assert_eq!(parts.len(), 2);
+        assert!(matches!(&parts[1].node, AssignTarget::Tuple(inner) if inner.len() == 2));
+        let Stmt::Expr(e) = &body[0].node else {
+            panic!("expected an expression statement");
+        };
+        let Expr::ListComp(comp) = &e.node else {
+            panic!("expected a comprehension, got {:?}", e.node);
+        };
+        let CompClause::For { target, .. } = &comp.clauses[0] else {
+            panic!("expected a for clause");
+        };
+        assert!(matches!(&target.node, AssignTarget::Tuple(parts) if parts.len() == 2));
+    }
+
+    /// `_ := e` declares no mutable variable, so it is the statement `_ = e`.
+    #[test]
+    fn a_mutable_assignment_to_the_wildcard_is_an_assignment() {
+        let m = parse_m("_ := f()\n");
+        assert!(
+            matches!(&m.body[0].node, Stmt::Assign { target, .. } if matches!(&target.node, AssignTarget::Name(n) if n == "_")),
+            "{:?}",
+            m.body[0].node
+        );
+    }
+
+    /// A trailing comma makes a one-component tuple pattern of a `for` binder, as it does of
+    /// an assignment target.
+    #[test]
+    fn a_trailing_comma_makes_a_for_target_a_tuple() {
+        let m = parse_m(indoc! {r#"
+            for a, in m:
+                [x for x, in a]
+        "#});
+        let Stmt::For { target, body, .. } = &m.body[0].node else {
+            panic!("expected a For");
+        };
+        assert!(matches!(&target.node, AssignTarget::Tuple(parts) if parts.len() == 1));
+        let Stmt::Expr(e) = &body[0].node else {
+            panic!("expected an expression statement");
+        };
+        let Expr::ListComp(comp) = &e.node else {
+            panic!("expected a comprehension, got {:?}", e.node);
+        };
+        let CompClause::For { target, .. } = &comp.clauses[0] else {
+            panic!("expected a for clause");
+        };
+        assert!(matches!(&target.node, AssignTarget::Tuple(parts) if parts.len() == 1));
     }
 
     /// A `for` binder reads the pair as the tuple target it is, so entry

@@ -363,8 +363,9 @@ aug_op          ::= "+=" | "-=" | "*=" | "//="
 assign_target   ::= pair_target
                  |  pair_target ( "," pair_target )+ [ "," ]
 pair_target     ::= target_atom [ "->" target_atom ]      -- a pair: the two-tuple (k, v)
-target_atom     ::= ident
+target_atom     ::= ident                          -- `_` binds nothing
                  |  "(" assign_target ( "," assign_target )* [ "," ] ")"
+                 |  type_path "::" ident [ "(" ident ( "," ident )* [ "," ] ")" ]  -- constructor
 
 compound_stmt   ::= if_stmt | match_stmt | for_stmt | with_stmt | def_stmt
                  |  load_from_stmt | renamed_from_stmt | discard_stmt | pub_stmt
@@ -407,7 +408,8 @@ pub_stmt        ::= "pub" statement
 block           ::= NEWLINE INDENT statement+ DEDENT
 ```
 
-`assign_target` is a bare name, a constructor pattern, or a nested tuple of those — **no
+`assign_target` is a name, `_`, a nested tuple of targets, or a constructor pattern
+([4.3.1 Destructuring patterns](#431-destructuring-patterns)) — **no
 subscript or attribute targets** (`xs[0] = x` and `obj.f = x` are not
 valid). Every binding LHS is therefore a static pattern: which names a
 statement introduces is decidable from the syntax alone, without any
@@ -1660,8 +1662,7 @@ executes, so it can be the source of an unbounded stream (e.g. when
 | `target op= value` | Compound mutation — `target := target op value`, for `op` ∈ `+ - * //`. The target **must** be a mutable variable (one introduced with `:=`); a `+=` to an immutable binding is a type error, not a silent rebind. |
 | `target <<= value` | Gives the feed `target` the value `value` (§4.4). |
 
-`target` is an `AssignTarget`: a bare name, a constructor pattern (§4.3.1), or a (nested)
-tuple of those. Tuple destructuring:
+`target` is an `AssignTarget` (§2.2). Tuple destructuring:
 
 ```python
 a, b = pair
@@ -1671,11 +1672,6 @@ a, b = pair
 is supported at any nesting depth, with or without parentheses around the pattern. A tuple
 expression keeps its parentheses. `value` is evaluated in the scope before the statement, so
 `b, a = (a, b)` exchanges the two names.
-
-> **Direction [Tentative].** Destructuring targets generalize: any
-> tuple-yielding expression can be destructured wherever a target
-> appears, `for` binders included. The decided pattern
-> surface is §4.3.1.
 
 **No assignment-as-expression** — neither `=` nor `:=` is an expression
 (the mutation `:=` is a statement, §1.8). **No multi-target chained
@@ -1753,9 +1749,9 @@ values, and a write reveals one more position of it (§8.1, and
 this section for what today's grammar accepts.
 
 A binding LHS is a **pattern**: a shape that names the parts of the value
-being bound. Patterns appear in three positions — an assignment target
-(§4.3), a `for` binder (§4.6), and a `case` arm (§4.10) — and the same
-grammar serves all three.
+being bound. Patterns appear in four positions — an assignment target
+(§4.3), a `for` binder (§4.6), a comprehension binder (§3.12), and a `case`
+arm (§4.10) — and the same grammar serves all four.
 
 ```ebnf
 pattern      ::= ident
@@ -1805,17 +1801,21 @@ per declared parameter, in order, so `Shape::rect(w, h)` binds `rect`'s two para
 is the type's name, qualified as anywhere else (`shop::Shape`). A constructor that declares no
 parameters takes no parentheses, `Option::none`.
 
+The wildcard `_` matches any value and binds nothing, so outside a refinement predicate (§6.4),
+where `_` is the refined value, no term reads it. `_ := e` declares no mutable variable: it is
+`_ = e`, which computes `e` and keeps nothing.
+
 Patterns are still **static** — which names a binding introduces is
-decidable from the syntax alone (§2.2). A variant pattern and a constructor pattern are the forms
+decidable from the syntax alone (§2.2). A pattern binds each name once: `a, a = p` is an error. A variant pattern and a constructor pattern are the forms
 that can *fail* to match, which is why they appear only in a `case` arm or where the match is
 exhaustive: a variant pattern against a single-tag variant type, and a constructor pattern against
 a type that declares one constructor (`Price::new(r) = p`).
 
-Today's grammar accepts the tuple forms, unannotated, with the
-annotation restricted to the whole target (`ann_assign_stmt`, §2.2), and a constructor pattern on
-the left of `=`, alone or as a component of a tuple pattern (`(Price::new(p), q) = …`); record,
-variant, and wildcard patterns, a constructor pattern in a `for` binder,
-and per-component annotations are all unimplemented.
+Today's grammar accepts the tuple forms, unannotated, with the annotation restricted to the whole
+target (`ann_assign_stmt`, §2.2), the wildcard `_`, and a constructor pattern whose parameters are
+names or `_`, alone or as a component of a tuple pattern (`(Price::new(p), q) = …`), on the left
+of `=`, in a `for` binder and in a comprehension binder. Record and variant patterns, and
+per-component annotations, are unimplemented.
 
 ### 4.4 Define statement `<<=`
 
@@ -1903,10 +1903,10 @@ collections is `m.keys()` / `m.values()` / `m.items()` (§6.3).
 
 > **[Interim].** Today `for`-in binds the **value** (codomain) for every
 > collection — so a map iterates its values (as `groupby` results do) and a set
-> iterates `unit`. A destructuring target parses in either spelling, `(k, v)` and
-> `k -> v` alike, and lowering takes only a simple name. Entry/key iteration is
-> the [Planned] work; it only *adds* the type-directed element choice, so
-> `for k -> v in m` is the form to write once it lands. Design:
+> iterates `unit`. A destructuring target takes the element apart, in either
+> spelling, `(k, v)` and `k -> v` alike. Entry/key iteration is the [Planned]
+> work; it only *adds* the type-directed element choice, so `for k -> v in m` is
+> the form to write once it lands. Design:
 > [collections.md, "Operations: how the trait layer dispatches [Planned]"](../src/ccl/design/collections.md#operations-how-the-trait-layer-dispatches-planned).
 
 **Iterations are unordered and may run in parallel** (§3): unless the
@@ -2219,9 +2219,8 @@ The indented and one-line forms use the same pattern, selection and value rules.
 `match` whose arms sit on their `case` lines
 ([An arm on its `case` line](#an-arm-on-its-case-line)) is the indented form.
 
-**[Tentative]** Extending unused-binder `_` beyond pattern payloads to lambda parameters,
-loop targets and tuple patterns requires a binder-position rule distinct from the type-position
-wildcard in [Atoms](#24-atoms).
+**[Tentative]** Extending unused-binder `_` from patterns to lambda parameters requires a
+binder-position rule distinct from the type-position wildcard in [Atoms](#24-atoms).
 
 **[Tentative]** Per-arm guards, such as `` case `some(v) if v > 0: ``, would permit repeated
 tags and make arm order observable. This extension requires a combined tag-and-guard selection
@@ -5611,10 +5610,10 @@ with parser-level support that lowering rejects:
   tag dispatch over a variant is implemented (§4.10), in both the indented and
   the one-line form, but patterns are shallow: no nesting, no literal patterns,
   and no per-arm guard.
-- **Destructuring patterns** beyond tuples and a constructor pattern on the left of `=` — record,
-  variant, and wildcard patterns in assignment targets and `for` binders, a constructor pattern in a
-  `for` binder (a `match` arm's tag or constructor pattern is §4.10), and per-component annotations
-  with `:` binding tighter than `,` (**[Decided]**, §4.3.1).
+- **Destructuring patterns** beyond tuples, `_` and constructor patterns — record and variant
+  patterns in assignment targets and binders (a `match` arm's tag or constructor pattern is §4.10),
+  a pattern in a constructor pattern's parameter, and per-component annotations with `:` binding
+  tighter than `,` (**[Decided]**, §4.3.1).
 - **Unit values do not run** — the type surface is settled (`{}` for the type,
   `()` for the value, §6.6) and both typecheck, but a unit-valued program
   output cannot be materialized by the interpreter: it has no column
