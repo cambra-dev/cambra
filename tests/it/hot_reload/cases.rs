@@ -781,6 +781,72 @@ fn the_control_port_refuses_a_request_from_a_web_page() {
     assert!(from_curl.starts_with("HTTP/1.1 200"), "{from_curl}");
 }
 
+/// A finished program takes no control request, and says so rather than
+/// hanging: under `--inspect` the binary goes on serving after the driver loop
+/// has ended, and the control port with it.
+#[test]
+fn a_finished_program_answers_a_control_request_with_409() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::{Command, Stdio};
+
+    let inspect = reserve_test_port();
+    let control = reserve_test_port();
+    let dir = std::env::temp_dir().join(format!("cambra-finished-{control}"));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let file = dir.join("prog.cambra");
+    std::fs::write(&file, "[x + 1 for x in [1, 2, 3]]\n").expect("write the program");
+    let mut program = super::harness::RunningProgram {
+        child: Command::new(env!("CARGO_BIN_EXE_cambra"))
+            .arg(format!("--inspect={inspect}"))
+            .arg(format!("--control={control}"))
+            .arg(&file)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn cambra"),
+        dir,
+    };
+    // The value is printed as the program finishes. The reader thread keeps the
+    // pipe open, so the rest of the print does not fail.
+    let (tx, rx) = std::sync::mpsc::channel();
+    let out = program.child.stdout.take().expect("piped stdout");
+    thread::spawn(move || {
+        for line in BufReader::new(out).lines().map_while(Result::ok) {
+            let _ = tx.send(line);
+        }
+    });
+    let first = rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the program prints its value");
+    assert!(first.starts_with("Got value"), "{first}");
+
+    // Retried until the driver loop has ended, with a read timeout on each
+    // attempt: the regression this pins is a request that never returns.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let response = loop {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", control)).expect("connect");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("a read timeout");
+        write!(
+            stream,
+            "GET /branches HTTP/1.1\r\nHost: 127.0.0.1:{control}\r\nConnection: close\r\n\r\n"
+        )
+        .expect("write the request");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .expect("the control port answers rather than hanging");
+        if !response.starts_with("HTTP/1.1 200") || std::time::Instant::now() > deadline {
+            break response;
+        }
+        thread::sleep(Duration::from_millis(50));
+    };
+    assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+    assert!(response.contains("finished"), "{response}");
+}
+
 /// A program whose output is its `main` value rather than a sink reloads too.
 ///
 /// Its source is `stdin`, which is unbounded, so the program keeps running and
