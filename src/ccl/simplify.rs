@@ -1346,9 +1346,40 @@ fn try_exponential_beta(expr: &mut Expr) -> bool {
                     })
                     .unwrap_or(Type::Hole);
             let id_node = id().with_ty(id_ty);
-            vec![zip_pair(id_node, g, mint_kind), h]
+            let pair = stating_domain_of(zip_pair(id_node, g, mint_kind), &h);
+            vec![pair, h]
         },
     )
+}
+
+/// `pair`, the `⟨id, 𝑔⟩` exponential beta builds to feed `h`, with the refinements of `h`'s
+/// domain stated on the pairs it gives.
+///
+/// Lambda elimination restates a filter on a curried lambda's inner binder on the pair its
+/// uncurried body takes (`lambda_elim`'s nested-lambda rule), and `h` reads its pair at that
+/// type. `⟨𝑔, curry(h)⟩ ≫ apply` applies `h` to `(𝑥, 𝑔(𝑥))` at each `𝑥`, so every pair the
+/// zip gives satisfies `h`'s domain: the refinement is a fact about the pair, and the zip
+/// states it, as a producer supplies the refinement its consumer's domain demands.
+fn stating_domain_of(mut pair: Expr, h: &Expr) -> Expr {
+    let refinements = match h.ty.peel_refinements() {
+        Type::Fun { domain, .. } => domain.refinements().to_vec(),
+        _ => Vec::new(),
+    };
+    if refinements.is_empty() {
+        return pair;
+    }
+    let Type::Fun { codomain, .. } = &mut pair.ty else {
+        return pair;
+    };
+    let mut set = crate::ccl::ty::RefinementSet::new();
+    set.extend(refinements);
+    let bare = std::mem::replace(&mut **codomain, Type::Hole);
+    **codomain = Type::refined(bare, set);
+    let TypedExprNode::Apply { argument, function } = &mut pair.node else {
+        unreachable!("`zip_pair` builds `(𝑓, 𝑔) ▷ zip`")
+    };
+    function.ty = Type::compute_fun_or_hole(&argument.ty, &pair.ty);
+    pair
 }
 
 /// Partial lookup: `⟨const(𝑐), 𝑔⟩ ≫ lookup?  ⟹  𝑔 ≫ (𝑐 ▷ curry(lookup?))`

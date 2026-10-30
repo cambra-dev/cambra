@@ -53,10 +53,9 @@
 //! ([`try_extract_fanout_feed`]). One `Case` fans out once per deferred collection
 //! it feeds, and each pass leaves the arms it did not take for the pass that will
 //! ([`residual_after_fanout`]), so two defers fed from complementary arms are two
-//! channels over one conditional. A feeding `Case` outside any iteration becomes a
-//! gated one-shot lift when its arms are guards; only a scrutinee / pattern one is
-//! rejected, with `DeferError::PartialFeedCaseUnsupported` (see the `Case` arm of
-//! [`extract_for_defer`]).
+//! channels over one conditional. Each feeding arm of a `Case` outside any iteration
+//! contributes on its own: a guard arm as a gated one-shot lift, and a `match` arm through
+//! its tag's projection of the scrutinee (see the `Case` arm of [`extract_for_defer`]).
 //!
 //! # Vocabulary
 //!
@@ -125,10 +124,12 @@ use crate::ccl::ccl_utils::{
 use crate::ccl::feed_nest::{
     LoopFeed, contribution_lambda, indexed_nest, key_by_positions, lifted_past,
 };
+use crate::ccl::subst::Subst;
 use crate::ccl::{
-    BaseType, BindingTransparency, Branch, Expr, FunKind, HistoryKind, Lit, Name, Pattern,
-    PredicateId, Refinement, Type, TypedBinding, TypedExpr, TypedExprNode,
-    ccl_utils::{count_free, synthesize_arm_predicate, typed_compose, unit_expr},
+    BaseType, BinOpKind, BindingTransparency, Branch, Builtin, Expr, FieldKey, FunKind,
+    HistoryKind, Lit, LogicKind, Name, Pattern, PredicateId, Refinement, Type, TypedBinding,
+    TypedExpr, TypedExprNode,
+    ccl_utils::{count_free, synthesize_arm_predicate, tag_test, typed_compose, unit_expr},
     letrec::check_letrec_causal,
     provenance::{self, Located, NodeId},
 };
@@ -189,14 +190,6 @@ pub enum DeferError {
     /// governs overwrite recursion. The payload names one of the defers on the
     /// cycle.
     MutuallyRecursiveCycle(Name),
-    /// A feeding `Case` reached the generic structural recursion — a
-    /// conditional feed with no enclosing iteration source to restrict per arm
-    /// (the loop-sourced multi-arm case is fanned out at the `Compose` site via
-    /// [`try_extract_fanout_feed`]). A guard-only one becomes a gated one-shot
-    /// lift there, over a `{Unit | π̂ᵢ}` driver; a scrutinee / pattern feed
-    /// cannot be gated by a boolean predicate, so it is rejected rather than
-    /// miscompiled. The payload names the defer.
-    PartialFeedCaseUnsupported(Name),
     /// A feed or define whose target is a feed handle no deferred binding's cluster reached,
     /// as one taken out of a data structure (`docs/chl-spec.md`, "A deferred collection inside
     /// a data structure \[Open\]"). The payload names the target.
@@ -220,7 +213,6 @@ impl DeferError {
             | DeferError::NestedDefinition(name)
             | DeferError::UnboundDeferHandle(name)
             | DeferError::MutuallyRecursiveCycle(name)
-            | DeferError::PartialFeedCaseUnsupported(name)
             | DeferError::UnreachedFeedHandle(name) => name,
         }
     }
@@ -242,10 +234,6 @@ impl DeferError {
             DeferError::MutuallyRecursiveCycle(_) => {
                 format!("deferred bindings form a mutually recursive cycle through {subject}")
             }
-            DeferError::PartialFeedCaseUnsupported(_) => format!(
-                "{subject} is fed from some but not all branches of a multi-way conditional; \
-                 this shape is not supported yet"
-            ),
             DeferError::UnreachedFeedHandle(_) => "this feeds a feed taken out of a data \
                  structure, which this compiler does not follow back to the feed's \
                  declaration, so what it is fed would be lost; a feed reaches its declaration \
@@ -292,10 +280,7 @@ fn residual_after_fanout(body: Expr, defer_name: &Name) -> Expr {
     let branches = branches
         .into_iter()
         .map(|b| Branch {
-            body: match &b.body.node {
-                TypedExprNode::Feed { name, .. } if name == defer_name => unit_expr(),
-                _ => b.body,
-            },
+            body: erase_spine_feeds(b.body, defer_name),
             pattern: b.pattern,
             guard: b.guard,
         })
@@ -317,30 +302,30 @@ fn residual_after_fanout(body: Expr, defer_name: &Name) -> Expr {
 ///
 /// Shape (as lowered from `if g₀: d << v₀ elif g₁: d << v₁ … [else: d << vₑ]` in
 /// a for-loop body): `Case { None, [g₀ → body₀; …; true → bodyₜ] }`, where each
-/// `bodyᵢ` is either `Feed(defer_name, vᵢ)` (a feeding arm) or `Unit` (a
-/// non-feeding arm). The trailing `true`-guarded arm is the `else` body when
-/// present (a feed) or the implicit fallthrough (`Unit`) when absent — both are
-/// ordinary arms here, so an `else` that feeds fans out just like a guard arm
-/// (its first-match predicate is `¬⋁ⱼ gⱼ`).
+/// `bodyᵢ` is a statement spine of `let`s, feeds, `Unit`s and conditionals of the same
+/// shape ([`arm_contributions`]). The trailing `true`-guarded arm is the `else` body when
+/// present or the implicit fallthrough (`Unit`) when absent — both are ordinary arms here,
+/// so an `else` that feeds fans out just like a guard arm (its first-match predicate is
+/// `¬⋁ⱼ gⱼ`).
 ///
 /// **An arm feeding another deferred collection is a non-feeding arm here**, which is
 /// what leaves `if c: good << i else: bad << i` fannable for either defer.
 ///
-/// Returns each arm's `(guard, feed_value?)` in source order — `feed_value` is
-/// `None` for a non-feeding arm, whose guard still participates in later arms'
-/// predicate synthesis ([`synthesize_arm_predicate`]). Returns `None` (not
-/// fannable) if the trailing guard is not `true` or an arm body is neither a feed
-/// nor `Unit`.
+/// Returns each arm's guard and its feeds of the defer in source order, each a site of the
+/// channel with the condition a conditional inside the arm adds and its value. An arm with
+/// no feed still has its guard take part in later arms' predicate synthesis
+/// ([`synthesize_arm_predicate`]). Returns `None` (not fannable) if the trailing guard is
+/// not `true` or an arm feeds the defer from inside a definition or a loop.
 ///
-/// A `None` on a loop-sourced `Case` has no clean rejection behind it. The generic
+/// A `None` on a loop-sourced `if` has no clean rejection behind it. The generic
 /// handling has no iteration source, so it gates on `Unit` with a predicate over the
 /// loop binder, and the program then dies in compiler internals rather than on a
-/// diagnostic: [`DeferError::PartialFeedCaseUnsupported`] for a `match`, naming the
-/// wrong cause, and for an `if` either lambda elimination's rejection of the gate's
-/// dependent codomain or, when an arm body is itself a conditional, an inference abort
-/// naming an inference variable with no source span. Reaching the generic handling from
-/// a loop is therefore a defect wherever it happens, not a fallback.
-fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, Option<Expr>)>> {
+/// diagnostic: lambda elimination's rejection of the gate's dependent codomain or, when
+/// an arm body is itself a conditional, an inference abort naming an inference variable
+/// with no source span. Where it compiles, its one-row lift is a level of the channel's
+/// keys the loop does not have. Reaching the generic handling from a loop is therefore a
+/// defect wherever it happens, not a fallback.
+fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, Vec<ArmFeed>)>> {
     // A `match` arm dispatches on a tag, so it reaches the fan-out as a
     // `Pattern` against a scrutinee. Convert it to the guard form first — the
     // same rewrite the induction writer applies at its own consumption point —
@@ -377,20 +362,206 @@ fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, 
         if b.pattern.is_some() {
             return None;
         }
-        match &b.body.node {
-            TypedExprNode::Feed { name, value, .. } if name == defer_name => {
-                any_feed = true;
-                arms.push((b.guard.clone(), Some((**value).clone())));
-            }
-            // Another defer's feed, and `Unit`: neither contributes a value to this
-            // defer's channel, and both leave their guard in the predicate synthesis.
-            TypedExprNode::Feed { .. } | TypedExprNode::Lit(Lit::Unit) => {
-                arms.push((b.guard.clone(), None))
-            }
-            _ => return None,
-        }
+        let values = arm_contributions(&b.body, defer_name)?;
+        any_feed |= !values.is_empty();
+        arms.push((b.guard.clone(), values));
     }
     any_feed.then_some(arms)
+}
+
+/// One feed of a fanned-out `Case`'s arm ([`arm_contributions`]): the condition a conditional
+/// inside the arm adds, if one does, and the feed's value.
+type ArmFeed = (Option<Expr>, Expr);
+
+/// What one arm of a fanned-out `Case` feeds `defer_name`: each of its feeds of the defer in
+/// written order, each a site of the channel, as the condition under which the arm reaches
+/// it and its value. Both stand under the `let`s ahead of the feed.
+///
+/// The arm is a statement spine of `let`s and statements ([`arm_spine`]). A conditional on
+/// the spine is read the same way, arm by arm, and its arm's first-match predicate joins the
+/// condition of each feed in it; a feed straight on the spine has no condition of its own.
+/// Another defer's feed and a `Unit` contribute no value to this defer's channel. `None` is an
+/// arm the fan-out cannot read: it feeds the defer from inside a definition or a loop.
+fn arm_contributions(body: &Expr, defer_name: &Name) -> Option<Vec<ArmFeed>> {
+    let mut lets: Vec<(TypedBinding, Expr)> = Vec::new();
+    let mut contributions = Vec::new();
+    for step in arm_spine(body) {
+        match step {
+            SpineStep::Let(binding, bound) => {
+                if &binding.name == defer_name || feeds_defer(bound, defer_name) {
+                    return None;
+                }
+                lets.push((binding.clone(), bound.clone()));
+            }
+            SpineStep::Statement(e) => match &e.node {
+                TypedExprNode::Feed { name, value, .. } if name == defer_name => {
+                    contributions.push((None, under_lets(&lets, (**value).clone())));
+                }
+                TypedExprNode::Case { .. } if feeds_defer(e, defer_name) => {
+                    for (condition, value) in case_contributions(e, defer_name)? {
+                        contributions
+                            .push((Some(under_lets(&lets, condition)), under_lets(&lets, value)));
+                    }
+                }
+                _ if feeds_defer(e, defer_name) => return None,
+                _ => {}
+            },
+        }
+    }
+    Some(contributions)
+}
+
+/// [`arm_contributions`] of each arm of the `Case` `case`, each feed's condition joined by its
+/// arm's first-match predicate. A `match` reads as the guards it converts to.
+fn case_contributions(case: &Expr, defer_name: &Name) -> Option<Vec<(Expr, Expr)>> {
+    let converted = matches!(
+        &case.node,
+        TypedExprNode::Case {
+            scrutinee: Some(_),
+            ..
+        }
+    )
+    .then(|| crate::ccl::ccl_utils::tag_case_to_guard_case(case.clone()));
+    let TypedExprNode::Case {
+        scrutinee: None,
+        branches,
+    } = &converted.as_ref().unwrap_or(case).node
+    else {
+        return None;
+    };
+    let mut prior: Vec<Expr> = Vec::new();
+    let mut contributions = Vec::new();
+    for b in branches {
+        if b.pattern.is_some() {
+            return None;
+        }
+        let taken = synthesize_arm_predicate(&b.guard, &prior);
+        prior.push(b.guard.clone());
+        for (condition, value) in arm_contributions(&b.body, defer_name)? {
+            let condition = match condition {
+                Some(condition) => conjunction(taken.clone(), condition),
+                None => taken.clone(),
+            };
+            contributions.push((condition, value));
+        }
+    }
+    Some(contributions)
+}
+
+/// `a ∧ b`.
+fn conjunction(a: Expr, b: Expr) -> Expr {
+    let mut conj = Expr::binop(a, BinOpKind::BoolLogic(LogicKind::And), b);
+    conj.ty = Type::Base(BaseType::Bool);
+    conj
+}
+
+/// Whether `e` feeds `defer_name` anywhere.
+fn feeds_defer(e: &Expr, defer_name: &Name) -> bool {
+    collect_feed_target_names(e).contains(defer_name)
+}
+
+/// One step of an arm's statement spine ([`arm_spine`]).
+enum SpineStep<'e> {
+    /// `let 𝑛 = 𝑒 in …`.
+    Let(&'e TypedBinding, &'e Expr),
+    /// A statement, or the term the spine ends in.
+    Statement(&'e Expr),
+}
+
+/// The spine of `body`: its `let`s and statements in written order, then the term it ends in.
+fn arm_spine(body: &Expr) -> Vec<SpineStep<'_>> {
+    let mut steps = Vec::new();
+    let mut end = body;
+    loop {
+        match &end.node {
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                body,
+            } => {
+                steps.push(SpineStep::Let(binding, bound_expr));
+                end = body;
+            }
+            TypedExprNode::ExprStmt { expr, body } => {
+                steps.push(SpineStep::Statement(expr));
+                end = body;
+            }
+            _ => {
+                steps.push(SpineStep::Statement(end));
+                return steps;
+            }
+        }
+    }
+}
+
+/// The feeds of `defer_name` on `body`'s spine and in the arms of a conditional on it, in
+/// written order: the feeds [`arm_contributions`] reads.
+fn spine_feeds<'e>(body: &'e Expr, defer_name: &Name) -> Vec<&'e Expr> {
+    let mut feeds = Vec::new();
+    for step in arm_spine(body) {
+        let SpineStep::Statement(e) = step else {
+            continue;
+        };
+        match &e.node {
+            TypedExprNode::Feed { name, .. } if name == defer_name => feeds.push(e),
+            TypedExprNode::Case { branches, .. } => {
+                for b in branches {
+                    feeds.extend(spine_feeds(&b.body, defer_name));
+                }
+            }
+            _ => {}
+        }
+    }
+    feeds
+}
+
+/// `body` with each feed of `defer_name` [`spine_feeds`] lists replaced by `unit`, every other
+/// node keeping its identity.
+fn erase_spine_feeds(body: Expr, defer_name: &Name) -> Expr {
+    let TypedExpr {
+        node,
+        ty,
+        user_annotation,
+        node_id,
+        site,
+    } = body;
+    let node = match node {
+        TypedExprNode::Feed { ref name, .. } if name == defer_name => return unit_expr(),
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body: Box::new(erase_spine_feeds(*body, defer_name)),
+        },
+        TypedExprNode::ExprStmt { expr, body } => TypedExprNode::ExprStmt {
+            expr: Box::new(erase_spine_feeds(*expr, defer_name)),
+            body: Box::new(erase_spine_feeds(*body, defer_name)),
+        },
+        TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } => TypedExprNode::Case {
+            scrutinee,
+            branches: branches
+                .into_iter()
+                .map(|b| Branch {
+                    body: erase_spine_feeds(b.body, defer_name),
+                    ..b
+                })
+                .collect(),
+        },
+        other => other,
+    };
+    TypedExpr {
+        node,
+        ty,
+        user_annotation,
+        node_id,
+        site,
+    }
 }
 
 /// The `let`s `body` binds ahead of what it ends in, outermost first, and that end:
@@ -770,7 +941,7 @@ fn contains_feed_or_define_for(expr: &Expr, name: &Name) -> bool {
 /// correct.
 ///
 /// A thin wrapper over the uniform engine's in-place mode
-/// ([`crate::ccl::subst::Subst::rewrite_expr`]). Unlike the pre-port
+/// ([`Subst::rewrite_expr`]). Unlike the pre-port
 /// version, the engine also rewrites type-carried refinement predicates
 /// (`Cast` targets, annotations), so a channelize rename now reaches a
 /// predicate that closes over the renamed binder instead of leaving a stale
@@ -784,7 +955,7 @@ fn channelize_rename(expr: Expr, from: &Name, to: &Name) -> Expr {
     // discharge substitutes a term that brings its own — and a hand-built `Expr::var`
     // brings `Type::Hole`, which `subst`'s typedness assertion now rejects. Keeping the
     // species honest also keeps `Subst::invert`/`split_renames` exact here.
-    crate::ccl::subst::Subst::rename(from.clone(), to.clone()).rewrite_expr(&mut expr);
+    Subst::rename(from.clone(), to.clone()).rewrite_expr(&mut expr);
     expr
 }
 
@@ -1222,10 +1393,7 @@ fn erase_chan_domains(
         // mutable variable's read, is not discharged: a type lifted past it keeps the
         // binder (`crate::ccl::BindingTransparency`).
         if binding.transparency == BindingTransparency::Transparent {
-            let discharge = crate::ccl::subst::Subst::discharge(
-                &binding.name,
-                bound_expr.clone_preserving_ids(),
-            );
+            let discharge = Subst::discharge(&binding.name, bound_expr.clone_preserving_ids());
             // Only a domain naming the binder is rewritten. A `let` under a loop's position
             // lambda can read the position, and a domain built from that loop names a binder
             // after it, which a discharge passing under it would report as a capture.
@@ -2343,14 +2511,14 @@ fn feed_site(e: &Expr) -> Option<Rc<crate::ccl::site::Site>> {
 ///
 /// Where a feed has lost its site on the way here, or two contributions share one: each is a
 /// pass that rebuilt a feed without carrying its site, or copied one where a feed is one place.
-fn site_tags(sites: &[Option<Rc<crate::ccl::site::Site>>]) -> Vec<crate::ccl::FieldKey> {
-    let tags: Vec<crate::ccl::FieldKey> = sites
+fn site_tags(sites: &[Option<Rc<crate::ccl::site::Site>>]) -> Vec<FieldKey> {
+    let tags: Vec<FieldKey> = sites
         .iter()
         .map(|site| {
             let site = site.as_ref().unwrap_or_else(|| {
                 panic!("a feed of a channel fed from several places reached channelize without its site")
             });
-            crate::ccl::FieldKey::Name(crate::ccl::Label::new(site.tag()))
+            FieldKey::Name(crate::ccl::Label::new(site.tag()))
         })
         .collect();
     let mut sorted = tags.clone();
@@ -2397,16 +2565,15 @@ fn combine_feed_values(
     );
     // Operands in the order of their tags, which is the order a variant type keeps its arms
     // in, so every reader pairs the `i`th operand with the `i`th arm.
-    let mut tagged: Vec<(crate::ccl::FieldKey, Expr)> =
-        site_tags(sites).into_iter().zip(feeds).collect();
+    let mut tagged: Vec<(FieldKey, Expr)> = site_tags(sites).into_iter().zip(feeds).collect();
     tagged.sort_by(|(a, _), (b, _)| a.cmp(b));
     let (tags, feeds): (Vec<_>, Vec<_>) = tagged.into_iter().unzip();
     let ty = copair_type(&feeds, &tags, element);
     Expr::copair(feeds).with_ty(ty)
 }
 
-/// The type of an N-ary channel union: `Variant[Index(i) ↦ domainᵢ] ⤇ element`, where each
-/// operand contributes its domain as tag `i`. Returns [`Type::Hole`] when an operand is not a
+/// The type of an N-ary channel union: `Variant[tagᵢ ↦ domainᵢ] ⤇ element`, where each
+/// operand contributes its domain under its site's tag, `sites[i]`. Returns [`Type::Hole`] when an operand is not a
 /// function-shaped type at all (the untyped-mode pipeline); a defer-read operand is
 /// function-shaped via its handle's read view, so typed-mode unions are
 /// concrete-modulo-`ChanDom` at construction.
@@ -2417,8 +2584,8 @@ fn combine_feed_values(
 /// holds `Int`, and two jagged rows `box([1])` and `box([2, 3])` differ in their witness
 /// kinds. So no operand's codomain stands in for the channel's, and the handle is the one
 /// source of it.
-fn copair_type(feeds: &[Expr], sites: &[crate::ccl::FieldKey], element: Option<&Type>) -> Type {
-    let mut tags: Vec<(crate::ccl::FieldKey, Type)> = Vec::with_capacity(feeds.len());
+fn copair_type(feeds: &[Expr], sites: &[FieldKey], element: Option<&Type>) -> Type {
+    let mut tags: Vec<(FieldKey, Type)> = Vec::with_capacity(feeds.len());
     for (site, f) in sites.iter().zip(feeds) {
         match f.ty.peel_refinements() {
             Type::Fun { domain, .. } => {
@@ -2916,16 +3083,13 @@ fn extract_for_defer_impl(
                             assert_eq!(
                                 fanout_arms
                                     .iter()
-                                    .filter(|(_, value)| value.is_some())
-                                    .count(),
+                                    .map(|(_, values)| values.len())
+                                    .sum::<usize>(),
                                 original_branches
                                     .iter()
-                                    .filter(|b| matches!(
-                                        &b.body.node,
-                                        TypedExprNode::Feed { name, .. } if name == defer_name
-                                    ))
-                                    .count(),
-                                "the fan-out extracts and the residual erases the same arms"
+                                    .map(|b| spine_feeds(&b.body, defer_name).len())
+                                    .sum::<usize>(),
+                                "the fan-out extracts and the residual erases the same feeds"
                             );
                             // Every feeding arm composes its own restriction onto a
                             // clone of this prefix, so N defers off one conditional
@@ -2944,32 +3108,33 @@ fn extract_for_defer_impl(
                             };
                             let src_domain = source_prefix.ty.domain().unwrap_or(Type::Hole);
                             let src_item = source_prefix.ty.codomain().unwrap_or(Type::Hole);
-                            // The `Feed` each feeding arm is, in arm order: the guard form a
+                            // The `Feed`s of the arms, in written order: the guard form a
                             // `match` converts to is a copy, so the originals name them.
                             let mut arm_feeds = original_branches
                                 .iter()
-                                .filter(|b| {
-                                    matches!(
-                                        &b.body.node,
-                                        TypedExprNode::Feed { name, .. } if name == defer_name
-                                    )
-                                })
-                                .map(|b| (b.body.node_id(), feed_site(&b.body)))
+                                .flat_map(|b| spine_feeds(&b.body, defer_name))
+                                .map(|feed| (feed.node_id(), feed_site(feed)))
                                 .collect::<Vec<_>>()
                                 .into_iter();
                             let mut prior: Vec<Expr> = Vec::new();
-                            for (guard, feed_value) in fanout_arms {
-                                if let Some(value) = feed_value {
-                                    let (feed, site) = arm_feeds.next().expect(
-                                        "one original `Feed` per feeding arm, asserted above",
-                                    );
+                            for (guard, values) in fanout_arms {
+                                for (condition, value) in values {
+                                    let (feed, site) = arm_feeds
+                                        .next()
+                                        .expect("one original `Feed` per feed, asserted above");
                                     let _g = provenance::enter(
                                         feed,
                                         "channelize.feed",
                                         provenance::Nature::Expansion,
                                     );
-                                    let pred =
-                                        under_lets(&lets, synthesize_arm_predicate(&guard, &prior));
+                                    let taken = synthesize_arm_predicate(&guard, &prior);
+                                    let pred = under_lets(
+                                        &lets,
+                                        match condition {
+                                            Some(condition) => conjunction(taken, condition),
+                                            None => taken,
+                                        },
+                                    );
                                     let elem = Expr::var(Name::elem()).with_ty(src_domain.clone());
                                     let source_at_elem = Expr::apply(elem, source_prefix.clone())
                                         .with_ty(src_item.clone());
@@ -3206,28 +3371,33 @@ fn extract_for_defer_impl(
                 // body) is handled at those sites via `try_extract_fanout_feed`.
                 //
                 // A *source-less* conditional feed (`if c: d << 1 else: d << 2`,
-                // outside any loop) has no iteration source, so each feeding arm
+                // outside any loop) has no iteration source, so each feeding guard arm
                 // becomes a **gated one-shot lift** over the `Unit` driver:
                 // `λ __unused : {Unit | π̂ᵢ} → vᵢ`, first-match `π̂ᵢ = gᵢ ∧ ¬⋁ⱼ<ᵢ gⱼ`
                 // (a source-less feed; see `design/mutability.md`). Lambda elimination const-lifts
                 // each to the value-`Case` C-form arm, planning materializes the
                 // gate, and the channel union publishes exactly the selected arm's
-                // value — empty (a naturally-partial feed) when no arm fires. A
-                // *scrutinee / pattern* feed cannot be gated by a boolean
-                // predicate, so it stays rejected.
-                let guard_only =
-                    scrutinee.is_none() && per_branch.iter().all(|(p, ..)| p.is_none());
-                if !guard_only {
-                    return Err(Located::new(
-                        DeferError::PartialFeedCaseUnsupported(defer_name.clone()),
-                        node_id,
-                    ));
-                }
+                // value — empty (a naturally-partial feed) when no arm fires.
+                //
+                // A `match` arm feeds through its tag's projection instead, which restricts:
+                // `(λ __unused : Unit → s) ≫ variant_project(𝑡ᵢ) ≫ (λ xᵢ → vᵢ)` holds `vᵢ`
+                // exactly when the scrutinee `s` carries `𝑡ᵢ`, with the arm's own payload
+                // binder. The projection reads a one-row stream rather than the scalar `s`,
+                // where a restriction would have no domain to narrow. Only a `case _` arm
+                // takes the gated lift, with the tag tests of the arms before it complemented
+                // into its predicate.
                 let unit_ty = Type::Base(BaseType::Unit);
                 let mut prior_guards: Vec<Expr> = Vec::new();
-                for (_, guard, branch_feeds, _) in &per_branch {
-                    let pred = synthesize_arm_predicate(guard, &prior_guards);
-                    prior_guards.push(guard.clone());
+                for (pattern, guard, branch_feeds, _) in &per_branch {
+                    let guard = match (pattern, &scrutinee) {
+                        (Some(pat), Some(scrut)) => tag_test(scrut, pat.tag()),
+                        (None, _) => guard.clone(),
+                        (Some(_), None) => {
+                            unreachable!("a pattern arm dispatches on its Case's scrutinee")
+                        }
+                    };
+                    let pred = synthesize_arm_predicate(&guard, &prior_guards);
+                    prior_guards.push(guard);
                     // `{Unit | π̂ᵢ}` — the gate is constant in the driver element.
                     // Store `π̂ᵢ` *directly* as the refinement's bare predicate (it
                     // does not mention `__elem`): planning's `fn_of_bare_predicate`
@@ -3255,10 +3425,30 @@ fn extract_for_defer_impl(
                         // The channel is a collection, exactly as at the unconditional
                         // const-wrap above; `Expr::lambda` stamps `Compute`, so restate it.
                         // The gated unit is one more level, as the unconditional lift's is.
-                        let vty = v.ty.clone();
+                        let value = match (pattern, &scrutinee) {
+                            (Some(pat), Some(scrut)) => {
+                                let payload_ty = pat.binding.ty.clone();
+                                let one_row =
+                                    Expr::lambda("__unused", unit_ty.clone(), (**scrut).clone())
+                                        .with_ty(Type::data_fun(unit_ty.clone(), scrut.ty.clone()));
+                                let project = Expr::builtin(Builtin::VariantProject(
+                                    FieldKey::Name(pat.tag()),
+                                ))
+                                .with_ty(Type::fun(scrut.ty.clone(), payload_ty));
+                                compose_typed_or_hole(vec![
+                                    one_row,
+                                    project,
+                                    contribution_lambda(&pat.binding, v.clone(), None),
+                                ])
+                            }
+                            _ => {
+                                let vty = v.ty.clone();
+                                Expr::lambda("__unused", refined.clone(), v.clone())
+                                    .with_ty(Type::data_fun(refined.clone(), vty))
+                            }
+                        };
                         feeds.push(Contribution {
-                            value: Expr::lambda("__unused", refined.clone(), v.clone())
-                                .with_ty(Type::data_fun(refined.clone(), vty)),
+                            value,
                             levels: levels + 1,
                             feed: *feed,
                             site: site.clone(),

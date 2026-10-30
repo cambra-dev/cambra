@@ -3844,6 +3844,12 @@ instead of substituting it: the lifted filter is `__elem.0 ▷ (λ 𝑎 → 𝑝
 reads a binder of the filter's own term. A substitution that would capture still fails, where
 it reaches an occurrence (`Mapping::Unspellable`).
 
+Where the pair is iterated, planning applies the lifted filter (`emit_pair_filter` in
+`src/ccl/planning/correlated.rs`). Where it is built by applying the curried lambda, the zip
+states it: exponential beta rewrites `⟨𝑔, curry(ℎ)⟩ ≫ apply` to `⟨id, 𝑔⟩ ≫ ℎ` and refines the
+zip's pairs with `ℎ`'s domain refinements (`simplify::stating_domain_of`), since every pair it
+gives, `(𝑥, 𝑔(𝑥))`, is one `ℎ` was applied to.
+
 ### Iterating a dependent tuple
 
 A curried site over a dependent tuple, `curry(𝑔)` with `𝑔 : ((𝑥 : 𝑋) × 𝐷(𝑥)) ⤇ 𝑉`, has no one

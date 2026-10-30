@@ -1067,6 +1067,60 @@ fn skeletons() -> Vec<Skeleton> {
             out << ap(\x -> x * 10, {})
         "#}},
 
+        // A branch binding a value before it feeds, in a loop: the feed's key is the loop's.
+        Skeleton { name: "loop_branch_binding", hole: Ty::Int, scope: &[("i", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            for i in [1, 2, 3]:
+                if i != 2:
+                    d = i * 2
+                    out << d + {}
+                else:
+                    out << 100
+        "#}},
+        Skeleton { name: "loop_arm_binding", hole: Ty::Int, scope: &[("i", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            for i in [1, 2, 3]:
+                o = `some(i) if i != 2 else `none
+                match o:
+                    case `some(v):
+                        d = v * 2
+                        out << d + {}
+                    case `none:
+                        out << 100
+        "#}},
+        // Two feeds in one branch, which are two sites of the channel, and feeds a conditional
+        // inside a branch guards again.
+        Skeleton { name: "loop_branch_two_feeds", hole: Ty::Int, scope: &[("i", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            for i in [1, 2, 3]:
+                if i != 2:
+                    out << i
+                    out << {}
+                else:
+                    out << 100
+        "#}},
+
+        Skeleton { name: "loop_branch_nested_if", hole: Ty::Int, scope: &[("i", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            for i in [1, 2, 3]:
+                if i != 2:
+                    if i > 2:
+                        out << i + {}
+                    else:
+                        out << 0
+                else:
+                    out << 100
+        "#}},
+        Skeleton { name: "loop_branch_nested_after_binding", hole: Ty::Int, scope: &[("i", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            for i in [1, 2, 3]:
+                if i != 2:
+                    d = i * 3
+                    if d > 4:
+                        out << d + {}
+                else:
+                    out << 100
+        "#}},
         // A product key: a tuple names each group (`Equatable` on a product).
         Skeleton { name: "groupby_tuple_key", hole: Ty::RecColl, scope: &[], body: indoc! {r#"
             out = test_sink()
