@@ -273,6 +273,25 @@ fn guard_depth(g: &TileGuard) -> usize {
     }
 }
 
+/// Whether every field of `tile` has arrived. A field that has not carries no rows, counting its
+/// absent cells, while a sibling carries some (`tiling::tile::valid_over`): its operand has no
+/// answer yet. A collection field with no keys has arrived, since it carries a row start per row.
+/// A value that is no record has arrived.
+fn fields_arrived(tile: &Tile) -> bool {
+    match tile {
+        Tile::Record { fields, absent } => {
+            // A cell released from a field is absent there, not missing (`Tile::Record`).
+            let rows = |name: &SmolStr, field: &Tile| {
+                field.rows() + absent.get(name).map_or(0, BitSet::len)
+            };
+            let missing = fields.iter().any(|(name, field)| rows(name, field) == 0);
+            let present = fields.iter().any(|(name, field)| rows(name, field) > 0);
+            !(missing && present) && fields.values().all(fields_arrived)
+        }
+        _ => true,
+    }
+}
+
 /// Wrap a dense `payload` column at the `tag` arm: that arm owns every row and
 /// every other arm is present but empty — which is what keeps the column total
 /// over `variant_extents`' tags, so a downstream merge or append has an arm to
@@ -352,6 +371,11 @@ impl TileProducer for VariantWrapProducer {
         visit("payload", &*self.input);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("payload", &mut *self.input);
+    }
+
     /// It keeps its input's keys above its level and computes the values beneath it.
     fn restates(&self) -> Restates {
         Restates::Above(self.level)
@@ -400,6 +424,11 @@ impl TileProducer for VariantWrapProducer {
         // Either way the payload becomes a value: an arm rides its row as one, so a payload
         // carrying a collection materializes here rather than staying a level.
         let slot = tile.values_at_mut(self.level);
+        // A record payload is a value only once every field has arrived: an operand with no
+        // answer yet, as a breaker before its first consume, leaves its field empty.
+        if !fields_arrived(slot) {
+            return self.tiling().empty_tile();
+        }
         let payload =
             materialize_collections(std::mem::replace(slot, Tile::Scalar(ColumnValue::Units(0))));
         *slot = Tile::Scalar(wrap_variant_column(
@@ -665,6 +694,11 @@ impl TileProducer for VariantProjectProducer {
         visit("scrutinee", &*self.input);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("scrutinee", &mut *self.input);
+    }
+
     /// A union stream keeps its keys at the rows carrying the tag, so the scrutinee is pulled at
     /// the projection. A bare union has implicit positions for keys, so it is read whole and
     /// the positions cut after.
@@ -909,6 +943,11 @@ impl TileProducer for VariantIsProducer {
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("scrutinee", &*self.input);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("scrutinee", &mut *self.input);
     }
 
     /// Every key in is a key out, so the scrutinee is pulled at the projection.
@@ -1628,6 +1667,69 @@ mod variant_projection_tests {
             !domain_predicate.contains_path(&[Value::UInt(1)]),
             "row 1 is withheld, so it is not complete: {domain_predicate:?}"
         );
+    }
+
+    /// A record payload is wrapped only once every field has arrived: an operand with no answer
+    /// yet leaves its field empty beside a full sibling, and the wrap answers nothing.
+    #[test]
+    fn a_record_payload_with_a_field_not_arrived_wraps_nothing() {
+        let fields = |b: Vec<i64>| {
+            Tile::record(HashMap::from([
+                (SmolStr::new("a"), Tile::Scalar(ColumnValue::Ints(vec![1]))),
+                (SmolStr::new("b"), Tile::Scalar(ColumnValue::Ints(b))),
+            ]))
+        };
+        let record = Extent::Record(
+            [("a", BaseType::Int), ("b", BaseType::Int)]
+                .into_iter()
+                .map(|(name, base)| (SmolStr::new(name), Extent::Base(base)))
+                .collect(),
+        );
+        let out_tiling = Tiling::Scalar(Extent::Union(TagMap::from_arms(vec![(
+            commit(),
+            record.clone(),
+        )])));
+        for (b, wrapped) in [(vec![], false), (vec![2], true)] {
+            let payload_tiling = Tiling::Record(HashMap::from(["a", "b"].map(|name| {
+                (
+                    SmolStr::new(name),
+                    Tiling::Scalar(Extent::Base(BaseType::Int)),
+                )
+            })));
+            let (payload, _, _) = ProjectionSpy::new(fields(b), payload_tiling);
+            let mut wrap = VariantWrapProducer {
+                level: CurryLevel::OUTERMOST,
+                base: ProducerBase::unowned(VariantWrapProducer::alloc_id(), &out_tiling),
+                input: Box::new(payload),
+                tag: commit(),
+                variant_extents: TagMap::from_arms(vec![(commit(), record.clone())]),
+            };
+            let tile = wrap.get(out_tiling.universal_guard());
+            assert_eq!(!tile.is_empty(), wrapped, "{tile:?}");
+        }
+    }
+
+    /// A collection field with no keys has arrived: it carries its row start beside the
+    /// sibling's row, where a scalar field with no entries has not.
+    #[test]
+    fn a_record_field_holding_an_empty_collection_has_arrived() {
+        let with_b = |b: Tile| {
+            Tile::record(HashMap::from([
+                (SmolStr::new("a"), Tile::Scalar(ColumnValue::Ints(vec![1]))),
+                (SmolStr::new("b"), b),
+            ]))
+        };
+        let empty_collection = Tile::grouped(
+            vec![0],
+            ColumnValue::UInts(vec![]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        assert!(fields_arrived(&with_b(empty_collection)));
+        assert!(!fields_arrived(&with_b(Tile::Scalar(ColumnValue::Ints(
+            vec![]
+        )))));
     }
 
     #[test]
