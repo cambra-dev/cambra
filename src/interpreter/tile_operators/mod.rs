@@ -59,8 +59,12 @@ mod helpers;
 mod iterate;
 mod lookup;
 mod map;
+#[cfg(test)]
+mod program_run_tests;
 mod reshape;
 mod scalar;
+#[cfg(test)]
+mod sink_breaker;
 mod union;
 
 pub use aggregate::*;
@@ -75,6 +79,8 @@ pub use lookup::*;
 pub use map::*;
 pub use reshape::*;
 pub use scalar::*;
+#[cfg(test)]
+pub(crate) use sink_breaker::SinkBreaker;
 pub use union::*;
 
 /// Static descriptor of a computation node in the tile dataflow graph.
@@ -242,6 +248,46 @@ pub(crate) fn subscribe_forwarding_keeping_keys_if(
     match keeps_keys {
         true => subscribe_forwarding_keeping_keys(op, shared, scheduler),
         false => subscribe_forwarding(op, shared, scheduler),
+    }
+}
+
+/// What a pipeline breaker's operator passes its input, and what the breaker keeps. The breaker
+/// keeps the consumer it was subscribed with, shared so the breaker can push to it. The consumer
+/// is shared behind a gate that passes every notification (`Notified::Always`), so sharing it
+/// changes no notification it receives. The input's notifications reach it unchanged where the
+/// breaker keeps its input's keys, and as `Everything` where it re-keys or reads the input whole.
+/// In front of the input sits the [`Entry`](crate::interpreter::dispatcher::Entry) a planner
+/// places in the breaker's pipeline.
+pub(crate) struct BreakerInput {
+    /// The consumer to subscribe the input with.
+    pub(crate) consumer: Box<dyn Consumer>,
+    /// The breaker's own consumer, shared, which it pushes to (`ProducerBase::breaking`).
+    pub(crate) downstream: crate::interpreter::SharedConsumer,
+    /// The pipeline the entry queues for (`ProducerBase::breaking`).
+    pub(crate) placement: crate::interpreter::dispatcher::Placement,
+}
+
+impl BreakerInput {
+    /// The input consumer of a breaker subscribed with `consumer`, whose input answers `input`,
+    /// and which keeps its input's keys where `keeps_keys`.
+    pub(crate) fn new(
+        consumer: Box<dyn Consumer>,
+        input: &Tiling,
+        keeps_keys: bool,
+        scheduler: &Scheduler,
+    ) -> Self {
+        let shared = GatedConsumer::new(consumer, Notified::Always);
+        let forwarding = match keeps_keys {
+            true => forwarding_consumer_keeping_keys(&shared, &scheduler.wakeup_queue()),
+            false => forwarding_consumer(&shared, &scheduler.wakeup_queue()),
+        };
+        let (entry, placement) =
+            crate::interpreter::dispatcher::Entry::unplaced(input.clone(), forwarding);
+        BreakerInput {
+            consumer: Box::new(entry),
+            downstream: shared.shared().clone(),
+            placement,
+        }
     }
 }
 
@@ -886,9 +932,12 @@ pub struct ProducerBase {
     /// changes ([`completeness_violation`]). Debug builds only; `None` in release.
     pub(crate) last_output: Option<Tile>,
     /// For a pipeline breaker, the consumer its pushes climb (`dispatcher::Pushes`), which is
-    /// its reader's chain. `None` for a breaker no one pushes through, and for every other
-    /// producer.
+    /// its reader's chain; for a range (`IterateExtent`), the consumer a planner pushes its region
+    /// through once. `None` for every other producer.
     pub(crate) downstream: Option<crate::interpreter::SharedConsumer>,
+    /// For a pipeline breaker, the pipeline the [`Entry`](crate::interpreter::dispatcher::Entry)
+    /// at its input queues for, which a planner sets. `None` for every other producer.
+    pub(crate) placement: Option<crate::interpreter::dispatcher::Placement>,
 }
 
 impl ProducerBase {
@@ -909,7 +958,27 @@ impl ProducerBase {
             pulls: 0,
             last_output: None,
             downstream: None,
+            placement: None,
         }
+    }
+
+    /// This producer is a pipeline breaker: it pushes to `downstream`, the consumer it was
+    /// subscribed with, and the entry at its input queues for the pipeline `placement` names.
+    pub(crate) fn breaking(
+        mut self,
+        downstream: crate::interpreter::SharedConsumer,
+        placement: crate::interpreter::dispatcher::Placement,
+    ) -> Self {
+        self.downstream = Some(downstream);
+        self.placement = Some(placement);
+        self
+    }
+
+    /// This producer has no input, and a planner pushes its region through `consumer`, the one it
+    /// was subscribed with.
+    pub(crate) fn leaf(mut self, consumer: crate::interpreter::SharedConsumer) -> Self {
+        self.downstream = Some(consumer);
+        self
     }
 
     /// Push this breaker's work to `consumer`, the head of its reader's chain.
@@ -940,6 +1009,7 @@ impl ProducerBase {
             pulls: 0,
             last_output: None,
             downstream: None,
+            placement: None,
         }
     }
 }
@@ -1262,8 +1332,8 @@ pub trait Breaker {
     fn input_released(&self, input: InputId) -> TileGuard;
 
     /// The breaker as a producer that other pipelines read: a [`BreakingProducer`] answers
-    /// itself. A breaker that is no producer answers `None`, and pushes nothing, after a consume
-    /// or at a finish.
+    /// itself, and a breaker that is no producer, such as a sink's, answers `None`. A breaker
+    /// that answers `None` pushes nothing, after a consume or at a finish.
     fn as_producer(&self) -> Option<&dyn BreakingProducer>;
 
     /// Finish an epoch once the pipeline has consumed every package of it. `last` says the epoch
@@ -1617,6 +1687,18 @@ pub trait TileProducer {
     /// `scheduler::pull_laps`'s debug check that a woken
     /// consumer pulls walks. A producer that pulls nothing visits nothing.
     fn visit_input_producers(&self, _visit: &mut dyn FnMut(&str, &dyn TileProducer)) {}
+
+    /// [`visit_input_producers`](Self::visit_input_producers) with each producer mutable: the
+    /// same producers, in the same order, under the same roles. A test driver walks it to reach
+    /// the pipeline breakers inside a chain (`as_breaking_mut`).
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, _visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {}
+
+    /// This producer as a pipeline breaker, where it is one.
+    #[cfg(test)]
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        None
+    }
 
     /// Hook for adding any children to the InspectNode: by default, each producer
     /// [`visit_input_producers`](Self::visit_input_producers) visits, under its role.
