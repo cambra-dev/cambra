@@ -1,0 +1,3 @@
+run lines as a
+run lines as b
+(["a " + line for line in a::lines], ["b " + line for line in b::lines])
