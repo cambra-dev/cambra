@@ -76,13 +76,14 @@ fn cut(guard: &TileGuard, rows: usize) -> Vec<TileGuard> {
     cut_before(&predicate(guard), &cuts, &Extent::uint_range(UNIVERSE))
 }
 
-/// The keys of `consumed` a pipeline that keeps every `keep`-th key holds: none for `keep` 0.
-fn kept(consumed: u64, keep: u64) -> u64 {
+/// The keys of `consumed` a pipeline that keeps every `keep`-th key, from key `offset` on,
+/// holds: none for `keep` 0.
+fn kept(consumed: u64, keep: u64, offset: u64) -> u64 {
     match keep {
         0 => 0,
         _ => {
             (0..UNIVERSE)
-                .filter(|key| key % keep == 0)
+                .filter(|key| key % keep == offset % keep)
                 .fold(0, |mask, key| mask | 1 << key)
                 & consumed
         }
@@ -95,10 +96,19 @@ struct Script {
     reads: Vec<Vec<usize>>,
     rows: usize,
     ordered: Vec<bool>,
-    /// The positions of each source pipeline's input; unused for a pipeline that reads one.
+    /// The positions of each source pipeline's input, and of each input read whole; unused for a
+    /// pipeline that reads the pushes of the one it reads.
     positions: Vec<u64>,
-    /// Each pipeline holds every `keep`-th key it consumed when it finalizes, and none for 0.
+    /// Each pipeline holds every `keep`-th key it consumed when it finalizes, from key `offset`
+    /// on, and none for `keep` 0.
     keep: Vec<u64>,
+    offset: Vec<u64>,
+    /// Per pipeline that reads others, whether it reads its input whole once they have finished;
+    /// one that reads several does unless it reads them restated.
+    whole: Vec<bool>,
+    /// Per pipeline that reads others, whether it reads their pushes restated under no tags, so
+    /// that they push disjoint keys.
+    mapped: Vec<bool>,
 }
 
 impl Script {
@@ -120,7 +130,23 @@ impl Script {
                 dispatcher.order(PipelineId(pipeline));
             }
         }
+        for pipeline in (0..self.count()).filter(|p| self.whole[*p]) {
+            dispatcher.read_whole(PipelineId(pipeline), &keys_tiling(self.positions[pipeline]));
+        }
+        for pipeline in (0..self.count()).filter(|p| self.mapped[*p]) {
+            let edges = self.reads[pipeline]
+                .iter()
+                .map(|read| (PipelineId(*read), Vec::new()))
+                .collect();
+            dispatcher.read_mapped(PipelineId(pipeline), edges, Vec::new());
+        }
         dispatcher
+    }
+
+    /// Whether `pipeline` starts from an input of its own: a source, or a pipeline that reads its
+    /// input whole.
+    fn reads_own_input(&self, pipeline: usize) -> bool {
+        self.reads[pipeline].is_empty() || self.whole[pipeline]
     }
 
     fn start(&self, dispatcher: &Dispatcher) {
@@ -149,6 +175,9 @@ impl Script {
             ordered: vec![false; count],
             positions: vec![positions; count],
             keep: vec![1; count],
+            offset: vec![0; count],
+            whole: vec![false; count],
+            mapped: vec![false; count],
         }
     }
 
@@ -185,9 +214,37 @@ impl Script {
         Self::random_over(rng, reads)
     }
 
+    /// A random acyclic graph over up to `most` pipelines, numbered in a random order: each
+    /// pipeline reads up to three that come before it, and one that reads several, or one in
+    /// four that reads one, reads its input whole.
+    fn random_dags(rng: &mut Rng, most: u64) -> Self {
+        let count = 1 + rng.below(most) as usize;
+        let mut order: Vec<usize> = (0..count).collect();
+        for at in (1..count).rev() {
+            order.swap(at, rng.below(at as u64 + 1) as usize);
+        }
+        let mut reads = vec![Vec::new(); count];
+        for at in 1..count {
+            for _ in 0..rng.below(4) {
+                let read = order[rng.below(at as u64) as usize];
+                if !reads[order[at]].contains(&read) {
+                    reads[order[at]].push(read);
+                }
+            }
+        }
+        let mut script = Self::random_over(rng, reads);
+        for pipeline in 0..count {
+            if script.reads[pipeline].len() == 1 && rng.below(4) == 0 {
+                script.whole[pipeline] = true;
+            }
+        }
+        script
+    }
+
     /// A script over the pipelines `reads` describes, with random morsels, order, inputs and keys.
     fn random_over(rng: &mut Rng, reads: Vec<Vec<usize>>) -> Self {
         let count = reads.len();
+        let reads_several = reads.iter().map(|read| read.len() > 1).collect();
         let rows = match rng.below(6) {
             0 => UNIVERSE as usize,
             rows => rows as usize,
@@ -198,6 +255,9 @@ impl Script {
             ordered: (0..count).map(|_| rng.below(3) == 0).collect(),
             positions: (0..count).map(|_| rng.below(41)).collect(),
             keep: (0..count).map(|_| rng.below(4)).collect(),
+            offset: vec![0; count],
+            whole: reads_several,
+            mapped: vec![false; count],
         }
     }
 }
@@ -221,7 +281,7 @@ struct Observed {
 impl Observed {
     fn of(script: &Script) -> Self {
         let count = script.count();
-        let sources = |p: usize| match script.reads[p].is_empty() {
+        let sources = |p: usize| match script.reads_own_input(p) {
             true => u64::MAX,
             false => 0,
         };
@@ -371,7 +431,7 @@ fn finalize(
         observed.consumed[p].load(SeqCst),
         "pipeline {p} finalizes with every package it consumed recorded"
     );
-    let held = guard_of(kept(consumed, script.keep[p]));
+    let held = guard_of(kept(consumed, script.keep[p], script.offset[p]));
     let mut pushes = dispatcher.pushes(pipeline);
     let mut pushed = Vec::new();
     pushes.push(&held, |guard, rows| {
@@ -380,7 +440,9 @@ fn finalize(
     });
     let keys = pushed.iter().fold(0, |keys, morsel| keys | mask_of(morsel));
     for reader in script.readers(p) {
-        observed.queued[reader].store(keys, SeqCst);
+        if !script.whole[reader] {
+            observed.queued[reader].fetch_or(keys, SeqCst);
+        }
     }
     observed.finished[p].store(true, SeqCst);
     dispatcher.finish(pushes);
@@ -397,6 +459,7 @@ struct ScriptBreaker {
     base: ProducerBase,
     input: Tiling,
     keep: u64,
+    offset: u64,
     consumed: u64,
 }
 
@@ -424,7 +487,7 @@ impl BreakingProducer for ScriptBreaker {
     }
 
     fn held(&self) -> TileGuard {
-        guard_of(kept(self.consumed, self.keep))
+        guard_of(kept(self.consumed, self.keep, self.offset))
     }
 
     fn morsels(&self, guard: &TileGuard, rows: usize) -> Vec<TileGuard> {
@@ -447,7 +510,7 @@ struct Outcome {
 fn single_threaded(script: &Script) -> (Outcome, usize) {
     let breakers: Vec<BreakerHandle> = (0..script.count())
         .map(|p| {
-            let input = match script.reads[p].is_empty() {
+            let input = match script.reads_own_input(p) {
                 true => keys_tiling(script.positions[p]),
                 false => keys_tiling(UNIVERSE),
             };
@@ -455,6 +518,7 @@ fn single_threaded(script: &Script) -> (Outcome, usize) {
                 base: ProducerBase::unowned(ScriptBreaker::alloc_id(), &keys_tiling(UNIVERSE)),
                 input,
                 keep: script.keep[p],
+                offset: script.offset[p],
                 consumed: 0,
             }));
             breaker
@@ -597,29 +661,33 @@ fn assert_ordered_events(script: &Script, events: &[Event], records: &[Record]) 
             );
         }
     }
+    let mut pushes = vec![Vec::new(); script.count()];
     for record in records {
-        let Record::Finalized {
+        if let Record::Finalized {
             pipeline, pushed, ..
         } = record
-        else {
-            continue;
-        };
-        for reader in script.readers(*pipeline) {
-            let consumed: Vec<TileGuard> = events
-                .iter()
-                .filter_map(|event| match event {
-                    Event::Consume {
-                        pipeline: at,
-                        guard,
-                    } if *at == PipelineId(reader) => Some(guard.clone()),
-                    _ => None,
-                })
-                .collect();
-            assert!(
-                same_guards(&consumed, pushed),
-                "pipeline {reader} consumes exactly the morsels pipeline {pipeline} pushed"
-            );
+        {
+            pushes[*pipeline] = pushed.clone();
         }
+    }
+    for reader in (0..script.count()).filter(|p| !script.reads_own_input(*p)) {
+        let consumed: Vec<TileGuard> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::Consume { pipeline, guard } if *pipeline == PipelineId(reader) => {
+                    Some(guard.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        let pushed: Vec<TileGuard> = script.reads[reader]
+            .iter()
+            .flat_map(|read| pushes[*read].iter().cloned())
+            .collect();
+        assert!(
+            same_guards(&consumed, &pushed),
+            "pipeline {reader} consumes exactly the morsels the pipelines it reads pushed"
+        );
     }
 }
 
@@ -835,8 +903,10 @@ fn random_trees_match_the_single_threaded_run() {
 fn a_pipeline_read_by_six_runs_on_many_threads() {
     for seed in 1..=10 {
         for threads in THREADS {
-            let mut script = Script::chains(&[1], 1, 30);
-            script.reads.extend((0..6).map(|_| vec![0]));
+            let mut script = Script::chains(&[1; 7], 1, 30);
+            for reader in 1..7 {
+                script.reads[reader] = vec![0];
+            }
             script.ordered = vec![false, true, false, false, true, false, false];
             script.positions = vec![30; 7];
             script.keep = vec![1, 1, 2, 1, 3, 1, 0];
@@ -844,6 +914,59 @@ fn a_pipeline_read_by_six_runs_on_many_threads() {
             let what = format!("seed {seed}, {threads} threads");
             agrees_with_the_single_threaded_run(script, workers, what);
         }
+    }
+}
+
+/// Random acyclic graphs, where a pipeline may read several pipelines and read its input whole,
+/// at every thread count: each reader consumes only after every pipeline it reads finalized,
+/// and the run consumes and holds what the single-threaded run does.
+#[test]
+fn random_dags_match_the_single_threaded_run() {
+    let mut fanned_in = 0;
+    for seed in 1..=40u64 {
+        let script = Script::random_dags(&mut Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15)), 10);
+        fanned_in += usize::from(script.reads.iter().any(|read| read.len() > 1));
+        for threads in THREADS {
+            let workers = workers(threads, seed, script.count(), seed % 2 == 0);
+            let what = format!("seed {seed}, {threads} threads, {script:?}");
+            agrees_with_the_single_threaded_run(script.clone(), workers, what);
+        }
+    }
+    assert!(
+        fanned_in >= 10,
+        "a pipeline reads several in {fanned_in} of 40 scripts"
+    );
+}
+
+/// Six sources of one package each, read by one pipeline, at once on many threads, two hundred
+/// times: the finishes race, and the last of them writes the reader's queue, exactly once.
+#[test]
+fn the_finishes_of_six_pipelines_one_reads_race() {
+    for iteration in 1..=200u64 {
+        let mut script = Script::chains(&[1, 1, 1, 1, 1, 1, 1], UNIVERSE as usize, 4);
+        script.reads[6] = (0..6).collect();
+        script.whole[6] = true;
+        script.ordered[6] = iteration % 2 == 0;
+        let workers = workers(8, iteration, script.count(), false);
+        let what = format!("iteration {iteration}");
+        agrees_with_the_single_threaded_run(script, workers, what);
+    }
+}
+
+/// Six sources that keep disjoint keys, read restated by one pipeline, at once on many threads,
+/// two hundred times: the last finish writes the reader's queue from every source's packages,
+/// whichever finish that is.
+#[test]
+fn the_finishes_of_six_pipelines_one_reads_restated_race() {
+    for iteration in 1..=200u64 {
+        let mut script = Script::chains(&[1, 1, 1, 1, 1, 1, 1], 3, UNIVERSE);
+        script.reads[6] = (0..6).collect();
+        script.mapped[6] = true;
+        script.keep = vec![6, 6, 6, 6, 6, 6, 1];
+        script.offset = vec![0, 1, 2, 3, 4, 5, 0];
+        let workers = workers(8, iteration, script.count(), false);
+        let what = format!("iteration {iteration}");
+        agrees_with_the_single_threaded_run(script, workers, what);
     }
 }
 

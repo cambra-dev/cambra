@@ -278,52 +278,129 @@ fn a_union_written_out_whole() {
     );
 }
 
-/// Two aggregates of one binding: their pipelines both read its memo, and the planner plans that,
-/// but the output's memo reads both aggregates, so a pipeline reads two and the dispatcher refuses
-/// it. Each sink's output is compiled on its own, so two sinks read no binding in common.
+/// Two aggregates of one binding: their pipelines both read its memo, and the output's memo
+/// reads both aggregates through the expression combining them, so it reads its input whole
+/// once both have finished.
 #[test]
-#[should_panic(expected = "reads pipelines")]
-fn two_aggregates_of_one_binding_are_refused_where_they_meet() {
-    dispatched(
+fn two_aggregates_of_one_binding() {
+    answers_as_pull_mode_does(
         indoc! {"
             out = test_sink()
             xs = [1, 2, 3, 4]
             out << sum(xs) * 10 + max(xs)
         "},
-        1,
+        &["Memo", "Aggregate", "ExtractAggregate"],
     );
 }
 
 /// A group-by's memo reads its input's memo and the `Converse` that keys the groups, which reads
-/// that input's memo too: the input's memo has two readers, and the group-by's memo reads two.
+/// that input's memo too, so it reads its input whole once both have finished.
 #[test]
-#[should_panic(expected = "reads pipelines")]
-fn a_group_by_is_refused() {
-    dispatched(
-        indoc! {"
-            out = test_sink()
-            xs = [1, 2, 3, 4]
-            g = groupby(xs, \\x -> x > 2)
-            out << sum([sum(v) for v in g])
-        "},
-        1,
+fn a_sum_of_group_sums() {
+    let source = indoc! {"
+        out = test_sink()
+        xs = [1, 2, 3, 4]
+        g = groupby(xs, \\x -> x > 2)
+        out << sum([sum(v) for v in g])
+    "};
+    answers_as_pull_mode_does(source, &["Memo", "Converse", "MapAggregate"]);
+    let (_, ran) = dispatched(source, 1);
+    let group_sums = breaker(&ran, "MapAggregate");
+    assert_eq!(group_sums.reading, "whole", "{group_sums:?}");
+}
+
+/// A sum read inside another comprehension: the outer sum's pipeline reads the inner sum's and
+/// its own input's. Its chain reaches the inner sum through a producer whose
+/// `TileProducer::input_keys` answers nothing for that input, so it reads its input whole once
+/// both have finished.
+#[test]
+fn a_sum_read_inside_another_comprehension() {
+    let source = indoc! {"
+        out = test_sink()
+        ys = [1, 2]
+        n = sum(ys)
+        xs = [1, 2, 3]
+        out << sum([x * n for x in xs])
+    "};
+    answers_as_pull_mode_does(source, &["Memo", "Aggregate"]);
+    let (_, ran) = dispatched(source, 1);
+    let outer = ran
+        .iter()
+        .rfind(|ran| ran.name.starts_with("Aggregate"))
+        .expect("the outer sum's pipeline, the last aggregate's");
+    assert_eq!(
+        (outer.reading, outer.consumed.len()),
+        ("whole", 3),
+        "{outer:?}"
     );
 }
 
-/// A sum read inside another comprehension makes that comprehension's pipeline read two.
+/// A sum over a union of two comprehensions: the sum reads both comprehensions' memos, each
+/// under its own arm's tag, and nothing else.
 #[test]
-#[should_panic(expected = "reads pipelines")]
-fn a_pipeline_reading_two_pipelines_is_refused() {
-    dispatched(
-        indoc! {"
-            out = test_sink()
-            ys = [1, 2]
-            n = sum(ys)
-            xs = [1, 2, 3]
-            out << sum([x * n for x in xs])
-        "},
-        1,
+fn a_sum_over_a_union_of_two_comprehensions() {
+    let source = indoc! {"
+        out = test_sink()
+        xs = [1, 2, 3]
+        ys = [10, 20]
+        out << sum([x * 2 for x in xs] ++ [y + 1 for y in ys])
+    "};
+    answers_as_pull_mode_does(source, &["Memo", "Aggregate"]);
+    for (rows, first, second) in [(1, 3, 2), (usize::MAX, 1, 1)] {
+        let (_, ran) = dispatched(source, rows);
+        let sum = breaker(&ran, "Aggregate");
+        let under = |tag: usize| {
+            let arm = under_tags(&[tag], Predicate::True);
+            sum.consumed
+                .iter()
+                .filter(|guard| {
+                    matches!(guard, TileGuard::Function(FunctionGuard::Domain(keys))
+                        if arm.subsumes(keys))
+                })
+                .count()
+        };
+        assert_eq!(
+            (under(0), under(1)),
+            (first, second),
+            "at morsels of {rows}"
+        );
+        assert_eq!(
+            sum.consumed.len(),
+            first + second,
+            "no other package: {sum:?}"
+        );
+    }
+}
+
+/// A sum over a comprehension unioned with itself: each arm reads a memo of its own, and the sum
+/// consumes each memo's morsels under its arm's tag.
+#[test]
+fn a_sum_over_a_comprehension_unioned_with_itself() {
+    let source = indoc! {"
+        out = test_sink()
+        xs = [1, 2, 3]
+        ys = [x * 2 for x in xs]
+        out << sum(ys ++ ys)
+    "};
+    answers_as_pull_mode_does(source, &["Memo", "Aggregate"]);
+    let (_, ran) = dispatched(source, 1);
+    let sum = breaker(&ran, "Aggregate");
+    let under = |tag: usize| {
+        let arm = under_tags(&[tag], Predicate::True);
+        sum.consumed
+            .iter()
+            .filter(|guard| {
+                matches!(guard, TileGuard::Function(FunctionGuard::Domain(keys))
+                    if arm.subsumes(keys))
+            })
+            .count()
+    };
+    assert_eq!(
+        (sum.reading, under(0), under(1)),
+        ("mapped", 3, 3),
+        "{sum:?}"
     );
+    assert_eq!(sum.consumed.len(), 6, "no other package: {sum:?}");
 }
 
 #[test]

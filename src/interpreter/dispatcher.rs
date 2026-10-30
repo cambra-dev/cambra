@@ -262,9 +262,9 @@ impl Queue {
     }
 }
 
-/// How a pipeline's queue is filled from what the pipeline it reads pushes.
+/// How a pipeline's queue is filled from what the pipelines it reads push.
 enum Reading {
-    /// The pushed morsels as they are.
+    /// The pushed morsels as they are, of the one pipeline it reads.
     Pushed,
     /// Its breaker's input whole, as that input's morsels ([`Dispatcher::read_whole`]).
     Whole(Vec<TileGuard>),
@@ -272,23 +272,25 @@ enum Reading {
     Mapped(Mapped),
 }
 
-/// How a reader's packages restate the pushes of the pipeline it reads
+/// How a reader's packages restate the pushes of the pipelines it reads
 /// ([`Dispatcher::read_mapped`]).
 struct Mapped {
-    /// The tags a pushed guard is restated under, innermost first.
-    tags: Vec<FieldKey>,
+    /// Per pipeline whose pushes are restated, the tags a pushed guard is restated under,
+    /// innermost first. A pipeline may be named once per tag path it is read under. A pipeline
+    /// read but not named here is waited for, and its pushes are not queued for this reader.
+    edges: Vec<(usize, Vec<FieldKey>)>,
     /// The regions of the reader's input no pipeline pushes, one package each.
     uncovered: Vec<TileGuard>,
 }
 
 impl Mapped {
-    /// `guard`, a guard of the pushing breaker's outermost keys, under each tag in turn; `None`
-    /// for a guard that names more than the outermost keys.
-    fn restate(&self, guard: &TileGuard) -> Option<TileGuard> {
+    /// `guard`, a guard of the pushing breaker's outermost keys, under each of `tags` in turn;
+    /// `None` for a guard that names more than the outermost keys.
+    fn restate(tags: &[FieldKey], guard: &TileGuard) -> Option<TileGuard> {
         let TileGuard::Function(FunctionGuard::Domain(keys)) = guard else {
             return None;
         };
-        let keys = self.tags.iter().fold(keys.clone(), |keys, tag| {
+        let keys = tags.iter().fold(keys.clone(), |keys, tag| {
             Predicate::tagged(TagMap::from_arms(vec![(tag.clone(), keys)]), false)
         });
         Some(TileGuard::Function(FunctionGuard::Domain(keys)))
@@ -303,6 +305,9 @@ struct EpochPipeline {
     /// How many of the pipeline's packages in the epoch have been acknowledged.
     acknowledged: AtomicUsize,
     phase: AtomicPhase,
+    /// How many of the pipelines it reads have not finished the epoch. The finish that brings it
+    /// to zero closes the queue.
+    unfinished: AtomicUsize,
 }
 
 /// What the dispatcher keeps for one epoch, every pipeline's part of it. The window's slot holds
@@ -316,18 +321,21 @@ struct EpochState {
 }
 
 impl EpochState {
-    fn new(number: u64, pipelines: usize) -> Self {
+    /// Epoch `number` of the pipelines `reads` describes.
+    fn new(number: u64, reads: &[Vec<usize>]) -> Self {
         EpochState {
             number,
-            pipelines: (0..pipelines)
-                .map(|_| EpochPipeline {
+            pipelines: reads
+                .iter()
+                .map(|read| EpochPipeline {
                     queue: Queue::new(),
                     claimed: AtomicUsize::new(0),
                     acknowledged: AtomicUsize::new(0),
                     phase: AtomicPhase::new(Phase::Running),
+                    unfinished: AtomicUsize::new(read.len()),
                 })
                 .collect(),
-            unfinished: AtomicUsize::new(pipelines),
+            unfinished: AtomicUsize::new(reads.len()),
         }
     }
 }
@@ -424,23 +432,28 @@ impl Dispatcher {
     /// window holds [`DEFAULT_WINDOW`] epochs.
     ///
     /// Several pipelines may read one pipeline, each through a `FanOut` slot of its own: without
-    /// one, the release of one reader would remove what another has still to read.
+    /// one, the release of one reader would remove what another has still to read. A pipeline may
+    /// read several pipelines, and its queue is written at the finish of the last of them. A
+    /// pushed guard names the pushing breaker's keys, so such a pipeline reads their pushes
+    /// restated ([`read_mapped`](Dispatcher::read_mapped)) or its input whole
+    /// ([`read_whole`](Dispatcher::read_whole)); one left to read them as pushed is refused at the
+    /// finish that would write its queue.
     ///
     /// # Panics
     ///
-    /// When `morsel_rows` is zero, when a pipeline reads one that does not exist or reads more
-    /// than one pipeline, or when the graph has a cycle. A breaker has one input, so its pipeline
-    /// reads at most one other. A pipeline in a cycle would wait for itself to finish.
+    /// When `morsel_rows` is zero, when a pipeline reads one that does not exist or reads one
+    /// pipeline twice, or when the graph has a cycle. A pipeline in a cycle would wait for itself
+    /// to finish.
     pub fn new(reads: Vec<Vec<usize>>, morsel_rows: usize) -> Self {
         assert!(morsel_rows > 0, "a morsel holds at least one row");
         let count = reads.len();
         let mut readers = vec![Vec::new(); count];
         for (pipeline, read) in reads.iter().enumerate() {
-            assert!(
-                read.len() <= 1,
-                "pipeline {pipeline} reads pipelines {read:?}; a breaker has one input"
-            );
-            for &child in read {
+            for (at, &child) in read.iter().enumerate() {
+                assert!(
+                    !read[..at].contains(&child),
+                    "pipeline {pipeline} reads pipeline {child} once"
+                );
                 assert!(
                     child < count,
                     "pipeline {pipeline} reads {child}, which is not one"
@@ -461,6 +474,7 @@ impl Dispatcher {
                 in_flight: AtomicBool::new(false),
             })
             .collect();
+        let window = Self::slots(DEFAULT_WINDOW, &reads);
         Self {
             morsel_rows,
             reads,
@@ -469,7 +483,7 @@ impl Dispatcher {
             reading: (0..count).map(|_| Reading::Pushed).collect(),
             credit: vec![usize::MAX; count],
             pipelines,
-            window: Self::slots(DEFAULT_WINDOW, count),
+            window,
             current: AtomicU64::new(0),
             last: AtomicU64::new(UNKNOWN),
             done: AtomicBool::new(false),
@@ -486,10 +500,10 @@ impl Dispatcher {
         }
     }
 
-    /// A window of `epochs` slots holding epochs `0..epochs`.
-    fn slots(epochs: usize, pipelines: usize) -> Vec<RwLock<Arc<EpochState>>> {
+    /// A window of `epochs` slots holding epochs `0..epochs` of the pipelines `reads` describes.
+    fn slots(epochs: usize, reads: &[Vec<usize>]) -> Vec<RwLock<Arc<EpochState>>> {
         (0..epochs as u64)
-            .map(|number| RwLock::new(Arc::new(EpochState::new(number, pipelines))))
+            .map(|number| RwLock::new(Arc::new(EpochState::new(number, reads))))
             .collect()
     }
 
@@ -515,7 +529,7 @@ impl Dispatcher {
                 }),
             "a window is set before any notify, seal or close"
         );
-        self.window = Self::slots(epochs, self.reads.len());
+        self.window = Self::slots(epochs, &self.reads);
     }
 
     /// Mark `pipeline`, which reads a pipeline, as consuming its breaker's input whole, `input`
@@ -537,29 +551,44 @@ impl Dispatcher {
         self.read(pipeline, Reading::Whole(seed(input, self.morsel_rows)));
     }
 
-    /// Mark `pipeline`, which reads a pipeline, as consuming that pipeline's pushed morsels
-    /// restated in its own breaker's input keys, in each epoch, and `uncovered` besides, in the
-    /// run's last epoch. A pushed guard of the pushing breaker's outermost keys is restated under
-    /// each tag of `tags` in turn, innermost first, as the producers between the two breakers tag
-    /// the pushing breaker's keys, a union's arm for each. `uncovered` are the regions of the
+    /// Mark `pipeline`, which reads a pipeline, as consuming the pushed morsels of each pipeline
+    /// `edges` names restated in its own breaker's input keys, in each epoch, and `uncovered`
+    /// besides, in the run's last epoch. A pushed guard of the pushing breaker's outermost keys
+    /// is restated under each of its edge's tags in turn, innermost first, as the producers
+    /// between the two breakers tag the pushing breaker's keys, a union's arm for each. An edge
+    /// names a pipeline once per tag path it is read under, as a union of one binding with itself
+    /// reads it under each arm. A pipeline `pipeline` reads that `edges` does not name is waited
+    /// for, and its pushes are not queued for `pipeline`. `uncovered` are the regions of the
     /// reader's input no pipeline pushes, each a guard of the reader's breaker's input, consumed
-    /// as one package each.
+    /// as one package each. A debug build asserts at each append that the restated pushes and
+    /// `uncovered` meet no region queued before in the epoch.
     ///
     /// # Panics
     ///
-    /// When `pipeline` reads no pipeline.
+    /// When `pipeline` reads no pipeline, or an edge names a pipeline it does not read.
     pub fn read_mapped(
         &mut self,
         pipeline: PipelineId,
-        tags: Vec<FieldKey>,
+        edges: Vec<(PipelineId, Vec<FieldKey>)>,
         uncovered: Vec<TileGuard>,
     ) {
+        let p = pipeline.0;
         assert!(
-            !self.reads[pipeline.0].is_empty(),
-            "pipeline {} reads mapped pushes only from a pipeline it reads",
-            pipeline.0
+            !self.reads[p].is_empty(),
+            "pipeline {p} reads mapped pushes only from a pipeline it reads"
         );
-        self.read(pipeline, Reading::Mapped(Mapped { tags, uncovered }));
+        for (child, _) in &edges {
+            assert!(
+                self.reads[p].contains(&child.0),
+                "pipeline {p} restates the pushes only of a pipeline it reads: {}",
+                child.0
+            );
+        }
+        let edges = edges
+            .into_iter()
+            .map(|(child, tags)| (child.0, tags))
+            .collect();
+        self.read(pipeline, Reading::Mapped(Mapped { edges, uncovered }));
     }
 
     /// Set how `pipeline`'s queue is filled.
@@ -886,6 +915,7 @@ impl Dispatcher {
         if !self.ordered[pipeline] {
             return epochs
                 .iter()
+                .filter(|epoch| self.takes_from(pipeline, epoch))
                 .find_map(|epoch| Self::claim_in(pipeline, epoch));
         }
         let state = &self.pipelines[pipeline];
@@ -898,8 +928,9 @@ impl Dispatcher {
         {
             return None;
         }
-        let package =
-            Self::unfinished(pipeline, epochs).and_then(|epoch| Self::claim_in(pipeline, epoch));
+        let package = Self::unfinished(pipeline, epochs)
+            .filter(|epoch| self.takes_from(pipeline, epoch))
+            .and_then(|epoch| Self::claim_in(pipeline, epoch));
         if package.is_none() {
             state.in_flight.store(false, Ordering::SeqCst);
             // A claim that found the flag held answered nothing for the pipeline, and may wait on
@@ -908,13 +939,20 @@ impl Dispatcher {
             // after the release sees that package's advance and every write before it, and a
             // second look finds the package and wakes that claim.
             self.generation.load(Ordering::SeqCst);
-            if Self::unfinished(pipeline, &self.epochs())
-                .is_some_and(|epoch| Self::claimable(pipeline, epoch))
-            {
+            if Self::unfinished(pipeline, &self.epochs()).is_some_and(|epoch| {
+                self.takes_from(pipeline, epoch) && Self::claimable(pipeline, epoch)
+            }) {
                 self.advance();
             }
         }
         package
+    }
+
+    /// Whether a claim may take `pipeline`'s packages in `epoch`. A reader takes an epoch's
+    /// packages once every pipeline it reads has finished the epoch, which closes its queue there:
+    /// its chain reads those breakers, final for the epoch only then.
+    fn takes_from(&self, pipeline: usize, epoch: &EpochState) -> bool {
+        self.reads[pipeline].is_empty() || epoch.pipelines[pipeline].queue.is_closed()
     }
 
     /// The oldest of `epochs` that `pipeline` has not finished.
@@ -1203,35 +1241,60 @@ impl Dispatcher {
         // Recorded before the readers' queues are closed, which lets them claim.
         #[cfg(test)]
         self.record(Event::Finalize(PipelineId(p)));
+        let last = epoch.number == self.last.load(Ordering::Acquire);
         for &reader in &self.readers[p] {
             let queue = &epoch.pipelines[reader];
             self.ensure(queue.phase.load() == Phase::Running, || {
                 format!("pipeline {reader} receives packages before it finalizes")
             });
-            let last = epoch.number == self.last.load(Ordering::Acquire);
             let queued = match &self.reading[reader] {
-                Reading::Whole(input) if last => input.clone(),
                 Reading::Whole(_) => Vec::new(),
                 Reading::Mapped(mapped) => {
-                    let restated = |guard: &TileGuard| {
-                        let restated = mapped.restate(guard);
-                        self.ensure(restated.is_some(), || {
-                            format!(
-                                "pipeline {reader} reads restated pushes, and a restated guard \
-                                 names its breaker's outermost keys: {guard:?}"
-                            )
-                        });
-                        restated.expect("refused above")
-                    };
-                    let mut queued: Vec<TileGuard> = morsels.iter().map(restated).collect();
-                    if last {
-                        queued.extend(mapped.uncovered.iter().cloned());
+                    let mut queued = Vec::new();
+                    for (_, tags) in mapped.edges.iter().filter(|(child, _)| *child == p) {
+                        let restated = |guard: &TileGuard| {
+                            let restated = Mapped::restate(tags, guard);
+                            self.ensure(restated.is_some(), || {
+                                format!(
+                                    "pipeline {reader} reads restated pushes, and a restated \
+                                     guard names its breaker's outermost keys: {guard:?}"
+                                )
+                            });
+                            restated.expect("refused above")
+                        };
+                        queued.extend(morsels.iter().map(restated));
                     }
                     queued
                 }
-                Reading::Pushed => morsels.clone(),
+                Reading::Pushed => {
+                    self.ensure(self.reads[reader].len() == 1, || {
+                        format!(
+                            "pipeline {reader} reads several pipelines, so it reads their pushes \
+                             restated or its input whole"
+                        )
+                    });
+                    morsels.clone()
+                }
             };
-            let landed = queue.queue.append(reader, &queued) && queue.queue.close();
+            self.ensure(queue.queue.append(reader, &queued), || {
+                format!("pipeline {reader} receives packages once")
+            });
+            // The last of the pipelines it reads to finish the epoch closes the reader's queue;
+            // the decrement orders every earlier finish's appends before it.
+            let unfinished = queue.unfinished.fetch_sub(1, Ordering::AcqRel);
+            debug_assert!(
+                unfinished > 0,
+                "pipeline {reader} counts a finish once per pipeline it reads"
+            );
+            if unfinished != 1 {
+                continue;
+            }
+            let closing = match &self.reading[reader] {
+                Reading::Whole(input) if last => input.clone(),
+                Reading::Mapped(mapped) if last => mapped.uncovered.clone(),
+                _ => Vec::new(),
+            };
+            let landed = queue.queue.append(reader, &closing) && queue.queue.close();
             self.ensure(landed, || {
                 format!("pipeline {reader} receives packages once")
             });
@@ -1252,7 +1315,7 @@ impl Dispatcher {
         let later = epoch.number + self.window.len() as u64;
         let slot = &self.window[(epoch.number % self.window.len() as u64) as usize];
         *slot.write().unwrap_or_else(PoisonError::into_inner) =
-            Arc::new(EpochState::new(later, self.reads.len()));
+            Arc::new(EpochState::new(later, &self.reads));
     }
 
     /// How many of `pipeline`'s packages are queued and not acknowledged, in every epoch.
@@ -1296,16 +1359,22 @@ impl Dispatcher {
 
     /// Finalize `pipeline`'s oldest unfinished epoch through `finalize`, a breaker's finalize
     /// called by hand, between the steps a claim's finalize goes through: begin, push, finish. A
-    /// source a test finalizes by hand is closed first, whatever was queued for it.
+    /// test that finalizes a source by hand has queued all its input, so every source still open
+    /// is closed first, and the epoch is the last.
     #[cfg(test)]
     pub(crate) fn finalize_by_hand(
         &self,
         pipeline: PipelineId,
         finalize: impl FnOnce(&mut Pushes<'_>),
     ) {
-        if self.reads[pipeline.0].is_empty() && !self.state(pipeline).closed.load(Ordering::Acquire)
-        {
-            self.close(pipeline);
+        if self.reads[pipeline.0].is_empty() {
+            let open: Vec<_> = self
+                .sources()
+                .filter(|source| !self.pipelines[*source].closed.load(Ordering::Acquire))
+                .collect();
+            for source in open {
+                self.close(PipelineId(source));
+            }
         }
         let (epoch, _) = self.begin_finalize(pipeline);
         let mut pushes = self.pushes_in(pipeline, epoch);
@@ -1588,7 +1657,8 @@ pub(crate) enum Event {
 ///
 /// When a pipeline cannot finish though nothing is queued, which an acyclic graph rules out; in a
 /// debug build, when a package's guard is not a guard of the tiling its breaker's input answers,
-/// when a pipeline consumes a region it consumed before, or when a breaker's morsels do not
+/// when a pipeline consumes a region it consumed before, which one push or the restated pushes of
+/// several overlapping would make it do, or when a breaker's morsels do not
 /// partition its final guard; and at any of the invariants [`finalize`] asserts.
 pub fn run(dispatcher: &Dispatcher, breakers: &[BreakerHandle]) {
     assert_eq!(
@@ -1740,16 +1810,15 @@ fn finalize_with(
 /// ([`TileProducer::as_breaking_mut`]), and a store breaker over each fan-out of `stores` a chain
 /// reads. A breaker's pipeline reads the pipelines of the nearest breakers beneath it. A walk
 /// stops at a store's fan-out: what its cycle holds runs inside the store, in pull mode. A
-/// pipeline reads the pushes of the one it reads restated in its own input's keys where the
-/// producers between the two say how (`TileProducer::input_keys`), and its input whole
-/// otherwise. The run
-/// pulls only the breakers' inputs; the roots' consumers pull the breakers afterwards. It answers
-/// each pipeline it ran, in pipeline order.
+/// pipeline reads the pushes of the pipelines it reads restated in its own input's keys where
+/// the producers between them say how (`TileProducer::input_keys`) and the restated pushes are
+/// apart, and its input whole otherwise. The run pulls only the breakers' inputs; the roots'
+/// consumers pull the breakers afterwards. It answers each pipeline it ran, in pipeline order.
 ///
 /// # Panics
 ///
-/// When a pipeline reads two pipelines, or reads directly a pipeline that another pipeline reads;
-/// and where [`run`] panics.
+/// When a pipeline reads directly a pipeline that another pipeline reads, and where [`run`]
+/// panics.
 #[cfg(test)]
 pub(crate) fn run_program(
     roots: &[crate::interpreter::sinks::ProducerSlot],
@@ -1799,14 +1868,23 @@ pub(crate) fn run_program(
             dispatcher.order(PipelineId(pipeline));
         }
     }
+    let mut readings = Vec::new();
     for (pipeline, plan) in plans.into_iter().enumerate() {
-        match plan {
-            Plan::Pushed => {}
-            Plan::Whole(input) => dispatcher.read_whole(PipelineId(pipeline), &input),
-            Plan::Mapped(Mapped { tags, uncovered }) => {
-                dispatcher.read_mapped(PipelineId(pipeline), tags, uncovered);
+        readings.push(match plan {
+            Plan::Pushed => "pushed",
+            Plan::Whole(input) => {
+                dispatcher.read_whole(PipelineId(pipeline), &input);
+                "whole"
             }
-        }
+            Plan::Mapped(Mapped { edges, uncovered }) => {
+                let edges = edges
+                    .into_iter()
+                    .map(|(child, tags)| (PipelineId(child), tags))
+                    .collect();
+                dispatcher.read_mapped(PipelineId(pipeline), edges, uncovered);
+                "mapped"
+            }
+        });
     }
     drive(
         &dispatcher,
@@ -1833,9 +1911,11 @@ pub(crate) fn run_program(
     let events = dispatcher.into_events();
     names
         .into_iter()
+        .zip(readings)
         .enumerate()
-        .map(|(at, name)| RanPipeline {
+        .map(|(at, (name, reading))| RanPipeline {
             name,
+            reading,
             consumed: events
                 .iter()
                 .filter_map(|event| match event {
@@ -1847,11 +1927,13 @@ pub(crate) fn run_program(
         .collect()
 }
 
-/// A pipeline [`run_program`] ran: its breaker's name and the guards it consumed, in order.
+/// A pipeline [`run_program`] ran: its breaker's name, how its queue was filled (`"pushed"`,
+/// `"whole"` or `"mapped"`, as its [`Plan`]), and the guards it consumed, in order.
 #[cfg(test)]
 #[derive(Debug)]
 pub(crate) struct RanPipeline {
     pub(crate) name: String,
+    pub(crate) reading: &'static str,
     pub(crate) consumed: Vec<TileGuard>,
 }
 
@@ -2136,22 +2218,42 @@ impl Planner<'_> {
             matches!(&self.tilings[push.pipeline], Tiling::DataFunction { codomain, .. }
                 if !codomain.holds_a_level())
         };
-        let [push] = pushes.as_slice() else {
-            return (reads, Plan::Whole(input.clone()));
-        };
-        if push.tags.is_empty() && uncovered.is_empty() && (push.direct || one_level(push)) {
+        if let [push] = pushes.as_slice()
+            && reads.len() == 1
+            && push.tags.is_empty()
+            && uncovered.is_empty()
+            && (push.direct || one_level(push))
+        {
             return (reads, Plan::Pushed);
         }
+        // Pushes restated into keys apart from each other: no tag path, read outermost first, is
+        // a prefix of another's, so no key is restated from two pushes.
+        let apart = pushes.iter().enumerate().all(|(at, one)| {
+            pushes[..at].iter().all(|other| {
+                let (a, b) = (one.tags.iter().rev(), other.tags.iter().rev());
+                a.zip(b).any(|(a, b)| a != b)
+            })
+        });
         // A region no pipeline pushes that is the whole of the keys a push is read in leaves the
         // two to overlap.
-        if !one_level(push) || uncovered.iter().any(Predicate::is_true) {
+        if pushes.is_empty()
+            || !pushes.iter().all(one_level)
+            || !apart
+            || uncovered.iter().any(Predicate::is_true)
+        {
             return (reads, Plan::Whole(input.clone()));
         }
         // The keys no push is restated under, spelled as that difference: the regions an arm
         // holds no pipeline in are among them, and keys outside the domain are no key at all.
-        let pushed = push.tags.iter().fold(Predicate::True, |keys, tag| {
-            Predicate::tagged(TagMap::from_arms(vec![(tag.clone(), keys)]), false)
-        });
+        let pushed = pushes
+            .iter()
+            .map(|push| {
+                push.tags.iter().fold(Predicate::True, |keys, tag| {
+                    Predicate::tagged(TagMap::from_arms(vec![(tag.clone(), keys)]), false)
+                })
+            })
+            .reduce(|all, one| all.union(&one))
+            .expect("at least one push");
         let rest = Predicate::True.minus(&pushed);
         debug_assert!(
             uncovered.iter().all(|region| rest.subsumes(region)),
@@ -2162,13 +2264,11 @@ impl Planner<'_> {
             true => Vec::new(),
             false => vec![TileGuard::Function(FunctionGuard::Domain(rest))],
         };
-        (
-            reads,
-            Plan::Mapped(Mapped {
-                tags: push.tags.clone(),
-                uncovered,
-            }),
-        )
+        let edges = pushes
+            .iter()
+            .map(|push| (push.pipeline, push.tags.clone()))
+            .collect();
+        (reads, Plan::Mapped(Mapped { edges, uncovered }))
     }
 
     /// The pipeline already planned at `at`, where there is one.

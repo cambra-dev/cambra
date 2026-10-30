@@ -840,12 +840,15 @@ package's index in the pipeline's queue for that epoch. The dispatcher holds no 
 `run`, reaches each breaker through a handle its caller passes, indexed by pipeline, and borrows it
 for one call at a time.
 
-`Dispatcher::new` refuses a zero morsel size, a graph with a cycle, and a pipeline that reads more
-than one pipeline, so the pipelines form a forest of trees. A breaker has one input, and a work
-package does not say which input its guard is for. Several pipelines may read one pipeline, each
-reading its breaker through a `FanOut` slot of its own: the release of one reader would otherwise
-remove rows from the breaker's state that another has still to read. The dispatcher cannot see the
-slots, and `run_program` checks them.
+`Dispatcher::new` refuses a zero morsel size, a graph with a cycle, and a pipeline that reads one
+pipeline twice, so the pipelines form a directed acyclic graph. Several pipelines may read one
+pipeline, each reading its breaker through a `FanOut` slot of its own: the release of one reader
+would otherwise remove rows from the breaker's state that another has still to read. The dispatcher
+cannot see the slots, and `run_program` checks them. A pipeline may read several pipelines. A work
+package does not say which pipeline pushed its guard, and a pushed guard names the pushing
+breaker's keys, so a pipeline that reads several reads their pushes restated (`read_mapped`) or its
+input whole (`read_whole`). One that reads them as pushed is refused at the finish that would write
+its queue.
 
 A source pipeline, one that reads no pipeline, is queued the regions of its breaker's input that
 have arrived. `Dispatcher::notify` queues one such region in the current epoch, cut every
@@ -883,23 +886,24 @@ than `morsel_rows` held keys is one morsel. The guard is of the pushing breaker'
 its keys, so a pushed package fits a reader whose breaker reads the pushing breaker directly or
 through producers that keep its keys, and `run` asserts in a debug build that a package fits its
 breaker's input. A pipeline can be marked before the dispatcher is shared to fill its queue
-otherwise. With `Dispatcher::read_mapped`, each pushed morsel is restated under tags, the way a
-union keys an arm's rows, and the regions no pipeline pushes follow as one package each, in the
-run's last epoch. With `Dispatcher::read_whole`, its queue in the run's last epoch is its own
-breaker's input whole, one package per morsel (`seed`), in place of the push, and in every earlier
-epoch it closes empty, since its input is whole only once every epoch has run.
+otherwise. With `Dispatcher::read_mapped`, each morsel a named pipeline pushes is restated under
+that pipeline's tags, the way a union keys an arm's rows, a pipeline it reads and does not name is
+waited for and its pushes are not queued for the reader, and the regions no pipeline pushes follow
+as one package each, in the run's last epoch. With `Dispatcher::read_whole`, its queue in the run's
+last epoch is its own breaker's input whole, one package per morsel (`seed`), in place of the push,
+and in every earlier epoch it closes empty, since its input is whole only once every epoch has run.
 
 `dispatcher::finalize` finishes a pipeline's oldest unfinished epoch. It asserts six invariants
 before it calls the breaker: the pipeline has not begun to finish the epoch, its queue there is
-closed and empty, no package claimed for it there is in flight, the pipeline it reads has finished
+closed and empty, no package claimed for it there is in flight, every pipeline it reads has finished
 the epoch, the epoch is sealed or known to be the last, and its breaker's input has released every
 guard the pipeline consumed in the epoch. A source's input releases the regions queued for it; a
 reading pipeline's input releases only what its packages name: the guards pushed to it, nothing at
-all when the pipeline it reads pushed nothing, those guards restated together with the regions no
+all when the pipelines it reads pushed nothing, those guards restated together with the regions no
 pipeline pushes for a pipeline that reads them restated, and all of it for a pipeline that reads its
 input whole. A debug build also asserts that the morsels of a pushed guard partition it
 (`partition_gap`), and that a pipeline consumes each region once in an epoch: a guard pushed to a
-pipeline meets none pushed to it before.
+pipeline meets none pushed to it before in the epoch, whichever pipeline pushed it.
 
 The dispatcher reads a breaker's input through `input_tiling` and `input_released`, the tiling a
 package's guard is a guard of and the guard the breaker has released of its input, so a breaker
@@ -931,18 +935,21 @@ since it is read at the values it is applied to. A breaker's keys are those of t
 and pushes no package. The reader reads the pushed guard under the tags (`Dispatcher::read_mapped`),
 together with one package holding every key not under the tags. That package covers the arms no
 pipeline holds, as the debug check against the regions the walk found asserts, and names nothing
-outside the domain. A reader reads its input whole (`Dispatcher::read_whole`) when it reads the
-breaker beneath through any other producer, reads two breakers' keys, or reads through other
-producers a breaker that holds more than one level, since past the outermost level a pushed guard
-names the pushing breaker's keys. A breaker or store a second reader reaches is not walked again:
-its pipeline is read by each reader that reaches it, and a reader that reaches it along several
-paths, as a filter reads its input for the values and the predicate, reads it once. A pipeline that
-reads directly a pipeline another pipeline reads is refused, since only a fan-out slot keeps one
-reader's release from removing what another still reads. A pipeline that reads two pipelines is
-refused too: a breaker whose chain reaches two breakers, as a `groupby`'s memo reaches its input's
-memo and the `Converse` keying it, and as the output's memo reaches two aggregates of one binding.
-Each sink's output is compiled on its own, so two sinks read no binding in common. Each package
-reaches its breaker by walking the chains again.
+outside the domain. A reader that reads several breakers' keys reads each push under its own tags,
+as a union of two comprehensions reads one under each arm, where no tag path, read outermost first,
+is a prefix of another's, so no key is restated from two pushes. A breaker an arm reaches is
+restated under that arm's tag path, so a pipeline two arms reach is restated under each. A reader
+reads its input whole (`Dispatcher::read_whole`) when it reads a breaker beneath through any other
+producer, reads two breakers' keys whose tag paths are not apart, or reads through other producers a
+breaker that holds more than one level, since past the outermost level a pushed guard names the
+pushing breaker's keys. A breaker or store a second reader reaches is not walked again: its pipeline
+is read by each reader that reaches it, and a reader that reaches it along several paths, as a
+filter reads its input for the values and the predicate, reads it once. A pipeline that reads
+directly a pipeline another pipeline reads is refused, since only a fan-out slot keeps one reader's
+release from removing what another still reads. A breaker whose chain reaches two breakers other
+than through tags, as a `groupby`'s memo reaches its input's memo and the `Converse` keying it, and
+as the output's memo reaches two aggregates of one binding, reads its input whole once both have
+finished. Each package reaches its breaker by walking the chains again.
 
 The run pulls only the breakers' inputs. A test compiles the program with
 `GlobalContext::defer_sink_pulls`, which leaves out the pull each sink takes once subscribed, runs
@@ -987,9 +994,13 @@ before.
 `Dispatcher` is `Sync`, and a claim takes no lock beyond a read lock on each epoch's slot, which it
 holds only to clone the epoch's handle. A pipeline's queue in an epoch is appended to while it is
 open, and a closed queue takes nothing more. A source's queue grows at each `notify` and closes at
-the epoch's seal or the source's close. A reader's queue in an epoch is filled and closed at the
-`finish` of the pipeline it reads in that epoch, since a pipeline reads at most one other and
-finishes each epoch once.
+the epoch's seal or the source's close. A reader's queue in an epoch grows at the `finish` in that
+epoch of each pipeline it reads, and closes at the finish of the last of them. Each pipeline counts,
+per epoch, the pipelines it reads that have not finished it; the finish that brings the count to
+zero closes the queue, so exactly one finish does, whichever of several concurrent finishes that is,
+and every earlier finish's appends happen before the close. A reader claims a package of an epoch
+only once its queue there is closed: its chain reads the breakers of the pipelines it reads, final
+for the epoch only then.
 
 A queue's slots sit in buckets that double in size, each allocated by the first append that reaches
 it, so a slot never moves. An append reserves its indices together, by compare and exchange on
@@ -1046,7 +1057,8 @@ close, so the count of a closed queue is its last. The counters only grow, so a 
 finish an epoch stays so until it does. Its packages there partition the region its queue was filled
 with, and the finish gets that region as `consumed`: the regions notified to a source in the epoch,
 its input whole in the last epoch for a pipeline that reads its input whole, or the union of the
-guards pushed to the pipeline in it.
+guards pushed to the pipeline in it, restated together with the regions no pipeline pushes where it
+reads them restated.
 
 The claim that finds a pipeline that may finish an epoch moves its phase there from running to
 finalizing with a compare and exchange, so exactly one claim finishes each pipeline in each epoch.
@@ -1054,11 +1066,11 @@ finalizing with a compare and exchange, so exactly one claim finishes each pipel
 and asserts each condition; `dispatcher::finalize` calls it. A finish's pushes collect in its
 `Pushes`. `finish` moves the pipeline from finalizing to finished in the epoch with a compare and
 exchange, so a second finish is refused, and then appends the pushes to the queue for the epoch of
-each pipeline that reads it and closes those queues. A reader claims and finishes an epoch only from
-a closed queue, so its packages become claimable only once the finish of the epoch of the pipeline
-it reads has returned, and its chain never reads that pipeline's breaker during the finish. `finish`
-asserts that no reader has begun to finish the epoch, and dropping a `Pushes` whose morsels never
-landed panics.
+each pipeline that reads it, closing the queue of each reader it is the last to finish for. A reader
+claims and finishes an epoch only from a closed queue, so its packages become claimable only once
+the finish of the epoch of every pipeline it reads has returned, and its chain never reads one of
+their breakers during a finish. `finish` asserts that no reader has begun to finish the epoch, and
+dropping a `Pushes` whose morsels never landed panics.
 
 An ordered pipeline has at most one package in flight across its epochs. A flag per pipeline, taken
 by compare and exchange before a claim of it looks and kept for the package it takes, admits one

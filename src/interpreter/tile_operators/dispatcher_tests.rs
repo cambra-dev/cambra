@@ -276,11 +276,58 @@ fn a_breaker_read_by_several_pipelines_pushes_to_each() {
     assert_eq!(consumed_by(&events, 3), vec![whole.universal_guard()]);
 }
 
-/// A breaker has one input, so a pipeline reads at most one other.
+/// A pipeline that reads two pipelines reads its input whole once both have finished, whichever
+/// finishes last, and consumes nothing before.
 #[test]
-#[should_panic(expected = "pipeline 2 reads pipelines [0, 1]; a breaker has one input")]
-fn a_pipeline_that_reads_two_pipelines_is_refused() {
-    Dispatcher::new(vec![vec![], vec![], vec![0, 1]], UNBOUNDED);
+fn a_pipeline_reading_two_reads_its_input_whole_once_both_finished() {
+    let breakers: Vec<BreakerHandle> = vec![
+        Scripted::holding(ints().universal_guard()),
+        Scripted::holding(ints().universal_guard()),
+        Scripted::holding(ints().universal_guard()),
+    ];
+    let input = breakers[2].borrow().input_tiling();
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![0, 1]], 2);
+    dispatcher.read_whole(PipelineId(2), &input);
+    run(&dispatcher, &breakers);
+    let events = dispatcher.into_events();
+    let at = |event: &Event| {
+        events
+            .iter()
+            .position(|seen| seen == event)
+            .expect("happened")
+    };
+    let first_consume = events
+        .iter()
+        .position(
+            |event| matches!(event, Event::Consume { pipeline, .. } if *pipeline == PipelineId(2)),
+        )
+        .expect("pipeline 2 consumes");
+    assert!(at(&finalized(0)) < first_consume && at(&finalized(1)) < first_consume);
+    let consumed = consumed_by(&events, 2);
+    assert_eq!(partition_gap(&input.universal_guard(), &consumed), None);
+}
+
+/// A pipeline that reads two pipelines and neither reads its input whole nor restates their
+/// pushes is refused at the first finish that reaches it: two pushes are no one input's.
+#[test]
+#[should_panic(expected = "pipeline 2 reads several pipelines, so it reads their pushes restated")]
+fn a_pipeline_reading_two_as_pushed_is_refused() {
+    let breakers: Vec<BreakerHandle> = vec![
+        Scripted::holding(ints().universal_guard()),
+        Scripted::holding(ints().universal_guard()),
+        Scripted::holding(ints().universal_guard()),
+    ];
+    run(
+        &Dispatcher::new(vec![vec![], vec![], vec![0, 1]], UNBOUNDED),
+        &breakers,
+    );
+}
+
+/// A pipeline reads each pipeline once.
+#[test]
+#[should_panic(expected = "pipeline 1 reads pipeline 0 once")]
+fn a_pipeline_reading_one_pipeline_twice_is_refused() {
+    Dispatcher::new(vec![vec![], vec![0, 0]], UNBOUNDED);
 }
 
 /// The driver consumes the lowest pipeline's package first and finalizes only when nothing is
@@ -1583,7 +1630,7 @@ fn a_mapped_reader_is_queued_the_pushes_restated_and_the_uncovered_regions() {
     let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.read_mapped(
         PipelineId(1),
-        vec![FieldKey::Index(0), FieldKey::Index(1)],
+        vec![(PipelineId(0), vec![FieldKey::Index(0), FieldKey::Index(1)])],
         vec![rest.clone()],
     );
     dispatcher.finalize_by_hand(PipelineId(0), |pushes| child.borrow_mut().finalize(pushes));
@@ -1600,6 +1647,132 @@ fn a_mapped_reader_is_queued_the_pushes_restated_and_the_uncovered_regions() {
     );
 }
 
+/// A guard of `keys` under the tags of `path`, innermost first, as a mapped reader restates a
+/// push.
+fn tagged_keys(path: &[usize], keys: Predicate) -> TileGuard {
+    use crate::ccl::{FieldKey, TagMap};
+    let keys = path.iter().fold(keys, |keys, tag| {
+        Predicate::tagged(
+            TagMap::from_arms(vec![(FieldKey::Index(*tag), keys)]),
+            false,
+        )
+    });
+    TileGuard::Function(FunctionGuard::Domain(keys))
+}
+
+fn tags(path: &[usize]) -> Vec<crate::ccl::FieldKey> {
+    path.iter()
+        .map(|tag| crate::ccl::FieldKey::Index(*tag))
+        .collect()
+}
+
+fn queued(dispatcher: &Dispatcher) -> Vec<TileGuard> {
+    std::iter::from_fn(|| dispatcher.pop())
+        .map(|package| package.guard)
+        .collect()
+}
+
+/// A pipeline that reads two pipelines restated is queued nothing until both have finished,
+/// then each one's pushed morsels under its own tags, then the regions no pipeline pushes.
+#[test]
+fn a_mapped_reader_of_two_is_queued_each_under_its_own_tags() {
+    let domain = |keys: Predicate| TileGuard::Function(FunctionGuard::Domain(keys));
+    let (low, high) = (
+        keys_predicate(0, 1),
+        Predicate::True.minus(&keys_predicate(0, 1)),
+    );
+    let first = Scripted::cutting(
+        ints().universal_guard(),
+        vec![domain(low.clone()), domain(high.clone())],
+    );
+    let second = Scripted::cutting(ints().universal_guard(), vec![ints().universal_guard()]);
+    let both = tagged_keys(&[0], Predicate::True).union(&tagged_keys(&[1], Predicate::True));
+    let TileGuard::Function(FunctionGuard::Domain(both)) = both else {
+        unreachable!("a guard of keys")
+    };
+    let rest = domain(Predicate::True.minus(&both));
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![0, 1]], UNBOUNDED);
+    dispatcher.read_mapped(
+        PipelineId(2),
+        vec![(PipelineId(0), tags(&[0])), (PipelineId(1), tags(&[1]))],
+        vec![rest.clone()],
+    );
+    dispatcher.finalize_by_hand(PipelineId(1), |pushes| second.borrow_mut().finalize(pushes));
+    assert!(dispatcher.pop().is_none(), "pipeline 0 has not finished");
+    dispatcher.finalize_by_hand(PipelineId(0), |pushes| first.borrow_mut().finalize(pushes));
+    // In the order the pushes landed: pipeline 1 finished first.
+    assert_eq!(
+        queued(&dispatcher),
+        vec![
+            tagged_keys(&[1], Predicate::True),
+            tagged_keys(&[0], low),
+            tagged_keys(&[0], high),
+            rest
+        ]
+    );
+}
+
+/// A pipeline read under two tag paths, as a union of one binding with itself reads it under
+/// each arm, has its pushes queued under each.
+#[test]
+fn a_mapped_reader_is_queued_one_pipeline_under_each_tag_path_it_reads() {
+    let child = Scripted::cutting(ints().universal_guard(), vec![ints().universal_guard()]);
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    dispatcher.read_mapped(
+        PipelineId(1),
+        vec![(PipelineId(0), tags(&[0])), (PipelineId(0), tags(&[1]))],
+        Vec::new(),
+    );
+    dispatcher.finalize_by_hand(PipelineId(0), |pushes| child.borrow_mut().finalize(pushes));
+    assert_eq!(
+        queued(&dispatcher),
+        vec![
+            tagged_keys(&[0], Predicate::True),
+            tagged_keys(&[1], Predicate::True)
+        ]
+    );
+}
+
+/// A pipeline a mapped reader reads and does not name is waited for, and its pushes are not
+/// queued for the reader.
+#[test]
+fn a_pipeline_a_mapped_reader_does_not_name_is_waited_for() {
+    let named = Scripted::cutting(ints().universal_guard(), vec![ints().universal_guard()]);
+    let waited = Scripted::cutting(ints().universal_guard(), vec![ints().universal_guard()]);
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![0, 1]], UNBOUNDED);
+    dispatcher.read_mapped(PipelineId(2), vec![(PipelineId(0), Vec::new())], Vec::new());
+    dispatcher.finalize_by_hand(PipelineId(0), |pushes| named.borrow_mut().finalize(pushes));
+    assert!(dispatcher.pop().is_none(), "pipeline 1 has not finished");
+    dispatcher.finalize_by_hand(PipelineId(1), |pushes| waited.borrow_mut().finalize(pushes));
+    assert_eq!(queued(&dispatcher), vec![ints().universal_guard()]);
+}
+
+/// A mapped reader restates the pushes only of a pipeline it reads.
+#[test]
+#[should_panic(expected = "pipeline 1 restates the pushes only of a pipeline it reads: 2")]
+fn a_mapped_edge_to_a_pipeline_not_read_is_refused() {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0], vec![]], UNBOUNDED);
+    dispatcher.read_mapped(PipelineId(1), vec![(PipelineId(2), Vec::new())], Vec::new());
+}
+
+/// Restated pushes of two pipelines that overlap would consume a region twice, which a debug
+/// build refuses when the reader's queue is written.
+#[cfg(debug_assertions)]
+#[test]
+#[should_panic(expected = "pipeline 2 consumes each region once")]
+fn overlapping_restated_pushes_are_refused() {
+    let first = Scripted::cutting(ints().universal_guard(), vec![ints().universal_guard()]);
+    let second = Scripted::cutting(ints().universal_guard(), vec![ints().universal_guard()]);
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![0, 1]], UNBOUNDED);
+    dispatcher.read_mapped(
+        PipelineId(2),
+        vec![(PipelineId(0), Vec::new()), (PipelineId(1), Vec::new())],
+        Vec::new(),
+    );
+    dispatcher.finalize_by_hand(PipelineId(0), |pushes| first.borrow_mut().finalize(pushes));
+    dispatcher.finalize_by_hand(PipelineId(1), |pushes| second.borrow_mut().finalize(pushes));
+}
+
 /// A mapped push restates a guard of the pushing breaker's outermost keys, so a guard beneath
 /// them is refused.
 #[test]
@@ -1611,7 +1784,11 @@ fn a_mapped_push_beneath_the_outermost_keys_is_refused() {
     ))));
     let child = Scripted::cutting(beneath.clone(), vec![beneath]);
     let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.read_mapped(PipelineId(1), vec![FieldKey::Index(0)], Vec::new());
+    dispatcher.read_mapped(
+        PipelineId(1),
+        vec![(PipelineId(0), vec![FieldKey::Index(0)])],
+        Vec::new(),
+    );
     dispatcher.finalize_by_hand(PipelineId(0), |pushes| child.borrow_mut().finalize(pushes));
 }
 
