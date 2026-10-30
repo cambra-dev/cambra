@@ -1089,7 +1089,16 @@ fn checked_lookup_over_a_key_stream(#[case] tail: &str, #[case] expected: Value)
     "g: FullMap(_, _) = groupby([1,2,3,4], \\v -> v // 2)\nsum([sum(v) for v in g])",
     Value::Int(10)
 )]
-fn an_exact_keyed_annotation_compiles_and_runs(#[case] code: &str, #[case] expected: Value) {
+// Bounded: `g` keeps the group-by's own type, binder included.
+#[case(
+    "g <: FullMap(_, _) = groupby([1,2], \\v -> v)\nsum([sum(v) for v in g])",
+    Value::Int(3)
+)]
+#[case(
+    "g <: FullMap(_, _) = groupby([1,2,3,4], \\v -> v // 2)\nsum([sum(v) for v in g])",
+    Value::Int(10)
+)]
+fn a_keyed_annotation_compiles_and_runs(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
@@ -1311,20 +1320,31 @@ fn a_zip_with_a_constant_arm_pairs_at_the_groups(#[case] fast: &str, #[case] gen
 /// too.
 #[rstest]
 #[case::summing_the_groups(r"1 if 0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) else 0")]
-#[case::in_a_chained_comparison(
-    r"1 if 0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) < 100 else 0"
-)]
 fn a_group_by_in_a_guard(#[case] program: &str) {
     check_scalar(program, Value::Int(1));
 }
 
-/// A group-by in the middle operand of a chained comparison, which lowering places in both
-/// comparisons: the groups sum to 4.
-#[test]
-fn a_group_by_in_a_chained_comparison() {
-    check_scalar(
-        r"0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) < 100",
-        Value::Bool(true),
+/// A group-by result held in two places, each iterated through `Iterable::elements`, meets
+/// its other copy at one variable, and inference panics: the middle operand of a chained
+/// comparison, which lowering places in both comparisons, and a group-by nested in a key, which
+/// the key domain's predicate and the partition each hold. A generic function applied to a
+/// dependent collection is not iterated yet, and `elements` is one. Each program's value is in
+/// its comment.
+#[rstest]
+// `true`: the groups sum to 4.
+#[case::in_a_chained_comparison(r"0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) < 100")]
+// 1.
+#[case::in_a_guard_s_chained_comparison(
+    r"1 if 0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) < 100 else 0"
+)]
+// 4.
+#[case::nested_in_a_key(
+    r"sum([sum(g) for g in groupby([1, 1, 2], \e -> sum([sum(h) for h in groupby([1, 1, 2], \f -> f)]))])"
+)]
+fn a_group_by_held_twice_is_not_iterated_yet(#[case] program: &str) {
+    check_compile_error(
+        program,
+        "two distinct non-invertible morphisms met at one variable",
     );
 }
 
@@ -1335,11 +1355,6 @@ fn a_group_by_in_a_chained_comparison() {
 #[case::a_filter_reading_the_element(indoc! {r#"
     out = test_sink()
     out << sum([sum(g) for g in groupby([1, 1, 2], \e -> sum([z for z in [1, 2, 3] if z > e]))])
-"#}, "[() -> 4]")]
-#[case::a_nested_group_by(indoc! {r#"
-    out = test_sink()
-    out << sum([sum(g) for g in groupby([1, 1, 2],
-        \e -> sum([sum(h) for h in groupby([1, 1, 2], \f -> f)]))])
 "#}, "[() -> 4]")]
 #[case::a_conditional_on_the_element(indoc! {r#"
     out = test_sink()
@@ -1424,14 +1439,10 @@ fn a_per_group_count_that_ignores_the_row() {
     );
 }
 
-/// A `groupby` over a comprehension of records bound to a name first does not compile: the
-/// post-lambda-elim type check rejects the collection domain of the grouping. The same
-/// comprehension written inline as the `groupby` source compiles, which the `groupby_source` row
-/// of `tests/it/generated_pairs.rs` holds for its `rec_comp` and `rec_filtered` fillers.
+/// A `groupby` over a comprehension of records bound to a name first, as over one written inline
+/// as the `groupby` source, which the `groupby_source` row of `tests/it/generated_pairs.rs` holds
+/// for its `rec_comp` and `rec_filtered` fillers.
 #[test]
-#[should_panic(
-    expected = "post-lambda-elim produced an invalid tree: [Type mismatch for collection domain"
-)]
 fn a_groupby_over_a_bound_comprehension_of_records() {
     check_tile(
         &sales_program(indoc! {r#"

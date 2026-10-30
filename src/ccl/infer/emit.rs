@@ -1148,15 +1148,17 @@ pub(super) fn emit_apply<C: Typing>(
         .as_ref()
         .and_then(Type::fun_kind)
         .cloned();
-    // A tuple's projection names itself, since a tuple pattern applies one the program
-    // never wrote.
-    let context = match &function.node {
+    // A trait function's failure names the function, which a loop's source calls without
+    // spelling it (`docs/chl-spec.md`, "4.6 `for` — iteration"), and a tuple's projection
+    // names itself, since a tuple pattern applies one the program never wrote.
+    let at = match &function.node {
+        TypedExprNode::TraitFn {
+            trait_, function, ..
+        } => format!("{trait_}::{function}"),
         TypedExprNode::Proj(key @ ProjKey::Index(_)) => format!("projection `.{key}`"),
         _ => "Apply".to_string(),
     };
-    let applied = ctx.apply(&fn_ty, &arg_ty, argument, declared.as_ref(), &|| {
-        context.clone()
-    });
+    let applied = ctx.apply(&fn_ty, &arg_ty, argument, declared.as_ref(), &|| at.clone());
     if applied.is_ok() && matches!(function.node, TypedExprNode::TraitFn { .. }) {
         ctx.bind_instance_function_called(function.node_id())?;
     }
@@ -2417,8 +2419,10 @@ fn feed_places(defer: &Name, body: &Expr) -> Vec<NodeId> {
             {
                 places.push(e.node_id())
             }
+            // A loop reads its source through `Iterable::elements`, which feeds nothing.
             TypedExprNode::Apply { argument, function }
                 if !matches!(function.node, TypedExprNode::Builtin(_))
+                    && !is_iterable_elements(function)
                     && crate::ccl::ccl_utils::is_free(defer, argument) =>
             {
                 places.push(e.node_id())
@@ -2430,6 +2434,13 @@ fn feed_places(defer: &Name, body: &Expr) -> Vec<NodeId> {
     let mut places = Vec::new();
     walk(defer, body, &mut places);
     places
+}
+
+/// Whether `function` is `Iterable::elements`, the call a loop reads its source through.
+fn is_iterable_elements(function: &Expr) -> bool {
+    use crate::ccl::infer::solver::traits::{ITERABLE_ELEMENTS, Trait};
+    matches!(&function.node, TypedExprNode::TraitFn { trait_, function, .. }
+        if *trait_ == Trait::iterable() && function.as_str() == ITERABLE_ELEMENTS)
 }
 
 /// Emit/check a `letrec` group (design doc `src/ccl/design/mutability.md`,
@@ -3468,6 +3479,38 @@ pub(super) fn emit_compose<C: Typing>(
     let cod = crate::ccl::ccl_utils::over_input(elts, &binders[..last], &position, &first_dom, cod);
     let names_position = crate::ccl::subst::type_free_vars(&cod).contains(&position)
         || (read && crate::ccl::subst::type_contains_infer(&cod));
+    // A sum's binders are what its domain is under, and the chain's domain is its head's, so
+    // the binders are the head's. The recorded kind can name others: a head read through a
+    // variable that stood for it, as `Iterable::elements`'s result stands for a collection the
+    // call is then removed from, was resolved with binders of its own.
+    let fun_kind = match (&fun_kind, elts[0].ty.peel_refinements()) {
+        (
+            FunKind::Data(Some(recorded_ws)),
+            Type::Fun {
+                fun_kind: head @ FunKind::Data(Some(head_ws)),
+                ..
+            },
+        ) => {
+            // Both name the sum the head is, so they bind the same witnesses position for
+            // position; only the recorded ids can be stale.
+            debug_assert_eq!(
+                recorded_ws.len(),
+                head_ws.len(),
+                "a chain's recorded funkind and its head's name one sum, so they bind as many \
+                 witnesses"
+            );
+            if recorded_ws
+                .iter()
+                .zip(head_ws.iter())
+                .any(|(r, h)| r.id() != h.id())
+            {
+                head.clone()
+            } else {
+                fun_kind
+            }
+        }
+        _ => fun_kind,
+    };
     // Construction closes: the reference to the input goes back to the index form every
     // stored type is in.
     Ok(if names_position {

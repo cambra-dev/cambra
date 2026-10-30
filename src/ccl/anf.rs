@@ -711,7 +711,12 @@ fn atomize(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
     }
     let name = Name::anf_temp();
     let binding = TypedBinding::new_unannotated(name.clone());
-    let var_ref = Expr::var(name);
+    // The read stands where `core` stood, and a later pass that inlines the binding again
+    // leaves this read's identity in the tree, so it is attributed to `core`, not the root.
+    let var_ref = {
+        let _g = provenance::enter(core.node_id(), "anf.hoist", Nature::Machinery);
+        Expr::var(name)
+    };
     binds.push((binding, core));
     (binds, var_ref)
 }

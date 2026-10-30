@@ -1878,6 +1878,17 @@ fn coalesce_node(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
 /// The body of [`coalesce_node`]; see the wrapper for the per-error blame
 /// bookkeeping it is wrapped in.
 fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
+    // `c ▷ Iterable::elements` over a structural collection is `c`: the collection rule
+    // answered its obligation, so the collection is its own `Elements` and `elements` the
+    // identity (`src/ccl/design/type-inference.md`, "A collection is answered off the
+    // table"). The call goes before anything reads it, here and in each copy a predicate
+    // holds, so no pass after inference meets it.
+    if !ctx.discarding
+        && let Some(collection) = elements_of_a_collection(expr)
+    {
+        *expr = collection;
+        return coalesce_node_inner(expr, level, ctx);
+    }
     if !ctx.discarding {
         dispatch_operator(expr, ctx);
     }
@@ -2611,6 +2622,35 @@ fn run_instance_primitive(expr: &mut Expr) {
     if let Some(primitive) = primitive {
         *op = primitive;
     }
+}
+
+/// The collection `expr` walks, when it is `c ▷ Iterable::elements` and `c`'s type resolves to
+/// a structural collection; the call's argument is moved out of it.
+pub(super) fn elements_of_a_collection(expr: &mut Expr) -> Option<Expr> {
+    let TypedExprNode::Apply { argument, function } = &expr.node else {
+        return None;
+    };
+    let TypedExprNode::TraitFn {
+        trait_, operands, ..
+    } = &function.node
+    else {
+        return None;
+    };
+    if !trait_.reads_collections() {
+        return None;
+    }
+    let resolved = resolve_var_type(operands.first()?).ok()?;
+    if !crate::ccl::infer::solver::traits::is_structural_collection(&resolved) {
+        return None;
+    }
+    debug_assert!(
+        !matches!(argument.node, TypedExprNode::Error),
+        "an `elements` call's argument is a lowered source"
+    );
+    let TypedExprNode::Apply { argument, .. } = std::mem::take(expr).node else {
+        unreachable!("matched an application above")
+    };
+    Some(*argument)
 }
 
 /// Replace a `TraitFn` a compiler instance answers with the function the instance builds at

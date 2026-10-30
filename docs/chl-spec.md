@@ -883,8 +883,10 @@ equality or order. A nominal type compares as its declaration states
 and equality requirements ([Trait requirements](#trait-requirements)):
 
 ```
-_ in _ : forall (C, E) {e: E, c: C} => Bool requires Iterable(C, Item=E), Equatable(E, E)
+_ in _ : forall (C, E) {e: E, c: C} => Bool requires Iterable(C), Equatable(E, E)
 ```
+
+where `E` is the type of each value of `C`'s `Elements`.
 
 - **`in` tests what iteration binds** ([4.6 `for` — iteration](#46-for--iteration)): the key of a
   `Set`, the value of an `Array`, `List` or `Collection`, and the entry `(k, v)` of a `Map` or
@@ -1891,15 +1893,20 @@ proof, so for a key from `for k -> v in m` (or `for k in s`) the refinement on `
 `Option::none`, and `m[k]! : V` type-checks (§3.9). Reaching a map's keys or values as their own
 collections is `m.keys()` / `m.values()` / `m.items()` (§6.3).
 
-> **Direction [Decided] — the element is a trait requirement.** `for x in c` places the built-in
-> requirement `Iterable(C, Item=E)` on `c`'s type `C` and binds `x: E`
-> ([Trait requirements](#trait-requirements)). The table above lists its instances. A structural
-> collection, including every comprehension result
-> ([3.12 Comprehensions](#312-comprehensions)), yields its values. `Set`, `Map` and `FullMap` are
-> nominal builtins ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)),
-> and each yields what its row states. A polymorphic `def` that iterates a parameter carries the
-> requirement in its type: `def f(c): for x in c: …` requires `Iterable(C, Item=X)` of its
-> parameter's type `C`, so each call iterates its argument by the argument's own instance.
+**A loop walks its source's `Elements`.** `for x in c` places the built-in requirement `i:
+Iterable(C)` on `c`'s type `C`, iterates `summon(Iterable(_))::elements(c)`, and binds `x` to each
+value of `i::Elements` ([Trait requirements](#trait-requirements)). A structural collection,
+including every comprehension result ([3.12 Comprehensions](#312-comprehensions)), is its own
+`Elements`, so it yields its values. A nominal type yields what its module's instance returns. A
+polymorphic `def` that iterates a parameter carries the requirement in its type: `def f(c): for x in
+c: …` requires `Iterable(C)` of its parameter's type `C`, so each call iterates its argument by the
+argument's own instance.
+
+> **Direction [Decided] — the element is chosen per collection type.** `Set`, `Map` and `FullMap`
+> are nominal builtins
+> ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)), and each
+> satisfies `Iterable` through an instance the compiler provides, whose `Elements` yields what the
+> table above lists.
 
 > **[Interim].** Today `for`-in binds the **value** (codomain) for every
 > collection — so a map iterates its values (as `groupby` results do) and a set
@@ -3381,6 +3388,7 @@ requirement names one as it names these, which are built in:
 | `Negatable` | unary `-` | 1 | `Output` | `neg` | `Int` |
 | `Equatable` | `==`, `!=`, `in`, `not in` | 2 | none | none | `Int`, `UInt`, `String`, `Bool`, and a tuple or record whose fields are `Equatable` |
 | `Orderable` | `<`, `<=`, `>`, `>=`, `max`, `min` | 2 | none | none | `Int`, `UInt`, `String`, `Bool`, and a tuple whose components are `Orderable` |
+| `Iterable` | `for`-in, a comprehension's `for` clause | 1 | `Elements` | `elements` | every collection, as its own `Elements` |
 
 `max` and `min` place `Orderable(T, T)` on their element type `T`. A binary trait is satisfied by
 two operands of one listed type. A tuple or record satisfies `Equatable` only against the same
@@ -3394,6 +3402,12 @@ instance ([Equality and order](#equality-and-order)).
   `add` of two strings joins them.
 - **A comparison calls no function.** `Equatable` and `Orderable` compare values by value
   ([Equality and order](#equality-and-order)), so an instance of either defines nothing.
+- **A loop calls `Iterable`'s `elements`.** `for x in c` walks `summon(Iterable(_))::elements(c)`
+  and binds `x` to each of its values ([4.6 `for` — iteration](#46-for--iteration)). A collection is its own
+  `Elements`, and `elements` returns it. An instance defines it for a nominal type:
+  `impl Iterable(Bag)` with `Elements = List(Int)` and `def elements(b): b.extract()`. An
+  instance's `Elements` is a structural collection: a nominal `Elements` is an error at the
+  instance.
 
 - **A named requirement binds its instance.** In `def total(S, s: S) => Int requires a: Area(S)`,
   `a` is the instance each call passes, and `a::area(s)` calls its `area`
@@ -3429,15 +3443,36 @@ instance ([Equality and order](#equality-and-order)).
   satisfies it. A call that does not is rejected at the call. A secondary label at the requirement
   is **[Decided]**.
 
-> **Direction [Decided] — collection traits.** One more trait is built in, with instances the
-> compiler provides for the collection types
-> ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)):
+> **Direction [Decided] — collection types.** `Set`, `Map` and `FullMap` satisfy `Iterable`
+> through instances the compiler provides
+> ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)). Each
+> instance's `Elements` yields what [4.6 `for` — iteration](#46-for--iteration) lists for its
+> type.
+
+> **Direction [Open] — a nominal `Elements`.** An instance's `Elements` may be a nominal type
+> with an `Iterable` instance of its own, and a loop walks through instances until it reaches a
+> structural collection:
 >
-> | Trait | Required by | Operands | Associated type | Satisfied by |
-> | --- | --- | --- | --- | --- |
-> | `Iterable` | `for`-in, a comprehension's `for` clause, `in`, `not in` | 1 | `Item` | `Array`, `List`, `Collection`, `Set`, `Map`, `FullMap`, and every comprehension result |
+> ```python
+> trait Iterable(C) requires it: Iterable(Elements):
+>     Elements
+>     Walked                      # the compiler's: it::Walked, or C under the collection rule
+>     def elements(c: C) => Walked
+> ```
 >
-> `Iterable`'s `Item` is what [4.6 `for` — iteration](#46-for--iteration) binds.
+> - An instance writes `Elements` and an `elements` that returns an `Elements`, one step. The
+>   compiler composes it with `it::elements`, so a loop's one `elements` call reaches a
+>   structural collection, and instance search does the recursion.
+> - The collection rule is the only base case. A structural collection is its own `Elements` and
+>   its own `Walked`, and it is exempt from the trait's requirement, which would otherwise require
+>   `Iterable(C)` of itself.
+> - The requirement is the trait's, not `elements`'s, so `it` is in scope for `Walked`.
+> - A trait that requires itself, an associated type the trait defines
+>   ([Declaring a trait](#declaring-a-trait)), and the base-case exemption are each the
+>   compiler's alone; a declared trait has none of them.
+> - The walk terminates by a check where an instance is declared. A chain with no type variables
+>   is followed there, and a cycle (`Bag` to `Wrap` to `Bag`) is rejected. A generic instance's
+>   `Elements` is strictly smaller than its head: `Wrap(T)` with `Elements = T`.
 
 #### Summoning an instance
 

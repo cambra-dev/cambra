@@ -1761,7 +1761,7 @@ fn a_bare_key_lookup_on_a_groupby_is_refused() {
 
 /// Consuming this boxed Map annotation fails inference: the reported domains name
 /// `__iter_record` and `__box_k` instead of reconciling the dependent key.
-/// The exact FullMap counterpart runs in `an_exact_keyed_annotation_compiles_and_runs`.
+/// The FullMap counterpart runs in `a_keyed_annotation_compiles_and_runs`.
 #[test]
 fn a_consumed_boxed_map_annotation_escapes_its_scope() {
     let errs = infer_program_err(indoc! {r#"
@@ -1776,20 +1776,8 @@ fn a_consumed_boxed_map_annotation_escapes_its_scope() {
     );
 }
 
-/// Consuming this bounded annotation records a bound with a free `__gb_k` absent
-/// from the holder's telescope. The current failure is an invariant panic, not a diagnostic.
-#[test]
-#[should_panic(expected = "open bound recorded")]
-fn a_consumed_bounded_keyed_annotation_records_an_open_bound() {
-    infer_program(indoc! {r#"
-        g <: FullMap(_, _) = groupby([1,2], \v -> v)
-        sum([sum(v) for v in g])
-    "#});
-}
-
-/// FullMap(_, _) preserves the group-by domain at either annotation strength.
-/// An exact annotation also permits consuming these groups. The bounded consumption
-/// failure is tested separately in `a_consumed_bounded_keyed_annotation_records_an_open_bound`.
+/// FullMap(_, _) preserves the group-by domain at either annotation strength. Consuming the
+/// groups under either is run in `a_keyed_annotation_compiles_and_runs`.
 /// See `src/ccl/design/collections.md`, "`groupby`'s exact type".
 #[test]
 fn a_groupby_is_a_full_map_at_either_strength() {

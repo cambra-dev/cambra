@@ -56,7 +56,7 @@ fn lower_clauses(
     };
     match clause {
         CompClause::For { target, iter } => {
-            let iter = lower_expr(iter, ctx)?;
+            let iter = lower_loop_source(iter, ctx)?;
             let leaves = match &target.node {
                 AssignTarget::Name(n) if n.as_str() != WILDCARD => {
                     let name = extract_name_target(target, "comprehension target")?;
@@ -167,11 +167,17 @@ mod tests {
 
     #[rstest]
     // Identity: the element passes through unchanged.
-    #[case("[x for x in [10, 20]]", "[x for x in [10, 20]]")]
+    #[case("[x for x in [10, 20]]", "[x for x in [10, 20] ▷ Iterable::elements]")]
     // Constant element: the generator variable is unused.
-    #[case("[42 for x in [10, 20]]", "[42 for x in [10, 20]]")]
+    #[case(
+        "[42 for x in [10, 20]]",
+        "[42 for x in [10, 20] ▷ Iterable::elements]"
+    )]
     // BinOp element: the generator variable is used in arithmetic.
-    #[case("[x + 2 for x in [10, 20]]", "[x + 2 for x in [10, 20]]")]
+    #[case(
+        "[x + 2 for x in [10, 20]]",
+        "[x + 2 for x in [10, 20] ▷ Iterable::elements]"
+    )]
     // Outer capture: `y` comes from an enclosing let binding.
     #[case(
         "\
@@ -179,17 +185,17 @@ y = 5
 [x + y for x in [10, 20]]",
         "\
 let y = 5
-in [x + y for x in [10, 20]]"
+in [x + y for x in [10, 20] ▷ Iterable::elements]"
     )]
     // Nested comprehension: the inner one is the outer one's generator source.
     #[case(
         "[y for y in [x for x in [10, 20]]]",
-        "[y for y in [x for x in [10, 20]]]"
+        "[y for y in [x for x in [10, 20] ▷ Iterable::elements] ▷ Iterable::elements]"
     )]
     // Each guard rides the generator before it, and renders where it was written.
     #[case(
         "[x + y for x in [1, 2] if x > 1 for y in [3] if y < 4]",
-        "[x + y for x in [1, 2] if x > 1 for y in [3] if y < 4]"
+        "[x + y for x in [1, 2] ▷ Iterable::elements if x > 1 for y in [3] ▷ Iterable::elements if y < 4]"
     )]
     fn test_lower_list_comp(#[case] code: &str, #[case] expected: &str) {
         let stmts = parse_module(code);
@@ -201,8 +207,11 @@ in [x + y for x in [10, 20]]"
 
     #[rstest]
     // A generator expression lowers identically to the equivalent list comp.
-    #[case("(x for x in [10, 20])", "[x for x in [10, 20]]")]
-    #[case("(x + 2 for x in [10, 20])", "[x + 2 for x in [10, 20]]")]
+    #[case("(x for x in [10, 20])", "[x for x in [10, 20] ▷ Iterable::elements]")]
+    #[case(
+        "(x + 2 for x in [10, 20])",
+        "[x + 2 for x in [10, 20] ▷ Iterable::elements]"
+    )]
     fn test_lower_generator_expr(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
         let ccl = lower_expr(&expr, &mut LoweringContext::default()).expect("lowering failed");
@@ -218,6 +227,9 @@ in [x + y for x in [10, 20]]"
         let ccl = lower_stmts(&stmts, &mut ctx)
             .into_result()
             .expect("lowering failed");
-        assert_eq!(symbolic(&ccl), "[x for x in source(src)]");
+        assert_eq!(
+            symbolic(&ccl),
+            "[x for x in source(src) ▷ Iterable::elements]"
+        );
     }
 }

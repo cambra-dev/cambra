@@ -318,6 +318,7 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
         requires,
         named,
         products: ProductReading::None,
+        reads_collections: false,
     }))
 }
 
@@ -709,6 +710,19 @@ fn declare_instance(
                     "a refinement in the associated type `{}` of `impl {written}` is not \
                      supported yet",
                     a.name
+                ),
+            ));
+        }
+        // A loop walks its source through one `elements` call to a structural collection,
+        // so a nominal `Elements` would need a second instance's `elements` after it
+        // (`docs/chl-spec.md`, "Trait requirements").
+        if trait_ == Trait::iterable() && matches!(ty, Type::Nominal(..)) {
+            return Err(LoweringError::unsupported(
+                a.value.span,
+                format!(
+                    "`Elements = {ty}` in `impl {}` is a nominal type, and an `Elements` that \
+                     is not a structural collection is not supported yet",
+                    head_spelling(&trait_, &operands)
                 ),
             ));
         }

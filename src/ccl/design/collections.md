@@ -187,12 +187,11 @@ retains the source positions whose values have that key. The codomain depends on
 binder. Both the outer function and the inner group are data functions.
 
 This is an explicit-domain function, the `FullMap` representation, rather than a uniform
-`Map(K, V)` abbreviation. An exact `FullMap(_, _)` annotation can preserve and consume the
-group-by's type. Boxing it to satisfy a `Map` annotation does not establish equivalent behavior:
-`a_consumed_boxed_map_annotation_escapes_its_scope` records an inference failure when that
-boxed annotation is consumed. Bounded group-by annotation cases also have an open-bound
-invariant failure in `a_consumed_bounded_keyed_annotation_records_an_open_bound`.
-These are implementation limitations, not rules rejecting every group-by annotation.
+`Map(K, V)` abbreviation. A `FullMap(_, _)` annotation, exact or bounded, can preserve and consume
+the group-by's type. Boxing it to satisfy a `Map` annotation does not establish equivalent
+behavior: `a_consumed_boxed_map_annotation_escapes_its_scope` records an inference failure when
+that boxed annotation is consumed. This is an implementation limitation, not a rule rejecting
+every group-by annotation.
 
 A checked lookup substitutes its key into the dependent group type during inference.
 The streamed collection-valued answer is rejected later at operator conversion; see
@@ -300,15 +299,15 @@ The proposal assigns per-type `Iterable`, `Index`, `Membership` and `Ordering` o
 These collection interfaces are distinct from the solver's implemented arithmetic/comparison
 trait tables. General contextual-parameter/typeclass resolution remains future work.
 
-- `for x in c` places the requirement `Iterable(𝐶, Item=𝐸)` on `c`'s type and binds `x: 𝐸`
-  ([chl-spec, 4.6 `for` — iteration](../../../docs/chl-spec.md#46-for--iteration)). The solver
-  discharges it once `𝐶`'s head is known, as it discharges an operator's requirement, and a
-  polymorphic `def` generalizes over it. The instances are built in: values for a structural
-  collection, including every comprehension result; keys for `Set`; entries for `Map` and
-  `FullMap`. A nominal type is related only to itself, so every producer of a value names the same
-  head and the instance does not depend on where the value flows. The instance chooses which part
-  of the existing iteration record to expose. Current lowering binds values and does not
-  implement that dispatch.
+- `for x in c` iterates `Iterable::elements(c)`, which places the requirement
+  `Iterable(𝐶)` on `c`'s type, and binds `x` to each value of its `Elements`
+  ([chl-spec, 4.6 `for` — iteration](../../../docs/chl-spec.md#46-for--iteration)). A structural
+  collection, including every comprehension result, is its own `Elements`
+  ([type-inference.md, "A collection is answered off the table"](type-inference.md#a-collection-is-answered-off-the-table)),
+  and a polymorphic `def` generalizes over the requirement. The instances for the nominal
+  collections are built in: keys for `Set`, entries for `Map` and `FullMap`. A nominal type is
+  related only to itself, so every producer of a value names the same head and the instance does
+  not depend on where the value flows.
 - Optional lookup would decide membership at runtime; proven access would require a key
   refinement. The surface spellings are governed by the CHL reference, not duplicated here.
 - Membership would test map/set domains and list/collection values. A key-membership guard
