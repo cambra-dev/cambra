@@ -242,34 +242,10 @@ fn binop(op: BinOpKind, a: &Lit, b: &Lit) -> Result<Lit, NoValue> {
         NoValue(format!(
             "`{} {} {}` has no value",
             ConstTerm::Lit(a.clone()),
-            symbol(op),
+            op.chl_sym(),
             ConstTerm::Lit(b.clone())
         ))
     })
-}
-
-/// How CHL spells `op`.
-fn symbol(op: BinOpKind) -> &'static str {
-    match op {
-        BinOpKind::Arithmetic(ArithmeticKind::Add) | BinOpKind::Concat => "+",
-        BinOpKind::Arithmetic(ArithmeticKind::AddRefined) => "^+",
-        BinOpKind::Arithmetic(ArithmeticKind::Sub) => "-",
-        BinOpKind::Arithmetic(ArithmeticKind::Mul) => "*",
-        BinOpKind::Arithmetic(ArithmeticKind::FloorDiv) => "//",
-        BinOpKind::Arithmetic(ArithmeticKind::Pow) => "**",
-        BinOpKind::Compare(CompareKind::Equals) => "==",
-        BinOpKind::Compare(CompareKind::NotEquals) => "!=",
-        BinOpKind::Compare(CompareKind::Less) => "<",
-        BinOpKind::Compare(CompareKind::LessOrEq) => "<=",
-        BinOpKind::Compare(CompareKind::Greater) => ">",
-        BinOpKind::Compare(CompareKind::GreaterOrEq) => ">=",
-        BinOpKind::BoolLogic(LogicKind::And) => "and",
-        BinOpKind::BoolLogic(LogicKind::Or) => "or",
-        BinOpKind::BoolLogic(LogicKind::Xor) => "^",
-        BinOpKind::BoolLogic(LogicKind::Nand) => "nand",
-        BinOpKind::BoolLogic(LogicKind::Nor) => "nor",
-        BinOpKind::BoolLogic(LogicKind::Xnor) => "xnor",
-    }
 }
 
 /// As CHL writes the term: `30`, `"us"`, `(a=1, b=2)`, `r + 1`.
@@ -314,7 +290,7 @@ impl fmt::Display for ConstTerm {
                 }
                 write!(f, ")")
             }
-            ConstTerm::BinOp(op, l, r) => write!(f, "({l} {} {r})", symbol(*op)),
+            ConstTerm::BinOp(op, l, r) => write!(f, "({l} {} {r})", op.chl_sym()),
             ConstTerm::Neg(t) => write!(f, "-{t}"),
             ConstTerm::Not(t) => write!(f, "not {t}"),
             ConstTerm::If(c, t, e) => write!(f, "({t} if {c} else {e})"),
@@ -327,6 +303,7 @@ impl fmt::Display for ConstTerm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
 
     fn int(n: i64) -> ConstTerm {
         ConstTerm::Lit(Lit::Int(n))
@@ -417,5 +394,23 @@ mod tests {
             op(ArithmeticKind::Add, s("a"), s("b")).normalized(),
             Ok(s("ab"))
         );
+    }
+
+    /// A constant term prints each operator as CHL writes it, including the two whose CHL spelling
+    /// differs from `BinOpKind::sym`: xor `^` and string concatenation `+`.
+    #[rstest]
+    #[case::xor(BinOpKind::BoolLogic(LogicKind::Xor), "(p ^ 1)")]
+    #[case::concat(BinOpKind::Concat, "(p + 1)")]
+    #[case::add(BinOpKind::Arithmetic(ArithmeticKind::Add), "(p + 1)")]
+    fn a_constant_term_spells_its_operator_as_chl_does(
+        #[case] kind: BinOpKind,
+        #[case] expected: &str,
+    ) {
+        let term = ConstTerm::BinOp(
+            kind,
+            Box::new(ConstTerm::Param(ConstParam::declared("p"))),
+            Box::new(int(1)),
+        );
+        assert_eq!(term.to_string(), expected);
     }
 }
