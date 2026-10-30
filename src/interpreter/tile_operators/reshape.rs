@@ -123,6 +123,11 @@ impl TileProducer for PermuteRecordDomainProducer {
         visit("input", &*self.input);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
+    }
+
     impl_producer_base!();
 
     /// The keys are renamed fieldwise, so the input is read whole and the answer is cut to the
@@ -470,6 +475,11 @@ impl TileProducer for FlattenTupleDomainProducer {
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
     }
 
     /// The keys are restated flat, so the input is read whole and the answer is cut to the
