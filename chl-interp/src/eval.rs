@@ -2952,7 +2952,7 @@ impl Interp {
                 Ok(Value::Record(fields))
             }
 
-            // `c[k]` is the entry at `k`; the checked `c[k]?` answers `Option::some(v)` for an
+            // `c[k]!` is the entry at `k`; the checked `c[k]` answers `Option::some(v)` for an
             // entry and `Option::none` where there is none (`docs/chl-spec.md`, "3.9 Subscript
             // and attribute access").
             Expr::Subscript {

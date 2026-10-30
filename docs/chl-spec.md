@@ -204,7 +204,7 @@ surface level.
 =  += -= *= //=
 :=  <:  ::
 <<  <<=
-(  )  [  ]  {  }  ,  :  .  ;  \  `  ?  @
+(  )  [  ]  {  }  ,  :  .  ;  \  `  !  @
 ```
 
 `::` separates a qualifier from the name it qualifies: a module or a run from its member
@@ -216,8 +216,9 @@ module](#912-field-labels-and-tags-belong-to-a-module)), a nominal type from its
 (`a::area`, `summon(Area(_))::area`, [Summoning an instance](#summoning-an-instance)). A qualified
 name parses wherever a name does.
 
-> **Direction [Decided].** Postfix `!` joins the set. It unwraps an `Option` proven not to be
-> `Option::none` ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)).
+Postfix `!` unwraps an `Option` proven not to be `Option::none`
+([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)). `!=` is one token,
+so `x! == y` needs the space.
 
 `:=` is the **mutation** operator (§4.3, §8.1) — it introduces and writes
 a mutable variable. It is *not* Python's walrus operator: it is an
@@ -227,10 +228,6 @@ assignment-as-expression.
 `<:` is the bounded annotation: `x <: T` bounds the binder's inferred type
 by `T` where `x: T` fixes it
 ([Two annotation forms: exact and bounded](#two-annotation-forms-exact-and-bounded)).
-
-`?` directly after a subscript's `]` is the optional lookup, `c[k]?`
-([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)). The decided
-direction there retires it.
 
 `@` is the decorator introducer ([1.9 Decorators](#19-decorators)); there is no
 matrix-multiplication operator.
@@ -1192,11 +1189,11 @@ states presence by. An index drawn from iterating `xs` is present.
 
 `c[k]!` is accepted exactly where the refinement on `c[k]` entails `not _.is_none()`: under an
 `in` guard, for a key drawn from iterating `c`, or for a `FullMap`. Failure to establish presence
-is a type error at `!`, not a runtime unwrap failure. The proposed `!` has postfix precedence;
+is a type error at `!`, not a runtime unwrap failure. `!` has postfix precedence;
 `!=` remains one token, so `x! == y` requires a space before `==`.
 
-> **[Interim]** The compiler has no postfix `!`. Today's `c[k]?` corresponds to the decided
-> `c[k]`, and today's `c[k]` corresponds to the decided proven access `c[k]!`.
+> **[Interim]** The compiler accepts `!` only directly after a subscript, as `c[k]!`. A `!` after
+> any other expression is a parse error.
 
 A direct call `c(k)` remains function application, not an optional membership test.
 
@@ -2320,9 +2317,10 @@ marked one carries its status per "How to read this document".)
   entry pairs that `map([…])` re-keys.
 - `FullMap(K, V)` — *total*-map type (§6.3): every value of `K` is a key. `K` is the finite domain
   of keys present in what built the map, and only `groupby` builds one, so a lookup always finds
-  its key. Today the lookup answers `V`. Under
-  [Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided) it answers
-  `{Option(V) where not _.is_none()}`, which `!` unwraps without a proof at the call.
+  its key. Today the proven lookup `m[k]!` answers `V`, and the key's type is its proof. Under
+  [Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided) the checked
+  lookup `m[k]` answers `{Option(V) where not _.is_none()}`, which `!` unwraps without a proof at
+  the call.
 - `Time` — a position in the commit order, what a transaction handle's
   `current_time()` answers (**[Tentative]**, §8.2). §8.2 calls the handle
   itself a `Txn` value, and the two spellings are not reconciled.
@@ -2834,7 +2832,10 @@ The rules, and what each one is doing:
 and ``{ `some{Int} | `none }`` are the same type, and an annotation written in
 either order compares equal to what inference produced.
 
-What a partial lookup returns (§3.9, §6.3) is `Option(T)`, a nominal type and not a variant
+What a checked lookup returns
+([3.9 Subscript and attribute access](#39-subscript-and-attribute-access),
+[6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)) is `Option(T)`,
+a nominal type and not a variant
 ([3.15 Variant constructors](#315-variant-constructors)): the variant language privileges no tag,
 so ``{ `some{T} | `none }`` is an ordinary variant type and a different type from `Option(T)`. A
 sum that several modules share, such as a `Result`, is declared as a nominal type the same way
@@ -3907,9 +3908,11 @@ of built-in functions.
 All three are unary and take a collection-typed argument. Other aggregates
 (`count`, `avg`, `len`) are **[Planned]** but not yet recognised.
 
-`max` and `min` are to return `Option(T)`, `Option::none` for an empty collection, as §3.9's
-optional lookup is **[Planned]**, and a postfix `!` unwraps the result where the collection is proven
-non-empty, as it unwraps a lookup whose key is proven present
+`max` and `min` are to return `Option(T)`, `Option::none` for an empty collection, as the checked
+lookup `c[k]` returns `Option::none` for an absent key
+([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)). A postfix `!` is to
+unwrap the result where the collection is proven non-empty, as it unwraps a lookup whose key is
+proven present
 ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)). Until then `max` of
 an empty collection is not defined, and neither is `min` of one
 ([Partiality is not yet defined](#partiality-is-not-yet-defined-open)).

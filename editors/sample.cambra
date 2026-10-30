@@ -39,11 +39,12 @@ def evens(xs):
         yield x
 
 with begin():
-    match store[key]?:
+    match store[key]:
         case `some(v):
             total := v
         case `none:
             total := 0
+    total := store[key]!
 
 opaque ^= False
 pairs = [k -> v for k in keys] ++ [x for x in "a\tb\"c\d"]

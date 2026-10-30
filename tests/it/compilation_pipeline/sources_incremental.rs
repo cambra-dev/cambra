@@ -1688,7 +1688,7 @@ fn test_a_feed_releases_the_positions_it_does_not_fire_at() {
 "})]
 #[case::checked_lookup(indoc! {"
     m = map([(200, 1), (10, 2)])
-    [m[z]? for z in source1() if z > 99]
+    [m[z] for z in source1() if z > 99]
 "})]
 fn test_a_dropped_filtered_row_is_released(#[case] code: &str) {
     let released = released_by_a_sink_over_a_live_source(code, &[10, 200, 20], 12);
@@ -2034,7 +2034,7 @@ fn a_correlated_lookup_answers_the_keys_its_collection_has_decided(
                 case Option::none:
                     0
         m = map([(x, x) for x in source1()])
-        sum([sum([or_zero(m[k]?) * r for k in [10, 3]]) for r in [1, 2]])
+        sum([sum([or_zero(m[k]) * r for k in [10, 3]]) for r in [1, 2]])
     "};
     let first: (&[(u64, i64)], u64) = (&[(0, 10)], 0);
     let second: (&[(u64, i64)], u64) = (&[(5, 3)], 5);

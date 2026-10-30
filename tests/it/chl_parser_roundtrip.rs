@@ -207,10 +207,10 @@ fn a_mismatched_close_renders_both_brackets() {
 #[test]
 fn tuples_and_subscript() {
     let _ = must_parse_expr(r#"('a', 1)"#);
-    let _ = must_parse_expr(r#"('a', 1)[0]"#);
+    let _ = must_parse_expr(r#"('a', 1)[0]!"#);
     must_parse_module(indoc! {r#"
         x = ('a', 1)
-        x[0]
+        x[0]!
     "#});
 }
 

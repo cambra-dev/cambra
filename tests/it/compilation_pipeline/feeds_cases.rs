@@ -1649,7 +1649,7 @@ fn functions_whose_parameter_varies_with_a_binder_have_no_join() {
             o: Feed(_)
             for r in [1, 2]:
                 xs = [v for v in [1, 2, 3] if v > r]
-                o << (\i -> xs[i])
+                o << (\i -> xs[i]!)
             o
         "#},
         "the parameter of a function written to a feed or mutable variable depends on `r`",

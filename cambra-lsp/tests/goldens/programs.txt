@@ -485,15 +485,15 @@ symbols:
   variable events 22:1-22:16 (name 22:1-22:7)
   function bump 26:1-35:29 (name 26:5-26:9)
   function evens 37:1-39:16 (name 37:5-37:10)
-  variable opaque 48:1-48:16 (name 48:1-48:7)
-  variable pairs 49:1-49:59 (name 49:1-49:6)
-  variable escapes 50:1-50:29 (name 50:1-50:8)
-  variable totals 51:1-51:46 (name 51:1-51:7)
-  variable inc 52:1-52:18 (name 52:1-52:4)
-  variable held 53:1-53:28 (name 53:1-53:5)
-  variable apply 54:1-54:22 (name 54:1-54:6)
-  variable evens 55:1-55:43 (name 55:1-55:6)
-  variable n 70:1-70:42 (name 70:1-70:2)
+  variable opaque 49:1-49:16 (name 49:1-49:7)
+  variable pairs 50:1-50:59 (name 50:1-50:6)
+  variable escapes 51:1-51:29 (name 51:1-51:8)
+  variable totals 52:1-52:46 (name 52:1-52:7)
+  variable inc 53:1-53:18 (name 53:1-53:4)
+  variable held 54:1-54:28 (name 54:1-54:5)
+  variable apply 55:1-55:22 (name 55:1-55:6)
+  variable evens 56:1-56:43 (name 56:1-56:6)
+  variable n 71:1-71:42 (name 71:1-71:2)
 folds:
   1-5 comment
   12-13
@@ -503,7 +503,7 @@ folds:
   31-32
   37-39
   38-39
-  41-46
+  41-47
   42-46
   43-44
   45-46

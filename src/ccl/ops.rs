@@ -773,13 +773,13 @@ pub enum Builtin {
     /// holds because nothing reifies it, not because a check rejects one that does.
     CollectionContains,
 
-    /// `lookup? : ((𝑘: 𝐷) ⤇ 𝑉, 𝐾) → Option(𝑉[𝑘 ↦ key])` — the **checked** lookup `c[k]?`,
+    /// `lookup? : ((𝑘: 𝐷) ⤇ 𝑉, 𝐾) → Option(𝑉[𝑘 ↦ key])` — the **checked** lookup `c[k]`,
     /// evaluating a finite function at a point not known to be in its domain
     /// (`docs/chl-spec.md`, "3.9 Subscript and attribute access").
     ///
     /// **Not an application**, so the key owes the collection's key *base* and presence is
     /// what the operator decides at runtime (`src/ccl/design/collections.md`,
-    /// "The checked lookup `𝑐[𝑘]?`"). A dependent codomain answers at the key, its
+    /// "The checked lookup `𝑐[𝑘]`"). A dependent codomain answers at the key, its
     /// binder discharging to the key term.
     ///
     /// Applied as a tupled argument, the convention [`Self::Insert`] and

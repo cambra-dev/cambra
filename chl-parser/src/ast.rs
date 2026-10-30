@@ -793,7 +793,7 @@ pub enum AssignTarget {
     /// being a write to a mutable collection (`src/ccl/design/mutability.md`,
     /// "Surface-marker nodes: `For`, `MutWrite`, `Begin`, `Feed`"); every other
     /// statement form rejects it at lowering, where the message can name the binder
-    /// the form wanted. The checked spelling `m[k]? := v` is refused earlier, in
+    /// the form wanted. The proven spelling `m[k]! := v` is refused earlier, in
     /// [`expr_to_assign_target`](crate::parser), because it is not a
     /// target this enum can hold rather than a target used in the wrong statement.
     ///
@@ -1022,14 +1022,14 @@ pub enum Expr {
         codomain: Box<Spanned<Expr>>,
     },
 
-    /// Subscript: `target[index]`, or the **checked** form `target[index]?` —
-    /// **collection lookup only**. Projecting a product is a different operation and
-    /// has its own spelling, [`Expr::Attribute`].
+    /// Subscript: the **checked** form `target[index]`, or the proven form
+    /// `target[index]!` — **collection lookup only**. Projecting a product is a
+    /// different operation and has its own spelling, [`Expr::Attribute`].
     ///
     /// The two subscript forms are one syntactic form because they are one operation —
     /// evaluate a finite function at a point — differing only in what happens when the
     /// point may be absent. `checked` yields `Option(V)` and always type-checks; the
-    /// plain form yields `V` and requires the index's presence to be *provable*
+    /// proven form yields `V` and requires the index's presence to be *provable*
     /// (`docs/chl-spec.md`, "3.9 Subscript and attribute access").
     Subscript {
         target: Box<Spanned<Expr>>,

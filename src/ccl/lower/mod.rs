@@ -30,7 +30,7 @@
 //! | Record values `(field=expr, ...)` | [`TypedExprNode::Record`] |
 //! | Field access `r.field` | [`TypedExprNode::Apply`] with [`TypedExprNode::Proj`]`(`[`crate::ccl::ProjKey::Field`]`)` |
 //! | Positional access `t.0` | [`TypedExprNode::Apply`] with [`TypedExprNode::Proj`]`(`[`crate::ccl::ProjKey::Index`]`)` |
-//! | Collection lookup `c[k]` | [`TypedExprNode::Apply`] — the same node as the call `c(k)` |
+//! | Proven collection lookup `c[k]!` | [`TypedExprNode::Apply`] — the same node as the call `c(k)` |
 //! | The outputs of a program that binds a sink | a [`TypedExprNode::Record`] at the tail of the root `Let*` chain |
 //!
 //! `src/ccl/design/lowering.md`, "Lowering — CHL to CCL" specifies functions,
@@ -1493,31 +1493,17 @@ fn lower_expr_inner(
         )),
         // Attribute access `target.attr` → `Apply(target, Proj(k))`. The `Proj` images
         // the `.attr` access the user wrote.
-        //
-        // This is the one place a projection key's two spellings are resolved: digits
-        // are a tuple **position**, anything else a record field **name**. The two are
-        // disjoint because an identifier cannot begin with a digit, so `starts_with` a
-        // digit *is* the discriminator — no guessing and no ambiguity.
         ChlExpr::Attribute {
             target,
             attr,
             attr_span,
             attr_qualifier,
         } => {
-            let key = if attr.starts_with(|c: char| c.is_ascii_digit()) {
-                // Only magnitude can fail here: the parser admits an integer literal,
-                // so the digits are a non-negative number, but not necessarily one a
-                // `usize` position can hold.
-                let index: usize = attr.parse().map_err(|_| {
-                    LoweringError::unsupported(
-                        *attr_span,
-                        format!("tuple position `.{attr}` is too large to be an index"),
-                    )
-                })?;
-                Expr::proj_index(index)
-            } else {
-                Expr::proj_field(ctx.label(attr_qualifier, attr, *attr_span)?)
-            };
+            let key = Expr::new(TypedExprNode::Proj(ctx.projection_key(
+                attr_qualifier,
+                attr,
+                *attr_span,
+            )?));
             let target_expr = lower_expr(target, ctx)?;
             let proj = ctx.tag_image(key, expr.span);
             Ok(Expr::apply(target_expr, proj))
@@ -2073,8 +2059,8 @@ mod tests {
 
     /// A subscript target parses, so the statement forms that cannot perform a keyed
     /// write reject it at **lowering** rather than at parse time. `:=` is the only
-    /// one that can: `=` binds, and `+=` would need to read `m[k]` first, which is
-    /// the proven lookup that does not exist yet.
+    /// one that can: `=` binds, and `+=` would need to read `m[k]!` first, and lowering
+    /// has no keyed read-modify-write.
     #[test]
     fn a_subscript_target_is_rejected_by_every_form_but_mut_assign() {
         for code in ["x = [1]\nx[0] += 1\nx", "x = [1]\nx[0] = 1\nx"] {
@@ -2104,10 +2090,10 @@ mod tests {
             e.fold_children((), |(), c| option_bindings(c, out));
         }
         for (code, bound) in [
-            ("m = map([(1, 10)])\nm[1]?", &[][..]),
+            ("m = map([(1, 10)])\nm[1]", &[][..]),
             ("Option::some(1)", &["Option::some"][..]),
             (
-                "m = map([(1, 10)])\nm[1]?.is_none()",
+                "m = map([(1, 10)])\nm[1].is_none()",
                 &["Option::is_none"][..],
             ),
         ] {

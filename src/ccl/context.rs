@@ -3474,7 +3474,7 @@ Error: lowering error
 
     /// Emission recovers at each statement: every failing statement reports, in
     /// source order, and a binding whose definition failed reports nothing more at
-    /// its uses, even where a rule needs the value's shape as it emits (`m[1]?`). An
+    /// its uses, even where a rule needs the value's shape as it emits (`m[1]`). An
     /// exact annotation binds its name at the declared type, so a use of it
     /// still reports. `expected` is the text each error's span covers.
     #[rstest]
@@ -3500,7 +3500,7 @@ Error: lowering error
             y = x + 1
             z = not x
             m = bar
-            v = m[1]?
+            v = m[1]
             y
         "},
         &["foo", "bar"]

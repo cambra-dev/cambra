@@ -236,7 +236,7 @@ fn find_node(expr: &Expr, id: crate::ccl::provenance::NodeId) -> Option<&Expr> {
 ///
 /// The types inside its refinement predicates are resolved too, here rather than
 /// when the message is written: the variables' bounds are gone by then, and the
-/// message reads them (`chl_print` writes a read of a collection as `xs[i]` and a
+/// message reads them (`chl_print` writes a read of a collection as `xs[i]!` and a
 /// call as `f(x)`, which only the callee's type tells apart).
 pub(super) fn coalesce_for_error(ty: &Type) -> Type {
     let mut resolved = resolve_var_type(ty).unwrap_or(Type::Hole);
@@ -517,7 +517,7 @@ pub(super) fn lit_base(lit: &Lit) -> Type {
 /// `__elem == lit`, so `5 : {Int | __elem == 5}`.
 ///
 /// A literal knows more about itself than its base type does, and that knowledge is
-/// what a proof obligation needs: `a[0]` can only discharge against `Array(3, 𝑇)`'s
+/// what a proof obligation needs: `a[0]!` can only discharge against `Array(3, 𝑇)`'s
 /// index range if `0`'s type says it *is* `0`. Typing `5` as plain `Int` throws that
 /// away at the one place it is free to keep.
 ///

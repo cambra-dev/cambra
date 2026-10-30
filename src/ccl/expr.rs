@@ -736,7 +736,7 @@ pub enum TypedExprNode {
     /// A first-class projection morphism `.n` (tuple) or `.name` (record).
     ///
     /// `Proj(k)` represents the morphism `λ t → t.k` in point-free form.
-    /// Tuple index access `t[n]` is lowered as `Apply(Proj(Index(n)), t)`.
+    /// Tuple projection `t.n` is lowered as `Apply(Proj(Index(n)), t)`.
     /// Introduced by lowering; absent in the higher-level design.
     Proj(ProjKey),
 
@@ -1493,7 +1493,7 @@ impl TypedExpr {
 
     /// Construct a first-class projection morphism node.
     ///
-    /// `Proj(Index(n))` acts as the function `λ t → t.n`. Tuple subscript `t[n]`
+    /// `Proj(Index(n))` acts as the function `λ t → t.n`. Tuple projection `t.n`
     /// is lowered as `Expr::apply(t, Expr::proj_index(n))`.
     pub fn proj_index(i: usize) -> Self {
         Self::new(TypedExprNode::Proj(ProjKey::Index(i)))

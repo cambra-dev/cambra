@@ -3491,7 +3491,7 @@ fn a_map_valued_mut_var_reads_inside_a_block() {
         n: Mut(Int, Txn) := 0
         for r in [1, 2, 3]:
             with begin():
-                hit = m["a"]?
+                hit = m["a"]
                 n := n + 1
         await_final(n)
     "#});
@@ -3734,7 +3734,7 @@ fn map_entries_int(v: &Value) -> Vec<(i64, i64)> {
     out
 }
 
-/// A keyed write and a keyed read, round trip: `m[k] := v` commits and `m[k]?` reads it
+/// A keyed write and a keyed read, round trip: `m[k] := v` commits and `m[k]` reads it
 /// back. This is the pair that makes a mutable collection usable rather than write-only.
 ///
 /// The read goes through the **materialized** path in `CheckedLookup`: a mutable variable holds its
@@ -3750,7 +3750,7 @@ fn a_keyed_write_reads_back_through_a_checked_lookup() {
                 with begin():
                     m["c"] := 3
             final: Map(String, Int) = await_final(m)
-            match final["c"]?:
+            match final["c"]:
                 case Option::some(v):
                     v
                 case Option::none:
@@ -3775,7 +3775,7 @@ fn a_product_keys_a_mutable_collection() {
                 with begin():
                     m[(r, r)] := r
             final: Map({Int, Int}, Int) = await_final(m)
-            match final[(3, 3)]?:
+            match final[(3, 3)]:
                 case Option::some(v):
                     v
                 case Option::none:
@@ -3802,7 +3802,7 @@ fn a_shared_key_component_keys_a_mutable_collection() {
                 with begin():
                     m[(1, "BTC")] := r
             final: Map({Int, String}, Int) = await_final(m)
-            match final[(1, "BTC")]?:
+            match final[(1, "BTC")]:
                 case Option::some(v):
                     v
                 case Option::none:
@@ -3823,7 +3823,7 @@ fn a_checked_lookup_on_a_mut_var_answers_none_for_an_absent_key() {
                 with begin():
                     m["c"] := 3
             final: Map(String, Int) = await_final(m)
-            match final["zzz"]?:
+            match final["zzz"]:
                 case Option::some(v):
                     v
                 case Option::none:
@@ -3854,7 +3854,7 @@ fn a_keyed_read_at_the_loop_item_reads_the_snapshot() {
         n: Mut(Int, Txn) := 0
         for r in [1, 2]:
             with begin():
-                n := n + or_zero(m[r]?)
+                n := n + or_zero(m[r])
         await_final(n)
     "#});
     assert_eq!(value, Value::Int(30));
@@ -3910,7 +3910,7 @@ fn a_checked_lookup_of_an_absent_key_in_a_read_only_block_answers_none() {
             out: Feed(_)
             for r in [1, 2, 1]:
                 with begin():
-                    out << (match m[r]?:
+                    out << (match m[r]:
                         case Option::some(v): v
                         case Option::none: 0)
             sum(out)
@@ -3944,7 +3944,7 @@ fn a_checked_lookup_of_an_absent_key_in_a_writing_block() {
             n: Mut(Int, Txn) := 0
             for r in [3]:
                 with begin():
-                    n := n + or_zero(m[r]?)
+                    n := n + or_zero(m[r])
             await_final(n)
         "#},
         Value::Int(0),
@@ -3952,7 +3952,7 @@ fn a_checked_lookup_of_an_absent_key_in_a_writing_block() {
 }
 
 /// A checked lookup in a loop that writes the map back at the looked-up key: the read-modify-write
-/// counter `m[r] := or_zero(m[r]?) + 1` over an **induction** map, at a key the seed holds.
+/// counter `m[r] := or_zero(m[r]) + 1` over an **induction** map, at a key the seed holds.
 #[test]
 fn a_counter_over_an_induction_map_at_a_present_key() {
     let value = final_mut_var_value(indoc! {r#"
@@ -3964,7 +3964,7 @@ fn a_counter_over_an_induction_map_at_a_present_key() {
                     0
         m: Mut(Map(Int, Int)) := box(map([(3, 0)]))
         for r in [3, 3]:
-            m[r] := or_zero(m[r]?) + 1
+            m[r] := or_zero(m[r]) + 1
         m
     "#});
     assert_eq!(map_entries_int(&value), vec![(3, 2)]);
@@ -3985,7 +3985,7 @@ fn a_counter_over_an_induction_map_at_an_absent_key() {
                     0
         m: Mut(Map(Int, Int)) := box(map([(1, 10)]))
         for r in [3, 3]:
-            m[r] := or_zero(m[r]?) + 1
+            m[r] := or_zero(m[r]) + 1
         m
     "#});
     assert_eq!(map_entries_int(&value), vec![(1, 10), (3, 2)]);

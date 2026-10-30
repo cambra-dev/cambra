@@ -458,7 +458,7 @@ cutoff at the binding's level, so `pick: forall (T) T => T = inc` reports `inc` 
   `\x -> y` as `forall (A) A => ‹?𝑛›`.
 - **Predicates.** The types inside the result's refinement predicates are resolved when the error
   is raised, as `coalesce_for_error` resolves them, so `chl_print` can tell a read of a collection
-  (`ys[_]`) from a call.
+  (`ys[_]!`) from a call.
 - **Bounds.** The type beside a parameter at a negative position is its bound. A parameter that
   occurs once was eliminated by simplification, so its bound is written inline:
   `def at(a): a.at` prints as `forall (A) {at: A} => A`, and `def both(a): (a.at, a)` as

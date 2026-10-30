@@ -342,7 +342,7 @@ fn option_values() {
         m = map([(1, 10), (2, 20)])
         out = test_sink()
         for k in [1, 2, 3]:
-            out << (or_zero(m[k]?), m[k]?.is_none(), or_zero(Option::some(k)))
+            out << (or_zero(m[k]), m[k].is_none(), or_zero(Option::some(k)))
         out << (or_zero(Option::none), True, 0)
     "#});
 }
@@ -854,8 +854,8 @@ fn a_defer_channel_read_back() {
 fn a_checked_lookup_on_a_map() {
     agree(indoc! {r#"
         m = map([("a", 1)])
-        r = m["a"]?
-        s = m["b"]?
+        r = m["a"]
+        s = m["b"]
         out = test_sink()
         out << r
         out << s

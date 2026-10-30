@@ -208,6 +208,24 @@ fn a_declaration_refines_by_a_constant(
     "pub rate = 5\n",
     "expected {Int | __elem <= 5}"
 )]
+#[case::tuple_position(
+    indoc! {"
+        import cfg
+        type Small = {Int where _ <= cfg::rate}
+        Small::new(30).extract()
+    "},
+    "pub rate = (2, 5).1\n",
+    "expected {Int | __elem <= 5}"
+)]
+#[case::tuple_pattern(
+    indoc! {"
+        import cfg
+        type Small = {Int where _ <= cfg::rate}
+        Small::new(30).extract()
+    "},
+    "pairs = (2, 5)\n(lo, hi) = pairs\npub rate = hi\n",
+    "expected {Int | __elem <= 5}"
+)]
 #[case::imported_not_a_constant(
     indoc! {"
         import cfg

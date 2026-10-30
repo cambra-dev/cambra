@@ -90,7 +90,7 @@
     "vim": "Special"
   },
   "operator": {
-    "construct": "Every other operator, and the checked-lookup ?",
+    "construct": "Every other operator, and the unwrap !",
     "textmate": "keyword.operator",
     "vim": "Operator"
   },

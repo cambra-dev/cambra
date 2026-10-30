@@ -5566,7 +5566,7 @@ fn reject_unanswerable_lookup_collection(tiling: &Tiling) -> Result<(), Conversi
         return Ok(());
     }
     Err(ConversionError::Unsupported(format!(
-        "`c[k]?` needs a collection that tiles either as a one-level function over a scalar \
+        "`c[k]` needs a collection that tiles either as a one-level function over a scalar \
          codomain, so that its domain can be searched and its values carried as the `some` \
          payload, or as one materialized map value; this one tiles as {tiling}. A \
          collection-valued codomain is the usual reason"

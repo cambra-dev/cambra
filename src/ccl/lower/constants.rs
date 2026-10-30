@@ -18,7 +18,7 @@ use smol_str::SmolStr;
 
 use super::{LoweringContext, LoweringError};
 use crate::ccl::constant::{ConstParam, ConstTerm};
-use crate::ccl::{ArithmeticKind, BinOpKind, CompareKind, Lit, LogicKind};
+use crate::ccl::{ArithmeticKind, BinOpKind, CompareKind, Lit, LogicKind, ProjKey};
 use crate::chl_parser::ast::{
     AssignTarget, BinOp as ChlBinOp, BoolOp, CmpOp, Expr as ChlExpr, Lit as ChlLit,
     QualifiedName as ParserQualifiedName, Span, Spanned, Stmt as ChlStmt, UnaryOp,
@@ -243,8 +243,7 @@ impl LoweringContext {
         self.constants.terms.insert(key.clone(), Err(Refused(None)));
         let term = self.const_term(&definition, start).and_then(|term| {
             path.iter().try_fold(term, |term, &i| {
-                let index = ConstTerm::Lit(Lit::Int(i64::try_from(i).expect("a tuple index fits")));
-                ConstTerm::Element(Box::new(term), Box::new(index))
+                ConstTerm::Field(Box::new(term), ProjKey::Index(i))
                     .normalized()
                     .map_err(|e| Refused::from(refused(definition.span, e.0)))
             })
@@ -416,9 +415,9 @@ impl LoweringContext {
                 attr_span,
                 attr_qualifier,
             } => {
-                let label = self.label(attr_qualifier, attr, *attr_span)?;
+                let key = self.projection_key(attr_qualifier, attr, *attr_span)?;
                 let target = self.const_term(target, at)?;
-                ConstTerm::Field(Box::new(target), label)
+                ConstTerm::Field(Box::new(target), key)
                     .normalized()
                     .map_err(no_value)
             }

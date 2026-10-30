@@ -29,14 +29,14 @@ use super::panic_message::panic_message;
         xs = [1, 2, 3]
         ys = [x for x in xs if x > 1]
     "},
-    "{UInt where _ < 3 and xs[_] > 1} |=> Int"
+    "{UInt where _ < 3 and xs[_]! > 1} |=> Int"
 )]
 #[case::filtered_tuples(
     indoc! {"
         xs = [(1, 2), (3, 4)]
         ys = [p for p in xs if p.0 > 1]
     "},
-    "{UInt where _ < 2 and xs[_].0 > 1} |=> {Int, Int}"
+    "{UInt where _ < 2 and xs[_]!.0 > 1} |=> {Int, Int}"
 )]
 // A function the filter calls is a call; the collection it reads is an index.
 #[case::filter_calling_a_function(
@@ -46,7 +46,7 @@ use super::panic_message::panic_message;
         xs = [1, 2, 3]
         ys = [x for x in xs if big(x)]
     "},
-    "{UInt where _ < 3 and big(xs[_])} |=> Int"
+    "{UInt where _ < 3 and big(xs[_]!)} |=> Int"
 )]
 #[case::nested_comprehension(
     indoc! {"
@@ -66,7 +66,7 @@ use super::panic_message::panic_message;
         xs = [1, 2, 3]
         g = groupby(xs, \\x -> x > 1)
     "},
-    "(k: {Bool where _ in [x > 1 for x in xs]}) |=> {UInt where _ < 3 and (xs[_] > 1) == k} |=> Int"
+    "(k: {Bool where _ in [x > 1 for x in xs]}) |=> {UInt where _ < 3 and (xs[_]! > 1) == k} |=> Int"
 )]
 // A key the compiler names is spelled apart from the program's own `k`.
 #[case::group_by_beside_k(
@@ -75,7 +75,7 @@ use super::panic_message::panic_message;
         xs = [1, 2, 3]
         g = groupby(xs, \\x -> x + k)
     "},
-    "(k1: {Int where _ in [x + k for x in xs]}) |=> {UInt where _ < 3 and xs[_] + k == k1} |=> Int"
+    "(k1: {Int where _ in [x + k for x in xs]}) |=> {UInt where _ < 3 and xs[_]! + k == k1} |=> Int"
 )]
 #[case::boxed_literal("b = box([1, 2, 3])", "Box(Array(3, Int))")]
 #[case::boxed_alternatives(

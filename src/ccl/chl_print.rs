@@ -476,7 +476,7 @@ impl Printer {
     }
 
     /// `argument ▷ function`: a field read, a lambda's body at the argument, a
-    /// membership test, an index into a collection, or a call. The last two differ
+    /// membership test, a proven lookup `c[k]!`, or a call. The last two differ
     /// only in the function's kind, so a function whose type does not say which is
     /// written in the checker's notation.
     ///
@@ -523,7 +523,7 @@ impl Printer {
                     let target = self.expr(function, Prec::Postfix, env);
                     let arg = self.expr(argument, Prec::Lowest, env);
                     let text = if fun_kind.resolved().is_data() {
-                        format!("{target}[{arg}]")
+                        format!("{target}[{arg}]!")
                     } else {
                         format!("{target}({arg})")
                     };

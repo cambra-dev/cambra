@@ -659,7 +659,7 @@ fn present_key_domain(
     Type::refined_one(key, Refinement::born(Rc::new(predicate)))
 }
 
-/// Lower `target[index]` as application and `target[index]?` as checked lookup.
+/// Lower `target[index]!` as application and `target[index]` as checked lookup.
 /// Neither spelling projects a product; projection uses `.` regardless of the index's shape.
 /// See `docs/chl-spec.md`, "3.9 Subscript and attribute access".
 pub(super) fn lower_subscript(
