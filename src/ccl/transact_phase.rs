@@ -3099,8 +3099,8 @@ fn plan_store(
         // (allocate-on-commit), so `get_prev_txn` searches the latest write
         // `≤ t` with no filter (matching its declared `{time, write}` codomain).
         // A key written by no site is read-only: it self-guards on its own
-        // history. The pointwise maps and the union are guarded shapes
-        // (`letrec::is_causal_history_slot` — they change what is read at each
+        // history. The pointwise maps and the union are causal history slots
+        // (`letrec::is_causal_history_slot`: they change what is read at each
         // position, never which positions the accessor consults), so the
         // `hist_k ↔ commits_j` cycles still cross the guard.
         let view_rec_ty = Type::Record(vec![(F_TIME, Type::Txn), (F_WRITE, v.clone())]);

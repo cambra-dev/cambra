@@ -222,15 +222,15 @@ fn is_causal_history_slot(history: &TypedExpr, live: &BTreeSet<Name>) -> bool {
     }
 }
 
-/// Collect the group names referenced *non-causal* in `e` into `out`.
+/// Collect into `out` the group names `e` references outside a causal history slot.
 ///
-/// `live` is the set of group names still visible at this point of the walk
-/// — an inner binder that re-binds a group name shadows it for its scope
-/// (impossible after uniquify's Barendregt minting, but the check stays
-/// honest on hand-built trees). A reference in the history slot of a guard
-/// is skipped, in both the pointful and the point-free guard shape; every
-/// other occurrence — including the position/default slots of the same call
-/// — is an ordinary, non-causal reference.
+/// `live` holds the group names visible at this point of the walk; an inner binder that
+/// re-binds a group name shadows it for its scope. Uniquify's Barendregt minting rules that
+/// out, and the walk still respects it on hand-built trees. A guard's history slot is skipped
+/// when it passes `is_causal_history_slot`, in both the pointful shape and the point-free
+/// shape `lambda_elim` produces. Every other reference is non-causal, including one in the
+/// guard's position or default slot, one in a middle compose element of the point-free shape,
+/// and one in a history slot that is not causal.
 fn collect_noncausal_refs(e: &TypedExpr, live: &BTreeSet<Name>, out: &mut BTreeSet<Name>) {
     // The guard shape: `Apply(Tuple([history, …]), Builtin(get_prev_*))`
     // where `history` is a causal slot (see `is_causal_history_slot`).
