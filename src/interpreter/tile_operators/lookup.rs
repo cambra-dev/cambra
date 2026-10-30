@@ -1020,11 +1020,11 @@ mod tests {
             ]),
             absent: HashMap::new(),
         };
-        // The outer collection holds exactly rows 0 and 1, and each row's collection still grows.
+        // The rows' collections are still growing, so no row is complete.
         let tile = Tile::data_function(
             ColumnValue::UInts(vec![0, 1]),
             Box::new(record),
-            Predicate::from_column_value(&ColumnValue::UInts(vec![0, 1])),
+            Predicate::False,
             BitSet::new(),
         );
         let tiling = Tiling::data_function(
@@ -1073,6 +1073,23 @@ mod tests {
         } = &out
         else {
             panic!("the answer tiles as a collection: {out:?}")
+        };
+        assert!(!domain_predicate.contains_path(&[Value::UInt(1)]));
+    }
+
+    /// Row 1 of `keyed_rows(2)` waits on key `2` in its collection, and a complete path's
+    /// descendants are complete at every depth, so the input calls no path through row 1
+    /// complete.
+    #[test]
+    fn keyed_rows_calls_no_row_awaiting_its_key_complete() {
+        let mut lookup = keyed_rows(2);
+        let guard = lookup.input.tiling().universal_guard();
+        let input = lookup.input.get(guard);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &input
+        else {
+            panic!("the input tiles as a collection: {input:?}")
         };
         assert!(!domain_predicate.contains_path(&[Value::UInt(1)]));
     }
