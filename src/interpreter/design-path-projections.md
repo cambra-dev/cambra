@@ -1,13 +1,43 @@
 # Projections that name a path
 
+Status: accepted. Stages 1 and 2 are built, and stage 3 runs in the dispatcher's tests
+(`tile_operators/program_run_tests.rs`). The decisions are listed under [Decisions](#decisions), and
+the work lands in the [stages](#stages) below.
+
 A projection names the part of a producer's tile a pull asks for, and a push names the region a
 pipeline breaker decided (`src/interpreter/design-operators.md`, "Projection guards"). This note
 specifies projections that name keys at any collection level, each under the path of keys above it,
-and the guard differences they need. A producer declares the levels whose keys it restates
-(`TileProducer::restates`, a `Restates`), the outermost keys only by default, and one that declares
-more reads its projection with `TileGuard::projection_for`. The `get` wrapper of a debug build
-panics on a pull at a level a producer does not restate, and a push beneath the outermost keys lands
-in its reader as a projection at its level (`Dispatcher::land_in`).
+the guard differences they need, and the stages that put them to use. A producer declares the levels
+whose keys it restates (`TileProducer::restates`, a `Restates`), the outermost keys only by default,
+and one that declares more reads its projection with `TileGuard::projection_for`. The `get` wrapper
+of a debug build panics on a pull at a level a producer does not restate, and a push beneath the
+outermost keys lands in its reader as a projection at its level (`Dispatcher::land_in`).
+
+## What the gap blocks
+
+A loop nested in another runs in rounds of its own (`src/interpreter/design-operators.md`, "A loop
+in rounds"). Removing the scheduler removes pull mode, so every shape a dispatched run refuses has
+to run there first.
+
+## Where a region crosses an operator
+
+A region crosses an operator on four paths, and only three need a path.
+
+| Path | What crosses | Needs a path |
+| --- | --- | --- |
+| Notification (`Consumer::notify`) | the keys that changed | no |
+| Pull (`TileProducer::get`) | the region asked for | yes |
+| Push (`Consumer::push`) and package | the region a breaker decided | yes |
+| Release (`TileProducer::release`) | the region read no more | yes |
+
+A notification only has to be sound: naming more than changed costs a read and loses nothing, so
+a change at `(k, j)` is notified as the key `k`, or widened to `Everything`. A push names a region
+its reader's pipeline consumes once in the run (`Pushes::record`), so a push of `k` for a change at
+`(k, j)` would consume the row `k` at its first position. A pull at a package's region answers
+that region and no more (`Tile::within`), and the breaker releases its input at what the answer
+states, which a finish checks covers the package (`finish_with`).
+
+Notifications go with the scheduler (the `TODO` on `Consumer::push`), so they need no change.
 
 ## Representation
 
@@ -76,3 +106,83 @@ held      = Domain(True)
 released  = Or [ Domain(k = 0), Codomain(Record { _0: ∅, _1: Domain(Qualified { enclosing: k = 0, here: True }) }) ]
 held − released = Domain(k ≠ 0)
 ```
+
+A round pushes per position, so it needs the difference, where a push at a finish only names the
+breaker's whole held region.
+
+`Pushes::record`, `Queue::append_unqueued` and the finish's release check (`finish_with`) compute
+their regions with `guard_minus`, `union` and `intersect` over `TileGuard`, so they take nested
+regions.
+
+## Operator rows
+
+Each row of the table under "Projection guards" in `design-operators.md` gains what the operator
+does with a projection at level 𝑛 > 0. The rows fall into five kinds:
+
+| Kind | Operators | A projection at level 𝑛 |
+| --- | --- | --- |
+| Keeps every level's keys | `MapResultWithSource`, `Filter` (with a collection predicate, the levels down to the masked one), `Restrict`, `MapDomain`, `VariantProject`, `VariantIs`, `Memo`, `FanOutSlot`, `IterateExtent`, `MapAggregate`, `MapExtractAggregate` (the levels of its input, not those of a `Sole` collection beneath them) | pulls each keyed input at the same projection and cuts its answer to it |
+| Keeps the keys above its level | `MapResult` (keyed input), `MapResultToConst`, `RecordWrap`, `Zip`, `VariantWrap`, `Product` | pulls each keyed input at a projection above its level and refuses one at or beneath it, or, for `Product`, pulls both sides at the rows above its paired level and cuts the pairs |
+| Shifts levels | `Uncurry`, `Converse` beneath standing levels (pulled at the standing keys, its groups cut), a nested store's read | restates the projection by the levels it adds or removes |
+| Reads whole and cuts | `PermuteRecordDomain`, `FlattenTupleDomain`, `SelectField` over a product, `CheckedLookup`'s collection, `UnionOperator`, `Converse` at the outermost level | reads its input whole and cuts the answer at level 𝑛 |
+| No keys beneath | `Aggregate`, `ExtractAggregate`, `ExtractFinal`, `MakeRecord`, `Constant` scalar | refuses, as it refuses keys today |
+
+An operator that keeps its input's keys above its own level and computes the values beneath them
+refuses a projection at or beneath that level (`Restates::Above`): those keys are inside the values
+it computes. The outer side of `Product` has no paired level, so `Product` declares
+`Restates::Every`, pulls both sides at the rows above that level that a projection's paths run
+through (`Projection::above`), and cuts the pairs after.
+
+`Memo` is the operator whose state depends on the algebra: its `dirty` region and its cache's cut
+are projection arithmetic (`MemoProducer::get_impl`), which `Projection` does at every level.
+
+The induction drive emits a position only where the pull's projection names its whole path
+(`InductionDriverProducer::step`). A drive and a store are pulled beneath their outermost keys only
+in a round of a nested loop, so their rows land with the nested scope.
+
+A push is restated by the consumer an operator chooses at subscribe time, not by the operator:
+`Forwarding` keeps the region, `Widening` widens it to `Everything`, and `Tagging` puts it under an
+arm's tag (`scheduler.rs`). A nested region passes `Forwarding` as it is and `Widening` as
+`Everything`. `Tagging` tags its outermost key: the enclosing component of `keys` goes under the
+tag. An operator that shifts levels and keeps keys has to restate a nested push by the shift instead
+of passing it on, so it gets a consumer of its own.
+
+## The planner
+
+A loop nested in another runs as a scope inside the outer loop's scope, queued a row of its store
+per outer round: the inner scope's rounds are the positions `(k, j)` of row `k` the inner drive
+emits, and a round at the row closes it.
+
+The planner panics on a nested loop where an operator its rounds pull beneath the outermost keys
+restates no projection there (`Planner::refusal_of_nested`). It composes the levels along each path
+from an inner pipeline's breaker: `TileProducer::restates` says what an operator accepts, and
+`TileProducer::input_level` the level it pulls each input at. There is no folded execution.
+
+## Stages
+
+1. The algebra: `Projection::Keys` at a level, its `of`, `guard`, `intersect`, `minus` and `union`;
+   `Tile::restrict_to` and `Tile::within` at a level; `guard_minus` with arms at several levels and
+   their closing against a row's extent. Unit tests over the algebra only.
+2. The rows of the operators a nested loop's body pulls at a path: `MapResult`,
+   `MapResultToConst`, `Zip`, `RecordWrap`, `VariantWrap`, `Product`, `FanOutSlot` and `Memo`,
+   each declaring the levels it restates (`TileProducer::restates`).
+   Each with a test that a pull at a projection of paths answers what a pull at `Everything` cut
+   to it answers.
+3. The nested scope in the planner, refused where an operator its rounds pull restates no nested
+   projection (`TileProducer::input_level`), with the rows of the induction drive, the stores and
+   their reads, and the nested-loop programs of the differential suite running in rounds.
+4. Live sources at any level, once a dispatched run notifies them: the feed of a map over a source,
+   and a loop over a source.
+5. The remaining rows, the operators a refused nested loop's rounds pull among them, then the
+   scheduler's removal (`src/interpreter/design-operators.md`, "Running a compiled program").
+
+## Decisions
+
+- One variant spells a projection at every level: `Keys { level, keys }`, with level 0 the
+  outermost collection.
+- A round pushes per position, so the guard algebra has a difference of nested guards rather than
+  pushing only at a finish.
+- A difference closes an arm against the extent of the row it names, so an arm that names no
+  position of its row reads as `Nothing`.
+- A nested loop whose rounds pull an operator with no nested row is refused; no loop folds into the
+  scope around it.

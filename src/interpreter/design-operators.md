@@ -668,8 +668,10 @@ unqualified at some level is named only under the rows held. Three tiles whose h
 prefix still take that path: a last key whose group holds nothing, an earlier key whose own group's
 statement calls every key complete, and a statement about the keys beneath an enclosing key the tile
 does not hold. The guard names all three exactly, the third by path. A universal input release
-latches `upstream_drained`. Release builds then return the cache without pulling that input again;
-debug builds continue pulling to exercise its post-release checks.
+latches `upstream_drained`. Until the input notifies again, release builds then return the cache
+without pulling it, and debug builds probe it once to exercise its post-release checks. A drained
+input inside a loop's cycle delivers again where a round has it read again (`read_again`), and every
+build reads the region it notified.
 
 ### What a producer holds
 
@@ -836,8 +838,10 @@ pushes nothing.
 | `pushes_while_consuming()` | Whether the driver also pushes after each `consume_impl`. The default answers `true`. |
 | `offer_impl(guard)` | Answers from the state `consume_impl` built and pulls nothing. The breaker's own `get_impl` calls it once the breaker is consuming. |
 
-`Memo`, `Aggregate`, `ExtractAggregate`, `MapAggregate`, `Converse` and `ExtractFinal` are breakers
-that are producers; `SinkBreaker`, in a test's program run, is one that is not.
+`Memo`, `Aggregate`, `ExtractAggregate`, `MapAggregate`, `Converse`, `ExtractFinal`, and an
+induction store and a transaction store of one writer
+([A store as a breaker](#a-store-as-a-breaker)) are breakers that are producers; `SinkBreaker`, in a
+test's program run, is one that is not.
 A breaker starts in the pull mode described in [The producer protocol](#the-producer-protocol) and
 is a consuming producer from its first `consume_impl`, which it stays. `final_guard` is provided
 over `held()`: it is `held()` less the guard released to the breaker, and the driver pushes the part
@@ -936,6 +940,70 @@ then nothing is held. The dispatcher issues no `consume_impl` after the last epo
 the last epoch panics when the output is unreleased and no value has been extracted rather than push
 nothing. A source declared total that held nothing panics as it does in pull mode. The value is
 final from then, and stays until the consumer releases the output, which is all or nothing.
+
+### A store as a breaker
+
+An induction store (`InductionStoreProducer`) and a transaction store of one writer
+(`CommitProducer`, `commit_operator.rs`) are pipeline breakers. A transaction's whole cycle, the
+store, its writer and its drive, is one pipeline, and the operators inside it stay in pull mode. An
+induction loop runs in rounds ([A loop in rounds](#a-loop-in-rounds)), and its store steps once per
+round; a loop nested in it runs as a scope inside that loop's scope, a row of its store per round. A
+cyclic `FanOut` holds its store in a cell of its own (`Inner::Store`, `tile_operators/fanout.rs`)
+and hands the store a `Cycle` when it subscribes it (`TileProducer::enter_cycle`). The call that
+steps the store holds the store's cell, so the recurrence's pull of the store finds the cell
+borrowed and is answered from the snapshot the store published after its previous step.
+
+A store's input is what a morsel names: an induction store's body, its decision stream, whose
+positions are the loop's, and a transaction store's writer's source, whose positions are its items.
+`consume_impl` steps the store until its input has released the morsel. Before each step the store
+has the operators inside its cycle read again (`read_cycle_again`, `commit_operator.rs`): every
+producer in its chain on a path to a recurrence slot of its fan-out reads that input again at its
+next pull (`TileProducer::read_again`, through `read_again_toward`). A `Memo` there reads every
+region again, as after a notification of `Everything`, and a drive reads its source again where that
+input is on such a path. The store then clears its gate, as a pull does
+(`ProducerBase::clear_gate`): no pull of the store clears it while the store steps itself, since a
+read through the recurrence is answered from the snapshot. After the step the store publishes its
+snapshot (`Cycle::publish`). A store is queued a morsel only for positions its input can release, so
+a step that changes neither the store nor its input's release panics, and so does a store not
+terminal at the run's last epoch. A transaction's deny commits nothing and progresses through its
+source's release alone.
+
+A store holds everything once it is terminal and nothing before, since a reader pulls the store
+tile, which `restrict_to` cannot cut to part of its positions. It pushes once, at the finish where
+it is terminal (`pushes_while_consuming` answers `false`), to its reader slots and not its
+recurrence slots (`FanOutInput::push`), and every reader reads the store whole. Its `final_guard` is
+`held()`. A release of a store with no rows above it names the positions a reader reads no more and
+removes nothing from the store tile; a nested store's offer cuts the rows its readers released ([A
+loop in rounds](#a-loop-in-rounds)). A consuming store answers a pull from its snapshot.
+
+In pull mode an induction store releases its body whole once the body is terminal and every decision
+is stepped, and a transaction drive releases its source whole once it is done. A nested induction
+drive releases each row of its source it calls complete, in either mode. A consuming nested store
+releases its body a position at a time, and whole each row the body calls complete once its every
+decision is stepped, at every level above its positions: the release through the decided path names
+the row's positions only, not its paths past the last of them. A consuming store wakes no reader
+outside its cycle: its readers there take the rows it closes from its pushes, and the planner
+refuses a store read inside the cycle of a store that steps itself (`Planner::beneath_cycle`). A
+seed sits behind an entry no planner places (`subscribe_pulled`), since the store reads it by pull
+at a step, so a push from beneath the seed stops there rather than climb to the store's readers. A
+release through the decided positions or the last finished item never names a position the source
+filtered out, and the dispatcher's finish checks that a store's input released every morsel the
+pipeline consumed.
+
+`run_program` plans a store's pipeline where it reaches a reader slot of the store's fan-out
+(`TileProducer::store_read`). The pipeline reads the pipelines beneath the store's cycle: a subtree
+that reaches no recurrence slot of the store (`reaches_recurrence`) is planned as any chain is, and
+inside the cycle a breaker is no pipeline. A store's pipeline is ordered, since a store decides its
+positions in order. A store that steps itself runs in the run's dispatcher, and one that reads
+pipelines reads its input whole; an induction store runs in a loop's scope instead ([A loop in
+rounds](#a-loop-in-rounds)). The planner refuses:
+
+- outside a loop's scope, a nested store, one per enclosing row, whose frontier a flat morsel does
+  not name, and a store whose seed reads a pipeline;
+- a store over a live source, whose arrivals no run notifies;
+- a store inside the cycle of a store that steps itself, which no round reaches;
+- a transaction store of any number of writers but one, since a morsel names positions of one
+  source.
 
 ### The dispatcher
 
@@ -1045,15 +1113,19 @@ each producer whose `as_breaking_mut` answers one as a pipeline breaker. A break
 the pipelines of the nearest breakers beneath it, which are numbered before it, and the walk places
 the `Entry` at the breaker's input in the pipeline. A breaker's operator installs that entry when it
 subscribes its input (`BreakerInput`), and keeps the consumer it was subscribed with as the one it
-pushes to; a range (`IterateExtent`) keeps its consumer too. A producer is identified by its
-address, since `producer_id` counts per producer type. A breaker a second reader reaches keeps its
-pipeline, and a reader that reaches one along two paths, as a filter reads its input for the values
-and the predicate, reads it once. A pipeline that reads directly a pipeline another pipeline reads
-is refused, since only a fan-out slot keeps one reader's release from removing what another still
-reads. A program that reads a store is refused, since no breaker runs a store's cycle: the walk
-asserts at the slot of a store's fan-out (`store_of`). Each package reaches its breaker by walking
-the chains again, and the pushes a call makes land once the walk has returned, since a breaker
-reached through a fan-out slot is called while the walk holds the fan-out its push climbs.
+pushes to; a store and the induction drive build their entries themselves, since each shares its
+consumer with other inputs, a store's with its seeds and the drive's with the store, and a range
+(`IterateExtent`) keeps its consumer too. A producer is identified by its address, since
+`producer_id` counts per producer type. A breaker a second reader reaches keeps its pipeline, and a
+reader that reaches one along two paths, as a filter reads its input for the values and the
+predicate, reads it once. A pipeline that reads directly a pipeline another pipeline reads is
+refused, since only a fan-out slot keeps one reader's release from removing what another still
+reads. A store, or a loop's scope, is the breaker of a pipeline of its own
+([A store as a breaker](#a-store-as-a-breaker), [A loop in rounds](#a-loop-in-rounds)), which the
+walk plans where it reaches a reader slot of the store's fan-out (`TileProducer::store_read`).
+Each package reaches its breaker by walking the chains again, and the pushes a call makes land
+once the walk has returned, since a breaker reached through a fan-out slot is called while the walk
+holds the fan-out its push climbs.
 
 Before the run, each edge from a pipeline to the pipeline that reads it is probed: the read
 pipeline's breaker pushes a region through its consumer into a landing that records what reaches
@@ -1080,7 +1152,7 @@ brings a key the ranges and the pushes do not name:
 `run_program` refuses, in a debug build, a constant collection beneath a reader of pushes that is
 not a function operand. What those probes bring, less everything the stream edges' pushes can
 name, is queued for the reader at the start of the run as one region
-(`Dispatcher::queue_at_start`), which the reader takes once its build edges' pipelines have
+(`Dispatcher::queue_for`), which the reader takes once its build edges' pipelines have
 finished. A build edge whose `Everything` probe reaches no entry names no region to queue, and its
 reader reads its input whole.
 
@@ -1103,6 +1175,85 @@ runs the pipelines, the sinks' among them. `tile_operators/program_run_tests.rs`
 releases each sink's producer whole, that a pull of each sink afterwards reaches no producer beneath
 a breaker, changes no sink's value and finds every sink done, and that each program answers what
 pull mode answers.
+
+#### A loop in rounds
+
+An induction loop runs in rounds, one per position. The breakers inside the store's cycle are the
+pipelines of a dispatcher of their own, which runs one epoch per position, and the store steps
+after each epoch. `run_program` plans the loop's scope (`LoopScope`, `dispatcher/loop_scope.rs`) as
+the breaker of a pipeline of the run's dispatcher where it reaches a reader slot of the store's
+fan-out. The walk tags each breaker with the dispatcher it runs in, the scope whose cycle it is
+inside or the run's, and a read between two dispatchers is a read of the scope's pipeline in the
+run's dispatcher. The scope's input is the store's, and its pipeline is ordered and reads its input
+whole. The store is the breaker of no pipeline, and its entry stays unplaced.
+
+The drive (`InductionDriverProducer`) is a pipeline breaker, and its pipeline is a source of the
+scope's dispatcher. A package names the position a round runs, and a consume emits it where the
+store has decided the position before it, as a pull does. A consuming drive answers a pull from
+what its last consume rendered, and wakes no consumer. The entry in front of its source stops a
+push from beneath while it is unplaced; a round places it once the pipelines beneath the source
+have finished. The drive's nested inputs sit behind entries no planner places. A consume of the
+scope runs a round per position of its morsel that the drive emits, the next its source delivers
+(`TileProducer::next_position`), until the store is terminal; a position the source filters out
+runs none:
+
+1. The store has the operators inside its cycle read again (`TileProducer::read_cycle_again`). Its
+   last step pulled the operators in pull mode there before the pipelines they read took this
+   position.
+2. Each source is notified of the position (`Dispatcher::notify`), and the scope of each loop
+   nested in this one is queued it (`Dispatcher::queue_for`).
+3. The epoch is sealed, and the scope's dispatcher runs until nothing is claimable.
+4. The store consumes the position, which one step decides and releases
+   ([A store as a breaker](#a-store-as-a-breaker)).
+
+A consume of the drive emits a position only where the package names its whole path at the
+positions' level, so a round emits one position and a round at a row emits none; a pull in pull mode
+emits the next position whatever it names. A consume at no position reads the drive's source and
+emits nothing. The first consume of the scope has the drive consume at no position, then steps the
+store once, which opens the store at its seed and publishes it: the drive reads the open store
+before it emits a position, and emits none outside a round. The scope pushes the store at the finish
+where the store is terminal, to the readers of the store's fan-out.
+
+The scope places its pipelines' entries only while it runs (`Placed`). A push into the cycle comes
+from a pipeline beneath it, which has finished before the scope consumes, and stops at the unplaced
+entry rather than queue for a pipeline of the scope's dispatcher. The scope reaches a breaker inside
+the cycle by walking the store's chain with the store's cell borrowed, so a read of the store
+through its recurrence is answered from the published snapshot.
+
+A pipeline the scope's dispatcher would read whole, which happens only in the run's last epoch,
+stays in pull mode, and its readers read the pipelines beneath it; the round has it read again.
+
+A loop nested in another runs as a scope inside the scope of the loop around it: a pipeline of that
+scope's dispatcher, with a dispatcher of its own for the whole run. A scope inside 𝑑 others runs its
+rounds at paths of 𝑑 + 1 keys (`Projection::of_path`). The scope around it queues it each round's
+position, a row of its store, once the pipelines it reads have finished the round, and a consume of
+the row runs:
+
+1. Before the row's rounds, the drive consumes at no position: the nested loop's source is read
+   through pipelines of the scope around it, which take their packages from the dispatcher and
+   notify no one.
+2. A round per position of the row that the drive emits, each at the position's path.
+3. A round at the row, which closes it. The drive consumes at no position again, and the row is
+   queued to every other inner pipeline: a drive states a row complete only once the store has
+   decided every position of it, and a consuming memo answers from what it read. The store's step
+   then releases the row of its body whole.
+
+A nested store releases its body a position at a time and each row it decides whole, at every level
+above its positions. Its readers release its rows as they finish with them, so its offer cuts the
+rows released since its last step from the snapshot.
+
+The planner refuses a nested loop where an operator its rounds pull beneath the outermost keys
+restates no projection at the level it is pulled at. The check runs once every scope is built
+(`Planner::refusal_of_nested`). Its walk starts at each breaker a nested scope keeps, at the level
+of its rounds, and passes each operator's level to its inputs as `TileProducer::input_level`
+declares. It ends at every breaker that consumes, in any dispatcher, since that breaker's consume
+pulls its inputs and its own scope checks them; a breaker whose pipeline its dispatcher would read
+whole runs in pull mode and passes the pull on. The planner panics on such a loop, as it does on the
+stores [A store as a breaker](#a-store-as-a-breaker) lists.
+
+`dispatcher/loop_scope.rs` tests the rounds of one scope, `dispatcher.rs` tests the refusal's walk,
+and `tile_operators/program_run_tests.rs` runs flat, guarded and nested loops, a loop nested twice
+among them, against pull mode.
 
 #### Epochs
 
@@ -1367,7 +1518,7 @@ derived from the edges on both sides of the wire rather than serialized separate
 | `MapAggregate` | Collection chain of at least two levels | Enclosing levels ending in `Aggregation` | Folds the innermost collection, preserving the levels above it. |
 | `MapExtractAggregate` | Collection chain ending in `Aggregation` | Enclosing levels ending in the accumulator tiling | Extracts terminal results and removes innermost keys whose aggregates are not terminal. |
 | `FanOut` | `*` | Same as input | Allows multiple operators to consume the output of the same operator. Each consumer subscribes via a `FanOut::slot()` handle; the fan-out forwards `get` requests and tracks the intersection of release guards across slots. Constructed via either `FanOut::new` (no cyclic-mode overhead — the common case) or `FanOut::new_cyclic` (for fan-outs whose slots feed back into their own input, e.g. a commit/induction store whose writer reads the store back before proposing, or a mutation-loop body whose other slot is wired to the cyclic prev-accumulator stream). Cyclic mode adds a per-pull tile-cache and a subscribe-in-progress flag so re-entrant subscribes / pulls skip redundant inner work and serve from the cached snapshot instead of re-entering the inner producer. |
-| `Memo` | `*` | Same as input | Caches the output of an operator so it can be repeatedly read without recomputation. Releases each region as it takes delivery of it, so the input can clear its state; once the input is drained the cache is the sole source of the value. Release builds then skip the upstream pull. A debug build probes the drained input once after it drains and again after each notification of a region the pull reads, so an input that answers with released data trips the release-contract check at the input; probing on every pull would re-read a shared subgraph once per path to it. A `Memo` keeps a dirty region of its input, which starts as everything and takes each region the input notifies (`Arrivals`): a pull outside the dirty region answers from the cache and no pull goes below, in every build, apart from that probe, and a pull inside it reads the input and removes what it read. A `Memo` is also a [pipeline breaker](#pipeline-breakers): a consuming memo answers from its cache and pulls nothing. |
+| `Memo` | `*` | Same as input | Caches the output of an operator so it can be repeatedly read without recomputation. Releases each region as it takes delivery of it, so the input can clear its state; once the input is drained the cache is the sole source of the value. Until the input notifies again, release builds then skip the upstream pull, and a debug build probes the drained input once after it drains, so an input that answers with released data trips the release-contract check at the input; probing on every pull would re-read a shared subgraph once per path to it. After a notification of a region the pull reads, every build reads it: a drained input inside a loop's cycle delivers again where a round has it read again (`read_again`). A `Memo` keeps a dirty region of its input, which starts as everything and takes each region the input notifies (`Arrivals`): a pull outside the dirty region answers from the cache and no pull goes below, in every build, apart from that probe, and a pull inside it reads the input and removes what it read. A `Memo` is also a [pipeline breaker](#pipeline-breakers): a consuming memo answers from its cache and pulls nothing. |
 | `ExtractFinal` | Collection source and optional default | Source codomain | Extracts the last live position's value after source completion; see [Final-value extraction](#final-value-extraction). |
 | `UnionOperator` | N inputs of `DataFunction(dᵢ → 𝑇ᵢ)` tilings | `DataFunction(Union(d₀,…,dₙ₋₁) → Scalar(C'))`, or `DataFunction(Union(d₀,…,dₙ₋₁) → DataFunction(𝐵 → 𝑇))` for jagged rows | Merges N function operators into one. The domain is the discriminated union of the arms' domains, and the codomain is one the caller declares. The domain keeps the arms apart, and `final_or_default` dispatches on the arm a row came from. The codomain is the arms' join, because the arms are alternative values at one row. A union node is typed `D ⤇ V`, with `V` the join inference computed in the full type lattice, and op-conversion reads `V` off the node and passes its extent in. The operator does not join the operand tilings: `Extent`'s lattice has variant and range rules but no record rule, so it would join two arms at different record widths to an anonymous positional sum where the type is `{a: Int}`, a shape no row holds. Arms that agree on a tiling keep it, because a `Tiling` carries a layout (struct-of-arrays for a record) that an `Extent` cannot express. Arms whose codomains are collections over different domains, the rows of a jagged collection, merge at the bound `𝐵` the declared codomain gives their domains, beneath which they share the tiling `𝑇`, as a list literal of boxed rows has it (`OpConversionContext::witness_domain_extent`). Other arms whose codomain tilings differ must each fit in one column (`Tiling::is_scalar`: a `Scalar`, or a `Record` of such at any depth), and each is rebuilt as one column, keeping its own record fields, before the arms merge. A flat union (`new_flat`) collapses the arms' domain to the one they share whatever each row holds, a collection included. A realized conditional's legs are over different domains and disjoint only by their gates, so they flat-merge under the domain bound the sum's type declares (`new_flat_over`), which must include every leg's domain. Release is per arm: an incoming `Predicate::Union` guard splits into per-variant predicates, so one arm can be released in full while its siblings still produce. |
 | `VariantWrap` | Payload: `Scalar(Pₜ)` or `DataFunction(D → Scalar(Pₜ))` | `Scalar(Union(P₀,…,Pₙ))` or `DataFunction(D → Scalar(Union))` | **Sum introduction — dual of `VariantProject`.** Wraps the payload under tag `tag`, so that arm holds the payload and every other arm is empty. Arms are keyed by [`FieldKey`], not by position: a tag's *position* is not stable under width subtyping (``{`b} <: {`a | `b}`` renumbers `b`), and an arm set is part of a union column's layout, so a position-keyed arm would need a renumbering coercion at every subsumption. A bare `Scalar` payload (a scalar `VariantCtor`) yields `Scalar(Union)`; a payload *stream* (a `VariantCtor` inside a lambda, `Builtin::VariantWrap(tag)`) is wrapped element-wise **preserving the domain** `D`, so the constructor composes as the RHS of a `≫`. Because the domain is preserved, a domain release forwards to the payload verbatim. A payload that is a collection is one value, held materialized in its arm's cell: an applied `VariantCtor` wraps its whole payload, and a composed one each row's. A cell cannot grow, so a row's cell is emitted once that row's collection is complete. |
