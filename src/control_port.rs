@@ -25,6 +25,22 @@
 //! [`OFFERED_PHASES`]); it must come first when the query also carries the
 //! source.
 //!
+//! # Who may send a request
+//!
+//! A `/reload` runs the code it carries, so [`admit`] refuses every request a
+//! web page could have sent. The port serves no page, and its clients are
+//! `curl`, scripts and editors, none of which sends the headers a browser adds:
+//!
+//! - **`Origin`**, which a browser sends on every `POST` and on a cross-origin
+//!   `fetch`. A cross-site page can `POST` a `text/plain` body with no
+//!   preflight, so binding loopback alone does not keep it out.
+//! - **`Sec-Fetch-Site`** other than `none`, which a browser sends on a request
+//!   that carries no `Origin`, such as an `<img>` loading a `/diff` URL. `none`
+//!   is the reader typing the URL into the address bar.
+//! - **A `Host` that does not name loopback.** A page on a name its attacker
+//!   re-points at `127.0.0.1` is same-origin with the port, and its same-origin
+//!   `GET` carries no `Origin` in a browser that predates `Sec-Fetch-Site`.
+//!
 //! # Why requests are handed to the main loop
 //!
 //! Nothing on the interpreter side is [`Send`]: the operator graph, the sources,
@@ -103,6 +119,70 @@ fn require_post(method: &str, request: &ControlRequest) -> Result<(), ControlRep
         });
     }
     Ok(())
+}
+
+/// Whether a request with these headers may reach the control port; see the
+/// module docs, "Who may send a request".
+pub fn admit(
+    host: Option<&str>,
+    origin: Option<&str>,
+    fetch_site: Option<&str>,
+) -> Result<(), ControlReply> {
+    if !host.is_some_and(is_loopback_host) {
+        return Err(ControlReply {
+            status: 403,
+            body: format!(
+                "the Host header {} does not name loopback\n",
+                host.map_or("(absent)".to_string(), |h| format!("`{h}`"))
+            ),
+        });
+    }
+    if let Some(origin) = origin {
+        return Err(ControlReply {
+            status: 403,
+            body: format!("a page at `{origin}` cannot use the control port\n"),
+        });
+    }
+    if let Some(site) = fetch_site
+        && !site.eq_ignore_ascii_case("none")
+    {
+        return Err(ControlReply {
+            status: 403,
+            body: format!("a {site} browser request cannot use the control port\n"),
+        });
+    }
+    Ok(())
+}
+
+/// Whether a `Host` header names this machine's loopback: `localhost`, a name
+/// under `.localhost`, or a loopback address, with or without a port.
+pub fn is_loopback_host(host: &str) -> bool {
+    let name = if let Some(bracketed) = host.strip_prefix('[') {
+        match bracketed.split_once(']') {
+            Some((address, _)) => address,
+            None => return false,
+        }
+    } else {
+        match host.rsplit_once(':') {
+            Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name,
+            _ => host,
+        }
+    };
+    let name = name.to_ascii_lowercase();
+    name == "localhost"
+        || name.ends_with(".localhost")
+        || name
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// The value of the header `name` on `request`, if it carries one.
+pub fn header_value(request: &tiny_http::Request, name: &str) -> Option<String> {
+    request
+        .headers()
+        .iter()
+        .find(|h| h.field.as_str().as_str().eq_ignore_ascii_case(name))
+        .map(|h| h.value.as_str().to_string())
 }
 
 /// The answer to one [`ControlRequest`], as an HTTP status and a plain-text body.
@@ -336,7 +416,13 @@ impl ControlPort {
             for mut request in server.incoming_requests() {
                 let mut body = String::new();
                 let _ = std::io::Read::read_to_string(request.as_reader(), &mut body);
-                let parsed = parse_request(request.url(), &body).and_then(|parsed| {
+                let parsed = admit(
+                    header_value(&request, "Host").as_deref(),
+                    header_value(&request, "Origin").as_deref(),
+                    header_value(&request, "Sec-Fetch-Site").as_deref(),
+                )
+                .and_then(|()| parse_request(request.url(), &body))
+                .and_then(|parsed| {
                     require_post(request.method().as_str(), &parsed).map(|()| parsed)
                 });
                 let reply = match parsed {
@@ -642,6 +728,75 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What `curl` and a script send: a loopback `Host`, and no browser header.
+    #[test]
+    fn a_request_without_browser_headers_is_admitted() {
+        for host in ["127.0.0.1:8081", "localhost:8081", "[::1]:8081"] {
+            assert!(admit(Some(host), None, None).is_ok(), "{host}");
+        }
+        // The reader typing a `/branches` URL into the address bar.
+        assert!(admit(Some("localhost:8081"), None, Some("none")).is_ok());
+    }
+
+    /// A cross-site `POST` of a `text/plain` body needs no preflight, so the
+    /// `Origin` it carries is what refuses it.
+    #[test]
+    fn a_request_carrying_an_origin_is_refused() {
+        for origin in ["http://example.com", "http://localhost:8081", "null"] {
+            let refusal = admit(Some("localhost:8081"), Some(origin), None).unwrap_err();
+            assert_eq!(refusal.status, 403, "{origin}");
+        }
+    }
+
+    /// An `<img>` or `<script>` loading a control-port URL sends no `Origin`.
+    #[test]
+    fn a_browser_request_from_a_page_is_refused() {
+        for site in ["cross-site", "same-site", "same-origin"] {
+            let refusal = admit(Some("localhost:8081"), None, Some(site)).unwrap_err();
+            assert_eq!(refusal.status, 403, "{site}");
+        }
+    }
+
+    /// The DNS-rebinding shape: a same-origin request to a name re-pointed at
+    /// loopback.
+    #[test]
+    fn a_host_that_does_not_name_loopback_is_refused() {
+        assert_eq!(
+            admit(Some("rebind.example:8081"), None, None)
+                .unwrap_err()
+                .status,
+            403
+        );
+        assert_eq!(admit(None, None, None).unwrap_err().status, 403);
+    }
+
+    #[test]
+    fn loopback_hosts_are_recognised_with_and_without_a_port() {
+        for host in [
+            "localhost",
+            "localhost:8080",
+            "LOCALHOST:8080",
+            "app.localhost:3000",
+            "127.0.0.1",
+            "127.0.0.1:8080",
+            "127.1.2.3:80",
+            "[::1]",
+            "[::1]:8080",
+        ] {
+            assert!(is_loopback_host(host), "{host}");
+        }
+        for host in [
+            "example.com",
+            "localhost.example.com:8080",
+            "10.0.0.1:8080",
+            "[::2]:8080",
+            "0.0.0.0:8080",
+            "[::1",
+        ] {
+            assert!(!is_loopback_host(host), "{host}");
+        }
+    }
 
     /// The control port answers loopback only, because a `/reload` runs the
     /// code it carries.
