@@ -196,6 +196,79 @@ fn a_filter_aggregating_a_correlated_comprehension() {
     );
 }
 
+/// A filter reading a binding of the loop body that writes a mutable variable. The binding
+/// stays a binding in the writer, and the comprehension's type names it in its refinement,
+/// so the binding is discharged there.
+#[test]
+fn a_filter_reading_a_binding_of_a_writing_loop_body() {
+    check_sink(
+        indoc! {r#"
+        out = test_sink()
+        acc := 1
+        for r in [1, 2]:
+            t = acc + r
+            acc := sum([z for z in [1, 2, 3, 4] if z > t])
+            out << acc
+    "#},
+        "[7, 0]",
+    );
+}
+
+/// A loop-body binding holding a comprehension that reads an earlier binding, aggregated
+/// beside a read of that binding. The comprehension takes the binding's value; the read
+/// beside it shares the binding.
+#[test]
+fn a_comprehension_binding_reading_a_binding_of_a_writing_loop_body() {
+    check_sink(
+        indoc! {r#"
+        out = test_sink()
+        acc := 2
+        for r in [1, 2]:
+            t = acc + r
+            xs = [z * t for z in [1, 2, 3, 4] if z > t]
+            acc := acc + 1
+            out << sum(xs) + t
+    "#},
+        "[15, 5]",
+    );
+}
+
+/// A binding of an `if` arm read by a comprehension in the same arm. The arm's bindings stay
+/// apart from the loop body's, and the comprehension reads the one it needs under its map.
+#[test]
+fn a_comprehension_reading_a_binding_of_its_arm() {
+    check_sink(
+        indoc! {r#"
+        out = test_sink()
+        x := 0
+        for i in [1, 2, 3]:
+            if i > 1:
+                t = i + 1
+                x += sum([z * t for z in [1, 2, 3, 4] if z > t])
+            out << x
+    "#},
+        "[0, 12, 12]",
+    );
+}
+
+/// A sum over a comprehension reading an earlier sum twice. Both sums stay bindings of the
+/// loop body, and the second reads the first under its map.
+#[test]
+fn a_sum_reading_an_earlier_sum_of_the_loop_body() {
+    check_sink(
+        indoc! {r#"
+        out = test_sink()
+        x := 0
+        for i in [1, 2, 3]:
+            a = sum([z + i for z in [1, 2]])
+            b = sum([z + a + a for z in [1, 2]])
+            x += b + b
+            out << x
+    "#},
+        "[46, 108, 186]",
+    );
+}
+
 // A *let-bound* (and therefore generalized) UDF referenced from inside a
 // filter predicate. The predicate's `f(x)` use lives inside the cast-target
 // refinement, not the main expression tree — exercising the coalesce walk's

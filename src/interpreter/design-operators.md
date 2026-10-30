@@ -1122,10 +1122,22 @@ by Var-lookup time.
 
 Which iteration a binding is aligned to is `LetBinding::depth`. A reference made in a deeper
 iteration reads a tile keyed by one it is not running over, so it is spread over the keys beneath
-each of the binding's rows first (`lift_into_iteration`). A reference converted at a deeper curry
-level than the binding's (`LetBinding::level`), inside a `strength_over` or `curry_over` its loop
-body runs beneath, is spread the same way, over the keys of the reference's input, one level at a
-time (`lift_into_level`).
+each of the binding's rows first (`lift_into_iteration`). `LetBinding::level` records the curry
+level an `Aligned` binding's values stand at. A reference converted deeper than that level plus the
+iterations opened since stands under a comprehension's map, or a `strength_over` or `curry_over` its
+loop body runs beneath, none of which opens an iteration. It is spread the same way, paired one
+level at a time with the keys its input holds beneath each of the binding's rows
+(`lift_into_level`). Only the input's keys are read: the map's input at a row is that row paired
+with each element (`strength_over`), so the binding's value at the row is the value the reference
+wants. Read through instead, the binding is one level short of the `zip` that pairs it with the
+map's values.
+
+A reference made after a step that drops keys reads an `Aligned` binding at the keys its input
+holds, as `zip(input, 𝑣) ≫ .1`, which `Zip` intersects. The steps are a value-`Case` arm's
+`filter_values`, a `variant_project`, a `restrict`, and a chain, `zip` or `let` holding one
+(`simplify::narrows_keys`). `LetBinding::narrowed` counts the steps standing above the binding,
+and a reference converted under more of them pairs. Read through instead, an arm of a disjoint
+join returns the binding at every key, and the join claims a key twice.
 
 ### Fan-out and sharing
 
@@ -1345,8 +1357,8 @@ An induction store is the recurrence a `mut` loop compiles to: a [`Tile::Store`]
 driven by iteration position rather than by concurrent proposals, and so the no-conflict dual of
 the commit store, sharing its engine. Op-conversion (`build_induction_store_single`) routes every
 induction store here — plain, conditional or feed-carrying, over a finite (list) or an async
-(`DataSource`) extent. An induction store has exactly one writer: recognition folds a
-conditional write into one carry-complete writer (`writes = Case[ĝ → w; true → snapshot]`), so
+(`DataSource`) extent. An induction store has exactly one writer: the writer walk merges a
+conditional write into one carry-complete writer (`writes = Case[𝑔 → 𝑤; true → 𝑣]`), so
 one realization serves them all.
 
 Nothing here distinguishes a finite source from a streaming one. The tiling protocol treats a
