@@ -1063,9 +1063,9 @@ fn discharge_transparent_lets_in_term(e: &Expr) -> Expr {
 /// (`src/ccl/design/type-inference.md`, "`let` binders and scope exit"). An opaque binder
 /// carries no definiens to discharge, so its name stays in the lifted type.
 ///
-/// The post-pass check reconstructs a `let`'s type with this, and [`Expr::let_in`] and
-/// [`Expr::let_in_preserving`] stamp it, so a `let` a pass builds through them carries the type
-/// the check expects.
+/// The post-pass check reconstructs a `let`'s type with this, and [`Expr::let_in`],
+/// [`Expr::let_in_preserving`] and `feed_nest`'s rebuilt `let`s stamp it, so a `let` a pass
+/// builds through them carries the type the check expects.
 pub(crate) fn closed_let_type(binding: &TypedBinding, bound_expr: &Expr, body_ty: Type) -> Type {
     if binding.transparency == BindingTransparency::Opaque
         || !crate::ccl::subst::type_free_vars(&body_ty).contains(&binding.name)
