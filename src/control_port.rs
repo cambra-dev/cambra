@@ -37,8 +37,6 @@
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::thread;
 
-use log::info;
-
 use crate::ccl::context::{CompileError, GlobalContext, Phase, ReuseTally};
 use crate::ccl::load::{LoadError, LoadedProgram};
 use crate::live_program::{
@@ -314,7 +312,15 @@ impl ControlPort {
     pub fn new(port: u16) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (tx, rx) = sync_channel::<ControlMessage>(0);
         let server = tiny_http::Server::http(format!("0.0.0.0:{port}"))?;
-        info!("Control port running at http://localhost:{port}");
+        // The port bound, not the one asked for: they differ under
+        // `--control=0`, where the OS picks a free port, and printing `0` would
+        // leave nothing able to send to it. Printed rather than logged for the
+        // same reason: a log line is hidden unless `RUST_LOG` asks for it.
+        let port = server
+            .server_addr()
+            .to_ip()
+            .map_or(port, |addr| addr.port());
+        eprintln!("cambra: control port at http://localhost:{port}");
 
         thread::spawn(move || {
             for mut request in server.incoming_requests() {

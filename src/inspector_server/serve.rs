@@ -263,10 +263,23 @@ fn route(url: &str) -> &str {
     url.split_once('?').map_or(url, |(path, _)| path)
 }
 
+/// The TCP port `server` is listening on, or `requested` for a server that is
+/// not on one.
+fn bound_port(server: &tiny_http::Server, requested: u16) -> u16 {
+    server
+        .server_addr()
+        .to_ip()
+        .map_or(requested, |addr| addr.port())
+}
+
 /// Bind the inspector's port on loopback, and say where to look.
 fn bind(name: &str, port: u16) -> io::Result<tiny_http::Server> {
     let server = tiny_http::Server::http(format!("127.0.0.1:{port}"))
         .map_err(|e| io::Error::other(e.to_string()))?;
+    // The port bound, not the one asked for: they differ under `--inspect=0`,
+    // where the OS picks a free port, and printing `0` would leave nothing
+    // able to find the server.
+    let port = bound_port(&server, port);
     // Names the scheme and says where to look: `https://` to a plain-HTTP port
     // fails the handshake and renders as a blank page with nothing logged here.
     eprintln!("cambra: inspecting {name} at http://localhost:{port} — Ctrl+C to stop");
