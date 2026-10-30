@@ -49,9 +49,10 @@
 //! folds, which is every case this pass exists for.
 //!
 //! The whole subtree is skipped and not just the definition's own node, so a collection
-//! literal under such a definition keeps its unevaluated elements — and a downstream `^+`,
-//! which is what makes a binder discharged, can therefore stop a literal compiling that
-//! compiled under `+` (`a_downstream_refined_sum_stops_an_element_folding`).
+//! literal under such a definition keeps its unevaluated elements. Refinement erasure
+//! (`crate::ccl::erase_refinements`) runs before planning and removes the refinement a
+//! downstream `^+` gives a scalar binder, so that `^+` leaves the literal foldable
+//! (`a_downstream_refined_sum_folds_its_element`).
 //!
 //! **A string longer than [`MAX_FOLDED_STRING`].** Concatenation is the one fold whose
 //! result can be much larger than its operands, and a doubling chain is exponential in the

@@ -5,7 +5,7 @@ use bit_set::BitSet;
 use indoc::indoc;
 use rstest::rstest;
 
-use super::helpers::{check_compile_error, check_scalar, check_tile, make_int_list};
+use super::helpers::{check_compile_error, check_scalar, check_sink, check_tile, make_int_list};
 
 use cambra::ccl::infer::{TypeInferenceContext, infer, typecheck};
 use cambra::ccl::lower::{LoweringContext, lower_stmts};
@@ -1479,39 +1479,30 @@ fn read_captured_mut_inside_comprehension(#[case] decl: &str, #[case] after: &st
     check_tile(&program, make_int_list(&[4, 5]));
 }
 
-/// TODO: Allow a second operation between a comprehension element's mutable
-/// read and the element value.
+/// Two operations between a comprehension element's mutable read and the element value.
 #[test]
-fn two_operations_on_a_mut_read_in_a_comprehension_not_supported() {
-    check_compile_error(
+fn two_operations_on_a_mut_read_in_a_comprehension() {
+    check_tile(
         indoc! {r#"
 x := 3
 ys = [x ^+ x ^+ i for i in [1,2]]
 ys
         "#},
-        // The binder's uid counts from the run, not from the program, so it is left out.
-        "Barendregt violation: substitution range mentions binder `Unique { base: \"i\"",
+        make_int_list(&[7, 8]),
     )
 }
 
-/// TODO: Allow a nested comprehension's element to read a mutable variable.
-///
-/// The same lift
-/// (`two_operations_on_a_mut_read_in_a_comprehension_not_supported`). The outer
-/// generator's binder is the first operation's second operand here, so the inner
-/// element lambda carries the same intermediate transparent `let`, and its
-/// eliminated definition holds the refinement free on the same unnamed `Fun`
-/// slots. The binder reported is the nested pair the enclosing binders merge
-/// into rather than any generator's own parameter.
+/// A nested comprehension's element reads a mutable variable and both generators' binders.
 #[test]
-fn nested_comprehension_reading_a_mut_not_supported() {
-    check_compile_error(
+fn nested_comprehension_reading_a_mut() {
+    check_sink(
         indoc! {r#"
 x := 3
 ys = [[x ^+ i ^+ j for j in [10,20]] for i in [1,2]]
-ys
+out = test_sink()
+out << ys
         "#},
-        "Barendregt violation: substitution range mentions binder `Synthetic { kind: Pair",
+        "[() -> [[14, 24], [15, 25]]]",
     )
 }
 

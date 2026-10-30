@@ -2461,13 +2461,11 @@ fn write_typechecks_against_the_solver_scope_built_from_the_program() {
     )
 }
 
-/// The transactional sibling of the case above. It types, and stops at letrec
-/// recognition, which stamps a transactional mutable variable's history at the
-/// unrefined join over its contributions — a declared restriction reaching that
-/// stamp is the shape that assertion was written before.
+/// The transactional sibling of the case above: each write answers to the declared
+/// restriction of a `Mut(_, Txn)` variable.
 #[test]
-fn transactional_write_stops_at_the_letrec_refinement_join() {
-    check_compile_error(
+fn transactional_write_answers_to_the_declared_restriction() {
+    check_scalar(
         indoc! {r#"
             x: Mut({Int where _ >= 0}, Txn) := 0
             for p in [1,2,3]:
@@ -2477,7 +2475,7 @@ fn transactional_write_stops_at_the_letrec_refinement_join() {
                     x := x1
             await_final(x)
         "#},
-        "a mutable variable's joined value type carries no refinement",
+        Value::Int(3),
     )
 }
 
@@ -3015,4 +3013,24 @@ fn an_inner_list_literal_reading_the_enclosing_binder_is_refused() {
         "#},
         "a list element must be a constant",
     );
+}
+
+/// A value a loop computed filters a comprehension after the loop: the data function's domain
+/// refinement reads the read binder, whose definiens reads the loop's history.
+#[test]
+fn a_loop_computed_value_filters_a_comprehension_after_the_loop() {
+    check_tile(
+        indoc! {r#"
+            acc := 0
+            for r in [0]:
+                acc += 1
+            [z for z in [1, 2, 3, 4] if z > acc]
+        "#},
+        Tile::data_function(
+            ColumnValue::UInts(vec![1, 2, 3]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 4]))),
+            Predicate::True,
+            BitSet::new(),
+        ),
+    )
 }

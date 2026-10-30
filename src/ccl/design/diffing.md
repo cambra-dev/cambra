@@ -533,6 +533,7 @@ complete phase order. The following table states which representation a diff obs
 | `Infer` | Types inferred and definitions specialized; mutable-read naming has been undone. |
 | `Inline` | Capability bindings inlined and calls beta-reduced. |
 | `Transact` / `Letrec` | Intermediate transaction/induction history rewrites. |
+| `EraseRefinements` | Refinements dropped except on data function domains. |
 | `Channelize` | Deferred collections and feeds rewritten; as-of-read rewriting has not run. |
 | `AsOfRead` | Fed-out mutable reads rewritten, before lambda elimination. |
 | `LambdaElim` | Point-free term representation before loop recognition and join planning. |

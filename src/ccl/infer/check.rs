@@ -140,6 +140,41 @@ pub(super) struct CheckCtx {
     planned: bool,
 }
 
+thread_local! {
+    static REFINEMENT_BLIND: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// A scope in which every post-inference check is refinement-blind: its edges draw against
+/// a [`Derivation::RefinementBlind`] cache, which relates a refined type by its base and
+/// decides no refinement entailment.
+///
+/// [`crate::ccl::erase_refinements`] leaves refinements on data function domains only,
+/// so from that phase on an argument no longer carries the refinement a refined domain
+/// demands, and a literal's recorded type no longer carries the singleton its rule
+/// derives. The pipeline enters this scope after that phase. A scope rather than a
+/// parameter because planning type-checks the fragments it builds through
+/// [`crate::ccl::infer::typecheck`] at every rewrite, below any signature the
+/// pipeline passes a flag through.
+///
+/// Restores the previous setting on drop, so scopes nest.
+#[must_use = "the check is refinement-blind only while the guard lives"]
+pub struct RefinementBlind {
+    previous: bool,
+}
+
+impl RefinementBlind {
+    pub fn enter() -> Self {
+        let previous = REFINEMENT_BLIND.with(|blind| blind.replace(true));
+        Self { previous }
+    }
+}
+
+impl Drop for RefinementBlind {
+    fn drop(&mut self) {
+        REFINEMENT_BLIND.with(|blind| blind.set(self.previous));
+    }
+}
+
 /// The environment a Check query runs in: the lexical scope at the query, plus
 /// every opaque binder recorded so far.
 ///
@@ -198,10 +233,15 @@ impl CheckCtx {
     /// from the walk's witness context.
     ///
     /// Check re-derives at a pass boundary, reconciling types two passes spelled in
-    /// different forms, so the derivation is always [`Derivation::PostPass`] — the one
-    /// respect in which Check's constraint solving differs from the live solve's.
+    /// different forms, so the derivation is [`Derivation::PostPass`], or
+    /// [`Derivation::RefinementBlind`] inside a [`RefinementBlind`] scope.
     fn cache(&self) -> ConstrainCache {
-        let mut cache = ConstrainCache::for_derivation(Derivation::PostPass);
+        let derivation = if REFINEMENT_BLIND.with(std::cell::Cell::get) {
+            Derivation::RefinementBlind
+        } else {
+            Derivation::PostPass
+        };
+        let mut cache = ConstrainCache::for_derivation(derivation);
         cache.seed_context(&self.witness_ctx);
         cache
     }

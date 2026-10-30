@@ -272,6 +272,15 @@ pub enum Derivation {
     /// passes spelled in different coordinates, but every binder the tree's
     /// refinements reference is a binder the walk itself can enter.
     PostPass,
+    /// A [`PostPass`](Self::PostPass) re-derivation after
+    /// [`crate::ccl::erase_refinements`]: a refined type is related by its base. The phase
+    /// kept a data function domain's refinements and erased the argument's, so the
+    /// entailment between them is no longer stated.
+    ///
+    /// Only the refinement arm reads it. An arm above that one still matches a refined
+    /// type first: a channel domain stays compatible with a refined domain until
+    /// `channelize` substitutes the channel's assembled domain.
+    RefinementBlind,
 }
 
 impl Derivation {
@@ -1687,6 +1696,38 @@ fn constrain_go_impl(
             Ok(())
         }
 
+        // A dependent tuple against a plain tuple, after refinement erasure: a data function's
+        // domain keeps the dependent tuple, while the argument's erased components read nothing
+        // of each other. A component reads another only from inside a refinement predicate,
+        // which this derivation does not compare, so the components relate positionally, each
+        // opened at its component names.
+        (Type::Tuple(_), Type::DepTuple(_)) | (Type::DepTuple(_), Type::Tuple(_))
+            if cache.derivation == Derivation::RefinementBlind =>
+        {
+            let components = |ty: &Type| -> Vec<Type> {
+                match ty {
+                    Type::Tuple(elems) => elems.clone(),
+                    Type::DepTuple(cs) => crate::ccl::subst::open_tuple_components(cs, |j, _| {
+                        crate::ccl::subst::Mapping::Rename(cs[j].0.clone().unwrap_or_else(|| {
+                            panic!("a component a later one reads by index names a binder: {ty}")
+                        }))
+                    }),
+                    _ => unreachable!("matched a tuple and a dependent tuple above"),
+                }
+            };
+            let (a, b) = (components(lhs), components(rhs));
+            if a.len() != b.len() {
+                return Err(ConstrainError::Mismatch {
+                    lhs: Box::new(lhs.clone()),
+                    rhs: Box::new(rhs.clone()),
+                });
+            }
+            for (t0, t1) in a.iter().zip(&b) {
+                constrain_go(t0, t1, sl, sr, cache, scope)?;
+            }
+            Ok(())
+        }
+
         // Record: named width-subtyping. rhs's fields must all appear in lhs.
         (Type::Record(a), Type::Record(b)) => {
             for (name, t1) in b {
@@ -2243,6 +2284,9 @@ fn constrain_go_impl(
         (Type::Refinement(..), _) | (_, Type::Refinement(..)) => {
             let (lbase, lrefs) = (lhs.peel_refinements(), lhs.refinements());
             let (rbase, rrefs) = (rhs.peel_refinements(), rhs.refinements());
+            if cache.derivation == Derivation::RefinementBlind {
+                return constrain_go(lbase, rbase, sl, sr, cache, scope);
+            }
             // The refinements rhs requires that no transported lhs layer
             // matches (by `Refinement`'s structural `PartialEq`). Each side's
             // refinements are forced through its own morphism into the ambient frame

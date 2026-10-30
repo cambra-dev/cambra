@@ -1,9 +1,10 @@
 # Optimization & compilation passes
 
 After inference, the compiler rewrites typed CCL into an operator graph. `context.rs` runs
-`inline`, transaction rewriting, `mut_elim`, `channelize`, the as-of-read rewrite,
-`lambda_elim`, `planning::plan_loops`, and `planning::run`, in that order. Lambda elimination
-runs `simplify` internally; planning also runs it before and after iteration-site marking.
+`inline`, transaction rewriting, `mut_elim`, refinement erasure, `channelize`, the as-of-read
+rewrite, `lambda_elim`, `planning::plan_loops`, and `planning::run`, in that order. Lambda
+elimination runs `simplify` internally; planning also runs it before and after iteration-site
+marking.
 `interpreter/operator_conversion.rs` then converts the planned CCL to `TileOperator`s. The
 transaction and mutation phases are described in [mutability.md](mutability.md); the AST is
 described in [ir.md](ir.md).
@@ -178,6 +179,26 @@ operator conversion.
 - **Body duplication:** An eligible function body is copied at each use in the CCL tree. The pass
   has no use-count or cost test.
 - **Recursive UDFs**: unsupported (already noted in `operator_conversion.rs`).
+
+---
+
+## Refinement Erasure (`ccl/erase_refinements.rs`)
+
+Refinement erasure runs after `mut_elim` and before `channelize`. It removes every refinement from
+every type slot, except inside a data function's domain. A data function lambda's parameter is
+bound at that domain and keeps the same refinements. A domain keeps the refinements on its
+components, because join planning reads a nested comprehension's guard off the component of the
+product domain that carries it. A Σ's witness kinds keep theirs, since each candidate is a data
+function's domain.
+
+The phase leaves `let` binders unchanged. `mut_elim` ends with `mut_read::reveal`, which has made
+every `let` transparent and hidden a value a loop computed where a type leaves its scope.
+
+Every type check from this phase through planning is refinement-blind. A subtyping edge relates
+the two types with their refinements stripped (`infer::RefinementBlind`), because an argument no
+longer carries the refinement a kept domain demands. The pipeline enters that scope after the
+phase. A scope rather than a parameter is needed because planning type-checks the fragments it
+builds through `typecheck` at each rewrite.
 
 ---
 

@@ -341,7 +341,7 @@ fn a_bare_groupby_tail_is_driven() {
 // `case_21`); it is a carried refinement that happens to survive to here.
 #[case(
     "1",
-    "1:{Int | __elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)}",
+    "1:Int",
     Tile::Scalar(ColumnValue::Ints(vec![1]))
 )]
 // Closed arithmetic reaches op conversion as the literal it computes, a whole chain of it
@@ -379,7 +379,7 @@ fn a_bare_groupby_tail_is_driven() {
 // nothing eliminating a `let` whose body no longer reads it.
 #[case(
     "y = 10; [x + y for x in [1,2,3]]",
-    "let y : {Int | __elem ▷ ((id, 10 ▷ const) ▷ zip ≫ eq)} = 10\nin iterate ≫ [1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add:(0..3 ⤇ Int)",
+    "let y : Int = 10\nin iterate ≫ [1, 2, 3] ≫ (id, 10 ▷ const) ▷ zip ≫ add:(0..3 ⤇ Int)",
     make_int_list(&[11,12,13])
 )]
 #[case(
