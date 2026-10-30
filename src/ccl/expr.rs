@@ -1717,13 +1717,13 @@ impl TypedExpr {
             TypedExprNode::Lambda { body, .. } => f(body.as_ref()),
             TypedExprNode::Aggregate { input, .. } => f(input.as_ref()),
             TypedExprNode::Let {
-                bound_expr, body, ..
-            } => {
-                f(bound_expr.as_ref());
-                f(body.as_ref());
+                bound_expr: e,
+                body,
+                ..
             }
-            TypedExprNode::MutDecl { init, body, .. } => {
-                f(init.as_ref());
+            | TypedExprNode::MutDecl { init: e, body, .. }
+            | TypedExprNode::For { iter: e, body, .. } => {
+                f(e.as_ref());
                 f(body.as_ref());
             }
             TypedExprNode::LetType { body, .. } | TypedExprNode::Run { body, .. } => {
@@ -1773,10 +1773,6 @@ impl TypedExpr {
                 for (_, def) in bindings {
                     f(def);
                 }
-                f(body.as_ref());
-            }
-            TypedExprNode::For { iter, body, .. } => {
-                f(iter.as_ref());
                 f(body.as_ref());
             }
             TypedExprNode::ExprStmt { expr, body } => {
@@ -1927,13 +1923,13 @@ impl TypedExpr {
             TypedExprNode::Lambda { body, .. } => f(body.as_mut()),
             TypedExprNode::Aggregate { input, .. } => f(input.as_mut()),
             TypedExprNode::Let {
-                bound_expr, body, ..
-            } => {
-                f(bound_expr.as_mut());
-                f(body.as_mut());
+                bound_expr: e,
+                body,
+                ..
             }
-            TypedExprNode::MutDecl { init, body, .. } => {
-                f(init.as_mut());
+            | TypedExprNode::MutDecl { init: e, body, .. }
+            | TypedExprNode::For { iter: e, body, .. } => {
+                f(e.as_mut());
                 f(body.as_mut());
             }
             TypedExprNode::LetType { body, .. } | TypedExprNode::Run { body, .. } => {
@@ -1981,10 +1977,6 @@ impl TypedExpr {
                 for (_, def) in bindings {
                     f(def);
                 }
-                f(body.as_mut());
-            }
-            TypedExprNode::For { iter, body, .. } => {
-                f(iter.as_mut());
                 f(body.as_mut());
             }
             TypedExprNode::ExprStmt { expr, body } => {
