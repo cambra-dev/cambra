@@ -371,7 +371,6 @@ impl TileProducer for VariantWrapProducer {
         visit("payload", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("payload", &mut *self.input);
     }
@@ -694,7 +693,6 @@ impl TileProducer for VariantProjectProducer {
         visit("scrutinee", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("scrutinee", &mut *self.input);
     }
@@ -945,7 +943,6 @@ impl TileProducer for VariantIsProducer {
         visit("scrutinee", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("scrutinee", &mut *self.input);
     }

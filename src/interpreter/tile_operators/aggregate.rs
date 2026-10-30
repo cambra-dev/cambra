@@ -206,7 +206,6 @@ impl TileProducer for AggregateProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }
@@ -444,7 +443,6 @@ impl TileProducer for ExtractAggregateProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }
@@ -630,7 +628,6 @@ impl TileProducer for MapExtractAggregateProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }
@@ -1179,7 +1176,6 @@ impl TileProducer for MapAggregateProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }
