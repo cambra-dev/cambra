@@ -782,6 +782,20 @@ fn the_control_port_refuses_a_request_from_a_web_page() {
     assert!(from_curl.starts_with("HTTP/1.1 200"), "{from_curl}");
 }
 
+/// A finished program takes no control request, and says so rather than
+/// hanging: under `--inspect` the binary goes on serving after the driver loop
+/// has ended, and the control port with it.
+#[test]
+fn a_finished_program_answers_a_control_request_with_409() {
+    let launched = launch_under_control_with(
+        "[x + 1 for x in [1, 2, 3]]\n",
+        &[format!("--inspect={}", reserve_test_port())],
+    );
+    let response = launched.wait_until_finished(Duration::from_secs(30));
+    assert!(response.starts_with("HTTP/1.1 409"), "{response}");
+    assert!(response.contains("finished"), "{response}");
+}
+
 /// A program whose output is its `main` value rather than a sink reloads too.
 ///
 /// Its source is `stdin`, which is unbounded, so the program keeps running and
