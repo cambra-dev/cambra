@@ -54,3 +54,10 @@ held      = Domain(k ∈ {0, 1})
 released  = Codomain(Domain(Qualified { enclosing: k = 0, here: j ≤ 1 }))
 held − released = Or [ Domain(k = 1), Codomain(Domain(Qualified { enclosing: k = 0, here: j > 1 })) ]
 ```
+
+The arm `(0, j > 1)` is empty where row 0 has no position past 1, which the guard alone does not
+say. `TileGuard::closed_over`, which also closes a guard against a tagged union's tags, drops the
+arm where its level's extent is a finite range of positions none of which it names, so over rows
+of positions `0..2` the difference is `Domain(k = 1)`. A level of any other extent closes no arm,
+and a row there is held no more once a release names it whole. Closing drops an empty arm and does
+not lift an arm naming every position of its row to the key above.
