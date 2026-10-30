@@ -1667,8 +1667,7 @@ impl TypedExpr {
     /// explicitly rather than relying on this method.
     ///
     /// This is the single immutable child-structure definition —
-    /// [`child_exprs`](Self::child_exprs), [`any_child`](Self::any_child),
-    /// [`all_children`](Self::all_children), and
+    /// [`child_exprs`](Self::child_exprs), [`any_child`](Self::any_child), and
     /// [`fold_children`](Self::fold_children) all route through it, so they
     /// cannot drift out of sync — and it allocates nothing, which is why it is
     /// the form the compile-path walks use.
@@ -1827,17 +1826,6 @@ impl TypedExpr {
             }
         });
         found
-    }
-
-    /// Return `true` if `f` returns `true` for every direct child Expr.  Vacuously true at leaves.
-    pub fn all_children(&self, mut f: impl FnMut(&TypedExpr) -> bool) -> bool {
-        let mut all = true;
-        self.walk_children(|e| {
-            if all && !f(e) {
-                all = false;
-            }
-        });
-        all
     }
 
     /// Fold `f` left-to-right over the direct child Exprs, starting from `init`.
