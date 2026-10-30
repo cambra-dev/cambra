@@ -524,9 +524,11 @@ fn main() {
                 std::process::exit(1);
             }
 
-            if let Some(port) = inspect_port {
+            // The inspector's own startup line names the port it bound, which is
+            // not `inspect_port` under `--inspect=0`.
+            if inspect_port.is_some() {
                 eprintln!(
-                    "Program finished. Inspector at http://localhost:{port} — press Ctrl+C to exit."
+                    "Program finished. The inspector goes on serving — press Ctrl+C to exit."
                 );
                 loop {
                     std::thread::park();

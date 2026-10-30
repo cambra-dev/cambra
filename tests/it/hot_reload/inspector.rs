@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tungstenite::{Message, WebSocket};
 
-use super::harness::launch_under_control_with;
+use super::harness::{RunningProgram, launch_under_control_with};
 use super::serving::{http_get, raw_http, reserve_test_port};
 
 /// The served `/api/snapshot`, parsed.
@@ -229,4 +229,66 @@ fn a_reload_of_main_publishes_a_frame_before_any_input() {
 
     await_reloaded_frame(&mut socket, Instant::now() + Duration::from_secs(10));
     assert_eq!(version(&snapshot(inspect)), 2);
+}
+
+/// Under `--inspect=0 --control=0` the OS picks both ports, and each banner
+/// names the port it picked, so a reader of stderr can reach both servers.
+#[test]
+fn port_zero_prints_the_port_the_os_picked() {
+    use std::io::{BufRead, BufReader};
+    use std::process::{Command, Stdio};
+    use std::sync::mpsc;
+
+    let dir = std::env::temp_dir().join(format!("cambra-port-zero-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch dir");
+    let source = dir.join("v1.cambra");
+    std::fs::write(&source, "[line for line in stdin()]\n").expect("write v1");
+    let mut program = RunningProgram {
+        child: Command::new(env!("CARGO_BIN_EXE_cambra"))
+            .args(["--inspect=0", "--control=0"])
+            .arg(&source)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn cambra"),
+        dir,
+    };
+    let err = program.child.stderr.take().expect("piped stderr");
+    let (lines, banners) = mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(err).lines().map_while(Result::ok) {
+            let _ = lines.send(line);
+        }
+    });
+
+    // The port in a banner's `http://localhost:PORT`.
+    let port_after = |banner: &str, prefix: &str| -> Option<u16> {
+        let rest = banner.strip_prefix(prefix)?;
+        let (_, url) = rest.split_once("http://localhost:")?;
+        url.split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()
+    };
+    let (mut inspect, mut control_port) = (None, None);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while inspect.is_none() || control_port.is_none() {
+        let left = deadline.saturating_duration_since(Instant::now());
+        let banner = banners
+            .recv_timeout(left)
+            .expect("both servers announce themselves on stderr");
+        inspect = inspect.or_else(|| port_after(&banner, "cambra: inspecting "));
+        control_port = control_port.or_else(|| port_after(&banner, "cambra: control port at "));
+    }
+    let (inspect, control_port) = (inspect.unwrap(), control_port.unwrap());
+    assert_ne!(inspect, 0, "the inspector's banner names the bound port");
+    assert_ne!(
+        control_port, 0,
+        "the control port's banner names the bound port"
+    );
+
+    assert_eq!(version(&snapshot(inspect)), 1);
+    let branches = control(control_port, "/branches", "");
+    assert!(branches.contains("main"), "{branches}");
 }
