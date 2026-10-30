@@ -634,6 +634,91 @@ fn a_recreated_name_continues_its_tombstones_numbering() {
     assert_eq!(log_of(&live, "staging"), "ab", "forked afresh from main");
 }
 
+/// A restart discards every branch and runs its version from a fresh compile:
+/// `main`'s variable starts from its declaration rather than from what it held,
+/// and its version number goes on from where it was. The discarded branch
+/// leaves a tombstone, as a deleted one does.
+#[test]
+fn a_restart_discards_every_branch_and_starts_mains_state_over() {
+    let (port, mut ctx, mut live) = running_log_with_ab();
+    let created = ask(
+        &mut ctx,
+        &mut live,
+        create("staging", MAIN_BRANCH, with_port(DASHED_LOG, port)),
+    );
+    assert_eq!(created.status, 200, "{}", created.body);
+
+    let restarted = ask(
+        &mut ctx,
+        &mut live,
+        ControlRequest::Restart {
+            code: source("running-log", port),
+        },
+    );
+    assert_eq!(restarted.status, 200, "{}", restarted.body);
+    assert_eq!(
+        restarted.body,
+        "restarted: `main@2` from a fresh compile\ndiscarded branches `staging`\n"
+    );
+    let branches = list(&mut ctx, &mut live);
+    assert_eq!(branches.lines().count(), 1, "{branches}");
+    assert!(branches.starts_with("main\tversion=2\t"), "{branches}");
+    assert_eq!(log_of(&live, MAIN_BRANCH), "", "a restart carries no state");
+
+    let replies = exchange(&mut ctx, move || {
+        vec![http_post(port, "/set", "c"), http_get(port, "/get")]
+    });
+    assert_eq!(
+        replies,
+        vec!["ok\n", "c"],
+        "the fresh `log` folds from empty"
+    );
+
+    let recreated = ask(
+        &mut ctx,
+        &mut live,
+        create("staging", MAIN_BRANCH, with_port(DASHED_LOG, port)),
+    );
+    assert!(
+        recreated
+            .body
+            .starts_with("created `staging@2` from `main@2`"),
+        "a discarded name continues its tombstone's numbering: {}",
+        recreated.body
+    );
+}
+
+/// A restart the compiler refuses changes nothing: every branch keeps serving
+/// what it held, and the reply carries the errors' spans.
+#[test]
+fn a_restart_that_does_not_compile_changes_nothing() {
+    let (port, mut ctx, mut live) = running_log_with_ab();
+    let created = ask(
+        &mut ctx,
+        &mut live,
+        create("staging", MAIN_BRANCH, with_port(DASHED_LOG, port)),
+    );
+    assert_eq!(created.status, 200, "{}", created.body);
+    let before = list(&mut ctx, &mut live);
+
+    let refused = ask(
+        &mut ctx,
+        &mut live,
+        ControlRequest::Restart {
+            code: "nowhere\n".into(),
+        },
+    );
+    assert_eq!(refused.status, 400, "{}", refused.body);
+    assert!(!refused.diagnostics.is_empty(), "{}", refused.body);
+    assert_eq!(list(&mut ctx, &mut live), before);
+    assert_eq!(log_of(&live, MAIN_BRANCH), "ab");
+
+    let replies = exchange(&mut ctx, move || {
+        vec![http_post(port, "/set", "c"), http_get(port, "/get")]
+    });
+    assert_eq!(replies[1], "abc", "main still folds onto what it held");
+}
+
 /// Deleting a branch frees the operators only it held and leaves every operator
 /// another entry holds alive.
 #[test]
