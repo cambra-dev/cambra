@@ -125,9 +125,10 @@ cargo run -- --control tests/programs/http_greeter/program.cambra
 # in another terminal, with the edited program in v2.cambra:
 curl --data-binary @v2.cambra localhost:8081/diff
 curl --data-binary @v2.cambra localhost:8081/reload
+curl --data-binary @v2.cambra localhost:8081/restart
 ```
 
-`/diff` reports how the two versions differ and changes nothing. `/reload` replaces the program in place: sockets stay open, every binding whose computation is unchanged keeps running, and a variable whose logic you did edit resumes from the value it was holding. It compares at `as-of-read` by default; add `phase=<name>&` before the source to compare somewhere else (`lowered`, `inferred`, `inlined`, `channelized`, `as-of-read`, `lambda-elim`, `planned`).
+`/diff` reports how the two versions differ and changes nothing. `/restart` discards the running program and runs the new source from a fresh compile, keeping no state; under `--inspect` it also runs a program that has finished again. `/reload` replaces the program in place: sockets stay open, every binding whose computation is unchanged keeps running, and a variable whose logic you did edit resumes from the value it was holding. It compares at `as-of-read` by default; add `phase=<name>&` before the source to compare somewhere else (`lowered`, `inferred`, `inlined`, `channelized`, `as-of-read`, `lambda-elim`, `planned`).
 
 A reload may change the program's logic freely, add endpoints, and stop serving ones it no longer wants (their addresses then answer 404). A variable may even move to another loop: it keeps its value and starts counting positions in whatever it now iterates. The one thing a reload may not do is break continuity of state: a variable the running program is holding a value for must be one the new version declares, or one it loads under another name with `@LoadFrom`, at a type the value fits, and one the source names well enough to tell from its siblings — or the reload is refused and the running program is left serving. See [program-evolution.md](src/ccl/design/program-evolution.md#state-takeover).
 
