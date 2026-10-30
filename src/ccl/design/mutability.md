@@ -825,7 +825,11 @@ Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` alge
    `MutWrite` — are untouched) lift every writer body's leading statements and intermediate `let`s
    onto the spine so the write lands as a direct `ExprStmt` effect; a value-position write
    terminalizes to `ExprStmt(MutWrite, unit)` (its mutable variable's final state is unobserved, so its value
-   is `unit`). Downstream collection and read-your-writes rewriting then see only on-spine writes.
+   is `unit`). Inside a for-loop body a `Feed` counts as a write does, because the loop's chain
+   reads each feed as a tap on its path: a function that feeds and returns a value, inlined into a
+   binding (`y = f(i)`), has its feed lifted onto the body's spine. Outside a loop, `channelize`
+   collects a feed wherever it sits. Downstream collection and read-your-writes rewriting then see
+   only on-spine writes, and only on-spine feeds in a loop body.
 1. **Collects** the `Mut` introductions and each variable's writing sites (loops, `with begin():`
    blocks — post-inline, so writes through `Mut` parameters have landed), and each feed's sites.
 2. **Resolves domains**: an induction variable takes its writing loop's source domain; a `Txn`

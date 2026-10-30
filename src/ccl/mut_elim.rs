@@ -149,10 +149,10 @@ pub fn run(expr: Expr) -> Expr {
     // A write inside a `Case` branch is off the spine too, and its normalization
     // needs to know whether it is inside a writer body — where the writer walk
     // merges the `Case` — so it is its own walk rather than an arm of the one
-    // below, and `flatten_spine` carries the same flag.
+    // below, and `flatten_spine` carries the same distinction ([`Spine`]).
     let expr = flatten_spine(
         push_bindings_into_writing_cases(peel_effectful_outputs(expr)),
-        false,
+        Spine::OutsideLoops,
     );
     let mut out = rewrite(expr);
     // The rewrite turns every mutable read/write into an ordinary recurrence
@@ -277,23 +277,45 @@ fn is_mut_write(e: &Expr) -> bool {
     matches!(e.node, TypedExprNode::MutWrite { .. })
 }
 
-/// Whether some path through `e` performs a mutable write, following `ExprStmt`
-/// effects/bodies, `Let` continuations, and a `Case`'s branches. Broader than
-/// "heads a write": a pass-by-reference writer that computes an intermediate
-/// first (`tmp = c + 1; c := tmp`) splices as a `Let`-headed body whose write
-/// sits *past* the leading binding, and a conditional nested inside a block
-/// right-hand side normalizes to a `Case` standing where a statement did
-/// (`push_binding_into_case`), which puts its writes on the branches rather
-/// than on the spine. Used to gate `flatten_spine`'s `Let`-hoist — it fires
-/// only for genuine writer bodies, never for a pure `Let` (a join subplan spine
-/// holds no `MutWrite`, so its reassociation is left undisturbed).
-fn spine_writes_mut(e: &Expr) -> bool {
-    match &e.node {
-        TypedExprNode::MutWrite { .. } => true,
-        TypedExprNode::ExprStmt { expr, body } => is_mut_write(expr) || spine_writes_mut(body),
-        TypedExprNode::Let { body, .. } => spine_writes_mut(body),
-        TypedExprNode::Case { branches, .. } => branches.iter().any(|b| spine_writes_mut(&b.body)),
-        _ => false,
+/// The statement spine [`flatten_spine`] normalizes, which fixes what it carries as direct
+/// `ExprStmt` effects: every mutable write, and in a for-loop body every feed too.
+///
+/// A for-loop body is a writer body. [`WriterWalk`] reads its writes and feeds off its chain,
+/// a feed becoming a tap on the path it sits on, so a feed inside a binding's value is one it
+/// never meets. Outside a loop `channelize` collects a feed wherever it sits, and a feed chain
+/// keeps its nesting, which channelize's contribution order follows.
+///
+/// A lambda's body is not a loop body's spine even inside one: a feed-only loop nested in a
+/// loop body is a lambda whose feeds `channelize` takes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Spine {
+    OutsideLoops,
+    LoopBody,
+}
+
+impl Spine {
+    /// Whether `e` is one of this spine's statements.
+    fn statement(self, e: &Expr) -> bool {
+        is_mut_write(e) || (self == Spine::LoopBody && matches!(e.node, TypedExprNode::Feed { .. }))
+    }
+
+    /// Whether some path through `e` performs one of this spine's statements, following
+    /// `ExprStmt` effects/bodies, `Let` continuations, and a `Case`'s branches. Broader than
+    /// "heads a write": a pass-by-reference writer that computes an intermediate first
+    /// (`tmp = c + 1; c := tmp`) splices as a `Let`-headed body whose write sits *past* the
+    /// leading binding, and a conditional nested inside a block right-hand side normalizes to
+    /// a `Case` standing where a statement did (`push_binding_into_case`), which puts its
+    /// writes on the branches rather than on the spine. Used to gate `flatten_spine`'s
+    /// `Let`-hoist — it fires only for genuine writer bodies, never for a pure `Let` (a join
+    /// subplan spine holds no statement, so its reassociation is left undisturbed).
+    fn performs(self, e: &Expr) -> bool {
+        match &e.node {
+            _ if self.statement(e) => true,
+            TypedExprNode::ExprStmt { expr, body } => self.statement(expr) || self.performs(body),
+            TypedExprNode::Let { body, .. } => self.performs(body),
+            TypedExprNode::Case { branches, .. } => branches.iter().any(|b| self.performs(&b.body)),
+            _ => false,
+        }
     }
 }
 
@@ -332,7 +354,10 @@ fn splice_branch_value(name: &Name, branch: Expr, cont: Expr) -> Expr {
         TypedExprNode::Case {
             scrutinee,
             mut branches,
-        } if branches.iter().any(|b| spine_writes_mut(&b.body)) => {
+        } if branches
+            .iter()
+            .any(|b| Spine::OutsideLoops.performs(&b.body)) =>
+        {
             for br in branches.iter_mut() {
                 let body = std::mem::take(&mut br.body);
                 br.body = splice_branch_value(name, body, cont.clone());
@@ -372,12 +397,7 @@ fn splice_branch_value(name: &Name, branch: Expr, cont: Expr) -> Expr {
 /// it. The writes are sequenced *before* binding — a mutable write reads the
 /// *previous* value, so it never observes the binder — preserving evaluation
 /// order and scope.
-fn hoist_writer_body(
-    binding: TypedBinding,
-    writer_body: Expr,
-    body: Expr,
-    in_writer_body: bool,
-) -> Expr {
+fn hoist_writer_body(binding: TypedBinding, writer_body: Expr, body: Expr, spine: Spine) -> Expr {
     match writer_body.node {
         // 1:1 reparents — carry the input node's id (a preserve, not a mint): the
         // statement/binding survives at a new spine position, so its source span
@@ -388,7 +408,7 @@ fn hoist_writer_body(
         } => Expr::expr_stmt_preserving(
             writer_body.node_id,
             *effect,
-            hoist_writer_body(binding, *cont, body, in_writer_body),
+            hoist_writer_body(binding, *cont, body, spine),
         ),
         TypedExprNode::Let {
             binding: inner,
@@ -398,11 +418,11 @@ fn hoist_writer_body(
             writer_body.node_id,
             inner,
             *def,
-            hoist_writer_body(binding, *cont, body, in_writer_body),
+            hoist_writer_body(binding, *cont, body, spine),
         ),
         // A bare writer terminal: its value is `unit`. The write itself moves to
         // a new spine position, keeping its id, source span and provenance.
-        TypedExprNode::MutWrite { .. } => {
+        _ if spine.statement(&writer_body) => {
             Expr::expr_stmt(writer_body, Expr::let_in(binding, unit_expr(), body))
         }
         // A writing `Case` in terminal position. Its writes are conditional, so
@@ -412,19 +432,19 @@ fn hoist_writer_body(
         // rewrite. That pattern-match reads a `Let`'s bound expression directly and
         // so misses the shape where a binding sits between the `Let` and the `Case`
         // — a `match` whose scrutinee A-normalization named, for one.
-        TypedExprNode::Case { .. } if in_writer_body || merges_in_place(&writer_body) => {
+        TypedExprNode::Case { .. } if spine == Spine::LoopBody || merges_in_place(&writer_body) => {
             Expr::let_in(binding, writer_body, body)
         }
         TypedExprNode::Case { .. } => push_binding_into_branches(&binding.name, writer_body, body),
         // A pure terminal value: bind it directly.
         _ => {
-            // The arms above cover every node kind [`spine_writes_mut`] admits,
+            // The arms above cover every node kind [`Spine::performs`] admits,
             // and `flatten_spine` re-runs on whatever this returns. A writing
             // terminal reaching this arm comes back unchanged, so that recursion
             // never converges — the divergence between the two is a hang, not a
             // wrong tree.
             debug_assert!(
-                !spine_writes_mut(&writer_body),
+                !spine.performs(&writer_body),
                 "hoist_writer_body has no arm for a writing {:?}, which `flatten_spine` \
                  would re-hoist unchanged forever",
                 std::mem::discriminant(&writer_body.node)
@@ -453,7 +473,7 @@ fn hoist_writer_body(
 fn push_binding_into_case(e: &mut Expr) -> Option<Expr> {
     let applies = matches!(&e.node, TypedExprNode::Let { bound_expr, .. }
         if matches!(&bound_expr.node, TypedExprNode::Case { branches, .. }
-            if branches.iter().any(|b| spine_writes_mut(&b.body)))
+            if branches.iter().any(|b| Spine::OutsideLoops.performs(&b.body)))
             && !merges_in_place(bound_expr));
     if applies {
         let let_id = e.node_id();
@@ -533,7 +553,7 @@ fn push_binding_into_branches(name: &Name, mut case: Expr, cont: Expr) -> Expr {
 fn push_continuation_into_case(e: &mut Expr) -> Option<Expr> {
     let applies = matches!(&e.node, TypedExprNode::ExprStmt { expr: effect, .. }
         if matches!(&effect.node, TypedExprNode::Case { branches, .. }
-            if branches.iter().any(|b| spine_writes_mut(&b.body)))
+            if branches.iter().any(|b| Spine::OutsideLoops.performs(&b.body)))
             && !merges_in_place(effect));
     if !applies {
         return None;
@@ -649,7 +669,7 @@ fn push_writing_cases(mut expr: Expr, in_writer_body: bool) -> Expr {
         return expr;
     }
     // Children before this node. Pushing a nested `Case` lifts its writes onto
-    // the branch spine of the `Case` enclosing it, and `spine_writes_mut` reads
+    // the branch spine of the `Case` enclosing it, and `Spine::performs` reads
     // exactly that spine — so a binding whose branches write only through a
     // block right-hand side of their own qualifies only after the inner push.
     expr.map_children(|c| push_writing_cases(c, in_writer_body));
@@ -694,31 +714,36 @@ fn push_writing_cases(mut expr: Expr, in_writer_body: bool) -> Expr {
 ///
 /// - `MutWrite(..)                  →  ExprStmt(MutWrite(..), unit)`.
 ///
-/// The `Let`-hoist is gated on `spine_writes_mut`: only a genuine writer body
-/// is reassociated. `Feed`/`Define`-headed `ExprStmt` chains keep their nesting
-/// — channelize collects feeds outermost-first, so reassociating them would
+/// The `Let`-hoist is gated on [`Spine::performs`]: only a genuine writer body
+/// is reassociated. Outside a loop, `Feed`/`Define`-headed `ExprStmt` chains keep their
+/// nesting — channelize collects feeds outermost-first, so reassociating them would
 /// reorder channel contributions — and a pure `Let` (e.g. a join subplan) holds
-/// no `MutWrite` on its spine, so it is left undisturbed. After this pass the
-/// only `MutWrite`s in the tree are `ExprStmt` effects, so `rewrite` and
-/// `WriterWalk` never meet a mutable write in value position. The one exception is a
-/// `Let`-bound writing `Case`, which stays bound inside a writer body
-/// (`in_writer_body`, a for-loop body) for `WriterWalk` to merge, and outside one where
-/// it merges in place for `rewrite` ([`merges_in_place`]).
-fn flatten_spine(mut e: Expr, in_writer_body: bool) -> Expr {
+/// no statement on its spine, so it is left undisturbed. Inside a for-loop body a feed is
+/// moved as a write is ([`Spine`]). After this pass the only `MutWrite`s in the tree, and
+/// the only `Feed`s in a loop body, are `ExprStmt` effects, so `rewrite` and `WriterWalk`
+/// never meet one in value position. The one exception is a `Let`-bound writing `Case`,
+/// which stays bound inside a writer body ([`Spine::LoopBody`]) for `WriterWalk` to merge,
+/// and outside one where it merges in place for `rewrite` ([`merges_in_place`]).
+fn flatten_spine(mut e: Expr, spine: Spine) -> Expr {
     // As in `push_writing_cases`: a loop body is a writer body, whose `Let`-bound writing
     // `Case` the writer walk merges where it stands.
     if let TypedExprNode::For { iter, body, .. } = &mut e.node {
         let taken_iter = std::mem::take(&mut **iter);
-        **iter = flatten_spine(taken_iter, in_writer_body);
+        **iter = flatten_spine(taken_iter, spine);
         let taken_body = std::mem::take(&mut **body);
-        **body = flatten_spine(taken_body, true);
+        **body = flatten_spine(taken_body, Spine::LoopBody);
         return e;
     }
-    // Un-nest a *mutable-write-headed* nested sequence (a spliced multi-statement
-    // writer body). A Feed/Define-headed nested `ExprStmt` keeps its nesting.
+    if let TypedExprNode::Lambda { body, .. } = &mut e.node {
+        let taken_body = std::mem::take(&mut **body);
+        **body = flatten_spine(taken_body, Spine::OutsideLoops);
+        return e;
+    }
+    // Un-nest a nested sequence headed by one of the spine's statements (a spliced
+    // multi-statement writer body). Any other nested `ExprStmt` keeps its nesting.
     if let TypedExprNode::ExprStmt { expr: effect, .. } = &e.node
         && let TypedExprNode::ExprStmt { expr: a, .. } = &effect.node
-        && is_mut_write(a)
+        && spine.statement(a)
     {
         // Re-association is a 1:1 reparent (two `ExprStmt` wrappers in, two out):
         // carry both ids so the statements survive as self-edges, not fresh mints.
@@ -731,10 +756,7 @@ fn flatten_spine(mut e: Expr, in_writer_body: bool) -> Expr {
             unreachable!()
         };
         let inner = Expr::expr_stmt_preserving(inner_id, *b, *body);
-        return flatten_spine(
-            Expr::expr_stmt_preserving(outer_id, *a, inner),
-            in_writer_body,
-        );
+        return flatten_spine(Expr::expr_stmt_preserving(outer_id, *a, inner), spine);
     }
     // Lift a writer body's leading binding out of *effect* position. A
     // pass-by-reference writer called as a bare statement (`f(cnt)`) whose body
@@ -746,7 +768,7 @@ fn flatten_spine(mut e: Expr, in_writer_body: bool) -> Expr {
     // (which holds no `MutWrite`) is untouched.
     if let TypedExprNode::ExprStmt { expr: effect, .. } = &e.node
         && matches!(effect.node, TypedExprNode::Let { .. })
-        && spine_writes_mut(effect)
+        && spine.performs(effect)
     {
         // A 1:1 reparent: the `Let` and the outer `ExprStmt` both survive at new
         // spine positions — carry their ids (preserve, not mint).
@@ -770,17 +792,17 @@ fn flatten_spine(mut e: Expr, in_writer_body: bool) -> Expr {
         let inner = Expr::expr_stmt_preserving(outer_id, *rest, *cont);
         return flatten_spine(
             Expr::let_in_preserving(let_id, binding, *bound_expr, inner),
-            in_writer_body,
+            spine,
         );
     }
     // Hoist mutable writes out of a value-position writer body bound by a `Let`
-    // (`y = f(c)`). `spine_writes_mut` fires for a genuine writer body only —
+    // (`y = f(c)`). `Spine::performs` fires for a genuine writer body only —
     // one that heads the write, sequences it after siblings, or computes an
     // intermediate first — never for a pure `Let`.
     if let TypedExprNode::Let { bound_expr, .. } = &e.node
-        && spine_writes_mut(bound_expr)
+        && spine.performs(bound_expr)
         && !(matches!(bound_expr.node, TypedExprNode::Case { .. })
-            && (in_writer_body || merges_in_place(bound_expr)))
+            && (spine == Spine::LoopBody || merges_in_place(bound_expr)))
     {
         let let_id = e.node_id();
         let TypedExprNode::Let {
@@ -807,13 +829,13 @@ fn flatten_spine(mut e: Expr, in_writer_body: bool) -> Expr {
                 "letrec.hoist_writer_body",
                 provenance::Nature::Machinery,
             );
-            hoist_writer_body(binding, *bound_expr, *body, in_writer_body)
+            hoist_writer_body(binding, *bound_expr, *body, spine)
         };
-        return flatten_spine(hoisted, in_writer_body);
+        return flatten_spine(hoisted, spine);
     }
     // A bare write reached in value/terminal position: it is a `Unit`-valued
     // statement, not a value to bind.
-    if is_mut_write(&e) {
+    if spine.statement(&e) {
         // The write keeps its own id and becomes the effect; the `ExprStmt` and
         // the `unit` body are new, and they exist to put this write in statement
         // position. So the recording names the write.
@@ -826,7 +848,7 @@ fn flatten_spine(mut e: Expr, in_writer_body: bool) -> Expr {
             );
             Expr::expr_stmt(e, unit_expr())
         };
-        return flatten_spine(terminalized, in_writer_body);
+        return flatten_spine(terminalized, spine);
     }
     // Pass-through — recurse in place so this node's own `ty`/annotation are
     // preserved (rebuilding would drop them, corrupting e.g. join subplans).
@@ -838,15 +860,15 @@ fn flatten_spine(mut e: Expr, in_writer_body: bool) -> Expr {
         // writer body.
         if matches!(effect.node, TypedExprNode::For { .. }) {
             let taken = std::mem::take(&mut **effect);
-            **effect = flatten_spine(taken, in_writer_body);
+            **effect = flatten_spine(taken, spine);
         } else {
-            effect.map_children(|c| flatten_spine(c, in_writer_body));
+            effect.map_children(|c| flatten_spine(c, spine));
         }
         let taken = std::mem::take(&mut **body);
-        **body = flatten_spine(taken, in_writer_body);
+        **body = flatten_spine(taken, spine);
         return e;
     }
-    e.map_children(|c| flatten_spine(c, in_writer_body));
+    e.map_children(|c| flatten_spine(c, spine));
     e
 }
 
@@ -2954,10 +2976,10 @@ fn share_a_binding(values: &[&Expr], kept: &[Kept]) -> bool {
     readers.iter().any(|&n| n > 1)
 }
 
-/// Whether `e` is an `if` or a `match` some branch of which writes, or runs a loop. The write
-/// may sit in a binding of the branch (`u = if …: x += 1; …`), off the branch's spine.
+/// Whether `e` is an `if` or a `match` some branch of which writes, feeds, or runs a loop. The
+/// write may sit in a binding of the branch (`u = if …: x += 1; …`), off the branch's spine.
 pub(crate) fn is_writing_case(e: &Expr) -> bool {
-    matches!(e.node, TypedExprNode::Case { .. }) && contains_marker(e)
+    matches!(e.node, TypedExprNode::Case { .. }) && (contains_marker(e) || body_has_feed(e))
 }
 
 /// The end of a chain of statements, which is `unit`.
@@ -4257,7 +4279,7 @@ mod tests {
         // `let x = (c := 1) in x` — the value-position bare-writer shape.
         let tree = Expr::let_bind(x.clone(), write, tvar(&x, Type::Base(BaseType::Unit)));
 
-        let out = flatten_spine(tree, false);
+        let out = flatten_spine(tree, Spine::OutsideLoops);
 
         // Find the (single) MutWrite in the output and assert its id is preserved.
         fn find_mut_write(e: &Expr) -> Option<NodeId> {
