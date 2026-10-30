@@ -6,7 +6,8 @@ use std::iter::repeat_n;
 use super::*;
 use crate::interpreter::operator_graph::value;
 use crate::interpreter::{
-    ColumnValue, Consumer, Extent, Scheduler, Value, live_keys, shared_consumer, tuple_field,
+    ColumnValue, Consumer, Extent, Projection, Scheduler, Value, live_keys, shared_consumer,
+    tuple_field,
 };
 
 /// Inverts a function operator, producing a lookup-function from codomain to domain.
@@ -288,8 +289,21 @@ impl TileProducer for ConverseProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let input_tile = self.input.get(self.input.tiling().universal_guard());
+    /// Inverting the outermost collection makes the values it holds the keys, and which rows
+    /// carry which value is known only once the rows are read: the input is read whole and the
+    /// groups cut after. The rows a cut group does not name stay unreleased at the input, so a
+    /// later pull reads them again. Beneath standing levels the projection names keys the
+    /// inversion leaves standing, so the input is pulled at it.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let input_guard = match self.level.enclosing() {
+            None => self.input.tiling().universal_guard(),
+            Some(_) => projection.guard(self.input.tiling()),
+        };
+        let input_tile = self.input.get(input_guard);
         let mut out = match self.level.enclosing() {
             None => {
                 debug_assert!(
@@ -328,6 +342,7 @@ impl TileProducer for ConverseProducer {
             }
             out.remove_guarded(released);
         }
+        out.restrict_to(&projection, self.tiling());
         out
     }
 
@@ -475,8 +490,13 @@ impl TileProducer for MapDomainProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let mut tile = self.input.get(self.input.tiling().universal_guard());
+    /// Every level's keys stand, so the input is pulled at the projection.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let mut tile = self.input.get(projection.guard(self.input.tiling()));
         // The keys stand, so only the values at the level are replaced, in place.
         let Tile::DataFunction {
             domain, codomain, ..
@@ -612,8 +632,27 @@ impl TileProducer for UncurryProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let input_tile = self.input.get(self.input.tiling().universal_guard());
+    /// Beneath standing levels the projection names keys the pairing leaves standing, so the
+    /// input is pulled at it. Pairing the whole tile makes the pairs the keys: the projection
+    /// is then over pairs, and what reaches the input is the admitted first components, which
+    /// is every pair they head, and the pairs are cut after.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let input_guard = match (self.level == CurryLevel::OUTERMOST, &projection) {
+            (false, _) => projection.guard(self.input.tiling()),
+            (true, Projection::Keys(Predicate::Record(components))) => {
+                let first = components
+                    .get(&tuple_field(0))
+                    .cloned()
+                    .unwrap_or(Predicate::True);
+                Projection::admitting(first).guard(self.input.tiling())
+            }
+            (true, _) => self.input.tiling().universal_guard(),
+        };
+        let input_tile = self.input.get(input_guard);
         // Pair beneath the standing levels, which stand unchanged: a row's group is a
         // curried collection in its own right, so the pairing below is the same one a
         // depth-zero `Uncurry` does to the whole tile.
@@ -625,6 +664,7 @@ impl TileProducer for UncurryProducer {
                 }
             });
         result.remove_guarded(self.base().obsolete_guard.clone());
+        result.restrict_to(&projection, self.tiling());
         result
     }
 
@@ -883,9 +923,39 @@ impl TileProducer for FilterProducer {
         visit("predicate", &*self.predicate);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let pred_guard = self.predicate.tiling().universal_guard();
-        let i_guard = self.input.tiling().universal_guard();
+    /// The predicate and the input share the keys of the level the mask names, so both are
+    /// pulled at the projection.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+
+        self.filtered(&projection)
+    }
+
+    fn release_impl(&mut self, obsolete_guard: TileGuard) {
+        if matches!(self.predicate.tiling(), Tiling::DataFunction { .. }) {
+            // Both predicate and input share the same underlying domain source, so both
+            // must be released together; releasing only one leaves the other's upstream
+            // FanOutProducer release-guard stale, causing it to re-deliver already-consumed
+            // data while the other side returns nothing on the next get().
+            let keys = predicate_release(obsolete_guard.clone(), self.predicate.tiling());
+            self.predicate.release(keys);
+        }
+        self.input.release(obsolete_guard);
+    }
+}
+
+impl FilterProducer {
+    /// The input's rows the predicate keeps, for the keys `projection` names.
+    fn filtered(&mut self, projection: &Projection) -> Tile {
+        let guard_for = |tiling: &Tiling| match tiling.is_data_function() {
+            true => projection.guard(tiling),
+            false => tiling.universal_guard(),
+        };
+        let pred_guard = guard_for(self.predicate.tiling());
+        let i_guard = guard_for(self.input.tiling());
         let predicate_result = self.predicate.get(pred_guard);
         let input_result = self.input.get(i_guard);
 
@@ -957,18 +1027,6 @@ impl TileProducer for FilterProducer {
             }
             _ => panic!("Invalid Filter input tiles"),
         }
-    }
-
-    fn release_impl(&mut self, obsolete_guard: TileGuard) {
-        if matches!(self.predicate.tiling(), Tiling::DataFunction { .. }) {
-            // Both predicate and input share the same underlying domain source, so both
-            // must be released together; releasing only one leaves the other's upstream
-            // FanOutProducer release-guard stale, causing it to re-deliver already-consumed
-            // data while the other side returns nothing on the next get().
-            let keys = predicate_release(obsolete_guard.clone(), self.predicate.tiling());
-            self.predicate.release(keys);
-        }
-        self.input.release(obsolete_guard);
     }
 }
 
@@ -1133,9 +1191,17 @@ impl TileProducer for RestrictProducer {
         visit("predicate", &*self.predicate);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let pred_guard = self.predicate.tiling().universal_guard();
-        let pred_result = self.predicate.get(pred_guard);
+    /// A restricted domain is the predicate's keys that pass, so the predicate is pulled at the
+    /// projection.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let pred_result = self
+            .predicate
+            .get(projection.guard(self.predicate.tiling()));
+
         match pred_result {
             Tile::DataFunction {
                 row_starts,
@@ -1517,10 +1583,16 @@ impl TileProducer for ProductProducer {
         visit("inner", &*self.inner);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
-        let mut outer_tile = self.outer.get(self.outer.tiling().universal_guard());
+    /// The two sides are aligned row for row, so a projection of the rows is a projection of
+    /// each side.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
+        let mut outer_tile = self.outer.get(projection.guard(self.outer.tiling()));
         outer_tile.compact();
-        let mut inner_tile = self.inner.get(self.inner.tiling().universal_guard());
+        let mut inner_tile = self.inner.get(projection.guard(self.inner.tiling()));
         inner_tile.compact();
         // The two sides are pulled from their own branches, so a row is matched by its path.
         let (outer_paths, inner_row_at) = match self.level.enclosing() {
@@ -3107,5 +3179,902 @@ mod tests {
             "row 0's inner collection is still arriving, so row 0 is not complete: \
              {domain_predicate:?}"
         );
+    }
+}
+
+/// `Filter` as a comprehension's guard uses it: `[x for x in xs if p(x)]` keeps the rows of the
+/// stream whose boolean answer, read from a predicate stream over the same keys, is true. A
+/// worker pulls both at one morsel.
+#[cfg(test)]
+mod filter_projection_tests {
+    use super::*;
+    use crate::interpreter::BaseType;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms, int_entries, ints_by_position, keys_between,
+    };
+    use bit_set::BitSet;
+
+    const ROWS: u64 = 8;
+
+    /// `[x for x in xs if x % 2 == 0]` over `xs = [0, 10, 20, …]`, the predicate stream holding
+    /// the answer at each position: even positions pass.
+    fn keep_even_positions() -> (FilterProducer, GuardLog, GuardLog) {
+        let values: Vec<i64> = (0..ROWS as i64).map(|i| 10 * i).collect();
+        let in_tiling = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let answers = Tile::data_function(
+            ColumnValue::UInts((0..ROWS).collect()),
+            Box::new(Tile::Scalar(ColumnValue::Bools(
+                (0..ROWS).map(|i| i % 2 == 0).collect(),
+            ))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let pred_tiling = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Bool)),
+        );
+        let (input, input_pulled, _) =
+            ProjectionSpy::new(ints_by_position(&values, true), in_tiling.clone());
+        let (predicate, predicate_pulled, _) = ProjectionSpy::new(answers, pred_tiling);
+        (
+            FilterProducer {
+                base: ProducerBase::unowned(FilterProducer::alloc_id(), &in_tiling),
+                input: Box::new(input),
+                predicate: Box::new(predicate),
+                level: CurryLevel::OUTERMOST,
+            },
+            input_pulled,
+            predicate_pulled,
+        )
+    }
+
+    #[test]
+    fn a_filtered_morsel_keeps_the_passing_rows_and_pulls_both_sides_at_it() {
+        let (mut filter, input_pulled, predicate_pulled) = keep_even_positions();
+        let morsel = filter.get(keys_between(2, 5));
+        assert_eq!(int_entries(&morsel), [(2, 20), (4, 40)]);
+        assert_eq!(*input_pulled.borrow(), [keys_between(2, 5)]);
+        assert_eq!(*predicate_pulled.borrow(), [keys_between(2, 5)]);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &morsel
+        else {
+            panic!("a collection")
+        };
+        let TileGuard::Function(FunctionGuard::Domain(stated)) = keys_between(2, 5) else {
+            unreachable!("a morsel is a domain guard")
+        };
+        assert_eq!(*domain_predicate, stated, "complete over the morsel");
+    }
+
+    #[test]
+    fn a_filtered_morsel_is_the_whole_pull_cut_to_it() {
+        for guard in [keys_between(0, 3), keys_between(5, 40)] {
+            assert_conforms(|| Box::new(keep_even_positions().0), guard);
+        }
+    }
+
+    /// A rejected row is in no consumer's tile, so no guard of the consumer's names it. The
+    /// tile states the region it decided, rejected rows included, and a consumer releases that
+    /// region, so the input and the predicate both release the rejected positions with it.
+    #[test]
+    fn releasing_the_stated_region_releases_the_rejected_rows() {
+        let values: Vec<i64> = (0..ROWS as i64).map(|i| 10 * i).collect();
+        let (mut filter, _, _) = keep_even_positions();
+        let (input, _, input_released) = ProjectionSpy::new(
+            ints_by_position(&values, true),
+            filter.input.tiling().clone(),
+        );
+        let answers = Tile::data_function(
+            ColumnValue::UInts((0..ROWS).collect()),
+            Box::new(Tile::Scalar(ColumnValue::Bools(
+                (0..ROWS).map(|i| i % 2 == 0).collect(),
+            ))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let (predicate, _, predicate_released) =
+            ProjectionSpy::new(answers, filter.predicate.tiling().clone());
+        filter.input = Box::new(input);
+        filter.predicate = Box::new(predicate);
+        let kept = filter.get(keys_between(0, ROWS - 1));
+        assert_eq!(int_entries(&kept), [(0, 0), (2, 20), (4, 40), (6, 60)]);
+        filter.release(kept.to_guard());
+        let everything = || keys_between(0, ROWS - 1);
+        assert_eq!(*input_released.borrow(), [everything()]);
+        assert_eq!(*predicate_released.borrow(), [everything()]);
+    }
+
+    /// `[x for x in (evens ++ odds) if p(x)]` while the odd arm has decided only `0..=3`: the
+    /// union's tile holds the even rows and the odd rows so far, and states `0..=3` complete.
+    /// The predicate answers every position. The filter answers for the rows held and states
+    /// only `0..=3` complete. The consumer releases what it holds, `0..=3` and row 6, and the
+    /// rows that arrive afterwards are filtered by the predicate's answers for them.
+    #[test]
+    fn rows_a_union_delivers_late_are_filtered_and_complete_only_where_the_input_is() {
+        use crate::interpreter::tile_operators::test_helpers::ScriptedProducer;
+
+        let column = |keys: Vec<u64>, decided: Predicate, value: fn(u64) -> Value| {
+            let values = keys.iter().map(|&key| value(key)).collect::<Vec<_>>();
+            let codomain = match values.first() {
+                Some(Value::Bool(_)) => ColumnValue::Bools(
+                    values
+                        .iter()
+                        .map(|v| matches!(v, Value::Bool(true)))
+                        .collect(),
+                ),
+                _ => ColumnValue::Ints(
+                    values
+                        .iter()
+                        .map(|v| match v {
+                            Value::Int(i) => *i,
+                            other => panic!("an int or a bool, got {other:?}"),
+                        })
+                        .collect(),
+                ),
+            };
+            Tile::data_function(
+                ColumnValue::from_uints(keys),
+                Box::new(Tile::Scalar(codomain)),
+                decided,
+                BitSet::new(),
+            )
+        };
+        let value = |key: u64| Value::Int(10 * key as i64);
+        // Positions 1, 4 and 7 fail.
+        let answer = |key: u64| Value::Bool(key % 3 != 1);
+        let TileGuard::Function(FunctionGuard::Domain(through_3)) = keys_between(0, 3) else {
+            unreachable!("keys_between names a key region")
+        };
+        let TileGuard::Function(FunctionGuard::Domain(from_4)) = keys_between(4, ROWS - 1) else {
+            unreachable!("keys_between names a key region")
+        };
+
+        let in_tiling = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let pred_tiling = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Bool)),
+        );
+        let (input, input_cell) = ScriptedProducer::new(
+            column(vec![0, 1, 2, 3, 4, 6], through_3.clone(), value),
+            in_tiling.clone(),
+        );
+        let (predicate, predicate_cell) = ScriptedProducer::new(
+            column((0..ROWS).collect(), Predicate::True, answer),
+            pred_tiling,
+        );
+        let mut filter = FilterProducer {
+            base: ProducerBase::unowned(FilterProducer::alloc_id(), &in_tiling),
+            input: Box::new(input),
+            predicate: Box::new(predicate),
+            level: CurryLevel::OUTERMOST,
+        };
+
+        let first = filter.get(keys_between(0, ROWS - 1));
+        assert_eq!(int_entries(&first), [(0, 0), (2, 20), (3, 30), (6, 60)]);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &first
+        else {
+            panic!("a collection, got {first:?}")
+        };
+        assert_eq!(
+            *domain_predicate, through_3,
+            "positions 5 and 7 have not arrived, so only the input's decided prefix is complete"
+        );
+
+        filter.release(first.to_guard());
+        *input_cell.borrow_mut() = column(vec![4, 5, 7], from_4.clone(), value);
+        *predicate_cell.borrow_mut() = column(vec![4, 5, 7], Predicate::True, answer);
+        let second = filter.get(keys_between(0, ROWS - 1));
+        assert_eq!(int_entries(&second), [(5, 50)]);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &second
+        else {
+            panic!("a collection, got {second:?}")
+        };
+        assert_eq!(*domain_predicate, from_4);
+    }
+
+    #[test]
+    fn nothing_filters_nothing() {
+        let (mut filter, input_pulled, predicate_pulled) = keep_even_positions();
+        let nothing = filter.tiling().empty_guard();
+        assert_eq!(filter.get(nothing), filter.tiling().empty_tile());
+        assert!(input_pulled.borrow().is_empty() && predicate_pulled.borrow().is_empty());
+    }
+}
+
+/// `Restrict` as the head of a filtered iteration uses it: `iterate ▷ (p ▷ restrict)` keeps the
+/// positions a predicate stream passes, and a worker pulls the predicate at one morsel.
+#[cfg(test)]
+mod restrict_projection_tests {
+    use super::*;
+    use crate::interpreter::BaseType;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms, keys_between,
+    };
+    use bit_set::BitSet;
+
+    const ROWS: u64 = 8;
+
+    /// The positions whose predicate answer is true: every third position.
+    fn every_third() -> (RestrictProducer, GuardLog) {
+        let answers = Tile::data_function(
+            ColumnValue::UInts((0..ROWS).collect()),
+            Box::new(Tile::Scalar(ColumnValue::Bools(
+                (0..ROWS).map(|i| i % 3 == 0).collect(),
+            ))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let pred_tiling = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Bool)),
+        );
+        let out = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::uint_range(ROWS)),
+        );
+        let (predicate, pulled, _) = ProjectionSpy::new(answers, pred_tiling);
+        (
+            RestrictProducer {
+                base: ProducerBase::unowned(RestrictProducer::alloc_id(), &out),
+                predicate: Box::new(predicate),
+            },
+            pulled,
+        )
+    }
+
+    /// The keys a consumer sees: those the tile does not mark deleted.
+    fn live_keys(tile: &Tile) -> Vec<u64> {
+        let Tile::DataFunction {
+            domain: ColumnValue::UInts(keys),
+            deleted,
+            ..
+        } = tile
+        else {
+            panic!("a collection of positions, got {tile:?}")
+        };
+        keys.iter()
+            .enumerate()
+            .filter(|(row, _)| !deleted.contains(*row))
+            .map(|(_, key)| *key)
+            .collect()
+    }
+
+    #[test]
+    fn a_restricted_morsel_keeps_the_passing_positions_and_pulls_the_predicate_at_it() {
+        let (mut restrict, pulled) = every_third();
+        let morsel = restrict.get(keys_between(2, 7));
+        assert_eq!(live_keys(&morsel), [3, 6]);
+        assert_eq!(*pulled.borrow(), [keys_between(2, 7)]);
+    }
+
+    #[test]
+    fn a_restricted_morsel_is_the_whole_pull_cut_to_it() {
+        for guard in [keys_between(0, 3), keys_between(4, 30)] {
+            assert_conforms(|| Box::new(every_third().0), guard);
+        }
+    }
+
+    #[test]
+    fn nothing_restricts_nothing() {
+        let (mut restrict, pulled) = every_third();
+        let nothing = restrict.tiling().empty_guard();
+        assert_eq!(restrict.get(nothing), restrict.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
+    }
+}
+
+/// `MapDomain` as a loop over a grouping reads it: the values of a collection are replaced by its
+/// keys, at the level the loop iterates, while the keys above stand. A worker pulls the groups
+/// it owns.
+#[cfg(test)]
+mod map_domain_projection_tests {
+    use super::*;
+    use crate::interpreter::BaseType;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms, ints_by_position, keys_between,
+    };
+    use bit_set::BitSet;
+
+    const ROWS: u64 = 6;
+
+    /// A stream of positions holding `0, 10, 20, …`, whose values are replaced by the positions.
+    fn keys_of_a_stream() -> (MapDomainProducer, GuardLog) {
+        let values: Vec<i64> = (0..ROWS as i64).map(|i| 10 * i).collect();
+        let tiling = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let out = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::uint_range(ROWS)),
+        );
+        let (input, pulled, _) = ProjectionSpy::new(ints_by_position(&values, true), tiling);
+        (
+            MapDomainProducer {
+                base: ProducerBase::unowned(MapDomainProducer::alloc_id(), &out),
+                input: Box::new(input),
+                level: CurryLevel::OUTERMOST,
+            },
+            pulled,
+        )
+    }
+
+    #[test]
+    fn a_stream_keeps_its_morsel_and_takes_its_keys_as_values() {
+        let (mut keys, pulled) = keys_of_a_stream();
+        let morsel = keys.get(keys_between(1, 3));
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = &morsel
+        else {
+            panic!("a collection")
+        };
+        assert_eq!(*domain, ColumnValue::UInts(vec![1, 2, 3]));
+        assert_eq!(**codomain, Tile::Scalar(ColumnValue::UInts(vec![1, 2, 3])));
+        assert_eq!(*pulled.borrow(), [keys_between(1, 3)]);
+    }
+
+    /// The groups a `Converse` makes, each member listed by the key it stands at: the outer keys
+    /// are the groups, which the projection names, and the inner values become the inner keys.
+    fn members_of_groups() -> (MapDomainProducer, GuardLog) {
+        let groups = Tile::data_function(
+            ColumnValue::Ints(vec![1, 2, 3]),
+            Box::new(Tile::grouped(
+                vec![0, 2, 3],
+                ColumnValue::UInts(vec![0, 2, 1, 3]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![5, 6, 7, 8]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let in_tiling = Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::data_function(
+                Extent::uint_range(4),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        let out = Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::data_function(Extent::uint_range(4), Tiling::Scalar(Extent::uint_range(4))),
+        );
+        let (input, pulled, _) = ProjectionSpy::new(groups, in_tiling);
+        (
+            MapDomainProducer {
+                base: ProducerBase::unowned(MapDomainProducer::alloc_id(), &out),
+                input: Box::new(input),
+                level: CurryLevel::new(1),
+            },
+            pulled,
+        )
+    }
+
+    fn groups_one_and_three() -> TileGuard {
+        TileGuard::Function(FunctionGuard::Domain(
+            Predicate::point(Value::Int(1)).union(&Predicate::point(Value::Int(3))),
+        ))
+    }
+
+    #[test]
+    fn a_projection_of_groups_reaches_the_groups() {
+        let (mut members, pulled) = members_of_groups();
+        let answer = members.get(groups_one_and_three());
+        let Tile::DataFunction { domain, .. } = &answer else {
+            panic!("a collection")
+        };
+        assert_eq!(*domain, ColumnValue::Ints(vec![1, 3]));
+        assert_eq!(*pulled.borrow(), [groups_one_and_three()]);
+    }
+
+    #[test]
+    fn the_projections_are_the_whole_pull_cut_to_them() {
+        assert_conforms(|| Box::new(keys_of_a_stream().0), keys_between(2, 4));
+        assert_conforms(|| Box::new(members_of_groups().0), groups_one_and_three());
+    }
+
+    #[test]
+    fn nothing_maps_nothing() {
+        let (mut keys, pulled) = keys_of_a_stream();
+        let nothing = keys.tiling().empty_guard();
+        assert_eq!(keys.get(nothing), keys.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
+    }
+}
+
+/// `Uncurry` as a join reads a grouping: `K ⤇ (D ⤇ V)` becomes a collection keyed by the pairs
+/// `(k, d)`. A worker's morsel names pairs, and the first component of each is a key of the
+/// grouping.
+#[cfg(test)]
+mod uncurry_projection_tests {
+    use super::*;
+    use crate::interpreter::BaseType;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms,
+    };
+    use bit_set::BitSet;
+
+    /// Groups 1, 2 and 3 holding members `{0, 2}`, `{1}` and `{3}` with values 10 to 40.
+    fn paired_groups() -> (UncurryProducer, GuardLog) {
+        let groups = Tile::data_function(
+            ColumnValue::Ints(vec![1, 2, 3]),
+            Box::new(Tile::grouped(
+                vec![0, 2, 3],
+                ColumnValue::UInts(vec![0, 2, 1, 3]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 30, 20, 40]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let in_tiling = Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::data_function(
+                Extent::uint_range(4),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        let out = Tiling::data_function(
+            Extent::Record(
+                [
+                    (tuple_field(0), Extent::Base(BaseType::Int)),
+                    (tuple_field(1), Extent::uint_range(4)),
+                ]
+                .into_iter()
+                .collect(),
+            ),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let (input, pulled, _) = ProjectionSpy::new(groups, in_tiling);
+        (
+            UncurryProducer {
+                base: ProducerBase::unowned(UncurryProducer::alloc_id(), &out),
+                input: Box::new(input),
+                level: CurryLevel::OUTERMOST,
+                empty_pair: out.empty_at_no_rows(),
+            },
+            pulled,
+        )
+    }
+
+    /// The pairs whose first component `first` admits and whose second `second` admits.
+    fn pairs(first: Predicate, second: Predicate) -> TileGuard {
+        TileGuard::Function(FunctionGuard::Domain(Predicate::Record(
+            [(tuple_field(0), first), (tuple_field(1), second)]
+                .into_iter()
+                .collect(),
+        )))
+    }
+
+    fn groups_one_and_three() -> Predicate {
+        Predicate::point(Value::Int(1)).union(&Predicate::point(Value::Int(3)))
+    }
+
+    fn pair_count(tile: &Tile) -> usize {
+        let Tile::DataFunction { domain, .. } = tile else {
+            panic!("a collection, got {tile:?}")
+        };
+        domain.len()
+    }
+
+    /// A morsel of pairs headed by groups 1 and 3 reads those groups of the grouping alone, and
+    /// holds the pairs they head: `(1, 0)`, `(1, 2)` and `(3, 3)`.
+    #[test]
+    fn a_morsel_of_pairs_reads_the_groups_that_head_them() {
+        let (mut uncurry, pulled) = paired_groups();
+        let guard = pairs(groups_one_and_three(), Predicate::True);
+        let morsel = uncurry.get(guard);
+        assert_eq!(pair_count(&morsel), 3);
+        assert_eq!(
+            *pulled.borrow(),
+            [TileGuard::Function(FunctionGuard::Domain(
+                groups_one_and_three()
+            ))]
+        );
+    }
+
+    /// A morsel that names the second component only cannot say which groups it needs, so the
+    /// grouping is read whole and the pairs are cut after.
+    #[test]
+    fn a_morsel_of_second_components_reads_the_grouping_whole_and_cuts_the_pairs() {
+        let (mut uncurry, pulled) = paired_groups();
+        let guard = pairs(Predicate::True, Predicate::point(Value::UInt(1)));
+        let morsel = uncurry.get(guard);
+        assert_eq!(pair_count(&morsel), 1, "only the pair (2, 1)");
+        assert_eq!(*pulled.borrow(), [uncurry.input.tiling().universal_guard()]);
+    }
+
+    #[test]
+    fn a_morsel_of_pairs_is_the_whole_pull_cut_to_it() {
+        for guard in [
+            pairs(groups_one_and_three(), Predicate::True),
+            pairs(Predicate::True, Predicate::point(Value::UInt(1))),
+            pairs(
+                Predicate::point(Value::Int(1)),
+                Predicate::point(Value::UInt(2)),
+            ),
+        ] {
+            assert_conforms(|| Box::new(paired_groups().0), guard);
+        }
+    }
+
+    #[test]
+    fn nothing_pairs_nothing() {
+        let (mut uncurry, pulled) = paired_groups();
+        let nothing = uncurry.tiling().empty_guard();
+        assert_eq!(uncurry.get(nothing), uncurry.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
+    }
+}
+
+/// `Product` as a correlated inner comprehension uses it: `[(x, y) for x in xs for y in ys_of(x)]`
+/// pairs each row of `xs` with the keys of the collection that row holds. A worker owns a range
+/// of the rows.
+#[cfg(test)]
+mod product_projection_tests {
+    use super::*;
+    use crate::interpreter::BaseType;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms, ints_by_position, keys_between,
+    };
+    use bit_set::BitSet;
+
+    /// Four rows `100, 200, 300, 400`, row `i` holding a collection over the keys `0..=i`.
+    fn rows_and_their_keys() -> (ProductProducer, GuardLog, GuardLog) {
+        let outer = ints_by_position(&[100, 200, 300, 400], true);
+        let outer_tiling = Tiling::data_function(
+            Extent::uint_range(4),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let sizes = [1usize, 2, 3, 4];
+        let starts: Vec<usize> = sizes
+            .iter()
+            .scan(0, |at, n| {
+                let start = *at;
+                *at += n;
+                Some(start)
+            })
+            .collect();
+        let keys: Vec<u64> = sizes.iter().flat_map(|n| 0..*n as u64).collect();
+        let values: Vec<i64> = (0..keys.len() as i64).collect();
+        let inner = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1, 2, 3]),
+            Box::new(Tile::grouped(
+                starts,
+                ColumnValue::UInts(keys),
+                Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let inner_tiling = Tiling::data_function(
+            Extent::uint_range(4),
+            Tiling::data_function(
+                Extent::uint_range(4),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        let out_tiling = outer_tiling.append_level(
+            Extent::uint_range(4),
+            Tiling::Scalar(Extent::Record(HashMap::from([
+                (tuple_field(0), Extent::Base(BaseType::Int)),
+                (tuple_field(1), Extent::uint_range(4)),
+            ]))),
+        );
+        let (outer, outer_pulled, _) = ProjectionSpy::new(outer, outer_tiling);
+        let (inner, inner_pulled, _) = ProjectionSpy::new(inner, inner_tiling);
+        (
+            ProductProducer {
+                base: ProducerBase::unowned(ProductProducer::alloc_id(), &out_tiling),
+                outer: Box::new(outer),
+                inner: Box::new(inner),
+                level: CurryLevel::OUTERMOST,
+                empty_level: out_tiling.empty_at_no_rows(),
+                pair: out_tiling.deepest_values().clone(),
+                second: Paired::Key,
+            },
+            outer_pulled,
+            inner_pulled,
+        )
+    }
+
+    #[test]
+    fn a_range_of_rows_pulls_both_sides_at_it() {
+        let (mut product, outer_pulled, inner_pulled) = rows_and_their_keys();
+        let rows = product.get(keys_between(1, 2));
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = &rows
+        else {
+            panic!("a collection of rows")
+        };
+        assert_eq!(*domain, ColumnValue::UInts(vec![1, 2]));
+        let Tile::DataFunction { domain: keys, .. } = codomain.as_ref() else {
+            panic!("a collection per row")
+        };
+        assert_eq!(keys.len(), 2 + 3, "rows 1 and 2 hold two and three keys");
+        assert_eq!(*outer_pulled.borrow(), [keys_between(1, 2)]);
+        assert_eq!(*inner_pulled.borrow(), [keys_between(1, 2)]);
+    }
+
+    #[test]
+    fn a_range_of_rows_is_the_whole_pull_cut_to_it() {
+        for guard in [keys_between(0, 1), keys_between(3, 9)] {
+            assert_conforms(|| Box::new(rows_and_their_keys().0), guard);
+        }
+    }
+
+    /// An outer row whose inner collection has not arrived has no pairs yet and is not in the
+    /// output, and the output states complete only the rows both sides settle: the inner side
+    /// may still deliver rows 1 and 2, and a statement covering them would have a consumer
+    /// release them before they exist.
+    #[test]
+    fn a_row_with_no_inner_collection_yet_is_not_stated_complete() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let int = || Extent::Base(BaseType::Int);
+        let outer_tiling = Tiling::data_function(uint(), Tiling::Scalar(int()));
+        let outer = ints_by_position(&[100, 200, 300], true);
+        let inner_tiling =
+            Tiling::data_function(uint(), Tiling::data_function(uint(), Tiling::Scalar(int())));
+        let inner = Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::grouped(
+                vec![0],
+                ColumnValue::from_uints(vec![0]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![7]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::exactly(&[Value::UInt(0)]),
+            BitSet::new(),
+        );
+        let out_tiling = outer_tiling.append_level(
+            uint(),
+            Tiling::Scalar(Extent::Record(HashMap::from([
+                (tuple_field(0), int()),
+                (tuple_field(1), uint()),
+            ]))),
+        );
+        let mut producer = ProductProducer {
+            base: ProducerBase::unowned(ProductProducer::alloc_id(), &out_tiling),
+            outer: Box::new(ProjectionSpy::new(outer, outer_tiling).0),
+            inner: Box::new(ProjectionSpy::new(inner, inner_tiling).0),
+            level: CurryLevel::OUTERMOST,
+            empty_level: out_tiling.empty_at_no_rows(),
+            pair: out_tiling.deepest_values().clone(),
+            second: Paired::Key,
+        };
+        let out = producer.get(out_tiling.universal_guard());
+        let Tile::DataFunction {
+            domain,
+            domain_predicate,
+            ..
+        } = &out
+        else {
+            panic!("Product tiles as a collection, got {out:?}")
+        };
+        assert_eq!(
+            *domain,
+            ColumnValue::UInts(vec![0]),
+            "rows 1 and 2 have no pairs yet"
+        );
+        for withheld in [1, 2] {
+            assert!(
+                !domain_predicate.contains(&Value::UInt(withheld)),
+                "row {withheld} may still be paired, so it is not complete: {domain_predicate:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn nothing_pairs_nothing() {
+        let (mut product, outer_pulled, inner_pulled) = rows_and_their_keys();
+        let nothing = product.tiling().empty_guard();
+        assert_eq!(product.get(nothing), product.tiling().empty_tile());
+        assert!(outer_pulled.borrow().is_empty() && inner_pulled.borrow().is_empty());
+    }
+}
+
+/// `Converse` as the bucketize step of a group-by uses it: the key stream `sales ≫ key` is
+/// inverted into the groups `key ⤇ (position ⤇ position)`, and a worker owns a range of groups.
+#[cfg(test)]
+mod converse_projection_tests {
+    use super::*;
+    use crate::interpreter::BaseType;
+    use crate::interpreter::tile_operators::test_helpers::{
+        GuardLog, ProjectionSpy, assert_conforms, ints_by_position, keys_between,
+    };
+    use bit_set::BitSet;
+
+    const ROWS: u64 = 8;
+
+    /// The group of each position: `1, 2, 1, 3, 2, 1, 3, 2`, so group 1 holds positions
+    /// `{0, 2, 5}`, group 2 holds `{1, 4, 7}` and group 3 holds `{3, 6}`.
+    const GROUPS: [i64; 8] = [1, 2, 1, 3, 2, 1, 3, 2];
+
+    fn groups_tiling() -> Tiling {
+        Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::data_function(
+                Extent::uint_range(ROWS),
+                Tiling::Scalar(Extent::uint_range(ROWS)),
+            ),
+        )
+    }
+
+    fn bucketize() -> (ConverseProducer, GuardLog, GuardLog) {
+        let in_tiling = Tiling::data_function(
+            Extent::uint_range(ROWS),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let (keys, pulled, released) =
+            ProjectionSpy::new(ints_by_position(&GROUPS, true), in_tiling);
+        (
+            ConverseProducer {
+                base: ProducerBase::unowned(ConverseProducer::alloc_id(), &groups_tiling()),
+                input: Box::new(keys),
+                held: Vec::new(),
+                level: CurryLevel::OUTERMOST,
+                empty_level: groups_tiling()
+                    .values_at(CurryLevel::OUTERMOST)
+                    .empty_at_no_rows(),
+            },
+            pulled,
+            released,
+        )
+    }
+
+    fn groups(keys: &[i64]) -> TileGuard {
+        TileGuard::Function(FunctionGuard::Domain(
+            keys.iter()
+                .map(|k| Predicate::point(Value::Int(*k)))
+                .fold(Predicate::False, |all, one| all.union(&one)),
+        ))
+    }
+
+    /// Each group of `tile` as `(key, members)`, members in position order.
+    fn members_by_group(tile: &Tile) -> Vec<(i64, Vec<u64>)> {
+        let Tile::DataFunction {
+            domain: ColumnValue::Ints(keys),
+            codomain,
+            ..
+        } = tile
+        else {
+            panic!("groups keyed by integers, got {tile:?}")
+        };
+        let Tile::DataFunction {
+            row_starts,
+            domain: ColumnValue::UInts(members),
+            ..
+        } = codomain.as_ref()
+        else {
+            panic!("members per group, got {codomain:?}")
+        };
+        let mut groups: Vec<(i64, Vec<u64>)> = keys
+            .iter()
+            .enumerate()
+            .map(|(group, key)| {
+                let end = row_starts.get(group + 1).copied().unwrap_or(members.len());
+                let mut held = members[row_starts[group]..end].to_vec();
+                held.sort_unstable();
+                (*key, held)
+            })
+            .collect();
+        groups.sort();
+        groups
+    }
+
+    /// A worker's groups: the keys are read from the rows, so the whole key stream is read and
+    /// the groups outside the range are cut.
+    #[test]
+    fn a_range_of_groups_reads_the_whole_key_stream_and_cuts_the_groups() {
+        let (mut converse, pulled, _) = bucketize();
+        let answer = converse.get(groups(&[1, 3]));
+        assert_eq!(
+            members_by_group(&answer),
+            [(1, vec![0, 2, 5]), (3, vec![3, 6])]
+        );
+        assert_eq!(
+            *pulled.borrow(),
+            [converse.input.tiling().universal_guard()]
+        );
+    }
+
+    /// The consumer releases the groups it took. That frees the rows they hold at the input and
+    /// no others, so the next range finds its own rows still there.
+    #[test]
+    fn releasing_a_range_of_groups_frees_its_rows_and_leaves_the_others() {
+        let (mut converse, _, released) = bucketize();
+        converse.get(groups(&[1]));
+        converse.release(groups(&[1]));
+        let freed = released.borrow().clone();
+        assert_eq!(freed.len(), 1);
+        let TileGuard::Function(FunctionGuard::Domain(rows)) = &freed[0] else {
+            panic!("a domain release of the rows, got {freed:?}")
+        };
+        for row in [0u64, 2, 5] {
+            assert!(rows.contains(&Value::UInt(row)), "row {row} is group 1's");
+        }
+        for row in [1u64, 3, 4, 6, 7] {
+            assert!(!rows.contains(&Value::UInt(row)), "row {row} is not");
+        }
+        let rest = converse.get(groups(&[2, 3]));
+        assert_eq!(
+            members_by_group(&rest),
+            [(2, vec![1, 4, 7]), (3, vec![3, 6])]
+        );
+    }
+
+    #[test]
+    fn a_range_of_groups_is_the_whole_pull_cut_to_it() {
+        for guard in [groups(&[1]), groups(&[2, 3]), groups(&[9])] {
+            assert_conforms(|| Box::new(bucketize().0), guard);
+        }
+    }
+
+    /// A group-by whose source varies per enclosing row inverts each row's collection on its
+    /// own: the outer keys stand, so the projection of rows reaches the rows.
+    #[test]
+    fn beneath_a_standing_level_the_projection_reaches_the_enclosing_rows() {
+        let rows = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 3],
+                ColumnValue::UInts(vec![0, 1, 2, 0, 1]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![5, 6, 5, 7, 7]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let in_tiling = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::data_function(
+                Extent::uint_range(3),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        let out = Tiling::data_function(Extent::uint_range(2), groups_tiling());
+        let make = || {
+            let (input, pulled, _) = ProjectionSpy::new(rows.clone(), in_tiling.clone());
+            (
+                ConverseProducer {
+                    base: ProducerBase::unowned(ConverseProducer::alloc_id(), &out),
+                    input: Box::new(input),
+                    held: Vec::new(),
+                    level: CurryLevel::new(1),
+                    empty_level: out.values_at(CurryLevel::new(1)).empty_at_no_rows(),
+                },
+                pulled,
+            )
+        };
+        let (mut converse, pulled) = make();
+        converse.get(keys_between(1, 1));
+        assert_eq!(*pulled.borrow(), [keys_between(1, 1)]);
+        assert_conforms(|| Box::new(make().0), keys_between(1, 1));
+    }
+
+    #[test]
+    fn nothing_inverts_nothing() {
+        let (mut converse, pulled, _) = bucketize();
+        let nothing = converse.tiling().empty_guard();
+        assert_eq!(converse.get(nothing), converse.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
     }
 }
