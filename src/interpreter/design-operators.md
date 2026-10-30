@@ -211,10 +211,16 @@ the domain uses `over_every_tag`, which also recognizes universality over that t
 Set operations combine the predicates for every tag named by either operand and combine their
 defaults separately.
 
-A tagged `UnionProducer` splits releases by tag and forwards each payload predicate to that
-tag's input. A flat union instead forwards the whole predicate over the domain shared by its
-arms, even when that domain is itself union-keyed. Prefix construction over union keys is
-specified under [Componentwise predicates and prefixes](#componentwise-predicates-and-prefixes).
+A tagged `UnionProducer` splits releases by tag and forwards each payload predicate to that tag's
+input. It splits a pull the same way: a guard of its keys by tag reaches each arm as what it names
+under that arm's tag, an arm it names nothing of is not pulled, and a key guard of any other shape
+panics. A guard that names every arm of a union domain whole reads as the universal guard once
+closed over the tiling (`TileGuard::closed_over`), since a union predicate does not know the
+domain's tags. `TileProducer::release` closes the accumulated guard, so the releases of each arm add
+up to the universal guard, and a tagged union closes a pull's guard before splitting it. A flat
+union instead forwards the whole predicate over the domain shared by its arms, even when that domain
+is itself union-keyed. Prefix construction over union keys is specified under [Componentwise
+predicates and prefixes](#componentwise-predicates-and-prefixes).
 
 ### Qualified predicates
 
@@ -432,8 +438,11 @@ implement projection for the producer.
 | Previously complete paths obey the completeness contract | Debug assertions |
 
 The `release` wrapper checks that the guard matches the tiling in every build, normalizes it,
-and unions it into `obsolete_guard`. If the accumulated representation changes, it calls
-`release_impl` with the normalized argument, not with the entire accumulated guard.
+unions it into `obsolete_guard`, and closes the result over the tiling (`TileGuard::closed_over`).
+If the accumulated representation changes, it calls `release_impl` with the normalized argument,
+not with the entire accumulated guard. When the closure makes the accumulated guard universal, it
+calls `release_impl` with the universal guard instead, which overlaps the pieces released before
+it: a `release_impl` reclaims everything only on a universal guard.
 
 Sources are polled separately from producers. `Scheduler::poll_sources` buffers source arrivals
 and returns a `Delivery` without notifying consumers. `Scheduler::deliver` notifies those
@@ -505,7 +514,7 @@ of a cyclic fan-out).
 | `Converse` | Beneath standing levels the input is pulled at the projection. Inverting the outermost collection reads the whole input and cuts the groups, and the rows of a group the projection does not name stay unreleased at the input. |
 | `FanOutSlot` | Pulls the shared input at its own projection and cuts its answer to it. A producer states completeness only for the region it returns, so slots at different regions each pull the one input at their own and a pull of one region retracts nothing it said of another (the debug check compares the last output inside the region pulled). A cyclic fan-out reads its input whole, because a sibling that re-enters mid-pull is answered from the cache of the last completed pull, which has to cover whatever region that sibling asks for. |
 | `Memo` | Reads its input at the projection and caches what it read; a pull over a region it has read answers from the cache cut to the projection, and a region it has not read reaches the input however quiet the input has been. |
-| `UnionOperator` | A flat union pulls every arm at the projection and cuts the merge to it: the arms are disjoint slices of one collection, and an arm the consumer has released contributes an empty tile that states every key decided, which the cut brings back to the projection. A tagged union keys its rows by arm. Splitting a projection per arm, as its `release_impl` splits a release, is not implemented, so it admits only `Everything` and `Nothing` and panics on a key projection. |
+| `UnionOperator` | A flat union pulls every arm at the projection and cuts the merge to it: the arms are disjoint slices of one collection, and an arm the consumer has released contributes an empty tile that states every key decided, which the cut brings back to the projection. A tagged union keys its rows by arm. It pulls each arm at what a guard of its keys by tag names under that arm's tag, as its `release_impl` splits a release, and does not pull an arm the guard names nothing of; a key projection of any other shape panics. |
 | `CheckedLookup` | A stream of keys, or of `(collection, key)` rows, is pulled at the projection, since each answer sits at its key's position; the collection is read whole, because every key is answered against all of it. One key has no keys to project and admits only `Everything` and `Nothing`. |
 | `ExtractFinal` | Admits `Everything` and `Nothing`. The last position of a stream is not known before the stream ends, so the source is read whole, and the one value or collection it yields is released whole. A key projection panics, including over a collection-valued final position, which is not implemented. |
 | `PermuteRecordDomain` | Reads its input whole and cuts the answer to the projection over the permuted keys: a region of record keys is componentwise, and the input's fields are renamed, so the projection is not forwarded. |
