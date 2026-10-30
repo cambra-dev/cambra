@@ -299,11 +299,85 @@ fn a_breaker_read_by_several_pipelines_pushes_to_each() {
     }
 }
 
-/// A breaker has one input, so a pipeline reads at most one other.
+/// A pipeline names each pipeline it reads once.
 #[test]
-#[should_panic(expected = "pipeline 2 reads pipelines [0, 1]; a breaker has one input")]
-fn a_pipeline_that_reads_two_pipelines_is_refused() {
-    Dispatcher::new(vec![vec![], vec![], vec![0, 1]], UNBOUNDED);
+#[should_panic(expected = "pipeline 1 reads pipeline 0 once")]
+fn a_pipeline_reading_one_pipeline_twice_is_refused() {
+    Dispatcher::new(vec![vec![], vec![0, 0]], UNBOUNDED);
+}
+
+/// The two halves of the integers' keys, held by two breakers.
+fn halves() -> (TileGuard, TileGuard) {
+    (
+        keys_between(0, 1),
+        TileGuard::Function(FunctionGuard::Domain(
+            Predicate::True.minus(&keys_predicate(0, 1)),
+        )),
+    )
+}
+
+/// A pipeline that reads two consumes what each pushes, and finishes after both: its queue closes
+/// at the finish of the last of them.
+#[test]
+fn a_reader_of_two_pipelines_consumes_both_and_finishes_after_both() {
+    let (low, high) = halves();
+    let breakers: Vec<BreakerHandle> = vec![
+        Scripted::holding(low.clone()),
+        Scripted::holding(high.clone()),
+        Scripted::holding(ints().universal_guard()),
+    ];
+    let events = run_over(vec![vec![], vec![], vec![0, 1]], &breakers);
+    let at = |event: &Event| {
+        events
+            .iter()
+            .position(|seen| seen == event)
+            .expect("happens")
+    };
+    assert!(at(&finished(0)) < at(&finished(2)) && at(&finished(1)) < at(&finished(2)));
+    let consumed: BTreeSet<_> = consumed_by(&events, 2)
+        .into_iter()
+        .map(|guard| format!("{guard:?}"))
+        .collect();
+    assert_eq!(
+        consumed,
+        BTreeSet::from([format!("{low:?}"), format!("{high:?}")])
+    );
+}
+
+/// Along a build edge a reader takes no push, and no package before the pipeline it builds on
+/// has finished the epoch: here pipeline 2 builds on 1 and takes 0's pushes.
+#[test]
+fn a_reader_takes_nothing_before_the_pipeline_it_builds_on_finishes() {
+    let (low, high) = halves();
+    let breakers: Vec<BreakerHandle> = vec![
+        Scripted::holding(low.clone()),
+        Scripted::holding(high),
+        Scripted::holding(ints().universal_guard()),
+    ];
+    let reads = vec![vec![], vec![], vec![0, 1]];
+    wire(&reads, &breakers);
+    let mut dispatcher = Dispatcher::new(reads, UNBOUNDED);
+    dispatcher.build(PipelineId(2), PipelineId(1));
+    run(&dispatcher, &breakers);
+    let events = dispatcher.into_events();
+    let first = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                Event::Consume {
+                    pipeline: PipelineId(2),
+                    ..
+                }
+            )
+        })
+        .expect("pipeline 2 consumes");
+    let built = events
+        .iter()
+        .position(|event| *event == finished(1))
+        .expect("pipeline 1 finishes");
+    assert!(built < first, "{events:?}");
+    assert_eq!(consumed_by(&events, 2), vec![low]);
 }
 
 /// The driver consumes the lowest pipeline's package first and finishes only when nothing is
@@ -507,6 +581,35 @@ fn a_package_of_another_tiling_is_refused() {
         &Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED),
         &breakers,
     );
+}
+
+/// A pipeline that reads its input whole consumes that input in morsels that partition it once
+/// the pipeline it reads finishes, whatever that pipeline pushes: here a guard of a sum, while
+/// the scripted breaker's input answers rows.
+#[test]
+fn a_pipeline_reading_its_input_whole_consumes_it_in_morsels() {
+    let breakers: Vec<BreakerHandle> = vec![
+        aggregate_over(Box::new(Input::over(&source(0..6))), &sum_tiling()),
+        Scripted::holding(ints().universal_guard()),
+    ];
+    let input = breakers[1].borrow().input_tiling();
+    wire(&[vec![], vec![0]], &breakers);
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], 2);
+    dispatcher.read_whole(PipelineId(1), &input);
+    run(&dispatcher, &breakers);
+    let consumed = consumed_by(&dispatcher.into_events(), 1);
+    assert!(
+        consumed.len() > 1,
+        "the rows in morsels of two: {consumed:?}"
+    );
+    assert_eq!(partition_gap(&input.universal_guard(), &consumed), None);
+}
+
+/// A source starts from its input, so it has no pipeline to read whole after.
+#[test]
+#[should_panic(expected = "pipeline 0 reads its input whole only after a pipeline it reads")]
+fn a_source_read_whole_is_refused() {
+    Dispatcher::new(vec![vec![]], UNBOUNDED).read_whole(PipelineId(0), &ints());
 }
 
 #[test]

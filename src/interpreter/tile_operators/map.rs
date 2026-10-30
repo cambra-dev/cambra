@@ -601,6 +601,12 @@ impl TileProducer for MapResultProducer {
         visit("input", &*self.input);
     }
 
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("fn", &mut *self.function);
+        visit("input", &mut *self.input);
+    }
+
     /// It keeps its input's keys above its level and computes the values beneath it.
     fn restates(&self) -> Restates {
         Restates::Above(self.level)
@@ -842,6 +848,12 @@ impl TileProducer for MapResultToConstProducer {
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
         visit("constant", &*self.constant);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
+        visit("constant", &mut *self.constant);
     }
 
     /// It keeps its input's keys above its level and computes the values beneath it.
@@ -1241,6 +1253,11 @@ impl TileProducer for MapResultWithSourceProducer {
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
     }
 
     fn inspect(&self, opts: &VizOptions) -> InspectNode {
