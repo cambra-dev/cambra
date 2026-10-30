@@ -286,23 +286,32 @@ regardless, because the pane links name their ids.
 ### An occurrence on the wire
 
 **Planned.** An occurrence is the id the compiler gives a name the IR holds in a field rather than
-as a node ([provenance.md](../ccl/design/provenance.md#name-occurrences)). It is one of two kinds:
+as a node, and to the type expression a binder's annotation writes
+([provenance.md](../ccl/design/provenance.md#name-occurrences)). It is one of five kinds:
 
 - a **binding occurrence**, the name a binder introduces: `p` in `def f(p)`;
 - an **applied occurrence** held as a field, a use of a binder bound elsewhere: `out` in `out << v`,
-  which a `Feed`, `Define` or `MutWrite` holds.
+  which a `Feed`, `Define` or `MutWrite` holds;
+- a **label occurrence**, a record literal's label or a variant constructor's tag: `x` in
+  `(x=1, y=2)`;
+- a **head occurrence**, the tag or constructor a `match` arm matches: `rect` in
+  `case Shape::rect(w, h)`;
+- an **annotation occurrence**, the type a binder's annotation writes: `String` in
+  `x: String = 5`.
 
-A use held as a node, the `g` in `p + g`, is a `Var` and ships as one already. Every pane ships
-each of its occurrences as an entry of the node table, because the pane links name their ids. An
-occurrence entry is a child of the node that holds it: the binding node for a binding occurrence,
-the `Feed`, `Define` or `MutWrite` for an applied occurrence.
+A use held as a node, the `g` in `p + g`, is a `Var` and ships as one already, and so does the `.x`
+of a field access. Every pane ships each of its occurrences as an entry of the node table, because
+the pane links name their ids. An occurrence entry is a child of the node that holds it: the
+binding node for a binding or annotation occurrence, the `Feed`, `Define` or `MutWrite` for an
+applied occurrence, the `Record` or `VariantCtor` for a label occurrence, and the `Case` for a head
+occurrence.
 
 A child carries a `kind` in place of `predicate`:
 
 | `kind` | the child is |
 |---|---|
 | `value` | a value child, as today's `predicate: false` |
-| `occurrence` | a binding occurrence or an applied occurrence the parent holds |
+| `occurrence` | an occurrence the parent holds, of any of the five kinds |
 | `predicate` | a refinement predicate riding one of the parent's type slots, as today's `predicate: true` |
 
 Children ship value children first, then occurrences in `for_each_own_id` order, then predicates in
@@ -319,14 +328,26 @@ An occurrence entry carries the fields every tree node carries:
 | `rewritten` | `{ Machinery, "lower.image" }` in a lowering pane, the copy's tag in a later one | likewise |
 | `type` | the binder's `ty`, rendered | the `ty` of the binder it names, found by `Uid` in the same tree |
 | `children` | empty | empty |
+| edge label in a tree pane | `binder` | `use` |
+
+The other three kinds differ in `label` and `type`; every other field is as above:
+
+| kind | `label` | `type` | edge label |
+|---|---|---|---|
+| label occurrence (`x` in `(x=1, y=2)`) | `Label(x)` | the type of the entry's value, or of the tag's payload | `label` |
+| head occurrence (`rect` in `case Shape::rect(w, h)`) | `Head(rect)` | the type of the arm's payload binding | `head` |
+| annotation occurrence (`String` in `x: String = 5`) | `Annotation` | the annotation's `Type`, rendered | `annotation` |
+
+An annotation occurrence appears only in the `pre-inference` pane, because inference clears the
+annotation that holds it.
 
 The type is what makes an occurrence worth drawing. A tree pane draws an occurrence as a row under
-the node that holds it, edge-labelled `binder` or `use` rather than by position, so a click on a
+the node that holds it, edge-labelled by its kind rather than by position, so a click on a
 name in the source selects that row, and the row shows the binder's type in that pane. The
 positional queries (`tightestNodeAt`, `typesAt`) include occurrences; a predicate stays excluded
 from them because the tree draws no row for one.
 
-Both wire validators check that `kind` is one of the three, that an occurrence entry has no
+Both wire validators check that `kind` is `value`, `occurrence` or `predicate`, that an occurrence entry has no
 children, and that one child edge names each occurrence. `IrChild` is a breaking change to the wire
 shape, which the [schema version](#the-schema-version) rule leaves at 1 while no durable consumer
 exists.
@@ -383,11 +404,32 @@ containing row, so a broad row would shadow them. Those uses contribute none: `o
 
 **Planned.** Such a name resolves through its applied occurrence: `useSpan` is the span of the name
 and `defSpan` its binder's binding occurrence, so `out` in `out << value` resolves to the `out` in
-`out = defer()`.
+`out: Feed(Int)`.
+
+**Planned.** A head occurrence for a constructor resolves to the constructor's declaration:
+`rect` in `case Shape::rect(w, h)` resolves to `rect` in `type Shape:`, through the pattern's
+`PatternHead::Constructor`. A label occurrence and a tag head contribute no row, because a
+structural label has no declaration
+([provenance.md](../ccl/design/provenance.md#labels-pattern-heads-and-annotations)).
+
+**Planned.** The names lowering resolves in types and module paths join the same rows. Each row of
+lowering's `ResolvedNames` table becomes a `definitions` row: `Shape` in `s: Shape` resolves to
+`Shape` in `type Shape:`, an alias's use to its name, a type parameter's use to its declaration, a
+module qualifier to the module's file, and a `use` item that names a value to the member's binding
+occurrence ([lowering.md](../ccl/design/lowering.md#names-lowering-resolves)). A row whose target is
+in another file carries that file in its `defSpan`. The table describes the program the
+`pre-inference` pane holds, so the two sources of rows agree on which program they answer for.
+
+A qualified use such as `Shape::rect(1, 2)` or `m::f(x)` is one `Var` whose span covers the whole
+path, and its qualifier has a row of its own from the table. The `Var`'s row therefore takes the
+span of the last segment, `rect` or `f`, so no row contains another and a consumer's first
+containing row is the narrowest.
 
 This layer implements no scoping of its own. CHL's binding structure is stated in `ccl/scope.rs`
 and minted by `uniquify`, and resolution here reads the result rather than recomputing it, so a
-binding form added to the language cannot be answered wrong here without failing there first.
+binding form added to the language cannot be answered wrong here without failing there first. The
+names in types follow the same rule: lowering resolves them and records the result, and this layer
+reads the record.
 
 ### Diagnostics and the degraded payload
 
