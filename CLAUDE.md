@@ -399,6 +399,35 @@ does, and a PR outside a stack object keeps an editable base.
 
 The stack object owns the base branches of its members. Everything below follows from that.
 
+#### The `gh-stack` skill, under jj
+
+`.claude/skills/gh-stack/` is GitHub's own skill for the extension, vendored unmodified from
+`github/gh-stack` at commit `a644af6d` (skill version 0.2.0, MIT, `LICENSE` beside it). It carries
+the stack model, the non-interactive form of each command, exit codes, and recovery. Update it by
+replacing the directory with a newer upstream copy, never by editing it in place.
+
+The skill assumes `gh stack` tracks the branches locally. Here jj owns them, which the skill's own
+"Driving stacks from another tool or worktree" section covers:
+
+- jj makes the commits, rebases, and pushes ("Stack Management & Rebasing (jj)" above). Do not run
+  `gh stack init`, `add`, `push`, `sync`, `rebase`, or the navigation commands in a jj workspace,
+  except as "Restructuring a locked stack" below prescribes.
+- `gh stack` does the GitHub-side work: `link` creates and grows a stack, and `merge` lands it.
+- Where the skill and this section disagree, this section records what this repository observed,
+  and it holds.
+
+#### Merging a stack
+
+`gh stack merge <pr> --yes --squash` merges that PR and every unmerged PR below it, all or nothing:
+if any of them cannot merge, none does. `gh stack merge <stack-number> --yes --squash` merges every
+unmerged PR in the stack. The PRs above the merged ones stay open and re-target the stack's base.
+`gh pr merge` cannot merge a stack member. See `.claude/skills/gh-stack/references/commands.md`,
+"merge".
+
+Merge requirements come from the bottom PR's base branch and apply to every PR in the stack, and CI
+for the default branch runs on every PR in it (GitHub's documentation, "About stacked pull
+requests").
+
 #### Creating and growing a stack
 
 `gh stack link` takes branch names, PR numbers or PR URLs in stack order, bottom first, and keeps no
