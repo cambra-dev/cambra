@@ -28,9 +28,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
 use chl_parser::ast::{
-    ArmPattern, AssignTarget, AugOp, BinOp, BoolOp, CmpOp, CompClause, ConstructorPattern, Expr,
-    IfBranch, Lit, PayloadPattern, QualifiedName, Spanned, Stmt, TypeAnnotation, TypeDeclBody,
-    UnaryOp, VariantPayload,
+    ArmPattern, AssignTarget, AugOp, BinOp, BoolOp, CmpOp, CompClause, ConstructorPattern,
+    ExceptClause, Expr, IfBranch, Lit, PayloadPattern, QualifiedName, Spanned, Stmt,
+    TypeAnnotation, TypeDeclBody, UnaryOp, VariantPayload,
 };
 
 use crate::value::{Collection, Value};
@@ -38,16 +38,25 @@ use chl_parser::SurfaceBuiltin;
 use chl_parser::places::{Place, places, site_tag};
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Error(pub String);
+pub enum Error {
+    /// The program's answer is undefined or not judgeable, for this reason.
+    Message(String),
+    /// An exception a `raise` raised, on its way to the `try` that catches it
+    /// (`docs/chl-spec.md`, "Exceptions").
+    Raised(Value),
+}
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
+        match self {
+            Error::Message(why) => write!(f, "{why}"),
+            Error::Raised(exception) => write!(f, "the exception {exception} escaped the program"),
+        }
     }
 }
 
 fn err<T>(msg: impl Into<String>) -> Result<T, Error> {
-    Err(Error(msg.into()))
+    Err(Error::Message(msg.into()))
 }
 
 /// What each sink observed.
@@ -818,7 +827,7 @@ fn tuple_key(keys: &[Value]) -> Value {
 
 fn collection(entries: Vec<(Value, Value)>) -> Result<Collection, Error> {
     Collection::try_from_entries(entries)
-        .map_err(|key| Error(format!("two entries share the key {key}")))
+        .map_err(|key| Error::Message(format!("two entries share the key {key}")))
 }
 
 /// Run `source`, answering what each sink observed.
@@ -826,7 +835,7 @@ pub fn run(source: &str) -> Result<Observations, Error> {
     let root = chl_parser::FileId::ROOT;
     let module = chl_parser::parse_module(root, source)
         .into_result()
-        .map_err(|errors| Error(format!("parse error: {errors:?}")))?;
+        .map_err(|errors| Error::Message(format!("parse error: {errors:?}")))?;
     let mut feed_sites = BTreeMap::new();
     collect_feed_sites(&module.body, &mut feed_sites);
     let places: Rc<HashMap<usize, Place>> = Rc::new(
@@ -942,7 +951,14 @@ fn for_each_stmt<'a>(
                 for_each_stmt(body, bodies, f);
             }
             Stmt::With { body, .. } => for_each_stmt(body, bodies, f),
+            Stmt::Try { body, handlers } => {
+                for_each_stmt(body, bodies, f);
+                for h in handlers {
+                    for_each_stmt(&h.body, bodies, f);
+                }
+            }
             Stmt::Expr(e)
+            | Stmt::Raise(e)
             | Stmt::Return(Some(e))
             | Stmt::Assign { value: e, .. }
             | Stmt::AnnAssign { value: e, .. }
@@ -1261,7 +1277,7 @@ impl Interp {
                 Ok(None)
             }
             Ok(Some(_)) if self.speculating > self.speculating_at_call => {
-                self.lose(Error(
+                self.lose(Error::Message(
                     "a `return` whose branch depends on a channel still being built".into(),
                 ));
                 Ok(None)
@@ -1559,6 +1575,16 @@ impl Interp {
                 }),
             },
 
+            // An exception travels as an error until the `try` that catches it
+            // (`docs/chl-spec.md`, "Exceptions").
+            Stmt::Raise(e) => {
+                let exception = self.eval(e)?;
+                Err(Error::Raised(exception))
+            }
+            Stmt::Try { body, handlers } => {
+                self.run_try(body, handlers, |me, block| me.exec_block(block))
+            }
+
             // An instance binds each `def` under its own prefix, which dispatch names. Its
             // functions read the requirements its trait names and those the block names.
             Stmt::Impl(block)
@@ -1712,7 +1738,8 @@ impl Interp {
                 if !positional {
                     let watch = self.order_watches.pop().expect("pushed above");
                     let returned_early = several && matches!(ran, Ok(Some(_)));
-                    if ran.is_ok() && (watch.moved || returned_early) {
+                    let raised = several && matches!(ran, Err(Error::Raised(_)));
+                    if (ran.is_ok() && (watch.moved || returned_early)) || raised {
                         return err(
                             "a loop whose result may depend on its iteration order iterates a \
                              collection not keyed by position, whose order is not defined, \
@@ -2001,7 +2028,7 @@ impl Interp {
             v.iter()
                 .find(|(n, _)| n == name)
                 .map(|(_, x)| x.clone())
-                .ok_or_else(|| Error(format!("a product has no field `{name}`")))
+                .ok_or_else(|| Error::Message(format!("a product has no field `{name}`")))
         };
         for (name, inner) in fields {
             match self.order_by(&field(a, name)?, &field(b, name)?, inner)? {
@@ -2033,7 +2060,9 @@ impl Interp {
                 }
             });
         }
-        best.ok_or_else(|| Error(format!("`{name}` of an empty collection is not defined")))
+        best.ok_or_else(|| {
+            Error::Message(format!("`{name}` of an empty collection is not defined"))
+        })
     }
 
     /// `receiver.method(args)`: the method of the one type that declares it and has the
@@ -2091,7 +2120,7 @@ impl Interp {
             .and_then(|t| t.members.get(q.name.node.as_str()))
             .copied()
             .ok_or_else(|| {
-                Error(format!(
+                Error::Message(format!(
                     "`{}::{}` is not a declared member",
                     ty.node, q.name.node
                 ))
@@ -2384,6 +2413,66 @@ impl Interp {
     /// write through a `Mut` parameter, a feed) runs for its effects and denotes unit, which
     /// is what a function body ending that way returns. Without it, such a block is refused,
     /// which is what a block in expression position requires.
+    /// `try: body except T as e: …`: `run` over the body, and where the body raises an
+    /// exception a clause catches, `run` over the first such clause with the exception bound
+    /// (`docs/chl-spec.md`, "Exceptions"). An exception no clause catches passes on.
+    fn run_try<T>(
+        &mut self,
+        body: &[Spanned<Stmt>],
+        handlers: &[ExceptClause],
+        mut run: impl FnMut(&mut Self, &[Spanned<Stmt>]) -> Result<T, Error>,
+    ) -> Result<T, Error> {
+        let exception = match self.scoped(|me| run(me, body)) {
+            Err(Error::Raised(exception)) => exception,
+            ran => return ran,
+        };
+        if matches!(exception, Value::Pending) {
+            return err(
+                "an exception whose value depends on a channel still being built, so the clause \
+                 catching it is not judgeable",
+            );
+        }
+        for h in handlers {
+            if self.catches(&h.ty, &exception)? {
+                return self.scoped(|me| {
+                    if let Some(name) = &h.binding {
+                        me.bind(name.node.to_string(), Slot::Val(exception));
+                    }
+                    run(me, &h.body)
+                });
+            }
+        }
+        Err(Error::Raised(exception))
+    }
+
+    /// Whether `except ty` catches `exception`.
+    ///
+    /// The compiler decides catching by the raised expression's type, which a value does not
+    /// carry. For a primitive type or a nominal type's name the value decides it: every value
+    /// of such a type has a type below it, and no value of another type does. Any other type,
+    /// a refinement above all, could catch a value whose expression's type it does not, so the
+    /// interpreter refuses it.
+    fn catches(&self, ty: &Spanned<Expr>, exception: &Value) -> Result<bool, Error> {
+        let Expr::Name(name) = &ty.node else {
+            return err(
+                "an `except` naming a type other than a primitive or a nominal type, whose \
+                 catching the interpreter cannot decide from the value",
+            );
+        };
+        Ok(match (name.as_str(), exception) {
+            ("Int", Value::Int(_)) | ("String", Value::Str(_)) | ("Bool", Value::Bool(_)) => true,
+            ("Int" | "String" | "Bool", _) => false,
+            (name, Value::Nominal { ty, .. }) if self.types.contains_key(name) => ty == name,
+            (name, _) if self.types.contains_key(name) => false,
+            (name, _) => {
+                return err(format!(
+                    "an `except {name}`, a type whose catching the interpreter cannot decide \
+                     from the value"
+                ));
+            }
+        })
+    }
+
     fn block_value(
         &mut self,
         body: &[Spanned<Stmt>],
@@ -2401,7 +2490,11 @@ impl Interp {
             Stmt::If {
                 else_body: Some(_), ..
             }
-            | Stmt::Match { .. } => self.branch_value(last, effects_denote_unit),
+            | Stmt::Match { .. }
+            | Stmt::Try { .. } => self.branch_value(last, effects_denote_unit),
+            // A path that raises contributes no value: the exception leaves the block, or a
+            // speculative one loses its effects and is pending.
+            Stmt::Raise(_) => self.exec(last).map(|_| Value::Pending),
             _ if effects_denote_unit => self
                 .exec(last)
                 .map(|returned| returned.unwrap_or(Value::Unit)),
@@ -2450,6 +2543,9 @@ impl Interp {
                     Ok(Value::Pending)
                 }),
             },
+            Stmt::Try { body, handlers } => self.run_try(body, handlers, |me, block| {
+                me.block_value(block, effects_denote_unit)
+            }),
             other => err(format!("{other:?} in expression position")),
         }
     }
@@ -2624,7 +2720,9 @@ fn constructor_binds(
                 .iter()
                 .find(|(k, _)| *k == key)
                 .map(|(_, v)| v.clone())
-                .ok_or_else(|| Error(format!("no position {i} in a constructor's tuple")))?;
+                .ok_or_else(|| {
+                    Error::Message(format!("no position {i} in a constructor's tuple"))
+                })?;
             out.push((n.to_string(), v));
         }
     }
@@ -2818,7 +2916,7 @@ impl Interp {
                     .into_iter()
                     .find(|(n, _)| *n == wanted)
                     .map(|(_, v)| v)
-                    .ok_or_else(|| Error(format!("no field `{attr}`")))
+                    .ok_or_else(|| Error::Message(format!("no field `{attr}`")))
             }
 
             Expr::VariantCtor {
@@ -2854,7 +2952,7 @@ impl Interp {
                     (UnaryOp::Neg, Value::Int(i)) => i
                         .checked_neg()
                         .map(Value::Int)
-                        .ok_or_else(|| Error(format!("-({i}) is not defined"))),
+                        .ok_or_else(|| Error::Message(format!("-({i}) is not defined"))),
                     (UnaryOp::Not, Value::Bool(b)) => Ok(Value::Bool(!b)),
                     (op, v) => err(format!("unsupported unary {op:?} on {v}")),
                 }
@@ -3009,7 +3107,7 @@ impl Interp {
                             .into_iter()
                             .find(|(n, _)| *n == format!("_{i}"))
                             .map(|(_, v)| v)
-                            .ok_or_else(|| Error(format!("no component _{i}")))
+                            .ok_or_else(|| Error::Message(format!("no component _{i}")))
                     }
                     other => err(format!("cannot subscript {other}")),
                 }
@@ -3084,7 +3182,7 @@ impl Interp {
                             .iter()
                             .find(|(f, _)| f == n)
                             .map(|(_, v)| v.clone())
-                            .ok_or_else(|| Error(format!("a pair has no component {n}")))
+                            .ok_or_else(|| Error::Message(format!("a pair has no component {n}")))
                     };
                     entries.push((get("_0")?, get("_1")?));
                 }
@@ -3436,13 +3534,25 @@ impl Interp {
                     }
                     _ => return err("a comprehension iterates a collection"),
                 };
-                for (key, elem) in c.entries().to_vec() {
+                // An exception escapes from the first raising position, which only positions
+                // the interpreter orders as the compiler does decide, as a loop's
+                // ([`Stmt::For`]).
+                let entries = c.entries().to_vec();
+                let ordered =
+                    entries.len() < 2 || entries.iter().all(|(k, _)| matches!(k, Value::Int(_)));
+                for (key, elem) in entries {
                     keys.push(key);
                     let walked = self.scoped(|me| {
                         me.bind_pattern(target, elem)?;
                         me.comprehend(rest, element, keys, out)
                     });
                     keys.pop();
+                    if !ordered && matches!(walked, Err(Error::Raised(_))) {
+                        return err(
+                            "an exception escapes a comprehension over a collection not keyed \
+                             by position, whose order is not defined, which is not judgeable",
+                        );
+                    }
                     walked?;
                 }
                 Ok(())
@@ -3487,7 +3597,7 @@ fn binop(op: BinOp, l: Value, r: Value) -> Result<Value, Error> {
     }
     let int = |v: Option<i64>| {
         v.map(Value::Int)
-            .ok_or_else(|| Error(format!("{l} {op:?} {r} is not defined")))
+            .ok_or_else(|| Error::Message(format!("{l} {op:?} {r} is not defined")))
     };
     match (op, &l, &r) {
         (BinOp::Add | BinOp::AddRefined, Value::Int(a), Value::Int(b)) => int(a.checked_add(*b)),
@@ -3551,7 +3661,7 @@ fn builtin_function(
             [Value::Int(i)] => i
                 .checked_neg()
                 .map(Value::Int)
-                .ok_or_else(|| Error(format!("-({i}) is not defined"))),
+                .ok_or_else(|| Error::Message(format!("-({i}) is not defined"))),
             _ => return None,
         },
         _ => return None,
@@ -3571,7 +3681,39 @@ mod tests {
     }
 
     fn refused(source: &str) -> String {
-        run(source).expect_err("the program is refused").0
+        run(source).expect_err("the program is refused").to_string()
+    }
+
+    /// Catching is decided by the raised expression's type, which a value does not carry,
+    /// so an `except` naming a refinement is refused rather than decided by the value.
+    #[test]
+    fn an_except_naming_a_refinement_is_refused() {
+        let why = refused(indoc! {"
+            out = test_sink()
+            y = try:
+                    raise 2
+                except {Int where _ > 0}:
+                    1
+            out << y
+        "});
+        assert!(why.contains("cannot decide from the value"), "{why}");
+    }
+
+    /// An exception escapes from the first raising position, and the interpreter orders
+    /// only positions keyed by integers as the compiler does.
+    #[test]
+    fn an_exception_escaping_a_loop_over_unordered_keys_is_refused() {
+        let why = refused(indoc! {"
+            out = test_sink()
+            r = try:
+                    for v in map([\"a\" -> 1, \"b\" -> 2]):
+                        raise v
+                    0
+                except Int as e:
+                    e
+            out << r
+        "});
+        assert!(why.contains("whose order is not defined"), "{why}");
     }
 
     #[test]
@@ -3677,7 +3819,7 @@ mod tests {
             out << f(M::new(0))
         "#})
         .expect_err("the program is refused")
-        .0;
+        .to_string();
         assert!(
             refused
                 .contains("`b` is an instance of `Both`, which shows only its trait's functions"),

@@ -604,3 +604,54 @@ Operator conversion compiles `reading` to `Readings` over its operand, and a `Re
 operand to `Readings` at the one position with no keys. Every `Readings` of one site reads one
 `ReadingSource`, which holds the value taken the first time any of them asks for a position. Copies
 of a call agree whatever positions each one's input carries.
+
+## Exceptions
+
+`Raise { value }` raises `value`, and `Try { body, handlers }` evaluates `body` and, where it
+raises, the first handler whose type catches the exception (`docs/chl-spec.md`, "Exceptions").
+Lowering builds them from `raise` and `try` (`lower_try`). Inference types a `Raise` by its context,
+records `Raise(𝐸)` with `𝐸` the value's type, and decides catching by type
+(`effects::Catch`). Both nodes live from lowering through inlining. `exceptions::eliminate` replaces
+them right after inlining, where each `raise` stands in the tree it escapes through, and no later
+phase meets either.
+
+Inlining keeps every term that may raise. A binding whose definiens may raise stays bound rather
+than being moved to its one use or dropped (`may_raise`), because the exception is raised whether
+the value is read or not.
+
+Elimination writes an expression that may raise as its **outcome**, a value of
+``{`__ok{𝑇} | `__raise𝑖{𝐸𝑖} …}``: `𝑇` is the expression's type, with one arm per exception type that
+can reach the `try` around it, and each exception type takes one tag throughout the program. What
+reads the value matches on the outcome. A statement after one that may raise, and an operand written
+after one, sit in the `` `__ok `` arm, so they run only where nothing before them raised. A `try`
+matches its body's outcome: an exception a clause catches runs that clause, and any other passes on
+to the `try` around it.
+
+- An `if` whose guard may raise splits at that guard,
+  `{𝑔₁ → 𝐴₁; …; true → let 𝑐 = 𝑔ᵢ in {𝑐 → 𝐴ᵢ; …}}`, so the guard is evaluated only where the guards
+  before it failed. `𝑎 and 𝑏` and `𝑎 or 𝑏` with a `𝑏` that may raise are the `if`s they denote.
+- A loop whose body may raise carries the first exception out in a mutable variable of its own,
+  `__loop : Mut(𝑆, 𝐷)` over the loop's positions `𝐷`, with `𝑆` the outcome of a `Unit`. An
+  iteration runs where `__loop` holds `` `__ok ``, and one that raises writes its exception there.
+  `__loop` is an accumulator, so it orders the loop's iterations. A loop that only feeds reaches
+  elimination as `𝑠 ≫ (λ 𝑥 → body)`, since lowering chooses that form before inference says
+  whether a call in the body raises; with a body that may raise it is eliminated as that loop.
+- A comprehension whose elements may raise is the collection of its elements' outcomes, scanned in
+  position order by such a loop. Its value where nothing raised is each outcome's `` `__ok ``
+  payload. A filtered comprehension's outcomes keep the `Cast` that filters it, so a position the
+  filter drops raises nothing.
+- A comprehension whose filter may raise evaluates the filter once per position, into a collection
+  of its outcomes, `__filter`. A second collection reads `__filter` at each position and holds the
+  element where the filter held, as `{ℎ → `__kept(𝑒); true → `__dropped(unit)}`, or raises the
+  filter's exception. That collection is scanned as one whose elements may raise, so its first
+  exception in position order escapes. The value reads each kept element from it, cast to where
+  `__filter` holds, which replaces the filter in every type that carries it.
+  `__filter` is bound as high as its free variables allow, so those types are in its scope. Where
+  one is not, a lambda's type stating the domain in terms of its parameter, the filter's pure form
+  replaces it instead: the filter with each exception read as `false`, which agrees with it
+  wherever nothing raised, and which the cast evaluates a second time.
+- A function an inlined call passes on stands in the tuple of the call's arguments,
+  `(𝑓, 𝑥) ▷ .0`, and is applied where it stands (`ccl_utils::projected_element`).
+- A match on an outcome whose producer ends in an `if` or a `match` with each branch ending in a
+  different constructor moves into those branches, where each constructor selects its arm
+  (`dispatch`). No value then passes through the sum, a collection included.

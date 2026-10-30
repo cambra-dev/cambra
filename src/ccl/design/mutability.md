@@ -946,7 +946,7 @@ position, where the binding stands. `lambda_elim` lifts a `let` out of the lambd
 to a function of the lambda's parameter, so a copy placed in the seed would make the seed read
 `__pos`, which letrec recognition refuses.
 
-The walk inlines four kinds of binding rather than keeping them:
+The walk inlines three kinds of binding rather than keeping them:
 
 - An **opaque** binding (`x ^= 𝑒`), the read segment's snapshot `mut_read` mints. A refined mutable
   variable's contribution predicate names that binder — `{Int | __elem == __anf ^+ 1}` on the value
@@ -954,12 +954,12 @@ The walk inlines four kinds of binding rather than keeping them:
   point-free rebuild turns into a function of the writer parameter, whose codomain then references
   an enclosing function with no binder to open at (`subst::open_codomain`).
 - A value whose **type names a term**, such as that refined contribution, because a binder of that
-  type carries the name out of the value, into the tap type of a feed that reads it.
-- A value that **is a lambda or a cast**: bound at the writer's domain, a comprehension's collection
-  has a type reading the writer's parameter, which `lambda_elim` does not eliminate the parameter
-  from. An aggregate is kept, since its type is its result's.
+  type carries the name out of the value, into the tap type of a feed that reads it. A comprehension
+  whose filter reads the writer's parameter is one.
 - A **literal**: it costs nothing to copy, and a list literal bound to a name reaches op-conversion
   without the `iterate` planning puts before one it meets in place.
+
+Every other binding stays, a collection included, so a body that reads one twice builds it once.
 
 ## Worked example
 

@@ -639,6 +639,19 @@ fn hash_payload<'a>(
                 }
             }
         }
+        // A raise is its value, its one child.
+        N::Raise { .. } => {}
+        // Which types a `try` catches is part of what it denotes, and each clause binds its
+        // exception in its body.
+        N::Try { handlers, .. } => {
+            handlers.len().hash(h);
+            for handler in handlers {
+                if fold == Fold::Whole {
+                    hash_type(&handler.catches, env, wenv, free, h);
+                }
+                hash_binding(&handler.binding, env, wenv, free, fold, h);
+            }
+        }
         N::Transact {
             keys,
             writers,

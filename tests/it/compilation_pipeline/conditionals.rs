@@ -479,6 +479,39 @@ c: Bool = False
     assert_eq!(codomain_ints(&result), vec![3, 4]);
 }
 
+/// A `match` arm that reads nothing of its scrutinee is broadcast whole, and a filtered
+/// collection it binds is iterated there as at the program's top level.
+#[rstest]
+#[case::the_arm_taken(indoc! {"
+    t := 0
+    for i in [1, 2]:
+        t := t + i
+    o = `some(t) if t > 2 else `none
+    y = match o:
+        case `some(v):
+            xs = [x for x in [1, 2, 4] if x > 1]
+            sum(xs)
+        case `none:
+            0
+    y
+"}, 6)]
+#[case::the_other_arm(indoc! {"
+    t := 0
+    for i in [1, 2]:
+        t := t + i
+    o = `some(t) if t > 5 else `none
+    y = match o:
+        case `some(v):
+            xs = [x for x in [1, 2, 4] if x > 1]
+            sum(xs)
+        case `none:
+            0
+    y
+"}, 0)]
+fn a_filtered_collection_bound_in_a_closed_arm(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
 /// A conditional collection whose condition reads the row: each row takes its own arm. Lambda
 /// elimination fans the rows out by the arms' gates, and each leg broadcasts its arm; boxed
 /// arms keep their `box`, since the union's codomain binds a witness per row

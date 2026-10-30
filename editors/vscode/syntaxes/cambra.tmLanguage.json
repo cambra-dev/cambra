@@ -181,7 +181,7 @@
     },
     "keyword-control": {
       "name": "keyword.control.cambra",
-      "match": "\\b(?:if|elif|else|for|in|return|yield|match|case|pass|with)\\b"
+      "match": "\\b(?:if|elif|else|for|in|return|yield|match|case|pass|with|raise|try|except)\\b"
     },
     "keyword-other": {
       "name": "keyword.other.cambra",

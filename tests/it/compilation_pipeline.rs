@@ -24,6 +24,7 @@ mod comprehensions;
 mod conditionals;
 mod constants;
 mod effects;
+mod exceptions;
 mod feeds_cases;
 mod generators_udf_poly;
 mod joins_aggregates_groupby;

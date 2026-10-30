@@ -227,6 +227,17 @@ impl Refusals {
                 self.expr(scrutinee);
                 self.arms(arms);
             }
+            ChlStmt::Raise(value) => self.expr(value),
+            ChlStmt::Try { body, handlers } => {
+                self.stmts(body);
+                for handler in handlers {
+                    self.expr(&handler.ty);
+                    if let Some(binding) = &handler.binding {
+                        self.binders.push((binding.node.clone(), binding.span));
+                    }
+                    self.stmts(&handler.body);
+                }
+            }
             ChlStmt::For { target, iter, body } => {
                 self.target(target);
                 self.expr(iter);

@@ -70,11 +70,16 @@ fn is_causal_builtin(b: &Builtin) -> bool {
 }
 
 /// Whether any binding of the group applies a `get_prev_*` guard, so the group carries
-/// recurrent state. A guard-free group is a channel cluster, which `channelize` emits.
+/// recurrent state. A guard-free group is a channel cluster, which `channelize` emits. A guard
+/// inside a nested `LetRec` is that group's own: a channel fed a value a loop computes holds
+/// the loop's group in its definition and is still a channel cluster.
 pub fn group_has_causal(bindings: &[(TypedBinding, TypedExpr)]) -> bool {
     fn uses_causal(e: &TypedExpr) -> bool {
-        matches!(&e.node, TypedExprNode::Builtin(b) if is_causal_builtin(b))
-            || e.any_child(uses_causal)
+        match &e.node {
+            TypedExprNode::Builtin(b) => is_causal_builtin(b),
+            TypedExprNode::LetRec { body, .. } => uses_causal(body),
+            _ => e.any_child(uses_causal),
+        }
     }
     bindings.iter().any(|(_, def)| uses_causal(def))
 }

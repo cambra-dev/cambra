@@ -81,6 +81,8 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         TypedExprNode::Comprehension { .. } => {
             unreachable!("a Comprehension reached inference; the comprehension phase eliminates it")
         }
+        TypedExprNode::Raise { value } => emit_raise(value, node_id, &recorded_ty, ctx)?,
+        TypedExprNode::Try { body, handlers } => emit_try(body, handlers, node_id, ctx)?,
         // Lowering builds a `Method` only as an application's function, which
         // `emit_apply` resolves before emitting it.
         TypedExprNode::Method { name, .. } => {
@@ -3410,6 +3412,47 @@ fn emit_case_branch<C: Typing>(b: &mut Branch, ctx: &mut C) -> Result<Type, Loca
     // the position that catches that (`bump(x if c else y)`) reads the argument
     // *node*, not its type, precisely because the type is a value.
     emit_value_read(&mut b.body, ctx)
+}
+
+/// Type `raise value` (`docs/chl-spec.md`, "Exceptions"): the value is read, and the
+/// enclosing body raises it at its type. The `raise` itself stands at whatever type its
+/// position expects, so it adds no lower bound to a join ([`Typing::raise_type`]).
+pub(super) fn emit_raise<C: Typing>(
+    value: &mut Expr,
+    site: NodeId,
+    recorded: &Type,
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
+    let raised = emit_value_read(value, ctx)?;
+    ctx.record_raise(site, &raised);
+    Ok(ctx.raise_type(recorded))
+}
+
+/// Type `try: body except 𝑇ᵢ as 𝑒ᵢ: handlerᵢ` (`docs/chl-spec.md`, "Exceptions"): the join of
+/// the body's value and every handler's, as a `Case`'s arms join. Each handler binds its
+/// exception at the type it catches. The body's exceptions reach the enclosing body less
+/// those a clause catches ([`Typing::try_body`]).
+pub(super) fn emit_try<C: Typing>(
+    body: &mut Expr,
+    handlers: &mut [crate::ccl::expr::Handler],
+    node: NodeId,
+    ctx: &mut C,
+) -> Result<Type, LocatedInferError> {
+    for h in handlers.iter_mut() {
+        ctx.type_annotation_predicates(&mut h.catches)?;
+        h.catches = ctx.normalize(&h.catches);
+    }
+    let catches: Vec<Type> = handlers.iter().map(|h| h.catches.clone()).collect();
+    let body_ty = ctx.try_body(node, &catches, |ctx| emit_value_read(body, ctx))?;
+    let result_ty = ctx.fresh();
+    ctx.require_sub(&body_ty, &result_ty, &|| "try body".to_string())?;
+    for h in handlers.iter_mut() {
+        h.binding.ty = h.catches.clone();
+        let (name, ty) = (h.binding.name.clone(), h.binding.ty.clone());
+        let handler_ty = ctx.scoped(&name, &ty, |ctx| emit_value_read(&mut h.body, ctx))?;
+        ctx.require_sub(&handler_ty, &result_ty, &|| "except clause".to_string())?;
+    }
+    Ok(result_ty)
 }
 
 pub(super) fn emit_variant_ctor<C: Typing>(
