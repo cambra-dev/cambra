@@ -197,6 +197,9 @@ pub enum ConstrainError {
         /// known about the other operand: the surviving rows' bases, or the product this
         /// trait has already been answered at ([`Trait::is_structural`]).
         accepted: Vec<Type>,
+        /// The node whose obligation refused it: an operator, or an ordered loop requiring
+        /// `Orderable` of its positions.
+        operator: crate::ccl::provenance::NodeId,
     },
     /// A method call failed once its receiver's type arrived: the type's method is one the
     /// call cannot reach (its binding is not in scope at the call, is still being emitted,
@@ -1688,6 +1691,8 @@ fn constrain_go_impl(
                     // sub-comparison rides along as the inequality's `cause`. A `NotOfKind`
                     // is not an inequality either: it says a domain is not of the kind a
                     // collection annotation demands, which holds whatever it is compared to.
+                    // Nor is a `NoTraitInstance`: an obligation on the domain, such as an
+                    // ordered loop's `Orderable` of its positions, refused what arrived.
                     //
                     // **Between two inferred domains it is a join.** A demand is a domain a
                     // declaration or parameter states; where neither side is one, the two
@@ -1695,9 +1700,9 @@ fn constrain_go_impl(
                     // carried there by invariance, and that is the conflict a join reports.
                     if let Err(err) = decided {
                         return match err {
-                            ConstrainError::SmtError { .. } | ConstrainError::NotOfKind { .. } => {
-                                Err(err)
-                            }
+                            ConstrainError::SmtError { .. }
+                            | ConstrainError::NotOfKind { .. }
+                            | ConstrainError::NoTraitInstance { .. } => Err(err),
                             _ if matches!(&**d0, Type::Infer(_))
                                 && matches!(&**d1, Type::Infer(_))
                                 && let Some(domains) = colliding_domains(&err) =>
@@ -2157,6 +2162,14 @@ fn constrain_go_impl(
             notify_lower(rv, lhs, cache)?;
             match lhs {
                 Type::Infer(lv) => link_watches(lv, rv, cache)?,
+                // A refinement offers what its base does, so the watch follows the edge down to
+                // a refined variable as to a bare one: a map loop's positions are its key
+                // variable refined by membership.
+                Type::Refinement(inner, _) => {
+                    if let Type::Infer(lv) = &**inner {
+                        link_watches(lv, rv, cache)?;
+                    }
+                }
                 // A barrier variable's lowers are not closed against `rv`'s uppers, and
                 // `notify_lower` offers nothing for it, so the watch follows the edge
                 // down as it does for a var-var edge.

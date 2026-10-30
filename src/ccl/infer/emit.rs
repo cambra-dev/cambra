@@ -411,7 +411,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             ty?
         }
 
-        TypedExprNode::For { target, iter, body } => emit_for(target, iter, body, ctx)?,
+        TypedExprNode::For { target, iter, body } => emit_for(node_id, target, iter, body, ctx)?,
 
         // The write target's lookup is Emit-specific, like `Feed`'s: the
         // written value must flow into the mutable variable's binding type.
@@ -2799,6 +2799,7 @@ pub(super) fn emit_mut_decl<C: Typing>(
 /// rule; the unified phase (src/ccl/design/mutability.md) eliminates the
 /// node before anything downstream runs.
 pub(super) fn emit_for<C: Typing>(
+    node: NodeId,
     target: &mut TypedBinding,
     iter: &mut Expr,
     body: &mut Expr,
@@ -2826,7 +2827,35 @@ pub(super) fn emit_for<C: Typing>(
     // A `for` reaching inference as a loop node writes mutable variables declared outside
     // it: one that only feeds lowers to `𝑠 ≫ (λ 𝑥 → body)` (`lower::loops::tagged_for_loop`).
     ctx.note_loop_source(&target.name, None, iter, &position_ty, &target_simple);
-    ctx.scoped(&target.name, &target_simple, |ctx| ctx.subexpr(body))?;
+    // A loop whose iterations interact runs in its source's position order, so the positions
+    // must be orderable (`docs/chl-spec.md`, "Ordered loops").
+    fn declared_in(e: &Expr, out: &mut std::collections::HashSet<Name>) {
+        if let TypedExprNode::MutDecl { binding, .. } = &e.node {
+            out.insert(binding.name.clone());
+        }
+        e.walk_children(|c| declared_in(c, out));
+    }
+    let mut declared = std::collections::HashSet::new();
+    declared_in(body, &mut declared);
+    let (emitted, ordered) = ctx.loop_body(node, &declared, |ctx| {
+        ctx.scoped(&target.name, &target_simple, |ctx| ctx.subexpr(body))
+    });
+    emitted?;
+    if ordered {
+        let required = ctx.require_trait(
+            Trait::orderable(),
+            node,
+            &[&position_ty, &position_ty],
+            None,
+            &|| format!("the positions of the ordered loop over `{iter_label}`"),
+        );
+        if let Err(error) = required {
+            return Err(ctx
+                .unordered_loop(node, iter.node_id(), &position_ty)
+                .unwrap_or(error));
+        }
+        ctx.note_ordered_loop(node, iter.node_id(), &iter_ty, &position_ty);
+    }
     Ok(Type::Base(BaseType::Unit))
 }
 

@@ -219,6 +219,42 @@ fn blame_node_for_place(
 }
 
 /// The node of `expr` whose id is `id`.
+/// `error`, a loop's refusal located at its source, moved to where the source is written:
+/// lowering binds a loop's source to a name the loop walks, and the binding holds the
+/// expression the program wrote.
+fn at_written_source(expr: &Expr, mut error: LocatedInferError) -> LocatedInferError {
+    fn bound_at(e: &Expr, name: &Name) -> Option<crate::ccl::provenance::NodeId> {
+        if let crate::ccl::TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } = &e.node
+            && binding.name == *name
+        {
+            // The source's operands are bound before it, so the expression is the tail.
+            let mut tail: &Expr = bound_expr;
+            while let crate::ccl::TypedExprNode::Let { body, .. } = &tail.node {
+                tail = body;
+            }
+            return Some(tail.node_id());
+        }
+        let mut found = None;
+        e.walk_children(|c| {
+            if found.is_none() {
+                found = bound_at(c, name);
+            }
+        });
+        found
+    }
+    if let Some(crate::ccl::TypedExprNode::Var(name)) =
+        find_node(expr, error.node_id).map(|e| &e.node)
+        && let Some(bound) = bound_at(expr, name)
+    {
+        error.node_id = bound;
+    }
+    error
+}
+
 fn find_node(expr: &Expr, id: crate::ccl::provenance::NodeId) -> Option<&Expr> {
     if expr.node_id() == id {
         return Some(expr);
@@ -388,6 +424,7 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             position,
             found,
             accepted,
+            ..
         } => InferError::NoTraitInstance {
             trait_: trait_.to_string(),
             position,
@@ -850,6 +887,46 @@ pub(crate) fn run_with_params(
             }]);
         }
     }
+    // An ordered loop over a keyed collection requires `Orderable` of its keys, which its
+    // source's type states once resolved.
+    let unordered = sub_ctx.order_keyed_loops();
+    if !unordered.is_empty() {
+        return Err(unordered
+            .into_iter()
+            .map(|e| at_written_source(expr, e))
+            .collect());
+    }
+    // An operand no contribution reached is judged by what it resolves to, which the sweep's
+    // own deposits can determine, so this follows the sweep.
+    {
+        let mut cache = solver::ConstrainCache::new();
+        if let Err((error, node)) =
+            solver::traits::deliver_resolutions(&mut cache, |ty| resolve_var_type(ty).ok())
+        {
+            let failure = cache.take_failure();
+            // A loop's positions are the one operand known to reach here
+            // (`deliver_resolutions`); anything else is named generically.
+            let unordered = match (find_node(expr, node).map(|e| &e.node), &error) {
+                (
+                    Some(crate::ccl::TypedExprNode::For { iter, .. }),
+                    ConstrainError::NoTraitInstance { found, .. },
+                ) => typing::Typing::unordered_loop(&sub_ctx, node, iter.node_id(), found),
+                _ => None,
+            };
+            if let Some(unordered) = unordered {
+                return Err(vec![at_written_source(expr, unordered)]);
+            }
+            let what = match find_node(expr, node).map(|e| &e.node) {
+                Some(crate::ccl::TypedExprNode::For { .. }) => {
+                    "the positions of a loop whose iterations interact, which runs in their order"
+                }
+                _ => "a value a trait requires",
+            };
+            return Err(vec![
+                LocatedInferError::new(map_constrain_err(error, what), node).with_failure(failure),
+            ]);
+        }
+    }
     // Sealed *after* the requirement sweep, not before: the sweep itself narrows, and
     // legitimately so. What must not happen is a later pass narrowing a definition's
     // obligation, which would leave the sweep's verdict stale.
@@ -900,6 +977,7 @@ pub(crate) fn run_with_params(
     debug_assert_no_free_witness(expr, "post-inference");
     // An expression statement, and a `with begin():` block, does something only by what it
     // causes.
+    sub_ctx.check_loop_orders();
     let inert: Vec<LocatedInferError> = sub_ctx
         .does_nothing()
         .into_iter()

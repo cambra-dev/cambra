@@ -1972,9 +1972,8 @@ fn a_collection_per_row_released_as_it_is_read() {
 }
 
 /// A `mut` loop runs its positions in order over a source that delivers them out of order.
-/// A product or a concatenation with a streamed part delivers a later position before an
-/// earlier one: `(1, 0)` before `(0, 1)` when the inner factor streams, `1(0)` before
-/// `0(1)` when the first part does. The drive emits a position only once the source calls
+/// A product with a streamed factor delivers a later position before an earlier one: `(1, 0)`
+/// before `(0, 1)` when the inner factor streams. The drive emits a position only once the source calls
 /// every path before it complete, so each case folds every position, in order.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
@@ -1995,15 +1994,6 @@ fn a_collection_per_row_released_as_it_is_read() {
         n
     "},
     11211222
-)]
-#[case::first_part_streams(
-    indoc::indoc! {r"
-        n := 0
-        for l in source1() ++ [100]:
-            n := n * 1000 + l
-        n
-    "},
-    1002100
 )]
 fn a_mut_loop_runs_in_order_over_positions_that_arrive_out_of_order(
     #[case] code: &str,

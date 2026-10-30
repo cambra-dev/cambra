@@ -345,6 +345,9 @@ pub enum InferError {
     EffectBeyondSignature { item: String },
     /// A commit inside a `with begin():` block's body, directly or through a call.
     NestedTransaction,
+    /// An ordered loop whose source's positions have no order: `why` says what orders the
+    /// loop, and `detail` what its positions are (`docs/chl-spec.md`, "Ordered loops").
+    UnorderedLoop { why: String, detail: String },
     /// A function returning a function that has `item`, which names a variable the
     /// returning function binds.
     EscapesItsVariable { item: String, every: bool },
@@ -933,6 +936,7 @@ impl InferError {
             | InferError::ClauseNamesNoVariable { .. }
             | InferError::EffectBeyondSignature { .. }
             | InferError::NestedTransaction
+            | InferError::UnorderedLoop { .. }
             | InferError::TransactionOutsideBlock
             | InferError::EmptyTransaction
             | InferError::EscapesItsVariable { .. }
@@ -1399,6 +1403,11 @@ impl std::fmt::Debug for InferError {
                 f,
                 "this commits a transaction inside a `with begin():` block's body, directly or \
                  through a call; transactions do not nest"
+            ),
+            InferError::UnorderedLoop { why, detail } => write!(
+                f,
+                "this loop runs in its source's position order, since {why}, but this source has \
+                 {detail}"
             ),
             InferError::EffectBeyondSignature { item } => write!(
                 f,

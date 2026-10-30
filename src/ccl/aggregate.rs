@@ -71,6 +71,9 @@ impl AggregateKind {
             (AggregateKind::Sum, Extent::Base(BaseType::Int)) => Some(Extent::Base(BaseType::Int)),
             (AggregateKind::Max, Extent::Base(b)) => Some(Extent::Base(b.clone())),
             (AggregateKind::Min, Extent::Base(b)) => Some(Extent::Base(b.clone())),
+            // A nominal value's extreme, in the order its declaration writes, which its tag
+            // names (`crate::ccl::nominal::payload_order`).
+            (AggregateKind::Max | AggregateKind::Min, e @ Extent::Union(_)) => Some(e.clone()),
             // A tuple's extreme is lexicographic, seeded by each position's.
             (AggregateKind::Max | AggregateKind::Min, e @ Extent::Record(fields))
                 if fields
@@ -164,6 +167,8 @@ impl AggregateKind {
             // fold in as no-ops (see `accumulate`).
             (AggregateKind::Drain, Extent::Base(BaseType::Unit)) => ColumnValue::Units(1),
             (AggregateKind::Min, Extent::Base(BaseType::String)) => return None,
+            // A nominal value's extreme has none either: its declaration bounds nothing.
+            (AggregateKind::Max | AggregateKind::Min, Extent::Union(_)) => return None,
             _ => panic!("No identity for {self:?} over {accumulator_extent:?}"),
         })
     }
@@ -245,12 +250,13 @@ impl AggregateKind {
                     acc[0] = false;
                 }
             }
-            // A tuple's extreme, lexicographically: the row the batch holds beyond the one
-            // held, if any.
+            // A tuple's extreme, lexicographically, and a nominal value's, in its declaration's
+            // order: the row the batch holds beyond the one held, if any, by the values' own
+            // comparison.
             (
                 kind @ (AggregateKind::Max | AggregateKind::Min),
-                acc @ ColumnValue::Records(_),
-                vs @ ColumnValue::Records(_),
+                acc @ (ColumnValue::Records(_) | ColumnValue::Union(_)),
+                vs @ (ColumnValue::Records(_) | ColumnValue::Union(_)),
             ) => {
                 let beyond = if *kind == AggregateKind::Max {
                     std::cmp::Ordering::Greater
@@ -261,7 +267,7 @@ impl AggregateKind {
                 let mut chosen = None;
                 for i in start..end {
                     let v = vs.index_at(i);
-                    if crate::interpreter::compare_values(&v, &held) == Some(beyond) {
+                    if v.partial_cmp(&held) == Some(beyond) {
                         held = v;
                         chosen = Some(i);
                     }
@@ -319,6 +325,7 @@ impl AggregateKind {
             | (AggregateKind::Min, ColumnValue::Strings(_))
             | (AggregateKind::Min, ColumnValue::Bools(_))
             | (AggregateKind::Max | AggregateKind::Min, ColumnValue::Records(_))
+            | (AggregateKind::Max | AggregateKind::Min, ColumnValue::Union(_))
             | (AggregateKind::Drain, ColumnValue::Units(_)) => accumulator,
             _ => panic!("Invalid accumulate"),
         }

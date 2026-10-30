@@ -51,8 +51,10 @@ impl Componentwise {
                     m1.len() == m2.len() && m2.keys().all(|k| m1.contains_key(k)),
                     "records over one domain have one schema: {a:?} and {b:?}"
                 );
-                let mut names: Vec<SmolStr> = m1.keys().cloned().collect();
-                names.sort();
+                let names: Vec<SmolStr> = crate::interpreter::fields_in_order(m1.keys())
+                    .into_iter()
+                    .cloned()
+                    .collect();
                 let first = names.iter().map(|n| &m1[n]).collect();
                 let second = names.iter().map(|n| &m2[n]).collect();
                 Some((Componentwise::Record(names), first, second))
@@ -322,8 +324,10 @@ impl Predicate {
     /// A [`Record`](Self::Record) componentwise predicate over `fields`, in canonical form: a field
     /// admitting nothing makes the componentwise predicate admit nothing ([`Componentwise`]).
     pub(crate) fn record(fields: HashMap<SmolStr, Predicate>) -> Predicate {
-        let mut names: Vec<SmolStr> = fields.keys().cloned().collect();
-        names.sort();
+        let names: Vec<SmolStr> = crate::interpreter::fields_in_order(fields.keys())
+            .into_iter()
+            .cloned()
+            .collect();
         let mut fields = fields;
         let components = names.iter().map(|n| fields.remove(n).unwrap()).collect();
         Componentwise::Record(names).build(components)
@@ -1095,7 +1099,7 @@ impl Predicate {
     /// construction [`domain_prefix`](super::domain_prefix) takes across levels, taken across
     /// fields.
     pub fn at_or_below(v: Value) -> Predicate {
-        Predicate::up_to(v, true, None)
+        Predicate::up_to(v, true, None, None)
     }
 
     /// [`at_or_below`](Self::at_or_below) over the domain `extent`, which names the tags a
@@ -1107,12 +1111,12 @@ impl Predicate {
     /// since one `rest` covers every unnamed tag alike and cannot tell those before `𝑡` from
     /// those after it. A record key's fields recurse with their own domains.
     pub fn at_or_below_in(v: Value, extent: &Extent) -> Predicate {
-        Predicate::up_to(v, true, Some(extent))
+        Predicate::up_to(v, true, Some(extent), None)
     }
 
     /// [`below`](Self::below) over the domain `extent`.
     pub(crate) fn below_in(v: Value, extent: &Extent) -> Predicate {
-        Predicate::up_to(v, false, Some(extent))
+        Predicate::up_to(v, false, Some(extent), None)
     }
 
     /// Everything ordered strictly below `v`.
@@ -1121,10 +1125,18 @@ impl Predicate {
     /// covered, so it is excluded rather than taken whole. A record is a staircase, as in
     /// [`at_or_below`](Self::at_or_below).
     pub(crate) fn below(v: Value) -> Predicate {
-        Predicate::up_to(v, false, None)
+        Predicate::up_to(v, false, None, None)
     }
 
-    fn up_to(v: Value, inclusive: bool, extent: Option<&Extent>) -> Predicate {
+    /// `order` is the order `v`'s fields compare in, where a declaration states one: a nominal
+    /// value's payload's ([`crate::ccl::nominal::payload_order`]). Without one, a record's
+    /// fields step in [`crate::interpreter::fields_in_order`].
+    fn up_to(
+        v: Value,
+        inclusive: bool,
+        extent: Option<&Extent>,
+        order: Option<&crate::interpreter::ValueOrder>,
+    ) -> Predicate {
         // A prefix of a union domain is the tags ordered before the bound's whole, part of its
         // own, and none after. One `rest` for every unnamed tag cannot spell that, so the
         // domain's tags have to be named, which takes the domain.
@@ -1139,10 +1151,23 @@ impl Predicate {
                 .iter()
                 .filter_map(|(t, e)| match t.cmp(&tag) {
                     Ordering::Less => Some((t.clone(), Predicate::True)),
-                    Ordering::Equal => Some((
-                        t.clone(),
-                        Predicate::up_to((*inner).clone(), inclusive, Some(e)),
-                    )),
+                    Ordering::Equal => {
+                        let payload = match &tag {
+                            FieldKey::Name(label) => label
+                                .decl()
+                                .and_then(|d| crate::ccl::nominal::payload_order(d, label.name())),
+                            FieldKey::Index(_) => None,
+                        };
+                        Some((
+                            t.clone(),
+                            Predicate::up_to(
+                                (*inner).clone(),
+                                inclusive,
+                                Some(e),
+                                payload.as_deref(),
+                            ),
+                        ))
+                    }
                     Ordering::Greater => None,
                 })
                 .collect();
@@ -1162,8 +1187,17 @@ impl Predicate {
             };
             return Predicate::intervals(IntervalSet::new(vec![bound]));
         };
-        let mut names: Vec<&SmolStr> = fields.keys().collect();
-        names.sort();
+        let (names, orders): (Vec<&SmolStr>, Vec<Option<&crate::interpreter::ValueOrder>>) =
+            match order {
+                Some(crate::interpreter::ValueOrder::Fields(ordered)) => {
+                    ordered.iter().map(|(name, o)| (name, Some(o))).unzip()
+                }
+                _ => {
+                    let names = crate::interpreter::fields_in_order(fields.keys());
+                    let orders = vec![None; names.len()];
+                    (names, orders)
+                }
+            };
         // Step `i` agrees with `v` on the fields before `i`, lies below it on field `i`,
         // and admits anything after. The last step's field takes `v`'s own value too where
         // the bound is inclusive, which is what puts `v` itself in the region.
@@ -1185,6 +1219,7 @@ impl Predicate {
                                         Some(Extent::Record(fs)) => fs.get(*name),
                                         _ => None,
                                     },
+                                    orders[j],
                                 ),
                                 Ordering::Greater => Predicate::True,
                             };

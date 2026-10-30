@@ -5736,14 +5736,16 @@ fn a_product_keys_a_collection() {
         .is_empty(),
         "a bare Int key must not reach a pair-keyed map"
     );
-    // A tuple's width is part of its type, so a wider key is not the key type.
+    // A tuple's width is part of its type, so a wider key is not the key type: the lookup's
+    // `Equatable` is answered at the map's key type, which does not take it.
     let errs = infer_program_err(indoc! {r#"
         m = map([((1, 2), 10), ((3, 4), 20)])
         m[(1, 2, 3)]
     "#});
     assert!(
-        errs.iter()
-            .any(|e| format!("{e:?}").contains("tuples of different widths")),
+        errs.iter().any(|e| format!("{e:?}").contains(
+            "operand 2 is (Int@1, Int@2, Int@3), but the only type accepted there is (Int, Int)"
+        )),
         "a 3-tuple key must not reach a pair-keyed map, got {errs:?}"
     );
 }
