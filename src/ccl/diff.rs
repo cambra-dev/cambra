@@ -2433,8 +2433,8 @@ mod tests {
     fn a_deleted_cast_with_a_surviving_predicate_is_not_wholly_deleted() {
         // `diff_children` descends into a cast target's refinement predicate — a
         // comprehension filter or join condition, a term the matcher can match.
-        // The collapse tests must walk that same child set: over the narrower
-        // `all_children` the cast reads as wholly gone while a matched node is
+        // The collapse tests must walk that same child set: over `walk_children`'s
+        // narrower child set the cast reads as wholly gone while a matched node is
         // still live inside it, and `divergences()` then reports `Deleted` over
         // a subtree that survives in part.
         let pred = || {

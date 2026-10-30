@@ -204,11 +204,6 @@ impl TypeInferenceContext {
         self.source_types.insert(name.to_string(), ty);
     }
 
-    /// Look up the CCL type for a registered source by name.
-    pub fn source_type(&self, name: &str) -> Option<Type> {
-        self.source_types.get(name).cloned()
-    }
-
     /// The type of every registered source, by name.
     pub fn source_types(&self) -> &HashMap<String, Type> {
         &self.source_types
