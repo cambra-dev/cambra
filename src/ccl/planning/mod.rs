@@ -126,12 +126,10 @@ pub(crate) use predicates::fn_of_bare_predicate;
 /// ([`groupby::recognize_groupby_sites`], via `groupby::convert_groupby_pointful`)
 /// runs before the materialisation walk.
 ///
-/// The error is an unsupported program: a jagged row realization cannot keep
-/// ([`conditionals::realize_conditional_collections`]), a correlated site whose keys nothing
-/// enumerates, in the tree or in a lifted term (`correlated::pair_correlated_sites`), a
-/// lifted term applying a union at its element ([`refuse_a_union_applied_at_the_input`]), or
-/// a per-group narrowing no filter materializes
-/// ([`per_group_filter::reject_unmaterialized_narrowings`]).
+/// The error is an unsupported program: a correlated site whose keys nothing enumerates, in
+/// the tree or in a lifted term (`correlated::pair_correlated_sites`), a lifted term applying
+/// a union at its element ([`refuse_a_union_applied_at_the_input`]), or a per-group narrowing
+/// no filter materializes ([`per_group_filter::reject_unmaterialized_narrowings`]).
 pub fn run(expr: Expr, instances: &Rc<InstanceTable>) -> Result<Expr, String> {
     // Live cross-endpoint reads are recognized earlier, in
     // `transact_phase::rewrite_as_of_reads` (pre-lambda-elim), so by here every
@@ -298,7 +296,7 @@ fn run_phases(
     for phase in phases {
         match phase {
             PlanningPhase::RealizeConditionals => {
-                conditionals::realize_conditional_collections(&mut term, &mut ctx.witnesses)?;
+                conditionals::realize_conditional_collections(&mut term, &mut ctx.witnesses);
                 if root == Root::Lifted {
                     refuse_a_union_applied_at_the_input(&term)?;
                 }

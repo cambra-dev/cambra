@@ -305,8 +305,7 @@ calls `planning::plan_loops` to recognize causal `LetRec` groups as `Transact` n
 induction loops and transaction groups use this carrier; its domain selects the runtime
 engine during operator conversion. `planning::run` then performs these rewrites in order:
 
-1. Realize collection-valued conditionals and erase determined sum witnesses. A row of a jagged
-   collection read from a mutable variable is refused.
+1. Realize collection-valued conditionals.
 2. Recognize pointful keyed-aggregate sources and rewrite them using `converse`.
 3. Simplify point-free expressions before inserting iteration sources.
 4. Fold closed scalar computations with `const_fold::fold_constants`.
@@ -333,11 +332,11 @@ A collection-valued guard `Case` carries a sum over its possible domains. For a 
 finitely many named candidates, conditional planning restricts each arm by its first-match
 condition and unions the arms. Exactly one arm contributes data. The resulting tagged union
 is an executable representation of the selected collection; it is introduced after type
-inference because its type differs from the source sum. A determined witness with one
-candidate is erased from the term and its types. Every other witness is materialized: its `box`
-stays standing, the value carries its own keys, and operator conversion bounds the domain from
-the witness's kind. A `for` loop over a sum is refused by name, since its history would name the
-witness outside its binder. See
+inference because its type differs from the source sum. Every other witness is materialized: its
+`box` stays standing, the value carries its own keys, and operator conversion bounds the domain
+from the witness's kind. `box` is the identity at runtime, so a sum over one candidate compiles to
+the operators its collection does. A `for` loop over a sum is refused by name, since its history
+would name the witness outside its binder. See
 [collections.md](collections.md#compiling-a-conditional-collection).
 
 ### Loop recognition
@@ -469,9 +468,9 @@ the phases off `lifted_during`. The walk does not treat a lifted term's root as 
 a consumer applies the term per element. A hash join plans its keys and residual predicates once
 the join is built: the join typechecks each piece as it builds it, against neighbours that state
 their predicates bare, and a planned term states its own compiled. It plans them against a copy of
-the witness decisions, kept only if the join is. Realization records what it decided about each
-witness once for the whole program (`Witnesses`), because a lifted term names the witnesses of the
-tree it came from.
+the witness decisions, kept only if the join is. Realization records which witnesses it realized
+once for the whole program (`Witnesses`), because a lifted term names the witnesses of the tree it
+came from.
 
 Every lift point-frees its term through `eliminate_lifted`, which states which of the passes
 between inference and planning skip a predicate and runs those on the term. Channelize is the one
