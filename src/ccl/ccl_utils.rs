@@ -765,6 +765,7 @@ fn reduce_application(
                     ty: Type::Hole,
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
+                    site: None,
                 };
                 Some(
                     Expr::throwaway(TypedExprNode::Lambda {
@@ -797,6 +798,7 @@ fn reduce_application(
                     ty: Type::Hole,
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
+                    site: None,
                 };
                 Some(
                     Expr::throwaway(TypedExprNode::Lambda {

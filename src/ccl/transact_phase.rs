@@ -2689,6 +2689,9 @@ struct MutVarDecl {
     /// and written at a third is the case where reading the seed rejects the program
     /// (`src/ccl/expr.rs`, [`TypedExprNode::MutDecl`]).
     value_ty: Type,
+    /// Where the key is declared, which names its store (`src/ccl/design/sites.md`,
+    /// "Stores").
+    site: Option<std::rc::Rc<crate::ccl::site::Site>>,
 }
 
 /// Locate each mutable variable key's `let` binding and record it (keeping the outermost
@@ -2718,6 +2721,7 @@ fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, MutVarD
                 decl: expr.node_id(),
                 init: (**init).clone(),
                 value_ty: mut_var_value_ty(&binding.ty),
+                site: binding.site.clone(),
             },
         );
     }
@@ -3202,7 +3206,13 @@ fn plan_store(
         );
         let mut lam = Expr::lambda(t, Type::Txn, gpt);
         lam.ty = history_ty(&v);
-        hist_bindings.push((binding(hist_k, history_ty(&v)), lam));
+        hist_bindings.push((
+            TypedBinding {
+                site: key_init[k].site.clone(),
+                ..binding(hist_k, history_ty(&v))
+            },
+            lam,
+        ));
     }
 
     // History bindings first, then commit records, then tap views — order is

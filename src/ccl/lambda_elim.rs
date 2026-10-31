@@ -2100,6 +2100,7 @@ fn elim_lambda_impl(
                         ty: def.ty.clone(),
                         user_annotation: b.user_annotation.clone(),
                         transparency: b.transparency,
+                        site: b.site.clone(),
                     };
                     (binding, def)
                 })
@@ -2572,6 +2573,7 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
         node,
         ty,
         user_annotation,
+        site,
         ..
     } = expr;
     // The node's own function type, read in every build: the `Lambda` arm carries its
@@ -2897,6 +2899,8 @@ fn elim_lambdas_impl(ctx: &mut ElimContext, expr: Expr) -> Result<Expr, LambdaEl
             // A preserve would add the id correspondence on top.
             let mut expr = Expr::new(node).with_ty(ty);
             expr.user_annotation = user_annotation;
+            // A site rides the node it names, as a `@LoadFrom`'s does.
+            expr.site = site;
             expr.try_map_children(|child| elim_lambdas(ctx, child))?;
             Ok(expr)
         }
@@ -3536,6 +3540,7 @@ mod tests {
                     ty: binder_ty,
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
+                    site: None,
                 },
                 empty_payload: false,
             }),

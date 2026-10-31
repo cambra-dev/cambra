@@ -125,6 +125,7 @@ fn for_over(iter_var: String, source: Expr, block: Expr) -> Expr {
             ty: Type::Hole,
             user_annotation: None,
             transparency: BindingTransparency::Transparent,
+            site: None,
         },
         iter: Box::new(source),
         body: Box::new(block),

@@ -11,8 +11,9 @@ A place (`chl_parser::places::Place`) is a feed, a `yield` or a named call as wr
 
 - the path of the module whose source holds it, empty for the root;
 - the bindings the author wrote around it, outermost first;
-- its kind (`Feed`, `Yield`, `Call`) and its spelling: a feed's target, `yield`, or the callee's
-  name (`f`, `m::f`, a method's name, a called field's name);
+- its kind (`Feed`, `Yield`, `Call`, `For`, `Assign`) and its spelling: a feed's target, `yield`,
+  the callee's name (`f`, `m::f`, a method's name, a called field's name), a loop's target, or an
+  assigned variable's name ([Stores](#stores));
 - its index among the places that share all of the above, counted in source order.
 
 The bindings that enclose a place are the names an assignment to a single name binds (`x = …`,
@@ -21,10 +22,9 @@ The bindings that enclose a place are the names an assignment to a single name b
 
 `chl_parser::places::places` is the one numbering. It walks a module's syntax once, in source order,
 and answers each place by a span: a feed's target's, a `yield`'s own, a call's callee's, a method
-call's method name's, a field callee's field name's. Lowering numbers each module as it starts it
-(`Naming::add_module`) and looks each feed's and each named call's place up by that span
-(`Naming::site`). A feed or a named call with no place there is a lowering bug, and the lookup
-panics.
+call's method name's, a field callee's field name's, a loop's or an assignment's target's. Lowering
+numbers each module as it starts it (`Naming::add_module`) and looks each place up by that span
+(`Naming::site`). A node with no place there is a lowering bug, and the lookup panics.
 
 ## Sites
 
@@ -86,6 +86,24 @@ is renamed. A call of another function, a feed of another target, or a change to
 definition moves nothing.
 
 A run's path names the runs from the root to it, so renaming a run moves the sites under it.
+
+## Stores
+
+A mutable variable's store is named by a site: an induction store by its loop's, a transactional
+store by its declaration's. A loop is a place spelled by its target, `for i`, and an assignment
+`x := v`, or a declaration `@LoadFrom` seeds, is a place spelled by its variable, `x:=`. Lowering
+gives the loop's target binding and the declaring binding their sites, as
+`TypedBinding::site`, and inlining and linking extend them as they extend a node's. Mutability
+elimination gives a loop's history binding its target's site, and the transaction phase gives each
+key's history binding its declaration's. Planning copies them onto each `TransactKey`.
+
+A store's identity across versions, `VarPath`, is the scope its site stands in, the variable's
+spelling, and the store's position among the stores sharing both
+(`src/ccl/design/program-evolution.md`, "Inherit and load"). The scope is the run, each call that
+reached the site with the bindings around it, and the bindings around the site's own place
+(`scope_segments`). The loop is not part of it, so a variable moved to another loop in the same
+scope keeps its store. A store the compiler introduces, an exception scan's, has no place in the
+source; its scope is the author-written bindings around it.
 
 ## The reference interpreter
 

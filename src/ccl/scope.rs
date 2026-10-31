@@ -822,6 +822,7 @@ mod tests {
             keys: vec![crate::ccl::TransactKey {
                 name: Name::raw("k"),
                 init: int(0),
+                site: None,
             }],
             writers: vec![WriterSite {
                 read_keys: vec![Name::raw("k")],
