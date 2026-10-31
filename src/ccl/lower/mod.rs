@@ -359,6 +359,8 @@ pub struct LoweredRoute {
 /// register each entry with the appropriate downstream contexts.
 #[derive(Default)]
 pub struct LoweringContext {
+    /// Names each feed's and each call's place ([`crate::ccl::site`]).
+    pub(crate) sites: crate::ccl::site::Naming,
     /// All sources for this compilation: pre-registered (e.g. stdin, test sources)
     /// plus any discovered during lowering (e.g. from `http_serve`).  Drained by
     /// [`take_sources`](Self::take_sources) after `lower_stmts` returns so every
@@ -1656,6 +1658,7 @@ pub fn lower_stmts(module: &ChlModule, ctx: &mut LoweringContext) -> LoweringRes
 /// unread. [`lower_stmts`] finishes a program of one module; a program of
 /// several finishes once its runs are in place (`modules`).
 pub(super) fn lower_root(module: &ChlModule, ctx: &mut LoweringContext) -> LoweringResult {
+    ctx.sites.add_module(&[], &module.body);
     lower_module(module, ctx, Lowered::Root)
 }
 

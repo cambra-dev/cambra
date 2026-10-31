@@ -26,6 +26,7 @@ pub mod lexer;
 pub mod line_index;
 pub mod module_path;
 pub mod parser;
+pub mod places;
 pub mod source_map;
 
 pub use ast::{Expr, Module, Stmt};

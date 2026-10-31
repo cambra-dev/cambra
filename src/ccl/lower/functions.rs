@@ -79,6 +79,7 @@ fn feeds_name(body: &Expr, name: &Name) -> bool {
         TypedExprNode::Feed {
             name: target,
             value,
+            ..
         }
         | TypedExprNode::Define {
             name: target,

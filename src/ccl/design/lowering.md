@@ -183,14 +183,14 @@ loops, so channelization handles them like feeds from other expressions. It elim
 
 For each cluster of consecutive defer bindings, channelization extracts its feeds or define from the
 cluster body and builds a channel expression for each handle. Multiple feeds combine with `Copair`
-(`++`), whose contributions occupy distinct index sets. Feeds inside iteration retain their
-iteration context. An extracted feed takes a copy of each binding it reads in the scope it leaves: a
-`let`, or a channel group, which is what a feed declared beneath the extracted one, as in a loop
-body, has become by then. A recurrence group is not copied. A multi-arm feeding `Case` inside a loop
-produces a refined-source channel for each feeding arm. A guarded feeding `Case` outside iteration
-can use a one-shot lift; a scrutinee-pattern feeding `Case` there is rejected. The cluster becomes a
-mutually scoped `Feed`-kind `LetRec`. Recognition later orders an acyclic group as `Let` bindings;
-an unguarded cycle between channels is rejected.
+(`++`), each contribution under its feed's site's tag ([sites.md](sites.md#channel-tags)). Feeds
+inside iteration retain their iteration context. An extracted feed takes a copy of each binding it
+reads in the scope it leaves: a `let`, or a channel group, which is what a feed declared beneath the
+extracted one, as in a loop body, has become by then. A recurrence group is not copied. A multi-arm
+feeding `Case` inside a loop produces a refined-source channel for each feeding arm. A guarded
+feeding `Case` outside iteration can use a one-shot lift; a scrutinee-pattern feeding `Case` there
+is rejected. The cluster becomes a mutually scoped `Feed`-kind `LetRec`. Recognition later orders an
+acyclic group as `Let` bindings; an unguarded cycle between channels is rejected.
 
 `channelize` also lifts defer-returning bindings and substitutes aliases that carry defer handles.
 It drops the `ExprStmt` nodes after their feed contributions have been extracted. The

@@ -312,7 +312,7 @@ impl Uniquifier {
 
             // The target name is a use of the defer-handle binder
             // (Feed/Define) or of the mutable variable's `let` (MutWrite).
-            TypedExprNode::Feed { name, value } | TypedExprNode::Define { name, value } => {
+            TypedExprNode::Feed { name, value, .. } | TypedExprNode::Define { name, value } => {
                 if let Some(m) = self.resolve(name) {
                     *name = m;
                 }

@@ -1197,9 +1197,13 @@ impl Subst {
             // the stale handle is kept for channelize's own
             // `UnboundDeferHandle` boundary to report (feeding a lambda
             // parameter is user-reachable: `\d, v -> d << v`).
-            Feed { name, value } => {
+            Feed { name, value, site } => {
                 let (name, value) = self.apply_handle_use(name, value);
-                Feed { name, value }
+                Feed {
+                    name,
+                    value,
+                    site: site.clone(),
+                }
             }
             Define { name, value } => {
                 let (name, value) = self.apply_handle_use(name, value);
@@ -4107,7 +4111,7 @@ mod rewrite_tests {
     fn rewrite_renames_feed_handles() {
         let mut e = TypedExpr::feed("d", var("d"));
         Subst::rename("d", "q").rewrite_expr(&mut e);
-        let TypedExprNode::Feed { name, value } = &e.node else {
+        let TypedExprNode::Feed { name, value, .. } = &e.node else {
             panic!("feed preserved");
         };
         assert_eq!(name, &Name::raw("q"));
@@ -4219,6 +4223,7 @@ mod rewrite_tests {
             TypedExpr::new(TypedExprNode::Feed {
                 name: Name::raw("h"),
                 value: Box::new(int(1)),
+                site: None,
             }),
             TypedExpr::new(TypedExprNode::Define {
                 name: Name::raw("h"),

@@ -1418,8 +1418,9 @@ refinements, history handles, and annotation forms.
 
 `Type::Variant(Vec<(FieldKey, Type)>, Openness)` represents tagged variants during inference and
 in the typed AST. Named tags use `FieldKey::Name`; positional tags use `FieldKey::Index`.
-A positional annotation `𝐴 | 𝐵` has tags 0 and 1. `Copair`, including lowered `++`, constructs
-positional variants. This representation is distinct from
+A positional annotation `𝐴 | 𝐵` has tags 0 and 1. A lowered `++` constructs positional
+variants. A channel fed from several sites constructs one tagged by its sites
+([sites.md](sites.md#channel-tags)). This representation is distinct from
 [dependent sums](#47-dependent-sums), which quantify witnesses rather than select variant tags.
 
 `constrain_go` checks every producer tag against the consumer:

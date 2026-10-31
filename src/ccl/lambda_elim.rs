@@ -2051,6 +2051,7 @@ fn elim_lambda_impl(
                 },
                 user_annotation: None,
                 node_id: body_id,
+                site: None,
             };
             elim_lambda_kinded(ctx, param, param_ty, as_let, fun_kind)
         }

@@ -107,20 +107,20 @@ r#"x: Feed(_)
 x << 1
 x << 2
 x"#,
-    Tile::data_function(ColumnValue::positional_union(&[0, 1], vec![
+    Tile::data_function(channel_union(&["x<<", "x<<#1"], &[0, 1], vec![
                 ColumnValue::Units(1),
                 ColumnValue::Units(1),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2]))), channel_predicate(&["x<<", "x<<#1"]), BitSet::new()))]
 #[case::scalar_and_loop_feeds(
 r#"x: Feed(_)
 x << 1
 for i in [1, 2, 3]:
     x << i
 x"#,
-    Tile::data_function(ColumnValue::positional_union(&[0, 1, 1, 1], vec![
+    Tile::data_function(channel_union(&["x<<", "x<<#1"], &[0, 1, 1, 1], vec![
                 ColumnValue::Units(1),
                 ColumnValue::UInts(vec![0, 1, 2])
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1, 2, 3]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1, 2, 3]))), channel_predicate(&["x<<", "x<<#1"]), BitSet::new()))]
 // Three feed sites: locks down N-ary union construction beyond N=2.
 #[case::three_feeds(
 r#"x: Feed(_)
@@ -128,21 +128,21 @@ x << 1
 x << 2
 x << 3
 x"#,
-    Tile::data_function(ColumnValue::positional_union(&[0, 1, 2], vec![
+    Tile::data_function(channel_union(&["x<<", "x<<#1", "x<<#2"], &[0, 1, 2], vec![
                 ColumnValue::Units(1),
                 ColumnValue::Units(1),
                 ColumnValue::Units(1),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new()))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3]))), channel_predicate(&["x<<", "x<<#1", "x<<#2"]), BitSet::new()))]
 // Identical feed values still produce distinct variant tags.
 #[case::identical_feeds(
 r#"x: Feed(_)
 x << 1
 x << 1
 x"#,
-    Tile::data_function(ColumnValue::positional_union(&[0, 1], vec![
+    Tile::data_function(channel_union(&["x<<", "x<<#1"], &[0, 1], vec![
                 ColumnValue::Units(1),
                 ColumnValue::Units(1),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 1]))), channel_predicate(&["x<<", "x<<#1"]), BitSet::new()))]
 #[case::feed_via_alias(
 r#"
 x: Feed(_)
@@ -192,10 +192,10 @@ def f(n):
 y = f(10)
 for i in [1,2,3]:
   y << i
-y"#, Tile::data_function(ColumnValue::positional_union(&[0, 1, 1, 1], vec![
+y"#, Tile::data_function(channel_union(&["y.f()/f.x<<", "y<<"], &[0, 1, 1, 1], vec![
                 ColumnValue::Units(1),
                 ColumnValue::UInts(vec![0, 1, 2])
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 1, 2, 3]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new()))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 1, 2, 3]))), channel_predicate(&["y.f()/f.x<<", "y<<"]), BitSet::new()))]
 #[case::multiple_func_feeds(
 r#"
 def f(n):
@@ -208,11 +208,11 @@ def g(c):
 y = g(f(10))
 for i in [1,2,3]:
   y << i
-y"#, Tile::data_function(ColumnValue::positional_union(&[0, 1, 2, 2, 2], vec![
+y"#, Tile::data_function(channel_union(&["y.f()/f.x<<", "y.g()/g.c<<", "y<<"], &[0, 1, 2, 2, 2], vec![
                 ColumnValue::Units(1),
                 ColumnValue::Units(1),
                 ColumnValue::UInts(vec![0, 1, 2])
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 100, 1, 2, 3]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new()))]
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 100, 1, 2, 3]))), channel_predicate(&["y.f()/f.x<<", "y.g()/g.c<<", "y<<"]), BitSet::new()))]
 #[case::union_of_complex_defers(
 r#"
 def f(n):
@@ -226,27 +226,19 @@ y = g(f(10))
 for i in [1,2,3]:
   y << i
 y ++ y"#, Tile::data_function(ColumnValue::positional_union(&[0, 0, 0, 0, 0, 1, 1, 1, 1, 1], vec![
-                ColumnValue::positional_union(&[0, 1, 2, 2, 2], vec![
+                channel_union(&["y.f()/f.x<<", "y.g()/g.c<<", "y<<"], &[0, 1, 2, 2, 2], vec![
                         ColumnValue::Units(1),
                         ColumnValue::Units(1),
                         ColumnValue::UInts(vec![0, 1, 2]),
                     ]),
-                ColumnValue::positional_union(&[0, 1, 2, 2, 2], vec![
+                channel_union(&["y.f()/f.x<<", "y.g()/g.c<<", "y<<"], &[0, 1, 2, 2, 2], vec![
                         ColumnValue::Units(1),
                         ColumnValue::Units(1),
                         ColumnValue::UInts(vec![0, 1, 2]),
                     ]),
             ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 100, 1, 2, 3, 10, 100, 1, 2, 3]))), Predicate::over_every_tag(TagMap::from_positional(vec![
-            Predicate::over_every_tag(TagMap::from_positional(vec![
-                Predicate::True,
-                Predicate::True,
-                Predicate::True,
-            ])),
-            Predicate::over_every_tag(TagMap::from_positional(vec![
-                Predicate::True,
-                Predicate::True,
-                Predicate::True,
-            ])),
+            channel_predicate(&["y.f()/f.x<<", "y.g()/g.c<<", "y<<"]),
+            channel_predicate(&["y.f()/f.x<<", "y.g()/g.c<<", "y<<"]),
         ])), BitSet::new()))]
 // A feed, a rebind, a second feed: an interleaved body with no accumulator, which
 // only the one grammar admits. `x = i` and `x = x + i` are per-iteration immutable
@@ -260,10 +252,10 @@ for i in [1, 2, 3]:
     x = x + i
     o << x * 10
 o"#,
-    Tile::data_function(ColumnValue::positional_union(&[0, 0, 0, 1, 1, 1], vec![
+    Tile::data_function(channel_union(&["o<<", "o<<#1"], &[0, 0, 0, 1, 1, 1], vec![
                 ColumnValue::UInts(vec![0, 1, 2]),
                 ColumnValue::UInts(vec![0, 1, 2]),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 20, 40, 60]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new())
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 20, 40, 60]))), channel_predicate(&["o<<", "o<<#1"]), BitSet::new())
 )]
 // Pass-by-reference writer that *feeds before it writes*: `o << c` precedes
 // `c += 1` in the writer body, inlined per iteration. The Feed-headed spliced
@@ -330,15 +322,13 @@ d"#;
     check_tile(
         code,
         Tile::data_function(
-            ColumnValue::positional_union(
+            channel_union(
+                &["d<<", "d<<#1"],
                 &[0, 1],
                 vec![ColumnValue::UInts(vec![0]), ColumnValue::UInts(vec![1])],
             ),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 40]))),
-            Predicate::over_every_tag(TagMap::from_positional(vec![
-                Predicate::True,
-                Predicate::True,
-            ])),
+            channel_predicate(&["d<<", "d<<#1"]),
             BitSet::new(),
         ),
     );
@@ -363,7 +353,8 @@ o"#;
     check_tile(
         code,
         Tile::data_function(
-            ColumnValue::positional_union(
+            channel_union(
+                &["o<<", "o<<#1"],
                 &[0, 0, 1, 1],
                 vec![
                     ColumnValue::UInts(vec![0, 1]),
@@ -371,10 +362,7 @@ o"#;
                 ],
             ),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 100, 100]))),
-            Predicate::over_every_tag(TagMap::from_positional(vec![
-                Predicate::True,
-                Predicate::True,
-            ])),
+            channel_predicate(&["o<<", "o<<#1"]),
             BitSet::new(),
         ),
     );
@@ -1549,7 +1537,7 @@ fn a_feed_crossing_a_generic_let() {
         out << y
     f(1)
     f(2)
-"#}, "[`0(()) -> 1, `1(()) -> 2]")]
+"#}, "[`f()#1/f.out<<(()) -> 2, `f()/f.out<<(()) -> 1]")]
 #[case::called_once_and_from_a_loop(indoc! {r#"
     out = test_sink()
     def f(y):
@@ -1558,7 +1546,7 @@ fn a_feed_crossing_a_generic_let() {
     f(0)
     for r in [1, 2]:
         f(r)
-"#}, "[`0(()) -> 0, `1(()) -> 0, `2(0) -> 1, `2(1) -> 2]")]
+"#}, "[`f()#1/f.out<<(0) -> 1, `f()#1/f.out<<(1) -> 2, `f()/f.out<<(()) -> 0, `out<<(()) -> 0]")]
 #[case::called_through_another_def(indoc! {r#"
     out = test_sink()
     def f(y):
@@ -1567,7 +1555,31 @@ fn a_feed_crossing_a_generic_let() {
         f(z)
         f(z + 10)
     g(1)
-"#}, "[`0(()) -> 1, `1(()) -> 11]")]
+"#}, "[`g()/g.f()#1/f.out<<(()) -> 11, `g()/g.f()/f.out<<(()) -> 1]")]
+// A function a field holds is called at the field's place, by the record's name or through a
+// parameter the record is passed as.
+#[case::a_field_called_twice(indoc! {r#"
+    out = test_sink()
+    r = (f=\y -> out << y)
+    (r.f)(1)
+    (r.f)(2)
+"#}, "[`f()#1/r.out<<(()) -> 2, `f()/r.out<<(()) -> 1]")]
+#[case::a_field_of_a_parameter_called_twice(indoc! {r#"
+    out = test_sink()
+    def call(r):
+        (r.f)(1)
+        (r.f)(2)
+    call((f=\y -> out << y))
+"#}, "[`call()/call.f()#1/out<<(()) -> 2, `call()/call.f()/out<<(()) -> 1]")]
+// A function another call returns is reached through that call too.
+#[case::a_returned_function_called_twice(indoc! {r#"
+    out = test_sink()
+    def mk(n):
+        \y -> out << y + n
+    h = mk(1)
+    h(5)
+    h(6)
+"#}, "[`h()#1/h.mk()/mk.out<<(()) -> 7, `h()/h.mk()/mk.out<<(()) -> 6]")]
 fn a_def_feeding_a_handle_declared_outside_it(#[case] source: &str, #[case] expected: &str) {
     check_sink(source, expected);
 }
