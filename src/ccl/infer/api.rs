@@ -2391,8 +2391,7 @@ pub(crate) fn typecheck_planned(
     instances: &Rc<InstanceTable>,
 ) -> Result<(), Vec<InferError>> {
     check_annotated(expr, Strictness::Planned).map_err(unlocated)?;
-    crate::ccl::infer::check::check_located_against(expr, Some(sources), instances)
-        .map_err(unlocated)
+    crate::ccl::infer::check::check_planned_located(expr, sources, instances).map_err(unlocated)
 }
 
 /// [`typecheck`] against the types of the registered data sources ([`typecheck_planned`]

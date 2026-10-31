@@ -273,12 +273,26 @@ fn as_of_join(expr: &Expr) -> Option<Expr> {
     if reads.is_empty() {
         return None;
     }
-    // The chain body must be `trigger ≫ (λ r → e)`.
-    let TypedExprNode::Compose(celts) = &cur.node else {
-        return None;
-    };
-    let [trigger, lam] = celts.as_slice() else {
-        return None;
+    // The chain body must be a loop over the trigger, `trigger ≫ (λ r → e)` or the same loop
+    // at its position, `λ 𝑝 → (𝑝 ▷ trigger) ▷ (λ r → e)`.
+    let (trigger, param, lam_body) = match &cur.node {
+        TypedExprNode::Compose(celts) => {
+            let [trigger, lam] = celts.as_slice() else {
+                return None;
+            };
+            let TypedExprNode::Lambda {
+                param,
+                body: lam_body,
+            } = &lam.node
+            else {
+                return None;
+            };
+            (trigger, param, &**lam_body)
+        }
+        _ => {
+            let parts = crate::ccl::ccl_utils::loop_parts(cur)?;
+            (parts.source, parts.element, parts.body)
+        }
     };
     // Every fed-out read of a `Txn` mutable variable is an **as-of read at an arbitrary
     // position** — the mutable variable's value as of wherever the reading transaction lands
@@ -288,13 +302,6 @@ fn as_of_join(expr: &Expr) -> Option<Expr> {
     // standalone-vs-loop classification here; all such reads fold to `AsOf`. A
     // program that wants the *completed* value asks for it by name (`await_final`),
     // whose read is a different term — see this function's docs.
-    let TypedExprNode::Lambda {
-        param,
-        body: lam_body,
-    } = &lam.node
-    else {
-        return None;
-    };
     let used: Vec<&BoundRead> = reads
         .iter()
         .filter(|r| is_free_in_value(&r.name, lam_body))
@@ -1013,7 +1020,13 @@ fn fold_cross_domain_loops(expr: Expr, cross_reads: &HashSet<Name>, out: &mut Cr
             unreachable!("guarded above")
         };
         let effect_id = effect.node_id();
-        let TypedExprNode::For { target, iter, body } = effect.node else {
+        let TypedExprNode::For {
+            position,
+            target,
+            iter,
+            body,
+        } = effect.node
+        else {
             unreachable!("guarded above")
         };
         // The recording names the statement: everything the fold builds stands in for it,
@@ -1031,7 +1044,7 @@ fn fold_cross_domain_loops(expr: Expr, cross_reads: &HashSet<Name>, out: &mut Cr
         // this loop's accumulators, so their `Mut(V, D)`s give each one the value
         // type inference joined for it.
         let value_tys = mut_var_value_tys([&*body, &*cont]);
-        let fold = fold_induction_loop(&target, &iter, *body, &value_tys);
+        let fold = fold_induction_loop(&position, &target, &iter, *body, &value_tys);
         for (i, acc) in fold.accs.iter().enumerate() {
             if cross_reads.contains(&acc.name) {
                 let final_var = fold
@@ -1247,7 +1260,13 @@ fn strip(
             user_annotation,
             node_id,
         } = expr;
-        let TypedExprNode::For { target, iter, body } = node else {
+        let TypedExprNode::For {
+            position,
+            target,
+            iter,
+            body,
+        } = node
+        else {
             unreachable!("guarded above")
         };
         let source = strip(*iter, txn_mut_vars, enclosing, out);
@@ -1265,6 +1284,7 @@ fn strip(
         );
         return Expr {
             node: TypedExprNode::For {
+                position,
                 target,
                 iter: Box::new(source),
                 body: Box::new(body),
@@ -3838,6 +3858,7 @@ mod tests {
         for_body.ty = Type::Base(BaseType::Unit);
 
         let mut for_node = Expr::new(TypedExprNode::For {
+            position: Box::new(TypedBinding::new_unannotated(Name::fresh("pos"))),
             target: binding(r, int.clone()),
             iter: Box::new(list),
             body: Box::new(for_body),

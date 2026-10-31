@@ -40,14 +40,13 @@
 //! rather than exposing it, so no substitution crosses into a scope that rebinds the
 //! name.
 //!
-//! **Anything inside a definition the body's type discharges.** The post-planning wall
-//! compares recorded and reconstructed types with their refinements rather than by base, and
-//! a `Let` whose binder is free in its body's type has that binder discharged into the
-//! recorded type (`close_let_type` in `src/ccl/infer/check.rs`). The wall re-runs the
-//! discharge over whatever `bound_expr` holds by then, so folding the definition puts
-//! `{Int | __elem == 4}` against `{Int | __elem == 1 ^+ 3}` — one value, two spellings,
-//! compared structurally (`a_discharged_definition_survives_planning`). A definition no type
-//! records still folds, which is every case this pass exists for.
+//! **Anything inside a definition the body's type reads.** The post-planning wall relates a
+//! node's refinements to its neighbours' assuming each binder equal to its definition
+//! (`src/ccl/design/type-inference.md`, "The scope a query runs in"). A type reading `y`
+//! whose definition is `x + 1` meets a type reading `x + 1` through that assumption, and
+//! folding the definitions to literals leaves predicates the structural comparison does not
+//! relate (`a_binder_is_assumed_equal_to_its_definition`). A definition no type reads still
+//! folds, which is every case this pass exists for.
 //!
 //! The whole subtree is skipped and not just the definition's own node, so a collection
 //! literal under such a definition keeps its unevaluated elements — and a downstream `^+`,
@@ -125,12 +124,9 @@ fn fold(expr: &mut Expr, consts: &mut Consts) {
         // CCL's `let` is non-recursive: the binding scopes over `body` and not over
         // `bound_expr` (`scope::for_each_scoped_item` states every such rule). The bound
         // expression therefore folds in the enclosing environment.
-        // **A definition the body's type discharges does not fold.** Where the binder is
-        // free in the body's type, the recorded type of this `Let` was closed over the
-        // definition as it stands (`close_let_type` in `src/ccl/infer/check.rs`), and the
-        // post-planning wall re-runs that discharge over whatever `bound_expr` is by
-        // then. Folding it would put two spellings of one value either side of a
-        // structural comparison.
+        // **A definition the body's type reads does not fold.** The post-planning wall
+        // relates the types reading the binder through the definition as it stands, and a
+        // folded definition no longer relates them (see the module docs).
         let discharged = crate::ccl::subst::type_free_vars(&body.ty).contains(&binding.name);
         let lit = if discharged {
             None

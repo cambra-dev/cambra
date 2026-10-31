@@ -705,11 +705,17 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
         // directly under `ExprStmt`, goes through `atomize_stmt_effect`
         // instead, which threads `iter`'s hoisted bindings past the
         // `ExprStmt` rather than sealing them here. See the module docs.
-        TypedExprNode::For { target, iter, body } => {
+        TypedExprNode::For {
+            position,
+            target,
+            iter,
+            body,
+        } => {
             let (binds, iter) = atomize(*iter, muts);
             let_chain(
                 binds,
                 rebuild(TypedExprNode::For {
+                    position,
                     target,
                     iter: Box::new(iter),
                     body: Box::new(normalize(*body, muts)),
@@ -753,7 +759,7 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             )
         }
 
-        TypedExprNode::Realize { .. }
+        TypedExprNode::Realize(_)
         | TypedExprNode::LetRec { .. }
         | TypedExprNode::Transact { .. }
         | TypedExprNode::DisjointJoin(_) => unreachable!(
@@ -1002,11 +1008,17 @@ fn atomize_stmt_effect(expr: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, E
                 }),
             )
         }
-        TypedExprNode::For { target, iter, body } => {
+        TypedExprNode::For {
+            position,
+            target,
+            iter,
+            body,
+        } => {
             let (binds, iter) = atomize(*iter, muts);
             (
                 binds,
                 rebuild(TypedExprNode::For {
+                    position,
                     target,
                     iter: Box::new(iter),
                     body: Box::new(normalize(*body, muts)),

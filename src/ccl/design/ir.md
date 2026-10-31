@@ -89,7 +89,7 @@ are:
 | `Lambda` | `param` binds in `body`. |
 | `Let`, `MutDecl` | `binding` binds in `body`; `bound_expr` or `init` is outside its scope. |
 | `LetRec`, `DefGroup` | Every group binder binds in every definition and in `body`. |
-| `For` | `target` binds in `body`; `iter` is outside its scope. |
+| `For` | `position` and `target` bind in `body`, and `target`'s type is in `position`'s scope; `iter` is outside their scope. |
 | `Case` | A branch pattern's payload binder binds in that branch's `guard` and `body` only. |
 | `Comprehension` | A generator's `target` binds in its own `guards`, in every later generator, and in `element`; its own `iter` is outside its scope. |
 | `Feed`, `Define`, `MutWrite` | `name` is a use of an enclosing binder. |
@@ -128,7 +128,7 @@ binders are the ones [Binding structure lives in one place](#binding-structure-l
 lists. Inside a type, that type's own binders bind too: a Pi binder over its codomain, a dependent
 tuple's component over the components after it, `__elem` over a refinement's predicate, and a
 quoted term's binders over that term. A sum binds its witnesses within its own type and nowhere
-else.
+else, and a generalized type's `Poly` binds its type parameters within that type and nowhere else.
 
 The rule does not change from phase to phase. Lowering and elimination change which form a term
 takes, not what binds where:
@@ -150,7 +150,7 @@ value each read took and makes every opaque `let` transparent
 ([A read is named while inference runs](mutability.md#a-read-is-named-while-inference-runs)).
 
 `well_scoped::assert_well_scoped` checks the rule in debug builds at every boundary `settle`
-checks, and `infer::debug_assert_no_free_witness` checks witnesses.
+checks, type parameters included, and `infer::debug_assert_no_free_witness` checks witnesses.
 
 ### Source locations on substituted parameter projections
 

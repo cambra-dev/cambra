@@ -1661,12 +1661,22 @@ impl Subst {
 
             // The loop target binds only in the body; the source sees the
             // outer scope — same discipline as `Lambda`.
-            For { target, iter, body } => {
+            For {
+                position,
+                target,
+                iter,
+                body,
+            } => {
                 let iter = Box::new(self.apply_expr(iter));
-                let inner = self.under_binder(&target.name, body);
+                let outer = self.under_binder(&position.name, body);
+                let inner = outer.under_binder(&target.name, body);
                 let body = Box::new(inner.apply_expr(body));
-                let target = target.clone();
-                For { target, iter, body }
+                For {
+                    position: position.clone(),
+                    target: target.clone(),
+                    iter,
+                    body,
+                }
             }
 
             Let {
@@ -2612,6 +2622,16 @@ pub fn type_free_vars(ty: &Type) -> BTreeSet<Binder> {
     out
 }
 
+/// [`type_free_vars`] into `out`, sharing `visited` with the caller's walk: a predicate term
+/// shared by `Rc` across several slots is read once.
+pub(crate) fn collect_type_free_vars(
+    ty: &Type,
+    visited: &mut BTreeSet<PredicateId>,
+    out: &mut BTreeSet<Binder>,
+) {
+    collect_type_fv(ty, &mut BTreeSet::new(), visited, out);
+}
+
 /// The indices of the element references `t` reads free: `0` for the element of the
 /// refinement whose predicate holds `t`, one more per refinement further out.
 pub fn free_elem_indices(t: &TypedExpr) -> BTreeSet<u32> {
@@ -2861,7 +2881,9 @@ fn collect_expr_fv(
     visited: &mut BTreeSet<PredicateId>,
     out: &mut BTreeSet<Binder>,
 ) {
-    collect_type_fv(&e.ty, bound, visited, out);
+    // Every type slot, a binder's declared type and a cast's target included, in the scope
+    // around the node: a binder does not bind in its own type.
+    e.walk_type_slots(|ty| collect_type_fv(ty, bound, visited, out));
     for_each_scoped_item(e, &mut |item| match item {
         ScopedItem::VarRef(n) => {
             // A `PiBound` is a bound reference to a function of the enclosing
@@ -3191,6 +3213,18 @@ pub fn rewrite_pairing_projections_memo(
         changed
     }
     in_type(ty, binder, components, memo);
+}
+
+/// `codomain`, read off a function binding `fun_binder`, spelled at the name `to`: what a
+/// binder of that name sees the function return at it.
+pub fn codomain_renamed(fun_binder: Option<&Name>, to: &Name, codomain: &Type) -> Type {
+    let opened = open_codomain_at(to, codomain);
+    match fun_binder {
+        Some(b) if b != to && type_free_vars(&opened).contains(b) => {
+            Subst::rename(b.clone(), to.clone()).apply_type(&opened)
+        }
+        _ => opened,
+    }
 }
 
 /// `codomain` opened at `binder`, the function it was read off binding that name.
@@ -4451,15 +4485,23 @@ mod tests {
     }
 
     #[test]
-    fn a_for_keeps_its_target_name() {
+    fn a_for_keeps_its_position_and_target_names() {
         let e = TypedExpr::new(TypedExprNode::For {
+            position: Box::new(TypedBinding::new_unannotated("p")),
             target: TypedBinding::new_unannotated("y"),
             iter: Box::new(TypedExpr::var("xs")),
             body: Box::new(TypedExpr::var("k")),
         });
-        let TypedExprNode::For { target, body, .. } = live_rename().apply_expr(&e).node else {
+        let TypedExprNode::For {
+            position,
+            target,
+            body,
+            ..
+        } = live_rename().apply_expr(&e).node
+        else {
             panic!("expected a for");
         };
+        assert_eq!(position.name, Name::raw("p"));
         assert_eq!(target.name, Name::raw("y"));
         assert_eq!(body.node, renamed());
     }
@@ -4751,6 +4793,7 @@ mod rewrite_tests {
     #[should_panic(expected = "Barendregt violation")]
     fn a_binder_crossing_is_checked_even_when_the_body_is_inert() {
         let mut e = TypedExpr::new(TypedExprNode::For {
+            position: Box::new(TypedBinding::new_unannotated("q")),
             target: TypedBinding::new_unannotated("y"),
             iter: Box::new(var("x")),
             body: Box::new(int(1)),

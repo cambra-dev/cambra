@@ -325,11 +325,12 @@ these markers; `mut_elim` + `channelize` rewrite it into **pure CCL** — the ma
 the rest of the pipeline runs on. This is the concrete input→output contract of the mutability
 eliminator, stated by content rather than by a "mirrors CHL" adjective.)
 
-- `For { target, iter, body }` — every statement `for` loop, generator / side-effecting /
+- `For { position, target, iter, body }` — every statement `for` loop, generator / side-effecting /
   mutation alike (comprehensions keep their expression lowering). Lowering does not distinguish
   the loop kinds — that classification is the phase's, post-inference (see
   [Mutability is the type](#mutability-is-the-type-no-lowering-registry)). Value `Unit`;
-  `iter : 𝐼 ⤇ 𝑇`, `target : 𝑇` bound in `body`.
+  `iter : (𝑟 : 𝐼) ⤇ 𝑇(𝑟)`, with `position : 𝐼` and `target : 𝑇(position)` bound in `body`. The
+  recurrence `mut_elim` builds binds the loop's position as its own.
 - `MutDecl { binding, init, body }` — one mutable variable **introduction** (`x := init`),
   binding `x` as a mutable variable over `body`. The declaring half of `:=`, paired with
   `MutWrite` for its writing half; before it existed the introduction was a `Let`
@@ -851,7 +852,8 @@ Input: a typed, inlined, surface-CCL tree. Output: pure CCL (`let`/`letrec` alge
    (`type-inference.md`, "A history's value may depend on its position").
 5. **Routes loops and rewrites reads**: a `For` whose body writes a `Mut` variable bound outside it is
    an accumulator recurrence (built in step 3); **any other `For` is rebuilt as its map shape** —
-   `Compose([iter, λ target → body])`, with feeds/yields already routed in step 4 — so a generator
+   `λ position → (position ▷ iter) ▷ (λ target → body)`, with feeds/yields already routed in
+   step 4 — so a generator
    or bare side-effect loop needs no letrec at all. Trailing induction reads →
    `final_read(history)`; a `Txn` read fed out of a read-only block → a broadcast of the history
    over the enclosing loop, which planning latches through the as-of read.

@@ -117,9 +117,10 @@ pub(super) fn lower_standalone_transaction(
     Ok(ctx.tag_machinery(Expr::expr_stmt(for_node, continuation), span, ts))
 }
 
-/// `For { target: <iter_var> (untyped), iter: <source>, body: <block> }`.
+/// `For { position, target: <iter_var> (untyped), iter: <source>, body: <block> }`.
 fn for_over(iter_var: String, source: Expr, block: Expr) -> Expr {
     Expr::new(TypedExprNode::For {
+        position: Box::new(TypedBinding::new_unannotated(LOOP_POSITION)),
         target: TypedBinding {
             name: iter_var.into(),
             ty: Type::Hole,

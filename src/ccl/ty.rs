@@ -4788,7 +4788,7 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::Var(_)
         | N::Builtin(_)
         | N::Apply { .. }
-        | N::Realize { .. }
+        | N::Realize(_)
         | N::Cast { .. }
         | N::BinOp { .. }
         | N::UnaryOp(..)
@@ -4931,8 +4931,8 @@ fn eq_term_modulo_ty_slots_go(
                 kind: k2,
             },
         ) => k1 == k2 && eq_term_modulo_ty_slots_go(i1, i2, pairs),
-        // `bound_expr`, `init` or `iter` sits outside the binder's scope; the binder scopes
-        // over `body`.
+        // `bound_expr` or `init` sits outside the binder's scope; the binder scopes over
+        // `body`.
         (
             N::Let {
                 binding: bd1,
@@ -4956,21 +4956,32 @@ fn eq_term_modulo_ty_slots_go(
                 init: e2,
                 body: b2,
             },
-        )
-        | (
-            N::For {
-                target: bd1,
-                iter: e1,
-                body: b1,
-            },
-            N::For {
-                target: bd2,
-                iter: e2,
-                body: b2,
-            },
         ) => {
             eq_term_modulo_ty_slots_go(e1, e2, pairs)
                 && eq_under_binder(pairs, &bd1.name, &bd2.name, &[(b1, b2)])
+        }
+        (
+            N::For {
+                position: p1,
+                target: t1,
+                iter: it1,
+                body: b1,
+            },
+            N::For {
+                position: p2,
+                target: t2,
+                iter: it2,
+                body: b2,
+            },
+            // The source is evaluated outside the loop; the position and target are bound over
+            // the body.
+        ) => {
+            eq_term_modulo_ty_slots_go(it1, it2, pairs) && {
+                pairs.push((p1.name.clone(), p2.name.clone()));
+                let equal = eq_under_binder(pairs, &t1.name, &t2.name, &[(b1, b2)]);
+                pairs.pop();
+                equal
+            }
         }
         (
             N::MutWrite {
@@ -5116,9 +5127,7 @@ fn eq_term_modulo_ty_slots_go(
         // A realized conditional collection. Reachable inside a predicate because a
         // filter's predicate carries its own copy of the source (`__elem ▷ src ▷ 𝑓`), so
         // when `src` is a conditional, realization rewrites it *in the predicate*.
-        (N::Realize { value: v1, .. }, N::Realize { value: v2, .. }) => {
-            eq_term_modulo_ty_slots_go(v1, v2, pairs)
-        }
+        (N::Realize(v1), N::Realize(v2)) => eq_term_modulo_ty_slots_go(v1, v2, pairs),
         _ => {
             // **A missing arm is not "unequal", it is unanswered.** Falling through with
             // two nodes of the *same* shape means this function has no rule for that
@@ -5238,9 +5247,16 @@ fn hash_term_modulo_ty_slots<H: std::hash::Hasher>(
             hash_term_modulo_ty_slots(init, state, scope);
             hash_under_binder(state, scope, &binding.name, &[body]);
         }
-        TypedExprNode::For { target, iter, body } => {
+        TypedExprNode::For {
+            position,
+            target,
+            iter,
+            body,
+        } => {
             hash_term_modulo_ty_slots(iter, state, scope);
+            scope.push(position.name.clone());
             hash_under_binder(state, scope, &target.name, &[body]);
+            scope.pop();
         }
         TypedExprNode::Case {
             scrutinee,
@@ -5751,16 +5767,10 @@ mod tests {
     fn a_rebuilt_predicate_containing_realize_equals_itself() {
         let realizing = || {
             Rc::new(
-                TypedExpr::new(TypedExprNode::Realize {
-                    value: Box::new(
-                        TypedExpr::new(TypedExprNode::Var(Name::elem()))
-                            .with_ty(Type::Base(BaseType::Int)),
-                    ),
-                    staged: Rc::new(
-                        TypedExpr::new(TypedExprNode::Var(Name::elem()))
-                            .with_ty(Type::Base(BaseType::Int)),
-                    ),
-                })
+                TypedExpr::new(TypedExprNode::Realize(Box::new(
+                    TypedExpr::new(TypedExprNode::Var(Name::elem()))
+                        .with_ty(Type::Base(BaseType::Int)),
+                )))
                 .with_ty(Type::Base(BaseType::Int)),
             )
         };
@@ -6264,50 +6274,6 @@ mod tests {
             gt, lt,
             "casts differing only in the target's nested filter are distinct refinements"
         );
-    }
-
-    /// A predicate reading a definition planning restaged equals one reading it unplanned.
-    /// `𝑦 ▷ (𝑥 ▷ ((𝐹, 𝑔) ▷ curry_over))` reads as `𝑦 ▷ (𝑥 ▷ (𝑔 ▷ curry))`, and
-    /// `𝑥 ▷ (𝑚 ▷ filter_values)` and `𝑥 ▷ (𝑢 ▷ (𝑝 ▷ restrict))` as `𝑥`: an application reaches
-    /// only keys in its function's domain, so the restriction a staged form adds changes no
-    /// value read.
-    #[test]
-    fn a_staged_form_compares_as_what_it_stages() {
-        let apply = |argument: TypedExpr, function: TypedExpr| TypedExpr::apply(argument, function);
-        use crate::ccl::Builtin;
-        let builtin = |b: Builtin| TypedExpr::builtin(b);
-        let compare = |lhs: TypedExpr| {
-            Refinement::born(Rc::new(TypedExpr::binop(
-                TypedExpr::var(Name::elem()),
-                BinOpKind::Compare(CompareKind::Greater),
-                lhs,
-            )))
-        };
-        let read =
-            |curried: TypedExpr| apply(TypedExpr::var("y"), apply(TypedExpr::var("x"), curried));
-
-        let curried = read(apply(TypedExpr::var("g"), builtin(Builtin::Curry)));
-        let staged = read(apply(
-            TypedExpr::tuple(vec![TypedExpr::var("F"), TypedExpr::var("g")]),
-            builtin(Builtin::CurryOver),
-        ));
-        assert_eq!(compare(curried), compare(staged));
-
-        let filtered = apply(
-            TypedExpr::var("x"),
-            apply(TypedExpr::var("m"), builtin(Builtin::FilterValues)),
-        );
-        assert_eq!(compare(filtered), compare(TypedExpr::var("x")));
-
-        // An iteration source narrowed by a filter maps each key it keeps to itself.
-        let narrowed = apply(
-            TypedExpr::var("x"),
-            apply(
-                TypedExpr::var("u"),
-                apply(TypedExpr::var("p"), builtin(Builtin::Restrict)),
-            ),
-        );
-        assert_eq!(compare(narrowed), compare(TypedExpr::var("x")));
     }
 
     /// A rewrite that makes two refinements equal leaves a *set*, not a bag.

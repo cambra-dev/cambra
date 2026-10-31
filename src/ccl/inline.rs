@@ -754,6 +754,33 @@ fn move_into_list_elements(
     (body, moved)
 }
 
+/// Take the position slot of every `for` loop in `e`, in walk order. Each restates its loop's
+/// source domain (`crate::ccl::mut_elim::loop_domain`), so a read there is not an occurrence.
+fn take_loop_positions(e: &mut Expr, out: &mut Vec<Type>) {
+    if let TypedExprNode::For { position, .. } = &mut e.node {
+        out.push(std::mem::replace(&mut position.ty, Type::Hole));
+    }
+    e.walk_children_mut(|c| take_loop_positions(c, out));
+}
+
+/// Put back the slots [`take_loop_positions`] took, in the same walk order.
+fn restore_loop_positions(e: &mut Expr, slots: &mut impl Iterator<Item = Type>) {
+    if let TypedExprNode::For { position, .. } = &mut e.node {
+        position.ty = slots.next().expect("one slot per loop taken");
+    }
+    e.walk_children_mut(|c| restore_loop_positions(c, slots));
+}
+
+/// Restate each `for` loop's position slot in `e` that reads `name` from the loop's source.
+fn restate_loop_positions(name: &Name, e: &mut Expr) {
+    if let TypedExprNode::For { position, iter, .. } = &mut e.node
+        && crate::ccl::ccl_utils::is_free_in_type(name, &position.ty)
+    {
+        position.ty = crate::ccl::mut_elim::loop_domain(iter);
+    }
+    e.walk_children_mut(|c| restate_loop_positions(name, c));
+}
+
 /// Substitute an A-normalization temp into its one use, so an element holds the
 /// value former it denotes rather than a `Let` chain building one. Bottom-up, so a
 /// chain collapses from the inside out.
@@ -1024,10 +1051,20 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
             //
             // The three conditions are [`flatten_anf_bindings`]': an `AnfTemp`
             // binder, one occurrence (a refinement predicate's counted), and no
-            // read of a variable the body writes.
+            // read of a variable the body writes. A `for` loop's position restates its
+            // source's domain, so a read there is not an occurrence: the slot is
+            // restated from the source the temp moves into.
+            let mut body = body;
+            let mut occurrences = count_free(&binding.name, &body);
+            if occurrences > 1 && binding.name.is_anf_temp() {
+                let mut slots = Vec::new();
+                take_loop_positions(&mut body, &mut slots);
+                occurrences = count_free(&binding.name, &body);
+                restore_loop_positions(&mut body, &mut slots.into_iter());
+            }
             if !binder_spelled_in_a_type
                 && binding.name.is_anf_temp()
-                && count_free(&binding.name, &body) == 1
+                && occurrences == 1
                 && !reads_a_variable_written_in(&bound_expr, &body)
                 && !stands_in_a_value_former(&binding.name, &body)
             {
@@ -1039,12 +1076,15 @@ fn inline_impl(expr: Expr, scope: &mut BinderScope, channels: &mut HashSet<Name>
                 // occurrence and freshens its interior, which is right for a
                 // *copy* (one template, several use sites) and wrong for the
                 // single occurrence this rewrite is guarded on.
-                let (body, unplaced) = move_single_occurrence(body, &binding.name, bound_expr);
+                let (mut body, unplaced) = move_single_occurrence(body, &binding.name, bound_expr);
                 // A definiens handed back is one whose only occurrence sits
                 // inside a refinement predicate, an `Rc` no term walk rebuilds.
                 // Leave the binding standing.
                 return match unplaced {
-                    None => inline_impl(body, scope, channels),
+                    None => {
+                        restate_loop_positions(&binding.name, &mut body);
+                        inline_impl(body, scope, channels)
+                    }
                     Some(bound_expr) => Expr {
                         node_id,
                         node: TypedExprNode::Let {
@@ -1511,16 +1551,26 @@ fn inline_and_beta_reduce(
 
         TypedExprNode::Error => crate::unexpected_error_node!(),
 
-        // The loop target shadows `name` inside the body only; the source
+        // The loop's binders shadow `name` inside the body only; the source
         // still substitutes.
-        TypedExprNode::For { target, iter, body } => {
+        TypedExprNode::For {
+            position,
+            target,
+            iter,
+            body,
+        } => {
             let iter = Box::new(inline_and_beta_reduce(*iter, name, lambda, scope, memo));
-            let body = if &target.name == name {
+            let body = if &target.name == name || &position.name == name {
                 body
             } else {
                 Box::new(inline_and_beta_reduce(*body, name, lambda, scope, memo))
             };
-            TypedExprNode::For { target, iter, body }
+            TypedExprNode::For {
+                position,
+                target,
+                iter,
+                body,
+            }
         }
 
         // All remaining variants: pure structural recursion.  Atoms have

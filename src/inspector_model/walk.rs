@@ -83,7 +83,7 @@ pub(super) fn node_label(node: &TypedExprNode) -> String {
             trait_, function, ..
         } => format!("TraitFn({trait_}::{function})"),
         LoadFrom(n) => format!("LoadFrom({n})"),
-        Realize { .. } => "Realize".to_string(),
+        Realize(_) => "Realize".to_string(),
         Transact { .. } => "Transact".to_string(),
         LetRec { .. } => "LetRec".to_string(),
         DefGroup { .. } => "DefGroup".to_string(),

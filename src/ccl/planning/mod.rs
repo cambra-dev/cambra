@@ -351,7 +351,7 @@ fn refuse_a_union_applied_at_the_input(term: &Expr) -> Result<(), String> {
             {
                 legs.iter().find_map(find)
             }
-            TypedExprNode::Realize { .. } => None,
+            TypedExprNode::Realize(_) => None,
             TypedExprNode::Copair(_) | TypedExprNode::DisjointJoin(_) => {
                 e.ty.is_collection().then_some(e)
             }

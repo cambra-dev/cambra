@@ -15,6 +15,9 @@
 //!
 //! A sum's witness follows the same rule: a sum binds it within the sum's own type, and nowhere
 //! else. Witnesses are not term names, so `infer::debug_assert_no_free_witness` checks them.
+//!
+//! So does a generalized type parameter: the `Poly` of a generalized type binds it within that
+//! type, and no type reads one outside its `Poly` ([`params_bound`]).
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -72,9 +75,28 @@ fn violations(root: &Expr) -> Vec<Violation> {
     out
 }
 
-/// Panic on any [`violations`] of `root` at `boundary`.
+/// Panic on a type slot in `root` that reads a generalized type parameter no `Poly` in the slot
+/// binds.
+#[cfg(debug_assertions)]
+fn params_bound(root: &Expr, boundary: &str) {
+    root.walk_type_slots(|ty| {
+        if let Some(p) = crate::ccl::generalize::free_params(ty).first() {
+            panic!(
+                "{boundary}: the generalized type parameter `{}` is read outside the `Poly` that \
+                 binds it: {ty} in `{}`",
+                p.spelling,
+                crate::ccl::symbolic::symbolic(root)
+            );
+        }
+    });
+    root.walk_children(|c| params_bound(c, boundary));
+}
+
+/// Panic on any [`violations`] of `root` at `boundary`, or on a generalized type parameter read
+/// outside its `Poly` ([`params_bound`]).
 #[cfg(debug_assertions)]
 pub(crate) fn assert_well_scoped(root: &Expr, boundary: &str) {
+    params_bound(root, boundary);
     let found = violations(root);
     if let Some(v) = found.first() {
         let innermost = innermost_reader(&v.ty, &v.name)
@@ -125,9 +147,23 @@ fn innermost_reader(ty: &Type, name: &Name) -> Option<(String, Type)> {
 
 #[cfg(debug_assertions)]
 fn walk(e: &Expr, scope: &mut Scope, everywhere: &BTreeSet<Name>, out: &mut Vec<Violation>) {
+    // A `for` loop's target is typed under its position, which its element's type may read.
+    let (position, target_slots): (Option<&Name>, Vec<*const Type>) = match &e.node {
+        TypedExprNode::For {
+            position, target, ..
+        } => (
+            Some(&position.name),
+            std::iter::once(&target.ty)
+                .chain(&target.user_annotation)
+                .map(|t| t as *const Type)
+                .collect(),
+        ),
+        _ => (None, Vec::new()),
+    };
     e.walk_type_slots(|ty| {
+        let under = position.filter(|_| target_slots.contains(&(ty as *const Type)));
         for name in type_free_vars(ty) {
-            if !scope.contains(&name) && !everywhere.contains(&name) {
+            if !scope.contains(&name) && !everywhere.contains(&name) && under != Some(&name) {
                 out.push(Violation {
                     name,
                     at: crate::ccl::symbolic::symbolic(e),

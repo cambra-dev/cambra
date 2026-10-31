@@ -2444,7 +2444,7 @@ fn convert_impl_inner(
         // the sum denotes is that leg keyed by its own keys. Merging flat at the bound the
         // sum's type declares is that, where a tagged merge would show every key wearing its
         // leg's tag (`src/ccl/design/collections.md`, "Compiling a conditional collection").
-        TypedExprNode::Realize { value, .. } => match &value.node {
+        TypedExprNode::Realize(value) => match &value.node {
             // An opened sum, the function view `σ ⤇ V` a `Case` inside a predicate has after
             // `lambda_elim`, carries no binder, so its kind is not here to bound the legs'
             // keys, and converting the copairing as itself would key each row by its leg.

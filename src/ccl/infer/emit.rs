@@ -199,11 +199,13 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // Realization is a planning rewrite, so it is born after inference has finished:
         // Emit only ever runs on a tree that has none. The post-inference check *does*
         // meet them, and trusts the assertion ([`check_node_rule`]).
-        TypedExprNode::Realize { .. } => {
+        TypedExprNode::Realize(_) => {
             unreachable!("Realize is born in planning, after inference")
         }
 
-        TypedExprNode::Apply { function, argument } => emit_apply(function, argument, ctx)?,
+        TypedExprNode::Apply { function, argument } => {
+            emit_apply(function, argument, &recorded_ty, ctx)?
+        }
 
         // Scheme-based rules: the registry lookup (which scheme for this op)
         // is Emit-specific, so the dispatcher resolves it and hands the
@@ -229,7 +231,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             binding,
             bound_expr,
             body,
-        } => emit_let(binding, bound_expr, body, ctx)?,
+        } => emit_let(binding, bound_expr, body, &recorded_ty, ctx)?,
 
         TypedExprNode::LetType { .. } => {
             unreachable!("uniquify removes every `LetType`")
@@ -376,7 +378,12 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             ty?
         }
 
-        TypedExprNode::For { target, iter, body } => emit_for(target, iter, body, ctx)?,
+        TypedExprNode::For {
+            position,
+            target,
+            iter,
+            body,
+        } => emit_for(position, target, iter, body, ctx)?,
 
         // The write target's lookup is Emit-specific, like `Feed`'s: the
         // written value must flow into the mutable variable's binding type.
@@ -1029,6 +1036,7 @@ pub(super) fn emit_cast<C: Typing>(
 pub(super) fn emit_apply<C: Typing>(
     function: &mut Expr,
     argument: &mut Expr,
+    recorded: &Type,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     // The **checked** lookup `c[k]?`, intercepted rather than given a scheme. A scheme
@@ -1100,7 +1108,7 @@ pub(super) fn emit_apply<C: Typing>(
         } = &argument.node
         && let TypedExprNode::Var(r) = &position.node
     {
-        ctx.note_loop_source(&param.name, Some(r), source, &position.ty, &raw_arg_ty);
+        ctx.note_loop_source(&param.name, r, source, &position.ty, &raw_arg_ty);
     }
     // A function position is a value position, so a mutable variable mention there reads
     // (`src/ccl/design/mutability.md`, "A mutable variable read is an explicit operation").
@@ -1189,7 +1197,14 @@ pub(super) fn emit_apply<C: Typing>(
         TypedExprNode::Proj(key @ ProjKey::Index(_)) => format!("projection `.{key}`"),
         _ => "Apply".to_string(),
     };
-    let applied = ctx.apply(&fn_ty, &arg_ty, argument, declared.as_ref(), &|| at.clone());
+    let applied = ctx.apply(
+        &fn_ty,
+        &arg_ty,
+        argument,
+        recorded,
+        declared.as_ref(),
+        &|| at.clone(),
+    );
     if applied.is_ok() && matches!(function.node, TypedExprNode::TraitFn { .. }) {
         ctx.bind_instance_function_called(function.node_id())?;
     }
@@ -1829,9 +1844,17 @@ pub(super) fn emit_disjoint_join<C: Typing>(
         _ => None,
     };
     let dom_var = ctx.fresh();
+    // Every arm is reached with the join's input, which instantiates a generalized type, as a
+    // chain's input does at its head (`compose_chain`).
+    let incoming = recorded.domain();
     let mut codomains: Vec<(Type, Vec<crate::ccl::ty::Witness>)> = Vec::new();
     for e in exprs.iter_mut() {
         let ty = emit_value_read(e, ctx)?;
+        let ty = match &incoming {
+            Some(input) => ctx.instantiate_generalized(&ty, input),
+            None => ty,
+        };
+        let ty = ctx.open_generic(ty);
         let (dom, cod) = ctx.as_function(&ty, &|| "DisjointJoin element".to_string())?;
         // One shared domain: each operand's domain flows into the same variable, so
         // operands over genuinely different index sets are a type error here rather
@@ -1872,12 +1895,12 @@ pub(super) fn emit_disjoint_join<C: Typing>(
     // rule disagree with the pass that built the node. A join with no function type to
     // read is a collection: the node *is* the merged map.
     let fun_kind = recorded.fun_kind().cloned().unwrap_or(FunKind::Data(None));
-    Ok(Type::Fun {
+    Ok(ctx.requantify_opened(Type::Fun {
         name: binder,
         fun_kind,
         domain: Box::new(dom_var),
         codomain: Box::new(cod_var),
-    })
+    }))
 }
 
 /// Aggregate (`Sum`, `Max`): the scheme is the full operator type
@@ -1924,6 +1947,7 @@ pub(super) fn emit_let<C: Typing>(
     binding: &mut TypedBinding,
     bound_expr: &mut Expr,
     body: &mut Expr,
+    recorded: &Type,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     let recoveries_before = ctx.recoveries();
@@ -1936,7 +1960,13 @@ pub(super) fn emit_let<C: Typing>(
     })?;
     // Lifting the body type out of the binder's scope must close it over the
     // binding (design §6.2) — see [`Typing::close_let_type`] for the per-mode
-    // story.
+    // story. Closing puts the definition into the type, so after planning, which respells
+    // it, a body type reading the binder is the recorded one.
+    let reads_binder = ctx.reads_recorded_dependent_results()
+        && crate::ccl::subst::type_free_vars(&body_ty).contains(&binding.name);
+    if reads_binder {
+        return Ok(recorded.clone());
+    }
     Ok(ctx.close_let_type(binding, bound_expr, body_ty))
 }
 
@@ -2620,6 +2650,7 @@ pub(super) fn emit_mut_decl<C: Typing>(
 /// rule; the unified phase (src/ccl/design/mutability.md) eliminates the
 /// node before anything downstream runs.
 pub(super) fn emit_for<C: Typing>(
+    position: &mut TypedBinding,
     target: &mut TypedBinding,
     iter: &mut Expr,
     body: &mut Expr,
@@ -2627,28 +2658,46 @@ pub(super) fn emit_for<C: Typing>(
 ) -> Result<Type, LocatedInferError> {
     let iter_ty = emit_value_read(iter, ctx)?;
     let iter_label = symbolic(iter);
-    let (position_ty, item_ty) =
-        ctx.as_function(&iter_ty, &|| format!("for-loop source `{iter_label}`"))?;
+    // The element is the source's value at the position, so its type is the codomain at the
+    // position's name: a group's reads its key.
+    let (position_ty, item_ty) = ctx.as_function_at(&iter_ty, &position.name, &|| {
+        format!("for-loop source `{iter_label}`")
+    })?;
 
-    // The target binds at the source's element type — same binder discipline
-    // as `emit_lambda`'s param (normalize the slot so references share vars).
-    let target_simple = ctx.normalize(&target.ty);
-    target.ty = target_simple.clone();
-    let target_label = target.name.clone();
+    // The position binds at the source's domain and the target at its element type — the
+    // same binder discipline as `emit_lambda`'s param (normalize the slot so references
+    // share vars).
+    // The position ranges over the source's domain, a part of the demand as an application's
+    // binder is (`Typing::apply`): a sum's domain is its witness, which only the demand's
+    // binders name. Its slot is filled once the source is resolved, with the witnesses
+    // projected through the source (`coalesce_node`).
+    let position_simple = position_ty.clone();
     // The element type left the source's Σ behind, so the edge carries it.
     let source_binders = iter_ty.peel_refinements().sum().unwrap_or(&[]).to_vec();
-    ctx.require_sub_under(&item_ty, &source_binders, &target_simple, &[], &|| {
-        format!("for-loop target `{target_label}`")
-    })?;
-    if let Some(ann) = target.user_annotation.clone() {
-        ctx.bind_annotation(&target_simple, &ann)?;
-    }
+    let target_label = target.name.clone();
+    // The target's type may read the position, so its slot is minted in the position's scope.
+    ctx.scoped(&position.name, &position_simple, |ctx| {
+        let target_simple = ctx.normalize(&target.ty);
+        target.ty = target_simple.clone();
+        ctx.require_sub_under(&item_ty, &source_binders, &target_simple, &[], &|| {
+            format!("for-loop target `{target_label}`")
+        })?;
+        if let Some(ann) = target.user_annotation.clone() {
+            ctx.bind_annotation(&target_simple, &ann)?;
+        }
 
-    // A `for` reaching inference as a loop node writes mutable variables declared outside
-    // it: one that only feeds is a loop over its source's positions
-    // (`crate::ccl::comprehension`, `index_loop`).
-    ctx.note_loop_source(&target.name, None, iter, &position_ty, &target_simple);
-    ctx.scoped(&target.name, &target_simple, |ctx| ctx.subexpr(body))?;
+        // A `for` reaching inference as a loop node writes mutable variables declared
+        // outside it: one that only feeds is a loop over its source's positions
+        // (`crate::ccl::comprehension`, `index_loop`).
+        ctx.note_loop_source(
+            &target.name,
+            &position.name,
+            iter,
+            &position_ty,
+            &target_simple,
+        );
+        ctx.scoped(&target.name, &target_simple, |ctx| ctx.subexpr(body))
+    })?;
     Ok(Type::Base(BaseType::Unit))
 }
 
@@ -3452,6 +3501,12 @@ pub(super) fn emit_compose<C: Typing>(
         binders,
         last_ty,
     } = compose_chain(elts, 0, None, recorded.domain().as_ref(), ctx)?;
+    // A chain that names its positions has a type quoting the terms before each one, which
+    // planning respells; after planning that type is the recorded one, its adjacencies
+    // checked above.
+    if binders.iter().any(Option::is_some) && ctx.reads_recorded_dependent_results() {
+        return Ok(recorded.clone());
+    }
     // The chain's kind **rides its own type**, like a lambda's (`emit_lambda`).
     // It is not the head morphism's: a head can be a re-indexing rather than a
     // decision — `id ≫ xs` and `.0 ≫ xs` denote the collection `xs` re-addressed,
@@ -3498,7 +3553,9 @@ pub(super) fn emit_compose<C: Typing>(
                     item,
                 ));
             ctx.scoped(&position, &first_dom, |ctx| {
-                ctx.apply(&last_ty, item, &at, None, &|| format!("Compose[{last}]"))
+                ctx.apply(&last_ty, item, &at, recorded, None, &|| {
+                    format!("Compose[{last}]")
+                })
             })?
         }
         _ => cod,
@@ -3567,6 +3624,31 @@ fn accumulator_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) ->
     product(dom)
 }
 
+/// Whether a tap of the writer whose body has type `body_ty` reads the body's parameter, so that
+/// its history quotes the writer's source ([`writer_tap_histories`]).
+fn tap_reads_its_row(body_ty: &Type) -> bool {
+    let Type::Fun {
+        name: Some(binder),
+        codomain,
+        ..
+    } = body_ty.peel_refinements()
+    else {
+        return false;
+    };
+    let codom = crate::ccl::subst::open_codomain(body_ty, codomain);
+    let Type::Variant(tags, _) = codom.peel_refinements() else {
+        return false;
+    };
+    tags.iter()
+        .filter(|(k, _)| matches!(k, FieldKey::Name(n) if n == V_COMMIT))
+        .any(|(_, payload)| match payload.peel_refinements() {
+            Type::Record(fields) => fields.iter().any(|(f, t)| {
+                f != crate::ccl::F_WRITES && crate::ccl::subst::type_free_vars(t).contains(binder)
+            }),
+            _ => false,
+        })
+}
+
 /// The history of each `__to_<defer>` tap a writer's decision carries: the tap's value at each
 /// position of `domain`, in the order the decision's `commit` payload lists them.
 ///
@@ -3581,6 +3663,8 @@ fn accumulator_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) ->
 ///
 /// The terms the history types quote are minted for the `Transact` at `node_id`, whose type
 /// carries them into the tree.
+///
+/// [`tap_reads_its_row`] says whether any tap's history quotes the source.
 pub(super) fn writer_tap_histories(
     domain: &Type,
     body_ty: &Type,
@@ -3815,6 +3899,7 @@ pub(super) fn emit_transact<C: Typing>(
     writers: &mut [WriterSite],
     domain: &Type,
     parameter: Option<&Type>,
+    recorded: &Type,
     node_id: NodeId,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
@@ -3856,8 +3941,15 @@ pub(super) fn emit_transact<C: Typing>(
         fields.push((k.name.field_key(), read_ty));
         key_types.insert(k.name.clone(), value_ty);
     }
+    // A tap's history that reads its row quotes the writer's source, which planning respells,
+    // so after planning the record is the recorded one, its writers checked below.
+    let quotes_a_source = ctx.reads_recorded_dependent_results()
+        && writers.iter().any(|w| tap_reads_its_row(&w.body.ty));
     for w in writers.iter_mut() {
         emit_transact_writer(w, &key_types, parameter, ctx)?;
+        if quotes_a_source {
+            continue;
+        }
         // A `__to_<defer>` field on the writer's decision record becomes a
         // virtual mutable variable key the consumer reads as `__hist.__to_…`. The store
         // holds one tap value per commit, keyed by its commit time, so the field
@@ -3870,6 +3962,9 @@ pub(super) fn emit_transact<C: Typing>(
             enclosing_value.as_ref().map(|(e, t)| (*e, t)),
             node_id,
         ));
+    }
+    if quotes_a_source {
+        return Ok(recorded.clone());
     }
     // A nested `Transact` is one history record per enclosing position, so it is a function of the
     // enclosing half of its `(enclosing, position)` parameter.
