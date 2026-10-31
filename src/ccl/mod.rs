@@ -16,6 +16,7 @@ pub mod content_hash;
 pub mod context;
 pub mod diff;
 pub mod feed_nest;
+pub(crate) mod free_names;
 pub(crate) mod generalize;
 pub mod infer;
 pub mod inline;
@@ -41,6 +42,7 @@ pub mod symbolic;
 pub(crate) mod test_corpus;
 pub mod transact_phase;
 pub mod uniquify;
+#[cfg(debug_assertions)]
 pub(crate) mod well_scoped;
 
 // Core type definitions, split out of this crate-root module. Each submodule
