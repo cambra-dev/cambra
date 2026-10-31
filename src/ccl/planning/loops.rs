@@ -401,10 +401,24 @@ fn split_decision_compose(
     // filter on the inner binder onto the pair, where it reads `__elem.1`, and neither
     // component carries it.
     let parameter = enclosing.map(|ctx_ty| {
-        let p = source
-            .ty
-            .domain()
-            .expect("letrec recognition: a snapshot slot is a function");
+        // A slot generic in the rows' domain takes a parameter whose structure is its bound's
+        // (`crate::ccl::generalize::shape`), naming that domain by its own type's parameter, which
+        // is read in the history's by matching the enclosing component.
+        let p = crate::ccl::generalize::shape(
+            &source
+                .ty
+                .domain()
+                .expect("letrec recognition: a snapshot slot is a function"),
+        );
+        let p = match p.peel_refinements() {
+            Type::Tuple(parts) if parts.len() == 2 => {
+                crate::ccl::generalize::renamed_by_match(&p, &parts[0], ctx_ty)
+            }
+            Type::DepTuple(parts) if parts.len() == 2 => {
+                crate::ccl::generalize::renamed_by_match(&p, &parts[0].1, ctx_ty)
+            }
+            _ => p,
+        };
         // A dependent pair where the inner positions depend on the enclosing value, an inner
         // source filtered by the outer loop's variable.
         assert!(
@@ -897,6 +911,10 @@ fn onto_enclosing(e: Expr, enclosing: &Type) -> Option<Expr> {
 /// (`__hist ≫ .writes ≫ .acc` extracts and `__hist ≫ .__to_<feed>` taps) become
 /// history-record projections.
 fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
+    // A history under a loop whose rows read the enclosing loop's position is generic in that
+    // row's domain (`src/ccl/design/type-parameters.md`, "Generalized types"), and is read at its
+    // body: the types built from its parts are closed over the parameters after planning.
+    let family_ty = crate::ccl::generalize::opened(&h.ty).clone();
     // An inner loop's history is a family — one recurrence per enclosing position —
     // which `lambda_elim` leaves as a pair morphism under `curry`, typed
     // `enclosing ⇒ (position ⤇ decision)`. Peel both so the recurrence recognized
@@ -913,20 +931,20 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         };
         let Type::Fun {
             domain, codomain, ..
-        } = &h.ty
+        } = &family_ty
         else {
             panic!("letrec recognition: a curried history is a function");
         };
         // A family whose histories depend on the enclosing argument names it, and each
         // history reads that name once opened.
-        let history = crate::ccl::subst::open_codomain(&h.ty, codomain);
+        let history = crate::ccl::subst::open_codomain(&family_ty, codomain);
         (history, *argument, Some((**domain).clone()))
     } else {
-        (h.ty.clone(), def, None)
+        (family_ty.clone(), def, None)
     };
     // The name the family gives its enclosing argument, which the history's fields read where
     // they depend on it.
-    let enclosing_binder = match (&enclosing, h.ty.peel_refinements()) {
+    let enclosing_binder = match (&enclosing, family_ty.peel_refinements()) {
         (Some(_), Type::Fun { name: Some(e), .. }) => Some(e.clone()),
         _ => None,
     };

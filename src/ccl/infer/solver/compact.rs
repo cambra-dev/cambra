@@ -758,12 +758,66 @@ impl CompactType {
 /// nothing, and compaction has already folded a variable's bounds into the atoms beside it.
 /// [`denoted_domains`] reads the same position and takes that reading, so both agree on which
 /// positions denote a domain at all.
+///
+/// **A witness projected through a sum is a dense range where its whole range is**, as
+/// `admits` judges it: `σ₁(𝑐)` is whichever candidate `𝑐` holds, so a sum ranging over dense
+/// ranges alone projects one.
 fn denotes_a_uint_range(ct: &CompactType) -> bool {
     let o = ct.occupied();
     o.atoms == 1
         && o.fun.is_none()
         && !o.others
-        && ct.atoms.iter().all(|a| matches!(a, AtomKey::UIntRange(_)))
+        && ct.atoms.iter().all(|a| match a {
+            AtomKey::UIntRange(_) => true,
+            AtomKey::Projection(p) => match &*p.ty {
+                Type::WitnessProjection(p) => projects_a_uint_range(p),
+                _ => false,
+            },
+            _ => false,
+        })
+}
+
+/// Whether `p` projects a dense range: its sum ranges over dense ranges alone. A term typed by
+/// a variable is read through the variable's compaction, at the binder `p` projects.
+fn projects_a_uint_range(p: &crate::ccl::ty::WitnessProjection) -> bool {
+    if let Some(w) = p.witness() {
+        return ranges_over_uint_ranges(&w.type_kind());
+    }
+    let Type::Infer(v) = p.term.ty.peel_refinements() else {
+        return false;
+    };
+    thread_local! {
+        /// The variables whose sums are being read, so a cycle through them answers no.
+        static READING: std::cell::RefCell<HashSet<InferVarId>> =
+            std::cell::RefCell::new(HashSet::new());
+    }
+    if !READING.with(|r| r.borrow_mut().insert(v.uid)) {
+        return false;
+    }
+    let term = compact_type(&p.term.ty).term;
+    READING.with(|r| r.borrow_mut().remove(&v.uid));
+    term.fun
+        .and_then(|f| f.binders.get(p.position).map(|w| w.type_kind.clone()))
+        .is_some_and(|k| match k {
+            CompactTypeKind::UIntRanges => true,
+            CompactTypeKind::Enumerated(ds) => ds.iter().all(denotes_a_uint_range),
+            CompactTypeKind::SubtypesOf(_) | CompactTypeKind::Type => false,
+        })
+}
+
+/// Whether every member of `k` is a dense prefix range: `UIntRanges` itself, or candidates
+/// that each are one.
+fn ranges_over_uint_ranges(k: &crate::ccl::ty::TypeKind) -> bool {
+    use crate::ccl::ty::TypeKind;
+    match k {
+        TypeKind::UIntRanges => true,
+        TypeKind::Enumerated(ds) => ds.iter().all(|d| match d {
+            Type::UIntRange(_) => true,
+            Type::WitnessProjection(p) => projects_a_uint_range(p),
+            _ => false,
+        }),
+        TypeKind::SubtypesOf(_) | TypeKind::Type => false,
+    }
 }
 
 /// The domains a compacted **data**-function domain position denotes, as types.

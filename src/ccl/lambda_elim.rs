@@ -1618,6 +1618,18 @@ fn elim_lambda_impl(
 
         // Application: λ x → e ▷ f  ⟹  ⟨λx→e, λx→f⟩ ≫ apply
         TypedExprNode::Apply { argument, function } => {
+            // **A result reading `param`** reads it through the operands, a dependent
+            // application's codomain discharged at its argument: `apply`'s type states it over
+            // the pair it is handed ([`operation_type`]), since `param` binds nothing once
+            // eliminated. The copies are compared against and dropped.
+            let operands = crate::ccl::subst::type_free_vars(&body_ty)
+                .contains(param)
+                .then(|| {
+                    (
+                        argument.clone_preserving_ids(),
+                        function.clone_preserving_ids(),
+                    )
+                });
             let elim_arg = elim_lambda_kinded(ctx, param, param_ty, *argument, fun_kind.clone())?;
             let elim_fn = elim_lambda_kinded(ctx, param, param_ty, *function, fun_kind.clone())?;
             let pair = zip_pair(elim_arg, elim_fn, &fun_kind);
@@ -1625,10 +1637,13 @@ fn elim_lambda_impl(
             // The transformer sits under the pair's binder, so its domain speaks
             // the opened form `body_ty` is already in.
             let apply_ty = match &pair.ty {
-                Type::Fun { codomain: cod, .. } => Type::compute_fun_or_hole(
-                    &crate::ccl::subst::open_codomain(&pair.ty, cod),
-                    &body_ty,
-                ),
+                Type::Fun { codomain: cod, .. } => {
+                    let input = crate::ccl::subst::open_codomain(&pair.ty, cod);
+                    match &operands {
+                        Some((a, f)) => operation_type(&[a, f], &input, &body_ty),
+                        None => Type::compute_fun_or_hole(&input, &body_ty),
+                    }
+                }
                 _ => Type::Hole,
             };
             let apply_var = Expr::builtin(Builtin::Apply).with_ty(apply_ty);
@@ -1823,6 +1838,36 @@ fn elim_lambda_impl(
             let zip_fn_ty = Type::compute_fun_or_hole(&inner_record.ty, &result_ty);
             let zip_var = Expr::builtin(Builtin::Zip).with_ty(zip_fn_ty);
             Ok(Expr::apply(inner_record, zip_var).with_ty(result_ty))
+        }
+
+        // **A collection bound from the parameter** is a value per argument, which the body
+        // reads as data: `λ 𝑥 → let 𝑣 = 𝑑(𝑥) in 𝑏` is the application `𝑑(𝑥) ▷ (λ 𝑣 → 𝑏)`, and
+        // the application and nested-lambda rules carry `𝑣` beside the argument. The rule below
+        // would lift it to a function of the argument, read at each use by applying that
+        // function to the argument, which a collection-valued function has no operator for.
+        TypedExprNode::Let {
+            binding,
+            bound_expr: def,
+            body: let_body,
+        } if def.ty.is_collection() && is_free(param, &def) => {
+            let _g = provenance::enter(
+                body_id,
+                "lambda_elim.let_as_application",
+                provenance::Nature::Machinery,
+            );
+            let lambda_ty = if crate::ccl::subst::codomain_depends_on(&binding.name, &let_body.ty) {
+                Type::pi(
+                    binding.name.clone(),
+                    binding.ty.clone(),
+                    let_body.ty.clone(),
+                )
+            } else {
+                Type::fun(binding.ty.clone(), let_body.ty.clone())
+            };
+            let lambda =
+                Expr::lambda(&binding.name, binding.ty.clone(), *let_body).with_ty(lambda_ty);
+            let application = Expr::apply(*def, lambda).with_ty(body_ty.clone());
+            elim_lambda_kinded(ctx, param, param_ty, application, fun_kind)
         }
 
         // Let binding:

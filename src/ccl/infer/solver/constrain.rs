@@ -1258,6 +1258,7 @@ fn discharged_witness(ty: &Type, s: &Subst) -> Option<Type> {
 fn eliminate_at(ty: &Type, s: &Subst) -> Option<(Type, Subst)> {
     use crate::ccl::ty::FunKind;
     let (term, rest) = s.top_elim()?;
+
     match ty {
         // A parameter is eliminated as its bound is, once the parameter's arm reads it.
         Type::Infer(_) | Type::Param(_) => None,

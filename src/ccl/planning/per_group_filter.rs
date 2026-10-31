@@ -56,35 +56,61 @@ pub(super) fn insert_per_group_filters(
         }
     });
     result?;
-    let TypedExprNode::Compose(elts) = &expr.node else {
-        return Ok(());
-    };
-    // The compose is what the recording names: the filter is spliced into it,
-    // and the site it narrows keeps its own id, re-typed in place. `Machinery`, for
-    // the reason `planning.iterate` is — a per-group filter is how a refinement the site's
-    // type already carries gets materialised, and the user wrote an inner
-    // comprehension with an `if`.
-    //
-    // The recording spans the *match*: `per_group_filter_site` clones a candidate's value
-    // predicate out of its refinements while probing, so a scan that rewrites nothing
-    // still copies. Those copies reach no output tree and compose away as transients
-    // of this node, as `planning.hash_join`'s rejected attempts do.
-    let _g = provenance::enter(
-        expr.node_id(),
-        "planning.per_group_filter",
-        provenance::Nature::Machinery,
-    );
-    let Some(site) = elts.iter().position(|e| per_group_filter_site(e).is_some()) else {
-        return Ok(());
-    };
-    // `site` is never 0: the morphism consumes a collection, so something upstream
-    // produces one.
-    if site == 0 {
+    let node_id = expr.node_id();
+    if let TypedExprNode::Compose(elts) = &mut expr.node {
+        // The compose is what the recording names: the filter is spliced into it,
+        // and the site it narrows keeps its own id, re-typed in place. `Machinery`, for
+        // the reason `planning.iterate` is — a per-group filter is how a refinement the site's
+        // type already carries gets materialised, and the user wrote an inner
+        // comprehension with an `if`.
+        //
+        // The recording spans the *match*: `per_group_filter_site` clones a candidate's value
+        // predicate out of its refinements while probing, so a scan that rewrites nothing
+        // still copies. Those copies reach no output tree and compose away as transients
+        // of this node, as `planning.hash_join`'s rejected attempts do.
+        let _g = provenance::enter(
+            node_id,
+            "planning.per_group_filter",
+            provenance::Nature::Machinery,
+        );
+        // A site may head the chain: a component of a `zip`, `(𝑚 ≫ sum, sum) ▷ zip`, receives
+        // the collection as the chain's own input, and the filter inserted before it takes
+        // that input.
+        if let Some(site) = elts.iter().position(|e| per_group_filter_site(e).is_some()) {
+            insert_before(elts, site, ctx)?;
+        }
         return Ok(());
     }
-    let TypedExprNode::Compose(elts) = &mut expr.node else {
-        unreachable!("matched a Compose above")
-    };
+    // **A site standing alone**, a component of a `zip` or an argument rather than an element
+    // of a chain, is a chain of one: the filter goes before it in a chain built in its place,
+    // which has the site's type.
+    let mut result = Ok(());
+    expr.walk_children_mut(|child| {
+        if result.is_err() || matches!(child.node, TypedExprNode::Compose(_)) {
+            return;
+        }
+        // Spanning the match, as for a chain's elements.
+        let _g = provenance::enter(
+            child.node_id(),
+            "planning.per_group_filter",
+            provenance::Nature::Machinery,
+        );
+        if per_group_filter_site(child).is_none() {
+            return;
+        }
+        let site_ty = child.ty.clone();
+        let mut elts = vec![std::mem::take(child)];
+        result = insert_before(&mut elts, 0, ctx);
+        *child = match <[Expr; 1]>::try_from(elts) {
+            Ok([only]) => only,
+            Err(elts) => Expr::compose(elts).with_ty(site_ty),
+        };
+    });
+    result
+}
+
+/// Materialize the narrowing of the site at `elts[site]` ([`insert_per_group_filters`]).
+fn insert_before(elts: &mut Vec<Expr>, site: usize, ctx: &mut PlanningCtx) -> Result<(), String> {
     let Some((binder, site_codomain, value_predicate)) = per_group_filter_site(&elts[site]) else {
         unreachable!("position found it")
     };
@@ -106,7 +132,7 @@ pub(super) fn insert_per_group_filters(
     let carried = upstream_codomain
         .codomain()
         .expect("a per-group filter site takes a collection");
-    let filtered = Type::fun_like(&upstream_codomain, narrowed, carried.clone());
+    let filtered = Type::fun_like(&upstream_codomain, narrowed.clone(), carried.clone());
     let filter_values = apply_primitive(
         value_predicate,
         Builtin::FilterValues,
@@ -115,8 +141,42 @@ pub(super) fn insert_per_group_filters(
     let filter = apply_primitive(
         filter_values,
         Builtin::Map,
-        Type::pi(binder, upstream_codomain, filtered.clone()),
+        Type::pi(binder.clone(), upstream_codomain.clone(), filtered.clone()),
     );
+    // **A site pairing each row with its keys**, `(𝐹, 𝑔) ▷ curry_over`, hands `𝑔` the whole
+    // enclosing value, which `𝑔` may read beyond the keys the narrowing keeps (`sum(g)` in
+    // `[sum(g) for x in g if x > 1]`). Filtering upstream would change that value, so the
+    // narrowing goes into the keys instead: `𝐹` reads the filtered collection.
+    let site_ty = elts[site].ty.clone();
+    if let TypedExprNode::Apply { argument, function } = &mut elts[site].node
+        && is_builtin(function, Builtin::CurryOver)
+        && let TypedExprNode::Tuple(parts) = &mut argument.node
+        && let [family, _] = parts.as_mut_slice()
+    {
+        if !is_builtin(family, Builtin::MapDomain) {
+            return Err(format!(
+                "a row-filtered site whose keys are not the row's own collection's is not \
+                 supported yet: its keys are {}",
+                symbolic(family)
+            ));
+        }
+        let keys = Type::data_fun(narrowed.clone(), narrowed);
+        let map_domain = std::mem::replace(family, Expr::builtin(Builtin::Id))
+            .with_ty(Type::fun(filtered, keys.clone()));
+        // The keys read the collection they are the keys of, by the filter's binder.
+        *family = Expr::compose(vec![filter, map_domain]).with_ty(Type::pi(
+            binder,
+            upstream_codomain,
+            keys,
+        ));
+        let family_ty = family.ty.clone();
+        if let TypedExprNode::Tuple(parts) = &argument.node {
+            argument.ty = Type::Tuple(vec![family_ty, parts[1].ty.clone()]);
+        }
+        // `curry_over` carries no scheme, so its type follows its argument.
+        function.ty = Type::fun(argument.ty.clone(), site_ty);
+        return Ok(());
+    }
     // The site now takes the narrowed collection, and its Pi binder is the filter's. An
     // `Apply`'s function slot carries the same function type, so it is re-typed with the node:
     // leaving it behind makes the node disagree with itself.
@@ -223,6 +283,37 @@ fn is_per_group_filter(e: &Expr) -> bool {
         if is_builtin(function, Builtin::Map)
             && matches!(&argument.node, TypedExprNode::Apply { function, .. }
                 if is_builtin(function, Builtin::FilterValues)))
+        || filters_its_keys(e)
+        || filters_its_pairs(e)
+}
+
+/// Whether `e` is a site pairing each row with keys whose morphism filters the pairs first,
+/// `(𝐹, filter_values(𝑝) ≫ 𝑔) ▷ curry_over`: a correlated filter, which
+/// `correlated::emit_pair_filter` puts at the head of the morphism, drops the keys the site's
+/// codomain leaves out.
+fn filters_its_pairs(e: &Expr) -> bool {
+    let is_filter = |e: &Expr| {
+        matches!(&e.node, TypedExprNode::Apply { function, .. }
+            if is_builtin(function, Builtin::FilterValues))
+    };
+    matches!(&e.node, TypedExprNode::Apply { argument, function }
+    if is_builtin(function, Builtin::CurryOver)
+        && matches!(&argument.node, TypedExprNode::Tuple(parts)
+            if parts.get(1).is_some_and(|g| match &g.node {
+                TypedExprNode::Compose(steps) => steps.first().is_some_and(is_filter),
+                _ => is_filter(g),
+            })))
+}
+
+/// Whether `e` is a site pairing each row with keys its family filters,
+/// `(map(filter_values(𝑞)) ≫ 𝐹, 𝑔) ▷ curry_over`: the narrowing [`insert_per_group_filters`]
+/// puts into the keys.
+fn filters_its_keys(e: &Expr) -> bool {
+    matches!(&e.node, TypedExprNode::Apply { argument, function }
+        if is_builtin(function, Builtin::CurryOver)
+            && matches!(&argument.node, TypedExprNode::Tuple(parts)
+                if matches!(&parts[0].node, TypedExprNode::Compose(steps)
+                    if steps.first().is_some_and(is_per_group_filter))))
 }
 
 /// Reject a narrowing [`insert_per_group_filters`] left standing.
@@ -230,19 +321,28 @@ fn is_per_group_filter(e: &Expr) -> bool {
 /// The site keeps claiming a narrowing no operator performs, and op-conversion reads a
 /// collection's extent with its refinements stripped, so compiling it would drop the filter
 /// and answer as though it were absent. Runs after [`insert_per_group_filters`] over the same
-/// positions it inspects: the elements of a composition after the first.
+/// positions it inspects: the elements of a composition, and a site standing alone.
 ///
 /// A site is rejected wherever its codomain claims a narrowing, not only where it has the shape
 /// [`narrowing`] matches: a codomain whose domain adds a refinement reading the site's input,
 /// over a base other than the one the site consumes, is a narrowing no operator performs either.
 pub(super) fn reject_unmaterialized_narrowings(expr: &Expr) -> Result<(), String> {
-    if let TypedExprNode::Compose(elts) = &expr.node
-        && let Some(site) = elts.iter().skip(1).find(|e| {
-            (narrowing(e).is_some() || refines_by_its_input(e)) && !is_per_group_filter(e)
-        })
-    {
-        let codomain = match &site.ty {
-            Type::Fun { codomain, .. } => open_codomain(&site.ty, codomain).to_string(),
+    let unmaterialized =
+        |e: &Expr| (narrowing(e).is_some() || refines_by_its_input(e)) && !is_per_group_filter(e);
+    // A chain's elements, or a site standing alone among another node's children.
+    let mut candidates: Vec<&Expr> = Vec::new();
+    match &expr.node {
+        TypedExprNode::Compose(elts) => candidates.extend(elts.iter()),
+        _ => expr.walk_children(|c| {
+            if !matches!(c.node, TypedExprNode::Compose(_)) {
+                candidates.push(c);
+            }
+        }),
+    }
+    if let Some(site) = candidates.into_iter().find(|e| unmaterialized(e)) {
+        let opened = crate::ccl::generalize::opened(&site.ty);
+        let codomain = match opened {
+            Type::Fun { codomain, .. } => open_codomain(opened, codomain).to_string(),
             _ => String::new(),
         };
         return Err(format!(
@@ -291,7 +391,7 @@ fn refines_by_its_input(e: &Expr) -> bool {
 /// `__elem ▷ (𝑔 ≫ 𝑞)`. A predicate reading another collection there, whose filter reads `binder`
 /// as a value, is a correlated filter.
 fn looks_up_at_the_key(predicate: &Expr, binder: &Name) -> bool {
-    let is_binder = |e: &Expr| matches!(&e.node, TypedExprNode::Var(n) if n == binder);
+    let is_binder = |e: &Expr| reads_the_binder(e, binder);
     if let TypedExprNode::Apply { argument, function } = &predicate.node
         && matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem())
         && (is_binder(function)
@@ -303,6 +403,14 @@ fn looks_up_at_the_key(predicate: &Expr, binder: &Name) -> bool {
     let mut found = false;
     predicate.walk_children(|child| found |= looks_up_at_the_key(child, binder));
     found
+}
+
+/// Whether `e` is the binder `binder`, in any spelling of it: simplification can leave a read
+/// of a pairing's component in a type, `(𝑔 ▷ ⟨id, 𝑓⟩).0`, where the pairing it removed stood,
+/// and that reads back to `𝑔` ([`ccl_utils::normal_form`]).
+fn reads_the_binder(e: &Expr, binder: &Name) -> bool {
+    let is_binder = |e: &Expr| matches!(&e.node, TypedExprNode::Var(n) if n == binder);
+    is_binder(e) || is_binder(&ccl_utils::normal_form(e))
 }
 
 /// Strip `__elem ▷ (𝑔 ≫ 𝑞)` down to `𝑞`, the predicate on the collection's values, where 𝑔 is
@@ -324,7 +432,7 @@ fn value_predicate(predicate: &Expr, binder: &Name) -> Option<Expr> {
     let [head, rest @ ..] = chain.as_slice() else {
         return None;
     };
-    if !matches!(&head.node, TypedExprNode::Var(n) if n == binder) {
+    if !reads_the_binder(head, binder) {
         return None;
     }
     let q = match rest {

@@ -333,7 +333,9 @@ fn a_filtered_inner_comprehension_over_the_outer_row_keeps_its_filter(
 /// A filtered inner comprehension over a **projection of the outer row** keeps its filter. The
 /// filter reads the row only through the projection, so the chain the curry reduces to,
 /// `.xs ≫ map(id)`, states the narrowing on `map` over the row carried through `.xs`, and
-/// planning materializes it as a per-group filter.
+/// planning materializes it as a per-group filter. Inside a `with begin():` block a mutable
+/// variable arrives as a projection of the block's snapshot tuple, so a filtered comprehension over
+/// a map-valued one is the same shape (`mut_var_in_block`).
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::bare_element(
@@ -348,36 +350,19 @@ fn a_filtered_inner_comprehension_over_the_outer_row_keeps_its_filter(
     "sum([max([v for v in r.xs if v > 1]) for r in [(xs=[1, 2]), (xs=[3, 4])]])",
     6
 )]
+#[case::mut_var_in_block(indoc! {r"
+    m: Mut(Map(Int, Int), Txn) := box(map([(1, 10)]))
+    n: Mut(Int, Txn) := 0
+    for r in [1, 2]:
+        with begin():
+            n := sum([v for v in m if v > 0])
+    await_final(n)
+"}, 10)]
 fn a_filtered_inner_comprehension_over_a_projected_row_keeps_its_filter(
     #[case] program: &str,
     #[case] total: i64,
 ) {
     check_scalar(program, Value::Int(total));
-}
-
-/// Inside a `with begin():` block a mutable variable arrives as a projection of the block's
-/// snapshot tuple, so a filtered comprehension over a map-valued one filters a projection too, of
-/// a boxed map. It does not compile: planning finds a filter on keys it takes to be the same for
-/// every row, `σ₁(__txp.0)`, which a debug build asserts and the check after planning otherwise
-/// rejects. Pinned as it fails; it answers 10.
-#[rstest]
-#[timeout(Duration::from_secs(10))]
-fn a_filtered_comprehension_over_a_mutable_map_in_a_block_does_not_compile() {
-    check_compile_error(
-        indoc! {r"
-            m: Mut(Map(Int, Int), Txn) := box(map([(1, 10)]))
-            n: Mut(Int, Txn) := 0
-            for r in [1, 2]:
-                with begin():
-                    n := sum([v for v in m if v > 0])
-            await_final(n)
-        "},
-        if cfg!(debug_assertions) {
-            "a filtered component's keys are the same for every row"
-        } else {
-            "post-planning produced an invalid tree"
-        },
-    );
 }
 
 /// A filter reading the outer row other than through the projection it narrows, `r.lim`

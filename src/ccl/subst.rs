@@ -1163,7 +1163,9 @@ impl Subst {
             }
         }
         // An elimination in `a` reads its sum through a term `b` then acts on; those in `b` act
-        // on what `a` produced, so they follow.
+        // on what `a` produced, so they follow. The term reaches a type only as a witness
+        // projection, which is a collection's domain, so `b` acts on it as on a domain: a
+        // binder `b` joins over is read at the key ([`Mapping::Join`]).
         //
         // **An elimination and its read-back through one term compose to the later one.** A
         // read-back `b` eliminates again takes `σᵢ(𝑐)` to `σᵢ` and back, so the pair is the
@@ -1181,7 +1183,7 @@ impl Subst {
         let elims: Vec<Elim> = a
             .elims
             .iter()
-            .map(|e| e.map_term(|t| b.without_elim().apply_expr(t)))
+            .map(|e| e.map_term(|t| b.without_elim().in_data_domain().apply_expr(t)))
             .filter(|e| !undone_by_b(e))
             .chain(b.elims.iter().cloned())
             .collect();
@@ -2013,13 +2015,16 @@ impl Subst {
             | Type::Param(_)
             | Type::BarrierVar(_) => {}
             // The projected sum is a term the type quotes, rebuilt once per substitution
-            // as a predicate is. It binds no element, so the substitution acts on it whole.
+            // as a predicate is. It binds no element, so the substitution acts on it whole,
+            // and as on a collection's domain, which a witness projection is wherever it
+            // stands ([`Self::in_data_domain`]).
             Type::WitnessProjection(p) => {
-                memo.rebuild(p, self, |term| {
-                    if !self.acts_on(term) {
+                let s = self.in_data_domain();
+                memo.rebuild(p, &s, |term| {
+                    if !s.acts_on(term) {
                         return false;
                     }
-                    self.rewrite_expr_go(term, memo);
+                    s.rewrite_expr_go(term, memo);
                     true
                 });
             }
@@ -2068,7 +2073,10 @@ impl Subst {
                     }
                 }
                 self.rewrite_type_go(domain, memo);
-                let restricted = self.shadow(b);
+                // Restricted to the entries that act on the codomain, as the structural mode's
+                // [`Self::under_binder_ty`] is: a range naming the binder captures only where
+                // the substitution reaches inside.
+                let restricted = self.shadow(b).acting_on_type(codomain);
                 restricted.assert_no_capture(b);
                 restricted.rewrite_type_go(codomain, memo);
             }
@@ -2112,13 +2120,20 @@ impl Subst {
             Type::Tuple(ts) => ts.iter_mut().for_each(|t| self.rewrite_type_go(t, memo)),
             // A component's name binds the components after it, as a `Fun`'s binds
             // its codomain.
+            // Each component under the earlier components' names, restricted as in the
+            // structural mode.
             Type::DepTuple(cs) => {
                 let mut restricted = self.clone();
+                let mut entered: Vec<Name> = Vec::new();
                 for (name, t) in cs.iter_mut() {
-                    restricted.rewrite_type_go(t, memo);
+                    let acting = restricted.acting_on_type(t);
+                    for b in &entered {
+                        acting.assert_no_capture(b);
+                    }
+                    acting.rewrite_type_go(t, memo);
                     if let Some(b) = name {
                         restricted = restricted.shadow(b);
-                        restricted.assert_no_capture(b);
+                        entered.push(b.clone());
                     }
                 }
             }
@@ -2148,6 +2163,12 @@ impl Subst {
     /// itself). Capture is therefore asserted rather than α-renamed, so no
     /// fresh names are minted on any equality-mediated path and the same
     /// discharge applied twice yields the same term.
+    ///
+    /// A type binder's scope can nest inside a type binding the same name: a chain's type
+    /// quotes its earlier morphisms, whose types bind the name lambda elimination gave every
+    /// morphism it built from one lambda. The assertion is made for the entries that act inside
+    /// the binder's scope ([`Self::under_binder_ty`], and the dependent-tuple arms), where a
+    /// collision would capture.
     fn under_binder(&self, binder: &Name, body: &TypedExpr) -> Subst {
         let restricted = self.shadow(binder);
         // If no substituted binder occurs free in the body, the substitution
@@ -2421,12 +2442,16 @@ impl Subst {
             },
 
             // The projected sum is a term the type quotes: substituted as a term, so a binder
-            // the projection leaves projects that binder's definition. A substitution acting
-            // on nothing in it keeps the `Rc`.
+            // the projection leaves projects that binder's definition. A witness projection is
+            // a collection's domain wherever it stands, so a binder the substitution joins over
+            // is read at the key ([`Self::in_data_domain`]): whether the function around it is
+            // a collection may not be known yet. A substitution acting on nothing in it keeps
+            // the `Rc`.
             Type::WitnessProjection(p) => {
-                let p = if self.acts_on(&p.term) {
+                let s = self.in_data_domain();
+                let p = if s.acts_on(&p.term) {
                     crate::ccl::ty::WitnessProjection::new(
-                        Rc::new(self.apply_expr(&p.term)),
+                        Rc::new(s.apply_expr(&p.term)),
                         p.position,
                     )
                 } else {
@@ -2494,14 +2519,23 @@ impl Subst {
             }
 
             Type::Tuple(ts) => Type::Tuple(ts.iter().map(|t| self.apply_type(t)).collect()),
+            // Each component under the names of the components before it, as a codomain is under
+            // its function's binder ([`Self::under_binder_ty`]): restricted to the entries that
+            // act on it, so a range naming an earlier component captures only where the
+            // substitution reaches inside.
             Type::DepTuple(cs) => {
                 let mut restricted = self.clone();
+                let mut entered: Vec<&Name> = Vec::new();
                 let mut out = Vec::with_capacity(cs.len());
                 for (name, t) in cs {
-                    out.push((name.clone(), restricted.apply_type(t)));
+                    let acting = restricted.acting_on_type(t);
+                    for b in &entered {
+                        acting.assert_no_capture(b);
+                    }
+                    out.push((name.clone(), acting.apply_type(t)));
                     if let Some(b) = name {
                         restricted = restricted.shadow(b);
-                        restricted.assert_no_capture(b);
+                        entered.push(b);
                     }
                 }
                 Type::DepTuple(out)
@@ -3807,6 +3841,45 @@ mod tests {
         assert_eq!(inner_first, outer_first);
         let pred = gt(var("a"), plus(var("x"), var("y")));
         assert_eq!(inner_first.apply_expr(&pred), outer_first.apply_expr(&pred));
+    }
+
+    /// A substitution whose range names a binder passes under that binder where it acts on
+    /// nothing inside, in both modes: a type quoting a term whose type binds a name the
+    /// substitution renames to, as a chain's type quotes its earlier morphisms.
+    #[test]
+    fn a_rename_passes_under_a_same_named_binder_it_does_not_reach() {
+        let int_ty = Type::Base(crate::ccl::BaseType::Int);
+        let rename = Subst::rename("r", "g");
+        let pair = Type::DepTuple(vec![
+            (Some(Name::from("g")), int_ty.clone()),
+            (None, int_ty.clone()),
+        ]);
+        let function = Type::pi(Name::from("g"), int_ty.clone(), int_ty.clone());
+        let ty = Type::Tuple(vec![pair, function]);
+        assert_eq!(rename.apply_type(&ty), ty);
+        let mut rewritten = var("e").with_ty(ty.clone());
+        rename.rewrite_expr(&mut rewritten);
+        assert_eq!(rewritten.ty, ty);
+    }
+
+    /// A witness projection is a collection's domain wherever it stands, so a binder it projects
+    /// through, joined at a key, is read there, in both modes, even where the function around it
+    /// is not stated to be a collection: a row's funkind can still be undetermined when a loop's
+    /// exit reaches it.
+    #[test]
+    fn a_witness_projection_reads_a_joined_binder_at_the_key() {
+        let read = TypedExpr::apply(var("key"), var("src"));
+        let exit = Subst::join_at_key("g", read.clone());
+        let projected = |term: TypedExpr| {
+            Type::WitnessProjection(crate::ccl::ty::WitnessProjection::new(Rc::new(term), 0))
+        };
+        let int_ty = Type::Base(crate::ccl::BaseType::Int);
+        let row = Type::fun(projected(var("g")), int_ty.clone());
+        let expected = Type::fun(projected(read), int_ty);
+        assert_eq!(exit.apply_type(&row), expected);
+        let mut rewritten = var("r").with_ty(row);
+        exit.rewrite_expr(&mut rewritten);
+        assert_eq!(rewritten.ty, expected);
     }
 
     /// A projection out of a pairing's binder read only in a cast nested inside another cast's
