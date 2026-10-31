@@ -51,11 +51,12 @@ default parameters.
 before it consults scope. A `Function`-kind builtin lowers in its own arm, and a call of the wrong
 arity is refused. A call of the `Qualifier`-kind `summon` is refused: the parser reads
 `summon(T)::f` itself. Any other name, including a builtin of another kind, lowers as a call to a
-registered source when one has that name and as an ordinary application otherwise. A zero-argument
-call to such a name that no registered source has is refused, because an ordinary application needs
-an argument; `begin()` and `test_sink()` in expression position are refused this way. The `with`
-block recognizes `begin`, and `sink_declaration` recognizes `http_serve` and `test_sink`, both
-through the same table.
+registered source when one has that name and as an ordinary application otherwise. An ordinary
+application with no arguments applies the callee to the unit, `f()` → `unit ▷ f`, and a function of
+no parameters binds the unit (`uncurry_params`). A name beginning with `__` that names an intrinsic
+lowers to a `Reading` node, in a std module only (`lower_reading`). The `with` block recognizes
+`begin`, and `sink_declaration` recognizes `http_serve` and `test_sink`, both through the same
+table.
 
 ## Generator functions and feed-only loops
 

@@ -5,8 +5,8 @@ use smol_str::SmolStr;
 
 use crate::{
     ccl::{
-        AggregateKind, Builtin, Expr, F_WRITES, FieldKey, Lit, Name, ProjKey, TagMap, TransactKey,
-        Type, TypedExprNode, V_COMMIT, WriterSite,
+        AggregateKind, Builtin, Expr, F_WRITES, FieldKey, Lit, Name, ProjKey, Reading, TagMap,
+        TransactKey, Type, TypedExprNode, V_COMMIT, WriterSite,
         ccl_utils::strip_refinements,
         ccl_utils::{free_names, is_trivially_true_predicate},
         content_hash::{ContentHash, content_hash},
@@ -46,9 +46,9 @@ use crate::{
             Aggregate, CheckedLookup, Constant, Converse, ExtractAggregate, ExtractFinal, FanOut,
             Filter, FlattenTupleDomain, IterateExtent, Lookup, MakeRecord, MapAggregate, MapDomain,
             MapExtractAggregate, MapResult, MapResultToConst, MapResultToConstMode,
-            MapResultWithSource, Memo, PermuteRecordDomain, Product, Restrict, SelectField,
-            TileOperator, Tiling, Uncurry, UnionOperator, VariantIs, VariantProject, VariantWrap,
-            zip_arms_at, zip_arms_named_at,
+            MapResultWithSource, Memo, PermuteRecordDomain, Product, ReadingSource, Readings,
+            Restrict, SelectField, TileOperator, Tiling, Uncurry, UnionOperator, VariantIs,
+            VariantProject, VariantWrap, zip_arms_at, zip_arms_named_at,
         },
         tuple_field,
         uint_of_row,
@@ -445,6 +445,8 @@ pub struct OpConversionContext {
     /// ([`reads_a_source`]). Installed by the same call, because both answer
     /// about the tree rather than about the compilation.
     unrecomputable: HashSet<NodeId>,
+    /// The source of each reading site's values ([`Self::reading_source`]).
+    readings: HashMap<Rc<crate::ccl::site::Site>, Rc<RefCell<ReadingSource>>>,
     /// The nodes of that tree whose value comes from a `@LoadFrom`
     /// ([`is_a_load`]). Off the same [`nodes_reaching`] walk as the field above,
     /// and read where a store decides whether its seed summarizes positions.
@@ -894,6 +896,22 @@ impl OpConversionContext {
         );
         [self.unrecomputable, self.load_from_derived] =
             nodes_reaching(expr, [reads_a_source, is_a_load]);
+        self.readings.clear();
+    }
+
+    /// The source of `reading`'s site, which every copy of the call reads.
+    fn reading_source(&mut self, reading: &Reading) -> Rc<RefCell<ReadingSource>> {
+        let source = self
+            .readings
+            .entry(Rc::clone(&reading.site))
+            .or_insert_with(|| Rc::new(RefCell::new(ReadingSource::new(reading.intrinsic))));
+        assert_eq!(
+            source.borrow().intrinsic(),
+            reading.intrinsic,
+            "one site is one call, of one intrinsic: {}",
+            reading.site,
+        );
+        Rc::clone(source)
     }
 
     /// Install where each node of the tree about to be converted stood in the
@@ -3055,6 +3073,12 @@ fn convert_impl_inner(
                         payload_extent,
                     )))
                 }
+                // A reading at each position of the input's keys: the run records one value per
+                // position and call path.
+                Builtin::Reading(reading) => {
+                    let source = ctx.reading_source(reading);
+                    Ok(Box::new(Readings::at(input, source, ctx.level())))
+                }
                 // `variant_is(c)` — the total tag test. Same scrutinee shapes as
                 // `variant_project(c)`, but every key of the domain is answered,
                 // which is what a writer decision's guard position takes.
@@ -3287,6 +3311,18 @@ fn convert_impl_inner(
             Ok(Box::new(MapResultWithSource::projecting(
                 source, input, fields,
             )))
+        }
+
+        // A reading with no position operand stands outside every loop, at the one position
+        // with no keys (`inline::bind_reading_positions`). Under a lambda it is constant in the
+        // binder, so `lambda_elim` has made it a `const` and it is converted with no input.
+        TypedExprNode::Reading(reading) => {
+            assert!(
+                input.is_none(),
+                "a reading with no position operand is converted outside every loop: {}",
+                reading.site,
+            );
+            Ok(Box::new(Readings::once(ctx.reading_source(reading))))
         }
 
         // `@LoadFrom(x)`: the value the retired version held, as a constant.

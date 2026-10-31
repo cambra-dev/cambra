@@ -4792,6 +4792,7 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::Abstract
         | N::Begin { .. }
         | N::LoadFrom(_)
+        | N::Reading(_)
         | N::Error => true,
         // The two shapes a term this walk compares never holds; the catch-all says why.
         N::LetRec { .. } | N::Transact { .. } | N::LetType { .. } | N::Run { .. } => false,
@@ -4840,6 +4841,7 @@ fn eq_term_modulo_ty_slots_go(
         // than a `VarRef`). Resolving it through the pairing would equate two spellings
         // that name different predecessors' variables.
         (N::LoadFrom(x), N::LoadFrom(y)) => x == y,
+        (N::Reading(x), N::Reading(y)) => x == y,
         (N::Defer, N::Defer) | (N::Abstract, N::Abstract) | (N::Error, N::Error) => true,
         (
             N::Apply {

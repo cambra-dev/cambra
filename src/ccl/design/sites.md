@@ -32,7 +32,9 @@ A site (`crate::ccl::site::Site`) is a place, the places of the calls that reach
 first, and the run's path (`RunPath`). Each IR form carries its site in one slot:
 
 - a feed carries it in `TypedExprNode::Feed`'s `site`;
-- a call carries it on the callee's `Var`, in `TypedExpr::site`.
+- a call carries it on the callee's `Var`, in `TypedExpr::site`;
+- a call of an intrinsic, a reading, carries it in `Reading::site`, which keys the values the run
+  reads for it (`src/ccl/design/ir.md`, "Readings").
 
 Three passes change a site:
 

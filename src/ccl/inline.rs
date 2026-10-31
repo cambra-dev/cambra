@@ -75,17 +75,20 @@
 //! [`Define`]: crate::ccl::TypedExprNode::Define
 
 use crate::ccl::{
-    BindingTransparency, Expr, Lit, Name, ProjKey, Refinement, Type, TypedBinding, TypedExprNode,
+    BindingTransparency, Builtin, Expr, FunKind, Lit, Name, ProjKey, Refinement, Type,
+    TypedBinding, TypedExprNode,
     ccl_utils::{
         PredMemo, count_free, discharge_transparent_lets, free_names_in_value, is_free,
         refresh_let_binder, spelled_in_a_type, walk_refined_predicates_mut,
     },
     lambda_elim::substitute,
     provenance,
+    site::Site,
 };
 
 use crate::ccl::infer::solver::smt::{NoScope, SmtError, smt_sub};
 use std::collections::HashSet;
+use std::rc::Rc;
 
 // ---------------------------------------------------------------------------
 // Public entry points
@@ -108,7 +111,67 @@ use std::collections::HashSet;
 pub fn inline_capability_lambdas(expr: Expr) -> Expr {
     let expr = inline_impl(expr, &mut HashSet::new());
     let expr = beta_reduce_variable_arguments(expr);
-    inline_list_element_reads(expr, &PredMemo::new()).0
+    let mut expr = inline_list_element_reads(expr, &PredMemo::new()).0;
+    bind_reading_positions(&mut expr, &mut Vec::new());
+    expr
+}
+
+/// Give every reading under a binder its position as an operand: under the binders
+/// `𝑥₁ … 𝑥ₙ` of the loops and lambdas around it, `__now()` becomes
+/// `(𝑥₁, …, 𝑥ₙ) ▷ reading(__now)` (`src/ccl/design/ir.md`, "Readings").
+///
+/// A reading's value is one per position, the key path of every iteration around it, so it
+/// depends on each enclosing binder whether or not it names one. The operand states that
+/// dependence as data: every later pass's free-variable analysis then keeps the reading inside
+/// each iteration around it, where a reading with no operand would read as invariant in the
+/// binders and could be lifted out of its loop. Operator conversion reads only the operand's
+/// keys. A reading under no binder keeps no operand: it has the one position outside every loop.
+///
+/// Runs last in inlining, once every site is complete: a reading in a function's body
+/// takes its position from the loops around the call.
+fn bind_reading_positions(e: &mut Expr, binders: &mut Vec<(Name, Type)>) {
+    let node_id = e.node_id();
+    match &mut e.node {
+        TypedExprNode::Reading(reading) if !binders.is_empty() => {
+            let _g = provenance::enter(
+                node_id,
+                "inline.reading_position",
+                provenance::Nature::Machinery,
+            );
+            let mut vars: Vec<Expr> = binders
+                .iter()
+                .map(|(name, ty)| Expr::var(name.clone()).with_ty(ty.clone()))
+                .collect();
+            let operand = if vars.len() == 1 {
+                vars.pop().expect("one binder")
+            } else {
+                let ty = Type::tuple(vars.iter().map(|v| v.ty.clone()).collect());
+                Expr::tuple(vars).with_ty(ty)
+            };
+            let fn_ty = Type::Fun {
+                name: None,
+                fun_kind: FunKind::Compute,
+                domain: Box::new(operand.ty.clone()),
+                codomain: Box::new(e.ty.clone()),
+                effects: crate::ccl::effects::Effects::none(),
+            };
+            let function = Expr::builtin(Builtin::Reading(reading.clone())).with_ty(fn_ty);
+            let ty = e.ty.clone();
+            *e = Expr::apply(operand, function).with_ty(ty);
+        }
+        TypedExprNode::Lambda { param, body } => {
+            binders.push((param.name.clone(), param.ty.clone()));
+            bind_reading_positions(body, binders);
+            binders.pop();
+        }
+        TypedExprNode::For { target, iter, body } => {
+            bind_reading_positions(iter, binders);
+            binders.push((target.name.clone(), target.ty.clone()));
+            bind_reading_positions(body, binders);
+            binders.pop();
+        }
+        _ => e.walk_children_mut(|child| bind_reading_positions(child, binders)),
+    }
 }
 
 /// Refuse a call whose function the inliner could not resolve, pointing at the call.
@@ -214,7 +277,7 @@ fn beta_reduce_variable_arguments_under(mut expr: Expr, enclosing: &mut Vec<Name
 /// `src/ccl/design/optimization.md`, "Collection sharing".
 fn should_inline(bound_ty: &Type) -> bool {
     match bound_ty {
-        Type::Fun { fun_kind, .. } => !matches!(fun_kind, crate::ccl::ty::FunKind::Data(..)),
+        Type::Fun { fun_kind, .. } => !matches!(fun_kind, FunKind::Data(..)),
         _ => false,
     }
 }
@@ -1306,6 +1369,22 @@ fn collect_var_elements(tuple: &Expr, out: &mut Vec<Name>) {
     }
 }
 
+/// Extend every site in `e`, a copy of a function's body made for a call, with that call's
+/// site ([`Site::through`]): a feed's, a call's and a reading's.
+fn reached_through(e: &mut Expr, call: &Site) {
+    if let Some(site) = &e.site {
+        e.site = Some(site.through(call));
+    }
+    match &mut e.node {
+        TypedExprNode::Feed {
+            site: Some(site), ..
+        } => *site = site.through(call),
+        TypedExprNode::Reading(reading) => reading.through(call),
+        _ => {}
+    }
+    e.walk_children_mut(|child| reached_through(child, call));
+}
+
 /// Substitute `lambda` at every free occurrence of `name` in `expr`, and
 /// beta-reduce at each call-site Apply chain — i.e. where `Var(name)` sits in
 /// the function position of an `Apply(arg, …)` (optionally nested for curried
@@ -1333,9 +1412,10 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
     if let TypedExprNode::Var(ref n) = expr.node
         && n == name
     {
-        // A call copies the body: the sites in the copy are reached through it
-        // (`crate::ccl::site`). A use that is not a call, such as a function passed as an
-        // argument, names no call, and its copy is reached where it is called.
+        // A call copies the body: the readings and sites in the copy are reached through it
+        // (`docs/chl-spec.md`, "Inputs from outside the program"; `crate::ccl::site`). A use
+        // that is not a call, such as a function passed as an argument, names no call site,
+        // and the sites in its copy are reached where it is called.
         let mut copy = lambda.clone();
         if let Some(call) = &expr.site {
             reached_through(&mut copy, call);
@@ -1578,7 +1658,7 @@ fn substitute_floating_lets(body: Expr, param: TypedBinding, argument: Expr) -> 
     }
     let reduced = if is_shared_computation(&value, &param.name, &body) {
         bind_argument(param, value, body)
-    } else if matches!(value.node, TypedExprNode::Lambda { .. }) && holds_a_site(&value) {
+    } else if matches!(value.node, TypedExprNode::Lambda { .. }) {
         substitute_function(body, &param.name, &value)
     } else {
         substitute(body, &param.name, &value)
@@ -1590,31 +1670,11 @@ fn substitute_floating_lets(body: Expr, param: TypedBinding, argument: Expr) -> 
         })
 }
 
-/// Extend every site in `e`, a copy of a function's body made for a call, with that call's
-/// site ([`crate::ccl::site::Site::through`]).
-fn reached_through(e: &mut Expr, call: &crate::ccl::site::Site) {
-    if let Some(site) = &e.site {
-        e.site = Some(site.through(call));
-    }
-    if let TypedExprNode::Feed {
-        site: Some(site), ..
-    } = &mut e.node
-    {
-        *site = site.through(call);
-    }
-    e.walk_children_mut(|child| reached_through(child, call));
-}
-
-/// Whether `e` holds a feed's or a call's site.
-fn holds_a_site(e: &Expr) -> bool {
-    e.site.is_some()
-        || matches!(e.node, TypedExprNode::Feed { site: Some(_), .. })
-        || e.any_child(holds_a_site)
-}
-
-/// Substitute the function `value` for `name` in `body`, where each call of it is a call of its
-/// own: the sites in each call's copy are reached through it, as a named function's are. A use
-/// that is not a call takes the plain copy, reached where it is called.
+/// Substitute the function `value` for `name` in `body`, where each use is a call of its own:
+/// the readings and sites in each use's copy are reached through that use, as a named function's
+/// are ([`reached_through`]; `docs/chl-spec.md`, "Inputs from outside the program"). A copy of a
+/// data value is the same evaluation and keeps its sites, which is why only a function
+/// takes this path.
 ///
 /// Each use is first renamed apart, so that [`substitute`] places every copy and keeps its
 /// capture avoidance. A mention in a type slot is not a use, and takes the plain copy.
@@ -1632,13 +1692,9 @@ fn substitute_function(body: Expr, name: &Name, value: &Expr) -> Expr {
     substitute(body, name, value)
 }
 
-/// Rename every free use of `name` in `e` to a name of its own, recording each with the call
-/// site it stood at, where it is a call.
-fn rename_uses(
-    e: &mut Expr,
-    name: &Name,
-    uses: &mut Vec<(Name, Option<std::rc::Rc<crate::ccl::site::Site>>)>,
-) {
+/// Rename every free use of `name` in `e` to a name of its own, recording each with its call
+/// site, where it is a call.
+fn rename_uses(e: &mut Expr, name: &Name, uses: &mut Vec<(Name, Option<Rc<Site>>)>) {
     let call = e.site.clone();
     match &mut e.node {
         TypedExprNode::Var(n) if n == name => {

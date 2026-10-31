@@ -226,6 +226,8 @@ fn is_atomic(e: &Expr, muts: &Muts) -> bool {
         | TypedExprNode::Builtin(_)
         | TypedExprNode::TraitFn { .. }
         | TypedExprNode::Lambda { .. } => true,
+        // A reading is named where it is evaluated: a copy of the call would be a second
+        // reading, where a copy of the name is the same one.
         // An unresolved method stands for one of its candidate references, each an atom,
         // and inference resolves it only where it is an application's function.
         TypedExprNode::Method { .. } => true,
@@ -337,6 +339,7 @@ fn normalize_inner(e: Expr, muts: &Muts) -> Expr {
         | TypedExprNode::Var(_)
         | TypedExprNode::Source(..)
         | TypedExprNode::LoadFrom(_)
+        | TypedExprNode::Reading(_)
         | TypedExprNode::Proj(_)
         | TypedExprNode::Defer
         | TypedExprNode::Abstract

@@ -572,3 +572,35 @@ registry makes names available while constructing the tree; `compile_program` re
 with inference and conversion after lowering has discovered them. The conversion registry
 shares a materialized source extent across references to the same registered source. Sink
 bindings remain outside the expression tree as described by the purity invariant.
+
+## Readings
+
+`Reading(intrinsic)` is a call of an intrinsic whose value comes from outside the program,
+`__now()` or `__random()` (`docs/chl-spec.md`, "Inputs from outside the program"). Lowering makes
+one from a call in a std module and refuses one in any other (`lower_reading`). Inference types it
+`Int` and records `Ext`.
+
+A reading has one value per position and call path. The call path is the call's site
+([sites.md](sites.md)): its place, reached through each call of a function inlining copied it
+through, outermost first (`Reading::site`). Inlining extends it at each call of a named function
+and of a function value a beta reduction substitutes (`reached_through`, `substitute_function`),
+because each call is a call of its own. A copy of a data value is the same evaluation, so every
+other pass copies the site with the term, and the copies mutability elimination makes of one
+evaluation are one reading.
+
+The position is the key path of every loop around the call. Inlining's last step gives a reading
+under binders 𝑥₁ … 𝑥ₙ, of the loops and lambdas around it, an operand naming them:
+`(𝑥₁, …, 𝑥ₙ) ▷ reading(__now)` (`bind_reading_positions`). The operand states the dependence on
+each enclosing iteration as data, so every later pass's free-variable analysis keeps the reading
+inside them, and `lambda_elim` needs no rule of its own: `reading(__now)` is a morphism like any
+builtin. A reading under no binder keeps no operand and has the one position outside every loop;
+under a lambda it is constant in the binder.
+
+Equality of terms includes the site, so two calls are unequal terms and nothing that merges equal
+terms makes them one call. `content_hash` hashes only the intrinsic: a reload pairs readings by
+where they sit in the tree, as it pairs any other leaf.
+
+Operator conversion compiles `reading` to `Readings` over its operand, and a `Reading` with no
+operand to `Readings` at the one position with no keys. Every `Readings` of one site reads one
+`ReadingSource`, which holds the value taken the first time any of them asks for a position. Copies
+of a call agree whatever positions each one's input carries.

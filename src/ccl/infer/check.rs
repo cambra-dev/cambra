@@ -854,9 +854,10 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         // Leaves whose type carries the full load and was resolved during
         // inference — trust the recorded type (matching the old typecheck,
         // which left these unchecked).
-        TypedExprNode::Var(_) | TypedExprNode::Builtin(_) | TypedExprNode::LoadFrom(_) => {
-            expr.ty.clone()
-        }
+        TypedExprNode::Var(_)
+        | TypedExprNode::Builtin(_)
+        | TypedExprNode::LoadFrom(_)
+        | TypedExprNode::Reading(_) => expr.ty.clone(),
 
         // A projected source is minted by projection pruning, after planning, with the type
         // of its leaves stamped on it. The registered source type states what that type must

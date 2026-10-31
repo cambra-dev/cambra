@@ -21,7 +21,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use super::scope::{ScopedItem, for_each_scoped_item};
-use super::{FunKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExpr, TypedExprNode};
+use super::{Builtin, FunKind, Lit, Name, ProjKey, Type, TypedBinding, TypedExpr, TypedExprNode};
 
 /// A 64-bit term fingerprint under the chosen free-variable and structural hashing rules.
 /// Equal fingerprints can collide; they do not prove term equivalence.
@@ -509,6 +509,9 @@ fn hash_payload<'a>(
         N::Lit(Lit::String(s)) => s.hash(h),
         N::Lit(Lit::Bool(b)) => b.hash(h),
         N::Lit(Lit::Unit) => {}
+        // A reading's site is left out: a reload pairs readings by where they sit; see the leaf
+        // below.
+        N::Builtin(Builtin::Reading(r)) => r.intrinsic.hash(h),
         N::Builtin(b) => b.hash(h),
         N::Source(s, projection) => {
             s.hash(h);
@@ -518,6 +521,11 @@ fn hash_payload<'a>(
         // by where the node sits, and the enclosing structure a reader hashes
         // carries that.
         N::LoadFrom(s) => s.hash(h),
+        // Two readings of one intrinsic hash alike: which values each reads is decided by where
+        // it sits, as for a `LoadFrom`. This is correspondence between versions, not equality:
+        // two readings at different sites are two calls, unequal as terms, and a pass that
+        // merges equal terms compares them with `==`, never by this hash.
+        N::Reading(r) => r.intrinsic.hash(h),
         N::Proj(ProjKey::Index(i)) => i.hash(h),
         N::Proj(ProjKey::Field(f)) => f.hash(h),
 
@@ -765,6 +773,25 @@ mod tests {
             h(&light(&["red", "green"])),
             h(&light(&["red", "green", "blue"]))
         );
+    }
+
+    /// Two calls of one intrinsic hash alike, so a reload pairs them by where they sit, and are
+    /// unequal as terms, so nothing that merges equal terms makes them one call.
+    #[test]
+    fn two_readings_hash_alike_and_are_two_calls() {
+        use crate::ccl::site::{PlaceKind, root_site};
+        use crate::ccl::{Intrinsic, Reading};
+        let (one, two) = (0, 1);
+        let reading = |at: u32| Reading {
+            intrinsic: Intrinsic::Random,
+            site: root_site(PlaceKind::Call, "__random", at),
+        };
+        let leaf = |at| TypedExpr::new(TypedExprNode::Reading(reading(at)));
+        let applied = |at| TypedExpr::builtin(Builtin::Reading(reading(at)));
+        assert_eq!(h(&leaf(one)), h(&leaf(two)));
+        assert_eq!(h(&applied(one)), h(&applied(two)));
+        assert_ne!(leaf(one).node, leaf(two).node);
+        assert_ne!(applied(one).node, applied(two).node);
     }
 
     #[test]

@@ -840,6 +840,73 @@ pub enum Builtin {
     /// scheme: its type `Union ⇒ Bool` is stamped on the node and the post-phase
     /// CHECK-mode `typecheck` trusts it (like [`Self::VariantProject`]).
     VariantIs(FieldKey),
+    /// `reading(i) : 𝐴 ⇒ 𝑉` — the reading `i` at each position of its input's domain
+    /// (`docs/chl-spec.md`, "Inputs from outside the program"). The input's value is not read:
+    /// its key path is the position, and the run records one value per position.
+    ///
+    /// Minted by inlining, applied to the binders of the loops and lambdas around a
+    /// [`TypedExprNode::Reading`], so that every later pass sees the reading depend on them
+    /// (`src/ccl/design/ir.md`, "Readings"). Its type is stamped on the node, as
+    /// [`Self::VariantIs`]'s is.
+    ///
+    /// [`TypedExprNode::Reading`]: crate::ccl::TypedExprNode::Reading
+    Reading(Reading),
+}
+
+/// One call of an intrinsic: which intrinsic, and the site of the call
+/// (`docs/chl-spec.md`, "Inputs from outside the program"; `src/ccl/design/sites.md`).
+///
+/// The site is the call's place, reached through each call of a function inlining copied it
+/// through, outermost first. A pass that copies a term copies the site with it, so every copy of
+/// one evaluation is one reading, and two calls are two. Equality includes the site, so two
+/// calls are unequal terms (`src/ccl/design/ir.md`, "Readings").
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Reading {
+    pub intrinsic: Intrinsic,
+    pub site: std::rc::Rc<crate::ccl::site::Site>,
+}
+
+impl Reading {
+    /// This reading reached through the call `call`, which inlining replaced by the body
+    /// holding it.
+    pub fn through(&mut self, call: &crate::ccl::site::Site) {
+        self.site = self.site.through(call);
+    }
+}
+
+/// A builtin whose value comes from outside the program: a reading
+/// (`docs/chl-spec.md`, "Inputs from outside the program"). Its name begins with `__`, and only
+/// a std module names one (`docs/chl-spec.md`, "9.16 The std root").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum Intrinsic {
+    /// `__now()`: the runtime's clock, in nanoseconds since the Unix epoch.
+    Now,
+    /// `__random()`: a random `Int`.
+    Random,
+}
+
+impl Intrinsic {
+    /// Every intrinsic.
+    pub const ALL: [Intrinsic; 2] = [Intrinsic::Now, Intrinsic::Random];
+
+    /// The name a std module calls it by.
+    pub fn spelling(self) -> &'static str {
+        match self {
+            Intrinsic::Now => "__now",
+            Intrinsic::Random => "__random",
+        }
+    }
+
+    /// The intrinsic named `name`, if any.
+    pub fn named(name: &str) -> Option<Intrinsic> {
+        Self::ALL.into_iter().find(|i| i.spelling() == name)
+    }
+}
+
+impl fmt::Display for Intrinsic {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.spelling())
+    }
 }
 
 impl Builtin {
@@ -894,6 +961,7 @@ impl Builtin {
             Self::LookupChecked => "lookup?",
             Self::Insert => "insert",
             Self::VariantIs(_) => "variant_is",
+            Self::Reading(_) => "reading",
         }
     }
 

@@ -62,19 +62,14 @@ pub type Duration = Int
 #   earlier than one taken before it.
 # - Each evaluation of a call reads the clock, once per iteration of each enclosing loop. Two calls
 #   can return different readings, including two in one transaction.
-# - A call at a module's top level reads the clock once, when the program starts. A reload keeps
-#   the reading of a binding it keeps.
+# - A call at a module's top level reads the clock once, when the program starts. A reload may
+#   read the clock again; a mutable variable holding a reading keeps it across reloads.
 # - A reading orders nothing, and commit order never consults one: a transaction that commits after
 #   another can hold an earlier reading.
 # - A call is IO. A module whose top-level evaluation calls `now()` is run, not imported
 #   (docs/chl-spec.md, "9.7 Importing asserts a shareable module").
-#
-# [proposed] a call the compiler represents as a read of a clock source at the call's position
-# (docs/chl-spec.md, "7.5 Time [Decided]"); a zero-argument call of a std builtin, where a `def`
-# with no parameters is refused (docs/chl-spec.md, "3.8 Function calls"); and binding the
-# intrinsic `__now`, a name "9.15 Module files" refuses in user modules.
 pub def now() => Instant:
-    __now()
+    Instant::new(__now())
 
 # Returns a source and a sink: each row fed to the sink comes out of the source once the clock
 # reaches the row's `at`.
@@ -132,10 +127,9 @@ pub def now() => Instant:
 #                     pass
 #
 # [proposed] a builtin source and sink a std module provides, bound by tuple destructuring
-# (docs/chl-spec.md, "9.16 The std root"; docs/chl-spec.md, "7.5 Time [Decided]"), called with
-# no arguments (docs/chl-spec.md, "3.8 Function calls"), and bound through the intrinsic
-# `__alarms`, a name "9.15 Module files" refuses in user modules; a type for a
-# source, which the spec does not name; a type parameter determined by the use (docs/chl-spec.md,
+# (docs/chl-spec.md, "9.16 The std root"; docs/chl-spec.md, "7.5 Time [Decided]"), through the
+# intrinsic `__alarms` (docs/chl-spec.md, "9.16 The std root"); a type for a source, which the
+# spec does not name; a type parameter determined by the use (docs/chl-spec.md,
 # "Type parameters"), bounded as in "Kinds and bounds"; a source's element type taken from the rows
 # fed to its sink, where today a source's type is fixed before inference; a sink whose held rows
 # the runtime feeds back into the graph; held rows kept across a reload, and their reload identity;

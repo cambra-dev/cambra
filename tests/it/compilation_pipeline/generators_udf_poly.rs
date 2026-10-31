@@ -192,6 +192,53 @@ fn a_call_to_a_function_chosen_at_run_time_is_refused(#[case] code: &str, #[case
     assert_eq!(&code[span.start..span.end], site);
 }
 
+/// A function of no parameters is called with no arguments, which apply it to the unit
+/// (`docs/chl-spec.md`, "3.8 Function calls").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_def(indoc! {"
+    def zero() => Int:
+        0
+    zero() + 1
+"}, Value::Int(1))]
+#[case::a_block_body(indoc! {"
+    def total():
+        xs = [1, 2, 3]
+        sum(xs) * 2
+    total()
+"}, Value::Int(12))]
+#[case::a_lambda(indoc! {"
+    three = \\ -> 3
+    three() + three()
+"}, Value::Int(6))]
+#[case::in_an_iteration(indoc! {"
+    def two():
+        2
+    sum([x * two() for x in [1, 2, 3]])
+"}, Value::Int(12))]
+#[case::an_associated_function(indoc! {"
+    type Price = Int
+    def Price::zero() => Price:
+        Price::new(0)
+    Price::zero().extract() + 5
+"}, Value::Int(5))]
+#[case::a_trait_function(indoc! {"
+    type Circle = Int
+    trait One(S):
+        def one() => S
+    impl One(Circle):
+        def one() => Circle:
+            Circle::new(1)
+    summon(One(Circle))::one().extract() + 1
+"}, Value::Int(2))]
+#[case::a_field(indoc! {"
+    r = (f=\\ -> 4, n=1)
+    (r.f)() + r.n
+"}, Value::Int(5))]
+fn a_function_of_no_parameters(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
 // A polymorphic UDF applied at two *distinct* argument types in the same
 // program, end-to-end. `x == x` is `∀α. α → Bool`, so the two calls have
 // incompatible domains (Int vs String) — under a monomorphic `let` they would

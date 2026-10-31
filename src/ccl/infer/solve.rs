@@ -1959,6 +1959,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         | TypedExprNode::Builtin(_)
         | TypedExprNode::Source(..)
         | TypedExprNode::LoadFrom(_)
+        | TypedExprNode::Reading(_)
         | TypedExprNode::Proj(_) => {}
         TypedExprNode::Apply { function, argument } => {
             // Specialization can deposit demands on the argument's variables.

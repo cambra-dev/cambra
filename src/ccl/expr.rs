@@ -7,7 +7,9 @@ use crate::ccl::module_type::AliasType;
 use crate::ccl::provenance::NodeId;
 use smol_str::SmolStr;
 
-use crate::ccl::{AggregateKind, BinOpKind, Builtin, Label, Lit, Name, ProjKey, Type, UnaryOpKind};
+use crate::ccl::{
+    AggregateKind, BinOpKind, Builtin, Label, Lit, Name, ProjKey, Reading, Type, UnaryOpKind,
+};
 use crate::chl_parser::ModulePath;
 use crate::chl_parser::ast::Span;
 
@@ -786,6 +788,14 @@ pub enum TypedExprNode {
     /// see [`LoadFromSite`](crate::interpreter::operator_conversion::LoadFromSite).
     LoadFrom(String),
 
+    /// A call of an intrinsic whose value comes from outside the program, `__now()`
+    /// (`docs/chl-spec.md`, "Inputs from outside the program"). A leaf, like
+    /// [`Self::Source`]: the run supplies its value, one per position and call path. The call
+    /// path is the site riding the node ([`Reading::site`]), and the position is the key path of the
+    /// loops around it, which [`crate::ccl::lambda_elim`] keeps by turning the reading into
+    /// [`Builtin::Reading`] over its body's domain.
+    Reading(Reading),
+
     /// N-ary point-free function composition: `f₀ ≫ f₁ ≫ … ≫ fₙ₋₁`.
     ///
     /// Built by lowering and [`crate::ccl::lambda_elim`]; always contains at least
@@ -962,6 +972,7 @@ impl TypedExprNode {
             TypedExprNode::Record(_) => "Record",
             TypedExprNode::Source(..) => "Source",
             TypedExprNode::LoadFrom(_) => "LoadFrom",
+            TypedExprNode::Reading(_) => "Reading",
             TypedExprNode::Compose(_) => "Compose",
             TypedExprNode::Copair(_) => "Copair",
             TypedExprNode::DisjointJoin(_) => "DisjointJoin",
@@ -1726,6 +1737,7 @@ impl TypedExpr {
             | TypedExprNode::Proj(_)
             | TypedExprNode::Source(..)
             | TypedExprNode::LoadFrom(_)
+            | TypedExprNode::Reading(_)
             | TypedExprNode::Defer
             | TypedExprNode::Abstract
             | TypedExprNode::Error => {}
@@ -1934,6 +1946,7 @@ impl TypedExpr {
             | TypedExprNode::Proj(_)
             | TypedExprNode::Source(..)
             | TypedExprNode::LoadFrom(_)
+            | TypedExprNode::Reading(_)
             | TypedExprNode::Defer
             | TypedExprNode::Abstract
             | TypedExprNode::Error => {}
@@ -2074,6 +2087,7 @@ impl TypedExpr {
             | TypedExprNode::Proj(_)
             | TypedExprNode::Source(..)
             | TypedExprNode::LoadFrom(_)
+            | TypedExprNode::Reading(_)
             | TypedExprNode::Defer
             | TypedExprNode::Abstract
             | TypedExprNode::Error
@@ -2133,6 +2147,7 @@ impl TypedExpr {
             | TypedExprNode::Proj(_)
             | TypedExprNode::Source(..)
             | TypedExprNode::LoadFrom(_)
+            | TypedExprNode::Reading(_)
             | TypedExprNode::Defer
             | TypedExprNode::Abstract
             | TypedExprNode::Error

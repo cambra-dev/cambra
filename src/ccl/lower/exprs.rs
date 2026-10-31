@@ -8,7 +8,8 @@ use super::*;
 use crate::{
     ccl::{
         AggregateKind, ArithmeticKind, BaseType, BinOpKind, BindingTransparency, Builtin,
-        CompareKind, Expr, Lit, LogicKind, Name, Refinement, Type, TypedExprNode, UnaryOpKind,
+        CompareKind, Expr, Intrinsic, Lit, LogicKind, Name, Reading, Refinement, Type,
+        TypedExprNode, UnaryOpKind,
         ccl_utils::{make_cast, refined_data_fun},
         uniquify,
     },
@@ -16,7 +17,7 @@ use crate::{
         AssignTarget, AugOp, BinOp as ChlBinOp, BindingTransparency as ChlTransparency, BoolOp,
         CmpOp, Expr as ChlExpr, Lit as ChlLit, Span, Spanned, UnaryOp,
     },
-    chl_parser::{self, SurfaceBuiltin},
+    chl_parser::{self, ModulePath, SurfaceBuiltin},
 };
 
 pub(super) fn lower_constant(constant: &ChlLit) -> Result<Expr, LoweringError> {
@@ -35,10 +36,8 @@ pub(super) fn lower_constant(constant: &ChlLit) -> Result<Expr, LoweringError> {
 /// [`SurfaceBuiltinKind::Function`](chl_parser::SurfaceBuiltinKind::Function) builtin lowers in
 /// its own arm; a call of the wrong arity is refused rather than lowered as an ordinary call. A
 /// call to a registered source lowers to [`TypedExprNode::Source`], and any other name lowers
-/// as an application of the variable it names. A zero-argument call to a name that is neither a
-/// `Function`-kind builtin nor a registered source returns [`LoweringError::Unsupported`]; this
-/// includes `begin()`, `test_sink()`, and `http_serve()` outside the statement that recognizes
-/// them.
+/// as an application of the variable it names, to the unit for a call with no arguments. An
+/// intrinsic lowers to [`TypedExprNode::Reading`] ([`lower_reading`]).
 ///
 /// A callee that is an expression rather than a name — `(r.f)(x)`, a field of a
 /// record — is ordinary application of the function value it evaluates to
@@ -75,13 +74,6 @@ pub(super) fn lower_call(
             let Some(member) = ctx.member(q, func.span)? else {
                 return Ok(Expr::error());
             };
-            if args.is_empty() {
-                return Err(LoweringError::unsupported(
-                    func.span,
-                    "a call with no arguments reads a registered source, and a module member \
-                     is not one",
-                ));
-            }
             if member.history_param {
                 return lower_curried_call(member.name.raw(), func.span, args, ctx);
             }
@@ -334,6 +326,9 @@ pub(super) fn lower_call(
             | SurfaceBuiltin::Stdin,
         )
         | None => {
+            if let Some(intrinsic) = Intrinsic::named(name) {
+                return lower_reading(intrinsic, func.span, args, ctx);
+            }
             if ctx.sources.contains_key(name) {
                 return Ok(Expr::new(TypedExprNode::Source(
                     name.to_string(),
@@ -360,13 +355,6 @@ pub(super) fn lower_call(
                     func.span,
                     "`defer()` no longer introduces a feed: declare one with no value, \
                      `x: Feed(T)`, or `x: Feed(_)` to infer its value type",
-                ));
-            }
-            // For zero-argument calls, only registered sources are allowed.
-            if args.is_empty() {
-                return Err(LoweringError::unsupported(
-                    func.span,
-                    format!("unknown zero-argument function: {name}; register it as a data source"),
                 ));
             }
             // A `def` with a pass-by-reference `Mut` or `Feed` parameter is lowered
@@ -437,19 +425,13 @@ fn lower_expression_call(
             ));
         }
     }
-    if args.is_empty() {
-        return Err(LoweringError::unsupported(
-            func.span,
-            "a function takes at least one argument, so a call needs one",
-        ));
-    }
     if matches!(func.node, ChlExpr::Lambda { .. }) {
         // `(\x -> e)(a)` is `f = \x -> e; f(a)`: binding the lambda makes it a
         // let-bound capability, which the inliner substitutes and beta-reduces.
         // Left in call position, the lambda would reach `lambda_elim` unreduced.
         let callee_name = ctx.fresh_callee_name();
         let lambda = lower_expr(func, ctx)?;
-        let call = apply_to_args(args, ctx, |ctx| {
+        let call = apply_to_args(args, func.span, ctx, |ctx| {
             Ok(ctx.tag_machinery(
                 Expr::var(callee_name.clone()),
                 func.span,
@@ -462,7 +444,7 @@ fn lower_expression_call(
         let bound = Expr::let_bind(callee_name, lambda, call);
         return Ok(ctx.tag_machinery(bound, func.span, "lower.lambda_call"));
     }
-    apply_to_args(args, ctx, |ctx| {
+    apply_to_args(args, func.span, ctx, |ctx| {
         let mut callee = lower_expr(func, ctx)?;
         // A field callee is a call of the function the field holds: inlining reaches that
         // function's body through this place (`crate::ccl::site`).
@@ -473,8 +455,8 @@ fn lower_expression_call(
     })
 }
 
-/// Apply the callee `callee` builds to a call's arguments: `f(a)` → `a ▷ f`, and
-/// `f(a, b, …)` → `(a, b, …) ▷ f`. The arguments lower first.
+/// Apply the callee `callee` builds to a call's arguments: `f()` → `() ▷ f`, the one empty
+/// product, `f(a)` → `a ▷ f`, and `f(a, b, …)` → `(a, b, …) ▷ f`. The arguments lower first.
 ///
 /// The tupled form pairs with the uncurried multi-arg lambda lowering in
 /// [`lower_lambda`], so syntactic multi-arg functions compile without any
@@ -484,32 +466,39 @@ fn lower_expression_call(
 /// [`lower_curried_call`], accepts a bare mutable variable and bypasses the gate.)
 fn apply_to_args(
     args: &[Spanned<ChlExpr>],
+    call_span: Span,
     ctx: &mut LoweringContext,
     callee: impl FnOnce(&mut LoweringContext) -> Result<Expr, LoweringError>,
 ) -> Result<Expr, LoweringError> {
-    if let [arg] = args {
-        let arg = lower_expr(arg, ctx)?;
-        return Ok(Expr::apply(arg, callee(ctx)?));
+    match args {
+        [] => {
+            let unit = ctx.tag_machinery(Expr::lit(Lit::Unit), call_span, "lower.call_unit");
+            Ok(Expr::apply(unit, callee(ctx)?))
+        }
+        [arg] => {
+            let arg = lower_expr(arg, ctx)?;
+            Ok(Expr::apply(arg, callee(ctx)?))
+        }
+        _ => {
+            let tupled: Result<Vec<_>, _> = args.iter().map(|a| lower_expr(a, ctx)).collect();
+            // The tuple is manufactured packing: there is no tuple in the source call.
+            let args_span = args[0].span.join(args[args.len() - 1].span);
+            let arg_tuple = ctx.tag_machinery(Expr::tuple(tupled?), args_span, "lower.call_tuple");
+            Ok(Expr::apply(arg_tuple, callee(ctx)?))
+        }
     }
-    let tupled: Result<Vec<_>, _> = args.iter().map(|a| lower_expr(a, ctx)).collect();
-    // The tuple is manufactured packing: there is no tuple in the source call.
-    let args_span = args[0].span.join(args[args.len() - 1].span);
-    let arg_tuple = ctx.tag_machinery(Expr::tuple(tupled?), args_span, "lower.call_tuple");
-    Ok(Expr::apply(arg_tuple, callee(ctx)?))
 }
 
-/// The function `callee` names, written at `func_span`, applied to `args`, a
-/// non-empty argument list, as an ordinary call ([`apply_to_args`]). The callee
-/// images the function the user named.
+/// The function `callee` names, written at `func_span`, applied to `args` as an ordinary
+/// call ([`apply_to_args`]). The callee images the function the user named.
 pub(super) fn lower_application(
     callee: Name,
     func_span: Span,
     args: &[Spanned<ChlExpr>],
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    debug_assert!(!args.is_empty(), "an ordinary call has an argument");
     let site = ctx.sites.site(func_span);
-    apply_to_args(args, ctx, |ctx| {
+    apply_to_args(args, func_span, ctx, |ctx| {
         let mut callee = ctx.reference(callee, func_span);
         // The call's place, which inlining extends the sites of the body it copies here with.
         callee.site = Some(site);
@@ -698,6 +687,33 @@ pub(super) fn lower_subscript(
     }
     // Evaluate the finite function at the point.
     Ok(Expr::apply(key, collection))
+}
+
+/// A call of an intrinsic, which only a std module names (`docs/chl-spec.md`, "9.16 The std
+/// root"): a reading, whose value the run supplies at each position and site.
+fn lower_reading(
+    intrinsic: Intrinsic,
+    span: Span,
+    args: &[Spanned<ChlExpr>],
+    ctx: &LoweringContext,
+) -> Result<Expr, LoweringError> {
+    if !ctx.module.labels.as_ref().is_some_and(ModulePath::is_std) {
+        return Err(LoweringError::unsupported(
+            span,
+            format!("`{intrinsic}` is an intrinsic, which only a std module names"),
+        ));
+    }
+    if !args.is_empty() {
+        return Err(LoweringError::unsupported(
+            span,
+            format!("`{intrinsic}` takes no arguments"),
+        ));
+    }
+    let call = Expr::new(TypedExprNode::Reading(Reading {
+        intrinsic,
+        site: ctx.sites.site(span),
+    }));
+    Ok(call.with_ty(Type::Base(BaseType::Int)))
 }
 
 /// Lower a user-function call argument. A **bare variable** argument is the only
@@ -1231,16 +1247,12 @@ mod tests {
         assert_eq!(symbolic(&ccl), "x ▷ foo");
     }
 
-    /// A zero-argument call to an unknown (non-source) name still fails.
+    /// A zero-argument call to a name that is no source applies it to the unit.
     #[test]
-    fn test_lower_unknown_zero_arg_fails() {
+    fn test_lower_unknown_zero_arg_applies_the_unit() {
         let expr = parse_expr("foo()");
-        let err = lower_expr(&expr, &mut LoweringContext::default())
-            .expect_err("expected lowering error");
-        assert!(
-            matches!(err, LoweringError::Unsupported { .. }),
-            "expected Unsupported, got {err:?}"
-        );
+        let ccl = lower_expr(&expr, &mut placing(&expr)).expect("expected lowering to succeed");
+        assert_eq!(symbolic(&ccl), "unit ▷ foo");
     }
 
     // -----------------------------------------------------------------------
@@ -1255,15 +1267,6 @@ mod tests {
         let expr = parse_expr("mystream()");
         let ccl = lower_expr(&expr, &mut ctx).expect("lowering failed");
         assert_eq!(symbolic(&ccl), "source(mystream)");
-    }
-
-    /// A zero-argument call whose name is NOT registered still fails.
-    #[test]
-    fn test_lower_unregistered_zero_arg_call_fails() {
-        let expr = parse_expr("unknown_source()");
-        let err = lower_expr(&expr, &mut LoweringContext::default())
-            .expect_err("expected lowering error");
-        assert!(matches!(err, LoweringError::Unsupported { .. }));
     }
 
     /// The table's kind column holds lowering's recognizers: called in expression position at
