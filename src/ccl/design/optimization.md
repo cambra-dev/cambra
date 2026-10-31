@@ -240,6 +240,30 @@ after it. This recognition requires the two-branch `Case` at the lambda body's r
 later materializes the refinement at an iteration site. A leading `Let` around the `Case`
 does not match this filter rule and takes the general lambda-elimination path.
 
+### A parameter only the type reads: the Pi-constant form
+
+A lambda eliminates to the Pi-constant form `const(body) : (𝑥: 𝐷) ⇒ body.ty` when its parameter
+occurs in `body.ty` and not in the body's value (`is_free_in_value`), and `body.ty` is not a data
+function whose domain reads the parameter. A refinement on a collection's domain is a filter, which
+determines which entries exist ([A refinement on a collection's domain is
+data](type-inference.md#a-refinement-on-a-collections-domain-is-data)), so a parameter there varies
+the body as one free in the value does. Neither shape that carries such a filter takes the
+Pi-constant form:
+
+- The body is a lambda whose binder's type reads the parameter, as in
+  `λ r → λ i : {0..3 | 𝑝(r)} → 𝑒`. The nested-lambda rule lifts the refinement onto the pair it
+  forms.
+- A cast inside the body reads the parameter, under a node whose type does not, as in
+  `λ r → cast(λ i → 𝑒, {0..3 | 𝑝(r)} ⤇ Int) ▷ sum : Int`. `lambda_elim` rewrites the cast to
+  `λ i : {0..3 | 𝑝(r)} → 𝑒`, which reduces to the first shape.
+
+A cast that is a lambda's whole body is not rewritten. Its type is `body.ty`, so the cast arm binds
+the parameter there with a Pi, and `groupby`'s partition `λ k → cast(…)` keeps the shape planning's
+group-by recognizer reads.
+
+Pairing and currying can introduce a parameter for a point-free body that only the body's type
+reads, and the same rule applies to it.
+
 ### `Let` inside a lambda
 
 For `λ x → let v = def in body`, elimination keeps a `Let`: its bound expression becomes
