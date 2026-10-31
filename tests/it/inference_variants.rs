@@ -59,6 +59,7 @@ fn arm(tag: &str, binding: &str, guard: Option<TypedExpr>, body: TypedExpr) -> B
                 ty: Type::Hole,
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             empty_payload: false,
         }),
@@ -160,6 +161,7 @@ fn variant_param_accepts_subtype() {
             ty: param_ty.clone(),
             user_annotation: Some(param_ty.clone()),
             transparency: BindingTransparency::Transparent,
+            site: None,
         },
         body: Box::new(var("v")),
     });
@@ -180,6 +182,7 @@ fn variant_extra_tag_rejected() {
             ty: param_ty.clone(),
             user_annotation: Some(param_ty),
             transparency: BindingTransparency::Transparent,
+            site: None,
         },
         body: Box::new(var("v")),
     });
@@ -261,6 +264,7 @@ fn value_ascription_accepts_widening() {
             ty: Type::Hole,
             user_annotation: Some(variant(&[("A", unit_ty()), ("B", unit_ty())])),
             transparency: BindingTransparency::Transparent,
+            site: None,
         },
         bound_expr: Box::new(TypedExpr::variant_ctor("A", lit_unit())),
         body: Box::new(var("x")),
@@ -445,6 +449,7 @@ fn lambda_returns_variant() {
             ty: int(),
             user_annotation: Some(int()),
             transparency: BindingTransparency::Transparent,
+            site: None,
         },
         body: Box::new(TypedExpr::variant_ctor("some", var("x"))),
     });
@@ -503,6 +508,7 @@ fn payload_covariance_accept() {
             ty: param_ty.clone(),
             user_annotation: Some(param_ty.clone()),
             transparency: BindingTransparency::Transparent,
+            site: None,
         },
         body: Box::new(var("v")),
     });
@@ -521,6 +527,7 @@ fn payload_mismatch_reject() {
             ty: param_ty.clone(),
             user_annotation: Some(param_ty),
             transparency: BindingTransparency::Transparent,
+            site: None,
         },
         body: Box::new(var("v")),
     });

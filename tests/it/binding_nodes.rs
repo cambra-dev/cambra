@@ -19,6 +19,7 @@ fn binding(name: &str, user_annotation: Option<Type>) -> TypedBinding {
         ty: Type::Hole,
         user_annotation,
         transparency: BindingTransparency::Transparent,
+        site: None,
     }
 }
 

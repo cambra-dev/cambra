@@ -568,6 +568,7 @@ mod tests {
                 ty: Type::Hole,
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             body: Box::new(TypedExpr::new(TypedExprNode::Record(vec![
                 ("a".into(), lit_int(1)),

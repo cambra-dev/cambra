@@ -1378,6 +1378,8 @@ fn lower_nested_loop(
                 ty: Type::Hole,
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
+                // The loop's place, which names the stores of the variables it writes.
+                site: Some(ctx.sites.site(target.span)),
             },
             iter: Box::new(source),
             body: Box::new(chain),
@@ -1473,6 +1475,8 @@ pub(super) fn lower_direct_mirror_loop(
                 ty: Type::Hole,
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
+                // The loop's place, which names the stores of the variables it writes.
+                site: Some(ctx.sites.site(target.span)),
             },
             iter: Box::new(source),
             body: Box::new(chain),
@@ -1633,7 +1637,9 @@ fn lower_loop_body_chain_scoped(
                     // it does for one declared before a top-level loop.
                     let mut_ty = Type::mutable(Type::Hole, value_ty);
                     let init = lower_assigned_value(value, &[], outer_bindings, ctx)?;
-                    ctx.tag_image(Expr::mut_decl(name, mut_ty, init, chain), stmt.span)
+                    let decl = Expr::mut_decl(name, mut_ty, init, chain)
+                        .declared_at(ctx.sites.site(target.span));
+                    ctx.tag_image(decl, stmt.span)
                 } else {
                     if !acc_names.contains(&name) {
                         return Err(in_loop_mut_var_error(stmt.span, &name));

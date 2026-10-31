@@ -1101,6 +1101,7 @@ fn check_slot_predicates(expr: &Expr, ctx: &mut CheckCtx) {
                         ty: (**base).clone(),
                         user_annotation: None,
                         transparency: BindingTransparency::Transparent,
+                        site: None,
                     },
                     body: Box::new(body),
                 })
