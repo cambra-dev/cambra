@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::effects::{
-    Blame, Bound as LabelBound, Effect, EffectSet, EffectVar, Effects, Filter, Item, Label, Repr,
-    Requirement, Upper,
+    Blame, Bound as LabelBound, Effect, EffectSet, EffectVar, EffectVarId, Effects, Filter, Item,
+    Label, Repr, Requirement, Upper,
 };
 use crate::ccl::infer::solver::barrier::EdgeReport;
 use crate::ccl::infer::solver::display::poly_for_display;
@@ -143,8 +143,11 @@ pub(super) struct InferCtx {
     effect_frames: Vec<EffectFrame>,
     /// Where each mutable variable and feed in scope is bound, for the label that names it.
     effect_binders: HashMap<Name, EffectBinder>,
-    /// Each statement emitted, with the variable collecting what it causes.
-    effect_statements: Vec<(NodeId, Rc<EffectVar>)>,
+    /// Each statement emitted, with the variable collecting what it causes and the one of
+    /// the body it stands in.
+    effect_statements: Vec<(NodeId, Rc<EffectVar>, EffectVarId)>,
+    /// Each `with begin():` block emitted, with the variable collecting what its body causes.
+    effect_transactions: Vec<(NodeId, Rc<EffectVar>)>,
     /// The `ExprStmt` of each expression statement the program writes, the statements an
     /// inert one is refused among.
     pub(super) expression_statements: HashSet<NodeId>,
@@ -155,7 +158,7 @@ pub(super) struct InferCtx {
     /// and its node ([`InferCtx::requirements_beyond_clauses`]).
     bounded_requires: Vec<BoundedRequires>,
     /// The variable of every call site ([`InferCtx::call_effects`]).
-    effect_calls: HashSet<crate::ccl::effects::EffectVarId>,
+    effect_calls: HashSet<EffectVarId>,
     /// Lexical scope: name → [`Binding`] for in-scope variables and let-bound
     /// names. Lambda params and `Case`/`Loop` binders bind monomorphically; a
     /// polymorphic `let` additionally stashes its typed definition subtree so
@@ -397,8 +400,9 @@ struct EffectBinder {
     /// and the callee records nothing (`docs/chl-spec.md`, "Discharging requirements and
     /// effects").
     parameter: bool,
-    /// A transactional mutable variable belongs to its run, so no scope's end discharges
-    /// its writes, and reading or writing it requires `Transaction`.
+    /// A transactional mutable variable, or a parameter passed one: reading or writing it
+    /// requires `Transaction`. A declared one belongs to its run, so no scope's end
+    /// discharges its writes.
     transactional: bool,
     /// A feed, which a clause names in `Append(f)`; every other binder here is a mutable
     /// variable.
@@ -568,6 +572,7 @@ impl InferCtx {
             }],
             effect_binders: HashMap::new(),
             effect_statements: Vec::new(),
+            effect_transactions: Vec::new(),
             expression_statements: HashSet::new(),
             effect_calls: HashSet::new(),
             effect_public: Vec::new(),
@@ -592,8 +597,7 @@ impl InferCtx {
     /// is its argument's.
     fn bind_effect_name(&mut self, name: &Name, ty: &Type, declares: bool) {
         if let Some((domain, _, history_kind)) = ty.history_parts() {
-            let transactional = declares
-                && matches!(history_kind, crate::ccl::ty::HistoryKind::Overwrite)
+            let transactional = matches!(history_kind, crate::ccl::ty::HistoryKind::Overwrite)
                 && matches!(domain, Type::Txn);
             let depth = self.effect_frame().depth;
             let public_feed = declares
@@ -607,13 +611,13 @@ impl InferCtx {
                     parameter: !declares,
                     transactional,
                     feed: matches!(history_kind, crate::ccl::ty::HistoryKind::Append),
-                    escapes: transactional || public_feed,
+                    escapes: (declares && transactional) || public_feed,
                 },
             );
             // Declaring a transactional variable writes it, and other modules append to a
             // public feed, so declaring one is an output of the top level's too. Neither
             // label is discharged where the variable's scope ends.
-            if transactional {
+            if declares && transactional {
                 self.record_effect(Item::Causes(Effect::Write(name.clone())));
             }
             if public_feed {
@@ -743,26 +747,40 @@ impl InferCtx {
         out
     }
 
-    /// The statements emitted that cause nothing and so do nothing
+    /// What was emitted that causes nothing and so does nothing: each `with begin():` block
+    /// whose body writes and feeds nothing (`docs/chl-spec.md`, "8.2 Transactions: `with
+    /// begin():`"), then each expression statement outside those blocks
     /// (`docs/chl-spec.md`, "4.9 Expression statement").
     ///
     /// A statement in a polymorphic definition can call a function that only each use of the
     /// definition determines: a parameter's. That call's variable has nothing flowing into it
-    /// at the definition, where each use fills a copy of its own, so a statement reaching one
-    /// may do something and is not reported.
-    pub(super) fn inert_statements(&self) -> Vec<NodeId> {
+    /// at the definition, where each use fills a copy of its own, so a statement or a block
+    /// reaching one may do something and is not reported.
+    pub(super) fn does_nothing(&self) -> Vec<(NodeId, InferError)> {
         let undetermined = |v: &EffectVar| {
             self.effect_calls.contains(&v.uid) && v.incoming().is_empty() && v.own().is_empty()
         };
-        self.effect_statements
+        let idle = |var: &EffectVar| {
+            crate::ccl::effects::set_of(&var.resolved())
+                .causes
+                .is_empty()
+                && !var.reaches(&undetermined)
+        };
+        let empty: Vec<&(NodeId, Rc<EffectVar>)> = self
+            .effect_transactions
             .iter()
-            .filter(|(_, var)| {
-                crate::ccl::effects::set_of(&var.resolved())
-                    .causes
-                    .is_empty()
-                    && !var.reaches(&undetermined)
-            })
-            .map(|(node, _)| *node)
+            .filter(|(_, var)| idle(var))
+            .collect();
+        let in_empty = |body: EffectVarId| empty.iter().any(|(_, var)| var.uid == body);
+        empty
+            .iter()
+            .map(|(node, _)| (*node, InferError::EmptyTransaction))
+            .chain(
+                self.effect_statements
+                    .iter()
+                    .filter(|(_, var, body)| idle(var) && !in_empty(*body))
+                    .map(|(node, _, _)| (*node, InferError::InertStatement)),
+            )
             .collect()
     }
 
@@ -869,7 +887,7 @@ impl InferCtx {
         &mut self,
         requirement: &TraitRequirement,
         obligation: &Rc<TraitObligation>,
-        copies: &HashMap<crate::ccl::effects::EffectVarId, Rc<EffectVar>>,
+        copies: &HashMap<EffectVarId, Rc<EffectVar>>,
     ) {
         for (assoc, member) in &requirement.effect_assoc {
             let Some(var) = self.opened_clause_params.get(&member.param.id) else {
@@ -2556,7 +2574,9 @@ impl Typing for InferCtx {
         }
     }
 
-    fn record_read(&mut self, name: &Name) {
+    fn record_read(&mut self, name: &Name, at: NodeId) {
+        // The read is the variable's mention, wherever the rule reading through it runs.
+        let prev = self.enter_node(at);
         match self.effect_binders.get(name) {
             Some(binder) if binder.transactional => {
                 self.record_effect(Item::Requires(Requirement::transaction()));
@@ -2564,6 +2584,7 @@ impl Typing for InferCtx {
             Some(_) => self.record_effect(Item::Requires(Requirement::read(name.clone()))),
             None => {}
         }
+        self.leave_node(prev);
     }
 
     fn statement<R>(&mut self, node: NodeId, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -2589,7 +2610,8 @@ impl Typing for InferCtx {
                 ..outer.filter()
             },
         );
-        self.effect_statements.push((node, var));
+        let body = outer.var.uid;
+        self.effect_statements.push((node, var, body));
         r
     }
 
@@ -2631,6 +2653,7 @@ impl Typing for InferCtx {
         self.effect_frames.push(frame);
         let r = f(self);
         self.effect_frames.pop();
+        self.effect_transactions.push((node, Rc::clone(&var)));
         let outer = self.effect_frame();
         outer.var.flows_from(
             &var,

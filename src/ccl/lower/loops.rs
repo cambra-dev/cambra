@@ -1589,9 +1589,6 @@ fn lower_loop_body_chain_scoped(
             } => {
                 refuse_nested_sink(target, value, stmt.span)?;
                 let assignment = AssignmentBindings::of(target, *transparency, stmt.span, ctx)?;
-                for name in assignment.names() {
-                    check_mut_write_context(&name, stmt.span, ctx)?;
-                }
                 let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;
                 assignment.wrap(val, chain, stmt.span, ctx)
             }
@@ -1607,7 +1604,6 @@ fn lower_loop_body_chain_scoped(
                 if !acc_names.contains(&name) {
                     return Err(in_loop_aug_assign_error(stmt.span, &name));
                 }
-                check_mut_write_context(&name, stmt.span, ctx)?;
                 let rhs = lower_assigned_value(value, &[], outer_bindings, ctx)?;
                 let val = lower_aug_binop(&name, *op, rhs, stmt.span, ctx)?;
                 let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
@@ -1666,7 +1662,6 @@ fn lower_loop_body_chain_scoped(
                             ctx,
                         )?,
                         _ => {
-                            check_mut_write_context(&name, stmt.span, ctx)?;
                             let val = lower_assigned_value(value, &[], outer_bindings, ctx)?;
                             ctx.tag_image(Expr::mut_write(name, val), stmt.span)
                         }
@@ -2098,29 +2093,6 @@ in guarded_let"
     // Generator function negative / mutation-loop tests
     // -----------------------------------------------------------------------
 
-    /// A `with begin():` block that neither writes a transactional mutable variable nor
-    /// feeds a read does nothing observable and is rejected. Covers standalone,
-    /// middle, and loop-body positions — here `x`/`y` are plain locals, not
-    /// `Mut(_, Txn)` stores, and there is no feed.
-    #[test]
-    fn test_with_begin_requires_effect() {
-        for code in [
-            "with begin():\n    x = 1\nx",
-            "with begin():\n    x = 1\ny = 2\ny",
-            "for r in [1]:\n    with begin():\n        x = 1\nx",
-        ] {
-            let stmts = parse_module(code);
-            let err = expect_one_lowering_error(&stmts);
-            let LoweringError::Unsupported { message: msg, .. } = &err else {
-                panic!("expected an unsupported error, got {err:?}")
-            };
-            assert!(
-                msg.contains("must do something"),
-                "expected a `with begin()` no-effect error, got: {msg}"
-            );
-        }
-    }
-
     /// A feed-only loop nested in a mutation loop is refused with an internal error where it
     /// holds what the compiler does not compile yet, and lowers where its filters read only
     /// loop variables, what the scope around the mutation loop binds and no loop writes, and
@@ -2261,22 +2233,6 @@ g";
             panic!("expected an internal error, got {err:?}")
         };
         assert!(message.contains("a `yield`"), "got: {message}");
-    }
-
-    /// `store: Mut(Int, Txn) := 0` lowers as a plain `let store = 0`, registering
-    /// `store` transactional. A *bare* trailing read is then rejected — a
-    /// transactional mutable variable may be read only inside a `with begin():` block.
-    #[test]
-    fn test_mut_txn_bare_read_rejected() {
-        let stmts = parse_module("store: Mut(Int, Txn) := 0\nstore");
-        let err = expect_one_lowering_error(&stmts);
-        let LoweringError::Unsupported { message: msg, .. } = &err else {
-            panic!("expected an unsupported error, got {err:?}")
-        };
-        assert!(
-            msg.contains("inside a `with begin():` block"),
-            "expected a `with begin():` hint for a bare transactional read, got: {msg}"
-        );
     }
 
     /// Augmented assignment to iter var (shadowing) in a generator for-loop.

@@ -864,14 +864,6 @@ fn an_annotation_mismatch_prints_the_inferred_polymorphic_type(
     "},
     "a binding annotated with a polymorphic type must be polymorphic",
 )]
-#[case::requires_transaction(
-    indoc! {r#"
-        def put(k: String) => String requires Transaction:
-            k
-        put("a")
-    "#},
-    "`Transaction` is not supported yet",
-)]
 // The caller's assumption fixes the components' order.
 #[case::product_requirement_with_swapped_components(
     indoc! {r#"

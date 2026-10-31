@@ -149,10 +149,11 @@ fn context_requirement(
         ("_", []) => Ok(Lowered::Hole),
         ("Ext", []) => Ok(Lowered::Item(Requirement::ext())),
         ("Read", [x]) => Ok(Lowered::Item(Requirement::read(variable(x, "Read")?))),
+        ("Transaction", []) => Ok(Lowered::Item(Requirement::transaction())),
         ("Transaction", _) => Err(LoweringError::unsupported(
             ty.name_span,
-            "`Transaction` is not supported yet: transactions as contextual parameters are \
-             not implemented",
+            "a transaction domain, `Transaction(dom)`, is not supported yet: every transaction \
+             is the one domain's",
         )),
         (name, _) => Err(arity(item.span, name)),
     }

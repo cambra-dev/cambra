@@ -2363,8 +2363,9 @@ fn a_read_only_mentioned_key_completes_while_a_live_writer_runs() {
 // ---------------------------------------------------------------------------
 
 /// A transactional mutable variable may be read only inside a `with begin():` block, and
-/// that is permanent rather than a current limitation (the CHL spec, "8.3 Reads"). The
-/// diagnostic names both legal reads: wrap it in a block, or `await_final` it.
+/// that is permanent rather than a current limitation (the CHL spec, "8.3 Reads"): reading
+/// it requires `Transaction`, which only a block's body supplies. The diagnostic names both
+/// legal reads: in a block, or with `await_final`.
 #[test]
 fn bare_txn_read_outside_tx_rejected() {
     check_compile_error(
@@ -2374,15 +2375,17 @@ fn bare_txn_read_outside_tx_rejected() {
                 pool := pool - 10
             pool
         "#},
-        "read transactional variable `pool` inside a `with begin():` block",
+        "this requires `Transaction` outside a `with begin():` block, whose body is what \
+         supplies one: it reads or writes a transactional variable, or calls a function that \
+         does; `await_final(x)` reads `x`'s final committed value outside a block",
     );
 }
 
-/// The gate follows a `Mut(_, Txn)` **parameter** into the callee: a by-reference pass is
-/// the one mention lowering lets through, and it hands the callee a mutable variable in
-/// its own right, so a read of it there obeys the same rule. Reading only inside a block
-/// is permanent (the CHL spec, "8.3 Reads"), so it holds through a function boundary as
-/// well as at the top level.
+/// The rule follows a `Mut(_, Txn)` **parameter** into the callee: a by-reference pass hands
+/// the callee a mutable variable in its own right, so a read of it outside the callee's
+/// block requires `Transaction`, and so does a call of the callee, which no block encloses
+/// here. Reading only inside a block is permanent (the CHL spec, "8.3 Reads"), so it holds
+/// through a function boundary as well as at the top level.
 #[test]
 fn bare_read_of_a_mut_param_outside_a_block_rejected() {
     check_compile_error(
@@ -2395,7 +2398,7 @@ fn bare_read_of_a_mut_param_outside_a_block_rejected() {
             draw(pool, 10)
             await_final(pool)
         "#},
-        "read transactional variable `p` inside a `with begin():` block",
+        "this requires `Transaction` outside a `with begin():` block",
     );
 }
 
@@ -2759,8 +2762,7 @@ fn induction_keyed_write_reading_past_a_lifted_write_rejected() {
 }
 
 /// C3: a write to a transactional mutable variable *outside* any `with begin():` block
-/// is rejected (write-side mirror of the read gate). Otherwise it becomes a plain
-/// sequential `let` shadow that silently hides every committed value.
+/// is rejected, as a read is: it requires `Transaction`, which nothing there supplies.
 #[test]
 fn out_of_block_txn_write_rejected() {
     check_compile_error(
@@ -2769,12 +2771,13 @@ fn out_of_block_txn_write_rejected() {
             store := 50
             0
         "#},
-        "write transactional variable `store`",
+        "this requires `Transaction` outside a `with begin():` block",
     );
 }
 
 /// C3, by-reference flavor: a `Mut(_, Txn)` writer body that assigns its mutable variable
-/// *without* a `with begin():` block is rejected at lowering of the body.
+/// *without* a `with begin():` block requires `Transaction`, so a call of it that no block
+/// encloses is rejected.
 #[test]
 fn by_ref_txn_write_without_block_rejected() {
     check_compile_error(
@@ -2785,7 +2788,7 @@ fn by_ref_txn_write_without_block_rejected() {
             w(store)
             0
         "#},
-        "write transactional variable `p`",
+        "this requires `Transaction` outside a `with begin():` block",
     );
 }
 
@@ -2848,10 +2851,231 @@ fn transaction_handle_binding_rejected() {
     );
 }
 
-/// C5: the out-of-block read gate applies to a bare mutable variable passed as an
-/// argument to an *ordinary* function (only a `Mut`-parameter callee accepts a
-/// bare mutable variable pass and bypasses the gate). `f(store)` reads the mutable variable
-/// outside a block, so it is rejected.
+/// A function that reads or writes a transactional mutable variable outside a block of its
+/// own requires `Transaction`, and the block it is called in supplies it: its writes join
+/// that block's commit, and its reads see the block's writes before it (`docs/chl-spec.md`,
+/// "8.7 Direction [Decided]: transactions as contextual parameters"). The call may stand as a
+/// statement, as a binding's definition, as an operand, in the order it is written, as a
+/// guard's condition, or under `and`, which calls it only where its left operand holds; it may
+/// be passed to another function that calls it; the variable may be one the function
+/// captures or a `Mut(_, Txn)` parameter; and the requirement may be written as a clause.
+#[rstest]
+#[case::a_call_statement(indoc! {r#"
+    stock: Mut(Int, Txn) := 100
+    def take(n: Int) => Int:
+        stock := stock - n
+        n
+    for q in [1, 2, 3]:
+        with begin():
+            take(q)
+    await_final(stock)
+"#}, 94)]
+#[case::a_bound_call_then_a_guard(indoc! {r#"
+    stock: Mut(Int, Txn) := 100
+    log: Mut(Int, Txn) := 0
+    def take(n: Int) => Int:
+        stock := stock - n
+        log := log + 1
+        stock
+    for q in [1, 2, 3]:
+        with begin():
+            left = take(q)
+            if left < 96:
+                stock := stock + 100
+    await_final(stock) * 10 + await_final(log)
+"#}, 1943)]
+#[case::calls_as_operands_in_order(indoc! {r#"
+    stock: Mut(Int, Txn) := 100
+    def take(n: Int) => Int:
+        stock := stock - n
+        stock
+    with begin():
+        stock := stock + take(1) * 100 + take(2)
+    await_final(stock)
+"#}, 100 + 99 * 100 + 97)]
+#[case::through_a_function_that_calls_it(indoc! {r#"
+    stock: Mut(Int, Txn) := 100
+    def take(n: Int) => Int:
+        stock := stock - n
+        n
+    def twice(f, x):
+        f(x) + f(x)
+    for q in [1, 2]:
+        with begin():
+            twice(take, q)
+    await_final(stock)
+"#}, 100 - 2 * (1 + 2))]
+#[case::a_guards_condition(indoc! {r#"
+    stock: Mut(Int, Txn) := 100
+    log: Mut(Int, Txn) := 0
+    def take(n: Int) => Int:
+        stock := stock - n
+        stock
+    for q in [1, 2]:
+        with begin():
+            if take(q) > 98:
+                log := log + 1
+    await_final(stock) * 10 + await_final(log)
+"#}, 97 * 10 + 1)]
+#[case::under_and(indoc! {r#"
+    stock: Mut(Int, Txn) := 100
+    log: Mut(Int, Txn) := 0
+    def take(n: Int) => Int:
+        stock := stock - n
+        stock
+    for q in [1, 2]:
+        with begin():
+            ok = q > 1 and take(q) > 0
+            if ok:
+                log := log + 1
+    await_final(stock) * 10 + await_final(log)
+"#}, 98 * 10 + 1)]
+#[case::a_read(indoc! {r#"
+    stock: Mut(Int, Txn) := 100
+    def less(n: Int) => Int:
+        stock - n
+    with begin():
+        stock := less(1)
+    await_final(stock)
+"#}, 99)]
+#[case::a_parameter(indoc! {r#"
+    store: Mut(Int, Txn) := 0
+    def add(p: Mut(Int, Txn)) => Int:
+        p := p + 50
+        1
+    for q in [1, 2]:
+        with begin():
+            add(store)
+    await_final(store)
+"#}, 100)]
+#[case::a_written_clause(indoc! {r#"
+    stock: Mut(Int, Txn) := 100
+    def double(n: Int) => Int requires Transaction:
+        n * 2
+    with begin():
+        stock := stock - double(5)
+    await_final(stock)
+"#}, 90)]
+#[timeout(Duration::from_secs(10))]
+fn a_function_requiring_a_transaction_runs_in_its_callers_block(
+    #[case] code: &str,
+    #[case] expected: i64,
+) {
+    check_scalar(code, Value::Int(expected));
+}
+
+/// A run's public function requiring `Transaction` runs in the block of the module calling it,
+/// writing the run's variable in that block's commit (`docs/chl-spec.md`, "9.7 Importing
+/// asserts a shareable module", whose `inventory` declares `reserve` so).
+#[test]
+fn a_runs_function_requiring_a_transaction_runs_in_its_callers_block() {
+    let inventory = indoc! {r#"
+        stock: Mut(Int, Txn) := 100
+        pub def reserve(qty: Int) => Int requires Transaction:
+            stock := stock - qty
+            qty
+        pub def left(n: Int) => Int:
+            stock + n
+    "#};
+    let root = indoc! {r#"
+        run inventory as inv
+        total: Mut(Int, Txn) := 0
+        for q in [3, 4]:
+            with begin():
+                total := total + inv::reserve(q) + inv::left(0) * 1000
+        await_final(total)
+    "#};
+    check_program_scalar(
+        &super::modules::program(root, &[("inventory", inventory)]),
+        Value::Int(3 + 97 * 1000 + 4 + 93 * 1000),
+    );
+}
+
+/// A function requiring `Transaction` called where no block supplies one is refused at the
+/// call, whether it reads, writes, or states the requirement.
+#[rstest]
+#[case::a_write(indoc! {r#"
+    stock: Mut(Int, Txn) := 100
+    def take(n: Int) => Int:
+        stock := stock - n
+        n
+    take(5)
+"#})]
+#[case::a_written_clause(indoc! {r#"
+    def double(n: Int) => Int requires Transaction:
+        n * 2
+    double(1)
+"#})]
+#[timeout(Duration::from_secs(10))]
+fn a_function_requiring_a_transaction_outside_a_block_is_refused(#[case] code: &str) {
+    let errors = super::modules::compile_errors(&LoadedProgram::test(code));
+    assert!(
+        errors.contains("this requires `Transaction` outside a `with begin():` block"),
+        "{errors}"
+    );
+}
+
+/// A parameter written `Mut(V)` takes a mutable variable and not a transactional one, whose
+/// type is `Mut(V, Txn)`.
+#[test]
+fn a_transactional_variable_passed_to_a_mut_parameter_is_refused() {
+    check_compile_error(
+        indoc! {r#"
+            store: Mut(Int, Txn) := 0
+            def w(p: Mut(Int)) => Int:
+                p := 50
+                1
+            w(store)
+        "#},
+        "`p` is written `Mut(…)`, a mutable variable, and is passed a transactional one",
+    );
+}
+
+/// A write a call brings into a block where the block cannot order it among its own, a later
+/// `elif`'s condition, is refused.
+#[test]
+fn a_write_in_a_later_conditions_call_is_refused() {
+    let errors = super::modules::compile_errors(&LoadedProgram::test(indoc! {r#"
+        stock: Mut(Int, Txn) := 100
+        log: Mut(Int, Txn) := 0
+        def take(n: Int) => Int:
+            stock := stock - n
+            stock
+        for q in [1, 2]:
+            with begin():
+                if q > 1:
+                    log := log + 1
+                elif take(q) > 0:
+                    log := log + 10
+        await_final(log)
+    "#}));
+    assert!(
+        errors.contains("stands where the block cannot order it among its own"),
+        "{errors}"
+    );
+}
+
+/// A block whose only call does nothing does nothing, which the block reports, once.
+#[test]
+fn a_block_calling_only_what_does_nothing_is_refused() {
+    let errors = super::modules::compile_errors(&LoadedProgram::test(indoc! {r#"
+        stock: Mut(Int, Txn) := 100
+        def peek(n: Int) => Int:
+            stock + n
+        with begin():
+            peek(1)
+        await_final(stock)
+    "#}));
+    assert!(
+        errors.contains("this `with begin():` block does nothing"),
+        "{errors}"
+    );
+    assert_eq!(errors.matches("Error:").count(), 1, "{errors}");
+}
+
+/// C5: a bare mutable variable passed as an argument to an *ordinary* function is read
+/// there (only a `Mut`-parameter callee takes the variable itself). `f(store)` reads the
+/// mutable variable outside a block, so it is rejected.
 #[test]
 fn bare_mut_var_arg_to_ordinary_fn_is_gated() {
     check_compile_error(
@@ -2861,7 +3085,7 @@ fn bare_mut_var_arg_to_ordinary_fn_is_gated() {
                 x + 1
             f(store)
         "#},
-        "read transactional variable `store`",
+        "this requires `Transaction` outside a `with begin():` block",
     );
 }
 

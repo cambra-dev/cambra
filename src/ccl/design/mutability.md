@@ -707,7 +707,24 @@ snapshot and source in front of it. The `Transact` is born at loop planning and 
 
 Inlining runs before `mut_elim`: a UDF that writes a `Mut` parameter or feeds a `Feed` parameter
 is beta-reduced to its call site, where `mut_elim` sees its writes and feeds in the scope of the
-mutable variables and channels they target. Generators survive inlining because surface-CCL lowering
+mutable variables and channels they target.
+
+**A call in a `with begin():` block joins the block's transaction.** A function that reads or
+writes a transactional mutable variable outside a block of its own, the variable captured or a
+`Mut(_, Txn)` parameter, requires `Transaction`, which only a block's body supplies, so inference
+refuses a call of it that no block encloses (`InferError::TransactionOutsideBlock`). Lowering
+does not decide it: a `:=` to a captured transactional variable in a function body is a
+`MutWrite`, and a block holds call statements. Inlined, the call leaves the callee's body where
+the call stood, in a statement, a binding's definition, an operand or a guard's first condition,
+as a chain of bindings and statements ending in its value; a function passed to another and
+called there leaves a lambda applied where it stands, or projected out of a tuple of arguments.
+`transact_phase` first moves each such chain onto the block's spine in evaluation order
+(`flatten_begin_bodies`), binding each operand's value as it is reached so it reads what the
+variables hold there, reducing an applied lambda to a `let`, turning `a and b` and `a or b` with a
+chain in `b` into the guard they are, and dropping a statement left holding only a value. The
+block is then the flat chain of writes, guards and feeds the rest of the phase reads, and a write
+reached through a call commits with the block's own. A write still off that chain, in a later
+guard's condition, a function value or a comprehension, is refused (`write_off_a_spine`). Generators survive inlining because surface-CCL lowering
 leaves nothing to lose — a generator body is `For` + `Feed` nodes against an implicit result feed,
 substituted wholesale.
 
@@ -745,8 +762,8 @@ Nothing else forces sharing. Two consequences are observable:
   interleaving between transactions that never interact.
 
 A mutable variable **no block writes at all** is not a key of any store, and relates nothing by
-being read. Nothing can advance it — the lowering write gate admits a mutable variable write only
-inside a block, and a block write would put it in a write set — so its history is constant at its
+being read. Nothing can advance it — inference refuses a mutable variable write that no block
+encloses, and a block write would put it in a write set — so its history is constant at its
 seed and every read of it is that seed. It keeps its introduction on the spine. Only a read-only
 footprint reaches this case: `limit` above is unwritten too, but a *writing* block reads it, which
 makes its value a question about a commit snapshot rather than about a constant.
@@ -1365,8 +1382,8 @@ The operand is the mutable variable **handle** — the third position alongside 
 argument and a write target (["A mutable variable read is an explicit
 operation"](#a-mutable-variable-read-is-an-explicit-operation)). `Builtin::AwaitFinal`'s scheme
 `∀ν. Mut(ν, Txn) ⇒ ν` pins the domain, so awaiting an induction accumulator is a type error; and
-lowering resolves 𝑥 by name, as it does a write target, rather than through the value-reading path
-whose out-of-block gate would reject the very read this is.
+lowering resolves 𝑥 by name, as it does a write target, rather than through the value-reading path,
+which would make it a read requiring `Transaction` outside a block.
 
 **Four rules, in three places.** Two are order-independent and belong at lowering: the operand must
 be a `Mut(_, Txn)` mutable variable named bare, and the await may not sit inside a `with begin():`

@@ -550,7 +550,6 @@ pub(super) fn lower_final_stmt(
         // "must end in a value" error below, never this arm.)
         ChlStmt::AugAssign { target, op, value } => {
             let name = extract_name_target(target, "augmented assignment")?;
-            check_mut_write_context(&name, last.span, ctx)?;
             let rhs = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
             let val = lower_aug_binop(&name, *op, rhs, last.span, ctx)?;
             Ok(ctx.tag_image(Expr::mut_write(name, val), last.span))
@@ -572,7 +571,6 @@ pub(super) fn lower_final_stmt(
         }) =>
         {
             let name = extract_name_target(target, "mutable assignment")?;
-            check_mut_write_context(&name, last.span, ctx)?;
             let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
             Ok(ctx.tag_image(Expr::mut_write(name, val), last.span))
         }
@@ -862,27 +860,20 @@ pub(super) fn lower_middle_stmt(
             value,
         } => {
             let name = extract_name_target(target, "mutable assignment")?;
-            // A *bare* `x := e` (no annotation) to an already-live mutable variable is a
-            // write / sequential re-bind, not a declaration: gate it like any
-            // mutable write. A transactional mutable variable written here (outside a
-            // `with begin():` block) is rejected; an induction accumulator re-bind
-            // passes (`check_mut_write_context` is a no-op for it). An
-            // *annotated* `:=` is the introduction and needs no gate.
-            if annotation.is_none() {
-                check_mut_write_context(&name, stmt.span, ctx)?;
-            }
             let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
-            // A bare `x := e` where `x` is already in scope is a *write*, not a
-            // declaration: emit a `MutWrite` marker (mutability checked
+            // A bare `x := e` where `x` is already in scope, or where `x` is a
+            // transactional mutable variable a function body captures, is a *write*,
+            // not a declaration: emit a `MutWrite` marker (mutability checked
             // post-inference; the unified phase turns it into a recurrence in a
-            // loop or a shadowing advance at the top level). A transactional
-            // mutable variable write here was already rejected by
-            // `check_mut_write_context` above (a mutable variable write must sit inside
-            // a `with begin():` block).
+            // loop or a shadowing advance at the top level). A transactional write
+            // requires `Transaction`, which inference refuses where no `with
+            // begin():` block supplies it.
             if annotation.is_none() {
                 let mut scope = outer_bindings.clone();
                 collect_stmt_names(preceding, &mut scope);
-                if scope.contains(&name) {
+                if scope.contains(&name)
+                    || (ctx.is_transactional_mut_var(&name) && !ctx.is_shadowed(&name))
+                {
                     // The `MutWrite` is the image of `x := e`; the `ExprStmt`
                     // that sequences it onto the rest of the block is
                     // manufactured — the user wrote no sequencing operator. Two
@@ -932,11 +923,7 @@ pub(super) fn lower_middle_stmt(
         // targets are supported; tuple-destructuring `(a, b) += …` is Unsupported.
         ChlStmt::AugAssign { target, op, value } => {
             let name = extract_name_target(target, "augmented assignment")?;
-            // A `+=` to a transactional mutable variable outside a `with begin():` block
-            // is rejected here (a mutable variable write must commit inside a block);
-            // otherwise it is a bare mutable write whose target-is-a-mutable check
-            // runs post-inference.
-            check_mut_write_context(&name, stmt.span, ctx)?;
+            // A bare mutable write, whose target-is-a-mutable check runs post-inference.
             let rhs = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
             let val = lower_aug_binop(&name, *op, rhs, stmt.span, ctx)?;
             let write = ctx.tag_image(Expr::mut_write(name, val), stmt.span);
@@ -1579,7 +1566,6 @@ pub(super) fn lower_keyed_write(
         ));
     };
     let name = id.as_str().to_string();
-    check_mut_write_context(&name, span, ctx)?;
     let key = lower_expr(index, ctx)?;
     let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
     Ok(ctx.tag_image(Expr::mut_write_keyed(name, key, val), span))
@@ -1595,39 +1581,6 @@ pub(super) fn name_target_as_name(target: &Spanned<AssignTarget>) -> Option<&str
     } else {
         None
     }
-}
-
-/// Reject a `Mut(V, Txn)` **mutable variable** write that lands *outside* a `with
-/// begin():` block — the write-side mirror of the out-of-block read gate in
-/// [`super::lower_expr`]. A mutable variable's history is the commit order, so a bare
-/// write outside a block would become a plain sequential `let` shadow that
-/// silently hides every committed value from subsequent reads; require the
-/// write to sit inside a block.
-///
-/// A name shadowed by an inner local binder is a genuine local (its α-unique
-/// binder wins), not the mutable variable, so it is never gated — mirroring the read
-/// gate's `is_shadowed` guard against the base-name registry.
-///
-/// The dual case — an induction `Mut(V)` mutable variable written *inside* a block, which
-/// `transact_phase` would silently swallow — is rejected at the block-body write
-/// site in [`super::transactions::write_or_let`]; that check needs no induction
-/// registry, because inside a block the only legal `:=` / `+=` target is a
-/// transactional mutable variable.
-pub(super) fn check_mut_write_context(
-    name: &str,
-    span: Span,
-    ctx: &LoweringContext,
-) -> Result<(), LoweringError> {
-    if ctx.is_shadowed(name) {
-        return Ok(());
-    }
-    if ctx.is_transactional_mut_var(name) && !ctx.in_tx_body {
-        return Err(LoweringError::unsupported(
-            span,
-            format!("write transactional variable `{name}` inside a `with begin():` block"),
-        ));
-    }
-    Ok(())
 }
 
 /// Rejection for `x: Mut(V) = init` / `x: Mut(V, Txn) = init` — a `Mut` annotation with
@@ -2461,8 +2414,8 @@ pub(super) fn lower_trait_type(
     if name == "Transaction" {
         return Err(LoweringError::unsupported(
             ty.name_span,
-            "`Transaction` is not supported yet: transactions as contextual parameters are \
-             not implemented",
+            "`Transaction` is supplied by a `with begin():` block's body, not by an instance, \
+             so no summon or trait requirement names it",
         ));
     }
     let Some(trait_) = ctx.trait_named(name) else {

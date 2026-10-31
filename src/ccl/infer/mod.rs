@@ -846,11 +846,12 @@ pub(crate) fn run_with_params(
     // validator does not traverse for witness references. This additional walk is debug-only.
     #[cfg(debug_assertions)]
     debug_assert_no_free_witness(expr, "post-inference");
-    // An expression statement does something only by what it causes.
+    // An expression statement, and a `with begin():` block, does something only by what it
+    // causes.
     let inert: Vec<LocatedInferError> = sub_ctx
-        .inert_statements()
+        .does_nothing()
         .into_iter()
-        .map(|node| LocatedInferError::new(InferError::InertStatement, node))
+        .map(|(node, error)| LocatedInferError::new(error, node))
         .collect();
     // A public function's type naming a variable its module keeps is a type the module's
     // interface cannot state, so it fails inference outright.
@@ -875,6 +876,26 @@ pub(crate) fn run_with_params(
     // A private feed a public function appends to is appended to by other modules, so it is
     // the run's, as a public feed is.
     let mut top_level = sub_ctx.top_level_effects();
+    // Only a `with begin():` block's body supplies a transaction, so one a top level requires
+    // is supplied by nothing.
+    let unsupplied: Vec<LocatedInferError> = top_level
+        .iter()
+        .filter(|l| {
+            l.item
+                == crate::ccl::effects::Item::Requires(
+                    crate::ccl::effects::Requirement::transaction(),
+                )
+        })
+        .map(|l| {
+            let at = l
+                .at
+                .expect("a top-level requirement enters at the node that records or carries it");
+            LocatedInferError::new(InferError::TransactionOutsideBlock, at)
+        })
+        .collect();
+    if !unsupplied.is_empty() {
+        return Err(unsupplied);
+    }
     top_level.extend(exported.appends);
     Ok(Inferred {
         ty: expr.ty.clone(),

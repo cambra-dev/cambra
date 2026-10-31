@@ -2956,7 +2956,7 @@ fn share_a_binding(values: &[&Expr], kept: &[Kept]) -> bool {
 
 /// Whether `e` is an `if` or a `match` some branch of which writes, or runs a loop. The write
 /// may sit in a binding of the branch (`u = if …: x += 1; …`), off the branch's spine.
-fn is_writing_case(e: &Expr) -> bool {
+pub(crate) fn is_writing_case(e: &Expr) -> bool {
     matches!(e.node, TypedExprNode::Case { .. }) && contains_marker(e)
 }
 

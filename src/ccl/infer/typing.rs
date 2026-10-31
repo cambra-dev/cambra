@@ -340,8 +340,8 @@ pub(super) trait Typing {
 
     /// Record what reading the mutable variable `name` as a value requires: `Transaction`
     /// for a transactional one, and a position in its history, `Read(name)`, for an
-    /// induction variable. Check records nothing.
-    fn record_read(&mut self, _name: &Name) {}
+    /// induction variable, at `at`, the variable's mention. Check records nothing.
+    fn record_read(&mut self, _name: &Name, _at: NodeId) {}
 
     /// Note that the `let` of `name` at `node` binds `ty`, for the check that no public
     /// function's type names a variable of its module's own. Check notes nothing.

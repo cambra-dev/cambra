@@ -348,9 +348,9 @@ Each module is lowered with fresh block state. Every spelling-keyed map in `Lowe
 (`transactional_vars`, `type_aliases`, `history_param_fns`, `shadow_depth`, `nominal_types`,
 `associated_functions`, `used_nominal`) covers one module. The
 entries a module seeds from interfaces and from its parameters' Module types, `Txn` members in
-`transactional_vars` and `Mut`- and `Feed`-parameter functions in `history_param_fns`, are keyed by qualified
-spelling. The out-of-block read gate and the `MutWrite` shape then apply to `eu::stock` and
-`audit::stock` exactly as they apply to `stock` inside its own module.
+`transactional_vars` and `Mut`- and `Feed`-parameter functions in `history_param_fns`, are keyed
+by qualified spelling. The `MutWrite` shape a `:=` to one lowers to then applies to `eu::stock` and
+`audit::stock` exactly as it applies to `stock` inside its own module.
 
 A module whose own errors stop it from lowering has no interface, and a reference or a `use` item
 into it adds no error: that module's own errors account for it.
@@ -581,8 +581,8 @@ the run, since a predicate holds no such value yet (`compound_const_reads`).
 `Phase::Uniquify`, `Phase::Infer` in `src/ccl/context.rs`), plus the run-site checks of the
 module's own `run` and `import` statements ([Checking a module on its
 own](#checking-a-module-on-its-own)). Lowering's own refusals are part of it: the
-mutation-statement rules, the out-of-block `Txn` read gate, visibility, and a duplicate literal
-route within the module.
+mutation-statement rules, visibility, and a duplicate literal route within the module. So is a
+`Txn` read or write that no `with begin():` block encloses, which inference refuses.
 
 **Every later pass runs only on the linked tree**, because it needs the bodies of called functions
 inlined or the run tree assembled:
@@ -931,11 +931,6 @@ the [Implementation stack](#implementation-stack).
   function that owns a transaction and serves a request loop.
 - **Mutable writes inside a comprehension.** A function writing a mutable variable, called in a
   comprehension's element, has its writes dropped rather than applied or refused.
-- **`requires Transaction`** ([chl-spec.md, "8.7 Direction [Decided]: transactions as contextual
-  parameters"](chl-spec.md#87-direction-decided-transactions-as-contextual-parameters)). A function
-  that reads or writes `Txn` state inside its caller's transaction, and so two module functions
-  composed in one transaction. The lexical read gate refuses a `Txn` read in a `def` outside a `with
-  begin():` of its own until then.
 - **Trait requirements in generalized types.** A requirement a body places on a generic parameter is
   part of the inferred type, so a use that fails it is rejected at the use.
 - **Refinements over mutable state.** A refinement whose predicate reads a mutable variable,
