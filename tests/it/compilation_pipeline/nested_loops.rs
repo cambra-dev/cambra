@@ -179,6 +179,132 @@ fn a_mutable_variable_may_be_introduced_between_the_loops() {
     );
 }
 
+/// A conditional after an inner loop, in the same body. Each arm of the conditional reads the
+/// inner loop's final value, and an arm answers only at the positions its condition admits;
+/// read whole, the two arms of `if i == 2` would both answer for every `i`.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// 3 × (10 + 20), then 1000 at `i == 2`.
+#[case::writes_the_inner_variable(
+    indoc! {r"
+        t := 0
+        for i in [1, 2, 3]:
+            for j in [10, 20]:
+                t := t + j
+            if i == 2:
+                t := t + 1000
+        t
+    "},
+    1090
+)]
+#[case::writes_another_variable(
+    indoc! {r"
+        t := 0
+        s := 0
+        for i in [1, 2, 3]:
+            for j in [10, 20]:
+                t := t + j
+            if i == 2:
+                s := 1
+        t * 10 + s
+    "},
+    901
+)]
+// The inner loop and the write sit under a guard that reads the variable written, so the
+// inner loop runs for `i` 1 and 2 only.
+#[case::under_a_guard_on_the_variable_written(
+    indoc! {r"
+        t := 0
+        s := 0
+        for i in [1, 2, 3]:
+            if s == 0:
+                for j in [10, 20]:
+                    t := t + j
+                if i == 2:
+                    s := 1
+        t
+    "},
+    60
+)]
+#[case::under_a_match_on_the_variable_written(
+    indoc! {r"
+        t := 0
+        st := `ok(0)
+        for i in [1, 2, 3]:
+            match st:
+                case `ok(_):
+                    for j in [10, 20]:
+                        t := t + j
+                    if i == 2:
+                        st := `err(i)
+                case `err(_):
+                    pass
+        t
+    "},
+    60
+)]
+fn a_conditional_after_an_inner_loop(#[case] program: &str, #[case] total: i64) {
+    check_scalar(program, Value::Int(total));
+}
+
+/// A `match` in an inner loop's body. The scrutinee stands under both loops' positions, so
+/// each arm's tag test answers one value per inner position, beneath the outer ones.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::on_the_inner_element(
+    indoc! {r"
+        t := 0
+        for i in [1, 2]:
+            for m in [`a(1), `b(2)]:
+                match m:
+                    case `a(n):
+                        t := t + n
+                    case `b(k):
+                        t := t + k * 10
+        t
+    "},
+    42
+)]
+// The inner variable turns `err` at `j == 20` of `i == 2`, after that position's write.
+#[case::on_a_variable_the_outer_body_declares(
+    indoc! {r"
+        t := 0
+        for i in [1, 2, 3]:
+            st := `ok(0)
+            for j in [10, 20]:
+                match st:
+                    case `ok(_):
+                        t := t + j
+                        if i == 2:
+                            st := `err(j)
+                    case `err(_):
+                        pass
+        t
+    "},
+    70
+)]
+// The variable turns `err` at `i == 2, j == 10`, and nothing is added after it.
+#[case::on_a_variable_declared_before_both(
+    indoc! {r"
+        t := 0
+        st := `ok(0)
+        for i in [1, 2, 3]:
+            for j in [10, 20]:
+                match st:
+                    case `ok(_):
+                        t := t + j
+                        if i == 2:
+                            st := `err(j)
+                    case `err(_):
+                        pass
+        t
+    "},
+    40
+)]
+fn a_match_in_an_inner_loop(#[case] program: &str, #[case] total: i64) {
+    check_scalar(program, Value::Int(total));
+}
+
 // ---------------------------------------------------------------------------
 // Crossed with the write forms
 // ---------------------------------------------------------------------------
