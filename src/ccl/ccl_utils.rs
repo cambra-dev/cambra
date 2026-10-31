@@ -2546,11 +2546,10 @@ pub fn refine_with_bare(base: Type, bare_predicate: &Expr) -> Type {
 /// *uses* of the handle / mutable variable), while a
 /// [`TypedExprNode::Transact`] mutable variable key does not (it is a field label).
 ///
-/// A [`Type::Refinement`] is a binding form too — it binds
-/// [`crate::ccl::REFINEMENT_BINDER`] (`__elem`) in its predicate — so occurrences
-/// of that one name inside a type are **bound, never free** (see
-/// [`is_free_in_type`]). Every other name in a predicate is a free reference to
-/// the enclosing lexical scope and is counted.
+/// A [`Type::Refinement`] is a binding form too: it binds its element in its
+/// predicate, so an element reference `__elem^𝑛` inside it reads an enclosing element
+/// at `𝑛 - 1` and is counted there. Every other name in a predicate is a free
+/// reference to the enclosing lexical scope and is counted.
 ///
 /// Used by:
 /// - [`is_free`] — the bool wrapper for "does `name` appear at all?"
@@ -2878,7 +2877,7 @@ fn free_names_counting(expr: &Expr, writes: bool) -> HashSet<Name> {
                 // predicate is walked under the binders in force *here*.
                 let mut inner = HashSet::new();
                 go(pred, writes, bound, vis, &mut inner);
-                out.extend(inner.into_iter().filter(|n| !n.is_elem()));
+                out.extend(inner.into_iter().filter(|n| n.elem_index().is_none()));
             });
         });
         // A `VarRef` is a `Var`'s name or a write's target.
@@ -2951,22 +2950,8 @@ fn count_free_in_type_with_visited(
     ty: &Type,
     visited: &mut HashSet<PredicateId>,
 ) -> usize {
-    // The refinement element binder ([`crate::ccl::REFINEMENT_BINDER`]) occurs *only*
-    // inside refinement predicates, and each such occurrence is bound by its enclosing
-    // refinement — including under nesting, where each layer binds its own. So it is
-    // never free in a type: counting its (bound) occurrences reports a binder capture
-    // that cannot happen, and the caller that asks (lambda-elim's "value-dependent
-    // dependent function" guard) then rejects a perfectly ordinary term because some
-    // type inside it carried an `__elem` predicate.
-    //
-    // The carve-out is type-level only: the *term* walk
-    // ([`count_free_with_visited`]) deliberately keeps counting `__elem`, because a
-    // bare predicate manipulated as a term — eta-expanded by
-    // `planning::fn_of_bare_predicate`, say — genuinely has it free until that
-    // expansion binds it.
-    if name.is_elem() {
-        return 0;
-    }
+    // An element reference is bound by the refinements it sits in: inside one more, the same
+    // element is one index further out (`count_free_in_type_go`).
     count_free_in_type_go(name, ty, visited)
 }
 
@@ -3009,8 +2994,21 @@ fn count_free_in_type_go(name: &Name, ty: &Type, visited: &mut HashSet<Predicate
             let mut count = 0;
             if let Type::Refinement(_, refinements) = ty {
                 for refinement in refinements {
-                    if visited.insert(refinement.predicate_id()) {
-                        count += count_free_with_visited(name, &refinement.predicate, visited);
+                    match name.elem_index() {
+                        // The refinement binds its own element, so the one `name` reads is an
+                        // index further out inside it. A predicate shared at two depths reads
+                        // two different elements, so the walk dedups within one depth alone.
+                        Some(up) => {
+                            count += count_free_with_visited(
+                                &Name::elem_at(up + 1),
+                                &refinement.predicate,
+                                &mut HashSet::new(),
+                            )
+                        }
+                        None if visited.insert(refinement.predicate_id()) => {
+                            count += count_free_with_visited(name, &refinement.predicate, visited);
+                        }
+                        None => {}
                     }
                 }
             }

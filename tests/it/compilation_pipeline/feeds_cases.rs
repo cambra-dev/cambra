@@ -1798,13 +1798,20 @@ fn rows_keyed_by_the_loops_around_the_feed(#[case] source: &str, #[case] expecte
 }
 
 /// A loop over a group-by feeds one row per group, keyed by the group's key. Each group's
-/// domain reads its key, which the loop binds as its position.
+/// domain reads its key, which the loop binds as its position. A condition on the group
+/// filters the channel's domain by a predicate reading the group at its element.
 #[rstest]
 #[case::summed(indoc! {r#"
     out = test_sink()
     for g in groupby([1, 2, 3, 4], \e -> e // 2):
         out << sum(g)
 "#}, "[1, 5, 4]")]
+#[case::under_a_condition_on_the_group(indoc! {r#"
+    out = test_sink()
+    for g in groupby([1, 2, 3, 4], \e -> e // 2):
+        if sum(g) > 3:
+            out << sum(g)
+"#}, "[1 -> 5, 2 -> 4]")]
 #[case::over_records(indoc! {r#"
     sales = [(region="east", amount=1), (region="west", amount=2), (region="east", amount=3)]
     out = test_sink()

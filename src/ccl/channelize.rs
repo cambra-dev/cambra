@@ -2417,7 +2417,7 @@ fn extract_for_defer(
     // — deep enough trees overflow a test thread's default stack. Every level goes
     // through this wrapper, so each one checks the remaining headroom.
     stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
-        extract_for_defer_impl(expr, defer_name, feeds, define, in_inner_scope)
+        extract_for_defer_impl(expr, defer_name, feeds, define, in_inner_scope, None)
     })
 }
 
@@ -2438,6 +2438,7 @@ fn extract_for_defer_impl(
     feeds: &mut Vec<Contribution>,
     define: &mut Option<(NodeId, Expr)>,
     in_inner_scope: bool,
+    position: Option<&Name>,
 ) -> Result<Expr, Located<DeferError>> {
     // A loop indexed by its position is the chain `source ≫ step` it denotes, whose arm below
     // extracts the feeds a loop's step makes; each loop that arm hands back, the residual and
@@ -2453,7 +2454,14 @@ fn extract_for_defer_impl(
             chain.ty = loop_ty;
             chain.user_annotation = annotation.clone();
             let start = feeds.len();
-            let out = extract_for_defer_impl(chain, defer_name, feeds, define, in_inner_scope)?;
+            let out = extract_for_defer_impl(
+                chain,
+                defer_name,
+                feeds,
+                define,
+                in_inner_scope,
+                Some(&position.name),
+            )?;
             // A contribution is a loop of its own over the source, so it binds a position of
             // its own, which the step's reads of the loop's position become.
             for contribution in &mut feeds[start..] {
@@ -2942,10 +2950,30 @@ fn extract_for_defer_impl(
                                     let pred =
                                         under_lets(&lets, synthesize_arm_predicate(&guard, &prior));
                                     let elem = Expr::var(Name::elem()).with_ty(src_domain.clone());
+                                    // The item at the element: a family's item reads its key.
+                                    let item_at_elem = match source_prefix.ty.peel_refinements() {
+                                        Type::Fun {
+                                            name: Some(key),
+                                            codomain,
+                                            ..
+                                        } => crate::ccl::subst::discharge_codomain(
+                                            key, &elem, codomain,
+                                        ),
+                                        _ => src_item.clone(),
+                                    };
                                     let source_at_elem = Expr::apply(elem, source_prefix.clone())
-                                        .with_ty(src_item.clone());
-                                    let pred_lambda =
+                                        .with_ty(item_at_elem);
+                                    let mut pred_lambda =
                                         Expr::lambda(&param.name, param.ty.clone(), pred);
+                                    // The predicate's element is the loop's position, which
+                                    // the element's type may read.
+                                    if let Some(position) = position {
+                                        pred_lambda = crate::ccl::subst::Subst::rename(
+                                            position,
+                                            Name::elem(),
+                                        )
+                                        .apply_expr(&pred_lambda);
+                                    }
                                     let pred_on_source = Expr::apply(source_at_elem, pred_lambda)
                                         .with_ty(Type::Base(BaseType::Bool));
                                     let refinement_struct =

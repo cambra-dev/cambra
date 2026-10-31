@@ -29,10 +29,13 @@
 //!   a pass minted too early) and lets code recognize a binder's origin by its
 //!   `kind` rather than by parsing a spelling.
 //! * [`Name::Reserved`] — a name with **custom semantics** ([`ReservedName`]).
-//!   The only one today is the refinement element binder `__elem`: every
-//!   refinement implicitly binds the *same* one (see [`crate::ccl::Refinement`]),
-//!   which is what makes refinement equality plain structural equality of bare
-//!   predicates. Uniquification never mints it; substitution shadows it.
+//!   The only one today is the refinement element reference `__elem^𝑛`, indexed by
+//!   the refinements between it and the refinement whose element it reads (see
+//!   [`crate::ccl::Refinement`]). The index identifies the element, which is what
+//!   makes refinement equality plain structural equality of bare predicates.
+//!   Uniquification never mints it; substitution shifts it
+//!   (`src/ccl/design/type-inference.md`, "A refinement's element is referenced by
+//!   index").
 //! * [`Name::PiBound`] — a **bound reference to an enclosing function's Pi
 //!   binder**, as a de Bruijn index ([`PiRef`]). Not a binder: nothing
 //!   introduces one; a reference becomes one when function construction closes
@@ -80,16 +83,19 @@ impl fmt::Debug for Uid {
 /// spelling and is constructed only through its dedicated [`Name`] constructor.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ReservedName {
-    /// The refinement element binder, spelled `__elem`. One shared name across
-    /// every refinement (see the module docs and [`crate::ccl::Refinement`]).
-    Elem,
+    /// A reference to a refinement's element, spelled `__elem`, indexed by the refinements
+    /// crossed: `Elem(0)` is the element of the refinement whose predicate holds the
+    /// reference, `Elem(n)` the element of the refinement `n` further out. One shared name
+    /// per index across every refinement (see the module docs and
+    /// [`crate::ccl::Refinement`]).
+    Elem(u32),
 }
 
 impl ReservedName {
     /// The canonical source-disjoint spelling.
     pub fn spelling(self) -> &'static str {
         match self {
-            ReservedName::Elem => "__elem",
+            ReservedName::Elem(_) => "__elem",
         }
     }
 }
@@ -457,7 +463,7 @@ impl Name {
     pub fn raw(base: impl Into<SmolStr>) -> Self {
         let base = base.into();
         debug_assert!(
-            base != ReservedName::Elem.spelling(),
+            base != ReservedName::Elem(0).spelling(),
             "`{base}` is a reserved spelling — construct it via its Name constructor, not raw()",
         );
         Name::Raw(base)
@@ -516,7 +522,13 @@ impl Name {
 
     /// The refinement element binder `__elem`.
     pub fn elem() -> Self {
-        Name::Reserved(ReservedName::Elem)
+        Self::elem_at(0)
+    }
+
+    /// The element of the refinement `up` refinements out from the one whose predicate holds
+    /// the reference.
+    pub fn elem_at(up: u32) -> Self {
+        Name::Reserved(ReservedName::Elem(up))
     }
 
     /// Mint a compiler-introduced binder of `kind` with a globally fresh
@@ -732,9 +744,17 @@ impl Name {
         matches!(self, Name::Raw(_))
     }
 
-    /// Is this the reserved refinement element binder?
+    /// Is this the element of the refinement whose predicate holds it?
     pub fn is_elem(&self) -> bool {
-        matches!(self, Name::Reserved(ReservedName::Elem))
+        self.elem_index() == Some(0)
+    }
+
+    /// The refinements crossed to the element this reads, if it reads one.
+    pub fn elem_index(&self) -> Option<u32> {
+        match self {
+            Name::Reserved(ReservedName::Elem(up)) => Some(*up),
+            _ => None,
+        }
     }
 
     /// A reference to the enclosing function `index` crossings out, spelled by
@@ -807,6 +827,7 @@ impl fmt::Display for Name {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Name::PiBound(PiRef { index, hint: None }) => write!(f, "#{index}"),
+            Name::Reserved(ReservedName::Elem(up)) if *up > 0 => write!(f, "__elem^{up}"),
             // An imported module's or a run's member renders qualified, in every
             // module's diagnostics alike.
             Name::Unique {

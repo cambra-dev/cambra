@@ -176,6 +176,21 @@ fn compile_cast_target(target: &mut Type, value_dom: Option<Type>, memo: &PredMe
     }
 }
 
+/// Whether a type slot in `e` reads a refinement's element.
+fn types_read_element(e: &Expr) -> bool {
+    let mut found = false;
+    e.walk_type_slots(|ty| {
+        found |= crate::ccl::subst::type_free_vars(ty)
+            .iter()
+            .any(|n| n.elem_index().is_some())
+    });
+    found || {
+        let mut below = false;
+        e.walk_children(|c| below |= types_read_element(c));
+        below
+    }
+}
+
 /// The point-free predicate function `p : base ⇒ Bool` underlying a refinement's
 /// bare predicate `__elem ▷ p` (the inverse of [`ccl_utils::bare_predicate_of_fn`]).
 /// Fast-pathed when the bare predicate is already that single application; otherwise
@@ -208,6 +223,7 @@ pub(crate) fn fn_of_bare_predicate(
 ) -> Expr {
     if let TypedExprNode::Apply { argument, function } = &bare.node
         && matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem())
+        && crate::ccl::subst::free_elem_indices(function).is_empty()
     {
         if crate::ccl::channelize::holds_defer(function) {
             return eliminate_lifted((**function).clone())
@@ -225,7 +241,15 @@ pub(crate) fn fn_of_bare_predicate(
     };
     // Only the *kind* is declared. The shape is whatever the η-expansion built, so a bare
     // predicate that is already function-valued keeps the codomain it has.
-    let lam = Expr::lambda(Name::elem(), base.clone(), bare.clone());
+    // A type inside the predicate reading the element reads the function's parameter, so the
+    // parameter takes a name of its own there.
+    let lam = if types_read_element(bare) {
+        let param = Name::fresh("elem");
+        let bare = crate::ccl::subst::Subst::rename(Name::elem(), param.clone()).apply_expr(bare);
+        Expr::lambda(param, base.clone(), bare)
+    } else {
+        Expr::lambda(Name::elem(), base.clone(), bare.clone())
+    };
     let lam = match &lam.ty {
         Type::Fun {
             name,

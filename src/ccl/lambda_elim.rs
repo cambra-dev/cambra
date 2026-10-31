@@ -408,65 +408,6 @@ fn strength_over_ty(f: &Expr, fun_kind: &FunKind) -> Type {
     }
 }
 
-/// Remove from the types inside `predicate` each refinement that restates `param`'s own
-/// dependent-tuple type: a later component's type opened at `param`, such as the key
-/// `param.1 : {𝐾 | __elem ∈ 𝑀(param.0)}` of `param : (𝑖 : 𝐼) × {𝐾 | __elem ∈ 𝑀(𝑖)}`.
-///
-/// Lifting the predicate onto a pair rewrites `param` to `__elem.0`, and a refinement that
-/// reads `param` inside a subterm's type binds `__elem` again, so the rewrite would capture
-/// (`subst::Mapping::Unspellable`). A restated component fact loses nothing
-/// when removed: the pair's first component is `param`, whose type states it. Only a
-/// refinement equal as a term to one the tuple's type states is removed; any other that
-/// would capture still reaches the substitution and fails there.
-fn remove_restated_component_facts(param: &Name, param_ty: &Type, predicate: &mut TypedExpr) {
-    let Type::DepTuple(components) = param_ty.peel_refinements() else {
-        return;
-    };
-    let restated: Vec<Rc<TypedExpr>> = (1..components.len())
-        .filter_map(|k| {
-            param_ty.component_type(k, |j, ty| {
-                Expr::apply(
-                    Expr::var(param).with_ty(param_ty.clone()),
-                    Expr::proj_index(j).with_ty(Type::fun(param_ty.clone(), ty.clone())),
-                )
-                .with_ty(ty.clone())
-            })
-        })
-        .flat_map(|ty| ty.refinements().to_vec())
-        .filter(|r| is_free(param, &r.predicate))
-        .map(|r| Rc::clone(&r.predicate))
-        .collect();
-    if restated.is_empty() {
-        return;
-    }
-    fn in_type(ty: &mut Type, restated: &[Rc<TypedExpr>]) {
-        if let Type::Refinement(base, refinements) = ty
-            && refinements.iter().any(|r| {
-                restated
-                    .iter()
-                    .any(|f| crate::ccl::eq_term_modulo_ty_slots(&r.predicate, f))
-            })
-        {
-            let kept: crate::ccl::RefinementSet = refinements
-                .iter()
-                .filter(|r| {
-                    !restated
-                        .iter()
-                        .any(|f| crate::ccl::eq_term_modulo_ty_slots(&r.predicate, f))
-                })
-                .cloned()
-                .collect();
-            *ty = Type::refined((**base).clone(), kept);
-        }
-        ty.walk_children_mut(|child| in_type(child, restated));
-    }
-    fn in_expr(e: &mut TypedExpr, restated: &[Rc<TypedExpr>]) {
-        e.walk_type_slots_mut(|t| in_type(t, restated));
-        e.walk_children_mut(|child| in_expr(child, restated));
-    }
-    in_expr(predicate, &restated);
-}
-
 /// The components of a pairing `⟨𝑓₀, 𝑓₁, …⟩ ▷ zip : (𝑎 : 𝐴) ⇒ 𝑇` as terms in its input's
 /// binder: `𝑎 ▷ 𝑓ₖ`, or `𝑎` for an `id` component. `None` for any other term, and for a
 /// pairing whose type names no binder for its input, which leaves nothing to state the
@@ -1477,10 +1418,9 @@ fn elim_lambda_impl(
             // **A filter reading `param` stays where the pair is otherwise not dependent.** The
             // component is then `{𝐾 | 𝑝(param, ·)}`, a type chosen by the first component's
             // value, so the pair is the dependent tuple `(param : 𝐴) × {𝐾 | 𝑝(param, ·)}` and
-            // `.1` out of it carries the filter its readers need. Nothing lifts: on the pair,
-            // the filter's `.1` would have to read the refinement's own `__elem.0` inside a
-            // nested refinement, which has no spelling. Planning applies it from the
-            // component instead (`emit_pair_filter` in `src/ccl/planning/correlated.rs`).
+            // `.1` out of it carries the filter its readers need. Nothing lifts: planning
+            // applies it from the component (`emit_pair_filter` in
+            // `src/ccl/planning/correlated.rs`).
             let refinements = y_ty.refinements().to_vec();
             let membership_dependent = refinements
                 .iter()
@@ -1541,37 +1481,20 @@ fn elim_lambda_impl(
                         .with_ty(ty.clone())
                     };
                     // Innermost first: the element read introduces `__elem`, and the
-                    // `param` read must not then be rewritten as one of its occurrences.
+                    // `param` read must not then be rewritten as one of its occurrences. A
+                    // nested refinement reading `param` reads `__elem^1.0`
+                    // (`src/ccl/design/type-inference.md`, "Lifting a filter onto the pair").
                     let on_element =
                         crate::ccl::subst::Subst::discharge(Name::elem(), at(1, &y_ty))
                             .apply_expr(predicate);
-                    // **`param` is bound, not substituted, where a nested refinement reads
-                    // it.** Writing `__elem.0` there would capture: the nested refinement
-                    // binds `__elem` to its own element, and no spelling names the
-                    // enclosing one. Applying `λ param → …` to the pair's first component
-                    // leaves the nested refinement reading a binder of the predicate's own
-                    // term, which every reader resolves as it resolves any lambda binder
-                    // in a predicate (`src/ccl/design/type-inference.md`, "Lifting a
-                    // filter onto the pair").
-                    let free = crate::ccl::ccl_utils::count_free(param, &on_element);
-                    if free > crate::ccl::ccl_utils::count_free_in_value(param, &on_element) {
-                        let ty = on_element.ty.clone();
-                        Expr::apply(
-                            at(0, param_ty),
-                            Expr::lambda(param.clone(), param_ty.clone(), on_element),
-                        )
-                        .with_ty(ty)
-                    } else {
-                        crate::ccl::subst::Subst::discharge(param.clone(), at(0, param_ty))
-                            .apply_expr(&on_element)
-                    }
+                    crate::ccl::subst::Subst::discharge(param.clone(), at(0, param_ty))
+                        .apply_expr(&on_element)
                 };
                 let key = (param.clone(), bare_pair.clone());
                 let lifted: Vec<Refinement> = lifting
                     .into_iter()
                     .map(|mut r| {
                         ctx.pair_lifts.rebuild(&mut r, &key, |predicate| {
-                            remove_restated_component_facts(param, param_ty, predicate);
                             *predicate = onto_pair(&Rc::new(predicate.clone()));
                             true
                         });
