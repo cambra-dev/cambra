@@ -2022,13 +2022,19 @@ The codomain comparison aligns binder names with `Subst::aligned` when required.
 record the resulting relation in its native direction. Pre-inverting a discharge would lose the
 argument replacement, including when a concrete function reaches an earlier opaque application.
 
+A variable's side of an edge keeps only what can act on the variable (`Subst::acting_on`): an entry
+for a binder outside its telescope leaves its content unchanged
+([The invariant](#the-invariant)). `constrain_go` restricts both sides on entry, so one constraint
+reached along several paths, each composing the binders of the dependent applications and lambdas
+it passed through, is one edge, recorded once.
+
 When lower and upper entries meet at one holder, `bridge_holder_gap` reconciles their holder views:
 
 1. Identical views need no bridge.
-2. Views that differ only in discharges the holder cannot name act alike on it, so
-   `L <: 𝑉‹lo›` and `𝑉‹hi› <: 𝑈` meet at one type and need no bridge. A discharge cannot act on
-   `𝑉` when its binder is outside `𝑉`'s telescope, or its witness outside every binder scoping
-   over `𝑉` (`Subst::without_vacuous_discharges`).
+2. Views that differ only in entries the holder cannot name act alike on it, so
+   `L <: 𝑉‹lo›` and `𝑉‹hi› <: 𝑈` meet at one type and need no bridge. An entry cannot act on
+   `𝑉` when its binder is outside `𝑉`'s telescope, or a witness discharge when its witness is
+   outside every binder scoping over `𝑉` (`Subst::acting_on`).
 3. The bridge applies `licensed_correspondence_view`, which treats variable-target discharges as
    renames at this site. This is an existing restricted transport assumption, not general
    invertibility of discharge.
