@@ -2767,6 +2767,24 @@ fn convert_impl_inner(
             // product's component plans as `iterate ▷ (𝑠 ≫ 𝑝) ▷ restrict ≫ 𝑠` with `𝑠` such an
             // `Apply`, and its second `𝑠` reaches here. An input reaching any other `Apply`
             // is an iteration planning left out.
+            //
+            // `box` is the identity, and `unbox` re-views the keys of the `box` it is given, so
+            // an input passes through either to the collection beneath, which looks itself up
+            // at it.
+            if input.is_some() {
+                let boxes = |e: &Expr| {
+                    matches!(&e.node, TypedExprNode::Apply { function, .. }
+                        if as_builtin(function) == Some(Builtin::Box))
+                };
+                match as_builtin(function) {
+                    Some(Builtin::Box) => return convert_impl(argument, input, ctx),
+                    Some(Builtin::Unbox) if boxes(argument) => {
+                        let arg = convert_impl(argument, input, ctx)?;
+                        return convert_impl(function, Some(arg), ctx);
+                    }
+                    _ => {}
+                }
+            }
             if let Some(input) = input {
                 if !expr.ty.is_collection() {
                     return Err(ConversionError::Unsupported(format!(
@@ -2882,9 +2900,7 @@ fn convert_impl_inner(
                 // with a collection over it, and a collection carries its own domain, so the
                 // witness is recoverable from the value and nothing represents it separately
                 // (`src/ccl/design/mutability.md`, "A mutable collection's key set varies with
-                // the position"). Planning erases a `box` over one candidate and leaves standing
-                // one whose witness the value carries, described or listed
-                // (`src/ccl/planning/conditionals.rs`, `binds_an_undetermined_witness`).
+                // the position"). Every `box` reaches here except a realized arm's.
                 Builtin::Box => Ok(input),
                 // **`unbox(𝑐)` is tiled at its witness's bound**, the extent its type
                 // `σ₁(𝑐) ⤇ 𝑉` converts to, so a key typed by the witness applies to it: a

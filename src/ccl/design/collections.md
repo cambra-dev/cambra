@@ -461,9 +461,8 @@ bound off its own term. It holds the binder's position rather than its id: infer
 sum's binders into each consumer's scope, and the term and the position stay the same. A type that
 mentions `σᵢ(𝑥)` and leaves the binding of `𝑥` substitutes `𝑥`'s definition, as any type naming a
 `let` binder does ([`let` binders and scope exit](type-inference.md#let-binders-and-scope-exit)).
-Planning's erasure of a determined witness rewrites `σᵢ(𝑐)` to the candidate, and `unbox` of a
-collection whose witness it erased to that collection. It reads the witness off the term the
-projection quotes, under the id that term was typed with.
+Realization rewrites `σᵢ(𝑐)` in a leg to the candidate the leg chose. It reads the witness off the
+term the projection quotes, under the id that term was typed with.
 
 ### Typing
 
@@ -531,13 +530,12 @@ At runtime the value is the leg holding rows, keyed by its own keys: op-conversi
 `Realize` over a copairing as a flat merge at the key bound the sum's type declares
 (`UnionOperator::new_flat_over`), so no key carries its leg's tag.
 
-Planning can instead erase a determined witness or retain a materialized one. Erasure
-removes the introduction and instantiates its type references. A materialized witness keeps
-the `box`, and the value carries its keys. This supports `List(𝑇)` over `UIntRanges` and
+Every other sum is materialized: its `box` stays, and the value carries its keys. `box` is the
+identity at runtime, since a collection carries its own domain, so a sum over one candidate
+compiles to the operators its collection does. This supports `List(𝑇)` over `UIntRanges` and
 `Map(𝐾, 𝑉)` over `SubtypesOf(𝐾)`: `extent_of` supplies a key bound, not an enumeration.
-A determined row must also remain materialized when its enclosing position requires a sum.
-The type-level erasure exceptions are specified in
-[Witness erasure](type-inference.md#which-case-a-site-realizes-and-what-a-leg-instantiates).
+Iteration planning places an `iterate` beneath a standing `box`, and beneath `unbox(box(𝑥))`,
+since an applied function's argument is a stream of its own (`planning::iterate::under_box`).
 
 A materialized collection still cannot supply an `IterateExtent` from its type alone.
 The standalone `WitnessRef` case in `extent_of` rejects that use. A comprehension can
@@ -547,10 +545,8 @@ instead compose its generator with the collection, taking the keys from its valu
 A `for` loop over a sum types its history over the source's domain; see
 [A `for` loop over a sum](#a-for-loop-over-a-sum).
 
-`erase_determined_boxes` decides whether to retain a row's introduction from the position it fills.
-Inlining can move a let-bound row into a jagged literal position, where its box is preserved. A row
-read from mutable storage has already had its determined witness erased. Such a bare row cannot fill
-a sum-typed element position; `reject_rows_fixed_elsewhere` reports the mismatch.
+A row a jagged list literal reads from a mutable variable does not compile: op-conversion converts
+the literal as a constant, and takes a collection-valued element only written out as a list literal.
 
 A conditional is realized where it stands. The `Case` is replaced in place by its union, under a
 `Realize` that asserts the `Case`'s type and keeps the `Case` as the term it stages. Every consumer
@@ -560,9 +556,8 @@ as the term it stages (`ccl_utils::normal_form`), so those types and the realize
 one term. A `let`-bound conditional is realized once, in its binding, and its consumers share it.
 
 Unboxed arms sharing a domain need no sum; boxed arms sharing a domain still have a
-one-candidate sum during inference. A same-domain boxed conditional is realized, not erased:
-realization records its witness in `realized`, and `collapse_determined_sums` preserves it so the
-`Realize` assertion retains its binder.
+one-candidate sum. A same-domain boxed conditional is realized like any other, and the realized
+conditional's type keeps its binder.
 
 ### A conditional chosen per row
 
@@ -605,15 +600,8 @@ for i in [1, 2]:
 ```
 
 Each row's value has type `Σ (σ : [0..2, 0..3]). σ ⤇ Int` and carries its own `σ`, so each
-arm keeps its `box`, as a row of a jagged list literal does. `erase_determined_boxes` erases a
-`box` whose type has one candidate unless the type its position requires is a sum.
-`walk_children_with_demand` passes the position's type through each leg to its arm by two rules:
-
-- The last step of a `≫` chain receives the chain's result type.
-- The argument of `𝑎 ▷ const` receives the result type, since `𝑎 ▷ const` returns `𝑎` at every
-  row.
-
-A consumer that iterates a leg's arm finds the list beneath the `box` (`mark_component_source`).
+arm keeps its `box`, as every `box` does. A consumer that iterates a leg's arm finds the list
+beneath the `box` (`mark_component_source`).
 
 A loop over a conditional chosen per row reads it through `unbox`, so a type after the loop quotes
 the conditional as written, `σ₁({ 𝑔(𝑥) → 𝑎; true → 𝑏 })`, while the tree holds its fan-out. Normal

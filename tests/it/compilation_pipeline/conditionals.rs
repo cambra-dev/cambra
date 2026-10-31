@@ -525,30 +525,19 @@ c: Bool = False
     for i in [1, 2]:
         out << sum([x for x in [1, 2, 3, 4, 5, 6, 7, 8] if x > sum(box([1, 2]) if i > 1 else box([3, 4, 5]))])
 "#}, "[0, 30]")]
+// A boxed arm built by a comprehension reading the row: the leg ends in the comprehension's
+// chain, `… ≫ map ≫ box`.
+#[case::a_boxed_arm_reading_the_row_through_a_comprehension(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        out << sum(box([z * i for z in [1, 2]]) if i > 1 else box([7]))
+"#}, "[7, 6]")]
 #[case::in_a_filter_reading_the_element(indoc! {r#"
     out = test_sink()
     out << sum([x for x in [1, 2, 3, 4, 5, 6, 7, 8] if x > sum([1, 2] if x > 4 else [3, 4])])
 "#}, "[() -> 26]")]
 fn a_conditional_chosen_per_row(#[case] source: &str, #[case] expected: &str) {
     check_sink(source, expected);
-}
-
-/// A boxed arm built by a comprehension reading the row. The arm is not constant in the row, so
-/// its leg ends in the comprehension's chain, `… ≫ map ≫ box`, rather than `box` applied to a
-/// constant, and neither `erase_determined_boxes` nor the materialized set recognizes that
-/// `box`: post-planning finds the leg's plain collection where the union's codomain binds a
-/// witness. Pinned on that failure as a known gap.
-#[test]
-#[should_panic(expected = "post-planning produced an invalid tree")]
-fn a_boxed_arm_reading_the_row_through_a_comprehension() {
-    check_sink(
-        indoc! {r#"
-            out = test_sink()
-            for i in [1, 2]:
-                out << sum(box([z * i for z in [1, 2]]) if i > 1 else box([7]))
-        "#},
-        "[7, 6]",
-    );
 }
 
 // Consuming a conditional collection through a comprehension

@@ -305,8 +305,7 @@ calls `planning::plan_loops` to recognize causal `LetRec` groups as `Transact` n
 induction loops and transaction groups use this carrier; its domain selects the runtime
 engine during operator conversion. `planning::run` then performs these rewrites in order:
 
-1. Realize collection-valued conditionals and erase determined sum witnesses. A row of a jagged
-   collection read from a mutable variable is refused.
+1. Realize collection-valued conditionals.
 2. Recognize pointful keyed-aggregate sources and rewrite them using `converse`.
 3. Simplify point-free expressions before inserting iteration sources.
 4. Fold closed scalar computations with `const_fold::fold_constants`.
@@ -333,10 +332,10 @@ A collection-valued guard `Case` carries a sum over its possible domains. For a 
 finitely many named candidates, conditional planning restricts each arm by its first-match
 condition and unions the arms. Exactly one arm contributes data. The resulting tagged union
 is an executable representation of the selected collection; it is introduced after type
-inference because its type differs from the source sum. A determined witness with one
-candidate is erased from the term and its types. Every other witness is materialized: its `box`
-stays standing, the value carries its own keys, and operator conversion bounds the domain from
-the witness's kind. A `for` loop over a sum is refused by name, since its history would name the
+inference because its type differs from the source sum. Every other witness is materialized: its
+`box` stays standing, the value carries its own keys, and operator conversion bounds the domain
+from the witness's kind. `box` is the identity at runtime, so a sum over one candidate compiles to
+the operators its collection does. A `for` loop over a sum is refused by name, since its history would name the
 witness outside its binder. See
 [collections.md](collections.md#compiling-a-conditional-collection).
 
