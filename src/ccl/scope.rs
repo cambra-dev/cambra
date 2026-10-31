@@ -335,7 +335,7 @@ where
 
         // The write target is a *use* of the binder that introduced the defer
         // handle / mutable variable, so it resolves like any variable.
-        N::Feed { name, value } | N::Define { name, value } => {
+        N::Feed { name, value, .. } | N::Define { name, value } => {
             f(ScopedItem::VarRef(name));
             open(f, value);
         }

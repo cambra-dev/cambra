@@ -698,7 +698,7 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
             (Precedence::Lowest, format!("{expr_str}; {body_str}"))
         }
 
-        TypedExprNode::Feed { name, value } => {
+        TypedExprNode::Feed { name, value, .. } => {
             let val_str = fmt(value, Precedence::Lowest, opts);
             (Precedence::Atom, format!("feed({name}, {val_str})"))
         }

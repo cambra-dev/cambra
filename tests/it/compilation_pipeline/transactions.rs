@@ -32,8 +32,6 @@ use cambra::interpreter::{
 use rstest_log::rstest;
 use smol_str::SmolStr;
 
-use cambra::ccl::TagMap;
-
 use super::helpers::*;
 use cambra::interpreter::pull_laps;
 use indoc::{formatdoc, indoc};
@@ -822,7 +820,7 @@ fn reply_union_over_two_sites_is_keyed_by_commit_time() {
             out
         "#},
     );
-    assert_eq!(ast.ty.to_string(), "(Txn | Txn ⤇ Int)");
+    assert_eq!(ast.ty.to_string(), "({`out<<{Txn} | `out<<#1{Txn}} ⤇ Int)");
 }
 
 // ---------------------------------------------------------------------------
@@ -961,19 +959,17 @@ fn both_arms_feed_in_committing_block() {
             out
         "#},
         // Both taps fan out into a tagged-union channel (each fires on its own
-        // route): variant 0 is the `if` arm (x=2,3 → 2,3), variant 1 the `else`
-        // (x=1 → 0). Same union shape as the read-only both-arms reply, over the
+        // route): arm `out<<` is the `if` arm (x=2,3 → 2,3), arm `out<<#1` the
+        // `else` (x=1 → 0). Same union shape as the read-only both-arms reply, over the
         // committing-block feed indexing (cf. `reply_feed_under_one_route`).
         Tile::data_function(
-            ColumnValue::positional_union(
+            channel_union(
+                &["out<<", "out<<#1"],
                 &[0, 0, 1],
                 vec![ColumnValue::UInts(vec![2, 3]), ColumnValue::UInts(vec![1])],
             ),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 0]))),
-            Predicate::over_every_tag(TagMap::from_positional(vec![
-                Predicate::True,
-                Predicate::True,
-            ])),
+            channel_predicate(&["out<<", "out<<#1"]),
             BitSet::new(),
         ),
     );
@@ -1053,15 +1049,13 @@ fn conditional_if_else_reply_in_readonly_block() {
             resp
         "#},
         Tile::data_function(
-            ColumnValue::positional_union(
+            channel_union(
+                &["resp<<", "resp<<#1"],
                 &[0, 0, 1],
                 vec![ColumnValue::UInts(vec![1, 2]), ColumnValue::UInts(vec![0])],
             ),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3, 0]))),
-            Predicate::over_every_tag(TagMap::from_positional(vec![
-                Predicate::True,
-                Predicate::True,
-            ])),
+            channel_predicate(&["resp<<", "resp<<#1"]),
             BitSet::new(),
         ),
     );

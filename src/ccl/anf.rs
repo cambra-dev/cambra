@@ -310,7 +310,7 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
     }
 }
 
-/// Rebuild `node` with `e`'s id, type and annotation. Lowering pre-stamps some nodes'
+/// Rebuild `node` with `e`'s id, type, annotation and site. Lowering pre-stamps some nodes'
 /// `ty`/`user_annotation` before inference runs (e.g. a `for`-loop's `Compose` carries a
 /// `Type::data_fun(Hole, Hole)` kind stamp inference reads at `infer::emit`), and
 /// `Expr::preserve` alone sets both to `Hole`/`None`.
@@ -318,10 +318,12 @@ fn rebuilt_as(
     id: provenance::NodeId,
     ty: Type,
     annotation: Option<Type>,
+    site: Option<std::rc::Rc<crate::ccl::site::Site>>,
     node: TypedExprNode,
 ) -> Expr {
     let mut out = Expr::preserve(id, node).with_ty(ty);
     out.user_annotation = annotation;
+    out.site = site;
     out
 }
 
@@ -341,6 +343,7 @@ fn normalize_let(e: Expr, muts: &Muts) -> Expr {
             },
         ty,
         user_annotation,
+        site,
         ..
     } = e
     else {
@@ -359,6 +362,7 @@ fn normalize_let(e: Expr, muts: &Muts) -> Expr {
             id,
             ty,
             user_annotation,
+            site,
             TypedExprNode::Let {
                 binding,
                 bound_expr: Box::new(bound_expr),
@@ -375,6 +379,7 @@ fn normalize_expr_stmt(e: Expr, muts: &Muts) -> Expr {
         node: TypedExprNode::ExprStmt { expr, body },
         ty,
         user_annotation,
+        site,
         ..
     } = e
     else {
@@ -388,6 +393,7 @@ fn normalize_expr_stmt(e: Expr, muts: &Muts) -> Expr {
             id,
             ty,
             user_annotation,
+            site,
             TypedExprNode::ExprStmt {
                 expr: Box::new(expr),
                 body: Box::new(body),
@@ -401,8 +407,10 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
     let id = e.node_id();
     let ty = e.ty.clone();
     let annotation = e.user_annotation.clone();
-    let rebuild =
-        move |node: TypedExprNode| -> Expr { rebuilt_as(id, ty.clone(), annotation.clone(), node) };
+    let site = e.site.clone();
+    let rebuild = move |node: TypedExprNode| -> Expr {
+        rebuilt_as(id, ty.clone(), annotation.clone(), site.clone(), node)
+    };
     match e.node {
         // A comprehension is still in surface form here —
         // `crate::ccl::comprehension` turns it into the `cast`/`λ`/`▷`
@@ -631,13 +639,14 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             )
         }
 
-        TypedExprNode::Feed { name, value } => {
+        TypedExprNode::Feed { name, value, site } => {
             let (binds, value) = atomize_handle(*value, muts);
             let_chain(
                 binds,
                 rebuild(TypedExprNode::Feed {
                     name,
                     value: Box::new(value),
+                    site,
                 }),
             )
         }
@@ -983,9 +992,11 @@ fn atomize_stmt_effect(expr: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, E
     let id = expr.node_id();
     let ty = expr.ty.clone();
     let annotation = expr.user_annotation.clone();
+    let site = expr.site.clone();
     let rebuild = move |node: TypedExprNode| -> Expr {
         let mut out = Expr::preserve(id, node).with_ty(ty.clone());
         out.user_annotation = annotation.clone();
+        out.site = site.clone();
         out
     };
     match expr.node {
@@ -1048,13 +1059,14 @@ fn atomize_stmt_effect(expr: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, E
                 }),
             )
         }
-        TypedExprNode::Feed { name, value } => {
+        TypedExprNode::Feed { name, value, site } => {
             let (binds, value) = atomize_handle(*value, muts);
             (
                 binds,
                 rebuild(TypedExprNode::Feed {
                     name,
                     value: Box::new(value),
+                    site,
                 }),
             )
         }
@@ -1135,6 +1147,7 @@ fn normalize_apply_spine(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Ex
     let id = e.node_id();
     let ty = e.ty.clone();
     let annotation = e.user_annotation.clone();
+    let site = e.site.clone();
     let TypedExprNode::Apply { function, argument } = e.node else {
         unreachable!("guarded above")
     };
@@ -1154,6 +1167,7 @@ fn normalize_apply_spine(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Ex
     )
     .with_ty(ty);
     rebuilt.user_annotation = annotation;
+    rebuilt.site = site;
     (binds, rebuilt)
 }
 
