@@ -56,9 +56,7 @@ use crate::ccl::opaque_output;
 use crate::ccl::{
     BaseType, BindingTransparency, Branch, Builtin, Expr, F_WRITES, HistoryKind, Lit, Name, Type,
     TypedBinding, TypedExprNode,
-    ccl_utils::{
-        refresh_let_binder, strip_refinements, synthesize_arm_predicate, typed_compose, unit_expr,
-    },
+    ccl_utils::{refresh_let_binder, synthesize_arm_predicate, typed_compose, unit_expr},
     letrec::check_letrec_causal,
     provenance::{self, NodeId, RecordingGuard, RewriteLabel},
     subst::Subst,
@@ -154,7 +152,8 @@ pub fn run(expr: Expr) -> Expr {
         push_bindings_into_writing_cases(peel_effectful_outputs(expr)),
         Spine::OutsideLoops,
     );
-    let mut out = rewrite(expr);
+    let mut declared = Declared::of(&expr);
+    let mut out = rewrite(expr, &mut declared);
     // The rewrite turns every mutable read/write into an ordinary recurrence
     // read/commit at the mutable variable's *value* type, but the transient history
     // `Type::History { history_kind: Overwrite }` wrappers that rode the accumulator's
@@ -872,7 +871,7 @@ fn flatten_spine(mut e: Expr, spine: Spine) -> Expr {
     e
 }
 
-fn rewrite(mut expr: Expr) -> Expr {
+fn rewrite(mut expr: Expr, declared: &mut Declared) -> Expr {
     let stmt_id = expr.node_id();
     // A writing `if` or `match` no writer walks, bound by a `let` or in statement
     // position, merges where it stands ([`merge_writing_case`]).
@@ -893,7 +892,7 @@ fn rewrite(mut expr: Expr) -> Expr {
             "letrec.merge_writing_case",
             provenance::Nature::Machinery,
         );
-        return merge_writing_case(Some(binding), *bound_expr, *body);
+        return merge_writing_case(Some(binding), *bound_expr, *body, declared);
     }
     if let TypedExprNode::ExprStmt { expr: effect, .. } = &expr.node
         && is_writing_case(effect)
@@ -907,7 +906,7 @@ fn rewrite(mut expr: Expr) -> Expr {
             "letrec.merge_writing_case",
             provenance::Nature::Machinery,
         );
-        return merge_writing_case(None, *effect, *body);
+        return merge_writing_case(None, *effect, *body, declared);
     }
     if let TypedExprNode::ExprStmt { expr: effect, body } = expr.node {
         let site = StmtSite::new(stmt_id, effect.node_id());
@@ -934,7 +933,7 @@ fn rewrite(mut expr: Expr) -> Expr {
             // `body_has_feed` here to guess what `transform_loop` would decide
             // ~140 lines away.
             let _g = site.enter(LOOP_LABEL, provenance::Nature::Expansion);
-            return transform_loop(site, target, *iter, *loop_body, *body);
+            return transform_loop(site, target, *iter, *loop_body, *body, declared);
         }
         // A `MutWrite` outside any `For` is a *sequential* mutation — a
         // top-level `cnt += 1`, or an inlined pass-by-reference writer
@@ -951,12 +950,12 @@ fn rewrite(mut expr: Expr) -> Expr {
             // dead: both are absent from the output tree, so the boundary
             // difference reports them.
             let _g = site.enter(BARE_WRITE_LABEL, provenance::Nature::Machinery);
-            return normalize_bare_write(name, *value, *body);
+            return normalize_bare_write(name, *value, *body, declared);
         }
         // Not a loop/write statement: rebuild and recurse.
         expr.node = TypedExprNode::ExprStmt {
-            expr: Box::new(rewrite(*effect)),
-            body: Box::new(rewrite(*body)),
+            expr: Box::new(rewrite(*effect, declared)),
+            body: Box::new(rewrite(*body, declared)),
         };
         return expr;
     }
@@ -978,8 +977,8 @@ fn rewrite(mut expr: Expr) -> Expr {
     {
         expr.node = TypedExprNode::Let {
             binding,
-            bound_expr: Box::new(rewrite(*init)),
-            body: Box::new(rewrite(*body)),
+            bound_expr: Box::new(rewrite(*init, declared)),
+            body: Box::new(rewrite(*body, declared)),
         };
         return expr;
     }
@@ -992,7 +991,7 @@ fn rewrite(mut expr: Expr) -> Expr {
         !matches!(expr.node, TypedExprNode::MutWrite { .. }),
         "letrec phase: bare MutWrite in value position — flat-spine invariant violated"
     );
-    expr.map_children(rewrite);
+    expr.map_children(|c| rewrite(c, declared));
     expr
 }
 
@@ -1024,10 +1023,14 @@ fn merges_in_place(case: &Expr) -> bool {
 /// The writer walk merges a writing `Case` the same way inside a writer body
 /// ([`WriterWalk`]); outside one, a write is a shadowing `let` ([`normalize_bare_write`]),
 /// and the branch is rewritten into those before its end is read.
-fn merge_writing_case(bound: Option<TypedBinding>, case: Expr, rest: Expr) -> Expr {
-    let value_tys = mut_var_value_tys([&case, &rest]);
+fn merge_writing_case(
+    bound: Option<TypedBinding>,
+    case: Expr,
+    rest: Expr,
+    declared: &mut Declared,
+) -> Expr {
     let mut written = Vec::new();
-    collect_writes(&case, &value_tys, &mut written);
+    collect_writes(&case, declared, &mut written);
     let mut slot_tys: Vec<Type> = bound.iter().map(|b| b.ty.clone()).collect();
     slot_tys.extend(written.iter().map(|a| a.ty.clone()));
     let tuple_ty = Type::Tuple(slot_tys);
@@ -1039,7 +1042,7 @@ fn merge_writing_case(bound: Option<TypedBinding>, case: Expr, rest: Expr) -> Ex
         slots.extend(written.iter().map(|a| tvar(&a.name, a.ty.clone())));
         Expr::tuple(slots).with_ty(tuple_ty.clone())
     };
-    let merged = rewrite(end_with(case, &end, &tuple_ty));
+    let merged = rewrite(end_with(case, &end, &tuple_ty), declared);
     let merge = binding(Name::fresh("__merge"), tuple_ty.clone());
     let mut rest = rest;
     let mut reads: Vec<(TypedBinding, Expr)> = Vec::new();
@@ -1051,10 +1054,11 @@ fn merge_writing_case(bound: Option<TypedBinding>, case: Expr, rest: Expr) -> Ex
     for (j, a) in written.iter().enumerate() {
         let fresh = Name::fresh_like(&a.name);
         rename_uses(&mut rest, &a.name, &fresh);
+        declared.advance(&a.name, &fresh);
         let read = proj_of(&merge.name, &tuple_ty, offset + j, &a.ty);
         reads.push((binding(fresh, a.ty.clone()), read));
     }
-    let mut out = rewrite(rest);
+    let mut out = rewrite(rest, declared);
     for (b, read) in reads.into_iter().rev() {
         out = Expr::let_in(b, read, out);
     }
@@ -1114,14 +1118,16 @@ fn end_with(body: Expr, end: &dyn Fn(Expr) -> Expr, ty: &Type) -> Expr {
 /// every read of `name` in `cont` (and any later `MutWrite` target) advanced to
 /// the fresh binder `name'`. `value` reads the *previous* value, so it is
 /// left un-renamed. `name` is globally unique post-uniquify, so the fresh
-/// shadow cannot capture an unrelated binding.
-fn normalize_bare_write(name: Name, value: Expr, cont: Expr) -> Expr {
-    let value = rewrite(value);
-    let vty = value.ty.clone();
+/// shadow cannot capture an unrelated binding. The shadow is bound at the variable's
+/// declared value type, which the value written is one contribution to.
+fn normalize_bare_write(name: Name, value: Expr, cont: Expr, declared: &mut Declared) -> Expr {
+    let value = rewrite(value, declared);
+    let vty = declared.value_ty(&name).clone();
     let fresh = Name::fresh_like(&name);
     let mut cont = cont;
     rename_uses(&mut cont, &name, &fresh);
-    let cont = rewrite(cont);
+    declared.advance(&name, &fresh);
+    let cont = rewrite(cont, declared);
     Expr::let_in(binding(fresh, vty), value, cont)
 }
 
@@ -2094,15 +2100,12 @@ fn transform_loop(
     iter: Expr,
     loop_body: Expr,
     cont: Expr,
+    declared: &mut Declared,
 ) -> Expr {
-    // Every reference to an accumulator is either in the loop (a read-your-writes
-    // read) or downstream of it (the trailing final read), so these two trees
-    // carry every `Mut(V, D)` this loop's mutable variables have.
-    let value_tys = mut_var_value_tys([&loop_body, &cont]);
     // Accumulating variables in first-write order, with their value types and
     // every write to each.
     let mut accs: Vec<AccumulatorVariable> = Vec::new();
-    collect_writes(&loop_body, &value_tys, &mut accs);
+    collect_writes(&loop_body, declared, &mut accs);
     if accs.is_empty() {
         // A loop with no accumulator. If its body feeds — a stateless generator,
         // or a `with begin():` read-only transaction (`for r in iter: with
@@ -2137,15 +2140,15 @@ fn transform_loop(
                 let mut lambda = Expr::lambda(target.name.clone(), target.ty.clone(), body);
                 lambda.ty = Type::fun(target.ty.clone(), loop_body.ty.clone());
                 let map = typed_compose(vec![iter, lambda]);
-                let cont = rewrite(cont);
+                let cont = rewrite(cont, declared);
                 let cont_ty = cont.ty.clone();
                 let mut stmt = Expr::expr_stmt(map, cont);
                 stmt.ty = cont_ty;
                 return stmt;
             }
-            return transform_feed_only_loop(loop_site, target, iter, loop_body, cont);
+            return transform_feed_only_loop(loop_site, target, iter, loop_body, cont, declared);
         }
-        return rewrite(cont);
+        return rewrite(cont, declared);
     }
 
     // A conditional induction write (`if p: total += x`) lowers to a
@@ -2159,16 +2162,17 @@ fn transform_loop(
     // Fold the accumulators into a decision-factored history binding, then wrap it
     // in a nested `LetRec`: re-point the continuation's trailing reads at the
     // extracted finals, recurse into it, prepend the reads, and hoist the feeds.
-    let fold = fold_induction_loop(&target, &iter, loop_body, &value_tys);
+    let fold = fold_induction_loop(&target, &iter, loop_body, declared);
     let mut cont = cont;
     for (acc, x_final) in &fold.renames {
         rename_uses(&mut cont, acc, x_final);
+        declared.advance(acc, x_final);
     }
     close_recurrence_group(
         vec![fold.binding],
         fold.reads,
         fold.feed_views,
-        rewrite(cont),
+        rewrite(cont, declared),
     )
 }
 
@@ -2281,17 +2285,15 @@ impl InductionFold {
 /// See [`InductionFold`]. Caller must guard on a non-empty accumulator set
 /// (an accumulator-free loop is a feed-only/no-op loop, handled separately).
 ///
-/// `value_tys` supplies each accumulator's value type ([`mut_var_value_tys`]);
-/// the caller builds it over the widest tree it holds, so that a mutable variable read
-/// only *downstream* of the loop still contributes its `Mut(V, D)`.
+/// `declared` supplies each accumulator's value type.
 pub(crate) fn fold_induction_loop(
     target: &TypedBinding,
     iter: &Expr,
     loop_body: Expr,
-    value_tys: &HashMap<Name, Type>,
+    declared: &Declared,
 ) -> InductionFold {
     let mut accs: Vec<AccumulatorVariable> = Vec::new();
-    collect_writes(&loop_body, value_tys, &mut accs);
+    collect_writes(&loop_body, declared, &mut accs);
     assert!(
         !accs.is_empty(),
         "fold_induction_loop: caller must guard on a non-empty accumulator set"
@@ -2337,7 +2339,7 @@ pub(crate) fn fold_induction_loop(
         .iter()
         .map(|a| (a.name.clone(), a.ty.clone()))
         .collect();
-    let mut walk = WriterWalk::new(env, &mut feed_counter, None, writes);
+    let mut walk = WriterWalk::new(env, &mut feed_counter, None, writes, declared);
     let mut kept = Vec::new();
     walk.walk(loop_body, &mut kept);
     // The opaque writer body: `λ __p → ⟨chain⟩ ending in the decision`.
@@ -2537,6 +2539,7 @@ fn transform_feed_only_loop(
     iter: Expr,
     loop_body: Expr,
     cont: Expr,
+    declared: &mut Declared,
 ) -> Expr {
     let (domain_ty, _item_ty) = fun_parts(&iter.ty);
     let mut prefix: Vec<Kept> = Vec::new();
@@ -2547,7 +2550,7 @@ fn transform_feed_only_loop(
         "letrec phase: accumulator-free loop with no feed — lowering rejects an empty \
          `with begin():` block, so a `For` here always carries a feed"
     );
-    let mut body_out = rewrite(cont);
+    let mut body_out = rewrite(cont, declared);
     // Emit in reverse so the first source feed ends up outermost — channelize
     // collects feeds outermost-first into the channel union, preserving source
     // order (mirrors the accumulator path's hoist ordering).
@@ -2630,64 +2633,50 @@ fn collect_feed_only(expr: Expr, prefix: &mut Vec<Kept>, feeds: &mut Vec<FedAt>)
     }
 }
 
-/// The value type `V` of every mutable variable referenced anywhere in `roots`.
+/// Each mutable variable's value type, read off the binder that declares it.
 ///
-/// A mutable variable's `V` is the **join** over its seed and all of its writes, and
-/// inference has already computed it: it is the `V` of the `Mut(V, D)` that each
-/// *reference* to the mutable variable carries. (The mutability rides reference types
-/// rather than the binding slot — see [`emit_let`](crate::ccl::infer)'s `Mut`
-/// arm — so the seed binding records only the seed's own type.) Reading it here
-/// is what keeps this phase's view of a mutable variable identical to the one the
-/// `Transact` rule derives, instead of each rebuilding a value type from
-/// whichever single contribution it happens to hold.
-///
-/// Binders are α-unique by this point (`uniquify` runs before inference), so one
-/// map over the whole tree cannot conflate two mutable variables.
-pub(crate) fn mut_var_value_tys<'a>(
-    roots: impl IntoIterator<Item = &'a Expr>,
-) -> HashMap<Name, Type> {
-    fn walk(e: &Expr, out: &mut HashMap<Name, Type>) {
-        // A mutable variable is never wrapped in anything but `Refinement` before this
-        // phase, and only an *overwrite* history is one — a `Feed` channel reads as its
-        // whole collection rather than as a value, which is why `mut_value_type` and not
-        // `is_handle` is the test.
-        if let TypedExprNode::Var(name) = &e.node
-            && let Some(value) = e.ty.mut_value_type()
-        {
-            out.insert(name.clone(), value.clone());
-        }
-        e.walk_children(|c| walk(c, out));
+/// Inference types that binder at the join of the seed and every write (`emit_mut_decl`), so
+/// it is the one place the whole type is stated: a write names its variable without its type,
+/// and a variable nothing reads has no reference to carry it. Names are unique by this phase,
+/// so one map built over the whole tree serves every loop in it. A phase that advances a
+/// variable to a fresh name, after a loop or a write outside one, records the new name as the
+/// same variable ([`Declared::advance`]).
+pub(crate) struct Declared(HashMap<Name, Type>);
+
+impl Declared {
+    pub(crate) fn of(expr: &Expr) -> Self {
+        let mut tys = HashMap::new();
+        collect_mut_value_types(expr, &mut tys);
+        Declared(tys)
     }
-    let mut out = HashMap::new();
-    for r in roots {
-        walk(r, &mut out);
+
+    /// Record `to` as the variable `from` advanced to, which later writes name.
+    pub(crate) fn advance(&mut self, from: &Name, to: &Name) {
+        let ty = self.value_ty(from).clone();
+        self.0.insert(to.clone(), ty);
     }
-    out
+
+    /// The value type of the mutable variable `name`.
+    fn value_ty(&self, name: &Name) -> &Type {
+        self.0.get(name).unwrap_or_else(|| {
+            panic!(
+                "letrec phase: mutable variable `{name}` has no declaring binder in the tree, \
+                 neither a `MutDecl` nor a by-reference parameter"
+            )
+        })
+    }
 }
 
 /// Collect the loop's accumulating variables in first-write order, each with its
-/// value type taken from `value_tys` — the join inference recorded on the mutable
-/// variable's `Mut(V, D)` — and the statements of every write to it.
+/// declared value type — the join inference records over the seed and every write —
+/// and the statements of every write to it.
 ///
 /// One variable is one recurrence slot however many times the body writes it, so a
 /// repeat write extends that variable's entry rather than adding one; the entry
 /// order is the order of first writes, which is the slot order
-/// ([`AccumulatorVariable`]). The value type comes from the first write, whose
-/// `value.ty` is the fallback below.
-///
-/// A mutable variable with no entry is one no reference types as a `Mut`: either nothing
-/// reads it (only writes mention it, so its value type is unobservable), or the
-/// tree records reads at the deref'd value directly, as the phase's own
-/// hand-built test trees do. The written type then stands in, **stripped** — a
-/// mutable variable takes no refinement from any single contribution, and an unstripped
-/// one would be a refinement acquired by erasure rather than by `cast`
-/// (`src/ccl/design/type-inference.md`, "Refinements on the lattice").
-fn collect_writes(
-    expr: &Expr,
-    value_tys: &HashMap<Name, Type>,
-    out: &mut Vec<AccumulatorVariable>,
-) {
-    collect_writes_in(expr, None, value_tys, &mut Vec::new(), out);
+/// ([`AccumulatorVariable`]).
+fn collect_writes(expr: &Expr, declared: &Declared, out: &mut Vec<AccumulatorVariable>) {
+    collect_writes_in(expr, None, declared, &mut Vec::new(), out);
 }
 
 /// `stmt` is the `ExprStmt` whose effect `expr` is, when the walk arrived through
@@ -2702,7 +2691,7 @@ fn collect_writes(
 fn collect_writes_in(
     expr: &Expr,
     stmt: Option<NodeId>,
-    value_tys: &HashMap<Name, Type>,
+    declared: &Declared,
     introduced: &mut Vec<Name>,
     out: &mut Vec<AccumulatorVariable>,
 ) {
@@ -2712,38 +2701,32 @@ fn collect_writes_in(
         body,
     } = &expr.node
     {
-        collect_writes_in(init, None, value_tys, introduced, out);
+        collect_writes_in(init, None, declared, introduced, out);
         introduced.push(binding.name.clone());
-        collect_writes_in(body, None, value_tys, introduced, out);
+        collect_writes_in(body, None, declared, introduced, out);
         introduced.pop();
         return;
     }
-    if let TypedExprNode::MutWrite { name, value, .. } = &expr.node
+    if let TypedExprNode::MutWrite { name, .. } = &expr.node
         && !introduced.contains(name)
     {
         let write = expr.node_id();
         let site = StmtSite::new(stmt.unwrap_or(write), write);
         match out.iter_mut().find(|a| a.name == *name) {
             Some(acc) => acc.writes.push(site),
-            None => {
-                let ty = value_tys
-                    .get(name)
-                    .cloned()
-                    .unwrap_or_else(|| strip_refinements(&value.ty));
-                out.push(AccumulatorVariable {
-                    name: name.clone(),
-                    ty,
-                    writes: vec![site],
-                });
-            }
+            None => out.push(AccumulatorVariable {
+                name: name.clone(),
+                ty: declared.value_ty(name).clone(),
+                writes: vec![site],
+            }),
         }
     }
     if let TypedExprNode::ExprStmt { expr: effect, body } = &expr.node {
-        collect_writes_in(effect, Some(expr.node_id()), value_tys, introduced, out);
-        collect_writes_in(body, None, value_tys, introduced, out);
+        collect_writes_in(effect, Some(expr.node_id()), declared, introduced, out);
+        collect_writes_in(body, None, declared, introduced, out);
         return;
     }
-    expr.walk_children(|c| collect_writes_in(c, None, value_tys, introduced, out));
+    expr.walk_children(|c| collect_writes_in(c, None, declared, introduced, out));
 }
 
 /// Whether `expr` contains a `Feed` marker (backs the no-op-loop invariant
@@ -3084,12 +3067,13 @@ pub(crate) struct WriterWalk<'a> {
     feed_counter: &'a mut usize,
     /// The variables a write may target, where the caller fixes them.
     allowed_writes: Option<&'a HashSet<Name>>,
-    /// The variables the writer writes, in the write set's order, with their value types,
-    /// which an inner loop's fold reads too.
+    /// The variables the writer writes, in the write set's order, with their value types.
     writes: Vec<(Name, Type)>,
     /// The feeds the block declares ([`walk_channel`](Self::walk_channel)). A feed into one
     /// stays in its binding, so it does not commit.
     channels: HashSet<Name>,
+    /// Each mutable variable's value type, which an inner loop's fold reads.
+    declared: &'a Declared,
 }
 
 impl<'a> WriterWalk<'a> {
@@ -3098,6 +3082,7 @@ impl<'a> WriterWalk<'a> {
         feed_counter: &'a mut usize,
         allowed_writes: Option<&'a HashSet<Name>>,
         writes: Vec<(Name, Type)>,
+        declared: &'a Declared,
     ) -> Self {
         WriterWalk {
             env,
@@ -3107,6 +3092,7 @@ impl<'a> WriterWalk<'a> {
             allowed_writes,
             writes,
             channels: HashSet::new(),
+            declared,
         }
     }
 
@@ -3297,19 +3283,15 @@ impl<'a> WriterWalk<'a> {
                         iter,
                         body: inner_body,
                     } => {
-                        let mut value_tys = mut_var_value_tys([&*inner_body]);
-                        for (name, ty) in &self.writes {
-                            value_tys.insert(name.clone(), ty.clone());
-                        }
                         // An inner loop whose calls inlined to no write, and which feeds
                         // nothing, is a no-op, as a flat one is: lowering let it through
                         // only because a call might have hidden a pass-by-reference write.
                         let mut inner_accs = Vec::new();
-                        collect_writes(&inner_body, &value_tys, &mut inner_accs);
+                        collect_writes(&inner_body, self.declared, &mut inner_accs);
                         if inner_accs.is_empty() && !body_has_feed(&inner_body) {
                             return self.walk_chain(*body, kept);
                         }
-                        let fold = fold_induction_loop(&target, &iter, *inner_body, &value_tys);
+                        let fold = fold_induction_loop(&target, &iter, *inner_body, self.declared);
                         // Both halves of a binding: a binder's declared type is written in
                         // the enclosing scope, so an inner loop correlated with this one's
                         // binder carries it there too, in the refinement on its own
@@ -4322,15 +4304,12 @@ mod tests {
         use crate::ccl::provenance::{PhaseScope, TableSession};
 
         let (tree, ..) = direct_mirror_sum();
+        let declared = Declared::of(&tree);
         let TypedExprNode::MutDecl { body: stmt, .. } = tree.node else {
             unreachable!("`direct_mirror_sum` is a `MutDecl`")
         };
         let loop_stmt_id = stmt.node_id();
-        let TypedExprNode::ExprStmt {
-            expr: effect,
-            body: cont,
-        } = stmt.node
-        else {
+        let TypedExprNode::ExprStmt { expr: effect, .. } = stmt.node else {
             unreachable!("the introduction's body is the loop statement")
         };
         let TypedExprNode::For { target, iter, body } = effect.node else {
@@ -4343,7 +4322,6 @@ mod tests {
             unreachable!("the loop body is one write statement")
         };
         let write_id = write.node_id();
-        let value_tys = mut_var_value_tys([&*body, &*cont]);
 
         let session = TableSession::install();
         let view_ids = {
@@ -4356,7 +4334,7 @@ mod tests {
                 "transact.cross_domain_fold",
                 provenance::Nature::Expansion,
             );
-            let fold = fold_induction_loop(&target, &iter, *body, &value_tys);
+            let fold = fold_induction_loop(&target, &iter, *body, &declared);
             let view = fold.acc_view(0);
             let mut ids = Vec::new();
             fn collect(e: &Expr, out: &mut Vec<NodeId>) {
@@ -4400,15 +4378,12 @@ mod tests {
         use crate::ccl::provenance::{PhaseScope, TableSession};
 
         let (tree, ..) = mirror_sum_writing(2);
+        let declared = Declared::of(&tree);
         let TypedExprNode::MutDecl { body: stmt, .. } = tree.node else {
             unreachable!("`mirror_sum_writing` is a `MutDecl`")
         };
         let loop_stmt_id = stmt.node_id();
-        let TypedExprNode::ExprStmt {
-            expr: effect,
-            body: cont,
-        } = stmt.node
-        else {
+        let TypedExprNode::ExprStmt { expr: effect, .. } = stmt.node else {
             unreachable!("the introduction's body is the loop statement")
         };
         let TypedExprNode::For { target, iter, body } = effect.node else {
@@ -4431,7 +4406,6 @@ mod tests {
             unreachable!("the loop body's second statement is the repeat write")
         };
         let (second_stmt_id, second_write_id) = (rest.node_id(), second_write.node_id());
-        let value_tys = mut_var_value_tys([&*body, &*cont]);
 
         let session = TableSession::install();
         let view_ids = {
@@ -4441,7 +4415,7 @@ mod tests {
                 "transact.cross_domain_fold",
                 provenance::Nature::Expansion,
             );
-            let fold = fold_induction_loop(&target, &iter, *body, &value_tys);
+            let fold = fold_induction_loop(&target, &iter, *body, &declared);
             assert_eq!(fold.accs.len(), 1, "two writes to one variable is one slot");
             assert_eq!(
                 fold.accs[0].writes.len(),
