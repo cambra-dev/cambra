@@ -276,7 +276,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             let Some(registered) = ctx.sources.get(name).cloned() else {
                 return Err(ctx.raise(InferError::UnboundVariable(name.to_string())));
             };
-            ctx.record_effect(Item::Requires(Requirement::ext()), None);
+            ctx.record_effect(Item::Requires(Requirement::ext()));
             registered
         }
 
@@ -325,7 +325,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // returns the param type verbatim.
         TypedExprNode::Feed { name, value, .. } => {
             let target_ty = ctx.instantiate_binding(name)?;
-            ctx.record_effect(Item::Causes(Effect::Append(name.clone())), Some(name));
+            ctx.record_effect(Item::Causes(Effect::Append(name.clone())));
             emit_feed(name, &target_ty, value, &label, ctx).map_err(|e| {
                 e.with_escape_target(EscapeTarget::Feed {
                     channel: name.to_string(),
@@ -335,7 +335,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
 
         TypedExprNode::Define { name, value } => {
             let target_ty = ctx.instantiate_binding(name)?;
-            ctx.record_effect(Item::Causes(Effect::Append(name.clone())), Some(name));
+            ctx.record_effect(Item::Causes(Effect::Append(name.clone())));
             emit_define(name, &target_ty, value, &label, ctx)?
         }
 
@@ -373,7 +373,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // write and surface as `UnresolvedInfer`).
         TypedExprNode::MutWrite { name, key, value } => {
             let var_ty = ctx.instantiate_binding(name)?;
-            ctx.record_effect(Item::Causes(Effect::Write(name.clone())), Some(name));
+            ctx.record_effect(Item::Causes(Effect::Write(name.clone())));
             ctx.record_transactional_access(name);
             // The written value flows into the mutable variable's *value* type, not
             // the `Mut` handle itself — which is what a write means: it updates `V`.
@@ -550,8 +550,10 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
             fun_kind,
             domain: d,
             codomain: c,
+            effects,
             ..
         } => {
+            ctx.check_written(effects)?;
             for w in fun_kind.witnesses_mut() {
                 for t in w.types_mut() {
                     emit_annotation_predicates(t, ctx)?;
@@ -1138,7 +1140,7 @@ pub(super) fn emit_apply<C: Typing>(
             // The callee may write the argument, so the call does, whether or not the callee
             // does (`docs/chl-spec.md`, "Discharging requirements and effects").
             if let TypedExprNode::Var(a) = &argument.node {
-                ctx.record_effect(Item::Causes(Effect::Write(a.clone())), Some(a));
+                ctx.record_effect(Item::Causes(Effect::Write(a.clone())));
             }
             raw_arg_ty
         }
@@ -1167,7 +1169,7 @@ pub(super) fn emit_apply<C: Typing>(
         // for a `Mut` parameter.
         (Some(param), None) if param.as_feed().is_some() && raw_arg_ty.as_feed().is_some() => {
             if let TypedExprNode::Var(a) = &argument.node {
-                ctx.record_effect(Item::Causes(Effect::Append(a.clone())), Some(a));
+                ctx.record_effect(Item::Causes(Effect::Append(a.clone())));
             }
             raw_arg_ty
         }
@@ -2094,6 +2096,7 @@ fn emit_let_definition<C: Typing>(
             _ => &scheme_ty,
         };
         ctx.note_scheme(&binding.name, noted);
+        ctx.note_definition(&scheme_ty, binding.user_annotation.as_ref(), bound_expr);
     }
     Ok((scheme, defined))
 }
@@ -2726,7 +2729,7 @@ pub(super) fn emit_begin<C: Typing>(
     body: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
-    ctx.record_effect(Item::Causes(Effect::Commit), None);
+    ctx.record_effect(Item::Causes(Effect::Commit));
     ctx.transaction_body(|ctx| ctx.in_transaction(|ctx| ctx.subexpr(body)))?;
     Ok(Type::Base(BaseType::Unit))
 }

@@ -119,13 +119,13 @@ fn a_parameterised_constructor_without_parameters_is_polymorphic() {
         indoc! {r#"
             type Maybe(T):
                 just(T)
-                nothing
+                empty
 
-            a: Maybe(Int) = Maybe::nothing
-            b: Maybe(String) = Maybe::nothing
+            a: Maybe(Int) = Maybe::empty
+            b: Maybe(String) = Maybe::empty
             a
         "#},
-        ctor("nothing", Value::Unit),
+        ctor("empty", Value::Unit),
     );
 }
 
@@ -872,16 +872,16 @@ fn a_parameterised_arm_binds_at_the_argument() {
         indoc! {r#"
             type Maybe(T):
                 just(T)
-                nothing
+                empty
 
             def or_zero(m: Maybe(Int)) => Int:
                 match m:
                     case Maybe::just(v):
                         v
-                    case Maybe::nothing:
+                    case Maybe::empty:
                         0
 
-            or_zero(Maybe::just(7)) + or_zero(Maybe::nothing)
+            or_zero(Maybe::just(7)) + or_zero(Maybe::empty)
         "#},
         Value::Int(7),
     );
@@ -1387,21 +1387,21 @@ fn an_impl_block_binds_the_types_parameters() {
         indoc! {r#"
             type Maybe(T):
                 just(T)
-                nothing
+                empty
 
             impl Maybe(T):
                 def or_else(self, d: T) => T:
                     match self:
                         case Maybe::just(v):
                             v
-                        case Maybe::nothing:
+                        case Maybe::empty:
                             d
 
                 def unwrap_or(self, d: T) => T:
                     self.or_else(d)
 
             m: Maybe(Int) = Maybe::just(7)
-            n: Maybe(Int) = Maybe::nothing
+            n: Maybe(Int) = Maybe::empty
             m.or_else(0) + n.unwrap_or(5)
         "#},
         Value::Int(12),

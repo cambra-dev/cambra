@@ -273,7 +273,7 @@ pub enum Stmt {
         body: Vec<Spanned<Stmt>>,
     },
 
-    /// `def name(type_params, params) => output requires …: body`.
+    /// `def name(type_params, params) => output requires … causes …: body`.
     ///
     /// The type parameters are the capitalized leading parameters, kept apart from
     /// `params` because they are not arguments: `params` alone is the arity.
@@ -287,7 +287,8 @@ pub enum Stmt {
         type_params: Vec<TypeParam>,
         params: Vec<Param>,
         output: Option<Spanned<Expr>>,
-        requires: Vec<Spanned<Requirement>>,
+        requires: Box<Clause<Requirement>>,
+        causes: Box<Clause<TraitType>>,
         body: Vec<Spanned<Stmt>>,
     },
 
@@ -684,6 +685,31 @@ pub enum KindAnnotation {
     Bound(Spanned<Expr>),
 }
 
+/// A `requires` or `causes` clause after a `def` signature or a function type's codomain, over
+/// `T`, its item: [`Requirement`] or [`TraitType`]. An effect is written as a trait is, and `_`
+/// is a trait type named `_`, as a type hole is a name.
+///
+/// Spec: `docs/chl-spec.md`, "Writing requirements and effects".
+#[derive(Debug, Clone, PartialEq)]
+pub struct Clause<T> {
+    /// The keyword's span through the last item's, `None` when no clause is written.
+    pub span: Option<Span>,
+    /// The span of `only` or `nothing`, which makes the clause an upper bound.
+    pub only: Option<Span>,
+    /// Empty when no clause is written and under `nothing`.
+    pub items: Vec<Spanned<T>>,
+}
+
+impl<T> Default for Clause<T> {
+    fn default() -> Self {
+        Clause {
+            span: None,
+            only: None,
+            items: Vec::new(),
+        }
+    }
+}
+
 /// One item of a `requires` clause.
 ///
 /// Spec: `docs/chl-spec.md`, "Trait requirements".
@@ -1012,6 +1038,11 @@ pub enum Expr {
         domain: Box<Spanned<Expr>>,
         arrow: Arrow,
         codomain: Box<Spanned<Expr>>,
+        /// The clauses after the codomain, which a written type states exactly
+        /// (`docs/chl-spec.md`, "Writing requirements and effects"). Boxed, as the clauses
+        /// of a `def` are, so that every expression does not carry their size.
+        requires: Box<Clause<Requirement>>,
+        causes: Box<Clause<TraitType>>,
     },
 
     /// Subscript: `target[index]`, or the **checked** form `target[index]?` —

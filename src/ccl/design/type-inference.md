@@ -3894,11 +3894,14 @@ a term parameter, the variable whose history the read stands in (`TraitDecl::ter
 
 ### Effect variables
 
-An `EffectVar` holds **labels** and **edges**. A label is one requirement or effect, with the
-depth of the function body that binds the variable it names: the number of function bodies around
-the binder, 0 at the top level, and none for a label naming no variable or a transactional mutable
-variable. An edge from 𝑢 into 𝑣 says that what 𝑢 holds, through the edge's filter, 𝑣 holds too.
-`EffectVar::resolved` is the fixpoint over the edges reaching a variable.
+An `EffectVar` holds **labels**, **edges** and **upper bounds**. A label is one requirement or
+effect, with the depth of the function body that binds the variable it names: the number of
+function bodies around the binder, 0 at the top level, and none for a label naming no variable or a
+transactional mutable variable. A label also records the node where it entered its variable
+(`Label::at`), which equality and ordering leave out. An edge from 𝑢 into 𝑣 says that what 𝑢
+holds, through the edge's filter, 𝑣 holds too. An edge standing for a node, a call, a statement or
+an argument, stamps that node on each label crossing it (`Filter::at`). `EffectVar::resolved` is the
+fixpoint over the edges reaching a variable.
 
 Emission keeps a stack of frames, one for the module's top level and one for each function body
 under emission (`InferCtx::effect_frames`). A frame's variable is the effects of the function
@@ -3930,8 +3933,43 @@ has a position in its history.
 **A call relates the callee's effects to the caller's.** `InferCtx::apply` puts a fresh call
 variable on the expected function type and an edge from it into the innermost frame. The
 `Fun`/`Fun` arm of `constrain_go` relates effects covariantly: an edge from the left side's
-variable into the right side's, or the left side's known labels recorded on the right side's
-variable. A known set on the right records nothing.
+variable into the right side's, stamped with the value's node, or the left side's known labels
+recorded on the right side's variable. A known set is a type the compiler built or materialized,
+and on the right it bounds nothing.
+
+**Written clauses.** Lowering writes a function type's clauses as `Repr::Written`: the items, which
+clause ends in `_`, and where the clauses are written (`lower/clauses.rs`). A function type with
+no clause is written too, with no item and neither clause open, since a written type's clauses are
+exact. `normalize_annotation` turns written clauses into a fresh variable holding the items, with
+an upper bound of the items over each clause not ending in `_` (`InferCtx::normalize_effects`).
+`uniquify` resolves the variables a clause names in the scope the clause is written in, and
+`Typing::check_written` refuses one that names no variable of the kind its item takes
+(`InferError::ClauseNamesNoVariable`). The Check mode reads no effects, and normalizes a written
+clause to none.
+
+A `def`'s clauses ride a stamp on the lambda whose body is the `def`'s body, the innermost of its
+parameters' chain (`lower/functions.rs`, `stamp_clauses`). `Typing::function_body` records the
+items on the body's variable, and a clause under `only` or `nothing` bounds it. The stamp states
+nothing as an annotation (`Written::of_def`), so the bound is checked once.
+
+**Declared parameters.** A type parameter bounded by `Effect` or `Context`, `E <: Effect`, stands
+for a clause (`LoweringContext::clause_params`), and a clause naming it carries it
+(`EffectSet::params`). Opening the definition's `Poly` gives it an effect variable holding a label
+that names it rigidly (`Item::Param`), as an opened type parameter stands for itself
+(`InferCtx::open_poly`). A written type naming it relates its own variable to the parameter's in
+both directions, and a `def`'s clause naming it has the parameter's variable flow into the body's.
+So `causes only E` is checked once, at the definition, against what any use may pass. Instantiation
+drops the rigid label, and a copied bound no longer bounds the part the parameter stands in
+(`freshen_effect_var`), so a use's copy holds what its arguments bring.
+
+**Upper bounds are checked once emission is complete.** A variable's labels are known only then,
+so `effects::exceeded_uppers` reads each bounded variable's resolution after the barrier variables'
+checks. The first label beyond a bound is reported at the node where it entered: the statement
+recording it, or the call or argument an edge carried it through. The clause or the written type
+is the secondary label (`InferError::EffectBeyondClause`, `InferError::EffectNotStated`).
+Instantiation copies a variable's bounds with its labels, so each use checks what its own arguments
+add. A `def` whose `requires` clause is bounded is also checked against the trait requirements its
+scheme reaches beyond those it writes (`InferCtx::requirements_beyond_clauses`).
 
 **A collection runs where it is built.** A lambda, a `Compose` chain or a `Cast` whose kind is data
 denotes a collection, and its body runs where the collection is built, so its labels flow into the
@@ -3941,16 +3979,35 @@ compute function's labels stay in its type. A chain's and a cast's effects are t
 parts' (`Typing::composed_effects`). The kind is the lowering stamp where the node carries one, as
 `emit_node` applies it.
 
-**Levels.** An effect variable is minted at the emission level. `type_level` leaves effects out,
-since an effect variable decides nothing about whether a definition is polymorphic. A type
-becoming a bound of a variable at a shallower level lowers its effect variables to that level
-(`lower_effect_levels`, at bound recording and at extrusion). Instantiation copies an effect
-variable above the scheme's cutoff with its labels and the edges into it
-(`freshen_effect_var`), so two uses of one polymorphic function collect their effects apart.
+**Levels.** An effect variable is minted at the emission level. `type_level` leaves effects out:
+counting the variable of every function body would generalize every function. An effect variable
+at an input, a parameter's function type, decides that a definition is polymorphic as a type
+variable does (`effects::input_effect_level` in `should_generalize`): a body that calls the
+parameter leaves it open. A type becoming a bound of a variable at a shallower level lowers its
+effect variables to that level (`lower_effect_levels`, at bound recording and at extrusion).
+Instantiation copies an effect variable above the scheme's cutoff with its labels, its upper
+bounds and the edges into it (`freshen_effect_var`), so two uses of one polymorphic function
+collect their effects apart. `freshen_level` counts a function type's effect variable, so a type
+whose only quantified part is its effects is copied rather than shared.
+
+**Effects choose no clone.** Uses that differ only in what they require and cause run one body, so
+`SpecKey` leaves effects out and a specialization pin relates none
+(`ConstrainCache::without_effects`). A pin still adds the clone's function type as a bound of the
+use's variables, whose effects then meet the use's at an input, so the walk's read-stability check
+compares types without their effects. Nothing after specialization reads an effect off a
+materialized type.
 
 **Materialization.** Compaction resolves each function position's effects (`CompactFun::effects`).
 A merge takes the union at a positive position and the intersection at a negative one. Coalesce
 writes the set into a compute function's type as `Known`.
+
+**Printing an effect variable.** A rendering of a polymorphic type (`poly_for_display`) compacts
+with `compact_type_for_display`, which also records the effect variables at each function
+position (`EffectSet::vars`): at an input the position's own variable, at an output every variable
+flowing into it. A variable above the cutoff that stands at both an input and an output relates
+them, and is printed: its requirements as a parameter `R <: Context` and its effects as
+`E <: Effect`, each where no exact clause closes that part (`EffectVar::closed`). A variable at
+inputs alone is dropped, as a type variable at one polarity is.
 
 **Statements.** An expression statement a program writes before its block's last statement gets a
 frame of its own, which keeps every label, the enclosing function's own variables' included, and

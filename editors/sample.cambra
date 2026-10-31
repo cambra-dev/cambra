@@ -9,10 +9,10 @@ run storefront as us
 param region: String = "us"
 const param ceiling: Int = 10
 
-pub def quote(item, qty) => Int requires Transaction:
+pub def quote(item, qty) => Int requires Transaction causes only Commit:
     return this::price(item) * qty
 
-bigger: forall (T <: {at: Int}) {T, T} => T = larger
+bigger: forall (T <: {at: Int}) {T, T} => T causes nothing = larger
 
 reqs, resps = http_serve(8080, 'GET', "/count")
 

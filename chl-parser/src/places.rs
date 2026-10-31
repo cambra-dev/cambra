@@ -17,7 +17,7 @@ use smol_str::SmolStr;
 
 use crate::ast::{
     AssignTarget, CompClause, Expr, KindAnnotation, Param, Requirement, Span, Spanned, Stmt,
-    TraitItem, TypeAnnotation, TypeDeclBody, TypeParam, VariantPayload,
+    TraitItem, TraitType, TypeAnnotation, TypeDeclBody, TypeParam, VariantPayload,
 };
 
 /// What a place is the place of.
@@ -213,11 +213,13 @@ impl Walk {
                 params,
                 output,
                 requires,
+                causes,
                 body,
             } => {
                 let names: Vec<&SmolStr> = owner.iter().chain([name]).map(|n| &n.node).collect();
                 self.within(&names, |w| {
-                    w.signature(type_params, params, output.as_ref(), requires);
+                    w.signature(type_params, params, output.as_ref(), &requires.items);
+                    w.trait_types(&causes.items);
                     w.stmts(body);
                 });
             }
@@ -324,6 +326,12 @@ impl Walk {
             .for_each(|a| self.annotation(a));
     }
 
+    fn trait_types(&mut self, types: &[Spanned<TraitType>]) {
+        types
+            .iter()
+            .for_each(|t| t.node.args.iter().for_each(|a| self.expr(a)));
+    }
+
     fn requirements(&mut self, requires: &[Spanned<Requirement>]) {
         for r in requires {
             match &r.node {
@@ -410,10 +418,16 @@ impl Walk {
                 self.expr(predicate);
             }
             Expr::FunctionType {
-                domain, codomain, ..
+                domain,
+                codomain,
+                requires,
+                causes,
+                ..
             } => {
                 self.expr(domain);
                 self.expr(codomain);
+                self.requirements(&requires.items);
+                self.trait_types(&causes.items);
             }
             Expr::Subscript { target, index, .. } => {
                 self.expr(target);

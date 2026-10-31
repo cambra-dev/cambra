@@ -10,8 +10,8 @@ use rstest_log::rstest;
 
 use super::modules::program;
 
-/// The members the cases below share: a transactional mutable variable, a feed, a function
-/// that commits a transaction, and a higher-order function.
+/// The members the cases below share: a transactional mutable variable, a feed, functions
+/// that commit a transaction, and a higher-order function.
 const PRELUDE: &str = indoc! {"
     stock: Mut(Int, Txn) := 10
     out: Feed(_)
@@ -20,11 +20,16 @@ const PRELUDE: &str = indoc! {"
         with begin():
             stock := stock - n
 
+    pub def taken(n: Int) => Int:
+        take(n)
+        n
+
     def apply(f, x):
         f(x)
 "};
 
-/// The clauses after the codomain of `member`'s contract, as `cambra check` prints it.
+/// The `causes` clause after the codomain of `member`'s contract, as `cambra check` prints it:
+/// the last one on the line, after any a parameter's type writes.
 fn clauses_of(code: &str, member: &str) -> String {
     let source = format!("{PRELUDE}\n{code}");
     let interface = check_program(&mut GlobalContext::default(), &program(&source, &[]))
@@ -34,7 +39,7 @@ fn clauses_of(code: &str, member: &str) -> String {
         .lines()
         .find(|l| l.starts_with(&prefix))
         .unwrap_or_else(|| panic!("no `{member}` in the interface:\n{interface}"));
-    match line.find(" causes ") {
+    match line.rfind(" causes ") {
         Some(at) => line[at + 1..].to_owned(),
         None => String::new(),
     }
@@ -152,12 +157,228 @@ fn clauses_of(code: &str, member: &str) -> String {
     "bump_stock",
     "causes Write(stock), Commit"
 )]
+// A written clause is a lower bound: the body adds what it does, and a call sees what the
+// clause lists whether or not the body does it.
+#[case(
+    indoc! {"
+        pub def report(n: Int) causes Emit:
+            out << n
+    "},
+    "report",
+    "causes Append(out), Emit"
+)]
+#[case(
+    indoc! {"
+        pub def later(n: Int) causes Commit:
+            n
+    "},
+    "later",
+    "causes Commit"
+)]
+// `only` makes the clause an upper bound that the body meets.
+#[case(
+    indoc! {"
+        pub def take_only(n: Int) causes only Write(stock), Commit:
+            take(n)
+    "},
+    "take_only",
+    "causes Write(stock), Commit"
+)]
+// A written function type's clauses are exact, so a function meeting them is passed, and the
+// call does what the type states.
+#[case(
+    indoc! {"
+        def call_with(f: Int => Int causes Write(stock), Commit, x: Int):
+            f(x)
+        pub def call_taken(n: Int):
+            call_with(taken, n)
+    "},
+    "call_taken",
+    "causes Write(stock), Commit"
+)]
+// A parameter's `_` is what each call passes.
+#[case(
+    indoc! {"
+        def call_with(f: Int => Int causes _, x: Int):
+            f(x)
+        pub def via_hole(n: Int):
+            call_with(taken, n)
+    "},
+    "via_hole",
+    "causes Write(stock), Commit"
+)]
+// A declared parameter is what each call passes.
+#[case(
+    indoc! {"
+        def call_all(E <: Effect, f: Int => Int causes E, x: Int) causes only E:
+            f(x)
+        pub def via_param(n: Int):
+            call_all(taken, n)
+    "},
+    "via_param",
+    "causes Write(stock), Commit"
+)]
+// A `let` annotation's `_` is what its value fills.
+#[case(
+    indoc! {"
+        g: Int => Int causes _ = taken
+        pub def via_g(n: Int):
+            g(n)
+    "},
+    "via_g",
+    "causes Write(stock), Commit"
+)]
 fn a_contract_states_what_the_function_causes(
     #[case] code: &str,
     #[case] member: &str,
     #[case] expected: &str,
 ) {
     assert_eq!(clauses_of(code, member), expected);
+}
+
+/// A function whose effects are what a function argument's are is polymorphic in them, and
+/// its contract names each part a written clause leaves open (`docs/chl-spec.md`, "Writing
+/// requirements and effects").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_called_parameter(
+    "pub def call(f, x):\n    f(x)\n",
+    "pub call: forall (A, B, R <: Context, E <: Effect) {A => B requires R causes E, A} => B \
+     requires R causes E"
+)]
+#[case::a_hole_in_a_written_parameter_type(
+    "pub def call_with(f: Int => Int causes _, x: Int):\n    f(x)\n",
+    "pub call_with: forall (E <: Effect) {Int => Int causes E, Int} => Int causes E"
+)]
+#[case::a_parameter_never_called(
+    "pub def keep(f, x: Int):\n    x\n",
+    "pub keep: forall (A) {A, Int} => Int"
+)]
+#[case::a_returned_function(
+    "pub def compose(f, g):\n    \\x -> g(f(x))\n",
+    "pub compose: forall (A, B, C, R <: Context, E <: Effect, R1 <: Context, E1 <: Effect) \
+     {A => B requires R causes E, B => C requires R1 causes E1} => A => C requires R, R1 causes \
+     E, E1"
+)]
+#[case::a_declared_effect_parameter(
+    "pub def call_all(E <: Effect, f: Int => Int causes E, x: Int) causes only E:\n    f(x)\n",
+    "pub call_all: forall (E <: Effect) {Int => Int causes E, Int} => Int causes E"
+)]
+#[case::a_declared_requirement_parameter(
+    "pub def with_ctx(R <: Context, f: Int => Int requires R, x: Int) requires only R:\n    \
+     f(x)\n",
+    "pub with_ctx: forall (R <: Context) {Int => Int requires R, Int} => Int requires R"
+)]
+fn a_contract_names_the_effects_an_argument_brings(#[case] code: &str, #[case] line: &str) {
+    let interface = check_program(&mut GlobalContext::default(), &program(code, &[]))
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert!(interface.lines().any(|l| l == line), "{interface}");
+}
+
+/// A clause bounding what a function may require or cause refuses a body or an argument that
+/// exceeds it, and a clause naming no variable of the kind it takes is refused
+/// (`docs/chl-spec.md`, "Writing requirements and effects").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::beyond_only(
+    indoc! {"
+        def f(n: Int) causes only Commit:
+            with begin():
+                stock := stock - n
+            n
+    "},
+    "this has `Write(stock)`, which the definition's clause"
+)]
+#[case::beyond_nothing(
+    indoc! {"
+        def f(n: Int) causes nothing:
+            out << n
+            n
+    "},
+    "this has `Append(out)`, which the definition's clause"
+)]
+#[case::an_inferred_trait_requirement(
+    indoc! {"
+        def add(a, b) requires nothing:
+            a + b
+    "},
+    "Addable(A, B)"
+)]
+#[case::an_argument_beyond_a_written_type(
+    indoc! {"
+        def call_with(f: Int => Int, x: Int):
+            f(x)
+        call_with(taken, 1)
+    "},
+    "this has `Write(stock)`, which the function type it must have does not state"
+)]
+#[case::beyond_a_parameter(
+    indoc! {"
+        def f(E <: Effect, g: Int => Int causes E, n: Int) causes only E:
+            out << n
+            g(n)
+    "},
+    "this has `Append(out)`, which the definition's clause"
+)]
+#[case::a_name_bound_nowhere(
+    indoc! {"
+        def f(n: Int) causes Write(nope):
+            n
+    "},
+    "`Write(nope)` names no variable in scope"
+)]
+#[case::a_feed_written(
+    indoc! {"
+        def f(n: Int) causes Write(out):
+            n
+    "},
+    "`Write(out)` names no variable in scope"
+)]
+fn a_clause_refuses_what_exceeds_it(#[case] code: &str, #[case] needle: &str) {
+    let errors = super::modules::compile_errors(&program(&format!("{PRELUDE}\n{code}\n0\n"), &[]));
+    assert!(errors.contains(needle), "{errors}");
+}
+
+/// A clause form this compiler does not implement yet, and one written where it cannot stand,
+/// is refused where it is written.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::an_exception(
+    "def f(n: Int) causes Raise(Int):\n    n\n",
+    "`Raise` is not supported yet"
+)]
+#[case::an_effect_variable("def f(n: Int) causes E:\n    n\n", "`E` is not an effect")]
+#[case::a_hole_under_only(
+    "def f(n: Int) causes only _:\n    n\n",
+    "`only` makes a clause an upper bound"
+)]
+#[case::a_trait_requirement_in_a_function_type(
+    "def call_with(f: Int => Int requires Orderable(Int, Int), x: Int):\n    f(x)\n",
+    "a function type's `requires` clause names only"
+)]
+#[case::a_clause_on_an_instance_function(
+    indoc! {"
+        type Count:
+            count(n: Int)
+        trait Twice(T):
+            def twice(t: T) => T
+        impl Twice(Count):
+            def twice(t: Count) => Count causes Commit:
+                t
+    "},
+    "an instance's function requires and causes what its trait's signature states"
+)]
+#[case::a_parameter_in_the_other_clause(
+    "def f(R <: Context, g: Int => Int causes R, n: Int):\n    g(n)\n",
+    "`R` is bounded by `Context`, so it stands in a `requires` clause"
+)]
+#[case::a_bound_as_a_value_type(
+    "def f(x: Effect):\n    x\n",
+    "`Effect` bounds a type parameter standing for a clause"
+)]
+fn an_unsupported_or_misplaced_clause_is_refused(#[case] code: &str, #[case] needle: &str) {
+    let errors = super::modules::compile_errors(&program(&format!("{PRELUDE}\n{code}\n0\n"), &[]));
+    assert!(errors.contains(needle), "{errors}");
 }
 
 /// An expression statement before its block's last statement is evaluated only for what it

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use super::traits::{TraitObligation, TraitObligationId};
-use crate::ccl::effects::{EffectVar, EffectVarId, Effects, Repr};
+use crate::ccl::effects::{EffectVar, EffectVarId, Effects, Item, Repr};
 use crate::ccl::infer_var::Telescope;
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::TraitRequirement;
@@ -337,12 +337,32 @@ fn freshen_effect_var(
     let f = EffectVar::fresh(target.level_of(v.level()));
     // Cached before the edges are copied, so a cycle reaches the copy.
     cache.effect_vars.insert(v.uid, Rc::clone(&f));
+    // A label naming a parameter that stands for a clause is the definition's rigid stand-in
+    // for what each use passes (`InferCtx::open_poly`); a use's copy holds what its arguments
+    // bring instead.
     for label in v.own() {
-        f.record(label);
+        if !matches!(label.item, Item::Param(_)) {
+            f.record(label);
+        }
     }
     for (source, filter) in v.incoming() {
         let source = freshen_effect_var(lim, &source, target, cache);
         f.flows_from(&source, filter);
+    }
+    // Each use answers the bounds the definition states: a use's arguments can add labels
+    // its copy holds and the definition's variable never does. A part a parameter stands in
+    // admits whatever the use passes there, and the definition was checked against it.
+    for mut upper in v.uppers() {
+        for param in std::mem::take(&mut upper.set.params) {
+            if param.of_causes {
+                upper.of_causes = false;
+            } else {
+                upper.of_requires = false;
+            }
+        }
+        if upper.of_requires || upper.of_causes {
+            f.bound_above(upper);
+        }
     }
     f
 }
@@ -447,6 +467,10 @@ fn freshen_level(ty: &Type) -> Level {
         // emitted.
         Type::Param(param) => param.opened_at.unwrap_or(0),
         Type::ChanDom(_, l) => l.0,
+        // An effect variable is copied like any variable above the cutoff, so a type whose
+        // only quantified content is a function's effects is not returned verbatim: each use
+        // would add its arguments' effects to the definition's own variable.
+        Type::Fun { effects, .. } => effects.level(),
         _ => 0,
     };
     for r in ty.refinements() {
@@ -553,6 +577,9 @@ pub fn freshen_above(
                 effects: match effects.repr() {
                     Repr::Var(v) => Effects::var(freshen_effect_var(lim, v, target, cache)),
                     Repr::Known(_) => effects.clone(),
+                    Repr::Written(_) => {
+                        unreachable!("a scheme's written clauses are normalized when it is bound")
+                    }
                 },
             };
             // A scheme binds its witnesses, so each instantiation owes itself its own —

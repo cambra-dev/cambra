@@ -478,7 +478,7 @@ symbols:
   variable region 9:1-9:28 (name 9:7-9:13)
   variable ceiling 10:1-10:30 (name 10:13-10:20)
   function quote 12:1-13:35 (name 12:9-12:14)
-  variable bigger 15:1-15:53 (name 15:1-15:7)
+  variable bigger 15:1-15:68 (name 15:1-15:7)
   variable reqs 17:1-17:48 (name 17:1-17:5)
   variable resps 17:1-17:48 (name 17:7-17:12)
   variable total 19:1-20:21 (name 20:1-20:6)

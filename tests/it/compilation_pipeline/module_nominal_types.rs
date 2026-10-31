@@ -326,7 +326,7 @@ fn a_method_call_above_a_run_takes_a_copy_in_scope() {
 
 #[rstest]
 #[case::private("hidden")]
-#[case::undeclared("nothing")]
+#[case::undeclared("absent")]
 #[timeout(Duration::from_secs(10))]
 fn a_method_call_through_another_module_reaches_only_public_methods(#[case] method: &str) {
     assert_refused(

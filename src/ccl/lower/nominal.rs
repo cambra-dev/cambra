@@ -30,9 +30,9 @@ use crate::ccl::{
 };
 use crate::ccl::{V_NONE, V_SOME};
 use crate::chl_parser::ast::{
-    AnnotationMode, ArmPattern, ConstructorPattern, Expr as ChlExpr, ImplBlock, MatchArm, Param,
-    QualifiedName, Requirement, Span, Spanned, Stmt as ChlStmt, TypeAnnotation, TypeDecl,
-    TypeDeclBody, TypeParam as ChlTypeParam,
+    AnnotationMode, ArmPattern, Clause, ConstructorPattern, Expr as ChlExpr, ImplBlock, MatchArm,
+    Param, QualifiedName, Requirement, Span, Spanned, Stmt as ChlStmt, TraitType, TypeAnnotation,
+    TypeDecl, TypeDeclBody, TypeParam as ChlTypeParam,
 };
 
 /// The name the function a declaration's member `name` declares is bound to, `Shape::rect`.
@@ -58,7 +58,8 @@ pub(super) struct AssociatedDef<'a> {
     pub type_params: &'a [ChlTypeParam],
     pub params: &'a [Param],
     pub output: Option<&'a Spanned<ChlExpr>>,
-    pub requires: &'a [Spanned<Requirement>],
+    pub requires: &'a Clause<Requirement>,
+    pub causes: &'a Clause<TraitType>,
     pub body: &'a [Spanned<ChlStmt>],
     /// The block declaring it, if it is in one.
     pub block: Option<&'a ImplBlock>,
@@ -90,6 +91,7 @@ pub(super) fn associated_defs<'a>(
             params,
             output,
             requires,
+            causes,
             body,
         } = &def.node
         else {
@@ -108,6 +110,7 @@ pub(super) fn associated_defs<'a>(
             params,
             output: output.as_ref(),
             requires,
+            causes,
             body,
             block,
             block_params,
@@ -2178,6 +2181,7 @@ pub(super) fn lower_associated_def(
         params,
         output,
         requires,
+        causes,
         body,
         span,
         ..
@@ -2218,8 +2222,16 @@ pub(super) fn lower_associated_def(
             ty,
         });
     }
-    let (func, annotation) =
-        super::functions::lower_def(span, &all_type_params, &params, output, requires, body, ctx)?;
+    let (func, annotation) = super::functions::lower_def(
+        span,
+        &all_type_params,
+        &params,
+        output,
+        requires,
+        causes,
+        body,
+        ctx,
+    )?;
     Ok((member_binding(decl, name), func, annotation))
 }
 

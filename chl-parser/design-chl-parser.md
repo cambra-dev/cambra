@@ -169,8 +169,18 @@ Key shape choices:
 - **A `requires` clause ends a signature.** `requires_clause` parses
   `requires a: Addable(A, B), a::Output <: O, Transaction` into `Vec<Spanned<Requirement>>`: each a
   trait type, optionally naming its instance, or a bound on a named instance's associated type. It
-  follows a `def`'s `=>` result and a `forall`'s body. A clause after a nested `forall`'s body
-  belongs to the innermost one.
+  follows a trait's and an instance's declaration and a `forall`'s body. A clause after a nested
+  `forall`'s body belongs to the innermost one.
+- **A `def` and a function type end in `requires` and `causes` clauses.** `effect_clauses` parses
+  both into `Clause`s, each holding its items and the span of `only` or `nothing` when one bounds it
+  ([Writing requirements and effects](../docs/chl-spec.md#writing-requirements-and-effects)). An
+  effect is a trait type, `Write(x)`, and `_` is a trait type named `_`. The clauses after a
+  function type's codomain are that arrow's, so the clause after a `forall`'s function-type body is
+  the arrow's, and lowering moves its trait requirements to the `forall`. A function type's items
+  are capitalized names or `_` (`clause_item`), which ends a function-typed parameter at the comma
+  before the next parameter. A `def`'s `requires` clause also takes a named requirement and a
+  bound. Both AST nodes box their clauses, so that every expression and statement does not carry
+  them.
 - **Module statements have their own variants.** `Stmt::Import`, `Stmt::Run`,
   `Stmt::Param` and `Stmt::Discard` carry the statements of
   [docs/chl-spec.md](../docs/chl-spec.md), "9. Modules". `Stmt::Pub`

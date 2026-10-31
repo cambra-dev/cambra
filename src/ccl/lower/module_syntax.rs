@@ -239,6 +239,7 @@ impl Refusals {
                 params,
                 output,
                 requires,
+                causes,
                 body,
             } => {
                 // An associated function's name is a member of its type, not a binder of
@@ -251,7 +252,8 @@ impl Refusals {
                 if let Some(output) = output {
                     self.expr(output);
                 }
-                self.requires(requires);
+                self.requires(&requires.items);
+                self.trait_types(&causes.items);
                 self.stmts(body);
             }
             ChlStmt::With {
@@ -355,6 +357,12 @@ impl Refusals {
     fn trait_type(&mut self, ty: &TraitType) {
         for arg in &ty.args {
             self.expr(arg);
+        }
+    }
+
+    fn trait_types(&mut self, tys: &[Spanned<TraitType>]) {
+        for ty in tys {
+            self.trait_type(&ty.node);
         }
     }
 
@@ -514,10 +522,16 @@ impl Refusals {
                 self.requires(requires);
             }
             ChlExpr::FunctionType {
-                domain, codomain, ..
+                domain,
+                codomain,
+                requires,
+                causes,
+                ..
             } => {
                 self.expr(domain);
                 self.expr(codomain);
+                self.requires(&requires.items);
+                self.trait_types(&causes.items);
             }
             ChlExpr::Subscript { target, index, .. } => {
                 self.expr(target);
