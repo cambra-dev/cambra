@@ -713,9 +713,12 @@ impl ColumnValue {
         if data.is_empty() {
             return ColumnValue::Records(HashMap::new());
         }
-        // Sort keys for a deterministic column order when computing strides.
-        let mut keys: Vec<SmolStr> = data.keys().cloned().collect();
-        keys.sort();
+        // The columns in the order their rows enumerate: a tuple's by position, the order its
+        // values compare in, so the rows come out ascending; a record's by name.
+        let keys: Vec<SmolStr> = super::fields_in_order(data.keys())
+            .into_iter()
+            .cloned()
+            .collect();
         let lengths: Vec<usize> = keys.iter().map(|k| data[k].len()).collect();
         let total: usize = lengths.iter().product();
         let expanded = keys

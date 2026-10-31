@@ -146,6 +146,10 @@ pub(super) struct InferCtx {
     /// Each statement emitted, with the variable collecting what it causes and the one of
     /// the body it stands in.
     effect_statements: Vec<(NodeId, Rc<EffectVar>, EffectVarId)>,
+    /// Each `for` loop emitted, for [`InferCtx::check_loop_orders`]: its node, the variable
+    /// collecting what its body causes, the mutable variables the body declares, and whether
+    /// its iterations interacted when its body was emitted.
+    effect_loops: Vec<EffectLoop>,
     /// Each `with begin():` block emitted, with the variable collecting what its body causes.
     effect_transactions: Vec<(NodeId, Rc<EffectVar>)>,
     /// What lowering marks each marked node as: an expression statement, which an inert one
@@ -372,6 +376,23 @@ impl EffectFrame {
     }
 }
 
+/// A `for` loop emitted ([`InferCtx::effect_loops`]).
+struct EffectLoop {
+    node: NodeId,
+    var: Rc<EffectVar>,
+    declared: HashSet<Name>,
+    ordered: bool,
+}
+
+/// Whether what `var` collects, a loop body's effects, makes its iterations interact: a write
+/// to a mutable variable not among `declared`, the ones the body declares, outlives the
+/// iteration (`docs/chl-spec.md`, "Ordered loops").
+fn iterations_interact(var: &Rc<EffectVar>, declared: &HashSet<Name>) -> bool {
+    var.resolved()
+        .iter()
+        .any(|l| matches!(&l.item, Item::Causes(Effect::Write(x)) if !declared.contains(x)))
+}
+
 /// A variable standing for an associated effect type, `Writes`, at a call of a trait's
 /// function or a use of a definition requiring the trait: it holds what the instance the
 /// obligation selects does, or the requirement in scope that answers it.
@@ -572,6 +593,7 @@ impl InferCtx {
             }],
             effect_binders: HashMap::new(),
             effect_statements: Vec::new(),
+            effect_loops: Vec::new(),
             effect_transactions: Vec::new(),
             marks: HashMap::new(),
             effect_calls: HashSet::new(),
@@ -756,6 +778,22 @@ impl InferCtx {
     /// definition determines: a parameter's. That call's variable has nothing flowing into it
     /// at the definition, where each use fills a copy of its own, so a statement or a block
     /// reaching one may do something and is not reported.
+    /// Hold each loop's order to what its body was found to cause once emission is done. A loop
+    /// is ordered, and requires `Orderable` of its positions, from what its body causes when it
+    /// is emitted, which is when a requirement can enter the scheme of the function holding
+    /// it. A body that interacts only through a function passed to it learns so later.
+    pub(super) fn check_loop_orders(&self) {
+        for l in &self.effect_loops {
+            assert!(
+                l.ordered || !iterations_interact(&l.var, &l.declared),
+                "the loop at {:?} is ordered only by what a function passed to it causes, which \
+                 is known after its body is emitted, too late to require `Orderable` of its \
+                 positions; that is not supported yet",
+                l.node
+            );
+        }
+    }
+
     pub(super) fn does_nothing(&self) -> Vec<(NodeId, InferError)> {
         let undetermined = |v: &EffectVar| {
             self.effect_calls.contains(&v.uid) && v.incoming().is_empty() && v.own().is_empty()
@@ -2619,6 +2657,43 @@ impl Typing for InferCtx {
         let body = outer.var.uid;
         self.effect_statements.push((node, var, body));
         r
+    }
+
+    fn loop_body<R>(
+        &mut self,
+        node: NodeId,
+        declared: &HashSet<Name>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> (R, bool) {
+        // A frame of its own, as a statement's, keeping what names the enclosing function's own
+        // variables: an accumulator may be one.
+        let outer = self.effect_frame();
+        let frame = EffectFrame {
+            var: EffectVar::fresh(self.level),
+            depth: outer.depth,
+            keeps_own: true,
+            transactions: outer.transactions,
+        };
+        let var = Rc::clone(&frame.var);
+        self.effect_frames.push(frame);
+        let r = f(self);
+        self.effect_frames.pop();
+        let outer = self.effect_frame();
+        outer.var.flows_from(
+            &var,
+            Filter {
+                at: Some(node),
+                ..outer.filter()
+            },
+        );
+        let ordered = iterations_interact(&var, declared);
+        self.effect_loops.push(EffectLoop {
+            node,
+            var,
+            declared: declared.clone(),
+            ordered,
+        });
+        (r, ordered)
     }
 
     fn note_binding(&mut self, name: &Name, ty: &Type, node: NodeId) {

@@ -799,6 +799,27 @@ pub(crate) fn run_with_params(
             }]);
         }
     }
+    // An operand no contribution reached is judged by what it resolves to, which the sweep's
+    // own deposits can determine, so this follows the sweep.
+    {
+        let mut cache = solver::ConstrainCache::new();
+        if let Err((error, node)) =
+            solver::traits::deliver_resolutions(&mut cache, |ty| resolve_var_type(ty).ok())
+        {
+            let failure = cache.take_failure();
+            // A loop's positions are the one operand known to reach here
+            // (`deliver_resolutions`); anything else is named generically.
+            let what = match find_node(expr, node).map(|e| &e.node) {
+                Some(crate::ccl::TypedExprNode::For { .. }) => {
+                    "the positions of a loop whose iterations interact, which runs in their order"
+                }
+                _ => "a value a trait requires",
+            };
+            return Err(vec![
+                LocatedInferError::new(map_constrain_err(error, what), node).with_failure(failure),
+            ]);
+        }
+    }
     // Sealed *after* the requirement sweep, not before: the sweep itself narrows, and
     // legitimately so. What must not happen is a later pass narrowing a definition's
     // obligation, which would leave the sweep's verdict stale.
@@ -848,6 +869,7 @@ pub(crate) fn run_with_params(
     debug_assert_no_free_witness(expr, "post-inference");
     // An expression statement, and a `with begin():` block, does something only by what it
     // causes.
+    sub_ctx.check_loop_orders();
     let inert: Vec<LocatedInferError> = sub_ctx
         .does_nothing()
         .into_iter()

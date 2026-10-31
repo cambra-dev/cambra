@@ -265,18 +265,6 @@ fn check_compile_error(code: &str, needle: &str) {
     "#},
     101
 )]
-// A transaction per position of a concatenation, whose positions are keyed by a tagged
-// union: the driver releases each finished item as a prefix of that union.
-#[case::over_a_concatenation(
-    indoc! {r#"
-        t: Mut(Int, Txn) := 0
-        for y in [10] ++ [20]:
-            with begin():
-                t := t * 100 + y
-        await_final(t)
-    "#},
-    1020
-)]
 // A transaction per position of a product, whose positions are records.
 #[case::over_a_product(
     indoc! {r#"

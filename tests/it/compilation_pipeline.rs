@@ -37,6 +37,7 @@ mod modules;
 mod mutability;
 mod nested_loops;
 mod nominal_types;
+mod ordered_loops;
 mod probes;
 mod readings;
 mod records;

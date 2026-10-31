@@ -18,13 +18,11 @@ use crate::{
         BaseType,
         BinOpKind as InterpreterBinOp,
         ColumnValue,
-        CompareKind,
         CurryLevel,
         DataSourceDomainExtentImpl,
         Extent,
         FuncBinding,
         FunctionDef,
-        OrderKey,
         Position,
         Predicate,
         ScalarProgram,
@@ -2516,15 +2514,7 @@ fn convert_impl_inner(
         {
             expect_no_input(input, "scalar aggregate")?;
             let input = convert_impl(argument, None, ctx)?;
-            match extreme_by_key(kind, &expr.ty) {
-                Some(key) => {
-                    let element = ctx.extent_of(&expr.ty)?;
-                    let keys = map_order_key(input, &key, &element, true);
-                    let extreme = apply_aggregate(keys, kind)?;
-                    Ok(map_order_key(extreme, &key, &element, false))
-                }
-                None => apply_aggregate(input, kind),
-            }
+            apply_aggregate(input, kind)
         }
 
         // `FinalOrDefault` is the stream-to-scalar primitive that extracts the
@@ -3134,34 +3124,16 @@ fn convert_impl_inner(
                     )))
                 }
                 b if let Some(op) = builtin_to_binop(b.clone()) => {
-                    match compared_by_key(&op, &expr.ty) {
-                        Some((kind, key)) => apply_compare_by_key(input, kind, key, ctx.level()),
-                        None => apply_binop(input, op, ctx.level()),
-                    }
+                    apply_binop(input, op, ctx.level())
                 }
                 b if let Some(op) = builtin_to_unaryop(b.clone()) => {
                     apply_unaryop(input, op, ctx.level())
                 }
                 // If we have reached here, we are composing with sum, not applying it, so we are doing a MapAggregate
-                b if let Some(kind) = b.as_aggregate() => {
-                    let element_ty = expr.ty.codomain().unwrap_or(Type::Hole);
-                    match extreme_by_key(kind, &element_ty) {
-                        Some(key) => {
-                            let element = ctx.extent_of(&element_ty)?;
-                            let keys = map_order_key(input, &key, &element, true);
-                            let extremes: Box<dyn TileOperator> =
-                                Box::new(MapExtractAggregate::new(
-                                    Box::new(MapAggregate::new(keys, kind)),
-                                    kind,
-                                ));
-                            Ok(map_order_key(extremes, &key, &element, false))
-                        }
-                        None => Ok(Box::new(MapExtractAggregate::new(
-                            Box::new(MapAggregate::new(input, kind)),
-                            kind,
-                        ))),
-                    }
-                }
+                b if let Some(kind) = b.as_aggregate() => Ok(Box::new(MapExtractAggregate::new(
+                    Box::new(MapAggregate::new(input, kind)),
+                    kind,
+                ))),
                 // Composed rather than applied would be a reduction per enclosing position, which
                 // nothing mints: a loop's trailing read is `final_read`, and a guard-`Case`
                 // is applied to its stream and its default.
@@ -3261,9 +3233,11 @@ fn convert_impl_inner(
         ctor @ (TypedExprNode::VariantCtor { .. } | TypedExprNode::NominalCtor { .. }) => {
             let (tag, payload) = match ctor {
                 TypedExprNode::VariantCtor { tag, payload } => (tag.clone(), payload),
-                TypedExprNode::NominalCtor { ctor, payload, .. } => {
-                    (crate::ccl::nominal::ctor_tag(ctor), payload)
-                }
+                TypedExprNode::NominalCtor {
+                    decl,
+                    ctor,
+                    payload,
+                } => (decl.tag(ctor), payload),
                 _ => unreachable!("matched as a constructor"),
             };
             expect_no_input(input, "variant constructor")?;
@@ -3705,8 +3679,12 @@ pub(super) fn expr_to_value(expr: &Expr) -> Result<Value, ConversionError> {
             tag: FieldKey::Name(tag.clone()),
             inner: Box::new(expr_to_value(payload)?),
         }),
-        TypedExprNode::NominalCtor { ctor, payload, .. } => Ok(Value::Union {
-            tag: FieldKey::Name(crate::ccl::nominal::ctor_tag(ctor)),
+        TypedExprNode::NominalCtor {
+            decl,
+            ctor,
+            payload,
+        } => Ok(Value::Union {
+            tag: FieldKey::Name(decl.tag(ctor)),
             inner: Box::new(expr_to_value(payload)?),
         }),
         // A nested collection is constant exactly when its elements are, and its
@@ -5765,147 +5743,6 @@ fn apply_scalar_expr(
     Box::new(MapResult::new_at(
         input,
         Box::new(Constant::new(fn_value, fn_extent)),
-        level,
-    ))
-}
-
-/// How a value of `ty` is read as the tuple it orders by, or `None` for a type whose values
-/// order as they stand, which holds no nominal type (`docs/chl-spec.md`, "Equality and
-/// order"). A nominal type is ordered by its one constructor's argument, and a record its
-/// declaration writes by its fields as written.
-fn order_key(ty: &Type) -> Option<OrderKey> {
-    use crate::ccl::nominal::WrittenOrder;
-    fn key_of(ty: &Type, written: &WrittenOrder) -> OrderKey {
-        let ty = strip_refinements(ty);
-        match (&ty, written) {
-            (Type::Nominal(decl, args), _) => {
-                let [ctor] = decl.body().ctors.as_slice() else {
-                    panic!(
-                        "an orderable nominal type has one constructor, `{}` has not",
-                        decl.name
-                    )
-                };
-                let payload = decl.instantiate(&strip_refinements(&ctor.payload()), args);
-                OrderKey::Payload(
-                    FieldKey::Name(crate::ccl::nominal::ctor_tag(&ctor.name)),
-                    Box::new(key_of(&payload, &ctor.payload_order())),
-                )
-            }
-            (Type::Tuple(elems), WrittenOrder::Fields(fields)) => OrderKey::Fields(
-                fields
-                    .iter()
-                    .map(|(field, order)| {
-                        let FieldKey::Index(i) = field else {
-                            unreachable!("a tuple's fields are positions")
-                        };
-                        (tuple_field(*i), key_of(&elems[*i], order))
-                    })
-                    .collect(),
-            ),
-            (Type::Record(types), WrittenOrder::Fields(fields)) => OrderKey::Fields(
-                fields
-                    .iter()
-                    .map(|(field, order)| {
-                        let FieldKey::Name(name) = field else {
-                            unreachable!("a record's fields are names")
-                        };
-                        let (_, t) = types
-                            .iter()
-                            .find(|(n, _)| n == name)
-                            .unwrap_or_else(|| panic!("the record writes its field `{name}`"));
-                        (name.runtime_key(), key_of(t, order))
-                    })
-                    .collect(),
-            ),
-            _ => OrderKey::Whole,
-        }
-    }
-    ty.mentions_nominal()
-        .then(|| key_of(ty, &WrittenOrder::of_type(ty)))
-}
-
-/// The order key a `max` or `min` of elements of `element` reads them by, if they need one.
-fn extreme_by_key(kind: AggregateKind, element: &Type) -> Option<OrderKey> {
-    matches!(kind, AggregateKind::Max | AggregateKind::Min)
-        .then(|| order_key(element))
-        .flatten()
-}
-
-/// The comparison and order key an ordering `op` of type `{𝐴, 𝐴} ⇒ Bool` compares by, if its
-/// operands need one. Equality needs none: a value is equal to another by its columns.
-fn compared_by_key(op: &InterpreterBinOp, ty: &Type) -> Option<(CompareKind, OrderKey)> {
-    let InterpreterBinOp::Compare(
-        kind @ (CompareKind::Less
-        | CompareKind::LessOrEq
-        | CompareKind::Greater
-        | CompareKind::GreaterOrEq),
-    ) = op
-    else {
-        return None;
-    };
-    let Type::Fun { domain, .. } = ty.peel_refinements() else {
-        return None;
-    };
-    let Type::Tuple(operands) = domain.peel_refinements() else {
-        return None;
-    };
-    Some((*kind, order_key(operands.first()?)?))
-}
-
-/// Compare the tupled pairs `input` produces by the tuple each value orders by.
-fn apply_compare_by_key(
-    input: Box<dyn TileOperator>,
-    kind: CompareKind,
-    key: OrderKey,
-    level: CurryLevel,
-) -> Result<Box<dyn TileOperator>, ConversionError> {
-    let record_extent = value_extent_at(input.tiling(), level);
-    let fn_value =
-        Value::ComputableFunction(FunctionDef::CompareByKey(kind, std::sync::Arc::new(key)));
-    let fn_extent = Extent::Function {
-        domain: Box::new(record_extent),
-        codomain: Box::new(Extent::Base(BaseType::Bool)),
-    };
-    Ok(Box::new(MapResult::new_at(
-        input,
-        Box::new(Constant::new(fn_value, fn_extent)),
-        level,
-    )))
-}
-
-/// Read the values of `input` as their order keys, or (`to_key` false) back from them,
-/// `element` being the values' own extent.
-fn map_order_key(
-    input: Box<dyn TileOperator>,
-    key: &OrderKey,
-    element: &Extent,
-    to_key: bool,
-) -> Box<dyn TileOperator> {
-    let level = CurryLevel::values_of(input.tiling());
-    let key_extent = key.key_extent(element);
-    let (function, domain, codomain) = if to_key {
-        (
-            FunctionDef::ToOrderKey(std::sync::Arc::new(key.clone())),
-            element.clone(),
-            key_extent,
-        )
-    } else {
-        (
-            FunctionDef::FromOrderKey(std::sync::Arc::new(key.clone())),
-            key_extent,
-            element.clone(),
-        )
-    };
-    let fn_extent = Extent::Function {
-        domain: Box::new(domain),
-        codomain: Box::new(codomain),
-    };
-    Box::new(MapResult::new_at(
-        input,
-        Box::new(Constant::new(
-            Value::ComputableFunction(function),
-            fn_extent,
-        )),
         level,
     ))
 }

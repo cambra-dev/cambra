@@ -106,12 +106,57 @@ pub fn context() -> Rc<NominalDecl> {
     CONTEXT_DECL.with(Rc::clone)
 }
 
-/// The tag a value built by the constructor `ctor` carries once nominal types erase: the
-/// constructor's name, as a label of the root's namespace whichever module declares the
-/// type. Construction, patterns and erasure all build it here, so they agree, and the
-/// runtime's checked lookup builds `Option`'s the same way ([`V_SOME`]).
-pub fn ctor_tag(ctor: &str) -> Label {
-    Label::new(ctor)
+/// A nominal declaration as one version of a program defines it, named at run time: the
+/// constructor tags of a declared type carry it ([`NominalDecl::tag`]), and its constructors'
+/// payload orders are recorded under it ([`payload_order`]).
+///
+/// One id per identity and definition: the declaration's path and name, and its
+/// constructors' names, parameter types and written orders. Versions and branches agreeing
+/// on a definition share its id, so a value built by an operator one keeps matches the
+/// other's patterns, and a changed definition takes a new one, so two running at once each
+/// compare by their own order. The table is process-wide because a [`Value`] comparison
+/// takes no context to look it up in.
+///
+/// [`Value`]: crate::interpreter::Value
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct DeclId(u32);
+
+#[derive(Default)]
+struct DeclTable {
+    ids: HashMap<String, DeclId>,
+    /// Each declaration's constructors' payload orders, by constructor name.
+    orders: Vec<HashMap<SmolStr, std::sync::Arc<crate::interpreter::ValueOrder>>>,
+}
+
+static DECLS: std::sync::LazyLock<std::sync::RwLock<DeclTable>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// The order the payload of `ctor`, a constructor of the declaration `decl`, compares in.
+pub fn payload_order(
+    decl: DeclId,
+    ctor: &str,
+) -> Option<std::sync::Arc<crate::interpreter::ValueOrder>> {
+    let table = DECLS.read().unwrap_or_else(|e| e.into_inner());
+    table.orders.get(decl.0 as usize)?.get(ctor).cloned()
+}
+
+/// `order` with each field named as run time names it.
+fn runtime_order(order: &WrittenOrder) -> crate::interpreter::ValueOrder {
+    match order {
+        WrittenOrder::Whole | WrittenOrder::Unordered => crate::interpreter::ValueOrder::Natural,
+        WrittenOrder::Fields(fields) => crate::interpreter::ValueOrder::Fields(
+            fields
+                .iter()
+                .map(|(key, order)| {
+                    let name = match key {
+                        FieldKey::Index(i) => crate::interpreter::tuple_field(*i),
+                        FieldKey::Name(label) => label.runtime_key(),
+                    };
+                    (name, runtime_order(order))
+                })
+                .collect(),
+        ),
+    }
 }
 
 /// The compiler-provided declaration `name` names, if any.
@@ -646,6 +691,67 @@ impl NominalDecl {
             || *self == *context()
     }
 
+    /// The tag a value built by the constructor `ctor` carries once nominal types erase.
+    /// Construction, patterns and erasure all build it here, so they agree. A declared
+    /// type's tag belongs to the declaration ([`DeclId`]); a compiler-provided type's is the
+    /// constructor's name in the root's namespace, which the runtime's checked lookup builds
+    /// `Option`'s the same way ([`V_SOME`]).
+    pub fn tag(&self, ctor: &str) -> Label {
+        if self.is_builtin() {
+            Label::new(ctor)
+        } else {
+            Label::in_decl(self.runtime_id(), ctor)
+        }
+    }
+
+    /// This declaration's [`DeclId`], recording its constructors' payload orders the first
+    /// time its definition is seen.
+    fn runtime_id(&self) -> DeclId {
+        let definition: Vec<String> = self
+            .body()
+            .ctors
+            .iter()
+            .map(|c| {
+                let params: Vec<String> = c.params.iter().map(|(_, t)| t.to_string()).collect();
+                format!("{}({}) {:?}", c.name, params.join(", "), c.orders)
+            })
+            .collect();
+        let key = format!(
+            "{}::{}[{}] {}",
+            self.module.join("::"),
+            self.name,
+            self.params.len(),
+            definition.join("; ")
+        );
+        if let Some(id) = DECLS
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .ids
+            .get(&key)
+        {
+            return *id;
+        }
+        let mut table = DECLS.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(id) = table.ids.get(&key) {
+            return *id;
+        }
+        let id = DeclId(u32::try_from(table.orders.len()).expect("fewer than 2³² declarations"));
+        let orders = self
+            .body()
+            .ctors
+            .iter()
+            .map(|c| {
+                (
+                    c.name.clone(),
+                    std::sync::Arc::new(runtime_order(&c.payload_order())),
+                )
+            })
+            .collect();
+        table.orders.push(orders);
+        table.ids.insert(key, id);
+        id
+    }
+
     /// The constructor named `name`.
     pub fn ctor(&self, name: &str) -> Option<&NominalCtor> {
         self.body().ctors.iter().find(|c| c.name == name)
@@ -707,7 +813,7 @@ impl NominalDecl {
             .iter()
             .map(|c| {
                 let payload = self.instantiate(&strip_refinements(&c.payload()), args);
-                (FieldKey::Name(ctor_tag(&c.name)), payload)
+                (FieldKey::Name(self.tag(&c.name)), payload)
             })
             .collect();
         arms.sort_by(|(a, _), (b, _)| a.cmp(b));

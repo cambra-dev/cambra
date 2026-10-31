@@ -30,108 +30,57 @@ pub enum FunctionDef {
     /// where it was absent. Applied to a `Records` column of the tupled argument
     /// ([`crate::ccl::Builtin::Insert`]), pointwise: one map in, one map out.
     Insert,
-    /// A value read as the tuple it orders by ([`OrderKey`]).
-    ToOrderKey(std::sync::Arc<OrderKey>),
-    /// The value an [`OrderKey`] tuple is read from: [`Self::ToOrderKey`]'s inverse.
-    FromOrderKey(std::sync::Arc<OrderKey>),
-    /// A comparison of the tupled pair's two values by the tuple each orders by.
-    CompareByKey(crate::interpreter::CompareKind, std::sync::Arc<OrderKey>),
 }
 
-/// How a value is read as the tuple it orders by (`docs/chl-spec.md`, "Equality and order"):
-/// a nominal value by its constructor's argument, and each product by its fields in the
-/// order the declaration writes them, as a tuple of `_0`, `_1`, …. Operator conversion
-/// builds one from a type, which the column alone does not carry: a record's fields have no
-/// order of their own.
-///
-/// The key holds every field, so it is a rearrangement of the value's columns and is read
-/// back exactly ([`OrderKey::from_key`]).
+/// A record's field names in the order its values compare and its rows enumerate: a tuple's,
+/// `_0`, `_1`, …, by position, and named fields by name, an internal order (a record with
+/// named fields has none in the language).
+pub fn fields_in_order<'a>(names: impl IntoIterator<Item = &'a SmolStr>) -> Vec<&'a SmolStr> {
+    let mut names: Vec<&SmolStr> = names.into_iter().collect();
+    let position = |k: &SmolStr| k.strip_prefix('_').and_then(|i| i.parse::<usize>().ok());
+    if names.iter().all(|k| position(k).is_some()) {
+        names.sort_by_key(|k| position(k));
+    } else {
+        names.sort();
+    }
+    names
+}
+
+/// The order a declared nominal type's payload compares in: a record its declaration writes by
+/// its fields in the order they are listed, a tuple by position, and anything else by
+/// [`Value`]'s own comparison (`docs/chl-spec.md`, "Equality and order"). A value carries no
+/// field order of its own, so the declaration's is recorded under its id
+/// ([`crate::ccl::nominal::payload_order`]).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum OrderKey {
-    /// The value itself: a base type.
-    Whole,
-    /// A product's fields, by column name, each read by its own key, in key order.
-    Fields(Vec<(SmolStr, OrderKey)>),
-    /// The value of a type with one constructor, by its argument: the union's one arm.
-    Payload(FieldKey, Box<OrderKey>),
+pub enum ValueOrder {
+    /// By [`Value`]'s own comparison.
+    Natural,
+    /// A product's fields, compared in this order, each by its own order.
+    Fields(Vec<(SmolStr, ValueOrder)>),
 }
 
-impl OrderKey {
-    /// `column` read as its key.
-    pub fn key(&self, column: ColumnValue) -> ColumnValue {
-        match (self, column) {
-            (OrderKey::Whole, column) => column,
-            (OrderKey::Fields(fields), ColumnValue::Records(mut columns)) => ColumnValue::Records(
-                fields
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (name, key))| {
-                        let field = columns
-                            .remove(name)
-                            .unwrap_or_else(|| panic!("a product's key reads its field `{name}`"));
-                        (tuple_field(i), key.key(field))
-                    })
-                    .collect(),
-            ),
-            (OrderKey::Payload(tag, key), ColumnValue::Union(arms)) => {
-                let len = arms.iter().map(|(_, a)| a.rows().len()).sum::<usize>();
-                let arm = arms
-                    .get(tag)
-                    .unwrap_or_else(|| panic!("a value of one constructor is its arm `{tag}`"));
-                debug_assert!(
-                    arm.rows().iter().copied().eq(0..len),
-                    "a type of one constructor fills every row with it"
-                );
-                key.key(arm.values().clone())
+impl ValueOrder {
+    /// `a` against `b`, two payloads of the constructor this order was recorded for.
+    pub fn compare(&self, a: &Value, b: &Value) -> Ordering {
+        match (self, a, b) {
+            (ValueOrder::Natural, a, b) => a.partial_cmp(b).unwrap_or_else(|| {
+                panic!("two values of one orderable type compare, but `{a}` and `{b}` do not")
+            }),
+            (ValueOrder::Fields(fields), Value::Record(x), Value::Record(y)) => {
+                for (name, order) in fields {
+                    let field = |r: &HashMap<SmolStr, Value>| {
+                        r.get(name)
+                            .unwrap_or_else(|| panic!("an ordered product has its field `{name}`"))
+                            .clone()
+                    };
+                    match order.compare(&field(x), &field(y)) {
+                        Ordering::Equal => continue,
+                        unequal => return unequal,
+                    }
+                }
+                Ordering::Equal
             }
-            (key, column) => panic!("{key:?} does not read {column:?}"),
-        }
-    }
-
-    /// The value `column`, a column of keys, was read from.
-    pub fn from_key(&self, column: ColumnValue) -> ColumnValue {
-        match (self, column) {
-            (OrderKey::Whole, column) => column,
-            (OrderKey::Fields(fields), ColumnValue::Records(mut columns)) => ColumnValue::Records(
-                fields
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (name, key))| {
-                        let field = columns
-                            .remove(&tuple_field(i))
-                            .unwrap_or_else(|| panic!("a key has its position {i}"));
-                        (name.clone(), key.from_key(field))
-                    })
-                    .collect(),
-            ),
-            (OrderKey::Payload(tag, key), column) => {
-                let payload = key.from_key(column);
-                let rows = (0..payload.len()).collect();
-                ColumnValue::Union(crate::ccl::TagMap::from_arms(vec![(
-                    tag.clone(),
-                    super::UnionArm::new(rows, payload),
-                )]))
-            }
-            (key, column) => panic!("{key:?} does not read back {column:?}"),
-        }
-    }
-
-    /// The extent of the keys of values of `extent`.
-    pub fn key_extent(&self, extent: &Extent) -> Extent {
-        match (self, extent) {
-            (OrderKey::Whole, e) => e.clone(),
-            (OrderKey::Fields(fields), Extent::Record(extents)) => Extent::Record(
-                fields
-                    .iter()
-                    .enumerate()
-                    .map(|(i, (name, key))| (tuple_field(i), key.key_extent(&extents[name])))
-                    .collect(),
-            ),
-            (OrderKey::Payload(tag, key), Extent::Union(arms)) => key.key_extent(
-                arms.get(tag)
-                    .unwrap_or_else(|| panic!("a value of one constructor is its arm `{tag}`")),
-            ),
-            (key, extent) => panic!("{key:?} does not read {extent:?}"),
+            (order, a, b) => panic!("{order:?} does not order `{a}` against `{b}`"),
         }
     }
 }
@@ -146,13 +95,6 @@ impl FunctionDef {
             ),
             (FunctionDef::Scalar(program), cv) => program.eval(&cv),
             (FunctionDef::UnaryOp(op), cv) => apply_unaryop_column(*op, &cv),
-            (FunctionDef::ToOrderKey(key), cv) => key.key(cv),
-            (FunctionDef::FromOrderKey(key), cv) => key.from_key(cv),
-            (FunctionDef::CompareByKey(op, key), ColumnValue::Records(mut fields)) => {
-                let left = key.key(fields.remove(&tuple_field(0)).expect("Not a tuple"));
-                let right = key.key(fields.remove(&tuple_field(1)).expect("Not a tuple"));
-                apply_binop_column(BinOpKind::Compare(*op), &left, &right)
-            }
             (FunctionDef::RecordField(f), ColumnValue::Records(mut fields)) => fields
                 .remove(f)
                 .unwrap_or_else(|| panic!("Missing field {f}")),
@@ -290,9 +232,6 @@ impl std::fmt::Display for FunctionDef {
             FunctionDef::Scalar(program) => write!(f, "Scalar({program})"),
             FunctionDef::RecordField(field) => write!(f, ".{field}"),
             FunctionDef::Insert => write!(f, "insert"),
-            FunctionDef::ToOrderKey(_) => write!(f, "order_key"),
-            FunctionDef::FromOrderKey(_) => write!(f, "from_order_key"),
-            FunctionDef::CompareByKey(op, _) => write!(f, "compare_by_key({op:?})"),
         }
     }
 }
@@ -390,22 +329,26 @@ impl PartialOrd for Value {
                     None
                 }
             }
-            // Order records lexicographically if they have the same schema.
+            // A tuple orders lexicographically by position, which is its type's order
+            // (`docs/chl-spec.md`, "Equality and order"). A record with named fields has no
+            // order in the language; it orders by its sorted field names here, an internal
+            // order for indexing that nothing a program observes reads.
             Value::Record(fields) => {
-                if let Value::Record(o_fields) = other {
-                    if fields.keys().collect::<std::collections::HashSet<_>>()
-                        != o_fields.keys().collect::<std::collections::HashSet<_>>()
-                    {
-                        return None; // Records with different keys are not comparable
-                    }
-                    let mut entries: Vec<_> = fields.iter().collect();
-                    let mut o_entries: Vec<_> = o_fields.iter().collect();
-                    entries.sort_by_key(|(k, _)| *k);
-                    o_entries.sort_by_key(|(k, _)| *k);
-                    entries.partial_cmp(&o_entries)
-                } else {
-                    None
+                let Value::Record(o_fields) = other else {
+                    return None;
+                };
+                if fields.len() != o_fields.len()
+                    || fields.keys().any(|k| !o_fields.contains_key(k))
+                {
+                    return None; // Records with different keys are not comparable
                 }
+                for k in fields_in_order(fields.keys()) {
+                    match fields[k].partial_cmp(&o_fields[k])? {
+                        Ordering::Equal => continue,
+                        unequal => return Some(unequal),
+                    }
+                }
+                Some(Ordering::Equal)
             }
             Value::Union { tag, inner } => {
                 if let Value::Union {
@@ -413,11 +356,19 @@ impl PartialOrd for Value {
                     inner: o_inner,
                 } = other
                 {
+                    // A declared nominal type's value compares its payload in the order its
+                    // declaration writes, which its tag names (`docs/chl-spec.md`, "Equality
+                    // and order"); any other sum's payload by its own order.
                     tag.partial_cmp(o_tag).and_then(|o| {
-                        if o.is_eq() {
-                            inner.partial_cmp(o_inner)
-                        } else {
-                            Some(o)
+                        if !o.is_eq() {
+                            return Some(o);
+                        }
+                        match tag {
+                            FieldKey::Name(label) if let Some(decl) = label.decl() => {
+                                crate::ccl::nominal::payload_order(decl, label.name())
+                                    .map(|order| order.compare(inner, o_inner))
+                            }
+                            _ => inner.partial_cmp(o_inner),
                         }
                     })
                 } else {

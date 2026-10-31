@@ -2266,9 +2266,11 @@ fn elim_lambda_impl(
         ctor @ (TypedExprNode::VariantCtor { .. } | TypedExprNode::NominalCtor { .. }) => {
             let (tag, payload) = match ctor {
                 TypedExprNode::VariantCtor { tag, payload } => (tag, payload),
-                TypedExprNode::NominalCtor { ctor, payload, .. } => {
-                    (crate::ccl::nominal::ctor_tag(&ctor), payload)
-                }
+                TypedExprNode::NominalCtor {
+                    decl,
+                    ctor,
+                    payload,
+                } => (decl.tag(&ctor), payload),
                 _ => unreachable!("matched as a constructor"),
             };
             // `variant_wrap` carries the tag itself, so there is nothing to resolve

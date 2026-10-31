@@ -1839,43 +1839,6 @@ fn a_mut_loop_over_a_product_domain_runs_in_pair_order(#[case] code: &str, #[cas
     check_scalar(code, Value::Int(expected));
 }
 
-/// A `mut` loop over a **concatenation** runs each part's positions in turn, inline and
-/// let-bound. `xs ++ ys` is keyed by a tagged union of its parts' positions, whose prefix
-/// takes every part before the bound's whole (`Predicate::at_or_below_in`).
-#[rstest]
-#[case::inline(
-    indoc! {r#"
-        acc := 0
-        for v in [1, 2] ++ [3]:
-            acc += v
-        acc
-    "#},
-    6
-)]
-#[case::let_bound(
-    indoc! {r#"
-        acc := 0
-        xs = [1, 2] ++ [3]
-        for v in xs:
-            acc += v
-        acc
-    "#},
-    6
-)]
-// Order-dependent, over three parts.
-#[case::in_part_order(
-    indoc! {r#"
-        acc := 0
-        for v in [1, 2] ++ [3] ++ [4, 5]:
-            acc := acc * 10 + v
-        acc
-    "#},
-    12345
-)]
-fn a_mut_loop_over_a_concatenation_runs_in_part_order(#[case] code: &str, #[case] expected: i64) {
-    check_scalar(code, Value::Int(expected));
-}
-
 /// A `Lambda` param may still bind a mutable variable — that is pass-by-reference, where
 /// the mutable variable genuinely crosses a function boundary. Pinned because `emit_let`
 /// now reads through an initializer that is a mutable variable, and widening that to argument

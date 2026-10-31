@@ -311,18 +311,6 @@ fn a_nested_loop_carries_any_write_law(#[case] program: &str, #[case] total: i64
     "#},
     90
 )]
-// A concatenation as the outer source, whose rows are keyed by a tagged union: the rows run
-// in part order, 10, 20, then 20, 40.
-#[case::concatenation_outer_source(
-    indoc! {r"
-        total := 0
-        for x in [1] ++ [2]:
-            for y in [10, 20]:
-                total := total * 100 + x * y
-        total
-    "},
-    10202040
-)]
 // A product as the inner source, whose positions are records.
 #[case::product_inner_source(
     indoc! {r"
@@ -338,22 +326,22 @@ fn a_nested_loop_composes_with_collections(#[case] program: &str, #[case] total:
     check_scalar(program, Value::Int(total));
 }
 
-/// A concatenation as the inner source. Answers 10202040 once it compiles.
+/// A concatenation as the inner source. Answers 90 once it compiles.
 ///
 /// The inner source is read once per outer row, so the `++` is read at a projected index
 /// beside the outer generator: a fed copairing, which op-conversion rejects by name. The
 /// program without a nest is `an_inline_union_generator_beside_a_second_generator` in
-/// `scalars_collections.rs`. A concatenation as the outer source runs
-/// ([`a_nested_loop_composes_with_collections`]).
+/// `scalars_collections.rs`. The nest only feeds: one that accumulates needs an order on the
+/// concatenation's positions, which they do not have (`ordered_loops.rs`).
 #[test]
 fn a_concatenation_as_the_inner_source_needs_a_fed_copairing() {
     check_compile_error(
         indoc! {r"
-            total := 0
+            out: Feed(_)
             for x in [1, 2]:
                 for y in [10] ++ [20]:
-                    total := total * 100 + x * y
-            total
+                    out << x * y
+            sum(out)
         "},
         "a fed copairing",
     );

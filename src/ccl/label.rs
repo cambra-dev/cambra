@@ -14,9 +14,12 @@ use std::fmt;
 ///
 /// - the labels the compiler builds for itself, such as the decision record's
 ///   `commit` and `writes`, which no source can name;
-/// - the tags of a nominal type's constructors, `Option`'s `some` and `none`
-///   among them ([`crate::ccl::nominal::ctor_tag`]). A nominal value's tags meet
-///   only its own type's constructors and patterns, which all build them there.
+/// - the tags of a compiler-provided nominal type's constructors, `Option`'s `some` and
+///   `none`, which the runtime builds too.
+///
+/// A declared nominal type's constructor tags belong to the declaration
+/// ([`Label::in_decl`]), so a value names the declaration it was built under, which is
+/// how it compares in that declaration's order at run time.
 ///
 /// A run's top-level mutable variable is labeled in its run instead
 /// ([`Label::in_run`]), and a shared import's in the shared import
@@ -26,10 +29,52 @@ use std::fmt;
 ///
 /// Labels order by spelling, then by module, so a record or variant written in
 /// one module keeps the order of its spellings.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// A constructor's tag carries its declaration ([`Label::in_decl`]), which is not part of the
+/// tag's identity: a nominal value meets only its own type's constructors and patterns, so its
+/// spelling and module already tell its tags apart. Equality, hashing and order leave it out,
+/// and a comparison of the value reads it ([`Label::decl`]).
+#[derive(Clone)]
 pub struct Label {
     name: SmolStr,
     space: Option<Space>,
+}
+
+impl Label {
+    /// The part of the label that is its identity: everything but a constructor's declaration.
+    fn identity(&self) -> (&SmolStr, Option<&Space>) {
+        let space = match &self.space {
+            Some(Space::Decl(_)) | None => None,
+            Some(space) => Some(space),
+        };
+        (&self.name, space)
+    }
+}
+
+impl PartialEq for Label {
+    fn eq(&self, other: &Self) -> bool {
+        self.identity() == other.identity()
+    }
+}
+
+impl Eq for Label {}
+
+impl std::hash::Hash for Label {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.identity().hash(state);
+    }
+}
+
+impl PartialOrd for Label {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Label {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.identity().cmp(&other.identity())
+    }
 }
 
 /// What a label belongs to, when not the root's namespace.
@@ -38,6 +83,7 @@ enum Space {
     Module(ModulePath),
     Run(RunPath),
     Import(std::sync::Arc<ImportSpace>),
+    Decl(crate::ccl::nominal::DeclId),
 }
 
 /// The shared import a label belongs to: its spelling, which is its identity, and
@@ -107,6 +153,26 @@ impl Label {
         }
     }
 
+    /// The tag of the constructor spelled `name` of the declaration `decl`
+    /// ([`crate::ccl::nominal::NominalDecl::tag`]).
+    pub fn in_decl(decl: crate::ccl::nominal::DeclId, name: impl Into<SmolStr>) -> Self {
+        let name = name.into();
+        debug_assert_spelling(&name);
+        Label {
+            name,
+            space: Some(Space::Decl(decl)),
+        }
+    }
+
+    /// The declaration whose constructor's tag the label is, or `None` for any other label
+    /// ([`Label::in_decl`]).
+    pub fn decl(&self) -> Option<crate::ccl::nominal::DeclId> {
+        match &self.space {
+            Some(Space::Decl(decl)) => Some(*decl),
+            _ => None,
+        }
+    }
+
     /// The label spelled `name` of a top-level mutable variable of the run at `run`
     /// ([`crate::ccl::Name::field_key`]).
     pub fn in_run(run: RunPath, name: impl Into<SmolStr>) -> Self {
@@ -169,7 +235,7 @@ impl Label {
     pub fn module(&self) -> Option<&ModulePath> {
         match &self.space {
             Some(Space::Module(module)) => Some(module),
-            Some(Space::Run(_) | Space::Import(_)) | None => None,
+            Some(Space::Run(_) | Space::Import(_) | Space::Decl(_)) | None => None,
         }
     }
 
@@ -178,7 +244,7 @@ impl Label {
     pub fn run(&self) -> Option<&RunPath> {
         match &self.space {
             Some(Space::Run(run)) => Some(run),
-            Some(Space::Module(_) | Space::Import(_)) | None => None,
+            Some(Space::Module(_) | Space::Import(_) | Space::Decl(_)) | None => None,
         }
     }
 
@@ -190,7 +256,7 @@ impl Label {
             Some(Space::Import(space)) => Some(space.shared.as_ref().unwrap_or_else(|| {
                 panic!("`{self}` was read back from a run-time key, which keeps no shared import")
             })),
-            Some(Space::Module(_) | Space::Run(_)) | None => None,
+            Some(Space::Module(_) | Space::Run(_) | Space::Decl(_)) | None => None,
         }
     }
 
@@ -199,9 +265,11 @@ impl Label {
     /// `@@shared::name` for a shared import's, since no module path or run path begins
     /// with `@`. A spelling holds no `::`, so no two labels
     /// share a key, and [`Label::from_runtime_key`] inverts it. A root label's key
-    /// is its spelling, shared rather than copied.
+    /// is its spelling, shared rather than copied. A constructor's tag keys by its spelling
+    /// too: a tag is never a store's or a record's key, which is what the key is for.
     pub fn runtime_key(&self) -> SmolStr {
         match &self.space {
+            Some(Space::Decl(_)) => self.name.clone(),
             Some(Space::Module(module)) => smol_str::format_smolstr!("{module}::{}", self.name),
             Some(Space::Run(run)) => smol_str::format_smolstr!("@{run}::{}", self.name),
             Some(Space::Import(space)) => {
@@ -231,7 +299,7 @@ impl fmt::Display for Label {
             Some(Space::Module(module)) => write!(f, "{module}::{}", self.name),
             Some(Space::Run(run)) => write!(f, "{run}::{}", self.name),
             Some(Space::Import(space)) => write!(f, "{}::{}", space.spelled, self.name),
-            None => f.write_str(&self.name),
+            Some(Space::Decl(_)) | None => f.write_str(&self.name),
         }
     }
 }
