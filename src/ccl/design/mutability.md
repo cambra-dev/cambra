@@ -1431,11 +1431,11 @@ The value-`Case` positions ride the same union-of-restricts:
   collection restricted by a constant-in-element gate, unioned. Which union depends on whether
   the site names a witness. Arms over **distinct** domains do — the `Case` is a Σ (see
   [type-inference.md §4.6](type-inference.md#46-data-vs-compute-functions))
-  — so the legs live over different index sets, the union is a `Copair` over the `Variant` of
-  those sets, and a `Realize` node asserts the sum back over it rather than rewriting every
-  mention of it. Arms over **one** domain 𝐷 name none: first-match keeps the legs' supports
-  disjoint, so the union is a `DisjointJoin` at `𝐷 ⤇ 𝑉`, and a coproduct domain there would be a
-  claim every consumer's 𝐷-shaped demand had to undo
+  — so the legs live over different index sets, and the union is a `Realized` node typed as the
+  sum, each leg the sum's body at one candidate, so no mention of it has to be rewritten. Arms
+  over **one** domain 𝐷 name none: first-match keeps the legs' supports disjoint, so the union is
+  a `DisjointJoin` at `𝐷 ⤇ 𝑉`, and a coproduct domain there would be a claim every consumer's
+  𝐷-shaped demand had to undo
   ([ir.md](ir.md), "`Copair` and `DisjointJoin` — two collection-combining operations, not one").
   `elif` chains flatten to one N-choice partition first. A conditional collection is consumed —
   aggregate, program result, or comprehension — by one rule: the sum pins the consumer's kind

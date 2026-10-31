@@ -765,10 +765,10 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             )
         }
 
-        TypedExprNode::Realize(_)
-        | TypedExprNode::LetRec { .. }
+        TypedExprNode::LetRec { .. }
         | TypedExprNode::Transact { .. }
-        | TypedExprNode::DisjointJoin(_) => unreachable!(
+        | TypedExprNode::DisjointJoin(_)
+        | TypedExprNode::Realized(_) => unreachable!(
             "anf: {} cannot appear before inference — it is introduced by a \
              post-inference pass (lambda_elim, mut_elim/transact_phase, or planning)",
             e.node.kind_name()

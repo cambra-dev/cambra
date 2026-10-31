@@ -344,13 +344,6 @@ after the restriction is planned. See
 [dependent refinements](type-inference.md#45-dependent-refinements-via-pi-types) and
 [optimization](optimization.md).
 
-`Realize(value)` has a different owner and obligation. Planning introduces it after inference
-when it realizes a conditional collection's dependent-sum type as a gated collection over a
-positional variant domain. The asserted type is the `Realize` node's own `ty`; the node has no
-target field. The gated collection and the sum are not related by the ordinary `Cast` rule.
-Operator conversion compiles `value` and drops the `Realize` wrapper. See
-[conditional planning](optimization.md) for the realization step.
-
 ### `Case` only — no `IfThenElse`
 
 `Case { scrutinee, branches }` represents `if`/`elif`/`else`, conditional expressions, and
@@ -388,9 +381,9 @@ The remaining nodes supply values or mark source structure for a later phase:
 | `Feed`, `Define`, `Defer` | Deferred-output write, definition, and placeholder; `channelize` resolves them. |
 | `Error` | Recovery placeholder accompanied by lowering errors; compilation stops before inference. |
 
-`Source` is specified under [source injection](#source-injection). `Realize`, `Transact`,
-`LetRec`, `LetType`, and `Aggregate` have their own sections because their typing or phase
-ownership needs more than a node description.
+`Source` is specified under [source injection](#source-injection). `Transact`, `LetRec`,
+`LetType`, and `Aggregate` have their own sections because their typing or phase ownership needs
+more than a node description.
 
 ### `Copair` and `DisjointJoin` — two collection-combining operations, not one
 
@@ -426,6 +419,21 @@ and fails in union-key lookup instead. The respective tests are
 `an_inline_union_generator_beside_a_second_generator` and
 `a_let_bound_union_generator_beside_a_second_generator` in
 `tests/it/compilation_pipeline/scalars_collections.rs`.
+
+### `Realized` — a conditional collection's gated legs
+
+`Realized(legs)` is a conditional collection after planning realizes it, typed as the sum
+`Σ (σ : 𝐾). σ ⤇ 𝑉` the conditional had. Each leg is the sum's body at one candidate, `𝑑 ⤇ 𝑉` for
+some `𝑑 ∈ 𝐾`, with its domain refined by the leg's first-match gate, and several legs may share a
+candidate. The check after planning holds the legs to that (`check_realized`); the gates'
+disjointness is assumed, and the flat merge checks it at run time. Operator conversion merges the
+legs under the key bound `extent_of` gives the sum (`UnionOperator::new_flat_over`), so the value
+is the leg holding rows, keyed by its own keys. It is standing: no input feeds it.
+
+It differs from a `DisjointJoin` in its typing and its runtime. A disjoint join's operands share
+one domain and are merged where an input splits them; a realized conditional's legs are over
+distinct candidates of a sum and are merged under the sum's bound. See
+[Compiling a conditional collection](collections.md#compiling-a-conditional-collection).
 
 ### The program's outputs are a trailing `Record`
 

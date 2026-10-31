@@ -267,39 +267,6 @@ pub enum TypedExprNode {
     /// targets.  Either generalize to the full `𝑈 ⇒ 𝑇` semantics or
     /// rename narrower (`Refine`, `AssertDomain`).  See
     /// `src/ccl/design/type-inference.md` for the migration plan.
-    /// Pure type-level assertion that `value` is the **executable realization** of a term
-    /// typed `target` — a re-view the type system cannot prove, and is not asked to.
-    ///
-    /// Distinct from [`Cast`](Self::Cast). A cast's type is derived from `value`'s: `emit_cast`
-    /// rebuilds `value`'s own function type with the target's domain refinements, so the
-    /// result keeps `value`'s domain shape. This asserts a type with a different domain shape,
-    /// an **isomorphism the rules cannot see**. Planning's realization of a conditional
-    /// collection is the case: a `Case`
-    /// typed `Σ (𝐷 : 𝐾). 𝐷 ⤇ 𝑉` becomes a gated union typed
-    /// `Variant({𝑖: {𝐷ᵢ | π̂ᵢ}}) ⤇ 𝑉`, and those are genuinely different types — the sum
-    /// picks one branch, the tagged union has rows from every leg. Only the gates make them
-    /// agree, and no typing rule can check a gate. `Cast`'s rebuild would type the gated
-    /// union at its own `Variant` domain, not at the sum.
-    ///
-    /// **Why it exists rather than rewriting the types above it.** Realization changes a
-    /// subterm's type, and every enclosing mention of that type would otherwise have to
-    /// follow — a chain that does not terminate, because the mentions are not all sums and
-    /// not all reachable by one rule. Asserting the *original* type here means nothing
-    /// above has to change at all.
-    ///
-    /// **What it does not cover.** A mention op-conversion *reads* — a comprehension's
-    /// binder domain, which becomes the iteration extent — needs the realized type for
-    /// real, not a re-view of the old one. This node is for mentions that are type-level
-    /// only.
-    ///
-    /// Born after the type system is done (planning), so nothing infers it, and it carries
-    /// **no target field**: the type it asserts is the node's own `ty`. A separate copy
-    /// would be a second thing to keep in sync, and planning normalizes predicates in
-    /// `ty` — a `Cast`'s `target` needs threading through exactly that walk, and this
-    /// sidesteps it by not having one. At runtime it is a no-op: op-conversion compiles
-    /// `value` and discards the wrapper.
-    Realize(Box<TypedExpr>),
-
     Cast {
         /// The value being re-viewed under `target`.
         value: Box<TypedExpr>,
@@ -858,6 +825,17 @@ pub enum TypedExprNode {
     /// co-iterate with the sibling `commit` field of its own record.
     DisjointJoin(Vec<TypedExpr>),
 
+    /// A conditional collection realized as the union of its gated legs, typed as the sum
+    /// `Σ (σ : 𝐾). σ ⤇ 𝑉` the conditional was. Each leg is the sum's body at one candidate
+    /// `𝑑 ∈ 𝐾`, its domain refined by its arm's first-match gate, so at most one leg holds rows
+    /// and the value is that leg, keyed by its own keys under the sum's bound
+    /// (`src/ccl/design/collections.md`, "Compiling a conditional collection").
+    ///
+    /// Born by planning's realization, after the type system, and standing: no input feeds it.
+    /// A [`DisjointJoin`](Self::DisjointJoin)'s operands share one domain; a realized
+    /// conditional's legs are over distinct candidates of the sum.
+    Realized(Vec<TypedExpr>),
+
     /// A plan expression, followed by another statement
     ExprStmt {
         expr: Box<TypedExpr>,
@@ -935,7 +913,6 @@ impl TypedExprNode {
             TypedExprNode::Apply { .. } => "Apply",
             TypedExprNode::Cast { .. } => "Cast",
             TypedExprNode::Comprehension { .. } => "Comprehension",
-            TypedExprNode::Realize(_) => "Realize",
             TypedExprNode::BinOp { .. } => "BinOp",
             TypedExprNode::UnaryOp { .. } => "UnaryOp",
             TypedExprNode::Lambda { .. } => "Lambda",
@@ -963,6 +940,7 @@ impl TypedExprNode {
             TypedExprNode::Compose(_) => "Compose",
             TypedExprNode::Copair(_) => "Copair",
             TypedExprNode::DisjointJoin(_) => "DisjointJoin",
+            TypedExprNode::Realized(_) => "Realized",
             TypedExprNode::ExprStmt { .. } => "ExprStmt",
             TypedExprNode::Feed { .. } => "Feed",
             TypedExprNode::Define { .. } => "Define",
@@ -1712,7 +1690,7 @@ impl TypedExpr {
                 f(function.as_ref());
                 f(argument.as_ref());
             }
-            TypedExprNode::Cast { value, .. } | TypedExprNode::Realize(value) => f(value.as_ref()),
+            TypedExprNode::Cast { value, .. } => f(value.as_ref()),
             TypedExprNode::BinOp { left, right, .. } => {
                 f(left.as_ref());
                 f(right.as_ref());
@@ -1737,7 +1715,8 @@ impl TypedExpr {
             | TypedExprNode::Tuple(elts)
             | TypedExprNode::Compose(elts)
             | TypedExprNode::Copair(elts)
-            | TypedExprNode::DisjointJoin(elts) => {
+            | TypedExprNode::DisjointJoin(elts)
+            | TypedExprNode::Realized(elts) => {
                 for e in elts {
                     f(e);
                 }
@@ -1922,7 +1901,7 @@ impl TypedExpr {
             }
             // Only `value` is an expression child; `target` is a type (its
             // refinement predicate is reached via type walks, not here).
-            TypedExprNode::Cast { value, .. } | TypedExprNode::Realize(value) => f(value.as_mut()),
+            TypedExprNode::Cast { value, .. } => f(value.as_mut()),
             TypedExprNode::BinOp { left, right, .. } => {
                 f(left.as_mut());
                 f(right.as_mut());
@@ -1947,7 +1926,8 @@ impl TypedExpr {
             | TypedExprNode::Tuple(elts)
             | TypedExprNode::Compose(elts)
             | TypedExprNode::Copair(elts)
-            | TypedExprNode::DisjointJoin(elts) => {
+            | TypedExprNode::DisjointJoin(elts)
+            | TypedExprNode::Realized(elts) => {
                 for e in elts {
                     f(e);
                 }
@@ -2063,7 +2043,6 @@ impl TypedExpr {
             | TypedExprNode::Error
             | TypedExprNode::Apply { .. }
             | TypedExprNode::Cast { .. }
-            | TypedExprNode::Realize(_)
             | TypedExprNode::BinOp { .. }
             | TypedExprNode::UnaryOp(..)
             | TypedExprNode::Aggregate { .. }
@@ -2077,6 +2056,7 @@ impl TypedExpr {
             | TypedExprNode::Compose(_)
             | TypedExprNode::Copair(_)
             | TypedExprNode::DisjointJoin(_)
+            | TypedExprNode::Realized(_)
             | TypedExprNode::ExprStmt { .. }
             | TypedExprNode::Begin { .. }
             | TypedExprNode::Feed { .. }
@@ -2127,7 +2107,6 @@ impl TypedExpr {
             | TypedExprNode::Error
             | TypedExprNode::Apply { .. }
             | TypedExprNode::Cast { .. }
-            | TypedExprNode::Realize(_)
             | TypedExprNode::BinOp { .. }
             | TypedExprNode::UnaryOp(..)
             | TypedExprNode::Aggregate { .. }
@@ -2141,6 +2120,7 @@ impl TypedExpr {
             | TypedExprNode::Compose(_)
             | TypedExprNode::Copair(_)
             | TypedExprNode::DisjointJoin(_)
+            | TypedExprNode::Realized(_)
             | TypedExprNode::ExprStmt { .. }
             | TypedExprNode::Begin { .. }
             | TypedExprNode::Feed { .. }

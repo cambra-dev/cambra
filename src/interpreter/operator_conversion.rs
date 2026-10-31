@@ -2255,6 +2255,12 @@ fn convert_impl_inner(
             )
         }
 
+        // **A realized conditional keeps the keys of the leg that holds its rows**, under the
+        // bound its sum declares: its legs are over the sum's candidates, at most one holds
+        // rows, and the value is that leg (`src/ccl/design/collections.md`, "Compiling a
+        // conditional collection").
+        TypedExprNode::Realized(legs) => realized(legs, expr, input, ctx),
+
         // `Apply(Tuple(ops), Builtin::Copair)` — the point-free
         // function-form, produced by lambda elimination when a
         // `Copair` appears inside a lambda body whose operands
@@ -2457,61 +2463,6 @@ fn convert_impl_inner(
         // specialized join chain — by op-conversion time the cast is
         // value-level inert.
         TypedExprNode::Cast { value, .. } => convert_impl(value, input, ctx),
-
-        // `realize` is likewise inert here, and for a sharper reason: its job was to let
-        // the *type* above it stay unchanged while the value below became the executable
-        // form. Op-conversion wants the executable form, so the wrapper is dropped and the
-        // value compiled — its own type, not the asserted one, is what extents read from.
-        // **A realized sum keeps the keys of the leg that holds its rows.** Realization builds
-        // a copairing of gated legs, one per arm, and asserts the sum back on top; the
-        // copairing's tags tell the legs apart, but at most one leg holds rows, so the value
-        // the sum denotes is that leg keyed by its own keys. Merging flat at the bound the
-        // sum's type declares is that, where a tagged merge would show every key wearing its
-        // leg's tag (`src/ccl/design/collections.md`, "Compiling a conditional collection").
-        TypedExprNode::Realize(value) => match &value.node {
-            // An opened sum, the function view `σ ⤇ V` a `Case` inside a predicate has after
-            // `lambda_elim`, carries no binder, so its kind is not here to bound the legs'
-            // keys, and converting the copairing as itself would key each row by its leg.
-            TypedExprNode::Copair(_)
-                if expr.ty.witness_kind().is_none() && expr.ty.is_witness_indexed() =>
-            {
-                unreachable!(
-                    "a realized copairing typed by an opened sum reached op-conversion, with no \
-                     witness kind to bound its legs' keys: {}",
-                    expr.ty
-                )
-            }
-            // Whether the sum survived or was erased to its one candidate's collection.
-            TypedExprNode::Copair(operands) => {
-                // A fed union merges one level above its input, where the arms split the
-                // input's rows. A realized leg is a whole collection per row, so that merge
-                // would put each leg's keys at the wrong level. No program feeds one: a
-                // realized conditional stands where its witness is bound, outside any row.
-                if input.is_some() {
-                    return Err(ConversionError::Unsupported(
-                        "a fed realized conditional: its legs are whole collections per row, \
-                         and the fed union merges rows the arms split"
-                            .to_string(),
-                    ));
-                }
-                let Extent::Function { domain, codomain } = ctx.extent_of(&expr.ty)? else {
-                    unreachable!(
-                        "a realized collection converts to a function extent: {}",
-                        expr.ty
-                    )
-                };
-                union_operand_ops(
-                    operands,
-                    UnionShape::DisjointJoin {
-                        over: Some(*domain),
-                    },
-                    *codomain,
-                    input,
-                    ctx,
-                )
-            }
-            _ => convert_impl(value, input, ctx),
-        },
 
         // If we are applying an aggregate, then it is a global aggregate that should use the Aggregate operator.
         TypedExprNode::Apply { argument, function }
@@ -5916,6 +5867,47 @@ fn map_order_key(
         )),
         level,
     ))
+}
+
+/// A realized conditional: its legs, merged at the bound the sum it is typed as declares
+/// ([`UnionOperator::new_flat_over`]).
+fn realized(
+    operands: &[Expr],
+    expr: &Expr,
+    input: Option<Box<dyn TileOperator>>,
+    ctx: &mut OpConversionContext,
+) -> Result<Box<dyn TileOperator>, ConversionError> {
+    // An opened sum, the function view `σ ⤇ V` a `Case` inside a predicate has after
+    // `lambda_elim`, carries no binder, so no kind is here to bound the legs' keys.
+    assert!(
+        expr.ty.witness_kind().is_some(),
+        "a realized conditional typed by an opened sum reached op-conversion, with no witness \
+         kind to bound its legs' keys: {}",
+        expr.ty
+    );
+    // A fed union merges one level above its input, where the arms split the input's rows. A
+    // realized leg is a whole collection per row, so that merge would put each leg's keys at
+    // the wrong level. No program feeds one: a realized conditional stands where its witness
+    // is bound, outside any row.
+    if input.is_some() {
+        return Err(ConversionError::Unsupported(
+            "a fed realized conditional: its legs are whole collections per row, and the fed \
+             union merges rows the arms split"
+                .to_string(),
+        ));
+    }
+    let Extent::Function { domain, codomain } = ctx.extent_of(&expr.ty)? else {
+        unreachable!("a sum converts to a function extent: {}", expr.ty)
+    };
+    union_operand_ops(
+        operands,
+        UnionShape::DisjointJoin {
+            over: Some(*domain),
+        },
+        *codomain,
+        None,
+        ctx,
+    )
 }
 
 /// Which of the two collection-combining operations a union node denotes.

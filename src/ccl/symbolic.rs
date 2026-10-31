@@ -445,13 +445,6 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         // information and bloats nested-cast dumps quadratically.  Before
         // inference, `expr.ty` is still a `Hole`/`Infer` placeholder and
         // `target` is the only place the type is visible, so render it inline.
-        // `Realize` renders as `realize(value)`: born after inference, so its target is
-        // always `expr.ty` and inlining it would duplicate what callers already suffix.
-        TypedExprNode::Realize(value) => (
-            Precedence::Atom,
-            format!("realize({})", fmt(value, Precedence::Lowest, opts)),
-        ),
-
         TypedExprNode::Cast { value, target } => {
             let rendered_arg = fmt(value, Precedence::Lowest, opts);
             let text = match &expr.ty {
@@ -688,6 +681,18 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         // `⊔` is the join in the partial-function order: the operands are partial maps over one
         // domain, merged where their domains are disjoint. `Copair` copairs operands over
         // distinct domains into their coproduct and renders `⊎`.
+        // A realized conditional renders as the join of its legs under `realized`, so it reads
+        // apart from a fan-out's `⊔`.
+        TypedExprNode::Realized(legs) => (
+            Precedence::Atom,
+            format!(
+                "realized({})",
+                legs.iter()
+                    .map(|l| fmt(l, Precedence::Lowest, opts))
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            ),
+        ),
         TypedExprNode::DisjointJoin(operands) => {
             fmt_nary(operands, Precedence::And, "⊔", "DisjointJoin", opts)
         }

@@ -231,7 +231,9 @@ pub(super) fn insert_iterate_recurse(
         // [`FunKind`](crate::ccl::ty::FunKind) is exactly that distinction, so ask
         // it: a `Data` domain is one the runtime sweeps, which is what an
         // iteration site is.
-        TypedExprNode::Copair(operands) | TypedExprNode::DisjointJoin(operands)
+        TypedExprNode::Copair(operands)
+        | TypedExprNode::DisjointJoin(operands)
+        | TypedExprNode::Realized(operands)
             if is_collection =>
         {
             for operand in operands.iter_mut() {
@@ -513,8 +515,8 @@ pub(super) fn wrap_with_iterate(
         // **A realized sum owes nothing here.** Realization materializes the witness, and
         // with it discharges the restriction the site placed on that witness — as a gate
         // per leg, reading that leg's own arm (`planning::conditionals`). So a site sitting
-        // over a `Realize` is already both iterated and filtered, and the `{𝑤 | 𝑝}` its type
-        // still shows is the *pre*-realization view `Realize` deliberately asserts.
+        // over a realized conditional is already both iterated and filtered, and the `{𝑤 | 𝑝}`
+        // its type still shows is the sum it is typed as.
         //
         // Emitting a chain here would restrict a second time, over a witness with no
         // extent.
@@ -796,6 +798,7 @@ pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
         TypedExprNode::DisjointJoin(legs) if legs.iter().all(is_filter_values_led) => false,
         TypedExprNode::Copair(_)
         | TypedExprNode::DisjointJoin(_)
+        | TypedExprNode::Realized(_)
         | TypedExprNode::Tuple(_)
         | TypedExprNode::Record(_) => true,
         TypedExprNode::Var(_)
@@ -809,8 +812,6 @@ pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
         {
             true
         }
-        // A realization is the union it holds, gated legs and all.
-        TypedExprNode::Realize(value) => is_iteration_bearing(value),
         // `unbox(𝑐)` is `𝑐`'s value over the domain its witness names, keys and all, so it
         // iterates exactly when `𝑐` does: an `iterate` over its projected domain would
         // enumerate the witness's whole bound (`src/ccl/design/collections.md`, "A projection

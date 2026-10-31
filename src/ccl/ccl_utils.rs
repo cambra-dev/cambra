@@ -3208,23 +3208,16 @@ mod tests {
         assert_ne!(filtered_sum(1), filtered_sum(2));
     }
 
-    /// A realized conditional over two collections: a term op-conversion can only compile by
-    /// iterating it.
+    /// A union of two collections: a term op-conversion can only compile by iterating it.
     #[cfg(debug_assertions)]
-    fn realized_union() -> Expr {
+    fn a_union() -> Expr {
         let arm = |n| {
             Expr::new(TypedExprNode::Var(Name::from("xs"))).with_ty(Type::data_fun(
                 Type::UIntRange(n),
                 Type::Base(BaseType::Int),
             ))
         };
-        Expr::new(TypedExprNode::Realize(Box::new(
-            Expr::new(TypedExprNode::Copair(vec![arm(2), arm(3)])).with_ty(Type::data_fun(
-                Type::UIntRange(2),
-                Type::Base(BaseType::Int),
-            )),
-        )))
-        .with_ty(Type::data_fun(
+        Expr::new(TypedExprNode::Copair(vec![arm(2), arm(3)])).with_ty(Type::data_fun(
             Type::UIntRange(2),
             Type::Base(BaseType::Int),
         ))
@@ -3235,10 +3228,7 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn a_predicate_may_state_a_term_needing_iteration() {
-        let ty = Type::refined_one(
-            Type::UIntRange(2),
-            Refinement::born(Rc::new(realized_union())),
-        );
+        let ty = Type::refined_one(Type::UIntRange(2), Refinement::born(Rc::new(a_union())));
         debug_assert_no_iteration_markers_in_type(&ty);
     }
 
