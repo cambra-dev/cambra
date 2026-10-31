@@ -10,6 +10,7 @@ use cambra::ccl::FieldKey;
 use cambra::interpreter::Value;
 
 use super::helpers::{check_compile_error, check_scalar, make_record, make_tuple};
+use super::modules::{compile_errors, program, report_count};
 
 /// A `Value::Union` at the constructor `tag` carrying `inner`.
 fn ctor(tag: &str, inner: Value) -> Value {
@@ -1571,7 +1572,8 @@ fn method_errors_name_what_is_wrong() {
 
                 total(Price::new(1))
             "#},
-            "nothing before the call determines that type; annotate the receiver",
+            "nothing but the uses of a definition polymorphic over that type determines it; \
+             annotate the receiver",
         ),
         (
             indoc! {r#"
@@ -1847,10 +1849,10 @@ fn an_impl_blocks_functions_reach_each_other() {
     );
 }
 
-/// What states a receiver's type before its call, which is what resolves the call
+/// What states a receiver's type before its call, which resolves the call where it stands
 /// (`src/ccl/design/nominal-types.md`, "Method calls"): the receiver's own expression, a
 /// binding's definition, a parameter's annotation, a function's declared result, a
-/// comprehension's source, and an earlier call of the chain. A use after the call does not.
+/// comprehension's source, and an earlier call of the chain.
 #[test]
 fn what_states_a_receivers_type_before_its_call() {
     check_scalar(
@@ -1876,6 +1878,357 @@ fn what_states_a_receivers_type_before_its_call() {
         "#},
         Value::Int(6132),
     );
+}
+
+/// A call whose receiver's type nothing before it states waits for it: a lambda's parameter
+/// typed by the call it is passed to, a parameter a later statement of its definition passes
+/// where a nominal type is declared, from the call's own statement or from one a `let` binds,
+/// and a monomorphic binding's lambda typed by a later definition's call
+/// (`src/ccl/design/nominal-types.md`, "Method calls").
+#[test]
+fn a_method_call_waits_for_its_receivers_type() {
+    check_scalar(
+        indoc! {r#"
+            type Price = Int
+
+            impl Price:
+                def cents(self) => Int:
+                    self.extract()
+
+            def apply_to(f: Price => Int, x: Price) => Int:
+                f(x)
+
+            def takes(p: Price) => Int:
+                p.extract()
+
+            def twice(p) => Int:
+                p.cents() + takes(p)
+
+            def held(p) => Int:
+                c = p.cents()
+                c + takes(p)
+
+            def id(x):
+                x
+
+            f = id(\p -> p.cents())
+
+            def later(u) => Int:
+                f(Price::new(100))
+
+            apply_to(\p -> p.cents(), Price::new(1)) + twice(Price::new(10)) + held(Price::new(1000)) + later(0)
+        "#},
+        Value::Int(2121),
+    );
+}
+
+/// A waiting call instantiates the method its receiver's type selects as a call where it
+/// stands would: the method's own type parameters at the call's types, and its requirements
+/// at those.
+#[test]
+fn a_waiting_call_instantiates_the_selected_method() {
+    check_scalar(
+        indoc! {r#"
+            type Price = Int
+
+            def Price::larger(T, self, a: T, b: T) => T requires Orderable(T, T):
+                a if a > b else b
+
+            def apply_to(f: Price => Int, x: Price) => Int:
+                f(x)
+
+            def takes(p: Price) => Int:
+                p.extract()
+
+            def pick(p) => Int:
+                p.larger(3, 9) + takes(p)
+
+            apply_to(\p -> p.larger(30, 20), Price::new(1)) + pick(Price::new(1))
+        "#},
+        Value::Int(40),
+    );
+    check_compile_error(
+        indoc! {r#"
+            type Price = Int
+
+            def Price::larger(T, self, a: T, b: T) => T requires Orderable(T, T):
+                a if a > b else b
+
+            def apply_to(f: Price => Int, x: Price) => Int:
+                f(x)
+
+            apply_to(\p -> p.larger(\x -> x, \y -> y), Price::new(1))
+        "#},
+        "No Orderable instance",
+    );
+}
+
+/// A call whose receiver's type is unknown where it stands reaches a function of the block
+/// it stands in that the block declares after it.
+#[test]
+fn a_waiting_call_reaches_a_later_function_of_its_block() {
+    check_scalar(
+        indoc! {r#"
+            type Price = Int
+
+            def apply_to(f: Price => Int, x: Price) => Int:
+                f(x)
+
+            impl Price:
+                def doubled(self) => Int:
+                    apply_to(\p -> p.seven(), self) * 2
+                def seven(self) => Int:
+                    7
+
+            Price::new(21).doubled()
+        "#},
+        Value::Int(14),
+    );
+}
+
+/// A waiting call emits only the function of its block that its receiver's type selects. In
+/// each program the receiver is a `B`, so the call reaches neither `A::y`, which calls the
+/// function the call stands in, nor `A::m`, which is that function.
+#[test]
+fn a_waiting_call_emits_only_the_function_it_selects() {
+    for src in [
+        indoc! {r#"
+            type A = Int
+            type B = Int
+
+            def apply_b(f: B => Int, x: B) => Int:
+                f(x)
+
+            def B::y(self) => Int:
+                2
+
+            impl A:
+                def x(self) => Int:
+                    apply_b(\p -> p.y(), B::new(1))
+                def y(self) => Int:
+                    self.x()
+
+            A::new(1).x()
+        "#},
+        indoc! {r#"
+            type A = Int
+            type B = Int
+
+            def apply_b(f: B => Int, x: B) => Int:
+                f(x)
+
+            def B::m(self) => Int:
+                2
+
+            impl A:
+                def m(self) => Int:
+                    apply_b(\p -> p.m(), B::new(1))
+
+            A::new(1).m()
+        "#},
+    ] {
+        check_scalar(src, Value::Int(2));
+    }
+}
+
+/// A waiting call whose receiver's type the scheme of the definition it stands in does not
+/// quantify waits with the enclosing definition's calls: here `p` is `outer`'s parameter,
+/// which `inner`'s type does not mention, so `takes(p)` after `inner`'s use selects the
+/// method, whether the call reads `p` itself or a lambda's parameter `p` is passed to.
+#[test]
+fn a_waiting_call_leaves_a_definition_not_polymorphic_over_its_receiver() {
+    for src in [
+        indoc! {r#"
+            type Price = Int
+
+            def Price::cents(self) => Int:
+                self.extract()
+
+            def takes(p: Price) => Int:
+                p.extract()
+
+            def outer(p) => Int:
+                def inner(u) => Int:
+                    p.cents()
+                inner(0) + takes(p)
+
+            outer(Price::new(5))
+        "#},
+        indoc! {r#"
+            type Price = Int
+
+            def Price::cents(self) => Int:
+                self.extract()
+
+            def takes(p: Price) => Int:
+                p.extract()
+
+            def outer(p) => Int:
+                def inner(u):
+                    p.cents()
+                inner(0) + takes(p)
+
+            outer(Price::new(5))
+        "#},
+        indoc! {r#"
+            type Price = Int
+
+            def Price::cents(self) => Int:
+                self.extract()
+
+            def takes(p: Price) => Int:
+                p.extract()
+
+            def apply(f, x):
+                f(x)
+
+            def outer(p) => Int:
+                def inner(u):
+                    apply(\q -> q.cents(), p)
+                inner(0) + takes(p)
+
+            outer(Price::new(5))
+        "#},
+    ] {
+        check_scalar(src, Value::Int(10));
+    }
+}
+
+/// A call whose receiver's type arrives after it reports what it would have reported had the
+/// type been known where it stands.
+#[test]
+fn a_waiting_call_reports_what_its_receivers_type_lacks() {
+    for (src, needle) in [
+        (
+            indoc! {r#"
+                type Price = Int
+
+                def Price::cents(self) => Int:
+                    self.extract()
+
+                def apply_to(f, x):
+                    f(x)
+
+                apply_to(\p -> p.cents(), 3)
+            "#},
+            "is not a nominal type, so it has no methods",
+        ),
+        (
+            indoc! {r#"
+                type Price = Int
+                type Cost = Int
+
+                def Price::cents(self) => Int:
+                    self.extract()
+
+                def apply_to(f, x):
+                    f(x)
+
+                apply_to(\p -> p.cents(), Cost::new(1))
+            "#},
+            "`Cost` has no method `cents`",
+        ),
+        (
+            indoc! {r#"
+                type Price = Int
+
+                def Price::cents(self) => Int:
+                    self.extract()
+
+                def apply_to(f, x):
+                    f(x)
+
+                apply_to(\p -> p.cents(1), Price::new(1))
+            "#},
+            "`Price::cents` takes 0 arguments after `self`, got 1",
+        ),
+        (
+            indoc! {r#"
+                type A = Int
+
+                def apply_to(f, x):
+                    f(x)
+
+                r = apply_to(\p -> p.m(), A::new(1))
+
+                def A::m(self) => Int:
+                    1
+
+                r
+            "#},
+            "Unbound variable: 'A::m'",
+        ),
+    ] {
+        check_compile_error(src, needle);
+    }
+}
+
+/// A waiting call's obligation is of a trait of the method's own, which no assumption of a
+/// declared trait answers, whatever its name: `Cents(T)` is assumed here, and `T`, the type
+/// reaching the receiver of `.Cents()`, still has no methods.
+#[test]
+fn a_method_named_as_a_trait_is_no_requirement_of_it() {
+    check_compile_error(
+        indoc! {r#"
+            type Price = Int
+            type Box = Int
+
+            def Price::Cents(self) => Int:
+                self.extract()
+
+            trait Cents(T):
+                def get(x: T) => Int
+
+            instance Cents(Box):
+                def get(x: Box) => Int:
+                    x.extract()
+
+            def apply_to(f, x):
+                f(x)
+
+            def f(T, x: T) => Int requires Cents(T):
+                apply_to(\p -> p.Cents(), x)
+
+            f(Box::new(7))
+        "#},
+        "`T` is not a nominal type, so it has no methods",
+    );
+}
+
+/// A rule that fails drops the calls it selected a function of its block for, which report
+/// nothing, as a failed statement's waiting calls do: `"s"` fails the application, and `y`'s
+/// `String` result is not checked against the lambda's.
+#[test]
+fn a_failed_rule_reports_nothing_of_the_methods_it_selected() {
+    let errors = compile_errors(&program(
+        indoc! {r#"
+            type A = Int
+
+            def apply_a(f: A => Int, x: A) => Int:
+                f(x)
+
+            impl A:
+                def x(self) => Int:
+                    apply_a(\p -> p.y(), "s")
+                def y(self) => String:
+                    "t"
+
+            A::new(1).x()
+        "#},
+        &[],
+    ));
+    assert_eq!(report_count(&errors), 1, "{errors}");
+    assert!(errors.contains("expected A, found String"), "{errors}");
+}
+
+/// A generalized definition's method call that nothing in the definition resolves, on a
+/// receiver whose type the definition is polymorphic over, is an error: each use instantiating
+/// its own would make the definition polymorphic over every type declaring the method, which a
+/// trait states instead (`docs/chl-spec.md`, "Associated functions and methods"). `inner`
+/// passes its call to `outer`, which is polymorphic over `p`. A call nothing in the program
+/// resolves is an error at the program's end.
+#[test]
+fn a_generalized_definition_resolves_its_own_method_calls() {
     for src in [
         indoc! {r#"
             type Price = Int
@@ -1897,8 +2250,36 @@ fn what_states_a_receivers_type_before_its_call() {
 
             g(Price::new(1))
         "#},
+        indoc! {r#"
+            type Price = Int
+
+            def Price::cents(self) => Int:
+                self.extract()
+
+            def outer(p) => Int:
+                def inner(u) => Int:
+                    p.cents()
+                inner(0)
+
+            outer(Price::new(1))
+        "#},
+        indoc! {r#"
+            type Price = Int
+
+            def Price::cents(self) => Int:
+                self.extract()
+
+            def id(x):
+                x
+
+            f = id(\p -> p.cents())
+            1
+        "#},
     ] {
-        check_compile_error(src, "nothing before the call determines that type");
+        check_compile_error(
+            src,
+            "nothing but the uses of a definition polymorphic over that type determines it",
+        );
     }
 }
 

@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::infer::solver::barrier::EdgeReport;
-use crate::ccl::infer::solver::display::poly_for_display;
+use crate::ccl::infer::solver::display::{poly_for_display, scheme_obligations};
 use crate::ccl::infer::solver::smt::{NoScope, ScopeEnv};
 use crate::ccl::infer::solver::{
     ConstrainCache, PolyScheme, constrain_subtype_in, fun, type_level,
@@ -28,9 +28,11 @@ use crate::util::ScopeStack;
 use super::emit::emit_node;
 use super::schemes::OperatorSchemes;
 use super::solve::value_type;
-use super::typing::{LetScheme, Typing};
+use super::typing::{LetScheme, MethodCallsEnd, Typing};
 use super::{coalesce_for_error, map_constrain_err};
-use crate::ccl::infer::solver::traits::{Assoc, InstanceTable, Trait, TraitObligation};
+use crate::ccl::infer::solver::traits::{
+    Assoc, InstanceTable, MethodCall, MethodRow, Trait, TraitObligation,
+};
 use crate::ccl::ty::{KindPin, TraitRequirement};
 
 /// A lexical-scope entry: the binder's polymorphic scheme.
@@ -267,6 +269,14 @@ pub(super) struct InferCtx {
     /// place as well, with that place ([`Self::require_feed`]). A coalesce error naming the
     /// variable names the place ([`Self::name_other_feed_places`]).
     fed_elsewhere: HashMap<Name, NodeId>,
+    /// The method calls emission has deferred until their receivers' types are known, by
+    /// the statement that encloses each, innermost last; the first holds the program's own
+    /// (`src/ccl/design/nominal-types.md`, "Method calls").
+    pub(super) method_calls: Vec<Vec<DeferredMethod>>,
+    /// The method calls whose receivers' types selected a function of a block not emitted
+    /// yet, which emission emits and instantiates
+    /// ([`instantiate_selected_methods`](super::emit::instantiate_selected_methods)).
+    pub(super) selected_methods: Rc<RefCell<Vec<Rc<TraitObligation>>>>,
 }
 
 /// A loop variable's source, as a feed crossing the variable reads it at the channel's key.
@@ -279,6 +289,29 @@ struct LoopSource {
     position: Type,
     /// The type of the variable, one of the source's values.
     item: Type,
+}
+
+/// A method call deferred until its receiver's type is known.
+pub(super) struct DeferredMethod {
+    /// The call's obligation, which selects the method once that type arrives.
+    pub(super) obligation: Rc<TraitObligation>,
+    /// The call's `Method` placeholder, which an unresolved call is blamed on.
+    pub(super) node: NodeId,
+}
+
+impl DeferredMethod {
+    /// The error for a call whose receiver's type never arrived.
+    pub(super) fn unresolved(&self) -> LocatedInferError {
+        LocatedInferError {
+            error: InferError::UnresolvedMethod {
+                method: self.obligation.trait_.name().to_string(),
+                receiver: None,
+            },
+            node_id: self.node,
+            also: Box::default(),
+            related: crate::ccl::infer::RelatedPositions::default(),
+        }
+    }
 }
 
 /// A [`DefGroup`](crate::ccl::TypedExprNode::DefGroup) under emission: what its members are
@@ -429,6 +462,8 @@ impl InferCtx {
             groups: Vec::new(),
             trait_calls: HashMap::new(),
             recoveries: 0,
+            method_calls: vec![Vec::new()],
+            selected_methods: Rc::default(),
         }
     }
 
@@ -634,6 +669,82 @@ impl InferCtx {
     ) -> Result<Vec<Type>, LocatedInferError> {
         self.require_trait_obligation(trait_, operator_node_id, operand_types, assoc, None, at)
             .map(|(settled, _)| settled)
+    }
+
+    /// Pass the method calls of a statement, still waiting, to the statement enclosing it.
+    fn pass_method_calls(&mut self, calls: Vec<DeferredMethod>) {
+        self.method_calls
+            .last_mut()
+            .expect("the program's own method calls are collected throughout")
+            .extend(
+                calls
+                    .into_iter()
+                    .filter(|call| call.obligation.selected_instance().is_none()),
+            );
+    }
+
+    /// Place the obligation of the method call `name` on its receiver's type `receiver`,
+    /// with a candidate for each of `rows`, and record it with the statement being emitted
+    /// (`src/ccl/design/nominal-types.md`, "Method calls"). The selected method's type flows
+    /// into `function`, the type of the call's placeholder, `node`.
+    pub(super) fn require_method(
+        &mut self,
+        name: &str,
+        rows: Vec<MethodRow>,
+        function: &Type,
+        receiver: &Type,
+        node: NodeId,
+    ) -> Result<Rc<TraitObligation>, LocatedInferError> {
+        let call = MethodCall {
+            at: RefCell::new((self.level, self.telescope.clone())),
+            rows,
+            node,
+            selected: Rc::clone(&self.selected_methods),
+        };
+        let obligation = TraitObligation::new_method(
+            &self.instances,
+            name,
+            call,
+            function.clone(),
+            node,
+            self.demand_at.unwrap_or(Origin::Node(node)),
+        );
+        // The selected method's requirements are answered by the instances and by the
+        // assumptions in scope here, as a call of it where it stands would be.
+        obligation.assume(&self.assumptions);
+        let position = self.fresh();
+        obligation.watch(&position, 0);
+        self.method_calls
+            .last_mut()
+            .expect("the program's own method calls are collected throughout")
+            .push(DeferredMethod {
+                obligation: Rc::clone(&obligation),
+                node,
+            });
+        // The receiver's type reaches the obligation from below, as an operand's does, and a
+        // nominal type bounding it from above reaches it too (`traits::notify_upper`).
+        self.require_sub(receiver, &position, &|| {
+            format!("the receiver of `.{name}(…)`")
+        })?;
+        Ok(obligation)
+    }
+
+    /// Instantiate `scheme`, the method the method call `call` selected, where the call
+    /// stands ([`TraitObligation::instantiate_method`]).
+    pub(super) fn instantiate_method(
+        &mut self,
+        call: &TraitObligation,
+        scheme: &PolyScheme,
+    ) -> Result<(), LocatedInferError> {
+        let at = || format!("the method `.{}(…)`", call.trait_.name());
+        self.cache.at(self.here(), self.demand_at.or(self.here()));
+        let result = call.instantiate_method(scheme, &mut self.cache);
+        self.cache.report_recorded(|| EdgeReport::Labeled(at()));
+        result.map_err(|e| {
+            let failure = self.cache.take_failure();
+            self.raise(map_constrain_err(e, &at()))
+                .with_failure(failure)
+        })
     }
 
     /// [`require_trait_associating`](Self::require_trait_associating), with the refinement
@@ -1522,6 +1633,71 @@ impl TelescopeWalk for InferCtx {
 }
 
 impl Typing for InferCtx {
+    fn defer_method(
+        &mut self,
+        function: &mut Expr,
+        receiver: &Type,
+    ) -> Result<(), LocatedInferError> {
+        super::emit::defer_method(function, receiver, self)
+    }
+
+    fn open_method_calls(&mut self) {
+        self.method_calls.push(Vec::new());
+    }
+
+    fn close_method_calls(&mut self, end: MethodCallsEnd) -> Vec<LocatedInferError> {
+        let calls = self
+            .method_calls
+            .pop()
+            .expect("a definition closes the method calls it opened");
+        let ty = match end {
+            MethodCallsEnd::Failed => return Vec::new(),
+            MethodCallsEnd::Monomorphic => {
+                self.pass_method_calls(calls);
+                return Vec::new();
+            }
+            MethodCallsEnd::Generalized(ty) => ty,
+        };
+        // A selected call's method is instantiated before the definition is generalized.
+        let mut errors: Vec<_> = super::emit::instantiate_selected_methods(self)
+            .err()
+            .into_iter()
+            .collect();
+        // A call the scheme carries would be selected by each use on its own, which is
+        // polymorphism over every type declaring the method. One it does not carry waits with
+        // the enclosing definition's calls. Its method's type then flows into a variable of
+        // the enclosing level below the call's function variable, which no use copies, so
+        // every use's copy of the definition receives it.
+        let carried: HashSet<_> = scheme_obligations(&ty, self.level)
+            .iter()
+            .map(|o| o.uid)
+            .collect();
+        let mut passed = Vec::new();
+        for call in calls {
+            if call.obligation.selected_instance().is_some() {
+                continue;
+            }
+            if carried.contains(&call.obligation.uid) {
+                errors.push(call.unresolved());
+                continue;
+            }
+            let function = self.fresh();
+            let below = self.require_sub(&function, &call.obligation.method_function(), &|| {
+                format!("the method `.{}(…)`", call.obligation.trait_.name())
+            });
+            match below {
+                Ok(()) => {
+                    call.obligation
+                        .pass_method_call(self.level, self.telescope.clone(), function);
+                    passed.push(call);
+                }
+                Err(error) => errors.push(error),
+            }
+        }
+        self.pass_method_calls(passed);
+        errors
+    }
+
     fn bind_instance_function_called(&mut self, function: NodeId) -> Result<(), LocatedInferError> {
         let Some((obligation, name, operands)) = self.trait_calls.get(&function).cloned() else {
             return Ok(());

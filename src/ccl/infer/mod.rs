@@ -351,6 +351,13 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             target: None,
             at: ctx_label.to_string(),
         },
+        // A method called on a value of a type parameter's type, which has no methods.
+        ConstrainError::MissingRequirement { trait_, param, .. } if trait_.is_method() => {
+            InferError::UnresolvedMethod {
+                method: trait_.name().to_string(),
+                receiver: Some(Type::Param(param)),
+            }
+        }
         ConstrainError::MissingRequirement {
             trait_,
             position,
@@ -361,6 +368,15 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             param: param.spelling.to_string(),
             at: ctx_label.to_string(),
         },
+        // What a method's receiver turned out to be: a type with no method of the name, or
+        // one that is not nominal.
+        ConstrainError::NoTraitInstance { trait_, found, .. } if trait_.is_method() => {
+            InferError::UnresolvedMethod {
+                method: trait_.name().to_string(),
+                receiver: Some(found),
+            }
+        }
+        ConstrainError::MethodUnreachable(error) => *error,
         ConstrainError::NoTraitInstance {
             trait_,
             position,
@@ -643,6 +659,20 @@ pub(crate) fn run_with_params(
     // anything in the program.
     let emitted = emit_node(expr, &mut sub_ctx);
     let mut errors = std::mem::take(&mut sub_ctx.errors);
+    // A method call the program's own statements deferred, and nothing after it resolved
+    // (`src/ccl/design/nominal-types.md`, "Method calls"). A walk an error ended leaves
+    // the calls of the statements it was inside, which report nothing.
+    if emitted.is_ok() {
+        let [calls] = std::mem::take(&mut sub_ctx.method_calls)
+            .try_into()
+            .unwrap_or_else(|_| panic!("every definition closes the method calls it opens"));
+        errors.extend(
+            calls
+                .iter()
+                .filter(|call| call.obligation.selected_instance().is_none())
+                .map(|call| call.unresolved()),
+        );
+    }
     if let Err(e) = emitted {
         errors.push(e);
     }
