@@ -2002,6 +2002,24 @@ pub(super) fn declare_type_params(
                 format!("type parameter `{name}` is declared twice"),
             ));
         }
+        // A family parameter is written applied, `V(k)`, and names no type alone
+        // (`docs/chl-spec.md`, "Family parameters").
+        if let Some(domains) = nominal::family_kind(tp)? {
+            let domains = domains
+                .into_iter()
+                .map(|d| lower_type_expr(d, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            let param = crate::ccl::ty::TypeParam::declared_family(name, domains.len());
+            ctx.family_params
+                .push((tp.name.clone(), Rc::clone(&param), domains));
+            ctx.type_params_in_scope.push(name.to_string());
+            declared.push(crate::ccl::ty::PolyParam {
+                param,
+                kind: crate::ccl::ty::TypeKind::Type,
+                bound_at: None,
+            });
+            continue;
+        }
         let kind = lower_kind(tp, &type_params[i..], ctx)?;
         let param = crate::ccl::ty::TypeParam::declared(name);
         ctx.declare_type_throughout(name, AliasType::Type(Type::Param(Rc::clone(&param))));
@@ -3105,7 +3123,7 @@ pub(super) fn lower_type_expr_or_poly(
                     body,
                 })))
             });
-            ctx.type_params_in_scope.truncate(scoped);
+            ctx.end_type_params(scoped);
             ctx.restore_type_aliases(snapshot);
             poly
         }
@@ -4161,6 +4179,37 @@ fn lower_type_application(
                     domain: Box::new(key),
                     codomain: Box::new(value),
                 });
+            }
+            // A family parameter passed on is the family it applies, read at the key.
+            if let ChlExpr::Name(n) = &v.node
+                && let Some(param) = ctx
+                    .family_params
+                    .iter()
+                    .find(|(s, ..)| s == n)
+                    .map(|(_, p, _)| Rc::clone(p))
+            {
+                if param.arity != 1 {
+                    return Err(LoweringError::unsupported(
+                        v.span,
+                        format!(
+                            "`FullMap`'s value type is a family over its one key, and `{n}` is a \
+                             family over {} values",
+                            param.arity
+                        ),
+                    ));
+                }
+                let k = Name::fresh("k");
+                let term = ctx.tag_machinery(
+                    Expr::var(k.clone()).with_ty(key.clone()),
+                    v.span,
+                    "lower.family_argument",
+                );
+                return Ok(Type::pi_kinded(
+                    k,
+                    key,
+                    Type::FamilyApp(crate::ccl::ty::FamilyApp::new(param, vec![Rc::new(term)])),
+                    crate::ccl::FunKind::Data(None),
+                ));
             }
             Ok(Type::full_map_of(key, lower_type_expr(v, ctx)?))
         }

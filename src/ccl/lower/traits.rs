@@ -297,7 +297,7 @@ pub(super) fn declare_traits(
         let aliases = ctx.snapshot_type_aliases();
         let scoped = ctx.type_params_in_scope.len();
         let declared = declare_trait(decl, ctx);
-        ctx.type_params_in_scope.truncate(scoped);
+        ctx.end_type_params(scoped);
         ctx.restore_type_aliases(aliases);
         match declared {
             Ok(trait_) => ctx.traits.push(trait_),
@@ -437,7 +437,7 @@ fn declare_trait(decl: &ChlTraitDecl, ctx: &mut LoweringContext) -> Result<Trait
         let aliases = ctx.snapshot_type_aliases();
         let scoped = ctx.type_params_in_scope.len();
         let function = declare_function(&name.node, &names, sig, ctx);
-        ctx.type_params_in_scope.truncate(scoped);
+        ctx.end_type_params(scoped);
         ctx.restore_type_aliases(aliases);
         functions.push(function?);
         function_spans.push(sig.span);
@@ -728,7 +728,7 @@ pub(super) fn declare_instances(
         let aliases = ctx.snapshot_type_aliases();
         let scoped = ctx.type_params_in_scope.len();
         let declared = declare_instance(trait_, block, stmt.span, ctx);
-        ctx.type_params_in_scope.truncate(scoped);
+        ctx.end_type_params(scoped);
         ctx.restore_type_aliases(aliases);
         if let Err(e) = declared {
             errors.push(e);
@@ -1524,7 +1524,7 @@ pub(super) fn lower_instance(
         let in_scope = ctx.named_requirements.len();
         let result = lower_instance_def(&trait_, &instance, &variables, &named, &members, def, ctx);
         ctx.named_requirements.truncate(in_scope);
-        ctx.type_params_in_scope.truncate(scoped);
+        ctx.end_type_params(scoped);
         ctx.restore_type_aliases(aliases);
         let (name, func, annotation) = result?;
         let binding = match annotation {

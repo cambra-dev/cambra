@@ -238,6 +238,22 @@ pub(super) fn declare_nominal_types(
     errors
 }
 
+/// The index types a `def`'s or a `forall`'s type parameter's family kind writes, `K` for
+/// `V: K => Type`, or `None` for any other kind, which [`super::stmts::lower_kind`] reads.
+pub(super) fn family_kind(
+    param: &ChlTypeParam,
+) -> Result<Option<Vec<&Spanned<ChlExpr>>>, LoweringError> {
+    match &param.annotation {
+        Some(KindAnnotation::Kind(kind))
+            if matches!(&kind.node, ChlExpr::FunctionType { arrow: Arrow::Compute, codomain, .. }
+                if matches!(&codomain.node, ChlExpr::Name(n) if n == "Type")) =>
+        {
+            family_indices(param).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
 /// The index types a type declaration's parameter's kind writes: none for no kind or `Type`,
 /// `K` for a family parameter `V: K => Type`, and `K₁, K₂` for `V: {K₁, K₂} => Type`
 /// (`docs/chl-spec.md`, "Family parameters").

@@ -78,7 +78,11 @@ tuple and fixes how many lambdas a `Mut`-parameter function's chain has (`uncurr
 
 `declare_type_params` declares each parameter in order as an alias of a declared `Type::Param`,
 after lowering its kind with the parameters before it in scope, and records it in the `Poly`. It
-refuses a built-in name and a name declared twice.
+refuses a built-in name and a name declared twice. A parameter of family kind, `V: K => Type`, is a
+`TypeParam::declared_family` instead, kept in `LoweringContext::family_params` with its index types
+rather than as an alias, so a type written in its scope applies it or passes it on as a type
+declaration's family parameter is ([nominal-types.md, "Family parameters"](nominal-types.md#family-parameters)).
+`LoweringContext::end_type_params` leaves both scopes.
 
 A type-position `forall (T, U <: B) V` lowers through `lower_type_expr_or_poly`, which declares the
 parameters in an alias scope of its own and lowers `V` as the body. Only a `let` annotation
