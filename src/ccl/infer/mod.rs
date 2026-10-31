@@ -875,9 +875,7 @@ pub(crate) fn run_with_params(
     // A private feed a public function appends to is appended to by other modules, so it is
     // the run's, as a public feed is.
     let mut top_level = sub_ctx.top_level_effects();
-    top_level = top_level.union(&crate::ccl::effects::set_of(
-        &exported.appends.into_iter().collect(),
-    ));
+    top_level.extend(exported.appends);
     Ok(Inferred {
         ty: expr.ty.clone(),
         schemes: sub_ctx.schemes_noted,
@@ -892,8 +890,9 @@ pub(crate) struct Inferred {
     pub(crate) ty: Type,
     pub(crate) schemes: NotedSchemes,
     pub(crate) opened: OpenedVars,
-    /// What the tree's top level requires and causes, less what its scopes discharge.
-    pub(crate) top_level: crate::ccl::effects::EffectSet,
+    /// What the tree's top level requires and causes, less what its scopes discharge, each
+    /// label at the node where it entered.
+    pub(crate) top_level: Vec<crate::ccl::effects::Label>,
     /// The expression statements that cause nothing, each an error the caller reports once
     /// the checks that diagnose a statement more precisely have run.
     pub(crate) inert: Vec<LocatedInferError>,

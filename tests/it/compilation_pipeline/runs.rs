@@ -27,12 +27,13 @@ const COUNTER: &str = indoc! {"
 "};
 
 /// A module whose run folds a loop into an induction variable and publishes the
-/// result.
+/// result. Its transactional variable makes it a run.
 const SUMMER: &str = indoc! {"
     total := 0
     for x in [1, 2, 3]:
         total += x
     pub sum = total
+    visits: Mut(Int, Txn) := 0
 "};
 
 /// A module whose run commits a transaction on its own variable.
@@ -330,11 +331,11 @@ fn a_misused_run_is_refused(#[case] root: &str, #[case] needle: &str) {
     );
 }
 
-/// A `run` inside an imported module would give the run no run path, so it is
-/// refused, once.
+/// A module that runs another is run, so importing it is an error, once, pointing at its
+/// `run` statement (`docs/chl-spec.md`, "Shareable modules [Decided]").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-fn a_run_in_an_imported_module_is_refused() {
+fn importing_a_module_that_runs_another_is_refused() {
     let errors = compile_errors(&program(
         indoc! {"
                 import lib
@@ -352,9 +353,13 @@ fn a_run_in_an_imported_module_is_refused() {
         ],
     ));
     assert!(
-        errors.contains("an imported module declares no run"),
+        errors.contains(
+            "module `lib` is run, since it runs another module, so importing it is an error: run \
+             it instead"
+        ),
         "{errors}"
     );
+    assert!(errors.contains("this makes it a run"), "{errors}");
     assert_eq!(report_count(&errors), 1, "{errors}");
 }
 

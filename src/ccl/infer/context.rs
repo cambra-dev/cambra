@@ -576,9 +576,9 @@ impl InferCtx {
     }
 
     /// What the module's top level requires and causes, less what its scopes discharge
-    /// (`docs/chl-spec.md`, "Shareable modules [Decided]").
-    pub(super) fn top_level_effects(&self) -> EffectSet {
-        crate::ccl::effects::set_of(&self.effect_frames[0].var.resolved())
+    /// (`docs/chl-spec.md`, "Shareable modules \[Decided\]").
+    pub(super) fn top_level_effects(&self) -> Vec<Label> {
+        self.effect_frames[0].var.resolved().into_iter().collect()
     }
 
     fn effect_frame(&self) -> &EffectFrame {
@@ -610,8 +610,12 @@ impl InferCtx {
                     escapes: transactional || public_feed,
                 },
             );
-            // Other modules append to a public feed, so declaring one is an output of the
-            // top level's, as declaring a transactional variable writes it.
+            // Declaring a transactional variable writes it, and other modules append to a
+            // public feed, so declaring one is an output of the top level's too. Neither
+            // label is discharged where the variable's scope ends.
+            if transactional {
+                self.record_effect(Item::Causes(Effect::Write(name.clone())));
+            }
             if public_feed {
                 self.record_effect(Item::Causes(Effect::Append(name.clone())));
             }

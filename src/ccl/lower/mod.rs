@@ -594,9 +594,6 @@ pub struct LoweringContext {
     /// what its import names reach. Set per module by
     /// [`begin_module`](Self::begin_module).
     pub(super) module: modules::ModuleScope,
-    /// Where the module being lowered performs IO, if it does: the first call to
-    /// a registered source (`docs/chl-spec.md`, "9.7 Importing asserts a shareable module").
-    pub(super) io_site: Option<Span>,
     /// Each reference to a name a run's `use` clause binds, by its node, with
     /// where it is written ([`Self::reference`]).
     pub(super) run_use_reads: HashMap<crate::ccl::provenance::NodeId, Span>,
@@ -632,11 +629,6 @@ pub struct LoweringContext {
     /// The check tree of each module other than the root, which the compile
     /// infers before the linked program ([`modules::ModuleCheck`]).
     pub(crate) module_checks: Vec<modules::ModuleCheck>,
-    /// The `ExprStmt` of each expression statement a program writes before its block's last
-    /// statement, which inference refuses when it causes nothing (`docs/chl-spec.md`, "4.9
-    /// Expression statement"). A statement lowering builds for a loop, an `if` or a `match`
-    /// is not one.
-    pub(crate) expression_statements: HashSet<crate::ccl::provenance::NodeId>,
     /// The root's `import` and `run` statements. Its check is usually the linked program's
     /// inference rather than a module check, so they are kept here for the rule that decides
     /// whether a module is imported or run (`docs/chl-spec.md`, "Shareable modules
@@ -1269,6 +1261,26 @@ impl LoweringContext {
     }
 }
 
+/// The rewrite label of the `ExprStmt` an expression statement lowers to, one the program
+/// writes before its block's last statement, which inference refuses when it causes nothing
+/// (`docs/chl-spec.md`, "4.9 Expression statement"). A statement lowering builds for a loop,
+/// an `if` or a `match` is not one. Every copy of the statement keeps its label, so the
+/// statements of each run and shared import of a module are found by it
+/// ([`expression_statements`]).
+pub(crate) const EXPRESSION_STATEMENT: RewriteLabel = "lower.expression_statement";
+
+/// The node of each expression statement in the trees `projection` attributes
+/// ([`EXPRESSION_STATEMENT`]).
+pub(crate) fn expression_statements(
+    projection: &crate::ccl::provenance::SourceProjection,
+) -> HashSet<crate::ccl::provenance::NodeId> {
+    projection
+        .iter()
+        .filter(|(_, attribution)| attribution.rewritten.label == EXPRESSION_STATEMENT)
+        .map(|(&id, _)| id)
+        .collect()
+}
+
 /// Prefix for synthetic parameter names representing the tupled domain of a
 /// multi-arg lambda. Each multi-arg lambda's name is this prefix followed by
 /// a unique id (see [`LoweringContext::fresh_tuple_arg`]).
@@ -1699,9 +1711,9 @@ pub(super) fn lower_root(module: &ChlModule, ctx: &mut LoweringContext) -> Lower
 /// Lower `module`, a module other than the root, to the chain of its top-level
 /// statements around [`modules::MODULE_BODY`], the placeholder for the code below
 /// it wherever a run of it stands (`modules`). It has no value of its own
-/// (`docs/chl-spec.md`, "9.17 No trailing expressions"). A run performs its
-/// whole top level, and what an import may not hold is refused where the module
-/// is imported ([`library_statement_refusals`]).
+/// (`docs/chl-spec.md`, "9.17 No trailing expressions"). A run or a shared import
+/// performs its whole top level, and whether the module is imported or run is decided
+/// once every module is checked (`docs/chl-spec.md`, "Shareable modules \[Decided\]").
 pub fn lower_module_body(module: &ChlModule, ctx: &mut LoweringContext) -> LoweringResult {
     lower_module(module, ctx, Lowered::Module)
 }
@@ -1715,10 +1727,9 @@ enum Lowered {
     Module,
 }
 
-/// Where `module`, an imported module, binds a sink: the first statement that
-/// declares one, which makes importing it an error (`docs/chl-spec.md`, "9.7
-/// Importing asserts a shareable module"). Reading a source is the other IO a
-/// module can perform, and lowering records it ([`LoweringContext::io_site`]).
+/// Where `module` binds a sink: the first statement that declares one, which
+/// causes `Emit` and so makes the module a run (`docs/chl-spec.md`, "Shareable
+/// modules \[Decided\]").
 pub fn sink_site(module: &ChlModule) -> Option<Span> {
     module.body.iter().find_map(|stmt| {
         let inner = match &stmt.node {
@@ -1736,9 +1747,8 @@ pub fn sink_site(module: &ChlModule) -> Option<Span> {
 
 /// The first statement at `module`'s top level that declares or writes mutable
 /// state: a mutable variable, a write to one, a loaded declaration, a feed
-/// declaration, or a feed's definition. Such a module is run and not
-/// imported (`docs/chl-spec.md`, "9.7 Importing asserts a shareable module"): a
-/// feed at an import's module would collect what every importer feeds it.
+/// declaration, or a feed's definition. A shared import of such a module keys its state
+/// by its spelling (`ProgramLowering::shared_import`).
 pub fn state_site(module: &ChlModule) -> Option<Span> {
     module.body.iter().find_map(|stmt| {
         let inner = match &stmt.node {
@@ -1950,53 +1960,6 @@ fn use_name_members(
                 )
                 .with_related(used.item, "bound by `use` here"),
             )
-        })
-        .collect()
-}
-
-/// One error per top-level statement an imported module may not hold: a `run`,
-/// since the import would reach the run's state (`docs/chl-spec.md`, "9.7
-/// Importing asserts a shareable module"), an expression statement, and,
-/// not supported yet, anything but a value binding, a `def`, a type alias, an
-/// `import`, `pass`, a nominal type, or an `impl` block.
-pub(super) fn library_statement_refusals(stmts: &[Spanned<ChlStmt>]) -> Vec<LoweringError> {
-    stmts
-        .iter()
-        .filter_map(|stmt| {
-            let inner = match &stmt.node {
-                ChlStmt::Pub { stmt, .. } => &stmt.node,
-                other => other,
-            };
-            let message = match inner {
-                ChlStmt::Assign { .. }
-                | ChlStmt::AnnAssign { .. }
-                | ChlStmt::FunctionDef { .. }
-                | ChlStmt::TypeDecl(_)
-                | ChlStmt::Impl(_)
-                | ChlStmt::Import { .. }
-                | ChlStmt::Param { .. }
-                | ChlStmt::Pass
-                | ChlStmt::Error => return None,
-                ChlStmt::Run { .. } => {
-                    "an imported module declares no run, since the import would reach the run's \
-                     state: run this module instead"
-                }
-                ChlStmt::Expr(_) => {
-                    "an expression statement at a module's top level gives the module a value, \
-                     and an imported module has none"
-                }
-                ChlStmt::MutAssign { .. }
-                | ChlStmt::AugAssign { .. }
-                | ChlStmt::LoadFrom { .. }
-                | ChlStmt::Define { .. } => unreachable!(
-                    "`state_site` keeps a module that declares mutable state from lowering"
-                ),
-                _ => {
-                    "this statement at an imported module's top level is not supported yet: an \
-                     imported module holds value bindings, `def`s, type aliases and nominal types"
-                }
-            };
-            Some(LoweringError::unsupported(stmt.span, message))
         })
         .collect()
 }

@@ -1110,12 +1110,11 @@ pub(super) fn lower_middle_stmt(
         }
         ChlStmt::Expr { .. } | ChlStmt::If { .. } | ChlStmt::Match { .. } => {
             let effect = lower_final_stmt(stmt, preceding, outer_bindings, ctx)?;
-            let statement =
-                ctx.tag_machinery(Expr::expr_stmt(effect, body), stmt.span, "lower.stmt_seq");
-            if matches!(stmt.node, ChlStmt::Expr { .. }) {
-                ctx.expression_statements.insert(statement.node_id());
-            }
-            Ok(statement)
+            let label = match stmt.node {
+                ChlStmt::Expr { .. } => EXPRESSION_STATEMENT,
+                _ => "lower.stmt_seq",
+            };
+            Ok(ctx.tag_machinery(Expr::expr_stmt(effect, body), stmt.span, label))
         }
         // A standalone `with begin():` transaction — one commit over a
         // synthesized singleton source, which `transact_phase` folds into the commit

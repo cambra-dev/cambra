@@ -5359,13 +5359,6 @@ access](#39-subscript-and-attribute-access)). With `import shop::cart`, `run sho
 
 ### 9.7 Importing asserts a shareable module
 
-**[Decided]** — the rules of this section. Today a module is imported only when it performs no IO
-and declares no mutable state: its top level opens no source, binds no sink, introduces, writes or
-loads (`@LoadFrom`) no mutable variable, declares or defines no feed, and runs no module that does
-any of these. The rules of this section differ in two cases: a module whose only state is induction
-variables, private feeds and loaded declarations is imported, where today it is run, and a module
-that performs no IO and declares no state cannot be run.
-
 Importing a module asserts that it is **shareable**: its top level reads nothing from outside
 the program, and leaves behind no output and no state another module could reach
 ([Shareable modules [Decided]](#shareable-modules-decided)).

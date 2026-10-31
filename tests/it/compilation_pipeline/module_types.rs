@@ -416,7 +416,8 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
         run logger(log=audit) as l
         1
     "},
-    "module `audit` declares mutable state, so importing it is an error: run it instead"
+    "module `audit` is run, since its top level causes `Append(events)`, so importing it is an \
+     error: run it instead"
 )]
 #[case::imports_passing_each_other(
     indoc! {"

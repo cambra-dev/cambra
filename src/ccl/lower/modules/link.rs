@@ -450,9 +450,6 @@ pub(super) fn in_source_order(errors: Vec<LoweringError>) -> Vec<LoweringError> 
 /// in link order outermost. A module whose own errors stop it from lowering has
 /// no interface, and a reference into it lowers to an error placeholder without
 /// an error of its own.
-///
-/// An imported module that performs IO or declares state has no shared import,
-/// and each `import` of it is the error.
 pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> LoweringResult {
     let sources = program.sources();
     let root = sources.root();
@@ -581,7 +578,6 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
                     chain,
                     ctx.parameters.clone(),
                     ctx,
-                    None,
                 )),
                 scope: scope.clone(),
                 sinks: Vec::new(),
@@ -711,9 +707,9 @@ pub(super) struct ProgramLowering<'a> {
     /// The names each shared import reaches ([`Created::names`]), or `None` when it
     /// has none.
     pub(super) shared: HashMap<SharedImport, Option<Rc<HashMap<QualifiedName, Name>>>>,
-    /// The imported modules whose statements an import may not hold have been
-    /// reported ([`ProgramLowering::importable`]).
-    pub(super) import_refusals: HashSet<FileId>,
+    /// Each shared import of a module that declares state, by its spelling, which keys its
+    /// variables' histories ([`crate::ccl::Label::in_import`]).
+    pub(super) spelled: HashMap<SmolStr, SharedImport>,
     /// The modules a copy in the tree being assembled holds the own predicates of
     /// ([`copy_predicates`]).
     pub(super) holding_predicates: HashSet<FileId>,
@@ -905,7 +901,7 @@ impl<'a> ProgramLowering<'a> {
             imports: HashMap::new(),
             type_keys: TypeKeys::default(),
             shared: HashMap::new(),
-            import_refusals: HashSet::new(),
+            spelled: HashMap::new(),
             holding_predicates: HashSet::new(),
             shared_chains: Vec::new(),
             shared_reached: HashMap::new(),
@@ -1028,10 +1024,6 @@ impl<'a> ProgramLowering<'a> {
         let lowered = lower_module_body(ast, ctx);
         let sinks = std::mem::take(&mut ctx.declared_sinks);
         let run_checks = std::mem::take(&mut ctx.run_type_checks);
-        let unimportable = sink_site(ast)
-            .map(Unimportable::Io)
-            .or_else(|| state_site(ast).map(Unimportable::State))
-            .or(ctx.io_site.map(Unimportable::Io));
         let clean = lowered.errors.is_empty() && self.program.parsed_cleanly(file);
         self.errors.extend(lowered.errors);
         let chain = lowered.value.filter(|_| clean)?;
@@ -1041,7 +1033,6 @@ impl<'a> ProgramLowering<'a> {
             &chain,
             std::mem::take(&mut ctx.parameters),
             ctx,
-            unimportable,
         );
         ctx.reached_methods.extend(interface.public_methods());
         Some(LoweredModule {
@@ -1054,43 +1045,12 @@ impl<'a> ProgramLowering<'a> {
         })
     }
 
-    /// Whether the module in `file` can be imported for its statements: an
-    /// imported module declares no `run`, since the import would reach the run's
-    /// state (`docs/chl-spec.md`, "9.7 Importing asserts a shareable module"), and
-    /// no statement but a value binding, a `def`, a type alias, an `import`, or
-    /// `pass`. Each refusal is reported once, at the statement.
-    pub(super) fn importable(&mut self, file: FileId) -> bool {
-        let Some(ast) = self.program.ast(file) else {
-            return false;
-        };
-        let refusals = library_statement_refusals(&ast.body);
-        if refusals.is_empty() {
-            return true;
-        }
-        if self.import_refusals.insert(file) {
-            self.errors.extend(refusals);
-        }
-        false
-    }
-
     /// The interface an import of the module in `file` reaches, or `None` when
-    /// the module has errors of its own or an import may not hold its statements.
-    pub(super) fn import_interface(&mut self, file: FileId) -> Option<Rc<Interface>> {
-        // A module that performs IO or declares state is refused at each import
-        // of it, for that reason alone (`module_scope`), whether or not it has
-        // errors of its own.
-        let Some(lowered) = self.lowered.get(&file).cloned().flatten() else {
-            let ast = self.program.ast(file)?;
-            let why = sink_site(ast)
-                .map(Unimportable::Io)
-                .or_else(|| state_site(ast).map(Unimportable::State))?;
-            let module = self.program.sources().module(file)?.clone();
-            return Some(Rc::new(Interface::unimportable(module, why)));
-        };
-        if lowered.interface.unimportable.is_some() {
-            return Some(Rc::clone(&lowered.interface));
-        }
-        self.importable(file).then(|| Rc::clone(&lowered.interface))
+    /// the module has errors of its own. Whether it may be imported is decided once
+    /// every module is checked (`docs/chl-spec.md`, "Shareable modules \[Decided\]").
+    pub(super) fn import_interface(&self, file: FileId) -> Option<Rc<Interface>> {
+        let lowered = self.lowered.get(&file)?.as_ref()?;
+        Some(Rc::clone(&lowered.interface))
     }
 
     /// Create the shared import `shared`, of those in `sites`, if it is not created
@@ -1150,20 +1110,41 @@ impl<'a> ProgramLowering<'a> {
         site: &ImportSite,
         ctx: &mut LoweringContext,
     ) -> Option<Expr> {
-        let interface = self.import_interface(file);
-        let created = interface
-            .filter(|interface| interface.unimportable.is_none())
-            .and_then(|_| {
-                let home = Home::Import(shared.clone());
-                self.create(
-                    file,
-                    Some(home),
-                    None,
-                    Supplied::Import(&shared, site),
-                    &[],
-                    ctx,
-                )
-            });
+        // A shared import's variables are keyed by its spelling, so two shared imports of a
+        // module that declares state, whose type arguments are distinct types spelled alike,
+        // would share them.
+        if self.program.ast(file).and_then(state_site).is_some() {
+            let spelled = smol_str::format_smolstr!("{shared}");
+            match self.spelled.get(&spelled) {
+                Some(other) if *other != shared => {
+                    self.errors.push(LoweringError::unsupported(
+                        site.statement,
+                        format!(
+                            "this import passes `{}` type arguments spelled as another import's, \
+                             `{spelled}`, which are distinct types; the module declares state, \
+                             which is kept by that spelling, so this is not supported yet",
+                            shared.module
+                        ),
+                    ));
+                    return None;
+                }
+                Some(_) => {}
+                None => {
+                    self.spelled.insert(spelled, shared.clone());
+                }
+            }
+        }
+        let created = self.import_interface(file).and_then(|_| {
+            let home = Home::Import(shared.clone());
+            self.create(
+                file,
+                Some(home),
+                None,
+                Supplied::Import(&shared, site),
+                &[],
+                ctx,
+            )
+        });
         let (chain, names) = match created {
             Some(created) => (Some(created.chain), Some(Rc::new(created.names))),
             None => (None, None),

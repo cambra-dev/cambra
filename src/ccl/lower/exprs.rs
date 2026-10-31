@@ -335,10 +335,6 @@ pub(super) fn lower_call(
         )
         | None => {
             if ctx.sources.contains_key(name) {
-                // Reading a source is IO, which a module that is imported may not
-                // perform.
-                ctx.io_site
-                    .get_or_insert(func.span.join(args.last().map_or(func.span, |a| a.span)));
                 return Ok(Expr::new(TypedExprNode::Source(
                     name.to_string(),
                     Vec::new(),

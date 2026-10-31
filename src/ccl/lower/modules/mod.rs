@@ -35,7 +35,7 @@ pub(super) use types::*;
 
 use super::{
     AliasAt, DeclaredSink, LoweringContext, LoweringError, LoweringResult, finish_program,
-    library_statement_refusals, lower_module_body, lower_root, sink_site, sinks_at, state_site,
+    lower_module_body, lower_root, sink_site, sinks_at, state_site,
 };
 use crate::ccl::ccl_utils::{
     PredMemo, free_names, walk_refined_predicates, walk_refined_predicates_mut,
