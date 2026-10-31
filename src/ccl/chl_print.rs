@@ -153,17 +153,55 @@ impl Printer {
     /// `forall (T, U <: B) V requires …`.
     fn poly(&mut self, poly: &PolyType) -> String {
         let poly = &poly.with_member_names();
+        // A family parameter is written with its kind, `V: K => Type`, and a bound on its
+        // values as a requirement, `forall (k: K) V(k) <: U`, whose binders the kind keeps no
+        // names for, so they are spelled `k`, `k1`, ….
+        let mut family_bounds: Vec<String> = Vec::new();
         let params: Vec<String> = poly
             .params
             .iter()
             .filter(|p| !poly.is_member(&p.param))
-            .map(|p| match p.bound() {
-                Some(bound) => format!("{} <: {}", p.param.spelling, self.ty(bound)),
-                None => p.param.spelling.to_string(),
+            .map(|p| match p.kind.family_domains() {
+                Some(domains) => {
+                    let shown: Vec<String> = domains.iter().map(|d| self.ty(d)).collect();
+                    let kind = match shown.as_slice() {
+                        [one] => format!("{one} => Type"),
+                        many => format!("{{{}}} => Type", many.join(", ")),
+                    };
+                    if let Some(bound) = p.kind.family_bound() {
+                        let names: Vec<String> = (0..domains.len())
+                            .map(|i| {
+                                if i == 0 {
+                                    "k".to_string()
+                                } else {
+                                    format!("k{i}")
+                                }
+                            })
+                            .collect();
+                        let binders: Vec<String> = names
+                            .iter()
+                            .zip(&shown)
+                            .map(|(k, d)| format!("{k}: {d}"))
+                            .collect();
+                        family_bounds.push(format!(
+                            "forall ({}) {}({}) <: {}",
+                            binders.join(", "),
+                            p.param.spelling,
+                            names.join(", "),
+                            self.ty(bound)
+                        ));
+                    }
+                    format!("{}: {kind}", p.param.spelling)
+                }
+                None => match p.bound() {
+                    Some(bound) => format!("{} <: {}", p.param.spelling, self.ty(bound)),
+                    None => p.param.spelling.to_string(),
+                },
             })
             .collect();
         let body = self.ty(&poly.body);
-        let requires = poly.requires_text(|t| self.ty(t));
+        let mut requires = family_bounds;
+        requires.extend(poly.requires_text(|t| self.ty(t)));
         let mut text = format!("forall ({}) {body}", params.join(", "));
         if !requires.is_empty() {
             text.push_str(" requires ");
@@ -420,6 +458,9 @@ impl Printer {
                 }
             }
             TypeKind::Type => format!("Collection({cod})"),
+            TypeKind::Family { .. } => unreachable!(
+                "a family's kind is a family parameter's, and no witness ranges over it"
+            ),
             TypeKind::Enumerated(candidates) => {
                 let alternatives: Vec<String> = candidates
                     .iter()

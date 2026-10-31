@@ -839,8 +839,8 @@ fn an_annotation_mismatch_prints_the_inferred_polymorphic_type(
             x
         f(1)
     "},
-    "the kind of `T` is `Type` or `SubtypesOf(U)`, also written `T <: U`; no other kind is \
-     supported",
+    "the kind of `T` is `Type`, `SubtypesOf(U)`, also written `T <: U`, or a family's \
+     `K => Type`; no other kind is supported",
 )]
 #[case::type_as_a_kind(
     indoc! {"
@@ -848,7 +848,7 @@ fn an_annotation_mismatch_prints_the_inferred_polymorphic_type(
             x
         f(1)
     "},
-    "the kind of `T` is `Type` or `SubtypesOf(U)`",
+    "the kind of `T` is `Type`, `SubtypesOf(U)`",
 )]
 #[case::subtypes_of_two_types(
     indoc! {"

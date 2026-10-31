@@ -348,6 +348,19 @@ impl Refusals {
             match &requirement.node {
                 Requirement::Trait { ty, .. } => self.trait_type(ty),
                 Requirement::Bound { bound, .. } => self.expr(bound),
+                Requirement::Subtype { sub, sup } => {
+                    self.expr(sub);
+                    self.expr(sup);
+                }
+                Requirement::Forall {
+                    binders,
+                    requirements,
+                } => {
+                    for (_, ty) in binders {
+                        self.expr(ty);
+                    }
+                    self.requires(requirements);
+                }
             }
         }
     }

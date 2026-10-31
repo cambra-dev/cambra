@@ -368,6 +368,14 @@ pub(super) enum OpenTuples {
     UnderTypeParameterBound,
 }
 
+/// How many type parameters and family parameters were in scope at a point
+/// ([`LoweringContext::type_param_scope`]).
+#[derive(Clone, Copy)]
+pub(super) struct TypeParamScope {
+    params: usize,
+    families: usize,
+}
+
 /// Context for CHL → CCL lowering that carries registered data sources and sinks.
 ///
 /// Zero-argument function calls whose name appears in `sources` are lowered to
@@ -512,9 +520,9 @@ pub struct LoweringContext {
     /// every other position refuses one (`docs/chl-spec.md`, "Tuple width").
     pub(super) open_tuples: OpenTuples,
 
-    /// The family parameters of the type declaration being lowered, each with its index
-    /// types: a family parameter is written applied, `V(k)` (`docs/chl-spec.md`, "Family
-    /// parameters").
+    /// The family parameters in scope, of a type declaration or of a `def` or polymorphic type,
+    /// each with its index types: a family parameter is written applied, `V(k)`
+    /// (`docs/chl-spec.md`, "Family parameters").
     pub(super) family_params: Vec<(SmolStr, Rc<crate::ccl::ty::TypeParam>, Vec<Type>)>,
 
     /// The value binders a type written here is inside, innermost last, each with the type it
@@ -1158,6 +1166,21 @@ impl LoweringContext {
                     .map(|(found, _)| Rc::clone(&found.decl))
             })
             .or_else(|| crate::ccl::nominal::builtin(name))
+    }
+
+    /// The type parameters and family parameters in scope now, for [`Self::end_type_params`].
+    pub(super) fn type_param_scope(&self) -> TypeParamScope {
+        TypeParamScope {
+            params: self.type_params_in_scope.len(),
+            families: self.family_params.len(),
+        }
+    }
+
+    /// Leave the scope of the type parameters declared since `scope`, family parameters among
+    /// them.
+    pub(super) fn end_type_params(&mut self, scope: TypeParamScope) {
+        self.type_params_in_scope.truncate(scope.params);
+        self.family_params.truncate(scope.families);
     }
 
     /// Whether `name` is a type parameter of a definition being lowered.

@@ -995,6 +995,9 @@ fn occurrences(ty: &Type, at: Variance, f: &mut dyn FnMut(TypeParamId, Variance)
                             .iter()
                             .for_each(|c| occurrences(c, Variance::Invariant, f)),
                         TypeKind::UIntRanges | TypeKind::Type => {}
+                        TypeKind::Family { .. } => unreachable!(
+                            "a family's kind is a family parameter's, and no witness ranges over it"
+                        ),
                     }
                 }
             }

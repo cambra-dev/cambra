@@ -2091,8 +2091,9 @@ pub struct PolyParam {
     /// The declared parameter, which the kinds after it, the body, and the
     /// annotations of the definition the `Poly` annotates name.
     pub param: Rc<TypeParam>,
-    /// [`TypeKind::Type`], or [`TypeKind::SubtypesOf`] for a bounded parameter;
-    /// lowering writes no other (`docs/chl-spec.md`, "Kinds and bounds").
+    /// [`TypeKind::Type`], [`TypeKind::SubtypesOf`] for a bounded parameter, or
+    /// [`TypeKind::Family`] for a family parameter; lowering writes no other
+    /// (`docs/chl-spec.md`, "Kinds and bounds").
     pub kind: TypeKind,
     /// Where the bound was written.
     pub bound_at: Option<chl_parser::ast::Span>,
@@ -2133,11 +2134,11 @@ impl PolyParam {
     /// On any other kind, which lowering refuses.
     pub fn bound(&self) -> Option<&Type> {
         match &self.kind {
-            TypeKind::Type => None,
+            TypeKind::Type | TypeKind::Family { .. } => None,
             TypeKind::SubtypesOf(bound) => Some(bound),
             other => panic!(
                 "type parameter `{}` has kind {other}, which lowering refuses: a type \
-                 parameter's kind is `Type` or `SubtypesOf`",
+                 parameter's kind is `Type`, `SubtypesOf` or a family's",
                 self.param.spelling
             ),
         }
@@ -2281,11 +2282,12 @@ impl fmt::Debug for Witness {
 
 /// A **classifier of types** — which types it admits.
 ///
-/// Used today only as the classifier of a Σ's type-witness ([`Witness`]), which is
-/// the sole kind-carrying position in the grammar; since a Σ's witness is a data
-/// function's domain, every type a kind classifies here happens to be a domain. That is
-/// a fact about current usage, not part of the notion: nothing in the membership judgment
-/// (`constrain::admits`) is domain-specific.
+/// It classifies a Σ's type-witness ([`Witness`]) and a declared type parameter
+/// ([`PolyParam::kind`]). Since a Σ's witness is a data function's domain, every type a
+/// witness's kind classifies happens to be a domain. That is a fact about current usage, not
+/// part of the notion: nothing in the membership judgment (`constrain::admits`) is
+/// domain-specific. A family parameter's kind, [`Family`](TypeKind::Family), classifies
+/// families rather than types, and no witness ranges over it.
 ///
 /// Note the direction: a kind admits many types and a type is admitted by many kinds, so
 /// there is no "kind of a type" to read off. What a type determines is the *minimal* kind
@@ -2310,6 +2312,12 @@ pub enum TypeKind {
     /// dependent-type-theory reading (the type of types) rather than for a subtyping ⊤:
     /// it is the top of the *kind* order, and says nothing about values.
     Type,
+    /// A family's kind, `K => Type`: a type for each value of the index types, which a family
+    /// parameter's [`PolyParam::kind`] states (`docs/chl-spec.md`, "Family parameters"). Its
+    /// `types` are the `indices` index types, then the bound on the family's values where it
+    /// states one, `requires forall (k: K) V(k) <: U` ([`TypeKind::family_bound`]). All are children, as
+    /// `SubtypesOf`'s key is.
+    Family { types: Vec<Type>, indices: usize },
 }
 
 /// The name of `Option`'s constructor of a present value, `Option::some`.
@@ -2334,6 +2342,19 @@ impl fmt::Display for TypeKind {
             TypeKind::SubtypesOf(k) => write!(f, "SubtypesOf({k})"),
             TypeKind::UIntRanges => write!(f, "UIntRanges"),
             TypeKind::Type => write!(f, "Type"),
+            TypeKind::Family { .. } => {
+                let domains = self.family_domains().unwrap_or_default();
+                let values = self
+                    .family_bound()
+                    .map_or_else(|| "Type".to_string(), |b| format!("SubtypesOf({b})"));
+                match domains {
+                    [one] => write!(f, "{one} => {values}"),
+                    many => {
+                        let ds: Vec<_> = many.iter().map(|t| t.to_string()).collect();
+                        write!(f, "{{{}}} => {values}", ds.join(", "))
+                    }
+                }
+            }
         }
     }
 }
@@ -2361,6 +2382,7 @@ impl TypeKind {
             // The **parameter**, not a domain: traversals must reach it, and the domain
             // lattice must never match against it.
             TypeKind::SubtypesOf(k) => std::slice::from_ref(k),
+            TypeKind::Family { types, .. } => types,
             TypeKind::UIntRanges | TypeKind::Type => &[],
         }
     }
@@ -2370,6 +2392,7 @@ impl TypeKind {
         match self {
             TypeKind::Enumerated(domains) => domains,
             TypeKind::SubtypesOf(k) => std::slice::from_mut(k),
+            TypeKind::Family { types, .. } => types,
             TypeKind::UIntRanges | TypeKind::Type => &mut [],
         }
     }
@@ -2383,7 +2406,35 @@ impl TypeKind {
                 TypeKind::Enumerated(domains.iter().map(&mut f).collect())
             }
             TypeKind::SubtypesOf(k) => TypeKind::SubtypesOf(Box::new(f(k))),
+            TypeKind::Family { types, indices } => TypeKind::Family {
+                types: types.iter().map(&mut f).collect(),
+                indices: *indices,
+            },
             TypeKind::UIntRanges | TypeKind::Type => self.clone(),
+        }
+    }
+
+    /// A family's kind, over `domains`, with `bound` on its values where it states one.
+    pub fn family(domains: Vec<Type>, bound: Option<Type>) -> TypeKind {
+        let indices = domains.len();
+        let mut types = domains;
+        types.extend(bound);
+        TypeKind::Family { types, indices }
+    }
+
+    /// A family's index types, or `None` for any other kind.
+    pub fn family_domains(&self) -> Option<&[Type]> {
+        match self {
+            TypeKind::Family { types, indices } => Some(&types[..*indices]),
+            _ => None,
+        }
+    }
+
+    /// The bound a family's kind states on its values, `U` in `forall (k: K) V(k) <: U`.
+    pub fn family_bound(&self) -> Option<&Type> {
+        match self {
+            TypeKind::Family { types, indices } => types.get(*indices),
+            _ => None,
         }
     }
 }

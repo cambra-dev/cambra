@@ -78,7 +78,28 @@ tuple and fixes how many lambdas a `Mut`-parameter function's chain has (`uncurr
 
 `declare_type_params` declares each parameter in order as an alias of a declared `Type::Param`,
 after lowering its kind with the parameters before it in scope, and records it in the `Poly`. It
-refuses a built-in name and a name declared twice.
+refuses a built-in name and a name declared twice. A family parameter, `V: K => Type`, is a
+`TypeParam::declared_family` instead, kept in `LoweringContext::family_params` with its index types
+rather than as an alias, so a type written in its scope applies it or passes it on as a type
+declaration's family parameter is
+([nominal-types.md, "Family parameters"](nominal-types.md#family-parameters)). Its `PolyParam`
+records the kind `TypeKind::Family`: the index types, then the bound on its values where the
+`requires` clause states one, all as the kind's children. `LoweringContext::end_type_params`
+leaves both scopes.
+
+The bound is a requirement, `forall (k: K) V(k) <: U`, which `bound_family_values` reads off the
+clause after the parameters are declared and writes into the parameter's kind. `V` is a family
+parameter of the definition, applied to distinct binders of the `forall`, each ranging over its
+index type up to refinements, and `U` reads none of them; any other requirement under `forall` is
+refused. A family parameter's bound is a family itself:
+
+- **`open_poly` opens it as `\k: K -> U`**, normalized under the binders, so a hole in `U` is a
+  variable that may read them, and the opened parameter's `bound` is that family.
+- **An application `V(t)` meets another type as the bound at its terms**
+  (`subst::family_bound_at`, `constrain_go`'s family-bound arm). A meet of the application and a
+  type above that applied bound is the application (`relate_params_by_bounds`).
+- **Instantiating the scheme bounds the family's variable** at its own binders
+  (`subst::family_at_names`), among the bounds each use checks.
 
 A type-position `forall (T, U <: B) V` lowers through `lower_type_expr_or_poly`, which declares the
 parameters in an alias scope of its own and lowers `V` as the body. Only a `let` annotation

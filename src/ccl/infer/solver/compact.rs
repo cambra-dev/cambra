@@ -104,6 +104,11 @@ pub struct ClosedAtom {
 }
 
 impl ClosedAtom {
+    /// The type the atom holds.
+    pub(super) fn ty(&self) -> &Type {
+        &self.ty
+    }
+
     fn new(ty: &Type) -> Self {
         debug_assert!(
             !crate::ccl::subst::type_contains_infer(ty),
@@ -845,6 +850,9 @@ fn ranges_over_uint_ranges(k: &crate::ccl::ty::TypeKind) -> bool {
             _ => false,
         }),
         TypeKind::SubtypesOf(_) | TypeKind::Type => false,
+        TypeKind::Family { .. } => {
+            unreachable!("a family's kind is a family parameter's, and no witness ranges over it")
+        }
     }
 }
 
@@ -3030,6 +3038,9 @@ fn compact_type_kind(
     // — is a position, so it compacts like one. A kind that carries no type has nothing to
     // decompose and crosses as itself.
     match type_kind {
+        TypeKind::Family { .. } => {
+            unreachable!("a family's kind is a family parameter's, and no witness ranges over it")
+        }
         // **A candidate naming a joined binder** is one domain per value of the binder, so
         // the kind over every value is every subtype of the candidate without what it
         // states about the binder (`src/ccl/design/type-inference.md`, "A contribution

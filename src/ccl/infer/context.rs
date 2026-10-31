@@ -1913,8 +1913,27 @@ impl Typing for InferCtx {
         let mut failed = None;
         let mut params = Vec::with_capacity(poly.params.len());
         for p in &poly.params {
-            let bound = p.bound().map(|b| {
-                let mut b = b.clone();
+            // A family parameter's bound on its values is the family over its index types whose
+            // every value is the bound, so a hole in it is minted under the binders and may read
+            // them (`docs/chl-spec.md`, "Family parameters").
+            let stated = match p.kind.family_bound() {
+                Some(values) => Some(Type::family(
+                    p.kind
+                        .family_domains()
+                        .unwrap_or_default()
+                        .iter()
+                        .map(|d| {
+                            (
+                                Name::fresh(format!("__{}_k", p.param.spelling.to_lowercase())),
+                                d.clone(),
+                            )
+                        })
+                        .collect(),
+                    values.clone(),
+                )),
+                None => p.bound().cloned(),
+            };
+            let bound = stated.map(|mut b| {
                 if let Err(e) = self.type_annotation_predicates(&mut b) {
                     failed.get_or_insert(e);
                 }
@@ -1929,9 +1948,14 @@ impl Typing for InferCtx {
             );
             self.opened_params
                 .push((p.param.id, Type::Param(Rc::clone(&opened))));
-            params.push(crate::ccl::ty::PolyParam::with_bound(
-                opened, bound, p.bound_at,
-            ));
+            params.push(match &p.kind {
+                crate::ccl::ty::TypeKind::Family { .. } => crate::ccl::ty::PolyParam {
+                    param: opened,
+                    kind: p.kind.map_children(|t| self.normalize_annotation(t)),
+                    bound_at: p.bound_at,
+                },
+                _ => crate::ccl::ty::PolyParam::with_bound(opened, bound, p.bound_at),
+            });
         }
         if let Some(e) = failed {
             return Err(e);

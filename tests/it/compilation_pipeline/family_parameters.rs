@@ -68,6 +68,21 @@ fn a_family_parameter_is_passed_on() {
     );
 }
 
+/// A declaration passes its family parameter on as `FullMap`'s value type.
+#[test]
+fn a_family_parameter_is_a_full_map_s_value_type() {
+    check_scalar(
+        indoc! {r#"
+            type G(K, V: K => Type) = FullMap(K, V)
+            g = G::new(groupby([1, 2, 3], \x -> x > 1))
+            match g:
+                case G::new(m):
+                    sum([sum(grp) for grp in m])
+        "#},
+        Value::Int(6),
+    );
+}
+
 /// A type with several constructors applies its family parameter in each.
 #[test]
 fn a_family_parameter_of_a_type_with_several_constructors() {
@@ -440,4 +455,267 @@ fn a_method_a_family_type_does_not_declare_names_the_type() {
         ),
         "has no method `cents`",
     );
+}
+
+/// A function's family parameter, which its parameters' types pass on: two arguments of one
+/// family, and a `FullMap` whose value type is the family.
+#[test]
+fn a_function_takes_a_family_parameter() {
+    check_scalar(
+        indoc! {r#"
+            def same(K, V: K => Type, g: FullMap(K, V)) => FullMap(K, V):
+                g
+            sum([sum(grp) for grp in same(groupby([1, 2, 3], \x -> x > 1))])
+        "#},
+        Value::Int(6),
+    );
+    check_scalar(
+        &format!(
+            "{GROUPS}{}{SUM_GROUPS}",
+            indoc! {r#"
+                def first(K, V: K => Type, a: Groups(K, V), b: Groups(K, V)) => Groups(K, V):
+                    a
+                g = Groups::new(groupby([1, 2, 3], \x -> x > 1))
+                gs = first(g, g)
+            "#}
+        ),
+        Value::Int(6),
+    );
+}
+
+/// A polymorphic annotation's family parameter.
+#[test]
+fn a_polymorphic_type_takes_a_family_parameter() {
+    check_scalar(
+        &format!(
+            "{GROUPS}{}{SUM_GROUPS}",
+            indoc! {r#"
+                wrap: forall (K, V: K => Type) FullMap(K, V) => Groups(K, V) = \g -> Groups::new(g)
+                gs = wrap(groupby([1, 2, 3], \x -> x > 1))
+            "#}
+        ),
+        Value::Int(6),
+    );
+}
+
+/// A polymorphic type records a family parameter's kind and the bound on its values, and a
+/// diagnostic writes them: the kind in the parameter list, the bound as a `forall` requirement.
+#[rstest]
+#[case::kind(
+    r"wrap: forall (K, V: K => Type) FullMap(K, V) => Groups(K, V) = \g -> 1",
+    r"annotated as forall (K, V: K => Type) ((k: K) |=> V(k)) => Groups(K, \k: K -> V(k))"
+)]
+#[case::bound(
+    r"wrap: forall (K, V: K => Type) FullMap(K, V) => Groups(K, V) requires forall (k: K) V(k) <: _ |=> Int = \g -> 1",
+    r"annotated as forall (K, V: K => Type) ((k: K) |=> V(k)) => Groups(K, \k: K -> V(k)) requires forall (k: K) V(k) <: _ |=> Int"
+)]
+fn a_polymorphic_type_writes_its_family_parameter_s_kind(
+    #[case] annotation: &str,
+    #[case] message: &str,
+) {
+    check_compile_error(&format!("{GROUPS}{annotation}\n1"), message);
+}
+
+/// Inside a function, an application of its family parameter is opaque, as a type parameter is,
+/// so a group typed by it is no collection unless a requirement bounds its values.
+#[test]
+fn a_family_parameter_is_opaque_in_its_function() {
+    check_compile_error(
+        indoc! {r#"
+            def total(K, V: K => Type, g: FullMap(K, V)) => Int:
+                sum([sum(grp) for grp in g])
+            total(groupby([1, 2, 3], \x -> x > 1))
+        "#},
+        "Expected function type at Aggregate, found V(k)",
+    );
+}
+
+/// A bound on a family parameter's values, `requires forall (k: K) V(k) <: U`, is what the body
+/// uses an application of it as, at each value: a group of a group-by, whose domain differs by
+/// key, is a collection of `Int`. The bound may stand alone or in a group, a kind may name its
+/// value, a `forall` states the bound as a `def` does, and one `forall` may bound two families.
+#[rstest]
+#[case::one_call(
+    indoc! {r#"
+        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) V(k) <: _ |=> Int:
+            sum([sum(grp) for grp in g])
+        total(groupby([1, 2, 3], \x -> x > 1))
+    "#},
+    6
+)]
+#[case::two_calls_over_different_keys(
+    indoc! {r#"
+        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) V(k) <: _ |=> Int:
+            sum([sum(grp) for grp in g])
+        total(groupby([1, 2, 3], \x -> x > 1)) + total(groupby([10, 20, 30, 40], \x -> x // 20))
+    "#},
+    106
+)]
+#[case::in_a_group(
+    indoc! {r#"
+        def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) (V(k) <: _ |=> Int):
+            sum([sum(grp) for grp in g])
+        total(groupby([1, 2, 3], \x -> x > 1))
+    "#},
+    6
+)]
+#[case::a_kind_naming_its_value(
+    indoc! {r#"
+        def total(K, V: (k: K) => Type, g: FullMap(K, V)) => Int requires forall (k: K) V(k) <: _ |=> Int:
+            sum([sum(grp) for grp in g])
+        total(groupby([1, 2, 3], \x -> x > 1))
+    "#},
+    6
+)]
+#[case::a_polymorphic_annotation(
+    indoc! {r#"
+        total: forall (K, V: K => Type) FullMap(K, V) => Int requires forall (k: K) V(k) <: _ |=> Int = \g -> sum([sum(grp) for grp in g])
+        total(groupby([1, 2, 3], \x -> x > 1)) + total(groupby([4, 5], \x -> x > 4))
+    "#},
+    15
+)]
+#[case::two_families_in_one_group(
+    indoc! {r#"
+        def total(K, V: K => Type, W: K => Type, g: FullMap(K, V), h: FullMap(K, W)) => Int requires forall (k: K) (V(k) <: _ |=> Int, W(k) <: _ |=> Int):
+            sum([sum(grp) for grp in g]) + sum([sum(grp) for grp in h])
+        g = groupby([1, 2, 3], \x -> x > 1)
+        total(g, g)
+    "#},
+    12
+)]
+#[case::a_family_over_two_values(
+    indoc! {r#"
+        def total(A, B, V: {A, B} => Type, n: (a: A) |=> (b: B) |=> V(a, b)) => Int requires forall (a: A, b: B) V(a, b) <: Int:
+            sum([sum(row) for row in n])
+        total([[1, 2], [3, 4]])
+    "#},
+    10
+)]
+fn a_family_parameter_s_bound_is_its_values_type(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
+}
+
+/// A call whose family has a value outside the bound is refused at the call.
+#[test]
+fn a_value_outside_a_family_parameter_s_bound_is_refused() {
+    check_compile_error(
+        indoc! {r#"
+            def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) V(k) <: _ |=> Int:
+                sum([sum(grp) for grp in g])
+            total(groupby(["a", "bb"], \x -> x == "a"))
+        "#},
+        "expected Int, found String",
+    );
+}
+
+/// A function's family parameter ends with the function: a later `def` may declare `V` as an
+/// ordinary type parameter.
+#[test]
+fn a_family_parameter_ends_with_its_function() {
+    check_scalar(
+        indoc! {r#"
+            def same(K, V: K => Type, g: FullMap(K, V)) => FullMap(K, V):
+                g
+            def keep(V, x: V) => V:
+                x
+            keep(1) + sum([sum(grp) for grp in same(groupby([1, 2, 3], \x -> x > 1))])
+        "#},
+        Value::Int(7),
+    );
+}
+
+#[test]
+fn a_functions_family_parameter_errors_name_what_is_wrong() {
+    /// A `def` over a family `V` of `K` and a type parameter `T`, ending in `requires {clause}`.
+    fn with_requires(clause: &str) -> String {
+        format!(
+            "def f(K, T, V: K => Type, g: FullMap(K, V), t: T) => Int requires {clause}:\n    0\n1"
+        )
+    }
+    for (program, message) in [
+        (
+            "def f(K, V: {K, K} => Type, g: FullMap(K, V)) => Int:\n    0\n1".to_string(),
+            "`V` is a family over 2 values, where one over 1 is taken",
+        ),
+        (
+            "def f(K, v: K => Type, g: FullMap(K, v)) => Int:\n    0\n1".to_string(),
+            "`v` is lowercase, so it binds a value, and its annotation is a kind",
+        ),
+        (
+            "def f(K, V: K => Int, g: FullMap(K, V)) => Int:\n    0\n1".to_string(),
+            "the kind of `V` is `Type`, `SubtypesOf(U)`, also written `V <: U`, or a family's \
+             `K => Type`",
+        ),
+        // A family parameter's index type is its binders' types: the map's key, and a binder it
+        // is applied to.
+        (
+            indoc! {r#"
+                def f(K, V: String => Type, g: FullMap(K, V)) => FullMap(K, V):
+                    g
+                1
+            "#}
+            .to_string(),
+            "`V` ranges over `String`, and the map's key ranges over `K`",
+        ),
+        (
+            indoc! {r#"
+                def f(K, V: String => Type, g: (k: K) |=> V(k)) => Int:
+                    1
+                1
+            "#}
+            .to_string(),
+            "`k` ranges over `K`, and `V` is a family over `String`",
+        ),
+        (
+            "def f(K, V: K => Type, x: V) => Int:\n    0\n1".to_string(),
+            "`V` is a family parameter, a type for each value it ranges over",
+        ),
+        // A bound on a family's values is a `forall` requirement, over the family's index.
+        (
+            with_requires("V(k) <: Int"),
+            "a subtype requirement bounds a family parameter's values under a `forall`",
+        ),
+        (
+            with_requires("forall (k: K) T <: Int"),
+            "a bound under `forall` bounds a family parameter's values, `V(k) <: U`",
+        ),
+        (
+            with_requires("forall (k: K) W(k) <: Int"),
+            "`W` is not a family parameter of this definition",
+        ),
+        (
+            with_requires("forall (k: K) V(j) <: Int"),
+            "`j` is not bound by this `forall`",
+        ),
+        (
+            with_requires("forall (k: String) V(k) <: Int"),
+            "`k` ranges over `String`, and `V` is a family over `K`",
+        ),
+        (
+            with_requires("forall (k: K) (V(k) <: Int, V(k) <: Int)"),
+            "`V`'s values are bounded twice",
+        ),
+        (
+            with_requires("forall (k: K, k: K) V(k) <: Int"),
+            "`forall` binds `k` twice",
+        ),
+        (
+            with_requires("forall (K: K) V(K) <: Int"),
+            "`K` is capitalized, so it names a type",
+        ),
+        (
+            with_requires("forall (k: Type) V(k) <: Int"),
+            "`k` is lowercase, so it binds a value, and its annotation is a kind",
+        ),
+        (
+            with_requires("forall (k: K) V(k) <: {Int where _ <= 1 if k else 2}"),
+            "a bound that reads the `forall`'s binder `k` is not supported yet",
+        ),
+        (
+            with_requires("forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int)"),
+            "any other requirement under `forall` is not supported yet",
+        ),
+    ] {
+        check_compile_error(&program, message);
+    }
 }

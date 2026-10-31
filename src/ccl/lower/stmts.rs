@@ -2039,6 +2039,26 @@ pub(super) fn declare_type_params(
                 format!("type parameter `{name}` is declared twice"),
             ));
         }
+        // A family parameter is written applied, `V(k)`, and names no type alone
+        // (`docs/chl-spec.md`, "Family parameters").
+        // A bound on its values is a requirement, `requires forall (k: K) V(k) <: U`, which
+        // `bound_family_values` records in the kind.
+        if let Some(indices) = nominal::family_kind(tp)? {
+            let domains = indices
+                .into_iter()
+                .map(|d| lower_type_expr(d, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            let param = crate::ccl::ty::TypeParam::declared_family(name, domains.len());
+            ctx.family_params
+                .push((tp.name.clone(), Rc::clone(&param), domains.clone()));
+            ctx.type_params_in_scope.push(name.to_string());
+            declared.push(crate::ccl::ty::PolyParam {
+                param,
+                kind: crate::ccl::ty::TypeKind::family(domains, None),
+                bound_at: None,
+            });
+            continue;
+        }
         let kind = lower_kind(tp, &type_params[i..], ctx)?;
         let param = crate::ccl::ty::TypeParam::declared(name);
         ctx.declare_type_throughout(name, AliasType::Type(Type::Param(Rc::clone(&param))));
@@ -2085,8 +2105,8 @@ pub(super) fn lower_kind(
                 return Err(LoweringError::unsupported(
                     kind.span,
                     format!(
-                        "the kind of `{0}` is `Type` or `SubtypesOf(U)`, also written \
-                         `{0} <: U`; no other kind is supported",
+                        "the kind of `{0}` is `Type`, `SubtypesOf(U)`, also written \
+                         `{0} <: U`, or a family's `K => Type`; no other kind is supported",
                         tp.name
                     ),
                 ));
@@ -2180,6 +2200,7 @@ pub(super) fn lower_requirements(
     if let Some(binder) = requires.iter().find_map(|r| match &r.node {
         Requirement::Trait { binder, .. } => binder.as_ref(),
         Requirement::Bound { instance, .. } => Some(instance),
+        Requirement::Subtype { .. } | Requirement::Forall { .. } => None,
     }) {
         return Err(LoweringError::unsupported(
             binder.span,
@@ -2442,7 +2463,173 @@ fn lower_requirement_item(
             slot.bound_at = Some(bound.span);
             Ok(())
         }
+        Requirement::Forall {
+            binders,
+            requirements,
+        } => bound_family_values(binders, requirements, req.span, members, ctx),
+        Requirement::Subtype { .. } => Err(LoweringError::unsupported(
+            req.span,
+            "a subtype requirement bounds a family parameter's values under a `forall` that \
+             binds its index, `requires forall (k: K) V(k) <: U`; a type parameter states its \
+             bound in the parameter list, `T <: U`",
+        )),
     }
+}
+
+/// A `forall` requirement, `forall (k: K) V(k) <: U`: each requirement under it bounds the
+/// values of a family parameter of the definition, which the parameter's kind records
+/// ([`crate::ccl::ty::TypeKind::family`]). A requirement of any other form under `forall` is
+/// refused (`docs/chl-spec.md`, "Family parameters").
+fn bound_family_values(
+    binders: &[(Spanned<SmolStr>, Spanned<ChlExpr>)],
+    requirements: &[Spanned<Requirement>],
+    span: Span,
+    members: Option<&mut Vec<crate::ccl::ty::PolyParam>>,
+    ctx: &mut LoweringContext,
+) -> Result<(), LoweringError> {
+    let mut scope: Vec<(&Spanned<SmolStr>, Type)> = Vec::with_capacity(binders.len());
+    for (name, ty) in binders {
+        refuse_misannotated_type_binder(name, ty)?;
+        if scope.iter().any(|(n, _)| n.node == name.node) {
+            return Err(LoweringError::unsupported(
+                name.span,
+                format!("`forall` binds `{}` twice", name.node),
+            ));
+        }
+        scope.push((name, lower_type_expr(ty, ctx)?));
+    }
+    let Some(members) = members else {
+        return Err(LoweringError::unsupported(
+            span,
+            "a `forall` requirement bounds a family parameter's values, and this clause belongs \
+             to no definition with type parameters",
+        ));
+    };
+    for req in requirements {
+        let Requirement::Subtype { sub, sup } = &req.node else {
+            return Err(LoweringError::unsupported(
+                req.span,
+                "a requirement under `forall` bounds a family parameter's values, \
+                 `forall (k: K) V(k) <: U`; any other requirement under `forall` is not \
+                 supported yet",
+            ));
+        };
+        bound_family_value(&scope, sub, sup, members, ctx)?;
+    }
+    Ok(())
+}
+
+/// `sub <: sup` under a `forall` binding `scope`: `sub` is a family parameter of the definition
+/// applied to distinct binders of `scope`, each ranging over its index type, and `sup` reads
+/// none of them. A hole in `sup` stays a hole: opening the parameter mints one variable for it
+/// at each value (`src/ccl/design/type-parameters.md`, "Lowering").
+fn bound_family_value(
+    scope: &[(&Spanned<SmolStr>, Type)],
+    sub: &Spanned<ChlExpr>,
+    sup: &Spanned<ChlExpr>,
+    members: &mut [crate::ccl::ty::PolyParam],
+    ctx: &mut LoweringContext,
+) -> Result<(), LoweringError> {
+    let applied = match &sub.node {
+        ChlExpr::Call { func, args } => match &func.node {
+            ChlExpr::Name(v) => Some((v, func.span, args)),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some((v, v_span, args)) = applied else {
+        return Err(LoweringError::unsupported(
+            sub.span,
+            "a bound under `forall` bounds a family parameter's values, `V(k) <: U`",
+        ));
+    };
+    let Some(at) = members
+        .iter()
+        .position(|m| m.param.spelling == *v && m.kind.family_domains().is_some())
+    else {
+        return Err(LoweringError::unsupported(
+            v_span,
+            format!(
+                "`{v}` is not a family parameter of this definition; `forall (k: K) V(k) <: U` \
+                 bounds the values of one, `V: K => Type`"
+            ),
+        ));
+    };
+    let domains = members[at]
+        .kind
+        .family_domains()
+        .expect("found as a family")
+        .to_vec();
+    if args.len() != domains.len() {
+        return Err(LoweringError::unsupported(
+            sub.span,
+            format!(
+                "`{v}` is a family over {} value{}, applied here to {}",
+                domains.len(),
+                if domains.len() == 1 { "" } else { "s" },
+                args.len()
+            ),
+        ));
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    for (arg, domain) in args.iter().zip(&domains) {
+        let ChlExpr::Name(n) = &arg.node else {
+            return Err(LoweringError::unsupported(
+                arg.span,
+                format!(
+                    "`{v}` is applied to the `forall`'s binders, `forall (k: K) {v}(k) <: U`, \
+                     and not to a computed value"
+                ),
+            ));
+        };
+        let Some((_, ty)) = scope.iter().find(|(b, _)| b.node == *n) else {
+            return Err(LoweringError::unsupported(
+                arg.span,
+                format!("`{n}` is not bound by this `forall`: `forall ({n}: K) {v}({n}) <: U`"),
+            ));
+        };
+        if seen.contains(&n.as_str()) {
+            return Err(LoweringError::unsupported(
+                arg.span,
+                format!("`{v}` is applied to `{n}` twice; each of its values is a distinct binder"),
+            ));
+        }
+        seen.push(n.as_str());
+        if !family_domains_agree(domain, ty) {
+            return Err(LoweringError::unsupported(
+                arg.span,
+                format!("`{n}` ranges over `{ty}`, and `{v}` is a family over `{domain}`"),
+            ));
+        }
+    }
+    if members[at].kind.family_bound().is_some() {
+        return Err(LoweringError::unsupported(
+            sub.span,
+            format!("`{v}`'s values are bounded twice"),
+        ));
+    }
+    let depth = ctx.type_binders.len();
+    ctx.type_binders
+        .extend(scope.iter().map(|(n, t)| (n.node.clone(), t.clone())));
+    let lowered = lower_type_expr(sup, ctx);
+    ctx.type_binders.truncate(depth);
+    let bound = lowered?;
+    let free = crate::ccl::subst::type_free_vars(&bound);
+    if let Some((b, _)) = scope
+        .iter()
+        .find(|(b, _)| free.contains(&Name::raw(b.node.clone())))
+    {
+        return Err(LoweringError::unsupported(
+            sup.span,
+            format!(
+                "a bound that reads the `forall`'s binder `{}` is not supported yet",
+                b.node
+            ),
+        ));
+    }
+    members[at].kind = crate::ccl::ty::TypeKind::family(domains, Some(bound));
+    members[at].bound_at = Some(sup.span);
+    Ok(())
 }
 
 /// A trait type written at `span`, `Container(C)`, lowered over the type parameters
@@ -3172,7 +3359,7 @@ pub(super) fn lower_type_expr_or_poly(
             requires,
         } => {
             let snapshot = ctx.snapshot_type_aliases();
-            let scoped = ctx.type_params_in_scope.len();
+            let scoped = ctx.type_param_scope();
             let poly = declare_type_params(type_params, ctx).and_then(|mut params| {
                 let (requires, named) = lower_named_requirements(requires, Some(&mut params), ctx)?;
                 // The body reads the associated types of the requirements the clause names.
@@ -3187,7 +3374,7 @@ pub(super) fn lower_type_expr_or_poly(
                     body,
                 })))
             });
-            ctx.type_params_in_scope.truncate(scoped);
+            ctx.end_type_params(scoped);
             ctx.restore_type_aliases(snapshot);
             poly
         }
@@ -4360,6 +4547,18 @@ fn lower_type_application(
                     domain: Box::new(key.clone()),
                     codomain: Box::new(value),
                 });
+            }
+            // A family parameter passed on is the family it applies, read at the key.
+            if let Some(PassedOnFamily { mut binders, app }) =
+                passed_on_family(v, std::slice::from_ref(&key), "the map's key", ctx)?
+            {
+                let (k, key) = binders.pop().expect("one binder per key");
+                return Ok(Type::pi_kinded(
+                    k,
+                    key,
+                    app,
+                    crate::ccl::FunKind::Data(None),
+                ));
             }
             Ok(Type::full_map_of(key, lower_type_expr(v, ctx)?))
         }

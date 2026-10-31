@@ -2536,7 +2536,8 @@ where
 
 /// `requires R₀, R₁, …`, the clause that ends a `def` signature or a polymorphic
 /// type. A requirement is a trait type, `Addable(A, B)`, optionally naming its instance,
-/// `a: Addable(A, B)`, or a bound on a named instance's associated type, `a::Output <: T`.
+/// `a: Addable(A, B)`, a bound on a named instance's associated type, `a::Output <: T`, or
+/// requirements under a `forall` that binds values ([`requirement`]).
 ///
 /// Spec: `docs/chl-spec.md`, "Trait requirements".
 fn requires_clause<'src, I, E>(
@@ -2544,7 +2545,7 @@ fn requires_clause<'src, I, E>(
 ) -> impl Parser<'src, I, Vec<Spanned<Requirement>>, PErr<'src>> + Clone
 where
     I: ValueInput<'src, Token = Token, Span = Span>,
-    E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
+    E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone + 'src,
 {
     just(Token::Requires).ignore_then(
         requirement(expr)
@@ -2555,43 +2556,84 @@ where
 }
 
 /// One requirement: a trait type, `Addable(A, B)`, and before it the name the requirement
-/// binds its instance to, if it names one; or a bound, `a::Output <: T`.
+/// binds its instance to, if it names one; a bound, `a::Output <: T`; a type below another,
+/// `V(k) <: U`; or requirements under a `forall` that binds values, `forall (k: K) V(k) <: U`,
+/// one of them or a parenthesised group (`docs/chl-spec.md`, "Family parameters").
 fn requirement<'src, I, E>(
     expr: E,
 ) -> impl Parser<'src, I, Spanned<Requirement>, PErr<'src>> + Clone
 where
     I: ValueInput<'src, Token = Token, Span = Span>,
-    E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
+    E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone + 'src,
 {
-    // `requires Transaction:` ends a signature with the `:` a binder would take, so the bare
-    // trait type is the alternative, not an optional binder before it.
-    let ident = select! { Token::Ident(s) => s }.map_with(|s, e| Spanned::new(e.span(), s));
-    let binder = ident.then_ignore(just(Token::Colon));
-    // `a::Output <: T`: a bound on an associated type of the instance a requirement names.
-    let bound = ident
-        .then_ignore(just(Token::ColonColon))
-        .then(ident)
-        .then_ignore(just(Token::LtColon))
-        .then(expr.clone())
-        .map(|((instance, member), bound)| Requirement::Bound {
-            instance,
-            member,
+    recursive(move |requirement| {
+        // `requires Transaction:` ends a signature with the `:` a binder would take, so the
+        // bare trait type is the alternative, not an optional binder before it.
+        let ident = select! { Token::Ident(s) => s }.map_with(|s, e| Spanned::new(e.span(), s));
+        let binder = ident.then_ignore(just(Token::Colon));
+        // `a::Output <: T`: a bound on an associated type of the instance a requirement names.
+        let bound = ident
+            .then_ignore(just(Token::ColonColon))
+            .then(ident)
+            .then_ignore(just(Token::LtColon))
+            .then(expr.clone())
+            .map(|((instance, member), bound)| Requirement::Bound {
+                instance,
+                member,
+                bound,
+            });
+        // `V(k) <: U`. Tried after the associated-type bound, which it would also read, and
+        // before a trait type, which `V(k)` alone would be.
+        let subtype = expr
+            .clone()
+            .then_ignore(just(Token::LtColon))
+            .then(expr.clone())
+            .map(|(sub, sup)| Requirement::Subtype { sub, sup });
+        // `forall (k: K) R` or `forall (k: K) (R₀, R₁)`: the parentheses after the binders
+        // group requirements, since braces in a type never group.
+        let forall = just(Token::Forall)
+            .ignore_then(
+                ident
+                    .then_ignore(just(Token::Colon))
+                    .then(expr.clone())
+                    .separated_by(just(Token::Comma))
+                    .at_least(1)
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(just(Token::LParen), just(Token::RParen)),
+            )
+            .then(choice((
+                requirement
+                    .clone()
+                    .separated_by(just(Token::Comma))
+                    .at_least(1)
+                    .allow_trailing()
+                    .collect::<Vec<_>>()
+                    .delimited_by(just(Token::LParen), just(Token::RParen)),
+                requirement.clone().map(|r| vec![r]),
+            )))
+            .map(|(binders, requirements)| Requirement::Forall {
+                binders,
+                requirements,
+            });
+        choice((
+            forall,
             bound,
-        });
-    choice((
-        bound,
-        binder
-            .then(trait_type(expr.clone()))
-            .map(|(b, ty)| Requirement::Trait {
-                binder: Some(b),
+            subtype,
+            binder
+                .then(trait_type(expr.clone()))
+                .map(|(b, ty)| Requirement::Trait {
+                    binder: Some(b),
+                    ty: ty.node,
+                }),
+            trait_type(expr.clone()).map(|ty| Requirement::Trait {
+                binder: None,
                 ty: ty.node,
             }),
-        trait_type(expr).map(|ty| Requirement::Trait {
-            binder: None,
-            ty: ty.node,
-        }),
-    ))
-    .map_with(|r, e| Spanned::new(e.span(), r))
+        ))
+        .map_with(|r, e| Spanned::new(e.span(), r))
+        .boxed()
+    })
 }
 
 /// A trait type, `Addable(A, B)`: a name, optionally applied to its operand types. An
@@ -3231,7 +3273,7 @@ mod tests {
     fn requirement_binder(r: &Requirement) -> Option<&str> {
         match r {
             Requirement::Trait { binder, .. } => binder.as_ref().map(|b| b.node.as_str()),
-            Requirement::Bound { .. } => panic!("expected a trait requirement, got {r:?}"),
+            _ => panic!("expected a trait requirement, got {r:?}"),
         }
     }
 
@@ -3239,7 +3281,7 @@ mod tests {
     fn requirement_trait(r: &Requirement) -> &TraitType {
         match r {
             Requirement::Trait { ty, .. } => ty,
-            Requirement::Bound { .. } => panic!("expected a trait requirement, got {r:?}"),
+            _ => panic!("expected a trait requirement, got {r:?}"),
         }
     }
 
@@ -5026,6 +5068,52 @@ mod tests {
         let transaction = requirement_trait(&requires[2].node);
         assert_eq!(transaction.name.as_str(), "Transaction");
         assert!(transaction.args.is_empty());
+    }
+
+    /// A `forall` in a `requires` clause binds values over one requirement, or over a
+    /// parenthesised group, and a requirement may bound a type, `V(k) <: U`.
+    #[test]
+    fn a_forall_requirement_binds_values_over_its_requirements() {
+        let m = parse_m(indoc! {"
+            def f(K, V: K => Type, W: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) V(k) <: _ |=> Int, forall (k: K) (V(k) <: Int, W(k) <: Int), Equatable(K, K):
+                1
+        "});
+        let (_, _, requires) = def_signature(&m);
+        let shapes: Vec<(Vec<&str>, usize)> = requires
+            .iter()
+            .take(2)
+            .map(|r| match &r.node {
+                Requirement::Forall {
+                    binders,
+                    requirements,
+                } => {
+                    assert!(
+                        requirements
+                            .iter()
+                            .all(|r| matches!(r.node, Requirement::Subtype { .. })),
+                        "{requirements:?}"
+                    );
+                    (
+                        binders.iter().map(|(b, _)| b.node.as_str()).collect(),
+                        requirements.len(),
+                    )
+                }
+                other => panic!("expected a `forall` requirement, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(shapes, [(vec!["k"], 1), (vec!["k"], 2)]);
+        assert_eq!(
+            requirement_trait(&requires[2].node).name.as_str(),
+            "Equatable"
+        );
+        let Requirement::Forall { requirements, .. } = &requires[0].node else {
+            unreachable!("checked above")
+        };
+        let Requirement::Subtype { sub, sup } = &requirements[0].node else {
+            unreachable!("checked above")
+        };
+        assert!(matches!(&sub.node, Expr::Call { .. }), "{sub:?}");
+        assert!(matches!(&sup.node, Expr::FunctionType { .. }), "{sup:?}");
     }
 
     /// A requirement may bind its instance to a name, beside one that binds none.

@@ -1002,6 +1002,9 @@ fn constrain_type_kinds(
         rhs: Box::new(rhs.clone()),
     };
     match (sub, sup) {
+        (TypeKind::Family { .. }, _) | (_, TypeKind::Family { .. }) => {
+            unreachable!("a family's kind is a family parameter's, and no witness ranges over it")
+        }
         // The universe admits every domain, so nothing is left to ask.
         (_, TypeKind::Type) => Ok(()),
         // Candidates are members, so containment is membership, once per member.
@@ -1139,6 +1142,9 @@ fn admits(
     // materialized position, predicates included, so what is left open is a variable.
     let open = mode == Membership::Check && crate::ccl::subst::type_contains_infer(d);
     match k {
+        TypeKind::Family { .. } => {
+            unreachable!("a family's kind is a family parameter's, and no witness ranges over it")
+        }
         TypeKind::Type => Ok(()),
         // A barrier variable is a head nothing has resolved yet, so it abstains.
         TypeKind::UIntRanges => match d {
@@ -2336,8 +2342,16 @@ fn constrain_go_impl(
             }
         }
         // A family's bound holds at every value it is applied to.
-        (Type::FamilyApp(app), _) if !matches!(rhs.peel_refinements(), Type::FamilyApp(b) if b.param == app.param) => {
+        (Type::FamilyApp(app), _) if !matches!(rhs.peel_refinements(), Type::FamilyApp(b) if b.param == app.param) =>
+        {
             match &app.param.bound {
+                // A bound on a family's values is a family itself, read at the application's
+                // terms (`docs/chl-spec.md`, "Family parameters").
+                Some(Type::Family { .. }) => {
+                    let at = crate::ccl::subst::family_bound_at(app)
+                        .expect("a family parameter's bound is a family");
+                    constrain_go(&at, rhs, sl, sr, cache, scope)
+                }
                 Some(bound) => constrain_go(bound, rhs, sl, sr, cache, scope),
                 None => Err(ConstrainError::Mismatch {
                     lhs: Box::new(lhs.clone()),

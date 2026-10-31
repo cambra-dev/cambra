@@ -142,10 +142,25 @@ impl PolyScheme {
             pending.sort_by(|a, b| a.0.cmp(&b.0));
             for (param, instantiation) in pending {
                 done.insert(param.id);
+                // A family parameter this freshening re-opens carries its bound on its own.
+                if param.arity > 0 {
+                    continue;
+                }
                 if let Some(bound) = &param.bound {
                     let bound = freshen_above(self.level, bound, at, &mut cache);
                     bounds.push((instantiation, bound, param.bound_at));
                 }
+            }
+        }
+        // An instantiated family parameter's variable is below its bound at the variable's own
+        // binders ([`FreshenCache::family_params`]).
+        let mut families: Vec<_> = cache.family_params.values().cloned().collect();
+        families.sort_by(|a, b| a.0.cmp(&b.0));
+        for (param, names, var) in families {
+            if let Some(bound) = &param.bound {
+                let fresh = freshen_above(self.level, bound, at, &mut cache);
+                let bound = crate::ccl::subst::family_at_names(&fresh, &names);
+                bounds.push((var, bound, param.bound_at));
             }
         }
         Instance {
@@ -266,7 +281,10 @@ pub struct FreshenCache {
     /// read the binders beside it, one per term the parameter is applied to. An application
     /// is the variable with those binders discharged to its terms
     /// (`src/ccl/design/nominal-types.md`, "Family parameters").
-    pub family_params: HashMap<crate::ccl::ty::TypeParamId, (Vec<crate::ccl::Name>, Type)>,
+    pub family_params: HashMap<
+        crate::ccl::ty::TypeParamId,
+        (Rc<crate::ccl::ty::TypeParam>, Vec<crate::ccl::Name>, Type),
+    >,
 }
 
 impl FreshenCache {
@@ -501,10 +519,14 @@ fn freshen_family_app(
         let fresh = match cache.params.get(&param.id) {
             Some((_, Type::Param(p))) => Rc::clone(p),
             _ => {
+                let bound = param
+                    .bound
+                    .as_ref()
+                    .map(|b| freshen_above(lim, b, target, cache));
                 let p = crate::ccl::ty::TypeParam::opened_family(
                     param.spelling.clone(),
                     target.level_of(param.level()),
-                    None,
+                    bound,
                     param.bound_at,
                     param.arity,
                 );
@@ -532,9 +554,11 @@ fn freshen_family_app(
             _ => target.level_of(param.level()),
         };
         let var = Type::Infer(InferVar::fresh_in(level, &telescope));
-        cache.family_params.insert(param.id, (names, var));
+        cache
+            .family_params
+            .insert(param.id, (Rc::clone(param), names, var));
     }
-    let (names, var) = &cache.family_params[&param.id];
+    let (_, names, var) = &cache.family_params[&param.id];
     crate::ccl::subst::discharge_binders(names, var, &args)
 }
 

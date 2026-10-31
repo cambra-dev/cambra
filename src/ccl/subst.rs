@@ -3320,6 +3320,54 @@ pub fn open_family_body(n: usize, body: &Type, mut at: impl FnMut(usize) -> Mapp
     out
 }
 
+/// The closed family `family` ([`Type::Family`]) at the binders `names`, one per binder of it.
+///
+/// The body is opened at the family's own binder names and then renamed to `names`, not opened
+/// at `names` directly: a variable in the body may read the family's binders by name, and only
+/// the rename reaches it, suspending on it as an application's does ([`discharge_binders`]).
+pub fn family_at_names(family: &Type, names: &[Name]) -> Type {
+    let Type::Family { binders, body } = family else {
+        panic!("a family is opened at its binders: {family}")
+    };
+    debug_assert_eq!(binders.len(), names.len(), "one name per binder");
+    let own: Vec<Name> = binders
+        .iter()
+        .zip(names)
+        .map(|((n, _), to)| n.clone().unwrap_or_else(|| to.clone()))
+        .collect();
+    let opened = open_family_body(binders.len(), body, |j| Mapping::Rename(own[j].clone()));
+    let renames: BTreeMap<Binder, Mapping> = own
+        .iter()
+        .zip(names)
+        .filter(|(o, to)| o != to)
+        .map(|(o, to)| (o.clone(), Mapping::Rename(to.clone())))
+        .collect();
+    if renames.is_empty() {
+        return opened;
+    }
+    Subst::of_binders(renames).apply_type(&opened)
+}
+
+/// The bound on a family parameter's values at an application of it, `U` at `k` for `V(k)`
+/// under `requires forall (k: K) V(k) <: U` (`docs/chl-spec.md`, "Family parameters"); `None`
+/// where the parameter
+/// states no such bound.
+pub fn family_bound_at(app: &crate::ccl::ty::FamilyApp) -> Option<Type> {
+    let bound @ Type::Family { binders, .. } = app.param.bound.as_ref()? else {
+        return None;
+    };
+    let names: Vec<Name> = binders
+        .iter()
+        .map(|(n, _)| n.clone().unwrap_or_else(|| Name::fresh("k")))
+        .collect();
+    let terms: Vec<Rc<TypedExpr>> = app.args.iter().map(|a| Rc::clone(&a.term)).collect();
+    Some(discharge_binders(
+        &names,
+        &family_at_names(bound, &names),
+        &terms,
+    ))
+}
+
 /// `ty`, read under the names `binders`, at the terms `args`: a family applied to them
 /// ([`Type::FamilyApp`]). A term that is a binder renames the family's binder to it, which is
 /// the pattern-fragment case an application of a family parameter always is

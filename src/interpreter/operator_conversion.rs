@@ -1728,6 +1728,9 @@ the compilation declined outlives it here"
             // length is the value's. `Type::Txn` converts the same way for the same reason:
             // its positions are minted at runtime.
             crate::ccl::TypeKind::UIntRanges => Ok(Extent::Base(BaseType::UInt)),
+            crate::ccl::TypeKind::Family { .. } => unreachable!(
+                "a family's kind is a family parameter's, and no witness ranges over it"
+            ),
             // Naming the candidates says which domains are possible and still not which one
             // this value is, so the bound is over their keys as above. Candidates disagreeing
             // on that have no common key type to bound.

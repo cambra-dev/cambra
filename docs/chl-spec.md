@@ -168,7 +168,7 @@ trait, and `trait` a trait ([6.8 Nominal types and methods [Decided]](#68-nomina
 
 `forall` begins a polymorphic type (**[Planned]**,
 [Polymorphic type annotations](#polymorphic-type-annotations)), and in a `requires` clause a
-requirement at every value of a type (**[Planned]**, [Family parameters](#family-parameters)).
+requirement at every value of a type ([Family parameters](#family-parameters)).
 `requires` begins a `requires` clause, which ends a `def` signature or a polymorphic type
 ([Trait requirements](#trait-requirements)). `requires Transaction` is **[Planned]**
 ([8.7 Direction [Decided]: transactions as contextual parameters](#87-direction-decided-transactions-as-contextual-parameters)).
@@ -3150,10 +3150,12 @@ gs = Groups::new(groupby([1, 2, 3], \x -> x > 1))
   and family applications, in any annotation: `def f(g: (k: _) |=> (_ |=> Int))`.
 - **A family parameter is applied to distinct binders in scope.** `V(k)` names a binder of a type
   around it, and `V(k, k)`, `V(k + 1)` and a bare `V` are errors. Passing it to another family
-  parameter passes the family: `type Outer(K, V: K => Type) = Groups(K, V)`.
-- **A family parameter's index types are its binders' types.** The binder it is applied to and
-  the family parameter it is passed to range over its index type, up to refinements:
-  `V: String => Type` is not applied to `(k: Bool)`.
+  parameter, or as `FullMap`'s value type, passes the family:
+  `type Outer(K, V: K => Type) = Groups(K, V)`, and `FullMap(K, V)` is `FullMap(K, \k -> V(k))`,
+  which is `(k: K) |=> V(k)`.
+- **A family parameter's index types are its binders' types.** The binder it is applied to, the
+  family parameter it is passed to, and the map key it is read at range over its index type, up
+  to refinements: `V: String => Type` is not applied to `(k: Bool)`.
 - **A family is written as a lambda, `\k: K -> T`**, a type `T` for each value `k` of `K`, which
   `T` reads in refinements and family applications. A binder written without its type, `\k -> T`,
   ranges over the type the family is taken at, and a family over two values is `\a, b -> T`. A
@@ -3168,7 +3170,16 @@ gs = Groups::new(groupby([1, 2, 3], \x -> x > 1))
   is a subtype of `T₂` at every `k`. A family parameter's variance is computed from the
   constructors as any parameter's is, and an index type is invariant.
 
-A bound on a family's values (**[Planned]**) is a requirement in a `requires` clause, under a
+A polymorphic type's and a `def`'s type parameter may be a family parameter too. Two parameters of
+one family state that two values share it, and inside the body an application of it is opaque, as
+a type parameter is:
+
+```python
+def first(K, V: K => Type, a: Groups(K, V), b: Groups(K, V)) => Groups(K, V):
+    a
+```
+
+A bound on a family's values is a requirement in the definition's `requires` clause, under a
 `forall` that binds the family's index:
 
 ```ebnf
@@ -3184,19 +3195,25 @@ def total(K, V: K => Type, g: FullMap(K, V)) => Int requires forall (k: K) V(k) 
 ```
 
 - **`forall (k: K)` binds `k`, a value of `K`, over exactly one requirement.** Parentheses group
-  several: `requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int), Equatable(K, K)`
-  states the first two at every `k` and the third once. Braces in a type never group
+  several: `requires forall (k: K) (V(k) <: U, W(k) <: X)`. Braces in a type never group
   ([2.4 Atoms](#24-atoms)), so a bound is written bare, as above, or in parentheses.
 - **`forall` means every value.** A use is checked with `k` abstract, so the requirement holds at
   every value of `K`, not only at the values the use's arguments hold.
-- **A requirement may bound a type, `V(k) <: U`.** Every value of the family is a subtype of `U`.
+- **`V(k) <: U` bounds the family's values.** Every value of the family is a subtype of `U`, the
+  call is rejected where one is not, and the body uses `V(k)` as a `U`, as it uses a bounded type
+  parameter ([Kinds and bounds](#kinds-and-bounds)). `V` is a family parameter of the definition,
+  applied to the `forall`'s binders, each once, and bounded once. Each binder ranges over the
+  index type `V` takes it at, up to refinements.
 - **A hole in a requirement under `forall` is inferred separately at each value of `k`.** It is a
   family parameter of the definition, a type for each `k`, where a hole in an unquantified clause
   is a type parameter ([Trait requirements](#trait-requirements)). So `_ |=> Int` admits groups
   whose domains differ by key.
 
-**[Planned]** — a family parameter of a polymorphic type or a `def`, `forall (K, V: K => Type)`,
-and a `requires` clause on a type declaration, which has none.
+**[Planned]** — a bound that reads a `forall`'s binder,
+`requires forall (k: K) V(k) <: {Int where _ <= k}`; a trait requirement under `forall`,
+`requires forall (k: K) (i: Iterable(V(k)), i::Elements <: _ |=> Int)`; a subtype requirement on
+anything but a family parameter's values; and a `requires` clause on a type declaration, which has
+none.
 
 #### A nominal type is opaque
 
@@ -3502,9 +3519,9 @@ in the kind `K`:
   `T: SubtypesOf(U)`. An open tuple `U` is not itself among them, no value having its type
   ([Tuple width](#tuple-width)).
 - `K => Type` is every family over the values of `K`, a type for each value. `=>` is the kind
-  arrow and `K` is a type. A parameter of this kind is a family parameter, declared on a type
-  declaration ([Family parameters](#family-parameters)); on a `def`'s or a `forall`'s it is
-  **[Planned]**.
+  arrow and `K` is a type. A parameter of this kind is a family parameter, declared in a type
+  declaration's, a `def`'s or a `forall`'s parameter list
+  ([Family parameters](#family-parameters)).
 
 Any other kind, such as a listing `T: [Int, String]`, is **[Open]** and an error.
 
@@ -3602,8 +3619,8 @@ instance ([Equality and order](#equality-and-order)).
   requirement with no name has it too, so under `requires Iterable(C)`, `C`'s collection is some
   collection of some type, and a loop over a `C` types. A hole in a bound, the trait's or the
   clause's, is a type parameter of the definition, and one in a requirement under `forall (k: K)`
-  is a family parameter of it, a type for each `k` (**[Planned]**,
-  [Family parameters](#family-parameters)). Under
+  is a family parameter of it, a type for each `k` ([Family parameters](#family-parameters)).
+  Under
   `requires i: Iterable(C), i::Elements <: _ |=> T`, `C`'s collection has values of type `T`,
   whatever its domain.
 
