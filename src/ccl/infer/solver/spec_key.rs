@@ -501,6 +501,7 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // substituted with a sentinel binder, which would be a third case in the id space
         // that everything else has to know not to mean anything.
         Type::WitnessRef(_) | Type::WitnessProjection(_) => KeyView::anonymous_witness(),
+        Type::FamilyApp(_) => unreachable!("a generalized family is born after inference"),
         // A refinement rides the position it refines. The accumulated substitution
         // is forced on it exactly as `compact_go` does, so a suspended
         // dependent-application discharge lands in the key as the predicate the

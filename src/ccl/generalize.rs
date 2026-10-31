@@ -5,7 +5,9 @@
 //! eliminated, so a type written under that parameter, `sum : ({0..4 | key(__elem) == k} ⤇
 //! Int) ⇒ Int`, names a binder that no longer encloses it. Where the name sits in what the
 //! morphism receives, the type is generalized over that part, `∀ (D <: 0..4). (D ⤇ Int) ⇒
-//! Int`, and each use instantiates it from the type it is handed ([`instantiate`]).
+//! Int`, and each use instantiates it from the type it is handed ([`instantiate`]). A part that
+//! also reads a binder of the type's own is a family over that binder, applied to it:
+//! `∀ (D, D1(_)). ((k : D) ⤇ (D1(k) ⤇ Int)) ⇒ …`.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -31,11 +33,35 @@ pub(crate) fn instantiate(ty: &Type, incoming: &Type) -> Type {
         .domain()
         .unwrap_or_else(|| panic!("a generalized type is a function, got {ty}"));
     let params: Vec<TypeParamId> = poly.params.iter().map(|p| p.param.id).collect();
-    // Matched with every binder of `incoming` read by name: a type a parameter is bound to can
-    // read them, and an index would read a different binder at the depth it lands at.
     let mut bound = HashMap::new();
-    match_params(&domain, &opened_deep(incoming), &params, &mut bound);
+    match_params(&domain, incoming, &params, &mut bound);
     closed_deep(&instantiate_with(poly, &bound))
+}
+
+/// What a generalized parameter is instantiated to ([`match_params`]).
+#[derive(Clone)]
+enum Instance {
+    /// The type the parameter stands for. A family's reads its `binders` by name, one per
+    /// argument, and an application discharges each to its argument ([`substitute`]); a
+    /// plain parameter's has none.
+    Type {
+        binders: Vec<crate::ccl::Name>,
+        ty: Type,
+    },
+    /// Another parameter of the same arity, applied where it was.
+    Param(Rc<crate::ccl::ty::TypeParam>),
+}
+
+impl Instance {
+    /// Whether this instance is `id` itself.
+    fn is_param(&self, id: TypeParamId) -> bool {
+        match self {
+            Instance::Param(q) => q.id == id,
+            Instance::Type { binders, ty } => {
+                binders.is_empty() && matches!(ty, Type::Param(q) if q.id == id)
+            }
+        }
+    }
 }
 
 /// `body` quantified over those of `params` it reads; `body` itself where it reads none.
@@ -57,7 +83,10 @@ pub(crate) fn requantify(params: &[crate::ccl::ty::PolyParam], body: Type) -> Ty
 }
 
 /// `poly` with the parameters `bound` maps replaced, quantified over the rest it still reads.
-fn instantiate_with(poly: &crate::ccl::ty::PolyType, bound: &HashMap<TypeParamId, Type>) -> Type {
+fn instantiate_with(
+    poly: &crate::ccl::ty::PolyType,
+    bound: &HashMap<TypeParamId, Instance>,
+) -> Type {
     let body = substitute(&poly.body, bound);
     let reads = free_params(&body);
     let unbound: Vec<_> = poly
@@ -138,6 +167,24 @@ fn opened_deep(ty: &Type) -> Type {
             domain: Box::new(opened_deep(domain)),
             codomain: Box::new(opened_deep(&crate::ccl::subst::open_codomain(ty, codomain))),
         },
+        // A component's references to the components before it are read by their names, as a
+        // codomain's to its function's binder. A tuple naming each component has them.
+        Type::DepTuple(cs) if cs.iter().all(|(n, _)| n.is_some()) => {
+            let opened = crate::ccl::subst::open_tuple_components(cs, |j, _| {
+                crate::ccl::subst::Mapping::Rename(
+                    cs[j]
+                        .0
+                        .clone()
+                        .unwrap_or_else(|| unreachable!("every component is named")),
+                )
+            });
+            Type::DepTuple(
+                cs.iter()
+                    .zip(opened)
+                    .map(|((n, _), t)| (n.clone(), opened_deep(&t)))
+                    .collect(),
+            )
+        }
         _ => {
             let mut out = ty.clone();
             out.walk_children_mut(|c| *c = opened_deep(c));
@@ -160,44 +207,17 @@ fn closed_deep(ty: &Type) -> Type {
             closed_deep(codomain),
             fun_kind.clone(),
         ),
+        // Closed over the components' names, and the plain tuple where none reads another.
+        Type::DepTuple(cs) => Type::dep_tuple(
+            cs.iter()
+                .map(|(n, t)| (n.clone(), closed_deep(t)))
+                .collect(),
+        ),
         _ => {
             let mut out = ty.clone();
             out.walk_children_mut(|c| *c = closed_deep(c));
             out
         }
-    }
-}
-
-/// `ty` with each function the supertype `like` names at the same position named alike, where
-/// `ty` names none.
-fn adopt_binder_names(ty: Type, like: &Type) -> Type {
-    match (ty, like.peel_refinements()) {
-        (
-            Type::Fun {
-                name,
-                fun_kind,
-                domain,
-                codomain,
-            },
-            Type::Fun {
-                name: like_name,
-                domain: like_domain,
-                codomain: like_codomain,
-                ..
-            },
-        ) => Type::Fun {
-            name: name.or_else(|| like_name.clone()),
-            fun_kind,
-            domain: Box::new(adopt_binder_names(*domain, like_domain)),
-            codomain: Box::new(adopt_binder_names(*codomain, like_codomain)),
-        },
-        (Type::Tuple(ts), Type::Tuple(likes)) if ts.len() == likes.len() => Type::Tuple(
-            ts.into_iter()
-                .zip(likes)
-                .map(|(t, l)| adopt_binder_names(t, l))
-                .collect(),
-        ),
-        (other, _) => other,
     }
 }
 
@@ -229,19 +249,16 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
         // two generic types are compared with one parameter for both.
         return match &opened {
             Type::Poly(still) => {
-                // Matched with every binder read by name: a type a parameter is bound to can
-                // read the supertype's binders, and an index would read a different one at
-                // the depth it lands at. The instance binds them under the same names, the two
-                // being one function up to those names, and is closed over them again.
-                let named = opened_deep(sup);
+                // Matched with every binder read by name ([`match_params`]), and closed over
+                // them again.
                 let mut bound = HashMap::new();
                 match_params(
                     &still.body,
-                    &named,
+                    sup,
                     &still.params.iter().map(|q| q.param.id).collect::<Vec<_>>(),
                     &mut bound,
                 );
-                closed_deep(&adopt_binder_names(substitute(&still.body, &bound), &named))
+                closed_deep(&substitute(&still.body, &bound))
             }
             // An instance can hold generalized types of its own, a pair of generic morphisms whose
             // pairing is generic too, which meet the supertype's components in turn.
@@ -324,6 +341,7 @@ fn align_sub(sub: &Type, sup: &Type) -> Type {
 pub(crate) fn shape(ty: &Type) -> Type {
     match ty.peel_refinements() {
         Type::Param(p) if p.generalized => p.bound.as_ref().map_or_else(|| ty.clone(), shape),
+        Type::FamilyApp(app) => app.param.bound.as_ref().map_or_else(|| ty.clone(), shape),
         _ => ty.clone(),
     }
 }
@@ -338,7 +356,7 @@ pub(crate) fn renamed_by_match(part: &Type, pattern: &Type, actual: &Type) -> Ty
     let params: Vec<TypeParamId> = free_params(pattern).iter().map(|q| q.id).collect();
     let mut bound = HashMap::new();
     match_params(pattern, actual, &params, &mut bound);
-    bound.retain(|id, to| !matches!(to, Type::Param(q) if q.id == *id));
+    bound.retain(|id, to| !to.is_param(*id));
     if bound.is_empty() {
         return part.clone();
     }
@@ -393,14 +411,26 @@ pub(crate) fn holds_generalized_type(ty: &Type) -> bool {
 
 /// Bind each parameter of `params` that `pattern` holds where `actual` has a type, outermost
 /// first.
+///
+/// Both are matched with every binder read by name: a type a parameter is bound to can read
+/// `actual`'s binders, and an index would read a different binder at the depth it lands at. A
+/// family applied to binders of `pattern` is bound to the type `actual` has there over the
+/// binders of `actual` they correspond to.
 fn match_params(
     pattern: &Type,
     actual: &Type,
     params: &[TypeParamId],
-    out: &mut HashMap<TypeParamId, Type>,
+    out: &mut HashMap<TypeParamId, Instance>,
 ) {
     let mut met = Vec::new();
-    match_direct(pattern, actual, params, out, &mut met);
+    match_direct(
+        &opened_deep(pattern),
+        &opened_deep(actual),
+        params,
+        &[],
+        out,
+        &mut met,
+    );
     // A parameter's bound reads parameters the input fixes only through it: in `∀ (𝐷 <: 𝑅,
     // 𝑃 <: ((𝐷 ⤇ 𝑉), 𝐷)). 𝑃 ⇒ (𝐷 ⤇ 𝑉)`, the type 𝑃 is handed is a subtype of its bound, and
     // a collection's domain is invariant, so that type's structure names 𝐷. Matched after
@@ -418,32 +448,47 @@ fn match_params(
             },
             other => other.clone(),
         };
-        match_direct(bound, &structure, params, out, &mut met);
+        match_direct(bound, &structure, params, &[], out, &mut met);
     }
 }
 
+/// The parameter `pattern` is, applied to the terms it is applied to, with the refinements it
+/// states beside it: `𝐷`, `𝐷₁(𝑘)`, or either refined.
+fn param_at(
+    pattern: &Type,
+) -> Option<(
+    &Rc<crate::ccl::ty::TypeParam>,
+    &[crate::ccl::ty::FamilyArg],
+    Option<&crate::ccl::RefinementSet>,
+)> {
+    let (base, stated) = match pattern {
+        Type::Refinement(base, stated) => (base.as_ref(), Some(stated)),
+        other => (other, None),
+    };
+    match base {
+        Type::Param(p) => Some((p, &[], stated)),
+        Type::FamilyApp(app) => Some((&app.param, &app.args, stated)),
+        _ => None,
+    }
+}
+
+/// [`match_params`] at one position, `pairs` the binders of `pattern` around it with the
+/// binders of `actual` each corresponds to, innermost last.
 fn match_direct(
     pattern: &Type,
     actual: &Type,
     params: &[TypeParamId],
-    out: &mut HashMap<TypeParamId, Type>,
+    pairs: &[(crate::ccl::Name, crate::ccl::Name)],
+    out: &mut HashMap<TypeParamId, Instance>,
     met: &mut Vec<(Rc<crate::ccl::ty::TypeParam>, Type)>,
 ) {
-    if let Type::Param(p) = pattern
+    if let Some((p, args, stated)) = param_at(pattern)
         && params.contains(&p.id)
     {
-        out.entry(p.id).or_insert_with(|| actual.clone());
-        met.push((Rc::clone(p), actual.clone()));
-        return;
-    }
-    // A refined parameter, `{D | 𝑝}`, is what `actual` is without the refinements the pattern
-    // states.
-    if let Type::Refinement(base, stated) = pattern
-        && let Type::Param(p) = base.as_ref()
-        && params.contains(&p.id)
-    {
-        let rest = match actual {
-            Type::Refinement(abase, refinements) => Type::refined(
+        // A refined parameter, `{D | 𝑝}`, is what `actual` is without the refinements the
+        // pattern states.
+        let rest = match (stated, actual) {
+            (Some(stated), Type::Refinement(abase, refinements)) => Type::refined(
                 (**abase).clone(),
                 refinements
                     .iter()
@@ -451,49 +496,79 @@ fn match_direct(
                     .cloned()
                     .collect(),
             ),
-            other => other.clone(),
+            _ => actual.clone(),
         };
-        out.entry(p.id).or_insert(rest.clone());
-        met.push((Rc::clone(p), rest));
+        // A family is bound only where each argument is a binder of the pattern, which names
+        // the binder of `actual` the type there reads in its place.
+        let binders: Option<Vec<crate::ccl::Name>> = args
+            .iter()
+            .map(|a| match &a.term.node {
+                crate::ccl::TypedExprNode::Var(n) => pairs
+                    .iter()
+                    .rev()
+                    .find(|(ours, _)| ours == n)
+                    .map(|(_, theirs)| theirs.clone()),
+                _ => None,
+            })
+            .collect();
+        if let Some(binders) = binders {
+            out.entry(p.id).or_insert_with(|| Instance::Type {
+                binders,
+                ty: rest.clone(),
+            });
+        }
+        if args.is_empty() {
+            met.push((Rc::clone(p), rest));
+        }
         return;
     }
     match (pattern.peel_refinements(), actual.peel_refinements()) {
         (
             Type::Fun {
+                name: pn,
                 domain: pd,
                 codomain: pc,
                 ..
             },
             Type::Fun {
+                name: an,
                 domain: ad,
                 codomain: ac,
                 ..
             },
         ) => {
-            match_direct(pd, ad, params, out, met);
-            match_direct(pc, ac, params, out, met);
+            match_direct(pd, ad, params, pairs, out, met);
+            let mut inner = pairs.to_vec();
+            if let Some(ours) = pn {
+                inner.push((ours.clone(), an.clone().unwrap_or_else(|| ours.clone())));
+            }
+            match_direct(pc, ac, params, &inner, out, met);
         }
         (Type::Tuple(ps), Type::Tuple(acts)) if ps.len() == acts.len() => {
             for (p, a) in ps.iter().zip(acts) {
-                match_direct(p, a, params, out, met);
+                match_direct(p, a, params, pairs, out, met);
             }
         }
         (Type::DepTuple(ps), Type::DepTuple(acts)) if ps.len() == acts.len() => {
-            for ((_, p), (_, a)) in ps.iter().zip(acts) {
-                match_direct(p, a, params, out, met);
+            let mut inner = pairs.to_vec();
+            for ((pn, p), (an, a)) in ps.iter().zip(acts) {
+                match_direct(p, a, params, &inner, out, met);
+                if let Some(ours) = pn {
+                    inner.push((ours.clone(), an.clone().unwrap_or_else(|| ours.clone())));
+                }
             }
         }
         (Type::Record(ps), Type::Record(acts)) => {
             for (label, p) in ps {
                 if let Some((_, a)) = acts.iter().find(|(l, _)| l == label) {
-                    match_direct(p, a, params, out, met);
+                    match_direct(p, a, params, pairs, out, met);
                 }
             }
         }
         (Type::Variant(ps, _), Type::Variant(acts, _)) => {
             for (key, p) in ps {
                 if let Some((_, a)) = acts.iter().find(|(k, _)| k == key) {
-                    match_direct(p, a, params, out, met);
+                    match_direct(p, a, params, pairs, out, met);
                 }
             }
         }
@@ -502,9 +577,19 @@ fn match_direct(
 }
 
 /// `ty` with each parameter `bound` maps replaced, in the terms it quotes as well. A refined
-/// parameter's refinements join what replaces it ([`Type::refined`]).
-pub(crate) fn substitute(ty: &Type, bound: &HashMap<TypeParamId, Type>) -> Type {
-    let mut out = substitute_go(ty, bound);
+/// parameter's refinements join what replaces it ([`Type::refined`]), and a family's
+/// application is its instance with the instance's binders discharged to the arguments.
+fn substitute(ty: &Type, bound: &HashMap<TypeParamId, Instance>) -> Type {
+    // An application's arguments read the binders around it, so they are discharged into the
+    // instance with those binders read by name, an index being loose there.
+    let families = bound
+        .values()
+        .any(|i| matches!(i, Instance::Type { binders, .. } if !binders.is_empty()));
+    let mut out = if families {
+        closed_deep(&substitute_go(&opened_deep(ty), bound))
+    } else {
+        substitute_go(ty, bound)
+    };
     // The terms a type quotes carry type slots of their own, written over the same
     // parameters. The rewrite is the same type's, so it keeps the identities it copies.
     crate::ccl::provenance::preserving_ids(|| {
@@ -513,7 +598,7 @@ pub(crate) fn substitute(ty: &Type, bound: &HashMap<TypeParamId, Type>) -> Type 
             &crate::ccl::ccl_utils::PredMemo::default(),
             &(),
             &mut |term, _| {
-                fn in_term(e: &mut crate::ccl::Expr, bound: &HashMap<TypeParamId, Type>) {
+                fn in_term(e: &mut crate::ccl::Expr, bound: &HashMap<TypeParamId, Instance>) {
                     e.walk_type_slots_mut(|t| *t = substitute(t, bound));
                     e.walk_children_mut(|c| in_term(c, bound));
                 }
@@ -525,9 +610,38 @@ pub(crate) fn substitute(ty: &Type, bound: &HashMap<TypeParamId, Type>) -> Type 
     out
 }
 
-fn substitute_go(ty: &Type, bound: &HashMap<TypeParamId, Type>) -> Type {
+fn substitute_go(ty: &Type, bound: &HashMap<TypeParamId, Instance>) -> Type {
     match ty {
-        Type::Param(p) => bound.get(&p.id).cloned().unwrap_or_else(|| ty.clone()),
+        Type::Param(p) => match bound.get(&p.id) {
+            Some(Instance::Type { ty, .. }) => ty.clone(),
+            Some(Instance::Param(q)) => Type::Param(Rc::clone(q)),
+            None => ty.clone(),
+        },
+        Type::FamilyApp(app) => match bound.get(&app.param.id) {
+            // The arguments are the application's own terms, moved into the instance, so
+            // they keep their identities, as `substitute`'s rewrite of quoted terms does.
+            Some(Instance::Type { binders, ty: at }) => {
+                crate::ccl::provenance::preserving_ids(|| {
+                    let is_itself = |b: &crate::ccl::Name, a: &crate::ccl::ty::FamilyArg| matches!(&a.term.node, crate::ccl::TypedExprNode::Var(n) if n == b);
+                    let env: HashMap<crate::ccl::Name, crate::ccl::Expr> = binders
+                        .iter()
+                        .zip(&app.args)
+                        .filter(|(b, a)| !is_itself(b, a))
+                        .map(|(b, a)| (b.clone(), (*a.term).clone()))
+                        .collect();
+                    if env.is_empty() {
+                        at.clone()
+                    } else {
+                        crate::ccl::subst::Subst::discharging(&env).apply_type(at)
+                    }
+                })
+            }
+            Some(Instance::Param(q)) => Type::FamilyApp(crate::ccl::ty::FamilyApp {
+                param: Rc::clone(q),
+                args: app.args.clone(),
+            }),
+            None => ty.clone(),
+        },
         Type::Refinement(base, refinements) => {
             Type::refined(substitute_go(base, bound), refinements.clone())
         }
@@ -1054,13 +1168,12 @@ fn quantified(
     // one of those binders stays where the binder is in scope, around its parameter.
     let mut own = Vec::new();
     type_binders(ty, &mut own);
-    // A predicate reads a binder of the type by name, or by index where the type stores it
-    // closed: a dependent tuple's later component reads an earlier one so.
+    // The type is opened, so a predicate reads its binders by name, a dependent tuple's
+    // components included.
     let reads_own = |r: &crate::ccl::Refinement| {
-        reads_an_index(&r.predicate)
-            || crate::ccl::subst::refinement_free_vars(r)
-                .iter()
-                .any(|n| own.contains(n))
+        crate::ccl::subst::refinement_free_vars(r)
+            .iter()
+            .any(|n| own.contains(n))
     };
     for i in 0..groups.len() {
         let group = groups[i].clone();
@@ -1076,8 +1189,6 @@ fn quantified(
         // scope and no binder of the type; a sum's witness read through a term out of scope
         // ranges over the witness's own kind.
         let (kind, bound) = part_range(&group, out_of_scope, &reads_own);
-        let param = crate::ccl::ty::TypeParam::generalized(spelling(i), bound);
-        let d = Type::Param(Rc::clone(&param));
         let staying: crate::ccl::RefinementSet = match &group {
             Type::Refinement(_, refinements) => refinements
                 .iter()
@@ -1085,6 +1196,44 @@ fn quantified(
                 .cloned()
                 .collect(),
             _ => crate::ccl::RefinementSet::default(),
+        };
+        // The type's own binders the parameter's part reads, outermost first: the part is a
+        // type per value of them, so the parameter is a family over them, applied to them
+        // where the part stands.
+        let part_reads = match &group {
+            Type::Refinement(base, refinements) => {
+                let mut names = crate::ccl::subst::type_free_vars(base);
+                for r in refinements
+                    .iter()
+                    .filter(|r| !staying.iter().any(|s| s == *r))
+                {
+                    names.extend(crate::ccl::subst::refinement_free_vars(r));
+                }
+                names
+            }
+            other => crate::ccl::subst::type_free_vars(other),
+        };
+        let mut indices: Vec<crate::ccl::Name> = Vec::new();
+        for b in &own {
+            if part_reads.contains(b) && !indices.contains(b) {
+                indices.push(b.clone());
+            }
+        }
+        let param =
+            crate::ccl::ty::TypeParam::generalized_family(spelling(i), bound, indices.len());
+        let d = if indices.is_empty() {
+            Type::Param(Rc::clone(&param))
+        } else {
+            let args = indices
+                .iter()
+                .map(|b| {
+                    let mut read = crate::ccl::Expr::var(b.clone());
+                    read.ty = binder_domain(&body, b)
+                        .unwrap_or_else(|| unreachable!("`{b}` is a binder of the type `{body}`"));
+                    Rc::new(read)
+                })
+                .collect();
+            Type::FamilyApp(crate::ccl::ty::FamilyApp::new(Rc::clone(&param), args))
         };
         let d = Type::refined(d, staying);
         body = abstract_deep(&body, &group, &d, out_of_scope);
@@ -1110,6 +1259,30 @@ fn quantified(
     })))
 }
 
+/// The type `ty` gives its binder `b`: a function's domain, or a dependent tuple's component.
+fn binder_domain(ty: &Type, b: &crate::ccl::Name) -> Option<Type> {
+    match ty {
+        Type::Fun {
+            name: Some(n),
+            domain,
+            ..
+        } if n == b => return Some((**domain).clone()),
+        Type::DepTuple(cs) => {
+            if let Some((_, t)) = cs.iter().find(|(n, _)| n.as_ref() == Some(b)) {
+                return Some(t.clone());
+            }
+        }
+        _ => {}
+    }
+    let mut found = None;
+    ty.walk_children(|c| {
+        if found.is_none() {
+            found = binder_domain(c, b);
+        }
+    });
+    found
+}
+
 /// `groups` ordered so that each comes after every other it contains, as a nested type or as
 /// its base with a subset of its refinements ([`abstract_go`]): a part is quantified once,
 /// and a part holding it reads its parameter.
@@ -1126,16 +1299,6 @@ fn contained_first(mut groups: Vec<Type>) -> Vec<Type> {
         ordered.push(groups.remove(next));
     }
     ordered
-}
-
-/// Whether `term`, a predicate, reads a binder of the type it stands in by index: a term binder
-/// inside it is a name, so a [`crate::ccl::Name::PiBound`] it reads points outside it.
-fn reads_an_index(term: &crate::ccl::Expr) -> bool {
-    matches!(&term.node, crate::ccl::TypedExprNode::Var(n) if n.pi_bound_index().is_some()) || {
-        let mut found = false;
-        term.walk_children(|c| found |= reads_an_index(c));
-        found
-    }
 }
 
 /// What a part a type is generalized over ranges over, and the bound its parameter states: a
@@ -1291,9 +1454,11 @@ fn abstract_go(ty: &Type, group: &Type, d: &Type) -> Type {
             .collect();
         return Type::refined(d.clone(), rest);
     }
+    // The type is abstracted opened, its dependent tuples reading their components by name;
+    // closing it again ([`closed_deep`]) makes a tuple whose components read none plain.
     let mut out = ty.clone();
     out.walk_children_mut(|c| *c = abstract_go(c, group, d));
-    renormalized(out)
+    out
 }
 
 /// `ty`, a dependent tuple a rewrite may have left with no component reading an earlier one,
@@ -1457,15 +1622,18 @@ fn params_renamed_apart(
     if !p.params.iter().any(|q| avoid.contains(&q.param.id)) {
         return Rc::clone(p);
     }
-    let mut fresh: HashMap<TypeParamId, Type> = HashMap::new();
+    let mut fresh: HashMap<TypeParamId, Instance> = HashMap::new();
     let params = p
         .params
         .iter()
         .map(|q| {
             let bound = q.param.bound.as_ref().map(|b| substitute(b, &fresh));
-            let param =
-                crate::ccl::ty::TypeParam::generalized(q.param.spelling.clone(), bound.clone());
-            fresh.insert(q.param.id, Type::Param(Rc::clone(&param)));
+            let param = crate::ccl::ty::TypeParam::generalized_family(
+                q.param.spelling.clone(),
+                bound.clone(),
+                q.param.arity,
+            );
+            fresh.insert(q.param.id, Instance::Param(Rc::clone(&param)));
             crate::ccl::ty::PolyParam {
                 param,
                 kind: match bound {
@@ -1492,6 +1660,11 @@ pub(crate) fn free_params(ty: &Type) -> Vec<Rc<crate::ccl::ty::TypeParam>> {
             {
                 out.push(Rc::clone(p));
             }
+            Type::FamilyApp(app)
+                if !bound.contains(&app.param.id) && !out.iter().any(|q| q.id == app.param.id) =>
+            {
+                out.push(Rc::clone(&app.param));
+            }
             Type::Poly(p) => {
                 let depth = bound.len();
                 bound.extend(p.params.iter().map(|q| q.param.id));
@@ -1504,4 +1677,71 @@ pub(crate) fn free_params(ty: &Type) -> Vec<Rc<crate::ccl::ty::TypeParam>> {
     let mut out = Vec::new();
     go(ty, &mut Vec::new(), &mut out);
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ccl::{Expr, FunKind, Name};
+
+    /// `((𝑘 : σ₁(𝑟)) ⤇ (σ₁(𝑘 ▷ 𝑟) ⤇ Int)) ⇒ ((𝑘 : σ₁(𝑟)) × σ₁(𝑘 ▷ 𝑟) ⤇ Int)`: `uncurry`'s type
+    /// over the rows of `𝑟`, each with domains of its own, its binder spelled `k`.
+    fn uncurry_over_rows_of(r: &str, k: &str) -> Type {
+        let projected = |term: Expr| {
+            Type::WitnessProjection(crate::ccl::ty::WitnessProjection::new(Rc::new(term), 0))
+        };
+        let k = Name::from(k);
+        let row_of = || projected(Expr::var(r));
+        let inner_of = || projected(Expr::apply(Expr::var(k.clone()), Expr::var(r)));
+        let int = Type::Base(crate::ccl::BaseType::Int);
+        let curried = Type::pi_kinded(
+            k.clone(),
+            row_of(),
+            Type::pi_kinded(
+                Name::from("j"),
+                inner_of(),
+                int.clone(),
+                FunKind::Data(None),
+            ),
+            FunKind::Data(None),
+        );
+        let flat = Type::pi_kinded(
+            Name::from("p"),
+            Type::dep_tuple(vec![
+                (Some(k.clone()), row_of()),
+                (Some(Name::from("j")), inner_of()),
+            ]),
+            int,
+            FunKind::Data(None),
+        );
+        Type::pi_kinded(Name::from("g"), curried, flat, FunKind::Compute)
+    }
+
+    /// A part reading the type's own binder generalizes to a family applied to it, and a use
+    /// instantiates the family at the binder of the type it is handed, keeping the tuple
+    /// dependent.
+    #[test]
+    fn a_part_reading_the_types_binder_is_a_family_instantiated_at_it() {
+        let uncurry = uncurry_over_rows_of("xss", "k");
+        let out_of_scope = |n: &Name| *n == Name::from("xss");
+        let generic = generalized(&uncurry, &out_of_scope, "uncurry", &mut HashMap::new());
+        let Type::Poly(poly) = &generic else {
+            panic!("the type reads `xss`, so it is generic: {generic}")
+        };
+        let arities: Vec<usize> = poly.params.iter().map(|p| p.param.arity).collect();
+        assert_eq!(arities, vec![0, 1], "{generic}");
+        assert!(
+            crate::ccl::subst::type_free_vars(&generic).is_empty(),
+            "{generic}"
+        );
+        // Handed a function whose binder is spelled apart from the type's, the family is read
+        // at the type's own binder.
+        let incoming = uncurry_over_rows_of("row", "i")
+            .domain()
+            .unwrap_or_else(|| unreachable!("a function"));
+        assert_eq!(
+            instantiate(&generic, &incoming),
+            uncurry_over_rows_of("row", "k")
+        );
+    }
 }

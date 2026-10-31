@@ -221,9 +221,16 @@ fn hash_type<'a>(
         // run-varying `uid`, exactly like a free term variable.
         T::ChanDom(name, _level) => name.base().hash(state),
         // A type parameter's identity is per-compilation, like a binder's `uid`, so
-        // its spelling is what is folded. None survives inference, so this is
-        // reached only by a hash of a pre-inference tree.
+        // its spelling is what is folded. Only a generalized one survives inference.
         T::Param(param) => param.spelling.hash(state),
+        // A family is a parameter, folded by its spelling, applied to terms the type quotes,
+        // each hashed as a predicate is.
+        T::FamilyApp(app) => {
+            app.param.spelling.hash(state);
+            for a in &app.args {
+                hash_rel(&a.term, env, wenv, free).hash(state);
+            }
+        }
         // A declaration is identified by its module's path and its name, the same in
         // every compilation. Two versions of a program may declare one name differently,
         // and the hash is what compares them, so it folds the declaration's body too: each

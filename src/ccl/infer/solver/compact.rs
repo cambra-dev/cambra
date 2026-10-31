@@ -81,9 +81,13 @@ pub enum AtomKey {
     /// A witness projected through a sum's value ([`Type::WitnessProjection`]), which
     /// matches only a projection equal to it: one witness, named the same way.
     Projection(ClosedAtom),
+    /// A generalized family applied to terms ([`Type::FamilyApp`]), which matches only an
+    /// application equal to it: one family, at the same values.
+    Family(ClosedAtom),
 }
 
-/// A type held whole as an [`AtomKey`]: a [`Type::WitnessProjection`]. It holds no inference variable, so the solver has nothing to
+/// A type held whole as an [`AtomKey`]: a [`Type::WitnessProjection`] or a
+/// [`Type::FamilyApp`]. It holds no inference variable, so the solver has nothing to
 /// relate inside it, and it matches only a type `==` to it up to binder names, which
 /// [`Type::without_pi_names`] strips (references are indices, so nothing else names a binder). `==`
 /// on a refinement ignores its predicate's type slots, so the atom is keyed by `Type`'s own `Hash`,
@@ -177,6 +181,7 @@ impl AtomKey {
             Type::ChanDom(n, l) => Some(AtomKey::ChanDom(n.clone(), *l)),
             Type::Param(p) => Some(AtomKey::Param(Rc::clone(p))),
             Type::WitnessProjection(_) => Some(AtomKey::Projection(ClosedAtom::new(ty))),
+            Type::FamilyApp(_) => Some(AtomKey::Family(ClosedAtom::new(ty))),
             _ => None,
         }
     }
@@ -190,7 +195,7 @@ impl AtomKey {
             AtomKey::Witness(b) => Type::WitnessRef(*b),
             AtomKey::ChanDom(n, l) => Type::ChanDom(n.clone(), *l),
             AtomKey::Param(p) => Type::Param(Rc::clone(p)),
-            AtomKey::Projection(a) => (*a.ty).clone(),
+            AtomKey::Projection(a) | AtomKey::Family(a) => (*a.ty).clone(),
         }
     }
 }
@@ -2886,8 +2891,24 @@ fn compact_go_inner(
             let Type::WitnessProjection(p) = &ty else {
                 unreachable!("a substitution maps a projection to a projection or reads it back")
             };
-            let ty = Type::WitnessProjection(st.scope.close_projection(p));
+            let ty = Type::WitnessProjection(st.scope.close_quoted(p));
             CompactType::from_atom(AtomKey::from_type(&ty).unwrap())
+        }
+        // A family's arguments are quoted terms, substituted and closed as a projection's is.
+        // Only Check meets one: a generalized type is born after inference.
+        Type::FamilyApp(_) => {
+            let ty = subst_acc
+                .without_witnesses()
+                .unwrap_or_else(|| subst_acc.clone())
+                .apply_type(ty);
+            let Type::FamilyApp(app) = &ty else {
+                unreachable!("a substitution maps a family's application to one")
+            };
+            let mut closed = app.clone();
+            for arg in &mut closed.args {
+                *arg = st.scope.close_quoted(arg);
+            }
+            CompactType::from_atom(AtomKey::from_type(&Type::FamilyApp(closed)).unwrap())
         }
         // `emit_let` opens a `Poly` and binds at its body; none reaches the solver.
         Type::Poly(_) => unreachable!("a polymorphic type reached `compact`"),
