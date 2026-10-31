@@ -242,3 +242,58 @@ fn a_nested_group_by_in_a_family_is_not_compiled_yet() {
         Value::Int(10),
     );
 }
+
+/// A function's family parameter, which its parameters' types pass on: two arguments of one
+/// family, and a `FullMap` whose value type is the family.
+#[test]
+fn a_function_takes_a_family_parameter() {
+    check_scalar(
+        indoc! {r#"
+            def same(K, V: K => Type, g: FullMap(K, V)) => FullMap(K, V):
+                g
+            sum([sum(grp) for grp in same(groupby([1, 2, 3], \x -> x > 1))])
+        "#},
+        Value::Int(6),
+    );
+    check_scalar(
+        &format!(
+            "{GROUPS}{}{SUM_GROUPS}",
+            indoc! {r#"
+                def first(K, V: K => Type, a: Groups(K, V), b: Groups(K, V)) => Groups(K, V):
+                    a
+                g = Groups::new(groupby([1, 2, 3], \x -> x > 1))
+                gs = first(g, g)
+            "#}
+        ),
+        Value::Int(6),
+    );
+}
+
+/// A polymorphic annotation's family parameter.
+#[test]
+fn a_polymorphic_type_takes_a_family_parameter() {
+    check_scalar(
+        &format!(
+            "{GROUPS}{}{SUM_GROUPS}",
+            indoc! {r#"
+                wrap: forall (K, V: K => Type) FullMap(K, V) => Groups(K, V) = \g -> Groups::new(g)
+                gs = wrap(groupby([1, 2, 3], \x -> x > 1))
+            "#}
+        ),
+        Value::Int(6),
+    );
+}
+
+/// Inside a function, an application of its family parameter is opaque, as a type parameter is,
+/// so a group typed by it is no collection.
+#[test]
+fn a_family_parameter_is_opaque_in_its_function() {
+    check_compile_error(
+        indoc! {r#"
+            def total(K, V: K => Type, g: FullMap(K, V)) => Int:
+                sum([sum(grp) for grp in g])
+            total(groupby([1, 2, 3], \x -> x > 1))
+        "#},
+        "Expected function type at Aggregate, found V(k)",
+    );
+}

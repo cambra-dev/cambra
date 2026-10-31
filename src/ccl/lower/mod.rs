@@ -1138,6 +1138,15 @@ impl LoweringContext {
             .or_else(|| crate::ccl::nominal::builtin(name))
     }
 
+    /// Leave the scope of the type parameters declared after the first `scoped`, family
+    /// parameters among them.
+    pub(super) fn end_type_params(&mut self, scoped: usize) {
+        self.type_params_in_scope.truncate(scoped);
+        let in_scope = &self.type_params_in_scope;
+        self.family_params
+            .retain(|(name, ..)| in_scope.iter().any(|n| n == name.as_str()));
+    }
+
     /// Whether `name` is a type parameter of a definition being lowered.
     pub(super) fn is_type_param(&self, name: &str) -> bool {
         self.type_params_in_scope.iter().any(|n| n == name)

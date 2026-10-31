@@ -3098,7 +3098,14 @@ gs = Groups::new(groupby([1, 2, 3], \x -> x > 1))
   when `T₁` is a subtype of `T₂` at every `k`. A family parameter's variance is computed from the
   constructors as any parameter's is, and an index type is invariant.
 
-**[Planned]** — a family parameter of a polymorphic type or a `def`, `forall (K, V: K => Type)`.
+A polymorphic type's and a `def`'s type parameter may be a family parameter too. Two parameters of
+one family state that two values share it, and inside the body an application of it is opaque, as
+a type parameter is:
+
+```python
+def first(K, V: K => Type, a: Groups(K, V), b: Groups(K, V)) => Groups(K, V):
+    a
+```
 
 #### A nominal type is opaque
 
@@ -3398,9 +3405,9 @@ in the kind `K`:
   `T: SubtypesOf(U)`.
 
 Any other kind, such as a listing `T: [Int, String]`, is **[Open]** and an error. A type written as
-a kind, as in `T: Int`, is an error. A family's kind, `V: K => Type`, is written on a type declaration's
-parameter ([Family parameters](#family-parameters)); on a `def`'s or a `forall`'s it is
-**[Planned]**.
+a kind, as in `T: Int`, is an error. A family's kind, `V: K => Type`, makes a family parameter
+([Family parameters](#family-parameters)), which a `def`'s or a `forall`'s parameter list declares
+as a type declaration's does.
 
 `T <: U` restricts `T` to subtypes of `U`. The body uses a value of type `T` as a `U`. The caller
 receives its own type for `T`.

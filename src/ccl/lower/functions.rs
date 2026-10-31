@@ -490,7 +490,7 @@ pub(super) fn lower_def(
         )
     });
     ctx.named_requirements.truncate(in_scope);
-    ctx.type_params_in_scope.truncate(scoped);
+    ctx.end_type_params(scoped);
     ctx.restore_type_aliases(aliases);
     result
 }
@@ -574,8 +574,15 @@ pub(super) fn lower_def_declared(
 /// and one per parameter for a `Mut`-parameter one.
 /// Every type parameter `ty` names, into `out`.
 pub(super) fn collect_params(ty: &Type, out: &mut HashSet<crate::ccl::ty::TypeParamId>) {
-    if let Type::Param(param) = ty {
-        out.insert(param.id);
+    match ty {
+        Type::Param(param) => {
+            out.insert(param.id);
+        }
+        // An application of a family parameter is an occurrence of it.
+        Type::FamilyApp(app) => {
+            out.insert(app.param.id);
+        }
+        _ => {}
     }
     ty.walk_children(|child| collect_params(child, out));
 }
