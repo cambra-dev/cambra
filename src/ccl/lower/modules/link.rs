@@ -67,6 +67,23 @@ pub(super) fn spine(chain: &Expr) -> (Vec<&Name>, &Expr) {
     (binders, at)
 }
 
+/// Put each site in `e` that no run holds yet under the run at `run`.
+fn in_run(e: &mut Expr, run: &RunPath) {
+    if let Some(site) = &e.site
+        && site.run == RunPath::default()
+    {
+        e.site = Some(site.in_run(run));
+    }
+    if let TypedExprNode::Feed {
+        site: Some(site), ..
+    } = &mut e.node
+        && site.run == RunPath::default()
+    {
+        *site = site.in_run(run);
+    }
+    e.walk_children_mut(|child| in_run(child, run));
+}
+
 /// `chain` with `body` in place of its one placeholder, at the end of its spine.
 pub fn fill_module_body(mut chain: Expr, body: Expr) -> Expr {
     let mut at = &mut chain;
@@ -1006,6 +1023,7 @@ impl<'a> ProgramLowering<'a> {
         });
         let scope = self.scope(ast, Some(module.clone()), ctx);
         ctx.begin_module(scope.clone());
+        ctx.sites.add_module(module.segments(), &ast.body);
         let lowered = lower_module_body(ast, ctx);
         let sinks = std::mem::take(&mut ctx.declared_sinks);
         let run_checks = std::mem::take(&mut ctx.run_type_checks);
@@ -1649,7 +1667,10 @@ impl<'a> ProgramLowering<'a> {
                 )
             });
             let run = match created {
-                Some(created) => {
+                Some(mut created) => {
+                    // The run's places are this run's ([`crate::ccl::site`]). A run nested in
+                    // it has stamped its own deeper path already.
+                    in_run(&mut created.chain, &path.child(name.clone()));
                     // The rest of the module, below the run, reaches it.
                     for (spelling, binder) in created.names {
                         qualified.insert(QualifiedName::new(name.clone()).then(&spelling), binder);

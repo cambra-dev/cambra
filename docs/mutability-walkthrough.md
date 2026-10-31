@@ -635,14 +635,15 @@ keyed by its commit time (`by_commit_time` over the site's commit records), not 
 that produced it, since a denied iteration commits nothing:
 
 ```
-in letrec out : (Txn | Txn ⤇ Int) = to_out_0 ⊎ to_out_1
+in letrec out : ({`out<<{Txn} | `out<<#1{Txn}} ⤇ Int) = to_out_0 ⊎ to_out_1
 in pool ▷ final_read
 ```
 
-That `|` is a `Union` domain — an anonymous positional sum, not a tagged variant. Its arm still
-records which site replied; [A reply's `Txn` domain overstates its keys
-[Interim]](../src/ccl/design/mutability.md#a-replys-txn-domain-overstates-its-keys-interim)
-records why that is more than one store's clock needs.
+Each arm of that domain is tagged by its feed's site, `out<<` and `out<<#1`
+([sites.md](../src/ccl/design/sites.md#channel-tags)), so the arm records which site replied; [A
+reply's `Txn` domain overstates its keys
+[Interim]](../src/ccl/design/mutability.md#a-replys-txn-domain-overstates-its-keys-interim) records
+why that is more than one store's clock needs.
 
 ### `rewrite_as_of_reads`, then `plan_loops` and the rest of planning
 

@@ -745,17 +745,30 @@ impl ColumnValue {
     /// `rows` from it, so callers describing a union row-by-row do not have to
     /// compute the partition themselves.
     pub fn positional_union(tags: &[usize], variants: Vec<ColumnValue>) -> ColumnValue {
-        let arms = variants
+        let keys = (0..variants.len()).map(FieldKey::Index).collect();
+        ColumnValue::tagged_union(keys, tags, variants)
+    }
+
+    /// [`Self::positional_union`] with arm `j` keyed `keys[j]`: the shape a feed's channel
+    /// produces, each arm keyed by its site's tag.
+    pub fn tagged_union(
+        keys: Vec<FieldKey>,
+        tags: &[usize],
+        variants: Vec<ColumnValue>,
+    ) -> ColumnValue {
+        assert_eq!(keys.len(), variants.len(), "one key per arm");
+        let arms = keys
             .into_iter()
+            .zip(variants)
             .enumerate()
-            .map(|(j, values)| {
+            .map(|(j, (key, values))| {
                 let rows: Vec<usize> = tags
                     .iter()
                     .enumerate()
                     .filter(|(_, t)| **t == j)
                     .map(|(row, _)| row)
                     .collect();
-                (FieldKey::Index(j), UnionArm::new(rows, values))
+                (key, UnionArm::new(rows, values))
             })
             .collect();
         let cv = ColumnValue::Union(TagMap::from_arms(arms));

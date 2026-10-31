@@ -1012,6 +1012,13 @@ The two rows are collections over different keys, which have no join, and they n
 typed at its own position. `box` (§7.4) is needed where a value's type does not follow from its
 position, as between the values of two `<<` statements.
 
+A stream fed from more than one site holds each contribution at its site paired with its position.
+A site is a `<<` together with the calls that reached it, so one `<<` in a function called from two
+places is two sites. A site that never fires is still one of the stream's sites. A program reads the
+contributions and never a site. An edit moves a site only when it adds or removes a `<<` of the same
+target, or a call of the same function, earlier in the same definition, or renames a definition
+around it.
+
 The collection a feed accumulates is, like any CHL
 collection, **unordered** (§3): multiple `<<` statements — across
 different iterations of a `for` loop, or across multiple feed sites

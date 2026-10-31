@@ -5000,10 +5000,12 @@ fn eq_term_modulo_ty_slots_go(
             N::Feed {
                 name: n1,
                 value: v1,
+                ..
             },
             N::Feed {
                 name: n2,
                 value: v2,
+                ..
             },
         )
         | (

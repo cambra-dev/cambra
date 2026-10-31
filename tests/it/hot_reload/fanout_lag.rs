@@ -257,11 +257,22 @@ fn a_stdin_feed_repeats_the_value_at_the_cut_when_its_other_writer_is_edited() {
         reply.contains("reloaded"),
         "the reload is accepted: {reply}"
     );
-    // The driver prints each tile's `Debug` form, one string value per line.
+    // The driver prints each tile's `Debug` form, one string value per line of a `Strings`
+    // column. A channel's arm tags print quoted too, outside any `Strings` column.
+    let mut in_strings = false;
     let printed: Vec<&str> = out
         .lines()
         .map(str::trim)
-        .filter_map(|l| l.strip_prefix('"')?.strip_suffix("\","))
+        .filter_map(|l| {
+            match l {
+                "Strings(" => in_strings = true,
+                "]," | "]" => in_strings = false,
+                _ => {}
+            }
+            in_strings
+                .then(|| l.strip_prefix('"')?.strip_suffix("\","))
+                .flatten()
+        })
         .collect();
     assert_eq!(
         printed,

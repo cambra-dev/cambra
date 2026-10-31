@@ -955,7 +955,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
 
         TypedExprNode::ExprStmt { expr: e, body } => emit_expr_stmt(e, body, ctx)?,
 
-        TypedExprNode::Copair(exprs) => emit_copair(exprs, ctx)?,
+        TypedExprNode::Copair(exprs) => emit_copair(exprs, &recorded_ty, ctx)?,
         TypedExprNode::DisjointJoin(exprs) => emit_disjoint_join(exprs, &recorded_ty, ctx)?,
 
         TypedExprNode::Transact {
