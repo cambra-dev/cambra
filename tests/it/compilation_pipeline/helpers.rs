@@ -33,9 +33,9 @@ use std::panic::{self, AssertUnwindSafe};
 use std::rc::Rc;
 
 use bit_set::BitSet;
-use cambra::ccl::Expr;
 use cambra::ccl::context::{CompileResultExt, GlobalContext, compile_program};
 use cambra::ccl::load::LoadedProgram;
+use cambra::ccl::{Expr, FieldKey, Label, TagMap};
 use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
 use cambra::interpreter::{
     ColumnValue, Consumer, Predicate, Tile, Value, pull_laps, sort_function_by_domain, tuple_field,
@@ -179,6 +179,33 @@ pub(crate) fn run_program_with_ctx(
 // ---------------------------------------------------------------------------
 // Parity assertion helpers
 // ---------------------------------------------------------------------------
+
+/// The union column a feed's channel holds: arm `j` keyed by the tag of site `sites[j]`, with
+/// the rows `tags` gives it ([`ColumnValue::positional_union`]).
+pub(crate) fn channel_union(
+    sites: &[&str],
+    tags: &[usize],
+    variants: Vec<ColumnValue>,
+) -> ColumnValue {
+    ColumnValue::tagged_union(site_keys(sites), tags, variants)
+}
+
+/// The domain predicate holding every arm of a channel over `sites`.
+pub(crate) fn channel_predicate(sites: &[&str]) -> Predicate {
+    Predicate::over_every_tag(TagMap::from_arms(
+        site_keys(sites)
+            .into_iter()
+            .map(|k| (k, Predicate::True))
+            .collect(),
+    ))
+}
+
+fn site_keys(sites: &[&str]) -> Vec<FieldKey> {
+    sites
+        .iter()
+        .map(|s| FieldKey::Name(Label::new(*s)))
+        .collect()
+}
 
 /// Assert `code` produces `expected` via the pipeline path.
 pub(crate) fn check_tile(code: &str, expected: Tile) {

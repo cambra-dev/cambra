@@ -260,9 +260,11 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
     // this closure instead, which carries the original slots forward.
     let ty = e.ty.clone();
     let annotation = e.user_annotation.clone();
+    let site = e.site.clone();
     let rebuild = move |node: TypedExprNode| -> Expr {
         let mut out = Expr::preserve(id, node).with_ty(ty.clone());
         out.user_annotation = annotation.clone();
+        out.site = site.clone();
         out
     };
     let annotated_result = is_annotated_result(&e);
@@ -487,13 +489,14 @@ fn normalize(e: Expr, muts: &Muts) -> Expr {
             )
         }
 
-        TypedExprNode::Feed { name, value } => {
+        TypedExprNode::Feed { name, value, site } => {
             let (binds, value) = atomize_handle(*value, muts);
             let_chain(
                 binds,
                 rebuild(TypedExprNode::Feed {
                     name,
                     value: Box::new(value),
+                    site,
                 }),
             )
         }
@@ -833,9 +836,11 @@ fn atomize_stmt_effect(expr: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, E
     let id = expr.node_id();
     let ty = expr.ty.clone();
     let annotation = expr.user_annotation.clone();
+    let site = expr.site.clone();
     let rebuild = move |node: TypedExprNode| -> Expr {
         let mut out = Expr::preserve(id, node).with_ty(ty.clone());
         out.user_annotation = annotation.clone();
+        out.site = site.clone();
         out
     };
     match expr.node {
@@ -898,13 +903,14 @@ fn atomize_stmt_effect(expr: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, E
                 }),
             )
         }
-        TypedExprNode::Feed { name, value } => {
+        TypedExprNode::Feed { name, value, site } => {
             let (binds, value) = atomize_handle(*value, muts);
             (
                 binds,
                 rebuild(TypedExprNode::Feed {
                     name,
                     value: Box::new(value),
+                    site,
                 }),
             )
         }
@@ -1006,6 +1012,7 @@ fn normalize_apply_spine(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Ex
     let id = e.node_id();
     let ty = e.ty.clone();
     let annotation = e.user_annotation.clone();
+    let site = e.site.clone();
     let TypedExprNode::Apply { function, argument } = e.node else {
         unreachable!("guarded above")
     };
@@ -1025,6 +1032,7 @@ fn normalize_apply_spine(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Ex
     )
     .with_ty(ty);
     rebuilt.user_annotation = annotation;
+    rebuilt.site = site;
     (binds, rebuilt)
 }
 

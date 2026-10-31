@@ -1305,8 +1305,8 @@ no induction recurrence reaches it with one. Two further gaps follow from the sa
 
 - Every store's clock is `Txn`, so the type does not keep apart two stores' commit times, which are
   separate sequences.
-- A channel fed from two sites is `Txn | Txn`, whose positional arm records which site replied,
-  although one store's commit times never collide.
+- A channel fed from two sites is ``{`out<<{Txn} | `out<<#1{Txn}}``, whose arm records which site
+  replied, although one store's commit times never collide.
 
 Typing a reply at its image, `{Txn | __elem ▷ ((commits_j ≫ .time) ▷ collection_contains)}`, makes
 its domain its key set; a clock indexed by its store closes both gaps above.

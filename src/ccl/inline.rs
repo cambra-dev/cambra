@@ -314,10 +314,16 @@ fn fold_product_projection(expr: Expr) -> Expr {
     let TypedExprNode::Proj(key) = function.node else {
         unreachable!()
     };
-    into_product_components(*argument)
+    let mut component = into_product_components(*argument)
         .into_iter()
         .find_map(|(k, e)| (k == key).then_some(e))
-        .expect("the projected component was found above")
+        .expect("the projected component was found above");
+    // A projection called as a function stands at the call's site: the copy of the function
+    // that lands here is the one that call runs.
+    if let Some(call) = &expr.site {
+        reached_through(&mut component, call);
+    }
+    component
 }
 
 /// Whether `expr` is a projection, `𝑝 ▷ .𝑘`.
@@ -412,6 +418,9 @@ fn split_product_let(binding: &TypedBinding, product: Expr, body: Expr) -> Expr 
             );
             let mut var = Expr::var(binder).with_ty(expr.ty);
             var.user_annotation = expr.user_annotation;
+            // A projection called as a function stands at the call's site, which the
+            // component's copy at this use is reached through.
+            var.site = expr.site;
             return var;
         }
         let mut expr = expr;
@@ -594,6 +603,7 @@ fn inline_list_element_reads(mut expr: Expr, memo: &PredMemo) -> (Expr, bool) {
         ty,
         user_annotation,
         node_id,
+        site,
     } = expr;
     let TypedExprNode::Let {
         binding,
@@ -607,6 +617,7 @@ fn inline_list_element_reads(mut expr: Expr, memo: &PredMemo) -> (Expr, bool) {
                 ty,
                 user_annotation,
                 node_id,
+                site,
             },
             moved,
         );
@@ -654,6 +665,7 @@ fn inline_list_element_reads(mut expr: Expr, memo: &PredMemo) -> (Expr, bool) {
             ty,
             user_annotation,
             node_id,
+            site,
         },
         moved || here,
     )
@@ -885,6 +897,7 @@ fn inline_impl(expr: Expr, channels: &mut HashSet<Name>) -> Expr {
         ty,
         user_annotation,
         node_id,
+        site,
     } = expr;
 
     let new_node = match node {
@@ -999,6 +1012,7 @@ fn inline_impl(expr: Expr, channels: &mut HashSet<Name>) -> Expr {
                     None => inline_impl(body, channels),
                     Some(bound_expr) => Expr {
                         node_id,
+                        site,
                         node: TypedExprNode::Let {
                             binding,
                             bound_expr: Box::new(bound_expr),
@@ -1133,6 +1147,7 @@ fn inline_impl(expr: Expr, channels: &mut HashSet<Name>) -> Expr {
             );
             let mut expr = Expr {
                 node_id,
+                site,
                 node,
                 ty,
                 user_annotation,
@@ -1168,6 +1183,7 @@ fn inline_impl(expr: Expr, channels: &mut HashSet<Name>) -> Expr {
 
     Expr {
         node_id,
+        site,
         node: new_node,
         ty,
         user_annotation,
@@ -1317,7 +1333,14 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
     if let TypedExprNode::Var(ref n) = expr.node
         && n == name
     {
-        return lambda.clone();
+        // A call copies the body: the sites in the copy are reached through it
+        // (`crate::ccl::site`). A use that is not a call, such as a function passed as an
+        // argument, names no call, and its copy is reached where it is called.
+        let mut copy = lambda.clone();
+        if let Some(call) = &expr.site {
+            reached_through(&mut copy, call);
+        }
+        return copy;
     }
 
     // Substitute inside refinement predicates riding **every** type slot this
@@ -1343,6 +1366,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
             ty,
             user_annotation,
             node_id,
+            site,
         } = expr;
         let (function, argument) = match node {
             TypedExprNode::Apply { function, argument } => (function, argument),
@@ -1361,6 +1385,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
             _ => {
                 return Expr {
                     node_id,
+                    site,
                     node: TypedExprNode::Apply {
                         function: Box::new(function),
                         argument: Box::new(argument),
@@ -1382,6 +1407,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
         ty,
         user_annotation,
         node_id,
+        site,
     } = expr;
     let new_node = match node {
         TypedExprNode::Lambda { param, body } => {
@@ -1452,6 +1478,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
         node => {
             let mut expr = Expr {
                 node_id,
+                site,
                 node,
                 ty,
                 user_annotation,
@@ -1463,6 +1490,7 @@ fn inline_and_beta_reduce(expr: Expr, name: &Name, lambda: &Expr, memo: &PredMem
 
     Expr {
         node_id,
+        site,
         node: new_node,
         ty,
         user_annotation,
@@ -1550,6 +1578,8 @@ fn substitute_floating_lets(body: Expr, param: TypedBinding, argument: Expr) -> 
     }
     let reduced = if is_shared_computation(&value, &param.name, &body) {
         bind_argument(param, value, body)
+    } else if matches!(value.node, TypedExprNode::Lambda { .. }) && holds_a_site(&value) {
+        substitute_function(body, &param.name, &value)
     } else {
         substitute(body, &param.name, &value)
     };
@@ -1558,6 +1588,74 @@ fn substitute_floating_lets(body: Expr, param: TypedBinding, argument: Expr) -> 
         .fold(reduced, |body, (node_id, binding, bound_expr)| {
             Expr::let_in_preserving(node_id, binding, bound_expr, body)
         })
+}
+
+/// Extend every site in `e`, a copy of a function's body made for a call, with that call's
+/// site ([`crate::ccl::site::Site::through`]).
+fn reached_through(e: &mut Expr, call: &crate::ccl::site::Site) {
+    if let Some(site) = &e.site {
+        e.site = Some(site.through(call));
+    }
+    if let TypedExprNode::Feed {
+        site: Some(site), ..
+    } = &mut e.node
+    {
+        *site = site.through(call);
+    }
+    e.walk_children_mut(|child| reached_through(child, call));
+}
+
+/// Whether `e` holds a feed's or a call's site.
+fn holds_a_site(e: &Expr) -> bool {
+    e.site.is_some()
+        || matches!(e.node, TypedExprNode::Feed { site: Some(_), .. })
+        || e.any_child(holds_a_site)
+}
+
+/// Substitute the function `value` for `name` in `body`, where each call of it is a call of its
+/// own: the sites in each call's copy are reached through it, as a named function's are. A use
+/// that is not a call takes the plain copy, reached where it is called.
+///
+/// Each use is first renamed apart, so that [`substitute`] places every copy and keeps its
+/// capture avoidance. A mention in a type slot is not a use, and takes the plain copy.
+fn substitute_function(body: Expr, name: &Name, value: &Expr) -> Expr {
+    let mut uses = Vec::new();
+    let mut body = body;
+    rename_uses(&mut body, name, &mut uses);
+    let body = uses.into_iter().fold(body, |body, (renamed, call)| {
+        let mut copy = value.clone();
+        if let Some(call) = call {
+            reached_through(&mut copy, &call);
+        }
+        substitute(body, &renamed, &copy)
+    });
+    substitute(body, name, value)
+}
+
+/// Rename every free use of `name` in `e` to a name of its own, recording each with the call
+/// site it stood at, where it is a call.
+fn rename_uses(
+    e: &mut Expr,
+    name: &Name,
+    uses: &mut Vec<(Name, Option<std::rc::Rc<crate::ccl::site::Site>>)>,
+) {
+    let call = e.site.clone();
+    match &mut e.node {
+        TypedExprNode::Var(n) if n == name => {
+            let renamed = Name::fresh_like(name);
+            uses.push((renamed.clone(), call));
+            *n = renamed;
+        }
+        TypedExprNode::Lambda { param, .. } if &param.name == name => {}
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } if &binding.name == name => {
+            rename_uses(bound_expr, name, uses);
+        }
+        _ => e.walk_children_mut(|child| rename_uses(child, name, uses)),
+    }
 }
 
 /// Run [`inline_and_beta_reduce`] on every refinement predicate embedded in

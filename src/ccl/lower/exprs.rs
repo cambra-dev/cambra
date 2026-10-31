@@ -401,7 +401,9 @@ fn lower_curried_call(
     // curried `Apply`s are manufactured (the outermost `Apply` is the call's
     // image, tagged by `lower_expr`, whose entry overwrites the interim machinery
     // tag).
-    let reference = ctx.reference(callee, func_span);
+    let site = ctx.sites.site(func_span);
+    let mut reference = ctx.reference(callee, func_span);
+    reference.site = Some(site);
     let mut acc = ctx.tag_image(reference, func_span);
     for arg in args {
         let applied = Expr::apply(lower_call_arg(arg, ctx)?, acc);
@@ -464,7 +466,15 @@ fn lower_expression_call(
         let bound = Expr::let_bind(callee_name, lambda, call);
         return Ok(ctx.tag_machinery(bound, func.span, "lower.lambda_call"));
     }
-    apply_to_args(args, ctx, |ctx| lower_expr(func, ctx))
+    apply_to_args(args, ctx, |ctx| {
+        let mut callee = lower_expr(func, ctx)?;
+        // A field callee is a call of the function the field holds: inlining reaches that
+        // function's body through this place (`crate::ccl::site`).
+        if let ChlExpr::Attribute { attr_span, .. } = &func.node {
+            callee.site = Some(ctx.sites.site(*attr_span));
+        }
+        Ok(callee)
+    })
 }
 
 /// Apply the callee `callee` builds to a call's arguments: `f(a)` → `a ▷ f`, and
@@ -502,8 +512,11 @@ pub(super) fn lower_application(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     debug_assert!(!args.is_empty(), "an ordinary call has an argument");
+    let site = ctx.sites.site(func_span);
     apply_to_args(args, ctx, |ctx| {
-        let callee = ctx.reference(callee, func_span);
+        let mut callee = ctx.reference(callee, func_span);
+        // The call's place, which inlining extends the sites of the body it copies here with.
+        callee.site = Some(site);
         Ok(ctx.tag_image(callee, func_span))
     })
 }
@@ -852,7 +865,8 @@ pub(super) fn lower_feed(
     let Some(name) = feed_target(target, "handle binding", ctx)? else {
         return Ok(Expr::error());
     };
-    Ok(Expr::feed(name, lower_expr(value, ctx)?))
+    let site = ctx.sites.site(target.span);
+    Ok(Expr::feed_at(name, lower_expr(value, ctx)?, Some(site)))
 }
 
 /// The feed `target` names: a name, or another module's member, `a::events`
@@ -1202,13 +1216,21 @@ mod tests {
         ));
     }
 
+    /// A context holding the places of `expr`, as a module's lowering names them before it
+    /// lowers a call ([`crate::ccl::site::Naming`]).
+    fn placing(expr: &Spanned<ChlExpr>) -> LoweringContext {
+        let mut ctx = LoweringContext::default();
+        let stmt = Spanned::new(expr.span, chl_parser::ast::Stmt::Expr(expr.clone()));
+        ctx.sites.add_module(&[], std::slice::from_ref(&stmt));
+        ctx
+    }
+
     /// A single-argument call to an unknown (non-builtin, non-source) name lowers
     /// to an `Apply` node — general function application.
     #[test]
     fn test_lower_unknown_function_single_arg() {
         let expr = parse_expr("foo(x)");
-        let ccl = lower_expr(&expr, &mut LoweringContext::default())
-            .expect("expected lowering to succeed");
+        let ccl = lower_expr(&expr, &mut placing(&expr)).expect("expected lowering to succeed");
         // foo(x) == x ▷ foo in pipeline notation
         assert_eq!(symbolic(&ccl), "x ▷ foo");
     }

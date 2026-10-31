@@ -12,8 +12,6 @@ use cambra::ccl::load::LoadedProgram;
 use cambra::interpreter::{ColumnValue, Consumer, Predicate, Tile, Value};
 use rstest_log::rstest;
 
-use cambra::ccl::TagMap;
-
 use super::helpers::*;
 
 #[rstest]
@@ -182,13 +180,13 @@ o"#,
         // Tags map each domain entry to its source variant: index 0 (pre-loop
         // feed of `x = 0`) → variant 0; indices 1-3 (loop1 running sums) →
         // variant 1; indices 4-5 (loop2 running sums) → variant 2.
-        ColumnValue::positional_union(&[0, 1, 1, 1, 2, 2], vec![
+        channel_union(&["o<<", "o<<#1", "o<<#2"], &[0, 1, 1, 1, 2, 2], vec![
             ColumnValue::Units(1),
             ColumnValue::UInts(vec![0, 1, 2]),
             ColumnValue::UInts(vec![0, 1]),
         ]),
         Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 1, 3, 6, 10, 15]))),
-        Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])),
+        channel_predicate(&["o<<", "o<<#1", "o<<#2"]),
         BitSet::new(),
     ))]
 // Pre-mutation let `y = x + 1` introduces a non-trivial let that survives
@@ -282,10 +280,10 @@ for i in [1, 2, 3]:
     o << x
     o << x + 100
 o"#,
-    Tile::data_function(ColumnValue::positional_union(&[0, 0, 0, 1, 1, 1], vec![
+    Tile::data_function(channel_union(&["o<<", "o<<#1"], &[0, 0, 0, 1, 1, 1], vec![
                 ColumnValue::UInts(vec![0, 1, 2]),
                 ColumnValue::UInts(vec![0, 1, 2]),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 3, 6, 101, 103, 106]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True])), BitSet::new())
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 3, 6, 101, 103, 106]))), channel_predicate(&["o<<", "o<<#1"]), BitSet::new())
 )]
 // Feeds in every part of the loop body: a pre-loop feed, an in-loop
 // pre-mutation feed (which sees the previous-iteration accumulator
@@ -304,11 +302,11 @@ for i in [1, 2, 3]:
     x := x + i
     o << x * 10
 o"#,
-    Tile::data_function(ColumnValue::positional_union(&[0, 1, 1, 1, 2, 2, 2], vec![
+    Tile::data_function(channel_union(&["o<<", "o<<#1", "o<<#2"], &[0, 1, 1, 1, 2, 2, 2], vec![
                 ColumnValue::Units(1),
                 ColumnValue::UInts(vec![0, 1, 2]),
                 ColumnValue::UInts(vec![0, 1, 2]),
-            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 0, 1, 3, 10, 30, 60]))), Predicate::over_every_tag(TagMap::from_positional(vec![Predicate::True, Predicate::True, Predicate::True])), BitSet::new())
+            ]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![0, 0, 1, 3, 10, 30, 60]))), channel_predicate(&["o<<", "o<<#1", "o<<#2"]), BitSet::new())
 )]
 // Pass-by-reference `Mut` param, driven by a loop: `bump(c)` writes its
 // pass-by-ref mutable variable on each iteration. `bump(cnt)` inlines to `MutWrite(cnt,

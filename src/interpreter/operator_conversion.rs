@@ -2224,7 +2224,9 @@ fn convert_impl_inner(
             }
             union_operand_ops(
                 operands,
-                UnionShape::Copair,
+                UnionShape::Copair {
+                    tags: copair_tags(&expr.ty, operands.len()),
+                },
                 union_codomain_extent(&expr.ty, ctx)?,
                 input,
                 ctx,
@@ -2272,7 +2274,9 @@ fn convert_impl_inner(
             }
             union_operand_ops(
                 elts,
-                UnionShape::Copair,
+                UnionShape::Copair {
+                    tags: copair_tags(&expr.ty, elts.len()),
+                },
                 union_codomain_extent(&expr.ty, ctx)?,
                 input,
                 ctx,
@@ -5879,13 +5883,24 @@ fn map_order_key(
 /// decides only *how* the operands are wired.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum UnionShape {
-    Copair,
+    /// Each operand's arm tagged by `tags`, in operand order ([`copair_tags`]).
+    Copair { tags: Vec<FieldKey> },
     /// `over` is the bound the merged keys range over where the operands' domains differ,
     /// the legs of a realized sum ([`UnionOperator::new_flat_over`]); `None` merges over
     /// the domain they share.
-    DisjointJoin {
-        over: Option<Extent>,
-    },
+    DisjointJoin { over: Option<Extent> },
+}
+
+/// The tag of each of a copairing's `n` operands, in operand order: the arms of the variant
+/// its domain is, where the node's type names one per operand, a channel's sites
+/// (`crate::ccl::site`), and the operands' positions otherwise.
+fn copair_tags(ty: &Type, n: usize) -> Vec<FieldKey> {
+    match ty.domain().as_ref().map(Type::peel_refinements) {
+        Some(Type::Variant(arms, _)) if arms.len() == n => {
+            arms.iter().map(|(key, _)| key.clone()).collect()
+        }
+        _ => (0..n).map(FieldKey::Index).collect(),
+    }
 }
 
 /// The merged column's value extent, read off the union **node's** type.
@@ -5922,8 +5937,9 @@ fn union_operand_ops(
                 .map(|e| convert_impl(e, None, ctx))
                 .collect::<Result<Vec<_>, _>>()?;
             Ok(match shape {
-                UnionShape::Copair => {
-                    Box::new(UnionOperator::new(ops, declared_codomain)) as Box<dyn TileOperator>
+                UnionShape::Copair { tags } => {
+                    Box::new(UnionOperator::new_tagged(ops, tags, declared_codomain))
+                        as Box<dyn TileOperator>
                 }
                 UnionShape::DisjointJoin { over } => Box::new(UnionOperator::new_flat_over(
                     ops,

@@ -1234,6 +1234,7 @@ fn strip(
             ty,
             user_annotation,
             node_id,
+            site,
         } = expr;
         let TypedExprNode::For { target, iter, body } = node else {
             unreachable!("guarded above")
@@ -1260,6 +1261,7 @@ fn strip(
             ty,
             user_annotation,
             node_id,
+            site,
         };
     }
     let mut expr = expr;
@@ -1286,6 +1288,7 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
                 ty,
                 user_annotation: None,
                 node_id,
+                site: None,
             }
         }
         TypedExprNode::Let {
@@ -1305,6 +1308,7 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
                 ty,
                 user_annotation: None,
                 node_id,
+                site: None,
             }
         }
         // A mutable variable introduced *inside* the block. Unreachable: lowering does not
@@ -1383,6 +1387,7 @@ fn partition_spine(
         ty,
         user_annotation,
         node_id,
+        site,
     } = expr;
     match node {
         TypedExprNode::ExprStmt { expr: effect, body } if matches!(&effect.node, TypedExprNode::MutWrite { name, .. } if !txn_mut_vars.contains(name)) =>
@@ -1400,6 +1405,7 @@ fn partition_spine(
                 ty,
                 user_annotation,
                 node_id,
+                site,
             }
         }
         TypedExprNode::Let {
@@ -1432,6 +1438,7 @@ fn partition_spine(
                 ty,
                 user_annotation,
                 node_id,
+                site,
             }
         }
         // Unreachable for the same reason as in `splice_block`: this walks a
@@ -1447,6 +1454,7 @@ fn partition_spine(
             ty,
             user_annotation,
             node_id,
+            site,
         },
     }
 }
@@ -2553,6 +2561,8 @@ struct HoistedFeed {
     /// The fed value type `𝑉`, which the channel carries after `` `fired `` is
     /// eliminated.
     value_ty: Type,
+    /// The site of the feed the tap carries ([`crate::ccl::site`]).
+    fed_at: Option<std::rc::Rc<crate::ccl::site::Site>>,
 }
 
 /// Assemble the transaction `letrec` from the built writers/keys/feeds and
@@ -2758,6 +2768,7 @@ fn plan_store(
                 tap: tap_name,
                 tap_ty,
                 value_ty: f.value.ty.clone(),
+                fed_at: f.fed_at,
             });
         }
     }
@@ -2990,6 +3001,7 @@ impl StorePlan {
                     defer: f.defer.clone(),
                     view,
                     levels: 1,
+                    site: f.fed_at.clone(),
                 }
             })
             .collect()

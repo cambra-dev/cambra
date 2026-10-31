@@ -2066,7 +2066,7 @@
             "nature": "expansion",
             "label": "channelize.cluster"
           },
-          "type": "(Unit | 0..4 ⤇ Int)",
+          "type": "({`totals.make_totals()/make_totals.t<< | `totals<<{0..4}} ⤇ Int)",
           "children": [
             {
               "id": 585,
@@ -2266,7 +2266,7 @@
             "nature": "machinery",
             "label": "channelize.defer_lift"
           },
-          "type": "(Unit | 0..4 ⤇ Int)",
+          "type": "({`totals.make_totals()/make_totals.t<< | `totals<<{0..4}} ⤇ Int)",
           "children": []
         }
       ]
@@ -2705,7 +2705,7 @@
             "nature": "expansion",
             "label": "channelize.cluster"
           },
-          "type": "(Unit | 0..4 ⤇ Int)",
+          "type": "({`totals.make_totals()/make_totals.t<< | `totals<<{0..4}} ⤇ Int)",
           "children": [
             {
               "id": 585,
@@ -2905,7 +2905,7 @@
             "nature": "machinery",
             "label": "channelize.defer_lift"
           },
-          "type": "(Unit | 0..4 ⤇ Int)",
+          "type": "({`totals.make_totals()/make_totals.t<< | `totals<<{0..4}} ⤇ Int)",
           "children": []
         }
       ]
@@ -3364,7 +3364,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Unit | 0..4 ⤇ Int)",
+          "type": "({`totals.make_totals()/make_totals.t<< | `totals<<{0..4}} ⤇ Int)",
           "children": [
             {
               "id": 599,
@@ -3544,7 +3544,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "((Unit | 0..4 ⤇ Int) ⇒ Int)",
+          "type": "(({`totals.make_totals()/make_totals.t<< | `totals<<{0..4}} ⤇ Int) ⇒ Int)",
           "children": []
         },
         {
@@ -3562,7 +3562,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Unit | 0..4 ⤇ Int)",
+          "type": "({`totals.make_totals()/make_totals.t<< | `totals<<{0..4}} ⤇ Int)",
           "children": []
         }
       ]
@@ -4876,7 +4876,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Unit | 0..4 ⤇ Int)",
+          "type": "({`totals.make_totals()/make_totals.t<< | `totals<<{0..4}} ⤇ Int)",
           "children": [
             {
               "id": 696,
@@ -5191,7 +5191,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "((Unit | 0..4 ⤇ Int) ⇒ Int)",
+          "type": "(({`totals.make_totals()/make_totals.t<< | `totals<<{0..4}} ⤇ Int) ⇒ Int)",
           "children": []
         },
         {
@@ -5209,7 +5209,7 @@
             "nature": "machinery",
             "label": "lambda_elim.point_free"
           },
-          "type": "(Unit | 0..4 ⤇ Int)",
+          "type": "({`totals.make_totals()/make_totals.t<< | `totals<<{0..4}} ⤇ Int)",
           "children": []
         }
       ]
@@ -5501,7 +5501,7 @@
           "label": "UnionOperator",
           "nodeId": 1009,
           "role": "operator",
-          "tiling": "Fn({`0 | `1{0..4}} → Int)",
+          "tiling": "Fn({`totals.make_totals()/make_totals.t<< | `totals<<{0..4}} → Int)",
           "spans": [
             {
               "file": 0,
@@ -5539,7 +5539,7 @@
           "label": "Memo",
           "nodeId": 1010,
           "role": "operator",
-          "tiling": "Fn({`0 | `1{0..4}} → Int)",
+          "tiling": "Fn({`totals.make_totals()/make_totals.t<< | `totals<<{0..4}} → Int)",
           "spans": [
             {
               "file": 0,
@@ -5568,7 +5568,7 @@
           "label": "FanOutSlot",
           "nodeId": 1011,
           "role": "operator",
-          "tiling": "Fn({`0 | `1{0..4}} → Int)",
+          "tiling": "Fn({`totals.make_totals()/make_totals.t<< | `totals<<{0..4}} → Int)",
           "spans": [
             {
               "file": 0,
