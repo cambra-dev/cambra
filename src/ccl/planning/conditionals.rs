@@ -64,7 +64,7 @@ pub(super) fn realize_conditional_collections(
         realized,
         materialized,
     } = witnesses;
-    inline_undetermined_conditionals(expr);
+    inline_conditional_bindings(expr);
     realize_and_erase_boxes(
         expr,
         erased,
@@ -164,7 +164,7 @@ fn reject_rows_fixed_elsewhere(expr: &Expr) -> Result<(), String> {
 }
 
 /// Give every consumer of a conditional collection binding its own copy of it, dropping the
-/// binding that shared it — where the conditional's witness is **undetermined**.
+/// binding that shared it.
 ///
 /// Realization needs the `Case` *below* the site that consumes it: it emits one leg per arm
 /// tuple across the site's witnesses, and each leg is the site with the `Case` replaced
@@ -177,12 +177,14 @@ fn reject_rows_fixed_elsewhere(expr: &Expr) -> Result<(), String> {
 /// rides the consuming site's type, so two consumers of one binding own two different
 /// demands, and one shared set of legs can satisfy neither.
 ///
-/// A **determined** witness — one candidate — is not inlined: nothing realizes it, because the
-/// candidate is already its domain and [`erase_determined_boxes`] and [`collapse_determined_sums`]
-/// erase the binder where it stands. Copying such a binding duplicates the arms and puts a box
-/// inside each consumer, where the erasure reaches the term but not every type that named it.
-fn inline_undetermined_conditionals(expr: &mut Expr) {
-    expr.walk_children_mut(inline_undetermined_conditionals);
+/// A same-domain conditional is copied too, though its witness is determined: its `Case` still
+/// realizes into one leg per arm. Realized in its binding instead, it leaves the `Case` standing
+/// in every type the binding's definition was discharged into. A filtered comprehension whose
+/// source is bound inside the comprehension's own scope is that case: the `let`'s type holds the
+/// `Case` in its predicate, and the post-planning check rejects the realized definition against
+/// it.
+fn inline_conditional_bindings(expr: &mut Expr) {
+    expr.walk_children_mut(inline_conditional_bindings);
     let TypedExprNode::Let { bound_expr, .. } = &expr.node else {
         return;
     };
@@ -193,7 +195,7 @@ fn inline_undetermined_conditionals(expr: &mut Expr) {
             ..
         }
     ) && collection_value_ty(&bound_expr.ty).is_some();
-    if !is_conditional_collection || !undetermined_witness(&bound_expr.ty) {
+    if !is_conditional_collection {
         return;
     }
     let TypedExprNode::Let {
@@ -213,18 +215,6 @@ fn inline_undetermined_conditionals(expr: &mut Expr) {
         provenance::Nature::Expansion,
     );
     *expr = lambda_elim::substitute(*body, &binding.name, &bound_expr);
-}
-
-/// Whether `ty`'s outermost sum ranges over **more than one** candidate — the witness that
-/// realization has to materialize, as against the determined one the erasure removes.
-///
-/// The same reading [`arm_domain`] and [`collapse_determined_sums`] take: one possible
-/// witness is no information, so nothing has to carry it.
-fn undetermined_witness(ty: &Type) -> bool {
-    matches!(
-        witnesses_named_by(ty).first().map(|w| w.type_kind()),
-        Some(crate::ccl::ty::TypeKind::Enumerated(ds)) if ds.len() > 1
-    )
 }
 
 /// The type each child of `expr` is expected to have, where the position says something the
@@ -283,10 +273,9 @@ fn child_demand(expr: &Expr, effective: &Type) -> Option<Type> {
 /// Whether `ty` binds a witness that is **not determined** — the complement, at the outermost
 /// binder, of the one-candidate precondition [`erase_determined_boxes`] erases under.
 ///
-/// Wider than [`undetermined_witness`], which asks only whether realization has candidates to
-/// fan out over. A described kind — `UIntRanges` for a `List(𝑇)`, `SubtypesOf(𝐾)` for a
-/// `Map(𝐾, 𝑉)`, the universe for a `Collection(𝑇)` — names no candidate at all, so it is
-/// neither determined nor realizable and the value is what says which domain it is.
+/// A described kind — `UIntRanges` for a `List(𝑇)`, `SubtypesOf(𝐾)` for a `Map(𝐾, 𝑉)`, the
+/// universe for a `Collection(𝑇)` — names no candidate at all, so it is neither determined nor
+/// realizable and the value is what says which domain it is.
 fn binds_an_undetermined_witness(ty: &Type) -> bool {
     match ty.witness_kind() {
         None => false,
@@ -1529,19 +1518,15 @@ mod tests {
         );
     }
 
-    /// **A conditional binding is inlined when its witness is undetermined.**
+    /// **A conditional binding is copied into its consumer, whether or not its witness is
+    /// determined.**
     ///
-    /// Neither half is observable end-to-end — both programs compute the same answer
-    /// whether the binding was shared or copied — so the placement itself is what gets
-    /// asserted here.
-    ///
-    /// Copying puts the `Case` below the site that consumes it, which is where
-    /// [`realize`] needs it: the legs are copies of the site with the `Case` replaced, so a
-    /// `Case` left in a binding is above every site that reads it. A determined witness
-    /// has no realization to feed — the candidate is already its domain — and copying one
-    /// duplicates the arms and the boxes on them for nothing.
+    /// Both programs compute the same answer whether the binding was shared or copied, so the
+    /// placement itself is what gets asserted here. Copying puts the `Case` below the site that
+    /// consumes it, which is where [`realize`] needs it: the legs are copies of the site with
+    /// the `Case` replaced.
     #[test]
-    fn a_conditional_binding_is_copied_when_its_witness_is_undetermined() {
+    fn a_conditional_binding_is_copied_into_its_consumer() {
         let int = Type::Base(BaseType::Int);
         // Each arm is **boxed**, as inference leaves it: two collections over distinct
         // domains have no common type, so the arms of a conditional that types as a sum
@@ -1585,25 +1570,18 @@ mod tests {
             .with_ty(ty)
         };
 
-        // One candidate: the witness stands for a domain that is known, and the erasure
-        // removes the binder where it stands.
-        let mut shared = bind_to(vec![Type::UIntRange(2)], [2, 2]);
-        inline_undetermined_conditionals(&mut shared);
-        assert!(
-            matches!(shared.node, TypedExprNode::Let { .. }),
-            "a determined witness needs no realization site, so its binding stays shared: \
-             {:?}",
-            shared.node
-        );
-
-        // Two candidates: nothing but realization can give this domain an extent, and it
-        // fires at the site.
-        let mut copied = bind_to(vec![Type::UIntRange(2), Type::UIntRange(3)], [2, 3]);
-        inline_undetermined_conditionals(&mut copied);
-        assert!(
-            matches!(copied.node, TypedExprNode::Case { .. }),
-            "a consumer gets the conditional itself, not a name for it: {:?}",
-            copied.node
-        );
+        // One candidate, two arms (a same-domain conditional), and two candidates.
+        for (candidates, arms) in [
+            (vec![Type::UIntRange(2)], [2, 2]),
+            (vec![Type::UIntRange(2), Type::UIntRange(3)], [2, 3]),
+        ] {
+            let mut copied = bind_to(candidates, arms);
+            inline_conditional_bindings(&mut copied);
+            assert!(
+                matches!(copied.node, TypedExprNode::Case { .. }),
+                "a consumer gets the conditional itself, not a name for it: {:?}",
+                copied.node
+            );
+        }
     }
 }

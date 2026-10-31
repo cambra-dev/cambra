@@ -1593,6 +1593,16 @@ the result refinement `__elem == t + 3`.
 its encodable refinements to `Γ`. Without a usable scope type, the encoder can use the reading
 node's type to choose a sort but assumes no additional facts about the name.
 
+A transparent `let` binder is looked up at its type refined by `__elem == definition`
+(`smt::defined_as`). Its definition is what a type leaving its scope substitutes for it
+([`let` binders and scope exit](#let-binders-and-scope-exit)), so a type read inside the scope that
+names the binder carries the same fact. For `__anf = t.a`, a type naming `__anf` gets the
+assumption `__anf == t.a`, though a projection's result type carries no refinement of its own.
+The definition is stated in its predicate normal form
+([Predicates are compared by normal form](#predicates-are-compared-by-normal-form)), so a check
+after lambda elimination reads `(x, 1) ▷ add` as `x + 1`. Only a definition built from the
+encoder's term forms is stated.
+
 Lookups are demand-driven. For `x = 2`, the predicate `t ^+ x == t + 2` needs the assumption
 `x == 2`. For `y = x ^+ 1`, translating `y`'s refinement can trigger the lookup of `x`.
 Paths are marked before their assumptions are traversed, preventing recursive re-entry.
@@ -1603,7 +1613,8 @@ this prevents an unrelated contradictory binder from proving an otherwise unsupp
 | --- | --- |
 | Emission through `constrain_subtype_in` | `InferCtx` supplies lexical and recorded opaque binder types. `value_type` resolves their positive contributions with opposite-side compaction disabled, so a use's demand cannot prove itself. |
 | Post-inference checks | `CheckCtx` supplies lexical and opaque binder types from the tree through `constrain_subtype_in` and `constrain_subtype_under_in`. Recorded `Var` types are trusted; a missing scope entry contributes no assumption rather than a name-resolution error. |
-| `NoScope` | Supplies no binder types. Used by inlining's discharge check, a specialization's clone-below-use pin and probes without a program scope. The query can prove less than one with lexical assumptions. |
+| Inlining's discharge check | `inline::Scope` supplies the `let` and lambda binders enclosing the call and the opaque binders met so far, as `CheckCtx` does. A loop target or pattern binder contributes no assumption. |
+| `NoScope` | Supplies no binder types. Used by a specialization's clone-below-use pin and probes without a program scope. The query can prove less than one with lexical assumptions. |
 | `SkipSmtScope` | Suppresses the query. `constrain_subtype` uses this structural-only policy. |
 
 Emission does not instantiate a generalized binder merely to create an SMT assumption. Unresolved

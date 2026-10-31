@@ -285,14 +285,27 @@ fn a_filtered_comprehension_drives_a_mutation_loop() {
 /// predicate and realizes the copy with it, and the predicate applies the realized union at the
 /// element's index, which planning refuses (`src/ccl/design/optimization.md`, "Planning a lifted
 /// term"). The per-leg substitution would serve here too; what is missing is a way to find the
-/// copy without a witness. A `++` source is the same shape without the realization.
+/// copy without a witness.
+#[test]
+fn a_filter_over_a_same_domain_conditional_is_refused() {
+    check_compile_error(
+        indoc! {r"
+            c: Bool = True
+            sum([y for y in ([1, 5] if c else [3, 4]) if y > 2])"},
+        "applies a union of collections at its element",
+    );
+}
+
+/// A filter over a `++` source restricts the positional union of its operands' keys: bound ahead
+/// like any filtered source, each key is an arm's tag with that arm's index, and the restrict
+/// matches it as one value.
 #[rstest]
-#[case::conditional(indoc! {r"
-    c: Bool = True
-    sum([y for y in ([1, 5] if c else [3, 4]) if y > 2])"})]
-#[case::union("sum([y for y in ([1, 5] ++ [3, 4]) if y > 2])")]
-fn a_filter_over_a_union_source_is_refused(#[case] code: &str) {
-    check_compile_error(code, "applies a union of collections at its element");
+#[case::inline("sum([y for y in ([1, 5] ++ [3, 4]) if y > 2])")]
+#[case::let_bound(indoc! {r"
+    xs = [1, 5] ++ [3, 4]
+    sum([y for y in xs if y > 2])"})]
+fn a_filter_over_a_union_source_is_applied(#[case] code: &str) {
+    check_scalar(code, Value::Int(12));
 }
 
 /// A **filtered inner comprehension over the outer row**, which the filter narrows.

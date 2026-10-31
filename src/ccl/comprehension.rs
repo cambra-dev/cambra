@@ -158,7 +158,7 @@ pub fn encodes_to_lambda(generators: &[Generator]) -> bool {
 }
 
 /// Whether `e` is `𝑐 ▷ Iterable::elements`, the collection a generator walks.
-fn is_elements_call(e: &Expr) -> bool {
+pub(crate) fn is_elements_call(e: &Expr) -> bool {
     matches!(
         &e.node,
         TypedExprNode::Apply { function, .. }
@@ -488,27 +488,27 @@ mod tests {
     // source at the index position its parameter names.
     #[case(
         "[x for x in [10, 20]]",
-        "λ __iter_record → let __anf = let __anf = [10, 20]\nin __iter_record ▷ (__anf ▷ Iterable::elements)\nin __anf ▷ (λ x → x)"
+        "λ __iter_record → let __anf = [10, 20]\nin let __anf = __iter_record ▷ (__anf ▷ Iterable::elements)\nin __anf ▷ (λ x → x)"
     )]
     // Constant element: the generator variable is unused.
     #[case(
         "[42 for x in [10, 20]]",
-        "λ __iter_record → let __anf = let __anf = [10, 20]\nin __iter_record ▷ (__anf ▷ Iterable::elements)\nin __anf ▷ (λ x → 42)"
+        "λ __iter_record → let __anf = [10, 20]\nin let __anf = __iter_record ▷ (__anf ▷ Iterable::elements)\nin __anf ▷ (λ x → 42)"
     )]
     // BinOp element.
     #[case(
         "[x + 2 for x in [10, 20]]",
-        "λ __iter_record → let __anf = let __anf = [10, 20]\nin __iter_record ▷ (__anf ▷ Iterable::elements)\nin __anf ▷ (λ x → x + 2)"
+        "λ __iter_record → let __anf = [10, 20]\nin let __anf = __iter_record ▷ (__anf ▷ Iterable::elements)\nin __anf ▷ (λ x → x + 2)"
     )]
     // Outer capture: `y` comes from an enclosing let binding.
     #[case(
         "y = 5\n[x + y for x in [10, 20]]",
-        "let y = 5\nin λ __iter_record → let __anf = let __anf = [10, 20]\nin __iter_record ▷ (__anf ▷ Iterable::elements)\nin __anf ▷ (λ x → x + y)"
+        "let y = 5\nin λ __iter_record → let __anf = [10, 20]\nin let __anf = __iter_record ▷ (__anf ▷ Iterable::elements)\nin __anf ▷ (λ x → x + y)"
     )]
     // Nested: the inner comprehension is the outer one's source, encoded first.
     #[case(
         "[y for y in [x for x in [10, 20]]]",
-        "λ __iter_record → let __anf = __iter_record ▷ ((λ __iter_record → let __anf = let __anf = [10, 20]\nin __iter_record ▷ (__anf ▷ Iterable::elements)\nin __anf ▷ (λ x → x)) ▷ Iterable::elements)\nin __anf ▷ (λ y → y)"
+        "λ __iter_record → let __anf = __iter_record ▷ ((λ __iter_record → let __anf = [10, 20]\nin let __anf = __iter_record ▷ (__anf ▷ Iterable::elements)\nin __anf ▷ (λ x → x)) ▷ Iterable::elements)\nin __anf ▷ (λ y → y)"
     )]
     // A guard puts the lambda under a `cast` whose target refines the domain by
     // the guard over the source — and nothing inside is hoisted, the two copies
@@ -528,7 +528,7 @@ mod tests {
     // which lambda elimination compiles over the element stream.
     #[case(
         "[x if x > 1 else 0 for x in [1, 2]]",
-        "λ __iter_record → let __anf = let __anf = [1, 2]\nin __iter_record ▷ (__anf ▷ Iterable::elements)\nin __anf ▷ (λ x → { x > 1 → x; true → 0 })"
+        "λ __iter_record → let __anf = [1, 2]\nin let __anf = __iter_record ▷ (__anf ▷ Iterable::elements)\nin __anf ▷ (λ x → { x > 1 → x; true → 0 })"
     )]
     fn the_encoding(#[case] code: &str, #[case] expected: &str) {
         assert_eq!(encoded(code), expected);

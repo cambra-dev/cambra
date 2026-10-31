@@ -534,7 +534,7 @@ impl Typing for CheckCtx {
     fn scoped_let<R>(
         &mut self,
         binding: &TypedBinding,
-        _definition: Option<&Expr>,
+        definition: Option<&Expr>,
         _scheme: LetScheme,
         f: impl FnOnce(&mut Self) -> R,
     ) -> R {
@@ -547,8 +547,15 @@ impl Typing for CheckCtx {
         }
         // See `scoped`. No generalization either: Check never generalizes
         // (`is_generalizable` is `false`), so the binder stands for the one type its
-        // definiens has, which is the fact the body's queries assume.
-        self.scoped(&binding.name, &binding.ty, f)
+        // definiens has, which is the fact the body's queries assume. A transparent
+        // binder also equals its definiens there, as emission's scope states it.
+        let assumed = match definition {
+            Some(definition) if binding.transparency == BindingTransparency::Transparent => {
+                crate::ccl::infer::solver::smt::defined_as(binding.ty.clone(), definition)
+            }
+            _ => binding.ty.clone(),
+        };
+        self.scoped(&binding.name, &assumed, f)
     }
 
     fn close_let_type(&mut self, binding: &TypedBinding, bound_expr: &Expr, body_ty: Type) -> Type {
