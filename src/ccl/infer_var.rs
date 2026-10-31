@@ -254,7 +254,17 @@ impl Bound {
         if self.self_subst.is_id() {
             return self.ty_subst.clone();
         }
-        let inv = match self.self_subst.invert() {
+        subst::Subst::then(&self.ty_subst, &self.holder_inverse())
+    }
+
+    /// The holder side of [`render_subst`](Self::render_subst): `self_subst` inverted where
+    /// it is invertible, and otherwise its rename part inverted, its term part acting as the
+    /// identity.
+    fn holder_inverse(&self) -> subst::Subst {
+        if self.self_subst.is_id() {
+            return subst::Subst::id();
+        }
+        match self.self_subst.invert() {
             Some(inv) => inv,
             None => {
                 let (ren, _term) = self.self_subst.split_renames();
@@ -291,8 +301,26 @@ impl Bound {
                 // respells it as it respells the content.
                 subst::Subst::then(&self.self_subst.read_backs(), &inv)
             }
+        }
+    }
+
+    /// The term names this bound puts in its holder: the free names of its type as the edge's
+    /// substitutions leave them ([`render_subst`](Self::render_subst)), read name by name so
+    /// that nothing is applied ([`subst::Subst::names_after`]).
+    ///
+    /// A projection the holder side reads back names the holder's binder rather than the term
+    /// it quotes, so where the holder side eliminates, the names are read off the content with
+    /// the edge's content side and the read-back applied.
+    pub(crate) fn rendered_names(&self) -> BTreeSet<Name> {
+        let read_back = self.self_subst.read_backs();
+        let names = if read_back.is_id() {
+            self.ty_subst.names_after(subst::type_free_vars(&self.ty))
+        } else {
+            subst::type_free_vars(
+                &subst::Subst::then(&self.ty_subst, &read_back).apply_type(&self.ty),
+            )
         };
-        subst::Subst::then(&self.ty_subst, &inv)
+        self.holder_inverse().names_after(names)
     }
 
     /// The bound type expressed in the holder's context — see
@@ -584,11 +612,11 @@ pub(crate) trait TelescopeWalk {
     }
 }
 
-/// The free term variables of a bound's type not accounted for where the
-/// bound is being recorded: not in the holder's telescope — neither a lexical
-/// entry nor an opaque binder — and not in either edge substitution's domain
-/// (a discharge's binders are bound by the edge — the suspension is the
-/// application that closes them).
+/// The term names a bound puts in its holder that the holder's telescope does not account
+/// for — neither a lexical entry nor an opaque binder. What the bound puts there is its type's
+/// free names as the edge's substitutions leave them ([`Bound::rendered_names`]): a name the
+/// edge discharges is replaced by its term's names, and one it renames by the target, which
+/// the holder must be able to name as much as any other.
 ///
 /// The gap set of the record-time closure check
 /// (`src/ccl/design/type-inference.md`, "The invariant"), and every member is
@@ -596,19 +624,11 @@ pub(crate) trait TelescopeWalk {
 /// [`crate::ccl::TypedExprNode::Source`] node, so it is not a term variable and
 /// [`subst::type_free_vars`] does not report it.
 pub(crate) fn bound_scope_gaps(telescope: &Telescope, bound: &Bound) -> BTreeSet<Name> {
-    // A witness the holder side eliminates is read back as the holder's binder, so the term it
-    // was projected from is not one of the bound's free names.
-    let read_back = bound.self_subst.read_backs();
-    let ty = if read_back.is_id() {
-        std::borrow::Cow::Borrowed(&bound.ty)
-    } else {
-        std::borrow::Cow::Owned(read_back.apply_type(&bound.ty))
-    };
-    subst::scope_gaps(&ty, |n| {
-        telescope.contains(n)
-            || bound.ty_subst.binders().any(|b| b == n)
-            || bound.self_subst.binders().any(|b| b == n)
-    })
+    bound
+        .rendered_names()
+        .into_iter()
+        .filter(|n| !telescope.contains(n))
+        .collect()
 }
 
 /// Reject a recorded bound whose free references escape the holder's telescope.
@@ -627,10 +647,9 @@ pub(crate) fn bound_scope_gaps(telescope: &Telescope, bound: &Bound) -> BTreeSet
 pub(crate) fn enforce_bound_scope(holder: &InferVar, side: &'static str, bound: &Bound) {
     // The record-time closure invariant, as an internal error (see
     // `src/ccl/design/type-inference.md`, "The invariant"). Every gap is an
-    // error: a bound's free term variables are the telescope's entries and
-    // the edge substitutions' domains, and a program source is not among them
-    // because a source reference is a [`crate::ccl::TypedExprNode::Source`]
-    // node rather than a variable.
+    // error: the names a bound puts in its holder are the telescope's entries, and a
+    // program source is not among them because a source reference is a
+    // [`crate::ccl::TypedExprNode::Source`] node rather than a variable.
     // The witness half of the same invariant: a reference to a witness is free only on a
     // variable placed under witness binders, since anywhere else it has left its binder.
     if cfg!(debug_assertions) {
@@ -649,10 +668,10 @@ pub(crate) fn enforce_bound_scope(holder: &InferVar, side: &'static str, bound: 
     let gaps = bound_scope_gaps(&holder.telescope, bound);
     if let Some(open) = gaps.iter().next() {
         panic!(
-            "open bound recorded on ?{}: `{open:?}` is free in the {side} bound \
-             `{}` but is neither in the holder's telescope {:?} nor discharged by \
-             the edge's substitutions — the bound left its binder's scope \
-             without a mediating discharge (see type-inference.md, \"The invariant\")",
+            "open bound recorded on ?{}: `{open:?}` is free in the {side} bound `{}` once \
+             the edge's substitutions act, and is not in the holder's telescope {:?} — the \
+             bound left its binder's scope without a mediating discharge (see \
+             type-inference.md, \"The invariant\")",
             holder.uid, bound.ty, holder.telescope,
         );
     }
@@ -1283,12 +1302,11 @@ mod tests {
         );
     }
 
-    /// The record-time closure check: a bound's free reference is covered by
-    /// the holder's telescope or by an edge substitution's domain, and
-    /// anything else is a gap. [`enforce_bound_scope`] rejects a
-    /// bound with a non-empty gap set.
+    /// The record-time closure check: what a bound names once its edge's substitutions act
+    /// must be covered by the holder's telescope, and anything else is a gap.
+    /// [`enforce_bound_scope`] rejects a bound with a non-empty gap set.
     #[test]
-    fn bound_scope_gaps_sees_telescope_and_edge_domains() {
+    fn bound_scope_gaps_reads_the_bound_as_its_edge_leaves_it() {
         use crate::ccl::{Lit, Name, Refinement, TypedExpr, subst::Subst};
         use std::rc::Rc as StdRc;
         let dep = |referenced: &str| {
@@ -1316,6 +1334,14 @@ mod tests {
         assert_eq!(
             gaps.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
             ["y"]
+        );
+        // Renamed onto a binder the holder cannot name: the edge's domain covers `y`, but what
+        // lands in the holder is `z`.
+        let renamed = Bound::with_subst(dep("y"), Subst::rename(Name::raw("y"), Name::raw("z")));
+        let gaps = bound_scope_gaps(&scope, &renamed);
+        assert_eq!(
+            gaps.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+            ["z"]
         );
     }
 
