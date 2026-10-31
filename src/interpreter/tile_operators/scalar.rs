@@ -766,22 +766,19 @@ pub struct VariantIs {
     input: Box<dyn TileOperator>,
     /// The tag to test for.
     tag: FieldKey,
-    /// Identity and the output tiling — `DataFunction { <scrutinee domain> ⇒ Bool }`.
+    /// Identity and the output tiling — the scrutinee's, with `Bool` in place of the union:
+    /// `Scalar(Bool)` or `DataFunction { <scrutinee domain> ⇒ Bool }`.
     base: OperatorBase,
 }
 
 impl VariantIs {
-    /// Construct a `VariantIs` testing arm `tag` of the scrutinee's union. The
-    /// domain is the scrutinee's own, as [`VariantProject::new`] derives it; the
-    /// codomain is `Bool` rather than the arm's payload, and unlike a projection
-    /// every key of the domain is answered.
+    /// Construct a `VariantIs` testing arm `tag` of the scrutinee's union. The output has the
+    /// scrutinee's shape with `Bool` in place of the union: a test answers every position, so
+    /// it keeps every key, and a scalar scrutinee gets a scalar answer. [`VariantProject`]
+    /// differs on a scalar because a restriction needs a domain to narrow.
     pub fn new(input: Box<dyn TileOperator>, tag: FieldKey) -> Self {
-        // As [`VariantProject::new`], with `Bool` in place of the arm's payload.
         let tiling = match input.tiling() {
-            Tiling::Scalar(Extent::Union(_)) => Tiling::data_function(
-                Extent::Base(BaseType::UInt),
-                Tiling::Scalar(Extent::Base(BaseType::Bool)),
-            ),
+            Tiling::Scalar(Extent::Union(_)) => Tiling::Scalar(Extent::Base(BaseType::Bool)),
             t @ Tiling::DataFunction { codomain, .. } => {
                 assert!(
                     matches!(codomain.as_ref(), Tiling::Scalar(Extent::Union(_))),
@@ -894,17 +891,16 @@ impl TileProducer for VariantIsProducer {
                 .filter(|p| !deleted.contains(*p))
                 .collect(),
         };
-        let answers: Vec<bool> = positions.iter().map(|p| carried.contains(*p)).collect();
-        let out_domain = match domain_col {
-            Some(d) => d.select_indices(positions.iter().copied(), positions.len()),
-            None => ColumnValue::uints_from_rows(positions),
-        };
-        Tile::data_function(
-            out_domain,
-            Box::new(Tile::Scalar(ColumnValue::Bools(answers))),
-            domain_predicate,
-            BitSet::new(),
-        )
+        let answers = ColumnValue::Bools(positions.iter().map(|p| carried.contains(*p)).collect());
+        match domain_col {
+            Some(d) => Tile::data_function(
+                d.select_indices(positions.iter().copied(), positions.len()),
+                Box::new(Tile::Scalar(answers)),
+                domain_predicate,
+                BitSet::new(),
+            ),
+            None => Tile::Scalar(answers),
+        }
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {

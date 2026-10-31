@@ -669,10 +669,157 @@ fn test_conditional_feed_skips_partial_off_path_arm(
 // partial feed) is blocked earlier, at lowering — a bare `if` with no `else` is
 // rejected as a value-returning expression before channelize sees it. The source-less-feed path handles
 // the feed extraction once lowering admits the shape; the if/else and elif forms
-// above exercise it. A *scrutinee / pattern* feed has no boolean to gate on there and
-// stays rejected. Inside a loop it is admitted, by the per-arm refined-source channels
-// the fan-out builds, and one such `Case` feeding two deferred collections is two of
-// those channels (`two_defers_fed_from_complementary_match_arms` in `feeds_cases`).
+// above exercise it. Inside a loop a feeding `match` is admitted by the per-arm
+// refined-source channels the fan-out builds, and one such `Case` feeding two deferred
+// collections is two of those channels (`two_defers_fed_from_complementary_match_arms` in
+// `feeds_cases`).
+
+// A feeding `match` arm outside any loop contributes `(λ _ : Unit → s) ≫
+// variant_project(𝑡) ≫ (λ x → v)`: the scrutinee as a one-row collection, restricted to
+// the rows carrying the arm's tag, so the arm's value is fed exactly when the scrutinee
+// carries its tag. A `case _` arm is the gated one-shot lift, on the complement of the tags
+// before it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::first_arm(indoc! {"
+    o: Feed(_)
+    m = `a(2)
+    match m:
+        case `a(n):
+            o << n
+        case `b(k):
+            o << k * 10
+    sum(o)
+"}, Value::Int(2))]
+#[case::second_arm(indoc! {"
+    o: Feed(_)
+    m = `b(3)
+    match m:
+        case `a(n):
+            o << n
+        case `b(k):
+            o << k * 10
+    sum(o)
+"}, Value::Int(30))]
+// The arm that does not feed this collection feeds another one.
+#[case::other_collection_in_the_taken_arm(indoc! {"
+    o: Feed(_)
+    q: Feed(_)
+    o << 1
+    m = `b(3)
+    match m:
+        case `a(n):
+            o << n
+        case `b(k):
+            q << k
+    sum(o) + 10 * sum(q)
+"}, Value::Int(31))]
+#[case::scrutinee_computed(indoc! {"
+    o: Feed(_)
+    def g(x):
+        `a(x) if x > 5 else `b(x)
+    match g(3):
+        case `a(n):
+            o << n
+        case `b(k):
+            o << k * 10
+    sum(o)
+"}, Value::Int(30))]
+// A `let` inside the arm is copied into the contribution that reads it.
+#[case::arm_local_binding_and_two_feeds(indoc! {"
+    o: Feed(_)
+    m = `a(2)
+    match m:
+        case `a(n):
+            y = n + 1
+            o << y
+            o << y * 100
+        case _:
+            o << 0
+    sum(o)
+"}, Value::Int(303))]
+#[case::in_a_def_called_twice(indoc! {"
+    o: Feed(_)
+    def f(m):
+        match m:
+            case `a(n):
+                o << n
+            case `b(k):
+                o << k * 10
+    f(`a(4))
+    f(`b(5))
+    sum(o)
+"}, Value::Int(54))]
+#[case::default_arm_taken(indoc! {"
+    o: Feed(_)
+    m = `c(7)
+    match m:
+        case `a(n):
+            o << n
+        case _:
+            o << 100
+    sum(o)
+"}, Value::Int(100))]
+#[case::default_arm_skipped(indoc! {"
+    o: Feed(_)
+    m = `a(7)
+    match m:
+        case `a(n):
+            o << n
+        case _:
+            o << 100
+    sum(o)
+"}, Value::Int(7))]
+#[case::match_value_used(indoc! {"
+    o: Feed(_)
+    m = `b(3)
+    r = match m:
+        case `a(n):
+            o << n
+            n
+        case `b(k):
+            o << k * 10
+            k + 1
+    r + sum(o)
+"}, Value::Int(34))]
+#[case::loop_in_an_arm(indoc! {"
+    o: Feed(_)
+    m = `a(3)
+    match m:
+        case `a(n):
+            for i in [1, 2]:
+                o << i * n
+            o << 0
+        case `b(k):
+            o << k
+    sum(o)
+"}, Value::Int(9))]
+#[case::two_collections(indoc! {"
+    good: Feed(_)
+    bad: Feed(_)
+    m = `b(3)
+    match m:
+        case `a(n):
+            good << n
+        case `b(k):
+            bad << k
+    sum(good) * 10 + sum(bad)
+"}, Value::Int(3))]
+#[case::tag_without_payload(indoc! {"
+    o: Feed(_)
+    def f(m):
+        match m:
+            case `none:
+                o << 1
+            case `some(k):
+                o << k
+    f(`none)
+    f(`some(5))
+    sum(o)
+"}, Value::Int(6))]
+fn feed_from_a_match_arm(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
 
 // ---------------------------------------------------------------------------
 // Comprehension over a conditional collection

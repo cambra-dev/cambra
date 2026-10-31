@@ -1506,16 +1506,20 @@ The value-`Case` positions ride the same union-of-restricts:
   variable, so the result is a sum over the same witness
   (type-inference.md, "Consuming a sum: pinning the consumer's kind").
 - **Source-less conditional feeds** (`if c: o << 1 else: o << 2` outside any loop) — *implemented*
-  (`channelize`): each feeding arm becomes a gated one-shot lift `λ __unused : {Unit | π̂ᵢ} → 𝑣ᵢ`,
-  one channel per arm — replacing `PartialFeedCaseUnsupported` for guard-only `Case`s. A
-  scrutinee / pattern feed stays rejected there; a no-else partial feed is still blocked earlier
-  at lowering (bare `if` as a value expression).
+  (`channelize`): each feeding guard arm becomes a gated one-shot lift
+  `λ __unused : {Unit | π̂ᵢ} → 𝑣ᵢ`, one channel per arm. A feeding `match` arm becomes
+  `` (λ __unused : Unit → 𝑠) ≫ variant_project(`𝑡ᵢ) ≫ (λ 𝑥ᵢ → 𝑣ᵢ) ``: the scrutinee as a one-row
+  collection, restricted to the row carrying the arm's tag, so the arm's payload binder reads the
+  projection over a domain rather than a scalar. A `case _` arm is the gated lift, on the
+  complement of the tag tests before it.
 - **Loop-sourced conditional feeds** (`if c: good << i else: bad << i` in a `for` body) —
   *implemented* (`channelize`): each feeding arm becomes a channel over the iteration source
   restricted to that arm's first-match predicate, rather than the gated `Unit` lift above. One
   `Case` fans out once per deferred collection it feeds, and each pass leaves the arms it did
   not take (`channelize`'s `residual_after_fanout`), so two defers fed from complementary arms
-  are two channels over one conditional. The fan-out reads a pattern arm through the
+  are two channels over one conditional. An arm is a statement spine: a feed's value takes the
+  `let`s ahead of it, each feed is a site of its own, and a conditional inside the arm adds its
+  first-match predicate to the restriction of each feed in it. The fan-out reads a pattern arm through the
   tag-to-guard rewrite, which puts `variant_is` in the arm's refinement predicate and
   `variant_project` in its channel value; the rewrite runs on a copy, so the arm in the tree
   keeps its scrutinee and its pattern for the next defer's pass to read.

@@ -189,9 +189,10 @@ inside iteration retain their iteration context. An extracted feed takes a copy 
 reads in the scope it leaves: a `let`, or a channel group, which is what a feed declared beneath the
 extracted one, as in a loop body, has become by then. A recurrence group is not copied. A multi-arm
 feeding `Case` inside a loop produces a refined-source channel for each feeding arm. A guarded
-feeding `Case` outside iteration can use a one-shot lift; a scrutinee-pattern feeding `Case` there
-is rejected. The cluster becomes a mutually scoped `Feed`-kind `LetRec`. Recognition later orders an
-acyclic group as `Let` bindings; an unguarded cycle between channels is rejected.
+feeding `Case` outside iteration uses a one-shot lift, and a feeding `match` arm there feeds through
+its tag's projection of the scrutinee. The cluster becomes a mutually scoped `Feed`-kind `LetRec`.
+Recognition later orders an acyclic group as `Let` bindings; an unguarded cycle between channels is
+rejected.
 
 `channelize` also lifts defer-returning bindings and substitutes aliases that carry defer handles.
 It drops the `ExprStmt` nodes after their feed contributions have been extracted. The
