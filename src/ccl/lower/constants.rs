@@ -5,19 +5,22 @@
 //! expression as a [`ConstTerm`] over the module's `const` parameters. The term is built
 //! from the syntax: a constant reads only literals, constants and `const` parameters, so no
 //! lowering is needed to know its value, and the term is ready wherever a constant is
-//! required, before the statements above it have lowered. A call, a comprehension, and any
-//! other form are refused.
+//! required, before the statements above it have lowered. A call is read through the
+//! callee's term ([`LoweringContext::const_function`]): a function whose body is a constant
+//! over its parameters is one a constant may call. A comprehension and any other form are
+//! refused.
 //!
 //! A top-level `=` binding is a constant when its definition is one, with no marker
 //! ([`LoweringContext::settle_constants`]). Whether it is one is reported only where a
 //! constant is required: a binding that is not one is an ordinary value elsewhere.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use smol_str::SmolStr;
 
 use super::{LoweringContext, LoweringError};
-use crate::ccl::constant::{ConstParam, ConstTerm};
+use crate::ccl::constant::{ConstFunction, ConstParam, ConstTerm};
 use crate::ccl::{ArithmeticKind, BinOpKind, CompareKind, Lit, LogicKind};
 use crate::chl_parser::ast::{
     AssignTarget, BinOp as ChlBinOp, BoolOp, CmpOp, Expr as ChlExpr, Lit as ChlLit,
@@ -32,6 +35,12 @@ pub(in crate::ccl) struct ModuleConstants {
     /// What each `=` binding read so far is as a constant, by name and the start of its
     /// statement: its term, or why its definition is not one.
     terms: HashMap<(SmolStr, usize), Result<ConstTerm, Refused>>,
+    /// What each `def` read so far is as a function a constant may call, by name and the
+    /// start of its statement: its term, or why it may not be called in a constant.
+    functions: HashMap<(SmolStr, usize), Result<ConstFunction, Refused>>,
+    /// The parameters and local bindings of the function whose body is being read, each with
+    /// its term, innermost last ([`LoweringContext::const_function`]).
+    locals: Vec<(SmolStr, ConstTerm)>,
 }
 
 /// One top-level binding of a name.
@@ -56,7 +65,8 @@ enum BindingKind {
     Param,
     /// A mutable variable.
     Mutable,
-    Function,
+    /// `def f(…): …`, the statement itself.
+    Function(Rc<ChlStmt>),
 }
 
 impl ModuleConstants {
@@ -91,7 +101,7 @@ impl ModuleConstants {
                 }
                 ChlStmt::FunctionDef {
                     owner: None, name, ..
-                } => push(&name.node, BindingKind::Function),
+                } => push(&name.node, BindingKind::Function(Rc::new(stmt.clone()))),
                 ChlStmt::Param { name, constant, .. } => {
                     let kind = match constant {
                         Some(_) => BindingKind::ConstParam(ConstParam::declared(name.node.clone())),
@@ -118,13 +128,24 @@ impl ModuleConstants {
 
     /// Each `=` binding, by name, with where its statement starts, in source order.
     fn value_bindings(&self) -> Vec<(SmolStr, usize)> {
+        self.bindings_where(|kind| matches!(kind, BindingKind::Value { .. }))
+    }
+
+    /// Each `def`, by name, with where its statement starts, in source order.
+    fn function_bindings(&self) -> Vec<(SmolStr, usize)> {
+        self.bindings_where(|kind| matches!(kind, BindingKind::Function(_)))
+    }
+
+    /// Each binding whose kind `wanted` admits, by name, with where its statement starts, in
+    /// source order.
+    fn bindings_where(&self, wanted: impl Fn(&BindingKind) -> bool) -> Vec<(SmolStr, usize)> {
         let mut out: Vec<(SmolStr, usize)> = self
             .bindings
             .iter()
             .flat_map(|(name, bindings)| {
                 bindings
                     .iter()
-                    .filter(|b| matches!(b.kind, BindingKind::Value { .. }))
+                    .filter(|b| wanted(&b.kind))
                     .map(move |b| (name.clone(), b.start))
             })
             .collect();
@@ -141,6 +162,19 @@ impl ModuleConstants {
             return None;
         }
         self.terms.get(&(SmolStr::from(name), last.start)).cloned()
+    }
+
+    /// What the last top-level binding of `name` is as a function a constant may call, when
+    /// it is a `def`: its term, or why it may not be called in a constant.
+    /// [`LoweringContext::settle_constants`] has read every `def`.
+    pub(super) fn settled_function(&self, name: &str) -> Option<Result<ConstFunction, Refused>> {
+        let last = self.bindings.get(name)?.iter().max_by_key(|b| b.start)?;
+        if !matches!(last.kind, BindingKind::Function(_)) {
+            return None;
+        }
+        self.functions
+            .get(&(SmolStr::from(name), last.start))
+            .cloned()
     }
 
     /// The binding a reference to `name` from a statement starting at `at` reads: the last
@@ -210,6 +244,22 @@ impl Refused {
         error.related_mut().extend(why.related().iter().cloned());
         Refused(Some(error))
     }
+
+    /// The refusal of a call, at `span`, of the function `name`, which may not be called in a
+    /// constant for this reason: an error at the call, with the function's own error beside
+    /// it.
+    fn of_function(self, name: &str, span: Span) -> Refused {
+        let Refused(Some(why)) = self else {
+            return self;
+        };
+        let mut error = refused(
+            span,
+            format!("`{name}` may not be called in a constant, since its body is not a constant"),
+        )
+        .with_related(why.span(), why.to_string());
+        error.related_mut().extend(why.related().iter().cloned());
+        Refused(Some(error))
+    }
 }
 
 impl LoweringContext {
@@ -221,6 +271,139 @@ impl LoweringContext {
             // The result is cached; nothing is reported unless a read requires it.
             let _ = self.const_binding_term(&name, start);
         }
+        for (name, start) in self.constants.function_bindings() {
+            let _ = self.const_function(&name, start);
+        }
+    }
+
+    /// The `def` `name` whose statement starts at `start` as a function a constant may call,
+    /// reading it once, or why it may not be called in one (`docs/chl-spec.md`, "9.19
+    /// Constants").
+    ///
+    /// Its body is its local `=` bindings and its last expression, each a constant over its
+    /// parameters, and it states no clause and takes no mutable variable. Reading only
+    /// parameters, constants and functions that may be called in a constant, it requires and
+    /// causes nothing.
+    fn const_function(&mut self, name: &SmolStr, start: usize) -> Result<ConstFunction, Refused> {
+        let key = (name.clone(), start);
+        if let Some(function) = self.constants.functions.get(&key) {
+            return function.clone();
+        }
+        let binding = self.constants.bindings[name]
+            .iter()
+            .find(|b| b.start == start)
+            .cloned()
+            .expect("a `def` is recorded");
+        let BindingKind::Function(def) = binding.kind else {
+            unreachable!("asked for the function of a binding that is not a `def`");
+        };
+        // A body that reached its own function would recur; the entry ends it.
+        self.constants
+            .functions
+            .insert(key.clone(), Err(Refused(None)));
+        let outer = std::mem::take(&mut self.constants.locals);
+        let function = self.read_const_function(&def, start);
+        self.constants.locals = outer;
+        self.constants.functions.insert(key, function.clone());
+        function
+    }
+
+    /// [`Self::const_function`] of `def`, a `def` statement starting at `start`, with no
+    /// locals of an enclosing body in scope.
+    fn read_const_function(
+        &mut self,
+        def: &ChlStmt,
+        start: usize,
+    ) -> Result<ConstFunction, Refused> {
+        let ChlStmt::FunctionDef {
+            params,
+            requires,
+            causes,
+            body,
+            ..
+        } = def
+        else {
+            unreachable!("a function binding is a `def`");
+        };
+        for (clause, what) in [(requires.span, "requires"), (causes.span, "causes")] {
+            let stated = match what {
+                "requires" => !requires.items.is_empty(),
+                _ => !causes.items.is_empty(),
+            };
+            if let Some(span) = clause
+                && stated
+            {
+                return Err(refused(
+                    span,
+                    format!(
+                        "this function {what} what its clause states, and a function called \
+                         in a constant requires and causes nothing"
+                    ),
+                )
+                .into());
+            }
+        }
+        let mut terms = Vec::new();
+        for param in params {
+            if let Some(annotation) = &param.annotation
+                && matches!(&annotation.ty.node, ChlExpr::Call { func, .. }
+                    if matches!(&func.node, ChlExpr::Name(n) if n == "Mut"))
+            {
+                return Err(refused(
+                    param.name_span,
+                    format!(
+                        "`{}` is a mutable variable the caller passes, and a function called \
+                         in a constant reads only values",
+                        param.name
+                    ),
+                )
+                .into());
+            }
+            let param = ConstParam::declared(param.name.clone());
+            self.constants
+                .locals
+                .push((param.spelling.clone(), ConstTerm::Param(param.clone())));
+            terms.push(param);
+        }
+        let Some((last, bindings)) = body.split_last() else {
+            unreachable!("a `def` has a body");
+        };
+        for stmt in bindings {
+            match &stmt.node {
+                ChlStmt::Assign { target, value, .. }
+                | ChlStmt::AnnAssign { target, value, .. }
+                    if matches!(target.node, AssignTarget::Name(_)) =>
+                {
+                    let AssignTarget::Name(local) = &target.node else {
+                        unreachable!("guarded above");
+                    };
+                    let term = self.const_term(value, start)?;
+                    self.constants.locals.push((local.clone(), term));
+                }
+                ChlStmt::Pass => {}
+                _ => {
+                    return Err(refused(
+                        stmt.span,
+                        "a function called in a constant holds `=` bindings and its value; \
+                         this statement in one is not supported yet",
+                    )
+                    .into());
+                }
+            }
+        }
+        let ChlStmt::Expr(value) = &last.node else {
+            return Err(refused(
+                last.span,
+                "a function called in a constant ends in its value; this statement in one is \
+                 not supported yet",
+            )
+            .into());
+        };
+        let body = self.const_term(value, start)?;
+        Ok(ConstFunction {
+            params: terms,
+            body,
+        })
     }
 
     /// The term of the `=` binding `name` whose statement starts at `start`, reading it
@@ -433,10 +616,29 @@ impl LoweringContext {
                     .normalized()
                     .map_err(no_value)
             }
-            ChlExpr::Call { .. } | ChlExpr::MethodCall { .. } => Err(refused(
+            ChlExpr::Call { func, args } => {
+                let function = self.called_function(func, at)?;
+                if function.params.len() != args.len() {
+                    return Err(refused(
+                        span,
+                        format!(
+                            "this call passes {} arguments to a function of {} parameters",
+                            args.len(),
+                            function.params.len()
+                        ),
+                    )
+                    .into());
+                }
+                let args = args
+                    .iter()
+                    .map(|arg| self.const_term(arg, at))
+                    .collect::<Result<Vec<_>, _>>()?;
+                function.applied(args).map_err(no_value)
+            }
+            ChlExpr::MethodCall { .. } => Err(refused(
                 span,
-                "a call in a constant is not supported yet; a constant is built from \
-                 literals, constants, operators, and tuples, records and lists of them",
+                "a method call in a constant is not supported yet; a constant calls a \
+                 function by name",
             )
             .into()),
             _ => Err(refused(
@@ -448,8 +650,118 @@ impl LoweringContext {
         }
     }
 
+    /// The function a constant written in a statement starting at `at` calls through
+    /// `func`: a `def` above, a `use` name, or another module's member.
+    fn called_function(
+        &mut self,
+        func: &Spanned<ChlExpr>,
+        at: usize,
+    ) -> Result<ConstFunction, Refused> {
+        let span = func.span;
+        match &func.node {
+            ChlExpr::Name(name) if !self.constants.locals.iter().any(|(l, _)| l == name) => {
+                if self.constants.above(name, at).is_none()
+                    && let Some(function) = self.used_function(name, span)
+                {
+                    return function;
+                }
+                match self.constants.above(name, at).cloned() {
+                    Some(TopBinding {
+                        kind: BindingKind::Function(_),
+                        start,
+                    }) => self
+                        .const_function(name, start)
+                        .map_err(|why| why.of_function(name, span)),
+                    Some(_) => Err(refused(
+                        span,
+                        format!("`{name}` is not a function, so a constant does not call it"),
+                    )
+                    .into()),
+                    None => Err(refused(
+                        span,
+                        format!(
+                            "`{name}` is not a function a constant may call: a constant calls \
+                             a `def` above it, and builtins are not supported yet"
+                        ),
+                    )
+                    .into()),
+                }
+            }
+            ChlExpr::Qualified(q) => {
+                let [qualifier] = q.qualifier.as_slice() else {
+                    return Err(refused(
+                        span,
+                        "a function reached through more than one qualifier is not supported \
+                         yet",
+                    )
+                    .into());
+                };
+                self.qualified_function(&qualifier.node, &q.name.node, span)
+            }
+            _ => Err(refused(span, "a constant calls a function by name").into()),
+        }
+    }
+
+    /// The function the `use` name `name` reads, if it is a `use` name of a value: another
+    /// module's member, which a constant may call if its interface says so.
+    fn used_function(&mut self, name: &str, span: Span) -> Option<Result<ConstFunction, Refused>> {
+        let used = self.module.uses.get(name)?;
+        let super::modules::Reached::Value(reference) = &used.reached else {
+            return None;
+        };
+        let Some(reference) = reference else {
+            return Some(Err(Refused(None)));
+        };
+        let (qualifier, member) = reference.name.segments().split_first()?;
+        let [member] = member else {
+            return Some(Err(refused(
+                span,
+                "a function reached through more than one qualifier is not supported yet",
+            )
+            .into()));
+        };
+        let (qualifier, member) = (qualifier.clone(), member.clone());
+        Some(self.qualified_function(&qualifier, &member, span))
+    }
+
+    /// The function `qualifier::member` is, as this module writes it: a term over this
+    /// module's `const` parameters, which the run or import `qualifier` names passes.
+    fn qualified_function(
+        &mut self,
+        qualifier: &str,
+        member: &str,
+        span: Span,
+    ) -> Result<ConstFunction, Refused> {
+        let Some(at) = self.module.qualifiers.get(qualifier) else {
+            return Err(refused(span, format!("`{qualifier}` names no module")).into());
+        };
+        let Some(interface) = at.reachable() else {
+            return Err(Refused(None));
+        };
+        match interface.const_functions.get(member) {
+            Some(Ok(function)) => function
+                .substituted(&at.types.consts)
+                .map_err(|e| refused(span, e.0).into()),
+            Some(Err(why)) => Err(why
+                .clone()
+                .of_function(&format!("{qualifier}::{member}"), span)),
+            None => Err(refused(
+                span,
+                format!(
+                    "`{qualifier}::{member}` is not a function a constant may call: module `{}` \
+                     has no public `def` `{member}`",
+                    interface.module
+                ),
+            )
+            .into()),
+        }
+    }
+
     /// The constant `name` reads from a statement starting at `at`.
     fn const_name(&mut self, name: &SmolStr, span: Span, at: usize) -> Result<ConstTerm, Refused> {
+        if let Some((_, term)) = self.constants.locals.iter().rev().find(|(l, _)| l == name) {
+            return Ok(term.clone());
+        }
         if self.constants.above(name, at).is_none()
             && let Some(term) = self.used_const(name, span)
         {
@@ -478,7 +790,7 @@ impl LoweringContext {
             BindingKind::ConstParam(param) => Ok(ConstTerm::Param(param)),
             BindingKind::Param => Err(not_const("a parameter without `const`").into()),
             BindingKind::Mutable => Err(not_const("a mutable variable").into()),
-            BindingKind::Function => Err(not_const("a function").into()),
+            BindingKind::Function(_) => Err(not_const("a function").into()),
         }
     }
 
