@@ -148,9 +148,9 @@ pub(super) struct InferCtx {
     effect_statements: Vec<(NodeId, Rc<EffectVar>, EffectVarId)>,
     /// Each `with begin():` block emitted, with the variable collecting what its body causes.
     effect_transactions: Vec<(NodeId, Rc<EffectVar>)>,
-    /// The `ExprStmt` of each expression statement the program writes, the statements an
-    /// inert one is refused among.
-    pub(super) expression_statements: HashSet<NodeId>,
+    /// What lowering marks each marked node as: an expression statement, which an inert one
+    /// is refused among, or a sink binding, which causes `Emit`.
+    pub(super) marks: HashMap<NodeId, crate::ccl::lower::Mark>,
     /// Each public function of the module, with its effects and its `let`.
     effect_public: Vec<(Name, Rc<EffectVar>, NodeId)>,
     /// Each generalized `def` whose `requires` clause is an upper bound: its type, the level
@@ -573,7 +573,7 @@ impl InferCtx {
             effect_binders: HashMap::new(),
             effect_statements: Vec::new(),
             effect_transactions: Vec::new(),
-            expression_statements: HashSet::new(),
+            marks: HashMap::new(),
             effect_calls: HashSet::new(),
             effect_public: Vec::new(),
             bounded_requires: Vec::new(),
@@ -2574,6 +2574,12 @@ impl Typing for InferCtx {
         }
     }
 
+    fn record_sink_binding(&mut self) {
+        if self.marks.get(&self.current_node_id) == Some(&crate::ccl::lower::Mark::Sink) {
+            self.record_effect(Item::Causes(Effect::Emit));
+        }
+    }
+
     fn record_read(&mut self, name: &Name, at: NodeId) {
         // The read is the variable's mention, wherever the rule reading through it runs.
         let prev = self.enter_node(at);
@@ -2588,7 +2594,7 @@ impl Typing for InferCtx {
     }
 
     fn statement<R>(&mut self, node: NodeId, f: impl FnOnce(&mut Self) -> R) -> R {
-        if !self.expression_statements.contains(&node) {
+        if self.marks.get(&node) != Some(&crate::ccl::lower::Mark::ExpressionStatement) {
             return f(self);
         }
         let outer = self.effect_frame();

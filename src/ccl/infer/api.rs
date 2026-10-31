@@ -132,9 +132,9 @@ pub struct TypeInferenceContext {
     /// The program's trait instances, which lowering builds.
     pub(crate) instances: Rc<InstanceTable>,
 
-    /// The `ExprStmt` of each expression statement the program writes
-    /// ([`crate::ccl::lower::expression_statements`]).
-    pub(crate) expression_statements: HashSet<NodeId>,
+    /// What lowering marks each marked node as: an expression statement or a sink binding
+    /// ([`crate::ccl::lower::marked_nodes`]).
+    pub(crate) marks: HashMap<NodeId, crate::ccl::lower::Mark>,
 
     /// The expression statements [`infer`] found to cause nothing, which the compile reports
     /// once the checks that diagnose a statement more precisely have run.
@@ -1770,12 +1770,7 @@ pub fn infer(
     // variable's bounds, breaking the `Rc` cycles that would otherwise leak
     // the whole variable graph. See [`InferArena`].
     let _arena = InferArena::new();
-    let ty = super::run(
-        expr,
-        &ctx.source_types,
-        &ctx.instances,
-        &ctx.expression_statements,
-    );
+    let ty = super::run(expr, &ctx.source_types, &ctx.instances, &ctx.marks);
     #[cfg(debug_assertions)]
     if std::env::var_os("DUMP_KINDS").is_some() {
         eprintln!("=== kind vars ===\n{}", crate::ccl::ty::dump_kind_vars());
@@ -1848,7 +1843,7 @@ pub fn check_module(
         params,
         reported,
         public,
-        &ctx.expression_statements,
+        &ctx.marks,
     )?;
     // A module checked on its own runs no later check that diagnoses a statement more
     // precisely, so an inert statement is reported here.

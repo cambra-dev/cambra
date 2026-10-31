@@ -140,10 +140,6 @@ pub struct ModuleCheck {
     pub interface: Rc<Interface>,
     /// The module's own `import` and `run` statements, each with the file it names.
     pub statements: Vec<ModuleStatement>,
-    /// The statement binding a sink at the module's top level, if one does: an output
-    /// outside the program, which its top level causes (`docs/chl-spec.md`, "Output outside
-    /// the program").
-    pub binds_sink: Option<Span>,
 }
 
 /// One `import` or `run` statement of a module, with the file it names.
@@ -343,7 +339,6 @@ impl<'a> ProgramLowering<'a> {
             arguments: self.inferred_arguments(file, &lowered.chain),
             interface: Rc::clone(&lowered.interface),
             statements: self.statements(file),
-            binds_sink: self.program.ast(file).and_then(sink_site),
         })
     }
 

@@ -651,13 +651,14 @@ discharge (`ModuleChecked::top_level`; [chl-spec.md, "Shareable modules
 `import_and_run_errors` in `src/ccl/context.rs` reads it for each module's `import` and `run`
 statements (`ModuleCheck::statements`), and for the root's, which lowering keeps on the context
 because the root usually has no check of its own (`LoweringContext::root_statements`). A module is
-shareable when its top level requires and causes nothing, binds no sink, and runs no module.
+shareable when its top level requires and causes nothing, a sink it binds causing `Emit`, and it
+runs no module.
 `@LoadFrom` is outside the effects model, so a load bears on none of this. A
 statement whose module is shareable and whose arguments an import could pass, each a constant, an
 import name, or a type written over imports (`ModuleStatement::importable_arguments`), must be an
 `import`; any other must be a `run`. The error at an `import` names what makes the module a run,
-with a label at the statement it comes from: the sink, the `run`, or the node where the first label
-its top level holds entered (`obstacle`). `cambra check` prints that reason as the interface's last
+with a label at the statement it comes from: the `run`, or the node where the first label its top
+level holds entered (`obstacle`). `cambra check` prints that reason as the interface's last
 line (`Interface::written`).
 
 An error of a `run` statement or of its arguments, such as a missing argument, depends on the

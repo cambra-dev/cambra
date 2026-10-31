@@ -593,7 +593,7 @@ pub(crate) fn run(
     expr: &mut Expr,
     sources: &HashMap<String, Type>,
     instances: &Rc<solver::traits::InstanceTable>,
-    statements: &HashSet<crate::ccl::provenance::NodeId>,
+    marks: &HashMap<crate::ccl::provenance::NodeId, crate::ccl::lower::Mark>,
 ) -> Result<(Type, Vec<LocatedInferError>), Vec<LocatedInferError>> {
     run_with_params(
         expr,
@@ -602,7 +602,7 @@ pub(crate) fn run(
         &[],
         &HashSet::new(),
         &HashSet::new(),
-        statements,
+        marks,
     )
     .map(|inferred| (inferred.ty, inferred.inert))
 }
@@ -665,7 +665,7 @@ pub(crate) fn run_with_params(
     params: &[ModuleCheckParam],
     reported: &HashSet<Name>,
     public: &HashSet<Name>,
-    statements: &HashSet<crate::ccl::provenance::NodeId>,
+    marks: &HashMap<crate::ccl::provenance::NodeId, crate::ccl::lower::Mark>,
 ) -> Result<Inferred, Vec<LocatedInferError>> {
     // Convert source registry once; reuse across all node emissions.
     let mut sub_ctx = {
@@ -683,7 +683,7 @@ pub(crate) fn run_with_params(
     let opened = sub_ctx.open_module_params(params).map_err(|e| vec![e])?;
     sub_ctx.reported = reported.clone();
     sub_ctx.public = public.clone();
-    sub_ctx.expression_statements = statements.clone();
+    sub_ctx.marks = marks.clone();
 
     // Pass 1: emit constraints. The high-value variants
     // (`UnboundVariable`/`TypeMismatch`/`ExpectedFunction`) all originate here.

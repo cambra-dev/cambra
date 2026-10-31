@@ -284,6 +284,10 @@ fn a_checked_module_prints_its_interface() {
     "stock: Mut(Int, Txn) := 0\npub n = 1\n",
     "module main\npub n: {Int where _ == 1}  # a constant\nrun, since its top level causes `Write(stock)`\n"
 )]
+#[case::a_sink(
+    "out = test_sink()\nout << 1\n",
+    "module main\nrun, since its top level causes `Emit`\n"
+)]
 #[case::induction(
     indoc! {"
         total := 0
