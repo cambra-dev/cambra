@@ -30,7 +30,7 @@
     "vim": "Boolean"
   },
   "keyword-control": {
-    "construct": "if elif else for in return yield match case pass with",
+    "construct": "if elif else for in return yield match case pass with raise try except",
     "textmate": "keyword.control",
     "vim": "Statement"
   },

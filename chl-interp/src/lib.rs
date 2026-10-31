@@ -13,7 +13,10 @@
 //! accepts: on an ill-formed one it may answer where the spec refuses, such as a `:=` to an
 //! immutable name, which declares a new mutable variable here. The distinctions the type
 //! system draws that the answer depends on are ones the surface syntax already states: a
-//! comprehension's filter is an `if` in the source, whatever refinement it becomes.
+//! comprehension's filter is an `if` in the source, whatever refinement it becomes. The one
+//! it cannot read off the syntax is which `except` catches an exception, which the raised
+//! expression's type decides: the interpreter decides it from the value for a primitive or a
+//! nominal type, where the two agree, and refuses any other.
 
 pub mod eval;
 pub mod value;

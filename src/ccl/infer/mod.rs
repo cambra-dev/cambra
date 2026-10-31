@@ -721,6 +721,9 @@ pub(crate) fn run_with_params(
     // checked here (`src/ccl/design/type-inference.md`, "Effect variables"), after each
     // associated effect type is given what the obligation standing for it selected.
     sub_ctx.settle_effect_links();
+    // Which exceptions each `try` catches depends on their types, which emission has now
+    // finished constraining; every check reading labels below sees what is left.
+    errors.extend(sub_ctx.settle_catches());
     push_effect_failures(&mut errors, expr);
     errors.extend(sub_ctx.requirements_beyond_clauses());
     errors.extend(sub_ctx.escaping_results());
@@ -917,6 +920,28 @@ pub(crate) fn run_with_params(
         .collect();
     if !unsupplied.is_empty() {
         return Err(unsupplied);
+    }
+    // No exception escapes the program: one the top level raises is an error at the
+    // statement it escapes from, with a label at the `raise`.
+    let escaping_exceptions: Vec<LocatedInferError> = top_level
+        .iter()
+        .filter_map(|l| match &l.item {
+            crate::ccl::effects::Item::Causes(crate::ccl::effects::Effect::Raise(raised)) => {
+                let ty = resolve_var_type(&raised.ty).unwrap_or_else(|_| raised.ty.clone());
+                let at = l.at.unwrap_or(raised.site);
+                Some(
+                    LocatedInferError::new(InferError::ExceptionEscapes { ty: ty.to_string() }, at)
+                        .with_failure((
+                            Some(crate::ccl::infer_var::Origin::Node(raised.site)),
+                            None,
+                        )),
+                )
+            }
+            _ => None,
+        })
+        .collect();
+    if !escaping_exceptions.is_empty() {
+        return Err(escaping_exceptions);
     }
     top_level.extend(exported.appends);
     Ok(Inferred {

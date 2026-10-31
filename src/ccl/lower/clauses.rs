@@ -12,10 +12,12 @@ use chl_parser::ast::{
     Clause, Expr as ChlExpr, Requirement as ChlRequirement, Span, Spanned, TraitType,
 };
 
+use super::stmts::lower_type_expr;
 use super::{LoweringContext, LoweringError};
 use crate::ccl::Name;
-use crate::ccl::effects::{ClauseParam, Effect, EffectSet, Requirement, Written};
+use crate::ccl::effects::{ClauseParam, Effect, EffectSet, Raised, Requirement, Written};
 use crate::ccl::infer::solver::traits::Trait;
+use crate::ccl::provenance::NodeId;
 
 /// Whether a `requires` item names a context trait or a parameter bounded by `Context`, or
 /// is `_`, rather than a trait instance search answers.
@@ -58,7 +60,7 @@ pub(super) fn lower_clauses(
     causes: &Clause<TraitType>,
     site: Site,
     written_at: Span,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Option<Written>, LoweringError> {
     let at = match (requires.span, causes.span) {
         (None, None) if site == Site::Def => return Ok(None),
@@ -162,7 +164,7 @@ fn context_requirement(
 /// The effect or the parameter `item` names.
 fn effect(
     item: &Spanned<TraitType>,
-    ctx: &LoweringContext,
+    ctx: &mut LoweringContext,
 ) -> Result<Lowered<Effect>, LoweringError> {
     let ty = &item.node;
     if let Some(param) = associated(ty, ctx)? {
@@ -177,16 +179,20 @@ fn effect(
         ("Append", [f]) => Ok(Lowered::Item(Effect::Append(variable(f, "Append")?))),
         ("Commit", []) => Ok(Lowered::Item(Effect::Commit)),
         ("Emit", []) => Ok(Lowered::Item(Effect::Emit)),
-        ("Raise", _) => Err(LoweringError::unsupported(
-            ty.name_span,
-            "`Raise` is not supported yet: exceptions are not implemented",
-        )),
-        ("Write" | "Append" | "Commit" | "Emit" | "_", _) => Err(arity(item.span, &ty.name)),
+        // The clause item stands for a `raise` the function may perform, so it is the site
+        // an exception it states is raised at.
+        ("Raise", [t]) => Ok(Lowered::Item(Effect::Raise(Raised::at(
+            NodeId::fresh(),
+            lower_type_expr(t, ctx)?,
+        )))),
+        ("Write" | "Append" | "Commit" | "Emit" | "Raise" | "_", _) => {
+            Err(arity(item.span, &ty.name))
+        }
         (name, _) => Err(LoweringError::unsupported(
             ty.name_span,
             format!(
                 "`{name}` is not an effect; a `causes` clause lists `Write(x)`, `Append(f)`, \
-                 `Commit`, `Emit`, `_`, and a type parameter bounded by `Effect`"
+                 `Commit`, `Emit`, `Raise(T)`, `_`, and a type parameter bounded by `Effect`"
             ),
         )),
     }
@@ -271,6 +277,7 @@ fn variable(arg: &Spanned<ChlExpr>, item: &str) -> Result<Name, LoweringError> {
 fn arity(span: Span, name: &str) -> LoweringError {
     let expected = match name {
         "_" | "Ext" | "Commit" | "Emit" => "no argument",
+        "Raise" => "one type",
         _ => "one variable",
     };
     LoweringError::unsupported(span, format!("`{name}` takes {expected}"))

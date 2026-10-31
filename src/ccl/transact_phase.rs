@@ -1166,10 +1166,10 @@ enum SpineStep {
 /// bound as it is reached, so it reads what the variables hold there and not what the later
 /// chain writes.
 fn hoist_onto_spine(e: Expr, spine: &mut Vec<SpineStep>) -> Expr {
-    let mut e = projected_element(e);
+    let mut e = crate::ccl::ccl_utils::projected_element(e);
     if let TypedExprNode::Apply { function, .. } = &mut e.node {
         let taken = std::mem::take(&mut **function);
-        **function = projected_element(taken);
+        **function = crate::ccl::ccl_utils::projected_element(taken);
     }
     let id = e.node_id();
     match e.node {
@@ -1422,37 +1422,6 @@ fn write_off_a_spine(expr: &Expr) -> Option<NodeId> {
             found
         }
     }
-}
-
-/// `e` as the element it projects, when it projects one out of a tuple of values written
-/// where it stands, `(f, x) ▷ .0`: what inlining a call of several arguments leaves for
-/// each argument it passes on, a function among them. Otherwise `e`.
-fn projected_element(e: Expr) -> Expr {
-    let TypedExprNode::Apply { argument, function } = &e.node else {
-        return e;
-    };
-    let (TypedExprNode::Tuple(elements), TypedExprNode::Proj(ProjKey::Index(i))) =
-        (&argument.node, &function.node)
-    else {
-        return e;
-    };
-    let i = *i;
-    let values = elements.iter().all(|element| {
-        matches!(
-            element.node,
-            TypedExprNode::Var(_) | TypedExprNode::Lit(_) | TypedExprNode::Lambda { .. }
-        )
-    });
-    if !values || i >= elements.len() {
-        return e;
-    }
-    let TypedExprNode::Apply { argument, .. } = e.node else {
-        unreachable!("guarded above")
-    };
-    let TypedExprNode::Tuple(mut elements) = argument.node else {
-        unreachable!("guarded above")
-    };
-    projected_element(elements.swap_remove(i))
 }
 
 /// Whether `e` holds a chain [`hoist_onto_spine`] moves that writes or feeds ([`acts`]): a

@@ -221,6 +221,18 @@ does so as well. No separate block-expression node remains. The result is normal
 default-only `match` uses the sequence described below. A value-returning `if` requires an `else`
 branch.
 
+## `raise` and `try`
+
+`raise 𝑒` lowers to `Raise { value }`, a `Unit`-valued statement on the chain it stands in. `try`
+lowers to `Try { body, handlers }`, one `Handler` per `except` clause holding the type it catches
+and its body under the clause's binder, or under an inaccessible one where the clause names none
+(`lower_try`). In value position a `try` is lowered as an `if` or a `match` is, its value the join
+of its blocks'. A statement `if` with no `else` lowers its missing branch to `unit`.
+
+A `for` loop whose body holds a `raise` or a `try` keeps a structured `For` node, as a
+mutation-accumulation loop does (`for_body_has_exceptions`), so its body is a statement chain
+exception elimination can give the loop state it adds ([ir.md](ir.md#exceptions)).
+
 ## Variants and match
 
 A variant constructor becomes `VariantCtor(tag, payload)`. A bare `` `tag `` and `` `tag() ``

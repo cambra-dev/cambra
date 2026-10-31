@@ -4771,6 +4771,8 @@ fn eq_has_arm(node: &TypedExprNode) -> bool {
         | N::Let { .. }
         | N::List(_)
         | N::Case { .. }
+        | N::Raise { .. }
+        | N::Try { .. }
         | N::VariantCtor { .. }
         | N::NominalCtor { .. }
         | N::Method { .. }
@@ -5014,6 +5016,31 @@ fn eq_term_modulo_ty_slots_go(
                         }
                         _ => false,
                     })
+        }
+        (N::Raise { value: v1 }, N::Raise { value: v2 }) => {
+            eq_term_modulo_ty_slots_go(v1, v2, pairs)
+        }
+        // Each clause binds its exception in its body; which type it catches is a type slot.
+        (
+            N::Try {
+                body: b1,
+                handlers: h1,
+            },
+            N::Try {
+                body: b2,
+                handlers: h2,
+            },
+        ) => {
+            eq_term_modulo_ty_slots_go(b1, b2, pairs)
+                && h1.len() == h2.len()
+                && h1.iter().zip(h2).all(|(x, y)| {
+                    eq_under_binder(
+                        pairs,
+                        &x.binding.name,
+                        &y.binding.name,
+                        &[(&x.body, &y.body)],
+                    )
+                })
         }
         (
             N::VariantCtor {

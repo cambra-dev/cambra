@@ -3937,6 +3937,7 @@ whose body it is. Labels are recorded on the innermost frame:
 | a value read of an induction variable 𝑥 | `Read(𝑥)` |
 | an `Apply` passing 𝑎 to a `Mut` parameter | `Write(𝑎)` |
 | an `Apply` passing a feed 𝑎 to a `Feed` parameter | `Append(𝑎)` |
+| `Raise` of a value of type 𝐸 | `Raise(𝐸)`, at the `Raise` node and an instance of its own |
 
 A value read is a mention whose handle becomes its value (`read_value` in `emit.rs`). A mention
 passed by reference, or to `await_final`, stays a handle and reads nothing. A parameter's history
@@ -3950,13 +3951,25 @@ frame's. Inside a `Begin` body the filter also drops `Transaction`. A label nami
 always passes. `Read(𝑥)` is filtered as `Write(𝑥)` is: inside the scope binding 𝑥, every call
 has a position in its history.
 
+**A `try` catches by type.** A `try` body collects on a frame of its own, and the edge out of it
+stops each `Raise(𝑆)` whose 𝑆 resolves to a subtype of a type a clause catches (`effects::Catch`).
+The edge reads the type each time it is crossed, so an exception reaching the body through a
+function a use of the definition is passed is decided as one raised in it is. A type still open
+lets the exception through, and `InferCtx::settle_catches`, once emission is done, marks the types
+settled and refuses a clause that catches nothing (`InferError::ExceptCatchesNothing`). A `try`
+whose body reaches a call of a function no value of the definition flows into, such as an
+unannotated parameter's, raises what each use passes, so none of its clauses is refused at the
+definition: `Typing::apply` records each call whose callee is an inference variable, and the check
+skips a `try` reaching one whose variable receives no value. Each use of a polymorphic definition
+copies its `Raise` labels at its own instance of the types (`Raised::instantiated`).
+
 **A loop whose iterations interact requires an order of its positions** (`docs/chl-spec.md`,
 "Ordered loops"). A `for` body is emitted on a frame of its own that keeps what names the enclosing
 function's own variables (`Typing::loop_body`). Where what it collects holds `Write(𝑥)` for an `𝑥`
-the body does not declare, the loop is ordered, and `emit_for` requires `Orderable(𝑃, 𝑃)` of its
-source's position type `𝑃`, during emission, so a definition's scheme states it. A body that
-interacts only through a function passed to it is found to after emission, too late for the scheme;
-`check_loop_orders` asserts no loop is.
+the body does not declare, or a `Raise` that escapes the body, the loop is ordered, and `emit_for`
+requires `Orderable(𝑃, 𝑃)` of its source's position type `𝑃`, during emission, so a definition's
+scheme states it. A body that interacts only through a function passed to it is found to after
+emission, too late for the scheme; `check_loop_orders` asserts no loop is.
 
 **A call relates the callee's effects to the caller's.** `InferCtx::apply` puts a fresh call
 variable on the expected function type and an edge from it into the innermost frame. The
@@ -3970,9 +3983,11 @@ clause ends in `_`, and where the clauses are written (`lower/clauses.rs`). A fu
 no clause is written too, with no item and neither clause open, since a written type's clauses are
 exact. `normalize_annotation` turns written clauses into a fresh variable holding the items, with
 an upper bound of the items over each clause not ending in `_` (`InferCtx::normalize_effects`).
-`uniquify` resolves the variables a clause names in the scope the clause is written in, and
-`Typing::check_written` refuses one that names no variable of the kind its item takes
-(`InferError::ClauseNamesNoVariable`). The Check mode reads no effects, and normalizes a written
+A stated `Raise(𝑇)` bounds by subtyping, since `Raise` is covariant: an upper bound admits a
+`Raise(𝑆)` with 𝑆 a subtype of a 𝑇 it states (`Upper::admits`), checked once inference is done and
+the types resolve. `uniquify` resolves the variables a clause names in the scope the clause is
+written in, and `Typing::check_written` refuses one that names no variable of the kind its item
+takes (`InferError::ClauseNamesNoVariable`). The Check mode reads no effects, and normalizes a written
 clause to none.
 
 A `def`'s clauses ride a stamp on the lambda whose body is the `def`'s body, the innermost of its

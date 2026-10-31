@@ -2976,27 +2976,20 @@ fn assert_statement_end(end: &Expr) {
 
 /// Whether a [`WriterWalk`] keeps a binding of `value` rather than inlining it.
 ///
-/// A value whose type names a term is inlined, because a binder of that type carries the
-/// name out of the value: into the tap type of a feed that reads it, or, for a refined
-/// write's contribution `{Int | __elem == __anf ^+ 1}`, to a read segment's snapshot binder
-/// that an opaque binding leaves standing in the type (see the walk's `Let` arm). A value
-/// that is a lambda or a cast is inlined too: bound at the writer's domain, a
-/// comprehension's collection has a type reading the writer's parameter
-/// (`{[0, 2] | __elem ▷ xs ▷ (λ z → z > __p.0)} ⤇ Int`), which `lambda_elim` does not
-/// eliminate the parameter from. An aggregate is kept: its type is its result's. A literal
-/// is inlined as well: it costs nothing to copy, and a list literal bound to a name reaches
-/// op-conversion without the `iterate` planning puts before one it meets in place. A boxed
-/// value, a sum `Σ (σ : 𝐾). 𝐶`, is inlined too: a binding read after a step that drops keys,
-/// a write under an `if` read by the commit arm, pairs with the reader's input in a `zip`
-/// (`operator_conversion`'s `Var` arm), and that zip never completes on a boxed binding.
+/// A value whose type names a term is inlined, because a binder of that type carries the name out
+/// of the value: into the tap type of a feed that reads it, or, for a refined write's contribution
+/// `{Int | __elem == __anf ^+ 1}`, to a read segment's snapshot binder that an opaque binding
+/// leaves standing in the type (see the walk's `Let` arm). A comprehension whose filter reads the
+/// writer's parameter has such a type (`{[0, 2] | __elem ▷ xs ▷ (λ z → z > __p.0)} ⤇ Int`). Any
+/// other collection is kept, so a body reading it twice builds it once. A literal is inlined as
+/// well: it costs nothing to copy, and a list literal bound to a name reaches op-conversion without
+/// the `iterate` planning puts before one it meets in place. A boxed value, a sum `Σ (σ : 𝐾). 𝐶`,
+/// is inlined too: a binding read after a step that drops keys, a write under an `if` read by the
+/// commit arm, pairs with the reader's input in a `zip` (`operator_conversion`'s `Var` arm), and
+/// that zip never completes on a boxed binding.
 fn keeps(value: &Expr) -> bool {
-    !matches!(
-        value.node,
-        TypedExprNode::Lambda { .. }
-            | TypedExprNode::Cast { .. }
-            | TypedExprNode::Lit(_)
-            | TypedExprNode::List(_)
-    ) && crate::ccl::subst::type_free_vars(&value.ty).is_empty()
+    !matches!(value.node, TypedExprNode::Lit(_) | TypedExprNode::List(_))
+        && crate::ccl::subst::type_free_vars(&value.ty).is_empty()
         && !matches!(
             value.ty.peel_refinements(),
             Type::Fun { fun_kind, .. } if !fun_kind.witnesses().is_empty()

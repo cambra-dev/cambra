@@ -1121,6 +1121,171 @@ fn skeletons() -> Vec<Skeleton> {
                 else:
                     out << 100
         "#}},
+        // --- exceptions (`docs/chl-spec.md`, "Exceptions"): the raised value, a value a `try`
+        // body computes, and positions an exception escapes in order
+        Skeleton { name: "raise_value", hole: Ty::Int, scope: &[], body: indoc! {r#"
+            out = test_sink()
+            y = try:
+                    raise {}
+                except Int as e:
+                    e + 1
+            out << y
+        "#}},
+        Skeleton { name: "raise_string", hole: Ty::Str, scope: &[], body: indoc! {r#"
+            out = test_sink()
+            y = try:
+                    raise {}
+                except String as s:
+                    s + "!"
+            out << y
+        "#}},
+        Skeleton { name: "raise_guarded", hole: Ty::Int, scope: &[], body: indoc! {r#"
+            def exc_check(n):
+                if n > 5:
+                    raise n
+                n * 10
+
+            out = test_sink()
+            y = try:
+                    exc_check({})
+                except Int as e:
+                    0 - e
+            out << y
+        "#}},
+        Skeleton { name: "raise_nominal", hole: Ty::Int, scope: &[], body: indoc! {r#"
+            type ExcBad = {n: Int}
+
+            def exc_nominal(n):
+                if n > 5:
+                    raise ExcBad::new((n=n))
+                n
+
+            out = test_sink()
+            y = try:
+                    exc_nominal({})
+                except ExcBad:
+                    0 - 1
+            out << y
+        "#}},
+        // The statements before a raise stand, and those after it do not run.
+        Skeleton { name: "raise_after_feed", hole: Ty::Int, scope: &[], body: indoc! {r#"
+            out = test_sink()
+            try:
+                out << {}
+                raise 0
+                out << 99
+            except Int:
+                out << 1
+        "#}},
+        Skeleton { name: "raise_in_loop", hole: Ty::Int, scope: &[("i", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            t := 0
+            r = try:
+                    for i in [1, 2, 3]:
+                        t := t + {}
+                        if i == 2:
+                            raise t
+                    0
+                except Int as e:
+                    e
+            out << t * 1000 + r
+        "#}},
+        Skeleton { name: "raise_caught_in_loop", hole: Ty::Int, scope: &[("i", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            for i in [1, 2, 3]:
+                v = try:
+                        if i == 2:
+                            raise {}
+                        i
+                    except Int as e:
+                        e + 100
+                out << v
+        "#}},
+        // A loop that only feeds, which an exception escapes through a call.
+        Skeleton { name: "raise_in_feed_loop", hole: Ty::Int, scope: &[("i", Ty::Int)], body: indoc! {r#"
+            def exc_pos(n):
+                if n > 5:
+                    raise n
+                n
+
+            out = test_sink()
+            r = try:
+                    for i in [1, 2, 3]:
+                        out << exc_pos({})
+                    0
+                except Int as e:
+                    0 - e
+            out << r
+        "#}},
+        // An exception from a function passed as a value, raised where it is applied.
+        Skeleton { name: "raise_through_fn_param", hole: Ty::Int, scope: &[], body: indoc! {r#"
+            def exc_apply(g: Int => Int causes Raise(Int), x: Int) => Int:
+                try:
+                    g(x)
+                except Int as e:
+                    e + 100
+            def exc_h(x):
+                if x > 1:
+                    raise x
+                x
+
+            out = test_sink()
+            out << exc_apply(exc_h, {})
+        "#}},
+        Skeleton { name: "raise_through_unannotated_fn_param", hole: Ty::Int, scope: &[], body: indoc! {r#"
+            def exc_apply(g, x):
+                try:
+                    g(x)
+                except Int as e:
+                    e + 100
+            def exc_h(x):
+                if x > 1:
+                    raise x
+                x
+
+            out = test_sink()
+            out << exc_apply(exc_h, {})
+        "#}},
+        Skeleton { name: "raise_in_comp", hole: Ty::Int, scope: &[("q", Ty::Int)], body: indoc! {r#"
+            def exc_big(n):
+                if n > 20:
+                    raise n
+                n
+
+            out = test_sink()
+            y = try:
+                    sum([exc_big({}) for q in [1, 2, 3]])
+                except Int as e:
+                    0 - e
+            out << y
+        "#}},
+        Skeleton { name: "raise_in_nested_comp", hole: Ty::Int, scope: &[("q", Ty::Int)], body: indoc! {r#"
+            def exc_big(n):
+                if n > 20:
+                    raise n
+                n
+
+            out = test_sink()
+            y = try:
+                    sum([sum([exc_big({}) for q in r]) for r in [[1, 2], [3, 4]]])
+                except Int as e:
+                    0 - e
+            out << y
+        "#}},
+        Skeleton { name: "raise_in_comp_filter", hole: Ty::Bool, scope: &[("q", Ty::Int)], body: indoc! {r#"
+            def exc_guard(n, keep):
+                if n == 3 and not keep:
+                    raise n
+                keep
+
+            out = test_sink()
+            y = try:
+                    sum([q for q in [1, 2, 3, 4] if exc_guard(q, {})])
+                except Int as e:
+                    100 + e
+            out << y
+        "#}},
+
         // A product key: a tuple names each group (`Equatable` on a product).
         Skeleton { name: "groupby_tuple_key", hole: Ty::RecColl, scope: &[], body: indoc! {r#"
             out = test_sink()

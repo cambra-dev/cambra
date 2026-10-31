@@ -1737,6 +1737,50 @@ fn check_scope_valid_go(
 
 /// Resolve a type that may contain inference variables into a concrete
 /// `Type`, via the compact → simplify → coalesce pipeline.
+/// Whether every path through `e` raises, so that it has no value: a `raise`, and a `try`,
+/// a conditional, or a statement sequence all of whose values are one.
+fn never_has_value(e: &Expr) -> bool {
+    match &e.node {
+        TypedExprNode::Raise { .. } => true,
+        TypedExprNode::Try { body, handlers } => {
+            never_has_value(body) && handlers.iter().all(|h| never_has_value(&h.body))
+        }
+        TypedExprNode::Case { branches, .. } => {
+            !branches.is_empty() && branches.iter().all(|b| never_has_value(&b.body))
+        }
+        TypedExprNode::Let { body, .. }
+        | TypedExprNode::ExprStmt { body, .. }
+        | TypedExprNode::MutDecl { body, .. } => never_has_value(body),
+        _ => false,
+    }
+}
+
+/// The type a node with no value stands at ([`never_has_value`]), from `ty`, the variable
+/// emission gave it: no value reaches it, so it is what its position expects, the bound the
+/// join or the use above it puts on it, or `Unit` where nothing does, as for a `raise`
+/// standing as a statement.
+fn stands_at(ty: &Type) -> Type {
+    // The bound above may be another node with no value, a `try` whose every path raises
+    // inside one that has a value: its own bound is what both stand at.
+    let mut current = ty.clone();
+    let mut seen = std::collections::HashSet::new();
+    while let Type::Infer(v) = &current {
+        if !seen.insert(v.uid) {
+            break;
+        }
+        let Some(upper) = v.bounds.borrow().upper().first().map(|b| b.ty.clone()) else {
+            break;
+        };
+        if let Ok(resolved) = resolve_var_type(&upper)
+            && !crate::ccl::subst::type_contains_infer(&resolved)
+        {
+            return resolved;
+        }
+        current = upper;
+    }
+    Type::Base(crate::ccl::BaseType::Unit)
+}
+
 pub(crate) fn resolve_var_type(ty: &Type) -> Result<Type, CoalesceError> {
     let compacted = compact_type(ty);
     crate::ccl::infer::solver::coalesce::refuse_param_joined_with_outer_variable(&compacted)?;
@@ -2156,6 +2200,27 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 coalesce_node(e, level, ctx);
             }
         }
+        TypedExprNode::Raise { value } => coalesce_node(value, level, ctx),
+        TypedExprNode::Try { body, handlers } => {
+            coalesce_node(body, level, ctx);
+            for h in handlers.iter_mut() {
+                with_shadows(ctx, Some(h.binding.name.clone()), |ctx| {
+                    coalesce_node(&mut h.body, level, ctx);
+                });
+                resolve_binder_slot(
+                    &mut h.binding.ty,
+                    || "except clause's exception".to_string(),
+                    level,
+                    ctx,
+                );
+                resolve_binder_slot(
+                    &mut h.catches,
+                    || "except clause's type".to_string(),
+                    level,
+                    ctx,
+                );
+            }
+        }
         TypedExprNode::Case {
             scrutinee,
             branches,
@@ -2345,6 +2410,11 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     }
     let label = symbolic(expr);
     match resolve_var_type(&expr.ty) {
+        // A node every path through which raises has no value, so nothing bounds its type
+        // from below: it stands at what its position expects of it.
+        Ok(ty) if crate::ccl::subst::type_contains_infer(&ty) && never_has_value(expr) => {
+            expr.ty = stands_at(&expr.ty);
+        }
         Ok(ty) => {
             // Log the graph read for the ordering-invariant check. The
             // var-laden `expr.ty` shares the live `InferVar`s, so the

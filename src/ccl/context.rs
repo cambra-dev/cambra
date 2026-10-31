@@ -2654,8 +2654,10 @@ fn run_passes(
     // The letrec audit covers inlining, transaction lowering, and induction lowering.
     let audit_letrec = ProvenanceAudit::start("letrec", "post-inference..post-letrec", &expr);
 
+    // Exception elimination runs with inlining: after it, every `raise` stands in the tree
+    // it escapes through (`crate::ccl::exceptions`).
     expr = recorded(capture_provenance, Phase::Inline, || {
-        inline::inline_capability_lambdas(expr)
+        crate::ccl::exceptions::eliminate(inline::inline_capability_lambdas(expr))
     });
     settle(
         &expr,

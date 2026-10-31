@@ -809,6 +809,12 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         TypedExprNode::DefGroup { .. } => {
             unreachable!("a DefGroup reached the check; inference rewrites it into `Let`s")
         }
+        TypedExprNode::Raise { value } => {
+            super::emit::emit_raise(value, node_id, &recorded_ty, ctx)?
+        }
+        TypedExprNode::Try { body, handlers } => {
+            super::emit::emit_try(body, handlers, node_id, ctx)?
+        }
         TypedExprNode::Method { .. } => {
             unreachable!("a Method reached the check; inference resolves every method")
         }

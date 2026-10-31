@@ -453,12 +453,33 @@ pub(super) fn lower_final_stmt(
             // inside the if branches can check for mutation correctly.
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
-            lower_if(last.span, branches, else_body.as_deref(), &scope, ctx)
+            lower_if(
+                last.span,
+                branches,
+                else_body.as_deref(),
+                false,
+                &scope,
+                ctx,
+            )
         }
         ChlStmt::Match { scrutinee, arms } => {
             let mut scope = outer_bindings.clone();
             collect_stmt_names(preceding, &mut scope);
             lower_match(last.span, scrutinee, arms, &scope, ctx)
+        }
+        ChlStmt::Raise(value) => {
+            let value = lower_expr(value, ctx)?;
+            Ok(ctx.tag_image(
+                Expr::new(TypedExprNode::Raise {
+                    value: Box::new(value),
+                }),
+                last.span,
+            ))
+        }
+        ChlStmt::Try { body, handlers } => {
+            let mut scope = outer_bindings.clone();
+            collect_stmt_names(preceding, &mut scope);
+            lower_try(last.span, body, handlers, &scope, ctx)
         }
         ChlStmt::For {
             target,
@@ -491,7 +512,10 @@ pub(super) fn lower_final_stmt(
                 // is rejected there, not here). A plain `=` to an outer name is
                 // caught separately by the generator path below.
                 let acc_names = find_mutation_loop_vars(for_body, &scope);
-                if !acc_names.is_empty() || for_body_has_with(for_body) {
+                if !acc_names.is_empty()
+                    || for_body_has_with(for_body)
+                    || for_body_has_exceptions(for_body)
+                {
                     let unit =
                         ctx.tag_machinery(Expr::lit(Lit::Unit), last.span, "lower.loop_unit");
                     let site = ForSite {
@@ -662,8 +686,11 @@ pub(super) fn lower_block_value(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     debug_assert!(
-        matches!(stmt.node, ChlStmt::If { .. } | ChlStmt::Match { .. }),
-        "Expr::Block wraps an `if` or a `match`; the parser builds no other block value"
+        matches!(
+            stmt.node,
+            ChlStmt::If { .. } | ChlStmt::Match { .. } | ChlStmt::Try { .. }
+        ),
+        "Expr::Block wraps an `if`, a `match` or a `try`; the parser builds no other block value"
     );
     lower_final_stmt(stmt, preceding, outer_bindings, ctx)
 }
@@ -1041,7 +1068,10 @@ pub(super) fn lower_middle_stmt(
             // the loop and wrap the continuation. Mutability of each write is
             // checked post-inference; a `:=` / `+=` to a non-mutable surfaces there.
             let acc_names = find_mutation_loop_vars(for_body, &scope);
-            if !acc_names.is_empty() || for_body_has_with(for_body) {
+            if !acc_names.is_empty()
+                || for_body_has_with(for_body)
+                || for_body_has_exceptions(for_body)
+            {
                 // All such loops — mutation accumulators, per-iteration
                 // `with begin():` transactions, and mixes of both (plus their
                 // feeds/yields) — take the direct-mirror `For` path; the unified
@@ -1095,7 +1125,22 @@ pub(super) fn lower_middle_stmt(
             let for_expr = lower_generator_for(target, iter, for_body, &scope, stmt.span, ctx)?;
             Ok(ctx.tag_machinery(Expr::expr_stmt(for_expr, body), stmt.span, "lower.stmt_seq"))
         }
-        ChlStmt::Expr { .. } | ChlStmt::If { .. } | ChlStmt::Match { .. } => {
+        // An `if` whose value nothing reads needs no `else`: where no branch's guard holds, it
+        // does nothing.
+        ChlStmt::If {
+            branches,
+            else_body: None,
+        } => {
+            let mut scope = outer_bindings.clone();
+            collect_stmt_names(preceding, &mut scope);
+            let effect = lower_if(stmt.span, branches, None, true, &scope, ctx)?;
+            Ok(ctx.tag_machinery(Expr::expr_stmt(effect, body), stmt.span, "lower.stmt_seq"))
+        }
+        ChlStmt::Expr { .. }
+        | ChlStmt::If { .. }
+        | ChlStmt::Match { .. }
+        | ChlStmt::Raise(_)
+        | ChlStmt::Try { .. } => {
             let effect = lower_final_stmt(stmt, preceding, outer_bindings, ctx)?;
             let label = match stmt.node {
                 ChlStmt::Expr { .. } => EXPRESSION_STATEMENT,
@@ -2742,6 +2787,72 @@ fn expand_requirement(
     Ok(())
 }
 
+/// Lower a [`ChlStmt::Try`] to a [`TypedExprNode::Try`] (`docs/chl-spec.md`, "Exceptions").
+/// Each clause binds its exception in its own body only, under the name it writes or an
+/// inaccessible one, as a `match` arm binds its payload.
+fn lower_try(
+    span: chl_parser::ast::Span,
+    body: &[Spanned<ChlStmt>],
+    handlers: &[chl_parser::ast::ExceptClause],
+    outer_bindings: &HashSet<String>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    lower_try_over(
+        span,
+        body,
+        handlers,
+        outer_bindings,
+        ctx,
+        |body, scope, ctx| lower_stmts_inner(body, scope, ctx, false),
+    )
+}
+
+/// [`lower_try`] with a caller-selected block policy, as [`lower_match_over`] takes one: a
+/// value block and a loop body's statement chain lower their blocks differently.
+pub(super) fn lower_try_over(
+    span: chl_parser::ast::Span,
+    body: &[Spanned<ChlStmt>],
+    handlers: &[chl_parser::ast::ExceptClause],
+    outer_bindings: &HashSet<String>,
+    ctx: &mut LoweringContext,
+    mut lower_body: impl FnMut(
+        &[Spanned<ChlStmt>],
+        &HashSet<String>,
+        &mut LoweringContext,
+    ) -> Result<Expr, LoweringError>,
+) -> Result<Expr, LoweringError> {
+    let body = lower_body(body, outer_bindings, ctx)?;
+    let mut lowered = Vec::with_capacity(handlers.len());
+    for h in handlers {
+        let catches = lower_type_expr(&h.ty, ctx)?;
+        let binder = match &h.binding {
+            Some(name) => name.node.to_string(),
+            None => ctx.fresh_ignored_payload(),
+        };
+        let mut scope = outer_bindings.clone();
+        scope.insert(binder.clone());
+        let handler_body =
+            ctx.with_shadowed(vec![binder.clone()], |ctx| lower_body(&h.body, &scope, ctx))?;
+        lowered.push(crate::ccl::expr::Handler {
+            catches,
+            binding: TypedBinding {
+                name: binder.into(),
+                ty: Type::Hole,
+                user_annotation: None,
+                transparency: BindingTransparency::Transparent,
+            },
+            body: handler_body,
+        });
+    }
+    Ok(ctx.tag_image(
+        Expr::new(TypedExprNode::Try {
+            body: Box::new(body),
+            handlers: lowered,
+        }),
+        span,
+    ))
+}
+
 /// Lower a CHL type *expression* to a CCL [`Type`].
 ///
 /// Recognised forms:
@@ -4183,15 +4294,16 @@ pub(super) fn lower_if(
     if_span: Span,
     branches: &[IfBranch],
     else_body: Option<&[Spanned<ChlStmt>]>,
+    statement: bool,
     outer_bindings: &HashSet<String>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let Some(else_body) = else_body else {
+    if else_body.is_none() && !statement {
         return Err(LoweringError::unsupported(
             if_span,
             "if without else is not supported as a value-returning expression",
         ));
-    };
+    }
     // A sink declaration is not permitted inside if/else arms.
     let mut out_branches = Vec::with_capacity(branches.len() + 1);
     for branch in branches {
@@ -4203,7 +4315,11 @@ pub(super) fn lower_if(
             body,
         });
     }
-    let else_expr = lower_stmts_inner(else_body, outer_bindings, ctx, false)?;
+    // A statement's missing `else` does nothing.
+    let else_expr = match else_body {
+        Some(else_body) => lower_stmts_inner(else_body, outer_bindings, ctx, false)?,
+        None => ctx.tag_machinery(Expr::lit(Lit::Unit), if_span, "lower.if_no_else"),
+    };
     // The `else` arm's always-true guard is manufactured encoding; the `Case`
     // itself images the if/else statement.
     out_branches.push(Branch {

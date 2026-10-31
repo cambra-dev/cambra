@@ -130,11 +130,13 @@ pub(crate) fn tag_case_to_guard_case(case: Expr) -> Expr {
                 .with_ty(Type::fun(scrut.ty.clone(), payload_ty.clone())),
         );
         payload.ty = payload_ty;
-        let payload_subst = Subst::discharge(pat.binding.name.clone(), payload);
+        // In place: the arm is the same arm, so its nodes keep their ids.
+        let mut body = br.body;
+        Subst::discharge_in_place(&mut body, &pat.binding.name, &payload);
         out.push(Branch {
             pattern: None,
             guard,
-            body: payload_subst.apply_expr(&br.body),
+            body,
         });
     }
     if !has_default {
@@ -2902,6 +2904,56 @@ where
     }
     ty.walk_children_mut(|child| changed |= walk_refined_predicates_mut(child, memo, context, f));
     changed
+}
+
+/// `e` as the element it projects, when it projects one out of a tuple of values written
+/// where it stands, `(f, x) ▷ .0`: what inlining a call of several arguments leaves for
+/// each argument it passes on, a function among them. Otherwise `e`.
+pub(crate) fn projected_element(e: Expr) -> Expr {
+    let Some(i) = projected_index(&e) else {
+        return e;
+    };
+    let TypedExprNode::Apply { argument, .. } = e.node else {
+        unreachable!("`projected_index` answers only for an application")
+    };
+    let TypedExprNode::Tuple(mut elements) = argument.node else {
+        unreachable!("`projected_index` answers only for a tuple")
+    };
+    projected_element(elements.swap_remove(i))
+}
+
+/// [`projected_element`] of a borrowed `e`.
+pub(crate) fn projected_element_ref(e: &Expr) -> &Expr {
+    let Some(i) = projected_index(e) else {
+        return e;
+    };
+    let TypedExprNode::Apply { argument, .. } = &e.node else {
+        unreachable!("`projected_index` answers only for an application")
+    };
+    let TypedExprNode::Tuple(elements) = &argument.node else {
+        unreachable!("`projected_index` answers only for a tuple")
+    };
+    projected_element_ref(&elements[i])
+}
+
+/// The index `e` projects, where it projects an element out of a tuple of values written
+/// where it stands ([`projected_element`]).
+fn projected_index(e: &Expr) -> Option<usize> {
+    let TypedExprNode::Apply { argument, function } = &e.node else {
+        return None;
+    };
+    let (TypedExprNode::Tuple(elements), TypedExprNode::Proj(ProjKey::Index(i))) =
+        (&argument.node, &function.node)
+    else {
+        return None;
+    };
+    let values = elements.iter().all(|element| {
+        matches!(
+            element.node,
+            TypedExprNode::Var(_) | TypedExprNode::Lit(_) | TypedExprNode::Lambda { .. }
+        )
+    });
+    (values && *i < elements.len()).then_some(*i)
 }
 
 #[cfg(test)]

@@ -343,9 +343,9 @@ fn a_clause_refuses_what_exceeds_it(#[case] code: &str, #[case] needle: &str) {
 /// is refused where it is written.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::an_exception(
-    "def f(n: Int) causes Raise(Int):\n    n\n",
-    "`Raise` is not supported yet"
+#[case::an_exception_without_its_type(
+    "def f(n: Int) causes Raise:\n    n\n",
+    "`Raise` takes one type"
 )]
 #[case::an_effect_variable("def f(n: Int) causes E:\n    n\n", "`E` is not an effect")]
 #[case::a_hole_under_only(

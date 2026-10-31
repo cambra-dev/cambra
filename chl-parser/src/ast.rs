@@ -253,6 +253,19 @@ pub enum Stmt {
         else_body: Option<Vec<Spanned<Stmt>>>,
     },
 
+    /// `raise e`: raise the exception `e` (`docs/chl-spec.md`, "Exceptions").
+    Raise(Spanned<Expr>),
+
+    /// `try: … except T as e: …`: run the body, and where it raises an exception a clause
+    /// catches, run the first such clause instead (`docs/chl-spec.md`, "Exceptions").
+    ///
+    /// A block statement mirroring [`Stmt::If`], value-yielding by the same rule. `handlers`
+    /// is non-empty and in source order.
+    Try {
+        body: Vec<Spanned<Stmt>>,
+        handlers: Vec<ExceptClause>,
+    },
+
     /// ``match scrutinee: case `tag(binder): … case `tag2: …`` — tag dispatch over
     /// a `cambra::ccl::Type::Variant`.
     ///
@@ -396,6 +409,30 @@ pub enum Stmt {
     Error,
 }
 
+impl Stmt {
+    /// The blocks this statement runs in its own place, in written order: an `if`'s branches
+    /// and its `else`, a `match`'s arms, a `try`'s block and its `except` clauses. A `for`
+    /// body and a `with` block are not among them: one runs once per element, the other as
+    /// a transaction.
+    pub fn branch_blocks(&self) -> Vec<&[Spanned<Stmt>]> {
+        match self {
+            Stmt::If {
+                branches,
+                else_body,
+            } => branches
+                .iter()
+                .map(|b| b.body.as_slice())
+                .chain(else_body.as_deref())
+                .collect(),
+            Stmt::Match { arms, .. } => arms.iter().map(|a| a.body.as_slice()).collect(),
+            Stmt::Try { body, handlers } => std::iter::once(body.as_slice())
+                .chain(handlers.iter().map(|h| h.body.as_slice()))
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
 /// A module path as a statement writes it, `shop::cart`, each segment with its
 /// span (`docs/chl-spec.md`, "9.1 Vocabulary"). [`Self::to_path`] gives the
 /// module it names.
@@ -462,6 +499,15 @@ pub enum DiscardHead {
 #[derive(Debug, Clone, PartialEq)]
 pub struct IfBranch {
     pub cond: Spanned<Expr>,
+    pub body: Vec<Spanned<Stmt>>,
+}
+
+/// One clause of a [`Stmt::Try`]: `except T as e: body`, catching each exception the body
+/// raises whose type is a subtype of `ty`, bound to `binding` where one is written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExceptClause {
+    pub ty: Spanned<Expr>,
+    pub binding: Option<Spanned<SmolStr>>,
     pub body: Vec<Spanned<Stmt>>,
 }
 

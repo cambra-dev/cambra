@@ -13,7 +13,7 @@ endif
 syn case match
 
 syn keyword cambraBoolean True False
-syn keyword cambraKeywordControl if elif else for in return yield match case pass with
+syn keyword cambraKeywordControl if elif else for in return yield match case pass with raise try except
 syn keyword cambraKeywordOther def where and or not forall requires causes only nothing type impl trait import use as pub run param const this
 
 " Ordinary operators. Among matches starting at one column, Vim prefers the one
