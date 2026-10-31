@@ -17,13 +17,11 @@
 //! (`src/ccl/design/type-inference.md`, "Only a term builds a sum").
 //!
 //! Only a witness over **named candidates** can be realized here: the legs are the
-//! candidates, so there have to be finitely many, named. Realization is therefore one of
-//! three dispositions a witness gets, and this pass decides all three. A determined witness —
-//! one candidate — is erased, term and types together. An undetermined one whose candidates a
-//! `Case` picks between is realized. Every other is **materialized**: the introduction stays
-//! standing and the value carries the witness. A jagged list literal's element position is the
-//! listed case, an `Enumerated` kind over each row's domain with no `Case` to pick one, and a
-//! `List(𝑇)`'s `UIntRanges` and a `Map(𝐾, 𝑉)`'s `SubtypesOf(𝐾)` are the described ones
+//! candidates, so there have to be finitely many, named. A witness a `Case` picks between is
+//! realized. Every other is **materialized**: its `box` stays standing, the identity it is at
+//! runtime, and the value carries the witness in its keys. A jagged list literal's element
+//! position is a listed kind with no `Case` to pick a candidate, and a `List(𝑇)`'s `UIntRanges`
+//! and a `Map(𝐾, 𝑉)`'s `SubtypesOf(𝐾)` are described ones
 //! (`src/ccl/design/collections.md`, "Compiling a conditional collection").
 
 use std::rc::Rc;
@@ -36,224 +34,48 @@ use crate::ccl::{
     BaseType, BinOpKind, Builtin, Expr, FieldKey, LogicKind, Type, TypedExprNode, provenance,
 };
 
-/// What realization decided about each witness it reached: erased, realized or materialized.
+/// The witnesses realization realized, by binder.
 ///
 /// One per program rather than one per term, because survival is a fact about a witness
 /// rather than about a position ([`realize_conditional_collections`]). A term planning lifts
-/// out of a type names the witnesses of the tree it came from, and realizing it with sets of
-/// its own would collapse a sum the tree kept.
+/// out of a type names the witnesses of the tree it came from.
 #[derive(Default, Clone)]
 pub(crate) struct Witnesses {
-    erased: std::collections::HashMap<crate::ccl::ty::WitnessId, Type>,
     pub(super) realized: std::collections::HashSet<crate::ccl::ty::WitnessId>,
-    materialized: std::collections::HashSet<crate::ccl::ty::WitnessId>,
 }
 
-/// Rewrite every collection-valued value-`Case` in `expr` into its gated union, and erase
-/// every sum whose witness is **determined** — from the types as well as the terms.
+/// Rewrite every collection-valued value-`Case` in `expr` into its gated union.
 ///
-/// Fails, as an unsupported program, on a jagged collection whose row is read from a mutable
-/// variable ([`reject_rows_fixed_elsewhere`]).
+/// Every other sum stays, `box` included: `box` is the identity at runtime, and a collection
+/// carries its own domain, so a sum over one candidate is that candidate's collection whether
+/// or not its type says so (`src/ccl/design/collections.md`, "Compiling a conditional
+/// collection").
 pub(super) fn realize_conditional_collections(
     expr: &mut Expr,
     witnesses: &mut Witnesses,
 ) -> Result<(), String> {
-    let Witnesses {
-        erased,
-        realized,
-        materialized,
-    } = witnesses;
-    realize_and_erase_boxes(
-        expr,
-        erased,
-        &PredMemo::new(),
-        false,
-        realized,
-        None,
-        materialized,
-    );
-    // **The other half of the erasure.** `erase_determined_boxes` removed the introduction from the
-    // *term*; every type still says `Σ`. A type asserting an indeterminacy the term no longer has
-    // is not a harmless leftover: the domain it presents at a consuming site is a witness, which
-    // has no extent, so `planning::iterate` cannot build an iteration source for it and drops the
-    // site's refinements with it (`tests/it/compilation_pipeline/sums.rs`).
-    //
-    // Safe under exactly the precondition `erase_determined_boxes` already checks — one candidate,
-    // so the witness stands for a domain that is *known* — and applied to exactly the binders it
-    // erased. That last part is what keeps a **realized** sum out of it: realization consumes its
-    // arms' boxes without recording them, because the union it built has a `Variant` domain, and
-    // `Realize` asserts the sum over it. A same-domain conditional is the case that proves the
-    // distinction is needed — one candidate, two legs — and instantiating its assertion breaks it.
-    if !erased.is_empty() {
-        instantiate_erased_witnesses(expr, erased, &PredMemo::new(), false);
-    }
-    // **And every determined sum the erasure did not name.** A consumer of a sum is a sum
-    // over its *own* binder ([`crate::ccl::ty::FunKindVar::binder_ids`]), so erasing the
-    // introduction leaves each consumer downstream still quantifying a witness — over the
-    // one candidate the introduction had, which is the same "indeterminacy the term no
-    // longer has".
-    //
-    // The exclusion is the one above, by the same argument: a binder realization consumed
-    // stands over a `Variant` of its legs' domains, and `Realize` asserts the sum over it.
-    // A same-domain conditional is that case — one candidate, two legs — and instantiating
-    // its assertion would contradict the term it asserts over.
-    // **What the term half declined to erase, the type half must decline too.** Realization
-    // consumed one set and [`erase_determined_boxes`] left the other standing; both are sums that
-    // survive.
-    //
-    // One set for the whole expression, because survival is a fact about a witness rather
-    // than about a position: a binder is minted once, where its sum is built
-    // ([`crate::ccl::ty::Witness::mint`]), and every type slot naming it describes that one
-    // sum. Keeping it at one slot and collapsing it at another would give one value two
-    // types. A witness erased at its `box` and materialized where the row lands is a row fixed
-    // before it reached the position that merges it — the case [`reject_rows_fixed_elsewhere`]
-    // names — reached through a binding the collapse below cannot see past, so it is refused
-    // the same way.
-    if erased.keys().any(|w| materialized.contains(w)) {
-        return Err(ROW_FIXED_ELSEWHERE.to_string());
-    }
-    let survives: std::collections::HashSet<_> = realized.union(materialized).copied().collect();
-    collapse_determined_sums(expr, &survives);
-    reject_rows_fixed_elsewhere(expr)
+    realize_everywhere(expr, &PredMemo::new(), false, &mut witnesses.realized);
+    Ok(())
 }
 
-/// Why a row reaching a jagged position from elsewhere is refused.
-const ROW_FIXED_ELSEWHERE: &str = "a collection whose rows have different domains takes each \
-    row as a `box(…)` written in place or bound by a `let`; a row read from a mutable variable \
-    is not supported yet";
-
-/// Reject a row whose sum collapsed away while the position holding it materialized one.
+/// Realize every conditional collection in `expr`, top-down.
 ///
-/// The decision to keep a `box` is made where the `box` is written ([`erase_determined_boxes`]).
-/// Inlining moves a `let`-bound row into the literal that reads it, so that `box` stands where the
-/// row is merged. A row read from a mutable variable does not move: `x := box([1, 2])`, `y = x`,
-/// and then `[y, box([3, 4, 5])]` erases the `box` where `x` is introduced, its one candidate being
-/// the whole position. Its type is then a bare collection standing where the list's element type is
-/// a sum, and the two are incomparable. The list literal and each copair or disjoint-join arm are
-/// the positions that merge rows this way ([`child_demand`]).
-fn reject_rows_fixed_elsewhere(expr: &Expr) -> Result<(), String> {
-    let binds_a_witness = |ty: Option<Type>| ty.is_some_and(|t| t.witness_kind().is_some());
-    let rows: &[Expr] = match &expr.node {
-        TypedExprNode::List(elts) if binds_a_witness(expr.ty.codomain()) => elts,
-        TypedExprNode::Copair(arms) | TypedExprNode::DisjointJoin(arms)
-            if binds_a_witness(expr.ty.codomain()) =>
-        {
-            arms
-        }
-        _ => &[],
-    };
-    let row_ty = |row: &Expr| match &expr.node {
-        TypedExprNode::List(_) => Some(row.ty.clone()),
-        _ => row.ty.codomain(),
-    };
-    if let Some(row) = rows.iter().find(|row| !binds_a_witness(row_ty(row))) {
-        return Err(format!(
-            "{ROW_FIXED_ELSEWHERE}: `{}`",
-            crate::ccl::symbolic::symbolic(row)
-        ));
-    }
-    let mut result = Ok(());
-    expr.walk_children(|child| {
-        if result.is_ok() {
-            result = reject_rows_fixed_elsewhere(child);
-        }
-    });
-    result
-}
-
-/// The type each child of `expr` is expected to have, where the position says something the
-/// child's own type does not.
-///
-/// A position says something extra exactly where inference made **several terms lower bounds of
-/// one variable**: the variable's merge is what the position holds, and each term states only
-/// its own contribution. The arms here are the sites whose merged position is a term this walk
-/// reaches:
-///
-/// - **A list literal's elements** (`emit_list`). The whole element type flows into one
-///   variable, sum and all, so that position binds a witness over every candidate that reached
-///   it (`src/ccl/design/type-inference.md`, "The domain join needs `box`").
-/// - **A copair's arms** (`emit_copair`) and **a disjoint join's** (`emit_disjoint_join`). The
-///   operand's own sum is decomposed — its domain becomes a variant tag — so an arm position
-///   binds no witness of its own, but the **codomains** merge into one variable. Where the
-///   elements are themselves collections that merge is a sum, and each arm's child stands at it.
-///   So an arm is handed this node's own type: its `codomain` is the merged one, and it binds no
-///   witness, both of which are what the position holds.
-///
-/// A `box`'s argument is here for a different reason: `box` is the identity on values, so its
-/// argument stands where the application stands, and an annotation naming a described kind lands
-/// on the application while the introduction states the single candidate the value is.
-///
-/// A constructor's payload is handed the parameter type its declaration states at the node's
-/// arguments, since no type slot in the tree states it. `type Bag(T) = List(T)` declares a
-/// described sum there, which the payload's `box` enters and which only the position says.
-///
-/// `emit_case` merges its branches the same way and needs no arm: realization consumes a
-/// collection-valued `Case` before this walk reaches it. Every other position types its child by
-/// the child's own term.
-///
-/// The mutable writes and feeds merge terms into one variable as well, and have no arm. A `:=`
-/// overwrite and a `<<=` feed of jagged rows compile, since each writes a whole list literal
-/// whose elements this walk reaches. Two `<<` appends of rows at differing domains and a keyed
-/// write of one do not compile; `tests/it/compilation_pipeline/sums.rs` pins both failures.
-fn child_demand(expr: &Expr, effective: &Type) -> Option<Type> {
-    match &expr.node {
-        TypedExprNode::Apply { function, .. }
-            if matches!(function.node, TypedExprNode::Builtin(Builtin::Box)) =>
-        {
-            Some(effective.clone())
-        }
-        TypedExprNode::Copair(_) | TypedExprNode::DisjointJoin(_) => Some(effective.clone()),
-        TypedExprNode::List(_) => effective.codomain(),
-        TypedExprNode::NominalCtor { decl, ctor, .. } => match effective.peel_refinements() {
-            Type::Nominal(applied, args) if applied == decl => decl.ctor(ctor).map(|c| {
-                crate::ccl::ccl_utils::strip_refinements(&decl.instantiate(&c.payload(), args))
-            }),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-/// Whether `ty` binds a witness that is **not determined** — the complement, at the outermost
-/// binder, of the one-candidate precondition [`erase_determined_boxes`] erases under.
-///
-/// A described kind — `UIntRanges` for a `List(𝑇)`, `SubtypesOf(𝐾)` for a `Map(𝐾, 𝑉)`, the
-/// universe for a `Collection(𝑇)` — names no candidate at all, so it is neither determined nor
-/// realizable and the value is what says which domain it is.
-fn binds_an_undetermined_witness(ty: &Type) -> bool {
-    match ty.witness_kind() {
-        None => false,
-        Some(crate::ccl::ty::TypeKind::Enumerated(ds)) => ds.len() != 1,
-        Some(_) => true,
-    }
-}
-
 /// `in_predicate` records that this subtree *is* a refinement predicate. A predicate may
 /// carry no realized collection (`debug_assert_no_iteration_markers_in_type`: a gated union
 /// needs the `iterate`/`restrict` a predicate is forbidden), so realization does not fire
-/// there — the `Case` stays, and the per-leg discharge above is what replaces it, with a
-/// plain arm rather than a union. Unboxing still runs: erasing a determined `box` adds
-/// nothing to iterate.
-fn realize_and_erase_boxes(
+/// there — the `Case` stays, and the per-leg discharge is what replaces it, with a plain arm
+/// rather than a union.
+fn realize_everywhere(
     expr: &mut Expr,
-    erased: &mut std::collections::HashMap<crate::ccl::ty::WitnessId, Type>,
     memo: &PredMemo<()>,
     in_predicate: bool,
     realized: &mut std::collections::HashSet<crate::ccl::ty::WitnessId>,
-    demand: Option<Type>,
-    materialized: &mut std::collections::HashSet<crate::ccl::ty::WitnessId>,
 ) -> bool {
     let mut changed = false;
-    // Every question below is asked of this rather than of `expr.ty`, because the witness that
-    // has to survive is the one the position binds ([`child_demand`]).
-    let effective = demand.unwrap_or_else(|| expr.ty.clone());
     // **A conditional inside a predicate is left entirely alone** — not only unrealized,
     // but un-rewritten. It is a placeholder: the per-leg discharge replaces the whole
     // predicate with one reading that leg's arm ([`read_the_arm_instead`]), so nothing
-    // inside this copy survives to be compiled. Descending would only *break* it, and does:
-    // erasing the `box` off each arm leaves a `Case` joining collections over distinct
-    // domains, which is exactly the type error `box` exists to prevent. Nothing reports it:
-    // the pass-boundary typecheck does not descend into predicates.
+    // inside this copy survives to be compiled.
     if in_predicate && collection_value_ty(&expr.ty).is_some() && is_value_case(expr) {
         return changed;
     }
@@ -274,157 +96,16 @@ fn realize_and_erase_boxes(
             provenance::Nature::Expansion,
         );
         changed |= realize(expr, realized);
-        // A realized sum over one candidate is that candidate's collection, as a determined
-        // `box` is, and is erased with it: every copy of its type, under whichever binder it
-        // carries there, then reads the one collection.
-        if let TypedExprNode::Realize { .. } = &expr.node
-            && let Some([first, ..]) = expr.ty.peel_refinements().sum()
-            && let Some(sole) = first.sole_candidate()
-            && !binds_an_undetermined_witness(&effective)
-        {
-            erased.insert(*first.id(), sole);
-        }
     }
-    walk_children_with_demand(
-        expr,
-        &effective,
-        materialized,
-        &mut |child, demand, materialized| {
-            changed |= realize_and_erase_boxes(
-                child,
-                erased,
-                memo,
-                in_predicate,
-                realized,
-                demand,
-                materialized,
-            )
-        },
-    );
-    // **A refinement predicate is a term too, and it carries its own copy of the source.**
-    // A filter looks the collection up at the index (`__elem ▷ src ▷ 𝑓`), so when `src` is
-    // a `box` the introduction sits inside the predicate — somewhere the term walk above
-    // never reaches, since predicates ride *type* slots. Left there it survives to
-    // op-conversion, which has no `box` arm and rejects it as a non-combinator.
+    expr.walk_children_mut(|child| {
+        changed |= realize_everywhere(child, memo, in_predicate, realized)
+    });
     expr.walk_type_slots_mut(|ty| {
         changed |= walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
-            realize_and_erase_boxes(
-                pred,
-                erased,
-                memo,
-                true,
-                &mut std::collections::HashSet::new(),
-                None,
-                materialized,
-            )
+            realize_everywhere(pred, memo, true, &mut std::collections::HashSet::new())
         });
     });
-    // A `box` whose **witness is determined** is erased here, not only the ones a
-    // realized `Case` consumed. Left in place, the `Apply(_, Box)` hides its argument
-    // from the rest of planning, so a `box`ed list literal never gets its `iterate`
-    // marker and reaches op-conversion bare.
-    //
-    // Determined means the kind names exactly *one* candidate: one possible witness is no
-    // information, so nothing has to carry it — the same reading [`arm_domain`] takes. A
-    // sum with two or more candidates that reaches here was **not** realized by a fan-out
-    // above, so its witness is real; erasing it would drop the discriminant and silently
-    // compile the wrong program. It is left standing instead, and op-conversion reads the
-    // value's own keys (`src/ccl/design/collections.md`, "Compiling a conditional
-    // collection").
-    let (unboxed, erased_here) = {
-        let _g = provenance::enter(
-            expr.node_id(),
-            "planning.unbox",
-            provenance::Nature::Machinery,
-        );
-        erase_determined_boxes(
-            std::mem::replace(expr, Expr::lit(crate::ccl::Lit::Unit)),
-            Some(erased),
-            &effective,
-            materialized,
-        )
-    };
-    *expr = unboxed;
-    changed |= erased_here;
     changed
-}
-
-/// A set of witnesses, by binder.
-type WitnessSet = std::collections::HashSet<crate::ccl::ty::WitnessId>;
-
-/// Walk `expr`'s children, handing each the type its position holds.
-///
-/// [`child_demand`] gives the one demand an arm list or a list literal's elements share. The
-/// other rules hand a child a demand of its own:
-///
-/// - A record or a tuple hands each field the type the demand gives it. The standing record
-///   case is `transact_phase`'s write set: `(m: 𝑣)` is typed by the mutable variable's declared
-///   value type, so a `Mut(List(𝑇), Txn)` write states the one candidate it is at a field bound
-///   over `UIntRanges`. The tuple case is a row of a list literal of pairs,
-///   `[("a", box([1])), ("b", box([2, 3]))]`, whose element type is a tuple with a sum in it,
-///   the shape `map` takes its entries in.
-/// - The last step of a `≫` chain receives the chain's result type, since a chain's result is
-///   its last morphism's.
-/// - The argument of `𝑎 ▷ const` receives the result type, since `𝑎 ▷ const` returns `𝑎` at
-///   every input. With the chain rule, this carries a per-row fan-out's demand,
-///   `⊔ᵢ filter_values(π̂ᵢ) ≫ (armᵢ ▷ const)`, to each arm's `box`.
-///
-/// **A position whose witness survives keeps every sum describing it**, so the witnesses
-/// `expr`'s element type names are recorded as materialized where the element position binds
-/// an undetermined one. The elements are held at the element position, and collapsing that
-/// position's own sum while their introductions stand would leave the codomain saying one
-/// domain where each element says its own.
-fn walk_children_with_demand(
-    expr: &mut Expr,
-    effective: &Type,
-    materialized: &mut WitnessSet,
-    visit: &mut dyn FnMut(&mut Expr, Option<Type>, &mut WitnessSet),
-) {
-    let below = child_demand(expr, effective);
-    if below.as_ref().is_some_and(binds_an_undetermined_witness)
-        && let Some(elem) = expr.ty.codomain()
-    {
-        for w in witnesses_named_by(&elem) {
-            materialized.insert(*w.id());
-        }
-    }
-    match (effective.peel_refinements(), &mut expr.node) {
-        (Type::Record(field_tys), TypedExprNode::Record(fields)) => {
-            for (name, child) in fields.iter_mut() {
-                let field = field_tys
-                    .iter()
-                    .find(|(n, _)| n == name)
-                    .map(|(_, t)| t.clone());
-                visit(child, field, materialized);
-            }
-        }
-        (Type::Tuple(elt_tys), TypedExprNode::Tuple(elts)) if elt_tys.len() == elts.len() => {
-            for (child, ty) in elts.iter_mut().zip(elt_tys) {
-                visit(child, Some(ty.clone()), materialized);
-            }
-        }
-        (Type::Fun { codomain, .. }, TypedExprNode::Compose(elts)) => {
-            let last = elts.len().saturating_sub(1);
-            for (i, child) in elts.iter_mut().enumerate() {
-                let demand = if i == last {
-                    child
-                        .ty
-                        .domain()
-                        .map(|d| Type::fun_like(&child.ty, d, (**codomain).clone()))
-                } else {
-                    None
-                };
-                visit(child, demand, materialized);
-            }
-        }
-        (Type::Fun { codomain, .. }, TypedExprNode::Apply { argument, function })
-            if matches!(function.node, TypedExprNode::Builtin(Builtin::Const)) =>
-        {
-            visit(argument, Some((**codomain).clone()), materialized);
-            visit(function, None, materialized);
-        }
-        _ => expr.walk_children_mut(|child| visit(child, below.clone(), materialized)),
-    }
 }
 
 /// Replace every sum on an **erased** binder by its single candidate, throughout `expr`'s
@@ -440,7 +121,7 @@ fn instantiate_erased_witnesses(
     in_predicate: bool,
 ) {
     // **A conditional a predicate quotes stays whole**, as realization leaves it
-    // ([`realize_and_erase_boxes`]): its arms keep their `box`es, so their sums keep their
+    // ([`realize_everywhere`]): its arms keep their `box`es, so their sums keep their
     // binders, whichever of those binders the tree's realized copy erased.
     if in_predicate && collection_value_ty(&expr.ty).is_some() && is_value_case(expr) {
         return;
@@ -978,38 +659,21 @@ fn discharge_determined_witnesses(arm: Expr) -> Expr {
     fn go(
         expr: &mut Expr,
         erased: &mut std::collections::HashMap<crate::ccl::ty::WitnessId, Type>,
-        demand: Option<Type>,
-        materialized: &mut std::collections::HashSet<crate::ccl::ty::WitnessId>,
     ) {
-        let effective = demand.unwrap_or_else(|| expr.ty.clone());
-        walk_children_with_demand(
-            expr,
-            &effective,
-            materialized,
-            &mut |child, demand, materialized| go(child, erased, demand, materialized),
-        );
+        expr.walk_children_mut(|child| go(child, erased));
         let (unboxed, _) = erase_determined_boxes(
             std::mem::replace(expr, Expr::lit(crate::ccl::Lit::Unit)),
             Some(erased),
-            &effective,
-            materialized,
         );
         *expr = unboxed;
     }
     let mut arm = arm;
     let mut erased = std::collections::HashMap::new();
-    let mut materialized = std::collections::HashSet::new();
-    go(&mut arm, &mut erased, None, &mut materialized);
-    // The disjointness [`realize_conditional_collections`] checks, for the same reason.
-    assert!(
-        erased.keys().all(|w| !materialized.contains(w)),
-        "a witness `erase_determined_boxes` erased at one position of an arm was materialized at \
-         another"
-    );
+    go(&mut arm, &mut erased);
     if !erased.is_empty() {
         instantiate_erased_witnesses(&mut arm, &erased, &PredMemo::new(), false);
     }
-    collapse_determined_sums(&mut arm, &materialized);
+    collapse_determined_sums(&mut arm, &std::collections::HashSet::new());
     arm
 }
 
@@ -1029,7 +693,7 @@ fn collapse_determined_sums(
     // **Not into the predicates.** A predicate holding a conditional source is a
     // placeholder realization replaces wholesale ([`read_the_arm_instead`]), and collapsing
     // a sum inside it rewrites a copy that does not survive — the same reason
-    // [`realize_and_erase_boxes`] leaves one alone.
+    // [`realize_everywhere`] leaves one alone.
     fn gather_type(
         ty: &Type,
         keep: &std::collections::HashSet<crate::ccl::ty::WitnessId>,
@@ -1275,8 +939,6 @@ fn arm_domain(ty: &Type) -> Option<Type> {
 fn erase_determined_boxes(
     e: Expr,
     erased: Option<&mut std::collections::HashMap<crate::ccl::ty::WitnessId, Type>>,
-    effective: &Type,
-    materialized: &mut std::collections::HashSet<crate::ccl::ty::WitnessId>,
 ) -> (Expr, bool) {
     let TypedExprNode::Apply { function, argument } = &e.node else {
         return (e, false);
@@ -1306,21 +968,6 @@ fn erase_determined_boxes(
     if argument.ty.peel_refinements().sum().is_some() && !described {
         return ((**argument).clone(), true);
     }
-    // **An introduction whose position binds an undetermined witness stays**, whatever its own
-    // states. `box` names the single candidate the value is, and the position it fills may bind
-    // a witness over more: a list literal's element position ranges over every candidate that
-    // reached the join, and an annotation names a described kind — `Map(𝐾, 𝑉)` binds
-    // `SubtypesOf(𝐾)` where the value's keys are one candidate. Erasing against the stated kind
-    // is locally justified and drops the injection, leaving a bare collection where every
-    // consumer downstream reads a sum.
-    if binds_an_undetermined_witness(effective) {
-        for ty in [&stated, &e.ty] {
-            for w in witnesses_named_by(ty) {
-                materialized.insert(*w.id());
-            }
-        }
-        return (e, false);
-    }
     // Only a determined witness — one candidate — is erasable.
     match stated.witness_kind() {
         Some(crate::ccl::ty::TypeKind::Enumerated(ds)) if ds.len() == 1 => {
@@ -1346,37 +993,15 @@ mod tests {
     use crate::ccl::ty::{TypeKind, Witness};
     use crate::ccl::{Branch, Lit, Name};
 
-    /// **A `box` inside a refinement predicate is erased, and the erasure sticks.**
-    ///
-    /// A filter's predicate looks its collection up at the index (`__elem ▷ src ▷ 𝑓`), so
-    /// when `src` is boxed the introduction sits inside the predicate — a term riding a
-    /// *type* slot, which no term walk reaches. Both walks descend into predicates for that
-    /// reason, and predicates are rewritten through [`PredMemo::rebuild`], which
-    /// **discards** the rewrite unless the caller reports a change. So the report is
-    /// load-bearing: erasing without reporting leaves the original predicate in place, and
-    /// a `box` reaches op-conversion, which has no arm for it.
-    ///
-    /// A `Case` in the same position is *not* realized — the gated union it
-    /// would become needs `iterate`/`restrict`, which a predicate may not carry
-    /// (`debug_assert_no_iteration_markers_in_type`). The per-leg discharge replaces it with
-    /// a plain arm instead. Both halves are asserted here, since they are one decision.
+    /// **A `Case` inside a refinement predicate is left alone.** The gated union it would
+    /// become needs `iterate`/`restrict`, which a predicate may not carry
+    /// (`debug_assert_no_iteration_markers_in_type`), so the per-leg discharge replaces it with
+    /// a plain arm instead.
     #[test]
-    fn a_box_inside_a_refinement_predicate_is_erased_but_a_case_is_left_alone() {
+    fn a_case_inside_a_refinement_predicate_is_left_alone() {
         let int = Type::Base(BaseType::Int);
         let coll = Type::data_fun(Type::UIntRange(2), int.clone());
-        // `Σ (σ : [0..2]). σ ⤇ Int` — one candidate, so the witness is determined and
-        // erasable.
-        let w = fresh_witness_binder_id();
-        let sum = || {
-            let wit = Witness::bound_to(w, TypeKind::Enumerated(vec![Type::UIntRange(2)]));
-            let occurrence = Type::WitnessRef(*wit.id());
-            Type::sum_binding(wit, Type::data_fun(occurrence, int.clone()))
-        };
-        let boxed = Expr::apply(
-            Expr::new(TypedExprNode::Var(Name::from("xs"))).with_ty(coll.clone()),
-            Expr::builtin(Builtin::Box).with_ty(Type::fun(coll.clone(), sum())),
-        )
-        .with_ty(sum());
+
         let guard = |b: bool| Expr::lit(Lit::Bool(b)).with_ty(Type::Base(BaseType::Bool));
         let case = Expr::new(TypedExprNode::Case {
             scrutinee: None,
@@ -1394,17 +1019,15 @@ mod tests {
             ],
         })
         .with_ty(coll.clone());
-        // One predicate holding both.
-        let pred = Expr::new(TypedExprNode::Tuple(vec![boxed, case])).with_ty(int.clone());
         let ty = Type::refined_one(
             Type::UIntRange(2),
-            crate::ccl::Refinement::born(Rc::new(pred)),
+            crate::ccl::Refinement::born(Rc::new(case)),
         );
         let mut expr =
             Expr::new(TypedExprNode::Var(Name::from("site"))).with_ty(Type::data_fun(ty, int));
 
         realize_conditional_collections(&mut expr, &mut Witnesses::default())
-            .expect("no jagged rows here");
+            .expect("realization does not fail");
 
         let Type::Fun { domain, .. } = &expr.ty else {
             panic!("expected a function type, got {}", expr.ty);
@@ -1414,10 +1037,6 @@ mod tests {
         };
         let refinement = refinements.sole().expect("one refinement");
         let rendered = crate::ccl::symbolic::symbolic(&refinement.predicate);
-        assert!(
-            !rendered.contains("box"),
-            "the predicate's `box` was erased and then discarded: {rendered}"
-        );
         assert!(
             rendered.contains('→'),
             "the predicate's `Case` must be left for the per-leg discharge: {rendered}"

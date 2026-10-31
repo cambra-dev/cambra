@@ -342,6 +342,31 @@ fn mark_component_source(
     Ok(())
 }
 
+/// The collection `box(𝑥)` or `unbox(box(𝑥))` holds, `𝑥`.
+///
+/// `box` is the identity at runtime, and `unbox(𝑐)` is `𝑐`'s value keyed as it is, so either
+/// one iterates exactly when `𝑥` does ([`is_iteration_bearing`]). An `iterate` in front of the
+/// application would not reach `𝑥`: an applied function's argument is a stream of its own.
+fn under_box(expr: &mut Expr) -> Option<&mut Expr> {
+    let is_box = |e: &Expr| matches!(&e.node, TypedExprNode::Builtin(Builtin::Box));
+    let TypedExprNode::Apply { argument, function } = &mut expr.node else {
+        return None;
+    };
+    if is_box(function) {
+        return Some(argument);
+    }
+    if builtin_at_function_position(function) == Some(Builtin::Unbox)
+        && let TypedExprNode::Apply {
+            argument: inner,
+            function: boxing,
+        } = &mut argument.node
+        && is_box(boxing)
+    {
+        return Some(inner);
+    }
+    None
+}
+
 /// Returns `true` if `func` is a function position that op-conversion
 /// compiles by treating its argument as an `input=None` iteration site.
 ///
@@ -450,10 +475,15 @@ pub(super) fn wrap_with_iterate(
     // collection iterated: the sum it builds has a witness for a domain, which no source
     // enumerates, while the argument's domain is the one its keys stand at.
     // `mark_component_source` looks through it for the same reason.
-    if let TypedExprNode::Apply { argument, function } = &mut expr.node
-        && matches!(function.node, TypedExprNode::Builtin(Builtin::Box))
+    if let Some(boxed) = under_box(expr) {
+        return wrap_with_iterate(boxed, ctx, memo, site);
+    }
+    // A chain led by one iterates from its head the same way.
+    if let TypedExprNode::Compose(elts) = &mut expr.node
+        && let Some(head) = elts.first_mut()
+        && let Some(boxed) = under_box(head)
     {
-        return wrap_with_iterate(argument, ctx, memo, site);
+        return wrap_with_iterate(boxed, ctx, memo, site);
     }
     let Some(domain_ty) = expr.ty.domain() else {
         // Non-function expressions can't be iterated; leave them alone.

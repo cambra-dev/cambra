@@ -1,4 +1,4 @@
-//! End-to-end sum compilation: determined-witness erasure, filtering, materialized
+//! End-to-end sum compilation: boxed collections, filtering, materialized
 //! jagged rows, witness-domained comprehensions and unsupported storage/loop shapes.
 //!
 //! See `src/ccl/design/type-inference.md`, "Only a term builds a sum".
@@ -15,8 +15,7 @@ use super::helpers::*;
 // Consuming a boxed collection — the unfiltered baseline
 // ---------------------------------------------------------------------------
 
-/// These one-candidate sums have no enclosing demand requiring a materialized witness.
-/// Planning erases their introductions, preserving the plain collection's results.
+/// One-candidate sums, consumed as the collections they wrap: `box` is the identity at runtime.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // Consumed whole, without an iteration site of its own.
@@ -334,8 +333,7 @@ fn a_correlated_comprehension_over_a_witness_domained_collection(
 
 /// **A `let`-bound row reaches a jagged position written in place.** Inlining moves a
 /// `let`-bound list element into the literal that reads it, so the `box` stands where the row
-/// is merged and planning keeps it there. Through a list literal and through a copair arm:
-/// `2 + 5`.
+/// is merged. Through a list literal and through a copair arm: `2 + 5`.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(indoc! {r"
@@ -350,9 +348,9 @@ fn a_let_bound_row_at_a_jagged_position_is_read_in_place(#[case] code: &str) {
     check_scalar(code, Value::Int(7));
 }
 
-/// **A row read from a mutable variable is rejected by name** at a jagged position. Its `box`
-/// is erased where the variable is introduced, while the position merging it keeps the sum, so
-/// the row stands fixed before it reaches the list.
+/// **A row read from a mutable variable does not compile at a jagged position.** The literal
+/// holding it is converted as a constant, and op-conversion takes a collection-valued element
+/// only written out as a list literal, which a read is not. Pinned on that failure.
 #[test]
 fn a_row_read_from_a_mutable_variable_at_a_jagged_position_is_unsupported() {
     check_compile_error(
@@ -361,14 +359,12 @@ fn a_row_read_from_a_mutable_variable_at_a_jagged_position_is_unsupported() {
             y = x
             sum([max(r) for r in [y, box([3, 4, 5])]])
         "},
-        "a row read from a mutable variable",
+        "a collection-valued list element must be written out as a list literal",
     );
 }
 
-/// **Rows at differing domains merged by two appends.** Each append's `box` stands at a
-/// position whose element type is the sum over both rows, so planning keeps it, as a list
-/// literal's element keeps its row's (`src/ccl/planning/conditionals.rs`,
-/// `walk_children_with_demand`).
+/// **Rows at differing domains merged by two appends.** Each append's `box` stays, so each row
+/// carries its own domain into the merged collection.
 #[test]
 fn jagged_rows_merged_by_two_appends() {
     check_scalar(
@@ -382,22 +378,19 @@ fn jagged_rows_merged_by_two_appends() {
     );
 }
 
-/// **Rows at differing domains merged by a keyed write do not compile.** The write hands its
-/// row no demand the way a list literal does, and fails group-by recognition's type check.
-/// Pinned on that failure.
-#[rstest]
-#[timeout(Duration::from_secs(10))]
-#[case::keyed_write(
-    indoc! {r#"
-        m: Mut(Map(String, List(Int)), Txn) := box(map([("a", box([1]))]))
-        with begin():
-            m["b"] := box([2, 3])
-        sum([max(r) for r in await_final(m)])
-    "#},
-    "Bad group expr"
-)]
-fn jagged_rows_merged_by_a_keyed_write_do_not_compile(#[case] code: &str, #[case] needle: &str) {
-    check_compile_error(code, needle);
+/// **Rows at differing domains merged by a keyed write.** Each row's `box` stays, so each row
+/// carries its own domain into the map: `1 + 3`.
+#[test]
+fn jagged_rows_merged_by_a_keyed_write() {
+    check_scalar(
+        indoc! {r#"
+            m: Mut(Map(String, List(Int)), Txn) := box(map([("a", box([1]))]))
+            with begin():
+                m["b"] := box([2, 3])
+            sum([max(r) for r in await_final(m)])
+        "#},
+        Value::Int(4),
+    );
 }
 
 /// **A filtered collection reaching a `List` position through a sum's candidate is refused.**

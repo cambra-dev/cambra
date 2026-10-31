@@ -1973,6 +1973,15 @@ const BAG: &str = indoc! {"
     "},
     3
 )]
+#[case::a_feed_loop_over_a_type_whose_elements_is_a_box(
+    indoc! {"
+        out: Feed(_)
+        for x in Bag::new(box([1, 2])):
+            out << x
+        sum(out)
+    "},
+    3
+)]
 #[case::a_generator_over_a_box(
     indoc! {"
         def g(b):
@@ -2022,24 +2031,6 @@ const BAG: &str = indoc! {"
 )]
 fn a_loop_walks_its_sources_elements(#[case] code: &str, #[case] expected: i64) {
     check_scalar(&format!("{BAG}\n{code}"), Value::Int(expected));
-}
-
-/// **Not compiled yet: a feed loop over a type whose `Elements` is a box.** Planning erases the
-/// `box` in `Bag::new(box([1, 2]))`, whose sum has one candidate, while the constructor's
-/// payload position still holds the `List(Int)` sum, so the planned tree is refused. Pinned on
-/// that failure; the program answers 3.
-#[test]
-fn a_feed_loop_over_a_type_whose_elements_is_a_box_is_not_compiled_yet() {
-    let code = indoc! {"
-        out: Feed(_)
-        for x in Bag::new(box([1, 2])):
-            out << x
-        sum(out)
-    "};
-    check_compile_error(
-        &format!("{BAG}\n{code}"),
-        "Type mismatch for the argument of constructor `Bag::new`",
-    );
 }
 
 /// A loop over a type no instance of `Iterable` accepts is refused at its source, as the call of

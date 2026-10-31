@@ -2901,12 +2901,11 @@ binder: a dependent collection's element type can reference that binder, and the
 must bind it over the witness domain. Boxing a scalar, compute function or already boxed
 collection fails the application's type constraints.
 
-A one-candidate sum remains distinct from its plain collection type during inference.
-Planning can erase a determined witness, subject to the exceptions in
-[realization and witness erasure](#which-case-a-site-realizes-and-what-a-leg-instantiates).
-Consequently, `box` is neither a general runtime no-op nor a
-[`Cast`](ir.md#cast--explicit-refinement-acquisition): a surviving sum must carry its
-witness in the value.
+A one-candidate sum remains distinct from its plain collection type in every phase. At runtime
+`box` is the identity: a collection carries its own domain, so a sum's value carries its witness
+in its keys ([Compiling a conditional collection](collections.md#compiling-a-conditional-collection)).
+It is not a [`Cast`](ir.md#cast--explicit-refinement-acquisition), whose type is derived from its
+value's.
 
 ### Subtyping for sums
 
@@ -3215,10 +3214,8 @@ introduction through `box(box(xs))`, since the outer call requires a plain colle
 
 #### Which `Case` a site realizes, and what a leg instantiates
 
-Planning realizes a conditional through its arms even when its witness has one candidate.
-The witness remains bound by the `Realize` assertion and is excluded from determined-sum
-erasure. A determined witness is erased only if it was neither realized nor retained as a
-materialized witness in the value.
+Planning realizes a conditional through its arms even when its witness has one candidate, and
+the realized conditional's type keeps the witness bound.
 [Compiling a conditional collection](collections.md#compiling-a-conditional-collection)
 owns the compilation rules and runtime restrictions.
 
@@ -3232,11 +3229,10 @@ the leg's types are replaced too. This can free references whose binders were in
 copies, so the leg instantiates both the site's witness and every newly free witness with
 the chosen domain. Other sums in the leg keep their own binders.
 
-`collapse_determined_sums` instantiates single-candidate sums throughout the term's
-types, not just the introduction that was erased. It preserves IDs recorded as realized
-or materialized: realized sums assert a type over a tagged union, and materialized sums
-must agree with the positions storing their values. It does not descend into refinement
-predicates for this collapse; realization replaces conditional predicate copies separately.
+A leg is the sum's body at its candidate, a plain collection, so realization also erases each arm's
+`box` whose sum has one candidate and instantiates every single-candidate sum in the arm's types
+(`discharge_determined_witnesses`). It does not descend into refinement predicates for this;
+realization replaces conditional predicate copies separately.
 
 #### Planning asserts the type it replaces
 

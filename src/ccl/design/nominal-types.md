@@ -361,10 +361,8 @@ nominal type's **representation** and every other type itself:
   `variant_wrap` arms build a union column.
 
 Planning treats a constructor's payload as a product's component: a collection-valued payload is
-an iteration site (`planning::iterate`'s `mark_component_source`). The payload position is handed
-the constructor's declared parameter type (`planning::conditionals`'s `child_demand`), so a `box`
-entering the described sum `type Bag(T) = List(T)` declares stays, as one entering an annotated
-`let`'s does.
+an iteration site (`planning::iterate`'s `mark_component_source`). A `box` entering the described
+sum `type Bag(T) = List(T)` declares stays, as every `box` does.
 
 The representation of `N(𝑎…)` is the closed variant tagged by constructor name, each tag carrying
 its payload at `𝑎…`, with the tags in name order (`NominalDecl::representation`). It carries no
