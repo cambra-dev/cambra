@@ -15,6 +15,7 @@ const ADDER: &str = indoc! {"
     param T
     param x: T
     pub y = x + 1
+    visits: Mut(Int, Txn) := 0
 "};
 
 /// A module with an error of its own is reported once, however many runs it has.
@@ -190,6 +191,7 @@ fn an_argument_for_an_open_parameter_is_checked_through_its_uses() {
         param T
         param x: T
         pub y = [x, 1]
+        visits: Mut(Int, Txn) := 0
     "},
     indoc! {r#"
         run m(T=String, x="a") as a
@@ -204,6 +206,7 @@ fn an_argument_for_an_open_parameter_is_checked_through_its_uses() {
         param T
         param x: T
         pub y = x.name
+        visits: Mut(Int, Txn) := 0
     "},
     indoc! {"
         run m(T=Int, x=1) as a

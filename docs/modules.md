@@ -633,6 +633,18 @@ linked as though it were the root, with its own parameters abstract:
 The root has a check of its own only when it has parameters or its runs and imports have checks or
 pass arguments for inferred parameters. Otherwise the linked program's inference is its check.
 
+A check also answers what the module's top level requires and causes, less what its scopes
+discharge (`ModuleChecked::top_level`; [chl-spec.md, "Shareable modules
+[Decided]"](chl-spec.md#shareable-modules-decided)). Once every module is checked,
+`import_and_run_errors` in `src/ccl/context.rs` reads it for each module's `import` and `run`
+statements (`ModuleCheck::statements`), and for the root's, which lowering keeps on the context
+because the root usually has no check of its own (`LoweringContext::root_statements`). A module is
+shareable when its top level requires and causes nothing, binds no sink, and runs no module. A
+statement whose module is shareable and whose arguments an import could pass, each a constant, an
+import name, or a type written over imports (`ModuleStatement::importable_arguments`), must be an
+`import`; any other must be a `run`. A module lowering refuses to import (`Unimportable`) is run,
+and no `run` of it is refused.
+
 An error of a `run` statement or of its arguments, such as a missing argument, depends on the
 statement and the interface it runs alone. Creating a run raises it only when the statement is the
 checked or linked module's own, and creating a run that another run declares raises none
@@ -708,6 +720,8 @@ source cache is keyed by `FileId`, so a single report can label several files. S
 - a private or missing member: primary label at the reference, secondary at the declaration;
 - an import of a module that performs IO or declares mutable state: primary label at the `import`,
   secondary at the IO site or the state;
+- an import of a module whose top level requires or causes something, and a run of a shareable
+  module whose arguments an import could pass: at the statement;
 - a module-graph cycle: one label per statement in the cycle;
 - a public name bound twice, and a conflict between an import, run, or parameter name and a member:
   both sites;

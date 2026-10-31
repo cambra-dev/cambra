@@ -685,6 +685,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
         {
             lowering.lowered.insert(root, Some(Rc::new(root_lowered)));
         }
+        ctx.root_statements = lowering.statements(root);
         lowering.check_all(order, ctx);
         errors.extend(std::mem::take(&mut lowering.errors));
     }

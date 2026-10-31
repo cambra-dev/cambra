@@ -6,7 +6,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::ccl_utils::TermMemo;
-use crate::ccl::effects::{EffectVar, Effects, Filter, Item, Label, Repr, Requirement};
+use crate::ccl::effects::{Effect, EffectVar, Effects, Filter, Item, Label, Repr, Requirement};
 use crate::ccl::infer::solver::barrier::EdgeReport;
 use crate::ccl::infer::solver::display::poly_for_display;
 use crate::ccl::infer::solver::smt::{NoScope, ScopeEnv};
@@ -209,6 +209,10 @@ pub(super) struct InferCtx {
     /// scheme each was bound at, written as an annotation would state it
     /// ([`Typing::note_scheme`]).
     pub(super) reported: HashSet<Name>,
+    /// The public members of the module under check, bound at its top level. A public feed
+    /// is appended to by other modules, so no scope's end discharges an append to it
+    /// (`docs/chl-spec.md`, "Discharging requirements and effects").
+    pub(super) public: HashSet<Name>,
     pub(super) schemes_noted: Vec<(Name, crate::ccl::infer::solver::display::InferredPoly)>,
     /// Where the demand of the edges being drawn was stated, when it is not the node
     /// under emission: a type parameter's bound or a requirement, written in a `Poly`
@@ -327,6 +331,9 @@ struct EffectBinder {
     /// A transactional mutable variable belongs to its run, so no scope's end discharges
     /// its writes, and reading or writing it requires `Transaction`.
     transactional: bool,
+    /// No scope's end discharges what is done to it: a transactional mutable variable,
+    /// and a public feed.
+    escapes: bool,
 }
 
 pub(super) struct OpenGroup {
@@ -458,6 +465,7 @@ impl InferCtx {
             shared_holes: RefCell::new(HashMap::new()),
             opened_params: Vec::new(),
             reported: HashSet::new(),
+            public: HashSet::new(),
             schemes_noted: Vec::new(),
             demand_at: None,
             assumptions: Vec::new(),
@@ -485,6 +493,12 @@ impl InferCtx {
         }
     }
 
+    /// What the module's top level requires and causes, less what its scopes discharge
+    /// (`docs/chl-spec.md`, "Shareable modules [Decided]").
+    pub(super) fn top_level_effects(&self) -> crate::ccl::effects::EffectSet {
+        crate::ccl::effects::set_of(&self.effect_frames[0].var.resolved())
+    }
+
     fn effect_frame(&self) -> &EffectFrame {
         self.effect_frames
             .last()
@@ -500,14 +514,24 @@ impl InferCtx {
                 && matches!(history_kind, crate::ccl::ty::HistoryKind::Overwrite)
                 && matches!(domain, Type::Txn);
             let depth = self.effect_frame().depth;
+            let public_feed = declares
+                && depth == 0
+                && matches!(history_kind, crate::ccl::ty::HistoryKind::Append)
+                && self.public.contains(name);
             self.effect_binders.insert(
                 name.clone(),
                 EffectBinder {
                     depth,
                     parameter: !declares,
                     transactional,
+                    escapes: transactional || public_feed,
                 },
             );
+            // Other modules append to a public feed, so declaring one is an output of the
+            // top level's, as declaring a transactional variable writes it.
+            if public_feed {
+                self.record_effect(Item::Causes(Effect::Append(name.clone())), Some(name));
+            }
         }
     }
 
@@ -1912,7 +1936,7 @@ impl Typing for InferCtx {
         }
         let label = Label {
             item,
-            bound_at: binder.filter(|b| !b.transactional).map(|b| b.depth),
+            bound_at: binder.filter(|b| !b.escapes).map(|b| b.depth),
         };
         let frame = self.effect_frame();
         if frame.filter().admits(&label) {
@@ -2059,7 +2083,6 @@ impl Typing for InferCtx {
             .push(exit);
         self.scopes.push_scope();
         self.scopes.bind(binding.name.clone(), entry);
-        self.bind_effect_name(&binding.name, &binding.ty, true);
         let r = self.under_binder(&binding.name, f);
         self.scopes.pop_scope();
         r
