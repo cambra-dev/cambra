@@ -357,8 +357,9 @@ fn a_filtered_inner_comprehension_over_a_projected_row_keeps_its_filter(
 
 /// Inside a `with begin():` block a mutable variable arrives as a projection of the block's
 /// snapshot tuple, so a filtered comprehension over a map-valued one filters a projection too, of
-/// a boxed map. It does not compile: the post-elimination type check finds the comprehension's
-/// witness where the projection `σ₁(__boxed)` is read. Pinned as it fails; it answers 10.
+/// a boxed map. It does not compile: planning finds a filter on keys it takes to be the same for
+/// every row, `σ₁(__txp.0)`, which a debug build asserts and the check after planning otherwise
+/// rejects. Pinned as it fails; it answers 10.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn a_filtered_comprehension_over_a_mutable_map_in_a_block_does_not_compile() {
@@ -371,19 +372,41 @@ fn a_filtered_comprehension_over_a_mutable_map_in_a_block_does_not_compile() {
                     n := sum([v for v in m if v > 0])
             await_final(n)
         "},
-        "post-lambda-elim produced an invalid tree",
+        if cfg!(debug_assertions) {
+            "a filtered component's keys are the same for every row"
+        } else {
+            "post-planning produced an invalid tree"
+        },
     );
 }
 
-/// A filter reading the outer row other than through the projection it narrows has no
-/// spelling as a filter on the projected values: the values alone do not say `r.lim`. It is
-/// refused by name rather than compiled without its filter.
+/// A filter reading the outer row other than through the projection it narrows, `r.lim`
+/// beside `r.xs`: the narrowing has no spelling over the projected values alone, so the curried
+/// inner comprehension stays curried, and its filter is kept.
+#[rstest]
+#[case::summed(
+    "sum([sum([v for v in r.xs if v > r.lim]) for r in [(xs=[1, 2], lim=1), (xs=[3, 4], lim=3)]])",
+    6
+)]
+#[case::a_limit_per_row(
+    "sum([sum([v for v in r.xs if v > r.lim]) for r in [(xs=[1, 2], lim=0), (xs=[3, 4], lim=4)]])",
+    3
+)]
+#[timeout(Duration::from_secs(10))]
+fn a_filter_reading_the_row_beside_its_projection_keeps_its_filter(
+    #[case] program: &str,
+    #[case] total: i64,
+) {
+    check_scalar(program, Value::Int(total));
+}
+
+/// The same per row, with no outer aggregate.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-fn a_filter_reading_the_row_beside_its_projection_is_refused() {
-    check_compile_error(
-        "sum([sum([v for v in r.xs if v > r.lim]) for r in [(xs=[1, 2], lim=1), (xs=[3, 4], lim=3)]])",
-        "a filter on an inner collection that planning cannot materialize",
+fn a_filter_reading_the_row_beside_its_projection_keeps_its_filter_per_row() {
+    check_tile(
+        "[sum([v for v in r.xs if v > r.lim]) for r in [(xs=[1, 2], lim=1), (xs=[3, 4], lim=3)]]",
+        make_int_list(&[2, 4]),
     );
 }
 

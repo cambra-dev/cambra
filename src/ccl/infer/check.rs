@@ -132,6 +132,10 @@ pub(super) struct CheckCtx {
     opened_types: Vec<Type>,
     /// The program's instances, which say what a nominal type's comparisons are.
     instances: Rc<InstanceTable>,
+    /// The generalized parameters a chain left generic ([`Typing::open_generic`]), which a chain's
+    /// type is quantified over where it reads them. Parameters are unique, so the list only
+    /// grows.
+    opened_params: Vec<crate::ccl::ty::PolyParam>,
 }
 
 /// The environment a Check query runs in: the lexical scope at the query, plus
@@ -175,6 +179,7 @@ impl CheckCtx {
             checked_predicates: Default::default(),
             opened_types: Vec::new(),
             instances,
+            opened_params: Vec::new(),
         }
     }
 
@@ -476,6 +481,8 @@ impl Typing for CheckCtx {
         // `{Int | __elem >= 0}` is the shape that needs it: the two predicates match
         // nowhere structurally, and the entailment holds given the type `__read` is
         // bound at.
+        let (sub, sup) = crate::ccl::generalize::align(sub, sup);
+        let (sub, sup) = (&sub, &sup);
         let mut cache = self.cache();
         let outcome = constrain_subtype_in(sub, sup, &mut cache, &self.scope());
         if let Err(e) = outcome {
@@ -494,6 +501,29 @@ impl Typing for CheckCtx {
         let r = self.under_binder(name, f);
         self.scopes.pop_scope();
         r
+    }
+
+    fn instantiate_generalized(&mut self, ty: &Type, incoming: &Type) -> Type {
+        crate::ccl::generalize::instantiate(ty, incoming)
+    }
+
+    fn open_generic(&mut self, ty: Type) -> Type {
+        match ty {
+            Type::Poly(p)
+                if !p.params.is_empty() && p.params.iter().all(|q| q.param.generalized) =>
+            {
+                self.opened_params.extend(p.params.iter().cloned());
+                p.body.clone()
+            }
+            other => other,
+        }
+    }
+
+    fn requantify_opened(&mut self, ty: Type) -> Type {
+        if self.opened_params.is_empty() {
+            return ty;
+        }
+        crate::ccl::generalize::requantify(&self.opened_params, ty)
     }
 
     fn in_let_rhs<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
@@ -653,6 +683,8 @@ impl Typing for CheckCtx {
         sup_binders: &[crate::ccl::ty::Witness],
         at: &dyn Fn() -> String,
     ) -> Result<(), LocatedInferError> {
+        let (sub, sup) = crate::ccl::generalize::align(sub, sup);
+        let (sub, sup) = (&sub, &sup);
         let mut cache = self.cache();
         let outcome = constrain_subtype_under_in(
             sub,
@@ -718,8 +750,22 @@ impl Typing for CheckCtx {
         // whether a channel is a function ([`Type::read_view`]). A comprehension over a
         // channel applies it, so the disagreement is reachable.
         let function = fn_ty.read_view();
+        // A generalized type is instantiated by the argument it is applied to
+        // (`src/ccl/design/type-parameters.md`, "Generalized types").
+        let function = crate::ccl::generalize::instantiate(&function, arg_ty);
+        // An argument that leaves a parameter unfixed, itself generic in that part, makes the
+        // application generic in it: the function is read at its body, the parameter standing
+        // for any type, and the result keeps it quantified.
+        let (function, generic) = match function {
+            Type::Poly(p) if p.params.iter().all(|q| q.param.generalized) => (
+                std::borrow::Cow::Owned(p.body.clone()),
+                Some(p.params.clone()),
+            ),
+            other => (std::borrow::Cow::Owned(other), None),
+        };
         let (_domain, codomain) = self.as_function(&function, at)?;
         self.constrain_argument(arg_ty, &function, at)?;
+
         // Re-run the discharge on the resolved codomain so the reconstructed
         // type matches the recorded (discharged) one. A named Pi discharges its
         // binder to the argument; an ordinary function's codomain is unchanged.
@@ -732,6 +778,10 @@ impl Typing for CheckCtx {
                 crate::ccl::subst::discharge_codomain(b, argument, &codomain)
             }
             _ => codomain,
+        };
+        let result = match generic {
+            Some(params) => crate::ccl::generalize::requantify(&params, result),
+            None => result,
         };
         Ok(result)
     }
@@ -769,23 +819,32 @@ fn check_node(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedInferE
     // One stack frame per node over the whole tree, sized for the union
     // of `check_node_rule`'s arms, so a deep tree can outrun a test thread's stack.
     // Same guard, and same reason, as `lambda_elim`'s recursion entries.
-    // **A node whose type is a sum binds those witnesses over the subtree that produces
-    // it**, so Γ gains them for this node's rule and loses them on the way out
-    // (`src/ccl/design/type-inference.md`, "The witness context"). Not a lambda-only rule:
-    // by the walls that run after lambda elimination the collection is point-free, and the
-    // Σ rides an `Apply` or a `Compose` instead.
-    let binders = expr.ty.peel_refinements().sum().unwrap_or(&[]).to_vec();
-    let outer = (!binders.is_empty()).then(|| {
-        let inner = ctx.witness_ctx.extended(&binders);
-        std::mem::replace(&mut ctx.witness_ctx, inner)
-    });
+    // **A generic node is checked at its body**, its generalized parameters standing for any
+    // type, and its derived type is generalized over them again
+    // (`src/ccl/design/type-parameters.md`, "Generalized types"). A builtin's type is trusted
+    // whole, generic or not.
+    let generic = match &expr.ty {
+        Type::Poly(p)
+            if p.params.iter().all(|q| q.param.generalized)
+                && !matches!(expr.node, TypedExprNode::Builtin(_)) =>
+        {
+            let p = Rc::clone(p);
+            expr.ty = p.body.clone();
+            Some(p)
+        }
+        _ => None,
+    };
     let out = stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
         check_slot_predicates(expr, ctx);
         check_node_rule(expr, ctx)
     });
-    if let Some(outer) = outer {
-        ctx.witness_ctx = outer;
-    }
+    let out = match generic {
+        Some(p) => {
+            expr.ty = Type::Poly(Rc::clone(&p));
+            out.map(|body| crate::ccl::generalize::requantify(&p.params, body))
+        }
+        None => out,
+    };
     ctx.current_node = prev;
     out
 }
@@ -1032,6 +1091,14 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         // collection is a collection over that witness — so neither side names an index its
         // own type does not bind.
         ctx.require_sub(&ty, &expr.ty, &|| format!("type of {}", symbolic(expr)))?;
+        // A generic derivation meets the type the node states as an instance of it, and the
+        // node is that instance to what reads it (`src/ccl/design/type-parameters.md`, "Generalized
+        // types").
+        if matches!(&ty, Type::Poly(p) if p.params.iter().all(|q| q.param.generalized))
+            && !matches!(&expr.ty, Type::Poly(_))
+        {
+            return Ok(expr.ty.clone());
+        }
     }
     Ok(ty)
 }

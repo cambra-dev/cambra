@@ -1759,6 +1759,14 @@ fn a_target_fed_from_two_places_names_the_other() {
     out = test_sink()
     out << sum([sum(row) for row in o])
 "#}, "[() -> 8]")]
+#[case::read_back_by_a_loop(indoc! {r#"
+    o: Feed(_)
+    for r in [1, 2]:
+        o << [v for v in [1, 2, 3] if v > r]
+    out = test_sink()
+    for row in o:
+        out << sum(row)
+"#}, "[5, 3]")]
 #[case::yielded_by_a_generator(indoc! {r#"
     def rows(xs):
         for x in xs:
@@ -1789,25 +1797,28 @@ fn rows_keyed_by_the_loops_around_the_feed(#[case] source: &str, #[case] expecte
     check_sink(source, expected);
 }
 
-/// Rows keyed by the loops that fed them, read back by a `for` loop, are not compiled: the loop
-/// types its element at a row that reads the position, which nothing binds over the loop's
-/// body. Inference records the row's bound on a variable of the loop's body, whose telescope does
-/// not hold the position, and the telescope invariant panics there. A comprehension over the
-/// same rows compiles (`read_back_through_a_defer`).
-#[test]
-fn keyed_rows_read_back_by_a_loop_do_not_compile() {
-    check_compile_error(
-        indoc! {r#"
-            o: Feed(_)
-            for r in [1, 2]:
-                o << [v for v in [1, 2, 3] if v > r]
-            out: Feed(_)
-            for row in o:
-                out << sum(row)
-            sum(out)
-        "#},
-        "is not in the holder's telescope",
-    );
+/// A loop over a group-by feeds one row per group, keyed by the group's key. Each group's
+/// domain reads its key, which the loop binds as its position.
+#[rstest]
+#[case::summed(indoc! {r#"
+    out = test_sink()
+    for g in groupby([1, 2, 3, 4], \e -> e // 2):
+        out << sum(g)
+"#}, "[1, 5, 4]")]
+#[case::over_records(indoc! {r#"
+    sales = [(region="east", amount=1), (region="west", amount=2), (region="east", amount=3)]
+    out = test_sink()
+    for g in groupby(sales, \r -> r.region):
+        out << [s.amount for s in g]
+"#}, r#"["east" -> [0 -> 1, 2 -> 3], "west" -> [1 -> 2]]"#)]
+#[case::keyed_by_an_enclosing_loop(indoc! {r#"
+    out = test_sink()
+    for i in [1, 2]:
+        for g in groupby([1, 2, 3, 4], \e -> e // i):
+            out << max(g)
+"#}, "[(_0: 0, _1: 1) -> 1, (_0: 0, _1: 2) -> 2, (_0: 0, _1: 3) -> 3, (_0: 0, _1: 4) -> 4, (_0: 1, _1: 0) -> 1, (_0: 1, _1: 1) -> 3, (_0: 1, _1: 2) -> 4]")]
+fn a_loop_over_a_group_by_feeds_a_row_per_group(#[case] source: &str, #[case] expected: &str) {
+    check_sink(source, expected);
 }
 
 /// A nest whose inner loop ranges over keys chosen by the outer loop's value. The feed is

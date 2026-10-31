@@ -1453,8 +1453,15 @@ pub fn typed_compose(elts: Vec<Expr>) -> Expr {
 /// ([`chain_type_of`]).
 pub(crate) fn chain_type(elts: &[Expr], fun_kind: crate::ccl::ty::FunKind) -> Type {
     let head_domain = elts[0].ty.domain().expect("a chain's head is a function");
-    let last_codomain = elts[elts.len() - 1]
-        .ty
+    // Each morphism is read at what the one before it hands it: a generalized type is instantiated
+    // there (`src/ccl/design/type-parameters.md`, "Generalized types").
+    let mut reaching = head_domain.clone();
+    let mut last = elts[0].ty.clone();
+    for e in elts {
+        last = crate::ccl::generalize::instantiate(&e.ty, &reaching);
+        reaching = last.codomain().expect("a chain's element is a function");
+    }
+    let last_codomain = last
         .codomain()
         .expect("a chain's last element is a function");
     chain_type_of(
@@ -1466,6 +1473,229 @@ pub(crate) fn chain_type(elts: &[Expr], fun_kind: crate::ccl::ty::FunKind) -> Ty
             codomain: Box::new(last_codomain),
         },
     )
+}
+
+/// `λ 𝑟 → 𝑟 ▷ head ▷ 𝑠₁ ▷ … ▷ 𝑠ₙ`: the value `head` holds at each position with `steps`
+/// applied, a collection over `head`'s domain at `head`'s kind. A view is written with its
+/// position bound, so a step whose type reads the position, as a history's does where the
+/// value it records depends on it, reads the lambda's binder
+/// (`src/ccl/design/ir.md`, "Every stored type is well-scoped"). The steps' types read the
+/// position by the name `head`'s type gives it. [`pointwise_view_parts`] reads one back.
+pub(crate) fn pointwise_view(head: Expr, steps: Vec<Expr>) -> Expr {
+    let Type::Fun {
+        name,
+        fun_kind,
+        domain,
+        codomain,
+    } = head.ty.peel_refinements().clone()
+    else {
+        panic!("a view reads a collection, got {}", head.ty)
+    };
+    let position = name
+        .as_ref()
+        .map_or_else(|| Name::fresh("__pos"), Name::refreshed);
+    let at_position = |ty: &Type| match &name {
+        Some(b) => Subst::rename(b.clone(), position.clone()).apply_type(ty),
+        None => ty.clone(),
+    };
+    let named = Type::Fun {
+        name: Some(position.clone()),
+        fun_kind: fun_kind.clone(),
+        domain: domain.clone(),
+        codomain: codomain.clone(),
+    };
+    let value = crate::ccl::subst::open_codomain(&named, &codomain);
+    let mut body =
+        Expr::apply(Expr::var(&position).with_ty((*domain).clone()), head).with_ty(value);
+    for mut step in steps {
+        step.ty = at_position(&step.ty);
+        let out = step
+            .ty
+            .codomain()
+            .unwrap_or_else(|| panic!("a view's step is a function, got {}", step.ty));
+        body = Expr::apply(body, step).with_ty(out);
+    }
+    // Typed under the name `head`'s type gives the position, so the view and the collection it
+    // reads state a value that depends on the position alike.
+    let ty = if crate::ccl::subst::type_free_vars(&body.ty).contains(&position) {
+        let b = name.clone().unwrap_or_else(|| position.clone());
+        let value = Subst::rename(position.clone(), b.clone()).apply_type(&body.ty);
+        Type::pi_kinded(b, (*domain).clone(), value, fun_kind)
+    } else {
+        Type::Fun {
+            name: None,
+            fun_kind,
+            domain: domain.clone(),
+            codomain: Box::new(body.ty.clone()),
+        }
+    };
+    Expr::lambda(position, *domain, body).with_ty(ty)
+}
+
+/// The collection a [`pointwise_view`] reads and the steps it applies, in order; `None` where
+/// `e` is not one.
+pub(crate) fn pointwise_view_parts(e: &Expr) -> Option<(&Expr, Vec<&Expr>)> {
+    let TypedExprNode::Lambda { param, body } = &e.node else {
+        return None;
+    };
+    let mut steps = Vec::new();
+    let mut at: &Expr = body;
+    loop {
+        let TypedExprNode::Apply { argument, function } = &at.node else {
+            return None;
+        };
+        if matches!(&argument.node, TypedExprNode::Var(n) if *n == param.name) {
+            steps.reverse();
+            return Some((function, steps));
+        }
+        steps.push(&**function);
+        at = argument;
+    }
+}
+
+/// A loop over a collection, `λ 𝑟 → (𝑟 ▷ source) ▷ (λ 𝑥 → body)`: the collection over
+/// `source`'s positions of what `body` makes of the element at each, the form a `for` loop and
+/// a comprehension's generator take (`crate::ccl::comprehension`).
+pub(crate) struct LoopParts<'a> {
+    /// The collection the loop runs over.
+    pub(crate) source: &'a Expr,
+    /// The element `𝑥`.
+    pub(crate) element: &'a TypedBinding,
+    /// What the loop makes of each element.
+    pub(crate) body: &'a Expr,
+}
+
+/// The parts of the loop `e` is ([`LoopParts`]); `None` where it is not one.
+pub(crate) fn loop_parts(e: &Expr) -> Option<LoopParts<'_>> {
+    let TypedExprNode::Lambda {
+        param: position,
+        body: step_at,
+    } = &e.node
+    else {
+        return None;
+    };
+    let TypedExprNode::Apply {
+        argument: read,
+        function: step,
+    } = &step_at.node
+    else {
+        return None;
+    };
+    let TypedExprNode::Lambda {
+        param: element,
+        body,
+    } = &step.node
+    else {
+        return None;
+    };
+    let TypedExprNode::Apply {
+        argument: at,
+        function: source,
+    } = &read.node
+    else {
+        return None;
+    };
+    if !matches!(&at.node, TypedExprNode::Var(n) if *n == position.name) {
+        return None;
+    }
+    Some(LoopParts {
+        source,
+        element,
+        body,
+    })
+}
+
+/// The loop `λ 𝑟 → (𝑟 ▷ source) ▷ step` over `source`'s positions ([`LoopParts`]), typed from
+/// `source` and `step`: a collection over `source`'s domain at `source`'s kind, its position
+/// named `position` or freshly and typed at that domain, and dependent where the value `step`
+/// makes reads it.
+pub(crate) fn indexed_loop(position: Option<Name>, source: Expr, step: Expr) -> Expr {
+    // A channel is read through its read view, the collection it assembles to.
+    let Type::Fun {
+        fun_kind,
+        domain,
+        codomain,
+        ..
+    } = source.ty.read_view().peel_refinements().clone()
+    else {
+        panic!("a loop runs over a collection, got {}", source.ty)
+    };
+    let position = TypedBinding {
+        name: position.unwrap_or_else(Name::iter_record),
+        ty: (*domain).clone(),
+        user_annotation: None,
+        transparency: BindingTransparency::Transparent,
+    };
+    let named = Type::Fun {
+        name: Some(position.name.clone()),
+        fun_kind: fun_kind.clone(),
+        domain: domain.clone(),
+        codomain: codomain.clone(),
+    };
+    let item = crate::ccl::subst::open_codomain(&named, &codomain);
+    let read = Expr::apply(
+        Expr::var(&position.name).with_ty(position.ty.clone()),
+        source,
+    )
+    .with_ty(item);
+    let value = match step.ty.peel_refinements() {
+        Type::Fun {
+            name: Some(x),
+            codomain,
+            ..
+        } => crate::ccl::subst::discharge_codomain(x, &read, codomain),
+        Type::Fun { codomain, .. } => (**codomain).clone(),
+        other => panic!("a loop's step is a function, got {other}"),
+    };
+    let ty = if crate::ccl::subst::type_free_vars(&value).contains(&position.name) {
+        Type::pi_kinded(
+            position.name.clone(),
+            (*domain).clone(),
+            value.clone(),
+            fun_kind,
+        )
+    } else {
+        Type::Fun {
+            name: None,
+            fun_kind,
+            domain,
+            codomain: Box::new(value.clone()),
+        }
+    };
+    let body = Expr::apply(read, step).with_ty(value);
+    let TypedExprNode::Lambda { param, body } = Expr::lambda(position.name, Type::Hole, body).node
+    else {
+        unreachable!("Expr::lambda builds a Lambda")
+    };
+    Expr::new(TypedExprNode::Lambda {
+        param: TypedBinding {
+            ty: position.ty,
+            ..param
+        },
+        body,
+    })
+    .with_ty(ty)
+}
+
+/// The loop `e` ([`loop_parts`]) taken apart: its position binder, its source and its step,
+/// with `e`'s own node otherwise dropped. `Err(e)` where `e` is not a loop.
+pub(crate) fn into_loop(e: Expr) -> Result<(TypedBinding, Expr, Expr), Box<Expr>> {
+    if loop_parts(&e).is_none() {
+        return Err(Box::new(e));
+    }
+    let TypedExprNode::Lambda { param, body } = e.node else {
+        unreachable!("loop_parts matched a Lambda")
+    };
+    let TypedExprNode::Apply { argument, function } = body.node else {
+        unreachable!("loop_parts matched an Apply")
+    };
+    let TypedExprNode::Apply {
+        function: source, ..
+    } = argument.node
+    else {
+        unreachable!("loop_parts matched a read")
+    };
+    Ok((param, *source, *function))
 }
 
 /// The chain `elts` typed `ty`, where `ty` is the type a site states for it

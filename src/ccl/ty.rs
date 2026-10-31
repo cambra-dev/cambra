@@ -1524,6 +1524,10 @@ pub struct TypeParam {
     /// For an opened parameter, where its bound was written: the secondary label of a
     /// use that fails it.
     pub bound_at: Option<chl_parser::ast::Span>,
+    /// Whether the compiler made the parameter, generalizing a type a pass moved out of the
+    /// scope of a binder its instance named ([`TypeParam::generalized`]). Its `Poly` stays in the
+    /// tree after inference.
+    pub generalized: bool,
 }
 
 impl TypeParam {
@@ -1535,6 +1539,21 @@ impl TypeParam {
             opened_at: None,
             bound: None,
             bound_at: None,
+            generalized: false,
+        })
+    }
+
+    /// A parameter a pass generalizes a type over: a type the instance stated and its
+    /// new position cannot, below `bound` (`src/ccl/design/type-parameters.md`, "Generalized
+    /// types").
+    pub fn generalized(spelling: impl Into<SmolStr>, bound: Option<Type>) -> Rc<TypeParam> {
+        Rc::new(TypeParam {
+            id: TypeParamId(TYPE_PARAM_COUNTER.fetch_add(1, Ordering::Relaxed)),
+            spelling: spelling.into(),
+            opened_at: None,
+            bound,
+            bound_at: None,
+            generalized: true,
         })
     }
 
@@ -1551,6 +1570,7 @@ impl TypeParam {
             opened_at: Some(level),
             bound,
             bound_at,
+            generalized: false,
         })
     }
 
@@ -1562,6 +1582,11 @@ impl TypeParam {
     /// the right-hand side that opens its `Poly`, so one reaching the solver was never
     /// opened.
     pub fn level(&self) -> crate::ccl::Level {
+        // A generalized parameter is rigid and born after inference: no variable's level is below
+        // it, so it sits at the outermost one.
+        if self.generalized {
+            return 0;
+        }
         self.opened_at.unwrap_or_else(|| {
             panic!(
                 "type parameter `{}` reached the solver as declared: no binding opened the \
@@ -3082,6 +3107,7 @@ impl Type {
     pub fn fun_kind(&self) -> Option<&FunKind> {
         match self.peel_refinements() {
             Type::Fun { fun_kind, .. } => Some(fun_kind),
+            Type::Poly(p) if p.params.iter().all(|q| q.param.generalized) => p.body.fun_kind(),
             _ => None,
         }
     }
@@ -3597,6 +3623,9 @@ impl Type {
     pub fn domain(&self) -> Option<Type> {
         match self {
             Type::Fun { domain, .. } => Some(domain.as_ref().clone()),
+            // A generalized type's structure is its body's, its parameters standing for any type
+            // (`src/ccl/design/type-parameters.md`, "Generalized types").
+            Type::Poly(p) if p.params.iter().all(|q| q.param.generalized) => p.body.domain(),
             _ => None,
         }
     }
@@ -3608,6 +3637,7 @@ impl Type {
     pub fn codomain(&self) -> Option<Type> {
         match self {
             Type::Fun { codomain, .. } => Some(codomain.as_ref().clone()),
+            Type::Poly(p) if p.params.iter().all(|q| q.param.generalized) => p.body.codomain(),
             _ => None,
         }
     }

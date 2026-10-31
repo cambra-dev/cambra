@@ -184,9 +184,9 @@ fn partition_key_of(predicate: &Expr) -> Option<PartitionKey<'_>> {
 
 /// The pieces [`emit_groupby`] needs, read off a matched group-by site by
 /// [`match_pointful_site`].
-struct PointfulSite<'a> {
-    /// The collection the group-by ranges over — the cast's value.
-    collection: &'a Expr,
+struct PointfulSite {
+    /// The collection the group-by ranges over: what the family reads at each element.
+    collection: Expr,
     /// The key morphism read off the partition refinement. Owned: the refinement it is
     /// read from lives on the *opened* codomain, which is built here and does not outlive
     /// the match.
@@ -221,23 +221,35 @@ struct PointfulSite<'a> {
 /// This is the syntactic half, coupled to how a site is currently spelled, as against
 /// [`partition_key_of`]'s question of whether a refinement partitions at all. It stays
 /// narrow: a new site pattern is a sibling of this function rather than an edit to it.
-fn match_pointful_site(head: &Expr) -> Option<PointfulSite<'_>> {
+fn match_pointful_site(head: &Expr) -> Option<PointfulSite> {
+    // The family lambda elimination builds for a group-by: `(.1 ≫ 𝑐) ▷ curry`, the
+    // collection `𝑐` read at the element half of each `(key, element)` pair of the
+    // partition's domain, curried back into one collection per key.
     let TypedExprNode::Apply {
-        argument: cast_expr,
-        function: const_fn,
+        argument: pairs,
+        function: curry_fn,
     } = &head.node
     else {
         return None;
     };
-    if !is_builtin(const_fn, Builtin::Const) {
+    if !is_builtin(curry_fn, Builtin::Curry) {
         return None;
     }
-    let TypedExprNode::Cast {
-        value: collection, ..
-    } = &cast_expr.node
-    else {
+    let TypedExprNode::Compose(elts) = &pairs.node else {
         return None;
     };
+    let [element, read @ ..] = elts.as_slice() else {
+        return None;
+    };
+    if !matches!(element.node, TypedExprNode::Proj(ProjKey::Index(1))) || read.is_empty() {
+        return None;
+    }
+    // A source the comprehension built reaches the pair as a chain of its own morphisms.
+    let collection = match read {
+        [one] => one.clone_preserving_ids(),
+        many => typed_compose(many.iter().map(Expr::clone_preserving_ids).collect()),
+    };
+    let collection = &collection;
     // head.ty = (k: K) ⇒ ({I | pred} ⇒ V) — read the types name-agnostically. The
     // outer function's domain is the key domain `{K | k ▷ (𝑚 ▷ collection_contains)}` when the source
     // came through `reify` (the `groupby` realization).
@@ -308,7 +320,7 @@ fn match_pointful_site(head: &Expr) -> Option<PointfulSite<'_>> {
     }
 
     Some(PointfulSite {
-        collection,
+        collection: collection.clone_preserving_ids(),
         key_binder: key_binder.clone(),
         key_fn: partition.key_fn.clone(),
         key_ty: ccl_utils::strip_refinements(key_ty),
@@ -424,7 +436,7 @@ mod tests {
         assert!(matches!(expr.node, TypedExprNode::Var(ref v) if v.base() == "x"));
     }
 
-    /// `const(cast(c)) : (k) ⇒ ({i | i ▷ c ▷ key == k} ⇒ V)` composed with a
+    /// `(.1 ≫ c) ▷ curry : (k) ⇒ ({i | i ▷ c ▷ key == k} ⇒ V)` composed with a
     /// tail — the pointful group-by source the recognizer matches, with the key
     /// morphism deliberately **shared** between the predicate and the tail.
     ///
@@ -452,8 +464,13 @@ mod tests {
             int.clone(),
             fun_ty(refined_ty(idx.clone(), pred), int.clone()),
         );
-        let cast = Expr::cast(c.clone(), fun_ty(idx, int)).with_ty(c.ty.clone());
-        let head = apply_builtin(cast, Builtin::Const, Type::Hole, head_ty.clone());
+        let _ = idx;
+        let pairs = Expr::compose(vec![
+            Expr::new(TypedExprNode::Proj(ProjKey::Index(1))).with_ty(Type::Hole),
+            c.clone(),
+        ])
+        .with_ty(Type::Hole);
+        let head = apply_builtin(pairs, Builtin::Curry, Type::Hole, head_ty.clone());
         // The tail stands in for the live main-tree occurrence of the shared key.
         Expr::compose(vec![head, key.clone()]).with_ty(head_ty)
     }
@@ -472,7 +489,7 @@ mod tests {
         assert!(
             !matches!(&expr.node, TypedExprNode::Compose(elts)
                 if matches!(&elts[0].node, TypedExprNode::Apply { function, .. }
-                    if is_builtin(function, Builtin::Const))),
+                    if is_builtin(function, Builtin::Curry))),
             "the recognizer must have rewritten the source: {}",
             symbolic(&expr)
         );

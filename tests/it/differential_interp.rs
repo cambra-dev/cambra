@@ -662,12 +662,11 @@ fn a_mutable_variable_introduced_in_a_nested_loops_body() {
 }
 
 /// Group keys compared through the loop key, rather than folded away by an aggregate.
-/// Inference panics: the group key binder `__gb_k` escapes into a bound outside its scope.
-/// Pinned at the interpreter's answer and the compiler's panic.
+/// A loop over a group-by feeds one row per group, keyed by the group's key: each group's
+/// domain reads its key, which the loop's position binds.
 #[test]
-#[should_panic(expected = "open bound recorded")]
-fn a_loop_over_groups_panics_in_inference() {
-    let source = indoc! {r#"
+fn a_loop_over_groups_feeds_a_row_per_group() {
+    agree(indoc! {r#"
         sales = [
             (region="east", amount=1),
             (region="west", amount=2),
@@ -676,12 +675,7 @@ fn a_loop_over_groups_panics_in_inference() {
         out = test_sink()
         for g in groupby(sales, \r -> r.region):
             out << sum([s.amount for s in g])
-    "#};
-    assert_eq!(
-        interpreted(source).to_string(),
-        r#"["east" -> 4, "west" -> 2]"#
-    );
-    compiled(source);
+    "#});
 }
 
 /// A site that never fires still makes the channel a union, because the tagging is fixed

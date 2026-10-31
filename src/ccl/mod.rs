@@ -16,6 +16,7 @@ pub mod content_hash;
 pub mod context;
 pub mod diff;
 pub mod feed_nest;
+pub(crate) mod generalize;
 pub mod infer;
 pub mod inline;
 pub mod lambda_elim;
@@ -40,6 +41,7 @@ pub mod symbolic;
 pub(crate) mod test_corpus;
 pub mod transact_phase;
 pub mod uniquify;
+pub(crate) mod well_scoped;
 
 // Core type definitions, split out of this crate-root module. Each submodule
 // owns one cluster of the AST/type vocabulary; the re-exports below keep every

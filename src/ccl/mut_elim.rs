@@ -166,6 +166,8 @@ pub fn run(expr: Expr) -> Expr {
     // induction accumulator consumed here; the transactional `Mut(V, Txn)` erasure
     // lands with `transact_phase`.
     erase_mut(&mut out);
+    // Every value a mutable variable holds has a binder now, so a read binder's is nameable.
+    crate::ccl::mut_read::reveal(&mut out);
     // Release-mode post-conditions (not `debug_assert!`): these are the phase's
     // contract with every downstream pass — a leaked `For`/`MutWrite` marker or
     // a surviving history is a miscompile, not a debug-only sanity check,
@@ -1067,7 +1069,7 @@ fn spell_out_product(e: &mut Expr, target: &Type) {
 }
 
 /// Restate `e`'s introduction at `target`, minting one where `e` has none.
-fn view_at(e: &mut Expr, target: Type) {
+pub(crate) fn view_at(e: &mut Expr, target: Type) {
     if let TypedExprNode::Apply { function, argument } = &mut e.node
         && matches!(function.node, TypedExprNode::Builtin(Builtin::Box))
     {
@@ -1181,21 +1183,27 @@ pub(crate) fn tvar(name: &Name, ty: Type) -> Expr {
 /// collections it builds would be unioned, and a union of collections that vary with the
 /// iteration is not supported, as `[x] ++ [x * 10]` in a loop body is not. One place may sit
 /// under a condition or in an inner loop. A loop's iteration is a `For`'s body or, for a loop
-/// that writes no mutable variable, the body of a function a `Compose` applies to each
-/// element. Runs on the inlined tree ahead of [`run`], so a feed a called function makes
+/// that writes no mutable variable, the body of the function the loop applies to the element
+/// at each position, `λ 𝑟 → (𝑟 ▷ 𝑠) ▷ (λ 𝑥 → body)` (`crate::ccl::comprehension`'s
+/// `index_loop`). Runs on the inlined tree ahead of [`run`], so a feed a called function makes
 /// stands where the call does.
 pub(crate) fn check_iteration_channel_feeds(
     expr: &Expr,
 ) -> Result<(), provenance::Located<String>> {
     let iterations: Vec<&Expr> = match &expr.node {
         TypedExprNode::For { body, .. } => vec![body],
-        TypedExprNode::Compose(elts) => elts
-            .iter()
-            .filter_map(|elt| match &elt.node {
-                TypedExprNode::Lambda { body, .. } => Some(&**body),
-                _ => None,
-            })
-            .collect(),
+        TypedExprNode::Lambda { param, body } => match &body.node {
+            TypedExprNode::Apply { argument, function }
+                if matches!(&argument.node, TypedExprNode::Apply { argument: at, .. }
+                    if matches!(&at.node, TypedExprNode::Var(n) if *n == param.name)) =>
+            {
+                match &function.node {
+                    TypedExprNode::Lambda { body, .. } => vec![&**body],
+                    _ => Vec::new(),
+                }
+            }
+            _ => Vec::new(),
+        },
         _ => Vec::new(),
     };
     for body in iterations {
@@ -1489,29 +1497,6 @@ pub(crate) fn proj_of(p: &Name, tuple_ty: &Type, i: usize, elt_ty: &Type) -> Exp
     app
 }
 
-/// `__hist ≫ variant_project(`commit) ≫ .writes ≫ .acc : domain ⇒ vty` — one
-/// accumulator's slice of the history's committing-write stream, built as one
-/// flat compose so recognition (and the causal-slot grammar) match it
-/// structurally. The write set is keyed by accumulator name, so the slice is
-/// named too. The ``variant_project(`commit)`` step eliminates the ``{`commit{𝑃} | `abort}`` decision to its dense payload before the `.writes` read.
-/// The type of a view of the history `hist_ty` reading `field_ty` at each position. A history
-/// keyed by its position names it, and a field that reads it is keyed the same way.
-fn view_ty(hist_ty: &Type, domain_ty: &Type, field_ty: &Type) -> Type {
-    match hist_ty.peel_refinements() {
-        Type::Fun {
-            name: Some(r),
-            fun_kind,
-            ..
-        } if crate::ccl::subst::type_free_vars(field_ty).contains(r) => Type::pi_kinded(
-            r.clone(),
-            domain_ty.clone(),
-            field_ty.clone(),
-            fun_kind.clone(),
-        ),
-        _ => Type::fun_like(hist_ty, domain_ty.clone(), field_ty.clone()),
-    }
-}
-
 /// `ty`, a type a loop's writer states over its parameter `p`, read at one position: each
 /// projection `p.𝑖` becomes `components[𝑖]`, and a read of the whole parameter becomes
 /// `whole`. The item's component reads the position, so a fed row whose keys depend on the
@@ -1535,25 +1520,23 @@ fn read_at_position(ty: &Type, p: &Name, components: &[Expr], whole: &Expr, prev
     ty
 }
 
+/// ``λ 𝑟 → 𝑟 ▷ __hist ▷ variant_project(`commit) ▷ .writes ▷ .acc``, one accumulator's slice
+/// of the history's committing-write stream, a [`crate::ccl::ccl_utils::pointwise_view`] so
+/// that recognition and the causal-slot grammar match it structurally. The write set is keyed
+/// by accumulator name, so the slice is named too.
 fn writes_key_view(
     h: &Name,
     hist_ty: &Type,
-    domain_ty: &Type,
     writes_ty: &Type,
     decision_ty: &Type,
     acc: &Label,
     vty: &Type,
 ) -> Expr {
-    let payload_ty = crate::ccl::ccl_utils::commit_payload_ty(decision_ty);
-    let vp = crate::ccl::ccl_utils::commit_project(decision_ty);
-    let mut wproj = Expr::proj_field(F_WRITES);
-    wproj.ty = Type::fun(payload_ty, writes_ty.clone());
+    let mut steps = hist_field_steps(&F_WRITES, writes_ty, decision_ty);
     let mut iproj = Expr::proj_field(acc);
     iproj.ty = Type::fun(writes_ty.clone(), vty.clone());
-    crate::ccl::ccl_utils::chain_typed(
-        vec![tvar(h, hist_ty.clone()), vp, wproj, iproj],
-        view_ty(hist_ty, domain_ty, vty),
-    )
+    steps.push(iproj);
+    crate::ccl::ccl_utils::pointwise_view(tvar(h, hist_ty.clone()), steps)
 }
 
 /// A [`TypedBinding`] with `name : ty` and no user annotation.
@@ -1566,26 +1549,17 @@ pub(crate) fn binding(name: Name, ty: Type) -> TypedBinding {
     }
 }
 
-/// `__hist ▷ variant_project(`commit) ▷ .field : domain ⇒ field_ty` — a projected
-/// view of the history's committing-decision payload (`{writes, __to_<feed>*}`).
-/// The ``variant_project(`commit)`` step eliminates the `` {`commit{𝑃} | `abort} ``
-/// decision to its dense payload before the field read.
-fn hist_field_view(
-    h: &Name,
-    hist_ty: &Type,
-    domain_ty: &Type,
-    field: &Label,
-    field_ty: &Type,
-    decision_ty: &Type,
-) -> Expr {
+/// ``variant_project(`commit) ▷ .field``, the steps of a view of the history's
+/// committing-decision payload (`{writes, __to_<feed>*}`)
+/// ([`crate::ccl::ccl_utils::pointwise_view`]). The ``variant_project(`commit)`` step
+/// eliminates the `` {`commit{𝑃} | `abort} `` decision to its dense payload before the field
+/// read.
+fn hist_field_steps(field: &Label, field_ty: &Type, decision_ty: &Type) -> Vec<Expr> {
     let payload_ty = crate::ccl::ccl_utils::commit_payload_ty(decision_ty);
     let vp = crate::ccl::ccl_utils::commit_project(decision_ty);
     let mut proj = Expr::proj_field(field.clone());
     proj.ty = Type::fun(payload_ty, field_ty.clone());
-    crate::ccl::ccl_utils::chain_typed(
-        vec![tvar(h, hist_ty.clone()), vp, proj],
-        view_ty(hist_ty, domain_ty, field_ty),
-    )
+    vec![vp, proj]
 }
 
 /// Close a recurrence group: wrap `cont` in `letrec { bindings } in <feed hoists>
@@ -1665,23 +1639,42 @@ pub(crate) fn hoist_feeds(mut body: Expr, feeds: Vec<LoopFeed>) -> Expr {
     body
 }
 
-/// `for x in collection: defer << x` — the loop `collection ≫ (λ x → Feed(defer, x))`.
+/// `for x in collection: defer << x` — the loop `λ 𝑟 → (𝑟 ▷ collection) ▷ (λ x → Feed(defer,
+/// x))`, indexed by the collection's position as a comprehension's step is, so a fed item whose
+/// type reads the position reads the loop's binder.
 fn feed_each(defer: Name, collection: Expr) -> Expr {
     let (domain_ty, item_ty) = fun_parts(&collection.ty);
-    // A collection keyed by its position names it, and the item read there is its codomain
-    // opened at that name, which the lambda after it reads.
-    let item_ty = crate::ccl::subst::open_codomain(&collection.ty, &item_ty);
+    let position = Name::fresh("__iter_record");
+    // The item read at the position is the collection's codomain opened there.
+    let named = match collection.ty.peel_refinements() {
+        Type::Fun {
+            fun_kind,
+            domain,
+            codomain,
+            ..
+        } => Type::Fun {
+            name: Some(position.clone()),
+            fun_kind: fun_kind.clone(),
+            domain: domain.clone(),
+            codomain: codomain.clone(),
+        },
+        other => panic!("a fed collection is a function, got {other}"),
+    };
+    let item_ty = crate::ccl::subst::open_codomain(&named, &item_ty);
     let x = Name::fresh("__fed");
     let mut feed = Expr::feed(defer, tvar(&x, item_ty.clone()));
     feed.ty = Type::Base(BaseType::Unit);
     let mut lambda = Expr::lambda(x, item_ty.clone(), feed);
-    lambda.ty = Type::fun(item_ty, Type::Base(BaseType::Unit));
+    lambda.ty = Type::fun(item_ty.clone(), Type::Base(BaseType::Unit));
     let collection_ty = collection.ty.clone();
+    let read = Expr::apply(tvar(&position, domain_ty.clone()), collection).with_ty(item_ty);
+    let step = Expr::apply(read, lambda).with_ty(Type::Base(BaseType::Unit));
     // A loop over the collection is a read of it, so it is whatever the collection is.
-    crate::ccl::ccl_utils::chain_typed(
-        vec![collection, lambda],
-        Type::fun_like(&collection_ty, domain_ty, Type::Base(BaseType::Unit)),
-    )
+    Expr::lambda(position, domain_ty.clone(), step).with_ty(Type::fun_like(
+        &collection_ty,
+        domain_ty,
+        Type::Base(BaseType::Unit),
+    ))
 }
 
 /// Rewrite one loop. `cont` is the raw continuation after the loop
@@ -1863,7 +1856,6 @@ pub(crate) struct InductionFold {
     /// The history binder and its shape, for per-position accumulator reads.
     pub hist: Name,
     pub hist_ty: Type,
-    pub domain_ty: Type,
     pub writes_ty: Type,
     pub decision_ty: Type,
     /// Accumulating variables in first-write order. The order is the layout; a
@@ -1891,7 +1883,6 @@ impl InductionFold {
         writes_key_view(
             &self.hist,
             &self.hist_ty,
-            &self.domain_ty,
             &self.writes_ty,
             &self.decision_ty,
             &acc.name.field_key(),
@@ -2055,13 +2046,9 @@ pub(crate) fn fold_induction_loop(
     // the history is a causal reference (see `check_letrec_causal`); the defaults
     // are the accumulators' pre-loop bindings, under the same labels as the write
     // set they default.
-    let writes_view = hist_field_view(
-        &h,
-        &hist_ty,
-        &domain_ty,
-        &F_WRITES,
-        &writes_ty,
-        &decision_ty,
+    let writes_view = crate::ccl::ccl_utils::pointwise_view(
+        tvar(&h, hist_ty.clone()),
+        hist_field_steps(&F_WRITES, &writes_ty, &decision_ty),
     );
     let seeds: Vec<(Label, Expr)> = accs
         .iter()
@@ -2108,7 +2095,6 @@ pub(crate) fn fold_induction_loop(
         let view = writes_key_view(
             &h,
             &hist_ty,
-            &domain_ty,
             &writes_ty,
             &decision_ty,
             &acc.name.field_key(),
@@ -2136,15 +2122,9 @@ pub(crate) fn fold_induction_loop(
             // ([`fired_project`](crate::ccl::ccl_utils::fired_project)).
             let value_ty = at_position(&f.value.ty);
             let tap_ty = crate::ccl::ccl_utils::tap_variant_ty(value_ty.clone());
-            let field_view =
-                hist_field_view(&h, &hist_ty, &domain_ty, &f.field, &tap_ty, &decision_ty);
-            let view = crate::ccl::ccl_utils::chain_typed(
-                vec![
-                    field_view,
-                    crate::ccl::ccl_utils::fired_project(value_ty.clone()),
-                ],
-                view_ty(&hist_ty, &domain_ty, &value_ty),
-            );
+            let mut steps = hist_field_steps(&f.field, &tap_ty, &decision_ty);
+            steps.push(crate::ccl::ccl_utils::fired_project(value_ty.clone()));
+            let view = crate::ccl::ccl_utils::pointwise_view(tvar(&h, hist_ty.clone()), steps);
             // This loop's positions are one more level over what the feed held.
             LoopFeed {
                 defer: f.defer.clone(),
@@ -2161,7 +2141,6 @@ pub(crate) fn fold_induction_loop(
         feed_views,
         hist: h,
         hist_ty,
-        domain_ty,
         writes_ty,
         decision_ty,
         accs,
@@ -2731,6 +2710,8 @@ fn transform_chain(
         }
         TypedExprNode::ExprStmt { expr: effect, body } => {
             let effect_id = effect.node_id();
+            let feed_loop = crate::ccl::ccl_utils::loop_parts(&effect).is_some()
+                || matches!(effect.node, TypedExprNode::Compose(_));
             match effect.node {
                 // A write advances the read-your-writes environment by *inlining*
                 // the written value (point-free over `__p`), not binding a `let` —
@@ -2808,11 +2789,12 @@ fn transform_chain(
                     transform_chain(spliced, env, accs, writes_ty, entering, path, feeds)
                 }
                 // An inner loop that writes no mutable variable outside it, which lowering
-                // builds as it builds a feed-only loop anywhere: `𝑠 ≫ (λ 𝑥 → body)`. It
-                // carries nothing, so there is no recurrence to fold. Each feed in it rides
-                // this decision as a tap, as an inner recurrence's does below: one
-                // collection per position of this level.
-                node @ TypedExprNode::Compose(_) => {
+                // builds as it builds a feed-only loop anywhere, indexed by its position
+                // before inference: `λ 𝑟 → (𝑟 ▷ 𝑠) ▷ (λ 𝑥 → body)`. It carries nothing, so
+                // there is no recurrence to fold. Each feed in it rides this decision as a
+                // tap, as an inner recurrence's does below: one collection per position of
+                // this level.
+                node @ (TypedExprNode::Compose(_) | TypedExprNode::Lambda { .. }) if feed_loop => {
                     let site = StmtSite::new(stmt_id, effect_id);
                     let feed_loop = crate::ccl::TypedExpr {
                         node,
@@ -3139,8 +3121,13 @@ fn sink_prefix(decision: Expr) -> Expr {
 }
 
 /// Whether `e` evaluates any part of itself at a narrower domain than its own —
-/// the test [`sink_prefix`] cuts regions at.
+/// the test [`sink_prefix`] cuts regions at. A view of a collection
+/// ([`crate::ccl::ccl_utils::pointwise_view`]) evaluates its steps at the collection's own
+/// domain, which is the view's, so only what it reads and applies can restrict.
 fn restricts(e: &Expr) -> bool {
+    if let Some((head, steps)) = crate::ccl::ccl_utils::pointwise_view_parts(e) {
+        return restricts(head) || steps.into_iter().any(restricts);
+    }
     matches!(
         e.node,
         TypedExprNode::Case { .. }

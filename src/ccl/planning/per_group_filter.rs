@@ -74,18 +74,7 @@ pub(super) fn insert_per_group_filters(
         "planning.per_group_filter",
         provenance::Nature::Machinery,
     );
-    let chain_binder = match expr.ty.peel_refinements() {
-        Type::Fun { name, .. } => name.clone(),
-        _ => None,
-    };
-    let Some(site) = (0..elts.len()).position(|i| {
-        per_group_filter_site(
-            &elts[i],
-            carried_into(elts, i).as_ref(),
-            &positions_before(chain_binder.as_ref(), elts, i),
-        )
-        .is_some()
-    }) else {
+    let Some(site) = elts.iter().position(|e| per_group_filter_site(e).is_some()) else {
         return Ok(());
     };
     // `site` is never 0: the morphism consumes a collection, so something upstream
@@ -96,11 +85,7 @@ pub(super) fn insert_per_group_filters(
     let TypedExprNode::Compose(elts) = &mut expr.node else {
         unreachable!("matched a Compose above")
     };
-    let carried = carried_into(elts, site);
-    let positions = positions_before(chain_binder.as_ref(), elts, site);
-    let Some((binder, site_codomain, value_predicate)) =
-        per_group_filter_site(&elts[site], carried.as_ref(), &positions)
-    else {
+    let Some((binder, site_codomain, value_predicate)) = per_group_filter_site(&elts[site]) else {
         unreachable!("position found it")
     };
     // The filter evaluates its predicate per value, so it is planned as a `restrict`'s
@@ -146,11 +131,7 @@ pub(super) fn insert_per_group_filters(
 
 /// The site's codomain and the value predicate to filter by, if `expr` is a per-group
 /// filter site. See [`insert_per_group_filters`] for the shape.
-fn per_group_filter_site(
-    expr: &Expr,
-    carried: Option<&Expr>,
-    positions: &[Name],
-) -> Option<(Name, Type, Expr)> {
+fn per_group_filter_site(expr: &Expr) -> Option<(Name, Type, Expr)> {
     let Narrowing {
         binder,
         opened,
@@ -162,10 +143,7 @@ fn per_group_filter_site(
     // it pairs with — the stages of a filter *pipeline* — have no counterpart here.
     let mut conjoined = None;
     for (r, _) in application_order(&added, &consumed) {
-        conjoined = combine_predicates(
-            conjoined,
-            Some(value_predicate(&r.predicate, &binder, carried, positions)?),
-        );
+        conjoined = combine_predicates(conjoined, Some(value_predicate(&r.predicate, &binder)?));
     }
     Some((binder, opened, conjoined?))
 }
@@ -191,12 +169,12 @@ fn narrowing(expr: &Expr) -> Option<Narrowing> {
         domain,
         codomain,
         ..
-    } = &expr.ty
+    } = crate::ccl::generalize::opened(&expr.ty)
     else {
         return None;
     };
     let consumed = domain.domain()?;
-    let opened = open_codomain(&expr.ty, codomain);
+    let opened = open_codomain(crate::ccl::generalize::opened(&expr.ty), codomain);
     // **A row whose collection is a sum** — a jagged row, its domain a witness — narrows
     // under a sum of its own: the codomain binds a second witness over the same kind, and
     // the two domains name different binders for the one row's domain. Reading the codomain
@@ -293,12 +271,13 @@ fn refines_by_its_input(e: &Expr) -> bool {
         domain,
         codomain,
         ..
-    } = &e.ty
+    } = crate::ccl::generalize::opened(&e.ty)
     else {
         return false;
     };
     let consumed = domain.domain().map(|d| d.refinements().to_vec());
-    let Some(narrowed) = open_codomain(&e.ty, codomain).domain() else {
+    let Some(narrowed) = open_codomain(crate::ccl::generalize::opened(&e.ty), codomain).domain()
+    else {
         return false;
     };
     narrowed.refinements().iter().any(|r| {
@@ -326,59 +305,13 @@ fn looks_up_at_the_key(predicate: &Expr, binder: &Name) -> bool {
     found
 }
 
-/// The names of the positions a chain passes through before `elts[i]`: the chain's own binder
-/// and the binders of the morphisms before `i` (`src/ccl/design/type-inference.md`, "A chain
-/// names each position").
-fn positions_before(chain_binder: Option<&Name>, elts: &[Expr], i: usize) -> Vec<Name> {
-    chain_binder
-        .cloned()
-        .into_iter()
-        .chain(
-            elts[..i]
-                .iter()
-                .filter_map(|e| match e.ty.peel_refinements() {
-                    Type::Fun { name, .. } => name.clone(),
-                    _ => None,
-                }),
-        )
-        .collect()
-}
-
-/// The value the morphism before position `i` carries into it, `𝑝 ▷ 𝑒` for that morphism 𝑒 and
-/// its binder 𝑝: the other spelling of the site's input (`src/ccl/design/type-inference.md`,
-/// "A chain names each position"). Built only to compare against, so it reaches no tree.
-fn carried_into(elts: &[Expr], i: usize) -> Option<Expr> {
-    let before = elts.get(i.checked_sub(1)?)?;
-    let Type::Fun {
-        name: Some(p),
-        domain,
-        ..
-    } = before.ty.peel_refinements()
-    else {
-        return None;
-    };
-    let position = Expr::throwaway(TypedExprNode::Var(p.clone())).with_ty((**domain).clone());
-    Some(
-        Expr::throwaway(TypedExprNode::Apply {
-            argument: Box::new(position),
-            function: Box::new(before.clone_preserving_ids()),
-        })
-        .with_ty(Type::Hole),
-    )
-}
-
-/// Strip `__elem ▷ (𝑔 ≫ 𝑞)` down to `𝑞`, the predicate on the collection's values. The site's
-/// input is read by its binder 𝑔 or as the value `carried` into it.
+/// Strip `__elem ▷ (𝑔 ≫ 𝑞)` down to `𝑞`, the predicate on the collection's values, where 𝑔 is
+/// the site's binder, its input.
 ///
 /// Returns `None` for any other shape, including a predicate that never dereferences
 /// the site's input: the rewrite is only sound when the collection being filtered is the one
 /// the predicate reads through.
-fn value_predicate(
-    predicate: &Expr,
-    binder: &Name,
-    carried: Option<&Expr>,
-    positions: &[Name],
-) -> Option<Expr> {
+fn value_predicate(predicate: &Expr, binder: &Name) -> Option<Expr> {
     let TypedExprNode::Apply { argument, function } = &predicate.node else {
         return None;
     };
@@ -391,9 +324,7 @@ fn value_predicate(
     let [head, rest @ ..] = chain.as_slice() else {
         return None;
     };
-    let reads_input = matches!(&head.node, TypedExprNode::Var(n) if n == binder)
-        || carried.is_some_and(|c| crate::ccl::ty::eq_term_modulo_ty_slots(head, c));
-    if !reads_input {
+    if !matches!(&head.node, TypedExprNode::Var(n) if n == binder) {
         return None;
     }
     let q = match rest {
@@ -407,13 +338,9 @@ fn value_predicate(
             ccl_utils::chain_typed(many.to_vec(), ty)
         }
     };
-    // The filter is handed the values alone, so a value predicate reading the site's input,
-    // or any position of the chain before it, has nothing to read:
-    // `[v for v in r.xs if v > r.lim]`.
-    let reads_positions = std::iter::once(binder)
-        .chain(positions)
-        .any(|p| ccl_utils::is_free(p, &q));
-    (!reads_positions).then_some(q)
+    // The filter is handed the values alone, so a value predicate reading the site's input
+    // has nothing to read: `[v for v in r.xs if v > r.lim]`.
+    (!ccl_utils::is_free(binder, &q)).then_some(q)
 }
 
 #[cfg(test)]

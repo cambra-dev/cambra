@@ -162,7 +162,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::{
-    BindingTransparency, Branch, Expr, Name, TypedBinding, TypedExprNode,
+    BindingTransparency, Branch, Expr, Name, Type, TypedBinding, TypedExprNode,
     ccl_utils::{free_names_in_value, spelled_in_a_type},
     lambda_elim::substitute,
     mut_scope::{Muts, is_mut_var, under_param, with},
@@ -706,6 +706,331 @@ fn unbind_go(mut expr: Expr) -> Expr {
         symbolic(&bound_expr),
     );
     substitute(*body, &binding.name, &bound_expr)
+}
+
+// ---------------------------------------------------------------------------
+// Revealing: naming the value a read took, once mutability elimination has
+// ---------------------------------------------------------------------------
+
+/// The `let`s of a tree by binder name, each with its node, its definiens, and its interval in
+/// [`reveal_go`]'s visiting order: its own index and the last index under it.
+type Definiens = HashMap<Name, Vec<Definition>>;
+
+struct Definition {
+    at: provenance::NodeId,
+    value: Expr,
+    interval: (usize, usize),
+}
+
+/// Make every opaque `let` transparent, and restate each type that names one of its binders
+/// outside the binder's scope by the binder's definiens.
+///
+/// Runs at the end of mutability elimination ([`crate::ccl::mut_elim::run`]). A read binder is
+/// opaque while inference runs because its definiens is a mutable variable, which no type may
+/// name. Mutability elimination gives each value the variable holds a binder of its own, so a
+/// read binder's definiens is then a value like any other, and a type lifted past the binder
+/// reads it by that definiens as it does past a transparent `let`
+/// (`src/ccl/design/ir.md`, "Every stored type is well-scoped"). A type lifted past several
+/// binders is restated through each, outermost last: a read's definiens is a version binder,
+/// whose own definiens the type reads past that one.
+///
+/// A value a loop computed has no definiens a type outside the loop can state: it reads the
+/// loop's history, a `letrec` binder. Such a value, and the loop's history itself, are hidden
+/// where a type leaves their scope instead ([`hide_at_loop_exits`]).
+///
+/// A binder's name is not unique in the tree: a definition's specializations are clones of one
+/// body, each binding the same names to definientia of its own. A type naming a binder out of its
+/// scope is restated by the `let` inside the nearest node around the type, the type's own node
+/// included, that holds a `let` binding the name: where that node holds one, it is the `let`
+/// the type was lifted past. Where it holds several, the name is left as it is.
+pub(crate) fn reveal(root: &mut Expr) {
+    let mut loops = HashSet::new();
+    letrec_binders(root, &mut loops);
+    fn collect(e: &mut Expr, loops: &mut HashSet<Name>) {
+        if let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } = &mut e.node
+        {
+            binding.transparency = BindingTransparency::Transparent;
+            if loops
+                .iter()
+                .any(|h| crate::ccl::ccl_utils::is_free(h, bound_expr))
+            {
+                loops.insert(binding.name.clone());
+            }
+        }
+        e.walk_children_mut(|c| collect(c, loops));
+    }
+    collect(root, &mut loops);
+    let mut definiens = Definiens::new();
+    let mut last = Vec::new();
+    number(root, &loops, &mut definiens, &mut last);
+    let everywhere = crate::ccl::well_scoped::free_names(root);
+    reveal_go(
+        root,
+        &mut Vec::new(),
+        &mut Vec::new(),
+        &mut 0,
+        &last,
+        &everywhere,
+        &definiens,
+    );
+    if !loops.is_empty() {
+        hide_at_loop_exits(root, &mut Vec::new(), &loops, &mut HashMap::new());
+    }
+}
+
+/// Number `e`'s nodes in [`reveal_go`]'s visiting order, recording at each node's index the
+/// last index under it, and record each `let` a loop did not compute in `definiens`.
+fn number(e: &mut Expr, loops: &HashSet<Name>, definiens: &mut Definiens, last: &mut Vec<usize>) {
+    let index = last.len();
+    last.push(index);
+    let own = match &e.node {
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            ..
+        } if !loops.contains(&binding.name) => Some((
+            binding.name.clone(),
+            e.node_id(),
+            bound_expr.clone_preserving_ids(),
+        )),
+        _ => None,
+    };
+    crate::ccl::scope::for_each_scoped_item_mut(e, &mut |item| {
+        if let crate::ccl::scope::ScopedItemMut::Child(c) = item {
+            number(c, loops, definiens, last);
+        }
+    });
+    last[index] = last.len() - 1;
+    if let Some((name, at, value)) = own {
+        definiens.entry(name).or_default().push(Definition {
+            at,
+            value,
+            interval: (index, last[index]),
+        });
+    }
+}
+
+/// Every `letrec` binder in `e`.
+fn letrec_binders(e: &Expr, out: &mut HashSet<Name>) {
+    if let TypedExprNode::LetRec { bindings, .. } = &e.node {
+        out.extend(bindings.iter().map(|(b, _)| b.name.clone()));
+    }
+    e.walk_children(|c| letrec_binders(c, out));
+}
+
+/// Hide, in each type outside the scope of a loop's history or of a value a loop computed
+/// (`loops`), what it states about them, and box each value carrying such a type across the
+/// scope's exit at the hidden type.
+///
+/// No term outside the scope spells a loop's history or what the loop computed from it. A type
+/// there that states it holds an existential instead ([`hidden`]): a collection over a domain
+/// the value refines is a collection over some subset of the domain's base, which only a term
+/// builds (`src/ccl/design/type-inference.md`, "Only a term builds a sum"). Two values carry
+/// such a type out: a `letrec`'s or `let`'s own result, and a value fed to a channel declared
+/// outside the scope. `channels` holds the channels whose handle type changed, by name, with
+/// that handle type: every handle of the channel in its scope is stated at it.
+fn hide_at_loop_exits(
+    e: &mut Expr,
+    scope: &mut Vec<Name>,
+    loops: &HashSet<Name>,
+    channels: &mut HashMap<Name, Type>,
+) {
+    let mut changed = false;
+    e.walk_type_slots_mut(|ty| {
+        if !channels.is_empty() {
+            *ty = handles_restated(ty, channels);
+        }
+        let out_of_scope = |n: &Name| loops.contains(n) && !scope.contains(n);
+        if crate::ccl::subst::type_free_vars(ty)
+            .iter()
+            .any(out_of_scope)
+        {
+            *ty = hidden(ty, &out_of_scope);
+            changed = true;
+        }
+    });
+    let id = e.node_id();
+    if changed
+        && let TypedExprNode::Let { binding, .. } = &e.node
+        && binding.ty.as_feed().is_some()
+    {
+        channels.insert(binding.name.clone(), binding.ty.clone());
+    }
+    let depth = scope.len();
+    crate::ccl::scope::for_each_scoped_item_mut(e, &mut |item| match item {
+        crate::ccl::scope::ScopedItemMut::Scope(names) => {
+            scope.truncate(depth);
+            scope.extend(names.iter().cloned());
+        }
+        crate::ccl::scope::ScopedItemMut::Child(c) => hide_at_loop_exits(c, scope, loops, channels),
+        _ => {}
+    });
+    scope.truncate(depth);
+    let _g = provenance::enter(id, "mut_read.hide_at_loop_exit", Nature::Machinery);
+    let ty = e.ty.clone();
+    match &mut e.node {
+        // The result crosses the exit carrying what the exit hides only where its type reads
+        // one of the binders the node itself binds.
+        TypedExprNode::LetRec { bindings, body } => {
+            let own: Vec<Name> = bindings.iter().map(|(b, _)| b.name.clone()).collect();
+            if reads_any(&body.ty, &own) {
+                box_at(body, ty);
+            }
+        }
+        TypedExprNode::Let { binding, body, .. } if loops.contains(&binding.name) => {
+            if reads_any(&body.ty, std::slice::from_ref(&binding.name)) {
+                box_at(body, ty);
+            }
+        }
+        TypedExprNode::Feed { name, value } => {
+            if let Some((_, row)) = channels.get(name).and_then(Type::as_feed)
+                && value.ty != *row
+            {
+                box_at(value, row.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether `ty` reads any of `names`.
+fn reads_any(ty: &Type, names: &[Name]) -> bool {
+    let free = crate::ccl::subst::type_free_vars(ty);
+    names.iter().any(|n| free.contains(n))
+}
+
+/// `ty` with each handle of a channel `channels` holds stated at the handle type it holds.
+fn handles_restated(ty: &Type, channels: &HashMap<Name, Type>) -> Type {
+    if let Some((Type::ChanDom(name, _), _)) = ty.as_feed()
+        && let Some(handle) = channels.get(name)
+    {
+        return handle.clone();
+    }
+    let mut out = ty.clone();
+    out.walk_children_mut(|c| *c = handles_restated(c, channels));
+    out
+}
+
+/// `value` introduced at the sum `target`, the type a value it computes is seen at past the loop
+/// that computes it ([`hide_at_loop_exits`]).
+///
+/// # Panics
+///
+/// Where `target` is not a sum: a loop's value held inside a product or a row crosses the exit
+/// only as a whole collection here.
+fn box_at(value: &mut Expr, target: Type) {
+    assert!(
+        target.peel_refinements().sum().is_some(),
+        "a value crossing a loop's exit holds a collection over a domain the loop determines \
+         other than as the value itself, which is not supported: {} at {target}",
+        value.ty
+    );
+    crate::ccl::mut_elim::view_at(value, target);
+}
+
+/// `ty` as a value of it is seen outside the scope of the binders `out_of_scope` reports: a
+/// collection whose domain a refinement reading one narrows is a collection over some subset
+/// of the domain's base, `Σ (𝐷 : SubtypesOf(base)). 𝐷 ⤇ 𝑉`, and a fact about a value reading one
+/// is dropped.
+fn hidden(ty: &Type, out_of_scope: &dyn Fn(&Name) -> bool) -> Type {
+    let reads = |r: &crate::ccl::Refinement| {
+        crate::ccl::subst::refinement_free_vars(r)
+            .iter()
+            .any(out_of_scope)
+    };
+    let kept = |rs: &crate::ccl::RefinementSet| -> crate::ccl::RefinementSet {
+        rs.iter().filter(|r| !reads(r)).cloned().collect()
+    };
+    match ty {
+        Type::Fun {
+            name,
+            fun_kind,
+            domain,
+            codomain,
+        } if fun_kind.resolved().is_data()
+            && matches!(&**domain, Type::Refinement(_, rs) if rs.iter().any(reads)) =>
+        {
+            let Type::Refinement(base, rs) = &**domain else {
+                unreachable!("matched a refined domain above")
+            };
+            let base = Type::refined(hidden(base, out_of_scope), kept(rs));
+            Type::sum_over(
+                crate::ccl::ty::TypeKind::SubtypesOf(Box::new(base)),
+                name.clone(),
+                hidden(codomain, out_of_scope),
+            )
+        }
+        Type::Refinement(base, rs) => Type::refined(hidden(base, out_of_scope), kept(rs)),
+        _ => {
+            let mut out = ty.clone();
+            out.walk_children_mut(|c| *c = hidden(c, out_of_scope));
+            out
+        }
+    }
+}
+
+/// [`reveal`] under `e`. `around` holds the intervals of the nodes around `e`, outermost first;
+/// `index` counts the nodes visited, in the order [`number`] numbered them.
+fn reveal_go(
+    e: &mut Expr,
+    scope: &mut Vec<Name>,
+    around: &mut Vec<(usize, usize)>,
+    index: &mut usize,
+    last: &[usize],
+    everywhere: &std::collections::BTreeSet<Name>,
+    definiens: &Definiens,
+) {
+    let here = (*index, last[*index]);
+    *index += 1;
+    around.push(here);
+    // The `let` a type lifted past: inside the nearest node around it holding one for `n`.
+    let lifted_past = |n: &Name| -> Option<&Definition> {
+        let candidates = definiens.get(n)?;
+        around.iter().rev().find_map(|&(from, to)| {
+            let mut inside = candidates
+                .iter()
+                .filter(|d| from <= d.interval.0 && d.interval.0 <= to);
+            let first = inside.next()?;
+            Some(inside.next().is_none().then_some(first))
+        })?
+    };
+    e.walk_type_slots_mut(|ty| {
+        // Each restatement replaces a name by a term written further in, which reads only
+        // names bound around it, so the chain ends at a type naming nothing out of scope.
+        loop {
+            let escaped: Vec<(Name, &Definition)> = crate::ccl::subst::type_free_vars(ty)
+                .into_iter()
+                .filter(|n| !scope.contains(n) && !everywhere.contains(n))
+                .filter_map(|n| lifted_past(&n).map(|d| (n, d)))
+                .collect();
+            if escaped.is_empty() {
+                break;
+            }
+            for (n, d) in escaped {
+                // The terms the restated type quotes are minted for the `let` whose definiens
+                // they copy.
+                let _g = provenance::enter(d.at, "mut_read.reveal", Nature::Machinery);
+                *ty = Subst::discharge(n, d.value.clone_preserving_ids()).apply_type(ty);
+            }
+        }
+    });
+    let depth = scope.len();
+    crate::ccl::scope::for_each_scoped_item_mut(e, &mut |item| match item {
+        crate::ccl::scope::ScopedItemMut::Scope(names) => {
+            scope.truncate(depth);
+            scope.extend(names.iter().cloned());
+        }
+        crate::ccl::scope::ScopedItemMut::Child(c) => {
+            reveal_go(c, scope, around, index, last, everywhere, definiens)
+        }
+        _ => {}
+    });
+    scope.truncate(depth);
+    around.pop();
 }
 
 #[cfg(test)]
