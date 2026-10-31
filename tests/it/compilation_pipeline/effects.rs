@@ -601,3 +601,67 @@ fn a_module_argument_beyond_its_entry_is_refused() {
         "{errors}"
     );
 }
+
+/// A function returning a function that requires or causes something naming a variable the
+/// returning function binds is refused: the returned function would outlive the variable.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_read(
+    indoc! {"
+        def counter(start: Int):
+            c := start
+            \\x -> c + x
+    "},
+    "this returns a function that has `Read(c)`"
+)]
+#[case::through_a_record(
+    indoc! {"
+        def counter(start: Int):
+            c := start
+            (get=\\x -> c + x, n=1)
+    "},
+    "this returns a function that has `Read(c)`"
+)]
+fn a_function_returning_a_closure_over_its_variable_is_refused(
+    #[case] code: &str,
+    #[case] needle: &str,
+) {
+    let errors = super::modules::compile_errors(&program(&format!("{code}\n0\n"), &[]));
+    assert!(errors.contains(needle), "{errors}");
+}
+
+/// A returned function naming only what outlives the returning function, a parameter's
+/// value, is kept.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_parameter(indoc! {"
+    def adder(n: Int):
+        \\x -> x + n
+    f = adder(1)
+    f(2)
+"})]
+fn a_returned_closure_over_what_outlives_it_is_kept(#[case] root: &str) {
+    super::helpers::check_program_scalar(&program(root, &[]), cambra::interpreter::Value::Int(3));
+}
+
+/// A commit inside a `with begin():` block's body is refused, directly or through a call,
+/// including a call of a function a polymorphic definition takes as a parameter, which each
+/// use decides (`docs/chl-spec.md`, "8.2 Transactions: `with begin():`").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::through_a_parameter(indoc! {"
+    stock: Mut(Int, Txn) := 10
+    def taken(n: Int) => Int:
+        with begin():
+            stock := stock - n
+        n
+    def in_txn(f, x: Int):
+        with begin():
+            stock := stock - f(x)
+    in_txn(taken, 1)
+    0
+"})]
+fn a_commit_inside_a_transaction_is_refused(#[case] root: &str) {
+    let errors = super::modules::compile_errors(&program(root, &[]));
+    assert!(errors.contains("transactions do not nest"), "{errors}");
+}

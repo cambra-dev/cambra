@@ -1472,40 +1472,6 @@ fn prepend_effects(effects: Vec<Expr>, rest: Expr) -> Expr {
     })
 }
 
-/// Reject a **nested transaction** reaching a `with begin():` block through a
-/// function call.
-///
-/// Lowering's nested-`with` check is textual — it catches a literal `with`
-/// inside a `with`, but not a by-reference transactional writer
-/// (`def do_it(p: Mut(_, Txn)): with begin(): p -= 1`) *called* inside a block.
-/// After inlining, that callee's own `Begin` lands inside the outer block, where
-/// stripping would fold the inner site incorrectly. Detect it here, on the
-/// inlined tree, *before* [`run`]'s [`strip`] consumes the blocks: a `Begin` may
-/// not contain another `Begin` anywhere in its body.
-pub fn check_no_nested_transactions(
-    expr: &Expr,
-    _txn_stores: &HashSet<Name>,
-) -> Result<(), Located<String>> {
-    if let TypedExprNode::Begin { body } = &expr.node
-        && contains_begin(body)
-    {
-        return Err(Located::new(
-            "nested `with begin():` transactions are not supported: a transactional writer \
-             called inside a `with begin():` block would run its own transaction within the \
-             outer one"
-                .to_string(),
-            expr.node_id(),
-        ));
-    }
-    let mut result = Ok(());
-    expr.walk_children(|c| {
-        if result.is_ok() {
-            result = check_no_nested_transactions(c, _txn_stores);
-        }
-    });
-    result
-}
-
 /// Reject an **induction-only transaction**: a `with begin():` block that writes
 /// an induction accumulator (`Mut(…)`, non-`Txn`) but no transactional mutable variable.
 ///
@@ -1752,8 +1718,7 @@ fn collect_write_targets(expr: &Expr, out: &mut HashSet<Name>) {
 /// awaited mutable variable itself.
 ///
 /// **Why post-inline and not at lowering.** A callee's mention only becomes a read or a
-/// write once inlined, exactly as a callee's `Begin` only becomes a nested transaction
-/// once inlined ([`check_no_nested_transactions`]). It also needs source order, which the
+/// write once inlined. It also needs source order, which the
 /// continuation spine here supplies ([`Expr::walk_children`] visits `bound_expr` before `body`
 /// for every spine node) and lowering's right-to-left statement chain is not.
 pub fn check_await_final_linearity(expr: &Expr) -> Result<(), Located<String>> {

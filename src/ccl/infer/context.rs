@@ -7,8 +7,8 @@ use std::collections::{HashMap, HashSet};
 
 use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::effects::{
-    Blame, Bound as LabelBound, Effect, EffectVar, Effects, Filter, Item, Label, Repr, Requirement,
-    Upper,
+    Blame, Bound as LabelBound, Effect, EffectSet, EffectVar, Effects, Filter, Item, Label, Repr,
+    Requirement, Upper,
 };
 use crate::ccl::infer::solver::barrier::EdgeReport;
 use crate::ccl::infer::solver::display::poly_for_display;
@@ -236,6 +236,10 @@ pub(super) struct InferCtx {
     /// the obligation that decides which instance's, or which requirement's in scope, it is
     /// ([`InferCtx::settle_effect_links`]).
     effect_links: Vec<EffectLink>,
+    /// Each function body's result type, the depth of the body, and its lambda: a function
+    /// the body returns may name no variable the body binds
+    /// ([`InferCtx::escaping_results`]).
+    results: Vec<(Type, u32, NodeId)>,
     /// The generalized bindings whose schemes a module check reports, and the
     /// scheme each was bound at, written as an annotation would state it
     /// ([`Typing::note_scheme`]).
@@ -535,6 +539,7 @@ impl InferCtx {
             opened_clause_params: HashMap::new(),
             instance_effects: Default::default(),
             effect_links: Vec::new(),
+            results: Vec::new(),
             reported: HashSet::new(),
             public: HashSet::new(),
             schemes_noted: Vec::new(),
@@ -572,7 +577,7 @@ impl InferCtx {
 
     /// What the module's top level requires and causes, less what its scopes discharge
     /// (`docs/chl-spec.md`, "Shareable modules [Decided]").
-    pub(super) fn top_level_effects(&self) -> crate::ccl::effects::EffectSet {
+    pub(super) fn top_level_effects(&self) -> EffectSet {
         crate::ccl::effects::set_of(&self.effect_frames[0].var.resolved())
     }
 
@@ -656,6 +661,44 @@ impl InferCtx {
             }
         }
         out
+    }
+
+    /// An error at each function body whose result is a function requiring or causing
+    /// something naming a variable the body binds, which the function would outlive
+    /// (`docs/chl-spec.md`, "Discharging requirements and effects").
+    pub(super) fn escaping_results(&self) -> Vec<LocatedInferError> {
+        fn beyond(ty: &Type, depth: u32) -> Option<Label> {
+            if let Type::Fun { effects, .. } = ty
+                && let Repr::Var(v) = effects.repr()
+                && let Some(label) = v
+                    .resolved()
+                    .into_iter()
+                    .find(|l| matches!(l.bound, LabelBound::At(at) if at >= depth))
+            {
+                return Some(label);
+            }
+            let mut found = None;
+            ty.walk_children(|child| {
+                if found.is_none() {
+                    found = beyond(child, depth);
+                }
+            });
+            found
+        }
+        self.results
+            .iter()
+            .filter_map(|(ty, depth, node)| {
+                let label = beyond(ty, *depth)?;
+                Some(LocatedInferError {
+                    error: InferError::EscapesItsVariable {
+                        item: label.item.to_string(),
+                    },
+                    node_id: *node,
+                    also: Box::default(),
+                    related: crate::ccl::infer::api::RelatedPositions::default(),
+                })
+            })
+            .collect()
     }
 
     /// An error at each `def` whose bounded `requires` clause a trait requirement inference
@@ -745,7 +788,7 @@ impl InferCtx {
     }
 
     /// The effect variable each parameter `set` names opened to.
-    fn clause_param_vars(&self, set: &crate::ccl::effects::EffectSet) -> Vec<Rc<EffectVar>> {
+    fn clause_param_vars(&self, set: &EffectSet) -> Vec<Rc<EffectVar>> {
         set.params
             .iter()
             .map(|p| {
@@ -969,6 +1012,7 @@ impl InferCtx {
             set,
             of_requires: !open_requires,
             of_causes: !open_causes,
+            forbidden: std::collections::BTreeSet::new(),
             blame,
         });
     }
@@ -2453,6 +2497,11 @@ impl Typing for InferCtx {
         });
     }
 
+    fn note_result(&mut self, ty: &Type) {
+        let depth = self.effect_frame().depth + 1;
+        self.results.push((ty.clone(), depth, self.current_node_id));
+    }
+
     fn pending_effect_links(&self) -> usize {
         self.pending_links()
     }
@@ -2555,15 +2604,38 @@ impl Typing for InferCtx {
     }
 
     fn transaction_body<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
-        self.effect_frames
-            .last_mut()
-            .expect("the top level's frame stays open through emission")
-            .transactions += 1;
+        // The body collects on a variable of its own, which no commit may reach, directly or
+        // through a call: transactions do not nest (`docs/chl-spec.md`, "8.2 Transactions:
+        // `with begin():`"). The bound is copied with the variable at each instantiation, so
+        // a call through a polymorphic definition's parameter is checked at each use.
+        let node = self.current_node_id;
+        let outer = self.effect_frame();
+        let frame = EffectFrame {
+            var: EffectVar::fresh(self.level),
+            depth: outer.depth,
+            keeps_own: true,
+            transactions: outer.transactions + 1,
+        };
+        let var = Rc::clone(&frame.var);
+        var.bound_above(Upper {
+            set: EffectSet::default(),
+            of_requires: false,
+            of_causes: false,
+            forbidden: [Effect::Commit].into_iter().collect(),
+            blame: Blame::NestedTransaction(node),
+        });
+        self.effect_frames.push(frame);
         let r = f(self);
-        self.effect_frames
-            .last_mut()
-            .expect("the top level's frame stays open through emission")
-            .transactions -= 1;
+        self.effect_frames.pop();
+        let outer = self.effect_frame();
+        outer.var.flows_from(
+            &var,
+            Filter {
+                discharges: [Requirement::transaction()].into_iter().collect(),
+                at: Some(node),
+                ..outer.filter()
+            },
+        );
         r
     }
 

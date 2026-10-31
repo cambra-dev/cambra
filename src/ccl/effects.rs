@@ -408,12 +408,20 @@ pub struct Upper {
     /// `only` on one clause and leave the other a lower bound.
     pub of_requires: bool,
     pub of_causes: bool,
+    /// Effects the variable may not hold whatever else the bound admits: `Commit` inside a
+    /// `with begin():` body.
+    pub forbidden: BTreeSet<Effect>,
     pub blame: Blame,
 }
 
 impl Upper {
     /// Whether `item` is within this bound.
     pub fn admits(&self, item: &Item) -> bool {
+        if let Item::Causes(e) = item
+            && self.forbidden.contains(e)
+        {
+            return false;
+        }
         let of_causes = match item {
             Item::Requires(_) => false,
             Item::Causes(_) => true,
@@ -430,12 +438,14 @@ impl Upper {
 
 /// Where a failed [`Upper`] is written. The first label beyond it is reported at the node
 /// where it entered the variable, with this as the secondary label.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Blame {
     /// A `def`'s `only` clause.
     Clause(chl_parser::ast::Span),
     /// The trait's signature bounding an instance's function.
     Signature(chl_parser::ast::Span),
+    /// A `with begin():` block, at its node, whose body may not commit.
+    NestedTransaction(NodeId),
     /// A written function type, whose clauses are exact.
     Written(chl_parser::ast::Span),
 }
@@ -511,6 +521,7 @@ impl EffectVar {
             u.set == upper.set
                 && u.of_requires == upper.of_requires
                 && u.of_causes == upper.of_causes
+                && u.forbidden == upper.forbidden
         }) {
             return;
         }

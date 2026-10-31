@@ -613,11 +613,26 @@ pub(crate) fn run(
 fn push_effect_failures(errors: &mut Vec<LocatedInferError>, expr: &Expr) {
     use crate::ccl::effects::Blame;
     use crate::ccl::infer_var::Origin;
+    // Each use of a polymorphic definition checks its own copy of the definition's bounds,
+    // and the copies name the definition's nodes, so one failure is reported once.
+    let mut reported = HashSet::new();
     for failure in crate::ccl::effects::exceeded_uppers() {
         let item = failure.label.item.to_string();
+        if !reported.insert((failure.label.at, item.clone(), failure.blame)) {
+            continue;
+        }
         let (error, written) = match failure.blame {
             Blame::Clause(at) => (InferError::EffectBeyondClause { item }, at),
             Blame::Signature(at) => (InferError::EffectBeyondSignature { item }, at),
+            Blame::NestedTransaction(_) => {
+                errors.push(LocatedInferError {
+                    error: InferError::NestedTransaction,
+                    node_id: failure.label.at.unwrap_or_else(|| expr.node_id()),
+                    also: Box::default(),
+                    related: RelatedPositions::default(),
+                });
+                continue;
+            }
             Blame::Written(at) => (InferError::EffectNotStated { item }, at),
         };
         errors.push(
@@ -708,6 +723,7 @@ pub(crate) fn run_with_params(
     sub_ctx.settle_effect_links();
     push_effect_failures(&mut errors, expr);
     errors.extend(sub_ctx.requirements_beyond_clauses());
+    errors.extend(sub_ctx.escaping_results());
     if !errors.is_empty() {
         return Err(errors);
     }
