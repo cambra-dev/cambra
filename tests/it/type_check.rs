@@ -16,7 +16,7 @@ use std::collections::HashSet;
 use std::{cell::RefCell, rc::Rc};
 
 use cambra::ccl::{
-    Expr, FieldKey, HistoryKind, Lit, PredicateId, Type, TypeKind, TypedExprNode,
+    Expr, FieldKey, HistoryKind, Lit, PredicateId, Type, TypeKind, TypedExprNode, anf,
     ccl_utils::walk_refined_predicates,
     comprehension,
     infer::{
@@ -24,7 +24,7 @@ use cambra::ccl::{
         lit_singleton,
     },
     lower::{LoweringContext, lower_stmts},
-    opaque_output, uniquify,
+    mut_read, opaque_output, uniquify,
 };
 use cambra::chl_parser::{self, ast as chl_ast};
 use cambra::interpreter::{BaseType, Extent, TestDataSource};
@@ -40,6 +40,47 @@ fn candidates_of(type_kind: &TypeKind) -> Option<Vec<Type>> {
         TypeKind::Enumerated(ds) => Some(ds.clone()),
         _ => None,
     }
+}
+
+/// The kinds of the witnesses a comprehension over sums is keyed by, one per index position.
+/// Its result is a plain collection whose domain is each source's witness, `σ₁(source)`
+/// (`docs/chl-spec.md`, "7.4 `box`"), and each projected binder says what its witness ranges
+/// over.
+fn projected_kinds(ty: &Type) -> Vec<TypeKind> {
+    assert!(
+        ty.sum().is_none(),
+        "a comprehension over a sum is plain, got {ty}"
+    );
+    let Type::Fun { domain, .. } = ty.peel_refinements() else {
+        panic!("a comprehension is a collection, got {ty}")
+    };
+    let positions = match domain.peel_refinements() {
+        Type::Tuple(ts) => ts.clone(),
+        d => vec![d.clone()],
+    };
+    positions
+        .iter()
+        .map(|d| match d.peel_refinements() {
+            Type::WitnessProjection(p) => p
+                .witness()
+                .unwrap_or_else(|| panic!("the projected term is a sum, got {ty}"))
+                .type_kind(),
+            _ => panic!("keyed by its sources' witnesses, got {ty}"),
+        })
+        .collect()
+}
+
+/// The candidates of the one witness a comprehension over one conditional is keyed by.
+fn projected_candidates(ty: &Type) -> Vec<Type> {
+    let [kind] = &projected_kinds(ty)[..] else {
+        panic!("one source, got {ty}")
+    };
+    candidates_of(kind).unwrap_or_else(|| panic!("an enumerated witness, got {ty}"))
+}
+
+/// `[0, n - 1]` for each `n`: the domains of the arms the tests box.
+fn ranges(lengths: &[u64]) -> Vec<Type> {
+    lengths.iter().map(|n| Type::UIntRange(*n)).collect()
 }
 
 #[test]
@@ -73,8 +114,11 @@ fn arm_dependent_filter_result_panics_when_recording_an_escaping_bound() {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Lower `stmts`, α-uniquify, lower comprehensions, and bind opaque outputs — the
-/// pipeline's prefix to `infer`, in `ccl::context`'s order.
+/// Lower `stmts`, α-uniquify, A-normalize, name mutable reads, lower comprehensions, and
+/// bind opaque outputs — the pipeline's prefix to `infer`, in `ccl::context`'s order.
+///
+/// A-normalization binds a comprehension's sources ahead of it, which its domain needs: the
+/// domain is the sources' projections, standing outside the comprehension's lambda.
 ///
 /// `opaque_output::run` is what drops a lambda body's opaque binders from the
 /// lambda's codomain, so a harness without it infers codomains that name binders
@@ -91,7 +135,8 @@ fn lower_uniquified(module: &chl_ast::Module, lctx: &mut LoweringContext) -> Exp
     let expr = lower_stmts(module, lctx)
         .into_result()
         .expect("lowering failed");
-    opaque_output::run(comprehension::run(uniquify::run(expr), lctx.shared_holes()))
+    let expr = mut_read::run(anf::run(uniquify::run(expr)));
+    opaque_output::run(comprehension::run(expr, lctx.shared_holes()))
 }
 
 /// Parse Python module code, lower to CCL, run type inference, and return the
@@ -1563,12 +1608,8 @@ fn conditional_collection_into_a_udf_param() {
             "the filtered arms survive: {program}"
         );
     }
-    // `List` still excludes a refined arm, and now only for the intended reason — a refined
-    // range is not a `UIntRange`, so it cannot supply the length witness a `List` ranges over.
-    assert!(
-        !infer_program_err(&format!("def f(c: List(Int)):\n    sum(c)\nf({filtered})")).is_empty(),
-        "a filtered collection is not a `List`"
-    );
+    // A filtered arm reaching a `List` parameter is pinned in `sums.rs`
+    // (`a_filtered_arm_reaching_a_list_parameter_is_not_refused_in_inference`).
 }
 
 #[test]
@@ -1584,14 +1625,12 @@ fn test_collection_uniform_consumers_accepted() {
         infer_program("def f(c: Collection(Int)):\n    c\nf").to_string(),
         "(Σ (σ : Type). (σ ⤇ Int) ⇒ Σ (σ : Type). (σ ⤇ Int))"
     );
-    // A comprehension over a `Collection` maps it (domain-preserving), so the witness
-    // survives into the result — the annotation's own, since an exact annotation binds
-    // the parameter at the type written and the caller's one-candidate kind never
-    // reaches the domain.
+    // A comprehension over a `Collection` is keyed by its witness, `σ₁(c)`, which the call
+    // discharges to the argument's: one candidate.
     assert_eq!(
         infer_program("def f(c: Collection(Int)):\n    [x + 1 for x in c]\nf(box([1,2,3]))")
             .to_string(),
-        "Σ (σ : Type). (σ ⤇ Int)"
+        "(0..3 ⤇ Int)"
     );
 }
 
@@ -1599,18 +1638,17 @@ fn test_collection_uniform_consumers_accepted() {
 // only difference. Nothing leaks: elimination names the consumed sum's witness and the
 // close re-binds it, so no free witness escapes into a consumer's result.
 #[test]
-fn test_list_map_reseals_to_list() {
+fn test_list_map_is_keyed_by_its_argument() {
     // Identity round-trips the sum (compaction re-pairs the opened domain).
     assert_eq!(
         infer_program("def f(c: List(Int)):\n    c\nf").to_string(),
         "(Σ (σ : UIntRanges). (σ ⤇ Int) ⇒ Σ (σ : UIntRanges). (σ ⤇ Int))"
     );
-    // `map` (domain-preserving) preserves the parameter's witness, which an exact
-    // annotation fixes at the `List` kind — the caller's one-candidate kind never reaches
-    // the domain.
+    // `map` (domain-preserving) is keyed by the parameter's witness, `σ₁(c)`, which the call
+    // discharges to the argument's: one candidate.
     assert_eq!(
         infer_program("def f(c: List(Int)):\n    [x + 1 for x in c]\nf(box([1,2,3]))").to_string(),
-        "Σ (σ : UIntRanges). (σ ⤇ Int)"
+        "(0..3 ⤇ Int)"
     );
     // `sum` (collapsing) → the scalar element type; the domain collapses away.
     assert_eq!(
@@ -1759,9 +1797,10 @@ fn a_bare_key_lookup_on_a_groupby_is_refused() {
     }
 }
 
-/// Consuming this boxed Map annotation fails inference: the reported domains name
-/// `__iter_record` and `__box_k` instead of reconciling the dependent key.
-/// The FullMap counterpart runs in `a_keyed_annotation_compiles_and_runs`.
+/// Consuming this boxed Map annotation fails inference: the dependent key is spelled by
+/// `box`'s binder `__box_k` on one side and by the consumer's binder on the other, and the
+/// two domains collide instead of reconciling. The FullMap counterpart runs in
+/// `a_keyed_annotation_compiles_and_runs`.
 #[test]
 fn a_consumed_boxed_map_annotation_escapes_its_scope() {
     let errs = infer_program_err(indoc! {r#"
@@ -1769,9 +1808,9 @@ fn a_consumed_boxed_map_annotation_escapes_its_scope() {
         sum([sum(v) for v in g])
     "#});
     assert!(
-        errs.iter()
-            .map(|e| format!("{e:?}"))
-            .any(|m| m.contains("__iter_record") && m.contains("__box_k")),
+        errs.iter().map(|e| format!("{e:?}")).any(|m| m
+            .contains("collection domains have no common answer")
+            && m.contains("__box_k")),
         "expected the two spellings of the key domain to collide, got {errs:?}"
     );
 }
@@ -2043,15 +2082,6 @@ f(box([1,2]),box([3,4,5]))"
 /// result is a `List`, not a function over an unresolved domain.
 #[test]
 fn list_param_under_a_domain_preserving_consumer() {
-    assert_eq!(
-        infer_program(
-            r"
-def f(a: List(Int)):
-    [x + 1 for x in a]
-sum(f(box([1,2])))"
-        ),
-        int()
-    );
     // Two consumers of one `List` param — a uniform one and a domain-preserving
     // one — so the annotation's kind meets two separate demands.
     assert_eq!(
@@ -2062,6 +2092,21 @@ def f(a: List(Int)):
 f(box([1,2]))"
         ),
         int()
+    );
+}
+
+/// The domain-preserving consumer alone: the comprehension over the parameter, bound ahead by
+/// A-normalization, is read through `unbox`, and the projection `σ₁(__anf)` its result is keyed
+/// by lands on a variable whose telescope does not hold the temp. Pinned on the panic it
+/// reaches; the program answers 5.
+#[test]
+#[should_panic(expected = "open bound recorded")]
+fn list_param_under_a_domain_preserving_consumer_alone() {
+    infer_program(
+        r"
+def f(a: List(Int)):
+    [x + 1 for x in a]
+sum(f(box([1,2])))",
     );
 }
 
@@ -2317,9 +2362,8 @@ fn test_source_list_comp_element_type() {
 /// predicate on a shape, not a subtype constraint. When the injecting collection is
 /// *computed* (a comprehension), its domain is an inference variable at emit time and
 /// has no shape to read, so the requirement is recorded as a **kinding constraint** on
-/// that variable and discharged when its position resolves. See
-/// `src/ccl/design/type-inference.md`, "An unresolved candidate becomes a kinding
-/// edge".
+/// that variable and decided where its position materializes. See
+/// `src/ccl/design/type-inference.md`, "Membership is decided at materialization".
 #[test]
 fn test_comprehension_enters_a_list_annotation() {
     // The comprehension's domain resolves to `0..3` — a range — which realizes
@@ -3633,7 +3677,7 @@ f({c})"
 #[test]
 fn domain_preserving_consumption_of_a_conditional_collection() {
     let c = "box([1, 2]) if True else box([1, 2, 3])";
-    let sum = "Σ (σ : [0..2, 0..3]). (σ ⤇ Int)";
+
     for program in [
         // Directly over the `Case`.
         format!("[y + 1 for y in {c}]"),
@@ -3660,9 +3704,9 @@ f(x)"
         ),
     ] {
         assert_eq!(
-            infer_program(&program).to_string(),
-            sum,
-            "domain-preserving consumption must preserve the sum: {program}"
+            projected_candidates(&infer_program(&program)),
+            ranges(&[2, 3]),
+            "domain-preserving consumption is keyed by the sum's witness: {program}"
         );
     }
 }
@@ -4578,7 +4622,6 @@ fn a_result_refinement_over_the_parameter_is_well_scoped() {
 /// come first: their candidates are bare variables with no refinement at all.
 #[test]
 fn an_arm_whose_domain_is_inferred_joins_like_a_written_one() {
-    let sum = "Σ (σ : [0..2, 0..3]). (σ ⤇ Int)";
     for arms in [
         // Written domains.
         "box([1, 2]) if True else box([1, 2, 3])",
@@ -4601,8 +4644,8 @@ f({arms})"
             ),
         ] {
             assert_eq!(
-                infer_program(&shape).to_string(),
-                sum,
+                projected_candidates(&infer_program(&shape)),
+                ranges(&[2, 3]),
                 "an inferred arm domain must resolve, not survive as a variable: {shape}"
             );
         }
@@ -4613,11 +4656,7 @@ f({arms})"
 x = box([q for q in [1, 2, 3] if q > 1]) if True else box([1, 2])
 [y + 1 for y in x]";
     let ty = infer_program(filtered);
-    let Some([w]) = ty.sum() else {
-        panic!("expected a sum, got {ty}");
-    };
-    let kind = w.type_kind();
-    let candidates = candidates_of(&kind).expect("an enumerated kind lists its domains");
+    let candidates = projected_candidates(&ty);
     assert_eq!(candidates.len(), 2, "expected both arms, got {ty}");
     assert!(
         candidates
@@ -4631,12 +4670,11 @@ x = box([q for q in [1, 2, 3] if q > 1]) if True else box([1, 2])
     );
     // Nested conditionals over inferred domains flatten the same way.
     assert_eq!(
-        infer_program(
+        projected_candidates(&infer_program(
             "d = 4 > 3\nx = box([q + 1 for q in [1, 2]]) if True else (box([1, 2, 3]) if d else box([1, 2, 3, 4]))\n\
              [y + 1 for y in x]"
-        )
-        .to_string(),
-        "Σ (σ : [0..2, 0..3, 0..4]). (σ ⤇ Int)"
+        )),
+        ranges(&[2, 3, 4])
     );
 }
 
@@ -4655,8 +4693,8 @@ fn a_udf_call_arm_joins_through_the_bound_graph() {
     let program = "def g(n):\n    [1,2]\ndef h(n):\n    [1,2,3]\n\
                    x = box(g(0)) if True else box(h(0))\n[y + 1 for y in x]";
     assert_eq!(
-        infer_program(program).to_string(),
-        "Σ (σ : [0..2, 0..3]). (σ ⤇ Int)",
+        projected_candidates(&infer_program(program)),
+        ranges(&[2, 3]),
         "a call-shaped arm reaches the join transitively, like any other lower bound"
     );
 }
@@ -4679,14 +4717,13 @@ fn a_lambda_param_use_falls_back_to_the_param_slot() {
     // The collection case: without the fallback this is `Conflicting Types: 0..2 | 0..3`
     // at the `__iter_record` use inside the comprehension.
     assert_eq!(
-        infer_program(
+        projected_candidates(&infer_program(
             r"
 def f(c):
     [y + 1 for y in c]
 f(box([1,2]) if True else box([1,2,3]))"
-        )
-        .to_string(),
-        "Σ (σ : [0..2, 0..3]). (σ ⤇ Int)"
+        )),
+        ranges(&[2, 3])
     );
     // And the standalone read stays load-bearing: a projection's domain is recovered from a
     // record-typed parameter's uses, so those reads must still resolve.
@@ -4726,10 +4763,10 @@ x = box([1, 2]) if c else box([1, 2, 3])
     assert_eq!(infer_program(&format!("{c}min(x)")), int());
     // The binding alone is what the `box`es built.
     assert_eq!(infer_program(&format!("{c}x")).to_string(), sum);
-    // A domain-preserving consumer agrees on the sum.
+    // A domain-preserving consumer is keyed by the witness the sum's value carries.
     assert_eq!(
-        infer_program(&format!("{c}[y + 1 for y in x]")).to_string(),
-        sum
+        projected_candidates(&infer_program(&format!("{c}[y + 1 for y in x]"))),
+        ranges(&[2, 3])
     );
     // Equal-length arms need no `box` at all: their join is an ordinary data function,
     // so nothing is lost and there is no sum to introduce. This is the control for every
@@ -4746,12 +4783,11 @@ x = [1, 2] if c else [3, 4]
     );
     // Nothing about the join is arity-two.
     assert_eq!(
-        infer_program(
+        projected_candidates(&infer_program(
             "c = 3 > 2\nd = 4 > 3\nx = box([1, 2]) if c else (box([1, 2, 3]) if d else box([1, 2, 3, 4]))\n\
              [y + 1 for y in x]"
-        )
-        .to_string(),
-        "Σ (σ : [0..2, 0..3, 0..4]). (σ ⤇ Int)"
+        )),
+        ranges(&[2, 3, 4])
     );
     // A filtered comprehension is domain-preserving too, and its restriction rides the
     // **witness**: the filter is a fact about the domain the witness names, whichever
@@ -4764,19 +4800,16 @@ x = [1, 2] if c else [3, 4]
     // discharged. A single candidate can carry both at once, so comparing candidates
     // cannot recover the distinction either. On the witness it is structural.
     let filtered = infer_program(&format!("{c}[y for y in x if y > 1]"));
-    let Some([w]) = filtered.sum() else {
-        panic!("a filtered conditional collection is still a sum, got {filtered}");
-    };
     assert_eq!(
-        candidates_of(&w.type_kind()).expect("an enumerated kind lists its domains"),
-        [Type::UIntRange(2), Type::UIntRange(3)],
+        projected_candidates(&filtered),
+        ranges(&[2, 3]),
         "the candidates carry no restriction, got {filtered}"
     );
     let Some(domain) = filtered.domain() else {
-        panic!("a consumed collection sum has a data-function body, got {filtered}");
+        panic!("a filtered collection has a domain, got {filtered}");
     };
     assert!(
-        matches!(&domain, Type::Refinement(b, _) if matches!(**b, Type::WitnessRef(_))),
+        matches!(&domain, Type::Refinement(b, _) if matches!(**b, Type::WitnessProjection(_))),
         "the restriction rides the witness, got {filtered}"
     );
     // And a collapsing consumer wrapping a domain-preserving one collapses the sum.
@@ -4800,16 +4833,15 @@ def f(a, b, d):
         infer_program(&format!("{f}f(True, box([1,2]), box([1,2,3]))")).to_string(),
         "Σ (σ : [0..2, 0..3]). (σ ⤇ Int)"
     );
-    // And a domain-preserving consumer carries it, exactly as it carries a directly-bound
-    // one, because the consumer names the witness rather than handing over a named domain (`src/ccl/design/type-inference.md`, "Consuming a sum: pinning the consumer's kind").
+    // And a domain-preserving consumer is keyed by its witness, exactly as over a
+    // directly-bound one.
     assert_eq!(
-        infer_program(&format!(
+        projected_candidates(&infer_program(&format!(
             r"
 {f}x = f(True, box([1,2]), box([1,2,3]))
 [y + 1 for y in x]"
-        ))
-        .to_string(),
-        "Σ (σ : [0..2, 0..3]). (σ ⤇ Int)"
+        ))),
+        ranges(&[2, 3])
     );
 }
 
@@ -4857,11 +4889,10 @@ y = f(c, True)
     );
 }
 
-/// **Two witnesses live at once.** A comprehension over two conditional collections opens
-/// both sums while typing one body, so both witnesses are in scope together and the
-/// result's index domain mentions each. This is the case identity exists for: with one
-/// anonymous witness the two would merge into a single position and be silently conflated
-/// (`src/ccl/design/type-inference.md`, "Consuming a sum: pinning the consumer's kind").
+/// **Two witnesses live at once.** A comprehension over two conditional collections is keyed
+/// by both witnesses, `(σ₁(a), σ₁(b))`, so the result's index domain mentions each. This is
+/// the case identity exists for: with one anonymous witness the two would merge into a single
+/// position and be silently conflated.
 ///
 /// Distinct domains on the two sources, deliberately — equal ones would type correctly
 /// even under conflation, so they would not test it.
@@ -4875,44 +4906,25 @@ a = box([1, 2]) if c else box([1, 2, 3])
 b = box([10, 20, 30, 40]) if d else box([10, 20, 30, 40, 50])
 [x + y for x in a for y in b]",
     );
-    // Asserted structurally, not on the rendering. What has to hold is that the index
-    // tuple's two components name the two *binders* — and a rendered type cannot express
-    // binder identity at all (`Display` writes every witness `σ`), so a string assertion
-    // passes just as happily on the distributed `((Σ (𝜎 : 𝐾₁). 𝜎, Σ (𝜎 : 𝐾₂). 𝜎) ⤇ Int)`,
-    // where each index is quantified independently of the collection it indexes.
-    let Some([outer, inner]) = ty.sum() else {
-        panic!("expected one function binding both sources' witnesses, got {ty}")
-    };
+    // Asserted structurally, not on the rendering: the index tuple's two components are
+    // the two sources' witnesses, each ranging over its own source's domains.
     assert_eq!(
-        candidates_of(&outer.type_kind()).as_deref(),
-        Some(&[Type::UIntRange(2), Type::UIntRange(3)][..]),
-        "the first source's candidate domains: {ty}"
-    );
-    assert_eq!(
-        candidates_of(&inner.type_kind()).as_deref(),
-        Some(&[Type::UIntRange(4), Type::UIntRange(5)][..]),
-        "the second source's candidate domains: {ty}"
-    );
-    assert_eq!(
-        ty.domain(),
-        Some(Type::Tuple(vec![
-            Type::WitnessRef(*outer.id()),
-            Type::WitnessRef(*inner.id()),
-        ])),
-        "the index is the pair of the two witnesses, each naming its own binder: {ty}"
+        projected_kinds(&ty)
+            .iter()
+            .map(|k| candidates_of(k).expect("an enumerated witness"))
+            .collect::<Vec<_>>(),
+        [ranges(&[2, 3]), ranges(&[4, 5])],
+        "the index is the pair of the two sources' witnesses: {ty}"
     );
     assert_eq!(ty.codomain(), Some(int()), "element type: {ty}");
 }
 
-/// **A consumer's result is the sum it consumed.** The consuming rule says
-/// `𝑓(𝑒) : Σ (𝑤 : 𝐾). 𝑊` for the same `𝐾` the collection carries, so a comprehension over
-/// a conditional collection and the collection itself are one collection type. The binder
-/// ids are not compared: two derivations of one consumption never share a mint
-/// (`src/ccl/design/type-inference.md`, "A binder is minted where a scope needs one"), and the
-/// kind is the shared content. What the result owes its **own** binder is internal: its
-/// domain names the binder its slot introduces, which is the second assertion.
+/// **A comprehension is keyed by its source's witness.** A comprehension over a sum is a plain
+/// collection over the witness the sum's value carries, `σ₁(x)` (`docs/chl-spec.md`, "7.4
+/// `box`"), so the source and the comprehension range over one set of domains: the projected
+/// binder is the source's.
 #[test]
-fn a_comprehension_carries_its_sources_sum() {
+fn a_comprehension_is_keyed_by_its_sources_witness() {
     let ty = infer_program(
         r"
 c = 3 > 2
@@ -4925,27 +4937,20 @@ x = box([1, 2]) if c else box([1, 2, 3])
     let [src, comp] = &parts[..] else {
         panic!("expected (source, comprehension), got {ty}")
     };
-    let (Some([sw]), Some([cw])) = (src.sum(), comp.sum()) else {
-        panic!("both components are sums, got {ty}")
+    let Some([sw]) = src.sum() else {
+        panic!("the source is a sum, got {ty}")
     };
     assert_eq!(
-        sw.type_kind(),
-        cw.type_kind(),
+        projected_kinds(comp),
+        [sw.type_kind()],
         "the comprehension ranges over its source's candidate domains: {ty}"
-    );
-    assert_eq!(
-        comp.domain(),
-        Some(Type::WitnessRef(*cw.id())),
-        "and its domain names its own binder: {ty}"
     );
 }
 
-/// **One collection consumed twice is one collection.** Both comprehensions range over
-/// whichever domain the same conditional took, so they carry one collection type — the
-/// sharing half of witness identity, where
-/// `two_conditional_sources_keep_their_witnesses_apart` covers the separating half. The
-/// binder ids are not compared: each consumer's kind variable mints its own meeting, and
-/// the kind is the shared content.
+/// **One collection consumed twice is one collection.** Both comprehensions are keyed by
+/// the one witness the conditional's value carries, `σ₁(x)`, so they carry one collection
+/// type: the sharing half of witness identity, where
+/// `two_conditional_sources_keep_their_witnesses_apart` covers the separating half.
 #[test]
 fn one_collection_consumed_twice_is_one_collection() {
     let ty = infer_program(
@@ -4960,18 +4965,14 @@ x = box([1, 2]) if c else box([1, 2, 3])
     let [a, b] = &parts[..] else {
         panic!("both components are conditional collections, got {ty}")
     };
-    let (Some([aw]), Some([bw])) = (a.sum(), b.sum()) else {
-        panic!("both components are conditional collections, got {ty}")
-    };
     assert_eq!(
-        aw.type_kind(),
-        bw.type_kind(),
+        a, b,
         "two consumers of one collection carry one collection type: {ty}"
     );
     assert_eq!(
-        aw.type_kind(),
-        bw.type_kind(),
-        "and range over the same domains: {ty}"
+        projected_candidates(a),
+        ranges(&[2, 3]),
+        "and range over its domains: {ty}"
     );
 }
 
@@ -5048,26 +5049,8 @@ f({c})"
         )),
         int()
     );
-    // A **filtered** arm is rejected, and now for the *intended* reason: its candidate
-    // keeps its refinement through the join, and a refined range is not a `UIntRange`, so
-    // it fails `List` membership (the rule itself is pinned by
-    // `containment_in_a_description_is_membership_of_every_candidate`, in `src/ccl/ty.rs`).
-    // Before a data-function join kept
-    // its candidates, this was rejected earlier and for the wrong reason — the refinement
-    // floated free of the position and the kinds came out unrelated before membership was
-    // ever asked.
-    let filtered = "box([x for x in [1, 2, 3] if x > 1]) if True else box([1, 2])";
-    assert!(
-        !infer_program_err(&format!(
-            r"
-def f(c: List(Int)):
-    sum(c)
-f({filtered})"
-        ))
-        .is_empty(),
-        "a filtered collection is not a `List` — it cannot supply a length witness for a \
-         domain with holes"
-    );
+    // A filtered arm, which is not a `List`, is pinned in `sums.rs`
+    // (`a_filtered_arm_reaching_a_list_parameter_is_not_refused_in_inference`).
 }
 
 /// A refinement belongs to **one candidate**, not to the sum: put the same refinement
@@ -5119,8 +5102,7 @@ fn a_refinement_belongs_to_one_candidate_not_the_sum() {
 /// The regression this guards is silent *acceptance*. If instantiation dropped the
 /// constraint, it would survive only on the scheme's own variable — which nothing
 /// resolves — and every call site would type-check regardless of its source. See
-/// `src/ccl/design/type-inference.md`, "An unresolved candidate becomes a kinding
-/// edge".
+/// `src/ccl/design/type-inference.md`, "Membership is decided at materialization".
 #[test]
 fn test_kinding_constraint_survives_instantiation() {
     let def = r"
@@ -5225,16 +5207,15 @@ box(xs) if c else xs"
 // rather than representation, so they survive the carrier changing underneath them —
 // which is the point.
 
-/// A domain-preserving consumer over an abstract collection gives back an abstract
-/// collection, not a concrete one: the consumer carries the sum into its own result
-/// domain rather than resolving it, and the close re-binds it there.
+/// A comprehension over an abstract-collection parameter is keyed by the argument, and the
+/// parameter returned unconsumed keeps the annotation's type.
 ///
-/// Both routes give the annotation's own type back, because an **exact** parameter
-/// annotation is what the parameter is bound at — the caller's `0..3` never reaches
-/// the domain. A change that silently resolved either result to a concrete
-/// `0..3 ⤇ Int` is exactly the regression this pins.
+/// The comprehension reads its source through `unbox`, so its result is a plain collection
+/// over `σ₁(a)`, and the call discharges `a` to the argument, whose sum is over the one
+/// candidate `0..3`. The parameter itself is bound at its **exact** annotation, which the
+/// caller's `0..3` does not reach.
 #[test]
-fn a_comprehension_over_a_list_param_stays_abstract() {
+fn a_comprehension_over_a_list_param_is_keyed_by_the_argument() {
     assert_eq!(
         infer_program(
             r"
@@ -5243,7 +5224,7 @@ def f(a: List(Int)):
 f(box([1, 2, 3]))"
         )
         .to_string(),
-        "Σ (σ : UIntRanges). (σ ⤇ Int)"
+        "(0..3 ⤇ Int)"
     );
     assert_eq!(
         infer_program(
@@ -5417,23 +5398,13 @@ x = a if c else box([1, 2, 3])
 y = a if d else box([1, 2, 3, 4, 5])
 [p + q for p in x for q in y]",
     );
-    // Two sources, two witnesses on one function, each over its own candidates.
-    let Some([outer, inner]) = ty.sum() else {
-        panic!("expected one function binding both sources' witnesses, got {ty}")
-    };
+    // Two sources, two witnesses, each over its own candidates.
     assert_eq!(
-        candidates_of(&outer.type_kind()).as_deref(),
-        Some(&[Type::UIntRange(2), Type::UIntRange(3)][..]),
-        "the first source's candidate domains: {ty}"
-    );
-    assert_eq!(
-        candidates_of(&inner.type_kind()).as_deref(),
-        Some(&[Type::UIntRange(2), Type::UIntRange(5)][..]),
-        "the second source's candidate domains: {ty}"
-    );
-    assert_ne!(
-        outer.id(),
-        inner.id(),
+        projected_kinds(&ty)
+            .iter()
+            .map(|k| candidates_of(k).expect("an enumerated witness"))
+            .collect::<Vec<_>>(),
+        [ranges(&[2, 3]), ranges(&[2, 5])],
         "the two joins keep their witnesses apart: {ty}"
     );
 }

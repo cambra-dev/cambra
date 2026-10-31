@@ -225,6 +225,13 @@ pub fn temp_respelling(expr: &Expr) -> Subst {
             && binding.transparency == BindingTransparency::Transparent
         {
             let mut definition = Subst::discharge_env_in_place((**bound_expr).clone(), env);
+            // A loop source's `elements` call over a structural collection is the collection,
+            // as coalescing reads it.
+            if let Some(collection) =
+                crate::ccl::infer::solve::elements_of_a_collection(&mut definition)
+            {
+                definition = collection;
+            }
             // An inference error leaves the tree partly typed. A definition has its binder's
             // type, so the substitution keeps every occurrence typed.
             if matches!(definition.ty, Type::Hole) {
@@ -746,7 +753,7 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
             )
         }
 
-        TypedExprNode::Realize(_)
+        TypedExprNode::Realize { .. }
         | TypedExprNode::LetRec { .. }
         | TypedExprNode::Transact { .. }
         | TypedExprNode::DisjointJoin(_) => unreachable!(
@@ -757,14 +764,15 @@ fn normalize_node(e: Expr, muts: &Muts) -> Expr {
     }
 }
 
-/// **A filtered comprehension's sources are bound ahead of it**, as the bindings returned. Its
-/// encoding is a refined cast whose predicate reads each generator's source, so a source left
-/// in place is copied into the predicate, and a source that is itself a filtered comprehension
-/// carries a copy of its own: the term doubles at each level of nesting. Bound ahead, the
-/// predicate and the cast's value read one name. A source reading an earlier generator's
-/// binder stays in place, since no binding ahead of the comprehension has that binder in
-/// scope. A source is its collection's `Iterable::elements` call
-/// (`lower::loops::lower_loop_source`), which stays in place over the collection's name.
+/// **Every comprehension's sources are bound ahead of it**, as the bindings returned. Its domain
+/// is its sources' projections, `σ(source)`, which stand outside the comprehension's lambda, so
+/// a source named inside it would be named out of the domain's scope. A filtered
+/// comprehension's encoding is also a refined cast whose predicate reads each source, so a
+/// source left in place is copied into the predicate, and a source that is itself a filtered
+/// comprehension carries a copy of its own: the term doubles at each level of nesting. Bound
+/// ahead, the predicate and the cast's value read one name. A source reading an earlier
+/// generator's binder stays in place, since no binding ahead of the comprehension has that
+/// binder in scope.
 ///
 /// A function of its own rather than a part of [`normalize_node`]'s comprehension arm, whose
 /// frame [`normalize`] pays at every node it reaches.
@@ -773,9 +781,6 @@ fn bind_sources_ahead(
     muts: &Muts,
 ) -> Vec<(TypedBinding, Expr)> {
     let mut sources = Vec::new();
-    if crate::ccl::comprehension::encodes_to_lambda(generators) {
-        return sources;
-    }
     for k in 0..generators.len() {
         let reads_a_binder = generators[..k]
             .iter()
@@ -787,14 +792,14 @@ fn bind_sources_ahead(
         let iter = std::mem::take(&mut generators[k].iter);
         let (binds, core) = peel(normalize(iter, muts));
         sources.extend(binds);
-        generators[k].iter =
-            if is_atomic(&core, muts) || crate::ccl::comprehension::is_elements_call(&core) {
-                core
-            } else {
-                let name = Name::anf_temp();
-                sources.push((TypedBinding::new_unannotated(name.clone()), core));
-                Expr::var(name)
-            };
+        generators[k].iter = if is_atomic(&core, muts) {
+            core
+        } else {
+            let name = Name::anf_temp();
+            let var_ref = temp_read(&name, &core);
+            sources.push((TypedBinding::new_unannotated(name), core));
+            var_ref
+        };
     }
     sources
 }
@@ -851,14 +856,17 @@ fn atomize(e: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Expr) {
     }
     let name = Name::anf_temp();
     let binding = TypedBinding::new_unannotated(name.clone());
-    // The read stands where `core` stood, and a later pass that inlines the binding again
-    // leaves this read's identity in the tree, so it is attributed to `core`, not the root.
-    let var_ref = {
-        let _g = provenance::enter(core.node_id(), "anf.hoist", Nature::Machinery);
-        Expr::var(name)
-    };
+    let var_ref = temp_read(&name, &core);
     binds.push((binding, core));
     (binds, var_ref)
+}
+
+/// A read of the temp `name` that binds `definition`. The read stands where the definition did
+/// and denotes it, so it is minted under the definition's identity: an error at the read is an
+/// error about the term the program wrote there.
+fn temp_read(name: &Name, definition: &Expr) -> Expr {
+    let _g = provenance::enter(definition.node_id(), "anf.temp_read", Nature::Machinery);
+    Expr::var(name.clone())
 }
 
 /// Undo [`let_chain`] at the root of `e`: split the bindings this pass sealed

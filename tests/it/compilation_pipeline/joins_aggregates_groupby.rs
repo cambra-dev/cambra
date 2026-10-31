@@ -1324,28 +1324,24 @@ fn a_group_by_in_a_guard(#[case] program: &str) {
     check_scalar(program, Value::Int(1));
 }
 
-/// A group-by result held in two places, each iterated through `Iterable::elements`, meets
-/// its other copy at one variable, and inference panics: the middle operand of a chained
-/// comparison, which lowering places in both comparisons, and a group-by nested in a key, which
-/// the key domain's predicate and the partition each hold. A generic function applied to a
-/// dependent collection is not iterated yet, and `elements` is one. Each program's value is in
-/// its comment.
+/// A group-by result held in two places, each iterated through `Iterable::elements`: the middle
+/// operand of a chained comparison, which lowering places in both comparisons, and a group-by
+/// nested in a key, which the key domain's predicate and the partition each hold.
 #[rstest]
-// `true`: the groups sum to 4.
-#[case::in_a_chained_comparison(r"0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) < 100")]
-// 1.
+#[case::in_a_chained_comparison(
+    r"0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) < 100",
+    Value::Bool(true)
+)]
 #[case::in_a_guard_s_chained_comparison(
-    r"1 if 0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) < 100 else 0"
+    r"1 if 0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) < 100 else 0",
+    Value::Int(1)
 )]
-// 4.
 #[case::nested_in_a_key(
-    r"sum([sum(g) for g in groupby([1, 1, 2], \e -> sum([sum(h) for h in groupby([1, 1, 2], \f -> f)]))])"
+    r"sum([sum(g) for g in groupby([1, 1, 2], \e -> sum([sum(h) for h in groupby([1, 1, 2], \f -> f)]))])",
+    Value::Int(4)
 )]
-fn a_group_by_held_twice_is_not_iterated_yet(#[case] program: &str) {
-    check_compile_error(
-        program,
-        "two distinct non-invertible morphisms met at one variable",
-    );
+fn a_group_by_held_twice_is_iterated(#[case] program: &str, #[case] expected: Value) {
+    check_scalar(program, expected);
 }
 
 /// A group-by whose key function computes its key with a nested collection, a union, or a
@@ -1439,9 +1435,9 @@ fn a_per_group_count_that_ignores_the_row() {
     );
 }
 
-/// A `groupby` over a comprehension of records bound to a name first, as over one written inline
-/// as the `groupby` source, which the `groupby_source` row of `tests/it/generated_pairs.rs` holds
-/// for its `rec_comp` and `rec_filtered` fillers.
+/// A `groupby` over a comprehension of records bound to a name first. The same comprehension
+/// written inline as the `groupby` source is the `groupby_source` row of
+/// `tests/it/generated_pairs.rs`, for its `rec_comp` and `rec_filtered` fillers.
 #[test]
 fn a_groupby_over_a_bound_comprehension_of_records() {
     check_tile(

@@ -502,7 +502,7 @@ fn hash_payload<'a>(
         }
         // `Realize` wraps the value it realizes and adds no content of its own beyond the
         // discriminant hashed by the caller.
-        N::Realize(v) => hash_payload(v, env, wenv, free, fold, h),
+        N::Realize { value: v, .. } => hash_payload(v, env, wenv, free, fold, h),
         N::Lit(Lit::Int(n)) => n.hash(h),
         N::Lit(Lit::String(s)) => s.hash(h),
         N::Lit(Lit::Bool(b)) => b.hash(h),

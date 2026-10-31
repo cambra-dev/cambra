@@ -9,7 +9,7 @@ per case, or `error: …` when a line does not decode. An empty line (or EOF) te
 - `"sub"`: `true` / `false`, the model's `subtypeCheck` on a concrete type pair.
 - `"merge"`: `ok`, or `mismatch: <CompactTy>` carrying the model's own merged bound.
 - `"mergeKind"`: the same, for a Σ binder's kind.
-- `"refuses"`: `ok`, or `mismatch: <Bool>` carrying the model's own verdict.
+- `"admits"`: `ok`, or `mismatch: <Bool>` carrying the model's own verdict.
 - `"coalesce"`: `ok`, or `mismatch: <outcome>` carrying the model's own.
 
 The Rust half lives in `tests/differential_oracle.rs`, which generates the cases, computes the
@@ -53,18 +53,14 @@ def mergeKindVerdict (j : Lean.Json) : Except String String := do
   pure (if CompactTypeKind.equivTypeKind want got then "ok"
         else s!"mismatch: {(CompactTypeKind.toJson want).compress}")
 
-/-- `{"op":"refuses","kind":<TypeKind>,"ty":<Ty>,"got":<Bool>}` — whether the solver's certain
-non-membership verdict is the model's.
-
-The half of membership a caller may act on, and the one every caller of it turns into a
-rejection, so a disagreement here is a program refused or an error missed.
-`not_admits_of_refuses` proves a refusal never lands on a member; this checks that the two
-sides refuse the same things. -/
-def refusesVerdict (j : Lean.Json) : Except String String := do
+/-- `{"op":"admits","kind":<TypeKind>,"ty":<Ty>,"got":<Bool>}` — whether the solver's
+membership verdict at materialization is the model's. `admitsCheck_iff_admits` proves the model's
+verdict is `Admits`, so a disagreement here is a program refused or an error missed. -/
+def admitsVerdict (j : Lean.Json) : Except String String := do
   let kind ← TypeKind.fromJson? (← j.getObjVal? "kind")
   let ty ← Ty.fromJson? (← j.getObjVal? "ty")
   let got : Bool ← Lean.fromJson? (← j.getObjVal? "got")
-  let want := refuses kind ty
+  let want := admitsCheck kind ty
   pure (if want == got then "ok" else s!"mismatch: {want}")
 
 /-- `{"op":"coalesce","pol":<Bool>,"ct":<CompactTy>,"got":<outcome>}` — whether the
@@ -100,7 +96,7 @@ def verdict (line : String) : String :=
         | "sub" => subVerdict j
         | "merge" => mergeVerdict j
         | "mergeKind" => mergeKindVerdict j
-        | "refuses" => refusesVerdict j
+        | "admits" => admitsVerdict j
         | "coalesce" => coalesceVerdict j
         | op => throw s!"unknown op: {op}"
       match checked with

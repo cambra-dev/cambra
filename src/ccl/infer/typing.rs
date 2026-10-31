@@ -110,6 +110,14 @@ pub(super) trait Typing {
     /// A fresh existential type variable at the current level.
     fn fresh(&mut self) -> Type;
 
+    /// A fresh variable for a **part** of a function of kind `kind`, placed under the witness
+    /// binders that kind may have ([`crate::ccl::InferVar::may_name_witness`]).
+    fn fresh_part(&mut self, kind: &crate::ccl::ty::FunKind) -> Type {
+        let t = self.fresh();
+        crate::ccl::InferVar::place_parts_under(&t, kind);
+        t
+    }
+
     /// The memo that keeps refinement-predicate `Rc` sharing across this whole
     /// emit/check walk. Both modes rebuild every predicate they type
     /// ([`emit_bare_predicate`](super::emit)), so both need it; it lives on the

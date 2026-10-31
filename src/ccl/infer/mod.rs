@@ -230,6 +230,28 @@ fn find_node(expr: &Expr, id: crate::ccl::provenance::NodeId) -> Option<&Expr> {
     found
 }
 
+/// Why two functions' kinds do not relate, read off what each side's kind settled to.
+fn kind_mismatch_reason(lhs: &Type, rhs: &Type) -> &'static str {
+    use crate::ccl::ty::KindPin;
+    let pin = |t: &Type| t.peel_refinements().fun_kind_of().map(|k| k.resolved());
+    match (pin(lhs), pin(rhs)) {
+        (Some(KindPin::Sum(_)), Some(KindPin::Plain)) => {
+            "a sum reached a plain collection — a sum's domain is its witness, which no written \
+             domain names; an annotation admits a sum with the domain `_`, as in `_ |=> V`, or \
+             as `Collection(V)`"
+        }
+        (Some(KindPin::Plain), Some(KindPin::Sum(_))) => {
+            "a plain collection reached a sum — a collection becomes a sum only through `box`"
+        }
+        (Some(KindPin::Sum(a)), Some(KindPin::Sum(b))) if a != b => {
+            "two sums over different numbers of witnesses met at one position"
+        }
+        _ => {
+            "a compute function ⇒ and a data collection ⤇ met at one position — the two \
+             kinds are incomparable, so neither stands in for the other"
+        }
+    }
+}
 /// Resolve a (possibly variable-laden) [`Type`] to a concrete type for use
 /// in error messages. Falls back to [`Type::Hole`] if coalesce fails (which
 /// can happen for types with incompatible bounds that triggered the error).
@@ -260,13 +282,24 @@ pub(super) fn resolve_predicate_types(ty: &mut Type) {
         resolve_predicate_types(&mut e.ty);
         e.walk_children_mut(resolve_expr);
     }
-    if let Type::Refinement(_, refinements) = ty {
-        refinements.rewrite_each(|_, r| {
+    match ty {
+        Type::Refinement(_, refinements) => {
+            refinements.rewrite_each(|_, r| {
+                let _frame = crate::ccl::provenance::copy_frame("infer.error_predicate_types");
+                let mut predicate = (*r.predicate).clone();
+                resolve_expr(&mut predicate);
+                *r = Refinement::born(Rc::new(predicate));
+            });
+        }
+        // A projection quotes the sum it reads, which a loop source reads through its
+        // `elements` call.
+        Type::WitnessProjection(p) => {
             let _frame = crate::ccl::provenance::copy_frame("infer.error_predicate_types");
-            let mut predicate = (*r.predicate).clone();
-            resolve_expr(&mut predicate);
-            *r = Refinement::born(Rc::new(predicate));
-        });
+            let mut term = (*p.term).clone();
+            resolve_expr(&mut term);
+            *p = crate::ccl::ty::WitnessProjection::new(Rc::new(term), p.position);
+        }
+        _ => {}
     }
     ty.walk_children_mut(resolve_predicate_types);
 }
@@ -312,40 +345,11 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             found: Box::new(coalesce_for_error(&found)),
             expected: Some(Box::new(coalesce_for_error(&required))),
         },
-        ConstrainError::KindMismatch { lhs, rhs } => {
-            // Which two kinds met: a capability and a collection, or a plain collection
-            // and a sum, which only `box` relates.
-            let compute = [&lhs, &rhs].iter().any(|t| {
-                t.fun_kind_of()
-                    .is_some_and(|k| k.resolved() == crate::ccl::ty::KindPin::Compute)
-            });
-            let ctx = if compute {
-                format!(
-                    "{ctx_label} (a compute function ⇒ and a data collection ⤇ met \
-                     at one position — the two kinds are incomparable, so neither \
-                     stands in for the other)"
-                )
-            } else if lhs
-                .fun_kind_of()
-                .is_some_and(|k| matches!(k.resolved(), crate::ccl::ty::KindPin::Sum(_)))
-            {
-                format!(
-                    "{ctx_label} (a sum reached a plain collection — a sum's domain is its \
-                     witness, which no written domain names; an annotation admits a sum \
-                     with the domain `_`, as in `_ |=> V`, or as `Collection(V)`)"
-                )
-            } else {
-                format!(
-                    "{ctx_label} (a plain collection reached a sum — a collection becomes a \
-                     sum only through `box`)"
-                )
-            };
-            InferError::TypeMismatch {
-                ctx,
-                found: Box::new(coalesce_for_error(&lhs)),
-                expected: Some(Box::new(coalesce_for_error(&rhs))),
-            }
-        }
+        ConstrainError::KindMismatch { lhs, rhs } => InferError::TypeMismatch {
+            ctx: format!("{ctx_label} ({})", kind_mismatch_reason(&lhs, &rhs)),
+            found: Box::new(coalesce_for_error(&lhs)),
+            expected: Some(Box::new(coalesce_for_error(&rhs))),
+        },
         ConstrainError::TypeParamEscapes { param } => InferError::TypeParamEscapes {
             param: param.spelling.to_string(),
             target: None,

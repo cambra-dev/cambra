@@ -40,18 +40,18 @@
 //! | Literal tuple projection | `(e₀, …, eₙ).i` | `eᵢ` | ✗ (drops siblings) |
 //! | CCC universal | `⟨.1, .0 ≫ curry(f)⟩ ≫ apply` | `f` | ✗ (drops structure) |
 //! | Exponential beta | `⟨g, curry(h)⟩ ≫ apply` | `⟨id, g⟩ ≫ h` | ✗ (restructures) |
-//! | Exponential eta | `curry(⟨.1, .0 ≫ f⟩ ≫ apply ≫ g)` | `f ≫ map(g)` | ✗ (drops structure) |
+//! | Exponential eta | `curry(⟨.1, .0 ≫ f⟩ ≫ apply ≫ g)`, `f` a chain | `f ≫ map(g)` | ✗ (drops structure) |
 //! | Const-apply | `⟨f, const(g)⟩ ≫ apply` | `f ≫ g` | ✗ (drops `const` wrap) |
 //! | Apply-compose | `⟨x, ⟨F, G⟩ ≫ compose⟩ ≫ apply` | `⟨⟨x, F⟩ ≫ apply, G⟩ ≫ apply` | ✗ (restructures) |
 //! | Apply-zip | `⟨x, ⟨F, G⟩ ≫ zip⟩ ≫ apply` | `⟨⟨x, F⟩ ≫ apply, ⟨x, G⟩ ≫ apply⟩` | ✗ (duplicates `x`) |
 //! | Apply-constant-valued | `⟨x, h ≫ const⟩ ≫ apply` | `h` | ✗ (drops `x`) |
 //! | Product eta | `⟨f ≫ .0, f ≫ .1⟩` | `f` | ✗ (collapses) |
-//! | Flatten compose | `Compose([…, Compose([…]), …])` | `Compose([…flat…])` | ✓ |
+//! | Flatten compose | `Compose([…, Compose([…]), …])` | `Compose([…flat…])`, later reads of inner positions restated | ✓ |
 //! | Zip distribute | `⟨f0, f1⟩ ≫ ⟨g, h⟩` (if g,h will simplify) | `⟨⟨f0, f1⟩ ≫ g, ⟨f0, f1⟩ ≫ h⟩` | ✗ (restructures) |
 //! | ANF morphism binding | `let x = 𝑚 in 𝑏` (`x` an ANF temp, `𝑚` a morphism, used once) | `𝑏[x := 𝑚]` | ✓ |
 
 use crate::ccl::ccl_utils::{
-    PredMemo, apply_primitive, count_free, is_builtin, walk_refined_predicates_mut,
+    PredMemo, apply_primitive, count_free, is_builtin, walk_quoted_terms_mut,
 };
 use crate::ccl::lambda_elim::{id, strength_over, zip_pair};
 use crate::ccl::ty::FunKind;
@@ -171,7 +171,7 @@ fn simplify_once(expr: &mut Expr, memo: &PredMemo) -> (bool, bool) {
     // compares by structural refinement equality.
     let mut slot_changed = false;
     expr.walk_type_slots_mut(|ty| {
-        slot_changed |= walk_refined_predicates_mut(ty, memo, &(), &mut |pred, memo| {
+        slot_changed |= walk_quoted_terms_mut(ty, memo, &(), &mut |pred, memo| {
             // Reporting "unchanged" keeps the origin `Rc` in the slot, so a
             // predicate simplify has nothing to say about stays pointer-shared with
             // every other occurrence — including ones in nodes this walk never
@@ -501,12 +501,14 @@ fn is_proj_idx(expr: &Expr, n: usize) -> bool {
 }
 
 /// Returns `true` if `expr` is the second arm of an exponential-eta zip: `.0`,
-/// or `.0 ≫ 𝑓` for one morphism 𝑓.
+/// or `.0 ≫ 𝑓₁ ≫ … ≫ 𝑓ₙ`.
 ///
 /// The arm carries the curried function into `apply`. A bare projection carries
 /// it unchanged (`𝑓 = id`); see [`try_exponential_eta`].
 fn is_eta_apply_arm(expr: &Expr) -> bool {
-    is_proj_idx(expr, 0) || as_compose(expr).is_some_and(|(proj0, _)| is_proj_idx(proj0, 0))
+    is_proj_idx(expr, 0)
+        || matches!(&expr.node, TypedExprNode::Compose(elts)
+            if elts.len() >= 2 && is_proj_idx(&elts[0], 0))
 }
 
 /// Collapse a non-empty morphism list into one expression: the element itself
@@ -808,6 +810,18 @@ fn try_compose_identity(expr: &mut Expr) -> bool {
     )
 }
 
+/// Whether `source` is a generator's source as `compose_sum_generators` leaves it: a morphism
+/// to a sum, or one ending in `unbox`, whose collection is over the witness the sum projects
+/// (`σ₁(𝑐)`). The second is read from the term rather than from the projected domain, because a
+/// history over a projected domain has that type too and is not a generator's source.
+fn over_a_witness(source: &Expr) -> bool {
+    let ends_in_unbox = match &source.node {
+        TypedExprNode::Compose(elts) => elts.last().is_some_and(|e| is_builtin(e, Builtin::Unbox)),
+        _ => is_builtin(source, Builtin::Unbox),
+    };
+    ends_in_unbox || source.ty.codomain().is_some_and(|c| c.sum().is_some())
+}
+
 /// Composition with a constant function: `⟨𝑆, 𝑓 ▷ const⟩ ≫ compose  ⟹  𝑆 ≫ map(𝑓)`,
 /// and `⟹  𝑆` where `𝑓` is `id`.
 ///
@@ -816,13 +830,14 @@ fn try_compose_identity(expr: &mut Expr) -> bool {
 /// whose element function reads nothing from the enclosing scope (`compose_sum_generators`).
 /// Both sides keep `𝑆` and `𝑓`, so the rule relocates no iteration source.
 ///
-/// Scoped to an `𝑆` whose values are a sum, the shape the generator rewrite produces. Planning's
+/// Scoped to a generator's source ([`over_a_witness`]), the shape the generator rewrite
+/// produces. Planning's
 /// letrec recognition reads a history through the unrewritten form, so the rule leaves every
 /// other `𝑆` alone.
 fn try_compose_constant_function(expr: &mut Expr) -> bool {
     fn constant_function(left: &Expr) -> Option<(&Expr, &Expr)> {
         let (source, lifted) = as_zip(left)?;
-        if !source.ty.codomain().is_some_and(|c| c.sum().is_some()) {
+        if !over_a_witness(source) {
             return None;
         }
         Some((source, as_const(lifted)?))
@@ -836,7 +851,13 @@ fn try_compose_constant_function(expr: &mut Expr) -> bool {
             if is_id(&f) {
                 return vec![source];
             }
-            let mapped_ty = match source.ty.codomain() {
+            // A collection whose keys read the input reads it by the source's binder, the name
+            // the chain gives that position.
+            let collection = source
+                .ty
+                .codomain()
+                .map(|c| crate::ccl::subst::open_codomain(&source.ty, &c));
+            let mapped_ty = match collection {
                 Some(collection) => match (collection.domain(), f.ty.codomain()) {
                     (Some(domain), Some(codomain)) => Type::fun(
                         collection.clone(),
@@ -862,11 +883,11 @@ fn try_compose_constant_function(expr: &mut Expr) -> bool {
 /// Conversion has no operator for a bare `compose`, and the right side is combinators it
 /// compiles.
 ///
-/// Scoped as [`try_compose_constant_function`] is, to an `𝑆` whose values are a sum.
+/// Scoped as [`try_compose_constant_function`] is, to a generator's source.
 fn try_compose_with_strength(expr: &mut Expr) -> bool {
     fn curried_function(left: &Expr) -> Option<(&Expr, &Expr)> {
         let (source, curried) = as_zip(left)?;
-        if !source.ty.codomain().is_some_and(|c| c.sum().is_some()) {
+        if !over_a_witness(source) {
             return None;
         }
         Some((source, as_curry(curried)?))
@@ -886,9 +907,12 @@ fn try_compose_with_strength(expr: &mut Expr) -> bool {
             let (fun_kind, enclosing) = (fun_kind.clone(), (**enclosing).clone());
             let (source, curried) = into_zip(left);
             let g = into_argument(curried);
+            // A collection whose keys read the input reads it by the source's binder, which
+            // `strength_over` keeps: the name the chain gives that position.
             let collection = source
                 .ty
                 .codomain()
+                .map(|c| crate::ccl::subst::open_codomain(&source.ty, &c))
                 .expect("the source is a function to a collection");
             let (Some(keys), Some(values), Some(result)) =
                 (collection.domain(), collection.codomain(), g.ty.codomain())
@@ -932,6 +956,20 @@ fn narrows_domain_irrecoverably(expr: &Expr) -> bool {
         TypedExprNode::Builtin(Builtin::VariantProject(_)) => true,
         _ => false,
     }
+}
+
+/// Whether `expr`'s domain is one whose keys only a collection holds — a projected
+/// witness, which no extent enumerates. Collapsing `expr ≫ const(𝑔)` would keep the domain as
+/// a type and lose the keys, so planning could not rebuild which positions exist.
+fn keys_only_in_the_data(expr: &Expr) -> bool {
+    fn projected(ty: &Type) -> bool {
+        match ty.peel_refinements() {
+            Type::WitnessProjection(_) => true,
+            Type::Tuple(cs) => cs.iter().any(projected),
+            _ => false,
+        }
+    }
+    expr.ty.domain().is_some_and(|d| projected(&d))
 }
 
 /// Whether the morphism `expr`, composed after a collection, leaves that collection's keys as
@@ -1103,6 +1141,7 @@ fn try_const_reduce(expr: &mut Expr) -> bool {
         |left, right| {
             as_const(right).is_some()
                 && !narrows_domain_irrecoverably(left)
+                && !keys_only_in_the_data(left)
                 && !crate::ccl::subst::is_dependent(&right.ty)
         },
         |left, right, mint_kind| {
@@ -1425,9 +1464,33 @@ fn try_let_morphism_inline(expr: &mut Expr) -> bool {
         unreachable!("matched above");
     };
     let mut body = *body;
+    let mut bound_expr = *bound_expr;
+    // The use site's binder names the position the morphism takes its input at, and the types
+    // after it read that position by it (`src/ccl/design/type-inference.md`, "A chain names each
+    // position"); the definition is typed without it. A codomain reads its binder by index, so
+    // naming it is an α-conversion.
+    if let Some(Type::Fun { name: Some(b), .. }) = use_site_type(&body, &binding.name)
+        && let Type::Fun { name, .. } = &mut bound_expr.ty
+    {
+        *name = Some(b);
+    }
     crate::ccl::subst::Subst::discharge_in_place(&mut body, &binding.name, &bound_expr);
     *expr = body;
     true
+}
+
+/// The type the term occurrence of `name` in `e` is stamped with, where `e` reads it in a term.
+fn use_site_type(e: &Expr, name: &Name) -> Option<Type> {
+    if matches!(&e.node, TypedExprNode::Var(n) if n == name) {
+        return Some(e.ty.peel_refinements().clone());
+    }
+    let mut found = None;
+    e.walk_children(|child| {
+        if found.is_none() {
+            found = use_site_type(child, name);
+        }
+    });
+    found
 }
 
 /// Const-apply: `⟨f, const(g)⟩ ≫ apply  ⟹  f ≫ g`
@@ -1679,7 +1742,9 @@ fn try_zip_distribute_compose(expr: &mut Expr) -> bool {
 /// Exponential eta: `curry(⟨.1, .0 ≫ 𝑓⟩ ≫ apply ≫ 𝑔)  ⟹  𝑓 ≫ map(𝑔)`
 ///
 /// The inner compose must begin with `⟨.1, .0 ≫ 𝑓⟩` then `apply`; any element
-/// before the zip disqualifies the rule. Both morphisms are optional — a bare
+/// before the zip disqualifies the rule. 𝑓 is the whole rest of the arm, which may be a
+/// chain: a row read through `unbox` is `.0 ≫ unbox`, one projected from a nested pair
+/// `.0 ≫ .0 ≫ unbox`. Both morphisms are optional — a bare
 /// `.0` arm is `𝑓 = id`, an empty suffix is `𝑔 = id` — so the rule also covers
 /// the degenerate forms `curry(⟨.1, .0 ≫ 𝑓⟩ ≫ apply) ⟹ 𝑓` and
 /// `curry(⟨.1, .0⟩ ≫ apply) ⟹ id`. Where the curried collection is narrower than the
@@ -1717,7 +1782,10 @@ fn try_exponential_eta(expr: &mut Expr) -> bool {
         let (_, proj0f) = into_zip(inner_elts.pop().unwrap());
         // `𝑓`: the `.0` arm with its projection dropped, absent for a bare `.0`.
         let f = match proj0f.node {
-            TypedExprNode::Compose(mut compose_elts) => Some(compose_elts.pop().unwrap()),
+            TypedExprNode::Compose(mut compose_elts) => {
+                compose_elts.remove(0);
+                Some(collapse_compose(compose_elts))
+            }
             _ => None,
         };
         // **A curry whose collection is narrower than its argument keeps a node to say so.**
@@ -1729,13 +1797,21 @@ fn try_exponential_eta(expr: &mut Expr) -> bool {
         // narrowing, and planning materializes it as a per-group filter
         // (`planning/per_group_filter.rs`).
         //
-        // With 𝑓 present the narrowing reads the argument while `map` receives 𝑓's result,
-        // so no type spells it; that shape fails the post-elimination type check as it does
-        // without this rule.
-        //
         // The test is the one `id` itself would fail: with 𝑓 and the suffix absent the curry
         // is `𝐴 ⇒ 𝐵`, and `id` types only where `𝐴` is `𝐵`.
-        if f.is_none() && suffix.is_empty() && curry_ty.domain() != curry_ty.codomain() {
+        // **With 𝑓 present the same holds behind 𝑓**: `𝑓 ≫ map(id)`, where `map`'s type is the
+        // curry's result read over the chain's head position, which 𝑓's binder names
+        // ([`restate_behind`]). A narrowing reading the argument only through `𝑥 ▷ 𝑓` is a
+        // per-group filter on `map`'s input; one reading it otherwise is refused by name at
+        // planning.
+        let mut f = f;
+        let behind = f.as_mut().and_then(|f| restate_behind(f, &curry_ty));
+        let narrowed = match (&f, &behind) {
+            (None, _) => curry_ty.domain() != curry_ty.codomain(),
+            (Some(_), Some((_, narrowed))) => *narrowed,
+            (Some(_), None) => false,
+        };
+        if suffix.is_empty() && narrowed {
             let Some(elem) = curry_ty.codomain().and_then(|c| c.codomain()) else {
                 unreachable!("a curry's result is a collection, got {curry_ty}")
             };
@@ -1748,9 +1824,10 @@ fn try_exponential_eta(expr: &mut Expr) -> bool {
         // element behind 𝑓, spanning 𝑓's codomain at 𝑓's kind, and the curry's type
         // rides the compose that replaces the node.
         let mapped = (!suffix.is_empty()).then(|| {
-            let map_ty = match &f {
-                None => curry_ty.clone(),
-                Some(f) => match (f.ty.codomain(), curry_ty.codomain()) {
+            let map_ty = match (&f, behind) {
+                (None, _) => curry_ty.clone(),
+                (Some(_), Some((map_ty, _))) => map_ty,
+                (Some(f), None) => match (f.ty.codomain(), curry_ty.codomain()) {
                     (Some(domain), Some(codomain)) => {
                         Type::fun_like_or_hole(&f.ty, &domain, &codomain)
                     }
@@ -1770,6 +1847,37 @@ fn try_exponential_eta(expr: &mut Expr) -> bool {
     false
 }
 
+/// `map`'s type behind 𝑓 in `𝑓 ≫ map(𝑔)`, the replacement for the curry typed `curry_ty`, and
+/// whether its result is narrower than its input.
+///
+/// `curry_ty` is `(𝑥 : 𝐴) ⇒ 𝑅`, where 𝑅 reads 𝑥. The chain's head position takes 𝑥's name as
+/// 𝑓's binder, so 𝑅 reads that position, and `map`'s input as `𝑥 ▷ 𝑓`, the value carried there
+/// (`src/ccl/design/type-inference.md`, "A chain names each position"): `map : 𝑂 ⇒ 𝑅` over 𝑓's
+/// output 𝑂. The types after the chain read it the same way. `None` where the curry names no
+/// binder.
+fn restate_behind(f: &mut Expr, curry_ty: &Type) -> Option<(Type, bool)> {
+    let Type::Fun {
+        name: Some(x),
+        codomain,
+        ..
+    } = curry_ty.peel_refinements()
+    else {
+        return None;
+    };
+    let result = crate::ccl::subst::open_codomain(curry_ty, codomain);
+    // 𝑓's codomain reads its binder by index, so renaming the slot is an α-conversion.
+    let Type::Fun { name, fun_kind, .. } = &mut f.ty else {
+        return None;
+    };
+    *name = Some(x.clone());
+    let fun_kind = fun_kind.clone();
+    let f_codomain = f.ty.codomain()?;
+    let input = crate::ccl::subst::open_codomain(&f.ty, &f_codomain);
+    let narrowed = result.domain() != input.domain();
+    let c = Name::fresh("__curried");
+    Some((Type::pi_kinded(c, input, result, fun_kind), narrowed))
+}
+
 /// Flatten a [`TypedExprNode::Compose`] whose elements contain nested
 /// `Compose` nodes, expanding them into a single flat list.
 ///
@@ -1784,6 +1892,9 @@ fn try_exponential_eta(expr: &mut Expr) -> bool {
 /// so the morphisms that read the position by it still do. At the outer chain's head the
 /// position is the outer chain's input, so the outer chain's binder names it, where it has
 /// one. The other names for that position, the head's own binder say, are renamed to it.
+/// The nested chain's inner positions become the outer chain's, and the steps after it read
+/// them by their binders ([`restate_spliced_reads`]); a nested chain is flattened before it
+/// is spliced, so every position it carries is in the outer chain then.
 fn try_flatten_compose(expr: &mut Expr) -> bool {
     let TypedExprNode::Compose(elts) = &expr.node else {
         return false;
@@ -1805,9 +1916,15 @@ fn try_flatten_compose(expr: &mut Expr) -> bool {
     };
     let outer = binder_of(&ty);
     let mut renames: Vec<(Name, Name, Type)> = Vec::new();
+    // Each spliced chain: where its elements start in `flat`, how many, and the name and type
+    // of its input.
+    let mut spliced: Vec<(usize, usize, Option<Name>, Type)> = Vec::new();
     let mut flat: Vec<Expr> = Vec::new();
     let mut rest = elts.into_iter();
-    while let Some(arm) = rest.next() {
+    while let Some(mut arm) = rest.next() {
+        // A spliced chain is flat first, so every position it carries is one of the outer
+        // chain's when the steps after it are restated ([`restate_spliced_reads`]).
+        try_flatten_compose(&mut arm);
         let after = rest.as_slice();
         let inner_binder = binder_of(&arm.ty);
         let input = arm.ty.domain().unwrap_or(Type::Hole);
@@ -1846,6 +1963,7 @@ fn try_flatten_compose(expr: &mut Expr) -> bool {
                 *name = Some(t);
             }
         }
+        spliced.push((flat.len(), inner.len(), binder_of(&inner[0].ty), input));
         flat.extend(inner);
     }
     for (old, new, input) in renames {
@@ -1854,10 +1972,168 @@ fn try_flatten_compose(expr: &mut Expr) -> bool {
             crate::ccl::subst::Subst::discharge_in_place(e, &old, &at);
         }
     }
+    for (start, len, head, input) in spliced {
+        if let Some(head) = head {
+            restate_spliced_reads(&mut flat, start, len, &head, &input);
+        }
+    }
     *expr = Expr::compose(flat);
     expr.ty = ty;
     expr.user_annotation = user_annotation;
     true
+}
+
+/// Restate the reads of a spliced chain's inner positions as the binders that name them in
+/// the outer chain.
+///
+/// The steps after a nested chain were typed against the chain's own type, which reads an
+/// inner position as the chain's input carried there, `ℎ ▷ 𝑒₀ ≫ … ≫ 𝑒ᵢ₋₁`, and a rewrite that
+/// built the nested chain can leave its later morphisms reading one that way too. Spliced in,
+/// the position is the outer chain's, named by `𝑒ᵢ`'s binder `𝑏ᵢ`: `𝑒ᵢ`'s own codomain reads it
+/// by `𝑏ᵢ`, and so does every type after `𝑒ᵢ` (`src/ccl/design/type-inference.md`, "A chain
+/// names each position"). The two denote one value, so the restatement is the definition of
+/// `𝑏ᵢ` read backwards. A read matches by normal form
+/// ([`crate::ccl::ccl_utils::normal_form`]), the form projections compare in, so any spelling
+/// of it is found.
+fn restate_spliced_reads(flat: &mut [Expr], start: usize, len: usize, head: &Name, input: &Type) {
+    if !flat[start + 1..]
+        .iter()
+        .any(|e| crate::ccl::ccl_utils::is_free(head, e))
+    {
+        return;
+    }
+    // The positions, by the index of the morphism each is the input of.
+    let mut reads: Vec<(usize, Expr, Expr)> = Vec::new();
+    // Ascending, so that where two positions carry one value (`𝑎 ▷ unbox` reads as `𝑎`), the
+    // first names it: it is in scope wherever the later one is.
+    for i in 1..len {
+        let e = &flat[start + i];
+        let (Some(b), Some(domain)) = (binder_of(&e.ty), e.ty.domain()) else {
+            continue;
+        };
+        let read =
+            crate::ccl::ccl_utils::read_at_position(&flat[start..start + i], head, input, &domain);
+        let _g = crate::ccl::provenance::enter(
+            e.node_id(),
+            "simplify.restate_spliced_read",
+            crate::ccl::provenance::Nature::Machinery,
+        );
+        let normal =
+            crate::ccl::ccl_utils::normal_form(&crate::ccl::ccl_utils::predicate_term(&read));
+        // The position carries the chain's input (every step before `𝑒ᵢ` maps each position to
+        // itself, or reads as the identity, as `unbox` does), which `head` names first.
+        if matches!(normal.node, TypedExprNode::Var(_)) {
+            continue;
+        }
+        reads.push((i, normal, Expr::var(&b).with_ty(domain)));
+    }
+    if reads.is_empty() {
+        return;
+    }
+    let memo = PredMemo::default();
+    for (offset, e) in flat[start + 1..].iter_mut().enumerate() {
+        let j = offset + 1;
+        if !crate::ccl::ccl_utils::is_free(head, e) {
+            continue;
+        }
+        let earlier: Vec<(Expr, Expr)> = reads
+            .iter()
+            .filter(|(i, ..)| *i < j)
+            .map(|(_, read, binder)| (read.clone(), binder.clone()))
+            .collect();
+        if !earlier.is_empty() {
+            restate_reads_in(e, head, &earlier, &memo);
+        }
+        if let Some((_, read, binder)) = reads.iter().find(|(i, ..)| *i == j) {
+            restate_own_input(e, head, read, binder, &earlier, &memo);
+        }
+    }
+}
+
+/// `e`'s codomain reading `e`'s input by `e`'s binder where it reads it as `read`, a spelling of
+/// the input that names the chain's head. The codomain is opened at the binder, restated, and
+/// closed again.
+fn restate_own_input(
+    e: &mut Expr,
+    head: &Name,
+    read: &Expr,
+    binder: &Expr,
+    earlier: &[(Expr, Expr)],
+    memo: &PredMemo,
+) {
+    let Type::Fun {
+        name: Some(b),
+        fun_kind,
+        domain,
+        codomain,
+    } = &e.ty
+    else {
+        return;
+    };
+    let mut opened = crate::ccl::subst::open_codomain(&e.ty, codomain);
+    if !crate::ccl::ccl_utils::is_free_in_type(head, &opened) {
+        return;
+    }
+    // The earlier positions first, so a read of one of them is not taken for this one where
+    // the two share a normal form.
+    let mut reads = earlier.to_vec();
+    reads.push((read.clone(), binder.clone()));
+    let changed = walk_quoted_terms_mut(&mut opened, memo, &(), &mut |term, memo| {
+        restate_reads_in_term(term, head, &reads, memo)
+    });
+    if !changed {
+        return;
+    }
+    let restated = Type::pi_kinded(b.clone(), (**domain).clone(), opened, fun_kind.clone());
+    // A morphism built by applying a builtin to its argument (`𝑔 ▷ map`) states its type twice:
+    // as its own, and as the builtin's codomain.
+    if let TypedExprNode::Apply { function, .. } = &mut e.node
+        && let Type::Fun { codomain, .. } = &mut function.ty
+        && **codomain == e.ty
+    {
+        **codomain = restated.clone();
+    }
+    e.ty = restated;
+}
+
+/// [`restate_spliced_reads`] over every type slot at or below `e`.
+fn restate_reads_in(e: &mut Expr, head: &Name, reads: &[(Expr, Expr)], memo: &PredMemo) {
+    e.walk_type_slots_mut(|ty| {
+        walk_quoted_terms_mut(ty, memo, &(), &mut |term, memo| {
+            restate_reads_in_term(term, head, reads, memo)
+        });
+    });
+    e.walk_children_mut(|child| restate_reads_in(child, head, reads, memo));
+}
+
+/// A quoted term with each subterm that reads one of `reads` replaced by its binder,
+/// outermost first, so the longest read is the one taken. Where several positions share a
+/// normal form, the first listed is taken.
+fn restate_reads_in_term(
+    term: &mut Expr,
+    head: &Name,
+    reads: &[(Expr, Expr)],
+    memo: &PredMemo,
+) -> bool {
+    if !crate::ccl::ccl_utils::is_free(head, term) {
+        return false;
+    }
+    let normal = crate::ccl::ccl_utils::normal_form(term);
+    if let Some((_, binder)) = reads
+        .iter()
+        .find(|(read, _)| crate::ccl::eq_term_modulo_ty_slots(read, &normal))
+    {
+        *term = binder.clone();
+        return true;
+    }
+    let mut changed = false;
+    term.walk_type_slots_mut(|ty| {
+        changed |= walk_quoted_terms_mut(ty, memo, &(), &mut |inner, memo| {
+            restate_reads_in_term(inner, head, reads, memo)
+        });
+    });
+    term.walk_children_mut(|child| changed |= restate_reads_in_term(child, head, reads, memo));
+    changed
 }
 
 // ---------------------------------------------------------------------------

@@ -298,7 +298,14 @@ pub enum TypedExprNode {
     /// `ty` — a `Cast`'s `target` needs threading through exactly that walk, and this
     /// sidesteps it by not having one. At runtime it is a no-op: op-conversion compiles
     /// `value` and discards the wrapper.
-    Realize(Box<TypedExpr>),
+    Realize {
+        /// The executable form: what op-conversion compiles.
+        value: Box<TypedExpr>,
+        /// The term `value` stages — the conditional realization replaced — quoted as a
+        /// type quotes a term. Term walks do not reach it; normal form reads the node as it, so
+        /// a type quoting the conditional and the tree's realization compare as one term.
+        staged: std::rc::Rc<TypedExpr>,
+    },
 
     Cast {
         /// The value being re-viewed under `target`.
@@ -930,7 +937,7 @@ impl TypedExprNode {
             TypedExprNode::Apply { .. } => "Apply",
             TypedExprNode::Cast { .. } => "Cast",
             TypedExprNode::Comprehension { .. } => "Comprehension",
-            TypedExprNode::Realize(_) => "Realize",
+            TypedExprNode::Realize { .. } => "Realize",
             TypedExprNode::BinOp { .. } => "BinOp",
             TypedExprNode::UnaryOp { .. } => "UnaryOp",
             TypedExprNode::Lambda { .. } => "Lambda",
@@ -1708,7 +1715,9 @@ impl TypedExpr {
                 f(function.as_ref());
                 f(argument.as_ref());
             }
-            TypedExprNode::Cast { value, .. } | TypedExprNode::Realize(value) => f(value.as_ref()),
+            TypedExprNode::Cast { value, .. } | TypedExprNode::Realize { value, .. } => {
+                f(value.as_ref())
+            }
             TypedExprNode::BinOp { left, right, .. } => {
                 f(left.as_ref());
                 f(right.as_ref());
@@ -1918,7 +1927,9 @@ impl TypedExpr {
             }
             // Only `value` is an expression child; `target` is a type (its
             // refinement predicate is reached via type walks, not here).
-            TypedExprNode::Cast { value, .. } | TypedExprNode::Realize(value) => f(value.as_mut()),
+            TypedExprNode::Cast { value, .. } | TypedExprNode::Realize { value, .. } => {
+                f(value.as_mut())
+            }
             TypedExprNode::BinOp { left, right, .. } => {
                 f(left.as_mut());
                 f(right.as_mut());
@@ -2054,7 +2065,7 @@ impl TypedExpr {
             | TypedExprNode::Error
             | TypedExprNode::Apply { .. }
             | TypedExprNode::Cast { .. }
-            | TypedExprNode::Realize(_)
+            | TypedExprNode::Realize { .. }
             | TypedExprNode::BinOp { .. }
             | TypedExprNode::UnaryOp(..)
             | TypedExprNode::Aggregate { .. }
@@ -2113,7 +2124,7 @@ impl TypedExpr {
             | TypedExprNode::Error
             | TypedExprNode::Apply { .. }
             | TypedExprNode::Cast { .. }
-            | TypedExprNode::Realize(_)
+            | TypedExprNode::Realize { .. }
             | TypedExprNode::BinOp { .. }
             | TypedExprNode::UnaryOp(..)
             | TypedExprNode::Aggregate { .. }
@@ -2135,6 +2146,16 @@ impl TypedExpr {
             | TypedExprNode::LetType { .. }
             | TypedExprNode::Run { .. }
             | TypedExprNode::Transact { .. } => {}
+        }
+    }
+
+    /// Every term this node quotes: each term its type slots quote
+    /// ([`Type::walk_quoted_terms`]), then the conditional a [`TypedExprNode::Realize`]
+    /// stages. Term walks reach none of them; id enumeration must reach all of them.
+    pub fn walk_quoted_terms<'a>(&'a self, f: &mut impl FnMut(&'a std::rc::Rc<TypedExpr>)) {
+        self.walk_type_slots(|t| t.walk_quoted_terms(f));
+        if let TypedExprNode::Realize { staged, .. } = &self.node {
+            f(staged);
         }
     }
 

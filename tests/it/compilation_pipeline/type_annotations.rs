@@ -777,17 +777,16 @@ fn a_record_equality_in_a_refinement_predicate_is_not_discharged() {
     )
 }
 
-/// A refinement in a `Map` key type that no key satisfies. The plain annotation reports it,
-/// and the `Mut` form reaches a pass boundary instead.
+/// A refinement in a `Map` key type that no key satisfies, reported by the plain annotation and
+/// by the `Mut` form.
 ///
 /// Neither program is well-typed today: a literal key carries `__elem == "a"`, and a
 /// refinement is discharged by matching the predicate rather than by proving it, so
-/// `__elem != ""` is not satisfied. What differs is the report. The plain
-/// annotation is an `Annotation mismatch` against the whole `Σ`, which names the
-/// annotation the program wrote; the mutable one panics at the post-inference boundary as
-/// an invalid tree, which reads as a compiler bug for a program that is simply rejected.
-///
-/// Pinned on both, so the day the `Mut` form reports a user error the pin says so.
+/// `__elem != ""` is not satisfied. The plain annotation is an `Annotation mismatch`
+/// against the whole `Σ`, which names the annotation the program wrote. The mutable one
+/// boxes the map, so the key domain is a candidate of the box's binder, and the report is
+/// that candidate's membership in the annotated kind, decided where the position
+/// materializes.
 #[test]
 fn a_refined_map_key_no_key_satisfies() {
     check_compile_error(
@@ -800,13 +799,13 @@ m
 }
 
 #[test]
-fn a_refined_map_key_in_a_mut_annotation_reaches_the_boundary() {
+fn a_refined_map_key_in_a_mut_annotation_is_reported() {
     check_compile_error(
         r#"
 m: Mut(Map({String where _ != ""}, Int)) := box(map([("a", 1), ("z", 2)]))
 m
 "#,
-        "produced an invalid tree: [Type mismatch for collection domain",
+        r#"Type mismatch for collection annotation: expected Σ (σ : SubtypesOf({String | __elem != ""})). (σ ⤇ _), found {String | __elem ▷ (([("a", 1), ("z", 2)] ≫ (λ __map_kv : (String, Int) → __map_kv.0)) ▷ collection_contains)}"#,
     )
 }
 
@@ -2114,7 +2113,7 @@ fn a_written_domain_admits_a_plain_collection(#[case] code: &str, #[case] expect
             sum(a) + sum(b)
         both([1, 2], [3, 4, 5])
     "},
-    "collection domains have no common answer"
+    "a collection over one domain does not stand in for a collection over another"
 )]
 #[case::a_sum_in_a_nominal_type(
     indoc! {"

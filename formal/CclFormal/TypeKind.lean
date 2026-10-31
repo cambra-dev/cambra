@@ -1,6 +1,7 @@
 import CclFormal.Subtyping
 import CclFormal.SubtypingIsReflexive
 import CclFormal.SubtypingIsTransitive
+import CclFormal.SubtypeCheckDecidesSubtyping
 
 /-!
 # What a Σ binder ranges over, and the order on it
@@ -22,10 +23,10 @@ the Σ rule. Two facts about it are proved here: containment transports membersh
 being reflexive and transitive — and it is transitive ([`ContainedIn.trans`]), which is what
 lets a chain of Σ edges compose.
 
-Membership itself is a relation, not a decision. What a caller with no graph to draw into
-decides instead is [`refuses`] — certain non-membership — and the one fact relating the two is
-that a refusal never lands on a member ([`not_admits_of_refuses`]). That direction is the whole
-of what makes a rejection legitimate, and it is what the bound arm's equality test broke.
+Membership is decided where a position materializes, once its type is a type
+(`constrain.rs :: admits_resolved`). On a resolved type that check is a decision, and
+[`admitsCheck`] is its image here: [`admitsCheck_iff_admits`] proves it decides exactly
+[`Admits`].
 
 A kind is **not** a `Ty`, and the direction matters: a kind admits many types and a type is
 admitted by many kinds, so there is no "kind of a type" to read off. What a type determines
@@ -61,13 +62,12 @@ inductive TypeKind.WellFormed : TypeKind → Prop where
   | everyType : TypeKind.WellFormed .everyType
 
 /-- Does `k` classify `d`? One constructor per type kind, because how each states which types
-it classifies is what the question turns on (`constrain.rs :: candidate_in_kind`).
+it classifies is what the question turns on (`constrain.rs :: admits`).
 
 Membership in a candidate list is **equality**, not subtyping: the list names its members,
 so being one of them is identity. At a Σ's witness that reading is also the one the position
 requires, since a data domain is invariant and a refined range is therefore a different
-candidate from the range it refines. Membership in a `subtypesOf` bound is subtyping, which
-is why the Rust draws it as an edge rather than deciding it structurally. -/
+candidate from the range it refines. Membership in a `subtypesOf` bound is subtyping. -/
 inductive Admits : TypeKind → Ty → Prop where
   | everyType {d} : Admits .everyType d
   | uintRanges {n} : Admits .uintRanges (.uintRange n)
@@ -116,101 +116,47 @@ theorem Admits.mono {M N : TypeKind} {d : Ty}
             | subtypesOf hwb => exact .subtypesOf (subtyping_trans hd hwa hwb hda hab)
   | uintRanges => exact ha
 
-/-! ## The decision a caller with no graph makes
+/-! ## The decision at materialization
 
-`Admits` is the relation; `ccl::ty::TypeKind::refuses` is what a caller decides when it has no
-graph to draw an edge into. The two are related in one direction only, and that direction is
-the whole of what makes a rejection legitimate.
+`ccl::infer::solver::constrain::admits_resolved` decides membership for a materialized position.
+It abstains only on an inference variable left in the type, which `Ty` does not carry, so on the
+modelled fragment it is a decision. A refinement is decided like any other type: by then its
+predicate has been coalesced, so equality and subtyping read it whole.
 -/
 
-mutual
+/-- `admits_resolved` on a resolved type: equality against the candidates, a dense range for
+`uintRanges` (a refinement over a range is not one), subtyping for a bound, anything for the
+universe. -/
+def admitsCheck : TypeKind → Ty → Bool
+  | .everyType, _ => true
+  | .uintRanges, .uintRange _ => true
+  | .uintRanges, _ => false
+  | .subtypesOf k, d => subtypeCheck d k
+  | .candidates ds, d => ds.any (Ty.beq d ·)
 
-/-- Does a refinement occur anywhere in this type?
-
-The model's image of `Type::holds_an_unresolved_position`. `Ty` carries no `Infer` and no
-`Hole`, so those disjuncts have nothing to range over and what is left is the refinement one:
-equality compares a predicate, and a predicate's own type slots are not reachable from the slot
-walk the Rust uses, so a refinement is treated as still open on both sides. -/
-def Ty.holdsARefinement : Ty → Bool
-  | .refined _ _ => true
-  | .base _ | .uintRange _ | .dataSource _ | .txn => false
-  | .fn _ _ d c => Ty.holdsARefinement d || Ty.holdsARefinement c
-  | .tuple ts => Ty.holdsARefinementSeq ts
-  | .record fs => Ty.holdsARefinementFields fs
-  | .variant tags => Ty.holdsARefinementTags tags
-termination_by t => sizeOf t
-decreasing_by all_goals (try simp_wf) <;> omega
-
-def Ty.holdsARefinementSeq : List Ty → Bool
-  | [] => false
-  | t :: rest => Ty.holdsARefinement t || Ty.holdsARefinementSeq rest
-termination_by ts => sizeOf ts
-decreasing_by all_goals (try simp_wf) <;> omega
-
-def Ty.holdsARefinementFields : List (String × Ty) → Bool
-  | [] => false
-  | (_, t) :: rest => Ty.holdsARefinement t || Ty.holdsARefinementFields rest
-termination_by fs => sizeOf fs
-decreasing_by all_goals (try simp_wf) <;> omega
-
-def Ty.holdsARefinementTags : List (FieldKey × Ty) → Bool
-  | [] => false
-  | (_, t) :: rest => Ty.holdsARefinement t || Ty.holdsARefinementTags rest
-termination_by ts => sizeOf ts
-decreasing_by all_goals (try simp_wf) <;> omega
-
-end
-
-/-- `ccl::ty::TypeKind::refuses`: **certain non-membership**, the only half of the membership
-question a caller may act on.
-
-Every caller turns the answer into a rejection — `answer_type_kinds` and `candidate_in_kind`
-raise `NotOfKind`, `coalesce_compact_go` raises `KindMismatch` — so a `true` where [`Admits`]
-holds refuses a program that type-checks. Two arms decide and two abstain. A bound abstains
-because its membership is subtyping, which the solver draws as an edge, so a caller with no
-graph has nothing to certify; the universe abstains because it refuses nothing at all.
-
-`Ty` carries no unresolved position, so these are the resolved fragment of the Rust's arms —
-its `Infer`/`Hole` abstentions have nothing here to range over. -/
-def refuses : TypeKind → Ty → Bool
-  | .everyType, _ => false
-  | .subtypesOf _, _ => false
-  | .uintRanges, .uintRange _ => false
-  | .uintRanges, _ => true
-  | .candidates ds, d =>
-      !d.holdsARefinement && !ds.any Ty.holdsARefinement && !ds.any (Ty.beq d ·)
-
-/-- **A refusal is sound**: nothing `refuses` rejects is a member.
-
-The property every caller rests on, and the one the equality test on a bound broke —
-[`a_bound_admits_what_equality_refuses`] carries the pair. Only the two deciding arms have
-content: an abstention is vacuous, since nothing reads a `false` here as membership. -/
-theorem not_admits_of_refuses : (K : TypeKind) → (d : Ty) → refuses K d = true → ¬ Admits K d
-  | .everyType, _, h => by simp [refuses] at h
-  | .subtypesOf _, _, h => by simp [refuses] at h
-  | .uintRanges, .uintRange _, h => by simp [refuses] at h
-  | .uintRanges, .base _, _ | .uintRanges, .dataSource _, _ | .uintRanges, .txn, _
-  | .uintRanges, .fn .., _ | .uintRanges, .tuple _, _ | .uintRanges, .record _, _
-  | .uintRanges, .variant _, _ | .uintRanges, .refined .., _ => by
+/-- **The check decides membership**: it accepts exactly the members, so a rejection never
+refuses a member and an acceptance never admits a non-member. -/
+theorem admitsCheck_iff_admits :
+    (K : TypeKind) → (d : Ty) → (admitsCheck K d = true ↔ Admits K d)
+  | .everyType, _ => by simp [admitsCheck, Admits.everyType]
+  | .uintRanges, .uintRange _ => by simp [admitsCheck, Admits.uintRanges]
+  | .uintRanges, .base _ | .uintRanges, .dataSource _ | .uintRanges, .txn
+  | .uintRanges, .fn .. | .uintRanges, .tuple _ | .uintRanges, .record _
+  | .uintRanges, .variant _ | .uintRanges, .refined .. => by
+      simp only [admitsCheck, Bool.false_eq_true, false_iff]
       intro ha; cases ha
-  | .candidates ds, d, h => by
-      intro ha
-      cases ha with
-      | candidates hmem =>
-          simp only [refuses, Bool.and_eq_true, Bool.not_eq_true', List.any_eq_false] at h
-          exact absurd ((Ty.beq_iff d d).mpr rfl) (by simpa using h.2 d hmem)
-
-/-- **A bound admits what equality refuses.** `{Int | p} <: Int`, so `subtypesOf Int` admits
-it, and the two are not equal — so the arm's old answer reported certain non-membership of a
-member, and every caller raised on it.
-
-`Ty` carries no unresolved position, so the arm's *other* old answer — a parameter that is
-`Infer` or `Hole`, admitting everything — has nothing here to exhibit. -/
-theorem a_bound_admits_what_equality_refuses :
-    Admits (.subtypesOf (.base .int)) (.refined (.base .int) [.litBool true])
-      ∧ Ty.beq (.refined (.base .int) [.litBool true]) (.base .int) = false := by
-  refine ⟨.subtypesOf (.refined rfl rfl (Or.inl (by simp)) ?_ (.base .int)), by simp [Ty.beq]⟩
-  simp [deficit]
+  | .subtypesOf k, d => by
+      rw [admitsCheck, subtypeCheck_iff_subtyping]
+      exact ⟨Admits.subtypesOf, fun ha => by cases ha; assumption⟩
+  | .candidates ds, d => by
+      simp only [admitsCheck, List.any_eq_true]
+      constructor
+      · rintro ⟨e, hmem, hbeq⟩
+        rw [(Ty.beq_iff d e).mp hbeq]
+        exact .candidates hmem
+      · intro ha
+        cases ha with
+        | candidates hmem => exact ⟨d, hmem, (Ty.beq_iff d d).mpr rfl⟩
 
 /-- Containment is **reflexive** over well-formed kinds, so a Σ edge between two spellings
 of one kind carries no obligation. -/

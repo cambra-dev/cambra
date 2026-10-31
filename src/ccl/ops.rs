@@ -328,10 +328,11 @@ pub enum Builtin {
     /// (`src/ccl/design/collections.md`, "Projecting a sum's witness"). The identity on the
     /// value: a sum's value is its collection, keys and all.
     ///
-    /// **Born after inference**, so it carries no scheme: the body is a function of the
-    /// witness, which a scheme cannot quantify over, so each use stamps its own type
-    /// ([`crate::ccl::ty::unbox_type`]) and the post-inference check holds the stamp to the
-    /// rule (`check_unbox` in `src/ccl/infer/check.rs`).
+    /// **No scheme**: the body is a function of the witness, which a scheme cannot quantify
+    /// over. Inference types each use `(𝑐 : 𝐴) ⇒ 𝐴‹elim(𝑐)›`, reading the binders of whatever
+    /// sum `𝐴` turns out to be through `𝑐` ([`crate::ccl::subst::Elim`]). A use minted after
+    /// inference stamps its own type ([`crate::ccl::ty::unbox_type`]), and the post-inference
+    /// check holds every use to the rule (`check_unbox` in `src/ccl/infer/check.rs`).
     Unbox,
     /// `empty_map : Σ (σ : SubtypesOf(𝐾)). σ ⤇ 𝑉` — the collection with no entries.
     /// **\[Interim\].**
@@ -351,9 +352,9 @@ pub enum Builtin {
     /// TODO(witness-kind-var): what this term asserts is the witness *kind*,
     /// `SubtypesOf` against [`TypeKind::UIntRanges`](crate::ccl::ty::TypeKind::UIntRanges),
     /// and it exists because [`TypeKind`](crate::ccl::ty::TypeKind) has no variable to
-    /// leave that open. The absence is justified on
-    /// [`TypeKind::refuses`](crate::ccl::ty::TypeKind::refuses) by a premise the empty
-    /// literal breaks: membership is decidable from the classified type, so the only thing
+    /// leave that open. The absence is justified by the membership check at materialization
+    /// (`constrain::admits_resolved`) on a premise the empty literal breaks: membership is
+    /// decidable from the classified type, so the only thing
     /// inference can be missing is that type. `[]` has a classified type, and its kind is
     /// therefore decided as `UIntRanges`, while zero rows witness no kind at all. A
     /// type-kind variable retires this term.
