@@ -1145,12 +1145,9 @@ fn a_tuple_of_folds_pairs_at_the_group() {
 }
 
 /// A tuple whose arms both keep the group's elements, a collection and a fold, is where a
-/// pair at the group and a pair at the innermost level differ. It fails before conversion, at
-/// substitution's `debug_assertions`-gated check for a discharged binder, and is pinned as it
-/// fails there. A build without that check compiles it, and `east` pairs `[1]` with 50 and
+/// pair at the group and a pair at the innermost level differ: `east` pairs `[1]` with 50 and
 /// `west` pairs `[2, 4]` with 300.
 #[test]
-#[cfg_attr(debug_assertions, should_panic(expected = "discharged binder"))]
 fn a_tuple_of_a_collection_and_a_fold_over_each_group() {
     check_tile(
         indoc! {r#"
@@ -1547,16 +1544,10 @@ fn expected_per_region_record() -> Tile {
     )
 }
 
-/// A nested `for` over a group's rows, `[r for g in groupby(xs, \s -> s) for r in g]`, does not
-/// compile. A debug build stops where a variable resolves to a type naming `xs` outside its
-/// telescope; without debug assertions the type check after inference finds `__anf` out of scope.
-///
-/// The program runs in a `cambra` child process with a time limit, since unbounded recursion
-/// aborts or exhausts the process rather than unwinding. The assertion reads its exit status and
-/// stderr.
+/// A nested `for` over a group's rows, `[r for g in groupby(xs, \s -> s) for r in g]`, runs to
+/// completion. It runs in a `cambra` child process with a time limit, so unbounded recursion,
+/// which aborts or exhausts the process rather than unwinding, fails this test alone.
 #[test]
-#[cfg_attr(debug_assertions, should_panic(expected = "outside its telescope"))]
-#[cfg_attr(not(debug_assertions), should_panic(expected = "Scope violation"))]
 fn a_nested_for_over_a_groups_rows() {
     // A healthy run of a program this size takes well under a second, so a few seconds already
     // shows it does not finish. The child's address space is capped as well, so a runaway

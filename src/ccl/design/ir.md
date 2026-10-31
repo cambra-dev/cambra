@@ -207,20 +207,48 @@ one.
 ### Lambda/Apply encoding of collection iteration
 
 Collection iteration uses ordinary function nodes in two shapes. A single-generator comprehension
-such as `[f(x) for x in xs]` becomes an outer lambda over an iteration position:
-`λ __iter_record → __iter_record ▷ (xs ▷ unbox) ▷ (λ x → f(x))`. The first application reads the
-source at that position, through `unbox`; the second maps its element through the body. Multiple generators nest
-those application and lambda pairs, with a product of source domains for the outer parameter.
+such as `[f(x) for x in xs]` becomes an outer lambda over an iteration position: `λ __iter_record →
+__iter_record ▷ (xs ▷ unbox) ▷ (λ x → f(x))`. The first application reads the source at that
+position, through `unbox`; the second maps its element through the body. Several generators build
+one collection over tuples of positions ([Several generators](#several-generators)).
 `ccl/comprehension.rs` builds both, and the `__iter_record` binder it mints is a `Synthetic`:
-α-uniquification has already run, so a raw spelling would shadow its twin in a nested
-comprehension. A feed-only or yield-only statement loop without loop-carried mutation is built at
-lowering as `xs ▷ unbox ≫ (λ x → body)` (`lower/loops.rs`) and indexed by the comprehension phase
-to the same form, `λ 𝑟 → (𝑟 ▷ (xs ▷ unbox)) ▷ (λ x → body)` (`ccl_utils::loop_parts` reads one).
-Both forms use existing
+α-uniquification has already run, so a raw spelling would shadow its twin in a nested comprehension.
+A feed-only or yield-only statement loop without loop-carried mutation is built at lowering as `xs ▷
+unbox ≫ (λ x → body)` (`lower/loops.rs`) and indexed by the comprehension phase to the same form, `λ
+𝑟 → (𝑟 ▷ (xs ▷ unbox)) ▷ (λ x → body)` (`ccl_utils::loop_parts` reads one). Both forms use existing
 function nodes; mutation and transaction loops instead retain a structured `For`. `lambda_elim`
 removes the lambdas and produces point-free combinators; operator conversion builds the dataflow
 operators. See [lambda elimination](optimization.md#lambda-elimination-ccllambda_elimrs) and the
 [operational lowering model](/docs/operational-semantics/lowering.md).
+
+#### Several generators
+
+A comprehension over several generators is the comprehension over the first generator of the
+comprehensions over the rest, flattened by `uncurry(𝑛)`:
+
+```text
+[e for a in S for b in T]
+  ⟹  (λ r → r ▷ (S ▷ unbox) ▷ (λ a → λ r' → r' ▷ (T ▷ unbox) ▷ (λ b → e))) ▷ uncurry
+```
+
+`uncurry(𝑛) : ((𝑘₁ : 𝐴₁) ⤇ (… ⤇ ((𝑘ₙ : 𝐴ₙ) ⤇ 𝑉))) ⇒ (((𝑘₁ : 𝐴₁) × … × 𝐴ₙ) ⤇ 𝑉)`, where each
+`𝐴ᵢ` may read the keys outside it, turns the `𝑛` nested collections into one collection keyed by
+the tuple of their positions, one component per generator; `uncurry` alone is `uncurry(2)`. Where
+an inner generator's source reads an outer element, as in `[x for xs in xss for x in xs]`, its
+keys depend on the outer key and the tuple is dependent
+([type-inference.md, "4.8 Dependent tuples"](type-inference.md#48-dependent-tuples)); elsewhere it
+is the plain tuple. Each level is a one-generator encoding.
+
+The filters of every generator form one filter, stated as the same nest over the filter's value,
+flattened the same way and read at the element: `__elem ▷ ((λ r → … (λ b → p)) ▷ uncurry(𝑛))` on
+a cast of the flattened collection. The filter is a collection keyed as the result is, so reading
+it at `__elem` is an application at the domain, which `uncurry(𝑛)`'s scheme types whether or not
+the tuple is dependent. It is not split across the levels: join planning reads the equalities
+between generators off the one filter over the tuple (`planning/join.rs`). A source that may be a
+sum is bound ahead of the whole nest, so the filter's copy of it reads the name its level reads. A
+source that reads an outer element is bound ahead of its own level instead, inside the element
+binder it reads: the level's domain is the source's projection, and A-normalization would name a
+source left in place inside the level, out of the domain's scope.
 
 ### `MutDecl` — the mutable variable introduction
 

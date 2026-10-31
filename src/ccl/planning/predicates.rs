@@ -196,12 +196,14 @@ fn types_read_element(e: &Expr) -> bool {
 /// Fast-pathed when the bare predicate is already that single application; otherwise
 /// η-expands to `λ __elem → bare` and lambda-eliminates to point-free.
 ///
-/// The fast path returns `p` as it stands, and lambda elimination leaves predicates alone, so
-/// `p` can still hold a lambda. The one predicate of that shape is a membership refinement, a
-/// group-by's key domain `__elem ▷ ((c ≫ λ 𝑒 → key) ▷ collection_contains)`, which is carried
-/// and never executed: an iteration site enumerates the collection's image instead
-/// (`iterate::membership_keys`). A `p` holding a `defer`, from a generator called in the key,
-/// runs [`eliminate_lifted`] on itself, which channelizes it.
+/// Lambda elimination leaves predicates alone, so `p` can still hold a lambda. A comprehension's
+/// filter predicate is the filter's nest read at the element, `__elem ▷ (𝑛𝑒𝑠𝑡 ▷ uncurry(𝑛))`
+/// (`src/ccl/design/ir.md`, "Several generators"), and the fast path eliminates its `p`
+/// ([`eliminate_lifted`]). A membership refinement, a group-by's key domain
+/// `__elem ▷ ((c ≫ λ 𝑒 → key) ▷ collection_contains)`, is carried and never executed: an
+/// iteration site enumerates the collection's image instead (`iterate::membership_keys`), so its
+/// `p` stays as it stands unless it holds a `defer`, from a generator called in the key, which
+/// [`eliminate_lifted`] channelizes.
 ///
 /// The function is a **collection**: it yields one `Bool` per element of what the refinement
 /// refines, and the runtime `Restrict` evaluates it over the extent
@@ -225,9 +227,15 @@ pub(crate) fn fn_of_bare_predicate(
         && matches!(&argument.node, TypedExprNode::Var(n) if n.is_elem())
         && crate::ccl::subst::free_elem_indices(function).is_empty()
     {
-        if crate::ccl::channelize::holds_defer(function) {
+        let membership = matches!(
+            &function.node,
+            TypedExprNode::Apply { function: contains, .. }
+                if is_builtin(contains, Builtin::CollectionContains)
+        );
+        if crate::ccl::channelize::holds_defer(function) || (!membership && holds_lambda(function))
+        {
             return eliminate_lifted((**function).clone())
-                .expect("lambda-elim of a refinement predicate holding a `defer`");
+                .expect("lambda-elim of a refinement predicate");
         }
         return (**function).clone();
     }
@@ -306,6 +314,13 @@ pub(crate) fn eliminate_lifted(term: Expr) -> Result<Expr, lambda_elim::LambdaEl
         );
     }
     Ok(eliminated)
+}
+
+/// Whether `e`'s term holds a lambda.
+fn holds_lambda(e: &Expr) -> bool {
+    let mut found = matches!(e.node, TypedExprNode::Lambda { .. });
+    e.walk_children(|c| found |= !found && holds_lambda(c));
+    found
 }
 
 /// The first node in `e`'s term that a pass between inference and planning rewrites

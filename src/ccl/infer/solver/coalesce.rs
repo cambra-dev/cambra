@@ -187,6 +187,9 @@ pub fn refuse_param_joined_with_outer_variable(graph: &CompactGraph) -> Result<(
         for field in ct.rec.iter().flat_map(|fields| fields.values()) {
             go(field, polarity)?;
         }
+        for component in ct.dep_tuple.iter().flat_map(|d| &d.components) {
+            go(component, polarity)?;
+        }
         for payload in ct.var.iter().flat_map(|tags| tags.tags.values()) {
             go(payload, polarity)?;
         }
@@ -492,6 +495,16 @@ fn coalesce_compact_go(
         let vars: Vec<InferVarId> = ct.vars.iter().copied().collect();
         shapes.push(materialize_record(rec, polarity, &vars, scope)?);
     }
+    // A dependent tuple's components arrive closed against the binders before them, so the
+    // tuple is the telescope of their materializations, or the plain tuple where no component
+    // reads an earlier one (`Type::dep_tuple`).
+    if let Some(dep) = &ct.dep_tuple {
+        let mut components = Vec::with_capacity(dep.components.len());
+        for (name, c) in dep.names.iter().zip(&dep.components) {
+            components.push((name.clone(), coalesce_compact_go(c, polarity, scope)?));
+        }
+        shapes.push(Type::dep_tuple(components));
+    }
     if let Some(var) = &ct.var {
         shapes.push(materialize_variant(var, polarity, scope)?);
     }
@@ -792,8 +805,11 @@ fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
             ct.history_slot = Some(history);
             break;
         }
-        let has_other =
-            !ct.atoms.is_empty() || ct.rec.is_some() || ct.var.is_some() || ct.fun.is_some();
+        let has_other = !ct.atoms.is_empty()
+            || ct.rec.is_some()
+            || ct.dep_tuple.is_some()
+            || ct.var.is_some()
+            || ct.fun.is_some();
         if !has_other {
             ct.history_slot = Some(history);
             break;

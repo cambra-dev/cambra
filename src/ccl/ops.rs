@@ -410,8 +410,13 @@ pub enum Builtin {
     Compose,
     /// `converse : (A → K) → (K → (A → A))` — group-by-key combinator.
     Converse,
-    /// `uncurry : (A → (B → C)) → ((A, B) → C)`.
-    Uncurry,
+    /// `uncurry(𝑛) : ((𝑘₁ : 𝐴₁) ⤇ (… ⤇ ((𝑘ₙ : 𝐴ₙ) ⤇ 𝑉))) ⇒ (((𝑘₁ : 𝐴₁) × … × 𝐴ₙ) ⤇ 𝑉)`, for
+    /// `𝑛 ≥ 2`, each `𝐴ᵢ` reading the keys outside it — flatten `𝑛` collection levels into one
+    /// collection keyed by the tuple of their keys, a dependent tuple where a level's keys read
+    /// an outer key. Visible to inference
+    /// ([`OperatorSchemes`](crate::ccl::infer::OperatorSchemes) builds the scheme for each
+    /// arity).
+    Uncurry(usize),
     /// `restrict : (D ⤇ Bool) ⇒ (D ⤇ T) ⇒ ({d: D | p(d)} ⤇ T)` —
     /// mid-chain filter step.
     ///
@@ -863,7 +868,7 @@ impl Builtin {
             Self::MapDomain => "map_domain",
             Self::Compose => "compose",
             Self::Converse => "converse",
-            Self::Uncurry => "uncurry",
+            Self::Uncurry(_) => "uncurry",
             Self::Restrict => "restrict",
             Self::Iterate => "iterate",
             Self::PermuteDomain => "permute_domain",
@@ -976,7 +981,7 @@ impl Builtin {
                 self,
                 Self::Converse
                     | Self::MapDomain
-                    | Self::Uncurry
+                    | Self::Uncurry(_)
                     | Self::PermuteDomain
                     | Self::FlattenDomain
                     | Self::Copair

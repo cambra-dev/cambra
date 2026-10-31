@@ -760,14 +760,18 @@ fn reduce_application(
                     .with_ty(ty.clone()),
                 )
             }
-            TypedExprNode::Builtin(Builtin::Uncurry) => {
+            // At a tuple `(𝑘₁, …, 𝑘ₙ)`, `uncurry(𝑛)` of `𝑔` reads `𝑘ₙ ▷ (… ▷ (𝑘₁ ▷ 𝑔))`.
+            TypedExprNode::Builtin(Builtin::Uncurry(n)) => {
                 let project = |k: usize| {
                     Expr::throwaway(TypedExprNode::Proj(ProjKey::Index(k))).with_ty(Type::Hole)
                 };
-                let first = applied(a(), project(0), Type::Hole, fuel);
-                let second = applied(a(), project(1), Type::Hole, fuel);
-                let curried = applied(first, inner.clone_preserving_ids(), Type::Hole, fuel);
-                Some(applied(second, curried, ty.clone(), fuel))
+                let mut level = inner.clone_preserving_ids();
+                for k in 0..*n {
+                    let key = applied(a(), project(k), Type::Hole, fuel);
+                    let at = if k + 1 == *n { ty.clone() } else { Type::Hole };
+                    level = applied(key, level, at, fuel);
+                }
+                Some(level)
             }
             _ => None,
         },
@@ -1955,8 +1959,11 @@ pub fn make_restrict_stating(stated: Expr, predicate: Expr, upstream: Expr) -> E
         .expect("restrict upstream must have a function type D ⤇ T");
     debug_assert!(
         {
+            // A binder name is a spelling, as a dependent tuple's component names are, so two
+            // domains spelled under different binders are one domain.
             let (u, d) = (strip_refinements(&upstream_dom), strip_refinements(&domain));
-            u == d || (matches!(u, Type::WitnessRef(_)) && matches!(d, Type::WitnessRef(_)))
+            u.without_pi_names() == d.without_pi_names()
+                || (matches!(u, Type::WitnessRef(_)) && matches!(d, Type::WitnessRef(_)))
         },
         "restrict upstream domain {upstream_dom} must match predicate domain {domain}",
     );
@@ -3002,6 +3009,62 @@ impl TermMemo {
             }
         }
     }
+}
+
+/// The predicate each predicate an inference run derived was derived from: a transport's
+/// copy ([`Subst::force_refinement`]) and a coalesce rebuild each record one
+/// (`src/ccl/design/type-inference.md`, "Copies of one predicate share after coalesce").
+/// Keyed by the derived predicate's allocation; each entry keeps both terms alive, so neither
+/// address is reused while the run lasts.
+type Derivations = HashMap<PredicateId, (Rc<Expr>, Rc<Expr>)>;
+
+thread_local! {
+    static DERIVATIONS: RefCell<Option<Derivations>> = const { RefCell::new(None) };
+}
+
+/// Records derivations ([`record_derivation`]) until dropped. One per inference run, held by
+/// [`crate::ccl::infer::InferArena`].
+pub(crate) struct RecordingDerivations(());
+
+impl RecordingDerivations {
+    pub(crate) fn start() -> Self {
+        DERIVATIONS.with(|d| *d.borrow_mut() = Some(HashMap::new()));
+        RecordingDerivations(())
+    }
+}
+
+impl Drop for RecordingDerivations {
+    fn drop(&mut self) {
+        DERIVATIONS.with(|d| d.borrow_mut().take());
+    }
+}
+
+/// Record that `to` was derived from `from`, while a run records derivations.
+pub(crate) fn record_derivation(from: &Rc<Expr>, to: &Rc<Expr>) {
+    if Rc::ptr_eq(from, to) {
+        return;
+    }
+    DERIVATIONS.with(|d| {
+        if let Some(d) = d.borrow_mut().as_mut() {
+            d.entry(Rc::as_ptr(to))
+                .or_insert_with(|| (Rc::clone(to), Rc::clone(from)));
+        }
+    });
+}
+
+/// The predicate `predicate` was derived from, through every recorded derivation: itself
+/// where none is recorded.
+pub(crate) fn derivation_origin(predicate: &Rc<Expr>) -> Rc<Expr> {
+    DERIVATIONS.with(|d| {
+        let d = d.borrow();
+        let mut at = Rc::clone(predicate);
+        if let Some(d) = d.as_ref() {
+            while let Some((_, from)) = d.get(&Rc::as_ptr(&at)) {
+                at = Rc::clone(from);
+            }
+        }
+        at
+    })
 }
 
 /// Reachable refinements in walk order, deduplicated by predicate allocation.

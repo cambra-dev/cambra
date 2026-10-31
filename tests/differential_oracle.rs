@@ -500,13 +500,11 @@ fn atom_json(a: &AtomKey) -> Option<String> {
         // A witness reference is a name for whichever domain a Σ picked, and the model
         // has no witness — outside the fragment for the same reason `ChanDom` is. Nor
         // does it have type parameters, which exist only inside a polymorphic
-        // definition's body. A dependent tuple's components read one another by
-        // index, and the model has no binders. A witness projection names a witness
-        // through a term, which the model has neither of.
+        // definition's body. A witness projection names a witness through a term,
+        // which the model has neither of.
         AtomKey::ChanDom(..)
         | AtomKey::Witness(..)
         | AtomKey::Param(..)
-        | AtomKey::DepTuple(..)
         | AtomKey::Projection(..) => return None,
     })
 }
@@ -523,10 +521,12 @@ fn atom_json(a: &AtomKey) -> Option<String> {
 /// - `Openness` has no field. Nothing is hidden inside the generated fragment:
 ///   every generated arm set is closed and `meet_openness` keeps it closed.
 ///
-/// `None` for a contribution outside the fragment — a history slot, a `ChanDom`
-/// atom, or a predicate outside the modeled `Predicate` vocabulary.
+/// `None` for a contribution outside the fragment — a history slot, a dependent
+/// tuple, a `ChanDom` atom, or a predicate outside the modeled `Predicate` vocabulary.
 fn cty_json(ct: &CompactType) -> Option<String> {
-    if ct.history_slot.is_some() {
+    // A dependent tuple's components read one another by name, and the model has no
+    // binders.
+    if ct.history_slot.is_some() || ct.dep_tuple.is_some() {
         return None;
     }
     let atoms: Option<Vec<String>> = ct.atoms.iter().map(atom_json).collect();

@@ -18,11 +18,11 @@
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{
-    PredMemo, apply_primitive, cast_target_refinement, compose_typed_or_hole, count_free,
+    apply_primitive, cast_target_refinement, compose_typed_or_hole, count_free,
 };
 use crate::ccl::{
-    BaseType, BindingTransparency, Builtin, Expr, FunKind, Lit, Name, Refinement, Type,
-    TypedBinding, TypedExpr, TypedExprNode, provenance::NodeId,
+    BindingTransparency, Builtin, Expr, FunKind, Name, Refinement, Type, TypedBinding, TypedExpr,
+    TypedExprNode, provenance::NodeId,
 };
 
 /// A feed out of a loop, lifted out of the loop with the values it fed: `view` holds them,
@@ -91,86 +91,41 @@ pub(crate) fn key_by_positions(value: Expr, levels: usize) -> Expr {
 /// those: `out << [[1, 2], [3]]` appends a collection of collections whole, so nothing of it
 /// is flattened.
 ///
-pub(crate) fn flatten_nested_contribution(mut value: Expr, levels: usize) -> Expr {
-    for level in 0..levels.saturating_sub(1) {
-        let Levels {
-            outer_name,
-            outer,
-            inner_name,
-            keys,
-            elem,
-        } = outer_levels(&value.ty);
-        let paired = keyed_by(
-            vec![
-                (outer_name.clone(), outer.clone()),
-                (inner_name.clone(), keys.clone()),
-            ],
-            elem.clone(),
-        );
-        value = apply_primitive(value, Builtin::Uncurry, paired.clone());
-        // Past the first level the outer key is the tuple this loop built, and it is spliced
-        // open: a feed under three loops is keyed by the three positions, not by a pair of a
-        // pair and a position (`docs/chl-spec.md`, "8.4 Feeds are the second form of
-        // mutability"). A loop's own key that is a tuple stays one; only the position this
-        // flattening paired is spliced.
-        if level > 0 {
-            let flat = spliced(outer_name.as_ref(), &outer, inner_name, keys, elem);
-            let positions = Expr::list(vec![
-                Expr::lit(Lit::Int(0)).with_ty(Type::Base(BaseType::Int)),
-            ])
-            .with_ty(Type::data_fun(
-                Type::UIntRange(1),
-                Type::Base(BaseType::Int),
-            ));
-            let flatten = apply_primitive(
-                positions,
-                Builtin::FlattenDomain,
-                Type::fun(paired, flat.clone()),
-            );
-            value = crate::ccl::ccl_utils::apply_function(value, flatten, flat);
-        }
+pub(crate) fn flatten_nested_contribution(value: Expr, levels: usize) -> Expr {
+    if levels < 2 {
+        return value;
     }
-    value
+    // One `uncurry(𝑛)` keys the outer `levels` levels by the tuple of their positions: a feed
+    // under three loops is keyed by the three positions, not by a pair of a pair and a position
+    // (`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability"). A loop's own key
+    // that is a tuple stays one component.
+    let (components, elem) = opened_levels(&value.ty, levels);
+    let flat = keyed_by(components, elem);
+    apply_primitive(value, Builtin::Uncurry(levels), flat)
 }
 
-/// The two outer collection levels of a contribution, `(𝑘₀ : 𝐴) ⤇ (𝑘₁ : 𝐾) ⤇ 𝐸`, opened
-/// by name: `keys` (`𝐾`) may read `outer_name`, and `elem` (`𝐸`) both names. An inner loop
-/// whose positions depend on the outer loop's value is the case where `𝐾` reads `𝑘₀`.
-struct Levels {
-    outer_name: Option<Name>,
-    outer: Type,
-    inner_name: Option<Name>,
-    keys: Type,
-    elem: Type,
-}
-
-fn outer_levels(ty: &Type) -> Levels {
-    let Type::Fun {
-        fun_kind: FunKind::Data(_),
-        name: outer_name,
-        domain: outer,
-        codomain: inner,
-    } = ty.peel_refinements()
-    else {
-        unreachable!("a contribution has a collection level per loop it was fed under")
-    };
-    let inner = crate::ccl::subst::open_codomain(ty, inner);
-    let Type::Fun {
-        fun_kind: FunKind::Data(_),
-        name: inner_name,
-        domain: keys,
-        codomain: elem,
-    } = inner.peel_refinements()
-    else {
-        unreachable!("a contribution has a collection level per loop it was fed under")
-    };
-    Levels {
-        outer_name: outer_name.clone(),
-        outer: (**outer).clone(),
-        inner_name: inner_name.clone(),
-        keys: (**keys).clone(),
-        elem: crate::ccl::subst::open_codomain(inner.peel_refinements(), elem),
+/// The outer `levels` collection levels of a contribution, `(𝑘₀ : 𝐴₀) ⤇ … ⤇ (𝑘ₙ : 𝐴ₙ) ⤇ 𝐸`,
+/// opened by name: each level's keys may read the levels above it, and `𝐸` all of them. An
+/// inner loop whose positions depend on an outer loop's value is the case where `𝐴ᵢ` reads
+/// `𝑘ⱼ` for `𝑗 < 𝑖`.
+fn opened_levels(ty: &Type, levels: usize) -> (Vec<(Option<Name>, Type)>, Type) {
+    let mut components = Vec::with_capacity(levels);
+    let mut current = ty.clone();
+    for _ in 0..levels {
+        let level = current.peel_refinements().clone();
+        let Type::Fun {
+            fun_kind: FunKind::Data(_),
+            name,
+            domain,
+            codomain,
+        } = &level
+        else {
+            unreachable!("a contribution has a collection level per loop it was fed under")
+        };
+        components.push((name.clone(), (**domain).clone()));
+        current = crate::ccl::subst::open_codomain(&level, codomain);
     }
+    (components, current)
 }
 
 /// The collection `(key : (𝑐₀ : 𝐶₀) × … × 𝐶ₙ) ⤇ 𝐸` over the telescope `components`, with
@@ -207,61 +162,6 @@ fn keyed_by(components: Vec<(Option<Name>, Type)>, elem: Type) -> Type {
     } else {
         Type::data_fun(tuple, elem)
     }
-}
-
-/// The collection over `outer`'s components followed by `keys`, where `outer` is the tuple of
-/// positions an earlier level built and `outer_name` the binder `keys` and `elem` read it
-/// through: each read `outer_name.𝑗` becomes the spliced key's component `𝑗`
-/// (`src/ccl/design/type-inference.md`, "Flattening").
-fn spliced(
-    outer_name: Option<&Name>,
-    outer: &Type,
-    inner_name: Option<Name>,
-    mut keys: Type,
-    mut elem: Type,
-) -> Type {
-    let prefix: Vec<(Option<Name>, Type)> = match outer {
-        Type::Tuple(ts) => ts.iter().map(|t| (None, t.clone())).collect(),
-        Type::DepTuple(cs) => cs.clone(),
-        other => unreachable!("the level above was flattened to a tuple, got {other}"),
-    };
-    let names = crate::ccl::subst::tuple_component_names(&prefix);
-    let opened = crate::ccl::subst::open_tuple_components(&prefix, |j, _| {
-        crate::ccl::subst::Mapping::Rename(names[j].clone())
-    });
-    if let Some(outer_name) = outer_name {
-        let components: Vec<Expr> = names
-            .iter()
-            .zip(&opened)
-            .map(|(name, ty)| Expr::var(name).with_ty(ty.clone()))
-            .collect();
-        let memo = PredMemo::new();
-        crate::ccl::subst::rewrite_pairing_projections_memo(
-            outer_name,
-            &components,
-            &mut keys,
-            &memo,
-        );
-        crate::ccl::subst::rewrite_pairing_projections_memo(
-            outer_name,
-            &components,
-            &mut elem,
-            &memo,
-        );
-        assert!(
-            !crate::ccl::subst::type_free_vars(&keys).contains(outer_name)
-                && !crate::ccl::subst::type_free_vars(&elem).contains(outer_name),
-            "a nested feed's keys and rows read an earlier level's key only through its \
-             components"
-        );
-    }
-    let components = names
-        .into_iter()
-        .map(Some)
-        .zip(opened)
-        .chain([(inner_name, keys)])
-        .collect();
-    keyed_by(components, elem)
 }
 
 /// A feed's contribution from under nested loops, rebuilt over the product of the loops'

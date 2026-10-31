@@ -40,6 +40,28 @@ fn split_join_conditions(refinement: &Expr, rec_ty: &Type) -> (Vec<(Expr, Expr)>
     // env: element binder name → its extraction morphism `rec.i ▷ li` (over rec).
     let mut env: Vec<(Name, Expr)> = Vec::new();
     let mut cur = refinement;
+    // A comprehension over several generators states its filter as the filter's nest read at
+    // the element, `rec ▷ (𝑛𝑒𝑠𝑡 ▷ uncurry(𝑛))` (`src/ccl/design/ir.md`, "Several generators"):
+    // level `𝑖`, `λ 𝑟ᵢ → 𝑟ᵢ ▷ 𝑙ᵢ ▷ (λ 𝑣ᵢ → …)`, binds `𝑣ᵢ` to `rec.𝑖 ▷ 𝑙ᵢ`. A dependent tuple's
+    // components are not independent arms, so its filter is one residual.
+    if let Some((levels, inner)) = filter_nest_levels(refinement)
+        && let Type::Tuple(components) = rec_ty.peel_refinements()
+    {
+        for (i, (element, source)) in levels.into_iter().enumerate() {
+            let component = components[i].clone();
+            let position = Expr::apply(
+                Expr::var(Name::elem()).with_ty(rec_ty.clone()),
+                Expr::proj_index(i).with_ty(Type::fun(rec_ty.clone(), component.clone())),
+            )
+            .with_ty(component);
+            let read_ty = source.ty.codomain().unwrap_or(Type::Hole);
+            env.push((
+                element,
+                Expr::apply(position, source.clone()).with_ty(read_ty),
+            ));
+        }
+        cur = inner;
+    }
     while let TypedExprNode::Apply { argument, function } = &cur.node
         && let TypedExprNode::Lambda {
             param, body: inner, ..
@@ -57,6 +79,70 @@ fn split_join_conditions(refinement: &Expr, rec_ty: &Type) -> (Vec<(Expr, Expr)>
         &mut other_preds,
     );
     (eq_conds, other_preds)
+}
+
+/// The levels of a filter stated as a nest read at the element, `__elem ▷ (𝑛𝑒𝑠𝑡 ▷ uncurry(𝑛))`,
+/// outermost first: each level's element binder `𝑣ᵢ` and the source `𝑙ᵢ` its position is read
+/// in, `λ 𝑟ᵢ → 𝑟ᵢ ▷ 𝑙ᵢ ▷ (λ 𝑣ᵢ → …)`, and the filter's value inside the innermost level. `None`
+/// for any other shape.
+fn filter_nest_levels(predicate: &Expr) -> Option<(Vec<(Name, &Expr)>, &Expr)> {
+    let TypedExprNode::Apply { argument, function } = &predicate.node else {
+        return None;
+    };
+    if !matches!(&argument.node, TypedExprNode::Var(n) if *n == Name::elem()) {
+        return None;
+    }
+    let TypedExprNode::Apply {
+        argument: nest,
+        function: uncurry,
+    } = &function.node
+    else {
+        return None;
+    };
+    let TypedExprNode::Builtin(Builtin::Uncurry(n)) = uncurry.node else {
+        return None;
+    };
+    let mut levels = Vec::with_capacity(n);
+    let mut level: &Expr = nest;
+    for i in 0..n {
+        let TypedExprNode::Lambda {
+            param: position,
+            body,
+        } = &level.node
+        else {
+            return None;
+        };
+        let TypedExprNode::Apply {
+            argument: read,
+            function: per_element,
+        } = &body.node
+        else {
+            return None;
+        };
+        let TypedExprNode::Apply {
+            argument: at,
+            function: source,
+        } = &read.node
+        else {
+            return None;
+        };
+        if !matches!(&at.node, TypedExprNode::Var(r) if *r == position.name) {
+            return None;
+        }
+        let TypedExprNode::Lambda {
+            param: element,
+            body: inner,
+        } = &per_element.node
+        else {
+            return None;
+        };
+        levels.push((element.name.clone(), source.as_ref()));
+        level = inner;
+        if i + 1 == n {
+            return Some((levels, inner));
+        }
+    }
+    None
 }
 
 /// Decompose the innermost boolean of a join predicate into equality conditions
@@ -844,7 +930,7 @@ fn join_plan_to_expr(
             // uncurry: (probe_output_ty, build_output_ty) -> build_output_ty
             let uncurry = apply_primitive(
                 probe_expr,
-                Builtin::Uncurry,
+                Builtin::Uncurry(2),
                 Type::data_fun(
                     Type::Tuple(vec![probe_output_ty.clone(), build_output_ty.clone()]),
                     build_output_ty.clone(),

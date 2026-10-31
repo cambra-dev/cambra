@@ -287,6 +287,12 @@ fn is_atomic(e: &Expr, muts: &Muts) -> bool {
     }
 }
 
+/// [`is_atomic`] with no mutable variable in scope: whether a term is named where it stands, for
+/// a binding the comprehension phase makes after this pass has run (`crate::ccl::comprehension`).
+pub(crate) fn is_atomic_term(e: &Expr) -> bool {
+    is_atomic(e, &Muts::new())
+}
+
 /// Normalize `e` in a "tail" position — one that is already going to be
 /// consumed by an existing binder or sealed scope (a `Let`/`MutDecl` body, a
 /// `Lambda`/`Case`-branch body, `For`/`Begin` bodies, `ExprStmt`'s own `expr`

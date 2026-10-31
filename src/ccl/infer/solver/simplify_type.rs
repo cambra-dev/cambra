@@ -226,6 +226,19 @@ fn simplify_analyze(
             );
         }
     }
+    // A dependent tuple's components recurse as a tuple's fields do.
+    if let Some(dep) = &ct.dep_tuple {
+        for v in &dep.components {
+            simplify_analyze(
+                v,
+                pol,
+                input_rec_vars,
+                all_vars,
+                rec_processed,
+                co_occurrences,
+            );
+        }
+    }
     // Variant payloads recurse at the same polarity (covariant depth),
     // matching how records' payloads behave.
     if let Some(tags) = &ct.var {
@@ -384,6 +397,15 @@ fn simplify_reconstruct(
         ..h
     });
 
+    let new_dep_tuple = ct.dep_tuple.map(|d| super::compact::CompactDepTuple {
+        names: d.names,
+        components: d
+            .components
+            .into_iter()
+            .map(|c| simplify_reconstruct(c, var_subst))
+            .collect(),
+    });
+
     let new_nominal = ct
         .nominal
         .into_iter()
@@ -407,6 +429,7 @@ fn simplify_reconstruct(
         fun: new_fun,
         refinements: ct.refinements,
         history_slot: new_history_slot,
+        dep_tuple: new_dep_tuple,
         nominal: new_nominal,
         nominal_conflict: ct.nominal_conflict.map(|(decl, a, b)| {
             (

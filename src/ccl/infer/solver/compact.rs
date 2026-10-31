@@ -78,22 +78,16 @@ pub enum AtomKey {
     /// `String` do (`src/ccl/design/type-parameters.md`, "Subtyping with a type
     /// parameter").
     Param(Rc<crate::ccl::ty::TypeParam>),
-    /// A dependent tuple, which matches only a tuple equal to it up to binder
-    /// names ([`ClosedAtom`]). The lattice's product slot keys fields with
-    /// nothing in scope between them, so a telescope rides as a whole; comparing
-    /// its components under subtyping is not represented here.
-    DepTuple(ClosedAtom),
     /// A witness projected through a sum's value ([`Type::WitnessProjection`]), which
     /// matches only a projection equal to it: one witness, named the same way.
     Projection(ClosedAtom),
 }
 
-/// A type born after inference, held whole as an [`AtomKey`]: a [`Type::DepTuple`] or a
-/// [`Type::WitnessProjection`]. It holds no inference variable, so the solver has nothing to
+/// A type held whole as an [`AtomKey`]: a [`Type::WitnessProjection`]. It holds no inference variable, so the solver has nothing to
 /// relate inside it, and it matches only a type `==` to it up to binder names, which
 /// [`Type::without_pi_names`] strips (references are indices, so nothing else names a binder). `==`
 /// on a refinement ignores its predicate's type slots, so the atom is keyed by `Type`'s own `Hash`,
-/// which ignores them too, and not by the content hash, which reads them. Two unequal tuples
+/// which ignores them too, and not by the content hash, which reads them. Two unequal projections
 /// sharing a hash are told apart by `rank`, the order in which this thread first met each
 /// ([`rank_among_equal_hashes`]).
 #[derive(Debug, Clone)]
@@ -105,24 +99,6 @@ pub struct ClosedAtom {
 
 impl ClosedAtom {
     fn new(ty: &Type) -> Self {
-        // `Hash` and `==` read a reference between components as an index, so a component
-        // naming an earlier one by name would compare by its spelling, and two α-equivalent
-        // tuples would land apart. `Type::dep_tuple` closes them.
-        debug_assert!(
-            match ty.peel_refinements() {
-                Type::DepTuple(components) => components.iter().enumerate().all(|(k, (_, t))| {
-                    components[..k]
-                        .iter()
-                        .filter_map(|(name, _)| name.as_ref())
-                        .all(|name| !crate::ccl::ccl_utils::is_free_in_type(name, t))
-                }),
-                _ => true,
-            },
-            "a dependent tuple whose component names an earlier one by name, not by index: \
-             {ty} (build with Type::dep_tuple)"
-        );
-        // `extrude` and `freshen_above` return the tuple as it is, which is right only for a
-        // tuple holding no variable.
         debug_assert!(
             !crate::ccl::subst::type_contains_infer(ty),
             "a closed atom is born after inference and the solver holds it whole: {ty}"
@@ -200,7 +176,6 @@ impl AtomKey {
             Type::WitnessRef(b) => Some(AtomKey::Witness(*b)),
             Type::ChanDom(n, l) => Some(AtomKey::ChanDom(n.clone(), *l)),
             Type::Param(p) => Some(AtomKey::Param(Rc::clone(p))),
-            Type::DepTuple(_) => Some(AtomKey::DepTuple(ClosedAtom::new(ty))),
             Type::WitnessProjection(_) => Some(AtomKey::Projection(ClosedAtom::new(ty))),
             _ => None,
         }
@@ -215,7 +190,7 @@ impl AtomKey {
             AtomKey::Witness(b) => Type::WitnessRef(*b),
             AtomKey::ChanDom(n, l) => Type::ChanDom(n.clone(), *l),
             AtomKey::Param(p) => Type::Param(Rc::clone(p)),
-            AtomKey::DepTuple(a) | AtomKey::Projection(a) => (*a.ty).clone(),
+            AtomKey::Projection(a) => (*a.ty).clone(),
         }
     }
 }
@@ -613,6 +588,16 @@ pub struct CompactHistory {
     pub kind: HistoryKind,
 }
 
+/// A dependent tuple in a compacted position: each component's binder and the component,
+/// compacted under the binders before it (`CompactType::dep_tuple`). The names are opening
+/// addresses and spellings, as [`CompactFun::name`] is; references between components are
+/// indices by the time they land.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactDepTuple {
+    pub names: Vec<Option<Name>>,
+    pub components: Vec<CompactType>,
+}
+
 /// A merged function shape — the **single** carrier for every function-shaped type,
 /// plain function and dependent sum alike. What distinguishes them is the
 /// [`CompactTypeKind`], so both reach one position through one slot and
@@ -732,6 +717,7 @@ impl CompactType {
             fun,
             refinements,
             history_slot,
+            dep_tuple,
             nominal,
             nominal_conflict: _,
         } = self;
@@ -742,6 +728,7 @@ impl CompactType {
                 || var.is_some()
                 || refinements.as_ref().is_some_and(|r| !r.is_empty())
                 || history_slot.is_some()
+                || dep_tuple.is_some()
                 || !nominal.is_empty(),
         }
     }
@@ -1055,6 +1042,13 @@ pub struct CompactType {
     /// onto each child's variables, and compaction only needs a deterministic
     /// materialization, not a second polarity analysis.
     pub history_slot: Option<CompactHistory>,
+    /// A dependent tuple, if one contributed here: a telescope rides as a whole, component
+    /// `𝑘` compacted under the binders of the `𝑘` components before it, so its references to
+    /// binders around the tuple close `𝑘` deeper than a plain tuple's do in [`rec`](Self::rec).
+    /// The two slots therefore never merge into each other; meeting both at one position is
+    /// two shapes ([`shapes`](Self::shapes)). Materialization collapses a tuple whose
+    /// components read no earlier one to the plain tuple (`Type::dep_tuple`).
+    pub dep_tuple: Option<CompactDepTuple>,
     /// Nominal contributions, keyed by declaration: each declaration with its arguments,
     /// one position per argument. Two declarations at one position are two shapes, which
     /// [`shapes`](Self::shapes) counts and coalesce reports: a join of two nominal types is
@@ -1282,6 +1276,7 @@ impl CompactType {
             fun,
             refinements: _,
             history_slot,
+            dep_tuple,
             nominal,
             nominal_conflict: _,
         } = self;
@@ -1292,6 +1287,7 @@ impl CompactType {
             + usize::from(var.is_some())
             + usize::from(fun.is_some())
             + usize::from(history_slot.is_some())
+            + usize::from(dep_tuple.is_some())
             + nominal.len()
     }
 
@@ -1299,6 +1295,11 @@ impl CompactType {
     fn conflicted(&self) -> bool {
         self.shapes() > 1
             || self.rec.iter().flatten().any(|(_, t)| t.conflicted())
+            || self
+                .dep_tuple
+                .iter()
+                .flat_map(|d| &d.components)
+                .any(Self::conflicted)
             || self
                 .var
                 .iter()
@@ -1368,6 +1369,7 @@ impl CompactType {
             fun,
             refinements,
             history_slot,
+            dep_tuple,
             nominal,
             nominal_conflict: _,
         } = self;
@@ -1380,6 +1382,17 @@ impl CompactType {
         };
         atoms == &other.atoms
             && refinements == &other.refinements
+            && match (dep_tuple, &other.dep_tuple) {
+                (None, None) => true,
+                (Some(a), Some(b)) => {
+                    a.components.len() == b.components.len()
+                        && a.components
+                            .iter()
+                            .zip(&b.components)
+                            .all(|(x, y)| x.equiv(y))
+                }
+                _ => false,
+            }
             && match (rec, &other.rec) {
                 (None, None) => true,
                 (Some(x), Some(y)) => keyed(x, y),
@@ -1468,6 +1481,33 @@ impl CompactType {
             (None, f) | (f, None) => f,
             (Some(a), Some(b)) => Some(CompactFun::merge(pol, a, b)),
         };
+        // Component by component, as `constrain_go` relates two dependent tuples: the
+        // components are keyed by position, and a name is either side's spelling.
+        let dep_tuple = match (lhs.dep_tuple, rhs.dep_tuple) {
+            (None, d) | (d, None) => d,
+            (Some(a), Some(b)) => {
+                assert_eq!(
+                    a.components.len(),
+                    b.components.len(),
+                    "two dependent tuples of different lengths met at one position: a key of \
+                     one arity flowing into a collection of another"
+                );
+                Some(CompactDepTuple {
+                    names: a
+                        .names
+                        .into_iter()
+                        .zip(b.names)
+                        .map(|(x, y)| x.or(y))
+                        .collect(),
+                    components: a
+                        .components
+                        .into_iter()
+                        .zip(b.components)
+                        .map(|(x, y)| Self::merge(pol, x, y))
+                        .collect(),
+                })
+            }
+        };
         let refinements = match (lhs.refinements, rhs.refinements) {
             // `None` is the identity, exactly as for the shape slots above.
             (None, r) | (r, None) => r,
@@ -1540,6 +1580,7 @@ impl CompactType {
             fun,
             refinements,
             history_slot,
+            dep_tuple,
             nominal,
             nominal_conflict,
         }
@@ -1565,6 +1606,7 @@ impl CompactType {
             fun,
             refinements,
             history_slot,
+            dep_tuple,
             kinds,
             nominal,
             nominal_conflict: _,
@@ -1575,6 +1617,7 @@ impl CompactType {
             && fun.is_none()
             && refinements.is_none()
             && history_slot.is_none()
+            && dep_tuple.is_none()
             && nominal.is_empty()
             && kinds.is_empty()
     }
@@ -1801,6 +1844,7 @@ fn refinement_slot_present(ct: &CompactType) -> bool {
         || ct.var.is_some()
         || ct.fun.is_some()
         || ct.history_slot.is_some()
+        || ct.dep_tuple.is_some()
         || !ct.nominal.is_empty();
     if carries_content && ct.refinements.is_none() {
         return false;
@@ -1809,6 +1853,11 @@ fn refinement_slot_present(ct: &CompactType) -> bool {
         .iter()
         .flat_map(|m| m.values())
         .all(refinement_slot_present)
+        && ct
+            .dep_tuple
+            .iter()
+            .flat_map(|d| &d.components)
+            .all(refinement_slot_present)
         && ct
             .var
             .iter()
@@ -2747,7 +2796,23 @@ fn kind_renames(
 /// function's domain from its kind, propagate along a variable's bound chain and through
 /// a refinement's base, and reset at every other structural child, because they answer a
 /// question about the position and a structural child is a new one.
+///
+/// One stack frame per type layer and bound edge crossed; the stack grows on demand, as the
+/// other solver walks do.
 fn compact_go(
+    ty: &Type,
+    pol: bool,
+    subst_acc: &Subst,
+    pos: Position<'_>,
+    st: &mut CompactState,
+) -> CompactType {
+    stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
+        compact_go_inner(ty, pol, subst_acc, pos, st)
+    })
+}
+
+/// The body of [`compact_go`].
+fn compact_go_inner(
     ty: &Type,
     pol: bool,
     subst_acc: &Subst,
@@ -2779,8 +2844,29 @@ fn compact_go(
         | Type::DataSource(_)
         | Type::ChanDom(..)
         | Type::Param(_)
-        | Type::DepTuple(_)
         | Type::Txn => CompactType::from_atom(AtomKey::from_type(ty).unwrap()),
+        // Component `𝑘` compacts under the binders of the `𝑘` components before it, as a
+        // codomain compacts under its function's: each is a crossing for what lands below,
+        // and a component's binder shadows the accumulated substitution after it.
+        Type::DepTuple(cs) => {
+            let mut acc = subst_acc.clone();
+            let mut components = Vec::with_capacity(cs.len());
+            for (name, t) in cs {
+                components.push(compact_go(t, pol, &acc, Position::default(), st));
+                st.scope.enter(name.clone());
+                if let Some(b) = name {
+                    acc = acc.shadow(b);
+                }
+            }
+            cs.iter().for_each(|_| st.scope.exit());
+            CompactType {
+                dep_tuple: Some(CompactDepTuple {
+                    names: cs.iter().map(|(n, _)| n.clone()).collect(),
+                    components,
+                }),
+                ..CompactType::value()
+            }
+        }
         // A projection quotes a term, so a term substitution acts on it, as it does on
         // a predicate: a dependent application's `[c ↦ 𝑎]` turns `σ₁(c)` into `σ₁(𝑎)`.
         Type::WitnessProjection(_) => {
@@ -3362,6 +3448,7 @@ fn compact_go(
                     rec,
                     fun,
                     history_slot,
+                    dep_tuple,
                     nominal,
                     var,
                     // A sum is a shape: it is what the position *is*, and it
@@ -3393,6 +3480,7 @@ fn compact_go(
                     && rec.is_none()
                     && fun.is_none()
                     && history_slot.is_none()
+                    && dep_tuple.is_none()
                     && nominal.is_empty()
                     && !var_is_shape
             };
@@ -3664,11 +3752,12 @@ mod tests {
         assert!(read(&w2).contains('y'), "{}", read(&w2));
     }
 
-    /// A dependent tuple is an atom of the solver's lattice: two α-variants of
-    /// `(a : Int) × {Int | __elem == a}` flowing into one variable compact to one atom, and
-    /// coalescing reads the tuple back.
+    /// A dependent tuple compacts component by component: two α-variants of
+    /// `(a : Int) × {Int | __elem == a}` flowing into one variable meet in one dependent-tuple
+    /// slot, each component closed against the binder before it, and coalescing reads the
+    /// tuple back.
     #[test]
-    fn a_dependent_tuple_compacts_and_coalesces_as_one_atom() {
+    fn a_dependent_tuple_compacts_componentwise_and_coalesces_back() {
         use crate::ccl::infer::solver::simplify_type;
         use crate::ccl::{BinOpKind, CompareKind};
         let int = || Type::Base(BaseType::Int);
@@ -3693,8 +3782,9 @@ mod tests {
         constrain_subtype(&tuple("a"), &v, &mut cache).expect("the first copy flows in");
         constrain_subtype(&tuple("b"), &v, &mut cache).expect("and the second");
         let compact = compact_type(&v);
-        assert_eq!(compact.term.atoms.len(), 1, "{:?}", compact.term.atoms);
-        let back = coalesce_compact(&simplify_type(compact)).expect("one atom coalesces");
+        let components = compact.term.dep_tuple.as_ref().map(|d| d.components.len());
+        assert_eq!(components, Some(2), "{:?}", compact.term);
+        let back = coalesce_compact(&simplify_type(compact)).expect("one tuple coalesces");
         assert_eq!(
             back.without_pi_names(),
             tuple("c").without_pi_names(),
@@ -3709,9 +3799,9 @@ mod tests {
     ///   b: DepTuple[ (i, Int), (–, {Int | #0 : Int}) ]
     ///
     /// `Type ==` ignores type slots inside a predicate, so the two are equal; their
-    /// atoms must be too.
+    /// compactions must be too.
     #[test]
-    fn a_dependent_tuple_atom_agrees_with_type_equality() {
+    fn a_dependent_tuple_compaction_agrees_with_type_equality() {
         let tuple = |slot: Type| {
             let i = Name::fresh("i");
             let pred = TypedExpr::var(i.clone()).with_ty(slot);
@@ -3725,7 +3815,12 @@ mod tests {
         };
         let (a, b) = (tuple(Type::Hole), tuple(Type::Base(BaseType::Int)));
         assert_eq!(a.without_pi_names(), b.without_pi_names());
-        assert_eq!(AtomKey::from_type(&a), AtomKey::from_type(&b));
+        let compacted = |t: &Type| {
+            let v = fresh_var(0);
+            constrain_subtype(t, &v, &mut ConstrainCache::new()).expect("the tuple flows in");
+            compact_type(&v).term
+        };
+        assert!(compacted(&a).equiv(&compacted(&b)));
     }
 
     /// A negative position's reading is the meet of both sides: the requirement side
