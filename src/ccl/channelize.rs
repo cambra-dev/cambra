@@ -283,6 +283,7 @@ fn residual_after_fanout(body: Expr, defer_name: &Name) -> Expr {
         ty,
         user_annotation,
         node_id,
+        site,
     } = body
     else {
         unreachable!(
@@ -309,6 +310,7 @@ fn residual_after_fanout(body: Expr, defer_name: &Name) -> Expr {
         ty,
         user_annotation,
         node_id,
+        site,
     }
 }
 
@@ -557,18 +559,21 @@ fn lift_defer(
                 name_occurrence,
                 name: _,
                 value,
+                site: fed_at,
             } => TypedExpr {
                 ty: head.ty,
                 node: TypedExprNode::Feed {
                     name_occurrence,
                     name: binding_name.clone(),
                     value,
+                    site: fed_at,
                 },
                 user_annotation: None,
                 // Preserve: the lifted prefix head is the same node with its
                 // feed target renamed, so carry its id onto the rebuild.
                 // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                 node_id: head.node_id,
+                site: head.site,
             },
             TypedExprNode::Define {
                 name_occurrence,
@@ -584,6 +589,7 @@ fn lift_defer(
                 user_annotation: None,
                 // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                 node_id: head.node_id,
+                site: head.site,
             },
             _ => head,
         };
@@ -641,6 +647,7 @@ fn replace_result_var(expr: Expr, replacement: Expr) -> Expr {
         ty: _,
         user_annotation,
         node_id,
+        site,
     } = expr;
     let new_node = match node {
         TypedExprNode::Var(_) => return replacement,
@@ -668,6 +675,7 @@ fn replace_result_var(expr: Expr, replacement: Expr) -> Expr {
         ty,
         user_annotation,
         node_id,
+        site,
     }
 }
 
@@ -689,6 +697,8 @@ struct Contribution {
     /// The `Feed` this contribution is what became of, which records each node built
     /// around it as its product.
     feed: NodeId,
+    /// That feed's site, which tags its contributions in the channel ([`crate::ccl::site`]).
+    site: Option<Rc<crate::ccl::site::Site>>,
 }
 
 /// The contributions a feed-only loop makes, one per feed in it, each with the deferred
@@ -714,11 +724,18 @@ pub(crate) fn loop_contributions(feed_loop: Expr) -> Vec<LoopFeed> {
             define.is_none(),
             "a `<<=` inside a loop defines its collection once per iteration"
         );
-        for Contribution { value, levels, .. } in feeds {
+        for Contribution {
+            value,
+            levels,
+            site,
+            ..
+        } in feeds
+        {
             contributions.push(LoopFeed {
                 defer: defer.clone(),
                 view: indexed_nest(value, levels),
                 levels,
+                site,
             });
         }
     }
@@ -773,6 +790,7 @@ fn contains_feed_or_define_for(expr: &Expr, name: &Name) -> bool {
             name_occurrence: _,
             name: t,
             value,
+            site: _,
         }
         | TypedExprNode::Define {
             name_occurrence: _,
@@ -1655,6 +1673,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
         ty,
         user_annotation,
         node_id,
+        site,
     } = expr;
     match node {
         TypedExprNode::Let {
@@ -1877,6 +1896,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
                 ty,
                 user_annotation,
                 node_id,
+                site,
             })
         }
         // All other variants (Apply/BinOp/Lambda/Loop/…, leaves, and the
@@ -1889,6 +1909,7 @@ fn channelize_inner(expr: Expr, ctx: &mut ChannelizeCtx) -> Result<Expr, Located
                 ty,
                 user_annotation,
                 node_id,
+                site,
             };
             expr.try_map_children(|c| channelize_expr(c, ctx))?;
             Ok(expr)
@@ -1936,28 +1957,29 @@ fn channelize_cluster(
         let mut feeds = Vec::new();
         let mut define: Option<(NodeId, Expr)> = None;
         rewritten = extract_for_defer(rewritten, name, &mut feeds, &mut define, false)?;
-        let feeds: Vec<Expr> = feeds
+        let (sites, feeds): (Vec<_>, Vec<Expr>) = feeds
             .into_iter()
             .map(
                 |Contribution {
                      value,
                      levels,
                      feed,
+                     site,
                  }| {
                     // Keying the contribution by the tuple of its positions is still building
                     // what its `Feed` became.
                     let _g =
                         provenance::enter(feed, "channelize.feed", provenance::Nature::Expansion);
-                    key_by_positions(value, levels)
+                    (site, key_by_positions(value, levels))
                 },
             )
-            .collect();
+            .unzip();
         let channel = match (feeds.is_empty(), define) {
             (true, None) => {
                 return Err(ctx.at_declaration(DeferError::NoFeedOrDefine(name.clone())));
             }
             (true, Some((_, d))) => d,
-            (false, None) => combine_feed_values(feeds, elements.get(name)),
+            (false, None) => combine_feed_values(feeds, &sites, elements.get(name)),
             (false, Some((define_id, _))) => {
                 return Err(Located::new(
                     DeferError::FeedsAndDefinesMixed(name.clone()),
@@ -2094,6 +2116,7 @@ fn bind_cluster_at_scope(expr: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
         ty,
         user_annotation,
         node_id,
+        site,
     } = expr;
     match node {
         TypedExprNode::Let {
@@ -2126,6 +2149,7 @@ fn bind_cluster_at_scope(expr: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
                     ty,
                     user_annotation,
                     node_id,
+                    site,
                 };
                 return emit_cluster_letrec(original_let, group);
             }
@@ -2138,6 +2162,7 @@ fn bind_cluster_at_scope(expr: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
                 ty,
                 user_annotation,
                 node_id,
+                site,
             }
         }
         TypedExprNode::ExprStmt { expr: e, body } => TypedExpr {
@@ -2148,6 +2173,7 @@ fn bind_cluster_at_scope(expr: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
             ty,
             user_annotation,
             node_id,
+            site,
         },
         // A letrec's continuation is the scope its trailing reads live in, and
         // a channel assembled from the group's taps (`__hist ≫ .__to_<feed>`)
@@ -2165,6 +2191,7 @@ fn bind_cluster_at_scope(expr: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
                     ty,
                     user_annotation,
                     node_id,
+                    site,
                 };
                 return emit_cluster_letrec(original, group);
             }
@@ -2176,6 +2203,7 @@ fn bind_cluster_at_scope(expr: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
                 ty,
                 user_annotation,
                 node_id,
+                site,
             }
         }
         other => {
@@ -2184,6 +2212,7 @@ fn bind_cluster_at_scope(expr: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
                 ty,
                 user_annotation,
                 node_id,
+                site,
             };
             emit_cluster_letrec(terminal, group)
         }
@@ -2242,6 +2271,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
                 name_occurrence: _,
                 name,
                 value,
+                site: _,
             }
             | TypedExprNode::Define {
                 name_occurrence: _,
@@ -2381,6 +2411,41 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
     sorted
 }
 
+/// The site of the feed `e` is.
+fn feed_site(e: &Expr) -> Option<Rc<crate::ccl::site::Site>> {
+    match &e.node {
+        TypedExprNode::Feed { site, .. } => site.clone(),
+        _ => None,
+    }
+}
+
+/// The tag of each contribution of a channel fed from several places: its feed's site
+/// ([`crate::ccl::site`]), which an edit elsewhere in the program leaves alone
+/// (`src/ccl/design/sites.md`, "Stability").
+///
+/// # Panics
+///
+/// Where a feed has lost its site on the way here, or two contributions share one: each is a
+/// pass that rebuilt a feed without carrying its site, or copied one where a feed is one place.
+fn site_tags(sites: &[Option<Rc<crate::ccl::site::Site>>]) -> Vec<crate::ccl::FieldKey> {
+    let tags: Vec<crate::ccl::FieldKey> = sites
+        .iter()
+        .map(|site| {
+            let site = site.as_ref().unwrap_or_else(|| {
+                panic!("a feed of a channel fed from several places reached channelize without its site")
+            });
+            crate::ccl::FieldKey::Name(crate::ccl::Label::new(site.tag()))
+        })
+        .collect();
+    let mut sorted = tags.clone();
+    sorted.sort();
+    assert!(
+        sorted.windows(2).all(|w| w[0] != w[1]),
+        "two contributions of one channel share a site: {tags:?}"
+    );
+    tags
+}
+
 /// A single feed value passes through unchanged.  Multiple feed values
 /// are merged via [`TypedExprNode::Copair`] — the dedicated
 /// N-ary collection-union node — which compiles to a `UnionOperator`
@@ -2391,12 +2456,16 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
 /// `i`, over the shared element codomain, `element` where the handle states it. A
 /// defer-read operand contributes its handle's rigid `ChanDom` domain, closed by the final
 /// [`erase_chan_domains`] substitution.
-fn combine_feed_values(mut feeds: Vec<Expr>, element: Option<&Type>) -> Expr {
+fn combine_feed_values(
+    mut feeds: Vec<Expr>,
+    sites: &[Option<Rc<crate::ccl::site::Site>>],
+    element: Option<&Type>,
+) -> Expr {
     debug_assert!(!feeds.is_empty());
     if feeds.len() == 1 {
         return feeds.pop().unwrap();
     }
-    // `copair_type` stamps one `Index(i)` tag per operand, while `Expr::copair`
+    // `copair_type` stamps one tag per operand, while `Expr::copair`
     // *splices* an operand that is itself a copairing — so a `Copair` feed value would
     // leave the node with more operands than its type has tags. It cannot arise here: a
     // feed value is a lambda, a compose or an apply, because a feed outside any iteration
@@ -2410,7 +2479,13 @@ fn combine_feed_values(mut feeds: Vec<Expr>, element: Option<&Type>) -> Expr {
          splices it and the stamped type's {} tags no longer describe the node's operands",
         feeds.len()
     );
-    let ty = copair_type(&feeds, element);
+    // Operands in the order of their tags, which is the order a variant type keeps its arms
+    // in, so every reader pairs the `i`th operand with the `i`th arm.
+    let mut tagged: Vec<(crate::ccl::FieldKey, Expr)> =
+        site_tags(sites).into_iter().zip(feeds).collect();
+    tagged.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let (tags, feeds): (Vec<_>, Vec<_>) = tagged.into_iter().unzip();
+    let ty = copair_type(&feeds, &tags, element);
     Expr::copair(feeds).with_ty(ty)
 }
 
@@ -2426,12 +2501,12 @@ fn combine_feed_values(mut feeds: Vec<Expr>, element: Option<&Type>) -> Expr {
 /// holds `Int`, and two jagged rows `box([1])` and `box([2, 3])` differ in their witness
 /// kinds. So no operand's codomain stands in for the channel's, and the handle is the one
 /// source of it.
-fn copair_type(feeds: &[Expr], element: Option<&Type>) -> Type {
+fn copair_type(feeds: &[Expr], sites: &[crate::ccl::FieldKey], element: Option<&Type>) -> Type {
     let mut tags: Vec<(crate::ccl::FieldKey, Type)> = Vec::with_capacity(feeds.len());
-    for (i, f) in feeds.iter().enumerate() {
+    for (site, f) in sites.iter().zip(feeds) {
         match f.ty.peel_refinements() {
             Type::Fun { domain, .. } => {
-                tags.push((crate::ccl::FieldKey::Index(i), (**domain).clone()));
+                tags.push((site.clone(), (**domain).clone()));
             }
             _ => return Type::Hole,
         }
@@ -2535,6 +2610,7 @@ fn extract_for_defer_impl(
         ty,
         user_annotation,
         node_id,
+        site,
     } = expr;
     let node = match node {
         TypedExprNode::Comprehension { .. } => {
@@ -2564,6 +2640,7 @@ fn extract_for_defer_impl(
             name_occurrence: _,
             name,
             value,
+            site: fed_at,
         } if &name == defer_name => {
             // A feed outside any iteration contributes one element, keyed by the unit: its
             // value is lifted to `Unit ⤇ 𝑉`, whatever 𝑉 is, a collection included
@@ -2579,6 +2656,7 @@ fn extract_for_defer_impl(
                     value,
                     levels: 0,
                     feed,
+                    site: fed_at.clone(),
                 }
             } else {
                 // The channel is a collection — inference says so on the handle, and every
@@ -2595,6 +2673,7 @@ fn extract_for_defer_impl(
                     .with_ty(Type::data_fun(Type::Base(BaseType::Unit), vty)),
                     levels: 1,
                     feed,
+                    site: fed_at.clone(),
                 }
             };
             feeds.push(contribution);
@@ -2751,6 +2830,7 @@ fn extract_for_defer_impl(
                     user_annotation: function_user_annotation,
                     // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                     node_id: function_node_id,
+                    site,
                 } = *function
                 else {
                     unreachable!("peeked above as a lambda whose param is not the defer binder")
@@ -2776,6 +2856,7 @@ fn extract_for_defer_impl(
                     value: v,
                     levels,
                     feed,
+                    site,
                 } in lambda_feeds
                 {
                     let _g =
@@ -2794,6 +2875,7 @@ fn extract_for_defer_impl(
                         value: channel,
                         levels,
                         feed,
+                        site,
                     });
                 }
                 let new_function = TypedExpr {
@@ -2805,6 +2887,7 @@ fn extract_for_defer_impl(
                     user_annotation: function_user_annotation,
                     // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                     node_id: function_node_id,
+                    site,
                 };
                 TypedExprNode::Apply {
                     function: Box::new(new_function),
@@ -2899,6 +2982,7 @@ fn extract_for_defer_impl(
                 let elt_ty = elt.ty.clone();
                 let elt_user_ann = elt.user_annotation.clone();
                 let elt_node_id = elt.node_id;
+                let elt_site = elt.site.clone();
                 match elt.node {
                     TypedExprNode::Lambda { param, body } if &param.name != defer_name => {
                         // Feeding `λ p → Case({g₀ → Feed(d, v₀); …; true → Unit})`
@@ -2994,13 +3078,13 @@ fn extract_for_defer_impl(
                                         TypedExprNode::Feed { name, .. } if name == defer_name
                                     )
                                 })
-                                .map(|b| b.body.node_id())
+                                .map(|b| (b.body.node_id(), feed_site(&b.body)))
                                 .collect::<Vec<_>>()
                                 .into_iter();
                             let mut prior: Vec<Expr> = Vec::new();
                             for (guard, feed_value) in fanout_arms {
                                 if let Some(value) = feed_value {
-                                    let feed = arm_feeds.next().expect(
+                                    let (feed, site) = arm_feeds.next().expect(
                                         "one original `Feed` per feeding arm, asserted above",
                                     );
                                     let _g = provenance::enter(
@@ -3058,6 +3142,7 @@ fn extract_for_defer_impl(
                                         value: channel_expr,
                                         levels: 1,
                                         feed,
+                                        site,
                                     });
                                 }
                                 prior.push(guard);
@@ -3079,6 +3164,7 @@ fn extract_for_defer_impl(
                                 user_annotation: elt_user_ann,
                                 // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                                 node_id: elt_node_id,
+                                site: elt_site,
                             };
                             new_elts.push(new_lambda);
                             continue;
@@ -3102,6 +3188,7 @@ fn extract_for_defer_impl(
                             value: v,
                             levels,
                             feed,
+                            site,
                         } in lambda_feeds
                         {
                             let _g = provenance::enter(
@@ -3131,6 +3218,7 @@ fn extract_for_defer_impl(
                                 value: channel_expr,
                                 levels: levels + 1,
                                 feed,
+                                site,
                             });
                         }
                         new_elts.push(TypedExpr {
@@ -3142,6 +3230,7 @@ fn extract_for_defer_impl(
                             user_annotation: elt_user_ann,
                             // TODO(preserve): hand-rolled preserve — fold into `Expr::preserve`.
                             node_id: elt_node_id,
+                            site: elt_site,
                         });
                     }
                     _ => new_elts.push(extract_for_defer(
@@ -3201,6 +3290,7 @@ fn extract_for_defer_impl(
                 value: v,
                 levels,
                 feed,
+                site,
             } in local_feeds
             {
                 let _g = provenance::enter(feed, "channelize.feed", provenance::Nature::Expansion);
@@ -3213,6 +3303,7 @@ fn extract_for_defer_impl(
                     value: wrapped,
                     levels: levels + 1,
                     feed,
+                    site,
                 });
             }
             TypedExprNode::Lambda {
@@ -3307,6 +3398,7 @@ fn extract_for_defer_impl(
                         value: v,
                         levels,
                         feed,
+                        site,
                     } in branch_feeds
                     {
                         let _g = provenance::enter(
@@ -3328,6 +3420,7 @@ fn extract_for_defer_impl(
                             .with_ty(Type::data_fun(refined.clone(), vty)),
                             levels: levels + 1,
                             feed: *feed,
+                            site: site.clone(),
                         });
                     }
                 }
@@ -3462,6 +3555,7 @@ fn extract_for_defer_impl(
         ty,
         user_annotation,
         node_id,
+        site,
     })
 }
 
@@ -3631,10 +3725,18 @@ mod tests {
     /// Multiple feeds: copaired (distinct index sets, tagged apart).
     #[test]
     fn run_multiple_feeds_use_copair() {
-        let body = Expr::expr_stmt(
-            Expr::feed("d", Occurrence::mint(), lit(1)),
-            Expr::expr_stmt(Expr::feed("d", Occurrence::mint(), lit(2)), var("d")),
-        );
+        use crate::ccl::site::{Place, PlaceKind, Site};
+        let fed = |index, value| {
+            let place = Place {
+                module: std::sync::Arc::from([]),
+                bindings: std::sync::Arc::from([]),
+                kind: PlaceKind::Feed,
+                spelling: "d".into(),
+                index,
+            };
+            Expr::feed_at("d", Occurrence::mint(), value, Some(Site::written(place)))
+        };
+        let body = Expr::expr_stmt(fed(0, lit(1)), Expr::expr_stmt(fed(1, lit(2)), var("d")));
         let expr = Expr::let_bind(
             "d",
             Occurrence::mint(),

@@ -810,7 +810,12 @@ fn lower_for_body_stmt(
                         "yield outside a generator for-loop context",
                     )
                 })?;
-                let feed = Expr::feed(name.to_string(), Occurrence::mint(), lower_expr(y, ctx)?);
+                let feed = Expr::feed_at(
+                    name.to_string(),
+                    Occurrence::mint(),
+                    lower_expr(y, ctx)?,
+                    Some(ctx.places.site(value.span)),
+                );
                 Ok(ctx.tag_image(feed, stmt.span))
             }
             // `r << e` — direct feed into a named defer handle.
@@ -1783,12 +1788,8 @@ fn lower_loop_body_chain_scoped(
                     value: feed_value,
                 } = &value.node =>
             {
-                let Some(defer_name) = feed_target(target, "feed target", ctx)? else {
-                    return Ok(Expr::error());
-                };
-                let lowered = lower_expr(feed_value, ctx)?;
-                let occurrence = ctx.occurrence_at(feed_target_span(target));
-                let feed = ctx.tag_image(Expr::feed(defer_name, occurrence, lowered), value.span);
+                let feed = lower_feed(target, feed_value, ctx)?;
+                let feed = ctx.tag_image(feed, value.span);
                 ctx.tag_machinery(Expr::expr_stmt(feed, chain), stmt.span, "lower.stmt_seq")
             }
             // `yield value` — a feed into the surrounding generator's defer.
@@ -1800,8 +1801,14 @@ fn lower_loop_body_chain_scoped(
                     )
                 })?;
                 let lowered = lower_expr(y, ctx)?;
+                let site = ctx.places.site(value.span);
                 let feed = ctx.tag_image(
-                    Expr::feed(defer_name.to_string(), Occurrence::mint(), lowered),
+                    Expr::feed_at(
+                        defer_name.to_string(),
+                        Occurrence::mint(),
+                        lowered,
+                        Some(site),
+                    ),
                     value.span,
                 );
                 ctx.tag_machinery(Expr::expr_stmt(feed, chain), stmt.span, "lower.stmt_seq")

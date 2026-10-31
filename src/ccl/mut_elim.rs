@@ -1711,6 +1711,8 @@ pub(crate) struct FeedSite {
     /// How many loop levels `value` already holds, curried outermost first: 0 for a
     /// value fed here, one per loop for an inner loop's whole tap collection.
     levels: usize,
+    /// The site of the feed the values came from ([`crate::ccl::site`]).
+    pub(crate) fed_at: Option<Rc<crate::ccl::site::Site>>,
 }
 
 /// A writer body's parameter `p`: the snapshot of each variable the writer reads, one slot
@@ -1887,13 +1889,14 @@ pub(crate) fn hoist_feeds(mut body: Expr, feeds: Vec<LoopFeed>) -> Expr {
         defer,
         view,
         levels,
+        site,
     } in feeds.into_iter().rev()
     {
         // The loop is what the view became, so it is recorded under the view, which is
         // itself recorded under the feed that rode the tap.
         let g = provenance::enter(view.node_id(), FEED_LABEL, provenance::Nature::Expansion);
         let view = crate::ccl::feed_nest::flatten_nested_contribution(view, levels);
-        let each = feed_each(defer, view);
+        let each = feed_each(defer, view, site);
         drop(g);
         // `expr_stmt` carries the body's type itself — an `ExprStmt`'s type *is*
         // its body's.
@@ -1904,8 +1907,9 @@ pub(crate) fn hoist_feeds(mut body: Expr, feeds: Vec<LoopFeed>) -> Expr {
 
 /// `for x in collection: defer << x` — the loop `λ 𝑟 → (𝑟 ▷ collection) ▷ (λ x → Feed(defer,
 /// x))`, indexed by the collection's position as a comprehension's step is, so a fed item whose
-/// type reads the position reads the loop's binder.
-fn feed_each(defer: Name, collection: Expr) -> Expr {
+/// type reads the position reads the loop's binder. Its feed is at `site`, the site of the feed
+/// the values came from.
+fn feed_each(defer: Name, collection: Expr, site: Option<Rc<crate::ccl::site::Site>>) -> Expr {
     let (domain_ty, item_ty) = fun_parts(&collection.ty);
     let position = Name::fresh("__iter_record");
     // The item read at the position is the collection's codomain opened there.
@@ -1925,7 +1929,7 @@ fn feed_each(defer: Name, collection: Expr) -> Expr {
     };
     let item_ty = crate::ccl::subst::open_codomain(&named, &item_ty);
     let x = Name::fresh("__fed");
-    let mut feed = Expr::feed(defer, Occurrence::mint(), tvar(&x, item_ty.clone()));
+    let mut feed = Expr::feed_at(defer, Occurrence::mint(), tvar(&x, item_ty.clone()), site);
     feed.ty = Type::Base(BaseType::Unit);
     let mut lambda = Expr::lambda(x, Occurrence::mint(), item_ty.clone(), feed);
     lambda.ty = Type::fun(item_ty.clone(), Type::Base(BaseType::Unit));
@@ -2391,6 +2395,7 @@ pub(crate) fn fold_induction_loop(
                 defer: f.defer.clone(),
                 view,
                 levels: 1 + f.levels,
+                site: f.fed_at.clone(),
             }
         })
         .collect();
@@ -2429,7 +2434,7 @@ fn transform_feed_only_loop(
     cont: Expr,
 ) -> Expr {
     let mut prefix: Vec<Kept> = Vec::new();
-    let mut feeds: Vec<(Name, Occurrence, Expr, StmtSite)> = Vec::new();
+    let mut feeds: Vec<FedAt> = Vec::new();
     collect_feed_only(loop_body, &mut prefix, &mut feeds);
     debug_assert!(
         !feeds.is_empty(),
@@ -2440,7 +2445,7 @@ fn transform_feed_only_loop(
     // Emit in reverse so the first source feed ends up outermost — channelize
     // collects feeds outermost-first into the channel union, preserving source
     // order (mirrors the accumulator path's hoist ordering).
-    for (defer, defer_occurrence, value, site) in feeds.into_iter().rev() {
+    for (defer, defer_occurrence, value, site, fed_at) in feeds.into_iter().rev() {
         // The map is what this feed became: one per feed, so each is recorded
         // against its own statement rather than all of them against the loop.
         // The enclosing `letrec.loop` mints nothing of its own on this path —
@@ -2457,7 +2462,7 @@ fn transform_feed_only_loop(
         // The feed is the source statement's, moved, and the lambda's binder stands for the
         // loop's target.
         let unit = Type::Base(BaseType::Unit);
-        let mut feed = Expr::feed(defer, defer_occurrence, value);
+        let mut feed = Expr::feed_at(defer, defer_occurrence, value, fed_at);
         feed.ty = unit.clone();
         let mut lambda = Expr::lambda(
             target.name.clone(),
@@ -2486,11 +2491,17 @@ fn transform_feed_only_loop(
 ///
 /// The site is the feed statement its map is recorded against, the same
 /// attribution the induction path's [`FeedSite`] carries.
-fn collect_feed_only(
-    expr: Expr,
-    prefix: &mut Vec<Kept>,
-    feeds: &mut Vec<(Name, Occurrence, Expr, StmtSite)>,
-) {
+/// A feed a read-only block makes: its target and the target's occurrence, its value closed over
+/// the block's bindings, its statement, and its site ([`crate::ccl::site`]).
+type FedAt = (
+    Name,
+    Occurrence,
+    Expr,
+    StmtSite,
+    Option<Rc<crate::ccl::site::Site>>,
+);
+
+fn collect_feed_only(expr: Expr, prefix: &mut Vec<Kept>, feeds: &mut Vec<FedAt>) {
     let stmt_id = expr.node_id();
     match expr.node {
         TypedExprNode::Let {
@@ -2508,8 +2519,15 @@ fn collect_feed_only(
                     name_occurrence,
                     name,
                     value,
+                    site: fed_at,
                 } => {
-                    feeds.push((name, name_occurrence, close_over(*value, prefix), site));
+                    feeds.push((
+                        name,
+                        name_occurrence,
+                        close_over(*value, prefix),
+                        site,
+                        fed_at,
+                    ));
                 }
                 other => panic!(
                     "letrec phase: unexpected statement in read-only `with begin():` block: {}",
@@ -2762,6 +2780,7 @@ fn splice_after_unit(chain: Expr, tail: Expr) -> Expr {
                 ty: chain.ty,
                 user_annotation: chain.user_annotation,
                 node_id: chain.node_id,
+                site: chain.site,
             };
             Expr::expr_stmt(terminal, tail)
         }
@@ -3148,9 +3167,10 @@ impl<'a> WriterWalk<'a> {
                         name_occurrence: _,
                         name,
                         value,
+                        site: fed_at,
                     } => {
                         let value = Subst::discharge_env_in_place(*value, &self.env);
-                        self.feed(name, value, site, 0);
+                        self.feed(name, value, site, 0, fed_at);
                         self.walk_chain(*body, kept)
                     }
                     // A bare `unit` statement is a no-op. This is the discarded terminal
@@ -3192,15 +3212,17 @@ impl<'a> WriterWalk<'a> {
                             ty: effect.ty,
                             user_annotation: effect.user_annotation,
                             node_id: effect_id,
+                            site: effect.site,
                         };
                         for LoopFeed {
                             defer,
                             view,
                             levels,
+                            site: fed_at,
                         } in crate::ccl::channelize::loop_contributions(feed_loop)
                         {
                             let value = Subst::discharge_env_in_place(view, &self.env);
-                            self.feed(defer, value, site, levels);
+                            self.feed(defer, value, site, levels, fed_at);
                         }
                         self.walk_chain(*body, kept)
                     }
@@ -3266,13 +3288,14 @@ impl<'a> WriterWalk<'a> {
                             defer,
                             view,
                             levels,
+                            site: fed_at,
                         } in fold.feed_views
                         {
                             // The view reads the inner history, whose binding the environment
                             // was discharged into above, and its type can read this level's
                             // binders as well, a fed row filtered by this loop's variable say.
                             let view = Subst::discharge_env_in_place(view, &self.env);
-                            self.feed(defer, view, site, levels);
+                            self.feed(defer, view, site, levels, fed_at);
                         }
                         self.walk_chain(*body, kept)
                     }
@@ -3290,6 +3313,7 @@ impl<'a> WriterWalk<'a> {
                     ty: block.ty,
                     user_annotation: block.user_annotation,
                     node_id: stmt_id,
+                    site: block.site,
                 };
                 if is_writing_case(&end) {
                     self.walk_value_case(end, kept)
@@ -3344,7 +3368,14 @@ impl<'a> WriterWalk<'a> {
 
     /// Record a feed of `value` to `defer`, fired wherever the walk reaches it, which also
     /// commits there unless `defer` is a feed the block declares.
-    fn feed(&mut self, defer: Name, value: Expr, site: StmtSite, levels: usize) {
+    fn feed(
+        &mut self,
+        defer: Name,
+        value: Expr,
+        site: StmtSite,
+        levels: usize,
+        fed_at: Option<Rc<crate::ccl::site::Site>>,
+    ) {
         let commits = !self.channels.contains(&defer);
         let field = defer.defer_tap_field(*self.feed_counter);
         *self.feed_counter += 1;
@@ -3355,6 +3386,7 @@ impl<'a> WriterWalk<'a> {
             fire: bool_lit(true),
             site,
             levels,
+            fed_at,
         });
         if commits {
             self.commit_paths.push(bool_lit(true));
@@ -3770,7 +3802,7 @@ fn iteration_channel(channel: &TypedBinding, defer: Expr, own: Vec<FeedSite>) ->
         let _g = f.site.enter(FEED_LABEL, provenance::Nature::Expansion);
         let conditional = !is_true_lit(&f.fire);
         let feed = if f.levels == 0 {
-            let mut feed = Expr::feed(inner.clone(), Occurrence::mint(), f.value);
+            let mut feed = Expr::feed_at(inner.clone(), Occurrence::mint(), f.value, f.fed_at);
             feed.ty = Type::Base(BaseType::Unit);
             if conditional {
                 gated_feed(f.fire, feed)

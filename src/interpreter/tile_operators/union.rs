@@ -1,6 +1,7 @@
 use bit_set::BitSet;
 
 use super::*;
+use crate::ccl::FieldKey;
 use crate::interpreter::live_keys;
 use crate::interpreter::operator_graph::value_at;
 use crate::{
@@ -25,6 +26,9 @@ pub struct UnionOperator {
     base: OperatorBase,
     /// Input operators; each must have a `DataFunction` tiling.
     inputs: Vec<Box<dyn TileOperator>>,
+    /// The tag of each input's arm of the coproduct domain, in input order: positional, or
+    /// the tags the union node's type names, a channel's sites (`crate::ccl::site`).
+    tags: Vec<FieldKey>,
     /// Flat-merge mode (see [`new_flat`](Self::new_flat) and
     /// [`new_flat_over`](Self::new_flat_over)): arms with disjoint keys, merged into a
     /// single flat `DataFunction` (sorted by domain key) over the domain they share or a
@@ -49,10 +53,22 @@ impl UnionOperator {
     /// record rule, so arms at different record widths came out a positional sum
     /// where the type layer said `{a: Int}`.
     pub fn new(inputs: Vec<Box<dyn TileOperator>>, declared_codomain: Extent) -> Self {
-        let tiling = Self::coproduct_tiling(&inputs, declared_codomain);
+        let tags = positional(inputs.len());
+        Self::new_tagged(inputs, tags, declared_codomain)
+    }
+
+    /// [`new`](Self::new), each input's arm tagged by `tags` rather than by its position.
+    pub fn new_tagged(
+        inputs: Vec<Box<dyn TileOperator>>,
+        tags: Vec<FieldKey>,
+        declared_codomain: Extent,
+    ) -> Self {
+        assert_eq!(tags.len(), inputs.len(), "one tag per input of a union");
+        let tiling = Self::coproduct_tiling(&inputs, &tags, declared_codomain);
         Self {
             base: OperatorBase::new(tiling),
             inputs,
+            tags,
             flat: false,
             level: CurryLevel::OUTERMOST,
         }
@@ -69,14 +85,18 @@ impl UnionOperator {
 
     /// The tagged coproduct tiling the arms imply: one `Extent::Union` domain,
     /// and the codomain they agree on or the declared one they merge into.
-    fn coproduct_tiling(inputs: &[Box<dyn TileOperator>], declared_codomain: Extent) -> Tiling {
+    fn coproduct_tiling(
+        inputs: &[Box<dyn TileOperator>],
+        tags: &[FieldKey],
+        declared_codomain: Extent,
+    ) -> Tiling {
         let arms = Self::inner_tilings(inputs, CurryLevel::OUTERMOST);
-        Self::coproduct_of(&arms, declared_codomain)
+        Self::coproduct_of(&arms, tags, declared_codomain)
     }
 
     /// [`coproduct_tiling`](Self::coproduct_tiling) over the arm tilings themselves, so
     /// the same rule applies at a standing level as at the top.
-    fn coproduct_of(arms: &[Tiling], declared_codomain: Extent) -> Tiling {
+    fn coproduct_of(arms: &[Tiling], tags: &[FieldKey], declared_codomain: Extent) -> Tiling {
         assert!(
             !arms.is_empty(),
             "UnionOperator requires at least one input"
@@ -145,7 +165,12 @@ impl UnionOperator {
             Tiling::Scalar(declared_codomain)
         };
 
-        Tiling::data_function(Extent::Union(TagMap::from_positional(domains)), codomain)
+        Tiling::data_function(
+            Extent::Union(TagMap::from_arms(
+                tags.iter().cloned().zip(domains).collect(),
+            )),
+            codomain,
+        )
     }
 
     /// The tiling every arm agrees on beneath its domain, where every arm is a collection:
@@ -248,12 +273,13 @@ impl UnionOperator {
         // the shape recorded at construction stale.
         let arms = Self::inner_tilings(&inputs, level);
         let merged = Self::flatten_domain(
-            Self::coproduct_of(&arms, declared_codomain),
+            Self::coproduct_of(&arms, &positional(arms.len()), declared_codomain),
             declared_domain,
         );
         let tiling = with_values_at(inputs[0].tiling(), level, merged);
         Self {
             base: OperatorBase::new(tiling),
+            tags: positional(inputs.len()),
             inputs,
             flat: true,
             level,
@@ -395,6 +421,11 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
     )
 }
 
+/// `0..n`, each input's arm tagged by its position.
+fn positional(n: usize) -> Vec<FieldKey> {
+    (0..n).map(FieldKey::Index).collect()
+}
+
 impl TileOperator for UnionOperator {
     impl_operator_base!();
 
@@ -425,6 +456,7 @@ impl TileOperator for UnionOperator {
             )
             .sharing(gate),
             inputs: input_producers,
+            tags: self.tags.clone(),
             flat: self.flat,
             level: self.level,
         })
@@ -438,6 +470,8 @@ struct UnionProducer {
     /// The level the union merges at — see [`UnionOperator::new_flat_at`].
     level: CurryLevel,
     inputs: Vec<Box<dyn TileProducer>>,
+    /// Each input's arm's tag ([`UnionOperator::new_tagged`]).
+    tags: Vec<FieldKey>,
     /// Flat-merge mode (see [`UnionOperator::new_flat`]).
     flat: bool,
 }
@@ -615,19 +649,22 @@ impl TileProducer for UnionProducer {
         }
 
         // One predicate per arm, and the arms are every tag of the union's domain.
-        let domain_predicate =
-            Predicate::over_every_tag(TagMap::from_positional(domain_predicates));
+        let domain_predicate = Predicate::over_every_tag(TagMap::from_arms(
+            self.tags.iter().cloned().zip(domain_predicates).collect(),
+        ));
 
         // Build the discriminated-union domain column. Each arm occupies a
         // contiguous run of rows, in arm order.
         let mut next_row = 0usize;
-        let union_domain = ColumnValue::Union(TagMap::from_positional(
-            domains
-                .into_iter()
-                .map(|d| {
+        let union_domain = ColumnValue::Union(TagMap::from_arms(
+            self.tags
+                .iter()
+                .cloned()
+                .zip(domains)
+                .map(|(tag, d)| {
                     let rows: Vec<usize> = (next_row..next_row + d.len()).collect();
                     next_row += d.len();
-                    UnionArm::new(rows, d)
+                    (tag, UnionArm::new(rows, d))
                 })
                 .collect(),
         ));
@@ -693,9 +730,9 @@ impl TileProducer for UnionProducer {
             TileGuard::Function(FunctionGuard::Domain(pred @ Predicate::Union { .. }))
                 if !self.flat =>
             {
-                for (arm, input) in self.inputs.iter_mut().enumerate() {
+                for (tag, input) in self.tags.iter().zip(self.inputs.iter_mut()) {
                     let pred = pred
-                        .under_tag(&crate::ccl::FieldKey::Index(arm))
+                        .under_tag(tag)
                         .unwrap_or_else(|| unreachable!("matched as a union predicate"));
                     input.release(TileGuard::Function(FunctionGuard::Domain(pred)));
                 }
@@ -1193,6 +1230,7 @@ mod tests {
             inputs,
             // Tagged, not flat-merged: the assertions below read per-arm
             // variants off a `ColumnValue::Union` domain.
+            tags: positional(2),
             flat: false,
             level: CurryLevel::OUTERMOST,
         };
@@ -1279,6 +1317,7 @@ mod tests {
                     log: log1.clone(),
                 }),
             ],
+            tags: positional(2),
             flat: false,
         };
 
@@ -1423,6 +1462,7 @@ mod tests {
                 Box::new(TestTileProducer::new(arm0, tiling.clone())),
                 Box::new(TestTileProducer::new(arm1, tiling.clone())),
             ],
+            tags: positional(2),
             flat: true,
         };
         let out = producer.get(tiling.universal_guard());

@@ -24,7 +24,7 @@
 //! every pass, so the order a pass runs in is the program's own.
 
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::rc::Rc;
 
 use chl_parser::ast::{
@@ -35,6 +35,7 @@ use chl_parser::ast::{
 
 use crate::value::{Collection, Value};
 use chl_parser::SurfaceBuiltin;
+use chl_parser::places::{Place, places, site_tag};
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Error(pub String);
@@ -109,7 +110,7 @@ struct TxnFrame {
     /// variable the block does not write is an as-of read.
     writes: BTreeSet<String>,
     /// Replies fed inside the block, held until the block commits and its commit time is known.
-    replies: Vec<(String, Site, Value)>,
+    replies: Vec<(String, String, Value)>,
     /// Whether the block wrote or replied speculatively, which leaves whether it commits
     /// undecided.
     uncertain: bool,
@@ -126,27 +127,27 @@ struct TxnFrame {
 struct Channel {
     /// The name its declaration binds, which a sink reports under.
     name: String,
-    /// Contributions: the feed site that made each, its key, and its value.
-    fed: Vec<(Site, Value, Value)>,
+    /// Contributions: the tag of the feed site that made each ([`Interp::feed_site`]), its
+    /// key, and its value.
+    fed: Vec<(String, Value, Value)>,
     /// The value a `<<=` defined the channel as.
     defined: Option<Value>,
-    /// Every feed site naming this channel, in source order.
+    /// Every feed site naming this channel.
     ///
     /// A channel fed from more than one place is a union (`++`) of those places
     /// (`docs/chl-spec.md`, "8.4 Feeds are the second form of mutability"), and its keys are
     /// tagged by which one. The tagging is a property of the program text, so a site that
     /// never fires still counts. A site reached through a call joins when it first fires.
-    sites: Vec<Site>,
+    sites: Vec<FeedPath>,
     /// How many calls and comprehension elements were running where the channel was
-    /// declared, below which a feed's calls make its site ([`Site`]).
+    /// declared, below which a feed's calls make its site ([`FeedPath`]).
     calls_at: usize,
 }
 
 /// Where a contribution comes from: the source position of each call between the channel's
-/// declaration and the feed, outermost first, then the feed's own. A feed in a function a
-/// program calls twice is two sites, as the compiler's two inlined copies of it are, and the
-/// order of sites is the order of their copies in the program.
-type Site = Vec<usize>;
+/// declaration and the feed, outermost first, then the feed's own target's. A feed in a
+/// function a program calls twice is two sites, as the compiler's two inlined copies of it are.
+type FeedPath = Vec<usize>;
 
 impl Channel {
     /// The channel's contents, if this pass made them final: no contribution is pending.
@@ -169,6 +170,9 @@ pub(crate) struct Interp {
     observed: BTreeSet<String>,
     /// Feed sites per channel name, collected from the program text before it runs.
     feed_sites: BTreeMap<String, Vec<usize>>,
+    /// The place of each feed and named call, by the source position of its span
+    /// ([`chl_parser::places::places`]).
+    places: Rc<HashMap<usize, Place>>,
     /// The values a generator has yielded, while one is running.
     yielded: Option<Vec<(Value, Value)>>,
     /// The commit times transaction blocks have taken. They are dense and 1-based: a block
@@ -698,12 +702,17 @@ struct OrderWatch {
 }
 
 impl Interp {
-    fn new(feed_sites: BTreeMap<String, Vec<usize>>, finals: BTreeMap<String, Value>) -> Self {
+    fn new(
+        feed_sites: BTreeMap<String, Vec<usize>>,
+        places: Rc<HashMap<usize, Place>>,
+        finals: BTreeMap<String, Value>,
+    ) -> Self {
         Self {
             scopes: vec![Vec::new()],
             channels: BTreeMap::new(),
             observed: BTreeSet::new(),
             feed_sites,
+            places,
             yielded: None,
             commit_time: 0,
             clock_known: true,
@@ -826,6 +835,12 @@ pub fn run(source: &str) -> Result<Observations, Error> {
         .map_err(|errors| Error(format!("parse error: {errors:?}")))?;
     let mut feed_sites = BTreeMap::new();
     collect_feed_sites(&module.body, &mut feed_sites);
+    let places: Rc<HashMap<usize, Place>> = Rc::new(
+        places(&[], &module.body)
+            .into_iter()
+            .map(|(span, place)| (span.start, place))
+            .collect(),
+    );
     let types = Rc::new(collect_types(&module.body));
     let traits = Rc::new(collect_traits(&module.body));
 
@@ -833,7 +848,7 @@ pub fn run(source: &str) -> Result<Observations, Error> {
     // channel, plus the last.
     let mut finals: BTreeMap<String, Value> = BTreeMap::new();
     loop {
-        let mut interp = Interp::new(feed_sites.clone(), finals.clone());
+        let mut interp = Interp::new(feed_sites.clone(), Rc::clone(&places), finals.clone());
         interp.types = Rc::clone(&types);
         interp.traits = Rc::clone(&traits);
         // A failure outside speculation is on the path the program takes, whatever a later
@@ -1148,7 +1163,7 @@ fn unwrap_pub(stmt: &Spanned<Stmt>) -> &Spanned<Stmt> {
 ///
 /// A `def`'s body contributes the sites feeding a name the body binds itself. A site feeding a
 /// name bound outside the `def` runs once per call, as the compiler's inlined copies of it do,
-/// so it is a site of each call ([`Site`]) and joins its channel when it first fires.
+/// so it is a site of each call ([`FeedPath`]) and joins its channel when it first fires.
 fn collect_feed_sites(body: &[Spanned<Stmt>], feeds: &mut BTreeMap<String, Vec<usize>>) {
     collect_function_feed_sites(body, None, feeds);
 }
@@ -1162,14 +1177,14 @@ fn collect_function_feed_sites(
 ) {
     for_each_stmt(body, Bodies::Enter, &mut |s| match &s.node {
         Stmt::Expr(e) => {
-            if let Expr::Feed { target, value } = &e.node
+            if let Expr::Feed { target, .. } = &e.node
                 && let Expr::Name(n) = &target.node
                 && local.is_none_or(|names| names.contains(n.as_str()))
             {
                 feeds
                     .entry(n.to_string())
                     .or_default()
-                    .push(value.span.start);
+                    .push(target.span.start);
             }
         }
         Stmt::FunctionDef { body, .. } => {
@@ -2308,7 +2323,7 @@ impl Interp {
         // The feed's source position and the calls it is reached through identify the site:
         // two `<<` in one program are two places whatever they write, and so is one `<<`
         // reached through two calls.
-        let site = self.feed_site(&channel, value.span.start);
+        let site = self.feed_site(&channel, target.span.start);
         if let Some(frame) = self.txn.as_mut() {
             // A reply rides its block's commit, so it is indexed by commit time, not by
             // the iteration that produced it. The commit time is not known until the block
@@ -2322,28 +2337,37 @@ impl Interp {
         Ok(())
     }
 
-    /// The site of a feed at source position `at` into the open channel `key` ([`Site`]),
-    /// which the channel's sites take in when it first fires.
-    fn feed_site(&mut self, key: &str, at: usize) -> Site {
+    /// The tag of a feed at source position `at` into the open channel `key`, whose site
+    /// ([`FeedPath`]) the channel's sites take in when it first fires.
+    ///
+    /// The tag spells every named call running, outermost first, then the feed's place
+    /// ([`site_tag`]): the calls the compiler's inlining copied the feed through.
+    fn feed_site(&mut self, key: &str, at: usize) -> String {
         let channel = self
             .channels
             .get_mut(key)
             .expect("a contribution names an open channel");
-        let mut site: Site = self.calls[channel.calls_at..]
+        let mut site: FeedPath = self.calls[channel.calls_at..]
             .iter()
             .filter(|(_, _, call)| *call)
             .map(|(at, _, _)| *at)
             .collect();
         site.push(at);
         if !channel.sites.contains(&site) {
-            channel.sites.push(site.clone());
-            channel.sites.sort();
+            channel.sites.push(site);
         }
-        site
+        let place = |at: &usize| self.places.get(at);
+        let calls = self
+            .calls
+            .iter()
+            .filter(|(_, _, call)| *call)
+            .filter_map(|(at, _, _)| place(at));
+        let fed = place(&at).expect("a feed's target is a place");
+        site_tag("", calls, fed)
     }
 
     /// The contributions of the open channel `key`.
-    fn contribute(&mut self, key: &str) -> &mut Vec<(Site, Value, Value)> {
+    fn contribute(&mut self, key: &str) -> &mut Vec<(String, Value, Value)> {
         &mut self
             .channels
             .get_mut(key)
@@ -2529,21 +2553,16 @@ fn unqualified<Segment>(qualifier: &[Segment], what: &str) -> Result<(), Error> 
 /// the channel's domain keys them.
 ///
 /// One feed site leaves the keys alone. Several make the channel a union (`++`) of them, so
-/// each key is tagged by the site's position among the channel's sites in source order.
+/// each key is tagged by its site's tag ([`Interp::feed_site`]).
 fn channel_value(channel: &Channel) -> Result<Value, Error> {
     if let Some(v) = &channel.defined {
         return Ok(v.clone());
     }
     let mut entries = Vec::with_capacity(channel.fed.len());
-    for (site, key, value) in &channel.fed {
+    for (tag, key, value) in &channel.fed {
         let key = if channel.sites.len() > 1 {
-            let Some(tag) = channel.sites.iter().position(|s| s == site) else {
-                return err(format!(
-                    "the feed at {site:?} fired but was not collected from the program text"
-                ));
-            };
             Value::Variant {
-                tag: tag.to_string(),
+                tag: tag.clone(),
                 payload: Box::new(key.clone()),
             }
         } else {
@@ -2723,7 +2742,7 @@ impl Interp {
                 receiver,
                 method,
                 args,
-            } => self.at_call(e.span.start, |me| {
+            } => self.at_call(method.span.start, |me| {
                 me.call_method(receiver, &method.node, args)
             }),
 
@@ -3011,7 +3030,7 @@ impl Interp {
             // of the branch they take.
             Expr::Block(stmt) => self.branch_value(stmt, false),
 
-            Expr::Call { func, args } => self.at_call(e.span.start, |me| me.call(func, args)),
+            Expr::Call { func, args } => self.at_call(func.span.start, |me| me.call(func, args)),
 
             other => err(format!("unsupported expression: {other:?}")),
         }
@@ -3907,7 +3926,10 @@ mod tests {
                 out << k + v
             out << sum([a * b for a, b in [(1, 10), (2, 20)]])
         "#});
-        assert_eq!(v.to_string(), "[`0(0) -> 11, `0(1) -> 22, `1(()) -> 50]");
+        assert_eq!(
+            v.to_string(),
+            "[`out<<(0) -> 11, `out<<(1) -> 22, `out<<#1(()) -> 50]"
+        );
     }
 
     /// A pattern binds each name once, at every binder.
@@ -3943,7 +3965,10 @@ mod tests {
             out << sum(summon(Iterable(_))::elements([4, 5])) + n
             out << total(Bag::new(box([1, 2, 3]))) + total([4, 5])
         "#});
-        assert_eq!(v.to_string(), "[`0(()) -> 9, `1(()) -> 12, `2(()) -> 15]");
+        assert_eq!(
+            v.to_string(),
+            "[`out<<(()) -> 9, `out<<#1(()) -> 12, `out<<#2(()) -> 15]"
+        );
     }
 
     /// A `for` binder takes a constructor pattern apart, as the compiler does.
@@ -4058,7 +4083,7 @@ mod tests {
             if 1 > 2:
                 out << 2
         "#});
-        assert_eq!(v.to_string(), "[`0(()) -> 1]");
+        assert_eq!(v.to_string(), "[`out<<(()) -> 1]");
     }
 
     #[test]
@@ -4117,7 +4142,10 @@ mod tests {
                     4
             out << y
         "#});
-        assert_eq!(v.to_string(), "[`0(()) -> 1, `1(()) -> 2, `2(()) -> 3]");
+        assert_eq!(
+            v.to_string(),
+            "[`out<<(()) -> 1, `out<<#1(()) -> 3, `y.out<<(()) -> 2]"
+        );
     }
 
     /// Two equal maps written in different orders would give 12 and 21.
@@ -4216,7 +4244,7 @@ mod tests {
         "#};
         assert_eq!(
             out(program).to_string(),
-            "[`0(0) -> 111, `0(1) -> 122, `1(()) -> 70]"
+            "[`out<<(0) -> 111, `out<<(1) -> 122, `out<<#1(()) -> 70]"
         );
     }
 
@@ -4322,7 +4350,7 @@ mod tests {
             out << sum(ch)
             out << push(5)
         "#});
-        assert_eq!(v.to_string(), "[`0(()) -> 5, `1(()) -> 0]");
+        assert_eq!(v.to_string(), "[`out<<(()) -> 5, `out<<#1(()) -> 0]");
     }
 
     /// A channel whose contents depend on a read of itself has no one answer: any `n` solves
