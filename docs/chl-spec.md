@@ -139,7 +139,7 @@ match  case
 pass
 where
 forall requires
-type   impl   trait
+type   impl   instance   trait
 import use    as     pub    run    param  const  this
 ```
 
@@ -162,9 +162,9 @@ reserved for future use.
 
 `match` and `case` introduce tag dispatch over a variant (§4.10).
 
-`type` declares a nominal type, `impl` its associated functions or an instance of a trait, and
-`trait` a trait ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided),
-[Declaring a trait](#declaring-a-trait)).
+`type` declares a nominal type, `impl` its associated functions, `instance` an instance of a
+trait, and `trait` a trait ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided),
+[Declaring a trait](#declaring-a-trait), [Declaring an instance](#declaring-an-instance)).
 
 `forall` begins a polymorphic type (**[Planned]**,
 [Polymorphic type annotations](#polymorphic-type-annotations)). `requires` begins a `requires`
@@ -177,12 +177,12 @@ clause, which ends a `def` signature or a polymorphic type
 > transactions-as-contextual-parameters layer — §8.7, **[Decided]**),
 > and `assert` and its `static assert` form (function contracts — §6, **[Decided]** as the
 > surface, **[Open]** as to what `static` demands). Avoid taking these names for other purposes.
-> (`with`, `:=`, `match`, `case`, `where`, `forall`, `requires`, `type`, `impl`, `trait` and
-> the module keywords are **already** lexed — the first two carry today's transactions and
-> mutation, §8, `match`/`case` carry tag dispatch, §4.10, `where` separates a refinement's
+> (`with`, `:=`, `match`, `case`, `where`, `forall`, `requires`, `type`, `impl`, `instance`,
+> `trait` and the module keywords are **already** lexed — the first two carry today's transactions
+> and mutation, §8, `match`/`case` carry tag dispatch, §4.10, `where` separates a refinement's
 > predicate, §6.4, `forall` and `requires` begin a polymorphic type and a `requires` clause, §6.10,
-> and `type`, `impl` and `trait` declare nominal types, their functions and traits, §6.8 and
-> §6.10 — so they are not in this list.)
+> and `type`, `impl`, `instance` and `trait` declare nominal types, their functions, instances and
+> traits, §6.8 and §6.10 — so they are not in this list.)
 
 ### 1.7 Literals
 
@@ -3205,8 +3205,9 @@ impl Option(T):
   ([Type parameters](#type-parameters)), with `self` of type `Option(T)` unannotated. A `def` may
   add type parameters of its own.
 - **The block names a type of its own module.** `impl shop::Price:` from another module is the
-  spelling an extension would take, and is **[Open]** with extensions. An `impl` block whose head
-  names a trait declares an instance of it ([Declaring an instance](#declaring-an-instance)).
+  spelling an extension would take, and is **[Open]** with extensions. An `impl` head naming a trait
+  is an error: an instance of a trait is declared with `instance`
+  ([Declaring an instance](#declaring-an-instance)).
 
 **Methods and fields are separate namespaces, and the parentheses decide which is meant.**
 `r.f(args)` is a method call, and `r.f` is a field and never a method. A nominal value has no
@@ -3422,7 +3423,7 @@ instance ([Equality and order](#equality-and-order)).
 - **A loop calls `Iterable`'s `elements`.** `for x in c` walks `summon(Iterable(_))::elements(c)`
   and binds `x` to each of its values ([4.6 `for` — iteration](#46-for--iteration)). A collection is its own
   `Elements`, and `elements` returns it. An instance defines it for a nominal type:
-  `impl Iterable(Bag)` with `Elements = List(Int)` and `def elements(b): b.extract()`. An
+  `instance Iterable(Bag)` with `Elements = List(Int)` and `def elements(b): b.extract()`. An
   instance's `Elements` is a structural collection: a nominal `Elements` is an error at the
   instance.
 
@@ -3456,7 +3457,7 @@ instance ([Equality and order](#equality-and-order)).
   does ([3.4 Comparisons](#34-comparisons)), so `requires Equatable({T, U}, {T, U})` also states
   `Equatable(T, T)` and `Equatable(U, U)`. `requires Describe(Two(T))` states `Describe` of the
   nominal type `Two(T)`, which a definition needs where the instances are at particular arguments,
-  as `impl Describe(Two(Int))` is ([Declaring an instance](#declaring-an-instance)).
+  as `instance Describe(Two(Int))` is ([Declaring an instance](#declaring-an-instance)).
 - **A requirement no instance can satisfy is an error at the requirement.**
   `requires Orderable(List(T), List(T))` is rejected where it is written: no `List` is `Orderable`,
   so no call could satisfy it.
@@ -3553,7 +3554,7 @@ def total(S, s: S) => Int requires a: Area(S):
 > **Direction [Decided] — an instance is a module.** A trait is a nominal Module type
 > ([9.8 Module types](#98-module-types)) whose operands are fixed type members, and an instance is
 > a module with no state whose members are its functions, read with `::` as a module's members are.
-> A generic instance, `impl forall (T) Area(Two(T)) requires a: Area(T)`, is a module that takes
+> A generic instance, `instance forall (T) Area(Two(T)) requires a: Area(T)`, is a module that takes
 > types and instances as arguments. Its instance at particular arguments is shared, as an import
 > with particular arguments reaches one shared run ([9.2 Imports](#92-imports)), rather than made
 > afresh for each use, as a run is. `requires Transaction`
@@ -3619,8 +3620,8 @@ trait Scales(V, F):
   each of its trait's associated types.
 - **An associated type may be bounded.** `Size <: Int` states that every instance's choice of the
   type is below `Int`, and may name the trait's operands and its other associated types. An
-  `impl Measured(Box2)` whose block defines `Size = String` is an error at the `impl`. A hole in
-  the bound is any type, chosen afresh at each use: `Iterable`'s `Elements` is bounded
+  `instance Measured(Box2)` whose block defines `Size = String` is an error at the `instance`. A
+  hole in the bound is any type, chosen afresh at each use: `Iterable`'s `Elements` is bounded
   `<: _ |=> _`, every collection.
 - **A trait may require traits of its types.** `trait Ranked(A, B) requires s: Same(A, B):` states
   that every instance of `Ranked` is at types `Same` holds of: an instance whose types `Same` does
@@ -3634,13 +3635,13 @@ trait Scales(V, F):
 #### Declaring an instance
 
 ```ebnf
-impl_stmt   ::= "impl" [ "forall" "(" Ident ( "," Ident )* [ "," ] ")" ]
-                trait_name "(" expression ( "," expression )* ")" [ requires_clause ]
-                ( ":" NEWLINE INDENT impl_item+ DEDENT | NEWLINE )
-impl_item   ::= Ident "=" expression NEWLINE | def_stmt
+instance_stmt ::= "instance" [ "forall" "(" Ident ( "," Ident )* [ "," ] ")" ]
+                  trait_name "(" expression ( "," expression )* ")" [ requires_clause ]
+                  ( ":" NEWLINE INDENT instance_item+ DEDENT | NEWLINE )
+instance_item ::= Ident "=" expression NEWLINE | def_stmt
 ```
 
-An `impl` block whose head names a trait declares an **instance** of it and installs it for the
+An `instance` block declares an **instance** of the trait its head names and installs it for the
 whole program: the types it is for, a definition of each of the trait's associated types, and a
 definition of each of the trait's functions.
 
@@ -3648,20 +3649,20 @@ definition of each of the trait's functions.
 type Circle = Int
 type Two(T) = {T, T}
 
-impl Area(Circle):
+instance Area(Circle):
     def area(s) => Int:
         3 * s.extract() * s.extract()
     def scaled(s, k):
         Circle::new(s.extract() * k)
 
-impl forall (T) Container(Two(T)):
+instance forall (T) Container(Two(T)):
     Elem = T
     def first(c, otherwise):
         c.extract().0
     def tag(c, label):
         (label, c.extract().0)
 
-impl forall (T) Area(Two(T)) requires a: Area(T):
+instance forall (T) Area(Two(T)) requires a: Area(T):
     def area(s):
         a::area(s.extract().0) + a::area(s.extract().1)
     def scaled(s, k):
@@ -3673,24 +3674,24 @@ impl forall (T) Area(Two(T)) requires a: Area(T):
   and `Duo(Two(Int), B)`. At least one operand is a nominal type, and the instance is declared in
   its trait's module or in the module of a nominal type its head names
   ([Traits and instances across modules [Decided]](#traits-and-instances-across-modules-decided)).
-- **`forall` declares the head's type variables.** `impl forall (T) Area(Two(T))` declares `T`; a
-  capitalized name in the head that names no type and is not declared is an error. A type variable
+- **`forall` declares the head's type variables.** `instance forall (T) Area(Two(T))` declares `T`;
+  a capitalized name in the head that names no type and is not declared is an error. A type variable
   stands for any type, one type wherever the head names it, appears in an operand, and is a type
   parameter of every function in the block. A variable standing as a whole operand, `F` in
-  `impl forall (F) Scales(Vec2, F)`, accepts any type there.
+  `instance forall (F) Scales(Vec2, F)`, accepts any type there.
 - **The block defines every associated type,** once each, as a type alias is written, `Elem = T`,
   over the head's variables. The head names only the operands, as a requirement does.
 - **A `requires` clause makes the instance conditional.**
-  `impl forall (T) Area(Two(T)) requires a: Area(T)` answers `Area(Two(X))` only where `Area(X)`
+  `instance forall (T) Area(Two(T)) requires a: Area(T)` answers `Area(Two(X))` only where `Area(X)`
   holds, and its functions reach the instance that holds it as `a`.
 - **Resolving an instance's conditions ends.** A type's depth is how deeply it nests, a type
   variable counting 0: `Int` and `T` have depth 0, `Two(T)` 1, `Two(Two(T))` 2. Each condition is
   no deeper than the head: its depth is at most the head's, and each type variable stands in it no
   deeper than at its deepest place in the head. A condition on the instance's own trait, or on a
   trait not declared before it, is shallower: both comparisons are strict.
-  `impl forall (T) Area(Two(T)) requires Area(T)` is accepted, and `requires Area(Two(T))` is an
+  `instance forall (T) Area(Two(T)) requires Area(T)` is accepted, and `requires Area(Two(T))` is an
   error. A variable may stand in a condition more often than in the head, as `T` does in
-  `impl forall (T) Same(Two(T)) requires Equatable(T, T)`. The compiler's traits are declared
+  `instance forall (T) Same(Two(T)) requires Equatable(T, T)`. The compiler's traits are declared
   before a module's, a module's traits in the order it writes them, and an imported module's
   before the importing module's; traits of two modules neither of which imports the other are not
   ordered. A chain of conditions therefore either names an earlier trait or a shallower type at
@@ -3705,7 +3706,8 @@ impl forall (T) Area(Two(T)) requires a: Area(T):
   it is resolved at. This rule, and the one on which module may declare an instance
   ([Traits and instances across modules [Decided]](#traits-and-instances-across-modules-decided)), are rules of
   installing an instance for the whole program.
-- **An instance is visible after its `impl`,** as a `def`'s name is after the `def`. Within a
+- **An instance is visible after its `instance` statement,** as a `def`'s name is after the
+  `def`. Within a
   module, a summon answered by an instance declared below it is an error, and so is a summon inside
   a generic definition declared above the instance that a use answers with it. Within the block, a
   function may call another of the instance's in either order, and two that call each other at the
@@ -3730,13 +3732,14 @@ impl forall (T) Area(Two(T)) requires a: Area(T):
   them, and a call reads its function from that instance. An instance is declared at a module's
   top level.
 - **An instance of an arithmetic operator's trait defines the operator.**
-  `impl Addable(Money, Money)`, with `Output = Money` in its block, defines `add`, which `+` on two
-  `Money` values calls, and an instance may be over two types, `impl Addable(Money, Int)`. A `**`'s
-  exponent is a non-negative `Int` whichever instance answers it
+  `instance Addable(Money, Money)`, with `Output = Money` in its block, defines `add`, which `+` on
+  two `Money` values calls, and an instance may be over two types, `instance Addable(Money, Int)`.
+  A `**`'s exponent is a non-negative `Int` whichever instance answers it
   ([3.3 Arithmetic and logical operators](#33-arithmetic-and-logical-operators)), so an instance
   of `Exponentiable` names `Int` as its second operand.
-- **An instance of a trait that declares no function has no block.** `impl Equatable(Money, Money)`
-  is the whole declaration. A type's own `impl` block declares at least one function.
+- **An instance of a trait that declares no function has no block.**
+  `instance Equatable(Money, Money)` is the whole declaration. A type's own `impl` block declares
+  at least one function.
 
 #### Equality and order
 
@@ -3747,14 +3750,14 @@ type Version:
     new(major: Int, minor: Int)
 type Two(T) = {T, T}
 
-impl Equatable(Money, Money)
-impl Orderable(Money, Money)
-impl Equatable(Person, Person)
-impl Orderable(Person, Person)      # by age, then name
-impl Equatable(Version, Version)
-impl Orderable(Version, Version)    # by major, then minor
-impl forall (T) Equatable(Two(T), Two(T)) requires Equatable(T, T)
-impl forall (T) Orderable(Two(T), Two(T)) requires Orderable(T, T), Equatable(T, T)
+instance Equatable(Money, Money)
+instance Orderable(Money, Money)
+instance Equatable(Person, Person)
+instance Orderable(Person, Person)      # by age, then name
+instance Equatable(Version, Version)
+instance Orderable(Version, Version)    # by major, then minor
+instance forall (T) Equatable(Two(T), Two(T)) requires Equatable(T, T)
+instance forall (T) Orderable(Two(T), Two(T)) requires Orderable(T, T), Equatable(T, T)
 ```
 
 - **Two values are equal when they are the same value.** `Equatable` and `Orderable` declare no
@@ -3766,8 +3769,8 @@ impl forall (T) Orderable(Two(T), Two(T)) requires Orderable(T, T), Equatable(T,
 - **A nominal type opts in.** An instance names one nominal type twice, and every constructor's
   argument must compare by value where the instance's `requires` clause holds: a base type the
   compiler compares, a product of such types, or a nominal type with its own instance, declared
-  above. A constructor with no parameters compares by its name alone. `impl Equatable(F, F)` for
-  `type F = Int => Int` is an error at the `impl`, since no function is `Equatable`.
+  above. A constructor with no parameters compares by its name alone. `instance Equatable(F, F)`
+  for `type F = Int => Int` is an error at the `instance`, since no function is `Equatable`.
 - **What orders by value is equal by value.** `Orderable(A, B)` requires `Equatable(A, B)`
   ([Declaring a trait](#declaring-a-trait)), so an instance of `Orderable` needs one of `Equatable`
   at its types. A requirement is not transitive: a definition that compares `T`'s values with `==`
@@ -3782,9 +3785,9 @@ impl forall (T) Orderable(Two(T), Two(T)) requires Orderable(T, T), Equatable(T,
   since its constructors have no order ([Declaring a nominal type](#declaring-a-nominal-type)).
   Any record other than one the declaration lists has no order: one named by an alias, as in
   `type P = PersonFields`, or passed as a type argument, as in `type P = Two({b: Int, a: Int})`.
-  Each is an error at the `impl`.
+  Each is an error at the `instance`.
 - **`Option` compares by value where its argument does.** The compiler declares
-  `impl forall (T) Equatable(Option(T), Option(T)) requires Equatable(T, T)`, as it declares
+  `instance forall (T) Equatable(Option(T), Option(T)) requires Equatable(T, T)`, as it declares
   `Option`, so `Option::some(1) == Option::none` is `False` and an `Option` is a key of a `groupby`.
   `Option` has two constructors, so it is not orderable.
 - **`max` and `min` read the same order.** `max([Person::new((age=3, name="a")), …])` is the
@@ -3796,10 +3799,10 @@ impl forall (T) Orderable(Two(T), Two(T)) requires Orderable(T, T), Equatable(T,
 A trait is a member of its module ([9. Modules [Decided]](#9-modules-decided)), and an instance
 belongs to the whole program.
 
-- **`pub trait` exports a trait** with its functions and associated types, and `pub` is refused on
-  a trait's `def`. Another module names it qualified, as `shapes::Area` in a `requires` clause, in
-  `summon(shapes::Area(_))` and in an instance's head `impl shapes::Area(Circle):`, or by its own
-  name after `use shapes::{Area}`.
+- **`pub trait` exports a trait** with its functions and associated types, and `pub` is refused on a
+  trait's `def`. Another module names it qualified, as `shapes::Area` in a `requires` clause, in
+  `summon(shapes::Area(_))` and in an instance's head `instance shapes::Area(Circle):`, or by its
+  own name after `use shapes::{Area}`.
 - **An instance's functions read nothing a run gives its module.** Every import and run of the
   module shares the instance, so, as an associated function's
   ([Associated functions and methods](#associated-functions-and-methods)), its functions read no
@@ -3807,27 +3810,27 @@ belongs to the whole program.
   a Module-typed parameter, and no member of a run the module declares other than its types'
   functions and constructors, directly or through the module's bindings and functions, and an
   error names what one reads.
-- **An instance holds wherever its trait and its types can be named.** `impl` takes no `pub`, and
-  no import selects instances: a module sees every instance its imports declare, directly or
-  through other imports. A key of a `Set`, a join's equality and each summon therefore mean the
-  same in every module.
+- **An instance holds wherever its trait and its types can be named.** `instance` takes no `pub`,
+  and no import selects instances: a module sees every instance its imports declare, directly or
+  through other imports. A key of a `Set`, a join's equality and each summon therefore mean the same
+  in every module.
 - **An instance is declared in its trait's module or in the module of a nominal type its head
   names.** A module that can name the trait and the type imports the module declaring the
   instance, directly or through other imports. The compiler's traits and `Option` belong to no
   module, so a module declares an instance of a compiler trait only for a type it declares, and an
   instance for `Option` only of a trait it declares.
 - **Outside its trait's module, no operand of an instance's head is a type variable.**
-  `impl forall (T) shapes::Area(Two(T))` may stand in `Two`'s module, and
-  `impl forall (F) Scales(Vec2, F)` only in `Scales`'s. Two modules that do not import each other
-  then cannot declare overlapping instances, so an overlap is an error in the module declaring the
-  second instance, which a module checked on its own reports
+  `instance forall (T) shapes::Area(Two(T))` may stand in `Two`'s module, and
+  `instance forall (F) Scales(Vec2, F)` only in `Scales`'s. Two modules that do not import each
+  other then cannot declare overlapping instances, so an overlap is an error in the module declaring
+  the second instance, which a module checked on its own reports
   ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)).
 - **A public member's contract names only public traits.** A `pub` definition whose stated or
   inferred `requires` clause names a private trait is an error, and so is a `pub trait` whose
   signatures or `requires` clause name a private type or trait.
 - **[Open] — a summon answered by an instance of another module.** A generic definition, an
   instance's function included, may be used at a type whose instance a module importing the
-  definition's declares: `app`'s `impl Area(Square)` answering the requirement of a library's
+  definition's declares: `app`'s `instance Area(Square)` answering the requirement of a library's
   `def total(S, s: S) => Int requires a: Area(S)`. Which such instances a use may pass is open;
   the scoping rule of [Declaring an instance](#declaring-an-instance) orders one module's
   declarations.

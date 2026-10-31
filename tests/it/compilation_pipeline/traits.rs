@@ -19,12 +19,12 @@ const SHAPES: &str = indoc! {"
     trait Area(S):
         def area(s: S) => Int
         def scaled(s: S, k: Int) => S
-    impl Area(Circle):
+    instance Area(Circle):
         def area(s) => Int:
             3 * s.extract() * s.extract()
         def scaled(s, k):
             Circle::new(s.extract() * k)
-    impl Area(Square):
+    instance Area(Square):
         def area(s):
             s.extract() * s.extract()
         def scaled(s, k: Int) => Square:
@@ -180,7 +180,7 @@ fn a_trait_function_call_refuses(#[case] code: &str, #[case] needle: &str) {
             Elem
             def left(c: C) => Elem
             def swap(c: C) => C
-        impl forall (T) Pair(Two(T)):
+        instance forall (T) Pair(Two(T)):
             Elem = T
             def left(c):
                 c.extract().0
@@ -206,11 +206,11 @@ const PAIRS: &str = indoc! {"
     trait Pair(C):
         Elem
         def left(c: C) => Elem
-    impl forall (T) Pair(Two(T)):
+    instance forall (T) Pair(Two(T)):
         Elem = T
         def left(c):
             c.extract().0
-    impl Pair(Named):
+    instance Pair(Named):
         Elem = String
         def left(c):
             c.extract().0
@@ -267,10 +267,10 @@ fn an_associated_type_is_the_instances(#[case] code: &str, #[case] expected: Val
         type Two(T) = {T, T}
         trait Area(S):
             def area(s: S) => Int
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s):
                 3 * s.extract() * s.extract()
-        impl forall (T) Area(Two(T)) requires a: Area(T):
+        instance forall (T) Area(Two(T)) requires a: Area(T):
             def area(s):
                 a::area(s.extract().0) + a::area(s.extract().1)
         summon(Area(_))::area(Two::new((Circle::new(1), Circle::new(2))))
@@ -283,10 +283,10 @@ fn an_associated_type_is_the_instances(#[case] code: &str, #[case] expected: Val
         type Two(T) = {T, T}
         trait Area(S):
             def area(s: S) => Int
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s):
                 s.extract()
-        impl forall (T) Area(Two(T)) requires Area(T):
+        instance forall (T) Area(Two(T)) requires Area(T):
             def area(s):
                 summon(Area(_))::area(s.extract().0) + summon(Area(_))::area(s.extract().1)
         c = Circle::new(1)
@@ -304,10 +304,10 @@ fn an_associated_type_is_the_instances(#[case] code: &str, #[case] expected: Val
         type Two(T) = {T, T}
         trait Area(S):
             def area(s: S) => Int
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s):
                 3 * s.extract() * s.extract()
-        impl forall (T) Area(Two(T)) requires a: Area(T):
+        instance forall (T) Area(Two(T)) requires a: Area(T):
             def area(s):
                 a::area(s.extract().0) + a::area(s.extract().1)
         def big(s):
@@ -322,10 +322,10 @@ fn an_associated_type_is_the_instances(#[case] code: &str, #[case] expected: Val
         type Two(T) = {T, T}
         trait Area(S):
             def area(s: S) => Int
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s):
                 3 * s.extract() * s.extract()
-        impl forall (T) Area(Two(T)) requires a: Area(T):
+        instance forall (T) Area(Two(T)) requires a: Area(T):
             def area(s):
                 a::area(s.extract().0) + a::area(s.extract().1)
         def big(S, s: S) => Int requires Area(Two(S)):
@@ -350,10 +350,10 @@ fn a_conditional_instance_uses_its_condition(#[case] code: &str, #[case] expecte
             def size(s: S) => Int
         trait Area(S):
             def area(s: S) => Int
-        impl Size(Two(Int)):
+        instance Size(Two(Int)):
             def size(s):
                 2
-        impl forall (T) Area(Two(T)) requires Size(Two(T)):
+        instance forall (T) Area(Two(T)) requires Size(Two(T)):
             def area(s):
                 10 * summon(Size(_))::size(s)
         summon(Area(_))::area(Two::new((1, 2)))
@@ -365,7 +365,7 @@ fn a_conditional_instance_uses_its_condition(#[case] code: &str, #[case] expecte
         type Two(T) = {T, T}
         trait Same(S):
             def same(s: S) => Int
-        impl forall (T) Same(Two(T)) requires Equatable(T, T):
+        instance forall (T) Same(Two(T)) requires Equatable(T, T):
             def same(s):
                 1 if s.extract().0 == s.extract().1 else 0
         summon(Same(_))::same(Two::new((3, 3))) + summon(Same(_))::same(Two::new((3, 4)))
@@ -386,12 +386,12 @@ fn a_condition_keeps_to_its_head_s_depth(#[case] code: &str, #[case] expected: i
         type Two(T) = {T, T}
         trait Area(S):
             def area(s: S) => Int
-        impl forall (T) Area(Two(T)) requires Area(Two(T)):
+        instance forall (T) Area(Two(T)) requires Area(Two(T)):
             def area(s):
                 1
         1
     "},
-    "`impl Area(Two(T))` requires `Area(Two(T))`, which is not shallower than the head; a \
+    "`instance Area(Two(T))` requires `Area(Two(T))`, which is not shallower than the head; a \
      condition on `Area` itself is shallower than the instance's head"
 )]
 #[case::its_own_trait_deeper(
@@ -399,7 +399,7 @@ fn a_condition_keeps_to_its_head_s_depth(#[case] code: &str, #[case] expected: i
         type Two(T) = {T, T}
         trait Area(S):
             def area(s: S) => Int
-        impl forall (T) Area(Two(T)) requires Area(Two(Two(T))):
+        instance forall (T) Area(Two(T)) requires Area(Two(Two(T))):
             def area(s):
                 1
         1
@@ -413,7 +413,7 @@ fn a_condition_keeps_to_its_head_s_depth(#[case] code: &str, #[case] expected: i
             def size(s: S) => Int
         trait Area(S):
             def area(s: S) => Int
-        impl forall (T) Area(Two(T)) requires Size(Two(Two(T))):
+        instance forall (T) Area(Two(T)) requires Size(Two(Two(T))):
             def area(s):
                 1
         1
@@ -427,7 +427,7 @@ fn a_condition_keeps_to_its_head_s_depth(#[case] code: &str, #[case] expected: i
             def area(s: S) => Int
         trait Size(S):
             def size(s: S) => Int
-        impl forall (T) Area(Two(T)) requires Size(Two(T)):
+        instance forall (T) Area(Two(T)) requires Size(Two(T)):
             def area(s):
                 1
         1
@@ -444,10 +444,10 @@ fn a_condition_keeps_to_its_head_s_depth(#[case] code: &str, #[case] expected: i
         type Pair(X, Y) = {X, Y}
         type Wa(T) = T
         type Wb(T) = T
-        impl forall (X, Y) P(Pair(Wa(X), Y)) requires Q(Pair(Y, Wa(X))):
+        instance forall (X, Y) P(Pair(Wa(X), Y)) requires Q(Pair(Y, Wa(X))):
             def p(a):
                 1
-        impl forall (U, V) Q(Pair(Wb(U), V)) requires P(Pair(V, Wb(U))):
+        instance forall (U, V) Q(Pair(Wb(U), V)) requires P(Pair(V, Wb(U))):
             def q(a):
                 1
         1
@@ -467,7 +467,7 @@ fn an_instance_s_conditions_end(#[case] code: &str, #[case] needle: &str) {
         type Circle = Int
         trait Tagged(C):
             def tag(R, c: C, label: R) => {R, Int}
-        impl Tagged(Circle):
+        instance Tagged(Circle):
             def tag(R, c, label: R) => {R, Int}:
                 (label, c.extract())
         c = Circle::new(4)
@@ -480,7 +480,7 @@ fn an_instance_s_conditions_end(#[case] code: &str, #[case] needle: &str) {
         type Circle = Int
         trait Tagged(C):
             def tag(R, c: C, label: R) => {R, Int}
-        impl Tagged(Circle):
+        instance Tagged(Circle):
             def tag(c, label):
                 (label, c.extract())
         p = summon(Tagged(_))::tag(Circle::new(4), True)
@@ -494,7 +494,7 @@ fn an_instance_s_conditions_end(#[case] code: &str, #[case] needle: &str) {
         trait Summable(C):
             Elem
             def total(c: C) => r::Output requires r: Addable(Elem, Elem)
-        impl forall (T) Summable(Two(T)):
+        instance forall (T) Summable(Two(T)):
             Elem = T
             def total(c):
                 c.extract().0 + c.extract().1
@@ -515,10 +515,10 @@ fn a_trait_function_has_its_own_parameters(#[case] code: &str, #[case] expected:
         type Feet = Int
         trait AddTo(A, B):
             def add_to(a: A, other: B) => A
-        impl AddTo(Meters, Meters):
+        instance AddTo(Meters, Meters):
             def add_to(a, other):
                 Meters::new(a.extract() + other.extract())
-        impl AddTo(Meters, Feet):
+        instance AddTo(Meters, Feet):
             def add_to(a, other):
                 Meters::new(a.extract() + other.extract() // 3)
         m = summon(AddTo(_, _))::add_to(Meters::new(1), Meters::new(2))
@@ -532,7 +532,7 @@ fn a_trait_function_has_its_own_parameters(#[case] code: &str, #[case] expected:
         trait Scales(V, F):
             def scale(v: V, f: F) => V
             def scale_vec(f: F, v: V) => V
-        impl Scales(Vec, Int):
+        instance Scales(Vec, Int):
             def scale(v, f):
                 Vec::new((v.extract().0 * f, v.extract().1 * f))
             def scale_vec(f, v):
@@ -554,7 +554,7 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
         type Circle = Int
         trait Area(S):
             def area(s: S) => Int
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s):
                 summon(Area(_))::area(s)
         summon(Area(_))::area(Circle::new(1))
@@ -567,10 +567,10 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
         type Two(T) = {T, T}
         trait Area(S):
             def area(s: S) => Int
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s):
                 s.extract()
-        impl forall (T) Area(Two(T)) requires Area(T):
+        instance forall (T) Area(Two(T)) requires Area(T):
             def area(s):
                 summon(Area(_))::area(s)
         summon(Area(_))::area(Two::new((Circle::new(1), Circle::new(2))))
@@ -583,10 +583,10 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
         type Two(T) = {T, T}
         trait Area(S):
             def area(s: S) => Int
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s):
                 s.extract()
-        impl forall (T) Area(Two(T)) requires Area(T):
+        instance forall (T) Area(Two(T)) requires Area(T):
             def area(s):
                 summon(Area(_))::area(Two::new((s, s)))
         summon(Area(_))::area(Two::new((Circle::new(1), Circle::new(2))))
@@ -600,12 +600,12 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
         trait Area(S):
             def area(s: S) => Int
         x = summon(Area(_))::area(Circle::new(2))
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s):
                 s.extract()
         x
     "},
-    "is answered by `impl Area(Circle)`, which is declared below it"
+    "is answered by `instance Area(Circle)`, which is declared below it"
 )]
 #[case::an_instance_below_a_generic_use(
     indoc! {"
@@ -614,7 +614,7 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
             def area(s: S) => Int
         def twice(S, s: S) => Int requires Area(S):
             2 * summon(Area(_))::area(s)
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s):
                 s.extract()
         twice(Circle::new(2))
@@ -627,7 +627,7 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
         type Square = Int
         trait Area(S):
             def area(s: S) => Int
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s):
                 s.extract()
         summon(Area(_))::area(Square::new(2))
@@ -648,21 +648,21 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
         type Circle = Int
         trait Area(S):
             def area(s: S) => Int
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s):
                 1
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s):
                 2
         1
     "},
-    "`impl Area(Circle)` overlaps another instance of `Area`"
+    "`instance Area(Circle)` overlaps another instance of `Area`"
 )]
 #[case::an_instance_of_a_structural_type(
     indoc! {"
         trait Area(S):
             def area(s: S) => Int
-        impl forall (T) Area(List(T)):
+        instance forall (T) Area(List(T)):
             def area(s):
                 1
         1
@@ -673,12 +673,12 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
     indoc! {"
         trait Area(S):
             def area(s: S) => Int
-        impl Area(Int):
+        instance Area(Int):
             def area(s):
                 1
         1
     "},
-    "`impl Area(Int)` names no nominal type"
+    "`instance Area(Int)` names no nominal type"
 )]
 #[case::a_missing_function(
     indoc! {"
@@ -686,19 +686,19 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
         trait Area(S):
             def area(s: S) => Int
             def perimeter(s: S) => Int
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s):
                 1
         1
     "},
-    "`impl Area(Circle)` does not define `perimeter`, which `Area` declares"
+    "`instance Area(Circle)` does not define `perimeter`, which `Area` declares"
 )]
 #[case::an_extra_function(
     indoc! {"
         type Circle = Int
         trait Area(S):
             def area(s: S) => Int
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s):
                 1
             def perimeter(s):
@@ -712,7 +712,7 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
         type Circle = Int
         trait Area(S):
             def scaled(s: S, k: Int) => S
-        impl Area(Circle):
+        instance Area(Circle):
             def scaled(s, k: String):
                 s
         1
@@ -724,7 +724,7 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
         type Circle = Int
         trait Area(S):
             def area(s: S) => Int
-        impl Area(Circle):
+        instance Area(Circle):
             def area(s) => String:
                 \"a\"
         1
@@ -737,7 +737,7 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
         trait Pair(C):
             Elem
             def left(c: C) => Elem
-        impl forall (T) Pair(Two(T)):
+        instance forall (T) Pair(Two(T)):
             def left(c):
                 c.extract().0
         1
@@ -757,7 +757,7 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
         type Circle = Int
         trait Area(S):
             def area(s: S) => Int
-        impl Area(Circle):
+        instance Area(Circle):
             def area(self):
                 1
         1
@@ -769,7 +769,7 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
         type Bag = List(Int)
         trait Container(C):
             Elem
-        impl Container(Bag):
+        instance Container(Bag):
             Elem = Int
             def first(x):
                 1
@@ -807,7 +807,7 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
         type Circle = Int
         trait Area(S):
             def area(s: S) => Int
-        impl Area(Circle) requires Addable(Bool, Bool):
+        instance Area(Circle) requires Addable(Bool, Bool):
             def area(s):
                 3
         summon(Area(_))::area(Circle::new(1))
@@ -820,7 +820,7 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
         type Square = Int
         trait Area(S):
             def area(s: S) => Int
-        impl Area(Circle) requires Area(Square):
+        instance Area(Circle) requires Area(Square):
             def area(s):
                 3
         summon(Area(_))::area(Circle::new(1))
@@ -853,20 +853,20 @@ fn the_specs_trait_and_instances() {
             type Circle = Int
             type Two(T) = {T, T}
 
-            impl Area(Circle):
+            instance Area(Circle):
                 def area(s) => Int:
                     3 * s.extract() * s.extract()
                 def scaled(s, k):
                     Circle::new(s.extract() * k)
 
-            impl forall (T) Container(Two(T)):
+            instance forall (T) Container(Two(T)):
                 Elem = T
                 def first(c, otherwise):
                     c.extract().0
                 def tag(c, label):
                     (label, c.extract().0)
 
-            impl forall (T) Area(Two(T)) requires a: Area(T):
+            instance forall (T) Area(Two(T)) requires a: Area(T):
                 def area(s):
                     a::area(s.extract().0) + a::area(s.extract().1)
                 def scaled(s, k):
@@ -897,10 +897,10 @@ fn a_trait_function_shares_no_namespace() {
                 def area(s: S) => Int
             trait Surface(S):
                 def area(s: S) => Int
-            impl Area(Circle):
+            instance Area(Circle):
                 def area(s):
                     20
-            impl Surface(Circle):
+            instance Surface(Circle):
                 def area(s):
                     300
             c = Circle::new(0)
@@ -917,19 +917,19 @@ const CODES: &str = indoc! {"
     type Duo(A, B) = {A, B}
     trait Describe(C):
         def code(c: C) => Int
-    impl Describe(Two(Int)):
+    instance Describe(Two(Int)):
         def code(c):
             c.extract().0
-    impl Describe(Two(String)):
+    instance Describe(Two(String)):
         def code(c):
             100
-    impl Describe(Two(Two(Int))):
+    instance Describe(Two(Two(Int))):
         def code(c):
             summon(Describe(_))::code(c.extract().0) + 1000
-    impl forall (B) Describe(Duo(Int, B)):
+    instance forall (B) Describe(Duo(Int, B)):
         def code(c):
             1
-    impl forall (B) Describe(Duo(String, B)):
+    instance forall (B) Describe(Duo(String, B)):
         def code(c):
             2
 "};
@@ -988,11 +988,11 @@ fn an_associated_type_differs_by_argument() {
             trait Label(C):
                 Out
                 def label(c: C) => Out
-            impl Label(Two(Int)):
+            instance Label(Two(Int)):
                 Out = String
                 def label(c):
                     \"int\"
-            impl Label(Two(String)):
+            instance Label(Two(String)):
                 Out = Int
                 def label(c):
                     7
@@ -1013,7 +1013,7 @@ fn a_repeated_variable_is_one_type() {
             type Duo(A, B) = {A, B}
             trait Same(C):
                 def same(c: C) => Bool
-            impl forall (T) Same(Duo(T, T)) requires Equatable(T, T):
+            instance forall (T) Same(Duo(T, T)) requires Equatable(T, T):
                 def same(c):
                     c.extract().0 == c.extract().1
             1 if summon(Same(_))::same(Duo::new((3, 3))) else 0
@@ -1051,10 +1051,10 @@ fn a_head_with_arguments_refuses(#[case] call: &str, #[case] needle: &str) {
         type Two(T) = {T, T}
         trait Describe(C):
             def code(c: C) => Int
-        impl forall (T) Describe(Two(T)):
+        instance forall (T) Describe(Two(T)):
             def code(c):
                 1
-        impl Describe(Two(Int)):
+        instance Describe(Two(Int)):
             def code(c):
                 2
         1
@@ -1065,10 +1065,10 @@ fn a_head_with_arguments_refuses(#[case] call: &str, #[case] needle: &str) {
         type Duo(A, B) = {A, B}
         trait Describe(C):
             def code(c: C) => Int
-        impl forall (B) Describe(Duo(Int, B)):
+        instance forall (B) Describe(Duo(Int, B)):
             def code(c):
                 1
-        impl forall (A) Describe(Duo(A, String)):
+        instance forall (A) Describe(Duo(A, String)):
             def code(c):
                 2
         1
@@ -1087,25 +1087,25 @@ fn overlapping_heads_are_refused(#[case] code: &str) {
         type Two(T) = {T, T}
         trait Describe(C):
             def code(c: C) => Int
-        impl Describe(Two(Strng)):
+        instance Describe(Two(Strng)):
             def code(c):
                 1
         1
     "},
     "`Strng` is no type; a type variable of an instance is declared before its head, \
-     `impl forall (Strng) Describe(…)`"
+     `instance forall (Strng) Describe(…)`"
 )]
 #[case::a_variable_no_operand_names(
     indoc! {"
         type Circle = Int
         trait Area(S):
             def area(s: S) => Int
-        impl forall (T) Area(Circle):
+        instance forall (T) Area(Circle):
             def area(s):
                 1
         1
     "},
-    "type variable `T` appears in no operand of `impl Area(Circle)`"
+    "type variable `T` appears in no operand of `instance Area(Circle)`"
 )]
 #[case::forall_on_a_type_s_own_block(
     indoc! {"
@@ -1115,7 +1115,7 @@ fn overlapping_heads_are_refused(#[case] code: &str) {
                 self.extract()
         1
     "},
-    "`forall` declares the type variables of an instance of a trait"
+    "`forall` declares the type variables of an `instance` of a trait"
 )]
 #[case::a_variable_named_after_a_type(
     indoc! {"
@@ -1123,7 +1123,7 @@ fn overlapping_heads_are_refused(#[case] code: &str) {
         type Two(T) = {T, T}
         trait Area(S):
             def area(s: S) => Int
-        impl forall (Circle) Area(Two(Circle)):
+        instance forall (Circle) Area(Two(Circle)):
             def area(s):
                 1
         1
@@ -1154,7 +1154,7 @@ fn a_variable_operand(#[case] call: &str, #[case] expected: i64) {
                 trait Scales(V, F):
                     def scale(v: V, f: F) => V
                     def times(f: F, v: V) => V
-                impl forall (F) Scales(Vec2, F) requires r: Multipliable(Int, F), r::Output <: Int:
+                instance forall (F) Scales(Vec2, F) requires r: Multipliable(Int, F), r::Output <: Int:
                     def scale(v, f):
                         Vec2::new((v.extract().0 * f, v.extract().1 * f))
                     def times(f, v):
@@ -1181,10 +1181,10 @@ const RANKED: &str = indoc! {"
 #[timeout(Duration::from_secs(10))]
 #[case::an_instance_reads_its_trait_s_requirement(
     indoc! {"
-        impl Same(M, M):
+        instance Same(M, M):
             def same(a, other):
                 a.extract() == other.extract()
-        impl Ranked(M, M):
+        instance Ranked(M, M):
             def rank(a, other):
                 1 if s::same(a, other) else 0
         summon(Ranked(_, _))::rank(M::new(2), M::new(2))
@@ -1193,16 +1193,16 @@ const RANKED: &str = indoc! {"
 )]
 #[case::a_conditional_instance_holds_by_its_condition(
     indoc! {"
-        impl Same(M, M):
+        instance Same(M, M):
             def same(a, other):
                 a.extract() == other.extract()
-        impl Ranked(M, M):
+        instance Ranked(M, M):
             def rank(a, other):
                 1
-        impl forall (T) Same(Two(T), Two(T)) requires e: Same(T, T):
+        instance forall (T) Same(Two(T), Two(T)) requires e: Same(T, T):
             def same(a, other):
                 e::same(a.extract().0, other.extract().0)
-        impl forall (T) Ranked(Two(T), Two(T)) requires r: Ranked(T, T), Same(T, T):
+        instance forall (T) Ranked(Two(T), Two(T)) requires r: Ranked(T, T), Same(T, T):
             def rank(a, other):
                 r::rank(a.extract().0, other.extract().0) + (1 if s::same(a, other) else 0)
         p = Two::new((M::new(1), M::new(2)))
@@ -1231,10 +1231,10 @@ fn a_requirement_is_not_transitive(#[case] body: &str, #[case] needle: &str) {
     check_compile_error(
         &formatdoc! {"
             {RANKED}
-            impl Same(M, M):
+            instance Same(M, M):
                 def same(a, other):
                     a.extract() == other.extract()
-            impl Ranked(M, M):
+            instance Ranked(M, M):
                 def rank(a, other):
                     1
             def check(T, x: T, y: T) => Bool requires r: Ranked(T, T):
@@ -1258,13 +1258,13 @@ fn two_required_traits_share_a_function_name() {
                 def name(a: A) => Int
             trait Both(A) requires l: Left(A), r: Right(A):
                 def sum(a: A) => Int
-            impl Left(M):
+            instance Left(M):
                 def name(a):
                     1
-            impl Right(M):
+            instance Right(M):
                 def name(a):
                     2
-            impl Both(M):
+            instance Both(M):
                 def sum(a):
                     10 * l::name(a) + r::name(a)
             def twice(A, a: A) => Int requires b: Both(A):
@@ -1282,13 +1282,13 @@ fn an_instance_without_its_trait_s_requirement_is_refused() {
         &format!(
             "{RANKED}\n{}",
             indoc! {"
-                impl Ranked(M, M):
+                instance Ranked(M, M):
                     def rank(a, other):
                         1
                 1
             "}
         ),
-        "`impl Ranked(M, M)` needs `Same(M, M)`, which `Ranked` requires of every instance",
+        "`instance Ranked(M, M)` needs `Same(M, M)`, which `Ranked` requires of every instance",
     );
 }
 
@@ -1306,12 +1306,12 @@ fn a_function_calls_one_declared_after_it(#[case] call: &str, #[case] expected: 
             trait Area(S):
                 def area(s: S) => Int
                 def twice(s: S) => Int
-            impl Area(Circle):
+            instance Area(Circle):
                 def area(s):
                     summon(Area(_))::twice(s) + 1
                 def twice(s):
                     2 * s.extract()
-            impl forall (T) Area(One(T)) requires Area(T):
+            instance forall (T) Area(One(T)) requires Area(T):
                 def area(s):
                     summon(Area(_))::twice(s) + 1
                 def twice(s):
@@ -1331,7 +1331,7 @@ fn functions_calling_each_other_at_the_instance_s_types() {
             trait Area(S):
                 def area(s: S) => Int
                 def twice(s: S) => Int
-            impl Area(Circle):
+            instance Area(Circle):
                 def area(s):
                     summon(Area(_))::twice(s) + 1
                 def twice(s):
@@ -1353,12 +1353,12 @@ fn functions_calling_each_other_at_other_types() {
             trait Shape(S):
                 def area(s: S) => Int
                 def scaled(s: S, k: Int) => S
-            impl Shape(Circle):
+            instance Shape(Circle):
                 def area(s):
                     s.extract()
                 def scaled(s, k):
                     Circle::new(s.extract() * k)
-            impl forall (T) Shape(Two(T)) requires h: Shape(T):
+            instance forall (T) Shape(Two(T)) requires h: Shape(T):
                 def area(s):
                     h::area(h::scaled(s.extract().0, 2)) + h::area(s.extract().1)
                 def scaled(s, k):
@@ -1379,10 +1379,10 @@ fn an_operand_determined_by_the_result() {
             type Circle = Int
             trait Make(T):
                 def make(n: Int) => T
-            impl Make(Circle):
+            instance Make(Circle):
                 def make(n):
                     Circle::new(n)
-            impl forall (T) Make(Two(T)) requires Make(T):
+            instance forall (T) Make(Two(T)) requires Make(T):
                 def make(n):
                     Two::new((summon(Make(_))::make(n), summon(Make(_))::make(n + 1)))
             x: Two(Circle) = summon(Make(_))::make(1)
@@ -1406,10 +1406,10 @@ fn a_chain_whose_types_contain_no_earlier_call_s(#[case] label: &str, #[case] ex
             type One(T) = T
             trait Tag(S):
                 def tag(R, s: S, label: R) => Int
-            impl Tag(Circle):
+            instance Tag(Circle):
                 def tag(s, label):
                     s.extract()
-            impl forall (T) Tag(One(T)) requires Tag(T):
+            instance forall (T) Tag(One(T)) requires Tag(T):
                 def tag(s, label):
                     summon(Tag(_))::tag(s.extract(), {label}) + 1
             summon(Tag(_))::tag(One::new(One::new(Circle::new(5))), 1)
@@ -1427,10 +1427,10 @@ fn a_shrinking_chain_of_any_depth() {
             type One(T) = T
             trait Area(S):
                 def area(s: S) => Int
-            impl Area(Circle):
+            instance Area(Circle):
                 def area(s):
                     s.extract()
-            impl forall (T) Area(One(T)) requires Area(T):
+            instance forall (T) Area(One(T)) requires Area(T):
                 def area(s):
                     summon(Area(_))::area(s.extract()) + 1
             summon(Area(_))::area(One::new(One::new(One::new(One::new(Circle::new(1))))))
@@ -1448,7 +1448,7 @@ fn a_refined_associated_type_is_an_internal_gap() {
             trait Container(C):
                 Elem
                 def first(c: C) => Elem
-            impl Container(Bag):
+            instance Container(Bag):
                 Elem = {Int where _ >= 0}
                 def first(c):
                     3
@@ -1462,16 +1462,16 @@ fn a_refined_associated_type_is_an_internal_gap() {
 /// functions the instances define, and `==` and the orderings compare by value.
 const MONEY: &str = indoc! {"
     type Money = Int
-    impl Addable(Money, Money):
+    instance Addable(Money, Money):
         Output = Money
         def add(x, other):
             Money::new(x.extract() + other.extract())
-    impl Negatable(Money):
+    instance Negatable(Money):
         Output = Money
         def neg(x):
             Money::new(0 - x.extract())
-    impl Equatable(Money, Money)
-    impl Orderable(Money, Money)
+    instance Equatable(Money, Money)
+    instance Orderable(Money, Money)
 "};
 
 fn with_money(code: &str) -> String {
@@ -1505,7 +1505,7 @@ fn with_money(code: &str) -> String {
 #[case::a_conditional_instance(
     indoc! {"
         type Two(T) = {T, T}
-        impl forall (T) Addable(Two(T), Two(T)) requires r: Addable(T, T), r::Output <: T:
+        instance forall (T) Addable(Two(T), Two(T)) requires r: Addable(T, T), r::Output <: T:
             Output = Two(T)
             def add(x, other):
                 Two::new((x.extract().0 + other.extract().0, x.extract().1 + other.extract().1))
@@ -1526,11 +1526,11 @@ fn an_arithmetic_instance_over_two_types() {
     check_scalar(
         indoc! {"
             type M = Int
-            impl Addable(M, Int):
+            instance Addable(M, Int):
                 Output = M
                 def add(x, other):
                     M::new(x.extract() + other)
-            impl Exponentiable(M, Int):
+            instance Exponentiable(M, Int):
                 Output = M
                 def pow(x, other):
                     M::new(x.extract() ** other)
@@ -1547,7 +1547,7 @@ fn an_arithmetic_instance_over_two_types() {
 #[timeout(Duration::from_secs(10))]
 #[case::only_option(
     indoc! {"
-        impl Addable(Option(Int), Option(Int)):
+        instance Addable(Option(Int), Option(Int)):
             Output = Option(Int)
             def add(x, other):
                 x
@@ -1558,7 +1558,7 @@ fn an_arithmetic_instance_over_two_types() {
 #[case::a_whole_operand_variable(
     indoc! {"
         type Money = Int
-        impl forall (F) Multipliable(Money, F) requires r: Multipliable(Int, F), r::Output <: Int:
+        instance forall (F) Multipliable(Money, F) requires r: Multipliable(Int, F), r::Output <: Int:
             Output = Money
             def mul(x, k):
                 Money::new(x.extract() * k)
@@ -1569,7 +1569,7 @@ fn an_arithmetic_instance_over_two_types() {
 #[case::an_exponent_not_int(
     indoc! {"
         type M = Int
-        impl Exponentiable(M, M):
+        instance Exponentiable(M, M):
             Output = M
             def pow(x, e):
                 x
@@ -1676,8 +1676,8 @@ fn a_nominal_type_compares_by_value(#[case] code: &str, #[case] expected: bool) 
 #[case::a_written_record(
     indoc! {"
         type P = {age: Int, name: String}
-        impl Equatable(P, P)
-        impl Orderable(P, P)
+        instance Equatable(P, P)
+        instance Orderable(P, P)
         a = P::new((age=3, name=\"b\"))
         b = P::new((age=3, name=\"c\"))
         a < b and a != b and max([a, b]) == b
@@ -1686,8 +1686,8 @@ fn a_nominal_type_compares_by_value(#[case] code: &str, #[case] expected: bool) 
 #[case::a_nested_written_record(
     indoc! {"
         type P = {b: {y: Int, x: Int}, a: Int}
-        impl Equatable(P, P)
-        impl Orderable(P, P)
+        instance Equatable(P, P)
+        instance Orderable(P, P)
         p = P::new((b=(y=1, x=9), a=0))
         q = P::new((b=(y=1, x=2), a=5))
         max([p, q]).extract().b.x == 9
@@ -1697,19 +1697,19 @@ fn a_nominal_type_compares_by_value(#[case] code: &str, #[case] expected: bool) 
     indoc! {"
         type V:
             new(major: Int, minor: Int)
-        impl Equatable(V, V)
-        impl Orderable(V, V)
+        instance Equatable(V, V)
+        instance Orderable(V, V)
         V::new(1, 9) < V::new(2, 0) and V::new(1, 2) == V::new(1, 2)
     "}
 )]
 #[case::a_conditional_instance(
     indoc! {"
         type Money = Int
-        impl Equatable(Money, Money)
-        impl Orderable(Money, Money)
+        instance Equatable(Money, Money)
+        instance Orderable(Money, Money)
         type Two(T) = {T, T}
-        impl forall (T) Equatable(Two(T), Two(T)) requires Equatable(T, T)
-        impl forall (T) Orderable(Two(T), Two(T)) requires Orderable(T, T), Equatable(T, T)
+        instance forall (T) Equatable(Two(T), Two(T)) requires Equatable(T, T)
+        instance forall (T) Orderable(Two(T), Two(T)) requires Orderable(T, T), Equatable(T, T)
         a = Two::new((Money::new(1), Money::new(9)))
         b = Two::new((Money::new(2), Money::new(0)))
         a < b and a != b and max([a, b]) == b
@@ -1719,15 +1719,15 @@ fn a_nominal_type_compares_by_value(#[case] code: &str, #[case] expected: bool) 
 #[case::option_inside_a_type(
     indoc! {"
         type W = Option(Int)
-        impl Equatable(W, W)
+        instance Equatable(W, W)
         W::new(Option::some(1)) == W::new(Option::some(1))
     "}
 )]
 #[case::min_of_a_written_record_with_a_string(
     indoc! {"
         type Person = {age: Int, name: String}
-        impl Equatable(Person, Person)
-        impl Orderable(Person, Person)
+        instance Equatable(Person, Person)
+        instance Orderable(Person, Person)
         min([Person::new((age=3, name=\"b\")), Person::new((age=3, name=\"a\"))]).extract().name == \"a\"
     "}
 )]
@@ -1766,6 +1766,44 @@ fn a_record_does_not_order() {
     check_compile_error("(a=1, b=2) < (a=3, b=4)", "No Orderable instance");
 }
 
+/// `instance` declares an instance of a trait and `impl` a type's own block, so each is refused
+/// on the other's head, and an instance, belonging to the whole program, takes no `pub`.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::impl_naming_a_trait(
+    indoc! {"
+        trait Area(S):
+            def area(s: S) => Int
+        type Circle = Int
+        impl Area(Circle):
+            def area(s):
+                1
+        1
+    "},
+    "`impl Area` names a trait; an instance of a trait is written `instance Area(…)`"
+)]
+#[case::instance_naming_a_type(
+    indoc! {"
+        type Circle = Int
+        instance Circle:
+            def area(s):
+                1
+        1
+    "},
+    "`instance Circle` names no trait"
+)]
+#[case::a_public_instance(
+    indoc! {"
+        type Money = Int
+        pub instance Equatable(Money, Money)
+        1
+    "},
+    "`pub` is refused on an `instance`"
+)]
+fn a_block_s_keyword_matches_its_head(#[case] code: &str, #[case] needle: &str) {
+    check_compile_error(code, needle);
+}
+
 /// What an instance of `Equatable` or `Orderable` refuses, and a comparison no instance
 /// answers.
 #[rstest]
@@ -1773,7 +1811,7 @@ fn a_record_does_not_order() {
 #[case::two_different_types(
     indoc! {"
         type M = Int
-        impl Equatable(M, Int)
+        instance Equatable(M, Int)
         1
     "},
     "relates two different types"
@@ -1781,7 +1819,7 @@ fn a_record_does_not_order() {
 #[case::a_function_argument(
     indoc! {"
         type F = Int => Int
-        impl Equatable(F, F)
+        instance Equatable(F, F)
         1
     "},
     "`F::new`'s argument is `Int => Int`, which is not `Equatable`"
@@ -1791,7 +1829,7 @@ fn a_record_does_not_order() {
         type S:
             a(Int)
             b(Int)
-        impl Orderable(S, S)
+        instance Orderable(S, S)
         1
     "},
     "`S` has 2 constructors, which have no order"
@@ -1800,7 +1838,7 @@ fn a_record_does_not_order() {
     indoc! {"
         R = {a: Int, b: Int}
         type P = R
-        impl Orderable(P, P)
+        instance Orderable(P, P)
         1
     "},
     "holds a record its declaration does not write"
@@ -1808,11 +1846,11 @@ fn a_record_does_not_order() {
 #[case::a_record_through_a_type_argument(
     indoc! {"
         type Two(T) = {T, T}
-        impl forall (T) Equatable(Two(T), Two(T)) requires Equatable(T, T)
-        impl forall (T) Orderable(Two(T), Two(T)) requires Orderable(T, T), Equatable(T, T)
+        instance forall (T) Equatable(Two(T), Two(T)) requires Equatable(T, T)
+        instance forall (T) Orderable(Two(T), Two(T)) requires Orderable(T, T), Equatable(T, T)
         type P = Two({b: Int, a: Int})
-        impl Equatable(P, P)
-        impl Orderable(P, P)
+        instance Equatable(P, P)
+        instance Orderable(P, P)
         1
     "},
     "which is not `Orderable`"
@@ -1820,7 +1858,7 @@ fn a_record_does_not_order() {
 #[case::an_argument_without_the_requirement(
     indoc! {"
         type Two(T) = {T, T}
-        impl forall (T) Orderable(Two(T), Two(T))
+        instance forall (T) Orderable(Two(T), Two(T))
         1
     "},
     "`Two::new`'s argument is `{T, T}`, which is not `Orderable`"
@@ -1828,7 +1866,7 @@ fn a_record_does_not_order() {
 #[case::a_function_in_the_block(
     indoc! {"
         type M = Int
-        impl Equatable(M, M):
+        instance Equatable(M, M):
             def eq(m, other):
                 True
         1
@@ -1844,7 +1882,7 @@ fn a_record_does_not_order() {
 )]
 #[case::option_s_own(
     indoc! {"
-        impl forall (T) Equatable(Option(T), Option(T)) requires Equatable(T, T)
+        instance forall (T) Equatable(Option(T), Option(T)) requires Equatable(T, T)
         1
     "},
     "names no type this module declares"
@@ -1869,17 +1907,17 @@ fn orderable_requires_equatable() {
     check_compile_error(
         indoc! {"
             type M = Int
-            impl Orderable(M, M)
+            instance Orderable(M, M)
             1
         "},
-        "`impl Orderable(M, M)` needs `Equatable(M, M)`, which `Orderable` requires of every \
+        "`instance Orderable(M, M)` needs `Equatable(M, M)`, which `Orderable` requires of every \
          instance",
     );
     let same_and_least = |requires: &str| {
         formatdoc! {"
             type M = Int
-            impl Equatable(M, M)
-            impl Orderable(M, M)
+            instance Equatable(M, M)
+            instance Orderable(M, M)
             def same_and_least(T, a: T, b: T) => Bool requires {requires}:
                 a == b and a <= b
             same_and_least(M::new(2), M::new(2))
@@ -1898,7 +1936,7 @@ fn orderable_requires_equatable() {
 /// A nominal type a module makes `Iterable`, whose `Elements` is the list it wraps.
 const BAG: &str = indoc! {"
     type Bag = List(Int)
-    impl Iterable(Bag):
+    instance Iterable(Bag):
         Elements = List(Int)
         def elements(b):
             b.extract()
@@ -1965,7 +2003,7 @@ const BAG: &str = indoc! {"
 #[case::a_mutation_loop_over_a_type_whose_elements_is_a_plain_collection(
     indoc! {"
         type Row(D) = D |=> Int
-        impl forall (D) Iterable(Row(D)):
+        instance forall (D) Iterable(Row(D)):
             Elements = D |=> Int
             def elements(r):
                 r.extract()
@@ -1979,7 +2017,7 @@ const BAG: &str = indoc! {"
 #[case::a_mutation_loop_over_the_type_around_another(
     indoc! {"
         type Row(D) = D |=> Int
-        impl forall (D) Iterable(Row(D)):
+        instance forall (D) Iterable(Row(D)):
             Elements = D |=> Int
             def elements(r):
                 r.extract()
@@ -2023,7 +2061,7 @@ fn an_associated_data_function_type_admits_no_sum(#[case] elements: &str) {
     check_compile_error(
         &formatdoc! {"
             type Bag = Int
-            impl Iterable(Bag):
+            instance Iterable(Bag):
                 Elements = {elements}
                 def elements(b):
                     n = b.extract()
@@ -2044,18 +2082,18 @@ fn a_nominal_elements_is_refused_at_the_instance() {
     check_compile_error(
         indoc! {"
             type Bag = List(Int)
-            impl Iterable(Bag):
+            instance Iterable(Bag):
                 Elements = List(Int)
                 def elements(b):
                     b.extract()
             type Wrap = Bag
-            impl Iterable(Wrap):
+            instance Iterable(Wrap):
                 Elements = Bag
                 def elements(w):
                     w.extract()
             sum([x for x in Wrap::new(Bag::new(box([1, 2])))])
         "},
-        "`Elements = Bag` in `impl Iterable(Wrap)` is a nominal type",
+        "`Elements = Bag` in `instance Iterable(Wrap)` is a nominal type",
     );
 }
 
@@ -2129,7 +2167,7 @@ const MEASURED: &str = indoc! {"
         Size <: Int
         def size(t: T) => Size
     type Box2 = Int
-    impl Measured(Box2):
+    instance Measured(Box2):
         Size = Int
         def size(t):
             t.extract()
@@ -2166,7 +2204,7 @@ fn a_bounded_associated_type_is_its_bound_where_unnamed(#[case] code: &str, #[ca
 #[case::an_instance_of_another_form(
     indoc! {"
         type Bad = Int
-        impl Iterable(Bad):
+        instance Iterable(Bad):
             Elements = Int
             def elements(b):
                 b.extract()
@@ -2180,7 +2218,7 @@ fn a_bounded_associated_type_is_its_bound_where_unnamed(#[case] code: &str, #[ca
             Size <: Int
             def size(t: T) => Size
         type Box2 = Int
-        impl Measured(Box2):
+        instance Measured(Box2):
             Size = String
             def size(t):
                 \"a\"
@@ -2195,7 +2233,7 @@ fn a_bounded_associated_type_is_its_bound_where_unnamed(#[case] code: &str, #[ca
             Size <: {Int where _ > 0}
             def size(t: T) => Size
         type Box2 = Int
-        impl Measured(Box2):
+        instance Measured(Box2):
             Size = Int
             def size(t):
                 t.extract()
@@ -2225,13 +2263,13 @@ fn a_bounded_associated_type_is_its_bound_where_unnamed(#[case] code: &str, #[ca
             Out <: T
             def conv(t: T) => Out
         type W = Int
-        impl Conv(W):
+        instance Conv(W):
             Out = String
             def conv(w):
                 \"x\"
         1
     "},
-    "`Out` is declared `Out <: T` in `trait Conv`, which is `Out <: W` in `impl Conv(W)`, and \
+    "`Out` is declared `Out <: T` in `trait Conv`, which is `Out <: W` in `instance Conv(W)`, and \
      `String` is not below `W`"
 )]
 #[case::a_bound_naming_a_sibling(
@@ -2241,14 +2279,14 @@ fn a_bounded_associated_type_is_its_bound_where_unnamed(#[case] code: &str, #[ca
             B <: A
             def b(t: T) => B
         type Box2 = Int
-        impl Two(Box2):
+        instance Two(Box2):
             A = Int
             B = String
             def b(t):
                 \"x\"
         summon(Two(_))::b(Box2::new(1))
     "},
-    "`B` is declared `B <: A` in `trait Two`, which is `B <: Int` in `impl Two(Box2)`, and \
+    "`B` is declared `B <: A` in `trait Two`, which is `B <: Int` in `instance Two(Box2)`, and \
      `String` is not below `Int`"
 )]
 // A data function's domain is invariant.
@@ -2258,7 +2296,7 @@ fn a_bounded_associated_type_is_its_bound_where_unnamed(#[case] code: &str, #[ca
             Rows <: {Int where _ > 0} |=> Int
             def rows(t: T) => Rows
         type Box2 = Int
-        impl Keyed(Box2):
+        instance Keyed(Box2):
             Rows = Int |=> Int
             def rows(t):
                 [t.extract()]
@@ -2289,7 +2327,7 @@ fn a_compute_choice_may_accept_more_than_its_bound() {
                 F <: {Int where _ > 0} => Int
                 def f(t: T) => F
             type Box2 = Int
-            impl Applied(Box2):
+            instance Applied(Box2):
                 F = Int => Int
                 def f(t):
                     \\x -> x + t.extract()
@@ -2311,7 +2349,7 @@ fn an_unnamed_requirement_reads_a_sibling_its_bound_names() {
                 B <: A
                 def b(t: T) => B
             type Box2 = Int
-            impl Two(Box2):
+            instance Two(Box2):
                 A = Int
                 B = Int
                 def b(t):

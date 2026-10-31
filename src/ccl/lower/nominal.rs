@@ -116,8 +116,29 @@ pub(super) fn associated_defs<'a>(
     }
     Ok(match &stmt.node {
         ChlStmt::FunctionDef { owner: Some(_), .. } => vec![view(stmt, None, Vec::new())],
-        // An instance of a trait is `traits::declare_instances`'s.
-        ChlStmt::Impl(block) if ctx.is_instance_block(block) => Vec::new(),
+        // A type's own block names a type, and an instance of a trait is written `instance`.
+        ChlStmt::Impl(block) if ctx.names_a_trait(block) => {
+            let written = block_head(block);
+            return Err(LoweringError::unsupported(
+                block.ty.span,
+                format!(
+                    "`impl {written}` names a trait; an instance of a trait is written \
+                     `instance {written}(…)`, and `impl` opens a type's own block"
+                ),
+            ));
+        }
+        // Declaring a function of another module's type is the extension that is **[Open]**
+        // (`docs/chl-spec.md`, "Associated functions and methods").
+        ChlStmt::Impl(block) if !block.qualifier.is_empty() => {
+            return Err(LoweringError::unsupported(
+                block.ty.span,
+                format!(
+                    "`impl {}` names a type through a module; a type's own block names a type \
+                     its module declares",
+                    block_head(block)
+                ),
+            ));
+        }
         ChlStmt::Impl(block) if block.defs.is_empty() => {
             return Err(LoweringError::unsupported(
                 block.ty.span,
@@ -917,7 +938,7 @@ pub(super) fn associated_reach(
                 errors.push(LoweringError::unsupported(
                     block.span,
                     format!(
-                        "the function `{function}` of `impl {head}` reads {}{through}; an \
+                        "the function `{function}` of `instance {head}` reads {}{through}; an \
                          instance's function reaches no state, no source, and no value an \
                          import or a run gives its module other than a `const` parameter's, \
                          since every copy of the module shares the instance",
@@ -1646,6 +1667,11 @@ pub(super) fn names_a_type_member(q: &QualifiedName) -> bool {
     )
 }
 
+/// The name an `impl` block's head writes, through its modules: `shapes::Circle`.
+fn block_head(block: &ImplBlock) -> crate::ccl::names::QualifiedName {
+    crate::ccl::names::QualifiedName::of_segments(&block.qualifier).child(block.ty.node.clone())
+}
+
 /// The type parameters an inherent `impl N(P…):` head binds: its arguments, each a name.
 /// An associated type or a `requires` clause belongs to an instance of a trait.
 pub(super) fn inherent_params(block: &ImplBlock) -> Result<Vec<Spanned<SmolStr>>, LoweringError> {
@@ -1655,7 +1681,7 @@ pub(super) fn inherent_params(block: &ImplBlock) -> Result<Vec<Spanned<SmolStr>>
             v.span,
             format!(
                 "`impl {ty}(…)` declares functions of the type `{ty}`, whose head names its \
-                 parameters; `forall` declares the type variables of an instance of a trait"
+                 parameters; `forall` declares the type variables of an `instance` of a trait"
             ),
         ));
     }

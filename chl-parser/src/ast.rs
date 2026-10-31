@@ -296,9 +296,11 @@ pub enum Stmt {
     TypeDecl(TypeDecl),
 
     /// `impl N(P…):` over `def`s, each an associated function of `N`
-    /// (`docs/chl-spec.md`, "Associated functions and methods"), or `impl T(A…):`, an
-    /// instance of the trait `T` (`docs/chl-spec.md`, "Declaring an instance").
+    /// (`docs/chl-spec.md`, "Associated functions and methods").
     Impl(ImplBlock),
+    /// `instance Area(Circle):` — an instance of a trait (`docs/chl-spec.md`, "Declaring an
+    /// instance").
+    Instance(ImplBlock),
 
     /// `trait T(P…):` over associated types and function signatures
     /// (`docs/chl-spec.md`, "Declaring a trait").
@@ -555,16 +557,15 @@ pub struct TypeDecl {
     pub body: TypeDeclBody,
 }
 
-/// An `impl` block ([`Stmt::Impl`]): a nominal type's associated functions, or an instance
-/// of a trait. The parser does not tell the two apart; lowering does, by what the head's name
-/// names.
+/// A block over a head: a nominal type's associated functions under `impl` ([`Stmt::Impl`]),
+/// or an instance of a trait under `instance` ([`Stmt::Instance`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImplBlock {
-    /// An instance's type variables, `T` in `impl forall (T) Area(Two(T)):`; empty for a
+    /// An instance's type variables, `T` in `instance forall (T) Area(Two(T)):`; empty for a
     /// type's own block, whose head names its parameters.
     pub vars: Vec<Spanned<SmolStr>>,
     /// The modules an instance's trait is reached through, `shapes` in
-    /// `impl shapes::Area(Circle):`; empty for a trait in scope by its name, and for a type's
+    /// `instance shapes::Area(Circle):`; empty for a trait in scope by its name, and for a type's
     /// own block.
     pub qualifier: Vec<Spanned<SmolStr>>,
     /// The type whose associated functions the block declares, or the trait the block is an
@@ -572,7 +573,7 @@ pub struct ImplBlock {
     pub ty: Spanned<SmolStr>,
     /// The head's arguments: the type's parameters, `T` in `impl Option(T):`, bound once for
     /// every `def` in the block; or the types an instance is for, `Bag(T)` in
-    /// `impl Container(Bag(T)):`.
+    /// `instance Container(Bag(T)):`.
     pub args: Vec<Spanned<Expr>>,
     /// The associated types an instance's block defines, `Elem = T`.
     pub assoc: Vec<AssocArg>,

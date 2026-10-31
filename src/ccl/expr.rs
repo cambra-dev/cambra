@@ -626,7 +626,7 @@ pub enum TypedExprNode {
         body: Box<TypedExpr>,
     },
 
-    /// The functions an `impl` block declares, which reach each other in any order
+    /// The functions an `impl` or `instance` block declares, which reach each other in any order
     /// (`docs/chl-spec.md`, "Associated functions and methods").
     ///
     /// Every binding's name is in scope in every binding's body and in `body`, as in a
@@ -1471,7 +1471,7 @@ impl TypedExpr {
         })
     }
 
-    /// Construct a [`TypedExprNode::DefGroup`] of an `impl` block's functions.
+    /// Construct a [`TypedExprNode::DefGroup`] of an `impl` or `instance` block's functions.
     pub fn def_group(bindings: Vec<(TypedBinding, Self)>, body: Self) -> Self {
         Self::new(TypedExprNode::DefGroup {
             bindings,

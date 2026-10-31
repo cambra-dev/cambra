@@ -525,7 +525,7 @@ pub struct LoweringContext {
     /// once they are ([`stmts::check_pending_requirements`]).
     pub(super) pending_requirements: Vec<PendingRequirement>,
 
-    /// What each instance's `impl` block needs to lower its `def`s where it stands.
+    /// What each `instance` block needs to lower its `def`s where it stands.
     pub(super) instance_blocks: Vec<traits::InstanceBlock>,
 
     /// The requirements the `requires` clauses around the expression being lowered name,
@@ -1926,7 +1926,7 @@ fn use_name_members(
 /// since the import would reach the run's state (`docs/chl-spec.md`, "9.7
 /// Importing asserts no IO and no state"), an expression statement, and,
 /// not supported yet, anything but a value binding, a `def`, a type alias, an
-/// `import`, `pass`, a nominal type, or an `impl` block.
+/// `import`, `pass`, a nominal type, or an `impl` or `instance` block.
 pub(super) fn library_statement_refusals(stmts: &[Spanned<ChlStmt>]) -> Vec<LoweringError> {
     stmts
         .iter()
@@ -1942,6 +1942,7 @@ pub(super) fn library_statement_refusals(stmts: &[Spanned<ChlStmt>]) -> Vec<Lowe
                 | ChlStmt::TypeDecl(_)
                 | ChlStmt::TraitDecl(_)
                 | ChlStmt::Impl(_)
+                | ChlStmt::Instance(_)
                 | ChlStmt::Import { .. }
                 | ChlStmt::Param { .. }
                 | ChlStmt::Pass

@@ -63,7 +63,7 @@ impl Price:
 trait Sized(S):
     def size(s: S) => Int
 
-impl Sized(Price):
+instance Sized(Price):
     def size(s):
         s.extract()
 

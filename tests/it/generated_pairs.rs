@@ -356,11 +356,11 @@ fn skeletons() -> Vec<Skeleton> {
         "#}},
         Skeleton { name: "nominal_operator_operand", hole: Ty::Int, scope: &[], body: indoc! {r#"
             type Money = Int
-            impl Addable(Money, Money):
+            instance Addable(Money, Money):
                 Output = Money
                 def add(x, other):
                     Money::new(x.extract() + other.extract())
-            impl Subtractable(Money, Money):
+            instance Subtractable(Money, Money):
                 Output = Money
                 def sub(x, other):
                     Money::new(x.extract() - other.extract())
@@ -370,7 +370,7 @@ fn skeletons() -> Vec<Skeleton> {
         "#}},
         Skeleton { name: "nominal_operator_accumulator", hole: Ty::Int, scope: &[("x", Ty::Int)], body: indoc! {r#"
             type Money = Int
-            impl Addable(Money, Money):
+            instance Addable(Money, Money):
                 Output = Money
                 def add(x, other):
                     Money::new(x.extract() + other.extract())
@@ -383,16 +383,16 @@ fn skeletons() -> Vec<Skeleton> {
         "#}},
         Skeleton { name: "nominal_key_guard", hole: Ty::Int, scope: &[("x", Ty::Int)], body: indoc! {r#"
             type Money = Int
-            impl Equatable(Money, Money)
-            impl Orderable(Money, Money)
+            instance Equatable(Money, Money)
+            instance Orderable(Money, Money)
 
             out = test_sink()
             out << sum([x for x in [1, 2, 3] if Money::new(x) < Money::new({})])
         "#}},
         Skeleton { name: "nominal_key_groupby", hole: Ty::Int, scope: &[("x", Ty::Int)], body: indoc! {r#"
             type Money = Int
-            impl Equatable(Money, Money)
-            impl Orderable(Money, Money)
+            instance Equatable(Money, Money)
+            instance Orderable(Money, Money)
 
             g = groupby([1, 2, 3, 4], \x -> Money::new(x + {}))
             out = test_sink()
@@ -400,8 +400,8 @@ fn skeletons() -> Vec<Skeleton> {
         "#}},
         Skeleton { name: "nominal_key_join", hole: Ty::Int, scope: &[("x", Ty::Int)], body: indoc! {r#"
             type Money = Int
-            impl Equatable(Money, Money)
-            impl Orderable(Money, Money)
+            instance Equatable(Money, Money)
+            instance Orderable(Money, Money)
 
             xs = [Money::new(x + {}) for x in [1, 2, 3]]
             ys = [Money::new(y) for y in [2, 3, 4]]
@@ -410,8 +410,8 @@ fn skeletons() -> Vec<Skeleton> {
         "#}},
         Skeleton { name: "nominal_extreme", hole: Ty::Int, scope: &[("x", Ty::Int)], body: indoc! {r#"
             type Money = Int
-            impl Equatable(Money, Money)
-            impl Orderable(Money, Money)
+            instance Equatable(Money, Money)
+            instance Orderable(Money, Money)
 
             out = test_sink()
             out << max([Money::new(x + {}) for x in [1, 2]]).extract()
@@ -420,7 +420,7 @@ fn skeletons() -> Vec<Skeleton> {
             type Box = Int
             trait Area(S):
                 def area(s: S) => Int
-            impl Area(Box):
+            instance Area(Box):
                 def area(s):
                     s.extract() * 2
 
@@ -431,7 +431,7 @@ fn skeletons() -> Vec<Skeleton> {
             type Box = Int
             trait Area(S):
                 def area(s: S, k: Int) => Int
-            impl Area(Box):
+            instance Area(Box):
                 def area(s, n):
                     {}
 
@@ -443,10 +443,10 @@ fn skeletons() -> Vec<Skeleton> {
             type One(T) = T
             trait Area(S):
                 def area(s: S) => Int
-            impl Area(Box):
+            instance Area(Box):
                 def area(s):
                     s.extract()
-            impl forall (T) Area(One(T)) requires Area(T):
+            instance forall (T) Area(One(T)) requires Area(T):
                 def area(s):
                     summon(Area(_))::area(s.extract()) + 1
 
@@ -458,10 +458,10 @@ fn skeletons() -> Vec<Skeleton> {
             type Pair = {Int, Int}
             trait Area(S):
                 def area(s: S) => Int
-            impl Area(Box):
+            instance Area(Box):
                 def area(s):
                     s.extract() * 2
-            impl Area(Pair):
+            instance Area(Pair):
                 def area(s):
                     s.extract().0 * s.extract().1
             f = summon(Area(_))::area
@@ -474,10 +474,10 @@ fn skeletons() -> Vec<Skeleton> {
             type Two(T) = {T, T}
             trait Area(S):
                 def area(s: S) => Int
-            impl Area(Box):
+            instance Area(Box):
                 def area(s):
                     s.extract()
-            impl forall (T) Area(Two(T)) requires Area(T):
+            instance forall (T) Area(Two(T)) requires Area(T):
                 def area(s):
                     summon(Area(_))::area(s.extract().0) + summon(Area(_))::area(s.extract().1)
             def total(s):

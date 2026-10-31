@@ -1912,11 +1912,11 @@ where
             impl_def.map(|d| ImplItem::Def(Box::new(d))),
             impl_assoc.map(ImplItem::Assoc),
         ));
-        // The head is a type applied to its parameters, or a trait applied to the types an
-        // instance is for, spelled as a requirement is: lowering tells them apart by what
-        // the name names. A head with no block is an instance of a trait with no functions,
-        // `impl Equatable(Money, Money)`. An instance's type variables are declared before its
-        // head, `impl forall (T) Area(Two(T))`; each is a capitalized name.
+        // `impl` heads a type applied to its parameters, and `instance` a trait applied to the
+        // types an instance is for, spelled as a requirement is. A head with no block is an
+        // instance of a trait with no functions, `instance Equatable(Money, Money)`. An
+        // instance's type variables are declared before its head,
+        // `instance forall (T) Area(Two(T))`; each is a capitalized name.
         let instance_vars = just(Token::Forall).ignore_then(
             binder
                 .validate(|name, _, emitter| {
@@ -1951,11 +1951,13 @@ where
             .then_ignore(just(Token::Dedent))
             .or(just(Token::Newline).to(Vec::new()));
         let impl_stmt = just(Token::Impl)
-            .ignore_then(instance_vars.or_not())
+            .to(false)
+            .or(just(Token::Instance).to(true))
+            .then(instance_vars.or_not())
             .then(trait_type(expr.clone()))
             .then(requires_clause(expr.clone()).or_not())
             .then(impl_body)
-            .map_with(|(((vars, head), requires), items), e| {
+            .map_with(|((((instance, vars), head), requires), items), e| {
                 let TraitType {
                     qualifier,
                     name,
@@ -1970,18 +1972,21 @@ where
                         ImplItem::Assoc(a) => assoc.push(a),
                     }
                 }
-                Spanned::new(
-                    e.span(),
-                    Stmt::Impl(ImplBlock {
-                        vars: vars.unwrap_or_default(),
-                        qualifier,
-                        ty: Spanned::new(name_span, name),
-                        args,
-                        assoc,
-                        requires: requires.unwrap_or_default(),
-                        defs,
-                    }),
-                )
+                let block = ImplBlock {
+                    vars: vars.unwrap_or_default(),
+                    qualifier,
+                    ty: Spanned::new(name_span, name),
+                    args,
+                    assoc,
+                    requires: requires.unwrap_or_default(),
+                    defs,
+                };
+                let stmt = if instance {
+                    Stmt::Instance(block)
+                } else {
+                    Stmt::Impl(block)
+                };
+                Spanned::new(e.span(), stmt)
             });
 
         // ---- trait T(P…): ( type A | def f(…) => R requires … )+ -------
@@ -2334,6 +2339,10 @@ fn pub_refusal(stmt: &Stmt) -> Option<&'static str> {
         }
         Stmt::Param { .. } => "`pub` is refused on a `param`",
         Stmt::Impl(_) => "`pub` stands on each `def` in an `impl` block, not on the block",
+        Stmt::Instance(_) => {
+            "`pub` is refused on an `instance`: an instance belongs to the whole program, and no \
+             import selects it"
+        }
         Stmt::Pub { .. } => "`pub` is written once",
         Stmt::AugAssign { .. } => {
             "`pub` is refused on a compound assignment, which writes a variable another statement introduced"
@@ -3096,7 +3105,7 @@ mod tests {
                 Elem
                 def first(c: C, otherwise: Elem) => Elem
                 def tag(R, c: C, label: R) => {R, Elem} requires Equatable(R, R)
-            impl forall (T) Container(Two(T)) requires c: Container(T):
+            instance forall (T) Container(Two(T)) requires c: Container(T):
                 Elem = T
                 def first(c, otherwise):
                     otherwise
@@ -3124,8 +3133,8 @@ mod tests {
         assert_eq!(first.node.params.len(), 2);
         assert_eq!(tag.node.type_params.len(), 1);
         assert_eq!(tag.node.requires.len(), 1);
-        let Stmt::Impl(block) = &m.body[1].node else {
-            panic!("expected an impl block, got {:?}", m.body[1].node)
+        let Stmt::Instance(block) = &m.body[1].node else {
+            panic!("expected an instance block, got {:?}", m.body[1].node)
         };
         assert_eq!(block.ty.node, "Container");
         assert_eq!(block.vars.len(), 1);
@@ -4862,12 +4871,12 @@ mod tests {
         let (_, _, requires) = def_signature(&m);
         assert_eq!(qualifier(requirement_trait(&requires[0].node)), ["shapes"]);
         let m = parse_m(indoc! {"
-            impl shapes::Area(Circle):
+            instance shapes::Area(Circle):
                 def area(c):
                     1
         "});
-        let Stmt::Impl(block) = &m.body[0].node else {
-            panic!("expected an impl, got {:?}", m.body[0].node)
+        let Stmt::Instance(block) = &m.body[0].node else {
+            panic!("expected an instance, got {:?}", m.body[0].node)
         };
         let path: Vec<&str> = block.qualifier.iter().map(|s| s.node.as_str()).collect();
         assert_eq!(

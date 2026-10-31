@@ -1999,9 +1999,9 @@ fn emit_let_definition<C: Typing>(
     Ok((scheme, defined))
 }
 
-/// Emit a [`DefGroup`](TypedExprNode::DefGroup), the functions of an `impl` block, and
-/// rewrite it into the `Let`s it means (`src/ccl/design/nominal-types.md`, "Associated
-/// functions"). Returns the node replacing the group and its type.
+/// Emit a [`DefGroup`](TypedExprNode::DefGroup), the functions of an `impl` or `instance`
+/// block, and rewrite it into the `Let`s it means (`src/ccl/design/nominal-types.md`,
+/// "Associated functions"). Returns the node replacing the group and its type.
 ///
 /// Each member is a `let`'s definition, emitted at the group's position and bound in the
 /// group's scope. The members are emitted in source order, except that a reference to one
@@ -2079,7 +2079,10 @@ fn emit_def_group(
         "infer.def_group",
         crate::ccl::provenance::Nature::Machinery,
     );
-    assert!(!order.is_empty(), "an `impl` block declares a function");
+    assert!(
+        !order.is_empty(),
+        "an `impl` or `instance` block declares a function"
+    );
     let mut acc = body;
     let mut acc_ty = body_ty;
     for (k, &at) in order.iter().enumerate().rev() {
