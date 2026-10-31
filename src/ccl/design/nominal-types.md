@@ -197,7 +197,8 @@ with a `Mut` parameter is refused.
 
 `associated_reach` refuses an associated function that reaches the module's state, a source, a value
 parameter without `const`, a member of a Module-typed parameter, or a member of a run the module
-declares, through the module's bindings and functions: the copies of the module whose arguments the
+declares other than its types' functions and constructors, through the module's bindings and
+functions: the copies of the module whose arguments the
 type does not tell apart share the type, so their copies of the function must be one function. A
 type parameter or a `const` parameter it reaches the same way joins the type's identity instead
 (`settle_implicit`).

@@ -2766,10 +2766,28 @@ fn use_instance_function(expr: &mut Expr, instance: &TraitInstance, ctx: &mut Co
         let instance = declared.head.clone();
         let inside =
             ctx.defining.contains(&binding) || ctx.specializing.iter().any(|s| s.name == binding);
+        // A definition of another module, specialized here, reaches the instances of the
+        // modules its own reaches, not those of a module that imports it
+        // (`docs/chl-spec.md`, "Traits and instances across modules [Decided]", **\[Open\]**).
+        let defined_in = ctx.specializing.last().and_then(|s| match s.name.home()? {
+            crate::ccl::Home::Import(shared) => Some(shared.module.segments().to_vec()),
+            crate::ccl::Home::Run(run) => Some(ctx.instances.run_module(run).to_vec()),
+        });
         let error = if inside {
             InferError::InstanceCallsItself {
                 function,
                 at: instance,
+            }
+        } else if let Some(defined_in) = defined_in.filter(|m| *m != declared.module) {
+            let module = |path: &[smol_str::SmolStr]| match path {
+                [] => "the root module".to_string(),
+                path => format!("module `{}`", path.join("::")),
+            };
+            InferError::InstanceOfAnotherModule {
+                function,
+                instance,
+                definition_module: module(&defined_in),
+                instance_module: module(&declared.module),
             }
         } else {
             InferError::InstanceAfterUse { function, instance }

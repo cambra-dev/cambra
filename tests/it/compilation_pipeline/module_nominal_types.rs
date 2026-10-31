@@ -585,6 +585,68 @@ fn an_associated_function_reaches_nothing_an_import_or_a_run_gives_its_module(
     );
 }
 
+/// A run's module with a public type, so a module runs it and names the type through it.
+const COUNTED: &str = indoc! {"
+    visits := 0
+    pub type Tally = Int
+"};
+
+/// A function of a run's type reads nothing the run gives: every run shares the type, whose
+/// own module keeps its functions from reaching anything. A method call on the module's own
+/// type, where a run's type also has the method, and a run's type's constructor and method
+/// are each accepted.
+#[rstest]
+#[case::a_method_of_its_own_type("self.extract()")]
+#[case::a_run_s_type_s_functions("i::Tally::new(self.extract()).extract()")]
+#[timeout(Duration::from_secs(10))]
+fn an_associated_function_calls_a_run_s_type(#[case] body: &str) {
+    let shop = formatdoc! {"
+        run counted as i
+        pub type Price = Int
+        pub def Price::get(self) => Int:
+            {body}
+    "};
+    check_program_scalar(
+        &program(
+            "run shop as s\ns::Price::new(5).get()\n",
+            &[("shop", &shop), ("counted", COUNTED)],
+        ),
+        Value::Int(5),
+    );
+}
+
+/// A run's type whose identity takes the module's `const` parameter makes a type whose
+/// function calls it take that parameter too, so the module's two runs hold two types.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_run_s_type_joins_the_identity_of_a_type_calling_it() {
+    let lib = indoc! {"
+        const param n: Int
+        tick := 0
+        pub type C = Int
+        impl C:
+            pub def get(self) => Int:
+                n
+    "};
+    let shop = indoc! {"
+        const param n: Int
+        run lib(n=n) as l
+        pub type Price = Int
+        impl Price:
+            pub def get(self) => Int:
+                l::C::new(1).get()
+    "};
+    let root = indoc! {"
+        run shop(n=1) as a
+        run shop(n=2) as b
+        a::Price::new(0).get() * 10 + b::Price::new(0).get()
+    "};
+    check_program_scalar(
+        &program(root, &[("shop", shop), ("lib", lib)]),
+        Value::Int(12),
+    );
+}
+
 /// A source and a Module-typed parameter's member are refused too.
 #[rstest]
 #[case::source(

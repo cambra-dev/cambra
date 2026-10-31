@@ -1357,7 +1357,7 @@ fn lower_expr_inner(
             Ok(ctx.reference(Name::raw(name), expr.span))
         }
         ChlExpr::Qualified(q) if nominal::names_a_type_member(q) => {
-            if let Some(trait_) = ctx.trait_named(&q.qualifier[0].node) {
+            if let Some(trait_) = ctx.trait_of_member(q)? {
                 Err(traits::refuse_trait_member(&trait_, q, expr.span))
             } else {
                 nominal::lower_member(q, expr.span, ctx)
@@ -1748,6 +1748,10 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, lowered: Lowered)
         &modules::top_level_nominal_types(&module.body),
         ctx,
     ));
+    errors.extend(use_name_members(
+        &modules::top_level_traits(&module.body),
+        ctx,
+    ));
     ctx.run_use_reads.clear();
     let value = if errors.is_empty() {
         // `pub` decides what an importer reaches, which the interface records,
@@ -1774,6 +1778,7 @@ fn lower_module(module: &ChlModule, ctx: &mut LoweringContext, lowered: Lowered)
     };
     if let Some(chain) = &value {
         errors.extend(ctx.uses_above_their_runs(chain));
+        errors.extend(traits::private_names_in_public_traits(&module.body, ctx));
     }
     // A block lowers its statements last to first, so they report in that order.
     // The reader reads first to last.
@@ -1935,6 +1940,7 @@ pub(super) fn library_statement_refusals(stmts: &[Spanned<ChlStmt>]) -> Vec<Lowe
                 | ChlStmt::AnnAssign { .. }
                 | ChlStmt::FunctionDef { .. }
                 | ChlStmt::TypeDecl(_)
+                | ChlStmt::TraitDecl(_)
                 | ChlStmt::Impl(_)
                 | ChlStmt::Import { .. }
                 | ChlStmt::Param { .. }
@@ -1956,7 +1962,8 @@ pub(super) fn library_statement_refusals(stmts: &[Spanned<ChlStmt>]) -> Vec<Lowe
                 ),
                 _ => {
                     "this statement at an imported module's top level is not supported yet: an \
-                     imported module holds value bindings, `def`s, type aliases and nominal types"
+                     imported module holds value bindings, `def`s, type aliases, nominal types, \
+                     traits and instances"
                 }
             };
             Some(LoweringError::unsupported(stmt.span, message))

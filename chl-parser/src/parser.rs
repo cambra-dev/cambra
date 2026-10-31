@@ -1957,6 +1957,7 @@ where
             .then(impl_body)
             .map_with(|(((vars, head), requires), items), e| {
                 let TraitType {
+                    qualifier,
                     name,
                     name_span,
                     args,
@@ -1973,6 +1974,7 @@ where
                     e.span(),
                     Stmt::Impl(ImplBlock {
                         vars: vars.unwrap_or_default(),
+                        qualifier,
                         ty: Spanned::new(name_span, name),
                         args,
                         assoc,
@@ -2515,14 +2517,19 @@ where
         .allow_trailing()
         .collect::<Vec<_>>()
         .delimited_by(just(Token::LParen), just(Token::RParen));
-    select! { Token::Ident(s) => s }
-        .map_with(|s, e| (s, e.span()))
+    let segment = select! { Token::Ident(s) => s }.map_with(|s, e| Spanned::new(e.span(), s));
+    segment
+        .then_ignore(just(Token::ColonColon))
+        .repeated()
+        .collect::<Vec<_>>()
+        .then(select! { Token::Ident(s) => s }.map_with(|s, e| (s, e.span())))
         .labelled("requirement")
         .then(args.or_not())
-        .map_with(|((name, name_span), args), e| {
+        .map_with(|((qualifier, (name, name_span)), args), e| {
             Spanned::new(
                 e.span(),
                 TraitType {
+                    qualifier,
                     name,
                     name_span,
                     args: args.unwrap_or_default(),
@@ -4828,6 +4835,44 @@ mod tests {
             matches!(&bare.node, Expr::Call { func, .. } if matches!(&func.node, Expr::Name(n) if n == "summon")),
             "{:?}",
             bare.node
+        );
+    }
+
+    /// A trait of another module is named through the modules that reach it, in a summon,
+    /// a requirement and an instance's head (`docs/chl-spec.md`, "Traits and instances
+    /// across modules \[Decided\]").
+    #[test]
+    fn a_trait_is_named_through_its_module() {
+        let qualifier = |t: &TraitType| -> Vec<String> {
+            t.qualifier.iter().map(|s| s.node.to_string()).collect()
+        };
+        let e = parse_e("summon(lib::shapes::Area(_))::area(c)");
+        let Expr::Call { func, .. } = &e.node else {
+            panic!("expected a call, got {:?}", e.node)
+        };
+        let Expr::Summon { trait_type, .. } = &func.node else {
+            panic!("expected a summon, got {:?}", func.node)
+        };
+        assert_eq!(qualifier(&trait_type.node), ["lib", "shapes"]);
+        assert_eq!(trait_type.node.name.as_str(), "Area");
+        let m = parse_m(indoc! {"
+            def total(S, s: S) => Int requires a: shapes::Area(S), a::Output <: Int:
+                a::area(s)
+        "});
+        let (_, _, requires) = def_signature(&m);
+        assert_eq!(qualifier(requirement_trait(&requires[0].node)), ["shapes"]);
+        let m = parse_m(indoc! {"
+            impl shapes::Area(Circle):
+                def area(c):
+                    1
+        "});
+        let Stmt::Impl(block) = &m.body[0].node else {
+            panic!("expected an impl, got {:?}", m.body[0].node)
+        };
+        let path: Vec<&str> = block.qualifier.iter().map(|s| s.node.as_str()).collect();
+        assert_eq!(
+            (path.as_slice(), block.ty.node.as_str()),
+            (["shapes"].as_slice(), "Area")
         );
     }
 

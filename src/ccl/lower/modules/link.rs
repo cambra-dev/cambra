@@ -1636,6 +1636,8 @@ impl<'a> ProgramLowering<'a> {
                 .map(|(parameter, _, ty)| (parameter.clone(), ty.clone()))
                 .collect();
             let run_path = path.child(name.clone());
+            ctx.instances
+                .note_run(run_path.clone(), module.segments().to_vec());
             let created = self.program.file_of(&module).and_then(|file| {
                 let home = Home::Run(run_path.clone());
                 let place = Some((run_path, statement));

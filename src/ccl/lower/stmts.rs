@@ -31,6 +31,9 @@ pub(super) fn lower_chain_recovering(
     if !declare_top_level_types(stmts, ctx, errors) {
         return None;
     }
+    if !declare_module_instances(stmts, ctx, errors) {
+        return None;
+    }
     let outer_bindings = HashSet::new();
     pre_register_txn_decls(stmts, ctx);
     let span = match (stmts.first(), stmts.last()) {
@@ -64,10 +67,34 @@ pub(super) fn lower_chain_recovering(
         .collect();
     errors.extend(sink_rebindings(stmts, &declared));
     let body = nominal::bind_constructors(body, ctx);
-    let (associated, reached_by) = nominal::associated_reach(&body, ctx);
-    nominal::settle_implicit(&reached_by, ctx);
+    let (associated, reaches) = nominal::associated_reach(&body, ctx);
+    nominal::settle_implicit(&reaches.associated, ctx);
     errors.extend(associated);
+    errors.extend(nominal::instances_reaching_parameters(&reaches, ctx));
     Some(body)
+}
+
+/// Declare the instances among a module's top-level `stmts`, then check the requirements
+/// lowered before them against the instances; `false`, with `errors` extended, where either
+/// fails. Every module declares its instances before its statements lower, the root's as any
+/// other's.
+fn declare_module_instances(
+    stmts: &[Spanned<ChlStmt>],
+    ctx: &mut LoweringContext,
+    errors: &mut Vec<LoweringError>,
+) -> bool {
+    let instances = traits::declare_instances(stmts, ctx);
+    if !instances.is_empty() {
+        errors.extend(instances);
+        return false;
+    }
+    ctx.instances_declared = true;
+    let unsatisfiable = check_pending_requirements(ctx);
+    if !unsatisfiable.is_empty() {
+        errors.extend(unsatisfiable);
+        return false;
+    }
+    true
 }
 
 /// `stmts`, a module's top level in the order written, with its value parameters first. A
@@ -164,15 +191,7 @@ pub(super) fn lower_stmts_recovering(
     if !declare_top_level_types(stmts, ctx, errors) {
         return None;
     }
-    let instances = traits::declare_instances(stmts, ctx);
-    if !instances.is_empty() {
-        errors.extend(instances);
-        return None;
-    }
-    ctx.instances_declared = true;
-    let unsatisfiable = check_pending_requirements(ctx);
-    if !unsatisfiable.is_empty() {
-        errors.extend(unsatisfiable);
+    if !declare_module_instances(stmts, ctx, errors) {
         return None;
     }
     pre_register_txn_decls(stmts, ctx);
@@ -232,9 +251,10 @@ pub(super) fn lower_stmts_recovering(
             }
         });
     let body = nominal::bind_constructors(body, ctx);
-    let (associated, reached_by) = nominal::associated_reach(&body, ctx);
-    nominal::settle_implicit(&reached_by, ctx);
+    let (associated, reaches) = nominal::associated_reach(&body, ctx);
+    nominal::settle_implicit(&reaches.associated, ctx);
     errors.extend(associated);
+    errors.extend(nominal::instances_reaching_parameters(&reaches, ctx));
     Some(body)
 }
 
@@ -951,7 +971,7 @@ pub(super) fn lower_middle_stmt(
         }
         // An associated function, `def N::f`, or an `impl` block of them: bindings at the
         // statement's position, as a module function's is (`nominal::lower_associated_def`).
-        ChlStmt::Impl(block) if !is_top_level && ctx.trait_named(&block.ty.node).is_some() => {
+        ChlStmt::Impl(block) if !is_top_level && ctx.is_instance_block(block) => {
             Err(LoweringError::unsupported(
                 stmt.span,
                 "an instance is declared at a module's top level",
@@ -965,7 +985,7 @@ pub(super) fn lower_middle_stmt(
         }
         // An instance's functions: bindings at the block's position, as a module function's
         // is (`traits::lower_instance`).
-        ChlStmt::Impl(block) if ctx.trait_named(&block.ty.node).is_some() => {
+        ChlStmt::Impl(block) if ctx.is_instance_block(block) => {
             traits::lower_instance(block, stmt.span, body, ctx)
         }
         ChlStmt::FunctionDef { owner: Some(_), .. } | ChlStmt::Impl(_) => {
@@ -2381,14 +2401,19 @@ pub(super) fn lower_trait_type(
     ctx: &mut LoweringContext,
 ) -> Result<crate::ccl::ty::TraitRequirement, LoweringError> {
     let name = ty.name.as_str();
-    if name == "Transaction" {
+    if name == "Transaction" && ty.qualifier.is_empty() {
         return Err(LoweringError::unsupported(
             ty.name_span,
             "`Transaction` is not supported yet: transactions as contextual parameters are \
              not implemented",
         ));
     }
-    let Some(trait_) = ctx.trait_named(name) else {
+    let Some(trait_) = ctx.resolve_trait(
+        &ty.qualifier,
+        &Spanned::new(ty.name_span, ty.name.clone()),
+        span,
+    )?
+    else {
         return Err(LoweringError::unsupported(
             ty.name_span,
             format!(
@@ -2584,7 +2609,7 @@ fn requirement_satisfiable(
 }
 
 /// The error for a requirement no instance satisfies, at `span`.
-fn unsatisfiable_requirement(
+pub(super) fn unsatisfiable_requirement(
     trait_: &crate::ccl::infer::solver::traits::Trait,
     args: &[Type],
     span: Span,
@@ -3668,7 +3693,7 @@ fn name_type(id: &str) -> Option<Type> {
 /// The nominal type `q` names, `shop::Price`, when the module its qualifier names declares
 /// one by that name. `None` leaves `q` to name a type alias, or to report why it names
 /// nothing.
-fn qualified_nominal(
+pub(super) fn qualified_nominal(
     q: &chl_parser::ast::QualifiedName,
     span: Span,
     ctx: &LoweringContext,

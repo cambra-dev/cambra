@@ -117,7 +117,7 @@ pub(super) fn associated_defs<'a>(
     Ok(match &stmt.node {
         ChlStmt::FunctionDef { owner: Some(_), .. } => vec![view(stmt, None, Vec::new())],
         // An instance of a trait is `traits::declare_instances`'s.
-        ChlStmt::Impl(block) if ctx.trait_named(&block.ty.node).is_some() => Vec::new(),
+        ChlStmt::Impl(block) if ctx.is_instance_block(block) => Vec::new(),
         ChlStmt::Impl(block) if block.defs.is_empty() => {
             return Err(LoweringError::unsupported(
                 block.ty.span,
@@ -764,22 +764,30 @@ fn module_const_params(ctx: &LoweringContext) -> Vec<crate::ccl::constant::Const
         .collect()
 }
 
-/// One error per associated function of the module that reaches, through the bindings and
-/// functions of the module's top level, its state, a source, a value parameter without
+/// One error per associated function and instance function of the module that reaches,
+/// through the bindings and functions of the module's top level, its state, a source, a value parameter without
 /// `const`, a value member of a Module-typed parameter, or a member of a run the module
 /// declares. Every import and run of a module shares a type that reaches no parameter, so
 /// each copy of the type's functions must be the same function (`docs/chl-spec.md`,
 /// "Associated functions and methods"). `chain` is the module's lowered top level.
 ///
-/// With the errors, what each associated function reaches that joins its type's identity
-/// ([`settle_implicit`]), by its binding.
+/// With the errors, what each function reaches: an associated function's joins its type's
+/// identity ([`settle_implicit`]), and an instance's decides whether the instance differs
+/// between the module's copies ([`instances_reaching_parameters`]).
 pub(super) fn associated_reach(
     chain: &Expr,
     ctx: &LoweringContext,
-) -> (Vec<LoweringError>, HashMap<String, AssociatedReach>) {
-    let mut reached_by = HashMap::new();
-    if ctx.associated_functions.is_empty() {
-        return (Vec::new(), reached_by);
+) -> (Vec<LoweringError>, Reaches) {
+    let mut associated = HashMap::new();
+    let mut instances = Vec::new();
+    if ctx.associated_functions.is_empty() && ctx.instance_blocks.is_empty() {
+        return (
+            Vec::new(),
+            Reaches {
+                associated,
+                instances,
+            },
+        );
     }
     // A copy with every binder minted, so a reference reads the binder it resolves to.
     let chain = crate::ccl::uniquify::run_in(chain.clone_preserving_ids(), &HashMap::new(), None);
@@ -858,8 +866,8 @@ pub(super) fn associated_reach(
         let mut through: Vec<String> = Vec::new();
         let mut reach = AssociatedReach::default();
         reach.definition(typed, def);
-        let found = first_reached(def, &top, &runs, &mut seen, &mut through, &mut reach);
-        reached_by.insert(binding.clone(), reach);
+        let found = first_reached(def, &top, &runs, ctx, &mut seen, &mut through, &mut reach);
+        associated.insert(binding.clone(), reach);
         if let Some((what, reached)) = found {
             let through = match through.as_slice() {
                 [] => String::new(),
@@ -877,7 +885,131 @@ pub(super) fn associated_reach(
             ));
         }
     }
-    (errors, reached_by)
+    // An instance belongs to the whole program, and every copy of its module binds its
+    // functions under one binder, so they reach what an associated function may
+    // (`docs/chl-spec.md`, "Traits and instances across modules [Decided]").
+    for block in &ctx.instance_blocks {
+        let mut reaches = Vec::new();
+        for (function, implementation) in &block.instance.functions {
+            let crate::ccl::infer::solver::traits::Implementation::Binding(binding) =
+                implementation
+            else {
+                continue;
+            };
+            let Some(TopLevel::Defined(typed, def)) = top.get(binding) else {
+                continue;
+            };
+            let mut seen: HashSet<Name> = HashSet::new();
+            let mut through: Vec<String> = Vec::new();
+            let mut reach = AssociatedReach::default();
+            reach.definition(typed, def);
+            let found = first_reached(def, &top, &runs, ctx, &mut seen, &mut through, &mut reach);
+            let head = block
+                .instance
+                .declared
+                .as_ref()
+                .map_or_else(|| block.trait_.to_string(), |d| d.head.clone());
+            if let Some((what, reached)) = found {
+                let through = match through.as_slice() {
+                    [] => String::new(),
+                    path => format!(", through `{}`", path.join("` → `")),
+                };
+                errors.push(LoweringError::unsupported(
+                    block.span,
+                    format!(
+                        "the function `{function}` of `impl {head}` reads {}{through}; an \
+                         instance's function reaches no state, no source, and no value an \
+                         import or a run gives its module other than a `const` parameter's, \
+                         since every copy of the module shares the instance",
+                        reached.describe(&what)
+                    ),
+                ));
+            }
+            reaches.push(reach);
+        }
+        instances.push(reaches);
+    }
+    (
+        errors,
+        Reaches {
+            associated,
+            instances,
+        },
+    )
+}
+
+/// What [`associated_reach`] finds each function of the module's types and instances
+/// reaches.
+pub(super) struct Reaches {
+    /// Each associated function's, under its binding, `Circle::area`.
+    pub associated: HashMap<String, AssociatedReach>,
+    /// Each instance's functions', one list per block of
+    /// [`LoweringContext::instance_blocks`], in its order.
+    pub instances: Vec<Vec<AssociatedReach>>,
+}
+
+/// One error per instance the module declares that reaches the module's type or `const`
+/// parameters, through a type its head names or what its functions reach, read once
+/// [`settle_implicit`] has recorded what each of the module's types reaches. Every copy of
+/// the module shares one instance, whose head and functions would differ between copies,
+/// so such an instance is a gap the compiler refuses (`docs/chl-spec.md`, "Traits and
+/// instances across modules \[Decided\]").
+pub(super) fn instances_reaching_parameters(
+    reaches: &Reaches,
+    ctx: &LoweringContext,
+) -> Vec<LoweringError> {
+    let module_params = module_type_params(ctx);
+    let module_consts = module_const_params(ctx);
+    if module_params.is_empty() && module_consts.is_empty() {
+        return Vec::new();
+    }
+    let reaches_parameters = |ty: &Type| {
+        let mut found = crate::ccl::subst::type_free_vars(ty)
+            .iter()
+            .any(|name| ctx.constants.param(name.base()).is_some());
+        // A declaration reaches what its implicit arguments name, its own module's and
+        // another's alike.
+        each_param_and_decl(ty, &mut |at| match at {
+            Found::Param(id) => found |= module_params.iter().any(|p| p.id == id),
+            Found::Decl(decl) => {
+                for arg in decl.implicit_args() {
+                    each_param_and_decl(&arg, &mut |inner| {
+                        if let Found::Param(id) = inner {
+                            found |= module_params.iter().any(|p| p.id == id);
+                        }
+                    });
+                }
+                found |= decl.const_args().iter().any(|arg| {
+                    arg.params()
+                        .iter()
+                        .any(|param| module_consts.iter().any(|c| c.id == param.id))
+                });
+            }
+        });
+        found
+    };
+    let mut errors = Vec::new();
+    for (block, functions) in ctx.instance_blocks.iter().zip(&reaches.instances) {
+        let head = block.instance.operands.iter().any(&reaches_parameters);
+        let functions = functions
+            .iter()
+            .any(|reach| !reach.consts.is_empty() || reach.types.iter().any(&reaches_parameters));
+        if head || functions {
+            let what = if head {
+                "names a type whose identity takes its module's parameters"
+            } else {
+                "has a function that reaches its module's parameters"
+            };
+            errors.push(LoweringError::internal(
+                block.span,
+                format!(
+                    "this instance {what}; an instance that differs between the copies of its \
+                     module is not supported yet"
+                ),
+            ));
+        }
+    }
+    errors
 }
 
 /// What an associated function reaches through its definition and the definitions it
@@ -897,6 +1029,17 @@ impl AssociatedReach {
         self.types.push(binding.ty.clone());
         self.types.extend(binding.user_annotation.clone());
         for_each_type_in(def, &mut |ty| self.types.push(ty.clone()));
+    }
+
+    /// Record a call of a function of `decl`, another module's type as this module reaches
+    /// it: what the type's identity takes there is reached.
+    fn other_type(&mut self, decl: Rc<NominalDecl>) {
+        let params = decl
+            .params
+            .iter()
+            .map(|p| Type::Param(Rc::clone(p)))
+            .collect();
+        self.types.push(Type::Nominal(decl, params));
     }
 }
 
@@ -949,6 +1092,7 @@ fn first_reached<'a>(
     expr: &'a Expr,
     top: &'a HashMap<Name, TopLevel<'a>>,
     runs: &HashSet<&'a str>,
+    ctx: &LoweringContext,
     seen: &mut HashSet<Name>,
     through: &mut Vec<String>,
     reach: &mut AssociatedReach,
@@ -964,9 +1108,17 @@ fn first_reached<'a>(
     if let Some(name) = read {
         if name.is_raw()
             && let Some((qualifier, _)) = name.base().split_once("::")
-            && let Some(run) = runs.get(qualifier)
         {
-            return Some((name.base().to_string(), Forbidden::Run(run)));
+            // A function of another module's type reaches what the type's identity takes
+            // where the import or run gives it, and reads nothing of a run's.
+            match ctx.qualified_type(name.base()) {
+                Some(decl) => reach.other_type(decl),
+                None => {
+                    if let Some(run) = runs.get(qualifier) {
+                        return Some((name.base().to_string(), Forbidden::Run(run)));
+                    }
+                }
+            }
         }
         match top.get(name) {
             Some(TopLevel::Is(reached)) => return Some((name.base().to_string(), *reached)),
@@ -976,7 +1128,7 @@ fn first_reached<'a>(
             Some(TopLevel::Defined(binding, def)) if seen.insert(name.clone()) => {
                 through.push(name.base().to_string());
                 reach.definition(binding, def);
-                if let Some(found) = first_reached(def, top, runs, seen, through, reach) {
+                if let Some(found) = first_reached(def, top, runs, ctx, seen, through, reach) {
                     return Some(found);
                 }
                 through.pop();
@@ -987,7 +1139,7 @@ fn first_reached<'a>(
     let mut found = None;
     expr.walk_children(|child| {
         if found.is_none() {
-            found = first_reached(child, top, runs, seen, through, reach);
+            found = first_reached(child, top, runs, ctx, seen, through, reach);
         }
     });
     found

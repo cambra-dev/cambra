@@ -3167,7 +3167,9 @@ method it means, and the method as an unapplied value has no other spelling.
   be one function. An associated function reads no mutable variable, feed or source of its module,
   no value parameter, no member of a Module-typed parameter, and no member of a run the module
   declares, directly or through the module's bindings and functions, and an error names what it
-  reads. A type parameter of the module that it reaches the same way is part of the type's
+  reads. A run's type's functions and constructors are not such members: every run shares the
+  type, whose own module holds its functions to this rule. A type parameter of the module that it
+  reaches the same way, or through a run's type whose identity takes it, is part of the type's
   identity instead. So is a `const` parameter it reaches ([9.19 Constants](#919-constants)), so the
   value parameters it may not read are those without `const`.
 - Whether a module other than the type's own may declare an associated function of it is **[Open]**.
@@ -3798,6 +3800,13 @@ belongs to the whole program.
   a trait's `def`. Another module names it qualified, as `shapes::Area` in a `requires` clause, in
   `summon(shapes::Area(_))` and in an instance's head `impl shapes::Area(Circle):`, or by its own
   name after `use shapes::{Area}`.
+- **An instance's functions read nothing a run gives its module.** Every import and run of the
+  module shares the instance, so, as an associated function's
+  ([Associated functions and methods](#associated-functions-and-methods)), its functions read no
+  mutable variable, feed or source of the module, no value parameter without `const`, no member of
+  a Module-typed parameter, and no member of a run the module declares other than its types'
+  functions and constructors, directly or through the module's bindings and functions, and an
+  error names what one reads.
 - **An instance holds wherever its trait and its types can be named.** `impl` takes no `pub`, and
   no import selects instances: a module sees every instance its imports declare, directly or
   through other imports. A key of a `Set`, a join's equality and each summon therefore mean the

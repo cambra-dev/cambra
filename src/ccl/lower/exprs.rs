@@ -51,7 +51,7 @@ pub(super) fn lower_call(
     let name = match &func.node {
         ChlExpr::Name(id) => id.as_str(),
         ChlExpr::Qualified(q) if nominal::names_a_type_member(q) => {
-            if let Some(trait_) = ctx.trait_named(&q.qualifier[0].node) {
+            if let Some(trait_) = ctx.trait_of_member(q)? {
                 return Err(traits::refuse_trait_member(&trait_, q, func.span));
             }
             return nominal::lower_member_call(q, func.span, args, ctx);
