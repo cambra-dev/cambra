@@ -2272,6 +2272,41 @@ fn lower_requirement_item(
     match &req.node {
         Requirement::Trait { binder, ty } => {
             let mut stated = lower_trait_type(ty, req.span, ctx)?;
+            let mut members = members;
+            // Each associated effect type of the trait stands, at this requirement, for what
+            // the instance each use passes does: a parameter of the definition, `s::Writes`,
+            // bounded as the trait's is (`docs/chl-spec.md`, "Effects in traits").
+            if let Some(members) = members.as_deref_mut() {
+                let owner = binder
+                    .as_ref()
+                    .map_or_else(|| stated.trait_.name().to_string(), |b| b.node.to_string());
+                for p in &stated.trait_.effect_assocs {
+                    let param = crate::ccl::ty::TypeParam::declared(
+                        format!("{owner}::{}", p.param.spelling).as_str(),
+                    );
+                    let bound = if p.of_causes {
+                        crate::ccl::nominal::effect()
+                    } else {
+                        crate::ccl::nominal::context()
+                    };
+                    members.push(crate::ccl::ty::PolyParam {
+                        param: Rc::clone(&param),
+                        kind: crate::ccl::ty::TypeKind::SubtypesOf(Box::new(Type::Nominal(
+                            bound,
+                            Vec::new(),
+                        ))),
+                        bound_at: None,
+                    });
+                    ctx.clause_params.insert(param.id, p.of_causes);
+                    stated.effect_assoc.push((
+                        p.param.id,
+                        crate::ccl::effects::ClauseParam {
+                            param,
+                            of_causes: p.of_causes,
+                        },
+                    ));
+                }
+            }
             if let Some(binder) = binder {
                 if is_type_name(&binder.node) {
                     return Err(LoweringError::unsupported(
@@ -2334,6 +2369,7 @@ fn lower_requirement_item(
                 trait_,
                 args,
                 assoc,
+                effect_assoc,
                 ..
             } = stated;
             // Before the module's instances are declared, a requirement of a trait, of one of
@@ -2343,7 +2379,15 @@ fn lower_requirement_item(
             } else {
                 Satisfiable::Later(&mut ctx.pending_requirements)
             };
-            expand_requirement(trait_, args, assoc, req.span, check, out)
+            let before = out.len();
+            expand_requirement(trait_, args, assoc, req.span, check, out)?;
+            for r in &mut out[before..] {
+                Rc::get_mut(r)
+                    .expect("a requirement just expanded has no other holder")
+                    .effect_assoc
+                    .clone_from(&effect_assoc);
+            }
+            Ok(())
         }
         Requirement::Bound {
             instance,
@@ -2451,6 +2495,7 @@ pub(super) fn lower_trait_type(
         trait_,
         args,
         terms: Vec::new(),
+        effect_assoc: Vec::new(),
         assoc: Vec::new(),
         at: Some(span),
     })
@@ -2705,6 +2750,7 @@ fn expand_requirement(
                 trait_,
                 args: args.iter().map(Type::canonical).collect(),
                 terms: Vec::new(),
+                effect_assoc: Vec::new(),
                 assoc,
                 at: Some(span),
             }));
@@ -2737,6 +2783,7 @@ fn expand_requirement(
         trait_,
         args,
         terms: Vec::new(),
+        effect_assoc: Vec::new(),
         assoc,
         at: Some(span),
     }));

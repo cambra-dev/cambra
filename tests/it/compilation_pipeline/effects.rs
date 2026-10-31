@@ -435,3 +435,169 @@ fn a_public_function_naming_an_induction_variable_is_refused(
     let rendered = format!("{errors:?}");
     assert!(rendered.contains(needle), "{rendered}");
 }
+
+/// A trait whose instances write state through an associated effect type, an instance that
+/// writes a transactional variable, and a polymorphic definition calling the trait.
+const TAKE: &str = indoc! {"
+    stock: Mut(Int, Txn) := 10
+    type Box = Int
+
+    trait Take(T):
+        Writes <: Effect
+        def take(t: T, n: Int) => Int causes Commit, Writes
+
+    impl Take(Box):
+        def take(t, n):
+            with begin():
+                stock := stock - n
+            n
+
+    def generic(T, s: T, n: Int) requires t: Take(T) causes only Commit, t::Writes:
+        t::take(s, n)
+"};
+
+/// What a call of a trait's function does is its signature's, and what an instance's
+/// function does beyond it is the instance's associated effect type, which a call at that
+/// instance does (`docs/chl-spec.md`, "Effects in traits").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_call_at_an_instance(
+    indoc! {"
+        def direct(n: Int) causes only Commit:
+            summon(Take(Box))::take(Box::new(1), n)
+    "},
+    "this has `Write(stock)`, which the definition's clause"
+)]
+#[case::a_call_through_a_requirement(
+    indoc! {"
+        def through(n: Int) causes only Commit:
+            generic(Box::new(1), n)
+    "},
+    "this has `Write(stock)`, which the definition's clause"
+)]
+// A requirement inference adds to a definition is answered at each use; until then a call
+// does what any instance answering it does.
+#[case::a_call_through_an_inferred_requirement(
+    indoc! {"
+        def inferred(s, n: Int):
+            summon(Take(_))::take(s, n)
+        def through_inferred(n: Int) causes only Commit:
+            inferred(Box::new(1), n)
+    "},
+    "this has `Write(stock)`, which the definition's clause"
+)]
+#[case::a_requirement_beyond_its_bound(
+    indoc! {"
+        def narrow(T, s: T, n: Int) requires t: Take(T) causes only Commit:
+            t::take(s, n)
+    "},
+    "this has `t::Writes`, which the definition's clause"
+)]
+fn a_trait_call_does_what_its_instance_does(#[case] code: &str, #[case] needle: &str) {
+    let errors = super::modules::compile_errors(&program(&format!("{TAKE}\n{code}\n0\n"), &[]));
+    assert!(errors.contains(needle), "{errors}");
+}
+
+/// A program calling an instance whose function writes state, directly and through a
+/// requirement, compiles and runs.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::directly("summon(Take(Box))::take(Box::new(1), 3)")]
+#[case::through_a_requirement("generic(Box::new(1), 3)")]
+fn a_trait_whose_instance_writes_state_runs(#[case] call: &str) {
+    super::helpers::check_program_scalar(
+        &program(&format!("{TAKE}\n{call}\n"), &[]),
+        cambra::interpreter::Value::Int(3),
+    );
+}
+
+/// A trait's declarations that cannot state what instances do are refused where they are
+/// written.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::an_instance_beyond_its_signature(
+    indoc! {"
+        stock: Mut(Int, Txn) := 10
+        type Box = Int
+        trait Take(T):
+            def take(t: T, n: Int) => Int causes Commit
+        impl Take(Box):
+            def take(t, n):
+                with begin():
+                    stock := stock - n
+                n
+    "},
+    "this has `Write(stock)`, which the trait's signature does not list"
+)]
+#[case::a_signature_naming_a_variable(
+    indoc! {"
+        stock: Mut(Int, Txn) := 10
+        trait Take(T):
+            def take(t: T, n: Int) => Int causes Write(stock)
+    "},
+    "a trait's signature names no variable"
+)]
+#[case::an_instance_writing_a_clause(
+    indoc! {"
+        type Box = Int
+        trait Take(T):
+            def take(t: T, n: Int) => Int
+        impl Take(Box):
+            def take(t, n) causes nothing:
+                n
+    "},
+    "so it writes no clause"
+)]
+#[case::an_associated_effect_type_of_no_requirement(
+    indoc! {"
+        def f(n: Int) causes s::Writes:
+            n
+    "},
+    "`s` names no requirement in scope"
+)]
+fn a_trait_declaration_that_cannot_state_effects_is_refused(
+    #[case] code: &str,
+    #[case] needle: &str,
+) {
+    let errors = super::modules::compile_errors(&program(&format!("{code}\n0\n"), &[]));
+    assert!(errors.contains(needle), "{errors}");
+}
+
+/// A Module type's entry is a written type, whose clauses are exact, so a run whose argument
+/// does more is refused at the argument (`docs/chl-spec.md`, "Writing requirements and
+/// effects").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_module_argument_beyond_its_entry_is_refused() {
+    let errors = super::modules::compile_errors(&program(
+        indoc! {"
+            run helper as h
+            run lib(p=h) as l
+            l::use_it(1)
+        "},
+        &[
+            (
+                "lib",
+                indoc! {"
+                    param p: Module{f: Int => Int}
+                    pub def use_it(x: Int) => Int:
+                        p::f(x)
+                "},
+            ),
+            (
+                "helper",
+                indoc! {"
+                    stock: Mut(Int, Txn) := 10
+                    pub def f(x: Int) => Int:
+                        with begin():
+                            stock := stock - x
+                        x
+                "},
+            ),
+        ],
+    ));
+    assert!(
+        errors.contains("this has `Write(h::stock)`, which the function type it must have"),
+        "{errors}"
+    );
+}

@@ -1574,6 +1574,11 @@ pub struct TraitRequirement {
     pub args: Vec<Type>,
     /// One per term parameter of the trait: the variable `x` in `Read(x)`.
     pub terms: Vec<crate::ccl::Name>,
+    /// Each of the trait's associated effect types, by the trait's parameter for it, with the
+    /// parameter standing for it at this requirement, `s::Writes` under `requires s:
+    /// Sink(T)` (`docs/chl-spec.md`, "Effects in traits"). Equality and hashing leave it
+    /// out: it follows from where the requirement is written.
+    pub effect_assoc: Vec<(TypeParamId, crate::ccl::effects::ClauseParam)>,
     /// The associated types the clause names. One it leaves unnamed is absent, and
     /// leaves that position open.
     pub assoc: Vec<(crate::ccl::infer::solver::traits::Assoc, Type)>,
@@ -1607,6 +1612,7 @@ impl TraitRequirement {
             trait_: self.trait_.clone(),
             args: self.args.iter().map(&mut f).collect(),
             terms: self.terms.clone(),
+            effect_assoc: self.effect_assoc.clone(),
             assoc: self.assoc.iter().map(|(n, t)| (n.clone(), f(t))).collect(),
             at: self.at,
         }

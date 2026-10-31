@@ -144,7 +144,8 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                     // "Instantiation").
                     for r in &instance.requires {
                         let at = || format!("the requirement {}(…) of `{name}`", r.trait_);
-                        require_stated(r, node_id, &at, ctx)?;
+                        let obligation = require_stated(r, node_id, &at, ctx)?;
+                        ctx.link_requirement_effects(r, &obligation, &instance.effect_copies);
                     }
                     instance.ty
                 }
@@ -2031,6 +2032,7 @@ fn emit_let_definition<C: Typing>(
     };
     // The `Poly` stays open through the annotation's reconcile, which normalizes
     // the parameters the annotation names, and is closed on every path out.
+    let links_before = ctx.pending_effect_links();
     let bound = emit_let_bound(
         binding,
         bound_expr,
@@ -2091,6 +2093,7 @@ fn emit_let_definition<C: Typing>(
         LetScheme::Monomorphic
     };
     if defined && generalize {
+        ctx.settle_effect_links_since(links_before);
         let noted = match &binding.user_annotation {
             Some(poly @ Type::Poly(_)) => poly,
             _ => &scheme_ty,
@@ -3107,6 +3110,7 @@ fn emit_trait_fn(
         inputs,
         output,
         requires,
+        effects,
     } = &declared.signature;
     let mut opened: HashMap<TypeParamId, Type> = HashMap::new();
     for (param, operand) in trait_.operands.iter().zip(operands.iter()) {
@@ -3128,9 +3132,14 @@ fn emit_trait_fn(
         };
         require_stated(&requirement, node_id, &at, ctx)?;
     }
-    let mut ty = replace_params(&function_over(inputs, output.clone()), &opened);
+    // A call does what the signature states, whichever instance it reaches: each instance's
+    // function is bounded by the signature (`docs/chl-spec.md`, "Effects in traits").
+    let mut ty = replace_params(
+        &function_over(inputs, output.clone()).with_effects(effects.clone()),
+        &opened,
+    );
     ctx.type_annotation_predicates(&mut ty)?;
-    Ok(ctx.normalize_annotation(&ty))
+    Ok(ctx.normalize_trait_call(&ty, &trait_, &obligation))
 }
 
 /// Emit the function `function` of the instance `obligation` selects first, where that
@@ -3186,22 +3195,23 @@ fn require_stated(
     node_id: NodeId,
     at: &dyn Fn() -> String,
     ctx: &mut InferCtx,
-) -> Result<(), LocatedInferError> {
+) -> Result<std::rc::Rc<crate::ccl::infer::solver::traits::TraitObligation>, LocatedInferError> {
     let names: Vec<Assoc> = r.assoc.iter().map(|(n, _)| n.clone()).collect();
     let require = |ctx: &mut InferCtx| {
-        ctx.require_trait_associating(
+        ctx.require_trait_obligation(
             r.trait_.clone(),
             node_id,
             &r.args.iter().collect::<Vec<_>>(),
             &names,
+            None,
             at,
         )
     };
-    let settled = ctx.with_demand_at(r.at.map(Origin::Written), require)?;
+    let (settled, obligation) = ctx.with_demand_at(r.at.map(Origin::Written), require)?;
     for (settled, (_, named)) in settled.iter().zip(&r.assoc) {
         ctx.require_sub(settled, named, at)?;
     }
-    Ok(())
+    Ok(obligation)
 }
 
 /// Replace the `Method` placeholder `function` with the candidate its receiver's type names

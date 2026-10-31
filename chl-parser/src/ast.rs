@@ -598,7 +598,9 @@ pub struct TraitDecl {
 #[derive(Debug, Clone, PartialEq)]
 pub enum TraitItem {
     /// `Elem`, or `Elem <: B`: an associated type, with the bound every instance's choice of it
-    /// is below (`docs/chl-spec.md`, "Declaring a trait").
+    /// is below (`docs/chl-spec.md`, "Declaring a trait"). A bound of `Effect` or `Context`
+    /// makes it stand for a clause, which each instance's functions decide (`docs/chl-spec.md`,
+    /// "Effects in traits").
     AssocType {
         name: Spanned<SmolStr>,
         bound: Option<Spanned<Expr>>,
@@ -614,7 +616,10 @@ pub struct FunctionSignature {
     pub type_params: Vec<TypeParam>,
     pub params: Vec<Param>,
     pub output: Option<Spanned<Expr>>,
-    pub requires: Vec<Spanned<Requirement>>,
+    /// The clauses, which a signature states exactly, as a written function type does
+    /// (`docs/chl-spec.md`, "Effects in traits"). Its trait requirements are its own.
+    pub requires: Clause<Requirement>,
+    pub causes: Clause<TraitType>,
 }
 
 /// What a [`TypeDecl`] declares after its head.
@@ -741,6 +746,9 @@ pub struct TraitType {
     pub name_span: Span,
     /// The operand types, positionally.
     pub args: Vec<Spanned<Expr>>,
+    /// In a clause, the requirement whose associated effect type the item names: `s` in
+    /// `causes s::Writes` (`docs/chl-spec.md`, "Effects in traits").
+    pub instance: Option<Spanned<SmolStr>>,
 }
 
 /// An associated type an instance's block defines, `Output = Money`.

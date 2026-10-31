@@ -1972,6 +1972,7 @@ where
                     name,
                     name_span,
                     args,
+                    ..
                 } = head.node;
                 let mut defs = Vec::new();
                 let mut assoc = Vec::new();
@@ -2011,22 +2012,25 @@ where
                     .delimited_by(just(Token::LParen), just(Token::RParen)),
             )
             .then(just(Token::DoubleArrow).ignore_then(expr.clone()).or_not())
-            .then(requires_clause(expr.clone()).or_not())
-            .map_with(|(((name, (type_params, params)), output), requires), e| {
-                TraitItem::Function(Box::new(Spanned::new(
-                    e.span(),
-                    FunctionSignature {
-                        name,
-                        type_params,
-                        params,
-                        output,
-                        requires: requires.unwrap_or_default(),
-                    },
-                )))
-            });
+            .then(effect_clauses(expr.clone(), requirement(expr.clone())).boxed())
+            .map_with(
+                |(((name, (type_params, params)), output), (requires, causes)), e| {
+                    TraitItem::Function(Box::new(Spanned::new(
+                        e.span(),
+                        FunctionSignature {
+                            name,
+                            type_params,
+                            params,
+                            output,
+                            requires,
+                            causes,
+                        },
+                    )))
+                },
+            );
         // An associated type is its capitalized name, alone or bounded, `Size <: Int`: it is a
         // type the instance defines, as an alias, not a nominal type a `type` declaration
-        // introduces.
+        // introduces. One bounded by `Effect` or `Context` stands for a clause.
         let trait_item = choice((
             binder
                 .then(just(Token::LtColon).ignore_then(expr.clone()).or_not())
@@ -2519,13 +2523,29 @@ where
     })
 }
 
-/// A clause item: a trait type whose name is capitalized, `Write(x)`, or `_`.
+/// A clause item: a trait type whose name is capitalized, `Write(x)`, `_`, or a
+/// requirement's associated effect type, `s::Writes`.
 fn clause_item<'src, I, E>(expr: E) -> impl Parser<'src, I, Spanned<TraitType>, PErr<'src>> + Clone
 where
     I: ValueInput<'src, Token = Token, Span = Span>,
     E: Parser<'src, I, Spanned<Expr>, PErr<'src>> + Clone,
 {
-    trait_type(expr).try_map(|ty, span| {
+    let ident = select! { Token::Ident(s) => s }.map_with(|s, e| Spanned::new(e.span(), s));
+    let qualified = ident
+        .then_ignore(just(Token::ColonColon))
+        .then(ident)
+        .map_with(|(instance, name), e| {
+            Spanned::new(
+                e.span(),
+                TraitType {
+                    name: name.node,
+                    name_span: name.span,
+                    args: Vec::new(),
+                    instance: Some(instance),
+                },
+            )
+        });
+    qualified.or(trait_type(expr)).try_map(|ty, span| {
         if ty.node.name == "_" || is_type_name(&ty.node.name) {
             Ok(ty)
         } else {
@@ -2627,6 +2647,7 @@ where
                     name,
                     name_span,
                     args: args.unwrap_or_default(),
+                    instance: None,
                 },
             )
         })
@@ -3217,7 +3238,7 @@ mod tests {
         assert_eq!(elem.node, "Elem");
         assert_eq!(first.node.params.len(), 2);
         assert_eq!(tag.node.type_params.len(), 1);
-        assert_eq!(tag.node.requires.len(), 1);
+        assert_eq!(tag.node.requires.items.len(), 1);
         let Stmt::Impl(block) = &m.body[1].node else {
             panic!("expected an impl block, got {:?}", m.body[1].node)
         };

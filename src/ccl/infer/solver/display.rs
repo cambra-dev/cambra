@@ -227,6 +227,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
             trait_: stated.trait_.clone(),
             args: args.to_vec(),
             terms: Vec::new(),
+            effect_assoc: Vec::new(),
             assoc: stated
                 .assoc
                 .iter()
