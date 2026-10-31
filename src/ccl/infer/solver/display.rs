@@ -226,6 +226,7 @@ pub fn poly_for_display(ty: &Type, cutoff: Level) -> Option<InferredPoly> {
         let requirement = TraitRequirement {
             trait_: stated.trait_.clone(),
             args: args.to_vec(),
+            terms: Vec::new(),
             assoc: stated
                 .assoc
                 .iter()
