@@ -645,13 +645,13 @@ fn constrain_effects(e0: &Effects, e1: &Effects) {
             for r in &set.requires {
                 v1.record(Label {
                     item: Item::Requires(r.clone()),
-                    bound_at: None,
+                    bound: crate::ccl::effects::Bound::Escaping,
                 });
             }
             for e in &set.causes {
                 v1.record(Label {
                     item: Item::Causes(e.clone()),
-                    bound_at: None,
+                    bound: crate::ccl::effects::Bound::Escaping,
                 });
             }
         }

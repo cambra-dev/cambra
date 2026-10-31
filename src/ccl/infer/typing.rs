@@ -310,9 +310,24 @@ pub(super) trait Typing {
     /// induction variable. Check records nothing.
     fn record_read(&mut self, _name: &Name) {}
 
+    /// Note that the `let` of `name` at `node` binds `ty`, for the check that no public
+    /// function's type names a variable of its module's own. Check notes nothing.
+    fn note_binding(&mut self, _name: &Name, _ty: &Type, _node: NodeId) {}
+
     /// Record that `name`, just bound at `ty`, is a mutable variable its scope declares
     /// rather than a parameter, whose history would be its argument's.
     fn declare_mutable(&mut self, _name: &Name, _ty: &Type) {}
+
+    /// Run `f` as the expression of the statement `node`, whose value is discarded. Emit
+    /// collects what the expression causes, the enclosing function's own variables included,
+    /// so the statement can be refused as inert once inference has settled it; Check runs
+    /// `f`.
+    fn statement<R>(&mut self, _node: NodeId, f: impl FnOnce(&mut Self) -> R) -> R
+    where
+        Self: Sized,
+    {
+        f(self)
+    }
 
     /// Run `f` as the body of a `with begin():` block, which supplies `Transaction` to
     /// what it calls.

@@ -98,14 +98,27 @@ pub enum Item {
     Causes(Effect),
 }
 
-/// An [`Item`] with the depth of the function whose body binds the variable it names: the
-/// number of function bodies around the binder, `0` at a module's top level. `None` for an
-/// item that names no variable, and for one naming a variable no scope's end discharges, a
-/// transactional mutable variable bound by its run.
+/// An [`Item`] with where the variable it names is bound, which decides the function bodies
+/// it leaves.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Label {
     pub item: Item,
-    pub bound_at: Option<u32>,
+    pub bound: Bound,
+}
+
+/// Where the variable a [`Label`] names is bound.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Bound {
+    /// Nowhere a scope's end discharges: the label names no variable, or one bound by its run,
+    /// a transactional mutable variable or a public feed.
+    Escaping,
+    /// In the body of the function this many function bodies deep, `0` at a module's top
+    /// level.
+    At(u32),
+    /// As a parameter. A parameter's history is its argument's, so the call records what is
+    /// done to it, and the label leaves no function body: only the statement doing it holds it
+    /// (`docs/chl-spec.md`, "Discharging requirements and effects").
+    Parameter,
 }
 
 /// What an edge into an [`EffectVar`] lets through
@@ -139,9 +152,10 @@ impl Filter {
         {
             return false;
         }
-        match (self.below, label.bound_at) {
-            (Some(below), Some(at)) => at < below,
-            _ => true,
+        match (self.below, label.bound) {
+            (None, _) | (Some(_), Bound::Escaping) => true,
+            (Some(below), Bound::At(at)) => at < below,
+            (Some(_), Bound::Parameter) => false,
         }
     }
 }
@@ -286,6 +300,26 @@ impl EffectVar {
         out
     }
 
+    /// Whether `pred` holds of this variable or of any variable flowing into it.
+    pub fn reaches(&self, pred: &dyn Fn(&EffectVar) -> bool) -> bool {
+        let mut seen = std::collections::HashSet::new();
+        let mut stack: Vec<Rc<EffectVar>> = self.incoming().into_iter().map(|(v, _)| v).collect();
+        if pred(self) {
+            return true;
+        }
+        seen.insert(self.uid);
+        while let Some(v) = stack.pop() {
+            if !seen.insert(v.uid) {
+                continue;
+            }
+            if pred(&v) {
+                return true;
+            }
+            stack.extend(v.incoming().into_iter().map(|(w, _)| w));
+        }
+        false
+    }
+
     /// The labels recorded on this variable itself, without what flows in.
     pub fn own(&self) -> BTreeSet<Label> {
         self.own.borrow().clone()
@@ -380,7 +414,7 @@ impl Effects {
             .chain(set.causes.iter().map(|e| Item::Causes(e.clone())))
             .map(|item| Label {
                 item,
-                bound_at: None,
+                bound: Bound::Escaping,
             })
             .collect()
     }
