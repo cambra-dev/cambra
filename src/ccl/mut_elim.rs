@@ -2112,6 +2112,7 @@ pub(crate) fn binding(name: Name, ty: Type) -> TypedBinding {
         ty,
         user_annotation: None,
         transparency: BindingTransparency::Transparent,
+        site: None,
     }
 }
 
@@ -2729,7 +2730,15 @@ pub(crate) fn fold_induction_loop(
         .collect();
 
     InductionFold {
-        binding: (binding(h.clone(), hist_ty.clone()), lambda),
+        // The loop's site names the store this history becomes (`src/ccl/design/sites.md`,
+        // "Stores").
+        binding: (
+            TypedBinding {
+                site: target.site.clone(),
+                ..binding(h.clone(), hist_ty.clone())
+            },
+            lambda,
+        ),
         reads,
         renames,
         feed_views,
@@ -4498,6 +4507,7 @@ mod tests {
                 ty: int.clone(),
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             iter: Box::new(list),
             body: Box::new(body),

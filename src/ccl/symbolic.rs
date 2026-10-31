@@ -1296,8 +1296,7 @@ mod tests {
         TypedExpr::new(TypedExprNode::Transact {
             keys: vec![TransactKey {
                 name: "i".into(),
-                init: Expr::lit(Lit::Int(0)),
-            }],
+                init: Expr::lit(Lit::Int(0)), site: None, }],
             writers: vec![WriterSite {
                 read_keys: vec!["i".into()],
                 write_keys: vec!["i".into()],
@@ -1315,12 +1314,10 @@ mod tests {
             keys: vec![
                 TransactKey {
                     name: "x".into(),
-                    init: Expr::lit(Lit::Int(0)),
-                },
+                    init: Expr::lit(Lit::Int(0)), site: None, },
                 TransactKey {
                     name: "y".into(),
-                    init: Expr::lit(Lit::Int(1)),
-                },
+                    init: Expr::lit(Lit::Int(1)), site: None, },
             ],
             writers: vec![WriterSite {
                 read_keys: vec!["x".into(), "y".into()],
@@ -1339,8 +1336,7 @@ mod tests {
         TypedExpr::new(TypedExprNode::Transact {
             keys: vec![TransactKey {
                 name: "i".into(),
-                init: Expr::proj_index(0),
-            }],
+                init: Expr::proj_index(0), site: None, }],
             writers: vec![WriterSite {
                 read_keys: vec!["i".into()],
                 write_keys: vec!["i".into()],
@@ -1376,8 +1372,7 @@ mod tests {
                     name: "x".into(),
                     ty: Type::Base(BaseType::Int),
                     user_annotation: None,
-                    transparency: BindingTransparency::Transparent,
-                },
+                    transparency: BindingTransparency::Transparent, site: None, },
                 Expr::lit(Lit::Int(0)),
             )],
             Expr::var("x"),

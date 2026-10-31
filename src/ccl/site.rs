@@ -2,8 +2,8 @@
 //! agree on (`src/ccl/design/sites.md`).
 //!
 //! A [`Site`] is the [`Place`] something is written at and the places of the calls that
-//! reached it, under the run whose evaluation started them. Lowering looks each feed's and each
-//! named call's place up ([`places`]), linking puts each run's copy of a module under that run's
+//! reached it, under the run whose evaluation started them. Lowering looks each place up
+//! ([`places`]), linking puts each run's copy of a module under that run's
 //! path, and inlining extends a copied body's sites with the call that copied it. Every other
 //! pass carries a site with the node it rides, a clone included.
 

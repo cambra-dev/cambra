@@ -1839,6 +1839,7 @@ mod tests {
                 ty: Type::Hole,
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             body: Box::new(TypedExpr::new(TypedExprNode::Var("x".into()))),
         });
@@ -1884,6 +1885,7 @@ mod tests {
                 ty: Type::Hole,
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             bound_expr: Box::new(lit_int(42)),
             body: Box::new(TypedExpr::new(TypedExprNode::Var("x".into()))),

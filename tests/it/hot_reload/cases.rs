@@ -2,7 +2,7 @@
 
 use std::{sync::mpsc, thread, time::Duration};
 
-use indoc::indoc;
+use indoc::{formatdoc, indoc};
 use rstest_log::rstest;
 
 use cambra::{
@@ -2258,11 +2258,10 @@ fn an_undriven_store_has_no_value_to_load() {
 /// A load inside a stateful function reaches the variable that function's own
 /// instantiation declares.
 ///
-/// This is the address the chain exists for. `count_by`'s body is inlined into
-/// `a`'s definition, so the variable it declares is `` `a`.`total` `` and the
-/// load sits under `` `a`.`held` ``. The search runs outward from the site's own
-/// chain, so it passes the binding the load seeds and stops at the
-/// instantiation's.
+/// This is the address the scope exists for. `count_by`'s body is reached by the
+/// call in `a`'s definition, so the variable it declares is `` `a`.`count_by()`.`total` ``
+/// and the load stands in the same scope. The search runs outward from the load's own
+/// scope, which leaves out the binding the load seeds, and stops at the instantiation's.
 #[test]
 fn a_load_inside_an_instantiation_reaches_its_own_variable() {
     let v1 = indoc! {r#"
@@ -2332,7 +2331,7 @@ fn a_top_level_load_does_not_reach_inside_an_instantiation() {
         .expect("`total` at the top level names nothing the program holds");
     let rendered = format!("{errors:?}");
     assert!(
-        rendered.contains("`a`.`total` is no longer declared"),
+        rendered.contains("`a`.`count_by()`.`total` is no longer declared"),
         "the refusal should name the address the variable actually has: {rendered}",
     );
 }
@@ -2343,7 +2342,7 @@ fn a_top_level_load_does_not_reach_inside_an_instantiation() {
 ///
 /// A `@LoadFrom` lowers into the binding it seeds, which puts that binding's name
 /// on the site's own chain. Searching outward from the whole chain would make the
-/// innermost candidate `` `held`.`qty` `` — the variable inside `held`'s
+/// innermost candidate `` `held`.`count_by()`.`qty` `` — the variable inside `held`'s
 /// instantiation, which is exactly the address
 /// [`a_top_level_load_does_not_reach_inside_an_instantiation`] says no source can
 /// name. Nothing is ever declared under a load's binding, its definition being
@@ -2378,7 +2377,7 @@ fn a_load_is_not_addressed_under_the_binding_it_seeds() {
     let rendered = format!("{errors:?}");
     assert!(
         rendered.contains("`@LoadFrom(qty)` has no variable to read")
-            && rendered.contains("`held`.`qty` is no longer declared"),
+            && rendered.contains("`held`.`count_by()`.`qty` is no longer declared"),
         "the load should reach nothing, and the variable it did not take should be \
          reported dropped: {rendered}",
     );
@@ -4058,6 +4057,57 @@ fn a_loop_added_ahead_of_a_same_spelled_one_starts_at_its_init() {
     );
 }
 
+/// Two stateful functions called in one binding are told apart by their calls, so a third
+/// added ahead of them in that binding moves neither one's state.
+///
+/// Each body is edited too, so the stores are rebuilt and found by identity rather than kept
+/// whole. Told apart by position, the added `fold_c` would take `fold_a`'s value and `fold_a`
+/// `fold_b`'s.
+#[test]
+fn a_stateful_call_added_ahead_in_one_binding_moves_no_state() {
+    let program = |a: &str, b: &str, r: &str| {
+        formatdoc! {r#"
+            def fold_a(items) => String:
+                n := ""
+                for x in items:
+                    n := n + "{a}"
+                n
+            def fold_b(items) => String:
+                n := ""
+                for x in items:
+                    n := n + "{b}"
+                n
+            def fold_c(items) => String:
+                n := ""
+                for x in items:
+                    n := n + "c"
+                n
+            r = {r}
+            r
+        "#}
+    };
+    let v1 = program(
+        "a",
+        "b",
+        r#"fold_a(["p", "q"]) + "|" + fold_b(["p", "q", "r"])"#,
+    );
+    let v2 = program(
+        "A",
+        "B",
+        r#"fold_c(["p"]) + "|" + fold_a(["p", "q"]) + "|" + fold_b(["p", "q", "r"])"#,
+    );
+    let mut ctx = GlobalContext::default();
+    let mut live = LiveProgram::start_text(&mut ctx, &v1, &no_main).expect("v1 compiles");
+    assert_eq!(drive_main_to_terminal(&mut ctx, &mut live), "aa|bbb");
+    live.reload_text(&mut ctx, MAIN_BRANCH, &v2, &no_main)
+        .expect("each call's state has a store in the new version");
+    assert_eq!(
+        drive_main_to_terminal(&mut ctx, &mut live),
+        "c|aa|bbb",
+        "the added call folds its own list and the others keep their values",
+    );
+}
+
 /// Reordering two same-spelled variables leaves each one's state with it.
 ///
 /// The regression this pins: an index in tree order swaps when the two
@@ -4348,7 +4398,9 @@ fn swapping_two_anonymous_call_sites_is_refused() {
         Err(errors) => format!("{errors:?}"),
     };
     assert!(
-        rendered.contains("`n` and `n` (#1) are told apart only by where they appear"),
+        rendered.contains(
+            "`fold_by()`.`n` and `fold_by()#1`.`n` are told apart only by where they appear",
+        ),
         "the refusal names both declarations, got {rendered}",
     );
     assert!(

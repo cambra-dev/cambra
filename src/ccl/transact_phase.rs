@@ -2902,6 +2902,9 @@ struct MutVarDecl {
     /// and written at a third is the case where reading the seed rejects the program
     /// (`src/ccl/expr.rs`, [`TypedExprNode::MutDecl`]).
     value_ty: Type,
+    /// Where the key is declared, which names its store (`src/ccl/design/sites.md`,
+    /// "Stores").
+    site: Option<std::rc::Rc<crate::ccl::site::Site>>,
 }
 
 /// Locate each mutable variable key's `let` binding and record it (keeping the outermost
@@ -2932,6 +2935,7 @@ fn collect_key_inits(expr: &Expr, keys: &[Name], out: &mut HashMap<Name, MutVarD
                 occurrence: binding.occurrence.id(),
                 init: (**init).clone(),
                 value_ty: mut_var_value_ty(&binding.ty),
+                site: binding.site.clone(),
             },
         );
     }
@@ -3417,8 +3421,11 @@ fn plan_store(
         let mut lam = Expr::lambda(t, Occurrence::mint(), Type::Txn, gpt);
         lam.ty = history_ty(&v);
         // The history binding stands for the key's declaration, so it copies the
-        // declaration's occurrence.
-        let mut history = binding(hist_k, history_ty(&v));
+        // declaration's occurrence, and it takes the declaration's site.
+        let mut history = TypedBinding {
+            site: key_init[k].site.clone(),
+            ..binding(hist_k, history_ty(&v))
+        };
         history.occurrence = Occurrence::copied_from(key_init[k].occurrence);
         hist_bindings.push((history, lam));
     }

@@ -191,7 +191,7 @@ impl Annotation {
 /// observe one (`infer::api::debug_assert_annotations_cleared`). What survives the
 /// clearing is nothing: mutability is answered by
 /// [`TypedExprNode::MutDecl`] being the node that binds one.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct TypedBinding {
     /// The bound variable name. Carries the binder's identity (`uid`) under
     /// the Barendregt convention; see [`Name`].
@@ -224,6 +224,20 @@ pub struct TypedBinding {
     /// Whether a type leaving this binder's scope may read the definiens in the
     /// binder's place. See [`BindingTransparency`].
     pub transparency: BindingTransparency,
+    /// Where the binding is written, for the bindings a mutable variable's store is named by:
+    /// a `for` loop's target and a mutable variable's declaration
+    /// (`src/ccl/design/sites.md`, "Stores"). Passes carry it with the binding, as they carry
+    /// a node's [`TypedExpr::site`]; equality leaves it out.
+    pub site: Option<std::rc::Rc<crate::ccl::site::Site>>,
+}
+
+impl PartialEq for TypedBinding {
+    fn eq(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.ty == other.ty
+            && self.user_annotation == other.user_annotation
+            && self.transparency == other.transparency
+    }
 }
 
 impl TypedBinding {
@@ -238,6 +252,7 @@ impl TypedBinding {
             ty: Type::Hole,
             user_annotation: None,
             transparency: BindingTransparency::Transparent,
+            site: None,
         }
     }
 
@@ -256,6 +271,7 @@ impl TypedBinding {
             ty: Type::Hole,
             user_annotation: Some(annotation),
             transparency: BindingTransparency::Transparent,
+            site: None,
         }
     }
 
@@ -1712,6 +1728,7 @@ impl TypedExpr {
                 ty,
                 user_annotation: None,
                 transparency,
+                site: None,
             },
             bound_expr: Box::new(bound_expr),
             body: Box::new(body),
@@ -1786,10 +1803,21 @@ impl TypedExpr {
                 ty: history,
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             init: Box::new(init),
             body: Box::new(body),
         })
+    }
+
+    /// This mutable variable introduction with its binding written at `site`
+    /// ([`TypedBinding::site`]).
+    pub fn declared_at(mut self, site: std::rc::Rc<crate::ccl::site::Site>) -> Self {
+        let TypedExprNode::MutDecl { binding, .. } = &mut self.node else {
+            panic!("only a mutable variable introduction is declared at a site");
+        };
+        binding.site = Some(site);
+        self
     }
 
     /// Construct an annotated let binding expression.
@@ -1971,6 +1999,7 @@ impl TypedExpr {
                 ty: param_ty,
                 user_annotation: None,
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             body: Box::new(body),
         })
@@ -2928,6 +2957,9 @@ pub struct TransactKey {
     /// is `Fun(domain, V)`; a trailing read samples its value `V` where the store finishes
     /// (`final_read(history)`), which is `init` when the mutable variable ran zero positions.
     pub init: TypedExpr,
+    /// The site that names the key's store: an induction store's loop, a transactional
+    /// store's declaration (`src/ccl/design/sites.md`, "Stores").
+    pub site: Option<std::rc::Rc<crate::ccl::site::Site>>,
 }
 
 /// One writer of a [`TypedExprNode::Transact`] — loop-shaped, mirroring a
@@ -3207,6 +3239,7 @@ mod tests {
                     Occurrence::mint(),
                 )),
                 transparency: BindingTransparency::Transparent,
+                site: None,
             },
             body: Box::new(TypedExpr::lit(Lit::Unit)),
         });

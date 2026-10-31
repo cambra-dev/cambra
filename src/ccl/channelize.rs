@@ -2276,6 +2276,7 @@ fn channelize_cluster(
                     ty: channel.ty.clone(),
                     user_annotation: None,
                     transparency: BindingTransparency::Transparent,
+                    site: None,
                 },
                 channel,
             ));
