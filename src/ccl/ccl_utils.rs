@@ -1243,6 +1243,7 @@ pub(crate) fn chain_type(elts: &[Expr], fun_kind: crate::ccl::ty::FunKind) -> Ty
             fun_kind,
             domain: Box::new(head_domain),
             codomain: Box::new(last_codomain),
+            effects: crate::ccl::effects::Effects::none(),
         },
     )
 }
@@ -1350,6 +1351,7 @@ fn without_unread_binder(stated: Type, elts: &[Expr]) -> Type {
         fun_kind,
         domain,
         codomain,
+        effects,
     } = &stated
     else {
         return stated;
@@ -1367,6 +1369,7 @@ fn without_unread_binder(stated: Type, elts: &[Expr]) -> Type {
         fun_kind: fun_kind.clone(),
         domain: domain.clone(),
         codomain: codomain.clone(),
+        effects: effects.clone(),
     }
 }
 
@@ -1800,6 +1803,7 @@ pub fn refined_data_fun(
             Refinement::born(Rc::new(predicate)),
         )),
         codomain: Box::new(codomain),
+        effects: crate::ccl::effects::Effects::none(),
     }
 }
 

@@ -594,6 +594,7 @@ fn coalesce_compact_go(
                     fun_kind: crate::ccl::ty::FunKind::Compute,
                     domain: Box::new(sole.clone()),
                     codomain: Box::new(c),
+                    effects: crate::ccl::effects::Effects::known((*cf.effects).clone()),
                 });
             }
             KindPin::Data | KindPin::Plain | KindPin::Sum(_) => {
@@ -629,6 +630,7 @@ fn coalesce_compact_go(
                     },
                     domain: Box::new(domains[0].clone()),
                     codomain: Box::new(c),
+                    effects: crate::ccl::effects::Effects::none(),
                 });
             }
         }
@@ -649,6 +651,7 @@ fn coalesce_compact_go(
             fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(coalesce_compact_go(&history.domain, polarity, scope)?),
             codomain: Box::new(value),
+            effects: crate::ccl::effects::Effects::none(),
         };
         shapes.push(Type::history_over(function, history.kind));
     }
@@ -828,6 +831,7 @@ fn dissolve_read_feeds(mut ct: CompactType, polarity: bool) -> CompactType {
                 binders: Vec::new(),
                 // A feed's read view is a collection: a data function.
                 kind: super::compact::KindPin::Data,
+                effects: Default::default(),
                 // A read view is over its channel domain, not over an index of its own.
                 domains_disagree: false,
                 domain,
@@ -1009,7 +1013,8 @@ mod tests {
                 name: None,
                 fun_kind: crate::ccl::ty::FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
-                codomain: Box::new(Type::Base(BaseType::Bool))
+                codomain: Box::new(Type::Base(BaseType::Bool)),
+                effects: crate::ccl::effects::Effects::none(),
             }
         );
     }
@@ -1023,6 +1028,7 @@ mod tests {
             term: CompactType {
                 fun: Some(CompactFun {
                     binders: Vec::new(),
+                    effects: Default::default(),
                     name: None,
                     kind: KindPin::Data,
                     domains_disagree: false,
@@ -1042,6 +1048,7 @@ mod tests {
                 fun_kind: crate::ccl::ty::FunKind::Data(None),
                 domain: Box::new(Type::UIntRange(2)),
                 codomain: Box::new(Type::Base(BaseType::Int)),
+                effects: crate::ccl::effects::Effects::none(),
             }
         );
     }
@@ -1058,6 +1065,7 @@ mod tests {
             term: CompactType {
                 fun: Some(CompactFun {
                     binders: Vec::new(),
+                    effects: Default::default(),
                     name: None,
                     kind: KindPin::Plain,
                     domains_disagree: true,
@@ -1094,6 +1102,7 @@ mod tests {
             term: CompactType {
                 fun: Some(CompactFun {
                     binders: Vec::new(),
+                    effects: Default::default(),
                     name: None,
                     kind: KindPin::Conflict,
                     domains_disagree: false,

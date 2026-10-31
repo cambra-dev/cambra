@@ -6,6 +6,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 
 use crate::ccl::ccl_utils::TermMemo;
+use crate::ccl::effects::{EffectVar, Effects, Filter, Item, Label, Repr, Requirement};
 use crate::ccl::infer::solver::barrier::EdgeReport;
 use crate::ccl::infer::solver::display::poly_for_display;
 use crate::ccl::infer::solver::smt::{NoScope, ScopeEnv};
@@ -133,6 +134,11 @@ pub(super) struct InferCtx {
     /// The program's trait instances, from which every obligation emission mints takes
     /// its candidates.
     pub(super) instances: Rc<InstanceTable>,
+    /// The function bodies under emission, innermost last, above the module's top level
+    /// (`src/ccl/design/type-inference.md`, "Effect variables").
+    effect_frames: Vec<EffectFrame>,
+    /// Where each mutable variable and feed in scope is bound, for the label that names it.
+    effect_binders: HashMap<Name, EffectBinder>,
     /// Lexical scope: name → [`Binding`] for in-scope variables and let-bound
     /// names. Lambda params and `Case`/`Loop` binders bind monomorphically; a
     /// polymorphic `let` additionally stashes its typed definition subtree so
@@ -284,9 +290,50 @@ struct LoopSource {
 /// A [`DefGroup`](crate::ccl::TypedExprNode::DefGroup) under emission: what its members are
 /// emitted at, wherever a reference first needs one (`src/ccl/design/nominal-types.md`,
 /// "Associated functions").
+/// A function body, or the module's top level, under emission: the variable collecting
+/// what it requires and causes.
+struct EffectFrame {
+    var: Rc<EffectVar>,
+    /// How many function bodies enclose this one, 0 for the top level.
+    depth: u32,
+    /// How many `with begin():` bodies inside this function enclose the emission.
+    transactions: u32,
+}
+
+impl EffectFrame {
+    /// What an edge into this frame's variable lets through: nothing naming a variable
+    /// the frame's own body binds, and no `Transaction` inside a `with begin():` body.
+    fn filter(&self) -> Filter {
+        Filter {
+            when_data: None,
+            below: Some(self.depth),
+            discharges: if self.transactions > 0 {
+                [Requirement::Transaction].into_iter().collect()
+            } else {
+                Default::default()
+            },
+        }
+    }
+}
+
+/// Where a mutable variable or feed is bound, for the [`Label`] naming it.
+#[derive(Clone, Copy)]
+struct EffectBinder {
+    depth: u32,
+    /// A parameter's history is its argument's, so the call records what is done to it
+    /// and the callee records nothing (`docs/chl-spec.md`, "Discharging requirements and
+    /// effects").
+    parameter: bool,
+    /// A transactional mutable variable belongs to its run, so no scope's end discharges
+    /// its writes, and reading or writing it requires `Transaction`.
+    transactional: bool,
+}
+
 pub(super) struct OpenGroup {
     /// The scope the group's members are bound in.
     pub(super) depth: usize,
+    /// How many effect frames were open where the group stands.
+    effect_frames: usize,
     /// The emission position the group stands at: its level, its telescope, which has every
     /// member's name entered, the `Poly` parameters open there, and its assumptions.
     level: Level,
@@ -429,7 +476,68 @@ impl InferCtx {
             groups: Vec::new(),
             trait_calls: HashMap::new(),
             recoveries: 0,
+            effect_frames: vec![EffectFrame {
+                var: EffectVar::fresh(0),
+                depth: 0,
+                transactions: 0,
+            }],
+            effect_binders: HashMap::new(),
         }
+    }
+
+    fn effect_frame(&self) -> &EffectFrame {
+        self.effect_frames
+            .last()
+            .expect("the top level's frame stays open through emission")
+    }
+
+    /// Record where `name` is bound, at the innermost function body, when `ty` is a
+    /// mutable variable's or a feed's. `declares` is false for a parameter, whose history
+    /// is its argument's.
+    fn bind_effect_name(&mut self, name: &Name, ty: &Type, declares: bool) {
+        if let Some((domain, _, history_kind)) = ty.history_parts() {
+            let transactional = declares
+                && matches!(history_kind, crate::ccl::ty::HistoryKind::Overwrite)
+                && matches!(domain, Type::Txn);
+            let depth = self.effect_frame().depth;
+            self.effect_binders.insert(
+                name.clone(),
+                EffectBinder {
+                    depth,
+                    parameter: !declares,
+                    transactional,
+                },
+            );
+        }
+    }
+
+    /// Settle where a function body's labels go, by the kind of the function it is the body
+    /// of. A collection runs where it is built, so its labels are the enclosing body's, as a
+    /// call's are. A function's stay latent in its type. A kind still a variable decides
+    /// once it resolves.
+    fn settle_by_kind(&mut self, var: &Rc<EffectVar>, kind: Option<&crate::ccl::ty::FunKind>) {
+        let outer = self.effect_frame();
+        let filter = outer.filter();
+        match kind {
+            Some(crate::ccl::ty::FunKind::Data(_)) => outer.var.flows_from(var, filter),
+            Some(crate::ccl::ty::FunKind::Var(kind)) => outer.var.flows_from(
+                var,
+                Filter {
+                    when_data: Some(Rc::clone(kind)),
+                    ..filter
+                },
+            ),
+            Some(crate::ccl::ty::FunKind::Compute) | None => {}
+        }
+    }
+
+    /// The effects a call site expects of its callee: a fresh variable whose labels flow
+    /// into the enclosing function body's, through the body's filter.
+    fn call_effects(&mut self) -> Effects {
+        let call = EffectVar::fresh(self.level);
+        let frame = self.effect_frame();
+        frame.var.flows_from(&call, frame.filter());
+        Effects::var(call)
     }
 
     /// Open a scope for the members of a group about to be emitted, standing at the current
@@ -449,6 +557,7 @@ impl InferCtx {
         self.scopes.push_scope();
         self.groups.push(OpenGroup {
             depth: self.scopes.depth() - 1,
+            effect_frames: self.effect_frames.len(),
             level: self.level,
             telescope: self.telescope.clone(),
             opened_params: self.opened_params.len(),
@@ -475,6 +584,7 @@ impl InferCtx {
     pub(super) fn at_group<R>(&mut self, g: usize, f: impl FnOnce(&mut Self) -> R) -> R {
         let group = &self.groups[g];
         let suspended = self.scopes.suspend_above(group.depth + 1);
+        let frames = self.effect_frames.split_off(group.effect_frames);
         let level = std::mem::replace(&mut self.level, group.level);
         let telescope = std::mem::replace(&mut self.telescope, group.telescope.clone());
         let params = self.opened_params.split_off(group.opened_params);
@@ -482,6 +592,7 @@ impl InferCtx {
         let demand_at = self.demand_at.take();
         let r = f(self);
         self.scopes.resume(suspended);
+        self.effect_frames.extend(frames);
         self.level = level;
         self.telescope = telescope;
         self.opened_params.extend(params);
@@ -884,6 +995,7 @@ impl InferCtx {
                 fun_kind,
                 domain: d,
                 codomain: c,
+                effects,
             } => {
                 let cod_telescope = match name {
                     Some(b) => telescope.extended(b.clone()),
@@ -912,6 +1024,7 @@ impl InferCtx {
                     },
                     domain: Box::new(self.normalize_domain(d, telescope)),
                     codomain: Box::new(self.normalize_annotation_in(c, &cod_telescope)),
+                    effects: effects.clone(),
                 }
             }
             Type::Tuple(ts) => Type::Tuple(
@@ -1146,6 +1259,7 @@ impl InferCtx {
                 poisoned: false,
             },
         );
+        self.bind_effect_name(name, ty, false);
         let r = self.under_binder(name, f);
         self.scopes.pop_scope();
         self.scope_exits.get_mut(name).and_then(Vec::pop);
@@ -1354,6 +1468,7 @@ impl InferCtx {
             fun_kind: crate::ccl::ty::FunKind::Data(None),
             domain: Box::new(self.fresh()),
             codomain: Box::new(Type::Infer(element)),
+            effects: Effects::none(),
         };
         self.require_sub(&contribution, channel, at)
     }
@@ -1754,6 +1869,96 @@ impl Typing for InferCtx {
         self.scoped_exiting(name, ty, ScopeExit::Join, f)
     }
 
+    fn function_body<R>(
+        &mut self,
+        recorded: &Type,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> (R, Effects) {
+        let var = EffectVar::fresh(self.level);
+        let depth = self.effect_frame().depth + 1;
+        self.effect_frames.push(EffectFrame {
+            var: Rc::clone(&var),
+            depth,
+            transactions: 0,
+        });
+        let r = f(self);
+        self.effect_frames.pop();
+        self.settle_by_kind(&var, recorded.fun_kind());
+        (r, Effects::var(var))
+    }
+
+    fn composed_effects(&mut self, recorded: &Type, parts: &[Type]) -> Effects {
+        let var = EffectVar::fresh(self.level);
+        for part in parts {
+            if let Type::Fun { effects, .. } = part.peel_refinements() {
+                match effects.repr() {
+                    Repr::Var(v) => var.flows_from(v, Filter::default()),
+                    Repr::Known(_) => {
+                        for label in Effects::labels_of(effects) {
+                            var.record(label);
+                        }
+                    }
+                }
+            }
+        }
+        self.settle_by_kind(&var, recorded.fun_kind());
+        Effects::var(var)
+    }
+
+    fn record_effect(&mut self, item: Item, name: Option<&Name>) {
+        let binder = name.and_then(|n| self.effect_binders.get(n).copied());
+        if binder.is_some_and(|b| b.parameter) {
+            return;
+        }
+        let label = Label {
+            item,
+            bound_at: binder.filter(|b| !b.transactional).map(|b| b.depth),
+        };
+        let frame = self.effect_frame();
+        if frame.filter().admits(&label) {
+            frame.var.record(label);
+        }
+    }
+
+    fn record_transactional_access(&mut self, name: &Name) {
+        if self
+            .effect_binders
+            .get(name)
+            .is_some_and(|b| b.transactional)
+        {
+            self.record_effect(Item::Requires(Requirement::Transaction), None);
+        }
+    }
+
+    fn record_read(&mut self, name: &Name) {
+        match self.effect_binders.get(name) {
+            Some(binder) if binder.transactional => {
+                self.record_effect(Item::Requires(Requirement::Transaction), None);
+            }
+            Some(_) => {
+                self.record_effect(Item::Requires(Requirement::Read(name.clone())), Some(name))
+            }
+            None => {}
+        }
+    }
+
+    fn declare_mutable(&mut self, name: &Name, ty: &Type) {
+        self.bind_effect_name(name, ty, true);
+    }
+
+    fn transaction_body<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.effect_frames
+            .last_mut()
+            .expect("the top level's frame stays open through emission")
+            .transactions += 1;
+        let r = f(self);
+        self.effect_frames
+            .last_mut()
+            .expect("the top level's frame stays open through emission")
+            .transactions -= 1;
+        r
+    }
+
     fn in_let_rhs<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
         // Mint RHS-local variables one level deeper than the defining scope,
         // so generalization at the binding site (the outer level) quantifies
@@ -1854,6 +2059,7 @@ impl Typing for InferCtx {
             .push(exit);
         self.scopes.push_scope();
         self.scopes.bind(binding.name.clone(), entry);
+        self.bind_effect_name(&binding.name, &binding.ty, true);
         let r = self.under_binder(&binding.name, f);
         self.scopes.pop_scope();
         r
@@ -2062,6 +2268,7 @@ impl Typing for InferCtx {
             }
             _ => Type::pi_eliminated(&x, d.clone(), result.clone()),
         };
+        let expected = expected.with_effects(self.call_effects());
         self.require_sub(fn_ty, &expected, at)?;
         self.constrain_argument(arg_ty, &expected, at)?;
         // The application's type is `result` with the binder discharged to the

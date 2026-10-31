@@ -1011,6 +1011,7 @@ fn erase_chan_domains_in_type(
             fun_kind: fun_kind.unwrap_or(FunKind::Data(None)),
             domain,
             codomain: value,
+            effects: crate::ccl::effects::Effects::none(),
         };
         erase_chan_domains_in_type(ty, map, kinds);
         return true;
@@ -3666,6 +3667,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::refined_one(Type::Hole, refinement)),
             codomain: Box::new(Type::Hole),
+            effects: crate::ccl::effects::Effects::none(),
         });
         let free = crate::ccl::ccl_utils::free_reads(&typed);
         assert!(

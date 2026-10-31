@@ -513,6 +513,7 @@ pub(crate) mod test_helpers {
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            effects: crate::ccl::effects::Effects::none(),
         }
     }
 

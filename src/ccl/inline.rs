@@ -1792,6 +1792,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            effects: crate::ccl::effects::Effects::none(),
         };
         assert!(should_inline(&ty));
     }
@@ -1810,7 +1811,9 @@ mod tests {
                 fun_kind: FunKind::Compute,
                 domain: Box::new(Type::Base(BaseType::Int)),
                 codomain: Box::new(Type::Base(BaseType::Int)),
+                effects: crate::ccl::effects::Effects::none(),
             }),
+            effects: crate::ccl::effects::Effects::none(),
         };
         assert!(should_inline(&ty));
     }
@@ -1828,12 +1831,14 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            effects: crate::ccl::effects::Effects::none(),
         };
         let ty = Type::Fun {
             name: None,
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::Base(BaseType::Int)),
             codomain: Box::new(Type::refined_one(inner_fun, refinement)),
+            effects: crate::ccl::effects::Effects::none(),
         };
         assert!(should_inline(&ty));
     }
@@ -1848,6 +1853,7 @@ mod tests {
             fun_kind: FunKind::Data(None),
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            effects: crate::ccl::effects::Effects::none(),
         };
         assert!(!should_inline(&ty));
     }
@@ -1862,6 +1868,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(Type::UIntRange(3)),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            effects: crate::ccl::effects::Effects::none(),
         };
         assert!(should_inline(&ty));
     }
@@ -1877,6 +1884,7 @@ mod tests {
                 Type::Base(BaseType::Int),
             ])),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            effects: crate::ccl::effects::Effects::none(),
         };
         assert!(should_inline(&ty));
     }
@@ -1893,6 +1901,7 @@ mod tests {
                 Type::Base(BaseType::Int),
             ])),
             codomain: Box::new(Type::Base(BaseType::Int)),
+            effects: crate::ccl::effects::Effects::none(),
         };
         assert!(should_inline(&ty));
     }
@@ -2171,6 +2180,7 @@ mod tests {
             fun_kind: FunKind::Compute,
             domain: Box::new(domain),
             codomain: Box::new(codomain),
+            effects: crate::ccl::effects::Effects::none(),
         }
     }
 

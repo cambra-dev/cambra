@@ -1,4 +1,6 @@
-large-error-threshold = 144
+# An inference error carries two `Type`s, and a function type carries its effects, which puts
+# `LocatedInferError` at 144 bytes.
+large-error-threshold = 152
 
 # `WitnessId` hashes and orders on `(spelling, uid, position)` — plain integers. A
 # `Pending` reaches a `FunKindVar`'s `RefCell` through an `Rc`, and nothing that keys a
