@@ -793,7 +793,7 @@ fn a_misused_import_argument_is_refused(#[case] root: &str, #[case] needle: &str
 }
 
 /// Importing a module that performs IO is an error at the `import`, pointing at
-/// the IO (`docs/chl-spec.md`, "9.7 Importing asserts no IO and no state"): a sink it
+/// the IO (`docs/chl-spec.md`, "9.7 Importing asserts a shareable module"): a sink it
 /// binds, or a source it reads.
 #[rstest]
 #[case::a_sink(indoc! {"
@@ -822,7 +822,7 @@ fn importing_a_module_that_performs_io_is_refused(#[case] audit: &str, #[case] i
 
 /// Importing a module that declares mutable state is an error at the `import`,
 /// pointing at the state: a module with state is run, not imported
-/// (`docs/chl-spec.md`, "9.7 Importing asserts no IO and no state").
+/// (`docs/chl-spec.md`, "9.7 Importing asserts a shareable module").
 #[rstest]
 #[case::transactional_variable("pub stock: Mut(Int, Txn) := 0\n")]
 #[case::private_variable(indoc! {"
@@ -916,7 +916,7 @@ fn an_imported_function_feeds_the_callers_feed(
 
 /// A loop passes its induction variable to another module's functions with a `Mut`
 /// parameter, by qualified name and through `use` (`docs/chl-spec.md`, "9.7 Importing
-/// asserts no IO and no state").
+/// asserts a shareable module").
 #[rstest]
 #[case::qualified("import counter\n", "counter::bump", "counter::add")]
 #[case::used("import counter use bump, add\n", "bump", "add")]
@@ -1067,7 +1067,7 @@ fn a_reference_into_a_module_with_errors_adds_no_error(#[case] root: &str) {
 
 /// A module two others import is evaluated once: its bindings stand once in the
 /// linked tree, ahead of both importers' (`docs/chl-spec.md`, "9.7 Importing
-/// asserts no IO and no state").
+/// asserts a shareable module").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn an_imported_module_is_linked_once() {

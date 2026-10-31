@@ -468,7 +468,7 @@ fn discard_marks_a_variable_or_a_run() {
 }
 
 /// An imported module holds no state, so `@Discard` has nothing to mark gone on
-/// an `import` (`docs/chl-spec.md`, "9.7 Importing asserts no IO and no state").
+/// an `import` (`docs/chl-spec.md`, "9.7 Importing asserts a shareable module").
 #[test]
 fn discard_does_not_mark_an_import() {
     assert!(

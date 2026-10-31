@@ -1055,7 +1055,7 @@ impl<'a> ProgramLowering<'a> {
 
     /// Whether the module in `file` can be imported for its statements: an
     /// imported module declares no `run`, since the import would reach the run's
-    /// state (`docs/chl-spec.md`, "9.7 Importing asserts no IO and no state"), and
+    /// state (`docs/chl-spec.md`, "9.7 Importing asserts a shareable module"), and
     /// no statement but a value binding, a `def`, a type alias, an `import`, or
     /// `pass`. Each refusal is reported once, at the statement.
     pub(super) fn importable(&mut self, file: FileId) -> bool {

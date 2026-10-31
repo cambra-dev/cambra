@@ -683,7 +683,7 @@ fn instance_prefix(trait_: &str, at: usize) -> String {
 }
 
 /// A loop over a collection not keyed by position, whose iteration order is not defined
-/// (`docs/chl-spec.md`, "Accumulator iteration order is not yet defined [Open]").
+/// (`docs/chl-spec.md`, "Ordered loops").
 ///
 /// An iteration's effects that outlive it make the loop's result depend on that order: a write
 /// to a cell made before the loop began, and a commit, which takes the next commit time. The
@@ -1674,9 +1674,9 @@ impl Interp {
                 let Value::Collection(c) = source else {
                     return err("a `for` loop iterates a collection");
                 };
-                // Iteration order is `[Open]` (`docs/chl-spec.md`, "Accumulator iteration order
-                // is not yet defined [Open]"). Both sides run a list in index order, so a loop
-                // runs over integer keys ascending. Over any other key it runs under an
+                // An ordered loop runs in its source's position order (`docs/chl-spec.md`,
+                // "Ordered loops"). Both sides run a list in index order, so a loop runs over
+                // integer keys ascending. Over any other key it runs under an
                 // [`OrderWatch`], and is refused if an iteration had an effect that outlives
                 // it, or returned while another iteration might have returned first. The
                 // compiler refuses an accumulating loop over an integer-keyed collection that
