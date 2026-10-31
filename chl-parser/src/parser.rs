@@ -272,6 +272,24 @@ where
             .then_ignore(just(Token::RParen))
             .map_with(|fields, e| Spanned::new(e.span(), Expr::Record(fields)));
 
+        // A binder in a type, `k: K`: a function type's parenthesised domain. A name
+        // followed by `:` begins no other expression, so the alternative commits only once
+        // the colon is seen.
+        let type_binder = select! { Token::Ident(s) => s }
+            .map_with(|s, e| Spanned::new(e.span(), s))
+            .then_ignore(just(Token::Colon))
+            .then(bracketed_expr.clone())
+            .map_with(|(name, ty), e| {
+                Spanned::new(
+                    e.span(),
+                    Expr::TypeBinder {
+                        name,
+                        ty: Box::new(ty),
+                    },
+                )
+            })
+            .boxed();
+
         // Parenthesised expression / tuple / record / generator expression.
         let paren_group = just(Token::LParen)
             .ignore_then(choice((
@@ -279,6 +297,10 @@ where
                 just(Token::RParen).map_with(|_, e| Spanned::new(e.span(), Expr::Tuple(vec![]))),
                 // Record value `(name=value, …)`.
                 paren_record,
+                // The domain of a dependent function type, `(k: K)`.
+                type_binder
+                    .then_ignore(just(Token::RParen))
+                    .map_with(|binder, e| Spanned::new(e.span(), binder.node)),
                 bracketed_expr
                     .clone()
                     .then(choice((
@@ -1091,8 +1113,9 @@ where
                 name,
                 name_span,
                 annotation,
-            })
-            .try_map(|param, _| type_param(param));
+            });
+        // Capitalized binders make a polymorphic type and lowercase ones a family
+        // (`docs/chl-spec.md`, "Family parameters"); one `forall` binds one or the other.
         let forall = just(Token::Forall)
             .ignore_then(
                 forall_param
@@ -1100,19 +1123,33 @@ where
                     .at_least(1)
                     .allow_trailing()
                     .collect::<Vec<_>>()
-                    .delimited_by(just(Token::LParen), just(Token::RParen)),
+                    .delimited_by(just(Token::LParen), just(Token::RParen))
+                    .try_map(|params, _| forall_binders(params)),
             )
             .then(expr.clone())
             .then(requires_clause(expr.clone()).or_not())
-            .map_with(|((type_params, body), requires), e| {
-                Spanned::new(
-                    e.span(),
-                    Expr::Forall {
-                        type_params,
-                        body: Box::new(body),
-                        requires: requires.unwrap_or_default(),
-                    },
-                )
+            .validate(|((binders, body), requires), e, emitter| {
+                let body = Box::new(body);
+                match binders {
+                    ForallBinders::Types(type_params) => Spanned::new(
+                        e.span(),
+                        Expr::Forall {
+                            type_params,
+                            body,
+                            requires: requires.unwrap_or_default(),
+                        },
+                    ),
+                    ForallBinders::Values(binders) => {
+                        if let Some(r) = requires.as_deref().and_then(<[_]>::first) {
+                            emitter.emit(Rich::custom(
+                                r.span,
+                                "a family, `forall (k: K) V`, takes no `requires` clause: a \
+                                 requirement constrains type parameters",
+                            ));
+                        }
+                        Spanned::new(e.span(), Expr::Family { binders, body })
+                    }
+                }
             })
             .boxed();
 
@@ -1805,10 +1842,18 @@ where
                 .then_ignore(just(Token::Dedent))
                 .map(TypeDeclBody::Constructors),
         ));
+        // A parameter with its kind, `V: K => Type`, as a `forall` writes one.
+        let type_decl_param = binder
+            .then(just(Token::Colon).ignore_then(expr.clone()).or_not())
+            .map(|(name, kind)| TypeParam {
+                name: name.node,
+                name_span: name.span,
+                annotation: kind.map(KindAnnotation::Kind),
+            });
         let type_stmt = just(Token::Type)
             .ignore_then(binder)
             .then(
-                binder
+                type_decl_param
                     .separated_by(just(Token::Comma))
                     .at_least(1)
                     .allow_trailing()
@@ -1819,16 +1864,18 @@ where
             )
             .then(type_body)
             .validate(|((name, params), body), e, emitter| {
-                let heads = std::iter::once((&name, "type name"))
-                    .chain(params.iter().map(|p| (p, "type parameter")));
-                for (head, what) in heads {
-                    if !is_type_name(&head.node) {
+                let heads = std::iter::once((&name.node, name.span, "type name")).chain(
+                    params
+                        .iter()
+                        .map(|p| (&p.name, p.name_span, "type parameter")),
+                );
+                for (head, span, what) in heads {
+                    if !is_type_name(head) {
                         emitter.emit(Rich::custom(
-                            head.span,
+                            span,
                             format!(
-                                "{what} `{}` begins with a lowercase letter; a type's name \
-                                 is capitalized",
-                                head.node
+                                "{what} `{head}` begins with a lowercase letter; a type's name \
+                                 is capitalized"
                             ),
                         ));
                     }
@@ -2576,6 +2623,56 @@ fn split_params<'src>(
     Ok((type_params, params))
 }
 
+/// What a `forall`'s binder list binds: type parameters, capitalized, or the values a family
+/// ranges over, lowercase and each with its type.
+enum ForallBinders {
+    Types(Vec<TypeParam>),
+    Values(Vec<(Spanned<SmolStr>, Spanned<Expr>)>),
+}
+
+/// Read a `forall`'s binder list: type parameters, `forall (T, U <: B) V`, or a family's
+/// binders, `forall (k: K) V`, but not both.
+///
+/// Spec: `docs/chl-spec.md`, "Polymorphic type annotations" and "Family parameters".
+fn forall_binders<'src>(params: Vec<Param>) -> Result<ForallBinders, Rich<'src, Token, Span>> {
+    if params.iter().all(|p| is_type_name(&p.name)) {
+        return params
+            .into_iter()
+            .map(type_param)
+            .collect::<Result<Vec<_>, _>>()
+            .map(ForallBinders::Types);
+    }
+    if let Some(first) = params.iter().find(|p| is_type_name(&p.name)) {
+        return Err(Rich::custom(
+            first.name_span,
+            format!(
+                "`{}` is capitalized and a binder beside it is not: a `forall` binds type \
+                 parameters, `forall (T) V`, or the values a family ranges over, \
+                 `forall (k: K) V`, but not both",
+                first.name
+            ),
+        ));
+    }
+    params
+        .into_iter()
+        .map(|p| match p.annotation {
+            Some(TypeAnnotation {
+                mode: AnnotationMode::Exact,
+                ty,
+            }) => Ok((Spanned::new(p.name_span, p.name), ty)),
+            _ => Err(Rich::custom(
+                p.name_span,
+                format!(
+                    "`{0}` is not capitalized, so it is not a type parameter, and a family's \
+                     binder states the type it ranges over: `forall ({0}: K) V`",
+                    p.name
+                ),
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(ForallBinders::Values)
+}
+
 /// Read a parameter as a type parameter: its name must be capitalized, and its
 /// annotation is its kind, `T: K`, or its bound, `T <: U`.
 ///
@@ -2999,7 +3096,7 @@ mod tests {
             panic!("expected a type declaration, got {:?}", m.body[0].node)
         };
         assert_eq!(decl.name.node, "Shape");
-        let params: Vec<_> = decl.params.iter().map(|p| p.node.as_str()).collect();
+        let params: Vec<_> = decl.params.iter().map(|p| p.name.as_str()).collect();
         assert_eq!(params, ["T"]);
         let TypeDeclBody::Constructors(ctors) = &decl.body else {
             panic!("expected constructor lines, got {:?}", decl.body)
@@ -3241,6 +3338,43 @@ mod tests {
         };
         assert_eq!(decl.name.node, "Price");
         assert!(matches!(decl.body, TypeDeclBody::Single(_)));
+    }
+
+    /// A parameter written `V: K => Type` states its kind; one written `K` states none.
+    #[test]
+    fn a_type_declaration_parameter_may_state_its_kind() {
+        let m = parse_m("type Groups(K, V: K => Type) = (k: K) |=> V(k)\n");
+        let Stmt::TypeDecl(decl) = &m.body[0].node else {
+            panic!("expected a type declaration, got {:?}", m.body[0].node)
+        };
+        let params: Vec<_> = decl
+            .params
+            .iter()
+            .map(|p| (p.name.as_str(), p.annotation.is_some()))
+            .collect();
+        assert_eq!(params, [("K", false), ("V", true)]);
+        let TypeDeclBody::Single(body) = &decl.body else {
+            panic!("expected the single-constructor form, got {:?}", decl.body)
+        };
+        let Expr::FunctionType { domain, .. } = &body.node else {
+            panic!("expected a function type, got {:?}", body.node)
+        };
+        assert!(
+            matches!(domain.node, Expr::TypeBinder { .. }),
+            "the domain `(k: K)` is a binder, got {:?}",
+            domain.node
+        );
+    }
+
+    /// Lowercase binders make a `forall` a family, capitalized ones a polymorphic type.
+    #[test]
+    fn a_forall_over_values_is_a_family() {
+        let Expr::Family { binders, .. } = parse_e("forall (a: A, b: B) V(a, b)").node else {
+            panic!("expected a family");
+        };
+        let names: Vec<_> = binders.iter().map(|(n, _)| n.node.as_str()).collect();
+        assert_eq!(names, ["a", "b"]);
+        assert!(matches!(parse_e("forall (T) T").node, Expr::Forall { .. }));
     }
 
     /// A type's name and parameters are capitalized and its constructors are not, and each
@@ -4951,10 +5085,20 @@ mod tests {
         ));
     }
 
+    /// A `forall` binds type parameters or a family's values, and a family's binder states the
+    /// type it ranges over.
     #[test]
-    fn forall_binds_only_type_parameters() {
+    fn forall_binds_type_parameters_or_a_familys_values() {
         let msg = custom_error("f: forall (x) Int = 1");
-        assert!(msg.contains("`forall` binds only type parameters"), "{msg}");
+        assert!(
+            msg.contains("`x` is not capitalized, so it is not a type parameter"),
+            "{msg}"
+        );
+        let msg = custom_error("f: forall (k: K, T) T = 1");
+        assert!(
+            msg.contains("`T` is capitalized and a binder beside it is not"),
+            "{msg}"
+        );
     }
 
     #[test]

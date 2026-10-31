@@ -105,9 +105,10 @@ pub struct NominalDecl {
     pub module: Vec<SmolStr>,
     /// The name the declaration binds.
     pub name: SmolStr,
-    /// The type parameters, declared ([`TypeParam::declared`]). A constructor's parameter
-    /// types name them; [`NominalDecl::instantiate`] replaces them with an application's
-    /// arguments.
+    /// The type parameters, declared ([`TypeParam::declared`]), or [`TypeParam::declared_family`]
+    /// for a family parameter. A constructor's parameter types name them;
+    /// [`NominalDecl::instantiate`] replaces them with an application's arguments, a family
+    /// parameter's argument a [`Type::Family`].
     pub params: Vec<Rc<TypeParam>>,
     /// The declaration's name, for diagnostics naming it.
     pub span: Span,
@@ -116,6 +117,13 @@ pub struct NominalDecl {
     pub declares_extract: bool,
     /// Shared with every instance of the declaration ([`NominalDecl::substituted`]).
     body: Rc<OnceCell<NominalBody>>,
+    /// One per type parameter: the index types of a family parameter, `K` in `V: K => Type`,
+    /// one per term it is applied to, and none for any other (`src/ccl/design/
+    /// nominal-types.md`, "Family parameters"). They name the parameters that are not
+    /// families. Set once the module's aliases are declared, before any constructor lowers,
+    /// since a constructor's type may apply another declaration of the module. Shared with
+    /// every instance.
+    family_domains: Rc<OnceCell<Vec<Vec<Type>>>>,
     /// The type parameters of the declaring module that the type reaches, through its
     /// constructors and its associated functions, set once that module has lowered. With
     /// the module's path and the type's name, their arguments identify the type
@@ -376,6 +384,7 @@ impl NominalDecl {
             span,
             declares_extract,
             body: Rc::new(OnceCell::new()),
+            family_domains: Rc::new(OnceCell::new()),
             implicit: Rc::new(OnceCell::new()),
             implicit_args: None,
             implicit_consts: Rc::new(OnceCell::new()),
@@ -499,6 +508,7 @@ impl NominalDecl {
             span: self.span,
             declares_extract: self.declares_extract,
             body: Rc::clone(&self.body),
+            family_domains: Rc::clone(&self.family_domains),
             implicit: Rc::clone(&self.implicit),
             implicit_args: self.implicit_args.clone(),
             implicit_consts: Rc::clone(&self.implicit_consts),
@@ -507,14 +517,104 @@ impl NominalDecl {
     }
 
     /// `self` applied to its own type parameters: the type of `self` inside a function
-    /// the declaration declares, such as `extract`.
-    pub fn applied_to_params(self: &Rc<Self>) -> Type {
+    /// the declaration declares, such as `extract`. A family parameter is passed as the family
+    /// it applies to its binders, `forall (k: K) V(k)`, each term of which `mint` makes from the
+    /// binder and its type.
+    pub fn applied_to_params(
+        self: &Rc<Self>,
+        mint: &mut dyn FnMut(Name, Type) -> crate::ccl::Expr,
+    ) -> Type {
         let args = self
             .params
             .iter()
-            .map(|p| Type::Param(Rc::clone(p)))
+            .enumerate()
+            .map(|(i, p)| {
+                if p.arity == 0 {
+                    return Type::Param(Rc::clone(p));
+                }
+                let binders: Vec<(Name, Type)> = self
+                    .family_domains(i)
+                    .iter()
+                    .map(|d| (Name::fresh("k"), d.clone()))
+                    .collect();
+                let terms = binders
+                    .iter()
+                    .map(|(n, d)| Rc::new(mint(n.clone(), d.clone())))
+                    .collect();
+                Type::family(
+                    binders,
+                    Type::FamilyApp(crate::ccl::ty::FamilyApp::new(Rc::clone(p), terms)),
+                )
+            })
             .collect();
         Type::Nominal(Rc::clone(self), args)
+    }
+
+    /// Whether any parameter is a family parameter.
+    pub fn has_family_params(&self) -> bool {
+        self.params.iter().any(|p| p.arity > 0)
+    }
+
+    /// Set the index types of each family parameter ([`Self::family_domains`]).
+    ///
+    /// # Panics
+    ///
+    /// On a declaration whose domains are set twice, or on `domains` not giving each
+    /// parameter one index type per term it is applied to.
+    pub fn set_family_domains(&self, domains: Vec<Vec<Type>>) {
+        assert!(
+            self.params.len() == domains.len()
+                && self
+                    .params
+                    .iter()
+                    .zip(&domains)
+                    .all(|(p, d)| p.arity == d.len()),
+            "`{}` gives each family parameter one index type per term",
+            self.name
+        );
+        assert!(
+            self.family_domains.set(domains).is_ok(),
+            "`{}`'s family domains set twice",
+            self.name
+        );
+    }
+
+    /// The index types of parameter `i` in an application whose arguments are `args`, which
+    /// they read at the parameters that are not families. An argument at a family position is
+    /// not read.
+    pub fn family_domains_at(&self, i: usize, args: &[Type]) -> Vec<Type> {
+        fn go(ty: &Type, decl: &NominalDecl, args: &[Type]) -> Type {
+            if let Type::Param(p) = ty
+                && let Some(j) = decl.params.iter().position(|q| q.id == p.id)
+            {
+                return args[j].clone();
+            }
+            let mut out = ty.clone();
+            out.walk_children_mut(|c| *c = go(c, decl, args));
+            out
+        }
+        self.family_domains(i)
+            .iter()
+            .map(|d| go(d, self, args))
+            .collect()
+    }
+
+    /// The index types of parameter `i`: empty for a parameter that is not a family.
+    ///
+    /// # Panics
+    ///
+    /// On a family parameter read before [`Self::set_family_domains`]: lowering sets them
+    /// before it lowers any type.
+    pub fn family_domains(&self, i: usize) -> &[Type] {
+        if self.params[i].arity == 0 {
+            return &[];
+        }
+        &self.family_domains.get().unwrap_or_else(|| {
+            panic!(
+                "`{}`'s family parameter `{}` read before its domains were set",
+                self.name, self.params[i].spelling
+            )
+        })[i]
     }
 
     /// Define the constructors, computing each parameter's variance.
@@ -634,8 +734,21 @@ impl NominalDecl {
                     .zip(implicit_args.iter().map(|a| (a, a))),
             )
             .collect();
-        let mut out = ty.clone();
-        replace_params(&mut out, true, &map);
+        // An application of a family parameter discharges its argument's binders to the
+        // application's terms by name, so a declaration with one is instantiated opened.
+        let mut out = if self.has_family_params() {
+            // Opening and closing rewrite the terms the declaration's types quote, which no tree
+            // holds, so the copies keep their identities rather than derive from them.
+            crate::ccl::provenance::preserving_ids(|| {
+                let mut opened = crate::ccl::generalize::opened_deep(ty);
+                replace_params(&mut opened, true, &map);
+                crate::ccl::generalize::closed_deep(&opened)
+            })
+        } else {
+            let mut out = ty.clone();
+            replace_params(&mut out, true, &map);
+            out
+        };
         // A type of the module that reaches the same `const` parameters names them as its
         // own module does, so it takes this instance's arguments too.
         let consts: HashMap<TypeParamId, ConstTerm> = self
@@ -858,6 +971,16 @@ impl<'a, V> IntoIterator for &'a DeclMap<V> {
 fn occurrences(ty: &Type, at: Variance, f: &mut dyn FnMut(TypeParamId, Variance)) {
     match ty {
         Type::Param(p) => f(p.id, at),
+        // An application of a family parameter is an occurrence of it.
+        Type::FamilyApp(app) => f(app.param.id, at),
+        // A family's domains are index types, ordered by equality; its body stands where the
+        // family does.
+        Type::Family { binders, body } => {
+            for (_, d) in binders {
+                occurrences(d, Variance::Invariant, f);
+            }
+            occurrences(body, at, f);
+        }
         Type::Fun {
             fun_kind,
             domain,
@@ -913,6 +1036,30 @@ fn replace_params(ty: &mut Type, pol: bool, map: &HashMap<TypeParamId, (&Type, &
                     (*input).clone()
                 };
             }
+        }
+        // The argument a family parameter takes is a family, applied here: its body with its
+        // binders discharged to this application's terms (`src/ccl/design/nominal-types.md`,
+        // "Family parameters"). The terms read the binders around them by name, as
+        // [`NominalDecl::instantiate`] reads the type opened.
+        Type::FamilyApp(app) if map.contains_key(&app.param.id) => {
+            let (input, output) = map[&app.param.id];
+            let family = if pol { output } else { input };
+            let Type::Family { binders, body } = family else {
+                panic!(
+                    "family parameter `{}` takes a family as its argument, got {family}",
+                    app.param.spelling
+                )
+            };
+            let names: Vec<Name> = binders
+                .iter()
+                .map(|(n, _)| n.clone().unwrap_or_else(|| Name::fresh("k")))
+                .collect();
+            let opened = crate::ccl::subst::open_family_body(binders.len(), body, |j| {
+                crate::ccl::subst::Mapping::Rename(names[j].clone())
+            });
+            let terms: Vec<Rc<crate::ccl::TypedExpr>> =
+                app.args.iter().map(|a| Rc::clone(&a.term)).collect();
+            *ty = crate::ccl::subst::discharge_binders(&names, &opened, &terms);
         }
         Type::Fun {
             fun_kind,

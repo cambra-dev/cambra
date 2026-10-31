@@ -165,6 +165,9 @@ fn blame_node_for_place(
             Type::Tuple(elems) | Type::Nominal(_, elems) => elems.iter().any(|t| mentions(t, uid)),
             Type::Split { input, output } => mentions(input, uid) || mentions(output, uid),
             Type::DepTuple(cs) => cs.iter().any(|(_, t)| mentions(t, uid)),
+            Type::Family { binders, body } => {
+                binders.iter().any(|(_, t)| mentions(t, uid)) || mentions(body, uid)
+            }
             Type::Record(fields) => fields.iter().any(|(_, t)| mentions(t, uid)),
             Type::Variant(arms, _) => arms.iter().any(|(_, t)| mentions(t, uid)),
             Type::WitnessRef(_) | Type::WitnessProjection(_) | Type::FamilyApp(_) => false,

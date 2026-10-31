@@ -2682,7 +2682,7 @@ the `Iterable` instance ([Membership expressions](#membership-expressions-decide
 representation is
 [Telling `Set` and `Map` apart](../src/ccl/design/collections.md#telling-set-and-map-apart-decided).
 
-A builtin differs from a declared nominal type in five ways:
+A builtin differs from a declared nominal type in four ways:
 
 - **No constructors or `extract`.** A program builds one through `set`, `map`, `groupby` or an
   empty value, and takes it apart through its operations.
@@ -2690,8 +2690,6 @@ A builtin differs from a declared nominal type in five ways:
   parameters are determined by their use ([Type parameters](#type-parameters)). A declared type
   has no spelling for an associated value
   ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
-- **A type family as a parameter.** `FullMap(K, V)`'s `V` may depend on the key, as a group-by's
-  groups do. A declared type's parameter takes a type.
 - **Trait instances.** All three satisfy `Iterable` through instances the compiler provides
   ([Trait requirements](#trait-requirements)). A declared type satisfies the traits its module
   declares instances of ([Declaring an instance](#declaring-an-instance)).
@@ -2964,9 +2962,11 @@ spellings name the same nominal type is
 #### Declaring a nominal type
 
 ```ebnf
-type_stmt   ::= "type" Ident [ "(" Ident ( "," Ident )* [ "," ] ")" ] ":"
+type_stmt   ::= "type" Ident [ "(" type_param ( "," type_param )* [ "," ] ")" ] ":"
                 NEWLINE INDENT ctor_line+ DEDENT
-             |  "type" Ident [ "(" Ident ( "," Ident )* [ "," ] ")" ] "=" expression NEWLINE
+             |  "type" Ident [ "(" type_param ( "," type_param )* [ "," ] ")" ] "=" expression
+                NEWLINE
+type_param  ::= Ident [ ":" expression ]
 ctor_line   ::= [ "@" "RenamedFrom" "(" ident ")" NEWLINE ]
                 ident [ "(" ctor_param ( "," ctor_param )* [ "," ] ")" ] NEWLINE
 ctor_param  ::= [ ident ":" ] expression
@@ -3013,7 +3013,9 @@ renamed_type_stmt ::= "@" "RenamedFrom" "(" type_path ")" NEWLINE type_stmt
   covariant. One that appears only in contravariant positions, such as the domain of
   `on(T => Int)`, is contravariant. One that appears in both, or under an invariant constructor
   such as `Mut(T)`, is invariant. `Option`'s `T` is covariant, so `Option({a: Int, b: Int})` is a
-  subtype of `Option({a: Int})`. A bound or a kind on a type parameter is **[Open]**.
+  subtype of `Option({a: Int})`. A parameter's kind is `Type`, written or not, or a family's,
+  `K => Type` ([Family parameters](#family-parameters)). A bound on a declaration's parameter is
+  **[Open]**.
   - **A position inside a position composes their variances.** Covariant inside contravariant is
     contravariant, contravariant inside contravariant is covariant, and invariant inside anything
     is invariant. `T` is covariant in `on((T => Int) => Int)`. A collection's domain is its data,
@@ -3060,6 +3062,43 @@ with patterns, even when it has one constructor.
 
 **[Tentative]** — the name `extract`. The method shares the type's namespace with its own
 associated functions, so whatever name it takes is unavailable to every type declared with `= R`.
+
+#### Family parameters
+
+A parameter of kind `K => Type` is a **family parameter**: it takes a type for each value of `K`.
+The declaration applies it to the value binders of the types it writes, `(k: K) |=> V(k)`.
+
+```python
+type Groups(K, V: K => Type) = (k: K) |=> V(k)
+
+gs = Groups::new(groupby([1, 2, 3], \x -> x > 1))
+# gs's type, as a diagnostic writes it:
+#   Groups({Bool where _ in [1 > 1, 2 > 1, 3 > 1]},
+#          forall (k: {Bool where _ in [1 > 1, 2 > 1, 3 > 1]})
+#              {UInt where _ < 3 and ([1, 2, 3][_] > 1) == k} |=> Int)
+```
+
+- **A family is indexed by values.** `V: {K₁, K₂} => Type` takes a type for each pair of values,
+  applied as `V(a, b)`. The index types name the declaration's other parameters. No parameter's
+  kind takes a type to a type.
+- **A declaration names the binders it applies a family parameter to.** `(k: K)` binds the value
+  of a function type's domain in its codomain, and is written only in a type declaration.
+- **A family parameter is applied to distinct binders in scope.** `V(k)` names a binder of a type
+  around it, and `V(k, k)`, `V(k + 1)` and a bare `V` are errors. Passing it to another family
+  parameter passes the family: `type Outer(K, V: K => Type) = Groups(K, V)`.
+- **A family is written `forall (k: K) T`**, a type `T` for each value `k` of `K`, which `T` reads
+  in refinements and family applications. Its binders begin with a lowercase letter, where a
+  polymorphic type's begin with a capital, and one `forall` binds one kind. It stands only where a
+  family is taken: as a family parameter's argument, and as `FullMap`'s value type, whose binder is
+  the key, `FullMap(K, forall (k: K) V)`.
+- **Any other type where a family is taken is the family constant at it.** `Groups(_, _ |=> Int)`
+  is `Groups(_, forall (k: _) _ |=> Int)`, and its holes are inferred under the binder, so a
+  group-by's groups, whose domain reads the key, are admitted.
+- **Two families relate value by value.** `forall (k: K) T₁` is a subtype of `forall (k: K) T₂`
+  when `T₁` is a subtype of `T₂` at every `k`. A family parameter's variance is computed from the
+  constructors as any parameter's is, and an index type is invariant.
+
+**[Planned]** — a family parameter of a polymorphic type or a `def`, `forall (K, V: K => Type)`.
 
 #### A nominal type is opaque
 
@@ -3359,7 +3398,9 @@ in the kind `K`:
   `T: SubtypesOf(U)`.
 
 Any other kind, such as a listing `T: [Int, String]`, is **[Open]** and an error. A type written as
-a kind, as in `T: Int`, is an error.
+a kind, as in `T: Int`, is an error. A family's kind, `V: K => Type`, is written on a type declaration's
+parameter ([Family parameters](#family-parameters)); on a `def`'s or a `forall`'s it is
+**[Planned]**.
 
 `T <: U` restricts `T` to subtypes of `U`. The body uses a value of type `T` as a `U`. The caller
 receives its own type for `T`.

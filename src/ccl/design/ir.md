@@ -540,7 +540,8 @@ durable forms are:
 | `Poly`, `Param` | A polymorphic type over type parameters, and a parameter ([type-parameters.md](type-parameters.md)). |
 | `WitnessRef` | Reference to a dependent-sum witness, inside the sum's own type; realization or erasure replaces it with a candidate. |
 | `WitnessProjection` | `σᵢ(𝑐)`, the `i`th witness of the sum the term `𝑐` holds: how a type outside the sum names it ([Projecting a sum's witness](collections.md#projecting-a-sums-witness)). |
-| `FamilyApp` | A generalized family applied to terms, `𝐷₁(𝑘)`: a type per value of the binders it is applied to ([Generalized types](type-parameters.md#generalized-types)). |
+| `FamilyApp` | A family parameter applied to terms, `𝐷₁(𝑘)` or `V(k)`: a type per value of the binders it is applied to ([Generalized types](type-parameters.md#generalized-types), [nominal-types.md, "Family parameters"](nominal-types.md#family-parameters)). |
+| `Family` | `forall (𝑘: 𝐾) 𝑇`, a type for each value of its binders: a nominal type's argument at a family parameter ([nominal-types.md, "Family parameters"](nominal-types.md#family-parameters)). |
 
 A `Label` (`src/ccl/label.rs`) is a record field label or a variant tag: a spelling and the module
 it belongs to ([chl-spec.md, "9.12 Field labels and tags belong to a

@@ -536,6 +536,24 @@ fn types_agree_modulo_unread(read: &Type, now: &Type, refinements: bool) -> bool
                     .zip(ys)
                     .all(|((_, x), (_, y))| types_agree_modulo_unread(x, y, refinements))
         }
+        // A binder's name is a spelling, as a component's is.
+        (
+            Type::Family {
+                binders: xb,
+                body: x,
+            },
+            Type::Family {
+                binders: yb,
+                body: y,
+            },
+        ) => {
+            xb.len() == yb.len()
+                && xb
+                    .iter()
+                    .zip(yb)
+                    .all(|((_, x), (_, y))| types_agree_modulo_unread(x, y, refinements))
+                && types_agree_modulo_unread(x, y, refinements)
+        }
         (Type::Record(xs), Type::Record(ys)) => {
             xs.len() == ys.len()
                 && xs.iter().zip(ys).all(|((nx, x), (ny, y))| {
@@ -1096,6 +1114,10 @@ enum PositionStep {
     HistoryDomain,
     /// An argument of an application of this declaration.
     Argument(Rc<crate::ccl::nominal::NominalDecl>, usize),
+    /// The domain of a family's binder at this position ([`Type::Family`]).
+    FamilyIndex(usize),
+    /// A family's body.
+    FamilyBody,
     /// The input side of a bipolar parameter's argument ([`Type::Split`]).
     Input,
     /// Its output side.
@@ -1154,6 +1176,12 @@ fn for_each_positioned_var(
                 step(t, PositionStep::Argument(Rc::clone(decl), i), path);
             }
         }
+        Type::Family { binders, body } => {
+            for (j, (_, t)) in binders.iter().enumerate() {
+                step(t, PositionStep::FamilyIndex(j), path);
+            }
+            step(body, PositionStep::FamilyBody, path);
+        }
         Type::Split { input, output } => {
             step(input, PositionStep::Input, path);
             step(output, PositionStep::Output, path);
@@ -1193,6 +1221,8 @@ fn read_at<'a>(ty: &'a Type, path: &[PositionStep]) -> Option<&'a Type> {
         (Type::History { .. }, PositionStep::HistoryValue) => ty.history_parts()?.1,
         (Type::History { .. }, PositionStep::HistoryDomain) => ty.history_parts()?.0,
         (Type::Nominal(decl, args), PositionStep::Argument(at, i)) if decl == at => args.get(*i)?,
+        (Type::Family { binders, .. }, PositionStep::FamilyIndex(j)) => &binders.get(*j)?.1,
+        (Type::Family { body, .. }, PositionStep::FamilyBody) => body.as_ref(),
         (Type::Split { input, .. }, PositionStep::Input) => input.as_ref(),
         (Type::Split { output, .. }, PositionStep::Output) => output.as_ref(),
         // An argument that is not split is both its sides.
@@ -3128,7 +3158,31 @@ fn coalesce_type_predicates_go(
             .iter_mut()
             .for_each(|(_, t)| coalesce_type_predicates_go(t, level, ctx, scope)),
         Type::History { function, .. } => coalesce_type_predicates_go(function, level, ctx, scope),
-        Type::FamilyApp(_) => unreachable!("a generalized family is born after inference"),
+        Type::FamilyApp(app) if app.param.generalized => {
+            unreachable!("a generalized family is born after inference")
+        }
+        // A declared family's arguments are quoted terms, resolved as a projection's is.
+        Type::FamilyApp(app) => {
+            let memo = ctx.pred_memo.clone();
+            for arg in &mut app.args {
+                memo.rebuild(arg, &(), |term| {
+                    coalesce_node(term, level, ctx);
+                    true
+                });
+                *arg = scope.close_quoted(arg);
+            }
+        }
+        // The body is inside every binder; a domain stands where the family does.
+        Type::Family { binders, body } => {
+            for (_, t) in binders.iter_mut() {
+                coalesce_type_predicates_go(t, level, ctx, scope);
+            }
+            for (name, _) in binders.iter() {
+                scope.enter(name.clone());
+            }
+            coalesce_type_predicates_go(body, level, ctx, scope);
+            binders.iter().for_each(|_| scope.exit());
+        }
         // A projection quotes a term as a predicate does, so its slots resolve the same way
         // and it leaves closed against the functions entered.
         Type::WitnessProjection(p) => {

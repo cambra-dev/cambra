@@ -99,6 +99,12 @@ pub fn type_level(ty: &Type) -> Level {
         Type::Tuple(ts) | Type::Nominal(_, ts) => ts.iter().map(type_level).max().unwrap_or(0),
         Type::Split { input, output } => type_level(input).max(type_level(output)),
         Type::DepTuple(cs) => cs.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
+        Type::Family { binders, body } => binders
+            .iter()
+            .map(|(_, t)| type_level(t))
+            .max()
+            .unwrap_or(0)
+            .max(type_level(body)),
         Type::Record(fs) => fs.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
         Type::Variant(tags, _) => tags.iter().map(|(_, t)| type_level(t)).max().unwrap_or(0),
         Type::Refinement(inner, _) => type_level(inner),
@@ -119,8 +125,10 @@ pub fn type_level(ty: &Type) -> Level {
         // The witness's type children and the body carry the sum's inference
         // A witness reference is a leaf (level 0) — naming its binder gives it no
         // solver content.
-        // A generalized family is rigid and born after inference, at the outermost level.
-        Type::WitnessRef(_) | Type::WitnessProjection(_) | Type::FamilyApp(_) => 0,
+        Type::WitnessRef(_) | Type::WitnessProjection(_) => 0,
+        // An application of a family parameter is at its parameter's level, as the parameter
+        // is; a generalized family's is the outermost.
+        Type::FamilyApp(app) => app.param.level(),
         // Unlike a channel domain, a type parameter reports the level it was opened
         // at: it must not flow to a lower-level variable, and reporting its level is
         // what routes such an edge to the escape check

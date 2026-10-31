@@ -465,6 +465,13 @@ pub(super) fn mentioned_names(expr: &ChlExpr, names: &mut HashSet<SmolStr>) {
             names.insert(first.node.clone());
         }
         ChlExpr::Call { func, args } => each(&mut std::iter::once(&**func).chain(args)),
+        ChlExpr::Family { binders, body } => each(
+            &mut binders
+                .iter()
+                .map(|(_, t)| t)
+                .chain(std::iter::once(&**body)),
+        ),
+        ChlExpr::TypeBinder { ty, .. } => each(&mut std::iter::once(&**ty)),
         ChlExpr::MethodCall { receiver, args, .. } => {
             each(&mut std::iter::once(&**receiver).chain(args))
         }

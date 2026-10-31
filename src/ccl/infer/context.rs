@@ -759,6 +759,19 @@ impl InferCtx {
             .map(|(_, opened)| opened.clone())
     }
 
+    /// What the innermost open `Poly` declaring `param` opened it at. Lowering scopes a
+    /// parameter to the definition its `Poly` annotates, and that definition is emitted with
+    /// the `Poly` open, so every declared occurrence normalized has one.
+    fn declared_param(&self, param: &crate::ccl::ty::TypeParam) -> Type {
+        self.opened_param(param.id).unwrap_or_else(|| {
+            panic!(
+                "type parameter `{}` was normalized outside the right-hand side whose `Poly` \
+                 declares it",
+                param.spelling
+            )
+        })
+    }
+
     /// Normalize a user annotation / source type into a solver-ready
     /// `Type`: every `Hole` becomes a fresh inference variable and every
     /// `BarrierVar` a fresh barrier variable, both at the current level. Everything
@@ -822,24 +835,28 @@ impl InferCtx {
                 .entry(*id)
                 .or_insert_with(|| Type::Infer(InferVar::fresh_in(self.level, telescope)))
                 .clone(),
-            // A declared type parameter is the one the innermost open `Poly` declaring it
-            // minted. Lowering scopes a parameter to the definition its `Poly`
-            // annotates, and that definition is emitted with the `Poly` open, so every
-            // declared occurrence normalized has one.
-            Type::FamilyApp(_) => unreachable!("a generalized family is born after inference"),
-            Type::Param(param) if param.opened_at.is_none() => self
-                .opened_params
-                .iter()
-                .rev()
-                .find(|(id, _)| *id == param.id)
-                .map(|(_, opened)| opened.clone())
-                .unwrap_or_else(|| {
-                    panic!(
-                        "type parameter `{}` was normalized outside the right-hand side whose \
-                         `Poly` declares it",
-                        param.spelling
+            Type::FamilyApp(app) if app.param.generalized => {
+                unreachable!("a generalized family is born after inference")
+            }
+            // A declared family parameter's application is the opened parameter's, at the
+            // same terms, as a declared parameter is its opened one.
+            Type::FamilyApp(app) if app.param.opened_at.is_none() => {
+                let opened = self.declared_param(&app.param);
+                let Type::Param(opened) = opened else {
+                    unreachable!(
+                        "family parameter `{}` opened as `{opened}`, which no term applies",
+                        app.param.spelling
                     )
-                }),
+                };
+                Type::FamilyApp(crate::ccl::ty::FamilyApp {
+                    param: opened,
+                    args: app.args.clone(),
+                })
+            }
+            Type::FamilyApp(_) => ty.clone(),
+            // A declared type parameter is the one the innermost open `Poly` declaring it
+            // minted.
+            Type::Param(param) if param.opened_at.is_none() => self.declared_param(param),
             // A bounded annotation `𝑥 <: 𝑇` means "infer this, subject to `<: 𝑇`"
             // → the same fresh variable, carrying `𝑇` as an upper bound. This is
             // the *only* place `BoundedHole` is consumed; every other pass either
@@ -944,6 +961,21 @@ impl InferCtx {
                     .map(|(n, t)| (n.clone(), self.normalize_annotation_in(t, telescope)))
                     .collect(),
             ),
+            // The body is under every binder, as a named function's codomain is under its
+            // binder: a variable minted there may read them.
+            Type::Family { binders, body } => {
+                let inner = binders
+                    .iter()
+                    .filter_map(|(n, _)| n.clone())
+                    .fold(telescope.clone(), |t, n| t.extended(n));
+                Type::Family {
+                    binders: binders
+                        .iter()
+                        .map(|(n, t)| (n.clone(), self.normalize_annotation_in(t, telescope)))
+                        .collect(),
+                    body: Box::new(self.normalize_annotation_in(body, &inner)),
+                }
+            }
             Type::Nominal(decl, args) => Type::Nominal(
                 decl.clone(),
                 args.iter()
@@ -1690,11 +1722,12 @@ impl Typing for InferCtx {
                 }
                 self.normalize_annotation(&b)
             });
-            let opened = crate::ccl::ty::TypeParam::opened(
+            let opened = crate::ccl::ty::TypeParam::opened_family(
                 p.param.spelling.clone(),
                 self.level,
                 bound.clone(),
                 p.bound_at,
+                p.param.arity,
             );
             self.opened_params
                 .push((p.param.id, Type::Param(Rc::clone(&opened))));

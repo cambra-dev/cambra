@@ -2814,6 +2814,15 @@ pub(super) fn lower_type_expr_or_poly(
             if let Some(ty) = name_type(id.as_str()) {
                 return Ok(ty);
             }
+            if ctx.family_params.iter().any(|(n, ..)| n == id) {
+                return Err(LoweringError::unsupported(
+                    annotation.span,
+                    format!(
+                        "`{id}` is a family parameter, a type for each value it ranges over: \
+                         apply it to a binder, `{id}(k)`, or pass it to a family parameter"
+                    ),
+                ));
+            }
             match ctx.type_alias(id.as_str(), annotation.span) {
                 AliasAt::InScope(AliasType::Type(ty)) => Ok(ty.clone()),
                 AliasAt::InScope(AliasType::Module(_)) => Err(module_type_as_value_type(
@@ -2889,6 +2898,10 @@ pub(super) fn lower_type_expr_or_poly(
                 return nominal_application(annotation.span, decl, args, ctx);
             }
             let head = type_ctor_head(func)?;
+            if let Some((_, param, _)) = ctx.family_params.iter().find(|(n, ..)| n == head) {
+                let param = Rc::clone(param);
+                return family_application(annotation.span, &param, args, ctx);
+            }
             match ctx.nominal_type(head) {
                 Some(decl) => nominal_application(annotation.span, decl, args, ctx),
                 None => lower_type_application(annotation.span, head, args, ctx),
@@ -2974,6 +2987,52 @@ pub(super) fn lower_type_expr_or_poly(
         // `f: (Int => Int) = \x -> …` matches its value. `Type::fun` builds the
         // non-dependent form (`name: None`): the surface has no binder to make it a Pi
         // type.
+        // A parenthesised binder `(k: K) |=> V(k)` binds the domain's value in the codomain.
+        // It is written only in a type declaration (`docs/chl-spec.md`, "Family parameters").
+        ChlExpr::FunctionType {
+            domain,
+            arrow,
+            codomain,
+        } if matches!(domain.node, ChlExpr::TypeBinder { .. }) => {
+            let ChlExpr::TypeBinder { name, ty } = &domain.node else {
+                unreachable!("matched a binder")
+            };
+            if !ctx.in_type_declaration {
+                return Err(LoweringError::unsupported(
+                    domain.span,
+                    format!(
+                        "`({0}: K)` names the domain's value only in a type declaration, as \
+                         `({0}: K) |=> V({0})` over a family parameter `V`",
+                        name.node
+                    ),
+                ));
+            }
+            let domain = lower_type_expr(ty, ctx)?;
+            let fun_kind = match arrow {
+                chl_parser::ast::Arrow::Compute => crate::ccl::FunKind::Compute,
+                chl_parser::ast::Arrow::Data => crate::ccl::FunKind::Data(None),
+            };
+            let codomain = under_type_binders(&[(name, domain.clone())], codomain, ctx)?;
+            Ok(Type::Fun {
+                name: Some(Name::fresh(name.node.clone())),
+                fun_kind,
+                domain: Box::new(domain),
+                codomain: Box::new(codomain),
+            })
+        }
+        ChlExpr::TypeBinder { name, .. } => Err(LoweringError::unsupported(
+            annotation.span,
+            format!(
+                "`{0}: K` binds a value only as a function type's domain, `({0}: K) |=> V({0})`, \
+                 or in a family, `forall ({0}: K) V`",
+                name.node
+            ),
+        )),
+        ChlExpr::Family { .. } => Err(LoweringError::unsupported(
+            annotation.span,
+            "a family, `forall (k: K) V`, is written as the argument of a family parameter, \
+             `V: K => Type`, or as `FullMap`'s value type",
+        )),
         ChlExpr::FunctionType {
             domain,
             arrow: chl_parser::ast::Arrow::Compute,
@@ -3250,6 +3309,8 @@ fn describe_type_form(e: &ChlExpr) -> &'static str {
         | ChlExpr::ModuleType(_)
         | ChlExpr::FunctionType { .. }
         | ChlExpr::Forall { .. }
+        | ChlExpr::Family { .. }
+        | ChlExpr::TypeBinder { .. }
         | ChlExpr::VariantCtor { .. }
         | ChlExpr::Tuple(_) => "this expression",
     }
@@ -3754,11 +3815,237 @@ fn nominal_application(
             ),
         ));
     }
-    let args = args
+    // A family parameter's argument is lowered after the others, whose arguments its index
+    // types read.
+    let mut lowered: Vec<Option<Type>> = Vec::with_capacity(args.len());
+    for (a, p) in args.iter().zip(&decl.params) {
+        lowered.push(if p.arity == 0 {
+            Some(lower_type_expr(a, ctx)?)
+        } else {
+            None
+        });
+    }
+    let plain: Vec<Type> = lowered
         .iter()
-        .map(|a| lower_type_expr(a, ctx))
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Type::Nominal(decl, args))
+        .map(|t| t.clone().unwrap_or(Type::Hole))
+        .collect();
+    for (i, (a, p)) in args.iter().zip(&decl.params).enumerate() {
+        if p.arity == 0 {
+            continue;
+        }
+        let domains = decl.family_domains_at(i, &plain);
+        lowered[i] = Some(family_argument(p, &domains, a, ctx)?);
+    }
+    Ok(Type::Nominal(
+        decl,
+        lowered
+            .into_iter()
+            .map(|t| t.expect("every argument lowered"))
+            .collect(),
+    ))
+}
+
+/// The family `param`, a family parameter over `domains`, takes as the argument `arg`
+/// (`docs/chl-spec.md`, "Family parameters"):
+///
+/// - `forall (k: K) T`, the family written out, ranging over `domains`;
+/// - a family parameter of the declaration around it, `V`, passed as the family it applies,
+///   `forall (k: K) V(k)`;
+/// - any other type `T`, the family constant at it, `forall (k: K) T`, whose holes are inferred
+///   under the binders and may read them.
+fn family_argument(
+    param: &Rc<crate::ccl::ty::TypeParam>,
+    domains: &[Type],
+    arg: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Type, LoweringError> {
+    if let ChlExpr::Family { binders, body } = &arg.node {
+        if binders.len() != domains.len() {
+            return Err(LoweringError::unsupported(
+                arg.span,
+                format!(
+                    "`{}` is a family over {} value{}, and this family binds {}",
+                    param.spelling,
+                    domains.len(),
+                    if domains.len() == 1 { "" } else { "s" },
+                    binders.len()
+                ),
+            ));
+        }
+        let mut scope = Vec::with_capacity(binders.len());
+        for ((name, written), domain) in binders.iter().zip(domains) {
+            let written_domain = lower_type_expr(written, ctx)?;
+            let domain = match domain {
+                Type::Hole => written_domain,
+                _ if crate::ccl::ccl_utils::strip_refinements(&written_domain)
+                    == crate::ccl::ccl_utils::strip_refinements(domain)
+                    || matches!(written_domain, Type::Hole) =>
+                {
+                    domain.clone()
+                }
+                _ => {
+                    return Err(LoweringError::unsupported(
+                        written.span,
+                        format!(
+                            "`{}` ranges over `{written_domain}`, and `{}`'s family ranges over \
+                             `{domain}`",
+                            name.node, param.spelling
+                        ),
+                    ));
+                }
+            };
+            scope.push((name, domain));
+        }
+        let lowered = under_type_binders(&scope, body, ctx)?;
+        return Ok(closed_family(&scope, lowered));
+    }
+    // A family parameter of the declaration around it, passed on.
+    if let ChlExpr::Name(n) = &arg.node
+        && let Some(outer) = ctx
+            .family_params
+            .iter()
+            .find(|(s, ..)| s == n)
+            .map(|(_, p, _)| Rc::clone(p))
+    {
+        if outer.arity != domains.len() {
+            return Err(LoweringError::unsupported(
+                arg.span,
+                format!(
+                    "`{n}` is a family over {} values, and `{}` takes one over {}",
+                    outer.arity,
+                    param.spelling,
+                    domains.len()
+                ),
+            ));
+        }
+        let binders: Vec<(Name, Type)> = domains
+            .iter()
+            .map(|d| (Name::fresh("k"), d.clone()))
+            .collect();
+        let terms = binders
+            .iter()
+            .map(|(b, d)| {
+                Rc::new(ctx.tag_machinery(
+                    Expr::var(b.clone()).with_ty(d.clone()),
+                    arg.span,
+                    "lower.family_argument",
+                ))
+            })
+            .collect();
+        return Ok(Type::family(
+            binders,
+            Type::FamilyApp(crate::ccl::ty::FamilyApp::new(outer, terms)),
+        ));
+    }
+    let body = lower_type_expr(arg, ctx)?;
+    Ok(Type::family(
+        domains
+            .iter()
+            .map(|d| (Name::fresh("k"), d.clone()))
+            .collect(),
+        body,
+    ))
+}
+
+/// `body` lowered with each of `scope`'s binders in scope at its type, innermost last, and
+/// its references to them closed into indices, as the codomain of a function binding them
+/// stores them.
+fn under_type_binders(
+    scope: &[(&Spanned<SmolStr>, Type)],
+    body: &Spanned<ChlExpr>,
+    ctx: &mut LoweringContext,
+) -> Result<Type, LoweringError> {
+    let depth = ctx.type_binders.len();
+    ctx.type_binders.extend(
+        scope
+            .iter()
+            .map(|(name, ty)| (name.node.clone(), ty.clone())),
+    );
+    let lowered = lower_type_expr(body, ctx);
+    ctx.type_binders.truncate(depth);
+    let enclosing: Vec<Option<Name>> = scope
+        .iter()
+        .map(|(name, _)| Some(Name::raw(name.node.clone())))
+        .collect();
+    Ok(crate::ccl::subst::close_pi_binders(&enclosing, &lowered?))
+}
+
+/// The family over `scope`'s binders whose body, closed over them, is `body`.
+fn closed_family(scope: &[(&Spanned<SmolStr>, Type)], body: Type) -> Type {
+    Type::Family {
+        binders: scope
+            .iter()
+            .map(|(name, ty)| (Some(Name::fresh(name.node.clone())), ty.clone()))
+            .collect(),
+        body: Box::new(body),
+    }
+}
+
+/// `param(args)`, a family parameter applied to binders in scope
+/// (`docs/chl-spec.md`, "Family parameters"). Each argument is a distinct binder, so the
+/// application names the family's own binders and nothing computed from them.
+fn family_application(
+    span: Span,
+    param: &Rc<crate::ccl::ty::TypeParam>,
+    args: &[Spanned<ChlExpr>],
+    ctx: &mut LoweringContext,
+) -> Result<Type, LoweringError> {
+    if args.len() != param.arity {
+        return Err(LoweringError::unsupported(
+            span,
+            format!(
+                "`{}` is a family over {} value{}, applied here to {}",
+                param.spelling,
+                param.arity,
+                if param.arity == 1 { "" } else { "s" },
+                args.len()
+            ),
+        ));
+    }
+    let mut seen: Vec<&str> = Vec::new();
+    let mut terms = Vec::with_capacity(args.len());
+    for arg in args {
+        let ChlExpr::Name(n) = &arg.node else {
+            return Err(LoweringError::unsupported(
+                arg.span,
+                format!(
+                    "`{}` is applied to a binder of a type around it, `(k: K) |=> {}(k)`, \
+                     and not to a computed value",
+                    param.spelling, param.spelling
+                ),
+            ));
+        };
+        let Some((_, ty)) = ctx.type_binders.iter().rev().find(|(b, _)| b == n) else {
+            return Err(LoweringError::unsupported(
+                arg.span,
+                format!(
+                    "`{n}` is not a binder of a type around this application: `{}` is applied \
+                     to one, as in `({n}: K) |=> {}({n})`",
+                    param.spelling, param.spelling
+                ),
+            ));
+        };
+        if seen.contains(&n.as_str()) {
+            return Err(LoweringError::unsupported(
+                arg.span,
+                format!(
+                    "`{}` is applied to `{n}` twice; each of its values is a distinct binder",
+                    param.spelling
+                ),
+            ));
+        }
+        seen.push(n.as_str());
+        let term = Expr::var(Name::raw(n.clone())).with_ty(ty.clone());
+        terms.push(Rc::new(ctx.tag_machinery(
+            term,
+            arg.span,
+            "lower.family_application",
+        )));
+    }
+    Ok(Type::FamilyApp(crate::ccl::ty::FamilyApp::new(
+        Rc::clone(param),
+        terms,
+    )))
 }
 
 /// Extract the simple-name head of a type application (`List` in `List(T)`).
@@ -3838,10 +4125,44 @@ fn lower_type_application(
             let [k, v] = args else {
                 return Err(arity_err("a key and a value type"));
             };
-            Ok(Type::full_map_of(
-                lower_type_expr(k, ctx)?,
-                lower_type_expr(v, ctx)?,
-            ))
+            let key = lower_type_expr(k, ctx)?;
+            // The value type is a family over the key: written out, `forall (k: K) V`, its
+            // binder is the map's (`docs/chl-spec.md`, "Family parameters").
+            if let ChlExpr::Family { binders, body } = &v.node {
+                let [(name, written)] = binders.as_slice() else {
+                    return Err(LoweringError::unsupported(
+                        v.span,
+                        "`FullMap`'s value type is a family over its one key: `forall (k: K) V`",
+                    ));
+                };
+                let written_key = lower_type_expr(written, ctx)?;
+                let key = match (&key, &written_key) {
+                    (Type::Hole, _) => written_key,
+                    (_, Type::Hole) => key,
+                    _ if crate::ccl::ccl_utils::strip_refinements(&key)
+                        == crate::ccl::ccl_utils::strip_refinements(&written_key) =>
+                    {
+                        key
+                    }
+                    _ => {
+                        return Err(LoweringError::unsupported(
+                            written.span,
+                            format!(
+                                "`{}` ranges over `{written_key}`, and the map's keys are `{key}`",
+                                name.node
+                            ),
+                        ));
+                    }
+                };
+                let value = under_type_binders(&[(name, key.clone())], body, ctx)?;
+                return Ok(Type::Fun {
+                    name: Some(Name::fresh(name.node.clone())),
+                    fun_kind: crate::ccl::FunKind::Data(None),
+                    domain: Box::new(key),
+                    codomain: Box::new(value),
+                });
+            }
+            Ok(Type::full_map_of(key, lower_type_expr(v, ctx)?))
         }
         // `Set(K)` = `Map(K, unit)` — a map whose codomain is `unit`, so the
         // key domain is the payload (`Type::set_of`).

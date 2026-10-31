@@ -1564,12 +1564,8 @@ fn pi_typed_collection() -> Type {
 
 /// Infer and type-check `λ c : 𝐶 → body`, where `𝐶` is [`pi_typed_collection`].
 ///
-/// TODO: Bind a Pi's binder while typing its codomain's annotation predicates.
-///
-/// Construction closes `i` in the codomain to a `PiBound` reference, and
-/// `emit_annotation_predicates` descends into the codomain without opening it, so
-/// the reference reaches the `Var` lookup unbound. Inference reports `Unbound
-/// variable: 'i'` (the `PiBound` prints its hint), and every caller pins it.
+/// `emit_annotation_predicates` types the codomain's predicate opened, with `i` in scope at
+/// the keys.
 fn check_over_pi_typed_collection(body: Expr) {
     let mut expr = uniquify::run(Expr::lambda("c", pi_typed_collection(), body));
     infer(&mut expr, &mut TypeInferenceContext::new())
@@ -1582,10 +1578,8 @@ fn check_over_pi_typed_collection(body: Expr) {
 /// Nothing applies `c`, so the only predicate naming the binder `i` is the annotation's
 /// own codomain refinement, which is in scope under the Pi that binds it.
 ///
-/// No CHL spelling names a Pi binder in an annotation (`FullMap(K, V)` mints its own), so
-/// the tree is built directly.
+/// The tree is built directly, its binder spelled `i` by name.
 #[test]
-#[should_panic = "Unbound variable: 'i'"]
 fn a_pi_typed_collection_parameter() {
     check_over_pi_typed_collection(Expr::var("c"));
 }
@@ -1598,7 +1592,7 @@ fn a_pi_typed_collection_parameter() {
 /// handle a Pi-binder referenced in the collection's codomain. See
 /// also `collection_contains_of_an_inferred_pi_typed_collection`.
 #[test]
-#[should_panic = "Unbound variable: 'i'"]
+#[should_panic = "`Raw(\"i\")` is free in the lower bound"]
 fn collection_contains_of_a_pi_typed_collection() {
     check_over_pi_typed_collection(Expr::apply(
         Expr::var("c"),

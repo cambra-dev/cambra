@@ -1066,6 +1066,11 @@ fn reads_in_collection_domain(param: &Name, ty: &Type) -> bool {
             .any(|(_, t)| reads_in_collection_domain(param, t)),
         Type::History { function, .. } => reads_in_collection_domain(param, function),
         Type::Nominal(_, args) => args.iter().any(|t| reads_in_collection_domain(param, t)),
+        // A family's body is a type per value of its binders, read as a codomain is.
+        Type::Family { binders, body } => {
+            !binders.iter().any(|(n, _)| n.as_ref() == Some(param))
+                && reads_in_collection_domain(param, body)
+        }
         Type::Split { input, output } => {
             reads_in_collection_domain(param, input) || reads_in_collection_domain(param, output)
         }

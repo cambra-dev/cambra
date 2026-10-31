@@ -3343,6 +3343,8 @@ fn places_under(root: &Rc<InferVar>) -> std::collections::BTreeMap<StepPath, Pla
                 // A nominal value is opaque: no operation reaches a component of it, so
                 // its arguments name no place inside it.
                 Type::Nominal(..) | Type::Split { .. } => {}
+                // A family stands only as a nominal type's argument, so no place is inside it.
+                Type::Family { .. } => {}
                 Type::Poly(_) => unreachable!("a polymorphic type is never a recorded bound"),
                 // `peel_refinements` returns a non-refinement by construction.
                 Type::Refinement(_, _) => unreachable!("refinements are peeled above"),

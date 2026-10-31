@@ -26,8 +26,10 @@ type, both in `ccl/ty.rs`:
 
 - A `TypeParam` has an id, which equality, ordering and hashing use; the spelling the user wrote,
   for display; and, once opened, a level (`opened_at`) and the bound its kind gives it, normalized
-  at that level. A generalized one also has an `arity`, nonzero for a family, whose occurrences are
-  `Type::FamilyApp`s applying it to that many terms ([Generalized types](#generalized-types)).
+  at that level. A family also has an `arity`, nonzero, whose occurrences are `Type::FamilyApp`s
+  applying it to that many terms: a generalized one ([Generalized types](#generalized-types)),
+  and a nominal type's family parameter, declared by lowering and opened as any parameter is
+  ([nominal-types.md, "Family parameters"](nominal-types.md#family-parameters)).
 - A `PolyType` holds its parameters in declaration order, each a `PolyParam` (a declared
   `TypeParam` and its kind); its `requires` clause, each requirement a `TraitRequirement` (a
   trait, its operand types and the types its associated types are, by name); and its body.
@@ -325,7 +327,12 @@ The `Var` arm instantiates every binding through `PolyScheme::instantiate_with_p
 freshens the body, the bounds and the `requires` clause through one copy (`Instance`):
 
 1. Each type parameter above the scheme's cutoff maps to a fresh variable `𝛼` at the use's level,
-   in the use's telescope, through `FreshenCache::params`, and the body freshens through it.
+   in the use's telescope, through `FreshenCache::params`, and the body freshens through it. A
+   family parameter maps to a fresh variable in the use's telescope extended by one fresh binder
+   per index (`FreshenCache::family_params`). An application of it is that variable with those
+   binders renamed to the application's terms, which suspends on the variable, so the bounds the
+   suspension receives reach the variable through the rename. A function whose codomain holds an
+   application is freshened with the codomain opened at its binder, so the terms name it.
 2. For each parameter with bound `𝐵`, the arm records `𝛼 <: 𝐵[𝛼/𝑃]`, the bound freshened through
    the same cache.
 3. For each requirement of the scheme's `requires` clause, the arm calls `require_trait` over the

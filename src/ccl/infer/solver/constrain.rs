@@ -1720,6 +1720,49 @@ fn constrain_go_impl(
             Ok(())
         }
 
+        // Family: pointwise, a family below another where at each value of the binders its
+        // body is below the other's (`src/ccl/design/nominal-types.md`, "Family parameters").
+        // The domains are index types and relate both ways. The bodies relate under the two
+        // sides' binders aligned, as two codomains do (`sl.aligned`), each side opening at its
+        // names where the other side is live, as a dependent tuple's components do.
+        (
+            Type::Family {
+                binders: a,
+                body: a_body,
+            },
+            Type::Family {
+                binders: b,
+                body: b_body,
+            },
+        ) if a.len() == b.len() => {
+            for ((_, d0), (_, d1)) in a.iter().zip(b) {
+                constrain_go(d0, d1, sl, sr, cache, scope)?;
+                cache.swapped(|cache| constrain_go(d1, d0, sr, sl, cache, scope))?;
+            }
+            let opened = |binders: &[(Option<Name>, Type)], body: &Type, other: &Type| -> Type {
+                let n = binders.len();
+                if crate::ccl::subst::references_binder_within(body, n as u32)
+                    && (cache.derivation.opens_unconditionally()
+                        || crate::ccl::subst::type_contains_infer(other))
+                {
+                    crate::ccl::subst::open_family_body(n, body, |j| {
+                        let name = binders[j].0.clone().unwrap_or_else(|| {
+                            panic!("a binder the body reads by index names itself: {lhs}")
+                        });
+                        crate::ccl::subst::Mapping::Rename(name)
+                    })
+                } else {
+                    body.clone()
+                }
+            };
+            let (a_opened, b_opened) = (opened(a, a_body, rhs), opened(b, b_body, lhs));
+            let aligned = a
+                .iter()
+                .zip(b)
+                .fold(sl.clone(), |s, ((n0, _), (n1, _))| s.aligned(n0, n1));
+            constrain_go(&a_opened, &b_opened, &aligned, sr, cache, scope)
+        }
+
         // Record: named width-subtyping. rhs's fields must all appear in lhs.
         (Type::Record(a), Type::Record(b)) => {
             for (name, t1) in b {
@@ -2378,6 +2421,7 @@ fn copy_watches(from: &Rc<InferVar>, to: &Rc<InferVar>) {
 fn escaping_param(ty: &Type, target_level: Level) -> Option<Rc<crate::ccl::ty::TypeParam>> {
     match ty {
         Type::Param(param) if param.level() > target_level => Some(Rc::clone(param)),
+        Type::FamilyApp(app) if app.param.level() > target_level => Some(Rc::clone(&app.param)),
         Type::Infer(_) => None,
         _ => {
             let mut found = None;
@@ -2487,6 +2531,15 @@ pub fn extrude(ty: &Type, pol: bool, target_level: Level, cache: &mut ExtrudeCac
         | Type::Txn
         | Type::Hole
         | Type::SharedHole(_) => ty.clone(),
+        // A domain is an index type and extrudes as an invariant argument does; the body at
+        // the family's polarity, its binders staying its own.
+        Type::Family { binders, body } => Type::Family {
+            binders: binders
+                .iter()
+                .map(|(name, t)| (name.clone(), extrude_invariant(t, target_level, cache)))
+                .collect(),
+            body: Box::new(extrude(body, pol, target_level, cache)),
+        },
         // Componentwise, as a tuple is: a component's names stay its binders.
         Type::DepTuple(components) => Type::DepTuple(
             components

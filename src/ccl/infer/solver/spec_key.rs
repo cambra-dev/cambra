@@ -98,6 +98,9 @@ struct KeyView {
     /// binders around the tuple at different depths. The names are spellings and not part
     /// of the key.
     dep_tuple: Vec<KeyView>,
+    /// A family's domains and its body, keyed under the family's binders as `compact_go`
+    /// compacts it. The names are spellings and not part of the key.
+    family: Option<(Vec<KeyView>, Box<KeyView>)>,
     /// Variant tags, unioned.
     var: BTreeMap<FieldKey, KeyView>,
     /// History contributions, keyed by kind so an `Overwrite` and an `Append`
@@ -131,6 +134,7 @@ impl PartialEq for KeyView {
             && self.fun == other.fun
             && self.rec == other.rec
             && self.dep_tuple == other.dep_tuple
+            && self.family == other.family
             && self.var == other.var
             && self.history == other.history
             && self.nominal == other.nominal
@@ -179,6 +183,21 @@ impl KeyView {
             );
             for (mine, theirs) in self.dep_tuple.iter_mut().zip(other.dep_tuple) {
                 mine.union(theirs);
+            }
+        }
+        match (&mut self.family, other.family) {
+            (_, None) => {}
+            (None, theirs) => self.family = theirs,
+            (Some((domains, body)), Some((their_domains, their_body))) => {
+                assert_eq!(
+                    domains.len(),
+                    their_domains.len(),
+                    "two families of different arities key one position"
+                );
+                for (mine, theirs) in domains.iter_mut().zip(their_domains) {
+                    mine.union(theirs);
+                }
+                body.union(*their_body);
             }
         }
         union_map(&mut self.var, other.var);
@@ -231,6 +250,12 @@ impl KeyView {
         for (value, domain) in self.history.values_mut() {
             value.drop_covariant_refinements(at(Variance::Invariant));
             domain.drop_covariant_refinements(at(Variance::Invariant));
+        }
+        if let Some((domains, body)) = &mut self.family {
+            for d in domains {
+                d.drop_covariant_refinements(at(Variance::Invariant));
+            }
+            body.drop_covariant_refinements(at(Variance::Covariant));
         }
         for (decl, args) in self.nominal.iter_mut() {
             let mut args = args.iter_mut();
@@ -308,6 +333,10 @@ impl fmt::Display for KeyView {
         if !self.dep_tuple.is_empty() {
             let components: Vec<String> = self.dep_tuple.iter().map(|v| format!("{v}")).collect();
             parts.push(format!("({})", components.join(" × ")));
+        }
+        if let Some((domains, body)) = &self.family {
+            let domains: Vec<String> = domains.iter().map(|v| format!("{v}")).collect();
+            parts.push(format!("forall ({}) {body}", domains.join(", ")));
         }
         if !self.var.is_empty() {
             let tags: Vec<String> = self.var.iter().map(|(k, v)| format!(".{k}: {v}")).collect();
@@ -501,7 +530,15 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
         // substituted with a sentinel binder, which would be a third case in the id space
         // that everything else has to know not to mean anything.
         Type::WitnessRef(_) | Type::WitnessProjection(_) => KeyView::anonymous_witness(),
-        Type::FamilyApp(_) => unreachable!("a generalized family is born after inference"),
+        Type::FamilyApp(app) if app.param.generalized => {
+            unreachable!("a generalized family is born after inference")
+        }
+        // An opened family parameter's application is rigid inside the definition it is
+        // opened for, as the parameter is, and keys as the atom compaction makes of it.
+        Type::FamilyApp(_) => KeyView::from_atom(
+            AtomKey::from_type(&subst_acc.apply_type(ty))
+                .expect("a family application classifies as an AtomKey"),
+        ),
         // A refinement rides the position it refines. The accumulated substitution
         // is forced on it exactly as `compact_go` does, so a suspended
         // dependent-application discharge lands in the key as the predicate the
@@ -598,6 +635,27 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             cs.iter().for_each(|_| ctx.scope.exit());
             KeyView {
                 dep_tuple: components,
+                ..Default::default()
+            }
+        }
+        // A domain keys as an index type, at this polarity as a data domain does; the body
+        // under every binder, as `compact_go` compacts it.
+        Type::Family { binders, body } => {
+            let domains = binders
+                .iter()
+                .map(|(_, t)| key_go(t, pol, subst_acc, ctx))
+                .collect();
+            let mut acc = subst_acc.clone();
+            for (name, _) in binders {
+                ctx.scope.enter(name.clone());
+                if let Some(b) = name {
+                    acc = acc.shadow(b);
+                }
+            }
+            let body = key_go(body, pol, &acc, ctx);
+            binders.iter().for_each(|_| ctx.scope.exit());
+            KeyView {
+                family: Some((domains, Box::new(body))),
                 ..Default::default()
             }
         }
