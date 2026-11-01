@@ -640,6 +640,10 @@ struct BlockValue {
     defer: Name,
     /// The binding the code after the block reads the values through, `𝐼 ⤇ 𝑉`.
     values: Name,
+    /// The tag the value carries where the block commits ([`TypedExprNode::Begin`]). Where it
+    /// carries another, the writer writes back each variable's snapshot and sends no output,
+    /// so the block reads every variable it writes.
+    commits_on: Option<Label>,
 }
 
 /// A loop whose body holds a block in value position: the loop iterates the block's values
@@ -1159,7 +1163,7 @@ fn rename_var_uses(e: &mut Expr, from: &Name, to: &Name) {
 fn flatten_begin_bodies(mut expr: Expr) -> Expr {
     expr.map_children(flatten_begin_bodies);
     let begin_id = expr.node_id();
-    if let TypedExprNode::Begin { body } = &mut expr.node {
+    if let TypedExprNode::Begin { body, .. } = &mut expr.node {
         let _g = provenance::enter(begin_id, "transact.flatten", provenance::Nature::Machinery);
         let taken = std::mem::take(&mut **body);
         **body = flatten_block(taken);
@@ -1454,7 +1458,7 @@ fn write_off_a_spine(expr: &Expr) -> Option<NodeId> {
         }
     }
     match &expr.node {
-        TypedExprNode::Begin { body } => spine(body),
+        TypedExprNode::Begin { body, .. } => spine(body),
         _ => {
             let mut found = None;
             expr.any_child(|child| {
@@ -1557,7 +1561,7 @@ fn strip(
             unreachable!("guarded above")
         };
         let begin_id = effect.node_id;
-        let TypedExprNode::Begin { body: block } = effect.node else {
+        let TypedExprNode::Begin { body: block, .. } = effect.node else {
             unreachable!("guarded above")
         };
         // ``match m: case `tag(w): <writes>`` in the block reaches here as a
@@ -1582,16 +1586,12 @@ fn strip(
         };
         if writes_any(&block, txn_mut_vars) {
             // A writing block → a commit-record site keyed on the *enclosing*
-            // loop. Partition it by mutable variable domain: the transactional remainder is
-            // the commit decision; each induction `MutWrite` is lifted onto the
-            // loop body as a sibling (after the stripped block, same iteration
-            // position), where `mut_elim` folds it into the loop recurrence.
+            // loop, or on a singleton outside one. Partition it by mutable variable domain:
+            // the transactional remainder is the commit decision; each induction `MutWrite`
+            // is lifted onto the loop body as a sibling (after the stripped block, same
+            // iteration position), where `mut_elim` folds it into the loop recurrence.
             // The two domains stay independent — an induction accumulator is
             // never in the atomic commit.
-            let (target, source, enclosing_writes) = enclosing.expect(
-                "a writing `with begin():` block must be inside a loop (lowering wraps a \
-                 standalone block in a singleton `For`)",
-            );
             let new_rest = {
                 // Recorded here: the source copy the site takes, the statement
                 // wrappers `prepend_effects` mints for the lifted induction
@@ -1600,19 +1600,20 @@ fn strip(
                 // disassembled by `build_writer` under this same parent.
                 let g = provenance::enter(stmt_id, "transact.strip", provenance::Nature::Expansion);
                 g.blame(&[begin_id]);
+                let (target, source, enclosing_writes) = site_source(enclosing);
                 let (txn_block, lifted) = partition_block(*block, txn_mut_vars);
                 let (read_keys, write_keys) = collect_footprint(&txn_block, txn_mut_vars);
                 out.sites.push(RawSite {
                     parent: stmt_id,
-                    target: target.clone(),
+                    target,
                     // The enclosing `For` keeps its `iter` in the stripped tree while
                     // the site carries the same expression into the writer's source,
                     // so the site's copy is its own.
-                    source: source.clone(),
+                    source,
                     block: txn_block,
                     read_keys,
                     write_keys,
-                    enclosing_writes: enclosing_writes.clone(),
+                    enclosing_writes,
                     value: None,
                 });
                 prepend_effects(lifted, *rest)
@@ -1630,17 +1631,37 @@ fn strip(
         }
         let spliced = {
             // `splice_block` re-types the spine as it re-points each statement's
-            // continuation, but preserves every id, so this recording usually
-            // captures nothing and writes nothing. It is here because the arm is a
-            // rewrite: if a re-typed rebuild ever starts minting, the node lands
-            // on the statement it belongs to instead of becoming a leak.
+            // continuation, but preserves every id, so inside a loop this recording
+            // usually captures nothing and writes nothing. It is here because the arm is
+            // a rewrite: if a re-typed rebuild ever starts minting, the node lands
+            // on the statement it belongs to instead of becoming a leak. Outside a loop
+            // it records the singleton loop the block is unwrapped into.
             let g = provenance::enter(
                 stmt_id,
                 "transact.unwrap_block",
                 provenance::Nature::Machinery,
             );
             g.blame(&[begin_id]);
-            splice_block(*block, *rest)
+            match enclosing {
+                Some(_) => splice_block(*block, *rest),
+                // Outside a loop the block runs once, as the body of a loop over the
+                // singleton: an as-of read it feeds out is positioned by the loop that
+                // indexes it (`rewrite_as_of_reads`).
+                None => {
+                    let unit_ty = Type::Base(BaseType::Unit);
+                    let (target, source, _) = site_source(None);
+                    let mut unit = Expr::lit(Lit::Unit);
+                    unit.ty = unit_ty.clone();
+                    let mut once = Expr::new(TypedExprNode::For {
+                        target,
+                        iter: Box::new(source),
+                        body: Box::new(splice_block(*block, unit)),
+                    });
+                    once.ty = unit_ty;
+                    let ty = rest.ty.clone();
+                    Expr::expr_stmt(once, *rest).with_ty(ty)
+                }
+            }
         };
         return strip(spliced, txn_mut_vars, enclosing, out);
     }
@@ -1688,7 +1709,8 @@ fn strip(
     expr
 }
 
-/// Refuse a `with begin():` block in value position inside a lambda: one in a loop lowering
+/// Refuse a `with begin():` block in value position inside a lambda, which includes a block an
+/// exception escapes (`crate::ccl::exceptions`): one in a loop lowering
 /// compiles as a function over its items (a loop that only feeds, or the outer loop of a nest),
 /// or one a call inlined into a feed's value, a comprehension or a function value. [`strip`]
 /// keys a block by the loop whose `For` encloses it, and a lambda's body runs once per
@@ -1700,9 +1722,9 @@ pub fn refuse_valued_blocks_under_lambdas(expr: &Expr) -> Result<(), String> {
             && matches!(bound_expr.node, TypedExprNode::Begin { .. })
         {
             return Err(
-                "a `with begin():` block in value position is not compiled yet where the \
-                 loop around it only feeds or holds another loop, or where a call puts it in an \
-                 expression such as a feed's value"
+                "a `with begin():` block in value position, or one an exception escapes, is not \
+                 compiled yet where the loop around it only feeds or holds another loop, or \
+                 where a call puts it in an expression such as a feed's value"
                     .to_string(),
             );
         }
@@ -1823,6 +1845,94 @@ pub fn refuse_feeds_under_block_values(
     .walk(expr, false, false)
 }
 
+/// Refuse a `with begin():` block an exception escapes ([`TypedExprNode::Begin`]'s
+/// `commits_on`) where the abort is not compiled: one that writes a variable that is not
+/// transactional, and one that writes no transactional variable but sends output. The first's
+/// induction writes leave the block onto the enclosing loop ([`partition_block`]), and the
+/// second is unwrapped onto it, so in both the writes or the outputs stand whatever the block
+/// decides, where the abort must undo them (`docs/chl-spec.md`, "Exceptions").
+pub fn refuse_uncompiled_aborting_blocks(
+    expr: &Expr,
+    txn_mut_vars: &HashSet<Name>,
+) -> Result<(), String> {
+    if let TypedExprNode::Begin {
+        body,
+        commits_on: Some(_),
+    } = &expr.node
+    {
+        if let Some(name) = first_non_txn_write(body, txn_mut_vars) {
+            return Err(format!(
+                "`{name}`, which is not transactional, is written inside a `with begin():` block \
+                 an exception escapes; undoing such a write when the exception aborts the block \
+                 is not compiled yet"
+            ));
+        }
+        if !writes_any(body, txn_mut_vars) && feeds_any(body) {
+            return Err(
+                "a `with begin():` block an exception escapes that sends output and writes no \
+                 transactional variable is not compiled yet"
+                    .to_string(),
+            );
+        }
+    }
+    let mut result = Ok(());
+    expr.any_child(|c| {
+        result = refuse_uncompiled_aborting_blocks(c, txn_mut_vars);
+        result.is_err()
+    });
+    result
+}
+
+/// Refuse a `with begin():` block that writes a transactional variable on only some paths: in a
+/// branch of an `if` or a `match`, which includes a block after a statement that may raise and a
+/// block in a loop an exception escapes, both of which exception elimination places in the
+/// branch where nothing raised (`crate::ccl::exceptions`). [`strip`] keys a block by the loop
+/// around it, or a singleton, and commits it at every position of that source whatever the
+/// branch decides. A read-only block is unwrapped where it stands, so the branch still gates it.
+pub fn refuse_conditional_writing_blocks(
+    expr: &Expr,
+    txn_mut_vars: &HashSet<Name>,
+) -> Result<(), String> {
+    fn walk(e: &Expr, txn_mut_vars: &HashSet<Name>, in_branch: bool) -> Result<(), String> {
+        if let TypedExprNode::Begin { body, .. } = &e.node {
+            if in_branch && writes_any(body, txn_mut_vars) {
+                return Err(
+                    "a `with begin():` block that writes on only some paths, under an `if` or a \
+                     `match` or after a statement that may raise, is not compiled yet"
+                        .to_string(),
+                );
+            }
+            return Ok(());
+        }
+        if let TypedExprNode::Case {
+            scrutinee,
+            branches,
+        } = &e.node
+        {
+            if let Some(s) = scrutinee {
+                walk(s, txn_mut_vars, in_branch)?;
+            }
+            for b in branches {
+                walk(&b.guard, txn_mut_vars, in_branch)?;
+                walk(&b.body, txn_mut_vars, true)?;
+            }
+            return Ok(());
+        }
+        let mut result = Ok(());
+        e.any_child(|c| {
+            result = walk(c, txn_mut_vars, in_branch);
+            result.is_err()
+        });
+        result
+    }
+    walk(expr, txn_mut_vars, false)
+}
+
+/// Whether `e` feeds a channel anywhere in it.
+fn feeds_any(e: &Expr) -> bool {
+    matches!(e.node, TypedExprNode::Feed { .. }) || e.any_child(feeds_any)
+}
+
 /// Strip a `with begin():` block in value position, `let x = Begin{block} in rest`, and return
 /// the continuation that reads its value ([`BlockValue`]).
 ///
@@ -1849,7 +1959,11 @@ fn strip_valued_block(
         unreachable!("called on a `let`")
     };
     let begin_id = bound_expr.node_id;
-    let TypedExprNode::Begin { body: block } = bound_expr.node else {
+    let TypedExprNode::Begin {
+        body: block,
+        commits_on,
+    } = bound_expr.node
+    else {
         unreachable!("called on a `let` of a `Begin`")
     };
     if !writes_any(&block, txn_mut_vars) {
@@ -1868,19 +1982,7 @@ fn strip_valued_block(
     );
     g.blame(&[begin_id]);
     let value_ty = binding.ty.clone();
-    let (target, source, enclosing_writes) = match enclosing {
-        Some((target, source, writes)) => (target.clone(), source.clone(), writes.clone()),
-        None => {
-            // One item, one transaction, as lowering gives a standalone block in statement
-            // position (`lower_standalone_transaction`).
-            let target = binding_unit(Name::fresh("__txn_item"));
-            let mut unit = Expr::lit(Lit::Unit);
-            unit.ty = Type::Base(BaseType::Unit);
-            let mut source = Expr::list(vec![unit]);
-            source.ty = Type::data_fun(Type::UIntRange(1), Type::Base(BaseType::Unit));
-            (target, source, HashSet::new())
-        }
-    };
+    let (target, source, enclosing_writes) = site_source(enclosing);
     let dom = source
         .ty
         .domain()
@@ -1890,7 +1992,14 @@ fn strip_valued_block(
     let block = feed_block_value(*block, &defer, &value_ty);
     let block = crate::ccl::ccl_utils::statement_tag_cases_to_guards(block);
     let (txn_block, lifted) = partition_block(block, txn_mut_vars);
-    let (read_keys, write_keys) = collect_footprint(&txn_block, txn_mut_vars);
+    let (mut read_keys, write_keys) = collect_footprint(&txn_block, txn_mut_vars);
+    if commits_on.is_some() {
+        for k in &write_keys {
+            if !read_keys.contains(k) {
+                read_keys.push(k.clone());
+            }
+        }
+    }
     out.sites.push(RawSite {
         parent: stmt_id,
         target: target.clone(),
@@ -1902,6 +2011,7 @@ fn strip_valued_block(
         value: Some(BlockValue {
             defer,
             values: values.clone(),
+            commits_on,
         }),
     });
     let rest = match enclosing {
@@ -1925,9 +2035,22 @@ fn strip_valued_block(
     prepend_effects(lifted, rest)
 }
 
-/// A `Unit` binder for the item of a synthesized singleton source.
-fn binding_unit(name: Name) -> TypedBinding {
-    binding(name, Type::Base(BaseType::Unit))
+/// The item binder, source and enclosing induction writes of a block's site: the enclosing
+/// loop's, or outside a loop a synthesized singleton `[unit]`, one item and so one transaction.
+fn site_source(
+    enclosing: Option<(&TypedBinding, &Expr, &HashSet<Name>)>,
+) -> (TypedBinding, Expr, HashSet<Name>) {
+    match enclosing {
+        Some((target, source, writes)) => (target.clone(), source.clone(), writes.clone()),
+        None => {
+            let target = binding(Name::fresh("__txn_item"), Type::Base(BaseType::Unit));
+            let mut unit = Expr::lit(Lit::Unit);
+            unit.ty = Type::Base(BaseType::Unit);
+            let mut source = Expr::list(vec![unit]);
+            source.ty = Type::data_fun(Type::UIntRange(1), Type::Base(BaseType::Unit));
+            (target, source, HashSet::new())
+        }
+    }
 }
 
 /// `block`, the body of a block in value position, ending in `let __v = tail in defer << __v`
@@ -2240,7 +2363,7 @@ pub fn check_no_induction_only_transactions(
     expr: &Expr,
     txn_mut_vars: &HashSet<Name>,
 ) -> Result<(), Located<String>> {
-    if let TypedExprNode::Begin { body } = &expr.node
+    if let TypedExprNode::Begin { body, .. } = &expr.node
         && !writes_any(body, txn_mut_vars)
         && let Some(name) = first_non_txn_write(body, txn_mut_vars)
     {
@@ -2282,7 +2405,7 @@ pub fn check_no_guarded_induction_write_in_block(
     expr: &Expr,
     txn_mut_vars: &HashSet<Name>,
 ) -> Result<(), Located<String>> {
-    if let TypedExprNode::Begin { body } = &expr.node
+    if let TypedExprNode::Begin { body, .. } = &expr.node
         && let Some(name) = guarded_non_txn_write(body, txn_mut_vars, false)
     {
         return Err(Located::new(
@@ -2326,7 +2449,7 @@ pub fn check_no_induction_write_reading_past_a_write(
     expr: &Expr,
     txn_mut_vars: &HashSet<Name>,
 ) -> Result<(), Located<String>> {
-    if let TypedExprNode::Begin { body } = &expr.node
+    if let TypedExprNode::Begin { body, .. } = &expr.node
         && let Some(var) = induction_write_reading_past_a_write(body, txn_mut_vars)
     {
         return Err(Located::new(
@@ -2985,6 +3108,22 @@ fn build_writer(
     let mut walk = WriterWalk::new(env, feed_counter, Some(&allowed_writes), writes, declared);
     let mut kept = Vec::new();
     walk.walk(site.block, &mut kept);
+    if let Some(value) = &site.value
+        && let Some(tag) = &value.commits_on
+    {
+        let snapshots =
+            site.write_keys
+                .iter()
+                .map(|wk| {
+                    let i =
+                        site.read_keys.iter().position(|rk| rk == wk).expect(
+                            "transact_phase: an aborting block reads every variable it writes",
+                        );
+                    (wk.clone(), param.snapshot(i))
+                })
+                .collect();
+        walk.commit_only_on(&value.defer, tag, &snapshots, &mut kept);
+    }
 
     // The decision variant over `{commit, writes, __to_<defer>*}`, keyed by the variables
     // written: the whole-transaction grant/deny is the tag, the (dense) payload rides

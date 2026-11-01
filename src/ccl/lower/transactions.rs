@@ -19,7 +19,7 @@ use smol_str::SmolStr;
 
 use super::*;
 use crate::{
-    ccl::{BindingTransparency, Branch, Expr, Lit, Type, TypedBinding, TypedExprNode},
+    ccl::{Branch, Expr, Lit, TypedExprNode},
     chl_parser::{
         SurfaceBuiltin,
         ast::{AssignTarget, Expr as ChlExpr, IfBranch, Span, Spanned, Stmt as ChlStmt},
@@ -66,9 +66,9 @@ fn validate_begin_context(context: &Spanned<ChlExpr>) -> Result<(), LoweringErro
 /// reads are snapshots).
 ///
 /// The caller wraps the returned chain in `Expr::begin(..)` and places it as one
-/// statement of a loop body (a per-iteration transaction) or a singleton `For`
-/// (a standalone transaction). `transact_phase` strips each `Begin` into a
-/// commit-record site keyed on the enclosing loop.
+/// statement of a loop body (a per-iteration transaction) or of any other statement
+/// chain (a standalone transaction). `transact_phase` strips each `Begin` into a
+/// commit-record site keyed on the enclosing loop, or on a singleton source outside one.
 pub(super) fn lower_with_block(
     with_stmt: &Spanned<ChlStmt>,
     outer_bindings: &HashSet<String>,
@@ -112,11 +112,9 @@ pub(super) fn lower_valued_with_block(
     Ok(ctx.tag_image(Expr::begin(block), with_stmt.span))
 }
 
-/// Lower a standalone `with begin(): <block>` (anywhere a statement can appear)
-/// to `ExprStmt(For{__txn_item, [unit], Begin{<block>}}, continuation)` — one
-/// commit over a synthesized singleton source (one item → one transaction). The
-/// synthetic `For` gives `transact_phase` an enclosing loop to key the site on,
-/// uniform with a per-iteration transaction inside a real loop.
+/// Lower a standalone `with begin(): <block>` (anywhere a statement can appear) to
+/// `ExprStmt(Begin{<block>}, continuation)`. The transaction phase runs it once, over a
+/// singleton source.
 pub(super) fn lower_standalone_transaction(
     with_stmt: &Spanned<ChlStmt>,
     continuation: Expr,
@@ -124,37 +122,12 @@ pub(super) fn lower_standalone_transaction(
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     let block = lower_with_block(with_stmt, outer_bindings, ctx)?;
-    let iter_var = ctx.fresh_txn_item();
-    // A singleton source `[unit]`: one element → exactly one transaction. The
-    // item is never read (the block reads only stores). The `Begin` sits as an
-    // `ExprStmt` effect on the (singleton) loop body — the same shape a
-    // per-iteration transaction has, so `transact_phase::strip` handles both.
-    // The whole singleton-loop scaffolding is manufactured encoding; only the
-    // `Begin` images the `with begin():` the user wrote.
-    let ts = "lower.txn_singleton";
-    let span = with_stmt.span;
-    let unit_item = ctx.tag_machinery(Expr::lit(Lit::Unit), span, ts);
-    let source = ctx.tag_machinery(Expr::list(vec![unit_item]), span, ts);
-    let begin = ctx.tag_image(Expr::begin(block), span);
-    let body_unit = ctx.tag_machinery(Expr::lit(Lit::Unit), span, ts);
-    let body = ctx.tag_machinery(Expr::expr_stmt(begin, body_unit), span, ts);
-    let for_node = ctx.tag_machinery(for_over(iter_var, source, body), span, ts);
-    Ok(ctx.tag_machinery(Expr::expr_stmt(for_node, continuation), span, ts))
-}
-
-/// `For { target: <iter_var> (untyped), iter: <source>, body: <block> }`.
-fn for_over(iter_var: String, source: Expr, block: Expr) -> Expr {
-    Expr::new(TypedExprNode::For {
-        target: TypedBinding {
-            name: iter_var.into(),
-            ty: Type::Hole,
-            user_annotation: None,
-            transparency: BindingTransparency::Transparent,
-            site: None,
-        },
-        iter: Box::new(source),
-        body: Box::new(block),
-    })
+    let begin = ctx.tag_image(Expr::begin(block), with_stmt.span);
+    Ok(ctx.tag_machinery(
+        Expr::expr_stmt(begin, continuation),
+        with_stmt.span,
+        "lower.stmt_seq",
+    ))
 }
 
 /// Lower a `with begin():` block body to a per-transaction statement chain
@@ -357,7 +330,7 @@ fn lower_tx_block_scoped(
                     handlers,
                     outer_bindings,
                     ctx,
-                    |body, scope, ctx| lower_tx_block_inner(body, scope, stmt.span, false, ctx),
+                    |body, scope, _, ctx| lower_tx_block_inner(body, scope, stmt.span, false, ctx),
                 )?;
                 ctx.tag_machinery(Expr::expr_stmt(attempt, chain), stmt.span, "lower.stmt_seq")
             }
@@ -425,7 +398,7 @@ fn lower_tx_tail(
             handlers,
             outer_bindings,
             ctx,
-            |body, scope, ctx| lower_tx_block_inner(body, scope, stmt.span, true, ctx),
+            |body, scope, _, ctx| lower_tx_block_inner(body, scope, stmt.span, true, ctx),
         ),
         _ => Err(LoweringError::unsupported(
             stmt.span,

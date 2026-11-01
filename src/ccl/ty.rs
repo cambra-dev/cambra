@@ -4972,7 +4972,16 @@ fn eq_term_modulo_ty_slots_go(
                 }
                 && eq_term_modulo_ty_slots_go(v1, v2, pairs)
         }
-        (N::Begin { body: b1 }, N::Begin { body: b2 }) => eq_term_modulo_ty_slots_go(b1, b2, pairs),
+        (
+            N::Begin {
+                body: b1,
+                commits_on: c1,
+            },
+            N::Begin {
+                body: b2,
+                commits_on: c2,
+            },
+        ) => c1 == c2 && eq_term_modulo_ty_slots_go(b1, b2, pairs),
         (N::List(x), N::List(y))
         | (N::Tuple(x), N::Tuple(y))
         | (N::Compose(x), N::Compose(y))

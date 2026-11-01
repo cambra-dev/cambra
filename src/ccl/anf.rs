@@ -689,8 +689,9 @@ fn normalize_inner(e: Expr, muts: &Muts) -> Expr {
             )
         }
 
-        TypedExprNode::Begin { body } => rebuild(TypedExprNode::Begin {
+        TypedExprNode::Begin { body, commits_on } => rebuild(TypedExprNode::Begin {
             body: Box::new(normalize(*body, muts)),
+            commits_on,
         }),
 
         TypedExprNode::Case {

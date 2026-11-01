@@ -345,12 +345,16 @@ eliminator, stated by content rather than by a "mirrors CHL" adjective.)
   `mut_elim::desugar_keyed_writes` then rewrites it to the whole-value write it denotes,
   `m := insert(m, k, v)`, so every phase below sees one kind of `MutWrite` and none of them
   needs a key.
-- `Begin { body }` — one `with begin():` transaction block, made a *single* `Unit`-valued statement
+- `Begin { body, commits_on }` — one `with begin():` transaction block, made a single `Unit`-valued statement
   (`ExprStmt(Begin{block}, rest)`) so a loop body may freely mix a per-iteration transaction, sibling
   induction writes, and feeds. `body` is the per-transaction statement chain. The transaction phase
   strips it: a block writing a `Mut(_, Txn)` mutable variable becomes a commit site (partitioned by mutable variable
   domain — induction writes lifted onto the enclosing loop); a read-only block is unwrapped onto the
-  loop spine. A standalone block lowers to a singleton `For` wrapping a `Begin`.
+  loop spine. A standalone block lowers to a `Begin` on its statement chain, and the phase runs it
+  over the singleton `[unit]`: a writing block as a site over it, and a read-only block as the
+  body of a loop over it, which positions the as-of reads it feeds out. `commits_on` is
+  `` `__ok `` on a block an exception escapes ([A block an exception
+  escapes](#a-block-an-exception-escapes)) and `None` on every other.
 - `Feed { name, value }` / `Defer` — a `<<` feed and its channel. These survive into inference (so
   a defer binding is typed, at `Feed(𝑉)`) and are eliminated by mut_elim (feeds via channelize).
 
@@ -1363,6 +1367,38 @@ any condition. `channelize` types a conditional feed's channel by restricting a 
 condition, and here the restriction reads the store. The channel's type leaves the store's scope at
 the declaration of the channel it feeds, and a type outside a `letrec` cannot state a value read
 from it.
+
+### A block an exception escapes
+
+Exception elimination makes a `Begin` whose body may raise the outcome of its body,
+``{`__ok{𝑇} | `__raise𝑖{𝐸𝑖} …}``, with `commits_on` set to `` `__ok ``, and the code after the
+block matches that outcome: `let __outcome = Begin{block} in match __outcome {…}`. A block in
+statement position is then in value position too, and compiles as [A block in value
+position](#a-block-in-value-position) describes, with the decision gated on the outcome
+(`WriterWalk::commit_only_on`):
+
+- `committed = __v ▷ variant_is(`__ok)`, over the value the block feeds to its `__block_value`
+  defer.
+- Each variable the block writes holds `{committed → 𝑤; true → 𝑠}`, its written value `𝑤` where
+  the block commits and its snapshot `𝑠` elsewhere. The block reads every variable it writes, so
+  each snapshot is a slot of the writer parameter.
+- Each tap other than the value's fires on `committed` and its own path, so an aborted block sends
+  no output. The value's tap fires on every path, so the code after the block reads every outcome.
+
+An aborted block commits its snapshots, which leaves every variable as it was, and takes a commit
+time like any other proposal.
+
+In a loop, the block's outcome is a value the loop iterates, so a clause that feeds is a feed under
+a condition reading a block's value, refused as [A block in value position](#a-block-in-value-position)
+describes.
+
+Three shapes are refused before the phase with internal errors. An induction write in such a
+block is lifted onto the enclosing loop, and a block that writes no transactional variable is
+unwrapped onto it, so their writes and outputs would stand whatever the block decides
+(`refuse_uncompiled_aborting_blocks`). A writing block on only some paths, in a branch of an `if`
+or a `match`, would commit at every position of its source
+(`refuse_conditional_writing_blocks`). Exception elimination puts a block there when a statement
+before it may raise, and when an exception escapes the loop around it.
 
 ### A reply's `Txn` domain overstates its keys [Interim]
 

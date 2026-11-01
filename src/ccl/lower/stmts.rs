@@ -2813,12 +2813,13 @@ fn lower_try(
         handlers,
         outer_bindings,
         ctx,
-        |body, scope, ctx| lower_stmts_inner(body, scope, ctx, false),
+        |body, scope, _, ctx| lower_stmts_inner(body, scope, ctx, false),
     )
 }
 
 /// [`lower_try`] with a caller-selected block policy, as [`lower_match_over`] takes one: a
-/// value block and a loop body's statement chain lower their blocks differently.
+/// value block and a loop body's statement chain lower their blocks differently. The policy's
+/// `bool` is whether the block is a clause's, which runs only where the `try` block raised.
 pub(super) fn lower_try_over(
     span: chl_parser::ast::Span,
     body: &[Spanned<ChlStmt>],
@@ -2828,10 +2829,11 @@ pub(super) fn lower_try_over(
     mut lower_body: impl FnMut(
         &[Spanned<ChlStmt>],
         &HashSet<String>,
+        bool,
         &mut LoweringContext,
     ) -> Result<Expr, LoweringError>,
 ) -> Result<Expr, LoweringError> {
-    let body = lower_body(body, outer_bindings, ctx)?;
+    let body = lower_body(body, outer_bindings, false, ctx)?;
     let mut lowered = Vec::with_capacity(handlers.len());
     for h in handlers {
         let catches = lower_type_expr(&h.ty, ctx)?;
@@ -2841,8 +2843,9 @@ pub(super) fn lower_try_over(
         };
         let mut scope = outer_bindings.clone();
         scope.insert(binder.clone());
-        let handler_body =
-            ctx.with_shadowed(vec![binder.clone()], |ctx| lower_body(&h.body, &scope, ctx))?;
+        let handler_body = ctx.with_shadowed(vec![binder.clone()], |ctx| {
+            lower_body(&h.body, &scope, true, ctx)
+        })?;
         lowered.push(crate::ccl::expr::Handler {
             catches,
             binding: TypedBinding {

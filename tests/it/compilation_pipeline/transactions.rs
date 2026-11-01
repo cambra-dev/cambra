@@ -4684,6 +4684,24 @@ fn a_feed_beside_a_block_value(#[case] code: &str, #[case] expected: &str) {
     );
 }
 
+/// A writing block under an `if` outside a loop commits only where the `if` holds, which the
+/// transaction phase does not compile: it is refused rather than committed whatever the `if`
+/// decides.
+#[test]
+fn a_writing_block_under_an_if_is_refused() {
+    check_compile_error(
+        indoc! {"
+            pool: Mut(Int, Txn) := 100
+            x = 1
+            if x > 2:
+                with begin():
+                    pool := pool - 1
+            await_final(pool)
+        "},
+        "a `with begin():` block that writes on only some paths",
+    );
+}
+
 /// A block in value position ends in a value on every path.
 #[rstest]
 #[case::a_write(indoc! {"
@@ -4811,7 +4829,8 @@ fn a_block_value_replies_while_its_source_is_open() {
 fn a_block_value_under_a_lambda_is_refused(#[case] code: &str) {
     check_compile_error(
         code,
-        "a `with begin():` block in value position is not compiled yet",
+        "a `with begin():` block in value position, or one an exception escapes, is not \
+         compiled yet",
     );
 }
 

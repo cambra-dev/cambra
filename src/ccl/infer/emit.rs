@@ -329,7 +329,7 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
         // A value known only by its type, which the `let` binding it states.
         TypedExprNode::Abstract => ctx.fresh(),
 
-        TypedExprNode::Begin { body } => emit_begin(body, ctx)?,
+        TypedExprNode::Begin { body, .. } => emit_begin(body, ctx)?,
 
         // The feed/define target lookup is Emit-specific (Check maintains no
         // scope): resolve the feed handle's type from the environment exactly

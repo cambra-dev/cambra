@@ -526,6 +526,7 @@ fn hash_payload<'a>(
         // two readings at different sites are two calls, unequal as terms, and a pass that
         // merges equal terms compares them with `==`, never by this hash.
         N::Reading(r) => r.intrinsic.hash(h),
+        N::Begin { commits_on, .. } => commits_on.hash(h),
         N::Proj(ProjKey::Index(i)) => i.hash(h),
         N::Proj(ProjKey::Field(f)) => f.hash(h),
 
@@ -536,7 +537,6 @@ fn hash_payload<'a>(
         | N::Error
         | N::Apply { .. }
         | N::ExprStmt { .. }
-        | N::Begin { .. }
         | N::List(_)
         | N::Tuple(_)
         | N::Compose(_)

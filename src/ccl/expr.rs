@@ -933,10 +933,15 @@ pub enum TypedExprNode {
     /// none, and inference is the last pass a module's check tree reaches.
     Abstract,
 
-    /// A `with begin():` transaction block, as **one statement** (value `Unit`).
-    /// `body` is the per-transaction statement chain lowering builds (a
-    /// `Let`/`MutWrite`/`Case`/`Feed` chain ending in `Unit`) — the block's
-    /// atomic writes, reads, guards, and per-commit feeds.
+    /// A `with begin():` transaction block. `body` is the per-transaction statement chain
+    /// lowering builds (a `Let`/`MutWrite`/`Case`/`Feed` chain) — the block's atomic writes,
+    /// reads, guards, and per-commit feeds — ending in `Unit` in statement position and in the
+    /// block's value in value position.
+    ///
+    /// `commits_on` is the tag the block's value carries on the paths that commit its writes
+    /// and send its outputs. Exception elimination sets it to `` `__ok `` on a block an
+    /// exception escapes, whose value is then its outcome (`crate::ccl::exceptions`); every
+    /// other block has `None` and commits on every path its statements decide.
     ///
     /// A pre-phase surface marker in the same transient class as
     /// [`For`](TypedExprNode::For)/[`Feed`](TypedExprNode::Feed)/
@@ -947,7 +952,10 @@ pub enum TypedExprNode {
     /// Making the block a statement (rather than *being* the whole `For` body)
     /// is what lets one loop body mix a transaction with sibling induction
     /// writes and feeds.
-    Begin { body: Box<TypedExpr> },
+    Begin {
+        body: Box<TypedExpr>,
+        commits_on: Option<Label>,
+    },
 
     /// Recovery placeholder inserted by lowering when a sub-expression or
     /// statement could not be lowered (either because it came from a parser
@@ -1384,6 +1392,7 @@ impl TypedExpr {
     pub fn begin(body: Self) -> Self {
         Self::new(TypedExprNode::Begin {
             body: Box::new(body),
+            commits_on: None,
         })
     }
 
@@ -1883,7 +1892,7 @@ impl TypedExpr {
                 }
                 f(value.as_ref());
             }
-            TypedExprNode::Begin { body } => f(body.as_ref()),
+            TypedExprNode::Begin { body, .. } => f(body.as_ref()),
         }
     }
 
@@ -2094,7 +2103,7 @@ impl TypedExpr {
                 }
                 f(value.as_mut());
             }
-            TypedExprNode::Begin { body } => f(body.as_mut()),
+            TypedExprNode::Begin { body, .. } => f(body.as_mut()),
         }
     }
 

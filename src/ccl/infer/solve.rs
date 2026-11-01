@@ -2315,7 +2315,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
             coalesce_node(value, level, ctx);
         }
         // A `Begin` block: recurse into its body chain. It binds no name.
-        TypedExprNode::Begin { body } => coalesce_node(body, level, ctx),
+        TypedExprNode::Begin { body, .. } => coalesce_node(body, level, ctx),
         TypedExprNode::For { target, iter, body } => {
             coalesce_node(iter, level, ctx);
             // The loop target binds only inside the body.

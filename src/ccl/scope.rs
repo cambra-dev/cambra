@@ -331,7 +331,7 @@ where
             open(f, expr);
             open(f, body);
         }
-        N::Begin { body } => open(f, body),
+        N::Begin { body, .. } => open(f, body),
         // A type alias binds no value; its type is a type slot, reached by the
         // caller's type walk.
         N::LetType { body, .. } | N::Run { body, .. } => open(f, body),
@@ -737,6 +737,7 @@ mod tests {
             TypedExpr::expr_stmt(var("stmt"), var("rest")),
             node(N::Begin {
                 body: Box::new(var("bg")),
+                commits_on: None,
             }),
             TypedExpr::feed("d", var("fv")),
             node(N::Define {

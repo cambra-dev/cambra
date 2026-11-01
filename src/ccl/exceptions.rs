@@ -47,29 +47,6 @@ pub fn eliminate(expr: Expr) -> Expr {
     expr
 }
 
-/// Refuse an exception that escapes a `with begin():` block, which aborts the transaction
-/// (`docs/chl-spec.md`, "Exceptions"): its outcome would have to leave the commit, which
-/// nothing carries yet. An exception caught inside the block compiles.
-pub fn refuse_escaping_blocks(expr: &Expr) -> Result<(), String> {
-    if let TypedExprNode::Begin { body } = &expr.node {
-        let mut escaping = Vec::new();
-        Cx::escapes(body, &mut escaping);
-        if let Some(raised) = escaping.first() {
-            return Err(format!(
-                "an exception of type `{raised}` escaping a `with begin():` block is not \
-                 compiled yet; catch it inside the block"
-            ));
-        }
-    }
-    let mut result = Ok(());
-    expr.walk_children(|c| {
-        if result.is_ok() {
-            result = refuse_escaping_blocks(c);
-        }
-    });
-    result
-}
-
 /// `ty` with each refinement predicate structurally equal to `from` replaced by `to`, one
 /// rewrite per predicate term however many slots share it ([`PredMemo`]).
 fn replace_filter(ty: &mut Type, memo: &PredMemo<()>, from: &Expr, to: &Expr) {
@@ -981,22 +958,39 @@ impl Cx {
                     arms,
                 )
             }
-            // A block's exceptions are caught inside it ([`refuse_escaping_blocks`]), so it
-            // commits as its body's statements decide.
-            TypedExprNode::Begin { body } => match self.elim(*body, arms) {
-                Elim::Pure(body) => Elim::Pure(
-                    Expr::preserve(
-                        id,
-                        TypedExprNode::Begin {
-                            body: Box::new(body),
-                        },
-                    )
-                    .with_ty(ty),
-                ),
-                Elim::Raising(_) => {
-                    unreachable!("`refuse_escaping_blocks` refuses an exception escaping a block")
+            // A block an exception escapes is its body's outcome, and commits only where that
+            // holds a value: an escaping exception aborts it.
+            TypedExprNode::Begin { body, commits_on } => {
+                assert!(
+                    commits_on.is_none(),
+                    "exception elimination runs once, so no block commits on a tag yet"
+                );
+                match self.elim(*body, arms) {
+                    Elim::Pure(body) => Elim::Pure(
+                        Expr::preserve(
+                            id,
+                            TypedExprNode::Begin {
+                                body: Box::new(body),
+                                commits_on: None,
+                            },
+                        )
+                        .with_ty(ty),
+                    ),
+                    Elim::Raising(body) => {
+                        let outcome = body.ty.clone();
+                        Elim::Raising(
+                            Expr::preserve(
+                                id,
+                                TypedExprNode::Begin {
+                                    body: Box::new(body),
+                                    commits_on: Some(Self::ok()),
+                                },
+                            )
+                            .with_ty(outcome),
+                        )
+                    }
                 }
-            },
+            }
             TypedExprNode::Lambda { .. }
             | TypedExprNode::LetRec { .. }
             | TypedExprNode::DefGroup { .. } => {

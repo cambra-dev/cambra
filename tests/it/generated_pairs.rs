@@ -111,6 +111,8 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ),
     ("trait_instance_body", "groupby_sum", "CompilerRejects"),
     ("trait_instance_body", "rows_sum", "CompilerPanics"),
+    ("txn_raise", "generator_max", "CompilerRejects"),
+    ("txn_raise_standalone", "generator_max", "CompilerRejects"),
     ("txn_reply", "generator_max", "CompilerRejects"),
     ("txn_value", "generator_max", "CompilerRejects"),
     ("txn_value_standalone", "generator_max", "CompilerRejects"),
@@ -581,6 +583,34 @@ fn skeletons() -> Vec<Skeleton> {
                 pool := pool - 1
                 {}
             out << x
+        "#}},
+        Skeleton { name: "txn_raise", hole: Ty::Int, scope: &[("pool", Ty::Int), ("r", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            for r in [1, 2]:
+                got = try:
+                        with begin():
+                            pool := pool - {}
+                            out << pool
+                            if r > 1:
+                                raise r
+                        0
+                    except Int as e:
+                        e
+                out << got
+        "#}},
+        Skeleton { name: "txn_raise_standalone", hole: Ty::Int, scope: &[("pool", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            got = try:
+                    with begin():
+                        pool := pool - 1
+                        raise {}
+                    0
+                except Int as e:
+                    e
+            out << got
+            out << await_final(pool)
         "#}},
         Skeleton { name: "mut_init", hole: Ty::Int, scope: &[], body: indoc! {r#"
             acc := {}

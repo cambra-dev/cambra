@@ -1479,10 +1479,10 @@ pub(super) fn lower_direct_mirror_loop(
 /// body identically — so a `+=` under an `if` produces the same `MutWrite`
 /// marker it would at top level, just nested inside a statement-position `Case`.
 ///
-/// `in_conditional` is `true` when lowering an `if`-branch body: a per-iteration
-/// `with begin():` transaction inside a conditional is not yet supported (the
-/// per-path transaction verdict — see `design/mutability.md`), so it is rejected
-/// there rather than emitted as a `Begin` marker.
+/// `in_conditional` is `true` when lowering an `if`-branch body, a `match` arm or an `except`
+/// clause: a per-iteration `with begin():` transaction inside a conditional is not yet supported
+/// (the per-path transaction verdict — see `design/mutability.md`), so it is rejected there
+/// rather than emitted as a `Begin` marker.
 fn lower_loop_body_chain(
     body_stmts: &[Spanned<ChlStmt>],
     acc_names: &[String],
@@ -1752,7 +1752,8 @@ fn lower_loop_body_chain_scoped(
                 ctx.tag_machinery(Expr::expr_stmt(raise, chain), stmt.span, "lower.stmt_seq")
             }
             // `try: … except T as e: …` — its blocks are write paths of this body, as a
-            // `match`'s arms are.
+            // `match`'s arms are. The `try` block runs where the `try` does, and a clause only
+            // where it raised.
             ChlStmt::Try { body, handlers } => {
                 let attempt = lower_try_over(
                     stmt.span,
@@ -1760,12 +1761,12 @@ fn lower_loop_body_chain_scoped(
                     handlers,
                     outer_bindings,
                     ctx,
-                    |body, scope, ctx| {
+                    |body, scope, clause, ctx| {
                         lower_loop_body_chain(
                             body,
                             acc_names,
                             yield_defer,
-                            true,
+                            in_conditional || clause,
                             scope,
                             stmt.span,
                             ctx,

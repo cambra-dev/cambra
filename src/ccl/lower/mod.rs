@@ -1224,13 +1224,6 @@ impl LoweringContext {
         self.mint_synthetic_id("__result")
     }
 
-    /// Mint a unique `__txn_item_N` name for a standalone transaction's synthetic
-    /// singleton-source binder. The item is never read (the block reads only
-    /// stores), so the name only needs to be collision-free.
-    pub(super) fn fresh_txn_item(&mut self) -> String {
-        self.mint_synthetic_id("__txn_item")
-    }
-
     /// Mint a unique `__match_payload_N` name for a binder-less `case tag:` arm.
     ///
     /// A [`crate::ccl::expr::Pattern`] always names the payload it narrows, so an
