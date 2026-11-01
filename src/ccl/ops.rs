@@ -606,7 +606,8 @@ pub enum Builtin {
     /// tap's ``variant_project(`commit)`` drops it.
     ///
     /// Heads each in-block reply tap [`crate::ccl::transact_phase`] binds, which types a reply
-    /// `Txn ⤇ 𝑉`, keyed as the store serves it. Minted after inference with its type stamped,
+    /// `Txn ⤇ 𝑉`, keyed as the store serves it. A block's value is a tap read keyed by item, as
+    /// the records are, and does not pass through it. Minted after inference with its type stamped,
     /// like [`Self::BeginTxn`], and consumed with the tap binding by
     /// [`crate::ccl::planning::plan_loops`], so its op-conversion arm is a deliberate error.
     ByCommitTime,

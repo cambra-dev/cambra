@@ -469,7 +469,8 @@ enum TxnBinding {
     /// `commits_j : 𝐼 ⇒ {time, write_targets, decision} = let __t = begin in ⟨record⟩`.
     Commit,
     /// ``__to_<defer> : Txn ⤇ {`fired{V} | `idle} = (commits_j ▷ by_commit_time) ≫ .decision ≫
-    /// variant_project(`commit) ≫ .field``.
+    /// variant_project(`commit) ≫ .field``, or keyed by item, ``commits_j ≫ .decision ≫ …``
+    /// ([`tap_field`]).
     Tap,
 }
 
@@ -571,29 +572,36 @@ fn recover_writer(site_dom: &Type, def: Expr) -> WriterSite {
         write_keys,
         source,
         body,
+        item_taps: Vec::new(),
     }
 }
 
-/// The history-record tap field a tap binding ``(commits_j ▷ by_commit_time) ≫ .decision ≫
-/// variant_project(`commit) ≫ .field`` projects — its trailing field projection.
-fn tap_field(def: &Expr) -> Label {
+/// The history-record tap field a tap binding projects — its trailing field projection — and,
+/// for a tap keyed by item, the commit-record binding it reads.
+///
+/// A tap reads its site's commit records ``commits_j ≫ .decision ≫ variant_project(`commit) ≫
+/// .field``, either keyed by the commit time each carries, through `commits_j ▷ by_commit_time`,
+/// or keyed by the item each was committed for, as `commits_j` is: a block in value position's
+/// value ([`WriterSite::item_taps`]).
+fn tap_field(def: &Expr) -> (Label, Option<Name>) {
     let TypedExprNode::Compose(elts) = &def.node else {
         panic!("letrec recognition: tap binding is not a composition");
     };
-    // The history record's tap field is typed `Txn ⤇ …`, which holds only if the tap reads
-    // its site's commit records through `by_commit_time`.
-    debug_assert!(
-        matches!(
-            elts.first().map(|e| &e.node),
-            Some(TypedExprNode::Apply { function, .. })
-                if matches!(function.node, TypedExprNode::Builtin(Builtin::ByCommitTime))
+    let by_item = match elts.first().map(|e| &e.node) {
+        Some(TypedExprNode::Apply { function, .. })
+            if matches!(function.node, TypedExprNode::Builtin(Builtin::ByCommitTime)) =>
+        {
+            None
+        }
+        Some(TypedExprNode::Var(commits)) => Some(commits.clone()),
+        _ => panic!(
+            "letrec recognition: a tap reads its site's commit records, by commit time or by \
+             item: {}",
+            symbolic(def)
         ),
-        "letrec recognition: a tap is keyed by commit time, so its binding must start with \
-         `commits_j ▷ by_commit_time`: {}",
-        symbolic(def)
-    );
+    };
     match elts.last().map(|e| &e.node) {
-        Some(TypedExprNode::Proj(ProjKey::Field(f))) => f.clone(),
+        Some(TypedExprNode::Proj(ProjKey::Field(f))) => (f.clone(), by_item),
         _ => panic!("letrec recognition: tap binding does not end in a field projection"),
     }
 }
@@ -629,6 +637,10 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
     // Key history-binding name → value type (for the history record + read types).
     let mut key_ty: Vec<(Name, Type)> = Vec::new();
     let mut writers: Vec<WriterSite> = Vec::new();
+    // Each commit-record binding's writer, by binding name, for the taps it is read through.
+    let mut writer_of: HashMap<Name, usize> = HashMap::new();
+    // Each tap keyed by item, with the commit-record binding it reads.
+    let mut item_taps: Vec<(Name, Label)> = Vec::new();
     // Tap binding name → (history-record field, value type).
     let mut taps: Vec<(Name, Label, Type)> = Vec::new();
     // Every binding name, to assert the continuation has no dangling references.
@@ -675,15 +687,27 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
                 let site_dom =
                     b.ty.domain()
                         .expect("letrec recognition: commit binding is a function");
+                writer_of.insert(b.name.clone(), writers.len());
                 writers.push(recover_writer(&site_dom, def));
             }
             TxnBinding::Tap => {
-                // The tap's store field keeps the binding's own type
-                // (``Txn ⤇ {`fired{𝑉} | `idle}``, keyed by commit time): the channel union
-                // channelize already assembled references the taps at that type.
-                taps.push((b.name.clone(), tap_field(&def), b.ty.clone()));
+                // The tap's store field keeps the binding's own type (``Txn ⤇ {`fired{𝑉} |
+                // `idle}`` keyed by commit time, or ``𝐼 ⤇ …`` keyed by item): the channel
+                // union channelize already assembled references the taps at that type.
+                let (field, by_item) = tap_field(&def);
+                if let Some(commits) = by_item {
+                    item_taps.push((commits, field.clone()));
+                }
+                taps.push((b.name.clone(), field, b.ty.clone()));
             }
         }
+    }
+
+    for (commits, field) in item_taps {
+        let writer = writer_of
+            .get(&commits)
+            .unwrap_or_else(|| panic!("letrec recognition: a tap reads `{commits}`, no site's"));
+        writers[*writer].item_taps.push(field);
     }
 
     // Variable record `{key.field_key(): Fun(Txn, V), …, __to_<defer>: Fun(Txn, V)}`
@@ -1151,6 +1175,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         write_keys: key_names,
         source,
         body: writer_body,
+        item_taps: Vec::new(),
     };
     let mut transact = Expr::new(TypedExprNode::Transact {
         keys,

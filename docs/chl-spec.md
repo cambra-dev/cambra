@@ -358,7 +358,7 @@ block_assign_stmt ::= assign_target "=" block_value
                    |  assign_target aug_op block_value
                    |  assign_target "<<=" block_value
 
-block_value     ::= if_stmt | match_stmt
+block_value     ::= if_stmt | match_stmt | try_stmt | with_stmt
 
 aug_op          ::= "+=" | "-=" | "*=" | "//="
 
@@ -4924,9 +4924,9 @@ for req in incr_reqs:
   guards, more than one of them, and `match` dispatch. Each branch's
   writes are scoped to its own path and the transaction commits on the
   disjunction of the writing paths, so a write on the spine beside a
-  guard commits unconditionally. A bare `if p:` with no `else` is the
-  deny idiom: where `p` fails over the snapshot the transaction
-  contributes no write and no reply.
+  guard commits unconditionally. In a block in statement position, a bare `if p:` with no
+  `else` is the deny idiom: where `p` fails over the snapshot the transaction contributes no
+  write and no reply.
 - **An induction accumulator may not be written under a branch inside a
   block** (rejected with a diagnostic). Write it after the block, or, if
   it should be shared across the transaction, declare it `Mut(…, Txn)`
@@ -4938,18 +4938,38 @@ assignment after it. The north-star handlers observe this throughout (e.g.
 `storefront`'s `/order` matches the catalog before opening the transaction
 around `reserve` + `quote` + the feed).
 
-> **Direction [Tentative] — a block is also the value it computes.**
-> Scoping minimally puts the reply outside the block, which leaves the
-> block needing to hand its result out: a `with begin():` block in value
-> position denotes the value of its last statement, the same rule a
-> function body follows (§4.1), and the enclosing binding carries it past
-> the block's end. Nothing admits it today — §2.2 has `with_stmt` as a
-> compound statement and an `assign_stmt` right-hand side as an
-> `expression`, and the two never meet. **[Open]** is how §8.4's gating
-> rule reads against it: a reply fed *inside* a block rides the commit and
-> a denied transaction replies nothing, while a reply outside fires
-> regardless — and this shape puts the reply outside with a value that
-> came from inside, so which of the two it inherits has to be said.
+#### A block is also the value it computes
+
+A `with begin():` block on an assignment's right-hand side is the value of its last statement, by
+the rule a function body follows
+([4.1 `def` — function definition](#41-def--function-definition)): an expression, or an `if`,
+`match` or `try` whose blocks each end in a value. The binding carries the value past the block's
+end, so a handler scoped minimally replies outside the block with a value computed inside it:
+
+```python
+for req in withdraw_reqs:
+    result = with begin():
+        if balance >= req.amount:
+            balance := balance - req.amount
+            "ok"
+        else:
+            "insufficient funds"
+    withdraw_resps << result
+```
+
+- **The value is read in the block's snapshot,** after the writes its path made before it
+  (read-your-writes, [8.3 Reads](#83-reads)).
+- **Every path of a block in value position commits.** A path that writes nothing commits its
+  reads, which places its value at a commit time. There is no deny: where the bare `if p:` above
+  fails, the transaction commits no write and the code after the block still runs, with the value
+  that path computed.
+- **The value is available once the block commits.** Inside a loop, each iteration binds its own
+  block's value, so a reply after the block is indexed by the iteration, as any reply outside a
+  block is ([8.4 Feeds are the second form of
+  mutability](#84-feeds-are-the-second-form-of-mutability)).
+- **A block that writes no transactional variable is a snapshot read.** It commits nothing, and its
+  value is as of an arbitrary commit position, as an as-of read's is ([8.3 Reads](#83-reads)). It
+  reads several variables at one snapshot: `(a, b) = with begin(): (a, b)`.
 
 ### 8.3 Reads
 
@@ -4999,10 +5019,11 @@ observable:
 - **Reply *inside* a block** (`out << e` within `with begin():`) rides the
   commit: it is **sequenced after the commit** and **gated** — a denied
   transaction replies nothing — and is indexed by commit tick.
-- **Reply *outside* the block** rides its own loop's domain and fires every
-  iteration regardless of commit — request-indexed, value-correct, but not
-  commit-ordered. **To gate or commit-order a reply, put it inside the
-  block.**
+- **Reply *outside* the block** rides its own loop's domain and fires every iteration regardless of
+  commit — request-indexed, value-correct, but not commit-ordered. A reply of a block's value waits
+  for that block to commit, which every path of it does
+  ([A block is also the value it computes](#a-block-is-also-the-value-it-computes)). **To gate or
+  commit-order a reply, put it inside the block.**
 
 ### 8.5 Ordering and concurrency
 

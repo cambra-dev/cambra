@@ -84,6 +84,8 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ),
     ("trait_instance_body", "rows_sum", "CompilerPanics"),
     ("txn_reply", "generator_max", "CompilerRejects"),
+    ("txn_value", "generator_max", "CompilerRejects"),
+    ("txn_value_standalone", "generator_max", "CompilerRejects"),
     ("txn_write_rhs", "generator_max", "CompilerRejects"),
 ];
 
@@ -531,6 +533,26 @@ fn skeletons() -> Vec<Skeleton> {
                 with begin():
                     pool := pool - r
                     out << {}
+        "#}},
+        // A block in value position hands its value to the code after it, one value per item:
+        // the path that writes nothing commits its reads and has a value too.
+        Skeleton { name: "txn_value", hole: Ty::Int, scope: &[("pool", Ty::Int), ("r", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            for r in [1, 2]:
+                left = with begin():
+                    if r > 1:
+                        pool := pool - r
+                    {}
+                out << left
+        "#}},
+        Skeleton { name: "txn_value_standalone", hole: Ty::Int, scope: &[("pool", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            x = with begin():
+                pool := pool - 1
+                {}
+            out << x
         "#}},
         Skeleton { name: "mut_init", hole: Ty::Int, scope: &[], body: indoc! {r#"
             acc := {}
