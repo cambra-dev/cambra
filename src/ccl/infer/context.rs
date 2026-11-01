@@ -1109,9 +1109,17 @@ impl InferCtx {
                     .collect();
                 for i in 0..out.len() {
                     let domains = decl.family_domains_at(i, &out);
-                    if let Type::Family { binders, .. } = &mut out[i] {
+                    if let Type::Family { binders, body } = &mut out[i] {
                         for ((_, d), domain) in binders.iter_mut().zip(domains) {
                             *d = domain;
+                        }
+                        // A constant family's holes stand for one type at every value of its
+                        // binders.
+                        if binders.iter().all(|(n, _)| n.is_none()) {
+                            mark_constant_family_holes(
+                                body,
+                                &decl.params[i].spelling,
+                            );
                         }
                     }
                 }
@@ -1284,8 +1292,14 @@ impl InferCtx {
         self.cache.at(self.here(), self.here());
         let result = constrain_subtype_in(inferred, &ann_simple, &mut self.cache, &scope);
         let failed = result.is_err();
-        // A shape the solver does not compile is that gap, not a mismatch with the annotation.
-        if let Err(err @ crate::ccl::infer::solver::ConstrainError::NotCompiledYet(_)) = result {
+        // A value reaching a type chosen outside a binder it reads is refused for that, whatever
+        // else the annotation states: the remedy is a family that names the binder. A shape the
+        // solver does not compile is that gap, not a mismatch with the annotation.
+        if let Err(
+            err @ (crate::ccl::infer::solver::ConstrainError::ParamReadsBinder { .. }
+            | crate::ccl::infer::solver::ConstrainError::NotCompiledYet(_)),
+        ) = result
+        {
             let refused = map_constrain_err(err, "annotation");
             self.settle_annotation_edge(true, || refused.clone())?;
         }
@@ -2407,6 +2421,17 @@ impl Typing for InferCtx {
             None => codomain.clone(),
         }
     }
+}
+
+/// Mark each variable in a constant family's normalized body as standing for a hole of the
+/// family given for `param` ([`crate::ccl::infer_var::StandsFor::ConstantFamily`]).
+fn mark_constant_family_holes(body: &Type, param: &smol_str::SmolStr) {
+    if let Type::Infer(v) = body {
+        v.mark_stands_for(crate::ccl::infer_var::StandsFor::ConstantFamily(
+            param.clone(),
+        ));
+    }
+    body.walk_children(|c| mark_constant_family_holes(c, param));
 }
 
 #[cfg(test)]

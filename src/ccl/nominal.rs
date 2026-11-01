@@ -535,7 +535,7 @@ impl NominalDecl {
                 let binders: Vec<(Name, Type)> = self
                     .family_domains(i)
                     .iter()
-                    .map(|d| (Name::fresh("k"), d.clone()))
+                    .map(|d| (Name::fresh("__family_k"), d.clone()))
                     .collect();
                 let terms = binders
                     .iter()
@@ -1055,7 +1055,7 @@ fn replace_params(ty: &mut Type, pol: bool, map: &HashMap<TypeParamId, (&Type, &
             };
             let names: Vec<Name> = binders
                 .iter()
-                .map(|(n, _)| n.clone().unwrap_or_else(|| Name::fresh("k")))
+                .map(|(n, _)| n.clone().unwrap_or_else(|| Name::fresh("__family_k")))
                 .collect();
             let opened = crate::ccl::subst::open_family_body(binders.len(), body, |j| {
                 crate::ccl::subst::Mapping::Rename(names[j].clone())

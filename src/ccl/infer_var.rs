@@ -708,6 +708,17 @@ pub(crate) fn enforce_bound_scope(holder: &InferVar, side: &'static str, bound: 
     }
 }
 
+/// A type chosen once, outside every binder of the type around it, that an inference variable
+/// stands for: a bound that reads such a binder on the variable is a user error, since nothing
+/// discharges a value's dependence on one (`docs/chl-spec.md`, "Family parameters").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StandsFor {
+    /// A declared type parameter, by its spelling.
+    Param(smol_str::SmolStr),
+    /// A hole in the constant family given for the family parameter of this spelling.
+    ConstantFamily(smol_str::SmolStr),
+}
+
 /// A type inference variable: an unknown type the solver pins down by
 /// accumulating subtyping bounds.
 ///
@@ -768,6 +779,13 @@ pub struct InferVar {
     /// (`constrain_go`'s invariant-domain arm). Set once, at minting, so the edge an equation
     /// takes does not depend on when it is drawn.
     named_domain: std::cell::Cell<bool>,
+    /// The type chosen outside every binder that this variable stands for ([`StandsFor`]): what
+    /// a bound naming a binder outside the variable's scope is reported against
+    /// ([`InferVar::stands_for`]). A variable minted for a type parameter is marked at minting,
+    /// a hole in a constant family when normalization reads the annotation that writes the
+    /// family (`mark_constant_family_holes`), and a proxy or suspension when it is minted, with
+    /// its original's mark.
+    stands_for: RefCell<Option<StandsFor>>,
     /// **The witness binders this variable sits under**: the functions it was minted as a part
     /// of, by their kind, or the one it copies was.
     ///
@@ -1018,6 +1036,7 @@ impl InferVar {
             watches: RefCell::new(Vec::new()),
             suspensions: RefCell::new(Vec::new()),
             named_domain: std::cell::Cell::new(false),
+            stands_for: RefCell::new(None),
             witness_scopes: RefCell::new(Vec::new()),
         });
         ACTIVE_ARENA.with(|slot| {
@@ -1135,6 +1154,25 @@ impl InferVar {
     /// Mark the variable as naming one data domain ([`InferVar::named_domain`]).
     pub(crate) fn mark_named_domain(&self) {
         self.named_domain.set(true);
+    }
+
+    /// The type chosen outside every binder that this variable stands for
+    /// ([`InferVar::stands_for`]).
+    pub fn stands_for(&self) -> Option<StandsFor> {
+        self.stands_for.borrow().clone()
+    }
+
+    /// Record that the variable stands for `chosen` ([`InferVar::stands_for`]).
+    pub(crate) fn mark_stands_for(&self, chosen: StandsFor) {
+        *self.stands_for.borrow_mut() = Some(chosen);
+    }
+
+    /// Stand for what `original` stands for, if anything: for a variable that proxies or
+    /// suspends on it, which resolves to what `original` does.
+    pub(crate) fn inherit_stands_for(&self, original: &InferVar) {
+        if let Some(chosen) = original.stands_for() {
+            self.mark_stands_for(chosen);
+        }
     }
     /// Move the variable down to `level` if it sits above it. A monomorphic binding
     /// claims its right-hand side's variables this way

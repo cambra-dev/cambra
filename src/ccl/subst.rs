@@ -866,6 +866,7 @@ impl Subst {
             Rc::clone(&v.fun_kind)
         };
         let held = crate::ccl::infer_var::InferVar::fresh_over(v.level(), &telescope, kind);
+        held.inherit_stands_for(v);
         // The suspension stands where `v` does, except outside every scope whose binders this
         // substitution discharges: there the witness is a term, not a binder's occurrence.
         held.inherit_witness_placement_where(v, |scope| {
@@ -3358,7 +3359,7 @@ pub fn family_bound_at(app: &crate::ccl::ty::FamilyApp) -> Option<Type> {
     };
     let names: Vec<Name> = binders
         .iter()
-        .map(|(n, _)| n.clone().unwrap_or_else(|| Name::fresh("k")))
+        .map(|(n, _)| n.clone().unwrap_or_else(|| Name::fresh("__family_k")))
         .collect();
     let terms: Vec<Rc<TypedExpr>> = app.args.iter().map(|a| Rc::clone(&a.term)).collect();
     Some(discharge_binders(

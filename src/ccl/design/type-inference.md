@@ -2323,12 +2323,24 @@ Two checks hold it, because no single point sees the whole of what a variable re
 - **At resolution**, a debug build checks the type each variable resolves to against its
   telescope (`assert_resolves_in_scope`).
 
-Both are internal invariant failures, not recoverable user diagnostics, with one exception at
-record time. A gap naming the binder of a function whose codomain edge records the bound
-(`ConstrainCache::codomain_binders`) is a variable that is one type for every value of the binder,
-which the edge would bound at each value: a meet or a join over the binder, which the solver does
-not compute. `constrain_go` reports it as not compiled yet (`codomain_binder_gap`) instead of
-recording the bound.
+Both are internal invariant failures, not recoverable user diagnostics, with two exceptions at
+record time, both reported before the bound is recorded:
+
+- **A variable standing for a type chosen outside every binder of its type** records what it
+  stands for (`InferVar::stands_for`), and so do its proxies and suspensions: a variable that
+  instantiation or a specialization minted for a declared type parameter, and a hole in a constant
+  family. Such a type is chosen once, so a bound from the value's side of the edge naming one of
+  those binders is a program that gives it a value differing with the binder:
+  `ConstrainError::ParamReadsBinder` (`docs/chl-spec.md`, "Family parameters"). The value is on
+  the left of an edge the descent has swapped the sides of an even number of times, and on the
+  right otherwise (`ConstrainCache::value_on_right`). Every edge that relates the sides the other
+  way round swaps them, the second direction of an invariant pair included. A bound from the demand's side reads a binder
+  the value does not: the second exception where that binder is a codomain edge's, an internal
+  failure otherwise.
+- **A gap naming the binder of a function whose codomain edge records the bound**
+  (`ConstrainCache::codomain_binders`) is a variable that is one type for every value of the
+  binder, which the edge would bound at each value: a meet or a join over the binder, which the
+  solver does not compute. It is reported as not compiled yet (`codomain_binder_gap`).
 
 `InferCtx::fresh` passes the current telescope to `InferVar::fresh_in`. Emission extends that
 telescope for term binders, and normalization extends it when descending dependent annotations.

@@ -3701,10 +3701,12 @@ fn fresh_nominal_args<C: Typing>(
         if p.arity == 0 {
             continue;
         }
+        // The binders are the compiler's, so a diagnostic naming one reads it as a key rather
+        // than by a spelling the program never wrote (`Name::source_spelling`).
         let binders: Vec<(Name, Type)> = decl
             .family_domains_at(i, &args)
             .into_iter()
-            .map(|d| (Name::fresh("k"), d))
+            .map(|d| (Name::fresh("__family_k"), d))
             .collect();
         let body = under(&binders, ctx);
         args[i] = Type::family(binders, body);
