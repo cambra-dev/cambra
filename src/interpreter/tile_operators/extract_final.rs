@@ -184,7 +184,7 @@ impl TileProducer for ExtractFinalProducer {
             codomain,
             deleted,
             ..
-        } = source_tile
+        } = &source_tile
         else {
             panic!("ExtractFinal source must be a collection tile");
         };
@@ -195,27 +195,20 @@ impl TileProducer for ExtractFinalProducer {
         let live_outer = (0..domain.len()).rev().find(|i| !deleted.contains(*i));
         if let Some(final_idx) = live_outer {
             let tile = if codomain.is_data_function() {
-                // Keeping one row leaves that key's group standing alone, which is the
-                // value at this position. The source is terminal and this is its last
-                // position, so what it holds is the whole collection.
-                let mut sub = *codomain;
-                sub.retain_rows(
-                    &(0..domain.len())
-                        .map(|i| i == final_idx)
-                        .collect::<Vec<bool>>(),
-                );
-                let Tile::DataFunction {
-                    domain_predicate, ..
-                } = &mut sub
-                else {
-                    unreachable!("retain keeps a collection a collection")
-                };
-                *domain_predicate = Predicate::True;
-                sub
+                // That key's group, taken out on its own, is the value at this position. Every
+                // level's predicates are restated over the group's own paths: a level beneath
+                // the group's own still names the indexed key in its enclosing paths.
+                source_tile
+                    .group_at(CurryLevel::new(1), final_idx)
+                    .expect("a live row of the source has a group")
+                    .into_owned()
             } else {
                 // Built at the *declared* extent: a tag `match` collapses its arms to their
                 // join, and the arm that answers carries only its own tag. Laid out as this
                 // operator's tiling, which keeps a product a record of columns.
+                let Tile::DataFunction { codomain, .. } = source_tile else {
+                    unreachable!("matched as a collection above")
+                };
                 let cv = scalar_tile_to_column_value(*codomain);
                 column_value_to_tile(
                     ColumnValue::from_values(vec![cv.index_at(final_idx)], &extent),

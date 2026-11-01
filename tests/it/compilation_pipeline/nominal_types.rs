@@ -5,6 +5,7 @@
 //! value is one observes the tagged value the constructor built.
 
 use indoc::indoc;
+use rstest::rstest;
 
 use cambra::ccl::FieldKey;
 use cambra::interpreter::Value;
@@ -1263,6 +1264,45 @@ fn extract_answers_the_single_constructors_argument() {
         "#},
         Value::Int(5),
     );
+}
+
+/// `extract` answers a collection of collections whole: each group keeps its own domain, which
+/// is a subset of the source list's positions, at every level below the extracted one. The
+/// groups' type reads the key, which a family parameter names (`docs/chl-spec.md`, "Family
+/// parameters").
+#[rstest]
+#[case::groups(
+    indoc! {r#"
+        type Box1(V) = V
+
+        g = Box1::new(groupby([1, 2, 3], \x -> x > 1))
+        h = g.extract()
+        sum([sum(grp) for grp in h])
+    "#},
+    6
+)]
+#[case::groups_through_a_family_parameter(
+    indoc! {r#"
+        type Box1(K, V: K => Type) = (k: K) |=> V(k)
+
+        g = Box1::new(groupby([1, 2, 3], \x -> x > 1))
+        h = g.extract()
+        sum([sum(grp) for grp in h])
+    "#},
+    6
+)]
+#[case::three_levels(
+    indoc! {r#"
+        type Box1(V) = V
+
+        g = Box1::new([[[1, 2], [3, 4]], [[5, 6], [7, 8]]])
+        h = g.extract()
+        sum([sum([sum(c) for c in b]) for b in h])
+    "#},
+    36
+)]
+fn extract_answers_a_collection_of_groups(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(code, Value::Int(expected));
 }
 
 /// Only the single-constructor form declares `extract`.

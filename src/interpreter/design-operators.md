@@ -814,8 +814,10 @@ The default's extent must be included in the source codomain. `without_default` 
 that cannot finish empty, such as an exhaustive tag partition. Extraction panics if that requirement
 is violated.
 
-A collection-valued result retains the selected position's whole sub-tile. A collection default is
-returned once terminal. Non-collection values are normalized through
+A collection-valued result is the selected position's group taken out on its own
+(`Tile::group_at`): its whole sub-tile, with every level's predicates restated over the group's own
+paths ([Restating a moved group](#restating-a-moved-group)). A collection default is returned once
+terminal. Non-collection values are normalized through
 `scalar_tile_to_column_value` and rebuilt at the declared output extent, preserving variant arms
 absent from the selected value. Record layouts may differ between the source and default. A default
 without a complete value yields an empty result.
