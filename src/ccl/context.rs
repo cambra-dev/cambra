@@ -2705,6 +2705,14 @@ fn run_passes(
             message,
         }]
     })?;
+    transact_phase::refuse_valued_blocks_under_lambdas(&expr)
+        .and_then(|()| transact_phase::refuse_feeds_under_block_values(&expr, &txn_mut_vars))
+        .map_err(|message| {
+            vec![CompileError::Internal {
+                stage: "transact",
+                message,
+            }]
+        })?;
     mut_elim::check_iteration_channel_feeds(&expr)
         .map_err(|e| blame.unsupported(e, Some(&expr)))?;
 

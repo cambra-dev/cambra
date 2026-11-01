@@ -2525,6 +2525,11 @@ pub struct WriterSite {
     /// deny (carry, no proposal). An induction (`mut`-loop) position `` `commit ``s
     /// unless every branch carries (a full non-writing position `` `abort ``s).
     pub body: TypedExpr,
+    /// The decision taps read keyed by the item of [`Self::source`] each was committed for,
+    /// rather than by commit time: the value of a `with begin():` block in value position
+    /// (`src/ccl/design/mutability.md`, "A block in value position"). Empty for every other
+    /// writer.
+    pub item_taps: Vec<Label>,
 }
 
 /// A single branch in a [`TypedExprNode::Case`] expression.

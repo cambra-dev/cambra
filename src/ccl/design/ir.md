@@ -320,7 +320,7 @@ The remaining nodes supply values or mark source structure for a later phase:
 | `Proj` | First-class tuple or record projection; applying it to a value gives field access. |
 | `Compose` | Function composition in application order, built by lowering and lambda elimination. |
 | `ExprStmt` | Statement expression followed by its continuation. |
-| `For`, `MutWrite`, `Begin` | Pre-phase loop, mutable write, and transaction-block structure; mutability phases consume them. |
+| `For`, `MutWrite`, `Begin` | Pre-phase loop, mutable write, and transaction-block structure; mutability phases consume them. A `Begin` is its body's value: `Unit` in statement position, the block's value on an assignment's right-hand side. |
 | `Feed`, `Define`, `Defer` | Deferred-output write, definition, and placeholder; `channelize` resolves them. |
 | `Error` | Recovery placeholder accompanied by lowering errors; compilation stops before inference. |
 

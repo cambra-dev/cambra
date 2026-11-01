@@ -2164,8 +2164,8 @@ where
             )
             .try_map_with(|(target, tail), e| assign_stmt(target, tail, e.span()));
 
-        // `x = if c: … else: …` and `x = match v: …` — a block statement on the
-        // right of an assignment, whose value is the block's own
+        // `x = if c: … else: …`, `x = match v: …`, `x = try: …` and `x = with begin(): …` —
+        // a block statement on the right of an assignment, whose value is the block's own
         // (`docs/chl-spec.md`, "4.5 `if` / `elif` / `else`"). The
         // `BlockValueDedent` after the block ends the statement, so this form
         // takes no `stmt_terminator` and cannot ride `simple_stmt`, which is why
@@ -2184,12 +2184,17 @@ where
         // `BlockValueDedent`. Consuming the closer here ends the statement, and
         // it is what a chain written at the statement's own column fails on:
         // that spelling closes the level before the chain's first line.
-        let block_value = choice((if_stmt.clone(), match_stmt.clone(), try_stmt.clone()))
-            .then_ignore(just(Token::BlockValueDedent))
-            .map(|stmt: Spanned<Stmt>| {
-                let span = stmt.span;
-                Spanned::new(span, Expr::Block(Box::new(stmt)))
-            });
+        let block_value = choice((
+            if_stmt.clone(),
+            match_stmt.clone(),
+            try_stmt.clone(),
+            with_stmt.clone(),
+        ))
+        .then_ignore(just(Token::BlockValueDedent))
+        .map(|stmt: Spanned<Stmt>| {
+            let span = stmt.span;
+            Spanned::new(span, Expr::Block(Box::new(stmt)))
+        });
         let block_assign = just(Token::BlockValueIndent)
             .ignore_then(bare_tuple.clone())
             .then(assign_tail(block_value, expr.clone()))
@@ -3160,6 +3165,23 @@ mod tests {
             panic!("expected a block value, got {:?}", value.node)
         };
         assert!(matches!(stmt.node, Stmt::Try { .. }), "{stmt:?}");
+    }
+
+    /// A `with begin():` block stands on an assignment's right-hand side, as a `try` does.
+    #[test]
+    fn with_is_a_block_value() {
+        let m = parse_m(indoc! {"
+            y = with begin():
+                    balance := balance - 1
+                    balance
+        "});
+        let Stmt::Assign { value, .. } = &m.body[0].node else {
+            panic!("expected an assignment, got {:?}", m.body[0].node)
+        };
+        let Expr::Block(stmt) = &value.node else {
+            panic!("expected a block value, got {:?}", value.node)
+        };
+        assert!(matches!(stmt.node, Stmt::With { .. }), "{stmt:?}");
     }
 
     /// The constructor-list form keeps each line's name and parameters in source order, with
@@ -5240,7 +5262,7 @@ mod tests {
                 "a block right-hand side the grammar does not accept",
                 indoc! {"
                     for req in reqs:
-                        result = with begin():
+                        result = for x in xs:
                             stock = 1
                         out << result
                     after = 2

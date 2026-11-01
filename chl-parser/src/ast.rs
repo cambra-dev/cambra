@@ -1200,7 +1200,7 @@ pub enum Expr {
         value: Box<Spanned<Expr>>,
     },
 
-    /// A block statement in value position: an `if`/`match` on the right of an
+    /// A block statement in value position: an `if`, `match`, `try` or `with` on the right of an
     /// assignment, or a one-line `match` inside a bracket.
     ///
     /// The block's value is its last statement's, by the same rule that gives a
@@ -1209,8 +1209,8 @@ pub enum Expr {
     /// body is parsed, so both build the same statement here and lowering
     /// routes both through `lower_final_stmt`.
     ///
-    /// **Invariant:** the statement is a [`Stmt::If`] or a [`Stmt::Match`].
-    /// Lowering asserts it.
+    /// **Invariant:** the statement is a [`Stmt::If`], a [`Stmt::Match`], a [`Stmt::Try`] or a
+    /// [`Stmt::With`]. Lowering asserts it.
     Block(Box<Spanned<Stmt>>),
 
     /// Recovery placeholder inserted when chumsky's bracket-level

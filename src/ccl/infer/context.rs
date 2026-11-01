@@ -150,7 +150,8 @@ pub(super) struct InferCtx {
     /// collecting what its body causes, the mutable variables the body declares, and whether
     /// its iterations interacted when its body was emitted.
     effect_loops: Vec<EffectLoop>,
-    /// Each `with begin():` block emitted, with the variable collecting what its body causes.
+    /// Each `with begin():` block in statement position emitted, with the variable collecting
+    /// what its body causes.
     effect_transactions: Vec<(NodeId, Rc<EffectVar>)>,
     /// Each `try` emitted, innermost first: a `try` is recorded once its body is emitted.
     effect_tries: Vec<TryFrame>,
@@ -883,15 +884,6 @@ impl InferCtx {
         out
     }
 
-    /// What was emitted that causes nothing and so does nothing: each `with begin():` block
-    /// whose body writes and feeds nothing (`docs/chl-spec.md`, "8.2 Transactions: `with
-    /// begin():`"), then each expression statement outside those blocks
-    /// (`docs/chl-spec.md`, "4.9 Expression statement").
-    ///
-    /// A statement in a polymorphic definition can call a function that only each use of the
-    /// definition determines: a parameter's. That call's variable has nothing flowing into it
-    /// at the definition, where each use fills a copy of its own, so a statement or a block
-    /// reaching one may do something and is not reported.
     /// Hold each loop's order to what its body was found to cause once emission is done. A loop
     /// is ordered, and requires `Orderable` of its positions, from what its body causes when it
     /// is emitted, which is when a requirement can enter the scheme of the function holding
@@ -908,6 +900,16 @@ impl InferCtx {
         }
     }
 
+    /// What was emitted that causes nothing and so does nothing: each `with begin():` block in
+    /// statement position whose body writes and feeds nothing (`docs/chl-spec.md`, "8.2
+    /// Transactions: `with begin():`"), then each expression statement outside those blocks
+    /// (`docs/chl-spec.md`, "4.9 Expression statement"). A block in value position is its value,
+    /// so [`Typing::transaction_body`] does not record one.
+    ///
+    /// A statement in a polymorphic definition can call a function that only each use of the
+    /// definition determines: a parameter's. That call's variable has nothing flowing into it
+    /// at the definition, where each use fills a copy of its own, so a statement or a block
+    /// reaching one may do something and is not reported.
     pub(super) fn does_nothing(&self) -> Vec<(NodeId, InferError)> {
         let undetermined = |v: &EffectVar| {
             self.effect_calls.contains(&v.uid) && v.incoming().is_empty() && v.own().is_empty()
@@ -2865,7 +2867,7 @@ impl Typing for InferCtx {
         self.bind_effect_name(name, ty, true);
     }
 
-    fn transaction_body<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+    fn transaction_body<R>(&mut self, valued: bool, f: impl FnOnce(&mut Self) -> R) -> R {
         // The body collects on a variable of its own, which no commit may reach, directly or
         // through a call: transactions do not nest (`docs/chl-spec.md`, "8.2 Transactions:
         // `with begin():`"). The bound is copied with the variable at each instantiation, so
@@ -2889,7 +2891,9 @@ impl Typing for InferCtx {
         self.effect_frames.push(frame);
         let r = f(self);
         self.effect_frames.pop();
-        self.effect_transactions.push((node, Rc::clone(&var)));
+        if !valued {
+            self.effect_transactions.push((node, Rc::clone(&var)));
+        }
         let outer = self.effect_frame();
         outer.var.flows_from(
             &var,

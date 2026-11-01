@@ -620,6 +620,36 @@ struct RawSite {
     /// loop, so the read is that accumulator's final value, broadcast into every
     /// transaction (see [`build_writer`]).
     enclosing_writes: HashSet<Name>,
+    /// For a block in value position, the feed its value rides and the binding it is read
+    /// back through ([`BlockValue`]).
+    value: Option<BlockValue>,
+}
+
+/// How the value of a `with begin():` block in value position (`x = with begin(): …`) leaves
+/// the commit (`docs/chl-spec.md`, "A block is also the value it computes [Decided]").
+///
+/// The block feeds its value to `defer` on its spine, which no channel declares: the feed makes
+/// the value a tap of the decision, and every path feeds it, so every path commits, a path that
+/// writes nothing committing its reads. [`plan_store`] binds the tap keyed by the item of the
+/// site's source rather than by commit time, `commits_j ≫ .decision ≫ … ≫ .field : 𝐼 ⤇ …`, and
+/// `values` to the value at each item. A standalone block's source is the singleton, and the
+/// code after it reads its one value; a loop iterates `values` beside its source.
+#[derive(Clone)]
+struct BlockValue {
+    /// The defer the block's value is fed to.
+    defer: Name,
+    /// The binding the code after the block reads the values through, `𝐼 ⤇ 𝑉`.
+    values: Name,
+}
+
+/// A loop whose body holds a block in value position: the loop iterates the block's values
+/// ([`BlockValue::values`]) beside its source and binds each to `binding` ([`strip`]).
+struct LoopValue {
+    /// The loop's item binder, which names the loop.
+    target: Name,
+    values: Name,
+    /// The binding the block's value had, `x` in `x = with begin(): …`.
+    binding: TypedBinding,
 }
 
 /// One commit store's writer sites and their in-block feeds, as [`run`] collects
@@ -632,7 +662,11 @@ struct RawSite {
 /// the two vectors stay index-parallel. The phase hoists each as
 /// `Feed(defer, __hist ▷ .__to_<defer>)` for `channelize` to route, and a tap commits
 /// with its transaction: an aborted decision appends nothing, so it contributes no reply.
-type StoreWriters = (Vec<(NodeId, WriterSite)>, Vec<Vec<FeedSite>>);
+type StoreWriters = (
+    Vec<(NodeId, WriterSite)>,
+    Vec<Vec<FeedSite>>,
+    Vec<Option<BlockValue>>,
+);
 
 /// Rewrite every `with begin():` writer of a `Mut(_, Txn)` mutable variable into one shared
 /// commit `Transact`. A no-op (returns the input untouched) on programs that
@@ -694,7 +728,14 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
     let Stripped {
         sites,
         read_only_footprints,
+        loop_values,
     } = harvest;
+    // Every loop rebuilt its `For` over the values of the blocks in value position in its
+    // body, and a block outside every loop binds its value where it stood.
+    assert!(
+        loop_values.is_empty(),
+        "transact_phase: a block in value position was stripped inside a loop no `For` claimed"
+    );
     // Mutable variable keys: the union of every writer's footprint (read ∪ write), in
     // first-occurrence order. These are exact (α-unique) `Name`s.
     let mut key_names: Vec<Name> = Vec::new();
@@ -832,24 +873,25 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
     // planning rebuilds from a `Transact`, and what a recording names is
     // not a fact about the `Transact`.
     let mut per_store: Vec<StoreWriters> = (0..groups.len())
-        .map(|_| (Vec::new(), Vec::new()))
+        .map(|_| (Vec::new(), Vec::new(), Vec::new()))
         .collect();
     for s in sites {
         let store = store_of(&s);
         let parent = s.parent;
         let g = provenance::enter(parent, "transact.writer", provenance::Nature::Expansion);
-        let (writer, feeds) =
+        let (writer, feeds, value) =
             build_writer(s, &key_init, &mut feed_counter, &cross.acc_views, &declared);
         drop(g);
         per_store[store].0.push((parent, writer));
         per_store[store].1.push(feeds);
+        per_store[store].2.push(value);
     }
 
     let stores: Vec<StorePlan> = groups
         .into_iter()
         .zip(per_store)
-        .map(|(keys, (writers, site_feeds))| {
-            plan_store(keys, &hist, &key_init, writers, site_feeds)
+        .map(|(keys, (writers, site_feeds, site_values))| {
+            plan_store(keys, &hist, &key_init, writers, site_feeds, site_values)
         })
         .collect();
 
@@ -1478,6 +1520,8 @@ struct Stripped {
     sites: Vec<RawSite>,
     /// One entry per read-only block: the mutable variable keys it reads together.
     read_only_footprints: Vec<Vec<Name>>,
+    /// The blocks in value position inside a loop whose `For` is not yet rebuilt.
+    loop_values: Vec<LoopValue>,
 }
 
 /// Replace every transaction `For` site (`ExprStmt(For{…}, cont)` whose block
@@ -1489,6 +1533,13 @@ fn strip(
     enclosing: Option<(&TypedBinding, &Expr, &HashSet<Name>)>,
     out: &mut Stripped,
 ) -> Expr {
+    // A `with begin():` block in value position: `let x = Begin{block} in rest`.
+    if let TypedExprNode::Let { bound_expr, .. } = &expr.node
+        && matches!(bound_expr.node, TypedExprNode::Begin { .. })
+    {
+        let rest = strip_valued_block(expr, txn_mut_vars, enclosing, out);
+        return strip(rest, txn_mut_vars, enclosing, out);
+    }
     // A `with begin():` block (a `Begin` marker) on a statement spine.
     if let TypedExprNode::ExprStmt { expr: effect, .. } = &expr.node
         && matches!(&effect.node, TypedExprNode::Begin { .. })
@@ -1562,6 +1613,7 @@ fn strip(
                     read_keys,
                     write_keys,
                     enclosing_writes: enclosing_writes.clone(),
+                    value: None,
                 });
                 prepend_effects(lifted, *rest)
             };
@@ -1618,6 +1670,7 @@ fn strip(
             Some((&target, &source, &enclosing_writes)),
             out,
         );
+        let (target, source, body) = iterate_block_values(target, source, body, node_id, out);
         return Expr {
             node: TypedExprNode::For {
                 target,
@@ -1633,6 +1686,341 @@ fn strip(
     let mut expr = expr;
     expr.map_children(|c| strip(c, txn_mut_vars, enclosing, out));
     expr
+}
+
+/// Refuse a `with begin():` block in value position inside a lambda: one in a loop lowering
+/// compiles as a function over its items (a loop that only feeds, or the outer loop of a nest),
+/// or one a call inlined into a feed's value, a comprehension or a function value. [`strip`]
+/// keys a block by the loop whose `For` encloses it, and a lambda's body runs once per
+/// application of the lambda rather than once per position of that loop.
+pub fn refuse_valued_blocks_under_lambdas(expr: &Expr) -> Result<(), String> {
+    fn walk(e: &Expr, under_lambda: bool) -> Result<(), String> {
+        if under_lambda
+            && let TypedExprNode::Let { bound_expr, .. } = &e.node
+            && matches!(bound_expr.node, TypedExprNode::Begin { .. })
+        {
+            return Err(
+                "a `with begin():` block in value position is not compiled yet where the \
+                 loop around it only feeds or holds another loop, or where a call puts it in an \
+                 expression such as a feed's value"
+                    .to_string(),
+            );
+        }
+        let under_lambda = under_lambda || matches!(e.node, TypedExprNode::Lambda { .. });
+        let mut result = Ok(());
+        e.any_child(|c| {
+            result = walk(c, under_lambda);
+            result.is_err()
+        });
+        result
+    }
+    walk(expr, false)
+}
+
+/// Refuse a feed whose positions depend on the value of a `with begin():` block, which
+/// `channelize` has no closed type for: a feed under a condition reading a writing block's
+/// value, or in a loop a read-only block's, and in a loop that reads a writing block's value a
+/// feed under any condition. `channelize` types a conditional feed's channel by restricting a
+/// source by the condition. A loop reading a writing block's values iterates them beside its
+/// source ([`iterate_block_values`]), and those values are the store's, so the restriction
+/// reads the store. The channel's type then leaves the store's scope at the declaration of the
+/// channel it feeds, where a type cannot state the store. A read-only block's value in a loop
+/// is a read the restriction cannot carry either. Outside a loop a read-only block's value is
+/// read once, before the condition, and compiles.
+pub fn refuse_feeds_under_block_values(
+    expr: &Expr,
+    txn_mut_vars: &HashSet<Name>,
+) -> Result<(), String> {
+    /// Whether `e` feeds a channel outside the `with begin():` blocks in it, whose feeds the
+    /// commit sends.
+    fn feeds_outside_blocks(e: &Expr) -> bool {
+        match &e.node {
+            TypedExprNode::Feed { .. } => true,
+            TypedExprNode::Begin { .. } => false,
+            _ => e.any_child(feeds_outside_blocks),
+        }
+    }
+    /// Whether a loop's body, outside its blocks and inner loops, binds a writing block's value.
+    fn binds_a_writing_block_value(e: &Expr, txn_mut_vars: &HashSet<Name>) -> bool {
+        match &e.node {
+            TypedExprNode::Let { bound_expr, .. }
+                if matches!(&bound_expr.node, TypedExprNode::Begin { body, .. }
+                    if writes_any(body, txn_mut_vars)) =>
+            {
+                true
+            }
+            TypedExprNode::Begin { .. } | TypedExprNode::For { .. } => false,
+            _ => e.any_child(|c| binds_a_writing_block_value(c, txn_mut_vars)),
+        }
+    }
+    struct Walk<'a> {
+        txn_mut_vars: &'a HashSet<Name>,
+        /// The bindings of a block's value the refusal applies to, and of values reading one.
+        derived: HashSet<Name>,
+    }
+    impl Walk<'_> {
+        fn walk(&mut self, e: &Expr, in_loop: bool, iterates_values: bool) -> Result<(), String> {
+            match &e.node {
+                TypedExprNode::Begin { .. } => return Ok(()),
+                TypedExprNode::For { iter, body, .. } => {
+                    self.walk(iter, in_loop, iterates_values)?;
+                    let iterates = binds_a_writing_block_value(body, self.txn_mut_vars);
+                    return self.walk(body, true, iterates);
+                }
+                TypedExprNode::Let {
+                    binding,
+                    bound_expr,
+                    ..
+                } => {
+                    let derived = match &bound_expr.node {
+                        TypedExprNode::Begin { body, .. } => {
+                            in_loop || writes_any(body, self.txn_mut_vars)
+                        }
+                        _ => free_names_in_value(bound_expr)
+                            .iter()
+                            .any(|n| self.derived.contains(n)),
+                    };
+                    if derived {
+                        self.derived.insert(binding.name.clone());
+                    }
+                }
+                TypedExprNode::Case {
+                    scrutinee,
+                    branches,
+                } => {
+                    let reads_a_value = scrutinee
+                        .iter()
+                        .map(|s| &**s)
+                        .chain(branches.iter().map(|b| &b.guard))
+                        .any(|c| {
+                            free_names_in_value(c)
+                                .iter()
+                                .any(|n| self.derived.contains(n))
+                        });
+                    if (reads_a_value || iterates_values)
+                        && branches.iter().any(|b| feeds_outside_blocks(&b.body))
+                    {
+                        return Err("a feed under a condition that reads the value of a `with \
+                                    begin():` block, or in a loop that reads one under any \
+                                    condition, is not compiled yet"
+                            .to_string());
+                    }
+                }
+                _ => {}
+            }
+            let mut result = Ok(());
+            e.any_child(|c| {
+                result = self.walk(c, in_loop, iterates_values);
+                result.is_err()
+            });
+            result
+        }
+    }
+    Walk {
+        txn_mut_vars,
+        derived: HashSet::new(),
+    }
+    .walk(expr, false, false)
+}
+
+/// Strip a `with begin():` block in value position, `let x = Begin{block} in rest`, and return
+/// the continuation that reads its value ([`BlockValue`]).
+///
+/// A block that writes no transactional mutable variable needs no commit: its value is the
+/// value of its chain, whose reads are as-of reads, as a read-only block's are. A writing block
+/// becomes a site whose spine ends in `let __v = tail in __block_value << __v`: the walk merges a
+/// tail `Case` that writes as it merges a bound one ([`WriterWalk`]), so the feed sits on the
+/// spine and every path commits. Outside a loop the site runs over a singleton source, and
+/// the continuation binds `x` to the one value it commits. Inside one the loop binds `x`, at
+/// each item to the value committed for it ([`iterate_block_values`]).
+fn strip_valued_block(
+    expr: Expr,
+    txn_mut_vars: &HashSet<Name>,
+    enclosing: Option<(&TypedBinding, &Expr, &HashSet<Name>)>,
+    out: &mut Stripped,
+) -> Expr {
+    let stmt_id = expr.node_id;
+    let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body: rest,
+    } = expr.node
+    else {
+        unreachable!("called on a `let`")
+    };
+    let begin_id = bound_expr.node_id;
+    let TypedExprNode::Begin { body: block } = bound_expr.node else {
+        unreachable!("called on a `let` of a `Begin`")
+    };
+    if !writes_any(&block, txn_mut_vars) {
+        let g = provenance::enter(
+            stmt_id,
+            "transact.unwrap_block",
+            provenance::Nature::Machinery,
+        );
+        g.blame(&[begin_id]);
+        return Expr::let_in_preserving(stmt_id, binding, *block, *rest);
+    }
+    let g = provenance::enter(
+        stmt_id,
+        "transact.block_value",
+        provenance::Nature::Expansion,
+    );
+    g.blame(&[begin_id]);
+    let value_ty = binding.ty.clone();
+    let (target, source, enclosing_writes) = match enclosing {
+        Some((target, source, writes)) => (target.clone(), source.clone(), writes.clone()),
+        None => {
+            // One item, one transaction, as lowering gives a standalone block in statement
+            // position (`lower_standalone_transaction`).
+            let target = binding_unit(Name::fresh("__txn_item"));
+            let mut unit = Expr::lit(Lit::Unit);
+            unit.ty = Type::Base(BaseType::Unit);
+            let mut source = Expr::list(vec![unit]);
+            source.ty = Type::data_fun(Type::UIntRange(1), Type::Base(BaseType::Unit));
+            (target, source, HashSet::new())
+        }
+    };
+    let dom = source
+        .ty
+        .domain()
+        .expect("transact_phase: writer source is a function");
+    let defer = Name::fresh("__block_value");
+    let values = Name::fresh("__values");
+    let block = feed_block_value(*block, &defer, &value_ty);
+    let block = crate::ccl::ccl_utils::statement_tag_cases_to_guards(block);
+    let (txn_block, lifted) = partition_block(block, txn_mut_vars);
+    let (read_keys, write_keys) = collect_footprint(&txn_block, txn_mut_vars);
+    out.sites.push(RawSite {
+        parent: stmt_id,
+        target: target.clone(),
+        source,
+        block: txn_block,
+        read_keys,
+        write_keys,
+        enclosing_writes,
+        value: Some(BlockValue {
+            defer,
+            values: values.clone(),
+        }),
+    });
+    let rest = match enclosing {
+        // The loop binds `x`, from the values it iterates beside its source.
+        Some(_) => {
+            out.loop_values.push(LoopValue {
+                target: target.name,
+                values,
+                binding,
+            });
+            *rest
+        }
+        // The block commits once, over the singleton: `x` is that commit's value.
+        None => {
+            let committed = tvar(&values, Type::data_fun(dom, value_ty.clone()));
+            let mut sole = Expr::aggregate(committed, crate::ccl::AggregateKind::Sole);
+            sole.ty = value_ty;
+            Expr::let_in(binding, sole, *rest)
+        }
+    };
+    prepend_effects(lifted, rest)
+}
+
+/// A `Unit` binder for the item of a synthesized singleton source.
+fn binding_unit(name: Name) -> TypedBinding {
+    binding(name, Type::Base(BaseType::Unit))
+}
+
+/// `block`, the body of a block in value position, ending in `let __v = tail in defer << __v`
+/// rather than in its value `tail`.
+fn feed_block_value(block: Expr, defer: &Name, value_ty: &Type) -> Expr {
+    let unit_ty = Type::Base(BaseType::Unit);
+    match block.node {
+        TypedExprNode::ExprStmt { expr, body } => Expr::expr_stmt_preserving(
+            block.node_id,
+            *expr,
+            feed_block_value(*body, defer, value_ty),
+        ),
+        TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } => Expr::let_in_preserving(
+            block.node_id,
+            binding,
+            *bound_expr,
+            feed_block_value(*body, defer, value_ty),
+        ),
+        tail => {
+            let tail = Expr {
+                node: tail,
+                ..block
+            };
+            let v = Name::fresh("__v");
+            let mut feed = Expr::feed(defer.clone(), tvar(&v, value_ty.clone()));
+            feed.ty = unit_ty.clone();
+            let mut unit = Expr::lit(Lit::Unit);
+            unit.ty = unit_ty;
+            Expr::let_in(
+                binding(v, value_ty.clone()),
+                tail,
+                Expr::expr_stmt(feed, unit),
+            )
+        }
+    }
+}
+
+/// The loop `For{target, source, body}` with its blocks in value position iterated beside its
+/// source: `For{𝑝, λ ξ → (source(ξ), values₁(ξ), …), let target = 𝑝.0 in let x₁ = 𝑝.1 in …
+/// body}`, one `valuesᵢ` per block in its body ([`LoopValue`]). Each block's values are keyed by
+/// the loop's items, so the loop reads one value per item.
+fn iterate_block_values(
+    target: TypedBinding,
+    source: Expr,
+    body: Expr,
+    for_id: NodeId,
+    out: &mut Stripped,
+) -> (TypedBinding, Expr, Expr) {
+    let (mine, others): (Vec<LoopValue>, Vec<LoopValue>) = std::mem::take(&mut out.loop_values)
+        .into_iter()
+        .partition(|v| v.target == target.name);
+    out.loop_values = others;
+    if mine.is_empty() {
+        return (target, source, body);
+    }
+    let _g = provenance::enter(
+        for_id,
+        "transact.block_values",
+        provenance::Nature::Expansion,
+    );
+    let (dom, item_ty) = fun_parts(&source.ty);
+    let x = Name::fresh("__zx");
+    let mut elts = vec![apply_ty(
+        tvar(&x, dom.clone()),
+        source.clone(),
+        item_ty.clone(),
+    )];
+    let mut elt_tys = vec![item_ty.clone()];
+    for v in &mine {
+        let ty = v.binding.ty.clone();
+        let values = tvar(&v.values, Type::data_fun(dom.clone(), ty.clone()));
+        elts.push(apply_ty(tvar(&x, dom.clone()), values, ty.clone()));
+        elt_tys.push(ty);
+    }
+    let tuple_ty = Type::Tuple(elt_tys.clone());
+    let mut tuple = Expr::tuple(elts);
+    tuple.ty = tuple_ty.clone();
+    let mut iter = Expr::lambda(x, dom.clone(), tuple);
+    iter.ty = Type::fun_like(&source.ty, dom, tuple_ty.clone());
+    let p = Name::fresh("__item");
+    let item = tvar(&p, tuple_ty.clone());
+    let mut body = body;
+    for (i, v) in mine.into_iter().enumerate().rev() {
+        let elt = proj_item(&item, &tuple_ty, i + 1, &elt_tys[i + 1]);
+        body = Expr::let_in(v.binding, elt, body);
+    }
+    let elt = proj_item(&item, &tuple_ty, 0, &item_ty);
+    let body = Expr::let_in(target, elt, body);
+    (binding(p, tuple_ty), iter, body)
 }
 
 /// Splice a `with begin():` block's statement chain onto an enclosing spine by
@@ -2502,7 +2890,7 @@ fn build_writer(
     feed_counter: &mut usize,
     acc_views: &HashMap<Name, CrossAcc>,
     declared: &Declared,
-) -> (WriterSite, Vec<FeedSite>) {
+) -> (WriterSite, Vec<FeedSite>, Option<BlockValue>) {
     let value_ty = |k: &Name| {
         key_init
             .get(k)
@@ -2603,6 +2991,12 @@ fn build_writer(
     // `commit`. An empty block commits. The in-block feeds ride as `__to_<defer>` taps,
     // each `` `fired `` on the positions its own path admits.
     let (body, feeds) = walk.body(kept, param, true);
+    // The block's value is read keyed by the item it was committed for.
+    let item_taps = feeds
+        .iter()
+        .filter(|f| site.value.as_ref().is_some_and(|v| v.defer == f.defer))
+        .map(|f| f.field.clone())
+        .collect();
 
     (
         WriterSite {
@@ -2610,8 +3004,10 @@ fn build_writer(
             write_keys: site.write_keys,
             source,
             body,
+            item_taps,
         },
         feeds,
+        site.value,
     )
 }
 
@@ -2914,11 +3310,12 @@ struct HoistedFeed {
 ///   source(r))` at the site's commit time, and whose `write_targets` names the
 ///   write-set keys' histories so recognition recovers the writer's write-set;
 /// - one **tap** binding per in-block feed — ``(commits_j ▷ by_commit_time) ≫ .decision ≫
-///   variant_project(`commit) ≫ .field``, keyed by commit time.
+///   variant_project(`commit) ≫ .field``, keyed by commit time, and for a block's value
+///   ``commits_j ≫ .decision ≫ …``, keyed by item ([`BlockValue`]).
 ///
 /// The continuation rebinds each key variable's `let x = init` to a
-/// `final_or_default(hist_x, init)` read over its history and hoists each
-/// in-block feed to `Feed(defer, tap)`. `recognize` inverts this straight into
+/// `final_or_default(hist_x, init)` read over its history, hoists each
+/// in-block feed to `Feed(defer, tap)`, and binds each block's values. `recognize` inverts this straight into
 /// the `Transact{keys, writers, domain: Txn}` node.
 ///
 /// **Inverse pair:** the per-writer commit-record shape this emits — the
@@ -2937,6 +3334,7 @@ fn plan_store(
     key_init: &HashMap<Name, MutVarDecl>,
     writers: Vec<(NodeId, WriterSite)>,
     site_feeds: Vec<Vec<FeedSite>>,
+    site_values: Vec<Option<BlockValue>>,
 ) -> StorePlan {
     let hist: HashMap<Name, Name> = key_names
         .iter()
@@ -2957,6 +3355,7 @@ fn plan_store(
     let mut commit_bindings: Vec<(TypedBinding, Expr)> = Vec::with_capacity(writers.len());
     let mut tap_bindings: Vec<(TypedBinding, Expr)> = Vec::new();
     let mut hoisted: Vec<HoistedFeed> = Vec::new();
+    let mut values: Vec<(TypedBinding, Expr)> = Vec::new();
     // Per site: its source domain 𝐼, commit-record type, decision type, and
     // write-key list — the per-key history views read these back.
     let mut site_dom: Vec<Type> = Vec::with_capacity(writers.len());
@@ -2964,7 +3363,12 @@ fn plan_store(
     let mut site_decision_ty: Vec<Type> = Vec::with_capacity(writers.len());
     let mut site_write_keys: Vec<Vec<Name>> = Vec::with_capacity(writers.len());
 
-    for (j, ((parent, w), feeds)) in writers.into_iter().zip(site_feeds).enumerate() {
+    for (j, (((parent, w), feeds), value)) in writers
+        .into_iter()
+        .zip(site_feeds)
+        .zip(site_values)
+        .enumerate()
+    {
         // This site's commit record, its tap bindings, and the snapshot
         // scaffolding around the writer body all belong to the `with begin():`
         // statement they were built for. The writer `body` passes through
@@ -2979,6 +3383,7 @@ fn plan_store(
             write_keys,
             source,
             body,
+            item_taps: _,
         } = w;
         let (dom, item_ty) = fun_parts(&source.ty);
         let decision_ty = body
@@ -3075,15 +3480,26 @@ fn plan_store(
             // the log's kind — and `recognize_txn_group` takes the history record's tap
             // field type straight off this binding.
             let tap_value_ty = crate::ccl::ccl_utils::tap_variant_ty(f.value.ty.clone());
-            let tap_ty = Type::fun_like(&by_time_ty, Type::Txn, tap_value_ty.clone());
-            let by_time = apply_ty(
-                tvar(&commits[j], commits_ty.clone()),
-                builtin_ty(
-                    Builtin::ByCommitTime,
-                    Type::fun(commits_ty.clone(), by_time_ty.clone()),
+            // A block's value is read keyed by the item it was committed for, which is how the
+            // commit records are keyed; every other tap by the commit time it rides.
+            let value = value.as_ref().filter(|v| v.defer == f.defer);
+            let (records, tap_ty) = match value {
+                Some(_) => (
+                    tvar(&commits[j], commits_ty.clone()),
+                    Type::fun_like(&commits_ty, dom.clone(), tap_value_ty.clone()),
                 ),
-                by_time_ty.clone(),
-            );
+                None => (
+                    apply_ty(
+                        tvar(&commits[j], commits_ty.clone()),
+                        builtin_ty(
+                            Builtin::ByCommitTime,
+                            Type::fun(commits_ty.clone(), by_time_ty.clone()),
+                        ),
+                        by_time_ty.clone(),
+                    ),
+                    Type::fun_like(&by_time_ty, Type::Txn, tap_value_ty.clone()),
+                ),
+            };
             let mut dec_proj = Expr::proj_field(F_DECISION);
             dec_proj.ty = Type::fun(rec_ty.clone(), decision_ty.clone());
             let vp = crate::ccl::ccl_utils::commit_project(&decision_ty);
@@ -3095,10 +3511,14 @@ fn plan_store(
             let mut field_proj = Expr::proj_field(f.field.clone());
             field_proj.ty = Type::fun(payload_ty.clone(), tap_value_ty.clone());
             let tap_expr = crate::ccl::ccl_utils::chain_typed(
-                vec![by_time, dec_proj, vp, field_proj],
+                vec![records, dec_proj, vp, field_proj],
                 tap_ty.clone(),
             );
             tap_bindings.push((binding(tap_name.clone(), tap_ty.clone()), tap_expr));
+            if let Some(value) = value {
+                values.push(block_values(value, &tap_name, &tap_ty, &f.value.ty));
+                continue;
+            }
             hoisted.push(HoistedFeed {
                 defer: f.defer,
                 tap: tap_name,
@@ -3226,7 +3646,31 @@ fn plan_store(
         hist,
         bindings,
         hoisted,
+        values,
     }
+}
+
+/// The binding of a block's values ([`BlockValue::values`]) to its value tap `tap`, keyed by
+/// item, whose fed type is `value_ty`: `tap ≫ variant_project(`fired)`. Every path of the block
+/// feeds the value, so the tap fires at every item that commits.
+fn block_values(
+    value: &BlockValue,
+    tap: &Name,
+    tap_ty: &Type,
+    value_ty: &Type,
+) -> (TypedBinding, Expr) {
+    let dom = tap_ty
+        .domain()
+        .expect("transact_phase: a tap is a collection");
+    let values_ty = Type::fun_like(tap_ty, dom, value_ty.clone());
+    let values = crate::ccl::ccl_utils::chain_typed(
+        vec![
+            tvar(tap, tap_ty.clone()),
+            crate::ccl::ccl_utils::fired_project(value_ty.clone()),
+        ],
+        values_ty.clone(),
+    );
+    (binding(value.values.clone(), values_ty), values)
 }
 
 /// One commit store, planned but not yet placed: the keys it holds, their history
@@ -3245,6 +3689,9 @@ struct StorePlan {
     bindings: Vec<(TypedBinding, Expr)>,
     /// In-block feeds, to hoist over this store's body in source order.
     hoisted: Vec<HoistedFeed>,
+    /// The values of the store's blocks in value position, bound over its body
+    /// ([`BlockValue`]).
+    values: Vec<(TypedBinding, Expr)>,
 }
 
 impl StorePlan {
@@ -3260,6 +3707,10 @@ impl StorePlan {
         self.key_names.iter().any(|k| is_free_in_value(k, e))
             || self.hist.values().any(|h| is_free_in_value(h, e))
             || self.hoisted.iter().any(|f| is_free_in_value(&f.defer, e))
+            || self
+                .values
+                .iter()
+                .any(|(b, _)| is_free_in_value(&b.name, e))
     }
 
     /// The **as-of reads** to bind over `body`: one `let x = as_of_read(⟨history⟩)` per key
@@ -3468,7 +3919,12 @@ fn walk_spine(
                     .drain(..)
                     .rev()
                     .fold(inner, |body, node| relink_spine_body(node, body));
-                let reads = store.reads(key_init, &inner);
+                let reads: Vec<(TypedBinding, Expr)> = store
+                    .values
+                    .iter()
+                    .map(|(b, e)| (b.clone(), e.clone_preserving_ids()))
+                    .chain(store.reads(key_init, &inner))
+                    .collect();
                 // The plan's bindings move out of it rather than being duplicated:
                 // `stores` is borrowed and each plan is placed exactly once, so the
                 // copy the borrow forces is the only live one. Preserving keeps the
@@ -3766,6 +4222,7 @@ mod tests {
             read_keys: read_keys.iter().map(|n| (*n).clone()).collect(),
             write_keys: write_keys.iter().map(|n| (*n).clone()).collect(),
             enclosing_writes: HashSet::new(),
+            value: None,
         }
     }
 

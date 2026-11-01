@@ -2760,17 +2760,35 @@ pub(super) fn emit_for<C: Typing>(
 }
 
 /// Type a `Begin { body }` transaction-block marker: emit the per-transaction
-/// body chain and give the block itself type `Unit`. The block introduces no
-/// binder or scope — in-block mutable variable reads/writes/feeds are typed by their own
-/// `Var`/`MutWrite`/`Feed` rules. Shared by Emit and Check via [`Typing`], like
-/// [`emit_for`].
+/// body chain and give the block its body's type — `Unit` for a block in statement
+/// position, the value of its last statement for one in value position. A mutable variable
+/// there is read, as a passed value is: the block's value is the value the variable holds in
+/// the block's snapshot, not the variable. The block introduces no binder or scope —
+/// in-block mutable variable reads/writes/feeds are typed by their own `Var`/`MutWrite`/`Feed`
+/// rules. Shared by Emit and Check via [`Typing`], like [`emit_for`].
 pub(super) fn emit_begin<C: Typing>(
     body: &mut Expr,
     ctx: &mut C,
 ) -> Result<Type, LocatedInferError> {
     ctx.record_effect(Item::Causes(Effect::Commit));
-    ctx.transaction_body(|ctx| ctx.in_transaction(|ctx| ctx.subexpr(body)))?;
-    Ok(Type::Base(BaseType::Unit))
+    let valued = !ends_in_unit(body);
+    ctx.transaction_body(valued, |ctx| {
+        ctx.in_transaction(|ctx| {
+            let ty = ctx.subexpr(body)?;
+            Ok(read_passed(body, &ty, ctx))
+        })
+    })
+}
+
+/// Whether a `with begin():` block's body ends in the `unit` lowering gives a block in
+/// statement position, rather than in a value.
+fn ends_in_unit(body: &Expr) -> bool {
+    match &body.node {
+        TypedExprNode::ExprStmt { body, .. } | TypedExprNode::Let { body, .. } => {
+            ends_in_unit(body)
+        }
+        node => matches!(node, TypedExprNode::Lit(crate::ccl::Lit::Unit)),
+    }
 }
 
 /// Build the open-product shape a projection of `key` requires its input to
@@ -3739,7 +3757,9 @@ fn accumulator_body_domain(slots: impl IntoIterator<Item = Type>, item: Type) ->
 }
 
 /// The history of each `__to_<defer>` tap a writer's decision carries: the tap's value at each
-/// position of `domain`, in the order the decision's `commit` payload lists them.
+/// position of `domain`, in the order the decision's `commit` payload lists them. A tap in
+/// `item_taps` is read keyed by the item it was committed for, so its positions are the
+/// domain of the writer's `source` instead ([`crate::ccl::WriterSite::item_taps`]).
 ///
 /// The body is `(𝑝 : (slot₀, …, item)) ⇒ decision`, its codomain stored closed over `𝑝`; a
 /// nested writer's body takes `(𝑝 : ((enclosing, position), (slot₀, …, item)))`. A tap whose
@@ -3756,6 +3776,7 @@ pub(super) fn writer_tap_histories(
     domain: &Type,
     body_ty: &Type,
     source: &Expr,
+    item_taps: &[Label],
     enclosing: Option<(&Name, &Type)>,
     node_id: NodeId,
 ) -> Vec<(Label, Type)> {
@@ -3793,6 +3814,16 @@ pub(super) fn writer_tap_histories(
         .iter()
         .filter(|(f, _)| f != crate::ccl::F_WRITES)
         .map(|(f, t)| {
+            let item_domain;
+            let domain = if item_taps.contains(f) {
+                item_domain = source
+                    .ty
+                    .domain()
+                    .expect("a writer's source is a collection");
+                &item_domain
+            } else {
+                domain
+            };
             let Some(p) = binder
                 .as_ref()
                 .filter(|p| crate::ccl::subst::type_free_vars(t).contains(*p))
@@ -4030,6 +4061,7 @@ pub(super) fn emit_transact<C: Typing>(
             domain,
             &w.body.ty,
             &w.source,
+            &w.item_taps,
             enclosing_value.as_ref().map(|(e, t)| (*e, t)),
             node_id,
         ));

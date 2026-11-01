@@ -59,7 +59,14 @@ fn stmt_has_feed(stmt: &Spanned<ChlStmt>) -> bool {
 /// nested under an `if`/inner `for` is not this shape; the body walker rejects
 /// it.)
 pub(super) fn for_body_has_with(stmts: &[Spanned<ChlStmt>]) -> bool {
-    stmts.iter().any(|s| matches!(s.node, ChlStmt::With { .. }))
+    stmts.iter().any(is_with)
+}
+
+/// Whether `stmt` is a `with begin():` block, as a statement or on an assignment's right-hand
+/// side (`x = with begin(): …`).
+fn is_with(stmt: &Spanned<ChlStmt>) -> bool {
+    matches!(stmt.node, ChlStmt::With { .. })
+        || block_value_stmt(stmt).is_some_and(|inner| matches!(inner.node, ChlStmt::With { .. }))
 }
 
 /// Whether the loop body holds a `raise` or a `try` anywhere beneath it.
@@ -1066,7 +1073,7 @@ pub(super) struct ForSite<'a> {
 /// loop needs: a commit site anywhere inside it is one the nested `Transact` cannot key.
 fn body_has_with(stmts: &[Spanned<ChlStmt>]) -> bool {
     stmts.iter().any(|stmt| match &stmt.node {
-        ChlStmt::With { .. } => true,
+        _ if is_with(stmt) => true,
         ChlStmt::For { body, .. } => body_has_with(body),
         node => node.branch_blocks().into_iter().any(body_has_with),
     })
@@ -1500,6 +1507,16 @@ fn lower_loop_body_chain(
     })
 }
 
+/// The refusal of a `with begin():` block inside an `if` in a loop body, as a statement or
+/// in value position.
+fn with_in_conditional(span: Span) -> LoweringError {
+    LoweringError::unsupported(
+        span,
+        "a `with begin():` transaction inside an `if` in a for-loop body \
+         is not supported; move it to the loop's top level",
+    )
+}
+
 /// [`lower_loop_body_chain`] with the body's type aliases already in scope.
 fn lower_loop_body_chain_scoped(
     body_stmts: &[Spanned<ChlStmt>],
@@ -1551,6 +1568,9 @@ fn lower_loop_body_chain_scoped(
             // is a per-iteration shadowing `let`, *never* a mutable write: `=`
             // is not a mutation operator (accumulators are written with `:=`
             // / `+=`). A loop-carried accumulator therefore never appears here.
+            ChlStmt::Assign { .. } if in_conditional && is_with(stmt) => {
+                return Err(with_in_conditional(stmt.span));
+            }
             ChlStmt::Assign {
                 target,
                 value,
@@ -1788,11 +1808,7 @@ fn lower_loop_body_chain_scoped(
             // `with begin(): <block>` inside an `if` in the loop body: a per-path
             // transaction site is unsound (§4.3 transaction verdict) — rejected.
             ChlStmt::With { .. } if in_conditional => {
-                return Err(LoweringError::unsupported(
-                    stmt.span,
-                    "a `with begin():` transaction inside an `if` in a for-loop body \
-                     is not supported; move it to the loop's top level",
-                ));
+                return Err(with_in_conditional(stmt.span));
             }
             // `with begin(): <block>` — a per-iteration transaction, emitted
             // as a `Begin` marker (one statement in the loop body). Its

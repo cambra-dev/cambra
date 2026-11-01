@@ -45,8 +45,8 @@ use crate::{
             Filter, FlattenTupleDomain, IterateExtent, Lookup, MakeRecord, MapAggregate, MapDomain,
             MapExtractAggregate, MapResult, MapResultToConst, MapResultToConstMode,
             MapResultWithSource, Memo, PermuteRecordDomain, Product, ReadingSource, Readings,
-            Restrict, SelectField, TileOperator, Tiling, Uncurry, UnionOperator, VariantIs,
-            VariantProject, VariantWrap, zip_arms_at, zip_arms_named_at,
+            RekeySorted, Restrict, SelectField, TileOperator, Tiling, Uncurry, UnionOperator,
+            VariantIs, VariantProject, VariantWrap, zip_arms_at, zip_arms_named_at,
         },
         tuple_field,
         uint_of_row,
@@ -339,6 +339,10 @@ struct KeyReadInfo {
     /// The per-commit value extent for [`StoreValueStream`] (`commit` stores
     /// only; the accumulator value extent for induction stores).
     value_extent: Extent,
+    /// Whether the key is a reply tap read keyed by the item each value was committed for
+    /// rather than by commit time: it holds `(item position, value)` pairs, and a read
+    /// re-keys them by position ([`RekeySorted`]).
+    by_item: bool,
     /// Whether the variable's declared type mentions a nominal type, whose value no
     /// reload carries over yet ([`StateConflict::NominalState`]). Read only for a
     /// `carried` key.
@@ -3797,6 +3801,31 @@ fn body_tap_fields(body_ty: &Type) -> Vec<(Label, Type)> {
         .collect()
 }
 
+/// The extent of the value a store holds for writer `w`'s reply tap `field`, of type `tap_ty`: the
+/// tap's own, and for a tap read keyed by item ([`WriterSite::item_taps`]) the pair of the item's
+/// source position and that value, which the writer commits and `RekeySorted` re-keys.
+fn stored_tap_extent(
+    w: &WriterSite,
+    field: &Label,
+    tap_ty: &Type,
+    ctx: &mut OpConversionContext,
+) -> Result<Extent, ConversionError> {
+    let value = ctx.extent_of(tap_ty)?;
+    if !w.item_taps.contains(field) {
+        return Ok(value);
+    }
+    let positions = w.source.ty.domain().ok_or_else(|| {
+        ConversionError::TypeError(format!(
+            "transact writer source must have function type, got {}",
+            w.source.ty
+        ))
+    })?;
+    Ok(Extent::Record(HashMap::from([
+        (tuple_field(0), ctx.extent_of(&positions)?),
+        (tuple_field(1), value),
+    ])))
+}
+
 /// Each key's value type as a `Transact` states it: the codomain of the key's history in the
 /// node's history record, which is under the enclosing parameter for a nested one. Letrec
 /// recognition builds that record from the variable's declared type, the join of its seed and
@@ -3947,6 +3976,7 @@ fn build_commit_store(
         let prior = keys_map.insert(
             field,
             KeyReadInfo {
+                by_item: false,
                 carry_forward: true,
                 carried: Some(paths[i].clone()),
                 runtime_key,
@@ -4000,9 +4030,12 @@ fn build_commit_store(
             )
         })
         .collect();
-    for taps in &per_writer_taps {
+    for (w, taps) in writers.iter().zip(&per_writer_taps) {
         for (field, tap_ty) in taps {
-            store_values.insert(field.runtime_key(), Tiling::Scalar(ctx.extent_of(tap_ty)?));
+            store_values.insert(
+                field.runtime_key(),
+                Tiling::Scalar(stored_tap_extent(w, field, tap_ty, ctx)?),
+            );
         }
     }
 
@@ -4060,6 +4093,9 @@ fn build_commit_store(
             read_extents,
             item_extent,
             drive_resume,
+            // A tap keyed by item commits with its item's position, which the driver's rows
+            // carry for the writer.
+            !w.item_taps.is_empty(),
         );
         // Two slots of the driver: the body consumes rows, and the writer acks
         // finished attempts. The driver advances its item cursor on the release
@@ -4088,11 +4124,12 @@ fn build_commit_store(
         let mut write_keys: Vec<Value> = w.write_keys.iter().map(runtime_key).collect();
         let mut tap_fields: Vec<Label> = Vec::with_capacity(taps.len());
         for (field, tap_ty) in taps {
-            let tap_value_extent = ctx.extent_of(&tap_ty)?;
+            let tap_value_extent = stored_tap_extent(w, &field, &tap_ty, ctx)?;
             write_keys.push(store_key(&field));
             let prior = keys_map.insert(
                 field.clone(),
                 KeyReadInfo {
+                    by_item: w.item_taps.contains(&field),
                     // A reply tap is a per-commit event, not a persistent value:
                     // emit it only at the tick that wrote it, so two writers'
                     // taps to one defer don't smear across the shared clock. It
@@ -4123,6 +4160,7 @@ fn build_commit_store(
             w.read_keys.iter().map(runtime_key).collect(),
             write_keys,
             tap_fields.iter().map(Label::runtime_key).collect(),
+            w.item_taps.iter().map(Label::runtime_key).collect(),
             key_extent.clone(),
             value_extent.clone(),
         );
@@ -4972,6 +5010,7 @@ fn store_parts(
         let prior = keys_map.insert(
             field.clone(),
             KeyReadInfo {
+                by_item: false,
                 carry_forward: false, // a tap fires only at its own position
                 carried: None,
                 runtime_key,
@@ -5157,6 +5196,7 @@ fn build_nested_induction_store(
         let prior = keys_map.insert(
             field.clone(),
             KeyReadInfo {
+                by_item: false,
                 // An accumulator, so it carries within an enclosing position. It hands nothing
                 // across versions of its own: the *enclosing* store holds this variable,
                 // and two stores claiming one identity is what `live_state` asserts
@@ -5298,6 +5338,7 @@ fn build_induction_store_single(
         let prior = keys_map.insert(
             field.clone(),
             KeyReadInfo {
+                by_item: false,
                 // An accumulator persists across positions. A literal init is the
                 // leading-carry fold default; a *conditional* single-writer loop
                 // does have leading carries (positions before the first
@@ -5540,6 +5581,7 @@ fn convert_store_read(
                 k.runtime_key.clone(),
                 k.value_extent.clone(),
                 k.carry_forward(),
+                k.by_item,
             )
         });
         (info.fan.clone(), info.kind, key)
@@ -5549,9 +5591,21 @@ fn convert_store_read(
         // `runtime_key`. The key's registration fixes `carry_forward`: a mutable
         // variable holds its value across ticks that wrote other keys, and a reply tap
         // appears only at the tick that wrote it.
-        (StoreReadKind::Commit, Some((runtime_key, value_extent, carry_forward))) => Ok(Box::new(
-            StoreValueStream::new(fan.slot(), runtime_key, value_extent, carry_forward),
-        )),
+        (StoreReadKind::Commit, Some((runtime_key, value_extent, carry_forward, by_item))) => {
+            let stream = Box::new(StoreValueStream::new(
+                fan.slot(),
+                runtime_key,
+                value_extent,
+                carry_forward,
+            ));
+            // A tap keyed by item holds `(item position, value)` at each commit, and its site
+            // commits its items in its source's order.
+            Ok(if by_item {
+                Box::new(RekeySorted::new(stream))
+            } else {
+                stream
+            })
+        }
         // An `InductionChangelog` key read off the changelog by [`StoreDenseRead`],
         // folded at every position the store decided. An **accumulator**
         // (`carry_forward: true`) is dense `D ⇀ V`: every position folds the latest write
@@ -5566,7 +5620,7 @@ fn convert_store_read(
         // is a collection of stores and the read carries the levels the store does.
         (
             StoreReadKind::InductionChangelog | StoreReadKind::NestedInductionChangelog,
-            Some((runtime_key, value_extent, carry_forward)),
+            Some((runtime_key, value_extent, carry_forward, _)),
         ) => Ok(Box::new(StoreDenseRead::new(
             fan.slot(),
             runtime_key,

@@ -292,13 +292,14 @@ impl AggregateKind {
         !self.is_partial() && accumulator.rows() == 0
     }
 
-    /// Stop at the extreme of a complete, empty collection, which has no value. Interim, as
-    /// `//` by zero stops: `max` and `min` are to return `Option::none` there
-    /// (`docs/chl-spec.md`, "7.1 Aggregates").
-    pub fn no_extreme_of_nothing(&self) -> ! {
+    /// Stop at the fold of a complete, empty collection where the fold has no identity, which
+    /// has no value: an extreme, or `sole`. Interim, as `//` by zero stops: `max` and `min` are
+    /// to return `Option::none` there (`docs/chl-spec.md`, "7.1 Aggregates").
+    pub fn no_value_of_nothing(&self) -> ! {
         let name = match self {
             AggregateKind::Max => "max",
             AggregateKind::Min => "min",
+            AggregateKind::Sole => "sole",
             other => unreachable!("{other:?} has an identity, so it has a value at no elements"),
         };
         panic!("`{name}` of an empty collection has no value")
