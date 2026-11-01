@@ -306,8 +306,6 @@ diagnostics:
   62:12-62:18 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
     62:5-62:39 while parsing statement
     62:5-62:11 while parsing expression
-  76:14-76:18 found 'with', expected 'if', 'match', or 'try'
-    76:5-83:5 while parsing statement
 symbols:
   variable Dollars 30:1-30:14 (name 30:1-30:8)
   variable Qty 31:1-31:25 (name 31:1-31:4)
@@ -335,6 +333,7 @@ folds:
   67-69
   70-71
   75-83
+  76-81
   88-111
   89-90 comment
   91-109
@@ -355,8 +354,6 @@ diagnostics:
   75:12-75:18 found 'identifier', expected binary operator, comparison operator, boolean operator, postfix operation, augmented-assignment operator, 'newline', 'if', '<<', '<:', '^=', '->', '=>', '|=>', '**', '=', ',', ':', ':=', '::', or ';'
     75:5-75:39 while parsing statement
     75:5-75:11 while parsing expression
-  89:14-89:18 found 'with', expected 'if', 'match', or 'try'
-    89:5-96:5 while parsing statement
 symbols:
   variable Dollars 27:1-27:14 (name 27:1-27:8)
   variable Qty 28:1-28:25 (name 28:1-28:4)
@@ -389,6 +386,7 @@ folds:
   80-82
   83-84
   88-96
+  89-94
   101-124
   102-103 comment
   104-122

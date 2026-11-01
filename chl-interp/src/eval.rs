@@ -1787,68 +1787,86 @@ impl Interp {
 
             // `with begin():` — one commit record per block, at the next commit time, or none if
             // the block denied.
-            Stmt::With {
-                binding,
-                context,
-                body,
-            } => {
-                if binding.is_some() {
-                    return err("the `with t = begin():` transaction handle is not supported");
-                }
-                if !is_zero_arg_call(&context.node, SurfaceBuiltin::Begin) {
-                    return err("the only transaction context is `begin()`");
-                }
-                if self.txn.is_some() {
-                    return err("nested `with begin():` transactions are not supported");
-                }
-                let mut writes = BTreeSet::new();
-                written_names(body, &mut writes);
-                self.txn = Some(TxnFrame {
-                    site: stmt.span.start,
-                    wrote: false,
-                    writes,
-                    replies: Vec::new(),
-                    uncertain: false,
-                });
-                let outcome = self.scoped(|me| me.exec_block(body));
-                let frame = self.txn.take().expect("installed above");
-                outcome?;
-
-                // A block that may or may not commit leaves every later commit time undecided,
-                // and its own replies may not happen.
-                if frame.uncertain {
-                    self.clock_known = false;
-                    for (channel, site, _) in frame.replies {
-                        self.contribute(&channel)
-                            .push((site, Value::Pending, Value::Pending));
-                    }
-                    return Ok(None);
-                }
-                if !frame.wrote && frame.replies.is_empty() {
-                    // Denied: no write, no reply, no commit time.
-                    return Ok(None);
-                }
-                self.commit_time += 1;
-                // A commit takes the next commit time, so a loop around it takes its commits
-                // in iteration order.
-                for watch in &mut self.order_watches {
-                    watch.moved = true;
-                }
-                let at = if self.clock_known {
-                    Value::CommitTime(self.commit_time)
-                } else {
-                    Value::Pending
-                };
-                for (channel, site, value) in frame.replies {
-                    self.contribute(&channel).push((site, at.clone(), value));
-                }
-                Ok(None)
-            }
+            Stmt::With { .. } => self.transaction(stmt, false).map(|_| None),
 
             // A declaration binds no value; its members were collected before the run.
             Stmt::Pass | Stmt::TypeDecl(_) | Stmt::TraitDecl(_) => Ok(None),
             other => err(format!("unsupported statement: {other:?}")),
         }
+    }
+
+    /// Run the `with begin():` block `stmt`: one commit record, at the next commit time, or
+    /// none where the block denied. A block in value position (`valued`) answers its value,
+    /// and `Unit` otherwise.
+    fn transaction(&mut self, stmt: &Spanned<Stmt>, valued: bool) -> Result<Value, Error> {
+        let Stmt::With {
+            binding,
+            context,
+            body,
+        } = &stmt.node
+        else {
+            unreachable!("called on a `with` statement")
+        };
+        if binding.is_some() {
+            return err("the `with t = begin():` transaction handle is not supported");
+        }
+        if !is_zero_arg_call(&context.node, SurfaceBuiltin::Begin) {
+            return err("the only transaction context is `begin()`");
+        }
+        if self.txn.is_some() {
+            return err("nested `with begin():` transactions are not supported");
+        }
+        let mut writes = BTreeSet::new();
+        written_names(body, &mut writes);
+        self.txn = Some(TxnFrame {
+            site: stmt.span.start,
+            wrote: false,
+            writes,
+            replies: Vec::new(),
+            uncertain: false,
+        });
+        // A block in value position ends in its value, and commits on every path where it
+        // writes anywhere: a path that writes nothing commits its reads.
+        let outcome = self.scoped(|me| {
+            if valued {
+                me.block_value(body, false)
+            } else {
+                me.exec_block(body).map(|_| Value::Unit)
+            }
+        });
+        let frame = self.txn.take().expect("installed above");
+        let value = outcome?;
+        let valued_commit = valued && !frame.writes.is_empty();
+
+        // A block that may or may not commit leaves every later commit time undecided,
+        // and its own replies may not happen.
+        if frame.uncertain {
+            self.clock_known = false;
+            for (channel, site, _) in frame.replies {
+                self.contribute(&channel)
+                    .push((site, Value::Pending, Value::Pending));
+            }
+            return Ok(if valued { Value::Pending } else { value });
+        }
+        if !frame.wrote && frame.replies.is_empty() && !valued_commit {
+            // Denied: no write, no reply, no commit time.
+            return Ok(value);
+        }
+        self.commit_time += 1;
+        // A commit takes the next commit time, so a loop around it takes its commits
+        // in iteration order.
+        for watch in &mut self.order_watches {
+            watch.moved = true;
+        }
+        let at = if self.clock_known {
+            Value::CommitTime(self.commit_time)
+        } else {
+            Value::Pending
+        };
+        for (channel, site, reply) in frame.replies {
+            self.contribute(&channel).push((site, at.clone(), reply));
+        }
+        Ok(value)
     }
 
     /// Bind the associated function `ty::name`. It takes no `Mut` parameter, which the
@@ -2501,7 +2519,8 @@ impl Interp {
                 else_body: Some(_), ..
             }
             | Stmt::Match { .. }
-            | Stmt::Try { .. } => self.branch_value(last, effects_denote_unit),
+            | Stmt::Try { .. }
+            | Stmt::With { .. } => self.branch_value(last, effects_denote_unit),
             // A path that raises contributes no value: the exception leaves the block, or a
             // speculative one loses its effects and is pending.
             Stmt::Raise(_) => self.exec(last).map(|_| Value::Pending),
@@ -2556,6 +2575,7 @@ impl Interp {
             Stmt::Try { body, handlers } => self.run_try(body, handlers, |me, block| {
                 me.block_value(block, effects_denote_unit)
             }),
+            Stmt::With { .. } => self.transaction(stmt, true),
             other => err(format!("{other:?} in expression position")),
         }
     }
@@ -3726,6 +3746,23 @@ mod tests {
             out << r
         "});
         assert!(why.contains("whose order is not defined"), "{why}");
+    }
+
+    /// A function whose body ends in a `with begin():` block returns the block's value, as the
+    /// block does on an assignment's right-hand side (`docs/chl-spec.md`, "4.1 `def` — function
+    /// definition").
+    #[test]
+    fn a_function_ending_in_a_block_returns_its_value() {
+        let v = out(indoc! {"
+            pool: Mut(Int, Txn) := 100
+            def take(n: Int):
+                with begin():
+                    pool := pool - n
+                    pool
+            out = test_sink()
+            out << take(10)
+        "});
+        assert_eq!(v.to_string(), "[() -> 90]");
     }
 
     #[test]

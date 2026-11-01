@@ -714,10 +714,16 @@ pub(super) fn lower_block_value(
     debug_assert!(
         matches!(
             stmt.node,
-            ChlStmt::If { .. } | ChlStmt::Match { .. } | ChlStmt::Try { .. }
+            ChlStmt::If { .. } | ChlStmt::Match { .. } | ChlStmt::Try { .. } | ChlStmt::With { .. }
         ),
-        "Expr::Block wraps an `if`, a `match` or a `try`; the parser builds no other block value"
+        "Expr::Block wraps an `if`, a `match`, a `try` or a `with`; the parser builds no other \
+         block value"
     );
+    if let ChlStmt::With { .. } = stmt.node {
+        let mut scope = outer_bindings.clone();
+        collect_stmt_names(preceding, &mut scope);
+        return lower_valued_with_block(stmt, &scope, ctx);
+    }
     lower_final_stmt(stmt, preceding, outer_bindings, ctx)
 }
 

@@ -432,8 +432,7 @@ production is shared with pre-`:=` code shapes.
 `expression` in the grammar, but lowering accepts only `begin()`. The optional `ident "="`
 prefix names the block's transaction, which a program uses only before `::` (§8.7,
 **[Decided]**). `with` does
-**not** provide Python's general context-manager statement. A `with_stmt` as a
-`block_value` is **[Decided]**.
+**not** provide Python's general context-manager statement.
 
 `decl_stmt` declares a feed with no value, `h: Feed(V)`
 ([Declaring a feed](#declaring-a-feed)); every other binding takes a value.
@@ -5141,7 +5140,20 @@ around `reserve` + `quote` + the feed).
 
 #### A block is also the value it computes
 
-**[Decided]** — the rules of this section.
+> **[Interim]** The compiler refuses these blocks in value position:
+>
+> - a feed under a condition that reads the block's value, such as `if ok: out << r` after the
+>   block, and in a loop that reads a writing block's value, a feed under any condition;
+> - a block in a function that a loop calls, in a loop that only feeds or that holds another loop,
+>   or in an expression such as a feed's value;
+> - a block in a loop that reads the value of an earlier block in the loop or a variable its loop
+>   accumulates into, or a binding computed from either;
+> - a block that an exception escapes.
+>
+> In a loop, a block in statement position that reads the value of an earlier block, or a binding
+> computed from one or from a variable its loop accumulates into, is not compiled either, and
+> neither is a function body that ends in a block whose last statement has a value other than
+> `unit` (**[Decided]**, [4.1 `def` — function definition](#41-def--function-definition)).
 
 A `with begin():` block on an assignment's right-hand side is the value of its last statement, by
 the rule a function body follows

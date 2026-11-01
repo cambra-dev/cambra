@@ -2282,6 +2282,7 @@ fn transform_loop(
     cont: Expr,
     declared: &mut Declared,
 ) -> Expr {
+    let (target, iter, loop_body) = carry_position(&position, target, iter, loop_body);
     // Accumulating variables in first-write order, with their value types and
     // every write to each.
     let mut accs: Vec<AccumulatorVariable> = Vec::new();
@@ -2362,6 +2363,61 @@ fn transform_loop(
         fold.feed_views,
         rewrite(cont, declared),
     )
+}
+
+/// The loop `For{position, target, iter, body}` with its position carried in its item where its
+/// body reads it: `For{position, λ ξ → (iter(ξ), ξ), let target = 𝑝.0 in body[position ↦
+/// 𝑝.1]}`, binding the item `𝑝`. Unchanged where the body reads no position, or where the
+/// item's type reads it.
+///
+/// A loop's body is a function of its item: a writer body of its snapshot and its item alone,
+/// and a feed's step of the element it is fed. A block's value is read at the loop's position
+/// where the block stands ([`crate::ccl::transact_phase`]), so that read takes the position from
+/// the item, and a branch reads the value only at the positions it runs at.
+fn carry_position(
+    position: &Name,
+    target: TypedBinding,
+    iter: Expr,
+    body: Expr,
+) -> (TypedBinding, Expr, Expr) {
+    let (dom, item_ty) = fun_parts(&iter.ty);
+    if !reads_position(position, &body, &item_ty) {
+        return (target, iter, body);
+    }
+    let _g = provenance::enter(
+        iter.node_id(),
+        "letrec.carried_position",
+        provenance::Nature::Expansion,
+    );
+    let x = Name::fresh("__zx");
+    let at_x = tvar(&x, dom.clone());
+    let tuple_ty = Type::Tuple(vec![item_ty.clone(), dom.clone()]);
+    let source_ty = iter.ty.clone();
+    let tuple = Expr::tuple(vec![
+        Expr::apply(at_x.clone(), iter).with_ty(item_ty.clone()),
+        at_x,
+    ])
+    .with_ty(tuple_ty.clone());
+    let source = Expr::lambda(x.clone(), Occurrence::mint(), dom.clone(), tuple)
+        .with_ty(Type::fun_like(&source_ty, dom.clone(), tuple_ty.clone()));
+    let p = binding(Name::fresh("__item"), tuple_ty.clone());
+    let component = |i: usize, ty: &Type| {
+        let mut proj = Expr::proj_index(i);
+        proj.ty = Type::fun(tuple_ty.clone(), ty.clone());
+        Expr::apply(tvar(&p.name, tuple_ty.clone()), proj).with_ty(ty.clone())
+    };
+    let mut body = body;
+    Subst::discharge_in_place(&mut body, position, &component(1, &dom));
+    let ty = body.ty.clone();
+    let body = Expr::let_in(target, component(0, &item_ty), body).with_ty(ty);
+    (p, source, body)
+}
+
+/// Whether a loop's `body` reads its `position` where [`carry_position`] carries it: in its
+/// value, with an item type that does not read it.
+fn reads_position(position: &Name, body: &Expr, item_ty: &Type) -> bool {
+    crate::ccl::ccl_utils::is_free_in_value(position, body)
+        && !crate::ccl::subst::type_free_vars(item_ty).contains(position)
 }
 
 /// One accumulating mutable variable of an induction loop: the variable, the value
@@ -2482,6 +2538,19 @@ pub(crate) fn fold_induction_loop(
     loop_body: Expr,
     declared: &Declared,
 ) -> InductionFold {
+    let carried;
+    let (target, iter, loop_body) = if reads_position(position, &loop_body, &fun_parts(&iter.ty).1)
+    {
+        let _g = provenance::enter(
+            iter.node_id(),
+            "letrec.carried_position",
+            provenance::Nature::Expansion,
+        );
+        carried = carry_position(position, target.clone(), iter.clone(), loop_body);
+        (&carried.0, &carried.1, carried.2)
+    } else {
+        (target, iter, loop_body)
+    };
     let mut accs: Vec<AccumulatorVariable> = Vec::new();
     collect_writes(&loop_body, declared, &mut accs);
     assert!(

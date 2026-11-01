@@ -1297,6 +1297,83 @@ fn failed_after_coalesce(expr: &Expr, errors: Vec<LocatedInferError>) -> RunFail
     RunFailure { errors, recovered }
 }
 
+/// The last statements, with a value other than `unit`, of each `with begin():` block that ends a
+/// function body. Lowering builds such a block as a statement, whose value is `unit`, while the
+/// function's value is its block's (`docs/chl-spec.md`, "A block is also the value it
+/// computes"), so these are refused rather than discarded. An `if`, `match` or `try` ending the
+/// block ends it in each of its blocks, and a `raise` has no value.
+fn values_ending_function_blocks(expr: &TypedExpr) -> Vec<NodeId> {
+    use crate::ccl::expr::TypedExprNode as N;
+    let is_unit = |e: &TypedExpr| matches!(e.node, N::Lit(Lit::Unit));
+    /// The `with begin():` body ending the statement chain `e`, through the binding of a
+    /// function's result ([`crate::ccl::opaque_output::output_body`]). Lowering builds a block in
+    /// statement position as a loop over the one-item source `[unit]`, whose item it names
+    /// `__txn_item`, with the block as its body.
+    fn ending_block(e: &TypedExpr) -> Option<&TypedExpr> {
+        if let Some(body) = crate::ccl::opaque_output::output_body(e) {
+            return ending_block(body);
+        }
+        match &e.node {
+            N::Let { body, .. } | N::MutDecl { body, .. } => ending_block(body),
+            N::ExprStmt { expr, body } => match &expr.node {
+                N::For {
+                    target,
+                    body: block,
+                    ..
+                } if matches!(body.node, N::Lit(Lit::Unit))
+                    && target.name.base().starts_with("__txn_item") =>
+                {
+                    match &block.node {
+                        N::ExprStmt { expr, .. } => match &expr.node {
+                            N::Begin { body } => Some(body),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                }
+                _ => ending_block(body),
+            },
+            _ => None,
+        }
+    }
+    fn last_values(e: &TypedExpr, is_unit: &impl Fn(&TypedExpr) -> bool, out: &mut Vec<NodeId>) {
+        match &e.node {
+            N::Let { body, .. } | N::MutDecl { body, .. } => last_values(body, is_unit, out),
+            N::ExprStmt { expr, body } if is_unit(body) => match &expr.node {
+                N::Case { branches, .. } => {
+                    for branch in branches {
+                        last_values(&branch.body, is_unit, out);
+                    }
+                }
+                N::Try { body, handlers } => {
+                    last_values(body, is_unit, out);
+                    for handler in handlers {
+                        last_values(&handler.body, is_unit, out);
+                    }
+                }
+                N::Raise { .. } => {}
+                _ if !matches!(expr.ty.peel_refinements(), Type::Base(BaseType::Unit)) => {
+                    out.push(e.node_id());
+                }
+                _ => {}
+            },
+            N::ExprStmt { body, .. } => last_values(body, is_unit, out),
+            _ => {}
+        }
+    }
+    fn go(e: &TypedExpr, is_unit: &impl Fn(&TypedExpr) -> bool, out: &mut Vec<NodeId>) {
+        if let N::Lambda { body, .. } = &e.node
+            && let Some(block) = ending_block(body)
+        {
+            last_values(block, is_unit, out);
+        }
+        e.walk_children(|c| go(c, is_unit, out));
+    }
+    let mut out = Vec::new();
+    go(expr, &is_unit, &mut out);
+    out
+}
+
 /// One run of inference over `expr`, as [`run_with_params`] describes.
 fn run_once(
     expr: &mut Expr,
@@ -1593,6 +1670,27 @@ fn run_once(
     // validator does not traverse for witness references. This additional walk is debug-only.
     #[cfg(debug_assertions)]
     debug_assert_no_free_witness(expr, "post-inference");
+    // A function body ending in a block whose last statement has a value is refused by name,
+    // and that statement is not also reported as doing nothing.
+    let block_results = values_ending_function_blocks(expr);
+    if !block_results.is_empty() {
+        return Err(failed(
+            block_results
+                .into_iter()
+                .map(|node| {
+                    LocatedInferError::new(
+                        InferError::Unsupported(
+                            "a function body that ends in a `with begin():` block whose last \
+                             statement has a value is not compiled yet; bind the block's value, \
+                             `r = with begin(): …`, and end the body in `r`"
+                                .to_string(),
+                        ),
+                        node,
+                    )
+                })
+                .collect(),
+        ));
+    }
     // An expression statement, and a `with begin():` block, does something only by what it
     // causes.
     let inert: Vec<LocatedInferError> = sub_ctx

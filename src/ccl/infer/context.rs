@@ -165,7 +165,8 @@ pub(super) struct InferCtx {
     effect_loops: Vec<EffectLoop>,
     /// Each ordered loop's source, for [`InferCtx::order_keyed_loops`].
     ordered_loops: Vec<OrderedLoop>,
-    /// Each `with begin():` block emitted, with the variable collecting what its body causes.
+    /// Each `with begin():` block in statement position emitted, with the variable collecting
+    /// what its body causes.
     capability_transactions: Vec<(NodeId, Rc<CapabilityVar>)>,
     /// Each `try` emitted, innermost first: a `try` is recorded once its body is emitted.
     capability_tries: Vec<TryFrame>,
@@ -1546,10 +1547,11 @@ impl InferCtx {
         kept
     }
 
-    /// What was emitted that causes nothing and so does nothing: each `with begin():` block
-    /// whose body writes and feeds nothing (`docs/chl-spec.md`, "8.2 Transactions: `with
-    /// begin():`"), then each expression statement outside those blocks
-    /// (`docs/chl-spec.md`, "4.9 Expression statement").
+    /// What was emitted that causes nothing and so does nothing: each `with begin():` block in
+    /// statement position whose body writes and feeds nothing (`docs/chl-spec.md`, "8.2
+    /// Transactions: `with begin():`"), then each expression statement outside those blocks
+    /// (`docs/chl-spec.md`, "4.9 Expression statement"). A block in value position is its value,
+    /// so [`Typing::transaction_body`] does not record one.
     ///
     /// A statement in a polymorphic definition can call a function that only each use of the
     /// definition determines: a parameter's. That call's variable has nothing flowing into it
@@ -4283,7 +4285,7 @@ impl Typing for InferCtx {
         self.bind_capability_name(name, ty, true);
     }
 
-    fn transaction_body<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R {
+    fn transaction_body<R>(&mut self, valued: bool, f: impl FnOnce(&mut Self) -> R) -> R {
         // The body collects on a variable of its own, which no commit may reach, directly or
         // through a call: transactions do not nest (`docs/chl-spec.md`, "8.2 Transactions:
         // `with begin():`"). The bound is copied with the variable at each instantiation, so
@@ -4318,7 +4320,9 @@ impl Typing for InferCtx {
             .var
             .clone();
         self.leave_node_capabilities();
-        self.capability_transactions.push((node, var));
+        if !valued {
+            self.capability_transactions.push((node, var));
+        }
         r
     }
 

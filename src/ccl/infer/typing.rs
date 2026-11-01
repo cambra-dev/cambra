@@ -514,8 +514,9 @@ pub(super) trait Typing {
     }
 
     /// Run `f` as the body of a `with begin():` block, which supplies `Transaction` to
-    /// what it calls.
-    fn transaction_body<R>(&mut self, f: impl FnOnce(&mut Self) -> R) -> R
+    /// what it calls. A block in value position (`valued`) is not inert when it causes nothing:
+    /// its value is the snapshot it reads.
+    fn transaction_body<R>(&mut self, _valued: bool, f: impl FnOnce(&mut Self) -> R) -> R
     where
         Self: Sized,
     {

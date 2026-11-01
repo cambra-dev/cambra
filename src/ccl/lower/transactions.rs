@@ -85,7 +85,32 @@ pub(super) fn lower_with_block(
     };
     reject_txn_handle(binding, with_stmt.span)?;
     validate_begin_context(context)?;
-    lower_tx_block(body, outer_bindings, with_stmt.span, ctx)
+    lower_tx_block(body, outer_bindings, with_stmt.span, false, ctx)
+}
+
+/// Lower a `with begin():` block in value position (`x = with begin(): …`) to its
+/// [`TypedExprNode::Begin`] marker, whose body chain ends in the block's value: the value of
+/// its last statement, an expression or an `if`, `match` or `try` whose blocks each end in
+/// one (`docs/chl-spec.md`, "A block is also the value it computes"). The enclosing
+/// binding carries the value past the block; `transact_phase` strips the `Begin` into a commit
+/// site whose every path commits the value.
+pub(super) fn lower_valued_with_block(
+    with_stmt: &Spanned<ChlStmt>,
+    outer_bindings: &HashSet<String>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let ChlStmt::With {
+        binding,
+        context,
+        body,
+    } = &with_stmt.node
+    else {
+        unreachable!("caller guarantees a With statement")
+    };
+    reject_txn_handle(binding, with_stmt.span)?;
+    validate_begin_context(context)?;
+    let block = lower_tx_block(body, outer_bindings, with_stmt.span, true, ctx)?;
+    Ok(ctx.tag_image(Expr::begin(block), with_stmt.span))
 }
 
 /// Lower a standalone `with begin(): <block>` (anywhere a statement can appear)
@@ -136,12 +161,14 @@ fn for_over(iter_var: String, source: Expr, block: Expr) -> Expr {
 }
 
 /// Lower a `with begin():` block body to a per-transaction statement chain
-/// ending in `Unit` — the `For` body `transact_phase` reads to build the writer
-/// decision. Runs with `in_tx_body = true` (bare mutable variable reads are snapshots).
+/// ending in `Unit`, or in the block's value where `valued` — the `For` body `transact_phase`
+/// reads to build the writer decision. Runs with `in_tx_body = true` (bare mutable variable
+/// reads are snapshots).
 fn lower_tx_block(
     stmts: &[Spanned<ChlStmt>],
     outer_bindings: &HashSet<String>,
     span: Span,
+    valued: bool,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     if ctx.in_tx_body {
@@ -151,7 +178,7 @@ fn lower_tx_block(
         ));
     }
     ctx.in_tx_body = true;
-    let result = lower_tx_block_inner(stmts, outer_bindings, span, ctx);
+    let result = lower_tx_block_inner(stmts, outer_bindings, span, valued, ctx);
     ctx.in_tx_body = false;
     result
 }
@@ -164,15 +191,19 @@ fn lower_tx_block(
 ///
 /// `fallback_span` anchors the manufactured chain terminal when the statement
 /// list is empty (the block's own statement spans win when present).
+///
+/// Where `valued`, the last statement is the chain's terminal: its value is the block's
+/// ([`lower_tx_tail`]).
 fn lower_tx_block_inner(
     stmts: &[Spanned<ChlStmt>],
     outer_bindings: &HashSet<String>,
     fallback_span: Span,
+    valued: bool,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     // A `with begin():` body is a block, so it declares its own type aliases.
     with_block_type_aliases(stmts, ctx, |ctx| {
-        lower_tx_block_scoped(stmts, outer_bindings, fallback_span, ctx)
+        lower_tx_block_scoped(stmts, outer_bindings, fallback_span, valued, ctx)
     })
 }
 
@@ -181,6 +212,7 @@ fn lower_tx_block_scoped(
     stmts: &[Spanned<ChlStmt>],
     outer_bindings: &HashSet<String>,
     fallback_span: Span,
+    valued: bool,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     // Multiple `if` guards, `elif` chains, `else` branches and `match` arms are all
@@ -196,8 +228,16 @@ fn lower_tx_block_scoped(
         (Some(first), Some(last)) => first.span.join(last.span),
         _ => fallback_span,
     };
-    let mut chain = ctx.tag_machinery(Expr::lit(Lit::Unit), block_span, "lower.txn_unit");
-    for (_, stmt) in contributing_stmts(stmts).rev() {
+    let mut contributing = contributing_stmts(stmts).rev();
+    let mut chain = if valued {
+        let (_, last) = contributing
+            .next()
+            .ok_or_else(|| block_contributes_nothing(stmts))?;
+        lower_tx_tail(last, outer_bindings, ctx)?
+    } else {
+        ctx.tag_machinery(Expr::lit(Lit::Unit), block_span, "lower.txn_unit")
+    };
+    for (_, stmt) in contributing {
         chain = match &stmt.node {
             // `balance := value` — the transactional mutable variable write. `:=` is the
             // sole variable-write operator; `write_or_let` gates it (a write to a
@@ -265,7 +305,7 @@ fn lower_tx_block_scoped(
                 branches,
                 else_body,
             } => {
-                let case = lower_tx_if(branches, else_body.as_deref(), outer_bindings, ctx)?;
+                let case = lower_tx_if(branches, else_body.as_deref(), outer_bindings, false, ctx)?;
                 ctx.tag_machinery(Expr::expr_stmt(case, chain), stmt.span, "lower.stmt_seq")
             }
             // `out << e` inside the block — a per-commit feed. Its value reads
@@ -295,7 +335,7 @@ fn lower_tx_block_scoped(
                     arms,
                     outer_bindings,
                     ctx,
-                    |body, scope, ctx| lower_tx_block_inner(body, scope, stmt.span, ctx),
+                    |body, scope, ctx| lower_tx_block_inner(body, scope, stmt.span, false, ctx),
                 )?;
                 ctx.tag_machinery(Expr::expr_stmt(case, chain), stmt.span, "lower.stmt_seq")
             }
@@ -320,7 +360,7 @@ fn lower_tx_block_scoped(
                     handlers,
                     outer_bindings,
                     ctx,
-                    |body, scope, ctx| lower_tx_block_inner(body, scope, stmt.span, ctx),
+                    |body, scope, ctx| lower_tx_block_inner(body, scope, stmt.span, false, ctx),
                 )?;
                 ctx.tag_machinery(Expr::expr_stmt(attempt, chain), stmt.span, "lower.stmt_seq")
             }
@@ -356,6 +396,51 @@ fn lower_tx_block_scoped(
     Ok(chain)
 }
 
+/// The last statement of a `with begin():` block in value position, as the chain's terminal:
+/// a bare expression is the value, and an `if`, `match` or `try` is a `Case` whose blocks
+/// each end in one. Every other statement leaves the block without a value.
+fn lower_tx_tail(
+    stmt: &Spanned<ChlStmt>,
+    outer_bindings: &HashSet<String>,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    match &stmt.node {
+        ChlStmt::Expr(value) if !matches!(&value.node, ChlExpr::Feed { .. }) => {
+            lower_expr(value, ctx)
+        }
+        ChlStmt::If {
+            branches,
+            else_body: Some(else_body),
+        } => lower_tx_if(branches, Some(else_body), outer_bindings, true, ctx),
+        ChlStmt::If { .. } => Err(LoweringError::unsupported(
+            stmt.span,
+            "a `with begin():` block whose value is used ends in an `if` with an `else`; \
+             without one the block has no value where no guard holds",
+        )),
+        ChlStmt::Match { scrutinee, arms } => lower_match_over(
+            stmt.span,
+            scrutinee,
+            arms,
+            outer_bindings,
+            ctx,
+            |body, scope, ctx| lower_tx_block_inner(body, scope, stmt.span, true, ctx),
+        ),
+        ChlStmt::Try { body, handlers } => lower_try_over(
+            stmt.span,
+            body,
+            handlers,
+            outer_bindings,
+            ctx,
+            |body, scope, ctx| lower_tx_block_inner(body, scope, stmt.span, true, ctx),
+        ),
+        _ => Err(LoweringError::unsupported(
+            stmt.span,
+            "a `with begin():` block whose value is used ends in an expression, or in an \
+             `if`, `match` or `try` whose blocks each end in one",
+        )),
+    }
+}
+
 /// A `:=` / `+=` write inside a transaction, emitted as a `MutWrite` marker (a
 /// name shadowed by an inner binder is a genuine local → a per-transaction
 /// `Let`). Mutability carries no lowering registry, so the target is *not*
@@ -382,11 +467,13 @@ fn write_or_let(
 
 /// Lower an `if`/`elif`/`else` guard inside a transaction to a `Case`. A bare
 /// `if cond:` (no `else`) is the deny idiom — its implicit else branch is `Unit`
-/// (no writes), which `transact_phase` reads as `commit = false`.
+/// (no writes), which `transact_phase` reads as `commit = false`. Where `valued`, the
+/// `if` ends a block in value position and each branch ends in its value.
 fn lower_tx_if(
     branches: &[IfBranch],
     else_body: Option<&[Spanned<ChlStmt>]>,
     outer_bindings: &HashSet<String>,
+    valued: bool,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
     // `if`/`elif`/`else` inside a block lowers to the general first-match `Case`
@@ -397,7 +484,8 @@ fn lower_tx_if(
     let mut out_branches = Vec::with_capacity(branches.len() + 1);
     for branch in branches {
         let guard = lower_expr(&branch.cond, ctx)?;
-        let body = lower_tx_block_inner(&branch.body, outer_bindings, branch.cond.span, ctx)?;
+        let body =
+            lower_tx_block_inner(&branch.body, outer_bindings, branch.cond.span, valued, ctx)?;
         out_branches.push(Branch {
             pattern: None,
             guard,
@@ -409,7 +497,7 @@ fn lower_tx_if(
     // the guard statement.
     let guard_span = branches[0].cond.span;
     let else_expr = match else_body {
-        Some(stmts) => lower_tx_block_inner(stmts, outer_bindings, guard_span, ctx)?,
+        Some(stmts) => lower_tx_block_inner(stmts, outer_bindings, guard_span, valued, ctx)?,
         None => ctx.tag_machinery(Expr::lit(Lit::Unit), guard_span, "lower.txn_deny"),
     };
     out_branches.push(Branch {

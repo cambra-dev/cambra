@@ -148,10 +148,13 @@ impl TileProducer for AggregateProducer {
         };
         self.kind.accumulate(accumulator, &values, 0, values.rows());
         terminal[0] = is_terminal;
-        // No terminal flag can be emitted before the accumulator has a value.
-        if self.kind.awaits_first_element(accumulator) {
+        // No terminal flag can be emitted before the accumulator has a value: an extreme with no
+        // identity before its first element, or a partial fold (`sole`) before its element.
+        // Where a partial fold's empty accumulator is a value — a group, which holds an
+        // element — it reaches the map aggregate below rather than this one.
+        if accumulator.rows() == 0 {
             if is_terminal {
-                self.kind.no_extreme_of_nothing();
+                self.kind.no_value_of_nothing();
             }
             return self.tiling().empty_tile();
         }
@@ -719,7 +722,7 @@ impl TileProducer for MapAggregateProducer {
                 return true;
             }
             if complete.contains_path(path) {
-                kind.no_extreme_of_nothing();
+                kind.no_value_of_nothing();
             }
             false
         });

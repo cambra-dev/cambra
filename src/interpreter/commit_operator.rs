@@ -4358,6 +4358,9 @@ struct DriverWindow {
     /// so an empty window can still render the slot: with no rows there is no slice to
     /// take the shape from.
     item: Tiling,
+    /// The extent of the source's positions, where each row also carries the position of its
+    /// item ([`F_ITEM_POSITION`]), and `None` where it does not.
+    item_positions: Option<Extent>,
     /// How many rows have ever been pushed — the transaction driver's next attempt
     /// position, its attempts being a contiguous `UInt` domain of its own. Held
     /// across compaction, so a window emptied by a release still knows where it is.
@@ -4419,12 +4422,14 @@ impl DriverWindow {
         nested: Option<NestedBody>,
         read_extents: Vec<Extent>,
         item: Tiling,
+        item_positions: Option<Extent>,
     ) -> Self {
         Self {
             domain,
             nested,
             read_extents,
             item,
+            item_positions,
             attempts: 0,
             highest_pushed: None,
             groups: Vec::new(),
@@ -4646,6 +4651,18 @@ impl DriverWindow {
             column.map_level_predicates(&mut |depth, pred| pred.qualified_by(&held_rows, depth));
             column
         });
+        let mut fields = fields;
+        if let Some(extent) = &self.item_positions {
+            fields.insert(
+                SmolStr::new_static(F_ITEM_POSITION),
+                Tile::Scalar(ColumnValue::from_values(
+                    self.inner_rows()
+                        .map(|r| r.item_position.value().clone())
+                        .collect(),
+                    extent,
+                )),
+            );
+        }
         let slots = Tile::record(fields);
         let codomain = match &self.nested {
             None => slots,
@@ -4951,6 +4968,7 @@ impl InductionDriver {
                 body,
                 &read_extents,
                 item.clone(),
+                None,
             )),
             store_op,
             // **No [`Memo`] over the source.** This drive's release to it is its progress
@@ -5059,6 +5077,7 @@ impl TileOperator for InductionDriver {
                 self.nested.as_ref().map(|n| n.body.clone()),
                 self.read_extents.clone(),
                 self.item.clone(),
+                None,
             ),
             // A resuming driver has already emitted every position up to the one
             // its predecessor reached, whose rows are gone. The item cursor is where
@@ -5682,9 +5701,15 @@ pub struct TransactDriver {
     read_extents: Vec<Extent>,
     /// The item slot's tiling, taken from the source ([`source_item_tiling`]).
     item: Tiling,
+    /// The extent of the source's positions, where each row carries its item's position
+    /// ([`F_ITEM_POSITION`]) for a writer that commits a tap keyed by item.
+    item_positions: Option<Extent>,
 }
 
 impl TransactDriver {
+    /// A driver whose rows also carry their item's source position where `item_positions`,
+    /// which a writer committing a tap keyed by item reads ([`F_ITEM_POSITION`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         store_op: Box<dyn TileOperator>,
         source_op: Box<dyn TileOperator>,
@@ -5692,6 +5717,7 @@ impl TransactDriver {
         read_extents: Vec<Extent>,
         item_extent: Extent,
         resumed_after: Option<Position>,
+        item_positions: bool,
     ) -> Self {
         debug_assert_eq!(
             read_keys.len(),
@@ -5704,12 +5730,19 @@ impl TransactDriver {
             item_extent,
             "the source delivers the items the drive was built for"
         );
+        let item_positions = item_positions.then(|| {
+            let Tiling::DataFunction { domain, .. } = source_op.tiling() else {
+                panic!("a transaction's source is a collection")
+            };
+            domain.clone()
+        });
         Self {
             base: OperatorBase::new(body_input_tiling(
                 &Extent::Base(BaseType::UInt),
                 None,
                 &read_extents,
                 item.clone(),
+                item_positions.as_ref(),
             )),
             store_op,
             source_op,
@@ -5717,6 +5750,7 @@ impl TransactDriver {
             read_extents,
             item,
             resumed_after,
+            item_positions,
         }
     }
 }
@@ -5764,6 +5798,7 @@ impl TileOperator for TransactDriver {
                 None,
                 self.read_extents.clone(),
                 self.item.clone(),
+                self.item_positions.clone(),
             ),
             current: self.resumed_after.clone(),
             latest_emit: None,
@@ -6086,10 +6121,16 @@ fn body_input_tiling(
     nested: Option<&NestedBody>,
     read_extents: &[Extent],
     item: Tiling,
+    item_positions: Option<&Extent>,
 ) -> Tiling {
-    let slots = Tiling::Record(body_input_fields(read_extents, item, |_, ext| {
-        Tiling::from_extent(ext)
-    }));
+    let mut fields = body_input_fields(read_extents, item, |_, ext| Tiling::from_extent(ext));
+    if let Some(extent) = item_positions {
+        fields.insert(
+            SmolStr::new_static(F_ITEM_POSITION),
+            Tiling::Scalar(extent.clone()),
+        );
+    }
+    let slots = Tiling::Record(fields);
     let per_position = Tiling::data_function(
         domain.clone(),
         wrap_enclosing_tiling(nested.map(|n| &n.param), slots),
@@ -6178,6 +6219,32 @@ fn body_input_fields<T>(
     fields.insert(tuple_field(read_extents.len()), item);
     fields
 }
+
+/// The source position of the item driver row `pos` was built for, read off its
+/// [`F_ITEM_POSITION`] field.
+fn item_position_at(driver_tile: &Tile, pos: &Position) -> Value {
+    let Tile::DataFunction {
+        domain, codomain, ..
+    } = driver_tile
+    else {
+        panic!("a transaction driver renders a collection of rows, got {driver_tile:?}")
+    };
+    let row = (0..domain.len())
+        .find(|&i| &domain.index_at(i) == pos.value())
+        .unwrap_or_else(|| panic!("the attempt {pos} is a row of its driver"));
+    let Tile::Record { fields, .. } = codomain.as_ref() else {
+        panic!("a transaction driver's row is a record of its slots")
+    };
+    let Some(Tile::Scalar(positions)) = fields.get(F_ITEM_POSITION) else {
+        panic!("a driver for a writer with a tap keyed by item carries item positions")
+    };
+    positions.index_at(row)
+}
+
+/// The field of a transaction driver's row holding the source position of its item, beside the
+/// body's slots, for a writer that commits a tap keyed by item ([`TransactDriver::new`]). It is
+/// not a tuple field, so no projection of the body's parameter reaches it.
+pub(crate) const F_ITEM_POSITION: &str = "item_position";
 
 /// The `commit` tag of the decision variant `` {`commit{𝑃} | `abort} ``. A union
 /// column keys its arms by name, so the decode matches the tag the CCL side
@@ -6473,6 +6540,10 @@ pub struct TransactWriter {
     /// Their values are appended to each committed write set (a tap commits iff
     /// its transaction does, so a denied request replies nothing).
     tap_fields: Vec<SmolStr>,
+    /// The taps read keyed by the item each was committed for, a subset of `tap_fields`. Each
+    /// commits as the pair `(item position, value)`, the position read off the driver's row
+    /// ([`F_ITEM_POSITION`]), which `RekeySorted` re-keys the tap's stream by.
+    item_taps: Vec<SmolStr>,
 }
 
 impl TransactWriter {
@@ -6484,6 +6555,7 @@ impl TransactWriter {
         read_keys: Vec<Value>,
         write_keys: Vec<Value>,
         tap_fields: Vec<SmolStr>,
+        item_taps: Vec<SmolStr>,
         key_extent: Extent,
         value_extent: Extent,
     ) -> Self {
@@ -6495,6 +6567,7 @@ impl TransactWriter {
             read_keys,
             write_keys,
             tap_fields,
+            item_taps,
         }
     }
 }
@@ -6533,6 +6606,7 @@ impl TileOperator for TransactWriter {
         // reaches this writer, and through it the commit cycle, along this edge.
         let driver_producer = subscribe_forwarding(&mut *self.driver_op, &consumer, scheduler);
         Box::new(TransactWriterProducer {
+            item_taps: self.item_taps.clone(),
             base: ProducerBase::new(
                 TransactWriterProducer::alloc_id(),
                 self.tiling(),
@@ -6592,6 +6666,8 @@ struct TransactWriterProducer {
     /// Reply-tap decision fields, appended to each write set (see
     /// [`TransactWriter::tap_fields`]).
     tap_fields: Vec<SmolStr>,
+    /// See [`TransactWriter::item_taps`].
+    item_taps: Vec<SmolStr>,
     /// The driver position whose decision this writer has already acted on, so a
     /// re-pull re-reads a *not-ready* decision without re-deciding a settled one.
     last_decided_pos: Option<Position>,
@@ -6912,6 +6988,8 @@ impl TileProducer for TransactWriterProducer {
                         self.write_keys.len()
                     );
                     let n_carry = self.write_keys.len() - self.tap_fields.len();
+                    let item_position =
+                        (!self.item_taps.is_empty()).then(|| item_position_at(&driver_tile, &pos));
                     let writes: HashMap<Value, Value> = self
                         .write_keys
                         .iter()
@@ -6919,7 +6997,21 @@ impl TileProducer for TransactWriterProducer {
                         .zip(new)
                         .enumerate()
                         .filter(|(i, _)| *i < n_carry || tap_fired[*i - n_carry])
-                        .map(|(_, kv)| kv)
+                        .map(|(i, (key, value))| {
+                            let by_item = i >= n_carry
+                                && self.item_taps.contains(&self.tap_fields[i - n_carry]);
+                            if !by_item {
+                                return (key, value);
+                            }
+                            let at = item_position
+                                .clone()
+                                .expect("a writer with a tap keyed by item reads item positions");
+                            let pair = Value::Record(HashMap::from([
+                                (tuple_field(0), at),
+                                (tuple_field(1), value),
+                            ]));
+                            (key, pair)
+                        })
                         .collect();
                     // **A grant that writes nothing is read-only**, which is a local
                     // decision and never a proposal ([`Proposal`]): with no carry key and
@@ -8866,6 +8958,7 @@ mod tests {
                 // A drive built with its source, not one resuming a running
                 // program.
                 None,
+                false,
             );
             let driver_fan = Rc::new(FanOut::new(Box::new(DriverProbe {
                 inner: Box::new(driver),
@@ -8884,6 +8977,7 @@ mod tests {
                 driver_fan.slot(),
                 vec![pool.clone()],
                 vec![pool.clone()],
+                Vec::new(),
                 Vec::new(),
                 key_extent(),
                 value_extent(),
