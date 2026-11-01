@@ -167,20 +167,13 @@ pub(crate) fn opened_deep(ty: &Type) -> Type {
         },
         // A family's body reads its binders by their names.
         Type::Family { binders, body } if binders.iter().all(|(n, _)| n.is_some()) => {
-            let opened = crate::ccl::subst::open_family_body(binders.len(), body, |j| {
-                crate::ccl::subst::Mapping::Rename(
-                    binders[j]
-                        .0
-                        .clone()
-                        .unwrap_or_else(|| unreachable!("every binder is named")),
-                )
-            });
+            let opened = crate::ccl::subst::opened_family_body(binders, body);
             Type::Family {
                 binders: binders
                     .iter()
                     .map(|(n, t)| (n.clone(), opened_deep(t)))
                     .collect(),
-                body: Box::new(opened_deep(&opened)),
+                body: Box::new(opened_deep(opened.as_ref().unwrap_or(body))),
             }
         }
         // A component's references to the components before it are read by their names, as a

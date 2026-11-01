@@ -2463,6 +2463,12 @@ codomain contains inference variables; concrete closed pairs can compare index-t
 have produced different stored forms. Unconditionally opening concrete pairs during live solving
 could capture an unrelated free name matching a display spelling.
 
+**A walk that reads a type's terms opens every binder above them.** `walk_children_opened` and
+planning's `compile_predicates_in_type` open a function's codomain, a dependent tuple's components,
+and a family's body at their binders' names before reading the terms inside, and the latter closes
+them again (`map_opened_codomain`, `map_opened_family_body`). A predicate compiled closed carries
+its indices under the crossings its compiled morphisms add, where they name another binder.
+
 `open_codomain` is the rebuild entry point used by composition adjacency, lambda elimination's
 application transformer, and the group-by recognizer. The recognizer needs a free key reference
 to match its equality predicate. A missing name on a function whose codomain references it

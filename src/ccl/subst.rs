@@ -3419,11 +3419,12 @@ pub fn open_pi_binder(target: &Mapping, ty: &Type) -> Type {
 }
 
 /// Visit `ty`'s structural children as a reader under their binders sees them: a named
-/// function's codomain opened at its binder, and a dependent tuple's component opened at
-/// the names of the components before it. Every other child is visited as stored. The
-/// walk for code that reads the terms a type holds — a predicate typed or compiled must
-/// read its binders as names, since its subterms' types are carried into new function
-/// types (`src/ccl/design/type-inference.md`, "Where the conversions run").
+/// function's codomain opened at its binder, a dependent tuple's component opened at the
+/// names of the components before it, and a family's body opened at its binders' names.
+/// Every other child is visited as stored. The walk for code that reads the terms a type
+/// holds — a predicate typed or compiled must read its binders as names, since its
+/// subterms' types are carried into new function types
+/// (`src/ccl/design/type-inference.md`, "Where the conversions run").
 ///
 /// Each child comes with the binders it was opened at, outermost first, each paired with
 /// the type it ranges over (a component's own type opened as the component is), so a
@@ -3463,6 +3464,26 @@ pub fn walk_children_opened<'t>(
                 binders.push((name.clone(), opened));
             }
         }
+        Type::Family { binders, body } => {
+            for (_, t) in binders {
+                visit(&[], Cow::Borrowed(t));
+            }
+            match opened_family_body(binders, body) {
+                Some(opened) => {
+                    let scope: Vec<(Name, Type)> = binders
+                        .iter()
+                        .map(|(n, t)| {
+                            let n = n.clone().unwrap_or_else(|| {
+                                unreachable!("an opened family body's binders are named")
+                            });
+                            (n, t.clone())
+                        })
+                        .collect();
+                    visit(&scope, Cow::Owned(opened));
+                }
+                None => visit(&[], Cow::Borrowed(body)),
+            }
+        }
         _ => ty.walk_children(|child| visit(&[], Cow::Borrowed(child))),
     }
 }
@@ -3487,6 +3508,41 @@ pub fn map_opened_codomain(binder: &Name, codomain: &mut Type, edit: impl FnOnce
     let mut opened = open_pi_binder(&Mapping::Rename(binder.clone()), codomain);
     edit(&mut opened);
     *codomain = close_pi_binder(binder, &opened);
+}
+
+/// A [`Type::Family`]'s stored `body` with each of its `binders` read by name, or `None` when
+/// the body reads no binder and so is its own opened form.
+///
+/// # Panics
+///
+/// When the body reads a binder and some binder has no name to open it at.
+pub fn opened_family_body(binders: &[(Option<Name>, Type)], body: &Type) -> Option<Type> {
+    if !references_binder_within(body, binders.len() as u32) {
+        return None;
+    }
+    Some(open_family_body(binders.len(), body, |j| {
+        Mapping::Rename(
+            binders[j]
+                .0
+                .clone()
+                .expect("a family whose body reads its binders names them"),
+        )
+    }))
+}
+
+/// Run `edit` on a stored family body in its opened form ([`opened_family_body`]) and store
+/// the result closed again: [`map_opened_codomain`] for the binders of a [`Type::Family`].
+pub fn map_opened_family_body(
+    binders: &[(Option<Name>, Type)],
+    body: &mut Type,
+    edit: impl FnOnce(&mut Type),
+) {
+    let Some(mut opened) = opened_family_body(binders, body) else {
+        return edit(body);
+    };
+    edit(&mut opened);
+    let names: Vec<Option<Name>> = binders.iter().map(|(n, _)| n.clone()).collect();
+    *body = close_pi_binders(&names, &opened);
 }
 
 /// Close each dependent-tuple component's references to the names of the

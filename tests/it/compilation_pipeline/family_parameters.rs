@@ -417,12 +417,11 @@ fn a_kind_naming_its_value_is_the_kind_without_the_name() {
     );
 }
 
-/// A nested group-by wrapped in a nominal type is refused after planning: the inner groups'
-/// domains read the outer key under two names. A type without a family parameter,
-/// `type Box1(V) = V`, panics on the same program during inference.
+/// A nested group-by passed as a family: the inner groups' domains read the outer key, which the
+/// family's binder names, so the predicates planning compiles inside the family's body read it
+/// by that name.
 #[test]
-#[should_panic = "post-planning produced an invalid tree"]
-fn a_nested_group_by_in_a_family_is_not_compiled_yet() {
+fn a_nested_group_by_is_a_family() {
     check_scalar(
         &format!(
             "{GROUPS}{}",

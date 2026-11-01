@@ -397,6 +397,15 @@ fn compile_predicates_in_type(
                 *component = t;
             }
         }
+        // A family's body is compiled under its binders' names, as a codomain is.
+        Type::Family { binders, body } => {
+            for (_, t) in binders.iter_mut() {
+                compile_predicates_in_type(t, memo, slot);
+            }
+            crate::ccl::subst::map_opened_family_body(binders, body, |opened| {
+                compile_predicates_in_type(opened, memo, slot)
+            });
+        }
         _ => ty.walk_children_mut(|child| compile_predicates_in_type(child, memo, slot)),
     }
 }
