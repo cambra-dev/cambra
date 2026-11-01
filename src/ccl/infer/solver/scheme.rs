@@ -251,8 +251,8 @@ pub struct FreshenCache {
     /// re-minted as a new parameter.
     pub params: HashMap<crate::ccl::ty::TypeParamId, (Rc<crate::ccl::ty::TypeParam>, Type)>,
     /// The scope a variable minted for a type parameter stands in: the use site's,
-    /// at instantiation. A parameter has no variable of its own whose telescope a
-    /// copy could inherit.
+    /// at instantiation, and the clone's, in a specialization clone. A parameter has no
+    /// variable of its own whose telescope a copy could inherit.
     pub param_telescope: Option<Telescope>,
     /// The scope a let-generalized binding's instantiation stands in: the use site's, which
     /// holds the definition site's and every binder entered between the two. Each variable

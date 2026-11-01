@@ -1004,6 +1004,35 @@ fn a_definition_applied_to_each_group(
     );
 }
 
+/// A definition's declared type parameter instantiated at nested groups, whose inner domains read
+/// the outer group-by: the specialization's variable for the parameter stands where the
+/// specialization does, so it may resolve to a type reading that binder
+/// (`src/ccl/design/type-inference.md`, "A specialization stands where its types are in scope").
+///
+/// `function` defines `same` under `nested`, so its specialization stands at the definition, in the
+/// scope the definition stands in. A constructor is bound around the whole module, so
+/// `constructor`'s specialization stands under only the binders its placement enters, wherever
+/// `Box1` is declared.
+#[rstest]
+#[case::function(indoc! {r#"
+    nested = [groupby(grp, \x -> x > 3) for grp in groupby([1, 2, 3, 4], \x -> x > 2)]
+    def same(V, x: V) => V:
+        x
+    n = same(nested)
+"#})]
+#[case::constructor(indoc! {r#"
+    type Box1(V) = V
+
+    nested = [groupby(grp, \x -> x > 3) for grp in groupby([1, 2, 3, 4], \x -> x > 2)]
+    n = Box1::new(nested).extract()
+"#})]
+fn a_type_parameter_instantiated_at_nested_groups(#[case] code: &str) {
+    check_scalar(
+        &format!("{code}\nsum([sum([sum(inner) for inner in outer]) for outer in n])"),
+        Value::Int(10),
+    );
+}
+
 /// A definition applied under a `match` pattern's binder to a collection filtered by that binder.
 /// The specialization's resolved instance reads no binder between the definition and the use, so
 /// it is specialized at the definition rather than placed under the pattern binder, which takes
