@@ -1305,6 +1305,25 @@ fn extract_answers_a_collection_of_groups(#[case] code: &str, #[case] expected: 
     check_scalar(code, Value::Int(expected));
 }
 
+/// A function's annotated result, a collection of groups taken out of a nominal value, is a
+/// comprehension's source.
+#[test]
+fn an_annotated_functions_collection_of_groups_is_a_source() {
+    check_scalar(
+        indoc! {r#"
+            type Box1(V) = V
+
+            def ex(V, b: Box1(V)) => V:
+                match b:
+                    case Box1::new(g):
+                        g
+            b = Box1::new(groupby([1, 2, 3], \x -> x > 1))
+            sum([sum(grp) for grp in ex(b)])
+        "#},
+        Value::Int(6),
+    );
+}
+
 /// Only the single-constructor form declares `extract`.
 #[test]
 fn a_constructor_list_declares_no_extract() {

@@ -449,8 +449,9 @@ pub(super) fn wrap_with_iterate(
     // top-level Let (the only context that calls into this function with
     // a Let), both children are at `input=None` positions, so recurse
     // into them rather than prepending iterate to the Let itself.  This
-    // arm runs before [`is_iteration_bearing`]'s early-return below
-    // because Let isn't recognised as iteration-bearing on its own.
+    // arm runs before [`is_iteration_bearing`]'s early-return below because
+    // the two sides are planned separately: each is wrapped at its own
+    // `input=None` position.
     //
     // No matching product arm here: [`insert_iterate_recurse`] runs first and has
     // already wrapped every component that holds a collection, so a descent here
@@ -685,7 +686,7 @@ fn all_witnesses_realized(
 /// `Compose`) already provides iteration — i.e. wrapping it with
 /// `iterate` would either be redundant or break op-conversion.
 ///
-/// The check covers three groups:
+/// The check covers four groups:
 ///
 /// 1. Already iterate-led: `Apply(_, Iterate)` at head — or
 ///    `restrict`-led, `Apply(_, Apply(_, Restrict))` at head.  A
@@ -713,6 +714,8 @@ fn all_witnesses_realized(
 ///    `input=None`, and that bound op was itself iterate-wrapped at its
 ///    let-bind site. A capability-typed `Var` has no such wrapping behind it,
 ///    so the kind is what distinguishes them rather than mere `Fun`-ness.
+/// 4. A `Let` whose bound value and body both are: op-conversion feeds the `let`'s input to
+///    both sides.
 pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
     let head = head_of(expr);
     match &head.node {
@@ -724,6 +727,11 @@ pub(super) fn is_iteration_bearing(expr: &Expr) -> bool {
         | TypedExprNode::Realized { .. }
         | TypedExprNode::Tuple(_)
         | TypedExprNode::Record(_) => true,
+        // Op-conversion feeds a `let`'s input to its bound value and to its body alike, so the
+        // `let` takes no input when neither side does; when only one does, the `let` is wrapped.
+        TypedExprNode::Let {
+            bound_expr, body, ..
+        } => is_iteration_bearing(bound_expr) && is_iteration_bearing(body),
         TypedExprNode::Var(_)
             if matches!(
                 &head.ty,

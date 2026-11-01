@@ -488,6 +488,8 @@ The complete `is_iteration_bearing` skip cases are:
   `iterates_arg` property is true, including the domain-transforming combinators.
 - An `Apply` whose function position is not a builtin, such as a projection, variable, or curried
   application; its conversion path rejects an additional upstream input.
+- A `Let` whose bound value and body are both skip cases. Op-conversion feeds the `let`'s input to
+  both sides.
 
 Recognizing a `restrict`-led chain is necessary for repeated planning walks: its upstream already
 has an iteration source, and another wrapper would stack a second one.
