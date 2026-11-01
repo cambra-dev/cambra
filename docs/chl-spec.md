@@ -3354,10 +3354,9 @@ is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 ### 6.9 Capabilities
 
 **[Decided]** — sink functions and calls made outside the program
-([Output outside the program](#output-outside-the-program)); keeping readings across a reload and a
-restart ([Inputs from outside the program](#inputs-from-outside-the-program)); and an exception
-escaping a `with begin():` block ([Exceptions](#exceptions)). The rest of this section is
-implemented.
+([Output outside the program](#output-outside-the-program)); and keeping readings across a reload
+and a restart ([Inputs from outside the program](#inputs-from-outside-the-program)). The rest of
+this section is implemented.
 
 A function's type states what a call reads from its context, in its **`requires` clause**, and what
 the call contributes besides its result, in its **`causes` clause**. A requirement is an input that
@@ -4917,9 +4916,9 @@ for req in incr_reqs:
   `with` inside it has no coherent meaning.
 - A block causes `RunTransaction`, and its body supplies `Transaction` to what it calls. A body that
   causes `RunTransaction`, directly or through a call, is the nested transaction above
-  ([Discharging requirements and effects](#discharging-requirements-and-effects)). **[Decided]** —
-  an exception that escapes the block aborts it: none of its writes commits and no output inside it
-  is sent ([Exceptions](#exceptions)).
+  ([Discharging requirements and effects](#discharging-requirements-and-effects)). An exception that
+  escapes the block aborts it: none of its writes commits and no output inside it is sent
+  ([Exceptions](#exceptions)).
 - **Branch guards and tag dispatch.** A block may carry `if`/`elif`/`else`
   guards, more than one of them, and `match` dispatch. Each branch's
   writes are scoped to its own path and the transaction commits on the

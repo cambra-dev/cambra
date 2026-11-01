@@ -3702,6 +3702,59 @@ impl<'a> WriterWalk<'a> {
         }
     }
 
+    /// Abort the writer where the value fed to `defer` does not carry `tag`
+    /// ([`TypedExprNode::Begin`]'s `commits_on`): there each variable it writes keeps its
+    /// snapshot, `snapshots[name]`, and no other feed fires (`docs/chl-spec.md`,
+    /// "Exceptions"). The value's own feed fires on every path, so the code after the block
+    /// reads the outcome of every iteration.
+    pub(crate) fn commit_only_on(
+        &mut self,
+        defer: &Name,
+        tag: &Label,
+        snapshots: &HashMap<Name, Expr>,
+        kept: &mut Vec<Kept>,
+    ) {
+        let value = &self
+            .feeds
+            .iter()
+            .find(|f| f.defer == *defer)
+            .expect("writer walk: a block that commits on a tag feeds its value")
+            .value;
+        let committed = crate::ccl::ccl_utils::tag_test(value, tag.clone());
+        let committed = bind_value(kept, &Name::fresh("__committed"), committed);
+        for (name, ty) in &self.writes {
+            let written = self.env.remove(name).unwrap_or_else(|| {
+                panic!("writer walk: `{name}`, which the writer writes, holds no value")
+            });
+            let snapshot = snapshots.get(name).cloned().unwrap_or_else(|| {
+                panic!("writer walk: `{name}`, which an aborting writer writes, has no snapshot")
+            });
+            let kept_or_written = Expr::new(TypedExprNode::Case {
+                scrutinee: None,
+                branches: vec![
+                    Branch {
+                        pattern: None,
+                        guard: committed.clone(),
+                        body: written,
+                    },
+                    Branch {
+                        pattern: None,
+                        guard: bool_lit(true),
+                        body: snapshot,
+                    },
+                ],
+            })
+            .with_ty(ty.clone());
+            let value = bind_value(kept, name, kept_or_written);
+            self.env.insert(name.clone(), value);
+        }
+        for f in &mut self.feeds {
+            if f.defer != *defer {
+                f.fire = conjoin_path(&committed, &f.fire);
+            }
+        }
+    }
+
     /// The writer body `λ param → decision`, and the feeds whose taps the decision carries.
     ///
     /// The decision is the variant over `{commit, writes, __to_<defer>*}` that

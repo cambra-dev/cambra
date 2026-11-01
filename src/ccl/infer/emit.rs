@@ -2861,7 +2861,7 @@ pub(super) fn emit_for<C: Typing>(
     Ok(Type::Base(BaseType::Unit))
 }
 
-/// Type a `Begin { body, .. }` transaction-block marker: emit the per-transaction
+/// Type a `Begin { body }` transaction-block marker: emit the per-transaction
 /// body chain and give the block its body's type — `Unit` for a block in statement
 /// position, the value of its last statement for one in value position. A mutable variable
 /// there is read, as a passed value is: the block's value is the value the variable holds in
