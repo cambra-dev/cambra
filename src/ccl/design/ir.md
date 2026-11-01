@@ -386,7 +386,7 @@ The remaining nodes supply values or mark source structure for a later phase:
 | `Proj` | First-class tuple or record projection; applying it to a value gives field access. |
 | `Compose` | Function composition in application order, built by lowering and lambda elimination. |
 | `ExprStmt` | Statement expression followed by its continuation. |
-| `For`, `MutWrite`, `Begin` | Pre-phase loop, mutable write, and transaction-block structure; mutability phases consume them. A `Begin` is its body's value: `Unit` in statement position, the block's value on an assignment's right-hand side. |
+| `For`, `MutWrite`, `Begin` | Pre-phase loop, mutable write, and transaction-block structure; mutability phases consume them. A `Begin` is its body's value: `Unit` in statement position, the block's value on an assignment's right-hand side, and its outcome where an exception escapes it. |
 | `Feed`, `Define`, `Defer` | Deferred-output write, definition, and placeholder; `channelize` resolves them. |
 | `Error` | Recovery placeholder accompanied by lowering errors; compilation stops before inference. |
 
@@ -788,6 +788,7 @@ to the `try` around it.
   (`dispatch`). No value then passes through the sum, a collection included.
 - A `Begin` keeps its node, and its body is eliminated in place: a `try` in it becomes paths of
   the transaction, as an `if`'s branches are, so a clause's writes and feeds commit as a branch's
-  do. An exception escaping a block aborts the transaction and hands the exception to the code
-  after the block, which needs the outcome to leave the commit. Nothing carries it, so
-  `exceptions::refuse_escaping_blocks` refuses one right after inlining with an internal error.
+  do. A `Begin` whose body may raise becomes the outcome of its body, with `commits_on` set to
+  `` `__ok ``: the code after it matches the outcome, and the transaction commits the block's
+  writes and sends its outputs only where the outcome is `` `__ok ``
+  ([mutability.md](mutability.md#a-block-an-exception-escapes)).

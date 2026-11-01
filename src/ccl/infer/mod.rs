@@ -1306,9 +1306,7 @@ fn values_ending_function_blocks(expr: &TypedExpr) -> Vec<NodeId> {
     use crate::ccl::expr::TypedExprNode as N;
     let is_unit = |e: &TypedExpr| matches!(e.node, N::Lit(Lit::Unit));
     /// The `with begin():` body ending the statement chain `e`, through the binding of a
-    /// function's result ([`crate::ccl::opaque_output::output_body`]). Lowering builds a block in
-    /// statement position as a loop over the one-item source `[unit]`, whose item it names
-    /// `__txn_item`, with the block as its body.
+    /// function's result ([`crate::ccl::opaque_output::output_body`]).
     fn ending_block(e: &TypedExpr) -> Option<&TypedExpr> {
         if let Some(body) = crate::ccl::opaque_output::output_body(e) {
             return ending_block(body);
@@ -1316,20 +1314,8 @@ fn values_ending_function_blocks(expr: &TypedExpr) -> Vec<NodeId> {
         match &e.node {
             N::Let { body, .. } | N::MutDecl { body, .. } => ending_block(body),
             N::ExprStmt { expr, body } => match &expr.node {
-                N::For {
-                    target,
-                    body: block,
-                    ..
-                } if matches!(body.node, N::Lit(Lit::Unit))
-                    && target.name.base().starts_with("__txn_item") =>
-                {
-                    match &block.node {
-                        N::ExprStmt { expr, .. } => match &expr.node {
-                            N::Begin { body } => Some(body),
-                            _ => None,
-                        },
-                        _ => None,
-                    }
+                N::Begin { body: block, .. } if matches!(body.node, N::Lit(Lit::Unit)) => {
+                    Some(block)
                 }
                 _ => ending_block(body),
             },

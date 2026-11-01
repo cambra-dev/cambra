@@ -3150,23 +3150,20 @@ fn run_passes(
     // Exception elimination runs with inlining: after it, every `raise` stands in the tree
     // it escapes through (`crate::ccl::exceptions`).
     // A shape inlining and elimination do not compile yet is refused at the node a program
-    // wrote, with the tree that holds it where the tree is still whole.
+    // wrote.
     enum Refused {
         Internal(&'static str, String),
-        Unsupported(Located<String>, Option<Box<Expr>>),
+        Unsupported(Located<String>),
     }
     expr = recorded(capture_provenance, Phase::Inline, || {
         let expr = inline::inline_compute_lambdas(expr);
         crate::ccl::observe_world::check_filters(&expr)
             .map_err(|m| Refused::Internal("observeWorld", m))?;
-        if let Err(at) = crate::ccl::exceptions::refuse_escaping_blocks(&expr) {
-            return Err(Refused::Unsupported(at, Some(Box::new(expr))));
-        }
-        crate::ccl::exceptions::eliminate(expr).map_err(|at| Refused::Unsupported(at, None))
+        crate::ccl::exceptions::eliminate(expr).map_err(Refused::Unsupported)
     })
     .map_err(|refused| match refused {
         Refused::Internal(stage, message) => vec![CompileError::Internal { stage, message }],
-        Refused::Unsupported(at, tree) => blame.unsupported(at, tree.as_deref()),
+        Refused::Unsupported(at) => blame.unsupported(at, None),
     })?;
     settle(
         &expr,
@@ -3198,6 +3195,12 @@ fn run_passes(
     // like a mutable variable is not (its binder is a distinct `Name`). This replaces the
     // lowering-time base-name registry.
     let txn_mut_vars = transact_phase::collect_txn_mut_vars(&expr);
+    // Before the user-facing checks: after exception elimination, a write following a
+    // statement that may raise sits under the arm where it did not, which
+    // `check_no_guarded_induction_write_in_block` would report as a branch the user wrote.
+    transact_phase::refuse_uncompiled_aborting_blocks(&expr, &txn_mut_vars)
+        .and_then(|()| transact_phase::refuse_conditional_writing_blocks(&expr, &txn_mut_vars))
+        .map_err(|e| blame.unsupported(e, Some(&expr)))?;
     // A transactional writer reaching a `with begin():` block via a function call
     // is a nested transaction — the callee's inlined `For` would otherwise be
     // silently absorbed into the outer block's read-your-writes env, dropping its
@@ -3205,12 +3208,7 @@ fn run_passes(
     check_transact_rejections(&expr, &txn_mut_vars, &blame)?;
     transact_phase::refuse_valued_blocks_under_lambdas(&expr)
         .and_then(|()| transact_phase::refuse_feeds_under_block_values(&expr, &txn_mut_vars))
-        .map_err(|message| {
-            vec![CompileError::Internal {
-                stage: "transact",
-                message,
-            }]
-        })?;
+        .map_err(|e| blame.unsupported(e, Some(&expr)))?;
     transact_phase::refuse_valued_blocks_reading_their_loop(&expr, &txn_mut_vars)
         .map_err(|e| blame.unsupported(e, Some(&expr)))?;
     mut_elim::check_iteration_channel_feeds(&expr)

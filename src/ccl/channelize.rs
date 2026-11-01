@@ -381,7 +381,7 @@ type ArmFeed = (Option<Expr>, Expr);
 
 /// What one arm of a fanned-out `Case` feeds `defer_name`: each of its feeds of the defer in
 /// written order, each a site of the channel, as the condition under which the arm reaches
-/// it and its value. Both stand under the `let`s ahead of the feed.
+/// it and its value. Each stands under the `let`s ahead of the feed it reads ([`under_lets`]).
 ///
 /// The arm is a statement spine of `let`s and statements ([`arm_spine`]). A conditional on
 /// the spine is read the same way, arm by arm, and its arm's first-match predicate joins the
@@ -596,10 +596,17 @@ fn let_chain<'e>(body: &'e Expr, defer_name: &Name) -> (Vec<(TypedBinding, Expr)
     (lets, end)
 }
 
-/// `term` under the `let`s of a [`let_chain`], typed as `term`.
+/// `term` under the `let`s of a [`let_chain`] it reads, directly or through one another, typed
+/// as `term`. A `let` it does not read stays out: a condition that reads no block's value takes
+/// no binding of one, whose value its store computes (`src/ccl/design/mutability.md`, "A block in
+/// value position").
 fn under_lets(lets: &[(TypedBinding, Expr)], term: Expr) -> Expr {
     lets.iter().rev().fold(term, |body, (binding, def)| {
-        Expr::let_in(binding.clone(), def.clone(), body)
+        if crate::ccl::ccl_utils::free_reads(&body).contains(&binding.name) {
+            Expr::let_in(binding.clone(), def.clone(), body)
+        } else {
+            body
+        }
     })
 }
 
@@ -2566,7 +2573,7 @@ fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
                 rec(argument, bound, out);
             }
             TypedExprNode::Cast { value, .. } => rec(value, bound, out),
-            TypedExprNode::Begin { body } => rec(body, bound, out),
+            TypedExprNode::Begin { body, .. } => rec(body, bound, out),
             TypedExprNode::BinOp { left, right, .. } => {
                 rec(left, bound, out);
                 rec(right, bound, out);

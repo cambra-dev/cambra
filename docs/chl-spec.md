@@ -3480,9 +3480,8 @@ is a trait's function, read from an instance, `summon(Area(_))::area(s)`
 **[Decided]** — naming another module's public transactional variable, `WriteTxn(inv::stock)`; sink
 functions and calls made outside the program ([Output outside the
 program](#output-outside-the-program)); keeping readings across a reload and a restart ([Inputs
-from outside the program](#inputs-from-outside-the-program)); and an exception escaping a `with
-begin():` block, or raised by a function value held in a collection ([Exceptions](#exceptions)).
-The rest of this section is implemented.
+from outside the program](#inputs-from-outside-the-program)); and an exception raised by a function
+value held in a collection ([Exceptions](#exceptions)). The rest of this section is implemented.
 
 A function's type states what a call reads from its context, in its **`requires` clause**, and what
 the call contributes besides its result, in its **`causes` clause**. A requirement is an input that
@@ -3899,7 +3898,7 @@ def checked_or_zero(qty):
   does.
 - **An exception escaping a `with begin():` block aborts the transaction.** None of the block's
   writes commits and no output inside it is sent, and the exception continues outward. An exception
-  caught inside the block does not abort it. **[Decided]**
+  caught inside the block does not abort it.
 - **An exception escaping an iteration orders the iterations.** A `for` loop, or a comprehension
   whose element or condition may raise, raises the exception of its first raising iteration in
   position order, and nothing after that iteration takes effect. This is a dependency from one
@@ -5119,7 +5118,8 @@ for req in incr_reqs:
   causes `RunTransaction`, directly or through a call, is the nested transaction above
   ([Discharging requirements and effects](#discharging-requirements-and-effects)). An exception that
   escapes the block aborts it: none of its writes commits and no output inside it is sent
-  ([Exceptions](#exceptions), **[Decided]**).
+  ([Exceptions](#exceptions)). An aborted block still takes a commit position, at which it commits
+  nothing, so the commits after it are ordered as if it had committed.
 - **Branch guards and tag dispatch.** A block may carry `if`/`elif`/`else`
   guards, more than one of them, and `match` dispatch. Each branch's
   writes are scoped to its own path and the transaction commits on the
@@ -5143,17 +5143,15 @@ around `reserve` + `quote` + the feed).
 > **[Interim]** The compiler refuses these blocks in value position:
 >
 > - a feed under a condition that reads the block's value, such as `if ok: out << r` after the
->   block, and in a loop that reads a writing block's value, a feed under any condition;
+>   block;
 > - a block in a function that a loop calls, in a loop that only feeds or that holds another loop,
 >   or in an expression such as a feed's value;
-> - a block in a loop that reads the value of an earlier block in the loop or a variable its loop
->   accumulates into, or a binding computed from either;
-> - a block that an exception escapes.
+> - a block in a loop that reads a variable its loop accumulates into or a binding computed from
+>   one.
 >
-> In a loop, a block in statement position that reads the value of an earlier block, or a binding
-> computed from one or from a variable its loop accumulates into, is not compiled either, and
-> neither is a function body that ends in a block whose last statement has a value other than
-> `unit` (**[Decided]**, [4.1 `def` — function definition](#41-def--function-definition)).
+> A function body that ends in a block whose last statement has a value other than `unit`
+> (**[Decided]**, [4.1 `def` — function definition](#41-def--function-definition)) is not compiled
+> either.
 
 A `with begin():` block on an assignment's right-hand side is the value of its last statement, by
 the rule a function body follows

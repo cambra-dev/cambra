@@ -1055,10 +1055,15 @@ pub enum TypedExprNode {
     /// none, and inference is the last pass a module's check tree reaches.
     Abstract,
 
-    /// A `with begin():` transaction block, as **one statement** (value `Unit`).
-    /// `body` is the per-transaction statement chain lowering builds (a
-    /// `Let`/`MutWrite`/`Case`/`Feed` chain ending in `Unit`) — the block's
-    /// atomic writes, reads, guards, and per-commit feeds.
+    /// A `with begin():` transaction block. `body` is the per-transaction statement chain
+    /// lowering builds (a `Let`/`MutWrite`/`Case`/`Feed` chain) — the block's atomic writes,
+    /// reads, guards, and per-commit feeds — ending in `Unit` in statement position and in the
+    /// block's value in value position.
+    ///
+    /// `commits_on` is the tag the block's value carries on the paths that commit its writes
+    /// and send its outputs. Exception elimination sets it to `` `__ok `` on a block an
+    /// exception escapes, whose value is then its outcome (`crate::ccl::exceptions`); every
+    /// other block has `None` and commits on every path its statements decide.
     ///
     /// A pre-phase surface marker in the same transient class as
     /// [`For`](TypedExprNode::For)/[`Feed`](TypedExprNode::Feed)/
@@ -1069,7 +1074,10 @@ pub enum TypedExprNode {
     /// Making the block a statement (rather than *being* the whole `For` body)
     /// is what lets one loop body mix a transaction with sibling induction
     /// writes and feeds.
-    Begin { body: Box<TypedExpr> },
+    Begin {
+        body: Box<TypedExpr>,
+        commits_on: Option<Label>,
+    },
 
     /// Placeholder for an expression with no well-typed content, inserted in two places:
     ///
@@ -1659,6 +1667,7 @@ impl TypedExpr {
     pub fn begin(body: Self) -> Self {
         Self::new(TypedExprNode::Begin {
             body: Box::new(body),
+            commits_on: None,
         })
     }
 
@@ -2204,7 +2213,7 @@ impl TypedExpr {
                 }
                 f(value.as_ref());
             }
-            TypedExprNode::Begin { body } => f(body.as_ref()),
+            TypedExprNode::Begin { body, .. } => f(body.as_ref()),
         }
     }
 
@@ -2418,7 +2427,7 @@ impl TypedExpr {
                 }
                 f(value.as_mut());
             }
-            TypedExprNode::Begin { body } => f(body.as_mut()),
+            TypedExprNode::Begin { body, .. } => f(body.as_mut()),
         }
     }
 
@@ -2461,6 +2470,11 @@ impl TypedExpr {
                 }
             }
             TypedExprNode::Try { handlers, .. } => handlers.iter().for_each(|h| f(&h.binding)),
+            TypedExprNode::Transact { writers, .. } => {
+                for w in writers {
+                    w.fed_back.iter().for_each(|(b, _)| f(b));
+                }
+            }
             // Declares no binder. Enumerated rather than wildcarded — see above.
             TypedExprNode::Lit(_)
             | TypedExprNode::Var(_)
@@ -2495,8 +2509,7 @@ impl TypedExpr {
             | TypedExprNode::Define { .. }
             | TypedExprNode::MutWrite { .. }
             | TypedExprNode::LetType { .. }
-            | TypedExprNode::Run { .. }
-            | TypedExprNode::Transact { .. } => {}
+            | TypedExprNode::Run { .. } => {}
         }
     }
 
@@ -2656,8 +2669,12 @@ impl TypedExpr {
             | TypedExprNode::Define { .. }
             | TypedExprNode::MutWrite { .. }
             | TypedExprNode::LetType { .. }
-            | TypedExprNode::Run { .. }
-            | TypedExprNode::Transact { .. } => {}
+            | TypedExprNode::Run { .. } => {}
+            TypedExprNode::Transact { writers, .. } => {
+                for w in writers {
+                    w.fed_back.iter_mut().for_each(|(b, _)| f(b));
+                }
+            }
         }
     }
 
@@ -2993,6 +3010,12 @@ pub struct WriterSite {
     /// (`src/ccl/design/mutability.md`, "A block in value position"). Empty for every other
     /// writer.
     pub item_taps: Vec<Label>,
+    /// The item taps of earlier writers of the same `Transact` that [`Self::source`] reads,
+    /// each bound in `source` to its name here: a block whose source carries the value of an
+    /// earlier block in its own store (`src/ccl/design/mutability.md`, "A block reading
+    /// another block's value"). Its value at an item is final at that writer's commit for the
+    /// item. Empty for every other writer.
+    pub fed_back: Vec<(TypedBinding, Label)>,
 }
 
 /// A single branch in a [`TypedExprNode::Case`] expression.
