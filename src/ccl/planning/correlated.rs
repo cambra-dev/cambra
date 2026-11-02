@@ -728,6 +728,6 @@ fn mentions_type(e: &Expr, old: &Type) -> bool {
             || ty.any_child(|c| in_type(c, old))
     }
     let mut found = false;
-    e.walk_type_slots(|ty| found |= in_type(ty, old));
+    e.walk_type_slots(|ty| found = found || in_type(ty, old));
     found || e.any_child(|c| mentions_type(c, old))
 }

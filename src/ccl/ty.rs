@@ -5509,7 +5509,8 @@ fn dependency_order(refinements: &[Refinement]) -> Vec<&Refinement> {
 fn predicate_reads(pred: &TypedExpr, earlier: &Refinement) -> bool {
     let mut found = false;
     pred.walk_type_slots(|ty| {
-        found |= ty.holds_type(&|t| matches!(t, Type::Refinement(_, set) if set.contains(earlier)));
+        found = found
+            || ty.holds_type(&|t| matches!(t, Type::Refinement(_, set) if set.contains(earlier)));
     });
     found || pred.any_child(|child| predicate_reads(child, earlier))
 }

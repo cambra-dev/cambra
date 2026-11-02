@@ -23,7 +23,7 @@ fn a_narrowing_read_inside_a_component_type_orders_the_predicate_after_it() {
     };
     let inner = compare(TypedExpr::var(Name::elem()), 2);
     let narrowed = Type::refined(base.clone(), RefinementSet::one(inner.clone()));
-    // `__elem == 1` renders below `__elem == 2`, so only the read orders it second.
+    // `__elem == 1` sorts before `__elem == 2` by rendering, so only the read orders it second.
     let outer = compare(
         TypedExpr::var(Name::elem()).with_ty(Type::Tuple(vec![narrowed.clone()])),
         1,
