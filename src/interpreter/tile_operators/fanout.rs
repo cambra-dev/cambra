@@ -125,10 +125,11 @@ struct FanOutShared {
     /// long as this fan-out does. What a program branch that holds this fan-out
     /// holds of each source is read off it ([`FanOut::source_producers`]).
     source_producers: Vec<String>,
-    /// Set when the input's notification is passed to the branches, cleared when a branch
-    /// pulls. A second one before that says nothing the first did not, so it stops here, as
-    /// it does at an operator's shared consumer (`crate::interpreter::GatedConsumer`).
-    forwarded: Notified,
+    /// The gate the input's notifications pass to the branches through, which a branch's pull
+    /// reopens. A second notification before that, naming no key the ones passed since did not,
+    /// says nothing they did not, so it stops here, as it does at an operator's shared consumer
+    /// (`crate::interpreter::GatedConsumer`).
+    admission: crate::interpreter::scheduler::Admission,
 }
 
 impl FanOutShared {
@@ -203,7 +204,7 @@ impl Consumer for FanOutInput {
         };
         let consumers = {
             let shared = shared_rc.borrow();
-            if !shared.forwarded.mark_news() {
+            if !shared.admission.admits(arrived) {
                 return;
             }
             shared
@@ -320,7 +321,7 @@ impl FanOut {
             released_position: None,
             subscribers: Vec::new(),
             reentrancy,
-            forwarded: Notified::clear(),
+            admission: crate::interpreter::scheduler::Admission::new(Notified::clear()),
             source_producers: Vec::new(),
         }));
         Self {
@@ -772,7 +773,7 @@ impl TileProducer for FanOutProducer {
         let shared_rc = self.shared();
         // Reopened before the pull, as an operator's gate is (`TileProducer::get`), and so by
         // a pull that reads nothing.
-        shared_rc.borrow().forwarded.take();
+        shared_rc.borrow().admission.reopen();
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
@@ -2700,7 +2701,11 @@ mod consuming_tests {
         memo.consume_impl(Keys(0, 1).guard());
         notifier.notify(&Keys(2, 3).projection());
         sched.check_for_notifications();
-        assert_eq!(woken.get(), 1, "the notification wakes the consumer");
+        assert_eq!(
+            woken.get(),
+            2,
+            "the consume's wake, and the notification of keys it did not name"
+        );
 
         let pulled = memo.get(All.guard());
         assert_eq!(
@@ -2711,7 +2716,7 @@ mod consuming_tests {
 
         memo.consume_impl(Keys(2, 3).guard());
         sched.check_for_notifications();
-        assert_eq!(woken.get(), 2, "the rows the consume merged are announced");
+        assert_eq!(woken.get(), 3, "the rows the consume merged are announced");
     }
 
     // ------------------------------------------------------------------------------------

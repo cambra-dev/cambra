@@ -659,9 +659,10 @@ has no use for it, since its pull reads whatever arrived. A consumer that does n
 region instead.
 
 A component that merges notifications to one consumer unites their regions with
-`Projection::union` and narrows none. A gate drops the notification it suppresses, and its region
-with it: a consumer that pulls reads the change in its next pull, and a consumer that needs every
-region must not sit behind a gate.
+`Projection::union` and narrows none. A gate passes the first notification after a pull, and after
+it each one that names a key no notification passed since that pull named (`scheduler::Admission`).
+It drops the rest, whose keys its consumer has already heard of: a consumer that pulls reads them in
+its next pull, and one that acts on the region, as a memo marks it dirty, has marked them.
 
 **Forwarding.** An operator keeps an input's keys, forwarding its region unchanged, only if its row
 of the "Projection guards" table pulls that input at the projection and the input's keys are the
@@ -694,27 +695,27 @@ depends on the input's shape, the operator decides from its tiling when it subsc
 | `CheckedLookup` | one key | widens | One key has no keys to project. |
 | `CheckedLookup` | the collection | widens | Every key is answered against all of it. |
 | `Memo` | the input | keeps | Read at the projection, and its keys are the input's. |
-| `FanOutSlot` | the shared input | keeps | The fan-out forwards the input's region to every live slot. It passes one notification between pulls and drops the next with its region, which a slot consumer that pulls does not need: its pull reads whatever arrived. A consumer that needs every region cannot sit behind a fan-out, and the worker pool's plan refuses a chain with one (`plan_main`). |
+| `FanOutSlot` | the shared input | keeps | The fan-out forwards the input's region to every live slot. Between pulls it passes only a notification naming a key it has not passed since the last pull, as a gate does, and drops the rest, whose keys every slot consumer has heard of. |
 | `ExtractFinal`, `PermuteRecordDomain`, `FlattenTupleDomain` | the input | widens | Read whole; the keys are re-keyed or the last position. |
 | `Aggregate`, `ExtractAggregate` | the input | widens | The accumulator has no keys. |
 | `MapAggregate`, `MapExtractAggregate` | the input | keeps | The groups keep the input's outermost keys. |
 | Stores, recurrences and the commit operators (`commit_operator.rs`) | every input | widens | A recurrence re-keys its inputs by its own positions. |
 
-`GatedConsumer` forwards at most one notification between pulls to a consumer that pulls.
-`shared_consumer` constructs it with `Notified::clear()`, so the first notification passes,
-including one sent during `subscribe`. Forwarding sets the flag; `ProducerBase::sharing` holds the
-`Gate` token that clears it before each pull. A notification behind a closed gate is not delivered,
-and the consumer's next pull reads the change. `Notified::flag()` instead starts set to permit an
-initial input read. A
-`Notified::Flag` is set by notification and cleared by `take()`. `FanOutShared::forwarded` tracks
-forwarding to fan-out slots. Clearing does not depend on whether the pull reads the notifying input.
-Without this suppression, a change can reach a sink once per path through the graph, and cyclic
-notification paths can continue indefinitely.
+`GatedConsumer` forwards a notification between pulls only where it names a key not passed since the
+last pull. `shared_consumer` constructs it with `Notified::clear()`, so the first notification
+passes, including one sent during `subscribe`. Forwarding sets the flag and grows the region passed;
+`ProducerBase::sharing` holds the `Gate` token that clears the flag before each pull, which starts
+the region afresh. A notification of keys already passed behind a closed gate is not delivered, and
+the consumer's next pull reads the change. `Notified::flag()` instead starts set to permit an
+initial input read. A `Notified::Flag` is set by notification and cleared by `take()`.
+`FanOutShared::forwarded` tracks forwarding to fan-out slots. Clearing does not depend on whether
+the pull reads the notifying input. Without this suppression, a change can reach a sink once per
+path through the graph, and cyclic notification paths can continue indefinitely.
 
 `forwarding_consumer` delivers through the gate when its consumer can be borrowed. On reentry,
-it drops the notification if the gate is set: no pull has occurred since forwarding. Otherwise
-it queues the notification, because a pull during the current cascade may have missed the new
-change. Sharing notification handles does not share tile data; tiles still pass through `get`.
+it drops the notification where the gate would stop it: the gate is set, and the notifications
+passed since the last pull name every key it names (`Admission::covers`). Otherwise it queues the
+notification, because a pull during the current cascade may have missed the new change. Sharing notification handles does not share tile data; tiles still pass through `get`.
 
 A consumer woken by an operator must pull that operator if it still reads it. Until then,
 the operator suppresses later notifications from its inputs. Finished reads, settled seeds,

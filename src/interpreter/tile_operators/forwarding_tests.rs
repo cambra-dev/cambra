@@ -35,7 +35,7 @@ fn another_region() -> Projection {
 }
 
 /// What a recording consumer of the operator `build` makes receives when `region` is notified at
-/// its input `notified`. A consumer passes one notification between pulls, so each call builds an
+/// its input `notified`. A gate passes a region once between pulls, so each call builds an
 /// operator of its own.
 fn received(build: &dyn Fn() -> Built, notified: usize, region: &Projection) -> Vec<Projection> {
     let (mut operator, inputs) = build();
@@ -761,16 +761,34 @@ fn a_fan_out_forwards_a_region_to_every_live_slot_unchanged() {
     }
 }
 
-/// One notification passes between pulls; a pull reopens it, and the region of the next one is
-/// delivered.
+/// Between pulls a fan-out passes a notification only for keys it has not passed since the last
+/// pull; a pull reopens it, and the same region passes again.
 #[test]
-fn a_fan_out_suppresses_a_second_notification_until_a_pull_reopens_it() {
+fn a_fan_out_suppresses_a_notification_of_keys_it_passed_until_a_pull_reopens_it() {
     fan_out_with_two_slots!(logs, producers, consumer);
     notify_input(&consumer, &region());
-    notify_input(&consumer, &another_region());
-    assert_eq!(*logs[0].borrow_mut(), [region()]);
-    let guard = producers[0].tiling().universal_guard();
-    producers[0].get(guard);
+    notify_input(&consumer, &region());
     notify_input(&consumer, &another_region());
     assert_eq!(*logs[0].borrow_mut(), [region(), another_region()]);
+    let guard = producers[0].tiling().universal_guard();
+    producers[0].get(guard);
+    notify_input(&consumer, &region());
+    assert_eq!(
+        *logs[0].borrow_mut(),
+        [region(), another_region(), region()]
+    );
+}
+
+/// A flat union's arms notify different keys between pulls, and the union's consumer hears of
+/// each: a memo above it marks both regions dirty.
+#[test]
+fn a_union_passes_the_regions_of_two_arms_between_pulls() {
+    let (mut operator, inputs) = union(true);
+    let (log, regions) = RegionLog::new();
+    let guard = operator.tiling().universal_guard();
+    let _producer = operator.subscribe(guard, Box::new(log), &mut Scheduler::new());
+    regions.borrow_mut().clear();
+    notify_input(&inputs[0], &region());
+    notify_input(&inputs[1], &another_region());
+    assert_eq!(*regions.borrow_mut(), [region(), another_region()]);
 }
