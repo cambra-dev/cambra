@@ -588,6 +588,18 @@ fn caught_inside_a_block(#[case] code: &str, #[case] expected: i64) {
             pass
     await_final(pool)
 "}, 89)]
+#[case::a_block_after_a_block_that_aborts(indoc! {"
+    for r in [10, 20, 5]:
+        try:
+            with begin():
+                pool := pool - r
+                check(r)
+            with begin():
+                pool := pool + 1
+        except Int:
+            pass
+    await_final(pool)
+"}, 87)]
 #[case::a_raise_before_a_block(indoc! {"
     for r in [10, 20, 5]:
         try:

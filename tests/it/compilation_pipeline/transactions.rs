@@ -4762,23 +4762,82 @@ fn a_writing_block_in_a_branch(#[case] code: &str, #[case] expected: i64) {
     );
 }
 
-/// A block whose branch depends on another commit is refused: the positions it runs at are not
-/// known before that commit.
+/// A block reading the value of an earlier block, in itself or in the condition it runs under,
+/// runs at a position once that block has committed its value there: its site's source carries
+/// the earlier block's values. The earlier block writes the variable the later one writes, or
+/// another one.
+#[rstest]
+#[case::another_variable(indoc! {"
+    for r in [10, 20, 30]:
+        v = with begin():
+            pool := pool - r
+            r * 2
+        with begin():
+            log := log + v
+    await_final(log)
+"}, 120)]
+#[case::a_condition_on_it(indoc! {"
+    for r in [10, 20, 30]:
+        v = with begin():
+            pool := pool - r
+            r * 2
+        if v > 30:
+            with begin():
+                log := log + v
+    await_final(log)
+"}, 100)]
+#[case::outside_a_loop(indoc! {"
+    v = with begin():
+        pool := pool - 10
+        7
+    if v > 5:
+        with begin():
+            log := log + v
+    await_final(log)
+"}, 7)]
+#[case::the_same_variable(indoc! {"
+    for r in [10, 20, 30]:
+        v = with begin():
+            pool := pool - r
+            r * 2
+        with begin():
+            pool := pool + v
+    await_final(pool)
+"}, 160)]
+#[case::a_condition_on_it_writing_the_same_variable(indoc! {"
+    for r in [10, 20, 30]:
+        v = with begin():
+            pool := pool - r
+            r * 2
+        if v > 30:
+            with begin():
+                pool := pool + 1
+    await_final(pool)
+"}, 42)]
+fn a_block_reading_another_blocks_value(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(
+        &format!("pool: Mut(Int, Txn) := 100\nlog: Mut(Int, Txn) := 0\n{code}\n"),
+        Value::Int(expected),
+    );
+}
+
+/// A block under a condition on the value of a block that writes nothing is refused: that value
+/// is a read at the iteration, which no source the site could carry holds.
 #[test]
-fn a_block_under_a_condition_on_another_block_is_refused() {
+fn a_block_under_a_condition_on_a_read_only_value_is_refused() {
     check_compile_error(
         indoc! {"
             pool: Mut(Int, Txn) := 100
+            log: Mut(Int, Txn) := 0
             for r in [10, 20, 30]:
                 v = with begin():
-                    pool := pool - r
                     pool
-                if v > 75:
+                if v > r:
                     with begin():
-                        pool := pool - 1
-            await_final(pool)
+                        log := log + 1
+            await_final(log)
         "},
-        "under a condition that reads an induction accumulator or the value of another",
+        "under a condition that reads an induction accumulator or the value of a",
     );
 }
 

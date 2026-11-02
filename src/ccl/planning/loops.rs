@@ -573,6 +573,7 @@ fn recover_writer(site_dom: &Type, def: Expr) -> WriterSite {
         source,
         body,
         item_taps: Vec::new(),
+        fed_back: Vec::new(),
     }
 }
 
@@ -703,11 +704,39 @@ fn recognize_txn_group(bindings: Vec<(TypedBinding, Expr)>, body: Expr) -> Expr 
         }
     }
 
+    // Each item tap's writer, by tap binding name, for the later writers whose sources read it.
+    let mut item_tap_writer: HashMap<Name, usize> = HashMap::new();
     for (commits, field) in item_taps {
         let writer = writer_of
             .get(&commits)
             .unwrap_or_else(|| panic!("letrec recognition: a tap reads `{commits}`, no site's"));
+        if let Some((tap, _, _)) = taps.iter().find(|(_, f, _)| *f == field) {
+            item_tap_writer.insert(tap.clone(), *writer);
+        }
         writers[*writer].item_taps.push(field);
+    }
+    // A writer's source reading an earlier writer's item tap reads it as a name the writer
+    // binds in its source ([`WriterSite::fed_back`]); the `Transact` has no binder of its own
+    // for its record to be read through.
+    for (j, writer) in writers.iter_mut().enumerate() {
+        for (tap, field, stream_ty) in &taps {
+            if count_free(tap, &writer.source) == 0 {
+                continue;
+            }
+            let from = item_tap_writer.get(tap).unwrap_or_else(|| {
+                panic!(
+                    "letrec recognition: a writer source reads `{tap}`, which no site keys by item"
+                )
+            });
+            assert!(
+                *from < j,
+                "letrec recognition: a writer source reads the item tap `{tap}` of a writer not \
+                 before it"
+            );
+            writer
+                .fed_back
+                .push((binding(tap.clone(), stream_ty.clone()), field.clone()));
+        }
     }
 
     // Variable record `{key.field_key(): Fun(Txn, V), …, __to_<defer>: Fun(Txn, V)}`
@@ -1176,6 +1205,7 @@ fn recognize_group(h: TypedBinding, def: Expr, letrec_body: Expr) -> Expr {
         source,
         body: writer_body,
         item_taps: Vec::new(),
+        fed_back: Vec::new(),
     };
     let mut transact = Expr::new(TypedExprNode::Transact {
         keys,

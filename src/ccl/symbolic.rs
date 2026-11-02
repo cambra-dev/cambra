@@ -1253,6 +1253,7 @@ in x"
                 source: Expr::var("xs"),
                 body: Expr::var("i"),
                 item_taps: Vec::new(),
+                fed_back: Vec::new(),
             }],
             domain: Type::Base(BaseType::Int),
             parameter: None,
@@ -1276,6 +1277,7 @@ in x"
                 source: Expr::var("xs"),
                 body: Expr::tuple(vec![Expr::var("x"), Expr::var("y")]),
                 item_taps: Vec::new(),
+                fed_back: Vec::new(),
             }],
             domain: Type::Base(BaseType::Int),
             parameter: None,
@@ -1295,6 +1297,7 @@ in x"
                 source: Expr::var("xs"),
                 body: Expr::var("i"),
                 item_taps: Vec::new(),
+                fed_back: Vec::new(),
             }],
             domain: Type::Base(BaseType::Int),
             parameter: Some(Type::Tuple(vec![

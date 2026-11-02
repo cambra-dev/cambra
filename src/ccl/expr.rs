@@ -2146,6 +2146,11 @@ impl TypedExpr {
                 }
             }
             TypedExprNode::Try { handlers, .. } => handlers.iter().for_each(|h| f(&h.binding)),
+            TypedExprNode::Transact { writers, .. } => {
+                for w in writers {
+                    w.fed_back.iter().for_each(|(b, _)| f(b));
+                }
+            }
             // Declares no binder. Enumerated rather than wildcarded — see above.
             TypedExprNode::Lit(_)
             | TypedExprNode::Var(_)
@@ -2180,8 +2185,7 @@ impl TypedExpr {
             | TypedExprNode::Define { .. }
             | TypedExprNode::MutWrite { .. }
             | TypedExprNode::LetType { .. }
-            | TypedExprNode::Run { .. }
-            | TypedExprNode::Transact { .. } => {}
+            | TypedExprNode::Run { .. } => {}
         }
     }
 
@@ -2244,8 +2248,12 @@ impl TypedExpr {
             | TypedExprNode::Define { .. }
             | TypedExprNode::MutWrite { .. }
             | TypedExprNode::LetType { .. }
-            | TypedExprNode::Run { .. }
-            | TypedExprNode::Transact { .. } => {}
+            | TypedExprNode::Run { .. } => {}
+            TypedExprNode::Transact { writers, .. } => {
+                for w in writers {
+                    w.fed_back.iter_mut().for_each(|(b, _)| f(b));
+                }
+            }
         }
     }
 
@@ -2539,6 +2547,12 @@ pub struct WriterSite {
     /// (`src/ccl/design/mutability.md`, "A block in value position"). Empty for every other
     /// writer.
     pub item_taps: Vec<Label>,
+    /// The item taps of earlier writers of the same `Transact` that [`Self::source`] reads,
+    /// each bound in `source` to its name here: a block whose source carries the value of an
+    /// earlier block in its own store (`src/ccl/design/mutability.md`, "A block reading
+    /// another block's value"). Its value at an item is final at that writer's commit for the
+    /// item. Empty for every other writer.
+    pub fed_back: Vec<(TypedBinding, Label)>,
 }
 
 /// A single branch in a [`TypedExprNode::Case`] expression.

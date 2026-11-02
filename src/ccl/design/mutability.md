@@ -1391,17 +1391,37 @@ variable is written inside the block, where the snapshot it reads is the one the
 
 `refuse_conditional_writing_blocks` refuses, before the phase, with internal errors:
 
-- A block under a condition that reads an induction accumulator or the value of another block. The
-  positions it runs at depend on another commit, which no source refinement expresses. Exception
-  elimination puts a block in a loop an exception escapes under the condition that no earlier block
-  raised, which is this shape.
+- A block under a condition that reads an induction accumulator or the value of a block that writes
+  nothing. No source the site could carry holds either; a writing block's value is carried, as
+  [A block reading another block's value](#a-block-reading-another-blocks-value) describes.
 - A block in value position, or one an exception escapes, in a branch. `iterate_block_values` zips
   the loop's source with the block's values, and a restricted site has values at only some of its
-  positions.
+  positions. Exception elimination puts a block in a loop an exception escapes under the condition
+  that no earlier block raised, which is this shape.
 - A loop holding a writing block, in a branch. The loop's body runs at every position of its own
   source.
 - A block or condition reading a binding whose value writes, feeds, declares a channel or holds a
   loop or a block, which a copy would repeat.
+
+### A block reading another block's value
+
+A writing block whose block or condition reads the value of an earlier writing block in its loop's
+body runs at a position once that block has committed its value there. The value at an item is
+final at that commit, so the later site's source carries it: `restrict_to_path` makes the source
+`λ ξ → (source(ξ), __values(ξ), …)` and the item binder a tuple, from which the block and its
+condition bind the loop's item and each value they read. Outside a loop a block's value is bound
+once on the top-level spine and read where it stands.
+
+A block in another store reads the earlier block's `__values` from the store placed outside its
+own. A block in the same store reads them inside the store's `letrec`, where `plan_store` binds the
+earlier site's tap: the later site's source reads ``tap ≫ variant_project(`fired)``. Recognition
+records the tap on the reading writer (`WriterSite::fed_back`), which binds its name in the
+writer's source, and op-conversion reads the tap back from the store through the commit operator's
+recurrence slot, keyed by item (`RekeySorted`). A writer reads only an earlier writer's tap: its
+own would be a cycle `check_letrec_causal` refuses.
+
+An exception escaping a block is this shape too: the code after the block reads its outcome, so a
+block after it in the same `try` runs where the first one committed `` `__ok ``.
 
 ### A block an exception escapes
 

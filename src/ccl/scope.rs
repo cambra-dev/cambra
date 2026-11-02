@@ -40,13 +40,13 @@
 //!   [`MutWrite`](TypedExprNode::MutWrite) — the `name` field is a *use* of the
 //!   defer handle / mutable variable bound elsewhere, not a binder. It is
 //!   surfaced as a [`ScopedItem::VarRef`].
-//! - [`Transact`](TypedExprNode::Transact) — introduces **no** binder. Its
-//!   `keys` name mutable variable fields of the record the node denotes, and a writer's
-//!   `read_keys`/`write_keys` are references to those fields; they are labels,
-//!   not variable occurrences, so they are surfaced as
+//! - [`Transact`](TypedExprNode::Transact) — its `keys` name mutable variable fields of the
+//!   record the node denotes, and a writer's `read_keys`/`write_keys` are references to
+//!   those fields; they are labels, not variable occurrences, so they are surfaced as
 //!   [`ScopedItem::KeyRef`] — distinct from `VarRef` precisely so a
 //!   free-*variable* analysis can skip them while a consumer that cares about
-//!   every name a node mentions still folds them in.
+//!   every name a node mentions still folds them in. Its only binders are a writer's
+//!   `fed_back` names, which scope over that writer's `source` ([`Binders::Fed`]).
 //!
 //! Every other variant introduces no binder and makes no name reference: its
 //! children are yielded in the node's own scope.
@@ -83,7 +83,7 @@
 //! predicates, `is_free_in_value` deliberately does not. This module is about
 //! the *term* spine's binding structure only, matching `walk_children`.
 
-use super::{Generator, Name, TypedBinding, TypedExpr, TypedExprNode};
+use super::{Generator, Label, Name, TypedBinding, TypedExpr, TypedExprNode};
 
 /// The binders a node puts in scope over one of its children.
 ///
@@ -119,6 +119,9 @@ pub enum Binders<'a> {
     /// has `f(x)` under `x` and `e` under both — and slicing the generator list
     /// is what states that without copying the binders out of it.
     Generators(&'a [Generator]),
+    /// The names a [`Transact`](TypedExprNode::Transact) writer's source reads earlier
+    /// writers' item taps through ([`WriterSite::fed_back`](crate::ccl::WriterSite::fed_back)).
+    Fed(&'a [(TypedBinding, Label)]),
 }
 
 impl<'a> Binders<'a> {
@@ -130,6 +133,7 @@ impl<'a> Binders<'a> {
             Binders::One(b) => &b.name == name,
             Binders::Group(g) => g.iter().any(|(b, _)| &b.name == name),
             Binders::Generators(gs) => gs.iter().any(|g| &g.target.name == name),
+            Binders::Fed(fed) => fed.iter().any(|(b, _)| &b.name == name),
         }
     }
 
@@ -138,15 +142,18 @@ impl<'a> Binders<'a> {
     pub fn iter(self) -> impl Iterator<Item = &'a TypedBinding> {
         const EMPTY: &[(TypedBinding, TypedExpr)] = &[];
         const NO_GENERATORS: &[Generator] = &[];
-        let (one, group, generators) = match self {
-            Binders::Ambient => (None, EMPTY, NO_GENERATORS),
-            Binders::One(b) => (Some(b), EMPTY, NO_GENERATORS),
-            Binders::Group(g) => (None, g, NO_GENERATORS),
-            Binders::Generators(gs) => (None, EMPTY, gs),
+        const NO_FED: &[(TypedBinding, Label)] = &[];
+        let (one, group, generators, fed) = match self {
+            Binders::Ambient => (None, EMPTY, NO_GENERATORS, NO_FED),
+            Binders::One(b) => (Some(b), EMPTY, NO_GENERATORS, NO_FED),
+            Binders::Group(g) => (None, g, NO_GENERATORS, NO_FED),
+            Binders::Generators(gs) => (None, EMPTY, gs, NO_FED),
+            Binders::Fed(fed) => (None, EMPTY, NO_GENERATORS, fed),
         };
         one.into_iter()
             .chain(group.iter().map(|(b, _)| b))
             .chain(generators.iter().map(|g| &g.target))
+            .chain(fed.iter().map(|(b, _)| b))
     }
 
     /// Does this scope introduce nothing? True for [`Binders::Ambient`] — the
@@ -161,6 +168,7 @@ impl<'a> Binders<'a> {
             Binders::One(_) => false,
             Binders::Group(g) => g.is_empty(),
             Binders::Generators(gs) => gs.is_empty(),
+            Binders::Fed(fed) => fed.is_empty(),
         }
     }
 
@@ -182,6 +190,7 @@ impl<'a> Binders<'a> {
             (Binders::Generators(a), Binders::Generators(b)) => {
                 a.as_ptr() == b.as_ptr() && a.len() == b.len()
             }
+            (Binders::Fed(a), Binders::Fed(b)) => a.as_ptr() == b.as_ptr() && a.len() == b.len(),
             _ => false,
         }
     }
@@ -416,9 +425,10 @@ where
             }
         }
 
-        // Post-planning `Transact`. No binder: a writer body is already point-free
-        // and receives its mutable variable snapshots positionally, so the keys are
-        // field labels rather than binders (see the module docs).
+        // Post-planning `Transact`. A writer body is already point-free and receives its
+        // mutable variable snapshots positionally, so the keys are field labels rather than
+        // binders (see the module docs). A writer's source is under the names it reads
+        // earlier writers' item taps through.
         N::Transact { keys, writers, .. } => {
             for k in keys {
                 f(ScopedItem::KeyRef(&k.name));
@@ -428,7 +438,11 @@ where
                 for k in w.read_keys.iter().chain(&w.write_keys) {
                     f(ScopedItem::KeyRef(k));
                 }
-                open(f, &w.source);
+                if w.fed_back.is_empty() {
+                    open(f, &w.source);
+                } else {
+                    under(f, &w.source, Binders::Fed(&w.fed_back));
+                }
                 open(f, &w.body);
             }
         }
@@ -831,6 +845,7 @@ mod tests {
                 source: var("src"),
                 body: var("wbody"),
                 item_taps: Vec::new(),
+                fed_back: Vec::new(),
             }],
             domain: Type::Txn,
             parameter: None,

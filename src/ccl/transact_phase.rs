@@ -1545,10 +1545,13 @@ struct Path {
     conditions: Vec<Vec<ArmTest>>,
 }
 
-/// What a binding on a [`Path`] binds: a `let`'s value, or a `match` arm's payload.
+/// What a binding on a [`Path`] binds: a `let`'s value, a `match` arm's payload, or the value
+/// of a block earlier in the loop's body, which its site commits per item to `values`
+/// ([`BlockValue`]).
 enum PathBound {
     Value(Expr),
     Payload { scrutinee: Expr, tag: Label },
+    BlockValue { values: Name },
 }
 
 impl PathBound {
@@ -1557,6 +1560,9 @@ impl PathBound {
         match self {
             PathBound::Value(value) => value.clone(),
             PathBound::Payload { scrutinee, tag } => payload_of(scrutinee, tag, &binding.ty),
+            PathBound::BlockValue { .. } => {
+                unreachable!("a block's value is carried by the source, not copied")
+            }
         }
     }
 
@@ -1564,6 +1570,7 @@ impl PathBound {
         match self {
             PathBound::Value(value) => free_names_in_value(value),
             PathBound::Payload { scrutinee, .. } => free_names_in_value(scrutinee),
+            PathBound::BlockValue { .. } => HashSet::new(),
         }
     }
 }
@@ -1630,8 +1637,10 @@ fn payload_of(scrutinee: &Expr, tag: &Label, ty: &Type) -> Expr {
     Expr::apply(scrutinee.clone(), project).with_ty(ty.clone())
 }
 
-/// `term` under fresh copies of the bindings of `path` it reads, directly or through another.
-fn under_path_lets(path: &Path, term: Expr) -> Expr {
+/// `term` under fresh copies of the bindings of `path` it reads, directly or through another,
+/// and the values of earlier blocks among them, renamed as in `term`, with the `values` each is
+/// read from. A block's value is not copied: the site's source carries it ([`restrict_to_path`]).
+fn under_path_lets(path: &Path, term: Expr) -> (Expr, Vec<(TypedBinding, Name)>) {
     let mut needed = free_names_in_value(&term);
     let mut kept = Vec::new();
     for (binding, bound) in path.lets.iter().rev() {
@@ -1652,32 +1661,45 @@ fn under_path_lets(path: &Path, term: Expr) -> Expr {
         e
     };
     let mut term = rename(term);
+    let mut carried = Vec::new();
     for ((binding, bound), (_, to)) in kept.into_iter().zip(&renames).rev() {
-        let value = rename(bound.term(binding));
         let mut binding = binding.clone();
         binding.name = to.clone();
+        if let PathBound::BlockValue { values } = bound {
+            carried.push((binding, values.clone()));
+            continue;
+        }
+        let value = rename(bound.term(&binding));
         let ty = term.ty.clone();
         term = Expr::let_in(binding, value, term).with_ty(ty);
     }
-    term
+    carried.reverse();
+    (term, carried)
 }
 
-/// A site's `source` restricted to the positions where the conditions of `path` hold, and its
-/// `block` under the bindings of `path` it reads.
+/// A site's item binder, `source` and `block` for the place `path` describes: the source
+/// restricted to the positions where the conditions of `path` hold, carrying the values of
+/// the earlier blocks the block or the conditions read, and the block under the bindings of
+/// `path` it reads.
 ///
 /// The restriction is a refinement of the source's domain by `λ target → condition` applied
 /// to each position's item, which is how `channelize` restricts a conditional feed's source
 /// ([`refine_source_domain`](crate::ccl::channelize::refine_source_domain)). Each arm's
 /// condition is first-match, so it holds where its own test holds and no earlier arm's did,
 /// and nested branches conjoin theirs.
+///
+/// An earlier block's value at a position is final at that block's commit for it, so a site
+/// reading one runs at a position only once that commit is made: the source becomes
+/// `λ ξ → (source(ξ), values₁(ξ), …)` and the item binder a tuple, from which the block and
+/// the condition bind the loop's item and each value they read.
 fn restrict_to_path(
     path: &Path,
     target: &TypedBinding,
-    mut source: Expr,
+    source: Expr,
     block: Expr,
-) -> (Expr, Expr) {
-    let block = under_path_lets(path, block);
+) -> (TypedBinding, Expr, Expr) {
     let bool_ty = Type::Base(BaseType::Bool);
+    let (block, block_values) = under_path_lets(path, block);
     let condition = path
         .conditions
         .iter()
@@ -1688,19 +1710,69 @@ fn restrict_to_path(
         })
         .reduce(|outer, inner| {
             Expr::binop(outer, BinOpKind::BoolLogic(LogicKind::And), inner).with_ty(bool_ty.clone())
+        })
+        .map(|condition| under_path_lets(path, condition));
+    // The values the source carries, each once, in the order the tuple holds them.
+    let mut carried: Vec<(Name, Type)> = Vec::new();
+    for (binding, values) in block_values
+        .iter()
+        .chain(condition.iter().flat_map(|(_, values)| values))
+    {
+        if !carried.iter().any(|(v, _)| v == values) {
+            carried.push((values.clone(), binding.ty.clone()));
+        }
+    }
+    // Binds the loop's item and the carried values a term reads, from the site's item binder.
+    type BindItem = Box<dyn Fn(Expr, Vec<(TypedBinding, Name)>) -> Expr>;
+    let (domain, item_ty) = fun_parts(&source.ty);
+    let (site_target, mut source, bind_item) = if carried.is_empty() {
+        let bind_item: BindItem = Box::new(|term, _| term);
+        (target.clone(), source, bind_item)
+    } else {
+        let views: Vec<(Name, Expr, Type)> = carried
+            .iter()
+            .map(|(values, ty)| {
+                let view = tvar(values, Type::data_fun(domain.clone(), ty.clone()));
+                (values.clone(), view, ty.clone())
+            })
+            .collect();
+        let (zipped, tuple_ty) = build_zip_source(&source, &item_ty, &views);
+        let item = binding(Name::fresh("__item"), tuple_ty.clone());
+        let (item_name, target, carried) = (item.name.clone(), target.clone(), carried.clone());
+        let bind_item: BindItem = Box::new(move |term, values| {
+            let at = tvar(&item_name, tuple_ty.clone());
+            let mut term = term;
+            for (binding, from) in values.into_iter().rev() {
+                let i = carried
+                    .iter()
+                    .position(|(v, _)| *v == from)
+                    .expect("every value read is carried");
+                let value = proj_item(&at, &tuple_ty, i + 1, &binding.ty);
+                let ty = term.ty.clone();
+                term = Expr::let_in(binding, value, term).with_ty(ty);
+            }
+            let own = proj_item(&at, &tuple_ty, 0, &item_ty);
+            let ty = term.ty.clone();
+            Expr::let_in(target.clone(), own, term).with_ty(ty)
         });
-    if let Some(condition) = condition {
-        let condition = under_path_lets(path, condition);
+        (item, zipped, bind_item)
+    };
+    let block = bind_item(block, block_values);
+    if let Some((condition, values)) = condition {
+        let condition = bind_item(condition, values);
         let (domain, item) = fun_parts(&source.ty);
         let at = Expr::apply(Expr::var(Name::elem()).with_ty(domain), source.clone()).with_ty(item);
-        let test = Expr::apply(at, Expr::lambda(&target.name, target.ty.clone(), condition))
-            .with_ty(bool_ty);
+        let test = Expr::apply(
+            at,
+            Expr::lambda(&site_target.name, site_target.ty.clone(), condition),
+        )
+        .with_ty(bool_ty);
         crate::ccl::channelize::refine_source_domain(
             &mut source,
             crate::ccl::Refinement::born(std::rc::Rc::new(test)),
         );
     }
-    (source, block)
+    (site_target, source, block)
 }
 
 /// Replace every transaction `For` site (`ExprStmt(For{…}, cont)` whose block
@@ -1718,8 +1790,16 @@ fn strip(
     if let TypedExprNode::Let { bound_expr, .. } = &expr.node
         && matches!(bound_expr.node, TypedExprNode::Begin { .. })
     {
-        let rest = strip_valued_block(expr, txn_mut_vars, enclosing, path, out);
-        return strip(rest, txn_mut_vars, enclosing, path, out);
+        let (rest, value) = strip_valued_block(expr, txn_mut_vars, enclosing, path, out);
+        // In a loop the block's value is read back per item from `values`, which a later
+        // block reading it has its source carry.
+        let depth = path.lets.len();
+        if let Some((binding, values)) = value {
+            path.lets.push((binding, PathBound::BlockValue { values }));
+        }
+        let rest = strip(rest, txn_mut_vars, enclosing, path, out);
+        path.lets.truncate(depth);
+        return rest;
     }
     // A `with begin():` block (a `Begin` marker) on a statement spine.
     if let TypedExprNode::ExprStmt { expr: effect, .. } = &expr.node
@@ -1780,7 +1860,8 @@ fn strip(
                 g.blame(&[begin_id]);
                 let (target, source, enclosing_writes) = site_source(enclosing);
                 let (txn_block, lifted) = partition_block(*block, txn_mut_vars);
-                let (source, txn_block) = restrict_to_path(path, &target, source, txn_block);
+                let (target, source, txn_block) =
+                    restrict_to_path(path, &target, source, txn_block);
                 let (read_keys, write_keys) = collect_footprint(&txn_block, txn_mut_vars);
                 out.sites.push(RawSite {
                     parent: stmt_id,
@@ -2183,10 +2264,12 @@ pub fn refuse_uncompiled_aborting_blocks(
 /// Refuse a `with begin():` block that writes a transactional variable where [`strip`] cannot
 /// give its site the positions it runs at ([`restrict_to_path`]):
 ///
-/// - in a branch whose condition reads an induction accumulator or the value of a block, a
-///   block an exception escapes included: the positions would depend on another commit;
+/// - in a branch whose condition reads an induction accumulator or the value of a block that
+///   writes nothing: no source the site could carry holds either. The value of a writing block
+///   is carried ([`restrict_to_path`]);
 /// - in value position, or with an exception escaping it, in a branch, whose value the code
-///   after it reads per position of the unrestricted source;
+///   after it reads per position of the unrestricted source. A block in a loop an exception
+///   escapes is one, under the condition that no earlier block raised;
 /// - in a loop in a branch, which runs at every position of its own source;
 /// - reading, or under a condition reading, a binding in a loop's body or a branch whose value
 ///   writes, feeds, declares a channel or holds a loop or a block, which a copy would repeat.
@@ -2201,8 +2284,8 @@ pub fn refuse_conditional_writing_blocks(
 ) -> Result<(), String> {
     struct Walk<'a> {
         txn_mut_vars: &'a HashSet<Name>,
-        /// Names a condition cannot read: induction accumulators, and bindings of a block's
-        /// value or of a value reading one.
+        /// Names a condition cannot read: induction accumulators, and bindings of a read-only
+        /// block's value or of a value reading one.
         opaque: HashSet<Name>,
         /// The bindings a site copies, in a loop's body or a branch: the names each reads,
         /// and whether its value has an effect a copy would repeat.
@@ -2254,8 +2337,8 @@ pub fn refuse_conditional_writing_blocks(
             if condition.iter().any(|name| self.opaque.contains(name)) {
                 return Err(
                     "a `with begin():` block that writes, under a condition that reads an \
-                            induction accumulator or the value of another `with begin():` block, \
-                            is not compiled yet"
+                            induction accumulator or the value of a `with begin():` block that \
+                            writes nothing, is not compiled yet"
                         .to_string(),
                 );
             }
@@ -2298,10 +2381,12 @@ pub fn refuse_conditional_writing_blocks(
                     bound_expr,
                     body,
                 } => {
+                    // The value of a writing block in no branch: a later block reads it from the
+                    // values its site commits, which its own source carries.
+                    let mut block_value = false;
                     if let TypedExprNode::Begin { body: block, .. } = &bound_expr.node {
-                        if writes_any(block, self.txn_mut_vars)
-                            && (!conditions.is_empty() || loop_in_branch)
-                        {
+                        block_value = writes_any(block, self.txn_mut_vars);
+                        if block_value && (!conditions.is_empty() || loop_in_branch) {
                             return Err("a `with begin():` block that writes, in value position \
                                         or with an exception escaping it, under an `if` or a \
                                         `match` or after a statement that may raise, is not \
@@ -2312,12 +2397,18 @@ pub fn refuse_conditional_writing_blocks(
                     } else {
                         self.walk(bound_expr, local, conditions, loop_in_branch)?;
                     }
-                    let reads = free_names_in_value(bound_expr);
-                    if contains_begin(bound_expr) || reads.iter().any(|n| self.opaque.contains(n)) {
+                    let reads = if block_value {
+                        HashSet::new()
+                    } else {
+                        free_names_in_value(bound_expr)
+                    };
+                    if (!block_value && contains_begin(bound_expr))
+                        || reads.iter().any(|n| self.opaque.contains(n))
+                    {
                         self.opaque.insert(binding.name.clone());
                     }
                     if local {
-                        let effect = has_effect(bound_expr);
+                        let effect = !block_value && has_effect(bound_expr);
                         self.local.insert(binding.name.clone(), (reads, effect));
                     }
                     return self.walk(body, local, conditions, loop_in_branch);
@@ -2379,7 +2470,8 @@ fn feeds_any(e: &Expr) -> bool {
 }
 
 /// Strip a `with begin():` block in value position, `let x = Begin{block} in rest`, and return
-/// the continuation that reads its value ([`BlockValue`]).
+/// the continuation that reads its value ([`BlockValue`]), with, in a loop, the binding `x` and
+/// the `values` it is read from, which a later block reading `x` has its source carry.
 ///
 /// A block that writes no transactional mutable variable needs no commit: its value is the
 /// value of its chain, whose reads are as-of reads, as a read-only block's are. A writing block
@@ -2394,7 +2486,7 @@ fn strip_valued_block(
     enclosing: Option<(&TypedBinding, &Expr, &HashSet<Name>)>,
     path: &Path,
     out: &mut Stripped,
-) -> Expr {
+) -> (Expr, Option<(TypedBinding, Name)>) {
     let stmt_id = expr.node_id;
     let TypedExprNode::Let {
         binding,
@@ -2419,7 +2511,10 @@ fn strip_valued_block(
             provenance::Nature::Machinery,
         );
         g.blame(&[begin_id]);
-        return Expr::let_in_preserving(stmt_id, binding, *block, *rest);
+        return (
+            Expr::let_in_preserving(stmt_id, binding, *block, *rest),
+            None,
+        );
     }
     let g = provenance::enter(
         stmt_id,
@@ -2439,12 +2534,12 @@ fn strip_valued_block(
     let block = crate::ccl::ccl_utils::statement_tag_cases_to_guards(block);
     let (txn_block, lifted) = partition_block(block, txn_mut_vars);
     // In no branch (`refuse_conditional_writing_blocks`), so the path only lends the block
-    // the bindings it reads.
+    // the bindings it reads and the values of earlier blocks.
     debug_assert!(
         path.conditions.is_empty(),
         "a writing block in value position in a branch is refused before the phase"
     );
-    let txn_block = under_path_lets(path, txn_block);
+    let (site_target, source, txn_block) = restrict_to_path(path, &target, source, txn_block);
     let (mut read_keys, write_keys) = collect_footprint(&txn_block, txn_mut_vars);
     if commits_on.is_some() {
         for k in &write_keys {
@@ -2455,7 +2550,7 @@ fn strip_valued_block(
     }
     out.sites.push(RawSite {
         parent: stmt_id,
-        target: target.clone(),
+        target: site_target,
         source,
         block: txn_block,
         read_keys,
@@ -2467,25 +2562,26 @@ fn strip_valued_block(
             commits_on,
         }),
     });
-    let rest = match enclosing {
+    let (rest, value) = match enclosing {
         // The loop binds `x`, from the values it iterates beside its source.
         Some(_) => {
+            let value = (binding.clone(), values.clone());
             out.loop_values.push(LoopValue {
                 target: target.name,
                 values,
                 binding,
             });
-            *rest
+            (*rest, Some(value))
         }
         // The block commits once, over the singleton: `x` is that commit's value.
         None => {
             let committed = tvar(&values, Type::data_fun(dom, value_ty.clone()));
             let mut sole = Expr::aggregate(committed, crate::ccl::AggregateKind::Sole);
             sole.ty = value_ty;
-            Expr::let_in(binding, sole, *rest)
+            (Expr::let_in(binding, sole, *rest), None)
         }
     };
-    prepend_effects(lifted, rest)
+    (prepend_effects(lifted, rest), value)
 }
 
 /// The item binder, source and enclosing induction writes of a block's site: the enclosing
@@ -3597,6 +3693,8 @@ fn build_writer(
             source,
             body,
             item_taps,
+            // Recognition finds which of the store's own taps the source reads.
+            fed_back: Vec::new(),
         },
         feeds,
         site.value,
@@ -3954,6 +4052,10 @@ fn plan_store(
     let mut commit_rec_ty: Vec<Type> = Vec::with_capacity(writers.len());
     let mut site_decision_ty: Vec<Type> = Vec::with_capacity(writers.len());
     let mut site_write_keys: Vec<Vec<Name>> = Vec::with_capacity(writers.len());
+    // The values of each earlier site's block, as its tap read keyed by item: a later site in
+    // this store reads them there, inside the group, since the store's continuation, where
+    // `values` is bound, is outside it.
+    let mut own_values: Vec<(Name, Expr)> = Vec::new();
 
     for (j, (((parent, w), feeds), value)) in writers
         .into_iter()
@@ -3973,10 +4075,14 @@ fn plan_store(
         let WriterSite {
             read_keys,
             write_keys,
-            source,
+            mut source,
             body,
             item_taps: _,
+            fed_back: _,
         } = w;
+        for (values, tap) in &own_values {
+            Subst::discharge_in_place(&mut source, values, tap);
+        }
         let (dom, item_ty) = fun_parts(&source.ty);
         let decision_ty = body
             .ty
@@ -4108,7 +4214,9 @@ fn plan_store(
             );
             tap_bindings.push((binding(tap_name.clone(), tap_ty.clone()), tap_expr));
             if let Some(value) = value {
-                values.push(block_values(value, &tap_name, &tap_ty, &f.value.ty));
+                let (bound, read) = block_values(value, &tap_name, &tap_ty, &f.value.ty);
+                own_values.push((bound.name.clone(), read.clone_preserving_ids()));
+                values.push((bound, read));
                 continue;
             }
             hoisted.push(HoistedFeed {
