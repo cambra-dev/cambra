@@ -252,7 +252,6 @@ impl TileProducer for ExtractFinalProducer {
         }
     }
 
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         Some(self)
     }
