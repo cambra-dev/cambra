@@ -63,6 +63,18 @@ itsa_five(\"dummy_arg\")
     )
 }
 
+/// A bounded annotation is written as the bound it states.
+#[test]
+fn a_bounded_annotation_mismatch_writes_the_bound() {
+    check_compile_error(
+        indoc! {"
+            x <: {at: Int} = 5
+            x
+        "},
+        "Annotation mismatch: annotated as <: {at: Int}, but inferred as {Int where _ == 5}",
+    )
+}
+
 #[test]
 fn output_annotation_singleton_matches_the_literal() {
     check_scalar(
