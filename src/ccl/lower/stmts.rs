@@ -2487,17 +2487,7 @@ fn bound_members_by_their_trait(
 ) {
     use crate::ccl::ty::TypeKind;
     let trait_ = &requirement.trait_;
-    let mut at: HashMap<crate::ccl::ty::TypeParamId, Type> = trait_
-        .operand_params()
-        .iter()
-        .zip(&requirement.args)
-        .map(|(p, t)| (p.id, t.clone()))
-        .collect();
-    for (name, ty) in &requirement.assoc {
-        if let Some(p) = trait_.assoc_param(name) {
-            at.insert(p.id, ty.clone());
-        }
-    }
+    let at = trait_.params_at(&requirement.args, &requirement.assoc);
     for (name, ty) in &requirement.assoc {
         let (Some(bound), Type::Param(member)) = (trait_.assoc_bound(name), ty) else {
             continue;
