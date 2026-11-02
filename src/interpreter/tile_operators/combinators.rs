@@ -331,12 +331,10 @@ impl TileProducer for ConverseProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }
 
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         Some(self)
     }
@@ -461,6 +459,11 @@ impl TileProducer for ConverseProducer {
 }
 
 impl Breaker for ConverseProducer {
+    fn no_consuming_mode(&self) -> Option<String> {
+        (self.level != CurryLevel::OUTERMOST)
+            .then(|| "a Converse beneath standing levels has no consuming mode".to_string())
+    }
+
     /// Merges the input rows it answers at `guard`, a guard of the input's tiling, into the rows
     /// it holds, drops those whose group the consumer already released, and releases the input
     /// at what the answer stated. The input rows are the state: the groups are built from them on
@@ -646,7 +649,6 @@ impl TileProducer for MapDomainProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }
@@ -798,7 +800,6 @@ impl TileProducer for UncurryProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }
@@ -1112,7 +1113,6 @@ impl TileProducer for FilterProducer {
         visit("predicate", &*self.predicate);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
         visit("predicate", &mut *self.predicate);
@@ -1421,7 +1421,6 @@ impl TileProducer for RestrictProducer {
         visit("predicate", &*self.predicate);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("predicate", &mut *self.predicate);
     }
@@ -1819,7 +1818,6 @@ impl TileProducer for ProductProducer {
         visit("inner", &*self.inner);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("outer", &mut *self.outer);
         visit("inner", &mut *self.inner);

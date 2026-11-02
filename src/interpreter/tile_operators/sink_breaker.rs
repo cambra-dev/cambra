@@ -1,4 +1,4 @@
-//! A sink as a pipeline breaker, for the test-only `crate::interpreter::dispatcher::run_program`.
+//! A sink as a pipeline breaker, for `crate::interpreter::dispatcher::run_program`.
 //! See `src/interpreter/design-operators.md`, "Running a compiled program".
 
 use std::sync::Arc;
@@ -66,6 +66,7 @@ impl Breaker for SinkBreaker {
     }
 }
 
+#[cfg(test)]
 mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;

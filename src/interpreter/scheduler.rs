@@ -757,7 +757,6 @@ mod tests {
                 visit("input", &*self.input);
             }
 
-            #[cfg(test)]
             fn visit_input_producers_mut(
                 &mut self,
                 visit: &mut dyn FnMut(&str, &mut dyn TileProducer),

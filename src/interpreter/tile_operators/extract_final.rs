@@ -294,7 +294,6 @@ impl TileProducer for ExtractFinalProducer {
         }
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("source", &mut *self.source);
         if let Some(default) = &mut self.default {
@@ -302,7 +301,6 @@ impl TileProducer for ExtractFinalProducer {
         }
     }
 
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         Some(self)
     }

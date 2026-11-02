@@ -1083,9 +1083,9 @@ impl CommitProducer {
     fn writer_source<R>(&self, f: impl FnOnce(&dyn TileProducer) -> R) -> R {
         let [writer] = self.writer_producers.as_slice() else {
             panic!(
-                "a transaction store of {} writers has no consuming mode: a morsel names positions \
-                 of one writer's source",
-                self.writer_producers.len()
+                "{}",
+                self.no_consuming_mode()
+                    .expect("a store of one writer has a consuming mode")
             )
         };
         drive_source(&**writer, &mut Some(f))
@@ -1122,6 +1122,16 @@ impl SteppedStore for CommitProducer {
 /// drive and its body, is one pipeline; the operators inside it stay in pull mode. A deny commits
 /// nothing and progresses through the source's release alone.
 impl Breaker for CommitProducer {
+    fn no_consuming_mode(&self) -> Option<String> {
+        (self.writer_producers.len() != 1).then(|| {
+            format!(
+                "a transaction store of {} writers has no consuming mode: a morsel names positions \
+                 of one writer's source",
+                self.writer_producers.len()
+            )
+        })
+    }
+
     /// Drains the store until the writer's drive has released `guard` ([`consume_store`]).
     ///
     /// # Panics
@@ -2373,7 +2383,6 @@ impl TileProducer for CommitProducer {
         self.notifier.notify_if_changed(store)
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         for writer in &mut self.writer_producers {
             visit("writer", &mut **writer);
@@ -2383,7 +2392,6 @@ impl TileProducer for CommitProducer {
         }
     }
 
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         Some(self)
     }
@@ -3415,7 +3423,6 @@ impl TileProducer for InductionStoreProducer {
         }
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("body", &mut *self.body_producer);
         for (key, seed) in &mut self.seed_producers {
@@ -3437,17 +3444,14 @@ impl TileProducer for InductionStoreProducer {
         self.notifier.notify_if_changed(store)
     }
 
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         Some(self)
     }
 
-    #[cfg(test)]
     fn runs_in_rounds(&self) -> bool {
         true
     }
 
-    #[cfg(test)]
     fn announce_step(&self) {
         let cycle = self
             .breaker
@@ -3636,7 +3640,6 @@ impl TileProducer for StoreValueStreamProducer {
         visit("store", &*self.store_producer);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("store", &mut *self.store_producer);
     }
@@ -3869,7 +3872,6 @@ impl TileProducer for StoreFinalReadProducer {
         visit("store", &*self.store_producer);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("store", &mut *self.store_producer);
     }
@@ -4277,7 +4279,6 @@ impl TileProducer for StoreDenseReadProducer {
         visit("store", &*self.store_producer);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("store", &mut *self.store_producer);
     }
@@ -4674,7 +4675,6 @@ impl TileProducer for AsOfProducer {
         visit("source", &*self.source);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("trigger", &mut *self.trigger);
         visit("source", &mut *self.source);
@@ -5877,7 +5877,6 @@ impl TileProducer for InductionDriverProducer {
         }
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("store", &mut *self.store_producer);
         visit("source", &mut *self.source_producer);
@@ -5895,7 +5894,6 @@ impl TileProducer for InductionDriverProducer {
 
     impl_producer_base!();
 
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         Some(self)
     }
@@ -5917,7 +5915,6 @@ impl TileProducer for InductionDriverProducer {
         self.step(&Projection::Everything)
     }
 
-    #[cfg(test)]
     fn next_position(&self) -> Option<Option<Vec<Value>>> {
         let next = self
             .source
@@ -6612,7 +6609,6 @@ impl TileProducer for TransactDriverProducer {
         visit("source", &*self.source_producer);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("store", &mut *self.store_producer);
         visit("source", &mut *self.source_producer);
@@ -7468,7 +7464,6 @@ impl TileProducer for TransactWriterProducer {
         visit("driver", &*self.driver_producer);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("store", &mut *self.store_producer);
         visit("body", &mut *self.body_producer);

@@ -199,13 +199,12 @@ enum Inner {
     Store(Rc<RefCell<Box<dyn TileProducer>>>),
 }
 
-/// The cell a cyclic fan-out holds its store in ([`Inner::Store`]), which a test reaches.
-#[cfg(test)]
+/// The cell a cyclic fan-out holds its store in ([`Inner::Store`]), which a planner reaches.
+// shared-state-ok: the name of the cell `Inner::Store` holds, which a planner reaches to drive
+// the store as a pipeline breaker; what crosses it is the producer, never a tile.
 pub(crate) type StoreCell = Rc<RefCell<Box<dyn TileProducer>>>;
 
-/// A cyclic fan-out as a reader slot of it names it to a test driver
-/// (`TileProducer::store_read`).
-#[cfg(test)]
+/// A cyclic fan-out as a reader slot of it names it to a planner (`TileProducer::store_read`).
 pub struct StoreRead {
     /// The fan-out's id, which every slot's producer names.
     pub(crate) fan: usize,
@@ -883,7 +882,6 @@ impl TileProducer for FanOutProducer {
     /// A reader slot visits its fan-out's input. A recurrence slot visits nothing: it sits in a
     /// store's cycle, and the walk reaches the store through a reader slot
     /// (`TileProducer::store_read`).
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         let FanHold::Reader { shared, .. } = &self.hold else {
             return;
@@ -901,7 +899,6 @@ impl TileProducer for FanOutProducer {
         }
     }
 
-    #[cfg(test)]
     fn store_read(&self) -> Option<StoreRead> {
         let FanHold::Reader { shared, .. } = &self.hold else {
             return None;
@@ -918,7 +915,6 @@ impl TileProducer for FanOutProducer {
         })
     }
 
-    #[cfg(test)]
     fn recurrence_of(&self) -> Option<usize> {
         match &self.hold {
             FanHold::Recurrence { shared, .. } => shared.upgrade().map(|shared| shared.borrow().id),
@@ -1409,12 +1405,10 @@ impl TileProducer for MemoProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }
 
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         Some(self)
     }

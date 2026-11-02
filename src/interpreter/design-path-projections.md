@@ -1,8 +1,7 @@
 # Projections that name a path
 
-Status: accepted. Stages 1 and 2 are built, and stage 3 runs in the dispatcher's tests
-(`tile_operators/program_run_tests.rs`). The decisions are listed under [Decisions](#decisions), and
-the work lands in the [stages](#stages) below.
+Status: accepted. Stages 1 to 3 are built. The decisions are listed under [Decisions](#decisions),
+and the work lands in the [stages](#stages) below.
 
 A projection names the part of a producer's tile a pull asks for, and a push names the region a
 pipeline breaker decided (`src/interpreter/design-operators.md`, "Projection guards"). This note
@@ -140,10 +139,12 @@ A loop nested in another runs as a scope inside the outer loop's scope, queued a
 per outer round: the inner scope's rounds are the positions `(k, j)` of row `k` the inner drive
 emits, and a round at the row closes it.
 
-The planner panics on a nested loop where an operator its rounds pull beneath the outermost keys
-restates no projection there (`Planner::refusal_of_nested`). It composes the levels along each path
-from an inner pipeline's breaker: `TileProducer::restates` says what an operator accepts, and
-`TileProducer::input_level` the level it pulls each input at. There is no folded execution.
+The planner refuses a nested loop where an operator its rounds pull beneath the outermost keys
+restates no projection there (`Planner::refusal_of_nested`), and the program runs in pull mode. It
+composes the levels along each path from an inner pipeline's breaker: `TileProducer::restates` says
+what an operator accepts, and `TileProducer::input_level` the level it pulls each input at. There is
+no folded execution. No program of the differential suite is refused this way
+(`tests/it/dispatch_refused.txt`).
 
 ## Stages
 
@@ -171,5 +172,5 @@ from an inner pipeline's breaker: `TileProducer::restates` says what an operator
   pushing only at a finish.
 - A difference closes an arm against the extent of the row it names, so an arm that names no
   position of its row reads as `Nothing`.
-- A nested loop whose rounds pull an operator with no nested row is refused; no loop folds into the
-  scope around it.
+- A nested loop whose rounds pull an operator with no nested row is refused and runs in pull mode;
+  no loop folds into the scope around it.

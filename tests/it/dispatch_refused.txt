@@ -1,0 +1,5 @@
+differential_interp::a_group_by_whose_key_reads_the_loop_binder::case_1_every_key_is_the_binder	a Converse beneath standing levels has no consuming mode
+differential_interp::a_group_by_whose_key_reads_the_loop_binder::case_2_the_group_count_varies	a Converse beneath standing levels has no consuming mode
+differential_interp::a_group_by_whose_key_reads_the_loop_binder::case_3_each_group_aggregated	a Converse beneath standing levels has no consuming mode
+differential_interp::a_group_by_whose_key_reads_the_loop_binder::case_4_the_group_and_the_binder_both_read	a Converse beneath standing levels has no consuming mode
+differential_interp::two_writer_sites_on_one_store_are_not_judged	a transaction store of 2 writers has no consuming mode

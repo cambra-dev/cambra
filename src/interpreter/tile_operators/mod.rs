@@ -63,7 +63,6 @@ mod map;
 mod program_run_tests;
 mod reshape;
 mod scalar;
-#[cfg(test)]
 mod sink_breaker;
 #[cfg(test)]
 mod store_breaker_tests;
@@ -81,7 +80,6 @@ pub use lookup::*;
 pub use map::*;
 pub use reshape::*;
 pub use scalar::*;
-#[cfg(test)]
 pub(crate) use sink_breaker::SinkBreaker;
 pub use union::*;
 
@@ -1269,6 +1267,14 @@ pub trait Breaker {
     /// that answers `None` pushes nothing, after a consume or at a finish.
     fn as_producer(&self) -> Option<&dyn BreakingProducer>;
 
+    /// Why this breaker has no consuming mode for its shape, where it has none: a planner asks
+    /// before it plans the breaker's pipeline, since [`consume_impl`](Self::consume_impl) and
+    /// [`input_tiling`](Self::input_tiling) panic for such a breaker. `None` for a breaker that
+    /// consumes.
+    fn no_consuming_mode(&self) -> Option<String> {
+        None
+    }
+
     /// Finish an epoch once the pipeline has consumed every package of it. `last` says the epoch
     /// is the run's last, after which nothing calls the breaker. The default pushes what a
     /// producer's [`final_guard`](BreakingProducer::final_guard) names and no push named before,
@@ -1537,7 +1543,7 @@ pub trait TileProducer {
     /// whole. The default passes `level` to every input, which holds for an operator that keeps its
     /// input's keys level for level; an operator that shifts levels overrides it. The planner walks
     /// a loop's scope with it to find what a round pulls beneath the outermost keys (`unrestated`
-    /// in `dispatcher.rs`).
+    /// in `dispatcher/plan.rs`).
     fn input_level(&self, _role: &str, level: CurryLevel) -> Option<CurryLevel> {
         Some(level)
     }
@@ -1606,27 +1612,23 @@ pub trait TileProducer {
     fn visit_input_producers(&self, _visit: &mut dyn FnMut(&str, &dyn TileProducer)) {}
 
     /// [`visit_input_producers`](Self::visit_input_producers) with each producer mutable: the
-    /// same producers, in the same order, under the same roles. A test driver walks it to reach
+    /// same producers, in the same order, under the same roles. A dispatched run walks it to reach
     /// the pipeline breakers inside a chain ([`as_breaking_mut`](Self::as_breaking_mut)).
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, _visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {}
 
     /// This producer as a pipeline breaker, where it is one.
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         None
     }
 
     /// The id of the cyclic fan-out this producer reads through a recurrence slot, where it is
     /// one: an operator inside that fan-out's store's cycle reads the store through it.
-    #[cfg(test)]
     fn recurrence_of(&self) -> Option<usize> {
         None
     }
 
     /// The cyclic fan-out this producer reads through a reader slot, where it is one: a reader
     /// of that fan-out's store.
-    #[cfg(test)]
     fn store_read(&self) -> Option<StoreRead> {
         None
     }
@@ -1635,7 +1637,6 @@ pub trait TileProducer {
     /// encloses it: one round of the pipelines inside its cycle per position, in a nested
     /// dispatcher. A store that answers `false`, or one inside a loop's scope, steps itself until
     /// its input has released a morsel.
-    #[cfg(test)]
     fn runs_in_rounds(&self) -> bool {
         false
     }
@@ -1644,14 +1645,12 @@ pub trait TileProducer {
     /// where it is a store that holds its cycle, so an operator in pull mode there reads again at
     /// its next pull. A loop's scope announces at the start of each round, after the store's last
     /// step pulled them.
-    #[cfg(test)]
     fn announce_step(&self) {}
 
     /// Where this producer is the drive of a loop run in rounds, the path of the position it emits
     /// next, the next its source delivers, from the outermost level down, and `None` once the
     /// source delivers no more; `None` for any other producer. A loop's scope runs a round per
     /// position the drive emits.
-    #[cfg(test)]
     fn next_position(&self) -> Option<Option<Vec<Value>>> {
         None
     }
