@@ -1130,14 +1130,31 @@ The run pulls only the breakers' inputs. The program is compiled with
 a `Refused` error that names the shape, and pull mode runs every refused program:
 
 - a program compiled with its sinks pulled;
-- a program that reads a live source (`CompiledProgram::source_producers`), whose arrivals no run
-  notifies;
+- a live source read anywhere but by a source pipeline of the run's dispatcher whose input the
+  source's keys reach as its outermost keys (below);
 - a pipeline read directly by a pipeline another pipeline reads;
 - a breaker with no consuming mode (`Breaker::no_consuming_mode`): a transaction store of several
   writers;
 - the stores [A store as a breaker](#a-store-as-a-breaker) lists;
 - a loop nested in another whose rounds pull an operator beneath the outermost keys that restates
   no projection there ([A loop in rounds](#a-loop-in-rounds)).
+
+A range over a live source's domain (`TileProducer::data_sources`, an `IterateExtent` over a
+`DataSourceDomain`) is no range the run queues whole at its start. The pipeline above it must be a
+source of the run's dispatcher, and a push of one of the range's keys through the range's consumer
+must reach that pipeline's entry restated, as a guard of the input's outermost keys: a reader of
+pushes, a loop's round and a store take no package a source's arrival names, and a feed `out << 𝑒`
+is keyed by the sink's one row, so its source's keys sit beneath it. Such a pipeline is live
+(`Planned::live`). The run starts the other sources whole and then polls: each pass asks every live
+source for new data (`DataSourceDomainExtentImpl::check_for_new_data`), notifies each live pipeline
+of the keys its sources yield beyond what it was notified of (`get_yield_predicate`), as the region
+a push of them brings its entry, and seals the epoch where it notified one and one is still open.
+A live pipeline closes once its sources yield everything, and the run ends with the epoch the last
+one closes in. A pass that finds nothing new calls the caller's `on_idle` after running what is
+claimable (`run_program_polling`): `run_program` sleeps for a millisecond, and a test feeds the
+source there. A range reads one source, keyed by positions: the planner refuses a cross product of
+sources, a source beside a static extent, and a source with other keys, whose arrivals no region
+of one source's positions spells.
 
 The binary runs a program dispatched where `CAMBRA_DISPATCH` is set and not `0`, and neither
 `--inspect` nor `--control` is given, at morsels of `CAMBRA_MORSEL_ROWS` rows (1024 unset; a value

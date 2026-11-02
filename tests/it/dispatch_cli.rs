@@ -97,9 +97,9 @@ fn a_refused_program_runs_in_pull_mode() {
     );
 }
 
-/// A program that reads stdin, which the planner refuses as a live source read by no source
-/// pipeline, runs in pull mode in the context the dispatched run compiled it in: a second
-/// compile would open a second stdin reader, and the first would take the input.
+/// A pure program that reads stdin, which the planner refuses since no push reaches the driver's
+/// consumer at its `main` output, runs in pull mode in the context the dispatched run compiled it
+/// in: a second compile would open a second stdin reader, and the first would take the input.
 #[test]
 fn a_refused_program_reading_stdin_takes_its_input() {
     let source = "[\"> \" + line for line in stdin()]\n";
@@ -116,5 +116,58 @@ fn a_refused_program_reading_stdin_takes_its_input() {
         echoed(&dispatched),
         3,
         "the refused program echoes every line"
+    );
+}
+
+/// An HTTP server program runs dispatched: its request sources are live sources whose
+/// deliveries the run notifies the routes' pipelines of, and each request is answered while the
+/// run polls.
+#[test]
+fn an_http_server_answers_requests_dispatched() {
+    use std::io::Read;
+    use std::net::TcpStream;
+    use std::time::{Duration, Instant};
+
+    let port = cambra::interpreter::http_server::reserve_test_port();
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/programs/http_greeter/program.cambra"
+    ))
+    .expect("the greeter is readable")
+    .replace("{PORT}", &port.to_string());
+    let dir = std::env::temp_dir().join(format!("cambra-dispatch-http-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("the temporary directory is writable");
+    let path = dir.join("greeter.cambra");
+    std::fs::write(&path, source).expect("the program file is writable");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_cambra"))
+        .arg(&path)
+        .env("CAMBRA_DISPATCH", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("the binary runs");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let answer = loop {
+        if let Ok(mut stream) = TcpStream::connect(("127.0.0.1", port)) {
+            stream
+                .write_all(b"GET /greet HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                .expect("the request is sent");
+            let mut answer = String::new();
+            stream
+                .read_to_string(&mut answer)
+                .expect("the answer is read");
+            break answer;
+        }
+        assert!(Instant::now() < deadline, "the server listens within 20 s");
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    child.kill().expect("the server is stopped");
+    let output = child.wait_with_output().expect("the server exits");
+    std::fs::remove_dir_all(&dir).expect("the temporary directory is removable");
+    assert!(answer.contains("Hello, stranger!"), "the answer: {answer}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("running in pull mode"),
+        "the server runs dispatched: {stderr}"
     );
 }
