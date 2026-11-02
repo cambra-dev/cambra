@@ -4552,6 +4552,16 @@ fn a_block_value_outside_a_loop(#[case] code: &str, #[case] expected: i64) {
             pool
         out << left
 "}, "[90, 70, 40]")]
+#[case::a_binding_in_the_loop(indoc! {"
+    pool: Mut(Int, Txn) := 100
+    out = test_sink()
+    for r in [10, 20, 30]:
+        y = r * 2
+        left = with begin():
+            pool := pool - y
+            pool
+        out << left
+"}, "[80, 40, -20]")]
 #[case::each_branch_ends_in_its_value(indoc! {r#"
     pool: Mut(Int, Txn) := 100
     out = test_sink()
@@ -4684,21 +4694,91 @@ fn a_feed_beside_a_block_value(#[case] code: &str, #[case] expected: &str) {
     );
 }
 
-/// A writing block under an `if` outside a loop commits only where the `if` holds, which the
-/// transaction phase does not compile: it is refused rather than committed whatever the `if`
-/// decides.
+/// A writing block in a branch commits only at the positions where the branch runs: its
+/// site's source is restricted to them. Outside a loop the source is the singleton, which the
+/// `if` empties or keeps.
+#[rstest]
+#[case::an_if_that_fails(indoc! {"
+    x = 1
+    if x > 2:
+        with begin():
+            pool := pool - 1
+"}, 100)]
+#[case::an_if_that_holds(indoc! {"
+    x = 3
+    if x > 2:
+        with begin():
+            pool := pool - 1
+"}, 99)]
+#[case::an_if_in_a_loop(indoc! {"
+    for r in [10, 20, 30]:
+        if r > 15:
+            with begin():
+                pool := pool - r
+"}, 50)]
+#[case::an_else_in_a_loop(indoc! {"
+    for r in [10, 20, 30]:
+        if r > 15:
+            with begin():
+                pool := pool - r
+        else:
+            with begin():
+                pool := pool + 1
+"}, 51)]
+#[case::a_condition_on_a_binding_in_the_loop(indoc! {"
+    for r in [10, 20, 30]:
+        y = r * 2
+        if y > 30:
+            with begin():
+                pool := pool - y
+"}, 0)]
+#[case::nested_ifs(indoc! {"
+    for r in [10, 20, 30]:
+        if r > 15:
+            y = r + 1
+            if y < 25:
+                with begin():
+                    pool := pool - y
+"}, 79)]
+#[case::a_match_arm(indoc! {"
+    for r in [10, 20, 30]:
+        match (`a(r) if r > 15 else `b(r)):
+            case `a(v):
+                with begin():
+                    pool := pool - v
+            case `b(w):
+                pass
+"}, 50)]
+#[case::a_block_reading_a_binding_in_the_loop(indoc! {"
+    for r in [10, 20, 30]:
+        y = r * 2
+        with begin():
+            pool := pool - y
+"}, -20)]
+fn a_writing_block_in_a_branch(#[case] code: &str, #[case] expected: i64) {
+    check_scalar(
+        &format!("pool: Mut(Int, Txn) := 100\n{code}\nawait_final(pool)\n"),
+        Value::Int(expected),
+    );
+}
+
+/// A block whose branch depends on another commit is refused: the positions it runs at are not
+/// known before that commit.
 #[test]
-fn a_writing_block_under_an_if_is_refused() {
+fn a_block_under_a_condition_on_another_block_is_refused() {
     check_compile_error(
         indoc! {"
             pool: Mut(Int, Txn) := 100
-            x = 1
-            if x > 2:
-                with begin():
-                    pool := pool - 1
+            for r in [10, 20, 30]:
+                v = with begin():
+                    pool := pool - r
+                    pool
+                if v > 75:
+                    with begin():
+                        pool := pool - 1
             await_final(pool)
         "},
-        "a `with begin():` block that writes on only some paths",
+        "under a condition that reads an induction accumulator or the value of another",
     );
 }
 

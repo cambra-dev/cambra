@@ -330,7 +330,7 @@ fn lower_tx_block_scoped(
                     handlers,
                     outer_bindings,
                     ctx,
-                    |body, scope, _, ctx| lower_tx_block_inner(body, scope, stmt.span, false, ctx),
+                    |body, scope, ctx| lower_tx_block_inner(body, scope, stmt.span, false, ctx),
                 )?;
                 ctx.tag_machinery(Expr::expr_stmt(attempt, chain), stmt.span, "lower.stmt_seq")
             }
@@ -398,7 +398,7 @@ fn lower_tx_tail(
             handlers,
             outer_bindings,
             ctx,
-            |body, scope, _, ctx| lower_tx_block_inner(body, scope, stmt.span, true, ctx),
+            |body, scope, ctx| lower_tx_block_inner(body, scope, stmt.span, true, ctx),
         ),
         _ => Err(LoweringError::unsupported(
             stmt.span,

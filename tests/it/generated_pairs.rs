@@ -111,7 +111,9 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ),
     ("trait_instance_body", "groupby_sum", "CompilerRejects"),
     ("trait_instance_body", "rows_sum", "CompilerPanics"),
+    ("txn_if", "generator_max", "CompilerRejects"),
     ("txn_raise", "generator_max", "CompilerRejects"),
+    ("txn_raise_before", "generator_max", "CompilerRejects"),
     ("txn_raise_standalone", "generator_max", "CompilerRejects"),
     ("txn_reply", "generator_max", "CompilerRejects"),
     ("txn_value", "generator_max", "CompilerRejects"),
@@ -610,6 +612,45 @@ fn skeletons() -> Vec<Skeleton> {
                 except Int as e:
                     e
             out << got
+            out << await_final(pool)
+        "#}},
+        Skeleton { name: "txn_if", hole: Ty::Int, scope: &[("r", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            misses: Mut(Int, Txn) := 0
+            for r in [1, 2, 3]:
+                y = {}
+                if y > 2:
+                    with begin():
+                        pool := pool - y
+                        out << pool
+                else:
+                    with begin():
+                        misses := misses + 1
+            out << await_final(pool)
+            out << await_final(misses)
+        "#}},
+        Skeleton { name: "txn_if_standalone", hole: Ty::Int, scope: &[], body: indoc! {r#"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            x = {}
+            if x > 2:
+                with begin():
+                    pool := pool - x
+            out << await_final(pool)
+        "#}},
+        Skeleton { name: "txn_raise_before", hole: Ty::Int, scope: &[("r", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            for r in [1, 2, 3]:
+                try:
+                    if r == 2:
+                        raise r
+                    y = {}
+                    with begin():
+                        pool := pool - y
+                except Int as e:
+                    out << e
             out << await_final(pool)
         "#}},
         Skeleton { name: "mut_init", hole: Ty::Int, scope: &[], body: indoc! {r#"

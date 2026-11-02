@@ -588,6 +588,16 @@ fn caught_inside_a_block(#[case] code: &str, #[case] expected: i64) {
             pass
     await_final(pool)
 "}, 89)]
+#[case::a_raise_before_a_block(indoc! {"
+    for r in [10, 20, 5]:
+        try:
+            check(r)
+            with begin():
+                pool := pool - r
+        except Int:
+            pass
+    await_final(pool)
+"}, 85)]
 #[case::a_block_in_value_position(indoc! {"
     for r in [10, 20, 5]:
         try:
@@ -610,19 +620,10 @@ fn escaping_a_block(#[case] code: &str, #[case] expected: i64) {
     check_scalar(&format!("{defs}{code}"), Value::Int(expected));
 }
 
-/// A block an exception escapes whose abort is not compiled, and a writing block exception
-/// elimination leaves on only some paths, are refused rather than committed on every path.
+/// A block an exception escapes whose abort is not compiled, and one in a loop an exception
+/// escapes, which runs only where no earlier block raised, are refused rather than committed on
+/// every path.
 #[rstest]
-#[case::a_raise_before_a_block(indoc! {"
-    for r in [10, 20, 5]:
-        try:
-            check(r)
-            with begin():
-                pool := pool - r
-        except Int:
-            pass
-    await_final(pool)
-"}, "writes on only some paths")]
 #[case::an_exception_escaping_a_loop_of_blocks(indoc! {"
     y = try:
             for r in [10, 20, 5]:
@@ -633,7 +634,7 @@ fn escaping_a_block(#[case] code: &str, #[case] expected: i64) {
         except Int as e:
             e
     await_final(pool) + y
-"}, "writes on only some paths")]
+"}, "in value position or with an exception escaping it, under an `if`")]
 #[case::an_induction_write_in_the_block(indoc! {"
     n := 0
     for r in [10, 20, 5]:
