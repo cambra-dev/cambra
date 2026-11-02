@@ -248,7 +248,7 @@ fn none() -> Value {
 ///
 /// A range domain holds `UInt` positions, while a checked lookup's key is an `Int`: the lookup
 /// relaxes a range key to `Int` because it proves no bound (`src/ccl/design/collections.md`,
-/// "The checked lookup `𝑐[𝑘]?`"). An `Int` names the position it equals, and a negative one
+/// "The checked lookup `𝑐[𝑘]`"). An `Int` names the position it equals, and a negative one
 /// names none. Every other pair is compared as it stands.
 fn key_names(key: &Value, position: &Value) -> bool {
     match (key, position) {

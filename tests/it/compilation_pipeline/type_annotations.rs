@@ -2146,9 +2146,9 @@ c[1]! == 2
 }
 
 /// The codomain of `c` has `Int@1`, `Int@2`, and `Int@3` as lower
-/// bounds. Each is checked against the domain of `c` for the lookup
-/// `c[k]` during type inference, and the check against `Int@3`
-/// specifically fails.
+/// bounds, and therefore so does `k`. `Int@3` does not satisfy the
+/// domain of `c`, but `k` is allowed as a key because `c[k]` is a
+/// checked lookup.
 #[test]
 fn checked_lookup_keyed_by_list_element() {
     check_scalar(
@@ -2186,5 +2186,52 @@ k = c[4]!
 c[k] == Option::some(3)
         "#},
         "expected 0..3, found Int@4",
+    )
+}
+
+/// TODO: A checked lookup on a list inside a comprehension is rejected: the list's domain `0..3`
+/// and the key's `Int` have no common answer. Conjecture: the cause is that the kind lattice and
+/// the compact merge relate a range only to itself (`src/ccl/design/type-inference.md`, "A
+/// refined `Int` below a range"). Replace with the `Option` values when fixed.
+#[test]
+fn checked_lookup_in_comprehension_rejected() {
+    check_compile_error(
+        indoc! {r#"
+xs = [10, 20, 30]
+ks = [0, 1, 7]
+ys = [xs[k] for k in ks]
+match ys[0]!:
+    case Option::some(w):
+        w
+    case Option::none:
+        0
+        "#},
+        "Conflicting Domains: Int vs 0..3",
+    )
+}
+
+/// TODO: A proven lookup through a generic function is rejected: the key's `Int@1` and the
+/// list's domain `0..3` have no common answer. Conjecture: the cause is the same as in
+/// `checked_lookup_in_comprehension_rejected`. Replace with `Value::Int(20)` when fixed.
+#[test]
+fn proven_lookup_through_generic_caller_rejected() {
+    check_compile_error(
+        indoc! {r#"
+def get(c, k):
+    c[k]!
+get([10, 20, 30], 1)
+        "#},
+        "Conflicting Domains: Int@1 vs 0..3",
+    )
+}
+
+#[test]
+fn checked_lookup_on_negative_index() {
+    check_scalar(
+        indoc! {r#"
+xs = [1,2,3]
+xs[-1] == Option::none
+        "#},
+        Value::Bool(true),
     )
 }

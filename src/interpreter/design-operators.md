@@ -830,7 +830,11 @@ release. That release suppresses further emissions and releases both inputs univ
 
 Pointwise functions are applied through `MapResult(input, Constant(FunctionDef))`, not standalone
 operators. The variants are `BinOp(op)` over a `{_0, _1}` record column, `UnaryOp(op)` over one
-column, `RecordField(f)` projecting a field, and `Scalar(program)` evaluating a fused chain.
+column, `RecordField(f)` projecting a field, `Scalar(program)` evaluating a fused chain, and
+`ToUInt` converting an `Int` column to the `UInt` positions of a range. `ToUInt` is
+`Builtin::ToUInt`'s conversion. It panics on a negative value, which inference rules out by proving
+every argument lies in the range
+([A refined `Int` below a range](../ccl/design/type-inference.md#a-refined-int-below-a-range)).
 
 #### Scalar programs
 
@@ -1283,6 +1287,11 @@ input's completeness less that row's path, the rule `CheckedLookup` applies to a
 decided. An input that is complete answers every row, and `Lookup` fails loudly where one does
 not. The answer keeps the input's keys at every level above the rows, so a release passes
 through to the input, each row's collection going with its row.
+
+`CheckedLookup` compares a key with a domain position by `key_names` (`tile_operators/lookup.rs`).
+An `Int` key names the `UInt` position of a range domain it equals, and a negative key names none,
+because the checked lookup types its key at `Int` rather than at the range. Every other key is
+compared with the position by equality.
 
 ### Where a collection is materialized
 

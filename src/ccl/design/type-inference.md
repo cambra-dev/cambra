@@ -1592,8 +1592,8 @@ values. After the post-inference check, `coerce_range_keys` in `infer/range_keys
 each application `𝑎 ▷ 𝑓` with `𝑎 : {Int | 𝑆}` and `𝑓 : 0..𝑛 ⤇ 𝑉` to `𝑎 ▷ to_uint ▷ 𝑓`. The
 builtin's type `{Int | 𝑆} ⇒ 0..𝑛` is stamped, so no later check decides the edge again. An
 application is the only site rewritten. An `Int` reaching a range anywhere else, such as through
-an annotation or a tuple field, keeps its `Int` representation, and operator conversion rejects
-the mismatch (`Map::new` in `src/interpreter/tile_operators/map.rs`).
+an annotation or a tuple field, keeps its `Int` representation. No pass converts it and no test
+reaches it, so what operator conversion and evaluation do with it is **[Open]**.
 
 ##### A product is reached through its fields
 

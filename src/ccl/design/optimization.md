@@ -555,6 +555,7 @@ boundary and is rejected.
 | `zip((a: f, b: g))` | `zip_arms_named_at` selects `Zip` or `MakeRecord`, unless the enclosing chain is element-wise (see [Element-wise chains](#element-wise-chains)) |
 | `.n`, `.field` | Project a tuple or record field |
 | `add`, `neg`, and other scalar builtins | Apply the corresponding scalar operator |
+| `to_uint` | `MapResult` with `Constant(FunctionDef::ToUInt)`, whose output extent is the range the node's codomain names |
 | `(true ▷ const) ▷ iterate` | `IterateExtent` over the declared domain |
 | `p ▷ iterate`, nontrivial `p` | `IterateExtent` followed by `Restrict` |
 | `upstream ▷ (p ▷ restrict)` | Filter the upstream with `Restrict` |
