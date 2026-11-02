@@ -432,7 +432,6 @@ impl TileProducer for ConverseProducer {
         visit("input", &mut *self.input);
     }
 
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         Some(self)
     }

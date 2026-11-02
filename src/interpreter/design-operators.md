@@ -561,7 +561,7 @@ of a cyclic fan-out).
 | `MapResultToConst` | A collection input is pulled at the projection where the constant applies one level in or deeper. At the outermost level the constant replaces the whole input, so the input is read whole. The constant is read whole, since every row reads all of it. A projection beneath the outermost keys is answered above the constant's level (`Restates::Above`), and one at or beneath it panics. |
 | `MapResultWithSource` | The input is pulled at the projection, at any level (`Restates::Every`), so a morsel reads only its own keys from the source. |
 | `RecordWrap` | The input is pulled at the projection, which beneath the outermost keys is one above the wrapped level (`Restates::Above`). |
-| `SelectField` | A stream of records is pulled at the projection. A product of collections is pulled whole and the selected field is cut. |
+| `SelectField` | A stream of records is pulled at the projection, which beneath the outermost keys is one above the record's level (`Restates::Above`). A product of collections is pulled whole and the selected field is cut. Its release names the other fields' cells at every path, and a breaker's final guard names each key under which a cell is still held ([Differences of nested guards](design-path-projections.md#differences-of-nested-guards)). |
 | `Zip` | Every arm is pulled at the projection, since the arms share the pair's keys. The pair is complete only where every arm is. A projection beneath the outermost keys is answered above the record's level (`Restates::Above`). |
 | `MakeRecord` | A record of values has no keys: the projection is the whole record or nothing, and a guard naming keys panics. |
 | `VariantWrap` | A payload stream is pulled at the projection. A payload that is itself a collection becomes one union column and is read whole. A projection beneath the outermost keys is answered above the wrapped level (`Restates::Above`). |
@@ -1002,8 +1002,11 @@ rounds](#a-loop-in-rounds)). The planner refuses:
   not name, and a store whose seed reads a pipeline;
 - a store over a live source, whose arrivals no run notifies;
 - a store inside the cycle of a store that steps itself, which no round reaches;
-- a transaction store of any number of writers but one, since a morsel names positions of one
-  source.
+- a transaction store of several writers, since a morsel names positions of one source.
+
+The planner asserts that a transaction store has a writer: its keys are the footprints of its
+`with begin():` blocks, each one of its writers
+([How many commit stores a program has](../ccl/design/mutability.md#how-many-commit-stores-a-program-has)).
 
 ### The dispatcher
 
@@ -1106,8 +1109,8 @@ pipelines.
 
 #### Running a compiled program
 
-`dispatcher::run_program`, a test-only driver, runs a compiled program's pipelines on the calling
-thread. It walks the producer chains under the program's sinks with
+`dispatcher::run_program` (`dispatcher/plan.rs`) runs a compiled program's pipelines on the calling
+thread. It walks the producer chains under the program's sinks and `main` outputs with
 `TileProducer::visit_input_producers_mut`, the mutable twin of `visit_input_producers`, and takes
 each producer whose `as_breaking_mut` answers one as a pipeline breaker. A breaker's pipeline reads
 the pipelines of the nearest breakers beneath it, which are numbered before it, and the walk places
@@ -1166,15 +1169,47 @@ universal guard. The sink's pipeline is not ordered: a tile carries its keys, an
 each answer by key, as `TestSink` merges it and the HTTP sink answers each request by its index. A
 package's answer states only its own region complete, so it is terminal only where the package is
 the producer's whole input. A sink is done once its producer is released whole, however many
-packages that took. The run leaves that to its caller to read, and a pull of the sink afterwards
-finds it done (`DoneNotifier::signal`), since its producer answers from what its breakers consumed.
+packages that took. The run ends with one pull of each sink, as pull mode's last: the producer
+answers from what its breakers consumed and is released whole, so the pull hands the sink nothing
+new and finds it done (`DoneNotifier::signal`), which fires `CompiledProgram::done` once every sink
+has. The pull closes its answer's outermost statement over the producer's tiling
+(`Tile::closed_over`): an answer assembled arm by arm of a tagged union, as a sink fed from two
+sites is, states each arm complete on its own, and only the closed statement reads as terminal.
 
-The run pulls only the breakers' inputs. A test compiles the program with
+A `main` output's producer is the driver's to pull. The run takes it into a slot and makes it the
+root of a sink's pipeline whose `DataSink` merges what it is handed (`Collected`); no push reaches
+the driver's consumer, so that pipeline reads its input whole. The run answers the `main`
+output's merged tile (`Run::main`) and hands the producer back; a program has at most one.
+
+The run pulls only the breakers' inputs. The program is compiled with
 `GlobalContext::defer_sink_pulls`, which leaves out the pull each sink takes once subscribed, and
-runs the pipelines, the sinks' among them. `tile_operators/program_run_tests.rs` checks that the run
-releases each sink's producer whole, that a pull of each sink afterwards reaches no producer beneath
-a breaker, changes no sink's value and finds every sink done, and that each program answers what
-pull mode answers.
+`CompiledProgram::sink_pulls_deferred` records it. The planner refuses, before anything runs, with
+a `Refused` error that names the shape, and pull mode runs every refused program:
+
+- a program compiled with its sinks pulled;
+- a program that reads a live source (`CompiledProgram::source_producers`), whose arrivals no run
+  notifies;
+- a pipeline read directly by a pipeline another pipeline reads;
+- a breaker with no consuming mode (`Breaker::no_consuming_mode`): a transaction store of several
+  writers;
+- the stores [A store as a breaker](#a-store-as-a-breaker) lists;
+- a loop nested in another whose rounds pull an operator beneath the outermost keys that restates
+  no projection there ([A loop in rounds](#a-loop-in-rounds)).
+
+The binary runs a program dispatched where `CAMBRA_DISPATCH` is set and not `0`, and neither
+`--inspect` nor `--control` is given, at morsels of `CAMBRA_MORSEL_ROWS` rows (1024 unset; a value
+that is no positive count panics). It prints the `main` output's value once. A refused program
+runs in pull mode after a note on stderr, in the context the dispatched run compiled it in: the
+compile has opened its sources and sinks, a port bound or stdin taken, which a second compile
+could not open again.
+
+`tile_operators/program_run_tests.rs` checks that the run releases each sink's producer whole, that
+it finds every sink done, that a pull of each sink afterwards reaches no producer beneath a breaker
+and changes no sink's value, and that each program answers what pull mode answers. Every program
+of the differential suite (`tests/it/differential_interp.rs`) runs dispatched too, at morsels of
+one row and of every row, and answers what pull mode answers, or the planner refuses it as
+`tests/it/dispatch_refused.txt` pins by test name. `tests/it/dispatch_cli.rs` runs the binary both
+ways.
 
 #### A loop in rounds
 
@@ -1248,12 +1283,12 @@ restates no projection at the level it is pulled at. The check runs once every s
 of its rounds, and passes each operator's level to its inputs as `TileProducer::input_level`
 declares. It ends at every breaker that consumes, in any dispatcher, since that breaker's consume
 pulls its inputs and its own scope checks them; a breaker whose pipeline its dispatcher would read
-whole runs in pull mode and passes the pull on. The planner panics on such a loop, as it does on the
-stores [A store as a breaker](#a-store-as-a-breaker) lists.
+whole runs in pull mode and passes the pull on. A refused program runs in pull mode, and
+`tests/it/dispatch_refused.txt` pins each one the differential suite holds.
 
-`dispatcher/loop_scope.rs` tests the rounds of one scope, `dispatcher.rs` tests the refusal's walk,
-and `tile_operators/program_run_tests.rs` runs flat, guarded and nested loops, a loop nested twice
-among them, against pull mode.
+`dispatcher/loop_scope.rs` tests the rounds of one scope, `dispatcher/plan.rs` tests the refusal's
+walk, and `tile_operators/program_run_tests.rs` runs flat, guarded and nested loops, a loop nested
+twice among them, against pull mode.
 
 #### Epochs
 

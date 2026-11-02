@@ -1020,6 +1020,16 @@ impl SelectFieldProducer {
 impl TileProducer for SelectFieldProducer {
     impl_producer_base!();
 
+    /// A stream of records keeps its keys at every level above the record, so its input is pulled
+    /// at a projection there; the levels of a field that is itself a collection are inside the
+    /// record's values. A product of collections is pulled whole and cut at the projection.
+    fn restates(&self) -> Restates {
+        match self.input.tiling().is_data_function() {
+            true => Restates::Above(CurryLevel::values_of(self.input.tiling())),
+            false => Restates::Every,
+        }
+    }
+
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
     }
@@ -1032,7 +1042,7 @@ impl TileProducer for SelectFieldProducer {
     /// projection. A product of collections has no projection guard of its own: it is pulled
     /// whole, and the field cut after.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let projection = projection_guard.projection(&self.name());
+        let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
