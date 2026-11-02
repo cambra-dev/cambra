@@ -802,7 +802,7 @@ fn test_grouping_built_once(#[case] code: &str) {
 #[case::list_present(
     indoc! {"
         xs = [10, 20, 30]
-        match xs[1]?:
+        match xs[1]:
             case Option::some(v):
                 v
             case Option::none:
@@ -813,7 +813,7 @@ fn test_grouping_built_once(#[case] code: &str) {
 #[case::list_past_the_end(
     indoc! {"
         xs = [10, 20, 30]
-        match xs[5]?:
+        match xs[5]:
             case Option::some(v):
                 v
             case Option::none:
@@ -824,7 +824,7 @@ fn test_grouping_built_once(#[case] code: &str) {
 #[case::list_negative(
     indoc! {"
         xs = [10, 20, 30]
-        match xs[-1]?:
+        match xs[-1]:
             case Option::some(v):
                 v
             case Option::none:

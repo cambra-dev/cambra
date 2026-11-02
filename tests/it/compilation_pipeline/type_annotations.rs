@@ -2094,29 +2094,30 @@ fn a_data_function_type_is_no_value() {
     check_compile_error("x = Int |=> Int\n1", "`T |=> U` is a data-function *type*");
 }
 
-/// TODO: Currently fails because domain of `xs` is `UIntRange(..)`,
-/// which is not comparable to the base type `Int` of the key.
+/// A checked lookup on a list answers an `Option` of the element.
 #[test]
 fn checked_lookup_is_option() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
 xs = [1,2,3]
-xs[1]
+match xs[1]:
+    case Option::some(v):
+        v
+    case Option::none:
+        0
         "#},
-        "expected 0..3, found Int",
+        Value::Int(2),
     )
 }
 
-/// TODO: Currently fails because domain of `xs` is `UIntRange(..)`,
-/// which is not comparable to the base type `Int` of the key.
 #[test]
 fn proven_lookup_direct() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
 xs = [1,2,3]
 xs[1]!
         "#},
-        "expected 0..3, found Int",
+        Value::Int(2),
     )
 }
 
@@ -2130,15 +2131,15 @@ x = Option::some(1)
 x!
         "#},
         "found '!', expected binary operator",
+    )
+}
 
-/// The key `1` is typed `Int@1`, which entails `0 <= __elem < 3`, so `c : 0..3 ⤇ Int` applies
-/// to it through `to_uint`, which converts it to the range key `1`.
 #[test]
-fn proven_lookup_1() {
+fn proven_lookup_in_comparison() {
     check_scalar(
         indoc! {r#"
 c = [1,2,3]
-c[1] == 2
+c[1]! == 2
         "#},
         Value::Bool(true),
     )
@@ -2149,30 +2150,41 @@ c[1] == 2
 /// `c[k]` during type inference, and the check against `Int@3`
 /// specifically fails.
 #[test]
-fn proven_lookup_2() {
-    check_compile_error(
+fn checked_lookup_keyed_by_list_element() {
+    check_scalar(
         indoc! {r#"
 c = [1,2,3]
-k = c[1]
-c[k] == 3
+k = c[1]!
+c[k] == Option::some(3)
         "#},
-        "expected 0..3, found Int@3",
+        Value::Bool(true),
     )
 }
 
-/// The codomain of `c` has `Int@1`, `Int@2`, and `Int@2` as lower
-/// bounds. Each is checked against the domain of `c` for the lookup
-/// `c[k]` during type inference, and they all pass, so inference
-/// passes. However, the codomain type of `c` is settled as simply
-/// `Int`. And so the check after inference fails.
+/// TODO: Fix coalescence for codomain of list. Here, inference passes
+/// for the final proven lookup because all lower bounds of `k`'s type
+/// satisfy `c`'s domain. But after coalescence, `k` holds type `Int`,
+/// which is no-longer specific enough.
 #[test]
-fn proven_lookup_3() {
+fn proven_lookup_keyed_by_list_element_lost_in_coalescence() {
     check_compile_error(
         indoc! {r#"
 c = [1,2,2]
-k = c[1]
-c[k] == 3
+k = c[1]!
+c[k]! == 2
         "#},
-        "post-inference produced an invalid tree: [Type mismatch for Apply: expected 0..3, found Int]",
+        "post-inference produced an invalid tree",
+    )
+}
+
+#[test]
+fn proven_lookup_out_of_range_key_rejected() {
+    check_compile_error(
+        indoc! {r#"
+c = [1,2,3]
+k = c[4]!
+c[k] == Option::some(3)
+        "#},
+        "expected 0..3, found Int@4",
     )
 }

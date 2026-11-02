@@ -5598,12 +5598,9 @@ fn total_subscript_demands_a_provable_index() {
 /// `[…]` means **collection lookup only**, and `.0` / `.name` mean projection — disjoint
 /// spellings, so lowering never has to guess which operation a subscript was.
 ///
-/// The **proven** form does not type-check for a range domain: an `Array(3, 𝑇)`'s domain is
-/// the range `0..3`, which relates only by equality, so no integer carries the membership
-/// proof a total lookup needs and there is no refinement for the checked form to relax
-/// either (`src/ccl/design/collections.md`, "Lookup: membership discharge"). What this pins
-/// is that the *rejection* is uniform — `xs[0]`, `xs[i]` and `xs(0)` are one operation and
-/// fail alike — so none of them is quietly reinterpreted as projection.
+/// The proven lookup on a range domain discharges its membership obligation for an in-range
+/// key. `xs[0]!`, `xs[i]!` and `xs(0)` are one operation and type-check alike, so none of
+/// them is reinterpreted as projection.
 #[test]
 fn subscript_is_lookup_and_dot_is_projection() {
     // Projection: both keys, on the shapes that have them.
@@ -5621,17 +5618,12 @@ fn subscript_is_lookup_and_dot_is_projection() {
         "a tuple has no domain to look up in"
     );
 
-    // BUG: these valid lookups should have type Int and evaluate to 10. All three spellings
-    // fail the same undischarged-membership edge. Replace rejection with success when fixed.
     for program in [
         "xs = [10, 20, 30]\nxs[0]!",
         "xs = [10, 20, 30]\ni = 0\nxs[i]!",
         "xs = [10, 20, 30]\nxs(0)",
     ] {
-        assert!(
-            !infer_program_err(program).is_empty(),
-            "BUG pin: valid range lookup now succeeds; replace this rejection assertion: {program}"
-        );
+        assert_eq!(infer_program(program), int(), "{program}");
     }
 }
 
@@ -5672,16 +5664,12 @@ fn a_key_dependent_lookup_discharges_the_key_binder() {
     );
 }
 
-/// Range domains and tuple targets are rejected. A bounded parameter remains unresolved
-/// at emission, whereas the exact Map annotation exposes its keyed type.
+/// Tuple targets are rejected. A bounded parameter remains unresolved at emission, whereas
+/// the exact Map annotation exposes its keyed type. A range domain accepts any `Int` key.
 /// See `src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]`".
 #[test]
 fn checked_lookup_boundaries() {
     for (program, why) in [
-        (
-            "xs = [10, 20, 30]\nxs[0]",
-            "a range domain has no membership refinement",
-        ),
         (
             "def f(m <: Map(Int, Int)):\n    m[1]\nf",
             "a bounded parameter is unresolved where the relaxation runs",
@@ -5696,9 +5684,9 @@ fn checked_lookup_boundaries() {
     // A range's membership is its bound, so the checked lookup relaxes the key to `Int` and
     // answers a key on either side of the range.
     for program in [
-        "xs = [10, 20, 30]\nxs[0]?",
-        "xs = [10, 20, 30]\nxs[5]?",
-        "xs = [10, 20, 30]\nxs[-1]?",
+        "xs = [10, 20, 30]\nxs[0]",
+        "xs = [10, 20, 30]\nxs[5]",
+        "xs = [10, 20, 30]\nxs[-1]",
     ] {
         assert_eq!(
             infer_program(program).to_string(),
@@ -5707,7 +5695,7 @@ fn checked_lookup_boundaries() {
         );
     }
     assert!(
-        !infer_program_err("xs = [10, 20, 30]\nxs[\"nope\"]?").is_empty(),
+        !infer_program_err("xs = [10, 20, 30]\nxs[\"nope\"]").is_empty(),
         "a String key must not reach a range"
     );
     // The exact form binds `m` at `Map(Int, Int)` itself, so the relaxation has a domain
