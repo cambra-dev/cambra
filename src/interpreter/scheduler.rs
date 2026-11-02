@@ -4,6 +4,7 @@ use std::{
     rc::{Rc, Weak},
 };
 
+use crate::ccl::FieldKey;
 use crate::interpreter::CurryLevel;
 use crate::interpreter::{
     Consumer, DataSourceDomainExtentImpl, Projection, tile_operators::Notified,
@@ -154,15 +155,12 @@ pub fn shared_consumer(consumer: Box<dyn Consumer>) -> (GatedConsumer, Gate) {
 /// and `dyn Consumer` is not. Wrapping the wake in a closure gives the blanket
 /// impl something sized to bite on.
 ///
-/// The consumer forwards every notification as [`Projection::Everything`]: an input's keys say
-/// nothing of the operator's own unless the operator's outermost keys are its input's, which
-/// [`forwarding_consumer_keeping_keys`] is for.
+/// The consumer forwards every notification as [`Projection::Everything`] ([`widening`]): an
+/// input's keys say nothing of the operator's own unless the operator's outermost keys are its
+/// input's, which [`forwarding_consumer_keeping_keys`] is for, or its input's under a tag, which
+/// [`forwarding_consumer_tagging`] is for.
 pub fn forwarding_consumer(shared: &GatedConsumer, wakeups: &WakeupQueue) -> Box<dyn Consumer> {
-    Box::new(Forwarding {
-        gated: shared.clone(),
-        wakeups: wakeups.clone(),
-        keeps_keys: false,
-    })
+    widening(forwarding_consumer_keeping_keys(shared, wakeups))
 }
 
 /// [`forwarding_consumer`] for an input whose outermost keys are the operator's: its region is
@@ -174,8 +172,17 @@ pub fn forwarding_consumer_keeping_keys(
     Box::new(Forwarding {
         gated: shared.clone(),
         wakeups: wakeups.clone(),
-        keeps_keys: true,
     })
+}
+
+/// [`forwarding_consumer`] for an arm of a tagged union, whose outermost keys are the arm's keys
+/// under the arm's tag ([`tagging`]).
+pub fn forwarding_consumer_tagging(
+    shared: &GatedConsumer,
+    wakeups: &WakeupQueue,
+    tag: FieldKey,
+) -> Box<dyn Consumer> {
+    tagging(tag, forwarding_consumer_keeping_keys(shared, wakeups))
 }
 
 /// `consumer` behind a consumer that forwards every notification as [`Projection::Everything`].
@@ -213,22 +220,32 @@ impl Consumer for Restating {
     }
 }
 
-/// What [`forwarding_consumer`] returns.
+/// `consumer` behind a consumer that forwards each notification as the same keys under `tag`
+/// ([`Projection::tagged`]): an arm of a tagged union passes this to the arm's input, since
+/// the union's outermost keys are each arm's keys under the arm's tag.
+pub fn tagging(tag: FieldKey, consumer: Box<dyn Consumer>) -> Box<dyn Consumer> {
+    Box::new(Tagging(tag, consumer))
+}
+
+struct Tagging(FieldKey, Box<dyn Consumer>);
+
+impl Consumer for Tagging {
+    fn notify(&mut self, arrived: &Projection) {
+        self.1.notify(&arrived.tagged(&self.0));
+    }
+}
+
+/// What [`forwarding_consumer_keeping_keys`] returns: it passes each region on as it arrives,
+/// through the operator's gate. A wrapper in front of it restates the region ([`widening`],
+/// [`tagging`]).
 struct Forwarding {
     gated: GatedConsumer,
     wakeups: WakeupQueue,
-    keeps_keys: bool,
 }
 
 impl Consumer for Forwarding {
     fn notify(&mut self, arrived: &Projection) {
         let GatedConsumer { shared, admission } = &self.gated;
-        let everything = Projection::Everything;
-        let region = if self.keeps_keys {
-            arrived
-        } else {
-            &everything
-        };
         // A notification that re-enters a consumer already being notified is deferred to
         // the next drain of the wakeup queue. A recurrence's notification graph is cyclic,
         // and nesting closes a cycle through *two* inputs of one operator: the inner store
@@ -246,8 +263,8 @@ impl Consumer for Forwarding {
         // again on every poll after. One naming a key that has not passed is deferred, and
         // delivered as `Everything`, since the wakeup queue holds handles and not regions.
         match shared.try_borrow_mut() {
-            Ok(mut consumer) => consumer.notify(region),
-            Err(_) if admission.covers(region) => {}
+            Ok(mut consumer) => consumer.notify(arrived),
+            Err(_) if admission.covers(arrived) => {}
             Err(_) => self.wakeups.request(shared.clone()),
         }
     }
