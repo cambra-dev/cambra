@@ -159,9 +159,10 @@ impl Refusals {
             }
             ChlStmt::Discard(_) => self.refuse(stmt.span, "`@Discard` is not supported yet"),
             ChlStmt::Pub { keyword, stmt } => {
-                // The parser accepts `pub` only on a statement that introduces a member
-                // (`Stmt::Pub` in `chl-parser/src/ast.rs`); of those, a mutable variable,
-                // declared by `:=` or loaded by `@LoadFrom`, is not supported yet.
+                // The parser accepts `pub` only on the statements `pub_refusal` admits and
+                // on a loaded declaration (`load_from_tail`), both in
+                // `chl-parser/src/parser.rs`; of those, a mutable variable, declared by
+                // `:=` or loaded by `@LoadFrom`, is not supported yet.
                 if matches!(
                     stmt.node,
                     ChlStmt::MutAssign { .. } | ChlStmt::LoadFrom { .. }
