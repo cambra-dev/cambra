@@ -1060,9 +1060,9 @@ impl CommitProducer {
     fn writer_source<R>(&self, f: impl FnOnce(&dyn TileProducer) -> R) -> R {
         let [writer] = self.writer_producers.as_slice() else {
             panic!(
-                "a transaction store of {} writers has no consuming mode: a morsel names positions \
-                 of one writer's source",
-                self.writer_producers.len()
+                "{}",
+                self.no_consuming_mode()
+                    .expect("a store of one writer has a consuming mode")
             )
         };
         drive_source(&**writer, &mut Some(f))
@@ -1091,6 +1091,16 @@ impl SteppedStore for CommitProducer {
 /// drive and its body, is one pipeline; the operators inside it stay in pull mode. A deny commits
 /// nothing and progresses through the source's release alone.
 impl Breaker for CommitProducer {
+    fn no_consuming_mode(&self) -> Option<String> {
+        (self.writer_producers.len() != 1).then(|| {
+            format!(
+                "a transaction store of {} writers has no consuming mode: a morsel names positions \
+                 of one writer's source",
+                self.writer_producers.len()
+            )
+        })
+    }
+
     /// Drains the store until the writer's drive has released `guard` ([`consume_store`]).
     ///
     /// # Panics
@@ -2351,7 +2361,6 @@ impl TileProducer for CommitProducer {
         }
     }
 
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         Some(self)
     }
@@ -3398,17 +3407,14 @@ impl TileProducer for InductionStoreProducer {
         self.notifier.notify_if_changed(store)
     }
 
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         Some(self)
     }
 
-    #[cfg(test)]
     fn runs_in_rounds(&self) -> bool {
         true
     }
 
-    #[cfg(test)]
     fn read_cycle_again(&mut self) {
         let cycle = self
             .breaker
@@ -5858,7 +5864,6 @@ impl TileProducer for InductionDriverProducer {
 
     impl_producer_base!();
 
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         Some(self)
     }
@@ -5880,7 +5885,6 @@ impl TileProducer for InductionDriverProducer {
         self.step(&Projection::Everything)
     }
 
-    #[cfg(test)]
     fn next_position(&self) -> Option<Option<Vec<Value>>> {
         let next = self
             .source
