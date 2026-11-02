@@ -7,10 +7,8 @@ use indoc::indoc;
 
 use crate::ccl::context::{GlobalContext, compile_program};
 use crate::ccl::load::LoadedProgram;
-use crate::interpreter::dispatcher::{Planned, run_program};
-use crate::interpreter::{DataSink, Value};
-
-use std::sync::Arc;
+use crate::interpreter::Value;
+use crate::interpreter::dispatcher::{Planned, Refused, run_program};
 
 use super::TileProducer;
 
@@ -49,7 +47,7 @@ fn dispatched_with(
         .map(|name| ctx.register_test_sink(*name))
         .collect();
     let loaded = LoadedProgram::test(source);
-    let program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
+    let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
         .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
     // The operators stay alive through the run: the map holds the fan-outs the chains share.
     let _operators = ctx.take_operator_map();
@@ -64,12 +62,13 @@ fn dispatched_with(
                 .unwrap_or_else(|| panic!("{source} writes to sink {name}"))
         })
         .collect();
-    let targets: Vec<(_, Arc<dyn DataSink>)> = consumers
-        .iter()
-        .zip(&sinks)
-        .map(|(consumer, sink)| (consumer.clone(), sink.clone() as Arc<dyn DataSink>))
-        .collect();
-    let planned = run_program(&targets, rows);
+    let planned = run_program(&mut program, rows)
+        .unwrap_or_else(|refused| panic!("{refused}"))
+        .planned;
+    assert!(
+        program.done.try_recv().is_ok(),
+        "{source}: the run's last pull of each sink finds every sink done"
+    );
     let roots: Vec<_> = consumers
         .iter()
         .map(|consumer| consumer.borrow().producer_slot().clone())
@@ -109,10 +108,6 @@ fn dispatched_with(
         "{source}: a pull after the run stops at the breakers"
     );
     assert_eq!(values("holds a value after a later pull"), delivered);
-    assert!(
-        program.done.try_recv().is_ok(),
-        "{source}: a pull after the run finds every sink done"
-    );
     (delivered, planned)
 }
 
@@ -896,6 +891,85 @@ fn a_loop_nested_over_rows(#[case] source: &str) {
     answers_as_pull_mode_does(source, &["LoopScope", "SinkBreaker"]);
 }
 
+/// Why the planner refuses `source`, compiled with a test sink `out`.
+fn refusal(source: &str) -> Refused {
+    let loaded = LoadedProgram::test(source);
+    let mut ctx = GlobalContext::default();
+    ctx.defer_sink_pulls();
+    ctx.register_test_sink("out");
+    let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    let _operators = ctx.take_operator_map();
+    match run_program(&mut program, 1) {
+        Err(refused) => refused,
+        Ok(_) => panic!("{source} is refused"),
+    }
+}
+
+/// A condition on the inner position of a loop nested over rows is refused, and pull mode answers
+/// it. Its body selects a field of the record the inner drive renders, and the `SelectField`
+/// restates the outermost keys only (`src/interpreter/design-path-projections.md`, "Differences
+/// of nested guards").
+#[test]
+fn a_condition_in_a_loop_nested_over_rows_is_refused() {
+    let source = indoc! {"
+        out = test_sink()
+        acc := 0
+        for xs in [[1, 2], [3, 4]]:
+            for x in xs:
+                acc := acc + (x if x > 1 else 0)
+        out << acc
+    "};
+    let refused = refusal(source);
+    assert!(
+        refused.to_string().contains(
+            "SelectField in a nested loop's cycle is pulled at the keys of level 1 and restates \
+             the outermost keys only"
+        ),
+        "{refused}"
+    );
+
+    let loaded = LoadedProgram::test(source);
+    let mut ctx = GlobalContext::default();
+    let sink = ctx.register_test_sink("out");
+    let program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    assert!(
+        (0..100).any(|_| {
+            ctx.scheduler().check_for_notifications();
+            program.done.try_recv().is_ok()
+        }),
+        "{source} finishes in pull mode"
+    );
+    let written = sink.value().expect("the sink holds a value in pull mode");
+    let [binding] = written.as_function().as_slice() else {
+        panic!("{source} writes one value: {written:?}")
+    };
+    assert_eq!(binding.output, Value::Int(9));
+}
+
+/// A store per row of a comprehension, from a function whose loop runs once per row, runs in no
+/// loop's scope, so the planner refuses it.
+#[test]
+fn a_store_per_row_of_a_comprehension_is_refused() {
+    let source = indoc! {"
+        def fold_by(items) => Int:
+            n := 0
+            for x in items:
+                n := n + x
+            n
+
+        [fold_by(r) for r in [[1, 2], [3, 4]]]
+    "};
+    let refused = refusal(source);
+    assert!(
+        refused
+            .to_string()
+            .contains("runs in no pipeline outside its loop's scope"),
+        "{refused}"
+    );
+}
+
 /// A transaction store is the breaker of a pipeline of its own; its input is its one writer's
 /// source, cut into morsels of items, and the sink reads the store once it is terminal.
 #[rstest_log::rstest]
@@ -962,9 +1036,10 @@ fn a_transaction_store_of_two_writers_is_refused() {
     );
 }
 
-/// A loop over a live source runs in no pipeline: no run notifies the source's arrivals.
+/// A program that reads a live source runs in no pipeline: no run notifies the source's
+/// arrivals.
 #[test]
-#[should_panic(expected = "a store over a live source")]
+#[should_panic(expected = "reads a live source")]
 fn a_loop_over_a_live_source_is_refused() {
     dispatched_with(
         indoc! {"
@@ -1022,4 +1097,32 @@ fn a_guarded_loop_over_a_let_bound_list() {
         "},
         &["Memo", "LoopScope", "SinkBreaker"],
     );
+}
+
+/// A sink fed from two sites holds a tagged union of its feeds, which the run hands it arm by
+/// arm: the run's last pull closes the arms' statements over the union (`Tile::closed_over`),
+/// so the sink is done and holds both arms.
+#[rstest_log::rstest]
+fn a_sink_fed_from_two_sites(#[values(1, usize::MAX)] rows: usize) {
+    let source = indoc! {r#"
+        m = map([("a", 1)])
+        r = m["a"]?
+        s = m["b"]?
+        out = test_sink()
+        out << r
+        out << s
+    "#};
+    let mut ctx = GlobalContext::default();
+    ctx.defer_sink_pulls();
+    let sink = ctx.register_test_sink("out");
+    let loaded = LoadedProgram::test(source);
+    let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    let _operators = ctx.take_operator_map();
+    run_program(&mut program, rows).unwrap_or_else(|refused| panic!("{refused}"));
+    assert!(program.done.try_recv().is_ok(), "the sink is done");
+    let written = sink
+        .value()
+        .unwrap_or_else(|error| panic!("the sink holds a value: {error:?}"));
+    assert_eq!(written.as_function().len(), 2, "both feeds: {written:?}");
 }

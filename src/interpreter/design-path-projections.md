@@ -1,8 +1,7 @@
 # Projections that name a path
 
-Status: accepted. Stages 1 and 2 are built, and stage 3 runs in the dispatcher's tests
-(`tile_operators/program_run_tests.rs`). The decisions are listed under [Decisions](#decisions), and
-the work lands in the [stages](#stages) below.
+Status: accepted. Stages 1 to 3 are built. The decisions are listed under [Decisions](#decisions),
+and the work lands in the [stages](#stages) below.
 
 A projection names the part of a producer's tile a pull asks for, and a push names the region a
 pipeline breaker decided (`src/interpreter/design-operators.md`, "Projection guards"). This note
@@ -107,6 +106,14 @@ released  = Or [ Domain(k = 0), Codomain(Record { _0: ∅, _1: Domain(Qualified 
 held − released = Domain(k ≠ 0)
 ```
 
+An arm of cells that names part of what is left leaves a record guard beneath the held keys, which
+is no region of keys, and `guard_minus` panics on it. A breaker's finish pushes its final guard as a
+region of keys (`Dispatcher::land_in`), which `Projection::of` reads, so a finish cannot push cells
+beneath a path. `SelectField` restates the outermost keys only, since a selector pulled at a path
+leaves the inner loop's drive holding the selected field's cells beneath a path it has not pushed.
+The planner refuses a loop nested over rows that pulls one there
+(`a_condition_in_a_loop_nested_over_rows_is_refused`).
+
 A round pushes per position, so it needs the difference, where a push at a finish only names the
 breaker's whole held region.
 
@@ -117,15 +124,16 @@ regions.
 ## Operator rows
 
 Each row of the table under "Projection guards" in `design-operators.md` gains what the operator
-does with a projection at level 𝑛 > 0. The rows fall into five kinds:
+does with a projection at level 𝑛 > 0. The rows fall into six kinds:
 
 | Kind | Operators | A projection at level 𝑛 |
 | --- | --- | --- |
 | Keeps every level's keys | `MapResultWithSource`, `Filter` (with a collection predicate, the levels down to the masked one), `Restrict`, `MapDomain`, `VariantProject`, `VariantIs`, `Memo`, `FanOutSlot`, `IterateExtent`, `MapAggregate`, `MapExtractAggregate` (the levels of its input, not those of a `Sole` collection beneath them) | pulls each keyed input at the same projection and cuts its answer to it |
 | Keeps the keys above its level | `MapResult` (keyed input), `MapResultToConst`, `RecordWrap`, `Zip`, `VariantWrap`, `Product` | pulls each keyed input at a projection above its level and refuses one at or beneath it, or, for `Product`, pulls both sides at the rows above its paired level and cuts the pairs |
 | Shifts levels | `Uncurry`, `Converse` beneath standing levels, a nested store's read | restates the projection by the levels it adds or removes |
-| Reads whole and cuts | `PermuteRecordDomain`, `FlattenTupleDomain`, `SelectField` over a product, `CheckedLookup`'s collection, `UnionOperator` | reads its input whole and cuts the answer at level 𝑛 |
+| Reads whole and cuts | `PermuteRecordDomain`, `FlattenTupleDomain`, `CheckedLookup`'s collection, `UnionOperator` | reads its input whole and cuts the answer at level 𝑛 |
 | No keys beneath | `Aggregate`, `ExtractAggregate`, `ExtractFinal`, `MakeRecord`, `Constant` scalar | refuses, as it refuses keys today |
+| Restates the outermost keys only | `SelectField` (a stream of records, and a product of collections) | refuses, since a finish cannot push cells beneath a path ([Differences of nested guards](#differences-of-nested-guards)) |
 
 An operator that keeps its input's keys above its own level and computes the values beneath them
 refuses a projection at or beneath that level (`Restates::Above`): those keys are inside the values
@@ -153,10 +161,12 @@ A loop nested in another runs as a scope inside the outer loop's scope, queued a
 per outer round: the inner scope's rounds are the positions `(k, j)` of row `k` the inner drive
 emits, and a round at the row closes it.
 
-The planner panics on a nested loop where an operator its rounds pull beneath the outermost keys
-restates no projection there (`Planner::refusal_of_nested`). It composes the levels along each path
-from an inner pipeline's breaker: `TileProducer::restates` says what an operator accepts, and
-`TileProducer::input_level` the level it pulls each input at. There is no folded execution.
+The planner refuses a nested loop where an operator its rounds pull beneath the outermost keys
+restates no projection there (`Planner::refusal_of_nested`), and the program runs in pull mode. It
+composes the levels along each path from an inner pipeline's breaker: `TileProducer::restates` says
+what an operator accepts, and `TileProducer::input_level` the level it pulls each input at. There is
+no folded execution. No program of the differential suite is refused this way
+(`tests/it/dispatch_refused.txt`).
 
 ## Stages
 
@@ -184,5 +194,5 @@ from an inner pipeline's breaker: `TileProducer::restates` says what an operator
   pushing only at a finish.
 - A difference closes an arm against the extent of the row it names, so an arm that names no
   position of its row reads as `Nothing`.
-- A nested loop whose rounds pull an operator with no nested row is refused; no loop folds into the
-  scope around it.
+- A nested loop whose rounds pull an operator with no nested row is refused and runs in pull mode;
+  no loop folds into the scope around it.
