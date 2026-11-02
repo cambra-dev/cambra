@@ -95,19 +95,15 @@ impl Refusals {
         // (`docs/chl-spec.md`, "8.9 `@Discard` \[Decided\]"). Loading follows only
         // top-level `import` and `run` statements, so a nested one names no module.
         if self.depth > 0 {
-            let keyword = match &stmt.node {
-                ChlStmt::Import { .. } => Some("import"),
-                ChlStmt::Run { .. } => Some("run"),
-                ChlStmt::Param { .. } => Some("param"),
-                ChlStmt::Pub { .. } => Some("pub"),
-                ChlStmt::Discard(DiscardHead::Run { .. }) => Some("@Discard run"),
+            let refused = match &stmt.node {
+                ChlStmt::Import { .. } => Some(("import", stmt.span)),
+                ChlStmt::Run { .. } => Some(("run", stmt.span)),
+                ChlStmt::Param { .. } => Some(("param", stmt.span)),
+                ChlStmt::Pub { keyword, .. } => Some(("pub", *keyword)),
+                ChlStmt::Discard(DiscardHead::Run { .. }) => Some(("@Discard run", stmt.span)),
                 _ => None,
             };
-            if let Some(keyword) = keyword {
-                let span = match &stmt.node {
-                    ChlStmt::Pub { keyword, .. } => *keyword,
-                    _ => stmt.span,
-                };
+            if let Some((keyword, span)) = refused {
                 return self.refuse(
                     span,
                     format!("`{keyword}` stands only at a module's top level"),
@@ -163,26 +159,22 @@ impl Refusals {
             }
             ChlStmt::Discard(_) => self.refuse(stmt.span, "`@Discard` is not supported yet"),
             ChlStmt::Pub { keyword, stmt } => {
-                match &stmt.node {
-                    ChlStmt::Assign { .. }
-                    | ChlStmt::AnnAssign { .. }
-                    | ChlStmt::FunctionDef { .. } => {}
-                    ChlStmt::MutAssign { .. } | ChlStmt::LoadFrom { .. } => {
-                        self.refuse(*keyword, "a public mutable variable is not supported yet")
-                    }
-                    // `pub` on a `type` exports it, and on any other statement it is a
-                    // parse error.
-                    _ => {}
+                // The parser accepts `pub` only on a statement that introduces a member
+                // (`Stmt::Pub` in `chl-parser/src/ast.rs`); of those, a mutable variable,
+                // declared by `:=` or loaded by `@LoadFrom`, is not supported yet.
+                if matches!(
+                    stmt.node,
+                    ChlStmt::MutAssign { .. } | ChlStmt::LoadFrom { .. }
+                ) {
+                    self.refuse(*keyword, "a public mutable variable is not supported yet");
                 }
                 // The statement `pub` marks is checked as any other.
                 self.stmt(stmt);
             }
             ChlStmt::Expr(e) | ChlStmt::Return(Some(e)) => self.expr(e),
-            ChlStmt::Assign { target, value, .. } | ChlStmt::Define { target, value } => {
-                self.target(target);
-                self.expr(value);
-            }
-            ChlStmt::AugAssign { target, value, .. } => {
+            ChlStmt::Assign { target, value, .. }
+            | ChlStmt::Define { target, value }
+            | ChlStmt::AugAssign { target, value, .. } => {
                 self.target(target);
                 self.expr(value);
             }
