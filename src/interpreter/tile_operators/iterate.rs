@@ -9,8 +9,8 @@ use std::{cell::RefCell, collections::HashMap, rc::Rc};
 use super::*;
 use crate::ccl::TagMap;
 use crate::interpreter::{
-    BaseType, ColumnValue, Consumer, Extent, NotifyOrSubscribeResult, Projection, Scheduler,
-    SharedConsumer, UnionArm, Value, scheduler::shared_consumer,
+    BaseType, ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, NotifyOrSubscribeResult,
+    Projection, Scheduler, SharedConsumer, UnionArm, Value, scheduler::shared_consumer,
 };
 
 /// Produces a function tile whose domain and codomain both equal `extent`.
@@ -362,6 +362,13 @@ impl Drop for IterateExtentProducer {
 
 impl TileProducer for IterateExtentProducer {
     impl_producer_base!();
+
+    fn data_sources(&self) -> Vec<Rc<RefCell<dyn DataSourceDomainExtentImpl>>> {
+        let mut sources = Vec::new();
+        self.extent
+            .for_each_source(&mut |source| sources.push(source.clone()));
+        sources
+    }
 
     /// The extent's positions inside the projection. A finite range is cut before it is
     /// rendered, so a morsel costs the morsel's size; every other extent renders whole and is

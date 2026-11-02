@@ -32,7 +32,7 @@ use crate::interpreter::{
 mod loop_scope;
 mod plan;
 
-pub use plan::{Planned, Refused, Run, run_program};
+pub use plan::{Planned, Refused, Run, run_program, run_program_polling};
 
 /// A pipeline, by its index in the [`Dispatcher`].
 #[derive(Clone, Copy)]
