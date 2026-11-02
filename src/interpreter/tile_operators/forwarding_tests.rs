@@ -1,6 +1,7 @@
 //! The region an operator's consumer receives for a region of keys that changed at one of its
 //! inputs: the keys unchanged where the operator's row of the projection table pulls that input
-//! at the projection, and `Everything` where it re-keys or reads the input whole.
+//! at the projection, the keys under the arm's tag for an arm of a tagged union, and `Everything`
+//! where it re-keys or reads the input whole.
 //! See `src/interpreter/design-operators.md`, "The notification contract".
 
 use smol_str::SmolStr;
@@ -287,11 +288,72 @@ fn a_flat_union_forwards_the_region_of_each_arm() {
     assert_keeps_without_state(&|| union(true), 1);
 }
 
-/// A tagged union keys its rows by arm, which a region of plain keys does not name.
+/// `keys` of a tagged union's arm `arm`, as the union's own keys.
+fn under_arm(arm: usize, keys: Predicate) -> Projection {
+    Projection::admitting(Predicate::tagged(
+        crate::ccl::TagMap::from_arms(vec![(crate::ccl::FieldKey::Index(arm), keys)]),
+        false,
+    ))
+}
+
+/// The keys of a region of the test streams.
+fn keys_of(region: &Projection) -> Predicate {
+    match region {
+        Projection::Keys { keys, .. } => keys.clone(),
+        other => panic!("a region of keys: {other:?}"),
+    }
+}
+
+/// A tagged union keys an arm's rows by the arm's keys under its tag, so an arm's region reaches
+/// the union's consumer under that tag, and `Everything` as every key under it.
 #[test]
-fn a_tagged_union_sends_everything_for_any_region() {
-    assert_widens(&|| union(false), 0);
-    assert_widens(&|| union(false), 1);
+fn a_tagged_union_forwards_the_region_of_each_arm_under_its_tag() {
+    for arm in [0, 1] {
+        assert_eq!(
+            received(&|| union(false), arm, &region()),
+            [under_arm(arm, keys_of(&region()))]
+        );
+        assert_eq!(
+            received(&|| union(false), arm, &Projection::Everything),
+            [under_arm(arm, Predicate::True)]
+        );
+    }
+}
+
+/// A tagged union's arms notify one region of their own keys between pulls, which names different
+/// keys of the union under each arm's tag, so the union's gate passes both.
+#[test]
+fn a_tagged_union_passes_the_regions_of_two_arms_between_pulls() {
+    let (mut operator, inputs) = union(false);
+    let (log, regions) = RegionLog::new();
+    let guard = operator.tiling().universal_guard();
+    let _producer = operator.subscribe(guard, Box::new(log), &mut Scheduler::new());
+    regions.borrow_mut().clear();
+    notify_input(&inputs[0], &region());
+    notify_input(&inputs[1], &region());
+    assert_eq!(
+        *regions.borrow_mut(),
+        [
+            under_arm(0, keys_of(&region())),
+            under_arm(1, keys_of(&region()))
+        ]
+    );
+}
+
+/// A bounded region stays bounded through a fan-out slot under the arm of a tagged union: the
+/// union restates it under the arm's tag and narrows nothing to `Everything`.
+#[test]
+fn a_region_crosses_a_fan_out_slot_and_a_tagged_union() {
+    let (input, consumer) = feed(ints());
+    let fan = FanOut::new(input);
+    let (other, _) = feed(ints());
+    let mut union = UnionOperator::new(vec![other, fan.slot()], int());
+    let (log, regions) = RegionLog::new();
+    let guard = union.tiling().universal_guard();
+    let _producer = union.subscribe(guard, Box::new(log), &mut Scheduler::new());
+    regions.borrow_mut().clear();
+    notify_input(&consumer, &region());
+    assert_eq!(*regions.borrow_mut(), [under_arm(1, keys_of(&region()))]);
 }
 
 fn lookup(keys: Tiling) -> Built {

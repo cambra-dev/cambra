@@ -743,13 +743,15 @@ its next pull, and one that acts on the region, as a memo marks it dirty, has ma
 **Forwarding.** An operator keeps an input's keys, forwarding its region unchanged, only if its row
 of the "Projection guards" table pulls that input at the projection and the input's keys are the
 operator's own output keys: a region of changed input keys is then a region of possibly changed
-output keys, and a changed completeness statement at a key is a change at that key. An operator that
-re-keys, or reads an input whole, sends `Everything` for that input, since it cannot say which of
-its own keys changed. `MapResult`'s function operand is pulled at the projection where the input's
-values are its keys, and still widens: its keys are the values looked up, not the result's keys. A
-producer with no keys of its own notifies `Everything` whatever it is read through. Where a row
-depends on the input's shape, the operator decides from its tiling when it subscribes, as its
-`get_impl` does when it pulls.
+output keys, and a changed completeness statement at a key is a change at that key. A tagged union
+restates an arm's region as the same keys under the arm's tag (`forwarding_consumer_tagging`),
+since its outermost keys are its arms' keys by tag. An operator that re-keys otherwise, or reads an
+input whole, sends `Everything` for that input, since it cannot say which of its own keys changed.
+`MapResult`'s function operand is pulled at the projection where the input's values are its keys,
+and still widens: its keys are the values looked up, not the result's keys. A producer with no keys
+of its own notifies `Everything` whatever it is read through. Where a row depends on the input's
+shape, the operator decides from its tiling when it subscribes, as its `get_impl` does when it
+pulls.
 
 | Operator | Input | Notification | Reason |
 | --- | --- | --- | --- |
@@ -767,7 +769,7 @@ depends on the input's shape, the operator decides from its tiling when it subsc
 | `Filter` | the predicate, the input | keeps for a side that is a collection, else widens | A collection side shares the mask's keys; the other is read whole. |
 | `Uncurry` | the input | keeps beneath a standing level, widens at the outermost | Pairing the outermost collection re-keys it. |
 | `Converse` | the input | keeps the standing keys, and restates the inverted level's keys one level in, beneath every value (`scheduler::one_level_in`) | Each input key stands beneath exactly one value. |
-| `UnionOperator` | every arm | keeps for a flat union, widens for a tagged one | Flat arms are disjoint slices of one collection; a tagged union keys its rows by arm. |
+| `UnionOperator` | every arm | keeps for a flat union, restates under the arm's tag for a tagged one | Flat arms are disjoint slices of one collection; a tagged union keys an arm's rows by the arm's keys under its tag, and `Everything` of an arm is every key under that tag. |
 | `CheckedLookup` | a stream of keys, or the pairs | keeps | Each answer sits at its key's position. |
 | `CheckedLookup` | one key | widens | One key has no keys to project. |
 | `CheckedLookup` | the collection | widens | Every key is answered against all of it. |
