@@ -721,6 +721,12 @@ impl Trait {
         operands: &[Type],
         assoc: &[(Assoc, Type)],
     ) -> HashMap<TypeParamId, Type> {
+        debug_assert_eq!(
+            operands.len(),
+            self.operands.len(),
+            "`{self}` is over {} operand(s); its parameters are mapped at as many types",
+            self.operands.len()
+        );
         let mut at: HashMap<TypeParamId, Type> = self
             .operands
             .iter()
