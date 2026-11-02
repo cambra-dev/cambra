@@ -195,13 +195,12 @@ enum Inner {
     Store(Rc<RefCell<Box<dyn TileProducer>>>),
 }
 
-/// The cell a cyclic fan-out holds its store in ([`Inner::Store`]), which a test reaches.
-#[cfg(test)]
+/// The cell a cyclic fan-out holds its store in ([`Inner::Store`]), which a planner reaches.
+// shared-state-ok: the name of the cell `Inner::Store` holds, which a planner reaches to drive
+// the store as a pipeline breaker; what crosses it is the producer, never a tile.
 pub(crate) type StoreCell = Rc<RefCell<Box<dyn TileProducer>>>;
 
-/// A cyclic fan-out as a reader slot of it names it to a test driver
-/// (`TileProducer::store_read`).
-#[cfg(test)]
+/// A cyclic fan-out as a reader slot of it names it to a planner (`TileProducer::store_read`).
 pub struct StoreRead {
     /// The fan-out's id, which every slot's producer names.
     pub(crate) fan: usize,
@@ -853,7 +852,6 @@ impl TileProducer for FanOutProducer {
         }
     }
 
-    #[cfg(test)]
     fn store_read(&self) -> Option<StoreRead> {
         let FanHold::Reader { shared, .. } = &self.hold else {
             return None;
@@ -1378,7 +1376,6 @@ impl TileProducer for MemoProducer {
         self.arrivals.record(&Projection::Everything);
     }
 
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         Some(self)
     }

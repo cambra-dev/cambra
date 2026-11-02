@@ -973,9 +973,8 @@ pub struct GlobalContext {
     /// The sources and sinks the program holds open, which outlive any one
     /// version of it.
     sources_and_sinks: SourceSinkRegistry,
-    /// Whether a compile leaves each sink unpulled, for a test that runs the
-    /// sinks as pipelines of the program ([`Self::defer_sink_pulls`]).
-    #[cfg(test)]
+    /// Whether a compile leaves each sink unpulled, for a dispatched run that
+    /// takes the sinks as pipelines of the program ([`Self::defer_sink_pulls`]).
     sink_pulls_deferred: bool,
 }
 
@@ -992,7 +991,6 @@ impl GlobalContext {
             conversion: OpConversionContext::new(),
             scheduler: Scheduler::new(),
             sources_and_sinks: SourceSinkRegistry::default(),
-            #[cfg(test)]
             sink_pulls_deferred: false,
         };
         let stdin = Rc::new(RefCell::new(StdinDataSource::new()));
@@ -1013,7 +1011,6 @@ impl GlobalContext {
             conversion: OpConversionContext::new(),
             scheduler: Scheduler::new(),
             sources_and_sinks: SourceSinkRegistry::default(),
-            #[cfg(test)]
             sink_pulls_deferred: false,
         }
     }
@@ -1165,20 +1162,16 @@ impl GlobalContext {
         self.sources_and_sinks.sources.insert(name, source);
     }
 
-    /// Compile without the pull each sink takes once it is subscribed, so a
-    /// test runs the sinks as pipelines of the program
-    /// (`crate::interpreter::dispatcher::run_program`).
-    #[cfg(test)]
-    pub(crate) fn defer_sink_pulls(&mut self) {
+    /// Compile without the pull each sink takes once it is subscribed, so a dispatched run takes
+    /// the sinks as pipelines of the program
+    /// ([`run_program`](crate::interpreter::dispatcher::run_program)).
+    pub fn defer_sink_pulls(&mut self) {
         self.sink_pulls_deferred = true;
     }
 
     /// Whether a compile pulls each sink once it is subscribed.
     fn pulls_sinks(&self) -> bool {
-        #[cfg(test)]
-        return !self.sink_pulls_deferred;
-        #[cfg(not(test))]
-        true
+        !self.sink_pulls_deferred
     }
 
     /// Supply the sink that `name = test_sink()` binds, and keep a handle on it.
@@ -1334,9 +1327,19 @@ pub struct CompiledProgram {
     /// the compilation that built it; the producers under a kept operator are
     /// read off its fan-out instead ([`OperatorMap::source_producers`]).
     pub source_producers: HashSet<String>,
+    /// Whether the compile left out the pull each sink takes once subscribed
+    /// ([`GlobalContext::defer_sink_pulls`]), which a dispatched run needs: a sink pulled in pull
+    /// mode has run part of the program already.
+    sink_pulls_deferred: bool,
 }
 
 impl CompiledProgram {
+    /// Whether the compile left out the pull each sink takes once subscribed, which a dispatched
+    /// run needs ([`GlobalContext::defer_sink_pulls`]).
+    pub fn sink_pulls_deferred(&self) -> bool {
+        self.sink_pulls_deferred
+    }
+
     /// Every file the program was compiled from.
     ///
     /// Inspector queries need the source text to produce snippets (`hover`'s
@@ -3118,6 +3121,7 @@ fn compile_version(
         loaded: program.clone(),
         routes,
         source_producers,
+        sink_pulls_deferred: !ctx.pulls_sinks(),
     };
 
     // Optionally check the compiled program's selected pane pairs.
