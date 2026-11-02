@@ -1451,9 +1451,23 @@ impl Default for InstanceTable {
     }
 }
 
+/// Whether a function whose parameters are passed by reference where `by_reference` says so
+/// takes them one at a time: several, one of them a `Mut` or `Feed` parameter, whose argument
+/// reaches the body only through a named binder (`lower::functions`). A `def`, a trait's
+/// signature and the type of either decide it here.
+pub fn is_curried(by_reference: &[bool]) -> bool {
+    by_reference.len() > 1 && by_reference.iter().any(|b| *b)
+}
+
 /// The type of a function over `inputs`, as a `def` over them lowers: over the one input,
-/// or over the tuple of several.
+/// over the tuple of several, or one at a time where [`is_curried`].
 pub fn function_over(inputs: &[Type], output: Type) -> Type {
+    let by_reference: Vec<bool> = inputs.iter().map(|t| t.history_parts().is_some()).collect();
+    if is_curried(&by_reference) {
+        return inputs.iter().rev().fold(output, |acc, input| {
+            crate::ccl::infer::solver::fun(input.clone(), acc)
+        });
+    }
     let domain = match inputs {
         [one] => one.clone(),
         several => Type::Tuple(several.to_vec()),

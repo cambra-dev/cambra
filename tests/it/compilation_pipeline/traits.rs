@@ -2446,3 +2446,170 @@ fn a_hole_in_a_bound_is_spelled_by_its_member() {
         "of _::Elements",
     );
 }
+
+/// A trait's signature states a pass-by-reference parameter as a `def` does, `Mut(V, Txn)` or
+/// `Feed(V)`: the caller's variable or feed is the argument, and an instance's function
+/// writes it, called directly, through a requirement, or through a requirement that passes
+/// the module's own variable (`docs/chl-spec.md`, "Declaring a trait").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_direct_call(
+    indoc! {"
+        stock: Mut(Int, Txn) := 10
+        type Box = Int
+        trait Take(T):
+            def take(t: T, s: Mut(Int, Txn), n: Int) => Int
+        instance Take(Box):
+            def take(t, s, n):
+                with begin():
+                    s := s - n
+                n
+        summon(Take(Box))::take(Box::new(1), stock, 3)
+        await_final(stock)
+    "},
+    7
+)]
+#[case::through_a_requirement(
+    indoc! {"
+        stock: Mut(Int, Txn) := 10
+        type Box = Int
+        trait Take(T):
+            def take(t: T, s: Mut(Int, Txn), n: Int) => Int
+        instance Take(Box):
+            def take(t, s, n):
+                with begin():
+                    s := s - n
+                n
+        def generic(T, a: T, st: Mut(Int, Txn), n: Int) requires t: Take(T):
+            t::take(a, st, n)
+        generic(Box::new(1), stock, 3)
+        await_final(stock)
+    "},
+    7
+)]
+#[case::a_requirement_passing_the_module_s_variable(
+    indoc! {"
+        stock: Mut(Int, Txn) := 10
+        type Box = Int
+        trait Take(T):
+            def take(t: T, s: Mut(Int, Txn), n: Int) => Int
+        instance Take(Box):
+            def take(t, s, n):
+                with begin():
+                    s := s - n
+                n
+        def generic(T, a: T, n: Int) requires t: Take(T):
+            t::take(a, stock, n)
+        generic(Box::new(1), 3)
+        await_final(stock)
+    "},
+    7
+)]
+#[case::a_feed(
+    indoc! {"
+        type Box = Int
+        trait Put(T):
+            def put(t: T, o: Feed(Int), n: Int) => Int
+        instance Put(Box):
+            def put(t, o, n):
+                o << n
+                n
+        out: Feed(Int)
+        summon(Put(Box))::put(Box::new(1), out, 3)
+        sum(out)
+    "},
+    3
+)]
+#[case::a_single_transactional_parameter(
+    indoc! {"
+        type Amount = Int
+        stock: Mut(Amount, Txn) := Amount::new(10)
+        trait Bump(T):
+            def bump(s: Mut(T, Txn)) => Int
+        instance Bump(Amount):
+            def bump(s):
+                with begin():
+                    s := Amount::new(s.extract() + 1)
+                0
+        summon(Bump(Amount))::bump(stock)
+        await_final(stock).extract()
+    "},
+    11
+)]
+#[case::an_instance_restating_the_parameter(
+    indoc! {"
+        stock: Mut(Int, Txn) := 10
+        type Box = Int
+        trait Take(T):
+            def take(t: T, s: Mut(Int, Txn), n: Int) => Int
+        instance Take(Box):
+            def take(t, s: Mut(Int, Txn), n):
+                with begin():
+                    s := s - n
+                n
+        summon(Take(Box))::take(Box::new(1), stock, 3)
+        await_final(stock)
+    "},
+    7
+)]
+#[case::an_induction_variable(
+    indoc! {"
+        type Box = Int
+        trait Add(T):
+            def add(t: T, c: Mut(Int), n: Int) => Int
+        instance Add(Box):
+            def add(t, c, n):
+                c += n
+                n
+        t := 0
+        x = summon(Add(Box))::add(Box::new(0), t, 4)
+        for y in [1, 2]:
+            summon(Add(Box))::add(Box::new(0), t, y)
+        t + x
+    "},
+    11
+)]
+fn a_trait_function_takes_a_history_parameter(#[case] code: &str, #[case] expected: i64) {
+    super::helpers::check_program_scalar(&super::modules::program(code, &[]), Value::Int(expected));
+}
+
+/// `Mut` and `Feed` state a parameter, not a type: nested in another type or as a result they
+/// are refused, in a trait's signature as anywhere.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::nested_in_a_parameter(
+    indoc! {"
+        trait Take(T):
+            def take(t: T, xs: List(Mut(Int))) => Int
+        1
+    "}
+)]
+#[case::as_the_result(
+    indoc! {"
+        trait Take(T):
+            def take(t: T) => Mut(Int)
+        1
+    "}
+)]
+fn a_trait_signature_refuses_history_types_beyond_parameters(#[case] code: &str) {
+    check_compile_error(code, "unknown type application");
+}
+
+/// An instance restating a pass-by-reference parameter states the signature's history type, so
+/// one of another kind is refused.
+#[test]
+fn an_instance_restating_a_parameter_states_its_history() {
+    check_compile_error(
+        indoc! {"
+            stock: Mut(Int, Txn) := 10
+            type Box = Int
+            trait Take(T):
+                def take(t: T, s: Mut(Int, Txn), n: Int) => Int
+            instance Take(Box):
+                def take(t, s: Mut(Int), n):
+                    n
+            1
+        "},
+        "parameter `s` of `take` is annotated",
+    );
+}

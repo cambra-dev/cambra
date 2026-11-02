@@ -4330,8 +4330,8 @@ trait Scales(V, F):
   own types and satisfies the clause there. A signature is a written type, so one without a `causes`
   clause causes nothing, and an associated type `Name <: Effect` lets instances cause different
   effects ([Effects in traits](#effects-in-traits)).
-- **A parameter may be pass-by-reference** (**[Decided]**). `Mut(V)`, `Mut(V, Txn)` and `Feed(V)`
-  state a parameter as they do on a `def` ([6.2 Non-purity as type
+- **A parameter may be pass-by-reference.** `Mut(V)`, `Mut(V, Txn)` and `Feed(V)` state a
+  parameter as they do on a `def` ([6.2 Non-purity as type
   wrappers](#62-non-purity-as-type-wrappers)): the caller's variable or feed is the argument, and an
   instance's function writes it. A signature states them nowhere else, neither nested in a type nor
   as the result. An instance's function takes the signature's parameter without restating it, and a

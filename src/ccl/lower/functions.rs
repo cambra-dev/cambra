@@ -379,10 +379,14 @@ pub(super) fn uncurry_params(
     Ok(lam)
 }
 
-/// Whether [`uncurry_params`] curries `params` into one lambda each, which it does for more
-/// than one parameter when one is a pass-by-reference `Mut` or `Feed` parameter.
+/// Whether [`uncurry_params`] curries `params` into one lambda each
+/// ([`is_curried`](crate::ccl::infer::solver::traits::is_curried)).
 fn is_curried(params: &[Param], ctx: &mut LoweringContext) -> bool {
-    params.len() > 1 && params.iter().any(|p| history_param_type(p, ctx).is_some())
+    let by_reference: Vec<bool> = params
+        .iter()
+        .map(|p| history_param_type(p, ctx).is_some())
+        .collect();
+    crate::ccl::infer::solver::traits::is_curried(&by_reference)
 }
 
 /// Stamp the lambda whose body is a `def`'s body, the innermost of the chain
