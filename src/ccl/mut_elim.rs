@@ -1365,12 +1365,7 @@ fn feeds_into(expr: &Expr, channel: &Name, out: &mut Vec<NodeId>) {
 
 /// Whether `body` writes a mutable variable anywhere.
 fn writes_a_mutable(body: &Expr) -> bool {
-    if matches!(body.node, TypedExprNode::MutWrite { .. }) {
-        return true;
-    }
-    let mut found = false;
-    body.walk_children(|child| found = found || writes_a_mutable(child));
-    found
+    matches!(body.node, TypedExprNode::MutWrite { .. }) || body.any_child(writes_a_mutable)
 }
 
 /// Destructure a (possibly refinement- or `Mut`-wrapped) function type.

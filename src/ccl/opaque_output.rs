@@ -87,19 +87,16 @@ fn has_concrete_result_annotation(expr: &Expr) -> bool {
 /// or barrier variable at any depth. A refinement's base is searched and its
 /// predicate is not: the predicate's own type slots are not part of `ty`.
 fn is_concrete(ty: &Type) -> bool {
-    if matches!(
-        ty,
-        Type::Hole
-            | Type::SharedHole(_)
-            | Type::BoundedHole(_)
-            | Type::Infer(_)
-            | Type::BarrierVar(_)
-    ) {
-        return false;
-    }
-    let mut concrete = true;
-    ty.walk_children(|child| concrete &= is_concrete(child));
-    concrete
+    !ty.holds_type(&|t| {
+        matches!(
+            t,
+            Type::Hole
+                | Type::SharedHole(_)
+                | Type::BoundedHole(_)
+                | Type::Infer(_)
+                | Type::BarrierVar(_)
+        )
+    })
 }
 
 /// Push onto `out` each opaque variable `expr` binds outside every lambda nested in it.

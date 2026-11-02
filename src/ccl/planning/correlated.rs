@@ -725,14 +725,9 @@ fn mentions_type(e: &Expr, old: &Type) -> bool {
                 .refinements()
                 .iter()
                 .any(|r| mentions_type(&r.predicate, old))
-            || {
-                let mut found = false;
-                ty.walk_children(|c| found |= in_type(c, old));
-                found
-            }
+            || ty.any_child(|c| in_type(c, old))
     }
     let mut found = false;
     e.walk_type_slots(|ty| found |= in_type(ty, old));
-    e.walk_children(|c| found |= mentions_type(c, old));
-    found
+    found || e.any_child(|c| mentions_type(c, old))
 }

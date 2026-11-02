@@ -1247,13 +1247,9 @@ fn builds_domain_reading(param: &Name, expr: &Expr) -> bool {
             }
             _ => false,
         };
-        let mut below = false;
-        e.walk_children(|c| below |= inside(param, c));
-        here || below
+        here || e.any_child(|c| inside(param, c))
     }
-    let mut below = false;
-    expr.walk_children(|c| below |= inside(param, c));
-    below
+    expr.any_child(|c| inside(param, c))
 }
 
 /// The refinements on the domains of the collections `body` reads at `binder`: the sources a

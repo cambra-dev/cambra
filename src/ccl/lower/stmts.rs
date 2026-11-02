@@ -2517,12 +2517,7 @@ fn is_requirement_operand(ty: &Type) -> bool {
 
 /// Whether `ty` names no type parameter.
 fn is_closed(ty: &Type) -> bool {
-    if matches!(ty, Type::Param(_)) {
-        return false;
-    }
-    let mut closed = true;
-    ty.walk_children(|c| closed &= is_closed(c));
-    closed
+    !ty.holds_type(&|t| matches!(t, Type::Param(_)))
 }
 
 fn is_product(ty: &Type) -> bool {
