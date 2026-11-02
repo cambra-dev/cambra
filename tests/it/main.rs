@@ -26,6 +26,7 @@ mod cli_driver_convergence;
 mod compilation_pipeline;
 mod constraint_order_fuzz;
 mod differential_interp;
+mod dispatch_cli;
 mod editor_grammars;
 mod generated_pairs;
 mod hot_reload;

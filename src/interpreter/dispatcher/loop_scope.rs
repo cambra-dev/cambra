@@ -2,12 +2,13 @@
 //! over the pipelines inside the loop's cycle, one inner epoch per position, and steps the
 //! loop's store after each. See `src/interpreter/design-operators.md`, "A loop in rounds".
 
+use super::plan::{Consumes, Members, Planned, plan_edges, reach_in_chain};
 use super::*;
 use crate::interpreter::tile_operators::StoreCell;
 
 /// Where a loop scope finds the breaker of one of its inner pipelines.
 pub(super) enum Member {
-    /// In the store's chain, by its address ([`address`]).
+    /// In the store's chain, by its address (`plan::address`).
     Chain(usize),
     /// The scope of a loop nested in this one, which runs the rounds of one row of its store per
     /// round, the row of the round's position.
@@ -572,6 +573,7 @@ impl Drop for Placed<'_> {
 mod tests {
     use indoc::indoc;
 
+    use super::super::plan::Planner;
     use super::*;
     use crate::ccl::context::{GlobalContext, compile_program};
     use crate::ccl::load::LoadedProgram;

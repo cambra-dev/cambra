@@ -210,7 +210,6 @@ impl TileProducer for AggregateProducer {
         visit("input", &mut *self.input);
     }
 
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         Some(self)
     }
@@ -447,7 +446,6 @@ impl TileProducer for ExtractAggregateProducer {
         visit("input", &mut *self.input);
     }
 
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         Some(self)
     }
@@ -1180,7 +1178,6 @@ impl TileProducer for MapAggregateProducer {
         visit("input", &mut *self.input);
     }
 
-    #[cfg(test)]
     fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
         Some(self)
     }
