@@ -313,7 +313,7 @@ fn hash_type<'a>(
             p.position.hash(state);
             hash_rel(&p.term, env, wenv, free).hash(state);
         }
-        T::Tuple(tys) => {
+        T::Tuple(tys) | T::OpenTuple(tys) => {
             tys.len().hash(state);
             for t in tys {
                 hash_type(t, env, wenv, free, state);

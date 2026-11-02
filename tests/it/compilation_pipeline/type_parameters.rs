@@ -43,6 +43,17 @@ use super::helpers::{check_compile_error, check_scalar};
     "#},
     Value::Bool(true),
 )]
+// `B` is in no value parameter's annotation, but in the bound of `T`, which is, so each call
+// determines it (`docs/chl-spec.md`, "Type parameters").
+#[case::parameter_determined_through_a_bound(
+    indoc! {"
+        def stamp(B, T <: {at: B}, a: T) => {B, T}:
+            (a.at, a)
+        p = stamp((at=2, sku=3))
+        p.0 + p.1.sku
+    "},
+    Value::Int(5),
+)]
 // `U <: T` relates the two, so their join is `T` rather than a collision.
 #[case::bound_naming_an_earlier_parameter(
     indoc! {"
@@ -150,12 +161,15 @@ use super::helpers::{check_compile_error, check_scalar};
 // The types the annotation-mismatch cases below print are annotations a program can write.
 #[case::printed_types_annotate_their_definitions(
     indoc! {"
+        def first(t):
+            t.0
         def both(a):
             (a.at, a)
+        f: forall (A, B <: {A, ..}) B => A = first
         g: forall (A, B <: {at: A}) B => {A, B} = both
-        g((at=100, sku=1)).0
+        f((1, 2)) + f((10, 20, 30)) + g((at=100, sku=1)).0
     "},
-    Value::Int(100),
+    Value::Int(111),
 )]
 #[case::polymorphic_annotation_on_a_name(
     indoc! {"
@@ -699,6 +713,16 @@ fn type_parameter_errors(#[case] code: &str, #[case] needle: &str) {
     "},
     "inferred as forall (A, B, C) {A, B} => C requires r: Addable(A, B), r::Output <: C",
 )]
+// An open tuple is written only as a bound, so a parameter holds the position it bounds.
+#[case::open_tuple_behind_a_parameter(
+    indoc! {"
+        def first(t):
+            t.0
+        pick: forall (T) T => T = first
+        1
+    "},
+    "inferred as forall (A, B <: {A, ..}) B => A",
+)]
 #[case::bound_written_inline_where_the_parameter_occurs_once(
     indoc! {"
         def at(a):
@@ -782,6 +806,16 @@ fn an_annotation_mismatch_prints_the_inferred_polymorphic_type(
         f(1)
     "},
     "type parameter `T` appears in no parameter's annotation",
+)]
+// A bound determines what it names only when its own parameter is determined.
+#[case::parameter_named_by_an_undetermined_bound(
+    indoc! {"
+        def f(B, T <: {at: B}, x) => Int:
+            x
+        f(1)
+    "},
+    "type parameter `B` appears in no parameter's annotation and in no determined type \
+     parameter's bound",
 )]
 #[case::bound_naming_a_later_parameter(
     indoc! {"

@@ -53,7 +53,7 @@ theorem Ty.peel_of_not_refined {t : Ty} (h : t.isRefined = false) :
 /-- Peeling never grows a type. -/
 theorem Ty.peel_fst_sizeOf_le : (t : Ty) → sizeOf t.peel.1 ≤ sizeOf t
   | .base _ | .uintRange _ | .dataSource _ | .txn
-  | .fn .. | .tuple _ | .record _ | .variant _ => by simp [Ty.peel]
+  | .fn .. | .tuple _ | .openTuple _ | .record _ | .variant _ => by simp [Ty.peel]
   | .refined b p => by
       have ih := peel_fst_sizeOf_le b
       simp [Ty.peel]
@@ -62,7 +62,7 @@ theorem Ty.peel_fst_sizeOf_le : (t : Ty) → sizeOf t.peel.1 ≤ sizeOf t
 /-- Peeling a genuinely refined type strictly shrinks it. -/
 theorem Ty.peel_fst_sizeOf_lt : (t : Ty) → t.peel.2 ≠ [] → sizeOf t.peel.1 < sizeOf t
   | .base _, h | .uintRange _, h | .dataSource _, h | .txn, h
-  | .fn .., h | .tuple _, h | .record _, h | .variant _, h => by
+  | .fn .., h | .tuple _, h | .openTuple _, h | .record _, h | .variant _, h => by
       simp [Ty.peel] at h
   | .refined b p, _ => by
       have ih := Ty.peel_fst_sizeOf_le b
@@ -91,7 +91,7 @@ theorem Ty.peel_sum_lt (lhs rhs : Ty)
 /-- Peeling preserves well-formedness. -/
 theorem Ty.WellFormed.peel_fst : {t : Ty} → t.WellFormed → t.peel.1.WellFormed
   | .base _, h | .uintRange _, h | .dataSource _, h | .txn, h
-  | .fn .., h | .tuple _, h | .record _, h | .variant _, h => by
+  | .fn .., h | .tuple _, h | .openTuple _, h | .record _, h | .variant _, h => by
       simpa [Ty.peel] using h
   | .refined _ _, .refined _ _ hb => by
       simpa [Ty.peel] using hb.peel_fst
@@ -102,7 +102,7 @@ well-formed types, whose refinement sets are non-empty (`Type::refined` never bu
 distinct term). -/
 theorem Ty.peel_nil_self : {t : Ty} → t.WellFormed → t.peel.2 = [] → t.peel.1 = t
   | .base _, _, _ | .uintRange _, _, _ | .dataSource _, _, _ | .txn, _, _
-  | .fn .., _, _ | .tuple _, _, _ | .record _, _, _ | .variant _, _, _ => rfl
+  | .fn .., _, _ | .tuple _, _, _ | .openTuple _, _, _ | .record _, _, _ | .variant _, _, _ => rfl
   | .refined _ _, .refined hne _ _, h => by
       simp [Ty.peel] at h
       exact absurd h.1 hne
@@ -111,7 +111,7 @@ theorem Ty.peel_nil_self : {t : Ty} → t.WellFormed → t.peel.2 = [] → t.pee
 peeling is idempotent. -/
 theorem Ty.peel_fst_not_refined : (t : Ty) → t.peel.1.isRefined = false
   | .base _ | .uintRange _ | .dataSource _ | .txn
-  | .fn .. | .tuple _ | .record _ | .variant _ => by simp [Ty.peel, Ty.isRefined]
+  | .fn .. | .tuple _ | .openTuple _ | .record _ | .variant _ => by simp [Ty.peel, Ty.isRefined]
   | .refined b _ => by simpa [Ty.peel] using Ty.peel_fst_not_refined b
 
 theorem Ty.peel_fst_peel (t : Ty) : t.peel.1.peel = (t.peel.1, []) :=
@@ -281,12 +281,24 @@ inductive Subtyping : Ty → Ty → Prop where
       Subtyping d0 d1 →
       Subtyping c0 c1 →
       Subtyping (.fn n0 .data d0 c0) (.fn n1 .data d1 c1)
-  /-- Positional width: every position the rhs demands exists in the lhs
-  and is covariantly below it. -/
+  /-- Closed tuples: the width is part of the type, so the two widths are equal and each lhs
+  position is covariantly below the rhs one. -/
   | tuple {a b} :
-      b.length ≤ a.length →
+      a.length = b.length →
       (∀ (i : Nat) t0 t1, a[i]? = some t0 → b[i]? = some t1 → Subtyping t0 t1) →
       Subtyping (.tuple a) (.tuple b)
+  /-- A closed tuple below an open one: every position the open tuple lists exists in the closed
+  one and is covariantly below it. -/
+  | tupleOpen {a b} :
+      b.length ≤ a.length →
+      (∀ (i : Nat) t0 t1, a[i]? = some t0 → b[i]? = some t1 → Subtyping t0 t1) →
+      Subtyping (.tuple a) (.openTuple b)
+  /-- Two open tuples: the lower lists at least the upper's positions, each covariantly below.
+  No rule puts an open tuple below a closed one, since an open tuple fixes no width. -/
+  | openTuple {a b} :
+      b.length ≤ a.length →
+      (∀ (i : Nat) t0 t1, a[i]? = some t0 → b[i]? = some t1 → Subtyping t0 t1) →
+      Subtyping (.openTuple a) (.openTuple b)
   /-- Named width: every field the rhs demands is present (find-first) in
   the lhs and covariantly below it. -/
   | record {a b} :
@@ -332,6 +344,8 @@ theorem subtyping_peel_inv {x y : Ty} (h : Subtyping x y) :
   | fnCompute h1 h2 h3 h4 => exact ⟨rfl, .fnCompute h1 h2 h3 h4⟩
   | fnData h1 h2 h3 => exact ⟨rfl, .fnData h1 h2 h3⟩
   | tuple h1 h2 => exact ⟨rfl, .tuple h1 h2⟩
+  | tupleOpen h1 h2 => exact ⟨rfl, .tupleOpen h1 h2⟩
+  | openTuple h1 h2 => exact ⟨rfl, .openTuple h1 h2⟩
   | record h1 h2 => exact ⟨rfl, .record h1 h2⟩
   | variant h1 h2 => exact ⟨rfl, .variant h1 h2⟩
   | refined hpl hpr _ hdef hbase =>

@@ -107,10 +107,10 @@ theorem subtyping_iff_peel {x y : Ty} (hx : x.peel.2 = [] → x.peel.1 = x)
 /-! ## Products, viewed by key
 
 A tuple and a record are the same shape read with two spellings of the key, and `coalesce`'s record
-slot materializes to whichever its map's keys call for. `Subtyping` has one rule for each spelling,
-differing only in how the key is written, so the statements below are about the key-indexed view and
-the two rules are recovered
-from it. -/
+slot materializes to whichever its map's keys call for. `Subtyping`'s product rules differ in how the
+key is written and in one more fact, the closed tuple's width: a closed tuple is above only a closed
+tuple listing exactly its positions. So the statements below are about the key-indexed view plus that
+closure (`ClosedBelow`), and the rules are recovered from it. -/
 
 /-- A key's spelling: a tuple's position or a record's name. `coalesce` refuses a
 map that mixes them (`CoalesceError.partialRecord`, the Rust's `UnresolvedPartial`). -/
@@ -125,16 +125,28 @@ def keyKind : FieldKey → KeyKind
 
 /-- A product's spelling, and `none` for what is not a product. -/
 def productKind : Ty → Option KeyKind
-  | .tuple _ => some .positional
+  | .tuple _ | .openTuple _ => some .positional
   | .record _ => some .named
   | _ => none
+
+/-- Whether a product's fields are all of the fields any subtype of it may carry: true of a closed
+tuple, whose width is part of its type, and of no other product. -/
+def productClosed : Ty → Bool
+  | .tuple _ => true
+  | _ => false
 
 /-- The field a product carries at a key: a tuple's position, a record's name. A
 key of the other spelling resolves nowhere. -/
 def productAt : Ty → FieldKey → Option Ty
-  | .tuple ts, .idx i => ts[i]?
+  | .tuple ts, .idx i | .openTuple ts, .idx i => ts[i]?
   | .record fs, .name n => List.lookup n fs
   | _, _ => none
+
+/-- The closure half of a product edge `x <: y`: when `y` is closed, so is `x`, and every field
+`x` carries `y` carries too. With the field half, that makes the widths equal. -/
+def ClosedBelow (x y : Ty) : Prop :=
+  productClosed y = true → productClosed x = true ∧
+    ∀ key s, productAt x key = some s → (productAt y key).isSome = true
 
 /-- The payload a variant accepts at a tag. -/
 def variantAt : Ty → FieldKey → Option Ty
@@ -148,43 +160,73 @@ theorem nodupKeys_iff {l : List FieldKey} : nodupKeys l = true ↔ l.Nodup := by
 
 /-! ## Product subtyping, read through the view -/
 
-theorem productKind_positional : ∀ {x : Ty}, productKind x = some .positional → ∃ ts, x = .tuple ts
-  | .tuple ts, _ => ⟨ts, rfl⟩
+theorem productKind_positional : ∀ {x : Ty}, productKind x = some .positional →
+    ∃ ts, x = .tuple ts ∨ x = .openTuple ts
+  | .tuple ts, _ => ⟨ts, .inl rfl⟩
+  | .openTuple ts, _ => ⟨ts, .inr rfl⟩
   | .base _, h | .uintRange _, h | .dataSource _, h | .txn, h | .fn .., h
   | .record _, h | .variant _, h | .refined .., h => by simp [productKind] at h
 
 theorem productKind_named : ∀ {x : Ty}, productKind x = some .named → ∃ fs, x = .record fs
   | .record fs, _ => ⟨fs, rfl⟩
   | .base _, h | .uintRange _, h | .dataSource _, h | .txn, h | .fn .., h
-  | .tuple _, h | .variant _, h | .refined .., h => by simp [productKind] at h
+  | .tuple _, h | .openTuple _, h | .variant _, h | .refined .., h => by simp [productKind] at h
+
+/-- The positional half of every tuple rule: each position the upper tuple lists resolves in the
+lower one, below it. -/
+theorem positions_edge {ts bs : List Ty} (hlen : bs.length ≤ ts.length)
+    (hget : ∀ (i : Nat) t0 t1, ts[i]? = some t0 → bs[i]? = some t1 → Subtyping t0 t1) :
+    ∀ (i : Nat) t, bs[i]? = some t → ∃ s, ts[i]? = some s ∧ Subtyping s t := by
+  intro i t hk
+  have hi : i < bs.length := by
+    rcases Nat.lt_or_ge i bs.length with hlt | hge
+    · exact hlt
+    · rw [List.getElem?_eq_none hge] at hk
+      cases hk
+  obtain ⟨s, hs⟩ : ∃ s, ts[i]? = some s :=
+    ⟨_, List.getElem?_eq_getElem (Nat.lt_of_lt_of_le hi hlen)⟩
+  exact ⟨s, hs, hget i s t hs hk⟩
 
 /-- A product edge, inverted: with neither operand refined and one of them a
-product, both are, at the same spelling, and every field the supertype demands resolves above it in
-the subtype. One statement for both product rules and for either operand being the known one, since
-whether the product under discussion is
+product, both are, at the same spelling, every field the supertype demands resolves above it in
+the subtype, and the closure half holds. One statement for every product rule and for either
+operand being the known one, since whether the product under discussion is
 the subtype or the supertype depends on the bound's side. -/
 theorem product_subtyping_edge {x y : Ty} (h : Subtyping x y) (hx : x.peel.2 = [])
     (hy : y.peel.2 = [])
     (hprod : (productKind x).isSome = true ∨ (productKind y).isSome = true) :
     ∃ k, productKind x = some k ∧ productKind y = some k ∧
-      ∀ key t, productAt y key = some t → ∃ s, productAt x key = some s ∧ Subtyping s t := by
+      (∀ key t, productAt y key = some t → ∃ s, productAt x key = some s ∧ Subtyping s t) ∧
+      ClosedBelow x y := by
   cases h with
   | tuple hlen hget =>
     rename_i ts bs
-    refine ⟨.positional, rfl, rfl, ?_⟩
+    refine ⟨.positional, rfl, rfl, ?_, fun _ => ⟨rfl, ?_⟩⟩
+    · rintro (i | n) t hk
+      · exact positions_edge (Nat.le_of_eq hlen.symm) hget i t hk
+      · simp [productAt] at hk
+    · rintro (i | n) s hk
+      · simp only [productAt] at hk ⊢
+        have hi : i < ts.length := by
+          rcases Nat.lt_or_ge i ts.length with hlt | hge
+          · exact hlt
+          · rw [List.getElem?_eq_none hge] at hk
+            cases hk
+        rw [List.getElem?_eq_getElem (by omega)]
+        rfl
+      · simp [productAt] at hk
+  | tupleOpen hlen hget =>
+    refine ⟨.positional, rfl, rfl, ?_, fun hc => by simp [productClosed] at hc⟩
     rintro (i | n) t hk
-    · simp only [productAt] at hk ⊢
-      have hi : i < bs.length := by
-        rcases Nat.lt_or_ge i bs.length with hlt | hge
-        · exact hlt
-        · rw [List.getElem?_eq_none hge] at hk
-          cases hk
-      obtain ⟨s, hs⟩ : ∃ s, ts[i]? = some s :=
-        ⟨_, List.getElem?_eq_getElem (Nat.lt_of_lt_of_le hi hlen)⟩
-      exact ⟨s, hs, hget i s t hs hk⟩
+    · exact positions_edge hlen hget i t hk
+    · simp [productAt] at hk
+  | openTuple hlen hget =>
+    refine ⟨.positional, rfl, rfl, ?_, fun hc => by simp [productClosed] at hc⟩
+    rintro (i | n) t hk
+    · exact positions_edge hlen hget i t hk
     · simp [productAt] at hk
   | record hpres hpay =>
-    refine ⟨.named, rfl, rfl, ?_⟩
+    refine ⟨.named, rfl, rfl, ?_, fun hc => by simp [productClosed] at hc⟩
     rintro (i | n) t hk
     · simp [productAt] at hk
     · simp only [productAt] at hk ⊢
@@ -199,30 +241,51 @@ theorem product_subtyping_edge {x y : Ty} (h : Subtyping x y) (hx : x.peel.2 = [
     · exact absurd hy hg
   | _ => rcases hprod with hp | hp <;> simp [productKind] at hp
 
-/-- Construction: matching spellings, and a field of the subtype above every field
-the supertype demands. `Ty.WellFormed` supplies the unique keys the record rule's
+/-- Construction: matching spellings, a field of the subtype above every field the supertype
+demands, and the closure half. `Ty.WellFormed` supplies the unique keys the record rule's
 membership premise needs. -/
 theorem product_subtyping_of {x y : Ty} {k : KeyKind} (hx : productKind x = some k)
     (hy : productKind y = some k)
     (hndy : ∀ gs : List (String × Ty), y = .record gs → (gs.map (·.1)).Nodup)
-    (hfields : ∀ k t, productAt y k = some t → ∃ s, productAt x k = some s ∧ Subtyping s t) :
+    (hfields : ∀ k t, productAt y k = some t → ∃ s, productAt x k = some s ∧ Subtyping s t)
+    (hcl : ClosedBelow x y) :
     Subtyping x y := by
   cases k
-  · obtain ⟨ts, rfl⟩ := productKind_positional hx
-    obtain ⟨bs, rfl⟩ := productKind_positional hy
-    have hlen : bs.length ≤ ts.length := by
-      rcases Nat.lt_or_ge ts.length bs.length with hlt | hge
-      · obtain ⟨t, ht⟩ : ∃ t, bs[ts.length]? = some t :=
-          ⟨_, List.getElem?_eq_getElem hlt⟩
-        obtain ⟨s, hs, -⟩ := hfields (.idx ts.length) t (by simpa [productAt] using ht)
-        rw [productAt, List.getElem?_eq_none (Nat.le_refl _)] at hs
+  · -- The positional fields give the upper tuple's positions in the lower one.
+    have hpos : ∀ {ts bs : List Ty},
+        (∀ (i : Nat) (t : Ty), bs[i]? = some t → ∃ s, ts[i]? = some s ∧ Subtyping s t) →
+        bs.length ≤ ts.length ∧
+          ∀ (i : Nat) t0 t1, ts[i]? = some t0 → bs[i]? = some t1 → Subtyping t0 t1 := by
+      intro ts bs hf
+      refine ⟨?_, fun i t0 t1 h0 h1 => ?_⟩
+      · rcases Nat.lt_or_ge ts.length bs.length with hlt | hge
+        · obtain ⟨t, ht⟩ : ∃ t, bs[ts.length]? = some t :=
+            ⟨_, List.getElem?_eq_getElem hlt⟩
+          obtain ⟨s, hs, -⟩ := hf ts.length t ht
+          rw [List.getElem?_eq_none (Nat.le_refl _)] at hs
+          cases hs
+        · exact hge
+      · obtain ⟨s, hs, hsub⟩ := hf i t1 h1
+        rw [h0] at hs
         cases hs
-      · exact hge
-    refine .tuple hlen fun i t0 t1 h0 h1 => ?_
-    obtain ⟨s, hs, hsub⟩ := hfields (.idx i) t1 (by simpa [productAt] using h1)
-    rw [productAt, h0] at hs
-    cases hs
-    exact hsub
+        exact hsub
+    obtain ⟨ts, rfl | rfl⟩ := productKind_positional hx <;>
+      obtain ⟨bs, rfl | rfl⟩ := productKind_positional hy <;>
+      obtain ⟨hlen, hget⟩ := hpos (ts := ts) (bs := bs) (fun i t ht =>
+        hfields (.idx i) t (by simpa [productAt] using ht))
+    · -- Two closed tuples: the closure half bounds the lower width by the upper one.
+      obtain ⟨-, hkeys⟩ := hcl rfl
+      have hle : ts.length ≤ bs.length := by
+        rcases Nat.lt_or_ge bs.length ts.length with hlt | hge
+        · have := hkeys (.idx bs.length) ts[bs.length]
+            (by simp only [productAt]; exact List.getElem?_eq_getElem hlt)
+          simp only [productAt, List.getElem?_eq_none (Nat.le_refl _)] at this
+          cases this
+        · exact hge
+      exact .tuple (by omega) hget
+    · exact .tupleOpen hlen hget
+    · simp [ClosedBelow, productClosed] at hcl
+    · exact .openTuple hlen hget
   · obtain ⟨fs, rfl⟩ := productKind_named hx
     obtain ⟨gs, rfl⟩ := productKind_named hy
     have hnd : (gs.map (·.1)).Nodup := hndy gs rfl
@@ -253,7 +316,7 @@ def isVariant : Ty → Bool
 theorem isVariant_ex : ∀ {x : Ty}, isVariant x = true → ∃ tags, x = .variant tags
   | .variant tags, _ => ⟨tags, rfl⟩
   | .base _, h | .uintRange _, h | .dataSource _, h | .txn, h | .fn .., h
-  | .tuple _, h | .record _, h | .refined .., h => by simp [isVariant] at h
+  | .tuple _, h | .openTuple _, h | .record _, h | .refined .., h => by simp [isVariant] at h
 
 /-- A variant edge, inverted: with neither operand refined and one of them a
 variant, both are, and every tag the subtype may produce the supertype accepts
@@ -460,24 +523,28 @@ theorem zip_fst_sublist {α β} : ∀ (l₁ : List α) (l₂ : List β),
 /-- The materialized record slot, keyed: the product presents the map's keys, each
 carrying its payload's materialization, and takes its spelling from the keys. -/
 theorem coalesce_record_view (pol : Bool) {m : List (FieldKey × CompactTy)}
-    {c : Option (List Predicate)}
+    {c : Option (List Predicate)} {wd : Option TupleWidth}
     {ty : Ty} (hnd : nodupKeys (m.map Prod.fst) = true)
-    (h : coalesce pol (.mk [] (some m) none none c) = .ok (some ty)) :
+    (h : coalesce pol (.mk [] (some m) none none c wd) = .ok (some ty)) :
     ∃ base, ty = attachRefinements base c ∧ base.isRefined = false ∧ m ≠ [] ∧
       (∀ k ∈ m.map Prod.fst, productKind base = some (keyKind k)) ∧
       (∀ k v, m.lookup k = some v → ∃ t, productAt base k = some t ∧
         coalesce pol v = .ok (some t)) ∧
       (∀ k t, productAt base k = some t → ∃ v, m.lookup k = some v ∧
         coalesce pol v = .ok (some t)) ∧
-      (∀ gs : List (String × Ty), base = .record gs → (gs.map (·.1)).Nodup) := by
+      (∀ gs : List (String × Ty), base = .record gs → (gs.map (·.1)).Nodup) ∧
+      (productKind base = some .positional →
+        ((productClosed base = true ∧ wd = some (.exactly m.length)) ∨
+          (productClosed base = false ∧ ∃ c', wd = some (.atLeast m.length c'))) ∧
+        ∀ i, (productAt base (.idx i)).isSome = true ↔ i < m.length) := by
   obtain ⟨hne, ts, base, rfl, hrel, hshape⟩ := coalesce_record_ok pol h
   -- The whole case rests on one equation: the product resolves a key exactly as
   -- the map-keyed payload list does.
   have hat : ∀ k, productAt base k = ((m.map Prod.fst).zip ts).lookup k ∧
       (∀ k' ∈ m.map Prod.fst, productKind base = some (keyKind k')) ∧
       base.isRefined = false := by
-    rcases hshape with ⟨idxs, hi, hb⟩ | ⟨names, hn, rfl⟩
-    · obtain ⟨ts', rfl, hlen', hget⟩ := byIndex_get hb
+    rcases hshape with ⟨idxs, ts', hi, hb, hof⟩ | ⟨names, hn, rfl⟩
+    · obtain ⟨hlen', hget⟩ := byIndex_get hb
       have hkeys := indexKeys_keys hi
       have hinj : ∀ a b : Nat, FieldKey.idx a = FieldKey.idx b → a = b := by
         intro a b hab; cases hab; rfl
@@ -490,27 +557,29 @@ theorem coalesce_record_view (pol : Bool) {m : List (FieldKey × CompactTy)}
           ⟨_, List.getElem?_eq_getElem (by omega)⟩
         exact (List.of_mem_zip (mem_of_lookup (hget i z hi' hz))).1
       have hlt := dense_idxs_lt hilen hall
-      refine fun k => ⟨?_, fun k' hk' => ?_, rfl⟩
-      · cases k with
-        | name s =>
-          show (none : Option Ty) = _
-          rw [hkeys, lookup_name_idx_none]
-        | idx i =>
-          show ts'[i]? = _
-          rw [hkeys, lookup_zip_map_key FieldKey.idx hinj]
-          rcases Nat.lt_or_ge i m.length with hi' | hi'
-          · obtain ⟨z, hz⟩ : ∃ z, ts'[i]? = some z :=
-              ⟨_, List.getElem?_eq_getElem (by omega)⟩
-            rw [hz, hget i z hi' hz]
-          · rw [List.getElem?_eq_none (by omega),
-              lookup_eq_none_of_not_mem (fun hm => by
-                obtain ⟨e, hem, he⟩ := List.mem_map.mp hm
-                have hlti := hlt e.1 (List.of_mem_zip hem).1
-                rw [he] at hlti
-                omega)]
-      · rw [hkeys] at hk'
-        obtain ⟨i, -, rfl⟩ := List.mem_map.mp hk'
-        rfl
+      rcases hof with ⟨-, rfl⟩ | ⟨c', -, rfl⟩ <;>
+      refine fun k => ⟨?_, fun k' hk' => ?_, rfl⟩ <;>
+      first
+      | (cases k with
+          | name s =>
+            show (none : Option Ty) = _
+            rw [hkeys, lookup_name_idx_none]
+          | idx i =>
+            show ts'[i]? = _
+            rw [hkeys, lookup_zip_map_key FieldKey.idx hinj]
+            rcases Nat.lt_or_ge i m.length with hi' | hi'
+            · obtain ⟨z, hz⟩ : ∃ z, ts'[i]? = some z :=
+                ⟨_, List.getElem?_eq_getElem (by omega)⟩
+              rw [hz, hget i z hi' hz]
+            · rw [List.getElem?_eq_none (by omega),
+                lookup_eq_none_of_not_mem (fun hm => by
+                  obtain ⟨e, hem, he⟩ := List.mem_map.mp hm
+                  have hlti := hlt e.1 (List.of_mem_zip hem).1
+                  rw [he] at hlti
+                  omega)])
+      | (rw [hkeys] at hk'
+         obtain ⟨i, -, rfl⟩ := List.mem_map.mp hk'
+         rfl)
     · have hkeys := nameKeys_keys hn
       refine fun k => ⟨?_, fun k' hk' => ?_, rfl⟩
       · cases k with
@@ -523,17 +592,16 @@ theorem coalesce_record_view (pol : Bool) {m : List (FieldKey × CompactTy)}
       · rw [hkeys] at hk'
         obtain ⟨s, -, rfl⟩ := List.mem_map.mp hk'
         rfl
-  refine ⟨base, rfl, (hat (.idx 0)).2.2, hne, (hat (.idx 0)).2.1, ?_, ?_, ?_⟩
+  refine ⟨base, rfl, (hat (.idx 0)).2.2, hne, (hat (.idx 0)).2.1, ?_, ?_, ?_, ?_⟩
   · intro k v hv
     obtain ⟨t, ht, hct⟩ := hrel.lookup hv
     exact ⟨t, by rw [(hat k).1]; exact ht, hct⟩
   · intro k t ht
     rw [(hat k).1] at ht
     exact hrel.lookup' ht
-  · rcases hshape with ⟨idxs, hi, hb⟩ | ⟨names, hn, rfl⟩
-    · obtain ⟨ts', rfl, -, -⟩ := byIndex_get hb
-      intro gs hgs
-      cases hgs
+  · rcases hshape with ⟨idxs, ts', hi, hb, hof⟩ | ⟨names, hn, rfl⟩
+    · intro gs hgs
+      rcases hof with ⟨-, rfl⟩ | ⟨c', -, rfl⟩ <;> cases hgs
     · intro gs hgs
       cases hgs
       have hnames : names.Nodup := by
@@ -541,12 +609,31 @@ theorem coalesce_record_view (pol : Bool) {m : List (FieldKey × CompactTy)}
         rw [nameKeys_keys hn] at this
         exact List.Pairwise.of_map FieldKey.name (fun a b hne heq => hne (by rw [heq])) this
       exact hnames.sublist (zip_fst_sublist names ts)
+  · intro hpos
+    rcases hshape with ⟨idxs, ts', hi, hb, hof⟩ | ⟨names, hn, rfl⟩
+    · obtain ⟨hlen', -⟩ := byIndex_get hb
+      have hget : ∀ i, (ts'[i]?).isSome = true ↔ i < m.length := by
+        intro i
+        rw [← hlen']
+        constructor
+        · intro hs
+          rcases Nat.lt_or_ge i ts'.length with hlt | hge
+          · exact hlt
+          · rw [List.getElem?_eq_none hge] at hs
+            cases hs
+        · intro hlt
+          rw [List.getElem?_eq_getElem hlt]
+          rfl
+      rcases hof with ⟨hw, rfl⟩ | ⟨c', hw, rfl⟩
+      · exact ⟨.inl ⟨rfl, hw⟩, hget⟩
+      · exact ⟨.inr ⟨rfl, c', hw⟩, hget⟩
+    · simp [productKind] at hpos
 
 /-- The materialized variant slot, keyed. -/
 theorem coalesce_variant_view (pol : Bool) {m : List (FieldKey × CompactTy)}
     {c : Option (List Predicate)}
     {ty : Ty} (hnd : nodupKeys (m.map Prod.fst) = true)
-    (h : coalesce pol (.mk [] none (some m) none c) = .ok (some ty)) :
+    (h : coalesce pol (.mk [] none (some m) none c wd) = .ok (some ty)) :
     ∃ base, ty = attachRefinements base c ∧ base.isRefined = false ∧ isVariant base = true ∧
       (∀ k v, m.lookup k = some v → ∃ t, variantAt base k = some t ∧
         coalesce pol v = .ok (some t)) ∧
@@ -620,32 +707,34 @@ theorem refinementsBound_merge (pol above : Bool) {u : Ty} {p q : List Predicate
 /-! ## The merged position, slot by slot -/
 
 theorem merge_atoms_slot (pol : Bool) (as bs : List Atom) (c₁ c₂ : Option (List Predicate)) :
-    merge pol (.mk as none none none c₁) (.mk bs none none none c₂)
-      = .mk (as ++ bs) none none none (mergeRefinements pol c₁ c₂) := by
+    merge pol (.mk as none none none c₁ wd₁) (.mk bs none none none c₂ wd₂)
+      = .mk (as ++ bs) none none none (mergeRefinements pol c₁ c₂) (mergeWidth pol wd₁ wd₂) := by
   rw [merge.eq_def]
 
 theorem merge_record_slot (pol : Bool) (ma mb : List (FieldKey × CompactTy))
     (c₁ c₂ : Option (List Predicate)) :
-    merge pol (.mk [] (some ma) none none c₁) (.mk [] (some mb) none none c₂)
+    merge pol (.mk [] (some ma) none none c₁ wd₁) (.mk [] (some mb) none none c₂ wd₂)
       = .mk [] (some (if pol then intersectMap pol ma mb
           else unionMapGo pol ma mb ++ mb.filter (fun kw => (ma.lookup kw.1).isNone)))
-        none none (mergeRefinements pol c₁ c₂) := by
+        none none (mergeRefinements pol c₁ c₂) (mergeWidth pol wd₁ wd₂) := by
   rw [merge.eq_def]
   rfl
 
 theorem merge_variant_slot (pol : Bool) (ma mb : List (FieldKey × CompactTy))
     (c₁ c₂ : Option (List Predicate)) :
-    merge pol (.mk [] none (some ma) none c₁) (.mk [] none (some mb) none c₂)
+    merge pol (.mk [] none (some ma) none c₁ wd₁) (.mk [] none (some mb) none c₂ wd₂)
       = .mk [] none (some (if pol then
             unionMapGo pol ma mb ++ mb.filter (fun kw => (ma.lookup kw.1).isNone)
-          else intersectMap pol ma mb)) none (mergeRefinements pol c₁ c₂) := by
+          else intersectMap pol ma mb)) none (mergeRefinements pol c₁ c₂)
+        (mergeWidth pol wd₁ wd₂) := by
   rw [merge.eq_def]
   rfl
 
 theorem merge_fn_slot (pol : Bool) (g₁ g₂ : KindMerge × CompactTy × CompactTy)
     (c₁ c₂ : Option (List Predicate)) :
-    merge pol (.mk [] none none (some g₁) c₁) (.mk [] none none (some g₂) c₂)
-      = .mk [] none none (some (mergeFun pol g₁ g₂)) (mergeRefinements pol c₁ c₂) := by
+    merge pol (.mk [] none none (some g₁) c₁ wd₁) (.mk [] none none (some g₂) c₂ wd₂)
+      = .mk [] none none (some (mergeFun pol g₁ g₂)) (mergeRefinements pol c₁ c₂)
+        (mergeWidth pol wd₁ wd₂) := by
   rw [merge.eq_def]
   rfl
 
@@ -656,7 +745,7 @@ theorem merge_shape_agrees (pol : Bool) {as bs : List Atom}
     {ra va rb vb : Option (List (FieldKey × CompactTy))}
       {fa fb : Option (KindMerge × CompactTy × CompactTy)}
     {ca cb : Option (List Predicate)} {tm : Ty}
-    (hm : coalesce pol (merge pol (.mk as ra va fa ca) (.mk bs rb vb fb cb))
+    (hm : coalesce pol (merge pol (.mk as ra va fa ca wda) (.mk bs rb vb fb cb wdb))
       = .ok (some tm)) :
     (ra = none ∧ rb = none ∧ va = none ∧ vb = none ∧ fa = none ∧ fb = none) ∨
     (as = [] ∧ bs = [] ∧ va = none ∧ vb = none ∧ fa = none ∧ fb = none) ∨
@@ -691,11 +780,12 @@ theorem product_bounds_edge (above : Bool) {P y : Ty} (h : bounds above y P)
     ∃ k, productKind P = some k ∧ productKind y = some k ∧
       (if above then ∀ key t, productAt y key = some t → (productAt P key).isSome = true
         else ∀ key s, productAt P key = some s → (productAt y key).isSome = true) ∧
-      (∀ key s t, productAt P key = some s → productAt y key = some t → bounds above t s) := by
+      (∀ key s t, productAt P key = some s → productAt y key = some t → bounds above t s) ∧
+      (if above then ClosedBelow P y else ClosedBelow y P) := by
   cases above
-  · obtain ⟨k, hky, hkP, hfields⟩ :=
+  · obtain ⟨k, hky, hkP, hfields, hcl⟩ :=
       product_subtyping_edge (of_bounds_false h) hpy hpP (Or.inr hP)
-    refine ⟨k, hkP, hky, ?_, ?_⟩
+    refine ⟨k, hkP, hky, ?_, ?_, by simpa using hcl⟩
     · simp only [Bool.false_eq_true, if_false]
       intro key s hs
       obtain ⟨t, ht, -⟩ := hfields key s hs
@@ -705,9 +795,9 @@ theorem product_bounds_edge (above : Bool) {P y : Ty} (h : bounds above y P)
       rw [ht] at ht'
       cases ht'
       exact bounds_false hsub
-  · obtain ⟨k, hkP, hky, hfields⟩ :=
+  · obtain ⟨k, hkP, hky, hfields, hcl⟩ :=
       product_subtyping_edge (of_bounds_true h) hpP hpy (Or.inl hP)
-    refine ⟨k, hkP, hky, ?_, ?_⟩
+    refine ⟨k, hkP, hky, ?_, ?_, by simpa using hcl⟩
     · simp only [if_true]
       intro key t ht
       obtain ⟨s, hs, -⟩ := hfields key t ht
@@ -724,15 +814,16 @@ theorem product_bounds_of (above : Bool) {P y : Ty} {k : KeyKind}
     (hndy : ∀ gs : List (String × Ty), y = .record gs → (gs.map (·.1)).Nodup)
     (hpres : if above then ∀ key t, productAt y key = some t → (productAt P key).isSome = true
       else ∀ key s, productAt P key = some s → (productAt y key).isSome = true)
-    (hpay : ∀ key s t, productAt P key = some s → productAt y key = some t → bounds above t s) :
+    (hpay : ∀ key s t, productAt P key = some s → productAt y key = some t → bounds above t s)
+    (hcl : if above then ClosedBelow P y else ClosedBelow y P) :
     bounds above y P := by
   cases above
-  · simp only [Bool.false_eq_true, if_false] at hpres
-    refine bounds_false (product_subtyping_of hy hP hndP fun key s hs => ?_)
+  · simp only [Bool.false_eq_true, if_false] at hpres hcl
+    refine bounds_false (product_subtyping_of hy hP hndP (fun key s hs => ?_) hcl)
     obtain ⟨t, ht⟩ := Option.isSome_iff_exists.mp (hpres key s hs)
     exact ⟨t, ht, of_bounds_false (hpay key s t hs ht)⟩
-  · simp only [if_true] at hpres
-    refine bounds_true (product_subtyping_of hP hy hndy fun key t ht => ?_)
+  · simp only [if_true] at hpres hcl
+    refine bounds_true (product_subtyping_of hP hy hndy (fun key t ht => ?_) hcl)
     obtain ⟨s, hs⟩ := Option.isSome_iff_exists.mp (hpres key t ht)
     exact ⟨s, hs, of_bounds_true (hpay key s t hs ht)⟩
 
@@ -790,6 +881,7 @@ theorem productAt_wellFormed {y : Ty} {k : FieldKey} {t : Ty} (hwy : y.WellForme
     t.WellFormed := by
   cases y <;> cases k <;> simp only [productAt] at h <;> try cases h
   · exact hwy.tuple_mem (List.mem_of_getElem? h)
+  · exact hwy.openTuple_mem (List.mem_of_getElem? h)
   · exact hwy.record_mem (mem_of_lookup h)
 
 /-- A payload of a well-formed variant is well-formed. -/
@@ -889,6 +981,21 @@ theorem exists_mem_keys {m : List (FieldKey × CompactTy)} (h : m ≠ []) : ∃ 
   · exact absurd rfl h
   · exact ⟨k, by simp⟩
 
+/-- A closed product is a tuple, so it is spelled by position. -/
+theorem productKind_of_closed {x : Ty} (h : productClosed x = true) :
+    productKind x = some .positional := by
+  cases x <;> simp_all [productClosed, productKind]
+
+/-- A merge that answers a closed width had closed operands of that width: both of them at a
+positive position, where any open operand leaves the join open, and at least one at a negative
+position, where a closed width meets an open one at the closed one. -/
+theorem TupleWidth.merge_eq_exactly {pol : Bool} {a b : TupleWidth} {n : Nat}
+    (h : a.merge pol b = .exactly n) :
+    if pol then a = .exactly n ∧ b = .exactly n else a = .exactly n ∨ b = .exactly n := by
+  rcases a with m | ⟨p, _ | c⟩ | _ <;> rcases b with k | ⟨q, _ | d⟩ | _ <;> cases pol <;>
+    simp only [TupleWidth.merge, Bool.false_eq_true, if_true, if_false] at h ⊢ <;>
+    (repeat' split at h) <;> simp_all
+
 /-! ## The record case -/
 
 theorem bounds_record (pol above : Bool) {ma mb : List (FieldKey × CompactTy)}
@@ -901,13 +1008,13 @@ theorem bounds_record (pol above : Bool) {ma mb : List (FieldKey × CompactTy)}
       coalesce pol v = .ok (some tv) → coalesce pol w = .ok (some tw) →
       coalesce pol (merge pol v w) = .ok (some tvw) →
       t.WellFormed → bounds above t tv → bounds above t tw → bounds above t tvw)
-    (ha : coalesce pol (.mk [] (some ma) none none (some p)) = .ok (some ta))
-    (hb : coalesce pol (.mk [] (some mb) none none (some q)) = .ok (some tb))
-    (hm : coalesce pol (merge pol (.mk [] (some ma) none none (some p))
-      (.mk [] (some mb) none none (some q))) = .ok (some tm))
+    (ha : coalesce pol (.mk [] (some ma) none none (some p) wda) = .ok (some ta))
+    (hb : coalesce pol (.mk [] (some mb) none none (some q) wdb) = .ok (some tb))
+    (hm : coalesce pol (merge pol (.mk [] (some ma) none none (some p) wda)
+      (.mk [] (some mb) none none (some q) wdb)) = .ok (some tm))
     (hba : bounds above u ta) (hbb : bounds above u tb) : bounds above u tm := by
-  obtain ⟨Pa, rfl, hnra, hnea, hkia, hfwa, hbwa, hnpa⟩ := coalesce_record_view pol hnda ha
-  obtain ⟨Pb, rfl, hnrb, hneb, hkib, hfwb, hbwb, hnpb⟩ := coalesce_record_view pol hndb hb
+  obtain ⟨Pa, rfl, hnra, hnea, hkia, hfwa, hbwa, -, hwva⟩ := coalesce_record_view pol hnda ha
+  obtain ⟨Pb, rfl, hnrb, hneb, hkib, hfwb, hbwb, -, hwvb⟩ := coalesce_record_view pol hndb hb
   rw [merge_record_slot, show (if pol then intersectMap pol ma mb
       else unionMapGo pol ma mb ++ mb.filter (fun kw => (ma.lookup kw.1).isNone))
       = mergeKeyed pol pol ma mb from by cases pol <;> rfl] at hm
@@ -915,7 +1022,7 @@ theorem bounds_record (pol above : Bool) {ma mb : List (FieldKey × CompactTy)}
     cases pol
     · exact nodupKeys_unionMap hnda hndb
     · exact nodupKeys_intersectMap hnda
-  obtain ⟨Pm, rfl, hnrm, hnem, hkim, hfwm, hbwm, hnpm⟩ := coalesce_record_view pol hndM hm
+  obtain ⟨Pm, rfl, hnrm, hnem, hkim, hfwm, hbwm, hnpm, hwvm⟩ := coalesce_record_view pol hndM hm
   rw [bounds_attach_iff above hnra hwu] at hba
   rw [bounds_attach_iff above hnrb hwu] at hbb
   rw [bounds_attach_iff above hnrm hwu]
@@ -928,10 +1035,10 @@ theorem bounds_record (pol above : Bool) {ma mb : List (FieldKey × CompactTy)}
   have hpPb : Pb.peel.2 = [] := by rw [Ty.peel_of_not_refined hnrb]
   have hpPm : Pm.peel.2 = [] := by rw [Ty.peel_of_not_refined hnrm]
   obtain ⟨k0, hk0⟩ := exists_mem_keys hnea
-  obtain ⟨ka, hkPa, hkU, hpresa, hpaya⟩ :=
+  obtain ⟨ka, hkPa, hkU, hpresa, hpaya, hcla⟩ :=
     product_bounds_edge above hba.1 (by rw [hkia k0 hk0]; rfl) hpPa hpu
   obtain ⟨k1, hk1⟩ := exists_mem_keys hneb
-  obtain ⟨kb, hkPb, hkU', hpresb, hpayb⟩ :=
+  obtain ⟨kb, hkPb, hkU', hpresb, hpayb, hclb⟩ :=
     product_bounds_edge above hbb.1 (by rw [hkib k1 hk1]; rfl) hpPb hpu
   have hkab : kb = ka := by rw [hkU] at hkU'; exact (Option.some.injEq _ _ ▸ hkU').symm
   subst hkab
@@ -954,7 +1061,7 @@ theorem bounds_record (pol above : Bool) {ma mb : List (FieldKey × CompactTy)}
       (Option.isSome_iff_exists.mp (lookup_of_mem_keys hkm)).choose_spec)]
   refine product_bounds_of above hkPm hkU hnpm (fun gs hgs => by
     rw [hgs] at hwup
-    cases hwup with | record hnd _ => exact hnd) ?_ ?_
+    cases hwup with | record hnd _ => exact hnd) ?_ ?_ ?_
   · -- Which of the two must resolve the other's keys, by the bound's side.
     cases above
     · simp only [Bool.false_eq_true, if_false] at hpresa hpresb ⊢
@@ -989,6 +1096,129 @@ theorem bounds_record (pol above : Bool) {ma mb : List (FieldKey × CompactTy)}
     · intro w hw
       obtain ⟨sb, hsb, hcw⟩ := hfwb key w hw
       exact ⟨sb, hcw, hpayb key sb t hsb ht⟩
+  · -- The closure half. A closed tuple on the bound's side fixes the width, so it reads the
+    -- merged width off the operands' (`TupleWidth.merge_eq_exactly`).
+    have hclosed : ∀ {P : Ty} {wd : Option TupleWidth} {n k : Nat},
+        ((productClosed P = true ∧ wd = some (.exactly n)) ∨
+          (productClosed P = false ∧ ∃ c', wd = some (.atLeast n c'))) →
+        wd = some (.exactly k) → productClosed P = true ∧ k = n := by
+      intro P wd n k h hk
+      rcases h with ⟨h, hw⟩ | ⟨-, c', hw⟩ <;> rw [hk] at hw
+      · exact ⟨h, by simpa using hw⟩
+      · simp at hw
+    have hexact : ∀ {P : Ty} {wd : Option TupleWidth} {n : Nat},
+        ((productClosed P = true ∧ wd = some (.exactly n)) ∨
+          (productClosed P = false ∧ ∃ c', wd = some (.atLeast n c'))) →
+        productClosed P = true → wd = some (.exactly n) := by
+      intro P wd n h hc
+      rcases h with ⟨-, hw⟩ | ⟨h, -⟩
+      · exact hw
+      · rw [hc] at h; cases h
+    have hsome : ∀ {P : Ty} {wd : Option TupleWidth} {n : Nat},
+        ((productClosed P = true ∧ wd = some (.exactly n)) ∨
+          (productClosed P = false ∧ ∃ c', wd = some (.atLeast n c'))) → ∃ w, wd = some w := by
+      intro P wd n h
+      rcases h with ⟨-, hw⟩ | ⟨-, c', hw⟩ <;> exact ⟨_, hw⟩
+    cases above
+    · -- Below: a closed merge came from a closed operand, whose closure `u` shares.
+      simp only [Bool.false_eq_true, if_false] at hcla hclb ⊢
+      intro hPm
+      have hposm := productKind_of_closed hPm
+      have hposa : productKind Pa = some .positional := hkPa.trans (hkPm.symm.trans hposm)
+      have hposb : productKind Pb = some .positional := hkPb.trans (hkPm.symm.trans hposm)
+      have hmw := hexact (hwvm hposm).1 hPm
+      obtain ⟨wa, hwa⟩ := hsome (hwva hposa).1
+      obtain ⟨wb, hwb⟩ := hsome (hwvb hposb).1
+      rw [hwa, hwb] at hmw
+      simp only [mergeWidth, Option.some.injEq] at hmw
+      have hex := TupleWidth.merge_eq_exactly hmw
+      -- A key the merged map holds is a field of the merge.
+      have hfield : ∀ key vw, (mergeKeyed pol pol ma mb).lookup key = some vw →
+          (productAt Pm key).isSome = true := by
+        intro key vw hvw
+        obtain ⟨sm, hsm, -⟩ := hfwm key vw hvw
+        simp [hsm]
+      -- The operand on `a`'s side of a closed width puts `u`'s keys in its map.
+      have hkeyA : productClosed Pa = true → ∀ key t, productAt u.peel.1 key = some t →
+          ∃ v, ma.lookup key = some v := by
+        intro hPa key t ht
+        obtain ⟨sa, hsa⟩ := Option.isSome_iff_exists.mp ((hcla hPa).2 key t ht)
+        obtain ⟨v, hv, -⟩ := hbwa key sa hsa
+        exact ⟨v, hv⟩
+      have hkeyB : productClosed Pb = true → ∀ key t, productAt u.peel.1 key = some t →
+          ∃ w, mb.lookup key = some w := by
+        intro hPb key t ht
+        obtain ⟨sb, hsb⟩ := Option.isSome_iff_exists.mp ((hclb hPb).2 key t ht)
+        obtain ⟨w, hw, -⟩ := hbwb key sb hsb
+        exact ⟨w, hw⟩
+      have hPa_of : wa = .exactly (mergeKeyed pol pol ma mb).length → productClosed Pa = true :=
+        fun h => (hclosed (hwva hposa).1 (hwa.trans (congrArg some h))).1
+      have hPb_of : wb = .exactly (mergeKeyed pol pol ma mb).length → productClosed Pb = true :=
+        fun h => (hclosed (hwvb hposb).1 (hwb.trans (congrArg some h))).1
+      cases pol
+      · -- A negative merge unites the keys, so one closed operand is enough.
+        simp only [Bool.false_eq_true, if_false] at hex
+        rcases hex with h | h
+        · have hPa := hPa_of h
+          refine ⟨(hcla hPa).1, fun key t ht => ?_⟩
+          obtain ⟨v, hv⟩ := hkeyA hPa key t ht
+          rcases hw : mb.lookup key with _ | w
+          · exact hfield key v (by rw [mergeKeyed_lookup, hv, hw]; rfl)
+          · exact hfield key _ (by rw [mergeKeyed_lookup, hv, hw])
+        · have hPb := hPb_of h
+          refine ⟨(hclb hPb).1, fun key t ht => ?_⟩
+          obtain ⟨w, hw⟩ := hkeyB hPb key t ht
+          rcases hv : ma.lookup key with _ | v
+          · exact hfield key w (by rw [mergeKeyed_lookup, hv, hw]; rfl)
+          · exact hfield key _ (by rw [mergeKeyed_lookup, hv, hw])
+      · -- A positive merge intersects the keys, and both operands are closed.
+        simp only [if_true] at hex
+        have hPa := hPa_of hex.1
+        have hPb := hPb_of hex.2
+        refine ⟨(hcla hPa).1, fun key t ht => ?_⟩
+        obtain ⟨v, hv⟩ := hkeyA hPa key t ht
+        obtain ⟨w, hw⟩ := hkeyB hPb key t ht
+        exact hfield key _ (by rw [mergeKeyed_lookup, hv, hw])
+    · -- Above: both operands are closed, at the width `u` fixes, so the merge is too.
+      simp only [if_true] at hcla hclb hpresa hpresb ⊢
+      intro hU
+      obtain ⟨hPa, hkeysa⟩ := hcla hU
+      obtain ⟨hPb, hkeysb⟩ := hclb hU
+      have hposa := productKind_of_closed hPa
+      have hposb := productKind_of_closed hPb
+      have hwa := hexact (hwva hposa).1 hPa
+      have hwb := hexact (hwvb hposb).1 hPb
+      have hcnta := (hwva hposa).2
+      have hcntb := (hwvb hposb).2
+      have hab : ∀ i, i < ma.length → i < mb.length := by
+        intro i hi
+        obtain ⟨s, hs⟩ := Option.isSome_iff_exists.mp ((hcnta i).mpr hi)
+        obtain ⟨t, ht⟩ := Option.isSome_iff_exists.mp (hkeysa _ s hs)
+        exact (hcntb i).mp (hpresb _ t ht)
+      have hba' : ∀ i, i < mb.length → i < ma.length := by
+        intro i hi
+        obtain ⟨s, hs⟩ := Option.isSome_iff_exists.mp ((hcntb i).mpr hi)
+        obtain ⟨t, ht⟩ := Option.isSome_iff_exists.mp (hkeysb _ s hs)
+        exact (hcnta i).mp (hpresa _ t ht)
+      have hlen : ma.length = mb.length := by
+        rcases Nat.lt_or_ge ma.length mb.length with h | h
+        · exact absurd (hba' _ h) (Nat.lt_irrefl _)
+        rcases Nat.lt_or_ge mb.length ma.length with h' | h'
+        · exact absurd (hab _ h') (Nat.lt_irrefl _)
+        omega
+      have hposm : productKind Pm = some .positional := hkPm.trans (hkPa.symm.trans hposa)
+      have hmw : mergeWidth pol wda wdb = some (.exactly ma.length) := by
+        rw [hwa, hwb, ← hlen]
+        simp [mergeWidth, TupleWidth.merge]
+      refine ⟨(hclosed (hwvm hposm).1 hmw).1, fun key s hs => ?_⟩
+      obtain ⟨vw, hvw, -⟩ := hbwm key s hs
+      rcases mergeKeyed_key hvw with hk | hk
+      · obtain ⟨v, hv⟩ := Option.isSome_iff_exists.mp hk
+        obtain ⟨sa, hsa, -⟩ := hfwa key v hv
+        exact hkeysa key sa hsa
+      · obtain ⟨w, hw⟩ := Option.isSome_iff_exists.mp hk
+        obtain ⟨sb, hsb, -⟩ := hfwb key w hw
+        exact hkeysb key sb hsb
 
 /-! ## The variant case
 
@@ -1007,10 +1237,10 @@ theorem bounds_variant (pol above : Bool) {ma mb : List (FieldKey × CompactTy)}
       coalesce pol v = .ok (some tv) → coalesce pol w = .ok (some tw) →
       coalesce pol (merge pol v w) = .ok (some tvw) →
       t.WellFormed → bounds above t tv → bounds above t tw → bounds above t tvw)
-    (ha : coalesce pol (.mk [] none (some ma) none (some p)) = .ok (some ta))
-    (hb : coalesce pol (.mk [] none (some mb) none (some q)) = .ok (some tb))
-    (hm : coalesce pol (merge pol (.mk [] none (some ma) none (some p))
-      (.mk [] none (some mb) none (some q))) = .ok (some tm))
+    (ha : coalesce pol (.mk [] none (some ma) none (some p) wda) = .ok (some ta))
+    (hb : coalesce pol (.mk [] none (some mb) none (some q) wdb) = .ok (some tb))
+    (hm : coalesce pol (merge pol (.mk [] none (some ma) none (some p) wda)
+      (.mk [] none (some mb) none (some q) wdb)) = .ok (some tm))
     (hba : bounds above u ta) (hbb : bounds above u tb) : bounds above u tm := by
   obtain ⟨Pa, rfl, hnra, hva, hfwa, hbwa, hnpa⟩ := coalesce_variant_view pol hnda ha
   obtain ⟨Pb, rfl, hnrb, hvb, hfwb, hbwb, hnpb⟩ := coalesce_variant_view pol hndb hb
@@ -1079,7 +1309,7 @@ theorem atomTy_wellFormed (α : Atom) : (atomTy α).WellFormed := by
   cases α <;> constructor
 
 theorem coalesce_atoms_ok (pol : Bool) {as : List Atom} {c : Option (List Predicate)} {ty : Ty}
-    (h : coalesce pol (.mk as none none none c) = .ok (some ty)) :
+    (h : coalesce pol (.mk as none none none c wd) = .ok (some ty)) :
     ∃ t, (as.map atomTy).eraseDups = [t] ∧ ty = attachRefinements t c ∧
       t.isRefined = false ∧ t.WellFormed := by
   rw [coalesce_atoms] at h
@@ -1096,10 +1326,10 @@ theorem coalesce_atoms_ok (pol : Bool) {as : List Atom} {c : Option (List Predic
 theorem bounds_atoms (pol above : Bool) {as bs : List Atom} {p q : List Predicate}
     {u ta tb tm : Ty} (hane : as ≠ []) (hbne : bs ≠ [])
     (hwu : u.WellFormed)
-    (ha : coalesce pol (.mk as none none none (some p)) = .ok (some ta))
-    (hb : coalesce pol (.mk bs none none none (some q)) = .ok (some tb))
-    (hm : coalesce pol (merge pol (.mk as none none none (some p))
-      (.mk bs none none none (some q))) = .ok (some tm))
+    (ha : coalesce pol (.mk as none none none (some p) wda) = .ok (some ta))
+    (hb : coalesce pol (.mk bs none none none (some q) wdb) = .ok (some tb))
+    (hm : coalesce pol (merge pol (.mk as none none none (some p) wda)
+      (.mk bs none none none (some q) wdb)) = .ok (some tm))
     (hba : bounds above u ta) (hbb : bounds above u tb) : bounds above u tm := by
   obtain ⟨sa, hea, rfl, hnra, -⟩ := coalesce_atoms_ok pol ha
   obtain ⟨sb, heb, rfl, hnrb, -⟩ := coalesce_atoms_ok pol hb
@@ -1168,9 +1398,9 @@ theorem fn_bounds_of (above : Bool) {n0 n1 : Option String} {k : FunKind} {d0 c0
 reaches the comparison. -/
 theorem coalesce_fun_conflict (pol : Bool) {ds cod : CompactTy}
     {c : Option (List Predicate)} {ty : Ty}
-    (h : coalesce pol (.mk [] none none (some (.conflict, ds, cod)) c) = .ok (some ty)) :
+    (h : coalesce pol (.mk [] none none (some (.conflict, ds, cod)) c wd) = .ok (some ty)) :
     False := by
-  rcases hf : funShapes pol (.mk [] none none (some (KindMerge.conflict, ds, cod)) c) with e | x <;>
+  rcases hf : funShapes pol (.mk [] none none (some (KindMerge.conflict, ds, cod)) c wd) with e | x <;>
     rw [coalesce_fun_only, hf] at h
   · cases h
   rw [funShapes] at hf
@@ -1201,10 +1431,10 @@ theorem bounds_fun (pol above : Bool) {k₁ k₂ : KindMerge} {d₁ d₂ cod₁ 
       coalesce pol cod₁ = .ok (some tx) → coalesce pol cod₂ = .ok (some ty') →
       coalesce pol (merge pol cod₁ cod₂) = .ok (some tz) →
       t.WellFormed → bounds above t tx → bounds above t ty' → bounds above t tz)
-    (ha : coalesce pol (.mk [] none none (some (k₁, d₁, cod₁)) (some p)) = .ok (some ta))
-    (hb : coalesce pol (.mk [] none none (some (k₂, d₂, cod₂)) (some q)) = .ok (some tb))
-    (hm : coalesce pol (merge pol (.mk [] none none (some (k₁, d₁, cod₁)) (some p))
-      (.mk [] none none (some (k₂, d₂, cod₂)) (some q))) = .ok (some tm))
+    (ha : coalesce pol (.mk [] none none (some (k₁, d₁, cod₁)) (some p) wda) = .ok (some ta))
+    (hb : coalesce pol (.mk [] none none (some (k₂, d₂, cod₂)) (some q) wdb) = .ok (some tb))
+    (hm : coalesce pol (merge pol (.mk [] none none (some (k₁, d₁, cod₁)) (some p) wda)
+      (.mk [] none none (some (k₂, d₂, cod₂)) (some q) wdb)) = .ok (some tm))
     (hba : bounds above u ta) (hbb : bounds above u tb) : bounds above u tm := by
   rw [merge_fn_slot] at hm
   -- Concrete kinds that disagree join to `conflict`, which has no type.
@@ -1216,15 +1446,15 @@ theorem bounds_fun (pol above : Bool) {k₁ k₂ : KindMerge} {d₁ d₂ cod₁ 
   rw [mergeFun_same pol hkf] at hm
   -- Both operands, materialized.
   have hop : ∀ (d cod : CompactTy) (c : List Predicate) (t : Ty),
-      coalesce pol (.mk [] none none (some (k₁, d, cod)) (some c)) = .ok (some t) →
+      ∀ wdc, coalesce pol (.mk [] none none (some (k₁, d, cod)) (some c) wdc) = .ok (some t) →
       ∃ dt ct, coalesce (!pol) d = .ok (some dt) ∧ coalesce pol cod = .ok (some ct) ∧
         t = attachRefinements (.fn none (funKindOf k₁) dt ct) (some c) := by
-    intro d cod c t ht
+    intro d cod c t wdc ht
     rcases hk₁ with rfl | rfl
     · exact coalesce_fun_data_ok pol ht
     · exact coalesce_fun_compute_ok pol ht
-  obtain ⟨D₁, C₁, hd₁, hc₁, rfl⟩ := hop d₁ cod₁ p ta ha
-  obtain ⟨D₂, C₂, hd₂, hc₂, rfl⟩ := hop d₂ cod₂ q tb hb
+  obtain ⟨D₁, C₁, hd₁, hc₁, rfl⟩ := hop d₁ cod₁ p ta _ ha
+  obtain ⟨D₂, C₂, hd₂, hc₂, rfl⟩ := hop d₂ cod₂ q tb _ hb
   -- The merged slot: its codomain is the merged codomain and its domain is the merged
   -- domain, at both polarities and either kind — the domain is one position now, so a
   -- positive merge combines it like any other rather than accumulating alternatives.
@@ -1271,7 +1501,7 @@ sixteen cases close on `merge_shape_agrees`. -/
 case reads the slot as a set. -/
 theorem wellFormed_refs {as : List Atom} {r v : Option (List (FieldKey × CompactTy))}
     {f : Option (KindMerge × CompactTy × CompactTy)} {c : Option (List Predicate)}
-    (hw : wellFormed (.mk as r v f c) = true)
+    (hw : wellFormed (.mk as r v f c wd) = true)
     (hcontent : as ≠ [] ∨ r ≠ none ∨ v ≠ none ∨ f ≠ none) : ∃ ps, c = some ps := by
   rcases c with _ | ps
   · exfalso
@@ -1293,8 +1523,8 @@ theorem bounds_merge : ∀ (n : Nat) (pol above : Bool) (a b : CompactTy) (u : T
     exact absurd hfuel (by omega)
   | succ n ih =>
     intro pol above a b u hfuel hga hgb hwu ta tb tm ha hb hm hba hbb
-    obtain ⟨as, ra, va, fa, ca⟩ := a
-    obtain ⟨bs, rb, vb, fb, cb⟩ := b
+    obtain ⟨as, ra, va, fa, ca, wda⟩ := a
+    obtain ⟨bs, rb, vb, fb, cb, wdb⟩ := b
     -- `concrete`, projected onto a shared keyed payload, as the keyed cases want it.
     have hkeyed : ∀ (ma mb : List (FieldKey × CompactTy)),
         wellFormedKeys ma (ma.map Prod.fst) = true → wellFormedKeys mb (mb.map Prod.fst) = true →
@@ -1409,10 +1639,13 @@ theorem product_wellFormed {base : Ty} (hk : (productKind base).isSome = true)
   · rw [hkb] at hk
     cases hk
   cases pk
-  · obtain ⟨ts, rfl⟩ := productKind_positional hkb
-    exact .tuple fun t ht => by
-      obtain ⟨i, hi⟩ := List.getElem?_of_mem ht
-      exact hpay (.idx i) t hi
+  · obtain ⟨ts, rfl | rfl⟩ := productKind_positional hkb
+    · exact .tuple fun t ht => by
+        obtain ⟨i, hi⟩ := List.getElem?_of_mem ht
+        exact hpay (.idx i) t hi
+    · exact .openTuple fun t ht => by
+        obtain ⟨i, hi⟩ := List.getElem?_of_mem ht
+        exact hpay (.idx i) t hi
   · obtain ⟨fs, rfl⟩ := productKind_named hkb
     refine .record (hnd fs rfl) fun f hf => ?_
     obtain ⟨nm, t⟩ := f
@@ -1435,17 +1668,17 @@ theorem variant_wellFormed {base : Ty} (hv : isVariant base = true)
 same branch of `funShapes` — the default is in the match, not in a second rule. -/
 theorem funShapes_unknown_eq_compute (pol : Bool) (ds cod : CompactTy)
     (c : Option (List Predicate)) :
-    funShapes pol (.mk [] none none (some (.unknown, ds, cod)) c)
-      = funShapes pol (.mk [] none none (some (.compute, ds, cod)) c) := by
+    funShapes pol (.mk [] none none (some (.unknown, ds, cod)) c wd)
+      = funShapes pol (.mk [] none none (some (.compute, ds, cod)) c wd) := by
   rw [funShapes, funShapes]
   simp
 
 theorem coalesce_fun_unknown_ok (pol : Bool) {d cod : CompactTy} {c : Option (List Predicate)}
-    {ty : Ty}
-    (h : coalesce pol (.mk [] none none (some (.unknown, d, cod)) c) = .ok (some ty)) :
+    {wd : Option TupleWidth} {ty : Ty}
+    (h : coalesce pol (.mk [] none none (some (.unknown, d, cod)) c wd) = .ok (some ty)) :
     ∃ dt ct, coalesce (!pol) d = .ok (some dt) ∧ coalesce pol cod = .ok (some ct) ∧
       ty = attachRefinements (.fn none .compute dt ct) c := by
-  refine coalesce_fun_compute_ok pol ?_
+  refine coalesce_fun_compute_ok pol (wd := wd) ?_
   rw [coalesce_fun_only] at h ⊢
   rw [← funShapes_unknown_eq_compute]
   exact h
@@ -1461,7 +1694,7 @@ theorem coalesce_wellFormed : ∀ (n : Nat) (pol : Bool) (t : CompactTy) (ty : T
     exact absurd hd (by omega)
   | succ n ih =>
     intro pol t ty hd hw hc
-    obtain ⟨as, r, v, f, c⟩ := t
+    obtain ⟨as, r, v, f, c, wd⟩ := t
     rcases coalesce_shape pol hc with ⟨-, rfl, rfl, rfl⟩ | ⟨rfl, ⟨m, rfl⟩, rfl, rfl⟩
       | ⟨rfl, rfl, ⟨m, rfl⟩, rfl⟩ | ⟨rfl, rfl, rfl, ⟨g, rfl⟩⟩
     · obtain ⟨s, -, rfl, hnrs, hws⟩ := coalesce_atoms_ok pol hc
@@ -1469,13 +1702,13 @@ theorem coalesce_wellFormed : ∀ (n : Nat) (pol : Bool) (t : CompactTy) (ty : T
     · rw [wellFormed.eq_def] at hw
       simp only [Bool.and_eq_true] at hw
       obtain ⟨hwk, hndk⟩ := hw.1.1.1
-      obtain ⟨base, rfl, hnr, hne, hkind, -, hbw, hnp⟩ := coalesce_record_view pol hndk hc
+      obtain ⟨base, rfl, hnr, hne, hkind, -, hbw, hnp, -⟩ := coalesce_record_view pol hndk hc
       refine attachRefinements_wellFormed hnr (product_wellFormed ?_ hnp fun k t hpa => ?_) c
       · obtain ⟨k0, hk0⟩ := exists_mem_keys hne
         rw [hkind k0 hk0]
         rfl
       · obtain ⟨w, hwlk, hcw⟩ := hbw k t hpa
-        have hdw : depth w < depth (CompactTy.mk [] (some m) none none c) :=
+        have hdw : depth w < depth (CompactTy.mk [] (some m) none none c wd) :=
           depth_recordPayload_lt (mem_of_lookup hwlk)
         exact ih pol w t (by omega) (wfKeys_iff.mp hwk k (mem_keys_of_lookup hwlk) w hwlk) hcw
     · rw [wellFormed.eq_def] at hw
@@ -1484,16 +1717,16 @@ theorem coalesce_wellFormed : ∀ (n : Nat) (pol : Bool) (t : CompactTy) (ty : T
       obtain ⟨base, rfl, hnr, hvb, -, hbw, hnp⟩ := coalesce_variant_view pol hndk hc
       refine attachRefinements_wellFormed hnr (variant_wellFormed hvb hnp fun k t hpa => ?_) c
       obtain ⟨w, hwlk, hcw⟩ := hbw k t hpa
-      have hdw : depth w < depth (CompactTy.mk [] none (some m) none c) :=
+      have hdw : depth w < depth (CompactTy.mk [] none (some m) none c wd) :=
         depth_variantPayload_lt (mem_of_lookup hwlk)
       exact ih pol w t (by omega) (wfKeys_iff.mp hwk k (mem_keys_of_lookup hwlk) w hwlk) hcw
     · obtain ⟨k, d, cod⟩ := g
       rw [wellFormed.eq_def] at hw
       simp only [Bool.and_eq_true] at hw
       obtain ⟨⟨hknc, hwd⟩, hwcod⟩ := hw.1.2
-      have hdd : depth d < depth (CompactTy.mk [] none none (some (k, d, cod)) c) :=
+      have hdd : depth d < depth (CompactTy.mk [] none none (some (k, d, cod)) c wd) :=
         depth_dom_lt
-      have hdc : depth cod < depth (CompactTy.mk [] none none (some (k, d, cod)) c) :=
+      have hdc : depth cod < depth (CompactTy.mk [] none none (some (k, d, cod)) c wd) :=
         depth_cod_lt
       have hbuild : ∀ (kf : FunKind) (dt ct : Ty), coalesce (!pol) d = .ok (some dt) →
           coalesce pol cod = .ok (some ct) → (Ty.fn none kf dt ct).WellFormed :=
@@ -1522,7 +1755,13 @@ with no position standing in for it.
 
 `Ty.WellFormed` is the same invariant transitivity and reflexivity assume: uniquely-keyed records
 and variants, without which the find-first rules and the equality
-short-circuit disagree. -/
+short-circuit disagree.
+
+The statement is the same with tuple widths in the model, and it covers every width the merge
+materializes: a closed tuple bounded by `u` fixes `u`'s width when `u` is closed, so both operands
+are closed at that width and so is the merge (`TupleWidth.merge_eq_exactly`). Two closed tuples of
+different widths have no merge at either polarity; the width conflicts and the merge does not
+materialize. -/
 theorem merge_is_least_type (pol : Bool) {a b : CompactTy} {u ta tb tm : Ty}
     (hga : concrete a = true) (hgb : concrete b = true) (hwu : u.WellFormed)
     (ha : coalesce pol a = .ok (some ta)) (hb : coalesce pol b = .ok (some tb))

@@ -92,6 +92,11 @@ struct KeyView {
     /// Record/tuple fields, unioned. Tuples and records share this representation
     /// keyed by `Index` / `Name`, exactly as `compact_type` normalizes them.
     rec: BTreeMap<FieldKey, KeyView>,
+    /// The width of each tuple contribution, beside its positions in [`rec`](Self::rec),
+    /// as `compact_type` keeps a `TupleWidth` beside them. Without it a closed tuple and an
+    /// open one listing the same positions would key alike, though a clone pinned at one
+    /// fixes a width the other leaves open (`docs/chl-spec.md`, "Tuple width").
+    tuple_widths: BTreeSet<TupleWidthKey>,
     /// Variant tags, unioned.
     var: BTreeMap<FieldKey, KeyView>,
     /// History contributions, keyed by kind so an `Overwrite` and an `Append`
@@ -124,6 +129,7 @@ impl PartialEq for KeyView {
             && same_refinements(&self.refinements, &other.refinements)
             && self.fun == other.fun
             && self.rec == other.rec
+            && self.tuple_widths == other.tuple_widths
             && self.var == other.var
             && self.history == other.history
             && self.nominal == other.nominal
@@ -162,6 +168,7 @@ impl KeyView {
             }
         }
         union_map(&mut self.rec, other.rec);
+        self.tuple_widths.extend(other.tuple_widths);
         union_map(&mut self.var, other.var);
         for (kind, (value, domain)) in other.history {
             match self.history.entry(kind) {
@@ -254,6 +261,15 @@ impl KeyView {
     }
 }
 
+/// A tuple contribution's width, as [`KeyView::tuple_widths`] keys it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum TupleWidthKey {
+    /// A closed tuple of this many positions.
+    Exactly(usize),
+    /// An open tuple listing this many positions.
+    AtLeast(usize),
+}
+
 fn union_map(into: &mut BTreeMap<FieldKey, KeyView>, from: BTreeMap<FieldKey, KeyView>) {
     for (k, v) in from {
         match into.entry(k) {
@@ -283,7 +299,15 @@ impl fmt::Display for KeyView {
             parts.push(format!("({d} {arrow} {c})"));
         }
         if !self.rec.is_empty() {
-            let fields: Vec<String> = self.rec.iter().map(|(k, v)| format!("{k}: {v}")).collect();
+            let mut fields: Vec<String> =
+                self.rec.iter().map(|(k, v)| format!("{k}: {v}")).collect();
+            if self
+                .tuple_widths
+                .iter()
+                .any(|w| matches!(w, TupleWidthKey::AtLeast(_)))
+            {
+                fields.push("..".to_string());
+            }
             parts.push(format!("({})", fields.join(", ")));
         }
         if !self.var.is_empty() {
@@ -560,12 +584,17 @@ fn key_go(ty: &Type, pol: bool, subst_acc: &Subst, ctx: &mut KeyCtx) -> KeyView 
             }
             acc
         }
-        Type::Tuple(ts) => KeyView {
+        Type::Tuple(ts) | Type::OpenTuple(ts) => KeyView {
             rec: ts
                 .iter()
                 .enumerate()
                 .map(|(i, t)| (FieldKey::Index(i), key_go(t, pol, subst_acc, ctx)))
                 .collect(),
+            tuple_widths: BTreeSet::from([if matches!(ty, Type::OpenTuple(_)) {
+                TupleWidthKey::AtLeast(ts.len())
+            } else {
+                TupleWidthKey::Exactly(ts.len())
+            }]),
             ..Default::default()
         },
         Type::Record(fs) => KeyView {
@@ -740,6 +769,12 @@ mod tests {
         assert_ne!(
             spec_key(&Type::Tuple(vec![int()])),
             spec_key(&Type::Tuple(vec![int(), int()]))
+        );
+        // Nor a closed tuple with an open one listing the same positions: one fixes
+        // the width the other leaves open.
+        assert_ne!(
+            spec_key(&Type::Tuple(vec![int(), int()])),
+            spec_key(&Type::OpenTuple(vec![int(), int()]))
         );
     }
 

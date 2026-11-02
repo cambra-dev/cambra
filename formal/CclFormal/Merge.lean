@@ -186,7 +186,94 @@ theorem joinKind_assoc (a b c : KindMerge) :
 theorem joinKind_idem (a : KindMerge) : joinKind a a = a := by
   cases a <;> rfl
 
-/-- Compact atoms, optional keyed shapes, an optional function and a refinement contribution.
+/-! ## The tuple width
+
+A tuple contributes its positions to the record slot and its width to this one, mirroring
+`compact.rs`'s `TupleWidth` (`src/ccl/design/type-inference.md`, "Tuple width"). The key sets
+already merge as the positions do, so the width is the fact the record slot cannot carry: whether
+the listed positions are all of the tuple's.
+
+The model's `conflict` carries no payload. Rust's `Conflict` keeps the first two widths found to
+have no merge, which only the diagnostic reads; the encoder drops them. -/
+
+/-- Mirror of `compact.rs :: TupleWidth`. `exactly n` is a closed tuple of `n` positions;
+`atLeast listed closed` is an open tuple listing `listed` positions, with `closed` the closed width
+a positive merge joined under it. -/
+inductive TupleWidth where
+  | exactly (n : Nat)
+  | atLeast (listed : Nat) (closed : Option Nat)
+  | conflict
+deriving Repr, DecidableEq
+
+/-- Mirror of `TupleWidth::merge`. A negative merge is the meet of the types the widths come
+from: an open width meets a closed one at least as wide as the closed one, and two open widths
+meet at the longer, keeping a closed width only when both recorded the same one. A positive merge joins, except that two closed widths that differ have no
+join, so an open width records the closed width joined under it and a second, different closed
+width conflicts whatever order the three arrive in. `conflict` absorbs at both polarities. -/
+def TupleWidth.merge (pol : Bool) : TupleWidth → TupleWidth → TupleWidth
+  | .conflict, _ => .conflict
+  | _, .conflict => .conflict
+  | .exactly m, .exactly n => if m = n then .exactly m else .conflict
+  | .atLeast p c, .atLeast q d =>
+      if pol then
+        if c = none ∨ d = none ∨ c = d then .atLeast (min p q) (c.or d) else .conflict
+      else .atLeast (max p q) (if c = d then c else none)
+  | .exactly n, .atLeast p c =>
+      if pol then
+        if c = none ∨ c = some n then .atLeast (min n p) (some n) else .conflict
+      else if p ≤ n then .exactly n else .conflict
+  | .atLeast p c, .exactly n =>
+      if pol then
+        if c = none ∨ c = some n then .atLeast (min n p) (some n) else .conflict
+      else if p ≤ n then .exactly n else .conflict
+
+theorem TupleWidth.merge_comm (pol : Bool) (a b : TupleWidth) : a.merge pol b = b.merge pol a := by
+  rcases a with m | ⟨p, _ | c⟩ | _ <;> rcases b with n | ⟨q, _ | d⟩ | _ <;> cases pol <;>
+    simp only [merge, Bool.false_eq_true, if_true, if_false, Option.or] <;>
+    (repeat' split) <;> simp_all [Nat.min_comm, Nat.max_comm] <;> omega
+
+theorem TupleWidth.merge_idem (pol : Bool) (a : TupleWidth) : a.merge pol a = a := by
+  rcases a with m | ⟨p, _ | c⟩ | _ <;> cases pol <;> simp [merge]
+
+/-- A merge distributes over a conditional operand, which is what lets the associativity proof
+reduce an inner merge before the outer one inspects it. -/
+theorem TupleWidth.merge_ite_left (pol : Bool) {p : Prop} [Decidable p] (x y z : TupleWidth) :
+    (if p then x else y).merge pol z = if p then x.merge pol z else y.merge pol z := by
+  by_cases h : p <;> simp [h]
+
+theorem TupleWidth.merge_ite_right (pol : Bool) {p : Prop} [Decidable p] (x y z : TupleWidth) :
+    z.merge pol (if p then x else y) = if p then z.merge pol x else z.merge pol y := by
+  by_cases h : p <;> simp [h]
+
+theorem TupleWidth.merge_assoc (pol : Bool) (a b c : TupleWidth) :
+    (a.merge pol b).merge pol c = a.merge pol (b.merge pol c) := by
+  rcases a with m | ⟨p, _ | c1⟩ | _ <;> rcases b with n | ⟨q, _ | c2⟩ | _ <;>
+    rcases c with o | ⟨r, _ | c3⟩ | _ <;> cases pol <;>
+    simp only [merge.eq_1, merge.eq_2, merge.eq_3, merge.eq_4, merge.eq_5, merge.eq_6,
+      merge_ite_left, merge_ite_right, Bool.false_eq_true, if_true, if_false, Option.or,
+      Nat.min_def, Nat.max_def, reduceCtorEq, Option.some.injEq, or_false, false_or] <;>
+    (repeat' split) <;> (try subst_vars) <;> (try simp_all) <;> (try omega)
+
+/-- The width slot's merge: `none`, a position no tuple contributed to, is the identity. -/
+def mergeWidth (pol : Bool) : Option TupleWidth → Option TupleWidth → Option TupleWidth
+  | none, w => w
+  | w, none => w
+  | some a, some b => some (a.merge pol b)
+
+theorem mergeWidth_comm (pol : Bool) (a b : Option TupleWidth) :
+    mergeWidth pol a b = mergeWidth pol b a := by
+  rcases a with _ | a <;> rcases b with _ | b <;> simp [mergeWidth, TupleWidth.merge_comm]
+
+theorem mergeWidth_idem (pol : Bool) (a : Option TupleWidth) : mergeWidth pol a a = a := by
+  rcases a with _ | a <;> simp [mergeWidth, TupleWidth.merge_idem]
+
+theorem mergeWidth_assoc (pol : Bool) (a b c : Option TupleWidth) :
+    mergeWidth pol (mergeWidth pol a b) c = mergeWidth pol a (mergeWidth pol b c) := by
+  rcases a with _ | a <;> rcases b with _ | b <;> rcases c with _ | c <;>
+    simp [mergeWidth, TupleWidth.merge_assoc]
+
+/-- Compact atoms, optional keyed shapes, an optional function, a refinement contribution and a
+tuple width.
 A function contains one domain and one codomain. In optional slots, `none` is absence,
 not a populated slot with empty content. See `formal/design.md`, "The polar merge". -/
 inductive CompactTy where
@@ -195,6 +282,7 @@ inductive CompactTy where
        (varT : Option (List (FieldKey × CompactTy)))
        (fn : Option (KindMerge × CompactTy × CompactTy))
        (refinements : Option (List Predicate))
+       (width : Option TupleWidth)
 deriving Repr
 
 namespace CompactTy
@@ -224,16 +312,18 @@ Compare modeled fields only; see `formal/design.md`, "Why the model carries `Com
 mutual
 
 /-- Atoms and refinements compare by membership; maps compare by lookup;
-function kind, domain and codomain compare componentwise. This is representation
+function kind, domain and codomain compare componentwise; the tuple width, which belongs to the
+record slot, compares by equality alongside it. This is representation
 equivalence, not a subtype test or equality of full Rust solver state. -/
 def equiv : CompactTy → CompactTy → Bool
-  | .mk a1 r1 v1 f1 c1, .mk a2 r2 v2 f2 c2 =>
+  | .mk a1 r1 v1 f1 c1 wd1, .mk a2 r2 v2 f2 c2 wd2 =>
     a1.all (a2.contains ·) && a2.all (a1.contains ·)
-      && (match r1, r2 with
+      && ((match r1, r2 with
           | none, none => true
           | some m1, some m2 =>
             subtypeKeys m1 m2 (m1.map Prod.fst) && subtypeKeys m2 m1 (m2.map Prod.fst)
           | _, _ => false)
+          && wd1 == wd2)
       && (match v1, v2 with
           | none, none => true
           | some m1, some m2 =>
@@ -284,7 +374,7 @@ mutual
 positive merges are joins (types union, refinements/record-keys intersect, variant
 tags union), negative merges are meets (the duals). -/
 def merge (pol : Bool) : CompactTy → CompactTy → CompactTy
-  | .mk a1 r1 v1 f1 c1, .mk a2 r2 v2 f2 c2 =>
+  | .mk a1 r1 v1 f1 c1 wd1, .mk a2 r2 v2 f2 c2 wd2 =>
     .mk (a1 ++ a2)
         (match r1, r2 with
          | none, r | r, none => r
@@ -302,6 +392,7 @@ def merge (pol : Bool) : CompactTy → CompactTy → CompactTy
          | none, f | f, none => f
          | some s1, some s2 => some (mergeFun pol s1 s2))
         (mergeRefinements pol c1 c2)
+        (mergeWidth pol wd1 wd2)
 termination_by a b => sizeOf a + sizeOf b
 
 /-- Keyed merge, intersecting keys (records at positive polarity, variants at
@@ -440,39 +531,39 @@ theorem subtypeKeys_iff {m1 m2 : List (FieldKey × CompactTy)} {ks : List FieldK
 /-! ## `equiv` is an equivalence relation -/
 
 theorem equiv_refl : (t : CompactTy) → equiv t t = true
-  | .mk a r v f c => by
-    have hmap : ∀ (m : List (FieldKey × CompactTy)), sizeOf m < sizeOf (CompactTy.mk a r v f c) →
+  | .mk a r v f c wd => by
+    have hmap : ∀ (m : List (FieldKey × CompactTy)), sizeOf m < sizeOf (CompactTy.mk a r v f c wd) →
         subtypeKeys m m (m.map Prod.fst) = true := by
       intro m hm
       rw [subtypeKeys_iff]
       intro k hk
       obtain ⟨w, hw⟩ := Option.isSome_iff_exists.mp (lookup_of_mem_keys hk)
-      have hsz : sizeOf w < sizeOf (CompactTy.mk a r v f c) :=
+      have hsz : sizeOf w < sizeOf (CompactTy.mk a r v f c wd) :=
         Nat.lt_trans (lookup_sizeOf hw) hm
       exact ⟨w, w, hw, hw, equiv_refl w⟩
     rw [equiv.eq_def]
     simp only [Bool.and_eq_true]
-    refine ⟨⟨⟨⟨⟨?_, ?_⟩, ?_⟩, ?_⟩, ?_⟩, ?_⟩
+    refine ⟨⟨⟨⟨⟨?_, ?_⟩, ⟨?_, by simp⟩⟩, ?_⟩, ?_⟩, ?_⟩
     · simp [List.all_eq_true]
     · simp [List.all_eq_true]
     · rcases r with _ | m
       · rfl
-      · have hm : sizeOf m < sizeOf (CompactTy.mk a (some m) v f c) := by
+      · have hm : sizeOf m < sizeOf (CompactTy.mk a (some m) v f c wd) := by
           simp
           omega
         simp [hmap m hm]
     · rcases v with _ | m
       · rfl
-      · have hm : sizeOf m < sizeOf (CompactTy.mk a r (some m) f c) := by
+      · have hm : sizeOf m < sizeOf (CompactTy.mk a r (some m) f c wd) := by
           simp
           omega
         simp [hmap m hm]
     · rcases f with _ | ⟨k, d, cod⟩
       · rfl
-      · have hszd : sizeOf d < sizeOf (CompactTy.mk a r v (some (k, d, cod)) c) := by
+      · have hszd : sizeOf d < sizeOf (CompactTy.mk a r v (some (k, d, cod)) c wd) := by
           simp
           omega
-        have hszc : sizeOf cod < sizeOf (CompactTy.mk a r v (some (k, d, cod)) c) := by
+        have hszc : sizeOf cod < sizeOf (CompactTy.mk a r v (some (k, d, cod)) c wd) := by
           simp
           omega
         simp [equiv_refl d, equiv_refl cod]
@@ -523,7 +614,7 @@ theorem mapClause_iff {m1 m2 : List (FieldKey × CompactTy)} :
       exact ⟨w, v, hw, hv, hbwd k v w hv hw⟩
 
 theorem equiv_symm : (a b : CompactTy) → equiv a b = true → equiv b a = true
-  | .mk a1 r1 v1 f1 c1, .mk a2 r2 v2 f2 c2 => by
+  | .mk a1 r1 v1 f1 c1 wd1, .mk a2 r2 v2 f2 c2 wd2 => by
     intro h
     rw [equiv.eq_def] at h
     simp only [Bool.and_eq_true] at h
@@ -541,13 +632,13 @@ theorem equiv_symm : (a b : CompactTy) → equiv a b = true → equiv b a = true
         obtain ⟨⟨hk, hd⟩, hcod⟩ := hf
         simp only [Bool.and_eq_true]
         have hszc : sizeOf cod2 + sizeOf cod1 <
-            sizeOf (CompactTy.mk a2 r2 v2 (some (k2, d2, cod2)) c2) +
-              sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1) := by
+            sizeOf (CompactTy.mk a2 r2 v2 (some (k2, d2, cod2)) c2 wd2) +
+              sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1 wd1) := by
           simp
           omega
         have hszd : sizeOf d2 + sizeOf d1 <
-            sizeOf (CompactTy.mk a2 r2 v2 (some (k2, d2, cod2)) c2) +
-              sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1) := by
+            sizeOf (CompactTy.mk a2 r2 v2 (some (k2, d2, cod2)) c2 wd2) +
+              sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1 wd1) := by
           simp
           omega
         refine ⟨⟨?_, equiv_symm d1 d2 hd⟩, equiv_symm cod1 cod2 hcod⟩
@@ -557,7 +648,7 @@ termination_by a b => sizeOf a + sizeOf b
 decreasing_by all_goals omega
 
 theorem equiv_trans : (a b c : CompactTy) → equiv a b = true → equiv b c = true → equiv a c = true
-  | .mk a1 r1 v1 f1 c1, .mk a2 r2 v2 f2 c2, .mk a3 r3 v3 f3 c3 => by
+  | .mk a1 r1 v1 f1 c1 wd1, .mk a2 r2 v2 f2 c2 wd2, .mk a3 r3 v3 f3 c3 wd3 => by
     intro hab hbc
     rw [equiv.eq_def] at hab hbc
     simp only [Bool.and_eq_true] at hab hbc
@@ -576,8 +667,8 @@ theorem equiv_trans : (a b c : CompactTy) → equiv a b = true → equiv b c = t
       have h2 := hyz _ h1
       simpa using h2
     have hmapTrans : ∀ (m1 m2 m3 : List (FieldKey × CompactTy)),
-        sizeOf m1 < sizeOf (CompactTy.mk a1 r1 v1 f1 c1) →
-        sizeOf m3 < sizeOf (CompactTy.mk a3 r3 v3 f3 c3) →
+        sizeOf m1 < sizeOf (CompactTy.mk a1 r1 v1 f1 c1 wd1) →
+        sizeOf m3 < sizeOf (CompactTy.mk a3 r3 v3 f3 c3 wd3) →
         (subtypeKeys m1 m2 (m1.map Prod.fst) && subtypeKeys m2 m1 (m2.map Prod.fst)) = true →
         (subtypeKeys m2 m3 (m2.map Prod.fst) && subtypeKeys m3 m2 (m3.map Prod.fst)) = true →
         (subtypeKeys m1 m3 (m1.map Prod.fst) && subtypeKeys m3 m1 (m3.map Prod.fst)) = true := by
@@ -589,22 +680,28 @@ theorem equiv_trans : (a b c : CompactTy) → equiv a b = true → equiv b c = t
       · obtain ⟨y, hy⟩ := Option.isSome_iff_exists.mp ((hdom12 k).mp (by simp [hx]))
         have hxy := hfwd12 k x y hx hy
         have hyz := hfwd23 k y z hy hz
-        have hszx : sizeOf x < sizeOf (CompactTy.mk a1 r1 v1 f1 c1) :=
+        have hszx : sizeOf x < sizeOf (CompactTy.mk a1 r1 v1 f1 c1 wd1) :=
           Nat.lt_trans (lookup_sizeOf hx) hs1
-        have hszz : sizeOf z < sizeOf (CompactTy.mk a3 r3 v3 f3 c3) :=
+        have hszz : sizeOf z < sizeOf (CompactTy.mk a3 r3 v3 f3 c3 wd3) :=
           Nat.lt_trans (lookup_sizeOf hz) hs3
         exact equiv_trans x y z hxy hyz
       · obtain ⟨y, hy⟩ := Option.isSome_iff_exists.mp ((hdom12 k).mp (by simp [hx]))
         have hzy := hbwd23 k y z hy hz
         have hyx := hbwd12 k x y hx hy
-        have hszx : sizeOf x < sizeOf (CompactTy.mk a1 r1 v1 f1 c1) :=
+        have hszx : sizeOf x < sizeOf (CompactTy.mk a1 r1 v1 f1 c1 wd1) :=
           Nat.lt_trans (lookup_sizeOf hx) hs1
-        have hszz : sizeOf z < sizeOf (CompactTy.mk a3 r3 v3 f3 c3) :=
+        have hszz : sizeOf z < sizeOf (CompactTy.mk a3 r3 v3 f3 c3 wd3) :=
           Nat.lt_trans (lookup_sizeOf hz) hs3
         exact equiv_trans z y x hzy hyx
     refine ⟨⟨⟨⟨⟨hsub a1 a2 a3 hab1 hbc1, hsub a3 a2 a1 hbc2 hab2⟩, ?_⟩, ?_⟩, ?_⟩,
       refinementsEquiv_trans habc hbcc⟩
-    · rcases r1 with _ | m1 <;> rcases r2 with _ | m2 <;> rcases r3 with _ | m3 <;>
+    · refine ⟨?_, ?_⟩
+      rotate_left
+      · simp only [beq_iff_eq] at habr hbcr ⊢
+        exact habr.2.trans hbcr.2
+      replace habr := habr.1
+      replace hbcr := hbcr.1
+      rcases r1 with _ | m1 <;> rcases r2 with _ | m2 <;> rcases r3 with _ | m3 <;>
         first
         | rfl
         | (simp at habr; done)
@@ -628,13 +725,13 @@ theorem equiv_trans : (a b c : CompactTy) → equiv a b = true → equiv b c = t
       obtain ⟨⟨hbck, hbcd⟩, hbccod⟩ := hbcf
       simp only [Bool.and_eq_true]
       have hszc : sizeOf cod1 + sizeOf cod3 <
-          sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1) +
-            sizeOf (CompactTy.mk a3 r3 v3 (some (k3, d3, cod3)) c3) := by
+          sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1 wd1) +
+            sizeOf (CompactTy.mk a3 r3 v3 (some (k3, d3, cod3)) c3 wd3) := by
         simp
         omega
       have hszd : sizeOf d1 + sizeOf d3 <
-          sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1) +
-            sizeOf (CompactTy.mk a3 r3 v3 (some (k3, d3, cod3)) c3) := by
+          sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1 wd1) +
+            sizeOf (CompactTy.mk a3 r3 v3 (some (k3, d3, cod3)) c3 wd3) := by
         simp
         omega
       refine ⟨⟨?_, equiv_trans d1 d2 d3 habd hbcd⟩, equiv_trans cod1 cod2 cod3 habcod hbccod⟩
@@ -739,8 +836,8 @@ it is populated at all is not. -/
 theorem merge_slots (pol : Bool) (a1 a2 : List Atom)
     (r1 r2 v1 v2 : Option (List (FieldKey × CompactTy)))
     (f1 f2 : Option (KindMerge × CompactTy × CompactTy)) (c1 c2 : Option (List Predicate)) :
-    ∃ r v f, merge pol (.mk a1 r1 v1 f1 c1) (.mk a2 r2 v2 f2 c2)
-        = .mk (a1 ++ a2) r v f (mergeRefinements pol c1 c2) ∧
+    ∃ r v f, merge pol (.mk a1 r1 v1 f1 c1 wd1) (.mk a2 r2 v2 f2 c2 wd2)
+        = .mk (a1 ++ a2) r v f (mergeRefinements pol c1 c2) (mergeWidth pol wd1 wd2) ∧
       (r = none ↔ r1 = none ∧ r2 = none) ∧ (v = none ↔ v1 = none ∧ v2 = none) ∧
       (f = none ↔ f1 = none ∧ f2 = none) := by
   rw [merge.eq_def]
@@ -794,7 +891,7 @@ theorem funClause_of_funEquiv {s1 s2 : KindMerge × CompactTy × CompactTy}
 mutual
 
 theorem merge_comm (pol : Bool) : (a b : CompactTy) → equiv (merge pol a b) (merge pol b a) = true
-  | .mk a1 r1 v1 f1 c1, .mk a2 r2 v2 f2 c2 => by
+  | .mk a1 r1 v1 f1 c1 wd1, .mk a2 r2 v2 f2 c2 wd2 => by
     -- Pointwise commutativity of the two keyed merges, packaged with the size
     -- bounds the recursive calls need.
     have hinter : ∀ (p : Bool) (m1 m2 : List (FieldKey × CompactTy)),
@@ -867,7 +964,7 @@ theorem merge_comm (pol : Bool) : (a b : CompactTy) → equiv (merge pol a b) (m
           exact equiv_symm _ _ (hcomm v w k h1 h2)
     rw [merge.eq_def, merge.eq_def, equiv.eq_def]
     simp only [Bool.and_eq_true]
-    refine ⟨⟨⟨⟨⟨?_, ?_⟩, ?_⟩, ?_⟩, ?_⟩, ?_⟩
+    refine ⟨⟨⟨⟨⟨?_, ?_⟩, ⟨?_, by simp [mergeWidth_comm]⟩⟩, ?_⟩, ?_⟩, ?_⟩
     · simp only [List.all_eq_true, List.contains_iff_mem, List.mem_append]
       intro x hx
       exact hx.symm
@@ -907,8 +1004,8 @@ theorem merge_comm (pol : Bool) : (a b : CompactTy) → equiv (merge pol a b) (m
       · simpa using funClause_of_funEquiv (s1 := (k1, d1, cod1)) (s2 := (k1, d1, cod1))
           ⟨rfl, equiv_refl d1, equiv_refl cod1⟩
       · have hsz : sizeOf (k1, d1, cod1) + sizeOf (k2, d2, cod2) <
-            sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1) +
-              sizeOf (CompactTy.mk a2 r2 v2 (some (k2, d2, cod2)) c2) := by
+            sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1 wd1) +
+              sizeOf (CompactTy.mk a2 r2 v2 (some (k2, d2, cod2)) c2 wd2) := by
           simp
           omega
         simpa using funClause_of_funEquiv
@@ -952,7 +1049,7 @@ mutual
 /-- Nesting depth: one for the position, plus the deepest child. Atoms and refinements
 do not nest, so they do not count. -/
 def depth : CompactTy → Nat
-  | .mk _ recF varT fn _ =>
+  | .mk _ recF varT fn _ _ =>
     1 + Nat.max (optMapDepth recF) (Nat.max (optMapDepth varT) (optFnDepth fn))
 
 def optMapDepth : Option (List (FieldKey × CompactTy)) → Nat
@@ -972,7 +1069,7 @@ end
 /-! ### Reading `depth` -/
 
 theorem depth_pos (t : CompactTy) : 1 ≤ depth t := by
-  rcases t with ⟨a, r, v, f, c⟩
+  rcases t with ⟨a, r, v, f, c, wd⟩
   rw [depth]
   omega
 
@@ -1130,7 +1227,7 @@ theorem succ_max_le (A B : Nat) : 1 + Nat.max A B ≤ Nat.max (1 + A) (1 + B) :=
 theorem depth_mk_le {a1 : List Atom} {r v : Option (List (FieldKey × CompactTy))}
     {f : Option (KindMerge × CompactTy × CompactTy)} {c : Option (List Predicate)} {bnd : Nat}
     (hr : optMapDepth r ≤ bnd) (hv : optMapDepth v ≤ bnd) (hf : optFnDepth f ≤ bnd) :
-    depth (CompactTy.mk a1 r v f c) ≤ 1 + bnd := by
+    depth (CompactTy.mk a1 r v f c wd) ≤ 1 + bnd := by
   rw [depth]
   exact Nat.add_le_add_left (Nat.max_le.mpr ⟨hr, Nat.max_le.mpr ⟨hv, hf⟩⟩) 1
 
@@ -1146,8 +1243,8 @@ theorem merge_depth_le_bounded : ∀ (n : Nat) (pol : Bool) (a b : CompactTy),
     exact absurd (Nat.le_trans (depth_pos a) ha) (by omega)
   | succ n ih =>
     intro pol a b ha hb
-    rcases a with ⟨a1, r1, v1, f1, c1⟩
-    rcases b with ⟨a2, r2, v2, f2, c2⟩
+    rcases a with ⟨a1, r1, v1, f1, c1, wd1⟩
+    rcases b with ⟨a2, r2, v2, f2, c2, wd2⟩
     -- Children are shallower than their position, so the bound drops by one and the
     -- induction hypothesis applies to any pair of them.
     have hchild : ∀ x y : CompactTy,
@@ -1280,7 +1377,7 @@ def nodupKeys : List FieldKey → Bool
 
 /-- The input-bound invariant (see the section header). -/
 def wellFormed : CompactTy → Bool
-  | .mk atoms r v f c =>
+  | .mk atoms r v f c _ =>
     (match r with
      | none => true
      | some m => wellFormedKeys m (m.map Prod.fst) && nodupKeys (m.map Prod.fst))
@@ -1347,7 +1444,7 @@ theorem wfKeys_iff {m : List (FieldKey × CompactTy)} {ks : List FieldKey} :
 
 theorem merge_idem (pol : Bool) : (a : CompactTy) → wellFormed a = true → equiv (merge pol a a) a =
     true
-  | .mk a1 r1 v1 f1 c1 => by
+  | .mk a1 r1 v1 f1 c1 wd1 => by
     intro hwf
     rw [wellFormed.eq_def] at hwf
     simp only [Bool.and_eq_true] at hwf
@@ -1395,7 +1492,7 @@ theorem merge_idem (pol : Bool) : (a : CompactTy) → wellFormed a = true → eq
           exact equiv_symm _ _ (hidem _ k h1)
     rw [merge.eq_def, equiv.eq_def]
     simp only [Bool.and_eq_true]
-    refine ⟨⟨⟨⟨⟨?_, ?_⟩, ?_⟩, ?_⟩, ?_⟩, ?_⟩
+    refine ⟨⟨⟨⟨⟨?_, ?_⟩, ⟨?_, by simp [mergeWidth_idem]⟩⟩, ?_⟩, ?_⟩, ?_⟩
     · simp only [List.all_eq_true, List.contains_iff_mem, List.mem_append]
       exact fun x hx => hx.elim id id
     · simp only [List.all_eq_true, List.contains_iff_mem, List.mem_append]
@@ -1440,11 +1537,11 @@ theorem merge_idem (pol : Bool) : (a : CompactTy) → wellFormed a = true → eq
       · rfl
       · simp only [Bool.and_eq_true, bne_iff_ne, ne_eq] at hwfn
         obtain ⟨⟨_, hwd⟩, hwcod⟩ := hwfn
-        have hszd : sizeOf d1 < sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1) := by
+        have hszd : sizeOf d1 < sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1 wd1) := by
           simp
           omega
         have hszc : sizeOf cod1 <
-            sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1) := by
+            sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1 wd1) := by
           simp
           omega
         have hd : equiv (merge (!pol) d1 d1) d1 = true := merge_idem (!pol) d1 hwd
@@ -1483,11 +1580,11 @@ mutual
 
 theorem merge_congr_left (pol : Bool) :
     (a a' b : CompactTy) → equiv a a' = true → equiv (merge pol a b) (merge pol a' b) = true
-  | .mk a1 r1 v1 f1 c1, .mk a1' r1' v1' f1' c1', .mk b1 rb vb fb cb => by
+  | .mk a1 r1 v1 f1 c1 wd1, .mk a1' r1' v1' f1' c1' wd1', .mk b1 rb vb fb cb wdb => by
     intro h
     rw [equiv.eq_def] at h
     simp only [Bool.and_eq_true] at h
-    obtain ⟨⟨⟨⟨⟨h1, h2⟩, hr⟩, hv⟩, hf⟩, hcl⟩ := h
+    obtain ⟨⟨⟨⟨⟨h1, h2⟩, ⟨hr, hwd⟩⟩, hv⟩, hf⟩, hcl⟩ := h
     -- Pointwise congruence for the two keyed merges.
     have hinterC : ∀ (p : Bool) (m1 m1' m2 : List (FieldKey × CompactTy)),
         (subtypeKeys m1 m1' (m1.map Prod.fst) && subtypeKeys m1' m1 (m1'.map Prod.fst)) = true →
@@ -1645,7 +1742,7 @@ theorem merge_congr_left (pol : Bool) :
     rw [merge.eq_def, merge.eq_def, equiv.eq_def]
     simp only [Bool.and_eq_true]
     simp only [List.all_eq_true, List.contains_iff_mem] at h1 h2
-    refine ⟨⟨⟨⟨⟨?_, ?_⟩, ?_⟩, ?_⟩, ?_⟩, ?_⟩
+    refine ⟨⟨⟨⟨⟨?_, ?_⟩, ⟨?_, by simp only [beq_iff_eq] at hwd ⊢; rw [hwd]⟩⟩, ?_⟩, ?_⟩, ?_⟩
     · simp only [List.all_eq_true, List.contains_iff_mem, List.mem_append]
       exact fun x hx => hx.imp (fun hm => by simpa using h1 x hm) id
     · simp only [List.all_eq_true, List.contains_iff_mem, List.mem_append]
@@ -1707,9 +1804,9 @@ theorem merge_congr_left (pol : Bool) :
           obtain ⟨⟨hk, hd⟩, hcod⟩ := hf
           have hk' : k1 = k1' := by simpa using hk
           have hsz : sizeOf (k1, d1, cod1) + sizeOf (k1', d1', cod1') + sizeOf sb <
-              sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1) +
-                sizeOf (CompactTy.mk a1' r1' v1' (some (k1', d1', cod1')) c1') +
-                sizeOf (CompactTy.mk b1 rb vb (some sb) cb) := by
+              sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1 wd1) +
+                sizeOf (CompactTy.mk a1' r1' v1' (some (k1', d1', cod1')) c1' wd1') +
+                sizeOf (CompactTy.mk b1 rb vb (some sb) cb wdb) := by
             simp
             omega
           have hde : FunEquiv (k1, d1, cod1) (k1', d1', cod1') := ⟨hk', hd, hcod⟩
@@ -1794,7 +1891,7 @@ mutual
 theorem merge_assoc (pol : Bool) :
     (a b c : CompactTy) →
       equiv (merge pol (merge pol a b) c) (merge pol a (merge pol b c)) = true
-  | .mk a1 r1 v1 f1 c1, .mk a2 r2 v2 f2 c2, .mk a3 r3 v3 f3 c3 => by
+  | .mk a1 r1 v1 f1 c1 wd1, .mk a2 r2 v2 f2 c2 wd2, .mk a3 r3 v3 f3 c3 wd3 => by
     -- Pointwise associativity for the two keyed merges.
     have hinterA : ∀ (p : Bool) (m1 m2 m3 : List (FieldKey × CompactTy)),
         (∀ x y z k, m1.lookup k = some x → m2.lookup k = some y → m3.lookup k = some z →
@@ -1868,7 +1965,7 @@ theorem merge_assoc (pol : Bool) :
     rw [merge.eq_def, merge.eq_def, merge.eq_def, merge.eq_def, equiv.eq_def]
     dsimp only
     simp only [Bool.and_eq_true]
-    refine ⟨⟨⟨⟨⟨?_, ?_⟩, ?_⟩, ?_⟩, ?_⟩, ?_⟩
+    refine ⟨⟨⟨⟨⟨?_, ?_⟩, ⟨?_, by simp [mergeWidth_assoc]⟩⟩, ?_⟩, ?_⟩, ?_⟩
     · simp only [List.all_eq_true, List.contains_iff_mem, List.mem_append]
       exact fun x hx => by simpa [or_assoc] using hx
     · simp only [List.all_eq_true, List.contains_iff_mem, List.mem_append]
@@ -1914,9 +2011,9 @@ theorem merge_assoc (pol : Bool) :
       obtain ⟨k2, d2, cod2⟩ := s2
       obtain ⟨k3, d3, cod3⟩ := s3
       have hsz : sizeOf (k1, d1, cod1) + sizeOf (k2, d2, cod2) + sizeOf (k3, d3, cod3) <
-          sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1) +
-            sizeOf (CompactTy.mk a2 r2 v2 (some (k2, d2, cod2)) c2) +
-            sizeOf (CompactTy.mk a3 r3 v3 (some (k3, d3, cod3)) c3) := by
+          sizeOf (CompactTy.mk a1 r1 v1 (some (k1, d1, cod1)) c1 wd1) +
+            sizeOf (CompactTy.mk a2 r2 v2 (some (k2, d2, cod2)) c2 wd2) +
+            sizeOf (CompactTy.mk a3 r3 v3 (some (k3, d3, cod3)) c3 wd3) := by
         simp
         omega
       simpa using funClause_of_funEquiv
@@ -2015,7 +2112,7 @@ establish cross-polarity absorption or distributivity.
 
 /-- The empty position: no contribution at any slot, which is what a `Hole`
 compacts to (`CompactType::empty`). -/
-def emptyPosition : CompactTy := .mk [] none none none none
+def emptyPosition : CompactTy := .mk [] none none none none none
 
 /-- The empty position is the merge identity, at either polarity. Every slot's
 `none` is its own identity, the atom list unions, and the refinement slot's sentinel supplies the
@@ -2024,7 +2121,7 @@ neutral) — so the merged position is the other side itself, not merely `equiv`
 still folds from the first bound,
 but nothing in the algebra requires that any more. -/
 theorem merge_cempty_left (pol : Bool) (a : CompactTy) : merge pol emptyPosition a = a := by
-  rcases a with ⟨a1, r1, v1, f1, c1⟩
+  rcases a with ⟨a1, r1, v1, f1, c1, wd1⟩
   rw [merge.eq_def]
   rfl
 
