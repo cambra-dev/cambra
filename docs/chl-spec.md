@@ -4160,6 +4160,25 @@ trait Scales(V, F):
   written type, so one without a `causes` clause causes nothing, and an associated type
   `Name <: Effect` lets instances cause different effects
   ([Effects in traits](#effects-in-traits)).
+- **A parameter may be pass-by-reference.** `Mut(V)`, `Mut(V, Txn)` and `Feed(V)` state a
+  parameter as they do on a `def`
+  ([6.2 Non-purity as type wrappers](#62-non-purity-as-type-wrappers)): the caller's variable or
+  feed is the argument, and an instance's function writes it. A signature states them nowhere else,
+  neither nested in a type nor as the result. An instance's function takes the signature's
+  parameter without restating it, and a call through a summon or a requirement passes the variable
+  or feed as a `def`'s call does:
+
+  ```python
+  trait Take(T):
+      def take(t: T, s: Mut(Int, Txn), n: Int) => Int
+
+  instance Take(Box):
+      def take(t, s, n):
+          with begin():
+              s := s - n
+          n
+  ```
+
 - **A trait's function is no method.** No parameter of one is named `self`, in the trait or in an
   instance, and a call reads it from an instance: `summon(Scales(_, _))::scale_vec(2, v)`, not
   `2.scale_vec(v)` ([Associated functions and methods](#associated-functions-and-methods)).

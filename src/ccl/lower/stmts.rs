@@ -4083,9 +4083,9 @@ fn lower_type_application(
             };
             Ok(Type::collection_of(lower_type_expr(elem, ctx)?))
         }
-        // `Mut(…)` in a nested position is handled by `mut_annotation_parts`
-        // before this function is reached; seeing it here means a `Mut` inside
-        // another type, which is not supported yet.
+        // `Mut(…)` and `Feed(…)` in a nested position are refused: a binder or a trait
+        // signature's parameter states them (`mut_annotation_parts`,
+        // `lower::traits::signature_input`), and no other type position spells them.
         other => Err(LoweringError::unsupported(
             span,
             format!("unknown type application: `{other}(…)`"),

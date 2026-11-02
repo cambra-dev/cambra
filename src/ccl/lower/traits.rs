@@ -88,7 +88,7 @@ fn instance_function(
     instance: &TraitRequirement,
     function: &Spanned<SmolStr>,
     ctx: &mut LoweringContext,
-) -> Result<(Expr, usize), LoweringError> {
+) -> Result<(Expr, usize, bool), LoweringError> {
     let trait_ = &instance.trait_;
     let Some(declared) = trait_.function(&function.node) else {
         return Err(LoweringError::unsupported(
@@ -109,13 +109,19 @@ fn instance_function(
         ));
     }
     let arity = declared.signature.inputs.len();
+    let curried = arity > 1
+        && declared
+            .signature
+            .inputs
+            .iter()
+            .any(|t| t.history_parts().is_some());
     let node = Expr::new(TypedExprNode::TraitFn {
         trait_: trait_.clone(),
         function: declared.name.clone(),
         operands: instance.args.clone(),
         assoc: instance.assoc.clone(),
     });
-    Ok((ctx.tag_image(node, function.span), arity))
+    Ok((ctx.tag_image(node, function.span), arity, curried))
 }
 
 /// `i::f`, the function of an instance as a value.
@@ -124,7 +130,7 @@ pub(super) fn lower_instance_member(
     function: &Spanned<SmolStr>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    instance_function(instance, function, ctx).map(|(f, _)| f)
+    instance_function(instance, function, ctx).map(|(f, ..)| f)
 }
 
 /// `i::f(a…)`: the function of an instance applied to its arguments.
@@ -135,7 +141,7 @@ pub(super) fn lower_instance_member_call(
     args: &[Spanned<ChlExpr>],
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    let (f, arity) = instance_function(instance, function, ctx)?;
+    let (f, arity, curried) = instance_function(instance, function, ctx)?;
     if arity != args.len() {
         return Err(LoweringError::unsupported(
             span,
@@ -147,6 +153,15 @@ pub(super) fn lower_instance_member_call(
                 args.len()
             ),
         ));
+    }
+    if curried {
+        // A signature with a pass-by-reference parameter is curried (`lower_curried_call`).
+        let mut acc = f;
+        for arg in args {
+            let applied = Expr::apply(lower_call_arg(arg, ctx)?, acc);
+            acc = ctx.tag_machinery(applied, span, "lower.curried_call");
+        }
+        return Ok(acc);
     }
     apply_to_arguments(f, span, args, ctx)
 }
@@ -647,7 +662,7 @@ fn signature_types(
                 ),
             ));
         }
-        inputs.push(signature_type(&annotation.ty, qualified, ctx)?);
+        inputs.push(signature_input(&annotation.ty, qualified, ctx)?);
     }
     let Some(output) = output else {
         return Err(LoweringError::unsupported(
@@ -657,6 +672,39 @@ fn signature_types(
     };
     let output = signature_type(output, qualified, ctx)?;
     Ok((inputs, output))
+}
+
+/// A parameter's type in a trait's signature. `Mut(V)`, `Mut(V, Txn)` and `Feed(V)` state a
+/// pass-by-reference parameter, as they do on a `def`'s: the caller's variable or feed is the
+/// argument, and the function writes it (`docs/chl-spec.md`, "Declaring a trait").
+fn signature_input(
+    annotation: &Spanned<ChlExpr>,
+    qualified: &str,
+    ctx: &mut LoweringContext,
+) -> Result<Type, LoweringError> {
+    if let Some(parts) = mut_annotation_parts(annotation, ctx) {
+        let (value, transactional) = parts?;
+        return Ok(Type::mutable(
+            if transactional { Type::Txn } else { Type::Hole },
+            value,
+        ));
+    }
+    if is_feed_type(annotation) {
+        let ChlExpr::Call { args, .. } = &annotation.node else {
+            unreachable!("`is_feed_type` matched a call")
+        };
+        let [value] = args.as_slice() else {
+            return Err(LoweringError::unsupported(
+                annotation.span,
+                "`Feed` takes one type argument: `Feed(T)`",
+            ));
+        };
+        return Ok(Type::feed(
+            Type::Hole,
+            signature_type(value, qualified, ctx)?,
+        ));
+    }
+    signature_type(annotation, qualified, ctx)
 }
 
 /// A type a trait's signature states, lowered.
@@ -1718,10 +1766,34 @@ fn lower_instance_def(
         match &p.annotation {
             None => {
                 let alias = signature_alias(i);
-                ctx.declare_type_throughout(alias.as_str(), AliasType::Type(stated.clone()));
+                // A pass-by-reference parameter is recognized by its written annotation
+                // (`Mut(V, Txn)`, `Feed(V)`), so the instance's parameter states the
+                // signature's history type that way, over an alias of its value type.
+                let ty = if let Some((domain, value, kind)) = stated.history_parts() {
+                    ctx.declare_type_throughout(alias.as_str(), AliasType::Type(value.clone()));
+                    let at = p.name_span;
+                    let name = |n: &str| Spanned::new(at, ChlExpr::Name(n.into()));
+                    let (head, args) = match kind {
+                        crate::ccl::ty::HistoryKind::Append => ("Feed", vec![name(alias.as_str())]),
+                        _ if matches!(domain, Type::Txn) => {
+                            ("Mut", vec![name(alias.as_str()), name("Txn")])
+                        }
+                        _ => ("Mut", vec![name(alias.as_str())]),
+                    };
+                    Spanned::new(
+                        at,
+                        ChlExpr::Call {
+                            func: Box::new(name(head)),
+                            args,
+                        },
+                    )
+                } else {
+                    ctx.declare_type_throughout(alias.as_str(), AliasType::Type(stated.clone()));
+                    Spanned::new(p.name_span, ChlExpr::Name(alias.into()))
+                };
                 p.annotation = Some(TypeAnnotation {
                     mode: AnnotationMode::Exact,
-                    ty: Spanned::new(p.name_span, ChlExpr::Name(alias.into())),
+                    ty,
                 });
             }
             Some(written) => {
