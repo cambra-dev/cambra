@@ -2102,3 +2102,42 @@ const SUM_REACHED_PLAIN: &str = "a sum reached a plain collection";
 fn a_data_function_type_is_no_value() {
     check_compile_error("x = Int |=> Int\n1", "`T |=> U` is a data-function *type*");
 }
+
+/// TODO: Currently fails because domain of `xs` is `UIntRange(..)`,
+/// which is not comparable to the base type `Int` of the key.
+#[test]
+fn checked_lookup_is_option() {
+    check_compile_error(
+        indoc! {r#"
+xs = [1,2,3]
+xs[1]
+        "#},
+        "expected 0..3, found Int",
+    )
+}
+
+/// TODO: Currently fails because domain of `xs` is `UIntRange(..)`,
+/// which is not comparable to the base type `Int` of the key.
+#[test]
+fn proven_lookup_direct() {
+    check_compile_error(
+        indoc! {r#"
+xs = [1,2,3]
+xs[1]!
+        "#},
+        "expected 0..3, found Int",
+    )
+}
+
+/// TODO: Add `!` as a general postfix operator. It is currently only
+/// accepted as part of a proven lookup expression `c[k]!`.
+#[test]
+fn proven_option_unwrap() {
+    check_compile_error(
+        indoc! {r#"
+x = Option::some(1)
+x!
+        "#},
+        "found '!', expected binary operator",
+    )
+}
