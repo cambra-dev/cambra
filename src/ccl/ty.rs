@@ -4093,11 +4093,24 @@ pub struct Refinement {
     normal: NormalFormCache,
 }
 
-/// A [`Refinement`]'s normal form, computed the first time the refinement is compared or
-/// hashed. It holds the predicate `Rc` it was computed for, and a refinement whose predicate
-/// was re-pointed since computes it again.
+/// The normal form of the term a type quotes (a [`Refinement`]'s predicate or a
+/// [`WitnessProjection`]'s sum), computed the first time the type is compared or hashed. It holds
+/// the term `Rc` it was computed for, and a term re-pointed since computes it again.
 #[derive(Clone, Default)]
 struct NormalFormCache(RefCell<Option<(Rc<TypedExpr>, Rc<TypedExpr>)>>);
+
+impl NormalFormCache {
+    fn of(&self, term: &Rc<TypedExpr>) -> Rc<TypedExpr> {
+        if let Some((for_term, normal)) = &*self.0.borrow()
+            && Rc::ptr_eq(for_term, term)
+        {
+            return Rc::clone(normal);
+        }
+        let normal = Rc::new(ccl_utils::normal_form(term));
+        *self.0.borrow_mut() = Some((Rc::clone(term), Rc::clone(&normal)));
+        normal
+    }
+}
 
 impl fmt::Debug for Refinement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -4110,14 +4123,7 @@ impl fmt::Debug for Refinement {
 impl Refinement {
     /// The predicate's normal form ([`crate::ccl::ccl_utils::normal_form`]).
     pub(crate) fn normal(&self) -> Rc<TypedExpr> {
-        if let Some((for_predicate, normal)) = &*self.normal.0.borrow()
-            && Rc::ptr_eq(for_predicate, &self.predicate)
-        {
-            return Rc::clone(normal);
-        }
-        let normal = Rc::new(ccl_utils::normal_form(&self.predicate));
-        *self.normal.0.borrow_mut() = Some((Rc::clone(&self.predicate), Rc::clone(&normal)));
-        normal
+        self.normal.of(&self.predicate)
     }
 }
 
@@ -4150,14 +4156,7 @@ impl WitnessProjection {
 
     /// The term's normal form ([`crate::ccl::ccl_utils::normal_form`]).
     pub(crate) fn normal(&self) -> Rc<TypedExpr> {
-        if let Some((for_term, normal)) = &*self.normal.0.borrow()
-            && Rc::ptr_eq(for_term, &self.term)
-        {
-            return Rc::clone(normal);
-        }
-        let normal = Rc::new(ccl_utils::normal_form(&self.term));
-        *self.normal.0.borrow_mut() = Some((Rc::clone(&self.term), Rc::clone(&normal)));
-        normal
+        self.normal.of(&self.term)
     }
 
     /// The witness this projects, as the term's own type binds it.
