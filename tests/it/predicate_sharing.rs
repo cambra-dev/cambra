@@ -242,22 +242,3 @@ fn metric_counts_predicate_on_let_binding_slot() {
     }
     assert_eq!(distinct_predicate_rcs(&expr), 1);
 }
-
-/// A witness projection's normal-form cache is keyed by the term `Rc` it was computed for, so a
-/// projection whose term was re-pointed compares by the new term rather than the cached one.
-#[test]
-fn a_witness_projection_re_pointed_to_another_term_compares_by_the_new_term() {
-    use cambra::ccl::WitnessProjection;
-    let one = || Rc::new(Expr::lit(Lit::Int(1)));
-    let mut projection = WitnessProjection::new(one(), 0);
-    let other = WitnessProjection::new(one(), 0);
-    assert_eq!(
-        projection, other,
-        "equal terms at distinct `Rc`s compare by normal form"
-    );
-    projection.term = Rc::new(Expr::lit(Lit::Int(2)));
-    assert_ne!(
-        projection, other,
-        "the cached normal form belongs to the term the projection no longer holds"
-    );
-}

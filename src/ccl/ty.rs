@@ -4095,7 +4095,7 @@ pub struct Refinement {
 
 /// The normal form of the term a type quotes (a [`Refinement`]'s predicate or a
 /// [`WitnessProjection`]'s sum), computed the first time the type is compared or hashed. It holds
-/// the term `Rc` it was computed for, and a term re-pointed since computes it again.
+/// the term `Rc` it was computed for, and a type whose term was re-pointed since computes it again.
 #[derive(Clone, Default)]
 struct NormalFormCache(RefCell<Option<(Rc<TypedExpr>, Rc<TypedExpr>)>>);
 
@@ -5627,6 +5627,24 @@ mod tests {
         assert_eq!(
             Type::data_fun(Type::UIntRange(0), Type::Base(BaseType::Int)).to_string(),
             "(0..0 ⤇ Int)"
+        );
+    }
+
+    /// A witness projection's normal-form cache is keyed by the term `Rc` it was computed for, so
+    /// a projection whose term was re-pointed compares by the new term rather than the cached one.
+    #[test]
+    fn a_witness_projection_re_pointed_to_another_term_compares_by_the_new_term() {
+        let one = || Rc::new(TypedExpr::lit(Lit::Int(1)));
+        let mut projection = WitnessProjection::new(one(), 0);
+        let other = WitnessProjection::new(one(), 0);
+        assert_eq!(
+            projection, other,
+            "equal terms at distinct `Rc`s compare by normal form"
+        );
+        projection.term = Rc::new(TypedExpr::lit(Lit::Int(2)));
+        assert_ne!(
+            projection, other,
+            "the cached normal form belongs to the term the projection no longer holds"
         );
     }
 
