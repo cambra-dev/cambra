@@ -253,6 +253,7 @@ The two arrows are deliberately distinct: `⇒` is the type arrow, `→` is the 
 - [chl-spec.md](chl-spec.md) — the surface language, construct by construct, with the full status-marker discipline.
 - [operational-semantics/summary.md](operational-semantics/summary.md) — the runtime model in two pages; [semantics.md](operational-semantics/semantics.md) for the formal definitions.
 - [demo-programs.md](demo-programs.md) — runnable programs mapped to status: what works, what's blocked, and on what.
+- [configuration.md](configuration.md) — how configuration and secrets reach a program on sources. *[Sketched]*
 - [src/design.md](../src/design.md) — source layout and the index of per-module design docs.
 - [editors/README.md](../editors/README.md) — syntax highlighting for `.cambra` files in VS Code
   and Neovim.
