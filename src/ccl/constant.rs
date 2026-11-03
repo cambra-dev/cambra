@@ -162,7 +162,7 @@ impl ConstTerm {
     /// # Errors
     ///
     /// An operation over values that has no result: an integer overflow, a division by
-    /// zero, a missing field, or an index past the end.
+    /// zero, a missing field, an index past the end, or an index into a tuple.
     pub fn normalized(self) -> Result<Self, NoValue> {
         match self {
             ConstTerm::BinOp(op, l, r) => match (&*l, &*r) {
@@ -214,6 +214,11 @@ impl ConstTerm {
                             NoValue(format!("index {i} is past the end of {len} elements"))
                         })
                 }
+                // A tuple is read by position with `t.0` (`Field`), never by `[i]!`, which the
+                // rest of the language refuses on a tuple too.
+                (ConstTerm::Tuple(_), i) => Err(NoValue(format!(
+                    "a tuple has no `[{i}]!`; read a tuple's position with `.0`, `.1`, …"
+                ))),
                 (t, i) => Ok(ConstTerm::Element(Box::new(t), Box::new(i))),
             },
             term => Ok(term),

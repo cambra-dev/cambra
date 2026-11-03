@@ -3656,7 +3656,7 @@ mod tests {
     #[test]
     fn call_and_subscript_and_attr() {
         let e = parse_e("f(x)[0]!.name").node;
-        // f(x)[0].name = Attribute(Subscript(Call(Name(f), [Name(x)]), 0), "name")
+        // f(x)[0]!.name = Attribute(Subscript(Call(Name(f), [Name(x)]), 0, false), "name")
         match e {
             Expr::Attribute { target, attr, .. } => {
                 assert_eq!(attr.as_str(), "name");

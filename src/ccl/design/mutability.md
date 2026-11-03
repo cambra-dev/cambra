@@ -332,18 +332,15 @@ eliminator, stated by content rather than by a "mirrors CHL" adjective.)
   `Mut`-typed: inference peels the target's `Mut(𝑉, 𝐷)` and requires `value ⊑ 𝑉`; a write whose
   target is not `Mut` is a **type error**, never a shadowing rebind (`x += e` on a plain `x` is
   rejected, not silently turned into `x = x + e`). `x += e` lowers to `MutWrite(x, x + e)`, the
-  embedded read being the in-context read.
-  `key` is `Some` for a **keyed write** `m[k] := v` — a write to one key of a mutable
-  collection — and `None` for a write of the whole variable. Its rule is application on the
-  left of the assignment: the key is checked against the collection's key type and the value
-  against the codomain that key names, a dependent codomain being discharged to the key term.
-  So `m[k]` denotes one type whether it is read or written. The key owes the key domain's
-  base, its refinements peeled as they are for `m[k]` — a write is what makes a key present,
-  so demanding a presence proof of the key being written would be backwards. Peeling takes
-  the domain's whole refinement set, membership predicate and any other alike, so a domain
-  refinement that is not about presence is not enforced at a write either.
-  `mut_elim::desugar_keyed_writes` then rewrites it to the whole-value write it denotes,
-  `m := insert(m, k, v)`, so every phase below sees one kind of `MutWrite` and none of them
+  embedded read being the in-context read.  `key` is `Some` for a **keyed write** `m[k] := v` — a
+  write to one key of a mutable collection — and `None` for a write of the whole variable. Its rule
+  is application on the left of the assignment: the key is checked against the collection's key type
+  and the value against the codomain that key names, a dependent codomain being discharged to the
+  key term.  So when writing, `m[k]` denotes the same type as proven lookup `m[k]!`, but without
+  requiring the presence proof.  Peeling takes the domain's whole refinement set, membership
+  predicate and any other alike, so a domain refinement that is not about presence is not enforced
+  at a write either.  `mut_elim::desugar_keyed_writes` then rewrites it to the whole-value write it
+  denotes, `m := insert(m, k, v)`, so every phase below sees one kind of `MutWrite` and none of them
   needs a key.
 - `Begin { body }` — one `with begin():` transaction block, made a *single* `Unit`-valued statement
   (`ExprStmt(Begin{block}, rest)`) so a loop body may freely mix a per-iteration transaction, sibling

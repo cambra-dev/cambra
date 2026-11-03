@@ -217,6 +217,15 @@ fn a_declaration_refines_by_a_constant(
     "pub rate = (2, 5).1\n",
     "expected {Int | __elem <= 5}"
 )]
+#[case::tuple_element(
+    indoc! {"
+        import cfg
+        type Small = {Int where _ <= cfg::rate}
+        Small::new(30).extract()
+    "},
+    "pub rate = (2, 5)[1]!\n",
+    "read a tuple's position with `.0`"
+)]
 #[case::tuple_pattern(
     indoc! {"
         import cfg
