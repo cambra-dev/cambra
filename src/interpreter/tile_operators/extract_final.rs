@@ -271,7 +271,7 @@ impl TileProducer for ExtractFinalProducer {
 
 #[cfg(test)]
 mod tests {
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::rc::Rc;
 
     use super::*;
@@ -382,6 +382,139 @@ mod tests {
                 .map(|(t, e)| (crate::ccl::FieldKey::Name((*t).into()), e.clone()))
                 .collect(),
         ))
+    }
+
+    /// A scalar default whose availability and notifications are controlled by the test.
+    struct DelayedDefault {
+        tiling: Tiling,
+        ready: Rc<Cell<bool>>,
+        consumer: Rc<RefCell<Option<Box<dyn Consumer>>>>,
+    }
+
+    struct DelayedDefaultProducer {
+        base: ProducerBase,
+        ready: Rc<Cell<bool>>,
+    }
+
+    impl TileOperator for DelayedDefault {
+        fn visit_inputs(&self, _visit: &mut dyn FnMut(InputEdgeSpec<'_>)) {}
+        fn tiling(&self) -> &Tiling {
+            &self.tiling
+        }
+        fn subscribe(
+            &mut self,
+            _intent_guard: TileGuard,
+            consumer: Box<dyn Consumer>,
+            _scheduler: &mut Scheduler,
+        ) -> Box<dyn TileProducer> {
+            *self.consumer.borrow_mut() = Some(consumer);
+            Box::new(DelayedDefaultProducer {
+                base: ProducerBase::unowned(DelayedDefaultProducer::alloc_id(), &self.tiling),
+                ready: self.ready.clone(),
+            })
+        }
+    }
+
+    impl TileProducer for DelayedDefaultProducer {
+        impl_producer_base!();
+        fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+            if self.ready.get() {
+                Tile::Scalar(ColumnValue::Ints(vec![42]))
+            } else {
+                self.tiling().empty_tile()
+            }
+        }
+        fn release_impl(&mut self, _obsolete_guard: TileGuard) {}
+    }
+
+    fn int_source(keys: Vec<u64>, values: Vec<i64>) -> TerminalSource {
+        TerminalSource {
+            tiling: Tiling::data_function(
+                Extent::Base(BaseType::UInt),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+            domain: ColumnValue::from_uints(keys),
+            codomain_tile: ColumnValue::Ints(values),
+        }
+    }
+
+    /// BUG: a ready fallback should wake readers and let Memo deliver 42, but its notification
+    /// is discarded. A debug probe rejects the unnotified change; without assertions, Memo
+    /// keeps returning an empty result. Convert this pin when repaired.
+    #[test]
+    #[cfg_attr(debug_assertions, should_panic(expected = "changed without notifying"))]
+    fn bug_delayed_default_does_not_wake_a_memoized_consumer() {
+        let ready = Rc::new(Cell::new(false));
+        let consumer = Rc::new(RefCell::new(None));
+        let default = DelayedDefault {
+            tiling: Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ready: ready.clone(),
+            consumer: consumer.clone(),
+        };
+        let extract = ExtractFinal::new(Box::new(int_source(vec![], vec![])), Box::new(default));
+        // Memo will not retry an incomplete upstream unless it receives a notification.
+        let mut op = Memo::new(Box::new(extract));
+        let guard = op.tiling().universal_guard();
+        let notifications = Rc::new(Cell::new(0));
+        let observed = notifications.clone();
+        let mut producer = op.subscribe(
+            guard.clone(),
+            Box::new(move || observed.set(observed.get() + 1)),
+            &mut Scheduler::new(),
+        );
+        assert!(!producer.get(guard.clone()).is_terminal());
+
+        ready.set(true);
+        consumer.borrow_mut().as_mut().unwrap().notify();
+        assert_eq!(notifications.get(), 0, "bug pin: the fallback wake is lost");
+        let Tile::Scalar(result) = producer.get(guard) else {
+            panic!("expected a scalar fallback");
+        };
+        assert_eq!(
+            result.as_single(),
+            None,
+            "bug pin: Memo never retries extraction"
+        );
+    }
+
+    /// BUG: universal release should clear the cached tile, but it retains one scalar cell.
+    /// Both source and fallback results remain held even though later pulls emit nothing.
+    #[test]
+    fn bug_universal_release_retains_the_cached_final_value() {
+        for use_default in [false, true] {
+            let source = if use_default {
+                int_source(vec![], vec![])
+            } else {
+                int_source(vec![0], vec![42])
+            };
+            let default = Constant::new(Value::Int(42), Extent::Base(BaseType::Int));
+            let mut op = ExtractFinal::new(Box::new(source), Box::new(default));
+            let guard = op.tiling().universal_guard();
+            let mut producer = op.subscribe(guard.clone(), Box::new(|| {}), &mut Scheduler::new());
+            assert!(producer.get(guard.clone()).is_terminal());
+            assert!(producer.state_info().values > 0);
+            producer.release(guard.clone());
+            assert_eq!(
+                producer.state_info().values,
+                1,
+                "bug pin: released cache remains held"
+            );
+            assert_eq!(producer.get(guard).cell_count(), 0);
+        }
+    }
+
+    /// BUG: terminal extraction selects the last row instead of the greatest live key.
+    /// Pin the current result until the ordering policy is fixed; the value at key 2 is 20.
+    #[test]
+    fn bug_unsorted_final_selection_uses_row_order() {
+        let mut op =
+            ExtractFinal::without_default(Box::new(int_source(vec![2, 0, 1], vec![20, 0, 10])));
+        let guard = op.tiling().universal_guard();
+        let mut producer = op.subscribe(guard.clone(), Box::new(|| {}), &mut Scheduler::new());
+        let Tile::Scalar(result) = producer.get(guard) else {
+            panic!("expected a scalar final value");
+        };
+        assert_eq!(result.as_single(), Some(Value::Int(10)));
     }
 
     fn union_value(tag: &str, inner: Value) -> Value {
