@@ -47,3 +47,4 @@ mod subtype_transitivity_fuzz;
 mod test_layout;
 mod test_sink;
 mod type_check;
+mod type_predicates;

@@ -1204,9 +1204,7 @@ pub fn unify_all(a: &[Type], b: &[Type]) -> bool {
         if let Type::Param(p) = ty {
             return p.id == id;
         }
-        let mut found = false;
-        ty.walk_children(|c| found |= occurs(id, c, subst));
-        found
+        ty.any_child(|c| occurs(id, c, subst))
     }
     fn unify(a: &Type, b: &Type, subst: &mut HashMap<TypeParamId, Type>) -> bool {
         let (a, b) = (walk(a, subst).clone(), walk(b, subst).clone());

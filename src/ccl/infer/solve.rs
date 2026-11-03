@@ -3002,15 +3002,12 @@ fn coalesce_type_predicates_go(
 /// Whether `ty` holds no inference variable and no type parameter: a type an instance head
 /// can be matched against.
 fn names_no_variable(ty: &Type) -> bool {
-    if matches!(
-        ty,
-        Type::Infer(_) | Type::Param(_) | Type::BarrierVar(_) | Type::Hole
-    ) {
-        return false;
-    }
-    let mut closed = true;
-    ty.walk_children(|child| closed &= names_no_variable(child));
-    closed
+    !ty.holds_type(&|t| {
+        matches!(
+            t,
+            Type::Infer(_) | Type::Param(_) | Type::BarrierVar(_) | Type::Hole
+        )
+    })
 }
 
 /// What a failed specialization pin reports its edge as.

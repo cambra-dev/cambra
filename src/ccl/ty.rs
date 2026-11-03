@@ -5531,20 +5531,12 @@ fn dependency_order(refinements: &[Refinement]) -> Vec<&Refinement> {
 
 /// Whether `pred` reads a value `earlier` has narrowed: some type inside it carries `earlier`.
 fn predicate_reads(pred: &TypedExpr, earlier: &Refinement) -> bool {
-    fn reads_narrowed_by(ty: &Type, earlier: &Refinement) -> bool {
-        if let Type::Refinement(_, set) = ty
-            && set.contains(earlier)
-        {
-            return true;
-        }
-        let mut found = false;
-        ty.walk_children(|child| found |= reads_narrowed_by(child, earlier));
-        found
-    }
     let mut found = false;
-    pred.walk_type_slots(|ty| found |= reads_narrowed_by(ty, earlier));
-    pred.walk_children(|child| found |= predicate_reads(child, earlier));
-    found
+    pred.walk_type_slots(|ty| {
+        found = found
+            || ty.holds_type(&|t| matches!(t, Type::Refinement(_, set) if set.contains(earlier)));
+    });
+    found || pred.any_child(|child| predicate_reads(child, earlier))
 }
 
 /// Of two equal refinements, whether `newcomer` should replace `incumbent`: exactly when the
