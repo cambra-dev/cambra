@@ -480,7 +480,8 @@ pub enum InferError {
     UnresolvedMethod {
         /// The method's name.
         method: String,
-        /// The receiver's type, or `None` where nothing before the call determines it.
+        /// The receiver's type, or `None` where nothing but the uses of a definition polymorphic
+        /// over it determines it.
         receiver: Option<Type>,
     },
     /// A trait function's call whose instance a module declares below it: the instance's
@@ -1407,8 +1408,9 @@ impl std::fmt::Debug for InferError {
                 receiver: None,
             } => write!(
                 f,
-                "`.{method}(…)` calls a method of its receiver's type, and nothing before the \
-                 call determines that type; annotate the receiver with a nominal type"
+                "`.{method}(…)` calls a method of its receiver's type, and nothing but the uses \
+                 of a definition polymorphic over that type determines it; annotate the \
+                 receiver with a nominal type, or call a trait's function to work across types"
             ),
             InferError::UnresolvedMethod {
                 method,
