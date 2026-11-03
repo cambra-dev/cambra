@@ -1,6 +1,6 @@
 # Projections that name a path
 
-Status: accepted. Stages 1 to 3 are built. The decisions are listed under [Decisions](#decisions),
+Status: accepted. Stages 1 to 4 are built. The decisions are listed under [Decisions](#decisions),
 and the work lands in the [stages](#stages) below.
 
 A projection names the part of a producer's tile a pull asks for, and a push names the region a
@@ -12,19 +12,13 @@ and one that declares more reads its projection with `TileGuard::projection_for`
 of a debug build panics on a pull at a level a producer does not restate, and a push beneath the
 outermost keys lands in its reader as a projection at its level (`Dispatcher::land_in`).
 
-## What the gap blocks
-
-Two shapes a dispatched run refuses wait on projections beneath the outermost keys, and pull mode
-runs them instead:
-
-- A feed of a collection read from a live source, `out << [f(x) for x in source1()]`, is keyed by
-  the sink's one row, so a delivery's keys sit one level beneath the sink's.
-- A loop over a live source takes its positions as they arrive. Its rounds name positions of a
-  store, which for a loop nested in another are paths again.
+## What a dispatched run refuses
 
 A loop nested in another runs in rounds of its own (`src/interpreter/design-operators.md`, "A loop
-in rounds"). Removing the scheduler removes pull mode, so every shape a dispatched run refuses has
-to run there first.
+in rounds"), and a feed, a loop or a transaction over a live source runs dispatched
+(`src/interpreter/design-operators.md`, "Running a compiled program"). The shapes a dispatched run
+still refuses are listed there. Removing the scheduler removes pull mode, so each of them has to run
+there first.
 
 ## Where a region crosses an operator
 
@@ -154,9 +148,11 @@ what an operator accepts, and `TileProducer::input_level` the level it pulls eac
 no folded execution. No program of the differential suite is refused this way
 (`tests/it/dispatch_refused.txt`).
 
-Stage 4 notifies a live source's keys at the level they reach (`LivePipeline::poll`), the feed of a
-map over a source among them, and lifts the plan-time probe's refusal of an arrival beneath the
-outermost keys.
+A live source's arrivals are notified at the outermost keys of the pipeline that stands for the
+range, or that pipeline reads its input whole once the source yields everything
+(`LivePipeline::poll`): no arrival is notified beneath the outermost keys. A feed of a collection
+read from a live source is keyed by the sink's one row, so its arrivals reach the pipeline above the
+source widened, and that pipeline reads its input whole.
 
 ## Stages
 
@@ -171,8 +167,9 @@ outermost keys.
 3. The nested scope in the planner, refused where an operator its rounds pull restates no nested
    projection (`TileProducer::input_level`), with the rows of the induction drive, the stores and
    their reads, and the nested-loop programs of the differential suite running in rounds.
-4. Live sources at any level, once a dispatched run notifies them: the feed of a map over a source,
-   and a loop over a source.
+4. Live sources, once a dispatched run notifies them: a feed of a map over a source, read whole once
+   the source yields everything; a loop over a source, flat or nested; and a transaction over one,
+   whose store pushes the commit ticks each consume decides.
 5. The remaining rows, the operators a refused nested loop's rounds pull among them, then the
    scheduler's removal (`src/interpreter/design-operators.md`, "Running a compiled program").
 
@@ -186,3 +183,7 @@ outermost keys.
   position of its row reads as `Nothing`.
 - A nested loop whose rounds pull an operator with no nested row is refused and runs in pull mode;
   no loop folds into the scope around it.
+- `MapResultToConst` widens every push from its constant: a reader takes a row whose constant
+  streams once the constant is complete, and the constant's keys do not stream beneath the row.
+- A transaction store pushes the commit ticks each consume decides, so a feed inside a transaction
+  streams.

@@ -107,6 +107,7 @@ struct Gated {
 
 impl Consumer for Gated {
     fn notify(&mut self, arrived: &Projection) {
+        crate::interpreter::dispatcher::debug_assert_outside_a_run();
         debug_assert!(
             *arrived != Projection::Nothing,
             "no producer notifies of an empty region"
@@ -291,7 +292,14 @@ impl WakeupQueue {
     /// Request that `consumer` be notified at the next
     /// [`Scheduler::check_for_notifications`] — i.e. once the current `get`
     /// stack has fully unwound.
+    ///
+    /// Inside a compiled program's dispatched run a request is dropped: nothing delivers it there,
+    /// and the producers in pull mode the run pulls read again where a store steps
+    /// (`tile_operators::read_again_toward`).
     pub fn request(&self, consumer: SharedConsumer) {
+        if crate::interpreter::dispatcher::is_in_a_run() {
+            return;
+        }
         // Notifications request another read; repeated requests do not count separate changes.
         let mut queued = self.0.borrow_mut();
         if queued.iter().any(|waiting| Rc::ptr_eq(waiting, &consumer)) {
