@@ -228,10 +228,11 @@ pub enum Token {
     LBracket,
     #[token("]")]
     RBracket,
-    /// The **checked**-lookup suffix, only meaningful directly after a `]`
-    /// (`c[k]?`, `docs/chl-spec.md`, "3.9 Subscript and attribute access").
-    #[token("?")]
-    Question,
+    /// The proven-lookup suffix, accepted only directly after a `]` (`c[k]!`,
+    /// `docs/chl-spec.md`, "3.9 Subscript and attribute access"). `!=` lexes as
+    /// one token, so `c[k]! == v` needs the space.
+    #[token("!")]
+    Bang,
     #[token("{")]
     LBrace,
     #[token("}")]
@@ -518,7 +519,7 @@ pub fn highlight_class(token: &Token) -> Option<HighlightClass> {
         | Token::Eq
         | Token::Lt
         | Token::Gt
-        | Token::Question => C::Operator,
+        | Token::Bang => C::Operator,
         Token::Comma
         | Token::Colon
         | Token::ColonColon
@@ -795,7 +796,7 @@ impl fmt::Display for Token {
             Token::RParen => ")",
             Token::LBracket => "[",
             Token::RBracket => "]",
-            Token::Question => "?",
+            Token::Bang => "!",
             Token::LBrace => "{",
             Token::RBrace => "}",
             Token::Comma => ",",

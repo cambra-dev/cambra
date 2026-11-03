@@ -2,6 +2,7 @@
 //! `use` names, and labels (`docs/chl-spec.md`, "9.6 Qualified references").
 
 use super::*;
+use crate::ccl::ProjKey;
 
 /// The module being lowered: whose labels its unqualified ones are, the
 /// modules its names reach, and the members its `use` names reach.
@@ -350,6 +351,30 @@ impl LoweringContext {
         Ok(match module {
             Some(module) => Label::in_module(module.clone(), name),
             None => Label::new(name),
+        })
+    }
+
+    /// The projection key `.attr` names, qualified by `qualifier`.
+    ///
+    /// Digits are a tuple position and anything else a record field name. The two are
+    /// disjoint because an identifier cannot begin with a digit, so a leading digit is the
+    /// discriminator.
+    pub(in crate::ccl::lower) fn projection_key(
+        &self,
+        qualifier: &[Spanned<SmolStr>],
+        attr: &str,
+        span: Span,
+    ) -> Result<ProjKey, LoweringError> {
+        if !attr.starts_with(|c: char| c.is_ascii_digit()) {
+            return Ok(ProjKey::Field(self.label(qualifier, attr, span)?));
+        }
+        // Only magnitude can fail here: the parser admits an integer literal, so the digits
+        // are a non-negative number, but not necessarily one a `usize` position can hold.
+        attr.parse().map(ProjKey::Index).map_err(|_| {
+            LoweringError::unsupported(
+                span,
+                format!("tuple position `.{attr}` is too large to be an index"),
+            )
         })
     }
 

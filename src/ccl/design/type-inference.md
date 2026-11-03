@@ -322,7 +322,7 @@ has one and `bind_annotation` accepts it, so its uses are typed against what the
 Otherwise it binds the name at a poison: a fresh variable minted one level inside the binding and
 generalized. Each use of a poisoned binding instantiates its own copy, so uses that demand different
 types of the failed definition do not conflict. A rule that needs a value's shape as it emits, such
-as the checked lookup `m[k]?`, still fails on the bare variable, so `Typing::recover` drops the
+as the checked lookup `m[k]`, still fails on the bare variable, so `Typing::recover` drops the
 error of a statement that read a poisoned binding. The failure reports once, at the definition. A
 polymorphic annotation whose bounds do not type declares nothing usable: the `let` binds its name
 at a poison and does not type its definition, which would lack the bounds and the assumptions the
@@ -3057,8 +3057,8 @@ Refinement predicates also contain type slots. After resolving a predicate,
 projection paths through products. Updating only the element binder's occurrence would
 leave projection slots with stale witness names.
 
-A lookup on a sum emits the same application constraint as other lookups:
-`type(xs) <: (type(i) ⇒ ?r)`, with a kind variable on the demand. The codomain receives
+A proven lookup `xs[i]!` on a sum emits the same application constraint as any other proven
+lookup: `type(xs) <: (type(i) ⇒ ?r)`, with a kind variable on the demand. The codomain receives
 one covariant constraint. The index type and witness reference constrain the domain; any
 unresolved domain comparison must remain valid when the bounds materialize. See
 [Apply is one-way](#apply-is-one-way) and [Data domains are invariant](#data-domains-are-invariant).
@@ -4053,7 +4053,7 @@ t.0
 The parser retains the attribute spelling. Lowering maps an attribute beginning with
 a digit to a positional `ProjKey::Index`; an identifier becomes `ProjKey::Field`.
 Square brackets denote collection application, not product projection. Symbolically,
-`𝑟.x` is `𝑟 ▷ .x`, whereas `𝑐[𝑘]` is `𝑘 ▷ 𝑐`.
+`𝑟.x` is `𝑟 ▷ .x`, whereas the proven lookup `𝑐[𝑘]!` is `𝑘 ▷ 𝑐`.
 
 Record inference assigns each field its value-read type, as tuple inference does for
 positions. A record node retains a record type. Inside lambda elimination, its fields

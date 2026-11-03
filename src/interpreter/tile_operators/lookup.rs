@@ -16,12 +16,12 @@ use crate::{
 // CheckedLookup / CheckedLookupProducer
 // ---------------------------------------------------------------------------
 
-/// The checked lookup `c[k]?` — decide whether `k` is a key of `c`, and answer
+/// The checked lookup `c[k]` — decide whether `k` is a key of `c`, and answer
 /// `` `some(c(k)) `` or `` `none ``.
 ///
 /// **Membership is decided here, not read off an empty tile.** A collection is a total
 /// function on its own domain, so applying it at a key outside that domain is not an
-/// operation the type system offers; what `c[k]?` returns is a tagged sum, and producing
+/// operation the type system offers; what `c[k]` returns is a tagged sum, and producing
 /// one means deciding the predicate. An empty tile cannot stand in for that decision,
 /// because it means "no rows known here" — which covers a key genuinely absent *and* a
 /// producer that has not converged. Reading `` `none `` off it would make the answer a
@@ -58,7 +58,7 @@ enum LookupSource {
 
 impl CheckedLookup {
     /// Look keys up in `collection`, with both operands as their own sources. The answer
-    /// takes the keys' shape: a scalar for `m[1]?`, a stream wherever the keys are one.
+    /// takes the keys' shape: a scalar for `m[1]`, a stream wherever the keys are one.
     pub fn split(
         collection: Box<dyn TileOperator>,
         keys: Box<dyn TileOperator>,
@@ -96,7 +96,7 @@ impl CheckedLookup {
             Tiling::Scalar(Extent::Function { .. }) => {}
             other => {
                 return Err(format!(
-                    "`c[k]?` over a collection whose values are themselves collections is not \
+                    "`c[k]` over a collection whose values are themselves collections is not \
                      supported yet: the answer would carry a collection as its `some` \
                      payload, and its tiling is {other}"
                 ));
@@ -427,7 +427,7 @@ impl TileProducer for CheckedLookupProducer {
                 let mut coll = collection.get(collection.tiling().universal_guard());
                 compact_releasing(&mut coll, collection);
                 match key_tile {
-                    // One key: the scalar form `m[k]?`, the key pivoted to one column where
+                    // One key: the scalar form `m[k]`, the key pivoted to one column where
                     // it is a product. An empty column is a key that has not arrived, so
                     // there is nothing to answer.
                     Tile::Scalar(_) | Tile::Record { .. } => {

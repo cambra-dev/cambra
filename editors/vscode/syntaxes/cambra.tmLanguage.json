@@ -79,7 +79,7 @@
       "include": "#operator-assignment"
     },
     {
-      "include": "#operator-question"
+      "include": "#operator-unwrap"
     },
     {
       "include": "#punctuation"
@@ -260,9 +260,9 @@
       "name": "keyword.operator.assignment.cambra",
       "match": "="
     },
-    "operator-question": {
-      "name": "keyword.operator.question.cambra",
-      "match": "\\?"
+    "operator-unwrap": {
+      "name": "keyword.operator.unwrap.cambra",
+      "match": "!"
     },
     "punctuation": {
       "patterns": [

@@ -54,8 +54,8 @@ witness implementation; see
 annotation; this does not give it an unrefined `Int` domain. Likewise, a group-by retains its
 present-key domain. `full_map_annotations_are_satisfiable` and
 `a_groupby_is_a_full_map_at_either_strength` cover annotation cases.
-A `FullMap(Int, Int)` parameter can be type-checked with an integer subscript without establishing
-that a tested concrete collection can inhabit the parameter type.
+A `FullMap(Int, Int)` parameter can be type-checked with a proven integer lookup `m[1]!` without
+establishing that a tested concrete collection can inhabit the parameter type.
 
 A data-function type `𝐷 |=> 𝑉` lowers to `(k: 𝐷) ⤇ 𝑉` under a fresh binder, as
 `FullMap(𝐾, 𝑉)` does (`Type::full_map_of`), and its funkind follows its domain:
@@ -336,18 +336,17 @@ runtime-free conversion API. No surface view constructor should be inferred from
 
 ## Lookup: membership discharge
 
-Current `c[k]` lowers as function application. It requires the key type to be below the
-collection's domain. `c[k]?` is checked lookup: it requires a compatible key type but decides
+The proven lookup `c[k]!` lowers as function application. It requires the key type to be below
+the collection's domain. `c[k]` is checked lookup: it requires a compatible key type but decides
 presence at runtime and returns `Option`. The
-[CHL reference](../../../docs/chl-spec.md#39-subscript-and-attribute-access) owns the planned
-replacement spellings.
+[CHL reference](../../../docs/chl-spec.md#39-subscript-and-attribute-access) owns the spellings.
 
 A `FullMap(K, V)` parameter with a key of type `K` satisfies ordinary application.
 That typing rule does not construct a value at such a domain. A concrete keyed domain requires
 its own membership evidence; a known source element does not currently acquire it automatically.
 Range-domain list subscripts are also rejected in the tested integer-index cases.
 
-### The checked lookup `𝑐[𝑘]?`
+### The checked lookup `𝑐[𝑘]`
 
 Lowering emits `(c, k) ▷ lookup?`. `emit_apply` intercepts that builtin application and uses
 `emit_lookup_checked` rather than the ordinary collection-application rule:

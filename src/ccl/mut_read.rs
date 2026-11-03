@@ -107,8 +107,8 @@
 //! three positions (`src/ccl/design/mutability.md`, "A mutable variable read is
 //! an explicit operation"), and two of them — a pass-by-reference argument and
 //! `await_final`'s operand — are an application's argument, which `emit_apply`
-//! relates to the parameter by reading a bare reference there. A keyed read of a
-//! mutable collection, `m[k]`, puts the handle in the function position of the
+//! relates to the parameter by reading a bare reference there. A proven keyed read of a
+//! mutable collection, `m[k]!`, puts the handle in the function position of the
 //! same node.
 //!
 //! **A bare read fed to a deferred output.** `out << x` reaches

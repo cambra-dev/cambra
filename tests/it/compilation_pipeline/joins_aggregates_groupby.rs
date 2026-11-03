@@ -742,7 +742,7 @@ fn test_grouping_built_once(#[case] code: &str) {
     );
 }
 
-/// The checked lookup `c[k]?` end to end: membership decided against the collection's
+/// The checked lookup `c[k]` end to end: membership decided against the collection's
 /// domain, answered as the `Option(𝑉)` the type promises.
 ///
 /// The absent case is the one worth pinning. Absence is **decided** here rather than read
@@ -755,7 +755,7 @@ fn test_grouping_built_once(#[case] code: &str) {
 #[case::map_present(
     indoc! {"
         m = map([(1, 10), (2, 20)])
-        match m[1]?:
+        match m[1]:
             case Option::some(v):
                 v
             case Option::none:
@@ -766,7 +766,7 @@ fn test_grouping_built_once(#[case] code: &str) {
 #[case::map_absent(
     indoc! {"
         m = map([(1, 10), (2, 20)])
-        match m[9]?:
+        match m[9]:
             case Option::some(v):
                 v
             case Option::none:
@@ -778,7 +778,7 @@ fn test_grouping_built_once(#[case] code: &str) {
 #[case::set_present(
     indoc! {"
         s = set([1, 2, 3])
-        match s[2]?:
+        match s[2]:
             case Option::some(_):
                 1
             case Option::none:
@@ -789,7 +789,7 @@ fn test_grouping_built_once(#[case] code: &str) {
 #[case::set_absent(
     indoc! {"
         s = set([1, 2, 3])
-        match s[9]?:
+        match s[9]:
             case Option::some(_):
                 1
             case Option::none:
@@ -808,7 +808,7 @@ fn checked_lookup_answers_presence(#[case] code: &str, #[case] expected: Value) 
 #[case::present(
     indoc! {"
         m = map([(x, (x + 1, x * 2)) for x in [1, 2, 3]])
-        match m[2]?:
+        match m[2]:
             case Option::some(v):
                 v.0 * 100 + v.1
             case Option::none:
@@ -819,7 +819,7 @@ fn checked_lookup_answers_presence(#[case] code: &str, #[case] expected: Value) 
 #[case::absent(
     indoc! {"
         m = map([(x, (x + 1, x * 2)) for x in [1, 2, 3]])
-        match m[9]?:
+        match m[9]:
             case Option::some(v):
                 v.0 * 100 + v.1
             case Option::none:
@@ -921,7 +921,7 @@ fn a_product_keys_a_collection(#[case] code: &str, #[case] expected: Value) {
 fn a_product_key_decides_presence(#[case] key: &str, #[case] expected: Value) {
     let code = indoc! {r#"
         m = map([((1, 2), 10), ((3, 4), 20)])
-        match m[KEY]?:
+        match m[KEY]:
             case Option::some(v):
                 v
             case Option::none:
@@ -1012,7 +1012,7 @@ fn a_group_valued_lookup_is_rejected_by_name() {
     check_compile_error(
         indoc! {r#"
             g = groupby([1, 1, 2], \x -> x)
-            match g[1]?:
+            match g[1]:
                 case Option::some(grp):
                     sum(grp)
                 case Option::none:
@@ -1033,29 +1033,29 @@ fn a_group_valued_lookup_is_rejected_by_name() {
 /// `docs/chl-spec.md`, "4.10 `match` — tag dispatch" gives for per-element dispatch.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::both_present("sum([or_zero(m[k]?) for k in [1, 2]])", Value::Int(30))]
-#[case::one_absent("sum([or_zero(m[k]?) for k in [1, 9]])", Value::Int(10))]
-#[case::all_absent("sum([or_zero(m[k]?) for k in [8, 9]])", Value::Int(0))]
+#[case::both_present("sum([or_zero(m[k]) for k in [1, 2]])", Value::Int(30))]
+#[case::one_absent("sum([or_zero(m[k]) for k in [1, 9]])", Value::Int(10))]
+#[case::all_absent("sum([or_zero(m[k]) for k in [8, 9]])", Value::Int(0))]
 // A **filtered** key stream, which is where the answer's row alignment is load-bearing. A
 // `Restrict` marks a dropped key's row deleted rather than removing it, so a lookup that
 // searched its inputs uncompacted would answer the filtered-out key as present and sum it
 // (30 rather than 20 below), and would hand the answer a deletion set naming positions of a
 // column it no longer shares.
-#[case::filtered_keys("sum([or_zero(m[k]?) for k in [1, 2, 3] if k > 1])", Value::Int(20))]
-#[case::filtered_to_absent("sum([or_zero(m[k]?) for k in [1, 2, 3] if k > 2])", Value::Int(0))]
+#[case::filtered_keys("sum([or_zero(m[k]) for k in [1, 2, 3] if k > 1])", Value::Int(20))]
+#[case::filtered_to_absent("sum([or_zero(m[k]) for k in [1, 2, 3] if k > 2])", Value::Int(0))]
 // **Correlated**: an inner comprehension reading the outer binder, so the keys arrive as a
 // group per outer row and each is answered where it sits. Scaled by the row, then keyed by it,
 // then reading it beside the key: 10 + 20, (10 + 0) + (20 + 0), and (11 + 12) + (1 + 2).
 #[case::correlated_scaled(
-    "sum([sum([or_zero(m[k]?) * r for k in [1, 9]]) for r in [1, 2]])",
+    "sum([sum([or_zero(m[k]) * r for k in [1, 9]]) for r in [1, 2]])",
     Value::Int(30)
 )]
 #[case::correlated_key(
-    "sum([sum([or_zero(m[k + r]?) for k in [1, 9]]) for r in [0, 1]])",
+    "sum([sum([or_zero(m[k + r]) for k in [1, 9]]) for r in [0, 1]])",
     Value::Int(30)
 )]
 #[case::correlated_beside_the_key(
-    "sum([sum([or_zero(m[r]?) + k for k in [1, 2]]) for r in [1, 9]])",
+    "sum([sum([or_zero(m[r]) + k for k in [1, 2]]) for r in [1, 9]])",
     Value::Int(26)
 )]
 fn checked_lookup_over_a_key_stream(#[case] tail: &str, #[case] expected: Value) {
