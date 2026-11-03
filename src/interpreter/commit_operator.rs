@@ -61,7 +61,7 @@ use crate::interpreter::{
     tile_operators::{
         Breaker, BreakingProducer, Cycle, CycleSlot, CyclicSequencingProducer, Memo, ProducerBase,
         TileOperator, TileProducer, guard_minus, materialize_collections, materialized_row,
-        subscribe_forwarding,
+        subscribe_forwarding, subscribe_forwarding_keeping_keys,
     },
     tuple_field, uint_of_row,
 };
@@ -1124,6 +1124,24 @@ impl Breaker for CommitProducer {
         self.writer_source(|source| source.obsolete_guard().clone())
     }
 
+    /// The writer's drive, and every producer between it and the range over `source`, read the
+    /// source again ([`read_again_toward`]): the drive decodes its source only once told it gained
+    /// items.
+    fn read_source_again(
+        &mut self,
+        source: &std::rc::Rc<
+            std::cell::RefCell<dyn crate::interpreter::DataSourceDomainExtentImpl>,
+        >,
+    ) {
+        read_again_toward(self, &|producer| {
+            producer
+                .data_sources()
+                .iter()
+                .any(|read| std::rc::Rc::ptr_eq(read, source))
+                .then_some(true)
+        });
+    }
+
     fn as_producer(&self) -> Option<&dyn BreakingProducer> {
         Some(self)
     }
@@ -1135,8 +1153,20 @@ impl Breaker for CommitProducer {
 }
 
 impl BreakingProducer for CommitProducer {
+    /// The commit ticks the store has decided, through its watermark, and everything once it is
+    /// terminal. A reader of the store's changelog (`StoreValueStream`) takes the ticks as they are
+    /// decided, and a reader of its final value takes it once the store's pipeline has finished the
+    /// epoch, or, over a live source, once every epoch has run (`Dispatcher::read_whole`).
     fn held(&self) -> TileGuard {
-        self.breaker.held(self.tiling())
+        if self.breaker.terminal() {
+            return self.tiling().universal_guard();
+        }
+        match self.breaker.snapshot.as_ref().and_then(store_frontier) {
+            Some(watermark) => TileGuard::Function(FunctionGuard::Domain(Predicate::at_or_below(
+                watermark.into_value(),
+            ))),
+            None => self.tiling().empty_guard(),
+        }
     }
 
     /// What the store holds, whatever its readers released.
@@ -1144,9 +1174,9 @@ impl BreakingProducer for CommitProducer {
         self.held()
     }
 
-    /// The store pushes once, at the finish where it is terminal.
+    /// The store pushes the ticks each consume decides.
     fn pushes_while_consuming(&self) -> bool {
-        false
+        true
     }
 
     fn offer_impl(&mut self, _guard: TileGuard) -> Tile {
@@ -3365,6 +3395,34 @@ impl InductionStoreProducer {
                 self.body_producer.release(TileGuard::flatten_or(rows));
             }
         }
+        // The body states complete positions that hold no decision: positions the loop's source
+        // filtered out, and keys a live source calls complete and never delivers. Nothing is
+        // left to decide there, so the store releases them as it releases a decided position,
+        // whether or not a later position is decided; a position that still holds a decision
+        // the store has not stepped stays held. A store with rows above it releases by rows
+        // instead, while consuming (above), and its drive states read-past positions only where
+        // it has none.
+        if matches!(self.engines, Engines::Store(_)) {
+            let level = self.complete_rows.len() - 1;
+            let through = self.decided_path();
+            let empty = decided_paths(&body_tile)
+                .into_iter()
+                .map(|(path, _)| path)
+                .filter(|path| through.as_ref().is_none_or(|decided| path > decided))
+                .fold(
+                    self.complete_rows[level].clone(),
+                    |empty, path| match Projection::of_path(&path) {
+                        Projection::Keys { keys, .. } => empty.minus(&keys),
+                        other => unreachable!("a path's projection names its keys: {other:?}"),
+                    },
+                );
+            if !empty.is_false() {
+                self.body_producer.release(
+                    CurryLevel::new(level)
+                        .wrap_guard(TileGuard::Function(FunctionGuard::Domain(empty))),
+                );
+            }
+        }
         // A nested store's rows open as they are decided and release their seeds as they
         // go (`release_seeds_through`); the rest go once the body is done, since a row that
         // ran no position answers from the enclosing position's default instead. The induction
@@ -3574,7 +3632,10 @@ impl TileOperator for StoreValueStream {
         // value, so kick once to start the drain loop.
         let (consumer, gate) = shared_consumer(consumer);
         consumer.notify(&Projection::Everything);
-        let store_producer = subscribe_forwarding(&mut *self.store_op, &consumer, scheduler);
+        // The stream is keyed by the store's commit ticks, so a region of ticks the store
+        // decided names the stream's keys as it is.
+        let store_producer =
+            subscribe_forwarding_keeping_keys(&mut *self.store_op, &consumer, scheduler);
         Box::new(StoreValueStreamProducer {
             base: ProducerBase::new(
                 StoreValueStreamProducer::alloc_id(),
@@ -3628,7 +3689,7 @@ impl TileProducer for StoreValueStreamProducer {
     fn base_mut(&mut self) -> &mut ProducerBase {
         &mut self.base
     }
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         // Sample the store's current tile once and re-fold the whole changelog
         // (consumer-driven; no producer-side drive-to-fixpoint). The store's writer
         // steps one commit per pull and re-arms itself on the wakeup queue, which
@@ -3710,12 +3771,14 @@ impl TileProducer for StoreValueStreamProducer {
                 values.push(v);
             }
         }
-        read_tile(
+        let mut out = read_tile(
             ColumnValue::from_values(ticks, &Extent::Base(BaseType::UInt)),
             values,
             &self.value_extent,
             domain_predicate.clone(),
-        )
+        );
+        out.restrict_to(&projection_guard.projection_for(self), self.tiling());
+        out
     }
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
         // Advance the emit cursor past every released commit tick (so we don't
@@ -5137,13 +5200,14 @@ impl DriverWindow {
 
     /// The window as the body's input tile, terminal once `done`, with the rows the drive
     /// knows are complete — one predicate per row level above the positions, outermost
-    /// first, and none for a body whose rows are its positions.
+    /// first, and none for a body whose rows are its positions — and the positions it has read
+    /// past without emitting, `read_past`.
     ///
     /// [`reclaim`](Self::reclaim) has already dropped what a release named, so every
     /// retained row is live: a re-pull within a round re-emits only what the body has not
     /// merged, and an already-released position cannot come back to duplicate a domain
     /// position in the body's `Memo`.
-    fn render(&self, done: bool, complete_rows: &[Predicate]) -> Tile {
+    fn render(&self, done: bool, complete_rows: &[Predicate], read_past: &Predicate) -> Tile {
         // Column `i` is read key `i`'s snapshot, and the item's is the rows' own slices
         // run together. Same index that names the field, so the layout stays the tiling's.
         // Each row's item is a collection stated over its own paths, taken from the source
@@ -5220,7 +5284,7 @@ impl DriverWindow {
         let complete_positions = if done {
             Predicate::True
         } else {
-            self.emitted_prefix()
+            self.emitted_prefix().union(read_past)
         };
         let Some(nested) = &self.nested else {
             return Tile::data_function(
@@ -5774,8 +5838,8 @@ impl InductionDriverProducer {
     /// items of a nest whose elements are collections are collections, and a `Memo` in
     /// front of this driver releases whatever it has cached — and a row it only partly
     /// covers stays in the window, so its released part is stripped here.
-    fn render(&self, done: bool, complete_rows: &[Predicate]) -> Tile {
-        let mut tile = self.window.render(done, complete_rows);
+    fn render(&self, done: bool, complete_rows: &[Predicate], read_past: &Predicate) -> Tile {
+        let mut tile = self.window.render(done, complete_rows, read_past);
         tile.remove_guarded(self.base().obsolete_guard.clone());
         tile
     }
@@ -6008,7 +6072,7 @@ impl InductionDriverProducer {
         // been emitted, so the live window is the whole remaining answer. The driver
         // owns the source, so the obligation is its to keep.
         if self.source_fully_released {
-            return self.render(true, &[]);
+            return self.render(true, &[], &Predicate::False);
         }
         let levels_above = self.window.levels_above();
         // Everything the drive indexes is keyed by the **path** that reaches it: the
@@ -6301,12 +6365,27 @@ impl InductionDriverProducer {
             .next_delivered(self.emitted_through.as_ref())
             .cloned();
         let done = source_complete && pending.is_none();
+        // A drive with no rows above it has read past every position below the next one it
+        // runs that the source calls complete along with every position before it: those it
+        // emitted, and those the source holds nothing at, which it never emits. The body then
+        // states them complete, and the store releases a position with no decision as it
+        // releases a decided one.
+        let read_past = match levels_above {
+            0 => complete_prefix_below(
+                &source_complete_at(CurryLevel::OUTERMOST),
+                pending.as_ref().map(|p| &p[0]),
+            )
+            .map_or(Predicate::False, |through| {
+                self.window.path_prefix(&[], &through, true)
+            }),
+            _ => Predicate::False,
+        };
         let stated: Vec<Predicate> = match done {
             true => vec![Predicate::True; complete_rows.len() + 1],
             false => complete_rows
                 .iter()
                 .cloned()
-                .chain([self.window.emitted_prefix()])
+                .chain([self.window.emitted_prefix().union(&read_past)])
                 .collect(),
         };
         let states_more = stated.len() != self.stated.len()
@@ -6355,7 +6434,7 @@ impl InductionDriverProducer {
                 self.source_producer.release(rows);
             }
         }
-        self.render(done, &complete_rows)
+        self.render(done, &complete_rows, &read_past)
     }
 }
 
@@ -6765,7 +6844,7 @@ impl TileProducer for TransactDriverProducer {
         }
         // A release naming part of a row rather than the row leaves the row in the window
         // (`release_impl`), so what it names is withheld here.
-        let mut tile = self.window.render(done, &[]);
+        let mut tile = self.window.render(done, &[], &Predicate::False);
         tile.remove_guarded(self.obsolete_guard().clone());
         tile.compact();
         tile
@@ -6980,10 +7059,12 @@ fn last_position_below(
     positions.into_iter().filter(|p| p < bound).max()
 }
 
-/// The highest position of `held` a drive has read past without running it: one the source
-/// holds, filtered rows included, below `next` (the next position the drive will run, or
-/// `None` when there is none), and which the source calls `complete` along with every position
-/// before it. `held` and `next` are paths of one component.
+/// The highest position a drive has read past without running it, below `next` (the next
+/// position the drive will run, or `None` when there is none): the higher of the highest
+/// position the source holds, filtered rows included, that the source calls `complete` along
+/// with every position before it, and the end of the source's complete prefix of positions
+/// ([`complete_prefix_below`]), which can be a position the source holds nothing at. `held` and
+/// `next` are paths of one component.
 ///
 /// A filtered row stays in the tile, marked deleted, and the drive never runs it, so no
 /// decision or ack releases it; the drive releases it on reading past it. The completeness
@@ -6998,9 +7079,41 @@ fn source_read_through(
 ) -> Option<Position> {
     // A position complete along with everything before it, so the highest such position
     // below `next` is the first one found from above.
-    held.range::<Path, _>((Unbounded, next.map_or(Unbounded, Excluded)))
+    let held_through = held
+        .range::<Path, _>((Unbounded, next.map_or(Unbounded, Excluded)))
         .rfind(|p| complete.subsumes(&Predicate::at_or_below_in(p[0].clone(), positions)))
-        .map(|p| Position::new(p[0].clone()))
+        .map(|p| Position::new(p[0].clone()));
+    // A position the source calls complete and holds no item at, a key a live source never
+    // delivers, is read past as a filtered row is.
+    let absent_through = complete_prefix_below(complete, next.map(|p| &p[0])).map(Position::new);
+    held_through.max(absent_through)
+}
+
+/// The highest position below `next`, or of all, that `complete` calls complete along with
+/// every position before it, where the source's positions are `UInt` from 0: what a sequential
+/// drive has read past, the positions the source holds nothing at among them. `None` where
+/// `complete` names no such position; where it is no prefix of the positions from 0, which
+/// reads as naming none; and where it names every position and there is no `next`, which is the
+/// drive's end rather than a position.
+fn complete_prefix_below(complete: &Predicate, next: Option<&Value>) -> Option<Value> {
+    let before_next = match next {
+        Some(Value::UInt(0)) => return None,
+        Some(Value::UInt(n)) => Some(n - 1),
+        _ => None,
+    };
+    let through = match complete.is_true() {
+        true => before_next?,
+        false => {
+            let Value::UInt(through) = complete.max_released_position()?.into_value() else {
+                return None;
+            };
+            if !complete.subsumes(&Predicate::at_or_below(Value::UInt(through))) {
+                return None;
+            }
+            before_next.map_or(through, |before| through.min(before))
+        }
+    };
+    Some(Value::UInt(through))
 }
 
 /// Every position of a collection tile's domain. Empty for any other tile.
