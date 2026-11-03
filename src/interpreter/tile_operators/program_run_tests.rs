@@ -766,6 +766,108 @@ fn a_nested_loop_aggregating_a_map_of_its_position(#[case] source: &str) {
     answers_as_pull_mode_does(source, &["LoopScope", "SinkBreaker"]);
 }
 
+/// A nested loop with a condition in its body, on the inner and on the outer position, plans a
+/// loop scope and answers as pull mode does.
+#[rstest_log::rstest]
+#[case::on_the_inner_position(indoc! {"
+    out = test_sink()
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            if y > 1:
+                total += y
+    out << total
+"})]
+#[case::on_the_outer_position(indoc! {"
+    out = test_sink()
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            if x > 1:
+                total += y
+    out << total
+"})]
+fn a_nested_loop_with_a_condition(#[case] source: &str) {
+    answers_as_pull_mode_does(source, &["LoopScope", "SinkBreaker"]);
+}
+
+/// Nested-loop bodies of the shapes the cases name: each plans a loop scope and answers as pull
+/// mode does.
+#[rstest_log::rstest]
+#[case::an_aggregate_of_a_list_outside_the_loops(indoc! {"
+    out = test_sink()
+    xs = [1, 2, 3]
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            total += sum(xs) * y
+    out << total
+"})]
+#[case::a_record_of_two_aggregates(indoc! {"
+    out = test_sink()
+    xs = [1, 2, 3]
+    ws = [4, 5]
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            total += max([z for z in xs]) - min([w for w in ws]) + y
+    out << total
+"})]
+#[case::a_tuple_of_the_positions(indoc! {"
+    out = test_sink()
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            t = (x, y)
+            total += t.0 * t.1
+    out << total
+"})]
+#[case::two_generators(indoc! {"
+    out = test_sink()
+    xs = [1, 2, 3]
+    ws = [4, 5]
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            total += sum([z * w * y for z in xs for w in ws])
+    out << total
+"})]
+#[case::a_sum_of_sums(indoc! {"
+    out = test_sink()
+    xs = [1, 2, 3]
+    ws = [4, 5]
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            total += sum([sum([z * w for w in ws]) for z in xs]) * y
+    out << total
+"})]
+#[case::an_inner_loop_with_a_condition(indoc! {"
+    out = test_sink()
+    xs = [1, 2, 3]
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            acc := 0
+            for z in xs:
+                if z > y:
+                    acc += z
+            total += acc
+    out << total
+"})]
+#[case::a_comprehension_of_tuples(indoc! {"
+    out = test_sink()
+    xs = [1, 2, 3]
+    total := 0
+    for x in [1, 2]:
+        for y in [1, 2]:
+            total += sum([q.0 for q in [(y, z) for z in xs] if q.1 > 1])
+    out << total
+"})]
+fn a_nested_loop_body_reading(#[case] source: &str) {
+    answers_as_pull_mode_does(source, &["LoopScope", "SinkBreaker"]);
+}
+
 /// A transaction store is the breaker of a pipeline of its own; its input is its one writer's
 /// source, cut into morsels of items, and the sink reads the store once it is terminal.
 #[rstest_log::rstest]
