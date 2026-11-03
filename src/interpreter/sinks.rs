@@ -195,6 +195,7 @@ impl Consumer for SinkConsumer {
     /// Schedules one pull rather than pulling. A change reaches the sink once along every
     /// path from where it happened, and the queue holds a pull once however many arrive.
     fn notify(&mut self, _arrived: &Projection) {
+        crate::interpreter::dispatcher::debug_assert_outside_a_run();
         self.wakeups.request(self.pull.clone());
     }
 
