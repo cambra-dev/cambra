@@ -76,10 +76,13 @@ impl LoopScope {
                 .map(|&at| pipelines.leaves[at].clone())
                 .collect();
             let kinds: Vec<Consumes> = kept.iter().map(|&at| pipelines.kinds[at]).collect();
+            // A live source read inside a scope is read by the scope's pipeline in the run's
+            // dispatcher, so no inner pipeline is live.
             let (inner, planned) = plan_edges(
                 &reads,
                 &names,
                 &leaves,
+                &vec![false; names.len()],
                 &kinds,
                 morsel_rows,
                 &mut reach,
@@ -213,6 +216,22 @@ impl LoopScope {
         *drive
     }
 
+    /// Where a push of `region` from the range in front of `consumer` lands at the drive's entry,
+    /// as guards of the drive's input, the drive's source: a planner probes how a live source's
+    /// arrivals reach the scope's rounds.
+    pub(super) fn arrivals(&self, consumer: &SharedConsumer, region: &Projection) -> Vec<Arrival> {
+        let drive = self.drive();
+        self.placed(|_| {
+            let mut landing = Landing::probe(drive);
+            consumer.borrow_mut().push(region, &mut landing);
+            landing
+                .arrivals()
+                .into_iter()
+                .filter(|arrival| arrival.pipeline.0 == drive.0)
+                .collect()
+        })
+    }
+
     /// Have the drive read what its source holds, emitting nothing: a consume at no position. A
     /// loop nested in another learns the positions of a row once the round of the loop around it
     /// has run, so the scope reads them before it runs the row's rounds.
@@ -262,7 +281,7 @@ impl LoopScope {
 
     /// A round at `guard`, queued to every inner pipeline but the sources in the store's chain,
     /// the drive among them, which emit no position for it: a round at a row the drive has emitted
-    /// every position of.
+    /// every position of, or at positions it emits none of.
     fn closing_round(&self, guard: &TileGuard) {
         let readers: Vec<PipelineId> = (0..self.members.len())
             .map(PipelineId)
@@ -387,11 +406,42 @@ impl Breaker for LoopScope {
             if rows {
                 scope.read_source();
             }
-            while !scope.terminal()
-                && let Some(position) = scope.next_position()
-                && guard.covers_path(&position)
+            let mut rounds = 0;
+            let mut read = rows;
+            loop {
+                while !scope.terminal()
+                    && let Some(position) = scope.next_position()
+                    && guard.covers_path(&position)
+                {
+                    scope.round(&position);
+                    rounds += 1;
+                }
+                // A dispatched run notifies the drive of nothing. Once the drive has emitted
+                // every position it read, it reads its source again for what a live source
+                // delivered since, once per consume.
+                if read || scope.terminal() || scope.next_position().is_some() {
+                    break;
+                }
+                scope.read_source();
+                read = true;
+            }
+            // A package can name positions the drive runs no round at: those a filter on the
+            // drive's source dropped, keys a live source calls complete and never delivers, and
+            // the delivery that completes a source. The drive states them complete, having read
+            // past them, so a closing round at the package has every other inner pipeline read
+            // that, and the store's step releases them; the drive's next position, which lies
+            // past the package, is no part of it. A row's own closing round below closes a nested
+            // store's.
+            if rounds == 0
+                && !rows
+                && !scope.terminal()
+                && !guard_minus(
+                    &guard,
+                    &scope.with_store(|store| store.input_released(InputId::ONLY)),
+                )
+                .is_empty()
             {
-                scope.round(&position);
+                scope.closing_round(&guard);
             }
             // A drive states a row complete once the store has decided every position of it, so
             // its rendering of the row's last position says nothing of the row's end, and a
@@ -465,6 +515,8 @@ impl LoopScope {
     /// The consumer the scope's pipeline pushes to, the store's, and whether the store's output
     /// has keys of its own.
     pub(super) fn pushing_end(&self) -> (SharedConsumer, bool) {
+        // An induction store with no rows above it pushes once, everything at its terminal
+        // finish, so its readers are probed with everything; a nested store pushes rows.
         self.with_store(|store| {
             let keyed = matches!(store.tiling(), Tiling::DataFunction { .. });
             let downstream =
@@ -569,7 +621,6 @@ mod tests {
             planner.store_pipeline(crate::interpreter::tile_operators::StoreRead {
                 fan: stores[0].id(),
                 store: stores[0].store().expect("the program subscribed its store"),
-                sources: stores[0].source_producers(),
             });
             assert_eq!(planner.scopes.len(), 1, "an induction store runs in rounds");
             let mut scope = planner.build_scope(0, usize::MAX, &mut Vec::new());
