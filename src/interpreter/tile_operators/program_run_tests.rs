@@ -832,29 +832,219 @@ fn a_transaction_store_of_two_writers_is_refused() {
     );
 }
 
-/// A loop over a live source runs in no pipeline: no round takes the source's arrivals.
-#[test]
-#[should_panic(expected = "a store over a live source")]
-fn a_loop_over_a_live_source_is_refused() {
-    dispatched_with(
-        indoc! {"
-            out = test_sink()
-            total := 0
-            for x in source1():
-                total += x
-            out << total
-        "},
-        1,
-        &["out"],
-        |ctx| {
-            ctx.register_source(std::rc::Rc::new(std::cell::RefCell::new(
-                crate::interpreter::TestDataSource::new(
-                    "source1",
-                    crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
-                    crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
-                ),
-            )));
-        },
+/// A loop over a live source runs in a scope whose pipeline the run notifies of the positions each
+/// delivery adds, and answers what pull mode answers once the source yields everything.
+#[rstest_log::rstest]
+#[case::flat(indoc! {"
+    out = test_sink()
+    total := 0
+    for x in source1():
+        total += x
+    out << total
+"})]
+#[case::filtered(indoc! {"
+    out = test_sink()
+    total := 0
+    for x in source1():
+        if x > 2:
+            total += x
+    out << total
+"})]
+#[case::over_a_nested_loop(indoc! {"
+    out = test_sink()
+    total := 0
+    for x in source1():
+        for y in [1, 2]:
+            total += x * y
+    out << total
+"})]
+#[case::nested_over_the_source(indoc! {"
+    out = test_sink()
+    total := 0
+    for x in [1, 2]:
+        for y in source1():
+            total += x * y
+    out << total
+"})]
+fn a_loop_over_a_live_source(
+    #[case] source: &str,
+    #[values(two_batches(), one_key_batches(10), with_an_empty_last_delivery())] batches: Vec<
+        Batch,
+    >,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let expected = pulled_live(source, batches.clone());
+    let (value, planned) = dispatched_live(source, rows, batches);
+    assert_eq!(value, expected);
+    assert!(
+        planned
+            .iter()
+            .any(|plan| plan.live && plan.name.starts_with("LoopScope")),
+        "the loop's scope is the live source pipeline: {planned:?}"
+    );
+}
+
+/// A loop or a transaction over a live source whose drive reads past positions it runs no round
+/// or attempt at: positions a filter on the drive's source drops, and keys a delivery calls
+/// complete and holds nothing at while more are to come. The drive states them complete, so the
+/// store releases them in the epoch that delivered them.
+#[rstest_log::rstest]
+#[case::a_filter_on_the_drive_s_source(
+    indoc! {"
+        out = test_sink()
+        total := 0
+        for x in [y for y in source1() if y > 2]:
+            total += x
+        out << total
+    "},
+    one_key_batches(10),
+)]
+#[case::absent_keys_in_a_loop(
+    indoc! {"
+        out = test_sink()
+        total := 0
+        for x in source1():
+            total += x
+        out << total
+    "},
+    with_absent_keys(),
+)]
+#[case::absent_keys_in_a_transaction(
+    indoc! {"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in source1():
+            with begin():
+                pool := pool - r
+        out << await_final(pool)
+    "},
+    with_absent_keys(),
+)]
+#[case::an_item_ahead_of_its_completion(
+    indoc! {"
+        out = test_sink()
+        total := 0
+        for x in source1():
+            total += x
+        out << total
+    "},
+    with_an_item_ahead_of_its_completion(),
+)]
+#[case::an_item_ahead_of_its_completion_in_a_transaction(
+    indoc! {"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in source1():
+            with begin():
+                pool := pool - r
+        out << await_final(pool)
+    "},
+    with_an_item_ahead_of_its_completion(),
+)]
+fn a_drive_over_a_live_source_reads_past_empty_positions(
+    #[case] source: &str,
+    #[case] batches: Vec<Batch>,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let expected = pulled_live(source, batches.clone());
+    let (value, _) = dispatched_live(source, rows, batches);
+    assert_eq!(value, expected);
+}
+
+/// A loop over a let-bound map of a live source reads the map's `Memo`, the pipeline the run
+/// notifies of each delivery, whole once that pipeline has finished the last epoch.
+#[rstest_log::rstest]
+fn a_loop_over_a_let_bound_map_of_a_live_source(
+    #[values(two_batches(), one_key_batches(10))] batches: Vec<Batch>,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let source = indoc! {"
+        out = test_sink()
+        ys = [x * 2 for x in source1()]
+        total := 0
+        for y in ys:
+            total += y
+        out << total
+    "};
+    let expected = pulled_live(source, batches.clone());
+    let (value, planned) = dispatched_live(source, rows, batches);
+    assert_eq!(value, expected);
+    assert!(
+        planned
+            .iter()
+            .any(|plan| plan.live && plan.name.starts_with("Memo"))
+            && planned
+                .iter()
+                .any(|plan| plan.whole && plan.name.starts_with("LoopScope")),
+        "the map's `Memo` is the live pipeline, and the loop's scope reads it whole: {planned:?}"
+    );
+}
+
+/// A transaction over a live source is a pipeline the run notifies of the items each delivery adds,
+/// committed in order, and `await_final` answers once the source yields everything, as in pull
+/// mode.
+#[rstest_log::rstest]
+#[case::every_item(indoc! {"
+    out = test_sink()
+    pool: Mut(Int, Txn) := 100
+    for r in source1():
+        with begin():
+            pool := pool - r
+    out << await_final(pool)
+"})]
+#[case::with_denies(indoc! {"
+    out = test_sink()
+    pool: Mut(Int, Txn) := 10
+    for r in source1():
+        with begin():
+            if pool >= r:
+                pool := pool - r
+    out << await_final(pool)
+"})]
+fn a_transaction_over_a_live_source(
+    #[case] source: &str,
+    #[values(two_batches(), one_key_batches(10), with_an_empty_last_delivery())] batches: Vec<
+        Batch,
+    >,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let expected = pulled_live(source, batches.clone());
+    let (value, planned) = dispatched_live(source, rows, batches);
+    assert_eq!(value, expected);
+    assert!(
+        planned
+            .iter()
+            .any(|plan| plan.live && plan.name.starts_with("Commit")),
+        "the transaction store is the live source pipeline: {planned:?}"
+    );
+}
+
+/// A feed inside a transaction over a live source reads the store's decided stream, which the
+/// store pushes as each consume decides it, so the sink holds part of the stream before the source
+/// yields everything.
+#[rstest_log::rstest]
+fn a_feed_inside_a_transaction_over_a_live_source(
+    #[values(two_batches(), one_key_batches(10))] batches: Vec<Batch>,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let source = indoc! {"
+        out = test_sink()
+        pool: Mut(Int, Txn) := 100
+        for r in source1():
+            with begin():
+                pool := pool - r
+                out << pool
+    "};
+    let expected = pulled_live_written(source, batches.clone());
+    let mut written_before_the_end = Vec::new();
+    let (written, _) = dispatched_live_observed(source, rows, batches, |sink| {
+        written_before_the_end
+            .push(sink.value() == Err(crate::interpreter::SinkReadError::Incomplete));
+    });
+    assert_eq!(written, expected);
+    assert!(
+        written_before_the_end.first() == Some(&true),
+        "the first delivery's commits reach the sink before the next: {written_before_the_end:?}"
     );
 }
 
@@ -927,8 +1117,34 @@ type Batch = (Vec<(Value, Value)>, crate::interpreter::Predicate);
 
 /// `source`, reading the live source `source1`, compiled with a test sink `out` and run through
 /// the dispatcher at morsels of `rows`, the source fed `batches`: the first before the run, and
-/// each next one when the run has nothing to do. What the sink holds, and what the run planned.
+/// each next one when the run has nothing to do. The one value the sink holds, and what the run
+/// planned.
 fn dispatched_live(source: &str, rows: usize, batches: Vec<Batch>) -> (Value, Vec<Planned>) {
+    let (written, planned) = dispatched_live_written(source, rows, batches);
+    let [binding] = written.as_function().as_slice() else {
+        panic!("{source} writes one value: {written:?}")
+    };
+    (binding.output.clone(), planned)
+}
+
+/// [`dispatched_live`], answering everything the sink holds: a value under each site that feeds
+/// it.
+fn dispatched_live_written(
+    source: &str,
+    rows: usize,
+    batches: Vec<Batch>,
+) -> (Value, Vec<Planned>) {
+    dispatched_live_observed(source, rows, batches, |_| {})
+}
+
+/// [`dispatched_live_written`] with `idle` handed the sink each time the run has nothing to do,
+/// before the next delivery.
+fn dispatched_live_observed(
+    source: &str,
+    rows: usize,
+    batches: Vec<Batch>,
+    mut idle: impl FnMut(&crate::interpreter::TestSink),
+) -> (Value, Vec<Planned>) {
     let mut ctx = GlobalContext::default();
     ctx.defer_sink_pulls();
     let feed = std::rc::Rc::new(std::cell::RefCell::new(
@@ -956,6 +1172,7 @@ fn dispatched_live(source: &str, rows: usize, batches: Vec<Batch>) -> (Value, Ve
     deliver(batches.next());
     let planned =
         crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut || {
+            idle(&sink);
             deliver(batches.next())
         })
         .unwrap_or_else(|refused| panic!("{refused}"))
@@ -967,10 +1184,102 @@ fn dispatched_live(source: &str, rows: usize, batches: Vec<Batch>) -> (Value, Ve
     let written = sink
         .value()
         .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+    (written, planned)
+}
+
+/// The entries of `value`, a collection of `Int` keyed by a source's keys, in key order.
+fn keyed_ints(value: &Value) -> Vec<(u64, i64)> {
+    let mut pairs: Vec<(u64, i64)> = value
+        .as_function()
+        .iter()
+        .map(|binding| match (&binding.input, &binding.output) {
+            (Value::UInt(key), Value::Int(value)) => (*key, *value),
+            other => panic!("the map is keyed by the source's keys: {other:?}"),
+        })
+        .collect();
+    pairs.sort();
+    pairs
+}
+
+/// `source`, reading the live source `source1`, compiled with a test sink `out` and run in pull
+/// mode, the source fed `batches` one at a time, each once the scheduler has run out of work: the
+/// one value the sink holds once the source yields everything.
+fn pulled_live(source: &str, batches: Vec<Batch>) -> Value {
+    let written = pulled_live_written(source, batches);
     let [binding] = written.as_function().as_slice() else {
         panic!("{source} writes one value: {written:?}")
     };
-    (binding.output.clone(), planned)
+    binding.output.clone()
+}
+
+/// [`pulled_live`], answering everything the sink holds.
+fn pulled_live_written(source: &str, batches: Vec<Batch>) -> Value {
+    let mut ctx = GlobalContext::default();
+    let feed = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::interpreter::TestDataSource::new(
+            "source1",
+            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+        ),
+    ));
+    ctx.register_source(feed.clone());
+    let sink = ctx.register_test_sink("out");
+    let program = compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    for (entries, complete) in batches {
+        feed.borrow_mut().add_data(&entries);
+        feed.borrow_mut().set_yield_predicate(complete);
+        for _ in 0..1000 {
+            ctx.scheduler().check_for_notifications();
+        }
+    }
+    assert!(
+        program.done.try_recv().is_ok(),
+        "{source} completes in pull mode once the source yields everything"
+    );
+    sink.value().expect("the sink holds a value")
+}
+
+/// Two deliveries of `source1`: keys 0 to 2 with everything through 4 called complete, so keys 3
+/// and 4 never arrive, then keys 5 and 6 and the rest; each valued one more than the key.
+fn with_absent_keys() -> Vec<Batch> {
+    let entries = |keys: std::ops::Range<u64>| {
+        keys.map(|key| (Value::UInt(key), Value::Int(key as i64 + 1)))
+            .collect::<Vec<_>>()
+    };
+    vec![
+        (
+            entries(0..3),
+            crate::interpreter::Predicate::at_or_below(Value::UInt(4)),
+        ),
+        (entries(5..7), crate::interpreter::Predicate::True),
+    ]
+}
+
+/// Three deliveries of `source1`, one key each: key 0 with it complete; key 2 with only keys
+/// through 1 complete, so key 1 never arrives and the drive holds key 2 past the delivery's
+/// package; then key 3 and the rest. Each valued one more than the key.
+fn with_an_item_ahead_of_its_completion() -> Vec<Batch> {
+    let one = |key: u64| vec![(Value::UInt(key), Value::Int(key as i64 + 1))];
+    vec![
+        (
+            one(0),
+            crate::interpreter::Predicate::at_or_below(Value::UInt(0)),
+        ),
+        (
+            one(2),
+            crate::interpreter::Predicate::at_or_below(Value::UInt(1)),
+        ),
+        (one(3), crate::interpreter::Predicate::True),
+    ]
+}
+
+/// [`two_batches`] with a third delivery that adds no key and calls the source complete.
+fn with_an_empty_last_delivery() -> Vec<Batch> {
+    let mut batches = two_batches();
+    batches[1].1 = crate::interpreter::Predicate::at_or_below(Value::UInt(4));
+    batches.push((Vec::new(), crate::interpreter::Predicate::True));
+    batches
 }
 
 /// Two deliveries of `source1`: keys 0 to 2, then 3 and 4, valued one more than the key.
@@ -1045,18 +1354,65 @@ fn a_let_bound_map_over_a_live_source(#[values(1, usize::MAX)] rows: usize) {
     );
 }
 
-/// A feed of a map over a live source is keyed by the sink's one row, so a push of a delivery's
-/// keys is widened on its way to the pipeline above the source, which no package names.
-#[test]
-#[should_panic(expected = "widened, so no package names them")]
-fn a_feed_of_a_map_over_a_live_source_is_refused() {
-    dispatched_live(
+/// A feed of a map over a live source is keyed by the sink's one row, which holds the whole map, so
+/// a delivery's keys reach the pipeline above the source widened. The pipeline reads its input
+/// whole once the source yields everything.
+#[rstest_log::rstest]
+#[case::every_key(
+    indoc! {"
+        out = test_sink()
+        out << [x * 2 for x in source1()]
+    "},
+    (0..5).map(|key| (key, 2 * (key as i64 + 1))).collect(),
+)]
+#[case::filtered(
+    indoc! {"
+        out = test_sink()
+        out << [x * 2 for x in source1() if x > 2]
+    "},
+    (2..5).map(|key| (key, 2 * (key as i64 + 1))).collect(),
+)]
+fn a_feed_of_a_map_over_a_live_source(
+    #[case] source: &str,
+    #[case] expected: Vec<(u64, i64)>,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let (value, planned) = dispatched_live(source, rows, two_batches());
+    assert_eq!(keyed_ints(&value), expected);
+    assert!(
+        planned.iter().any(|plan| plan.live && plan.whole),
+        "a live pipeline reads its input whole: {planned:?}"
+    );
+}
+
+/// A sink fed from two sites reads a union of the two feeds, one arm each, so each site's arrivals
+/// reach the pipeline above the source widened under its own arm, and the pipeline reads both arms
+/// whole.
+#[rstest_log::rstest]
+fn a_sink_fed_twice_over_a_live_source(#[values(1, usize::MAX)] rows: usize) {
+    let (written, _) = dispatched_live_written(
         indoc! {"
             out = test_sink()
             out << [x * 2 for x in source1()]
+            out << [x + 100 for x in source1()]
         "},
-        1,
+        rows,
         two_batches(),
+    );
+    let mut arms: Vec<Vec<(u64, i64)>> = written
+        .as_function()
+        .iter()
+        .map(|arm| keyed_ints(&arm.output))
+        .collect();
+    arms.sort();
+    assert_eq!(
+        arms,
+        [
+            (0..5)
+                .map(|key| (key, 2 * (key as i64 + 1)))
+                .collect::<Vec<_>>(),
+            (0..5).map(|key| (key, key as i64 + 101)).collect(),
+        ]
     );
 }
 
@@ -1124,10 +1480,40 @@ fn a_cross_product_of_live_sources_is_refused() {
         two_batches(),
     );
 }
+/// A reader whose build edge reads a pipeline with a live source beneath it reads its input whole
+/// once every epoch has run, since that pipeline finishes epochs before its input is whole: a
+/// lookup of a live store's final value, and of an aggregate over a live map.
+#[rstest_log::rstest]
+#[case::a_live_store(indoc! {"
+    out = test_sink()
+    ys = [1, 2]
+    pool: Mut(Int, Txn) := 100
+    for r in source1():
+        with begin():
+            pool := pool - r
+    zs = [y + await_final(pool) for y in ys]
+    out << sum(zs)
+"})]
+#[case::a_live_map(indoc! {"
+    out = test_sink()
+    ys = [1, 2]
+    xs = [x * 2 for x in source1()]
+    zs = [y + sum(xs) for y in ys]
+    out << sum(zs)
+"})]
+fn a_reader_of_a_live_pipeline_through_a_build_edge(
+    #[case] source: &str,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let expected = pulled_live(source, two_batches());
+    let (value, _) = dispatched_live(source, rows, two_batches());
+    assert_eq!(value, expected);
+}
+
 /// A breaker whose chain reads a live source and a pipeline takes the pipeline's pushes, and no
 /// package a source's delivery names.
 #[test]
-#[should_panic(expected = "reads pushes and a live source")]
+#[should_panic(expected = "reads a pipeline and a live source")]
 fn a_reader_of_pushes_over_a_live_source_is_refused() {
     dispatched_live(
         indoc! {"

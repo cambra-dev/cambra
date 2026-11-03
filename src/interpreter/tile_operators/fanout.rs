@@ -210,9 +210,6 @@ pub struct StoreRead {
     pub(crate) fan: usize,
     /// The store, the fan-out's input.
     pub(crate) store: StoreCell,
-    /// The producers registered with a data source inside the store's chain
-    /// ([`FanOut::source_producers`]).
-    pub(crate) sources: Vec<String>,
 }
 
 /// A store's handle on the cyclic fan-out whose input it is ([`TileProducer::enter_cycle`]).
@@ -911,7 +908,6 @@ impl TileProducer for FanOutProducer {
         Some(StoreRead {
             fan: shared.id,
             store: store.clone(),
-            sources: shared.source_producers.clone(),
         })
     }
 
