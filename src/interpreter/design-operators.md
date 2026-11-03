@@ -916,13 +916,20 @@ a step that changes neither the store nor its input's release panics, and so doe
 terminal at the run's last epoch. A transaction's deny commits nothing and progresses through its
 source's release alone.
 
-A store holds everything once it is terminal and nothing before, since a reader pulls the store
-tile, which `restrict_to` cannot cut to part of its positions. It pushes once, at the finish where
-it is terminal (`pushes_while_consuming` answers `false`), to its reader slots and not its
-recurrence slots (`FanOutInput::push`), and every reader reads the store whole. Its `final_guard` is
-`held()`. A release of a store with no rows above it names the positions a reader reads no more and
-removes nothing from the store tile; a nested store's offer cuts the rows its readers released ([A
-loop in rounds](#a-loop-in-rounds)). A consuming store answers a pull from its snapshot.
+An induction store holds everything once it is terminal and nothing before, since a reader pulls the
+store tile, which `restrict_to` cannot cut to part of its positions, and it pushes once, at the
+finish where it is terminal (`pushes_while_consuming` answers `false`). A transaction store holds
+the commit ticks it has decided, through its watermark (`store_frontier`), and everything once it is
+terminal, and it pushes the ticks each consume decides (`pushes_while_consuming` answers `true`). A
+store pushes to its reader slots and not its recurrence slots (`FanOutInput::push`), and every
+reader pulls the store whole. `StoreValueStream`, a reader of a transaction store's changelog, keeps
+the store's keys and cuts its answer to the ticks a pull names, so a feed inside a transaction takes
+the ticks as they are decided; any other reader widens the push, so its pipeline takes a package of
+the store only once the store's pipeline has finished the epoch ([The dispatcher](#the-dispatcher)),
+or, over a live source, once every epoch has run. A store's `final_guard` is `held()`. A release of
+a store with no rows above it names the positions a reader reads no more and removes nothing from
+the store tile; a nested store's offer cuts the rows its readers released ([A loop in
+rounds](#a-loop-in-rounds)). A consuming store answers a pull from its snapshot.
 
 In pull mode an induction store releases its body whole once the body is terminal and every decision
 is stepped, and a transaction drive releases its source whole once it is done. A nested induction
@@ -934,9 +941,13 @@ outside its cycle: its readers there take the rows it closes from its pushes, an
 refuses a store read inside the cycle of a store that steps itself (`Planner::beneath_cycle`). A
 seed sits behind an entry no planner places (`subscribe_pulled`), since the store reads it by pull
 at a step, so a push from beneath the seed stops there rather than climb to the store's readers. A
-release through the decided positions or the last finished item never names a position the source
-filtered out, and the dispatcher's finish checks that a store's input released every morsel the
-pipeline consumed.
+drive with no rows above it states complete every position below its next one that its source calls
+complete along with every position before, so a position it reads past, one the source filtered out
+or holds nothing at, is stated as one it emitted (`complete_prefix_below`). An induction store with
+no rows above it releases its body through what the body states complete and holds no decision at,
+and a transaction drive releases its source through what it has read past, so either releases such a
+position without waiting for a later one to be decided. The dispatcher's finish checks that a
+store's input released every morsel the pipeline consumed.
 
 `run_program` plans a store's pipeline where it reaches a reader slot of the store's fan-out
 (`TileProducer::store_read`). The pipeline reads the pipelines beneath the store's cycle: a subtree
@@ -948,7 +959,6 @@ rounds](#a-loop-in-rounds)). The planner refuses:
 
 - outside a loop's scope, a nested store, one per enclosing row, whose frontier a flat morsel does
   not name, and a store whose seed reads a pipeline;
-- a store over a live source, whose arrivals no run notifies;
 - a store inside the cycle of a store that steps itself, which no round reaches;
 - a transaction store of several writers, since a morsel names positions of one source.
 
@@ -1026,9 +1036,10 @@ queued once. A push an operator widens to `Everything` on its way fails the run 
 reaches (`Landing::widened` marks the path, `Landing::queue` refuses it), since the reader could not
 tell which of its keys it names: a reader reached that way reads the pushing pipeline once it has
 finished, instead of its pushes. A push that re-enters a consumer it is passing through has met a
-cycle, and fails the run too. The push path sits beside `notify` while runs still pull. Once every
-run goes through the dispatcher, `notify`, its gates and `WakeupQueue` go, and `push` takes their
-place.
+cycle, and fails the run too. A compiled program's dispatched run notifies no consumer: a producer
+that caches what it reads reads it again where a store steps or a live source yields more
+(`TileProducer::read_again`), and a debug build checks that no consumer is notified inside the run
+(`dispatcher::in_a_run`). `notify`, its gates and `WakeupQueue` stay for pull mode.
 
 `dispatcher::finish_epoch` finishes a pipeline's oldest unfinished epoch. It asserts six invariants
 before it calls the breaker: the pipeline has not begun to finish the epoch, its queue there is
@@ -1135,8 +1146,8 @@ The run pulls only the breakers' inputs. The program is compiled with
 a `Refused` error that names the shape, and pull mode runs every refused program:
 
 - a program compiled with its sinks pulled;
-- a live source read anywhere but by a source pipeline of the run's dispatcher whose input the
-  source's keys reach as its outermost keys (below);
+- a live source whose arrivals reach no pipeline's entry, reach one beneath its outermost keys, or
+  reach a pipeline that also reads pushes (below);
 - a pipeline read directly by a pipeline another pipeline reads;
 - a breaker with no consuming mode (`Breaker::no_consuming_mode`): a transaction store of several
   writers;
@@ -1145,21 +1156,46 @@ a `Refused` error that names the shape, and pull mode runs every refused program
   no projection there ([A loop in rounds](#a-loop-in-rounds)).
 
 A range over a live source's domain (`TileProducer::data_sources`, an `IterateExtent` over a
-`DataSourceDomain`) is no range the run queues whole at its start. The pipeline above it must be a
-source of the run's dispatcher, and a push of one of the range's keys through the range's consumer
-must reach that pipeline's entry restated, as a guard of the input's outermost keys: a reader of
-pushes, a loop's round and a store take no package a source's arrival names, and a feed `out << 𝑒`
-is keyed by the sink's one row, so its source's keys sit beneath it. Such a pipeline is live
-(`Planned::live`). The run starts the other sources whole and then polls: each pass asks every live
-source for new data (`DataSourceDomainExtentImpl::check_for_new_data`), notifies each live pipeline
-of the keys its sources yield beyond what it was notified of (`get_yield_predicate`), as the region
-a push of them brings its entry, and seals the epoch where it notified one and one is still open.
-A live pipeline closes once its sources yield everything, and the run ends with the epoch the last
-one closes in. A pass that finds nothing new calls the caller's `on_idle` after running what is
-claimable (`run_program_polling`): `run_program` sleeps for a millisecond, and a test feeds the
-source there. A range reads one source, keyed by positions: the planner refuses a cross product of
-sources, a source beside a static extent, and a source with other keys, whose arrivals no region
-of one source's positions spells.
+`DataSourceDomain`) is no range the run queues whole at its start. The pipeline that stands for it
+in the run's dispatcher is live (`Planned::live`), and the run notifies it of what the source yields
+in one of four ways (`LivePipeline::poll`):
+
+- A push of one of the range's keys through the range's consumer reaches the pipeline's entry
+  restated, as a guard of the input's outermost keys: the pipeline is notified of the keys each
+  delivery adds, as the region a push of them brings its entry.
+- The push reaches the entry widened, as a feed `out << 𝑒` widens its source's keys, which sit
+  beneath the sink's one row: the pipeline reads its input whole once every live source under it
+  yields everything (`Planned::whole`). The widened pushes of several ranges, as of a sink fed from
+  two sites, name their parts of the input together.
+- The range is read inside a loop's scope, whose pipeline stands for every pipeline inside it
+  (`Planner::members`). Where the push reaches the scope's own drive, the scope is notified of each
+  delivery's keys as positions of its rounds. Where it reaches no drive of the scope, the source is
+  read inside a loop nested in it, whose rows end only once the source yields everything, so the
+  scope reads its input whole then, as pull mode waits for each row.
+- The range is read under a transaction store, whose input is its writer's source, read behind an
+  entry no planner places: the store's pipeline is notified of each delivery's keys as its items.
+
+A drive and a transaction store decide positions in order, and a debug build checks that a delivery
+adds positions after every one before it. A dispatched run delivers no notification: a loop's scope
+has its drive read its source once the drive has emitted every position it read, and a delivery to a
+transaction store has its writer's drive read its source again (`Breaker::read_source_again`). A
+package of positions the drive emits none of, such as the delivery that completes a source or one of
+keys a filter on its source drops, runs no round of a position; the scope runs a closing round at
+the package, queued to every inner pipeline but the sources in the store's chain, which has them
+read what the drive read past, and the store's step releases the package. A reader of a pipeline
+takes no package a source's arrival names, so the planner refuses a pipeline that reads both. A
+pipeline with a live source beneath it finishes epochs before its input is whole, so a reader with a
+build edge on it reads its input whole once every epoch has run (`Dispatcher::read_whole`).
+
+The run starts the other sources whole and then polls: each pass asks every live source for new data
+(`DataSourceDomainExtentImpl::check_for_new_data`), notifies each live pipeline of the keys its
+sources yield beyond what it was notified of (`get_yield_predicate`), and seals the epoch where it
+notified one and one is still open. A live pipeline closes once its sources yield everything, and
+the run ends with the epoch the last one closes in. A pass that finds nothing new calls the caller's
+`on_idle` after running what is claimable (`run_program_polling`): `run_program` sleeps for a
+millisecond, and a test feeds the source there. A range reads one source, keyed by positions: the
+planner refuses a cross product of sources, a source beside a static extent, and a source with other
+keys, whose arrivals no region of one source's positions spells.
 
 The binary runs a program dispatched where `CAMBRA_DISPATCH` is set and not `0`, and neither
 `--inspect` nor `--control` is given, at morsels of `CAMBRA_MORSEL_ROWS` rows (1024 unset; a value
@@ -1209,7 +1245,10 @@ runs none:
 A consume of the drive emits a position only where the package names its whole path at the
 positions' level, so a round emits one position and a round at a row emits none; a pull in pull mode
 emits the next position whatever it names. A consume at no position reads the drive's source and
-emits nothing. The first consume of the scope has the drive consume at no position, then steps the
+emits nothing. A dispatched run notifies the drive of nothing. A consume of a scope whose store has
+no rows above it has the drive read its source again once it has emitted every position it read and
+the store is not terminal, at most once per consume; a consume of a nested row has it read at the
+row's start and end. The first consume of the scope has the drive consume at no position, then steps the
 store once, which opens the store at its seed and publishes it: the drive reads the open store
 before it emits a position, and emits none outside a round. The scope pushes the store at the finish
 where the store is terminal, to the readers of the store's fan-out.
