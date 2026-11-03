@@ -134,6 +134,7 @@ theorem subtyping_of_subtypeCheck :
     -- Leaves.
     · exact eq_of_beq h ▸ Subtyping.base _
     · exact eq_of_beq h ▸ Subtyping.uintRange _
+    · exact Subtyping.uintRangeUInt _
     · exact eq_of_beq h ▸ Subtyping.dataSource _
     · exact Subtyping.txn
     -- Function edge.
@@ -238,6 +239,7 @@ theorem subtypeCheck_of_subtyping {lhs rhs : Ty}
   induction h with
   | base b => simp [subtypeCheck]
   | uintRange n => simp [subtypeCheck]
+  | uintRangeUInt n => simp [subtypeCheck]
   | dataSource s => simp [subtypeCheck]
   | txn => simp [subtypeCheck]
   | @fnCompute n0 n1 k0 k1 d0 c0 d1 c1 hok hnd hdom hcod ihdom ihcod =>

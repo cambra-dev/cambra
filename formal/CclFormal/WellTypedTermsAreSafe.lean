@@ -56,6 +56,7 @@ theorem Subtyping.refinements_mono {S W : Ty} (h : Subtyping S W) :
       exact deficit_eq_nil_iff.mp hdef
   | base b => simp [Ty.peel]
   | uintRange n => simp [Ty.peel]
+  | uintRangeUInt n => simp [Ty.peel]
   | dataSource s => simp [Ty.peel]
   | txn => simp [Ty.peel]
   | fnCompute h1 h2 h3 h4 => simp [Ty.peel]

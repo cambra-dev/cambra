@@ -455,6 +455,7 @@ original bound-graph variable identities as output type variables.
 | --- | --- |
 | No concrete shape | A fresh `Type::Infer` placeholder |
 | One compatible shape | The corresponding concrete type, with materialized children |
+| `UInt` beside one or more ranges `0..𝑛` | `UInt` at a positive position and the range at a negative one, since `0..𝑛 <: UInt`; two ranges remain distinct shapes |
 | Distinct incompatible shapes, such as `Int` and `String` | `IncompatibleBounds` |
 | A tagged variant shape | `Type::Variant`, retaining its tags rather than treating them as an untagged collision |
 
@@ -1626,7 +1627,8 @@ equality does not itself prove implication between different terms.
 `constrain_go` transports both sides' predicates into the ambient binder frame before comparison.
 It computes the consumer predicates missing from the producer, then takes one of these paths:
 
-1. With no deficit, constrain the peeled base types.
+1. With no deficit, constrain the peeled base types. A `UInt` producer base against a `0..𝑛`
+   consumer base skips this path: the range's bound is a demand no refinement layer records.
 2. If the producer base is an inference variable, constrain it against the consumer base with the
    missing predicates attached. That variable can still acquire the required information.
 3. For a concrete producer with a deficit, use the caller's SMT policy. A structural-only caller
@@ -1662,6 +1664,12 @@ literal factor, comparisons, boolean connectives, and `(𝑎, 𝑏) ▷ int_eq_u
 integer types encodes as SMT `Int`, and unsigned sorts add range constraints. A named string sort
 does not provide string-literal or concatenation encoding. Other function applications, nonlinear
 multiplication, floor division, and exponentiation are outside this fragment.
+
+A refined `UInt` against a `0..𝑛` base asks `smt_sub_at` instead, which declares the subject at
+the producer's base and adds its membership in the consumer's base, `0 ≤ __elem < 𝑛`, to the goal.
+`{UInt | (1, __elem) ▷ int_eq_uint} <: 0..3` holds and the same type at `3` does not. When the
+entailment holds the edge holds: the two bases are leaves, and `0..𝑛 <: UInt` is a structural rule
+of `constrain_go` for every `𝑛`. Two ranges relate only by equality.
 
 An unsupported predicate produces `SmtError::Encoding`. The subtype deficit rule treats that
 outcome as a mismatch: failure to encode is not evidence of entailment. Other SMT errors reach

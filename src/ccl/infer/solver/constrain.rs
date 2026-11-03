@@ -23,8 +23,8 @@ use crate::ccl::infer_var::Origin;
 use crate::ccl::subst::Subst;
 use crate::ccl::ty::{FunKind, KindPin, TypeKind};
 use crate::ccl::{
-    BarrierUpper, BarrierVar, BarrierVarId, Bound, HistoryKind, InferVar, InferVarId, Level, Name,
-    Refinement, RefinementSet, Type,
+    BarrierUpper, BarrierVar, BarrierVarId, BaseType, Bound, HistoryKind, InferVar, InferVarId,
+    Level, Name, Refinement, RefinementSet, Type,
 };
 
 use super::barrier::EdgeReport;
@@ -1355,6 +1355,9 @@ fn constrain_go_impl(
         // Leaf types match by structural equality.
         (Type::Base(a), Type::Base(b)) if a == b => Ok(()),
         (Type::UIntRange(a), Type::UIntRange(b)) if a == b => Ok(()),
+        // `0..𝑛` is the `UInt`s below `𝑛`. Two ranges still relate only by equality: a range is
+        // a data domain, and inclusion between two of them is not subsumption.
+        (Type::UIntRange(_), Type::Base(BaseType::UInt)) => Ok(()),
         (Type::DataSource(a), Type::DataSource(b)) if a == b => Ok(()),
         // a channel's nominal domain is reflexively equal to
         // itself (the common read-vs-read case short-circuits here).
@@ -2312,7 +2315,16 @@ fn constrain_go_impl(
                 .filter(|(_, forced)| !lrefs_in_ambient.contains(forced))
                 .map(|(r, _)| r.clone())
                 .collect();
-            if deficit.is_empty() {
+            // `0..𝑛` is the `UInt`s below `𝑛`, so a refined `UInt` is below it exactly when
+            // its refinements entail the bound. That bound is a demand the bases carry rather
+            // than a refinement layer, so no deficit records it and only the solver decides
+            // it. A `UInt` with no refinement on either side never reaches this arm: no
+            // predicate bounds it, so the base arm's mismatch is already the answer.
+            let range_demand = matches!(
+                (lbase, rbase),
+                (Type::Base(BaseType::UInt), Type::UIntRange(_))
+            );
+            if deficit.is_empty() && !range_demand {
                 // lhs's explicit layers already supply every refinement rhs requires.
                 constrain_go(lbase, rbase, sl, sr, cache, scope)
             } else if matches!(lbase, Type::Infer(_)) {
@@ -2326,19 +2338,26 @@ fn constrain_go_impl(
                     lhs: Box::new(lhs.clone()),
                     rhs: Box::new(rhs.clone()),
                 })
-            } else if super::smt::smt_sub(lbase, &lrefs_in_ambient, &rrefs_in_ambient, scope)
-                .or_else(|error| match error {
-                    // A predicate the encoder cannot read leaves the deficit undecided,
-                    // and undecided is the answer structural matching already gave:
-                    // a mismatch. Reporting the encoder's limit instead would turn an
-                    // ill-typed program's diagnostic into a note about this module.
-                    SmtError::Encoding { .. } => Ok(false),
-                    error => Err(ConstrainError::SmtError {
+            } else if range_demand {
+                // Both bases are leaves, so the entailment is the whole edge.
+                let proven = super::smt::smt_sub_at(
+                    lbase,
+                    rbase,
+                    &lrefs_in_ambient,
+                    &rrefs_in_ambient,
+                    scope,
+                )
+                .or_else(|error| smt_undecided_is_mismatch(error, lhs, rhs))?;
+                if proven {
+                    Ok(())
+                } else {
+                    Err(ConstrainError::Mismatch {
                         lhs: Box::new(lhs.clone()),
                         rhs: Box::new(rhs.clone()),
-                        error: Box::new(error),
-                    }),
-                })?
+                    })
+                }
+            } else if super::smt::smt_sub(lbase, &lrefs_in_ambient, &rrefs_in_ambient, scope)
+                .or_else(|error| smt_undecided_is_mismatch(error, lhs, rhs))?
             {
                 constrain_go(lbase, rbase, sl, sr, cache, scope)
             } else {
@@ -2352,6 +2371,27 @@ fn constrain_go_impl(
         _ => Err(ConstrainError::Mismatch {
             lhs: Box::new(lhs.clone()),
             rhs: Box::new(rhs.clone()),
+        }),
+    }
+}
+
+/// The deficit rule's reading of a solver query that did not answer.
+///
+/// A predicate the encoder cannot read leaves the deficit undecided, and undecided is the
+/// answer structural matching already gave: a mismatch. Reporting the encoder's limit instead
+/// would turn an ill-typed program's diagnostic into a note about the encoder. Every other
+/// error is the solver failing, which is reported.
+fn smt_undecided_is_mismatch(
+    error: SmtError,
+    lhs: &Type,
+    rhs: &Type,
+) -> Result<bool, ConstrainError> {
+    match error {
+        SmtError::Encoding { .. } => Ok(false),
+        error => Err(ConstrainError::SmtError {
+            lhs: Box::new(lhs.clone()),
+            rhs: Box::new(rhs.clone()),
+            error: Box::new(error),
         }),
     }
 }
@@ -3066,6 +3106,45 @@ mod tests {
             constrain_subtype(&filtered, &bare, &mut ConstrainCache::new()).is_err(),
             "in either direction"
         );
+    }
+
+    /// `{UInt | __elem == 𝑛}`, with an encodable predicate.
+    fn uint_eq(n: i64) -> Type {
+        let pred = TypedExpr::binop(
+            TypedExpr::var(Name::elem()).with_ty(prim(BaseType::UInt)),
+            BinOpKind::Compare(CompareKind::Equals),
+            TypedExpr::lit(Lit::Int(n)).with_ty(prim(BaseType::Int)),
+        )
+        .with_ty(prim(BaseType::Bool));
+        Type::Refinement(
+            Box::new(prim(BaseType::UInt)),
+            Refinement::born(Rc::new(pred)).into(),
+        )
+    }
+
+    /// `0..𝑛 <: UInt` holds structurally; the converse does not, and ranges relate only by
+    /// equality.
+    #[test]
+    fn a_range_is_below_uint() {
+        let mut cache = ConstrainCache::new();
+        let uint = prim(BaseType::UInt);
+        assert!(constrain_subtype(&Type::UIntRange(3), &uint, &mut cache).is_ok());
+        assert!(constrain_subtype(&uint, &Type::UIntRange(3), &mut cache).is_err());
+        assert!(constrain_subtype(&Type::UIntRange(3), &Type::UIntRange(4), &mut cache).is_err());
+    }
+
+    /// A refined `UInt` is below `0..𝑛` exactly when the solver proves its refinements entail
+    /// the bound, and a caller that skips the solver gets the structural mismatch.
+    #[test]
+    fn a_refined_uint_is_below_a_range_it_is_proven_inside() {
+        let range = Type::UIntRange(3);
+        let mut cache = ConstrainCache::new();
+        let proven = |lhs: &Type, cache: &mut ConstrainCache| {
+            constrain_subtype_in(lhs, &range, cache, &super::super::smt::NoScope)
+        };
+        assert!(proven(&uint_eq(1), &mut cache).is_ok());
+        assert!(proven(&uint_eq(3), &mut cache).is_err());
+        assert!(constrain_subtype(&uint_eq(1), &range, &mut cache).is_err());
     }
 
     #[test]

@@ -42,6 +42,29 @@ def atomTy : Atom → Ty
   | .source s => .dataSource s
   | .txn => .txn
 
+/-- Whether a materialized atom is `UInt`. -/
+def isUIntTy : Ty → Bool
+  | .base .uint => true
+  | _ => false
+
+/-- Whether a materialized atom is a range. -/
+def isUIntRangeTy : Ty → Bool
+  | .uintRange _ => true
+  | _ => false
+
+/-- Mirror of `absorb_uint_ranges` (`coalesce.rs`): where `UInt` meets a range, the position
+settles by `0..𝑛 <: UInt`. A join drops the ranges and a meet drops `UInt`; two ranges stay two
+atoms. -/
+def absorbUIntRanges (pol : Bool) (ts : List Ty) : List Ty :=
+  if ts.any isUIntTy && ts.any isUIntRangeTy then
+    if pol then ts.filter (fun t => !isUIntRangeTy t) else ts.filter (fun t => !isUIntTy t)
+  else ts
+
+/-- The atom contributions a position materializes: one type per distinct atom, then
+`absorbUIntRanges`. -/
+def atomShapes (pol : Bool) (atoms : List Atom) : List Ty :=
+  absorbUIntRanges pol (atoms.map atomTy).eraseDups
+
 /-- Re-attach the position's refinements, flattening as `Type::refined` does: an empty
 refinement set is the bare type. -/
 def attachRefinements (t : Ty) : Option (List Predicate) → Ty
@@ -199,7 +222,7 @@ def coalesce (pol : Bool) : CompactTy → Except CoalesceError (Option Ty)
       -- length is manifest here rather than something a lemma has to recover
       -- from the helper's branches. An absent slot's helper answers `none` and
       -- is not read.
-      combine ((atoms.map atomTy).eraseDups.map some
+      combine ((atomShapes pol atoms).map some
         ++ (if recF.isSome then [recShape] else [])
         ++ (if varT.isSome then [varShape] else [])
         ++ (if fn.isSome then [funShape] else [])) refinements

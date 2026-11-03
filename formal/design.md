@@ -87,6 +87,12 @@ closed tuples of equal width, `tupleOpen` a closed tuple below an open one listi
 positions, and `openTuple` two open tuples the same way. No rule puts an open tuple below a closed
 one.
 
+Two ranges relate only by equality (`uintRange`): a range is a data domain, and inclusion between
+two ranges is not subsumption. Every range is below `UInt` (`uintRangeUInt`), mirroring
+`constrain_go`'s `(UIntRange(_), Base(UInt))` arm. A refined `UInt` below a range is decided by the
+solver in the Rust (`smt_sub_at`), and the model, which has no solver, rejects it as a refinement
+deficit.
+
 The relation differs from the Rust implementation in three recorded ways: it has no trivial-equality
 shortcut, compares closed function codomains without binder correspondence, and has no
 partition-collapse arm. The module documentation states these boundaries. In particular, omitting
@@ -224,6 +230,13 @@ category rather than an inference-variable identity or its attached predicates.
 Each occupied shape contributes an entry to `combine`, even when that entry is unresolved.
 No entries produce `ok none`; one entry is returned with refinements attached; multiple entries
 produce `incompatible`. Error propagation from the shape helpers occurs before this combination.
+
+The atom slot contributes one entry per distinct atom, after `absorbUIntRanges`, which mirrors
+`absorb_uint_ranges` in `coalesce.rs`. Where `UInt` meets a range, a positive position drops the
+ranges and a negative one drops `UInt`, so the join is `UInt` and the meet is the range. Two ranges
+stay two entries. `atomShapes_singleton` states what a single surviving entry means: it is one of
+the position's atoms, and every atom there is below it at a positive position or above it at a
+negative one.
 
 The slot rules are:
 

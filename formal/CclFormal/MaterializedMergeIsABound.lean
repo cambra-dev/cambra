@@ -111,9 +111,9 @@ their `if` drops them, so `combine` sees one entry. -/
 
 theorem coalesce_atoms_only (pol : Bool) (as : List Atom) (c : Option (List Predicate)) :
     coalesce pol (.mk as none none none c wd) =
-      combine ((as.map atomTy).eraseDups.map some) c := by
+      combine ((atomShapes pol as).map some) c := by
   rw [coalesce, recordShapes_none, variantShapes_none, funShapes_none]
-  show combine ((as.map atomTy).eraseDups.map some ++ [] ++ [] ++ []) c = _
+  show combine ((atomShapes pol as).map some ++ [] ++ [] ++ []) c = _
   simp
 
 theorem coalesce_record_only (pol : Bool) (m : List (FieldKey × CompactTy))
@@ -164,12 +164,12 @@ the same one on both sides, so each case reasons about a single slot. -/
 /-- `coalesce` on a position whose only content is atoms and refinements. -/
 theorem coalesce_atoms (pol : Bool) (as : List Atom) (c : Option (List Predicate)) :
     coalesce pol (.mk as none none none c wd) =
-      (match (as.map atomTy).eraseDups with
+      (match atomShapes pol as with
        | [] => .ok none
        | [t] => .ok (some (attachRefinements t c))
        | _ => .error .incompatible) := by
   rw [coalesce_atoms_only]
-  rcases h : (as.map atomTy).eraseDups with _ | ⟨x, xs⟩
+  rcases h : atomShapes pol as with _ | ⟨x, xs⟩
   · simp [combine]
   · rcases xs with _ | ⟨y, ys⟩
     · simp [combine]
@@ -386,6 +386,56 @@ theorem eraseDups_ne_nil {α} [BEq α] [LawfulBEq α] :
     rw [hz] at hmem
     simp at hmem
 
+theorem eq_of_isUIntTy {x : Ty} (h : isUIntTy x = true) : x = .base .uint := by
+  unfold isUIntTy at h
+  split at h
+  · rfl
+  · contradiction
+
+theorem eq_of_isUIntRangeTy {x : Ty} (h : isUIntRangeTy x = true) : ∃ n, x = .uintRange n := by
+  unfold isUIntRangeTy at h
+  split at h
+  · exact ⟨_, rfl⟩
+  · contradiction
+
+/-- `absorbUIntRanges` keeps a subset of its input. -/
+theorem mem_of_mem_absorbUIntRanges {pol : Bool} {L : List Ty} {t : Ty}
+    (h : t ∈ absorbUIntRanges pol L) : t ∈ L := by
+  unfold absorbUIntRanges at h
+  split at h
+  · split at h
+    · exact (List.mem_filter.mp h).1
+    · exact (List.mem_filter.mp h).1
+  · exact h
+
+/-- `absorbUIntRanges` drops one kind of atom only beside the other, so it keeps a non-empty
+list non-empty. -/
+theorem absorbUIntRanges_ne_nil (pol : Bool) {L : List Ty} (h : L ≠ []) :
+    absorbUIntRanges pol L ≠ [] := by
+  unfold absorbUIntRanges
+  split
+  · rename_i hc
+    simp only [Bool.and_eq_true, List.any_eq_true] at hc
+    obtain ⟨⟨u, hu, hu'⟩, ⟨r, hr, hr'⟩⟩ := hc
+    obtain rfl := eq_of_isUIntTy hu'
+    obtain ⟨n, rfl⟩ := eq_of_isUIntRangeTy hr'
+    split
+    · intro he
+      have : Ty.base .uint ∈ L.filter (fun t => !isUIntRangeTy t) :=
+        List.mem_filter.mpr ⟨hu, by simp [isUIntRangeTy]⟩
+      simp [he] at this
+    · intro he
+      have : Ty.uintRange n ∈ L.filter (fun t => !isUIntTy t) :=
+        List.mem_filter.mpr ⟨hr, by simp [isUIntTy]⟩
+      simp [he] at this
+  · exact h
+
+theorem atomShapes_nil (pol : Bool) : atomShapes pol [] = [] := by
+  simp [atomShapes, absorbUIntRanges]
+
+theorem atomShapes_ne_nil (pol : Bool) {as : List Atom} (h : as ≠ []) : atomShapes pol as ≠ [] :=
+  absorbUIntRanges_ne_nil pol (eraseDups_ne_nil (by simpa using h))
+
 /-- **Materializing means exactly one slot carries the position.** The four
 contributions concatenate and `combine` accepts only a singleton, so a position with two populated
 slots has no type — which is what lets every case of the
@@ -410,21 +460,21 @@ theorem coalesce_shape (pol : Bool) {as : List Atom}
   -- One shape survives, so the four contributions' lengths sum to one. The atom
   -- contribution is non-empty exactly when the atom list is.
   have hcount := congrArg List.length hlen
-  have hzero : ((as.map atomTy).eraseDups).length = 0 → as = [] := by
+  have hzero : (atomShapes pol as).length = 0 → as = [] := by
     intro hz
     rcases as with _ | ⟨a, as'⟩
     · rfl
-    · exact absurd (List.eq_nil_of_length_eq_zero hz) (eraseDups_ne_nil (by simp))
-  have hpos : as ≠ [] → 0 < ((as.map atomTy).eraseDups).length := by
+    · exact absurd (List.eq_nil_of_length_eq_zero hz) (atomShapes_ne_nil pol (by simp))
+  have hpos : as ≠ [] → 0 < (atomShapes pol as).length := by
     intro hne
-    rcases hd : ((as.map atomTy).eraseDups) with _ | ⟨x, xs⟩
-    · exact absurd hd (eraseDups_ne_nil (by simpa using hne))
+    rcases hd : atomShapes pol as with _ | ⟨x, xs⟩
+    · exact absurd hd (atomShapes_ne_nil pol hne)
     · simp
   rcases r with _ | mr <;> rcases v with _ | mv <;> rcases f with _ | g <;>
     simp only [Option.isSome_none, Option.isSome_some, Bool.false_eq_true, if_false, if_true,
       List.length_append, List.length_map, List.length_nil, List.length_cons,
       Nat.add_zero, Nat.zero_add] at hcount
-  · exact Or.inl ⟨fun hnil => by rw [hnil] at hcount; simp at hcount, rfl, rfl, rfl⟩
+  · exact Or.inl ⟨fun hnil => by rw [hnil, atomShapes_nil] at hcount; simp at hcount, rfl, rfl, rfl⟩
   · refine Or.inr (Or.inr (Or.inr ⟨?_, rfl, rfl, ⟨g, rfl⟩⟩))
     exact hzero (by omega)
   · refine Or.inr (Or.inr (Or.inl ⟨?_, rfl, ⟨mv, rfl⟩, rfl⟩))
@@ -1046,6 +1096,72 @@ theorem atomTy_leaf (α : Atom) :
     (atomTy α).isRefined = false ∧ subtypeCheck (atomTy α) (atomTy α) = true := by
   cases α <;> simp [atomTy, Ty.isRefined, subtypeCheck]
 
+/-- A singleton `atomShapes` names one of the position's atoms, and every atom there is related to
+it in the polarity's direction: equal, or a range beside `UInt` that `absorbUIntRanges` dropped. -/
+theorem atomShapes_singleton {pol : Bool} {as : List Atom} {t : Ty}
+    (h : atomShapes pol as = [t]) :
+    (∃ α ∈ as, atomTy α = t) ∧ ∀ α ∈ as,
+      (if pol then subtypeCheck (atomTy α) t else subtypeCheck t (atomTy α)) = true := by
+  unfold atomShapes at h
+  have ht : t ∈ (as.map atomTy).eraseDups :=
+    mem_of_mem_absorbUIntRanges (pol := pol) (by rw [h]; simp)
+  refine ⟨List.mem_map.mp (List.mem_eraseDups.mp ht), fun α hα => ?_⟩
+  have hx : atomTy α ∈ (as.map atomTy).eraseDups :=
+    List.mem_eraseDups.mpr (List.mem_map_of_mem hα)
+  obtain ⟨-, hrefl⟩ := atomTy_leaf α
+  generalize (as.map atomTy).eraseDups = L at h hx ht
+  generalize atomTy α = x at hx hrefl
+  unfold absorbUIntRanges at h
+  split at h
+  · rename_i hc
+    simp only [Bool.and_eq_true, List.any_eq_true] at hc
+    obtain ⟨⟨u, hu, hu'⟩, ⟨r, hr, hr'⟩⟩ := hc
+    obtain rfl := eq_of_isUIntTy hu'
+    obtain ⟨n, rfl⟩ := eq_of_isUIntRangeTy hr'
+    split at h
+    · rename_i hpol
+      subst hpol
+      have hkeep : ∀ y ∈ L, isUIntRangeTy y = false → y = t := fun y hy hyr => by
+        have : y ∈ L.filter (fun t => !isUIntRangeTy t) :=
+          List.mem_filter.mpr ⟨hy, by simp [hyr]⟩
+        rw [h] at this
+        simpa using this
+      have htu : t = .base .uint := (hkeep _ hu (by simp [isUIntRangeTy])).symm
+      simp only [↓reduceIte]
+      cases hxr : isUIntRangeTy x
+      · obtain rfl := hkeep x hx hxr
+        exact hrefl
+      · obtain ⟨m, rfl⟩ := eq_of_isUIntRangeTy hxr
+        rw [htu]
+        simp [subtypeCheck]
+    · rename_i hpol
+      have : pol = false := by simpa using hpol
+      subst this
+      have hkeep : ∀ y ∈ L, isUIntTy y = false → y = t := fun y hy hyu => by
+        have : y ∈ L.filter (fun t => !isUIntTy t) :=
+          List.mem_filter.mpr ⟨hy, by simp [hyu]⟩
+        rw [h] at this
+        simpa using this
+      have htr : t = .uintRange n := (hkeep _ hr (by simp [isUIntTy])).symm
+      simp only [Bool.false_eq_true, ↓reduceIte]
+      cases hxu : isUIntTy x
+      · obtain rfl := hkeep x hx hxu
+        exact hrefl
+      · obtain rfl := eq_of_isUIntTy hxu
+        rw [htr]
+        simp [subtypeCheck]
+  · rw [h] at hx
+    simp only [List.mem_singleton] at hx
+    subst hx
+    split <;> exact hrefl
+
+/-- Two atoms related both ways are one atom: the only edge between distinct atoms is a range
+below `UInt`, which has no converse. -/
+theorem atomTy_antisymm (α β : Atom)
+    (h1 : subtypeCheck (atomTy α) (atomTy β) = true)
+    (h2 : subtypeCheck (atomTy β) (atomTy α) = true) : atomTy α = atomTy β := by
+  cases α <;> cases β <;> simp_all [atomTy, subtypeCheck, Ty.peel]
+
 /-- The atoms case of `CoalesceMonotoneAt`: a position whose only content is atoms and
 refinements. Both operands materialize to the same atom, because the merge unions the atom lists and
 `absorbedBy` says the union is the upper operand's, and the refinement slots
@@ -1059,13 +1175,12 @@ theorem coalesce_monotone_atoms (pol : Bool) {as bs : List Atom} {ca cb : Option
     (hb : coalesce pol (.mk bs none none none cb wdb) = .ok (some tb)) :
     (if pol then subtypeCheck ta tb else subtypeCheck tb ta) = true := by
   rw [coalesce_atoms] at ha hb
-  -- Exactly one atom survives dedup on each side, or the position did not
-  -- materialize.
-  rcases hda : (as.map atomTy).eraseDups with _ | ⟨α, αs⟩ <;> rw [hda] at ha
+  -- Exactly one shape survives on each side, or the position did not materialize.
+  rcases hda : atomShapes pol as with _ | ⟨α, αs⟩ <;> rw [hda] at ha
   · exact absurd ha (by simp)
   rcases αs with _ | ⟨_, _⟩
   case cons.cons => exact absurd ha (by simp)
-  rcases hdb : (bs.map atomTy).eraseDups with _ | ⟨β, βs⟩ <;> rw [hdb] at hb
+  rcases hdb : atomShapes pol bs with _ | ⟨β, βs⟩ <;> rw [hdb] at hb
   · exact absurd hb (by simp)
   rcases βs with _ | ⟨_, _⟩
   case cons.cons => exact absurd hb (by simp)
@@ -1074,18 +1189,14 @@ theorem coalesce_monotone_atoms (pol : Bool) {as bs : List Atom} {ca cb : Option
   rw [absorbedBy, merge.eq_def, equiv.eq_def] at hle
   simp only [Bool.and_eq_true] at hle
   obtain ⟨⟨⟨⟨⟨hat, -⟩, -⟩, -⟩, -⟩, hcl⟩ := hle
-  -- The atom lists union, so `absorbedBy` forces `as ⊆ bs`, and a singleton dedup on
-  -- each side then pins one atom on both.
-  have hmemα : α ∈ as.map atomTy := List.mem_eraseDups.mp (by rw [hda]; simp)
-  obtain ⟨a, hain, rfl⟩ := List.mem_map.mp hmemα
+  -- The atom lists union, so `absorbedBy` forces `as ⊆ bs`, and the atom `as` settles to is
+  -- then one of `bs`'s, related to the one `bs` settles to in the polarity's direction.
+  obtain ⟨⟨a, hain, rfl⟩, -⟩ := atomShapes_singleton hda
+  obtain ⟨⟨b, hbin, rfl⟩, hbrel⟩ := atomShapes_singleton hdb
   have hab : a ∈ bs := by
     have := (List.all_eq_true.mp hat) a (by simp [hain])
     simpa using this
-  have hαβ : atomTy a = β := by
-    have := List.mem_eraseDups.mpr (List.mem_map_of_mem (f := atomTy) hab)
-    rw [hdb] at this
-    simpa using this
-  subst hαβ
+  have hrel := hbrel a hab
   -- A position with atoms has a refinement slot (`wellFormed`), so both sides are `some`.
   have hasne : ¬ as.isEmpty = true := by
     intro h
@@ -1101,15 +1212,18 @@ theorem coalesce_monotone_atoms (pol : Bool) {as bs : List Atom} {ca cb : Option
   · exact absurd hwa.2 (by simp [hasne])
   rcases cb with _ | q
   · exact absurd hwb.2 (by simp [hbsne])
-  obtain ⟨hnr, hrefl⟩ := atomTy_leaf a
+  obtain ⟨hnra, -⟩ := atomTy_leaf a
+  obtain ⟨hnrb, -⟩ := atomTy_leaf b
   -- The refinement slots then compare by containment, in the polarity's direction:
   -- a positive merge intersects and a negative one appends.
   cases pol
-  · simp only [mergeRefinements, refinementsEquiv_iff] at hcl
-    simpa using subtypeCheck_attachRefinements hnr hnr hrefl fun x hx =>
+  · simp only [Bool.false_eq_true, ↓reduceIte] at hrel
+    simp only [mergeRefinements, refinementsEquiv_iff] at hcl
+    simpa using subtypeCheck_attachRefinements hnrb hnra hrel fun x hx =>
       hcl.1 x (List.mem_append_left _ hx)
-  · simp only [mergeRefinements, refinementsEquiv_iff] at hcl
-    simpa using subtypeCheck_attachRefinements hnr hnr hrefl fun x hx =>
+  · simp only [↓reduceIte] at hrel
+    simp only [mergeRefinements, refinementsEquiv_iff] at hcl
+    simpa using subtypeCheck_attachRefinements hnra hnrb hrel fun x hx =>
       (List.mem_filter.mp (hcl.2 x hx)).1
 
 /-- The atoms case, as an instance of the gate the sample measures. -/
@@ -1771,6 +1885,22 @@ private def provedCovered : List (Bool × CompactTy × CompactTy) :=
     (some []) none)
   (.mk [] none none
     (some (.data, .mk [.prim .int] none none none (some [.elem]) none, intPosition)) (some []) none)
+
+-- `UInt` beside a range settles by `0..𝑛 <: UInt`: a join is `UInt`, a meet the range, and
+-- the merge bounds both operands at either polarity. Two ranges still collide.
+private def uintPosition : CompactTy := .mk [.prim .uint] none none none (some []) none
+private def rangePosition : CompactTy := .mk [.uintRange 3] none none none (some []) none
+#guard match coalesce true (merge true uintPosition rangePosition) with
+  | .ok (some (.base .uint)) => true
+  | _ => false
+#guard match coalesce false (merge false uintPosition rangePosition) with
+  | .ok (some (.uintRange 3)) => true
+  | _ => false
+#guard match coalesce false (.mk [.uintRange 3, .uintRange 4] none none none (some []) none) with
+  | .error .incompatible => true
+  | _ => false
+#guard MergeIsBoundAt true uintPosition rangePosition
+#guard MergeIsBoundAt false uintPosition rangePosition
 
 -- Neither a duplicate key nor a content-bearing position without a refinement slot is
 -- `wellFormed`, and each breaks soundness. A duplicate is invisible to `equiv`, which

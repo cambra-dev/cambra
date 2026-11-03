@@ -51,46 +51,48 @@ fn int_to_uint_of_a_negative_int_panics() {
     check_scalar("int_to_uint(0 - 1)", Value::UInt(0))
 }
 
-/// TODO: Compare UInt to UIntRange. Should compile and eval to
-/// Bool::true when that is done.
+/// A checked lookup's key is bounded by the range's base, `UInt`, so a key inside the range
+/// answers `some`.
 #[test]
 fn list_lookup_checked_some() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
 xs = [1,2,3]
 xs[int_to_uint(1)] == Option::some(2)
         "#},
-        "Type mismatch for checked lookup key: expected 0..3, found UInt",
+        Value::Bool(true),
     )
 }
 
-/// TODO: Compare UInt to UIntRange. Should compile and eval to
-/// Bool::true when that is done.
+/// A key outside the range types as a `UInt` and answers `none`.
 #[test]
 fn list_lookup_checked_negative() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
 xs = [1,2,3]
 xs[int_to_uint(3)] == Option::none
         "#},
-        "Type mismatch for checked lookup key: expected 0..3, found UInt",
+        Value::Bool(true),
     )
 }
 
-/// TODO: Compare UInt to UIntRange. Should compile and eval to
-/// Bool::true when that is done.
+/// The key's refinement entails the bound `__elem < 3`, so `{UInt | …} <: 0..3` holds.
 #[test]
 fn list_lookup_proven() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
 xs = [1,2,3]
 xs[int_to_uint(1)]! == 2
         "#},
-        "Type mismatch for Apply: expected 0..3, found UInt",
+        Value::Bool(true),
     )
 }
 
-/// TODO: Compare UInt to UIntRange. Should type-error, expecting 0..3 and finding UInt@5, when that is done.
+/// The key's refinement refutes the bound, so the proven lookup is rejected.
+///
+/// TODO: Improve the confusing type error. The type `{UInt | (__int,
+/// __elem) ▷ int_eq_uint}` is asserting that the key is equal to the
+/// Int passed into `int_to_uint`, namely `5`.  But that's not obvious.
 #[test]
 fn list_lookup_rejected() {
     check_compile_error(
@@ -98,6 +100,6 @@ fn list_lookup_rejected() {
 xs = [1,2,3]
 xs[int_to_uint(5)]! == 2
         "#},
-        "Type mismatch for Apply: expected 0..3, found UInt",
+        "Type mismatch for Apply: expected 0..3, found {UInt | (__int, __elem) ▷ int_eq_uint}",
     )
 }

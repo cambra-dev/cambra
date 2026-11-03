@@ -422,6 +422,22 @@ fn coalesce_type_kind(
     }
 }
 
+/// Settle a scalar position where `UInt` meets ranges, by `0..𝑛 <: UInt`: a join is `UInt`,
+/// and a meet is the range. Two ranges stay two atoms, since ranges relate only by equality.
+/// A data domain's atoms are alternatives rather than bounds ([`super::compact::denoted_domains`])
+/// and never reach here.
+fn absorb_uint_ranges(atoms: &mut Vec<Type>, polarity: bool) {
+    let uint = Type::Base(crate::ccl::BaseType::UInt);
+    if !atoms.contains(&uint) || !atoms.iter().any(|a| matches!(a, Type::UIntRange(_))) {
+        return;
+    }
+    if polarity {
+        atoms.retain(|a| !matches!(a, Type::UIntRange(_)));
+    } else {
+        atoms.retain(|a| *a != uint);
+    }
+}
+
 fn coalesce_compact_go(
     ct: &CompactType,
     polarity: bool,
@@ -457,6 +473,7 @@ fn coalesce_compact_go(
             other => atoms.push(other.to_type()),
         }
     }
+    absorb_uint_ranges(&mut atoms, polarity);
     if !seen.is_empty() {
         // **A reference is resolved against the scope, not against its neighbours.** The
         // binders enclosing this position are settled before its parts materialize, so a
@@ -1512,6 +1529,22 @@ mod tests {
             coalesce_compact_go(&ct, false, &[]).unwrap(),
             Type::Param(t)
         );
+    }
+
+    /// `UInt` meeting `0..𝑛` settles by `0..𝑛 <: UInt`: the meet is the range and the join is
+    /// `UInt`. Two ranges still collide.
+    #[test]
+    fn uint_beside_a_range_settles_by_inclusion() {
+        let (uint, range) = (prim(BaseType::UInt), Type::UIntRange(3));
+        let meet = position(false, &[uint.clone(), range.clone()]);
+        assert_eq!(coalesce_compact_go(&meet, false, &[]).unwrap(), range);
+        let join = position(true, &[uint.clone(), range]);
+        assert_eq!(coalesce_compact_go(&join, true, &[]).unwrap(), uint);
+        let ranges = position(false, &[Type::UIntRange(3), Type::UIntRange(4)]);
+        assert!(matches!(
+            coalesce_compact_go(&ranges, false, &[]),
+            Err(CoalesceError::IncompatibleBounds { .. })
+        ));
     }
 
     /// An unbounded parameter has no common type with anything else.

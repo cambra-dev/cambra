@@ -74,8 +74,19 @@ impl MapResult {
         // this observable — the function handles tags this argument never carries, and
         // projecting one of those simply yields nothing — but the same holds for a record
         // with extra fields. [`Extent::includes`] is the runtime statement of that rule.
+        //
+        // An extent carries no refinement, so a `UInt` argument applied at a range is the
+        // erasure of `{UInt | 𝑝} <: 0..𝑛`, which inference admits only where `𝑝` entails the
+        // bound. A `UInt` here is therefore one the program proved inside the range.
+        let erased_refined_index = matches!(
+            (&fn_domain_extent, arguments.extent()),
+            (
+                Extent::UIntRange(_),
+                Extent::Base(crate::ccl::BaseType::UInt)
+            )
+        );
         assert!(
-            fn_domain_extent.includes(&arguments.extent()),
+            erased_refined_index || fn_domain_extent.includes(&arguments.extent()),
             "Cannot apply {function_tiling} to the values of {input_tiling} at {level}"
         );
         // The result takes the place of the argument it was applied to, which is where the

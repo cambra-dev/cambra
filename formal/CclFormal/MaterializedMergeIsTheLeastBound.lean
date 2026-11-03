@@ -1310,21 +1310,20 @@ theorem atomTy_wellFormed (α : Atom) : (atomTy α).WellFormed := by
 
 theorem coalesce_atoms_ok (pol : Bool) {as : List Atom} {c : Option (List Predicate)} {ty : Ty}
     (h : coalesce pol (.mk as none none none c wd) = .ok (some ty)) :
-    ∃ t, (as.map atomTy).eraseDups = [t] ∧ ty = attachRefinements t c ∧
+    ∃ t, atomShapes pol as = [t] ∧ ty = attachRefinements t c ∧
       t.isRefined = false ∧ t.WellFormed := by
   rw [coalesce_atoms] at h
-  rcases he : (as.map atomTy).eraseDups with _ | ⟨t, rest⟩ <;> rw [he] at h
+  rcases he : atomShapes pol as with _ | ⟨t, rest⟩ <;> rw [he] at h
   · cases h
   rcases rest with _ | ⟨_, _⟩
   · cases h
     refine ⟨t, rfl, rfl, ?_⟩
-    obtain ⟨α, -, rfl⟩ := List.mem_map.mp (List.mem_eraseDups.mp
-      (show t ∈ (as.map atomTy).eraseDups by rw [he]; simp))
+    obtain ⟨⟨α, -, rfl⟩, -⟩ := atomShapes_singleton he
     exact ⟨(atomTy_leaf α).1, atomTy_wellFormed α⟩
   · cases h
 
 theorem bounds_atoms (pol above : Bool) {as bs : List Atom} {p q : List Predicate}
-    {u ta tb tm : Ty} (hane : as ≠ []) (hbne : bs ≠ [])
+    {u ta tb tm : Ty} (_hane : as ≠ []) (_hbne : bs ≠ [])
     (hwu : u.WellFormed)
     (ha : coalesce pol (.mk as none none none (some p) wda) = .ok (some ta))
     (hb : coalesce pol (.mk bs none none none (some q) wdb) = .ok (some tb))
@@ -1335,27 +1334,33 @@ theorem bounds_atoms (pol above : Bool) {as bs : List Atom} {p q : List Predicat
   obtain ⟨sb, heb, rfl, hnrb, -⟩ := coalesce_atoms_ok pol hb
   rw [merge_atoms_slot] at hm
   obtain ⟨sm, hem, rfl, hnrm, -⟩ := coalesce_atoms_ok pol hm
-  -- One atom survives the union, so it is the one each operand contributed.
-  have hone : ∀ (xs : List Atom) (s : Ty), xs ≠ [] → (xs.map atomTy).eraseDups = [s] →
-      (∀ x ∈ xs, x ∈ as ++ bs) → s = sm := by
-    rintro (_ | ⟨α, rest⟩) s hne hs hsub
-    · exact absurd rfl hne
-    have h1 : atomTy α ∈ [s] := by
-      rw [← hs]
-      exact List.mem_eraseDups.mpr (by simp)
-    have h2 : atomTy α ∈ [sm] := by
-      rw [← hem]
-      exact List.mem_eraseDups.mpr (List.mem_map_of_mem (hsub α (by simp)))
-    simp only [List.mem_singleton] at h1 h2
-    rw [← h1, h2]
-  have hsa : sa = sm := hone as sa hane hea (fun x hx => List.mem_append_left _ hx)
-  have hsb : sb = sm := hone bs sb hbne heb (fun x hx => List.mem_append_right _ hx)
-  subst hsa
-  subst hsb
+  -- The union settles to an atom of one operand, and that operand settles to the same atom:
+  -- each is related to the other in the polarity's direction, and atoms are antisymmetric.
+  have hpick : ∀ (xs : List Atom) (s : Ty), atomShapes pol xs = [s] →
+      (∀ x ∈ xs, x ∈ as ++ bs) → (∃ γ ∈ xs, atomTy γ = sm) → s = sm := by
+    intro xs s hs hsub ⟨γ, hγ, hγm⟩
+    obtain ⟨⟨α, hα, rfl⟩, hrel⟩ := atomShapes_singleton hs
+    obtain ⟨-, hrelm⟩ := atomShapes_singleton hem
+    have h1 := hrel γ hγ
+    have h2 := hrelm α (hsub α hα)
+    subst hγm
+    cases pol
+    · simp only [Bool.false_eq_true, ↓reduceIte] at h1 h2
+      exact atomTy_antisymm α γ h1 h2
+    · simp only [↓reduceIte] at h1 h2
+      exact atomTy_antisymm α γ h2 h1
+  obtain ⟨⟨γ, hγ, hγm⟩, -⟩ := atomShapes_singleton hem
+  have hsm : sa = sm ∨ sb = sm := by
+    rcases List.mem_append.mp hγ with hγa | hγb
+    · exact .inl (hpick as sa hea (fun x hx => List.mem_append_left _ hx) ⟨γ, hγa, hγm⟩)
+    · exact .inr (hpick bs sb heb (fun x hx => List.mem_append_right _ hx) ⟨γ, hγb, hγm⟩)
   rw [bounds_attach_iff above hnra hwu] at hba
   rw [bounds_attach_iff above hnrb hwu] at hbb
   rw [bounds_attach_iff above hnrm hwu]
-  exact ⟨hba.1, refinementsBound_merge pol above hba.2 hbb.2⟩
+  refine ⟨?_, refinementsBound_merge pol above hba.2 hbb.2⟩
+  rcases hsm with rfl | rfl
+  · exact hba.1
+  · exact hbb.1
 
 /-! ## The function case
 

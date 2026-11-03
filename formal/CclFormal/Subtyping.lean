@@ -258,9 +258,12 @@ requires a refinement layer on at least one side. -/
 inductive Subtyping : Ty → Ty → Prop where
   /-- Leaves match by equality — `(Base(a), Base(b)) if a == b`. -/
   | base (b : BaseTy) : Subtyping (.base b) (.base b)
-  /-- `UIntRange` is **equality-only**: it is a data domain (a loop bound),
-  and range inclusion is deliberately not subsumption. -/
+  /-- Two ranges relate only by equality: a range is a data domain (a loop bound), and range
+  inclusion is not subsumption. -/
   | uintRange (n : Nat) : Subtyping (.uintRange n) (.uintRange n)
+  /-- Every range is below `UInt`: `0..𝑛` is the `UInt`s below `𝑛` —
+  `(Type::UIntRange(_), Type::Base(BaseType::UInt))`. -/
+  | uintRangeUInt (n : Nat) : Subtyping (.uintRange n) (.base .uint)
   | dataSource (s : String) : Subtyping (.dataSource s) (.dataSource s)
   | txn : Subtyping .txn .txn
   /-- Function edge, non-`data`-`data` kinds: the two kinds are equal (so both
@@ -339,6 +342,7 @@ theorem subtyping_peel_inv {x y : Ty} (h : Subtyping x y) :
   cases h with
   | base b => exact ⟨rfl, .base b⟩
   | uintRange n => exact ⟨rfl, .uintRange n⟩
+  | uintRangeUInt n => exact ⟨rfl, .uintRangeUInt n⟩
   | dataSource s => exact ⟨rfl, .dataSource s⟩
   | txn => exact ⟨rfl, .txn⟩
   | fnCompute h1 h2 h3 h4 => exact ⟨rfl, .fnCompute h1 h2 h3 h4⟩
