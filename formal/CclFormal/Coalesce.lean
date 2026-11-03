@@ -42,23 +42,28 @@ def atomTy : Atom → Ty
   | .source s => .dataSource s
   | .txn => .txn
 
-/-- Whether a materialized atom is `UInt`. -/
-def isUIntTy : Ty → Bool
+/-- Whether a materialized atom is `UInt` or a range: the atoms `0..𝑚 <: 0..𝑛 <: UInt` orders. -/
+def inUIntChain : Ty → Bool
   | .base .uint => true
-  | _ => false
-
-/-- Whether a materialized atom is a range. -/
-def isUIntRangeTy : Ty → Bool
   | .uintRange _ => true
   | _ => false
 
-/-- Mirror of `absorb_uint_ranges` (`coalesce.rs`): where `UInt` meets a range, the position
-settles by `0..𝑛 <: UInt`. A join drops the ranges and a meet drops `UInt`; two ranges stay two
-atoms. -/
+/-- The order on the `UInt` chain: `0..𝑚 <: 0..𝑛` for `𝑚 ≤ 𝑛`, and every range below `UInt`. -/
+def uintChainLe : Ty → Ty → Bool
+  | .uintRange a, .uintRange b => decide (a ≤ b)
+  | .uintRange _, .base .uint => true
+  | .base .uint, .base .uint => true
+  | _, _ => false
+
+/-- `u` is below `t` in the polarity's direction: a join keeps the greatest, a meet the least. -/
+def uintChainToward (pol : Bool) (u t : Ty) : Bool :=
+  if pol then uintChainLe u t else uintChainLe t u
+
+/-- Mirror of `absorb_uint_ranges` (`coalesce.rs`): where `UInt` and ranges meet, the position
+settles by `0..𝑚 <: 0..𝑛 <: UInt`. A chain atom survives only when every chain atom beside it is
+toward it, so a join keeps the greatest and a meet the least. -/
 def absorbUIntRanges (pol : Bool) (ts : List Ty) : List Ty :=
-  if ts.any isUIntTy && ts.any isUIntRangeTy then
-    if pol then ts.filter (fun t => !isUIntRangeTy t) else ts.filter (fun t => !isUIntTy t)
-  else ts
+  ts.filter fun t => !inUIntChain t || ts.all fun u => !inUIntChain u || uintChainToward pol u t
 
 /-- The atom contributions a position materializes: one type per distinct atom, then
 `absorbUIntRanges`. -/

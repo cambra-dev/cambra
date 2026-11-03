@@ -2187,7 +2187,7 @@ fn a_written_domain_admits_a_plain_collection(#[case] code: &str, #[case] expect
             sum(a) + sum(b)
         both([1, 2], [3, 4, 5])
     "},
-    "a collection over one domain does not stand in for a collection over another"
+    "Type mismatch for Apply: expected 0..2, found 0..3",
 )]
 #[case::a_sum_in_a_nominal_type(
     indoc! {"

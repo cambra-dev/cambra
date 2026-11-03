@@ -14,6 +14,7 @@ use std::rc::Rc;
 
 mod type_gen;
 
+use cambra::ccl::infer::solver::coalesce::coalesce_position;
 use cambra::ccl::infer::solver::compact::{
     AtomKey, CompactType, CompactTypeKind, KindPin, TupleWidth, compact_type,
 };
@@ -775,13 +776,12 @@ fn differential_coalesce_vs_lean_model() {
         for b in &bounds[1..] {
             acc = CompactType::merge_bounds(pol, acc, b.clone());
         }
-        let graph = CompactGraph {
-            term: acc.clone(),
-            rec_vars: std::collections::BTreeMap::new(),
-            join_violations: Vec::new(),
-        };
-        let (Some(ct), Some(got)) = (cty_json(&acc), coalesce_outcome(&coalesce_compact(&graph)))
-        else {
+        // Materialized at the merge's polarity: a join and a meet settle a chain of `UInt` and
+        // ranges at opposite ends.
+        let (Some(ct), Some(got)) = (
+            cty_json(&acc),
+            coalesce_outcome(&coalesce_position(&acc, pol)),
+        ) else {
             panic!("generator produced a bound outside the wire schema: {acc:?}");
         };
         cases.push(format!(

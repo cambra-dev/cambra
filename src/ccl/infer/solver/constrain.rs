@@ -1354,9 +1354,10 @@ fn constrain_go_impl(
     match (lhs, rhs) {
         // Leaf types match by structural equality.
         (Type::Base(a), Type::Base(b)) if a == b => Ok(()),
-        (Type::UIntRange(a), Type::UIntRange(b)) if a == b => Ok(()),
-        // `0..𝑛` is the `UInt`s below `𝑛`. Two ranges still relate only by equality: a range is
-        // a data domain, and inclusion between two of them is not subsumption.
+        // `0..𝑛` is the `UInt`s below `𝑛`, so a range is below every range that includes it and
+        // below `UInt`. A data domain stays invariant: the function edge relates two data
+        // domains in both directions, and inclusion both ways is equality.
+        (Type::UIntRange(a), Type::UIntRange(b)) if a <= b => Ok(()),
         (Type::UIntRange(_), Type::Base(BaseType::UInt)) => Ok(()),
         (Type::DataSource(a), Type::DataSource(b)) if a == b => Ok(()),
         // a channel's nominal domain is reflexively equal to
@@ -2315,15 +2316,16 @@ fn constrain_go_impl(
                 .filter(|(_, forced)| !lrefs_in_ambient.contains(forced))
                 .map(|(r, _)| r.clone())
                 .collect();
-            // `0..𝑛` is the `UInt`s below `𝑛`, so a refined `UInt` is below it exactly when
-            // its refinements entail the bound. That bound is a demand the bases carry rather
-            // than a refinement layer, so no deficit records it and only the solver decides
-            // it. A `UInt` with no refinement on either side never reaches this arm: no
-            // predicate bounds it, so the base arm's mismatch is already the answer.
-            let range_demand = matches!(
-                (lbase, rbase),
-                (Type::Base(BaseType::UInt), Type::UIntRange(_))
-            );
+            // `0..𝑛` is the `UInt`s below `𝑛`, so a refined `UInt` or wider range is below it
+            // exactly when its refinements entail the bound. That bound is a demand the bases
+            // carry rather than a refinement layer, so no deficit records it and only the
+            // solver decides it. An unrefined pair never reaches this arm: no predicate bounds
+            // it, so the base arm's mismatch is already the answer.
+            let range_demand = match (lbase, rbase) {
+                (Type::Base(BaseType::UInt), Type::UIntRange(_)) => true,
+                (Type::UIntRange(a), Type::UIntRange(b)) => a > b,
+                _ => false,
+            };
             if deficit.is_empty() && !range_demand {
                 // lhs's explicit layers already supply every refinement rhs requires.
                 constrain_go(lbase, rbase, sl, sr, cache, scope)
@@ -3122,15 +3124,16 @@ mod tests {
         )
     }
 
-    /// `0..𝑛 <: UInt` holds structurally; the converse does not, and ranges relate only by
-    /// equality.
+    /// `0..𝑚 <: 0..𝑛` for `𝑚 ≤ 𝑛`, and `0..𝑛 <: UInt`, hold structurally; the converses do not.
     #[test]
-    fn a_range_is_below_uint() {
+    fn a_range_is_below_uint_and_every_range_including_it() {
         let mut cache = ConstrainCache::new();
         let uint = prim(BaseType::UInt);
-        assert!(constrain_subtype(&Type::UIntRange(3), &uint, &mut cache).is_ok());
-        assert!(constrain_subtype(&uint, &Type::UIntRange(3), &mut cache).is_err());
-        assert!(constrain_subtype(&Type::UIntRange(3), &Type::UIntRange(4), &mut cache).is_err());
+        let (narrow, wide) = (Type::UIntRange(3), Type::UIntRange(4));
+        assert!(constrain_subtype(&narrow, &uint, &mut cache).is_ok());
+        assert!(constrain_subtype(&uint, &narrow, &mut cache).is_err());
+        assert!(constrain_subtype(&narrow, &wide, &mut cache).is_ok());
+        assert!(constrain_subtype(&wide, &narrow, &mut cache).is_err());
     }
 
     /// A refined `UInt` is below `0..𝑛` exactly when the solver proves its refinements entail
@@ -3145,6 +3148,25 @@ mod tests {
         assert!(proven(&uint_eq(1), &mut cache).is_ok());
         assert!(proven(&uint_eq(3), &mut cache).is_err());
         assert!(constrain_subtype(&uint_eq(1), &range, &mut cache).is_err());
+    }
+
+    /// A refined range is below a narrower range exactly when the solver proves its
+    /// refinements entail the narrower bound.
+    #[test]
+    fn a_refined_range_is_below_a_narrower_range_it_is_proven_inside() {
+        let range = Type::UIntRange(3);
+        let within = |n: i64| {
+            let Type::Refinement(_, refinements) = uint_eq(n) else {
+                unreachable!("uint_eq builds a refinement")
+            };
+            Type::Refinement(Box::new(Type::UIntRange(9)), refinements)
+        };
+        let mut cache = ConstrainCache::new();
+        let proven = |lhs: &Type, cache: &mut ConstrainCache| {
+            constrain_subtype_in(lhs, &range, cache, &super::super::smt::NoScope)
+        };
+        assert!(proven(&within(1), &mut cache).is_ok());
+        assert!(proven(&within(3), &mut cache).is_err());
     }
 
     #[test]

@@ -386,49 +386,88 @@ theorem eraseDups_ne_nil {α} [BEq α] [LawfulBEq α] :
     rw [hz] at hmem
     simp at hmem
 
-theorem eq_of_isUIntTy {x : Ty} (h : isUIntTy x = true) : x = .base .uint := by
-  unfold isUIntTy at h
-  split at h
-  · rfl
-  · contradiction
+theorem subtypeCheck_of_uintChainLe {x y : Ty} (h : uintChainLe x y = true) :
+    subtypeCheck x y = true := by
+  unfold uintChainLe at h
+  split at h <;> simp_all [subtypeCheck]
 
-theorem eq_of_isUIntRangeTy {x : Ty} (h : isUIntRangeTy x = true) : ∃ n, x = .uintRange n := by
-  unfold isUIntRangeTy at h
-  split at h
-  · exact ⟨_, rfl⟩
-  · contradiction
+theorem uintChainToward_refl (pol : Bool) {x : Ty} (h : inUIntChain x = true) :
+    uintChainToward pol x x = true := by
+  unfold inUIntChain at h
+  split at h <;> cases pol <;> simp_all [uintChainToward, uintChainLe]
+
+theorem uintChainToward_total (pol : Bool) {x y : Ty} (hx : inUIntChain x = true)
+    (hy : inUIntChain y = true) : uintChainToward pol x y = true ∨ uintChainToward pol y x = true := by
+  unfold inUIntChain at hx hy
+  split at hx <;> split at hy <;> cases pol <;> simp_all [uintChainToward, uintChainLe] <;> omega
+
+theorem uintChainToward_trans (pol : Bool) {x y z : Ty} (h1 : uintChainToward pol x y = true)
+    (h2 : uintChainToward pol y z = true) : uintChainToward pol x z = true := by
+  cases pol <;> simp only [uintChainToward, Bool.false_eq_true, ↓reduceIte] at h1 h2 ⊢ <;>
+    unfold uintChainLe at h1 h2 <;> split at h1 <;> split at h2 <;>
+    simp_all [uintChainLe] <;> omega
+
+/-- A list holding a chain atom holds an extreme one: every chain atom there is toward it. -/
+theorem exists_uintChain_extreme (pol : Bool) :
+    ∀ {L : List Ty} {x : Ty}, x ∈ L → inUIntChain x = true →
+      ∃ m ∈ L, inUIntChain m = true ∧ ∀ u ∈ L, inUIntChain u = true → uintChainToward pol u m = true
+  | [], _, hx, _ => absurd hx (by simp)
+  | y :: ys, x, hx, hxc => by
+    by_cases hrest : ∃ z ∈ ys, inUIntChain z = true
+    · obtain ⟨z, hz, hzc⟩ := hrest
+      obtain ⟨m, hm, hmc, hmax⟩ := exists_uintChain_extreme pol hz hzc
+      by_cases hyc : inUIntChain y = true
+      · rcases uintChainToward_total pol hyc hmc with hym | hmy
+        · refine ⟨m, List.mem_cons_of_mem _ hm, hmc, fun u hu huc => ?_⟩
+          rcases List.mem_cons.mp hu with rfl | hu
+          · exact hym
+          · exact hmax u hu huc
+        · refine ⟨y, List.mem_cons_self .., hyc, fun u hu huc => ?_⟩
+          rcases List.mem_cons.mp hu with rfl | hu
+          · exact uintChainToward_refl pol hyc
+          · exact uintChainToward_trans pol (hmax u hu huc) hmy
+      · refine ⟨m, List.mem_cons_of_mem _ hm, hmc, fun u hu huc => ?_⟩
+        rcases List.mem_cons.mp hu with rfl | hu
+        · exact absurd huc hyc
+        · exact hmax u hu huc
+    · have hy : x = y := by
+        rcases List.mem_cons.mp hx with h | h
+        · exact h
+        · exact absurd ⟨x, h, hxc⟩ hrest
+      subst hy
+      refine ⟨x, List.mem_cons_self .., hxc, fun u hu huc => ?_⟩
+      rcases List.mem_cons.mp hu with rfl | hu
+      · exact uintChainToward_refl pol hxc
+      · exact absurd ⟨u, hu, huc⟩ hrest
+
+/-- The extreme chain atom survives `absorbUIntRanges`. -/
+theorem mem_absorbUIntRanges_of_extreme {pol : Bool} {L : List Ty} {m : Ty} (hm : m ∈ L)
+    (hmax : ∀ u ∈ L, inUIntChain u = true → uintChainToward pol u m = true) :
+    m ∈ absorbUIntRanges pol L := by
+  refine List.mem_filter.mpr ⟨hm, ?_⟩
+  simp only [Bool.or_eq_true, Bool.not_eq_eq_eq_not, Bool.not_true, List.all_eq_true]
+  refine Or.inr fun u hu => ?_
+  cases huc : inUIntChain u
+  · simp
+  · simp [hmax u hu huc]
 
 /-- `absorbUIntRanges` keeps a subset of its input. -/
 theorem mem_of_mem_absorbUIntRanges {pol : Bool} {L : List Ty} {t : Ty}
-    (h : t ∈ absorbUIntRanges pol L) : t ∈ L := by
-  unfold absorbUIntRanges at h
-  split at h
-  · split at h
-    · exact (List.mem_filter.mp h).1
-    · exact (List.mem_filter.mp h).1
-  · exact h
+    (h : t ∈ absorbUIntRanges pol L) : t ∈ L :=
+  (List.mem_filter.mp h).1
 
-/-- `absorbUIntRanges` drops one kind of atom only beside the other, so it keeps a non-empty
-list non-empty. -/
+/-- `absorbUIntRanges` keeps every atom off the chain and the chain's extreme, so it keeps a
+non-empty list non-empty. -/
 theorem absorbUIntRanges_ne_nil (pol : Bool) {L : List Ty} (h : L ≠ []) :
     absorbUIntRanges pol L ≠ [] := by
-  unfold absorbUIntRanges
-  split
-  · rename_i hc
-    simp only [Bool.and_eq_true, List.any_eq_true] at hc
-    obtain ⟨⟨u, hu, hu'⟩, ⟨r, hr, hr'⟩⟩ := hc
-    obtain rfl := eq_of_isUIntTy hu'
-    obtain ⟨n, rfl⟩ := eq_of_isUIntRangeTy hr'
-    split
-    · intro he
-      have : Ty.base .uint ∈ L.filter (fun t => !isUIntRangeTy t) :=
-        List.mem_filter.mpr ⟨hu, by simp [isUIntRangeTy]⟩
-      simp [he] at this
-    · intro he
-      have : Ty.uintRange n ∈ L.filter (fun t => !isUIntTy t) :=
-        List.mem_filter.mpr ⟨hr, by simp [isUIntTy]⟩
-      simp [he] at this
-  · exact h
+  obtain ⟨x, hx⟩ := List.exists_mem_of_ne_nil L h
+  intro he
+  cases hxc : inUIntChain x
+  · have : x ∈ absorbUIntRanges pol L := List.mem_filter.mpr ⟨hx, by simp [hxc]⟩
+    simp [he] at this
+  · obtain ⟨m, hm, -, hmax⟩ := exists_uintChain_extreme pol hx hxc
+    have := mem_absorbUIntRanges_of_extreme hm hmax
+    simp [he] at this
 
 theorem atomShapes_nil (pol : Bool) : atomShapes pol [] = [] := by
   simp [atomShapes, absorbUIntRanges]
@@ -1097,7 +1136,8 @@ theorem atomTy_leaf (α : Atom) :
   cases α <;> simp [atomTy, Ty.isRefined, subtypeCheck]
 
 /-- A singleton `atomShapes` names one of the position's atoms, and every atom there is related to
-it in the polarity's direction: equal, or a range beside `UInt` that `absorbUIntRanges` dropped. -/
+it in the polarity's direction: equal, or a chain atom that `absorbUIntRanges` dropped beside the
+chain's extreme. -/
 theorem atomShapes_singleton {pol : Bool} {as : List Atom} {t : Ty}
     (h : atomShapes pol as = [t]) :
     (∃ α ∈ as, atomTy α = t) ∧ ∀ α ∈ as,
@@ -1111,56 +1151,24 @@ theorem atomShapes_singleton {pol : Bool} {as : List Atom} {t : Ty}
   obtain ⟨-, hrefl⟩ := atomTy_leaf α
   generalize (as.map atomTy).eraseDups = L at h hx ht
   generalize atomTy α = x at hx hrefl
-  unfold absorbUIntRanges at h
-  split at h
-  · rename_i hc
-    simp only [Bool.and_eq_true, List.any_eq_true] at hc
-    obtain ⟨⟨u, hu, hu'⟩, ⟨r, hr, hr'⟩⟩ := hc
-    obtain rfl := eq_of_isUIntTy hu'
-    obtain ⟨n, rfl⟩ := eq_of_isUIntRangeTy hr'
-    split at h
-    · rename_i hpol
-      subst hpol
-      have hkeep : ∀ y ∈ L, isUIntRangeTy y = false → y = t := fun y hy hyr => by
-        have : y ∈ L.filter (fun t => !isUIntRangeTy t) :=
-          List.mem_filter.mpr ⟨hy, by simp [hyr]⟩
-        rw [h] at this
-        simpa using this
-      have htu : t = .base .uint := (hkeep _ hu (by simp [isUIntRangeTy])).symm
-      simp only [↓reduceIte]
-      cases hxr : isUIntRangeTy x
-      · obtain rfl := hkeep x hx hxr
-        exact hrefl
-      · obtain ⟨m, rfl⟩ := eq_of_isUIntRangeTy hxr
-        rw [htu]
-        simp [subtypeCheck]
-    · rename_i hpol
-      have : pol = false := by simpa using hpol
-      subst this
-      have hkeep : ∀ y ∈ L, isUIntTy y = false → y = t := fun y hy hyu => by
-        have : y ∈ L.filter (fun t => !isUIntTy t) :=
-          List.mem_filter.mpr ⟨hy, by simp [hyu]⟩
-        rw [h] at this
-        simpa using this
-      have htr : t = .uintRange n := (hkeep _ hr (by simp [isUIntTy])).symm
-      simp only [Bool.false_eq_true, ↓reduceIte]
-      cases hxu : isUIntTy x
-      · obtain rfl := hkeep x hx hxu
-        exact hrefl
-      · obtain rfl := eq_of_isUIntTy hxu
-        rw [htr]
-        simp [subtypeCheck]
-  · rw [h] at hx
-    simp only [List.mem_singleton] at hx
-    subst hx
+  have hkept : ∀ y ∈ absorbUIntRanges pol L, y = t := fun y hy => by
+    rw [h] at hy
+    simpa using hy
+  cases hxc : inUIntChain x
+  · obtain rfl := hkept x (List.mem_filter.mpr ⟨hx, by simp [hxc]⟩)
     split <;> exact hrefl
+  · obtain ⟨m, hm, -, hmax⟩ := exists_uintChain_extreme pol hx hxc
+    obtain rfl := hkept m (mem_absorbUIntRanges_of_extreme hm hmax)
+    have hrel := hmax x hx hxc
+    cases pol <;> simp only [uintChainToward, Bool.false_eq_true, ↓reduceIte] at hrel ⊢ <;>
+      exact subtypeCheck_of_uintChainLe hrel
 
-/-- Two atoms related both ways are one atom: the only edge between distinct atoms is a range
-below `UInt`, which has no converse. -/
+/-- Two atoms related both ways are one atom: the only edges between distinct atoms are a range
+below a wider range and a range below `UInt`, and neither has a converse. -/
 theorem atomTy_antisymm (α β : Atom)
     (h1 : subtypeCheck (atomTy α) (atomTy β) = true)
     (h2 : subtypeCheck (atomTy β) (atomTy α) = true) : atomTy α = atomTy β := by
-  cases α <;> cases β <;> simp_all [atomTy, subtypeCheck, Ty.peel]
+  cases α <;> cases β <;> simp_all [atomTy, subtypeCheck, Ty.peel] <;> omega
 
 /-- The atoms case of `CoalesceMonotoneAt`: a position whose only content is atoms and
 refinements. Both operands materialize to the same atom, because the merge unions the atom lists and
@@ -1886,8 +1894,8 @@ private def provedCovered : List (Bool × CompactTy × CompactTy) :=
   (.mk [] none none
     (some (.data, .mk [.prim .int] none none none (some [.elem]) none, intPosition)) (some []) none)
 
--- `UInt` beside a range settles by `0..𝑛 <: UInt`: a join is `UInt`, a meet the range, and
--- the merge bounds both operands at either polarity. Two ranges still collide.
+-- `UInt` and ranges settle by `0..𝑚 <: 0..𝑛 <: UInt`: a join keeps the greatest, a meet the
+-- least, and the merge bounds both operands at either polarity.
 private def uintPosition : CompactTy := .mk [.prim .uint] none none none (some []) none
 private def rangePosition : CompactTy := .mk [.uintRange 3] none none none (some []) none
 #guard match coalesce true (merge true uintPosition rangePosition) with
@@ -1896,11 +1904,21 @@ private def rangePosition : CompactTy := .mk [.uintRange 3] none none none (some
 #guard match coalesce false (merge false uintPosition rangePosition) with
   | .ok (some (.uintRange 3)) => true
   | _ => false
-#guard match coalesce false (.mk [.uintRange 3, .uintRange 4] none none none (some []) none) with
-  | .error .incompatible => true
+private def widePosition : CompactTy := .mk [.uintRange 4] none none none (some []) none
+#guard match coalesce true (merge true widePosition rangePosition) with
+  | .ok (some (.uintRange 4)) => true
+  | _ => false
+#guard match coalesce false (merge false widePosition rangePosition) with
+  | .ok (some (.uintRange 3)) => true
+  | _ => false
+#guard match coalesce false (.mk [.uintRange 4, .prim .uint, .uintRange 3] none none none (some [])
+    none) with
+  | .ok (some (.uintRange 3)) => true
   | _ => false
 #guard MergeIsBoundAt true uintPosition rangePosition
 #guard MergeIsBoundAt false uintPosition rangePosition
+#guard MergeIsBoundAt true widePosition rangePosition
+#guard MergeIsBoundAt false widePosition rangePosition
 
 -- Neither a duplicate key nor a content-bearing position without a refinement slot is
 -- `wellFormed`, and each breaks soundness. A duplicate is invisible to `equiv`, which

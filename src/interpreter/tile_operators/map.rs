@@ -75,14 +75,15 @@ impl MapResult {
         // projecting one of those simply yields nothing — but the same holds for a record
         // with extra fields. [`Extent::includes`] is the runtime statement of that rule.
         //
-        // An extent carries no refinement, so a `UInt` argument applied at a range is the
-        // erasure of `{UInt | 𝑝} <: 0..𝑛`, which inference admits only where `𝑝` entails the
-        // bound. A `UInt` here is therefore one the program proved inside the range.
+        // An extent carries no refinement, so a `UInt` or range argument applied at a range it
+        // does not fit in is the erasure of `{UInt | 𝑝} <: 0..𝑛` or `{0..𝑚 | 𝑝} <: 0..𝑛`, which
+        // inference admits only where `𝑝` entails the bound. Such an argument is therefore one
+        // the program proved inside the range.
         let erased_refined_index = matches!(
             (&fn_domain_extent, arguments.extent()),
             (
                 Extent::UIntRange(_),
-                Extent::Base(crate::ccl::BaseType::UInt)
+                Extent::Base(crate::ccl::BaseType::UInt) | Extent::UIntRange(_)
             )
         );
         assert!(

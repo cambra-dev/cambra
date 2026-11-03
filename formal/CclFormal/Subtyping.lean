@@ -258,9 +258,9 @@ requires a refinement layer on at least one side. -/
 inductive Subtyping : Ty → Ty → Prop where
   /-- Leaves match by equality — `(Base(a), Base(b)) if a == b`. -/
   | base (b : BaseTy) : Subtyping (.base b) (.base b)
-  /-- Two ranges relate only by equality: a range is a data domain (a loop bound), and range
-  inclusion is not subsumption. -/
-  | uintRange (n : Nat) : Subtyping (.uintRange n) (.uintRange n)
+  /-- A range is below every range that includes it: `0..𝑚` is the `UInt`s below `𝑚` —
+  `(Type::UIntRange(a), Type::UIntRange(b)) if a <= b`. -/
+  | uintRange {m n : Nat} (h : m ≤ n) : Subtyping (.uintRange m) (.uintRange n)
   /-- Every range is below `UInt`: `0..𝑛` is the `UInt`s below `𝑛` —
   `(Type::UIntRange(_), Type::Base(BaseType::UInt))`. -/
   | uintRangeUInt (n : Nat) : Subtyping (.uintRange n) (.base .uint)
@@ -341,7 +341,7 @@ theorem subtyping_peel_inv {x y : Ty} (h : Subtyping x y) :
     deficit x.peel.2 y.peel.2 = [] ∧ Subtyping x.peel.1 y.peel.1 := by
   cases h with
   | base b => exact ⟨rfl, .base b⟩
-  | uintRange n => exact ⟨rfl, .uintRange n⟩
+  | uintRange h => exact ⟨rfl, .uintRange h⟩
   | uintRangeUInt n => exact ⟨rfl, .uintRangeUInt n⟩
   | dataSource s => exact ⟨rfl, .dataSource s⟩
   | txn => exact ⟨rfl, .txn⟩

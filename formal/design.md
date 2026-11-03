@@ -87,11 +87,13 @@ closed tuples of equal width, `tupleOpen` a closed tuple below an open one listi
 positions, and `openTuple` two open tuples the same way. No rule puts an open tuple below a closed
 one.
 
-Two ranges relate only by equality (`uintRange`): a range is a data domain, and inclusion between
-two ranges is not subsumption. Every range is below `UInt` (`uintRangeUInt`), mirroring
-`constrain_go`'s `(UIntRange(_), Base(UInt))` arm. A refined `UInt` below a range is decided by the
-solver in the Rust (`smt_sub_at`), and the model, which has no solver, rejects it as a refinement
-deficit.
+A range is below every range that includes it (`uintRange`) and below `UInt` (`uintRangeUInt`),
+mirroring `constrain_go`'s `(UIntRange(a), UIntRange(b)) if a <= b` and `(UIntRange(_), Base(UInt))`
+arms. A data domain stays invariant because the function edge relates two data domains in both
+directions. A refined `UInt` or wider range below a range is decided by the solver in the Rust
+(`smt_sub_at`), and the model, which has no solver, rejects it as a refinement deficit.
+`absorbUIntRanges` mirrors coalesce's `absorb_uint_ranges`: where `UInt` and ranges meet at a
+position, a join keeps the greatest and a meet the least.
 
 The relation differs from the Rust implementation in three recorded ways: it has no trivial-equality
 shortcut, compares closed function codomains without binder correspondence, and has no

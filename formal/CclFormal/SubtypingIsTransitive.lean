@@ -193,10 +193,10 @@ theorem subtyping_trans_aux : (n : Nat) → TransitivityIH n
               rcases hg with hg | hg
               · exact absurd rfl hg
               · exact absurd hzb hg
-      | uintRange m =>
+      | uintRange h12 =>
           cases h2 with
-          | uintRange _ => exact .uintRange m
-          | uintRangeUInt _ => exact .uintRangeUInt m
+          | uintRange h23 => exact .uintRange (Nat.le_trans h12 h23)
+          | uintRangeUInt _ => exact .uintRangeUInt _
           | refined hpl hpr hg _ _ =>
               rw [hpr] at hzb
               simp only [Ty.peel, Prod.mk.injEq] at hpl hzb

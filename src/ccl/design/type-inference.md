@@ -455,7 +455,7 @@ original bound-graph variable identities as output type variables.
 | --- | --- |
 | No concrete shape | A fresh `Type::Infer` placeholder |
 | One compatible shape | The corresponding concrete type, with materialized children |
-| `UInt` beside one or more ranges `0..𝑛` | `UInt` at a positive position and the range at a negative one, since `0..𝑛 <: UInt`; two ranges remain distinct shapes |
+| `UInt` and ranges `0..𝑛` | The greatest at a positive position and the least at a negative one, since `0..𝑚 <: 0..𝑛 <: UInt` for `𝑚 ≤ 𝑛` |
 | Distinct incompatible shapes, such as `Int` and `String` | `IncompatibleBounds` |
 | A tagged variant shape | `Type::Variant`, retaining its tags rather than treating them as an untagged collision |
 
@@ -1665,11 +1665,12 @@ integer types encodes as SMT `Int`, and unsigned sorts add range constraints. A 
 does not provide string-literal or concatenation encoding. Other function applications, nonlinear
 multiplication, floor division, and exponentiation are outside this fragment.
 
-A refined `UInt` against a `0..𝑛` base asks `smt_sub_at` instead, which declares the subject at
-the producer's base and adds its membership in the consumer's base, `0 ≤ __elem < 𝑛`, to the goal.
-`{UInt | (1, __elem) ▷ int_eq_uint} <: 0..3` holds and the same type at `3` does not. When the
-entailment holds the edge holds: the two bases are leaves, and `0..𝑛 <: UInt` is a structural rule
-of `constrain_go` for every `𝑛`. Two ranges relate only by equality.
+A refined `UInt`, or a refined range `0..𝑚` with `𝑚 > 𝑛`, against a `0..𝑛` base asks
+`smt_sub_at` instead, which declares the subject at the producer's base and adds its membership in
+the consumer's base, `0 ≤ __elem < 𝑛`, to the goal. `{UInt | (1, __elem) ▷ int_eq_uint} <: 0..3`
+holds and the same type at `3` does not. When the entailment holds the edge holds: the two bases
+are leaves, and `0..𝑚 <: 0..𝑛` for `𝑚 ≤ 𝑛` and `0..𝑛 <: UInt` are structural rules of
+`constrain_go`.
 
 An unsupported predicate produces `SmtError::Encoding`. The subtype deficit rule treats that
 outcome as a mismatch: failure to encode is not evidence of entailment. Other SMT errors reach
@@ -2832,6 +2833,11 @@ domain. Treating `[0,10] ⤇ 𝑉` as `[0,5] ⤇ 𝑉` would enumerate six indic
 collection. Record width subtyping does not have this effect: a record consumer reads only the
 fields named by its contract. Collection transformations also reproduce their input domain in
 their output, so the domain cannot be treated solely as a contravariant input parameter.
+
+Ranges are ordered by inclusion at every other position: `0..𝑚 <: 0..𝑛` for `𝑚 ≤ 𝑛`, the case
+that lets a key proven inside a narrower range index a collection over it. The function edge
+relates two concrete data domains in both directions, and inclusion both ways is equality, so the
+order leaves data domains invariant.
 
 The same requirement applies at joins. Subtyping and joining are one order, so a contravariant
 data domain would also change what a join computes. Under contravariance the join of the arms of

@@ -356,8 +356,9 @@ pub fn coalesce_compact(graph: &CompactGraph) -> Result<Type, CoalesceError> {
 /// [`coalesce_compact`] of one position at `polarity`, outside any binder.
 ///
 /// For a caller that rewrites a [`CompactGraph`] position by position and needs to
-/// know what one materializes to (`super::display`).
-pub(super) fn coalesce_position(ct: &CompactType, polarity: bool) -> Result<Type, CoalesceError> {
+/// know what one materializes to (`super::display`), and for the differential oracle, which
+/// materializes a merged bound at the polarity it merged at.
+pub fn coalesce_position(ct: &CompactType, polarity: bool) -> Result<Type, CoalesceError> {
     coalesce_compact_go(ct, polarity, &[])
 }
 
@@ -422,20 +423,22 @@ fn coalesce_type_kind(
     }
 }
 
-/// Settle a scalar position where `UInt` meets ranges, by `0..𝑛 <: UInt`: a join is `UInt`,
-/// and a meet is the range. Two ranges stay two atoms, since ranges relate only by equality.
+/// Settle a scalar position where `UInt` and ranges meet, by `0..𝑚 <: 0..𝑛 <: UInt` for
+/// `𝑚 ≤ 𝑛`: the atoms form a chain, so a join keeps its greatest member and a meet its least.
 /// A data domain's atoms are alternatives rather than bounds ([`super::compact::denoted_domains`])
 /// and never reach here.
 fn absorb_uint_ranges(atoms: &mut Vec<Type>, polarity: bool) {
-    let uint = Type::Base(crate::ccl::BaseType::UInt);
-    if !atoms.contains(&uint) || !atoms.iter().any(|a| matches!(a, Type::UIntRange(_))) {
+    // A range ranks by its bound, and `UInt` above every range.
+    let rank = |a: &Type| match a {
+        Type::UIntRange(n) => Some(u128::from(*n)),
+        Type::Base(crate::ccl::BaseType::UInt) => Some(u128::MAX),
+        _ => None,
+    };
+    let chain = atoms.iter().filter_map(rank);
+    let Some(keep) = (if polarity { chain.max() } else { chain.min() }) else {
         return;
-    }
-    if polarity {
-        atoms.retain(|a| !matches!(a, Type::UIntRange(_)));
-    } else {
-        atoms.retain(|a| *a != uint);
-    }
+    };
+    atoms.retain(|a| rank(a).is_none_or(|r| r == keep));
 }
 
 fn coalesce_compact_go(
@@ -1531,20 +1534,24 @@ mod tests {
         );
     }
 
-    /// `UInt` meeting `0..𝑛` settles by `0..𝑛 <: UInt`: the meet is the range and the join is
-    /// `UInt`. Two ranges still collide.
+    /// `UInt` and ranges meeting settle by `0..𝑚 <: 0..𝑛 <: UInt` for `𝑚 ≤ 𝑛`: the meet is the
+    /// narrowest range and the join the widest member.
     #[test]
-    fn uint_beside_a_range_settles_by_inclusion() {
-        let (uint, range) = (prim(BaseType::UInt), Type::UIntRange(3));
-        let meet = position(false, &[uint.clone(), range.clone()]);
-        assert_eq!(coalesce_compact_go(&meet, false, &[]).unwrap(), range);
-        let join = position(true, &[uint.clone(), range]);
-        assert_eq!(coalesce_compact_go(&join, true, &[]).unwrap(), uint);
-        let ranges = position(false, &[Type::UIntRange(3), Type::UIntRange(4)]);
-        assert!(matches!(
-            coalesce_compact_go(&ranges, false, &[]),
-            Err(CoalesceError::IncompatibleBounds { .. })
-        ));
+    fn uint_and_ranges_settle_by_inclusion() {
+        let uint = prim(BaseType::UInt);
+        let (narrow, wide) = (Type::UIntRange(3), Type::UIntRange(4));
+        let settle = |polarity: bool, atoms: &[Type]| {
+            coalesce_compact_go(&position(polarity, atoms), polarity, &[]).unwrap()
+        };
+        assert_eq!(settle(false, &[uint.clone(), narrow.clone()]), narrow);
+        assert_eq!(settle(true, &[uint.clone(), narrow.clone()]), uint);
+        assert_eq!(settle(false, &[wide.clone(), narrow.clone()]), narrow);
+        assert_eq!(settle(true, &[narrow.clone(), wide.clone()]), wide);
+        assert_eq!(
+            settle(false, &[wide.clone(), uint.clone(), narrow.clone()]),
+            narrow
+        );
+        assert_eq!(settle(true, &[wide, uint.clone(), narrow]), uint);
     }
 
     /// An unbounded parameter has no common type with anything else.
