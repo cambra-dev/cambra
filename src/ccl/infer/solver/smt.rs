@@ -12,7 +12,8 @@
 //! addresses is what an SMT constant is minted for.
 //!
 //! The fragment is over **surface-syntax** predicate shapes: a variable, a field
-//! read, a literal, a unary or a binary operator ([`Encode::expr`]). `lambda_elim`
+//! read, a literal, a unary or a binary operator, and the `Int`/`UInt` equality
+//! `(𝑎, 𝑏) ▷ int_eq_uint` ([`Encode::expr`]). `lambda_elim`
 //! rewrites every predicate point-free — `__elem == 1` becomes
 //! `__elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)` — so no predicate at or after that pass
 //! is encodable, and every check from there on decides its deficits structurally.
@@ -24,7 +25,7 @@
 //! violating an rhs one. Every other outcome is an [`SmtError`] naming what
 //! happened — a query outside the fragment (a base that is neither a scalar nor a
 //! product, floor division, a product of two unknowns, a predicate mentioning an
-//! application that is not a projection), a solver that will not start or breaks
+//! application that is neither a projection nor `int_eq_uint`), a solver that will not start or breaks
 //! mid-query, an `unknown`. An `Err` is not a mismatch: nothing decided the
 //! entailment.
 
@@ -35,8 +36,8 @@ use easy_smt::{Context, ContextBuilder, Response, SExpr};
 
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
-    ArithmeticKind, BaseType, BinOpKind, CompareKind, Lit, LogicKind, Name, ProjKey, Refinement,
-    Type, TypedExpr, TypedExprNode, UnaryOpKind,
+    ArithmeticKind, BaseType, BinOpKind, Builtin, CompareKind, Lit, LogicKind, Name, ProjKey,
+    Refinement, Type, TypedExpr, TypedExprNode, UnaryOpKind,
 };
 
 /// The solver subprocess `easy_smt`'s z3 defaults spawn. Named by every
@@ -718,6 +719,20 @@ impl<'a> Encode<'a> {
             } else {
                 self.ctx.false_()
             }),
+            // Both operands are SMT `Int`s, so the relation between an `Int` and a `UInt`
+            // is the solver's `=`.
+            TypedExprNode::Apply { function, argument }
+                if matches!(function.node, TypedExprNode::Builtin(Builtin::IntEqUint)) =>
+            {
+                let TypedExprNode::Tuple(operands) = &argument.node else {
+                    return Err(unencodable(e));
+                };
+                let [int, uint] = operands.as_slice() else {
+                    return Err(unencodable(e));
+                };
+                let (int, uint) = (self.expr(int)?, self.expr(uint)?);
+                Ok(self.ctx.eq(int, uint))
+            }
             // A name, or a field read through one: both address a leaf of the value
             // the root denotes, and the path is what names that leaf. An `Apply`
             // that is not a projection chain addresses no leaf and falls through.

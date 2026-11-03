@@ -299,6 +299,27 @@ pub(super) fn lower_call(
             let op = ctx.tag_machinery(Expr::builtin(Builtin::Box), func.span, "lower.box");
             Ok(Expr::apply(inner, op))
         }
+        // `int_to_uint(x)` — the `UInt` equal to `x` ([`Builtin::IntToUint`]). Its type is
+        // monomorphic, so the operator node is stamped here rather than given a scheme.
+        Some(b @ SurfaceBuiltin::IntToUint) => {
+            if !b.arity().accepts(args.len()) {
+                return Err(LoweringError::unsupported(
+                    func.span,
+                    format!("`int_to_uint` takes {}", b.arity()),
+                ));
+            }
+            let inner = lower_expr(&args[0], ctx)?;
+            let op = ctx.tag_machinery(
+                Expr::builtin(Builtin::IntToUint),
+                func.span,
+                "lower.int_to_uint",
+            );
+            let stamp = crate::ccl::ty::int_to_uint_type(|predicate| {
+                ctx.tag_predicate(predicate, func.span, "lower.int_to_uint")
+            });
+            let op = op.with_ty(stamp);
+            Ok(Expr::apply(inner, op))
+        }
         // `empty_map()` — the collection with no entries ([`Builtin::EmptyMap`], which
         // carries why it is a sum rather than something `box` lifts).
         //

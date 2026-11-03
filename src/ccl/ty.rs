@@ -4338,6 +4338,33 @@ pub fn unbox_type(sum_ty: &Type) -> Option<Type> {
     Some(Type::pi(boxed, sum_ty.clone(), body))
 }
 
+/// The type every use of [`crate::ccl::Builtin::IntToUint`] stamps:
+/// `(𝑥 : Int) ⇒ {UInt | (𝑥, __elem) ▷ int_eq_uint}`, closed over its binder.
+///
+/// The predicate's nodes are minted here and live in a type slot, which no fold over the term
+/// reaches, so `record` receives the predicate to record them.
+pub fn int_to_uint_type(record: impl FnOnce(&TypedExpr)) -> Type {
+    let int = Type::Base(BaseType::Int);
+    let uint = Type::Base(BaseType::UInt);
+    let x = crate::ccl::Name::fresh("__int");
+    let pair = TypedExpr::tuple(vec![
+        TypedExpr::var(x.clone()).with_ty(int.clone()),
+        TypedExpr::var(crate::ccl::Name::elem()).with_ty(uint.clone()),
+    ])
+    .with_ty(Type::Tuple(vec![int.clone(), uint.clone()]));
+    let relation = TypedExpr::builtin(crate::ccl::Builtin::IntEqUint).with_ty(Type::fun(
+        Type::Tuple(vec![int.clone(), uint.clone()]),
+        Type::Base(BaseType::Bool),
+    ));
+    let predicate = TypedExpr::apply(pair, relation).with_ty(Type::Base(BaseType::Bool));
+    record(&predicate);
+    Type::pi(
+        x,
+        int,
+        Type::refined_one(uint, Refinement::born(Rc::new(predicate))),
+    )
+}
+
 impl PartialEq for WitnessProjection {
     /// Equal positions of terms equal as [`Refinement`] predicates are: pointer-equal, or
     /// equal by normal form with their type slots skipped.

@@ -17,6 +17,7 @@ use super::{
     BaseType, BinOpKind as InterpreterBinOp, ColumnValue, ColumnView, CompareKind, Extent,
     LogicKind, UnaryOpKind, Value, apply_binop_views, apply_unaryop_views, binop::compared_fields,
     binop_output_extent, binop_result_column, operator_conversion::expr_to_value, tuple_field,
+    unaryop_result_column,
 };
 
 /// The index of an instruction, which is also the slot it writes.
@@ -147,8 +148,7 @@ impl<'a> Scratch<'a> {
             return column;
         }
         match instr {
-            // `neg` and `not` keep their operand's type.
-            Instr::Un(_, a) => self.view(program, *a as usize).empty_like(),
+            Instr::Un(op, a) => unaryop_result_column(*op, &self.view(program, *a as usize)),
             Instr::Bin(op, a, _) => binop_result_column(*op, &self.view(program, *a as usize)),
             Instr::Input { .. } | Instr::Const(_) | Instr::Record(_) => {
                 unreachable!("only an operation writes a slot")
@@ -507,12 +507,12 @@ impl Parser {
                 let (slot, extent) = self.operation((*op).into(), a, b)?;
                 Some(Val::Slot(slot, extent))
             }
-            TypedExprNode::Builtin(b @ (Builtin::Neg | Builtin::NotFn)) => {
+            TypedExprNode::Builtin(b @ (Builtin::Neg | Builtin::NotFn | Builtin::IntToUint)) => {
                 let (a, operand) = self.column(&cur)?;
-                let op = if *b == Builtin::Neg {
-                    UnaryOpKind::Neg
-                } else {
-                    UnaryOpKind::Not
+                let op = match b {
+                    Builtin::Neg => UnaryOpKind::Neg,
+                    Builtin::NotFn => UnaryOpKind::Not,
+                    _ => UnaryOpKind::IntToUint,
                 };
                 let extent = op.output_extent(&operand);
                 Some(Val::Slot(self.emit(Instr::Un(op, a)), extent))

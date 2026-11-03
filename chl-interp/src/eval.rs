@@ -3161,6 +3161,7 @@ impl Interp {
             Some(
                 SurfaceBuiltin::Set
                 | SurfaceBuiltin::EmptyMap
+                | SurfaceBuiltin::IntToUint
                 | SurfaceBuiltin::Begin
                 | SurfaceBuiltin::HttpServe
                 | SurfaceBuiltin::TestSink

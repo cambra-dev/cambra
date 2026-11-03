@@ -4305,6 +4305,22 @@ for e in expiries:
   and name of the binding that holds it, as a mutable variable's is, and a reload that keeps the
   binding keeps its held rows. Durable state is **[Tentative]** ([8.8 `@LoadFrom`](#88-loadfrom)).
 
+### 7.6 `int_to_uint`
+
+```
+int_to_uint(x)
+```
+
+The `UInt` equal to the `Int` `x`. Its type is `(x: Int) => {UInt where int_eq_uint(x, _)}`, where
+`int_eq_uint` holds of an `Int` and a `UInt` that are the same integer. A refinement checked against
+the result can use that equality, so `int_to_uint(1)` checks against `{UInt where _ == z}` for
+`z = int_to_uint(1)` and `int_to_uint(2)` does not. CHL has no `UInt` literal, so a `UInt` constant
+is written as `int_to_uint` of an `Int` literal.
+
+`int_eq_uint` appears only in this type; a program cannot write it in a refinement.
+
+A negative `x` has no `UInt` equal to it. Applying `int_to_uint` to one is a runtime error.
+
 ## 8. Mutability, transactions, and feeds
 
 CHL programs reassign variables, accumulate in loops, run transactions,

@@ -841,6 +841,26 @@ pub enum Builtin {
     /// scheme: its type `Union ⇒ Bool` is stamped on the node and the post-phase
     /// CHECK-mode `typecheck` trusts it (like [`Self::VariantProject`]).
     VariantIs(FieldKey),
+
+    /// `int_to_uint : (𝑥 : Int) ⇒ {UInt | (𝑥, __elem) ▷ int_eq_uint}` — the `UInt` equal to an
+    /// `Int`. The result's refinement relates it to the argument, so the solver knows
+    /// `int_to_uint(1)` is the `UInt` `1`.
+    ///
+    /// A negative argument has no `UInt` equal to it, so the codomain is empty there. The
+    /// runtime operator panics on one rather than producing a value its type does not admit,
+    /// and the refinement is sound only because of that panic: the solver assumes
+    /// `𝑥 == __elem ∧ __elem >= 0` of every result.
+    ///
+    /// Monomorphic, so it carries no [`crate::ccl::infer::OperatorSchemes`] scheme: lowering
+    /// stamps [`crate::ccl::ty::int_to_uint_type`] on the node.
+    IntToUint,
+    /// `int_eq_uint : (Int, UInt) ⇒ Bool` — whether an `Int` and a `UInt` are the same
+    /// integer. The refinement encoding represents both as SMT `Int`, where this is `=`;
+    /// CCL's `==` cannot state it, because `Equatable` relates two operands of one type.
+    ///
+    /// **Never executed.** It appears only in [`Self::IntToUint`]'s codomain refinement,
+    /// which nothing compiles into a filter, and CHL has no spelling for it.
+    IntEqUint,
 }
 
 impl Builtin {
@@ -895,6 +915,8 @@ impl Builtin {
             Self::LookupChecked => "lookup?",
             Self::Insert => "insert",
             Self::VariantIs(_) => "variant_is",
+            Self::IntToUint => "int_to_uint",
+            Self::IntEqUint => "int_eq_uint",
         }
     }
 

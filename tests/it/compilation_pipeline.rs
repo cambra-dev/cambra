@@ -27,6 +27,7 @@ mod feeds_cases;
 mod generators_udf_poly;
 mod joins_aggregates_groupby;
 mod key_collections;
+mod lookups;
 mod misc;
 mod module_checks;
 mod module_nominal_types;

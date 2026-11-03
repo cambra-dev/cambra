@@ -1657,10 +1657,11 @@ assumptions. `unknown`, process failures, and solver errors return `SmtError`, n
 
 The expression encoder accepts integer and boolean literals, scalar variables and projected
 fields, unary negation and boolean negation, addition and subtraction, multiplication with a
-literal factor, comparisons, and boolean connectives. Supported sorts include `Int`, `UInt`,
-`UIntRange`, and `Bool`; unsigned sorts add range constraints. A named string sort does not provide
-string-literal or concatenation encoding. General function applications, nonlinear multiplication,
-floor division, and exponentiation are outside this fragment.
+literal factor, comparisons, boolean connectives, and `(𝑎, 𝑏) ▷ int_eq_uint`, which encodes as
+`𝑎 = 𝑏`. Supported sorts include `Int`, `UInt`, `UIntRange`, and `Bool`; every one of the three
+integer types encodes as SMT `Int`, and unsigned sorts add range constraints. A named string sort
+does not provide string-literal or concatenation encoding. Other function applications, nonlinear
+multiplication, floor division, and exponentiation are outside this fragment.
 
 An unsupported predicate produces `SmtError::Encoding`. The subtype deficit rule treats that
 outcome as a mismatch: failure to encode is not evidence of entailment. Other SMT errors reach
