@@ -271,6 +271,17 @@ union instead forwards the whole predicate over the domain shared by its arms, e
 is itself union-keyed. Prefix construction over union keys is specified under [Componentwise
 predicates and prefixes](#componentwise-predicates-and-prefixes).
 
+### Absent keys
+
+A collection level records apart from its statement the paths it knows absent everywhere
+(`absent_keys`). A statement covers the region a tile answers, so a cut to a projection keeps only
+what it says of the region kept; an absent key has no path in any region, so a cut keeps the record
+whole, and a merge unites the two sides'. A key in it is complete wherever completeness is read for
+that level. `Converse` writes it: once every input key it has read is complete, a value no row
+carried has no group ([Converse](#converse)). `MapAggregate` reads it with the outer statement, so
+a group no answer holds is stated absent after any cut beneath the groups' keys. A key held is
+never recorded absent.
+
 ### Qualified predicates
 
 `Qualified { enclosing, here }` admits a path when `enclosing` admits its prefix and `here`
@@ -537,10 +548,10 @@ tile at a level beneath the outermost (`src/interpreter/design-path-projections.
   that builds its answer from anything else cuts: accumulators held across pulls (`MapAggregate`),
   arms already released (`UnionOperator`), or a cache read at a wider region (`Memo`, and `FanOutSlot`
 of a cyclic fan-out).
-  An operator whose output keys are not its input's keys, such as `Converse`, pulls the input in
-  full and cuts its own output. An operator that cannot restate 𝑝 for an input pulls the input in
-  full and still cuts its output: pulling more is sound for a `get`, where a release that names
-  more is not.
+  An operator whose output keys are not its input's keys, such as `Converse` pulled at its values,
+  pulls the input in full and cuts its own output. An operator that cannot restate 𝑝 for an input
+  pulls the input in full and still cuts its output: pulling more is sound for a `get`, where a
+  release that names more is not.
 - **Completeness between pulls.** The completeness contract compares a producer's answers inside
   the region pulled, and a pull of one projection states completeness over its keys only, so a pull
   of another region withdraws nothing it said of the first. The debug check keeps the last statement
@@ -572,7 +583,7 @@ of a cyclic fan-out).
 | `MapDomain` | The input is pulled at the projection, since every level's keys stand. |
 | `Uncurry` | Beneath standing levels the input is pulled at the projection. Pairing the whole tile reads the groups whose first component the projection admits, and the pairs are cut after. |
 | `Product` | Both sides are pulled at the projection, since they are aligned row for row. The outer side has no paired level, so a projection at or beneath it pulls both sides at the rows its paths run through (`Projection::above`), and the pairs are cut. |
-| `Converse` | Every level is restated (`Restates::Every`). Beneath standing levels the input is pulled at the standing keys the projection names (`Projection::above`), and the groups are cut to it. Inverting the outermost collection reads the whole input and cuts the groups, and the rows of a group the projection does not name stay unreleased at the input. |
+| `Converse` | Every level is restated (`Restates::Every`). A projection of the input's keys one level beneath the inverted one under every value pulls the input at those keys ([Converse](#converse)). Otherwise, beneath standing levels the input is pulled at the standing keys the projection names (`Projection::above`), and inverting the outermost collection reads the whole input; the groups are cut to the projection, and the rows of a group the projection does not name stay unreleased at the input. |
 | `FanOutSlot` | Pulls the shared input at its own projection and cuts its answer to it. A producer states completeness only for the region it returns, so slots at different regions each pull the one input at their own and a pull of one region retracts nothing it said of another (the debug check compares the last output inside the region pulled). A cyclic fan-out reads its input whole, because a sibling that re-enters mid-pull is answered from the cache of the last completed pull, which has to cover whatever region that sibling asks for. A projection beneath the outermost keys is read and cut as one of the outermost keys is. |
 | `Memo` | Reads its input at the projection and caches what it read; a pull over a region it has read answers from the cache cut to the projection, and a region it has not read reaches the input however quiet the input has been. The regions it has read and must read again are projections at any level, so a projection beneath the outermost keys is read and cached as one of the outermost keys is. |
 | `UnionOperator` | A flat union pulls every arm at the projection and cuts the merge to it: the arms are disjoint slices of one collection, and an arm the consumer has released contributes an empty tile that states every key decided, which the cut brings back to the projection. A tagged union keys its rows by arm. It pulls each arm at what a guard of its keys by tag names under that arm's tag, as its `release_impl` splits a release, and does not pull an arm the guard names nothing of; a key projection of any other shape panics. |
@@ -661,17 +672,18 @@ instead of adding an arm. A last key the statement calls whole, or whose group's
 every key complete, ends the staircase at that key. A tile whose held keys form no prefix is
 released key by key (`Tile::held_guard`). At a nested level that guard names each key held and each
 key the level's statement calls complete under a row the tile holds, both by whole path, so a key
-stated absent under an open row is released at that row. The part of a level's statement that names
-its rows by path at every level above is also named under rows the tile does not hold
-(`Tile::stated_by_path`): it names those rows, so it releases nothing under any other. A statement
-unqualified at some level is named only under the rows held. Three tiles whose held keys form a
-prefix still take that path: a last key whose group holds nothing, an earlier key whose own group's
-statement calls every key complete, and a statement about the keys beneath an enclosing key the tile
-does not hold. The guard names all three exactly, the third by path. A universal input release
-latches `upstream_drained`. Until the input notifies again, release builds then return the cache
-without pulling it, and debug builds probe it once to exercise its post-release checks. A drained
-input inside a loop's cycle delivers again where a round has it read again (`read_again`), and every
-build reads the region it notified.
+stated absent under an open row is released at that row. A level's statement is also named as it is
+spelled under rows the tile does not hold (`Tile::stated_by_path`). A part qualified by whole paths
+names its rows, so it releases nothing under any other. A part unqualified at a level above states
+its keys complete under every row there, those not yet delivered included, so it is named under
+every one: an inverse states its input's keys so, since each stands beneath one value
+([Converse](#converse)). Three tiles whose held keys form a prefix still take that path: a last key
+whose group holds nothing, an earlier key whose own group's statement calls every key complete, and
+a statement about the keys beneath an enclosing key the tile does not hold. The guard names all
+three exactly, the third by path. A universal input release latches `upstream_drained`. Until the
+input notifies again, release builds then return the cache without pulling it, and debug builds
+probe it once to exercise its post-release checks. A drained input inside a loop's cycle delivers
+again where a round has it read again (`read_again`), and every build reads the region it notified.
 
 ### What a producer holds
 
@@ -757,7 +769,8 @@ pulls.
 | `Zip`, `Product` | every arm, both sides | keeps | Pulled at the projection and aligned row for row. |
 | `MakeRecord` | every field | widens | A record of values has no keys. |
 | `Filter` | the predicate, the input | keeps for a side that is a collection, else widens | A collection side shares the mask's keys; the other is read whole. |
-| `Uncurry`, `Converse` | the input | keeps beneath a standing level, widens at the outermost | Inverting or pairing the outermost collection re-keys it. |
+| `Uncurry` | the input | keeps beneath a standing level, widens at the outermost | Pairing the outermost collection re-keys it. |
+| `Converse` | the input | keeps the standing keys, and restates the inverted level's keys one level in, beneath every value (`scheduler::one_level_in`) | Each input key stands beneath exactly one value. |
 | `UnionOperator` | every arm | keeps for a flat union, restates under the arm's tag for a tagged one | Flat arms are disjoint slices of one collection; a tagged union keys an arm's rows by the arm's keys under its tag, and `Everything` of an arm is every key under that tag. |
 | `CheckedLookup` | a stream of keys, or the pairs | keeps | Each answer sits at its key's position. |
 | `CheckedLookup` | one key | widens | One key has no keys to project. |
@@ -841,7 +854,7 @@ the placement of the entry at an input, which a planner sets to that input's pip
 | `pushes_while_consuming()` | Whether the driver also pushes after each `consume_impl`. The default answers `true`. |
 | `offer_impl(guard)` | Answers from the state `consume_impl` built and pulls nothing. The breaker's own `get_impl` calls it once the breaker is consuming. |
 
-`Memo`, `Aggregate`, `ExtractAggregate`, `MapAggregate`, `Converse`, `ExtractFinal`, and an
+`Memo`, `Aggregate`, `ExtractAggregate`, `MapAggregate`, `ExtractFinal`, and an
 induction store and a transaction store ([A store as a breaker](#a-store-as-a-breaker)) are
 breakers that are producers; `SinkBreaker`, in a test's program run, is one that is not.
 A breaker starts in the pull mode described in [The producer protocol](#the-producer-protocol) and
@@ -857,9 +870,9 @@ as their projections do: a release up to the path `(𝑘, 𝑗)` leaves of a hel
 which `TileGuard::closed_over` drops where the row's level is a finite range of positions with none
 past 𝑗; `final_guard` closes the difference over the producer's tiling. A state of another shape has
 no spelling, and a push after the first panics naming the gap instead of answering a smaller or
-larger region. `MapAggregate` and `Converse` hold a state released beneath the keys of a group, and
+larger region. `MapAggregate` holds a state released beneath the keys of a group, and
 what a release beneath them leaves is a region beneath the outermost keys. A reader's chain may
-restate only the outermost keys (`TileProducer::restates`), so they answer `pushes_while_consuming`
+restate only the outermost keys (`TileProducer::restates`), so it answers `pushes_while_consuming`
 with `false` and push once per epoch, at `finish`. A push beneath the outermost keys lands in each reader
 as a projection at its level ([The dispatcher](#the-dispatcher)).
 
@@ -908,26 +921,25 @@ accumulators it covers and forwards to the input, as in pull mode.
 
 ### Converse
 
-A consuming `Converse` holds the input rows it merged, because which rows share a value is known
-only once the rows are read, and builds the groups from them on each offer. Beneath standing levels
-it holds each enclosing row's input rows under that row's path and inverts each row's rows on their
-own, as pull mode does. A group is final once the input has been released whole. A row whose group
-the consumer already released is dropped when it is merged, and a release of a group removes its
-rows and forwards to the input as in pull mode. The members of a group keep the order the rows
-arrived in, where a pull in pull mode orders them by key. `finish` pushes the guard of the groups
-built from the held rows, less the guard released; a `Converse` pushes nothing after a consume.
+`Converse` is no breaker: it holds no rows between pulls. Inverting a level puts the input's keys at
+that level one level in, beneath the values that become the keys there, and each input key stands
+beneath exactly one value. So a region of the input's keys names exactly the output paths it
+changed, with the value step admitting anything: `Converse` passes its input a consumer that
+restates the region there (`scheduler::one_level_in`), and a pull at such a region pulls the input
+at the same keys (`Predicate::without_open_level`) and inverts only those rows. A region of the
+standing keys above the inverted level passes through as it is. At the outermost level it keeps the
+input keys its answers stated complete and the values those answers held, and once every input key
+is complete it records every other value absent ([Absent keys](#absent-keys)): such a value has no
+group, and a cut beneath the values keeps no statement of the groups it does not hold.
 
 #### A release of a converse group
 
 A release of a `Converse` names its output region exactly. Upstream it is forwarded in two parts:
-the held input rows the region covers at once, and each later row of a released group on the read
-that first holds it (`ConverseProducer::release_late_rows`). An input guard names rows by key, and
-a group is the rows whose value is the group's key, so no input guard names a group before its rows
-are read. The two parts together release exactly the region named, as
-[Guard operations are exact](#guard-operations-are-exact) requires. In consuming mode no held input
-row stands in a released group once a consume returns; `finish` checks this in a debug build by
-removing the released region from the groups the held rows build
-(`ConverseProducer::debug_assert_released_groups_freed`).
+the input rows the region covers among those the last pull read, at once, and each later row of a
+released group on the read that first holds it (`ConverseProducer::release_late_rows`). An input
+guard names rows by key, and a group is the rows whose value is the group's key, so no input guard
+names a group before its rows are read. The two parts together release exactly the region named, as
+[Guard operations are exact](#guard-operations-are-exact) requires.
 
 ### ExtractFinal
 
@@ -1163,16 +1175,15 @@ lands a push made after a consume at once (`Dispatcher::land`), before it acknow
 so a reader may claim it while the pipeline runs; the finish lands its own push and closes the
 queue of each pipeline that reads it, where every other pipeline that one reads has finished. A
 breaker whose output is one value, `Aggregate`, `ExtractAggregate` and `ExtractFinal`, pushes one
-morsel. `Memo`, `MapAggregate` and `Converse` cut
-at the outermost keys they hold, in key order (`cut_at_keys`): a cut falls before every
-`morsel_rows`-th held key the guard names, the first morsel reaches down from the guard's lower end
-and the last is open above. The morsels partition the guard exactly. A key the breaker states absent
-rides in the morsel that covers it, so the releases of a reader's input at its morsels add up to the
-whole guard, and a reader that is final once its input is released whole, such as `Aggregate`,
-becomes final. A released key is in no morsel, because the final guard already excludes it. A guard
-naming no more than `morsel_rows` held keys is one morsel. A package is a guard of the reader's
-input tiling, as the reader's chain restates the morsel, and `run` asserts in a debug build that a
-package fits its breaker's input.
+morsel. `Memo` and `MapAggregate` cut at the outermost keys they hold, in key order (`cut_at_keys`):
+a cut falls before every `morsel_rows`-th held key the guard names, the first morsel reaches down
+from the guard's lower end and the last is open above. The morsels partition the guard exactly. A
+key the breaker states absent rides in the morsel that covers it, so the releases of a reader's
+input at its morsels add up to the whole guard, and a reader that is final once its input is
+released whole, such as `Aggregate`, becomes final. A released key is in no morsel, because the
+final guard already excludes it. A guard naming no more than `morsel_rows` held keys is one morsel.
+A package is a guard of the reader's input tiling, as the reader's chain restates the morsel, and
+`run` asserts in a debug build that a package fits its breaker's input.
 
 A push lands by climbing the breaker's consumer (`ProducerBase::downstream`) one morsel at a time,
 as a projection of the breaker's keys at any level (`Consumer::push`). Each consumer between two

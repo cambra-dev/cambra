@@ -608,10 +608,25 @@ fn converse_beneath_a_standing_level_forwards_the_region() {
     assert_keeps_without_state(&beneath, 0);
 }
 
-/// Inverting the outermost collection makes its values the keys.
+/// Inverting the outermost collection makes its values the keys and puts the input's keys one
+/// level in, beneath every value, where a region of them is restated.
 #[test]
-fn converse_at_the_outermost_level_sends_everything() {
-    assert_widens(&|| converse(CurryLevel::OUTERMOST), 0);
+fn converse_at_the_outermost_level_restates_the_keys_one_level_in() {
+    let build = || converse(CurryLevel::OUTERMOST);
+    for sent in [region(), another_region()] {
+        let Projection::Keys { keys, .. } = &sent else {
+            unreachable!("a region of keys")
+        };
+        assert_eq!(
+            received(&build, 0, &sent),
+            [Projection::keys_at(CurryLevel::new(1), keys.clone())],
+            "{sent:?}"
+        );
+    }
+    assert_eq!(
+        received(&build, 0, &Projection::Everything),
+        [Projection::Everything]
+    );
 }
 
 fn uncurry(level: CurryLevel) -> Built {

@@ -913,6 +913,31 @@ impl Predicate {
         }
     }
 
+    /// The inverse of [`with_level_inserted`](Self::with_level_inserted): this predicate, over
+    /// the paths reaching level `level`, with component `at` (`at < level`) removed, where every
+    /// arm admits anything there. `None` where an arm names particular values at `at`.
+    pub(crate) fn without_open_level(&self, level: usize, at: usize) -> Option<Predicate> {
+        match self {
+            Predicate::Or(arms) => arms.iter().try_fold(Predicate::False, |all, arm| {
+                Some(all.union(&arm.without_open_level(level, at)?))
+            }),
+            Predicate::Qualified { enclosing, here } => {
+                let enclosing = match level - 1 == at {
+                    true => match &**enclosing {
+                        Predicate::Qualified {
+                            enclosing: above,
+                            here: open,
+                        } if open.is_true() => (**above).clone(),
+                        _ => return None,
+                    },
+                    false => enclosing.without_open_level(level - 1, at)?,
+                };
+                Some(Predicate::qualified(enclosing, (**here).clone()))
+            }
+            unqualified => Some(unqualified.clone()),
+        }
+    }
+
     /// This predicate, over the paths reaching level `level`, restated after components
     /// `at` and `at + 1` (`at < level`) merge into one pair record `{fields.0: …, fields.1: …}`.
     ///
@@ -1599,6 +1624,7 @@ pub fn sort_function_by_domain(tile: Tile) -> Tile {
             codomain,
             domain_predicate,
             deleted,
+            ..
         } if row_starts.len() == 1 && !codomain.is_data_function() => {
             match (*codomain, domain) {
                 (Tile::Scalar(ColumnValue::Ints(cod_ints)), ColumnValue::Ints(dom)) => {
@@ -2136,6 +2162,32 @@ mod tests {
             Predicate::flatten_or(vec![rest, Predicate::point(u(0)), Predicate::point(u(1))]),
             Predicate::True
         );
+    }
+
+    /// A component inserted that admits anything is removed again, at the outermost level and
+    /// beneath one, through an `Or`; a path naming values there has no such component to remove.
+    #[test]
+    fn a_level_inserted_open_is_removed_again() {
+        let keys = Predicate::at_or_below(u(4));
+        let beneath_zero = Predicate::qualified(Predicate::point(u(0)), keys.clone());
+        for (stated, level, at) in [
+            (keys.clone(), 0, 0),
+            (beneath_zero.clone(), 1, 1),
+            (beneath_zero.clone(), 1, 0),
+            (keys.union(&beneath_zero), 1, 1),
+        ] {
+            let inserted = stated.with_level_inserted(level, at);
+            assert_eq!(
+                inserted.without_open_level(level + 1, at),
+                Some(stated.clone()),
+                "{stated:?} at {level}, inserted at {at}: {inserted:?}"
+            );
+        }
+        let named = Predicate::qualified(
+            Predicate::qualified(Predicate::point(u(0)), Predicate::point(u(5))),
+            keys,
+        );
+        assert_eq!(named.without_open_level(2, 1), None);
     }
 
     #[test]

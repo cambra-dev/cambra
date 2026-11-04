@@ -442,9 +442,10 @@ fn run_targets(
                     let arrived = probe(&leaf.consumer, PipelineId(pipeline), &one, pipeline);
                     if routes.iter().any(|route| !route.keeps_keys) {
                         notifies = Notifies::Whole;
-                    } else if !arrived.iter().all(|arrival| {
-                        matches!(arrival.guard, TileGuard::Function(FunctionGuard::Domain(_)))
-                    }) {
+                    } else if !arrived
+                        .iter()
+                        .all(|arrival| Projection::of(&arrival.guard).is_ok())
+                    {
                         unplace(&planner.placements, targets);
                         return Err(Refused(format!(
                             "a live source's arrivals reach {} beneath its outermost keys, which \

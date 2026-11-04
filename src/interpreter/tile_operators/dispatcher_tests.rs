@@ -7,12 +7,11 @@ use std::rc::Rc;
 use std::collections::BTreeSet;
 
 use super::aggregate::{aggregate_over, extract_aggregate_over, map_aggregate_over};
-use super::combinators::converse_of;
 use super::extract_final::extract_final_of;
 use super::fanout::MemoProducer;
 use super::growing::{
     Input, KEYS, NestedInput, ReadsBreaker, Rng, Shared, entries, ints, keys_predicate,
-    nested_tiling, predicate, rows_of, same_region, source, source_of, value,
+    nested_tiling, predicate, rows_of, same_region, source, value,
 };
 use super::test_helpers::{keys_between, push_to, wire};
 use super::*;
@@ -627,21 +626,6 @@ fn pipelines_that_read_each_other_are_refused() {
 /// The keys a source holds, with holes, so a morsel's region reaches past the keys it holds.
 const SPARSE: [u64; 8] = [0, 1, 3, 4, 5, 8, 10, 11];
 
-/// The value of a key in a source a converse groups: three groups.
-fn group_of(key: u64) -> i64 {
-    (key % 3) as i64
-}
-
-fn groups_tiling() -> Tiling {
-    Tiling::data_function(
-        Extent::Base(BaseType::Int),
-        Tiling::data_function(
-            Extent::uint_range(KEYS),
-            Tiling::Scalar(Extent::uint_range(KEYS)),
-        ),
-    )
-}
-
 fn sums_tiling() -> Tiling {
     Tiling::data_function(Extent::uint_range(KEYS), sum_tiling())
 }
@@ -677,25 +661,15 @@ enum Top {
     Memo,
     Sum,
     MapSum,
-    Converse,
     Final,
     MemoThenSum,
-    MemoThenConverse,
     MapSumThenMemo,
-    ConverseThenMemo,
 }
 
 /// A run of the chain `top` names at morsels of `rows`: the events, the source, the top breaker
 /// and its tiling.
 fn run_chain(top: Top, rows: usize) -> (Vec<Event>, Shared, BreakerHandle, Tiling) {
-    let groups = matches!(
-        top,
-        Top::Converse | Top::MemoThenConverse | Top::ConverseThenMemo
-    );
-    let source = match groups {
-        true => source_of(SPARSE, group_of),
-        false => source(SPARSE),
-    };
+    let source = source(SPARSE);
     let base: BreakerHandle = match top {
         Top::MapSum | Top::MapSumThenMemo => Rc::new(RefCell::new(MemoProducer::over(
             Box::new(NestedInput::over(&source)),
@@ -715,36 +689,20 @@ fn run_chain(top: Top, rows: usize) -> (Vec<Event>, Shared, BreakerHandle, Tilin
             map_aggregate_over(reading(&base), &sums_tiling(), AggregateKind::Sum),
             sums_tiling(),
         ),
-        Top::Converse => (
-            converse_of(reading(&base), &groups_tiling()),
-            groups_tiling(),
-        ),
         Top::Final => (extract_final_of(reading(&base), None, &int()), int()),
-        Top::MemoThenSum | Top::MemoThenConverse => {
+        Top::MemoThenSum => {
             let middle: BreakerHandle = memo_reading(&base);
             breakers.push(middle.clone());
-            match top {
-                Top::MemoThenSum => (
-                    aggregate_over(reading(&middle), &sum_tiling()),
-                    sum_tiling(),
-                ),
-                _ => (
-                    converse_of(reading(&middle), &groups_tiling()),
-                    groups_tiling(),
-                ),
-            }
+            (
+                aggregate_over(reading(&middle), &sum_tiling()),
+                sum_tiling(),
+            )
         }
-        Top::MapSumThenMemo | Top::ConverseThenMemo => {
-            let (middle, tiling) = match top {
-                Top::MapSumThenMemo => (
-                    map_aggregate_over(reading(&base), &sums_tiling(), AggregateKind::Sum),
-                    sums_tiling(),
-                ),
-                _ => (
-                    converse_of(reading(&base), &groups_tiling()),
-                    groups_tiling(),
-                ),
-            };
+        Top::MapSumThenMemo => {
+            let (middle, tiling) = (
+                map_aggregate_over(reading(&base), &sums_tiling(), AggregateKind::Sum),
+                sums_tiling(),
+            );
             breakers.push(middle.clone());
             let memo: BreakerHandle =
                 Rc::new(RefCell::new(MemoProducer::over(reading(&middle), &tiling)));
@@ -793,12 +751,9 @@ fn every_chain_answers_the_same_at_every_morsel_size() {
         Top::Memo,
         Top::Sum,
         Top::MapSum,
-        Top::Converse,
         Top::Final,
         Top::MemoThenSum,
-        Top::MemoThenConverse,
         Top::MapSumThenMemo,
-        Top::ConverseThenMemo,
     ] {
         let outcome = |rows| {
             let (_, _, breaker, tiling) = run_chain(top, rows);
@@ -846,27 +801,6 @@ fn an_extraction_over_a_memo_extracts_at_every_morsel_size() {
             extract.borrow_mut().get(int().universal_guard()),
             Tile::Scalar(ColumnValue::Ints(vec![value(11)])),
             "at morsels of {rows}"
-        );
-    }
-}
-
-/// A converse over a memo holds every group final at every morsel size: its input is released
-/// whole, and each group holds the keys that carry its value.
-#[test]
-fn a_converse_over_a_memo_holds_every_group_final_at_every_morsel_size() {
-    for rows in [1, 3, UNBOUNDED] {
-        let (_, _, converse, _) = run_chain(Top::Converse, rows);
-        assert!(
-            converse
-                .borrow()
-                .input_released(InputId::ONLY)
-                .is_universal(),
-            "the input is released whole at morsels of {rows}"
-        );
-        assert!(
-            converse.borrow().final_guard().is_universal(),
-            "every group is final at morsels of {rows}: {:?}",
-            converse.borrow().final_guard()
         );
     }
 }
@@ -1142,36 +1076,6 @@ fn read_after_finish(events: &[Event], pipeline: usize, reader: usize) -> bool {
         |event| matches!(event, Event::Consume { pipeline, .. } if *pipeline == PipelineId(reader)),
     );
     finished.is_some_and(|finished| first.is_none_or(|first| first > finished))
-}
-
-/// A `Converse` read by a memo pushes one package per morsel of the groups it holds, one per
-/// value: `0`, `1` and `2`, all at its finish.
-#[test]
-fn a_converse_pushes_a_package_per_morsel_of_its_groups() {
-    for (rows, expected) in [
-        (1, vec![vec![0], vec![1], vec![2]]),
-        (2, vec![vec![0, 1], vec![2]]),
-        (3, vec![vec![0, 1, 2]]),
-        (UNBOUNDED, vec![vec![0, 1, 2]]),
-    ] {
-        let (events, _, _, _) = run_chain(Top::ConverseThenMemo, rows);
-        assert!(read_after_finish(&events, 1, 2), "at morsels of {rows}");
-        let packages = consumed_by(&events, 2);
-        let named: Vec<Vec<i64>> = packages
-            .iter()
-            .map(|m| {
-                (0..3)
-                    .filter(|value| predicate(m).contains(&Value::Int(*value)))
-                    .collect()
-            })
-            .collect();
-        assert_eq!(named, expected, "at morsels of {rows}");
-        assert_eq!(
-            partition_gap(&groups_tiling().universal_guard(), &packages),
-            None,
-            "at morsels of {rows}"
-        );
-    }
 }
 
 /// The two morsels a scripted source pushes to an ordered reader, claimed by hand.

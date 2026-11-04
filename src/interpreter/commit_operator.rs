@@ -4495,13 +4495,21 @@ impl StoreFinalReadProducer {
             .enumerate()
             .filter_map(|(k, v)| v.filter(|_| whole[k]))
             .collect();
+        let answered_rows = (0..n)
+            .filter(|&k| whole[k])
+            .map(|k| Predicate::exactly(&paths[k]))
+            .fold(Predicate::False, |all, one| all.union(&one));
         // The level keeps the rows answered, and the answers take their stores' place.
         let level = out.values_at_mut(rows);
         level.retain_keys(&whole);
         let Tile::DataFunction { codomain, .. } = level else {
             unreachable!("retaining keys leaves a collection a collection")
         };
-        **codomain = stored_value_tile(answered, &self.value_extent);
+        // The values state their levels whole without knowing which rows they stand under, so
+        // they are qualified by the rows answered: a row still running holds no value yet.
+        let mut values = stored_value_tile(answered, &self.value_extent);
+        values.map_level_predicates(&mut |depth, pred| pred.qualified_by(&answered_rows, depth));
+        **codomain = values;
         out
     }
 }
@@ -11768,6 +11776,7 @@ mod tests {
             codomain: Box::new(Tile::Scalar(ColumnValue::from_ints(values))),
             domain_predicate: Predicate::False,
             deleted: BitSet::new(),
+            absent_keys: Predicate::False,
         };
         let store = |state: Tile| Tile::Store {
             state: Box::new(state),

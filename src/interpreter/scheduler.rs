@@ -5,6 +5,7 @@ use std::{
 };
 
 use crate::ccl::FieldKey;
+use crate::interpreter::CurryLevel;
 use crate::interpreter::{
     Consumer, DataSourceDomainExtentImpl, Projection, dispatcher::Landing, dispatcher::Routes,
     tile_operators::Notified, value_probe::ProbeSlot,
@@ -224,6 +225,54 @@ impl Consumer for Widening {
 
     fn route(&mut self, routes: &mut Routes) {
         routes.widened(|routes| self.0.route(routes));
+    }
+}
+
+/// `consumer` behind a consumer that forwards each region of the input's keys at level `at` as
+/// the same paths one level in, with a component beneath the keys above `at` that admits anything:
+/// an inverse (`Converse`) at `at` passes this to its input, whose keys at `at` stand beneath the
+/// values that become its keys there. Each input key stands beneath exactly one value, so the
+/// region names exactly the paths it changed. A region of the keys above `at` is forwarded as it
+/// is, since those levels stand.
+pub fn one_level_in(at: CurryLevel, consumer: Box<dyn Consumer>) -> Box<dyn Consumer> {
+    Box::new(OneLevelIn { at, consumer })
+}
+
+struct OneLevelIn {
+    at: CurryLevel,
+    consumer: Box<dyn Consumer>,
+}
+
+impl OneLevelIn {
+    /// `region` one level in, `None` where it names keys beneath level `at`.
+    fn restated(&self, region: &Projection) -> Option<Projection> {
+        match region {
+            Projection::Keys { level, keys } if *level == self.at => Some(Projection::keys_at(
+                CurryLevel::new(level.index() + 1),
+                keys.with_level_inserted(level.index(), level.index()),
+            )),
+            Projection::Keys { level, .. } if *level > self.at => None,
+            standing => Some(standing.clone()),
+        }
+    }
+}
+
+impl Consumer for OneLevelIn {
+    fn notify(&mut self, arrived: &Projection) {
+        let restated = self.restated(arrived).unwrap_or(Projection::Everything);
+        self.consumer.notify(&restated);
+    }
+
+    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        match self.restated(region) {
+            Some(restated) => self.consumer.push(&restated, landing),
+            None => landing.widened(|landing| self.consumer.push(&Projection::Everything, landing)),
+        }
+    }
+
+    /// The input's keys stand one level in, so the path keeps them.
+    fn route(&mut self, routes: &mut Routes) {
+        self.consumer.route(routes);
     }
 }
 

@@ -412,7 +412,7 @@ fn a_group_by() {
         g = groupby(xs, \\x -> x > 2)
         out << sum([sum(v) for v in g])
     "};
-    answers(source, "10", &["Memo", "Converse"]);
+    answers(source, "10", &["Memo"]);
     let (_, planned) = dispatched(source, 1);
     assert!(
         planned

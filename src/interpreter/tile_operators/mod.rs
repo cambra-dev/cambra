@@ -575,6 +575,7 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                 codomain,
                 domain_predicate,
                 deleted,
+                ..
             } => {
                 // The rule `Tile::completion_at` states.
                 let complete = match level {
@@ -2572,6 +2573,7 @@ pub(crate) mod test_helpers {
                 ]))),
                 domain_predicate: Predicate::True,
                 deleted: BitSet::new(),
+                absent_keys: Predicate::False,
             }
         };
         let last = with_n(ColumnValue::Ints(vec![]));

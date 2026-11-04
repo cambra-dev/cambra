@@ -930,12 +930,15 @@ impl MapAggregateProducer {
     /// Fold the groups of `input_tile` into the accumulators.
     fn fold(&mut self, input_tile: &Tile) -> Stated {
         let Tile::DataFunction {
-            domain_predicate, ..
+            domain_predicate,
+            absent_keys,
+            ..
         } = input_tile
         else {
             panic!("MapAggregate requires a collection tile, got {input_tile:?}")
         };
-        let domain_predicate = domain_predicate.clone();
+        // A group known absent is complete: it has no element to fold, in any region.
+        let domain_predicate = domain_predicate.union(absent_keys);
 
         // The collection being folded is the innermost one, and the rows it stands over
         // are the groups: `parent_paths` names them, one path per group.

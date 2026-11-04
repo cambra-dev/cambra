@@ -133,8 +133,8 @@ does with a projection at level 𝑛 > 0. The rows fall into five kinds:
 | --- | --- | --- |
 | Keeps every level's keys | `MapResultWithSource`, `Filter` (with a collection predicate, the levels down to the masked one), `Restrict`, `MapDomain`, `VariantProject`, `VariantIs`, `Memo`, `FanOutSlot`, `IterateExtent`, `MapAggregate`, `MapExtractAggregate` (the levels of its input, not those of a `Sole` collection beneath them) | pulls each keyed input at the same projection and cuts its answer to it |
 | Keeps the keys above its level | `MapResult` (keyed input), `MapResultToConst`, `RecordWrap`, `Zip`, `VariantWrap`, `SelectField` over a stream of records, `Product` | pulls each keyed input at a projection above its level and refuses one at or beneath it, or, for `Product`, pulls both sides at the rows above its paired level and cuts the pairs |
-| Shifts levels | `Uncurry`, `Converse` beneath standing levels (pulled at the standing keys, its groups cut), a nested store's read | restates the projection by the levels it adds or removes |
-| Reads whole and cuts | `PermuteRecordDomain`, `FlattenTupleDomain`, `SelectField` over a product, `CheckedLookup`'s collection, `UnionOperator`, `Converse` at the outermost level | reads its input whole and cuts the answer at level 𝑛 |
+| Shifts levels | `Uncurry`, `Converse` (pulled at the input's keys one level in, or at the standing keys, its groups cut), a nested store's read | restates the projection by the levels it adds or removes |
+| Reads whole and cuts | `PermuteRecordDomain`, `FlattenTupleDomain`, `SelectField` over a product, `CheckedLookup`'s collection, `UnionOperator`, `Converse` at the outermost level pulled at its values | reads its input whole and cuts the answer at level 𝑛 |
 | No keys beneath | `Aggregate`, `ExtractAggregate`, `ExtractFinal`, `MakeRecord`, `Constant` scalar | refuses, as it refuses keys today |
 
 An operator that keeps its input's keys above its own level and computes the values beneath them
