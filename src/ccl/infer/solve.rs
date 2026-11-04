@@ -2012,10 +2012,9 @@ fn decide_suspended_memberships(root: NodeId, ctx: &mut CoalesceCtx) {
         ) {
             continue;
         }
-        let resolved = match &found {
-            crate::ccl::ty::TypeKind::Enumerated(ds) if ds.len() == 1 => ds[0].clone(),
-            _ => Type::sum_over(found, None, Type::Hole),
-        };
+        let resolved = witnesses[0]
+            .sole_candidate()
+            .unwrap_or_else(|| Type::sum_over(found, None, Type::Hole));
         let err = CoalesceError::KindMismatch {
             resolved: Box::new(resolved.clone()),
             type_kind: m.kind,
