@@ -402,6 +402,28 @@ fn a_pub_assignment_takes_a_block_value() {
     assert!(matches!(value.node, Expr::Block(_)));
 }
 
+/// `pub abstract type` marks the type, and `abstract` stands nowhere else
+/// (`docs/chl-spec.md`, "9.5 Visibility").
+#[test]
+fn abstract_marks_an_exported_type() {
+    let m = parse_m(indoc! {"
+        pub abstract type Token:
+            issued(Int)
+    "});
+    let Stmt::Pub { stmt, .. } = &m.body[0].node else {
+        panic!("expected `pub`");
+    };
+    let Stmt::TypeDecl(decl) = &stmt.node else {
+        panic!("expected a type declaration");
+    };
+    assert!(decl.abstract_kw.is_some());
+    assert_error(
+        "abstract type Cents = Int\n",
+        "`abstract` stands after `pub`, as `pub abstract type`",
+    );
+    assert_error("pub abstract x = 1\n", "`abstract` stands on a `type`");
+}
+
 #[test]
 fn pub_is_refused_on_a_statement_that_introduces_no_member() {
     assert_error("pub import cart\n", "`pub` is refused on an `import`");

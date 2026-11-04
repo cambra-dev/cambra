@@ -76,3 +76,5 @@ instance Sized(Price):
         s.extract()
 
 n = summon(Sized(_))::size(Price::new(3))
+
+pub abstract type Cents = Int

@@ -142,6 +142,7 @@ forall requires causes only   nothing
 raise  try    except
 type   impl   instance   trait
 import use    as     pub    run    param  const  this
+abstract
 ```
 
 `where` is the refinement predicate separator (§6.4). It is lexed so the name is
@@ -159,7 +160,8 @@ reserved for future use.
 
 `import`, `use`, `as`, `pub`, `run`, `param` and `this` are the module keywords
 ([9. Modules](#9-modules)). `const` marks a parameter whose argument is a link-time constant
-([9.19 Constants](#919-constants)).
+([9.19 Constants](#919-constants)). `abstract`, after `pub`, exports a type without its constructors
+([9.5 Visibility](#95-visibility)).
 
 `match` and `case` introduce tag dispatch over a variant (§4.10).
 
@@ -409,7 +411,7 @@ discard_head    ::= ident | "run" module_path [ "as" ident ]
 
 -- `pub` before the statement that introduces a member. Any statement parses
 -- after it; one that introduces no member is refused.
-pub_stmt        ::= "pub" statement
+pub_stmt        ::= "pub" [ "abstract" ] statement   (* "abstract" only before a type_stmt *)
 
 block           ::= NEWLINE INDENT statement+ DEDENT
 ```
@@ -3154,6 +3156,9 @@ renamed_type_stmt ::= "@" "RenamedFrom" "(" type_path ")" NEWLINE type_stmt
   documentation and diagnostics, and a call is positional: `Shape::circle(1)`. A call from another
   module therefore writes no qualified label
   ([9.12 Field labels and tags belong to a module](#912-field-labels-and-tags-belong-to-a-module)).
+- **`pub abstract type` keeps the constructors in their module.** Another module holds the type's
+  values and reaches them through its public functions, and neither builds nor matches one
+  ([9.5 Visibility](#95-visibility)).
 - **Constructors are lowercase and take no backtick.** They are declared names that belong to their
   type, reached as `Shape::circle`, or `shop::Shape::circle` from a module that imports `shop`.
 - **A parameter type may name the type being declared and the module's other types**, so recursive
@@ -5961,9 +5966,23 @@ pub held: Int
 - Private names keep the ordinary top-level shadowing of
   [5. Scoping and binding](#5-scoping-and-binding).
 - `pub` on a `type` declaration exports the nominal type with its constructors, and with `new` and
-  `extract` in the single-constructor form. `pub` on an associated function's `def`, including one
-  in an `impl` block, exports it, and one without `pub` is reached only from its own module, in
-  either spelling
+  `extract` in the single-constructor form.
+- `pub abstract type` exports the nominal type without its constructors, `new` or `extract`.
+  Another module holds the type's values and reaches them through the type's public functions,
+  and neither builds nor matches one, so those functions keep whatever the type's values promise
+  beyond what a refinement states. `abstract` stands only after `pub`, since a type its module does
+  not export has private constructors already.
+
+  ```python
+  pub abstract type Token:
+      revoked
+      issued(Int)
+  pub def Token::issue(n: Int) => Token:    # checks n before it builds
+      Token::issued(n)
+  pub abstract type UserId = Int           # minted only by its module
+  ```
+- `pub` on an associated function's `def`, including one in an `impl` block, exports it, and one
+  without `pub` is reached only from its own module, in either spelling
   ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). An associated
   function binds no module-level name, so the bound-once rule above does not apply to it.
 - Types need not be annotated on public members. An unannotated member's contract is its inferred

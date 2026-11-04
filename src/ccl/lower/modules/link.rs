@@ -946,7 +946,7 @@ fn method_copy(
             (function.arity - 1, function.declared)
         }
         Some(_) => return None,
-        None if method == "extract" && member.decl.declares_extract => (0, member.declared),
+        None if method == "extract" && member.decl.exports_extract() => (0, member.declared),
         None => return None,
     };
     let mut decl = Rc::clone(&member.decl);

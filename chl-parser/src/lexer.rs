@@ -132,6 +132,10 @@ pub enum Token {
     As,
     #[token("pub", priority = 3)]
     Pub,
+    /// After `pub`, before `type`: the type is exported and its constructors are not
+    /// (`docs/chl-spec.md`, "9.5 Visibility").
+    #[token("abstract", priority = 3)]
+    Abstract,
     #[token("run", priority = 3)]
     Run,
     #[token("param", priority = 3)]
@@ -399,6 +403,7 @@ pub const KEYWORDS: &[(&str, Token)] = &[
     ("use", Token::Use),
     ("as", Token::As),
     ("pub", Token::Pub),
+    ("abstract", Token::Abstract),
     ("run", Token::Run),
     ("param", Token::Param),
     ("const", Token::Const),
@@ -551,6 +556,7 @@ pub fn highlight_class(token: &Token) -> Option<HighlightClass> {
         | Token::Use
         | Token::As
         | Token::Pub
+        | Token::Abstract
         | Token::Run
         | Token::Param
         | Token::Const
@@ -839,6 +845,7 @@ impl fmt::Display for Token {
             Token::Use => "use",
             Token::As => "as",
             Token::Pub => "pub",
+            Token::Abstract => "abstract",
             Token::Run => "run",
             Token::Param => "param",
             Token::Const => "const",
@@ -1558,16 +1565,16 @@ impl<'a> Layout<'a> {
         }
     }
 
-    /// The token `tok` at `span` starts a statement, or is the `pub` or `const`
+    /// The token `tok` at `span` starts a statement, or is the `pub`, `abstract` or `const`
     /// before one.
     fn statement_head(&mut self, tok: &Token, span: Span) {
         self.line_head = (self.out.len(), span.start);
         if self.head_is_line_first {
             self.line_opens_at_first_token = opens_block_at_line_start(tok);
         }
-        // `pub` and `const` prefix the statement they mark, so the token after
+        // `pub`, `abstract` and `const` prefix the statement they mark, so the token after
         // them is the one that says whether the statement opens a block itself.
-        self.head_next = matches!(tok, Token::Pub | Token::Const);
+        self.head_next = matches!(tok, Token::Pub | Token::Abstract | Token::Const);
     }
 
     /// The first token of a logical line: open or close indentation levels.

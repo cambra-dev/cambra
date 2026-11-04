@@ -513,8 +513,8 @@ fn a_checked_module_says_whether_it_is_run(#[case] module: &str, #[case] expecte
 }
 
 /// A public nominal type prints as its module declares it, with each type parameter's
-/// variance and the module's type parameters whose arguments tell its instances apart,
-/// and each public associated function prints with its contract.
+/// variance and the module's type parameters whose arguments tell its instances apart, and an
+/// abstract one as its head alone. Each public associated function prints with its contract.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn a_checked_module_prints_its_nominal_types() {
@@ -531,6 +531,9 @@ fn a_checked_module_prints_its_nominal_types() {
                 1
             pub type Order:
                 placed(r: Receipt, total: Price)
+            pub abstract type Token:
+                issued(Int)
+            pub abstract type Cents = Int
             impl Box(T):
                 pub def or_else(self, d: T) => T:
                     match self:
@@ -555,6 +558,8 @@ fn a_checked_module_prints_its_nominal_types() {
             pub Price::doubled: Price => Int
             pub type Order:  # one type per argument of Receipt
                 placed(r: Receipt, total: Price)
+            pub abstract type Token
+            pub abstract type Cents
             pub Box::or_else: forall (T) {Box(T), T} => T
         "}
     );

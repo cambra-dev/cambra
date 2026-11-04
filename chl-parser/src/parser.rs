@@ -1872,19 +1872,34 @@ where
         // statement rather than as a failure to parse it.
         let pub_stmt = just(Token::Pub)
             .map_with(|_, e| e.span())
+            .then(just(Token::Abstract).map_with(|_, e| e.span()).or_not())
             .then(stmt.clone())
-            .validate(|(keyword, inner): (Span, Spanned<Stmt>), e, emitter| {
-                if let Some(refused) = pub_refusal(&inner.node) {
-                    emitter.emit(Rich::custom(keyword, refused));
-                }
-                Spanned::new(
-                    e.span(),
-                    Stmt::Pub {
-                        keyword,
-                        stmt: Box::new(inner),
-                    },
-                )
-            })
+            .validate(
+                |((keyword, abstract_kw), mut inner): ((Span, Option<Span>), Spanned<Stmt>),
+                 e,
+                 emitter| {
+                    if let Some(refused) = pub_refusal(&inner.node) {
+                        emitter.emit(Rich::custom(keyword, refused));
+                    }
+                    if let Some(abstract_kw) = abstract_kw {
+                        match &mut inner.node {
+                            Stmt::TypeDecl(decl) => decl.abstract_kw = Some(abstract_kw),
+                            _ => emitter.emit(Rich::custom(
+                                abstract_kw,
+                                "`abstract` stands on a `type`: it exports the type without its \
+                             constructors",
+                            )),
+                        }
+                    }
+                    Spanned::new(
+                        e.span(),
+                        Stmt::Pub {
+                            keyword,
+                            stmt: Box::new(inner),
+                        },
+                    )
+                },
+            )
             .boxed();
 
         // `const` before the `param` it marks (`docs/chl-spec.md`, "9.19 Constants"). Any
@@ -1905,6 +1920,21 @@ where
                     }
                 }
                 Spanned::new(e.span(), inner.node)
+            })
+            .boxed();
+
+        // `abstract` with no `pub` before it: a type its module does not export has private
+        // constructors already.
+        let abstract_stmt = just(Token::Abstract)
+            .map_with(|_, e| e.span())
+            .then(stmt.clone())
+            .validate(|(keyword, inner): (Span, Spanned<Stmt>), _, emitter| {
+                emitter.emit(Rich::custom(
+                    keyword,
+                    "`abstract` stands after `pub`, as `pub abstract type`: a type its module \
+                     does not export has private constructors already",
+                ));
+                inner
             })
             .boxed();
 
@@ -1931,6 +1961,7 @@ where
             builtin_stmt,
             decorated_stmt,
             pub_stmt,
+            abstract_stmt,
             const_stmt,
             block_assign,
             simple_stmt,
@@ -2079,6 +2110,7 @@ where
             Spanned::new(
                 e.span(),
                 Stmt::TypeDecl(TypeDecl {
+                    abstract_kw: None,
                     name,
                     params,
                     requires,

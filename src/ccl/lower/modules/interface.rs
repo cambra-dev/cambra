@@ -387,6 +387,11 @@ impl NominalMember {
             [] => String::new(),
             notes => format!("  # {}", notes.join("; ")),
         };
+        // An abstract type's constructors are its module's alone, so the interface states its
+        // head and no constructor.
+        if decl.is_abstract {
+            return format!("pub abstract type {head}{note}");
+        }
         if decl.declares_extract {
             let [ctor] = body.ctors.as_slice() else {
                 unreachable!("the single-constructor form declares one constructor")
@@ -586,7 +591,7 @@ impl Interface {
             .flat_map(|member| {
                 let extract = member
                     .decl
-                    .declares_extract
+                    .exports_extract()
                     .then(|| SmolStr::new_static("extract"));
                 member
                     .functions
