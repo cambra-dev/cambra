@@ -229,19 +229,19 @@ pub(crate) fn check_sink(code: &str, expected: &str) {
 /// Use this for negative tests and for program features that have
 /// only been partially implemented.
 pub fn check_compile_error(code: &str, needle: &str) {
-    let result = panic::catch_unwind(AssertUnwindSafe(|| run_pipeline(code)));
-    let payload = match result {
-        Ok(_) => panic!(
-            "expected compile_program to panic with substring {needle:?}; \
-             program ran to completion"
-        ),
-        Err(payload) => payload,
-    };
-    let msg = panic_message(&*payload);
+    let msg = compile_panic(code);
     assert!(
         msg.contains(needle),
         "expected panic to contain {needle:?}; got: {msg}",
     );
+}
+
+/// What the compiler panics with on `code`: a rendered compile error, or a pass's own panic.
+pub fn compile_panic(code: &str) -> String {
+    match panic::catch_unwind(AssertUnwindSafe(|| run_pipeline(code))) {
+        Ok(_) => panic!("expected compile_program to panic; program ran to completion"),
+        Err(payload) => panic_message(&*payload),
+    }
 }
 
 // ---------------------------------------------------------------------------

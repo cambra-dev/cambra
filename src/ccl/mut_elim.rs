@@ -1180,106 +1180,6 @@ pub(crate) fn tvar(name: &Name, ty: Type) -> Expr {
     e
 }
 
-/// Refuse a loop that writes a mutable variable over a sum this phase does not compile. A loop
-/// over a sum types its history over the source's projected witness
-/// (`src/ccl/design/collections.md`, "A `for` loop over a sum"), and three sources break that:
-///
-/// - A conditional collection, written in place or bound by a `let`. Realization copies a
-///   conditional into each of its consumers, a copy the projection quotes and realization does
-///   not rewrite.
-/// - A filtered sum. The filter's predicate applies the collection it filters at a position of
-///   the witness, and once the witness is projected, the check relates a projection to that
-///   collection's own witness, which it relates to a witness reference only.
-/// - A source computed per position of an enclosing loop, other than a variable.
-///   [`bind_sum_loop_sources`] binds a source only outside every loop, so the projection quotes
-///   this one itself, a copy the passes after this phase do not rewrite.
-pub(crate) fn refuse_uncompiled_loops_over_sums(expr: &Expr) -> Result<(), String> {
-    refuse_under(expr, &mut Vec::new(), &HashSet::new())
-}
-
-/// [`refuse_uncompiled_loops_over_sums`] under the `let`-bound conditionals in scope, each with
-/// its definition's rendering, and the names the enclosing loops scope.
-fn refuse_under(
-    expr: &Expr,
-    conditionals: &mut Vec<(Name, String)>,
-    enclosing: &HashSet<Name>,
-) -> Result<(), String> {
-    if let TypedExprNode::For { iter, body, .. } = &expr.node {
-        refuse_loop(iter, body, conditionals, enclosing)?;
-        refuse_under(iter, conditionals, enclosing)?;
-        let mut scoped = enclosing.clone();
-        names_scoped_by(expr, &mut scoped);
-        return refuse_under(body, conditionals, &scoped);
-    }
-    if let TypedExprNode::Let {
-        binding,
-        bound_expr,
-        body,
-    } = &expr.node
-    {
-        refuse_under(bound_expr, conditionals, enclosing)?;
-        let scope = conditionals.len();
-        if matches!(bound_expr.node, TypedExprNode::Case { .. }) {
-            conditionals.push((binding.name.clone(), symbolic(bound_expr)));
-        }
-        let result = refuse_under(body, conditionals, enclosing);
-        conditionals.truncate(scope);
-        return result;
-    }
-    let mut result = Ok(());
-    expr.walk_children(|child| {
-        if result.is_ok() {
-            result = refuse_under(child, conditionals, enclosing);
-        }
-    });
-    result
-}
-
-/// The refusal of [`refuse_uncompiled_loops_over_sums`] for one loop, over `iter` with body
-/// `body`.
-fn refuse_loop(
-    iter: &Expr,
-    body: &Expr,
-    conditionals: &[(Name, String)],
-    enclosing: &HashSet<Name>,
-) -> Result<(), String> {
-    if !writes_a_mutable(body) || source_fun(&iter.ty).sum().is_none() {
-        return Ok(());
-    }
-    let conditional = match &iter.node {
-        TypedExprNode::Case { .. } => Some(symbolic(iter)),
-        TypedExprNode::Var(name) => conditionals
-            .iter()
-            .find(|(bound, _)| bound == name)
-            .map(|(_, definition)| definition.clone()),
-        _ => None,
-    };
-    if let Some(conditional) = conditional {
-        return Err(format!(
-            "a `for` loop writing a mutable variable over a conditional collection is not \
-             compiled yet: `{conditional}` has type {}",
-            iter.ty
-        ));
-    }
-    if matches!(fun_parts(&iter.ty).0, Type::Refinement(..)) {
-        return Err(format!(
-            "a `for` loop writing a mutable variable over a filtered collection whose type \
-             is a sum is not compiled yet: `{}` has type {}",
-            symbolic(iter),
-            iter.ty
-        ));
-    }
-    if !matches!(iter.node, TypedExprNode::Var(_)) && reads_any(iter, enclosing) {
-        return Err(format!(
-            "a `for` loop writing a mutable variable over a sum computed per position of an \
-             enclosing loop is not compiled yet: `{}` has type {}",
-            symbolic(iter),
-            iter.ty
-        ));
-    }
-    Ok(())
-}
-
 /// Refuse a feed a loop body declares that the iteration feeds in two places: the two
 /// collections it builds would be unioned, and a union of collections that vary with the
 /// iteration is not supported, as `[x] ++ [x * 10]` in a loop body is not. One place may sit
@@ -1363,16 +1263,6 @@ fn feeds_into(expr: &Expr, channel: &Name, out: &mut Vec<NodeId>) {
     expr.walk_children(|child| feeds_into(child, channel, out));
 }
 
-/// Whether `body` writes a mutable variable anywhere.
-fn writes_a_mutable(body: &Expr) -> bool {
-    if matches!(body.node, TypedExprNode::MutWrite { .. }) {
-        return true;
-    }
-    let mut found = false;
-    body.walk_children(|child| found = found || writes_a_mutable(child));
-    found
-}
-
 /// Destructure a (possibly refinement- or `Mut`-wrapped) function type.
 ///
 /// A `Mut`-typed collection used as a loop source (`xs := [..]; for i in
@@ -1453,8 +1343,7 @@ fn source_value(iter: &Expr) -> Expr {
 ///
 /// Only a source no enclosing loop varies is bound: one reading nothing an enclosing loop binds
 /// or writes. Its binding stands outside every enclosing loop, so the inner domain depends on no
-/// enclosing position. A source computed per position of an enclosing loop is left in place
-/// ([`refuse_uncompiled_loops_over_sums`]).
+/// enclosing position. A source computed per position of an enclosing loop is left in place.
 pub(crate) fn bind_sum_loop_sources(expr: Expr) -> Expr {
     bind_sources(expr, &HashSet::new(), &mut HashSet::new())
 }
@@ -1563,10 +1452,7 @@ fn loop_domain(iter: &Expr) -> Type {
         .iter()
         .enumerate()
         .fold(domain, |domain, (position, witness)| {
-            let projection = Type::WitnessProjection(crate::ccl::WitnessProjection::new(
-                Rc::clone(&source),
-                position,
-            ));
+            let projection = crate::ccl::ty::projected_witness(&source, position, witness);
             crate::ccl::ty::instantiate_witness(&domain, witness.id(), &projection)
         })
 }

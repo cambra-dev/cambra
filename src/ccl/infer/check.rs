@@ -896,7 +896,7 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
         // relation it claims — a gated tagged union realizing a sum — is one no typing rule
         // can check, so re-deriving from the value would only rediscover that they differ.
         // The child is still walked: it is an ordinary term and its own subtree must check.
-        TypedExprNode::Realize(value) => {
+        TypedExprNode::Realize { value, .. } => {
             ctx.subexpr(value)?;
             expr.ty.clone()
         }
@@ -1162,7 +1162,7 @@ fn check_strength_over(ty: &Type, label: &str, ctx: &mut CheckCtx) {
 fn check_unbox(ty: &Type, label: &str, ctx: &mut CheckCtx) {
     let expected = (|| {
         let Type::Fun {
-            name: Some(boxed),
+            name,
             domain,
             codomain,
             ..
@@ -1170,6 +1170,12 @@ fn check_unbox(ty: &Type, label: &str, ctx: &mut CheckCtx) {
         else {
             return None;
         };
+        // A plain collection has no witness, so `unbox` of it is the identity, and its
+        // result does not depend on the argument.
+        if domain.peel_refinements().sum().is_none() {
+            return Some(((**domain).clone(), (**codomain).clone()));
+        }
+        let boxed = name.as_ref()?;
         let recorded = crate::ccl::subst::open_codomain(ty, codomain);
         // A reference compared against and rendered, never placed in a tree.
         let term =

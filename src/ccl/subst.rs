@@ -160,6 +160,46 @@ pub enum Mapping {
     Unspellable(Box<Mapping>),
 }
 
+/// A substitution's entries by what their images read ([`Subst::image_table`]).
+pub(crate) struct ImageTable {
+    names: BTreeMap<Binder, BTreeSet<Name>>,
+    witnesses:
+        BTreeMap<crate::ccl::ty::WitnessId, (BTreeSet<Name>, BTreeSet<crate::ccl::ty::WitnessId>)>,
+}
+
+impl ImageTable {
+    /// What a type reading `names` and `witnesses` reads once the substitution has acted on it:
+    /// a mapped name or witness reads what its image reads, and any other reads itself.
+    pub(crate) fn image(
+        &self,
+        names: &BTreeSet<Name>,
+        witnesses: &BTreeSet<crate::ccl::ty::WitnessId>,
+    ) -> (BTreeSet<Name>, BTreeSet<crate::ccl::ty::WitnessId>) {
+        let mut out_names = BTreeSet::new();
+        for n in names {
+            match self.names.get(n) {
+                Some(image) => out_names.extend(image.iter().cloned()),
+                None => {
+                    out_names.insert(n.clone());
+                }
+            }
+        }
+        let mut out_witnesses = BTreeSet::new();
+        for w in witnesses {
+            match self.witnesses.get(w) {
+                Some((n, ws)) => {
+                    out_names.extend(n.iter().cloned());
+                    out_witnesses.extend(ws.iter().copied());
+                }
+                None => {
+                    out_witnesses.insert(*w);
+                }
+            }
+        }
+        (out_names, out_witnesses)
+    }
+}
+
 /// What a substitution does to a **witness** binder — the witness-sort counterpart of
 /// [`Mapping`], and the same two species for the same reason.
 ///
@@ -316,6 +356,9 @@ fn debug_assert_no_pi_bound(binder: &Name) {
     );
 }
 
+/// A witness half: each binder it maps, to a binder or a domain.
+type WitnessMap = BTreeMap<crate::ccl::ty::WitnessId, WitnessMapping>;
+
 /// A simultaneous substitution `{binder ↦ mapping, …}`. An absent binder maps
 /// to itself (the identity). The empty map is [`Subst::id`].
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -328,7 +371,111 @@ pub struct Subst {
     /// the map rather than trying to make the two binders one object. Bounds already carry
     /// the edge's morphisms, so a reference recorded on a variable arrives already spelled
     /// in the holder's scope.
-    witnesses: BTreeMap<crate::ccl::ty::WitnessId, WitnessMapping>,
+    witnesses: WitnessMap,
+    /// The **eliminations of sums through terms** this substitution performs, in order
+    /// ([`Elim`]): a sum read out, and then one inside what that read produced. They act on
+    /// type structure only: a term's type slots are what the term says, not a collection
+    /// being read out of a value.
+    elims: Vec<Elim>,
+}
+
+/// **A sum read through a term**: what `unbox(𝑐)` does to `𝑐`'s collection type. Each of the
+/// sum's binders `σᵢ` becomes `σᵢ(𝑐)`, the witness the value carries, and the function is
+/// plain. A plain collection is the sum over no binders, so it is unchanged. See
+/// `src/ccl/design/collections.md`, "Projecting a sum's witness".
+#[derive(Clone, Debug, PartialEq)]
+pub enum Elim {
+    /// Not yet at a function: it acts on the outermost function of whatever it is applied to.
+    Top(Rc<TypedExpr>),
+    /// Inside a function whose funkind is the variable `κ`: each of `κ`'s binders `σᵢ` is
+    /// `σᵢ(𝑐)` wherever it occurs. Which ids those are is `κ`'s to say once its arity is
+    /// known, so the entry names the kind rather than ids.
+    Kind(Rc<crate::ccl::ty::FunKindVar>, Rc<TypedExpr>),
+    /// The inverse of [`Elim::Kind`], where `κ`'s arity is known: each `σᵢ(𝑐)` is `κ`'s binder
+    /// `σᵢ`. What a bound recorded on a variable read through `𝑐` says of the variable itself,
+    /// which is a part of a function of kind `κ` and so names that function's binders, never
+    /// the witnesses one value carries ([`crate::ccl::infer_var::Bound::render_subst`]). Like
+    /// every elimination it acts after the substitution's binders, so `𝑐` is spelled in the
+    /// frame they produce.
+    ReadBack(Rc<crate::ccl::ty::FunKindVar>, Rc<TypedExpr>),
+    /// **Onto `κ`'s binders**: a binder of a sum related to `κ` by kind edges is `κ`'s binder at
+    /// its position ([`crate::ccl::ty::FunKindVar::binder_position`]). What an edge between two
+    /// functions over variable kinds carries for the Σ rule: the position is read where the
+    /// reference stands, so the entry is the same whether or not the kinds' arities are known
+    /// yet, and names no binder a kind never binds. Not an elimination, but it acts where one
+    /// does, on a kind's binders, so it is ordered among them.
+    Onto(Rc<crate::ccl::ty::FunKindVar>),
+    /// **A witness half acting after the entries before it**, where a composition put one after
+    /// a respelling ([`Subst::then`]). A substitution's own witness half acts before its
+    /// eliminations, and a respelling and a witness map do not commute, so composing `𝑎` then `𝑏`
+    /// places `𝑏`'s witness half here, after `𝑎`'s respellings, rather than in front of them.
+    Map(Rc<WitnessMap>),
+}
+
+impl Elim {
+    fn term(&self) -> Option<&Rc<TypedExpr>> {
+        match self {
+            Elim::Top(c) | Elim::Kind(_, c) | Elim::ReadBack(_, c) => Some(c),
+            Elim::Onto(_) | Elim::Map(_) => None,
+        }
+    }
+
+    fn map_term(&self, f: impl FnOnce(&TypedExpr) -> TypedExpr) -> Elim {
+        match self {
+            Elim::Top(c) => Elim::Top(Rc::new(f(c))),
+            Elim::Kind(k, c) => Elim::Kind(Rc::clone(k), Rc::new(f(c))),
+            Elim::ReadBack(k, c) => Elim::ReadBack(Rc::clone(k), Rc::new(f(c))),
+            Elim::Onto(_) | Elim::Map(_) => self.clone(),
+        }
+    }
+
+    /// Whether this can act on a part of a function in `scope`. A respelling acts only on the
+    /// binders of `κ`'s kind component; an elimination acts on whatever sum a variable
+    /// resolves to, which nothing says yet.
+    pub(crate) fn acts_in(&self, scope: &crate::ccl::infer_var::WitnessScope) -> bool {
+        match self {
+            Elim::Onto(k) => match scope {
+                crate::ccl::infer_var::WitnessScope::Kind(s) => k.same_component(s),
+                crate::ccl::infer_var::WitnessScope::Binders(ws) => {
+                    ws.iter().any(|w| k.binder_position(w).is_some())
+                }
+            },
+            Elim::Map(m) => m.keys().any(|w| scope.may_bind(w)),
+            Elim::Top(_) | Elim::Kind(..) | Elim::ReadBack(..) => true,
+        }
+    }
+}
+
+/// `first`, then `second`, as one witness half: a rename lands where `second` sends its target,
+/// and a discharge's domain is read under `second`.
+fn compose_witness_maps(first: &WitnessMap, second: &WitnessMap) -> WitnessMap {
+    let after = Subst {
+        witnesses: second.clone(),
+        ..Subst::id()
+    };
+    let mut out: WitnessMap = first
+        .iter()
+        .map(|(from, to)| {
+            let to = match to {
+                WitnessMapping::Rename(w) => {
+                    second.get(w).cloned().unwrap_or(WitnessMapping::Rename(*w))
+                }
+                WitnessMapping::Discharge(d) => WitnessMapping::Discharge(after.apply_type(d)),
+            };
+            (*from, to)
+        })
+        .collect();
+    for (from, to) in second {
+        out.entry(*from).or_insert_with(|| to.clone());
+    }
+    out
+}
+
+/// Whether a witness projected from `a` is the one projected from `b`, by the equality
+/// projections compare by: the terms' normal forms.
+fn projects_alike(a: &Rc<TypedExpr>, b: &Rc<TypedExpr>) -> bool {
+    crate::ccl::ty::WitnessProjection::new(Rc::clone(a), 0)
+        == crate::ccl::ty::WitnessProjection::new(Rc::clone(b), 0)
 }
 
 impl Subst {
@@ -338,7 +485,70 @@ impl Subst {
         Subst {
             binders: BTreeMap::new(),
             witnesses: BTreeMap::new(),
+            elims: Vec::new(),
         }
+    }
+
+    /// `unbox(𝑐)`'s action on `𝑐`'s collection type ([`Elim`]).
+    pub fn eliminating(term: Rc<TypedExpr>) -> Self {
+        Subst {
+            elims: vec![Elim::Top(term)],
+            ..Subst::id()
+        }
+    }
+
+    /// The term an [`Elim::Top`] reads its sum through, and this substitution without it.
+    /// The first [`Elim::Top`], with the rest of this substitution: an elimination inside a
+    /// kind acts on references wherever they are, so it does not stand in front of one that
+    /// waits for a function.
+    pub(crate) fn top_elim(&self) -> Option<(Rc<TypedExpr>, Subst)> {
+        let i = self.elims.iter().position(|e| matches!(e, Elim::Top(_)))?;
+        let Elim::Top(c) = &self.elims[i] else {
+            unreachable!("found an Elim::Top at {i}")
+        };
+        let mut rest = self.clone();
+        rest.elims.remove(i);
+        Some((Rc::clone(c), rest))
+    }
+
+    /// The respelling onto `kind`'s binders alone ([`Elim::Onto`]).
+    pub(crate) fn onto(kind: &Rc<crate::ccl::ty::FunKindVar>) -> Subst {
+        Subst {
+            elims: vec![Elim::Onto(Rc::clone(kind))],
+            ..Subst::id()
+        }
+    }
+
+    /// The elimination of the sum over `kind`'s binders through `term` alone ([`Elim::Kind`]).
+    pub(crate) fn kind_elim(kind: &Rc<crate::ccl::ty::FunKindVar>, term: &Rc<TypedExpr>) -> Subst {
+        Subst {
+            elims: vec![Elim::Kind(Rc::clone(kind), Rc::clone(term))],
+            ..Subst::id()
+        }
+    }
+
+    /// This substitution without its elimination: what acts on a quoted term's type slots.
+    fn without_elim(&self) -> Cow<'_, Subst> {
+        if self.elims.is_empty() {
+            return Cow::Borrowed(self);
+        }
+        // A witness half placed among the eliminations still acts on a term's type slots, in
+        // its order; the eliminations and respellings between do not.
+        let witnesses = self
+            .elims
+            .iter()
+            .filter_map(|e| match e {
+                Elim::Map(m) => Some(m),
+                _ => None,
+            })
+            .fold(self.witnesses.clone(), |acc, m| {
+                compose_witness_maps(&acc, m)
+            });
+        Cow::Owned(Subst {
+            binders: self.binders.clone(),
+            witnesses,
+            elims: Vec::new(),
+        })
     }
 
     /// A substitution on term binders alone — the ordinary case, no scope change between
@@ -347,6 +557,7 @@ impl Subst {
         Subst {
             binders,
             witnesses: BTreeMap::new(),
+            elims: Vec::new(),
         }
     }
 
@@ -403,41 +614,66 @@ impl Subst {
         if self.witnesses.is_empty() {
             return None;
         }
+        // The respellings and the witness halves among the eliminations are the α-conversion
+        // [`Self::apply_witnesses`] applies with it; one applied twice is not one applied once.
         Some(Subst {
             binders: self.binders.clone(),
             witnesses: BTreeMap::new(),
+            elims: self
+                .elims
+                .iter()
+                .filter(|e| !matches!(e, Elim::Onto(_) | Elim::Map(_)))
+                .cloned()
+                .collect(),
         })
     }
 
     /// `ty` with only this substitution's witness renaming applied.
     pub fn apply_witnesses(&self, ty: &Type) -> Type {
-        if self.witnesses.is_empty() {
+        // An elimination inside a kind acts on that kind's binders, as a witness mapping does.
+        let kind_elims: Vec<Elim> = self
+            .elims
+            .iter()
+            .filter(|e| matches!(e, Elim::Kind(..) | Elim::Onto(_) | Elim::Map(_)))
+            .cloned()
+            .collect();
+        if self.witnesses.is_empty() && kind_elims.is_empty() {
             return ty.clone();
         }
         Subst {
             binders: BTreeMap::new(),
             witnesses: self.witnesses.clone(),
+            elims: kind_elims,
         }
         .apply_type(ty)
     }
 
     /// The witness half, rendered `from -> to` per entry. Diagnostic only.
     pub fn render_witnesses(&self) -> String {
-        self.witnesses
-            .iter()
-            .map(|(from, to)| match to {
-                WitnessMapping::Rename(w) => format!("{from:?} -> {w:?}"),
-                WitnessMapping::Discharge(d) => format!("{from:?} := {d}"),
-            })
+        let render = |m: &WitnessMap| {
+            m.iter()
+                .map(|(from, to)| match to {
+                    WitnessMapping::Rename(w) => format!("{from:?} -> {w:?}"),
+                    WitnessMapping::Discharge(d) => format!("{from:?} := {d}"),
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        std::iter::once(render(&self.witnesses))
+            .chain(self.elims.iter().filter_map(|e| match e {
+                Elim::Map(m) => Some(format!("then [{}]", render(m))),
+                _ => None,
+            }))
+            .filter(|r| !r.is_empty())
             .collect::<Vec<_>>()
-            .join(", ")
+            .join("; ")
     }
 
     /// Is this the identity? Callers fast-path the common (non-dependent) case
     /// on this so that ordinary code paths are byte-identical to a world
     /// without substitutions.
     pub fn is_id(&self) -> bool {
-        self.binders.is_empty() && self.witnesses.is_empty()
+        self.binders.is_empty() && self.witnesses.is_empty() && self.elims.is_empty()
     }
 
     /// A rename `[from ↦ to]` — a bijection on binders, hence invertible.
@@ -563,6 +799,7 @@ impl Subst {
                 .map(|(k, m)| (k.clone(), m.clone()))
                 .collect(),
             witnesses: self.witnesses.clone(),
+            elims: self.elims.clone(),
         })
     }
 
@@ -592,6 +829,7 @@ impl Subst {
                 })
                 .collect(),
             witnesses: self.witnesses.clone(),
+            elims: self.elims.clone(),
         })
     }
 
@@ -614,8 +852,7 @@ impl Subst {
     /// binders and nothing else. A witness mapping always suspends, since a telescope does not
     /// list the witnesses a variable's content may name.
     fn suspended(&self, v: &Rc<crate::ccl::infer_var::InferVar>) -> Type {
-        let acts =
-            !self.witnesses.is_empty() || self.binders.keys().any(|b| v.telescope.contains(b));
+        let acts = self.suspends_on(v);
         if !acts {
             return Type::Infer(Rc::clone(v));
         }
@@ -639,16 +876,41 @@ impl Subst {
                 },
                 Mapping::Join(None) => Vec::new(),
             })
+            .chain(
+                self.elims
+                    .iter()
+                    .filter_map(Elim::term)
+                    .flat_map(|t| crate::ccl::ccl_utils::free_names(t)),
+            )
+            .chain(self.witness_mappings().flat_map(|(_, m)| match m {
+                // A discharged witness's domain is a type, and a projection in it quotes a
+                // term whose names the suspension's content then reads.
+                WitnessMapping::Discharge(t) => type_free_vars(t).into_iter().collect(),
+                WitnessMapping::Rename(_) => Vec::new(),
+            }))
             .filter(|n| n.pi_bound_index().is_none() && !n.is_elem())
             .collect();
         let telescope = v
             .telescope
             .rescoped(|n| self.binders.contains_key(n), reads);
-        let held = crate::ccl::infer_var::InferVar::fresh_over(
-            v.level(),
-            &telescope,
-            Rc::clone(&v.fun_kind),
-        );
+        // A substitution leaves what kind of function a type is alone, so the suspension shares
+        // `v`'s kind. An elimination is the exception: it reads the sum out, and what is left
+        // is a plain collection whatever `v` turns out to be, so it has a data kind of its own.
+        let kind = if self.elims.iter().any(|e| matches!(e, Elim::Top(_))) {
+            let k = crate::ccl::ty::FunKindVar::fresh();
+            k.stamp_data();
+            k
+        } else {
+            Rc::clone(&v.fun_kind)
+        };
+        let held = crate::ccl::infer_var::InferVar::fresh_over(v.level(), &telescope, kind);
+        // The suspension stands where `v` does, except outside every scope whose binders this
+        // substitution discharges: there the witness is a term, not a binder's occurrence.
+        held.inherit_witness_placement_where(v, |scope| {
+            !self
+                .witness_mappings()
+                .any(|(w, m)| matches!(m, WitnessMapping::Discharge(_)) && scope.may_bind(w))
+        });
         v.suspensions
             .borrow_mut()
             .push((self.clone(), Rc::clone(&held)));
@@ -686,9 +948,27 @@ impl Subst {
             && other.image_of(&theirs).is_disjoint(&mine)
     }
 
-    /// Whether this substitution has a witness half.
+    /// Every witness mapping this substitution performs: its own witness half's, then those of
+    /// the witness halves placed among its eliminations ([`Elim::Map`]).
+    fn witness_mappings(
+        &self,
+    ) -> impl Iterator<Item = (&crate::ccl::ty::WitnessId, &WitnessMapping)> {
+        self.witnesses.iter().chain(
+            self.elims
+                .iter()
+                .filter_map(|e| match e {
+                    Elim::Map(m) => Some(m.iter()),
+                    _ => None,
+                })
+                .flatten(),
+        )
+    }
+
+    /// Whether this substitution has a witness half: witness mappings, or eliminations of
+    /// sums through terms ([`Elim`]). Either acts on whatever sum a variable resolves to, so
+    /// no set of names below the variable bounds what it reaches.
     pub fn has_witnesses(&self) -> bool {
-        !self.witnesses.is_empty()
+        !self.witnesses.is_empty() || !self.elims.is_empty()
     }
 
     /// The names `names` become under this substitution: a renamed binder its target, a
@@ -737,6 +1017,65 @@ impl Subst {
                 Mapping::Rename(_) | Mapping::Join(None) | Mapping::Unspellable(_) => {}
             }
         }
+        // A payload is a template, so it is copied at its own identities, as a discharge's is.
+        for e in &mut self.elims {
+            let (Elim::Top(t) | Elim::Kind(_, t) | Elim::ReadBack(_, t)) = e else {
+                continue;
+            };
+            let mut copy = t.clone_preserving_ids();
+            f(&mut copy);
+            *t = Rc::new(copy);
+        }
+    }
+
+    /// This substitution with its witness half rewritten: every binder, a key or a
+    /// rename's target, through `binder`, every kind an elimination names through `kind`, and
+    /// every discharge's type through `candidate`.
+    pub fn map_witness_half(
+        &self,
+        binder: impl Fn(&crate::ccl::ty::WitnessId) -> crate::ccl::ty::WitnessId,
+        kind: impl Fn(&Rc<crate::ccl::ty::FunKindVar>) -> Rc<crate::ccl::ty::FunKindVar>,
+        mut candidate: impl FnMut(&Type) -> Type,
+    ) -> Subst {
+        let witnesses = self
+            .witnesses
+            .iter()
+            .map(|(k, v)| {
+                let v = match v {
+                    WitnessMapping::Rename(to) => WitnessMapping::Rename(binder(to)),
+                    WitnessMapping::Discharge(t) => WitnessMapping::Discharge(candidate(t)),
+                };
+                (binder(k), v)
+            })
+            .collect();
+        let elims = self
+            .elims
+            .iter()
+            .map(|e| match e {
+                Elim::Top(_) => e.clone(),
+                Elim::Kind(k, c) => Elim::Kind(kind(k), Rc::clone(c)),
+                Elim::ReadBack(k, c) => Elim::ReadBack(kind(k), Rc::clone(c)),
+                Elim::Onto(k) => Elim::Onto(kind(k)),
+                Elim::Map(m) => Elim::Map(Rc::new(
+                    m.iter()
+                        .map(|(k, v)| {
+                            let v = match v {
+                                WitnessMapping::Rename(to) => WitnessMapping::Rename(binder(to)),
+                                WitnessMapping::Discharge(t) => {
+                                    WitnessMapping::Discharge(candidate(t))
+                                }
+                            };
+                            (binder(k), v)
+                        })
+                        .collect(),
+                )),
+            })
+            .collect();
+        Subst {
+            binders: self.binders.clone(),
+            witnesses,
+            elims,
+        }
     }
 
     /// Split into the rename entries and the discharge entries — a variant
@@ -751,7 +1090,26 @@ impl Subst {
             .iter()
             .map(|(k, v)| (k.clone(), v.clone()))
             .partition(|(_, v)| matches!(v, Mapping::Rename(_)));
-        (Subst::of_binders(ren), Subst::of_binders(term))
+        // The witness half splits by the same rule: a witness rename with the renames, a
+        // witness discharge with the discharges.
+        let (witness_ren, witness_term): (BTreeMap<_, _>, BTreeMap<_, _>) = self
+            .witnesses
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .partition(|(_, v)| matches!(v, WitnessMapping::Rename(_)));
+        (
+            Subst {
+                binders: ren,
+                witnesses: witness_ren,
+                elims: Vec::new(),
+            },
+            // An elimination has no inverse, so it goes with the discharges.
+            Subst {
+                binders: term,
+                witnesses: witness_term,
+                elims: self.elims.clone(),
+            },
+        )
     }
 
     /// Equality up to the terms' *type slots* — same binders, and each pair
@@ -774,7 +1132,21 @@ impl Subst {
     /// functions with colliding argument spellings meeting at one position —
     /// the domain-join territory that O1/O4 owns anyway.)
     pub fn eq_modulo_ty_slots(&self, other: &Subst) -> bool {
-        self.binders.len() == other.binders.len()
+        // The witness half carries no captured term, so it compares exactly.
+        let elims_agree = self.elims.len() == other.elims.len()
+            && self.elims.iter().zip(&other.elims).all(|pair| match pair {
+                (Elim::Top(a), Elim::Top(b)) => crate::ccl::eq_term_modulo_ty_slots(a, b),
+                (Elim::Kind(ka, a), Elim::Kind(kb, b))
+                | (Elim::ReadBack(ka, a), Elim::ReadBack(kb, b)) => {
+                    Rc::ptr_eq(ka, kb) && crate::ccl::eq_term_modulo_ty_slots(a, b)
+                }
+                (Elim::Onto(ka), Elim::Onto(kb)) => Rc::ptr_eq(ka, kb),
+                (Elim::Map(a), Elim::Map(b)) => a == b,
+                _ => false,
+            });
+        elims_agree
+            && self.witnesses == other.witnesses
+            && self.binders.len() == other.binders.len()
             && self
                 .binders
                 .iter()
@@ -863,6 +1235,7 @@ impl Subst {
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
             witnesses: BTreeMap::new(),
+            elims: Vec::new(),
         }
     }
 
@@ -877,18 +1250,44 @@ impl Subst {
         if b.is_id() {
             return a.clone();
         }
-        let mut witnesses = a.witnesses.clone();
-        for (from, to) in &b.witnesses {
-            witnesses.entry(*from).or_insert_with(|| to.clone());
-        }
-        // Species composes from the input species, exactly as the term half below: a
-        // rename whose target `b` maps again lands wherever `b` sends it, and a discharge
-        // anywhere in the chain makes the composite a discharge.
-        for to in witnesses.values_mut() {
-            if let WitnessMapping::Rename(w) = to
-                && let Some(next) = b.witnesses.get(w)
-            {
-                *to = next.clone();
+        // A discharge in `a` puts a type where its witness stood, and `b` acts on that type,
+        // as it acts on a discharged term in the term half below.
+        let after_b = |m: &WitnessMap| -> WitnessMap {
+            m.iter()
+                .map(|(from, to)| {
+                    let to = match to {
+                        WitnessMapping::Discharge(candidate) => {
+                            WitnessMapping::Discharge(b.apply_type(candidate))
+                        }
+                        rename => rename.clone(),
+                    };
+                    (*from, to)
+                })
+                .collect()
+        };
+        let mut witnesses = after_b(&a.witnesses);
+        // **`b`'s witness half acts after `a`'s respellings**, and the two do not commute: a
+        // respelling reads a reference's position wherever it stands, so a mapping of the binder
+        // it lands on acts only after it, and a mapping of a binder it moves acts only before
+        // it. Merged in front, `b`'s witness half would act first; it is placed after `a`'s
+        // eliminations instead ([`Elim::Map`]).
+        let placed = !b.witnesses.is_empty()
+            && a.elims
+                .iter()
+                .any(|e| matches!(e, Elim::Onto(_) | Elim::Map(_)));
+        if !placed {
+            for (from, to) in &b.witnesses {
+                witnesses.entry(*from).or_insert_with(|| to.clone());
+            }
+            // Species composes from the input species, exactly as the term half below: a
+            // rename whose target `b` maps again lands wherever `b` sends it, and a discharge
+            // anywhere in the chain makes the composite a discharge.
+            for to in witnesses.values_mut() {
+                if let WitnessMapping::Rename(w) = to
+                    && let Some(next) = b.witnesses.get(w)
+                {
+                    *to = next.clone();
+                }
             }
         }
         let mut keys: BTreeSet<Binder> = a.binders.keys().cloned().collect();
@@ -937,9 +1336,66 @@ impl Subst {
                 m.insert(k, composed);
             }
         }
+        // An elimination in `a` reads its sum through a term `b` then acts on; those in `b` act
+        // on what `a` produced, so they follow.
+        //
+        // **An elimination and its read-back through one term compose to the later one.** A
+        // read-back `b` eliminates again takes `σᵢ(𝑐)` to `σᵢ` and back, so the pair is the
+        // elimination; an elimination `b` reads back takes `σᵢ` to `σᵢ(𝑐)` and back, so the pair
+        // is the read-back. Kept as the pair, the two would undo each other at every reader.
+        let undone_by_b = |e: &Elim| {
+            b.elims.iter().any(|later| match (e, later) {
+                (Elim::ReadBack(k, c), Elim::Kind(k2, c2))
+                | (Elim::Kind(k, c), Elim::ReadBack(k2, c2)) => {
+                    Rc::ptr_eq(k, k2) && projects_alike(c, c2)
+                }
+                _ => false,
+            })
+        };
+        let elims: Vec<Elim> = a
+            .elims
+            .iter()
+            .map(|e| match e {
+                Elim::Map(m) => Elim::Map(Rc::new(after_b(m))),
+                e => e.map_term(|t| b.without_elim().apply_expr(t)),
+            })
+            .filter(|e| !undone_by_b(e))
+            .chain(placed.then(|| Elim::Map(Rc::new(b.witnesses.clone()))))
+            .chain(b.elims.iter().cloned())
+            .fold(Vec::new(), |mut out: Vec<Elim>, e| {
+                // **Two respellings within one kind component compose to the later.** Each
+                // reads the position where the reference stands, and the earlier writes the
+                // reference at the position it read, so the later reads the same position
+                // either way. Kept, a chain of edges through one component leaves a
+                // substitution per path, and each records the same bound again. A witness
+                // half between the two reads what the earlier wrote, so the earlier stays.
+                if let Elim::Onto(k) = &e {
+                    let from = out
+                        .iter()
+                        .rposition(|p| matches!(p, Elim::Map(_)))
+                        .map_or(0, |i| i + 1);
+                    let mut i = from;
+                    while i < out.len() {
+                        if matches!(&out[i], Elim::Onto(k2) if k.same_component(k2)) {
+                            out.remove(i);
+                        } else {
+                            i += 1;
+                        }
+                    }
+                }
+                // Two witness halves in a row are one.
+                if let (Elim::Map(later), Some(Elim::Map(earlier))) = (&e, out.last()) {
+                    let composed = compose_witness_maps(earlier, later);
+                    *out.last_mut().expect("matched a last entry") = Elim::Map(Rc::new(composed));
+                    return out;
+                }
+                out.push(e);
+                out
+            });
         Subst {
             binders: m,
             witnesses,
+            elims,
         }
     }
 
@@ -1014,7 +1470,12 @@ impl Subst {
                 (k.clone(), v)
             })
             .collect();
-        Subst::of_binders(m)
+        // The license reads term discharges only; the witness half is carried as it is.
+        Subst {
+            binders: m,
+            witnesses: self.witnesses.clone(),
+            elims: self.elims.clone(),
+        }
     }
 
     /// Invert a **rename** (every entry a [`Mapping::Rename`], distinct
@@ -1033,6 +1494,9 @@ impl Subst {
     /// transport never inverts a discharge — the closure bridge panics on the
     /// unbridgeable corner instead.
     pub fn invert(&self) -> Option<Subst> {
+        if !self.elims.is_empty() {
+            return None; // an elimination has no inverse
+        }
         let mut m = BTreeMap::new();
         let mut seen = BTreeSet::new();
         for (k, v) in &self.binders {
@@ -1044,7 +1508,24 @@ impl Subst {
             }
             m.insert(to.clone(), Mapping::Rename(k.clone()));
         }
-        Some(Subst::of_binders(m))
+        // The witness half inverts by the same rule: a rename is a bijection, a discharge
+        // has no inverse.
+        let mut witnesses = BTreeMap::new();
+        let mut seen_witnesses = BTreeSet::new();
+        for (k, v) in &self.witnesses {
+            let WitnessMapping::Rename(to) = v else {
+                return None;
+            };
+            if !seen_witnesses.insert(*to) {
+                return None;
+            }
+            witnesses.insert(*to, WitnessMapping::Rename(*k));
+        }
+        Some(Subst {
+            binders: m,
+            witnesses,
+            elims: Vec::new(),
+        })
     }
 
     /// Apply this substitution to a **term**. Capture-avoiding: it shadows the
@@ -1057,6 +1538,9 @@ impl Subst {
     /// catch. (That check accordingly demotes to a debug assert — see
     /// `check_scope_valid`.)
     pub fn apply_expr(&self, e: &TypedExpr) -> TypedExpr {
+        if !self.elims.is_empty() {
+            return self.without_elim().apply_expr(e);
+        }
         // Both early returns build a term the caller owns while `e` stays live in
         // whatever tree holds it, so the result is a genuinely new node even
         // though the substitution changed nothing. It freshens and is **recorded**
@@ -1103,6 +1587,9 @@ impl Subst {
     /// suspend on the variable ([`Self::suspended`]): what the variable resolves to may name a
     /// binder no free-name walk can see yet.
     fn acts_on(&self, e: &TypedExpr) -> bool {
+        if !self.elims.is_empty() {
+            return self.without_elim().acts_on(e);
+        }
         if self.binders.keys().any(|k| is_free(k, e)) {
             return true;
         }
@@ -1171,7 +1658,172 @@ impl Subst {
 
     /// Whether this substitution acts on what `v` may resolve to ([`Self::suspended`]).
     fn suspends_on(&self, v: &crate::ccl::infer_var::InferVar) -> bool {
-        !self.witnesses.is_empty() || self.binders.keys().any(|b| v.telescope.contains(b))
+        // The witness half acts only on a variable a binder of the mapped witness scopes over
+        // ([`crate::ccl::infer_var::InferVar::may_name_witness`]), as the name half acts
+        // only on one whose telescope holds a binder it maps.
+        // A respelling acts only on a variable a binder of its kind's component scopes over.
+        self.elims.iter().any(|e| {
+            !matches!(e, Elim::Onto(_) | Elim::Map(_)) || v.in_witness_scope(|s| e.acts_in(s))
+        }) || self.witnesses.keys().any(|w| v.may_name_witness(w))
+            || self.binders.keys().any(|b| v.telescope.contains(b))
+    }
+
+    /// This substitution with every discharge removed that cannot act on `v`: a term binder
+    /// outside `v`'s telescope, or a witness no binder of `v`'s witness scopes may bind. `v`
+    /// resolves to types naming those binders and nothing else
+    /// (`src/ccl/design/type-inference.md`, "The invariant"), so such a discharge leaves whatever
+    /// `v` resolves to unchanged, and dropping it is exact.
+    pub(crate) fn without_vacuous_discharges(&self, v: &crate::ccl::infer_var::InferVar) -> Subst {
+        Subst {
+            binders: self
+                .binders
+                .iter()
+                .filter(|(k, m)| matches!(m, Mapping::Rename(_)) || v.telescope.contains(k))
+                .map(|(k, m)| (k.clone(), m.clone()))
+                .collect(),
+            witnesses: self
+                .witnesses
+                .iter()
+                .filter(|(w, m)| matches!(m, WitnessMapping::Rename(_)) || v.may_name_witness(w))
+                .map(|(w, m)| (*w, m.clone()))
+                .collect(),
+            elims: self.elims.clone(),
+        }
+    }
+
+    /// What each entry's image reads, for carrying many name sets through this substitution
+    /// ([`ImageTable::image`]).
+    pub(crate) fn image_table(&self) -> ImageTable {
+        let image = |m: &Mapping| -> BTreeSet<Name> {
+            match m {
+                Mapping::Rename(to) => BTreeSet::from([to.clone()]),
+                Mapping::Discharge(t) | Mapping::Join(Some(t)) => {
+                    crate::ccl::ccl_utils::free_names(t).into_iter().collect()
+                }
+                Mapping::Join(None) => BTreeSet::new(),
+                Mapping::Unspellable(inner) => match &**inner {
+                    Mapping::Rename(to) => BTreeSet::from([to.clone()]),
+                    Mapping::Discharge(t) | Mapping::Join(Some(t)) => {
+                        crate::ccl::ccl_utils::free_names(t).into_iter().collect()
+                    }
+                    Mapping::Join(None) | Mapping::Unspellable(_) => BTreeSet::new(),
+                },
+            }
+        };
+        ImageTable {
+            names: self
+                .binders
+                .iter()
+                .map(|(k, m)| (k.clone(), image(m)))
+                .collect(),
+            witnesses: self
+                .witness_mappings()
+                .map(|(k, m)| {
+                    let (names, witnesses) = match m {
+                        WitnessMapping::Rename(to) => (BTreeSet::new(), BTreeSet::from([*to])),
+                        WitnessMapping::Discharge(t) => (
+                            type_free_vars(t),
+                            crate::ccl::ty::witness_references(t).into_iter().collect(),
+                        ),
+                    };
+                    (*k, (names, witnesses))
+                })
+                .collect(),
+        }
+    }
+
+    /// The witnesses this substitution maps, an elimination's kind's binders included.
+    pub(crate) fn mapped_witnesses(&self) -> BTreeSet<crate::ccl::ty::WitnessId> {
+        let mut out: BTreeSet<_> = self.witnesses.keys().copied().collect();
+        for e in &self.elims {
+            match e {
+                Elim::Kind(k, _) => out.extend(k.binder_ids()),
+                Elim::Onto(k) => out.extend(k.component_binder_ids()),
+                Elim::Map(m) => out.extend(m.keys().copied()),
+                Elim::Top(_) | Elim::ReadBack(..) => {}
+            }
+        }
+        out
+    }
+
+    /// The witness `w` is under this substitution's [`Elim::Kind`] entries, where one of their
+    /// kinds binds it: the witness its term carries at that position. A sum related to the
+    /// kind by a kind edge binds the same positions, and its binder's occurrences may arrive
+    /// before the correspondence respells them ([`crate::ccl::ty::FunKindVar::may_bind`]).
+    ///
+    /// A respelling ([`Elim::Onto`]) acts in order with them: what reaches an elimination is
+    /// the binder the respellings before it put there.
+    fn eliminated_witness(&self, w: &crate::ccl::ty::WitnessId) -> Option<Type> {
+        let mut at = *w;
+        for e in &self.elims {
+            match e {
+                Elim::Kind(k, c) => {
+                    if let Some(i) = k.binder_position(&at) {
+                        return Some(Type::WitnessProjection(
+                            crate::ccl::ty::WitnessProjection::new(Rc::clone(c), i),
+                        ));
+                    }
+                }
+                // A position past the kind's arity is never bound, so a reference there is
+                // not one of its binders.
+                Elim::Onto(k) => {
+                    if let Some(i) = k.binder_position(&at)
+                        && k.arity().is_none_or(|n| i < n)
+                    {
+                        at = k.binder_id_at(i);
+                    }
+                }
+                // A discharge's domain is already read under what follows it ([`Subst::then`]).
+                Elim::Map(m) => match m.get(&at) {
+                    Some(WitnessMapping::Rename(to)) => at = *to,
+                    Some(WitnessMapping::Discharge(d)) => return Some(d.clone()),
+                    None => {}
+                },
+                Elim::Top(_) | Elim::ReadBack(..) => {}
+            }
+        }
+        (at != *w).then_some(Type::WitnessRef(at))
+    }
+
+    /// The binder `p` reads back as ([`Elim::ReadBack`]), where an entry reads its term back.
+    pub(crate) fn read_back(&self, p: &crate::ccl::ty::WitnessProjection) -> Option<Type> {
+        self.elims.iter().find_map(|e| match e {
+            Elim::ReadBack(k, c) if projects_alike(&p.term, c) => k
+                .binder_ids()
+                .get(p.position)
+                .copied()
+                .map(Type::WitnessRef),
+            _ => None,
+        })
+    }
+
+    /// [`Elim::ReadBack`] of every [`Elim::Kind`] this substitution performs whose kind's arity
+    /// is known: what reads a type in the frame these eliminations act on back in the frame
+    /// they act from.
+    pub(crate) fn read_backs(&self) -> Subst {
+        Subst {
+            elims: self
+                .elims
+                .iter()
+                .filter_map(|e| match e {
+                    Elim::Kind(k, c) if k.arity().is_some() => {
+                        Some(Elim::ReadBack(Rc::clone(k), Rc::clone(c)))
+                    }
+                    _ => None,
+                })
+                .collect(),
+            ..Subst::id()
+        }
+    }
+
+    /// Whether this substitution eliminates the sum of whatever it reaches ([`Elim::Top`]).
+    pub(crate) fn eliminates_top(&self) -> bool {
+        self.elims.iter().any(|e| matches!(e, Elim::Top(_)))
+    }
+
+    /// Whether the witness half maps `w`.
+    pub(crate) fn maps_witness(&self, w: &crate::ccl::ty::WitnessId) -> bool {
+        self.witness_mappings().any(|(k, _)| k == w)
     }
 
     fn apply_expr_inner(&self, e: &TypedExpr) -> TypedExpr {
@@ -1394,6 +2046,9 @@ impl Subst {
     /// the function type's `FunKind` and Pi binder are preserved, since those belong to
     /// the composition and not to its elements.
     pub fn rewrite_expr(&self, e: &mut TypedExpr) {
+        if !self.elims.is_empty() {
+            return self.without_elim().rewrite_expr(e);
+        }
         if self.is_id() {
             return;
         }
@@ -1743,6 +2398,9 @@ impl Subst {
     /// refinement — `g(0)` vs `g(1)` — rewrite to structurally distinct
     /// predicates and stay distinguished for the same reason (O4).
     pub fn force_refinement(&self, r: &crate::ccl::Refinement) -> crate::ccl::Refinement {
+        if !self.elims.is_empty() {
+            return self.without_elim().force_refinement(r);
+        }
         if self.is_id() {
             return r.clone();
         }
@@ -1857,11 +2515,21 @@ impl Subst {
     /// binder itself, so carrying the entry on renames occurrences of a bound name to a
     /// sibling scope's spelling and the function binds a name its own domain no longer says.
     pub fn shadow_witnesses(&self, ids: &[crate::ccl::ty::WitnessId]) -> Subst {
-        if ids.iter().all(|id| !self.witnesses.contains_key(id)) {
+        if ids.iter().all(|id| !self.maps_witness(id)) {
             return self.clone();
         }
         let mut out = self.clone();
         out.witnesses.retain(|k, _| !ids.contains(k));
+        for e in &mut out.elims {
+            if let Elim::Map(m) = e {
+                *m = Rc::new(
+                    m.iter()
+                        .filter(|(k, _)| !ids.contains(k))
+                        .map(|(k, v)| (*k, v.clone()))
+                        .collect(),
+                );
+            }
+        }
         out
     }
 
@@ -1902,7 +2570,68 @@ impl Subst {
         with_transport_memo(|| self.apply_type_inner(ty))
     }
 
+    /// [`Elim::Top`] reaching `ty`: the outermost function of `ty` is the sum read through the
+    /// term. A settled sum's binders are discharged to the witnesses the value carries, which
+    /// opens the slot; a function whose funkind is a variable carries the elimination to its
+    /// kind's binders and is plain; a variable suspends. Anything else is not a collection,
+    /// and nothing is eliminated.
+    fn eliminate_top(&self, c: &Rc<TypedExpr>, rest: &Subst, ty: &Type) -> Type {
+        use crate::ccl::ty::FunKind;
+        let rest = rest.clone();
+        match ty {
+            Type::Infer(v) => self.suspended(v),
+            Type::Refinement(base, _) => match rest.apply_type_inner(ty) {
+                Type::Refinement(_, refinements) => {
+                    Type::Refinement(Box::new(self.eliminate_top(c, &rest, base)), refinements)
+                }
+                other => other,
+            },
+            Type::Fun {
+                fun_kind: FunKind::Data(Some(ws)),
+                ..
+            } => {
+                let mut discharging = rest;
+                for (i, w) in ws.iter().enumerate() {
+                    discharging.witnesses.insert(
+                        *w.id(),
+                        WitnessMapping::Discharge(Type::WitnessProjection(
+                            crate::ccl::ty::WitnessProjection::new(Rc::clone(c), i),
+                        )),
+                    );
+                }
+                discharging.apply_type_inner(ty)
+            }
+            Type::Fun {
+                fun_kind: FunKind::Var(k),
+                ..
+            } => {
+                let mut into_kind = rest;
+                into_kind
+                    .elims
+                    .insert(0, Elim::Kind(Rc::clone(k), Rc::clone(c)));
+                match into_kind.apply_type_inner(ty) {
+                    Type::Fun {
+                        name,
+                        domain,
+                        codomain,
+                        ..
+                    } => Type::Fun {
+                        name,
+                        fun_kind: FunKind::Data(None),
+                        domain,
+                        codomain,
+                    },
+                    other => other,
+                }
+            }
+            _ => rest.apply_type_inner(ty),
+        }
+    }
+
     fn apply_type_inner(&self, ty: &Type) -> Type {
+        if let Some((c, rest)) = self.top_elim() {
+            return self.eliminate_top(&c, &rest, ty);
+        }
         match ty {
             Type::BoundedHole(t) => Type::BoundedHole(Box::new(self.apply_type_inner(t))),
             Type::Base(_)
@@ -1920,23 +2649,37 @@ impl Subst {
             // binder of the sum it was written under; where this substitution records a
             // change of that scope, the reference is respelled in the target's — carrying
             // the target's own handle, so the kind it reports is the target binder's.
+            //
+            // A binder of a kind being eliminated is the witness the value carries, and the
+            // eliminations act on what the witness half leaves: a rename into such a kind's
+            // binder arrives at the elimination. Which binders a kind's are is known only once
+            // its arity is, so composition cannot fold the two together.
             Type::WitnessRef(w) => match self.witnesses.get(w) {
-                Some(WitnessMapping::Rename(to)) => Type::WitnessRef(*to),
+                Some(WitnessMapping::Rename(to)) => {
+                    self.eliminated_witness(to).unwrap_or(Type::WitnessRef(*to))
+                }
                 Some(WitnessMapping::Discharge(candidate)) => candidate.clone(),
-                None => ty.clone(),
+                None => self.eliminated_witness(w).unwrap_or_else(|| ty.clone()),
             },
 
             // The projected sum is a term the type quotes: substituted as a term, so a binder
             // the projection leaves projects that binder's definition. A substitution acting
             // on nothing in it keeps the `Rc`.
             Type::WitnessProjection(p) => {
-                if !self.acts_on(&p.term) {
-                    return ty.clone();
+                let p = if self.acts_on(&p.term) {
+                    crate::ccl::ty::WitnessProjection::new(
+                        Rc::new(self.apply_expr(&p.term)),
+                        p.position,
+                    )
+                } else {
+                    p.clone()
+                };
+                // Read back, the projection is a binder of the holder's function, which the
+                // substitution's witness half and eliminations act on as on any reference.
+                match self.read_back(&p) {
+                    Some(binder) => self.apply_witnesses(&binder),
+                    None => Type::WitnessProjection(p),
                 }
-                Type::WitnessProjection(crate::ccl::ty::WitnessProjection::new(
-                    Rc::new(self.apply_expr(&p.term)),
-                    p.position,
-                ))
             }
 
             // rename the named defer binder, mirroring the
@@ -2034,6 +2777,40 @@ impl Subst {
     /// `kind` with this substitution applied to each slot witness: the binder itself where
     /// the substitution renames it, and its kind's children either way — a substitution
     /// rewrites *predicates*, and a candidate domain's refinement carries them.
+    /// What this substitution does to a sum's own binder `w`, as it does to `w`'s references:
+    /// its witness half, then its respellings and the witness halves among its eliminations, in
+    /// order. An elimination proper reads the sum out rather than renaming its binder
+    /// ([`Self::eliminate_top`]), so it is not among them.
+    fn binder_mapping(&self, w: &crate::ccl::ty::WitnessId) -> Option<WitnessMapping> {
+        let mut at = match self.witnesses.get(w) {
+            Some(WitnessMapping::Discharge(d)) => {
+                return Some(WitnessMapping::Discharge(d.clone()));
+            }
+            Some(WitnessMapping::Rename(to)) => *to,
+            None => *w,
+        };
+        for e in &self.elims {
+            match e {
+                Elim::Onto(k) => {
+                    if let Some(i) = k.binder_position(&at)
+                        && k.arity().is_none_or(|n| i < n)
+                    {
+                        at = k.binder_id_at(i);
+                    }
+                }
+                Elim::Map(m) => match m.get(&at) {
+                    Some(WitnessMapping::Discharge(d)) => {
+                        return Some(WitnessMapping::Discharge(d.clone()));
+                    }
+                    Some(WitnessMapping::Rename(to)) => at = *to,
+                    None => {}
+                },
+                Elim::Top(_) | Elim::Kind(..) | Elim::ReadBack(..) => {}
+            }
+        }
+        (at != *w).then_some(WitnessMapping::Rename(at))
+    }
+
     fn apply_fun_kind(&self, fun_kind: &crate::ccl::ty::FunKind) -> crate::ccl::ty::FunKind {
         use crate::ccl::ty::FunKind;
         match fun_kind {
@@ -2046,7 +2823,7 @@ impl Subst {
                     .iter()
                     .filter(|w| {
                         !matches!(
-                            self.witnesses.get(w.id()),
+                            self.binder_mapping(w.id()),
                             Some(WitnessMapping::Discharge(_))
                         )
                     })
@@ -2056,8 +2833,8 @@ impl Subst {
                         // a body that spells another — a sum whose binder its own domain no
                         // longer says. A *discharge* is the other half and drops the binder
                         // outright, above.
-                        let w = match self.witnesses.get(w.id()) {
-                            Some(WitnessMapping::Rename(to)) => w.renamed(*to),
+                        let w = match self.binder_mapping(w.id()) {
+                            Some(WitnessMapping::Rename(to)) => w.renamed(to),
                             _ => w.clone(),
                         };
                         // A candidate is a domain the sum may take, so a joined binder's
@@ -2120,37 +2897,29 @@ pub fn type_free_vars(ty: &Type) -> BTreeSet<Binder> {
     out
 }
 
-/// Collect the free term-variable names of one refinement's predicate — the
-/// per-refinement counterpart of [`type_free_vars`], for a caller deciding
-/// which refinements of a set name a given binder.
-///
-/// The refinement binds [`Name::elem`] over its base, so `__elem` is bound, not
-/// free, inside the predicate.
-/// Whether an inference variable occurs in one of `e`'s type slots, at any depth, the
-/// predicates their refinements carry included.
-pub(crate) fn holds_infer_var(e: &TypedExpr) -> bool {
-    fn in_expr(e: &TypedExpr, visited: &mut HashSet<PredicateId>) -> bool {
-        let mut found = false;
-        e.walk_type_slots(|t| found |= !found && in_type(t, visited));
-        e.walk_children(|c| found |= !found && in_expr(c, visited));
-        found
+/// The binders the inference variables in `e`'s type slots may resolve to types naming, at
+/// any depth, the predicates their refinements carry included: each variable's telescope,
+/// lexical entries and opaque binders both (`Subst::suspended`).
+pub(crate) fn infer_var_scopes(e: &TypedExpr) -> BTreeSet<Name> {
+    fn in_expr(e: &TypedExpr, visited: &mut HashSet<PredicateId>, out: &mut BTreeSet<Name>) {
+        e.walk_type_slots(|t| in_type(t, visited, out));
+        e.walk_children(|c| in_expr(c, visited, out));
     }
-    fn in_type(ty: &Type, visited: &mut HashSet<PredicateId>) -> bool {
-        match ty {
-            Type::Infer(_) => true,
-            _ => {
-                ty.refinements()
-                    .iter()
-                    .any(|r| visited.insert(r.predicate_id()) && in_expr(&r.predicate, visited))
-                    || {
-                        let mut found = false;
-                        ty.walk_children(|c| found |= !found && in_type(c, visited));
-                        found
-                    }
+    fn in_type(ty: &Type, visited: &mut HashSet<PredicateId>, out: &mut BTreeSet<Name>) {
+        if let Type::Infer(v) = ty {
+            v.telescope.extend_with_accounted(out);
+            return;
+        }
+        for r in ty.refinements() {
+            if visited.insert(r.predicate_id()) {
+                in_expr(&r.predicate, visited, out);
             }
         }
+        ty.walk_children(|c| in_type(c, visited, out));
     }
-    in_expr(e, &mut HashSet::new())
+    let mut out = BTreeSet::new();
+    in_expr(e, &mut HashSet::new(), &mut out);
+    out
 }
 
 /// Whether a refinement predicate in one of `e`'s type slots, at any depth, names one of
@@ -2175,6 +2944,12 @@ fn refinement_reads_any(
     found
 }
 
+/// Collect the free term-variable names of one refinement's predicate — the
+/// per-refinement counterpart of [`type_free_vars`], for a caller deciding
+/// which refinements of a set name a given binder.
+///
+/// The refinement binds [`Name::elem`] over its base, so `__elem` is bound, not
+/// free, inside the predicate.
 pub fn refinement_free_vars(r: &crate::ccl::Refinement) -> BTreeSet<Binder> {
     let mut out = BTreeSet::new();
     let mut bound = BTreeSet::new();
@@ -2766,7 +3541,7 @@ thread_local! {
 /// through its walk for the same reason: a predicate shared across the type slots of the term
 /// being substituted stays shared in the result (`src/ccl/design/type-inference.md`, "Sharing
 /// is an invariant, not an optimization detail").
-fn with_transport_memo<R>(f: impl FnOnce() -> R) -> R {
+pub(crate) fn with_transport_memo<R>(f: impl FnOnce() -> R) -> R {
     if TRANSPORT_MEMO.with(|m| m.borrow().is_some()) {
         return f();
     }
@@ -3350,6 +4125,20 @@ impl RefinementScope {
         );
         out
     }
+
+    /// [`close`](Self::close) for a witness projection's quoted term.
+    pub(crate) fn close_projection(
+        &mut self,
+        p: &crate::ccl::ty::WitnessProjection,
+    ) -> crate::ccl::ty::WitnessProjection {
+        if self.enclosing.iter().all(Option::is_none) {
+            return p.clone();
+        }
+        let mut walk = PiWalk::new(PiMode::Close(&self.enclosing));
+        let mut out = p.clone();
+        walk.quoted(&mut out, 0);
+        out
+    }
 }
 
 /// Counts [`Subst::assert_no_capture`] calls, so a test can assert *how many
@@ -3889,6 +4678,59 @@ mod tests {
             Some(1),
             "the binder slot stays the composition's own; got `{}`",
             out.ty
+        );
+    }
+
+    /// Two kinds related by a kind edge, a kind unrelated to both, and the binder each states at
+    /// position 0: `κ`'s, the related kind's, and the unrelated one's.
+    fn respelling_kinds() -> (
+        Rc<crate::ccl::ty::FunKindVar>,
+        crate::ccl::ty::WitnessId,
+        crate::ccl::ty::WitnessId,
+        crate::ccl::ty::WitnessId,
+    ) {
+        use crate::ccl::ty::{FunKind, FunKindVar};
+        let k = FunKindVar::fresh();
+        let related = FunKindVar::fresh();
+        k.record(FunKind::Var(Rc::clone(&related)), true);
+        let unrelated = FunKindVar::fresh();
+        let (own, theirs, outside) = (
+            k.binder_id_at(0),
+            related.binder_id_at(0),
+            unrelated.binder_id_at(0),
+        );
+        (k, own, theirs, outside)
+    }
+
+    /// A witness half composed after a respelling acts on what the respelling wrote: after
+    /// `onto κ`, `[κ₀ ↦ t]` sends a binder related to `κ` at position 0 to `t`, by way of `κ₀`.
+    /// Merged in front of the respelling, it would leave the related binder at `κ₀`.
+    #[test]
+    fn a_witness_half_composed_after_a_respelling_acts_after_it() {
+        let (k, own, theirs, outside) = respelling_kinds();
+        let composed = Subst::then(&Subst::onto(&k), &Subst::rename_witness(&own, &outside));
+        for from in [theirs, own] {
+            assert_eq!(
+                composed.apply_type(&Type::WitnessRef(from)),
+                Type::WitnessRef(outside),
+                "`{from:?}` is respelled to `κ`'s binder, which the later witness half maps",
+            );
+        }
+    }
+
+    /// A respelling after a witness half that read an earlier one's output does not replace the
+    /// earlier one: `onto κ`, `[κ₀ ↦ t]`, `onto κ` sends the related binder to `t`, which the
+    /// second respelling leaves where it is, being outside `κ`'s component.
+    #[test]
+    fn two_respellings_with_a_witness_half_between_stay_two() {
+        let (k, own, theirs, outside) = respelling_kinds();
+        let composed = Subst::then(
+            &Subst::then(&Subst::onto(&k), &Subst::rename_witness(&own, &outside)),
+            &Subst::onto(&k),
+        );
+        assert_eq!(
+            composed.apply_type(&Type::WitnessRef(theirs)),
+            Type::WitnessRef(outside)
         );
     }
 

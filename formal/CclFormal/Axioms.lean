@@ -58,13 +58,9 @@ than only in the build log.
 #guard_msgs in
 #print axioms CclFormal.Admits.mono
 
-/-- info: 'CclFormal.not_admits_of_refuses' depends on axioms: [propext, Quot.sound] -/
+/-- info: 'CclFormal.admitsCheck_iff_admits' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs in
-#print axioms CclFormal.not_admits_of_refuses
-
-/-- info: 'CclFormal.a_bound_admits_what_equality_refuses' depends on axioms: [propext, Quot.sound] -/
-#guard_msgs in
-#print axioms CclFormal.a_bound_admits_what_equality_refuses
+#print axioms CclFormal.admitsCheck_iff_admits
 
 /-- info: 'CclFormal.ContainedIn.trans' depends on axioms: [propext, Classical.choice, Quot.sound] -/
 #guard_msgs in

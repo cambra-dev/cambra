@@ -634,6 +634,8 @@ its entry is removed when that visit returns. A bound graph shares variables fre
 constraining `?a <: ?b` copies `?a`'s lower bounds onto `?b`, so `?b` reaches `?a`'s bounds
 twice, and each level of a nested type doubles the walk. `CompactState::memo` keeps what each
 variable compacted to, so a walk reads a variable once rather than once per path that reaches it.
+An invariant data domain draws both edges between two variables, so cycles of variables are
+ordinary ([Data domains are invariant](#data-domains-are-invariant)).
 
 A result depends on more than the variable, and the memo's key holds the rest: the polarity, the
 binders the refinement-closing runs against (`st.scope`), whether the walk is at the position
@@ -641,11 +643,15 @@ binders the refinement-closing runs against (`st.scope`), whether the walk is at
 substitution, `subst_acc`, which the key leaves out. A result is stored and reused only where
 that substitution acts on none of the names the walk below the variable can reach
 (`consulted_below`), where it leaves the walk as the identity does. Those names are the free
-names of every refinement below the variable, each spelled through the substitutions of the
-bounds between, along the bounds `compact_go` follows: the polarity-correct side, the opposite
-side where it may be read, and a barrier variable's lowers. A cycle back through a renaming
-edge closes them under its images (`close_under_cycles`). A substitution with a witness half,
-or a variable whose names are not known, bypasses the memo.
+names of every refinement below the variable, and the telescope of every variable a refinement's
+predicate holds, through whose binders alone a substitution reaches what that variable resolves
+to (`Subst::suspended`). Each is spelled through the substitutions of the bounds between, along
+the bounds `compact_go` follows: the polarity-correct side, the opposite side where it may be
+read, and a barrier variable's lowers. A cycle back through a renaming edge closes them under its
+images (`close_under_cycles`). A variable's names are kept with the cycles its read cut back to
+variables entered before it (`Consulted::cuts`), and reused where each of those is again being
+read, which records those cycles again. A substitution with a witness half, or a variable whose
+names are not known, bypasses the memo.
 
 A result can also depend on the path through the cycles its walk cut back to variables entered
 before it. It is stored only where each such cut was spurious, and it records them
@@ -932,6 +938,30 @@ already materialized types. Constraining that concrete result against another li
 stronger operation and can reject a use whose own clone would have coalesced compatibly.
 A separate non-recording subsumption check is not implemented for this purpose.
 
+#### A specialization stands where its types are in scope
+
+A use instantiates the binding's scheme at the use site's telescope, with the binders the
+definition's own variables stood under inside the definition entered after it
+(`FreshenCache::use_telescope`). An argument whose type reads a binder entered between the
+definition and the use flows into the instance: a definition applied to a group, whose domain
+reads the group's key.
+
+A specialization typed at such an instance reads that binder, so it cannot stand where the
+definition does. `specialize_use` places it under the innermost binder between the definition and
+the use that the resolved instance or an argument reaching it reads (`argument_reads`). The pin
+gives the clone each argument's type, so an argument whose candidates meet its parameter's kind at
+none, which leaves the resolved instance reading less, still places the clone where its membership
+is decided. Its variables stand where the definition's did, with
+every binder from the definition to that one entered (`FreshenCache::entered_binders`), and the
+walk of the clone sees those binders as in scope, so a use inside the clone that reads one of them
+is placed there too. The clone is recorded on `CoalesceCtx::placed` with its binder. The walk
+leaving the binder's body splices the clones placed under it around that body (`splice_placed`),
+outermost first in the order they were made, so a clone that a later one calls encloses it. Uses
+under the same binder share a placed clone by the rules a definition-site clone is shared by. A
+binder whose scope is not one body, a `match` pattern's or a `letrec`'s, takes no placed clone:
+placing one there panics. A use whose instance reads no such binder is specialized at the
+definition, as before.
+
 #### Coalesce ordering and read stability
 
 Specialization runs during coalescing so that parents consume specialized child types on their
@@ -1160,6 +1190,12 @@ The key also preserves distinctions needed by code generation, including functio
 kind, and witness/kind shape. It does not use fresh inference-variable identities as a substitute
 for those distinctions.
 
+A sum keys the kinds its binders range over. A kind variable states none, so each of its positions
+keys what reaches it, by the relations `var_binder_kind` reads (`key_var_binder` in
+`solver/spec_key.rs`). Without them, two uses whose sums range over different domains share a
+clone typed over one of them (`a_data_function_type_admits_both_collections` in
+`tests/it/compilation_pipeline/type_annotations.rs`).
+
 ##### A use the key does not determine shares no clone
 
 A clone may be shared only where the key determines it. A clone's pins give each variable its
@@ -1293,12 +1329,18 @@ while a type's copy keeps its lambdas. The normal form is the spelling every suc
 - an applied `cast` reads its value, since a cast re-views a collection's domain and leaves what
   it holds at a key unchanged;
 - an applied eliminated combinator reads back to the term it stands for: `id`, `const`, a `zip`
-  pairing, `apply`, an operator, a chain, `curry` and `uncurry`;
+  pairing, `apply`, a binary or unary operator, a chain, `curry` and `uncurry`;
+- an applied value `Case` that lambda elimination fanned out over its input,
+  `𝑥 ▷ (⊔ᵢ (π̂ᵢ ▷ filter_values ≫ 𝑒ᵢ))`, reads back as `{ 𝑔ᵢ → 𝑥 ▷ 𝑒ᵢ }`. Leg `𝑖` filters by
+  the first-match predicate `π̂ᵢ = 𝑔ᵢ ∧ ¬𝑔₀ ∧ … ∧ ¬𝑔ᵢ₋₁`, and peeling the earlier guards off it
+  leaves `𝑔ᵢ`. A type quoting a conditional chosen per row then compares equal to the point-free
+  definition lambda elimination wrote for it;
 - an applied staged form reads as what it stages. Planning writes `curry(𝑔)` over a dependent
   domain as `(𝐹, 𝑔) ▷ curry_over`, which reads as `curry(𝑔)`, and a filter as `𝑚 ▷ filter_values`,
   the identity restricted to what `𝑚` keeps, which reads as `id`. A correlated site's keys and
   pairing read the same way: `𝑝 ▷ iterate`, an iteration source narrowed by a filter
-  (`𝑢 ▷ (𝑝 ▷ restrict)`) and `𝑐 ▷ map_domain` map each key to itself, `𝑎 ▷ (𝑓 ▷ strength_over)`
+  (`𝑢 ▷ (𝑝 ▷ restrict)`) and `𝑐 ▷ map_domain` map each key to itself, so a chain `iterate ≫ 𝑓`
+  reads as `𝑓` unapplied too, `𝑎 ▷ (𝑓 ▷ strength_over)`
   is `λ 𝑘 → (𝑎, 𝑘 ▷ (𝑎 ▷ 𝑓))`, and `𝑥 ▷ (𝑐 ▷ map(𝑔))` is `(𝑥 ▷ 𝑐) ▷ 𝑔`. An application reaches
   only keys in its function's domain, so no restriction changes the value
   read, and a type that reads a definition planning restaged still compares equal to the copy
@@ -1968,21 +2010,14 @@ collection it walks. The forward annotation constraint alone places one bound at
 domain position; it does not establish equality between all domains mentioning that variable.
 
 The variable a shared hole normalizes to when it is written as a function annotation's domain
-names one domain (`InferVar::names_domain`, marked by `normalize_annotation`). An invariant domain
-edge between that variable and a domain is an equation, drawn in both directions
-(`domains_equate`). The mark is set when the variable is minted and copied when it is freshened,
-so the equation holds on whichever edge the domains meet. The collection a comprehension walks is
-an `Iterable::elements` call, whose type is a variable until the
-[collection rule](#a-collection-is-answered-off-the-table) relates it to the source, and the
-source's domain reaches the annotation through that variable.
-
-The equation is restricted to that variable. A domain variable used for another purpose can
-collect distinct domains, as in a conditional collection or a domain-generic consumer. It is not
-equated with every contribution merely because the position is invariant.
-
-The equation is also excluded for a bound witness. Relating a free variable to that reference
-would let the witness escape its sum. Entering a sum instead requires a
-[term that builds it](#only-a-term-builds-a-sum).
+names one domain (`InferVar::names_domain`, marked by `normalize_annotation`). An edge between
+two functions whose domain is that variable takes the invariant-domain path even while neither
+kind is known, so the domains are drawn in both directions
+([Data domains are invariant](#data-domains-are-invariant)). The mark is set when the variable is
+minted and copied when it is freshened, so the equation holds on whichever edge the domains meet.
+The collection a comprehension walks is an `Iterable::elements` call, whose type is a variable
+until the [collection rule](#a-collection-is-answered-off-the-table) relates it to the source, and
+the source's domain reaches the annotation through that variable.
 
 Negative compaction has a different responsibility: it reads constraints already admitted.
 A witness demand is checked against its candidates by `constrain_go`. A witness reference and
@@ -2079,19 +2114,24 @@ argument replacement, including when a concrete function reaches an earlier opaq
 When lower and upper entries meet at one holder, `bridge_holder_gap` reconciles their holder views:
 
 1. Identical views need no bridge.
-2. The bridge applies `licensed_correspondence_view`, which treats variable-target discharges as
+2. Views that differ only in discharges the holder cannot name act alike on it, so
+   `L <: 𝑉‹lo›` and `𝑉‹hi› <: 𝑈` meet at one type and need no bridge. A discharge cannot act on
+   `𝑉` when its binder is outside `𝑉`'s telescope, or its witness outside every binder scoping
+   over `𝑉` (`Subst::without_vacuous_discharges`).
+3. The bridge applies `licensed_correspondence_view`, which treats variable-target discharges as
    renames at this site. This is an existing restricted transport assumption, not general
    invertibility of discharge.
-3. If either view is invertible, compose its inverse forward with the other view.
-4. Otherwise, split rename and discharge parts. Equal discharge parts, compared modulo term type
+4. If either view is invertible, compose its inverse forward with the other view.
+5. Otherwise, split rename and discharge parts. Equal discharge parts, compared modulo term type
    slots, permit a bridge through an invertible rename part.
-5. Whole views equal modulo type slots also need no bridge.
-6. Distinct non-invertible views not covered by these cases panic.
+6. Whole views equal modulo type slots also need no bridge.
+7. Distinct non-invertible views are two instances of `𝑉`: `L <: 𝑉[𝑎]` and `𝑉[𝑏] <: 𝑈` relate
+   nothing, and the closure draws no edge (`bridge_holder_gap` answers `None`).
 
 The licensed view is required by existing extrusion and per-occurrence dependent uses.
 Removing it without another representation reactivates those failures. Its source contract is
 limited to the current monomorphic treatment of the indexed family; first-class polymorphic
-dependent uses require a separate design. No rule here silently discards an unbridgeable discharge.
+dependent uses require a separate design.
 
 `ConstrainCache` records the side-substitution pairs seen for each `(lhs, rhs)` type pair.
 Two applications such as `g(0)` and `g(1)` must not collapse solely because the underlying variable
@@ -2105,6 +2145,15 @@ already in the post-discharge context. A non-injective rename part can also fall
 Debug checks require every untransported binder to be absent from the content.
 Dropping the whole mixed substitution would also drop useful renames.
 
+A bound under a discharge states a fact about an instance `𝑉[σ]`. Compaction reads it as `𝑉`'s
+own content exactly where `σ` leaves `𝑉`'s content unchanged: its binders are outside `𝑉`'s scope,
+or `𝑉`'s own content does not name them. `content_mentions` decides the second by walking `𝑉`'s
+bounds that are its own, mapping the queried names back through each bound's rendering
+substitution; it applies nothing, so it mints no suspension. An elimination
+([An elimination reads a sum through a term](#an-elimination-reads-a-sum-through-a-term)) acts on
+`𝑉` unless `𝑉`'s funkind settled plain. A fact about `𝑉[σ]` stays out of `𝑉`'s answer and reaches
+the variable that stands for the instance.
+
 `compact_go` accumulates these rendering substitutions while following bounds and forces the
 composite at refinement leaves. `RefinementScope` then closes references against the functions
 enclosing that position. Identity transport preserves an unchanged predicate.
@@ -2112,7 +2161,8 @@ enclosing that position. Identity transport preserves an unchanged predicate.
 ### Dependent application and reconstruction
 
 `InferCtx::apply` creates a fresh expected binder with `Name::solver_arg`, a domain variable, and
-a result variable. It emits the one-way function-shape and argument constraints described under
+a result variable. The result is the expected function's codomain, so it is minted under the
+binder, as an annotation's named function mints its codomain. It emits the one-way function-shape and argument constraints described under
 [Apply is one-way](#apply-is-one-way). A further fresh variable receives the result as a lower
 bound under the discharge mapping from the expected binder to the argument.
 
@@ -2451,9 +2501,17 @@ that removes or merges the morphism binding a position restates the types that r
 
 - Flattening gives a nested chain's head the nested chain's binder, the name its position was read
   by in the outer chain, or the outer chain's binder at the outer head.
+- Flattening restates the steps after a nested chain. They were typed against the nested chain's
+  own type, which reads each inner position as the chain's input carried there,
+  `ℎ ▷ 𝑒₀ ≫ … ≫ 𝑒ᵢ₋₁`. Spliced in, that position is the outer chain's and `𝑒ᵢ`'s binder names it,
+  so each read of it becomes that binder (`restate_spliced_reads`). A read is found by normal form
+  ([Predicates are compared by normal form](#predicates-are-compared-by-normal-form)). Where two
+  positions share a normal form (`𝑎 ▷ unbox` reads as `𝑎`), the first one names it.
 - Simplify's pairwise rewrite reads a binder its replacement no longer binds as the replacement's
   input carried through the morphism it replaced (`restate_entered_binders`).
 - A per-group filter takes the binder of the site it is inserted before, whose input it now takes.
+- Simplify's inlining of an A-normalization temporary bound to a morphism gives the morphism the
+  binder its use site carried (`try_let_morphism_inline`).
 
 A chain's own type is a function of its input alone. Each position its codomain reads is written
 as the input carried there: `(𝑥₀ : 𝐷) ⇒ 𝐶[𝑥ᵢ ↦ 𝑥₀ ▷ 𝑒₀ ≫ … ≫ 𝑒ᵢ₋₁]`, where leading morphisms that map
@@ -2513,6 +2571,47 @@ The slot is part of a refinement's predicate, which compaction forces whole
 dependent type quotes terms whose slots are such variables: a loop's source read at a position, a
 `let`'s definition, a key's projection. Discharging a loop variable into one leaves its slots
 naming the variable once they resolve.
+
+#### An elimination reads a sum through a term
+
+`unbox(𝑐)` is typed `(𝑐 : 𝐴) ⇒ 𝐴‹elim(𝑐)›`, `𝐴` a fresh variable stamped data. `elim(𝑐)` is a
+substitution component (`subst::Elim`): `𝐴`'s collection type with each binder `σᵢ` of its sum
+read as `σᵢ(𝑐)`, and the function plain. A plain collection is the sum over no binders, so the
+elimination leaves it unchanged. Which binders a sum has is its funkind's to say, so the type
+names none of them, and nothing is minted before the binders exist.
+
+`Elim::Top(𝑐)` waits for a function and acts on the outermost one it meets:
+
+- a settled sum: its binders are discharged to `σᵢ(𝑐)`, which opens the slot;
+- a function whose funkind is a variable `κ`: the elimination becomes `Elim::Kind(κ, 𝑐)` for the
+  function's parts, which discharges `κ`'s binders once its arity says which they are, and the
+  function is plain;
+- a variable: it suspends. The suspension has a data funkind of its own, because what an
+  elimination leaves is plain whatever the variable turns out to be;
+- anything else is not a collection and is unchanged.
+
+The component is separate from the witness half, so storing a bound does not force it, and it
+acts on type structure only: a quoted term's type slots are what the term says. A chain of
+substitutions keeps its eliminations in order, so a group read out of a sum read out of another
+eliminates both. The solver eliminates on entry to an edge (`eliminate_at`), and a variable arm
+relates an eliminated end's funkind as plain. Compaction applies the kind's binder correspondence
+before the elimination, so every spelling reaching the function is renamed onto the binders the
+elimination discharges (`eliminated_acc`).
+
+`Elim::Kind(κ, 𝑐)` also acts on a binder of a sum a kind edge relates to `κ`, at the same
+position, since such a binder's occurrences reach a part of the function before the
+correspondence renames them (`FunKindVar::binder_position`). A witness rename's target reaches the
+elimination as well: the component acts after the witness half.
+
+A bound recorded on a variable read through `𝑐` is about `𝑣‹elim(𝑐)›`, so its content can name
+`σᵢ(𝑐)`. The variable is a part of a function of kind `κ` and names that function's binders, never
+the witness one value carries. Rendering the bound in the holder's frame therefore reads `σᵢ(𝑐)`
+back as `κ`'s binder `σᵢ` (`Elim::ReadBack`, emitted by `Bound::render_subst` once `κ`'s arity is
+known). The record-time scope check reads it back the same way. An elimination and its read-back
+through one term compose to whichever acts later.
+
+The post-inference check types an `unbox` by its argument's settled sum instead
+([collections.md, "Typing"](collections.md#typing)).
 
 #### Where the conversions run
 
@@ -2723,16 +2822,17 @@ at the use site rather than hidden in a declaration.
 The function constraint arm first relates kinds. If either resolved kind is data, it uses the
 invariant-domain path:
 
-1. Draw the ordinary reversed domain edge.
-2. Unless either immediate domain is `Type::Infer`, also draw the forward domain edge.
-3. Preserve `SmtError` as an undecided comparison; wrap other domain failures in
-   `DataDomainMismatch`, retaining their cause.
+1. Draw the reversed domain edge and the forward one, whatever the two domains are: invariance is
+   two inequalities, and a variable on either side receives both bounds.
+2. Preserve `SmtError` as an undecided comparison. Where both domains are inference variables,
+   report a failure as `DomainJoinConflict` over the two domains that disagreed: neither side is
+   a stated demand, so the two reached one variable as contributions. Wrap any other domain
+   failure in `DataDomainMismatch`, retaining its cause.
 
-A variable-sided edge records a contribution without equating it immediately with every other
-contribution. Compaction/materialization then checks the domain contributions together and can
-report `DomainJoinConflict`. Depending on which constraints force the comparison, a program can
-fail at the concrete edge or during materialization. The representation of such joins is specified
-under [Materialization](#materialization).
+Two collections over different domains reaching one variable therefore meet as an equation, and
+the edge that closes them reports it. A `DisjointJoin`'s operands are partial maps over one
+domain, not collections standing for it: each operand's domain is a lower bound of the join's
+(`emit_disjoint_join`).
 
 Both directions matter for refinements. One direction rejects dropping a collection's declared
 filter; the other rejects treating an unfiltered collection as though that filter had already
@@ -2779,32 +2879,54 @@ Containment is defined in [Type kind containment](#type-kind-containment). Compa
 kinds using the lattice described in [Kind merges](#kind-merges). These are separate operations:
 containment may record constraints, whereas compact merging combines existing contributions.
 
-#### An unresolved candidate becomes a kinding edge
+#### Membership is decided at materialization
 
-For membership in `UIntRanges` or `Type`, `candidate_in_kind` records an unresolved
-candidate's requirement in `InferBounds::type_kinds`. `answer_type_kinds` checks recorded
-requirements against lower and upper bounds whenever a kind or bound arrives. A variable bound
-inherits the requirement; a concrete bound is tested by `TypeKind::refuses`.
-The variable lookup peels refinements, but the membership test receives the unpeeled type:
-a refined range is not an unrefined range.
+`admits` in `infer/solver/constrain.rs` is the one membership judgment. A candidate that is an
+inference variable, refinements peeled, records the kind on that variable in
+`InferBounds::type_kinds`, in every kind. The record draws no bound: an edge whose presence
+depended on the kind would be a second definition of the kind algebra, and an eager bound would
+have to be met with every other bound the variable receives.
 
-These requirements have no polarity. Compaction combines them conjunctively, and extrusion
-preserves them in either direction. A negative occurrence can therefore carry a `UIntRanges`
-requirement; `test_kinding_constraint_survives_instantiation` covers this through a
-`List` annotation and scheme instantiation.
+Recorded kinds have no polarity. Compaction joins them into the variable's compact type as a
+conjunction, and extrusion carries them at both polarities. A negative occurrence can carry a
+kind: `r: List(Int) = box(…)` records `UIntRanges` on the domain variable at the annotation, and
+`test_kinding_constraint_survives_instantiation` covers it through scheme instantiation.
 
-Upper bounds answer a requirement as lower bounds do. The variable is a candidate of a sum's
-binder, a data domain, and a data domain is invariant
-([Data domains are invariant](#data-domains-are-invariant)), so it resolves to a domain reaching it
-from either side; which side a bound was recorded on is the edge's direction, not the domain's.
-The domain an argument supplies reaches a parameter's domain variable as an upper bound, so a use
-of `def make(s): r: List(Int) = box([y + 1 for y in s])` with a data source fails at the use
-rather than in the specialization.
+Coalescing decides each recorded kind where the position is kept in a tree. `coalesce_compact_go`
+collects the kinds of a position that materializes to a type (`collecting_memberships`), and
+`coalesce_node` and `resolve_binder_slot` decide them once the type's predicates are coalesced,
+through `admits_resolved` under the walk's binders (`BinderScope`). A refinement is therefore
+judged whole: equality compares its coalesced predicate, and subtyping reads its scope. A
+resolution kept for no tree, such as a display or a specialization key, decides none. A position
+that materializes as a variable has no membership to decide, and the kind stays on the variable.
 
-This deferral does not apply to every kind. Membership in `SubtypesOf(𝑇)` is an ordinary
-subtyping edge to `𝑇`. Membership in `Enumerated` uses candidate equality; it does not
-record a disjunction of possible equalities. An unresolved candidate matches the same
-candidate expression, not an arbitrary member it might later become.
+An edge that reads the candidate's variable through a substitution records the kind on the
+suspension standing for it there
+([A substitution reaching a variable suspends on it](#a-substitution-reaching-a-variable-suspends-on-it)).
+No tree position holds a suspension, so no materialization collects it, and the coalesce pass
+decides each such kind after the walk (`decide_suspended_memberships`), under the witness context
+of the edge that recorded it. The suspension is resolved as the one candidate of a sum, so a
+candidate naming a binder its edge joins widens to every subtype of the rest
+([A contribution crosses the binders after its target](#a-contribution-crosses-the-binders-after-its-target)),
+and the sum's kind must be contained in the recorded one. A conditional with a filtered arm
+reaching a `List` parameter is refused there, and so is a filtered collection written to a
+`Mut(List(…))` inside a loop, whose candidate widens to every subtype of its range.
+
+Instantiating a scheme copies these decisions with the variables. A copied suspension carries its
+memberships to the copy, and a variable's copy also copies each of its suspensions that holds one,
+since only the original's suspension list reaches it. A loop over a definition's parameter reads its
+`Elements` through an elimination, so the kind a collection annotation states inside the body sits
+on such a suspension, and each use decides it at its own types.
+
+On a materialized type the check abstains only on an inference variable left in it. On the
+concrete fragment it is a decision: `formal/CclFormal/TypeKind.lean` proves its image
+`admitsCheck` decides `Admits` (`admitsCheck_iff_admits`), and
+`differential_admits_vs_lean_model` compares the two. A failure is a
+`CoalesceError::KindMismatch`, reported against the kind's sum.
+
+A candidate whose head is resolved is decided when the edge is drawn: equality for
+`Enumerated`, the head for `UIntRanges`, and an ordinary subtype edge to `𝑏` for
+`SubtypesOf(𝑏)`.
 
 ### The witness context
 
@@ -2817,6 +2939,20 @@ candidate lists do not identify witnesses: two independent collections can selec
 domains from the same list. Two sums establish a positional correspondence through
 [The Σ rule](#the-σ-rule); an argument comparison uses `witness_instantiation` to align
 witness references at corresponding positions in the demanded domain and the argument.
+
+A witness against a type that is not a witness, refined or not, is ordered by its range. A
+refined witness is compared by the refinement arms, which reach the witness beneath it. This holds
+for a reference and for a projection `σᵢ(𝑐)` alike. `σ <: 𝑇` holds when the range is contained in
+`SubtypesOf(𝑇)`, which is membership once per candidate. `𝑇 <: σ` holds when `𝑇` lies below
+every candidate, so a range that names no candidates has nothing below it. The rule is
+directional. Invariance belongs to the data-domain position: the function arm compares two
+concrete data domains in both directions
+([Data domains are invariant](#data-domains-are-invariant)), and the two directions together
+equate the type with every candidate.
+
+An edge's substitution acts before the arms compare: a reference it discharges is the domain the
+discharge put there, and a projection under it is the projection of the substituted term. Two
+projections through different binders that each discharge to one term are then one projection.
 
 A reference must remain under a binder that classifies it. Reference equality alone does not
 check this: a free ID compares equal to itself. `check_scope_valid` checks witness references
@@ -2898,8 +3034,11 @@ The Fun/Fun arm of `constrain_go` performs these operations:
 2. Check `constrain_type_kinds` for each position where both sides state concrete
    sum binders. This precedes the new witness correspondence, so the kinds are compared
    under the incoming substitutions.
-3. Read both sides' binder IDs. If both lists are nonempty, assert equal lengths and extend
-   the subtype's substitution with one positional rename per pair.
+3. Between two kind variables, extend the subtype's substitution with `Elim::Onto(κ₁)`, which
+   respells a binder of any sum in `κ₁`'s kind component as `κ₁`'s binder at that position
+   (`FunKindVar::binder_position`). Otherwise read both sides' binder IDs. If both lists are
+   nonempty, assert equal lengths and extend the subtype's substitution with one positional
+   rename per pair.
 4. Check the domain and codomain using that substitution. The codomain also receives
    the ordinary Pi-binder alignment for named functions.
 
@@ -2907,6 +3046,21 @@ Binder IDs are available for a kind variable once its arity is known, even thoug
 no candidate kind yet. Using only `sum_binders` for the correspondence would omit the
 consumer's IDs and compare unrelated domain spellings. The rule asserts that each kind
 supplies one ID per known position.
+
+A rename per pair needs both arities, and an edge between two kind variables is often drawn
+before either is known. Drawn without a correspondence, two consumers of one sum meet with a
+binder each. Drawn with renames for positions minted early, it names binders for positions a
+kind may never get, and the renames composed around cycles leave one substitution per path, so
+one bound is recorded once per path. `Elim::Onto` reads the position where a reference stands,
+so it is one entry whether or not the arities are known. Two respellings onto kinds of one
+component compose to the later (`Subst::then`), so a chain of such edges carries one.
+
+A respelling and a witness mapping do not commute: a mapping of the binder a respelling lands
+on acts only after it, and a mapping of a binder it moves acts only before it. A substitution
+applies its own witness half before its eliminations, so composing one with a respelling and a
+later one with a witness half places the later half among the eliminations, after the
+respelling (`Elim::Map`), and two respellings with a witness half between them stay two. A sum's
+own binder moves by the same ordered application as its references.
 
 The correspondence applies to the codomain as well as the domain. Although generated
 collection sums normally share a witness-independent codomain, the representation does not
@@ -2938,7 +3092,7 @@ Tests cover the full sum rule; the differential compact-type oracle does not. Th
 its wire representation.
 
 The kind operations have separate coverage:
-`differential_refuses_vs_lean_model` compares `TypeKind::refuses`, and
+`differential_admits_vs_lean_model` compares `admits_resolved`, and
 `differential_type_kind_merge_vs_lean_model` compares `CompactTypeKind::merge_kinds`.
 `formal/CclFormal/TypeKindIsALattice.lean` proves laws for the model's kind order.
 These do not establish the Rust sum rule's binder correspondence or domain/codomain premises.
@@ -2959,12 +3113,10 @@ Enumerated membership uses type equality. In particular, a refined domain is a d
 candidate from its unrefined base. `UIntRanges` tests the whole candidate and refuses
 a refinement over a range, because that domain may have holes.
 
-`SubtypesOf` membership must use the solver edge. This allows an unresolved
-`Map(_, 𝑉)` key parameter to receive information from its domains. The structural
-`TypeKind::refuses` test cannot solve that parameter and returns false for this kind.
-In general, false means no certain rejection, not proven membership: the test also abstains
-on unresolved shapes. Deferred property checks are specified in
-[An unresolved candidate becomes a kinding edge](#an-unresolved-candidate-becomes-a-kinding-edge).
+`SubtypesOf` membership of a resolved candidate is a subtype edge, so an unresolved
+`Map(_, 𝑉)` key parameter receives its domains as lower bounds. An unresolved candidate is
+decided where it materializes
+([Membership is decided at materialization](#membership-is-decided-at-materialization)).
 
 ### The domain join needs `box`
 
@@ -3177,14 +3329,13 @@ materialized witness in the value.
 [Compiling a conditional collection](collections.md#compiling-a-conditional-collection)
 owns the compilation rules and runtime restrictions.
 
-Realization matches a site's witnesses to collection-valued `Case` nodes below it.
-`is_the_conditional` compares their kinds where the expression binds a sum. Equal
-kinds can occur at multiple generator positions, so `ordinal_of` and
-`conditional_below` select the corresponding same-kind occurrence in traversal order.
-This is a planning-site match, not the witness equality used by subtyping.
+A site is a collection-valued `Case`, realized where it stands. Its witnesses are the ones its
+own type names, and the conditional each names is the `Case` itself (`conditional_below`).
+Consumers read the conditional through `unbox`, over its projected domain, so no consumer is a
+site.
 
-Each realized leg replaces the chosen conditional with its arm. Predicate copies of the
-source must be replaced too. This can free references whose binders were in the removed
+Each realized leg replaces the conditional with its arm. Predicate copies of the conditional in
+the leg's types are replaced too. This can free references whose binders were in the removed
 copies, so the leg instantiates both the site's witness and every newly free witness with
 the chosen domain. Other sums in the leg keep their own binders.
 
@@ -3225,9 +3376,8 @@ for the extent of the assertion.
 - Inference success does not imply runtime compilation support. Current examples and
   named rejections are in `tests/it/compilation_pipeline/sums.rs` and
   [Compiling a conditional collection](collections.md#compiling-a-conditional-collection).
-  Jagged collections and comprehensions over witness-domained collections are supported.
-  A `for` loop over a sum is rejected before constructing its history, including
-  a determined sum that planning could later erase. Collection-valued variant payloads
+  Jagged collections, comprehensions over witness-domained collections, and `for` loops over
+  sums are supported. Collection-valued variant payloads
   and rows fixed by mutable storage before reaching a jagged position remain unsupported.
   `jagged_rows_merged_by_a_keyed_write_do_not_compile` pins a keyed write of a boxed row with
   a different domain, which fails group-by recognition's type check, reported as
