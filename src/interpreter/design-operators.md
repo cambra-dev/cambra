@@ -1328,11 +1328,13 @@ a second compile could not open again.
 
 `tile_operators/program_run_tests.rs` checks that the run releases each sink's producer whole, that
 it finds every sink done, that a pull of each sink afterwards reaches no producer beneath a breaker
-and changes no sink's value, and that each program answers what pull mode answers. Every program
-of the differential suite (`tests/it/differential_interp.rs`) runs dispatched too, at morsels of
-one row and of every row, and answers what pull mode answers, or the planner refuses it as
-`tests/it/dispatch_refused.txt` pins by test name. `tests/it/dispatch_cli.rs` runs the binary both
-ways.
+and changes no sink's value, and that each program answers a fixed expected value. The compiler's
+side of the differential suites (`tests/it/differential_interp.rs`, `tests/it/generated_pairs.rs`)
+is a dispatched run at morsels of one row, which a run at morsels of every row has to match
+(`tests/support/differential.rs`, `dispatch`). A program the planner refuses fails its case. The
+one exception is a test that checks only that a program runs: it calls `check_dispatched`, which
+accepts the refusal `tests/it/dispatch_refused.txt` pins by test name. The generated grid counts a
+refusal as a rejection. `tests/it/dispatch_cli.rs` runs the binary both ways.
 
 #### Reading rows again
 
@@ -1476,7 +1478,7 @@ whole runs in pull mode and passes the pull on. A refused program runs in pull m
 
 `dispatcher/loop_scope.rs` tests the rounds of one scope, `dispatcher/plan.rs` tests the refusal's
 walk, and `tile_operators/program_run_tests.rs` runs flat, guarded and nested loops, a loop nested
-twice among them, against pull mode.
+twice among them, against fixed expected values.
 
 #### Epochs
 
