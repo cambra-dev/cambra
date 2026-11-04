@@ -396,8 +396,14 @@ impl NominalMember {
             };
             return format!("pub type {head} = {}{note}", chl_type(&ctor.payload()));
         }
+        // Another module reaches only the constructors marked `pub`, so the interface lists
+        // those, and a type it can neither build nor match is its head alone.
+        let public: Vec<_> = body.ctors.iter().filter(|c| c.public).collect();
+        if public.is_empty() {
+            return format!("pub type {head}{note}");
+        }
         let mut lines = vec![format!("pub type {head}:{note}")];
-        for ctor in &body.ctors {
+        for ctor in public {
             let params: Vec<String> = ctor
                 .params
                 .iter()
@@ -407,8 +413,8 @@ impl NominalMember {
                 })
                 .collect();
             lines.push(match params.as_slice() {
-                [] => format!("    {}", ctor.name),
-                params => format!("    {}({})", ctor.name, params.join(", ")),
+                [] => format!("    pub {}", ctor.name),
+                params => format!("    pub {}({})", ctor.name, params.join(", ")),
             });
         }
         lines.join("\n")

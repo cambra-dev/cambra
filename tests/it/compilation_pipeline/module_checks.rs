@@ -274,8 +274,9 @@ fn a_checked_module_prints_its_interface() {
 }
 
 /// A public nominal type prints as its module declares it, with each type parameter's
-/// variance and the module's type parameters whose arguments tell its instances apart,
-/// and each public associated function prints with its contract.
+/// variance and the module's type parameters whose arguments tell its instances apart, and
+/// with its public constructors alone: a type whose constructors are private prints its head.
+/// Each public associated function prints with its contract.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn a_checked_module_prints_its_nominal_types() {
@@ -283,15 +284,17 @@ fn a_checked_module_prints_its_nominal_types() {
         indoc! {"
             param Receipt
             pub type Box(T):
-                boxed(T)
-                empty
+                pub boxed(T)
+                pub empty
             pub type Price = Int
             pub def Price::doubled(self) => Int:
                 self.extract() * 2
             def Price::hidden(self) => Int:
                 1
             pub type Order:
-                placed(r: Receipt, total: Price)
+                pub placed(r: Receipt, total: Price)
+            pub type Token:
+                issued(Int)
             impl Box(T):
                 pub def or_else(self, d: T) => T:
                     match self:
@@ -310,12 +313,13 @@ fn a_checked_module_prints_its_nominal_types() {
             module main
             param Receipt
             pub type Box(T):  # covariant in T
-                boxed(T)
-                empty
+                pub boxed(T)
+                pub empty
             pub type Price = Int
             pub Price::doubled: Price => Int
             pub type Order:  # one type per argument of Receipt
-                placed(r: Receipt, total: Price)
+                pub placed(r: Receipt, total: Price)
+            pub type Token
             pub Box::or_else: forall (T) {Box(T), T} => T
         "}
     );

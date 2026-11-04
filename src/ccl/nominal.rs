@@ -133,6 +133,10 @@ pub struct NominalBody {
 pub struct NominalCtor {
     pub name: SmolStr,
     pub span: Span,
+    /// Whether another module may build the constructor and match it: its line is marked
+    /// `pub`, or it is the single-constructor form's `new`, exported with its type
+    /// (`docs/chl-spec.md`, "9.5 Visibility").
+    pub public: bool,
     /// The declared parameters: the name each is documented by, and its type.
     pub params: Vec<(Option<SmolStr>, Type)>,
     /// Each parameter's order, as the declaration writes its type, positionally.
@@ -195,6 +199,7 @@ impl NominalCtor {
         NominalCtor {
             name,
             span,
+            public: true,
             params,
             orders,
         }

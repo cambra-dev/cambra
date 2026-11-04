@@ -65,8 +65,8 @@ instance Orderable(Bool, Bool)
 # Two options are equal when both are `none`, or both are `some` of equal values. An `Option` is
 # not orderable, since its two constructors have no order.
 pub type Option(T):
-    none
-    some(T)
+    pub none
+    pub some(T)
 
 instance forall (T) Equatable(Option(T), Option(T)) requires Equatable(T, T)
 
