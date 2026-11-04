@@ -28,7 +28,7 @@ A Cambra program passes through three layers:
     - Concurrency and parallelism are the default. *[Decided]*
     - Durable state *[Sketched]* and transactions are built in.
 2. **CCL** (Cambra Core Language) — the small core CHL lowers into: literals, variables, tuples, records, collections, lambdas, let-bindings, application, aggregates, and recursion. CCL is pure and referentially transparent — CHL's impure surface forms (`:=` mutation, `<<` feeds) are compiled away into pure recursion over time domains, so every CCL node denotes a value. After inference every node carries a type. This is the language's reasoning surface: type checking, optimization, planning, and program comparison all happen here.
-3. **Dataflow runtime** — CCL is converted into a graph of _operators_ implementing a producer/consumer interface; a scheduler drives the graph with streaming dataflow semantics. Parallelization *[Sketched]*, vectorization, pipelining, transactionality, and durability *[Sketched]* are properties of the execution model rather than features provided in libraries.
+3. **Dataflow runtime** — CCL is converted into a graph of _operators_ implementing a producer/consumer interface; a scheduler drives the graph with streaming dataflow semantics. Parallelization *[Sketched]*, vectorization, pipelining, transactionality, and durability *[Sketched]* ([durability.md](durability.md)) are properties of the execution model rather than features provided in libraries.
 
 Programs are run on the Cambra engine, which compiles and executes CHL programs. This engine provides the operational tooling to interact with a CHL program:
 - An **Inspector** to observe and debug running programs.
