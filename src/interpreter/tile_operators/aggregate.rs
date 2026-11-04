@@ -982,14 +982,21 @@ impl MapAggregateProducer {
                 domain_predicate.clone()
             })
             .collect();
-        // Which groups are complete, over whole paths: those some level on the path calls
-        // complete ([`Tile::completion_at`]).
-        let complete = input_tile.completion_at(CurryLevel::new(depth - 1));
         let parent_paths = input_tile.row_paths_at(depth);
         let folded = input_tile.values_at(CurryLevel::new(depth));
-        let Tile::DataFunction { codomain, .. } = folded else {
+        let Tile::DataFunction {
+            codomain,
+            domain_predicate: elements,
+            ..
+        } = folded
+        else {
             unreachable!("the loop breaks on a collection")
         };
+        let elements = elements.clone();
+        // Which groups are complete, over whole paths: those some level on the path calls
+        // complete ([`Tile::completion_at`]). `Stated::settled` adds the held groups whose every
+        // element the folded level calls complete.
+        let complete = input_tile.completion_at(CurryLevel::new(depth - 1));
         let values = (**codomain).clone();
         let (_, output_tiling) = folded_shape(self.tiling());
 
@@ -1008,8 +1015,10 @@ impl MapAggregateProducer {
         Stated {
             domain_predicate,
             level_predicates,
+            elements,
             complete,
         }
+        .settled(self.accumulators.keys())
     }
 
     /// The output over every accumulator held, with the completeness `stated` names, cut to
@@ -1019,6 +1028,7 @@ impl MapAggregateProducer {
             domain_predicate,
             level_predicates,
             complete,
+            ..
         } = stated;
         let (extents, output_tiling) = folded_shape(self.tiling());
         let kind = &self.kind;
@@ -1097,10 +1107,13 @@ impl MapAggregateProducer {
 }
 
 /// What the answers of a map aggregate's input state about completeness: the outermost keys
-/// that are complete, each level's, and the groups that are, over whole paths.
+/// that are complete, each level's, the folded level's, and the groups that are, over whole
+/// paths.
 struct Stated {
     domain_predicate: Predicate,
     level_predicates: Vec<Predicate>,
+    /// The folded level's statement: the elements no answer will add to, over whole paths.
+    elements: Predicate,
     complete: Predicate,
 }
 
@@ -1115,8 +1128,45 @@ impl Stated {
                 .zip(&other.level_predicates)
                 .map(|(a, b)| a.union(b))
                 .collect(),
+            elements: self.elements.union(&other.elements),
             complete: self.complete.union(&other.complete),
         }
+    }
+
+    /// This statement with each of `groups`, the paths of the groups held, called complete where
+    /// the elements' statement covers every element under it, in `complete` and at the groups'
+    /// level: an answer of a pull beneath the groups' keys states only the elements it reads, so
+    /// a group's elements can be stated complete in parts across answers, and a group that will
+    /// gain no element is complete at its level, as the input would state it of an answer
+    /// naming the whole group.
+    fn settled<'a>(mut self, groups: impl Iterator<Item = &'a Vec<Value>>) -> Stated {
+        let depth = self.level_predicates.len();
+        let whole = Predicate::union_all(
+            groups
+                .filter(|path| {
+                    debug_assert_eq!(
+                        path.len(),
+                        depth,
+                        "a group's path names a key at every level above the folded one"
+                    );
+                    !self.complete.contains_path(path) && self.elements.within(path, 0).is_true()
+                })
+                .map(|path| Predicate::exactly(path))
+                .collect(),
+        );
+        if whole.is_false() {
+            return self;
+        }
+        self.complete = self.complete.union(&whole);
+        let at_groups = self
+            .level_predicates
+            .last_mut()
+            .expect("a map aggregate folds beneath at least one level");
+        *at_groups = at_groups.union(&whole);
+        if depth == 1 {
+            self.domain_predicate = self.domain_predicate.union(&whole);
+        }
+        self
     }
 }
 
@@ -1229,7 +1279,7 @@ impl Breaker for MapAggregateProducer {
         }
         let stated = self.read_input(guard);
         self.stated = Some(match self.stated.take() {
-            Some(before) => before.union(&stated),
+            Some(before) => before.union(&stated).settled(self.accumulators.keys()),
             None => stated,
         });
     }
@@ -1255,11 +1305,31 @@ impl BreakingProducer for MapAggregateProducer {
         false
     }
 
-    /// The guard of the output the accumulators build, empty before the first consume.
+    /// The guard of the output the accumulators build, less every group whose accumulator is not
+    /// terminal; empty before the first consume. A group still folding holds no decided value, so
+    /// a push names it once its input is complete, and a reader that read it before reads it again
+    /// then (`Pushes::push_final` pushes each region once).
     fn held(&self) -> TileGuard {
-        match &self.stated {
-            Some(stated) => self.build(stated, &Projection::Everything).to_guard(),
-            None => self.tiling().empty_guard(),
+        let Some(stated) = &self.stated else {
+            return self.tiling().empty_guard();
+        };
+        let built = self.build(stated, &Projection::Everything).to_guard();
+        let folding: Vec<Predicate> = self
+            .accumulators
+            .keys()
+            .filter(|path| !stated.complete.contains_path(path))
+            .map(|path| Predicate::exactly(path))
+            .collect();
+        let Some(depth) = self.accumulators.keys().next().map(Vec::len) else {
+            return built;
+        };
+        debug_assert!(
+            self.accumulators.keys().all(|path| path.len() == depth),
+            "every group of a map aggregate is keyed at the same depth"
+        );
+        match Projection::keys_at(CurryLevel::new(depth - 1), Predicate::union_all(folding)) {
+            Projection::Nothing => built,
+            folding => guard_minus(&built, &folding.collection_guard()),
         }
     }
 
@@ -1294,6 +1364,142 @@ mod tests {
             Predicate::True,
             BitSet::new(),
         )
+    }
+
+    /// Beneath an enclosing level, a group still folding is left out of what the aggregate holds
+    /// decided, and its sibling settled by the same answer is not.
+    #[test]
+    fn a_folding_group_beneath_a_level_is_not_held_decided() {
+        use crate::interpreter::tile_operators::test_helpers::ProjectionSpy;
+        let uints = || Extent::Base(BaseType::UInt);
+        let input_tiling = Tiling::data_function(
+            uints(),
+            Tiling::data_function(
+                uints(),
+                Tiling::data_function(uints(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+            ),
+        );
+        // Row 0 holds groups 0 and 1, each of elements 0 and 1; group 0 is stated whole and
+        // group 1 through element 1.
+        let groups = Tile::grouped(
+            vec![0],
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 2],
+                ColumnValue::UInts(vec![0, 1, 0, 1]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2, 3, 4]))),
+                Predicate::qualified(
+                    Predicate::exactly(&[Value::UInt(0), Value::UInt(0)]),
+                    Predicate::True,
+                )
+                .union(&Predicate::qualified(
+                    Predicate::exactly(&[Value::UInt(0), Value::UInt(1)]),
+                    Predicate::at_or_below(Value::UInt(1)),
+                )),
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let input = Tile::data_function(
+            ColumnValue::UInts(vec![0]),
+            Box::new(groups),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let (input, _, _) = ProjectionSpy::new(input, input_tiling.clone());
+        let output = Tiling::data_function(
+            uints(),
+            Tiling::data_function(
+                uints(),
+                Tiling::Aggregation {
+                    kind: AggregateKind::Sum,
+                    accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+                },
+            ),
+        );
+        let mut sums = MapAggregateProducer::new(
+            ProducerBase::unowned(MapAggregateProducer::alloc_id(), &output),
+            Box::new(input),
+            AggregateKind::Sum,
+        );
+        sums.consume_impl(InputId::ONLY, input_tiling.universal_guard());
+        let held = sums.held();
+        let group = |g: u64| [Value::UInt(0), Value::UInt(g)];
+        assert!(held.covers_path(&group(0)), "group 0 is settled: {held:?}");
+        assert!(
+            !held.covers_path(&group(1)),
+            "group 1 is still folding: {held:?}"
+        );
+    }
+
+    /// A group whose elements two answers state complete in parts is complete once the parts
+    /// cover every element, as answers of pulls beneath the groups' keys state them; until then
+    /// its accumulator is not terminal and the aggregate holds nothing decided under its key.
+    #[test]
+    fn a_group_stated_complete_in_parts_settles_once_they_cover_it() {
+        use crate::interpreter::tile_operators::test_helpers::{ProjectionSpy, paths_guard};
+        let point = |k: u64| Predicate::point(Value::UInt(k));
+        let input_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::data_function(
+                Extent::Base(BaseType::UInt),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        // Group 0 holds the elements 0 to 4, every one stated complete.
+        let whole = Tile::data_function(
+            ColumnValue::UInts(vec![0]),
+            Box::new(int_function(vec![0, 1, 2, 3, 4], vec![1, 2, 3, 4, 5])),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let (input, _, _) = ProjectionSpy::new(whole, input_tiling);
+        let output = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Aggregation {
+                kind: AggregateKind::Sum,
+                accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+            },
+        );
+        let mut sums = MapAggregateProducer::new(
+            ProducerBase::unowned(MapAggregateProducer::alloc_id(), &output),
+            Box::new(input),
+            AggregateKind::Sum,
+        );
+        let through_two = Predicate::at_or_below(Value::UInt(2));
+        sums.consume_impl(
+            InputId::ONLY,
+            paths_guard(Predicate::qualified(point(0), through_two.clone())),
+        );
+        assert!(
+            !sums.held().covers_path(&[Value::UInt(0)]),
+            "group 0 is still folding: {:?}",
+            sums.held()
+        );
+        sums.consume_impl(
+            InputId::ONLY,
+            paths_guard(Predicate::qualified(
+                point(0),
+                Predicate::True.minus(&through_two),
+            )),
+        );
+        assert!(
+            sums.held().covers_path(&[Value::UInt(0)]),
+            "{:?}",
+            sums.held()
+        );
+        let answer = sums.offer_impl(output.universal_guard());
+        let Tile::DataFunction {
+            codomain,
+            domain_predicate,
+            ..
+        } = &answer
+        else {
+            panic!("a collection of sums, got {answer:?}")
+        };
+        assert!(domain_predicate.contains(&Value::UInt(0)), "{answer:?}");
+        assert!(codomain.is_terminal(), "{answer:?}");
     }
 
     /// An `Aggregate`'s accumulator *is* its whole output, so once the consumer

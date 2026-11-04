@@ -1947,27 +1947,40 @@ impl Tile {
     /// A level appended beneath level `at`, in place of the values `at` holds, for groups
     /// that may still gain keys: `level` builds it from those values, as in
     /// [`append_level`](Self::append_level), and level `at`'s `domain_predicate` is left as the
-    /// caller stated it. A later tile adding to a group re-states its key, which
-    /// [`Tile::merge`] merges into the group.
+    /// caller stated it. The new level states `stated`, the keys the caller knows its groups
+    /// will gain no more of, over the paths from level `at`. A later tile adding to a group
+    /// re-states its key, which [`Tile::merge`] merges into the group.
     ///
     /// Beneath a stated level rather than the innermost one, because the values there may be
     /// collections of their own: pairing a row whose value is a collection puts the new level
     /// between the row and that collection.
+    ///
+    /// # Panics
+    ///
+    /// When `level` builds a level that names complete keys or has removed any: what the level
+    /// states is `stated`.
     pub fn append_open_level_beneath(
         mut self,
         at: CurryLevel,
+        stated: Predicate,
         level: impl FnOnce(Tile) -> Tile,
     ) -> Tile {
         let slot = self.values_at_mut(CurryLevel::new(at.index() + 1));
-        let built = level(std::mem::replace(slot, Tile::record(HashMap::new())));
+        let mut built = level(std::mem::replace(slot, Tile::record(HashMap::new())));
+        let Tile::DataFunction {
+            domain_predicate,
+            deleted,
+            ..
+        } = &mut built
+        else {
+            panic!("an appended level is a collection: {built:?}")
+        };
         assert!(
-            matches!(
-                &built,
-                Tile::DataFunction { domain_predicate: Predicate::False, deleted, .. }
-                    if deleted.is_empty()
-            ),
-            "an appended level names no complete keys and has removed nothing: {built:?}"
+            domain_predicate.is_false() && deleted.is_empty(),
+            "an appended level is built naming no complete keys and having removed nothing: \
+             {domain_predicate:?}, {deleted:?}"
         );
+        *domain_predicate = stated;
         *slot = built;
         self
     }
@@ -1988,7 +2001,8 @@ impl Tile {
     /// `domain_predicate` gains each key present: the new level sits beneath it, so each key
     /// is final together with the group opened under it, unioned with the region the arriving
     /// tile already called final. A caller whose groups may still gain keys appends with
-    /// [`append_open_level_beneath`](Self::append_open_level_beneath) instead, which states nothing more.
+    /// [`append_open_level_beneath`](Self::append_open_level_beneath) instead, which states what
+    /// the caller states.
     /// The levels above keep their own predicates: a row of one of them is complete once the
     /// level beneath it will gain no more keys, which appending says nothing about.
     pub fn append_level(mut self, level: impl FnOnce(Tile) -> Tile) -> Tile {
@@ -2027,16 +2041,15 @@ impl Tile {
         self
     }
 
-    /// The guard naming what this tile **holds**, with no allowance for what it has been
-    /// promised, standing over rows at `row_paths`.
+    /// The guard naming what this tile holds, standing over rows at `row_paths`, and the keys
+    /// each level states complete under each of those rows.
     ///
-    /// What [`Self::to_guard`] answers for a whole tile includes its `domain_predicate`:
-    /// a key the producer promises is releasable even before it arrives. A
-    /// [`FunctionGuard::Codomain`] arm cannot carry that, because it is read against every
-    /// row of the values it wraps — a promised key would be released under a row that
-    /// already holds it, and that row's value would go with it. A held key is named by its
-    /// whole path for the same reason: named bare, it would be released under every row,
-    /// including a row that has not received it yet.
+    /// What [`Self::to_guard`] answers for a whole tile includes its `domain_predicate`: a key
+    /// the producer states complete is releasable even before it arrives, and one it states
+    /// absent never arrives. A [`FunctionGuard::Codomain`] arm is read against every row of the
+    /// values it wraps, so a key it names bare would be released under every row, including a
+    /// row that has not received it yet. Every key is named here by its whole path: a held key,
+    /// and a key the row's own statement calls complete ([`stated_keys`](Self::stated_keys)).
     fn held_guard(&self, row_paths: &[Vec<Value>]) -> TileGuard {
         match self {
             // A record's fields stand over the rows the record does, and a `Codomain` arm
@@ -2088,7 +2101,10 @@ impl Tile {
                 ..
             } => {
                 if !codomain.holds_a_level() {
-                    return TileGuard::Function(FunctionGuard::Domain(self.held_keys(row_paths)));
+                    return TileGuard::Function(FunctionGuard::Domain(
+                        self.held_keys(row_paths)
+                            .union(&self.stated_keys(row_paths)),
+                    ));
                 }
                 let key_paths = self.key_paths(row_paths);
                 let complete = (0..key_paths.len())
@@ -2099,7 +2115,7 @@ impl Tile {
                     .enumerate()
                     .filter(|(key, _)| complete[*key])
                     .map(|(_, path)| Predicate::exactly(path))
-                    .fold(Predicate::False, |all, one| all.union(&one));
+                    .fold(self.stated_keys(row_paths), |all, one| all.union(&one));
                 let mut open_values = (**codomain).clone();
                 open_values.retain_rows(
                     &(0..key_paths.len())
@@ -2121,6 +2137,46 @@ impl Tile {
             }
             other => other.to_guard(),
         }
+    }
+
+    /// The keys this collection's `domain_predicate` calls complete under the rows at
+    /// `row_paths`, each beneath the path of its row ([`Predicate::within`]). Such a key is whole
+    /// where it is held and never arrives where it is not, so it is releasable at that row and
+    /// no other.
+    ///
+    /// Rows stated alike are named together, as [`held_keys`](Self::held_keys) names rows
+    /// holding alike.
+    fn stated_keys(&self, row_paths: &[Vec<Value>]) -> Predicate {
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = self
+        else {
+            panic!("stated_keys is a collection's: {self:?}")
+        };
+        let mut groups: Vec<(Predicate, Vec<usize>)> = Vec::new();
+        for (row, path) in row_paths.iter().enumerate() {
+            let stated = domain_predicate.within(path, 0);
+            if stated.is_false() {
+                continue;
+            }
+            match groups.iter_mut().find(|(alike, _)| *alike == stated) {
+                Some((_, rows)) => rows.push(row),
+                None => groups.push((stated, vec![row])),
+            }
+        }
+        Predicate::union_all(
+            groups
+                .into_iter()
+                .map(|(stated, rows)| {
+                    let rows = Predicate::union_all(
+                        rows.iter()
+                            .map(|&row| Predicate::exactly(&row_paths[row]))
+                            .collect(),
+                    );
+                    Predicate::qualified(rows, stated)
+                })
+                .collect(),
+        )
     }
 
     /// The keys this collection holds, each beneath the path of the row holding it.
@@ -4374,6 +4430,82 @@ mod tests {
             Predicate::False,
         );
         assert_eq!(record_fields(&released), record_fields(&expected));
+    }
+
+    /// Under a row still open, a level of scalars names the keys its statement calls complete
+    /// under that row, held or not, and none under another row.
+    #[test]
+    fn an_open_rows_stated_keys_are_named_under_that_row() {
+        let point = |k: u64| Predicate::point(Value::UInt(k));
+        let from_three = Predicate::True.minus(&Predicate::at_or_below(Value::UInt(2)));
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 2],
+                ColumnValue::UInts(vec![3, 4, 3]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![30, 40, 31]))),
+                Predicate::qualified(point(0), from_three),
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let guard = tile.to_guard();
+        let at = |row: u64, key: u64| [Value::UInt(row), Value::UInt(key)];
+        assert!(guard.covers_path(&at(0, 4)), "a held key: {guard:?}");
+        assert!(
+            guard.covers_path(&at(0, 7)),
+            "a key row 0 states complete and never receives: {guard:?}"
+        );
+        assert!(
+            !guard.covers_path(&at(0, 2)),
+            "a key row 0 may still receive: {guard:?}"
+        );
+        assert!(guard.covers_path(&at(1, 3)), "a held key: {guard:?}");
+        assert!(
+            !guard.covers_path(&at(1, 7)),
+            "row 1 states nothing, so only what it holds is named: {guard:?}"
+        );
+    }
+
+    /// Under a row still open, a level whose values hold a level names whole each key its
+    /// statement calls complete under that row and the row does not hold, and no key it holds
+    /// open.
+    #[test]
+    fn an_open_rows_stated_keys_are_named_whole_above_a_level() {
+        let point = |k: u64| Predicate::point(Value::UInt(k));
+        let from_five = Predicate::True.minus(&Predicate::at_or_below(Value::UInt(4)));
+        // Row 0 holds keys 3 and 4 at level 1, each over a group still open at level 2.
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0]),
+            Box::new(Tile::grouped(
+                vec![0],
+                ColumnValue::UInts(vec![3, 4]),
+                Box::new(Tile::grouped(
+                    vec![0, 1],
+                    ColumnValue::UInts(vec![0, 0]),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![30, 40]))),
+                    Predicate::False,
+                    BitSet::new(),
+                )),
+                Predicate::qualified(point(0), from_five),
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let guard = tile.to_guard();
+        let at = |path: &[u64]| path.iter().map(|k| Value::UInt(*k)).collect::<Vec<_>>();
+        assert!(guard.covers_path(&at(&[0, 7])), "{guard:?}");
+        assert!(guard.covers_path(&at(&[0, 7, 2])), "{guard:?}");
+        assert!(
+            !guard.covers_path(&at(&[0, 3])),
+            "key 3's group is open: {guard:?}"
+        );
+        assert!(
+            !guard.covers_path(&at(&[0, 2])),
+            "row 0 may still receive key 2: {guard:?}"
+        );
     }
 
     /// A collection under a record's field is a level under the key the record stands on,

@@ -91,9 +91,10 @@ when its values can grow. Under scalar values a repeated key stays as two entrie
 `append_level` replaces the innermost collection's values with a newly constructed collection
 level. Each appended group must be whole, so its parent key becomes complete. Completion at
 higher levels is unchanged. `append_open_level_beneath` is the operation for groups that may
-still grow. Both require the new level to have no logical deletions and a `False` completion
-predicate; existing levels retain their own deletion sets. `Tiling::append_level` performs the
-corresponding transformation on the static shape.
+still grow, and the new level states the completion predicate its caller passes. Both require the
+new level to be built with no logical deletions and a `False` completion predicate; existing levels
+retain their own deletion sets. `Tiling::append_level` performs the corresponding transformation on
+the static shape.
 
 Each collection level has its own `deleted` bitset, indexed by positions in that level's
 domain column. Removing an outer key removes its subtree; removing an inner key affects only
@@ -187,7 +188,7 @@ Tiles use predicates to state domain completeness; guards use them to select reg
 | `False` | No values. Empty predicate; annihilator under `intersect`. |
 | `Intervals(IntervalSet<Value>)` | A scalar key's admitted values, clamped to the type's range. `Predicate::at_or_below(v)` builds the prefix `≤ v`, the upper-bound streaming signal, and `Predicate::below(v)` the strict one. Never built over records. |
 | `Record(fields)` | A componentwise predicate over a record key: one predicate per field, with AND semantics. |
-| `Or(arms)` | Union of the arms' regions. `flatten_or` removes nested `Or` nodes and joins pairs of componentwise arms where possible. |
+| `Or(arms)` | Union of the arms' regions. `flatten_or` removes nested `Or` nodes, joins two `Intervals` arms into one, and joins pairs of componentwise arms where possible. |
 | `Qualified { enclosing, here }` | Keys admitted by `here` under paths admitted by `enclosing`. See [Qualified predicates](#qualified-predicates). |
 | `Union { tags, rest }` | Predicate for each named tag of an `Extent::Union`; Boolean `rest` applies to every unnamed tag. |
 
@@ -610,12 +611,13 @@ makes releasable, and its size grows with the tile's depth, not with the keys it
 that is itself a prefix reaching above the last key held ends the staircase at its greatest key
 instead of adding an arm. A last key the statement calls whole, or whose group's statement calls
 every key complete, ends the staircase at that key. A tile whose held keys form no prefix is
-released key by key; at a nested level that guard names only the keys held (`Tile::held_guard`),
-which leaves out the keys the statement calls complete and the tile does not hold. Three tiles whose
-held keys form a prefix still take that path: a last key whose group holds nothing, an earlier key
-whose own group's statement calls every key complete, and a statement about the keys beneath an
-enclosing key the tile does not hold. Naming those exactly needs `held_guard` to carry each open
-key's statement, which it does not yet. A universal input release latches `upstream_drained`.
+released key by key (`Tile::held_guard`). At a nested level that guard names each key held and
+each key the level's statement calls complete under a row the tile holds, both by whole path, so a
+key stated absent under an open row is released at that row. Three tiles whose held keys form a
+prefix still take that path: a last key whose group holds nothing, an earlier key whose own group's
+statement calls every key complete, and a statement about the keys beneath an enclosing key the
+tile does not hold. The guard names the first two exactly. It leaves out the third, which names a
+row the tile holds no path to. A universal input release latches `upstream_drained`.
 Release builds then return the cache without pulling that input again; debug builds continue pulling
 to exercise its post-release checks.
 
@@ -840,13 +842,17 @@ until the consumer releases the output.
 
 A consuming `MapAggregate` folds each group the input answers at the guard into the group's
 accumulator and keeps what the answers state about completeness, united across consumes. A group is
-final per key once the input states it complete. The input releases a complete group whole and an
-open one only beneath its key, so a group that arrives later in a region already consumed is still
-the input's to answer. The dispatcher finishes the pipeline's epoch once its input has released
-every guard the pipeline consumed in it, so every group it holds is then final, and `MapAggregate`
-pushes then rather than after each consume. The guard it pushes is the guard of the output built
-from the accumulators, less the guard released. A release of the output drops the accumulators it
-covers and forwards to the input, as in pull mode.
+final per key once the input states it complete, at a level on its path or at the folded level
+under its key. An answer of a pull beneath the groups' keys states only the elements it reads, so
+the folded level's statements are united too, and a group is final once they cover every element
+under its key (`Stated::settled`). The input releases a complete group whole and an open one only
+beneath its key, so a group that arrives later in a region already consumed is still the input's to
+answer. `MapAggregate` pushes at the pipeline's finish of an epoch rather than after each consume.
+The guard it pushes is the guard of the output built from the accumulators, less every group whose
+accumulator is not terminal, less the guard released. The dispatcher pushes each region once
+(`Pushes::push_final`), so a group still folding at one finish is pushed at the finish where it is
+final, and a reader that kept the row open reads it again then. A release of the output drops the
+accumulators it covers and forwards to the input, as in pull mode.
 
 ### Converse
 
