@@ -853,6 +853,10 @@ pub enum Builtin {
     ///
     /// Monomorphic, so it carries no [`crate::ccl::infer::OperatorSchemes`] scheme: lowering
     /// stamps [`crate::ccl::ty::int_to_uint_type`] on the node.
+    ///
+    /// `IntToUInt` is a temporary feature supporting development of
+    /// the proven and checked lookups system, and will be removed
+    /// when `Int`s can be used directly for list lookups.
     IntToUint,
     /// `int_eq_uint : (Int, UInt) ⇒ Bool` — whether an `Int` and a `UInt` are the same
     /// integer. The refinement encoding represents both as SMT `Int`, where this is `=`;

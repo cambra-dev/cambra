@@ -4305,7 +4305,10 @@ for e in expiries:
   and name of the binding that holds it, as a mutable variable's is, and a reload that keeps the
   binding keeps its held rows. Durable state is **[Tentative]** ([8.8 `@LoadFrom`](#88-loadfrom)).
 
-### 7.6 `int_to_uint`
+### 7.6 `int_to_uint` (temporary)
+
+This operation has been added as temporary support for the development of proven and checked
+lookups. It will be removed when `Int`s can be used directly for list lookups.
 
 ```
 int_to_uint(x)
