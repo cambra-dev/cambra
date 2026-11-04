@@ -619,6 +619,32 @@ struct RawSite {
     /// loop, so the read is that accumulator's final value, broadcast into every
     /// transaction (see [`build_writer`]).
     enclosing_writes: HashSet<Name>,
+    /// The per-iteration values the block reads, each taken at the read's position in
+    /// its iteration ([`partition_block`]).
+    captures: Vec<Capture>,
+}
+
+/// A read a block makes of a per-iteration value, taken on the loop body where the read
+/// stands: an accumulator of the enclosing loop, or a binding its body makes before the
+/// block.
+///
+/// A read in a block is the value at the read's position in the iteration
+/// (`docs/chl-spec.md`, "8.3 Reads"): after the writes the loop body makes before the
+/// block and the in-block writes before the read, and before every write after it. A
+/// binding is immutable, so its value there is the one it was bound with.
+/// [`partition_block`] writes `` name := `fired(source) `` on the loop body at that
+/// position, which makes `name` an accumulator of the loop written on every path of
+/// every iteration, so its value at a position is the read's. [`build_writer`] threads
+/// it through the writer source as it does every accumulator the loop writes, with
+/// ``variant_project(`fired)`` after it. The tap variant gives the capture a closed seed,
+/// `` `idle ``, which no read reaches, since the write precedes every read of `name` in
+/// an iteration.
+struct Capture {
+    name: Name,
+    /// The accumulator or binding read.
+    source: Name,
+    /// The value type of `source`; the capture itself is `` {`fired{ty} | `idle} ``.
+    ty: Type,
 }
 
 /// A per-transaction feed (`out << e`) collected from a `with begin():` block:
@@ -674,7 +700,7 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
     // read it. Lift it onto the spine first.
     let expr = crate::ccl::mut_elim::lift_bindings_out_of_effect_position(expr);
     let mut harvest = Stripped::default();
-    let stripped = strip(expr, txn_mut_vars, None, &mut harvest);
+    let stripped = strip(expr, txn_mut_vars, None, &mut harvest)?;
     // Post-strip invariants (release asserts, like the letrec-phase
     // post-conditions): every `Begin` was consumed (stripped into a site or
     // unwrapped), and no transactional write survives outside a block — a
@@ -693,6 +719,7 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
     let Stripped {
         sites,
         read_only_footprints,
+        ..
     } = harvest;
     // Mutable variable keys: the union of every writer's footprint (read ∪ write), in
     // first-occurrence order. These are exact (α-unique) `Name`s.
@@ -759,9 +786,16 @@ pub fn run(expr: Expr, txn_mut_vars: &HashSet<Name>) -> Result<Expr, Located<Str
     // `zip` of the loop iter and the accumulator's per-position view), which the
     // commit engine co-iterates. A non-entangled induction loop is left for
     // `mut_elim`.
+    // A block reads each capture by name, so the loop writing it is among those folded
+    // here, which types and seeds it as a tap ([`Capture`]).
     let cross_reads = cross_domain_reads(&sites, txn_mut_vars);
+    let captures: HashMap<Name, Type> = sites
+        .iter()
+        .flat_map(|s| s.captures.iter())
+        .map(|c| (c.name.clone(), c.ty.clone()))
+        .collect();
     let mut cross = CrossDomain::default();
-    let mut stripped = fold_cross_domain_loops(stripped, &cross_reads, &mut cross);
+    let mut stripped = fold_cross_domain_loops(stripped, &cross_reads, &captures, &mut cross);
 
     // Fresh history-binding name per key, distinct from the surface variable so a read
     // of the history is not a self-reference; recognition keys the `Transact` off these.
@@ -999,7 +1033,12 @@ fn cross_domain_reads(sites: &[RawSite], txn_mut_vars: &HashSet<Name>) -> HashSe
 /// Fold each residual induction `For` that writes a cross-read accumulator into
 /// `out` (see [`CrossDomain`]), removing the `For` from the tree and re-pointing
 /// its continuation's trailing reads at the extracted finals.
-fn fold_cross_domain_loops(expr: Expr, cross_reads: &HashSet<Name>, out: &mut CrossDomain) -> Expr {
+fn fold_cross_domain_loops(
+    expr: Expr,
+    cross_reads: &HashSet<Name>,
+    captures: &HashMap<Name, Type>,
+    out: &mut CrossDomain,
+) -> Expr {
     if let TypedExprNode::ExprStmt { expr: effect, .. } = &expr.node
         && let TypedExprNode::For { body, .. } = &effect.node
         && writes_any(body, cross_reads)
@@ -1030,8 +1069,16 @@ fn fold_cross_domain_loops(expr: Expr, cross_reads: &HashSet<Name>, out: &mut Cr
         // The loop body and the continuation between them carry every reference to
         // this loop's accumulators, so their `Mut(V, D)`s give each one the value
         // type inference joined for it.
-        let value_tys = mut_var_value_tys([&*body, &*cont]);
-        let fold = fold_induction_loop(&target, &iter, *body, &value_tys);
+        let mut value_tys = mut_var_value_tys([&*body, &*cont]);
+        let mut seeds = HashMap::new();
+        for (cap, ty) in captures {
+            value_tys.insert(
+                cap.clone(),
+                crate::ccl::ccl_utils::tap_variant_ty(ty.clone()),
+            );
+            seeds.insert(cap.clone(), crate::ccl::ccl_utils::tap_idle(ty.clone()));
+        }
+        let fold = fold_induction_loop(&target, &iter, *body, &value_tys, &seeds);
         for (i, acc) in fold.accs.iter().enumerate() {
             if cross_reads.contains(&acc.name) {
                 let final_var = fold
@@ -1059,10 +1106,10 @@ fn fold_cross_domain_loops(expr: Expr, cross_reads: &HashSet<Name>, out: &mut Cr
         out.parents.push(stmt_id);
         out.reads.extend(fold.reads);
         out.feeds.extend(fold.feed_views);
-        return fold_cross_domain_loops(cont, cross_reads, out);
+        return fold_cross_domain_loops(cont, cross_reads, captures, out);
     }
     let mut expr = expr;
-    expr.map_children(|c| fold_cross_domain_loops(c, cross_reads, out));
+    expr.map_children(|c| fold_cross_domain_loops(c, cross_reads, captures, out));
     expr
 }
 
@@ -1084,6 +1131,64 @@ fn loop_induction_writes(body: &Expr, txn_mut_vars: &HashSet<Name>) -> HashSet<N
     let mut out = HashSet::new();
     go(body, txn_mut_vars, &mut out);
     out
+}
+
+/// The bindings a loop body makes outside its `with begin():` blocks. A block after one reads
+/// it through a [`Capture`]. Names are α-unique, so a block cannot read one that is not in
+/// scope at the block.
+///
+/// Each binding maps to the binding whose value holds a statement ([`holds_statement`]) that
+/// its own value depends on: itself, or the least-named such binding its value reads. A
+/// binding that depends on none maps to `None`.
+type LoopLets = HashMap<Name, Option<Name>>;
+
+fn loop_body_bindings(body: &Expr) -> LoopLets {
+    // A binding is inserted before its body is walked, so every binding a value can read is
+    // already in `out` when that value is examined.
+    fn go(e: &Expr, out: &mut LoopLets) {
+        match &e.node {
+            TypedExprNode::Begin { .. } => return,
+            TypedExprNode::Let {
+                binding,
+                bound_expr,
+                ..
+            } => {
+                let root = if holds_statement(bound_expr) {
+                    Some(binding.name.clone())
+                } else {
+                    out.iter()
+                        .filter(|(n, _)| is_free(n, bound_expr))
+                        .filter_map(|(_, root)| root.clone())
+                        .min()
+                };
+                out.insert(binding.name.clone(), root);
+            }
+            _ => {}
+        }
+        e.walk_children(|c| go(c, out));
+    }
+    let mut out = HashMap::new();
+    go(body, &mut out);
+    out
+}
+
+/// Whether `e` holds a statement: a loop, a block, a feed, a definition, or a write. This pass
+/// folds a loop before `mut_elim`'s `flatten_spine` lifts a write out of a binding's value
+/// onto the loop body, so the fold does not carry that write, and a block's capture of the
+/// binding, or of any binding that reads it, would read the wrong value. See
+/// `src/ccl/design/mutability.md`, "A block reads per-iteration values through captures" for
+/// the fix proposed for the refusal.
+fn holds_statement(e: &Expr) -> bool {
+    matches!(
+        &e.node,
+        TypedExprNode::ExprStmt { .. }
+            | TypedExprNode::For { .. }
+            | TypedExprNode::Begin { .. }
+            | TypedExprNode::Feed { .. }
+            | TypedExprNode::Define { .. }
+            | TypedExprNode::MutDecl { .. }
+            | TypedExprNode::MutWrite { .. }
+    ) || e.any_child(holds_statement)
 }
 
 /// Whether the subtree holds a `MutWrite` to a name in `names`.
@@ -1124,6 +1229,9 @@ struct Stripped {
     sites: Vec<RawSite>,
     /// One entry per read-only block: the mutable variable keys it reads together.
     read_only_footprints: Vec<Vec<Name>>,
+    /// How many [`Capture`]s the walk has made. A loop's write set labels each slot by
+    /// its accumulator's spelling, so each capture is spelled with its own number.
+    captures_made: usize,
 }
 
 /// Replace every transaction `For` site (`ExprStmt(For{…}, cont)` whose block
@@ -1132,9 +1240,9 @@ struct Stripped {
 fn strip(
     expr: Expr,
     txn_mut_vars: &HashSet<Name>,
-    enclosing: Option<(&TypedBinding, &Expr, &HashSet<Name>)>,
+    enclosing: Option<(&TypedBinding, &Expr, &HashSet<Name>, &LoopLets)>,
     out: &mut Stripped,
-) -> Expr {
+) -> Result<Expr, Located<String>> {
     // A `with begin():` block (a `Begin` marker) on a statement spine.
     if let TypedExprNode::ExprStmt { expr: effect, .. } = &expr.node
         && matches!(&effect.node, TypedExprNode::Begin { .. })
@@ -1183,11 +1291,11 @@ fn strip(
             // position), where `mut_elim` folds it into the loop recurrence.
             // The two domains stay independent — an induction accumulator is
             // never in the atomic commit.
-            let (target, source, enclosing_writes) = enclosing.expect(
+            let (target, source, enclosing_writes, loop_lets) = enclosing.expect(
                 "a writing `with begin():` block must be inside a loop (lowering wraps a \
                  standalone block in a singleton `For`)",
             );
-            let new_rest = {
+            let new_rest: Result<Expr, Located<String>> = {
                 // Recorded here: the source copy the site takes, the statement
                 // wrappers `prepend_effects` mints for the lifted induction
                 // writes, and whatever `partition_block` rebuilds. The block
@@ -1195,8 +1303,55 @@ fn strip(
                 // disassembled by `build_writer` under this same parent.
                 let g = provenance::enter(stmt_id, "transact.strip", provenance::Nature::Expansion);
                 g.blame(&[begin_id]);
-                let (txn_block, lifted) = partition_block(*block, txn_mut_vars);
+                let (mut txn_block, mut lifted, captures, refused) = partition_block(
+                    *block,
+                    txn_mut_vars,
+                    enclosing_writes,
+                    loop_lets,
+                    &mut out.captures_made,
+                );
+                if let Some(Refusal { read, root }) = refused {
+                    let through = if read == root {
+                        String::new()
+                    } else {
+                        format!(", which reads `{root}`")
+                    };
+                    return Err(Located::new(
+                        format!(
+                            "this `with begin():` block reads `{read}`{through}, a binding whose \
+                             value runs a statement (a loop, a block, a feed, a definition, or a \
+                             write), which a block cannot read yet. Move the statement out of \
+                             `{root}`'s value onto the loop body before `{root}`, and bind \
+                             `{root}` to the value it leaves"
+                        ),
+                        begin_id,
+                    ));
+                }
+                // An accumulator's capture no later write in the iteration overtakes holds
+                // the value the accumulator ends the iteration with, which a read of the
+                // accumulator itself already gives. A binding's capture is its only route
+                // into the writer.
+                let (captures, redundant): (Vec<Capture>, Vec<Capture>) =
+                    captures.into_iter().partition(|c| {
+                        if !enclosing_writes.contains(&c.source) {
+                            return true;
+                        }
+                        let acc = HashSet::from([c.source.clone()]);
+                        let at = lifted
+                            .iter()
+                            .position(|e| is_capture_write(e, c))
+                            .expect("a capture is written on the loop body");
+                        lifted[at + 1..].iter().any(|e| writes_any(e, &acc))
+                            || writes_any(&rest, &acc)
+                    });
+                for c in &redundant {
+                    drop_capture(c, &mut txn_block, &mut lifted);
+                }
                 let (read_keys, write_keys) = collect_footprint(&txn_block, txn_mut_vars);
+                // A capture is an accumulator this loop writes, so the block's read of it
+                // is co-indexed.
+                let mut site_enclosing_writes = enclosing_writes.clone();
+                site_enclosing_writes.extend(captures.iter().map(|c| c.name.clone()));
                 out.sites.push(RawSite {
                     parent: stmt_id,
                     target: target.clone(),
@@ -1207,11 +1362,12 @@ fn strip(
                     block: txn_block,
                     read_keys,
                     write_keys,
-                    enclosing_writes: enclosing_writes.clone(),
+                    enclosing_writes: site_enclosing_writes,
+                    captures,
                 });
-                prepend_effects(lifted, *rest)
+                Ok(prepend_effects(lifted, *rest))
             };
-            return strip(new_rest, txn_mut_vars, enclosing, out);
+            return strip(new_rest?, txn_mut_vars, enclosing, out);
         }
         // A read-only block (feeds a mutable variable read, no txn write) → unwrap it onto
         // the loop spine. The fed mutable variable read then flows to `mut_elim`'s
@@ -1250,20 +1406,21 @@ fn strip(
         let TypedExprNode::For { target, iter, body } = node else {
             unreachable!("guarded above")
         };
-        let source = strip(*iter, txn_mut_vars, enclosing, out);
+        let source = strip(*iter, txn_mut_vars, enclosing, out)?;
         // The loop's own induction accumulators (direct writes + those lifted
         // from its `with begin():` blocks). A site inside this loop co-indexes a
         // read of one of these; a read of any other accumulator is a completed
         // sibling loop's final value (broadcast). Computed before recursing so it
         // is available to every site the body strips.
         let enclosing_writes = loop_induction_writes(&body, txn_mut_vars);
+        let loop_lets = loop_body_bindings(&body);
         let body = strip(
             *body,
             txn_mut_vars,
-            Some((&target, &source, &enclosing_writes)),
+            Some((&target, &source, &enclosing_writes, &loop_lets)),
             out,
-        );
-        return Expr {
+        )?;
+        return Ok(Expr {
             node: TypedExprNode::For {
                 target,
                 iter: Box::new(source),
@@ -1272,11 +1429,11 @@ fn strip(
             ty,
             user_annotation,
             node_id,
-        };
+        });
     }
     let mut expr = expr;
-    expr.map_children(|c| strip(c, txn_mut_vars, enclosing, out));
-    expr
+    expr.try_map_children(|c| strip(c, txn_mut_vars, enclosing, out))?;
+    Ok(expr)
 }
 
 /// Splice a `with begin():` block's statement chain onto an enclosing spine by
@@ -1353,11 +1510,136 @@ fn splice_block(block: Expr, rest: Expr) -> Expr {
 /// top-level spine writes are lifted; a *guarded* induction write is rejected
 /// up front by [`check_no_guarded_induction_write_in_block`] (it would need commit-gated
 /// carry-forward), so it never reaches here.
-fn partition_block(block: Expr, txn_mut_vars: &HashSet<Name>) -> (Expr, Vec<Expr>) {
-    let mut lifted = Vec::new();
-    let mut env = HashMap::new();
-    let txn_block = partition_spine(block, txn_mut_vars, &mut lifted, &mut env);
-    (txn_block, lifted)
+fn partition_block(
+    block: Expr,
+    txn_mut_vars: &HashSet<Name>,
+    loop_accs: &HashSet<Name>,
+    loop_lets: &LoopLets,
+    captures_made: &mut usize,
+) -> (Expr, Vec<Expr>, Vec<Capture>, Option<Refusal>) {
+    let captured: HashSet<Name> = loop_accs.iter().chain(loop_lets.keys()).cloned().collect();
+    let mut part = Partition {
+        txn_mut_vars,
+        captured: &captured,
+        captures_made,
+        lifted: Vec::new(),
+        env: HashMap::new(),
+        current: HashMap::new(),
+        captures: Vec::new(),
+    };
+    let txn_block = partition_spine(block, &mut part);
+    // A capture the remainder does not read was taken for a block binding only a lifted
+    // write consumed, and the write reads the binding's sources itself.
+    let (captures, unread): (Vec<Capture>, Vec<Capture>) = part
+        .captures
+        .into_iter()
+        .partition(|c| is_free(&c.name, &txn_block));
+    let mut txn_block = txn_block;
+    let mut lifted = part.lifted;
+    for c in &unread {
+        drop_capture(c, &mut txn_block, &mut lifted);
+    }
+    // Only a capture the block reads is refused: a binding a lifted write alone consumed
+    // stays on the loop body, where the loop's own handling of it applies.
+    let refused = captures.iter().find_map(|c| {
+        let root = loop_lets.get(&c.source)?.clone()?;
+        Some(Refusal {
+            read: c.source.clone(),
+            root,
+        })
+    });
+    (txn_block, lifted, captures, refused)
+}
+
+/// A block's read of a loop-body binding that depends on a statement-holding one
+/// ([`LoopLets`]), which [`strip`] refuses.
+struct Refusal {
+    /// The binding the block reads.
+    read: Name,
+    /// The binding whose value holds the statement: `read` itself, or one `read` depends on.
+    root: Name,
+}
+
+/// Whether `e` is `c`'s write on the loop body.
+fn is_capture_write(e: &Expr, c: &Capture) -> bool {
+    matches!(&e.node, TypedExprNode::MutWrite { name, .. } if *name == c.name)
+}
+
+/// Remove capture `c`, the remainder reading its source directly instead. Sound only where
+/// no write to the source lies between the capture's write and the end of the iteration.
+/// A lifted write never reads a capture ([`partition_spine`]).
+fn drop_capture(c: &Capture, txn_block: &mut Expr, lifted: &mut Vec<Expr>) {
+    lifted.retain(|e| !is_capture_write(e, c));
+    rename_var_uses(txn_block, &c.name, &c.source);
+}
+
+/// The state of one [`partition_spine`] walk.
+struct Partition<'a> {
+    txn_mut_vars: &'a HashSet<Name>,
+    /// The enclosing loop's accumulators and loop-body bindings, whose reads in the
+    /// remainder are captured.
+    captured: &'a HashSet<Name>,
+    captures_made: &'a mut usize,
+    lifted: Vec<Expr>,
+    /// The block spine's own `let` bindings, discharged into a lifted write.
+    env: HashMap<Name, Expr>,
+    /// Each accumulator's capture at the walk's position: the one a read here takes.
+    /// A lifted write to the accumulator ends it.
+    current: HashMap<Name, Name>,
+    captures: Vec<Capture>,
+}
+
+impl Partition<'_> {
+    /// `e` with each read of a per-iteration value replaced by its capture at the walk's
+    /// position, writing a capture on the loop body where none is current.
+    fn capture_reads(&mut self, mut e: Expr) -> Expr {
+        let mut accs: Vec<&Name> = self
+            .captured
+            .iter()
+            .filter(|a| is_free_in_value(a, &e))
+            .collect();
+        accs.sort();
+        for acc in accs {
+            let cap = match self.current.get(acc) {
+                Some(cap) => cap.clone(),
+                None => {
+                    let read_ty = var_ty(&e, acc).expect("a free accumulator has a `Var` node");
+                    let ty = read_ty.mut_value_type().cloned().unwrap_or(read_ty);
+                    let cap = Name::fresh(format!("__at{}", *self.captures_made));
+                    *self.captures_made += 1;
+                    let fired = crate::ccl::ccl_utils::tap_fired(tvar(acc, ty.clone()));
+                    let write =
+                        Expr::mut_write(cap.clone(), fired).with_ty(Type::Base(BaseType::Unit));
+                    self.lifted.push(write);
+                    self.captures.push(Capture {
+                        name: cap.clone(),
+                        source: acc.clone(),
+                        ty,
+                    });
+                    self.current.insert(acc.clone(), cap.clone());
+                    cap
+                }
+            };
+            rename_var_uses(&mut e, acc, &cap);
+        }
+        e
+    }
+}
+
+/// The type of the first `Var(name)` node in `e`.
+fn var_ty(e: &Expr, name: &Name) -> Option<Type> {
+    if let TypedExprNode::Var(n) = &e.node
+        && n == name
+    {
+        return Some(e.ty.clone());
+    }
+    let mut found = None;
+    e.walk_children(|c| {
+        if found.is_none() {
+            found = var_ty(c, name);
+        }
+    });
+    found
 }
 
 /// `env` carries the block spine's own `let` bindings, so a lifted write leaves
@@ -1384,12 +1666,7 @@ fn partition_block(block: Expr, txn_mut_vars: &HashSet<Name>) -> (Expr, Vec<Expr
 /// that claim is `cnt`, and [`fold_cross_domain_loops`] then folds every loop
 /// writing `cnt` into a cross-domain letrec for an accumulator no decision
 /// reads.
-fn partition_spine(
-    expr: Expr,
-    txn_mut_vars: &HashSet<Name>,
-    lifted: &mut Vec<Expr>,
-    env: &mut HashMap<Name, Expr>,
-) -> Expr {
+fn partition_spine(expr: Expr, part: &mut Partition<'_>) -> Expr {
     let Expr {
         node,
         ty,
@@ -1397,13 +1674,18 @@ fn partition_spine(
         node_id,
     } = expr;
     match node {
-        TypedExprNode::ExprStmt { expr: effect, body } if matches!(&effect.node, TypedExprNode::MutWrite { name, .. } if !txn_mut_vars.contains(name)) =>
+        TypedExprNode::ExprStmt { expr: effect, body } if matches!(&effect.node, TypedExprNode::MutWrite { name, .. } if !part.txn_mut_vars.contains(name)) =>
         {
-            lifted.push(Subst::discharge_env_in_place(*effect, env));
-            partition_spine(*body, txn_mut_vars, lifted, env)
+            if let TypedExprNode::MutWrite { name, .. } = &effect.node {
+                part.current.remove(name);
+            }
+            let write = Subst::discharge_env_in_place(*effect, &part.env);
+            part.lifted.push(write);
+            partition_spine(*body, part)
         }
         TypedExprNode::ExprStmt { expr: effect, body } => {
-            let body = partition_spine(*body, txn_mut_vars, lifted, env);
+            let effect = Box::new(part.capture_reads(*effect));
+            let body = partition_spine(*body, part);
             Expr {
                 node: TypedExprNode::ExprStmt {
                     expr: effect,
@@ -1422,11 +1704,14 @@ fn partition_spine(
             // The binding enters `env`, so a write lifted past it carries its
             // value instead of its name, and stays on the block spine for the
             // transactional remainder to read.
-            env.insert(
+            // A lifted write runs on the loop body in order, so it reads the binding's
+            // sources directly; only the remainder reads through captures.
+            part.env.insert(
                 binding.name.clone(),
-                Subst::discharge_env_in_place(bound_expr.as_ref().clone(), env),
+                Subst::discharge_env_in_place(bound_expr.as_ref().clone(), &part.env),
             );
-            let body = partition_spine(*body, txn_mut_vars, lifted, env);
+            let bound_expr = Box::new(part.capture_reads(*bound_expr));
+            let body = partition_spine(*body, part);
             // A binding the remainder does not name is one the lift took the last
             // consumer of. Dropping it is what keeps the remainder's reads the
             // block's reads. A type naming it counts: a filter reading a mutable
@@ -1454,17 +1739,17 @@ fn partition_spine(
             "partition_spine: a mutable variable declared inside a `with begin():` block — \
              lowering cannot produce one yet"
         ),
-        node => Expr {
+        node => part.capture_reads(Expr {
             node,
             ty,
             user_annotation,
             node_id,
-        },
+        }),
     }
 }
 
-/// Prepend a list of effect expressions (lifted induction `MutWrite`s) onto a
-/// spine as `ExprStmt` statements, preserving their original order.
+/// Prepend a list of effect expressions (lifted induction `MutWrite`s, captures
+/// among them) onto a spine as `ExprStmt` statements, preserving their order.
 fn prepend_effects(effects: Vec<Expr>, rest: Expr) -> Expr {
     effects.into_iter().rev().fold(rest, |rest, effect| {
         let ty = rest.ty.clone();
@@ -2204,7 +2489,20 @@ fn build_writer(
         if !block_reads_var(&site.block, n) {
             continue;
         }
-        if site.enclosing_writes.contains(n) {
+        if let Some(c) = site.captures.iter().find(|c| c.name == *n) {
+            // A capture's history is its tap; the block reads the fired value.
+            let dom = info
+                .view
+                .ty
+                .domain()
+                .expect("transact_phase: an accumulator view is a function");
+            let mut view = Expr::compose(vec![
+                info.view.clone(),
+                crate::ccl::ccl_utils::fired_project(c.ty.clone()),
+            ]);
+            view.ty = Type::fun_like(&info.view.ty, dom, c.ty.clone());
+            site_accs.push((n.clone(), view, c.ty.clone()));
+        } else if site.enclosing_writes.contains(n) {
             site_accs.push((n.clone(), info.view.clone(), info.value_ty.clone()));
         } else {
             broadcasts.push((n.clone(), info.final_var.clone(), info.value_ty.clone()));
@@ -3709,6 +4007,7 @@ mod tests {
             read_keys: read_keys.iter().map(|n| (*n).clone()).collect(),
             write_keys: write_keys.iter().map(|n| (*n).clone()).collect(),
             enclosing_writes: HashSet::new(),
+            captures: Vec::new(),
         }
     }
 
