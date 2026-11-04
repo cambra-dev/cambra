@@ -1544,9 +1544,18 @@ fn bind_constructor(
         label,
     );
     let name = member_binding(decl, &ctor.name);
+    // A constructor line writes its name at `ctor.span`. The single-constructor form's
+    // `new` is written nowhere, and its span is the declaration's name, as is a
+    // compiler-provided declaration's.
+    let binder = if decl.is_builtin() || decl.declares_extract {
+        Occurrence::mint()
+    } else {
+        ctx.occurrence_at(ctor.span)
+    };
     bind_function(
         decl,
         name,
+        binder,
         arg,
         ctor.payload(),
         value,
@@ -1589,7 +1598,10 @@ fn bind_is_none(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) ->
     let name = member_binding(decl, IS_NONE);
     let self_ty = decl
         .applied_to_params(&mut |n, ty| ctx.tag_machinery(Expr::var(n).with_ty(ty), span, label));
-    bind_function(decl, name, arg, self_ty, case, acc, span, label, ctx)
+    let binder = Occurrence::mint();
+    bind_function(
+        decl, name, binder, arg, self_ty, case, acc, span, label, ctx,
+    )
 }
 
 /// The name a reference to `decl`'s member `name` reads, recording the member as used when
@@ -1654,15 +1666,20 @@ fn bind_extract(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) ->
     let name = member_binding(decl, "extract");
     let self_ty = decl
         .applied_to_params(&mut |n, ty| ctx.tag_machinery(Expr::var(n).with_ty(ty), span, label));
-    bind_function(decl, name, arg, self_ty, case, acc, span, label, ctx)
+    let binder = Occurrence::mint();
+    bind_function(
+        decl, name, binder, arg, self_ty, case, acc, span, label, ctx,
+    )
 }
 
 /// `let name = λ arg : param_ty → value in acc`, polymorphic over the declaration's type
-/// parameters when it has any, as a `def` with type parameters is.
+/// parameters when it has any, as a `def` with type parameters is. `binder` is the
+/// occurrence of `name` in the binding.
 #[allow(clippy::too_many_arguments)]
 fn bind_function(
     decl: &NominalDecl,
     name: String,
+    binder: Occurrence,
     arg: &str,
     param_ty: Type,
     value: Expr,
@@ -1671,15 +1688,15 @@ fn bind_function(
     label: crate::ccl::provenance::RewriteLabel,
     ctx: &mut LoweringContext,
 ) -> Expr {
-    // The function, its parameter and its binding are the compiler's own, so their
-    // occurrences record where the function is tagged.
+    // The function and its parameter are the compiler's own, so their occurrences record
+    // where the function is tagged, as does `binder` unless the caller recorded it.
     let mut function = Expr::lambda(arg, Occurrence::mint(), Type::Hole, value);
     if let TypedExprNode::Lambda { param, .. } = &mut function.node {
         param.declare(Annotation::new(param_ty, Occurrence::mint()));
     }
     let function = ctx.tag_machinery(function, span, label);
     let binding = if decl.params.is_empty() {
-        Expr::let_bind(name, Occurrence::mint(), function, acc)
+        Expr::let_bind(name, binder, function, acc)
     } else {
         let poly = Type::Poly(Rc::new(PolyType {
             params: decl
@@ -1696,7 +1713,7 @@ fn bind_function(
         }));
         Expr::let_bind_annotated(
             name,
-            Occurrence::mint(),
+            binder,
             function,
             acc,
             Annotation::new(poly, Occurrence::mint()),

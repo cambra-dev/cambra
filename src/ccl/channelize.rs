@@ -378,11 +378,7 @@ fn try_extract_fanout_feed(body: &Expr, defer_name: &Name) -> Option<Vec<(Expr, 
             return None;
         }
         match &b.body.node {
-            TypedExprNode::Feed {
-                name_occurrence,
-                name,
-                value,
-            } if name == defer_name => {
+            TypedExprNode::Feed { name, value, .. } if name == defer_name => {
                 any_feed = true;
                 arms.push((b.guard.clone(), Some((**value).clone())));
             }

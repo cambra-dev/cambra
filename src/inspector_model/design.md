@@ -346,7 +346,10 @@ the node that holds it, so a click on a name in the source selects that row, and
 binder's type in that pane. The row's edge label is the leading word of the entry's `label`,
 lowercased: `binder`, `use`, `label`, `head` or `annotation` (`childEdge` in `web/src/treeView.ts`).
 The positional queries (`tightestNodeAt`, `typesAt`) include occurrences; a predicate stays excluded
-from them because the tree draws no row for one.
+from them because the tree draws no row for one. `tightestNodeAt` takes a node over an occurrence of
+equal extent. An occurrence the source writes is recorded at the name, narrower than the node
+holding it, so it wins on extent; one the source does not write, such as `__arg_tuple_0`, is
+recorded at its holder's span and does not take a click on `def` from the lambda that holds it.
 
 Both wire validators check that `kind` is `value`, `occurrence` or `predicate`, that an occurrence
 entry has no children, and that one child edge names each occurrence. `kind` replaced a boolean

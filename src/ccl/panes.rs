@@ -891,9 +891,10 @@ mod tests {
     }
 
     /// The shapes whose rebuilt binders the corpus holds none of: a `let` inside an
-    /// eliminated lambda, nested feeding loops, a feed under `with begin():`, a
-    /// constructor assignment, a nominal type's parameter and the single-constructor
-    /// form.
+    /// eliminated lambda, nested feeding loops with and without an accumulator, a feed
+    /// under `with begin():` with and without a guard, constructor assignments, a nominal
+    /// type's parameter, the single-constructor form, a loop and a comprehension over a
+    /// pattern binder, and a wildcard binder.
     #[rstest::rstest]
     #[case::let_in_an_eliminated_lambda(indoc! {"
         xs = [1, 2, 3]
