@@ -65,7 +65,7 @@ pub(crate) struct PlanningCtx {
 /// The context of a program that declares no instance, before realization.
 impl Default for PlanningCtx {
     fn default() -> PlanningCtx {
-        PlanningCtx::of(InstanceTable::builtin())
+        PlanningCtx::of(InstanceTable::std())
     }
 }
 

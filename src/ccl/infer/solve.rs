@@ -2085,7 +2085,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     if !ctx.discarding {
         dispatch_operator(expr, ctx);
     }
-    // A trait function's call answered by an instance a module declares becomes a use of
+    // A trait function's call answered by an instance whose `def`s implement it becomes a use of
     // the function the instance's `def` binds, before anything reads the node: the use then
     // specializes below, as any use of a generalized definition does. A walk whose types are
     // dropped resolves nothing to choose by: its operands are the definition's own, and
@@ -2099,7 +2099,7 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
                 return;
             }
             Ok(Some(instance)) => {
-                if instance.declared.is_some() && !use_instance_function(expr, &instance, ctx) {
+                if instance.binds_functions() && !use_instance_function(expr, &instance, ctx) {
                     return;
                 }
                 instance_call = true;
@@ -2719,23 +2719,25 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         build_instance_function(expr, &instance);
     }
     if !ctx.discarding {
-        run_instance_primitive(expr);
+        run_instance_primitive(expr, &ctx.instances);
     }
 }
 
-/// Replace an arithmetic operator answered by an instance a module declares with the call of
+/// Replace an arithmetic operator answered by an instance whose `def`s implement it with the call of
 /// the instance's function the operator makes ([`OperatorCall`]): `a + b` is `add` of
 /// `(a, b)`. The walk then reaches the call's `TraitFn` as it reaches any trait function's,
 /// which becomes a use of the instance's function (`src/ccl/design/type-inference.md`, "An
-/// operator's instance"). An operator a compiler instance answers stays, and runs that
+/// operator's instance"). An operator a `@Builtin` instance answers stays, and runs that
 /// instance's primitive ([`run_instance_primitive`]); a comparison calls no function.
 fn dispatch_operator(expr: &mut Expr, ctx: &CoalesceCtx) {
     let (call, operands): (OperatorCall, Vec<&Expr>) = match &expr.node {
-        TypedExprNode::BinOp { left, op, right } => match OperatorCall::of_binop(*op) {
-            Some(call) => (call, vec![&**left, &**right]),
-            None => return,
-        },
-        TypedExprNode::UnaryOp(op, inner) => match OperatorCall::of_unary(*op) {
+        TypedExprNode::BinOp { left, op, right } => {
+            match OperatorCall::of_binop(*op, &ctx.instances) {
+                Some(call) => (call, vec![&**left, &**right]),
+                None => return,
+            }
+        }
+        TypedExprNode::UnaryOp(op, inner) => match OperatorCall::of_unary(*op, &ctx.instances) {
             Some(call) => (call, vec![&**inner]),
             None => return,
         },
@@ -2744,9 +2746,9 @@ fn dispatch_operator(expr: &mut Expr, ctx: &CoalesceCtx) {
     let Some(function) = call.function() else {
         return;
     };
-    // Resolving the operands copies their refinements' predicates, so it waits for a
-    // declared instance to choose between.
-    if !ctx.instances.declares(&call.trait_) {
+    // Resolving the operands copies their refinements' predicates, so it waits for an
+    // instance whose `def`s implement it to choose between.
+    if !ctx.instances.binds_functions_of(&call.trait_) {
         return;
     }
     let Ok(types) = operands
@@ -2756,12 +2758,12 @@ fn dispatch_operator(expr: &mut Expr, ctx: &CoalesceCtx) {
     else {
         return;
     };
-    let declared = ctx
+    let bound = ctx
         .instances
         .instances(&call.trait_)
         .iter()
-        .any(|i| i.declared.is_some() && i.matches(&types));
-    if declared {
+        .any(|i| i.binds_functions() && i.matches(&types));
+    if bound {
         call_instance_function(expr, &call, function, types);
     }
 }
@@ -2836,11 +2838,11 @@ fn call_instance_function(expr: &mut Expr, call: &OperatorCall, function: &str, 
 
 /// Make an operator a compiler instance answers run that instance's primitive: `+` of two
 /// strings is `Concat`.
-fn run_instance_primitive(expr: &mut Expr) {
+fn run_instance_primitive(expr: &mut Expr, instances: &InstanceTable) {
     let TypedExprNode::BinOp { left, op, right } = &mut expr.node else {
         return;
     };
-    let Some(call) = OperatorCall::of_binop(*op) else {
+    let Some(call) = OperatorCall::of_binop(*op, instances) else {
         return;
     };
     let Some(function) = call.function() else {
@@ -2850,7 +2852,7 @@ fn run_instance_primitive(expr: &mut Expr) {
         crate::ccl::ccl_utils::strip_refinements(&left.ty),
         crate::ccl::ccl_utils::strip_refinements(&right.ty),
     ];
-    let primitive = InstanceTable::builtin()
+    let primitive = instances
         .instances(&call.trait_)
         .iter()
         .find(|i| i.matches(&types))
@@ -2983,7 +2985,7 @@ fn matching_instance(
     Ok(Some(Rc::clone(instance)))
 }
 
-/// Replace a `TraitFn` answered by an instance a module declares with a use of the function
+/// Replace a `TraitFn` answered by an instance whose `def`s implement it with a use of the function
 /// the instance's `def` binds, keeping the node's identity and its type, which is the
 /// trait's signature at the call's types. Returns whether it did: an instance declared
 /// below the call is not in scope there, which is reported.

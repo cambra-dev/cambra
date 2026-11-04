@@ -5,4 +5,15 @@
 # by its name, and the import name stays unbound. A module's own declarations, imports and `use`
 # names shadow a prelude name, so adding one changes no module that already binds it.
 
-import std use Option
+import std use (
+    Option,
+    Equatable,
+    Orderable,
+    Addable,
+    Subtractable,
+    Multipliable,
+    Divisible,
+    Exponentiable,
+    Negatable,
+    Iterable,
+)

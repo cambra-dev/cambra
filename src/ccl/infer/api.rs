@@ -175,8 +175,18 @@ impl<'a> Drop for TypeInferenceContextGuard<'a> {
 }
 
 impl TypeInferenceContext {
-    /// Create a new, empty context with no scopes and no registered sources.
+    /// Create a new, empty context with no scopes and no registered sources, for a tree no
+    /// program lowered: its traits and instances are `std`'s ([`InstanceTable::std`]).
     pub fn new() -> Self {
+        TypeInferenceContext {
+            instances: InstanceTable::std(),
+            ..Self::default()
+        }
+    }
+
+    /// [`Self::new`] for a program, whose compilation sets the traits and instances its
+    /// lowering found.
+    pub(crate) fn for_program() -> Self {
         Self::default()
     }
 
@@ -2720,7 +2730,7 @@ fn collect_type_errors(
 /// Returns `Ok(())` if no errors are found, or all discovered errors as
 /// `Err(errs)`.
 pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
-    typecheck_in(expr, &InstanceTable::builtin())
+    typecheck_in(expr, &InstanceTable::std())
 }
 
 /// [`typecheck`] of a program declaring `instances`.
@@ -2754,7 +2764,7 @@ pub fn typecheck_against(
     sources: &HashMap<String, Type>,
 ) -> Result<(), Vec<InferError>> {
     check_fully_typed(expr)?;
-    crate::ccl::infer::check::check_located_against(expr, Some(sources), &InstanceTable::builtin())
+    crate::ccl::infer::check::check_located_against(expr, Some(sources), &InstanceTable::std())
         .map_err(unlocated)
 }
 
@@ -2764,7 +2774,7 @@ pub fn typecheck_against(
 /// are permitted — the unified phase and `channelize` erase them (see
 /// [`Strictness::PreChannelize`]).
 pub fn check_pre_channelize(expr: &Expr) -> Result<(), Vec<InferError>> {
-    check_pre_channelize_located(expr, &InstanceTable::builtin()).map_err(unlocated)
+    check_pre_channelize_located(expr, &InstanceTable::std()).map_err(unlocated)
 }
 
 /// [`check_pre_channelize`], keeping the node each error was raised at.
@@ -5597,7 +5607,7 @@ mod tests {
         );
         let tree = Expr::lambda("x", refined, Expr::lit(Lit::Int(1)).with_ty(int_lit_ty(1)));
         typecheck(&tree).expect("before planning, a predicate holding a `defer` is source form");
-        let errs = typecheck_planned(&tree, &HashMap::new(), &InstanceTable::builtin())
+        let errs = typecheck_planned(&tree, &HashMap::new(), &InstanceTable::std())
             .expect_err("a feed handle in a predicate passed");
         assert!(
             errs.iter()
@@ -5620,7 +5630,7 @@ mod tests {
         let body = Expr::lit(Lit::Int(1)).with_ty(body_ty);
         let bound = Expr::lit(Lit::Int(1)).with_ty(int_lit_ty(1));
         let tree = Expr::let_bind("y", bound, body).with_ty(Type::Base(BaseType::String));
-        let errs = typecheck_planned(&tree, &HashMap::new(), &InstanceTable::builtin());
+        let errs = typecheck_planned(&tree, &HashMap::new(), &InstanceTable::std());
         assert!(
             errs.is_err(),
             "a `let` typed `String` over an `Int` body passed the check"
@@ -5646,8 +5656,7 @@ mod tests {
         let bound = Expr::lit(Lit::Int(1)).with_ty(int_lit_ty(1));
         let let_bound =
             |recorded: Type| Expr::let_bind("y", bound.clone(), body.clone()).with_ty(recorded);
-        let check =
-            |tree: &Expr| typecheck_planned(tree, &HashMap::new(), &InstanceTable::builtin());
+        let check = |tree: &Expr| typecheck_planned(tree, &HashMap::new(), &InstanceTable::std());
         let one = Expr::lit(Lit::Int(1)).with_ty(int_lit_ty(1));
         let two = Expr::lit(Lit::Int(2)).with_ty(int_lit_ty(2));
         check(&let_bound(equals(one))).expect("the closed body type is the recorded one");

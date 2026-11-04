@@ -1351,7 +1351,7 @@ mod tests {
         let result = planned_loop_join(
             &int_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &InstanceTable::std(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1371,7 +1371,7 @@ mod tests {
         let result = planned_loop_join(
             &triple_tuple,
             &refinement,
-            &InstanceTable::builtin(),
+            &InstanceTable::std(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1387,7 +1387,7 @@ mod tests {
         let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &InstanceTable::std(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1411,7 +1411,7 @@ mod tests {
         let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &InstanceTable::std(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1434,7 +1434,7 @@ mod tests {
         let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &InstanceTable::std(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1458,7 +1458,7 @@ mod tests {
         let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &InstanceTable::std(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1491,7 +1491,7 @@ mod tests {
         let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &InstanceTable::std(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1520,7 +1520,7 @@ mod tests {
         let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &InstanceTable::std(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1550,7 +1550,7 @@ mod tests {
         let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &InstanceTable::std(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1589,7 +1589,7 @@ mod tests {
         let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &InstanceTable::std(),
             &mut Vec::new(),
         );
         assert_eq!(result, None);
@@ -1636,7 +1636,7 @@ mod tests {
         let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
-            &InstanceTable::builtin(),
+            &InstanceTable::std(),
             &mut Vec::new(),
         );
         assert!(
@@ -2008,7 +2008,7 @@ mod tests {
         });
 
         // Should succeed: eq condition drives the hash join, filter becomes a predicate.
-        let result = planned_loop_join(&t, &refinement, &InstanceTable::builtin(), &mut Vec::new());
+        let result = planned_loop_join(&t, &refinement, &InstanceTable::std(), &mut Vec::new());
         assert!(
             result.is_some(),
             "convert_loop_join should succeed when eq conditions + extra filter are present"
@@ -2038,7 +2038,7 @@ mod tests {
         .with_ty(fun_ty(t.clone(), bool_ty_val));
 
         assert_eq!(
-            planned_loop_join(&t, &filter, &InstanceTable::builtin(), &mut Vec::new()),
+            planned_loop_join(&t, &filter, &InstanceTable::std(), &mut Vec::new()),
             None,
             "should return None when no equality conditions are present"
         );

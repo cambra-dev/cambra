@@ -2733,11 +2733,12 @@ mod tests {
         // A `TraitFn` carries its trait's operand types, which coalescing resolves to
         // choose the instance, and the associated types it states.
         let mut trait_fn = TypedExpr::new(TypedExprNode::TraitFn {
-            trait_: crate::ccl::infer::solver::traits::Trait::addable(),
+            trait_: crate::ccl::infer::solver::traits::InstanceTable::std()
+                .std_trait(crate::ccl::infer::solver::traits::StdTrait::Addable),
             function: "add".into(),
             operands: vec![marker("operand")],
             assoc: vec![(
-                crate::ccl::infer::solver::traits::Assoc::Output,
+                crate::ccl::infer::solver::traits::Assoc::output(),
                 marker("assoc"),
             )],
         });

@@ -725,7 +725,8 @@ mod tests {
                 var("pl"),
             ),
             node(N::TraitFn {
-                trait_: crate::ccl::infer::solver::traits::Trait::addable(),
+                trait_: crate::ccl::infer::solver::traits::InstanceTable::std()
+                    .std_trait(crate::ccl::infer::solver::traits::StdTrait::Addable),
                 function: "add".into(),
                 operands: vec![Type::Hole],
                 assoc: Vec::new(),

@@ -1117,7 +1117,7 @@ mod tests {
     )]
     fn test_lower_expr(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
-        let ccl = lower_expr(&expr, &mut LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_expr(&expr, &mut std_context()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -1133,7 +1133,7 @@ mod tests {
         use crate::ccl::provenance::{LoweringSession, fold_lowering};
 
         let expr = parse_expr("1 < x < 3");
-        let mut ctx = LoweringContext::default();
+        let mut ctx = std_context();
         let session = LoweringSession::install();
         let ccl = lower_expr(&expr, &mut ctx).expect("lowering failed");
         let log = session.into_log();
@@ -1180,7 +1180,7 @@ mod tests {
     )]
     fn test_lower_aggregate(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
-        let ccl = lower_expr(&expr, &mut LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_expr(&expr, &mut std_context()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 
@@ -1213,7 +1213,7 @@ mod tests {
     )]
     fn test_lower_groupby(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
-        let mut ctx = LoweringContext::default();
+        let mut ctx = std_context();
         let ccl = lower_expr(&expr, &mut ctx).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
@@ -1223,12 +1223,12 @@ mod tests {
     fn test_lower_groupby_wrong_arity() {
         let one_arg = parse_expr("groupby(xs)");
         assert!(matches!(
-            lower_expr(&one_arg, &mut LoweringContext::default()),
+            lower_expr(&one_arg, &mut std_context()),
             Err(LoweringError::Unsupported { .. })
         ));
         let three_args = parse_expr("groupby(xs, f, extra)");
         assert!(matches!(
-            lower_expr(&three_args, &mut LoweringContext::default()),
+            lower_expr(&three_args, &mut std_context()),
             Err(LoweringError::Unsupported { .. })
         ));
     }
@@ -1238,8 +1238,7 @@ mod tests {
     #[test]
     fn test_lower_unknown_function_single_arg() {
         let expr = parse_expr("foo(x)");
-        let ccl = lower_expr(&expr, &mut LoweringContext::default())
-            .expect("expected lowering to succeed");
+        let ccl = lower_expr(&expr, &mut std_context()).expect("expected lowering to succeed");
         // foo(x) == x ▷ foo in pipeline notation
         assert_eq!(symbolic(&ccl), "x ▷ foo");
     }
@@ -1248,8 +1247,7 @@ mod tests {
     #[test]
     fn test_lower_unknown_zero_arg_fails() {
         let expr = parse_expr("foo()");
-        let err = lower_expr(&expr, &mut LoweringContext::default())
-            .expect_err("expected lowering error");
+        let err = lower_expr(&expr, &mut std_context()).expect_err("expected lowering error");
         assert!(
             matches!(err, LoweringError::Unsupported { .. }),
             "expected Unsupported, got {err:?}"
@@ -1263,7 +1261,7 @@ mod tests {
     /// A zero-argument call whose name is registered lowers to `Expr::Source`.
     #[test]
     fn test_lower_registered_source_becomes_source_node() {
-        let mut ctx = LoweringContext::default();
+        let mut ctx = std_context();
         ctx.register_source("mystream", stub_source("mystream"));
         let expr = parse_expr("mystream()");
         let ccl = lower_expr(&expr, &mut ctx).expect("lowering failed");
@@ -1274,8 +1272,7 @@ mod tests {
     #[test]
     fn test_lower_unregistered_zero_arg_call_fails() {
         let expr = parse_expr("unknown_source()");
-        let err = lower_expr(&expr, &mut LoweringContext::default())
-            .expect_err("expected lowering error");
+        let err = lower_expr(&expr, &mut std_context()).expect_err("expected lowering error");
         assert!(matches!(err, LoweringError::Unsupported { .. }));
     }
 
@@ -1290,7 +1287,7 @@ mod tests {
         use chl_parser::{Arity, SurfaceBuiltinKind};
 
         for row in SURFACE_BUILTINS {
-            let mut ctx = LoweringContext::default();
+            let mut ctx = std_context();
             for other in SURFACE_BUILTINS {
                 ctx.register_source(other.spelling, stub_source(other.spelling));
             }
@@ -1319,7 +1316,7 @@ mod tests {
     /// lowers to `Expr::Var`, not `Expr::Source` — the call syntax is required.
     #[test]
     fn test_lower_source_name_without_call_is_var() {
-        let mut ctx = LoweringContext::default();
+        let mut ctx = std_context();
         ctx.register_source("mystream", stub_source("mystream"));
         let expr = parse_expr("mystream");
         let ccl = lower_expr(&expr, &mut ctx).expect("lowering failed");
@@ -1336,7 +1333,7 @@ mod tests {
     #[case("\"yes\" if flag else \"no\"", "{ flag → \"yes\"; true → \"no\" }")]
     fn test_lower_if_expr(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);
-        let ccl = lower_expr(&expr, &mut LoweringContext::default()).expect("lowering failed");
+        let ccl = lower_expr(&expr, &mut std_context()).expect("lowering failed");
         assert_eq!(symbolic(&ccl), expected);
     }
 }

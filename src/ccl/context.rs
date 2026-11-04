@@ -984,7 +984,7 @@ impl GlobalContext {
     pub fn new() -> Self {
         let mut result = Self {
             lowering: LoweringContext::default(),
-            inference: TypeInferenceContext::new(),
+            inference: TypeInferenceContext::for_program(),
             conversion: OpConversionContext::new(),
             scheduler: Scheduler::new(),
             sources_and_sinks: SourceSinkRegistry::default(),
@@ -1003,7 +1003,7 @@ impl GlobalContext {
     fn scratch(lowering: LoweringContext) -> Self {
         Self {
             lowering,
-            inference: TypeInferenceContext::new(),
+            inference: TypeInferenceContext::for_program(),
             conversion: OpConversionContext::new(),
             scheduler: Scheduler::new(),
             sources_and_sinks: SourceSinkRegistry::default(),

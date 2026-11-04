@@ -31,7 +31,7 @@ use super::solve::value_type;
 use super::typing::{LetScheme, MethodCallsEnd, Typing};
 use super::{coalesce_for_error, map_constrain_err};
 use crate::ccl::infer::solver::traits::{
-    Assoc, InstanceTable, MethodCall, MethodRow, Trait, TraitObligation,
+    Assoc, InstanceTable, MethodCall, MethodRow, StdTrait, Trait, TraitObligation,
 };
 use crate::ccl::ty::{KindPin, TraitRequirement};
 
@@ -506,7 +506,7 @@ impl InferCtx {
             fed_elsewhere: HashMap::new(),
             errors: Vec::new(),
             poisoned_reads: 0,
-            instances: InstanceTable::builtin(),
+            instances: Rc::default(),
             groups: Vec::new(),
             trait_calls: HashMap::new(),
             recoveries: 0,
@@ -1759,6 +1759,10 @@ impl TelescopeWalk for InferCtx {
 }
 
 impl Typing for InferCtx {
+    fn std_trait(&self, named: StdTrait) -> Trait {
+        self.instances.std_trait(named)
+    }
+
     fn defer_method(
         &mut self,
         function: &mut Expr,
@@ -2508,6 +2512,7 @@ mod tests {
     #[test]
     fn fresh_variables_carry_the_live_telescope() {
         let mut ctx = InferCtx::new(HashMap::new(), NodeId::fresh());
+        ctx.instances = InstanceTable::std();
         let k = Name::raw("k");
         let n = Name::raw("n");
         let inside = ctx.scoped(&k, &Type::Hole, |c| {
@@ -2534,6 +2539,7 @@ mod tests {
     #[test]
     fn an_unnamed_annotation_adopts_the_inferred_pi_binder() {
         let mut ctx = InferCtx::new(HashMap::new(), NodeId::fresh());
+        ctx.instances = InstanceTable::std();
         let k = Name::raw("__gb_k");
         let inferred = Type::pi_kinded(
             k.clone(),

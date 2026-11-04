@@ -448,8 +448,8 @@ module's own nominal types by name and another module's qualified by it (`chl_ty
 
 A trait is a member of its module, and its declaration records the module's path
 (`TraitDecl::module`), so two modules' traits of one name are two traits. A module names a trait
-it declares, a compiler trait, one a `use` name reaches (`Reached::Trait`), or a public one of the
-module a qualifier names (`Qualifier::reach_trait`), as in `shapes::Area(S)`
+it declares, one a `use` name reaches (`Reached::Trait`), the prelude's included, or a public one
+of the module a qualifier names (`Qualifier::reach_trait`), as in `shapes::Area(S)`
 (`LoweringContext::resolve_trait`). A summon, a requirement and an instance's head name a trait the
 same way, and an `impl` head naming one is refused (`LoweringContext::names_a_trait`).
 

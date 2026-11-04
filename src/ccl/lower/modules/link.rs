@@ -1078,6 +1078,9 @@ impl<'a> ProgramLowering<'a> {
         if let Some(option) = ctx.nominal_types.iter().find(|decl| decl.is_option()) {
             ctx.std_option = Some(declared_option(option));
         }
+        if module.segments() == [chl_parser::module_path::STD_ROOT] && lowered.errors.is_empty() {
+            ctx.declare_std_traits();
+        }
         let sinks = std::mem::take(&mut ctx.declared_sinks);
         let run_checks = std::mem::take(&mut ctx.run_type_checks);
         let unimportable = sink_site(ast)

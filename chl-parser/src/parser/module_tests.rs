@@ -549,7 +549,7 @@ fn an_unknown_decorator_is_reported_by_name() {
             @Forget
             stock
         "},
-        "unknown decorator `Forget`; the decorators are `LoadFrom`, `RenamedFrom` and `Discard`",
+        "unknown decorator `Forget`; the decorators are `LoadFrom`, `RenamedFrom`, `Discard` and `Builtin`",
     );
 }
 

@@ -3880,14 +3880,15 @@ determining side from the determined one. An instance is one hyper-edge, and
 resolution is the search for a hyper-edge consistent with what inference has determined
 about the operand positions.
 
-The compiler's traits have `𝑁 ∈ {1, 2}`, `𝐴 ∈ {0, 1}` (`Output`, or nothing) and `𝐹 ∈ {0, 1}`:
+The compiler's traits, which `std` declares (`StdTrait`), have `𝑁 ∈ {1, 2}`, `𝐴 ∈ {0, 1}` (`Output`, or nothing) and `𝐹 ∈ {0, 1}`:
 each arithmetic trait associates the function its operator calls, `add` for `+`, and
 `Equatable`, `Orderable` and `AddableRefined` associate none. A trait a module declares has any
 `𝑁`, `𝐴` and `𝐹` ([Trait functions](#trait-functions)).
 
 An arithmetic trait's rows denote distinct functions: `Addable(String, String ⇝ String)` is
-concatenation and `Addable(Int, Int ⇝ Int)` is integer addition. Each compiler row states its
-function as a primitive (`InstanceBody`), and an operator a compiler row answers runs that
+concatenation and `Addable(Int, Int ⇝ Int)` is integer addition. Each compiler row is a
+`@Builtin instance` of `std`, which lowering gives a primitive for each function its trait
+declares (`InstanceBody`, from `StdTrait::primitive`), and an operator a compiler row answers runs that
 primitive ([An operator's instance](#an-operators-instance)), so `+` on strings is `Concat` once
 coalescing has chosen the row. A primitive is one operation at every base its rows accept: `Add`
 at `Int` and at `UInt` is one primitive, and the interpreter runs it at the operand column's
@@ -3900,22 +3901,28 @@ the same value, and a nominal type's order is the one its declaration writes (`d
 
 Traits and instances are *data*, one representation for the compiler's and a module's alike.
 Every trait is a declaration (`TraitDecl`, held by `Trait`): its operands, its associated types
-and its functions. The compiler builds its traits once, as it builds `Option` (`Trait::addable` and
-the rest). An instance (`TraitInstance`) is a head of patterns over its type variables, the
-associated types it fixes, its conditions and its functions; a compiler instance's head names base
-types. A program's `InstanceTable` holds the compiler's instances and the ones lowering adds, of
-its traits and of the compiler's. Inference reads every obligation's candidates from that table, so
-a declared trait or instance is a table extension rather than a new mechanism.
+and its functions. Lowering builds every one, the compiler's included: they are `std`'s
+(`stdlib/src/std.cambra`), and a `@Builtin` trait takes its product reading and its collection
+reading from `StdTrait::builtin_reading`. An instance (`TraitInstance`) is a head of patterns over
+its type variables, the associated types it fixes, its conditions and its functions. A compiler
+instance is a `@Builtin` one, whose head names base types and whose functions are primitives;
+every other instance's functions are its `def`s' bindings (`TraitInstance::binds_functions`), and
+inference reads that, not where an instance is declared.
+A program's `InstanceTable` holds every instance lowering adds, `std`'s among them, and the traits
+the compiler names (`InstanceTable::std_trait`), which an operator, a loop and `max` require. A
+tree no program lowered, as a test builds, reads `InstanceTable::std`, the table of `std` alone.
+Inference reads every obligation's candidates from the table, so a declared trait or instance is
+a table extension rather than a new mechanism.
 
 #### What the tables hold
 
 An instance names a **pattern** at each operand: a type variable, a base type, or a nominal type
 applied to patterns. The pattern's **head** (`InstanceHead`) is a base type, a nominal type at any
-arguments, or `Any` for a variable standing as the whole operand, which is what narrowing reads. Every compiler instance but one accepts
-bases only, and every one is homogeneous: `Addable(Int, Int ⇝ Int)`, never
-`Addable(Int, String ⇝ …)`. The one is `Equatable(Option(𝑇), Option(𝑇)) requires Equatable(𝑇, 𝑇)`
-the compiler's as `Option` is, which no module may declare (`docs/chl-spec.md`, "Equality and
-order"). Two instances overlap when their patterns unify (`unify_all`), which
+arguments, or `Any` for a variable standing as the whole operand, which is what narrowing reads.
+Every compiler instance accepts bases only, and every one is homogeneous:
+`Addable(Int, Int ⇝ Int)`, never `Addable(Int, String ⇝ …)`.
+`Equatable(Option(𝑇), Option(𝑇)) requires Equatable(𝑇, 𝑇)` is `std`'s declared instance, beside
+`Option` (`docs/chl-spec.md`, "Equality and order"). Two instances overlap when their patterns unify (`unify_all`), which
 lowering refuses. These are the tables' content, not properties of resolution: nothing in
 narrowing or deposit assumes them. So a trait rejecting a variant is what these rows happen to be,
 and not a judgement that such types are incomparable.

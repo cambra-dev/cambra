@@ -17,7 +17,42 @@
 #             case Option::none:
 #                 0
 #
+# A member the compiler implements is marked `@Builtin`: its declaration states its type, and the
+# compiler supplies what CHL cannot state. A `@Builtin` trait holds of types beyond its instances,
+# and a `@Builtin` instance runs a primitive for each function its trait declares, which no CHL
+# body states: `+` on `Int` is the very operation `Addable(Int, Int)` defines. An instance of a
+# trait that declares no function is plain CHL. Only `std` declares a `@Builtin` member.
+#
 # Status: the std root and the prelude are implemented (docs/chl-spec.md, "9.16 The std root").
+
+# --- Comparison ---------------------------------------------------------------------------------
+
+# Types whose values compare with `==` and `!=`.
+#
+# Two values are equal when they are the same value: the same base value, the same constructor of
+# a nominal type with equal arguments, or products whose components are equal. A product is
+# `Equatable` wherever its components are, which no instance states: the compiler answers it
+# (docs/chl-spec.md, "Equality and order").
+@Builtin
+pub trait Equatable(A, B)
+
+# Types whose values order with `<`, `<=`, `>` and `>=`, and that `max` and `min` fold.
+#
+# A tuple orders lexicographically wherever its components order, which no instance states: the
+# compiler answers it. A record's fields carry no order. What orders by value is equal by value, so
+# every instance is one of `Equatable` too.
+@Builtin
+pub trait Orderable(A, B) requires Equatable(A, B)
+
+instance Equatable(Int, Int)
+instance Equatable(UInt, UInt)
+instance Equatable(String, String)
+instance Equatable(Bool, Bool)
+
+instance Orderable(Int, Int)
+instance Orderable(UInt, UInt)
+instance Orderable(String, String)
+instance Orderable(Bool, Bool)
 
 # --- Option -------------------------------------------------------------------------------------
 
@@ -43,3 +78,99 @@ impl Option(T):
                 False
             case Option::none:
                 True
+
+# --- Arithmetic ---------------------------------------------------------------------------------
+
+# Types `+` adds: `a + b` is `add(a, b)`, of type `Output`. On strings, `+` concatenates.
+pub trait Addable(A, B):
+    Output
+    def add(a: A, b: B) => Output
+
+# Types `^+` adds, whose result is refined by the sum of the operands
+# (docs/chl-spec.md, "Trait requirements"). It declares no function: `^+` computes what `+`
+# computes, and states the sum as a refinement of its result.
+trait AddableRefined(A, B):
+    Output
+
+# Types `-` subtracts: `a - b` is `sub(a, b)`.
+pub trait Subtractable(A, B):
+    Output
+    def sub(a: A, b: B) => Output
+
+# Types `*` multiplies: `a * b` is `mul(a, b)`.
+pub trait Multipliable(A, B):
+    Output
+    def mul(a: A, b: B) => Output
+
+# Types `//` divides: `a // b` is `div(a, b)`, rounded toward negative infinity on integers.
+pub trait Divisible(A, B):
+    Output
+    def div(a: A, b: B) => Output
+
+# Types `**` raises: `a ** b` is `pow(a, b)`. The exponent is a non-negative `Int` whichever
+# instance answers it.
+pub trait Exponentiable(A, B):
+    Output
+    def pow(a: A, b: B) => Output
+
+# Types unary `-` negates: `-a` is `neg(a)`.
+pub trait Negatable(A):
+    Output
+    def neg(a: A) => Output
+
+@Builtin
+instance Addable(Int, Int):
+    Output = Int
+@Builtin
+instance Addable(UInt, UInt):
+    Output = UInt
+@Builtin
+instance Addable(String, String):
+    Output = String
+
+instance AddableRefined(Int, Int):
+    Output = Int
+instance AddableRefined(UInt, UInt):
+    Output = UInt
+
+@Builtin
+instance Subtractable(Int, Int):
+    Output = Int
+@Builtin
+instance Subtractable(UInt, UInt):
+    Output = UInt
+
+@Builtin
+instance Multipliable(Int, Int):
+    Output = Int
+@Builtin
+instance Multipliable(UInt, UInt):
+    Output = UInt
+
+@Builtin
+instance Divisible(Int, Int):
+    Output = Int
+@Builtin
+instance Divisible(UInt, UInt):
+    Output = UInt
+
+@Builtin
+instance Exponentiable(Int, Int):
+    Output = Int
+
+@Builtin
+instance Negatable(Int):
+    Output = Int
+
+# --- Iteration ----------------------------------------------------------------------------------
+
+# Types a `for` loop and a comprehension's `for` clause walk: `elements(c)` is the collection the
+# loop walks, of type `Elements`.
+#
+# A structural collection is `Iterable` as itself, its `Elements` the collection and `elements`
+# the identity, which no instance states: the compiler answers it. A nominal type is `Iterable`
+# through the instance its module declares.
+@Builtin
+pub trait Iterable(C):
+    Elements <: _ |=> _
+    def elements(c: C) => Elements

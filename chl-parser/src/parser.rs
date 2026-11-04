@@ -1804,7 +1804,7 @@ where
                         .to_string(),
                     _ => format!(
                         "unknown decorator `{name}`; the decorators are `LoadFrom`, \
-                         `RenamedFrom` and `Discard`"
+                         `RenamedFrom`, `Discard` and `Builtin`"
                     ),
                 };
                 Err(Rich::custom(name_span, message))
@@ -2074,6 +2074,7 @@ where
                     assoc,
                     requires: requires.unwrap_or_default(),
                     defs,
+                    builtin: None,
                 };
                 let stmt = if instance {
                     Stmt::Instance(block)
@@ -2134,17 +2135,24 @@ where
                     .delimited_by(just(Token::LParen), just(Token::RParen)),
             )
             .then(requires_clause(expr.clone()).or_not())
-            .then_ignore(just(Token::Colon))
-            .then_ignore(just(Token::Newline))
-            .then_ignore(just(Token::Indent).labelled("indented associated types and signatures"))
+            // A trait with no body associates no type and declares no function, as
+            // `Equatable` does: its instances state only that their types satisfy it.
             .then(
-                trait_item
-                    .then_ignore(just(Token::Newline).repeated())
-                    .repeated()
-                    .at_least(1)
-                    .collect::<Vec<_>>(),
+                just(Token::Colon)
+                    .ignore_then(just(Token::Newline))
+                    .ignore_then(
+                        just(Token::Indent).labelled("indented associated types and signatures"),
+                    )
+                    .ignore_then(
+                        trait_item
+                            .then_ignore(just(Token::Newline).repeated())
+                            .repeated()
+                            .at_least(1)
+                            .collect::<Vec<_>>(),
+                    )
+                    .then_ignore(just(Token::Dedent))
+                    .or(just(Token::Newline).to(Vec::new())),
             )
-            .then_ignore(just(Token::Dedent))
             .validate(|(((name, params), requires), items), e, emitter| {
                 let heads = std::iter::once((&name, "trait name"))
                     .chain(params.iter().map(|p| (p, "trait operand")))
@@ -2171,8 +2179,59 @@ where
                         params,
                         requires: requires.unwrap_or_default(),
                         items,
+                        builtin: None,
                     }),
                 )
+            });
+
+        // ---- @Builtin above a trait or an instance -------------------
+        // (`docs/chl-spec.md`, "9.16 The std root")
+        //
+        // The decorator and its declaration are one statement, as the other decorators'
+        // are. Lowering refuses it outside the std root. `pub` stands on the line below the
+        // decorator, at the head of the declaration it marks.
+        let builtin_stmt = just(Token::At)
+            .ignore_then(
+                select! { Token::Ident(s) if s == "Builtin" => () }.map_with(|(), e| e.span()),
+            )
+            .then_ignore(just(Token::Newline))
+            .then(just(Token::Pub).map_with(|_, e| e.span()).or_not())
+            .then(choice((trait_stmt.clone(), impl_stmt.clone())))
+            .validate(|((builtin, keyword), stmt), e, emitter| {
+                let node = match stmt.node {
+                    Stmt::TraitDecl(mut decl) => {
+                        decl.builtin = Some(builtin);
+                        Stmt::TraitDecl(decl)
+                    }
+                    Stmt::Instance(mut block) => {
+                        block.builtin = Some(builtin);
+                        Stmt::Instance(block)
+                    }
+                    other => {
+                        emitter.emit(Rich::custom(
+                            builtin,
+                            "`@Builtin` decorates a `trait` or an `instance`; an `impl` block's \
+                             functions are written in CHL",
+                        ));
+                        other
+                    }
+                };
+                if let Some(keyword) = keyword
+                    && let Some(refused) = pub_refusal(&node)
+                {
+                    emitter.emit(Rich::custom(keyword, refused));
+                }
+                let stmt = Spanned::new(e.span(), node);
+                match keyword {
+                    None => stmt,
+                    Some(keyword) => Spanned::new(
+                        e.span(),
+                        Stmt::Pub {
+                            keyword,
+                            stmt: Box::new(stmt),
+                        },
+                    ),
+                }
             });
 
         // ---- simple statements (must end at NEWLINE) ----------------
@@ -2360,6 +2419,7 @@ where
             type_stmt,
             impl_stmt,
             trait_stmt,
+            builtin_stmt,
             decorated_stmt,
             pub_stmt,
             const_stmt,
@@ -3280,6 +3340,57 @@ mod tests {
         assert_eq!(block.assoc[0].name.as_str(), "Elem");
         assert_eq!(block.defs.len(), 1);
         assert_eq!(requirement_binder(&block.requires[0].node), Some("c"));
+    }
+
+    /// A trait with no body declares nothing, and `@Builtin` marks a trait or an instance on
+    /// the line below it, under `pub` or not (`docs/chl-spec.md`, "9.16 The std root").
+    #[test]
+    fn builtin_marks_a_trait_or_an_instance() {
+        let m = parse_m(indoc! {"
+            trait Same(A, B)
+            @Builtin
+            pub trait Ordered(A, B) requires Same(A, B)
+            @Builtin
+            instance Same(Int, Int)
+            @Builtin
+            instance Sized(Int):
+                Size = Int
+        "});
+        let Stmt::TraitDecl(same) = &m.body[0].node else {
+            panic!("expected a trait declaration, got {:?}", m.body[0].node)
+        };
+        assert!(same.items.is_empty() && same.builtin.is_none());
+        let Stmt::Pub { stmt, .. } = &m.body[1].node else {
+            panic!("expected `pub`, got {:?}", m.body[1].node)
+        };
+        let Stmt::TraitDecl(ordered) = &stmt.node else {
+            panic!("expected a trait declaration, got {:?}", stmt.node)
+        };
+        assert!(ordered.builtin.is_some() && ordered.requires.len() == 1);
+        for (i, assoc) in [(2, 0), (3, 1)] {
+            let Stmt::Instance(block) = &m.body[i].node else {
+                panic!("expected an instance, got {:?}", m.body[i].node)
+            };
+            assert!(block.builtin.is_some());
+            assert_eq!(block.assoc.len(), assoc);
+        }
+    }
+
+    #[test]
+    fn builtin_refuses_an_impl_block() {
+        let errors = parse_mod(indoc! {"
+            @Builtin
+            impl Two(T):
+                def first(self) => T:
+                    self.extract().0
+        "})
+        .errors;
+        assert!(
+            errors.iter().any(|e| e
+                .to_string()
+                .contains("`@Builtin` decorates a `trait` or an `instance`")),
+            "{errors:?}"
+        );
     }
 
     /// The name a trait requirement binds its instance to.

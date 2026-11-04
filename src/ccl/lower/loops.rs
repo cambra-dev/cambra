@@ -327,9 +327,9 @@ pub(super) fn lower_loop_source(
     iter: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Expr, LoweringError> {
-    use crate::ccl::infer::solver::traits::{ITERABLE_ELEMENTS, Trait};
+    use crate::ccl::infer::solver::traits::{ITERABLE_ELEMENTS, StdTrait};
     let source = lower_expr(iter, ctx)?;
-    let trait_ = Trait::iterable();
+    let trait_ = ctx.instances.std_trait(StdTrait::Iterable);
     let label = "lower.iterable_elements";
     let elements = ctx.tag_machinery(
         Expr::new(TypedExprNode::TraitFn {
