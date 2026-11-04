@@ -1024,6 +1024,8 @@ fn builtin_preserves_domain(builtin: &Builtin) -> bool {
         | Builtin::BinOp(_)
         | Builtin::Neg
         | Builtin::NotFn
+        | Builtin::IntToUint
+        | Builtin::IntEqUint
         | Builtin::VariantWrap(_)
         | Builtin::VariantIs(_)
         | Builtin::CollectionContains => true,

@@ -356,8 +356,9 @@ pub fn coalesce_compact(graph: &CompactGraph) -> Result<Type, CoalesceError> {
 /// [`coalesce_compact`] of one position at `polarity`, outside any binder.
 ///
 /// For a caller that rewrites a [`CompactGraph`] position by position and needs to
-/// know what one materializes to (`super::display`).
-pub(super) fn coalesce_position(ct: &CompactType, polarity: bool) -> Result<Type, CoalesceError> {
+/// know what one materializes to (`super::display`), and for the differential oracle, which
+/// materializes a merged bound at the polarity it merged at.
+pub fn coalesce_position(ct: &CompactType, polarity: bool) -> Result<Type, CoalesceError> {
     coalesce_compact_go(ct, polarity, &[])
 }
 
@@ -422,6 +423,24 @@ fn coalesce_type_kind(
     }
 }
 
+/// Settle a scalar position where `UInt` and ranges meet, by `0..𝑚 <: 0..𝑛 <: UInt` for
+/// `𝑚 ≤ 𝑛`: the atoms form a chain, so a join keeps its greatest member and a meet its least.
+/// A data domain's atoms are alternatives rather than bounds ([`super::compact::denoted_domains`])
+/// and never reach here.
+fn absorb_uint_ranges(atoms: &mut Vec<Type>, polarity: bool) {
+    // A range ranks by its bound, and `UInt` above every range.
+    let rank = |a: &Type| match a {
+        Type::UIntRange(n) => Some(u128::from(*n)),
+        Type::Base(crate::ccl::BaseType::UInt) => Some(u128::MAX),
+        _ => None,
+    };
+    let chain = atoms.iter().filter_map(rank);
+    let Some(keep) = (if polarity { chain.max() } else { chain.min() }) else {
+        return;
+    };
+    atoms.retain(|a| rank(a).is_none_or(|r| r == keep));
+}
+
 fn coalesce_compact_go(
     ct: &CompactType,
     polarity: bool,
@@ -457,6 +476,7 @@ fn coalesce_compact_go(
             other => atoms.push(other.to_type()),
         }
     }
+    absorb_uint_ranges(&mut atoms, polarity);
     if !seen.is_empty() {
         // **A reference is resolved against the scope, not against its neighbours.** The
         // binders enclosing this position are settled before its parts materialize, so a
@@ -1512,6 +1532,26 @@ mod tests {
             coalesce_compact_go(&ct, false, &[]).unwrap(),
             Type::Param(t)
         );
+    }
+
+    /// `UInt` and ranges meeting settle by `0..𝑚 <: 0..𝑛 <: UInt` for `𝑚 ≤ 𝑛`: the meet is the
+    /// narrowest range and the join the widest member.
+    #[test]
+    fn uint_and_ranges_settle_by_inclusion() {
+        let uint = prim(BaseType::UInt);
+        let (narrow, wide) = (Type::UIntRange(3), Type::UIntRange(4));
+        let settle = |polarity: bool, atoms: &[Type]| {
+            coalesce_compact_go(&position(polarity, atoms), polarity, &[]).unwrap()
+        };
+        assert_eq!(settle(false, &[uint.clone(), narrow.clone()]), narrow);
+        assert_eq!(settle(true, &[uint.clone(), narrow.clone()]), uint);
+        assert_eq!(settle(false, &[wide.clone(), narrow.clone()]), narrow);
+        assert_eq!(settle(true, &[narrow.clone(), wide.clone()]), wide);
+        assert_eq!(
+            settle(false, &[wide.clone(), uint.clone(), narrow.clone()]),
+            narrow
+        );
+        assert_eq!(settle(true, &[wide, uint.clone(), narrow]), uint);
     }
 
     /// An unbounded parameter has no common type with anything else.

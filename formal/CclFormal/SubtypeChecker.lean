@@ -26,7 +26,8 @@ codomains (and their index-spelled refinements) compare directly. -/
 def subtypeCheck (lhs rhs : Ty) : Bool :=
   match lhs, rhs with
   | .base a, .base b => a == b
-  | .uintRange a, .uintRange b => a == b
+  | .uintRange a, .uintRange b => decide (a ≤ b)
+  | .uintRange _, .base .uint => true
   | .dataSource a, .dataSource b => a == b
   | .txn, .txn => true
   | .fn _ k0 d0 c0, .fn _ k1 d1 c1 =>
@@ -120,9 +121,14 @@ the checker refusing to build is the cheapest regression net for the rules' shap
   (.refined (.record [("a", .base .int), ("b", .base .bool)]) [.elem])
   (.refined (.record [("a", .base .int)]) [.elem]) = true
 
-/- `UIntRange` is equality-only: `[0,3) ⊀ [0,4)` despite the inclusion. -/
-#guard subtypeCheck (.uintRange 3) (.uintRange 4) = false
+/- A range is below every range including it: `[0,3) <: [0,4)` and not the reverse. -/
+#guard subtypeCheck (.uintRange 3) (.uintRange 4) = true
+#guard subtypeCheck (.uintRange 4) (.uintRange 3) = false
 #guard subtypeCheck (.uintRange 3) (.uintRange 3) = true
+/- Every range is below `UInt`, and `UInt` is below no range. -/
+#guard subtypeCheck (.uintRange 3) (.base .uint) = true
+#guard subtypeCheck (.base .uint) (.uintRange 3) = false
+#guard subtypeCheck (.uintRange 3) (.base .int) = false
 
 /- Record width: more fields flow to fewer, never the reverse. -/
 #guard subtypeCheck

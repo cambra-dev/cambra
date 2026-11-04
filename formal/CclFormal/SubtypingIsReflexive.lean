@@ -23,7 +23,7 @@ namespace CclFormal
 no analog of `constrain_go`'s trivial-equality short-circuit. -/
 theorem Subtyping.refl : (t : Ty) → t.WellFormed → Subtyping t t
   | .base b, _ => .base b
-  | .uintRange n, _ => .uintRange n
+  | .uintRange _, _ => .uintRange (Nat.le_refl _)
   | .dataSource s, _ => .dataSource s
   | .txn, _ => .txn
   | .fn n k d c, hwf => by

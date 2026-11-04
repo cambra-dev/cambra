@@ -366,7 +366,9 @@ presence at runtime and returns `Option`. The
 A `FullMap(K, V)` parameter with a key of type `K` satisfies ordinary application.
 That typing rule does not construct a value at such a domain. A concrete keyed domain requires
 its own membership evidence; a known source element does not currently acquire it automatically.
-Range-domain list subscripts are also rejected in the tested integer-index cases.
+A list's proven lookup accepts a `UInt` key whose refinement entails the range bound, such as
+`xs[int_to_uint(1)]!` over `0..3` (see
+[Semantic entailment as a fallback](type-inference.md#semantic-entailment-as-a-fallback)).
 
 ### The checked lookup `𝑐[𝑘]`
 
@@ -377,7 +379,9 @@ Lowering emits `(c, k) ▷ lookup?`. `emit_apply` intercepts that builtin applic
    its first witness must have kind `SubtypesOf(K)`; the sum is instantiated at `K`.
    A concrete function supplies its own domain.
 2. `Typing::keyed_value_at` substitutes the key term into a dependent codomain.
-3. `keyed_access_value` constrains the key below the domain's base, peeling refinements.
+3. `keyed_access_value` constrains the key below the domain's base, peeling refinements. The
+   base of a range `0..𝑛` is `UInt`, so a list's checked lookup at a key outside the range types
+   and answers `none`.
 4. The rule returns `Option` of the value type and stamps the builtin with the concrete
    pair-to-Option function type.
 

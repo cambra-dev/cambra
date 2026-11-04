@@ -42,6 +42,34 @@ def atomTy : Atom → Ty
   | .source s => .dataSource s
   | .txn => .txn
 
+/-- Whether a materialized atom is `UInt` or a range: the atoms `0..𝑚 <: 0..𝑛 <: UInt` orders. -/
+def inUIntChain : Ty → Bool
+  | .base .uint => true
+  | .uintRange _ => true
+  | _ => false
+
+/-- The order on the `UInt` chain: `0..𝑚 <: 0..𝑛` for `𝑚 ≤ 𝑛`, and every range below `UInt`. -/
+def uintChainLe : Ty → Ty → Bool
+  | .uintRange a, .uintRange b => decide (a ≤ b)
+  | .uintRange _, .base .uint => true
+  | .base .uint, .base .uint => true
+  | _, _ => false
+
+/-- `u` is below `t` in the polarity's direction: a join keeps the greatest, a meet the least. -/
+def uintChainToward (pol : Bool) (u t : Ty) : Bool :=
+  if pol then uintChainLe u t else uintChainLe t u
+
+/-- Mirror of `absorb_uint_ranges` (`coalesce.rs`): where `UInt` and ranges meet, the position
+settles by `0..𝑚 <: 0..𝑛 <: UInt`. A chain atom survives only when every chain atom beside it is
+toward it, so a join keeps the greatest and a meet the least. -/
+def absorbUIntRanges (pol : Bool) (ts : List Ty) : List Ty :=
+  ts.filter fun t => !inUIntChain t || ts.all fun u => !inUIntChain u || uintChainToward pol u t
+
+/-- The atom contributions a position materializes: one type per distinct atom, then
+`absorbUIntRanges`. -/
+def atomShapes (pol : Bool) (atoms : List Atom) : List Ty :=
+  absorbUIntRanges pol (atoms.map atomTy).eraseDups
+
 /-- Re-attach the position's refinements, flattening as `Type::refined` does: an empty
 refinement set is the bare type. -/
 def attachRefinements (t : Ty) : Option (List Predicate) → Ty
@@ -199,7 +227,7 @@ def coalesce (pol : Bool) : CompactTy → Except CoalesceError (Option Ty)
       -- length is manifest here rather than something a lemma has to recover
       -- from the helper's branches. An absent slot's helper answers `none` and
       -- is not read.
-      combine ((atoms.map atomTy).eraseDups.map some
+      combine ((atomShapes pol atoms).map some
         ++ (if recF.isSome then [recShape] else [])
         ++ (if varT.isSome then [varShape] else [])
         ++ (if fn.isSome then [funShape] else [])) refinements

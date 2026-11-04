@@ -6046,6 +6046,7 @@ fn builtin_to_unaryop(b: Builtin) -> Option<UnaryOpKind> {
     Some(match b {
         Builtin::Neg => UnaryOpKind::Neg,
         Builtin::NotFn => UnaryOpKind::Not,
+        Builtin::IntToUint => UnaryOpKind::IntToUint,
         _ => return None,
     })
 }
@@ -6055,6 +6056,7 @@ fn unaryop_output_extent(op: &UnaryOpKind) -> Extent {
     match op {
         UnaryOpKind::Neg => Extent::Base(BaseType::Int),
         UnaryOpKind::Not => Extent::Base(BaseType::Bool),
+        UnaryOpKind::IntToUint => Extent::Base(BaseType::UInt),
     }
 }
 

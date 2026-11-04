@@ -1221,7 +1221,13 @@ fn keyed_access_value<C: Typing>(
 ) -> Result<Type, LocatedInferError> {
     // A common-supertype constraint would widen mismatched key types instead of rejecting
     // them. Keep the collection's base as the upper bound; only presence is checked later.
-    ctx.require_sub(key_ty, keys.peel_refinements(), at)?;
+    // A range's base is `UInt`: `0..𝑛` states which keys are present, and a key outside it is
+    // a lookup that answers `none`.
+    let base = match keys.peel_refinements() {
+        Type::UIntRange(_) => &Type::Base(BaseType::UInt),
+        base => base,
+    };
+    ctx.require_sub(key_ty, base, at)?;
     Ok(value)
 }
 

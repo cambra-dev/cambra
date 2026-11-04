@@ -12,7 +12,8 @@
 //! addresses is what an SMT constant is minted for.
 //!
 //! The fragment is over **surface-syntax** predicate shapes: a variable, a field
-//! read, a literal, a unary or a binary operator ([`Encode::expr`]). `lambda_elim`
+//! read, a literal, a unary or a binary operator, and the `Int`/`UInt` equality
+//! `(𝑎, 𝑏) ▷ int_eq_uint` ([`Encode::expr`]). `lambda_elim`
 //! rewrites every predicate point-free — `__elem == 1` becomes
 //! `__elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)` — so no predicate at or after that pass
 //! is encodable, and every check from there on decides its deficits structurally.
@@ -24,7 +25,7 @@
 //! violating an rhs one. Every other outcome is an [`SmtError`] naming what
 //! happened — a query outside the fragment (a base that is neither a scalar nor a
 //! product, floor division, a product of two unknowns, a predicate mentioning an
-//! application that is not a projection), a solver that will not start or breaks
+//! application that is neither a projection nor `int_eq_uint`), a solver that will not start or breaks
 //! mid-query, an `unknown`. An `Err` is not a mismatch: nothing decided the
 //! entailment.
 
@@ -35,8 +36,8 @@ use easy_smt::{Context, ContextBuilder, Response, SExpr};
 
 use crate::ccl::symbolic::symbolic;
 use crate::ccl::{
-    ArithmeticKind, BaseType, BinOpKind, CompareKind, Lit, LogicKind, Name, ProjKey, Refinement,
-    Type, TypedExpr, TypedExprNode, UnaryOpKind,
+    ArithmeticKind, BaseType, BinOpKind, Builtin, CompareKind, Lit, LogicKind, Name, ProjKey,
+    Refinement, Type, TypedExpr, TypedExprNode, UnaryOpKind,
 };
 
 /// The solver subprocess `easy_smt`'s z3 defaults spawn. Named by every
@@ -123,21 +124,11 @@ impl Sort {
     /// `UInt`).
     fn declare(self, sym: String, ctx: &mut Context) -> Result<(), SmtError> {
         let sym_atom = ctx.atom(sym.clone());
-        let zero = || ctx.numeral(0);
-        let non_neg = |x: SExpr| ctx.gte(x, zero());
-        let lt = |x: SExpr, y: u64| ctx.lt(x, ctx.numeral(y));
-        let (sort_atom, constraint) = match self {
-            Self::Bool => (ctx.bool_sort(), None),
-            Self::Int => (ctx.int_sort(), None),
-            Self::UInt => {
-                let c = non_neg(sym_atom);
-                (ctx.int_sort(), Some(c))
-            }
-            Self::UIntRange(n) => {
-                let c = ctx.and(non_neg(sym_atom), lt(sym_atom, n));
-                (ctx.int_sort(), Some(c))
-            }
-            Self::Named(s) => (ctx.atom(s), None),
+        let constraint = self.membership(sym_atom, ctx);
+        let sort_atom = match self {
+            Self::Bool => ctx.bool_sort(),
+            Self::Int | Self::UInt | Self::UIntRange(_) => ctx.int_sort(),
+            Self::Named(s) => ctx.atom(s),
         };
         ctx.declare_const(sym, sort_atom)
             .map_err(exchange_failure)?;
@@ -145,6 +136,17 @@ impl Sort {
             ctx.assert(c).map_err(exchange_failure)?;
         }
         Ok(())
+    }
+
+    /// The constraint pinning `x`, a constant of this sort's SMT sort, to the Cambra type
+    /// the sort encodes, or `None` when the SMT sort is exactly that type.
+    fn membership(&self, x: SExpr, ctx: &Context) -> Option<SExpr> {
+        let non_neg = ctx.gte(x, ctx.numeral(0));
+        match self {
+            Self::Bool | Self::Int | Self::Named(_) => None,
+            Self::UInt => Some(non_neg),
+            Self::UIntRange(n) => Some(ctx.and(non_neg, ctx.lt(x, ctx.numeral(*n)))),
+        }
     }
 }
 
@@ -472,7 +474,25 @@ pub fn smt_sub(
     if rhs.is_empty() {
         return Ok(true);
     }
-    with_solver(|ctx| check(ctx, base, lhs, rhs, scope))
+    with_solver(|ctx| check(ctx, base, None, lhs, rhs, scope))
+}
+
+/// Whether every value of `base` satisfying all of `lhs` is a value of `target` satisfying
+/// all of `rhs`: [`smt_sub`] with membership in `target` joining the goal.
+///
+/// The subject is declared at `base`'s sort, so `base` is what the antecedent assumes of
+/// it; `target`'s sort constraint ([`Sort::membership`]) is what the goal demands. Both
+/// encode at one SMT sort, so a `target` whose sort differs from `base`'s in its SMT sort
+/// is an [`SmtError::Encoding`]. `{UInt | 𝑝} <: 0..𝑛` is the query this answers: the
+/// subject is a `UInt` assumed to satisfy `𝑝` and demanded to be below `𝑛`.
+pub fn smt_sub_at(
+    base: &Type,
+    target: &Type,
+    lhs: &[Refinement],
+    rhs: &[Refinement],
+    scope: &dyn ScopeEnv,
+) -> Result<bool, SmtError> {
+    with_solver(|ctx| check(ctx, base, Some(target), lhs, rhs, scope))
 }
 
 /// One query: build it, then run it inside a `push`/`pop` scope so the constants
@@ -480,6 +500,7 @@ pub fn smt_sub(
 fn check(
     ctx: &mut Context,
     base: &Type,
+    target: Option<&Type>,
     lhs: &[Refinement],
     rhs: &[Refinement],
     scope: &dyn ScopeEnv,
@@ -487,7 +508,7 @@ fn check(
     // Encoding is pure and can bail; bailing before the `push` leaves no scope to
     // unwind.
     let mut enc = Encode::new(ctx, scope, base);
-    let formula = enc.query(lhs, rhs)?;
+    let formula = enc.query(target, lhs, rhs)?;
     let decls = enc.decls;
 
     ctx.push().map_err(exchange_failure)?;
@@ -583,17 +604,58 @@ impl<'a> Encode<'a> {
         }
     }
 
-    /// `⋀Γ ∧ ⋀lhs ∧ ¬⋀rhs` — unsatisfiable exactly when the entailment holds.
-    fn query(&mut self, lhs: &[Refinement], rhs: &[Refinement]) -> Result<SExpr, SmtError> {
+    /// `⋀Γ ∧ ⋀lhs ∧ ¬(⋀rhs ∧ 𝑡)` — unsatisfiable exactly when the entailment holds, where
+    /// `𝑡` is the subject's membership in `target` ([`smt_sub_at`]), or `true` without one.
+    fn query(
+        &mut self,
+        target: Option<&Type>,
+        lhs: &[Refinement],
+        rhs: &[Refinement],
+    ) -> Result<SExpr, SmtError> {
         self.declare_subject(lhs, rhs)?;
         let mut conjuncts = self.conjuncts(lhs)?;
-        let goals = self.conjuncts(rhs)?;
+        let mut goals = self.conjuncts(rhs)?;
+        if let Some(target) = target {
+            goals.extend(self.target_membership(target, lhs, rhs)?);
+        }
         let goal = self.ctx.not(self.ctx.and_many(goals));
         // Gathered after both sides are translated: `Γ` covers a binder first met
         // in the goal as much as one the antecedent mentions.
         conjuncts.append(&mut self.assumptions);
         conjuncts.push(goal);
         Ok(self.ctx.and_many(conjuncts))
+    }
+
+    /// The constraint putting the query's subject in `target`, or `None` when its sort
+    /// constrains nothing. The subject is a constant of `base`'s SMT sort, so a `target`
+    /// encoded at another one, or at none, has no membership to state about it.
+    fn target_membership(
+        &self,
+        target: &Type,
+        lhs: &[Refinement],
+        rhs: &[Refinement],
+    ) -> Result<Option<SExpr>, SmtError> {
+        let fails = |message: String| {
+            let body = lhs
+                .first()
+                .or_else(|| rhs.first())
+                .expect("smt_sub_at queries only a refined side");
+            SmtError::Encoding {
+                body: body.clone(),
+                message,
+            }
+        };
+        let integral = |sort: &Sort| matches!(sort, Sort::Int | Sort::UInt | Sort::UIntRange(_));
+        match (self.sort(self.base), self.sort(target)) {
+            (Some(from), Some(to)) if integral(&from) && integral(&to) => {
+                let subject = self.vars[&Path::subject()];
+                Ok(to.membership(subject, self.ctx))
+            }
+            _ => Err(fails(format!(
+                "the refined base {} and the demanded base {target} share no SMT sort",
+                self.base
+            ))),
+        }
     }
 
     /// Declare the constant the query's subject denotes.
@@ -718,6 +780,20 @@ impl<'a> Encode<'a> {
             } else {
                 self.ctx.false_()
             }),
+            // Both operands are SMT `Int`s, so the relation between an `Int` and a `UInt`
+            // is the solver's `=`.
+            TypedExprNode::Apply { function, argument }
+                if matches!(function.node, TypedExprNode::Builtin(Builtin::IntEqUint)) =>
+            {
+                let TypedExprNode::Tuple(operands) = &argument.node else {
+                    return Err(unencodable(e));
+                };
+                let [int, uint] = operands.as_slice() else {
+                    return Err(unencodable(e));
+                };
+                let (int, uint) = (self.expr(int)?, self.expr(uint)?);
+                Ok(self.ctx.eq(int, uint))
+            }
             // A name, or a field read through one: both address a leaf of the value
             // the root denotes, and the path is what names that leaf. An `Apply`
             // that is not a projection chain addresses no leaf and falls through.
@@ -1385,5 +1461,35 @@ mod tests {
             )
             .unwrap()
         );
+    }
+
+    /// `{UInt | __elem == 1} <: 0..3` holds and `{UInt | __elem == 3} <: 0..3` does not: the
+    /// target's bound joins the goal, and an rhs with no refinement still asks it.
+    #[test]
+    fn a_target_range_bounds_the_subject() {
+        let uint = Type::Base(BaseType::UInt);
+        let range = Type::UIntRange(3);
+        let eq = |n| [elem_cmp(CompareKind::Equals, lit(n))];
+        assert!(smt_sub_at(&uint, &range, &eq(1), &[], &NoScope).unwrap());
+        assert!(!smt_sub_at(&uint, &range, &eq(3), &[], &NoScope).unwrap());
+        assert!(
+            !smt_sub_at(&uint, &range, &eq(1), &eq(2), &NoScope).unwrap(),
+            "the rhs refinements are still demanded beside the bound"
+        );
+    }
+
+    /// A target encoded at a different SMT sort has no membership to state about the subject.
+    #[test]
+    fn a_target_of_another_sort_is_an_encoding_error() {
+        let eq = [elem_cmp(CompareKind::Equals, lit(1))];
+        let err = smt_sub_at(
+            &Type::Base(BaseType::UInt),
+            &Type::Base(BaseType::Bool),
+            &eq,
+            &[],
+            &NoScope,
+        )
+        .unwrap_err();
+        assert!(matches!(err, SmtError::Encoding { .. }), "{err}");
     }
 }

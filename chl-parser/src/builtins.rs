@@ -26,6 +26,7 @@ pub enum SurfaceBuiltin {
     Map,
     Box,
     EmptyMap,
+    IntToUint,
     AwaitFinal,
     Begin,
     HttpServe,
@@ -132,6 +133,7 @@ pub const SURFACE_BUILTINS: &[SurfaceBuiltinEntry] = {
         entry("map", B::Map, Exact(1), Function),
         entry("box", B::Box, Exact(1), Function),
         entry("empty_map", B::EmptyMap, Exact(0), Function),
+        entry("int_to_uint", B::IntToUint, Exact(1), Function),
         entry("await_final", B::AwaitFinal, Exact(1), Function),
         entry("begin", B::Begin, Exact(0), TransactionMarker),
         entry("http_serve", B::HttpServe, Exact(3), SinkDeclaration),
@@ -194,6 +196,7 @@ mod tests {
             | B::Map
             | B::Box
             | B::EmptyMap
+            | B::IntToUint
             | B::AwaitFinal
             | B::Begin
             | B::HttpServe
@@ -210,6 +213,7 @@ mod tests {
             B::Map,
             B::Box,
             B::EmptyMap,
+            B::IntToUint,
             B::AwaitFinal,
             B::Begin,
             B::HttpServe,
