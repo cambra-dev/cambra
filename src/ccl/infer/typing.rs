@@ -5,7 +5,7 @@
 use crate::ccl::ccl_utils::TermMemo;
 use crate::ccl::infer::api::RelatedPositions;
 use crate::ccl::infer::solver::PolyScheme;
-use crate::ccl::infer::solver::traits::{Assoc, Trait};
+use crate::ccl::infer::solver::traits::{Assoc, StdTrait, Trait};
 use crate::ccl::infer::{InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
 use crate::ccl::{Expr, Name, Type, TypedBinding};
@@ -204,6 +204,9 @@ pub(super) trait Typing {
         assoc: Option<Assoc>,
         at: &dyn Fn() -> String,
     ) -> Result<Option<Type>, LocatedInferError>;
+
+    /// The trait `std` declares as `named`, in the program being typed.
+    fn std_trait(&self, named: StdTrait) -> Trait;
 
     /// [`require_trait`](Self::require_trait) for an operator whose result is the associated
     /// type `assoc` refined by a predicate built from its operands: the type deposited there

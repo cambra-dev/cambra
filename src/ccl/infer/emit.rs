@@ -25,7 +25,7 @@ use super::schemes::{OpSignature, OperatorResult};
 use super::typing::{LetScheme, MethodCallsEnd, TempNames, Typing};
 use super::{product, variant_type};
 use crate::ccl::infer::solver::traits::{
-    Assoc, MethodRow, MethodTarget, Signature, Trait, function_over, replace_params,
+    Assoc, MethodRow, MethodTarget, Signature, StdTrait, Trait, function_over, replace_params,
 };
 use crate::ccl::infer_var::Origin;
 use crate::ccl::ty::{TraitRequirement, TypeParamId};
@@ -1478,7 +1478,7 @@ fn emit_lookup_checked<C: Typing>(
     // `Option(V)` requires `Equatable(V, V)`, which no constructor call checks here (`std`'s
     // `type Option(T) requires Equatable(T, T)`, `stdlib/src/std.cambra`).
     ctx.require_trait(
-        Trait::equatable(),
+        ctx.std_trait(StdTrait::Equatable),
         function.node_id(),
         &[&at_key, &at_key],
         None,
@@ -1634,13 +1634,14 @@ fn keyed_access_types(collection: &Type) -> Option<(Type, Option<Name>, Type)> {
 /// the *operator* declares, [`Typing::require_trait`] speaks only of associations.
 fn require_single_obligation<C: Typing>(
     ctx: &mut C,
-    trait_: Trait,
+    trait_: StdTrait,
     operator_node_id: NodeId,
     operand_types: &[&Type],
     operand_exprs: &[&Expr],
     result: &OperatorResult,
     at: &dyn Fn() -> String,
 ) -> Result<Type, LocatedInferError> {
+    let trait_ = ctx.std_trait(trait_);
     match result {
         OperatorResult::Associated(name, Some(refinement)) => ctx.require_trait_refined(
             trait_,
@@ -1780,7 +1781,7 @@ pub(super) fn emit_binop<C: Typing>(
         }
         OpSignature::SingleObligation { trait_, result } => require_single_obligation(
             ctx,
-            trait_.clone(),
+            *trait_,
             operator_node_id,
             &[&left_ty, &right_ty],
             &[left, right],
@@ -1816,7 +1817,7 @@ pub(super) fn emit_unary<C: Typing>(
         }
         OpSignature::SingleObligation { trait_, result } => require_single_obligation(
             ctx,
-            trait_.clone(),
+            *trait_,
             operator_node_id,
             &[&inner_ty],
             &[inner],
@@ -2322,7 +2323,7 @@ pub(super) fn emit_aggregate<C: Typing>(
     // the result type stays the scheme's.
     if kind == AggregateKind::Max || kind == AggregateKind::Min {
         ctx.require_trait(
-            Trait::orderable(),
+            ctx.std_trait(StdTrait::Orderable),
             operator_node_id,
             &[&result, &result],
             None,
@@ -2990,9 +2991,9 @@ fn feed_places(defer: &Name, body: &Expr) -> Vec<NodeId> {
 
 /// Whether `function` is `Iterable::elements`, the call a loop reads its source through.
 fn is_iterable_elements(function: &Expr) -> bool {
-    use crate::ccl::infer::solver::traits::{ITERABLE_ELEMENTS, Trait};
+    use crate::ccl::infer::solver::traits::{ITERABLE_ELEMENTS, StdTrait};
     matches!(&function.node, TypedExprNode::TraitFn { trait_, function, .. }
-        if *trait_ == Trait::iterable() && function.as_str() == ITERABLE_ELEMENTS)
+        if trait_.is_std(StdTrait::Iterable) && function.as_str() == ITERABLE_ELEMENTS)
 }
 
 /// Emit/check a `letrec` group (design doc `src/ccl/design/mutability.md`,
@@ -3211,7 +3212,7 @@ pub(super) fn emit_for<C: Typing>(
     })?;
     if ordered {
         let required = ctx.require_trait(
-            Trait::orderable(),
+            ctx.std_trait(StdTrait::Orderable),
             node,
             &[&position_ty, &position_ty],
             None,
@@ -5205,6 +5206,7 @@ mod review_tests {
         // Our stack seeds the blame cursor at construction; this unit test has no
         // enclosing tree, so the predicate term itself is the root to blame.
         let mut ctx = InferCtx::new(HashMap::new(), shared.node_id());
+        ctx.instances = crate::ccl::infer::solver::traits::InstanceTable::std();
         let d1 = ctx.fresh();
         let d2 = ctx.fresh();
         emit_bare_predicate(&mut r1, &d1, &mut ctx).expect("first occurrence types");
