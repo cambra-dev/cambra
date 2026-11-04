@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use crate::ccl::FieldKey;
-use crate::ccl::infer::solver::traits::{Assoc, OperatorCall, Trait};
+use crate::ccl::infer::solver::traits::{Assoc, OperatorCall, StdTrait};
 use crate::ccl::infer::solver::{PolyScheme, fresh_var, fun, prim};
 use crate::ccl::{AggregateKind, BaseType, BinOpKind, Builtin, Level, Type, UnaryOpKind};
 
@@ -60,8 +60,8 @@ pub(super) enum OpSignature {
     /// since a wider variant would have to be interpreted somewhere and that
     /// interpretation is what a rule *is*.
     SingleObligation {
-        /// The trait the operands jointly satisfy.
-        trait_: Trait,
+        /// The trait the operands jointly satisfy, which `std` declares.
+        trait_: StdTrait,
         /// Where the operator's own result type comes from.
         result: OperatorResult,
     },
@@ -93,8 +93,9 @@ fn refinement_of_unary(op: UnaryOpKind) -> Option<crate::ccl::RefinementTemplate
 ///
 /// Arithmetic, comparison and negation are absent for a different reason: they are
 /// polymorphic in their operands, which no signature can state without also forcing
-/// every other lattice dimension to agree. They state a [`Trait`] instead — see
-/// [`OpSignature`], which is what a lookup here returns.
+/// every other lattice dimension to agree. They state a
+/// [`Trait`](crate::ccl::infer::solver::traits::Trait) instead — see [`OpSignature`], which is
+/// what a lookup here returns.
 pub struct OperatorSchemes {
     /// `Bool → Bool → Bool`.
     bool_logic: PolyScheme,
@@ -397,7 +398,7 @@ impl OperatorSchemes {
     /// so this is cheap.
     pub(super) fn binop(&self, op: BinOpKind) -> OpSignature {
         let refinement = refinement_of_binop(op);
-        let Some(call) = OperatorCall::of_binop(op) else {
+        let Some(trait_) = OperatorCall::trait_of_binop(op) else {
             let scheme = match op {
                 BinOpKind::BoolLogic(_) => self.bool_logic.clone(),
                 BinOpKind::Concat => self.concat.clone(),
@@ -409,24 +410,23 @@ impl OperatorSchemes {
             // Every comparison yields `Bool` whatever operands it accepts, so the result
             // is the operator's to state and `Equatable`/`Orderable` associate nothing.
             BinOpKind::Compare(_) => OperatorResult::Fixed(BaseType::Bool, refinement),
-            _ => OperatorResult::Associated(Assoc::Output, refinement),
+            _ => OperatorResult::Associated(Assoc::output(), refinement),
         };
-        OpSignature::SingleObligation {
-            trait_: call.trait_,
-            result,
-        }
+        OpSignature::SingleObligation { trait_, result }
     }
 
     /// See [`Self::binop`] — the same split. `not` is genuinely monomorphic
     /// (`Bool → Bool`), so it keeps a scheme.
     pub(super) fn unary(&self, op: UnaryOpKind) -> OpSignature {
         let refinement = refinement_of_unary(op);
-        match OperatorCall::of_unary(op) {
-            Some(call) => OpSignature::SingleObligation {
-                trait_: call.trait_,
-                result: OperatorResult::Associated(Assoc::Output, refinement),
+        match op {
+            UnaryOpKind::Neg => OpSignature::SingleObligation {
+                trait_: StdTrait::Negatable,
+                result: OperatorResult::Associated(Assoc::output(), refinement),
             },
-            None => OpSignature::Scheme(self.not_op.clone(), refinement),
+            UnaryOpKind::Not | UnaryOpKind::NotRefined => {
+                OpSignature::Scheme(self.not_op.clone(), refinement)
+            }
         }
     }
 
