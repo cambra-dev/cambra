@@ -716,6 +716,9 @@ pub enum TypeDeclBody {
 /// One constructor line of a [`TypeDecl`], `rect(w: Int, h: Int)`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Constructor {
+    /// `pub` before the constructor's name: another module may build it and match it
+    /// (`docs/chl-spec.md`, "9.5 Visibility").
+    pub public: Option<Span>,
     /// The lowercase constructor name.
     pub name: Spanned<SmolStr>,
     /// The declared parameters. Empty for a line with no parentheses, which declares a

@@ -1157,8 +1157,8 @@ mod tests {
             {state}
             pub Item = Int
             pub type Shape:
-                circle(Int)
-                dot
+                pub circle(Int)
+                pub dot
         "};
         let root = formatdoc! {"
             {clause}
