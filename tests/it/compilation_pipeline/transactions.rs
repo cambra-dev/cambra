@@ -1134,6 +1134,134 @@ fn sustained_contention_conserves_pool() {
     check_tile(&code, Tile::Scalar(ColumnValue::Ints(vec![980])));
 }
 
+/// A writer whose unfired arm carries a key does not overwrite another writer's commit to
+/// that key.
+///
+/// Each carrying writer's decision writes `b` and its own counter on every route: `b := 0`
+/// never fires, so each commit writes `b` back at the snapshot value. That carry is sound only
+/// because `collect_footprint` puts every key written inside an `if` arm into the read set,
+/// so a carry whose snapshot an increment of `b` has since passed goes stale and retries.
+/// Without the read, a carry committing after an increment from an older snapshot overwrites
+/// it, and `b` finishes below 10.
+///
+/// Within one pull the commit drain serializes writers in index order from a rotating start,
+/// and each writer's proposal is built against the frontier from before the pull. A carry
+/// overwrites an increment only when it drains after one, so a carrying writer sits on each
+/// side of the incrementing one.
+#[test]
+fn an_unfired_arm_carries_its_key_past_a_concurrent_write() {
+    let xs = "[1, 2, 3, 4, 5, 6, 7, 8, 9, 10]";
+    let carry = |counter: &str| {
+        formatdoc! {"
+            for x in {xs}:
+                with begin():
+                    if x > 100:
+                        b := 0
+                    else:
+                        {counter} := {counter} + x
+        "}
+    };
+    let (carry_a, carry_c) = (carry("a"), carry("c"));
+    let code = formatdoc! {"
+        a: Mut(Int, Txn) := 0
+        b: Mut(Int, Txn) := 0
+        c: Mut(Int, Txn) := 0
+        {carry_a}\
+        for r in {xs}:
+            with begin():
+                b := b + 1
+        {carry_c}\
+        (await_final(a), await_final(b), await_final(c))
+    "};
+    let Tile::Record { fields, .. } = run_pipeline(&code) else {
+        panic!("expected a record of the three final reads")
+    };
+    assert_eq!(
+        fields.get("_1"),
+        Some(&Tile::Scalar(ColumnValue::Ints(vec![10]))),
+        "every increment of `b` survives the carrying writers' commits"
+    );
+    for counter in ["_0", "_2"] {
+        assert_eq!(
+            fields.get(counter),
+            Some(&Tile::Scalar(ColumnValue::Ints(vec![55])))
+        );
+    }
+}
+
+/// A blind write and concurrent increments of one key commit as one serialization.
+///
+/// The resetting writer's footprint reads nothing, so it never goes stale; each increment reads
+/// `x` and goes stale whenever a reset commits after its snapshot. In commit order the
+/// replies are therefore a sequence in which each value is `0` (a reset) or one more than the
+/// value before it (an increment). An increment validated against a snapshot older than the
+/// latest reset would commit a value larger than that.
+#[test]
+fn a_blind_write_serializes_with_concurrent_increments() {
+    let resets = 5;
+    let increments = 10;
+    let code = indoc! {r#"
+        out: Feed(_)
+        x: Mut(Int, Txn) := 0
+        for r in [1, 2, 3, 4, 5]:
+            with begin():
+                x := 0
+                out << 0
+        for r in [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]:
+            with begin():
+                x := x + 1
+                out << x
+        out
+    "#};
+    let tile = run_pipeline(code);
+    let Tile::DataFunction { codomain, .. } = &tile else {
+        panic!("expected a reply stream over commit ticks, got {tile:?}");
+    };
+    let Tile::Scalar(ColumnValue::Ints(replies)) = codomain.as_ref() else {
+        panic!("expected Int replies, got {codomain:?}");
+    };
+    assert_eq!(replies.len(), resets + increments, "one reply per commit");
+    let mut current = 0;
+    for &reply in replies {
+        assert!(
+            reply == 0 || reply == current + 1,
+            "reply {reply} follows {current}: not a serialization of resets and increments \
+             (replies in commit order: {replies:?})"
+        );
+        current = reply;
+    }
+    assert_eq!(
+        replies.iter().filter(|&&r| r == 0).count(),
+        resets,
+        "every reset commits once (replies {replies:?})"
+    );
+}
+
+/// Two writer sites writing distinct keys of one map both land.
+///
+/// `keyed_writes_at_distinct_keys_compose_across_transactions` covers one site, whose
+/// transactions never overlap. Here the sites run concurrently, and each `m[k] := v` commits
+/// the whole collection as `m := insert(m, k, v)`. Every key lands only because each write
+/// reads `m` and goes stale when the other site commits after its snapshot. A footprint
+/// narrowed to the written key loses the keys the other site committed in between.
+#[test]
+fn keyed_writes_from_two_sites_at_distinct_keys_both_land() {
+    let value = final_mut_var_value(indoc! {r#"
+        m: Mut(Map(Int, Int), Txn) := box(map([(0, 0)]))
+        for x in [1, 2, 3, 4, 5]:
+            with begin():
+                m[x] := x
+        for y in [6, 7, 8, 9, 10]:
+            with begin():
+                m[y] := y
+        await_final(m)
+    "#});
+    assert_eq!(
+        map_entries_int(&value),
+        (0..=10).map(|k| (k, k)).collect::<Vec<_>>()
+    );
+}
+
 // ---------------------------------------------------------------------------
 // `await_final`: the terminal read
 //
