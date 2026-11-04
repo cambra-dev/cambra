@@ -1031,6 +1031,21 @@ fn feeding_a_feed_out_of_a_data_structure_is_refused() {
     );
 }
 
+/// A feed taken out of a tuple literal beside a list literal reaches its declaration.
+#[test]
+fn a_feed_beside_a_list_literal_in_a_tuple_is_fed() {
+    check_scalar(
+        indoc! {r"
+            out: Feed(_)
+            out << 1
+            t = ([1, 2], out)
+            xs, o = t
+            o << 2
+            sum(out) + sum(xs)"},
+        Value::Int(6),
+    );
+}
+
 /// TODO: Support refined writes to vars used with feeds.
 #[test]
 fn refined_write_used_with_feed() {
