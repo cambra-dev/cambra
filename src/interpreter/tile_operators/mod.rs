@@ -1296,9 +1296,9 @@ pub(crate) fn projection_of_one_value(name: &str, what: &str, guard: &TileGuard)
     }
 }
 
-/// The index, from 0, of one of a breaker's inputs, which [`Breaker::consume_impl`],
-/// [`Breaker::input_tiling`] and [`Breaker::input_released`] act on. A breaker of one input is
-/// called only with [`InputId::ONLY`].
+/// Which of a breaker's inputs a work package, a tiling or a release is of, by its index from 0. A
+/// breaker of one input has only [`InputId::ONLY`].
+#[derive(Clone, Copy)]
 pub struct InputId(pub usize);
 
 impl InputId {
@@ -1338,6 +1338,12 @@ pub trait Breaker {
     /// itself, and a breaker that is no producer, such as a sink's, answers `None`. A breaker
     /// that answers `None` pushes nothing, after a consume or at a finish.
     fn as_producer(&self) -> Option<&dyn BreakingProducer>;
+
+    /// How many inputs the breaker consumes, each the input of a pipeline of its own: one, but for
+    /// a transaction store, which consumes one per writer.
+    fn inputs(&self) -> usize {
+        1
+    }
 
     /// Why this breaker has no consuming mode for its shape, where it has none: a planner asks
     /// before it plans the breaker's pipeline, since [`consume_impl`](Self::consume_impl) and
@@ -1418,6 +1424,19 @@ pub trait BreakingProducer: TileProducer + Breaker {
 
     /// The answer to a pull at `guard`, from the state `consume_impl` built. It pulls nothing.
     fn offer_impl(&mut self, guard: TileGuard) -> Tile;
+
+    /// The placement of the entry at input `input`, which a planner sets to that input's
+    /// pipeline. The default answers the producer's own (`ProducerBase::placement`), the entry of
+    /// a breaker of one input.
+    fn entry_placement(&self, input: InputId) -> Option<crate::interpreter::dispatcher::Placement> {
+        debug_assert_eq!(
+            input.0,
+            0,
+            "{} has one input, whose entry its own placement names",
+            self.name()
+        );
+        self.base().placement.clone()
+    }
 }
 
 /// Live runtime counterpart of a [`TileOperator`].

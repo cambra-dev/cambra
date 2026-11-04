@@ -3744,7 +3744,12 @@ fn build_commit_store(
         .collect();
     let store_fan = Rc::new(FanOut::new_cyclic(Box::new(commit)));
 
-    for ((set_writer, w), taps) in setters.into_iter().zip(writers.iter()).zip(per_writer_taps) {
+    for (writer_index, ((set_writer, w), taps)) in setters
+        .into_iter()
+        .zip(writers.iter())
+        .zip(per_writer_taps)
+        .enumerate()
+    {
         // Attribute this writer's operators to the writer, not to the binding
         // the whole store hangs off. Without this every operator of a
         // transaction resolves to one span, since each is minted after its
@@ -3783,6 +3788,18 @@ fn build_commit_store(
                     })
             })
             .collect::<Result<_, _>>()?;
+        // The source's positions, which the drive's rows and the writer's proposals carry each
+        // item's in.
+        let Tiling::DataFunction {
+            domain: item_positions,
+            ..
+        } = source_op.tiling().clone()
+        else {
+            return Err(ConversionError::TypeError(format!(
+                "a transaction source is a collection, got {}",
+                source_op.tiling()
+            )));
+        };
         let driver = TransactDriver::new(
             // The driver is placed inside this store by `set_writer` below, so
             // its read of the store is a recurrence rather than a reader.
@@ -3792,6 +3809,7 @@ fn build_commit_store(
             read_extents,
             item_extent,
             drive_resume,
+            writer_index,
         );
         // Two slots of the driver: the body consumes rows, and the writer acks
         // finished attempts. The driver advances its item cursor on the release
@@ -3808,7 +3826,12 @@ fn build_commit_store(
         // domain, whatever the `Transact` sits in.
         let body_op = convert_at(
             &w.body,
-            Some(Box::new(Memo::new(driver_fan.slot()))),
+            // The drive's stream is its rows and what it has decided of its source; the body
+            // reads the rows.
+            Some(Box::new(Memo::new(Box::new(SelectField::new(
+                driver_fan.slot(),
+                crate::interpreter::commit_operator::TRANSACT_ROWS,
+            ))))),
             CurryLevel::new(1),
             ctx,
         )?;
@@ -3857,6 +3880,7 @@ fn build_commit_store(
             tap_fields.iter().map(Label::runtime_key).collect(),
             key_extent.clone(),
             value_extent.clone(),
+            item_positions,
         );
         set_writer(Box::new(writer));
     }
