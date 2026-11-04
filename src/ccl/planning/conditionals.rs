@@ -151,10 +151,8 @@ fn instantiate_erased_in_type(
     // closed indices then bind whatever function encloses this one.
     if let Some([first, ..]) = ty.sum()
         && erased.contains_key(first.id())
-        && let crate::ccl::ty::TypeKind::Enumerated(ds) = first.type_kind()
-        && let [sole] = ds.as_slice()
+        && let Some(sole) = first.sole_candidate()
     {
-        let sole = sole.clone();
         let mut instantiated = ty.instantiate_sum(&sole);
         instantiate_erased_in_type(&mut instantiated, erased);
         *ty = instantiated;
@@ -692,16 +690,12 @@ fn collapse_determined_sums(expr: &mut Expr) {
     ) {
         let mut ty = ty.clone();
         while let Some([first, ..]) = ty.peel_refinements().sum() {
-            let kind = first.type_kind();
-            let crate::ccl::ty::TypeKind::Enumerated(ds) = &kind else {
-                break;
-            };
-            let [sole] = ds.as_slice() else {
+            let Some(sole) = first.sole_candidate() else {
                 break;
             };
             out.entry(*first.id()).or_insert_with(|| sole.clone());
             // A sum's body can be another, and dropping one binder is what exposes it.
-            ty = ty.instantiate_sum(sole);
+            ty = ty.instantiate_sum(&sole);
         }
         // A projection names its witness through the term it quotes, whose type binds it under
         // the id that term was typed with, so the witness is gathered from there.
@@ -895,14 +889,9 @@ fn collection_value_ty(ty: &Type) -> Option<Type> {
 fn arm_domain(ty: &Type) -> Option<Type> {
     let head = ty.peel_refinements();
     match head.sum() {
-        Some([first, ..]) => match first.type_kind() {
-            crate::ccl::ty::TypeKind::Enumerated(ds) if ds.len() == 1 => {
-                let sole = &ds[0];
-                let sole = sole.clone();
-                head.instantiate_sum(&sole).peel_refinements().domain()
-            }
-            _ => None,
-        },
+        Some([first, ..]) => first
+            .sole_candidate()
+            .and_then(|sole| head.instantiate_sum(&sole).peel_refinements().domain()),
         _ => head.domain(),
     }
 }
@@ -953,10 +942,9 @@ fn erase_determined_boxes(
     match stated.witness_kind() {
         Some(crate::ccl::ty::TypeKind::Enumerated(ds)) if ds.len() == 1 => {
             if let Some([first, ..]) = stated.peel_refinements().sum()
-                && let crate::ccl::ty::TypeKind::Enumerated(inner) = first.type_kind()
-                && let [sole] = inner.as_slice()
+                && let Some(sole) = first.sole_candidate()
             {
-                erased.insert(*first.id(), sole.clone());
+                erased.insert(*first.id(), sole);
             }
             // Reported rather than inferred from the recorded set: the *same* binder can be
             // erased at two occurrences, and a set that already holds it does not grow.
