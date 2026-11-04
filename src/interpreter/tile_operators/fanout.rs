@@ -283,23 +283,38 @@ impl Consumer for FanOutInput {
         region: &Projection,
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
-        let Some(shared_rc) = self.shared.upgrade() else {
-            return;
-        };
-        let consumers = {
-            let shared = shared_rc.borrow();
-            shared
-                .live_indices()
-                .filter(|&i| !shared.recurrence[i])
-                .map(|i| shared.consumers[i].clone())
-                .collect::<Vec<_>>()
-        };
-        for c in &consumers {
+        for c in &self.reader_consumers() {
             match c.try_borrow_mut() {
                 Ok(mut consumer) => consumer.push(region, landing),
                 Err(_) => landing.reentered(),
             }
         }
+    }
+
+    /// A route reaches every consumer a push does.
+    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
+        for c in &self.reader_consumers() {
+            match c.try_borrow_mut() {
+                Ok(mut consumer) => consumer.route(routes),
+                Err(_) => routes.reentered(),
+            }
+        }
+    }
+}
+
+impl FanOutInput {
+    /// The consumers of the live reader slots, which a push reaches, and none of a recurrence
+    /// slot. A clone of each handle, so no borrow of the fan-out is held while a push climbs past.
+    fn reader_consumers(&self) -> Vec<Rc<RefCell<Box<dyn Consumer>>>> {
+        let Some(shared_rc) = self.shared.upgrade() else {
+            return Vec::new();
+        };
+        let shared = shared_rc.borrow();
+        shared
+            .live_indices()
+            .filter(|&i| !shared.recurrence[i])
+            .map(|i| shared.consumers[i].clone())
+            .collect()
     }
 }
 
