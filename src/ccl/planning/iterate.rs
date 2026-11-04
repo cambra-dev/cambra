@@ -409,17 +409,18 @@ pub(super) fn builtin_at_function_position(func: &Expr) -> Option<Builtin> {
 ///    join conditions.  On success the rewrite replaces `expr` with the
 ///    hash-join chain (whose leaves are themselves iteration-bearing) and
 ///    returns.
-/// 4. Otherwise fall through to the default strategy: walk every nested
-///    `Type::Refinement` layer of the domain, lift each predicate, and
-///    build the iteration source by *applying* one `restrict(p)` filter
-///    per layer (innermost first) to a single chain-head `Apply(true ▷
-///    const, Iterate)` over the unrefined base, then compose the body
-///    onto it — `(iterate ▷ (p_inner ▷ restrict) ▷ … ▷ (p_outer ▷
-///    restrict)) ≫ body`.  There is exactly one `iterate` (the base
-///    source); the per-layer filters are `restrict`s *applied* to it, not
-///    additional iterates and not morphisms composed with it (its honest
-///    type makes the composed form ill-typed — see
-///    [`make_restrict`](crate::ccl::ccl_utils::make_restrict)).
+/// 4. Otherwise fall through to the default strategy: build the iteration
+///    source from the domain's keys ([`domain_keys`]) and compose the body
+///    onto it. For a domain with no membership and no projection, that is
+///    one `restrict(p)` filter per refinement *applied* to a single
+///    chain-head `Apply(true ▷ const, Iterate)` over the unrefined base —
+///    `(iterate ▷ (p₁ ▷ restrict) ▷ … ▷ (pₙ ▷ restrict)) ≫ body`. The
+///    filters are `restrict`s *applied* to the source, not additional
+///    iterates and not morphisms composed with it (its honest type makes
+///    the composed form ill-typed — see
+///    [`make_restrict`](crate::ccl::ccl_utils::make_restrict)). A product
+///    with a refined or projected component takes each component's keys in
+///    turn, so each component's refinements restrict that component.
 ///    Unrefined sites get just the chain-head iterate with a single
 ///    trivially-true predicate (`true ▷ const`) so op-conversion still
 ///    sees an explicit iteration marker; the trivially-true form is
@@ -538,7 +539,7 @@ pub(super) fn wrap_with_iterate(
     // `iterate(predicate)` fall-through are choosing how to materialise the same
     // iteration site — hash join is just a more efficient strategy when the type
     // structure permits.
-    if try_hash_join_rewrite(expr, &domain_ty, ctx) {
+    if try_hash_join_rewrite(expr, &domain_ty, ctx)? {
         return Ok(());
     }
     // Generic fallback. Now compile the site's refinement predicates (design
@@ -558,10 +559,10 @@ pub(super) fn wrap_with_iterate(
     // with a free outer binder would surface as a surviving free var, not a
     // silent miscompile.
     //
-    // The refinements as the site states them before compilation, which each `restrict`
+    // The domain as the site states it before compilation, whose refinements each `restrict`
     // lifts and plans: a lifted term reaches planning's phases in the form the tree does, its
     // nested refinements bare, so a group-by recognizer matches inside it as in the tree.
-    let uncompiled = domain_ty.refinements().to_vec();
+    let uncompiled = domain_ty.clone();
     // `memo` is the pass's one memo ([`PredMemo`], "One memo per pass"): a predicate
     // `Rc` reachable from several sites, as every earlier position's predicate is
     // through a nest's types, compiles once, and every occurrence is re-pointed at that
@@ -570,14 +571,6 @@ pub(super) fn wrap_with_iterate(
     let Some(domain_ty) = expr.ty.domain() else {
         return Ok(());
     };
-    // Compilation rewrites the set in place, so each refinement keeps its position unless two
-    // compile to one and the set drops the duplicate.
-    if domain_ty.refinements().len() != uncompiled.len() {
-        return Err(format!(
-            "two refinements of an iteration site compiled to one, which planning does not pair \
-             with the refinements it lifts yet [{site}]: {domain_ty}"
-        ));
-    }
     // The recording names the site being wrapped, so the staging minted under it
     // — the chain-head `iterate(true)` and one `restrict` per refinement —
     // descends from the site and not from the predicate each `restrict` applies.
@@ -590,13 +583,6 @@ pub(super) fn wrap_with_iterate(
         "planning.iterate",
         provenance::Nature::Machinery,
     );
-    // Every refinement at the position must hold, so each becomes a filter and
-    // the pipeline narrows stage by stage.  `application_order` picks the order —
-    // any is correct for the same final domain, and choosing it in one place is
-    // what makes the predicates compiled for this pipeline agree with its types.
-    // The chain is uniform: one chain-head `iterate(true)` over the unrefined base
-    // (op-conversion's `IterateExtent`), then one `restrict(pₖ)` per refinement.
-    // Unrefined sites get just the iterate.
     // **The site is already a collection.** A site is what an aggregate or a combinator
     // sweeps, so its kind says `Data` before this rewrite touches it: the rewrite gives it an
     // iteration *source*, a term, and does not re-declare what the site is.
@@ -611,54 +597,11 @@ pub(super) fn wrap_with_iterate(
         expr.ty,
         symbolic(expr),
     );
-    let base = domain_ty.peel_refinements();
+    // The iteration source enumerates the site's keys ([`domain_keys`]), and the
+    // value-producing `body` is composed onto it as a CCC morphism.
+    let source = domain_keys(&domain_ty, &uncompiled, ctx, site)?;
     let body = take(expr);
-    // Build the iteration source by applying one `restrict(p)` per refinement to a
-    // chain-head `iterate(true)` over the unrefined base.  Each `restrict` is a
-    // function transformer *applied* to its upstream (not composed):
-    // `make_restrict` narrows the domain by one refinement while preserving the
-    // codomain, so `source` ends with type `{D | p₁, …, pₙ} ⇒ D` — the site's
-    // full refinement set on the domain.  The value-producing `body` is then
-    // composed onto that source as a genuine CCC morphism.
-    //
-    // Each refinement's predicate function is recovered from its bare `__elem ▷ p`
-    // form against the element type that stage of the pipeline actually sees —
-    // the base narrowed by the refinements applied before it (`application_order`,
-    // which `compile_predicates_in_type` walks identically so the compiled
-    // predicates match these stages). Any order of the refinements yields a
-    // well-typed pipeline for the same final domain; the order is planning's to
-    // choose, which is what lets the refinement set itself stay unordered.
     let site_ty = body.ty.clone();
-    // A projected domain is enumerated from the collection it projects, not from its
-    // key bound: `unbox(𝑡) ▷ map_domain`, the keys `𝑡` holds.
-    let mut source = domain_keys(base, ctx)?;
-    for (r, elem_ty) in crate::ccl::application_order(domain_ty.refinements(), base) {
-        let position = domain_ty
-            .refinements()
-            .iter()
-            .position(|stated| stated == r)
-            .expect("a filter is one of the site's refinements");
-        let stated = fn_of_bare_predicate(&elem_ty, &r.predicate, &[]);
-        let lifted = fn_of_bare_predicate(&elem_ty, &uncompiled[position].predicate, &[]);
-        source = planned_restrict(stated, lifted, source, ctx)?;
-    }
-    // An iteration source produces the refined extent it iterates, so its
-    // codomain is the *site's* refined domain `{D | p}`, mirroring
-    // `make_iterate`'s `{D | p} ⇒ {D | p}` symmetry. Surfacing the refinement
-    // on the codomain lets the value-producing `body` — which `cast`s each
-    // element to the refined element type — compose against a producer that
-    // *already* carries `{D | p}`, rather than acquiring it from a bare
-    // codomain (`make_restrict` refines only the domain). We use `domain_ty`
-    // rather than the built source's domain because `make_restrict` drops a
-    // *trivially-true* layer (`if True`): the source then iterates a bare base,
-    // but the body's cast still demands the site's `{D | true}`, so the
-    // codomain must reflect the site domain to match it. Unrefined sites keep a
-    // bare `D ⇒ D`.
-    let source = if matches!(domain_ty, Type::Refinement(..)) {
-        set_codomain(source, domain_ty.clone())
-    } else {
-        source
-    };
     let mut elts: Vec<Expr> = vec![source];
     match body.node {
         // The body's own `Compose` is dissolved and its elements spliced into
@@ -833,6 +776,30 @@ fn is_filter_values_led(leg: &Expr) -> bool {
         if builtin_at_function_position(function) == Some(Builtin::FilterValues))
 }
 
+/// `𝑚 ▷ converse ▷ map_domain`, the keys present in the membership refinement
+/// `__elem ▷ (𝑚 ▷ collection_contains)`: the image of `𝑚`, keyed by itself, over `present`.
+///
+/// `𝑚` is a term lifted out of a type into the tree, so it is planned as every such term is
+/// (`src/ccl/design/optimization.md`, "Planning a lifted term").
+fn membership_keys(
+    collection: &Expr,
+    present: &Type,
+    ctx: &mut PlanningCtx,
+) -> Result<Expr, String> {
+    let image = predicates::eliminate_lifted(collection.clone())
+        .map_err(|e| format!("eliminating a membership's collection: {e:?}"))?;
+    let indices = image
+        .ty
+        .domain()
+        .ok_or_else(|| format!("a membership's collection is a function, got {}", image.ty))?;
+    let keys = present.peel_refinements().clone();
+    let groups = Type::data_fun(keys, Type::data_fun(indices.clone(), indices));
+    let grouped = apply_primitive(image, Builtin::Converse, groups);
+    let key_set = Type::data_fun(present.clone(), present.clone());
+    let keys = apply_primitive(grouped, Builtin::MapDomain, key_set);
+    plan_lifted(keys, PlanningPhase::MarkIterationSites, ctx)
+}
+
 /// `unbox(𝑡) ▷ map_domain`, the keys of the sum `𝑡`, over its projected domain.
 fn keys_of(term: &Expr, ctx: &mut PlanningCtx) -> Result<Expr, String> {
     let stamp = crate::ccl::ty::unbox_type(&term.ty)
@@ -860,26 +827,130 @@ fn keys_of(term: &Expr, ctx: &mut PlanningCtx) -> Result<Expr, String> {
     .with_ty(key_set))
 }
 
-/// The keys a domain ranges over, as an iteration source.
+/// The keys `domain` ranges over, as an iteration source: at each level of the domain, the
+/// level's keys restricted by the level's filters.
+///
+/// A level's membership refinement states which keys are present and is never executed, so
+/// the level's keys are its collection's image ([`membership_keys`]) and the membership gets
+/// no `restrict`. A level without one takes its keys from its base ([`base_keys`]). Every
+/// other refinement of the level is a filter, applied as one `restrict(p)` in
+/// [`crate::ccl::application_order`]; any order yields the same keys, and choosing it in one
+/// place keeps the compiled predicates in step with the stages they filter.
+///
+/// `uncompiled` is `domain` before its predicates were compiled, level for level; each
+/// `restrict` plans its predicate in that form ([`planned_restrict`]). `site` names the
+/// consumer for the errors, as in [`wrap_with_iterate`].
+fn domain_keys(
+    domain: &Type,
+    uncompiled: &Type,
+    ctx: &mut PlanningCtx,
+    site: &str,
+) -> Result<Expr, String> {
+    // Compilation rewrites the set in place, so each refinement keeps its position unless two
+    // compile to one and the set drops the duplicate.
+    if domain.refinements().len() != uncompiled.refinements().len() {
+        return Err(format!(
+            "two refinements of an iteration site compiled to one, which planning does not pair \
+             with the refinements it lifts yet [{site}]: {domain}"
+        ));
+    }
+    let base = domain.peel_refinements();
+    // A level carries at most one membership: a second would fall into the filters as a
+    // `restrict`, which op-conversion cannot compile, and which membership supplied the keys
+    // would depend on the refinement set's physical order.
+    let mut memberships = domain
+        .refinements()
+        .iter()
+        .filter_map(|r| r.membership_collection().map(|collection| (r, collection)));
+    let membership = memberships.next();
+    if memberships.next().is_some() {
+        return Err(format!(
+            "a site's domain carries at most one membership refinement [{site}]: {domain}"
+        ));
+    }
+    // The filters are ordered over the level's base, narrowed by the membership when there is
+    // one; `compile_predicates_in_type` walks the same order, so each compiled predicate
+    // matches the element type its stage sees.
+    let (mut source, filters, filtered_base) = match membership {
+        Some((m, collection)) => {
+            let present = Type::refined_one(base.clone(), m.clone());
+            let filters: Vec<_> = domain
+                .refinements()
+                .iter()
+                .filter(|r| *r != m)
+                .cloned()
+                .collect();
+            (
+                membership_keys(collection, &present, ctx)?,
+                filters,
+                present,
+            )
+        }
+        None => (
+            base_keys(base, uncompiled.peel_refinements(), ctx, site)?,
+            domain.refinements().to_vec(),
+            base.clone(),
+        ),
+    };
+    for (r, elem_ty) in crate::ccl::application_order(&filters, &filtered_base) {
+        let position = domain
+            .refinements()
+            .iter()
+            .position(|stated| stated == r)
+            .expect("a filter is one of the level's refinements");
+        let stated = fn_of_bare_predicate(&elem_ty, &r.predicate, &[]);
+        let lifted =
+            fn_of_bare_predicate(&elem_ty, &uncompiled.refinements()[position].predicate, &[]);
+        source = planned_restrict(stated, lifted, source, ctx)?;
+    }
+    // A refined level's source produces the refined domain it iterates, `{𝐷 | p} ⤇ {𝐷 | p}`,
+    // as `make_iterate`'s does: what consumes it, a body casting each element to the refined
+    // element type or a product family over it, expects that domain as the codomain.
+    // `domain` rather than the built source's domain, because `make_restrict` drops a
+    // trivially-true layer (`if True`) that the consumer's type still states.
+    Ok(if matches!(domain, Type::Refinement(..)) {
+        set_codomain(source, domain.clone())
+    } else {
+        source
+    })
+}
+
+/// The keys of an unrefined `base`, as an iteration source.
 ///
 /// A static domain is its extent, `iterate(true)`. A projected one is the keys of the sum it
-/// projects ([`keys_of`]). A product reaching either kind of component is its components'
-/// keys in turn: the first component's keys, each later one's as a family over them, and
-/// `uncurry` back to the one level of tuple keys the domain states. An all-static product
-/// keeps its one extent.
-fn domain_keys(base: &Type, ctx: &mut PlanningCtx) -> Result<Expr, String> {
+/// projects ([`keys_of`]), since its extent is the witness's whole key bound. A product with a
+/// component whose keys its extent overstates ([`extent_overstates_keys`]) is its components'
+/// keys in turn: the first component's keys, each later one's broadcast as a `const` family
+/// over them, and `uncurry` back to the one level of tuple keys the domain states. A component
+/// reads no other (a dependence is a `Type::DepTuple`), so the `const` family is exact. Any
+/// other product keeps its one extent.
+///
+/// `uncompiled` is `base` before its predicates were compiled, as in [`domain_keys`].
+fn base_keys(
+    base: &Type,
+    uncompiled: &Type,
+    ctx: &mut PlanningCtx,
+    site: &str,
+) -> Result<Expr, String> {
     match base {
         Type::WitnessProjection(p) => keys_of(&p.term, ctx),
-        Type::Tuple(components) if components.iter().any(has_projected_keys) => {
-            let Some((first, rest)) = components.split_first() else {
+        Type::Tuple(components) if components.iter().any(extent_overstates_keys) => {
+            let Type::Tuple(uncompiled) = uncompiled else {
+                return Err(format!(
+                    "compiling a domain's predicates keeps its structure, but the product \
+                     {base} compiled from {uncompiled} [{site}]"
+                ));
+            };
+            let mut levels = components.iter().zip(uncompiled);
+            let Some((first, uncompiled_first)) = levels.next() else {
                 return Ok(make_iterate(trivially_true_predicate(base.clone())));
             };
             // The keys of the prefix, as a key set over the prefix: one component, then each
             // next one's keys as a family over it, uncurried and flattened back to one level.
-            let mut keys = domain_keys(first, ctx)?;
+            let mut keys = domain_keys(first, uncompiled_first, ctx, site)?;
             let mut prefix = first.clone();
-            for (k, next) in rest.iter().enumerate() {
-                let inner = domain_keys(next, ctx)?;
+            for (k, (next, uncompiled_next)) in levels.enumerate() {
+                let inner = domain_keys(next, uncompiled_next, ctx, site)?;
                 let inner_ty = inner.ty.clone();
                 let family = apply_primitive(
                     inner,
@@ -932,11 +1003,12 @@ fn domain_keys(base: &Type, ctx: &mut PlanningCtx) -> Result<Expr, String> {
     }
 }
 
-/// Whether a domain has a component whose keys only a collection holds.
-fn has_projected_keys(ty: &Type) -> bool {
-    match ty.peel_refinements() {
-        Type::WitnessProjection(_) => true,
-        Type::Tuple(cs) => cs.iter().any(has_projected_keys),
+/// Whether `ty`'s extent holds keys `ty` does not: a refinement narrows the keys, and a
+/// projection's keys are the ones its collection holds.
+pub(super) fn extent_overstates_keys(ty: &Type) -> bool {
+    match ty {
+        Type::Refinement(..) | Type::WitnessProjection(_) => true,
+        Type::Tuple(cs) => cs.iter().any(extent_overstates_keys),
         _ => false,
     }
 }

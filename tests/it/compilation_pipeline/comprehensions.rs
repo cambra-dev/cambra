@@ -787,31 +787,173 @@ fn a_correlated_inner_aggregate_under_a_collection_result() {
     );
 }
 
-/// A **map comprehension whose body never reads the element** does not compile, with or
-/// without an enclosing comprehension.
-///
-/// Nothing here is about correlation or nesting: this one-line program fails, and so does
-/// the base branch's, which has none of the correlated work. A body that reads the element
-/// applies the collection, which is what puts it in the term
-/// (`sum([v for v in c])` answers 3). A body that does not leaves the collection reachable
-/// only through its domain's carried `collection_contains`, which op-conversion meets as a
-/// non-combinator handed an input.
-///
-/// The correlated form fails too and reports differently — reading the domain off the type
-/// answers the unbounded key type — which is why the message, not just the failure, is
-/// pinned here.
+/// A comprehension whose element never reads the generator's value counts the keys its
+/// source has. The source is reachable only through its domain's membership refinement, and
+/// planning enumerates that domain as the membership collection's image.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[should_panic(expected = "non-combinator collection_contains")]
-fn a_map_comprehension_that_ignores_the_element_does_not_compile() {
+#[case::over_a_map(
+    indoc! {r#"
+        c = map([("a", 1), ("b", 2)])
+        sum([1 for v in c])
+    "#},
+    2
+)]
+// Two entries, under rows 1 and 2.
+#[case::correlated(
+    indoc! {r#"
+        c = map([("a", 1), ("b", 2)])
+        sum([sum([1 for v in c]) * r for r in [1, 2]])
+    "#},
+    6
+)]
+// A membership beside a filter: the keys are enumerated, then restricted by the filter.
+#[case::filtered(
+    indoc! {r#"
+        c = map([("a", 1), ("b", 2)])
+        sum([1 for v in c if v > 1])
+    "#},
+    1
+)]
+#[case::over_a_filtered_list(
+    indoc! {r#"
+        c = map([("a", 1), ("b", 2)])
+        d = [v for v in c if v > 1]
+        sum([1 for w in d])
+    "#},
+    1
+)]
+#[case::over_a_mapped_list(
+    indoc! {r#"
+        c = map([("a", 1), ("b", 2)])
+        d = [v + 1 for v in c]
+        sum([1 for w in d])
+    "#},
+    2
+)]
+fn a_comprehension_ignoring_the_element_counts_the_present_keys(
+    #[case] program: &str,
+    #[case] total: i64,
+) {
+    check_scalar(program, Value::Int(total));
+}
+
+/// A product whose component ranges over a collection's keys enumerates that component's
+/// present keys, not its key type. `c` holds 1 and 2 under "a" and "b", and `d` holds 1 and 3
+/// under "x" and "y".
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// 2 keys of `c` × 2 keys of `d`.
+#[case::a_map_by_a_map("sum([1 for v in c for w in d])", 4)]
+// 2 keys × 3 positions, in either order.
+#[case::a_map_by_a_list("sum([1 for v in c for w in [1, 2, 3]])", 6)]
+#[case::a_list_by_a_map("sum([1 for w in [1, 2, 3] for v in c])", 6)]
+// (1 + 2) once per key of `d`.
+#[case::reading_the_map_s_element("sum([v for v in c for w in d])", 6)]
+// (1 + 2) × (1 + 2).
+#[case::reading_both_elements("sum([v * w for v in c for w in [1, 2]])", 9)]
+// The component's own filter keeps "b" alone, under each key of `d`: 2 × 2.
+#[case::a_filtered_map_by_a_map("sum([v for v in c if v > 1 for w in d])", 4)]
+// The groups of [1, 2, 3, 4] by `x // 2` are 0, 1 and 2: 3 groups × 2 keys of `d`.
+#[case::a_group_by_by_a_map(r"sum([1 for g in groupby([1, 2, 3, 4], \x -> x // 2) for w in d])", 6)]
+fn a_product_enumerates_a_keyed_component_s_present_keys(
+    #[case] comprehension: &str,
+    #[case] total: i64,
+) {
     check_scalar(
-        indoc! {r#"
-            c = map([("a", 1), ("b", 2)])
-            sum([1 for v in c])
-        "#},
-        // One per entry.
-        Value::Int(2),
+        &format!(
+            indoc! {r#"
+                c = map([("a", 1), ("b", 2)])
+                d = map([("x", 1), ("y", 3)])
+                {}
+            "#},
+            comprehension
+        ),
+        Value::Int(total),
     );
+}
+
+/// A filtered collection standing as one component of a product keeps its filter there.
+/// `xs` keeps 2 and 3 of [1, 2, 3], at positions 1 and 2.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// 2 kept × 2, in either order.
+#[case::counting("sum([1 for w in xs for u in [1, 2]])", 4)]
+#[case::counting_with_the_filtered_component_second("sum([1 for u in [1, 2] for w in xs])", 4)]
+// (1 + 2) × 2 kept.
+#[case::reading_the_other_component("sum([u for w in xs for u in [1, 2]])", 6)]
+// (2 + 3) × 2.
+#[case::reading_the_filtered_component("sum([w for w in xs for u in [1, 2]])", 10)]
+// (2 + 3) × (1 + 2) × (2 + 3), over three components.
+#[case::filtered_twice_in_three_components(
+    "sum([w * u * z for w in xs for u in [1, 2] for z in xs])",
+    75
+)]
+fn a_product_keeps_a_filtered_component_s_filter(#[case] comprehension: &str, #[case] total: i64) {
+    check_scalar(
+        &format!(
+            indoc! {r#"
+                xs = [x for x in [1, 2, 3] if x > 1]
+                {}
+            "#},
+            comprehension
+        ),
+        Value::Int(total),
+    );
+}
+
+/// A filtered conditional collection standing as one component of a product: the component is
+/// the projection of the sum `b`, so its keys are the ones the chosen arm holds, restricted by
+/// the component's filter. `q` is `3 > bound`: with bound 2, `b` is [1, 2, 3] and `xs` keeps
+/// [2, 3]; with bound 3, `b` is [1, 2] and `xs` keeps [2].
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+// 2 kept × 2.
+#[case::counting_the_first_arm(2, "1", 4)]
+// (2 + 3) × 2.
+#[case::reading_the_first_arm(2, "w", 10)]
+// 1 kept × 2.
+#[case::counting_the_second_arm(3, "1", 2)]
+// 2 × 2.
+#[case::reading_the_second_arm(3, "w", 4)]
+fn a_product_keeps_a_filtered_projection_s_filter(
+    #[case] bound: i64,
+    #[case] element: &str,
+    #[case] total: i64,
+) {
+    check_scalar(
+        &format!(
+            indoc! {r#"
+                q = sum([1, 2]) > {}
+                b = box([1, 2, 3]) if q else box([1, 2])
+                xs = [v for v in b if v > 1]
+                sum([{} for w in xs for u in [1, 2]])
+            "#},
+            bound, element
+        ),
+        Value::Int(total),
+    );
+}
+
+/// A join whose arm's type holds keys the arm does not, a keyed collection's membership or a
+/// filtered component, is refused: a join leaf iterates its arm's whole extent rather than the
+/// keys the arm holds, as an iteration site's source does.
+#[rstest]
+#[case::of_two_maps(indoc! {r#"
+    c = map([("a", 1), ("b", 2)])
+    d = map([("x", 1), ("y", 3)])
+    sum([v * w for v in c for w in d if v == w])
+"#})]
+#[case::of_a_map_and_a_list(indoc! {r#"
+    c = map([("a", 1), ("b", 2)])
+    sum([v for v in c for u in [1, 2, 3] if v == u])
+"#})]
+#[case::of_a_filtered_list_and_a_list(indoc! {"
+    xs = [x for x in [1, 2, 3] if x > 1]
+    sum([w for w in xs for u in [1, 2, 3] if w == u])
+"})]
+fn a_join_over_an_arm_its_extent_overstates_is_not_planned_yet(#[case] code: &str) {
+    check_compile_error(code, "is not planned yet");
 }
 
 /// A correlated inner comprehension **inside a transaction**, where the outer binder is the

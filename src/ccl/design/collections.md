@@ -238,6 +238,28 @@ test. `fn_of_bare_predicate` returns `f` directly for a bare `__elem ▷ f` pred
 An occurrence that remains in a type is not thereby a compiled runtime `CollectionContains`
 operator. The compiler does not provide a surface `in` expression yet.
 
+An iteration site over a present-key domain enumerates the keys instead of testing membership:
+its source is `𝑚 ▷ converse ▷ map_domain`, the image of the membership's collection `𝑚`, and the
+domain's other refinements restrict it (`membership_keys` in `planning/iterate.rs`). A
+comprehension whose element ignores the group reaches this, `[1 for g in groupby(xs, key)]` over
+a list `xs`, or `[1 for v in ages]` over a map `ages`, since nothing applies the partition.
+
+The source enumerates the domain level by level (`domain_keys` in `planning/iterate.rs`). A level
+takes its keys from its membership when it has one and from its base otherwise, and its other
+refinements restrict those keys. A product with a refined or projected component takes each
+component's keys this way, broadcasts each later component's keys over the earlier ones with
+`const`, and `uncurry`s them to the one level of tuple keys the domain states. A component reads
+no other component, since a dependence is a dependent tuple, so the broadcast is exact. Over a map
+`ages` with two entries, `[1 for v in ages for w in [1, 2]]` enumerates the two keys of `ages`
+under each of two positions. A hash join's leaf iterates its arm's extent rather than its keys,
+so a join with such a component is refused as an internal error (`extent_iteration` in
+`planning/join.rs`).
+
+Take `ages = map([("a", 1), ("b", 2)])`. The membership's collection `𝑚` is `ages ≫ key`, the
+entries' key column `[0 ↦ "a", 1 ↦ "b"]`, and its image is `{"a", "b"}`, so `[1 for v in ages]`
+iterates the two keys. The map `ages` itself is `["a" ↦ 1, "b" ↦ 2]`, whose image is the values
+`{1, 2}`.
+
 Producer-bearing domains expose two limitations:
 
 - A producer term is embedded in the type, so its structure can appear at many type sites.

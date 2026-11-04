@@ -645,6 +645,7 @@ fn pair_two_levels(tile: Tile) -> Tile {
         domain: domain1,
         codomain: inner,
         domain_predicate,
+        deleted: outer_deleted,
         ..
     } = tile
     else {
@@ -655,6 +656,7 @@ fn pair_two_levels(tile: Tile) -> Tile {
         domain: domain2,
         mut codomain,
         domain_predicate: inner_statement,
+        deleted: inner_deleted,
         ..
     } = *inner
     else {
@@ -682,6 +684,16 @@ fn pair_two_levels(tile: Tile) -> Tile {
         }
     }
     let total_rows = expansion_indices.len();
+    // A pair is deleted where its inner key is, or where its outer key is: a `Restrict`
+    // deletes keys rather than removing them, and a deleted key's group is deleted with it.
+    let mut deleted = inner_deleted;
+    deleted.extend(
+        expansion_indices
+            .iter()
+            .enumerate()
+            .filter(|&(_, outer)| outer_deleted.contains(*outer))
+            .map(|(pair, _)| pair),
+    );
     let expanded_domain1 = domain1.select_indices(expansion_indices.into_iter(), total_rows);
 
     let pair_domain = ColumnValue::Records(HashMap::from([
@@ -698,7 +710,7 @@ fn pair_two_levels(tile: Tile) -> Tile {
     // The values stand as they were: they are already one entry per key of the flattened
     // domain, in the same order, and materializing them into a column is what a
     // level-carrying value — a nest whose elements are collections — has nowhere to go.
-    Tile::data_function(pair_domain, codomain, pair_statement, BitSet::new())
+    Tile::data_function(pair_domain, codomain, pair_statement, deleted)
 }
 
 impl UncurryProducer {

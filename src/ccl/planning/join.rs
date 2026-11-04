@@ -12,6 +12,8 @@ use std::mem::take;
 
 use crate::ccl::provenance::NodeId;
 
+use super::iterate::extent_overstates_keys;
+
 use super::*;
 
 /// Splits a (pointful) join predicate into equality join conditions and
@@ -704,12 +706,14 @@ fn flatten_tuple_types(indices_to_flatten: &[i64], a: &Type, b: &Type) -> Type {
 ///
 /// Each key and residual predicate it places is a term lifted out of the join condition, and
 /// its id goes to `lifted` for [`try_hash_join_rewrite`] to plan once the join is built.
+///
+/// An error when a leaf's extent holds keys its arm does not ([`extent_iteration`]).
 fn join_plan_to_expr(
     plan: &JoinPlan,
     types: &[Type],
     instances: &Rc<InstanceTable>,
     lifted: &mut Vec<NodeId>,
-) -> Expr {
+) -> Result<Expr, String> {
     match plan {
         // For loop joins (including the trivial one-branch sort), iterate a tuple
         // type consisting of the types of just the arms in this join.
@@ -723,7 +727,7 @@ fn join_plan_to_expr(
         // and op-conversion recognises it as a filter-free iteration.
         JoinPlan::Loop { arms, predicate } => {
             let base_iteration = if arms.len() == 1 {
-                match convert_refinement_to_join(&types[arms[0]], instances, lifted) {
+                match convert_refinement_to_join(&types[arms[0]], instances, lifted)? {
                     Some(transformed) => {
                         trace!(
                             "Converted iteration to {} : {}",
@@ -732,11 +736,12 @@ fn join_plan_to_expr(
                         );
                         transformed
                     }
-                    None => make_iterate(trivially_true_predicate(types[arms[0]].clone())),
+                    None => extent_iteration(types[arms[0]].clone())?,
                 }
             } else {
-                let ty = Type::Tuple(arms.iter().map(|&i| types[i].clone()).collect());
-                make_iterate(trivially_true_predicate(ty))
+                extent_iteration(Type::Tuple(
+                    arms.iter().map(|&i| types[i].clone()).collect(),
+                ))?
             };
             if let Some(predicate) = predicate {
                 // Apply `restrict(predicate)` to the base iteration source as
@@ -747,9 +752,12 @@ fn join_plan_to_expr(
                 // generic applied-combinator arm: `base_iteration` is the
                 // upstream (`input=None`), then the Restrict arm consumes it
                 // (`input=Some(_)`) and emits a `Restrict` tile.
-                make_restrict(lifted_copy(predicate, lifted), base_iteration)
+                Ok(make_restrict(
+                    lifted_copy(predicate, lifted),
+                    base_iteration,
+                ))
             } else {
-                base_iteration
+                Ok(base_iteration)
             }
         }
 
@@ -785,7 +793,7 @@ fn join_plan_to_expr(
             // Build side: group by the build key using converse.
             // Use the full build output tuple type so that converse groups entire
             // build tuples (not just the key arm), preserving all arms through the join.
-            let build_input = join_plan_to_expr(build, types, instances, lifted);
+            let build_input = join_plan_to_expr(build, types, instances, lifted)?;
             let build_output_ty = build_input.ty.codomain().unwrap().clone();
             let build_key = if let Some(build_key_idx) = build_key_idx {
                 typed_compose(vec![
@@ -817,7 +825,7 @@ fn join_plan_to_expr(
 
             // Probe side: compose the probe key with the build side lookup.
             // Use the full probe output tuple type for the same reason.
-            let probe_input = join_plan_to_expr(probe, types, instances, lifted);
+            let probe_input = join_plan_to_expr(probe, types, instances, lifted)?;
             let probe_output_ty = probe_input.ty.codomain().unwrap().clone();
             let probe_key = if let Some(probe_key_idx) = probe_key_idx {
                 typed_compose(vec![
@@ -934,9 +942,24 @@ fn join_plan_to_expr(
             };
 
             typecheck_in(&result, instances).expect("Bad hash join expr");
-            result
+            Ok(result)
         }
     }
+}
+
+/// `iterate(true)` over `ty`, a join leaf's source. The leaf iterates the extent and nothing
+/// else, so over a membership, a filtered component or a projection
+/// ([`extent_overstates_keys`]) it would enumerate keys the arm does not have: an internal
+/// error, since a join leaf does not read its arm's keys the way an iteration site does
+/// ([`super::iterate::wrap_with_iterate`]).
+fn extent_iteration(ty: Type) -> Result<Expr, String> {
+    if extent_overstates_keys(&ty) {
+        return Err(format!(
+            "a join whose arm's extent holds keys the arm does not (a membership, a filtered \
+             component or a projection) is not planned yet: {ty}"
+        ));
+    }
+    Ok(make_iterate(trivially_true_predicate(ty)))
 }
 
 /// A copy of `term` for the join to place, its id recorded in `lifted`.
@@ -978,7 +1001,7 @@ fn convert_loop_join(
     refinement: &Expr,
     instances: &Rc<InstanceTable>,
     lifted: &mut Vec<NodeId>,
-) -> Option<Expr> {
+) -> Result<Option<Expr>, String> {
     trace!(
         "convert_loop_join: base_ty={}, refinement={} : {}",
         base_ty,
@@ -989,11 +1012,13 @@ fn convert_loop_join(
 
     let Type::Tuple(arm_types) = base_ty else {
         trace!("convert_loop_join: base_ty is not a tuple");
-        return None;
+        return Ok(None);
     };
-    let (plan, arm_order) = plan_loop_join(arm_types, refinement, instances)?;
+    let Some((plan, arm_order)) = plan_loop_join(arm_types, refinement, instances) else {
+        return Ok(None);
+    };
     trace!("convert_loop_join: planning succeeded. Plan:\n{plan:#?}");
-    let expr = join_plan_to_expr(&plan, arm_types, instances, lifted);
+    let expr = join_plan_to_expr(&plan, arm_types, instances, lifted)?;
 
     // The morphism produces the join-satisfying extent; surface that on its
     // codomain so downstream consumers (e.g. a `cast({base | r} ⇒ …)` reading
@@ -1007,7 +1032,7 @@ fn convert_loop_join(
     // output domain matches the original tuple type expected by the caller.
     let canonical: Vec<usize> = (0..arm_types.len()).collect();
     if arm_order == canonical {
-        return Some(refine_extent(expr, refinement));
+        return Ok(Some(refine_extent(expr, refinement)));
     }
 
     // perm[j] = position of canonical arm j in arm_order (i.e. where to find it in actual).
@@ -1062,7 +1087,7 @@ fn convert_loop_join(
     );
     let result = refine_extent(result, refinement);
     typecheck_in(&result, instances).expect("Bad permute_domain expr");
-    Some(result)
+    Ok(Some(result))
 }
 
 /// Compile **one** of a refined domain's refinements into a join, leaving the others
@@ -1073,17 +1098,18 @@ fn convert_loop_join(
 /// wins. That also gives planning latitude it could not have while refinements were
 /// a chain: when several are joinable, which one becomes the join is a free
 /// choice a cost model may later make, and the rest remain filters either way.
-/// `None` for an unrefined domain or when no refinement forms a join.
+/// `None` for an unrefined domain or when no refinement forms a join, and an error for a join
+/// that cannot be planned ([`extent_iteration`]).
 fn convert_refinement_to_join(
     domain_ty: &Type,
     instances: &Rc<InstanceTable>,
     lifted: &mut Vec<NodeId>,
-) -> Option<Expr> {
+) -> Result<Option<Expr>, String> {
     let Type::Refinement(base, refinements) = domain_ty else {
-        return None;
+        return Ok(None);
     };
     trace!("Attempting loop join conversion inside iteration");
-    refinements.iter().enumerate().find_map(|(i, r)| {
+    for (i, r) in refinements.iter().enumerate() {
         let rest = Type::refined(
             (**base).clone(),
             refinements
@@ -1095,8 +1121,11 @@ fn convert_refinement_to_join(
         );
         // `convert_loop_join` only reads the predicate (it builds a new expr),
         // so borrow the immutable term rather than clone it.
-        convert_loop_join(&rest, &r.predicate, instances, lifted)
-    })
+        if let Some(joined) = convert_loop_join(&rest, &r.predicate, instances, lifted)? {
+            return Ok(Some(joined));
+        }
+    }
+    Ok(None)
 }
 
 /// Try the hash-join rewrite at an iteration site whose domain is `domain_ty`.
@@ -1107,7 +1136,8 @@ fn convert_refinement_to_join(
 /// conditions (the recogniser is implemented by [`plan_loop_join`] /
 /// [`convert_loop_join`]).  Returns `true` and rewrites `expr` to
 /// `Compose([transformed, original])` on success, leaving `expr` untouched
-/// and returning `false` otherwise.  `transformed` is itself iteration-bearing
+/// and returning `false` otherwise, and an error for a join that cannot be planned
+/// ([`extent_iteration`]).  `transformed` is itself iteration-bearing
 /// at its leaves (`JoinPlan::Loop` emits `Apply(true ▷ const, Iterate)`),
 /// so the resulting chain already has explicit iterate markers — no
 /// further wrap is needed.
@@ -1125,7 +1155,7 @@ pub(super) fn try_hash_join_rewrite(
     expr: &mut Expr,
     domain_ty: &Type,
     ctx: &mut PlanningCtx,
-) -> bool {
+) -> Result<bool, String> {
     trace!(
         "Attempting hash-join rewrite at iteration site: {}",
         symbolic(expr),
@@ -1174,10 +1204,10 @@ pub(super) fn try_hash_join_rewrite(
         provenance::Nature::Machinery,
     );
     let mut lifted = Vec::new();
-    let Some(mut transformed) = convert_refinement_to_join(domain_ty, &ctx.instances, &mut lifted)
+    let Some(mut transformed) = convert_refinement_to_join(domain_ty, &ctx.instances, &mut lifted)?
     else {
         trace!("Hash-join pattern did not match");
-        return false;
+        return Ok(false);
     };
     // A term that does not plan declines the join. The site falls back to the
     // iterate-then-restricts chain, which plans the same refinement as one `restrict` and
@@ -1190,7 +1220,7 @@ pub(super) fn try_hash_join_rewrite(
             lifted.len(),
             "the join places each lifted term once and leaves its id as it placed it"
         ),
-        Err(_) => return false,
+        Err(_) => return Ok(false),
     }
     *ctx = attempt;
     // The whole domain, not the refinement the recogniser accepted:
@@ -1220,11 +1250,22 @@ pub(super) fn try_hash_join_rewrite(
         codomain,
     );
     *expr = ccl_utils::chain_typed(vec![transformed, take(expr)], result_ty);
-    true
+    Ok(true)
 }
 
 #[cfg(test)]
 mod tests {
+    /// [`convert_loop_join`] for a join these tests expect to plan or not to match.
+    fn planned_loop_join(
+        base_ty: &Type,
+        refinement: &Expr,
+        instances: &Rc<InstanceTable>,
+        lifted: &mut Vec<NodeId>,
+    ) -> Option<Expr> {
+        convert_loop_join(base_ty, refinement, instances, lifted)
+            .expect("these joins' arms enumerate their own keys")
+    }
+
     use super::super::test_helpers::*;
     use super::*;
     use crate::ccl::symbolic::symbolic;
@@ -1239,7 +1280,7 @@ mod tests {
         let refinement = var("ref").with_ty(int_ty_val.clone());
 
         // Base type is not a tuple, should return None
-        let result = convert_loop_join(
+        let result = planned_loop_join(
             &int_ty_val,
             &refinement,
             &InstanceTable::builtin(),
@@ -1259,7 +1300,7 @@ mod tests {
         let refinement = var("ref").with_ty(int_ty_val.clone());
 
         // Refinement is not a valid join condition, should return None
-        let result = convert_loop_join(
+        let result = planned_loop_join(
             &triple_tuple,
             &refinement,
             &InstanceTable::builtin(),
@@ -1275,7 +1316,7 @@ mod tests {
         let refinement = var("ref").with_ty(int_ty_val.clone());
 
         // Refinement is not a compose, should return None
-        let result = convert_loop_join(
+        let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
             &InstanceTable::builtin(),
@@ -1299,7 +1340,7 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(
+        let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
             &InstanceTable::builtin(),
@@ -1322,7 +1363,7 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(
+        let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
             &InstanceTable::builtin(),
@@ -1346,7 +1387,7 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(
+        let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
             &InstanceTable::builtin(),
@@ -1379,7 +1420,7 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(
+        let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
             &InstanceTable::builtin(),
@@ -1408,7 +1449,7 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(
+        let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
             &InstanceTable::builtin(),
@@ -1438,7 +1479,7 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(
+        let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
             &InstanceTable::builtin(),
@@ -1477,7 +1518,7 @@ mod tests {
         ])
         .with_ty(ref_ty);
 
-        let result = convert_loop_join(
+        let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
             &InstanceTable::builtin(),
@@ -1524,7 +1565,7 @@ mod tests {
         });
 
         // Should successfully convert
-        let result = convert_loop_join(
+        let result = planned_loop_join(
             &tuple_ty_val,
             &refinement,
             &InstanceTable::builtin(),
@@ -1899,7 +1940,7 @@ mod tests {
         });
 
         // Should succeed: eq condition drives the hash join, filter becomes a predicate.
-        let result = convert_loop_join(&t, &refinement, &InstanceTable::builtin(), &mut Vec::new());
+        let result = planned_loop_join(&t, &refinement, &InstanceTable::builtin(), &mut Vec::new());
         assert!(
             result.is_some(),
             "convert_loop_join should succeed when eq conditions + extra filter are present"
@@ -1929,7 +1970,7 @@ mod tests {
         .with_ty(fun_ty(t.clone(), bool_ty_val));
 
         assert_eq!(
-            convert_loop_join(&t, &filter, &InstanceTable::builtin(), &mut Vec::new()),
+            planned_loop_join(&t, &filter, &InstanceTable::builtin(), &mut Vec::new()),
             None,
             "should return None when no equality conditions are present"
         );
