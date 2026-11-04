@@ -2,7 +2,7 @@
 //! over the pipelines inside the loop's cycle, one inner epoch per position, and steps the
 //! loop's store after each. See `src/interpreter/design-operators.md`, "A loop in rounds".
 
-use super::plan::{Consumes, Members, Planned, plan_edges, reach_in_chain};
+use super::plan::{Consumes, Members, Planned, plan_edges, probe, reach_in_chain, routes_to};
 use super::*;
 use crate::interpreter::tile_operators::StoreCell;
 
@@ -85,6 +85,7 @@ impl LoopScope {
                 &names,
                 &leaves,
                 &vec![false; names.len()],
+                false,
                 &kinds,
                 &(0..names.len()).collect::<Vec<_>>(),
                 morsel_rows,
@@ -229,20 +230,19 @@ impl LoopScope {
         *drive
     }
 
+    /// The paths a push from the range in front of `consumer` takes to the drive's entry, as the
+    /// consumers on the way declare them (`Consumer::route`).
+    pub(super) fn routes(&self, consumer: &SharedConsumer) -> Vec<Route> {
+        let drive = self.drive();
+        self.placed(|_| routes_to(consumer, drive.0))
+    }
+
     /// Where a push of `region` from the range in front of `consumer` lands at the drive's entry,
     /// as guards of the drive's input, the drive's source: a planner probes how a live source's
     /// arrivals reach the scope's rounds.
     pub(super) fn arrivals(&self, consumer: &SharedConsumer, region: &Projection) -> Vec<Arrival> {
         let drive = self.drive();
-        self.placed(|_| {
-            let mut landing = Landing::probe(drive);
-            consumer.borrow_mut().push(region, &mut landing);
-            landing
-                .arrivals()
-                .into_iter()
-                .filter(|arrival| arrival.pipeline.0 == drive.0)
-                .collect()
-        })
+        self.placed(|_| probe(consumer, drive, region, drive.0))
     }
 
     /// Have the drive read what its source holds, emitting nothing: a consume at no position. A

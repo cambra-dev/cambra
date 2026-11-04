@@ -455,6 +455,9 @@ impl Consumer for FlaggingConsumer {
     ) {
         self.downstream.push(region, landing);
     }
+    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
+        self.downstream.route(routes);
+    }
 }
 
 /// The regions an input has notified since they were last taken.
@@ -519,6 +522,9 @@ impl Consumer for RecordingConsumer {
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
         self.downstream.push(region, landing);
+    }
+    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
+        self.downstream.route(routes);
     }
 }
 
@@ -1987,6 +1993,12 @@ pub(crate) mod test_helpers {
                 crate::interpreter::Consumer::push(entry, region, landing);
             }
         }
+
+        fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
+            for entry in &mut self.0 {
+                crate::interpreter::Consumer::route(entry, routes);
+            }
+        }
     }
 
     /// The projection guard naming the keys `[first, last]` of the outermost collection.
@@ -2165,6 +2177,18 @@ pub(crate) mod test_helpers {
                 pulled,
                 released,
             )
+        }
+
+        /// A spy that answers what the returned cell holds, which a test rewrites between pulls to
+        /// grow the input.
+        pub(crate) fn scripted(
+            tile: Tile,
+            tiling: Tiling,
+        ) -> (Self, std::rc::Rc<std::cell::RefCell<Tile>>) {
+            let (mut spy, _, _) = Self::new(tile.clone(), tiling);
+            let cell = std::rc::Rc::new(std::cell::RefCell::new(tile));
+            spy.script = Some(cell.clone());
+            (spy, cell)
         }
     }
 

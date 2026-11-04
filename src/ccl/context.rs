@@ -1232,6 +1232,11 @@ pub struct CompiledOutput {
     /// `Some` for sink outputs — the [`SinkConsumer`] subscribed to the
     /// operator that dispatches to the registered [`crate::interpreter::DataSink`].
     pub sink_consumer: Option<Rc<RefCell<SinkConsumer>>>,
+    /// `Some` for `main` outputs: the placement of the
+    /// [`Entry`](crate::interpreter::dispatcher::Entry) in front of the caller's consumer, which a
+    /// dispatched run sets to the `main` output's pipeline, as it places a sink's consumer in the
+    /// sink's.
+    pub main_entry: Option<crate::interpreter::dispatcher::Placement>,
 }
 
 impl CompiledOutput {
@@ -2873,7 +2878,9 @@ fn compile_to_in(
 /// per "output" of the program:
 ///
 /// - **Pure programs** (no sinks): a single `("main", op)` entry whose
-///   producer is subscribed to `main_consumer`.  The caller drives the main
+///   producer is subscribed to `main_consumer`, behind an unplaced
+///   [`Entry`](crate::interpreter::dispatcher::Entry) that a dispatched run
+///   places (`CompiledOutput::main_entry`).  The caller drives the main
 ///   loop by repeatedly calling [`TileProducer::get`] on that producer.
 /// - **Sink programs** (e.g. `http_serve`): one entry per sink name of the
 ///   trailing `Record{…}`, each wired to a [`SinkConsumer`] that dispatches
@@ -3045,7 +3052,9 @@ fn compile_version(
             let main_consumer = main_consumer
                 .take()
                 .expect("multiple `main` outputs in the program's trailing record");
-            let producer = op.subscribe(universal, main_consumer, ctx.scheduler());
+            let (entry, placement) =
+                crate::interpreter::dispatcher::Entry::unplaced(op.tiling().clone(), main_consumer);
+            let producer = op.subscribe(universal, Box::new(entry), ctx.scheduler());
             debug!(
                 "Main producer:\n{}",
                 pretty_tile_producer_with(
@@ -3061,6 +3070,7 @@ fn compile_version(
                 op,
                 producer: Some(producer),
                 sink_consumer: None,
+                main_entry: Some(placement),
             });
         } else {
             let sink = sink_bindings_registry
@@ -3098,6 +3108,7 @@ fn compile_version(
                 op,
                 producer: None,
                 sink_consumer: Some(consumer_rc),
+                main_entry: None,
             });
         }
     }

@@ -200,6 +200,39 @@ fn committed(store: &Tile) -> Vec<Value> {
         .collect()
 }
 
+/// How many times the store's inputs, its body or writers and its seeds, have been pulled.
+fn input_pulls(compiled: &Compiled) -> u64 {
+    let mut pulls = 0;
+    compiled
+        .store
+        .borrow()
+        .visit_input_producers(&mut |_, input| pulls += input.base().pulls);
+    pulls
+}
+
+/// A consuming store answers a pull before its first consume with the unopened store: nothing
+/// terminal, and no input pulled. Its consumes then run as they would have.
+#[rstest_log::rstest]
+#[case::an_induction_store(SUM)]
+#[case::a_transaction_store(TWO_WRITERS)]
+fn a_consuming_store_pulled_before_its_first_consume_answers_nothing_final(#[case] source: &str) {
+    let compiled = Compiled::of(source);
+    compiled.breaker(|_| {});
+    let before = input_pulls(&compiled);
+    let whole = compiled.store.borrow().tiling().universal_guard();
+    let pulled = compiled.store.borrow_mut().get(whole);
+    assert!(!pulled.is_terminal(), "{pulled:?}");
+    assert_eq!(input_pulls(&compiled), before, "the pull steps nothing");
+    if source == TWO_WRITERS {
+        compiled.consume_whole(0);
+        compiled.consume_whole(1);
+        assert_eq!(
+            committed(&compiled.snapshot()),
+            [90, 85, 65].map(Value::Int).to_vec()
+        );
+    }
+}
+
 /// A consume of one writer's source takes its proposals and commits none of them while the other
 /// writer has not passed their positions, and the positions taken count as released for that
 /// writer's input.

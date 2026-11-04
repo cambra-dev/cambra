@@ -347,10 +347,10 @@ fn a_reader_of_two_pipelines_consumes_both_and_finishes_after_both() {
     );
 }
 
-/// Along a build edge a reader takes no push, and no package before the pipeline it builds on
-/// has finished the epoch: here pipeline 2 builds on 1 and takes 0's pushes.
+/// A reader takes no push of a pipeline it follows, and no package before that pipeline has
+/// finished the epoch: here pipeline 2 follows 1 and takes 0's pushes.
 #[test]
-fn a_reader_takes_nothing_before_the_pipeline_it_builds_on_finishes() {
+fn a_reader_takes_nothing_before_the_pipeline_it_follows_finishes() {
     let (low, high) = halves();
     let breakers: Vec<BreakerHandle> = vec![
         Scripted::holding(low.clone()),
@@ -360,7 +360,7 @@ fn a_reader_takes_nothing_before_the_pipeline_it_builds_on_finishes() {
     let reads = vec![vec![], vec![], vec![0, 1]];
     wire(&reads, &breakers);
     let mut dispatcher = Dispatcher::new(reads, UNBOUNDED);
-    dispatcher.build(PipelineId(2), PipelineId(1));
+    dispatcher.follow(PipelineId(2), PipelineId(1));
     run(&dispatcher, &breakers);
     let events = dispatcher.into_events();
     let first = events
@@ -1334,7 +1334,7 @@ fn a_source_notified_after_its_close_is_refused() {
 
 /// A pipeline that reads another is queued what that one pushes, not notified.
 #[test]
-#[should_panic(expected = "pipeline 1 is queued its input only as a source")]
+#[should_panic(expected = "pipeline 1 is queued arrivals only as a source")]
 fn a_reader_notified_is_refused() {
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], 2);
     dispatcher.notify(PipelineId(1), &keys_between(0, 1));
@@ -1748,6 +1748,10 @@ impl Consumer for Boxed {
     ) {
         self.0.push(region, landing);
     }
+
+    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
+        self.0.route(routes);
+    }
 }
 
 /// The entry of pipeline 1 behind a gated consumer, as an operator between two breakers shares
@@ -1889,6 +1893,33 @@ impl Consumer for Paths {
             path.push(region, landing);
         }
     }
+
+    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
+        for path in &mut self.0 {
+            path.route(routes);
+        }
+    }
+}
+
+/// A route declares, per path, whether the consumers on it keep the pushing pipeline's keys: a
+/// path through a widening consumer reaches the entry widened, and one through a consumer that
+/// keeps keys reaches it with them kept. Nothing is pushed.
+#[test]
+fn a_route_declares_whether_each_path_keeps_its_keys() {
+    let (_gate, shared) = gated_entry(&ints());
+    let wakeups = WakeupQueue::default();
+    let mut paths = Paths(vec![
+        forwarding_consumer(&shared, &wakeups),
+        forwarding_consumer_keeping_keys(&shared, &wakeups),
+    ]);
+    let mut routes = crate::interpreter::dispatcher::Routes::new();
+    paths.route(&mut routes);
+    let reached: Vec<_> = routes
+        .reached()
+        .into_iter()
+        .map(|route| (route.pipeline, route.keeps_keys))
+        .collect();
+    assert_eq!(reached, [(PipelineId(1), false), (PipelineId(1), true)]);
 }
 
 /// A push widened to `Everything` on its way fails the run, since the reader could not tell which
@@ -2011,4 +2042,276 @@ impl Consumer for Through {
             .expect("the operator was subscribed")
             .push(region, landing);
     }
+
+    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
+        self.0
+            .borrow_mut()
+            .as_mut()
+            .expect("the operator was subscribed")
+            .route(routes);
+    }
+}
+
+/// A pipeline that takes arrivals beside the pipeline it reads is notified as a source is, and
+/// takes its package at once, before that pipeline has finished the epoch. Its queue closes once
+/// the epoch's arrivals have ended, by a seal or by its close, and that pipeline has finished.
+#[rstest_log::rstest]
+fn a_pipeline_that_takes_arrivals_takes_them_at_once(#[values(false, true)] closed: bool) {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    dispatcher.take_arrivals(PipelineId(1));
+    dispatcher.notify(PipelineId(1), &keys_between(0, 1));
+    let package = dispatcher
+        .claim_of(PipelineId(1))
+        .expect("the arrival, before pipeline 0 has finished the epoch");
+    assert_eq!(package.guard, keys_between(0, 1));
+    read_leaving_open(&dispatcher, package, None);
+    match closed {
+        true => {
+            dispatcher.close(PipelineId(1));
+            dispatcher.close(PipelineId(0));
+        }
+        false => assert!(dispatcher.try_seal(), "the window holds the next epoch"),
+    }
+    let Next::Finish {
+        pipeline, epoch, ..
+    } = dispatcher.try_claim(None)
+    else {
+        panic!("pipeline 0's finish is claimable, and pipeline 1's queue waits for it")
+    };
+    assert_eq!((pipeline, epoch), (PipelineId(0), 0));
+    dispatcher.finish(dispatcher.pushes_in(PipelineId(0), 0));
+    let Next::Finish { pipeline, .. } = dispatcher.try_claim(None) else {
+        panic!("pipeline 1's queue is closed once the arrivals ended and pipeline 0 finished")
+    };
+    assert_eq!(pipeline, PipelineId(1));
+}
+
+/// Consume `package` by hand, leaving `open` of it open.
+fn read_leaving_open(dispatcher: &Dispatcher, package: WorkPackage, open: Option<TileGuard>) {
+    dispatcher.begin_read(&package);
+    dispatcher.end_read(&package, open);
+    dispatcher.acknowledge(package);
+}
+
+/// A pipeline that keeps open rows records, at the end of each consume, the rows of its package
+/// its breaker's input has not released. A push that names them queues them as one package read
+/// again in the push's epoch, whether the rows were consumed in that epoch or an earlier one, and
+/// queues nothing fresh for rows queued before.
+#[rstest_log::rstest]
+fn the_open_rows_a_push_names_are_read_again_in_the_push_epoch(#[values(false, true)] later: bool) {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    dispatcher.keep_open_rows(PipelineId(1));
+    dispatcher.queue_for(PipelineId(1), &keys_between(0, 2));
+    let start = dispatcher
+        .claim_of(PipelineId(1))
+        .expect("the start region");
+    read_leaving_open(&dispatcher, start, Some(keys_between(1, 2)));
+    assert_eq!(
+        dispatcher.open_rows(PipelineId(1)),
+        Some(keys_between(1, 2))
+    );
+    if later {
+        assert!(dispatcher.try_seal(), "the window holds epoch 1");
+        dispatcher.finish_by_hand(PipelineId(0), |_| {});
+        dispatcher.finish_by_hand(PipelineId(1), |_| {});
+    }
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        pushes.push(&keys_between(0, 2), |guard, _| vec![guard.clone()])
+    });
+    let package = dispatcher
+        .claim_of(PipelineId(1))
+        .expect("the open rows the push names, read again");
+    assert_eq!(package.epoch, u64::from(later));
+    assert_eq!(package.guard, keys_between(1, 2));
+    assert_eq!(dispatcher.open_rows(PipelineId(1)), None);
+    read_leaving_open(&dispatcher, package, None);
+    assert_eq!(
+        dispatcher.claim_of(PipelineId(1)),
+        None,
+        "the push queues no row fresh that a queue held before"
+    );
+}
+
+/// A pipeline that keeps open rows finishes its epochs in order while the pipeline it reads
+/// finishes epochs ahead of it: each of its queues closes at that pipeline's finish of the epoch
+/// and the epoch's seal, and the run ends.
+#[test]
+fn several_epochs_wait_for_the_finishes_of_a_pipeline_that_keeps_open_rows() {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    dispatcher.take_arrivals(PipelineId(1));
+    for _ in 0..3 {
+        assert!(dispatcher.try_seal(), "the window holds the next epoch");
+        dispatcher.finish_by_hand(PipelineId(0), |_| {});
+    }
+    dispatcher.close(PipelineId(1));
+    for _ in 0..16 {
+        match dispatcher.try_claim(None) {
+            Next::Finish {
+                pipeline, epoch, ..
+            } => dispatcher.finish(dispatcher.pushes_in(pipeline, epoch)),
+            Next::Done => return,
+            next => panic!("every queue of pipeline 1 closes: {next:?}"),
+        }
+    }
+    panic!("the run ends");
+}
+
+/// A pipeline that keeps open rows fails the run at its finish of the last epoch where a row it
+/// consumed is still unreleased.
+#[test]
+#[should_panic(expected = "finishes the run's last epoch after its input has released every row")]
+fn a_row_open_at_the_last_epoch_fails_the_run() {
+    let reads = vec![vec![], vec![0]];
+    let breakers: Vec<BreakerHandle> = vec![
+        Scripted::holding(ints().universal_guard()),
+        Scripted::keeping(ints().universal_guard()),
+    ];
+    wire(&reads, &breakers);
+    let mut dispatcher = Dispatcher::new(reads, UNBOUNDED);
+    dispatcher.take_arrivals(PipelineId(1));
+    dispatcher.notify(PipelineId(1), &keys_between(0, 1));
+    dispatcher.close(PipelineId(1));
+    dispatcher.close(PipelineId(0));
+    finish_epoch(&dispatcher, &breakers, PipelineId(0));
+    let package = dispatcher
+        .claim_of(PipelineId(1))
+        .expect("the arrival, once pipeline 0 has finished");
+    hand_over(&dispatcher, &breakers, package);
+    finish_epoch(&dispatcher, &breakers, PipelineId(1));
+}
+
+/// A push that names the package of a consume in flight holds the reader's queue in the push's
+/// epoch open, though the pipeline that pushed has finished it, until the consume ends. Its end
+/// queues there what the push named of the rows it left open.
+#[test]
+fn a_push_during_a_consume_holds_the_queue_open_for_its_open_rows() {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    dispatcher.keep_open_rows(PipelineId(1));
+    dispatcher.queue_for(PipelineId(1), &keys_between(0, 2));
+    let package = dispatcher
+        .claim_of(PipelineId(1))
+        .expect("the start region");
+    dispatcher.begin_read(&package);
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        pushes.push(&keys_between(1, 5), |guard, _| vec![guard.clone()])
+    });
+    dispatcher.end_read(&package, Some(keys_between(2, 2)));
+    dispatcher.acknowledge(package);
+    let fresh = dispatcher
+        .claim_of(PipelineId(1))
+        .expect("the keys no queue held");
+    assert_eq!(fresh.guard, keys_between(3, 5));
+    dispatcher.acknowledge(fresh);
+    let again = dispatcher
+        .claim_of(PipelineId(1))
+        .expect("the row the consume left open, which the push named");
+    assert_eq!((again.epoch, again.guard.clone()), (0, keys_between(2, 2)));
+    dispatcher.acknowledge(again);
+    let Next::Finish { pipeline, .. } = dispatcher.try_claim(None) else {
+        panic!("the hold ended with the consume, so pipeline 1 may finish")
+    };
+    assert_eq!(pipeline, PipelineId(1));
+}
+
+/// A pipeline that takes arrivals is queued its rows as they arrive. A push to it queues no row
+/// fresh, since its region can name rows not yet arrived, and reads again the open rows it names.
+#[test]
+fn a_push_to_a_pipeline_that_takes_arrivals_only_reads_rows_again() {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    dispatcher.take_arrivals(PipelineId(1));
+    dispatcher.notify(PipelineId(1), &keys_between(0, 3));
+    let arrived = dispatcher.claim_of(PipelineId(1)).expect("the arrival");
+    assert_eq!(arrived.guard, keys_between(0, 3));
+    read_leaving_open(&dispatcher, arrived, Some(keys_between(2, 3)));
+    let mut pushes = dispatcher.pushes_in(PipelineId(0), 0);
+    pushes.push(&keys_between(0, 9), |guard, _| vec![guard.clone()]);
+    dispatcher.land(pushes);
+    let again = dispatcher
+        .claim_of(PipelineId(1))
+        .expect("the open rows the push names");
+    assert_eq!(again.guard, keys_between(2, 3));
+    read_leaving_open(&dispatcher, again, None);
+    assert_eq!(
+        dispatcher.claim_of(PipelineId(1)),
+        None,
+        "the push queues no row that has not arrived"
+    );
+}
+
+/// A push in a later epoch than a consume in flight holds the reader's queue in the push's epoch:
+/// the consume's end queues there what the push named of the rows it left open.
+#[test]
+fn a_push_in_a_later_epoch_holds_that_epochs_queue_for_a_consume_in_flight() {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    dispatcher.keep_open_rows(PipelineId(1));
+    dispatcher.queue_for(PipelineId(1), &keys_between(0, 2));
+    let package = dispatcher
+        .claim_of(PipelineId(1))
+        .expect("the start region");
+    dispatcher.begin_read(&package);
+    assert!(dispatcher.try_seal(), "the window holds epoch 1");
+    dispatcher.finish_by_hand(PipelineId(0), |_| {});
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        pushes.push(&keys_between(1, 2), |guard, _| vec![guard.clone()])
+    });
+    dispatcher.end_read(&package, Some(keys_between(2, 2)));
+    dispatcher.acknowledge(package);
+    let again = dispatcher
+        .claim_of(PipelineId(1))
+        .expect("the row the consume left open, which the push in epoch 1 named");
+    assert_eq!((again.epoch, again.guard), (1, keys_between(2, 2)));
+}
+
+/// A push that names part of an open row, beneath its outermost keys, reads the whole row again:
+/// every chain can be pulled at a row's outermost keys.
+#[test]
+fn a_push_naming_part_of_an_open_row_reads_the_row_again_whole() {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    dispatcher.keep_open_rows(PipelineId(1));
+    dispatcher.queue_for(PipelineId(1), &keys_between(0, 2));
+    let start = dispatcher
+        .claim_of(PipelineId(1))
+        .expect("the start region");
+    read_leaving_open(&dispatcher, start, Some(keys_between(1, 1)));
+    let part = TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+        FunctionGuard::Domain(Predicate::qualified(
+            Predicate::point(Value::UInt(1)),
+            Predicate::point(Value::UInt(5)),
+        )),
+    ))));
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        pushes.push(&part, |guard, _| vec![guard.clone()])
+    });
+    let again = dispatcher
+        .claim_of(PipelineId(1))
+        .expect("the open row the push names part of");
+    assert_eq!(again.guard, keys_between(1, 1));
+}
+
+/// A push that names part of a row beneath its outermost keys while a consume of the row is in
+/// flight reads the whole row again at the consume's end, in the push's epoch.
+#[test]
+fn a_push_during_a_consume_reads_the_row_again_whole() {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    dispatcher.keep_open_rows(PipelineId(1));
+    dispatcher.queue_for(PipelineId(1), &keys_between(0, 2));
+    let package = dispatcher
+        .claim_of(PipelineId(1))
+        .expect("the start region");
+    dispatcher.begin_read(&package);
+    let part = TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+        FunctionGuard::Domain(Predicate::qualified(
+            Predicate::point(Value::UInt(1)),
+            Predicate::point(Value::UInt(5)),
+        )),
+    ))));
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        pushes.push(&part, |guard, _| vec![guard.clone()])
+    });
+    dispatcher.end_read(&package, Some(keys_between(1, 1)));
+    dispatcher.acknowledge(package);
+    let again = dispatcher
+        .claim_of(PipelineId(1))
+        .expect("the row the consume left open, part of which the push named");
+    assert_eq!((again.epoch, again.guard), (0, keys_between(1, 1)));
 }

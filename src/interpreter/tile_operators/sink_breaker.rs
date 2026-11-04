@@ -7,10 +7,10 @@ use super::*;
 use crate::interpreter::DataSink;
 use crate::interpreter::sinks::ProducerSlot;
 
-/// The pipeline breaker of a sink: it consumes a package by pulling the sink's producer at the
-/// package's guard, hands the answer to the sink, and releases the producer at what the answer
-/// states, as a sink's pull in pull mode does at the universal guard. No pipeline reads it, so it
-/// is no producer: it holds nothing, offers nothing and pushes nothing.
+/// The pipeline breaker of a sink or a `main` output: it consumes a package by pulling the
+/// producer at the package's guard and releasing it at what the answer states, as a sink's pull
+/// in pull mode does at the universal guard, and hands the answers to the sink ([`Hands`]). No
+/// pipeline reads it, so it is no producer: it offers nothing and pushes nothing.
 ///
 /// A package's answer states only its own region complete, so it is terminal only where the
 /// package is the producer's whole input. The sink is done once its producer is released whole
@@ -21,13 +21,64 @@ use crate::interpreter::sinks::ProducerSlot;
 pub(crate) struct SinkBreaker {
     producer: ProducerSlot,
     sink: Arc<dyn DataSink>,
+    hands: Hands,
+}
+
+/// When a [`SinkBreaker`] hands its sink what it pulled.
+enum Hands {
+    /// Each package's answer, as the package is consumed: a sink output's breaker.
+    EachPackage,
+    /// One answer per epoch, at the epoch's finish: the answers of the epoch's packages merged
+    /// with a pull of the producer at the universal guard, which states what the producer states
+    /// complete, so the answer is the one a pull in pull mode makes once the epoch's arrivals have
+    /// reached it. The run's last finish answers a terminal tile. A `main` output's breaker, whose
+    /// driver prints each answer as pull mode prints each pull's. Its pipeline is ordered
+    /// (`Dispatcher::order`), so every package of an epoch is consumed after the finish of the
+    /// epoch before it and before its own: `answer` holds one epoch's answers.
+    EachEpoch {
+        /// The answers of the packages consumed since the last finish, merged.
+        answer: Option<Box<Tile>>,
+        /// The epoch the breaker last finished.
+        finished: Option<u64>,
+        /// Whether the output reads a loop's scope, directly or through other pipelines
+        /// ([`SinkBreaker::reads_a_loop`]).
+        loop_beneath: bool,
+    },
 }
 
 impl SinkBreaker {
     /// The breaker of the sink that hands what it pulls of `producer`, which `subscribe` has
-    /// filled, to `sink`.
+    /// filled, to `sink`, one answer per package.
     pub(crate) fn new(producer: ProducerSlot, sink: Arc<dyn DataSink>) -> Self {
-        Self { producer, sink }
+        Self {
+            producer,
+            sink,
+            hands: Hands::EachPackage,
+        }
+    }
+
+    /// The breaker of a `main` output, which hands what it pulls of `producer` to `sink` one
+    /// answer per epoch ([`Hands::EachEpoch`]).
+    pub(crate) fn per_epoch(producer: ProducerSlot, sink: Arc<dyn DataSink>) -> Self {
+        Self {
+            producer,
+            sink,
+            hands: Hands::EachEpoch {
+                answer: None,
+                finished: None,
+                loop_beneath: false,
+            },
+        }
+    }
+
+    /// Record that this `main` output reads a loop's scope. The scope's store pushes once it is
+    /// terminal, and a pipeline reading it takes it at the run's last epoch, so the pull at an
+    /// earlier finish reads, through that pipeline's breaker in pull mode, rows the loop's rounds
+    /// have written. Each is final as it is written, and the producer states it complete.
+    pub(crate) fn reads_a_loop(&mut self) {
+        if let Hands::EachEpoch { loop_beneath, .. } = &mut self.hands {
+            *loop_beneath = true;
+        }
     }
 
     fn input(producer: &ProducerSlot) -> std::cell::RefMut<'_, Box<dyn TileProducer>> {
@@ -53,8 +104,57 @@ impl Breaker for SinkBreaker {
     fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
         let mut producer = Self::input(&self.producer);
         let tile = producer.get(guard);
-        self.sink.process(&tile);
         producer.release(tile.to_guard());
+        match &mut self.hands {
+            Hands::EachPackage => self.sink.process(&tile),
+            Hands::EachEpoch { answer, .. } => match answer {
+                None => *answer = Some(Box::new(tile)),
+                Some(answer) => answer.merge(tile),
+            },
+        }
+    }
+
+    fn finish(&mut self, pushes: &mut Pushes<'_>, last: bool) {
+        let Hands::EachEpoch {
+            answer: epoch,
+            finished,
+            loop_beneath,
+        } = &mut self.hands
+        else {
+            return;
+        };
+        debug_assert!(
+            finished.is_none_or(|finished| finished < pushes.epoch()),
+            "a `main` output's pipeline is ordered, so it finishes its epochs in order and the \
+             answers merged at a finish are that epoch's alone"
+        );
+        *finished = Some(pushes.epoch());
+        let mut producer = Self::input(&self.producer);
+        let tiling = producer.tiling().clone();
+        let rest = producer.get(tiling.universal_guard()).closed_over(&tiling);
+        producer.release(rest.to_guard());
+        // The epoch's packages consumed all the producer holds, so the pull adds no key, except
+        // the rows of a loop's rounds where the output reads a loop's scope (`reads_a_loop`).
+        debug_assert!(
+            rest.is_empty()
+                || *loop_beneath
+                    && matches!(&rest, Tile::DataFunction { domain_predicate, .. }
+                        if rest.within(&Projection::admitting(domain_predicate.clone())).is_ok()),
+            "the pull at the finish of an epoch of a `main` output adds no key, unless it reads \
+             a loop's scope, and then only keys the producer states complete: {rest:?}"
+        );
+        let answer = match epoch.take() {
+            None => rest,
+            Some(mut answer) => {
+                answer.merge(rest);
+                *answer
+            }
+        };
+        debug_assert!(
+            !last || answer.is_terminal(),
+            "the run's last epoch hands a `main` output a terminal answer"
+        );
+        self.sink.process(&answer);
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
@@ -155,5 +255,99 @@ mod tests {
         );
         assert_eq!(sink.0.load(Ordering::SeqCst), 1);
         assert!(!breaker.input_released(InputId::ONLY).is_universal());
+    }
+
+    /// A sink that keeps each tile it is handed.
+    #[derive(Default)]
+    struct Recording(Mutex<Vec<Tile>>);
+
+    impl DataSink for Recording {
+        fn process(&self, tile: &Tile) {
+            self.0
+                .lock()
+                .expect("no hand-off panics")
+                .push(tile.clone());
+        }
+    }
+
+    /// A `main` output's breaker hands one answer per epoch: the epoch's packages' answers merged
+    /// with what the producer states complete, an answer of no key for an epoch of no package, and
+    /// a terminal answer at the last epoch.
+    #[test]
+    fn a_main_output_is_handed_one_answer_per_epoch() {
+        let tiling = Tiling::data_function(
+            Extent::Base(BaseType::Int),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let input = |keys: Vec<i64>, complete: Predicate| {
+            let values = keys.iter().map(|key| key * 10).collect();
+            Tile::data_function(
+                ColumnValue::Ints(keys),
+                Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+                complete,
+                bit_set::BitSet::new(),
+            )
+        };
+        let keys = |keys: Vec<i64>| {
+            TileGuard::Function(FunctionGuard::Domain(Predicate::from_column_value(
+                &ColumnValue::Ints(keys),
+            )))
+        };
+        let through = |key: i64| Predicate::at_or_below(Value::Int(key));
+        let (spy, script) = ProjectionSpy::scripted(input(vec![0], through(0)), tiling);
+        let producer: ProducerSlot = Rc::new(RefCell::new(Some(Box::new(spy))));
+        let sink = Arc::new(Recording::default());
+        let mut breaker = SinkBreaker::per_epoch(producer, sink.clone());
+        let dispatcher = crate::interpreter::dispatcher::Dispatcher::new(vec![vec![]], 1);
+        let finish = |breaker: &mut SinkBreaker, epoch: u64, last: bool| {
+            let mut pushes =
+                dispatcher.pushes_in(crate::interpreter::dispatcher::PipelineId(0), epoch);
+            breaker.finish(&mut pushes, last);
+        };
+        // Epoch 0: one package of key 0.
+        breaker.consume_impl(InputId::ONLY, keys(vec![0]));
+        finish(&mut breaker, 0, false);
+        // Epoch 1: no package; the producer states key 1 complete and holds nothing at it.
+        *script.borrow_mut() = input(vec![0], through(1));
+        finish(&mut breaker, 1, false);
+        // Epoch 2: two packages, keys 2 and 3, and everything complete.
+        *script.borrow_mut() = input(vec![0, 2, 3], Predicate::True);
+        breaker.consume_impl(InputId::ONLY, keys(vec![2]));
+        breaker.consume_impl(InputId::ONLY, keys(vec![3]));
+        finish(&mut breaker, 2, true);
+        let handed = sink.0.lock().expect("no hand-off panics");
+        let held: Vec<Vec<i64>> = handed
+            .iter()
+            .map(|tile| match tile {
+                Tile::DataFunction {
+                    domain: ColumnValue::Ints(keys),
+                    ..
+                } => keys.clone(),
+                other => panic!("an answer of keys: {other:?}"),
+            })
+            .collect();
+        assert_eq!(held, [vec![0], vec![], vec![2, 3]], "one answer per epoch");
+        assert_eq!(
+            handed.iter().map(Tile::is_terminal).collect::<Vec<_>>(),
+            [false, false, true],
+            "only the last epoch's answer is terminal"
+        );
+        assert!(breaker.input_released(InputId::ONLY).is_universal());
+    }
+
+    /// A `main` output's breaker finishes its epochs in order, since its pipeline is ordered.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a `main` output's pipeline is ordered")]
+    fn a_main_output_finishing_an_earlier_epoch_is_refused() {
+        let tiling = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let (spy, _, _) = ProjectionSpy::new(Tile::Scalar(ColumnValue::Ints(vec![3])), tiling);
+        let producer: ProducerSlot = Rc::new(RefCell::new(Some(Box::new(spy))));
+        let mut breaker = SinkBreaker::per_epoch(producer, Arc::new(Recording::default()));
+        let dispatcher = crate::interpreter::dispatcher::Dispatcher::new(vec![vec![]], 1);
+        let pipeline = crate::interpreter::dispatcher::PipelineId(0);
+        breaker.consume_impl(InputId::ONLY, TileGuard::Scalar(TileGuard::leaf(true)));
+        breaker.finish(&mut dispatcher.pushes_in(pipeline, 1), false);
+        breaker.finish(&mut dispatcher.pushes_in(pipeline, 0), false);
     }
 }
