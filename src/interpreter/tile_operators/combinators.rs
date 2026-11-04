@@ -436,13 +436,21 @@ impl TileProducer for ConverseProducer {
         Some(self)
     }
 
+    /// The answer is cut to the projection at any level, so every level is restated: the
+    /// standing levels name the input's keys, and the inverted level and those beneath it are cut
+    /// from the groups.
+    fn restates(&self) -> Restates {
+        Restates::Every
+    }
+
     /// Inverting the outermost collection makes the values it holds the keys, and which rows
     /// carry which value is known only once the rows are read: the input is read whole and the
     /// groups cut after. The rows a cut group does not name stay unreleased at the input, so a
-    /// later pull reads them again. Beneath standing levels the projection names keys the
-    /// inversion leaves standing, so the input is pulled at it.
+    /// later pull reads them again. Beneath standing levels the input is pulled at the standing
+    /// keys the projection names ([`Projection::above`]), since the inverted level's keys are
+    /// the input's values.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let projection = projection_guard.projection(&self.name());
+        let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
@@ -451,7 +459,7 @@ impl TileProducer for ConverseProducer {
         }
         let input_guard = match self.level.enclosing() {
             None => self.input.tiling().universal_guard(),
-            Some(_) => projection.guard(self.input.tiling()),
+            Some(_) => projection.above(self.level).guard(self.input.tiling()),
         };
         let input_tile = self.input.get(input_guard);
         let (mut out, held) = self.invert(input_tile);
@@ -636,7 +644,7 @@ impl BreakingProducer for ConverseProducer {
     }
 
     fn offer_impl(&mut self, guard: TileGuard) -> Tile {
-        let projection = guard.projection(&self.name());
+        let projection = guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
@@ -2045,6 +2053,59 @@ mod nested_projection_tests {
         ProjectionSpyOp, assert_conforms_beneath, ints_by_position, paths_guard, two_levels_of_ints,
     };
     use crate::interpreter::{BaseType, Extent, FunctionGuard, Predicate, Value};
+
+    /// Two rows of the keys `0..3`, each valued by a `UInt`, for a `Converse` to group by value
+    /// beneath the rows.
+    fn rows_of_uint_values() -> (Tile, Tiling) {
+        let uints = || Tiling::Scalar(Extent::Base(BaseType::UInt));
+        let tiling = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::data_function(Extent::uint_range(3), uints()),
+        );
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 3],
+                ColumnValue::UInts(vec![0, 1, 2, 0, 1, 2]),
+                Box::new(Tile::Scalar(ColumnValue::UInts(vec![0, 1, 1, 1, 1, 0]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        (tile, tiling)
+    }
+
+    /// A converse beneath a standing level pulled at a path of its groups pulls its input at the
+    /// standing row the path runs through, and answers the whole answer cut to the path.
+    #[test]
+    fn a_converse_beneath_a_level_pulls_a_path_of_its_groups_at_its_row() {
+        use crate::interpreter::tile_operators::test_helpers::assert_conforms;
+        let at_one = paths_guard(Predicate::qualified(
+            Predicate::point(Value::UInt(0)),
+            Predicate::point(Value::UInt(1)),
+        ));
+        let make = || {
+            let (tile, tiling) = rows_of_uint_values();
+            let (spy, pulled, _) = ProjectionSpyOp::new(tile, tiling);
+            let mut converse = Converse::new_at(Box::new(spy), CurryLevel::new(1));
+            let guard = converse.tiling().universal_guard();
+            (
+                converse.subscribe(guard, Box::new(|| {}), &mut Scheduler::new()),
+                pulled,
+            )
+        };
+        let (mut producer, pulled) = make();
+        producer.get(at_one.clone());
+        assert_eq!(
+            *pulled.borrow(),
+            [TileGuard::Function(FunctionGuard::Domain(
+                Predicate::point(Value::UInt(0))
+            ))]
+        );
+        assert_conforms(|| make().0, at_one);
+    }
 
     /// The outer side of a product has no paired level, so a projection of the pairs pulls both
     /// sides at the rows its paths run through and cuts the pairs.

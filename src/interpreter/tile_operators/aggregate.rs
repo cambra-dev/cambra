@@ -1202,7 +1202,9 @@ impl TileProducer for MapAggregateProducer {
 
     /// The keys at every level are the input's, with each group beneath one whole, so the input
     /// is pulled at the projection and the answer is cut to it: accumulators for keys pulled
-    /// earlier stay held, and a pull names the keys it wants.
+    /// earlier stay held, and a pull names the keys it wants. What the answers state is kept
+    /// across pulls with the accumulators, since a pull beneath the groups' keys states only the
+    /// elements it reads (`Stated::settled`).
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
@@ -1212,7 +1214,13 @@ impl TileProducer for MapAggregateProducer {
             return self.offer_impl(projection_guard);
         }
         let stated = self.read_input(projection.guard(self.input.tiling()));
-        self.build(&stated, &projection)
+        let stated = match self.stated.take() {
+            Some(before) => before.union(&stated).settled(self.accumulators.keys()),
+            None => stated,
+        };
+        let answer = self.build(&stated, &projection);
+        self.stated = Some(stated);
+        answer
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -1364,6 +1372,61 @@ mod tests {
             Predicate::True,
             BitSet::new(),
         )
+    }
+
+    /// A pulled aggregate keeps what its answers state across pulls, so a group whose elements
+    /// two answers state complete in parts is terminal once the parts cover it.
+    #[test]
+    fn a_pulled_group_stated_complete_in_parts_is_terminal() {
+        use crate::interpreter::tile_operators::test_helpers::ProjectionSpy;
+        let point = |k: u64| Predicate::point(Value::UInt(k));
+        let input_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::data_function(
+                Extent::Base(BaseType::UInt),
+                Tiling::Scalar(Extent::Base(BaseType::Int)),
+            ),
+        );
+        let through_two = Predicate::at_or_below(Value::UInt(2));
+        // Group 0's elements, stated complete through `stated` beneath it.
+        let group = |keys: Vec<u64>, values: Vec<i64>, stated: Predicate| {
+            Tile::data_function(
+                ColumnValue::UInts(vec![0]),
+                Box::new(Tile::grouped(
+                    vec![0],
+                    ColumnValue::from_uints(keys),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(values))),
+                    Predicate::qualified(point(0), stated),
+                    BitSet::new(),
+                )),
+                Predicate::False,
+                BitSet::new(),
+            )
+        };
+        let (input, cell) = ProjectionSpy::scripted(
+            group(vec![0, 1, 2], vec![1, 2, 3], through_two.clone()),
+            input_tiling,
+        );
+        let output = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::Aggregation {
+                kind: AggregateKind::Sum,
+                accumulator: Box::new(Tiling::Scalar(Extent::Base(BaseType::Int))),
+            },
+        );
+        let mut sums = MapAggregateProducer::new(
+            ProducerBase::unowned(MapAggregateProducer::alloc_id(), &output),
+            Box::new(input),
+            AggregateKind::Sum,
+        );
+        let key = TileGuard::Function(FunctionGuard::Domain(point(0)));
+        sums.get(key.clone());
+        *cell.borrow_mut() = group(vec![3, 4], vec![4, 5], Predicate::True.minus(&through_two));
+        let answer = sums.get(key);
+        let Tile::DataFunction { codomain, .. } = &answer else {
+            panic!("a collection of sums, got {answer:?}")
+        };
+        assert!(codomain.is_terminal(), "{answer:?}");
     }
 
     /// Beneath an enclosing level, a group still folding is left out of what the aggregate holds

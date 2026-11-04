@@ -1246,6 +1246,62 @@ impl MapResultWithSourceProducer {
     }
 }
 
+impl MapResultWithSourceProducer {
+    /// The source rows freed by `released`, a release of this producer's output, read through
+    /// `correlation`. An `Or` frees what its arms free.
+    ///
+    /// # Panics
+    ///
+    /// Where an arm is no region of keys at the outermost level or one beneath it, or a release
+    /// beneath the outermost keys reaches a source correlated more than one level in.
+    fn freed(&self, released: &TileGuard, correlation: &[TilePathStep]) -> Predicate {
+        match released {
+            TileGuard::Or(arms) => arms
+                .iter()
+                .map(|arm| self.freed(arm, correlation))
+                .fold(Predicate::False, |all, one| all.union(&one)),
+            g if g.is_universal() => Predicate::True,
+            g if g.is_empty() => Predicate::False,
+            // Values correlated one level in are freed where a release beneath every outer key
+            // names them, and a release of whole outer keys names every path beneath them.
+            TileGuard::Function(FunctionGuard::Domain(pred))
+                if correlation.first() == Some(&TilePathStep::Codomain) =>
+            {
+                self.freed_beneath(
+                    &Predicate::qualified(pred.clone(), Predicate::True),
+                    correlation,
+                )
+            }
+            TileGuard::Function(FunctionGuard::Domain(pred)) => {
+                extract_predicate(pred, correlation)
+            }
+            TileGuard::Function(FunctionGuard::Codomain(g)) => match &**g {
+                TileGuard::Function(FunctionGuard::Domain(pred)) => {
+                    self.freed_beneath(pred, correlation)
+                }
+                _ => panic!("{} releases a guard of keys, got {released:?}", self.name()),
+            },
+            _ => panic!("{} releases a guard of keys, got {released:?}", self.name()),
+        }
+    }
+
+    /// The source rows a release of the paths `pred` one level beneath the outermost keys frees
+    /// ([`released_beneath_every_key`](Self::released_beneath_every_key)).
+    fn freed_beneath(&self, pred: &Predicate, correlation: &[TilePathStep]) -> Predicate {
+        assert_eq!(correlation.first(), Some(&TilePathStep::Codomain));
+        // `released_beneath_every_key` reads the release at the level one beneath the
+        // outermost, which is where a source correlated through one codomain step stands. One
+        // correlated deeper has no reading here yet.
+        assert!(
+            !correlation[1..].contains(&TilePathStep::Codomain),
+            "a release beneath particular keys reaches a source correlated more than one level \
+             in, which nothing reads yet: {correlation:?}"
+        );
+        let keys = self.released_beneath_every_key(pred);
+        extract_predicate(&keys, &correlation[1..])
+    }
+}
+
 impl TileProducer for MapResultWithSourceProducer {
     impl_producer_base!();
 
@@ -1264,10 +1320,16 @@ impl TileProducer for MapResultWithSourceProducer {
             .child("input", self.input.inspect(opts))
     }
 
+    /// Each value is the source's at the input's value under the same path, so the output keeps
+    /// the input's keys at every level.
+    fn restates(&self) -> Restates {
+        Restates::Every
+    }
+
     /// The source is read at the keys the input answers, and the input is pulled at the
     /// projection, so a morsel reads only its own rows from the source.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let projection = projection_guard.projection(&self.name());
+        let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
@@ -1293,42 +1355,9 @@ impl TileProducer for MapResultWithSourceProducer {
             self.input.release(obsolete_guard);
             return;
         };
-        match &obsolete_guard {
-            TileGuard::Function(FunctionGuard::Domain(pred)) => {
-                let extracted_pred = extract_predicate(pred, &correlation).clone();
-                self.source
-                    .borrow_mut()
-                    .release(&self.name(), extracted_pred);
-            }
-            TileGuard::Function(FunctionGuard::Codomain(g))
-                if matches!(**g, TileGuard::Function(FunctionGuard::Domain(_))) =>
-            {
-                if let TileGuard::Function(FunctionGuard::Domain(pred)) = &**g {
-                    assert_eq!(correlation.first(), Some(&TilePathStep::Codomain));
-                    // `released_beneath_every_key` reads the release at the level one beneath
-                    // the outermost, which is where a source correlated through one codomain
-                    // step stands. One correlated deeper has no reading here yet.
-                    assert!(
-                        !correlation[1..].contains(&TilePathStep::Codomain),
-                        "a release beneath particular keys reaches a source correlated more \
-                         than one level in, which nothing reads yet: {correlation:?}"
-                    );
-                    let keys = self.released_beneath_every_key(pred);
-                    let extracted_pred = extract_predicate(&keys, &correlation[1..]).clone();
-                    self.source
-                        .borrow_mut()
-                        .release(&self.name(), extracted_pred);
-                }
-            }
-            g if g.is_universal() => {
-                self.source
-                    .borrow_mut()
-                    .release(&self.name(), Predicate::True);
-            }
-            g if g.is_empty() => {}
-            _ => panic!(
-                "MapResultWithSourceProducer::release expected Domain or Universal guard, got {obsolete_guard:?}"
-            ),
+        let freed = self.freed(&obsolete_guard, &correlation);
+        if !freed.is_false() {
+            self.source.borrow_mut().release(&self.name(), freed);
         }
         self.input.release(obsolete_guard);
     }
@@ -2145,6 +2174,87 @@ mod tests {
         producer.release(beneath(1));
         agreed.push(src.borrow().get_released_predicate());
         agreed
+    }
+
+    /// What the source agreed to release after each of `releases`, of the output of a map over
+    /// source key 10 held beneath complete outer rows 0 and 1.
+    fn release_whole_rows_over_one_source_key(releases: Vec<TileGuard>) -> Vec<Predicate> {
+        use crate::interpreter::{DataSourceDomainExtentImpl, test_source::TestDataSource};
+        let src = Rc::new(RefCell::new(TestDataSource::new(
+            "source_key",
+            crate::ccl::Type::Base(BaseType::String),
+            Extent::Base(BaseType::String),
+        )));
+        src.borrow_mut()
+            .add_data(&[(Value::UInt(10), Value::String("x".into()))]);
+        let as_domain: Rc<RefCell<dyn DataSourceDomainExtentImpl>> = src.clone();
+        let key_extent = Extent::DataSourceDomain(as_domain.clone());
+        let in_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::data_function(key_extent.clone(), Tiling::Scalar(key_extent.clone())),
+        );
+        let out_tiling = Tiling::data_function(
+            Extent::Base(BaseType::UInt),
+            Tiling::data_function(key_extent, Tiling::Scalar(Extent::Base(BaseType::String))),
+        );
+        let input = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 1],
+                ColumnValue::UInts(vec![10, 10]),
+                Box::new(Tile::Scalar(ColumnValue::UInts(vec![10, 10]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let mut producer = MapResultWithSourceProducer::new(
+            ProducerBase::unowned(MapResultWithSourceProducer::alloc_id(), &out_tiling),
+            Box::new(TestTileProducer::new(input, in_tiling)),
+            as_domain,
+            Vec::new(),
+            Some(vec![TilePathStep::Codomain]),
+        );
+        let _ = producer.get(producer.tiling().universal_guard());
+        releases
+            .into_iter()
+            .map(|release| {
+                producer.release(release);
+                src.borrow().get_released_predicate()
+            })
+            .collect()
+    }
+
+    /// Outer row `outer` whole.
+    fn whole_row(outer: u64) -> TileGuard {
+        TileGuard::Function(FunctionGuard::Domain(Predicate::point(Value::UInt(outer))))
+    }
+
+    /// Released as whole outer rows one at a time, the source key is released once both rows
+    /// are.
+    #[test]
+    fn a_source_key_is_released_once_every_outer_row_is_released_whole() {
+        let agreed = release_whole_rows_over_one_source_key(vec![whole_row(0), whole_row(1)]);
+        assert!(!agreed[0].contains(&Value::UInt(10)), "{agreed:?}");
+        assert!(agreed[1].contains(&Value::UInt(10)), "{agreed:?}");
+    }
+
+    /// A release of one row whole and the key beneath the other in one guard releases the
+    /// source key: an `Or` frees what its arms free together.
+    #[test]
+    fn a_release_of_a_row_and_a_path_together_releases_the_source_key() {
+        let beneath_one = TileGuard::Function(FunctionGuard::Codomain(Box::new(
+            TileGuard::Function(FunctionGuard::Domain(Predicate::qualified(
+                Predicate::point(Value::UInt(1)),
+                Predicate::point(Value::UInt(10)),
+            ))),
+        )));
+        let agreed = release_whole_rows_over_one_source_key(vec![TileGuard::Or(vec![
+            whole_row(0),
+            beneath_one,
+        ])]);
+        assert!(agreed[0].contains(&Value::UInt(10)), "{agreed:?}");
     }
 
     /// Released one row at a time, the source key is released only once the second row

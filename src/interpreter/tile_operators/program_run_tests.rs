@@ -1772,6 +1772,91 @@ fn a_sum_over_a_live_source(#[values(1, 2, usize::MAX)] rows: usize) {
     );
 }
 
+/// The entries of `value`, a collection keyed by `UInt`s, each value rendered, in key order.
+fn entries_by_key(value: &Value) -> Vec<(u64, String)> {
+    let mut entries: Vec<(u64, String)> = value
+        .as_function()
+        .iter()
+        .map(|binding| match &binding.input {
+            Value::UInt(key) => (*key, binding.output.to_string()),
+            other => panic!("a collection keyed by a `UInt`: {other:?}"),
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
+/// A lookup into a map built over a live source. The map groups the source's keys by value
+/// through a `Converse`, whose groups stay open until the source is complete, and its push of a
+/// region beneath the values reaches the per-group `sole` through `MapResultWithSource`, which
+/// restates every level.
+#[rstest_log::rstest]
+#[case::one_key(indoc! {"
+    out = test_sink()
+    m = map([(x, x) for x in source1()])
+    out << m[1]?
+"}, &[])]
+#[case::a_key_per_row(indoc! {"
+    out = test_sink()
+    m = map([(x, x * 10) for x in source1()])
+    out << [m[x]? for x in source1()]
+"}, &[(0, "`some(10)"), (1, "`some(20)"), (2, "`some(30)"), (3, "`some(40)"), (4, "`some(50)")])]
+fn a_lookup_into_a_map_over_a_live_source(
+    #[case] source: &str,
+    #[case] per_key: &[(u64, &str)],
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let (value, _) = dispatched_live(source, rows, two_batches());
+    match per_key {
+        [] => assert_eq!(value.to_string(), "`some(1)", "{source}"),
+        per_key => assert_eq!(
+            entries_by_key(&value),
+            per_key
+                .iter()
+                .map(|(key, value)| (*key, value.to_string()))
+                .collect::<Vec<_>>(),
+            "{source}"
+        ),
+    }
+}
+
+/// A collection per row of a live source, at the `main` output, over two deliveries: each row's
+/// value reads a static collection.
+#[rstest_log::rstest]
+#[case::pairs_per_row(
+    "[(x, [y * x for y in [1, 2]]) for x in source1()]",
+    &[
+        (0, "{1, Function [ 1, 2 ]}"),
+        (1, "{2, Function [ 2, 4 ]}"),
+        (2, "{3, Function [ 3, 6 ]}"),
+        (3, "{4, Function [ 4, 8 ]}"),
+        (4, "{5, Function [ 5, 10 ]}")
+    ]
+)]
+#[case::sum_per_row(
+    "[x + sum([y * x for y in [1, 2]]) for x in source1()]",
+    &[(0, "4"), (1, "8"), (2, "12"), (3, "16"), (4, "20")]
+)]
+#[case::filter_on_a_sum(
+    "[x for x in source1() if sum([y for y in [1, 2] if y == x]) > 0]",
+    &[(0, "1"), (1, "2")]
+)]
+fn a_static_collection_per_row_of_a_live_source_at_main(
+    #[case] source: &str,
+    #[case] expected: &[(u64, &str)],
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let live = dispatched_live_main(source, rows, two_batches());
+    assert_eq!(
+        entries_by_key(&live.value),
+        expected
+            .iter()
+            .map(|(key, value)| (*key, value.to_string()))
+            .collect::<Vec<_>>(),
+        "{source}"
+    );
+}
+
 /// A let-bound map over a live source is a `Memo` keyed by the source's keys, which the run
 /// notifies of each delivery. The sink reads the map through its feed's `Memo`, which is keyed by
 /// the sink's one row: that `Memo` keeps the row open and reads the row again at each of the map's

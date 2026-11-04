@@ -1259,8 +1259,9 @@ impl Tile {
                     "to_guard reads a tile's guard under one row: it starts at the root and \
                      descends only through record fields"
                 );
+                let beneath = codomain.stated_by_path(1);
                 if let Some(held) = self.held_prefix(&row_paths[0]) {
-                    return held.guard();
+                    return TileGuard::flatten_or(vec![held.guard(), beneath]);
                 }
                 // The codomain arm names what the **open** keys hold. A key the predicate
                 // calls whole is released by its own key, and a codomain guard is read
@@ -1276,7 +1277,10 @@ impl Tile {
                     })
                     .collect::<Vec<bool>>();
                 if !open.contains(&true) {
-                    return TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone()));
+                    return TileGuard::flatten_or(vec![
+                        TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
+                        beneath,
+                    ]);
                 }
                 let mut open_values = (**codomain).clone();
                 open_values.retain_rows(&open);
@@ -1290,8 +1294,9 @@ impl Tile {
                 TileGuard::flatten_or(vec![
                     TileGuard::Function(FunctionGuard::Domain(domain_predicate.clone())),
                     TileGuard::Function(FunctionGuard::Codomain(Box::new(
-                        open_values.held_guard(&open_paths),
+                        open_values.held_guard(&open_paths, 1),
                     ))),
+                    beneath,
                 ])
             }
             // The store's guard is over its commit-time domain (the change ticks), like a
@@ -2050,7 +2055,7 @@ impl Tile {
     /// values it wraps, so a key it names bare would be released under every row, including a
     /// row that has not received it yet. Every key is named here by its whole path: a held key,
     /// and a key the row's own statement calls complete ([`stated_keys`](Self::stated_keys)).
-    fn held_guard(&self, row_paths: &[Vec<Value>]) -> TileGuard {
+    fn held_guard(&self, row_paths: &[Vec<Value>], level: usize) -> TileGuard {
         match self {
             // A record's fields stand over the rows the record does, and a `Codomain` arm
             // is read against every row whatever sits at it — so a field is named here
@@ -2064,8 +2069,8 @@ impl Tile {
                     .iter()
                     .map(|(name, field)| {
                         let held = match field {
-                            _ if field.holds_a_level() => field.held_guard(row_paths),
-                            Tile::Record { .. } => field.held_guard(row_paths),
+                            _ if field.holds_a_level() => field.held_guard(row_paths, level),
+                            Tile::Record { .. } => field.held_guard(row_paths, level),
                             Tile::Scalar(cells) if !cells.is_empty() => {
                                 let at = cell_positions(
                                     row_paths.len(),
@@ -2116,6 +2121,7 @@ impl Tile {
                     .filter(|(key, _)| complete[*key])
                     .map(|(_, path)| Predicate::exactly(path))
                     .fold(self.stated_keys(row_paths), |all, one| all.union(&one));
+                let beneath = codomain.stated_by_path(level + 1);
                 let mut open_values = (**codomain).clone();
                 open_values.retain_rows(
                     &(0..key_paths.len())
@@ -2131,12 +2137,39 @@ impl Tile {
                 TileGuard::flatten_or(vec![
                     TileGuard::Function(FunctionGuard::Domain(whole)),
                     TileGuard::Function(FunctionGuard::Codomain(Box::new(
-                        open_values.held_guard(&open_paths),
+                        open_values.held_guard(&open_paths, level + 1),
                     ))),
+                    beneath,
                 ])
             }
             other => other.to_guard(),
         }
+    }
+
+    /// The part of this collection's `domain_predicate` that names its rows by whole path
+    /// ([`named_by_path`]), as a guard one level beneath the rows, where this collection stands
+    /// at `level` of the tile. That part states keys complete under the rows it names and no
+    /// other row. A guard naming it by path therefore releases nothing under any other row, held
+    /// or not. It reaches the rows
+    /// the tile holds no key of, which the guard of the held keys does not name
+    /// (`src/interpreter/design-operators.md`, "The release contract"). A path unqualified at some
+    /// level above names keys under every row there, so it is left to
+    /// [`stated_keys`](Self::stated_keys), which names it under the rows held.
+    fn stated_by_path(&self, level: usize) -> TileGuard {
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = self
+        else {
+            return TileGuard::Function(FunctionGuard::Domain(Predicate::False));
+        };
+        debug_assert!(
+            super::projection::qualifying_levels(domain_predicate) <= level,
+            "a statement at level {level} names a path through at most {level} levels above: \
+             {domain_predicate:?}"
+        );
+        TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+            FunctionGuard::Domain(named_by_path(domain_predicate, level)),
+        ))))
     }
 
     /// The keys this collection's `domain_predicate` calls complete under the rows at
@@ -3340,6 +3373,22 @@ fn valid_over_settled(
     }
 }
 
+/// The part of `stated`, a statement over the paths of a collection at `level`, whose paths name
+/// a row at every level above: an unqualified arm beneath the outermost level names keys under
+/// every row there, and is left out.
+fn named_by_path(stated: &Predicate, level: usize) -> Predicate {
+    match stated {
+        Predicate::Or(arms) => {
+            Predicate::union_all(arms.iter().map(|arm| named_by_path(arm, level)).collect())
+        }
+        Predicate::Qualified { enclosing, here } if level > 0 => {
+            Predicate::qualified(named_by_path(enclosing, level - 1), (**here).clone())
+        }
+        _ if level == 0 => stated.clone(),
+        _ => Predicate::False,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use bit_set::BitSet;
@@ -4505,6 +4554,106 @@ mod tests {
         assert!(
             !guard.covers_path(&at(&[0, 2])),
             "row 0 may still receive key 2: {guard:?}"
+        );
+    }
+
+    /// A level's statement qualified by rows the tile holds no key of is named by path: those
+    /// rows' keys are released, and no other row's.
+    #[test]
+    fn a_statement_beneath_rows_not_held_is_named_by_path() {
+        let rows = |from: u64, to: u64| {
+            Predicate::True
+                .minus(&Predicate::at_or_below(Value::UInt(to)))
+                .union(&Predicate::at_or_below(Value::UInt(from)))
+        };
+        let from_three = Predicate::True.minus(&Predicate::at_or_below(Value::UInt(2)));
+        let four_and_five = Predicate::True.minus(&rows(3, 5));
+        // Rows 4 and 5 are held and whole; rows 1 to 3 hold nothing, and their keys from 3 are
+        // stated complete.
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![4, 5]),
+            Box::new(Tile::grouped(
+                vec![0, 1],
+                ColumnValue::UInts(vec![3, 4]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![40, 50]))),
+                Predicate::qualified(Predicate::True.minus(&rows(0, 3)), from_three).union(
+                    &Predicate::qualified(four_and_five.clone(), Predicate::True),
+                ),
+                BitSet::new(),
+            )),
+            four_and_five,
+            BitSet::new(),
+        );
+        let guard = tile.to_guard();
+        let at = |row: u64, key: u64| [Value::UInt(row), Value::UInt(key)];
+        assert!(guard.covers_path(&at(2, 7)), "{guard:?}");
+        assert!(guard.covers_path(&at(4, 3)), "{guard:?}");
+        assert!(
+            !guard.covers_path(&at(2, 1)),
+            "row 2 may still receive key 1: {guard:?}"
+        );
+        assert!(
+            !guard.covers_path(&at(6, 7)),
+            "row 6 is stated nowhere: {guard:?}"
+        );
+    }
+
+    /// A tile whose held keys form a prefix names a statement about a row it does not hold by
+    /// path too.
+    #[test]
+    fn a_prefix_tile_names_a_statement_beneath_a_row_not_held() {
+        let point = |k: u64| Predicate::point(Value::UInt(k));
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0]),
+            Box::new(Tile::grouped(
+                vec![0],
+                ColumnValue::UInts(vec![0]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![7]))),
+                Predicate::qualified(point(1), Predicate::True),
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let guard = tile.to_guard();
+        let at = |row: u64, key: u64| [Value::UInt(row), Value::UInt(key)];
+        assert!(guard.covers_path(&at(1, 5)), "{guard:?}");
+        assert!(
+            !guard.covers_path(&at(2, 5)),
+            "row 2 is stated nowhere: {guard:?}"
+        );
+    }
+
+    /// Two levels down, an arm is named by path only where it names a row at every level above:
+    /// one unqualified at the level between names keys under every outermost row.
+    #[test]
+    fn a_statement_two_levels_down_is_named_by_path_only_when_qualified_at_every_level() {
+        let point = |k: u64| Predicate::point(Value::UInt(k));
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0]),
+            Box::new(Tile::grouped(
+                vec![0],
+                ColumnValue::UInts(vec![3]),
+                Box::new(Tile::grouped(
+                    vec![0],
+                    ColumnValue::UInts(vec![0]),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![7]))),
+                    Predicate::qualified(Predicate::qualified(point(0), point(5)), Predicate::True)
+                        .union(&Predicate::qualified(point(7), Predicate::True)),
+                    BitSet::new(),
+                )),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let guard = tile.to_guard();
+        let at = |path: &[u64]| path.iter().map(|k| Value::UInt(*k)).collect::<Vec<_>>();
+        assert!(guard.covers_path(&at(&[0, 5, 9])), "{guard:?}");
+        assert!(
+            !guard.covers_path(&at(&[9, 7, 0])),
+            "row 9 is not held, and the arm about key 7 names no outermost row: {guard:?}"
         );
     }
 

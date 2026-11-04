@@ -511,7 +511,7 @@ of a cyclic fan-out).
 | `Constant` | A collection constant answers the admitted keys. A scalar constant answers the whole value or nothing. |
 | `MapResult` | A keyed input is pulled at the projection; a scalar input is a key looked up in the function, has no keys to project, and is read whole. A function operand that is a collection is pulled at the projection too where the input's values are its keys, the arguments stand at the first level, and the operand is a data function; its keys are released with the data's. Any other function operand is read whole. Beneath the outermost keys the input is pulled at a projection above the level the function applies at (`Restates::Above`), and the function operand is read whole. |
 | `MapResultToConst` | A collection input is pulled at the projection where the constant applies one level in or deeper. At the outermost level the constant replaces the whole input, so the input is read whole. The constant is read whole, since every row reads all of it. A projection beneath the outermost keys is answered above the constant's level (`Restates::Above`), and one at or beneath it panics. |
-| `MapResultWithSource` | The input is pulled at the projection, so a morsel reads only its own keys from the source. |
+| `MapResultWithSource` | The input is pulled at the projection, at any level (`Restates::Every`), so a morsel reads only its own keys from the source. |
 | `RecordWrap` | The input is pulled at the projection, which beneath the outermost keys is one above the wrapped level (`Restates::Above`). |
 | `SelectField` | A stream of records is pulled at the projection, which beneath the outermost keys is one above the record's level (`Restates::Above`). A product of collections is pulled whole and the selected field is cut. Its release names the other fields' cells at every path, and a breaker's final guard names each key under which a cell is still held ([Differences of nested guards](design-path-projections.md#differences-of-nested-guards)). |
 | `Zip` | Every arm is pulled at the projection, since the arms share the pair's keys. The pair is complete only where every arm is. A projection beneath the outermost keys is answered above the record's level (`Restates::Above`). |
@@ -524,7 +524,7 @@ of a cyclic fan-out).
 | `MapDomain` | The input is pulled at the projection, since every level's keys stand. |
 | `Uncurry` | Beneath standing levels the input is pulled at the projection. Pairing the whole tile reads the groups whose first component the projection admits, and the pairs are cut after. |
 | `Product` | Both sides are pulled at the projection, since they are aligned row for row. The outer side has no paired level, so a projection at or beneath it pulls both sides at the rows its paths run through (`Projection::above`), and the pairs are cut. |
-| `Converse` | Beneath standing levels the input is pulled at the projection. Inverting the outermost collection reads the whole input and cuts the groups, and the rows of a group the projection does not name stay unreleased at the input. |
+| `Converse` | Every level is restated (`Restates::Every`). Beneath standing levels the input is pulled at the standing keys the projection names (`Projection::above`), and the groups are cut to it. Inverting the outermost collection reads the whole input and cuts the groups, and the rows of a group the projection does not name stay unreleased at the input. |
 | `FanOutSlot` | Pulls the shared input at its own projection and cuts its answer to it. A producer states completeness only for the region it returns, so slots at different regions each pull the one input at their own and a pull of one region retracts nothing it said of another (the debug check compares the last output inside the region pulled). A cyclic fan-out reads its input whole, because a sibling that re-enters mid-pull is answered from the cache of the last completed pull, which has to cover whatever region that sibling asks for. A projection beneath the outermost keys is read and cut as one of the outermost keys is. |
 | `Memo` | Reads its input at the projection and caches what it read; a pull over a region it has read answers from the cache cut to the projection, and a region it has not read reaches the input however quiet the input has been. The regions it has read and must read again are projections at any level, so a projection beneath the outermost keys is read and cached as one of the outermost keys is. |
 | `UnionOperator` | A flat union pulls every arm at the projection and cuts the merge to it: the arms are disjoint slices of one collection, and an arm the consumer has released contributes an empty tile that states every key decided, which the cut brings back to the projection. A tagged union keys its rows by arm. It pulls each arm at what a guard of its keys by tag names under that arm's tag, as its `release_impl` splits a release, and does not pull an arm the guard names nothing of; a key projection of any other shape panics. |
@@ -534,7 +534,7 @@ of a cyclic fan-out).
 | `FlattenTupleDomain` | Reads its input whole and cuts the answer to the projection over the flat keys, as `PermuteRecordDomain` does: the nested keys are restated flat, so the projection is not forwarded. |
 | `Aggregate` | Admits `Everything` and `Nothing`: the accumulator has no keys, and the input is read whole whatever the consumer asks. A key projection panics. |
 | `ExtractAggregate` | Admits `Everything` and `Nothing`: one extracted value has no keys. A key projection panics. |
-| `MapAggregate` | Pulls the input at the projection, at any level (`Restates::Every`), and cuts the answer to it: the answer is built from every accumulator held, including those of keys pulled earlier, and each group beneath a key is whole. |
+| `MapAggregate` | Pulls the input at the projection, at any level (`Restates::Every`), and cuts the answer to it: the answer is built from every accumulator held, including those of keys pulled earlier, and from what every pull's answer stated, and each group beneath a key is whole. |
 | `MapExtractAggregate` | Pulls the input at the projection, at any level of the input (`Restates::Above`). The answer keeps the input's keys, and only unfinished groups drop. |
 
 ### Producer attribution and probes
@@ -613,11 +613,13 @@ instead of adding an arm. A last key the statement calls whole, or whose group's
 every key complete, ends the staircase at that key. A tile whose held keys form no prefix is
 released key by key (`Tile::held_guard`). At a nested level that guard names each key held and
 each key the level's statement calls complete under a row the tile holds, both by whole path, so a
-key stated absent under an open row is released at that row. Three tiles whose held keys form a
-prefix still take that path: a last key whose group holds nothing, an earlier key whose own group's
-statement calls every key complete, and a statement about the keys beneath an enclosing key the
-tile does not hold. The guard names the first two exactly. It leaves out the third, which names a
-row the tile holds no path to. A universal input release latches `upstream_drained`.
+key stated absent under an open row is released at that row. The part of a level's statement that
+names its rows by path at every level above is also named under rows the tile does not hold
+(`Tile::stated_by_path`): it names those rows, so it releases nothing under any other. A statement
+unqualified at some level is named only under the rows held. Three tiles whose held keys form a prefix still take that path: a last key
+whose group holds nothing, an earlier key whose own group's statement calls every key complete, and
+a statement about the keys beneath an enclosing key the tile does not hold. The guard names all
+three exactly, the third by path. A universal input release latches `upstream_drained`.
 Release builds then return the cache without pulling that input again; debug builds continue pulling
 to exercise its post-release checks.
 
