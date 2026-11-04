@@ -7,7 +7,7 @@ use std::{
 use crate::ccl::FieldKey;
 use crate::interpreter::CurryLevel;
 use crate::interpreter::{
-    Consumer, DataSourceDomainExtentImpl, Projection, dispatcher::Landing,
+    Consumer, DataSourceDomainExtentImpl, Projection, dispatcher::Landing, dispatcher::Routes,
     tile_operators::Notified, value_probe::ProbeSlot,
 };
 
@@ -123,6 +123,10 @@ impl Consumer for Gated {
     fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         self.consumer.push(region, landing);
     }
+
+    fn route(&mut self, routes: &mut Routes) {
+        self.consumer.route(routes);
+    }
 }
 
 impl GatedConsumer {
@@ -218,6 +222,10 @@ impl Consumer for Widening {
             _ => landing.widened(|landing| self.0.push(&Projection::Everything, landing)),
         }
     }
+
+    fn route(&mut self, routes: &mut Routes) {
+        routes.widened(|routes| self.0.route(routes));
+    }
 }
 
 /// `consumer` behind a consumer that forwards each notification as the same keys under `tag`
@@ -237,6 +245,11 @@ impl Consumer for Tagging {
     fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         self.1.push(&region.tagged(&self.0), landing);
     }
+
+    /// The arm's keys under its tag are the union's keys, so the path keeps them.
+    fn route(&mut self, routes: &mut Routes) {
+        self.1.route(routes);
+    }
 }
 
 /// What [`forwarding_consumer_keeping_keys`] returns: it passes each region on as it arrives,
@@ -254,6 +267,13 @@ impl Consumer for Forwarding {
         match self.gated.shared.try_borrow_mut() {
             Ok(mut consumer) => consumer.push(region, landing),
             Err(_) => landing.reentered(),
+        }
+    }
+
+    fn route(&mut self, routes: &mut Routes) {
+        match self.gated.shared.try_borrow_mut() {
+            Ok(mut consumer) => consumer.route(routes),
+            Err(_) => routes.reentered(),
         }
     }
 
@@ -323,6 +343,11 @@ impl Consumer for OneLevelIn {
             Some(restated) => self.consumer.push(&restated, landing),
             None => landing.widened(|landing| self.consumer.push(&Projection::Everything, landing)),
         }
+    }
+
+    /// The input's keys stand one level in, so the path keeps them.
+    fn route(&mut self, routes: &mut Routes) {
+        self.consumer.route(routes);
     }
 }
 

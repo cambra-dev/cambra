@@ -9,7 +9,7 @@ use cambra::{
     control_port::{ControlPort, service},
     inspector_server::{ServedSnapshot, live::LiveChannel, serve_compiled},
     interpreter::{
-        ColumnValue, Consumer, Scheduler, dispatcher,
+        ColumnValue, Consumer, DataSink, Scheduler, dispatcher,
         operator_graph::source_nodes,
         tile_operators::{FunctionGuard, Tile, TileGuard, TileProducer},
         value_probe::{
@@ -78,11 +78,11 @@ fn dispatch_requested() -> bool {
     std::env::var(DISPATCH_VAR).is_ok_and(|value| !value.is_empty() && value != "0")
 }
 
-/// Runs `loaded` through the dispatcher on the calling thread ([`dispatcher::run_program`]),
-/// printing the `main` output's value once, as pull mode prints its last. A program the planner
-/// refuses runs in pull mode in the same context, after a note on stderr: its compile has opened
-/// its sources and sinks, a port bound or stdin taken, so a second compile could open none of
-/// them. `Err(())` where it does not compile.
+/// Runs `loaded` through the dispatcher on the calling thread ([`dispatcher::run_program_into`]),
+/// printing each epoch's answer of the `main` output ([`PrintedMain`]), as pull mode prints each
+/// pull's answer. A program the planner refuses runs in pull mode in the same context, after a
+/// note on stderr: its compile has opened its sources and sinks, a port bound or stdin taken, so a
+/// second compile could open none of them. `Err(())` where it does not compile.
 ///
 /// # Panics
 ///
@@ -105,18 +105,28 @@ fn run_dispatched(loaded: &LoadedProgram) -> Result<(), ()> {
             return Err(());
         }
     };
-    match dispatcher::run_program(&mut program, rows) {
-        Ok(run) => {
-            if let Some(tile) = run.main {
-                println!("Got value: {tile:#?}");
-            }
-        }
-        Err(refused) => {
-            eprintln!("note: {DISPATCH_VAR}: {refused}; running in pull mode");
-            run_in_pull_mode(&mut ctx, &mut program);
-        }
+    if let Err(refused) = dispatcher::run_program_into(
+        &mut program,
+        rows,
+        std::sync::Arc::new(PrintedMain),
+        &mut || thread::sleep(Duration::from_millis(1)),
+    ) {
+        eprintln!("note: {DISPATCH_VAR}: {refused}; running in pull mode");
+        run_in_pull_mode(&mut ctx, &mut program);
     }
     Ok(())
+}
+
+/// The `main` output of a dispatched run, which prints each answer it is handed as
+/// [`pull_main`] prints a pull's: one that holds a key or a value, or that is terminal.
+struct PrintedMain;
+
+impl DataSink for PrintedMain {
+    fn process(&self, tile: &Tile) {
+        if !tile_is_empty(tile) || tile.is_terminal() {
+            println!("Got value: {tile:#?}");
+        }
+    }
 }
 
 /// Drive `program`, compiled in `ctx` with its sinks unpulled, in pull mode: pull each sink once,
