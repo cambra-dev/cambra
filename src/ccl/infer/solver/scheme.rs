@@ -183,11 +183,14 @@ impl PolyScheme {
 /// single fresh (or pre-seeded — see [`seed_chan_dom_pairings`]) rename.
 #[derive(Default)]
 pub struct FreshenCache {
-    /// When set, every variable this freshening mints takes *this* telescope
-    /// instead of inheriting its original's — the operator-scheme
-    /// instantiation mode ([`PolyScheme::instantiate_in`]). Unset for
-    /// specialization clones, which stand where their definition stood or under the binders
-    /// their use entered ([`entered_binders`](Self::entered_binders)).
+    /// When set, every variable this freshening mints stands at *this* telescope instead
+    /// of its original's — the operator-scheme instantiation mode
+    /// ([`PolyScheme::instantiate_in`]). A template's own variables stand nowhere but under
+    /// the template's own functions, so an original's telescope holds only those
+    /// functions' binders, and the copy enters each after the site's as this
+    /// instantiation names it ([`binders`](Self::binders)). Unset for specialization
+    /// clones, which stand where their definition stood or under the binders their use
+    /// entered ([`entered_binders`](Self::entered_binders)).
     pub site_telescope: Option<Telescope>,
     /// Original quantified var → its fresh replacement.
     pub vars: HashMap<InferVarId, Rc<InferVar>>,
@@ -264,6 +267,16 @@ pub struct FreshenCache {
 impl FreshenCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The name a copied function binder `n` takes in this copy, minted on first use. The copy's
+    /// `Type::Fun` binder and the telescopes of the variables standing under it must agree on
+    /// it, so both ask here.
+    fn binder_name(&mut self, n: &crate::ccl::Name) -> crate::ccl::Name {
+        self.binders
+            .entry(n.clone())
+            .or_insert_with(|| crate::ccl::Name::fresh(n.base()))
+            .clone()
     }
 }
 
@@ -513,13 +526,7 @@ pub fn freshen_above(
             // stay alike. A specialization clone keeps its definition's names; it stands
             // where the definition stood ([`FreshenCache::site_telescope`]).
             let name = match (name, &cache.site_telescope) {
-                (Some(n), Some(_)) => Some(
-                    cache
-                        .binders
-                        .entry(n.clone())
-                        .or_insert_with(|| crate::ccl::Name::fresh(n.base()))
-                        .clone(),
-                ),
+                (Some(n), Some(_)) => Some(cache.binder_name(n)),
                 _ => name.clone(),
             };
             let out = Type::Fun {
@@ -698,8 +705,9 @@ pub fn freshen_above(
             // A freshened clone stands where the original stood, so it
             // inherits the original's telescope: the bounds copied below were
             // recorded against that scope. The exception is an operator-scheme
-            // instantiation, whose template stands nowhere — it takes the use
-            // site's telescope instead (see [`FreshenCache::site_telescope`]).
+            // instantiation, whose template stands nowhere but under its own functions — it
+            // takes the use site's telescope with those functions' binders entered after it
+            // (see [`FreshenCache::site_telescope`]).
             // **The copy stands over a copy of the original's kind**, registered in the
             // same cache as the bounds below. A variable's kind carries the edges to the
             // kinds of the function types that reached it; over a kind the cache does not
@@ -723,7 +731,13 @@ pub fn freshen_above(
                 }
             };
             let telescope = match &cache.site_telescope {
-                Some(site) => site.clone(),
+                Some(site) => {
+                    let mut template: Vec<_> = tv.telescope.iter().cloned().collect();
+                    template.reverse();
+                    template
+                        .into_iter()
+                        .fold(site.clone(), |t, n| t.extended(cache.binder_name(&n)))
+                }
                 None => match &cache.use_telescope {
                     Some(site) => {
                         let mut inside: Vec<_> = tv.telescope.iter().cloned().collect();

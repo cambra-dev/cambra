@@ -1493,17 +1493,15 @@ fn expected_per_region_record() -> Tile {
 
 /// A nested `for` over a group's rows, `[r for g in groupby(xs, \s -> s) for r in g]`, does not
 /// compile. The expected panic is a known compiler bug, tracked in the vault as
-/// `type-checker-nested-for-over-a-groups-rows-out-of-scope`. A debug build stops where a substitution leaves the discharged `xs` free in a
-/// predicate; without debug assertions the type check after inference finds `__anf` out of scope.
+/// `type-checker-nested-for-over-a-groups-rows-out-of-scope`. A debug build stops where a
+/// variable resolves to a type naming `xs` outside its telescope; without debug assertions the
+/// type check after inference finds `__anf` out of scope.
 ///
 /// The program runs in a `cambra` child process with a time limit, since unbounded recursion
 /// aborts or exhausts the process rather than unwinding. The assertion reads its exit status and
 /// stderr.
 #[test]
-#[cfg_attr(
-    debug_assertions,
-    should_panic(expected = "discharged binder `xs` still free after substitution")
-)]
+#[cfg_attr(debug_assertions, should_panic(expected = "outside its telescope"))]
 #[cfg_attr(not(debug_assertions), should_panic(expected = "Scope violation"))]
 fn a_nested_for_over_a_groups_rows() {
     // A healthy run of a program this size takes well under a second, so a few seconds already
