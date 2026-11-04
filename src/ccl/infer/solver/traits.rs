@@ -92,9 +92,8 @@ use super::constrain::{ConstrainCache, ConstrainError, constrain_subtype};
 /// A trait: a named requirement on types, together with any types it associates
 /// with them and the functions it declares.
 ///
-/// Every trait is a declaration ([`TraitDecl`]): the compiler builds its own here, as
-/// [`crate::ccl::nominal::option`] builds `Option` ([`Trait::addable`] and the rest), and
-/// lowering builds a module's. A program's instances of either are its [`InstanceTable`]'s.
+/// Every trait is a declaration ([`TraitDecl`]): the compiler builds its own here
+/// ([`Trait::addable`] and the rest), and lowering builds a module's. A program's instances of either are its [`InstanceTable`]'s.
 ///
 /// Equality, ordering and hashing are the declaration's, by the module that declares it and
 /// its name, and a method's trait ([`Trait::method`]), which no module declares, is equal
@@ -272,7 +271,7 @@ impl fmt::Debug for TraitDecl {
 /// The module the compiler's traits belong to.
 const COMPILER_MODULE: &str = "std";
 
-/// The traits the compiler provides, built once per thread as `Option` is.
+/// The traits the compiler provides, built once per thread.
 struct CompilerTraits {
     addable: Trait,
     addable_refined: Trait,
@@ -388,38 +387,6 @@ impl CompilerTraits {
             requires: Vec::new(),
         }
         .build(comparison(), &mut instances);
-        // `Option(T)` compares by value where `T` does, its constructor and then its payload.
-        // `Option` is the compiler's, so this instance is too: no module may declare it
-        // (`docs/chl-spec.md`, "Traits and instances across modules [Decided]").
-        {
-            let t = TypeParam::declared("T");
-            let option = Type::Nominal(
-                crate::ccl::nominal::option(),
-                vec![Type::Param(Rc::clone(&t))],
-            );
-            instances.add(
-                equatable.clone(),
-                Rc::new(TraitInstance {
-                    heads: vec![InstanceHead::of_pattern(&option); 2],
-                    operands: vec![option.clone(), option],
-                    assoc: Vec::new(),
-                    requires: vec![Rc::new(TraitRequirement {
-                        trait_: equatable.clone(),
-                        args: vec![Type::Param(Rc::clone(&t)), Type::Param(Rc::clone(&t))],
-                        terms: Vec::new(),
-                        assoc: Vec::new(),
-                        effect_assoc: Vec::new(),
-                        binders: Vec::new(),
-                        at: None,
-                    })],
-                    params: vec![t],
-                    bounds: Vec::new(),
-                    functions: Vec::new(),
-                    effect_assocs: Vec::new(),
-                    declared: None,
-                }),
-            );
-        }
         // `<`, `<=`, `>`, `>=`. `max` and `min` place it on their codomain twice, `(γ, γ)`: a
         // pure requirement, since the aggregate's scheme already returns an element of what
         // it consumes. What orders by value is equal by value, so it requires `Equatable`.
@@ -1058,8 +1025,7 @@ impl fmt::Display for InstanceHead {
 /// (`docs/chl-spec.md`, "Declaring an instance").
 ///
 /// The compiler's and a module's are the same data. A compiler instance's head names base
-/// types, except `Equatable`'s for `Option(T)`; a module's,
-/// `instance Container(Bag(T)) requires …:`, is built by lowering.
+/// types; a module's, `instance Container(Bag(T)) requires …:`, is built by lowering.
 #[derive(Debug)]
 pub struct TraitInstance {
     /// The head's type variables, `T` in `Bag(T)`, declared ([`TypeParam::declared`]).
@@ -3450,8 +3416,7 @@ impl TraitObligation {
                 return Ok(());
             };
             // A compiler row over bases states everything at its operands, and the deposit
-            // settles what it associates; one over type variables, `Option(T)`'s, is selected
-            // as a module's is.
+            // settles what it associates; one over type variables is selected as a module's is.
             if self.method.is_none() && only.declared.is_none() && !only.has_type_variables() {
                 return Ok(());
             }

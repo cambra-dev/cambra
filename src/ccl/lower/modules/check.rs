@@ -223,8 +223,10 @@ impl<'a> ProgramLowering<'a> {
         // The shared imports it reaches, each after the ones it reaches.
         let mut reached = HashSet::new();
         let mut pending: Vec<SharedImport> = self.program.ast(file).map_or_else(Vec::new, |ast| {
-            ast.body
+            self.program
+                .prelude_for(file)
                 .iter()
+                .chain(&ast.body)
                 .filter_map(|stmt| Some(self.imports.get(&stmt.span)?.shared.clone()))
                 .collect()
         });

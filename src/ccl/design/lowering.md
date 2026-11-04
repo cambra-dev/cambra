@@ -253,9 +253,9 @@ exception elimination can give the loop state it adds ([ir.md](ir.md#exceptions)
 
 A variant constructor becomes `VariantCtor(tag, payload)`. A bare `` `tag `` and `` `tag() ``
 both supply a `unit` payload. The payload can be a tuple or record, using ordinary term syntax.
-`Option(T)` names the compiler-provided nominal type, built by `Option::some` and `Option::none`
-([nominal-types.md](nominal-types.md#the-compiler-provided-option)); the backtick tags `` `some ``
-and `` `none `` are ordinary tags that build a structural variant.
+`Option(T)` names the nominal type `std` declares, built by `Option::some` and
+`Option::none` ([nominal-types.md](nominal-types.md#option-in-std)). The backtick tags
+`` `some `` and `` `none `` are ordinary tags that build a structural variant.
 
 `match 𝑠` becomes a `Case` with a scrutinee and one `Branch` per arm. Tagged branches carry a
 `Pattern(tag, binding, empty_payload)` and a literal `true` guard. A named payload binds its name.
@@ -374,8 +374,7 @@ as written there, and the span of the declaration the name resolves to.
 | a type a `use` item brings in: `T` in `x: T` after `use m::T`, and `F` after `use m::T as F` | `T`'s declaration in `m` | `type_alias`, from the `name_span` `Reached::Type` carries, or `resolved_nominal`, from `used_nominal`'s `NominalDecl.span` |
 
 A span names its file, so a target in another module's file resolves there. A name with no
-declaration in any source has no row: `Int` and the other built-in types, the compiler-provided
-`Option`, whose `NominalDecl.span` is empty, and a type parameter or alias the compiler declares
+declaration in any source has no row: `Int` and the other built-in types, and a type parameter or alias the compiler declares
 for itself, such as a trait instance's variables.
 
 A `use` type name resolves into the module that declares the type, for an import's `use` clause

@@ -1055,8 +1055,8 @@ enum Member {
 enum BuiltinMethod {
     /// The `extract` of the single-constructor form.
     Extract,
-    /// `Option::is_none`, which the compiler provides with `Option` (`bind_is_none` in
-    /// `src/ccl/lower/nominal.rs`).
+    /// `Option::is_none`, which `std` declares with `Option`
+    /// (`stdlib/src/std.cambra`).
     IsNone,
 }
 
@@ -1078,8 +1078,9 @@ impl BuiltinMethod {
     }
 }
 
-/// The compiler-provided `Option` (`docs/chl-spec.md`, "9.16 The std root"), the type of a
-/// checked lookup's answer. The compiler's declaration is `option` in `src/ccl/nominal.rs`.
+/// `Option` (`docs/chl-spec.md`, "9.16 The std root"), the type of a checked lookup's answer.
+/// The compiler reaches `std`'s declaration (`stdlib/src/std.cambra`) through the
+/// prelude, and this interpreter, which loads one file, declares the same members itself.
 const OPTION: &str = "Option";
 
 /// What the module declares of one nominal type.
@@ -1102,8 +1103,8 @@ impl TypeMembers {
 }
 
 /// What `body` declares of each nominal type, by the type's name: each `type` declaration's
-/// members, the methods the associated functions of the type declare, and the
-/// compiler-provided `Option`'s constructors and `is_none`.
+/// members, the methods the associated functions of the type declare, and `Option`'s
+/// constructors and `is_none` ([`OPTION`]).
 fn collect_types(body: &[Spanned<Stmt>]) -> BTreeMap<String, TypeMembers> {
     let mut option = TypeMembers {
         members: BTreeMap::from([

@@ -540,7 +540,7 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
             errors: lowering.errors,
         };
     };
-    let scope = lowering.scope(ast, None, ctx);
+    let scope = lowering.scope(root, ast, None, ctx);
     ctx.begin_module(scope.clone());
     let lowered = lower_root(ast, ctx);
     // The root has one run, which no `run` statement supplies arguments.
@@ -702,7 +702,9 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
         settle_const_params(&mut program, &lowering.const_values, &HashMap::new(), ctx);
         let refused = compound_const_reads(&program, &lowering.const_compounds);
         lowering.errors.extend(refused);
-        program
+        let instance_functions: HashSet<Name> =
+            ctx.instances.declared_bindings().cloned().collect();
+        drop_unread_std_imports(program, &instance_functions)
     });
     let mut errors = std::mem::take(&mut lowering.errors);
     // Each `import` reaching a shared import brings its copy in.
@@ -755,6 +757,72 @@ pub fn lower_program(program: &LoadedProgram, ctx: &mut LoweringContext) -> Lowe
         value,
         errors: in_source_order(errors),
     }
+}
+
+/// `program` without each `let` and `defs` group of a std module's shared import that nothing
+/// in the program reads. A shared import holds no state and performs no IO, so its bindings are
+/// values, and an unread one changes nothing. The prelude reaches every program, and a program
+/// that reads no member of a std module links none of its chain. Each function of a declared
+/// instance stays, in `instance_functions`: inference reads it through the instance, not
+/// through a name in the tree.
+///
+/// A user module's shared import keeps every binding, and inference types each one at the
+/// types its import passes.
+fn drop_unread_std_imports(program: Expr, instance_functions: &HashSet<Name>) -> Expr {
+    // The spine, top first, each node with the placeholder in place of its body.
+    let mut nodes = Vec::new();
+    let mut at = program;
+    while let Some(body) = spine_body_mut(&mut at) {
+        let rest = std::mem::replace(body, module_body());
+        nodes.push(at);
+        at = rest;
+    }
+    let mut live = free_names(&at);
+    let mut kept = at;
+    let unread = |name: &Name, live: &std::collections::BTreeSet<Name>| {
+        matches!(name.home(), Some(Home::Import(shared)) if shared.module.is_std())
+            && !live.contains(name)
+            && !instance_functions.contains(name)
+    };
+    for node in nodes.into_iter().rev() {
+        let dropped = match &node.node {
+            TypedExprNode::Let { binding, .. } => unread(&binding.name, &live),
+            TypedExprNode::DefGroup { bindings, .. } => bindings
+                .iter()
+                .all(|(binding, _)| unread(&binding.name, &live)),
+            _ => false,
+        };
+        if !dropped {
+            live.extend(free_names(&node));
+            kept = fill_module_body(node, kept);
+        }
+    }
+    kept
+}
+
+/// `option`, `std`'s `Option`, checked against what the runtime builds: a checked
+/// lookup's answer carries the tags [`V_NONE`](crate::ccl::V_NONE) and
+/// [`V_SOME`](crate::ccl::V_SOME), so the declaration's constructors are `none` and `some(T)`.
+fn declared_option(
+    option: &Rc<crate::ccl::nominal::NominalDecl>,
+) -> Rc<crate::ccl::nominal::NominalDecl> {
+    let ctors: Vec<(&str, usize)> = option
+        .body()
+        .ctors
+        .iter()
+        .map(|ctor| (ctor.name.as_str(), ctor.params.len()))
+        .collect();
+    assert!(
+        option.params.len() == 1
+            && ctors
+                == [
+                    (crate::ccl::V_NONE.name(), 0),
+                    (crate::ccl::V_SOME.name(), 1)
+                ],
+        "`std` declares `Option(T): none, some(T)`, which the runtime's checked lookup \
+         builds, and declares {ctors:?}"
+    );
+    Rc::clone(option)
 }
 
 /// The lowering of a program's modules: each module lowered once, the shared
@@ -1132,7 +1200,7 @@ impl<'a> ProgramLowering<'a> {
                 .unwrap_or("main");
             ModulePath::new([SmolStr::from(stem)])
         });
-        let scope = self.scope(ast, Some(module.clone()), ctx);
+        let scope = self.scope(file, ast, Some(module.clone()), ctx);
         ctx.begin_module(scope.clone());
         ctx.places.add_module(module.segments(), &ast.body);
         ctx.root_value = self
@@ -1143,6 +1211,9 @@ impl<'a> ProgramLowering<'a> {
             .map(|last| last.span);
         let lowered = lower_module_body(ast, ctx);
         ctx.root_value = None;
+        if let Some(option) = ctx.nominal_types.iter().find(|decl| decl.is_option()) {
+            ctx.std_option = Some(declared_option(option));
+        }
         let sinks = std::mem::take(&mut ctx.declared_sinks);
         let run_checks = std::mem::take(&mut ctx.run_type_checks);
         // A recovery placeholder contains every lowering error (`LoweringError::has_stand_in`),
@@ -1851,14 +1922,16 @@ impl<'a> ProgramLowering<'a> {
         qualified
     }
 
-    /// The interface each `import` and `run` statement of `module` reaches, by
-    /// the statement, or `None` where there is none.
+    /// The interface each `import` and `run` statement of `module`, the module in
+    /// `file`, reaches, by the statement, or `None` where there is none. The prelude's
+    /// imports are statements of each module it reaches.
     pub(super) fn interfaces(
         &mut self,
+        file: FileId,
         module: &ChlModule,
     ) -> HashMap<Span, Option<Rc<Interface>>> {
         let mut interfaces = HashMap::new();
-        for stmt in &module.body {
+        for stmt in self.program.prelude_for(file).iter().chain(&module.body) {
             let path = match &stmt.node {
                 ChlStmt::Import { path, .. } | ChlStmt::Run { path, .. } => path,
                 _ => continue,
@@ -1880,16 +1953,17 @@ impl<'a> ProgramLowering<'a> {
         interfaces
     }
 
-    /// The scope `module` lowers in ([`module_scope`]).
+    /// The scope `module`, the module in `file`, lowers in ([`module_scope`]).
     pub(super) fn scope(
         &mut self,
+        file: FileId,
         module: &ChlModule,
         labels: Option<ModulePath>,
         ctx: &LoweringContext,
     ) -> ModuleScope {
-        let interfaces = self.interfaces(module);
+        let interfaces = self.interfaces(file, module);
         module_scope(
-            module,
+            file,
             labels,
             self.program,
             &interfaces,

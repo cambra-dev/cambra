@@ -1,0 +1,8 @@
+# The prelude: the std members every module outside the std root names without an import
+# (docs/chl-spec.md, "9.16 The std root").
+#
+# Each line is an `import` of a std module. A module outside the std root reaches each `use` item
+# by its name, and the import name stays unbound. A module's own declarations, imports and `use`
+# names shadow a prelude name, so adding one changes no module that already binds it.
+
+import std use Option

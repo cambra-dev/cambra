@@ -345,24 +345,23 @@ before anything reads the node, and the use specializes as any use of a generali
 does. No `Method` node survives inference. A method no type declares is a lowering error pointing at
 `(r.f)(…)`, the call of a field's function, and a position, `t.0(…)`, names no method.
 
-### The compiler-provided `Option`
+### `Option` in `std`
 
-`Option(T)` is a `NominalDecl` the compiler provides (`nominal::option`) at the path `std::Option`,
-with the constructors `none` and `some(T)`, the method `is_none`, and no source. Its constructor
-names are the tags the runtime builds when it answers a checked lookup (`V_NONE`, `V_SOME`), so a
-lookup's answer is a value of it. `LoweringContext::nominal_type` answers it for the name `Option`
-after the module's own declarations, and `Type::option_of` builds an application of it.
+`Option(T)` is the `type` that `stdlib/src/std.cambra` declares, with the constructors `none`
+and `some(T)`, the method `is_none`, and an instance of `Equatable`. The prelude imports it, so
+every module outside the std root names it bare, and `NominalDecl::spelled` writes it bare.
 
-A member of `Option` is bound only where the module names it: a reference records it
-(`member_reference`), and `bind_constructors` binds the recorded ones, `is_none` as
-`λ 𝑜 : Option(𝑇) → match 𝑜 { Option::some(_) → false; Option::none → true }` (`bind_is_none`). A
-method call names every type that declares its method, because inference picks the candidate
-from the receiver's type, so any `.is_none()` call binds `Option::is_none`, even one whose
-receiver is a type declaring its own `is_none`. A module that names no member lowers as it would
-without the declaration. Its
-identity is its path, so every compilation, and every version of a reloaded program, names the
-same type. Its spans are empty, and lowering refuses the programs that would point a diagnostic at
-one: a declaration named `Option`, and an associated function of it.
+The compiler recognizes the declaration by its module path and name (`NominalDecl::is_option`).
+When `std` lowers, lowering records the declaration (`LoweringContext::std_option`) and
+asserts that its constructors are `none` and `some(T)`, the tags the runtime builds when it answers
+a checked lookup (`V_NONE`, `V_SOME`). The `lookup?` that `lower_subscript` builds for `c[k]`
+carries `(_ ⇒ Option(_))` as its type, and `emit_lookup_checked` reads the declaration from it. A
+module that declares its own `Option` shadows the prelude's name, and its lookups still answer
+`std`'s.
+
+Linking drops each binding of a std module's shared import that nothing in the program reads
+(`drop_unread_std_imports`), so a program that names no member of `Option` holds none of
+`std`'s chain, and its tree is the one it would have without the prelude.
 
 ---
 
