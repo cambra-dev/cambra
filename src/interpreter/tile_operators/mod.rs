@@ -2076,6 +2076,18 @@ pub(crate) mod test_helpers {
                 released,
             )
         }
+
+        /// A spy that answers what the returned cell holds, which a test rewrites between pulls to
+        /// grow the input.
+        pub(crate) fn scripted(
+            tile: Tile,
+            tiling: Tiling,
+        ) -> (Self, std::rc::Rc<std::cell::RefCell<Tile>>) {
+            let (mut spy, _, _) = Self::new(tile.clone(), tiling);
+            let cell = std::rc::Rc::new(std::cell::RefCell::new(tile));
+            spy.script = Some(cell.clone());
+            (spy, cell)
+        }
     }
 
     impl TileProducer for ProjectionSpy {

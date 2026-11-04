@@ -1219,9 +1219,21 @@ has. The pull closes its answer's outermost statement over the producer's tiling
 sites is, states each arm complete on its own, and only the closed statement reads as terminal.
 
 A `main` output's producer is the driver's to pull. The run takes it into a slot and makes it the
-root of a sink's pipeline whose `DataSink` merges what it is handed (`Collected`); no push reaches
-the driver's consumer, so that pipeline reads its input whole. The run answers the `main`
-output's merged tile (`Run::main`) and hands the producer back; a program has at most one.
+root of a sink's pipeline, and hands the producer back after; a program has at most one. The compile
+subscribes the producer to the driver's consumer behind an unplaced `Entry`
+(`CompiledOutput::main_entry`), which the walk places in that pipeline as it places a sink's
+`SinkConsumer`. A push that climbs to the `main` output therefore queues a guard of the producer's
+tiling there, and the pipeline plans its edges and its live sources as a sink's does: a map over a
+live source at the `main` output is notified of each delivery's keys. The pipeline's `SinkBreaker`
+(`SinkBreaker::per_epoch`) hands the `DataSink` the caller passes `run_program_into` one answer per
+epoch, at the pipeline's finish of it: the answers of the epoch's packages merged with a pull of the
+producer at the universal guard. That pull adds no key, since the epoch's packages consumed all the
+producer holds, and states what the producer states complete, so the answer is the one a pull in
+pull mode makes once the epoch's arrivals have reached it. The pipeline is ordered
+(`Dispatcher::order`), so it consumes an epoch's packages after its finish of the epoch before. The
+run's last finish answers a terminal tile, as pull mode's last pull does. `run_program` passes a
+`DataSink` that merges the answers (`Collected`) and answers the merged tile (`Run::main`). The
+driver holds the producer, released whole, once the run returns.
 
 The run pulls only the breakers' inputs. The program is compiled with
 `GlobalContext::defer_sink_pulls`, which leaves out the pull each sink takes once subscribed, and
@@ -1283,10 +1295,12 @@ keys, whose arrivals no region of one source's positions spells.
 
 The binary runs a program dispatched where `CAMBRA_DISPATCH` is set and not `0`, and neither
 `--inspect` nor `--control` is given, at morsels of `CAMBRA_MORSEL_ROWS` rows (1024 unset; a value
-that is no positive count panics). It prints the `main` output's value once. A refused program
-runs in pull mode after a note on stderr, in the context the dispatched run compiled it in: the
-compile has opened its sources and sinks, a port bound or stdin taken, which a second compile
-could not open again.
+that is no positive count panics). It prints each epoch's answer of the `main` output where the
+answer holds a key or a value or is terminal, as pull mode prints each pull's answer: a collection
+cut into several morsels prints once, and a map over stdin prints each line's answer as the line
+arrives. A refused program runs in pull mode after a note on stderr, in the context the dispatched
+run compiled it in: the compile has opened its sources and sinks, a port bound or stdin taken, which
+a second compile could not open again.
 
 `tile_operators/program_run_tests.rs` checks that the run releases each sink's producer whole, that
 it finds every sink done, that a pull of each sink afterwards reaches no producer beneath a breaker

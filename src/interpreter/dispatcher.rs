@@ -32,7 +32,7 @@ use crate::interpreter::{
 mod loop_scope;
 mod plan;
 
-pub use plan::{Planned, Refused, Run, run_program, run_program_polling};
+pub use plan::{Planned, Refused, Run, run_program, run_program_into, run_program_polling};
 
 /// A pipeline, by its index in the [`Dispatcher`].
 #[derive(Clone, Copy)]
@@ -1556,6 +1556,11 @@ pub struct Pushes<'d> {
 }
 
 impl Pushes<'_> {
+    /// The epoch these pushes land in.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// Push what `breaker` has decided and the pipeline has not pushed before, its final guard
     /// less the region pushed, for the pipelines that read it: one package per morsel the breaker
     /// cuts it into, in the breaker's order. A push of nothing new pushes nothing, and so does a

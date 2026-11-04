@@ -18,13 +18,16 @@ use crate::interpreter::{BaseType, DataSink, DataSourceDomainExtentImpl, Extent}
 /// program compiled with its sinks unpulled (`GlobalContext::defer_sink_pulls`). The breakers
 /// are the producers in the chains under its sinks' producers and its `main` output's that are
 /// pipeline breakers (`TileProducer::as_breaking_mut`), each store a reader slot reaches, and
-/// each sink's own ([`SinkBreaker`]), whose pipeline no pipeline reads. A breaker's pipeline reads
-/// the pipelines of the nearest breakers beneath it, and the [`Entry`] at the breaker's input, or
-/// the sink's consumer, is placed in the pipeline. A pipeline pulls only its breaker's input, and
-/// a sink's pipeline pulls the sink's producer, so a sink receives its producer's answer one
-/// package at a time. A sink is done once its producer is released whole; the run ends with one
-/// pull of each sink, which signals `CompiledProgram::done` once every sink is. It answers what
-/// it planned for each pipeline, in pipeline order, and what the `main` output answered.
+/// each sink's own and the `main` output's ([`SinkBreaker`]), whose pipeline no pipeline reads. A
+/// breaker's pipeline reads the pipelines of the nearest breakers beneath it, and the consumer at
+/// the breaker's input is placed in the pipeline: the [`Entry`] there for a breaker in a chain, the
+/// sink's consumer for a sink, and the entry before the driver's consumer for the `main` output
+/// (`CompiledOutput::main_entry`). A pipeline pulls only its breaker's input, and a sink's
+/// pipeline pulls the sink's producer, so a sink receives its producer's answer one package at a
+/// time, and the `main` output one epoch at a time ([`run_program_into`]). A sink is done once its producer is released whole; the run ends
+/// with one pull of each sink, which signals `CompiledProgram::done` once every sink is. It
+/// answers what it planned for each pipeline, in pipeline order, and what the `main` output
+/// answered, merged ([`Run::main`]).
 ///
 /// A store that runs in rounds (`TileProducer::runs_in_rounds`) is the breaker of no pipeline. Its
 /// loop's scope is one ([`loop_scope::LoopScope`]), and the breakers inside the store's cycle are
@@ -62,9 +65,7 @@ use crate::interpreter::{BaseType, DataSink, DataSourceDomainExtentImpl, Extent}
 ///
 /// Where [`run`] panics.
 pub fn run_program(program: &mut CompiledProgram, morsel_rows: usize) -> Result<Run, Refused> {
-    run_program_polling(program, morsel_rows, &mut || {
-        thread::sleep(std::time::Duration::from_millis(1));
-    })
+    run_program_polling(program, morsel_rows, &mut sleep_when_idle)
 }
 
 /// [`run_program`] with `on_idle` called each time nothing is claimable and a live source has
@@ -80,6 +81,36 @@ pub fn run_program_polling(
     morsel_rows: usize,
     on_idle: &mut dyn FnMut(),
 ) -> Result<Run, Refused> {
+    let collected = Arc::new(Collected::default());
+    let planned = run_program_into(program, morsel_rows, collected.clone(), on_idle)?;
+    Ok(Run {
+        planned,
+        main: collected.take(),
+    })
+}
+
+/// [`run_program_polling`] handing `main` one answer of the `main` output per epoch, at the
+/// output pipeline's finish of it: the epoch's packages' answers merged with what the producer
+/// states complete, which is the answer a pull in pull mode makes once the epoch's arrivals have
+/// reached it (`SinkBreaker::per_epoch`). The last epoch's answer is terminal. The driver of a
+/// program that reads a live source prints each delivery's part of the `main` output as it
+/// arrives. It answers what it planned for each pipeline, in pipeline order.
+///
+/// # Errors
+///
+/// As [`run_program`].
+///
+/// # Panics
+///
+/// Where [`run`] panics. In a debug build, where a run that returns has not released the `main`
+/// output's producer whole, where a pull at an epoch's finish answers a key or a value no package
+/// of the epoch consumed, and where the last epoch's answer is not terminal.
+pub fn run_program_into(
+    program: &mut CompiledProgram,
+    morsel_rows: usize,
+    main: Arc<dyn DataSink>,
+    on_idle: &mut dyn FnMut(),
+) -> Result<Vec<Planned>, Refused> {
     if !program.sink_pulls_deferred() {
         return Err(Refused(
             "the program was compiled with its sinks pulled, which runs part of it in pull mode \
@@ -89,49 +120,63 @@ pub fn run_program_polling(
     }
     // A `main` output's producer is the driver's to pull; the run takes it into a slot, as a
     // sink's sits in one, and hands it back after. A program has at most one.
-    let mut main = None;
-    let mut targets: Vec<(ProducerSlot, Arc<dyn DataSink>, Option<SinkTarget>)> = Vec::new();
+    let mut taken = None;
+    let mut targets: Vec<RunTarget> = Vec::new();
     for (at, output) in program.outputs.iter_mut().enumerate() {
         if let Some(consumer) = &output.sink_consumer {
             let consumer_ref = consumer.borrow();
             targets.push((
                 consumer_ref.producer_slot().clone(),
                 consumer_ref.sink(),
-                Some(consumer.clone()),
+                TargetEntry::Sink(consumer.clone()),
             ));
         } else if let Some(producer) = output.producer.take() {
-            assert!(main.is_none(), "a program has at most one `main` output");
-            let collected = Arc::new(Collected::default());
+            assert!(taken.is_none(), "a program has at most one `main` output");
+            let placement = output
+                .main_entry
+                .clone()
+                .expect("a `main` output keeps the placement of the entry before its consumer");
             let slot: ProducerSlot = Rc::new(RefCell::new(Some(producer)));
-            main = Some((at, slot.clone(), collected.clone()));
-            targets.push((slot, collected, None));
+            taken = Some((at, slot.clone()));
+            targets.push((slot, main.clone(), TargetEntry::Main(placement)));
         }
     }
     let result = run_targets(&targets, morsel_rows, on_idle);
-    if let Some((at, slot, _)) = &main {
-        program.outputs[*at].producer = slot.borrow_mut().take();
+    if let Some((at, slot)) = &taken {
+        let producer = slot.borrow_mut().take();
+        debug_assert!(
+            result.is_err()
+                || producer
+                    .as_ref()
+                    .is_some_and(|producer| producer.obsolete_guard().is_universal()),
+            "a run that returns has released the `main` output's producer whole, so the driver \
+             pulls nothing more of it"
+        );
+        program.outputs[*at].producer = producer;
     }
     let planned = result?;
     // The run's last pull of each sink, as pull mode's last: its producer answers from what the
     // breakers consumed and is released whole, so the pull hands the sink nothing new and
     // finds it done, which signals `CompiledProgram::done` once every sink has.
-    for (_, _, consumer) in &targets {
-        if let Some(consumer) = consumer {
+    for (_, _, entry) in &targets {
+        if let TargetEntry::Sink(consumer) = entry {
             consumer.borrow().pull_now();
         }
     }
-    Ok(Run {
-        planned,
-        main: main.and_then(|(_, _, collected)| collected.take()),
-    })
+    Ok(planned)
+}
+
+/// [`run_program`]'s `on_idle`: a millisecond's sleep before the next poll.
+fn sleep_when_idle() {
+    thread::sleep(std::time::Duration::from_millis(1));
 }
 
 /// What a dispatched run planned, and what the `main` output answered.
 pub struct Run {
     /// What the run planned for each pipeline, in pipeline order.
     pub planned: Vec<Planned>,
-    /// The tile the `main` output's pulls answered, merged; `None` for a program with no `main`
-    /// output, and where they answered nothing.
+    /// The `main` output's answers, one per epoch, merged: terminal, since the last epoch's is.
+    /// `None` for a program with no `main` output.
     pub main: Option<Tile>,
 }
 
@@ -163,10 +208,10 @@ impl DataSink for Collected {
 }
 
 /// Run the pipelines under `targets`' producers, each a root its sink breaker pulls: a sink's,
-/// whose consumer is placed in the sink's pipeline, or a `main` output's, whose pipeline reads
-/// its input whole, since no push reaches the driver's consumer.
+/// whose consumer is placed in the sink's pipeline, or a `main` output's, whose entry is placed in
+/// the output's pipeline.
 fn run_targets(
-    targets: &[(ProducerSlot, Arc<dyn DataSink>, Option<SinkTarget>)],
+    targets: &[RunTarget],
     morsel_rows: usize,
     on_idle: &mut dyn FnMut(),
 ) -> Result<Vec<Planned>, Refused> {
@@ -174,9 +219,16 @@ fn run_targets(
     let roots: Vec<ProducerSlot> = targets.iter().map(|(slot, _, _)| slot.clone()).collect();
     let mut sink_breakers = Vec::new();
     let mut sink_pipelines = Vec::new();
-    for (at, (root, sink, _)) in targets.iter().enumerate() {
-        let breaker =
-            crate::interpreter::tile_operators::SinkBreaker::new(root.clone(), sink.clone());
+    for (at, (root, sink, entry)) in targets.iter().enumerate() {
+        let breaker = match entry {
+            TargetEntry::Sink(_) => {
+                crate::interpreter::tile_operators::SinkBreaker::new(root.clone(), sink.clone())
+            }
+            TargetEntry::Main(_) => crate::interpreter::tile_operators::SinkBreaker::per_epoch(
+                root.clone(),
+                sink.clone(),
+            ),
+        };
         let under = {
             let mut root = root.borrow_mut();
             let producer = root.as_mut().expect("a root holds the producer it pulls");
@@ -205,15 +257,16 @@ fn run_targets(
         unplace(&planner.placements, targets);
         return Err(refused);
     }
-    for ((_, _, consumer), (pipeline, breaker)) in targets
+    for ((_, _, entry), (pipeline, breaker)) in targets
         .iter()
         .zip(sink_pipelines.iter().zip(&sink_breakers))
     {
-        if let Some(consumer) = consumer {
-            consumer.borrow_mut().place(
-                PipelineId(planner.local[*pipeline]),
-                breaker.borrow().input_tiling(InputId::ONLY),
-            );
+        let local = PipelineId(planner.local[*pipeline]);
+        match entry {
+            TargetEntry::Sink(consumer) => consumer
+                .borrow_mut()
+                .place(local, breaker.borrow().input_tiling(InputId::ONLY)),
+            TargetEntry::Main(placement) => placement.set(Some(local)),
         }
     }
     let members = planner.members(None);
@@ -282,7 +335,7 @@ fn run_targets(
                 .any(|&read| live_beneath[read]);
         live_beneath.push(beneath);
     }
-    let (dispatcher, mut planned) = plan_edges(
+    let (mut dispatcher, mut planned) = plan_edges(
         &members.reads,
         &members.names,
         &members.leaves,
@@ -293,6 +346,13 @@ fn run_targets(
         &mut reach,
         &mut end_of,
     );
+    // A `main` output's breaker merges an epoch's answers until the epoch's finish
+    // (`SinkBreaker::per_epoch`), so its pipeline consumes one epoch at a time.
+    for ((_, _, entry), pipeline) in targets.iter().zip(&sink_pipelines) {
+        if let TargetEntry::Main(_) = entry {
+            dispatcher.order(PipelineId(planner.local[*pipeline]));
+        }
+    }
     let mut live = Vec::new();
     for (pipeline, leaves) in members.live.iter().enumerate() {
         if leaves.is_empty() {
@@ -400,16 +460,14 @@ fn run_targets(
 /// Unplace every entry `placements` holds and every sink consumer of `targets`: a refused run
 /// runs nothing, so it leaves nothing placed. A later run in pull mode pushes nothing, but a
 /// placed entry claims a pipeline that no dispatcher holds.
-fn unplace(
-    placements: &[Option<Placement>],
-    targets: &[(ProducerSlot, Arc<dyn DataSink>, Option<SinkTarget>)],
-) {
+fn unplace(placements: &[Option<Placement>], targets: &[RunTarget]) {
     for placement in placements.iter().flatten() {
         placement.set(None);
     }
-    for (_, _, consumer) in targets {
-        if let Some(consumer) = consumer {
-            consumer.borrow_mut().unplace();
+    for (_, _, entry) in targets {
+        match entry {
+            TargetEntry::Sink(consumer) => consumer.borrow_mut().unplace(),
+            TargetEntry::Main(placement) => placement.set(None),
         }
     }
 }
@@ -625,6 +683,19 @@ pub(super) fn plan_edges(
 // (`CompiledOutput::sink_consumer`), which the planner places and reads the sink's producer
 // through; no tile crosses it.
 type SinkTarget = Rc<RefCell<crate::interpreter::sinks::SinkConsumer>>;
+
+/// A root of the run: the slot of the producer its sink breaker pulls, the `DataSink` the breaker
+/// hands each answer to, and what the planner places in the root's pipeline.
+type RunTarget = (ProducerSlot, Arc<dyn DataSink>, TargetEntry);
+
+/// What the planner places in a root's pipeline, so a push that climbs to the root queues there.
+enum TargetEntry {
+    /// A sink output's consumer.
+    Sink(SinkTarget),
+    /// The placement of the entry before a `main` output's consumer
+    /// (`CompiledOutput::main_entry`).
+    Main(Placement),
+}
 
 /// What [`run_program`] planned for one pipeline.
 #[derive(Debug)]

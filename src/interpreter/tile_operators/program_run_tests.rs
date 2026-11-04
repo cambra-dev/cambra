@@ -1816,3 +1816,254 @@ fn a_reader_of_pushes_over_a_live_source_is_refused() {
         two_batches(),
     );
 }
+
+/// What a dispatched run hands a `main` output: it keeps each answer as a test sink does, counts
+/// the outermost keys the answers have held, and lists the answers pull mode would print.
+#[derive(Default)]
+struct MainAnswers {
+    kept: crate::interpreter::TestSink,
+    keys: std::sync::atomic::AtomicUsize,
+    printed: std::sync::Mutex<Vec<crate::interpreter::Tile>>,
+}
+
+/// Whether the driver prints `tile`, as `pull_main` and the dispatched run's printer decide: it
+/// holds a key or a value, or it is terminal.
+fn is_printed(tile: &crate::interpreter::Tile) -> bool {
+    !tile.is_empty() || tile.is_terminal()
+}
+
+impl crate::interpreter::DataSink for MainAnswers {
+    fn process(&self, tile: &crate::interpreter::Tile) {
+        if let crate::interpreter::Tile::DataFunction {
+            domain, deleted, ..
+        } = tile
+        {
+            self.keys.fetch_add(
+                domain.len() - deleted.len(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+        if is_printed(tile) {
+            self.printed
+                .lock()
+                .expect("no answer panics")
+                .push(tile.clone());
+        }
+        self.kept.process(tile);
+    }
+}
+
+/// What [`dispatched_live_main`] observed of a run.
+struct LiveMain {
+    /// The `main` output's value.
+    value: Value,
+    /// What the run planned.
+    planned: Vec<Planned>,
+    /// The outermost keys the `main` output had been handed each time the run had nothing to do,
+    /// before the next delivery.
+    handed: Vec<usize>,
+    /// The answers the driver prints ([`is_printed`]), in the order they were handed.
+    printed: Vec<crate::interpreter::Tile>,
+}
+
+/// `source`, whose `main` output reads the live source `source1`, compiled and run through the
+/// dispatcher at morsels of `rows`, the source fed `batches` as [`dispatched_live`] feeds them.
+fn dispatched_live_main(source: &str, rows: usize, batches: Vec<Batch>) -> LiveMain {
+    let mut ctx = GlobalContext::default();
+    ctx.defer_sink_pulls();
+    let feed = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::interpreter::TestDataSource::new(
+            "source1",
+            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+        ),
+    ));
+    ctx.register_source(feed.clone());
+    let loaded = LoadedProgram::test(source);
+    let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    let _operators = ctx.take_operator_map();
+    let mut batches = batches.into_iter();
+    let deliver = |batch: Option<Batch>| {
+        let Some((entries, complete)) = batch else {
+            panic!("{source}: the run waits after the last batch")
+        };
+        let mut feed = feed.borrow_mut();
+        feed.add_data(&entries);
+        feed.set_yield_predicate(complete);
+    };
+    deliver(batches.next());
+    let main = std::sync::Arc::new(MainAnswers::default());
+    let mut handed = Vec::new();
+    let planned = crate::interpreter::dispatcher::run_program_into(
+        &mut program,
+        rows,
+        main.clone(),
+        &mut || {
+            handed.push(main.keys.load(std::sync::atomic::Ordering::SeqCst));
+            deliver(batches.next())
+        },
+    )
+    .unwrap_or_else(|refused| panic!("{refused}"));
+    let producer = program
+        .outputs
+        .iter()
+        .find(|output| output.is_main())
+        .and_then(|output| output.producer.as_ref())
+        .unwrap_or_else(|| panic!("{source}: the run hands the `main` output's producer back"));
+    assert!(
+        producer.obsolete_guard().is_universal(),
+        "{source}: the run releases the `main` output's producer whole: {planned:?}"
+    );
+    let value = main
+        .kept
+        .value()
+        .unwrap_or_else(|error| panic!("{source}: the `main` output: {error:?}"));
+    let printed = std::mem::take(&mut *main.printed.lock().expect("no answer panics"));
+    LiveMain {
+        value,
+        planned,
+        handed,
+        printed,
+    }
+}
+
+/// `source`, whose `main` output reads the live source `source1`, compiled and run in pull mode,
+/// the source fed `batches` one at a time, the `main` output pulled at the universal guard and
+/// released at its answer once the scheduler has run out of work after each: the answers the
+/// driver prints ([`is_printed`]).
+fn pulled_live_main(source: &str, batches: Vec<Batch>) -> Vec<crate::interpreter::Tile> {
+    let mut ctx = GlobalContext::default();
+    let feed = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::interpreter::TestDataSource::new(
+            "source1",
+            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+        ),
+    ));
+    ctx.register_source(feed.clone());
+    let mut program = compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    let mut producer = program
+        .outputs
+        .iter_mut()
+        .find(|output| output.is_main())
+        .and_then(|output| output.producer.take())
+        .unwrap_or_else(|| panic!("{source} has a `main` output"));
+    let mut printed = Vec::new();
+    for (entries, complete) in batches {
+        feed.borrow_mut().add_data(&entries);
+        feed.borrow_mut().set_yield_predicate(complete);
+        for _ in 0..1000 {
+            ctx.scheduler().check_for_notifications();
+        }
+        let tile = producer.get(producer.tiling().universal_guard());
+        producer.release(tile.to_guard());
+        if is_printed(&tile) {
+            printed.push(tile);
+        }
+    }
+    assert!(
+        printed
+            .last()
+            .is_some_and(crate::interpreter::Tile::is_terminal),
+        "{source}: pull mode's last pull answers a terminal tile"
+    );
+    printed
+}
+
+/// [`one_key_batches`] with a last delivery that adds no key and calls the source complete.
+fn one_key_batches_then_empty(batches: u64) -> Vec<Batch> {
+    let mut all = one_key_batches(batches);
+    all[batches as usize - 1].1 =
+        crate::interpreter::Predicate::at_or_below(Value::UInt(batches - 1));
+    all.push((Vec::new(), crate::interpreter::Predicate::True));
+    all
+}
+
+/// The `main` output is handed, one delivery at a time, the answers pull mode prints after each:
+/// a key the filter drops and a delivery of no key hand an answer the driver does not print, a
+/// sum is printed once its source is complete, and the last answer is terminal.
+#[rstest_log::rstest]
+#[case::a_map("[x * 10 for x in source1()]")]
+#[case::a_filter_dropping_a_key("[x for x in source1() if x != 2]")]
+#[case::a_sum("sum(source1())")]
+fn the_main_output_prints_what_pull_mode_prints_per_delivery(
+    #[case] source: &str,
+    #[values(one_key_batches(3), one_key_batches_then_empty(3))] batches: Vec<Batch>,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let pulled = pulled_live_main(source, batches.clone());
+    let dispatched = dispatched_live_main(source, rows, batches);
+    assert_eq!(dispatched.printed, pulled);
+}
+
+/// A map or a filter over a live source at the `main` output takes each delivery's keys as they
+/// arrive: the run places the entry before the `main` output's consumer in the output's pipeline,
+/// so a push of a delivery's keys reaches it restated, and the output is handed the first
+/// delivery's keys before the second arrives.
+#[rstest_log::rstest]
+#[case::a_map(
+    "[x * 10 for x in source1()]",
+    (0..5).map(|key| (key, 10 * (key as i64 + 1))).collect(),
+    3
+)]
+#[case::a_filter(
+    "[x for x in source1() if x > 2]",
+    (2..5).map(|key| (key, key as i64 + 1)).collect(),
+    1
+)]
+fn a_map_over_a_live_source_at_main(
+    #[case] source: &str,
+    #[case] expected: Vec<(u64, i64)>,
+    #[case] first: usize,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let LiveMain {
+        value,
+        planned,
+        handed,
+        ..
+    } = dispatched_live_main(source, rows, two_batches());
+    assert_eq!(keyed_ints(&value), expected);
+    assert_eq!(
+        handed,
+        [first],
+        "the first delivery's keys reach the `main` output before the second delivery"
+    );
+    assert!(
+        planned
+            .iter()
+            .any(|plan| plan.live && !plan.whole && plan.name.starts_with("SinkBreaker")),
+        "the `main` output's pipeline is notified of each delivery: {planned:?}"
+    );
+}
+
+/// A sum or a loop over a live source at the `main` output: the run notifies the aggregate's or
+/// the loop's pipeline of each delivery, beneath the output's pipeline, and the output is handed
+/// the scalar once the source yields everything.
+#[rstest_log::rstest]
+#[case::a_sum("sum(source1())", "Aggregate")]
+#[case::a_loop(
+    indoc! {"
+        total := 0
+        for x in source1():
+            total += x
+        total
+    "},
+    "LoopScope"
+)]
+fn a_sum_over_a_live_source_at_main(
+    #[case] source: &str,
+    #[case] live: &str,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let LiveMain { value, planned, .. } = dispatched_live_main(source, rows, two_batches());
+    assert_eq!(value, Value::Int(15));
+    assert!(
+        planned
+            .iter()
+            .all(|plan| plan.live == plan.name.starts_with(live)),
+        "the live source pipeline is the {live}'s alone: {planned:?}"
+    );
+}
