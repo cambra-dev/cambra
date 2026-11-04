@@ -12,20 +12,18 @@
 use crate::differential;
 
 use chl_interp::{Collection, Value};
-use differential::{Compiled, check_dispatched, run_compiled, run_interpreted};
+use differential::{Compiled, Dispatched, check_dispatched, dispatch, run_interpreted};
 use indoc::indoc;
 use rstest::rstest;
 
-/// What sink `out` observed under the compiler, for a program it compiles and completes. A
-/// dispatched run of the program observes the same, or the planner refuses it as
-/// `tests/it/dispatch_refused.txt` pins ([`check_dispatched`]).
+/// What sink `out` observed under a dispatched run of the compiled program, at morsels of one
+/// row and of every row ([`dispatch`]), for a program the compiler compiles and runs to
+/// completion. A refusal fails the test, pinned or not: only [`check_dispatched`] reads
+/// `tests/it/dispatch_refused.txt`.
 fn compiled(source: &str) -> Value {
-    match run_compiled(source) {
-        Compiled::Value(v) => {
-            check_dispatched(source, &v);
-            v
-        }
-        other => panic!("the compiled program produced no value: {other}"),
+    match dispatch(source) {
+        Dispatched::Ran(Compiled::Value(v)) => v,
+        other => panic!("the dispatched program produced no value: {other}\n  program:\n{source}"),
     }
 }
 
@@ -1190,8 +1188,9 @@ fn two_stores_written_in_one_block() {
 }
 
 /// Two writer sites on one store. Their commits are unordered (`docs/chl-spec.md`, "8.5
-/// Ordering and concurrency"), so the interpreter refuses to judge the program; the compiler
-/// picks an order, and this checks only that it runs the program to completion.
+/// Ordering and concurrency"), so the interpreter refuses to judge the program. The compiler
+/// picks an order, and this checks only that its dispatched run produces a value, the same at
+/// morsels of one row and of every row ([`check_dispatched`]), and that the interpreter refuses.
 #[test]
 fn two_writer_sites_on_one_store_are_not_judged() {
     let source = indoc! {r#"
@@ -1206,7 +1205,7 @@ fn two_writer_sites_on_one_store_are_not_judged() {
                 pool := pool - r
                 out << pool
     "#};
-    compiled(source);
+    check_dispatched(source);
     let refusal = run_interpreted(source).expect_err("the interpreter refuses");
     assert!(refusal.contains("more than one `with` block"), "{refusal}");
 }

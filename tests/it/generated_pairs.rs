@@ -1,5 +1,5 @@
 //! Generated pairs: every type-compatible (skeleton, filler) program, run through both the
-//! compiler and the differential interpreter.
+//! compiler, as a dispatched run (`differential::dispatch`), and the differential interpreter.
 //!
 //! A compiler defect is often one feature inside another: a collection under a feed, a
 //! record holding a collection, a comprehension inside a loop. So the unit here is a
@@ -18,10 +18,12 @@
 //! - a disagreement between compiler and interpreter is a wrong answer.
 //!
 //! Outcomes are classified by mechanism: any `CompileError` is a rejection, whether its
-//! message states a gap or reports a compiler bug, and a sink the compiled program could not
-//! read counts as a panic. An interpreter refusal is a gap in the differential interpreter,
-//! except where `docs/chl-spec.md` leaves the program's value undefined: there the refusal is
-//! the answer, and the compiler's is not compared. [`UNDEFINED`] names those cells.
+//! message states a gap or reports a compiler bug, and so is the planner's refusal of the
+//! dispatched run. A sink the compiled program could not read counts as a panic. Two dispatched
+//! runs, at morsels of one row and of every row, that answer differently are an outcome of their
+//! own, compared with no interpreted value. An interpreter refusal is a gap in the differential interpreter, except where `docs/chl-spec.md`
+//! leaves the program's value undefined: there the refusal is the answer, and the compiler's is
+//! not compared. [`UNDEFINED`] names those cells.
 //!
 //! Two tests run the grid:
 //!
@@ -42,7 +44,7 @@ use std::collections::BTreeMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 
 use chl_interp::Value;
-use differential::{Compiled, run_compiled, run_interpreted};
+use differential::{Compiled, Dispatched, dispatch, run_interpreted};
 use indoc::indoc;
 use panic_message::panic_message;
 
@@ -63,6 +65,109 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ("loop_source_in_loop", "map_arrow", "CompilerPanics"),
     ("loop_source_in_loop", "map_lit", "CompilerPanics"),
     ("loop_source_in_loop", "union", "CompilerRejects"),
+    // A loop nested over the rows of a list, run dispatched. A `CompilerPanics` cell panics in the
+    // guard algebra, which has no difference of a universal guard and a row's guard; a
+    // `CompilerRejects` cell is refused, since a `SelectField` in the nested loop's cycle restates
+    // the outermost keys only.
+    ("nested_mut_over_row", "arith", "CompilerPanics"),
+    ("nested_mut_over_row", "binder[x]", "CompilerPanics"),
+    ("nested_mut_over_row", "binder_arith[x]", "CompilerPanics"),
+    ("nested_mut_over_row", "binder_elif[x]", "CompilerRejects"),
+    (
+        "nested_mut_over_row",
+        "binder_floordiv_left[x]",
+        "CompilerPanics",
+    ),
+    (
+        "nested_mut_over_row",
+        "binder_floordiv_right[x]",
+        "CompilerPanics",
+    ),
+    ("nested_mut_over_row", "binder_in_call[x]", "CompilerPanics"),
+    (
+        "nested_mut_over_row",
+        "binder_in_comp[x]",
+        "CompilerRejects",
+    ),
+    (
+        "nested_mut_over_row",
+        "binder_in_comp_filter[x]",
+        "CompilerRejects",
+    ),
+    (
+        "nested_mut_over_row",
+        "binder_in_corr_filter[x]",
+        "CompilerRejects",
+    ),
+    (
+        "nested_mut_over_row",
+        "binder_in_nested_comp[x]",
+        "CompilerRejects",
+    ),
+    (
+        "nested_mut_over_row",
+        "binder_literal_chain[x]",
+        "CompilerPanics",
+    ),
+    (
+        "nested_mut_over_row",
+        "binder_mul_left[x]",
+        "CompilerPanics",
+    ),
+    (
+        "nested_mut_over_row",
+        "binder_partial_ternary[x]",
+        "CompilerRejects",
+    ),
+    (
+        "nested_mut_over_row",
+        "binder_plus_aggregate[x]",
+        "CompilerPanics",
+    ),
+    ("nested_mut_over_row", "binder_pow[x]", "CompilerPanics"),
+    (
+        "nested_mut_over_row",
+        "binder_shared_operand[x]",
+        "CompilerPanics",
+    ),
+    (
+        "nested_mut_over_row",
+        "binder_shared_subterm[x]",
+        "CompilerPanics",
+    ),
+    (
+        "nested_mut_over_row",
+        "binder_sub_left[x]",
+        "CompilerPanics",
+    ),
+    (
+        "nested_mut_over_row",
+        "binder_sub_right[x]",
+        "CompilerPanics",
+    ),
+    (
+        "nested_mut_over_row",
+        "binder_ternary[x]",
+        "CompilerRejects",
+    ),
+    ("nested_mut_over_row", "call", "CompilerPanics"),
+    ("nested_mut_over_row", "comp_sum", "CompilerPanics"),
+    ("nested_mut_over_row", "filtered_sum", "CompilerPanics"),
+    ("nested_mut_over_row", "floordiv", "CompilerPanics"),
+    ("nested_mut_over_row", "generator_max", "CompilerPanics"),
+    ("nested_mut_over_row", "groupby_sum", "CompilerPanics"),
+    ("nested_mut_over_row", "int_lit", "CompilerPanics"),
+    ("nested_mut_over_row", "max_lit", "CompilerPanics"),
+    ("nested_mut_over_row", "neg", "CompilerPanics"),
+    ("nested_mut_over_row", "nested_comp_sum", "CompilerPanics"),
+    ("nested_mut_over_row", "pow", "CompilerPanics"),
+    ("nested_mut_over_row", "record_proj", "CompilerPanics"),
+    ("nested_mut_over_row", "rows_sum", "CompilerPanics"),
+    ("nested_mut_over_row", "sum_lit", "CompilerPanics"),
+    ("nested_mut_over_row", "sum_of_empty", "CompilerPanics"),
+    ("nested_mut_over_row", "ternary", "CompilerPanics"),
+    ("nested_mut_over_row", "tuple_proj", "CompilerPanics"),
+    ("nested_mut_over_row", "union_sum", "CompilerPanics"),
     (
         "nested_mut_source",
         "binder_filtered_comp[i]",
@@ -89,8 +194,12 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ("rows_comp_source", "rows_filtered", "CompilerPanics"),
     ("rows_inner_filter", "rows_filtered", "CompilerPanics"),
     ("rows_loop_feed", "rows_filtered", "CompilerRejects"),
+    // The dispatched run panics in the guard algebra, as at the `nested_mut_over_row` cells.
+    ("rows_nested_mut", "rows_comp", "CompilerPanics"),
     ("rows_nested_mut", "rows_filtered", "CompilerRejects"),
     ("rows_nested_mut", "rows_jagged", "CompilerRejects"),
+    // The dispatched run panics in the guard algebra, as at the `nested_mut_over_row` cells.
+    ("rows_nested_mut", "rows_lit", "CompilerPanics"),
     ("terminal_read", "terminal_in_agg[pool]", "CompilerRejects"),
     (
         "terminal_read_after_guard",
@@ -202,7 +311,7 @@ enum Outcome {
     /// program completed with a sink that could not state a value.
     CompilerPanics(String),
     /// The compiler answered a `CompileError`, whether it states a gap or reports a compiler
-    /// bug.
+    /// bug, or the planner refused the dispatched run.
     CompilerRejects(String),
     /// The interpreter does not cover the program. Carries the interpreter's reason and the
     /// value the compiler produced, which the report shows beside the reason.
@@ -212,11 +321,14 @@ enum Outcome {
     InterpreterPanics(String),
     /// The compiled program did not complete, so its sink holds a partial value.
     DidNotFinish,
+    /// The dispatched runs at morsels of one row and of every row answered differently. Carries
+    /// both answers rendered.
+    MorselsDisagree(String),
 }
 
 impl Outcome {
     /// Every kind [`Self::kind`] answers.
-    const KINDS: [&'static str; 7] = [
+    const KINDS: [&'static str; 8] = [
         "Agrees",
         "Disagrees",
         "CompilerPanics",
@@ -224,6 +336,7 @@ impl Outcome {
         "InterpreterGap",
         "InterpreterPanics",
         "DidNotFinish",
+        "MorselsDisagree",
     ];
 
     /// The outcome without its detail, for tallying.
@@ -236,6 +349,7 @@ impl Outcome {
             Outcome::InterpreterGap(..) => "InterpreterGap",
             Outcome::InterpreterPanics(_) => "InterpreterPanics",
             Outcome::DidNotFinish => "DidNotFinish",
+            Outcome::MorselsDisagree(_) => "MorselsDisagree",
         }
     }
 
@@ -246,7 +360,8 @@ impl Outcome {
             | Outcome::CompilerPanics(d)
             | Outcome::CompilerRejects(d)
             | Outcome::InterpreterGap(d, _)
-            | Outcome::InterpreterPanics(d) => d,
+            | Outcome::InterpreterPanics(d)
+            | Outcome::MorselsDisagree(d) => d,
         }
     }
 }
@@ -1318,16 +1433,28 @@ fn classify(source: &str) -> Outcome {
 /// the differential interpreter. [`classify`] passes one program as both.
 fn compare(compiled: &str, interpreted: &str) -> Outcome {
     let interpreted = catch_unwind(AssertUnwindSafe(|| run_interpreted(interpreted)));
-    let compiled = catch_unwind(AssertUnwindSafe(|| run_compiled(compiled)));
+    let compiled = catch_unwind(AssertUnwindSafe(|| dispatch(compiled)));
 
     let c = match compiled {
         Err(payload) => return Outcome::CompilerPanics(first_line(&panic_message(&*payload))),
-        Ok(Compiled::Rejected(errs)) => return Outcome::CompilerRejects(first_line(&errs)),
-        Ok(Compiled::Unreadable(e)) => {
+        Ok(Dispatched::Ran(Compiled::Rejected(errs))) => {
+            return Outcome::CompilerRejects(first_line(&errs));
+        }
+        Ok(Dispatched::Refused(why)) => {
+            return Outcome::CompilerRejects(format!("refused: {}", first_line(&why)));
+        }
+        Ok(Dispatched::Ran(Compiled::Unreadable(e))) => {
             return Outcome::CompilerPanics(format!("sink unreadable: {e}"));
         }
-        Ok(Compiled::DidNotFinish) => return Outcome::DidNotFinish,
-        Ok(Compiled::Value(c)) => c,
+        Ok(Dispatched::Ran(Compiled::DidNotFinish)) => return Outcome::DidNotFinish,
+        Ok(Dispatched::MorselsDisagree { one, every }) => {
+            return Outcome::MorselsDisagree(format!(
+                "at morsels of 1 {}, at morsels of every row {}",
+                first_line(&one),
+                first_line(&every)
+            ));
+        }
+        Ok(Dispatched::Ran(Compiled::Value(c))) => c,
     };
     match interpreted {
         Err(payload) => Outcome::InterpreterPanics(first_line(&panic_message(&*payload))),
