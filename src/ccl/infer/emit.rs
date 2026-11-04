@@ -632,7 +632,7 @@ pub(super) fn emit_annotation_predicates<C: Typing>(
 /// Type a refinement's **bare** predicate (design §6.2). The refinement is a
 /// binding form: its element is the implicit [`crate::ccl::REFINEMENT_BINDER`], bound to
 /// the refined base type `domain` while the predicate is inferred, and the
-/// predicate itself must be `Bool` — exactly as `infer_lambda` binds a
+/// predicate itself must be `Bool` — exactly as `emit_lambda` binds a
 /// parameter for its body, but with the refinement doing the binding.
 ///
 /// The predicate is immutable, so emission types a *copy* (which seeds the

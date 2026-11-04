@@ -4,7 +4,7 @@
 //! variables' bound lists, propagating transitively (`constrain_go`),
 //! bridging two-sided edge substitutions (`bridge_holder_gap`), and recovering
 //! from level mismatches by `extrude`. Refinement layers are peeled/wrapped
-//! (`peel_refinements` / `wrap_refinements`) so a refinement deficit can flow onto
+//! (`peel_refinements` / `Type::refined`) so a refinement deficit can flow onto
 //! a variable base.
 
 // The `constrain` cycle cache (`ConstrainCache`) keys on `(Type, Type)`. `Type`

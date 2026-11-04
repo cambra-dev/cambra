@@ -715,7 +715,7 @@ pub fn freshen_above(
             // nothing relating those to the copy's own, and a Σ then materializes
             // declaring one name and referencing another.
             //
-            // Minted here and related in [`relate_freshened_kind`] after the bounds are
+            // Minted here and related in [`FreshenCache::relate_kind_copy`] after the bounds are
             // copied, rather than through [`freshen_kind_var`]: that copies a kind's edges
             // eagerly, and since an edge is recorded on both ends it would pull this
             // variable's whole undirected component into every instantiation — kinds no

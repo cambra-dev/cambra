@@ -51,7 +51,7 @@ fn a_boxed_collection_is_consumed_like_the_collection_it_wraps(
 /// materialised — the sum's candidate merely records it.
 ///
 /// This is the control group for
-/// [`a_filter_over_a_boxed_source_is_dropped`]: the refinement on a candidate
+/// [`a_filter_over_a_boxed_source_is_applied`]: the refinement on a candidate
 /// looks identical whether it was compiled inside the arm or is still owed by
 /// the consumer, so a rule that emits an operator for every refinement it finds
 /// on a candidate would double-apply these.
