@@ -463,7 +463,7 @@ durable forms are:
 | `Variant` | Tagged sum; source tags use `FieldKey::Name`, while anonymous positional sums use `FieldKey::Index`. `Openness` distinguishes a complete tag set from an open requirement. |
 | `Refinement` | A base type restricted by a nonempty set of predicates; construction flattens nested refinements. |
 | `DataSource`, `Txn` | An external source's nominal domain and the transaction sequencing domain. |
-| `WitnessRef` | Reference to a dependent-sum witness, inside the sum's own type; realization or erasure replaces it with a candidate. |
+| `WitnessRef` | Reference to a dependent-sum witness, inside the sum's own type; realization replaces it with the candidate a leg chose. |
 | `WitnessProjection` | `σᵢ(𝑐)`, the `i`th witness of the sum the term `𝑐` holds: how a type outside the sum names it ([Projecting a sum's witness](collections.md#projecting-a-sums-witness)). |
 
 A `Label` (`src/ccl/label.rs`) is a record field label or a variant tag: a spelling and the module

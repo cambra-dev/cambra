@@ -918,12 +918,9 @@ fn normalize_bare_write(name: Name, value: Expr, cont: Expr) -> Expr {
 /// [`Builtin::Box`]. A write `m := box(…)` names one key domain the same way. A keyed write
 /// needs nothing here: [`desugar_keyed_writes`] builds its `insert` at the variable's type.
 ///
-/// Stating the mutable variable's value type on that introduction is also what keeps it.
-/// `erase_determined_boxes` erases a box whose **stated** sum lists one candidate, reading the kind
-/// off `box`'s own function type, and a described kind lists none
-/// (`src/ccl/planning/conditionals.rs`). So a seed built by a conditional still realizes — the
-/// fan-out acts on the inner, multi-candidate sum — while the introduction that states the mutable
-/// variable's type survives realization and carries the value into it.
+/// A seed built by a conditional still realizes — the fan-out acts on the inner,
+/// multi-candidate sum — while the introduction that states the mutable variable's type stands
+/// over the realized conditional and carries the value into it.
 ///
 /// Runs after inference, so it stamps the types it builds and the CHECK-mode `typecheck`
 /// behind it validates them: the reconcile there is `derived <: recorded`, and the derived
