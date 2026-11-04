@@ -1124,8 +1124,10 @@ pub(crate) fn read_again_toward(
 /// keys at any levels ([`Projection::of`]) differ as their projections do: a release up to the
 /// path `(𝑘, 𝑗)` leaves of the held row `𝑘` its paths past `𝑗`, which `TileGuard::closed_over`
 /// drops where the row's level is a finite range with no position past `𝑗`
-/// ([`BreakingProducer::final_guard`] closes it). A shape that has no spelling panics: answering a
-/// smaller region would claim less than the state holds, and a larger one more.
+/// ([`BreakingProducer::final_guard`] closes it). A release with an arm of cells beneath keys,
+/// rather than of keys, is taken out of held keys by [`minus_disjoint_arms`]. A shape that has no
+/// spelling panics: answering a smaller region would claim less than the state holds, and a larger
+/// one more.
 pub(crate) fn guard_minus(held: &TileGuard, released: &TileGuard) -> TileGuard {
     if released.is_empty() {
         return held.clone();
@@ -1164,9 +1166,49 @@ pub(crate) fn guard_minus(held: &TileGuard, released: &TileGuard) -> TileGuard {
             {
                 held_keys.minus(&released_keys).collection_guard()
             }
+            (Ok(_), Err(_)) if names_collection_keys(held) => minus_disjoint_arms(held, released),
             _ => panic!("the guard algebra has no difference of {held:?} and {released:?}"),
         },
     }
+}
+
+/// `held`, a guard of a collection's keys, less `released`, an arm of which is a codomain guard
+/// naming no keys, such as the cells of some fields of a record beneath a level. The arms of keys
+/// are taken out as projections are ([`guard_minus`]). Every other arm names nothing of what that
+/// leaves, so the difference is that region (`src/interpreter/design-path-projections.md`,
+/// "Differences of nested guards").
+///
+/// # Panics
+///
+/// Where an arm is no codomain guard, or names a region of what the arms of keys leave. The
+/// difference with such an arm is a record guard beneath the held keys, not a region of keys,
+/// and a breaker pushes its final guard as a region of keys.
+fn minus_disjoint_arms(held: &TileGuard, released: &TileGuard) -> TileGuard {
+    let arms = match released {
+        TileGuard::Or(arms) => arms.as_slice(),
+        single => std::slice::from_ref(single),
+    };
+    let (keys, cells): (Vec<TileGuard>, Vec<TileGuard>) = arms
+        .iter()
+        .cloned()
+        .partition(|arm| Projection::of(arm).is_ok());
+    let left = match keys.is_empty() {
+        true => held.clone(),
+        false => guard_minus(held, &TileGuard::flatten_or(keys)),
+    };
+    for arm in &cells {
+        assert!(
+            matches!(arm, TileGuard::Function(FunctionGuard::Codomain(_))),
+            "the guard algebra has no difference of {held:?} and {released:?}: the arm {arm:?} \
+             is neither a guard of keys nor a codomain guard"
+        );
+        assert!(
+            left.intersect(arm).is_empty(),
+            "the guard algebra has no difference of {held:?} and {released:?} that is a region \
+             of keys: the arm {arm:?} names a region of {left:?}"
+        );
+    }
+    left
 }
 
 /// Whether `guard` is spelled of a collection's keys: a domain or a codomain guard, or an `Or` of
@@ -2825,6 +2867,107 @@ mod tests {
                 here: Box::new(keys(0, 2)),
             };
             guard_minus(&domain(Predicate::True), &domain(qualified));
+        }
+
+        /// The cells of the fields `_0` and `_1` that `first` and `second` name, beneath every key
+        /// of a stream of records.
+        fn record_cells(first: TileGuard, second: TileGuard) -> TileGuard {
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Record(
+                HashMap::from([("_0".into(), first), ("_1".into(), second)]),
+            ))))
+        }
+
+        /// A release of a key whole and of a field's cells beneath that key, which the meet of a
+        /// `FanOut`'s readers releases, leaves the keys the first arm leaves.
+        #[test]
+        fn a_release_of_cells_beneath_a_released_key_leaves_the_other_keys() {
+            let beneath_zero = Predicate::qualified(keys(0, 0), Predicate::True);
+            let released = TileGuard::Or(vec![
+                domain(keys(0, 0)),
+                record_cells(TileGuard::Scalar(Predicate::False), domain(beneath_zero)),
+            ]);
+            assert_eq!(
+                guard_minus(&domain(Predicate::True), &released),
+                domain(Predicate::True.minus(&keys(0, 0)))
+            );
+        }
+
+        /// A release of one field's cells under keys still held leaves those keys' other cells,
+        /// which a record guard beneath the keys names and a guard of keys does not.
+        #[test]
+        #[should_panic(expected = "the guard algebra has no difference")]
+        fn a_release_of_cells_of_a_held_key_has_no_difference() {
+            let released = TileGuard::Or(vec![
+                domain(keys(0, 0)),
+                record_cells(
+                    TileGuard::Scalar(Predicate::True),
+                    TileGuard::Scalar(Predicate::False),
+                ),
+            ]);
+            guard_minus(&domain(keys(0, 1)), &released);
+        }
+
+        /// A release of cells alone, not in an `Or`, beneath keys not held leaves what is held.
+        #[test]
+        fn a_release_of_cells_alone_beneath_keys_not_held_leaves_what_is_held() {
+            let beneath_zero = Predicate::qualified(keys(0, 0), Predicate::True);
+            let released = record_cells(TileGuard::Scalar(Predicate::False), domain(beneath_zero));
+            assert_eq!(
+                guard_minus(&domain(keys(1, 1)), &released),
+                domain(keys(1, 1))
+            );
+        }
+
+        /// A domain guard qualified by more enclosing levels than it steps into is no projection
+        /// and no codomain guard, so the difference names the gap.
+        #[test]
+        #[should_panic(expected = "is neither a guard of keys nor a codomain guard")]
+        fn a_release_arm_that_is_no_codomain_guard_has_no_difference() {
+            let qualified = Predicate::qualified(keys(1, 1), keys(0, 2));
+            let released = TileGuard::Or(vec![domain(keys(0, 0)), domain(qualified)]);
+            guard_minus(&domain(Predicate::True), &released);
+        }
+
+        /// `paths` beneath the keys: a guard of level 1.
+        fn beneath(paths: Predicate) -> TileGuard {
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(domain(paths))))
+        }
+
+        /// The cells of field `_0` of a stream of records two levels deep, beneath the paths
+        /// `paths` names.
+        fn first_field_beneath(paths: &TileGuard) -> TileGuard {
+            let first = TileGuard::Function(FunctionGuard::Codomain(Box::new(record_cells(
+                TileGuard::Scalar(Predicate::True),
+                TileGuard::Scalar(Predicate::False),
+            ))));
+            first.intersect(paths)
+        }
+
+        /// A held row of paths released at a path whole and at a field's cells beneath that path
+        /// holds the paths the first arm leaves.
+        #[test]
+        fn a_release_of_cells_beneath_a_released_path_leaves_the_other_paths() {
+            let path = |j| beneath(Predicate::qualified(keys(0, 0), keys(j, j)));
+            let released = TileGuard::Or(vec![path(0), first_field_beneath(&path(0))]);
+            assert_eq!(
+                guard_minus(
+                    &beneath(Predicate::qualified(keys(0, 0), keys(0, 1))),
+                    &released
+                ),
+                path(1)
+            );
+        }
+
+        /// A release of a field's cells beneath a held path leaves that path's other cells.
+        #[test]
+        #[should_panic(expected = "that is a region of keys")]
+        fn a_release_of_cells_beneath_a_held_path_has_no_difference() {
+            let path = |j| beneath(Predicate::qualified(keys(0, 0), keys(j, j)));
+            let released = TileGuard::Or(vec![path(0), first_field_beneath(&path(1))]);
+            guard_minus(
+                &beneath(Predicate::qualified(keys(0, 0), keys(0, 1))),
+                &released,
+            );
         }
     }
 }

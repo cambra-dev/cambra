@@ -864,6 +864,79 @@ fn a_nested_loop_body_reading(#[case] source: &str, #[case] expected: &str) {
     answers(source, expected, &["LoopScope", "SinkBreaker"]);
 }
 
+/// A loop nested over the rows of a list, the inner source being the outer element, so each
+/// outer position has a domain of its own.
+#[rstest_log::rstest]
+#[case::reading_the_inner_position(indoc! {"
+    out = test_sink()
+    acc := 0
+    for xs in [[1, 2], [3, 4]]:
+        for x in xs:
+            acc := acc + x
+    out << acc
+"}, "10")]
+#[case::reading_nothing(indoc! {"
+    out = test_sink()
+    acc := 0
+    for xs in [[1, 2], [3, 4]]:
+        for x in xs:
+            acc := acc + 7
+    out << acc
+"}, "28")]
+fn a_loop_nested_over_rows(#[case] source: &str, #[case] expected: &str) {
+    answers(source, expected, &["LoopScope", "SinkBreaker"]);
+}
+
+/// A condition on the inner position of a loop nested over rows is refused, and pull mode answers
+/// it. Its body selects a field of the record the inner drive renders, and the `SelectField`
+/// restates the outermost keys only (`src/interpreter/design-path-projections.md`, "Differences
+/// of nested guards").
+#[test]
+fn a_condition_in_a_loop_nested_over_rows_is_refused() {
+    let source = indoc! {"
+        out = test_sink()
+        acc := 0
+        for xs in [[1, 2], [3, 4]]:
+            for x in xs:
+                acc := acc + (x if x > 1 else 0)
+        out << acc
+    "};
+    let loaded = LoadedProgram::test(source);
+    let mut ctx = GlobalContext::default();
+    ctx.defer_sink_pulls();
+    ctx.register_test_sink("out");
+    let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    let _operators = ctx.take_operator_map();
+    let Err(refused) = run_program(&mut program, 1) else {
+        panic!("{source} is refused")
+    };
+    assert!(
+        refused.to_string().contains(
+            "SelectField in a nested loop's cycle is pulled at the keys of level 1 and restates \
+             the outermost keys only"
+        ),
+        "{refused}"
+    );
+
+    let mut ctx = GlobalContext::default();
+    let sink = ctx.register_test_sink("out");
+    let program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    assert!(
+        (0..100).any(|_| {
+            ctx.scheduler().check_for_notifications();
+            program.done.try_recv().is_ok()
+        }),
+        "{source} finishes in pull mode"
+    );
+    let written = sink.value().expect("the sink holds a value in pull mode");
+    let [binding] = written.as_function().as_slice() else {
+        panic!("{source} writes one value: {written:?}")
+    };
+    assert_eq!(binding.output, Value::Int(9));
+}
+
 /// A transaction store of one writer is the breaker of a pipeline of its own; its input is the
 /// writer's source, cut into morsels of items, and the sink reads the store once it is terminal.
 #[rstest_log::rstest]

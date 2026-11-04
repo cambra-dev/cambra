@@ -65,25 +65,9 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ("loop_source_in_loop", "map_arrow", "CompilerPanics"),
     ("loop_source_in_loop", "map_lit", "CompilerPanics"),
     ("loop_source_in_loop", "union", "CompilerRejects"),
-    // A loop nested over the rows of a list, run dispatched. A `CompilerPanics` cell panics in the
-    // guard algebra, which has no difference of a universal guard and a row's guard; a
-    // `CompilerRejects` cell is refused, since a `SelectField` in the nested loop's cycle restates
-    // the outermost keys only.
-    ("nested_mut_over_row", "arith", "CompilerPanics"),
-    ("nested_mut_over_row", "binder[x]", "CompilerPanics"),
-    ("nested_mut_over_row", "binder_arith[x]", "CompilerPanics"),
+    // A loop nested over the rows of a list whose body selects a field of the inner drive's
+    // record: refused, since `SelectField` restates the outermost keys only.
     ("nested_mut_over_row", "binder_elif[x]", "CompilerRejects"),
-    (
-        "nested_mut_over_row",
-        "binder_floordiv_left[x]",
-        "CompilerPanics",
-    ),
-    (
-        "nested_mut_over_row",
-        "binder_floordiv_right[x]",
-        "CompilerPanics",
-    ),
-    ("nested_mut_over_row", "binder_in_call[x]", "CompilerPanics"),
     (
         "nested_mut_over_row",
         "binder_in_comp[x]",
@@ -106,68 +90,14 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ),
     (
         "nested_mut_over_row",
-        "binder_literal_chain[x]",
-        "CompilerPanics",
-    ),
-    (
-        "nested_mut_over_row",
-        "binder_mul_left[x]",
-        "CompilerPanics",
-    ),
-    (
-        "nested_mut_over_row",
         "binder_partial_ternary[x]",
         "CompilerRejects",
-    ),
-    (
-        "nested_mut_over_row",
-        "binder_plus_aggregate[x]",
-        "CompilerPanics",
-    ),
-    ("nested_mut_over_row", "binder_pow[x]", "CompilerPanics"),
-    (
-        "nested_mut_over_row",
-        "binder_shared_operand[x]",
-        "CompilerPanics",
-    ),
-    (
-        "nested_mut_over_row",
-        "binder_shared_subterm[x]",
-        "CompilerPanics",
-    ),
-    (
-        "nested_mut_over_row",
-        "binder_sub_left[x]",
-        "CompilerPanics",
-    ),
-    (
-        "nested_mut_over_row",
-        "binder_sub_right[x]",
-        "CompilerPanics",
     ),
     (
         "nested_mut_over_row",
         "binder_ternary[x]",
         "CompilerRejects",
     ),
-    ("nested_mut_over_row", "call", "CompilerPanics"),
-    ("nested_mut_over_row", "comp_sum", "CompilerPanics"),
-    ("nested_mut_over_row", "filtered_sum", "CompilerPanics"),
-    ("nested_mut_over_row", "floordiv", "CompilerPanics"),
-    ("nested_mut_over_row", "generator_max", "CompilerPanics"),
-    ("nested_mut_over_row", "groupby_sum", "CompilerPanics"),
-    ("nested_mut_over_row", "int_lit", "CompilerPanics"),
-    ("nested_mut_over_row", "max_lit", "CompilerPanics"),
-    ("nested_mut_over_row", "neg", "CompilerPanics"),
-    ("nested_mut_over_row", "nested_comp_sum", "CompilerPanics"),
-    ("nested_mut_over_row", "pow", "CompilerPanics"),
-    ("nested_mut_over_row", "record_proj", "CompilerPanics"),
-    ("nested_mut_over_row", "rows_sum", "CompilerPanics"),
-    ("nested_mut_over_row", "sum_lit", "CompilerPanics"),
-    ("nested_mut_over_row", "sum_of_empty", "CompilerPanics"),
-    ("nested_mut_over_row", "ternary", "CompilerPanics"),
-    ("nested_mut_over_row", "tuple_proj", "CompilerPanics"),
-    ("nested_mut_over_row", "union_sum", "CompilerPanics"),
     (
         "nested_mut_source",
         "binder_filtered_comp[i]",
@@ -194,12 +124,8 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ("rows_comp_source", "rows_filtered", "CompilerPanics"),
     ("rows_inner_filter", "rows_filtered", "CompilerPanics"),
     ("rows_loop_feed", "rows_filtered", "CompilerRejects"),
-    // The dispatched run panics in the guard algebra, as at the `nested_mut_over_row` cells.
-    ("rows_nested_mut", "rows_comp", "CompilerPanics"),
     ("rows_nested_mut", "rows_filtered", "CompilerRejects"),
     ("rows_nested_mut", "rows_jagged", "CompilerRejects"),
-    // The dispatched run panics in the guard algebra, as at the `nested_mut_over_row` cells.
-    ("rows_nested_mut", "rows_lit", "CompilerPanics"),
     ("terminal_read", "terminal_in_agg[pool]", "CompilerRejects"),
     (
         "terminal_read_after_guard",
