@@ -397,6 +397,10 @@ struct PipelineInfo {
     /// Whether it keeps the rows it consumed and its breaker's input has not released, and reads
     /// them again where a push names them ([`keep_open_rows`](Dispatcher::keep_open_rows)).
     keeps_open: bool,
+    /// The pipelines it reads whose pushes arrive as its own keys, which no arrival names: a push
+    /// of one queues the rows it names fresh, though the pipeline takes arrivals
+    /// ([`queue_pushes_of`](Dispatcher::queue_pushes_of)).
+    pushed_rows: Vec<usize>,
 }
 
 /// What the dispatcher keeps of one pipeline across epochs.
@@ -552,6 +556,7 @@ impl Dispatcher {
                 pushes_with: pipeline,
                 arrivals: false,
                 keeps_open: false,
+                pushed_rows: Vec::new(),
             })
             .collect();
         let states = (0..count)
@@ -688,6 +693,26 @@ impl Dispatcher {
     pub fn take_arrivals(&mut self, pipeline: PipelineId) {
         self.mark_arrivals(pipeline);
         self.keep_open_rows(pipeline);
+    }
+
+    /// Have every push of `read` to `reader`, which takes arrivals and keeps open rows
+    /// ([`take_arrivals`](Self::take_arrivals)), queue the rows it names fresh: `read`'s pushes
+    /// arrive as `reader`'s own keys, as an arm of a concatenation, and no arrival names them.
+    ///
+    /// # Panics
+    ///
+    /// When `reader` does not read `read`, takes no arrivals, or keeps no open rows, where a push
+    /// queues no row fresh.
+    pub fn queue_pushes_of(&mut self, reader: PipelineId, read: PipelineId) {
+        let info = &mut self.infos[reader.0];
+        assert!(
+            info.reads.contains(&read.0) && info.arrivals && info.keeps_open,
+            "pipeline {} takes arrivals, keeps open rows, and reads pipeline {}, whose pushes it \
+             queues",
+            reader.0,
+            read.0
+        );
+        info.pushed_rows.push(read.0);
     }
 
     /// [`take_arrivals`](Self::take_arrivals) for a pipeline that takes each epoch's package only
@@ -2217,8 +2242,9 @@ impl Landing<'_> {
     /// reader that reads its input whole ([`Dispatcher::read_whole`]) takes no push, widened or
     /// not, and nor does one that follows the pipeline that pushed ([`Dispatcher::follow`]). A
     /// reader that keeps open rows ([`Dispatcher::keep_open_rows`]) reads again the open rows a
-    /// push names, widened or not; a widened push, or one to a reader that takes arrivals, queues
-    /// nothing else.
+    /// push names, widened or not. A widened push queues nothing else, and nor does one to a reader
+    /// that takes arrivals, but for a push of a pipeline whose rows arrive as the reader's own keys
+    /// ([`Dispatcher::queue_pushes_of`]), which queues the rows it names.
     ///
     /// # Panics
     ///
@@ -2252,10 +2278,11 @@ impl Landing<'_> {
             format!("pipeline {r} receives packages before it finishes")
         });
         // A widened push names every row of the reader's input, and a pipeline that takes
-        // arrivals is queued its rows as they arrive, so neither push queues a row fresh.
+        // arrivals is queued its rows as they arrive, so neither push queues a row fresh, but for
+        // the push of a pipeline whose rows arrive as the reader's own keys.
         if info.keeps_open {
             let whole: fn(&TileGuard, usize) -> Vec<TileGuard> = |guard, _| vec![guard.clone()];
-            let fresh = !self.widened && !info.arrivals;
+            let fresh = !self.widened && (!info.arrivals || info.pushed_rows.contains(&from));
             return dispatcher.land_open(epoch, r, guard, fresh.then_some(whole));
         }
         dispatcher.ensure(!self.widened, || {
