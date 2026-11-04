@@ -122,6 +122,11 @@ EXPECTED_EXCEPTIONS = [
     # guard pushes what is not in it and grows it in one step, so two threads pushing for one
     # pipeline push disjoint regions. What crosses it is a guard naming a region, never a tile.
     ("src/interpreter/dispatcher.rs", "cell of `Option<TileGuard>`"),
+    # A pipeline's open rows, every region queued for it, and its consumes in flight (`OpenRows`).
+    # Its consumes record the rows they leave open, pushes and arrivals to it read them again, and
+    # its finishes drop what its input released, on any thread. What crosses it is guards naming
+    # regions and epoch numbers, never a tile.
+    ("src/interpreter/dispatcher.rs", "cell of `OpenRows`"),
     # The lock that orders a dispatcher's seals and closes; it guards no data.
     ("src/interpreter/dispatcher.rs", "cell of `()`"),
     # The lock a dispatcher's sleeping worker waits under; it guards no data.
