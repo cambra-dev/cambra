@@ -854,25 +854,26 @@ the placement of the entry at an input, which a planner sets to that input's pip
 | `offer_impl(guard)` | Answers from the state `consume_impl` built and pulls nothing. The breaker's own `get_impl` calls it once the breaker is consuming. |
 
 An operator that consumes its input into state of its own is a breaker. One that answers pulls from
-that state is a producer; `SinkBreaker`, the breaker of a sink's pipeline, is one that is not. A
-breaker starts in the pull mode described in [The producer protocol](#the-producer-protocol) and is
-a consuming producer from its first `consume_impl`, which it stays. `final_guard` is provided over
-`held()`: it is `held()` less the guard released to the breaker, and the driver pushes the part of
-it no earlier push named, after each consume and at the epoch's `finish`. When a pipeline may finish
-an epoch is the dispatcher's to check ([The dispatcher](#the-dispatcher)). A release removes rows
-from the state and leaves the statement of the tile as it was, so the difference is taken in the
-guard algebra. `guard_minus` (`tile_operators/mod.rs`) spells it for guards of a collection's
-outermost keys, of a scalar and of an aggregation, none of them qualified by an enclosing path, and
-for a record of such guards field by field. Two guards of a collection's keys at any levels differ
-as their projections do: a release up to the path `(𝑘, 𝑗)` leaves of a held row 𝑘 its paths past 𝑗,
-which `TileGuard::closed_over` drops where the row's level is a finite range of positions with none
-past 𝑗; `final_guard` closes the difference over the producer's tiling. A state of another shape has
-no spelling, and a push after the first panics naming the gap instead of answering a smaller or
-larger region. `MapAggregate` holds a state released beneath the keys of a group, and what a release
-beneath them leaves is a region beneath the outermost keys. A reader's chain may restate only the
-outermost keys (`TileProducer::restates`), so it answers `pushes_while_consuming` with `false` and
-pushes once per epoch, at `finish`. A push beneath the outermost keys lands in each reader as a
-projection at its level ([The dispatcher](#the-dispatcher)).
+that state is a producer; `SinkBreaker`, the breaker of a sink's pipeline and of the `main`
+output's, is one that is not. A breaker starts in the pull mode described in
+[The producer protocol](#the-producer-protocol) and is a consuming producer from its first
+`consume_impl`, which it stays. `final_guard` is provided over `held()`: it is `held()` less the
+guard released to the breaker, and the driver pushes the part of it no earlier push named, after
+each consume and at the epoch's `finish`. When a pipeline may finish an epoch is the dispatcher's to
+check ([The dispatcher](#the-dispatcher)). A release removes rows from the state and leaves the
+statement of the tile as it was, so the difference is taken in the guard algebra. `guard_minus`
+(`tile_operators/mod.rs`) spells it for guards of a collection's outermost keys, of a scalar and of
+an aggregation, none of them qualified by an enclosing path, and for a record of such guards field
+by field. Two guards of a collection's keys at any levels differ as their projections do: a release
+up to the path `(𝑘, 𝑗)` leaves of a held row 𝑘 its paths past 𝑗, which `TileGuard::closed_over`
+drops where the row's level is a finite range of positions with none past 𝑗; `final_guard` closes
+the difference over the producer's tiling. A state of another shape has no spelling, and a push
+after the first panics naming the gap instead of answering a smaller or larger region.
+`MapAggregate` holds a state released beneath the keys of a group, and what a release beneath them
+leaves is a region beneath the outermost keys. A reader's chain may restate only the outermost keys
+(`TileProducer::restates`), so it answers `pushes_while_consuming` with `false` and pushes once per
+epoch, at `finish`. A push beneath the outermost keys lands in each reader as a projection at its
+level ([The dispatcher](#the-dispatcher)).
 
 ### Memo
 
@@ -911,11 +912,12 @@ under its key. An answer of a pull beneath the groups' keys states only the elem
 the folded level's statements are united too, and a group is final once they cover every element
 under its key (`Stated::settled`). The input releases a complete group whole and an open one only
 beneath its key, so a group that arrives later in a region already consumed is still the input's to
-answer. The dispatcher finishes the pipeline's epoch once its input has released every guard the
-pipeline consumed in it, so every group it holds is then final, and `MapAggregate` pushes then
-rather than after each consume. The guard it pushes is the guard of the output built from the
-accumulators, less every group whose accumulator is not terminal, less the guard released. A
-release of the output drops the accumulators it covers and forwards to the input, as in pull mode.
+answer. `MapAggregate` pushes at the pipeline's finish of an epoch rather than after each consume.
+The guard it pushes is the guard of the output built from the accumulators, less every group whose
+accumulator is not terminal, less the guard released. The dispatcher pushes each region once
+(`Pushes::push_final`), so a group still folding at one finish is pushed at the finish where it is
+final, and a reader that kept the row open reads it again then. A release of the output drops the
+accumulators it covers and forwards to the input, as in pull mode.
 
 ### Converse
 
@@ -998,7 +1000,11 @@ the store only once the store's pipeline has finished the epoch ([The dispatcher
 or, over a live source, once every epoch has run. A store's `final_guard` is `held()`. A release of
 a store with no rows above it names the positions a reader reads no more and removes nothing from
 the store tile; a nested store's offer cuts the rows its readers released ([A loop in
-rounds](#a-loop-in-rounds)). A consuming store answers a pull from its snapshot.
+rounds](#a-loop-in-rounds)). A consuming store answers a pull from its snapshot. A store placed
+in a pipeline (`ProducerBase::is_placed`) answers a pull before its first consume with the unopened
+store, which states nothing final, and steps nothing: it steps only at its pipeline's consumes, and
+a transaction store's writers decide only against a tile it published. A store no planner placed
+steps itself at a pull, as pull mode does.
 
 In pull mode an induction store releases its body whole once the body is terminal and every decision
 is stepped, and a transaction drive releases its source whole once it is done. A nested induction
@@ -1024,14 +1030,15 @@ input reads the pipelines beneath the store's cycle under that input: a subtree 
 recurrence slot of the store (`reaches_recurrence`) is planned as any chain is, and inside the cycle
 a breaker is no pipeline. A store's pipelines are ordered, since a store decides its positions in
 order. A store that steps itself runs in the run's dispatcher, and the pipeline of an input that
-reads pipelines reads the input whole. A store reads its seed by pull when it opens, at the first
-consume of any input, so every input's pipeline reads the seed's pipelines, and a push from one
-stops in front of the store (`subscribe_pulled`); an induction store runs in a loop's scope instead
+reads pipelines reads the input whole, or over a live source each delivery once those pipelines
+have finished its epoch (below). A store reads its seed by pull when it opens, at the first consume
+of any input, so every input's pipeline reads the seed's pipelines, and a push from one stops in
+front of the store (`subscribe_pulled`); an induction store runs in a loop's scope instead
 ([A loop in rounds](#a-loop-in-rounds)). A reader of a store reads every pipeline of it, so its
 queue in an epoch closes once the last of them has finished the epoch. The pipelines of one store
 share one record of what the store has pushed (`Dispatcher::share_pushes`), so no tick is pushed
 twice, and `plan_edges` plans their edges into one reader as one: a stream edge whose pushes name no
-key twice, or a build edge on each of them. The planner refuses:
+key twice, or a widened edge from each of them. The planner refuses:
 
 - outside a loop's scope, a nested store, one per enclosing row, whose frontier a flat morsel does
   not name;
@@ -1145,7 +1152,10 @@ rows from the breaker's state that another has still to read, so readers of one 
 A source pipeline, one that reads no pipeline, is queued the regions of its breaker's input that
 have arrived. `Dispatcher::notify` queues one such region in the current epoch, cut every
 `morsel_rows` positions where it names finite runs of positions (`Value::UInt` keys) and whole
-otherwise. `Dispatcher::close` says no more of the source's input arrives.
+otherwise. `Dispatcher::close` says no more of the source's input arrives. A pipeline that reads
+pipelines can also take arrivals (`Dispatcher::take_arrivals`): it is notified, sealed and closed as
+a source is, and its queue in an epoch closes once both the epoch's seal and the finishes of the
+pipelines it reads have happened ([Reading rows again](#reading-rows-again)).
 `Dispatcher::start_source` queues the input whole and closes the source: where the input's tiling
 states a finite range of positions for its outermost keys (a `UIntRange`), the dispatcher cuts it
 every `morsel_rows` positions, the last morsel open above. Any other input starts as one package at
@@ -1191,28 +1201,31 @@ at the input of each breaker the push reaches queues the region, as a guard of t
 tiling, for the breaker's pipeline in the epoch, less what is queued for that pipeline there
 already. The difference and the queue's growth are one step under the queue's lock, so a push that
 reaches a breaker along two paths, as a filter reads one memo for its values and its predicate, is
-queued once. A push an operator widens to `Everything` on its way fails the run at the reader it
-reaches (`Landing::widened` marks the path, `Landing::queue` refuses it), since the reader could not
-tell which of its keys it names: a reader reached that way reads the pushing pipeline once it has
-finished, instead of its pushes. A push that re-enters a consumer it is passing through has met a
-cycle, and fails the run too. A compiled program's dispatched run notifies no consumer: a producer
-that caches what it reads reads it again where a store steps or a live source yields more
-(`TileProducer::read_again`), and a debug build checks that no consumer is notified inside the run
-(`dispatcher::debug_assert_outside_a_run`). `notify`, its gates and `WakeupQueue` serve pull mode.
+queued once. A push an operator widens to `Everything` on its way fails the run at a reader that
+reads that pipeline's pushes (`Landing::widened` marks the path, `Landing::queue` refuses it), since
+the reader could not tell which of its keys it names: a reader reached that way reads the pushing
+pipeline once it has finished, instead of its pushes. A reader that keeps open rows reads again
+every open row such a push reaches it with ([Reading rows again](#reading-rows-again)). A push that
+re-enters a consumer it is passing through has met a cycle, and fails the run too. A compiled
+program's dispatched run notifies no consumer: a producer that caches what it reads reads it again
+where a store steps or a live source yields more (`TileProducer::read_again`), and a debug build
+checks that no consumer is notified inside the run (`dispatcher::debug_assert_outside_a_run`).
+`notify`, its gates and `WakeupQueue` serve pull mode.
 
 `dispatcher::finish_epoch` finishes a pipeline's oldest unfinished epoch. It asserts six invariants
 before it calls the breaker: the pipeline has not begun to finish the epoch, its queue there is
 closed and empty, no package claimed for it there is in flight, every pipeline it reads has finished
 the epoch, the epoch is sealed or known to be the last, and its breaker's input has released every
-guard the pipeline consumed in the epoch. The release check is closed over the input's tiling
-(`TileGuard::closed_over`): an input that released a row through the last position of its finite
-range of positions has released the row, though the difference of the two guards names the row's
-paths past that position. A source's input releases the regions queued for it; a reading
-pipeline's input releases only what the guards pushed or queued at the start for it name, and
-nothing at all when nothing was; a pipeline that reads its input whole releases all of it. A debug
-build also asserts that the morsels of a pushed guard partition it (`partition_gap`), and that a
-pipeline consumes each region once in an epoch: a guard pushed to a pipeline meets none pushed to
-it before.
+guard the pipeline consumed in the epoch. A pipeline that keeps open rows may leave rows unreleased
+until the run's last epoch ([Reading rows again](#reading-rows-again)). The release check is closed
+over the input's tiling (`TileGuard::closed_over`): an input that released a row through the last
+position of its finite range of positions has released the row, though the difference of the two
+guards names the row's paths past that position. A source's input releases the regions queued for
+it; a reading pipeline's input releases only what the guards pushed or queued at the start for it
+name, and nothing at all when nothing was; a pipeline that reads its input whole releases all of it.
+A debug build also asserts that the morsels of a pushed guard partition it (`partition_gap`), and
+that a pipeline consumes each region once in an epoch: a guard pushed to a pipeline meets none
+pushed to it before. A package of open rows read again is the one exception.
 
 The dispatcher reads a breaker's input `input` through `input_tiling` and `input_released`, the
 tiling a package's guard is a guard of and the guard the breaker has released of that input, so a
@@ -1245,20 +1258,26 @@ Each package reaches its breaker by walking the chains again, and the pushes a c
 once the walk has returned, since a breaker reached through a fan-out slot is called while the walk
 holds the fan-out its push climbs.
 
-Before the run, each edge from a pipeline to the pipeline that reads it is probed: the read
-pipeline's breaker pushes a region through its consumer into a landing that records what reaches
-each entry instead of queueing it (`Landing::probe`). The region is one key's where the breaker has
-keys of its own, and `Everything` where it holds one value. Where the region arrives as the chain
-restated it, the reader reads the pushes: a stream edge. Where an operator on the way widened it, or
-it reaches no entry, the reader takes no push along the edge and takes a package in an epoch only
-once that pipeline has finished it (`Dispatcher::build`): a build edge, as a lookup's table is. A
-reader with no stream edge reads its input whole once every pipeline it reads has finished
-(`Dispatcher::read_whole`), and so does one with two stream edges whose pushes can name one key, as
-the output's memo reads two aggregates of one binding: it would consume that key at the first push,
-before the other pipeline has decided it. A build edge is probed with `Everything` too, and so is
-each range under a reader of pushes, such as the positions of a literal arm of a concatenation. A
-constant keeps no consumer. A constant whose keys a reader consumes is one of four kinds, and none
-brings a key the ranges and the pushes do not name:
+Before the run, the planner reads each edge from a pipeline to the pipeline that reads it off the
+consumers between them (`Consumer::route`). Each consumer declares how it passes a push on without
+any region being pushed: a consumer that keeps its operator's input's keys passes the route on, a
+tagged union's arm passes it on under the arm's tag, a widening consumer marks it widened
+(`Routes::widened`), and the `Entry` of a placed breaker records its pipeline. Where every path to
+the reader's entry keeps the keys, or the pushing breaker holds one value, whose push is
+`Everything`, the reader is queued the rows the pushes name: a stream edge. Where a path widens
+them, as a lookup's table reaches its reader, a push names every row of the reader's input: a
+widened edge. Its reader keeps open rows and reads them again at the push, and takes its rows from
+its other edges and from a region queued at the start. So does a reader with two stream edges whose
+pushes can name one key, as the output's memo reads two aggregates of one binding
+([Reading rows again](#reading-rows-again)). A reader reads its input whole once every pipeline it
+reads has finished (`Dispatcher::read_whole`) where a pipeline it reads pushes along no route to
+it, or where no stream edge and no region queued at the start names a row of its input. Which region
+of the reader's input a push names comes from a probe: the read pipeline's breaker pushes
+`Everything` through its consumer into a landing that records what reaches each entry instead of
+queueing it (`Landing::probe`). A widened edge is probed so, and so is each range under a reader of
+pushes, such as the positions of a literal arm of a concatenation. A constant keeps no consumer. A
+constant whose keys a reader consumes is one of four kinds, and none brings a key the ranges and the
+pushes do not name:
 
 - a list literal's table, the function operand of a `MapResult` over the literal's positions
   (`IterateExtent`), so the positions bring every key the table would;
@@ -1270,9 +1289,7 @@ brings a key the ranges and the pushes do not name:
 `run_program` refuses, in a debug build, a constant collection beneath a reader of pushes that is
 not a function operand. What those probes bring, less everything the stream edges' pushes can
 name, is queued for the reader at the start of the run as one region
-(`Dispatcher::queue_for`), which the reader takes once its build edges' pipelines have
-finished. A build edge whose `Everything` probe reaches no entry names no region to queue, and its
-reader reads its input whole.
+(`Dispatcher::queue_for`).
 
 Each sink is the breaker of a pipeline of its own (`SinkBreaker`), planned after the pipelines its
 producer's chain reads and read by no pipeline. The walk places the sink's `SinkConsumer` in that
@@ -1292,9 +1309,23 @@ has. The pull closes its answer's outermost statement over the producer's tiling
 sites is, states each arm complete on its own, and only the closed statement reads as terminal.
 
 A `main` output's producer is the driver's to pull. The run takes it into a slot and makes it the
-root of a sink's pipeline whose `DataSink` merges what it is handed (`Collected`); no push reaches
-the driver's consumer, so that pipeline reads its input whole. The run answers the `main`
-output's merged tile (`Run::main`) and hands the producer back; a program has at most one.
+root of a sink's pipeline, and hands the producer back after; a program has at most one. The compile
+subscribes the producer to the driver's consumer behind an unplaced `Entry`
+(`CompiledOutput::main_entry`), which the walk places in that pipeline as it places a sink's
+`SinkConsumer`. A push that climbs to the `main` output therefore queues a guard of the producer's
+tiling there, and the pipeline plans its edges and its live sources as a sink's does: a map over a
+live source at the `main` output is notified of each delivery's keys. The pipeline's `SinkBreaker`
+(`SinkBreaker::per_epoch`) hands the `DataSink` the caller passes `run_program_into` one answer per
+epoch, at the pipeline's finish of it: the answers of the epoch's packages merged with a pull of the
+producer at the universal guard. That pull states what the producer states complete and adds no key,
+since the epoch's packages consumed all the producer holds. Where the output reads a loop's scope,
+whose store pushes once it is terminal, the pull also answers the rows the loop's rounds have
+written, each final as it is written (`SinkBreaker::reads_a_loop`). The answer is the one a pull in
+pull mode makes once the epoch's arrivals have reached it. The pipeline is ordered
+(`Dispatcher::order`), so it consumes an epoch's packages after its finish of the epoch before. The
+run's last finish answers a terminal tile, as pull mode's last pull does. `run_program` passes a
+`DataSink` that merges the answers (`Collected`) and answers the merged tile (`Run::main`). The
+driver holds the producer, released whole, once the run returns.
 
 The run pulls only the breakers' inputs. The program is compiled with
 `GlobalContext::defer_sink_pulls`, which leaves out the pull each sink takes once subscribed, and
@@ -1302,8 +1333,11 @@ The run pulls only the breakers' inputs. The program is compiled with
 a `Refused` error that names the shape, and pull mode runs every refused program:
 
 - a program compiled with its sinks pulled;
-- a live source whose arrivals reach no pipeline's entry, reach one as a region that is no
-  projection of its keys, or reach a pipeline that also reads pushes (below);
+- a live source whose arrivals reach no pipeline's entry or reach one as a region that is no
+  projection of its keys (below);
+- a pipeline notified of a live source's arrivals beside a range no live source yields, or beside a
+  pipeline it reads whose pushes arrive as its own keys, since no arrival names those rows, or whose
+  pushes reach it nowhere, since no push would name a row waiting on it;
 - a pipeline read directly by a pipeline another pipeline reads;
 - a breaker with no consuming mode (`Breaker::no_consuming_mode`): a transaction store of several
   writers whose sources' positions are not `UInt` positions;
@@ -1316,22 +1350,34 @@ A range over a live source's domain (`TileProducer::data_sources`, an `IterateEx
 in the run's dispatcher is live (`Planned::live`), and the run notifies it of what the source yields
 in one of four ways (`LivePipeline::poll`):
 
-- A push of one of the range's keys through the range's consumer reaches the pipeline's entry
-  restated, as a projection of the input's keys at any level, as a `Converse` restates its input's
-  keys one level in: the pipeline is notified of the keys each delivery adds, as the region a push
-  of them brings its entry.
-- The push reaches the entry widened, as a feed `out << 𝑒` widens its source's keys, which sit
-  beneath the sink's one row: the pipeline reads its input whole once every live source under it
-  yields everything (`Planned::whole`). The widened pushes of several ranges, as of a sink fed from
+- Every route from the range's consumer to the pipeline's entry keeps the range's keys
+  (`Consumer::route`), and a push of one key reaches the entry as a projection of the input's keys
+  at any level, as a `Converse` restates its input's keys one level in: the pipeline is notified of
+  the keys each delivery adds, as the region a push of them brings its entry.
+- A route widens the keys, as a feed `out << 𝑒` widens its source's keys, which sit beneath the
+  sink's one row: the pipeline reads its input whole once every live source under it yields
+  everything (`Planned::whole`). The widened pushes of several ranges, as of a sink fed from
   two sites, name their parts of the input together.
 - The range is read inside a loop's scope, whose pipeline stands for every pipeline inside it
-  (`Planner::members`). Where the push reaches the scope's own drive, the scope is notified of each
-  delivery's keys as positions of its rounds. Where it reaches no drive of the scope, the source is
+  (`Planner::members`). Where the range's routes reach the scope's own drive keeping its keys, and
+  a push of one key reaches the drive as that key, the scope is notified of each delivery's keys as
+  positions of its rounds. Where it reaches no drive of the scope, the source is
   read inside a loop nested in it, whose rows end only once the source yields everything, so the
   scope reads its input whole then, as pull mode waits for each row.
 - The range is read under a writer of a transaction store, whose source is the input of the
   writer's pipeline, read behind an entry no planner places: that pipeline is notified of each
   delivery's keys as its items.
+
+A scope or a store that also reads pipelines takes each delivery once those pipelines have
+finished the epoch (`Dispatcher::take_arrivals_after_reads`, `Dispatcher::follow`), and keeps no
+open rows. A pipeline that reads a live source, reads its input whole (`Dispatcher::read_whole`), or
+reads such a pipeline is final only in the run's last epoch. A scope or a store that reads one is
+notified of its whole input once every live source of the run yields everything (`Notifies::Whole`,
+`LivePipeline::waits`): its rounds and steps pull what it reads, which an earlier epoch leaves
+partial. A static pipeline read whole is in that set, so a loop or a transaction over a live source
+that reads one, such as the final value of a transaction store over a list, takes no delivery until
+every live source yields everything, and over a source that never yields everything it never
+steps.
 
 A drive and a transaction store decide positions in order, and a debug build checks that a delivery
 adds positions after every one before it. A dispatched run delivers no notification: a loop's scope
@@ -1340,10 +1386,10 @@ transaction store has its writer's drive read its source again (`Breaker::read_s
 package of positions the drive emits none of, such as the delivery that completes a source or one of
 keys a filter on its source drops, runs no round of a position; the scope runs a closing round at
 the package, queued to every inner pipeline but the sources in the store's chain, which has them
-read what the drive read past, and the store's step releases the package. A reader of a pipeline
-takes no package a source's arrival names, so the planner refuses a pipeline that reads both. A
-pipeline with a live source beneath it finishes epochs before its input is whole, so a reader with a
-build edge on it reads its input whole once every epoch has run (`Dispatcher::read_whole`).
+read what the drive read past, and the store's step releases the package. A pipeline other than a
+store or a loop's scope whose chain reads a live source and a pipeline takes the source's arrivals
+beside the pushes of the pipelines it reads, and keeps open rows
+([Reading rows again](#reading-rows-again)).
 
 The run starts the other sources whole and then polls: each pass asks every live source for new data
 (`DataSourceDomainExtentImpl::check_for_new_data`), notifies each live pipeline of the keys its
@@ -1357,13 +1403,85 @@ keys, whose arrivals no region of one source's positions spells.
 
 The binary runs a program dispatched where `CAMBRA_DISPATCH` is set to anything but `0` or the empty
 string, and neither `--inspect` nor `--control` is given, at morsels of `CAMBRA_MORSEL_ROWS` rows
-(1024 unset; a value that is no positive count panics). It prints the `main` output's value once. A
-refused program runs in pull mode after a note on stderr, in the context the dispatched run compiled
-it in: the compile has opened its sources and sinks, a port bound or stdin taken, which a second
-compile could not open again.
+(1024 unset; a value that is no positive count panics). It prints each epoch's answer of the `main`
+output where the answer holds a key or a value or is terminal, as pull mode prints each pull's
+answer: a collection cut into several morsels prints once, and a map over stdin prints each line's
+answer as the line arrives. A refused program runs in pull mode after a note on stderr, in the
+context the dispatched run compiled it in: the compile has opened its sources and sinks, a port
+bound or stdin taken, which a second compile could not open again.
 
 Every program of the differential suite (`tests/it/differential_interp.rs`) runs dispatched too, at
 morsels of one row and of every row, and answers what pull mode answers, or the planner refuses it.
+
+#### Reading rows again
+
+A pipeline keeps open rows (`Dispatcher::keep_open_rows`) where its chain can answer nothing for a
+row it consumes. An operator that reads a sibling input does not answer a row from that input before
+it is final: `MapResultToConst` answers no row while its scalar constant is not terminal
+(`empty_beneath_live_rows`), a binop combines only the positions both operands hold, `CheckedLookup`
+answers a missing key only once its table is terminal, a `VariantWrap` emits a collection payload
+only once it is whole, and `ExtractFinal` answers once its source is terminal. The answer names
+nothing of such a row, so the breaker's input does not release it, and the row is open: consumed,
+and not released by the input.
+
+Each consume of a pipeline that keeps open rows records the rows of its package that the breaker's
+input has not released after the consume (`Dispatcher::end_read`, `OpenRows`), each whole at the
+outermost keys (`whole_rows`). A push or an arrival to the pipeline queues, in its own epoch, the
+open rows its region names any part of as one package read again, and those rows leave the record. A
+push widened on its way names the whole input. A push that is not widened, to a pipeline that takes
+no arrivals, also queues fresh what of its region no queue of the pipeline held before, in any epoch
+(`OpenRows::queued`), so a key two stream edges name is queued fresh once. A pipeline that takes
+arrivals is queued fresh only its arrivals, since a push can name rows that have not arrived. A
+package read again consumes only its rows the input has not released (`consume_with`). Each finish
+removes from the record what the input has released (`settle_open_rows`), and at the run's last
+epoch a row still open fails the run. The pipeline finishes its epochs in order
+(`Dispatcher::ready`).
+
+A consume records itself in flight before its breaker consumes (`Dispatcher::begin_read`). A push
+lands after its pipeline decided the region it names, so a consume that begins after the push reads
+that region final. A push that names the package of a consume in flight holds the pipeline's queue
+in the push's epoch open, as one more event its close waits for (`EpochPipeline::unfinished`). The
+consume's end queues there, as a package read again, what the push named of the rows the consume
+left open, and then ends the hold.
+
+The planner keeps open rows in a pipeline of the run's dispatcher in three cases (`plan_edges`):
+
+- Its chain reads a live source and other pipelines (`Dispatcher::take_arrivals`). It takes the
+  source's arrivals, and its queue in an epoch counts the seal as one more event. It is queued no
+  start region and reads nothing whole.
+- A route from a pipeline it reads widens that pipeline's keys, so the pipeline's push names every
+  row of its input, as the group-by's memo reads its input's memo.
+- Two of its stream edges can push one key, as `sum([x * n for x in xs])` reads the list's memo and
+  `n`'s sum. A key consumed at the first push before the other pipeline decided it is read again at
+  the other's push.
+
+No reader waits for a pipeline it reads in the run's dispatcher: a row it consumes before that
+pipeline is final for the row is read again at the pipeline's push. A loop's scope keeps no open
+rows, since a round consumes its inner pipelines' packages in order and runs once. Its planner
+reads whole, in pull mode, a pipeline that would keep them ([A loop in rounds](#a-loop-in-rounds)),
+and orders two edges by the round instead (`Dispatcher::follow`): a nested loop's scope takes a
+round's row only once the pipelines its rounds pull have finished the round, and a reader of a
+nested loop's scope, which pushes its store only once it is terminal, takes its packages only once
+that scope has finished the round.
+
+A row is open whole at its outermost keys, since every chain can be pulled there and a row beneath
+them is no region every chain restates: `MapResultToConst` refuses a pull beneath the keys it
+restates (`TileProducer::restates`). A consume leaves open the whole rows of what of its package its
+input has not released (`rows_left_open`), where a key counts as released only where a release names
+it whole, not where it names cells beneath the key (`keys_released_whole`). A push reads again every
+open row it names any part of (`TileGuard::touched_keys`), and a row leaves the record once its
+input releases it whole by that rule. The breaker merges no part of a row twice: its input releases
+every key an answer holds a scalar under (`Tile::to_guard`), and a pull answers nothing its input
+released (`TileProducer::get`).
+
+A pull beneath a path over a live source's domain states the source's positions complete only
+through those it delivered, not past its last once it is complete, so a reader of a push beneath its
+outermost keys does not release those positions.
+
+`[x for x in source1() if sum([1, 2, 3]) > 5]` at `main` takes each delivery's rows as they arrive,
+and a row consumed before the sum is final is read again at the sum's push. With `sum(source1())` in
+its place, the rows of every delivery but the last are open until the last epoch, whose push of the
+sum reads them again.
 
 #### A loop in rounds
 
@@ -1466,17 +1584,22 @@ A pipeline moves through an epoch in three steps. Its queue there is open while 
 a source's notifies, and the pushes of the pipelines it reads, which land as those pipelines consume
 and at their finishes. The queue closes at the epoch's seal or the source's close, for a source, and
 at the finish of the last of the pipelines it reads, for a reader, which a count of the pipelines it
-reads that have not finished the epoch tells. A reader takes a package in an epoch only once every
-pipeline it builds on (`Dispatcher::build`) has finished the epoch, and takes no push of theirs. A
-claim hands out the pipeline's finish of the epoch (`Next::Finish`) once the queue is closed, every
-package in it acknowledged, and the epoch sealed or known to be the last; a compare and exchange of
-the pipeline's phase in the epoch picks one claim. The finish pushes what the epoch decided and no
-consume pushed into the queues of the pipelines that read it for the epoch, and closes the queue of
-each whose last pipeline read to finish it is this one.
-A pipeline's epochs run in parallel and finish in any order, except that its last epoch finishes
-after every earlier one, since the breaker's `finish` there, with `last` set, is its last call. An
-ordered pipeline runs its epochs one after another: it has at most one package in flight, takes it
-from the oldest epoch it has not finished, and finishes each epoch after the one before.
+reads that have not finished the epoch tells. A pipeline that takes arrivals beside the pipelines it
+reads counts the seal or its close as one more event, and one that keeps open rows counts each
+consume in flight that a push in the epoch named ([Reading rows again](#reading-rows-again)). In a
+loop's scope a reader takes a package in a round only once every pipeline it follows
+(`Dispatcher::follow`) has finished the round, and takes no push of theirs
+([A loop in rounds](#a-loop-in-rounds)). A claim hands out the pipeline's finish of the
+epoch (`Next::Finish`) once the queue is closed, every package in it acknowledged, and the epoch
+sealed or known to be the last; a compare and exchange of the pipeline's phase in the epoch picks
+one claim. The finish pushes what the epoch decided and no consume pushed into the queues of the
+pipelines that read it for the epoch, and closes the queue of each whose last pipeline read to
+finish it is this one. A pipeline's epochs run in parallel and finish in any order, except that its
+last epoch finishes after every earlier one, since the breaker's `finish` there, with `last` set, is
+its last call. An ordered pipeline runs its epochs one after another: it has at most one package in
+flight, takes it from the oldest epoch it has not finished, and finishes each epoch after the one
+before. A pipeline that keeps open rows finishes each epoch after the one before too, and claims
+from several epochs at once.
 
 #### Claiming from several threads
 
@@ -1498,11 +1621,12 @@ to claim, and `acknowledged`, how many packages have been acknowledged. Each pip
 each epoch (running, finishing, finished), a failure flag and the generation, the count of changes a
 waiting worker waits on, are atomics too. A worker takes a lock only to sleep while there is nothing
 to claim, and a change that can end a sleep takes it to wake the sleepers, only while there are
-some. A seal and a close take a lock that orders them, since both move the current epoch or close a
-source's queues. The graph, the morsel size, the window, the limits and the ordered pipelines are
-fixed before the dispatcher is shared, since the methods that set them take `&mut self`; every other
-method takes `&self`. The breakers are `Rc<RefCell<…>>`, which is not `Send`. `run` claims on the
-calling thread, and no driver claims from several threads.
+some. A pipeline that keeps open rows takes the lock on its `OpenRows` at its finish, at a push to
+it and at the close of its queue. A seal and a close take a lock that orders them, since both move
+the current epoch or close a source's queues. The graph, the morsel size, the window, the limits and
+the ordered pipelines are fixed before the dispatcher is shared, since the methods that set them
+take `&mut self`; every other method takes `&self`. The breakers are `Rc<RefCell<…>>`, which is not
+`Send`. `run` claims on the calling thread, and no driver claims from several threads.
 
 A worker asks `Dispatcher::try_claim` what to do next, and the answer (`Next`) is one of five:
 

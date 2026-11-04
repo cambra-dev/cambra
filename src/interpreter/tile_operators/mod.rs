@@ -455,6 +455,9 @@ impl Consumer for FlaggingConsumer {
     ) {
         self.downstream.push(region, landing);
     }
+    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
+        self.downstream.route(routes);
+    }
 }
 
 /// The regions an input has notified since they were last taken.
@@ -519,6 +522,9 @@ impl Consumer for RecordingConsumer {
         landing: &mut crate::interpreter::dispatcher::Landing<'_>,
     ) {
         self.downstream.push(region, landing);
+    }
+    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
+        self.downstream.route(routes);
     }
 }
 
@@ -980,6 +986,14 @@ impl ProducerBase {
         self.downstream = Some(downstream);
         self.placement = Some(placement);
         self
+    }
+
+    /// Whether a planner has placed this pipeline breaker in a pipeline of a dispatched run
+    /// (`dispatcher::run_program`): its entry's placement names one. A refused run unplaces it.
+    pub(crate) fn is_placed(&self) -> bool {
+        self.placement
+            .as_ref()
+            .is_some_and(|placement| placement.get().is_some())
     }
 
     /// This producer has no input, and a planner pushes its region through `consumer`, the one it
@@ -1981,6 +1995,12 @@ pub(crate) mod test_helpers {
                 crate::interpreter::Consumer::push(entry, region, landing);
             }
         }
+
+        fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
+            for entry in &mut self.0 {
+                crate::interpreter::Consumer::route(entry, routes);
+            }
+        }
     }
 
     /// The projection guard naming the keys `[first, last]` of the outermost collection.
@@ -2159,6 +2179,18 @@ pub(crate) mod test_helpers {
                 pulled,
                 released,
             )
+        }
+
+        /// A spy that answers what the returned cell holds, which a test rewrites between pulls to
+        /// grow the input.
+        pub(crate) fn scripted(
+            tile: Tile,
+            tiling: Tiling,
+        ) -> (Self, std::rc::Rc<std::cell::RefCell<Tile>>) {
+            let (mut spy, _, _) = Self::new(tile.clone(), tiling);
+            let cell = std::rc::Rc::new(std::cell::RefCell::new(tile));
+            spy.script = Some(cell.clone());
+            (spy, cell)
         }
     }
 

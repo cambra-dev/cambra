@@ -21,7 +21,7 @@ use crate::interpreter::{
     tile_operators::TileProducer,
 };
 use crate::interpreter::{
-    dispatcher::{Landing, PipelineId, pushed_guard},
+    dispatcher::{Landing, PipelineId, Routes, pushed_guard},
     tile_operators::Tiling,
 };
 
@@ -204,6 +204,11 @@ impl Consumer for SinkConsumer {
             && let Some(guard) = pushed_guard(region, input)
         {
             landing.queue(*pipeline, &guard);
+        }
+    }
+    fn route(&mut self, routes: &mut Routes) {
+        if let Some((pipeline, _)) = &self.placed {
+            routes.reach(*pipeline);
         }
     }
 }
