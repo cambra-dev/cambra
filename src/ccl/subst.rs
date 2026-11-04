@@ -615,6 +615,25 @@ impl Subst {
         out
     }
 
+    /// This substitution extended by discharging each of a sum's `binders`, outermost first,
+    /// to its projection `σᵢ(term)`: the sum read through `term`. See
+    /// `src/ccl/design/type-inference.md`, "An elimination reads a sum through a term".
+    pub fn discharged_through(
+        mut self,
+        binders: &[crate::ccl::ty::Witness],
+        term: &Rc<TypedExpr>,
+    ) -> Subst {
+        for (i, w) in binders.iter().enumerate() {
+            self.witnesses.insert(
+                *w.id(),
+                WitnessMapping::Discharge(Type::WitnessProjection(
+                    crate::ccl::ty::WitnessProjection::new(Rc::clone(term), i),
+                )),
+            );
+        }
+        self
+    }
+
     /// The discharge `[binder ↦ candidate]` alone.
     pub fn discharge_witness(binder: &crate::ccl::ty::WitnessId, candidate: &Type) -> Subst {
         Subst::id().extended_witness_discharge(binder, candidate)
@@ -2603,18 +2622,7 @@ impl Subst {
             Type::Fun {
                 fun_kind: FunKind::Data(Some(ws)),
                 ..
-            } => {
-                let mut discharging = rest;
-                for (i, w) in ws.iter().enumerate() {
-                    discharging.witnesses.insert(
-                        *w.id(),
-                        WitnessMapping::Discharge(Type::WitnessProjection(
-                            crate::ccl::ty::WitnessProjection::new(Rc::clone(c), i),
-                        )),
-                    );
-                }
-                discharging.apply_type_inner(ty)
-            }
+            } => rest.discharged_through(ws, c).apply_type_inner(ty),
             Type::Fun {
                 fun_kind: FunKind::Var(k),
                 ..

@@ -1285,15 +1285,7 @@ fn eliminate_at(ty: &Type, s: &Subst) -> Option<(Type, Subst)> {
             codomain,
         } => {
             let parts = match fun_kind {
-                FunKind::Data(Some(ws)) => ws.iter().enumerate().fold(rest, |acc, (i, w)| {
-                    acc.extended_witness_discharge(
-                        w.id(),
-                        &Type::WitnessProjection(crate::ccl::ty::WitnessProjection::new(
-                            Rc::clone(&term),
-                            i,
-                        )),
-                    )
-                }),
+                FunKind::Data(Some(ws)) => rest.discharged_through(ws, &term),
                 FunKind::Var(k) => Subst::then(&rest, &Subst::kind_elim(k, &term)),
                 // Nothing to eliminate: the sum over no binders, or not a collection.
                 FunKind::Data(None) | FunKind::Compute => return Some((ty.clone(), rest)),
