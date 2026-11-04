@@ -347,36 +347,40 @@ fn a_reader_of_two_pipelines_consumes_both_and_finishes_after_both() {
     );
 }
 
-/// A reader that parks takes a row only once every pipeline it reads has decided it, and once:
-/// here pipeline 2 reads 0 and 1, each pushing every key as it consumes it, and consumes the
-/// rows once after both.
+/// A reader takes no push of a pipeline it follows, and no package before that pipeline has
+/// finished the epoch: here pipeline 2 follows 1 and takes 0's pushes.
 #[test]
-fn a_parked_reader_takes_each_row_once_every_pipeline_it_reads_decided_it() {
-    let all = ints().universal_guard();
+fn a_reader_takes_nothing_before_the_pipeline_it_follows_finishes() {
+    let (low, high) = halves();
     let breakers: Vec<BreakerHandle> = vec![
-        Scripted::holding(all.clone()),
-        Scripted::holding(all.clone()),
-        Scripted::holding(all.clone()),
+        Scripted::holding(low.clone()),
+        Scripted::holding(high),
+        Scripted::holding(ints().universal_guard()),
     ];
     let reads = vec![vec![], vec![], vec![0, 1]];
     wire(&reads, &breakers);
     let mut dispatcher = Dispatcher::new(reads, UNBOUNDED);
-    dispatcher.park(PipelineId(2));
+    dispatcher.follow(PipelineId(2), PipelineId(1));
     run(&dispatcher, &breakers);
     let events = dispatcher.into_events();
-    let consumed = |pipeline: usize| {
-        events
-            .iter()
-            .position(
-                |event| matches!(event, Event::Consume { pipeline: p, .. } if p.0 == pipeline),
+    let first = events
+        .iter()
+        .position(|event| {
+            matches!(
+                event,
+                Event::Consume {
+                    pipeline: PipelineId(2),
+                    ..
+                }
             )
-            .expect("each pipeline consumes")
-    };
-    assert!(
-        consumed(0) < consumed(2) && consumed(1) < consumed(2),
-        "{events:?}"
-    );
-    assert_eq!(consumed_by(&events, 2), vec![all]);
+        })
+        .expect("pipeline 2 consumes");
+    let built = events
+        .iter()
+        .position(|event| *event == finished(1))
+        .expect("pipeline 1 finishes");
+    assert!(built < first, "{events:?}");
+    assert_eq!(consumed_by(&events, 2), vec![low]);
 }
 
 /// The driver consumes the lowest pipeline's package first and finishes only when nothing is
@@ -1330,7 +1334,7 @@ fn a_source_notified_after_its_close_is_refused() {
 
 /// A pipeline that reads another is queued what that one pushes, not notified.
 #[test]
-#[should_panic(expected = "pipeline 1 is queued its input only as a source")]
+#[should_panic(expected = "pipeline 1 is queued arrivals only as a source")]
 fn a_reader_notified_is_refused() {
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], 2);
     dispatcher.notify(PipelineId(1), &keys_between(0, 1));
@@ -1744,6 +1748,10 @@ impl Consumer for Boxed {
     ) {
         self.0.push(region, landing);
     }
+
+    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
+        self.0.route(routes);
+    }
 }
 
 /// The entry of pipeline 1 behind a gated consumer, as an operator between two breakers shares
@@ -1885,6 +1893,126 @@ impl Consumer for Paths {
             path.push(region, landing);
         }
     }
+
+    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
+        for path in &mut self.0 {
+            path.route(routes);
+        }
+    }
+}
+
+/// A route declares, per path, whether the consumers on it keep the pushing pipeline's keys: a
+/// path through a widening consumer reaches the entry widened, and one through a consumer that
+/// keeps keys reaches it with them kept. Nothing is pushed.
+#[test]
+fn a_route_declares_whether_each_path_keeps_its_keys() {
+    let (_gate, shared) = gated_entry(&ints());
+    let wakeups = WakeupQueue::default();
+    let mut paths = Paths(vec![
+        forwarding_consumer(&shared, &wakeups),
+        forwarding_consumer_keeping_keys(&shared, &wakeups),
+    ]);
+    let mut routes = crate::interpreter::dispatcher::Routes::new();
+    paths.route(&mut routes);
+    let reached: Vec<_> = routes
+        .reached()
+        .into_iter()
+        .map(|route| (route.pipeline, route.keeps_keys))
+        .collect();
+    assert_eq!(reached, [(PipelineId(1), false), (PipelineId(1), true)]);
+}
+
+/// A route declares, per path, whether its decided region names only part of what a row depends
+/// on: a widening path's does, and so does a lookup operand's, which names rows by the key they
+/// read whatever their input holds. A path that keeps its keys does not, and neither does an
+/// outermost `Uncurry`'s, which widens a change but restates a decided region exactly.
+#[test]
+fn a_route_declares_whether_each_path_decides_part_of_a_row() {
+    let (_gate, shared) = gated_entry(&ints());
+    let wakeups = WakeupQueue::default();
+    let mut paths = Paths(vec![
+        forwarding_consumer(&shared, &wakeups),
+        forwarding_consumer_keeping_keys(&shared, &wakeups),
+        crate::interpreter::scheduler::widening_restating_decided(
+            |region| region.clone(),
+            forwarding_consumer_keeping_keys(&shared, &wakeups),
+        ),
+        crate::interpreter::scheduler::restating_lookup(
+            Box::new(|region| region.clone()),
+            forwarding_consumer_keeping_keys(&shared, &wakeups),
+        ),
+    ]);
+    let mut routes = crate::interpreter::dispatcher::Routes::new();
+    paths.route(&mut routes);
+    let parts: Vec<_> = routes
+        .reached()
+        .into_iter()
+        .map(|route| route.decides_part)
+        .collect();
+    assert_eq!(parts, [true, false, false, true]);
+}
+
+/// A read that reaches its reader along a path that drops a decided region and one that keeps it
+/// decides the reader's input only once it is whole: a row reached along both depends on rows the
+/// region does not name. Its decided push of some keys records nothing, where the same push of a
+/// read with no such mark records those keys.
+#[cfg(debug_assertions)]
+#[test]
+fn a_read_decided_only_whole_records_no_part() {
+    use crate::interpreter::dispatcher::Decided;
+    let recorded = |whole_only: bool| {
+        let scripted = Scripted::holding(keys_between(0, 1));
+        let (_gate, shared) = gated_entry(&ints());
+        let wakeups = WakeupQueue::default();
+        let paths = vec![
+            forwarding_consumer(&shared, &wakeups),
+            forwarding_consumer_keeping_keys(&shared, &wakeups),
+        ];
+        scripted
+            .borrow_mut()
+            .base_mut()
+            .pushing_to(Rc::new(RefCell::new(Paths(paths))));
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+        dispatcher.park(PipelineId(1));
+        if whole_only {
+            dispatcher.decides_whole_only(PipelineId(1), PipelineId(0));
+        }
+        dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+            scripted.borrow_mut().finish(pushes, false)
+        });
+        dispatcher.decided_of(PipelineId(1), PipelineId(0))
+    };
+    assert!(matches!(recorded(true), Decided::Nothing));
+    assert!(matches!(recorded(false), Decided::Region(_)));
+}
+
+/// A read decided only whole still records its whole push: once the pipeline it reads has decided
+/// everything, each path's region is decided, whatever it was restated to on the way.
+#[cfg(debug_assertions)]
+#[test]
+fn a_read_decided_only_whole_records_its_whole_push() {
+    use crate::interpreter::dispatcher::Decided;
+    let scripted = Scripted::holding(ints().universal_guard());
+    let (_gate, shared) = gated_entry(&ints());
+    let wakeups = WakeupQueue::default();
+    let paths = vec![
+        forwarding_consumer(&shared, &wakeups),
+        forwarding_consumer_keeping_keys(&shared, &wakeups),
+    ];
+    scripted
+        .borrow_mut()
+        .base_mut()
+        .pushing_to(Rc::new(RefCell::new(Paths(paths))));
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    dispatcher.park(PipelineId(1));
+    dispatcher.decides_whole_only(PipelineId(1), PipelineId(0));
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        scripted.borrow_mut().finish(pushes, true)
+    });
+    assert!(matches!(
+        dispatcher.decided_of(PipelineId(1), PipelineId(0)),
+        Decided::Whole
+    ));
 }
 
 /// A push widened to `Everything` on its way fails the run, since the reader could not tell which
@@ -2007,31 +2135,12 @@ impl Consumer for Through {
             .expect("the operator was subscribed")
             .push(region, landing);
     }
-}
 
-/// A finish lands the region its breaker has decided beside its push, restated by the chain as the
-/// push is: the reader records it as decided by the pushing pipeline, and a region of every key as
-/// the whole.
-#[test]
-fn a_finish_records_what_its_breaker_decided_at_each_reader() {
-    use crate::interpreter::dispatcher::Decided;
-    let decided = |held: TileGuard| {
-        let scripted = Scripted::holding(held);
-        let (_gate, shared) = gated_entry(&ints());
-        let path = forwarding_consumer_keeping_keys(&shared, &WakeupQueue::default());
-        scripted
+    fn route(&mut self, routes: &mut crate::interpreter::dispatcher::Routes) {
+        self.0
             .borrow_mut()
-            .base_mut()
-            .pushing_to(Rc::new(RefCell::new(Boxed(path))));
-        let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-        dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-            scripted.borrow_mut().finish(pushes, true)
-        });
-        dispatcher.decided_of(PipelineId(1), PipelineId(0))
-    };
-    assert!(matches!(
-        decided(keys_between(0, 1)),
-        Decided::Region(region) if region == keys_between(0, 1)
-    ));
-    assert!(matches!(decided(ints().universal_guard()), Decided::Whole));
+            .as_mut()
+            .expect("the operator was subscribed")
+            .route(routes);
+    }
 }

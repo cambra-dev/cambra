@@ -32,7 +32,7 @@ use crate::interpreter::{
 mod loop_scope;
 mod plan;
 
-pub use plan::{Planned, Refused, Run, run_program, run_program_polling};
+pub use plan::{Planned, Refused, Run, run_program, run_program_into, run_program_polling};
 
 /// A pipeline, by its index in the [`Dispatcher`].
 #[derive(Clone, Copy)]
@@ -216,10 +216,7 @@ impl Queue {
                         .is_none_or(|region| region.intersect(morsel).is_empty()),
                     "pipeline {pipeline} consumes each region once: {morsel:?} meets {region:?}"
                 );
-                *region = Some(match region.take() {
-                    None => morsel.clone(),
-                    Some(region) => region.union(morsel),
-                });
+                grow(&mut region, morsel);
             }
         }
         for (index, morsel) in (first..).zip(morsels) {
@@ -248,10 +245,7 @@ impl Queue {
         let Some(index) = self.reserve(1) else {
             return false;
         };
-        *region = Some(match region.take() {
-            None => fresh.clone(),
-            Some(region) => region.union(&fresh),
-        });
+        grow(&mut region, &fresh);
         drop(region);
         self.write(index, fresh);
         true
@@ -320,8 +314,9 @@ struct EpochPipeline {
     /// How many of the pipeline's packages in the epoch have been acknowledged.
     acknowledged: AtomicUsize,
     phase: AtomicPhase,
-    /// How many of the pipelines it reads have not finished the epoch. The finish that brings it
-    /// to zero closes the queue.
+    /// How many of the pipelines it reads have not finished the epoch, plus one for the seal of
+    /// the epoch where it takes arrivals and reads pipelines
+    /// ([`Dispatcher::take_arrivals`]). Whichever brings it to zero closes the queue.
     unfinished: AtomicUsize,
 }
 
@@ -347,7 +342,7 @@ impl EpochState {
                     claimed: AtomicUsize::new(0),
                     acknowledged: AtomicUsize::new(0),
                     phase: AtomicPhase::new(Phase::Running),
-                    unfinished: AtomicUsize::new(info.reads.len()),
+                    unfinished: AtomicUsize::new(info.reads.len() + usize::from(info.arrivals)),
                 })
                 .collect(),
             unfinished: AtomicUsize::new(infos.len()),
@@ -366,19 +361,12 @@ struct PipelineInfo {
     /// Whether it consumes its morsels in queue order one at a time
     /// ([`order`](Dispatcher::order)).
     ordered: bool,
-    /// Where it reads its breaker's input whole rather than what the pipelines it reads push
-    /// ([`read_whole`](Dispatcher::read_whole)), that input's morsels.
-    whole: Option<Vec<TileGuard>>,
+    /// Whether it reads its breaker's input whole rather than what the pipelines it reads push
+    /// ([`read_whole`](Dispatcher::read_whole)).
+    whole: bool,
     /// The pipelines it reads that it takes no push from, and whose finish of an epoch it waits
     /// for before it takes a package there ([`follow`](Dispatcher::follow)).
     follows: Vec<usize>,
-    /// Whether it parks the rows pushes bring until the pipelines it reads have decided them
-    /// ([`park`](Dispatcher::park)).
-    parks: bool,
-    /// Per pipeline it reads, in the order of its `reads`, the region of its input that
-    /// pipeline's pushes reach, `None` where they reach all of it
-    /// ([`reaches`](Dispatcher::reaches)).
-    reach: Vec<Option<TileGuard>>,
     /// For a source, the most packages queued for it and not yet acknowledged that a notify finds
     /// before it queues more ([`limit`](Dispatcher::limit)); `usize::MAX` for none.
     limit: usize,
@@ -386,11 +374,28 @@ struct PipelineInfo {
     /// first of the pipelines whose breaker this one shares
     /// ([`share_pushes`](Dispatcher::share_pushes)).
     pushes_with: usize,
+    /// Whether it takes the arrivals of live sources although it reads pipelines
+    /// ([`take_arrivals`](Dispatcher::take_arrivals)).
+    arrivals: bool,
+    /// Whether it parks its arrivals until the pipelines it reads have decided them
+    /// ([`park`](Dispatcher::park)).
+    parks: bool,
+    /// Whether it is a store's seed input, which the store's other pipelines read and wait for
+    /// the consume of ([`opens_before`](Dispatcher::opens_before)).
+    opens: bool,
+    /// Per pipeline it reads, in the order of its `reads`, the region of its input that
+    /// pipeline's pushes reach along routes that keep its keys, `None` where they reach all of
+    /// it ([`reaches`](Dispatcher::reaches)).
+    reach: Vec<Option<TileGuard>>,
+    /// Per pipeline it reads, in the order of its `reads`, whether it decides the input only once
+    /// it is whole ([`decides_whole_only`](Dispatcher::decides_whole_only)).
+    whole_only: Vec<bool>,
 }
 
 /// A region a pipeline parked ([`Dispatcher::park`]), and whether a release may hand out the part
-/// of it that is decided and keep the rest. A row a loop's round queues is read for the row's end,
-/// which its reads state only once they have decided all of it, so it is released whole.
+/// of it that is decided and keep the rest. A morsel a source's notify cut counts as one of that
+/// source's packages, and a row a loop's round queues is read for the row's end, which its reads
+/// state only once they have decided all of it, so both are released whole.
 #[derive(Debug)]
 struct Parked {
     guard: TileGuard,
@@ -406,42 +411,34 @@ struct PipelineState {
     pushed: Mutex<Option<TileGuard>>,
     /// For a source, whether it is closed: no more of its input arrives.
     closed: AtomicBool,
-    /// Per pipeline its breaker's input reads, in the order of its `reads`, what that pipeline
-    /// has decided of the input ([`Decided`]).
+    /// Per source of its breaker's input, what that source has decided of it: one per pipeline it
+    /// reads, in the order of its `reads`, then one for the ranges in its own chain
+    /// ([`Decided`]).
     // shared-state-ok: guards naming regions of the pipeline's input, which the decided pushes
-    // of the pipelines it reads grow under the lock; never a tile.
+    // of its sources grow under the lock; never a tile.
     decided: Mutex<Vec<Decided>>,
-    /// For a pipeline that parks ([`Dispatcher::park`]), the rows pushes brought that the
-    /// pipelines it reads have not decided yet.
-    // shared-state-ok: guards naming regions of the pipeline's input, which the pushes and the
+    /// How many of a source's packages have been queued, in every epoch.
+    queued: AtomicUsize,
+    /// How many of a source's packages have been acknowledged, in every epoch.
+    acknowledged: AtomicUsize,
+    /// For an ordered pipeline, whether a package of it is in flight, in any epoch.
+    in_flight: AtomicBool,
+    /// For a pipeline that parks its arrivals ([`Dispatcher::park`]), the morsels notified that
+    /// the pipelines it reads have not decided yet.
+    // shared-state-ok: guards naming regions of the pipeline's input, which its notifies and the
     // decided pushes that release them read and write under the lock; never a tile.
     parked: Mutex<Vec<Parked>>,
-    /// For a pipeline that parks, every row a push has brought it, queued or parked, in any epoch,
-    /// `None` for none: two pushes can name one row, and the pipeline reads each row once
+    /// For a pipeline that parks the rows pushes bring, every row a push or a start has brought it,
+    /// queued or parked, in any epoch, `None` for none: two pushes can name one row, as a widened
+    /// read's and a stream read's do, and the pipeline reads each row once
     /// ([`queue_or_park`](Dispatcher::queue_or_park)).
     // shared-state-ok: a guard naming a region of the pipeline's input, which the pushes to it grow
     // under the `parked` lock; never a tile.
     brought: Mutex<Option<TileGuard>>,
-    /// How many of a source's packages have been queued, in every epoch.
-    queued: AtomicUsize,
-    /// How many of the pipeline's packages have been acknowledged, in every epoch.
-    acknowledged: AtomicUsize,
-    /// For an ordered pipeline, whether a package of it is in flight, in any epoch.
-    in_flight: AtomicBool,
 }
 
-impl PipelineState {
-    /// How many of the pipeline's packages are queued and not acknowledged. The acknowledgements
-    /// are read first: a notify counts its packages queued before it appends them, so a package
-    /// is acknowledged only after it was counted, and the queued count read after is at least as
-    /// large, whichever threads queue and acknowledge meanwhile.
-    fn outstanding(&self) -> usize {
-        let acknowledged = self.acknowledged.load(Ordering::Acquire);
-        self.queued.load(Ordering::Acquire) - acknowledged
-    }
-}
-
-/// What a pipeline a reader reads has decided of the reader's breaker's input.
+/// What one source of a pipeline's breaker's input has decided of that input: a pipeline it
+/// reads, or the ranges in its own chain.
 #[derive(Clone, Debug, Default)]
 pub(crate) enum Decided {
     /// Nothing yet.
@@ -449,17 +446,39 @@ pub(crate) enum Decided {
     Nothing,
     /// The region its decided pushes have named.
     Region(TileGuard),
-    /// All of what it contributes: it is wholly decided.
+    /// All of what it contributes: it is wholly decided, and a push of it reaches the input only
+    /// widened, or it is read by pull, which reads all of it.
     Whole,
 }
 
 impl Decided {
+    /// Whether it covers `guard`, a region of the input, as the end-of-run check reads it.
+    #[cfg(debug_assertions)]
+    pub(crate) fn covers(&self, guard: &TileGuard) -> bool {
+        match self {
+            Decided::Nothing => guard.is_empty(),
+            Decided::Region(region) => guard_minus(guard, region).is_empty(),
+            Decided::Whole => true,
+        }
+    }
+
     fn grown(self, guard: &TileGuard) -> Decided {
         match self {
             Decided::Whole => Decided::Whole,
             Decided::Nothing => Decided::Region(guard.clone()),
             Decided::Region(region) => Decided::Region(region.union(guard)),
         }
+    }
+}
+
+impl PipelineState {
+    /// How many of a source's packages are queued and not acknowledged. The acknowledgements
+    /// are read first: a notify counts its packages queued before it appends them, so a package
+    /// is acknowledged only after it was counted, and the queued count read after is at least as
+    /// large, whichever threads queue and acknowledge meanwhile.
+    fn outstanding(&self) -> usize {
+        let acknowledged = self.acknowledged.load(Ordering::Acquire);
+        self.queued.load(Ordering::Acquire) - acknowledged
     }
 }
 
@@ -521,7 +540,9 @@ impl Dispatcher {
     /// pipeline twice, or when the graph has a cycle. Several pipelines may read one: a `FanOut`
     /// between them keeps the release of one from removing what another has still to read. A
     /// pipeline may read several, and its queue in an epoch closes at the finish of the last of
-    /// them. A pipeline in a cycle would wait for itself to finish.
+    /// them, and for one that takes arrivals beside them also at the epoch's seal or its close
+    /// ([`take_arrivals`](Self::take_arrivals)). A pipeline in a cycle would wait for itself to
+    /// finish.
     pub fn new(reads: Vec<Vec<usize>>, morsel_rows: usize) -> Self {
         assert!(morsel_rows > 0, "a morsel holds at least one row");
         let count = reads.len();
@@ -551,12 +572,15 @@ impl Dispatcher {
                 reads,
                 readers,
                 ordered: false,
-                whole: None,
+                whole: false,
                 follows: Vec::new(),
-                parks: false,
-                reach: Vec::new(),
                 limit: usize::MAX,
                 pushes_with: pipeline,
+                arrivals: false,
+                parks: false,
+                opens: false,
+                reach: Vec::new(),
+                whole_only: Vec::new(),
             })
             .collect();
         let states = (0..count)
@@ -564,11 +588,11 @@ impl Dispatcher {
                 pushed: Mutex::new(None),
                 closed: AtomicBool::new(false),
                 decided: Mutex::new(Vec::new()),
-                parked: Mutex::new(Vec::new()),
-                brought: Mutex::new(None),
                 queued: AtomicUsize::new(0),
                 acknowledged: AtomicUsize::new(0),
                 in_flight: AtomicBool::new(false),
+                parked: Mutex::new(Vec::new()),
+                brought: Mutex::new(None),
             })
             .collect();
         let window = Self::slots(DEFAULT_WINDOW, &infos);
@@ -627,9 +651,8 @@ impl Dispatcher {
 
     /// Queue `guard`, a guard of the input of `reader`'s breaker, as a package of `reader` in the
     /// current epoch, less what is queued for it there already: at the start, what a range brings
-    /// that no push names ([`run_program`]), and in a loop's round, the row of a nested loop's
-    /// store, which follows the pipelines inside the cycle around it ([`follow`](Self::follow),
-    /// `loop_scope::LoopScope`).
+    /// that no push names ([`run_program`]). A reader that parks parks what the pipelines it
+    /// reads have not decided, and a release hands out the part they decide.
     ///
     /// # Panics
     ///
@@ -691,118 +714,93 @@ impl Dispatcher {
         self.infos[reader.0].follows.push(read.0);
     }
 
-    /// Whether a claim may take `pipeline`'s packages in `epoch`: once every pipeline it follows
-    /// ([`follow`](Self::follow)) has finished the epoch.
-    fn takes_from(&self, pipeline: usize, epoch: &EpochState) -> bool {
-        self.infos[pipeline]
-            .follows
-            .iter()
-            .all(|read| epoch.pipelines[*read].phase.load() == Phase::Finished)
-    }
-
-    /// Mark `pipeline`, which reads a pipeline, as consuming its breaker's input whole, `input`
-    /// cut one package per morsel ([`seed`]), in the run's last epoch, in place of what the
-    /// pipelines it reads push. A planner does so where no push reaches the reader restated in its
-    /// keys, where two pipelines it reads can push one key, or where a pipeline it reads takes no
-    /// push and names no region the planner could queue for the reader at the start
-    /// (`run_program`). Its
-    /// input is whole only once every epoch has run, so its queue in an earlier epoch closes
-    /// empty, and it takes no push ([`Landing::queue`]).
+    /// Mark `pipeline`, which reads pipelines, as also taking the arrivals of live sources: it is
+    /// notified, sealed and closed as a source is ([`notify`](Self::notify), [`seal`](Self::seal),
+    /// [`close`](Self::close)), and its queue in an epoch closes once both the epoch's seal and the
+    /// finishes of the pipelines it reads have happened. It takes an arrival once those pipelines
+    /// have decided it ([`park`](Self::park)) or have finished the epoch ([`follow`](Self::follow)).
     ///
     /// # Panics
     ///
-    /// When `pipeline` reads no pipeline.
-    pub fn read_whole(&mut self, pipeline: PipelineId, input: &Tiling) {
-        assert!(
-            !self.infos[pipeline.0].reads.is_empty(),
-            "pipeline {} reads its input whole only after a pipeline it reads; a source does so \
-             from its start",
-            pipeline.0
-        );
-        self.infos[pipeline.0].whole = Some(seed(input, self.morsel_rows));
+    /// When `pipeline` reads no pipeline or takes arrivals already, and when a source has been
+    /// notified, sealed or closed already.
+    pub fn take_arrivals(&mut self, pipeline: PipelineId) {
+        self.mark_arrivals(pipeline);
     }
 
-    /// Mark `pipeline` as consuming its morsels one at a time, epoch by epoch: every morsel of an
-    /// epoch in the order it was queued, then the epoch's finish, then the next epoch's. Its
-    /// breaker's state advances through them in order, as a loop's store decides its positions
-    /// ascending.
-    pub fn order(&mut self, pipeline: PipelineId) {
-        self.infos[pipeline.0].ordered = true;
-    }
-
-    /// Mark `pipelines` as the pipelines of one breaker, each consuming an input of its own: their
-    /// pushes read and grow one record of what the breaker pushed, the first pipeline's, so a
-    /// region one of them pushed is pushed by none of the others.
-    ///
-    /// # Panics
-    ///
-    /// When `pipelines` is empty, or one of them shares another breaker's pushes already.
-    pub fn share_pushes(&mut self, pipelines: &[PipelineId]) {
-        let first = pipelines
-            .first()
-            .expect("a breaker's pushes are shared by its pipelines, of which it has one at least")
-            .0;
-        for pipeline in pipelines {
-            let info = &mut self.infos[pipeline.0];
-            assert_eq!(
-                info.pushes_with, pipeline.0,
-                "pipeline {} already shares the pushes of another breaker's pipelines",
-                pipeline.0
-            );
-            info.pushes_with = first;
-        }
-    }
-
-    /// Let a notify of the source `pipeline` queue more only while fewer than `packages` of its
-    /// packages are queued and not acknowledged, in every epoch: [`notify`](Self::notify) waits
-    /// until then, and [`try_notify`](Self::try_notify) answers that it did not queue. A notify
-    /// admitted below the limit queues all its morsels, so the packages outstanding exceed
-    /// `packages` by at most one notify's morsels less one, for one thread that notifies.
-    ///
-    /// # Panics
-    ///
-    /// When `pipeline` reads a pipeline, or `packages` is zero.
-    pub fn limit(&mut self, pipeline: PipelineId, packages: usize) {
-        let p = pipeline.0;
-        assert!(
-            self.infos[p].reads.is_empty(),
-            "pipeline {p} is limited only as a source: a reader is queued what is pushed to it"
-        );
-        assert!(packages > 0, "a source's limit is at least one package");
-        self.infos[p].limit = packages;
-    }
-
-    /// The handle a breaker of `pipeline` pushes through, for its oldest epoch it has not
-    /// finished. Its pushes land at [`finish`](Self::finish).
-    #[cfg(test)]
-    pub(crate) fn pushes(&self, pipeline: PipelineId) -> Pushes<'_> {
-        self.state(pipeline);
-        let epoch = Self::unfinished(pipeline.0, &self.epochs())
-            .map_or(self.current.load(Ordering::Acquire), |epoch| epoch.number);
-        self.pushes_in(pipeline, epoch)
-    }
-
-    /// Park the rows pushes bring `pipeline` until every pipeline it reads has decided them, and
-    /// read each row once: a push brings the rows it names less what pushes brought before, and
-    /// queues the part the pipelines it reads have decided ([`decided_part`](Self::decided_part)).
-    /// Each decided push of a pipeline it reads releases the parked rows it decides into its epoch
+    /// Park `pipeline`'s arrivals until the pipelines it reads have decided them: a notify of a
+    /// region they have not all decided keeps its morsels outside every epoch, and the decided
+    /// push that covers a morsel appends it to the pipeline's queue in the push's epoch
+    /// ([`record_decided`](Self::record_decided)). An epoch before then finishes without them,
+    /// so the pipelines that read `pipeline` move on. A loop's scope or a transaction store, whose
+    /// steps pull the pipelines it reads, takes each delivery so once what it pulls is final
     /// (`src/interpreter/design-operators.md`, "Parking arrivals until a read is decided").
     ///
     /// # Panics
     ///
-    /// When `pipeline` reads no pipeline.
+    /// When `pipeline` reads no pipeline, and when a source has been notified, sealed or closed
+    /// already.
     pub fn park(&mut self, pipeline: PipelineId) {
         let p = pipeline.0;
         assert!(
+            self.current.load(Ordering::Acquire) == 0
+                && self.states.iter().all(|pipeline| {
+                    pipeline.queued.load(Ordering::Acquire) == 0
+                        && !pipeline.closed.load(Ordering::Acquire)
+                }),
+            "pipeline {p} parks its arrivals from before any notify, seal or close"
+        );
+        assert!(
             !self.infos[p].reads.is_empty(),
-            "pipeline {p} parks its rows on the pipelines it reads"
+            "pipeline {p} parks its arrivals on the pipelines it reads"
         );
         self.infos[p].parks = true;
     }
 
-    /// Record that the pushes of `read`, a pipeline `reader` reads, reach `region` of its input,
-    /// and no more of it: a row outside `region` does not depend on `read`, so it waits for nothing
-    /// of it ([`park`](Self::park)). A read with no such record reaches all of the input.
+    /// Mark `pipeline` as a store's seed input, which the store's other pipelines read: a store
+    /// opens before it steps, so once `pipeline` has consumed a package, the seeds are read and
+    /// the store is open, and each of its readers records it wholly decided at the finish of that
+    /// epoch, which releases what they parked ([`park`](Self::park)). A writer's pipeline that
+    /// reads its input whole takes it only once that record covers it, and one over a live source
+    /// parks each delivery until then.
+    ///
+    /// # Panics
+    ///
+    /// When `pipeline` is read by no pipeline.
+    pub fn opens_before(&mut self, pipeline: PipelineId) {
+        assert!(
+            !self.infos[pipeline.0].readers.is_empty(),
+            "a store's seed input {} is read by the store's other pipelines",
+            pipeline.0
+        );
+        self.infos[pipeline.0].opens = true;
+    }
+
+    /// Record that `read`, a pipeline `reader` reads, decides `reader`'s input only once it is
+    /// whole: one path from it decides only part of what a row depends on, and another passes a
+    /// decided region on ([`Routes::deciding_part`]), so the union of what they pass names rows
+    /// the other path has not decided. A decided push of it that is not whole records nothing.
+    ///
+    /// # Panics
+    ///
+    /// When `reader` does not read `read`.
+    pub fn decides_whole_only(&mut self, reader: PipelineId, read: PipelineId) {
+        let info = &mut self.infos[reader.0];
+        let at = info
+            .reads
+            .iter()
+            .position(|&r| r == read.0)
+            .unwrap_or_else(|| panic!("pipeline {} reads pipeline {}", reader.0, read.0));
+        if info.whole_only.len() < info.reads.len() {
+            info.whole_only.resize(info.reads.len(), false);
+        }
+        info.whole_only[at] = true;
+    }
+
+    /// Record that the pushes of `read`, a pipeline `reader` reads, reach `region` of its input
+    /// along routes that keep their keys, and no more of it: a row outside `region` does not depend
+    /// on `read`, so it waits for nothing of it ([`park`](Self::park)). A read with no such record
+    /// reaches all of the input, as one along a route that widens, or one read by pull, does.
     ///
     /// # Panics
     ///
@@ -905,15 +903,17 @@ impl Dispatcher {
 
     /// Append the morsels `reader` parked that the pipelines it reads have now decided to its
     /// queue in `epoch` ([`park`](Self::park)). A decided push lands before the pushing pipeline
-    /// counts its finish toward `reader`'s close, so `reader`'s queue in `epoch` is open.
+    /// counts its finish toward `reader`'s close, and a range's lands in the current epoch before
+    /// its seal, so `reader`'s queue in `epoch` is open.
     fn release_parked(&self, epoch: &EpochState, reader: usize) {
         let released: Vec<TileGuard> = {
             let mut parked = self.states[reader]
                 .parked
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            // A region that splits releases the part the pipelines it reads have decided. Any
-            // other region waits until they have decided all of it ([`Parked`]).
+            // A region that splits releases the part the pipelines it reads have decided, so a
+            // loop's scope that reads a live list whole steps once per position the list decides.
+            // Any other region waits until they have decided all of it ([`Parked`]).
             let mut released = Vec::new();
             let mut kept = Vec::new();
             for morsel in std::mem::take(&mut *parked) {
@@ -936,8 +936,22 @@ impl Dispatcher {
             *parked = kept;
             released
         };
+        if released.is_empty() {
+            return;
+        }
         let queue = &epoch.pipelines[reader].queue;
-        let appended = released.iter().all(|morsel| queue.append_unqueued(morsel));
+        // A pipeline that takes arrivals parks the morsels its sources' notifies cut, which count
+        // toward a source's packages; any other parks the rows pushes bring, which two pushes can
+        // both name, so each is queued less what is queued already.
+        let appended = match self.infos[reader].arrivals {
+            true => {
+                self.states[reader]
+                    .queued
+                    .fetch_add(released.len(), Ordering::AcqRel);
+                queue.append(reader, &released)
+            }
+            false => released.iter().all(|morsel| queue.append_unqueued(morsel)),
+        };
         self.ensure(appended, || {
             format!(
                 "pipeline {reader} has not finished epoch {} when a decided push covers what it \
@@ -947,11 +961,76 @@ impl Dispatcher {
         });
     }
 
-    /// Grow what `source`, a pipeline `reader` reads, has decided of `reader`'s input by `guard`,
-    /// or record it whole where `guard` is `None`, and release what `reader` parked that is now
-    /// decided. Every pipeline `reader` reads that shares `source`'s breaker shares the record,
-    /// since a store's pipelines push one store's decided region
-    /// ([`share_pushes`](Self::share_pushes)).
+    fn mark_arrivals(&mut self, pipeline: PipelineId) {
+        let p = pipeline.0;
+        assert!(
+            self.current.load(Ordering::Acquire) == 0
+                && self.states.iter().all(|pipeline| {
+                    pipeline.queued.load(Ordering::Acquire) == 0
+                        && !pipeline.closed.load(Ordering::Acquire)
+                }),
+            "pipeline {p} takes arrivals before any notify, seal or close"
+        );
+        let info = &mut self.infos[p];
+        assert!(
+            !info.reads.is_empty() && !info.arrivals,
+            "pipeline {p} takes arrivals beside the pipelines it reads, once"
+        );
+        info.arrivals = true;
+        // The window's epochs were made before the mark, so each one's count gains the seal.
+        for slot in &self.window {
+            let epoch = slot.read().unwrap_or_else(PoisonError::into_inner);
+            epoch.pipelines[p].unfinished.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    /// Whether `pipeline` is notified, sealed and closed: a source, or a pipeline that takes
+    /// arrivals beside the pipelines it reads ([`take_arrivals`](Self::take_arrivals)).
+    fn takes_arrivals(&self, pipeline: usize) -> bool {
+        self.infos[pipeline].reads.is_empty() || self.infos[pipeline].arrivals
+    }
+
+    /// End the arrivals of `pipeline`, which takes arrivals, in `epoch`: a source's queue there
+    /// closes, and a pipeline that also reads pipelines counts the end toward its close
+    /// ([`count_toward_close`](Self::count_toward_close)).
+    fn end_arrivals(&self, epoch: &EpochState, pipeline: usize) {
+        match self.infos[pipeline].reads.is_empty() {
+            true => {
+                epoch.pipelines[pipeline].queue.close();
+            }
+            false => self.count_toward_close(epoch, pipeline),
+        }
+    }
+
+    /// Count one feed of `reader`'s queue in `epoch` finished: a pipeline it reads, or the end of
+    /// its arrivals. The last of them closes the queue.
+    ///
+    /// # Panics
+    ///
+    /// When the queue was closed already.
+    fn count_toward_close(&self, epoch: &EpochState, reader: usize) {
+        // The decrement orders the appends of every earlier event before the close.
+        let unfinished = epoch.pipelines[reader]
+            .unfinished
+            .fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(
+            unfinished > 0,
+            "pipeline {reader} counts each event its queue waits for once"
+        );
+        if unfinished != 1 {
+            return;
+        }
+        let closed = epoch.pipelines[reader].queue.close();
+        self.ensure(closed, || {
+            format!("pipeline {reader} receives packages once")
+        });
+    }
+
+    /// Grow what `source` has decided of `reader`'s input by `guard`, or record it whole where
+    /// `guard` is `None`. `source` is a pipeline `reader` reads, whose record every pipeline it
+    /// reads that shares `source`'s breaker shares, since a store's pipelines push one store's
+    /// decided region ([`share_pushes`](Self::share_pushes)); or `reader` itself, for the ranges
+    /// in its own chain.
     fn record_decided(
         &self,
         epoch: &EpochState,
@@ -960,94 +1039,161 @@ impl Dispatcher {
         guard: Option<&TileGuard>,
     ) {
         let reads = &self.infos[reader].reads;
-        self.ensure(reads.contains(&source), || {
+        // A store's decided push reaches its own pipelines around its recurrence, which is no
+        // read: a pipeline of a store reads a sibling only for its seed input's consume
+        // ([`opens_before`](Self::opens_before)), which records it whole.
+        if guard.is_some()
+            && source != reader
+            && self.infos[source].pushes_with == self.infos[reader].pushes_with
+        {
+            return;
+        }
+        self.ensure(source == reader || reads.contains(&source), || {
             format!(
                 "pipeline {source} pushes a decided region to pipeline {reader}, which reads it"
             )
         });
-        {
-            let mut decided = self.states[reader]
-                .decided
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if decided.len() < reads.len() {
-                decided.resize(reads.len(), Decided::Nothing);
-            }
-            let shares = self.infos[source].pushes_with;
-            for at in (0..reads.len()).filter(|&at| self.infos[reads[at]].pushes_with == shares) {
-                let before = std::mem::take(&mut decided[at]);
-                decided[at] = match guard {
-                    Some(guard) => before.grown(guard),
-                    None => Decided::Whole,
-                };
-            }
+        let mut decided = self.states[reader]
+            .decided
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if decided.len() <= reads.len() {
+            decided.resize(reads.len() + 1, Decided::Nothing);
         }
+        let slots: Vec<usize> = match source == reader {
+            true => vec![reads.len()],
+            false => (0..reads.len())
+                .filter(|&at| self.infos[reads[at]].pushes_with == self.infos[source].pushes_with)
+                .collect(),
+        };
+        let whole_only = &self.infos[reader].whole_only;
+        for at in slots {
+            if guard.is_some() && whole_only.get(at).copied().unwrap_or(false) {
+                continue;
+            }
+            let before = std::mem::take(&mut decided[at]);
+            decided[at] = match guard {
+                Some(guard) => before.grown(guard),
+                None => Decided::Whole,
+            };
+        }
+        drop(decided);
         if self.infos[reader].parks {
             self.release_parked(epoch, reader);
         }
     }
 
-    /// Push `decided`, the region of its keys `pipeline`'s breaker has decided, through `to`, the
-    /// breaker's consumer, and record what reaches each reader's entry as decided by `pipeline`
-    /// ([`decided_of`](Self::decided_of)). Where `decided` is every key, each reader the push
-    /// reached no entry of reads `pipeline` by pull, which reads all of it: it records `pipeline`
-    /// whole.
-    fn land_decided(
-        &self,
-        epoch: &EpochState,
-        pipeline: usize,
-        decided: Option<&Projection>,
-        to: Option<&SharedConsumer>,
-    ) {
-        let (Some(decided), Some(to)) = (decided, to) else {
-            return;
-        };
-        if *decided == Projection::Nothing {
-            return;
-        }
-        let whole = *decided == Projection::Everything;
-        let mut landing = Landing {
-            target: Target::Decided {
-                dispatcher: self,
-                whole,
-                reached: Vec::new(),
-                epoch,
-            },
-            from: pipeline,
-            widened: false,
-        };
-        to.borrow_mut().push(decided, &mut landing);
-        let Target::Decided { reached, .. } = landing.target else {
-            unreachable!("a decided landing stays one");
-        };
-        if whole {
-            for &reader in &self.infos[pipeline].readers {
-                if !reached.contains(&reader) {
-                    self.record_decided(epoch, reader, pipeline, None);
-                }
-            }
-        }
+    /// Whether a claim may take `pipeline`'s packages in `epoch`: once every pipeline it follows
+    /// ([`follow`](Self::follow)) has finished the epoch.
+    fn takes_from(&self, pipeline: usize, epoch: &EpochState) -> bool {
+        self.infos[pipeline]
+            .follows
+            .iter()
+            .all(|read| epoch.pipelines[*read].phase.load() == Phase::Finished)
     }
 
-    /// What `source`, a pipeline `reader` reads, has decided of `reader`'s breaker's input.
+    /// Mark `pipeline`, which reads a pipeline, as consuming its breaker's input whole, `input`
+    /// cut one package per morsel ([`seed`]), in place of what the pipelines it reads push: the
+    /// morsels are parked from the start, and the decided push that leaves every pipeline it reads
+    /// having decided them queues them ([`park`](Self::park)). A planner does so where no push
+    /// reaches the reader restated in its keys, where two pipelines it reads can push one key, or
+    /// where a pipeline it reads takes no push and names no region the planner could queue for the
+    /// reader at the start (`run_program`). It takes no push ([`Landing::queue`]).
     ///
     /// # Panics
     ///
-    /// When `reader` does not read `source`.
-    #[cfg(test)]
-    pub(crate) fn decided_of(&self, reader: PipelineId, source: PipelineId) -> Decided {
-        let at = self.infos[reader.0]
-            .reads
-            .iter()
-            .position(|&r| r == source.0)
-            .unwrap_or_else(|| panic!("pipeline {} reads pipeline {}", reader.0, source.0));
-        self.states[reader.0]
-            .decided
+    /// When `pipeline` reads no pipeline.
+    pub fn read_whole(&mut self, pipeline: PipelineId, input: &Tiling) {
+        assert!(
+            !self.infos[pipeline.0].reads.is_empty(),
+            "pipeline {} reads its input whole only after a pipeline it reads; a source does so \
+             from its start",
+            pipeline.0
+        );
+        assert!(
+            self.current.load(Ordering::Acquire) == 0
+                && self.states.iter().all(|pipeline| {
+                    pipeline.queued.load(Ordering::Acquire) == 0
+                        && !pipeline.closed.load(Ordering::Acquire)
+                }),
+            "pipeline {} reads its input whole from before any notify, seal or close",
+            pipeline.0
+        );
+        let info = &mut self.infos[pipeline.0];
+        info.whole = true;
+        info.parks = true;
+        self.states[pipeline.0]
+            .parked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(at)
-            .cloned()
-            .unwrap_or_default()
+            .extend(
+                seed(input, self.morsel_rows)
+                    .into_iter()
+                    .map(|guard| Parked {
+                        guard,
+                        splits: true,
+                    }),
+            );
+    }
+
+    /// Mark `pipeline` as consuming its morsels one at a time, epoch by epoch: every morsel of an
+    /// epoch in the order it was queued, then the epoch's finish, then the next epoch's. Its
+    /// breaker's state advances through them in order, as a loop's store decides its positions
+    /// ascending.
+    pub fn order(&mut self, pipeline: PipelineId) {
+        self.infos[pipeline.0].ordered = true;
+    }
+
+    /// Mark `pipelines` as the pipelines of one breaker, each consuming an input of its own: their
+    /// pushes read and grow one record of what the breaker pushed, the first pipeline's, so a
+    /// region one of them pushed is pushed by none of the others.
+    ///
+    /// # Panics
+    ///
+    /// When `pipelines` is empty, or one of them shares another breaker's pushes already.
+    pub fn share_pushes(&mut self, pipelines: &[PipelineId]) {
+        let first = pipelines
+            .first()
+            .expect("a breaker's pushes are shared by its pipelines, of which it has one at least")
+            .0;
+        for pipeline in pipelines {
+            let info = &mut self.infos[pipeline.0];
+            assert_eq!(
+                info.pushes_with, pipeline.0,
+                "pipeline {} already shares the pushes of another breaker's pipelines",
+                pipeline.0
+            );
+            info.pushes_with = first;
+        }
+    }
+
+    /// Let a notify of the source `pipeline` queue more only while fewer than `packages` of its
+    /// packages are queued and not acknowledged, in every epoch: [`notify`](Self::notify) waits
+    /// until then, and [`try_notify`](Self::try_notify) answers that it did not queue. A notify
+    /// admitted below the limit queues all its morsels, so the packages outstanding exceed
+    /// `packages` by at most one notify's morsels less one, for one thread that notifies.
+    ///
+    /// # Panics
+    ///
+    /// When `pipeline` reads a pipeline, or `packages` is zero.
+    pub fn limit(&mut self, pipeline: PipelineId, packages: usize) {
+        let p = pipeline.0;
+        assert!(
+            self.infos[p].reads.is_empty(),
+            "pipeline {p} is limited only as a source: a reader is queued what is pushed to it"
+        );
+        assert!(packages > 0, "a source's limit is at least one package");
+        self.infos[p].limit = packages;
+    }
+
+    /// The handle a breaker of `pipeline` pushes through, for its oldest epoch it has not
+    /// finished. Its pushes land at [`finish`](Self::finish).
+    #[cfg(test)]
+    pub(crate) fn pushes(&self, pipeline: PipelineId) -> Pushes<'_> {
+        self.state(pipeline);
+        let epoch = Self::unfinished(pipeline.0, &self.epochs())
+            .map_or(self.current.load(Ordering::Acquire), |epoch| epoch.number);
+        self.pushes_in(pipeline, epoch)
     }
 
     /// The handle a breaker of `pipeline` pushes through for `epoch`.
@@ -1142,6 +1288,12 @@ impl Dispatcher {
     ///
     /// When `pipeline` reads a pipeline, or is closed.
     pub fn start_source(&self, pipeline: PipelineId, input: &Tiling) {
+        self.ensure(self.infos[pipeline.0].reads.is_empty(), || {
+            format!(
+                "pipeline {} starts whole only as a source, which reads no pipeline",
+                pipeline.0
+            )
+        });
         let morsels = seed(input, self.morsel_rows);
         debug_assert!(
             partition_gap(&input.universal_guard(), &morsels).is_none(),
@@ -1163,8 +1315,9 @@ impl Dispatcher {
     ///
     /// # Panics
     ///
-    /// When `pipeline` reads a pipeline or is closed; in a debug build, when `guard` meets a
-    /// region queued for it before in the epoch.
+    /// When `pipeline` takes no arrivals ([`take_arrivals`](Self::take_arrivals))
+    /// or is closed; in a debug build, when `guard` meets a region queued for a source before in
+    /// the epoch.
     pub fn notify(&self, pipeline: PipelineId, guard: &TileGuard) {
         loop {
             // Read before the check: an acknowledgement the check misses advances the generation
@@ -1189,7 +1342,14 @@ impl Dispatcher {
             return true;
         }
         self.ensure_source(pipeline);
-        if self.state(pipeline).outstanding() >= self.infos[pipeline.0].limit {
+        let info = &self.infos[pipeline.0];
+        debug_assert!(
+            info.parks || info.reads.iter().all(|read| info.follows.contains(read)),
+            "pipeline {} parks no arrival, so it takes one only after every pipeline it reads has \
+             finished the epoch, which it follows",
+            pipeline.0
+        );
+        if self.state(pipeline).outstanding() >= info.limit {
             return false;
         }
         let morsels = cut_positions(guard, self.morsel_rows);
@@ -1202,12 +1362,16 @@ impl Dispatcher {
         true
     }
 
-    /// Refuse `pipeline` unless it is a source, one that reads no pipeline.
+    /// Refuse `pipeline` unless it takes arrivals: a source, one that reads no pipeline, or one
+    /// that takes arrivals beside the pipelines it reads ([`take_arrivals`](Self::take_arrivals)).
     fn ensure_source(&self, pipeline: PipelineId) {
         let p = pipeline.0;
         self.state(pipeline);
-        self.ensure(self.infos[p].reads.is_empty(), || {
-            format!("pipeline {p} is queued its input only as a source, which reads no pipeline")
+        self.ensure(self.takes_arrivals(p), || {
+            format!(
+                "pipeline {p} is queued arrivals only as a source, which reads no pipeline, or \
+                 as a pipeline that takes arrivals beside the pipelines it reads"
+            )
         });
     }
 
@@ -1217,6 +1381,26 @@ impl Dispatcher {
         let p = pipeline.0;
         self.ensure_source(pipeline);
         let state = self.state(pipeline);
+        let parked_out;
+        let morsels = match self.infos[p].parks {
+            true => {
+                let mut parked = state.parked.lock().unwrap_or_else(PoisonError::into_inner);
+                let (decided, undecided): (Vec<TileGuard>, Vec<TileGuard>) = morsels
+                    .iter()
+                    .cloned()
+                    .partition(|morsel| self.reads_decided(p, morsel));
+                parked.extend(undecided.into_iter().map(|guard| Parked {
+                    guard,
+                    splits: false,
+                }));
+                parked_out = decided;
+                if parked_out.is_empty() {
+                    return;
+                }
+                &parked_out[..]
+            }
+            false => morsels,
+        };
         // Counted before the append makes the packages claimable, so an acknowledgement never
         // runs ahead of the count `outstanding` subtracts it from.
         state.queued.fetch_add(morsels.len(), Ordering::AcqRel);
@@ -1238,7 +1422,8 @@ impl Dispatcher {
     }
 
     /// End the current epoch and open the next: every open source's queue in the current epoch
-    /// closes, and later notifies land in the next. It waits while the window's slot for the next
+    /// closes, a pipeline that takes arrivals beside the pipelines it reads counts the seal toward
+    /// its queue's close, and later notifies land in the next. It waits while the window's slot for the next
     /// epoch still holds the epoch a window before it, so the window bounds the epochs in flight.
     /// After a failure it returns at once.
     ///
@@ -1278,13 +1463,12 @@ impl Dispatcher {
         let sealed = self
             .epoch(current)
             .expect("the window holds the current epoch");
+        // A source closed before has its arrivals ended in every epoch after its close: in the
+        // sealed epoch at its close or at the seal that opened it, and in the next one here.
         for p in self.sources() {
-            sealed.pipelines[p].queue.close();
-        }
-        // A source closed before is closed in every epoch after its close.
-        for p in self.sources() {
-            if self.states[p].closed.load(Ordering::Acquire) {
-                next.pipelines[p].queue.close();
+            match self.states[p].closed.load(Ordering::Acquire) {
+                true => self.end_arrivals(&next, p),
+                false => self.end_arrivals(&sealed, p),
             }
         }
         self.current.store(current + 1, Ordering::Release);
@@ -1292,25 +1476,31 @@ impl Dispatcher {
         true
     }
 
-    /// The source pipelines, those that read none.
+    /// The pipelines that take arrivals: the sources, those that read none, and those that take
+    /// arrivals beside the pipelines they read ([`take_arrivals`](Self::take_arrivals)).
     fn sources(&self) -> impl Iterator<Item = usize> + '_ {
-        (0..self.infos.len()).filter(|p| self.infos[*p].reads.is_empty())
+        (0..self.infos.len()).filter(|p| self.takes_arrivals(*p))
     }
 
-    /// Close a source pipeline: nothing more of its input arrives, its queue in the current epoch
-    /// closes, and so does its queue in every epoch after. Once every source is closed, the
+    /// Close a pipeline that takes arrivals: nothing more of its input arrives, and its arrivals
+    /// end in the current epoch and in every epoch after. A source's queue closes there; one that
+    /// takes arrivals beside the pipelines it reads counts the end toward its queue's close. Once every source is closed, the
     /// current epoch is the run's last. A claim never finishes a source's epoch before its close
     /// or the seal of the epoch, so workers may claim before the sources start; they wait until
     /// then.
     ///
     /// # Panics
     ///
-    /// When `pipeline` reads a pipeline, or is closed already.
+    /// When `pipeline` takes no arrivals ([`take_arrivals`](Self::take_arrivals)), or is closed
+    /// already.
     pub fn close(&self, pipeline: PipelineId) {
         let p = pipeline.0;
         let state = self.state(pipeline);
-        self.ensure(self.infos[p].reads.is_empty(), || {
-            format!("pipeline {p} closes its queue only as a source, which reads no pipeline")
+        self.ensure(self.takes_arrivals(p), || {
+            format!(
+                "pipeline {p} closes its arrivals only as a source, which reads no pipeline, or as \
+                 a pipeline that takes arrivals beside the pipelines it reads"
+            )
         });
         let _sealing = self.sealing.lock().unwrap_or_else(PoisonError::into_inner);
         let closed = !state.closed.swap(true, Ordering::AcqRel);
@@ -1322,11 +1512,10 @@ impl Dispatcher {
         {
             self.last.store(current, Ordering::Release);
         }
-        self.epoch(current)
-            .expect("the window holds the current epoch")
-            .pipelines[p]
-            .queue
-            .close();
+        let epoch = self
+            .epoch(current)
+            .expect("the window holds the current epoch");
+        self.end_arrivals(&epoch, p);
         self.advance();
     }
 
@@ -1416,7 +1605,7 @@ impl Dispatcher {
     /// Whether `pipeline` may finish `epoch`: it is running in it, its queue there is closed and
     /// every package in it acknowledged, and the epoch is sealed or known to be the last. Its
     /// last epoch it finishes only after every earlier one, since the breaker's `finish` there is
-    /// its last call, and an ordered pipeline finishes every epoch after the earlier ones.
+    /// its last call. An ordered pipeline finishes every epoch after the earlier ones.
     fn ready(&self, pipeline: usize, epoch: &EpochState, epochs: &[Arc<EpochState>]) -> bool {
         let state = &epoch.pipelines[pipeline];
         // One read of the count and the close: nothing is reserved after the close, so the count
@@ -1555,7 +1744,9 @@ impl Dispatcher {
             pipeline: package.pipeline,
             guard: package.guard,
         });
-        state.acknowledged.fetch_add(1, Ordering::AcqRel);
+        if self.infos[p].reads.is_empty() {
+            state.acknowledged.fetch_add(1, Ordering::AcqRel);
+        }
         let acknowledged = in_epoch.acknowledged.fetch_add(1, Ordering::AcqRel) + 1;
         if self.infos[p].ordered {
             state.in_flight.store(false, Ordering::Release);
@@ -1607,7 +1798,8 @@ impl Dispatcher {
         );
         // A source's queue is closed by a seal or its close. A pipeline that reads others has its
         // queue filled and closed once the pushes of the last of them to finish landed, which
-        // `finish` does after it marks that one finished.
+        // `finish` does after it marks that one finished, and, where it takes arrivals beside
+        // them, once its arrivals in the epoch ended too.
         self.ensure(state.queue.is_closed(), || {
             format!("pipeline {p} finishes after its queue is closed")
         });
@@ -1639,20 +1831,135 @@ impl Dispatcher {
         let p = pushes.pipeline;
         let morsels = std::mem::take(&mut pushes.morsels);
         let decided = pushes.decided.take();
-        if self.failed.load(Ordering::SeqCst) || (morsels.is_empty() && decided.is_none()) {
+        if self.failed.load(Ordering::SeqCst) {
             return;
         }
         let epoch = self.epoch(pushes.epoch);
+        if let Some(epoch) = &epoch {
+            self.land_decided(epoch, p, decided.as_ref(), pushes.to.as_ref());
+        }
+        if morsels.is_empty() {
+            return;
+        }
         self.ensure(
             epoch
                 .as_ref()
                 .is_some_and(|epoch| epoch.pipelines[p].phase.load() != Phase::Finished),
             || format!("pipeline {p} lands its pushes in an epoch before it finishes there"),
         );
-        let epoch = epoch.expect("refused above");
-        self.land_in(&epoch, p, &morsels, pushes.to.as_ref());
-        self.land_decided(&epoch, p, decided.as_ref(), pushes.to.as_ref());
+        self.land_in(
+            &epoch.expect("refused above"),
+            p,
+            &morsels,
+            pushes.to.as_ref(),
+        );
         self.advance();
+    }
+
+    /// Push `decided`, the region of its keys `pipeline`'s breaker has decided, through `to`, its
+    /// breaker's consumer, which restates it as each operator on the way decides
+    /// ([`Landing::is_decided`]), and record what reaches each reader's entry
+    /// ([`decided_of`](Self::decided_of)).
+    ///
+    /// Where `decided` is every key, each reader the push reached no entry of reads `pipeline` by
+    /// pull, as a loop's rounds pull a sum its body reads from outside the loop's cycle, which
+    /// reads all of it: it records `pipeline` whole.
+    /// `pipeline` is the pushing pipeline, or, for a range in its own chain, the pipeline itself.
+    fn land_decided(
+        &self,
+        epoch: &EpochState,
+        pipeline: usize,
+        decided: Option<&Projection>,
+        to: Option<&SharedConsumer>,
+    ) {
+        self.land_decided_from(epoch, pipeline, decided, to, true);
+    }
+
+    /// Push `decided`, the region of its keys a range in `pipeline`'s chain has decided, through
+    /// `to`, the range's consumer, and record what reaches each pipeline's entry as decided by the
+    /// ranges in that pipeline's own chain ([`decided_of`](Self::decided_of)): a range can reach
+    /// the entry of a pipeline beside its own, as the rows of a store per row reach the reader of
+    /// the store.
+    pub(crate) fn land_range_decided(
+        &self,
+        pipeline: PipelineId,
+        decided: &Projection,
+        to: &SharedConsumer,
+    ) {
+        // An epoch sealed after the read of `current` may have retired since, its slot taken by the
+        // epoch a window later; the reread finds the epoch after it.
+        let epoch = loop {
+            if let Some(epoch) = self.epoch(self.current.load(Ordering::Acquire)) {
+                break epoch;
+            }
+        };
+        self.land_decided_from(&epoch, pipeline.0, Some(decided), Some(to), false);
+    }
+
+    /// [`land_decided`](Self::land_decided), applying its rule for readers a push reaches no
+    /// entry of only where `pulled` says the push is a breaker's, which its readers read.
+    fn land_decided_from(
+        &self,
+        epoch: &EpochState,
+        pipeline: usize,
+        decided: Option<&Projection>,
+        to: Option<&SharedConsumer>,
+        pulled: bool,
+    ) {
+        let (Some(decided), Some(to)) = (decided, to) else {
+            return;
+        };
+        if *decided == Projection::Nothing {
+            return;
+        }
+        let whole = *decided == Projection::Everything;
+        let mut landing = Landing {
+            target: Target::Decided {
+                dispatcher: self,
+                whole,
+                reached: Vec::new(),
+                range: !pulled,
+                epoch,
+            },
+            from: pipeline,
+            widened: false,
+        };
+        to.borrow_mut().push(decided, &mut landing);
+        let Target::Decided { reached, .. } = landing.target else {
+            unreachable!("a decided landing stays one");
+        };
+        if whole && pulled {
+            for &reader in &self.infos[pipeline].readers {
+                if !reached.contains(&reader) {
+                    self.record_decided(epoch, reader, pipeline, None);
+                }
+            }
+        }
+    }
+
+    /// What `source` has decided of `reader`'s breaker's input: a pipeline `reader` reads, or
+    /// `reader` itself for the ranges in its own chain, as the end-of-run check reads it.
+    ///
+    /// # Panics
+    ///
+    /// When `source` is neither `reader` nor a pipeline it reads.
+    #[cfg(debug_assertions)]
+    pub(crate) fn decided_of(&self, reader: PipelineId, source: PipelineId) -> Decided {
+        let reads = &self.infos[reader.0].reads;
+        let at = match source.0 == reader.0 {
+            true => reads.len(),
+            false => reads
+                .iter()
+                .position(|&r| r == source.0)
+                .unwrap_or_else(|| panic!("pipeline {} reads pipeline {}", reader.0, source.0)),
+        };
+        self.states[reader.0]
+            .decided
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(at)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Push `morsels`, pushed by `pipeline` in `epoch`, through `to`, its breaker's consumer, one
@@ -1719,6 +2026,7 @@ impl Dispatcher {
         );
         let p = pushes.pipeline;
         let morsels = std::mem::take(&mut pushes.morsels);
+        let decided = pushes.decided.take();
         if self.failed.load(Ordering::SeqCst) {
             return;
         }
@@ -1735,13 +2043,9 @@ impl Dispatcher {
         // Recorded before the reader's queue is closed, which lets the reader finish.
         #[cfg(test)]
         self.record(Event::Finish(PipelineId(p)));
-        self.land_in(&epoch, p, &morsels, pushes.to.as_ref());
-        // The decided push releases what the readers parked into this epoch, so it lands before
-        // their queues here close.
-        let decided = pushes.decided.take();
         self.land_decided(&epoch, p, decided.as_ref(), pushes.to.as_ref());
-        // At the run's last epoch every pipeline it reads has decided all of it, so nothing stays
-        // parked.
+        // At the run's last epoch every pipeline it reads has decided all of what it reaches
+        // (the planner's end-of-run check), so nothing stays parked.
         if epoch.number == self.last.load(Ordering::Acquire) {
             let parked = self.states[p]
                 .parked
@@ -1754,28 +2058,18 @@ impl Dispatcher {
                 )
             });
         }
-        for &reader in &self.infos[p].readers {
-            // The last of the pipelines it reads to finish the epoch closes the reader's queue;
-            // the decrement orders every earlier finish's appends before it.
-            let unfinished = epoch.pipelines[reader]
-                .unfinished
-                .fetch_sub(1, Ordering::AcqRel);
-            debug_assert!(
-                unfinished > 0,
-                "pipeline {reader} counts a finish once per pipeline it reads"
-            );
-            if unfinished != 1 {
-                continue;
+        // The store's own pipelines wait for its seed input's consume; a reader of the store
+        // reads that pipeline too, but waits for what the store decides.
+        if self.infos[p].opens && epoch.pipelines[p].acknowledged.load(Ordering::Acquire) > 0 {
+            for &reader in &self.infos[p].readers {
+                if self.infos[reader].pushes_with == self.infos[p].pushes_with {
+                    self.record_decided(&epoch, reader, p, None);
+                }
             }
-            let queue = &epoch.pipelines[reader].queue;
-            let closing = match &self.infos[reader].whole {
-                Some(input) if epoch.number == self.last.load(Ordering::Acquire) => input,
-                _ => &Vec::new(),
-            };
-            let closed = queue.append(reader, closing) && queue.close();
-            self.ensure(closed, || {
-                format!("pipeline {reader} receives packages once")
-            });
+        }
+        self.land_in(&epoch, p, &morsels, pushes.to.as_ref());
+        for &reader in &self.infos[p].readers {
+            self.count_toward_close(&epoch, reader);
         }
         if epoch.unfinished.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.retire(&epoch);
@@ -1840,9 +2134,7 @@ impl Dispatcher {
     /// pipeline is closed first, whatever was queued for it.
     #[cfg(test)]
     pub(crate) fn finish_by_hand(&self, pipeline: PipelineId, push: impl FnOnce(&mut Pushes<'_>)) {
-        if self.infos[pipeline.0].reads.is_empty()
-            && !self.state(pipeline).closed.load(Ordering::Acquire)
-        {
+        if self.takes_arrivals(pipeline.0) && !self.state(pipeline).closed.load(Ordering::Acquire) {
             self.close(pipeline);
         }
         let (epoch, _) = self.begin_finish(pipeline);
@@ -1871,6 +2163,33 @@ impl Dispatcher {
             .into_inner()
             .unwrap_or_else(PoisonError::into_inner)
     }
+}
+
+/// `guard`, `None` where it is empty.
+fn nonempty(guard: TileGuard) -> Option<TileGuard> {
+    (!guard.is_empty()).then_some(guard)
+}
+
+/// Grow `region` by `guard`.
+fn grow(region: &mut Option<TileGuard>, guard: &TileGuard) {
+    *region = Some(match region.take() {
+        None => guard.clone(),
+        Some(region) => region.union(guard),
+    });
+}
+
+/// The rows of `rows`, a guard of `input`, that `released` does not name, closed over `input`
+/// (`TileGuard::closed_over`): where a row's level is a finite range of positions, what the input
+/// released through the row's last position covers its paths past it. `None` for none.
+///
+/// # Panics
+///
+/// Where the guard algebra has no exact difference of the two ([`guard_minus`]).
+fn unreleased(rows: &TileGuard, released: &TileGuard, input: &Tiling) -> Option<TileGuard> {
+    if released.is_universal() {
+        return None;
+    }
+    nonempty(guard_minus(rows, released).closed_over(input))
 }
 
 /// Whether no pipeline reaches itself through what it reads.
@@ -1915,14 +2234,19 @@ pub struct Pushes<'d> {
     pipeline: usize,
     epoch: u64,
     morsels: Vec<TileGuard>,
+    /// The region of its keys the breaker has decided, as a projection, which climbs the
+    /// consumer chain beside the morsels ([`Landing::is_decided`]); `None` where it pushed none.
+    decided: Option<Projection>,
     /// The consumer the morsels climb, the pushing breaker's.
     to: Option<SharedConsumer>,
-    /// The region of its keys the breaker has decided, pushed through `to` beside the morsels
-    /// ([`Landing::is_decided`]); `None` where it pushed none.
-    decided: Option<Projection>,
 }
 
 impl Pushes<'_> {
+    /// The epoch these pushes land in.
+    pub(crate) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// Push what `breaker` has decided and the pipeline has not pushed before, its final guard
     /// less the region pushed, for the pipelines that read it: one package per morsel the breaker
     /// cuts it into, in the breaker's order. A push of nothing new pushes nothing, and so does a
@@ -2047,6 +2371,12 @@ enum Target<'d> {
         dispatcher: &'d Dispatcher,
         epoch: &'d EpochState,
     },
+    /// Records each, for a planner that probes which region of a reader's input a pipeline's push
+    /// names; which edges keep keys the planner reads off [`Routes`].
+    Probe(Vec<Arrival>),
+    /// Records each, as `Probe` does, for a push restated as a wholly decided region is: the
+    /// region of a reader's input a pipeline can ever decide ([`Dispatcher::reaches`]).
+    ProbeDecided(Vec<Arrival>),
     /// Grows, for each, what the pushing pipeline has decided of the reader's input
     /// ([`Dispatcher::decided_of`]), and queues nothing. `whole` says the pushing pipeline is
     /// wholly decided, and `reached` lists the readers whose entry the push reached.
@@ -2054,11 +2384,12 @@ enum Target<'d> {
         dispatcher: &'d Dispatcher,
         whole: bool,
         reached: Vec<usize>,
-        /// The epoch the push lands in, which rows it releases join ([`Dispatcher::park`]).
+        /// Whether a range pushes it, which counts as a range in the chain of each pipeline whose
+        /// entry it reaches.
+        range: bool,
+        /// The epoch the push lands in, which morsels it releases join ([`Dispatcher::park`]).
         epoch: &'d EpochState,
     },
-    /// Records each, for a planner that probes where a pipeline's pushes arrive and how.
-    Probe(Vec<Arrival>),
 }
 
 /// A region a probing push brought to an [`Entry`].
@@ -2067,8 +2398,6 @@ pub(crate) struct Arrival {
     pub(crate) pipeline: PipelineId,
     /// The region as a guard of that pipeline's breaker's input.
     pub(crate) guard: TileGuard,
-    /// Whether an operator on its path widened it ([`Landing::widened`]).
-    pub(crate) widened: bool,
 }
 
 impl Landing<'_> {
@@ -2081,49 +2410,91 @@ impl Landing<'_> {
         }
     }
 
+    /// A landing that records where `from`'s push of a wholly decided region arrives, and queues
+    /// nothing.
+    pub(crate) fn probe_decided(from: PipelineId) -> Landing<'static> {
+        Landing {
+            target: Target::ProbeDecided(Vec::new()),
+            from: from.0,
+            widened: false,
+        }
+    }
+
     /// What a probing landing recorded.
     pub(crate) fn arrivals(self) -> Vec<Arrival> {
         match self.target {
-            Target::Probe(arrivals) => arrivals,
+            Target::Probe(arrivals) | Target::ProbeDecided(arrivals) => arrivals,
             Target::Queue { .. } | Target::Decided { .. } => {
-                panic!("a landing that queues or records decided regions records no arrivals")
+                panic!("only a probing landing records arrivals")
             }
         }
+    }
+
+    /// Whether the region climbing is a decided region rather than a change: an operator restates
+    /// a decided region by keeping what it names where it keeps the keys, and where it widens them
+    /// by naming nothing until the region is every key, since each of its keys depends on every
+    /// key of its input.
+    pub fn is_decided(&self) -> bool {
+        matches!(
+            self.target,
+            Target::Decided { .. } | Target::ProbeDecided(_)
+        )
+    }
+
+    /// Whether the region climbing is a decided region of a source that is wholly decided: an
+    /// operator that widens its input's keys passes it as every key, since what that source
+    /// contributes to each of the operator's keys is decided, and the reader intersects what its
+    /// other sources decided.
+    pub fn is_wholly_decided(&self) -> bool {
+        matches!(
+            self.target,
+            Target::Decided { whole: true, .. } | Target::ProbeDecided(_)
+        )
     }
 
     /// Queue `guard`, a guard of the input of `reader`'s breaker, as a package of `reader` in the
     /// epoch, less what is queued for it there already: a push that reaches a breaker along two
     /// paths, as a filter reads one memo for its values and its predicate, is queued once. A
     /// reader that reads its input whole ([`Dispatcher::read_whole`]) takes no push, widened or
-    /// not.
+    /// not, and nor does one that follows the pipeline that pushed ([`Dispatcher::follow`]). A
+    /// reader that parks ([`Dispatcher::park`]) queues or parks the rows a push brings of its own,
+    /// and nothing for a push to a reader that takes arrivals.
     ///
     /// # Panics
     ///
     /// When `reader` does not read the pipeline that pushed, or has begun to finish the epoch;
-    /// when the push was widened on its way to a reader that reads its pushes; and where the
+    /// when the push was widened on its way to a reader that neither parks nor reads its input
+    /// whole; and where the
     /// guard algebra has no exact difference of `guard` and what is queued ([`guard_minus`]).
     pub fn queue(&mut self, reader: PipelineId, guard: &TileGuard) {
         let (dispatcher, epoch) = match &mut self.target {
             Target::Queue { dispatcher, epoch } => (*dispatcher, *epoch),
+            Target::Probe(arrivals) | Target::ProbeDecided(arrivals) => {
+                arrivals.push(Arrival {
+                    pipeline: reader,
+                    guard: guard.clone(),
+                });
+                return;
+            }
             Target::Decided {
                 dispatcher,
                 whole,
                 reached,
+                range,
                 epoch,
             } => {
                 reached.push(reader.0);
-                // A wholly decided source is decided along whatever its push was restated to on
-                // the way, as an arm of a union restates it under its tag.
+                let source = match range {
+                    true => reader.0,
+                    false => self.from,
+                };
+                // A region that names the entry's input whole is the source wholly decided,
+                // whatever the entry's tiling: a store's seed entry is one value in front of a
+                // pipeline whose input is the loop's positions. A wholly decided source is, along
+                // whatever its push was restated to on the way, as an arm of a union restates it
+                // under its tag.
                 let guard = (!(*whole || guard.is_universal())).then_some(guard);
-                return dispatcher.record_decided(epoch, reader.0, self.from, guard);
-            }
-            Target::Probe(arrivals) => {
-                arrivals.push(Arrival {
-                    pipeline: reader,
-                    guard: guard.clone(),
-                    widened: self.widened,
-                });
-                return;
+                return dispatcher.record_decided(epoch, reader.0, source, guard);
             }
         };
         let (from, r) = (self.from, reader.0);
@@ -2132,45 +2503,33 @@ impl Landing<'_> {
             format!("pipeline {from} pushes to pipeline {r}, which reads it")
         });
         let info = &dispatcher.infos[r];
-        if info.whole.is_some() || info.follows.contains(&from) {
+        // A reader that reads its input whole takes no push, and a nested loop's scope, or a
+        // reader that waits for one, takes its rows in rounds.
+        if info.whole || info.follows.contains(&from) {
             return;
         }
         let queue = &epoch.pipelines[r];
         dispatcher.ensure(queue.phase.load() == Phase::Running, || {
             format!("pipeline {r} receives packages before it finishes")
         });
-        // A reader that parks reads each row once, when every pipeline it reads has decided it: a
-        // push brings the rows it names, widened or not, less what a push brought before, and the
-        // decided pushes release them ([`Dispatcher::park`]).
-        if dispatcher.infos[r].parks {
-            dispatcher.queue_or_park(epoch, r, guard, false);
+        // A reader that parks reads each row once, when every pipeline it reads has decided it:
+        // a push brings the rows it names, widened or not, less what a push brought before, and
+        // the decided pushes release them ([`Dispatcher::park`]).
+        if info.parks {
+            if !info.arrivals {
+                dispatcher.queue_or_park(epoch, r, guard, false);
+            }
             return;
         }
         dispatcher.ensure(!self.widened, || {
             format!(
                 "a push of pipeline {from} is widened to `Everything` on its way to pipeline {r}, \
-                 which neither parks nor reads that pipeline once it has finished"
+                 which neither parks nor reads its input whole"
             )
         });
         dispatcher.ensure(queue.queue.append_unqueued(guard), || {
             format!("pipeline {r} receives packages before the last pipeline it reads finishes")
         });
-    }
-
-    /// Whether the region climbing is a decided region rather than a change: an operator restates
-    /// a decided region by keeping what it names where it keeps the keys, and where it widens them
-    /// by naming nothing until the region is every key, since each of its keys depends on every
-    /// key of its input.
-    pub fn is_decided(&self) -> bool {
-        matches!(self.target, Target::Decided { .. })
-    }
-
-    /// Whether the region climbing is a decided region of a source that is wholly decided: an
-    /// operator that widens its input's keys passes it as every key, since what that source
-    /// contributes to each of the operator's keys is decided, and the reader intersects what its
-    /// other sources decided.
-    pub fn is_wholly_decided(&self) -> bool {
-        matches!(self.target, Target::Decided { whole: true, .. })
     }
 
     /// Push on through `push` as widened: an operator on this path turned the push's region
@@ -2193,8 +2552,78 @@ impl Landing<'_> {
             Target::Queue { dispatcher, .. } | Target::Decided { dispatcher, .. } => {
                 dispatcher.ensure(false, || message)
             }
-            Target::Probe(_) => panic!("{message}"),
+            Target::Probe(_) | Target::ProbeDecided(_) => panic!("{message}"),
         }
+    }
+}
+
+/// The entries a push of one pipeline's keys reaches, and whether each path keeps those keys, as
+/// the consumers on the way declare ([`Consumer::route`]). Nothing is pushed: each consumer states
+/// how it passes any push on.
+pub struct Routes {
+    widened: bool,
+    decides_part: bool,
+    reached: Vec<Route>,
+}
+
+/// One path of a push to the entry of a pipeline ([`Routes`]).
+pub(crate) struct Route {
+    /// The pipeline whose entry the path reaches.
+    pub(crate) pipeline: PipelineId,
+    /// Whether every operator on the path keeps the pushing pipeline's keys, restated as its own
+    /// or under a tag, so that a push of some keys reaches the entry as those keys.
+    pub(crate) keeps_keys: bool,
+    /// Whether the decided region the path passes on names only part of what a row it reaches
+    /// depends on ([`Routes::deciding_part`]).
+    pub(crate) decides_part: bool,
+}
+
+impl Routes {
+    /// No path walked yet.
+    pub(crate) fn new() -> Self {
+        Routes {
+            widened: false,
+            decides_part: false,
+            reached: Vec::new(),
+        }
+    }
+
+    /// The paths walked, each to the entry it reaches.
+    pub(crate) fn reached(self) -> Vec<Route> {
+        self.reached
+    }
+
+    /// Record that the path walked reaches the entry of `pipeline`.
+    pub fn reach(&mut self, pipeline: PipelineId) {
+        self.reached.push(Route {
+            pipeline,
+            keeps_keys: !self.widened,
+            decides_part: self.decides_part,
+        });
+    }
+
+    /// Walk on through `route` as widened: the operator declares that it reads its input's keys
+    /// as none of its own, so a push of some of them reaches it as `Everything`. A sibling path
+    /// walked after `route` returns is not widened by this one.
+    pub fn widened(&mut self, route: impl FnOnce(&mut Self)) {
+        let was = std::mem::replace(&mut self.widened, true);
+        route(self);
+        self.widened = was;
+    }
+
+    /// Walk on through `route` as a path whose decided region names only part of what a row it
+    /// reaches depends on: a widening passes a region that is not whole on as nothing decided,
+    /// and a lookup's operand names the rows that read a decided key, whatever their input holds.
+    pub fn deciding_part(&mut self, route: impl FnOnce(&mut Self)) {
+        let was = std::mem::replace(&mut self.decides_part, true);
+        route(self);
+        self.decides_part = was;
+    }
+
+    /// Refuse the walk: it re-entered a consumer it is passing through, so its chain is a cycle,
+    /// which only a store closes.
+    pub fn reentered(&mut self) {
+        panic!("a push's route re-enters a consumer it is passing through");
     }
 }
 
@@ -2208,7 +2637,18 @@ pub struct Entry {
     pipeline: Placement,
     input: Tiling,
     inner: Box<dyn Consumer>,
+    /// Where an unplaced entry still records a decided push ([`DecidedTarget`]).
+    decides: DecidedTarget,
 }
+
+/// The pipeline an unplaced [`Entry`] records a decided push at, and that pipeline's input, which
+/// the entry's input keys name the same rows of: a loop's drive reads its source by pull, so the
+/// entry in front of the source queues nothing, but the positions the drive emits are the
+/// source's keys, so what the source decides of its keys the scope's input has decided of its
+/// positions. `None` where nothing records it, as in front of any other pulled input.
+// shared-state-ok: the drive and the entry in front of its source both hold it, the planner
+// writes it before the run, and what crosses it is a pipeline's index and a tiling, never a tile.
+pub type DecidedTarget = Rc<RefCell<Option<(PipelineId, Tiling)>>>;
 
 /// The pipeline an [`Entry`] queues for, which a planner sets once it has put the entry's breaker
 /// in one: `None` before, as in a run that only pulls, where the entry queues nothing.
@@ -2223,6 +2663,7 @@ impl Entry {
             pipeline: Rc::new(Cell::new(Some(pipeline))),
             input,
             inner,
+            decides: DecidedTarget::default(),
         }
     }
 
@@ -2236,8 +2677,15 @@ impl Entry {
             pipeline: pipeline.clone(),
             input,
             inner,
+            decides: DecidedTarget::default(),
         };
         (entry, pipeline)
+    }
+
+    /// The target this entry records a decided push at while it is unplaced, which the holder
+    /// keeps for a planner to set ([`DecidedTarget`]).
+    pub fn decided_target(&self) -> DecidedTarget {
+        self.decides.clone()
     }
 }
 
@@ -2288,10 +2736,30 @@ impl Consumer for Entry {
     }
 
     fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        if let Some(pipeline) = self.pipeline.get()
-            && let Some(guard) = pushed_guard(region, &self.input)
+        if let Some(pipeline) = self.pipeline.get() {
+            if let Some(guard) = pushed_guard(region, &self.input) {
+                landing.queue(pipeline, &guard);
+            }
+            return;
+        }
+        if !landing.is_decided() {
+            return;
+        }
+        if let Some((pipeline, input)) = &*self.decides.borrow()
+            && let Some(guard) = pushed_guard(region, input)
         {
-            landing.queue(pipeline, &guard);
+            // The drive's positions are its source's keys, so a region of the source's keys is
+            // one of the store's input.
+            debug_assert!(
+                guard.check_from(input),
+                "a drive's source decides positions of its store's input: {region:?}"
+            );
+            landing.queue(*pipeline, &guard);
+        }
+    }
+    fn route(&mut self, routes: &mut Routes) {
+        if let Some(pipeline) = self.pipeline.get() {
+            routes.reach(pipeline);
         }
     }
 }
@@ -2307,9 +2775,6 @@ pub(crate) fn pushed_guard(region: &Projection, input: &Tiling) -> Option<TileGu
     }
 }
 
-/// The morsels a source pipeline starts with: its breaker's input whole, cut every `rows` keys
-/// where the input's tiling states a finite range of positions for its outermost keys, and one
-/// morsel otherwise.
 /// `held`, a breaker's decided region of its output `tiling`, as a projection: every key where it
 /// names every position of the finite range of positions the output's outermost keys range over,
 /// as a store or an aggregate under a loop of positions `0..n` states the positions it decided,
@@ -2345,6 +2810,9 @@ fn decided_projection(held: TileGuard, tiling: &Tiling) -> Option<Projection> {
     Projection::of(&held).ok()
 }
 
+/// The morsels a source pipeline starts with: its breaker's input whole, cut every `rows` keys
+/// where the input's tiling states a finite range of positions for its outermost keys, and one
+/// morsel otherwise.
 fn seed(input: &Tiling, rows: usize) -> Vec<TileGuard> {
     let guard = input.universal_guard();
     let Some(domain) = input.domain_extent() else {
@@ -2552,11 +3020,12 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
     // called while the walk holds the fan-out, which the push climbs.
     let mut landed = None;
     reach(package.pipeline, &mut |breaker, input| {
+        let tiling = breaker.input_tiling(input);
         // A package carries a guard of the tiling of the pipeline that pushed it, or of this
         // breaker's own input for a source or a pipeline that reads it whole, so it fits only a
         // breaker whose input answers that tiling.
         debug_assert!(
-            package.guard.check_from(&breaker.input_tiling(input)),
+            package.guard.check_from(&tiling),
             "pipeline {p} consumes a guard of the tiling its breaker's input answers: {:?}",
             package.guard
         );
@@ -2621,13 +3090,7 @@ fn finish_with(
         let released = breaker.input_released(input);
         dispatcher.ensure(
             consumed.is_none_or(|consumed| {
-                // Closed over the input's tiling: where a row's level is a finite range of
-                // positions, what the input released through the row's last position covers its
-                // paths past it.
-                released.is_universal()
-                    || guard_minus(&consumed, &released)
-                        .closed_over(&breaker.input_tiling(input))
-                        .is_empty()
+                unreleased(&consumed, &released, &breaker.input_tiling(input)).is_none()
             }),
             || {
                 format!(

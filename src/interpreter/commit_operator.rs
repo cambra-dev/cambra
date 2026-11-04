@@ -1034,6 +1034,20 @@ impl BreakingProducer for InductionStoreProducer {
         self.breaker.held(self.tiling())
     }
 
+    fn seed_placements(&self) -> Vec<crate::interpreter::dispatcher::Placement> {
+        self.seed_placements.clone()
+    }
+
+    /// The positions the last step decided, row by row under rows: the store tile's own
+    /// statement (`Tile::to_guard`), though it holds nothing short of terminal, since a reader
+    /// pulls the tile whole.
+    fn decided(&self) -> TileGuard {
+        match &self.breaker.snapshot {
+            Some(tile) => tile.to_guard(),
+            None => self.tiling().empty_guard(),
+        }
+    }
+
     /// What the store holds. A release of a store with no rows above it names the positions a
     /// reader reads no more and removes nothing from the tile it reads; a nested store's offer
     /// cuts the rows its readers released.
@@ -1148,9 +1162,46 @@ fn precedes_every(value: &Value, extent: &Extent) -> bool {
     }
 }
 
+/// The tiling of a store's seed input: one value, since the store reads every seed whole when it
+/// opens, so a push of any seed names the input whole.
+fn seed_input_tiling() -> Tiling {
+    Tiling::Scalar(Extent::Base(BaseType::Unit))
+}
+
+/// `op`, a store's seed, subscribed in front of `consumer` behind an unplaced entry of the seed
+/// input's tiling, and the entry's placement, which a planner sets to the pipeline that reads the
+/// store's seeds. A push of the seed names the input whole ([`seed_input_tiling`]).
+fn subscribe_seed(
+    op: &mut dyn TileOperator,
+    consumer: &GatedConsumer,
+    scheduler: &mut Scheduler,
+) -> (
+    Box<dyn TileProducer>,
+    crate::interpreter::dispatcher::Placement,
+) {
+    let forward = forwarding_consumer(consumer, &scheduler.wakeup_queue());
+    let (entry, placement) =
+        crate::interpreter::dispatcher::Entry::unplaced(seed_input_tiling(), forward);
+    let seed = op.subscribe(
+        op.tiling().universal_guard(),
+        crate::interpreter::scheduler::widening(Box::new(entry)),
+        scheduler,
+    );
+    (seed, placement)
+}
+
 impl CommitProducer {
+    /// The writer whose source is input `input`, and `None` for the seed input: input 0 where the
+    /// store has seed streams, ahead of every writer's, since the store opens before it steps.
+    fn writer_of(&self, input: InputId) -> Option<usize> {
+        match self.seed_placements.is_empty() {
+            true => Some(input.0),
+            false => input.0.checked_sub(1),
+        }
+    }
+
     /// Call `f` with the source of writer `writer`'s drive, which the store consumes as its input
-    /// `writer`.
+    /// `writer`, or `writer + 1` where it has a seed input.
     fn writer_source<R>(&self, writer: usize, f: impl FnOnce(&dyn TileProducer) -> R) -> R {
         drive_source(&*self.writer_producers[writer], &mut Some(f))
             .expect("a transaction writer reads its drive, which reads a source")
@@ -1176,8 +1227,24 @@ impl SteppedStore for CommitProducer {
         &mut self.breaker
     }
 
+    /// A step of the seed input opens the store, and a step of a writer's input steps in key
+    /// order.
     fn step_store(&mut self, input: InputId) -> Tile {
-        self.step_in_key_order(input.0)
+        match self.writer_of(input) {
+            Some(writer) => self.step_in_key_order(writer),
+            None => {
+                self.taking_ahead = true;
+                if self.open_store() {
+                    // The tile the open publishes states `writer_takes`, which every writer's
+                    // first decision reads.
+                    #[cfg(debug_assertions)]
+                    {
+                        self.takes_published = true;
+                    }
+                }
+                self.render_store()
+            }
+        }
     }
 
     fn settle(&mut self) {
@@ -1217,7 +1284,7 @@ impl Breaker for CommitProducer {
     }
 
     fn inputs(&self) -> usize {
-        self.writer_producers.len()
+        self.writer_producers.len() + usize::from(!self.seed_placements.is_empty())
     }
 
     /// Steps the store until writer `input`'s drive has released `guard` ([`consume_store`]).
@@ -1230,14 +1297,24 @@ impl Breaker for CommitProducer {
     }
 
     fn input_tiling(&self, input: InputId) -> Tiling {
-        self.writer_source(input.0, |source| source.tiling().clone())
+        match self.writer_of(input) {
+            Some(writer) => self.writer_source(writer, |source| source.tiling().clone()),
+            None => seed_input_tiling(),
+        }
     }
 
     /// The source positions of writer `input`'s items the store holds a decision for or has
     /// committed, and those the drive read past: the drive releases an item from its source at
     /// the take.
+    /// For the seed input, all of it once the store has opened, and nothing before.
     fn input_released(&self, input: InputId) -> TileGuard {
-        self.writer_source(input.0, |source| source.obsolete_guard().clone())
+        match self.writer_of(input) {
+            Some(writer) => self.writer_source(writer, |source| source.obsolete_guard().clone()),
+            None => match self.engine.is_some() {
+                true => seed_input_tiling().universal_guard(),
+                false => seed_input_tiling().empty_guard(),
+            },
+        }
     }
 
     /// The writer's drive, and every producer between it and the range over `source`, read the
@@ -1300,7 +1377,17 @@ impl BreakingProducer for CommitProducer {
     }
 
     fn entry_placement(&self, input: InputId) -> Option<crate::interpreter::dispatcher::Placement> {
-        self.placements.get(input.0).cloned()
+        match self.writer_of(input) {
+            Some(writer) => self.placements.get(writer).cloned(),
+            None => self.seed_placements.first().cloned(),
+        }
+    }
+
+    fn entry_placements(&self, input: InputId) -> Vec<crate::interpreter::dispatcher::Placement> {
+        match self.writer_of(input) {
+            Some(_) => self.entry_placement(input).into_iter().collect(),
+            None => self.seed_placements.clone(),
+        }
     }
 }
 
@@ -2440,12 +2527,18 @@ impl TileOperator for CommitOperator {
         // seed computed from a loop settles over as many pulls as that loop takes, and the
         // pull it settles on is the one that opens the store. Draining at subscribe
         // instead bounds a program by how far its seed's input can advance before the
-        // runtime has started ([`InductionStore::subscribe`] says the same). The store reads a
-        // seed by pull at a step, so a push from a pipeline beneath the seed stops in front of it
-        // (`subscribe_pulled`) rather than climb to the store's readers.
+        // runtime has started ([`InductionStore::subscribe`] says the same). As a pipeline
+        // breaker the store reads its seeds as its input 0, before any writer's: each seed is
+        // subscribed behind an entry a planner places in that input's pipeline, and a push of a
+        // seed queues the input whole, since the store reads every seed whole when it opens.
+        let mut seed_placements = Vec::new();
         let seed_producers = std::mem::take(&mut self.seed_ops)
             .into_iter()
-            .map(|(key, mut op)| (key, subscribe_pulled(&mut *op, &consumer, scheduler)))
+            .map(|(key, mut op)| {
+                let (seed, placement) = subscribe_seed(&mut *op, &consumer, scheduler);
+                seed_placements.push(placement);
+                (key, seed)
+            })
             .collect();
         // A writer is the store's input as a pipeline breaker, so it is subscribed behind an
         // entry, as an induction store's body is: the entry stops every push from beneath before
@@ -2478,7 +2571,8 @@ impl TileOperator for CommitOperator {
         )
         .sharing(gate);
         // The store runs as a pipeline breaker of one pipeline per writer, each placed through
-        // its writer's entry; its own placement is its first writer's.
+        // its writer's entry, beside one for its seeds where it has any; its own placement is
+        // its first writer's.
         let base = match placements.first() {
             Some(placement) => base.breaking(consumer.shared().clone(), placement.clone()),
             None => base,
@@ -2486,6 +2580,7 @@ impl TileOperator for CommitOperator {
         Box::new(CommitProducer {
             base,
             placements,
+            seed_placements,
             queued: (0..n).map(|_| BTreeMap::new()).collect(),
             taking_ahead: false,
             #[cfg(debug_assertions)]
@@ -2518,6 +2613,10 @@ struct CommitProducer {
     /// Per writer, the placement of the entry it is subscribed behind, which a planner sets to
     /// the pipeline that consumes the writer's source.
     placements: Vec<crate::interpreter::dispatcher::Placement>,
+    /// Per seed stream, the placement of the entry it is subscribed behind, which a planner sets
+    /// to the pipeline of the store's input 0 ([`Self::writer_of`]). Empty where the store has no
+    /// seed stream, and then it has no seed input.
+    seed_placements: Vec<crate::interpreter::dispatcher::Placement>,
     /// Per writer, the decisions a consuming store has taken and not committed, by the source
     /// position of the item each is for ([`take`](Self::take)). Empty in pull mode.
     queued: Vec<BTreeMap<Position, Held>>,
@@ -3469,12 +3568,17 @@ impl TileOperator for InductionStore {
         // seed computed from a loop settles over as many pulls as that loop takes, and the
         // pull it settles on is the one that opens the store. Draining at subscribe
         // instead bounds a seed by how many positions its input can deliver before the
-        // runtime has started. The store reads a seed by pull at a step, so a push from a
-        // pipeline beneath the seed stops in front of it (`subscribe_pulled`) rather than climb
-        // to the store's readers.
+        // runtime has started. The store reads a seed by pull at a step. Each seed is
+        // subscribed behind an entry a planner places in the pipeline of the loop's scope, which
+        // takes no push of it and records what it has decided.
+        let mut seed_placements = Vec::new();
         let seed_producers = std::mem::take(&mut self.seed_ops)
             .into_iter()
-            .map(|(key, mut op)| (key, subscribe_pulled(&mut *op, &consumer, scheduler)))
+            .map(|(key, mut op)| {
+                let (seed, placement) = subscribe_seed(&mut *op, &consumer, scheduler);
+                seed_placements.push(placement);
+                (key, seed)
+            })
             .collect();
         Box::new(InductionStoreProducer {
             base: ProducerBase::new(
@@ -3486,6 +3590,7 @@ impl TileOperator for InductionStore {
             .sharing(gate)
             .breaking(consumer.shared().clone(), placement),
             seed_producers,
+            seed_placements,
             complete_rows: vec![Predicate::False; self.tiling().levels() + 1],
             // Each store holds its accumulators' seeds as its own, so the changelog is
             // self-describing: `read_as_of`/`store_value_at` fold to the seed below
@@ -3546,6 +3651,9 @@ struct InductionStoreProducer {
     /// Per accumulator key, the per-row seed stream. An induction store with no rows above it has
     /// one row, the empty path, so its seed arrives there.
     seed_producers: Vec<(Value, Box<dyn TileProducer>)>,
+    /// Per seed stream, the placement of the entry it is subscribed behind, which a planner sets
+    /// to the pipeline of the loop's scope.
+    seed_placements: Vec<crate::interpreter::dispatcher::Placement>,
     /// What the body says is complete, one predicate per level of its decision stream,
     /// outermost first: the row levels above the stores, then the positions within one. The
     /// drive is what knows, from its source; the store carries it to the read. An induction store
@@ -5973,6 +6081,8 @@ struct DriverInputs {
     /// The placement of the entry in front of the source, which a planner sets where the drive
     /// is a pipeline breaker ([`InductionDriverProducer`]).
     placement: crate::interpreter::dispatcher::Placement,
+    /// Where the entry in front of the source records a decided push while unplaced.
+    decides: crate::interpreter::dispatcher::DecidedTarget,
     store_producer: Box<dyn TileProducer>,
     source_producer: Box<dyn TileProducer>,
     /// Set by every notification the source sends, for a driver that pulls the source
@@ -6003,10 +6113,26 @@ fn subscribe_behind_entry(
     Box<dyn TileProducer>,
     crate::interpreter::dispatcher::Placement,
 ) {
+    let (producer, placement, _) = subscribe_deciding(op, consumer, scheduler);
+    (producer, placement)
+}
+
+/// [`subscribe_behind_entry`], answering beside the placement the entry's decided target
+/// ([`DecidedTarget`](crate::interpreter::dispatcher::DecidedTarget)).
+fn subscribe_deciding(
+    op: &mut dyn TileOperator,
+    consumer: Box<dyn Consumer>,
+    scheduler: &mut Scheduler,
+) -> (
+    Box<dyn TileProducer>,
+    crate::interpreter::dispatcher::Placement,
+    crate::interpreter::dispatcher::DecidedTarget,
+) {
     let (entry, placement) =
         crate::interpreter::dispatcher::Entry::unplaced(op.tiling().clone(), consumer);
+    let decides = entry.decided_target();
     let producer = op.subscribe(op.tiling().universal_guard(), Box::new(entry), scheduler);
-    (producer, placement)
+    (producer, placement, decides)
 }
 
 fn subscribe_driver_inputs(
@@ -6024,7 +6150,7 @@ fn subscribe_driver_inputs(
     // positions it emits as a pipeline breaker's packages, and the pipelines beneath the source
     // have finished.
     let forward = source_news.consumer(forwarding_consumer(&consumer, &scheduler.wakeup_queue()));
-    let (source_producer, placement) = subscribe_behind_entry(source_op, forward, scheduler);
+    let (source_producer, placement, decides) = subscribe_deciding(source_op, forward, scheduler);
     // The store's progress changes what the drive renders — the next position it may
     // emit, and which rows it calls complete — so the store's wakes reach the drive's
     // consumer like the source's arrivals do.
@@ -6033,6 +6159,7 @@ fn subscribe_driver_inputs(
         consumer,
         gate,
         placement,
+        decides,
         store_producer,
         source_producer,
         source_news,
@@ -6274,6 +6401,7 @@ impl TileOperator for InductionDriver {
             store_producer: inputs.store_producer,
             source_producer: inputs.source_producer,
             source_news: inputs.source_news,
+            decides: inputs.decides,
             source: DecodedSource::default(),
             nested,
             consumer,
@@ -6375,6 +6503,8 @@ struct InductionDriverProducer {
     source_producer: Box<dyn TileProducer>,
     /// Whether the source has notified since it was last read.
     source_news: Notified,
+    /// Where the entry in front of the source records a decided push while unplaced.
+    decides: crate::interpreter::dispatcher::DecidedTarget,
     /// The source as of its last read.
     source: DecodedSource,
     /// `None` for a drive whose body takes the position alone.
@@ -6579,6 +6709,10 @@ impl TileProducer for InductionDriverProducer {
             .next_delivered(self.emitted_through.as_ref())
             .map(|path| path.to_vec());
         Some(next)
+    }
+
+    fn decides_through(&self) -> Option<crate::interpreter::dispatcher::DecidedTarget> {
+        Some(self.decides.clone())
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
