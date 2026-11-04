@@ -58,7 +58,7 @@ impl<'a> ProgramLowering<'a> {
         let import_names: HashMap<SmolStr, Span> = ast
             .body
             .iter()
-            .filter_map(|stmt| import_name(stmt).map(|name| (name, stmt.span)))
+            .filter_map(|stmt| import_name(program, stmt).map(|name| (name, stmt.span)))
             .collect();
         // A `use` type name of an import reaches its type through that import.
         let used_types: HashMap<SmolStr, Span> = ast
@@ -94,16 +94,16 @@ impl<'a> ProgramLowering<'a> {
                 _ => None,
             })
             .collect();
-        // Each import whose arguments are well formed. One whose arguments are
-        // not reaches no shared import.
+        // Each import whose arguments are well formed, the prelude's first. One whose
+        // arguments are not reaches no shared import.
         let mut pending = Vec::new();
-        for stmt in &ast.body {
+        for stmt in program.prelude_for(importer).iter().chain(&ast.body) {
             let ChlStmt::Import { path, args, .. } = &stmt.node else {
                 continue;
             };
             // A segment the parser refused names no module, and loading has
             // reported a module with no file.
-            let (Some(module), Some(name)) = (path.to_path(), import_name(stmt)) else {
+            let (Some(module), Some(name)) = (path.to_path(), import_name(program, stmt)) else {
                 continue;
             };
             let Some((file, target)) = program
@@ -221,7 +221,7 @@ impl<'a> ProgramLowering<'a> {
             })
         });
         let interfaces = if typed {
-            self.interfaces(ast)
+            self.interfaces(importer, ast)
         } else {
             HashMap::new()
         };
@@ -235,7 +235,7 @@ impl<'a> ProgramLowering<'a> {
             let decided: HashSet<Span> = resolved.keys().copied().collect();
             if typed {
                 let scope = module_scope(
-                    ast,
+                    importer,
                     None,
                     program,
                     &interfaces,

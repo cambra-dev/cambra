@@ -351,37 +351,42 @@ before anything reads the node, and the use specializes as any use of a generali
 does. No `Method` node survives inference. A method no type declares is a lowering error pointing at
 `(r.f)(…)`, the call of a field's function, and a position, `t.0(…)`, names no method.
 
-### The compiler-provided `Option`
+### `Option` in `std`
 
-`Option(T)` is a `NominalDecl` the compiler provides (`nominal::option`) at the path `std::Option`,
-with the constructors `none` and `some(T)`, the methods `is_none`, `value` and `unwrap_or`, and no
-source. Its constructor names are the tags the runtime builds when it answers a checked lookup
-(`V_NONE`, `V_SOME`), so a lookup's answer is a value of it. `LoweringContext::nominal_type`
-answers it for the name `Option` after the module's own declarations, and `Type::option_of` builds
-an application of it.
+`Option(T)` is the `type` that `stdlib/src/std.cambra` declares, with the constructors `none`
+and `some(T)`, the clause `requires Equatable(T, T)`, the methods `is_none`, `value` and
+`unwrap_or`, and an instance of `Equatable`. The prelude imports it, so every module outside the
+std root names it bare, and `NominalDecl::spelled` writes it bare. A message spells a member the
+prelude reaches the same way, `Option::some`, not `std::Option::some` (`chl_print`'s `spelling`).
 
-A member of `Option` is bound only where the module names it: a reference records it
-(`member_reference`), and `bind_constructors` binds the recorded ones. Each is an ordinary `match`:
+The compiler recognizes the declaration by its module path and name (`NominalDecl::is_option`).
+When `std` lowers, lowering records the declaration (`LoweringContext::std_option`) and
+asserts that its constructors are `none` and `some(T)`, the tags the runtime builds when it answers
+a checked lookup (`V_NONE`, `V_SOME`). The `lookup?` that `lower_subscript` builds for `c[k]`
+carries `(_ ⇒ Option(_))` as its type, and `emit_lookup_checked` reads the declaration from it. A
+module that declares its own `Option` shadows the prelude's name, and its lookups still answer
+`std`'s.
 
-- `is_none` is `λ 𝑜 : Option(𝑇) → match 𝑜 { Option::some(_) → false; Option::none → true }`
-  (`bind_is_none`).
-- `value`, which `x!` calls (`lower_unwrap`), is
-  `λ 𝑜 : {Option(𝑇) | not (__elem ▷ ctor_is(Option::none))} → match 𝑜 { Option::some(𝑣) → 𝑣 }`
-  (`bind_value`). The parameter's refinement rules out `none`, so the `match` has no arm for it
-  (`type-inference.md`, [Unreachable arms](type-inference.md#unreachable-arms)).
-- `unwrap_or` is `λ 𝑝 : (Option(𝑇₁), 𝑇₂) → match 𝑝.0 { Option::some(𝑣) → 𝑣; Option::none → 𝑝.1 }`,
-  polymorphic over `𝑇₃`, `𝑇₁ <: 𝑇₃` and `𝑇₂ <: 𝑇₃` (`bind_unwrap_or`). The payload and the default
-  each have their own parameter, so a call does not equate their types. Only the result's
-  parameter lies above both.
+The methods are CHL:
+
+- `value`, which `x!` calls, takes `{Option(T) where not _.is_none()}`, a refined `self`
+  (`docs/chl-spec.md`, "Associated functions and methods"). Its `match` has no arm for `none`,
+  which the refinement rules out (`type-inference.md`,
+  [Unreachable arms](type-inference.md#unreachable-arms)). `lower_unwrap` applies `std`'s
+  binding of it, through the qualifier that reaches `std`'s `Option` as a method call reaches a
+  foreign candidate (`std_option_member`), so a module that shadows `Option` still unwraps
+  `std`'s.
+- `unwrap_or` is `def Option::unwrap_or(R, T <: R, self: Option(T), fallback: R)`. The payload and
+  the default each have their own parameter, so a call does not equate their types. Only the
+  result's parameter lies above both.
 
 The refinements of `value`'s and `unwrap_or`'s results are the ones their `match` derives
-(`type-inference.md`, [Arm facts](type-inference.md#arm-facts)). A method call names every type
-that declares its method, because inference picks the candidate from the receiver's type, so any
-`.is_none()` call binds `Option::is_none`, even one whose receiver is a type declaring its own
-`is_none`. A module that names no member lowers as it would without the declaration. Its identity
-is its path, so every compilation, and every version of a reloaded program, names the same type.
-Its spans are empty, and lowering refuses the programs that would point a diagnostic at one: a
-declaration named `Option`, and an associated function of it.
+(`type-inference.md`, [Arm facts](type-inference.md#arm-facts)): neither states a result type.
+
+Linking drops each binding of a std module's shared import that nothing in the program reads
+(`drop_unread_std_imports`), so a program that names no member of `Option` holds none of
+`std`'s chain, and its tree is the one it would have without the prelude. Functions bound
+together, as an `impl` block's are, drop only when nothing reads any of them.
 
 ### A constructed value states its constructor and payload
 
@@ -394,18 +399,18 @@ and as the path to its payload (`type-inference.md`,
 
 `emit_nominal_ctor` refines each value it builds of a type that states its constructors
 (`nominal::states_constructors`) by `__elem ▷ ctor_is(N::c)` and, for a constructor that takes an
-argument, `(__elem ▷ ctor_payload(N::c)) == 𝑎` (`nominal::ctor_refinements`). `Option` alone
-states its constructors. The encoding, the arm facts and the coverage proof of a `match` hold for
-every nominal type (`type-inference.md`, [Arm facts](type-inference.md#arm-facts)). Trait
+argument, `(__elem ▷ ctor_payload(N::c)) == 𝑎` (`nominal::ctor_refinements`). `std`'s `Option`
+alone states its constructors (`NominalDecl::is_option`). The encoding, the arm facts and the
+coverage proof of a `match` hold for every nominal type (`type-inference.md`,
+[Arm facts](type-inference.md#arm-facts)). Trait
 selection and the passes after inlining do not yet read a refined value of any other type. The
 argument `𝑎` is stated only when it is a term (`smt::is_term`), as the arm facts and a `match`'s
 derived refinement state only terms: any other argument would copy a program into the type. The
 solver drops what it cannot read of a term, as it drops any antecedent outside its fragment.
 
 The payload is stated with `==`, which is `Equatable`'s, and a predicate can become a term
-(`compile_refinement_predicates`). `Option(T)` therefore requires `Equatable(T, T)`
-(`nominal::record_option_requirements`). The compiler's trait table records the clause when it
-builds `Equatable`, since that table's `Option` instance names the declaration. A constructor states
+(`compile_refinement_predicates`). `Option(T)` therefore requires `Equatable(T, T)`, which `std`
+states on the declaration: `type Option(T) requires Equatable(T, T)`. A constructor states
 its declaration's clause, so every call of `Option::some` is checked against it. A checked lookup
 builds an `Option(V)` without a constructor, and `emit_lookup_checked` requires `Equatable(V, V)`.
 `Unit` has an `Equatable` instance, which a `Set`'s lookup, answering `Option(Unit)`, needs. The

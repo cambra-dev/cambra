@@ -26,7 +26,7 @@
 #         with begin():
 #             deadlines[r.id] := time::now() + time::minutes(30)
 #
-# Status: [Decided] (docs/chl-spec.md, "7.5 Time [Decided]"). The std root it belongs to is
+# Status: [Decided] (docs/chl-spec.md, "7.5 Time [Decided]"). Embedding it in the std root is
 # [Planned] (docs/chl-spec.md, "9.16 The std root"). `[proposed]` marks each construct the compiler
 # lacks.
 

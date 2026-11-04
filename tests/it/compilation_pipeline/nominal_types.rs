@@ -10,7 +10,9 @@ use rstest::rstest;
 use cambra::ccl::FieldKey;
 use cambra::interpreter::Value;
 
-use super::helpers::{check_compile_error, check_scalar, make_record, make_tuple};
+use super::helpers::{
+    check_compile_error, check_program_scalar, check_scalar, make_record, make_tuple,
+};
 use super::modules::{compile_errors, program, report_count};
 
 /// A `Value::Union` at the constructor `tag` carrying `inner`.
@@ -1400,6 +1402,114 @@ fn a_method_is_called_on_its_receiver() {
     );
 }
 
+/// A method's `self` may carry a refinement of the type it has: in an `impl` block, outside one,
+/// and for a type without parameters. Each call proves it, here from `limit`'s value.
+#[rstest]
+#[case::in_a_block(indoc! {r#"
+    limit = 3
+
+    type Pair(T):
+        pair(T, T)
+
+    impl Pair(T):
+        def first(self: {Pair(T) where limit > 0}) => T:
+            match self:
+                case Pair::pair(a, _):
+                    a
+
+    Pair::pair(4, 5).first()
+"#})]
+#[case::outside_a_block(indoc! {r#"
+    limit = 3
+
+    type Pair(T):
+        pair(T, T)
+
+    def Pair::first(T, self: {Pair(T) where limit > 0}) => T:
+        match self:
+            case Pair::pair(a, _):
+                a
+
+    Pair::first(Pair::pair(4, 5))
+"#})]
+#[case::without_parameters(indoc! {r#"
+    limit = 3
+
+    type Price = Int
+
+    def Price::cents(self: {Price where limit > 0}) => Int:
+        Price::extract(self)
+
+    Price::new(4).cents()
+"#})]
+fn a_method_s_self_is_refined(#[case] code: &str) {
+    check_scalar(code, Value::Int(4));
+}
+
+/// A call whose receiver does not meet `self`'s refinement is refused at the call.
+#[test]
+fn a_receiver_outside_self_s_refinement_is_refused() {
+    check_compile_error(
+        indoc! {r#"
+            limit = 3
+
+            type Price = Int
+
+            impl Price:
+                def cents(self: {Price where limit < 0}) => Int:
+                    Price::extract(self)
+
+            Price::new(4).cents()
+        "#},
+        "Type mismatch for this call",
+    );
+}
+
+/// A refinement of `self` refines the type `self` has: its base names no other type and no
+/// other parameters.
+#[rstest]
+#[case::another_type_in_a_block(
+    indoc! {r#"
+        type A = Int
+        type B = Int
+
+        impl A:
+            def f(self: {B where True}) => Int:
+                1
+
+        1
+    "#},
+    "`self` of `A::f` is the `A` the block declares functions of, and an annotation only \
+     refines it: `self: {A where …}`"
+)]
+#[case::other_parameters_in_a_block(
+    indoc! {r#"
+        type Box(T) = T
+
+        impl Box(T):
+            def f(self: {Box(Int) where True}) => Int:
+                1
+
+        1
+    "#},
+    "`self` of `Box::f` is the `Box(T)` the block declares functions of, and an annotation \
+     only refines it: `self: {Box(T) where …}`"
+)]
+#[case::other_parameters_outside_a_block(
+    indoc! {r#"
+        type Box(T) = T
+
+        def Box::f(T, self: {Box(Int) where True}) => Int:
+            1
+
+        1
+    "#},
+    "`self` of `Box::f` is `Box` at type parameters of the function's own, each named once"
+)]
+fn a_refinement_of_self_keeps_its_base(#[case] code: &str, #[case] expected: &str) {
+    check_compile_error(code, expected);
+}
+
 #[test]
 fn extract_is_a_method() {
     check_scalar(
@@ -1820,8 +1930,8 @@ fn method_errors_name_what_is_wrong() {
 
                 1
             "#},
-            "`self` of `A::f` is the `A` the block declares functions of, and takes no \
-             annotation",
+            "`self` of `A::f` is the `A` the block declares functions of, and an annotation \
+             only refines it: `self: {A where …}`",
         ),
         (
             indoc! {r#"
@@ -1832,7 +1942,8 @@ fn method_errors_name_what_is_wrong() {
 
                 1
             "#},
-            "`self` of `Price::f` is a `Price`, and takes no annotation",
+            "`self` of `Price::f` is a `Price`, and an annotation only refines it: \
+             `self: {Price where …}`",
         ),
         (
             indoc! {r#"
@@ -2585,10 +2696,10 @@ fn a_method_delegates_to_another_types_same_named_method() {
 }
 
 // ---------------------------------------------------------------------------
-// The compiler-provided `Option`
+// `Option`, which `std` declares and the prelude imports
 // ---------------------------------------------------------------------------
 
-/// `Option(T)` is a nominal type the compiler provides, built by `Option::some` and
+/// `Option(T)` is the nominal type `std` declares, built by `Option::some` and
 /// `Option::none` and taken apart by arms naming them.
 #[test]
 fn option_is_built_and_matched_by_its_constructors() {
@@ -2625,7 +2736,7 @@ fn a_checked_lookup_answers_an_option() {
     );
 }
 
-/// `Option::is_none` is a method the compiler provides with `Option`.
+/// `Option::is_none` is a method `std` declares with `Option`.
 #[test]
 fn option_declares_is_none() {
     check_scalar(
@@ -2656,6 +2767,100 @@ fn is_none_as_a_condition(#[case] tail: &str, #[case] expected: Value) {
         {tail}"#
         ),
         expected,
+    );
+}
+
+/// `Option`s compare by value where their payloads do, through the instance of `Equatable`
+/// that `std` declares (`docs/chl-spec.md`, "Equality and order").
+#[test]
+fn options_compare_by_value() {
+    check_scalar(
+        indoc! {r#"
+            m = map([(1, 10)])
+            (m[1] == Option::some(10), m[2] == Option::none, m[1] == m[2])
+        "#},
+        make_tuple(&[Value::Bool(true), Value::Bool(true), Value::Bool(false)]),
+    );
+}
+
+/// A module's own `Option` shadows the prelude's name, and a checked lookup still answers
+/// `std`'s (`docs/chl-spec.md`, "9.16 The std root").
+#[test]
+fn a_module_s_own_option_shadows_the_prelude_s() {
+    check_scalar(
+        indoc! {r#"
+            type Option:
+                yes
+                no
+
+            def flag(o: Option) => Int:
+                match o:
+                    case Option::yes:
+                        1
+                    case Option::no:
+                        0
+
+            m = map([(1, 10)])
+            flag(Option::yes) + (10 if m[2].is_none() else 0)
+        "#},
+        Value::Int(11),
+    );
+}
+
+/// In a program where a module declares its own `Option`, a diagnostic writes `std`'s by its
+/// path, so the two read apart (`docs/chl-spec.md`, "9.16 The std root").
+#[test]
+fn a_diagnostic_writes_std_s_option_by_its_path_where_a_module_declares_its_own() {
+    check_compile_error(
+        indoc! {"
+            type Option(T):
+                none
+                some(T)
+
+            m = map([(1, 10)])
+            def f(o: Option(Int)) => Int:
+                0
+            f(m[1])
+        "},
+        "expected Option(Int), found std::Option(",
+    );
+}
+
+/// In a module that declares its own `Option`, `x!` still unwraps `std`'s, reached through an
+/// import that reaches it (`docs/chl-spec.md`, "9.16 The std root").
+#[test]
+fn an_unwrap_in_a_module_with_its_own_option_reaches_std_s_through_an_import() {
+    let root = indoc! {"
+        import lib
+        type Option:
+            yes
+        lib::s!
+    "};
+    check_program_scalar(
+        &program(root, &[("lib", "pub s = Option::some(3)\n")]),
+        Value::Int(3),
+    );
+}
+
+/// An import of `std` binds `std` and its `use` names beside the prelude's, and both name one
+/// type.
+#[test]
+fn an_explicit_import_of_std_names_the_prelude_s_type() {
+    check_scalar(
+        indoc! {r#"
+            import std use Option as Opt
+
+            def or_zero(o: Opt(Int)) => Int:
+                match o:
+                    case std::Option::some(v):
+                        v
+                    case Option::none:
+                        0
+
+            m = map([(1, 10)])
+            or_zero(m[1]) + or_zero(Option::some(5))
+        "#},
+        Value::Int(15),
     );
 }
 
@@ -2718,21 +2923,13 @@ fn option_errors_name_what_is_wrong() {
         ),
         (
             indoc! {r#"
-                type Option(T):
-                    some(T)
-
-                1
-            "#},
-            "`Option` is a built-in type and cannot be given another meaning",
-        ),
-        (
-            indoc! {r#"
                 def Option::get(T, self: Option(T), d: T) => T:
                     d
 
                 1
             "#},
-            "`Option` is a built-in type, so this module declares no associated function of it",
+            "`Option` is not a nominal type this module declares, so `Option::get` has no type \
+             to belong to",
         ),
         (
             indoc! {r#"

@@ -20,103 +20,15 @@ use crate::ccl::ccl_utils::{free_names, strip_refinements};
 use crate::ccl::constant::{ConstParam, ConstTerm, NoValue};
 use crate::ccl::{
     BaseType, CtorRef, FieldKey, FunKind, Label, Name, Refinement, RefinementSet, Type, TypeKind,
-    TypeParam, TypeParamId, V_NONE, V_SOME,
+    TypeParam, TypeParamId,
 };
 
-/// The name the compiler-provided `Option` declaration binds.
+/// The name `std` gives `Option`, the type the checked lookup `c[k]` answers.
 pub const OPTION: &str = "Option";
 
-/// The path of the module the compiler-provided declarations belong to.
-const STD: &str = "std";
-
-thread_local! {
-    /// `Option`, built once per thread. Its identity is its path, `std::Option`, so this
-    /// is a cache: any two builds compare equal.
-    static OPTION_DECL: Rc<NominalDecl> = option_declaration();
-}
-
-/// `type Option(T): none, some(T)` in `std`, with the constructor names [`V_NONE`] and
-/// [`V_SOME`] that the runtime builds when it answers a checked lookup.
-fn option_declaration() -> Rc<NominalDecl> {
-    let span = Span::new(chl_parser::FileId::ROOT, 0, 0);
-    let t = TypeParam::declared("T");
-    let decl = NominalDecl::declared_in(
-        vec![SmolStr::new_static(STD)],
-        OPTION.into(),
-        vec![Rc::clone(&t)],
-        span,
-        false,
-    );
-    decl.define(vec![
-        NominalCtor::unwritten(V_NONE.name().into(), span, Vec::new()),
-        NominalCtor::unwritten(V_SOME.name().into(), span, vec![(None, Type::Param(t))]),
-    ])
-    .expect("`some` names `T`");
-    decl
-}
-
-/// The compiler-provided `Option(T)` (`docs/chl-spec.md`, "9.16 The std root"), which the
-/// checked lookup answers and `Option(T)` in an annotation names.
-///
-/// It has no source, so its spans are empty, at the start of the root file. Lowering
-/// refuses every program that would point a diagnostic at one: a declaration of the name
-/// `Option`, and an associated function of it.
-///
-/// Its method `is_none` is built by lowering (`bind_is_none` in `src/ccl/lower/nominal.rs`).
-/// The interpreter declares the same members (`collect_types` in `chl-interp/src/eval.rs`),
-/// and `option_values` in `tests/it/differential_interp.rs` checks that the two agree.
-///
-/// Its `requires` clause ([`record_option_requirements`]) names `Equatable`, whose instance
-/// table names this declaration, so the clause is recorded by the table's build, which this
-/// forces.
-pub fn option() -> Rc<NominalDecl> {
-    let decl = OPTION_DECL.with(Rc::clone);
-    if decl.requirements.get().is_none() {
-        crate::ccl::infer::solver::traits::Trait::equatable();
-    }
-    debug_assert!(
-        decl.requirements.get().is_some(),
-        "building the compiler's traits records `Option`'s requirements"
-    );
-    decl
-}
-
-/// Record `Option(T)`'s `requires` clause, `Equatable(T, T)`, given `equatable`, the trait of
-/// `==`. The compiler's trait table calls this as it builds `Equatable`, before it names
-/// `Option` ([`option`]).
-///
-/// A constructor states its payload with `==` ([`ctor_refinements`]), and a predicate can become
-/// a term, so `Option::some`'s precise type is well-typed only where its payload has an
-/// `Equatable` instance. A constructor states its declaration's clause, so every call is checked
-/// against it, and a checked lookup, which builds an `Option(V)` without a constructor, requires
-/// the same of `V` (`emit_lookup_checked` in `src/ccl/infer/emit.rs`).
-///
-/// TODO: find a statement of the payload that needs no instance. The clause exists only because
-/// the payload fact is spelled with `==`, and it ties every lookup to `Equatable`.
-pub(crate) fn record_option_requirements(equatable: &crate::ccl::infer::solver::traits::Trait) {
-    OPTION_DECL.with(|decl| {
-        let [t] = decl.params.as_slice() else {
-            unreachable!("`Option` declares one type parameter")
-        };
-        let t_ty = Type::Param(Rc::clone(t));
-        decl.set_requirements(DeclRequirements {
-            params: vec![crate::ccl::ty::PolyParam {
-                param: Rc::clone(t),
-                kind: TypeKind::Type,
-                bound_at: None,
-            }],
-            requires: vec![Rc::new(crate::ccl::ty::TraitRequirement {
-                trait_: equatable.clone(),
-                args: vec![t_ty.clone(), t_ty],
-                terms: Vec::new(),
-                effect_assoc: Vec::new(),
-                assoc: Vec::new(),
-                binders: Vec::new(),
-                at: None,
-            })],
-        });
-    });
-}
+/// The path of the module that declares [`OPTION`] (`stdlib/src/std.cambra`). The compiler
+/// recognizes `Option` by this path and its name (`docs/chl-spec.md`, "9.16 The std root").
+pub const OPTION_MODULE: [&str; 1] = ["std"];
 
 /// The names of the two types bounding the variables that stand for clauses: every effect is
 /// below `Effect`, and every requirement below `Context` (`docs/chl-spec.md`, "6.9 Capabilities").
@@ -131,7 +43,7 @@ thread_local! {
 /// `type name` in `std` with no constructor: no value has an effect or a requirement type.
 fn clause_bound_declaration(name: &str) -> Rc<NominalDecl> {
     let decl = NominalDecl::declared_in(
-        vec![SmolStr::new_static(STD)],
+        vec![SmolStr::new_static(chl_parser::module_path::STD_ROOT)],
         name.into(),
         Vec::new(),
         Span::new(chl_parser::FileId::ROOT, 0, 0),
@@ -331,11 +243,11 @@ pub fn ctor_refinements(
 /// it derives its result's refinement from its arms (`src/ccl/design/nominal-types.md`,
 /// "A constructed value states its constructor and payload").
 ///
-/// `Option` alone does. The encoding, the arm facts and the coverage proof are general; a
-/// refinement on every nominal value is not yet, since trait selection and the passes after
+/// `std`'s `Option` alone does. The encoding, the arm facts and the coverage proof are general;
+/// a refinement on every nominal value is not yet, since trait selection and the passes after
 /// inlining do not read a refined nominal type.
 pub fn states_constructors(decl: &NominalDecl) -> bool {
-    *decl == *option()
+    decl.is_option()
 }
 
 /// What an arm of a `match` over `scrutinee`, a value of `decl` at `args`, knows of the
@@ -469,11 +381,6 @@ impl CtorRef {
     }
 }
 
-/// The compiler-provided declaration `name` names, if any.
-pub fn builtin(name: &str) -> Option<Rc<NominalDecl>> {
-    (name == OPTION).then(option)
-}
-
 /// A declared nominal type, identified by the path of the module that declares it, its name,
 /// and the arguments of its implicit parameters (`docs/chl-spec.md`, "Nominal type
 /// identity"). Equality and hashing are by those, so the same source declares the same types
@@ -535,6 +442,10 @@ pub struct NominalDecl {
     /// What every application of the type requires of its arguments, its `requires` clause, set
     /// once the constructors lower. Shared with every instance.
     requirements: Rc<OnceCell<DeclRequirements>>,
+    /// Whether the prelude binds this declaration under a name that some module of the program
+    /// declares itself, so that a diagnostic writes this one by its path, `std::Option`
+    /// ([`Self::spelled`]).
+    pub prelude_shadowed: bool,
 }
 
 /// A declaration's `requires` clause (`docs/chl-spec.md`, "Declaring a nominal type"): its type
@@ -802,6 +713,7 @@ impl NominalDecl {
             implicit_consts: Rc::new(OnceCell::new()),
             const_args: None,
             requirements: Rc::new(OnceCell::new()),
+            prelude_shadowed: false,
         })
     }
 
@@ -927,6 +839,7 @@ impl NominalDecl {
             implicit_consts: Rc::clone(&self.implicit_consts),
             const_args: self.const_args.clone(),
             requirements: Rc::clone(&self.requirements),
+            prelude_shadowed: self.prelude_shadowed,
         }
     }
 
@@ -1117,13 +1030,21 @@ impl NominalDecl {
     }
 
     /// The type's name as a diagnostic writes it: qualified by its module, `shop::Price`,
-    /// unless the root or the compiler declares it, whose types a program names bare. An
-    /// instance's module is written with its implicit arguments, as an import or a run
-    /// passes them: `shop(Receipt=stripe::Receipt)::Order`. The root has one run, so its
+    /// unless the root declares it, the prelude names it, or the compiler reserves its name.
+    /// A declaration the prelude names is qualified too when some module of the program
+    /// declares that name itself ([`Self::prelude_shadowed`]), so the two read apart.
+    /// An instance's module is written with its implicit arguments, as an import or a
+    /// run passes them: `shop(Receipt=stripe::Receipt)::Order`. The root has one run, so its
     /// instances are written bare too.
     pub fn spelled(&self) -> String {
+        if self.prelude_shadowed {
+            return format!("{}::{}", self.module.join("::"), self.name);
+        }
         if self.module.is_empty() || self.is_builtin() {
             return self.name.to_string();
+        }
+        if let Some(bare) = crate::ccl::load::prelude_name(&self.module, &self.name) {
+            return bare.to_string();
         }
         let module = self.module.join("::");
         if self.is_instance() {
@@ -1133,13 +1054,15 @@ impl NominalDecl {
         }
     }
 
-    /// Whether the compiler provides the declaration: one [`builtin`] names, or a bound of
-    /// the variables standing for clauses, which no type annotation names ([`effect`],
-    /// [`context`]).
+    /// Whether the declaration is `std`'s `Option` or a bound of the variables standing for
+    /// clauses ([`effect`], [`context`]).
     pub fn is_builtin(&self) -> bool {
-        builtin(&self.name).is_some_and(|b| *b == *self)
-            || *self == *effect()
-            || *self == *context()
+        self.is_option() || *self == *effect() || *self == *context()
+    }
+
+    /// Whether the declaration is `std`'s `Option` ([`OPTION_MODULE`]).
+    pub fn is_option(&self) -> bool {
+        self.name == OPTION && self.module.iter().map(SmolStr::as_str).eq(OPTION_MODULE)
     }
 
     /// The tag a value built by the constructor `ctor` carries once nominal types erase.
