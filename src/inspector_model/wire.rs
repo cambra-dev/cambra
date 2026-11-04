@@ -1412,7 +1412,7 @@ mod tests {
         );
     }
 
-    /// Every child id, every operator input id, and every walk start of every    /// Every child id, every operator input id, and every walk start of every
+    /// Every child id, every operator input id, and every walk start of every
     /// pane names a node of that pane's own table. A dangling id is the failure
     /// the node table makes possible and a nested tree could not express.
     #[test]

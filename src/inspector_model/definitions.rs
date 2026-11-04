@@ -100,10 +100,13 @@ const PARAM_PROJ: &str = "lower.param_proj";
 /// writes.
 fn collect_binder_sites(expr: &Expr, projection: &SourceProjection, out: &mut HashMap<Uid, Span>) {
     expr.walk_binders(|b| {
-        // Lowering's own binders are not names a reader can go to
-        // ([`Name::source_spelling`]). Without the test the tupled binder's
-        // own occurrences would emit a second row at a parameter's use span,
-        // competing with the projection's.
+        // A binder has a definition site when its name has a source spelling
+        // ([`Name::source_spelling`]) and its occurrence traces to CHL: the name
+        // the user wrote, or the declaration's name for one a declaration
+        // generates (`N::new`, `N::extract`). A binder the compiler provides has
+        // neither and is no name a reader can go to. Without the spelling test
+        // the tupled binder's own occurrences would emit a second row at a
+        // parameter's use span, competing with the projection's.
         if let Name::Unique { uid, .. } = &b.name
             && b.name.source_spelling().is_some()
             && let Some(span) = id_span(b.occurrence.id(), projection)
@@ -366,16 +369,26 @@ mod tests {
         }
     }
 
-    /// A name lowering declares for itself resolves no use: the single-constructor form's
-    /// `new` and the `case` its `extract` builds are written nowhere.
+    /// A name a declaration generates resolves to the declaration's name. The pattern
+    /// head its `extract` builds is spelled nowhere, so it resolves no use.
     #[test]
-    fn a_name_lowering_declares_resolves_no_use() {
+    fn a_generated_name_resolves_to_its_declaration() {
         let got = resolved(indoc! {r#"
             type Price = {amount: Int}
 
             p = Price::new(amount=3)
             p.extract().amount
         "#});
+        for name in ["new", "extract"] {
+            assert!(
+                got.contains(&(
+                    name.to_string(),
+                    "Price".to_string(),
+                    format!("Price::{name}")
+                )),
+                "`{name}` resolves to `type Price`; got {got:?}"
+            );
+        }
         assert!(
             !got.iter().any(|(u, _, n)| n == "new" && u == "Price"),
             "the `case` `extract` builds contributes no head row; got {got:?}"

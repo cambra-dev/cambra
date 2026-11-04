@@ -448,6 +448,24 @@ describe("an occurrence at a position", () => {
   });
 });
 
+describe("an occurrence on its holder's span", () => {
+  // `def f(p, q):` lowers to `λ __arg_tuple_0 → …` over [7,32). The source writes the
+  // tupled parameter nowhere, so its binder is recorded at the lambda's span, one level
+  // deeper than the lambda.
+  const heldNodes: IrNode[] = [
+    node(30, "Lambda(__arg_tuple_0)", { file: 0, start: 7, end: 32 }, "((Int, Int) ⇒ Int)", [
+      value(31),
+      { id: 32, kind: "occurrence" },
+    ]),
+    node(31, "Var(g)", { file: 0, start: 30, end: 31 }, "Int"),
+    node(32, "Binder(__arg_tuple_0)", { file: 0, start: 7, end: 32 }, "(Int, Int)"),
+  ];
+  const held = buildIndices(30, heldNodes, [], "");
+  it("does not win the tie against the node that holds it", () => {
+    expect(held.tightestNodeAt(7)).toBe(30);
+  });
+});
+
 describe("typesAt (monomorphized type set)", () => {
   it("returns the single narrowest type at a point", () => {
     expect(idx.typesAt(3)).toEqual(["Int"]); // leaf
