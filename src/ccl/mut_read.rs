@@ -258,8 +258,8 @@ fn spine(expr: Expr, muts: &Muts, open: &mut Open) -> Expr {
             )
         }
 
-        // An `impl` block's functions are a statement as a `let` is, each definition
-        // evaluated at it, and the body continues the same block.
+        // An `impl` or `instance` block's functions are a statement as a `let` is, each
+        // definition evaluated at it, and the body continues the same block.
         TypedExprNode::DefGroup { bindings, body } => {
             let mut minted = Minted::new();
             let bindings = bindings

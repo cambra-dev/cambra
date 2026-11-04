@@ -393,8 +393,8 @@ impl Uniquifier {
             // binding body, so a reference to any group name — in any body or
             // in the letrec body — resolves to its group binder.
             //
-            // An `impl` block's group stands on its module's spine, so at the top level its
-            // functions are members of the module and take its home.
+            // An `impl` or `instance` block's group stands on its module's spine, so at the
+            // top level its functions are members of the module and take its home.
             TypedExprNode::LetRec { bindings, body }
             | TypedExprNode::DefGroup { bindings, body } => {
                 let home = if group && top_level {

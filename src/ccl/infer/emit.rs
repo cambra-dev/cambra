@@ -1950,8 +1950,8 @@ pub(super) fn emit_let<C: Typing>(
 
 /// [`emit_let`]'s definition: emit the right-hand side, reconcile the binding's annotation,
 /// and decide the scheme it is bound at. Returns the scheme and whether the right-hand side
-/// typed. `body` is the `let`'s body, absent for a member of an `impl` block, which binds a
-/// function.
+/// typed. `body` is the `let`'s body, absent for a member of an `impl` or `instance` block,
+/// which binds a function.
 fn emit_let_definition<C: Typing>(
     binding: &mut TypedBinding,
     bound_expr: &mut Expr,
@@ -3062,9 +3062,9 @@ fn emit_trait_fn(
         &at,
     )?;
     // A call its types already answer with an instance whose functions are a group being
-    // emitted, as a call within an `impl` block is, binds that function first, as a reference
-    // to a member does. A call whose argument has not reached it yet is asked again by the
-    // application that passes it (`Typing::bind_instance_function_called`).
+    // emitted, as a call within that `instance` block is, binds that function first, as a
+    // reference to a member does. A call whose argument has not reached it yet is asked again by
+    // the application that passes it (`Typing::bind_instance_function_called`).
     bind_selected_instance_function(&obligation, function, operands, ctx)?;
     ctx.trait_calls.insert(
         node_id,
