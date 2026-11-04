@@ -5849,3 +5849,52 @@ fn an_unrelated_defect_of_the_same_content_is_reported() {
         .count();
     assert!(at_r > 0, "`r`'s own conflict must be reported: {errs:?}");
 }
+
+/// `unbox(𝑐)`'s elimination on a settled sum over two binders,
+/// `Σ (σ₀ : [0..2]) (σ₁ : [0..3]). (σ₀, σ₁) ⤇ Int`, discharges binder `i` to `σᵢ(𝑐)` and
+/// leaves the function plain: see
+/// `src/ccl/design/type-inference.md`, "An elimination reads a sum through a term".
+#[test]
+fn an_elimination_discharges_each_binder_of_a_settled_sum_to_its_projection() {
+    use cambra::ccl::subst::Subst;
+    use cambra::ccl::{FunKind, TypedExpr, WitnessProjection};
+
+    let witness_of = |sum: Type| match sum {
+        Type::Fun {
+            fun_kind: FunKind::Data(Some(ws)),
+            ..
+        } => ws[0].clone(),
+        other => panic!("expected a sum, got {other}"),
+    };
+    let int = Type::Base(BaseType::Int);
+    let w0 = witness_of(Type::sum_over(
+        TypeKind::Enumerated(vec![Type::UIntRange(2)]),
+        None,
+        int.clone(),
+    ));
+    let w1 = witness_of(Type::sum_over(
+        TypeKind::Enumerated(vec![Type::UIntRange(3)]),
+        None,
+        int.clone(),
+    ));
+    let sum = Type::Fun {
+        name: None,
+        fun_kind: FunKind::Data(Some(Rc::new(vec![w0.clone(), w1.clone()]))),
+        domain: Box::new(Type::Tuple(vec![
+            Type::WitnessRef(*w0.id()),
+            Type::WitnessRef(*w1.id()),
+        ])),
+        codomain: Box::new(int.clone()),
+    };
+    let c = Rc::new(TypedExpr::var("c"));
+    let projection = |i| Type::WitnessProjection(WitnessProjection::new(Rc::clone(&c), i));
+    assert_eq!(
+        Subst::eliminating(Rc::clone(&c)).apply_type(&sum),
+        Type::Fun {
+            name: None,
+            fun_kind: FunKind::Data(None),
+            domain: Box::new(Type::Tuple(vec![projection(0), projection(1)])),
+            codomain: Box::new(int),
+        }
+    );
+}
