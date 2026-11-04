@@ -1181,7 +1181,9 @@ pub(crate) fn guard_minus(held: &TileGuard, released: &TileGuard) -> TileGuard {
             {
                 held_keys.minus(&released_keys).collection_guard()
             }
-            (Ok(_), Err(_)) if names_collection_keys(held) => minus_disjoint_arms(held, released),
+            (Ok(_), Err(_)) if names_collection_keys(held) && names_collection_keys(released) => {
+                minus_disjoint_arms(held, released)
+            }
             _ => panic!("the guard algebra has no difference of {held:?} and {released:?}"),
         },
     }
@@ -1189,7 +1191,8 @@ pub(crate) fn guard_minus(held: &TileGuard, released: &TileGuard) -> TileGuard {
 
 /// `held`, a guard of a collection's keys, less `released`, an arm of which is a codomain guard
 /// naming no keys, such as the cells of some fields of a record beneath a level. The arms of keys
-/// are taken out as projections are ([`guard_minus`]). Every other arm names nothing of what that
+/// ([`keys_released_whole`]) are taken out as projections are ([`guard_minus`]). Every other arm
+/// names nothing of what that
 /// leaves, so the difference is that region (`src/interpreter/design-path-projections.md`,
 /// "Differences of nested guards").
 ///
@@ -1200,6 +1203,38 @@ pub(crate) fn guard_minus(held: &TileGuard, released: &TileGuard) -> TileGuard {
 /// record guard beneath the held keys, which is no region of keys, and a breaker pushes its final
 /// guard as a region of keys.
 fn minus_disjoint_arms(held: &TileGuard, released: &TileGuard) -> TileGuard {
+    let left = match keys_released_whole(released) {
+        Some(keys) => guard_minus(held, &keys),
+        None => held.clone(),
+    };
+    let arms = match released {
+        TileGuard::Or(arms) => arms.as_slice(),
+        single => std::slice::from_ref(single),
+    };
+    for arm in arms.iter().filter(|arm| Projection::of(arm).is_err()) {
+        assert!(
+            left.intersect(arm).is_empty(),
+            "the guard algebra has no difference of {held:?} and {released:?} that is a region \
+             of keys: the arm {arm:?} names a region of {left:?}"
+        );
+    }
+    left
+}
+
+/// The keys `released`, a guard of a collection's keys, names whole: its arms that are regions of
+/// keys at any level ([`Projection::of`]), `None` where it has none. Every other arm is a codomain
+/// guard naming cells beneath keys, as a selector releases the fields it does not read
+/// ([`guard_at_field`](fan)); those keys are not released whole.
+///
+/// # Panics
+///
+/// Where `released` is not spelled of a collection's keys, or an arm is neither a region of keys
+/// nor a codomain guard.
+pub(crate) fn keys_released_whole(released: &TileGuard) -> Option<TileGuard> {
+    assert!(
+        names_collection_keys(released),
+        "a release of a collection's keys, not {released:?}"
+    );
     let arms = match released {
         TileGuard::Or(arms) => arms.as_slice(),
         single => std::slice::from_ref(single),
@@ -1208,23 +1243,14 @@ fn minus_disjoint_arms(held: &TileGuard, released: &TileGuard) -> TileGuard {
         .iter()
         .cloned()
         .partition(|arm| Projection::of(arm).is_ok());
-    let left = match keys.is_empty() {
-        true => held.clone(),
-        false => guard_minus(held, &TileGuard::flatten_or(keys)),
-    };
     for arm in &cells {
         assert!(
             matches!(arm, TileGuard::Function(FunctionGuard::Codomain(_))),
-            "the guard algebra has no difference of {held:?} and {released:?}: the arm {arm:?} \
-             is no projection and no codomain guard"
-        );
-        assert!(
-            left.intersect(arm).is_empty(),
-            "the guard algebra has no difference of {held:?} and {released:?} that is a region \
-             of keys: the arm {arm:?} names a region of {left:?}"
+            "the guard algebra has no difference with {released:?}: the arm {arm:?} is no \
+             projection and no codomain guard"
         );
     }
-    left
+    (!keys.is_empty()).then(|| TileGuard::flatten_or(keys))
 }
 
 /// Whether `guard` is spelled of a collection's keys: a domain or a codomain guard, or an `Or` of
@@ -1451,15 +1477,29 @@ pub trait BreakingProducer: TileProducer + Breaker {
     /// removed is taken out of it. Empty when it holds nothing.
     fn held(&self) -> TileGuard;
 
-    /// What the producer holds: [`held`](Self::held) less the guard its readers have released,
-    /// closed over the producer's tiling (`TileGuard::closed_over`), so a row released through
-    /// its last position is held no more.
+    /// The keys under which the producer holds a cell: [`held`](Self::held) less the keys its
+    /// readers have released whole ([`keys_released_whole`]), closed over the producer's tiling
+    /// (`TileGuard::closed_over`), so a row released through its last position is held no more. A
+    /// key some of whose cells a reader released, as a selector releases the fields it does not
+    /// read, is still held, so a push of the final guard names it. A release of a record, a scalar
+    /// or an aggregation is taken out of what is held as [`guard_minus`] takes it.
     ///
     /// # Panics
     ///
-    /// Where the guard algebra has no exact difference of the two ([`guard_minus`]).
+    /// Where the guard algebra has no exact difference of what is held and what is released
+    /// ([`guard_minus`]), or a release of a collection's keys has an arm that is no region of keys
+    /// and no codomain guard ([`keys_released_whole`]).
     fn final_guard(&self) -> TileGuard {
-        guard_minus(&self.held(), self.obsolete_guard()).closed_over(self.tiling())
+        let held = self.held();
+        let obsolete = self.obsolete_guard();
+        let left = match names_collection_keys(obsolete) {
+            true => match keys_released_whole(obsolete) {
+                Some(released) if !held.is_empty() => guard_minus(&held, &released),
+                _ => held,
+            },
+            false => guard_minus(&held, obsolete),
+        };
+        left.closed_over(self.tiling())
     }
 
     /// `guard`, a guard of this producer's tiling it pushes, cut into morsels of at most `rows`
@@ -2803,7 +2843,7 @@ mod tests {
 
     /// The difference of two guards of a breaker's state, where the algebra can spell it exactly.
     mod guard_difference {
-        use super::super::{TileGuard, guard_minus};
+        use super::super::{TileGuard, guard_minus, keys_released_whole};
         use crate::interpreter::{FunctionGuard, Predicate, Value};
         use intervalsets::{Interval, IntervalSet};
         use std::collections::HashMap;
@@ -2927,6 +2967,19 @@ mod tests {
                 ),
             ]);
             guard_minus(&domain(keys(0, 1)), &released);
+        }
+
+        /// A release's arms of keys, at any level, are the keys it names whole; an arm of cells
+        /// beneath keys names none.
+        #[test]
+        fn the_keys_a_release_names_whole_leave_out_its_cells() {
+            let cells = record_cells(
+                TileGuard::Scalar(Predicate::True),
+                TileGuard::Scalar(Predicate::False),
+            );
+            let released = TileGuard::Or(vec![domain(keys(0, 0)), cells.clone()]);
+            assert_eq!(keys_released_whole(&released), Some(domain(keys(0, 0))));
+            assert_eq!(keys_released_whole(&cells), None);
         }
 
         /// A release of cells alone, not in an `Or`, beneath keys not held leaves what is held.

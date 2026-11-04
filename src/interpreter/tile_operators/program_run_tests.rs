@@ -903,46 +903,30 @@ fn refusal(source: &str) -> Refused {
     }
 }
 
-/// A condition on the inner position of a loop nested over rows is refused, and pull mode answers
-/// it. Its body selects a field of the record the inner drive renders, and the `SelectField`
-/// restates the outermost keys only (`src/interpreter/design-path-projections.md`, "Differences
-/// of nested guards").
-#[test]
-fn a_condition_in_a_loop_nested_over_rows_is_refused() {
-    let source = indoc! {"
-        out = test_sink()
-        acc := 0
-        for xs in [[1, 2], [3, 4]]:
-            for x in xs:
-                acc := acc + (x if x > 1 else 0)
-        out << acc
-    "};
-    let refused = refusal(source);
-    assert!(
-        refused.to_string().contains(
-            "SelectField in a nested loop's cycle is pulled at the keys of level 1 and restates \
-             the outermost keys only"
-        ),
-        "{refused}"
-    );
-
-    let loaded = LoadedProgram::test(source);
-    let mut ctx = GlobalContext::default();
-    let sink = ctx.register_test_sink("out");
-    let program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
-        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
-    assert!(
-        (0..100).any(|_| {
-            ctx.scheduler().check_for_notifications();
-            program.done.try_recv().is_ok()
-        }),
-        "{source} finishes in pull mode"
-    );
-    let written = sink.value().expect("the sink holds a value in pull mode");
-    let [binding] = written.as_function().as_slice() else {
-        panic!("{source} writes one value: {written:?}")
-    };
-    assert_eq!(binding.output, Value::Int(9));
+/// A condition on the inner position of a loop nested over rows. Its body selects a field of the
+/// record the inner drive renders, at a path, and the selector releases the drive's other field
+/// at every path. The drive's push names the paths under which a cell is still held
+/// (`keys_released_whole`), so the reader takes each path's selected field
+/// (`src/interpreter/design-path-projections.md`, "Differences of nested guards").
+#[rstest_log::rstest]
+#[case::reading_the_inner_position(indoc! {"
+    out = test_sink()
+    acc := 0
+    for xs in [[1, 2], [3, 4]]:
+        for x in xs:
+            acc := acc + (x if x > 1 else 0)
+    out << acc
+"}, "9")]
+#[case::reading_a_sum_over_the_inner_position(indoc! {"
+    out = test_sink()
+    acc := 0
+    for xs in [[1, 2], [3, 4]]:
+        for x in xs:
+            acc := acc + sum([z * x for z in [1, 2]])
+    out << acc
+"}, "30")]
+fn a_condition_in_a_loop_nested_over_rows(#[case] source: &str, #[case] expected: &str) {
+    answers(source, expected, &["LoopScope", "SinkBreaker"]);
 }
 
 /// A store per row of a comprehension, from a function whose loop runs once per row, runs in no

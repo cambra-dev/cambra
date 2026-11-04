@@ -109,12 +109,13 @@ held − released = Domain(k ≠ 0)
 ```
 
 An arm of cells that names part of what is left leaves a record guard beneath the held keys, which
-is no region of keys, and `guard_minus` panics on it. A breaker's finish pushes its final guard as a
-region of keys (`Dispatcher::land_in`), which `Projection::of` reads, so a finish cannot push cells
-beneath a path. `SelectField` restates the outermost keys only, since a selector pulled at a path
-leaves the inner loop's drive holding the selected field's cells beneath a path it has not pushed.
-The planner refuses a loop nested over rows that pulls one there
-(`a_condition_in_a_loop_nested_over_rows_is_refused`).
+is no region of keys, and `guard_minus` panics on it. A push names a region of keys
+(`Dispatcher::land_in` reads it with `Projection::of`), so a breaker's final guard is its held keys
+less the keys its readers released whole (`keys_released_whole`, `BreakingProducer::final_guard`).
+A key some of whose cells a reader released stays held, and the push names it. `SelectField`
+restates every level above the record: a selector pulled at a path leaves the inner loop's drive
+holding the other fields' cells of the path released, the drive's push names the path, and the
+selector takes its field there (`a_condition_in_a_loop_nested_over_rows`).
 
 A round pushes per position, so it needs the difference, where a push at a finish only names the
 breaker's whole held region.
@@ -126,16 +127,15 @@ regions.
 ## Operator rows
 
 Each row of the table under "Projection guards" in `design-operators.md` gains what the operator
-does with a projection at level 𝑛 > 0. The rows fall into six kinds:
+does with a projection at level 𝑛 > 0. The rows fall into five kinds:
 
 | Kind | Operators | A projection at level 𝑛 |
 | --- | --- | --- |
 | Keeps every level's keys | `MapResultWithSource`, `Filter` (with a collection predicate, the levels down to the masked one), `Restrict`, `MapDomain`, `VariantProject`, `VariantIs`, `Memo`, `FanOutSlot`, `IterateExtent`, `MapAggregate`, `MapExtractAggregate` (the levels of its input, not those of a `Sole` collection beneath them) | pulls each keyed input at the same projection and cuts its answer to it |
-| Keeps the keys above its level | `MapResult` (keyed input), `MapResultToConst`, `RecordWrap`, `Zip`, `VariantWrap`, `Product` | pulls each keyed input at a projection above its level and refuses one at or beneath it, or, for `Product`, pulls both sides at the rows above its paired level and cuts the pairs |
+| Keeps the keys above its level | `MapResult` (keyed input), `MapResultToConst`, `RecordWrap`, `Zip`, `VariantWrap`, `SelectField` over a stream of records, `Product` | pulls each keyed input at a projection above its level and refuses one at or beneath it, or, for `Product`, pulls both sides at the rows above its paired level and cuts the pairs |
 | Shifts levels | `Uncurry`, `Converse` beneath standing levels, a nested store's read | restates the projection by the levels it adds or removes |
-| Reads whole and cuts | `PermuteRecordDomain`, `FlattenTupleDomain`, `CheckedLookup`'s collection, `UnionOperator` | reads its input whole and cuts the answer at level 𝑛 |
+| Reads whole and cuts | `PermuteRecordDomain`, `FlattenTupleDomain`, `SelectField` over a product, `CheckedLookup`'s collection, `UnionOperator` | reads its input whole and cuts the answer at level 𝑛 |
 | No keys beneath | `Aggregate`, `ExtractAggregate`, `ExtractFinal`, `MakeRecord`, `Constant` scalar | refuses, as it refuses keys today |
-| Restates the outermost keys only | `SelectField` (a stream of records, and a product of collections) | refuses, since a finish cannot push cells beneath a path ([Differences of nested guards](#differences-of-nested-guards)) |
 
 An operator that keeps its input's keys above its own level and computes the values beneath them
 refuses a projection at or beneath that level (`Restates::Above`): those keys are inside the values

@@ -65,39 +65,6 @@ const BROKEN: &[(&str, &str, &str)] = &[
     ("loop_source_in_loop", "map_arrow", "CompilerPanics"),
     ("loop_source_in_loop", "map_lit", "CompilerPanics"),
     ("loop_source_in_loop", "union", "CompilerRejects"),
-    // A loop nested over the rows of a list whose body selects a field of the inner drive's
-    // record: refused, since `SelectField` restates the outermost keys only.
-    ("nested_mut_over_row", "binder_elif[x]", "CompilerRejects"),
-    (
-        "nested_mut_over_row",
-        "binder_in_comp[x]",
-        "CompilerRejects",
-    ),
-    (
-        "nested_mut_over_row",
-        "binder_in_comp_filter[x]",
-        "CompilerRejects",
-    ),
-    (
-        "nested_mut_over_row",
-        "binder_in_corr_filter[x]",
-        "CompilerRejects",
-    ),
-    (
-        "nested_mut_over_row",
-        "binder_in_nested_comp[x]",
-        "CompilerRejects",
-    ),
-    (
-        "nested_mut_over_row",
-        "binder_partial_ternary[x]",
-        "CompilerRejects",
-    ),
-    (
-        "nested_mut_over_row",
-        "binder_ternary[x]",
-        "CompilerRejects",
-    ),
     (
         "nested_mut_source",
         "binder_filtered_comp[i]",

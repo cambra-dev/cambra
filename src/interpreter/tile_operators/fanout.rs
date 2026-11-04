@@ -3081,6 +3081,60 @@ mod consuming_tests {
         );
     }
 
+    /// A memo of records released at a key whole and at one field's cells under every key holds
+    /// the other keys: the field it still holds there names them (`BreakingProducer::final_guard`).
+    #[test]
+    fn a_release_of_a_fields_cells_leaves_the_keys_held() {
+        use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
+        use crate::interpreter::{BaseType, ColumnValue, Extent};
+        use bit_set::BitSet;
+        let int = || Tiling::Scalar(Extent::Base(BaseType::Int));
+        let tiling = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::Record(HashMap::from([("_0".into(), int()), ("_1".into(), int())])),
+        );
+        // 0 ↦ (_0: 1, _1: 3), 1 ↦ (_0: 2, _1: 4).
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::Record {
+                fields: HashMap::from([
+                    ("_0".into(), Tile::Scalar(ColumnValue::Ints(vec![1, 2]))),
+                    ("_1".into(), Tile::Scalar(ColumnValue::Ints(vec![3, 4]))),
+                ]),
+                absent: Default::default(),
+            }),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let mut memo = MemoProducer::over(
+            Box::new(TestTileProducer::new(tile, tiling.clone())),
+            &tiling,
+        );
+        memo.consume_impl(InputId::ONLY, tiling.universal_guard());
+        let first_field = TileGuard::Function(FunctionGuard::Codomain(Box::new(
+            TileGuard::Record(HashMap::from([
+                ("_0".into(), TileGuard::Scalar(Predicate::True)),
+                ("_1".into(), TileGuard::Scalar(Predicate::False)),
+            ])),
+        )));
+        memo.release(TileGuard::Or(vec![
+            TileGuard::Function(FunctionGuard::Domain(Predicate::point(Value::UInt(0)))),
+            first_field,
+        ]));
+        let held = Projection::of(&memo.final_guard()).expect("a region of keys");
+        let key = |k| Projection::admitting(Predicate::point(Value::UInt(k)));
+        assert_eq!(
+            held.intersect(&key(0)),
+            Projection::Nothing,
+            "key 0 is released whole"
+        );
+        assert_ne!(
+            held.intersect(&key(1)),
+            Projection::Nothing,
+            "key 1 holds field `_1`"
+        );
+    }
+
     // ------------------------------------------------------------------------------------
     // Wakes
     // ------------------------------------------------------------------------------------
