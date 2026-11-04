@@ -377,6 +377,10 @@ struct PipelineInfo {
     /// Whether it takes the arrivals of live sources although it reads pipelines
     /// ([`take_arrivals`](Dispatcher::take_arrivals)).
     arrivals: bool,
+    /// The pipelines it reads whose pushes arrive as its own keys, which no arrival names: a push
+    /// of one queues the rows it names fresh, though the pipeline takes arrivals
+    /// ([`queue_pushes_of`](Dispatcher::queue_pushes_of)).
+    pushed_rows: Vec<usize>,
     /// Whether it parks its arrivals until the pipelines it reads have decided them
     /// ([`park`](Dispatcher::park)).
     parks: bool,
@@ -577,6 +581,7 @@ impl Dispatcher {
                 limit: usize::MAX,
                 pushes_with: pipeline,
                 arrivals: false,
+                pushed_rows: Vec::new(),
                 parks: false,
                 opens: false,
                 reach: Vec::new(),
@@ -712,6 +717,27 @@ impl Dispatcher {
             read.0
         );
         self.infos[reader.0].follows.push(read.0);
+    }
+
+    /// Have every push of `read` to `reader`, which takes arrivals and parks
+    /// ([`take_arrivals`](Self::take_arrivals), [`park`](Self::park)),
+    /// bring the rows it names: `read`'s pushes arrive as `reader`'s own keys, as an arm of a
+    /// concatenation, and no arrival names them.
+    ///
+    /// # Panics
+    ///
+    /// When `reader` does not read `read`, takes no arrivals, or does not park, where a push
+    /// brings no row.
+    pub fn queue_pushes_of(&mut self, reader: PipelineId, read: PipelineId) {
+        let info = &mut self.infos[reader.0];
+        assert!(
+            info.reads.contains(&read.0) && info.arrivals && info.parks,
+            "pipeline {} takes arrivals, parks, and reads pipeline {}, whose pushes it \
+             queues",
+            reader.0,
+            read.0
+        );
+        info.pushed_rows.push(read.0);
     }
 
     /// Mark `pipeline`, which reads pipelines, as also taking the arrivals of live sources: it is
@@ -2458,7 +2484,8 @@ impl Landing<'_> {
     /// reader that reads its input whole ([`Dispatcher::read_whole`]) takes no push, widened or
     /// not, and nor does one that follows the pipeline that pushed ([`Dispatcher::follow`]). A
     /// reader that parks ([`Dispatcher::park`]) queues or parks the rows a push brings of its own,
-    /// and nothing for a push to a reader that takes arrivals.
+    /// and nothing for a widened push or one to a reader that takes arrivals, but for a push of a
+    /// pipeline whose rows arrive as the reader's own keys ([`Dispatcher::queue_pushes_of`]).
     ///
     /// # Panics
     ///
@@ -2516,7 +2543,7 @@ impl Landing<'_> {
         // a push brings the rows it names, widened or not, less what a push brought before, and
         // the decided pushes release them ([`Dispatcher::park`]).
         if info.parks {
-            if !info.arrivals {
+            if !info.arrivals || (!self.widened && info.pushed_rows.contains(&from)) {
                 dispatcher.queue_or_park(epoch, r, guard, false);
             }
             return;
