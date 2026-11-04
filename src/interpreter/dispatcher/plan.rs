@@ -3,6 +3,7 @@
 //! the calling thread. See `src/interpreter/design-operators.md`, "Running a compiled program".
 
 use std::cell::RefCell;
+use std::ops::ControlFlow;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -147,7 +148,10 @@ pub fn run_program_into(
             targets.push((slot, main.clone(), TargetEntry::Main(placement)));
         }
     }
-    let result = run_targets(&targets, morsel_rows, on_idle);
+    let result = run_targets(&targets, morsel_rows, &mut Idle(on_idle)).map(|ended| match ended {
+        Ended::Done(planned) => planned,
+        Ended::Paused(_) => unreachable!("an observer that never breaks pauses no run"),
+    });
     if let Some((at, slot)) = &taken {
         let producer = slot.borrow_mut().take();
         debug_assert!(
@@ -161,15 +165,119 @@ pub fn run_program_into(
         program.outputs[*at].producer = producer;
     }
     let planned = result?;
-    // The run's last pull of each sink, as pull mode's last: its producer answers from what the
-    // breakers consumed and is released whole, so the pull hands the sink nothing new and
-    // finds it done, which signals `CompiledProgram::done` once every sink has.
-    for (_, _, entry) in &targets {
+    pull_sinks(&targets);
+    Ok(planned)
+}
+
+/// The run's last pull of each sink of `targets`, as pull mode's last: its producer answers from
+/// what the breakers consumed and is released whole, so the pull hands the sink nothing new and
+/// finds it done, which signals `CompiledProgram::done` once every sink has.
+fn pull_sinks(targets: &[RunTarget]) {
+    for (_, _, entry) in targets {
         if let TargetEntry::Sink(consumer) = entry {
             consumer.borrow().pull_now();
         }
     }
-    Ok(planned)
+}
+
+/// What a run's driver is told at a run's boundaries, on the run's thread, inside the run
+/// (`dispatcher::in_a_run`): a pass of a run over live sources polls them, then runs every epoch
+/// sealed so far to its finish. A run with no live source has no boundary.
+pub trait RunObserver {
+    /// The pass has polled its live sources and notified no pipeline yet.
+    fn polled(&mut self) {}
+    /// No package is in flight and every epoch sealed so far has finished. `changed` says whether
+    /// the pass notified a pipeline or closed one. `Break` ends the run here.
+    fn drained(&mut self, changed: bool) -> ControlFlow<()>;
+}
+
+/// [`run_program_into`]'s observer: it calls `on_idle` after a pass that changed nothing and
+/// never ends a run.
+struct Idle<'a>(&'a mut dyn FnMut());
+
+impl RunObserver for Idle<'_> {
+    fn drained(&mut self, changed: bool) -> ControlFlow<()> {
+        if !changed {
+            (self.0)();
+        }
+        ControlFlow::Continue(())
+    }
+}
+
+/// How a run ended, with what it planned for each pipeline.
+pub enum Ended {
+    /// Every live source yields everything and every pipeline has finished the last epoch. The
+    /// run has taken its last pull of each sink.
+    Done(Vec<Planned>),
+    /// The observer broke at a drained boundary. The run left nothing placed and pulled no sink.
+    Paused(Vec<Planned>),
+}
+
+/// The roots of a run over one compiled program's outputs, which `program` keeps.
+pub struct Targets(Vec<RunTarget>);
+
+impl Targets {
+    /// No root yet.
+    pub fn new() -> Self {
+        Self(Vec::new())
+    }
+
+    /// Every sink output of `program`.
+    pub fn add_sinks(&mut self, program: &CompiledProgram) {
+        for output in &program.outputs {
+            if let Some(consumer) = &output.sink_consumer {
+                let consumer_ref = consumer.borrow();
+                self.0.push((
+                    consumer_ref.producer_slot().clone(),
+                    consumer_ref.sink(),
+                    TargetEntry::Sink(consumer.clone()),
+                ));
+            }
+        }
+    }
+
+    /// `program`'s `main` output, whose producer the run pulls from `slot` and hands each epoch's
+    /// answer to `sink` (`SinkBreaker::per_epoch`).
+    ///
+    /// # Panics
+    ///
+    /// Where `program` has no `main` output.
+    pub fn add_main(
+        &mut self,
+        program: &CompiledProgram,
+        slot: ProducerSlot,
+        sink: Arc<dyn DataSink>,
+    ) {
+        let placement = program
+            .main()
+            .and_then(|output| output.main_entry.clone())
+            .expect("a `main` output keeps the placement of the entry before its consumer");
+        self.0.push((slot, sink, TargetEntry::Main(placement)));
+    }
+
+    /// Run the pipelines under every root until `observer` breaks or every live source yields
+    /// everything, and on [`Ended::Done`] take the last pull of each sink.
+    ///
+    /// # Errors
+    ///
+    /// As [`run_program`]. A refused run leaves nothing placed.
+    pub fn run(
+        &self,
+        morsel_rows: usize,
+        observer: &mut dyn RunObserver,
+    ) -> Result<Ended, Refused> {
+        let ended = run_targets(&self.0, morsel_rows, observer)?;
+        if let Ended::Done(_) = ended {
+            pull_sinks(&self.0);
+        }
+        Ok(ended)
+    }
+}
+
+impl Default for Targets {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// [`run_program`]'s `on_idle`: a millisecond's sleep before the next poll.
@@ -219,8 +327,8 @@ impl DataSink for Collected {
 fn run_targets(
     targets: &[RunTarget],
     morsel_rows: usize,
-    on_idle: &mut dyn FnMut(),
-) -> Result<Vec<Planned>, Refused> {
+    observer: &mut dyn RunObserver,
+) -> Result<Ended, Refused> {
     let mut planner = Planner::default();
     let roots: Vec<ProducerSlot> = targets.iter().map(|(slot, _, _)| slot.clone()).collect();
     let mut sink_breakers = Vec::new();
@@ -536,7 +644,7 @@ fn run_targets(
             breaker.enter_consuming_mode()
         });
     }
-    in_a_run(|| {
+    let done = in_a_run(|| {
         // A range over a static extent has decided every key from the start.
         for (pipeline, ranges) in members.leaves.iter().enumerate() {
             for range in ranges {
@@ -544,53 +652,58 @@ fn run_targets(
             }
         }
         match live.is_empty() {
-            true => drive(&dispatcher, &mut reach),
-            false => drive_live(&dispatcher, &mut reach, &mut live, on_idle),
+            true => {
+                drive(&dispatcher, &mut reach);
+                true
+            }
+            false => drive_live(&dispatcher, &mut reach, &mut live, observer),
         }
     });
     // Every breaker and range is terminal at the run's end, so each pipeline has recorded as
     // decided by each of its sources all that a push of the source's every key lands as at its
-    // entry.
+    // entry. A run that pauses stops at a drained boundary before its end, and checks nothing.
     #[cfg(debug_assertions)]
-    for (reader, reads) in members.reads.iter().enumerate() {
-        let covered = |source: usize, reached: Vec<Arrival>, name: &str| {
-            let Some(reached) = reached
-                .into_iter()
-                .map(|arrival| arrival.guard)
-                .reduce(|a, b| a.union(&b))
-            else {
-                return;
+    if done {
+        for (reader, reads) in members.reads.iter().enumerate() {
+            let covered = |source: usize, reached: Vec<Arrival>, name: &str| {
+                let Some(reached) = reached
+                    .into_iter()
+                    .map(|arrival| arrival.guard)
+                    .reduce(|a, b| a.union(&b))
+                else {
+                    return;
+                };
+                let decided = dispatcher.decided_of(PipelineId(reader), PipelineId(source));
+                debug_assert!(
+                    decided.covers(&reached),
+                    "{name} has decided all it reaches of {}'s input, {reached:?}, at the run's end, \
+                     which records {decided:?}",
+                    members.names[reader]
+                );
             };
-            let decided = dispatcher.decided_of(PipelineId(reader), PipelineId(source));
-            debug_assert!(
-                decided.covers(&reached),
-                "{name} has decided all it reaches of {}'s input, {reached:?}, at the run's end, \
-                 which records {decided:?}",
-                members.names[reader]
-            );
-        };
-        for &read in reads {
-            let (pusher, _) = end_of(PipelineId(read))
-                .unwrap_or_else(|| pushing_end(&mut reach, PipelineId(read)));
-            let reached = probe(&pusher, PipelineId(read), &Projection::Everything, reader);
-            covered(read, reached, &members.names[read]);
-        }
-        // A range reaches the entries of the pipelines it is listed under, and possibly others.
-        let ranges = members
-            .leaves
-            .iter()
-            .enumerate()
-            .flat_map(|(pipeline, ranges)| ranges.iter().map(move |range| (pipeline, range)));
-        let live = members
-            .live
-            .iter()
-            .enumerate()
-            .flat_map(|(pipeline, leaves)| {
-                leaves.iter().map(move |leaf| (pipeline, &leaf.consumer))
-            });
-        for (pipeline, range) in ranges.chain(live) {
-            let reached = probe(range, PipelineId(pipeline), &Projection::Everything, reader);
-            covered(reader, reached, "a range in its own chain");
+            for &read in reads {
+                let (pusher, _) = end_of(PipelineId(read))
+                    .unwrap_or_else(|| pushing_end(&mut reach, PipelineId(read)));
+                let reached = probe(&pusher, PipelineId(read), &Projection::Everything, reader);
+                covered(read, reached, &members.names[read]);
+            }
+            // A range reaches the entries of the pipelines it is listed under, and possibly others.
+            let ranges = members
+                .leaves
+                .iter()
+                .enumerate()
+                .flat_map(|(pipeline, ranges)| ranges.iter().map(move |range| (pipeline, range)));
+            let live = members
+                .live
+                .iter()
+                .enumerate()
+                .flat_map(|(pipeline, leaves)| {
+                    leaves.iter().map(move |leaf| (pipeline, &leaf.consumer))
+                });
+            for (pipeline, range) in ranges.chain(live) {
+                let reached = probe(range, PipelineId(pipeline), &Projection::Everything, reader);
+                covered(reader, reached, "a range in its own chain");
+            }
         }
     }
     for (plan, scope) in planned.iter_mut().zip(&scopes) {
@@ -598,7 +711,14 @@ fn run_targets(
             plan.rounds = std::mem::take(&mut scope.borrow_mut().planned);
         }
     }
-    Ok(planned)
+    Ok(match done {
+        true => Ended::Done(planned),
+        false => {
+            // The next run plans the graph afresh and places what it reaches.
+            unplace(&planner.placements, targets);
+            Ended::Paused(planned)
+        }
+    })
 }
 
 /// Whether `pipeline` reads a loop's scope, directly or through the pipelines it reads.
@@ -2045,15 +2165,15 @@ impl LivePipeline {
 /// start whole. Each pass polls the live sources
 /// (`DataSourceDomainExtentImpl::check_for_new_data`), notifies each live pipeline of what they
 /// yield ([`LivePipeline::poll`]), seals the epoch where it notified or closed one and one is
-/// still open, and runs until nothing is claimable. A pass that polls nothing new calls `on_idle`
-/// after. The run ends once every pipeline has finished the epoch the last live pipeline closed
-/// in.
+/// still open, and runs until nothing is claimable, then tells `observer` (`RunObserver::drained`).
+/// Answers `false` where the observer ended the run, and `true` once every pipeline has finished
+/// the epoch the last live pipeline closed in.
 fn drive_live(
     dispatcher: &Dispatcher,
     reach: &mut Reach<'_>,
     live: &mut [LivePipeline],
-    on_idle: &mut dyn FnMut(),
-) {
+    observer: &mut dyn RunObserver,
+) -> bool {
     for (pipeline, info) in dispatcher.infos.iter().enumerate() {
         if info.reads.is_empty() && !live.iter().any(|at| at.pipeline.0 == pipeline) {
             let mut input = None;
@@ -2074,6 +2194,7 @@ fn drive_live(
         for source in &sources {
             source.borrow_mut().check_for_new_data();
         }
+        observer.polled();
         let mut changed = false;
         for at in live.iter_mut() {
             changed |= at.poll(dispatcher, reach);
@@ -2102,12 +2223,12 @@ fn drive_live(
                     );
                     break;
                 }
-                Next::Done => return,
+                Next::Done => return true,
                 Next::Failed => panic!("a run on one thread fails only by panicking on it"),
             }
         }
-        if !changed {
-            on_idle();
+        if observer.drained(changed).is_break() {
+            return false;
         }
     }
 }

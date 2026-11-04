@@ -2557,6 +2557,85 @@ fn dispatched_live_main(source: &str, rows: usize, batches: Vec<Batch>) -> LiveM
     }
 }
 
+/// A run's observer that ends the run at its first drained boundary.
+struct PauseAtOnce;
+
+impl crate::interpreter::dispatcher::RunObserver for PauseAtOnce {
+    fn drained(&mut self, _changed: bool) -> std::ops::ControlFlow<()> {
+        std::ops::ControlFlow::Break(())
+    }
+}
+
+/// A run ended at its first drained boundary leaves no entry placed, and a run started after it
+/// over the same graph plans it afresh. The second delivery of `two_batches` comes between two
+/// runs, and the `main` output holds each key once at the end.
+#[rstest_log::rstest]
+fn a_run_paused_at_every_boundary_answers_each_arrival_once(#[values(1, usize::MAX)] rows: usize) {
+    use crate::interpreter::dispatcher::{Ended, Targets};
+    let source = "[x * 10 for x in source1()]";
+    let mut ctx = GlobalContext::default();
+    ctx.defer_sink_pulls();
+    let feed = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::interpreter::TestDataSource::new(
+            "source1",
+            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+        ),
+    ));
+    ctx.register_source(feed.clone());
+    let mut program = compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    let _operators = ctx.take_operator_map();
+    let producer = program
+        .main_mut()
+        .and_then(|output| output.producer.take())
+        .expect("a `main` output");
+    let slot: crate::interpreter::sinks::ProducerSlot =
+        std::rc::Rc::new(std::cell::RefCell::new(Some(producer)));
+    let main = std::sync::Arc::new(MainAnswers::default());
+    let mut targets = Targets::new();
+    targets.add_main(&program, slot.clone(), main.clone());
+    let placement = program
+        .main()
+        .and_then(|output| output.main_entry.clone())
+        .expect("a `main` output's entry");
+    let mut paused = 0;
+    for (entries, complete) in two_batches() {
+        let mut feed = feed.borrow_mut();
+        feed.add_data(&entries);
+        feed.set_yield_predicate(complete);
+        drop(feed);
+        match targets
+            .run(rows, &mut PauseAtOnce)
+            .unwrap_or_else(|refused| panic!("{refused}"))
+        {
+            Ended::Paused(_) => {
+                paused += 1;
+                assert!(
+                    placement.get().is_none(),
+                    "a paused run leaves nothing placed"
+                );
+            }
+            Ended::Done(_) => {}
+        }
+    }
+    while let Ended::Paused(_) = targets
+        .run(rows, &mut PauseAtOnce)
+        .unwrap_or_else(|refused| panic!("{refused}"))
+    {
+        paused += 1;
+    }
+    assert_eq!(
+        paused, 1,
+        "the first delivery's run pauses, and the run after the last delivery ends"
+    );
+    let value = main.kept.value().expect("the `main` output's value");
+    assert_eq!(
+        rendered_in_key_order(&value),
+        "[u0 -> 10, u1 -> 20, u2 -> 30, u3 -> 40, u4 -> 50]"
+    );
+}
+
 /// `source`, whose `main` output reads the live source `source1`, compiled and run in pull mode,
 /// the source fed `batches` one at a time, the `main` output pulled at the universal guard and
 /// released at its answer once the scheduler has run out of work after each: the answers the
