@@ -1349,9 +1349,8 @@ a `Refused` error that names the shape, and pull mode runs every refused program
 - a program compiled with its sinks pulled;
 - a live source whose arrivals reach no pipeline's entry or reach one as a region that is no
   projection of its keys (below);
-- a pipeline notified of a live source's arrivals beside a range no live source yields, or beside a
-  pipeline it reads whose pushes arrive as its own keys, since no arrival names those rows, or whose
-  pushes reach it nowhere, since no push would name a row waiting on it;
+- a pipeline notified of a live source's arrivals beside a pipeline it reads whose pushes reach it
+  nowhere, since no push would name a row waiting on it;
 - a pipeline read directly by a pipeline another pipeline reads;
 - a breaker with no consuming mode (`Breaker::no_consuming_mode`): a transaction store of several
   writers over positions key order does not compare, neither `UInt` positions nor a
@@ -1366,7 +1365,11 @@ in one of four ways (`LivePipeline::poll`):
 - Every route from the range's consumer to the pipeline's entry keeps the range's keys
   (`Consumer::route`), and a push of one key reaches the entry as a projection of the input's keys
   at any level, as a `Converse` restates its input's keys one level in: the pipeline is notified of
-  the keys each delivery adds, as the region a push of them brings its entry.
+  the keys each delivery adds, as the region a push of them brings its entry. The rows no arrival
+  names are queued with the first notification: those of a range of the pipeline's own that no live
+  source yields, as a static arm of a concatenation. A pipeline it reads whose pushes arrive as its
+  own keys, as a let-bound arm, brings rows no arrival names too, and each of its pushes queues the
+  rows it names (`Dispatcher::queue_pushes_of`).
 - A route widens the keys, as a feed `out << 𝑒` widens its source's keys, which sit beneath the
   sink's one row: the pipeline reads its input whole once every live source under it yields
   everything (`Planned::whole`). The widened pushes of several ranges, as of a sink fed from
@@ -1423,8 +1426,8 @@ answer as the line arrives. A refused program runs in pull mode after a note on 
 context the dispatched run compiled it in: the compile has opened its sources and sinks, a port
 bound or stdin taken, which a second compile could not open again.
 
-Every program of the differential suite (`tests/it/differential_interp.rs`) runs dispatched too, at
-morsels of one row and of every row, and answers what pull mode answers, or the planner refuses it.
+The differential suites compare a dispatched run at morsels of one row with one at morsels of every
+row (`tests/support/differential.rs`).
 
 #### Reading rows again
 
