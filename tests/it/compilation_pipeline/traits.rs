@@ -154,20 +154,97 @@ fn a_generic_definition_uses_each_instance(#[case] code: &str) {
     "},
     "No requirement states that `S` is Area"
 )]
-#[case::a_type_named_after_a_built_in_trait(
-    "type Addable = Int",
-    "`Addable` is a built-in trait and cannot be given another meaning"
-)]
-#[case::a_type_parameter_named_after_a_built_in_trait(
-    indoc! {"
-        def f(Addable, x: Addable) => Addable:
-            x
-        1
-    "},
-    "`Addable` is a built-in trait and cannot name a type parameter"
-)]
 fn a_trait_function_call_refuses(#[case] code: &str, #[case] needle: &str) {
     check_compile_error(&format!("{SHAPES}\n{code}"), needle);
+}
+
+/// A type and a type parameter named after a trait the prelude imports shadow its name, and the
+/// operators still require `std`'s traits (`docs/chl-spec.md`, "9.16 The std root").
+#[test]
+fn a_module_s_own_name_shadows_a_prelude_trait() {
+    check_scalar(
+        indoc! {"
+            type Addable = Int
+            def f(Orderable, x: Orderable) => Orderable:
+                x
+            f(1) + Addable::new(2).extract()
+        "},
+        Value::Int(3),
+    );
+}
+
+/// A module's own trait named after a prelude trait, with its own instance, leaves the
+/// operator on `std`'s: `+` adds (`docs/chl-spec.md`, "9.16 The std root").
+#[test]
+fn an_operator_requires_std_s_trait_beside_a_module_s_own_of_its_name() {
+    check_scalar(
+        indoc! {"
+            trait Addable(A, B):
+                Output
+                def add(a: A, b: B) => Output
+            instance Addable(Int, Int):
+                Output = Int
+                def add(a, b):
+                    a * b
+            1 + 2
+        "},
+        Value::Int(3),
+    );
+}
+
+/// Under a module's own trait of the prelude trait's name, a missing requirement names `std`'s
+/// by its path, apart from the one the `requires` clause states.
+#[test]
+fn a_missing_requirement_names_std_s_trait_by_its_path_where_a_module_shadows_it() {
+    check_compile_error(
+        indoc! {"
+            trait Addable(A, B):
+                Output
+                def add(a: A, b: B) => Output
+            instance Addable(Int, Int):
+                Output = Int
+                def add(a, b):
+                    a * b
+            def twice(T, x: T) => T requires Addable(T, T):
+                x + x
+            twice(3)
+        "},
+        "No requirement states that `T` is std::Addable",
+    );
+}
+
+/// A trait with no block declares nothing, and its instances state only that their types
+/// satisfy it (`docs/chl-spec.md`, "Declaring a trait").
+#[test]
+fn a_trait_with_no_block_is_satisfied_by_its_instances() {
+    check_scalar(
+        indoc! {"
+            type Circle = Int
+            trait Round(S)
+            instance Round(Circle)
+            def radius(S, s: S) => Int requires Round(S):
+                1
+            radius(Circle::new(3))
+        "},
+        Value::Int(1),
+    );
+}
+
+/// In its trait's own module, an instance may be for a base type alone (`docs/chl-spec.md`,
+/// "Declaring an instance").
+#[test]
+fn an_instance_in_its_trait_s_module_may_be_for_a_base_type() {
+    check_scalar(
+        indoc! {"
+            trait Area(S):
+                def area(s: S) => Int
+            instance Area(Int):
+                def area(s):
+                    s * s
+            summon(Area(Int))::area(5)
+        "},
+        Value::Int(25),
+    );
 }
 
 /// An instance of a nominal type with parameters, at two element types.
@@ -709,16 +786,35 @@ fn a_trait_over_two_types(#[case] code: &str, #[case] expected: i64) {
     "},
     "names a type that is not a type variable, a base type or a nominal type"
 )]
-#[case::an_instance_of_a_base_type_alone(
+#[case::a_builtin_trait_outside_std(
     indoc! {"
-        trait Area(S):
-            def area(s: S) => Int
-        instance Area(Int):
-            def area(s):
-                1
+        @Builtin
+        trait Sized(S)
         1
     "},
-    "`instance Area(Int)` names no nominal type"
+    "`@Builtin` marks a declaration whose behaviour the compiler supplies, and only `std` \
+     declares one"
+)]
+#[case::a_builtin_instance_outside_std(
+    indoc! {"
+        type Circle = Int
+        trait Sized(S)
+        @Builtin
+        instance Sized(Circle)
+        1
+    "},
+    "`@Builtin` marks a declaration whose behaviour the compiler supplies, and only `std` \
+     declares one"
+)]
+#[case::an_instance_of_another_modules_trait_for_a_base_type(
+    indoc! {"
+        instance Addable(Bool, Bool):
+            Output = Bool
+            def add(a, b):
+                a or b
+        1
+    "},
+    "`instance Addable(Bool, Bool)` names no type this module declares"
 )]
 #[case::a_missing_function(
     indoc! {"

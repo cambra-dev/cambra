@@ -208,8 +208,18 @@ impl<'a> Drop for TypeInferenceContextGuard<'a> {
 }
 
 impl TypeInferenceContext {
-    /// Create a new, empty context with no scopes and no registered sources.
+    /// Create a new, empty context with no scopes and no registered sources, for a tree no
+    /// program lowered: its traits and instances are `std`'s ([`InstanceTable::std`]).
     pub fn new() -> Self {
+        TypeInferenceContext {
+            instances: InstanceTable::std(),
+            ..Self::default()
+        }
+    }
+
+    /// [`Self::new`] for a program, whose compilation sets the traits and instances its
+    /// lowering found.
+    pub(crate) fn for_program() -> Self {
         Self::default()
     }
 
@@ -3518,7 +3528,7 @@ fn collect_type_errors(
 /// Checks in [`CheckMode::Full`], for a tree before refinement erasure; [`typecheck_in`] takes
 /// the mode.
 pub fn typecheck(expr: &Expr) -> Result<(), Vec<InferError>> {
-    typecheck_in(expr, &InstanceTable::builtin(), CheckMode::Full)
+    typecheck_in(expr, &InstanceTable::std(), CheckMode::Full)
 }
 
 /// [`typecheck`] of a program declaring `instances`, in `mode`.
@@ -3557,7 +3567,7 @@ pub fn typecheck_against(
     crate::ccl::infer::check::check_located_against(
         expr,
         Some(sources),
-        &InstanceTable::builtin(),
+        &InstanceTable::std(),
         CheckMode::Full,
     )
     .map_err(unlocated)
@@ -3569,8 +3579,7 @@ pub fn typecheck_against(
 /// are permitted — the unified phase and `channelize` erase them (see
 /// [`Strictness::PreChannelize`]). Checks in [`CheckMode::Full`].
 pub fn check_pre_channelize(expr: &Expr) -> Result<(), Vec<InferError>> {
-    check_pre_channelize_located(expr, &InstanceTable::builtin(), CheckMode::Full)
-        .map_err(unlocated)
+    check_pre_channelize_located(expr, &InstanceTable::std(), CheckMode::Full).map_err(unlocated)
 }
 
 /// [`check_pre_channelize`] of a program declaring `instances`, in `mode`, keeping the node
@@ -6673,7 +6682,7 @@ mod tests {
         let errs = typecheck_planned(
             &tree,
             &HashMap::new(),
-            &InstanceTable::builtin(),
+            &InstanceTable::std(),
             CheckMode::Full,
         )
         .expect_err("a feed handle in a predicate passed");
@@ -6702,7 +6711,7 @@ mod tests {
         let errs = typecheck_planned(
             &tree,
             &HashMap::new(),
-            &InstanceTable::builtin(),
+            &InstanceTable::std(),
             CheckMode::Full,
         );
         assert!(
@@ -6735,7 +6744,7 @@ mod tests {
             typecheck_planned(
                 tree,
                 &HashMap::new(),
-                &InstanceTable::builtin(),
+                &InstanceTable::std(),
                 CheckMode::Full,
             )
         };

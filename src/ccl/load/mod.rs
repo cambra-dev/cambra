@@ -116,6 +116,9 @@ pub struct LoadedProgram {
     /// Every module, each after every module it has an edge to, or `None` when
     /// the module graph has a cycle.
     link_order: Option<Vec<FileId>>,
+    /// Every module in an acyclic graph; otherwise the std modules whose dependencies can
+    /// be ordered, which supply the operators needed to check the root past a cycle.
+    lowering_order: Vec<FileId>,
     /// The errors of loading itself: modules that have no file, and cycles.
     errors: Vec<LoadError>,
 }
@@ -415,6 +418,12 @@ impl LoadedProgram {
         self.link_order.as_deref()
     }
 
+    /// The modules lowered before the root: every module in an acyclic graph, and only the
+    /// independently ordered std modules when a cycle prevents linking user modules.
+    pub(crate) fn lowering_order(&self) -> &[FileId] {
+        &self.lowering_order
+    }
+
     /// The modules `file` has an edge to, in statement order, with the
     /// statement's kind.
     pub fn edges(&self, file: FileId) -> impl Iterator<Item = (EdgeKind, FileId)> + '_ {
@@ -449,7 +458,7 @@ impl LoadedProgram {
     }
 
     /// The names the prelude binds that some module outside the std root declares itself, as
-    /// a type. A diagnostic writes `std`'s declaration of such a name by its path, so it reads
+    /// a type or a trait. A diagnostic writes `std`'s declaration of such a name by its path, so it reads
     /// apart from the module's own (`NominalDecl::spelled`).
     pub fn prelude_names_declared(&self) -> BTreeSet<SmolStr> {
         let bound: BTreeSet<SmolStr> =
@@ -461,6 +470,7 @@ impl LoadedProgram {
             .flat_map(|ast| &ast.body)
             .filter_map(|stmt| match &stmt.node {
                 Stmt::TypeDecl(decl) => Some(&decl.name.node),
+                Stmt::TraitDecl(decl) => Some(&decl.name.node),
                 _ => None,
             })
             .filter(|name| bound.contains(*name))
@@ -531,15 +541,26 @@ fn load_with(root: RootFile, files: &mut dyn ModuleFiles, std: StdRoot<'_>) -> L
         ..
     } = loading;
     let cycles = graph::cycles(&modules, &sources);
-    let link_order = cycles
-        .is_empty()
-        .then(|| graph::link_order(&modules, &sources));
+    let mut lowering_order = graph::link_order(&modules, &sources);
+    let link_order = if cycles.is_empty() {
+        assert_eq!(
+            lowering_order.len(),
+            modules.len(),
+            "an acyclic module graph orders every module"
+        );
+        Some(lowering_order.clone())
+    } else {
+        // The std modules still lower, so their operators check the root past the cycle.
+        lowering_order.retain(|&file| is_std_file(&sources, file));
+        None
+    };
     errors.extend(cycles);
     LoadedProgram {
         sources,
         modules,
         prelude,
         link_order,
+        lowering_order,
         errors,
     }
 }

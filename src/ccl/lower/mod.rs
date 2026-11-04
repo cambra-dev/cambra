@@ -128,6 +128,7 @@ pub(crate) use stmts::TUPLE_ASSIGNMENT_LABEL;
 /// The names a type alias may not rebind, re-exported so the test that pins the
 /// refusal iterates the same source [`is_builtin_type_name`] reads.
 pub use stmts::{RESERVED_TYPE_NAMES, is_builtin_type_name};
+pub use traits::std_instances;
 
 // Pull every submodule's `pub(super)` helpers into the `lower` namespace so
 // that sibling submodules can reach them via `use super::*`. The external
@@ -481,7 +482,8 @@ pub(super) struct TypeParamScope {
 pub struct LoweringContext {
     /// The names the prelude binds that some module of the program declares itself
     /// ([`crate::ccl::load::LoadedProgram::prelude_names_declared`]): `std`'s declaration of
-    /// one is written by its path in diagnostics ([`NominalDecl::prelude_shadowed`]).
+    /// one is written by its path in diagnostics ([`NominalDecl::prelude_shadowed`],
+    /// [`TraitDecl::prelude_shadowed`](crate::ccl::infer::solver::traits::TraitDecl::prelude_shadowed)).
     pub(crate) prelude_names_declared: std::collections::BTreeSet<SmolStr>,
     /// Names each feed's and each call's place ([`crate::ccl::site`]).
     pub(crate) places: crate::ccl::site::Naming,
@@ -1931,6 +1933,10 @@ fn lower_expr_inner(
 /// `channelize` removes all `Feed` nodes and then collapses the `ExprStmt` to
 /// its body, leaving a clean `Let* Record{…}` shape for `compile_program`.
 pub fn lower_stmts(module: &ChlModule, ctx: &mut LoweringContext) -> LoweringResult {
+    // A module lowered alone reaches `std`'s traits, as the prelude gives a program's modules.
+    if !ctx.instances.has_std() {
+        ctx.instances = (*crate::ccl::infer::solver::traits::InstanceTable::std()).clone();
+    }
     let lowered = lower_root(module, ctx);
     let sinks = std::mem::take(&mut ctx.declared_sinks);
     let mut errors = lowered.errors;
@@ -2231,6 +2237,15 @@ pub(crate) mod test_helpers {
             Type::Base(BaseType::String),
             Extent::Base(BaseType::String),
         )))
+    }
+
+    /// A context outside any program, which reaches `std`'s traits and instances as a module
+    /// the prelude reaches does, so a comprehension's `for` clause lowers.
+    pub(crate) fn std_context() -> LoweringContext {
+        LoweringContext {
+            instances: (*crate::ccl::infer::solver::traits::InstanceTable::std()).clone(),
+            ..LoweringContext::default()
+        }
     }
 
     /// Lower the CHL type expression `code`, a polymorphic type included, where a module the
