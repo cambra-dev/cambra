@@ -188,7 +188,40 @@ pub enum Tile {
         /// some other key, so it is closed by `terminal` alone — see
         /// [`StoreValueStream`](crate::interpreter::commit_operator::StoreValueStream).
         closed_keys: Vec<Value>,
+        /// Per writer of a transaction store that takes its writers' decisions ahead of their
+        /// commits, what it says to that writer of the decisions it took ([`WriterTakes`]).
+        /// Empty for a store in pull mode and for an induction store. The level's, as
+        /// `closed_keys` is, and it grows by join.
+        writer_takes: Vec<WriterTakes>,
     },
+}
+
+/// What a transaction store that takes its writers' decisions ahead of their commits says to one
+/// writer of the decisions it took: see `src/interpreter/design-operators.md`, "Commits in key
+/// order". The writer's drive reads it through the store's recurrence.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WriterTakes {
+    /// The highest source position of the writer's items whose decision has committed or
+    /// stood, every item of the writer below it having done the same; `None` before the first.
+    pub settled: Option<Position>,
+    /// The source positions above `settled` of the writer's items whose decisions went stale,
+    /// ascending: the writer decides each again.
+    pub again: Vec<Position>,
+}
+
+impl WriterTakes {
+    /// `self` joined with `other`, a later or earlier statement about one writer: the higher
+    /// `settled`, and the items either names to decide again above it.
+    fn join(&mut self, other: WriterTakes) {
+        if other.settled > self.settled {
+            self.settled = other.settled;
+        }
+        self.again.extend(other.again);
+        self.again.sort();
+        self.again.dedup();
+        let settled = self.settled.clone();
+        self.again.retain(|item| Some(item) > settled.as_ref());
+    }
 }
 
 /// The region a tile makes releasable, where its held keys form a prefix the checks of
@@ -637,6 +670,7 @@ impl Tile {
                     frontier: s_frontier,
                     terminal: s_terminal,
                     closed_keys: s_closed,
+                    writer_takes: s_takes,
                 },
                 Tile::Store {
                     state: o_state,
@@ -645,6 +679,7 @@ impl Tile {
                     frontier: o_frontier,
                     terminal: o_terminal,
                     closed_keys: o_closed,
+                    writer_takes: o_takes,
                 },
             ) => {
                 s_state.merge_part(*o_state, whole);
@@ -680,6 +715,18 @@ impl Tile {
                 }
                 *s_terminal = *s_terminal || o_terminal;
                 s_closed.extend(o_closed);
+                if s_takes.is_empty() {
+                    *s_takes = o_takes;
+                } else if !o_takes.is_empty() {
+                    assert_eq!(
+                        s_takes.len(),
+                        o_takes.len(),
+                        "two arrivals of one store speak of the same writers"
+                    );
+                    for (s, o) in s_takes.iter_mut().zip(o_takes) {
+                        s.join(o);
+                    }
+                }
             }
             (s, o) => panic!("Incompatible tiles {s:?} and {o:?}"),
         };
@@ -796,7 +843,8 @@ impl Tile {
             },
             // A store is vectorized over rows like anything else — one changelog, seed,
             // decided set and frontier per row — so gathering rows gathers each of them.
-            // `terminal` and `closed_keys` are the level's, not a row's, and carry over whole.
+            // `terminal`, `closed_keys` and `writer_takes` are the level's, not a row's, and
+            // carry over whole.
             Tile::Store {
                 state,
                 seed,
@@ -804,6 +852,7 @@ impl Tile {
                 frontier,
                 terminal,
                 closed_keys,
+                writer_takes,
             } => Tile::Store {
                 state: Box::new(state.select_rows(rows)),
                 seed: Box::new(seed.select_rows(rows)),
@@ -811,6 +860,7 @@ impl Tile {
                 frontier: Box::new(frontier.select_rows(rows)),
                 terminal: *terminal,
                 closed_keys: closed_keys.clone(),
+                writer_takes: writer_takes.clone(),
             },
         }
     }
@@ -5846,6 +5896,7 @@ mod tests {
             frontier: Box::new(one_row_decided(ColumnValue::UInts(vec![]))),
             terminal: false,
             closed_keys: Vec::new(),
+            writer_takes: Vec::new(),
         };
         let mut tile = store();
         tile.merge(store());
@@ -5905,6 +5956,85 @@ mod tests {
             )]))
         );
         let _ = make_record; // suppress unused warning
+    }
+
+    // ── WriterTakes ───────────────────────────────────────────────────────────
+
+    fn takes(settled: Option<u64>, again: &[u64]) -> WriterTakes {
+        WriterTakes {
+            settled: settled.map(|p| Position::new(Value::UInt(p))),
+            again: again
+                .iter()
+                .map(|p| Position::new(Value::UInt(*p)))
+                .collect(),
+        }
+    }
+
+    /// An empty store of one key, stating `writer_takes`.
+    fn store_with_takes(writer_takes: Vec<WriterTakes>) -> Tile {
+        let tiling = crate::interpreter::commit_operator::full_store_tiling(
+            Extent::Base(crate::interpreter::BaseType::UInt),
+            HashMap::from([(
+                SmolStr::from("pool"),
+                Tiling::Scalar(Extent::Base(crate::interpreter::BaseType::Int)),
+            )]),
+        );
+        let mut store = tiling.empty_tile();
+        let Tile::Store {
+            writer_takes: takes,
+            ..
+        } = &mut store
+        else {
+            unreachable!("a store tiling's empty tile is a store")
+        };
+        *takes = writer_takes;
+        store
+    }
+
+    /// A join takes the higher `settled` and the union of the items to decide again, less those
+    /// at or below it, in either order of the two.
+    #[test]
+    fn writer_takes_join_settles_at_the_higher_and_prunes_below_it() {
+        let mut earlier = takes(Some(1), &[2, 4]);
+        earlier.join(takes(Some(3), &[5]));
+        assert_eq!(earlier, takes(Some(3), &[4, 5]));
+        let mut later = takes(Some(3), &[5]);
+        later.join(takes(Some(1), &[2, 4]));
+        assert_eq!(later, takes(Some(3), &[4, 5]));
+        let mut unsettled = takes(None, &[0]);
+        unsettled.join(takes(None, &[0, 1]));
+        assert_eq!(unsettled, takes(None, &[0, 1]));
+    }
+
+    /// Two arrivals of one store merge their writers' takes writer by writer, and one stating
+    /// none takes the other's.
+    #[test]
+    fn a_store_merge_joins_its_writers_takes() {
+        let mut store = store_with_takes(Vec::new());
+        store.merge(store_with_takes(vec![
+            takes(Some(0), &[]),
+            takes(None, &[0]),
+        ]));
+        store.merge(store_with_takes(vec![
+            takes(Some(2), &[]),
+            takes(Some(0), &[]),
+        ]));
+        let Tile::Store { writer_takes, .. } = &store else {
+            unreachable!("a merge of stores is a store")
+        };
+        assert_eq!(
+            writer_takes,
+            &vec![takes(Some(2), &[]), takes(Some(0), &[])]
+        );
+    }
+
+    /// Two arrivals of one store that speak of different numbers of writers are no arrivals of
+    /// one store.
+    #[test]
+    #[should_panic(expected = "two arrivals of one store speak of the same writers")]
+    fn a_store_merge_of_takes_for_different_writers_panics() {
+        let mut store = store_with_takes(vec![takes(None, &[])]);
+        store.merge(store_with_takes(vec![takes(None, &[]), takes(None, &[])]));
     }
 
     // ── Tile::to_guard ────────────────────────────────────────────────────────
