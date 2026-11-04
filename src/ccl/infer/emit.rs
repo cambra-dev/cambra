@@ -1475,8 +1475,8 @@ fn emit_lookup_checked<C: Typing>(
         &|| "checked lookup key".to_string(),
         ctx,
     )?;
-    // `Option(V)` requires `Equatable(V, V)`, which no constructor call checks here
-    // (`crate::ccl::nominal::record_option_requirements`).
+    // `Option(V)` requires `Equatable(V, V)`, which no constructor call checks here (`std`'s
+    // `type Option(T) requires Equatable(T, T)`, `stdlib/src/std.cambra`).
     ctx.require_trait(
         Trait::equatable(),
         function.node_id(),
@@ -1484,7 +1484,8 @@ fn emit_lookup_checked<C: Typing>(
         None,
         &|| "the value a checked lookup answers".to_string(),
     )?;
-    let result = Type::option_of(at_key);
+    let option = stamped_option(&function.ty);
+    let result = Type::option_of(&option, at_key);
     // Stamp the builtin with the concrete instance at this site, as `reify` does, so later
     // passes read a consistent type off the node. The domain is the pair the operator is
     // applied to, which is what op-conversion reads to size its output.
@@ -1493,6 +1494,21 @@ fn emit_lookup_checked<C: Typing>(
         result.clone(),
     );
     Ok(result)
+}
+
+/// The `Option` declaration lowering stamped on `lookup?` as its answer's head,
+/// `(_ ⇒ Option(_))` (`lower_subscript` in `src/ccl/lower/exprs.rs`), or that an earlier
+/// emission of the same node stamped with the concrete instance.
+fn stamped_option(ty: &Type) -> std::rc::Rc<crate::ccl::nominal::NominalDecl> {
+    match ty.peel_refinements() {
+        Type::Fun { codomain, .. } => match codomain.peel_refinements() {
+            Type::Nominal(decl, _) if decl.is_option() => std::rc::Rc::clone(decl),
+            other => panic!("`lookup?` answers `Option`, stamped `{other}`"),
+        },
+        other => {
+            panic!("`lookup?` is stamped with a function type answering `Option`, got `{other}`")
+        }
+    }
 }
 
 /// Type a **keyed write** `m[k] := v`: check `k` against the collection's key type and

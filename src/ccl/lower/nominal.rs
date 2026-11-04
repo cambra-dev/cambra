@@ -1548,18 +1548,6 @@ pub(super) fn bind_constructors(body: Expr, ctx: &mut LoweringContext) -> Expr {
     for (decl, _) in closed.iter().rev() {
         acc = bind_functions(decl, acc, ctx);
     }
-    // A compiler-provided declaration's members are bound only where the module names them
-    // (`LoweringContext::builtin_members_used`).
-    let used = std::mem::take(&mut ctx.builtin_members_used);
-    for (decl, name) in used.into_values().rev() {
-        acc = match decl.ctor(&name) {
-            Some(ctor) => bind_constructor(&decl, ctor, acc, ctx),
-            None if name == IS_NONE => bind_is_none(&decl, acc, ctx),
-            None if name == VALUE => bind_value(&decl, acc, ctx),
-            None if name == UNWRAP_OR => bind_unwrap_or(&decl, acc, ctx),
-            None => unreachable!("`{}` provides no function `{name}`", decl.name),
-        };
-    }
     acc
 }
 
@@ -1645,9 +1633,8 @@ fn bind_constructor(
     );
     let name = member_binding(decl, &ctor.name);
     // A constructor line writes its name at `ctor.span`. The single-constructor form's
-    // `new` is written nowhere, and its span is the declaration's name, as is a
-    // compiler-provided declaration's.
-    let binder = if decl.is_builtin() || decl.declares_extract {
+    // `new` is written nowhere, and its span is the declaration's name.
+    let binder = if decl.declares_extract {
         Occurrence::mint()
     } else {
         ctx.occurrence_at(ctor.span)
@@ -1666,53 +1653,16 @@ fn bind_constructor(
     )
 }
 
-/// The method `Option::is_none` that the compiler provides with `Option`.
+/// The method `Option::is_none`, which `std` declares with `Option`.
 const IS_NONE: &str = "is_none";
 
-/// `Option::is_none`, the function `λ 𝑜 → match 𝑜 { Option::some(_) → false; Option::none →
-/// true }` (`docs/chl-spec.md`, "Subscript and unwrap syntax \[Decided\]"). The interpreter
-/// provides the same method (`BuiltinMethod::IsNone` in `chl-interp/src/eval.rs`).
-fn bind_is_none(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) -> Expr {
-    let label = "lower.option_is_none";
-    let span = decl.span;
-    let arg = "__is_none_arg";
-    let scrutinee = ctx.tag_machinery(Expr::var(arg), span, label);
-    let mut arms = Vec::new();
-    for (tag, empty_payload, answer) in [(V_SOME, false, false), (V_NONE, true, true)] {
-        let payload = ctx.fresh_ignored_payload();
-        arms.push(crate::ccl::Branch {
-            pattern: Some(Pattern {
-                head: PatternHead::Constructor {
-                    decl: Rc::clone(decl),
-                    ctor: tag.name().into(),
-                },
-                head_occurrence: Occurrence::mint(),
-                binding: TypedBinding::new_unannotated(payload, Occurrence::mint()),
-                empty_payload,
-            }),
-            guard: ctx.tag_machinery(Expr::lit(Lit::Bool(true)), span, label),
-            body: ctx.tag_machinery(Expr::lit(Lit::Bool(answer)), span, label),
-        });
-    }
-    let case = ctx.tag_machinery(Expr::match_expr(scrutinee, arms), span, label);
-    let name = member_binding(decl, IS_NONE);
-    let self_ty = decl
-        .applied_to_params(&mut |n, ty| ctx.tag_machinery(Expr::var(n).with_ty(ty), span, label));
-    let binder = Occurrence::mint();
-    bind_function(
-        decl, name, binder, arg, self_ty, case, acc, span, label, ctx,
-    )
-}
-
-/// The method `Option::unwrap_or` that the compiler provides with `Option`.
-const UNWRAP_OR: &str = "unwrap_or";
-
-/// The method `Option::value` that the compiler provides with `Option`, and that `x!` calls.
+/// The method `Option::value`, which `std` declares with `Option`, and that `x!` calls.
 const VALUE: &str = "value";
 
 /// `x!`: the payload of `x`, an `Option` proven `some` (`docs/chl-spec.md`, "Subscript and
-/// unwrap syntax \[Decided\]"). It applies `Option::value` ([`bind_value`]), whose
-/// parameter's refinement is the proof `x`'s type owes.
+/// unwrap syntax \[Decided\]"). It applies `std`'s `Option::value`, whose parameter's
+/// refinement is the proof `x`'s type owes. A module that declares its own `Option` still
+/// unwraps `std`'s, the type its lookups answer.
 pub(super) fn lower_unwrap(
     target: &Spanned<ChlExpr>,
     span: Span,
@@ -1722,10 +1672,50 @@ pub(super) fn lower_unwrap(
     if matches!(target.node, TypedExprNode::Error) {
         return Ok(target);
     }
-    let option = crate::ccl::nominal::option();
-    let binding = member_reference(&option, VALUE, ctx);
+    let binding = std_option_member(VALUE, span, ctx)?;
     let function = ctx.tag_image(Expr::var(binding), span);
     Ok(Expr::apply(target, function))
+}
+
+/// The name this module reads `std`'s `Option` member `name` by: the member's own binding in
+/// `std`, which declares it, and elsewhere the binding spelled through the qualifier that
+/// reaches `std`'s `Option`, as a method call spells a foreign candidate ([`foreign_methods`]).
+fn std_option_member(
+    name: &str,
+    span: Span,
+    ctx: &LoweringContext,
+) -> Result<String, LoweringError> {
+    if let Some(decl) = ctx.nominal_types.iter().find(|d| d.is_option()) {
+        return Ok(member_binding(decl, name));
+    }
+    let mut qualifiers: Vec<&super::modules::Qualifier> = ctx
+        .module
+        .qualifiers
+        .values()
+        .filter(|q| q.view.is_none())
+        .collect();
+    qualifiers.sort_by_key(|q| (q.kind.sequential(), q.name.to_string()));
+    qualifiers
+        .into_iter()
+        .find_map(|qualifier| {
+            let option = qualifier
+                .reachable()?
+                .nominal
+                .values()
+                .find(|ty| ty.public && ty.decl.is_option())?;
+            Some(format!(
+                "{}::{}",
+                qualifier.name,
+                member_binding(&option.decl, name)
+            ))
+        })
+        .ok_or_else(|| {
+            LoweringError::internal(
+                span,
+                "`x!` applies `std`'s `Option::value`, which no qualifier of this module \
+                 reaches: a std module that writes `x!` imports `std`",
+            )
+        })
 }
 
 /// `Option`'s constructor `ctor`.
@@ -1736,174 +1726,8 @@ fn option_ctor(decl: &Rc<NominalDecl>, ctor: Label) -> crate::ccl::CtorRef {
     }
 }
 
-/// `match scrutinee { Option::some(𝑣) → 𝑣; Option::none → none }`, or with no `none` arm when
-/// `none` is `None`.
-fn match_option(
-    decl: &Rc<NominalDecl>,
-    scrutinee: Expr,
-    none: Option<Expr>,
-    span: Span,
-    label: crate::ccl::provenance::RewriteLabel,
-    ctx: &mut LoweringContext,
-) -> Expr {
-    let payload = ctx.fresh_ignored_payload();
-    let some_body = ctx.tag_machinery(Expr::var(payload.as_str()), span, label);
-    let mut arms = vec![(
-        V_SOME,
-        TypedBinding::new_unannotated(payload, Occurrence::mint()),
-        false,
-        some_body,
-    )];
-    if let Some(none) = none {
-        let ignored = ctx.fresh_ignored_payload();
-        arms.push((
-            V_NONE,
-            TypedBinding::new_unannotated(ignored, Occurrence::mint()),
-            true,
-            none,
-        ));
-    }
-    let arms = arms
-        .into_iter()
-        .map(|(tag, binding, empty_payload, body)| crate::ccl::Branch {
-            pattern: Some(Pattern {
-                head: PatternHead::Constructor {
-                    decl: Rc::clone(decl),
-                    ctor: tag.name().into(),
-                },
-                head_occurrence: Occurrence::mint(),
-                binding,
-                empty_payload,
-            }),
-            guard: ctx.tag_machinery(Expr::lit(Lit::Bool(true)), span, label),
-            body,
-        })
-        .collect();
-    ctx.tag_machinery(Expr::match_expr(scrutinee, arms), span, label)
-}
-
-/// `Option::value`, the method `x!` calls:
-/// `λ 𝑜 : {Option(𝑇) | not (__elem ▷ ctor_is(Option::none))} → match 𝑜 { Option::some(𝑣) → 𝑣 }`.
-///
-/// The `match` has no arm for `none`: the parameter's refinement rules it out, which
-/// inference proves (`src/ccl/design/type-inference.md`, "Arm facts"). Its result is
-/// `{𝑇 | 𝑜 ▷ ctor_is(Option::some) and __elem == 𝑜 ▷ ctor_payload(Option::some)}`, which the
-/// `match` derives.
-fn bind_value(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) -> Expr {
-    use crate::ccl::UnaryOpKind;
-    let label = "lower.option_value";
-    let span = decl.span;
-    let arg = "__value_arg";
-    let option_ty = decl
-        .applied_to_params(&mut |n, ty| ctx.tag_machinery(Expr::var(n).with_ty(ty), span, label));
-    let Type::Nominal(_, args) = &option_ty else {
-        unreachable!("a declaration applied to its parameters is a nominal type")
-    };
-    let elem = Expr::var(Name::elem()).with_ty(option_ty.clone());
-    let is_none = crate::ccl::nominal::ctor_is(elem, &option_ctor(decl, V_NONE), args);
-    let excludes_none =
-        Expr::unary(UnaryOpKind::Not, is_none).with_ty(Type::Base(crate::ccl::BaseType::Bool));
-    ctx.tag_predicate(&excludes_none, span, label);
-    let param_ty = Type::refined_one(
-        option_ty.clone(),
-        crate::ccl::Refinement::born(Rc::new(excludes_none)),
-    );
-    let scrutinee = ctx.tag_machinery(Expr::var(arg), span, label);
-    let case = match_option(decl, scrutinee, None, span, label, ctx);
-    let name = member_binding(decl, VALUE);
-    let binder = Occurrence::mint();
-    bind_function(
-        decl, name, binder, arg, param_ty, case, acc, span, label, ctx,
-    )
-}
-
-/// `Option::unwrap_or`, the function
-/// `λ 𝑝 : (Option(𝑇₁), 𝑇₂) → match 𝑝.0 { Option::some(𝑣) → 𝑣; Option::none → 𝑝.1 }`, polymorphic
-/// over `𝑇₃`, `𝑇₁ <: 𝑇₃` and `𝑇₂ <: 𝑇₃`.
-///
-/// The option's payload and the default each have their own parameter, so a call does not
-/// equate their types. Only the result's parameter, `𝑇₃`, lies above both. The result's
-/// refinement is the one the `match` derives, `(𝑝.0 ▷ ctor_is(Option::some) and __elem ==
-/// 𝑝.0 ▷ ctor_payload(Option::some)) or (𝑝.0 ▷ ctor_is(Option::none) and __elem == 𝑝.1)`.
-fn bind_unwrap_or(decl: &Rc<NominalDecl>, acc: Expr, ctx: &mut LoweringContext) -> Expr {
-    let label = "lower.option_unwrap_or";
-    let span = decl.span;
-    let arg = "__unwrap_or_arg";
-    debug_assert!(
-        !decl.has_family_params(),
-        "`Option`'s one type parameter is not a family, so `Option(𝑇₁)` is its application"
-    );
-    let result = TypeParam::declared("T3");
-    let below_result = |spelling: &str| {
-        PolyParam::with_bound(
-            TypeParam::declared(spelling),
-            Some(Type::Param(Rc::clone(&result))),
-            None,
-        )
-    };
-    let params = vec![
-        PolyParam::with_bound(Rc::clone(&result), None, None),
-        below_result("T1"),
-        below_result("T2"),
-    ];
-    let [t1, t2] = [&params[1], &params[2]].map(|p| Type::Param(Rc::clone(&p.param)));
-    let param_ty = Type::Tuple(vec![Type::Nominal(Rc::clone(decl), vec![t1]), t2]);
-    let component = |i: usize, ctx: &mut LoweringContext| {
-        let read = Expr::apply(
-            ctx.tag_machinery(Expr::var(arg), span, label),
-            ctx.tag_machinery(Expr::proj_index(i), span, label),
-        );
-        ctx.tag_machinery(read, span, label)
-    };
-    let scrutinee = component(0, ctx);
-    let default = component(1, ctx);
-    let case = match_option(decl, scrutinee, Some(default), span, label, ctx);
-    let name = member_binding(decl, UNWRAP_OR);
-    let binder = Occurrence::mint();
-    bind_function_over(
-        params,
-        Vec::new(),
-        name,
-        binder,
-        arg,
-        param_ty,
-        case,
-        acc,
-        span,
-        label,
-        ctx,
-    )
-}
-
-/// The name a reference to `decl`'s member `name` reads, recording the member as used when
-/// the compiler provides `decl`.
-fn member_reference(decl: &Rc<NominalDecl>, name: &str, ctx: &mut LoweringContext) -> String {
-    let binding = member_binding(decl, name);
-    if decl.is_builtin() {
-        ctx.builtin_members_used
-            .entry(binding.clone())
-            .or_insert_with(|| (Rc::clone(decl), SmolStr::from(name)));
-    }
-    binding
-}
-
-/// The associated functions the compiler provides with its declarations: `Option`'s methods
-/// `is_none`, `value` and `unwrap_or`.
-fn builtin_functions() -> [AssociatedFunction; 3] {
-    let option = crate::ccl::nominal::option();
-    let span = option.span;
-    let method = |name: &'static str, arity: usize| AssociatedFunction {
-        decl: Rc::clone(&option),
-        name: SmolStr::new_static(name),
-        arity,
-        is_method: true,
-        span,
-    };
-    [method(IS_NONE, 1), method(VALUE, 1), method(UNWRAP_OR, 2)]
-}
-
 /// The reading a refinement predicate gives `decl`'s method `method`, where the method is one of
-/// `Option`'s observers: `is_none` reads `ctor_is(Option::none)`, and `value` reads
+/// `std`'s `Option`'s observers: `is_none` reads `ctor_is(Option::none)`, and `value` reads
 /// `ctor_payload(Option::some)`. A method call (`_.is_none()`) and a path (`Option::is_none(_)`,
 /// [`predicate_reference`]) read the same.
 ///
@@ -1913,7 +1737,7 @@ fn builtin_functions() -> [AssociatedFunction; 3] {
 /// type as any method call does. Unlike `value`, `ctor_payload` has no domain refinement: it
 /// states nothing of a `none`, and `_.value() == 3` is a predicate about any `Option`.
 fn predicate_reading(decl: &Rc<NominalDecl>, method: &str) -> Option<crate::ccl::Builtin> {
-    if **decl != *crate::ccl::nominal::option() {
+    if !decl.is_option() {
         return None;
     }
     match method {
@@ -2079,8 +1903,6 @@ fn member(decl: &NominalDecl, name: &str, ctx: &LoweringContext) -> Option<(Memb
     }
     ctx.associated_functions
         .iter()
-        .cloned()
-        .chain(builtin_functions())
         .find(|f| *f.decl == *decl && f.name == name)
         .map(|f| (Member::Associated { arity: f.arity }, f.span))
 }
@@ -2141,9 +1963,9 @@ impl Named {
 
     /// The name a reference to the member `name` reads: the binding its module's chain
     /// binds, spelled through the qualifier for another module's type.
-    fn reference(&self, name: &str, ctx: &mut LoweringContext) -> String {
+    fn reference(&self, name: &str) -> String {
         match &self.foreign {
-            None => member_reference(&self.decl, name, ctx),
+            None => member_binding(&self.decl, name),
             Some((qualifier, _)) => {
                 format!("{qualifier}::{}", member_binding(&self.decl, name))
             }
@@ -2151,8 +1973,8 @@ impl Named {
     }
 }
 
-/// The nominal type `path` names, `Shape` or `shop::Shape`: one the module declares or the
-/// compiler provides, or a public one of the module its qualifier names. `None` when that
+/// The nominal type `path` names, `Shape` or `shop::Shape`: one the module declares or a `use`
+/// name reaches, or a public one of the module its qualifier names. `None` when that
 /// module has errors of its own, which are reported where they stand.
 pub(super) fn resolve_type(
     path: &[Spanned<SmolStr>],
@@ -2313,7 +2135,7 @@ pub(super) fn lower_member(
             Ok(Expr::nominal_ctor(named.decl, q.name.node.as_str(), unit))
         }
         _ => Ok(predicate_reference(&named.decl, &q.name, ctx)
-            .unwrap_or_else(|| Expr::var(named.reference(&q.name.node, ctx)))),
+            .unwrap_or_else(|| Expr::var(named.reference(&q.name.node)))),
     }
 }
 
@@ -2368,7 +2190,7 @@ pub(super) fn lower_member_call(
                 Ok(Expr::apply(super::lower_expr(arg, ctx)?, reading))
             }
             None => {
-                let binding = named.reference(name, ctx);
+                let binding = named.reference(name);
                 super::exprs::lower_application(Name::raw(&binding), span, args, ctx)
             }
         },
@@ -2731,7 +2553,15 @@ fn declare_one(def: &AssociatedDef, ctx: &mut LoweringContext) -> Result<(), Low
             ),
         ));
     }
-    let Some(decl) = ctx.nominal_type(&owner.node) else {
+    // Whether another module may declare a type's associated functions is open
+    // (`docs/chl-spec.md`, "Associated functions and methods"), so the owner is a type this
+    // module declares, not one a `use` name reaches.
+    let Some(decl) = ctx
+        .nominal_types
+        .iter()
+        .find(|decl| decl.name == owner.node)
+        .cloned()
+    else {
         return Err(LoweringError::unsupported(
             owner.span,
             format!(
@@ -2743,18 +2573,6 @@ fn declare_one(def: &AssociatedDef, ctx: &mut LoweringContext) -> Result<(), Low
             ),
         ));
     };
-    // Whether another module may declare a type's associated functions is open, and the
-    // compiler provides `Option` from no module (`docs/chl-spec.md`, "Associated functions
-    // and methods").
-    if decl.is_builtin() {
-        return Err(LoweringError::unsupported(
-            owner.span,
-            format!(
-                "`{}` is a built-in type, so this module declares no associated function of it",
-                decl.name
-            ),
-        ));
-    }
     if block.is_some() && def.block_params.len() != decl.params.len() {
         return Err(LoweringError::unsupported(
             owner.span,
@@ -2831,11 +2649,12 @@ fn declare_one(def: &AssociatedDef, ctx: &mut LoweringContext) -> Result<(), Low
     Ok(())
 }
 
-/// Check the annotation on the `self` of `decl`'s method `name`: `self` is the declaration at
-/// type parameters (`docs/chl-spec.md`, "Associated functions and methods"). In an `impl` block
-/// and for a type without parameters it takes no annotation, and outside a block a
-/// parameterised type's `self` is the type applied to the function's own type parameters, each
-/// named once.
+/// Check the annotation on the `self` of `decl`'s method `name` (`docs/chl-spec.md`, "Associated
+/// functions and methods"). `self` is the declaration at type parameters: in an `impl` block the
+/// block's, outside one the function's own, each named once, and for a type without parameters
+/// the type itself. Outside a block a parameterised type's `self` is annotated with that type.
+/// Elsewhere the type is already fixed, so an annotation may only refine it. A refinement's base
+/// is the type `self` has without it, so the refinement is the annotation's whole content.
 fn check_self_annotation(
     decl: &NominalDecl,
     name: &str,
@@ -2843,55 +2662,56 @@ fn check_self_annotation(
     def: &AssociatedDef,
 ) -> Result<(), LoweringError> {
     let qualified = format!("{}::{name}", decl.name);
-    if def.block.is_some() {
-        let params = def
-            .block_params
-            .iter()
-            .map(|p| p.node.as_str())
-            .collect::<Vec<_>>();
+    let (base, refined) = match &annotation.ty.node {
+        ChlExpr::BraceRefinement { base, .. } => (&**base, true),
+        _ => (&annotation.ty, false),
+    };
+    let exact = annotation.mode == AnnotationMode::Exact;
+    // The parameter names `base` applies the declaration to, `Some([])` for the bare name.
+    fn applied_to<'a>(decl: &NominalDecl, base: &'a Spanned<ChlExpr>) -> Option<Vec<&'a str>> {
+        match &base.node {
+            ChlExpr::Name(n) if *n == decl.name => Some(Vec::new()),
+            ChlExpr::Call { func, args } if matches!(&func.node, ChlExpr::Name(n) if *n == decl.name) => {
+                args.iter()
+                    .map(|a| match &a.node {
+                        ChlExpr::Name(n) => Some(n.as_str()),
+                        _ => None,
+                    })
+                    .collect()
+            }
+            _ => None,
+        }
+    }
+    if def.block.is_some() || decl.params.is_empty() {
+        let params: Vec<&str> = def.block_params.iter().map(|p| p.node.as_str()).collect();
         let ty = if params.is_empty() {
             decl.name.to_string()
         } else {
             format!("{}({})", decl.name, params.join(", "))
         };
+        if refined && exact && applied_to(decl, base).is_some_and(|names| names == params) {
+            return Ok(());
+        }
+        let what = if def.block.is_some() {
+            format!("the `{ty}` the block declares functions of")
+        } else {
+            format!("a `{ty}`")
+        };
         return Err(LoweringError::unsupported(
             annotation.ty.span,
             format!(
-                "`self` of `{qualified}` is the `{ty}` the block declares functions of, and \
-                 takes no annotation"
-            ),
-        ));
-    }
-    if decl.params.is_empty() {
-        return Err(LoweringError::unsupported(
-            annotation.ty.span,
-            format!(
-                "`self` of `{qualified}` is a `{}`, and takes no annotation",
-                decl.name
+                "`self` of `{qualified}` is {what}, and an annotation only refines it: \
+                 `self: {{{ty} where …}}`"
             ),
         ));
     }
     let own: Vec<&str> = def.type_params.iter().map(|p| p.name.as_str()).collect();
-    let args = match &annotation.ty.node {
-        ChlExpr::Call { func, args } if matches!(&func.node, ChlExpr::Name(n) if *n == decl.name) => {
-            Some(args)
-        }
-        _ => None,
-    };
-    let at_own_params = args.is_some_and(|args| {
-        let names: Vec<&str> = args
-            .iter()
-            .filter_map(|a| match &a.node {
-                ChlExpr::Name(n) => Some(n.as_str()),
-                _ => None,
-            })
-            .collect();
-        names.len() == args.len()
-            && names.len() == decl.params.len()
+    let at_own_params = applied_to(decl, base).is_some_and(|names| {
+        names.len() == decl.params.len()
             && names.iter().all(|n| own.contains(n))
             && names.iter().collect::<HashSet<_>>().len() == names.len()
     });
-    if annotation.mode != AnnotationMode::Exact || !at_own_params {
+    if !exact || !at_own_params {
         let params = decl
             .params
             .iter()
@@ -2901,7 +2721,8 @@ fn check_self_annotation(
             annotation.ty.span,
             format!(
                 "`self` of `{qualified}` is `{0}` at type parameters of the function's own, \
-                 each named once: `self: {0}({1})` for `def {0}::{name}({1}, self: …)`",
+                 each named once: `self: {0}({1})` for `def {0}::{name}({1}, self: …)`, or a \
+                 refinement of it",
                 decl.name,
                 params.join(", ")
             ),
@@ -2947,7 +2768,7 @@ pub(super) fn lower_associated_def(
         && first.name == "self"
         && first.annotation.is_none()
     {
-        let head = Spanned::new(first.name_span, ChlExpr::Name(decl.name.clone()));
+        let head = Spanned::new(def.owner.span, ChlExpr::Name(decl.name.clone()));
         let ty = if impl_params.is_empty() {
             head
         } else {
@@ -2956,7 +2777,7 @@ pub(super) fn lower_associated_def(
                 .map(|p| Spanned::new(p.span, ChlExpr::Name(p.node.clone())))
                 .collect();
             Spanned::new(
-                first.name_span,
+                def.owner.span,
                 ChlExpr::Call {
                     func: Box::new(head),
                     args,
@@ -3057,8 +2878,6 @@ pub(super) fn lower_method_call(
     let mut owners: Vec<(Rc<NominalDecl>, usize, Option<QualifiedNameOf>)> = ctx
         .associated_functions
         .iter()
-        .cloned()
-        .chain(builtin_functions())
         .filter(|f| f.is_method && f.name == method.node)
         .map(|f| (Rc::clone(&f.decl), f.arity - 1, None))
         .collect();
@@ -3104,7 +2923,7 @@ pub(super) fn lower_method_call(
                 };
             }
             let binding = match qualifier {
-                None => member_reference(&decl, &method.node, ctx),
+                None => member_binding(&decl, &method.node),
                 Some(qualifier) => {
                     format!("{qualifier}::{}", member_binding(&decl, &method.node))
                 }

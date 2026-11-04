@@ -1056,14 +1056,13 @@ enum Member {
 enum BuiltinMethod {
     /// The `extract` of the single-constructor form.
     Extract,
-    /// `Option::is_none`, which the compiler provides with `Option` (`bind_is_none` in
-    /// `src/ccl/lower/nominal.rs`).
+    /// `Option::is_none`, which `std` declares with `Option`
+    /// (`stdlib/src/std.cambra`).
     IsNone,
-    /// `Option::unwrap_or`, which the compiler provides with `Option` (`bind_unwrap_or` in
-    /// `src/ccl/lower/nominal.rs`).
+    /// `Option::unwrap_or`, which `std` declares with `Option` (`stdlib/src/std.cambra`).
     UnwrapOr,
-    /// `Option::value`, which the compiler provides with `Option` and `x!` calls (`bind_value`
-    /// in `src/ccl/lower/nominal.rs`).
+    /// `Option::value`, which `std` declares with `Option` and `x!` calls
+    /// (`stdlib/src/std.cambra`).
     Value,
 }
 
@@ -1103,8 +1102,9 @@ impl BuiltinMethod {
     }
 }
 
-/// The compiler-provided `Option` (`docs/chl-spec.md`, "9.16 The std root"), the type of a
-/// checked lookup's answer. The compiler's declaration is `option` in `src/ccl/nominal.rs`.
+/// `Option` (`docs/chl-spec.md`, "9.16 The std root"), the type of a checked lookup's answer.
+/// The compiler reaches `std`'s declaration (`stdlib/src/std.cambra`) through the
+/// prelude, and this interpreter, which loads one file, declares the same members itself.
 const OPTION: &str = "Option";
 
 /// What the module declares of one nominal type.
@@ -1127,8 +1127,8 @@ impl TypeMembers {
 }
 
 /// What `body` declares of each nominal type, by the type's name: each `type` declaration's
-/// members, the methods the associated functions of the type declare, and the
-/// compiler-provided `Option`'s constructors, `is_none`, `value` and `unwrap_or`.
+/// members, the methods the associated functions of the type declare, and `Option`'s
+/// constructors, `is_none`, `value` and `unwrap_or` ([`OPTION`]).
 fn collect_types(body: &[Spanned<Stmt>]) -> BTreeMap<String, TypeMembers> {
     let mut option = TypeMembers {
         members: BTreeMap::from([
