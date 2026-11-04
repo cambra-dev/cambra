@@ -1040,6 +1040,24 @@ fn a_region_consumed_twice_is_refused() {
     });
 }
 
+/// The pipelines of one breaker push into one record of what it pushed: a region one of them
+/// pushed, the other pushing again would consume twice, which a debug build refuses.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "the reader of pipeline 1 consumes each region once")]
+fn the_pipelines_of_one_breaker_share_what_it_pushed() {
+    let all = ints().universal_guard();
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![0, 1]], UNBOUNDED);
+    dispatcher.share_pushes(&[PipelineId(0), PipelineId(1)]);
+    // Both sources closed, so the epoch is the run's last.
+    dispatcher.close(PipelineId(1));
+    for pipeline in [PipelineId(0), PipelineId(1)] {
+        dispatcher.finish_by_hand(pipeline, |pushes| {
+            pushes.push(&all, |guard, _| vec![guard.clone()]);
+        });
+    }
+}
+
 /// A breaker's final guard pushed twice pushes it once: the second push is of what the breaker
 /// decided since, which is nothing.
 #[test]
