@@ -2031,7 +2031,10 @@ where
             .map(|(name, ty)| ConstructorParam { name, ty });
         // Parentheses hold at least one parameter: a constructor that declares none is a
         // value, written without them.
-        let ctor_line = binder
+        let ctor_line = just(Token::Pub)
+            .map_with(|_, e| e.span())
+            .or_not()
+            .then(binder)
             .then(
                 ctor_param
                     .separated_by(just(Token::Comma))
@@ -2043,7 +2046,7 @@ where
                     .map(Option::unwrap_or_default),
             )
             .then_ignore(just(Token::Newline))
-            .validate(|(name, params), _, emitter| {
+            .validate(|((public, name), params), _, emitter| {
                 if is_type_name(&name.node) {
                     emitter.emit(Rich::custom(
                         name.span,
@@ -2054,7 +2057,11 @@ where
                         ),
                     ));
                 }
-                Constructor { name, params }
+                Constructor {
+                    public,
+                    name,
+                    params,
+                }
             });
         let type_body = choice((
             just(Token::Eq)

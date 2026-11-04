@@ -15,8 +15,8 @@ use super::modules::{assert_refused, compile_errors, program};
 /// A module with a nominal type, its associated function, and a method.
 const SHOP: &str = indoc! {"
     pub type Shape:
-        circle(Int)
-        dot
+        pub circle(Int)
+        pub dot
     pub def Shape::area(self) => Int:
         match self:
             case Shape::circle(r):
@@ -31,6 +31,11 @@ const SHOP: &str = indoc! {"
     type Secret = Int
     pub type Box(T) = T
     pub type Amount = {amount: Int}
+    pub type Token:
+        pub revoked
+        issued(Int)
+    pub def Token::issue(n: Int) => Token:
+        Token::issued(n)
 "};
 
 /// [`SHOP`] with a transactional variable, so it is run and not imported.
@@ -341,9 +346,49 @@ fn a_method_call_through_another_module_reaches_only_public_methods(#[case] meth
     );
 }
 
-/// A private type, and a private associated function of a public one, are their module's
-/// alone.
+/// A public constructor of a type whose other constructors are private is another module's to
+/// build and match, and the type's own functions build the private ones.
+#[test]
+fn a_public_constructor_beside_private_ones_is_reached() {
+    check_program_scalar(
+        &program(
+            indoc! {"
+                import shop
+                def code(t: shop::Token) => Int:
+                    match t:
+                        case shop::Token::revoked:
+                            0
+                        case _:
+                            1
+                code(shop::Token::revoked) + code(shop::Token::issue(5))
+            "},
+            &[("shop", SHOP)],
+        ),
+        Value::Int(1),
+    );
+}
+
+/// A private type, and a private associated function or constructor of a public one, are their
+/// module's alone: another module neither builds nor matches a constructor without `pub`.
 #[rstest]
+#[case::constructor_built(
+    indoc! {"
+        import shop
+        shop::Token::issued(1)
+    "},
+    "the constructor `Token::issued` is private to module `shop`"
+)]
+#[case::constructor_matched(
+    indoc! {"
+        import shop
+        match shop::Token::issue(1):
+            case shop::Token::issued(n):
+                n
+            case shop::Token::revoked:
+                0
+    "},
+    "the constructor `Token::issued` is private to module `shop`"
+)]
 #[case::type_(
     indoc! {"
         import shop
@@ -416,7 +461,7 @@ fn a_record_payload_is_built_with_qualified_keyword_arguments() {
 const ORDERS: &str = indoc! {"
     param Receipt
     pub type Order:
-        placed(Receipt)
+        pub placed(Receipt)
     pub type Price = Int
     pub def total(o: Order) => Int:
         1
