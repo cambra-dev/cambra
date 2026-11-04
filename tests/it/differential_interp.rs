@@ -327,8 +327,8 @@ fn methods_of_nominal_values() {
     "#});
 }
 
-/// The compiler-provided `Option`: a checked lookup's answer, its constructors, a `match`
-/// over them, and `is_none`.
+/// `std`'s `Option`: a checked lookup's answer, its constructors, a `match` over them,
+/// and `is_none`.
 #[test]
 fn option_values() {
     agree(indoc! {r#"

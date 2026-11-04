@@ -70,10 +70,12 @@ pub(super) struct Definition {
     pub(super) name: SmolStr,
 }
 
-/// Every resolved use→binder pair in `tree`, in first-visit pre-order.
+/// Every resolved use→binder pair in `tree` whose use and binder both stand in the root file,
+/// the one the payload shows, in first-visit pre-order.
 ///
 /// A use whose binder carries no site contributes no row, which is how a use of
-/// a compiler-minted binder stays out: those are written nowhere.
+/// a compiler-minted binder stays out: those are written nowhere. A use of a std module's
+/// member, such as `Option::some`, resolves into that module's file, and contributes no row.
 pub(super) fn definitions(
     tree: &Expr,
     projection: &SourceProjection,
@@ -84,6 +86,8 @@ pub(super) fn definitions(
 
     let mut out = Vec::new();
     collect_uses(tree, projection, sources, &sites, &mut out);
+    let root = sources.root();
+    out.retain(|d| d.use_span.file == root && d.def_span.file == root);
     out
 }
 

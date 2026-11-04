@@ -229,9 +229,9 @@ branch.
 
 A variant constructor becomes `VariantCtor(tag, payload)`. A bare `` `tag `` and `` `tag() ``
 both supply a `unit` payload. The payload can be a tuple or record, using ordinary term syntax.
-`Option(T)` names the compiler-provided nominal type, built by `Option::some` and `Option::none`
-([nominal-types.md](nominal-types.md#the-compiler-provided-option)); the backtick tags `` `some ``
-and `` `none `` are ordinary tags that build a structural variant.
+`Option(T)` names the nominal type `std` declares, built by `Option::some` and
+`Option::none` ([nominal-types.md](nominal-types.md#option-in-std)). The backtick tags
+`` `some `` and `` `none `` are ordinary tags that build a structural variant.
 
 `match 𝑠` becomes a `Case` with a scrutinee and one `Branch` per arm. Tagged branches carry a
 `Pattern(tag, binding, empty_payload)` and a literal `true` guard. A named payload binds its name.
@@ -361,8 +361,8 @@ A target is a `Span` for a declaration lowering locates directly, or the `Uid` o
 binder. A module's target is the empty span at the start of its file. A `Uid` target resolves
 through the binder's binding occurrence, as a use of the binder does
 ([provenance.md](provenance.md#name-occurrences)). A span names its file, so a target in another
-module's file resolves there. A name with no declaration in any source has no row: `Int`
-and the other built-in types, and the compiler-provided `Option`, whose `NominalDecl.span` is empty.
+module's file resolves there. A name with no declaration in any source has no row: `Int` and the
+other built-in types.
 
 The table is an output of lowering, not of provenance. No pass after lowering reads or rewrites the
 names it records, so a row needs no `NodeId` and no copy rule. It describes the program lowering

@@ -13,7 +13,19 @@ fn load(text: &str, files: InMemory) -> LoadedProgram {
     load_std(text, files, &[])
 }
 
-fn load_std(text: &str, mut files: InMemory, std: &[(&str, &str)]) -> LoadedProgram {
+/// [`load`] against the std modules `std`, with no prelude.
+fn load_std(text: &str, files: InMemory, std: &[(&str, &str)]) -> LoadedProgram {
+    load_root(
+        text,
+        files,
+        StdRoot {
+            modules: std,
+            prelude: "",
+        },
+    )
+}
+
+fn load_root(text: &str, mut files: InMemory, std: StdRoot<'_>) -> LoadedProgram {
     let root = RootFile {
         path: "main.cambra".to_owned(),
         module: Some(path("main")),
@@ -44,10 +56,72 @@ fn text_at(program: &LoadedProgram, span: Span) -> &str {
 }
 
 #[test]
-fn a_program_of_one_file_loads_it_alone() {
+fn a_program_of_one_file_loads_it_with_the_prelude() {
     let program = LoadedProgram::test("x = 1\n");
     assert!(messages(&program).is_empty());
-    assert_eq!(names(&program, program.link_order().unwrap()), ["<test>"]);
+    assert_eq!(
+        names(&program, program.link_order().unwrap()),
+        ["std", "<test>"]
+    );
+}
+
+#[test]
+fn the_prelude_parses_and_names_embedded_std_modules() {
+    let parsed = parse_module(FileId::ROOT, PRELUDE);
+    assert!(parsed.errors.is_empty(), "{:?}", parsed.errors);
+    for stmt in &parsed.value.expect("the prelude lexes").body {
+        let Stmt::Import { path, args, .. } = &stmt.node else {
+            panic!(
+                "the prelude holds only `import` statements, got {:?}",
+                stmt.node
+            );
+        };
+        let module = path.to_path().expect("a prelude path is well formed");
+        assert!(
+            module.is_std(),
+            "the prelude imports `{module}`, outside the std root"
+        );
+        assert!(args.is_empty(), "a prelude import passes no arguments");
+        assert!(
+            STD_MODULES.iter().any(|(m, _)| *m == module.to_string()),
+            "the prelude imports `{module}`, which the compiler does not embed"
+        );
+    }
+}
+
+#[test]
+fn the_prelude_reaches_every_module_outside_the_std_root() {
+    let std = StdRoot {
+        modules: &[
+            ("std::a", "pub x = 1\n"),
+            ("std::b", "import std::a\npub y = a::x\n"),
+        ],
+        prelude: "import std::a use x\n",
+    };
+    let program = load_root(
+        indoc! {"
+            import lib
+            import std::b
+        "},
+        InMemory::default().with("lib", "pub z = 2\n"),
+        std,
+    );
+    assert!(messages(&program).is_empty(), "{:?}", messages(&program));
+    let file = |m: &str| program.file_of(&path(m)).unwrap();
+    let edges = |m: &str| -> Vec<String> {
+        let targets: Vec<FileId> = program.edges(file(m)).map(|(_, to)| to).collect();
+        names(&program, &targets)
+    };
+    assert_eq!(edges("main"), ["lib", "std::b", "std::a"]);
+    assert_eq!(edges("lib"), ["std::a"]);
+    assert_eq!(edges("std::b"), ["std::a"]);
+    assert_eq!(edges("std::a"), Vec::<String>::new());
+    assert!(program.reaches_prelude(file("main")) && program.reaches_prelude(file("lib")));
+    assert!(!program.reaches_prelude(file("std::a")) && !program.reaches_prelude(file("std::b")));
+    assert_eq!(
+        names(&program, program.link_order().unwrap()),
+        ["std::a", "lib", "std::b", "main"]
+    );
 }
 
 #[test]
@@ -69,7 +143,8 @@ fn imports_and_runs_load_each_module_once() {
             .with("audit::log", "x = 1\n"),
     );
     assert!(messages(&program).is_empty(), "{:?}", messages(&program));
-    assert_eq!(program.sources().files().count(), 4);
+    // The four modules, and the prelude's file.
+    assert_eq!(program.sources().files().count(), 5);
     assert_eq!(
         names(&program, program.link_order().unwrap()),
         ["audit::log", "catalog", "shop", "main"]
@@ -154,7 +229,8 @@ fn a_nested_import_names_no_module() {
         InMemory::default(),
     );
     assert!(messages(&program).is_empty(), "{:?}", messages(&program));
-    assert_eq!(program.sources().files().count(), 1);
+    // The root, and the prelude's file.
+    assert_eq!(program.sources().files().count(), 2);
 }
 
 /// A segment the parser refuses names no module, so the parse error is the
@@ -236,7 +312,8 @@ fn a_module_that_imports_the_root_is_a_cycle() {
         "import lib\n",
         InMemory::default().with("lib", "import main\n"),
     );
-    assert_eq!(program.sources().files().count(), 2);
+    // The two modules, and the prelude's file.
+    assert_eq!(program.sources().files().count(), 3);
     assert_eq!(
         messages(&program),
         ["the module graph has a cycle: `lib` imports `main`, `main` imports `lib`"]
@@ -280,7 +357,7 @@ fn a_std_path_resolves_against_the_std_root() {
         messages(&program),
         [
             "no module `std::http`: the std root has no module `http`",
-            "`std` is the std root, not a module",
+            "no module `std`: the std root has no core module",
         ]
     );
 
@@ -298,7 +375,7 @@ fn a_std_path_resolves_against_the_std_root() {
     assert!(messages(&program).is_empty(), "{:?}", messages(&program));
     let order = program.link_order().unwrap();
     assert_eq!(names(&program, order), ["std::http", "main"]);
-    assert_eq!(program.sources().path(order[0]), "<std>/http.cambra");
+    assert_eq!(program.sources().path(order[0]), "<std>/std/http.cambra");
 }
 
 /// A directory of module files, removed when dropped.
@@ -342,9 +419,9 @@ fn disk_files_resolve_under_the_root_files_directory() {
     let program = dir.read("deploy.cambra").unwrap();
     assert!(messages(&program).is_empty(), "{:?}", messages(&program));
     let order = program.link_order().unwrap();
-    assert_eq!(names(&program, order), ["shop::cart", "deploy"]);
+    assert_eq!(names(&program, order), ["std", "shop::cart", "deploy"]);
     assert_eq!(
-        program.sources().path(order[0]),
+        program.sources().path(order[1]),
         dir.0.join("shop/cart.cambra").display().to_string()
     );
 }

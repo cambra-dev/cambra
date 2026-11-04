@@ -201,7 +201,7 @@ x = (3,-1)
 
 sum_up(x)
 ",
-        "Annotation mismatch: annotated as {Int where _ >= ‹__arg_tuple_0›.0}, but inferred as Int",
+        "Annotation mismatch: annotated as {Int where _ >= ‹__arg_tuple_2›.0}, but inferred as Int",
     )
 }
 

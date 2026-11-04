@@ -31,16 +31,88 @@ use std::fmt;
 use std::path::Path;
 
 /// The std root's modules, by path and source text (`docs/chl-spec.md`, "9.16
-/// The std root"). It has none yet.
-const STD_MODULES: &[(&str, &str)] = &[];
+/// The std root"): each module under `stdlib/src/` that compiles (`stdlib/README.md`).
+const STD_MODULES: &[(&str, &str)] = &[("std", include_str!("../../../stdlib/src/std.cambra"))];
+
+/// The prelude's source: the `import` statements whose `use` items every module outside
+/// the std root reaches without writing them (`docs/chl-spec.md`, "9.16 The std root").
+const PRELUDE: &str = include_str!("../../../stdlib/prelude.cambra");
+
+/// The name diagnostics show for the prelude's file.
+const PRELUDE_PATH: &str = "<std>/prelude.cambra";
+
+/// Whether `file` is part of the std root: a std module's file, or the prelude's.
+pub fn is_std_file(sources: &SourceMap, file: FileId) -> bool {
+    sources.module(file).is_some_and(ModulePath::is_std)
+        || (sources.module(file).is_none() && sources.path(file) == PRELUDE_PATH)
+}
+
+/// A std root: its modules, by path and source text, and the prelude's source.
+#[derive(Debug, Clone, Copy)]
+struct StdRoot<'a> {
+    modules: &'a [(&'a str, &'a str)],
+    prelude: &'a str,
+}
+
+/// The compiler's std root.
+const STD: StdRoot<'static> = StdRoot {
+    modules: STD_MODULES,
+    prelude: PRELUDE,
+};
+
+thread_local! {
+    /// The prelude's `use` items, parsed once per thread: each member's module path and
+    /// name, with the name it binds.
+    static PRELUDE_NAMES: Vec<(ModulePath, SmolStr, SmolStr)> = prelude_names();
+}
+
+/// Each `use` item of [`PRELUDE`]: the module path and name of the member, and the name it
+/// binds.
+fn prelude_names() -> Vec<(ModulePath, SmolStr, SmolStr)> {
+    let parsed = parse_module(FileId::ROOT, PRELUDE);
+    assert!(
+        parsed.errors.is_empty(),
+        "the prelude parses: {:?}",
+        parsed.errors
+    );
+    let module = parsed.value.expect("the prelude lexes");
+    module
+        .body
+        .iter()
+        .filter_map(|stmt| match &stmt.node {
+            Stmt::Import { path, uses, .. } => Some((path.to_path()?, uses)),
+            _ => None,
+        })
+        .flat_map(|(path, uses)| {
+            uses.iter().map(move |item| {
+                let bound = item.alias.as_ref().unwrap_or(&item.name);
+                (path.clone(), item.name.node.clone(), bound.node.clone())
+            })
+        })
+        .collect()
+}
+
+/// The name the prelude binds the member `name` of the module `module` under, if the prelude
+/// names it (`docs/chl-spec.md`, "9.16 The std root").
+pub fn prelude_name(module: &[SmolStr], name: &str) -> Option<SmolStr> {
+    PRELUDE_NAMES.with(|names| {
+        names
+            .iter()
+            .find(|(path, member, _)| path.segments() == module && member == name)
+            .map(|(_, _, bound)| bound.clone())
+    })
+}
 
 /// Every file a program reaches from its root, parsed, with the module graph
 /// over them.
 #[derive(Debug, Clone)]
 pub struct LoadedProgram {
     sources: SourceMap,
-    /// One per file of `sources`, in the order added. The root is first.
+    /// One per module file of `sources`, in the order added. The root is first.
     modules: Vec<LoadedModule>,
+    /// The prelude's file, which is no module: its edges are every module's outside the std
+    /// root as well as its own.
+    prelude: LoadedModule,
     /// Every module, each after every module it has an edge to, or `None` when
     /// the module graph has a cycle.
     link_order: Option<Vec<FileId>>,
@@ -236,7 +308,7 @@ impl fmt::Display for LoadError {
                 }
             },
             LoadError::NoStdModule { module, .. } => match module.segments() {
-                [_] => write!(f, "`{module}` is the std root, not a module"),
+                [_] => write!(f, "no module `std`: the std root has no core module"),
                 [_, rest @ ..] => write!(
                     f,
                     "no module `{module}`: the std root has no module `{}`",
@@ -262,18 +334,23 @@ impl LoadedProgram {
     /// Load the program rooted at `root`, reading every other module's file
     /// from `files`.
     pub fn load(root: RootFile, files: &mut dyn ModuleFiles) -> Self {
-        load_with(root, files, STD_MODULES)
+        load_with(root, files, STD)
     }
 
-    /// [`Self::load`] against the std root `std`, each module's path and source
-    /// text, in place of the compiler's own. It loads the sources under the
-    /// repository's `stdlib/src/`, which the compiler does not embed (`stdlib/README.md`).
+    /// [`Self::load`] against the std modules `std`, each module's path and source
+    /// text, in place of the compiler's own, with the compiler's prelude. It loads the
+    /// sources under the repository's `stdlib/src/`, of which the compiler embeds only the
+    /// modules that compile (`stdlib/README.md`).
     #[cfg(any(test, feature = "test-helpers"))]
     pub fn load_with_std(
         root: RootFile,
         files: &mut dyn ModuleFiles,
         std: &[(&str, &str)],
     ) -> Self {
+        let std = StdRoot {
+            modules: std,
+            prelude: PRELUDE,
+        };
         load_with(root, files, std)
     }
 
@@ -344,12 +421,40 @@ impl LoadedProgram {
         self.module(file).edges.iter().map(|e| (e.kind, e.target))
     }
 
+    /// The prelude's tree: the `import` statements whose `use` items reach every module
+    /// outside the std root ([`Self::reaches_prelude`]). `None` only when the lexer rejects
+    /// it, which `prelude_parses` in this module's tests refuses.
+    pub fn prelude(&self) -> Option<&Module> {
+        self.prelude.ast.as_ref()
+    }
+
+    /// The prelude's statements, if its `use` items reach `file` ([`Self::reaches_prelude`]),
+    /// and none otherwise.
+    pub fn prelude_for(&self, file: FileId) -> &[ast::Spanned<Stmt>] {
+        match self.prelude() {
+            Some(prelude) if self.reaches_prelude(file) => &prelude.body,
+            _ => &[],
+        }
+    }
+
+    /// Whether `span` stands in the prelude's file.
+    pub fn in_prelude(&self, span: Span) -> bool {
+        span.file == self.prelude.file
+    }
+
+    /// Whether the prelude's `use` items reach `file`: every module outside the std root
+    /// (`docs/chl-spec.md`, "9.16 The std root").
+    pub fn reaches_prelude(&self, file: FileId) -> bool {
+        !self.sources.module(file).is_some_and(ModulePath::is_std)
+    }
+
     /// Every error loading found, each file's parse errors in file order, then
     /// loading's own.
     pub fn compile_errors(&self) -> Vec<CompileError> {
         let parse = self
             .modules
             .iter()
+            .chain([&self.prelude])
             .flat_map(|m| m.parse_errors.iter().cloned().map(CompileError::Parse));
         let load = self.errors.iter().cloned().map(CompileError::Load);
         parse.chain(load).collect()
@@ -363,28 +468,90 @@ impl LoadedProgram {
     }
 }
 
-/// [`LoadedProgram::load`] against the std root `std`, a list of module paths
-/// and source texts.
-fn load_with(root: RootFile, files: &mut dyn ModuleFiles, std: &[(&str, &str)]) -> LoadedProgram {
-    let mut sources = SourceMap::default();
-    // What each module path a statement names resolves to: its file, or `None`
-    // for a std path the std root has no module for. A path is resolved once, so
-    // a file is added once and a missing file is looked for once.
-    let mut resolved: BTreeMap<ModulePath, Result<FileId, Option<MissingModule>>> = BTreeMap::new();
+/// [`LoadedProgram::load`] against the std root `std`.
+fn load_with(root: RootFile, files: &mut dyn ModuleFiles, std: StdRoot<'_>) -> LoadedProgram {
+    let mut loading = Loading {
+        sources: SourceMap::default(),
+        resolved: BTreeMap::new(),
+        pending: VecDeque::new(),
+        errors: Vec::new(),
+        files,
+        std: std.modules,
+    };
     let root_file = match root.module {
         Some(module) => {
-            let file = sources.add_module(module.clone(), root.path, &root.text);
-            resolved.insert(module, Ok(file));
+            let file = loading
+                .sources
+                .add_module(module.clone(), root.path, &root.text);
+            loading.resolved.insert(module, Ok(file));
             file
         }
-        None => sources.add(root.path, &root.text),
+        None => loading.sources.add(root.path, &root.text),
     };
+    loading.pending.push_back(root_file);
+    let mut modules = loading.drain();
+    // The prelude is parsed after the files the root reaches, so their ids do not depend
+    // on it, and each module it names is loaded as an import's is.
+    let prelude_file = loading.sources.add(PRELUDE_PATH, std.prelude);
+    let prelude = loading.parse(prelude_file);
+    modules.extend(loading.drain());
+    for module in &mut modules {
+        if !loading
+            .sources
+            .module(module.file)
+            .is_some_and(ModulePath::is_std)
+        {
+            module.edges.extend(prelude.edges.iter().copied());
+        }
+    }
 
-    let mut modules = Vec::new();
-    let mut errors = Vec::new();
-    let mut pending = VecDeque::from([root_file]);
-    while let Some(file) = pending.pop_front() {
-        let parse = parse_module(file, sources.text(file));
+    let Loading {
+        sources,
+        mut errors,
+        ..
+    } = loading;
+    let cycles = graph::cycles(&modules, &sources);
+    let link_order = cycles
+        .is_empty()
+        .then(|| graph::link_order(&modules, &sources));
+    errors.extend(cycles);
+    LoadedProgram {
+        sources,
+        modules,
+        prelude,
+        link_order,
+        errors,
+    }
+}
+
+/// The state of [`load_with`]: the files added so far, and the ones still to parse.
+struct Loading<'a> {
+    sources: SourceMap,
+    /// What each module path a statement names resolves to: its file, or `None`
+    /// for a std path the std root has no module for. A path is resolved once, so
+    /// a file is added once and a missing file is looked for once.
+    resolved: BTreeMap<ModulePath, Result<FileId, Option<MissingModule>>>,
+    /// The files added and not yet parsed.
+    pending: VecDeque<FileId>,
+    errors: Vec<LoadError>,
+    files: &'a mut dyn ModuleFiles,
+    std: &'a [(&'a str, &'a str)],
+}
+
+impl Loading<'_> {
+    /// Parse every pending file, and every file one of them reaches.
+    fn drain(&mut self) -> Vec<LoadedModule> {
+        let mut modules = Vec::new();
+        while let Some(file) = self.pending.pop_front() {
+            modules.push(self.parse(file));
+        }
+        modules
+    }
+
+    /// Parse `file`, resolving each module its statements name and adding the file of each
+    /// one not yet added.
+    fn parse(&mut self, file: FileId) -> LoadedModule {
+        let parse = parse_module(file, self.sources.text(file));
         let mut edges = Vec::new();
         for (kind, written) in parse.value.iter().flat_map(statement_edges) {
             // A segment the parser refused names no module.
@@ -392,15 +559,15 @@ fn load_with(root: RootFile, files: &mut dyn ModuleFiles, std: &[(&str, &str)]) 
                 continue;
             };
             let span = written.span();
-            let target = resolved.entry(module.clone()).or_insert_with(|| {
+            let target = self.resolved.entry(module.clone()).or_insert_with(|| {
                 let found = if module.is_std() {
-                    std_file(&module, std).ok_or(None)
+                    std_file(&module, self.std).ok_or(None)
                 } else {
-                    files.fetch(&module).map_err(Some)
+                    self.files.fetch(&module).map_err(Some)
                 };
                 found.map(|ModuleFile { path, text }| {
-                    let added = sources.add_module(module.clone(), path, text);
-                    pending.push_back(added);
+                    let added = self.sources.add_module(module.clone(), path, text);
+                    self.pending.push_back(added);
                     added
                 })
             });
@@ -412,32 +579,20 @@ fn load_with(root: RootFile, files: &mut dyn ModuleFiles, std: &[(&str, &str)]) 
                 }),
                 // Every statement naming the module is reported, each at its
                 // own path.
-                Err(Some(why)) => errors.push(LoadError::Missing {
+                Err(Some(why)) => self.errors.push(LoadError::Missing {
                     span,
                     module,
                     why: why.clone(),
                 }),
-                Err(None) => errors.push(LoadError::NoStdModule { span, module }),
+                Err(None) => self.errors.push(LoadError::NoStdModule { span, module }),
             }
         }
-        modules.push(LoadedModule {
+        LoadedModule {
             file,
             ast: parse.value,
             parse_errors: parse.errors,
             edges,
-        });
-    }
-
-    let cycles = graph::cycles(&modules, &sources);
-    let link_order = cycles
-        .is_empty()
-        .then(|| graph::link_order(&modules, &sources));
-    errors.extend(cycles);
-    LoadedProgram {
-        sources,
-        modules,
-        link_order,
-        errors,
+        }
     }
 }
 
@@ -447,7 +602,7 @@ fn std_file(module: &ModulePath, std: &[(&str, &str)]) -> Option<ModuleFile> {
     std.iter()
         .find(|(path, _)| *path == spelled)
         .map(|(_, text)| ModuleFile {
-            path: format!("<std>/{}.cambra", module.segments()[1..].join("/")),
+            path: format!("<std>/{}", module.relative_file()),
             text: (*text).to_owned(),
         })
 }

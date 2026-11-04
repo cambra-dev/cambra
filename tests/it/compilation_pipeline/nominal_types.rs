@@ -2596,10 +2596,10 @@ fn a_method_delegates_to_another_types_same_named_method() {
 }
 
 // ---------------------------------------------------------------------------
-// The compiler-provided `Option`
+// `Option`, which `std` declares and the prelude imports
 // ---------------------------------------------------------------------------
 
-/// `Option(T)` is a nominal type the compiler provides, built by `Option::some` and
+/// `Option(T)` is the nominal type `std` declares, built by `Option::some` and
 /// `Option::none` and taken apart by arms naming them.
 #[test]
 fn option_is_built_and_matched_by_its_constructors() {
@@ -2636,7 +2636,7 @@ fn a_checked_lookup_answers_an_option() {
     );
 }
 
-/// `Option::is_none` is a method the compiler provides with `Option`.
+/// `Option::is_none` is a method `std` declares with `Option`.
 #[test]
 fn option_declares_is_none() {
     check_scalar(
@@ -2661,6 +2661,65 @@ fn option_declares_is_none() {
 )]
 fn is_none_as_a_condition(#[case] tail: &str, #[case] expected: Value) {
     check_scalar(&format!("m = map([(1, 10), (3, 30)])\n{tail}"), expected);
+}
+
+/// `Option`s compare by value where their payloads do, through the instance of `Equatable`
+/// that `std` declares (`docs/chl-spec.md`, "Equality and order").
+#[test]
+fn options_compare_by_value() {
+    check_scalar(
+        indoc! {r#"
+            m = map([(1, 10)])
+            (m[1] == Option::some(10), m[2] == Option::none, m[1] == m[2])
+        "#},
+        make_tuple(&[Value::Bool(true), Value::Bool(true), Value::Bool(false)]),
+    );
+}
+
+/// A module's own `Option` shadows the prelude's name, and a checked lookup still answers
+/// `std`'s (`docs/chl-spec.md`, "9.16 The std root").
+#[test]
+fn a_module_s_own_option_shadows_the_prelude_s() {
+    check_scalar(
+        indoc! {r#"
+            type Option:
+                yes
+                no
+
+            def flag(o: Option) => Int:
+                match o:
+                    case Option::yes:
+                        1
+                    case Option::no:
+                        0
+
+            m = map([(1, 10)])
+            flag(Option::yes) + (10 if m[2].is_none() else 0)
+        "#},
+        Value::Int(11),
+    );
+}
+
+/// An import of `std` binds `std` and its `use` names beside the prelude's, and both name one
+/// type.
+#[test]
+fn an_explicit_import_of_std_names_the_prelude_s_type() {
+    check_scalar(
+        indoc! {r#"
+            import std use Option as Opt
+
+            def or_zero(o: Opt(Int)) => Int:
+                match o:
+                    case std::Option::some(v):
+                        v
+                    case Option::none:
+                        0
+
+            m = map([(1, 10)])
+            or_zero(m[1]) + or_zero(Option::some(5))
+        "#},
+        Value::Int(15),
+    );
 }
 
 /// A type declaring its own `is_none` keeps it beside `Option`'s: each `.is_none()` call
@@ -2722,21 +2781,13 @@ fn option_errors_name_what_is_wrong() {
         ),
         (
             indoc! {r#"
-                type Option(T):
-                    some(T)
-
-                1
-            "#},
-            "`Option` is a built-in type and cannot be given another meaning",
-        ),
-        (
-            indoc! {r#"
                 def Option::get(T, self: Option(T), d: T) => T:
                     d
 
                 1
             "#},
-            "`Option` is a built-in type, so this module declares no associated function of it",
+            "`Option` is not a nominal type this module declares, so `Option::get` has no type \
+             to belong to",
         ),
         (
             indoc! {r#"

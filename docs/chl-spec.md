@@ -4025,9 +4025,9 @@ instance forall (T) Orderable(Two(T), Two(T)) requires Orderable(T, T), Equatabl
   Any record other than one the declaration lists has no order: one named by an alias, as in
   `type P = PersonFields`, or passed as a type argument, as in `type P = Two({b: Int, a: Int})`.
   Each is an error at the `instance`.
-- **`Option` compares by value where its argument does.** The compiler declares
-  `instance forall (T) Equatable(Option(T), Option(T)) requires Equatable(T, T)`, as it declares
-  `Option`, so `Option::some(1) == Option::none` is `False` and an `Option` is a key of a `groupby`.
+- **`Option` compares by value where its argument does.** `std` declares
+  `instance forall (T) Equatable(Option(T), Option(T)) requires Equatable(T, T)` beside `Option`
+  ([9.16 The std root](#916-the-std-root)), so `Option::some(1) == Option::none` is `False` and an `Option` is a key of a `groupby`.
   `Option` has two constructors, so it is not orderable.
 - **`max` and `min` read the same order.** `max([Person::new((age=3, name="a")), …])` is the
   greatest value in it by `age`, then `name`. Every field takes part, so no two different values
@@ -4050,14 +4050,15 @@ belongs to the whole program.
   functions and constructors, directly or through the module's bindings and functions, and an
   error names what one reads.
 - **An instance holds wherever its trait and its types can be named.** `instance` takes no `pub`,
-  and no import selects instances: a module sees every instance its imports declare, directly or
-  through other imports. A key of a `Set`, a join's equality and each summon therefore mean the same
+  and no import selects instances: a module sees every instance its imports declare, directly,
+  through other imports, or through the prelude. A key of a `Set`, a join's equality and each summon therefore mean the same
   in every module.
 - **An instance is declared in its trait's module or in the module of a nominal type its head
   names.** A module that can name the trait and the type imports the module declaring the
-  instance, directly or through other imports. The compiler's traits and `Option` belong to no
-  module, so a module declares an instance of a compiler trait only for a type it declares, and an
-  instance for `Option` only of a trait it declares.
+  instance, directly, through other imports, or through the prelude
+  ([9.16 The std root](#916-the-std-root)). The compiler's traits belong to no module, so a module
+  declares an instance of a compiler trait only for a type it declares. `Option` belongs to
+  `std`, so a module declares an instance for `Option` only of a trait it declares.
 - **Outside its trait's module, no operand of an instance's head is a type variable.**
   `instance forall (T) shapes::Area(Two(T))` may stand in `Two`'s module, and
   `instance forall (F) Scales(Vec2, F)` only in `Scales`'s. Two modules that do not import each
@@ -5638,30 +5639,49 @@ prints. An annotation is how an author fixes the contract.
 
 ### 9.16 The std root
 
-**[Planned]** — the rules of this section.
+The compiler's own modules live under a **std root**, and every std module's path begins with `std`.
+A path beginning with `std` names a module of the std root and never a file under the module root,
+so `std` is the only name the std root reserves, and adding a std module changes no user module's
+meaning. `std` alone names the **core module**, which declares what every program names: `import
+std` binds `std`, then `std::Option`. A root file named `std.cambra` is refused. The std root's
+modules are CHL source the compiler embeds (`stdlib/src/`). A diagnostic in one names its file under
+`<std>`: `<std>/std.cambra` for `std`, and `<std>/std/time.cambra` for `std::time`.
 
-The compiler's own modules live under a **std root**, and every std module's path begins with `std`:
+| Module | Holds |
+| -- | -- |
+| `std` | `Option`, its method `is_none`, and its instance of `Equatable` |
+
+**The prelude** is a list of `import` statements of std modules (`stdlib/prelude.cambra`). Every
+module outside the std root reaches each of their `use` items by its name, without an import, and
+binds none of their import names: `Option` names `std`'s `Option` in every module, and `std`
+names nothing until a module imports it.
+
+- **A module's own name shadows a prelude name.** A member, a parameter, an import name, a run name
+  or a `use` name spelled like a prelude name is the module's, in place of the prelude's, so adding
+  a prelude name changes no module that already binds it.
+- **A std module reaches no prelude.** It imports each std module whose members it names.
+- **The prelude holds `Option`.**
+
+`Option` is a `type` that `std` declares
+([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). The operations
+that answer an `Option`, the lookup `c[k]` and the unwrap `e!`
+([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)), answer that declaration
+in every module, a module that declares its own `Option` included.
+
+**[Planned]** — the std modules `std::http` and `std::time`, and the builtins they provide:
 `import std::http` binds `http`, then `http::serve(…)` and `http::ok(…)` ([7.3
 Sources](#73-sources)), and `import std::time` binds `time`, then `time::now()` and
-`time::alarms()` ([7.5 Time [Decided]](#75-time-decided)). A path beginning with `std` names a
-module of the std root and never a file under the module root, so `std` is the only name the std
-root reserves, and adding a std module changes no user module's meaning. `std` alone names no
-module, and a root file named `std.cambra` is refused.
+`time::alarms()` ([7.5 Time [Decided]](#75-time-decided)). A builtin source, sink, or special form a
+std module provides is recognized by what a name resolves to, not by how it is spelled. After
+`import std::http as web`, `reqs, resps = web::serve(…)` is the same form as `http::serve(…)`, and
+the bare name `http_serve` is gone. Its address arguments are constants
+([9.19 Constants](#919-constants)), so a module that serves a route takes its address as a
+`const param` and each run serves its own.
 
-A builtin source, sink, or special form a std module provides is recognized by what a name resolves
-to, not by how it is spelled. After `import std::http as web`, `reqs, resps = web::serve(…)` is the
-same form as `http::serve(…)`, and the bare name `http_serve` is gone. Its address arguments are
-constants ([9.19 Constants](#919-constants)), so a module that serves a route takes its address as
-a `const param` and each run serves its own.
+**[Planned]** — the builtins in the prelude: `sum`, `max`, `groupby`, `stdin`, `box`, `begin`, and
+the rest stay unqualified in every module as prelude names of std modules.
 
-The prelude (`sum`, `max`, `groupby`, `stdin`, `box`, `begin`, …) stays unqualified and in
-scope in every module.
-
-**[Decided]** — `Option` is a `type` declared in a std module, and is in the prelude
-([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). Builtin
-operations that answer an `Option`, the lookup `c[k]` and the unwrap `e!`
-([3.9 Subscript and attribute access](#39-subscript-and-attribute-access)), refer to that
-declaration. `Set`, `Map` and `FullMap` stay compiler builtins, as nominal types with no
+**[Decided]** — `Set`, `Map` and `FullMap` stay compiler builtins, as nominal types with no
 constructors
 ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)).
 

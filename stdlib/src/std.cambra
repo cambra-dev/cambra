@@ -1,0 +1,45 @@
+# The core of the language that CHL can state: the types, traits and functions every program
+# names, each declared here rather than in the compiler.
+#
+# `std` declares no state and opens no source, so a module imports it
+# (docs/chl-spec.md, "9.7 Importing asserts no IO and no state"). The prelude imports its members
+# into every module outside the std root (docs/chl-spec.md, "9.16 The std root"), so a program
+# names them bare, `Option`, and qualified after `import std`, `std::Option`.
+#
+# Example, a price that falls back to zero for an unknown item:
+#
+#     prices: Map(String, Int) = map(["tea" -> 3])
+#
+#     def price(item: String) => Int:
+#         match prices[item]:
+#             case Option::some(p):
+#                 p
+#             case Option::none:
+#                 0
+#
+# Status: the std root and the prelude are implemented (docs/chl-spec.md, "9.16 The std root").
+
+# --- Option -------------------------------------------------------------------------------------
+
+# A value that is present, `some(v)`, or absent, `none`.
+#
+# The checked lookup `c[k]` answers an `Option` of this declaration, and the unwrap `e!` takes one
+# apart (docs/chl-spec.md, "Subscript and unwrap syntax [Decided]"). A module that declares its
+# own `Option` shadows the prelude's name, and its lookups still answer this one.
+#
+# Two options are equal when both are `none`, or both are `some` of equal values. An `Option` is
+# not orderable, since its two constructors have no order.
+pub type Option(T):
+    none
+    some(T)
+
+instance forall (T) Equatable(Option(T), Option(T)) requires Equatable(T, T)
+
+impl Option(T):
+    # Returns whether `self` is `none`.
+    pub def is_none(self) => Bool:
+        match self:
+            case Option::some(_):
+                False
+            case Option::none:
+                True

@@ -83,9 +83,15 @@ each file's parse, the module graph, and the link order. Every compile entry poi
 - **Edges.** The module graph's edges are the top-level `import` and `run` statements, bare or under
   `pub`. Lowering refuses a nested one, and it names no module.
 - **Resolution.** Each module path is resolved once. A path beginning with `std` resolves against
-  the std root, which has no modules until the std root item of the
-  [Implementation stack](#implementation-stack). Any other path resolves through a `ModuleFiles`:
-  `DiskFiles` reads under the root file's directory, and `InMemory` holds text keyed by module path.
+  the std root, the sources under `stdlib/src/` the compiler embeds (`STD_MODULES`). Any other path
+  resolves through a `ModuleFiles`: `DiskFiles` reads under the root file's directory, and
+  `InMemory` holds text keyed by module path.
+- **The prelude.** Loading parses the prelude (`stdlib/prelude.cambra`) as a file of its own after
+  the files the root reaches, so their `FileId`s do not depend on it. Its `import` statements are
+  edges of every module outside the std root, beside the module's own
+  (`LoadedProgram::reaches_prelude`), and the prelude is no module: nothing links or lowers it.
+  Lowering reads its statements as imports of each module it reaches
+  ([The prelude's imports](#the-preludes-imports)).
 - **Disk.** `DiskFiles` matches the root file's name and each component of `a/b/c.cambra` against
   its directory's entries, so a file whose name differs only in case is not the root or the module
   on any file system. A file it already read for another module path, compared by canonical path, is
@@ -545,10 +551,29 @@ Freshening
 `import n use T` for a type alias declares `T` in `m`'s `type_aliases` with `n`'s type spelled
 through `n`, in scope throughout `m` (`LoweringContext::begin_module`).
 
+### The prelude's imports
+
+The prelude's `import` statements are imports of every module outside the std root
+([chl-spec.md, "9.16 The std root"](chl-spec.md#916-the-std-root)). `LoadedProgram::prelude_for`
+answers them for each module the prelude reaches, and `import_keys`, `interfaces` and
+`module_scope` read them ahead of the module's own statements, so a prelude import reaches its
+shared import as any import does.
+
+- **No import name.** A prelude import binds its module under `<prelude>::std`
+  (`prelude_qualifier`). A qualifier is one identifier, so no module spells that name, and the
+  module's own names, an `import std` included, may take the module's.
+- **Shadowed `use` names.** `module_scope` adds a prelude `use` item after the module's own, and
+  only where the module binds no member, parameter, import name, run name or `use` name of its
+  spelling. A member spelled like a prelude name is therefore no error, as one spelled like a `use`
+  name is.
+- **Unread members link nothing.** Linking drops each binding of a std module's shared import that
+  the program does not read (`drop_unread_std_imports`), so a program that names no member of a
+  prelude module lowers to the tree it would have without the prelude.
+
 ### Intrinsics resolve by identity
 
 The std root ([chl-spec.md, "9.16 The std root"](chl-spec.md#916-the-std-root)) is CHL source
-embedded in the binary. A std file has a `FileId` and a path like any other, `<std>/http.cambra` for
+embedded in the binary. A std file has a `FileId` and a path like any other, `<std>/std/http.cambra` for
 `std::http`, so an error inside it renders against its source. The `http` status helpers are
 ordinary CHL functions there.
 
@@ -810,7 +835,9 @@ node of a member also names its run.
 
 This moves every golden wire fixture. The re-bless procedure is in
 [web/CLAUDE.md](../web/CLAUDE.md). Until then, a program of several modules gets the degraded
-payload, with a diagnostic saying the inspector shows one file.
+payload, with a diagnostic saying the inspector shows one file. The std root's files do not count:
+a program of one module and the std modules it reaches gets the full payload, and a node's spans in
+a std module's file do not ship.
 
 ---
 
@@ -927,8 +954,8 @@ The work that remains, one PR per item, each updating the spec and design docs i
    wrote, which needs a named wrapper type that every comparison looks through, and a diagnostic
    eliding the qualifier on its own module's members, which needs a diagnostic's text formatted once
    the error has a location ([Names carry their home](#names-carry-their-home)).
-5. **The std root.** `std::http` as a std module, intrinsics recognized by identity, `http_serve`
-   removed.
+5. **The std root's builtins.** `std::http` as a std module, intrinsics recognized by identity,
+   `http_serve` removed.
 6. **Hot reload.** Bundles on the control port, the run-tree diff, `@RenamedFrom` on runs,
    qualified `@LoadFrom` loads, `@Discard`.
 7. **No trailing expressions**, once an output sink exists. The compiler's own test harness keeps

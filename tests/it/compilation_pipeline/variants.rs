@@ -353,7 +353,7 @@ fn test_match_as_an_assigned_value(#[case] code: &str, #[case] expected: Value) 
     check_scalar(code, expected);
 }
 
-/// `Option(T)` is the compiler-provided nominal type, built by `Option::some` and
+/// `Option(T)` is the nominal type `std` declares, built by `Option::some` and
 /// `Option::none` and taken apart by `match` arms naming them.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
