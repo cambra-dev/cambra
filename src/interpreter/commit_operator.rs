@@ -2589,6 +2589,12 @@ impl TileProducer for CommitProducer {
         if self.breaker.consuming {
             return self.offer_impl(projection_guard);
         }
+        // A store placed in a pipeline steps at its pipeline's consumes, and its writers decide
+        // only against a tile it published, so a pull before the first consume answers the
+        // unopened store, which states nothing final.
+        if self.base.is_placed() {
+            return CommitEngine::unopened().render_full_store_tile(self.tiling());
+        }
         let store = self.drain();
         self.notifier.notify_if_changed(store)
     }
@@ -3932,6 +3938,15 @@ impl TileProducer for InductionStoreProducer {
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         if self.breaker.consuming {
             return self.offer_impl(projection_guard);
+        }
+        // A store placed in a pipeline steps at its pipeline's consumes, so a pull before the
+        // first answers the unopened store, which states nothing final.
+        if self.base.is_placed() {
+            return render_engines(
+                &Engines::unopened(self.tiling()),
+                self.tiling(),
+                &self.complete_rows,
+            );
         }
         let store = self.step();
         self.notifier.notify_if_changed(store)

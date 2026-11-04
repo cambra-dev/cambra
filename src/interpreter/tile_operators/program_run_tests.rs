@@ -154,6 +154,97 @@ fn answers_as_pull_mode_does(source: &str, kinds: &[&str]) {
     }
 }
 
+/// A per-row sum whose rows carry a constant reads it through a `MapResultToConst` beneath the
+/// `MapAggregate`, in the `MapAggregate`'s own chain: a zip with a constant arm, or a constant
+/// element under a filter on the row.
+#[rstest_log::rstest]
+#[case::zipped_with_a_constant(indoc! {"
+    out = test_sink()
+    ys = [1, 2, 3, 4, 5]
+    k = 10
+    out << [sum([y * x + k for y in ys]) for x in [1, 2]]
+"})]
+#[case::a_constant_under_a_filter(indoc! {"
+    out = test_sink()
+    ys = [1, 2, 3, 4, 5]
+    out << [sum([10 for y in ys if y > x]) for x in [1, 2]]
+"})]
+fn a_sum_over_rows_carrying_a_constant(#[case] source: &str) {
+    assert!(
+        kinds_beneath(&operator_graph(source, false), "MapAggregate")
+            .is_some_and(|kinds| kinds.contains(&"MapResultToConst")),
+        "{source}: the `MapAggregate` reads a `MapResultToConst` in its own chain"
+    );
+    answers_as_pull_mode_does(source, &["MapAggregate"]);
+}
+
+/// A sum of the constant alone does not depend on the row: it is one `Aggregate`, and a
+/// `MapResultToConst` gives its value to every row, with no `MapAggregate`.
+#[test]
+fn a_sum_of_a_constant_over_rows_is_one_aggregate() {
+    let source = indoc! {"
+        out = test_sink()
+        ys = [1, 2, 3, 4, 5]
+        out << [sum([10 for y in ys]) for x in [1, 2]]
+    "};
+    assert_eq!(
+        kinds_beneath(&operator_graph(source, false), "MapAggregate"),
+        None,
+        "{source} compiles no `MapAggregate`"
+    );
+    answers_as_pull_mode_does(source, &["Aggregate"]);
+}
+
+/// The operator graph `source` compiles to, with `source1` registered where `live`.
+fn operator_graph(source: &str, live: bool) -> crate::interpreter::operator_graph::OperatorGraph {
+    let mut ctx = GlobalContext::default();
+    if live {
+        ctx.register_source(std::rc::Rc::new(std::cell::RefCell::new(
+            crate::interpreter::TestDataSource::new(
+                "source1",
+                crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+                crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+            ),
+        )));
+    }
+    let _sink = ctx.register_test_sink("out");
+    let loaded = LoadedProgram::test(source);
+    compile_program(&mut ctx, &loaded, Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"))
+        .operator_graph
+}
+
+/// The kinds of the operators beneath the first operator of `kind` in `graph`, down to the first
+/// `Memo` or `FanOutSlot` on each path: the operators its own chain evaluates. `None` where no
+/// operator is of `kind`.
+fn kinds_beneath(
+    graph: &crate::interpreter::operator_graph::OperatorGraph,
+    kind: &str,
+) -> Option<Vec<&'static str>> {
+    use crate::interpreter::operator_graph::GraphNode;
+    let operators: std::collections::HashMap<_, _> = graph
+        .nodes()
+        .iter()
+        .filter_map(|node| match node {
+            GraphNode::Operator {
+                id, kind, inputs, ..
+            } => Some((*id, (*kind, inputs))),
+            GraphNode::Sink { .. } => None,
+        })
+        .collect();
+    let (_, (_, inputs)) = operators.iter().find(|(_, (k, _))| *k == kind)?;
+    let mut kinds = Vec::new();
+    let mut stack: Vec<_> = inputs.iter().map(|edge| edge.subscribed).collect();
+    while let Some(id) = stack.pop() {
+        let (kind, inputs) = operators[&id];
+        kinds.push(kind);
+        if !matches!(kind, "Memo" | "FanOutSlot") {
+            stack.extend(inputs.iter().map(|edge| edge.subscribed));
+        }
+    }
+    Some(kinds)
+}
+
 #[test]
 fn a_sum_over_a_let_bound_list() {
     answers_as_pull_mode_does(
@@ -301,8 +392,8 @@ fn two_aggregates_of_one_binding() {
 }
 
 /// A group-by's memo reads its input's memo and the `Converse` keying the groups, which reads
-/// that memo too: the group-by's memo reads two pipelines. It reads the `Converse`'s pushes and
-/// waits for the input's memo to finish, taking no push of it.
+/// that memo too: the group-by's memo reads two pipelines. It reads the `Converse`'s pushes, and
+/// the input memo's push reaches it widened, so it keeps open rows and reads them again there.
 #[test]
 fn a_group_by() {
     let source = indoc! {"
@@ -316,8 +407,8 @@ fn a_group_by() {
     assert!(
         planned
             .iter()
-            .any(|plan| plan.name.starts_with("Memo") && !plan.whole && !plan.builds.is_empty()),
-        "the group-by's memo has a build edge: {planned:?}"
+            .any(|plan| plan.name.starts_with("Memo") && !plan.whole && plan.open),
+        "the group-by's memo keeps open rows: {planned:?}"
     );
 }
 
@@ -336,7 +427,7 @@ fn a_sum_over_two_concatenated_comprehensions() {
     assert!(
         planned.iter().any(|plan| plan.name.starts_with("Aggregate")
             && !plan.whole
-            && plan.builds.is_empty()
+            && !plan.open
             && !plan.started),
         "the sum reads both arms' pushes: {planned:?}"
     );
@@ -344,9 +435,10 @@ fn a_sum_over_two_concatenated_comprehensions() {
 
 /// A sum read inside another comprehension: the outer sum's pipeline reads the inner sum's and the
 /// list's. The inner sum's push names every key of the outer sum's input, which the list's pushes
-/// name too, so the outer sum reads its input whole once both have finished.
-#[test]
-fn a_comprehension_reading_a_sum() {
+/// name too, so the outer sum keeps open rows: a row consumed at the list's push before the inner
+/// sum is final is read again at the inner sum's push.
+#[rstest_log::rstest]
+fn a_comprehension_reading_a_sum(#[values(1, usize::MAX)] rows: usize) {
     answers_as_pull_mode_does(
         indoc! {"
             out = test_sink()
@@ -365,11 +457,11 @@ fn a_comprehension_reading_a_sum() {
             xs = [1, 2, 3]
             out << sum([x * n for x in xs])
         "},
-        1,
+        rows,
     );
     assert!(
-        planned.iter().any(|plan| plan.whole),
-        "a pipeline reads its input whole: {planned:?}"
+        planned.iter().any(|plan| plan.open) && !planned.iter().any(|plan| plan.whole),
+        "the outer sum keeps open rows, and no pipeline reads its input whole: {planned:?}"
     );
 }
 
@@ -384,7 +476,7 @@ fn a_sink_reads_the_pushes_of_a_values_output_memo() {
     answers_as_pull_mode_does(source, &["Memo", "SinkBreaker"]);
     let (_, planned) = dispatched(source, 1);
     let sink = sink_of(&planned);
-    assert!(!sink.whole && sink.builds.is_empty(), "{sink:?}");
+    assert!(!sink.whole && !sink.open, "{sink:?}");
 }
 
 /// The sink of a collection reads the pushes of the collection's output memo.
@@ -398,7 +490,7 @@ fn a_sink_of_a_collection() {
     answers_as_pull_mode_does(source, &["Memo", "SinkBreaker"]);
     let (_, planned) = dispatched(source, 1);
     let sink = sink_of(&planned);
-    assert!(!sink.whole && sink.builds.is_empty(), "{sink:?}");
+    assert!(!sink.whole && !sink.open, "{sink:?}");
 }
 
 /// Two sinks each run as a pipeline of their own, and the program is done once both are.
@@ -1693,9 +1785,95 @@ fn a_sum_over_a_live_source(#[values(1, 2, usize::MAX)] rows: usize) {
     );
 }
 
+/// The entries of `value`, a collection keyed by `UInt`s, each value rendered, in key order.
+fn entries_by_key(value: &Value) -> Vec<(u64, String)> {
+    let mut entries: Vec<(u64, String)> = value
+        .as_function()
+        .iter()
+        .map(|binding| match &binding.input {
+            Value::UInt(key) => (*key, binding.output.to_string()),
+            other => panic!("a collection keyed by a `UInt`: {other:?}"),
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
+/// A lookup into a map built over a live source. The map groups the source's keys by value
+/// through a `Converse`, whose groups stay open until the source is complete, and its push of a
+/// region beneath the values reaches the per-group `sole` through `MapResultWithSource`, which
+/// restates every level.
+#[rstest_log::rstest]
+#[case::one_key(indoc! {"
+    out = test_sink()
+    m = map([(x, x) for x in source1()])
+    out << m[1]
+"}, &[])]
+#[case::a_key_per_row(indoc! {"
+    out = test_sink()
+    m = map([(x, x * 10) for x in source1()])
+    out << [m[x] for x in source1()]
+"}, &[(0, "`some(10)"), (1, "`some(20)"), (2, "`some(30)"), (3, "`some(40)"), (4, "`some(50)")])]
+fn a_lookup_into_a_map_over_a_live_source(
+    #[case] source: &str,
+    #[case] per_key: &[(u64, &str)],
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let (value, _) = dispatched_live(source, rows, two_batches());
+    match per_key {
+        [] => assert_eq!(value.to_string(), "`some(1)", "{source}"),
+        per_key => assert_eq!(
+            entries_by_key(&value),
+            per_key
+                .iter()
+                .map(|(key, value)| (*key, value.to_string()))
+                .collect::<Vec<_>>(),
+            "{source}"
+        ),
+    }
+}
+
+/// A collection per row of a live source, at the `main` output, over two deliveries: each row's
+/// value reads a static collection.
+#[rstest_log::rstest]
+#[case::pairs_per_row(
+    "[(x, [y * x for y in [1, 2]]) for x in source1()]",
+    &[
+        (0, "{1, Function [ 1, 2 ]}"),
+        (1, "{2, Function [ 2, 4 ]}"),
+        (2, "{3, Function [ 3, 6 ]}"),
+        (3, "{4, Function [ 4, 8 ]}"),
+        (4, "{5, Function [ 5, 10 ]}")
+    ]
+)]
+#[case::sum_per_row(
+    "[x + sum([y * x for y in [1, 2]]) for x in source1()]",
+    &[(0, "4"), (1, "8"), (2, "12"), (3, "16"), (4, "20")]
+)]
+#[case::filter_on_a_sum(
+    "[x for x in source1() if sum([y for y in [1, 2] if y == x]) > 0]",
+    &[(0, "1"), (1, "2")]
+)]
+fn a_static_collection_per_row_of_a_live_source_at_main(
+    #[case] source: &str,
+    #[case] expected: &[(u64, &str)],
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let live = dispatched_live_main(source, rows, two_batches());
+    assert_eq!(
+        entries_by_key(&live.value),
+        expected
+            .iter()
+            .map(|(key, value)| (*key, value.to_string()))
+            .collect::<Vec<_>>(),
+        "{source}"
+    );
+}
+
 /// A let-bound map over a live source is a `Memo` keyed by the source's keys, which the run
-/// notifies of each delivery. The sink reads the `Memo` through its feed, which is keyed by the
-/// sink's one row, so it takes the `Memo`'s pushes as a build edge.
+/// notifies of each delivery. The sink reads the map through its feed's `Memo`, which is keyed by
+/// the sink's one row: that `Memo` keeps the row open and reads the row again at each of the map's
+/// pushes.
 #[rstest_log::rstest]
 fn a_let_bound_map_over_a_live_source(#[values(1, usize::MAX)] rows: usize) {
     let (value, planned) = dispatched_live(
@@ -1728,6 +1906,12 @@ fn a_let_bound_map_over_a_live_source(#[values(1, usize::MAX)] rows: usize) {
             .iter()
             .any(|plan| plan.live && plan.name.starts_with("Memo")),
         "the map's `Memo` is the live source pipeline: {planned:?}"
+    );
+    assert!(
+        planned
+            .iter()
+            .any(|plan| !plan.live && !plan.whole && plan.open && plan.name.starts_with("Memo")),
+        "the feed's `Memo` keeps open rows: {planned:?}"
     );
 }
 
@@ -1887,18 +2071,557 @@ fn a_reader_of_a_live_pipeline_through_a_build_edge(
     assert_eq!(value, expected);
 }
 
-/// A breaker whose chain reads a live source and a pipeline takes the pipeline's pushes, and no
-/// package a source's delivery names.
-#[test]
-#[should_panic(expected = "reads a pipeline and a live source")]
-fn a_reader_of_pushes_over_a_live_source_is_refused() {
-    dispatched_live(
+/// A breaker whose chain reads a live source and a pipeline takes the source's arrivals and keeps
+/// open rows (`Dispatcher::take_arrivals`): each row adds the sum of `ys`, and a row consumed
+/// before the sum is final is read again at its push.
+#[rstest_log::rstest]
+fn a_reader_of_a_live_source_and_a_pipeline(#[values(1, usize::MAX)] rows: usize) {
+    let (value, planned) = dispatched_live(
         indoc! {"
             out = test_sink()
             ys = [1, 2]
             out << sum([x + sum(ys) for x in source1()])
         "},
-        1,
+        rows,
         two_batches(),
+    );
+    assert_eq!(value, Value::Int(30));
+    assert!(
+        planned.iter().any(|plan| plan.live && plan.open),
+        "the pipeline over the source keeps open rows: {planned:?}"
+    );
+}
+
+/// What a dispatched run hands a `main` output: it keeps each answer as a test sink does, counts
+/// the outermost keys the answers have held, and lists the answers pull mode would print.
+#[derive(Default)]
+struct MainAnswers {
+    kept: crate::interpreter::TestSink,
+    keys: std::sync::atomic::AtomicUsize,
+    printed: std::sync::Mutex<Vec<crate::interpreter::Tile>>,
+}
+
+/// Whether the driver prints `tile`, as `pull_main` and the dispatched run's printer decide: it
+/// holds a key or a value, or it is terminal.
+fn is_printed(tile: &crate::interpreter::Tile) -> bool {
+    !tile.is_empty() || tile.is_terminal()
+}
+
+impl crate::interpreter::DataSink for MainAnswers {
+    fn process(&self, tile: &crate::interpreter::Tile) {
+        if let crate::interpreter::Tile::DataFunction {
+            domain, deleted, ..
+        } = tile
+        {
+            self.keys.fetch_add(
+                domain.len() - deleted.len(),
+                std::sync::atomic::Ordering::SeqCst,
+            );
+        }
+        if is_printed(tile) {
+            self.printed
+                .lock()
+                .expect("no answer panics")
+                .push(tile.clone());
+        }
+        self.kept.process(tile);
+    }
+}
+
+/// What [`dispatched_live_main`] observed of a run.
+struct LiveMain {
+    /// The `main` output's value.
+    value: Value,
+    /// What the run planned.
+    planned: Vec<Planned>,
+    /// The outermost keys the `main` output had been handed each time the run had nothing to do,
+    /// before the next delivery.
+    handed: Vec<usize>,
+    /// The answers the driver prints ([`is_printed`]), in the order they were handed.
+    printed: Vec<crate::interpreter::Tile>,
+}
+
+/// `source`, whose `main` output reads the live source `source1`, compiled and run through the
+/// dispatcher at morsels of `rows`, the source fed `batches` as [`dispatched_live`] feeds them.
+fn dispatched_live_main(source: &str, rows: usize, batches: Vec<Batch>) -> LiveMain {
+    let mut ctx = GlobalContext::default();
+    ctx.defer_sink_pulls();
+    let feed = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::interpreter::TestDataSource::new(
+            "source1",
+            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+        ),
+    ));
+    ctx.register_source(feed.clone());
+    let loaded = LoadedProgram::test(source);
+    let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    let _operators = ctx.take_operator_map();
+    let mut batches = batches.into_iter();
+    let deliver = |batch: Option<Batch>| {
+        let Some((entries, complete)) = batch else {
+            panic!("{source}: the run waits after the last batch")
+        };
+        let mut feed = feed.borrow_mut();
+        feed.add_data(&entries);
+        feed.set_yield_predicate(complete);
+    };
+    deliver(batches.next());
+    let main = std::sync::Arc::new(MainAnswers::default());
+    let mut handed = Vec::new();
+    let planned = crate::interpreter::dispatcher::run_program_into(
+        &mut program,
+        rows,
+        main.clone(),
+        &mut || {
+            handed.push(main.keys.load(std::sync::atomic::Ordering::SeqCst));
+            deliver(batches.next())
+        },
+    )
+    .unwrap_or_else(|refused| panic!("{refused}"));
+    let producer = program
+        .outputs
+        .iter()
+        .find(|output| output.is_main())
+        .and_then(|output| output.producer.as_ref())
+        .unwrap_or_else(|| panic!("{source}: the run hands the `main` output's producer back"));
+    assert!(
+        producer.obsolete_guard().is_universal(),
+        "{source}: the run releases the `main` output's producer whole: {planned:?}"
+    );
+    let value = main
+        .kept
+        .value()
+        .unwrap_or_else(|error| panic!("{source}: the `main` output: {error:?}"));
+    let printed = std::mem::take(&mut *main.printed.lock().expect("no answer panics"));
+    LiveMain {
+        value,
+        planned,
+        handed,
+        printed,
+    }
+}
+
+/// `source`, whose `main` output reads the live source `source1`, compiled and run in pull mode,
+/// the source fed `batches` one at a time, the `main` output pulled at the universal guard and
+/// released at its answer once the scheduler has run out of work after each: the answers the
+/// driver prints ([`is_printed`]).
+fn pulled_live_main(source: &str, batches: Vec<Batch>) -> Vec<crate::interpreter::Tile> {
+    let mut ctx = GlobalContext::default();
+    let feed = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::interpreter::TestDataSource::new(
+            "source1",
+            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+        ),
+    ));
+    ctx.register_source(feed.clone());
+    let mut program = compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    let mut producer = program
+        .outputs
+        .iter_mut()
+        .find(|output| output.is_main())
+        .and_then(|output| output.producer.take())
+        .unwrap_or_else(|| panic!("{source} has a `main` output"));
+    let mut printed = Vec::new();
+    for (entries, complete) in batches {
+        feed.borrow_mut().add_data(&entries);
+        feed.borrow_mut().set_yield_predicate(complete);
+        for _ in 0..1000 {
+            ctx.scheduler().check_for_notifications();
+        }
+        let tile = producer.get(producer.tiling().universal_guard());
+        producer.release(tile.to_guard());
+        if is_printed(&tile) {
+            printed.push(tile);
+        }
+    }
+    assert!(
+        printed
+            .last()
+            .is_some_and(crate::interpreter::Tile::is_terminal),
+        "{source}: pull mode's last pull answers a terminal tile"
+    );
+    printed
+}
+
+/// [`one_key_batches`] with a last delivery that adds no key and calls the source complete.
+fn one_key_batches_then_empty(batches: u64) -> Vec<Batch> {
+    let mut all = one_key_batches(batches);
+    all[batches as usize - 1].1 =
+        crate::interpreter::Predicate::at_or_below(Value::UInt(batches - 1));
+    all.push((Vec::new(), crate::interpreter::Predicate::True));
+    all
+}
+
+/// The `main` output is handed, one delivery at a time, the answers pull mode prints after each:
+/// a key the filter drops and a delivery of no key hand an answer the driver does not print, a
+/// sum is printed once its source is complete, and the last answer is terminal. A row that reads a
+/// sum is answered once the sum is final: a sum over a literal before the first delivery's rows,
+/// and a sum over the live source at the last delivery, whose epoch reads the earlier rows again
+/// after its own, so that case compares the answers in key order.
+#[rstest_log::rstest]
+#[case::a_map("[x * 10 for x in source1()]", false)]
+#[case::a_filter_dropping_a_key("[x for x in source1() if x != 2]", false)]
+#[case::a_sum("sum(source1())", false)]
+#[case::a_filter_reading_a_sum("[x for x in source1() if sum([1, 2, 3]) > 5]", false)]
+#[case::a_map_reading_a_sum("[x + sum([1, 2]) for x in source1()]", false)]
+#[case::a_filter_reading_a_live_sum("[x for x in source1() if sum(source1()) > 2]", true)]
+fn the_main_output_prints_what_pull_mode_prints_per_delivery(
+    #[case] source: &str,
+    #[case] reads_again: bool,
+    #[values(one_key_batches(3), one_key_batches_then_empty(3))] batches: Vec<Batch>,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    // An epoch that reads rows again merges them after its own, so where a case does, the answers
+    // are compared in key order.
+    let in_key_order = |answers: Vec<crate::interpreter::Tile>| -> Vec<_> {
+        match reads_again {
+            true => answers
+                .into_iter()
+                .map(crate::interpreter::sort_function_by_domain)
+                .collect(),
+            false => answers,
+        }
+    };
+    let pulled = pulled_live_main(source, batches.clone());
+    let dispatched = dispatched_live_main(source, rows, batches);
+    assert_eq!(in_key_order(dispatched.printed), in_key_order(pulled));
+}
+
+/// A map or a filter over a live source at the `main` output takes each delivery's keys as they
+/// arrive: the run places the entry before the `main` output's consumer in the output's pipeline,
+/// so a push of a delivery's keys reaches it restated, and the output is handed the first
+/// delivery's keys before the second arrives.
+#[rstest_log::rstest]
+#[case::a_map(
+    "[x * 10 for x in source1()]",
+    (0..5).map(|key| (key, 10 * (key as i64 + 1))).collect(),
+    3
+)]
+#[case::a_filter(
+    "[x for x in source1() if x > 2]",
+    (2..5).map(|key| (key, key as i64 + 1)).collect(),
+    1
+)]
+fn a_map_over_a_live_source_at_main(
+    #[case] source: &str,
+    #[case] expected: Vec<(u64, i64)>,
+    #[case] first: usize,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let LiveMain {
+        value,
+        planned,
+        handed,
+        ..
+    } = dispatched_live_main(source, rows, two_batches());
+    assert_eq!(keyed_ints(&value), expected);
+    assert_eq!(
+        handed,
+        [first],
+        "the first delivery's keys reach the `main` output before the second delivery"
+    );
+    assert!(
+        planned
+            .iter()
+            .any(|plan| plan.live && !plan.whole && plan.name.starts_with("SinkBreaker")),
+        "the `main` output's pipeline is notified of each delivery: {planned:?}"
+    );
+}
+
+/// A filter over a live source that reads a sum takes the source's arrivals and keeps open rows
+/// (`Dispatcher::take_arrivals`). A sum over a literal is final in the first epoch, so the first
+/// delivery's rows are answered in it, read again at the sum's push where they arrived before. A
+/// sum over the live source is final only at the last delivery, so the first delivery's rows stay
+/// open until then and are read again at its push.
+#[rstest_log::rstest]
+#[case::a_sum_over_a_literal("[x for x in source1() if sum([1, 2, 3]) > 5]", 3)]
+#[case::a_sum_over_the_source("[x for x in source1() if sum(source1()) > 2]", 0)]
+fn a_filter_over_a_live_source_reading_a_sum(
+    #[case] source: &str,
+    #[case] first: usize,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let LiveMain {
+        value,
+        planned,
+        handed,
+        ..
+    } = dispatched_live_main(source, rows, two_batches());
+    assert_eq!(
+        keyed_ints(&value),
+        (0..5).map(|key| (key, key as i64 + 1)).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        handed,
+        [first],
+        "the `main` output is handed the first delivery's rows once the sum is final"
+    );
+    assert!(
+        planned.iter().any(|plan| plan.live
+            && !plan.whole
+            && plan.open
+            && plan.name.starts_with("SinkBreaker")),
+        "the `main` output's pipeline takes arrivals and keeps open rows: {planned:?}"
+    );
+}
+
+/// The readers of a pipeline with a live source beneath it read no input whole: the inner
+/// comprehension's memo, the per-row sum and the outer comprehension's memo each keep open rows,
+/// and a push reads again the rows it names (`src/interpreter/design-operators.md`, "Reading rows
+/// again").
+#[rstest_log::rstest]
+fn readers_over_a_live_pipeline_keep_open_rows(#[values(1, usize::MAX)] rows: usize) {
+    let source = indoc! {"
+        out = test_sink()
+        ys = [y for y in source1()]
+        out << [sum([y * x for y in ys]) for x in [1, 2]]
+    "};
+    let (value, planned) = dispatched_live(source, rows, two_batches());
+    assert_eq!(keyed_ints(&value), vec![(0, 15), (1, 30)]);
+    assert!(
+        !planned.iter().any(|plan| plan.whole),
+        "no pipeline reads its input whole: {planned:?}"
+    );
+    assert!(
+        planned
+            .iter()
+            .any(|plan| plan.open && plan.name.starts_with("MapAggregate")),
+        "the per-row sum keeps open rows: {planned:?}"
+    );
+    assert_eq!(
+        planned.iter().filter(|plan| plan.open).count(),
+        3,
+        "the two memos and the sum keep open rows: {planned:?}"
+    );
+}
+
+/// The sums of `a_sum_over_rows_carrying_a_constant` over a live list. The sum's pipeline keeps
+/// open rows and reads each row again at its outermost key, above the level the constant applies
+/// at, where `MapResultToConst` panics on a pull at or beneath that level, so the values check it
+/// (`src/interpreter/design-operators.md`, "Reading rows again").
+#[rstest_log::rstest]
+#[case::zipped_with_a_constant(
+    indoc! {"
+        out = test_sink()
+        ys = [y for y in source1()]
+        k = 10
+        out << [sum([y * x + k for y in ys]) for x in [1, 2]]
+    "},
+    vec![(0, 65), (1, 80)],
+)]
+#[case::a_constant_under_a_filter(
+    indoc! {"
+        out = test_sink()
+        ys = [y for y in source1()]
+        out << [sum([10 for y in ys if y > x]) for x in [1, 2]]
+    "},
+    vec![(0, 40), (1, 30)],
+)]
+fn a_sum_over_rows_carrying_a_constant_reading_a_live_list(
+    #[case] source: &str,
+    #[case] expected: Vec<(u64, i64)>,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    assert!(
+        kinds_beneath(&operator_graph(source, true), "MapAggregate")
+            .is_some_and(|kinds| kinds.contains(&"MapResultToConst")),
+        "{source}: the `MapAggregate` reads a `MapResultToConst` in its own chain"
+    );
+    let (value, planned) = dispatched_live(source, rows, two_batches());
+    assert_eq!(keyed_ints(&value), expected);
+    assert!(
+        !planned.iter().any(|plan| plan.whole),
+        "no pipeline reads its input whole: {planned:?}"
+    );
+    assert!(
+        planned
+            .iter()
+            .any(|plan| plan.open && plan.name.starts_with("MapAggregate")),
+        "the per-row sum keeps open rows: {planned:?}"
+    );
+}
+
+/// The same sums with the source as the rows: the sum's input is keyed by the source's keys, which
+/// reach it through the pushes of the live source's `Memo`.
+#[rstest_log::rstest]
+#[case::zipped_with_a_constant(
+    indoc! {"
+        out = test_sink()
+        k = 10
+        out << [sum([y * x + k for y in [1, 2, 3]]) for x in source1()]
+    "},
+    vec![(0, 36), (1, 42), (2, 48), (3, 54), (4, 60)],
+)]
+#[case::a_constant_under_a_filter(
+    indoc! {"
+        out = test_sink()
+        out << [sum([10 for y in [1, 2, 3] if y > x]) for x in source1()]
+    "},
+    vec![(0, 20), (1, 10), (2, 0), (3, 0), (4, 0)],
+)]
+fn a_sum_over_live_rows_carrying_a_constant(
+    #[case] source: &str,
+    #[case] expected: Vec<(u64, i64)>,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    assert!(
+        kinds_beneath(&operator_graph(source, true), "MapAggregate")
+            .is_some_and(|kinds| kinds.contains(&"MapResultToConst")),
+        "{source}: the `MapAggregate` reads a `MapResultToConst` in its own chain"
+    );
+    let (value, planned) = dispatched_live(source, rows, two_batches());
+    assert_eq!(keyed_ints(&value), expected);
+    assert!(
+        planned
+            .iter()
+            .any(|plan| plan.live && plan.name.starts_with("Memo")),
+        "the source's `Memo` is the live pipeline: {planned:?}"
+    );
+    assert!(
+        !planned.iter().any(|plan| plan.whole),
+        "no pipeline reads its input whole: {planned:?}"
+    );
+}
+
+/// The same filter fed to a sink. The comprehension is the constant of the `()` row above it, so
+/// a delivery's keys reach the sink's pipeline widened, and that pipeline reads its input whole
+/// once the source yields everything, keeping open rows for the sum's push.
+#[rstest_log::rstest]
+fn a_filter_over_a_live_source_reading_a_sum_into_a_sink(#[values(1, usize::MAX)] rows: usize) {
+    let source = indoc! {"
+        out = test_sink()
+        out << [x for x in source1() if sum([1, 2, 3]) > 5]
+    "};
+    let (value, planned) = dispatched_live(source, rows, two_batches());
+    assert_eq!(
+        keyed_ints(&value),
+        (0..5).map(|key| (key, key as i64 + 1)).collect::<Vec<_>>()
+    );
+    assert!(
+        planned
+            .iter()
+            .any(|plan| plan.live && plan.whole && plan.open),
+        "a pipeline over the source reads it whole and keeps open rows: {planned:?}"
+    );
+}
+
+/// A sum whose rows read a sum over the same live source: the outer sum's pipeline takes the
+/// source's arrivals and is not ordered, so its open rows are read again when the inner sum is
+/// final, at the last delivery.
+#[rstest_log::rstest]
+fn a_sum_over_a_live_source_reading_a_sum_over_it(#[values(1, usize::MAX)] rows: usize) {
+    let (value, _) = dispatched_live(
+        indoc! {"
+            out = test_sink()
+            out << sum([x for x in source1() if sum(source1()) > 2])
+        "},
+        rows,
+        two_batches(),
+    );
+    assert_eq!(value, Value::Int(15));
+}
+
+/// Why the planner refuses `source`, which reads the live source `source1`.
+fn live_refusal(source: &str) -> Refused {
+    let mut ctx = GlobalContext::default();
+    ctx.defer_sink_pulls();
+    ctx.register_source(std::rc::Rc::new(std::cell::RefCell::new(
+        crate::interpreter::TestDataSource::new(
+            "source1",
+            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+        ),
+    )));
+    ctx.register_test_sink("out");
+    let mut program = compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    let _operators = ctx.take_operator_map();
+    let main = std::sync::Arc::new(MainAnswers::default());
+    match crate::interpreter::dispatcher::run_program_into(&mut program, 1, main, &mut || {
+        panic!("{source}: a refused run polls nothing")
+    }) {
+        Err(refused) => refused,
+        Ok(planned) => panic!("{source} is refused: {planned:?}"),
+    }
+}
+
+/// A pipeline notified of a live source's arrivals takes no other package, so the planner refuses
+/// one whose input has rows no arrival names: a range no live source yields, as a static arm of a
+/// concatenation, or a pipeline it reads whose pushes arrive as its own keys, as a let-bound arm or
+/// a field of a let-bound record, whose memo holds one value.
+#[rstest_log::rstest]
+#[case::a_static_arm_reading_a_sum("[x for x in source1()] ++ [y + sum([10, 20]) for y in [0]]")]
+#[case::a_sum_of_a_static_arm_reading_a_sum(
+    "sum([x for x in source1()] ++ [y + sum([10, 20]) for y in [0]])"
+)]
+#[case::a_sum_of_an_arm_reading_a_sum(
+    "sum([x + sum([10, 20]) for x in source1()] ++ [y for y in [100]])"
+)]
+#[case::a_sum_of_a_static_arm("sum([x for x in source1()] ++ [y * 2 for y in [10, 20]])")]
+#[case::a_let_bound_arm(indoc! {"
+    ys = [y * 10 for y in [1, 2]]
+    [x for x in source1()] ++ ys
+"})]
+#[case::a_field_of_a_let_bound_record(indoc! {"
+    r = (a=[y * 2 for y in [10, 20]], b=1)
+    sum([x for x in source1()] ++ r.a) + r.b
+"})]
+fn a_pipeline_notified_of_arrivals_with_rows_no_arrival_names_is_refused(#[case] source: &str) {
+    let refused = live_refusal(source);
+    assert!(
+        refused.to_string().contains("which no arrival names")
+            || refused.to_string().contains("whose rows no arrival names"),
+        "{refused}"
+    );
+}
+
+/// A loop over a live source whose body reads a sum: the loop's scope reads the sum's pipeline
+/// beside the source, and a scope takes no arrivals beside the pipelines it reads.
+#[test]
+fn a_loop_over_a_live_source_reading_a_pipeline_is_refused() {
+    let refused = live_refusal(indoc! {"
+        out = test_sink()
+        ys = [1, 2]
+        total := 0
+        for x in source1():
+            total += x + sum(ys)
+        out << total
+    "});
+    assert!(
+        refused.to_string().contains("as a store or a loop's scope"),
+        "{refused}"
+    );
+}
+
+/// A sum or a loop over a live source at the `main` output: the run notifies the aggregate's or
+/// the loop's pipeline of each delivery, beneath the output's pipeline, and the output is handed
+/// the scalar once the source yields everything.
+#[rstest_log::rstest]
+#[case::a_sum("sum(source1())", "Aggregate")]
+#[case::a_loop(
+    indoc! {"
+        total := 0
+        for x in source1():
+            total += x
+        total
+    "},
+    "LoopScope"
+)]
+fn a_sum_over_a_live_source_at_main(
+    #[case] source: &str,
+    #[case] live: &str,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let LiveMain { value, planned, .. } = dispatched_live_main(source, rows, two_batches());
+    assert_eq!(value, Value::Int(15));
+    assert!(
+        planned
+            .iter()
+            .all(|plan| plan.live == plan.name.starts_with(live)),
+        "the live source pipeline is the {live}'s alone: {planned:?}"
     );
 }
