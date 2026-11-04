@@ -2344,3 +2344,57 @@ fn a_push_in_a_later_epoch_holds_that_epochs_queue_for_a_consume_in_flight() {
         .expect("the row the consume left open, which the push in epoch 1 named");
     assert_eq!((again.epoch, again.guard), (1, keys_between(2, 2)));
 }
+
+/// A push that names part of an open row, beneath its outermost keys, reads the whole row again:
+/// every chain can be pulled at a row's outermost keys.
+#[test]
+fn a_push_naming_part_of_an_open_row_reads_the_row_again_whole() {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    dispatcher.keep_open_rows(PipelineId(1));
+    dispatcher.queue_for(PipelineId(1), &keys_between(0, 2));
+    let start = dispatcher
+        .claim_of(PipelineId(1))
+        .expect("the start region");
+    read_leaving_open(&dispatcher, start, Some(keys_between(1, 1)));
+    let part = TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+        FunctionGuard::Domain(Predicate::qualified(
+            Predicate::point(Value::UInt(1)),
+            Predicate::point(Value::UInt(5)),
+        )),
+    ))));
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        pushes.push(&part, |guard, _| vec![guard.clone()])
+    });
+    let again = dispatcher
+        .claim_of(PipelineId(1))
+        .expect("the open row the push names part of");
+    assert_eq!(again.guard, keys_between(1, 1));
+}
+
+/// A push that names part of a row beneath its outermost keys while a consume of the row is in
+/// flight reads the whole row again at the consume's end, in the push's epoch.
+#[test]
+fn a_push_during_a_consume_reads_the_row_again_whole() {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    dispatcher.keep_open_rows(PipelineId(1));
+    dispatcher.queue_for(PipelineId(1), &keys_between(0, 2));
+    let package = dispatcher
+        .claim_of(PipelineId(1))
+        .expect("the start region");
+    dispatcher.begin_read(&package);
+    let part = TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+        FunctionGuard::Domain(Predicate::qualified(
+            Predicate::point(Value::UInt(1)),
+            Predicate::point(Value::UInt(5)),
+        )),
+    ))));
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        pushes.push(&part, |guard, _| vec![guard.clone()])
+    });
+    dispatcher.end_read(&package, Some(keys_between(1, 1)));
+    dispatcher.acknowledge(package);
+    let again = dispatcher
+        .claim_of(PipelineId(1))
+        .expect("the row the consume left open, part of which the push named");
+    assert_eq!((again.epoch, again.guard), (0, keys_between(1, 1)));
+}

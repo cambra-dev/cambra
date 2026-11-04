@@ -23,7 +23,8 @@ use intervalsets::Bounding;
 
 use crate::interpreter::tile_operators::InputId;
 use crate::interpreter::tile_operators::{
-    Breaker, BreakingProducer, FunctionGuard, Tiling, cut_before, guard_minus, partition_gap,
+    Breaker, BreakingProducer, FunctionGuard, Tiling, cut_before, guard_minus, keys_released_whole,
+    partition_gap,
 };
 use crate::interpreter::{
     Consumer, Extent, Predicate, Projection, SharedConsumer, TileGuard, Value,
@@ -819,10 +820,11 @@ impl Dispatcher {
         });
     }
 
-    /// Record `open`, the rows of `package`'s guard its breaker's input has not released after
-    /// the consume ([`unreleased`]), `None` for none. The part a push named since
-    /// [`begin_read`](Self::begin_read) is queued as a package read again in that push's epoch,
-    /// whose queue the push held open, and the hold ends; the rest joins the pipeline's open rows.
+    /// Record `open`, the whole rows of `package`'s guard its breaker's input has not released
+    /// whole after the consume ([`rows_left_open`]), `None` for none. The rows a push named any
+    /// part of since [`begin_read`](Self::begin_read) are queued as a package read again in that
+    /// push's epoch, whose queue the push held open, and the hold ends; the rest join the
+    /// pipeline's open rows.
     /// It comes before the package's acknowledgement. A no-op for a pipeline that keeps no open
     /// rows.
     ///
@@ -851,7 +853,7 @@ impl Dispatcher {
                 .epoch(number)
                 .expect("an epoch whose queue a read holds open is in the window");
             if let Some(rows) = &open {
-                let again = rows.intersect(&named);
+                let again = rows.intersect(&whole_rows(&named));
                 if !again.is_empty() {
                     open = nonempty(guard_minus(rows, &again));
                     let appended = epoch.pipelines[p].queue.append_again(&again);
@@ -878,9 +880,10 @@ impl Dispatcher {
     }
 
     /// Land `guard`, a push or an arrival to `reader`, which keeps open rows, in `epoch`: queue the
-    /// open rows it names as one package read again, hold the queue open for each consume in
-    /// flight whose package it names ([`begin_read`](Self::begin_read)), and, where `fresh` cuts,
-    /// queue what of it no queue of the reader held before as the morsels `fresh` cuts it into.
+    /// open rows it names any part of ([`whole_rows`]) as one package read again, hold the queue
+    /// open for each consume in flight whose package holds such a row
+    /// ([`begin_read`](Self::begin_read)), and, where `fresh` cuts, queue what of it no queue of
+    /// the reader held before as the morsels `fresh` cuts it into.
     ///
     /// # Panics
     ///
@@ -896,8 +899,9 @@ impl Dispatcher {
     ) {
         let queue = &epoch.pipelines[reader];
         let mut state = self.open_of(reader);
+        let rows_named = whole_rows(guard);
         if let Some(rows) = &state.rows {
-            let again = rows.intersect(guard);
+            let again = rows.intersect(&rows_named);
             if !again.is_empty() {
                 state.rows = nonempty(guard_minus(rows, &again));
                 let appended = queue.queue.append_again(&again);
@@ -907,7 +911,7 @@ impl Dispatcher {
             }
         }
         for reading in &mut state.reading {
-            let named = reading.guard.intersect(guard);
+            let named = reading.guard.intersect(&rows_named);
             if named.is_empty() {
                 continue;
             }
@@ -948,9 +952,9 @@ impl Dispatcher {
         }
     }
 
-    /// Remove from the open rows of `pipeline`, which keeps open rows, what its breaker's input
-    /// has released, `released`, closed over the input's tiling `input`, at its finish of `epoch`,
-    /// and answer the rows left open.
+    /// Keep of the open rows of `pipeline`, which keeps open rows, only those its breaker's input,
+    /// of tiling `input`, has not released whole by `released` ([`rows_left_open`]), at its finish
+    /// of `epoch`, and answer them.
     ///
     /// # Panics
     ///
@@ -973,7 +977,7 @@ impl Dispatcher {
         state.rows = state
             .rows
             .take()
-            .and_then(|rows| unreleased(&rows, released, input));
+            .and_then(|rows| rows_left_open(&rows, released, input));
         state.rows.clone()
     }
 
@@ -1950,6 +1954,39 @@ fn unreleased(rows: &TileGuard, released: &TileGuard, input: &Tiling) -> Option<
     nonempty(guard_minus(rows, released).closed_over(input))
 }
 
+/// The rows `guard`, a guard of a breaker's input, names any part of: where it is a guard of a
+/// collection's keys, every key of the outermost level it names any part of, whole
+/// ([`TileGuard::touched_keys`]), and `guard` itself otherwise. A pipeline that keeps open rows
+/// reads a row again whole, since every chain can be pulled at its outermost keys and a row left
+/// open beneath them is no region every chain restates (`TileProducer::restates`). The breaker
+/// merges no part of a row twice: its input releases every key an answer holds a scalar under
+/// (`Tile::to_guard`), and a pull answers nothing its input released (`TileProducer::get`).
+fn whole_rows(guard: &TileGuard) -> TileGuard {
+    match guard {
+        TileGuard::Function(_) | TileGuard::Or(_) => {
+            TileGuard::Function(FunctionGuard::Domain(guard.touched_keys()))
+        }
+        _ => guard.clone(),
+    }
+}
+
+/// The rows of `consumed`, a guard of `input`, that a consume leaves open: the whole rows
+/// ([`whole_rows`]) of what of `consumed` the input has not released, where a key counts as
+/// released only where a release names it whole (`keys_released_whole`), not where it releases
+/// cells beneath it. `None` for none.
+///
+/// # Panics
+///
+/// Where the guard algebra has no exact difference of `consumed` and the keys released
+/// ([`guard_minus`]).
+fn rows_left_open(consumed: &TileGuard, released: &TileGuard, input: &Tiling) -> Option<TileGuard> {
+    let released = match input.is_data_function() {
+        true => keys_released_whole(released).unwrap_or_else(|| input.empty_guard()),
+        false => released.clone(),
+    };
+    unreleased(consumed, &released, input).map(|open| whole_rows(&open))
+}
+
 /// Whether no pipeline reaches itself through what it reads.
 fn acyclic(reads: &[Vec<usize>]) -> bool {
     // 0: not visited, 1: on the path, 2: done.
@@ -2618,10 +2655,11 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
             "pipeline {p} consumes a guard of the tiling its breaker's input answers: {:?}",
             package.guard
         );
-        // A pipeline that keeps open rows consumes only the rows its input has not released: a
-        // package read again may name rows a later consume or a finish released.
+        // A pipeline that keeps open rows consumes only the rows its input has not released
+        // whole: a package read again may name rows a later consume or a finish released.
         let guard = match keeps_open {
-            true => unreleased(&package.guard, &breaker.input_released(input), &tiling),
+            true => rows_left_open(&package.guard, &breaker.input_released(input), &tiling)
+                .map(|rows| package.guard.intersect(&rows)),
             false => Some(package.guard.clone()),
         };
         let Some(guard) = guard else {
@@ -2629,7 +2667,7 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
         };
         breaker.consume_impl(input, guard.clone());
         if keeps_open {
-            open = unreleased(&guard, &breaker.input_released(input), &tiling);
+            open = rows_left_open(&guard, &breaker.input_released(input), &tiling);
         }
         if let Some(producer) = breaker.as_producer()
             && producer.pushes_while_consuming()
@@ -2769,6 +2807,66 @@ mod tests {
         };
         assert!(second.contains(&Value::UInt(1 << 63)));
         assert!(!second.contains(&Value::UInt((1 << 63) - 1)));
+    }
+
+    /// A consume that leaves part of a row open beneath its outermost keys leaves the whole row
+    /// open: row `0`, whose inner keys `0..=2` its input released, of a two-level input whose other
+    /// rows it released whole.
+    #[test]
+    fn a_row_left_open_beneath_its_outermost_keys_is_open_whole() {
+        let positions = || Extent::UIntRange(IntervalSet::from(Interval::closed(0, 9)));
+        let input = Tiling::data_function(
+            positions(),
+            Tiling::data_function(positions(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+        );
+        let point = |key: u64| Predicate::point(Value::UInt(key));
+        let inner = Predicate::intervals(IntervalSet::from(Interval::closed(
+            Value::UInt(0),
+            Value::UInt(2),
+        )));
+        let released = TileGuard::Or(vec![
+            TileGuard::Function(FunctionGuard::Domain(Predicate::intervals(
+                IntervalSet::from(Interval::closed_unbound(Value::UInt(1))),
+            ))),
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+                FunctionGuard::Domain(Predicate::qualified(point(0), inner)),
+            )))),
+        ]);
+        let open = rows_left_open(&input.universal_guard(), &released, &input);
+        assert_eq!(
+            open,
+            Some(TileGuard::Function(FunctionGuard::Domain(point(0))))
+        );
+    }
+
+    /// A release of every inner key of a row over the inner level's finite range releases the row
+    /// whole, so the row is left open nowhere.
+    #[test]
+    fn a_row_whose_inner_range_is_released_whole_is_left_open_nowhere() {
+        let positions = || Extent::UIntRange(IntervalSet::from(Interval::closed(0, 9)));
+        let input = Tiling::data_function(
+            positions(),
+            Tiling::data_function(positions(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+        );
+        let every_inner = Predicate::intervals(IntervalSet::from(Interval::closed(
+            Value::UInt(0),
+            Value::UInt(9),
+        )));
+        let released = TileGuard::Or(vec![
+            TileGuard::Function(FunctionGuard::Domain(Predicate::intervals(
+                IntervalSet::from(Interval::closed_unbound(Value::UInt(1))),
+            ))),
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
+                FunctionGuard::Domain(Predicate::qualified(
+                    Predicate::point(Value::UInt(0)),
+                    every_inner,
+                )),
+            )))),
+        ]);
+        assert_eq!(
+            rows_left_open(&input.universal_guard(), &released, &input),
+            None
+        );
     }
 
     /// A range of several runs is cut every `rows` positions counted across the runs: positions

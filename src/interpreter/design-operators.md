@@ -1348,16 +1348,17 @@ nothing of such a row, so the breaker's input does not release it, and the row i
 and not released by the input.
 
 Each consume of a pipeline that keeps open rows records the rows of its package that the breaker's
-input has not released after the consume (`Dispatcher::end_read`, `OpenRows`). A push or an arrival
-to the pipeline queues, in its own epoch, the open rows its region names as one package read again,
-and those rows leave the record. A push widened on its way names the whole input. A push that is
-not widened, to a pipeline that takes no arrivals, also queues fresh what of its region no queue of
-the pipeline held before, in any epoch (`OpenRows::queued`), so a key two stream edges name is
-queued fresh once. A pipeline that takes arrivals is queued fresh only its arrivals, since a push
-can name rows that have not arrived. A package read again consumes only its rows the input has not
-released (`consume_with`). Each finish removes from the record what the input has released
-(`settle_open_rows`), and at the run's last epoch a row still open fails the run. The pipeline
-finishes its epochs in order (`Dispatcher::ready`).
+input has not released after the consume (`Dispatcher::end_read`, `OpenRows`), each whole at the
+outermost keys (`whole_rows`). A push or an arrival to the pipeline queues, in its own epoch, the
+open rows its region names any part of as one package read again, and those rows leave the record. A
+push widened on its way names the whole input. A push that is not widened, to a pipeline that takes
+no arrivals, also queues fresh what of its region no queue of the pipeline held before, in any epoch
+(`OpenRows::queued`), so a key two stream edges name is queued fresh once. A pipeline that takes
+arrivals is queued fresh only its arrivals, since a push can name rows that have not arrived. A
+package read again consumes only its rows the input has not released (`consume_with`). Each finish
+removes from the record what the input has released (`settle_open_rows`), and at the run's last
+epoch a row still open fails the run. The pipeline finishes its epochs in order
+(`Dispatcher::ready`).
 
 A consume records itself in flight before its breaker consumes (`Dispatcher::begin_read`). A push
 lands after its pipeline decided the region it names, so a consume that begins after the push reads
@@ -1386,12 +1387,20 @@ round's row only once the pipelines its rounds pull have finished the round, and
 nested loop's scope, which pushes its store only once it is terminal, takes its packages only once
 that scope has finished the round.
 
-A row left open beneath its outermost keys is not read again correctly. A chain can refuse a pull
-there, as `MapResultToConst` refuses a pull beneath the keys it restates
-(`a_let_bound_map_over_a_live_source`), and a `Memo` that reads such a row again over a live source
-holds and pushes only the keys the source delivered, not the positions past its last, so the
-`MapAggregate` of `[sum([y * x for y in ys]) for x in [1, 2]]` never finds a row's group complete
-(`a_reader_building_on_a_live_pipeline_reads_its_input_whole`).
+A row is open whole at its outermost keys, since every chain can be pulled there and a row beneath
+them is no region every chain restates: `MapResultToConst` refuses a pull beneath the keys it
+restates (`TileProducer::restates`). A consume leaves open the whole rows of what of its package its
+input has not released (`rows_left_open`), where a key counts as released only where a release names
+it whole, not where it names cells beneath the key (`keys_released_whole`). A push reads again every
+open row it names any part of (`TileGuard::touched_keys`), and a row leaves the record once its
+input releases it whole by that rule. The breaker merges no part of a row twice: its input releases
+every key an answer holds a scalar under (`Tile::to_guard`), and a pull answers nothing its input
+released (`TileProducer::get`).
+
+A pull beneath a path over a live source's domain states the source's positions complete only
+through those it delivered, not past its last once it is complete, so a reader of a push beneath its
+outermost keys does not release those positions. `a_let_bound_map_over_a_live_source` and
+`readers_over_a_live_pipeline_keep_open_rows` fail on that statement.
 
 `[x for x in source1() if sum([1, 2, 3]) > 5]` at `main` takes each delivery's rows as they arrive,
 and a row consumed before the sum is final is read again at the sum's push. With `sum(source1())`

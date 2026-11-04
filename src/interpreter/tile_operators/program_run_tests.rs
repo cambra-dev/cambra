@@ -2173,14 +2173,12 @@ fn a_filter_over_a_live_source_reading_a_sum(
     );
 }
 
-/// A reader that takes no arrivals and builds on a pipeline with a live source beneath it reads its
-/// input whole once every epoch has run: the inner comprehension's memo reads the list's pushes and
-/// builds on the memo over the source, and the per-row sum reads the inner memo's pushes and builds
-/// on the same memo (`src/interpreter/design-operators.md`, "Reading rows again").
+/// The readers of a pipeline with a live source beneath it read no input whole: the inner
+/// comprehension's memo, the per-row sum and the outer comprehension's memo each keep open rows,
+/// and a push reads again the rows it names (`src/interpreter/design-operators.md`, "Reading rows
+/// again").
 #[rstest_log::rstest]
-fn a_reader_building_on_a_live_pipeline_reads_its_input_whole(
-    #[values(1, usize::MAX)] rows: usize,
-) {
+fn readers_over_a_live_pipeline_keep_open_rows(#[values(1, usize::MAX)] rows: usize) {
     let source = indoc! {"
         out = test_sink()
         ys = [y for y in source1()]
@@ -2189,9 +2187,19 @@ fn a_reader_building_on_a_live_pipeline_reads_its_input_whole(
     let (value, planned) = dispatched_live(source, rows, two_batches());
     assert_eq!(keyed_ints(&value), vec![(0, 15), (1, 30)]);
     assert!(
-        planned.iter().any(|plan| plan.whole) && !planned.iter().any(|plan| plan.open),
-        "the readers of the memo over the source read their inputs whole, and none keeps open \
-         rows: {planned:?}"
+        !planned.iter().any(|plan| plan.whole),
+        "no pipeline reads its input whole: {planned:?}"
+    );
+    assert!(
+        planned
+            .iter()
+            .any(|plan| plan.open && plan.name.starts_with("MapAggregate")),
+        "the per-row sum keeps open rows: {planned:?}"
+    );
+    assert_eq!(
+        planned.iter().filter(|plan| plan.open).count(),
+        3,
+        "the two memos and the sum keep open rows: {planned:?}"
     );
 }
 
