@@ -524,7 +524,15 @@ module lowers and taken by a run that passes no argument.
 
 A polymorphic entry's `let` carries its polymorphic type, as a `def` with type parameters does. A
 feed entry, `Feed(T)`, is a feed handle with its domain left to inference, and `audit::events << e`
-feeds the argument's feed through the `let`. A binding exported in an interface carries its
+feeds the argument's feed through the `let`.
+
+A transactional variable's entry, `stock: Mut(V, Txn)`, declares a variable rather than binding a
+`let`, since no `let` binds a `Mut`. Where the module is checked on its own, that declaration
+stands for the argument's variable, and the module reaches it as `p::stock`. Creating a run removes
+it and resolves the spelling `p::stock` to the argument's variable itself (`mut_entries`), so a
+write through the parameter writes the argument's history. In its place a function nothing calls
+writes and reads the variable at `V` (`rebind_mut_entry`), which checks the argument's value type
+is `V` both ways, as `Mut` is invariant. A binding exported in an interface carries its
 spelling and its view, so a module reaching `h::k` reaches what `k` does in `h`.
 
 A type member of a Module type is a `TypeEntry`, an alias for the entries after it. An exact one,
@@ -943,25 +951,22 @@ What each rule contributes:
 
 The work that remains, one PR per item, each updating the spec and design docs it touches:
 
-1. **Public mutable members.** `pub` on the `:=` that introduces a `Txn` variable, a `Txn` entry in
-   a Module type, a write through a qualifier, and an argument's member with a `Mut` parameter
-   reached through a Module-typed parameter.
-2. **Labels through a Module-typed parameter**, whose module is the argument's and is not known
+1. **Labels through a Module-typed parameter**, whose module is the argument's and is not known
    where the module lowers.
-3. **Inferred type arguments.** A type parameter a `run` or an `import` leaves out, inferred from
+2. **Inferred type arguments.** A type parameter a `run` or an `import` leaves out, inferred from
    the types of its other arguments ([chl-spec.md, "9.4 Parameters"](chl-spec.md#94-parameters)).
-4. **The interface as written.** `cambra check` printing a type with the alias names its module
+3. **The interface as written.** `cambra check` printing a type with the alias names its module
    wrote, which needs a named wrapper type that every comparison looks through, and a diagnostic
    eliding the qualifier on its own module's members, which needs a diagnostic's text formatted once
    the error has a location ([Names carry their home](#names-carry-their-home)).
-5. **The std root.** `std::http` as a std module, intrinsics recognized by identity, `http_serve`
+4. **The std root.** `std::http` as a std module, intrinsics recognized by identity, `http_serve`
    removed.
-6. **Hot reload.** Bundles on the control port, the run-tree diff, `@RenamedFrom` on runs,
+5. **Hot reload.** Bundles on the control port, the run-tree diff, `@RenamedFrom` on runs,
    qualified `@LoadFrom` loads, `@Discard`.
-7. **No trailing expressions**, once an output sink exists. The compiler's own test harness keeps
+6. **No trailing expressions**, once an output sink exists. The compiler's own test harness keeps
    them through a compile option the CLI does not expose, and reads the value through the `main`
    output.
-8. **The inspector's multi-file source pane.**
+7. **The inspector's multi-file source pane.**
 
 ---
 

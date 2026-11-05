@@ -593,7 +593,7 @@ pub(super) fn lower_final_stmt(
         // mutable variable. (A plain `=` is an immutable binding and reaches the
         // "must end in a value" error below, never this arm.)
         ChlStmt::AugAssign { target, op, value } => {
-            let name = extract_name_target(target, "augmented assignment")?;
+            let name = mut_target_name(target, "augmented assignment", ctx)?;
             let rhs = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
             let val = lower_aug_binop(&name, *op, rhs, last.span, ctx)?;
             Ok(ctx.tag_image(Expr::mut_write(name, val), last.span))
@@ -608,13 +608,14 @@ pub(super) fn lower_final_stmt(
             target,
             annotation: None,
             value,
-        } if name_target_as_name(target).is_some_and(|n| {
-            let mut scope = outer_bindings.clone();
-            collect_stmt_names(preceding, &mut scope);
-            scope.contains(n)
-        }) =>
+        } if matches!(target.node, AssignTarget::Qualified(_))
+            || name_target_as_name(target).is_some_and(|n| {
+                let mut scope = outer_bindings.clone();
+                collect_stmt_names(preceding, &mut scope);
+                scope.contains(n)
+            }) =>
         {
-            let name = extract_name_target(target, "mutable assignment")?;
+            let name = mut_target_name(target, "mutable assignment", ctx)?;
             let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
             Ok(ctx.tag_image(Expr::mut_write(name, val), last.span))
         }
@@ -924,7 +925,7 @@ pub(super) fn lower_middle_stmt(
             annotation,
             value,
         } => {
-            let name = extract_name_target(target, "mutable assignment")?;
+            let name = mut_target_name(target, "mutable assignment", ctx)?;
             let val = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
             // A bare `x := e` where `x` is already in scope, or where `x` is a
             // transactional mutable variable a function body captures, is a *write*,
@@ -937,6 +938,7 @@ pub(super) fn lower_middle_stmt(
                 let mut scope = outer_bindings.clone();
                 collect_stmt_names(preceding, &mut scope);
                 if scope.contains(&name)
+                    || matches!(target.node, AssignTarget::Qualified(_))
                     || (ctx.is_transactional_mut_var(&name) && !ctx.is_shadowed(&name))
                 {
                     // The `MutWrite` is the image of `x := e`; the `ExprStmt`
@@ -989,7 +991,7 @@ pub(super) fn lower_middle_stmt(
         // (in a loop) or a shadowing advance (outside one). Only simple name
         // targets are supported; tuple-destructuring `(a, b) += …` is Unsupported.
         ChlStmt::AugAssign { target, op, value } => {
-            let name = extract_name_target(target, "augmented assignment")?;
+            let name = mut_target_name(target, "augmented assignment", ctx)?;
             // A bare mutable write, whose target-is-a-mutable check runs post-inference.
             let rhs = lower_assigned_value(value, preceding, outer_bindings, ctx)?;
             let val = lower_aug_binop(&name, *op, rhs, stmt.span, ctx)?;
@@ -1248,7 +1250,14 @@ pub(super) fn lower_middle_stmt(
                 let lets = parameter.entry_lets();
                 return Ok(lets.into_iter().rev().fold(body, |body, (binder, ty)| {
                     let value = ctx.tag_image(Expr::new(TypedExprNode::Abstract), stmt.span);
-                    let bound = Expr::let_bind_annotated(binder.raw(), value, body, ty);
+                    // A transactional variable's entry declares one, which stands for the
+                    // argument's where the module is checked on its own, and which each run
+                    // replaces by the argument's own (`ProgramLowering::bind_module_parameter`).
+                    let bound = if is_mut_entry(&ty) {
+                        Expr::mut_decl(binder.raw(), ty, value, body)
+                    } else {
+                        Expr::let_bind_annotated(binder.raw(), value, body, ty)
+                    };
                     ctx.tag_image(bound, stmt.span)
                 }));
             }
@@ -1600,9 +1609,15 @@ pub(super) fn extract_name_target(
                  (write it as `m[k] := …`)"
             ),
         )),
-        AssignTarget::Qualified(_) => {
-            unreachable!("a qualified target is refused before lowering (`refuse_module_syntax`)")
-        }
+        // Another module's public mutable variable is written only where a block's statements
+        // and a function body's are lowered, which resolve it (`mut_target_name`).
+        AssignTarget::Qualified(_) => Err(LoweringError::unsupported(
+            target.span,
+            format!(
+                "{context}: another module's mutable variable is written in a `with begin():` \
+                 block, or in a function a block calls"
+            ),
+        )),
         AssignTarget::Constructor(_) => Err(LoweringError::unsupported(
             target.span,
             format!(
@@ -1610,6 +1625,29 @@ pub(super) fn extract_name_target(
                  assignment, a `for` binder or a `match` arm"
             ),
         )),
+    }
+}
+
+/// Whether a Module type's entry of type `ty` is a transactional variable, `stock: Mut(V, Txn)`.
+pub(super) fn is_mut_entry(ty: &Type) -> bool {
+    ty.history_parts()
+        .is_some_and(|(_, _, kind)| kind == crate::ccl::ty::HistoryKind::Overwrite)
+}
+
+/// The variable a `:=` or a compound assignment writes: [`extract_name_target`]'s name, or
+/// another module's public mutable variable, `inv::stock`, spelled as a reference to it lowers
+/// (`docs/chl-spec.md`, "9.9 Running"). A qualified target is always a write.
+pub(super) fn mut_target_name(
+    target: &Spanned<AssignTarget>,
+    context: &str,
+    ctx: &LoweringContext,
+) -> Result<String, LoweringError> {
+    match &target.node {
+        AssignTarget::Qualified(q) => Ok(match ctx.member(q, target.span)? {
+            Some(member) => member.name.to_string(),
+            None => q.name.node.to_string(),
+        }),
+        _ => extract_name_target(target, context),
     }
 }
 
@@ -1626,10 +1664,7 @@ pub(super) fn write_target_name(target: &Spanned<AssignTarget>) -> Option<&str> 
             ChlExpr::Name(id) => Some(id.as_str()),
             _ => None,
         },
-        AssignTarget::Tuple(_) | AssignTarget::Constructor(_) => None,
-        AssignTarget::Qualified(_) => {
-            unreachable!("a qualified target is refused before lowering (`refuse_module_syntax`)")
-        }
+        AssignTarget::Tuple(_) | AssignTarget::Constructor(_) | AssignTarget::Qualified(_) => None,
     }
 }
 
@@ -3471,12 +3506,19 @@ fn lower_module_type(
         // `Feed` parameter's is.
         let ty = match &field.value.node {
             ChlExpr::Call { func, args } => match (&func.node, args.as_slice()) {
+                // A public mutable variable is transactional, and an entry names one.
+                (ChlExpr::Name(head), [value, domain])
+                    if head == "Mut" && matches!(&domain.node, ChlExpr::Name(d) if d == "Txn") =>
+                {
+                    AliasType::Type(Type::mutable(Type::Txn, lower_type_expr(value, ctx)?))
+                }
                 (ChlExpr::Name(head), _) if head == "Mut" => {
                     return Err(LoweringError::unsupported(
                         field.value.span,
                         format!(
-                            "`{}` is a `Txn` variable, which a Module type does not name yet",
-                            field.name
+                            "`{}` is a mutable variable, which another module reaches only when it \
+                             is transactional: `{}: Mut(V, Txn)`",
+                            field.name, field.name
                         ),
                     ));
                 }

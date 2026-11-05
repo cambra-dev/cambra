@@ -3572,18 +3572,19 @@ clause by `Context` ([Kinds and bounds](#kinds-and-bounds),
   an append that hands out such a function is an error there. At a module's top level a public
   member is what leaves, and this rule is
   [9.10 Induction variables stay in their module](#910-induction-variables-stay-in-their-module).
-- **Another module writes a run's state through the run.** A transactional variable is private to
-  its module, so a module calling `inv::reserve`, which writes `inv`'s `stock`, cannot write
-  `WriteTxn(inv::stock)`, though its diagnostics print it. It writes `WriteTxn(inv::_)`, `inv`'s
-  top, which loses only what it cannot name. A Module type's entry writes the state of the module it
-  describes as `Module::_`, so
+- **Another module writes a run's state through the run.** A module calling `inv::reserve`, which
+  writes `inv`'s private `stock`, cannot write `WriteTxn(inv::stock)`, though its diagnostics print
+  it. It writes `WriteTxn(inv::_)`, `inv`'s top, which loses only what it cannot name. A public
+  variable is named as it is reached, `WriteTxn(inv::stock)` for `pub stock`
+  ([9.5 Visibility](#95-visibility)). A Module type's entry writes the private state of the module
+  it describes as `Module::_`, so
   `Module{reserve: Int => {} causes WriteTxn(Module::_), RunTransaction}` is met by a run whose
   `reserve` commits a write to its own state, and a call through a parameter `counter` of that type
   causes `WriteTxn(counter::_)`: the state of the run the parameter takes, which stays abstract
   where the module is checked on its own. The interface `cambra check` prints writes a module's own
-  state as `Module::_` too ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)).
-  `Module::_` stands only in a Module type and in that interface, and `inv::_` names a run or a
-  Module-typed parameter.
+  private state as `Module::_` too
+  ([9.14 Checking a module on its own](#914-checking-a-module-on-its-own)). `Module::_` stands only
+  in a Module type and in that interface, and `inv::_` names a run or a Module-typed parameter.
 - **The run supplies `ObserveWorld` and `ReadTxn(x)`,** at every position. No construct in a module
   discharges either, so a top level that requires one is run
   ([9.7 Importing asserts a shareable module](#97-importing-asserts-a-shareable-module)).
@@ -5162,8 +5163,8 @@ An **induction** accumulator may likewise be seeded from an await
 whole run, the same wherever it is evaluated ([6.9 Capabilities](#69-capabilities)). A writer of `x`
 is any statement that causes `WriteTxn(x)`, or a top holding it, directly or through a call, a call
 of another module's function included, so the await waits for every writer of `x` in the program.
-**[Decided]** — a writer that depends on `await_final(x)` through another module's public value is
-the cycle above, and an error at the write.
+A writer that depends on `await_final(x)` through another module's public value is the cycle
+above, and an error at the write.
 
 One restriction unrelated to cycles: `await_final` may not appear inside a `with
 begin():` block, which reads its mutable variables bare as a snapshot; awaiting
@@ -5569,7 +5570,7 @@ pub type Price = {amount: Int}
 pub def Price::discounted(self, pct: Int) => Price: …
 ```
 
-**[Planned]** — `pub` on a mutable variable:
+`pub` on a transactional mutable variable:
 
 ```python
 pub stock: Mut(Map(String, Int), Txn) := Map::empty
@@ -5585,9 +5586,9 @@ pub held: Int
 ```
 
 - A member without `pub` is private. Only its own module can name it.
-- `pub` on `:=` is accepted (**[Planned]**) on the statement that introduces a `Txn` mutable
-  variable and refused on a later write to it. It is refused on an induction variable ([9.10
-  Induction variables stay in their module](#910-induction-variables-stay-in-their-module)).
+- `pub` on `:=` is accepted on the statement that introduces a `Txn` mutable variable, which states
+  its type `Mut(V, Txn)`, and refused on a later write to it. It is refused on an induction variable
+  ([9.10 Induction variables stay in their module](#910-induction-variables-stay-in-their-module)).
 - `pub` is refused on `import`, `run`, `param`, `op=`, `<<=`, `for`, `if`, `match`, `with`,
   expression statements, and anywhere but a module's top level.
 - A public name is bound exactly once at its module's top level. A later binding of the same
@@ -5618,9 +5619,9 @@ access](#39-subscript-and-attribute-access)). With `import shop::cart`, `run sho
 | --- | --- | --- |
 | `cart::total` | value | the public member `total` of `shop::cart`'s shared import |
 | `cart::Item` | type | the public type member `Item` of `shop::cart`, an alias or a nominal type |
-| `c::count` | value, write target | **[Planned]** the public member `count` of the run `c` |
+| `c::count` | value, write target | the public member `count` of the run `c` |
 | `c::total` | value | the public member `total` of the run `c`, a copy distinct from `cart::total` |
-| `p::count` | value, write target | **[Planned]** the member `count` of the run passed as `p` |
+| `p::count` | value, write target | the member `count` of the run passed as `p` |
 | `cart` | value | `shop::cart`'s shared import, as a value of its Module type ([9.8 Module types](#98-module-types)) |
 | `c` | value | the run `c`, as a value of its Module type |
 | `cart::hidden` | any | error: `hidden` is private to `shop::cart`, with a secondary label at its declaration |
@@ -5722,7 +5723,7 @@ param payments: Module{Receipt <: {id: String}, charge: {amount: Int} => Receipt
 | --- | --- |
 | value, `def` | `name: T`, at its contract, which may be polymorphic |
 | feed | `name: Feed(T)` |
-| `Txn` mutable variable | **[Planned]** `name: Mut(V, Txn)` |
+| `Txn` mutable variable | `name: Mut(V, Txn)` |
 | member bound to a module, `pub audit = a` | `name: Module{…}`, the Module type of the module it is bound to |
 | type alias | `Name = T` for an exact type, `Name <: T` for one known through a bound, or `Name: K` for one known through its kind, any of them followed by a `requires` clause on it (**[Decided]**) |
 | nominal type | `Name = T`, where `T` is the nominal type |
@@ -5738,8 +5739,9 @@ and through `Name <: T` or `Name: K` it cannot. A type member is in scope in the
 which is how `charge` above returns a `Receipt`.
 **[Decided]** `Module{Receipt requires Identified(Receipt), charge: {amount: Int} => Receipt}` is met by a run
 whose `Receipt` has an instance of `Identified`.
-An entry's clauses write the transactional state of the module the type describes as `Module::_`,
-and a run's state is the parameter's through it: `counter::_` for a parameter `counter`
+An entry's clauses write the private transactional state of the module the type describes as
+`Module::_`, and a run's state is the parameter's through it: `counter::_` for a parameter
+`counter`, and `counter::stock` for its entry `stock: Mut(V, Txn)`
 ([Discharging requirements and effects](#discharging-requirements-and-effects)).
 
 `Module{…}` 𝐴 is a subtype of `Module{…}` 𝐵 when 𝐴 has every member 𝐵 names. A value member's type
@@ -5759,8 +5761,7 @@ An import name denotes its shared import, and a run name its run, as a Module va
 only: an argument, and a binding, `pub audit = a` ([9.3 Runs](#93-runs)). A Module value stored in
 data or returned from a function is **[Open]** ([9.20 Open questions](#920-open-questions)). A
 Module-typed parameter therefore names exactly one shared import or run in each copy of its module.
-A `Txn` member reached through it is a bare variable reference, as through a run name
-(**[Planned]**).
+A `Txn` member reached through it is a bare variable reference, as through a run name.
 
 ### 9.9 Running
 
@@ -5784,11 +5785,16 @@ run storefront(port="8081", audit=audit) as us   # eu and us feed one `audit::ev
 A program of modules means what the same code means written in one file, with each member spelled
 by its qualified name. For mutable state, modules add visibility and nothing else:
 
-- **[Planned]** A public mutable variable is a `Txn` variable. It is read and written through a
-  qualified reference inside a `with begin():` block ([8.3 Reads](#83-reads)).
-- **[Planned]** A qualified reference is a bare variable reference, so `eu::stock` may be passed to
-  a `Mut` parameter under the downward-only discipline of [8.1 Mutation is explicit: the `:=`
+- A public mutable variable is a `Txn` variable. It is read and written through a qualified
+  reference inside a `with begin():` block, or in a function a block calls
+  ([8.3 Reads](#83-reads)), and `await_final(eu::stock)` reads its final value
+  ([8.6 `await_final`](#86-await_final)). `=` does not rebind one.
+- A qualified reference is a bare variable reference, so `eu::stock` may be passed to a `Mut`
+  parameter under the downward-only discipline of [8.1 Mutation is explicit: the `:=`
   operator](#81-mutation-is-explicit-the--operator).
+- A Module type's entry `stock: Mut(V, Txn)` is the variable of the run passed for the parameter,
+  not a copy: `p::stock := e` writes the argument's `stock`. `Mut` is invariant, so the argument's
+  variable has value type `V` exactly.
 - A public feed is fed and read through a qualified reference. Append merges commutatively, so
   several writers are a feed's semantics.
 - A module that keeps its state private and exports functions over it relies on functions that
@@ -5990,11 +5996,12 @@ restrict what a type may mention.
 ### 9.14 Checking a module on its own
 
 A module is checked once, alone, with no root and nothing that uses it. `cambra check lib.cambra`
-runs that check and prints the module's interface. No other module names the module's transactional
-variables, which are private, or the state of the runs it declares, so the interface writes their
-reads and writes `ReadTxn(Module::_)` and `WriteTxn(Module::_)`, as a Module type of the module
-would. **[Planned]** — the interface writes each type with the alias names its module wrote: a
-member annotated `base: Count` is printed `base: Count`, not with the type `Count` names.
+runs that check and prints the module's interface. No other module names the module's private
+transactional variables or the state of the runs it declares, so the interface writes their reads
+and writes `ReadTxn(Module::_)` and `WriteTxn(Module::_)`, as a Module type of the module would, and
+a public variable by its name. **[Planned]** — the interface writes each type with the alias names
+its module wrote: a member annotated `base: Count` is printed `base: Count`, not with the type
+`Count` names.
 
 - **Parameters are typed binders.** A value parameter has its annotated type, with each `_` in it
   the type its uses infer. A type parameter is opaque apart from its bound. One with no bound is

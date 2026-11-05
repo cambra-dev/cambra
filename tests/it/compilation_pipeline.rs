@@ -42,6 +42,7 @@ mod nested_loops;
 mod nominal_types;
 mod ordered_loops;
 mod probes;
+mod public_mutables;
 mod readings;
 mod records;
 mod runs;

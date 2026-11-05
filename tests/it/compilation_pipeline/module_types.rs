@@ -328,14 +328,6 @@ fn a_module_typed_parameter_reaches_its_arguments_members(
     run store as c
     c
 "}, "`c` names a module")]
-#[case::a_txn_entry(
-    indoc! {"
-        run store as c
-        run stocked(counter=c) as s
-        1
-    "},
-    "`stock` is a `Txn` variable, which a Module type does not name yet"
-)]
 #[case::a_member_less_generic_than_its_entry(
     indoc! {"
         run rigid as c
@@ -534,13 +526,6 @@ fn a_misused_module_type_is_refused(#[case] root: &str, #[case] needle: &str) {
                     indoc! {"
                         param n: Int
                         pub v = n
-                    "},
-                ),
-                (
-                    "stocked",
-                    indoc! {"
-                        param counter: Module{stock: Mut(Int, Txn)}
-                        pub v = 1
                     "},
                 ),
                 (

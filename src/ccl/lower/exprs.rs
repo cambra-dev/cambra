@@ -226,6 +226,23 @@ pub(super) fn lower_call(
                     ),
                 ));
             };
+            // Another module's public mutable variable is named through its qualifier, and its
+            // type, `Mut(V, Txn)`, is checked where the await's scheme is instantiated.
+            if let ChlExpr::Qualified(q) = &arg.node {
+                if ctx.in_tx_body {
+                    return Err(LoweringError::unsupported(
+                        func.span,
+                        "await_final inside a `with begin():` block would wait on the commit \
+                         history that block extends; a block reads a variable bare, as a snapshot",
+                    ));
+                }
+                let Some(member) = ctx.member(q, arg.span)? else {
+                    return Ok(Expr::error());
+                };
+                let mut_var = ctx.tag_image(Expr::var(member.name.raw()), arg.span);
+                let await_fn = ctx.tag_image(Expr::builtin(Builtin::AwaitFinal), func.span);
+                return Ok(Expr::apply(mut_var, await_fn));
+            }
             let ChlExpr::Name(id) = &arg.node else {
                 return Err(LoweringError::unsupported(
                     arg.span,

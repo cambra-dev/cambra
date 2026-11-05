@@ -245,12 +245,15 @@ impl<'a> ProgramLowering<'a> {
                 opaque_members(ty, &mut params);
                 let mut names = HashMap::new();
                 for (binder, entry) in parameter.entry_lets() {
-                    let node = match entry.as_feed() {
-                        Some(_) => TypedExprNode::Defer,
-                        None => TypedExprNode::Abstract,
-                    };
-                    let value = ctx.tag_image(Expr::new(node), parameter.declared);
-                    read_argument(&mut chain, &binder.to_string(), value);
+                    // A transactional variable's entry keeps the declaration it lowered to.
+                    if !crate::ccl::lower::stmts::is_mut_entry(&entry) {
+                        let node = match entry.as_feed() {
+                            Some(_) => TypedExprNode::Defer,
+                            None => TypedExprNode::Abstract,
+                        };
+                        let value = ctx.tag_image(Expr::new(node), parameter.declared);
+                        read_argument(&mut chain, &binder.to_string(), value);
+                    }
                     let entry = binder
                         .strip_prefix(&QualifiedName::new(parameter.name.clone()))
                         .expect("a parameter's entries are spelled under it");
