@@ -862,12 +862,24 @@ impl TileProducer for UncurryProducer {
     /// input is pulled at it. Pairing the whole tile makes the pairs the keys: the projection
     /// is then over pairs, and what reaches the input is the admitted first components, which
     /// is every pair they head, and the pairs are cut after.
+    /// It restates every level: a standing level's keys are its input's, and a key at or beneath
+    /// the pairs stands under a pair, which is a path of the outer and the inner key
+    /// ([`unpaired`]).
+    fn restates(&self) -> Restates {
+        Restates::Every
+    }
+
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
-        let projection = projection_guard.projection(&self.name());
+        let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
         }
         let input_guard = match (self.level == CurryLevel::OUTERMOST, &projection) {
+            (_, Projection::Keys { level, keys }) if *level > self.level => Projection::keys_at(
+                CurryLevel::new(level.index() + 1),
+                unpaired(keys, *level, self.level),
+            )
+            .guard(self.input.tiling()),
             (false, _) => projection.guard(self.input.tiling()),
             (
                 true,
@@ -905,6 +917,52 @@ impl TileProducer for UncurryProducer {
         trace!("{} releasing up with: {input_guard:?}", self.name());
         self.input.release(input_guard);
     }
+}
+
+/// The keys `keys` admits at `level`, at or beneath the pairs an `Uncurry` makes at `pairs`, as keys
+/// of its input one level deeper: each path's pair is its outer key with its inner key beneath it.
+///
+/// # Panics
+///
+/// Where a path's pair is named by a predicate other than a record of its two components, which no
+/// projection of a pair level spells.
+fn unpaired(keys: &Predicate, level: CurryLevel, pairs: CurryLevel) -> Predicate {
+    // `admitted` admits paths whose last key stands at `depth`.
+    fn split(admitted: &Predicate, depth: usize, pairs: usize) -> Predicate {
+        match admitted {
+            Predicate::Or(arms) => {
+                Predicate::union_all(arms.iter().map(|arm| split(arm, depth, pairs)).collect())
+            }
+            Predicate::Qualified { enclosing, here } if depth > pairs => {
+                Predicate::qualified(split(enclosing, depth - 1, pairs), (**here).clone())
+            }
+            Predicate::Qualified { enclosing, here } => {
+                let (outer, inner) = components(here);
+                Predicate::qualified(Predicate::qualified((**enclosing).clone(), outer), inner)
+            }
+            unqualified if depth > pairs => unqualified.clone(),
+            pair => {
+                let (outer, inner) = components(pair);
+                Predicate::qualified(outer, inner)
+            }
+        }
+    }
+    fn components(pair: &Predicate) -> (Predicate, Predicate) {
+        match pair {
+            Predicate::True => (Predicate::True, Predicate::True),
+            Predicate::Record(fields) => {
+                let field = |at: usize| {
+                    fields
+                        .get(&tuple_field(at))
+                        .cloned()
+                        .unwrap_or(Predicate::True)
+                };
+                (field(0), field(1))
+            }
+            other => panic!("a pair is named by its two components, not {other:?}"),
+        }
+    }
+    split(keys, level.index(), pairs.index())
 }
 
 /// Pair a curried collection's two levels into one keyed by `(outer, inner)` pairs.
@@ -4364,6 +4422,76 @@ mod uncurry_projection_tests {
             panic!("a collection, got {tile:?}")
         };
         domain.len()
+    }
+
+    /// Groups 1 and 2 holding members `{0}` and `{1}`, each member holding keys `{5, 6}`, paired
+    /// at the outermost level: three levels in, two out.
+    fn paired_groups_of_collections() -> (UncurryProducer, GuardLog) {
+        let leaves = Tile::grouped(
+            vec![0, 2],
+            ColumnValue::UInts(vec![5, 6, 5, 6]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 20, 30, 40]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let groups = Tile::data_function(
+            ColumnValue::UInts(vec![1, 2]),
+            Box::new(Tile::grouped(
+                vec![0, 1],
+                ColumnValue::UInts(vec![0, 1]),
+                Box::new(leaves),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let uint = || Extent::Base(BaseType::UInt);
+        let leaf = || Tiling::data_function(uint(), Tiling::Scalar(Extent::Base(BaseType::Int)));
+        let in_tiling = Tiling::data_function(uint(), Tiling::data_function(uint(), leaf()));
+        let out = Tiling::data_function(
+            Extent::Record(
+                [(tuple_field(0), uint()), (tuple_field(1), uint())]
+                    .into_iter()
+                    .collect(),
+            ),
+            leaf(),
+        );
+        let (input, pulled, _) = ProjectionSpy::new(groups, in_tiling);
+        (
+            UncurryProducer {
+                base: ProducerBase::unowned(UncurryProducer::alloc_id(), &out),
+                input: Box::new(input),
+                level: CurryLevel::OUTERMOST,
+                empty_pair: out.empty_at_no_rows(),
+            },
+            pulled,
+        )
+    }
+
+    /// A projection beneath the pairs names keys under a pair, which is the path of the pair's
+    /// outer key and its inner key: key 5 under the pair `(2, 1)` pulls key 5 under group 2's
+    /// member 1, and answers what a whole pull cut to it answers.
+    #[test]
+    fn a_projection_beneath_the_pairs_pulls_the_path_of_each_pair() {
+        let point = |k: u64| Predicate::point(Value::UInt(k));
+        let pair = Predicate::Record(HashMap::from([
+            (tuple_field(0), point(2)),
+            (tuple_field(1), point(1)),
+        ]));
+        let codomain = |g: TileGuard| TileGuard::Function(FunctionGuard::Codomain(Box::new(g)));
+        let domain = |p: Predicate| TileGuard::Function(FunctionGuard::Domain(p));
+        let guard = codomain(domain(Predicate::qualified(pair, point(5))));
+        let (mut uncurry, pulled) = paired_groups_of_collections();
+        uncurry.get(guard.clone());
+        assert_eq!(
+            *pulled.borrow(),
+            [codomain(codomain(domain(Predicate::qualified(
+                Predicate::qualified(point(2), point(1)),
+                point(5),
+            ))))]
+        );
+        assert_conforms(|| Box::new(paired_groups_of_collections().0), guard);
     }
 
     /// A morsel of pairs headed by groups 1 and 3 reads those groups of the grouping alone, and
