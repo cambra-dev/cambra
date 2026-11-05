@@ -254,6 +254,21 @@ impl Queue {
         true
     }
 
+    /// Append `guard` as one package whatever was appended before, and answer whether the queue
+    /// was open to take it: a loop's round reads its row again, the row's end with its rows, in a
+    /// run that no seal ends ([`Dispatcher::without_seals`]), where every round shares one queue.
+    fn append_again(&self, guard: &TileGuard) -> bool {
+        let Some(index) = self.reserve(1) else {
+            return false;
+        };
+        grow(
+            &mut self.region.lock().unwrap_or_else(PoisonError::into_inner),
+            guard,
+        );
+        self.write(index, guard.clone());
+        true
+    }
+
     /// Reserve `count` indices while the queue is open, and answer the first; `None` once it is
     /// closed.
     fn reserve(&self, count: usize) -> Option<usize> {
@@ -660,12 +675,38 @@ impl Dispatcher {
         self.window = Self::slots(epochs, &self.infos);
     }
 
+    /// The count of the dispatcher's changes so far ([`Generation`]): an equal count read twice
+    /// says nothing was queued, consumed or finished between.
+    pub(crate) fn changes(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
     /// Run as one epoch that no seal ends: a pipeline finishes once, when its queue is closed for
     /// good, every package in it is acknowledged and every pipeline it reads has finished, and
     /// that finish is its last. A pipeline's readers learn what it decides from its pushes after
     /// each consume, and a seal is refused.
+    ///
+    /// A pipeline that follows another ([`follow`](Self::follow)) takes a package once the pipeline
+    /// it follows is quiescent instead of once it has finished, since it finishes only once
+    /// ([`quiescent`](Self::quiescent)).
     pub fn without_seals(&mut self) {
         self.unsealed = true;
+    }
+
+    /// Whether `pipeline` has consumed every package queued for it, and every pipeline it reads is
+    /// quiescent too: nothing it reads can bring it more until a pipeline outside what it reads
+    /// queues something. A row it parks waits for a decision no consume of the round makes. A
+    /// loop's rounds run on one thread, so a round's pipelines are quiescent once the round has
+    /// run all it queued.
+    fn quiescent(&self, pipeline: usize, epoch: &EpochState) -> bool {
+        let state = &epoch.pipelines[pipeline];
+        let reserved = state.queue.reserved();
+        state.claimed.load(Ordering::Acquire) == reserved
+            && state.acknowledged.load(Ordering::Acquire) == reserved
+            && self.infos[pipeline]
+                .reads
+                .iter()
+                .all(|&read| self.quiescent(read, epoch))
     }
 
     /// Queue `guard`, a guard of the input of `reader`'s breaker, as a package of `reader` in the
@@ -700,7 +741,11 @@ impl Dispatcher {
             self.advance();
             return;
         }
-        let appended = epoch.pipelines[reader.0].queue.append_unqueued(guard);
+        let queue = &epoch.pipelines[reader.0].queue;
+        let appended = match round && self.unsealed {
+            true => queue.append_again(guard),
+            false => queue.append_unqueued(guard),
+        };
         assert!(
             appended,
             "pipeline {} takes packages before the last pipeline it reads finishes",
@@ -933,7 +978,11 @@ impl Dispatcher {
         if decided.is_empty() {
             return;
         }
-        let appended = epoch.pipelines[reader].queue.append_unqueued(&decided);
+        let queue = &epoch.pipelines[reader].queue;
+        let appended = match again && self.unsealed {
+            true => queue.append_again(&decided),
+            false => queue.append_unqueued(&decided),
+        };
         self.ensure(appended, || {
             format!(
                 "pipeline {reader} receives packages before the last pipeline it reads finishes"
@@ -946,7 +995,7 @@ impl Dispatcher {
     /// counts its finish toward `reader`'s close, and a range's lands in the current epoch before
     /// its seal, so `reader`'s queue in `epoch` is open.
     fn release_parked(&self, epoch: &EpochState, reader: usize) {
-        let released: Vec<TileGuard> = {
+        let released: Vec<(TileGuard, bool)> = {
             let mut parked = self.states[reader]
                 .parked
                 .lock()
@@ -964,7 +1013,7 @@ impl Dispatcher {
                 };
                 let rest = guard_minus(&morsel.guard, &part);
                 if !part.is_empty() {
-                    released.push(part);
+                    released.push((part, !morsel.splits));
                 }
                 if !rest.is_empty() {
                     kept.push(Parked {
@@ -988,9 +1037,17 @@ impl Dispatcher {
                 self.states[reader]
                     .queued
                     .fetch_add(released.len(), Ordering::AcqRel);
-                queue.append(reader, &released)
+                let morsels: Vec<TileGuard> =
+                    released.into_iter().map(|(morsel, _)| morsel).collect();
+                queue.append(reader, &morsels)
             }
-            false => released.iter().all(|morsel| queue.append_unqueued(morsel)),
+            // A round's row is read again whole in a run that no seal ends ([`Parked`]).
+            false => released
+                .iter()
+                .all(|(morsel, again)| match *again && self.unsealed {
+                    true => queue.append_again(morsel),
+                    false => queue.append_unqueued(morsel),
+                }),
         };
         self.ensure(appended, || {
             format!(
@@ -1126,6 +1183,12 @@ impl Dispatcher {
     /// Whether a claim may take `pipeline`'s packages in `epoch`: once every pipeline it follows
     /// ([`follow`](Self::follow)) has finished the epoch.
     fn takes_from(&self, pipeline: usize, epoch: &EpochState) -> bool {
+        if self.unsealed {
+            return self.infos[pipeline]
+                .follows
+                .iter()
+                .all(|&read| self.quiescent(read, epoch));
+        }
         self.infos[pipeline]
             .follows
             .iter()

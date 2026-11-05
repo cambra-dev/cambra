@@ -80,7 +80,7 @@ impl LoopScope {
             // dispatcher, so no inner pipeline is live.
             // A store inside a scope is a nested loop's, whose scope is one pipeline, so no two
             // inner pipelines share a breaker's pushes.
-            let (inner, planned) = plan_edges(
+            let (mut inner, planned) = plan_edges(
                 &reads,
                 &names,
                 &leaves,
@@ -105,6 +105,8 @@ impl LoopScope {
                 .map(|(at, _)| kept[at])
                 .collect();
             if whole.is_empty() {
+                // A round is no epoch: the rounds share one, which no seal ends (`run_round`).
+                inner.without_seals();
                 break (inner, planned, reads);
             }
             kept.retain(|pipeline| !whole.contains(pipeline));
@@ -307,6 +309,25 @@ impl LoopScope {
         }
     }
 
+    /// Run the round queued. No finish ends a round, so each inner pipeline pushes what it has
+    /// decided and no push named, and the inner dispatcher runs until nothing is claimable, again
+    /// until a pass changes nothing: a pipeline the round queues nothing, as the drive in a closing
+    /// round, states there what it read past, and a breaker that pushes only at a finish, as
+    /// `MapAggregate`, hands its readers the round's groups.
+    fn run_round(&self) {
+        let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
+            reach_member(&self.store, &self.members[pipeline.0], pipeline, call)
+        };
+        loop {
+            let before = self.inner.changes();
+            push_held(&self.inner, &mut reach);
+            self.run_inner();
+            if self.inner.changes() == before {
+                return;
+            }
+        }
+    }
+
     /// One round: have the operators inside the cycle read again, queue the position's path for
     /// every pipeline the round starts, seal the epoch, run it, and step the store at the
     /// position. The store's last step pulled the operators in pull mode inside the cycle, before
@@ -409,12 +430,7 @@ impl LoopScope {
                 self.inner.queue_round(reader, &row);
             }
         }
-        // A blocking seal would wait for a retirement only this thread makes.
-        assert!(
-            self.inner.try_seal(),
-            "the round before {guard:?} finished every inner pipeline's epoch"
-        );
-        self.run_inner();
+        self.run_round();
         self.with_store(|store| {
             store.consume_impl(InputId::ONLY, guard.clone());
             // The round's pipelines ran before the step, so the store's input releases the
