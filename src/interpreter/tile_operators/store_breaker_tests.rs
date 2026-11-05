@@ -128,15 +128,15 @@ fn writer(k: usize) -> usize {
     k + 1
 }
 
-/// An induction store short of terminal holds nothing, since a reader pulls its tile whole, but
-/// states decided the positions it has stepped: its decided region grows a position a step.
+/// An induction store short of terminal holds the positions it has stepped, its decided region,
+/// which grows a position a step.
 #[test]
 fn an_induction_store_decides_each_position_it_steps() {
     let compiled = Compiled::of(SUM);
     let decided = || compiled.breaker(|store| (store.held(), store.decided()));
     compiled.breaker(|store| store.consume_impl(InputId::ONLY, keys_between(0, 0)));
     let (held, after_one) = decided();
-    assert!(held.is_empty(), "{held:?}");
+    assert_eq!(held, after_one);
     compiled.breaker(|store| store.consume_impl(InputId::ONLY, keys_between(1, 1)));
     let (_, after_two) = decided();
     assert!(

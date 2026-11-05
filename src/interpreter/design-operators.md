@@ -992,23 +992,25 @@ a step that changes neither the store nor its input's release panics, and so doe
 terminal at the run's last epoch. A transaction's deny commits nothing and progresses through its
 source's release alone.
 
-An induction store holds everything once it is terminal and nothing before, since a reader pulls the
-store tile, which `restrict_to` cannot cut to part of its positions, and it pushes once, at the
-finish where it is terminal (`pushes_while_consuming` answers `false`). A transaction store holds
-the commit ticks it has decided, through its watermark (`store_frontier`), and everything once it is
-terminal, and it pushes the ticks each consume decides (`pushes_while_consuming` answers `true`). A
-store pushes to its reader slots and not its recurrence slots (`FanOutInput::push`), and every
-reader pulls the store whole. `StoreValueStream`, a reader of a transaction store's changelog, keeps
-the store's keys and cuts its answer to the ticks a pull names, so a feed inside a transaction takes
-the ticks as they are decided; any other reader widens the push, so its pipeline takes a package of
-the store only once the store's pipeline has finished the epoch ([The dispatcher](#the-dispatcher)),
-or, over a live source, once every epoch has run. A store's `final_guard` is `held()`. A release of
-a store with no rows above it names the positions a reader reads no more and removes nothing from
-the store tile; a nested store's offer cuts the rows its readers released ([A loop in
-rounds](#a-loop-in-rounds)). A consuming store answers a pull from its snapshot. Its first
-consume opens it, and a pull before that answers the unopened store, which states nothing final.
-It steps only at its pipeline's consumes, or its scope's. A transaction store's writers decide only
-against a tile it published. In pull mode a store steps itself at a pull.
+An induction store with no rows above it holds the positions it has run and decided, its decided
+region (`Tile::to_guard`), and everything once it is terminal, so its loop's scope pushes them at
+each finish and a feed read from the store streams. A store that resumed its predecessor's run holds
+none of the positions through `resumed_after`, which its consumers took from the predecessor. A
+nested store, and one over a concatenation's tagged positions, whose prefix has no spelling without
+the domain's tags, holds nothing short of terminal (`pushes_decided_positions`). A transaction store
+holds the commit ticks it has decided, through its watermark (`store_frontier`), and everything once
+it is terminal, and it pushes the ticks each consume decides (`pushes_while_consuming` answers
+`true`). A store pushes to its reader slots and not its recurrence slots (`FanOutInput::push`).
+`StoreValueStream`, a reader of a transaction store's changelog, keeps the store's keys and cuts its
+answer to the ticks a pull names, so a feed inside a transaction takes the ticks as they are
+decided. `StoreDenseRead` answers every decided position its reader has not released. A store's
+`final_guard` is `held()`. A release of a store with no rows above it names the positions a reader
+reads no more and removes nothing from the store tile; a nested store's offer cuts the rows its
+readers released ([A loop in rounds](#a-loop-in-rounds)). A consuming store answers a pull from its
+snapshot. Its first consume opens it, and a pull before that answers the unopened store, which
+states nothing final. It steps only at its pipeline's consumes, or its scope's. A transaction
+store's writers decide only against a tile it published. In pull mode a store steps itself at a
+pull.
 
 In pull mode an induction store releases its body whole once the body is terminal and every decision
 is stepped, and a transaction drive releases its source whole once it is done. A nested induction
@@ -1339,13 +1341,13 @@ live source at the `main` output is notified of each delivery's keys. The pipeli
 epoch, at the pipeline's finish of it: the answers of the epoch's packages merged with a pull of the
 producer at the universal guard. That pull states what the producer states complete and adds no key,
 since the epoch's packages consumed all the producer holds. Where the output reads a loop's scope,
-whose store pushes once it is terminal, the pull also answers the rows the loop's rounds have
-written, each final as it is written (`SinkBreaker::reads_a_loop`). The answer is the one a pull in
-pull mode makes once the epoch's arrivals have reached it. The pipeline is ordered
-(`Dispatcher::order`), so it consumes an epoch's packages after its finish of the epoch before. The
-run's last finish answers a terminal tile, as pull mode's last pull does. `run_program` passes a
-`DataSink` that merges the answers (`Collected`) and answers the merged tile (`Run::main`). The
-driver holds the producer, released whole, once the run returns.
+the pull also answers the rows the loop's rounds have written, each final as it is written
+(`SinkBreaker::reads_a_loop`). The answer is the one a pull in pull mode makes once the epoch's
+arrivals have reached it. The pipeline is ordered (`Dispatcher::order`), so it consumes an epoch's
+packages after its finish of the epoch before. The run's last finish answers a terminal tile, as
+pull mode's last pull does. `run_program` passes a `DataSink` that merges the answers (`Collected`)
+and answers the merged tile (`Run::main`). The driver holds the producer, released whole, once the
+run returns.
 
 The run pulls only the breakers' inputs. The program is compiled with
 `GlobalContext::defer_sink_pulls`, which leaves out the pull each sink takes once subscribed, and
@@ -1537,10 +1539,11 @@ The range over `[10, 20]` pushes the universal guard at the start, and `a` pushe
 in epoch 0, so `a` is final there and the loop steps per delivery of `source1`, with no record of
 which pipelines have closed.
 
-A breaker states its decided region in `BreakingProducer::decided`, which is its held region but
-for the induction store: the transaction store its positions through its watermark, a memo, a map
-aggregate and an induction drive their tiles' `to_guard`, and an aggregate or an extraction
-everything once it is final. An induction store holds nothing until it is terminal
+A breaker states its decided region in `BreakingProducer::decided`, which is its held region but for
+a nested induction store and one over tagged positions: the transaction store its positions through
+its watermark, a memo, a map aggregate and an induction drive their tiles' `to_guard`, and an
+aggregate or an extraction everything once it is final. A flat induction store holds what it decides
+([A store as a breaker](#a-store-as-a-breaker)). A nested one holds nothing until it is terminal
 (`BreakerState::held`), since a reader pulls its tile whole, but decides its positions one at a
 time: its decided region is its tile's statement, the positions it has stepped, row by row under
 rows, so a reader of one row of a store per row waits for that row alone.
