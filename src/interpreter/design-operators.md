@@ -1386,14 +1386,9 @@ in one of four ways (`LivePipeline::poll`):
 
 A scope or a store that also reads pipelines takes each delivery once those pipelines have
 finished the epoch (`Dispatcher::take_arrivals_after_reads`, `Dispatcher::follow`), and keeps no
-open rows. A pipeline that reads a live source, reads its input whole (`Dispatcher::read_whole`), or
-reads such a pipeline is final only in the run's last epoch. A scope or a store that reads one is
-notified of its whole input once every live source of the run yields everything (`Notifies::Whole`,
-`LivePipeline::waits`): its rounds and steps pull what it reads, which an earlier epoch leaves
-partial. A static pipeline read whole is in that set, so a loop or a transaction over a live source
-that reads one, such as the final value of a transaction store over a list, takes no delivery until
-every live source yields everything, and over a source that never yields everything it never
-steps.
+open rows. Where one of those pipelines is final only once some live source yields everything, the
+scope or the store holds its deliveries until then
+([Holding arrivals until a read is final](#holding-arrivals-until-a-read-is-final)).
 
 A drive and a transaction store decide positions in order, and a debug build checks that a delivery
 adds positions after every one before it. A dispatched run delivers no notification: a loop's scope
@@ -1428,6 +1423,31 @@ bound or stdin taken, which a second compile could not open again.
 
 The differential suites compare a dispatched run at morsels of one row with one at morsels of every
 row (`tests/support/differential.rs`).
+
+#### Holding arrivals until a read is final
+
+A pipeline is final once every live pipeline beneath it has closed and it has finished the epoch of
+the last close. A pipeline that reads its input whole (`Dispatcher::read_whole`) reads that input in
+the run's last epoch, so it is final only once every live pipeline of the run has closed. The
+planner records, per pipeline, the live pipelines whose close it waits for in this sense.
+
+A loop's scope or a transaction store steps on the pipelines it reads by pull, and a step that pulls
+a pipeline not yet final reads a partial answer: a seed `sum(source1())` before `source1` yields
+everything opens the store at a wrong value. Where such a scope or store is notified per delivery
+(`Notifies::Rounds`, `Notifies::Items`), it holds its arrivals on the live pipelines those reads wait
+for (`Dispatcher::hold`). A notify of it before the last of them closes keeps its morsels outside
+every epoch, so each epoch before then finishes without them, and the pipelines that read the scope
+or store finish it too. The close of the last of them appends the held morsels to the scope's or
+store's queue in that close's epoch. The scope or store follows the pipelines it reads, so it takes
+them once those have finished that epoch, final. From then on each delivery is queued as it arrives.
+
+The held morsels are guards of the scope's or store's input, not rows: the rows stay in the live
+source, which releases none of them until the scope or store consumes them. Over a seed whose sources
+never yield everything, the scope or store never steps, and its source keeps every row it delivered.
+
+A scope or store notified of its whole input (`Notifies::Whole`) that reads such a pipeline, as a
+transaction whose writer reads a concatenation with the live source, is notified once every live
+source of the run yields everything (`LivePipeline::waits`), in the run's last epoch.
 
 #### Reading rows again
 

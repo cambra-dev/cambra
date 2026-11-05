@@ -333,18 +333,31 @@ fn run_targets(
         &mut reach,
         &mut end_of,
     );
-    // Whether each pipeline is final only in the run's last epoch: it reads a live source, reads
-    // its input whole, or reads such a pipeline, which is numbered before it.
-    let mut final_last = Vec::with_capacity(members.live.len());
+    // Per pipeline, the live pipelines whose close it is final only after: itself where it reads
+    // a live source, every live pipeline where it reads its input whole (it reads that in the run's
+    // last epoch), and those of each pipeline it reads, which is numbered before it.
+    let every_live: Vec<usize> = (0..members.live.len())
+        .filter(|&pipeline| !members.live[pipeline].is_empty())
+        .collect();
+    let mut final_after: Vec<Vec<usize>> = Vec::with_capacity(members.live.len());
     for (pipeline, leaves) in members.live.iter().enumerate() {
         debug_assert!(
             members.reads[pipeline].iter().all(|&read| read < pipeline),
             "a pipeline reads only pipelines numbered before it"
         );
-        let last = !leaves.is_empty()
-            || planned[pipeline].whole
-            || members.reads[pipeline].iter().any(|&read| final_last[read]);
-        final_last.push(last);
+        let mut after = match planned[pipeline].whole {
+            true => every_live.clone(),
+            false => Vec::new(),
+        };
+        if !leaves.is_empty() {
+            after.push(pipeline);
+        }
+        for &read in &members.reads[pipeline] {
+            after.extend(final_after[read].iter().copied());
+        }
+        after.sort_unstable();
+        after.dedup();
+        final_after.push(after);
     }
     // A `main` output's breaker merges an epoch's answers until the epoch's finish
     // (`SinkBreaker::per_epoch`), so its pipeline consumes one epoch at a time.
@@ -371,18 +384,27 @@ fn run_targets(
             input = Some(breaker.input_tiling(at))
         });
         let input = input.expect("a reach calls the breaker it reaches");
-        // A store or a loop's scope reading a pipeline that is final only in the run's last epoch
-        // is notified of its whole input once every live source of the run yields everything, in
-        // that epoch: a round or a step reads that pipeline's whole answer, which an earlier epoch
-        // leaves partial. It takes no delivery before then, so over a source that never yields
-        // everything it never steps.
-        let reads_late = matches!(
+        // A store or a loop's scope steps on a pipeline it reads by pull, which an epoch before
+        // that pipeline's live sources close leaves partial. It holds its deliveries until they
+        // have closed (`Dispatcher::hold`), and takes each one as it arrives from then on.
+        let late: Vec<usize> = match matches!(
             members.located[pipeline],
             Located::Store { .. } | Located::Scope { .. }
-        ) && members.reads[pipeline].iter().any(|&read| final_last[read]);
+        ) {
+            true => {
+                let mut late: Vec<usize> = members.reads[pipeline]
+                    .iter()
+                    .flat_map(|&read| final_after[read].iter().copied())
+                    .collect();
+                late.sort_unstable();
+                late.dedup();
+                late
+            }
+            false => Vec::new(),
+        };
+        let reads_late = !late.is_empty();
         let mut starts: Vec<TileGuard> = Vec::new();
         let notifies = match (&members.located[pipeline], scopes[pipeline].as_ref()) {
-            (Located::Store { .. } | Located::Scope { .. }, _) if reads_late => Notifies::Whole,
             // A transaction store's input is its writer's source, read behind an entry no
             // planner places, so its items are a delivery's keys where the writer's source is
             // the source every range under the writer reads.
@@ -391,15 +413,20 @@ fn run_targets(
                     matches!(input.domain_extent(), Some(Extent::DataSourceDomain(items))
                         if Rc::ptr_eq(&items, &leaf.source))
                 };
-                if !leaves.iter().all(items_of) {
-                    unplace(&planner.placements, targets);
-                    return Err(Refused(format!(
-                        "{} reads a live source other than as its writer's source, whose items \
-                         no delivery of it names",
-                        members.names[pipeline]
-                    )));
+                // One that also reads a late pipeline takes its input whole instead, once every
+                // live source yields everything.
+                match (leaves.iter().all(items_of), reads_late) {
+                    (true, _) => Notifies::Items,
+                    (false, true) => Notifies::Whole,
+                    (false, false) => {
+                        unplace(&planner.placements, targets);
+                        return Err(Refused(format!(
+                            "{} reads a live source other than as its writer's source, whose \
+                             items no delivery of it names",
+                            members.names[pipeline]
+                        )));
+                    }
                 }
-                Notifies::Items
             }
             // A loop's scope runs a round per position the drive emits. Its drive's positions are
             // a delivery's keys where one key reaches the drive's entry as itself, over the
@@ -520,7 +547,18 @@ fn run_targets(
         };
         planned[pipeline].live = true;
         planned[pipeline].whole |= matches!(notifies, Notifies::Whole);
-        let waits = match reads_late {
+        // A pipeline notified of its whole input that reads a late pipeline is notified once
+        // every live source of the run yields everything, in the epoch that pipeline is final in.
+        // One notified per delivery holds the deliveries instead.
+        match notifies {
+            Notifies::Items | Notifies::Rounds if reads_late => {
+                let on: Vec<PipelineId> = late.iter().map(|&on| PipelineId(on)).collect();
+                dispatcher.hold(PipelineId(pipeline), &on);
+                planned[pipeline].held = true;
+            }
+            _ => {}
+        }
+        let waits = match reads_late && matches!(notifies, Notifies::Whole) {
             true => members
                 .live
                 .iter()
@@ -675,6 +713,7 @@ pub(super) fn plan_edges(
             rounds: Vec::new(),
             live: false,
             open: false,
+            held: false,
         })
         .collect();
     let mut starts = Vec::new();
@@ -891,6 +930,8 @@ pub struct Planned {
     pub live: bool,
     /// Whether it keeps open rows ([`Dispatcher::keep_open_rows`]).
     pub open: bool,
+    /// Whether it holds its arrivals until pipelines it reads are final ([`Dispatcher::hold`]).
+    pub held: bool,
 }
 
 /// The consumer `pipeline`'s breaker pushes to, and whether its output has keys of its own, which

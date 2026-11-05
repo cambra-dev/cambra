@@ -2894,9 +2894,9 @@ fn rendered_in_key_order(value: &Value) -> String {
 
 /// A loop or a transaction over a live source whose body or seed reads a pipeline: the scope or
 /// the store takes each delivery once the pipelines it reads have finished the epoch. Where one of
-/// them is final only in the run's last epoch, because it reads a live source or reads its input
-/// whole, the scope or the store reads its input whole in that epoch. `whole` says which does, per
-/// live scope or store in plan order.
+/// them is final only once a live source yields everything, the scope or the store holds its
+/// deliveries until then, or reads its input whole where it takes no delivery's keys. `plans`
+/// says how each live scope or store in plan order takes its deliveries.
 #[rstest_log::rstest]
 #[case::a_loop_reading_a_sum(indoc! {"
     out = test_sink()
@@ -2905,7 +2905,7 @@ fn rendered_in_key_order(value: &Value) -> String {
     for x in source1():
         total += x + sum(ys)
     out << total
-"}, Value::Int(30), &[false])]
+"}, Value::Int(30), &["follows"])]
 #[case::a_transaction_reading_a_sum(indoc! {"
     out = test_sink()
     ys = [1, 2]
@@ -2914,14 +2914,14 @@ fn rendered_in_key_order(value: &Value) -> String {
         with begin():
             pool := pool - x - sum(ys)
     out << await_final(pool)
-"}, Value::Int(70), &[false])]
+"}, Value::Int(70), &["follows"])]
 #[case::a_loop_seeded_from_a_sum(indoc! {"
     out = test_sink()
     last := sum([1, 2])
     for x in source1():
         last := x
     out << last
-"}, Value::Int(5), &[false])]
+"}, Value::Int(5), &["follows"])]
 #[case::a_transaction_seeded_from_a_sum(indoc! {"
     out = test_sink()
     pool: Mut(Int, Txn) := sum([60, 40])
@@ -2929,7 +2929,7 @@ fn rendered_in_key_order(value: &Value) -> String {
         with begin():
             pool := pool - x
     out << await_final(pool)
-"}, Value::Int(85), &[false])]
+"}, Value::Int(85), &["follows"])]
 #[case::two_loops_seeded_from_a_sum(indoc! {"
     out = test_sink()
     total := sum([1, 2])
@@ -2938,14 +2938,14 @@ fn rendered_in_key_order(value: &Value) -> String {
     for y in source1():
         total += y * 10
     out << total
-"}, Value::Int(168), &[false, true])]
+"}, Value::Int(168), &["follows", "held"])]
 #[case::a_loop_reading_a_sum_of_the_source(indoc! {"
     out = test_sink()
     total := 0
     for x in source1():
         total += x + sum(source1())
     out << total
-"}, Value::Int(90), &[true])]
+"}, Value::Int(90), &["held"])]
 #[case::a_loop_reading_a_sum_of_a_map_of_the_source(indoc! {"
     out = test_sink()
     ys = [y * 10 for y in source1()]
@@ -2953,7 +2953,7 @@ fn rendered_in_key_order(value: &Value) -> String {
     for x in source1():
         total += x + sum(ys)
     out << total
-"}, Value::Int(765), &[true])]
+"}, Value::Int(765), &["held"])]
 #[case::a_transaction_reading_a_sum_of_the_source(indoc! {"
     out = test_sink()
     pool: Mut(Int, Txn) := 100
@@ -2961,7 +2961,7 @@ fn rendered_in_key_order(value: &Value) -> String {
         with begin():
             pool := pool - sum(source1())
     out << await_final(pool)
-"}, Value::Int(25), &[true])]
+"}, Value::Int(25), &["held"])]
 #[case::a_transaction_seeded_from_a_sum_of_the_source(indoc! {"
     out = test_sink()
     pool: Mut(Int, Txn) := sum(source1())
@@ -2969,7 +2969,7 @@ fn rendered_in_key_order(value: &Value) -> String {
         with begin():
             pool := pool - x
     out << await_final(pool)
-"}, Value::Int(0), &[true])]
+"}, Value::Int(0), &["held"])]
 #[case::a_loop_seeded_from_a_transaction(indoc! {"
     out = test_sink()
     rs = [10, 20]
@@ -2981,7 +2981,7 @@ fn rendered_in_key_order(value: &Value) -> String {
     for x in source1():
         last := last + x
     out << last
-"}, Value::Int(85), &[true])]
+"}, Value::Int(85), &["held"])]
 #[case::two_writers_seeded_from_a_sum_of_the_source(indoc! {"
     out = test_sink()
     pool: Mut(Int, Txn) := sum(source1())
@@ -2992,7 +2992,7 @@ fn rendered_in_key_order(value: &Value) -> String {
         with begin():
             pool := pool - y
     out << await_final(pool)
-"}, Value::Int(-15), &[true, true])]
+"}, Value::Int(-15), &["held", "held"])]
 #[case::a_transaction_over_a_concatenation_seeded_from_a_sum_of_the_source(indoc! {"
     out = test_sink()
     pool: Mut(Int, Txn) := sum(source1())
@@ -3000,14 +3000,14 @@ fn rendered_in_key_order(value: &Value) -> String {
         with begin():
             pool := pool - r
     out << await_final(pool)
-"}, Value::Int(-5), &[true])]
+"}, Value::Int(-5), &["whole"])]
 #[case::a_loop_over_a_concatenation_reading_a_sum_of_the_source(indoc! {"
     out = test_sink()
     total := 0
     for r in [x for x in source1()] ++ [5]:
         total += r + sum(source1())
     out << total
-"}, Value::Int(110), &[true])]
+"}, Value::Int(110), &["whole"])]
 #[case::two_writers_one_reading_a_sum_of_the_source(indoc! {"
     out = test_sink()
     pool: Mut(Int, Txn) := 100
@@ -3018,7 +3018,7 @@ fn rendered_in_key_order(value: &Value) -> String {
         with begin():
             pool := pool - y
     out << await_final(pool)
-"}, Value::Int(10), &[true])]
+"}, Value::Int(10), &["held"])]
 #[case::a_writer_over_a_list_seeded_from_a_sum_of_the_source(indoc! {"
     out = test_sink()
     pool: Mut(Int, Txn) := sum(source1())
@@ -3030,7 +3030,7 @@ fn rendered_in_key_order(value: &Value) -> String {
 fn a_store_over_a_live_source_reading_a_pipeline(
     #[case] source: &str,
     #[case] expected: Value,
-    #[case] whole: &[bool],
+    #[case] plans: &[&str],
     #[values(1, usize::MAX)] rows: usize,
 ) {
     let (value, planned) = dispatched_live(source, rows, two_batches());
@@ -3040,9 +3040,16 @@ fn a_store_over_a_live_source_reading_a_pipeline(
         .filter(|plan| plan.live && !plan.follows.is_empty())
         .collect();
     assert_eq!(
-        following.iter().map(|plan| plan.whole).collect::<Vec<_>>(),
-        whole,
-        "which live store or scope reads its input whole: {planned:?}"
+        following
+            .iter()
+            .map(|plan| match (plan.whole, plan.held) {
+                (true, _) => "whole",
+                (false, true) => "held",
+                (false, false) => "follows",
+            })
+            .collect::<Vec<_>>(),
+        plans,
+        "how each live store or scope takes its deliveries: {planned:?}"
     );
 }
 
@@ -3201,5 +3208,84 @@ fn a_sum_over_a_live_source_at_main(
             .iter()
             .all(|plan| plan.live == plan.name.starts_with(live)),
         "the live source pipeline is the {live}'s alone: {planned:?}"
+    );
+}
+
+/// A transaction over a live source seeded from a sum of a second live source, which yields
+/// everything while the first is still delivering: the store holds the deliveries that arrive
+/// before the seed is final, takes them once the second source yields everything, and takes each
+/// later delivery as it arrives, before the first source yields everything.
+#[rstest_log::rstest]
+fn a_transaction_takes_each_delivery_once_its_seed_is_final(#[values(1, usize::MAX)] rows: usize) {
+    let source = indoc! {"
+        out = test_sink()
+        pool: Mut(Int, Txn) := sum(source2())
+        for x in source1():
+            with begin():
+                pool := pool + x
+        out << await_final(pool)
+    "};
+    let mut ctx = GlobalContext::default();
+    ctx.defer_sink_pulls();
+    let feed = |name: &str| {
+        std::rc::Rc::new(std::cell::RefCell::new(
+            crate::interpreter::TestDataSource::new(
+                name,
+                crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+                crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+            ),
+        ))
+    };
+    let (items, seed) = (feed("source1"), feed("source2"));
+    ctx.register_source(items.clone());
+    ctx.register_source(seed.clone());
+    let sink = ctx.register_test_sink("out");
+    let loaded = LoadedProgram::test(source);
+    let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    let _operators = ctx.take_operator_map();
+    let entries = |keys: std::ops::Range<u64>| {
+        keys.map(|key| (Value::UInt(key), Value::Int(key as i64 + 1)))
+            .collect::<Vec<_>>()
+    };
+    let up_to = |key: u64| crate::interpreter::Predicate::at_or_below(Value::UInt(key));
+    items.borrow_mut().add_data(&entries(0..2));
+    items.borrow_mut().set_yield_predicate(up_to(1));
+    seed.borrow_mut().add_data(&entries(0..2));
+    seed.borrow_mut().set_yield_predicate(up_to(1));
+    let mut idle = 0;
+    let mut released = Vec::new();
+    crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut || {
+        idle += 1;
+        released.push(items.borrow().get_released_predicate());
+        match idle {
+            1 => {
+                seed.borrow_mut().add_data(&entries(2..4));
+                seed.borrow_mut()
+                    .set_yield_predicate(crate::interpreter::Predicate::True);
+            }
+            2 => {
+                items.borrow_mut().add_data(&entries(2..4));
+                items.borrow_mut().set_yield_predicate(up_to(3));
+            }
+            3 => items
+                .borrow_mut()
+                .set_yield_predicate(crate::interpreter::Predicate::True),
+            _ => panic!("{source}: the run waits only for its three batches"),
+        }
+    })
+    .unwrap_or_else(|refused| panic!("{refused}"));
+    let written = sink
+        .value()
+        .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+    let [binding] = written.as_function().as_slice() else {
+        panic!("{source} writes one value: {written:?}")
+    };
+    assert_eq!(binding.output, Value::Int(10 + 10));
+    assert_eq!(
+        released,
+        [crate::interpreter::Predicate::False, up_to(1), up_to(3)],
+        "the store releases nothing while its seed is open, the held deliveries once it is \
+         final, and each later delivery as it arrives"
     );
 }

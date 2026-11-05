@@ -401,6 +401,9 @@ struct PipelineInfo {
     /// of one queues the rows it names fresh, though the pipeline takes arrivals
     /// ([`queue_pushes_of`](Dispatcher::queue_pushes_of)).
     pushed_rows: Vec<usize>,
+    /// The pipelines that take arrivals whose close its arrivals wait for: until the last of them
+    /// closes, a notify of it holds its morsels outside every epoch ([`hold`](Dispatcher::hold)).
+    holds: Vec<usize>,
 }
 
 /// What the dispatcher keeps of one pipeline across epochs.
@@ -424,6 +427,19 @@ struct PipelineState {
     // consume in flight, which its consumes, its finishes and the pushes to it read and write under
     // the lock; what crosses it is guards naming regions, never a tile.
     open: Mutex<OpenRows>,
+    /// For a pipeline that holds its arrivals ([`Dispatcher::hold`]), the morsels notified while
+    /// a pipeline it holds on is open, and whether the last of those has closed.
+    // shared-state-ok: guards naming regions of the pipeline's input, which its notifies and the
+    // close that releases them read and write under the lock; never a tile.
+    held: Mutex<Held>,
+}
+
+/// The arrivals a pipeline holds until the pipelines it holds on have closed
+/// ([`Dispatcher::hold`]).
+#[derive(Default)]
+struct Held {
+    morsels: Vec<TileGuard>,
+    released: bool,
 }
 
 /// What a pipeline that keeps open rows knows of the rows it consumed
@@ -557,6 +573,7 @@ impl Dispatcher {
                 arrivals: false,
                 keeps_open: false,
                 pushed_rows: Vec::new(),
+                holds: Vec::new(),
             })
             .collect();
         let states = (0..count)
@@ -567,6 +584,7 @@ impl Dispatcher {
                 acknowledged: AtomicUsize::new(0),
                 in_flight: AtomicBool::new(false),
                 open: Mutex::new(OpenRows::default()),
+                held: Mutex::new(Held::default()),
             })
             .collect();
         let window = Self::slots(DEFAULT_WINDOW, &infos);
@@ -726,6 +744,82 @@ impl Dispatcher {
     /// notified, sealed or closed already.
     pub fn take_arrivals_after_reads(&mut self, pipeline: PipelineId) {
         self.mark_arrivals(pipeline);
+    }
+
+    /// Hold `pipeline`'s arrivals until every pipeline of `on` has closed: a notify of it before
+    /// then keeps its morsels outside every epoch, and the close of the last of `on` appends them
+    /// to the pipeline's queue in that close's epoch. An epoch before then finishes without them,
+    /// so the pipelines that read `pipeline` move on. A loop's scope or a transaction store that
+    /// reads a pipeline final only once those sources yield everything takes each delivery so,
+    /// rather than all of them at the run's last epoch (`src/interpreter/design-operators.md`,
+    /// "Holding arrivals until a read is final").
+    ///
+    /// # Panics
+    ///
+    /// When `pipeline` keeps open rows, when `on` is empty, when a pipeline of `on` takes no
+    /// arrivals, and when a source has been notified, sealed or closed already.
+    pub fn hold(&mut self, pipeline: PipelineId, on: &[PipelineId]) {
+        let p = pipeline.0;
+        assert!(
+            self.current.load(Ordering::Acquire) == 0
+                && self.states.iter().all(|pipeline| {
+                    pipeline.queued.load(Ordering::Acquire) == 0
+                        && !pipeline.closed.load(Ordering::Acquire)
+                }),
+            "pipeline {p} holds its arrivals from before any notify, seal or close"
+        );
+        assert!(
+            !self.infos[p].keeps_open && !on.is_empty(),
+            "pipeline {p} holds its arrivals on some pipeline, and keeps no open rows"
+        );
+        for on in on {
+            assert!(
+                self.takes_arrivals(on.0),
+                "pipeline {p} holds its arrivals on pipeline {}, which takes arrivals and closes",
+                on.0
+            );
+            if !self.infos[p].holds.contains(&on.0) {
+                self.infos[p].holds.push(on.0);
+            }
+        }
+    }
+
+    /// Append to the queue in `epoch` of each pipeline whose holds `closed`'s close completes the
+    /// morsels it held ([`hold`](Self::hold)). Runs under the `sealing` lock, before the close
+    /// ends `closed`'s arrivals in `epoch`, so a pipeline holding on it has not finished `epoch`.
+    fn release_holds(&self, epoch: &EpochState, closed: usize) {
+        for (p, info) in self.infos.iter().enumerate() {
+            if !info.holds.contains(&closed)
+                || !info
+                    .holds
+                    .iter()
+                    .all(|&on| self.states[on].closed.load(Ordering::Acquire))
+            {
+                continue;
+            }
+            let morsels = {
+                let mut held = self.states[p]
+                    .held
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                held.released = true;
+                std::mem::take(&mut held.morsels)
+            };
+            if morsels.is_empty() {
+                continue;
+            }
+            self.states[p]
+                .queued
+                .fetch_add(morsels.len(), Ordering::AcqRel);
+            let appended = epoch.pipelines[p].queue.append(p, &morsels);
+            self.ensure(appended, || {
+                format!(
+                    "pipeline {p} has not finished epoch {} when the last pipeline it holds on \
+                     closes there",
+                    epoch.number
+                )
+            });
+        }
     }
 
     fn mark_arrivals(&mut self, pipeline: PipelineId) {
@@ -1321,6 +1415,13 @@ impl Dispatcher {
         let p = pipeline.0;
         self.ensure_source(pipeline);
         let state = self.state(pipeline);
+        if !self.infos[p].holds.is_empty() {
+            let mut held = state.held.lock().unwrap_or_else(PoisonError::into_inner);
+            if !held.released {
+                held.morsels.extend_from_slice(morsels);
+                return;
+            }
+        }
         // Counted before the append makes the packages claimable, so an acknowledgement never
         // runs ahead of the count `outstanding` subtracts it from.
         state.queued.fetch_add(morsels.len(), Ordering::AcqRel);
@@ -1432,12 +1533,11 @@ impl Dispatcher {
         {
             self.last.store(current, Ordering::Release);
         }
-        self.end_arrivals(
-            &self
-                .epoch(current)
-                .expect("the window holds the current epoch"),
-            p,
-        );
+        let epoch = self
+            .epoch(current)
+            .expect("the window holds the current epoch");
+        self.release_holds(&epoch, p);
+        self.end_arrivals(&epoch, p);
         self.advance();
     }
 
