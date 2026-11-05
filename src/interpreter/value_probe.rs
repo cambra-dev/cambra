@@ -1,7 +1,7 @@
 //! Probes: what each producer returned, rendered and bounded, for the live
 //! value pane.
 //!
-//! Every producer holds the [`ProbeSlot`] of the scheduler it was built under.
+//! Every producer holds the [`ProbeSlot`] of the subscribe context it was built under.
 //! While the slot holds a table, each producer's probe takes a [`Reading`] of
 //! each result
 //! [`TileProducer::get`](crate::interpreter::tile_operators::TileProducer::get)

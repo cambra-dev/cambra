@@ -71,8 +71,8 @@ It does not reuse the static lookups. A live read is `node → readings` and a s
 ### Probing follows the live route
 
 Probing is on while at least one client holds `/api/live` open, and off otherwise. The switch is all
-or nothing: every producer holds a clone of one `ProbeSlot`, taken from the `Scheduler` it was
-subscribed under, and the slot is filled or emptied to match `LiveChannel::is_watched`. While the
+or nothing: every producer holds a clone of one `ProbeSlot`, taken from the `SubscribeContext` it
+was subscribed under, and the slot is filled or emptied to match `LiveChannel::is_watched`. While the
 slot is empty a `get` costs one atomic load and no source window is sampled, so an unwatched
 `--inspect` run costs what a run without `--inspect` does.
 
@@ -125,7 +125,7 @@ span, the same source text under it and the same label (`resolveTag`). Any other
 edit above a construct shifts its bytes and an edit inside it changes its text.
 
 Only `main` is followed. Every branch's producers hold the same `ProbeSlot`, because every branch
-subscribes under the one `Scheduler`
+subscribes under the one `SubscribeContext`
 ([program-evolution.md](../ccl/design/program-evolution.md#the-branch-table)). An operator another
 branch built and `main` does not hold mints a `NodeId` the payload does not contain, so its entries
 arrive in every probe frame and match no pane node. Reloading another branch changes nothing the

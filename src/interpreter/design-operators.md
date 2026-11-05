@@ -475,12 +475,12 @@ enclosing decision's variant payload; the channel then flattens the two collecti
 ## The producer protocol
 
 A subscription connects one producer to one consumer. `TileOperator::subscribe` constructs
-that producer with an intent guard, a consumer notification handle and a scheduler.
+that producer with an intent guard, a consumer notification handle and a `SubscribeContext`.
 `FanOut` shares an input through separate slot producers; each slot still has one consumer.
 
 | Call | Contract |
 | --- | --- |
-| `subscribe(intent, consumer, scheduler)` | Establish the subscription for the requested region of the output tiling. |
+| `subscribe(intent, consumer, cx)` | Establish the subscription for the requested region of the output tiling. |
 | `Consumer::notify()` | Signal that the consumer should pull again. It carries no tile and does not count individual changes. |
 | `get(projection)` | Request the current tile for a projection. Tile values cross the edge only through this call. |
 | `release(obsolete)` | Permanently relinquish a region; see [The release contract](#the-release-contract). |
@@ -598,7 +598,7 @@ Each operator answers a projection as its row of this table states.
 ### Producer attribution and probes
 
 Each `subscribe` returns one producer attributed to the operator that constructs it.
-`ProducerBase::new` records the operator's `node_id` and the scheduler's `ProbeSlot`.
+`ProducerBase::new` records the operator's `node_id` and the subscribe context's `ProbeSlot`.
 Input producers are constructed by their own operators' subscriptions.
 
 Probe keys are `(node_id, producer_id)`. `alloc_id` counts by producer display name, so two

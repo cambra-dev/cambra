@@ -6,8 +6,8 @@ use crate::interpreter::operator_graph::value;
 use crate::interpreter::{FieldPath, tuple_field};
 use crate::{
     interpreter::{
-        ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, Projection, Scheduler, Value,
-        shared_consumer,
+        ColumnValue, Consumer, DataSourceDomainExtentImpl, Extent, Projection, SubscribeContext,
+        Value, shared_consumer,
     },
     pretty_graph::VizOptions,
     pretty_tree::InspectNode,
@@ -218,7 +218,7 @@ impl TileOperator for MapResult {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
         let values_are_keys = self
@@ -271,15 +271,18 @@ impl TileOperator for MapResult {
             );
         }
         let function_producer = match looked_up_at_keys {
-            Some(at) => self.function.subscribe(
-                self.function.tiling().universal_guard(),
-                crate::interpreter::scheduler::restating_lookup(
-                    Box::new(move |region| keys_looked_up(region, at)),
-                    forwarding_consumer_keeping_keys(&shared, &scheduler.wakeup_queue()),
-                ),
-                scheduler,
-            ),
-            None => subscribe_forwarding(&mut *self.function, &shared, scheduler),
+            Some(at) => {
+                let wakeups = cx.scheduler().wakeup_queue();
+                self.function.subscribe(
+                    self.function.tiling().universal_guard(),
+                    crate::interpreter::scheduler::restating_lookup(
+                        Box::new(move |region| keys_looked_up(region, at)),
+                        forwarding_consumer_keeping_keys(&shared, &wakeups),
+                    ),
+                    cx,
+                )
+            }
+            None => subscribe_forwarding(&mut *self.function, &shared, cx),
         };
         // The result's outermost keys are the input's where the function applies to the input's
         // values, one level in, so the input's region is the result's. Applied to the input
@@ -291,15 +294,10 @@ impl TileOperator for MapResult {
         let keeps_keys =
             self.level != CurryLevel::OUTERMOST && self.input.tiling().is_data_function();
         let input_producer =
-            subscribe_forwarding_keeping_keys_if(keeps_keys, &mut *self.input, &shared, scheduler);
+            subscribe_forwarding_keeping_keys_if(keeps_keys, &mut *self.input, &shared, cx);
         Box::new(MapResultProducer {
-            base: ProducerBase::new(
-                MapResultProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            )
-            .sharing(gate),
+            base: ProducerBase::new(MapResultProducer::alloc_id(), self.tiling(), &self.base, cx)
+                .sharing(gate),
             input: input_producer,
             function: function_producer,
             values_are_keys,
@@ -831,22 +829,22 @@ impl TileOperator for MapResultToConst {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
-        let constant_producer = subscribe_forwarding(&mut *self.constant, &shared, scheduler);
+        let constant_producer = subscribe_forwarding(&mut *self.constant, &shared, cx);
         // The constant is read whole, since every row reads all of it, so its notification
         // widens; the input is pulled at the projection.
         let keeps_keys =
             self.level != CurryLevel::OUTERMOST && self.input.tiling().is_data_function();
         let input_producer =
-            subscribe_forwarding_keeping_keys_if(keeps_keys, &mut *self.input, &shared, scheduler);
+            subscribe_forwarding_keeping_keys_if(keeps_keys, &mut *self.input, &shared, cx);
         Box::new(MapResultToConstProducer {
             base: ProducerBase::new(
                 MapResultToConstProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             )
             .sharing(gate),
             input: input_producer,
@@ -1164,18 +1162,18 @@ impl TileOperator for MapResultWithSource {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // The input is pulled at the projection, so its output keys are the input's.
-        let input =
-            self.input
-                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+        let input = self
+            .input
+            .subscribe(self.input.tiling().universal_guard(), consumer, cx);
         Box::new(MapResultWithSourceProducer::new(
             ProducerBase::new(
                 MapResultWithSourceProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             ),
             input,
             self.source.clone(),
@@ -1514,7 +1512,7 @@ mod nested_projection_tests {
             CurryLevel::new(1),
         );
         let guard = map.tiling().universal_guard();
-        let mut producer = map.subscribe(guard, Box::new(|| {}), &mut Scheduler::new());
+        let mut producer = map.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new());
         producer.get(paths_guard(Predicate::qualified(
             Predicate::point(Value::UInt(0)),
             Predicate::point(Value::UInt(1)),
@@ -2468,7 +2466,7 @@ mod projection_tests {
             let _producer = map.subscribe(
                 map.tiling().universal_guard(),
                 Box::new(log),
-                &mut Scheduler::new(),
+                &mut SubscribeContext::new(),
             );
             let operand = if through_input {
                 &input_consumer
@@ -2513,7 +2511,7 @@ mod projection_tests {
         let _producer = map.subscribe(
             map.tiling().universal_guard(),
             Box::new(log),
-            &mut Scheduler::new(),
+            &mut SubscribeContext::new(),
         );
         notify_input(
             &input_consumer,
@@ -2539,7 +2537,7 @@ mod projection_tests {
         let _producer = map.subscribe(
             map.tiling().universal_guard(),
             Box::new(log),
-            &mut Scheduler::new(),
+            &mut SubscribeContext::new(),
         );
         notify_input(
             &input_consumer,

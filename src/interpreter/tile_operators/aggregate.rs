@@ -8,7 +8,7 @@ use crate::interpreter::nest_levels;
 use crate::interpreter::operator_graph::value;
 use crate::{
     ccl::AggregateKind,
-    interpreter::{ColumnValue, Consumer, Projection, Scheduler, Value},
+    interpreter::{ColumnValue, Consumer, Projection, SubscribeContext, Value},
 };
 
 /// Folds a collection's values into one [`Tile::Aggregation`].
@@ -51,22 +51,15 @@ impl TileOperator for Aggregate {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let input = BreakerInput::new(consumer, self.input.tiling(), false, scheduler);
-        let input_producer = self.input.subscribe(
-            self.input.tiling().universal_guard(),
-            input.consumer,
-            scheduler,
-        );
+        let input = BreakerInput::new(consumer, self.input.tiling(), false, cx);
+        let input_producer =
+            self.input
+                .subscribe(self.input.tiling().universal_guard(), input.consumer, cx);
         Box::new(AggregateProducer::new(
-            ProducerBase::new(
-                AggregateProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            )
-            .breaking(input.downstream, input.placement),
+            ProducerBase::new(AggregateProducer::alloc_id(), self.tiling(), &self.base, cx)
+                .breaking(input.downstream, input.placement),
             input_producer,
         ))
     }
@@ -356,22 +349,19 @@ impl TileOperator for ExtractAggregate {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
-        let input = BreakerInput::new(consumer, self.input.tiling(), false, scheduler);
+        let input = BreakerInput::new(consumer, self.input.tiling(), false, cx);
         let mut producer = ExtractAggregateProducer::new(
             ProducerBase::new(
                 ExtractAggregateProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             )
             .breaking(input.downstream, input.placement),
-            self.input.subscribe(
-                self.input.tiling().universal_guard(),
-                input.consumer,
-                scheduler,
-            ),
+            self.input
+                .subscribe(self.input.tiling().universal_guard(), input.consumer, cx),
             self.kind,
         );
         producer.only_terminal = self.only_terminal;
@@ -591,18 +581,18 @@ impl TileOperator for MapExtractAggregate {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // The groups keep the input's outermost keys.
         let input_producer =
             self.input
-                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+                .subscribe(self.input.tiling().universal_guard(), consumer, cx);
         Box::new(MapExtractAggregateProducer {
             base: ProducerBase::new(
                 MapExtractAggregateProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             ),
             input: input_producer,
             kind: self.kind,
@@ -859,21 +849,19 @@ impl TileOperator for MapAggregate {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // The groups keep the input's outermost keys.
-        let input = BreakerInput::new(consumer, self.input.tiling(), true, scheduler);
-        let input_producer = self.input.subscribe(
-            self.input.tiling().universal_guard(),
-            input.consumer,
-            scheduler,
-        );
+        let input = BreakerInput::new(consumer, self.input.tiling(), true, cx);
+        let input_producer =
+            self.input
+                .subscribe(self.input.tiling().universal_guard(), input.consumer, cx);
         Box::new(MapAggregateProducer::new(
             ProducerBase::new(
                 MapAggregateProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             )
             .breaking(input.downstream, input.placement),
             input_producer,
@@ -1966,7 +1954,7 @@ mod aggregate_projection_tests {
     fn a_sum_over_a_union_folds_each_row_once_across_pulls() {
         use crate::interpreter::tile_operators::UnionOperator;
         use crate::interpreter::tile_operators::test_helpers::{ScriptedOp, int_column};
-        use crate::interpreter::{FunctionGuard, Predicate, Scheduler, Value};
+        use crate::interpreter::{FunctionGuard, Predicate, SubscribeContext, Value};
 
         let stream = Tiling::data_function(
             Extent::uint_range(8),
@@ -1985,12 +1973,8 @@ mod aggregate_projection_tests {
             Extent::Base(BaseType::Int),
         );
         let mut sum = Aggregate::new(Box::new(union), AggregateKind::Sum);
-        let mut scheduler = Scheduler::new();
-        let mut producer = sum.subscribe(
-            sum.tiling().universal_guard(),
-            Box::new(|| {}),
-            &mut scheduler,
-        );
+        let mut cx = SubscribeContext::new();
+        let mut producer = sum.subscribe(sum.tiling().universal_guard(), Box::new(|| {}), &mut cx);
         let total = |tile: Tile| {
             let Tile::Aggregation {
                 accumulator,
@@ -2205,7 +2189,7 @@ mod map_aggregate_nested_projection_tests {
         let subscribe = || {
             let mut op = MapAggregate::new(three_levels_of_ints(), AggregateKind::Sum);
             let guard = op.tiling().universal_guard();
-            op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new())
+            op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new())
         };
         let expected = subscribe().get(paths.clone());
         let mut input = three_levels_of_ints();
@@ -2213,7 +2197,7 @@ mod map_aggregate_nested_projection_tests {
         let out_tiling = fold_innermost(input.tiling(), AggregateKind::Sum);
         let mut consuming = MapAggregateProducer::new(
             ProducerBase::unowned(MapAggregateProducer::alloc_id(), &out_tiling),
-            input.subscribe(input_guard, Box::new(|| {}), &mut Scheduler::new()),
+            input.subscribe(input_guard, Box::new(|| {}), &mut SubscribeContext::new()),
             AggregateKind::Sum,
         );
         consuming.enter_consuming_mode();
@@ -2236,7 +2220,7 @@ mod map_aggregate_nested_projection_tests {
         let subscribe = || {
             let mut op = MapAggregate::new(three_levels_of_ints(), AggregateKind::Sum);
             let guard = op.tiling().universal_guard();
-            op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new())
+            op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new())
         };
         let expected = subscribe().get(path(1, 0));
         let mut sums = subscribe();
@@ -2298,7 +2282,7 @@ mod map_aggregate_nested_projection_tests {
             || {
                 let mut op = MapAggregate::new(four_levels_of_ints(), AggregateKind::Sum);
                 let guard = op.tiling().universal_guard();
-                op.subscribe(guard, Box::new(|| {}), &mut Scheduler::new())
+                op.subscribe(guard, Box::new(|| {}), &mut SubscribeContext::new())
             },
             CurryLevel::new(2).wrap_guard(TileGuard::Function(FunctionGuard::Domain(paths))),
         );

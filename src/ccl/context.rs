@@ -41,6 +41,7 @@ use crate::{
     },
     interpreter::{
         Consumer, DataSink, DataSourceDomainExtentImpl, Scheduler, StdinDataSource,
+        SubscribeContext,
         http_server::SharedHttpServer,
         operator_conversion::{
             ConversionError, OpConversionContext, OperatorMap, convert_outputs_to_operators,
@@ -968,8 +969,8 @@ pub struct GlobalContext {
     inference: TypeInferenceContext,
     /// Operator Conversion context.
     conversion: OpConversionContext,
-    /// Scheduler for triggering notifications.
-    scheduler: Scheduler,
+    /// What every `subscribe` records about the producers it builds, and pull mode's scheduler.
+    subscribe: SubscribeContext,
     /// The sources and sinks the program holds open, which outlive any one
     /// version of it.
     sources_and_sinks: SourceSinkRegistry,
@@ -989,7 +990,7 @@ impl GlobalContext {
             lowering: LoweringContext::default(),
             inference: TypeInferenceContext::new(),
             conversion: OpConversionContext::new(),
-            scheduler: Scheduler::new(),
+            subscribe: SubscribeContext::new(),
             sources_and_sinks: SourceSinkRegistry::default(),
             sink_pulls_deferred: false,
         };
@@ -1009,7 +1010,7 @@ impl GlobalContext {
             lowering,
             inference: TypeInferenceContext::new(),
             conversion: OpConversionContext::new(),
-            scheduler: Scheduler::new(),
+            subscribe: SubscribeContext::new(),
             sources_and_sinks: SourceSinkRegistry::default(),
             sink_pulls_deferred: false,
         }
@@ -1084,10 +1085,10 @@ impl GlobalContext {
     pub fn retire_routes_absent_from(&mut self, still_bound: &HashSet<String>) {
         let GlobalContext {
             sources_and_sinks,
-            scheduler,
+            subscribe,
             ..
         } = self;
-        sources_and_sinks.retire_routes_absent_from(still_bound, scheduler);
+        sources_and_sinks.retire_routes_absent_from(still_bound, subscribe.scheduler());
     }
 
     /// Install a fresh [`LoweringContext`] seeded from the source/sink registry,
@@ -1147,7 +1148,12 @@ impl GlobalContext {
     }
 
     pub fn scheduler(&mut self) -> &mut Scheduler {
-        &mut self.scheduler
+        self.subscribe.scheduler()
+    }
+
+    /// What every `subscribe` of this context's compilations records.
+    pub fn subscribe_context(&mut self) -> &mut SubscribeContext {
+        &mut self.subscribe
     }
 
     /// Pre-register a data source so that `name()` is a valid call during lowering.
@@ -3019,7 +3025,7 @@ fn compile_version(
     // running it can say which producers it holds. Opened before conversion in
     // case an operator subscribes while being built, and closed once every
     // output has subscribed.
-    ctx.scheduler().begin_source_producers();
+    ctx.subscribe_context().begin_source_producers();
     let per_field_ops = recorded(provenance_capture_enabled(), Phase::Convert, || {
         if sink_bindings_registry.is_empty() {
             convert_to_operators(&join_planned, ctx.conversion_ctx())
@@ -3030,7 +3036,7 @@ fn compile_version(
     })
     .map_err(|e| vec![e.into()])
     .inspect_err(|_| {
-        ctx.scheduler().end_source_producers();
+        ctx.subscribe_context().end_source_producers();
     })?;
     // Conversion is over, so what the retired version offered and this one did
     // not take is released here. Holding it any longer keeps the producers under
@@ -3061,7 +3067,7 @@ fn compile_version(
                 .expect("multiple `main` outputs in the program's trailing record");
             let (entry, placement) =
                 crate::interpreter::dispatcher::Entry::unplaced(op.tiling().clone(), main_consumer);
-            let producer = op.subscribe(universal, Box::new(entry), ctx.scheduler());
+            let producer = op.subscribe(universal, Box::new(entry), ctx.subscribe_context());
             debug!(
                 "Main producer:\n{}",
                 pretty_tile_producer_with(
@@ -3089,8 +3095,11 @@ fn compile_version(
             let (sink_consumer, producer_slot) =
                 SinkConsumer::new(sink, notifier, ctx.scheduler().sink_pull_queue());
             let consumer_rc = Rc::new(RefCell::new(sink_consumer));
-            let sink_producer =
-                op.subscribe(universal, Box::new(consumer_rc.clone()), ctx.scheduler());
+            let sink_producer = op.subscribe(
+                universal,
+                Box::new(consumer_rc.clone()),
+                ctx.subscribe_context(),
+            );
             debug!(
                 "Sink producer for {name}:\n{}",
                 pretty_tile_producer_with(
@@ -3120,8 +3129,11 @@ fn compile_version(
         }
     }
 
-    let source_producers: HashSet<String> =
-        ctx.scheduler().end_source_producers().into_iter().collect();
+    let source_producers: HashSet<String> = ctx
+        .subscribe_context()
+        .end_source_producers()
+        .into_iter()
+        .collect();
     let provenance_table = table_session.into_table();
 
     let program = CompiledProgram {
