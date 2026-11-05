@@ -1073,10 +1073,10 @@ impl BreakingProducer for InductionStoreProducer {
         self.held()
     }
 
-    /// The store pushes at each finish: its loop's scope consumes it a round at a time, and
-    /// pushes what it holds at the finish of the scope's epoch.
+    /// The store pushes after each round its loop's scope consumes: what it holds is decided
+    /// positions, or nothing short of terminal ([`held`](BreakingProducer::held)).
     fn pushes_while_consuming(&self) -> bool {
-        false
+        true
     }
 
     /// The snapshot of the last step. A nested store's readers release its rows as they finish

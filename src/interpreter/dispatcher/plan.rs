@@ -489,8 +489,10 @@ fn run_targets(
             dispatcher.opens_before(PipelineId(pipeline));
         }
     }
-    // A `main` output's breaker merges an epoch's answers until the epoch's finish
-    // (`SinkBreaker::per_epoch`), so its pipeline consumes one epoch at a time.
+    // The run is one epoch: each pipeline finishes once, when its input is complete, and its
+    // readers take what it decides from its pushes after each consume.
+    dispatcher.without_seals();
+    // A `main` output's pipeline consumes its packages in queue order.
     for ((_, _, entry), (pipeline, breaker)) in targets
         .iter()
         .zip(sink_pipelines.iter().zip(&sink_breakers))
@@ -686,6 +688,17 @@ fn run_targets(
     }
     for (reader, read) in reads_as_keys {
         dispatcher.queue_pushes_of(PipelineId(reader), PipelineId(read));
+    }
+    // Over a live source a `main` output hands each package's answer as it consumes it, since
+    // the run finishes it only once every source yields everything. A run with no live source
+    // finishes it once its input is whole, so it merges its packages' answers until then and
+    // hands one, as pull mode's one pull does.
+    if !live.is_empty() {
+        for ((_, _, entry), breaker) in targets.iter().zip(&sink_breakers) {
+            if let TargetEntry::Main(_) = entry {
+                breaker.borrow_mut().unsealed();
+            }
+        }
     }
     // The run drives every breaker it planned, so each takes its consuming mode here, before any
     // package, and keeps it for the run.
@@ -2269,7 +2282,10 @@ fn drive_live(
             dispatcher.start_source(PipelineId(pipeline), &input, &released);
         }
     }
-    let mut sealed_once = false;
+    // A run after a pause or a reload starts over breakers that hold what an earlier run consumed,
+    // and the run has no finish before its sources close, so each pushes what it holds first, as
+    // a compile's pull of each sink does in pull mode.
+    push_held(dispatcher, reach);
     loop {
         let mut sources: Vec<LiveSource> = Vec::new();
         for (leaf, _) in live.iter().flat_map(|at| &at.leaves) {
@@ -2281,21 +2297,9 @@ fn drive_live(
             source.borrow_mut().check_for_new_data();
         }
         observer.polled();
-        let first = std::mem::replace(&mut sealed_once, true);
         let mut changed = false;
         for at in live.iter_mut() {
             changed |= at.poll(dispatcher, reach);
-        }
-        // Each pass runs every epoch sealed before it to its finish, so the window holds the
-        // epoch a seal opens. The first pass seals whether or not a source yielded more: a run
-        // after a pause or a reload starts over breakers that hold what an earlier run consumed,
-        // and every breaker pushes what it holds at the finish of the run's first epoch, before
-        // any arrival, as a compile's pull of each sink does in pull mode.
-        if live.iter().any(|at| !at.closed) && (changed || first) {
-            assert!(
-                dispatcher.try_seal(),
-                "a live run's seal finds its window free: each pass finishes the epoch it sealed"
-            );
         }
         loop {
             match dispatcher.try_claim(None) {

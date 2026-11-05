@@ -2726,39 +2726,50 @@ fn one_key_batches_then_empty(batches: u64) -> Vec<Batch> {
     all
 }
 
-/// The `main` output is handed, one delivery at a time, the answers pull mode prints after each:
-/// a key the filter drops and a delivery of no key hand an answer the driver does not print, a
-/// sum is printed once its source is complete, and the last answer is terminal. A row that reads a
-/// sum is answered once the sum is final: a sum over a literal before the first delivery's rows,
-/// and a sum over the live source at the last delivery, whose epoch reads the earlier rows again
-/// after its own, so that case compares the answers in key order.
+/// The answers the `main` output is handed add up to what pull mode prints, in key order, and the
+/// last is terminal: a key the filter drops and a delivery of no key add nothing, a sum is handed
+/// once its source is complete, and a row that reads a sum is answered once the sum is final. The
+/// answers' boundaries are not compared: a run hands each package's answer as it consumes it,
+/// where pull mode prints one answer per pull.
 #[rstest_log::rstest]
-#[case::a_map("[x * 10 for x in source1()]", false)]
-#[case::a_filter_dropping_a_key("[x for x in source1() if x != 2]", false)]
-#[case::a_sum("sum(source1())", false)]
-#[case::a_filter_reading_a_sum("[x for x in source1() if sum([1, 2, 3]) > 5]", false)]
-#[case::a_map_reading_a_sum("[x + sum([1, 2]) for x in source1()]", false)]
-#[case::a_filter_reading_a_live_sum("[x for x in source1() if sum(source1()) > 2]", true)]
-fn the_main_output_prints_what_pull_mode_prints_per_delivery(
+#[case::a_map("[x * 10 for x in source1()]")]
+#[case::a_filter_dropping_a_key("[x for x in source1() if x != 2]")]
+#[case::a_sum("sum(source1())")]
+#[case::a_filter_reading_a_sum("[x for x in source1() if sum([1, 2, 3]) > 5]")]
+#[case::a_map_reading_a_sum("[x + sum([1, 2]) for x in source1()]")]
+#[case::a_filter_reading_a_live_sum("[x for x in source1() if sum(source1()) > 2]")]
+fn the_main_output_prints_what_pull_mode_prints(
     #[case] source: &str,
-    #[case] reads_again: bool,
     #[values(one_key_batches(3), one_key_batches_then_empty(3))] batches: Vec<Batch>,
     #[values(1, usize::MAX)] rows: usize,
 ) {
-    // An epoch that reads rows again merges them after its own, so where a case does, the answers
-    // are compared in key order.
-    let in_key_order = |answers: Vec<crate::interpreter::Tile>| -> Vec<_> {
-        match reads_again {
-            true => answers
-                .into_iter()
-                .map(crate::interpreter::sort_function_by_domain)
-                .collect(),
-            false => answers,
-        }
+    let merged = |answers: Vec<crate::interpreter::Tile>| {
+        answers
+            .into_iter()
+            .reduce(|mut merged, answer| {
+                merged.merge(answer);
+                merged
+            })
+            .map(crate::interpreter::sort_function_by_domain)
     };
     let pulled = pulled_live_main(source, batches.clone());
     let dispatched = dispatched_live_main(source, rows, batches);
-    assert_eq!(in_key_order(dispatched.printed), in_key_order(pulled));
+    assert!(
+        dispatched
+            .printed
+            .last()
+            .is_some_and(crate::interpreter::Tile::is_terminal)
+            || merged(dispatched.printed.clone()).is_some_and(|merged| merged.is_terminal()),
+        "{source}: the answers handed add up to a terminal one"
+    );
+    let value = |tile: Option<crate::interpreter::Tile>| {
+        tile.map(|tile| rendered_in_key_order(&super::helpers::materialized_row(tile)))
+    };
+    assert_eq!(
+        value(merged(dispatched.printed)),
+        value(merged(pulled)),
+        "{source}"
+    );
 }
 
 /// A map or a filter over a live source at the `main` output takes each delivery's keys as they

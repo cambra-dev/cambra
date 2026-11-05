@@ -515,6 +515,8 @@ pub struct Dispatcher {
     sealing: Mutex<()>,
     /// Set by [`Dispatcher::fail`], and by every refusal before it panics ([`Dispatcher::ensure`]).
     failed: AtomicBool,
+    /// Whether the run is one epoch that no seal ends ([`without_seals`](Self::without_seals)).
+    unsealed: bool,
     /// Advances at every change that can make a claim succeed or end the run: an append, a seal,
     /// a close, an acknowledgement that frees an ordered pipeline's next package, completes a
     /// queue or returns credit to a limited source, a finish, and a failure. It also advances when
@@ -614,6 +616,7 @@ impl Dispatcher {
             done: AtomicBool::new(false),
             sealing: Mutex::new(()),
             failed: AtomicBool::new(false),
+            unsealed: false,
             generation: AtomicU64::new(0),
             sleepers: AtomicUsize::new(0),
             sleep: Mutex::new(()),
@@ -655,6 +658,14 @@ impl Dispatcher {
             "a window is set before any notify, seal or close"
         );
         self.window = Self::slots(epochs, &self.infos);
+    }
+
+    /// Run as one epoch that no seal ends: a pipeline finishes once, when its queue is closed for
+    /// good, every package in it is acknowledged and every pipeline it reads has finished, and
+    /// that finish is its last. A pipeline's readers learn what it decides from its pushes after
+    /// each consume, and a seal is refused.
+    pub fn without_seals(&mut self) {
+        self.unsealed = true;
     }
 
     /// Queue `guard`, a guard of the input of `reader`'s breaker, as a package of `reader` in the
@@ -1489,6 +1500,9 @@ impl Dispatcher {
         if self.failed.load(Ordering::SeqCst) {
             return true;
         }
+        self.ensure(!self.unsealed, || {
+            "a run that no seal ends is sealed".to_string()
+        });
         let _sealing = self.sealing.lock().unwrap_or_else(PoisonError::into_inner);
         self.ensure(self.last.load(Ordering::Acquire) == UNKNOWN, || {
             "a seal opens an epoch while a source is open".to_string()
@@ -1652,7 +1666,9 @@ impl Dispatcher {
         state.phase.load() == Phase::Running
             && reserved & CLOSED != 0
             && state.acknowledged.load(Ordering::Acquire) == reserved & !CLOSED
-            && (epoch.number < self.current.load(Ordering::Acquire) || last != UNKNOWN)
+            && (self.unsealed
+                || epoch.number < self.current.load(Ordering::Acquire)
+                || last != UNKNOWN)
             && ((epoch.number != last && !self.infos[pipeline].ordered)
                 || epochs
                     .iter()
@@ -1695,7 +1711,7 @@ impl Dispatcher {
                         pipeline: PipelineId(p),
                         epoch: epoch.number,
                         consumed: epoch.pipelines[p].queue.region(),
-                        last: epoch.number == self.last.load(Ordering::Acquire),
+                        last: self.unsealed || epoch.number == self.last.load(Ordering::Acquire),
                     };
                 }
             }
@@ -2083,7 +2099,7 @@ impl Dispatcher {
         self.land_decided(&epoch, p, decided.as_ref(), pushes.to.as_ref());
         // At the run's last epoch every pipeline it reads has decided all of what it reaches
         // (the planner's end-of-run check), so nothing stays parked.
-        if epoch.number == self.last.load(Ordering::Acquire) {
+        if self.unsealed || epoch.number == self.last.load(Ordering::Acquire) {
             let parked = self.states[p]
                 .parked
                 .lock()
@@ -3070,18 +3086,38 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
             package.guard
         );
         breaker.consume_impl(input, package.guard.clone());
-        if let Some(producer) = breaker.as_producer()
-            && producer.pushes_while_consuming()
-        {
-            let mut pushes = dispatcher.pushes_in(package.pipeline, package.epoch);
-            pushes.push_final(producer);
-            landed = Some(pushes);
-        }
+        breaker.pushing(&mut |producer| {
+            if producer.pushes_while_consuming() {
+                let mut pushes = dispatcher.pushes_in(package.pipeline, package.epoch);
+                pushes.push_final(producer);
+                landed = Some(pushes);
+            }
+        });
     });
     if let Some(pushes) = landed {
         dispatcher.land(pushes);
     }
     dispatcher.acknowledge(package);
+}
+
+/// Have every pipeline push what its breaker holds and no push named before, as the start of a run
+/// over breakers an earlier run consumed into: a run after a pause or a reload. A run that no seal
+/// ends ([`Dispatcher::without_seals`]) has no finish before its sources close, so the start is
+/// where its readers learn what the breakers already hold.
+pub(crate) fn push_held(dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
+    for pipeline in 0..dispatcher.infos.len() {
+        let mut landed = None;
+        reach(PipelineId(pipeline), &mut |breaker, _| {
+            breaker.pushing(&mut |producer| {
+                let mut pushes = dispatcher.pushes_in(PipelineId(pipeline), 0);
+                pushes.push_final(producer);
+                landed = Some(pushes);
+            });
+        });
+        if let Some(pushes) = landed {
+            dispatcher.land(pushes);
+        }
+    }
 }
 
 /// Finish `pipeline`'s oldest unfinished epoch, after checking what a finish rests on.
@@ -3095,7 +3131,7 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
 /// ([`guard_minus`]).
 pub fn finish_epoch(dispatcher: &Dispatcher, breakers: &[BreakerHandle], pipeline: PipelineId) {
     let (epoch, consumed) = dispatcher.begin_finish(pipeline);
-    let last = epoch == dispatcher.last.load(Ordering::Acquire);
+    let last = dispatcher.unsealed || epoch == dispatcher.last.load(Ordering::Acquire);
     finish_with(
         dispatcher,
         &mut handles(breakers),

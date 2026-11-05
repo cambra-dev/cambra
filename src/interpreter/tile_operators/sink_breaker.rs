@@ -22,6 +22,11 @@ pub(crate) struct SinkBreaker {
     producer: ProducerSlot,
     sink: Arc<dyn DataSink>,
     hands: Hands,
+    /// Whether a `main` output hands each package's answer as it consumes it
+    /// ([`unsealed`](Self::unsealed)).
+    unsealed: bool,
+    /// Whether an answer handed so far was terminal.
+    handed_terminal: bool,
 }
 
 /// When a [`SinkBreaker`] hands its sink what it pulled.
@@ -54,6 +59,8 @@ impl SinkBreaker {
             producer,
             sink,
             hands: Hands::EachPackage,
+            unsealed: false,
+            handed_terminal: false,
         }
     }
 
@@ -68,7 +75,16 @@ impl SinkBreaker {
                 finished: None,
                 loop_beneath: false,
             },
+            unsealed: false,
+            handed_terminal: false,
         }
+    }
+
+    /// Have a `main` output hand each package's answer as it consumes it, and at its one finish
+    /// the answer that states it complete: a run over a live source finishes it only once every
+    /// source yields everything (`Dispatcher::without_seals`).
+    pub(crate) fn unsealed(&mut self) {
+        self.unsealed = true;
     }
 
     /// Record that this `main` output reads a loop's scope. The scope's store pushes once it is
@@ -107,6 +123,19 @@ impl Breaker for SinkBreaker {
         producer.release(tile.to_guard());
         match &mut self.hands {
             Hands::EachPackage => self.sink.process(&tile),
+            // A run that no seal ends finishes the output once, at its end, so each package's
+            // answer is handed as it is consumed.
+            Hands::EachEpoch { answer, .. } if self.unsealed => {
+                self.handed_terminal |= tile.is_terminal();
+                self.sink.process(&tile);
+                // Kept only for the check at the finish that the answers add up to a terminal one.
+                if cfg!(debug_assertions) {
+                    match answer {
+                        None => *answer = Some(Box::new(tile)),
+                        Some(answer) => answer.merge(tile),
+                    }
+                }
+            }
             Hands::EachEpoch { answer, .. } => match answer {
                 None => *answer = Some(Box::new(tile)),
                 Some(answer) => answer.merge(tile),
@@ -143,6 +172,22 @@ impl Breaker for SinkBreaker {
             "the pull at the finish of an epoch of a `main` output adds no key, unless it reads \
              a loop's scope, and then only keys the producer states complete: {rest:?}"
         );
+        if self.unsealed {
+            if cfg!(debug_assertions) {
+                let mut handed = epoch.take().map_or_else(|| rest.clone(), |answer| *answer);
+                handed.merge(rest.clone());
+                debug_assert!(
+                    !last || handed.is_terminal(),
+                    "the answers handed to a `main` output add up to a terminal one: {handed:?}"
+                );
+            }
+            // Handed even with no row where no answer handed before was terminal: it states the
+            // output complete, as after a delivery of no key or a key a filter drops.
+            if !self.handed_terminal {
+                self.sink.process(&rest);
+            }
+            return;
+        }
         let answer = match epoch.take() {
             None => rest,
             Some(mut answer) => {

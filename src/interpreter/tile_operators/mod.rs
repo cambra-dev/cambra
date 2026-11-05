@@ -1426,6 +1426,15 @@ pub trait Breaker {
     /// that answers `None` pushes nothing, after a consume or at a finish.
     fn as_producer(&self) -> Option<&dyn BreakingProducer>;
 
+    /// Hand `push` the producer whose decided region this breaker's pipeline pushes to the
+    /// pipelines that read it: the breaker itself where it is a producer, and nothing for a breaker
+    /// no pipeline reads. A loop's scope, which is no producer, hands its store.
+    fn pushing(&self, push: &mut dyn FnMut(&dyn BreakingProducer)) {
+        if let Some(producer) = self.as_producer() {
+            push(producer);
+        }
+    }
+
     /// How many inputs the breaker consumes, each the input of a pipeline of its own: one, but for
     /// a transaction store, which consumes one per writer.
     fn inputs(&self) -> usize {

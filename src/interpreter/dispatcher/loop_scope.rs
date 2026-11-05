@@ -574,6 +574,10 @@ impl Breaker for LoopScope {
         None
     }
 
+    fn pushing(&self, push: &mut dyn FnMut(&dyn BreakingProducer)) {
+        self.with_store(|store| push(&*store));
+    }
+
     /// Ends the rounds at the run's last epoch, then pushes the store where it is terminal.
     ///
     /// # Panics
