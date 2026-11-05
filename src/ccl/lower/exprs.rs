@@ -9,7 +9,6 @@ use crate::{
     ccl::{
         AggregateKind, ArithmeticKind, BaseType, BinOpKind, BindingTransparency, Builtin,
         CompareKind, Expr, Lit, LogicKind, Name, Refinement, Type, TypedExprNode, UnaryOpKind,
-        ccl_utils::{make_cast, refined_data_fun},
         uniquify,
     },
     chl_parser::ast::{
@@ -92,10 +91,9 @@ pub(super) fn lower_call(
 
     let builtin = SurfaceBuiltin::from_name(name);
     match builtin {
-        // groupby(c: I ⤇ A, key: A → K) lowers to a data function over this site's key
-        // domain — [`lower_groupby`] builds the shape and says why it has two layers. The
-        // key domain it returns is unused here, the surface call having no second position
-        // over the same keys.
+        // groupby(c: I ⤇ A, key: A → K) is a data function over this site's key domain,
+        // kept in surface form until the comprehension phase expands it
+        // (`crate::ccl::comprehension`'s `expand_group_by`, which says why it has two layers).
         Some(b @ SurfaceBuiltin::Groupby) => {
             if !b.arity().accepts(args.len()) {
                 return Err(LoweringError::unsupported(
@@ -104,12 +102,10 @@ pub(super) fn lower_call(
                 ));
             }
             let collection = lower_expr(&args[0], ctx)?;
-            let key_fn = lower_expr(&args[1], ctx)?;
-            let (keyed, _key_domain) = lower_groupby(collection, key_fn, func.span, ctx);
-            Ok(keyed)
+            let key = lower_expr(&args[1], ctx)?;
+            Ok(Expr::group_by(collection, key, None))
         }
-        // set(xs) is a re-keying constructor ([`lower_rekeyed`];
-        // `src/ccl/design/collections.md`, "Constructor lowering: runtime `groupby` now,
+        // set(xs) is a re-keying constructor (`src/ccl/design/collections.md`, "Constructor lowering: runtime `groupby` now,
         // constant-folding later"): group the elements by identity — so this site's key
         // domain is the distinct elements — then collapse every group to the trivial
         // `unit` codomain. The result is `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇
@@ -137,16 +133,15 @@ pub(super) fn lower_call(
                 func.span,
                 sc,
             );
-            Ok(lower_rekeyed(
-                elements,
-                id_key,
-                "__set_g",
-                |group, span, ctx| {
-                    ctx.tag_machinery(Expr::aggregate(group, AggregateKind::Drain), span, sc)
-                },
+            let group = ctx.tag_machinery(Expr::var("__set_g"), func.span, sc);
+            let drained =
+                ctx.tag_machinery(Expr::aggregate(group, AggregateKind::Drain), func.span, sc);
+            let collapse =
+                ctx.tag_machinery(Expr::lambda("__set_g", Type::Hole, drained), func.span, sc);
+            Ok(ctx.tag_machinery(
+                Expr::group_by(elements, id_key, Some(collapse)),
                 func.span,
                 sc,
-                ctx,
             ))
         }
         // map(kvs) is the other re-keying constructor: group the 2-tuples by their
@@ -179,19 +174,17 @@ pub(super) fn lower_call(
                 func.span,
                 sc,
             );
-            Ok(lower_rekeyed(
-                entries,
-                fst_key,
-                "__map_g",
-                |group, span, ctx| {
-                    let sole =
-                        ctx.tag_machinery(Expr::aggregate(group, AggregateKind::Sole), span, sc);
-                    let val_proj = ctx.tag_machinery(Expr::proj_index(1), span, sc);
-                    ctx.tag_machinery(Expr::apply(sole, val_proj), span, sc)
-                },
+            let group = ctx.tag_machinery(Expr::var("__map_g"), func.span, sc);
+            let sole =
+                ctx.tag_machinery(Expr::aggregate(group, AggregateKind::Sole), func.span, sc);
+            let val_proj = ctx.tag_machinery(Expr::proj_index(1), func.span, sc);
+            let value = ctx.tag_machinery(Expr::apply(sole, val_proj), func.span, sc);
+            let collapse =
+                ctx.tag_machinery(Expr::lambda("__map_g", Type::Hole, value), func.span, sc);
+            Ok(ctx.tag_machinery(
+                Expr::group_by(entries, fst_key, Some(collapse)),
                 func.span,
                 sc,
-                ctx,
             ))
         }
         Some(b @ (SurfaceBuiltin::Sum | SurfaceBuiltin::Max | SurfaceBuiltin::Min)) => {
@@ -547,137 +540,6 @@ impl MintedTerm {
     fn copy(&self) -> Expr {
         self.0.clone()
     }
-
-    /// The term itself, for its last placement.
-    fn into_inner(self) -> Expr {
-        self.0
-    }
-}
-
-/// Lower group-by and return its present-key domain for re-keying callers.
-/// Reuse the returned domain: it shares both the key-type hole and the predicate allocation.
-/// See `src/ccl/design/collections.md`, "`groupby`'s exact type".
-fn lower_groupby(
-    collection: Expr,
-    key_fn: Expr,
-    span: Span,
-    ctx: &mut LoweringContext,
-) -> (Expr, Type) {
-    // Both operands are placed in the key domain and in the partition.
-    let collection = MintedTerm::mint(collection);
-    let key_fn = MintedTerm::mint(key_fn);
-    let key_domain = {
-        let key = ctx.fresh_shared_hole();
-        present_key_domain(&collection, &key_fn, key, span, ctx)
-    };
-    // `bare_pred` (and the `collection` clone inside it) lives in the cast target's
-    // refinement predicate — a type slot outside the `walk_children` domain, swept by
-    // `tag_predicate` below because `collect_tree_ids` reaches refinement predicates and
-    // the lowering fold therefore has to explain them. The `collection` clone is what
-    // makes that load-bearing here: `Clone` freshens, so the clone does not alias an
-    // already-tagged main-tree id. Everything on the main tree below is recorded — an
-    // unrecorded lowering mint is a `Leak::Unrecorded` at the boundary.
-    let bare_pred = Expr::binop(
-        Expr::apply(
-            Expr::apply(Expr::var(Name::elem()), collection.copy()),
-            key_fn.into_inner(),
-        ),
-        BinOpKind::Compare(CompareKind::Equals),
-        Expr::var("__gb_k"),
-    );
-    let gb = "lower.groupby";
-    let inner_var = ctx.tag_machinery(Expr::var("__gb_i"), span, gb);
-    let inner_body = ctx.tag_machinery(Expr::apply(inner_var, collection.into_inner()), span, gb);
-    // The group is a **collection** — the members sharing one key — so the lambda under
-    // the cast carries the same `Data` stamp the outer function does. The cast target's
-    // `Data` alone is not enough: a cast re-views its value at the target's kind, so an
-    // unstamped lambda underneath is a second, contradictory answer about what this
-    // function is, and it is the one elimination reads when it point-frees the group.
-    let unrefined_inner = ctx.tag_machinery(
-        Expr::lambda("__gb_i", Type::Hole, inner_body)
-            .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
-        span,
-        gb,
-    );
-    ctx.tag_predicate(&bare_pred, span, "lower.groupby_key_pred");
-    let target_ty = refined_data_fun(
-        Type::Hole,
-        bare_pred,
-        Type::Hole,
-        crate::ccl::ty::FunKind::fresh_data(),
-    );
-    let inner = ctx.tag_machinery(make_cast(unrefined_inner, target_ty), span, gb);
-
-    // The function is a collection because the `data_fun` annotation says so, which
-    // `emit_node` stamps onto the function type `emit_lambda` builds — one already carrying
-    // this binder and its domain.
-    let keyed = ctx.tag_machinery(
-        Expr::lambda("__gb_k", key_domain.clone(), inner)
-            .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
-        span,
-        gb,
-    );
-    (keyed, key_domain)
-}
-
-/// Re-key elements and collapse each group without changing its present-key domain.
-/// `collapse` must consume the group so planning can assign its source an iteration site.
-/// The eta-expanded read keeps the dependent key binder scoped; bare composition would
-/// expose it in the collapse parameter. Both the domain and data-function stamps are required.
-/// See `src/ccl/design/collections.md`,
-/// "Constructor lowering: runtime `groupby` now, constant-folding later".
-fn lower_rekeyed(
-    elements: Expr,
-    key_fn: Expr,
-    group_binder: &'static str,
-    collapse: impl FnOnce(Expr, Span, &mut LoweringContext) -> Expr,
-    span: Span,
-    sc: &'static str,
-    ctx: &mut LoweringContext,
-) -> Expr {
-    let (keyed, key_domain) = lower_groupby(elements, key_fn, span, ctx);
-
-    let group_var = ctx.tag_machinery(Expr::var(group_binder), span, sc);
-    let collapsed = collapse(group_var, span, ctx);
-    let collapse_fn =
-        ctx.tag_machinery(Expr::lambda(group_binder, Type::Hole, collapsed), span, sc);
-
-    let idx_var = ctx.tag_machinery(Expr::var("__iter_record"), span, sc);
-    let read = ctx.tag_machinery(Expr::apply(idx_var, keyed), span, sc);
-    let iter_record = ctx.tag_machinery(Expr::apply(read, collapse_fn), span, sc);
-    ctx.tag_machinery(
-        Expr::lambda("__iter_record", key_domain, iter_record)
-            .with_user_annotation(Type::data_fun(Type::Hole, Type::Hole)),
-        span,
-        sc,
-    )
-}
-
-/// Construct the present-key refinement, sharing `key` between its base and the
-/// key morphism's codomain. The caller supplies a `SharedHole`; a one-way builtin bound
-/// would not equate the types. The result must be available during constraint emission.
-/// Without the shared hole, the base receives only a lower bound, admitting `Map(String, _)`
-/// over `Int` keys.
-/// See `src/ccl/design/collections.md`, "The key domain is the key morphism's image".
-fn present_key_domain(
-    collection: &MintedTerm,
-    key_fn: &MintedTerm,
-    key: Type,
-    span: Span,
-    ctx: &mut LoweringContext,
-) -> Type {
-    // The composition retains the collection's data domain. Its codomain must share the
-    // refinement base, not merely constrain that base through builtin application.
-    let morphism = Expr::compose(vec![collection.copy(), key_fn.copy()])
-        .with_user_annotation(Type::data_fun(Type::Hole, key.clone()));
-    let characteristic = Expr::apply(morphism, Expr::builtin(Builtin::CollectionContains));
-    // The domain's nodes are minted here and live in a type slot, outside the
-    // `walk_children` domain the lowering fold covers — so the fold cannot explain
-    // them and they reach the boundary as `Leak::Unrecorded`. Sweeping the predicate
-    // is what records them, exactly as the group predicate is swept in [`lower_groupby`].
-    let predicate = Expr::apply(Expr::var(Name::elem()), characteristic);
-    ctx.tag_predicate(&predicate, span, "lower.present_key_domain");
-    Type::refined_one(key, Refinement::born(Rc::new(predicate)))
 }
 
 /// Lower `target[index]!` as application and `target[index]` as checked lookup.
@@ -1189,27 +1051,26 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[rstest]
-    // Variable collection and inline key lambda. The outer binder's domain is
-    // membership in what the key morphism `xs ≫ key` produces, and the `data_fun`
-    // annotation on the lambda (not rendered here) is what makes it a collection.
-    #[case(
-        "groupby(xs, \\x -> x)",
-        "λ __gb_k : {_#0 | __elem ▷ ((xs ≫ (λ x → x)) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ (λ x → x) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
-    )]
-    // List literal collection with a more complex key
+    // Lowering keeps a group-by in surface form; the comprehension phase expands it
+    // (`crate::ccl::comprehension`'s tests pin the expansion).
+    #[case("groupby(xs, \\x -> x)", "groupby(xs, λ x → x)")]
     #[case(
         "groupby([1, 2, 3], \\x -> x // 2)",
-        "λ __gb_k : {_#0 | __elem ▷ (([1, 2, 3] ≫ (λ x → x // 2)) ▷ collection_contains)} → cast(({_ | __elem ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ [1, 2, 3])"
+        "groupby([1, 2, 3], λ x → x // 2)"
     )]
-    // Key is a variable reference (pre-defined function)
-    #[case(
-        "groupby(xs, key_fn)",
-        "λ __gb_k : {_#0 | __elem ▷ ((xs ≫ key_fn) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
-    )]
-    // Keyed aggregation
+    #[case("groupby(xs, key_fn)", "groupby(xs, key_fn)")]
     #[case(
         "[sum(x) for x in groupby(xs, key_fn)]",
-        "[Sum(x) for x in (λ __gb_k : {_#0 | __elem ▷ ((xs ≫ key_fn) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)) ▷ Iterable::elements]"
+        "[Sum(x) for x in groupby(xs, key_fn) ▷ Iterable::elements]"
+    )]
+    // `set` and `map` are group-bys whose groups collapse.
+    #[case(
+        "set(xs)",
+        "groupby(xs, λ __set_key → __set_key) ▷ map(λ __set_g → Drain(__set_g))"
+    )]
+    #[case(
+        "map(kvs)",
+        "groupby(kvs, λ __map_kv → __map_kv.0) ▷ map(λ __map_g → (Sole(__map_g)).1)"
     )]
     fn test_lower_groupby(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);

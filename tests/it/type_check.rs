@@ -2462,8 +2462,9 @@ fn test_copair_heterogeneous_rejected() {
 // domain itself is `{K | __elem ▷ (𝑚 ▷ collection_contains)}`, the present-key domain this group-by
 // mints, and which keys are present is a different fact from what type they are.
 //
-// The relation is **not** visible in `test_lower_groupby`'s snapshots, because
-// `symbolic` does not render annotations. These are the tests that cover it.
+// The relation is **not** visible in the expansion's snapshots
+// (`comprehension::tests::the_expansion`), because `symbolic` does not render
+// annotations. These are the tests that cover it.
 #[rstest]
 #[case("groupby([1, 2, 3], \\x -> x)", int())]
 #[case("groupby([(a=1, b=\"w\"), (a=2, b=\"e\")], \\r -> r.b)", string())]
@@ -2655,8 +2656,8 @@ fn set_infers_deduped_keyed_unit_collection() {
 /// `Σ (𝐷 : SubtypesOf(K)). 𝐷 ⤇ unit`, and entering a sum is a term — so the `box` is required
 /// and the annotation is then **kind containment**: this site's concrete key domain is
 /// one of the domains `SubtypesOf(K)` ranges over. That works only because the constructor
-/// stamps its own iteration binder with the present-key domain at lowering
-/// (`present_key_domain`): containment reads the domain's *shape*, and it runs at
+/// stamps its own iteration binder with the present-key domain before inference
+/// (`comprehension::present_key_domain`): containment reads the domain's *shape*, and it runs at
 /// constraint-emission time, so a key domain that only became concrete at coalesce would
 /// fall through to a mismatch. Regression guard for exactly that.
 #[test]
@@ -2686,7 +2687,7 @@ fn set_injects_into_nominal_set_annotation() {
 /// `map(kvs)` infers `{K | __elem ▷ (𝑚 ▷ collection_contains)} ⤇ V` — this site's key
 /// domain, each key mapped to its entry's second component. The key morphism is `.0`,
 /// where `set`'s is the identity, and that is the whole difference in the type: both
-/// constructors are one re-keying shape at two collapses ([`lower_rekeyed`]).
+/// constructors are one re-keying shape at two collapses (`comprehension::expand_group_by`).
 #[test]
 fn map_infers_a_key_domain_over_the_value() {
     assert_eq!(

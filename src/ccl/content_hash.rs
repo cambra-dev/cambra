@@ -525,6 +525,8 @@ fn hash_payload<'a>(
                 g.guards.len().hash(h);
             }
         }
+        // Whether the groups collapse; the collection, key and collapse are children.
+        N::GroupBy { collapse, .. } => collapse.is_some().hash(h),
         N::Lit(Lit::Int(n)) => n.hash(h),
         N::Lit(Lit::String(s)) => s.hash(h),
         N::Lit(Lit::Bool(b)) => b.hash(h),

@@ -207,19 +207,18 @@ The streamed collection-valued answer is rejected later at operator conversion; 
 
 ### The key domain is the key morphism's image
 
-`present_key_domain` in `lower/exprs.rs` constructs
-`{K | __elem ▷ ((c ≫ key) ▷ collection_contains)}`. `comprehension::run` rewrites `c ≫ key` as it
-rewrites a loop, to `λ __iter_record → __iter_record ▷ c ▷ key`, the key at each of `c`'s
-positions. The predicate retains the producer morphism rather than an opaque key-set identifier. Its structural identity therefore depends
+`present_key_domain` in `comprehension.rs` constructs
+`{K | __elem ▷ ((c ≫ key) ▷ collection_contains)}`, with `c ≫ key` indexed as a loop is, to
+`λ __iter_record → __iter_record ▷ c ▷ key`, the key at each of `c`'s positions. The predicate retains the producer morphism rather than an opaque key-set identifier. Its structural identity therefore depends
 on the named term and its free references, not merely on the keys that term happens to produce.
 
 The helper shares one `SharedHole` between the refinement base and the morphism's codomain.
 Using only the builtin scheme would leave a one-way bound instead of establishing that identity.
-`lower_groupby` returns the domain so re-keying consumers reuse both its key type and its
-predicate allocation. Independently constructing a similar domain would create separately
-inferred predicate copies.
+`expand_group_by` builds the domain once, and a re-keying constructor's iteration binder reuses
+both its key type and its predicate allocation. Independently constructing a similar domain would
+create separately inferred predicate copies.
 
-The key domain is stamped during lowering. Delaying it until coalescing can leave a keyed-sum
+The key domain is stamped before inference, when the group-by is expanded. Delaying it until coalescing can leave a keyed-sum
 entry constraint with an unresolved candidate rather than the concrete membership-bearing domain
 it needs. An unresolved candidate's membership is decided where it materializes
 ([Membership is decided at materialization](type-inference.md#membership-is-decided-at-materialization)).
@@ -279,8 +278,14 @@ The implemented re-keying constructors return concrete data functions:
 | `set(xs)` | Identity on an element | `Drain` | Present-key domain to `unit`. |
 | `map(entries)` | First projection of a pair | `Sole`, then second projection | Present-key domain to the entry value. |
 
-`lower_rekeyed` builds both. It retains the domain returned by `lower_groupby` and
-eta-expands the application as `λ __iter_record → __iter_record ▷ keyed ▷ collapse`.
+Lowering keeps each as a `GroupBy` node holding its collection, its key morphism and its collapse,
+and the comprehension phase expands it (`expand_group_by`), after A-normalization. The expansion
+places the collection in the key domain, in the group's refinement and in the group, so it is
+built from the normalized collection: expanded ahead of A-normalization, the copy in the group
+would be normalized alone, a comprehension's generator source named inside its iteration lambda
+while the copies in types kept it inline, and the copies would type at unrelated witnesses. The
+expansion reuses the group-by's domain and eta-expands the application as
+`λ __iter_record → __iter_record ▷ keyed ▷ collapse`.
 A bare composition would expose the dependent key binder in the collapse parameter's type.
 The iteration lambda carries both the present-key domain and a data-function annotation;
 the refinement and function-kind stamps serve different constraints.

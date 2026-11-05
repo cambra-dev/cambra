@@ -895,8 +895,8 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
     // `emit_lambda`), taken before the walk borrows the node.
     let recorded_ty = expr.ty.clone();
     let ty = match &mut expr.node {
-        TypedExprNode::Comprehension { .. } => {
-            unreachable!("a Comprehension reached inference; the comprehension phase eliminates it")
+        TypedExprNode::Comprehension { .. } | TypedExprNode::GroupBy { .. } => {
+            unreachable!("a surface node reached inference; the comprehension phase eliminates it")
         }
         TypedExprNode::DefGroup { .. } => {
             unreachable!("a DefGroup reached the check; inference rewrites it into `Let`s")
@@ -1417,11 +1417,13 @@ fn check_unbox(ty: &Type, label: &str, ctx: &mut CheckCtx) {
         if domain.peel_refinements().sum().is_none() {
             return Some(((**domain).clone(), (**codomain).clone()));
         }
-        let boxed = name.as_ref()?;
+        // A codomain that reads no binder has none to name: the witness is then the one its
+        // kind determines, so the result is the same whatever the argument, and any reference
+        // stands for it.
+        let boxed = name.clone().unwrap_or_else(|| Name::fresh("__boxed"));
         let recorded = crate::ccl::subst::open_codomain(ty, codomain);
         // A reference compared against and rendered, never placed in a tree.
-        let term =
-            Rc::new(Expr::throwaway(TypedExprNode::Var(boxed.clone())).with_ty((**domain).clone()));
+        let term = Rc::new(Expr::throwaway(TypedExprNode::Var(boxed)).with_ty((**domain).clone()));
         Some((crate::ccl::ty::unboxed_type(domain, &term)?, recorded))
     })();
     let Some((expected, recorded)) = expected else {

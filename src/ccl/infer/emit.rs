@@ -86,8 +86,8 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
     let recorded_ty = expr.ty.clone();
     let has_ann = expr.user_annotation.is_some();
     let mut ty = match &mut expr.node {
-        TypedExprNode::Comprehension { .. } => {
-            unreachable!("a Comprehension reached inference; the comprehension phase eliminates it")
+        TypedExprNode::Comprehension { .. } | TypedExprNode::GroupBy { .. } => {
+            unreachable!("a surface node reached inference; the comprehension phase eliminates it")
         }
         // Lowering builds a `Method` only as an application's function, which
         // `emit_apply` resolves before emitting it, or defers, typing it as the variable

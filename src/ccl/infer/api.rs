@@ -1279,7 +1279,7 @@ fn product_keying_hint(expected: &Type, found: &Type) -> Option<&'static str> {
 fn undischarged_index_hint(type_a: &Type, type_b: &Type) -> Option<String> {
     /// A **present-key domain** — `{𝐾 | __elem ▷ (𝑚 ▷ collection_contains)}`, how a keyed
     /// collection states which keys it holds. Its sole producer is `present_key_domain` in
-    /// `src/ccl/lower/exprs.rs`, and the test is the shape that function builds.
+    /// `src/ccl/comprehension.rs`, and the test is the shape that function builds.
     ///
     /// Recognizing the predicate rather than asking whether *any* refinement is present is
     /// what keeps the hint to the case it describes. A literal's type is the singleton

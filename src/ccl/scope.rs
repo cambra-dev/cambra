@@ -327,6 +327,17 @@ where
         // `target` is a type; its refinement predicate is reached by the
         // caller's type walk, not here (see the module docs).
         N::Cast { value, .. } => open(f, value),
+        N::GroupBy {
+            collection,
+            key,
+            collapse,
+        } => {
+            open(f, collection);
+            open(f, key);
+            if let Some(collapse) = collapse {
+                open(f, collapse);
+            }
+        }
         N::BinOp { left, right, .. } => {
             open(f, left);
             open(f, right);
@@ -613,6 +624,7 @@ where
         | N::Abstract
         | N::Error
         | N::Apply { .. }
+        | N::GroupBy { .. }
         | N::Cast { .. }
         | N::BinOp { .. }
         | N::UnaryOp(..)
@@ -762,6 +774,11 @@ mod tests {
                 ("b".into(), var("rb")),
             ])),
             node(N::Compose(vec![var("c0"), var("c1")])),
+            node(N::GroupBy {
+                collection: Box::new(var("gc")),
+                key: Box::new(var("gk")),
+                collapse: Some(Box::new(var("gf"))),
+            }),
             TypedExpr::copair(vec![var("cp0"), var("cp1")]),
             TypedExpr::disjoint_join(vec![var("dj0"), var("dj1")]),
             node(N::Realized {
@@ -875,6 +892,7 @@ mod tests {
         N::Var(_) => "Var",
         N::Builtin(_) => "Builtin",
         N::Apply { .. } => "Apply",
+        N::GroupBy { .. } => "GroupBy",
         N::Cast { .. } => "Cast",
         N::Comprehension { .. } => "Comprehension",
         N::BinOp { .. } => "BinOp",

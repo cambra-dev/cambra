@@ -782,11 +782,6 @@ pub(super) enum AliasAt<'a> {
 }
 
 impl LoweringContext {
-    /// A fresh [`Type::SharedHole`] id — see [`SharedHoleMint::fresh`].
-    pub(super) fn fresh_shared_hole(&mut self) -> Type {
-        self.shared_holes.fresh()
-    }
-
     /// The id mint lowering spent its [`Type::SharedHole`]s from, for the phase
     /// after it that states domain equations on the same tree
     /// ([`crate::ccl::comprehension`]).

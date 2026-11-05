@@ -1,11 +1,13 @@
 //! Comprehension lowering: the surface
 //! [`Comprehension`](TypedExprNode::Comprehension) node to the CCL `Lambda`/`Apply`
-//! encoding (identity, loop-join and hash-join shapes).
+//! encoding (identity, loop-join and hash-join shapes), and the surface
+//! [`GroupBy`](TypedExprNode::GroupBy) node to its expansion.
 //!
 //! [`run`] is the phase, between [`crate::ccl::mut_read`] and
-//! [`crate::ccl::infer::infer`]. CHL lowering stops at the surface node — the
-//! element and its [`Generator`]s — and this is where that becomes the
-//! `cast`/`λ`/`▷` term inference reads.
+//! [`crate::ccl::infer::infer`]. CHL lowering stops at the surface nodes — a
+//! comprehension's element and its [`Generator`]s, a group-by's collection, key
+//! and collapse — and this is where they become the `cast`/`λ`/`▷` terms
+//! inference reads.
 //!
 //! # Why the encoding is built here
 //!
@@ -18,6 +20,13 @@
 //! ahead of that pass therefore reaches inference un-normalized. In surface
 //! form the element normalizes like any other term, and the copy this phase
 //! takes afterwards is a copy of the normalized one.
+//!
+//! A group-by is built here for the same reason. Its expansion places its
+//! collection in its key domain, in its groups' refinement and in its groups.
+//! Expanded ahead of A-normalization, the copy in the groups would be
+//! normalized, its comprehensions' sources named inside their iteration
+//! lambdas, while the copies in types kept them inline. In surface form the
+//! collection normalizes once, and the expansion copies the finished term.
 //!
 //! # What the phase mints
 //!
@@ -41,15 +50,17 @@
 //! records resolve an error to a span whether or not the compile captures
 //! provenance.
 
+use std::rc::Rc;
+
 use crate::ccl::{
-    BinOpKind, Expr, Generator, LogicKind, Name, SharedHoleMint, Type, TypedBinding, TypedExprNode,
-    anf,
+    BinOpKind, Builtin, CompareKind, Expr, Generator, LogicKind, Name, Refinement, SharedHoleMint,
+    Type, TypedBinding, TypedExprNode, anf,
     ccl_utils::{PredMemo, make_cast, refined_data_fun, walk_refined_predicates_mut},
     provenance::{self, Nature, NodeId},
     ty::FunKind,
 };
 
-/// Lower every [`TypedExprNode::Comprehension`] in `expr`.
+/// Lower every [`TypedExprNode::Comprehension`] and [`TypedExprNode::GroupBy`] in `expr`.
 ///
 /// `holes` is lowering's [`Type::SharedHole`] mint, shared so the domain
 /// equation an unfiltered comprehension states cannot collide with one lowering
@@ -84,14 +95,39 @@ impl Rewrite<'_> {
     /// this phase copies one.
     fn expr(&mut self, e: &mut Expr) {
         let comprehension = matches!(e.node, TypedExprNode::Comprehension { .. });
-        self.depth += usize::from(comprehension);
-        // A refinement predicate is a term like any other and can hold a
-        // comprehension — `lower_groupby` copies its collection into one, and
-        // that collection is whatever the program iterated.
+        // A group-by is a level of the nest too: its expansion copies its collection, so a
+        // comprehension in the collection is copied as encoded, and is normalized with the
+        // copies or not at all.
+        let group_by = matches!(e.node, TypedExprNode::GroupBy { .. });
+        self.depth += usize::from(comprehension || group_by);
+        // A refinement predicate is a term like any other, and the comprehensions
+        // and group-bys it holds are rewritten as the tree's are.
         e.walk_type_slots_mut(|t| self.ty(t));
         e.walk_children_mut(|c| self.expr(c));
         if is_loop(e) {
             index_loop(e);
+        }
+        if group_by {
+            self.depth -= 1;
+            let id = e.node_id();
+            let TypedExprNode::GroupBy {
+                collection,
+                key,
+                collapse,
+            } = std::mem::replace(&mut e.node, TypedExprNode::Defer)
+            else {
+                unreachable!("matched a GroupBy immediately above")
+            };
+            // A-normalized as an encoding is, once per nest: the operand positions the
+            // expansion mints are what that pass is for. Its collection stands in a refined
+            // cast's value and in types, which the pass leaves as they are, so every copy
+            // stays one term.
+            let expanded = expand_group_by(id, *collection, *key, collapse.map(|c| *c), self.holes);
+            *e = if self.depth == 0 {
+                anf::run(expanded)
+            } else {
+                expanded
+            };
         }
         if comprehension {
             self.depth -= 1;
@@ -151,6 +187,90 @@ impl Rewrite<'_> {
         });
         self.depth -= 1;
     }
+}
+
+/// Expand `groupby(collection, key)`, each group collapsed by `collapse` where one is given,
+/// to the term inference reads (`src/ccl/design/collections.md`, "`groupby`'s exact type"):
+///
+/// ```text
+/// λ 𝑘 : 𝐷 → cast({_ | __elem ▷ collection ▷ key == 𝑘} ⤇ _, λ 𝑖 → 𝑖 ▷ collection)
+/// ```
+///
+/// over the present-key domain `𝐷` ([`present_key_domain`]). The group at `𝑘` is the
+/// collection re-viewed at the elements `key` sends to `𝑘`. A collapse makes the expansion
+/// `λ 𝑟 : 𝐷 → (𝑟 ▷ keyed) ▷ collapse`, over the same domain: eta-expanded, because a bare
+/// composition would expose the key binder in the collapse parameter's type.
+///
+/// `collection` is placed in the key domain, in the groups' refinement and in the groups, and
+/// `key` in both types. Each is the finished term, its comprehensions encoded and its
+/// sources named by A-normalization, so the copies are one term: inference dedups the
+/// predicate-side refinements against the body-side ones by structural equality. The
+/// expansion's root takes the group-by's id.
+fn expand_group_by(
+    id: NodeId,
+    collection: Expr,
+    key: Expr,
+    collapse: Option<Expr>,
+    holes: &mut SharedHoleMint,
+) -> Expr {
+    let _frame = provenance::enter(id, "comprehension.group_by", Nature::Machinery);
+    let data_fun = || Type::data_fun(Type::Hole, Type::Hole);
+    let key_domain = present_key_domain(&collection, &key, holes.fresh());
+    let group_key = Name::group_key();
+    let member = Name::group_member();
+    let in_group = Expr::binop(
+        Expr::apply(
+            Expr::apply(Expr::var(Name::elem()), collection.clone()),
+            key,
+        ),
+        BinOpKind::Compare(CompareKind::Equals),
+        Expr::var(group_key.clone()),
+    );
+    // The group is a **collection** — the members sharing one key — so the lambda under the
+    // cast carries the same `Data` stamp the outer function does. The cast target's `Data`
+    // alone is not enough: a cast re-views its value at the target's kind, so an unstamped
+    // lambda underneath is a second, contradictory answer about what this function is, and
+    // it is the one elimination reads when it point-frees the group.
+    let group = Expr::lambda(
+        member.clone(),
+        Type::Hole,
+        Expr::apply(Expr::var(member), collection),
+    )
+    .with_user_annotation(data_fun());
+    let target = refined_data_fun(Type::Hole, in_group, Type::Hole, FunKind::fresh_data());
+    // The function is a collection because the `data_fun` annotation says so, which
+    // `emit_node` stamps onto the function type `emit_lambda` builds — one already carrying
+    // this binder and its domain.
+    let keyed = Expr::lambda(group_key, key_domain.clone(), make_cast(group, target))
+        .with_user_annotation(data_fun());
+    let expanded = match collapse {
+        None => keyed,
+        Some(collapse) => {
+            let position = Name::iter_record();
+            let read = Expr::apply(Expr::var(position.clone()), keyed);
+            Expr::lambda(position, key_domain, Expr::apply(read, collapse))
+                .with_user_annotation(data_fun())
+        }
+    };
+    at_id(expanded, id)
+}
+
+/// A group-by's present-key domain, `{𝐾 | __elem ▷ ((collection ≫ key) ▷ collection_contains)}`:
+/// the keys `key` sends some element of `collection` to (`src/ccl/design/collections.md`, "The
+/// key domain is the key morphism's image"). The refinement's base is `shared`, a fresh
+/// [`Type::SharedHole`] that is also the key morphism's codomain: a one-way bound from the
+/// application would give the base only a lower bound, admitting `Map(String, _)` over `Int`
+/// keys. The key morphism is a loop over the collection, indexed as every loop is
+/// ([`index_loop`]).
+fn present_key_domain(collection: &Expr, key: &Expr, shared: Type) -> Type {
+    let mut morphism = Expr::compose(vec![collection.clone(), key.clone()])
+        .with_user_annotation(Type::data_fun(Type::Hole, shared.clone()));
+    if is_loop(&morphism) {
+        index_loop(&mut morphism);
+    }
+    let characteristic = Expr::apply(morphism, Expr::builtin(Builtin::CollectionContains));
+    let predicate = Expr::apply(Expr::var(Name::elem()), characteristic);
+    Type::refined_one(shared, Refinement::born(Rc::new(predicate)))
 }
 
 /// Whether `e` is a composition `𝑠 ≫ (λ 𝑥 → body)`: the collection over `𝑠`'s positions of what
@@ -288,7 +408,7 @@ fn encode(
     let iter_dom = pred_op.is_none().then(|| holes.fresh());
     // The source is read through `unbox`, whose result is plain data, so the result is.
     let result_kind = FunKind::Data(None);
-    let unbox = |source: Expr| Expr::apply(source, Expr::builtin(crate::ccl::Builtin::Unbox));
+    let unbox = |source: Expr| Expr::apply(source, Expr::builtin(Builtin::Unbox));
     let body_expr = {
         // The generator's plumbing is its source's: the index read, the application of the
         // source, and the per-element lambda.
@@ -512,7 +632,7 @@ fn flattened_nest(
             body = Expr::let_bind(name, bound, body);
         }
     }
-    Expr::apply(body, Expr::builtin(crate::ccl::Builtin::Uncurry(arity)))
+    Expr::apply(body, Expr::builtin(Builtin::Uncurry(arity)))
 }
 
 /// `λ target → body` at a generator's binder.
@@ -609,6 +729,34 @@ mod tests {
         "λ __iter_record → let __anf = [1, 2]\nin let __anf = __anf ▷ Iterable::elements\nin let __anf = __iter_record ▷ (__anf ▷ unbox)\nin __anf ▷ (λ x → { x > 1 → x; true → 0 })"
     )]
     fn the_encoding(#[case] code: &str, #[case] expected: &str) {
+        assert_eq!(encoded(code), expected);
+    }
+
+    /// A group-by expands over its present-key domain, each group the collection re-viewed at
+    /// the elements its key function sends to that key, and every copy of the collection one
+    /// term.
+    #[rstest]
+    #[case(
+        "groupby(xs, \\x -> x)",
+        "λ __gb_k : {_#0 | __elem ▷ ((λ __iter_record → __iter_record ▷ xs ▷ (λ x → x)) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ (λ x → x) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
+    )]
+    #[case(
+        "groupby([1, 2, 3], \\x -> x // 2)",
+        "λ __gb_k : {_#0 | __elem ▷ ((λ __iter_record → __iter_record ▷ [1, 2, 3] ▷ (λ x → x // 2)) ▷ collection_contains)} → cast(({_ | __elem ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ [1, 2, 3])"
+    )]
+    #[case(
+        "groupby(xs, key_fn)",
+        "λ __gb_k : {_#0 | __elem ▷ ((xs ≫ key_fn) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
+    )]
+    #[case(
+        "set(xs)",
+        "λ __iter_record : {_#0 | __elem ▷ ((λ __iter_record → __iter_record ▷ xs ▷ (λ __set_key → __set_key)) ▷ collection_contains)} → let __anf = __iter_record ▷ (λ __gb_k : {_#0 | __elem ▷ ((λ __iter_record → __iter_record ▷ xs ▷ (λ __set_key → __set_key)) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ (λ __set_key → __set_key) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs))\nin __anf ▷ (λ __set_g → Drain(__set_g))"
+    )]
+    #[case(
+        "map(kvs)",
+        "λ __iter_record : {_#0 | __elem ▷ ((λ __iter_record → __iter_record ▷ kvs ▷ (λ __map_kv → __map_kv.0)) ▷ collection_contains)} → let __anf = __iter_record ▷ (λ __gb_k : {_#0 | __elem ▷ ((λ __iter_record → __iter_record ▷ kvs ▷ (λ __map_kv → __map_kv.0)) ▷ collection_contains)} → cast(({_ | __elem ▷ kvs ▷ (λ __map_kv → __map_kv.0) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ kvs))\nin __anf ▷ (λ __map_g → let __anf = Sole(__map_g)\nin __anf.1)"
+    )]
+    fn the_expansion(#[case] code: &str, #[case] expected: &str) {
         assert_eq!(encoded(code), expected);
     }
 

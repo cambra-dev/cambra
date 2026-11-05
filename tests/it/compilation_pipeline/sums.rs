@@ -784,6 +784,49 @@ fn a_comprehension_over_a_box_is_keyed_like_it(#[case] code: &str, #[case] expec
     check_scalar(code, expected);
 }
 
+/// A re-keying constructor over a **comprehension over a box**, which reads the box's witness.
+/// `groupby`, `map` and `set` place their collection in their type as well as in their value,
+/// and every copy is the one comprehension, normalized before the group-by is expanded. A
+/// function whose body binds the comprehension and returns the constructor closes its type over
+/// that binding.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::grouped(indoc! {r"
+    b = box([1, 2, 3])
+    sum([sum(g) for g in groupby([x for x in b], \x -> x > 1)])
+"}, Value::Int(6))]
+#[case::mapped(indoc! {r"
+    b = box([1, 2, 3])
+    sum(map([(x, x * 10) for x in b]))
+"}, Value::Int(60))]
+#[case::returned_from_a_function(indoc! {r"
+    def f(b):
+        c = [(x, 1) for x in b]
+        map(c)
+    sum(f(box([1, 2])))
+"}, Value::Int(2))]
+fn a_re_keying_constructor_takes_a_comprehension_over_a_box(
+    #[case] code: &str,
+    #[case] expected: Value,
+) {
+    check_scalar(code, expected);
+}
+
+/// [`a_re_keying_constructor_takes_a_comprehension_over_a_box`] for `set`, which keeps each
+/// element once.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_set_takes_a_comprehension_over_a_box() {
+    check_sink(
+        indoc! {"
+            out = test_sink()
+            b = box([1, 2, 2])
+            out << set([x for x in b])
+        "},
+        "[() -> [1 -> (), 2 -> ()]]",
+    );
+}
+
 /// The two spellings `box` refuses (`docs/chl-spec.md`, "7.4 `box`"): comprehensions over two
 /// different boxes are keyed differently and do not join, and a filtered box has gaps, so it is
 /// no `List`.

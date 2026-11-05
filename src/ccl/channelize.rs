@@ -1446,9 +1446,10 @@ fn all_binders(expr: &Expr, out: &mut HashSet<Name>) {
 /// residue), so dropping it is value-preserving.
 fn drop_expr_stmts(mut expr: Expr) -> Expr {
     match expr.node {
-        TypedExprNode::Comprehension { .. } => {
+        TypedExprNode::Comprehension { .. } | TypedExprNode::GroupBy { .. } => {
             unreachable!(
-                "a Comprehension reached channelize; the comprehension phase eliminates it"
+                "a {} reached channelize; the comprehension phase eliminates it",
+                expr.node.kind_name()
             )
         }
         TypedExprNode::DefGroup { .. } => {
@@ -1529,9 +1530,10 @@ fn drop_expr_stmts(mut expr: Expr) -> Expr {
 /// report the first one left at itself.
 fn assert_no_defer_residue(expr: &Expr) -> Result<(), Located<DeferError>> {
     match &expr.node {
-        TypedExprNode::Comprehension { .. } => {
+        TypedExprNode::Comprehension { .. } | TypedExprNode::GroupBy { .. } => {
             unreachable!(
-                "a Comprehension reached channelize; the comprehension phase eliminates it"
+                "a {} reached channelize; the comprehension phase eliminates it",
+                expr.node.kind_name()
             )
         }
         TypedExprNode::DefGroup { .. } => {
@@ -2180,8 +2182,9 @@ fn emit_cluster_letrec(inner: Expr, group: Vec<(TypedBinding, Expr)>) -> Expr {
 fn collect_feed_target_names(expr: &Expr) -> Vec<Name> {
     fn rec(expr: &Expr, bound: &mut Vec<Name>, out: &mut HashSet<Name>) {
         match &expr.node {
-            TypedExprNode::Comprehension { .. } => unreachable!(
-                "a Comprehension reached channelize; the comprehension phase eliminates it"
+            TypedExprNode::Comprehension { .. } | TypedExprNode::GroupBy { .. } => unreachable!(
+                "a {} reached channelize; the comprehension phase eliminates it",
+                expr.node.kind_name()
             ),
             TypedExprNode::DefGroup { .. } => {
                 unreachable!("a DefGroup reached channelize; inference rewrites it into `Let`s")
@@ -2487,9 +2490,10 @@ fn extract_for_defer_impl(
         node_id,
     } = expr;
     let node = match node {
-        TypedExprNode::Comprehension { .. } => {
+        node @ (TypedExprNode::Comprehension { .. } | TypedExprNode::GroupBy { .. }) => {
             unreachable!(
-                "a Comprehension reached channelize; the comprehension phase eliminates it"
+                "a {} reached channelize; the comprehension phase eliminates it",
+                node.kind_name()
             )
         }
         TypedExprNode::DefGroup { .. } => {

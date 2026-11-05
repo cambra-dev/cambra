@@ -445,6 +445,30 @@ fn fmt_inner(expr: &Expr, opts: &SymbolicOpts) -> (Precedence, String) {
         // information and bloats nested-cast dumps quadratically.  Before
         // inference, `expr.ty` is still a `Hole`/`Infer` placeholder and
         // `target` is the only place the type is visible, so render it inline.
+        // Surface form, as CHL's `groupby` spells it, each group then mapped through the
+        // collapse where there is one.
+        TypedExprNode::GroupBy {
+            collection,
+            key,
+            collapse,
+        } => {
+            let grouped = format!(
+                "groupby({}, {})",
+                fmt(collection, Precedence::Lowest, opts),
+                fmt(key, Precedence::Lowest, opts)
+            );
+            let text = match collapse {
+                Some(collapse) => {
+                    format!(
+                        "{grouped} ▷ map({})",
+                        fmt(collapse, Precedence::Lowest, opts)
+                    )
+                }
+                None => grouped,
+            };
+            (Precedence::Atom, text)
+        }
+
         TypedExprNode::Cast { value, target } => {
             let rendered_arg = fmt(value, Precedence::Lowest, opts);
             let text = match &expr.ty {
