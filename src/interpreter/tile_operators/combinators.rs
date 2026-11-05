@@ -769,14 +769,19 @@ impl TileOperator for Uncurry {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
-        // Beneath standing levels the input's outermost keys are the result's; pairing the whole
-        // tile re-keys, and an outer key decides every pair whose first field it is.
-        let consumer = match self.level == CurryLevel::OUTERMOST {
+        // Beneath standing levels the input's outermost keys are the result's, and a region at or
+        // beneath the paired level names the pairs it heads. Pairing the whole tile re-keys, so a
+        // change widens, and an outer key decides every pair whose first field it is.
+        let level = self.level;
+        let consumer = match level == CurryLevel::OUTERMOST {
             true => crate::interpreter::scheduler::widening_restating_decided(
-                pairs_of_outer_keys,
+                |region| paired(region, CurryLevel::OUTERMOST),
                 consumer,
             ),
-            false => consumer,
+            false => crate::interpreter::scheduler::restating(
+                Box::new(move |region| paired(region, level)),
+                consumer,
+            ),
         };
         Box::new(UncurryProducer {
             base: ProducerBase::new(
@@ -794,45 +799,66 @@ impl TileOperator for Uncurry {
     }
 }
 
-/// The pairs an outermost `Uncurry` makes of the keys `region` names: every pair whose first field
-/// is an outer key it names, or, for inner keys, every pair of an inner key it names under an
-/// outer key it names them under.
-///
-/// # Panics
-///
-/// Where `region` names keys deeper than the inner level, which no `Uncurry` input of two levels
-/// has.
-fn pairs_of_outer_keys(region: &Projection) -> Projection {
-    fn pairs(level: CurryLevel, keys: &Predicate) -> Predicate {
-        let field = |at: usize, keys: &Predicate| (tuple_field(at), keys.clone());
-        match keys {
-            _ if level == CurryLevel::OUTERMOST => {
-                Predicate::Record(HashMap::from([field(0, keys), field(1, &Predicate::True)]))
-            }
+/// The region of an `Uncurry`'s output that `region`, a region of its input, names, where the
+/// `Uncurry` pairs the keys at `pairs` with the keys beneath them: keys above `pairs` stand as they
+/// are, an outer key at `pairs` heads every pair whose first field it is, an inner key beneath it
+/// is the pair of the two, and each key deeper stands one level higher, under its pair.
+fn paired(region: &Projection, pairs: CurryLevel) -> Projection {
+    fn record(outer: Predicate, inner: Predicate) -> Predicate {
+        Predicate::Record(HashMap::from([
+            (tuple_field(0), outer),
+            (tuple_field(1), inner),
+        ]))
+    }
+    // The pair at `pairs` heading the path `admitted` admits, whose last key stands at `depth`.
+    fn join(admitted: &Predicate, depth: usize, pairs: usize) -> Predicate {
+        match admitted {
             Predicate::Or(arms) => {
-                Predicate::Or(arms.iter().map(|arm| pairs(level, arm)).collect())
+                Predicate::union_all(arms.iter().map(|arm| join(arm, depth, pairs)).collect())
             }
-            Predicate::Qualified { enclosing, here } => {
-                Predicate::Record(HashMap::from([field(0, enclosing), field(1, here)]))
+            Predicate::Qualified { enclosing, here } if depth > pairs + 1 => {
+                Predicate::qualified(join(enclosing, depth - 1, pairs), (**here).clone())
             }
-            unqualified => Predicate::Record(HashMap::from([
-                field(0, &Predicate::True),
-                field(1, unqualified),
-            ])),
+            unqualified if depth > pairs + 1 => unqualified.clone(),
+            Predicate::Qualified { enclosing, here } if depth == pairs + 1 => match &**enclosing {
+                Predicate::Or(outers) => Predicate::union_all(
+                    outers
+                        .iter()
+                        .map(|outer| {
+                            join(
+                                &Predicate::qualified(outer.clone(), (**here).clone()),
+                                depth,
+                                pairs,
+                            )
+                        })
+                        .collect(),
+                ),
+                Predicate::Qualified {
+                    enclosing: above,
+                    here: outer,
+                } => Predicate::qualified(
+                    (**above).clone(),
+                    record((**outer).clone(), (**here).clone()),
+                ),
+                outer => record(outer.clone(), (**here).clone()),
+            },
+            inner if depth == pairs + 1 => record(Predicate::True, inner.clone()),
+            Predicate::Qualified { enclosing, here } => Predicate::qualified(
+                (**enclosing).clone(),
+                record((**here).clone(), Predicate::True),
+            ),
+            outer => record(outer.clone(), Predicate::True),
         }
     }
     match region {
-        Projection::Keys { level, keys } => {
-            assert!(
-                level.index() <= 1,
-                "an outermost Uncurry pairs two levels; a region names keys at {level:?}"
-            );
+        Projection::Keys { level, keys } if level.index() >= pairs.index() => {
+            let at = level.index().saturating_sub(1).max(pairs.index());
             Projection::Keys {
-                level: CurryLevel::OUTERMOST,
-                keys: pairs(*level, keys),
+                level: CurryLevel::new(at),
+                keys: join(keys, level.index(), pairs.index()),
             }
         }
-        whole_or_none => whole_or_none.clone(),
+        standing_or_whole => standing_or_whole.clone(),
     }
 }
 
@@ -875,7 +901,7 @@ impl TileProducer for UncurryProducer {
             return self.tiling().empty_tile();
         }
         let input_guard = match (self.level == CurryLevel::OUTERMOST, &projection) {
-            (_, Projection::Keys { level, keys }) if *level > self.level => Projection::keys_at(
+            (_, Projection::Keys { level, keys }) if *level >= self.level => Projection::keys_at(
                 CurryLevel::new(level.index() + 1),
                 unpaired(keys, *level, self.level),
             )
@@ -4494,6 +4520,42 @@ mod uncurry_projection_tests {
         assert_conforms(|| Box::new(paired_groups_of_collections().0), guard);
     }
 
+    /// Beneath a standing level, a region of the input's inner keys climbs as the pairs they
+    /// make with their outer key, and one of the outer keys as every pair they head: inner key 0
+    /// under row 1's outer key 2 is the pair `(2, 0)` under row 1.
+    #[test]
+    fn a_region_beneath_a_standing_level_climbs_as_the_pairs_it_names() {
+        let point = |k: u64| Predicate::point(Value::UInt(k));
+        let record = |outer: Predicate, inner: Predicate| {
+            Predicate::Record(HashMap::from([
+                (tuple_field(0), outer),
+                (tuple_field(1), inner),
+            ]))
+        };
+        let standing = CurryLevel::new(1);
+        let inner = Projection::keys_at(
+            CurryLevel::new(2),
+            Predicate::qualified(Predicate::qualified(point(1), point(2)), point(0)),
+        );
+        assert_eq!(
+            paired(&inner, standing),
+            Projection::keys_at(
+                standing,
+                Predicate::qualified(point(1), record(point(2), point(0)))
+            )
+        );
+        let outer = Projection::keys_at(standing, Predicate::qualified(point(1), point(2)));
+        assert_eq!(
+            paired(&outer, standing),
+            Projection::keys_at(
+                standing,
+                Predicate::qualified(point(1), record(point(2), Predicate::True))
+            )
+        );
+        let rows = Projection::keys_at(CurryLevel::OUTERMOST, point(1));
+        assert_eq!(paired(&rows, standing), rows);
+    }
+
     /// A morsel of pairs headed by groups 1 and 3 reads those groups of the grouping alone, and
     /// holds the pairs they head: `(1, 0)`, `(1, 2)` and `(3, 3)`.
     #[test]
@@ -4510,15 +4572,20 @@ mod uncurry_projection_tests {
         );
     }
 
-    /// A morsel that names the second component only cannot say which groups it needs, so the
-    /// grouping is read whole and the pairs are cut after.
+    /// A morsel that names the second component only names that member under every group, so
+    /// the grouping is read at it: the pair `(2, 1)`.
     #[test]
-    fn a_morsel_of_second_components_reads_the_grouping_whole_and_cuts_the_pairs() {
+    fn a_morsel_of_second_components_reads_that_member_under_every_group() {
         let (mut uncurry, pulled) = paired_groups();
         let guard = pairs(Predicate::True, Predicate::point(Value::UInt(1)));
         let morsel = uncurry.get(guard);
         assert_eq!(pair_count(&morsel), 1, "only the pair (2, 1)");
-        assert_eq!(*pulled.borrow(), [uncurry.input.tiling().universal_guard()]);
+        assert_eq!(
+            *pulled.borrow(),
+            [TileGuard::Function(FunctionGuard::Codomain(Box::new(
+                TileGuard::Function(FunctionGuard::Domain(Predicate::point(Value::UInt(1))))
+            )))]
+        );
     }
 
     #[test]

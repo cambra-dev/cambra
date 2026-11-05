@@ -332,16 +332,58 @@ impl LoopScope {
         self.round_at(guard, &readers);
     }
 
+    /// The row `guard`, a guard of the store's input, as each inner pipeline in `readers` takes
+    /// it: where a push of the row from the drive reaches the pipeline's entry, what it lands as
+    /// there, restated by every operator on the way, as `Uncurry` restates the row as the pairs it
+    /// heads; elsewhere the row itself, for a pipeline whose input the store's positions key.
+    fn row_for(&self, guard: &TileGuard, readers: &[PipelineId]) -> Vec<(PipelineId, TileGuard)> {
+        let drive = self.drive();
+        let mut consumer = None;
+        reach_member(
+            &self.store,
+            &self.members[drive.0],
+            drive,
+            &mut |breaker, _| {
+                consumer = breaker
+                    .as_producer()
+                    .and_then(|producer| producer.base().downstream.clone());
+            },
+        );
+        let consumer = consumer.expect("a loop's drive pushes to the pipelines that read it");
+        let region = Projection::of(guard)
+            .unwrap_or_else(|why| panic!("a loop's round names a row of its store: {why}"));
+        let mut landing = Landing::probe(drive);
+        consumer.borrow_mut().push(&region, &mut landing);
+        let arrivals = landing.arrivals();
+        readers
+            .iter()
+            .flat_map(|&reader| {
+                let landed: Vec<(PipelineId, TileGuard)> = arrivals
+                    .iter()
+                    .filter(|arrival| arrival.pipeline.0 == reader.0)
+                    .map(|arrival| (reader, arrival.guard.clone()))
+                    .collect();
+                match landed.is_empty() {
+                    true => vec![(reader, guard.clone())],
+                    false => landed,
+                }
+            })
+            .collect()
+    }
+
     /// A round at `guard`, queued to `starts`: a position's path, queued to the pipelines a round
     /// starts, or a closing round's region, queued to every inner pipeline but the sources
     /// ([`closing_round`](Self::closing_round)).
     fn round_at(&self, guard: &TileGuard, starts: &[PipelineId]) {
         self.with_store(|store| store.read_cycle_again());
-        for &start in starts {
-            match self.inner.is_source(start) {
-                true => self.inner.notify(start, guard),
-                false => self.inner.queue_round(start, guard),
-            }
+        let (sources, readers): (Vec<PipelineId>, Vec<PipelineId>) = starts
+            .iter()
+            .partition(|&&start| self.inner.is_source(start));
+        for source in sources {
+            self.inner.notify(source, guard);
+        }
+        for (reader, row) in self.row_for(guard, &readers) {
+            self.inner.queue_round(reader, &row);
         }
         // A blocking seal would wait for a retirement only this thread makes.
         assert!(

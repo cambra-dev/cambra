@@ -768,7 +768,7 @@ pulls.
 | `Zip`, `Product` | every arm, both sides | keeps | Pulled at the projection and aligned row for row. |
 | `MakeRecord` | every field | widens | A record of values has no keys. |
 | `Filter` | the predicate, the input | keeps for a side that is a collection, else widens | A collection side shares the mask's keys; the other is read whole. |
-| `Uncurry` | the input | keeps beneath a standing level, widens at the outermost | Pairing the outermost collection re-keys it. |
+| `Uncurry` | the input | restates beneath a standing level, widens at the outermost | A region at or beneath the paired level names the pairs it heads; pairing the outermost collection re-keys it, and a decided region of outer keys names every pair they head. |
 | `Converse` | the input | keeps the standing keys, and restates the inverted level's keys one level in, beneath every value (`scheduler::one_level_in`) | Each input key stands beneath exactly one value. |
 | `UnionOperator` | every arm | keeps for a flat union, restates under the arm's tag for a tagged one | Flat arms are disjoint slices of one collection; a tagged union keys an arm's rows by the arm's keys under its tag, and `Everything` of an arm is every key under that tag. |
 | `CheckedLookup` | a stream of keys, or the pairs | keeps | Each answer sits at its key's position. |

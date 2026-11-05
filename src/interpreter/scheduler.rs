@@ -266,6 +266,33 @@ impl Consumer for WideningRestatingDecided {
     }
 }
 
+/// `consumer` behind a consumer that passes each region on as `restate` names it, a change as a
+/// decided region: an operator that keeps its input's keys under another spelling, as `Uncurry`
+/// beneath a standing level names an outer and an inner key as one pair, restates both exactly.
+pub fn restating(
+    restate: Box<dyn Fn(&Projection) -> Projection>,
+    consumer: Box<dyn Consumer>,
+) -> Box<dyn Consumer> {
+    Box::new(Restating(restate, consumer))
+}
+
+struct Restating(Box<dyn Fn(&Projection) -> Projection>, Box<dyn Consumer>);
+
+impl Consumer for Restating {
+    fn notify(&mut self, arrived: &Projection) {
+        self.1.notify(&(self.0)(arrived));
+    }
+
+    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        self.1.push(&(self.0)(region), landing);
+    }
+
+    /// The path keeps the keys, under another spelling.
+    fn route(&mut self, routes: &mut Routes) {
+        self.1.route(routes);
+    }
+}
+
 /// `consumer` behind a consumer that forwards each notification as the same keys under `tag`
 /// ([`Projection::tagged`]): an arm of a tagged union passes this to the arm's input, since
 /// the union's outermost keys are each arm's keys under the arm's tag.
