@@ -1463,31 +1463,19 @@ source yields everything.
 
 #### Completeness in pushes
 
-This section is the planned design. The code does not implement it yet: it decides finality by
-epochs, as [Parking arrivals until a read is decided](#parking-arrivals-until-a-read-is-decided)
-describes.
-
 A key of a pipeline's output is decided where its value can no longer change and its presence or
 absence is settled: a key present in the output, whose value is complete once it is there, or a key
 the domain predicate rules out ([The completeness contract](#the-completeness-contract)). That is
-the region `Tile::to_guard` names and `BreakingProducer::held` states. The decided region enters the
-dispatcher as a guard, pushed up the consumer chain as a breaker's final guard is pushed today, and
-the dispatcher decides that a read is final by guard containment rather than by epochs.
+the region `Tile::to_guard` names and `BreakingProducer::decided` states. The decided region enters
+the dispatcher as a guard, pushed up the consumer chain beside the region that changed, and the
+dispatcher decides that a read is final by guard containment rather than by epochs.
 
-Today the two ends of a pipeline state completeness through two channels:
+Both ends of a pipeline push a decided region:
 
-| End | States completeness by | Granularity |
-| --- | --- | --- |
-| A range (`IterateExtent`) | `Dispatcher::close` of its pipeline, and the run's last epoch once every source is closed | the whole pipeline, per epoch |
-| A breaker | a push of `BreakingProducer::final_guard` (`Pushes::push_final`) | a region of its output keys |
-
-In the planned design both push a guard:
-
-- A range pushes its decided region each time it grows. A range over a static extent pushes the
-  universal guard when the run starts. A range over a live source pushes the source's yield
-  predicate (`get_yield_predicate`), the keys it has delivered for good, each time it grows.
-- A breaker pushes its final guard, as it does today, which is its decided region less what its
-  readers released.
+- A range pushes its decided region each time it grows (`Dispatcher::land_range_decided`). A range
+  over a static extent pushes the universal guard when the run starts. A range over a live source
+  pushes the keys it has delivered for good.
+- A breaker pushes its decided region beside its final guard (`Pushes::push_final`).
 
 A push carries two guards: the region that changed, which a reader reads again, and the region
 decided. An operator restates each in its own keys by its own rule:
@@ -1495,7 +1483,8 @@ decided. An operator restates each in its own keys by its own rule:
 | Operator | Changed region | Decided region |
 | --- | --- | --- |
 | keeps its input's keys | unchanged | unchanged |
-| widens its input's keys | the universal guard (`Landing::widened`) | the empty guard, and the universal guard once the input's decided region is universal |
+| keeps them under another spelling (`Uncurry` beneath a standing level) | restated (`scheduler::restating`) | restated |
+| widens its input's keys | the universal guard (`Landing::widened`) | the empty guard, and the universal guard once the input's decided region is universal; an outermost `Uncurry` restates it as the pairs its outer keys head (`scheduler::widening_restating_decided`) |
 | reads several inputs (`Zip`, `Filter`, `Product`) | each input's region, as it arrives | the intersection of the inputs' decided regions |
 
 A widened change rounds up and a widened decided region rounds down: every output key of a widening
@@ -1509,20 +1498,19 @@ The dispatcher keeps, per pipeline, the union of the decided regions each pipeli
 pushed. A unit of work is claimable once that union covers the region the work pulls, checked with
 `guard_minus`:
 
-| Work | Claimable today | Claimable in the planned design |
-| --- | --- | --- |
-| A whole read (`Dispatcher::read_whole`) | once every pipeline it reads has decided it (implemented) | as now |
-| A step of a store or a loop's scope over a live source | once every pipeline it reads has decided it (implemented) | as now |
-| A parked delivery of a store or a loop's scope (`Dispatcher::park`) | once every pipeline it reads has decided it (implemented) | as now |
-| A row a push or an arrival brings ([Reading each row once](#reading-each-row-once)) | once every pipeline that reaches it has decided it (implemented) | as now |
+- a whole read (`Dispatcher::read_whole`);
+- a step of a store or a loop's scope over a live source;
+- a parked delivery of a store or a loop's scope (`Dispatcher::park`);
+- a row a push, an arrival or a loop's round brings
+  ([Reading each row once](#reading-each-row-once)).
 
-The four rows reduce to one rule in the run's dispatcher. A loop's scope's own dispatcher still
-orders its rounds by the finish of the pipelines a round reads (`Dispatcher::follow`), since an
-epoch there is a round. Epochs remain the batches a seal makes of live deliveries, and the unit a
-`main` output answers per (`SinkBreaker::per_epoch`).
+The rule is the same in a loop's scope's dispatcher, where the keys carry the loop's position. A
+nested loop's scope there still takes a round's row once the pipelines its rounds pull have finished
+the round (`Dispatcher::follow`). Epochs remain the batches a seal makes of live deliveries, and the
+unit a `main` output answers per (`SinkBreaker::per_epoch`).
 
-The program below shows what changes. Its store `a` reads a static list, and its loop reads a live
-source that never yields everything:
+In the program below, store `a` reads a static list, and the loop reads a live source that never
+yields everything:
 
 ```
 a: Mut(Int, Txn) := 100
@@ -1535,10 +1523,9 @@ for x in source1():
 out << last
 ```
 
-Today `a`'s pipeline is a source started whole and closed in epoch 0, so `a` is final there and the
-loop steps per delivery of `source1`, by the dispatcher's record of which pipelines have closed. In
-the planned design the same follows from the range over `[10, 20]` pushing the universal guard at
-the start and `a` pushing its final guard in epoch 0, with no record of closes.
+The range over `[10, 20]` pushes the universal guard at the start, and `a` pushes its decided region
+in epoch 0, so `a` is final there and the loop steps per delivery of `source1`, with no record of
+which pipelines have closed.
 
 A breaker states its decided region in `BreakingProducer::decided`, which is its held region but
 for the induction store: the transaction store its positions through its watermark, a memo, a map
@@ -1567,7 +1554,8 @@ decided, lands as at the reader's entry (`Dispatcher::reaches`). A row outside t
 depend on the pipeline. A pipeline read by pull, whose push reaches no entry of the reader, reaches
 all of its input, and the reader records it whole once it is wholly decided.
 
-The planner parks the rows of a pipeline of the run's dispatcher in three cases (`plan_edges`):
+The planner parks the rows of a pipeline, in the run's dispatcher or a loop's scope's, in three
+cases (`plan_edges`):
 
 - Its chain reads a live source and other pipelines (`Dispatcher::take_arrivals`). It takes the
   source's arrivals, and its queue in an epoch counts the seal as one more event. It is queued no
@@ -1580,12 +1568,17 @@ The planner parks the rows of a pipeline of the run's dispatcher in three cases 
 A pipeline that takes arrivals brings rows only from its arrivals and from a pipeline whose pushes
 arrive as its own keys (`Dispatcher::queue_pushes_of`), as a let-bound arm of a concatenation or a
 let-bound record's collection field; a push of one value that names only rows the arrivals bring
-brings none. A widened push brings no row. A loop's scope parks nothing, since a round consumes its
-inner pipelines' packages in order and runs once. Its planner reads whole, in pull mode, a pipeline
-that would park ([A loop in rounds](#a-loop-in-rounds)), and orders two edges by the round instead
-(`Dispatcher::follow`): a nested loop's scope takes a round's row only once the pipelines its rounds
-pull have finished the round, and a reader of a nested loop's scope, which pushes its store only
-once it is terminal, takes its packages only once that scope has finished the round.
+brings none. A widened push brings no row.
+
+A reader inside a loop's scope parks as one in the run's dispatcher does. Its inner pipelines' keys
+carry the loop's position, so a decided region names the rows of one position. A round queues its
+row to each inner reader as a push of the row from the drive lands at the reader's entry, restated
+by every operator on the way (`LoopScope::row_for`), and queues none to a reader whose input has
+released the row whole. A row a round queues waits whole until the pipelines the reader reads have
+decided all of it, the row's end included, which a closing round's reads state
+(`Dispatcher::queue_round`). A nested loop's scope still takes a round's row only once the
+pipelines its rounds pull have finished the round (`Dispatcher::follow`), and so does a reader of a
+nested loop's scope, which pushes its store only once it is terminal.
 
 A pull beneath a path over a live source's domain states the source's positions complete only
 through those it delivered, not past its last once it is complete, so a reader of a push beneath its

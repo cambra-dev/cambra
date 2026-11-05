@@ -689,6 +689,28 @@ fn a_loop_beside_a_sum() {
     );
 }
 
+/// A reader inside a loop's scope whose pushes can name one row twice parks its rows until the
+/// pipelines it reads have decided them, as one in the run's dispatcher does, and reads no input
+/// whole in pull mode.
+#[test]
+fn a_reader_inside_a_loops_scope_parks() {
+    let source = indoc! {"
+        out = test_sink()
+        total := 0
+        for x in [1, 2, 3]:
+            for y in [1, 2]:
+                total += x * y
+        out << total
+    "};
+    answers(source, "18", &["LoopScope", "SinkBreaker"]);
+    let (_, planned) = dispatched(source, 1);
+    let inner = rounds(&planned);
+    assert!(
+        inner.iter().any(|plan| plan.held) && !inner.iter().any(|plan| plan.whole),
+        "a reader in the outer loop's scope parks, and none reads whole: {planned:?}"
+    );
+}
+
 /// The inner loop of a nested pair runs as a scope inside the outer loop's scope, which queues it
 /// one row of its store per round of the outer loop.
 #[test]
