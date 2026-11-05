@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 use super::*;
 use crate::interpreter::operator_graph::value;
-use crate::interpreter::{ColumnValue, Consumer, Extent, Scheduler, tuple_field};
+use crate::interpreter::{ColumnValue, Consumer, Extent, Projection, Scheduler, tuple_field};
 
 /// An operator that permutes the fields of the domain of a `DataFunction`, according
 /// to a specified permutation of field indices.
@@ -123,7 +123,13 @@ impl TileProducer for PermuteRecordDomainProducer {
 
     impl_producer_base!();
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    /// The keys are renamed fieldwise, so the input is read whole and the answer is cut to the
+    /// projection over the permuted keys.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
         let input_tile = self.input.get(self.input.tiling().universal_guard());
         let Tile::DataFunction {
             row_starts,
@@ -140,13 +146,15 @@ impl TileProducer for PermuteRecordDomainProducer {
         };
         let output_domain = ColumnValue::Records(permute_record(input_fields, &self.permutation));
         let output_domain_pred = permute_componentwise(&domain_predicate, &self.permutation);
-        Tile::grouped(
+        let mut permuted = Tile::grouped(
             row_starts,
             output_domain,
             codomain,
             output_domain_pred,
             deleted,
-        )
+        );
+        permuted.restrict_to(&projection, self.tiling());
+        permuted
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -460,7 +468,13 @@ impl TileProducer for FlattenTupleDomainProducer {
         visit("input", &*self.input);
     }
 
-    fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
+    /// The keys are restated flat, so the input is read whole and the answer is cut to the
+    /// projection over the flat keys.
+    fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
+        let projection = projection_guard.projection(&self.name());
+        if projection == Projection::Nothing {
+            return self.tiling().empty_tile();
+        }
         let input_tile = self.input.get(self.input.tiling().universal_guard());
         let Tile::DataFunction {
             row_starts,
@@ -506,7 +520,9 @@ impl TileProducer for FlattenTupleDomainProducer {
             pred.with_component_restated(depth + 1, 0, &|keys| flatten_predicate(keys, field_map))
         });
 
-        Tile::grouped(row_starts, flat_domain, codomain, flat_pred, deleted)
+        let mut flat = Tile::grouped(row_starts, flat_domain, codomain, flat_pred, deleted);
+        flat.restrict_to(&projection, self.tiling());
+        flat
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {
@@ -1252,5 +1268,180 @@ mod tests {
             domain_predicate.contains(&key(6, 2, 4)),
             "{stated:?} -> {domain_predicate:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::test_helpers::{GuardLog, ProjectionSpy};
+    use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
+    use bit_set::BitSet;
+    use intervalsets::{Interval, IntervalSet};
+
+    fn uint() -> Extent {
+        Extent::Base(BaseType::UInt)
+    }
+
+    fn record_of<T>(fields: Vec<T>) -> HashMap<SmolStr, T> {
+        fields
+            .into_iter()
+            .enumerate()
+            .map(|(i, field)| (tuple_field(i), field))
+            .collect()
+    }
+
+    fn uints(values: &[u64]) -> ColumnValue {
+        ColumnValue::UInts(values.to_vec())
+    }
+
+    /// The keys whose field `field` is `position`, and nothing about the others.
+    fn field_is(field: usize, position: u64, fields: usize) -> TileGuard {
+        let only = Predicate::intervals(IntervalSet::from(Interval::closed(
+            Value::UInt(position),
+            Value::UInt(position),
+        )));
+        TileGuard::Function(FunctionGuard::Domain(Predicate::Record(
+            (0..fields)
+                .map(|i| {
+                    let admitted = if i == field {
+                        only.clone()
+                    } else {
+                        Predicate::True
+                    };
+                    (tuple_field(i), admitted)
+                })
+                .collect(),
+        )))
+    }
+
+    /// The key columns and values of a record-keyed tile of integers.
+    fn keyed_rows(tile: &Tile) -> (Vec<Vec<u64>>, Vec<i64>) {
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = tile
+        else {
+            panic!("a collection, got {tile:?}")
+        };
+        let ColumnValue::Records(columns) = domain else {
+            panic!("record keys, got {domain:?}")
+        };
+        let mut names: Vec<_> = columns.keys().cloned().collect();
+        names.sort();
+        let keys = names
+            .iter()
+            .map(|name| match &columns[name] {
+                ColumnValue::UInts(column) => column.clone(),
+                other => panic!("a column of positions, got {other:?}"),
+            })
+            .collect();
+        let Tile::Scalar(ColumnValue::Ints(values)) = &**codomain else {
+            panic!("integer values, got {codomain:?}")
+        };
+        (keys, values.clone())
+    }
+
+    /// `join` keys a collection by the pair `(x, y)`, and a consumer wants it keyed by
+    /// `(y, x)`: the pairs `(0,0) (0,1) (1,0) (1,1)` hold `10 11 12 13`.
+    fn swapped_pairs() -> (PermuteRecordDomainProducer, GuardLog) {
+        let tiling = Tiling::data_function(
+            Extent::Record(record_of(vec![uint(), uint()])),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let (input, pulled, _) = ProjectionSpy::new(
+            Tile::data_function(
+                ColumnValue::Records(record_of(vec![uints(&[0, 0, 1, 1]), uints(&[0, 1, 0, 1])])),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11, 12, 13]))),
+                Predicate::True,
+                BitSet::new(),
+            ),
+            tiling.clone(),
+        );
+        (
+            PermuteRecordDomainProducer {
+                base: ProducerBase::unowned(PermuteRecordDomainProducer::alloc_id(), &tiling),
+                input: Box::new(input),
+                permutation: vec![1, 0],
+            },
+            pulled,
+        )
+    }
+
+    /// The input is read whole, and the answer keeps the pairs whose first field, after the
+    /// swap, is `1`: the pairs `(1, 0)` and `(1, 1)` of the swapped keys.
+    #[test]
+    fn a_projection_over_the_permuted_keys_cuts_the_swapped_pairs() {
+        let (mut swapped, pulled) = swapped_pairs();
+        let cut = swapped.get(field_is(0, 1, 2));
+        assert_eq!(
+            keyed_rows(&cut),
+            (vec![vec![1, 1], vec![0, 1]], vec![11, 13])
+        );
+        assert!(pulled.borrow()[0].is_universal());
+    }
+
+    #[test]
+    fn permuted_pairs_asked_for_nothing_pull_nothing() {
+        let (mut swapped, pulled) = swapped_pairs();
+        let tile = swapped.get(swapped.tiling().empty_guard());
+        assert_eq!(tile, swapped.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
+    }
+
+    /// `((a, b), c)` keys flattened to `(a, b, c)`: the rows `((0,0),0) ((0,1),1) ((1,0),0)`
+    /// hold `10 11 12`.
+    fn flattened_triples() -> (FlattenTupleDomainProducer, GuardLog) {
+        let nested = Extent::Record(record_of(vec![
+            Extent::Record(record_of(vec![uint(), uint()])),
+            Extent::Record(record_of(vec![uint()])),
+        ]));
+        let in_tiling = Tiling::data_function(nested, Tiling::Scalar(Extent::Base(BaseType::Int)));
+        let (input, pulled, _) = ProjectionSpy::new(
+            Tile::data_function(
+                ColumnValue::Records(record_of(vec![
+                    ColumnValue::Records(record_of(vec![uints(&[0, 0, 1]), uints(&[0, 1, 0])])),
+                    ColumnValue::Records(record_of(vec![uints(&[0, 1, 0])])),
+                ])),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![10, 11, 12]))),
+                Predicate::True,
+                BitSet::new(),
+            ),
+            in_tiling,
+        );
+        let flat = Tiling::data_function(
+            Extent::Record(record_of(vec![uint(), uint(), uint()])),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        (
+            FlattenTupleDomainProducer {
+                base: ProducerBase::unowned(FlattenTupleDomainProducer::alloc_id(), &flat),
+                input: Box::new(input),
+                field_map: vec![
+                    (tuple_field(0), Some(tuple_field(0))),
+                    (tuple_field(0), Some(tuple_field(1))),
+                    (tuple_field(1), Some(tuple_field(0))),
+                ],
+            },
+            pulled,
+        )
+    }
+
+    #[test]
+    fn a_projection_over_the_flat_keys_cuts_the_flattened_triples() {
+        let (mut flat, pulled) = flattened_triples();
+        let cut = flat.get(field_is(2, 0, 3));
+        assert_eq!(
+            keyed_rows(&cut),
+            (vec![vec![0, 1], vec![0, 0], vec![0, 0]], vec![10, 12])
+        );
+        assert!(pulled.borrow()[0].is_universal());
+    }
+
+    #[test]
+    fn flattened_triples_asked_for_nothing_pull_nothing() {
+        let (mut flat, pulled) = flattened_triples();
+        let tile = flat.get(flat.tiling().empty_guard());
+        assert_eq!(tile, flat.tiling().empty_tile());
+        assert!(pulled.borrow().is_empty());
     }
 }
