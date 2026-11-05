@@ -234,6 +234,16 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
                     }
                     _ => instantiated,
                 }
+            } else if *b == crate::ccl::Builtin::Id {
+                // An `id` stamped by lowering asserts a refinement of the value it is applied
+                // to (`asserting` in `src/ccl/lower/nominal.rs`). Lowering types its predicate,
+                // in the declared parameters of the enclosing definition's `Poly`, which are
+                // opened here as the stamp's own types are. The predicate is not emitted: it
+                // is stated rather than checked, and emitting its `==` would demand
+                // `Equatable` of a parameter that declares nothing.
+                let mut stamp = expr.ty.clone();
+                open_stamped_predicates(&mut stamp, ctx);
+                ctx.normalize_annotation(&stamp)
             } else {
                 ctx.normalize_annotation(&expr.ty)
             }
@@ -839,6 +849,23 @@ fn emit_bare_predicate<C: Typing>(
             });
     });
     typed
+}
+
+/// Replace each declared type parameter in the type slots of the predicates `ty` carries with
+/// the variable its open `Poly` minted ([`Typing::refinement_domain`]).
+fn open_stamped_predicates<C: Typing>(ty: &mut Type, ctx: &C) {
+    fn open_slots<C: Typing>(e: &mut Expr, ctx: &C) {
+        e.walk_type_slots_mut(|t| *t = ctx.refinement_domain(t));
+        e.walk_children_mut(|child| open_slots(child, ctx));
+    }
+    if let Type::Refinement(_, refinements) = ty {
+        refinements.rewrite_each(|_, r| {
+            let mut predicate = r.predicate.clone_preserving_ids();
+            open_slots(&mut predicate, ctx);
+            *r = Refinement::born(std::rc::Rc::new(predicate));
+        });
+    }
+    ty.walk_children_mut(|child| open_stamped_predicates(child, ctx));
 }
 
 /// Apply a binary scheme: instantiate, build the expected call shape,
@@ -4149,7 +4176,28 @@ pub(super) fn emit_nominal_ctor<C: Typing>(
     ctx.require_sub(&payload_ty, &expected, &|| {
         format!("the argument of constructor `{}::{ctor}`", decl.name)
     })?;
-    Ok(Type::Nominal(decl.clone(), args))
+    if **decl != *crate::ccl::nominal::option() {
+        return Ok(Type::Nominal(decl.clone(), args));
+    }
+    // An `Option` states which constructor built it, and what its payload is where the
+    // payload is a term the refinement encoding reads: the body of `Option::some`'s function,
+    // `λ __ctor_arg → Option::some(__ctor_arg)`, whose type then reads the argument, and the
+    // `Option::some(1)` inlining leaves of a call of it.
+    let _g = crate::ccl::provenance::enter(
+        payload.node_id(),
+        "infer.option_ctor",
+        crate::ccl::provenance::Nature::Machinery,
+    );
+    let [arg] = args.as_slice() else {
+        unreachable!("`Option` declares one type parameter")
+    };
+    let argument = crate::ccl::infer::solver::smt::in_term_fragment(payload)
+        .then(|| payload.clone_preserving_ids());
+    let refinements = crate::ccl::nominal::option_ctor_refinements(ctor, arg, argument);
+    Ok(Type::refined(
+        Type::Nominal(decl.clone(), args),
+        refinements,
+    ))
 }
 
 /// A fresh argument for each parameter of `decl`: a variable, and for a family parameter the

@@ -830,10 +830,14 @@ where
             .map(|(qualifier, name)| PostfixOp::Attribute(name, qualifier))
             .boxed();
 
+        // `!` after anything but a subscript unwraps an `Option`; after a subscript the
+        // subscript parser above has already taken it as the proven lookup.
+        let unwrap = just(Token::Bang).to(PostfixOp::Unwrap);
+
         let postfix = atom
             .clone()
             .foldl_with(
-                choice((call_args, subscript, method_call, attribute)).repeated(),
+                choice((call_args, subscript, method_call, attribute, unwrap)).repeated(),
                 |target, op, e| {
                     let span = e.span();
                     let node = match op {
@@ -841,6 +845,7 @@ where
                             func: Box::new(target),
                             args,
                         },
+                        PostfixOp::Unwrap => Expr::Unwrap(Box::new(target)),
                         PostfixOp::Subscript(index, checked) => Expr::Subscript {
                             target: Box::new(target),
                             index,
@@ -1374,6 +1379,8 @@ enum PostfixOp {
     Attribute(Spanned<SmolStr>, Vec<Spanned<SmolStr>>),
     /// `.m(args)`: the method's name, its path's qualifier, and the arguments.
     MethodCall(Spanned<SmolStr>, Vec<Spanned<SmolStr>>, Vec<Spanned<Expr>>),
+    /// `!` after anything but a subscript.
+    Unwrap,
 }
 
 /// The n-ary boolean operation `first op₁ e₁ op₂ e₂ …`, flattened while the operator repeats.
@@ -5136,12 +5143,17 @@ mod tests {
         assert!(matches!(left.node, Expr::Subscript { checked: true, .. }));
     }
 
-    /// `!` is accepted only directly after a subscript.
+    /// `!` after anything but a subscript unwraps it, binding as tightly as the other
+    /// postfix operations.
     #[test]
-    fn a_bang_after_a_non_subscript_is_a_parse_error() {
-        for src in ["x!\n", "f(x)!\n", "r.a!\n"] {
-            assert!(!parse_mod(src).errors.is_empty(), "{src:?} must not parse");
+    fn a_bang_after_a_non_subscript_is_an_unwrap() {
+        for src in ["x!", "f(x)!", "r.a!"] {
+            assert!(matches!(parse_e(src).node, Expr::Unwrap(_)), "{src:?}");
         }
+        let Expr::Attribute { target, .. } = parse_e("x!.a").node else {
+            panic!("expected `x!.a` to read a field of the unwrap");
+        };
+        assert!(matches!(target.node, Expr::Unwrap(_)));
     }
 
     #[test]

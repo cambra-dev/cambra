@@ -1707,6 +1707,7 @@ fn lower_expr_inner(
             index,
             checked,
         } => lower_subscript(target, index, *checked, expr.span, ctx),
+        ChlExpr::Unwrap(target) => nominal::lower_unwrap(target, expr.span, ctx),
         // Record value `(name=expr, ...)`. Lowered to a `Record` constructor:
         // `(x=1, y="foo")` becomes `Record([("x", Lit(1)), ("y", Lit("foo"))])`.
         ChlExpr::Record(fields) => {

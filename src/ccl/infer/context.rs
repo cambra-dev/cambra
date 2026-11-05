@@ -808,6 +808,9 @@ impl ScopeEnv for SolverScope<'_> {
         }
         self.opaque_binders.get(name).and_then(value_type)
     }
+    fn resolve_slot(&self, slot: &Type) -> Option<Type> {
+        value_type(slot)
+    }
     fn is_skip_smt(&self) -> bool {
         false
     }

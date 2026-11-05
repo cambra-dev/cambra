@@ -1069,9 +1069,10 @@ fn pin_unobservable_param(lambda_ty: &Type, ctx: &mut CoalesceCtx) {
     }
 }
 
-/// Pin each argument of a constructed nominal value that neither its payload nor a demand
-/// determines, to the type of its position: `Opt::none` joined with `Opt::some(1)` is an
-/// `Opt(Int)`. With no answer the variable stays, for the post-inference check to report
+/// Pin each argument of a constructed nominal value that its payload does not reach: to what a
+/// demand on it resolves to, or with none to the type of its position (`Opt::none` joined with
+/// `Opt::some(1)` is an `Opt(Int)`). With no answer the variable stays, for the post-inference
+/// check to report
 /// (`docs/chl-spec.md`, "Type parameters"). See
 /// `src/ccl/design/type-inference.md`, "Pin sites".
 fn pin_unobservable_ctor_args(value_ty: &Type, ctx: &mut CoalesceCtx) {
@@ -1082,10 +1083,19 @@ fn pin_unobservable_ctor_args(value_ty: &Type, ctx: &mut CoalesceCtx) {
         let Type::Infer(v) = arg else {
             continue;
         };
-        if !matches!(resolve_var_type(arg), Ok(Type::Infer(_))) {
+        if value_reaches(arg) {
             continue;
         }
-        let Some(chosen) = accepted_position_type(v, ctx) else {
+        let chosen = match resolve_var_type(arg) {
+            Ok(Type::Infer(_)) => accepted_position_type(v, ctx),
+            // A demand alone determines the argument, and the walk reads it from that demand.
+            // The pin makes the reading a value, so a join the argument flows into covers it:
+            // `y.unwrap_or(2)` with `y = Option::none` and the result demanded `Int` reads
+            // `y : Option(Int)`, and `unwrap_or`'s `T` joins `Int` with `Int@2`.
+            Ok(read) => Some(read),
+            Err(_) => None,
+        };
+        let Some(chosen) = chosen else {
             continue;
         };
         if let Err(err) = pin_both_ways(&chosen, arg) {
@@ -2165,6 +2175,9 @@ impl crate::ccl::infer::solver::smt::ScopeEnv for ResolvingScope<'_> {
     fn binder_type(&self, name: &Name) -> Option<Type> {
         let ty = self.0.binder_type(name)?;
         Some(resolve_var_type(&ty).unwrap_or(ty))
+    }
+    fn resolve_slot(&self, slot: &Type) -> Option<Type> {
+        resolve_var_type(slot).ok()
     }
     fn is_skip_smt(&self) -> bool {
         false
@@ -3876,10 +3889,14 @@ pub(super) fn specialize_use(
     //
     // The outward edge decides a refinement deficit with the solver, as the
     // annotation check does, so a refinement the annotation states and the clone
-    // meets is discharged (`Int@5 <: {Int | __elem > 0}`). It runs under
-    // [`NoScope`](crate::ccl::infer::solver::smt::NoScope): the walk holds no scope
-    // to resolve free names against, so a predicate naming an enclosing binder is
-    // decided with nothing assumed about it.
+    // meets is discharged (`Int@5 <: {Int | __elem > 0}`). Both edges run under the
+    // binders in scope at the use ([`ResolvingScope`]): the use's types name them, as a
+    // dependent codomain does once the use's argument is substituted into it. The
+    // inward edge re-delivers the use's own bounds into the clone, so a deficit it
+    // decides without the solver lands on the clone's variable instead: for
+    // `x.unwrap_or(2)` with `x = Option::some(1)` annotated `{Int where _ == 1}`, the
+    // payload variable would acquire `Int@1` and refuse the argument `Int@2`, where
+    // the solver proves the result is `1` and the payload joins to `Int`.
     let ScopeEntry::Generalized(frame) = &ctx.scope[frame_idx] else {
         unreachable!("lookup_generalized returns indices of Generalized entries only");
     };
@@ -3896,13 +3913,18 @@ pub(super) fn specialize_use(
         &clone.ty,
         &use_expr.ty,
         &mut cache,
-        &crate::ccl::infer::solver::smt::NoScope,
+        &ResolvingScope(&ctx.binders),
     )
     .and_then(|()| {
         if one_way {
             Ok(())
         } else {
-            constrain_subtype(&use_expr.ty, &clone.ty, &mut cache)
+            constrain_subtype_in(
+                &use_expr.ty,
+                &clone.ty,
+                &mut cache,
+                &ResolvingScope(&ctx.binders),
+            )
         }
     });
     // Each of the binding's own type parameters that has a bound is below it in the clone,

@@ -787,14 +787,16 @@ the binder; specialization still needs its lexical scope.
 
 #### An unobservable variable takes the type of its position
 
-A variable is **unobservable** when a coalescing walk, the program's or a specialization clone's,
-is about to read it and nothing has determined it. What counts as determining it differs by site,
-as the table below gives. At an output site, an arm payload or a list literal's element, a value
+A variable is **unobservable** when a coalescing walk, the program's or a specialization clone's, is
+about to read it and nothing has determined it. What counts as determining it differs by site, as
+the table below gives. At an output site, an arm payload or a list literal's element, a value
 reaching it does (`value_reaches`) and a demand alone does not. At a lambda parameter, a value or a
-demand does. The walk pins each unobservable variable at a pin site to the type of its position,
-before any node reads it. The pin is recorded in both directions against the variable,
-so every occurrence reads the chosen type. Where the position determines nothing, each site
-applies its own fallback.
+demand does. A nominal constructor's type argument is an output site that a demand alone can
+resolve: it is then pinned to the type the demand gives, so a join it flows into, such as a call's
+type parameter, joins that type with the call's other arguments. The walk pins each unobservable
+variable at a pin site to the type of its position, before any node reads it. The pin is recorded in
+both directions against the variable, so every occurrence reads the chosen type. Where the position
+determines nothing, each site applies its own fallback.
 
 The pin gives a node the type its context already has. A join whose lower bounds are `𝐴` and an
 otherwise unbounded `𝛼` reads `𝐴`, because simplification removes a variable occurring at only one
@@ -811,7 +813,7 @@ conditional's reading unchanged.
 | Empty list literal | `box([1]) if c else box([])` | element `Int@1`, the other branch's element | the element type | no value reaches it | as an arm payload ([The empty literal names no element type](collections.md#the-empty-literal-names-no-element-type)) |
 | Lambda parameter | `(\x -> 1) if c else (\y -> y + 2)` | `x : Int`, the join's domain | the parameter's type | neither a value nor a demand reaches it | the variable remains, and the post-inference check reports `UnresolvedInfer` |
 | Call no value returns from | `def g(x): raise x`; `try: g(3) except Int as e: e + 1` | the call's result `Int`, the `try`'s join | the call's type | no value reaches it and the call may raise | as an arm payload |
-| Nominal constructor | `Opt::some(1) if c else Opt::none` | `T : Int@1`, the other branch's argument | each type argument of the value it builds, `T` in `Opt::none : Opt(T)` | neither the payload nor a demand reaches it | the variable remains, an unresolved type at the use (`docs/chl-spec.md`, "Type parameters") |
+| Nominal constructor | `Opt::some(1) if c else Opt::none` | `T : Int@1`, the other branch's argument | each type argument of the value it builds, `T` in `Opt::none : Opt(T)` | the payload does not reach it | the variable remains, an unresolved type at the use (`docs/chl-spec.md`, "Type parameters") |
 
 ##### The type of a position
 
@@ -982,9 +984,11 @@ of the same name. A frame retains the original definition until its body's walk 
    way, clone below use (`SpecializeFrame::bound_at_annotation`): the use is typed at an instance
    of the annotation, which the definition's own type need only be below. `\x -> x`, of type
    `𝑎 ⇒ 𝑎`, checks against `{Int where _ > 0} => Int`; the reverse edge would push the
-   annotation's codomain into the shared variable that is also the domain. The clone-below-use
-   edge decides a refinement deficit with the solver under `NoScope`, which assumes nothing about
-   a free name, so `\x -> 5` meets `Int => {Int where _ > 0}` at each use.
+   annotation's codomain into the shared variable that is also the domain. Both edges decide a
+   refinement deficit with the solver under the binders in scope at the use (`ResolvingScope`), so
+   `\x -> 5` meets `Int => {Int where _ > 0}` at each use. The use-below-clone edge re-delivers
+   the use's own bounds into the clone, and a deficit decided there without the solver would land
+   on the clone's type parameter instead of being proven of the call.
 6. Coalesce the clone in the definition site's scope, then restore the use site's scope. If the
    pin succeeded, the errors the clone's walk raises are held on the frame
    ([Checking a definition alone](#checking-a-definition-alone)).

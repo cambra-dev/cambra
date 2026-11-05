@@ -354,21 +354,45 @@ does. No `Method` node survives inference. A method no type declares is a loweri
 ### The compiler-provided `Option`
 
 `Option(T)` is a `NominalDecl` the compiler provides (`nominal::option`) at the path `std::Option`,
-with the constructors `none` and `some(T)`, the method `is_none`, and no source. Its constructor
-names are the tags the runtime builds when it answers a checked lookup (`V_NONE`, `V_SOME`), so a
-lookup's answer is a value of it. `LoweringContext::nominal_type` answers it for the name `Option`
-after the module's own declarations, and `Type::option_of` builds an application of it.
+with the constructors `none` and `some(T)`, the methods `is_none` and `unwrap_or`, and no source.
+Its constructor names are the tags the runtime builds when it answers a checked lookup (`V_NONE`,
+`V_SOME`), so a lookup's answer is a value of it. `LoweringContext::nominal_type` answers it for the
+name `Option` after the module's own declarations, and `Type::option_of` builds an application of
+it.
 
 A member of `Option` is bound only where the module names it: a reference records it
-(`member_reference`), and `bind_constructors` binds the recorded ones, `is_none` as
-`λ 𝑜 : Option(𝑇) → match 𝑜 { Option::some(_) → false; Option::none → true }` (`bind_is_none`). A
-method call names every type that declares its method, because inference picks the candidate
-from the receiver's type, so any `.is_none()` call binds `Option::is_none`, even one whose
-receiver is a type declaring its own `is_none`. A module that names no member lowers as it would
-without the declaration. Its
-identity is its path, so every compilation, and every version of a reloaded program, names the
-same type. Its spans are empty, and lowering refuses the programs that would point a diagnostic at
-one: a declaration named `Option`, and an associated function of it.
+(`member_reference`), and `bind_constructors` binds the recorded ones, `is_none` as `λ 𝑜 : Option(𝑇)
+→ match 𝑜 { Option::some(_) → false; Option::none → true }` (`bind_is_none`), `unwrap_or` as
+`bind_unwrap_or`, and `unwrap`, which only `x!` names (`lower_unwrap`), as `bind_unwrap`. A method
+call names every type that declares its method, because inference picks the candidate from the
+receiver's type, so any `.is_none()` call binds `Option::is_none`, even one whose receiver is a type
+declaring its own `is_none`. A module that names no member lowers as it would without the
+declaration. Its identity is its path, so every compilation, and every version of a reloaded
+program, names the same type. Its spans are empty, and lowering refuses the programs that would
+point a diagnostic at one: a declaration named `Option`, and an associated function of it.
+
+#### Refinements an `Option` carries
+
+Two builtins observe an `Option` in a refinement predicate: `option_is_none : Option(𝑇) ⇒ Bool`
+and `option_value : Option(𝑇) ⇒ 𝑇`. Neither is executed. The solver encodes `Option(𝑇)` as an
+uninterpreted sort with an uninterpreted `is_some` and `value` (`Sort::Option` in
+`src/ccl/infer/solver/smt.rs`), so `option_value` of a `none` is unconstrained.
+
+- `emit_nominal_ctor` refines each `Option` it builds: `Option::none` by
+  `__elem ▷ option_is_none`, and `Option::some(𝑣)` by `not (__elem ▷ option_is_none)` and, where
+  `𝑣` is in the solver's term fragment (`in_term_fragment`), `(__elem ▷ option_value) == 𝑣`.
+  The fragment admits an operator in both spellings, `𝑙 + 𝑟` and the `(𝑙, 𝑟) ▷ add` that
+  `lambda_elim` rewrites it to in a predicate as in the tree. The check after `lambda_elim`
+  re-derives the type of an `Option::some` inside a predicate, and with one spelling admitted it
+  derives a type without the `option_value` conjunct inference recorded.
+- `bind_unwrap` and `bind_unwrap_or` state their results through `asserting`, which applies an
+  `id` stamped `𝑇 ⇒ {𝑇 | predicate}`. Inference takes the stamp as given, since no typing rule
+  derives the predicate from the `match` that computes the result. `unwrap`'s parameter is
+  `{Option(𝑇) | not (__elem ▷ option_is_none)}`, so its `match` has no `none` arm.
+- In a refinement predicate, `.is_none()` and `.value()` lower to `option_is_none` and
+  `option_value` (`predicate_observer`) where `Option` is the only type declaring the method.
+  A call of the method's binding has no encoding, and specialization renames the binding. The
+  method `value` exists only in a predicate (`builtin_functions`) and has no binding.
 
 ---
 

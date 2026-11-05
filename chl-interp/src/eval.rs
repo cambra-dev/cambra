@@ -1013,7 +1013,8 @@ fn for_each_block<'a>(e: &'a Spanned<Expr>, bodies: Bodies, f: &mut dyn FnMut(&'
             payload: Some(VariantPayload::Term(inner)),
             ..
         }
-        | Expr::Yield(inner) => sub(inner),
+        | Expr::Yield(inner)
+        | Expr::Unwrap(inner) => sub(inner),
         Expr::IfExp {
             cond,
             then_expr,
@@ -1058,6 +1059,9 @@ enum BuiltinMethod {
     /// `Option::is_none`, which the compiler provides with `Option` (`bind_is_none` in
     /// `src/ccl/lower/nominal.rs`).
     IsNone,
+    /// `Option::unwrap_or`, which the compiler provides with `Option` (`bind_unwrap_or` in
+    /// `src/ccl/lower/nominal.rs`).
+    UnwrapOr,
 }
 
 impl BuiltinMethod {
@@ -1066,14 +1070,27 @@ impl BuiltinMethod {
         match self {
             BuiltinMethod::Extract => "extract",
             BuiltinMethod::IsNone => "is_none",
+            BuiltinMethod::UnwrapOr => "unwrap_or",
         }
     }
 
-    /// The method applied to a value built by the constructor `ctor` from `payload`.
-    fn apply(self, ctor: &str, payload: &Value) -> Value {
+    /// The number of arguments the method takes after its receiver.
+    fn arity(self) -> usize {
         match self {
-            BuiltinMethod::Extract => payload.clone(),
-            BuiltinMethod::IsNone => Value::Bool(ctor == "none"),
+            BuiltinMethod::Extract | BuiltinMethod::IsNone => 0,
+            BuiltinMethod::UnwrapOr => 1,
+        }
+    }
+
+    /// The method applied to a value built by the constructor `ctor` from `payload`, and to
+    /// the arguments `args` after it.
+    fn apply(self, ctor: &str, payload: &Value, args: &[Value]) -> Value {
+        match (self, args) {
+            (BuiltinMethod::Extract, []) => payload.clone(),
+            (BuiltinMethod::IsNone, []) => Value::Bool(ctor == "none"),
+            (BuiltinMethod::UnwrapOr, [default]) if ctor == "none" => default.clone(),
+            (BuiltinMethod::UnwrapOr, [_]) => payload.clone(),
+            _ => unreachable!("the caller checks `{}`'s arity", self.name()),
         }
     }
 }
@@ -1103,7 +1120,7 @@ impl TypeMembers {
 
 /// What `body` declares of each nominal type, by the type's name: each `type` declaration's
 /// members, the methods the associated functions of the type declare, and the
-/// compiler-provided `Option`'s constructors and `is_none`.
+/// compiler-provided `Option`'s constructors, `is_none` and `unwrap_or`.
 fn collect_types(body: &[Spanned<Stmt>]) -> BTreeMap<String, TypeMembers> {
     let mut option = TypeMembers {
         members: BTreeMap::from([
@@ -1113,6 +1130,7 @@ fn collect_types(body: &[Spanned<Stmt>]) -> BTreeMap<String, TypeMembers> {
         methods: BTreeSet::new(),
     };
     option.add_builtin(BuiltinMethod::IsNone);
+    option.add_builtin(BuiltinMethod::UnwrapOr);
     let mut out = BTreeMap::from([(OPTION.to_string(), option)]);
     let mut add_function = |ty: &str, name: &str, params: &[chl_parser::ast::Param]| {
         if params.first().is_some_and(|p| p.name == "self") {
@@ -2126,7 +2144,23 @@ impl Interp {
         if self.slot(&bound).is_none()
             && let Some(Member::Builtin(builtin)) = members.members.get(method)
         {
-            return Ok(builtin.apply(ctor, payload));
+            let builtin = *builtin;
+            if args.len() != builtin.arity() {
+                return err(format!(
+                    "`.{method}(…)` takes {} arguments, got {}",
+                    builtin.arity(),
+                    args.len()
+                ));
+            }
+            let (ctor, payload) = (ctor.clone(), payload.clone());
+            let mut values = Vec::with_capacity(args.len());
+            for a in args {
+                values.push(self.eval(a)?);
+            }
+            if any_pending(values.iter()) {
+                return Ok(Value::Pending);
+            }
+            return Ok(builtin.apply(&ctor, &payload, &values));
         }
         let Some(Slot::Fn(function)) = self.slot(&bound) else {
             return err(format!("`{bound}` is not bound"));
@@ -2182,19 +2216,28 @@ impl Interp {
                 return self.call_user(&bound, &function, args);
             }
         }
-        // `N::extract(n)` is the payload of `n`'s one constructor `new`, and
-        // `Option::is_none(o)` whether `o` is `none`.
+        // `N::extract(n)` is the payload of `n`'s one constructor `new`,
+        // `Option::is_none(o)` whether `o` is `none`, and `Option::unwrap_or(o, w)` the payload
+        // of `o` or `w`.
         if let Member::Builtin(method) = self.member(q)? {
             let name = method.name();
-            let [arg] = args else {
-                return err(format!("`{name}` takes one argument"));
+            let Some((arg, rest)) = args
+                .split_first()
+                .filter(|_| args.len() == method.arity() + 1)
+            else {
+                return err(format!("`{name}` takes {} arguments", method.arity() + 1));
             };
+            let mut values = Vec::with_capacity(rest.len());
+            for a in rest {
+                values.push(self.eval(a)?);
+            }
             return match self.eval(arg)? {
                 Value::Pending => Ok(Value::Pending),
+                _ if any_pending(values.iter()) => Ok(Value::Pending),
                 Value::Nominal { ty, ctor, payload }
                     if q.qualifier.last().is_some_and(|t| t.node == ty) =>
                 {
-                    Ok(method.apply(&ctor, &payload))
+                    Ok(method.apply(&ctor, &payload, &values))
                 }
                 other => err(format!("`{name}` takes a nominal value, got {other}")),
             };
@@ -2979,6 +3022,16 @@ impl Interp {
                     payload: Box::new(inner),
                 })
             }
+
+            // `x!`: the payload of an `Option::some`. The compiler refuses a program whose `x`
+            // is not proven `some`, so a `none` here is a program the two disagree on.
+            Expr::Unwrap(operand) => match self.eval(operand)? {
+                Value::Pending => Ok(Value::Pending),
+                Value::Nominal { ty, ctor, payload } if ty == OPTION && ctor == "some" => {
+                    Ok(*payload)
+                }
+                other => err(format!("`!` takes an `Option::some`, got {other}")),
+            },
 
             Expr::UnaryOp { op, operand } => {
                 let v = self.eval(operand)?;

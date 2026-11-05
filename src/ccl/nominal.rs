@@ -190,6 +190,81 @@ fn runtime_order(order: &WrittenOrder) -> crate::interpreter::ValueOrder {
     }
 }
 
+/// `option ▷ option_is_none`: whether `option`, an `Option(payload)`, is `none`, as a
+/// refinement predicate states it ([`crate::ccl::Builtin::OptionIsNone`]).
+///
+/// The refinements the compiler states about `Option` values are built from this and
+/// [`option_value`], the two observers of an `Option` the refinement encoding reads
+/// (`src/ccl/infer/solver/smt.rs`, "Option").
+pub fn option_is_none(option: crate::ccl::TypedExpr, payload: &Type) -> crate::ccl::TypedExpr {
+    option_observer(
+        crate::ccl::Builtin::OptionIsNone,
+        option,
+        payload,
+        Type::Base(BaseType::Bool),
+    )
+}
+
+/// `option ▷ option_value`: the payload of `option`, an `Option(payload)`, as a refinement
+/// predicate states it ([`crate::ccl::Builtin::OptionValue`]). It says nothing of a `none`.
+pub fn option_value(option: crate::ccl::TypedExpr, payload: &Type) -> crate::ccl::TypedExpr {
+    option_observer(
+        crate::ccl::Builtin::OptionValue,
+        option,
+        payload,
+        payload.clone(),
+    )
+}
+
+fn option_observer(
+    observer: crate::ccl::Builtin,
+    option: crate::ccl::TypedExpr,
+    payload: &Type,
+    result: Type,
+) -> crate::ccl::TypedExpr {
+    use crate::ccl::TypedExpr;
+    let function = TypedExpr::builtin(observer)
+        .with_ty(Type::fun(Type::option_of(payload.clone()), result.clone()));
+    TypedExpr::apply(option, function).with_ty(result)
+}
+
+/// The refinements an `Option(payload)` built by the constructor `ctor` carries: `none` is
+/// `__elem ▷ option_is_none`, and `some` is `not (__elem ▷ option_is_none)` and, where
+/// `argument` names its payload, `(__elem ▷ option_value) == argument`.
+pub fn option_ctor_refinements(
+    ctor: &str,
+    payload: &Type,
+    argument: Option<crate::ccl::TypedExpr>,
+) -> RefinementSet {
+    use crate::ccl::{BinOpKind, CompareKind, TypedExpr, UnaryOpKind};
+    let bool_ty = Type::Base(BaseType::Bool);
+    let elem = || TypedExpr::var(Name::elem()).with_ty(Type::option_of(payload.clone()));
+    let is_none = option_is_none(elem(), payload);
+    let born = |predicate: TypedExpr| Refinement::born(Rc::new(predicate));
+    if ctor == V_NONE.name() {
+        return born(is_none).into();
+    }
+    debug_assert_eq!(
+        ctor,
+        V_SOME.name(),
+        "`Option` declares `none` and `some` only"
+    );
+    let mut refinements = vec![born(
+        TypedExpr::unary(UnaryOpKind::Not, is_none).with_ty(bool_ty.clone()),
+    )];
+    if let Some(argument) = argument {
+        refinements.push(born(
+            TypedExpr::binop(
+                option_value(elem(), payload),
+                BinOpKind::Compare(CompareKind::Equals),
+                argument,
+            )
+            .with_ty(bool_ty),
+        ));
+    }
+    refinements.into_iter().collect()
+}
+
 /// The compiler-provided declaration `name` names, if any.
 pub fn builtin(name: &str) -> Option<Rc<NominalDecl>> {
     (name == OPTION).then(option)

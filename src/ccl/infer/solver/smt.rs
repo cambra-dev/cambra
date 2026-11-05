@@ -12,8 +12,9 @@
 //! addresses is what an SMT constant is minted for.
 //!
 //! The fragment is over **surface-syntax** predicate shapes: a variable, a field
-//! read, a literal, a unary or a binary operator, and the `Int`/`UInt` equality
-//! `(𝑎, 𝑏) ▷ int_eq_uint` ([`Encode::expr`]). `lambda_elim`
+//! read, a literal, a unary or a binary operator, the `Int`/`UInt` equality
+//! `(𝑎, 𝑏) ▷ int_eq_uint`, and the observers of an `Option` ([`Encode::expr`],
+//! [`Sort::Option`]). `lambda_elim`
 //! rewrites every predicate point-free — `__elem == 1` becomes
 //! `__elem ▷ ((id, 1 ▷ const) ▷ zip ≫ eq)` — so no predicate at or after that pass
 //! is encodable, and every check from there on decides its deficits structurally.
@@ -113,9 +114,19 @@ pub enum Sort {
     UIntRange(u64),
     /// A sort reached by the solver's own spelling for it, carrying no constraint
     /// of its own. `String` is the case: z3's built-in string sort, used here as a
-    /// sort name. This reaches a built-in sort and not an uninterpreted one,
-    /// which would need a `declare-sort` command that nothing here emits.
+    /// sort name. This reaches a built-in sort and not an uninterpreted one, which
+    /// [`Sort::Option`] is.
     Named(String),
+    /// `Option(𝑇)`, carrying `𝑇`'s sort: the uninterpreted sort `Option_𝑋`, where `𝑋` is
+    /// `𝑇`'s sort's [name](Sort::name). Two payload types with different sorts name two
+    /// sorts. What is known of a value of it is what the uninterpreted
+    /// `is_some_𝑋 : Option_𝑋 → Bool` and `value_𝑋 : Option_𝑋 → 𝑇` say, the readings of
+    /// `option_is_none` (negated) and `option_value` ([`Encode::observe`]). `value_𝑋` of a
+    /// value whose `is_some_𝑋` is false is unconstrained beyond its sort.
+    ///
+    /// [`Sort::declare_option_sorts`] declares the sort and its two functions for a query
+    /// that reads one.
+    Option(Box<Sort>),
 }
 
 impl Sort {
@@ -125,11 +136,7 @@ impl Sort {
     fn declare(self, sym: String, ctx: &mut Context) -> Result<(), SmtError> {
         let sym_atom = ctx.atom(sym.clone());
         let constraint = self.membership(sym_atom, ctx);
-        let sort_atom = match self {
-            Self::Bool => ctx.bool_sort(),
-            Self::Int | Self::UInt | Self::UIntRange(_) => ctx.int_sort(),
-            Self::Named(s) => ctx.atom(s),
-        };
+        let sort_atom = self.smt_sort(ctx);
         ctx.declare_const(sym, sort_atom)
             .map_err(exchange_failure)?;
         if let Some(c) = constraint {
@@ -143,10 +150,70 @@ impl Sort {
     fn membership(&self, x: SExpr, ctx: &Context) -> Option<SExpr> {
         let non_neg = ctx.gte(x, ctx.numeral(0));
         match self {
-            Self::Bool | Self::Int | Self::Named(_) => None,
+            Self::Bool | Self::Int | Self::Named(_) | Self::Option(_) => None,
             Self::UInt => Some(non_neg),
             Self::UIntRange(n) => Some(ctx.and(non_neg, ctx.lt(x, ctx.numeral(*n)))),
         }
+    }
+}
+
+impl Sort {
+    /// The SMT sort a constant of this sort is declared at.
+    fn smt_sort(&self, ctx: &Context) -> SExpr {
+        match self {
+            Self::Bool => ctx.bool_sort(),
+            Self::Int | Self::UInt | Self::UIntRange(_) => ctx.int_sort(),
+            Self::Named(s) => ctx.atom(s.as_str()),
+            Self::Option(_) => ctx.atom(self.name()),
+        }
+    }
+
+    /// A spelling of this sort that is a legal SMT-LIB symbol and differs between any two
+    /// sorts: the `𝑋` of the [`Sort::Option`] whose payload this is.
+    fn name(&self) -> String {
+        match self {
+            Self::Bool => "Bool".to_string(),
+            Self::Int => "Int".to_string(),
+            Self::UInt => "UInt".to_string(),
+            Self::UIntRange(n) => format!("UIntRange{n}"),
+            Self::Named(s) => s.clone(),
+            Self::Option(payload) => format!("Option_{}", payload.name()),
+        }
+    }
+
+    /// `is_some_𝑋`, for the [`Sort::Option`] whose payload is this sort.
+    fn is_some_symbol(&self) -> String {
+        format!("is_some_{}", self.name())
+    }
+
+    /// `value_𝑋`, for the [`Sort::Option`] whose payload is this sort.
+    fn value_symbol(&self) -> String {
+        format!("value_{}", self.name())
+    }
+
+    /// Declare every [`Sort::Option`] this sort is or contains, with its `is_some_𝑋` and
+    /// `value_𝑋`, payloads first. `declared` holds the names already declared in this
+    /// query, so a sort two constants share is declared once.
+    fn declare_option_sorts(
+        &self,
+        declared: &mut HashSet<String>,
+        ctx: &mut Context,
+    ) -> Result<(), SmtError> {
+        let Self::Option(payload) = self else {
+            return Ok(());
+        };
+        payload.declare_option_sorts(declared, ctx)?;
+        if !declared.insert(self.name()) {
+            return Ok(());
+        }
+        let sort = ctx.declare_sort(self.name(), 0).map_err(exchange_failure)?;
+        let bool_sort = ctx.bool_sort();
+        ctx.declare_fun(payload.is_some_symbol(), vec![sort], bool_sort)
+            .map_err(exchange_failure)?;
+        let payload_sort = payload.smt_sort(ctx);
+        ctx.declare_fun(payload.value_symbol(), vec![sort], payload_sort)
+            .map_err(exchange_failure)?;
+        Ok(())
     }
 }
 
@@ -173,6 +240,16 @@ pub trait ScopeEnv {
     /// variable and answering means resolving it — there is no settled `Type` in
     /// the scope to hand out a borrow of.
     fn binder_type(&self, name: &Name) -> Option<Type>;
+    /// What the inference variable `slot` resolves to, for a scope in which types still
+    /// hold inference variables, or `None` where it resolves to nothing more. The encoding
+    /// reads it for the variables of a predicate node's slot and of the query's base.
+    ///
+    /// The encoding reads it for a sort and never for an assumption: a slot also carries
+    /// what the position demanded, and the sort of a value is all a demand and the value
+    /// agree on.
+    fn resolve_slot(&self, _slot: &Type) -> Option<Type> {
+        None
+    }
     /// Whether a subtyping comparison carrying this environment decides a
     /// refinement deficit structurally, without raising a query at all.
     ///
@@ -346,17 +423,61 @@ pub fn defined_as(ty: Type, definition: &TypedExpr) -> Type {
 }
 
 /// Whether `e` is built only from the node forms [`Encode::expr`] translates: integer and boolean
-/// literals, paths, and unary and binary operators over them. An operator the encoding has no
-/// rule for still fails there, which drops the assumption.
-fn in_term_fragment(e: &TypedExpr) -> bool {
+/// literals, paths, and unary and binary operators over them in either spelling
+/// ([`Operation`]). An operator the encoding has no rule for still fails there, which drops the
+/// assumption.
+pub(crate) fn in_term_fragment(e: &TypedExpr) -> bool {
+    if let Some(operation) = Operation::of(e) {
+        return match operation {
+            Operation::Unary(_, operand) => in_term_fragment(operand),
+            Operation::Binary(left, _, right) => in_term_fragment(left) && in_term_fragment(right),
+        };
+    }
     match &e.node {
         TypedExprNode::Lit(Lit::Int(_) | Lit::Bool(_)) | TypedExprNode::Var(_) => true,
         TypedExprNode::Apply { .. } => Path::of(e).is_some(),
-        TypedExprNode::UnaryOp(_, operand) => in_term_fragment(operand),
-        TypedExprNode::BinOp { left, right, .. } => {
-            in_term_fragment(left) && in_term_fragment(right)
-        }
         _ => false,
+    }
+}
+
+/// An operator applied to its operands, in either spelling the pipeline gives it: the
+/// `UnaryOp`/`BinOp` node, or the application of the operator's builtin that `lambda_elim`
+/// rewrites the node to, `x ▷ neg` or `(l, r) ▷ add`.
+///
+/// `lambda_elim` rewrites the operators in a type's refinement predicates as well as in the
+/// tree, so a rule that reads a term through [`in_term_fragment`] after it meets the second
+/// spelling where inference met the first. Both have to answer the same, or the rule
+/// re-derives a type weaker than the one inference recorded.
+enum Operation<'a> {
+    Unary(UnaryOpKind, &'a TypedExpr),
+    Binary(&'a TypedExpr, BinOpKind, &'a TypedExpr),
+}
+
+impl<'a> Operation<'a> {
+    fn of(e: &'a TypedExpr) -> Option<Self> {
+        match &e.node {
+            TypedExprNode::UnaryOp(op, operand) => Some(Self::Unary(*op, operand)),
+            TypedExprNode::BinOp { left, op, right } => Some(Self::Binary(left, *op, right)),
+            TypedExprNode::Apply { function, argument } => match &function.node {
+                TypedExprNode::Builtin(Builtin::BinOp(op)) => {
+                    let TypedExprNode::Tuple(operands) = &argument.node else {
+                        return None;
+                    };
+                    let [left, right] = operands.as_slice() else {
+                        return None;
+                    };
+                    Some(Self::Binary(left, *op, right))
+                }
+                TypedExprNode::Builtin(Builtin::Neg) => {
+                    Some(Self::Unary(UnaryOpKind::Neg, argument))
+                }
+                TypedExprNode::Builtin(Builtin::NotFn) => {
+                    Some(Self::Unary(UnaryOpKind::Not, argument))
+                }
+                _ => None,
+            },
+            _ => None,
+        }
     }
 }
 
@@ -547,6 +668,10 @@ fn run(
     decls: Vec<(String, Sort)>,
     formula: SExpr,
 ) -> Result<Response, SmtError> {
+    let mut option_sorts = HashSet::new();
+    for (_, sort) in &decls {
+        sort.declare_option_sorts(&mut option_sorts, ctx)?;
+    }
     for (sym, sort) in decls {
         log::debug!("declare {sym} at {sort:?}");
         sort.declare(sym, ctx)?;
@@ -590,8 +715,8 @@ struct Encode<'a> {
     /// is that value.
     subject: Option<Path>,
     /// Leaves encoded so far, keyed by [`Path`] so that one leaf is one SMT
-    /// constant across both sides of the query.
-    vars: HashMap<Path, SExpr>,
+    /// constant across both sides of the query, with the sort each is declared at.
+    vars: HashMap<Path, (SExpr, Sort)>,
     /// The paths whose types have already been read for assumptions. Separate
     /// from `vars` because a path with no constant of its own still carries
     /// refinements — a product's own predicate reads its fields — and because a
@@ -666,7 +791,7 @@ impl<'a> Encode<'a> {
         let integral = |sort: &Sort| matches!(sort, Sort::Int | Sort::UInt | Sort::UIntRange(_));
         match (self.sort(self.base), self.sort(target)) {
             (Some(from), Some(to)) if integral(&from) && integral(&to) => {
-                let subject = self.vars[&Path::subject()];
+                let subject = self.vars[&Path::subject()].0;
                 Ok(to.membership(subject, self.ctx))
             }
             _ => Err(fails(format!(
@@ -807,7 +932,17 @@ impl<'a> Encode<'a> {
             Type::UIntRange(n) => Some(Sort::UIntRange(*n)),
             Type::Base(BaseType::Bool) => Some(Sort::Bool),
             Type::Base(BaseType::String) => Some(Sort::Named("String".to_string())),
+            Type::Nominal(..) => {
+                let payload = ty.peel_refinements().option_payload()?;
+                Some(Sort::Option(Box::new(self.sort(payload)?)))
+            }
             Type::History { .. } => self.sort(ty.history_parts()?.1),
+            // A variable takes the sort of what the scope resolves it to
+            // ([`ScopeEnv::resolve_slot`]): `Option(?𝑁)`'s payload, or a predicate node's slot.
+            Type::Infer(_) => match self.scope.resolve_slot(ty)? {
+                Type::Infer(_) => None,
+                resolved => self.sort(&resolved),
+            },
             _ => None,
         }
     }
@@ -815,6 +950,22 @@ impl<'a> Encode<'a> {
     /// A predicate term as an s-expression, or a description of the part with no
     /// encoding. The caller pairs that description with the body it came from.
     fn expr(&mut self, e: &TypedExpr) -> Result<SExpr, String> {
+        match Operation::of(e) {
+            Some(Operation::Unary(op, operand)) => {
+                let operand = self.expr(operand)?;
+                // `^not` computes what `not` computes, as a binary `^` sibling does.
+                return Ok(match op.unrefined() {
+                    UnaryOpKind::Neg => self.ctx.negate(operand),
+                    UnaryOpKind::Not => self.ctx.not(operand),
+                    UnaryOpKind::NotRefined => unreachable!("`unrefined` answers no `NotRefined`"),
+                });
+            }
+            Some(Operation::Binary(left, op, right)) => {
+                let (l, r) = (self.expr(left)?, self.expr(right)?);
+                return self.binop(op, left, right, l, r);
+            }
+            None => {}
+        }
         match &e.node {
             TypedExprNode::Lit(Lit::Int(n)) => Ok(self.numeral(*n)),
             TypedExprNode::Lit(Lit::Bool(b)) => Ok(if *b {
@@ -836,6 +987,10 @@ impl<'a> Encode<'a> {
                 let (int, uint) = (self.expr(int)?, self.expr(uint)?);
                 Ok(self.ctx.eq(int, uint))
             }
+            TypedExprNode::Apply { function, argument } if option_observer(function).is_some() => {
+                let observer = option_observer(function).expect("the guard found one");
+                self.observe(observer, argument)
+            }
             // A name, or a field read through one: both address a leaf of the value
             // the root denotes, and the path is what names that leaf. An `Apply`
             // that is not a projection chain addresses no leaf and falls through.
@@ -843,20 +998,55 @@ impl<'a> Encode<'a> {
                 Some(path) => self.leaf(path, &e.ty),
                 None => Err(unencodable(e)),
             },
-            TypedExprNode::UnaryOp(op, operand) => {
-                let operand = self.expr(operand)?;
-                // `^not` computes what `not` computes, as a binary `^` sibling does.
-                Ok(match op.unrefined() {
-                    UnaryOpKind::Neg => self.ctx.negate(operand),
-                    UnaryOpKind::Not => self.ctx.not(operand),
-                    UnaryOpKind::NotRefined => unreachable!("`unrefined` answers no `NotRefined`"),
-                })
-            }
-            TypedExprNode::BinOp { left, op, right } => {
-                let (l, r) = (self.expr(left)?, self.expr(right)?);
-                self.binop(*op, left, right, l, r)
-            }
             _ => Err(unencodable(e)),
+        }
+    }
+
+    /// `option ▷ observer`, for `observer` an observer of `Option` ([`option_observer`]):
+    /// `(not (is_some_𝑋 option))` or `(value_𝑋 option)` ([`Sort::Option`]). A `value_𝑋` whose
+    /// payload sort constrains its members adds that constraint to `Γ`, as a declared
+    /// constant of the sort does.
+    fn observe(&mut self, observer: Builtin, option: &TypedExpr) -> Result<SExpr, String> {
+        let (option, payload) = self.option_term(option)?;
+        match observer {
+            Builtin::OptionIsNone => {
+                let is_some = self.ctx.atom(payload.is_some_symbol());
+                Ok(self.ctx.not(self.ctx.list(vec![is_some, option])))
+            }
+            Builtin::OptionValue => {
+                let value = self.ctx.atom(payload.value_symbol());
+                let read = self.ctx.list(vec![value, option]);
+                if let Some(membership) = payload.membership(read, self.ctx) {
+                    self.assumptions.push(membership);
+                }
+                Ok(read)
+            }
+            _ => unreachable!("`option_observer` answers `option_is_none` or `option_value`"),
+        }
+    }
+
+    /// A term of an `Option` sort, with the sort of its payload: a leaf, or the
+    /// `option_value` of a term of an `Option(Option(𝑇))`.
+    fn option_term(&mut self, e: &TypedExpr) -> Result<(SExpr, Sort), String> {
+        let (term, sort) = match &e.node {
+            TypedExprNode::Apply { function, argument }
+                if option_observer(function) == Some(Builtin::OptionValue) =>
+            {
+                let (option, payload) = self.option_term(argument)?;
+                let value = self.ctx.atom(payload.value_symbol());
+                (self.ctx.list(vec![value, option]), payload)
+            }
+            _ => {
+                let path = Path::of(e).ok_or_else(|| unencodable(e))?;
+                self.leaf_sorted(path, &e.ty)?
+            }
+        };
+        match sort {
+            Sort::Option(payload) => Ok((term, *payload)),
+            sort => Err(format!(
+                "{} is observed as an `Option` and is encoded at {sort:?}",
+                symbolic(e)
+            )),
         }
     }
 
@@ -935,26 +1125,48 @@ impl<'a> Encode<'a> {
     /// settles: declaring the leaf is what the surrounding predicate needs, and the
     /// assumption is the part that can be dropped.
     fn leaf(&mut self, path: Path, ty: &Type) -> Result<SExpr, String> {
+        self.leaf_sorted(path, ty).map(|(leaf, _)| leaf)
+    }
+
+    /// [`Encode::leaf`], with the sort the leaf is declared at.
+    fn leaf_sorted(&mut self, path: Path, ty: &Type) -> Result<(SExpr, Sort), String> {
         let path = self.reroot(path);
-        if let Some(e) = self.vars.get(&path) {
-            return Ok(*e);
+        if let Some((e, sort)) = self.vars.get(&path) {
+            return Ok((*e, sort.clone()));
         }
-        match self.path_type(&path).and_then(|bound| self.sort(&bound)) {
+        match self
+            .path_type(&path)
+            .and_then(|bound| self.leaf_sort(&bound, ty))
+        {
             Some(sort) => {
                 // Declared before the types along the path are read, so a scope
                 // whose binders reference each other terminates rather than
                 // recurring through this arm.
-                let leaf = self.declare(path.clone(), sort);
+                let leaf = self.declare(path.clone(), sort.clone());
                 self.assume_along(&path);
-                Ok(leaf)
+                Ok((leaf, sort))
             }
             None => {
                 let sort = self
                     .sort(ty)
                     .ok_or_else(|| format!("{path} is typed {ty}, which has no SMT sort"))?;
-                Ok(self.declare(path, sort))
+                Ok((self.declare(path, sort.clone()), sort))
             }
         }
+    }
+
+    /// The sort of a leaf whose path's type is `bound`, read at the slot `slot`.
+    ///
+    /// An `Option` whose payload nothing has flowed into yet — `Option::none`'s, before a use
+    /// settles it — has no sort of its own, and takes the slot's: what the payload is, the
+    /// position reading it says. Its refinements are still the path's, so the leaf assumes
+    /// them as any sorted path's.
+    fn leaf_sort(&self, bound: &Type, slot: &Type) -> Option<Sort> {
+        self.sort(bound).or_else(|| {
+            bound.peel_refinements().option_payload()?;
+            self.sort(slot)
+                .filter(|sort| matches!(sort, Sort::Option(_)))
+        })
     }
 
     /// A path written inside a predicate, rewritten into the frame the query's
@@ -1011,9 +1223,21 @@ impl<'a> Encode<'a> {
     fn declare(&mut self, path: Path, sort: Sort) -> SExpr {
         let sym = format!("v!{}", self.decls.len());
         let e = self.ctx.atom(sym.as_str());
-        self.decls.push((sym, sort));
-        self.vars.insert(path, e);
+        self.decls.push((sym, sort.clone()));
+        self.vars.insert(path, (e, sort));
         e
+    }
+}
+
+/// The observer of `Option` that `function` is, if it is one: the builtin `option_is_none`
+/// or `option_value`, which a refinement the compiler states applies and a predicate's
+/// `.is_none()` or `.value()` lowers to (`predicate_observer` in `src/ccl/lower/nominal.rs`).
+fn option_observer(function: &TypedExpr) -> Option<Builtin> {
+    match &function.node {
+        TypedExprNode::Builtin(b @ (Builtin::OptionIsNone | Builtin::OptionValue)) => {
+            Some(b.clone())
+        }
+        _ => None,
     }
 }
 
@@ -1025,8 +1249,10 @@ fn unencodable(e: &TypedExpr) -> String {
 fn is_int_literal(e: &TypedExpr) -> bool {
     match &e.node {
         TypedExprNode::Lit(Lit::Int(_)) => true,
-        TypedExprNode::UnaryOp(UnaryOpKind::Neg, operand) => is_int_literal(operand),
-        _ => false,
+        _ => matches!(
+            Operation::of(e),
+            Some(Operation::Unary(UnaryOpKind::Neg, operand)) if is_int_literal(operand)
+        ),
     }
 }
 

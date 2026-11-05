@@ -1239,7 +1239,7 @@ postfix `!` takes an `Option` refined to exclude `none`:
 
 ```
 _[_] : {m: Map(K, V), k: K} => {Option(V) where _.is_none() == (k not in m.keys())}
-_!   : {Option(T) where not _.is_none()} => T
+_!   : (o: {Option(T) where not _.is_none()}) => {T where _ == o.value()}
 ```
 
 `Option` is a nominal type ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)),
@@ -1250,13 +1250,21 @@ type has no `==`. A lookup into a `Set` has the same type at `Option(unit)`. A l
 `{Option(V) where not _.is_none()}` for every key. **[Open]** — the predicate a `List(T)` lookup
 states presence by. An index drawn from iterating `xs` is present.
 
+`value` is a method of `Option` that only a refinement predicate calls: `o.value()` is the payload
+of `o` when `o` is `Option::some`, and is unspecified when `o` is `Option::none`. The constructors
+state which one built a value. `Option::none` is `{Option(T) where _.is_none()}`. `Option::some(v)`
+is `{Option(T) where not _.is_none() and _.value() == v}` where `v` is built from integer and
+boolean literals, names, field reads and operators, and `{Option(T) where not _.is_none()}`
+otherwise. The method `o.unwrap_or(w)` is the payload of `o`, or `w` when `o` is `Option::none`:
+
+```
+unwrap_or : (o: Option(T), w: T) => {T where (o.is_none() and _ == w) or (not o.is_none() and _ == o.value())}
+```
+
 `c[k]!` is accepted exactly where the refinement on `c[k]` entails `not _.is_none()`: under an
 `in` guard, for a key drawn from iterating `c`, or for a `FullMap`. Failure to establish presence
 is a type error at `!`, not a runtime unwrap failure. `!` has postfix precedence;
 `!=` remains one token, so `x! == y` requires a space before `==`.
-
-> **[Interim]** The compiler accepts `!` only directly after a subscript, as `c[k]!`. A `!` after
-> any other expression is a parse error.
 
 A direct call `c(k)` remains function application, not an optional membership test.
 
@@ -1575,8 +1583,9 @@ expected type, a join — rather than at the constructor.
 
 **`Option` is a nominal type, not a variant.** `Option(T)` is a `type` declared in a std module,
 with constructors `Option::some(T)` and `Option::none`
-([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)) and the method
-`Option::is_none` that a lookup's refinement tests
+([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)), the method
+`Option::is_none` that a lookup's refinement tests, and the methods `Option::unwrap_or` and, in a
+refinement predicate, `Option::value`
 ([Subscript and unwrap syntax [Decided]](#subscript-and-unwrap-syntax-decided)). A structural
 variant with the same arms is a different type, so `` y: Option(Int) = `some(1) `` is a type
 error and `y: Option(Int) = Option::some(1)` is the spelling.

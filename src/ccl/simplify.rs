@@ -1036,6 +1036,8 @@ fn builtin_preserves_domain(builtin: &Builtin) -> bool {
         | Builtin::NotFn
         | Builtin::IntToUint
         | Builtin::IntEqUint
+        | Builtin::OptionIsNone
+        | Builtin::OptionValue
         | Builtin::VariantWrap(_)
         | Builtin::VariantIs(_)
         | Builtin::Reading(_)

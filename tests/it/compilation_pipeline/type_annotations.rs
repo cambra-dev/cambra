@@ -952,13 +952,12 @@ fn a_type_error_in_a_chain_holding_a_read() {
     )
 }
 
-/// TODO: The typecheck for uses of polymorphic functions occurs
-/// during Coalesce, in which SMT is not currently used. In this
-/// example, structural equality comparison cannot reconcile the
-/// semantically equivalent refinements {_ == 4 + 1} and {_ == a}.
+/// The typecheck for uses of polymorphic functions occurs during Coalesce, under the binders
+/// in scope at the use, so the solver reconciles `{_ == 4 ^+ 1}` with `{_ == a}`, which
+/// structural equality cannot.
 #[test]
-fn monomorphization_check_is_not_smt() {
-    check_compile_error(
+fn monomorphization_check_is_smt() {
+    check_scalar(
         indoc! {r#"
 def f(x: Int):
     4 ^+ 1
@@ -966,7 +965,7 @@ a = f(1)
 b: {Int where _ == a} = f(2)
 a == b
         "#},
-        "Type mismatch for this use",
+        Value::Bool(true),
     )
 }
 
@@ -1043,11 +1042,11 @@ a == b
     )
 }
 
-/// TODO: this should be typecheckable, but `a`'s refinement isn't
-/// being used.
+/// `a`'s refinement, `Int@2`, is what the specialization pin assumes of `a`, so `f(2)` meets
+/// `{Int | __elem == a}`.
 #[test]
 fn dont_discharge_opaques_out_of_fun_bodies_with_a_singleton_codomain_named_by_an_annotation() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
 def f(x: {Int where _ == 2}) => {Int where _ == 2}:
     r ^= x;
@@ -1056,7 +1055,7 @@ a = f(2)
 b: {Int where _ == a} = f(2)
 a == b
         "#},
-        "Type mismatch for this use: expected {Int where _ == a}, found {Int where _ == 2}",
+        Value::Bool(true),
     )
 }
 
@@ -1476,18 +1475,17 @@ fn a_use_meets_the_annotations_codomain_refinement(#[case] code: &str) {
     check_scalar(code, Value::Int(5));
 }
 
-/// TODO: false rejections. The specialization pin decides a refinement without the
-/// definition's scope, so a predicate naming an enclosing binder (`n`) cannot be
-/// discharged, though the annotation check proved it.
+/// The specialization pin decides a refinement under the binders in scope at the use, so a
+/// predicate naming an enclosing binder (`n`) is discharged with what `n` is.
 #[test]
 fn a_use_meets_a_codomain_refinement_naming_an_enclosing_binder() {
-    check_compile_error(
+    check_scalar(
         indoc! {r#"
             n = 2
             g: Int => {Int where _ > n} = \x -> 5
             g(3)
         "#},
-        "Type mismatch for this use: expected {Int where _ > n}, found {Int where _ == 5}",
+        Value::Int(5),
     );
 }
 
@@ -2289,5 +2287,241 @@ fn a_data_function_type_is_no_value() {
         x = Int |=> Int
         1"#},
         "`T |=> U` is a data-function *type*",
+    );
+}
+
+/// `Option::some(v: T)` produces a value with type `{Option(T) where
+/// (not _.is_none()) and _.value() == v}`, and `Option::none`
+/// produces a value with type `{Option(T) where _.is_none()}`, with
+/// no constraint on `_.value()` in that case.
+///
+/// The `o.unwrap_or(w)` method, for `o: Option(T)` and `w: T`,
+/// produces a value with refinement `{T where if (o.is_none()) then
+/// (_ == w) else (_ == o.value())}.`
+#[test]
+fn unwrap_or_follows_the_option_constructor() {
+    check_scalar(
+        indoc! {r#"
+x = Option::some(1)
+y = Option::none
+x1: {Int where _ == 1} = x.unwrap_or(2)
+y1: {Int where _ == 2} = y.unwrap_or(2)
+x1 == 1 and y1 == 2
+        "#},
+        Value::Bool(true),
+    )
+}
+
+/// `!` is a unary operator, acting as a function with type `(o:
+/// {Option(T) where not _.is_none()}) => {T where _ == o.value()}`.
+///
+/// This test can only typecheck because `x` uses the `some`
+/// constructor.
+#[test]
+fn unwrapping_some_meets_the_domain_refinement() {
+    check_scalar(
+        indoc! {r#"
+x = Option::some(1)
+x1: {Int where _ == 1} = x!
+x1 == 1
+        "#},
+        Value::Bool(true),
+    )
+}
+
+/// This test should fail to typecheck, because `!`'s domain
+/// refinement is not satisfied.
+#[test]
+fn unwrapping_none_violates_the_domain_refinement() {
+    check_compile_error(
+        indoc! {r#"
+x = Option::none
+x1: {Int where _ == 1} = x!
+x1 == 1
+        "#},
+        "| not __elem ▷ option_is_none}, found {Option(",
+    )
+}
+
+/// This test should fail to typecheck, because `f`'s domain will be
+/// inferred to something that does not satisfy `!`'s domain
+/// refinement.
+#[test]
+fn unwrapping_a_parameter_called_with_none_is_rejected() {
+    check_compile_error(
+        indoc! {r#"
+def f(x):
+    x1: {Int where _ == 1} = x!
+    x1 == 1
+f(Option::some(1)) == f(Option::none)
+        "#},
+        "Type mismatch for Apply: expected {Option(Int@1) | not __elem ▷ option_is_none}, \
+         found {Option(?",
+    )
+}
+
+/// A predicate's `.is_none()` and `.value()` state what the constructors' refinements state,
+/// so the solver decides an annotation written with them.
+#[rstest]
+#[case::some_is_not_none(indoc! {"
+    y: {Option(Int) where not _.is_none()} = Option::some(3)
+    y.is_none()
+"}, Value::Bool(false))]
+#[case::none_is_none(indoc! {"
+    y: {Option(Int) where _.is_none()} = Option::none
+    y.is_none()
+"}, Value::Bool(true))]
+#[case::some_value(indoc! {"
+    y: {Option(Int) where _.value() == 3} = Option::some(3)
+    y.is_none()
+"}, Value::Bool(false))]
+#[case::parameter_unwrapped(indoc! {"
+    def f(o: {Option(Int) where not _.is_none()}) => Int:
+        o!
+    f(Option::some(4))
+"}, Value::Int(4))]
+fn an_option_meets_a_predicate_written_with_its_methods(
+    #[case] code: &str,
+    #[case] expected: Value,
+) {
+    check_scalar(code, expected);
+}
+
+/// The annotations of [`an_option_meets_a_predicate_written_with_its_methods`] refuse a value
+/// their predicate does not hold of.
+#[rstest]
+#[case::none_is_not_some(
+    indoc! {"
+        y: {Option(Int) where not _.is_none()} = Option::none
+        y.is_none()
+    "},
+    "Annotation mismatch",
+)]
+#[case::other_value(
+    indoc! {"
+        y: {Option(Int) where _.value() == 4} = Option::some(3)
+        y.is_none()
+    "},
+    "Annotation mismatch",
+)]
+#[case::parameter_given_none(
+    indoc! {"
+        def f(o: {Option(Int) where not _.is_none()}) => Int:
+            o!
+        f(Option::none)
+    "},
+    "expected {Option(Int) | not __elem ▷ option_is_none}, found {Option(?",
+)]
+fn an_option_violating_a_predicate_written_with_its_methods(
+    #[case] code: &str,
+    #[case] needle: &str,
+) {
+    check_compile_error(code, needle);
+}
+
+/// `unwrap_or` of an `Option::some` whose payload is computed. The result's refinement reads
+/// `Option::some(a + 1)`, which `lambda_elim` rewrites to `Option::some((a, 1) ▷ add)`; the
+/// constructor rule still reads `option_value == (a, 1) ▷ add` off it, so the re-derived type
+/// matches the recorded one.
+#[test]
+fn unwrap_or_of_some_of_a_computed_value() {
+    check_scalar(
+        indoc! {"
+            a = 5
+            b = a + 1
+            Option::some(b).unwrap_or(a)
+        "},
+        Value::Int(6),
+    );
+}
+
+// The tests below assert the value each program computes, and `should_panic` pins the panic it
+// raises instead. Pinned on the failure rather than deferred: an `#[ignore]` reports the same
+// green whether the gap closed, regressed, or went away, and nothing runs ignored tests here.
+// Once the program computes its value, the `should_panic` comes off.
+
+/// `Option::some(b)` with `b` computed rather than literal. Its type carries
+/// `__elem ▷ option_value == b`, which `lambda_elim` rewrites point-free in the expected type
+/// while the inferred type keeps `== 6`, so the post-planning check rejects the tree.
+#[rstest]
+#[case::is_none(
+    indoc! {"
+        a = 5
+        b = a + 1
+        Option::some(b).is_none()
+    "},
+    Value::Bool(false),
+)]
+#[case::matched(
+    indoc! {"
+        a = 5
+        b = a + 1
+        match Option::some(b):
+            case Option::some(v):
+                v
+            case Option::none:
+                0
+    "},
+    Value::Int(6),
+)]
+#[should_panic(expected = "post-planning produced an invalid tree")]
+fn some_of_a_computed_value(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
+/// `!` in a comprehension's element: lambda elimination reads `unwrap`'s `match` at a scrutinee
+/// type that no longer excludes `none`, so the match's one arm is non-exhaustive.
+#[test]
+#[should_panic(expected = "scrutinee-Case is non-exhaustive")]
+fn unwrap_in_a_comprehension() {
+    check_scalar(
+        indoc! {"
+            xs = [1, 2]
+            sum([Option::some(x)! for x in xs])
+        "},
+        Value::Int(3),
+    );
+}
+
+/// `!` applied twice. Inlining the monomorphized `Option::unwrap` meets a parameter refined
+/// `not __elem ▷ option_is_none` that the argument's type does not entail.
+#[test]
+#[should_panic(expected = "inline: outer lambda for `__mono`")]
+fn unwrap_of_an_unwrap() {
+    check_scalar(
+        indoc! {"
+            x = Option::some(Option::some(1))
+            x!!
+        "},
+        Value::Int(1),
+    );
+}
+
+/// `!` of a `String` payload. Inlining the monomorphized `Option::unwrap` meets a parameter
+/// typed `String@"a"` that the argument's type `String` does not entail.
+#[test]
+#[should_panic(expected = "inline: outer lambda for `__mono`")]
+fn unwrap_of_a_string_payload() {
+    check_scalar(
+        indoc! {r#"
+            x = Option::some("a")
+            x!
+        "#},
+        Value::String("a".into()),
+    );
+}
+
+/// `!` of an `Option` whose annotation proves it `some`. Inlining the monomorphized
+/// `Option::unwrap` meets a parameter typed `Int@3` that the argument's type `Int` does not
+/// entail, as in [`unwrap_of_a_string_payload`].
+#[test]
+#[should_panic(expected = "inline: outer lambda for `__mono`")]
+fn unwrap_of_an_annotated_option() {
+    check_scalar(
+        indoc! {"
+            y: {Option(Int) where not _.is_none()} = Option::some(3)
+            y!
+        "},
+        Value::Int(3),
     );
 }

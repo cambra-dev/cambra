@@ -159,6 +159,12 @@ pub struct OperatorSchemes {
     /// accumulator (`Mut(V, 0..4)`) a type error rather than a silent success,
     /// since two histories of the same kind equate invariantly in their domain.
     await_final: PolyScheme,
+    /// `option_is_none`: `∀α. Option(α) → Bool`, the predicate-only reading of
+    /// `Option::is_none` ([`Builtin::OptionIsNone`]).
+    option_is_none: PolyScheme,
+    /// `option_value`: `∀α. Option(α) → α`, the predicate-only payload of an `Option`
+    /// ([`Builtin::OptionValue`]).
+    option_value: PolyScheme,
     /// `∀ι κ. (ι ⤇ κ) ⇒ (κ ⇒ Bool)` — [`Builtin::CollectionContains`], the
     /// characteristic predicate of a collection's outputs. Inline-built because `κ` is
     /// shared between the argument's codomain and the result's domain, and that sharing
@@ -362,6 +368,15 @@ impl OperatorSchemes {
         let await_final =
             PolyScheme::poly(SCHEME_LEVEL, fun(Type::mutable(Type::Txn, nu.clone()), nu));
 
+        let alpha = fresh_var(BODY_LEVEL);
+        let option_is_none = PolyScheme::poly(
+            SCHEME_LEVEL,
+            fun(Type::option_of(alpha), prim(BaseType::Bool)),
+        );
+        let alpha = fresh_var(BODY_LEVEL);
+        let option_value =
+            PolyScheme::poly(SCHEME_LEVEL, fun(Type::option_of(alpha.clone()), alpha));
+
         Self {
             box_intro,
             collection_contains,
@@ -377,6 +392,8 @@ impl OperatorSchemes {
             get_prev_seq,
             get_prev_txn,
             await_final,
+            option_is_none,
+            option_value,
         }
     }
 
@@ -453,6 +470,8 @@ impl OperatorSchemes {
             Builtin::CollectionContains => &self.collection_contains,
             Builtin::Uncurry(n) => return Some(Cow::Owned(uncurry_scheme(n))),
             Builtin::FinalOrDefault => &self.final_or_default,
+            Builtin::OptionIsNone => &self.option_is_none,
+            Builtin::OptionValue => &self.option_value,
             Builtin::GetPrevSeq => &self.get_prev_seq,
             Builtin::GetPrevTxn => &self.get_prev_txn,
             Builtin::AwaitFinal => &self.await_final,

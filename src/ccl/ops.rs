@@ -955,6 +955,20 @@ pub enum Builtin {
     ///
     /// [`TypedExprNode::Reading`]: crate::ccl::TypedExprNode::Reading
     Reading(Reading),
+    /// `option_is_none : Option(𝑇) ⇒ Bool` — whether an `Option` is `none`, as a refinement
+    /// predicate states it. The refinement encoding reads it as the negation of the
+    /// uninterpreted `is_some` of the `Option`'s sort (`src/ccl/infer/solver/smt.rs`).
+    ///
+    /// **Never executed.** It appears only in refinement predicates: those the compiler
+    /// states about `Option` values (`crate::ccl::nominal::option_is_none`), and those whose
+    /// `.is_none()` lowers to it (`predicate_observer` in `src/ccl/lower/nominal.rs`).
+    OptionIsNone,
+    /// `option_value : Option(𝑇) ⇒ 𝑇` — the payload of an `Option`, as a refinement predicate
+    /// states it: the uninterpreted `value` of the `Option`'s sort, which says nothing of a
+    /// `none`.
+    ///
+    /// **Never executed**, for the reason [`Self::OptionIsNone`] is not.
+    OptionValue,
 }
 
 /// One reading: which kind, and the site of the call
@@ -1068,6 +1082,8 @@ impl Builtin {
             Self::IntToUint => "int_to_uint",
             Self::IntEqUint => "int_eq_uint",
             Self::Reading(_) => "reading",
+            Self::OptionIsNone => "option_is_none",
+            Self::OptionValue => "option_value",
         }
     }
 

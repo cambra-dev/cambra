@@ -4678,6 +4678,7 @@ fn describe_type_form(e: &ChlExpr) -> &'static str {
         ChlExpr::List(_) => "a list",
         ChlExpr::Record(_) => "a record value",
         ChlExpr::Subscript { .. } => "a subscript",
+        ChlExpr::Unwrap(_) => "an unwrap",
         ChlExpr::Attribute { .. } => "a field access",
         ChlExpr::IfExp { .. } => "a conditional expression",
         ChlExpr::ListComp(_) | ChlExpr::GenExp(_) => "a comprehension",
