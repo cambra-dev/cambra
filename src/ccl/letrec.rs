@@ -133,15 +133,6 @@ pub fn check_letrec_causal(
     }
 }
 
-/// Collect the group names referenced *non-causal* in `e` into `out`.
-///
-/// `live` is the set of group names still visible at this point of the walk
-/// — an inner binder that re-binds a group name shadows it for its scope
-/// (impossible after uniquify's Barendregt minting, but the check stays
-/// honest on hand-built trees). A reference in the history slot (first
-/// tuple element) of a guard-builtin application is skipped; every other
-/// occurrence — including the position/default slots of the same call — is
-/// an ordinary, non-causal reference.
 /// Whether a `get_prev_*` history-slot expression reads its binding(s) purely
 /// through the accessor. The causal grammar:
 ///
@@ -231,14 +222,18 @@ fn is_causal_history_slot(history: &TypedExpr, live: &BTreeSet<Name>) -> bool {
     }
 }
 
+/// Collect into `out` the group names `e` references outside a causal history slot.
+///
+/// `live` holds the group names visible at this point of the walk; an inner binder that
+/// re-binds a group name shadows it for its scope. Uniquify's Barendregt minting rules that
+/// out, and the walk still respects it on hand-built trees. A guard's history slot is skipped
+/// when it passes `is_causal_history_slot`, in both the pointful shape and the point-free
+/// shape `lambda_elim` produces. Every other reference is non-causal, including one in the
+/// guard's position or default slot, one in a middle compose element of the point-free shape,
+/// and one in a history slot that is not causal.
 fn collect_noncausal_refs(e: &TypedExpr, live: &BTreeSet<Name>, out: &mut BTreeSet<Name>) {
     // The guard shape: `Apply(Tuple([history, …]), Builtin(get_prev_*))`
-    // where `history` reads group bindings only through the accessor — a bare
-    // `Var(h)`, a pointwise view of one (`h ≫ .step`, or a projection-record
-    // map over a commit stream), or a `⧺`-union of such views (a
-    // multi-writer key's merged per-key commit views). In all of these the
-    // references are causal (the accessor consults only strictly earlier
-    // positions) — see `is_causal_history_slot` for the exact grammar.
+    // where `history` is a causal slot (see `is_causal_history_slot`).
     if let TypedExprNode::Apply { function, argument } = &e.node
         && let TypedExprNode::Builtin(b) = &function.node
         && is_causal_builtin(b)
