@@ -227,8 +227,9 @@ impl Consumer for Widening {
         }
     }
 
+    /// A change widens, and a decided region that is not whole passes as nothing.
     fn route(&mut self, routes: &mut Routes) {
-        routes.widened(|routes| self.0.route(routes));
+        routes.widened(|routes| routes.deciding_part(|routes| self.0.route(routes)));
     }
 }
 
@@ -263,6 +264,32 @@ impl Consumer for WideningRestatingDecided {
     /// A change widens, so the path widens.
     fn route(&mut self, routes: &mut Routes) {
         routes.widened(|routes| self.1.route(routes));
+    }
+}
+
+/// [`restating`] for a lookup's collection operand: the rows a key of the operand names read that
+/// key and also their input's value, so the decided region it passes names only part of what
+/// those rows depend on ([`Routes::deciding_part`]).
+pub fn restating_lookup(
+    restate: Box<dyn Fn(&Projection) -> Projection>,
+    consumer: Box<dyn Consumer>,
+) -> Box<dyn Consumer> {
+    Box::new(RestatingLookup(Restating(restate, consumer)))
+}
+
+struct RestatingLookup(Restating);
+
+impl Consumer for RestatingLookup {
+    fn notify(&mut self, arrived: &Projection) {
+        self.0.notify(arrived);
+    }
+
+    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        self.0.push(region, landing);
+    }
+
+    fn route(&mut self, routes: &mut Routes) {
+        routes.deciding_part(|routes| self.0.route(routes));
     }
 }
 
@@ -425,9 +452,10 @@ impl Consumer for OneLevelIn {
         }
     }
 
-    /// The input's keys stand one level in, so the path keeps them.
+    /// The input's keys stand one level in, so the path keeps them. A decided region beneath the
+    /// standing levels that is not whole passes as nothing.
     fn route(&mut self, routes: &mut Routes) {
-        self.consumer.route(routes);
+        routes.deciding_part(|routes| self.consumer.route(routes));
     }
 }
 

@@ -186,6 +186,26 @@ fn restate_gathered(
     )
 }
 
+/// The rows of a `MapResult` that a region of its collection operand names, where each row reads
+/// the operand at its own key at `at` ([`MapResult::subscribe`]): the operand's keys, under every
+/// path above `at`.
+///
+/// # Panics
+///
+/// Where `region` names keys beneath the operand's outermost, which a one-level operand has none
+/// of.
+fn keys_looked_up(region: &Projection, at: CurryLevel) -> Projection {
+    match region {
+        Projection::Keys { level, keys } if *level == CurryLevel::OUTERMOST => {
+            Projection::keys_at(at, keys.clone())
+        }
+        Projection::Keys { .. } => {
+            panic!("a one-level operand names its outermost keys: {region:?}")
+        }
+        whole_or_none => whole_or_none.clone(),
+    }
+}
+
 impl TileOperator for MapResult {
     impl_operator_base!();
 
@@ -209,7 +229,58 @@ impl TileOperator for MapResult {
                 self.input.tiling(),
                 Tiling::DataFunction { codomain, .. } if !codomain.holds_a_level()
             );
-        let function_producer = subscribe_forwarding(&mut *self.function, &shared, scheduler);
+        // A collection operand looked up at values that equal their own keys, at the level above
+        // the one the function applies at, is read at each row's own key: a key of the operand
+        // names, changed or decided, the rows whose last key it is, under every path above.
+        let looked_up_at_keys = self.level.enclosing().filter(|&at| {
+            self.input.result_correlation() == Some(vec![TilePathStep::Codomain; at.index()])
+                && matches!(
+                    self.input.tiling().values_at(at),
+                    Tiling::DataFunction { codomain, .. } if !codomain.holds_a_level()
+                )
+                && matches!(
+                    self.function.tiling(),
+                    Tiling::DataFunction { codomain, .. } if !codomain.holds_a_level()
+                )
+        });
+        if let Some(at) = looked_up_at_keys {
+            // The values are keys the operand's domain admits: one extent, or positions within
+            // `UInt`, as a literal's positions read a table keyed by `UInt`.
+            let positions = |extent: &Extent| {
+                matches!(
+                    extent,
+                    Extent::UIntRange(_) | Extent::Base(crate::interpreter::BaseType::UInt)
+                )
+            };
+            debug_assert!(
+                matches!(
+                    (self.input.tiling().values_at(at), self.function.tiling()),
+                    (
+                        Tiling::DataFunction { codomain: values, .. },
+                        Tiling::DataFunction { domain, .. },
+                    ) if matches!(
+                        &**values,
+                        Tiling::Scalar(values) if values == domain
+                            || (positions(values) && positions(domain))
+                    )
+                ),
+                "a lookup at its rows' own keys reads its operand at the values at {at:?}: {:?} \
+                 and {:?}",
+                self.input.tiling(),
+                self.function.tiling()
+            );
+        }
+        let function_producer = match looked_up_at_keys {
+            Some(at) => self.function.subscribe(
+                self.function.tiling().universal_guard(),
+                crate::interpreter::scheduler::restating_lookup(
+                    Box::new(move |region| keys_looked_up(region, at)),
+                    forwarding_consumer_keeping_keys(&shared, &scheduler.wakeup_queue()),
+                ),
+                scheduler,
+            ),
+            None => subscribe_forwarding(&mut *self.function, &shared, scheduler),
+        };
         // The result's outermost keys are the input's where the function applies to the input's
         // values, one level in, so the input's region is the result's. Applied to the input
         // itself, or to a scalar, the function's own keys are the result's. The function operand
@@ -1452,10 +1523,35 @@ mod nested_projection_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crate::interpreter::tile_operators::test_helpers::{ReleaseSpy, TestTileProducer};
     use bit_set::BitSet;
 
     use crate::interpreter::{BaseType, ColumnValue, Extent, Value};
+
+    /// A lookup that reads its operand at each row's own key at level 1, as a group-by reads its
+    /// input's values at the positions its groups hold: operand keys 2 and 3 name those positions
+    /// under every group, and a whole or empty region stays what it is.
+    #[test]
+    fn a_lookup_at_its_rows_own_keys_names_those_keys_under_every_path() {
+        let keys = Predicate::point(Value::UInt(2)).union(&Predicate::point(Value::UInt(3)));
+        let region = Projection::Keys {
+            level: CurryLevel::OUTERMOST,
+            keys: keys.clone(),
+        };
+        assert_eq!(
+            keys_looked_up(&region, CurryLevel::new(1)),
+            Projection::keys_at(CurryLevel::new(1), keys)
+        );
+        assert_eq!(
+            keys_looked_up(&Projection::Everything, CurryLevel::new(1)),
+            Projection::Everything
+        );
+        assert_eq!(
+            keys_looked_up(&Projection::Nothing, CurryLevel::new(1)),
+            Projection::Nothing
+        );
+    }
 
     /// Build a `MapResultProducer` whose `function` operand records its releases.
     fn map_result_with_function_spy() -> (MapResultProducer, Rc<RefCell<Vec<TileGuard>>>, Tiling) {

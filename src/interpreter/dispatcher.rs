@@ -391,6 +391,9 @@ struct PipelineInfo {
     /// pipeline's pushes reach along routes that keep its keys, `None` where they reach all of
     /// it ([`reaches`](Dispatcher::reaches)).
     reach: Vec<Option<TileGuard>>,
+    /// Per pipeline it reads, in the order of its `reads`, whether it decides the input only once
+    /// it is whole ([`decides_whole_only`](Dispatcher::decides_whole_only)).
+    whole_only: Vec<bool>,
 }
 
 /// A region a pipeline parked ([`Dispatcher::park`]), and whether a release may hand out the part
@@ -582,6 +585,7 @@ impl Dispatcher {
                 parks: false,
                 opens: false,
                 reach: Vec::new(),
+                whole_only: Vec::new(),
             })
             .collect();
         let states = (0..count)
@@ -796,6 +800,27 @@ impl Dispatcher {
             pipeline.0
         );
         self.infos[pipeline.0].opens = true;
+    }
+
+    /// Record that `read`, a pipeline `reader` reads, decides `reader`'s input only once it is
+    /// whole: one path from it decides only part of what a row depends on, and another passes a
+    /// decided region on ([`Routes::deciding_part`]), so the union of what they pass names rows
+    /// the other path has not decided. A decided push of it that is not whole records nothing.
+    ///
+    /// # Panics
+    ///
+    /// When `reader` does not read `read`.
+    pub fn decides_whole_only(&mut self, reader: PipelineId, read: PipelineId) {
+        let info = &mut self.infos[reader.0];
+        let at = info
+            .reads
+            .iter()
+            .position(|&r| r == read.0)
+            .unwrap_or_else(|| panic!("pipeline {} reads pipeline {}", reader.0, read.0));
+        if info.whole_only.len() < info.reads.len() {
+            info.whole_only.resize(info.reads.len(), false);
+        }
+        info.whole_only[at] = true;
     }
 
     /// Record that the pushes of `read`, a pipeline `reader` reads, reach `region` of its input
@@ -1067,7 +1092,11 @@ impl Dispatcher {
                 .filter(|&at| self.infos[reads[at]].pushes_with == self.infos[source].pushes_with)
                 .collect(),
         };
+        let whole_only = &self.infos[reader].whole_only;
         for at in slots {
+            if guard.is_some() && whole_only.get(at).copied().unwrap_or(false) {
+                continue;
+            }
             let before = std::mem::take(&mut decided[at]);
             decided[at] = match guard {
                 Some(guard) => before.grown(guard),
@@ -2476,10 +2505,10 @@ impl Landing<'_> {
             }
             Target::Decided {
                 dispatcher,
+                whole,
                 reached,
                 range,
                 epoch,
-                ..
             } => {
                 reached.push(reader.0);
                 let source = match range {
@@ -2488,8 +2517,10 @@ impl Landing<'_> {
                 };
                 // A region that names the entry's input whole is the source wholly decided,
                 // whatever the entry's tiling: a store's seed entry is one value in front of a
-                // pipeline whose input is the loop's positions.
-                let guard = (!guard.is_universal()).then_some(guard);
+                // pipeline whose input is the loop's positions. A wholly decided source is, along
+                // whatever its push was restated to on the way, as an arm of a union restates it
+                // under its tag.
+                let guard = (!(*whole || guard.is_universal())).then_some(guard);
                 return dispatcher.record_decided(epoch, reader.0, source, guard);
             }
         };
@@ -2558,6 +2589,7 @@ impl Landing<'_> {
 /// how it passes any push on.
 pub struct Routes {
     widened: bool,
+    decides_part: bool,
     reached: Vec<Route>,
 }
 
@@ -2568,6 +2600,9 @@ pub(crate) struct Route {
     /// Whether every operator on the path keeps the pushing pipeline's keys, restated as its own
     /// or under a tag, so that a push of some keys reaches the entry as those keys.
     pub(crate) keeps_keys: bool,
+    /// Whether the decided region the path passes on names only part of what a row it reaches
+    /// depends on ([`Routes::deciding_part`]).
+    pub(crate) decides_part: bool,
 }
 
 impl Routes {
@@ -2575,6 +2610,7 @@ impl Routes {
     pub(crate) fn new() -> Self {
         Routes {
             widened: false,
+            decides_part: false,
             reached: Vec::new(),
         }
     }
@@ -2589,6 +2625,7 @@ impl Routes {
         self.reached.push(Route {
             pipeline,
             keeps_keys: !self.widened,
+            decides_part: self.decides_part,
         });
     }
 
@@ -2599,6 +2636,15 @@ impl Routes {
         let was = std::mem::replace(&mut self.widened, true);
         route(self);
         self.widened = was;
+    }
+
+    /// Walk on through `route` as a path whose decided region names only part of what a row it
+    /// reaches depends on: a widening passes a region that is not whole on as nothing decided,
+    /// and a lookup's operand names the rows that read a decided key, whatever their input holds.
+    pub fn deciding_part(&mut self, route: impl FnOnce(&mut Self)) {
+        let was = std::mem::replace(&mut self.decides_part, true);
+        route(self);
+        self.decides_part = was;
     }
 
     /// Refuse the walk: it re-entered a consumer it is passing through, so its chain is a cycle,

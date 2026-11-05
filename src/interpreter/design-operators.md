@@ -1480,6 +1480,7 @@ decided. An operator restates each in its own keys by its own rule:
 | --- | --- | --- |
 | keeps its input's keys | unchanged | unchanged |
 | keeps them under another spelling (`Uncurry` beneath a standing level) | restated (`scheduler::restating`) | restated |
+| looks a collection operand up at each row's own key (`MapResult` over values that equal their keys, as a group-by's) | the rows whose last key it names, under every path (`keys_looked_up`) | the rows whose last key it names, under every path, as a part of what those rows depend on |
 | widens its input's keys | the universal guard (`Landing::widened`) | the empty guard, and the universal guard once the input's decided region is universal; an outermost `Uncurry` restates it as the pairs its outer keys head (`scheduler::widening_restating_decided`) |
 | reads several inputs (`Zip`, `Filter`, `Product`) | each input's region, as it arrives | the intersection of the inputs' decided regions |
 
@@ -1489,6 +1490,13 @@ is exact, as every guard operation must be ([Guard operations are
 exact](#guard-operations-are-exact)). The dispatcher intersects the decided regions of inputs that
 come from different pipelines, since a step needs each pipeline it reads to cover it. An operator
 intersects those of inputs within one chain, as a static arm beside a live arm.
+
+A pipeline that reaches a reader along a path whose decided region names only part of what a row
+depends on (`Routes::deciding_part`), and along another path, decides the reader's input only once
+it is whole (`Dispatcher::decides_whole_only`). The dispatcher records one region per pipeline, so
+it cannot intersect the paths. A widening passes a region that is not whole as nothing, and a
+lookup's operand names the rows reading a decided key whatever their input holds. A group-by's memo
+is the case: it reads a list both as its rows and as the table of a lookup.
 
 The dispatcher keeps, per pipeline, the union of the decided regions each pipeline it reads has
 pushed. A unit of work is claimable once that union covers the region the work pulls, checked with

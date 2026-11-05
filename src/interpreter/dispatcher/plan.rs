@@ -789,9 +789,22 @@ pub(super) fn plan_edges(
             seen.push(pushes_with[read]);
             let (pusher, _) =
                 end_of(PipelineId(read)).unwrap_or_else(|| pushing_end(reach, PipelineId(read)));
-            if routes_to(&pusher, reader).is_empty() {
+            let routes = routes_to(&pusher, reader);
+            if routes.is_empty() {
                 unreached = true;
                 continue;
+            }
+            // A row reached along a path that passes a decided region on and along one that drops
+            // it depends on rows the region does not name, so the read decides it only once whole.
+            if routes.iter().any(|route| route.decides_part)
+                && routes.iter().any(|route| !route.decides_part)
+            {
+                for &shared in read_all
+                    .iter()
+                    .filter(|&&r| pushes_with[r] == pushes_with[read])
+                {
+                    dispatcher.decides_whole_only(PipelineId(reader), PipelineId(shared));
+                }
             }
             // A read along a route reaches what a push of its every key, wholly decided, lands
             // as: a row elsewhere waits for nothing of it. One read by pull reaches all of it.

@@ -1922,6 +1922,99 @@ fn a_route_declares_whether_each_path_keeps_its_keys() {
     assert_eq!(reached, [(PipelineId(1), false), (PipelineId(1), true)]);
 }
 
+/// A route declares, per path, whether its decided region names only part of what a row depends
+/// on: a widening path's does, and so does a lookup operand's, which names rows by the key they
+/// read whatever their input holds. A path that keeps its keys does not, and neither does an
+/// outermost `Uncurry`'s, which widens a change but restates a decided region exactly.
+#[test]
+fn a_route_declares_whether_each_path_decides_part_of_a_row() {
+    let (_gate, shared) = gated_entry(&ints());
+    let wakeups = WakeupQueue::default();
+    let mut paths = Paths(vec![
+        forwarding_consumer(&shared, &wakeups),
+        forwarding_consumer_keeping_keys(&shared, &wakeups),
+        crate::interpreter::scheduler::widening_restating_decided(
+            |region| region.clone(),
+            forwarding_consumer_keeping_keys(&shared, &wakeups),
+        ),
+        crate::interpreter::scheduler::restating_lookup(
+            Box::new(|region| region.clone()),
+            forwarding_consumer_keeping_keys(&shared, &wakeups),
+        ),
+    ]);
+    let mut routes = crate::interpreter::dispatcher::Routes::new();
+    paths.route(&mut routes);
+    let parts: Vec<_> = routes
+        .reached()
+        .into_iter()
+        .map(|route| route.decides_part)
+        .collect();
+    assert_eq!(parts, [true, false, false, true]);
+}
+
+/// A read that reaches its reader along a path that drops a decided region and one that keeps it
+/// decides the reader's input only once it is whole: a row reached along both depends on rows the
+/// region does not name. Its decided push of some keys records nothing, where the same push of a
+/// read with no such mark records those keys.
+#[cfg(debug_assertions)]
+#[test]
+fn a_read_decided_only_whole_records_no_part() {
+    use crate::interpreter::dispatcher::Decided;
+    let recorded = |whole_only: bool| {
+        let scripted = Scripted::holding(keys_between(0, 1));
+        let (_gate, shared) = gated_entry(&ints());
+        let wakeups = WakeupQueue::default();
+        let paths = vec![
+            forwarding_consumer(&shared, &wakeups),
+            forwarding_consumer_keeping_keys(&shared, &wakeups),
+        ];
+        scripted
+            .borrow_mut()
+            .base_mut()
+            .pushing_to(Rc::new(RefCell::new(Paths(paths))));
+        let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+        dispatcher.park(PipelineId(1));
+        if whole_only {
+            dispatcher.decides_whole_only(PipelineId(1), PipelineId(0));
+        }
+        dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+            scripted.borrow_mut().finish(pushes, false)
+        });
+        dispatcher.decided_of(PipelineId(1), PipelineId(0))
+    };
+    assert!(matches!(recorded(true), Decided::Nothing));
+    assert!(matches!(recorded(false), Decided::Region(_)));
+}
+
+/// A read decided only whole still records its whole push: once the pipeline it reads has decided
+/// everything, each path's region is decided, whatever it was restated to on the way.
+#[cfg(debug_assertions)]
+#[test]
+fn a_read_decided_only_whole_records_its_whole_push() {
+    use crate::interpreter::dispatcher::Decided;
+    let scripted = Scripted::holding(ints().universal_guard());
+    let (_gate, shared) = gated_entry(&ints());
+    let wakeups = WakeupQueue::default();
+    let paths = vec![
+        forwarding_consumer(&shared, &wakeups),
+        forwarding_consumer_keeping_keys(&shared, &wakeups),
+    ];
+    scripted
+        .borrow_mut()
+        .base_mut()
+        .pushing_to(Rc::new(RefCell::new(Paths(paths))));
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    dispatcher.park(PipelineId(1));
+    dispatcher.decides_whole_only(PipelineId(1), PipelineId(0));
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
+        scripted.borrow_mut().finish(pushes, true)
+    });
+    assert!(matches!(
+        dispatcher.decided_of(PipelineId(1), PipelineId(0)),
+        Decided::Whole
+    ));
+}
+
 /// A push widened to `Everything` on its way fails the run, since the reader could not tell which
 /// of its keys it names: a reader reached that way reads the pushing pipeline once it finished.
 #[test]
