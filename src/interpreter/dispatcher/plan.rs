@@ -334,21 +334,16 @@ fn run_targets(
         &mut end_of,
     );
     // Per pipeline, the live pipelines whose close it is final only after: itself where it reads
-    // a live source, every live pipeline where it reads its input whole (it reads that in the run's
-    // last epoch), and those of each pipeline it reads, which is numbered before it.
-    let every_live: Vec<usize> = (0..members.live.len())
-        .filter(|&pipeline| !members.live[pipeline].is_empty())
-        .collect();
+    // a live source, and those of each pipeline it reads, which is numbered before it. A pipeline
+    // that reads its input whole reads it once the sources beneath it have closed
+    // (`Dispatcher::read_whole`), so it adds none of its own.
     let mut final_after: Vec<Vec<usize>> = Vec::with_capacity(members.live.len());
     for (pipeline, leaves) in members.live.iter().enumerate() {
         debug_assert!(
             members.reads[pipeline].iter().all(|&read| read < pipeline),
             "a pipeline reads only pipelines numbered before it"
         );
-        let mut after = match planned[pipeline].whole {
-            true => every_live.clone(),
-            false => Vec::new(),
-        };
+        let mut after = Vec::new();
         if !leaves.is_empty() {
             after.push(pipeline);
         }

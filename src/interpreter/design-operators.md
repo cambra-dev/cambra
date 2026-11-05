@@ -1428,22 +1428,26 @@ row (`tests/support/differential.rs`).
 
 A pipeline is final once every live pipeline beneath it has closed and it has finished the epoch of
 the last close. A pipeline that reads its input whole (`Dispatcher::read_whole`) reads that input in
-the run's last epoch, so it is final only once every live pipeline of the run has closed. The
-planner records, per pipeline, the live pipelines whose close it waits for in this sense.
+the first epoch by which every pipeline beneath it that takes arrivals has closed, so it is final
+after the same live pipelines as the pipelines it reads. A transaction store over a let-bound list,
+with nothing live beneath it, reads its input in epoch 0. The planner records, per pipeline, the
+live pipelines whose close it waits for in this sense.
 
 A loop's scope or a transaction store steps on the pipelines it reads by pull, and a step that pulls
 a pipeline not yet final reads a partial answer: a seed `sum(source1())` before `source1` yields
 everything opens the store at a wrong value. Where such a scope or store is notified per delivery
-(`Notifies::Rounds`, `Notifies::Items`), it holds its arrivals on the live pipelines those reads wait
-for (`Dispatcher::hold`). A notify of it before the last of them closes keeps its morsels outside
-every epoch, so each epoch before then finishes without them, and the pipelines that read the scope
-or store finish it too. The close of the last of them appends the held morsels to the scope's or
-store's queue in that close's epoch. The scope or store follows the pipelines it reads, so it takes
-them once those have finished that epoch, final. From then on each delivery is queued as it arrives.
+(`Notifies::Rounds`, `Notifies::Items`), it holds its arrivals on the live pipelines those reads
+wait for (`Dispatcher::hold`). A notify of it before the last of them closes keeps its morsels
+outside every epoch, so each epoch before then finishes without them, and the pipelines that read
+the scope or store finish it too. The close of the last of them appends the held morsels to the
+scope's or store's queue in that close's epoch. The scope or store follows the pipelines it reads,
+so it takes them once those have finished that epoch, final. From then on each delivery is queued as
+it arrives.
 
 The held morsels are guards of the scope's or store's input, not rows: the rows stay in the live
-source, which releases none of them until the scope or store consumes them. Over a seed whose sources
-never yield everything, the scope or store never steps, and its source keeps every row it delivered.
+source, which releases none of them until the scope or store consumes them. Over a seed whose
+sources never yield everything, the scope or store never steps, and its source keeps every row it
+delivered.
 
 A scope or store notified of its whole input (`Notifies::Whole`) that reads such a pipeline, as a
 transaction whose writer reads a concatenation with the live source, is notified once every live
@@ -1458,9 +1462,9 @@ describes.
 A key of a pipeline's output is decided where its value can no longer change and its presence or
 absence is settled: a key present in the output, whose value is complete once it is there, or a key
 the domain predicate rules out ([The completeness contract](#the-completeness-contract)). That is
-the region `Tile::to_guard` names and `BreakingProducer::held` states. The decided region enters
-the dispatcher as a guard, pushed up the consumer chain as a breaker's final guard is pushed today,
-and the dispatcher decides that a read is final by guard containment rather than by epochs.
+the region `Tile::to_guard` names and `BreakingProducer::held` states. The decided region enters the
+dispatcher as a guard, pushed up the consumer chain as a breaker's final guard is pushed today, and
+the dispatcher decides that a read is final by guard containment rather than by epochs.
 
 Today the two ends of a pipeline state completeness through two channels:
 
@@ -1488,27 +1492,26 @@ decided. An operator restates each in its own keys by its own rule:
 
 A widened change rounds up and a widened decided region rounds down: every output key of a widening
 operator depends on every input key, so none is decided until all of the input is. Each restatement
-is exact, as every guard operation must be
-([Guard operations are exact](#guard-operations-are-exact)). The dispatcher intersects the decided
-regions of inputs that come from different pipelines, since a step needs each pipeline it reads to
-cover it. An operator intersects those of inputs within one chain, as a static arm beside a live
-arm.
+is exact, as every guard operation must be ([Guard operations are
+exact](#guard-operations-are-exact)). The dispatcher intersects the decided regions of inputs that
+come from different pipelines, since a step needs each pipeline it reads to cover it. An operator
+intersects those of inputs within one chain, as a static arm beside a live arm.
 
 The dispatcher keeps, per pipeline, the union of the decided regions each pipeline it reads has
-pushed. A unit of work is claimable once that union covers the region the
-work pulls, checked with `guard_minus`:
+pushed. A unit of work is claimable once that union covers the region the work pulls, checked with
+`guard_minus`:
 
 | Work | Claimable today | Claimable in the planned design |
 | --- | --- | --- |
-| A whole read (`Dispatcher::read_whole`) | in the run's last epoch | once its reads' decided regions are universal |
+| A whole read (`Dispatcher::read_whole`) | once the pipelines beneath it that take arrivals have closed | once its reads' decided regions are universal |
 | A step of a store or a loop's scope that follows its reads (`Dispatcher::follow`) | once its reads have finished the epoch | once its reads are complete over the region the step pulls |
 | A held delivery (`Dispatcher::hold`) | once the live pipelines its reads wait for have closed | as a step |
 | An open row read again ([Reading rows again](#reading-rows-again)) | when a push names the row | when a pushed decided region covers the row |
 
 The four rows reduce to one rule, so `Dispatcher::hold`, `LivePipeline::waits` and the planner's
 per-pipeline record of the live pipelines a pipeline is final after (`final_after`) are removed.
-Epochs remain the batches a seal makes of live deliveries, and the unit a `main` output answers
-per (`SinkBreaker::per_epoch`).
+Epochs remain the batches a seal makes of live deliveries, and the unit a `main` output answers per
+(`SinkBreaker::per_epoch`).
 
 The program below shows what changes. Its store `a` reads a static list, and its loop reads a live
 source that never yields everything:
@@ -1524,17 +1527,17 @@ for x in source1():
 out << last
 ```
 
-Today `a` reads its input whole in the run's last epoch, which never comes, so the loop never
-steps. In the planned design the range over `[10, 20]` pushes the universal guard at the start, `a`
-steps and pushes its final guard in epoch 0, and the loop steps per delivery of `source1` from
-then on.
+Today `a`'s pipeline is a source started whole and closed in epoch 0, so `a` is final there and the
+loop steps per delivery of `source1`, by the dispatcher's record of which pipelines have closed. In
+the planned design the same follows from the range over `[10, 20]` pushing the universal guard at
+the start and `a` pushing its final guard in epoch 0, with no record of closes.
 
-Every breaker but the induction store states its decided region in `held`: the transaction store
-its positions through its watermark, a memo, a map aggregate and an induction drive their tiles'
-`to_guard`, and an aggregate or an extraction everything once it is final. An induction store
-states nothing until it is terminal (`BreakerState::held`), though it decides its positions one at
-a time, so a reader of one row of a store per row waits for the whole store. Its held region states
-its decided positions, and its decided rows under rows, before the design is implemented.
+Every breaker but the induction store states its decided region in `held`: the transaction store its
+positions through its watermark, a memo, a map aggregate and an induction drive their tiles'
+`to_guard`, and an aggregate or an extraction everything once it is final. An induction store states
+nothing until it is terminal (`BreakerState::held`), though it decides its positions one at a time,
+so a reader of one row of a store per row waits for the whole store. Its held region states its
+decided positions, and its decided rows under rows, before the design is implemented.
 
 #### Reading rows again
 
@@ -1653,8 +1656,9 @@ entry rather than queue for a pipeline of the scope's dispatcher. The scope reac
 the cycle by walking the store's chain with the store's cell borrowed, so a read of the store
 through its recurrence is answered from the published snapshot.
 
-A pipeline the scope's dispatcher would read whole, which happens only in the run's last epoch,
-stays in pull mode, and its readers read the pipelines beneath it; the round has it read again.
+A pipeline the scope's dispatcher would read whole, which happens only once the sources beneath it
+have closed, stays in pull mode, and its readers read the pipelines beneath it; the round has it
+read again.
 
 A loop nested in another runs as a scope inside the scope of the loop around it: a pipeline of that
 scope's dispatcher, with a dispatcher of its own for the whole run. A scope whose store has 𝑑 row
@@ -1790,7 +1794,8 @@ the last. A claim reads the count and the close in one read, and nothing is rese
 close, so the count of a closed queue is its last. The counters only grow, so a pipeline that may
 finish an epoch stays so until it does. Its packages there partition the region its queue was filled
 with, and the finish gets that region as `consumed`: the regions notified to a source in the epoch,
-its input whole in the last epoch for a pipeline that reads its input whole, or the union of the
+its input whole in the first epoch by which the sources beneath it have closed for a pipeline that
+reads its input whole, or the union of the
 guards pushed to the pipeline in it.
 
 The claim that finds a pipeline that may finish an epoch moves its phase there from running to

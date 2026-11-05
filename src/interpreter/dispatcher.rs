@@ -415,6 +415,10 @@ struct PipelineState {
     pushed: Mutex<Option<TileGuard>>,
     /// For a source, whether it is closed: no more of its input arrives.
     closed: AtomicBool,
+    /// For a source, the epoch it closed in, [`UNKNOWN`] while it is open.
+    closed_in: AtomicU64,
+    /// For a pipeline that reads its input whole, whether that input has been queued.
+    whole_queued: AtomicBool,
     /// How many of a source's packages have been queued, in every epoch.
     queued: AtomicUsize,
     /// How many of a source's packages have been acknowledged, in every epoch.
@@ -580,6 +584,8 @@ impl Dispatcher {
             .map(|_| PipelineState {
                 pushed: Mutex::new(None),
                 closed: AtomicBool::new(false),
+                closed_in: AtomicU64::new(UNKNOWN),
+                whole_queued: AtomicBool::new(false),
                 queued: AtomicUsize::new(0),
                 acknowledged: AtomicUsize::new(0),
                 in_flight: AtomicBool::new(false),
@@ -907,13 +913,41 @@ impl Dispatcher {
         }
         let queue = &epoch.pipelines[reader].queue;
         let closing = match &self.infos[reader].whole {
-            Some(input) if epoch.number == self.last.load(Ordering::Acquire) => input,
+            Some(input)
+                if self.sources_beneath_closed_by(reader, epoch.number)
+                    && !self.states[reader]
+                        .whole_queued
+                        .swap(true, Ordering::AcqRel) =>
+            {
+                input
+            }
             _ => &Vec::new(),
         };
         let closed = queue.append(reader, closing) && queue.close();
         self.ensure(closed, || {
             format!("pipeline {reader} receives packages once")
         });
+    }
+
+    /// Whether every pipeline beneath `pipeline` that takes arrivals closed in `epoch` or before.
+    /// The pipelines beneath it have then consumed all of their input by the time `pipeline`'s
+    /// queue in `epoch` closes, since that queue waits for the pipelines it reads to finish
+    /// `epoch`, and they for theirs.
+    fn sources_beneath_closed_by(&self, pipeline: usize, epoch: u64) -> bool {
+        let mut seen = vec![false; self.infos.len()];
+        let mut stack = self.infos[pipeline].reads.clone();
+        while let Some(read) = stack.pop() {
+            if std::mem::replace(&mut seen[read], true) {
+                continue;
+            }
+            if self.takes_arrivals(read)
+                && self.states[read].closed_in.load(Ordering::Acquire) > epoch
+            {
+                return false;
+            }
+            stack.extend(self.infos[read].reads.iter().copied());
+        }
+        true
     }
 
     /// What `pipeline`, which keeps open rows, knows of the rows it consumed, locked.
@@ -1127,13 +1161,13 @@ impl Dispatcher {
     }
 
     /// Mark `pipeline`, which reads a pipeline, as consuming its breaker's input whole, `input`
-    /// cut one package per morsel ([`seed`]), in the run's last epoch, in place of what the
-    /// pipelines it reads push. A planner does so where no push reaches the reader restated in its
-    /// keys, where two pipelines it reads can push one key, or where a pipeline it reads takes no
-    /// push and names no region the planner could queue for the reader at the start
-    /// (`run_program`). Its
-    /// input is whole only once every epoch has run, so its queue in an earlier epoch closes
-    /// empty, and it takes no push ([`Landing::queue`]).
+    /// cut one package per morsel ([`seed`]), in the first epoch by which every pipeline beneath
+    /// it that takes arrivals has closed, in place of what the pipelines it reads push. A planner
+    /// does so where no push reaches the reader restated in its keys, where two pipelines it reads
+    /// can push one key, or where a pipeline it reads takes no push and names no region the planner
+    /// could queue for the reader at the start (`run_program`). Its input is whole only once those
+    /// pipelines have closed, so its queue in an earlier epoch closes empty, and it takes no push
+    /// ([`Landing::queue`]).
     ///
     /// # Panics
     ///
@@ -1527,6 +1561,7 @@ impl Dispatcher {
         let closed = !state.closed.swap(true, Ordering::AcqRel);
         self.ensure(closed, || format!("pipeline {p} closes its queue once"));
         let current = self.current.load(Ordering::Acquire);
+        state.closed_in.store(current, Ordering::Release);
         if self
             .sources()
             .all(|source| self.states[source].closed.load(Ordering::Acquire))

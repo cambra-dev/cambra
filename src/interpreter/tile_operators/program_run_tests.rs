@@ -2981,7 +2981,7 @@ fn rendered_in_key_order(value: &Value) -> String {
     for x in source1():
         last := last + x
     out << last
-"}, Value::Int(85), &["held"])]
+"}, Value::Int(85), &["follows"])]
 #[case::two_writers_seeded_from_a_sum_of_the_source(indoc! {"
     out = test_sink()
     pool: Mut(Int, Txn) := sum(source1())
@@ -3287,5 +3287,76 @@ fn a_transaction_takes_each_delivery_once_its_seed_is_final(#[values(1, usize::M
         [crate::interpreter::Predicate::False, up_to(1), up_to(3)],
         "the store releases nothing while its seed is open, the held deliveries once it is \
          final, and each later delivery as it arrives"
+    );
+}
+
+/// A loop over a live source seeded from the final value of a transaction store over a let-bound
+/// list: the store reads the list's pipeline whole, nothing live is beneath it, so it reads its
+/// input in the first epoch, and the loop takes each delivery as it arrives, before its source
+/// yields everything.
+#[rstest_log::rstest]
+fn a_loop_seeded_from_a_static_store_takes_each_delivery(#[values(1, usize::MAX)] rows: usize) {
+    let source = indoc! {"
+        out = test_sink()
+        rs = [10, 20]
+        a: Mut(Int, Txn) := 100
+        for r in rs:
+            with begin():
+                a := a - r
+        last := await_final(a)
+        for x in source1():
+            last := last + x
+        out << last
+    "};
+    let mut ctx = GlobalContext::default();
+    ctx.defer_sink_pulls();
+    let items = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::interpreter::TestDataSource::new(
+            "source1",
+            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+        ),
+    ));
+    ctx.register_source(items.clone());
+    let sink = ctx.register_test_sink("out");
+    let loaded = LoadedProgram::test(source);
+    let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    let _operators = ctx.take_operator_map();
+    let entries = |keys: std::ops::Range<u64>| {
+        keys.map(|key| (Value::UInt(key), Value::Int(key as i64 + 1)))
+            .collect::<Vec<_>>()
+    };
+    let up_to = |key: u64| crate::interpreter::Predicate::at_or_below(Value::UInt(key));
+    items.borrow_mut().add_data(&entries(0..2));
+    items.borrow_mut().set_yield_predicate(up_to(1));
+    let mut idle = 0;
+    let mut released = Vec::new();
+    crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut || {
+        idle += 1;
+        released.push(items.borrow().get_released_predicate());
+        match idle {
+            1 => {
+                items.borrow_mut().add_data(&entries(2..4));
+                items.borrow_mut().set_yield_predicate(up_to(3));
+            }
+            2 => items
+                .borrow_mut()
+                .set_yield_predicate(crate::interpreter::Predicate::True),
+            _ => panic!("{source}: the run waits only for its two batches"),
+        }
+    })
+    .unwrap_or_else(|refused| panic!("{refused}"));
+    let written = sink
+        .value()
+        .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+    let [binding] = written.as_function().as_slice() else {
+        panic!("{source} writes one value: {written:?}")
+    };
+    assert_eq!(binding.output, Value::Int(70 + 1 + 2 + 3 + 4));
+    assert_eq!(
+        released,
+        [up_to(1), up_to(3)],
+        "the loop takes each delivery before its source yields everything"
     );
 }
