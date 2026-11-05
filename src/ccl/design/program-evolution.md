@@ -407,19 +407,17 @@ its outputs' producers, and a producer's release record dies with the producer. 
 registers outside every frame, which only a subscription made outside a compile does, is attributed
 to no branch.
 
-> **Open: a rebuilt reader resumes from the intersection over every slot.** A reader rebuilt behind
-> a kept fan-out starts at `FanOutShared::released`, the intersection over every live slot, not at
-> the slot of the reader it replaces, so any lagging slot holds it down. A rebuilt store over a kept
-> iteration resumes one past `FanOut::released_position`, read off the same intersection, and folds
-> the positions between a second time. `tests/it/hot_reload/fanout_lag.rs` pins the form of this one
-> version reaches on its own. Branch-and-reload reaches it a second way: within one version an
-> iteration input has one reader, and a branch that keeps the iteration and rebuilds the store adds
-> a second slot. `LiveProgram::check` refuses a reload or a creation that keeps an iteration whose
-> live slots disagree (`OperatorMap::disagreeing_kept_iterations`,
+> **Open: a rebuilt store resumes from the intersection over every slot.** A rebuilt store's
+> reader of a store starts at the slot of the reader it replaces
+> ([Where a fan-out's reader starts](#where-a-fan-outs-reader-starts)), but a store over a kept
+> iteration reads it through a plain slot, and resumes one past `FanOut::released_position`, read
+> off the intersection over every live slot. A lagging slot holds that intersection down, and the
+> store folds the positions between a second time. Within one version an iteration input has one
+> reader. Branch-and-reload adds a second: a branch that keeps the iteration and rebuilds the store
+> subscribes a second slot. `LiveProgram::check` refuses a reload or a creation that keeps an
+> iteration whose live slots disagree (`OperatorMap::disagreeing_kept_iterations`,
 > `a_reload_over_an_iteration_a_lagging_branch_reads_is_refused`), whether or not the store over it
-> is rebuilt, because that is decided at conversion, after the teardown. The fix that covers both
-> forms is per reader: snapshot each slot's guard before teardown, and resume a rebuilt reader from
-> the slot of the reader it replaces.
+> is rebuilt, because that is decided at conversion, after the teardown.
 
 **Every branch pins retention for every other.** A source keeps an element until every branch's
 producer releases it, so a slow branch holds memory for all of them, until it is reloaded or
@@ -468,8 +466,9 @@ changed](#a-binding-whose-operator-is-spent-is-rebuilt-not-changed)).
 An operator with no correspondent is built and subscribed like any other. Subscribing is how it
 learns where it is: a new subscriber's guard starts at what its input has already released, so it
 claims neither data that is gone nor data nobody has finished with. A `FanOut` seeds that guard from
-what it has released upstream, and a source seeds a newly registered producer the same way
-(`ProducerReleases`, `carry_release_to_new_producers`). This asks one thing of every producer: that
+what it has released upstream, except a reader slot of a store
+([Where a fan-out's reader starts](#where-a-fan-outs-reader-starts)), and a source seeds a newly
+registered producer the same way (`ProducerReleases`, `carry_release_to_new_producers`). This asks one thing of every producer: that
 it release what it has finished, and only that.
 
 A loop driver has finished a row its source's filter removed once it reads past it, so it releases
@@ -719,6 +718,32 @@ history into the replacement and re-emit an output for every input the replaced 
 The starting point is an intersection, not the newest position, because an index one of those
 producers has not finished with must not be skipped. An element that arrived and went unhandled is
 still delivered to whichever version takes over.
+
+### Where a fan-out's reader starts
+
+A slot of a kept fan-out starts at a release the slot itself carries. A recurrence slot starts at
+what every slot agreed to release (`FanOutShared::released`). A reader slot read by a node that
+corresponds to a node of the replaced version starts at the release that node's slot left
+(`FanOut::slot_read_by`), and its reader starts there too: a store's reader of positions releases
+that region of its own output when it subscribes, so it answers none of what its predecessor took.
+Any other reader slot starts at what every reader slot agreed to release
+(`FanOutShared::readers_released`), and its reader at nothing.
+
+A push reaches a reader slot whole, its release included (`FanOutInput::push`). The reader answers
+no rows in the released region but states it decided, so the breakers the reload rebuilt above the
+reader learn that the region is complete.
+
+The intersection a source carries does not serve a store's readers: a store's recurrence slots
+release nothing, and the `StoreDenseRead` under an `ExtractFinal` releases nothing until its loop is
+done, so the intersection stays empty while the reader that fed a sink has released every position
+it printed (`a_stdin_feed_prints_each_value_once_when_its_other_writer_is_edited`). A departed
+slot's release is kept by its reader's node until the next compaction, and one predecessor's
+release goes to one successor.
+
+A read a kept region holds keeps its slot, which stays recorded under the node of the version that
+built it. The operator map carries that node forward through each kept region
+(`OperatorMap::slot_keys`), so a reader rebuilt after one or more reloads that kept it starts at its
+slot's release (`a_feed_across_two_reloads_emits_each_value_once_at_every_cut`).
 
 ## State takeover
 

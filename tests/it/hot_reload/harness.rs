@@ -62,9 +62,16 @@ pub(crate) fn stdin_across_reload(
     thread::sleep(Duration::from_millis(400));
     drop(input);
 
-    launched.program.wait_for_exit(Duration::from_secs(10));
+    let status = launched.program.wait_for_exit(Duration::from_secs(10));
     reader.join().expect("reader thread");
     let text = collected.lock().unwrap().clone();
+    // A panic, a debug check that the run's answers are complete among them, ends the program
+    // with a failure.
+    assert!(
+        status.success(),
+        "the program ends cleanly once its input closes: {status}, {text}\n{}",
+        launched.program.stderr()
+    );
     (reply, text)
 }
 
@@ -135,7 +142,7 @@ pub(crate) fn launch_under_control_with(
             .env("CAMBRA_DISPATCH", dispatch)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(dir.join("stderr")).expect("create stderr file"))
             .spawn()
             .expect("spawn cambra"),
         dir,
@@ -183,15 +190,20 @@ impl RunningProgram {
     ///
     /// Polled rather than waited on: a program that never exits fails the test
     /// here instead of hanging the run.
-    pub(crate) fn wait_for_exit(&mut self, within: Duration) {
+    pub(crate) fn wait_for_exit(&mut self, within: Duration) -> std::process::ExitStatus {
         let deadline = Instant::now() + within;
         while Instant::now() < deadline {
-            if self.child.try_wait().expect("wait on cambra").is_some() {
-                return;
+            if let Some(status) = self.child.try_wait().expect("wait on cambra") {
+                return status;
             }
             thread::sleep(Duration::from_millis(20));
         }
         panic!("the program did not exit when its input closed");
+    }
+
+    /// What the program wrote to stderr so far.
+    pub(crate) fn stderr(&self) -> String {
+        std::fs::read_to_string(self.dir.join("stderr")).unwrap_or_default()
     }
 }
 

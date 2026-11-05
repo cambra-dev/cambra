@@ -1000,17 +1000,17 @@ nested store, and one over a concatenation's tagged positions, whose prefix has 
 the domain's tags, holds nothing short of terminal (`pushes_decided_positions`). A transaction store
 holds the commit ticks it has decided, through its watermark (`store_frontier`), and everything once
 it is terminal, and it pushes the ticks each consume decides (`pushes_while_consuming` answers
-`true`). A store pushes to its reader slots and not its recurrence slots (`FanOutInput::push`).
-`StoreValueStream`, a reader of a transaction store's changelog, keeps the store's keys and cuts its
-answer to the ticks a pull names, so a feed inside a transaction takes the ticks as they are
-decided. `StoreDenseRead` answers every decided position its reader has not released. A store's
-`final_guard` is `held()`. A release of a store with no rows above it names the positions a reader
-reads no more and removes nothing from the store tile; a nested store's offer cuts the rows its
-readers released ([A loop in rounds](#a-loop-in-rounds)). A consuming store answers a pull from its
-snapshot. Its first consume opens it, and a pull before that answers the unopened store, which
-states nothing final. It steps only at its pipeline's consumes, or its scope's. A transaction
-store's writers decide only against a tile it published. In pull mode a store steps itself at a
-pull.
+`true`). A store pushes to its reader slots and not its recurrence slots, and a change reaches each
+reader slot whole, what that slot released included (`FanOutInput::push`). The readers of a store's
+positions keep its keys and answer a pull at the positions it names: `StoreValueStream` over a
+transaction store's ticks, so a feed inside a transaction takes the ticks as they are decided, and
+`StoreDenseRead` over an induction store's, so a feed inside a loop does. A store's `final_guard` is
+`held()`. A release of a store with no rows above it names the positions a reader reads no more and
+removes nothing from the store tile; a nested store's offer cuts the rows its readers released
+([A loop in rounds](#a-loop-in-rounds)). A consuming store answers a pull from its snapshot. Its
+first consume opens it, and a pull before that answers the unopened store, which states nothing
+final. It steps only at its pipeline's consumes, or its scope's. A transaction store's writers
+decide only against a tile it published. In pull mode a store steps itself at a pull.
 
 In pull mode an induction store releases its body whole once the body is terminal and every decision
 is stepped, and a transaction drive releases its source whole once it is done. A nested induction

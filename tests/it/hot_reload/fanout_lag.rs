@@ -1,22 +1,17 @@
-//! A reload replays output when a rebuilt reader subscribes to a kept fan-out
-//! whose readers disagree about what they have released.
-//!
-//! `FanOutSlot::subscribe` seeds every new subscriber with `FanOutShared::released`,
-//! the intersection of all subscribers' releases, not with the release of the
-//! subscriber it replaces. A reader the reload rebuilds therefore starts at the
-//! slowest sibling's frontier and receives again every position between that
-//! frontier and the one its predecessor had reached.
+//! A reader a reload rebuilds over a kept fan-out starts at its predecessor's release
+//! (`FanOut::slot_read_by`), not at the intersection of every subscriber's release, so a
+//! reload replays no output where the fan-out's readers disagree about what they have
+//! released.
 //!
 //! Every feed case here reads a `defer` feed whose other writer the reload edits.
 //! That edit rebuilds the `out` binding, and with it the `StoreDenseRead` that reads
 //! the feed's tap off the store. The loop is unchanged, so the store and its fan-out
-//! are kept.
+//! are kept, and the store's other readers release less than the tap reader did.
 //!
-//! Every test here is a pinned failure: it asserts the wrong output the runtime
-//! produces today, so it passes now and turns red on any change to that output. Each
-//! test's doc comment gives the correct output. A change that fixes the bug should
-//! replace the pinned value with the correct one and rename the test to state the
-//! behavior it then pins.
+//! The last test is a pinned failure: it asserts the wrong output the runtime produces
+//! today, so it passes now and turns red on any change to that output. Its doc comment
+//! gives the correct output. A change that fixes it should replace the pinned value with
+//! the correct one and rename the test to state the behavior it then pins.
 
 use indoc::indoc;
 
@@ -102,6 +97,13 @@ fn pull(ctx: &mut GlobalContext, live: &mut LiveProgram) -> (Vec<String>, bool) 
 /// Run the feed over [`ITEMS`] for `pulls` pulls, reload with the second writer
 /// edited, drive to the end, and return everything `main` emitted.
 fn emitted_across_reload(reads_n: bool, pulls: usize) -> Vec<String> {
+    emitted_across_reloads(reads_n, pulls, &["!"])
+}
+
+/// Run the feed over [`ITEMS`] for `pulls` pulls, then reload to the second writer marked with
+/// each of `marks` in turn, pulling once between two reloads, drive to the end, and return
+/// everything `main` emitted. A mark equal to the one before keeps the second writer.
+fn emitted_across_reloads(reads_n: bool, pulls: usize, marks: &[&str]) -> Vec<String> {
     let mut ctx = GlobalContext::default();
     let mut live = LiveProgram::start_text(&mut ctx, &feed(ITEMS, reads_n, ""), &no_main)
         .expect("v1 compiles");
@@ -109,8 +111,13 @@ fn emitted_across_reload(reads_n: bool, pulls: usize) -> Vec<String> {
     for _ in 0..pulls {
         all.extend(pull(&mut ctx, &mut live).0);
     }
-    live.reload_text(&mut ctx, MAIN_BRANCH, &feed(ITEMS, reads_n, "!"), &no_main)
-        .expect("only the second writer changed");
+    for (at, mark) in marks.iter().enumerate() {
+        if at > 0 {
+            all.extend(pull(&mut ctx, &mut live).0);
+        }
+        live.reload_text(&mut ctx, MAIN_BRANCH, &feed(ITEMS, reads_n, mark), &no_main)
+            .expect("only the second writer changed");
+    }
     for _ in 0..100 {
         let (emitted, done) = pull(&mut ctx, &mut live);
         all.extend(emitted);
@@ -129,23 +136,19 @@ fn emitted_at_each_cut(reads_n: bool) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// Assert that each cut's output is the pinned buggy output, and name every cut
-/// that differs.
-fn assert_cuts_pinned(actual: &[Vec<String>], pinned: &[Vec<String>]) {
-    let changed: Vec<String> = actual
+/// Assert that every cut emits each value of [`EXPECTED`] once, and name every cut that does
+/// not.
+fn assert_every_cut_emits_each_value_once(actual: &[Vec<String>]) {
+    let wrong: Vec<String> = actual
         .iter()
-        .zip(pinned)
         .enumerate()
-        .filter(|(_, (actual, pinned))| actual != pinned)
-        .map(|(pulls, (actual, pinned))| {
-            format!("{pulls} pulls:\n    actual: {actual:?}\n    pinned: {pinned:?}")
-        })
+        .filter(|(_, emitted)| **emitted != strings(&EXPECTED))
+        .map(|(pulls, emitted)| format!("{pulls} pulls: {emitted:?}"))
         .collect();
     assert!(
-        changed.is_empty(),
-        "the feed's output across a reload changed. If the replay was fixed, pin the \
-         correct output from this test's doc comment instead.\n  {}",
-        changed.join("\n  "),
+        wrong.is_empty(),
+        "each value once at every cut:\n  {}",
+        wrong.join("\n  ")
     );
 }
 
@@ -153,109 +156,45 @@ fn strings(values: &[&str]) -> Vec<String> {
     values.iter().map(|v| v.to_string()).collect()
 }
 
-/// PINNED FAILURE. The value at the cut is emitted twice, as in
-/// [`a_feed_repeats_the_position_the_recurrence_still_reads`].
-///
-/// Correct at every cut from 0 to 10 pulls:
-///
-/// ```text
-/// ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh"]
-/// ```
-///
-/// Pinned: cuts 0 and 1 are correct, and each cut from 2 to 10 repeats the last value
-/// decided before the swap:
-///
-/// ```text
-/// 3 pulls:  ["a", "ab", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh"]
-/// 9 pulls:  ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh", "abcdefgh"]
-/// ```
-///
-/// The second writer reads `n` without taking anything (see [`feed`]), and releases the
-/// store's fan-out once its empty loop is done, so the kept fan-out's release is what the
-/// recurrence has read: the rebuilt tap reader starts one position behind its predecessor.
+/// Each value is emitted once at every cut from 0 to 10 pulls, though the second writer
+/// reads `n` without taking anything (see [`feed`]): its release is the recurrence's, a position
+/// behind the tap reader's, and the rebuilt tap reader starts at its own predecessor's release.
 #[test]
-fn a_feed_read_by_a_sibling_that_takes_nothing_repeats_the_position_at_the_cut() {
-    let pinned: Vec<Vec<String>> = (0..=10)
-        .map(|pulls| match pulls {
-            0 | 1 => strings(&EXPECTED),
-            // The last value decided before the swap, twice.
-            _ => {
-                let decided = (pulls - 1).min(EXPECTED.len());
-                strings(&[&EXPECTED[..decided], &EXPECTED[decided - 1..]].concat())
-            }
-        })
-        .collect();
-    assert_cuts_pinned(&emitted_at_each_cut(true), &pinned);
+fn a_feed_read_by_a_sibling_that_takes_nothing_emits_each_value_once_at_every_cut() {
+    assert_every_cut_emits_each_value_once(&emitted_at_each_cut(true));
 }
 
-/// PINNED FAILURE. The value at the cut is emitted twice.
-///
-/// Correct at every cut from 0 to 10 pulls:
-///
-/// ```text
-/// ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh"]
-/// ```
-///
-/// Pinned: cuts 0 and 1 are correct. Each cut from 2 to 10 repeats the last value
-/// decided before the swap, which after the fold finished is the last value:
-///
-/// ```text
-/// 3 pulls:  ["a", "ab", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh"]
-/// 8 pulls:  ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefg", "abcdefgh"]
-/// 9 pulls:  ["a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh", "abcdefgh"]
-/// ```
-///
-/// In-process only: through the binary over `stdin` the recurrence has caught up at
-/// the quiet point where `--control` reloads, and nothing is replayed.
-///
-/// No reader here is unpulled. The induction driver's recurrence slot reads each key
-/// at the store's frontier, the position before the one it feeds, so its release trails
-/// the tap reader's by one position, and the rebuilt tap reader is seeded at the driver's
-/// frontier.
+/// Each value is emitted once at every cut from 0 to 10 pulls. The induction driver's
+/// recurrence slot reads each key at the store's frontier, the position before the one it feeds,
+/// so its release trails the tap reader's by one position; the rebuilt tap reader starts at its
+/// own predecessor's release, not at the driver's.
 #[test]
-fn a_feed_repeats_the_position_the_recurrence_still_reads() {
-    let pinned: Vec<Vec<String>> = (0..=10)
-        .map(|pulls| match pulls {
-            0 | 1 => strings(&EXPECTED),
-            // The last value decided before the swap, twice.
-            _ => {
-                let decided = (pulls - 1).min(EXPECTED.len());
-                strings(&[&EXPECTED[..decided], &EXPECTED[decided - 1..]].concat())
-            }
-        })
-        .collect();
-    assert_cuts_pinned(&emitted_at_each_cut(false), &pinned);
+fn a_feed_the_recurrence_still_reads_emits_each_value_once_at_every_cut() {
+    assert_every_cut_emits_each_value_once(&emitted_at_each_cut(false));
 }
 
-/// PINNED FAILURE in pull mode, through the real binary. The new version prints again the last
-/// value the old version printed. A dispatched run prints each value once: the new version's run
-/// starts from what the old one released.
-///
-/// With `a` and `b` sent before the reload and `c` after, correct, and dispatched:
-///
-/// ```text
-/// ["a", "ab", "abc"]
-/// ```
-///
-/// Pinned in pull mode, which repeats the value at the cut:
-///
-/// ```text
-/// ["a", "ab", "ab", "abc"]
-/// ```
-///
-/// Pinned dispatched, which repeats every value before the cut: the store pushes each position it
-/// decides, and the rebuilt tap reader's slot starts at the intersection of every slot's release,
-/// which the store's recurrence slots hold empty.
-///
-/// ```text
-/// ["a", "ab", "a", "ab", "abc"]
-/// ```
-///
-/// The program of
-/// [`a_feed_read_by_a_sibling_that_takes_nothing_repeats_the_position_at_the_cut`], over
-/// `stdin`, reloaded through `--control` at a quiet point between lines.
+/// Each value is emitted once at every cut from 0 to 10 pulls across two reloads: one that keeps
+/// the tap reader and one that rebuilds it, then two that rebuild it. A slot a kept region holds
+/// stays recorded under the node of the version that built it, so the reader the second reload
+/// rebuilds starts at that slot's release only because the operator map carries the node across
+/// the first.
 #[rstest::rstest]
-fn a_stdin_feed_repeats_the_value_at_the_cut_when_its_other_writer_is_edited(
+fn a_feed_across_two_reloads_emits_each_value_once_at_every_cut(
+    #[values(false, true)] reads_n: bool,
+    #[values(["", "!"], ["!", "?"])] marks: [&str; 2],
+) {
+    let emitted: Vec<_> = (0..=10)
+        .map(|pulls| emitted_across_reloads(reads_n, pulls, &marks))
+        .collect();
+    assert_every_cut_emits_each_value_once(&emitted);
+}
+
+/// Through the real binary, over `stdin`, reloaded through `--control` at a quiet point
+/// between lines: with `a` and `b` sent before the reload and `c` after, each value is printed
+/// once, in pull mode as dispatched. The program is that of
+/// [`a_feed_read_by_a_sibling_that_takes_nothing_emits_each_value_once_at_every_cut`].
+#[rstest::rstest]
+fn a_stdin_feed_prints_each_value_once_when_its_other_writer_is_edited(
     #[values("0", "1")] dispatch: &str,
 ) {
     let (reply, out) = stdin_across_reload(
@@ -275,15 +214,7 @@ fn a_stdin_feed_repeats_the_value_at_the_cut_when_its_other_writer_is_edited(
         .map(str::trim)
         .filter_map(|l| l.strip_prefix('"')?.strip_suffix("\","))
         .collect();
-    let expected = match dispatch {
-        "1" => vec!["a", "ab", "a", "ab", "abc"],
-        _ => vec!["a", "ab", "ab", "abc"],
-    };
-    assert_eq!(
-        printed, expected,
-        "the printed values changed. If the replay was fixed, pin the correct \
-         [\"a\", \"ab\", \"abc\"] in both modes: {out}"
-    );
+    assert_eq!(printed, ["a", "ab", "abc"], "{out}");
 }
 
 /// PINNED FAILURE of a related bug: lost input, not replay. A loop the reload adds

@@ -4350,7 +4350,8 @@ impl TileOperator for StoreValueStream {
         // The stream is keyed by the store's commit ticks, so a region of ticks the store
         // decided names the stream's keys as it is.
         let store_producer = subscribe_forwarding_keeping_keys(&mut *self.store_op, &consumer, cx);
-        Box::new(StoreValueStreamProducer {
+        let carried = store_producer.obsolete_guard().clone();
+        let mut producer: Box<dyn TileProducer> = Box::new(StoreValueStreamProducer {
             base: ProducerBase::new(
                 StoreValueStreamProducer::alloc_id(),
                 self.tiling(),
@@ -4363,7 +4364,12 @@ impl TileOperator for StoreValueStream {
             value_extent: self.value_extent.clone(),
             carry_forward: self.carry_forward,
             release_cursor: PrefixReleaseCursor::default(),
-        })
+        });
+        // The stream starts at the release its slot carried, as a flat `StoreDenseRead` does.
+        if !carried.is_empty() {
+            producer.release(carried);
+        }
+        producer
     }
 }
 
@@ -4871,7 +4877,8 @@ impl TileOperator for StoreDenseRead {
         let (consumer, gate) = shared_consumer(consumer);
         consumer.notify(&Projection::Everything);
         let store_producer = subscribe_forwarding_keeping_keys(&mut *self.store_op, &consumer, cx);
-        Box::new(StoreDenseReadProducer {
+        let carried = store_producer.obsolete_guard().clone();
+        let mut producer: Box<dyn TileProducer> = Box::new(StoreDenseReadProducer {
             base: ProducerBase::new(
                 StoreDenseReadProducer::alloc_id(),
                 self.tiling(),
@@ -4887,7 +4894,18 @@ impl TileOperator for StoreDenseRead {
             enclosing: self.enclosing.clone(),
             level: self.level,
             release_cursor: PrefixReleaseCursor::default(),
-        })
+        });
+        // A read starts at the release its slot carried ([`FanOut::slot_read_by`]): a read a
+        // reload rebuilt over a kept store answers none of what its predecessor released.
+        debug_assert!(
+            self.enclosing.is_empty() || carried.is_empty(),
+            "a nested store is rebuilt by every version, so a read under rows has no predecessor \
+             whose release it carries"
+        );
+        if !carried.is_empty() {
+            producer.release(carried);
+        }
+        producer
     }
 }
 

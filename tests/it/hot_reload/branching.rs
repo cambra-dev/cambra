@@ -1113,7 +1113,12 @@ fn the_driver_pulls_every_branch_and_exits_when_all_have_finished(
     launched.wait_for_output(&["AL2", "BL2"], Duration::from_secs(10));
     drop(input);
 
-    launched.program.wait_for_exit(Duration::from_secs(10));
+    let status = launched.program.wait_for_exit(Duration::from_secs(10));
+    assert!(
+        status.success(),
+        "the program ends cleanly once its input closes: {status}\n{}",
+        launched.program.stderr()
+    );
     reader.join().expect("reader thread");
     let out = launched.collected.lock().unwrap().clone();
     let from_b: String = out

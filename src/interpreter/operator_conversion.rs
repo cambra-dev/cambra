@@ -507,6 +507,12 @@ pub(crate) struct OpenIteration {
 pub struct OperatorMap {
     /// What the graph holds, by the node it was built from.
     entries: HashMap<NodeId, Recorded>,
+    /// The node each store read's fan-out slot is recorded under
+    /// ([`FanOut::slot_read_by`]), by the node of this version that reads through it. A slot
+    /// records the node that subscribed it, so a read a kept region holds is under the node of
+    /// the version that built it, which [`keep_region`](OpConversionContext::keep_region)
+    /// carries forward.
+    slot_keys: HashMap<NodeId, NodeId>,
 }
 
 /// What a compilation is offered by the version it replaces: that version's
@@ -590,9 +596,9 @@ impl OperatorMap {
     /// A store rebuilt over such an iteration resumes one past the
     /// intersection of every slot's release, which a lagging slot holds below
     /// where this map's own reader stopped, so the store would fold the
-    /// positions between a second time. The reload is refused instead, until a
-    /// rebuilt reader resumes from the slot of the reader it replaces
-    /// (`src/ccl/design/program-evolution.md`, "Routes across branches").
+    /// positions between a second time. The reload is refused instead: a rebuilt
+    /// store reads its iteration through a plain slot, which starts at no reader's
+    /// own release (`src/ccl/design/program-evolution.md`, "Routes across branches").
     /// Refused whether or not the store is rebuilt, because whether it is is
     /// decided at conversion, after the teardown.
     pub fn disagreeing_kept_iterations(&self, previous: &Expr, planned: &Expr) -> Vec<NodeId> {
@@ -1192,6 +1198,21 @@ records one and the only site a `Transact` reaches"
             .cloned()
     }
 
+    /// A slot of the store fan-out `fan` read by the node `reader`, which starts at the release
+    /// the slot of the node `reader` replaces left ([`FanOut::slot_read_by`]); a plain slot for a
+    /// read with no node of its own.
+    fn store_slot(&mut self, fan: &FanOut, reader: Option<NodeId>) -> Box<dyn TileOperator> {
+        let Some(reader) = reader else {
+            return fan.slot();
+        };
+        let replaces = self
+            .correspondence
+            .previous(reader)
+            .and_then(|previous| self.offer.operators.slot_keys.get(&previous).copied());
+        self.operator_map.slot_keys.insert(reader, reader);
+        fan.slot_read_by(reader, replaces)
+    }
+
     /// Whether a store over `keys` at `paths` continues a recurrence the retired version was
     /// running, which is the `continues` argument of [`iteration_input`](Self::iteration_input).
     /// A store whose seed summarizes positions resumes above them; one whose seed summarizes none
@@ -1361,6 +1382,9 @@ in it has a correspondent",
             };
             if let Some(entry) = self.offer.operators.entries.get(&previous).cloned() {
                 self.record(node, entry);
+            }
+            if let Some(&key) = self.offer.operators.slot_keys.get(&previous) {
+                self.operator_map.slot_keys.insert(node, key);
             }
         }
     }
@@ -1969,7 +1993,12 @@ fn convert_impl_inner(
                     && let Some(TypedExprNode::Builtin(Builtin::FinalRead)) =
                         elems.get(2).map(|e| &e.node)
                 {
-                    result = Some(convert_store_settled_read(&read.store, &read.field, ctx)?);
+                    result = Some(convert_store_settled_read(
+                        &read.store,
+                        &read.field,
+                        None,
+                        ctx,
+                    )?);
                     rest = &elems[3..];
                 } else {
                     result = Some(convert_nested_store_read(read, ctx)?);
@@ -2031,7 +2060,7 @@ fn convert_impl_inner(
                 unreachable!("guarded above")
             };
             expect_no_input(input, "transactional store read")?;
-            convert_store_read(store_name, field, ctx)
+            convert_store_read(store_name, field, Some(expr.node_id()), ctx)
         }
 
         // A bare `Transact` never reaches here: `plan_loops` always binds it as
@@ -2629,7 +2658,7 @@ fn convert_impl_inner(
                         .into(),
                 ));
             };
-            convert_store_settled_read(&store_name, &field, ctx)
+            convert_store_settled_read(&store_name, &field, Some(expr.node_id()), ctx)
         }
 
         // `await_final` is a surface marker: `transact_phase` replaces each occurrence
@@ -5434,6 +5463,7 @@ fn as_store_read(e: &Expr, ctx: &OpConversionContext) -> Option<(Name, Label)> {
 fn convert_store_settled_read(
     store_name: &Name,
     field: &Label,
+    reader: Option<NodeId>,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
     let info = ctx.lookup_store(store_name).ok_or_else(|| {
@@ -5448,7 +5478,7 @@ fn convert_store_settled_read(
     // the levels standing above the stores are the store tiling's collection levels.
     let levels_above = fan.tiling().levels();
     Ok(Box::new(StoreFinalRead::per_row_at(
-        fan.slot(),
+        ctx.store_slot(&fan, reader),
         runtime_key,
         value_extent,
         levels_above,
@@ -5462,6 +5492,7 @@ fn convert_store_settled_read(
 fn convert_store_read(
     store_name: &Name,
     field: &Label,
+    reader: Option<NodeId>,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
     let (fan, kind, key) = {
@@ -5482,9 +5513,14 @@ fn convert_store_read(
         // `runtime_key`. The key's registration fixes `carry_forward`: a mutable
         // variable holds its value across ticks that wrote other keys, and a reply tap
         // appears only at the tick that wrote it.
-        (StoreReadKind::Commit, Some((runtime_key, value_extent, carry_forward))) => Ok(Box::new(
-            StoreValueStream::new(fan.slot(), runtime_key, value_extent, carry_forward),
-        )),
+        (StoreReadKind::Commit, Some((runtime_key, value_extent, carry_forward))) => {
+            Ok(Box::new(StoreValueStream::new(
+                ctx.store_slot(&fan, reader),
+                runtime_key,
+                value_extent,
+                carry_forward,
+            )))
+        }
         // An `InductionChangelog` key read off the changelog by [`StoreDenseRead`],
         // folded at every position the store decided. An **accumulator**
         // (`carry_forward: true`) is dense `D ⇀ V`: every position folds the latest write
@@ -5501,7 +5537,7 @@ fn convert_store_read(
             StoreReadKind::InductionChangelog | StoreReadKind::NestedInductionChangelog,
             Some((runtime_key, value_extent, carry_forward)),
         ) => Ok(Box::new(StoreDenseRead::new(
-            fan.slot(),
+            ctx.store_slot(&fan, reader),
             runtime_key,
             value_extent,
             carry_forward,
@@ -6204,7 +6240,7 @@ fn convert_nested_store_read(
     read: NestedStoreRead<'_>,
     ctx: &mut OpConversionContext,
 ) -> Result<Box<dyn TileOperator>, ConversionError> {
-    let mut op = convert_store_read(&read.store, &read.field, ctx)?;
+    let mut op = convert_store_read(&read.store, &read.field, None, ctx)?;
     for step in read.steps {
         op = convert_lifted(step, Some(op), ctx)?;
     }
