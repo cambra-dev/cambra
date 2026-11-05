@@ -670,12 +670,12 @@ fn reuse_does_not_depend_on_how_many_reloads_came_before() {
 /// `OneFile::diff_text`), so this is what covers the wire: both ways of carrying
 /// the source, the leading `phase=`, and the main loop servicing a `Diff`
 /// between ticks.
-#[test]
-fn the_control_port_answers_a_diff_request() {
+#[rstest::rstest]
+fn the_control_port_answers_a_diff_request(#[values("0", "1")] dispatch: &str) {
     const V1: &str = "[\"> \" + line for line in stdin()]\n";
     const V2: &str = "[\">> \" + line for line in stdin()]\n";
 
-    let launched = launch_under_control(V1);
+    let launched = launch_under_control(V1, dispatch);
     let control = launched.control;
 
     // The source is the body here, which is how a client sends a file. A space in
@@ -751,13 +751,14 @@ fn the_control_port_answers_a_diff_request() {
 /// the binary's own driver loop services the control port between pulls. The
 /// line written before the swap is answered by the old version and the one after
 /// by the new.
-#[test]
-fn a_main_output_program_over_stdin_reloads() {
+#[rstest::rstest]
+fn a_main_output_program_over_stdin_reloads(#[values("0", "1")] dispatch: &str) {
     let (reply, out) = stdin_across_reload(
         "[\"> \" + line for line in stdin()]\n",
         "[\">> \" + line for line in stdin()]\n",
         "one",
         "two",
+        dispatch,
     );
     assert!(
         reply.contains("reloaded"),
@@ -783,13 +784,14 @@ fn a_main_output_program_over_stdin_reloads() {
 /// Eight lines with the swap after the fourth. Nothing here holds state, so what
 /// is being checked is the seam itself — that the stream is neither replayed
 /// through the new version nor has elements dropped at the handover.
-#[test]
-fn an_element_wise_transformation_splits_exactly_at_the_swap() {
+#[rstest::rstest]
+fn an_element_wise_transformation_splits_exactly_at_the_swap(#[values("0", "1")] dispatch: &str) {
     let (reply, out) = stdin_across_reload(
         "[\"A\" + line for line in stdin()]\n",
         "[\"B\" + line for line in stdin()]\n",
         "L1\nL2\nL3\nL4",
         "L5\nL6\nL7\nL8",
+        dispatch,
     );
     assert!(
         reply.contains("reloaded"),
@@ -814,8 +816,8 @@ fn an_element_wise_transformation_splits_exactly_at_the_swap() {
 /// applied retroactively). Nothing about a `main` output makes its state less
 /// live than a sink program's — what a value like `n` here reports is decided by
 /// when it is read, and reading it at the tail of the program means EOF.
-#[test]
-fn a_main_output_accumulator_carries_across_the_swap() {
+#[rstest::rstest]
+fn a_main_output_accumulator_carries_across_the_swap(#[values("0", "1")] dispatch: &str) {
     let (reply, out) = stdin_across_reload(
         indoc! {r#"
             n := 0
@@ -831,6 +833,7 @@ fn a_main_output_accumulator_carries_across_the_swap() {
         "#},
         "a\nb",
         "c\nd",
+        dispatch,
     );
     assert!(
         reply.contains("reloaded"),
@@ -852,6 +855,21 @@ fn a_main_output_accumulator_carries_across_the_swap() {
 /// the second line: `1 + 1 + 2 + 2 + 2`.
 #[test]
 fn an_accumulator_over_a_concatenation_carries_across_the_swap() {
+    accumulator_over_a_concatenation_across_the_swap("0");
+}
+
+/// [`an_accumulator_over_a_concatenation_carries_across_the_swap`], dispatched. A dispatched loop
+/// over a concatenation with a live arm reads its input whole once the source yields everything,
+/// so the old version has stepped nothing at the reload, and the new version folds every line with
+/// `+2`: it answers 10.
+#[test]
+#[ignore = "a dispatched loop over a concatenation with a live arm reads its input whole, so the \
+            swap carries nothing"]
+fn an_accumulator_over_a_concatenation_carries_across_the_swap_dispatched() {
+    accumulator_over_a_concatenation_across_the_swap("1");
+}
+
+fn accumulator_over_a_concatenation_across_the_swap(dispatch: &str) {
     let (reply, out) = stdin_across_reload(
         indoc! {r#"
             n := 0
@@ -867,6 +885,7 @@ fn an_accumulator_over_a_concatenation_carries_across_the_swap() {
         "#},
         "a\nb",
         "c\nd",
+        dispatch,
     );
     assert!(
         reply.contains("reloaded"),
@@ -885,8 +904,8 @@ fn an_accumulator_over_a_concatenation_carries_across_the_swap() {
 ///
 /// Each line pairs with both of `[1, 2]`. Two lines before the swap count four positions at
 /// `+1`, and two after count four at `+2`: `4 + 8`.
-#[test]
-fn an_accumulator_over_a_product_carries_across_the_swap() {
+#[rstest::rstest]
+fn an_accumulator_over_a_product_carries_across_the_swap(#[values("0", "1")] dispatch: &str) {
     let (reply, out) = stdin_across_reload(
         indoc! {r#"
             n := 0
@@ -902,6 +921,7 @@ fn an_accumulator_over_a_product_carries_across_the_swap() {
         "#},
         "a\nb",
         "c\nd",
+        dispatch,
     );
     assert!(
         reply.contains("reloaded"),
@@ -920,8 +940,8 @@ fn an_accumulator_over_a_product_carries_across_the_swap() {
 /// `out << n` per line makes each step observable rather than only the value at
 /// EOF, so the sequence `1, 2, 4, 6` is the accumulator itself: two steps of `+1`,
 /// then the swap, then two of `+2` continuing from `2` rather than restarting.
-#[test]
-fn a_fed_accumulator_is_observable_across_the_swap() {
+#[rstest::rstest]
+fn a_fed_accumulator_is_observable_across_the_swap(#[values("0", "1")] dispatch: &str) {
     let (reply, out) = stdin_across_reload(
         indoc! {r#"
             out: Feed(_)
@@ -941,6 +961,7 @@ fn a_fed_accumulator_is_observable_across_the_swap() {
         "#},
         "a\nb",
         "c\nd",
+        dispatch,
     );
     assert!(
         reply.contains("reloaded"),
@@ -960,8 +981,8 @@ fn a_fed_accumulator_is_observable_across_the_swap() {
 /// The value never reaches the program's output (a scalar read of an
 /// accumulator over an unbounded source never finalizes), which is exactly why
 /// the guard has to catch the change rather than leaving it to be noticed.
-#[test]
-fn the_state_guard_covers_a_stdin_sourced_loop() {
+#[rstest::rstest]
+fn the_state_guard_covers_a_stdin_sourced_loop(#[values("0", "1")] dispatch: &str) {
     let (reply, _) = stdin_across_reload(
         indoc! {r#"
             n := ""
@@ -977,6 +998,7 @@ fn the_state_guard_covers_a_stdin_sourced_loop() {
         "#},
         "a",
         "b",
+        dispatch,
     );
     assert!(
         reply.contains("`n` is now Int"),
@@ -987,8 +1009,8 @@ fn the_state_guard_covers_a_stdin_sourced_loop() {
 /// A variable holding a nominal value does not carry over a reload yet. A renamed type has
 /// the representation of the old one, so comparing extents would let the value through
 /// where the spec refuses it (`docs/chl-spec.md`, "Reloading a nominal type").
-#[test]
-fn a_reload_refuses_a_variable_of_a_nominal_type() {
+#[rstest::rstest]
+fn a_reload_refuses_a_variable_of_a_nominal_type(#[values("0", "1")] dispatch: &str) {
     let (reply, _) = stdin_across_reload(
         indoc! {r#"
             type Price = Int
@@ -1008,6 +1030,7 @@ fn a_reload_refuses_a_variable_of_a_nominal_type() {
         "#},
         "a",
         "b",
+        dispatch,
     );
     assert!(
         reply.contains("`n` holds a value of a nominal type"),
@@ -1017,8 +1040,10 @@ fn a_reload_refuses_a_variable_of_a_nominal_type() {
 
 /// The refusal reads the running program's type too: a structural variant with the
 /// representation of the nominal type it replaces does not take the value over.
-#[test]
-fn a_reload_refuses_a_nominal_value_retyped_to_its_representation() {
+#[rstest::rstest]
+fn a_reload_refuses_a_nominal_value_retyped_to_its_representation(
+    #[values("0", "1")] dispatch: &str,
+) {
     let (reply, _) = stdin_across_reload(
         indoc! {r#"
             type Price = Int
@@ -1036,6 +1061,7 @@ fn a_reload_refuses_a_nominal_value_retyped_to_its_representation() {
         "#},
         "a",
         "b",
+        dispatch,
     );
     assert!(
         reply.contains("`n` holds a value of a nominal type"),
@@ -2657,8 +2683,10 @@ fn diffing_a_running_http_program_leaves_it_untouched() {
 /// exactly what the edit changes. Their identities are the spelling plus an index
 /// among the variables of that spelling, which is why the edit carries and the
 /// two do not cross.
-#[test]
-fn two_instantiations_of_one_function_keep_their_accumulators_apart() {
+#[rstest::rstest]
+fn two_instantiations_of_one_function_keep_their_accumulators_apart(
+    #[values("0", "1")] dispatch: &str,
+) {
     let v1 = concat!(
         "def count_by(src, step) => Int:\n",
         "    total := 0\n",
@@ -2672,7 +2700,7 @@ fn two_instantiations_of_one_function_keep_their_accumulators_apart() {
         "a * 1000 + b\n",
     );
     let v2 = v1.replace("total + step", "total + step * 2");
-    let (reply, out) = stdin_across_reload(v1, &v2, "m\nn", "o\np");
+    let (reply, out) = stdin_across_reload(v1, &v2, "m\nn", "o\np", dispatch);
     assert!(
         reply.contains("reloaded"),
         "the reload should be accepted: {reply}"

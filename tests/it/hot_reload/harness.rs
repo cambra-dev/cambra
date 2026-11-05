@@ -25,15 +25,18 @@ use super::serving::{raw_http, reserve_test_port};
 /// Driven as a subprocess because a `main` output belongs to the binary's own
 /// loop, not to a sink a test can pump. Such a program is not short-lived: its
 /// source is unbounded, so it keeps running and is as reloadable as any other.
+/// `dispatch` is the binary's `CAMBRA_DISPATCH`: `"1"` runs the program
+/// dispatched, `"0"` in pull mode.
 pub(crate) fn stdin_across_reload(
     program: &str,
     reloaded: &str,
     before: &str,
     after: &str,
+    dispatch: &str,
 ) -> (String, String) {
     use std::io::Write;
 
-    let mut launched = launch_under_control(program);
+    let mut launched = launch_under_control(program, dispatch);
     let control = launched.control;
     let v2 = launched.program.dir.join("v2.cambra");
     std::fs::write(&v2, reloaded).expect("write v2");
@@ -103,12 +106,18 @@ impl Launched {
 ///
 /// The wait is not optional: the program binds its control port during
 /// compilation, so a request sent before then is refused rather than served.
-pub(crate) fn launch_under_control(program: &str) -> Launched {
-    launch_under_control_with(program, &[])
+/// `dispatch` sets the binary's `CAMBRA_DISPATCH`, as [`stdin_across_reload`]
+/// says.
+pub(crate) fn launch_under_control(program: &str, dispatch: &str) -> Launched {
+    launch_under_control_with(program, &[], dispatch)
 }
 
 /// [`launch_under_control`], passing `extra` to the binary as well.
-pub(crate) fn launch_under_control_with(program: &str, extra: &[String]) -> Launched {
+pub(crate) fn launch_under_control_with(
+    program: &str,
+    extra: &[String],
+    dispatch: &str,
+) -> Launched {
     use std::io::{BufRead, BufReader};
     use std::process::{Command, Stdio};
 
@@ -123,6 +132,7 @@ pub(crate) fn launch_under_control_with(program: &str, extra: &[String]) -> Laun
             .arg(format!("--control={control}"))
             .args(extra)
             .arg(&v1)
+            .env("CAMBRA_DISPATCH", dispatch)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
