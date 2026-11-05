@@ -658,6 +658,28 @@ impl UnionProducer {
     }
 }
 
+/// What `keys`, admitting paths whose last key stands at `depth` beneath a tagged union, names of
+/// arm `arm`: each path's outermost key under the arm's tag, and nothing of a path headed by
+/// another arm's key.
+fn under_arm(keys: &Predicate, depth: usize, arm: usize) -> Predicate {
+    match keys {
+        Predicate::Or(arms) => Predicate::union_all(
+            arms.iter()
+                .map(|admitted| under_arm(admitted, depth, arm))
+                .collect(),
+        ),
+        Predicate::Qualified { enclosing, here } if depth > 0 => {
+            Predicate::qualified(under_arm(enclosing, depth - 1, arm), (**here).clone())
+        }
+        unqualified if depth > 0 => unqualified.clone(),
+        Predicate::True => Predicate::True,
+        tagged @ Predicate::Union { .. } => tagged
+            .under_tag(&crate::ccl::FieldKey::Index(arm))
+            .unwrap_or_else(|| unreachable!("matched as a union predicate")),
+        other => panic!("a tagged union's outermost keys are named by tag, not {other:?}"),
+    }
+}
+
 impl TileProducer for UnionProducer {
     impl_producer_base!();
 
@@ -673,16 +695,39 @@ impl TileProducer for UnionProducer {
         }
     }
 
+    /// It restates every level: a flat union's arms share its keys at each level, and beneath a
+    /// tagged union's outermost keys each arm's keys stand under the arm's tag
+    /// ([`under_arm`]).
+    fn restates(&self) -> Restates {
+        Restates::Every
+    }
+
     /// A flat union's arms are disjoint slices of one collection, so each is pulled at the
     /// projection and the merge is cut to it. A tagged union's keys carry the arm's tag: a
-    /// projection of its outermost keys reaches each arm as what it names under that arm's tag,
-    /// as a release does, and an arm it names nothing of is not pulled.
+    /// projection reaches each arm as what it names under that arm's tag, as a release does, and
+    /// an arm it names nothing of is not pulled.
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         // Closed first, so a pull of every arm reads as the pull of everything it is.
         let projection_guard = projection_guard.closed_over(self.tiling());
-        let projection = projection_guard.projection(&self.name());
+        let projection = projection_guard.projection_for(self);
         if projection == Projection::Nothing {
             return self.tiling().empty_tile();
+        }
+        if let (false, Projection::Keys { level, keys }) = (self.flat, &projection)
+            && *level != CurryLevel::OUTERMOST
+        {
+            let tiles: Vec<Tile> = self
+                .inputs
+                .iter_mut()
+                .enumerate()
+                .map(|(arm, p)| match under_arm(keys, level.index(), arm) {
+                    under if under.is_false() => p.tiling().empty_tile(),
+                    under => p.get(Projection::keys_at(*level, under).guard(p.tiling())),
+                })
+                .collect();
+            let mut merged = self.combine(tiles);
+            merged.restrict_to(&projection, self.tiling());
+            return merged;
         }
         let tags = match (&projection_guard, self.flat) {
             (_, true) => None,
@@ -802,6 +847,26 @@ mod tests {
     use crate::interpreter::{BaseType, ColumnValue, Extent};
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    // ── under_arm ────────────────────────────────────────────────────────────
+
+    /// Beneath a tagged union, key 5 under arm 1's key 2 names key 5 under key 2 of arm 1 and
+    /// nothing of arm 0; key 5 under every outer key names it under every key of each arm.
+    #[test]
+    fn a_path_beneath_a_tagged_union_reaches_the_arm_its_outer_key_is_tagged_with() {
+        let point = |k: u64| Predicate::point(Value::UInt(k));
+        let tagged = Predicate::tagged(
+            TagMap::from_positional(vec![Predicate::False, point(2)]),
+            false,
+        );
+        let path = Predicate::qualified(tagged, point(5));
+        assert!(under_arm(&path, 1, 0).is_false());
+        assert_eq!(
+            under_arm(&path, 1, 1),
+            Predicate::qualified(point(2), point(5))
+        );
+        assert_eq!(under_arm(&point(5), 1, 0), point(5));
+    }
 
     // ── UnionProducer::release_impl ───────────────────────────────────────────
 

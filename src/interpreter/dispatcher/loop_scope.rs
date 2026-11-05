@@ -393,7 +393,21 @@ impl LoopScope {
             self.inner.notify(source, guard);
         }
         for (reader, row) in self.row_for(guard, &readers) {
-            self.inner.queue_round(reader, &row);
+            // A reader whose input has released the whole row consumed it final, its end
+            // included, and reads it no more: it is no longer there to read. A row released in
+            // part is read again whole, for its end.
+            let mut released = false;
+            reach_member(
+                &self.store,
+                &self.members[reader.0],
+                reader,
+                &mut |breaker, input| {
+                    released = guard_minus(&row, &breaker.input_released(input)).is_empty()
+                },
+            );
+            if !released {
+                self.inner.queue_round(reader, &row);
+            }
         }
         // A blocking seal would wait for a retirement only this thread makes.
         assert!(
