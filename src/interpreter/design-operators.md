@@ -1449,6 +1449,93 @@ A scope or store notified of its whole input (`Notifies::Whole`) that reads such
 transaction whose writer reads a concatenation with the live source, is notified once every live
 source of the run yields everything (`LivePipeline::waits`), in the run's last epoch.
 
+#### Completeness in pushes
+
+This section is the planned design. The code does not implement it yet: it decides finality by
+epochs, as [Holding arrivals until a read is final](#holding-arrivals-until-a-read-is-final)
+describes.
+
+A key of a pipeline's output is decided where its value can no longer change and its presence or
+absence is settled: a key present in the output, whose value is complete once it is there, or a key
+the domain predicate rules out ([The completeness contract](#the-completeness-contract)). That is
+the region `Tile::to_guard` names and `BreakingProducer::held` states. The decided region enters
+the dispatcher as a guard, pushed up the consumer chain as a breaker's final guard is pushed today,
+and the dispatcher decides that a read is final by guard containment rather than by epochs.
+
+Today the two ends of a pipeline state completeness through two channels:
+
+| End | States completeness by | Granularity |
+| --- | --- | --- |
+| A range (`IterateExtent`) | `Dispatcher::close` of its pipeline, and the run's last epoch once every source is closed | the whole pipeline, per epoch |
+| A breaker | a push of `BreakingProducer::final_guard` (`Pushes::push_final`) | a region of its output keys |
+
+In the planned design both push a guard:
+
+- A range pushes its decided region each time it grows. A range over a static extent pushes the
+  universal guard when the run starts. A range over a live source pushes the source's yield
+  predicate (`get_yield_predicate`), the keys it has delivered for good, each time it grows.
+- A breaker pushes its final guard, as it does today, which is its decided region less what its
+  readers released.
+
+A push carries two guards: the region that changed, which a reader reads again, and the region
+decided. An operator restates each in its own keys by its own rule:
+
+| Operator | Changed region | Decided region |
+| --- | --- | --- |
+| keeps its input's keys | unchanged | unchanged |
+| widens its input's keys | the universal guard (`Landing::widened`) | the empty guard, and the universal guard once the input's decided region is universal |
+| reads several inputs (`Zip`, `Filter`, `Product`) | each input's region, as it arrives | the intersection of the inputs' decided regions |
+
+A widened change rounds up and a widened decided region rounds down: every output key of a widening
+operator depends on every input key, so none is decided until all of the input is. Each restatement
+is exact, as every guard operation must be
+([Guard operations are exact](#guard-operations-are-exact)). The dispatcher intersects the decided
+regions of inputs that come from different pipelines, since a step needs each pipeline it reads to
+cover it. An operator intersects those of inputs within one chain, as a static arm beside a live
+arm.
+
+The dispatcher keeps, per pipeline, the union of the decided regions each pipeline it reads has
+pushed. A unit of work is claimable once that union covers the region the
+work pulls, checked with `guard_minus`:
+
+| Work | Claimable today | Claimable in the planned design |
+| --- | --- | --- |
+| A whole read (`Dispatcher::read_whole`) | in the run's last epoch | once its reads' decided regions are universal |
+| A step of a store or a loop's scope that follows its reads (`Dispatcher::follow`) | once its reads have finished the epoch | once its reads are complete over the region the step pulls |
+| A held delivery (`Dispatcher::hold`) | once the live pipelines its reads wait for have closed | as a step |
+| An open row read again ([Reading rows again](#reading-rows-again)) | when a push names the row | when a pushed decided region covers the row |
+
+The four rows reduce to one rule, so `Dispatcher::hold`, `LivePipeline::waits` and the planner's
+per-pipeline record of the live pipelines a pipeline is final after (`final_after`) are removed.
+Epochs remain the batches a seal makes of live deliveries, and the unit a `main` output answers
+per (`SinkBreaker::per_epoch`).
+
+The program below shows what changes. Its store `a` reads a static list, and its loop reads a live
+source that never yields everything:
+
+```
+a: Mut(Int, Txn) := 100
+for r in [10, 20]:
+    with begin():
+        a := a - r
+last := await_final(a)
+for x in source1():
+    last := last + x
+out << last
+```
+
+Today `a` reads its input whole in the run's last epoch, which never comes, so the loop never
+steps. In the planned design the range over `[10, 20]` pushes the universal guard at the start, `a`
+steps and pushes its final guard in epoch 0, and the loop steps per delivery of `source1` from
+then on.
+
+Every breaker but the induction store states its decided region in `held`: the transaction store
+its positions through its watermark, a memo, a map aggregate and an induction drive their tiles'
+`to_guard`, and an aggregate or an extraction everything once it is final. An induction store
+states nothing until it is terminal (`BreakerState::held`), though it decides its positions one at
+a time, so a reader of one row of a store per row waits for the whole store. Its held region states
+its decided positions, and its decided rows under rows, before the design is implemented.
+
 #### Reading rows again
 
 A pipeline keeps open rows (`Dispatcher::keep_open_rows`) where its chain can answer nothing for a
