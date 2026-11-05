@@ -3356,13 +3356,14 @@ fn fun_kind_correspondence(fun_kind: &crate::ccl::ty::FunKind, acc: &Subst) -> S
 /// binders discharged to the witnesses the value carries, or a variable kind's binders, once
 /// the correspondence has renamed every spelling reaching it onto them.
 fn eliminated_acc(
+    sum: &Type,
     fun_kind: &crate::ccl::ty::FunKind,
     rest: &Subst,
     term: &Rc<crate::ccl::TypedExpr>,
 ) -> Subst {
     use crate::ccl::ty::FunKind;
     match fun_kind {
-        FunKind::Data(Some(ws)) => rest.clone().discharged_through(ws, term),
+        FunKind::Data(Some(ws)) => rest.discharged_through(ws, term, sum),
         FunKind::Var(k) => Subst::then(
             &fun_kind_correspondence(fun_kind, rest),
             &Subst::kind_elim(k, term),
@@ -3767,7 +3768,7 @@ fn compact_go_inner(
             // function binds none. The correspondence renames an arm's spelling onto this
             // kind's binders first, so the elimination then finds every occurrence.
             let (owned_acc, eliminated) = match subst_acc.top_elim() {
-                Some((term, rest)) => (eliminated_acc(fun_kind, &rest, &term), true),
+                Some((term, rest)) => (eliminated_acc(ty, fun_kind, &rest, &term), true),
                 None => (fun_kind_correspondence(fun_kind, subst_acc), false),
             };
             let subst_acc = &owned_acc;

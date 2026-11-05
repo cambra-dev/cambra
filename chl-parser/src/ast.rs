@@ -623,15 +623,18 @@ pub struct TypeDecl {
     /// V(k) <: U` (`docs/chl-spec.md`, "Declaring a nominal type"); empty without a clause.
     pub requires: Vec<Spanned<Requirement>>,
     pub body: TypeDeclBody,
+    /// The `@Builtin` decorator on the line above.
+    pub builtin: Option<Span>,
 }
 
 /// A block over a head: a nominal type's associated functions under `impl` ([`Stmt::Impl`]),
 /// or an instance of a trait under `instance` ([`Stmt::Instance`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ImplBlock {
-    /// An instance's type variables, `T` in `instance forall (T) Area(Two(T)):`; empty for a
-    /// type's own block, whose head names its parameters.
-    pub vars: Vec<Spanned<SmolStr>>,
+    /// An instance's type variables, `T` in `instance forall (T) Area(Two(T)):` and `K, V` in
+    /// `instance forall (K, V: K => Type) Iterable(FullMap(K, V))`; empty for a type's own block,
+    /// whose head names its parameters.
+    pub vars: Vec<TypeParam>,
     /// The modules an instance's trait is reached through, `shapes` in
     /// `instance shapes::Area(Circle):`; empty for a trait in scope by its name, and for a type's
     /// own block.
@@ -711,6 +714,9 @@ pub enum TypeDeclBody {
     Constructors(Vec<Constructor>),
     /// `= R`: the single-constructor form, whose one constructor is `new(R)`.
     Single(Spanned<Expr>),
+    /// No body: a `@Builtin` type, whose representation the compiler supplies
+    /// (`docs/chl-spec.md`, "9.16 The std root").
+    Builtin,
 }
 
 /// One constructor line of a [`TypeDecl`], `rect(w: Int, h: Int)`.

@@ -319,12 +319,18 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // them; a node built anywhere else would have its refinements never discharged.
             // Inference meets the node as lowering built it; the post-inference check meets
             // it after inlining has substituted the argument, which is already checked.
+            // A payload type with no refinement has none to discharge, so the compiler may
+            // build its value directly, as `set`, `map` and `groupby` build `std`'s collections.
             debug_assert!(
                 matches!(&payload.node, TypedExprNode::Var(n) if n.base() == "__ctor_arg")
-                    || matches!(&payload.node, TypedExprNode::Lit(crate::ccl::Lit::Unit)),
-                "a NominalCtor is built only as its constructor function's body or as a \
-                 nullary constructor's value; anywhere else its refinements are never \
-                 discharged, got payload {}",
+                    || matches!(&payload.node, TypedExprNode::Lit(crate::ccl::Lit::Unit))
+                    || decl.ctor(ctor).is_some_and(|c| {
+                        let declared = c.payload();
+                        crate::ccl::ccl_utils::strip_refinements(&declared) == declared
+                    }),
+                "a NominalCtor is built only as its constructor function's body, as a nullary \
+                 constructor's value, or over a payload type with no refinement; anywhere else \
+                 its refinements are never discharged, got payload {}",
                 symbolic(payload)
             );
             emit_nominal_ctor(decl, ctor, payload, ctx)?
@@ -1394,6 +1400,14 @@ pub(super) fn emit_apply<C: Typing>(
     if applied.is_ok() && matches!(function.node, TypedExprNode::TraitFn { .. }) {
         ctx.bind_instance_function_called(function.node_id())?;
     }
+    // A subscript reads its collection's structure where it stands: a checked lookup the key's
+    // value type, and a proven one the domain that is the key's proof. Where the collection's
+    // type is known, its `Entries` is that type's, which the obligation deposits only below
+    // the call's variable.
+    let applied = match applied {
+        Ok(result) => Ok(entries_known(function, &arg_ty, ctx).unwrap_or(result)),
+        applied => applied,
+    };
     // A call that fails against a generalized definition the definition alone already
     // rejects is the definition's error, reported at the definition rather than at a
     // call that only met it. Any other failure names the function a type parameter
@@ -1410,6 +1424,55 @@ pub(super) fn emit_apply<C: Typing>(
     }
 }
 
+/// The `Entries` of a known collection, where `function` is `Indexable::entries` applied to a
+/// value of type `collection`: a structural collection is its own, one of `std`'s collections
+/// has its representation, and another nominal type the `Entries` its instance states at the
+/// type's arguments. `None` while the collection's type is unknown, which the obligation the
+/// call placed waits for.
+fn entries_known<C: Typing>(function: &Expr, collection: &Type, ctx: &C) -> Option<Type> {
+    use crate::ccl::infer::solver::traits::{
+        INDEXABLE_ENTRIES, StdTrait, is_structural_collection,
+    };
+    let TypedExprNode::TraitFn {
+        trait_,
+        function: name,
+        ..
+    } = &function.node
+    else {
+        return None;
+    };
+    if !trait_.is_std(StdTrait::Indexable) || name.as_str() != INDEXABLE_ENTRIES {
+        return None;
+    }
+    // A binding's type is a variable its definition bounded, which is the collection's type
+    // where the definition stated one.
+    let resolved;
+    let collection = match collection {
+        Type::Infer(_) => {
+            resolved = crate::ccl::infer::resolve_var_type(collection).ok()?;
+            &resolved
+        }
+        _ => collection,
+    };
+    if is_structural_collection(collection) {
+        return Some(collection.clone());
+    }
+    let Type::Nominal(decl, _) = collection.peel_refinements() else {
+        return None;
+    };
+    if crate::ccl::nominal::StdCollection::of(decl).is_none() {
+        return ctx.associated_at(
+            trait_,
+            std::slice::from_ref(collection),
+            &trait_.collection_assoc(),
+        );
+    }
+    let [ctor] = decl.body().ctors.as_slice() else {
+        unreachable!("`std`'s `{}` has one constructor", decl.name)
+    };
+    collection.peel_refinements().nominal_payload(&ctor.name)
+}
+
 /// Check the key against the collection domain's base and return the supplied value type.
 /// Presence is not a typing obligation here: reads check it at runtime, and writes can add keys.
 /// See `src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]`".
@@ -1424,7 +1487,16 @@ fn keyed_access_value<C: Typing>(
     // them. Keep the collection's base as the upper bound; only presence is checked later.
     // A range's base is `UInt`: `0..𝑛` states which keys are present, and a key outside it is
     // a lookup that answers `none`.
-    let base = match keys.peel_refinements() {
+    // A collection of `std` is keyed by its type argument, a variable until the value its
+    // annotation or initializer states reaches it, which it has where the collection is read.
+    let resolved = match keys {
+        Type::Infer(_) => crate::ccl::infer::resolve_var_type(keys)
+            .ok()
+            .filter(|t| !matches!(t, Type::Infer(_)))
+            .unwrap_or_else(|| keys.clone()),
+        _ => keys.clone(),
+    };
+    let base = match resolved.peel_refinements() {
         Type::UIntRange(_) => &Type::Base(BaseType::UInt),
         base => base,
     };
@@ -1574,6 +1646,25 @@ fn not_a_keyed_access(collection: &Type, what: &str) -> InferError {
 /// See `src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]`".
 fn keyed_access_types(collection: &Type) -> Option<(Type, Option<Name>, Type)> {
     let collection = collection.peel_refinements();
+    // One of `std`'s collections is written at its representation, as a subscript reads it
+    // through `Indexable::entries`.
+    if let Type::Nominal(decl, args) = collection
+        && let Some(std_collection) = crate::ccl::nominal::StdCollection::of(decl)
+    {
+        // A `FullMap`'s value at a key is its family at that key: the family's body, under its
+        // own binder. Read through the representation `(k: K) |=> V(k)`, it is the application
+        // `V(k)`, a variable minted before `k` was bound, which a discharge of `k` passes over.
+        if std_collection == crate::ccl::nominal::StdCollection::FullMap
+            && let [keys, Type::Family { binders, body }] = args.as_slice()
+            && let [(binder, _)] = binders.as_slice()
+        {
+            return Some((keys.clone(), binder.clone(), (**body).clone()));
+        }
+        let [ctor] = decl.body().ctors.as_slice() else {
+            unreachable!("`std`'s `{}` has one constructor", std_collection.name())
+        };
+        return keyed_access_types(&collection.nominal_payload(&ctor.name)?);
+    }
     let viewed = match collection.sum() {
         Some([witness, ..]) => {
             let crate::ccl::ty::TypeKind::SubtypesOf(key) = witness.type_kind() else {
@@ -2943,10 +3034,11 @@ fn feed_places(defer: &Name, body: &Expr) -> Vec<NodeId> {
             {
                 places.push(e.node_id())
             }
-            // A loop reads its source through `Iterable::elements`, which feeds nothing.
+            // A loop reads its source through `Iterable::elements`, and a subscript its
+            // collection through `Indexable::entries`, neither of which feeds anything.
             TypedExprNode::Apply { argument, function }
                 if !matches!(function.node, TypedExprNode::Builtin(_))
-                    && !is_iterable_elements(function)
+                    && !reads_a_collection(function)
                     && crate::ccl::ccl_utils::is_free(defer, argument) =>
             {
                 places.push(e.node_id())
@@ -2960,11 +3052,13 @@ fn feed_places(defer: &Name, body: &Expr) -> Vec<NodeId> {
     places
 }
 
-/// Whether `function` is `Iterable::elements`, the call a loop reads its source through.
-fn is_iterable_elements(function: &Expr) -> bool {
-    use crate::ccl::infer::solver::traits::{ITERABLE_ELEMENTS, StdTrait};
+/// Whether `function` is `Iterable::elements`, the call a loop reads its source through, or
+/// `Indexable::entries`, the call a subscript reads its collection through.
+fn reads_a_collection(function: &Expr) -> bool {
+    use crate::ccl::infer::solver::traits::{INDEXABLE_ENTRIES, ITERABLE_ELEMENTS, StdTrait};
     matches!(&function.node, TypedExprNode::TraitFn { trait_, function, .. }
-        if trait_.is_std(StdTrait::Iterable) && function.as_str() == ITERABLE_ELEMENTS)
+        if (trait_.is_std(StdTrait::Iterable) && function.as_str() == ITERABLE_ELEMENTS)
+            || (trait_.is_std(StdTrait::Indexable) && function.as_str() == INDEXABLE_ENTRIES))
 }
 
 /// Emit/check a `letrec` group (design doc `src/ccl/design/mutability.md`,

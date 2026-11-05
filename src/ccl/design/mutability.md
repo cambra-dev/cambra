@@ -453,14 +453,12 @@ Typing:
 
 #### A mutable collection's key set varies with the position
 
-`Mut(𝐶, 𝑆)` for a `Map` denotes `𝑆 ⇒ Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉`, the sum sitting in the
-codomain. A value of a sum is a domain paired with a map over it, so the history yields a
-different pair at each position and the key set varies with the position. This is the
-quantifier order `∀s. ∃𝐷`, and it admits exactly the histories a mutable variable has.
+A `Mut(Map(𝐾, 𝑉), 𝑆)` history yields a nominal map at each position of `𝑆`. Each map holds
+a sum `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇ 𝑉` in its private constructor, so each position can have
+its own key domain. The quantifier order is `∀s. ∃𝐷`.
 
-Every contribution injects by kind containment: the seed names one key domain, each write
-names another, and both are members of `SubtypesOf(𝐾)`. So the single value type on `Mut` needs no
-per-position reconciliation — nothing has to relate a write's domain to the seed's.
+The seed and each write supply a nominal map. Each representation has its own domain below
+`𝐾`. A keyed write updates the representation and rebuilds the map at the same nominal type.
 
 **The type does not name the domain at a position, and cannot be made to.** A sum is what a
 collection type says when it forgets its domain — the same job `List(𝑇)` does for a length —
@@ -962,6 +960,8 @@ that holds of every value the variable takes (`joined_ty`), which the write set 
 
 A tap carries a feed's value at the feed's row, the type inference records on the `Feed`
 ([A contribution crosses the binders after its target](type-inference.md#a-contribution-crosses-the-binders-after-its-target)).
+An existential row is introduced with `box`, retaining the value's projected keys inside the
+introduction, including where such a row is a component of a product.
 The row reads the loops around the feed and no read of a mutable variable, so it states the value
 without the snapshot the writer reads it through. A type reading the snapshot would read `__prev`,
 the write set the history holds before the position, once the decision is read at a position: the

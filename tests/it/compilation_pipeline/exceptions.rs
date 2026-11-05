@@ -264,7 +264,7 @@ fn straight_line(#[case] code: &str, #[case] expected: Value) {
 #[case::over_a_map_by_key(indoc! {"
     m = map([3 -> 30, 1 -> 10, 2 -> 20])
     r = try:
-            for v in m:
+            for _ -> v in m:
                 if v > 15:
                     raise v
             0
@@ -272,20 +272,20 @@ fn straight_line(#[case] code: &str, #[case] expected: Value) {
             e
     r
 "}, 20)]
-#[case::over_a_retained_boxed_map(indoc! {"
-    items = box(map([3 -> 30, 1 -> 10, 2 -> 20]))
+#[case::over_a_retained_map(indoc! {"
+    items = map([3 -> 30, 1 -> 10, 2 -> 20])
     r = try:
-            for v in items:
+            for _ -> v in items:
                 raise v
             0
         except Int as e:
             e
-    r + sum(items)
+    r + sum([v for _ -> v in items])
 "}, 70)]
-#[case::feeding_from_a_boxed_map(indoc! {"
+#[case::feeding_from_a_map(indoc! {"
     o: Feed(_)
     r = try:
-            for v in box(map([3 -> 30, 1 -> 10, 2 -> 20])):
+            for _ -> v in map([3 -> 30, 1 -> 10, 2 -> 20]):
                 o << v
                 if v == 20:
                     raise v
@@ -294,13 +294,13 @@ fn straight_line(#[case] code: &str, #[case] expected: Value) {
             e
     sum(o) * 10 + r
 "}, 320)]
-#[case::raising_source_with_boxed_map(indoc! {"
+#[case::raising_source_with_map(indoc! {"
     def src(n: Int):
         if n < 0:
             raise n
-        box(map([2 -> 20, 1 -> 10]))
+        map([2 -> 20, 1 -> 10])
     r = try:
-            for v in src(0):
+            for _ -> v in src(0):
                 raise v
             0
         except Int as e:
@@ -560,7 +560,7 @@ fn raise_clauses(#[case] code: &str, #[case] expected: i64) {
     indoc! {"
         m = map([(a=1) -> 10, (a=2) -> 20])
         r = try:
-                for v in m:
+                for _ -> v in m:
                     if v > 15:
                         raise v
                 0
@@ -569,7 +569,7 @@ fn raise_clauses(#[case] code: &str, #[case] expected: i64) {
         r
     "},
     "this loop runs in its source's position order, since an exception of type `Int` may escape \
-     its body, but this source has positions of type `{a: Int}`, which have no order"
+     its body, but this source has keys of type `{a: Int}`, which have no order"
 )]
 #[case::a_raise_beyond_an_only_clause(
     indoc! {"

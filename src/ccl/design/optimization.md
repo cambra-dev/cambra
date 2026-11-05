@@ -102,6 +102,23 @@ clone copies its definition's binders, so the body may bind the name the argumen
 Finally, the pass revisits the reduced result, so newly exposed `Let` bindings can undergo the same
 inlining checks.
 
+### A value taken out of its constructor
+
+After inlining a node's children, the pass rewrites `match 𝐶(𝑥) { 𝐶(𝑤) → body }`, a value taken
+back out of the constructor that built it, to `body` with `𝑤` bound to `𝑥`, by the rule a call binds
+its argument by ([Substitution and beta-reduction](#substitution-and-beta-reduction))
+(`known_constructor`).
+
+Iterating a `std` collection takes its representation out of the constructor and iterates its
+`entries` ([collections.md](collections.md#keys-and-entries)). Where the constructor builds the
+collection in place, as `groupby` builds a `FullMap`, the rewrite leaves the loop iterating the
+representation's `entries`. After elimination, `simplify` reads an entry at a key as the key beside
+the value there, `⟨𝑥, 𝐹 ≫ entries⟩ ≫ apply ⟹ ⟨𝑥, ⟨𝑥, 𝐹⟩ ≫ apply⟩`, and the values of the entries as
+the collection, `(𝑐 ▷ entries) ≫ .1 ⟹ 𝑐`. Its other β-laws then reduce the read of `𝐹` where `𝐹` is
+a known function. A loop whose collection reads an enclosing binder thereby reads the
+representation's own computation per row, where the read would otherwise rebuild the collection
+for each row and `Lookup` the row's entry in it.
+
 ### Moving a binding into a list element
 
 `inline_list_element_reads` replaces each read of a `Let` binder inside a list element with
@@ -329,10 +346,19 @@ pairs each input with each value of its own collection under that value's key, s
 once, by the outer sum, and no dependent pair is needed. An `𝑆` whose keys are a projection through
 its input, `(𝑥 : 𝐴) ⇒ (σ(𝑥 ▷ 𝑝) ⤇ 𝑉)`, keeps its binder, and `map(𝑔)` reads the projection by it.
 Operator conversion compiles `strength_over` to `Product::per_row_values_at`, which pairs each row
-with the values of its own collection. Both rules are scoped to a generator's source, a morphism to a sum or
-one ending in `unbox` (`over_a_witness`), followed by any `map`s a filter on the generator leaves,
-because planning's recurrence recognition reads a history through the unrewritten form. A history over a projected domain has the type an unboxed source has,
-so the source is recognized by its last morphism.
+with the values of its own collection. Both rules are scoped to a generator's source, a morphism to a
+sum or one ending in `unbox`, or either collection held constant, `𝑡 ▷ const`, where the source reads
+nothing of the enclosing value (`over_a_witness`). Any `map`s a filter on the generator leaves may
+follow. The scope exists because planning's recurrence recognition reads a history through the
+unrewritten form. A history over a projected domain has the type an unboxed source has, so the source
+is recognized by its last morphism. A constant holding an `iterate` marker is an iteration source,
+which the rules leave in place.
+
+Two other laws read the forms the strength rewrite produces, so the rule set reaches one normal
+form whichever fires first. Reading the strengthened collection at a key is a β-law,
+`⟨𝑘, 𝑒 ≫ (𝐹 ▷ strength_over) ≫ map(𝑔)⟩ ≫ apply ⟹ ⟨𝑒, ⟨𝑘, 𝑒 ≫ 𝐹⟩ ≫ apply⟩ ≫ 𝑔`
+(`try_apply_strengthened`), beside the laws for `compose` and `zip`. An inner level of a nest takes
+either form under `uncurry` ([`uncurry` of an eliminated nest](#uncurry-of-an-eliminated-nest)).
 
 A correlated inner comprehension over a collection every row reads is the same shape with that
 collection constant: planning rewrites its `curry(𝑔)` to `const(𝐾) ▷ strength_over ≫ map(𝑔)`, where
@@ -355,7 +381,8 @@ rewrites `uncurry` of the result into a morphism of the pair `(𝑎, 𝑏)` (`tr
 - `curry(𝑔) ▷ uncurry ⟹ 𝑔`;
 - `(𝑠 ≫ curry(𝑔)) ▷ uncurry ⟹ ⟨.0 ≫ 𝑠, .1⟩ ≫ 𝑔`;
 - `(𝑠 ≫ ⟨𝑡 ▷ const, curry(𝑔)⟩ ≫ compose) ▷ uncurry ⟹ ⟨.0 ≫ 𝑠, .1 ≫ 𝑡⟩ ≫ 𝑔`, an inner level
-  over a sum composed with its source;
+  over a sum composed with its source, and the same of its strengthened form
+  `(𝑠 ≫ (𝑡 ▷ const) ▷ strength_over ≫ map(𝑔)) ▷ uncurry`;
 - `(𝑠 ≫ 𝑐 ▷ const) ▷ uncurry ⟹ .1 ≫ 𝑐`, an inner collection that reads nothing of the outer
   element.
 
@@ -465,7 +492,7 @@ as the loop it replaces.
 ### Keyed Aggregates
 
 `recognize_groupby_sites` matches the dependent-refinement source produced for a keyed
-aggregate such as `sum(x) for x in groupby(xs, key_fn)`. The source describes a group
+aggregate such as `sum(x) for _ -> x in groupby(xs, key_fn)`. The source describes a group
 through a key equality on its element domain. The rewrite computes keys over the source,
 groups them with `converse`, and maps the value function over each group. The group keeps
 the key-dependent refined domain, so a later aggregate sees only its members. If the

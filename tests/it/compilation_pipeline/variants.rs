@@ -2092,11 +2092,57 @@ fn test_the_spec_match_in_a_loop_example(#[case] code: &str, #[case] expected: V
     x = `some(m)
     match x:
         case `some(v):
-            sum(v)
+            sum([n for _ -> n in v])
         case `none:
             0"#})]
 fn a_collection_payload_is_one_variant_value(#[case] code: &str) {
     check_scalar(code, Value::Int(3));
+}
+
+#[test]
+fn a_collection_payload_match_in_a_loop() {
+    check_scalar(
+        indoc! {r"
+            total := 0
+            for _ -> g in groupby([1, 2, 3, 4], \x -> x // 2):
+                v = `some(g) if sum(g) > 2 else `none
+                match v:
+                    case `some(xs):
+                        total := total + sum(xs)
+                    case `none:
+                        pass
+            total
+        "},
+        Value::Int(9),
+    );
+}
+
+#[rstest]
+#[case::mixed("[1, 2]", "`some(g) if sum(g) > 2 else `none", 18)]
+#[case::every_group("[1, 2]", "`some(g)", 20)]
+#[case::no_groups("[1, 2]", "`some(g) if sum(g) > 10 else `none", 0)]
+#[case::three_outer_rows("[1, 2, 3]", "`some(g) if sum(g) > 2 else `none", 27)]
+#[timeout(Duration::from_secs(10))]
+fn a_collection_payload_match_under_two_feed_loops(
+    #[case] outer: &str,
+    #[case] choice: &str,
+    #[case] expected: i64,
+) {
+    check_scalar(
+        &formatdoc! {r"
+            out: Feed(_)
+            for i in {outer}:
+                for _ -> g in groupby([1, 2, 3, 4], \x -> x // 2):
+                    v = {choice}
+                    match v:
+                        case `some(xs):
+                            out << sum(xs)
+                        case `none:
+                            pass
+            sum(out)
+        "},
+        Value::Int(expected),
+    );
 }
 
 /// One variant per row when each row's payload is a collection: the groups `[1]`, `[2, 3]`
@@ -2108,7 +2154,7 @@ fn a_collection_payload_is_one_variant_value(#[case] code: &str) {
 fn a_collection_payload_per_row_is_one_variant_per_row() {
     let tile = run_pipeline(indoc! {r"
         g = groupby([1, 2, 3, 4], \v -> v // 2)
-        [`some(xs) for xs in g]
+        [`some(xs) for _ -> xs in g]
     "});
     let cambra::interpreter::Tile::DataFunction {
         domain, codomain, ..
@@ -2283,7 +2329,7 @@ fn a_collection_payload_match_under_two_loops(
         &formatdoc! {r"
             total := 0
             for i in {outer}:
-                for g in groupby([1, 2, 3, 4], \x -> x // 2):
+                for _ -> g in groupby([1, 2, 3, 4], \x -> x // 2):
                     v = {choice}
                     match v:
                         case `some(xs):

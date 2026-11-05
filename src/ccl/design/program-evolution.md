@@ -887,11 +887,13 @@ first pull.
   a store nothing reads is never driven, so it declares its variables and hands on nothing. The two
   are reported separately, because in the second case the source is right about where the value goes
   and only the value is missing.
-- **A variable held, declared or loaded at a type that mentions a nominal type.** An extent leaves
-  out the type's name and its declaration's refinements, so the second refusal would let through a
-  value the spec refuses, per [A nominal type is compared by
+- **A variable held, declared or loaded at a type that mentions a nominal type the program
+  declares.** An extent leaves out the type's name and its declaration's refinements, so the second
+  refusal would let through a value the spec refuses, per [A nominal type is compared by
   declaration](#a-nominal-type-is-compared-by-declaration). Until that comparison exists, every
-  such variable is refused (`StateConflict::NominalState`), an unchanged declaration included.
+  such variable is refused (`StateConflict::NominalState`), an unchanged declaration included. A
+  type `std` declares (`Option`, `Map`) is not refused: the compiler supplies `std`, so both versions
+  read one declaration.
 
 Nothing else is refused. A lost value is refused because the program carries on answering afterwards
 with only the accumulated history gone, so the author has nothing to notice. One other outcome is

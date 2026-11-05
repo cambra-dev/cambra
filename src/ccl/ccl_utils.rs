@@ -599,7 +599,8 @@ pub(crate) fn predicate_term(term: &Expr) -> Expr {
 /// - a projection out of a tuple or record former reads the component;
 /// - a `match` over a constructor's value reads the arm it selects ([`known_constructor`]); a
 ///   variant projection reads as the one-arm `match` it compiles ([`projection_as_match`]), and
-///   `𝑥 ▷ variant_wrap(𝑡)` as the constructor `` `𝑡(𝑥) ``.
+///   `𝑥 ▷ variant_wrap(𝑡)` as the constructor `` `𝑡(𝑥) ``;
+/// - a key read of `𝑚 ▷ map_domain` is the key, and of `𝑚 ▷ entries` the key beside `𝑚` at it.
 ///
 /// Type-blind, as predicate equality is: type slots ride along, and the nodes the rewrite
 /// builds carry none it needs. It mints no node identity, so an equality can run it.
@@ -762,6 +763,11 @@ fn reduce_application(
             function: combinator,
         } => match &combinator.node {
             TypedExprNode::Builtin(Builtin::Const) => Some(inner.clone_preserving_ids()),
+            // A collection's entries hold each key beside its value.
+            TypedExprNode::Builtin(Builtin::Entries) => {
+                let value = applied(a(), inner.clone_preserving_ids(), Type::Hole, fuel);
+                Some(Expr::throwaway(TypedExprNode::Tuple(vec![a(), value])).with_ty(ty.clone()))
+            }
             // `zip` fans its input out to each component, of a tuple or of a record.
             TypedExprNode::Builtin(Builtin::Zip) => {
                 let mut at = |f: &Expr| applied(a(), f.clone_preserving_ids(), codomain(f), fuel);

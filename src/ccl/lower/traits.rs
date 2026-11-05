@@ -22,9 +22,9 @@ use smol_str::SmolStr;
 
 use super::*;
 use crate::ccl::infer::solver::traits::{
-    Assoc, DeclaredAt, Implementation, InstanceHead, InstanceTable, ProductReading, Signature,
-    StdTrait, Supplier, Trait, TraitDecl, TraitFunction, TraitInstance, compares_by_value,
-    entailed, replace_params, unify_all,
+    Assoc, DeclaredAt, INDEXABLE_ENTRIES, ITERABLE_ELEMENTS, Implementation, InstanceBody,
+    InstanceHead, InstanceTable, ProductReading, Signature, StdTrait, Supplier, Trait, TraitDecl,
+    TraitFunction, TraitInstance, compares_by_value, entailed, replace_params, unify_all,
 };
 use crate::ccl::nominal::WrittenOrder;
 use crate::ccl::ty::{FieldKey, PolyParam, TraitRequirement, TypeKind, TypeParam, TypeParamId};
@@ -216,12 +216,54 @@ pub(crate) struct InstanceBlock {
     pub trait_: Trait,
     pub instance: Rc<TraitInstance>,
     /// The head's type variables by the names the head writes them with.
-    pub variables: Vec<(SmolStr, Rc<TypeParam>)>,
+    pub variables: Vec<InstanceVariable>,
     /// The requirements the block's `requires` clause names.
     pub named: Vec<NamedRequirement>,
     /// The associated types of those requirements, each a type parameter of every function
     /// in the block, bounded as the clause bounds it.
     pub members: Vec<PolyParam>,
+}
+
+/// A type variable an instance's `forall` declares: one that takes a type, `T`, or a family over
+/// values, `V: K => Type`, with its index types over the others (`docs/chl-spec.md`, "Declaring an
+/// instance").
+#[derive(Clone)]
+pub(crate) struct InstanceVariable {
+    pub name: SmolStr,
+    pub param: Rc<TypeParam>,
+    /// The family's index types; empty for a variable that takes a type.
+    pub domains: Vec<Type>,
+}
+
+impl InstanceVariable {
+    /// Put the variable in scope for the types written after it: a type by its name, a family as
+    /// a family parameter, which is written applied or passed on.
+    fn scope(&self, ctx: &mut LoweringContext) {
+        if self.param.arity == 0 {
+            ctx.declare_type_throughout(
+                self.name.as_str(),
+                None,
+                AliasType::Type(Type::Param(Rc::clone(&self.param))),
+            );
+        } else {
+            ctx.family_params.push((
+                self.name.clone(),
+                Rc::clone(&self.param),
+                self.domains.clone(),
+            ));
+        }
+        ctx.type_params_in_scope.push(self.name.to_string());
+    }
+
+    /// Each family among `variables` with its index types, as [`TraitInstance::families`] keeps
+    /// them.
+    fn families(variables: &[InstanceVariable]) -> Vec<(Rc<TypeParam>, Vec<Type>)> {
+        variables
+            .iter()
+            .filter(|w| w.param.arity > 0)
+            .map(|w| (Rc::clone(&w.param), w.domains.clone()))
+            .collect()
+    }
 }
 
 fn trait_decls(stmts: &[Spanned<ChlStmt>]) -> impl Iterator<Item = &ChlTraitDecl> {
@@ -590,7 +632,7 @@ fn clause_bound(bound: &Option<Spanned<ChlExpr>>) -> Option<bool> {
 
 /// Whether the module being lowered is `std`, the one module that declares `@Builtin` members
 /// (`docs/chl-spec.md`, "9.16 The std root").
-fn lowering_std(ctx: &LoweringContext) -> bool {
+pub(super) fn lowering_std(ctx: &LoweringContext) -> bool {
     ctx.module
         .labels
         .as_ref()
@@ -598,7 +640,7 @@ fn lowering_std(ctx: &LoweringContext) -> bool {
 }
 
 /// The refusal of `@Builtin` at `at` outside `std`.
-fn builtin_outside_std(at: Span) -> LoweringError {
+pub(super) fn builtin_outside_std(at: Span) -> LoweringError {
     LoweringError::unsupported(
         at,
         "`@Builtin` marks a declaration whose behaviour the compiler supplies, and only `std` \
@@ -1037,19 +1079,59 @@ fn declare_instance(
             ),
         ));
     }
-    // The head's type variables, which `forall` declares.
-    let mut variables: Vec<(SmolStr, Rc<TypeParam>)> = Vec::new();
+    // The head's type variables, which `forall` declares, each a type or a family over values.
+    let mut variables: Vec<InstanceVariable> = Vec::new();
     for v in &block.vars {
-        if let Some(why) = taken_type_name(&v.node, ctx) {
-            return Err(LoweringError::unsupported(v.span, why));
+        if let Some(why) = taken_type_name(&v.name, ctx) {
+            return Err(LoweringError::unsupported(v.name_span, why));
         }
-        if variables.iter().any(|(n, _)| *n == v.node) {
+        if variables.iter().any(|w| w.name == v.name) {
             return Err(LoweringError::unsupported(
-                v.span,
-                format!("`{}` is declared twice in `instance forall (…)`", v.node),
+                v.name_span,
+                format!("`{}` is declared twice in `instance forall (…)`", v.name),
             ));
         }
-        variables.push((v.node.clone(), TypeParam::declared(v.node.clone())));
+        // A family parameter's kind states its index types. No other kind or bound is
+        // written, since a call's types determine each type variable of an instance.
+        let family = nominal::family_kind(v)?;
+        if family.is_none()
+            && let Some(
+                chl_parser::ast::KindAnnotation::Kind(k)
+                | chl_parser::ast::KindAnnotation::Bound(k),
+            ) = &v.annotation
+        {
+            return Err(LoweringError::unsupported(
+                k.span,
+                format!(
+                    "`instance forall ({})` states no kind or bound but a family's, `{0}: K => \
+                     Type`: a call's types determine each type variable of an instance",
+                    v.name
+                ),
+            ));
+        }
+        let arity = family.map_or(0, |indices| indices.len());
+        variables.push(InstanceVariable {
+            name: v.name.clone(),
+            param: if arity == 0 {
+                TypeParam::declared(v.name.clone())
+            } else {
+                TypeParam::declared_family(v.name.clone(), arity)
+            },
+            domains: Vec::new(),
+        });
+    }
+    // A family's index types read the variables that take a type, so those are in scope first.
+    for w in variables.iter().filter(|w| w.param.arity == 0) {
+        w.scope(ctx);
+    }
+    for (v, w) in block.vars.iter().zip(&mut variables) {
+        if let Some(family) = nominal::family_kind(v)? {
+            w.domains = family
+                .into_iter()
+                .map(|d| lower_type_expr(d, ctx))
+                .collect::<Result<Vec<_>, _>>()?;
+            w.scope(ctx);
+        }
     }
     // The head's operands: each a base type, a nominal type applied to patterns, or a
     // type variable.
@@ -1113,32 +1195,25 @@ fn declare_instance(
         ));
     }
     // Each variable stands for a type a call's operands determine.
-    for (v, (_, param)) in block.vars.iter().zip(&variables) {
+    for (v, w) in block.vars.iter().zip(&variables) {
         let mut named = HashSet::new();
         for o in &operands {
             collect_params(o, &mut named);
         }
-        let named = named.contains(&param.id);
+        let named = named.contains(&w.param.id);
         if !named {
             return Err(LoweringError::unsupported(
-                v.span,
+                v.name_span,
                 format!(
                     "type variable `{}` appears in no operand of `instance {}`, so no call's types \
                      determine it",
-                    v.node,
+                    v.name,
                     head_spelling(&trait_, &operands)
                 ),
             ));
         }
     }
-    for (name, param) in &variables {
-        ctx.declare_type_throughout(
-            name.as_str(),
-            None,
-            AliasType::Type(Type::Param(Rc::clone(param))),
-        );
-        ctx.type_params_in_scope.push(name.to_string());
-    }
+
     // The block defines each associated type the trait declares, once.
     let mut assoc: Vec<(Assoc, Type)> = Vec::new();
     for a in &block.assoc {
@@ -1169,20 +1244,81 @@ fn declare_instance(
                 ),
             ));
         }
-        // A loop walks its source through one `elements` call to a structural collection,
-        // so a nominal `Elements` would need a second instance's `elements` after it
-        // (`docs/chl-spec.md`, "Trait requirements").
-        if trait_.is_std(StdTrait::Iterable) && matches!(ty, Type::Nominal(..)) {
+        // A loop walks its source through one `elements` call to a structural collection, and a
+        // subscript reads one through one `entries` call, so a nominal `Elements` or `Entries`
+        // would need a second instance's function after it (`docs/chl-spec.md`, "Trait
+        // requirements").
+        if trait_.reads_collections() && matches!(ty, Type::Nominal(..)) {
             return Err(LoweringError::unsupported(
                 a.value.span,
                 format!(
-                    "`Elements = {ty}` in `instance {}` is a nominal type, and an `Elements` that \
+                    "`{name} = {ty}` in `instance {}` is a nominal type, and an `{name}` that \
                      is not a structural collection is not supported yet",
                     head_spelling(&trait_, &operands)
                 ),
             ));
         }
         assoc.push((name, ty));
+    }
+    // `Iterable`'s and `Indexable`'s `@Builtin` instances of one of `std`'s collections read its
+    // representation, whose type no CHL spells, so the compiler supplies its `Elements` or
+    // `Entries`. The instance is over the collection's own parameters, at which its declaration
+    // states the representation, so the head writes the collection over its variables in order.
+    if block.builtin.is_some()
+        && let Some((collection, decl)) = builtin_collection_head(&trait_, &operands)
+    {
+        let in_order = match &operands[..] {
+            [Type::Nominal(_, args)] => {
+                args.len() == variables.len()
+                    && args.iter().zip(&variables).all(|(a, w)| match a {
+                        Type::Param(p) => p.id == w.param.id,
+                        family => crate::ccl::infer::solver::traits::family_variable(family)
+                            .is_some_and(|p| p.id == w.param.id),
+                    })
+            }
+            _ => false,
+        };
+        if !in_order {
+            return Err(LoweringError::internal(
+                block.ty.span,
+                format!(
+                    "`@Builtin instance {}` writes `{}` over its type variables in the order \
+                     `forall` declares them",
+                    head_spelling(&trait_, &operands),
+                    collection.name()
+                ),
+            ));
+        }
+        variables = decl
+            .params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| InstanceVariable {
+                name: p.spelling.clone(),
+                param: Rc::clone(p),
+                domains: decl.family_domains(i).to_vec(),
+            })
+            .collect();
+        operands = vec![decl.applied_to_params(&mut |n, ty| {
+            ctx.tag_machinery(
+                Expr::var(n).with_ty(ty),
+                block.ty.span,
+                "lower.builtin_instance",
+            )
+        })];
+        heads = operands.iter().map(InstanceHead::of_pattern).collect();
+        let [ctor] = decl.body().ctors.as_slice() else {
+            unreachable!("`std`'s `{}` has one constructor", collection.name())
+        };
+        // A loop walks the representation's keys or entries, and a subscript reads the
+        // representation itself.
+        let read = if trait_.is_std(StdTrait::Iterable) {
+            crate::ccl::infer::solver::traits::std_collection_elements(collection, &ctor.payload())
+                .expect("a collection's representation is a collection")
+        } else {
+            ctor.payload()
+        };
+        assoc.push((trait_.collection_assoc(), read));
     }
     // An instance's choice is below the associated type's bound, at the instance's operands
     // and its other choices, which the bound may name. A type variable of the instance is
@@ -1308,12 +1444,20 @@ fn declare_instance(
         ctx.instances.add(
             trait_,
             Rc::new(TraitInstance {
-                params: Vec::new(),
+                params: variables
+                    .iter()
+                    .map(|w| Rc::clone(&w.param))
+                    .chain(members.iter().map(|m| Rc::clone(&m.param)))
+                    .collect(),
+                families: InstanceVariable::families(&variables),
                 heads,
                 operands,
                 assoc,
                 requires,
-                bounds: Vec::new(),
+                bounds: members
+                    .iter()
+                    .filter_map(|m| m.bound().map(|b| (Rc::clone(&m.param), b.clone())))
+                    .collect(),
                 functions,
                 effect_assocs: Vec::new(),
                 declared: Some(declared),
@@ -1381,9 +1525,10 @@ fn declare_instance(
     let instance = Rc::new(TraitInstance {
         params: variables
             .iter()
-            .map(|(_, p)| Rc::clone(p))
+            .map(|w| Rc::clone(&w.param))
             .chain(members.iter().map(|m| Rc::clone(&m.param)))
             .collect(),
+        families: InstanceVariable::families(&variables),
         operands,
         heads,
         assoc,
@@ -1424,6 +1569,24 @@ fn declare_instance(
     Ok(())
 }
 
+/// The collection of `std` an instance of `Iterable` or `Indexable` is for, if the instance is
+/// one: `Iterable(Set(K))`, `Indexable(Map(K, V))`, `Iterable(FullMap(K, V))` and the like.
+fn builtin_collection_head(
+    trait_: &Trait,
+    operands: &[Type],
+) -> Option<(crate::ccl::nominal::StdCollection, Rc<NominalDecl>)> {
+    if !trait_.is_std(StdTrait::Iterable) && !trait_.is_std(StdTrait::Indexable) {
+        return None;
+    }
+    let [Type::Nominal(decl, _)] = operands else {
+        return None;
+    };
+    Some((
+        crate::ccl::nominal::StdCollection::of(decl)?,
+        Rc::clone(decl),
+    ))
+}
+
 /// The functions of `@Builtin instance head`, the block `block` marked at `at`: the primitive
 /// the compiler runs for each function the trait declares, at the instance's base types
 /// ([`StdTrait::primitive`]). The block defines none of them.
@@ -1439,6 +1602,19 @@ fn builtin_instance_functions(
         return Err(builtin_outside_std(at));
     }
     let internal = |why: String| LoweringError::internal(block.ty.span, why);
+    if let Some((collection, _)) = builtin_collection_head(trait_, operands) {
+        return Ok(vec![if trait_.is_std(StdTrait::Iterable) {
+            (
+                SmolStr::new_static(ITERABLE_ELEMENTS),
+                Implementation::Primitive(InstanceBody::Elements(collection)),
+            )
+        } else {
+            (
+                SmolStr::new_static(INDEXABLE_ENTRIES),
+                Implementation::Primitive(InstanceBody::Representation(collection)),
+            )
+        }]);
+    }
     let Some(named) = StdTrait::named(trait_.name()).filter(|t| trait_.is_std(*t)) else {
         return Err(internal(format!(
             "`@Builtin instance {head}` is an instance of `{trait_}`, which the compiler does not \
@@ -1701,7 +1877,7 @@ fn compares_as_written(
 fn instance_pattern(
     arg: &Spanned<ChlExpr>,
     head: &str,
-    variables: &[(SmolStr, Rc<TypeParam>)],
+    variables: &[InstanceVariable],
     ctx: &mut LoweringContext,
 ) -> Result<Type, LoweringError> {
     let refuse = || {
@@ -1743,9 +1919,11 @@ fn instance_pattern(
         _ => return Err(refuse()),
     };
     if args.is_empty()
-        && let Some((_, param)) = variables.iter().find(|(n, _)| n == name)
+        && let Some(w) = variables
+            .iter()
+            .find(|w| w.name == *name && w.param.arity == 0)
     {
-        return Ok(Type::Param(Rc::clone(param)));
+        return Ok(Type::Param(Rc::clone(&w.param)));
     }
     if args.is_empty()
         && let Some(base) = crate::ccl::BaseType::from_keyword(name)
@@ -1777,7 +1955,7 @@ fn applied_pattern(
     decl: Rc<NominalDecl>,
     args: &[Spanned<ChlExpr>],
     head: &str,
-    variables: &[(SmolStr, Rc<TypeParam>)],
+    variables: &[InstanceVariable],
     ctx: &mut LoweringContext,
 ) -> Result<Type, LoweringError> {
     if args.len() != decl.params.len() {
@@ -1792,10 +1970,33 @@ fn applied_pattern(
             ),
         ));
     }
-    let applied = args
-        .iter()
-        .map(|a| instance_pattern(a, head, variables, ctx))
-        .collect::<Result<Vec<_>, _>>()?;
+    // A family parameter's pattern is a family variable passed on, `V` for `V: K => Type`, at the
+    // index types the other patterns give it.
+    let mut applied: Vec<Type> = Vec::with_capacity(args.len());
+    for (a, p) in args.iter().zip(&decl.params) {
+        applied.push(if p.arity == 0 {
+            instance_pattern(a, head, variables, ctx)?
+        } else {
+            Type::Hole
+        });
+    }
+    for (i, (a, p)) in args.iter().zip(&decl.params).enumerate() {
+        if p.arity == 0 {
+            continue;
+        }
+        let domains = decl.family_domains_at(i, &applied);
+        let of = format!("`{}`'s family `{}`", decl.name, p.spelling);
+        let Some(family) = passed_on_family(a, &domains, &of, ctx)? else {
+            return Err(LoweringError::unsupported(
+                a.span,
+                format!(
+                    "`instance {head}` names {of} by a family variable, `instance forall (…, \
+                     V: K => Type) {head}`"
+                ),
+            ));
+        };
+        applied[i] = family;
+    }
     Ok(Type::Nominal(decl, applied))
 }
 
@@ -1883,7 +2084,7 @@ pub(super) fn lower_instance(
 fn lower_instance_def(
     trait_: &Trait,
     instance: &TraitInstance,
-    variables: &[(SmolStr, Rc<TypeParam>)],
+    variables: &[InstanceVariable],
     named: &[NamedRequirement],
     members: &[PolyParam],
     def: &Spanned<ChlStmt>,
@@ -1934,12 +2135,15 @@ fn lower_instance_def(
     // A call determines the head's variables through the trait's operands, so only the
     // function's own type parameters have to be determined by its arguments.
     let mut spans: Vec<Option<Span>> = Vec::new();
-    for (n, p) in variables {
-        ctx.declare_type_throughout(n.as_str(), None, AliasType::Type(Type::Param(Rc::clone(p))));
-        ctx.type_params_in_scope.push(n.to_string());
+    for w in variables {
+        w.scope(ctx);
         declared.push(PolyParam {
-            param: Rc::clone(p),
-            kind: TypeKind::Type,
+            param: Rc::clone(&w.param),
+            kind: if w.param.arity == 0 {
+                TypeKind::Type
+            } else {
+                TypeKind::family(w.domains.clone(), None)
+            },
             bound_at: None,
         });
         spans.push(None);
@@ -2330,13 +2534,56 @@ impl LoweringContext {
     }
 }
 
+/// What lowering a program records of `std`: its traits and instances, its `Option`, and its
+/// collection types. A module lowered outside any program reaches these as one the prelude
+/// reaches does ([`LoweringContext::reach_std`]).
+#[derive(Clone)]
+pub(crate) struct StdLowering {
+    instances: InstanceTable,
+    option: Option<Rc<NominalDecl>>,
+    collections: Vec<(crate::ccl::nominal::StdCollection, Rc<NominalDecl>)>,
+}
+
+thread_local! {
+    /// [`std_lowering`], built once per thread.
+    static STD_LOWERING: StdLowering = {
+        let mut ctx = LoweringContext::default();
+        let program = crate::ccl::load::LoadedProgram::test("1");
+        modules::lower_program(&program, &mut ctx)
+            .into_result()
+            .unwrap_or_else(|errors| {
+                panic!("`std` and a program of one literal lower: {errors:?}")
+            });
+        StdLowering {
+            option: ctx.std_option.clone(),
+            collections: ctx.std_collections.clone(),
+            instances: ctx.take_instances(),
+        }
+    };
+}
+
+/// What lowering `std` alone records ([`StdLowering`]).
+pub(crate) fn std_lowering() -> StdLowering {
+    STD_LOWERING.with(Clone::clone)
+}
+
 /// The traits and instances of a program that declares nothing of its own: `std`'s, which
 /// the prelude reaches ([`InstanceTable::std`]).
 pub fn std_instances() -> InstanceTable {
-    let mut ctx = LoweringContext::default();
-    let program = crate::ccl::load::LoadedProgram::test("1");
-    modules::lower_program(&program, &mut ctx)
-        .into_result()
-        .unwrap_or_else(|errors| panic!("`std` and a program of one literal lower: {errors:?}"));
-    ctx.take_instances()
+    std_lowering().instances
+}
+
+impl LoweringContext {
+    /// Reach `std` as a module the prelude reaches does, for a module lowered outside any
+    /// program: unless `std` has lowered into this context, take what lowering it alone
+    /// records.
+    pub(crate) fn reach_std(&mut self) {
+        if self.instances.has_std() {
+            return;
+        }
+        let std = std_lowering();
+        self.instances = std.instances;
+        self.std_option = std.option;
+        self.std_collections = std.collections;
+    }
 }

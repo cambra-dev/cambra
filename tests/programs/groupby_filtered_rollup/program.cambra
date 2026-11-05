@@ -6,4 +6,4 @@ sales = [
     (region="east",  amount=150, qty=5),
     (region="north", amount=40,  qty=1),
 ]
-[sum([s.amount for s in g if s.qty > 2]) for g in groupby(sales, \r -> r.region)]
+[sum([s.amount for s in g if s.qty > 2]) for _ -> g in groupby(sales, \r -> r.region)]

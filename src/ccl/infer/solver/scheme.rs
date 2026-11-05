@@ -1188,10 +1188,12 @@ pub fn freshen_above(
             let _f = crate::ccl::provenance::copy_frame("infer.freshen_projection");
             let mut term = (*p.term).clone();
             freshen_expr_type_slots(&mut term, lim, target, cache);
-            Type::WitnessProjection(crate::ccl::ty::WitnessProjection::new(
-                Rc::new(term),
-                p.position,
-            ))
+            let mut projection = p.clone();
+            projection.term = Rc::new(term);
+            if let Some(sum) = projection.read_through_mut() {
+                *sum = freshen_above(lim, sum, target, cache);
+            }
+            Type::WitnessProjection(projection)
         }
         Type::WitnessRef(w) => match cache.witnesses.get(w) {
             Some(fresh) => Type::WitnessRef(*fresh),

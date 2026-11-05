@@ -389,7 +389,7 @@ fn a_groupby_rollup() {
             (region="east", amount=3),
         ]
         out = test_sink()
-        out << sum([sum([s.amount for s in g]) for g in groupby(sales, \r -> r.region)])
+        out << sum([sum([s.amount for s in g]) for _ -> g in groupby(sales, \r -> r.region)])
     "#});
 }
 
@@ -640,22 +640,22 @@ fn rows_filtered_on_a_mutable_variable_the_loop_does_not_write(#[case] source: &
 #[case::every_key_is_the_binder(indoc! {r#"
     out = test_sink()
     for i in [1, 2]:
-        out << sum([sum([s for s in g]) for g in groupby([1, 1, 2], \e -> i)])
+        out << sum([sum([s for s in g]) for _ -> g in groupby([1, 1, 2], \e -> i)])
 "#})]
 #[case::the_group_count_varies(indoc! {r#"
     out = test_sink()
     for i in [1, 2]:
-        out << sum([1 for g in groupby([1, 2, 3], \e -> e // i)])
+        out << sum([1 for _ -> g in groupby([1, 2, 3], \e -> e // i)])
 "#})]
 #[case::each_group_aggregated(indoc! {r#"
     out = test_sink()
     for i in [1, 2]:
-        out << sum([sum(g) for g in groupby([1, 1, 2], \e -> i)])
+        out << sum([sum(g) for _ -> g in groupby([1, 1, 2], \e -> i)])
 "#})]
 #[case::the_group_and_the_binder_both_read(indoc! {r#"
     out = test_sink()
     for i in [1, 2, 3]:
-        out << sum([max(g) * i for g in groupby([1, 2, 3, 4], \e -> e // i)])
+        out << sum([max(g) * i for _ -> g in groupby([1, 2, 3, 4], \e -> e // i)])
 "#})]
 fn a_group_by_whose_key_reads_the_loop_binder(#[case] source: &str) {
     agree(source);
@@ -709,7 +709,7 @@ fn a_loop_over_groups_feeds_a_row_per_group() {
             (region="east", amount=3),
         ]
         out = test_sink()
-        for g in groupby(sales, \r -> r.region):
+        for _ -> g in groupby(sales, \r -> r.region):
             out << sum([s.amount for s in g])
     "#});
 }
@@ -1313,11 +1313,11 @@ fn two_feed_sites_tag_their_keys() {
 #[test]
 fn aggregating_a_keyed_written_store() {
     agree(indoc! {r#"
-        m: Mut(Map(String, Int)) := box(map([("a", 1)]))
+        m: Mut(Map(String, Int)) := map([("a", 1)])
         for k in ["b", "c"]:
             m[k] := 9
         out = test_sink()
-        out << sum(m)
+        out << sum([v for _ -> v in m])
     "#});
 }
 
@@ -1325,9 +1325,9 @@ fn aggregating_a_keyed_written_store() {
 #[test]
 fn a_seeded_mutable_collection_aggregates() {
     agree(indoc! {r#"
-        m: Mut(Map(String, Int)) := box(map([("a", 1), ("b", 2)]))
+        m: Mut(Map(String, Int)) := map([("a", 1), ("b", 2)])
         out = test_sink()
-        out << sum(m)
+        out << sum([v for _ -> v in m])
     "#});
 }
 
@@ -1379,12 +1379,12 @@ fn a_constant_whole_collection_write_in_a_loop() {
 fn a_constant_whole_map_write_through_a_mut_parameter() {
     agree(indoc! {r#"
         def put(m: Mut(Map(Int, Int))):
-            m := box(map([(5, 50), (6, 60)]))
-        m: Mut(Map(Int, Int)) := box(map([(1, 10), (2, 20)]))
+            m := map([(5, 50), (6, 60)])
+        m: Mut(Map(Int, Int)) := map([(1, 10), (2, 20)])
         for x in [3, 4]:
             put(m)
         out = test_sink()
-        out << sum(m)
+        out << sum([v for _ -> v in m])
     "#});
 }
 
@@ -1472,7 +1472,7 @@ fn a_groupby_key_reads_a_mutable_variable() {
     agree(indoc! {r#"
         out = test_sink()
         acc := 2
-        out << sum([sum(g) for g in groupby([1, 2, 3, 4], \v -> v // acc)])
+        out << sum([sum(g) for _ -> g in groupby([1, 2, 3, 4], \v -> v // acc)])
     "#});
 }
 

@@ -1486,7 +1486,7 @@ fn holds_a_sum(ty: &Type) -> bool {
 
 /// Restate `e` at `target`: through [`view_at`] where `target` is a sum, and component by
 /// component where it is a product holding one.
-fn view_at_value_type(e: &mut Expr, target: &Type) {
+pub(crate) fn view_at_value_type(e: &mut Expr, target: &Type) {
     if target.peel_refinements().sum().is_some() {
         if e.ty != *target {
             view_at(e, target.clone());
@@ -1677,14 +1677,37 @@ fn rewrite_keyed_writes(expr: &mut Expr, value_tys: &HashMap<Name, Type>) {
              target is rejected before this phase"
         )
     });
-    let arg_ty = Type::Tuple(vec![map_ty.clone(), key.ty.clone(), value.ty.clone()]);
-    let mut arg = Expr::tuple(vec![tvar(name, map_ty.clone()), *key, (**value).clone()]);
+    // One of `std`'s collections is written through its representation, which the write takes
+    // out of the value and puts back in its constructor: `m := rep(insert(rep⁻¹(m), k, v))`.
+    let read = tvar(name, map_ty.clone());
+    let (collection, collection_ty) =
+        match crate::ccl::infer::solver::traits::std_collection_representation(
+            read.clone_preserving_ids(),
+            &map_ty,
+        ) {
+            Some(unwrapped) => unwrapped,
+            None => (read, map_ty.clone()),
+        };
+    let arg_ty = Type::Tuple(vec![
+        collection_ty.clone(),
+        key.ty.clone(),
+        value.ty.clone(),
+    ]);
+    let mut arg = Expr::tuple(vec![collection, *key, (**value).clone()]);
     arg.ty = arg_ty.clone();
     let mut insert = Expr::builtin(Builtin::Insert);
-    insert.ty = Type::fun(arg_ty, map_ty.clone());
+    insert.ty = Type::fun(arg_ty, collection_ty.clone());
     let mut app = Expr::apply(arg, insert);
-    app.ty = map_ty;
-    **value = app;
+    app.ty = collection_ty;
+    **value = match map_ty.peel_refinements() {
+        Type::Nominal(decl, _) if crate::ccl::nominal::StdCollection::of(decl).is_some() => {
+            let [ctor] = decl.body().ctors.as_slice() else {
+                unreachable!("`std`'s `{}` has one constructor", decl.name)
+            };
+            Expr::nominal_ctor(Rc::clone(decl), ctor.name.clone(), app).with_ty(map_ty)
+        }
+        _ => app,
+    };
 }
 
 /// A `Var` reference stamped with its concrete type.
@@ -1864,6 +1887,11 @@ fn source_value(iter: &Expr) -> Expr {
 /// Only a source no enclosing loop varies is bound: one reading nothing an enclosing loop binds
 /// or writes. Its binding stands outside every enclosing loop, so the inner domain depends on no
 /// enclosing position. A source computed per position of an enclosing loop is left in place.
+///
+/// Every other `let` on a loop body's spine that no position varies is bound ahead of the loop
+/// the same way ([`take_floating`]), for a `for` loop and for a loop in lambda form that only
+/// feeds ([`statement_loop_body`]), so a type projecting through its name never needs its
+/// definition in its place.
 pub(crate) fn bind_sum_loop_sources(expr: Expr) -> Expr {
     bind_sources(expr, &HashSet::new(), &mut HashSet::new())
 }
@@ -1876,10 +1904,26 @@ fn bind_sources(mut expr: Expr, enclosing: &HashSet<Name>, sources: &mut HashSet
         body: cont,
     } = &mut expr.node
     else {
+        // A statement loop in lambda form standing anywhere but as a statement: its bindings
+        // that do not vary with it are bound around the loop itself.
+        if statement_loop_body(&mut expr).is_some() {
+            let mut scoped = enclosing.clone();
+            names_scoped_by(&expr, &mut scoped);
+            expr.map_children(|child| bind_sources(child, &scoped, sources));
+            let floated = take_lambda_loop_floating(&mut expr, &scoped);
+            return bind_ahead(floated, expr);
+        }
         expr.map_children(|child| bind_sources(child, enclosing, sources));
         return expr;
     };
     **cont = bind_sources(std::mem::take(&mut **cont), enclosing, sources);
+    if statement_loop_body(effect).is_some() {
+        let mut scoped = enclosing.clone();
+        names_scoped_by(effect, &mut scoped);
+        effect.map_children(|child| bind_sources(child, &scoped, sources));
+        let floated = take_lambda_loop_floating(effect, &scoped);
+        return bind_ahead(floated, expr);
+    }
     if !matches!(effect.node, TypedExprNode::For { .. }) {
         **effect = bind_sources(std::mem::take(&mut **effect), enclosing, sources);
         return expr;
@@ -1892,7 +1936,7 @@ fn bind_sources(mut expr: Expr, enclosing: &HashSet<Name>, sources: &mut HashSet
     **iter = bind_sources(std::mem::take(&mut **iter), enclosing, sources);
     **body = bind_sources(std::mem::take(&mut **body), &scoped, sources);
     let mut invariant = Vec::new();
-    take_sources(body, sources, &mut invariant);
+    take_floating(body, sources, &scoped, &mut invariant);
     debug_assert!(
         invariant
             .iter()
@@ -1914,10 +1958,129 @@ fn bind_sources(mut expr: Expr, enclosing: &HashSet<Name>, sources: &mut HashSet
         sources.insert(source.clone());
         expr = Expr::let_in(binding(source, definition.ty.clone()), definition, expr);
     }
-    for (id, binding, definition) in invariant.into_iter().rev() {
-        expr = Expr::let_in_preserving(id, binding, definition, expr);
+    bind_ahead(invariant, expr)
+}
+
+/// `body` under each of `floated`'s bindings, the first outermost.
+fn bind_ahead(floated: Vec<(NodeId, TypedBinding, Expr)>, mut body: Expr) -> Expr {
+    for (id, binding, definition) in floated.into_iter().rev() {
+        body = Expr::let_in_preserving(id, binding, definition, body);
     }
-    expr
+    body
+}
+
+/// The element body of `e` where `e` is a statement loop in lambda form: a loop
+/// `λ 𝑟 → (𝑟 ▷ 𝑠) ▷ (λ 𝑥 → body)` whose body is a statement chain ([`yields_units`]), as a loop
+/// that only feeds is. A comprehension has the same shape, and its body is the element it
+/// yields.
+fn statement_loop_body(e: &mut Expr) -> Option<&mut Expr> {
+    crate::ccl::ccl_utils::loop_parts(e)?;
+    let TypedExprNode::Lambda { body, .. } = &mut e.node else {
+        return None;
+    };
+    let TypedExprNode::Apply { function, .. } = &mut body.node else {
+        return None;
+    };
+    let TypedExprNode::Lambda { body, .. } = &mut function.node else {
+        return None;
+    };
+    yields_units(&body.ty).then_some(&mut **body)
+}
+
+/// Whether a loop body of type `ty` is a statement chain: `Unit`, or the collection of units an
+/// inner statement loop yields, at every level of a nest.
+fn yields_units(ty: &Type) -> bool {
+    match ty.peel_refinements() {
+        Type::Base(BaseType::Unit) => true,
+        Type::Fun {
+            fun_kind: crate::ccl::FunKind::Data(_),
+            codomain,
+            ..
+        } => yields_units(codomain),
+        _ => false,
+    }
+}
+
+/// The bindings of a statement loop in lambda form that stand outside it ([`take_floating`]),
+/// taken out of its element body.
+fn take_lambda_loop_floating(
+    e: &mut Expr,
+    scoped: &HashSet<Name>,
+) -> Vec<(NodeId, TypedBinding, Expr)> {
+    let mut out = Vec::new();
+    if let Some(body) = statement_loop_body(e) {
+        take_floating(body, &HashSet::new(), scoped, &mut out);
+    }
+    if !out.is_empty() {
+        retype_lambda_loop(e);
+    }
+    out
+}
+
+/// The types along a statement loop in lambda form recomputed from its element body, whose
+/// `let`s were taken out: a type that closed over one of them reads its name now, bound ahead of
+/// the loop.
+fn retype_lambda_loop(e: &mut Expr) {
+    let TypedExprNode::Lambda {
+        param: position,
+        body: step_at,
+    } = &mut e.node
+    else {
+        unreachable!("a statement loop in lambda form")
+    };
+    let TypedExprNode::Apply {
+        argument: read,
+        function: step,
+    } = &mut step_at.node
+    else {
+        unreachable!("a statement loop in lambda form")
+    };
+    let TypedExprNode::Lambda {
+        param: element,
+        body,
+    } = &mut step.node
+    else {
+        unreachable!("a statement loop in lambda form")
+    };
+    retype_spine(body);
+    let element_kind = step
+        .ty
+        .fun_kind()
+        .cloned()
+        .unwrap_or(crate::ccl::FunKind::Compute);
+    step.ty = Type::fun_over(
+        element.name.clone(),
+        element.ty.clone(),
+        body.ty.clone(),
+        element_kind,
+    );
+    step_at.ty = crate::ccl::subst::discharge_codomain(&element.name, read, &body.ty);
+    let loop_kind =
+        e.ty.fun_kind()
+            .cloned()
+            .unwrap_or(crate::ccl::FunKind::Data(None));
+    e.ty = Type::fun_over(
+        position.name.clone(),
+        position.ty.clone(),
+        step_at.ty.clone(),
+        loop_kind,
+    );
+}
+
+/// The types of the `let`s on a statement chain's spine recomputed from their bodies, innermost
+/// first, each closed over its own binder.
+fn retype_spine(e: &mut Expr) {
+    if let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        body,
+    } = &mut e.node
+    {
+        retype_spine(body);
+        e.ty = crate::ccl::ccl_utils::closed_let_type(binding, bound_expr, body.ty.clone());
+    } else if statement_loop_body(e).is_some() {
+        retype_lambda_loop(e);
+    }
 }
 
 /// Whether `e` reads any of `names`.
@@ -1936,6 +2099,84 @@ fn names_scoped_by(e: &Expr, out: &mut HashSet<Name>) {
         out.insert(name.clone());
     }
     e.walk_children(|child| names_scoped_by(child, out));
+}
+
+/// Remove from a loop body `e` the bindings that stand outside the loop, collecting each in
+/// `out` in the order met: on the body's statement spine, a `let` whose definition is the same at
+/// every position ([`floats`]), and anywhere, a binding of one of `sources`.
+///
+/// A writer body dissolves a binding it does not keep into the terms that read it
+/// ([`keeps`]), and with it into the types that project a witness through the name. Bound ahead
+/// of the loop, the name stays one those types can quote, and a loop source reading it reads
+/// nothing the enclosing loop varies.
+fn take_floating(
+    e: &mut Expr,
+    sources: &HashSet<Name>,
+    scoped: &HashSet<Name>,
+    out: &mut Vec<(NodeId, TypedBinding, Expr)>,
+) {
+    while let TypedExprNode::Let {
+        binding,
+        bound_expr,
+        ..
+    } = &e.node
+        && (sources.contains(&binding.name) || floats(bound_expr, scoped))
+    {
+        let id = e.node_id();
+        let TypedExprNode::Let {
+            binding,
+            bound_expr,
+            body,
+        } = std::mem::take(e).node
+        else {
+            unreachable!("matched a Let")
+        };
+        out.push((id, binding, *bound_expr));
+        *e = *body;
+    }
+    match &mut e.node {
+        TypedExprNode::Let {
+            bound_expr: off_spine,
+            body,
+            ..
+        }
+        | TypedExprNode::ExprStmt {
+            expr: off_spine,
+            body,
+        }
+        | TypedExprNode::MutDecl {
+            init: off_spine,
+            body,
+            ..
+        } => {
+            take_sources(off_spine, sources, out);
+            take_floating(body, sources, scoped, out);
+        }
+        _ => take_sources(e, sources, out),
+    }
+}
+
+/// Whether a binding of `value` in a loop body that scopes `scoped` stands outside the loop: the
+/// value reads none of the names the loop binds or writes, and neither reads nor writes a mutable
+/// variable or a feed, whose value depends on the position it is read at.
+fn floats(value: &Expr, scoped: &HashSet<Name>) -> bool {
+    fn effectful(e: &Expr) -> bool {
+        matches!(
+            e.node,
+            TypedExprNode::MutWrite { .. }
+                | TypedExprNode::MutDecl { .. }
+                | TypedExprNode::Feed { .. }
+                | TypedExprNode::Define { .. }
+                | TypedExprNode::Defer
+        ) || e.ty.mut_value_type().is_some()
+            || e.ty.as_feed().is_some()
+            || e.any_child(effectful)
+    }
+    !reads_any(value, scoped)
+        && !crate::ccl::subst::type_free_vars(&value.ty)
+            .iter()
+            .any(|n| scoped.contains(n))
+        && !effectful(value)
 }
 
 /// Remove from `e` each binding of one of `sources`, collecting it in `out` in the order met.

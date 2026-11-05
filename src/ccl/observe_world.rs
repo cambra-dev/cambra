@@ -31,12 +31,12 @@ use crate::ccl::{Builtin, Expr, Name, Type, TypedExprNode, provenance};
 /// collection's definition where the collection is read (`inline_list_element_reads`): such a
 /// read stands in loops the collection's own loops do not, and the reading inside is at the
 /// collection's position, which the substitution makes the read's key.
-pub fn eliminate(mut expr: Expr) -> Expr {
+pub fn eliminate(mut expr: Expr) -> Result<Expr, String> {
     bind(&mut expr, &mut Vec::new(), false);
     let memo = PredMemo::new();
-    in_filters(&mut expr, &memo);
+    in_filters(&mut expr, &memo)?;
     assert_eliminated(&expr);
-    expr
+    Ok(expr)
 }
 
 /// Refuse a reading in a comprehension's filter under another loop.
@@ -191,33 +191,50 @@ fn own_filters<'a>(from: &Type, target: &'a Type) -> Vec<&'a Expr> {
 
 /// Rewrite the readings of every filter in a type slot of `e` or its descendants, once per
 /// predicate however many slots carry it.
-fn in_filters(e: &mut Expr, memo: &PredMemo<()>) {
-    e.walk_type_slots_mut(|ty| in_type(ty, memo, false));
-    e.walk_children_mut(|child| in_filters(child, memo));
+fn in_filters(e: &mut Expr, memo: &PredMemo<()>) -> Result<(), String> {
+    let mut result = Ok(());
+    e.walk_type_slots_mut(|ty| {
+        if result.is_ok() {
+            result = in_type(ty, memo, false);
+        }
+    });
+    e.walk_children_mut(|child| {
+        if result.is_ok() {
+            result = in_filters(child, memo);
+        }
+    });
+    result
 }
 
 /// Rewrite the readings of each refinement in `ty` that holds one. `domain` is whether `ty` is a
 /// collection's domain, where a refinement's element is a position.
-fn in_type(ty: &mut Type, memo: &PredMemo<()>, domain: bool) {
+fn in_type(ty: &mut Type, memo: &PredMemo<()>, domain: bool) -> Result<(), String> {
     if let Type::Refinement(base, refinements) = ty
         && refinements.iter().any(|r| holds_reading(&r.predicate))
     {
         let element = (**base).clone();
+        let mut unsupported = None;
         refinements.rewrite_each(|_, refinement| {
             if !holds_reading(&refinement.predicate) {
                 return;
             }
             memo.rebuild(refinement, &(), |predicate| {
-                assert!(
-                    domain,
-                    "a reading in a refinement stands in a comprehension's filter, which refines \
-                     its loop's domain: {}",
-                    crate::ccl::symbolic::symbolic(predicate),
-                );
+                if !domain {
+                    unsupported = Some(format!(
+                        "a reading in a refinement under a loop, a comprehension's filter or a \
+                         group's membership, is not compiled yet: the reading depends on a \
+                         position the refined type does not state, in {}",
+                        crate::ccl::symbolic::symbolic(predicate),
+                    ));
+                    return false;
+                }
                 bind(predicate, &mut vec![(Name::elem(), element.clone())], false);
                 true
             });
         });
+        if let Some(unsupported) = unsupported {
+            return Err(unsupported);
+        }
     }
     match ty {
         Type::Fun {
@@ -226,11 +243,20 @@ fn in_type(ty: &mut Type, memo: &PredMemo<()>, domain: bool) {
             codomain,
             ..
         } => {
-            in_type(domain, memo, true);
-            in_type(codomain, memo, false);
+            in_type(domain, memo, true)?;
+            in_type(codomain, memo, false)?;
         }
-        _ => ty.walk_children_mut(|child| in_type(child, memo, false)),
+        _ => {
+            let mut result = Ok(());
+            ty.walk_children_mut(|child| {
+                if result.is_ok() {
+                    result = in_type(child, memo, false);
+                }
+            });
+            result?;
+        }
     }
+    Ok(())
 }
 
 /// Whether `e` holds a reading that has no operand yet, outside its type slots.

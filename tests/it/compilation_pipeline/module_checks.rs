@@ -870,14 +870,15 @@ fn cambra_check_prints_an_interface_or_errors() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn an_error_at_a_node_a_module_check_minted_has_a_span() {
-    let library = "pub g = [sum([s.amount for s in g]) for g in groupby(sales, \\r -> r.region)]\n";
+    let library =
+        "pub g = [sum([s.amount for s in g]) for _ -> g in groupby(sales, \\r -> r.region)]\n";
     let root = indoc! {"
         import lib
         lib::g
     "};
     let errors = compile_errors(&program(root, &[("lib", library)]));
     assert!(errors.contains("Unbound variable: 'sales'"), "{errors}");
-    assert!(errors.contains("lib.cambra:1:46"), "{errors}");
+    assert!(errors.contains("lib.cambra:1:59"), "{errors}");
 }
 
 /// Checking a file on its own, as `cambra check` and an editor do, reports its type errors past

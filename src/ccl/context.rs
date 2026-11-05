@@ -3150,7 +3150,8 @@ fn run_passes(
         Unsupported(Located<String>),
     }
     expr = recorded(capture_provenance, Phase::Inline, || {
-        let expr = inline::inline_compute_lambdas(expr);
+        let expr = inline::try_inline_compute_lambdas(expr)
+            .map_err(|m| Refused::Internal("observeWorld", m))?;
         crate::ccl::observe_world::check_filters(&expr)
             .map_err(|m| Refused::Internal("observeWorld", m))?;
         crate::ccl::exceptions::eliminate(expr).map_err(Refused::Unsupported)

@@ -167,11 +167,11 @@ fn test_aggregates(#[case] code: &str, #[case] expected: Value) {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
-    "[sum(x) for x in groupby([2,3,4,5], \\x -> x // 2)]",
+    "[sum(x) for _ -> x in groupby([2,3,4,5], \\x -> x // 2)]",
     Tile::data_function(ColumnValue::Ints(vec![1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![5, 9]))), Predicate::True, BitSet::new())
 )]
 #[case(
-    "[sum(x) for x in groupby([y + 10 for y in [2,3,4,5,6] if y < 6], \\x -> x // 2)]",
+    "[sum(x) for _ -> x in groupby([y + 10 for y in [2,3,4,5,6] if y < 6], \\x -> x // 2)]",
     Tile::data_function(ColumnValue::Ints(vec![6, 7]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![25, 29]))), Predicate::True, BitSet::new())
 )]
 // A filter over an **unmapped** source, keyed by the identity. `case_2` above filters too,
@@ -181,7 +181,7 @@ fn test_aggregates(#[case] code: &str, #[case] expected: Value) {
 // a compiled predicate the data function it is fixed it; before that, this met its own
 // source at the incomparable kind at the post-planning wall.
 #[case(
-    "[sum(x) for x in groupby([x for x in [1,2,3] if x > 1], \\x -> x)]",
+    "[sum(x) for _ -> x in groupby([x for x in [1,2,3] if x > 1], \\x -> x)]",
     Tile::data_function(ColumnValue::Ints(vec![2, 3]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2, 3]))), Predicate::True, BitSet::new())
 )]
 fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
@@ -195,38 +195,36 @@ fn test_groupby(#[case] code: &str, #[case] expected: Tile) {
 #[rstest]
 #[timeout(Duration::from_secs(30))]
 #[case(
-    "[sum(x) for x in groupby([1], \\x -> x)]",
+    "[sum(x) for _ -> x in groupby([1], \\x -> x)]",
     Tile::data_function(ColumnValue::Ints(vec![1]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1]))), Predicate::True, BitSet::new())
 )]
 #[case(
-    "[sum(x) for x in groupby([1, 1], \\x -> x)]",
+    "[sum(x) for _ -> x in groupby([1, 1], \\x -> x)]",
     Tile::data_function(ColumnValue::Ints(vec![1]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![2]))), Predicate::True, BitSet::new())
 )]
 #[case(
-    "[sum(x) for x in groupby([1, 2], \\x -> x)]",
+    "[sum(x) for _ -> x in groupby([1, 2], \\x -> x)]",
     Tile::data_function(ColumnValue::Ints(vec![1, 2]), Box::new(Tile::Scalar(ColumnValue::Ints(vec![1, 2]))), Predicate::True, BitSet::new())
 )]
 fn a_groupby_over_a_singleton_element_literal(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
 
-// `set([…])` is a deduplicating re-keying constructor: the distinct
-// elements become the present keys, each mapped to `unit` (the `Set(K) =
-// Map(K, unit)` payload). Duplicate elements collapse via the `Drain` aggregate.
-// See `src/ccl/design/collections.md`, "Constructor lowering: runtime `groupby`
-// now, constant-folding later".
+// `set([…])` is a deduplicating re-keying constructor: the distinct elements become the present
+// keys. Duplicate elements collapse via the `Drain` aggregate. See `src/ccl/design/collections.md`,
+// "Constructor lowering: runtime `groupby` now, constant-folding later". The set is read through
+// iteration, which walks its keys: `[k for k in s]` is keyed by them, each holding itself.
 //
-// The domain (key) order is hash-nondeterministic and the uniform `Units`
-// codomain isn't normalized by `sort_function_by_domain`, so compare the
-// sorted key column and assert the codomain is `n` units.
+// The domain (key) order is hash-nondeterministic, so compare the sorted key column and its `n`
+// rows.
 fn check_set_keys(code: &str, sorted_keys: ColumnValue, n: usize) {
     let Tile::DataFunction {
         domain, codomain, ..
-    } = run_pipeline(code)
+    } = run_pipeline(&format!("[k for k in {code}]"))
     else {
-        panic!("`set` must build a Function");
+        panic!("a set's keys are a Function");
     };
-    let got = match domain {
+    let sorted = |column: ColumnValue| match column {
         ColumnValue::Ints(mut v) => {
             v.sort_unstable();
             ColumnValue::Ints(v)
@@ -237,15 +235,14 @@ fn check_set_keys(code: &str, sorted_keys: ColumnValue, n: usize) {
         }
         other => panic!("unexpected key column: {other:?}"),
     };
-    // Sorted but **not** deduplicated: deduplication is what is under test, so
-    // normalizing it away here would leave the key column unasserted and only the
-    // `Units(n)` codomain catching a `set` that kept its duplicates.
-    assert_eq!(got, sorted_keys, "deduplicated keys");
-    assert_eq!(
-        *codomain,
-        Tile::Scalar(ColumnValue::Units(n)),
-        "unit payload"
-    );
+    // Sorted but **not** deduplicated: deduplication is what is under test, so normalizing it
+    // away here would leave the key column unasserted.
+    assert_eq!(domain.len(), n, "one row per distinct key");
+    assert_eq!(sorted(domain), sorted_keys, "deduplicated keys");
+    let Tile::Scalar(values) = *codomain else {
+        panic!("a set's keys hold scalar values");
+    };
+    assert_eq!(sorted(values), sorted_keys, "each key holds itself");
 }
 
 #[rstest]
@@ -273,9 +270,9 @@ fn test_set(#[case] code: &str, #[case] sorted_keys: ColumnValue, #[case] n: usi
 fn check_map_entries(code: &str, mut expected: Vec<(Value, Value)>) {
     let Tile::DataFunction {
         domain, codomain, ..
-    } = run_pipeline(code)
+    } = run_pipeline(&format!("[v for _ -> v in {code}]"))
     else {
-        panic!("`map` must build a Function");
+        panic!("a map's values are a Function");
     };
     let Tile::Scalar(values) = *codomain else {
         panic!("`map`'s codomain must be a scalar column");
@@ -288,6 +285,8 @@ fn check_map_entries(code: &str, mut expected: Vec<(Value, Value)>) {
     assert_eq!(got, expected, "keyed entries");
 }
 
+// A map is read through iteration over its entries: `[v for _ -> v in m]` is keyed by its keys.
+//
 // The arrow cases spell with `k -> v` what the parenthesised cases spell with `(k, v)`:
 // the entry pair is the two-tuple (`docs/chl-spec.md`, "2.4 Atoms"), so both reach `map`
 // as the same list and nothing below the parser reads them differently.
@@ -505,7 +504,7 @@ fn a_bare_groupby_tail_is_driven() {
 // collection keyed by the group key, and elimination now carries that kind
 // across instead of rebuilding the type as a bare combinator `⇒`.
 #[case(
-    "[sum(x) for x in groupby([1,2,3,4], \\y -> y // 2)]",
+    "[sum(x) for _ -> x in groupby([1,2,3,4], \\y -> y // 2)]",
     // The final `sum`'s domain is the honest present-key domain — the key type refined
     // by membership in what this group-by's key morphism produces, rather than the old
     // imprecise total `Int` (see `src/ccl/design/collections.md`, "`groupby`'s exact
@@ -694,14 +693,14 @@ fn test_new_compile(#[case] code: &str, #[case] expected_ccl: &str, #[case] expe
 #[case(
     indoc::indoc! {r#"
         g = groupby([1,2,3,4], \y -> y // 2)
-        sum([sum(x) for x in g]) + sum([max(x) for x in g])"#},
+        sum([sum(x) for _ -> x in g]) + sum([max(x) for _ -> x in g])"#},
     Value::Int(18)
 )]
 // Three, including a repeat of the first.
 #[case(
     indoc::indoc! {r#"
         g = groupby([1,2,3,4], \y -> y // 2)
-        sum([sum(x) for x in g]) + sum([max(x) for x in g]) + sum([sum(x) for x in g])"#},
+        sum([sum(x) for _ -> x in g]) + sum([max(x) for _ -> x in g]) + sum([sum(x) for _ -> x in g])"#},
     Value::Int(28)
 )]
 fn test_shared_grouping(#[case] code: &str, #[case] expected: Value) {
@@ -717,7 +716,7 @@ fn a_conditional_between_groups_at_two_keys_has_no_join() {
         indoc! {"
             g = groupby([1, 2, 3], \\x -> x > 1)
             c = 1 > 0
-            sum([sum([sum([x for x in (g1 if c else g2)]) for g2 in g]) for g1 in g])
+            sum([sum([sum([x for x in (g1 if c else g2)]) for _ -> g2 in g]) for _ -> g1 in g])
         "},
         "Collection domains have no common answer",
     );
@@ -727,30 +726,33 @@ fn a_conditional_between_groups_at_two_keys_has_no_join() {
 /// enclosing loop's key (`src/interpreter/design-operators.md`, `MapResult`).
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::two_keys("sum([sum([sum(g1) + sum(g2) for g2 in g]) for g1 in g])", 24)]
+#[case::two_keys(
+    "sum([sum([sum(g1) + sum(g2) for _ -> g2 in g]) for _ -> g1 in g])",
+    24
+)]
 #[case::three_keys(
-    "sum([sum([sum([sum(g1) + sum(g2) + sum(g3) for g3 in g]) for g2 in g]) for g1 in g])",
+    "sum([sum([sum([sum(g1) + sum(g2) + sum(g3) for _ -> g3 in g]) for _ -> g2 in g]) for _ -> g1 in g])",
     72
 )]
 #[case::their_elements(
-    "sum([sum([sum([x for x in g1]) + sum([y for y in g2]) for g2 in g]) for g1 in g])",
+    "sum([sum([sum([x for x in g1]) + sum([y for y in g2]) for _ -> g2 in g]) for _ -> g1 in g])",
     24
 )]
-#[case::beneath_a_list("sum([sum([sum(g2) + a for g2 in g]) for a in [1, 2]])", 18)]
+#[case::beneath_a_list("sum([sum([sum(g2) + a for _ -> g2 in g]) for a in [1, 2]])", 18)]
 #[case::a_boxed_group_at_the_inner_key(
     indoc! {"
         c = 1 > 2
-        sum([sum([sum([x for x in (box(g1) if c else box(g2))]) for g2 in g]) for g1 in g])
+        sum([sum([sum([x for x in (box(g1) if c else box(g2))]) for _ -> g2 in g]) for _ -> g1 in g])
     "},
     12
 )]
 // The inner comprehension reads no group of its own, so its keys are the grouping's.
 #[case::the_outer_group_over_an_inner_loop_reading_none(
-    "sum([sum([sum(g1) for g2 in g]) for g1 in g])",
+    "sum([sum([sum(g1) for _ -> g2 in g]) for _ -> g1 in g])",
     12
 )]
 #[case::the_outer_group_s_maximum_over_an_inner_loop_reading_none(
-    "sum([sum([max(g1) for g2 in g]) for g1 in g])",
+    "sum([sum([max(g1) for _ -> g2 in g]) for _ -> g1 in g])",
     8
 )]
 fn groups_read_at_the_keys_of_nested_loops(#[case] body: &str, #[case] expected: i64) {
@@ -791,8 +793,8 @@ fn groups_read_at_the_keys_of_nested_for_loops(#[case] body: &str, #[case] expec
         &formatdoc! {r"
             g = groupby([1, 2, 3], \x -> x > 1)
             t := 0
-            for g1 in g:
-                for g2 in g:
+            for _ -> g1 in g:
+                for _ -> g2 in g:
                     {body}
             t
         "},
@@ -805,7 +807,7 @@ fn groups_read_at_the_keys_of_nested_for_loops(#[case] body: &str, #[case] expec
 #[rstest]
 #[case::one_level(
     indoc! {r"
-        for g1 in g:
+        for _ -> g1 in g:
             for q in [u for u in g1 if u > 1]:
                 ch << q
     "},
@@ -813,8 +815,8 @@ fn groups_read_at_the_keys_of_nested_for_loops(#[case] body: &str, #[case] expec
 )]
 #[case::beneath_another_group_loop(
     indoc! {r"
-        for g1 in g:
-            for g2 in g:
+        for _ -> g1 in g:
+            for _ -> g2 in g:
                 for q in [u for u in g2 if u > 1]:
                     ch << q
     "},
@@ -840,7 +842,7 @@ fn a_group_s_filtered_elements_fed_per_group(#[case] body: &str, #[case] expecte
     indoc! {r"
         g = groupby([1, 2, 3, 4, 5], \x -> x > 2)
         ch: Feed(_)
-        for g2 in g:
+        for _ -> g2 in g:
             for q in g2:
                 if q > 1:
                     ch << q
@@ -854,7 +856,7 @@ fn a_group_s_filtered_elements_fed_per_group(#[case] body: &str, #[case] expecte
     indoc! {r"
         g = groupby([1, 2, 3, 4, 5], \x -> x > 2)
         ch: Feed(_)
-        for g2 in g:
+        for _ -> g2 in g:
             for q in g2:
                 if q > sum(g2) - 8:
                     ch << q
@@ -925,19 +927,19 @@ fn a_guard_in_a_loop_over_the_outer_element_s_collection(
 #[case(
     indoc::indoc! {r#"
         g = groupby([1,2,3,4], \y -> y // 2)
-        sum([sum(x) for x in g]) + sum([max(x) for x in g])"#}
+        sum([sum(x) for _ -> x in g]) + sum([max(x) for _ -> x in g])"#}
 )]
 // Three, including a repeat of the first, so a second bucketize would show as a second
 // `converse` whether or not the extra use aggregates differently.
 #[case(
     indoc::indoc! {r#"
         g = groupby([1,2,3,4], \y -> y // 2)
-        sum([sum(x) for x in g]) + sum([max(x) for x in g]) + sum([sum(x) for x in g])"#}
+        sum([sum(x) for _ -> x in g]) + sum([max(x) for _ -> x in g]) + sum([sum(x) for _ -> x in g])"#}
 )]
 // A grouping whose keys are its own elements, the shape the lookup spellings used.
 #[case(indoc::indoc! {r#"
     g = groupby([1,1,2,2,3], \x -> x)
-    sum([sum(x) for x in g]) + sum([max(x) for x in g])"#})]
+    sum([sum(x) for _ -> x in g]) + sum([max(x) for _ -> x in g])"#})]
 fn test_grouping_built_once(#[case] code: &str) {
     use cambra::ccl::symbolic::symbolic;
 
@@ -1051,28 +1053,28 @@ fn checked_lookup_of_a_product_value(#[case] code: &str, #[case] expected: Value
 #[case::map_over_tuples(
     indoc! {r#"
         m = map([((1, 2), 10), ((3, 4), 20)])
-        sum([v for v in m])
+        sum([v for _ -> v in m])
     "#},
     Value::Int(30)
 )]
 #[case::map_over_records(
     indoc! {r#"
         m = map([((a=1, b=2), 10), ((a=3, b=4), 20)])
-        sum([v for v in m])
+        sum([v for _ -> v in m])
     "#},
     Value::Int(30)
 )]
 #[case::group_by_a_tuple(
     indoc! {r#"
         g = groupby([(1, 2), (1, 2), (3, 4)], \x -> x)
-        sum([sum([y.1 for y in grp]) for grp in g])
+        sum([sum([y.1 for y in grp]) for _ -> grp in g])
     "#},
     Value::Int(8)
 )]
 #[case::group_by_a_record(
     indoc! {r#"
         g = groupby([(a=1, b=2), (a=1, b=2), (a=3, b=4)], \x -> x)
-        sum([sum([y.b for y in grp]) for grp in g])
+        sum([sum([y.b for y in grp]) for _ -> grp in g])
     "#},
     Value::Int(8)
 )]
@@ -1081,14 +1083,14 @@ fn checked_lookup_of_a_product_value(#[case] code: &str, #[case] expected: Value
 #[case::group_by_a_pair_of_the_element(
     indoc! {r#"
         g = groupby([1, 1, 2], \x -> (x, x))
-        sum([sum(grp) for grp in g])
+        sum([sum(grp) for _ -> grp in g])
     "#},
     Value::Int(4)
 )]
 #[case::group_by_a_one_field_record_of_the_element(
     indoc! {r#"
         g = groupby([1, 1, 2], \x -> (k=x))
-        sum([sum(grp) for grp in g])
+        sum([sum(grp) for _ -> grp in g])
     "#},
     Value::Int(4)
 )]
@@ -1100,21 +1102,21 @@ fn checked_lookup_of_a_product_value(#[case] code: &str, #[case] expected: Value
 #[case::map_over_tuples_sharing_a_component(
     indoc! {r#"
         m = map([((1, 2), 10), ((1, 4), 20)])
-        sum([v for v in m])
+        sum([v for _ -> v in m])
     "#},
     Value::Int(30)
 )]
 #[case::map_over_records_sharing_a_field(
     indoc! {r#"
         m = map([((a=1, b=2), 10), ((a=1, b=4), 20)])
-        sum([v for v in m])
+        sum([v for _ -> v in m])
     "#},
     Value::Int(30)
 )]
 #[case::one_entry_map_over_tuples(
     indoc! {r#"
         m = map([((1, 2), 10)])
-        sum([v for v in m])
+        sum([v for _ -> v in m])
     "#},
     Value::Int(10)
 )]
@@ -1300,33 +1302,27 @@ fn checked_lookup_over_a_key_stream(#[case] tail: &str, #[case] expected: Value)
 #[case(
     indoc::indoc! {r#"
         g: FullMap(_, _) = groupby([1,2], \v -> v)
-        sum([sum(v) for v in g])"#},
+        sum([sum(v) for _ -> v in g])"#},
     Value::Int(3)
 )]
 #[case(
     indoc::indoc! {r#"
         g: FullMap(_, _) = groupby([1,2,3,4], \v -> v // 2)
-        sum([sum(v) for v in g])"#},
+        sum([sum(v) for _ -> v in g])"#},
     Value::Int(10)
 )]
 // Bounded: `g` keeps the group-by's own type, binder included.
 #[case(
     indoc::indoc! {r#"
         g <: FullMap(_, _) = groupby([1,2], \v -> v)
-        sum([sum(v) for v in g])"#},
+        sum([sum(v) for _ -> v in g])"#},
     Value::Int(3)
 )]
 #[case(
     indoc::indoc! {r#"
         g <: FullMap(_, _) = groupby([1,2,3,4], \v -> v // 2)
-        sum([sum(v) for v in g])"#},
+        sum([sum(v) for _ -> v in g])"#},
     Value::Int(10)
-)]
-#[case(
-    indoc::indoc! {r#"
-        g: Map(_, _) = box(groupby([1,2,3], \x -> x))
-        sum([sum(v) for v in g])"#},
-    Value::Int(6)
 )]
 fn a_keyed_annotation_compiles_and_runs(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
@@ -1339,12 +1335,12 @@ fn a_keyed_annotation_compiles_and_runs(#[case] code: &str, #[case] expected: Va
 #[rstest]
 #[timeout(Duration::from_secs(30))]
 #[case::a_map(
-    "m: Map(Int, Int) = box(map([(1, 10), (2, 20)]))\nout << [v for v in m]",
+    "m: Map(Int, Int) = map([(1, 10), (2, 20)])\nout << [v for _ -> v in m]",
     "[() -> [1 -> 10, 2 -> 20]]"
 )]
-#[case::a_group_by(
-    "g: Map(_, _) = box(groupby([1, 2, 3], \\x -> x > 1))\nout << [sum(v) for v in g]",
-    "[() -> [false -> 1, true -> 5]]"
+#[case::a_set(
+    "s: Set(Int) = set([1, 2, 2])\nout << [x * 10 for x in s]",
+    "[() -> [1 -> 10, 2 -> 20]]"
 )]
 fn a_collection_read_out_of_an_annotated_sum_takes_its_definitions_domain(
     #[case] code: &str,
@@ -1356,11 +1352,8 @@ fn a_collection_read_out_of_an_annotated_sum_takes_its_definitions_domain(
 /// [`a_collection_read_out_of_an_annotated_sum_takes_its_definitions_domain`] as the program's value.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
-#[case::a_map("m: Map(Int, Int) = box(map([(1, 10), (2, 20)]))\n[v for v in m]", 30)]
-#[case::a_group_by(
-    "g: Map(_, _) = box(groupby([1, 2, 3], \\x -> x > 1))\n[sum(v) for v in g]",
-    6
-)]
+#[case::a_map("m: Map(Int, Int) = map([(1, 10), (2, 20)])\n[v for _ -> v in m]", 30)]
+#[case::a_set("s: Set(Int) = set([1, 2, 2])\n[x * 10 for x in s]", 30)]
 fn a_collection_value_read_out_of_an_annotated_sum_takes_its_definitions_domain(
     #[case] code: &str,
     #[case] total: i64,
@@ -1381,10 +1374,10 @@ fn a_collection_value_read_out_of_an_annotated_sum_takes_its_definitions_domain(
 }
 
 /// A collection over the witness of a sum read out of a name whose definition is no path leaves
-/// the name's scope packed wherever the witness stands in the collection's domain: alone, or
-/// beside another generator's position (`src/ccl/design/type-inference.md`, "`let` binders and
-/// scope exit"). The comprehension makes `b`'s definition no path, and `Bag`'s representation
-/// is a sum whose kind lists no candidates.
+/// the name's scope packed wherever the witness stands in the collection's domain: alone,
+/// beside another generator's position, or in each of two collections
+/// (`src/ccl/design/type-inference.md`, "`let` binders and scope exit"). The comprehension makes
+/// `b`'s definition no path, and `Bag`'s representation is a sum whose kind lists no candidates.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
 #[case::the_position_then_the_witness(
@@ -1414,6 +1407,17 @@ fn a_collection_value_read_out_of_an_annotated_sum_takes_its_definitions_domain(
     "},
     6
 )]
+#[case::two_collections_over_one_witness(
+    indoc! {"
+        def f(n):
+            b = Bag::new(box([v * n for v in [1, 2]]))
+            ys = b.extract()
+            ([y for y in ys], [y + 1 for y in ys])
+        p = f(1)
+        sum(p.0) + sum(p.1)
+    "},
+    8
+)]
 fn a_collection_over_a_witness_read_through_no_path_leaves_its_scope_packed(
     #[case] code: &str,
     #[case] expected: i64,
@@ -1440,7 +1444,7 @@ fn a_binop_pairs_two_projections_at_the_grouped_row() {
                 (region="west", amount=200, qty=3),
                 (region="east", amount=50,  qty=1),
             ]
-            sum([sum([s.amount + s.qty for s in g]) for g in groupby(sales, \r -> r.region)])
+            sum([sum([s.amount + s.qty for s in g]) for _ -> g in groupby(sales, \r -> r.region)])
         "#},
         Value::Int(356),
     );
@@ -1458,7 +1462,7 @@ fn a_tuple_of_folds_pairs_at_the_group() {
                 (region="east", amount=50,  qty=1),
                 (region="west", amount=200, qty=4),
             ]
-            [(sum([s.amount for s in g]), sum([s.qty for s in g])) for g in groupby(sales, \r -> r.region)]
+            [(sum([s.amount for s in g]), sum([s.qty for s in g])) for _ -> g in groupby(sales, \r -> r.region)]
         "#},
         Tile::data_function(
             ColumnValue::strings(&["east", "west"]),
@@ -1484,7 +1488,7 @@ fn a_tuple_of_a_collection_and_a_fold_over_each_group() {
                 (region="east", amount=50,  qty=1),
                 (region="west", amount=200, qty=4),
             ]
-            [([s.qty for s in g], sum([s.amount for s in g])) for g in groupby(sales, \r -> r.region)]
+            [([s.qty for s in g], sum([s.amount for s in g])) for _ -> g in groupby(sales, \r -> r.region)]
         "#},
         Tile::data_function(
             ColumnValue::strings(&["east", "west"]),
@@ -1525,7 +1529,7 @@ fn sales_program(rest: &str) -> String {
 /// and west `200`, and the unfiltered ones are north `40` and west `300`.
 fn per_region_program(body: &str) -> String {
     sales_program(&format!(
-        r"[{body} for g in groupby(sales, \r -> r.region)]"
+        r"[{body} for _ -> g in groupby(sales, \r -> r.region)]"
     ))
 }
 
@@ -1625,7 +1629,7 @@ fn a_filtered_comprehension_beside_another_over_each_row_keeps_its_filter(
 #[test]
 fn a_per_group_filter_keeps_each_elements_collection() {
     check_scalar(
-        "sum([sum([sum(s.xs) for s in g if s.q > 1]) for g in groupby([(k=a > 1, q=a, xs=[a * j for j in [1, 2]]) for a in [1, 2, 3]], \\x -> x.k)])",
+        "sum([sum([sum(s.xs) for s in g if s.q > 1]) for _ -> g in groupby([(k=a > 1, q=a, xs=[a * j for j in [1, 2]]) for a in [1, 2, 3]], \\x -> x.k)])",
         Value::Int(15),
     );
 }
@@ -1636,16 +1640,16 @@ fn a_per_group_filter_keeps_each_elements_collection() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::group_then_const(
-    r"[(g, 1) for g in groupby([1, 2, 3, 4], \v -> v // 2)]",
-    r"[(g, sum(g) * 0 + 1) for g in groupby([1, 2, 3, 4], \v -> v // 2)]"
+    r"[(g, 1) for _ -> g in groupby([1, 2, 3, 4], \v -> v // 2)]",
+    r"[(g, sum(g) * 0 + 1) for _ -> g in groupby([1, 2, 3, 4], \v -> v // 2)]"
 )]
 #[case::const_then_group(
-    r"[(1, g) for g in groupby([1, 2, 3, 4], \v -> v // 2)]",
-    r"[(sum(g) * 0 + 1, g) for g in groupby([1, 2, 3, 4], \v -> v // 2)]"
+    r"[(1, g) for _ -> g in groupby([1, 2, 3, 4], \v -> v // 2)]",
+    r"[(sum(g) * 0 + 1, g) for _ -> g in groupby([1, 2, 3, 4], \v -> v // 2)]"
 )]
 #[case::fold_then_const(
-    r"[(sum(g), 1) for g in groupby([1, 2, 3, 4], \v -> v // 2)]",
-    r"[(sum(g), sum(g) * 0 + 1) for g in groupby([1, 2, 3, 4], \v -> v // 2)]"
+    r"[(sum(g), 1) for _ -> g in groupby([1, 2, 3, 4], \v -> v // 2)]",
+    r"[(sum(g), sum(g) * 0 + 1) for _ -> g in groupby([1, 2, 3, 4], \v -> v // 2)]"
 )]
 fn a_zip_with_a_constant_arm_pairs_at_the_groups(#[case] fast: &str, #[case] generic: &str) {
     assert_eq!(
@@ -1659,7 +1663,7 @@ fn a_zip_with_a_constant_arm_pairs_at_the_groups(#[case] fast: &str, #[case] gen
 #[test]
 fn counting_the_groups_of_a_group_by() {
     check_scalar(
-        r"sum([1 for g in groupby([1, 2, 3], \x -> x // 2)])",
+        r"sum([1 for _ -> g in groupby([1, 2, 3], \x -> x // 2)])",
         Value::Int(2),
     );
 }
@@ -1670,7 +1674,7 @@ fn counting_the_groups_of_a_group_by() {
 #[test]
 fn a_filter_over_the_groups_of_a_group_by() {
     check_scalar(
-        r"sum([sum(g) for g in groupby([1, 2, 3, 4], \e -> e // 2) if sum(g) > 3])",
+        r"sum([sum(g) for _ -> g in groupby([1, 2, 3, 4], \e -> e // 2) if sum(g) > 3])",
         Value::Int(9),
     );
 }
@@ -1679,8 +1683,10 @@ fn a_filter_over_the_groups_of_a_group_by() {
 /// lifts from its uncompiled predicate and plans as the tree, so the group-by is recognized there
 /// too.
 #[rstest]
-#[case::summing_the_groups(r"1 if 0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) else 0")]
-#[case::counting_the_groups(r"1 if 0 < sum([1 for g in groupby([1, 1, 2], \e -> e)]) else 0")]
+#[case::summing_the_groups(
+    r"1 if 0 < sum([sum(g) for _ -> g in groupby([1, 1, 2], \e -> e)]) else 0"
+)]
+#[case::counting_the_groups(r"1 if 0 < sum([1 for _ -> g in groupby([1, 1, 2], \e -> e)]) else 0")]
 fn a_group_by_in_a_guard(#[case] program: &str) {
     check_scalar(program, Value::Int(1));
 }
@@ -1693,43 +1699,43 @@ fn a_group_by_in_a_guard(#[case] program: &str) {
 /// enclosing value holds, directly or as a record's field.
 #[rstest]
 #[case::filtered(
-    r"out << [[y for y in g if y > 1] for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    r"out << [[y for y in g if y > 1] for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
     "[() -> [[1 -> 2], [2 -> 3, 3 -> 4, 4 -> 5], [5 -> 6, 6 -> 7, 7 -> 8]]]"
 )]
 #[case::filtered_beside_the_sum(
-    r"out << [([y for y in g if y > 1], sum(g)) for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    r"out << [([y for y in g if y > 1], sum(g)) for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
     "[() -> [(_0: [1 -> 2], _1: 3), (_0: [2 -> 3, 3 -> 4, 4 -> 5], _1: 12), (_0: [5 -> 6, 6 -> 7, 7 -> 8], _1: 21)]]"
 )]
 #[case::summed_per_element(
-    r"out << [[sum([y for y in g]) for x in g] for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    r"out << [[sum([y for y in g]) for x in g] for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
     "[() -> [[3, 3], [2 -> 12, 3 -> 12, 4 -> 12], [5 -> 21, 6 -> 21, 7 -> 21]]]"
 )]
 #[case::summed_per_filtered_element(
-    r"out << [[sum([y for y in g]) for x in g if x > 1] for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    r"out << [[sum([y for y in g]) for x in g if x > 1] for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
     "[() -> [[1 -> 3], [2 -> 12, 3 -> 12, 4 -> 12], [5 -> 21, 6 -> 21, 7 -> 21]]]"
 )]
 #[case::correlated(
-    r"out << [[sum([y for y in g if y > x]) for x in g] for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    r"out << [[sum([y for y in g if y > x]) for x in g] for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
     "[() -> [[2, 0], [2 -> 9, 3 -> 5, 4 -> 0], [5 -> 15, 6 -> 8, 7 -> 0]]]"
 )]
 #[case::correlated_over_filtered_elements(
-    r"out << [[sum([y for y in g if y > x]) for x in g if x > 1] for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    r"out << [[sum([y for y in g if y > x]) for x in g if x > 1] for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
     "[() -> [[1 -> 0], [2 -> 9, 3 -> 5, 4 -> 0], [5 -> 15, 6 -> 8, 7 -> 0]]]"
 )]
 #[case::summed_per_element_of_a_group_filtered_to_empty(
-    r"out << [[sum([y for y in g]) for x in g if x > 2] for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    r"out << [[sum([y for y in g]) for x in g if x > 2] for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
     "[() -> [[], [2 -> 12, 3 -> 12, 4 -> 12], [5 -> 21, 6 -> 21, 7 -> 21]]]"
 )]
 #[case::correlated_over_a_group_filtered_to_empty(
-    r"out << [[sum([y for y in g if y > x]) for x in g if x > 2] for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    r"out << [[sum([y for y in g if y > x]) for x in g if x > 2] for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
     "[() -> [[], [2 -> 9, 3 -> 5, 4 -> 0], [5 -> 15, 6 -> 8, 7 -> 0]]]"
 )]
 #[case::reading_only_the_filtered_element(
-    r"out << [[sum([x for y in g]) for x in g if x > 1] for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    r"out << [[sum([x for y in g]) for x in g if x > 1] for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
     "[() -> [[1 -> 4], [2 -> 9, 3 -> 12, 4 -> 15], [5 -> 18, 6 -> 21, 7 -> 24]]]"
 )]
 #[case::reading_only_the_element_beside_a_record_field(
-    r"out << [[sum([x for y in r.g]) for x in [1, 2]] for r in [(g=g, n=1) for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]]",
+    r"out << [[sum([x for y in r.g]) for x in [1, 2]] for r in [(g=g, n=1) for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]]",
     "[() -> [[2, 4], [3, 6], [3, 6]]]"
 )]
 fn a_comprehension_over_each_group_of_a_group_by(#[case] row: &str, #[case] expected: &str) {
@@ -1753,7 +1759,7 @@ fn a_comprehension_reading_only_the_element_under_a_further_level() {
     check_sink(
         indoc! {r"
             out = test_sink()
-            out << [[[sum([x for y in g]) for x in g if x > 1] for z in [1]] for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]
+            out << [[[sum([x for y in g]) for x in g if x > 1] for z in [1]] for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]
         "},
         "[() -> [[[1 -> 4]], [[2 -> 9, 3 -> 12, 4 -> 15]], [[5 -> 18, 6 -> 21, 7 -> 24]]]]",
     );
@@ -1764,15 +1770,15 @@ fn a_comprehension_reading_only_the_element_under_a_further_level() {
 /// nested in a key, which the key domain's predicate and the partition each hold.
 #[rstest]
 #[case::in_a_chained_comparison(
-    r"0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) < 100",
+    r"0 < sum([sum(g) for _ -> g in groupby([1, 1, 2], \e -> e)]) < 100",
     Value::Bool(true)
 )]
 #[case::in_a_guard_s_chained_comparison(
-    r"1 if 0 < sum([sum(g) for g in groupby([1, 1, 2], \e -> e)]) < 100 else 0",
+    r"1 if 0 < sum([sum(g) for _ -> g in groupby([1, 1, 2], \e -> e)]) < 100 else 0",
     Value::Int(1)
 )]
 #[case::nested_in_a_key(
-    r"sum([sum(g) for g in groupby([1, 1, 2], \e -> sum([sum(h) for h in groupby([1, 1, 2], \f -> f)]))])",
+    r"sum([sum(g) for _ -> g in groupby([1, 1, 2], \e -> sum([sum(h) for _ -> h in groupby([1, 1, 2], \f -> f)]))])",
     Value::Int(4)
 )]
 fn a_group_by_held_twice_is_iterated(#[case] program: &str, #[case] expected: Value) {
@@ -1785,25 +1791,25 @@ fn a_group_by_held_twice_is_iterated(#[case] program: &str, #[case] expected: Va
 #[rstest]
 #[case::a_filter_reading_the_element(indoc! {r#"
     out = test_sink()
-    out << sum([sum(g) for g in groupby([1, 1, 2], \e -> sum([z for z in [1, 2, 3] if z > e]))])
+    out << sum([sum(g) for _ -> g in groupby([1, 1, 2], \e -> sum([z for z in [1, 2, 3] if z > e]))])
 "#}, "[() -> 4]")]
 #[case::a_conditional_on_the_element(indoc! {r#"
     out = test_sink()
-    out << sum([sum(g) for g in groupby([1, 1, 2], \e -> (e if e > 1 else 0))])
+    out << sum([sum(g) for _ -> g in groupby([1, 1, 2], \e -> (e if e > 1 else 0))])
 "#}, "[() -> 4]")]
 #[case::a_union(indoc! {r#"
     out = test_sink()
-    out << sum([sum(g) for g in groupby([1, 1, 2], \e -> sum([1, 2] ++ [3, 4]))])
+    out << sum([sum(g) for _ -> g in groupby([1, 1, 2], \e -> sum([1, 2] ++ [3, 4]))])
 "#}, "[() -> 4]")]
 #[case::a_conditional_collection(indoc! {r#"
     c: Bool = True
     out = test_sink()
-    out << sum([sum(g) for g in groupby([1, 2, 3, 4], \e -> e // sum(box([1, 2]) if c else box([3, 4, 5])))])
+    out << sum([sum(g) for _ -> g in groupby([1, 2, 3, 4], \e -> e // sum(box([1, 2]) if c else box([3, 4, 5])))])
 "#}, "[() -> 10]")]
 #[case::a_filter_in_the_key_reads_the_binder(indoc! {r#"
     out = test_sink()
     for i in [1, 2]:
-        out << sum([sum(g) for g in groupby([1, 1, 2], \e -> sum([z for z in [1, 2, 3] if z > i]))])
+        out << sum([sum(g) for _ -> g in groupby([1, 1, 2], \e -> sum([z for z in [1, 2, 3] if z > i]))])
 "#}, "[4, 4]")]
 fn a_group_by_whose_key_computes_with_a_collection(#[case] source: &str, #[case] expected: &str) {
     check_sink(source, expected);
@@ -1818,7 +1824,7 @@ fn a_group_by_under_a_loop_over_a_source_the_loop_filters() {
         indoc! {r#"
             out: Feed(Int)
             for i in [1, 2]:
-                out << sum([1 for g in groupby([x for x in [1, 2, 3] if x > i], \e -> e // i)])
+                out << sum([1 for _ -> g in groupby([x for x in [1, 2, 3] if x > i], \e -> e // i)])
             sum([v for v in out])
         "#},
         Value::Int(3),
@@ -1834,7 +1840,7 @@ fn a_group_by_under_a_nest_whose_key_reads_both_loops() {
             out: Feed(_)
             for i in [1, 2]:
                 for j in [1, 2]:
-                    out << sum([1 for g in groupby([1, 2, 3], \e -> e // (i + j))])
+                    out << sum([1 for _ -> g in groupby([1, 2, 3], \e -> e // (i + j))])
             sum([v for v in out])
         "#},
         Value::Int(7),
@@ -1848,7 +1854,7 @@ fn a_group_by_under_a_nest_whose_key_reads_both_loops() {
     indoc! {r#"
         out: Feed(_)
         for i in [1, 2]:
-            out << sum([1 for g in groupby([1, 2, 3], \e -> (e // i, e))])
+            out << sum([1 for _ -> g in groupby([1, 2, 3], \e -> (e // i, e))])
         sum([v for v in out])
     "#},
     "and is a tuple or record is not supported yet"
@@ -1875,7 +1881,7 @@ fn a_groupby_over_a_bound_comprehension_of_records() {
     check_tile(
         &sales_program(indoc! {r#"
             rows = [s for s in sales]
-            [sum([s.amount for s in g]) for g in groupby(rows, \r -> r.region)]
+            [sum([s.amount for s in g]) for _ -> g in groupby(rows, \r -> r.region)]
         "#}),
         per_region(Tile::Scalar(ColumnValue::Ints(vec![40, 300]))),
     );
@@ -1886,12 +1892,12 @@ fn a_groupby_over_a_bound_comprehension_of_records() {
 #[rstest]
 #[case::one_bound_grouping(indoc! {r#"
     gs = groupby(sales, \r -> r.region)
-    a = [sum([s.amount for s in g]) for g in gs]
-    b = [sum([s.qty for s in g]) for g in gs]
+    a = [sum([s.amount for s in g]) for _ -> g in gs]
+    b = [sum([s.qty for s in g]) for _ -> g in gs]
     "#})]
 #[case::two_inline_groupings(indoc! {r#"
-    a = [sum([s.amount for s in g]) for g in groupby(sales, \r -> r.region)]
-    b = [sum([s.qty for s in g]) for g in groupby(sales, \r -> r.region)]
+    a = [sum([s.amount for s in g]) for _ -> g in groupby(sales, \r -> r.region)]
+    b = [sum([s.qty for s in g]) for _ -> g in groupby(sales, \r -> r.region)]
     "#})]
 fn two_per_group_collections_held_in_a_record(#[case] bindings: &str) {
     check_tile(&per_region_record(bindings), expected_per_region_record());
@@ -1918,7 +1924,7 @@ fn expected_per_region_record() -> Tile {
     )
 }
 
-/// A nested `for` over a group's rows, `[r for g in groupby(xs, \s -> s) for r in g]`, runs to
+/// A nested `for` over a group's rows, `[r for _ -> g in groupby(xs, \s -> s) for r in g]`, runs to
 /// completion. It runs in a `cambra` child process with a time limit, so unbounded recursion,
 /// which aborts or exhausts the process rather than unwinding, fails this test alone.
 #[test]
@@ -1936,7 +1942,7 @@ fn a_nested_for_over_a_groups_rows() {
         &path,
         indoc::indoc! {r#"
             xs = [1, 2]
-            [r for g in groupby(xs, \s -> s) for r in g]
+            [r for _ -> g in groupby(xs, \s -> s) for r in g]
             "#},
     )
     .expect("the program file is written");

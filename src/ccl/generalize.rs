@@ -867,7 +867,12 @@ fn walk(
 /// which passes its input through and restates its domain.
 fn constructs_variant(e: &crate::ccl::Expr) -> bool {
     use crate::ccl::{Builtin, TypedExprNode};
-    let states_its_output = |b: &Builtin| matches!(b, Builtin::VariantWrap(_) | Builtin::MapDomain);
+    let states_its_output = |b: &Builtin| {
+        matches!(
+            b,
+            Builtin::VariantWrap(_) | Builtin::MapDomain | Builtin::Entries
+        )
+    };
     match &e.node {
         TypedExprNode::Builtin(b) => states_its_output(b),
         TypedExprNode::Apply { function, .. } => {
@@ -900,14 +905,37 @@ fn constructor_generalized(
             body => requantify(&p.params, body),
         });
     }
-    let mut groups: Vec<Type> = Vec::new();
-    refined_parts_naming(ty, out_of_scope, &mut groups);
-    quantified(
-        ty,
-        groups,
-        out_of_scope,
-        "a builtin whose output its use states",
-    )
+    with_binders_opened(ty, out_of_scope, |opened, out_of_scope| {
+        let mut groups: Vec<Type> = Vec::new();
+        refined_parts_naming(opened, out_of_scope, &mut groups);
+        quantified(
+            opened,
+            groups,
+            out_of_scope,
+            "a builtin whose output its use states",
+        )
+    })
+}
+
+/// `generalize` applied to `ty` with every Pi binder read by name, and the result closed again:
+/// a part the type states under a binder of its own and again opened is then one part, spelled
+/// one way, and a part read at a binder is a family over it. A name such a binder binds is the
+/// type's own, not one out of scope. A binder spelled like a name the type reads outside it is
+/// renamed apart first: a part read under the binder depends on the value it binds, which a
+/// parameter quantified outside the binder cannot.
+fn with_binders_opened(
+    ty: &Type,
+    out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
+    generalize: impl FnOnce(&Type, &dyn Fn(&crate::ccl::Name) -> bool) -> Result<Type, Ungeneralizable>,
+) -> Result<Type, Ungeneralizable> {
+    let free = crate::ccl::subst::type_free_vars(ty);
+    let mut renames = Vec::new();
+    let apart = renamed_apart(ty, &free, &mut renames);
+    let mut own = Vec::new();
+    type_binders(&apart, &mut own);
+    let out_of_scope_here = |n: &crate::ccl::Name| out_of_scope(n) && !own.contains(n);
+    let generalized = closed_deep(&generalize(&opened_deep(&apart), &out_of_scope_here)?);
+    Ok(restored_names(&generalized, &renames))
 }
 
 /// A type no generalizing makes well-scoped ([`generalized`]): it reads a binder no term binder
@@ -974,23 +1002,9 @@ pub(crate) fn generalized(
         cache.insert(key, done.clone());
         return Ok(done);
     }
-    // Generalized with every Pi binder read by name: a part the type states under a binder
-    // of its own and again opened is then one part, spelled one way. A name such a binder
-    // binds is the type's own, not one out of scope. A binder spelled like a name the type
-    // reads outside it is renamed apart first: a part read under the binder depends on the
-    // value it binds, which a parameter quantified outside the binder cannot.
-    let mut renames = Vec::new();
-    let apart = renamed_apart(ty, &free, &mut renames);
-    let mut own = Vec::new();
-    type_binders(&apart, &mut own);
-    let out_of_scope_here = |n: &crate::ccl::Name| out_of_scope(n) && !own.contains(n);
-    let generalized = closed_deep(&generalized_go(
-        &opened_deep(&apart),
-        &out_of_scope_here,
-        at,
-        cache,
-    )?);
-    let done = restored_names(&generalized, &renames);
+    let done = with_binders_opened(ty, out_of_scope, |opened, out_of_scope| {
+        generalized_go(opened, out_of_scope, at, cache)
+    })?;
     cache.insert(key, done.clone());
     Ok(done)
 }
@@ -1272,7 +1286,25 @@ fn quantified(
             Type::FamilyApp(crate::ccl::ty::FamilyApp::new(Rc::clone(&param), args))
         };
         let d = Type::refined(d, staying);
+        // The part is a type per value of the binders it reads, so where the type holds it read
+        // at other terms, as a projection's result is keyed by its input's key, it is the family
+        // applied at those.
+        let elsewhere = instances(&body, &group, &indices);
         body = abstract_deep(&body, &group, &d, out_of_scope);
+        for at in &elsewhere {
+            body = abstract_deep(
+                &body,
+                &at.apply_type(&group),
+                &at.apply_type(&d),
+                out_of_scope,
+            );
+        }
+        // A term an instance is read at was taken from the type before abstraction, its own
+        // slots the types it had there: it is typed again from the abstracted type.
+        if !elsewhere.is_empty() {
+            let whole = body.clone();
+            retype_family_args(&mut body, &param, &whole);
+        }
         // A later part can hold this one inside the terms it quotes; it is matched as the
         // abstraction leaves it.
         for later in groups.iter_mut().skip(i + 1) {
@@ -1293,6 +1325,261 @@ fn quantified(
         requires: Vec::new(),
         body,
     })))
+}
+
+/// The substitutions under which `group` occurs in `ty`, inferred by matching its predicates.
+/// Each index is bound where it occurs, and repeated occurrences must agree. Matching never
+/// enumerates assignments of unrelated subterms to the indices.
+fn instances(
+    ty: &Type,
+    group: &Type,
+    indices: &[crate::ccl::Name],
+) -> Vec<crate::ccl::subst::Subst> {
+    type Bindings = HashMap<crate::ccl::Name, Rc<crate::ccl::Expr>>;
+
+    fn parts<'a>(ty: &'a Type, base: &Type, out: &mut Vec<&'a Type>) {
+        if let Type::Refinement(b, _) = ty
+            && **b == *base
+        {
+            out.push(ty);
+        }
+        ty.walk_children(|c| parts(c, base, out));
+    }
+    fn substitution(bound: &Bindings) -> crate::ccl::subst::Subst {
+        crate::ccl::subst::Subst::of_binders(
+            bound
+                .iter()
+                .map(|(n, t)| {
+                    (
+                        n.clone(),
+                        crate::ccl::subst::Mapping::Discharge(Rc::clone(t)),
+                    )
+                })
+                .collect(),
+        )
+    }
+    fn children(e: &crate::ccl::Expr) -> Vec<(&crate::ccl::Expr, Vec<crate::ccl::Name>)> {
+        let mut out = Vec::new();
+        crate::ccl::scope::for_each_scoped_item(e, &mut |item| {
+            if let crate::ccl::scope::ScopedItem::Child { expr, binders } = item {
+                out.push((expr, binders.names().cloned().collect()));
+            }
+        });
+        out
+    }
+    fn term(
+        pattern: &crate::ccl::Expr,
+        actual: &crate::ccl::Expr,
+        indices: &[crate::ccl::Name],
+        whole: &Type,
+        mut bound: Bindings,
+        pattern_scope: &[crate::ccl::Name],
+        actual_scope: &[crate::ccl::Name],
+    ) -> Vec<Bindings> {
+        if let crate::ccl::TypedExprNode::Var(n) = &pattern.node
+            && indices.contains(n)
+            && !pattern_scope.contains(n)
+        {
+            let free = crate::ccl::ccl_utils::free_names(actual);
+            if free.contains(&crate::ccl::Name::elem())
+                || indices.iter().chain(actual_scope).any(|n| free.contains(n))
+            {
+                return Vec::new();
+            }
+            let Some(typed) = path_typed(actual, whole) else {
+                return Vec::new();
+            };
+            if let Some(first) = bound.get(n) {
+                if !crate::ccl::ty::eq_term_modulo_ty_slots(first, &typed) {
+                    return Vec::new();
+                }
+            } else {
+                bound.insert(n.clone(), Rc::new(typed));
+            }
+            return vec![bound];
+        }
+        if std::mem::discriminant(&pattern.node) != std::mem::discriminant(&actual.node) {
+            return Vec::new();
+        }
+        let lhs = children(pattern);
+        let rhs = children(actual);
+        if lhs.len() != rhs.len() {
+            return Vec::new();
+        }
+        let mut states = vec![bound];
+        for ((p, ps), (a, as_)) in lhs.iter().zip(&rhs) {
+            let mut pattern_scope = pattern_scope.to_vec();
+            pattern_scope.extend(ps.iter().cloned());
+            let mut actual_scope = actual_scope.to_vec();
+            actual_scope.extend(as_.iter().cloned());
+            states = states
+                .into_iter()
+                .flat_map(|state| term(p, a, indices, whole, state, &pattern_scope, &actual_scope))
+                .collect();
+        }
+        // A cast's filters are semantic term children although its other type slots are
+        // metadata. The final predicate comparison checks all other node attributes.
+        if let (
+            crate::ccl::TypedExprNode::Cast { target: p, .. },
+            crate::ccl::TypedExprNode::Cast { target: a, .. },
+        ) = (&pattern.node, &actual.node)
+        {
+            match (
+                crate::ccl::ccl_utils::cast_target_refinement(p),
+                crate::ccl::ccl_utils::cast_target_refinement(a),
+            ) {
+                (Some(p), Some(a)) => {
+                    let wanted: Vec<_> = p.iter().collect();
+                    states = states
+                        .into_iter()
+                        .flat_map(|state| {
+                            predicates(
+                                &wanted,
+                                &a,
+                                indices,
+                                whole,
+                                state,
+                                pattern_scope,
+                                actual_scope,
+                            )
+                        })
+                        .collect();
+                }
+                (None, None) => {}
+                _ => return Vec::new(),
+            }
+        }
+        states
+    }
+    fn predicates(
+        wanted: &[&crate::ccl::Refinement],
+        actual: &crate::ccl::RefinementSet,
+        indices: &[crate::ccl::Name],
+        whole: &Type,
+        bound: Bindings,
+        pattern_scope: &[crate::ccl::Name],
+        actual_scope: &[crate::ccl::Name],
+    ) -> Vec<Bindings> {
+        let Some((first, rest)) = wanted.split_first() else {
+            return vec![bound];
+        };
+        let mut found = Vec::new();
+        for candidate in actual.iter() {
+            let pattern = first.normal();
+            let target = candidate.normal();
+            for next in term(
+                &pattern,
+                &target,
+                indices,
+                whole,
+                bound.clone(),
+                pattern_scope,
+                actual_scope,
+            ) {
+                // A nested filter can read binders paired by its surrounding term. Its
+                // equality is checked with that entire term, where the pairing is in scope.
+                let fits = !pattern_scope.is_empty()
+                    || !actual_scope.is_empty()
+                    || crate::ccl::ty::eq_term_modulo_ty_slots(
+                        &substitution(&next).apply_expr(&pattern),
+                        &target,
+                    );
+                if fits {
+                    for bound in predicates(
+                        rest,
+                        actual,
+                        indices,
+                        whole,
+                        next,
+                        pattern_scope,
+                        actual_scope,
+                    ) {
+                        if !found.contains(&bound) {
+                            found.push(bound);
+                        }
+                    }
+                }
+            }
+        }
+        found
+    }
+    let Type::Refinement(base, wanted) = group else {
+        return Vec::new();
+    };
+    if indices.is_empty() {
+        return Vec::new();
+    }
+    let mut candidates = Vec::new();
+    parts(ty, base, &mut candidates);
+    let mut found = Vec::new();
+    let wanted: Vec<_> = wanted.iter().collect();
+    for part in candidates {
+        let Type::Refinement(_, actual) = part else {
+            unreachable!("a collected refinement")
+        };
+        for bound in predicates(&wanted, actual, indices, ty, HashMap::new(), &[], &[]) {
+            if !indices.iter().all(|n| bound.contains_key(n)) {
+                continue;
+            }
+            let s = substitution(&bound);
+            let instance = s.apply_type(group);
+            let mut replaced = false;
+            abstract_go(part, &instance, &Type::Hole, &mut replaced);
+            if replaced && instance != *group && !found.contains(&s) {
+                found.push(s);
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// `t`, a read of a binder of `ty` through tuple and field projections, typed from `ty`: the
+/// binder at the domain `ty` gives it, each projection at the component it reads. `None` where
+/// `t` is no such read.
+fn path_typed(t: &crate::ccl::Expr, ty: &Type) -> Option<crate::ccl::Expr> {
+    match &t.node {
+        crate::ccl::TypedExprNode::Var(b) => {
+            binder_domain(ty, b).map(|domain| t.clone().with_ty(domain))
+        }
+        crate::ccl::TypedExprNode::Apply { function, argument } => {
+            let crate::ccl::TypedExprNode::Proj(key) = &function.node else {
+                return None;
+            };
+            let argument = path_typed(argument, ty)?;
+            let component = match (key, argument.ty.peel_refinements()) {
+                (crate::ccl::ProjKey::Index(i), Type::Tuple(cs)) => cs.get(*i)?.clone(),
+                (crate::ccl::ProjKey::Field(l), Type::Record(fs)) => {
+                    fs.iter().find(|(f, _)| f == l)?.1.clone()
+                }
+                _ => return None,
+            };
+            let function = (**function)
+                .clone()
+                .with_ty(Type::fun(argument.ty.clone(), component.clone()));
+            Some(crate::ccl::Expr::apply(argument, function).with_ty(component))
+        }
+        _ => None,
+    }
+}
+
+/// `ty` with each argument of `param`'s applications typed again from `whole` ([`path_typed`]).
+fn retype_family_args(ty: &mut Type, param: &Rc<crate::ccl::ty::TypeParam>, whole: &Type) {
+    if let Type::FamilyApp(app) = ty
+        && Rc::ptr_eq(&app.param, param)
+    {
+        for arg in &mut app.args {
+            let typed = path_typed(&arg.term, whole).unwrap_or_else(|| {
+                panic!(
+                    "an instance of a generalized part is read at a binder's projection, got `{}`",
+                    crate::ccl::symbolic::symbolic(&arg.term)
+                )
+            });
+            arg.term = Rc::new(typed);
+        }
+        return;
+    }
+    ty.walk_children_mut(|c| retype_family_args(c, param, whole));
 }
 
 /// The type `ty` gives its binder `b`: a function's domain, a dependent tuple's component, or a
@@ -1937,5 +2224,84 @@ mod tests {
             instantiate(&generic, &incoming),
             uncurry_over_rows_of("row", "k")
         );
+    }
+    #[test]
+    fn matching_instances_derives_many_indices_and_checks_repeated_occurrences() {
+        let int = Type::Base(BaseType::Int);
+        let row = Name::fresh("row");
+        let indices: Vec<_> = (0..12).map(|i| Name::fresh(format!("i{i}"))).collect();
+        let indexed = |i: usize| Expr::var(indices[i].clone()).with_ty(int.clone());
+        let projected = |i: usize| {
+            Expr::apply(Expr::var(row.clone()), Expr::proj_index(i)).with_ty(int.clone())
+        };
+        let refined = |terms: Vec<Expr>| {
+            let sum = |ts: Vec<Expr>| {
+                ts.into_iter()
+                    .reduce(|a, b| {
+                        Expr::binop(a, BinOpKind::Arithmetic(crate::ccl::ArithmeticKind::Add), b)
+                            .with_ty(int.clone())
+                    })
+                    .unwrap()
+            };
+            let comparison = |kind, rhs| {
+                Refinement::born(Rc::new(
+                    Expr::binop(
+                        Expr::var(Name::elem()).with_ty(int.clone()),
+                        BinOpKind::Compare(kind),
+                        rhs,
+                    )
+                    .with_ty(Type::Base(BaseType::Bool)),
+                ))
+            };
+            Type::refined(
+                int.clone(),
+                [
+                    comparison(CompareKind::Greater, sum(terms[..6].to_vec())),
+                    comparison(
+                        CompareKind::Less,
+                        sum(terms[6..]
+                            .iter()
+                            .cloned()
+                            .chain([terms[5].clone()])
+                            .collect()),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            )
+        };
+        let group = refined((0..12).map(indexed).collect());
+        let part = refined((0..12).map(projected).collect());
+        // `instances` reads a type already opened at its binders.
+        let whole = |part| Type::Fun {
+            name: Some(row.clone()),
+            fun_kind: FunKind::Compute,
+            domain: Box::new(Type::Tuple(vec![int.clone(); 12])),
+            codomain: Box::new(part),
+            capabilities: crate::ccl::capabilities::Capabilities::none(),
+        };
+        let matched = instances(&whole(part.clone()), &group, &indices);
+        assert_eq!(matched.len(), 1);
+        assert_eq!(matched[0].apply_type(&group), part);
+        let mut inconsistent: Vec<_> = (0..12).map(projected).collect();
+        inconsistent[5] = projected(4);
+        let mut rhs = (0..12).map(projected).collect::<Vec<_>>();
+        rhs[5] = projected(3);
+        let Type::Refinement(_, first) = refined(inconsistent) else {
+            unreachable!()
+        };
+        let Type::Refinement(_, second) = refined(rhs) else {
+            unreachable!()
+        };
+        let bad = Type::refined(
+            int.clone(),
+            [
+                first.iter().next().unwrap().clone(),
+                second.iter().nth(1).unwrap().clone(),
+            ]
+            .into_iter()
+            .collect(),
+        );
+        assert!(instances(&whole(bad), &group, &indices).is_empty());
     }
 }

@@ -841,20 +841,17 @@ fn a_record_equality_in_a_refinement_predicate_is_not_discharged() {
 ///
 /// Neither program is well-typed today: a literal key carries `__elem == "a"`, and a
 /// refinement is discharged by matching the predicate rather than by proving it, so
-/// `__elem != ""` is not satisfied. The plain annotation is an `Annotation mismatch`
-/// against the whole `Σ`, which names the annotation the program wrote. The mutable one
-/// boxes the map, so the key domain is a candidate of the box's binder, and the report is
-/// that candidate's membership in the annotated kind, decided where the position
-/// materializes.
+/// `__elem != ""` is not satisfied. The plain annotation is an `Annotation mismatch` between
+/// the two `Map` types, the inferred key the map's own domain. The mutable one reports the
+/// initializer's first key against the declared key type.
 #[test]
 fn a_refined_map_key_no_key_satisfies() {
     check_compile_error(
         indoc::indoc! {r#"
-
             m: Map({String where _ != ""}, Int) = map([("a", 1), ("z", 2)])
             m
             "#},
-        r#"Annotation mismatch: annotated as Map({String where _ != ""}, Int), but inferred as {String where _ in ["a", "z"]} |=> Int"#,
+        r#"Annotation mismatch: annotated as Map({String where _ != ""}, Int), but inferred as Map({String where _ in ["a", "z"]}, Int)"#,
     )
 }
 
@@ -862,11 +859,10 @@ fn a_refined_map_key_no_key_satisfies() {
 fn a_refined_map_key_in_a_mut_annotation_is_reported() {
     check_compile_error(
         indoc::indoc! {r#"
-
-            m: Mut(Map({String where _ != ""}, Int)) := box(map([("a", 1), ("z", 2)]))
+            m: Mut(Map({String where _ != ""}, Int)) := map([("a", 1), ("z", 2)])
             m
             "#},
-        r#"Type mismatch for collection annotation: expected Map({String where _ != ""}, _), found {String where _ in ["a", "z"]}"#,
+        r#"Type mismatch for initializer of mutable `m`: expected {String where _ != ""}, found {String where _ == "a"}"#,
     )
 }
 
@@ -2083,11 +2079,11 @@ q = id(g)
 fn a_refinement_in_an_invariant_nominal_argument_survives_the_barrier() {
     check_scalar(
         indoc! {r#"
-type Index(K):
-    index(FullMap(K, Int))
+type Index(K, V: K => Type):
+    index(FullMap(K, V))
 def f(x: Int):
     r ^= x
-    Index::index(map([(1, 10), (2, 20)]))
+    Index::index(groupby([1, 2], \v -> v))
 i = f(1)
 7
         "#},
@@ -2161,16 +2157,6 @@ i = f(1)
 #[case::a_codomain(indoc::indoc! {r#"
     f: Int => _ |=> Int = \n -> [n, n]
     sum(f(3))"#}, 6)]
-// A group-by's codomain reads its key, and a hole in the annotation's codomain is filled under
-// the annotation's binder.
-#[case::a_group_by(
-    indoc! {"
-        xs = [1, 2, 3]
-        g: _ |=> _ = groupby(xs, \\x -> x > 1)
-        sum([sum(v) for v in g])
-    "},
-    6
-)]
 fn a_data_function_type_admits_both_collections(#[case] code: &str, #[case] expected: i64) {
     check_scalar(code, Value::Int(expected));
 }

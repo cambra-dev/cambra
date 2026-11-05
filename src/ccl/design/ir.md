@@ -579,7 +579,7 @@ it belongs to ([chl-spec.md, "9.12 Field labels and tags belong to a
 module"](../../../docs/chl-spec.md#912-field-labels-and-tags-belong-to-a-module)). Record types
 and terms, projections, variant constructors and patterns, and `FieldKey::Name` all hold one. The
 root module's labels have no module path, and they share that namespace with the labels the
-compiler builds for itself and with the tags of nominal types' constructors (`nominal::ctor_tag`),
+compiler builds for itself and with the tags of nominal types' constructors (`NominalDecl::tag`),
 `Option`'s `some` and `none` among them. A run's top-level mutable variable is labeled in its run
 (`Name::field_key`). At run time, where records are keyed by strings, a label is its
 `Label::runtime_key`: `name`, `module::name` for another module's label, and `@run::name` for a

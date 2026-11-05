@@ -877,7 +877,7 @@ fn test_nested_generator_functions(#[case] code: &str, #[case] expected: Tile) {
         for hx in hxs:
             yield hx * 3
     out = test_sink()
-    out << sum([sum(g) for g in groupby([1, 1, 2], \e -> max(triples([1, 2])) // e)])
+    out << sum([sum(g) for _ -> g in groupby([1, 1, 2], \e -> max(triples([1, 2])) // e)])
 "#}, "[() -> 4]")]
 #[case::in_a_key_under_a_loop(indoc! {r#"
     def triples(hxs):
@@ -885,7 +885,7 @@ fn test_nested_generator_functions(#[case] code: &str, #[case] expected: Tile) {
             yield hx * 3
     out = test_sink()
     for i in [1, 2]:
-        out << sum([sum(g) for g in groupby([1, 1, 2], \e -> max(triples([1, 2])) * i)])
+        out << sum([sum(g) for _ -> g in groupby([1, 1, 2], \e -> max(triples([1, 2])) * i)])
 "#}, "[4, 4]")]
 fn a_generator_called_in_a_predicate(#[case] source: &str, #[case] expected: &str) {
     check_sink(source, expected);
@@ -1107,7 +1107,7 @@ fn a_generalized_sibling_shares_a_monomorphic_binding(#[case] code: &str) {
         def big(g):
             [z * 2 for z in g]
     "#},
-    r"[big(g) for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    r"[big(g) for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
     "[() -> [[2, 4], [2 -> 6, 3 -> 8, 4 -> 10], [5 -> 12, 6 -> 14, 7 -> 16]]]"
 )]
 #[case::filtered(
@@ -1115,7 +1115,7 @@ fn a_generalized_sibling_shares_a_monomorphic_binding(#[case] code: &str) {
         def big(g):
             [z * 2 for z in g if z > 1]
     "#},
-    r"[big(g) for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    r"[big(g) for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
     "[() -> [[1 -> 4], [2 -> 6, 3 -> 8, 4 -> 10], [5 -> 12, 6 -> 14, 7 -> 16]]]"
 )]
 #[case::through_a_binding(
@@ -1124,7 +1124,7 @@ fn a_generalized_sibling_shares_a_monomorphic_binding(#[case] code: &str) {
             h = [y for y in g if y > 1]
             [sum([y for y in h if y > x]) for x in h]
     "#},
-    r"[big(g) for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    r"[big(g) for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
     "[() -> [[1 -> 0], [2 -> 9, 3 -> 5, 4 -> 0], [5 -> 15, 6 -> 8, 7 -> 0]]]"
 )]
 #[case::with_a_second_argument(
@@ -1132,7 +1132,7 @@ fn a_generalized_sibling_shares_a_monomorphic_binding(#[case] code: &str) {
         def above(g, t):
             [z for z in g if z > t]
     "#},
-    r"[above(g, 2) for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    r"[above(g, 2) for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
     "[() -> [[], [2 -> 3, 3 -> 4, 4 -> 5], [5 -> 6, 6 -> 7, 7 -> 8]]]"
 )]
 #[case::calling_another_definition(
@@ -1142,7 +1142,7 @@ fn a_generalized_sibling_shares_a_monomorphic_binding(#[case] code: &str) {
         def big(g):
             sum(small(g))
     "#},
-    r"[big(g) for g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
+    r"[big(g) for _ -> g in groupby([1, 2, 3, 4, 5, 6, 7, 8], \e -> e // 3)]",
     "[() -> [3, 15, 24]]"
 )]
 #[case::used_twice(
@@ -1150,7 +1150,7 @@ fn a_generalized_sibling_shares_a_monomorphic_binding(#[case] code: &str) {
         def big(g):
             [z * 2 for z in g]
     "#},
-    r"[(big(g), big(g)) for g in groupby([1, 2, 3, 4], \e -> e // 3)]",
+    r"[(big(g), big(g)) for _ -> g in groupby([1, 2, 3, 4], \e -> e // 3)]",
     "[() -> [(_0: [2, 4], _1: [2, 4]), (_0: [2 -> 6, 3 -> 8], _1: [2 -> 6, 3 -> 8])]]"
 )]
 fn a_definition_applied_to_each_group(
@@ -1180,7 +1180,7 @@ fn a_definition_applied_to_each_group(
 /// `Box1` is declared.
 #[rstest]
 #[case::function(indoc! {r#"
-    nested = [groupby(grp, \x -> x > 3) for grp in groupby([1, 2, 3, 4], \x -> x > 2)]
+    nested = [groupby(grp, \x -> x > 3) for _ -> grp in groupby([1, 2, 3, 4], \x -> x > 2)]
     def same(V, x: V) => V:
         x
     n = same(nested)
@@ -1188,12 +1188,12 @@ fn a_definition_applied_to_each_group(
 #[case::constructor(indoc! {r#"
     type Box1(V) = V
 
-    nested = [groupby(grp, \x -> x > 3) for grp in groupby([1, 2, 3, 4], \x -> x > 2)]
+    nested = [groupby(grp, \x -> x > 3) for _ -> grp in groupby([1, 2, 3, 4], \x -> x > 2)]
     n = Box1::new(nested).extract()
 "#})]
 fn a_type_parameter_instantiated_at_nested_groups(#[case] code: &str) {
     check_scalar(
-        &format!("{code}\nsum([sum([sum(inner) for inner in outer]) for outer in n])"),
+        &format!("{code}\nsum([sum([sum(inner) for _ -> inner in outer]) for outer in n])"),
         Value::Int(10),
     );
 }

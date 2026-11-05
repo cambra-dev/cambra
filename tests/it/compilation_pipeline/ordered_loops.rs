@@ -18,7 +18,7 @@ use rstest_log::rstest;
 #[case::a_map_by_key(indoc! {"
     m = map([3 -> 30, 1 -> 10, 2 -> 20])
     s := 0
-    for v in m:
+    for _ -> v in m:
         s := s * 100 + v
     s
 "}, 102030)]
@@ -40,7 +40,7 @@ use rstest_log::rstest;
         for v in c:
             last := v
         last + 0
-    lastof([1, 5, 2]) * 100 + lastof(map([2 -> 7, 1 -> 9]))
+    lastof([1, 5, 2]) * 100 + lastof([v for _ -> v in map([2 -> 7, 1 -> 9])])
 "}, 207)]
 #[case::a_nominal_key_by_its_declarations_order(indoc! {"
     type Q = {zeta: Int, alpha: Int}
@@ -48,7 +48,7 @@ use rstest_log::rstest;
     instance Orderable(Q, Q)
     m = map([Q::new((zeta=1, alpha=9)) -> 10, Q::new((zeta=2, alpha=0)) -> 20])
     s := 0
-    for v in m:
+    for _ -> v in m:
         s := s * 100 + v
     s
 "}, 1020)]
@@ -59,14 +59,14 @@ use rstest_log::rstest;
     instance Orderable(P, P)
     m = map([P::new(2, 0) -> 20, P::new(1, 9) -> 10])
     s := 0
-    for v in m:
+    for _ -> v in m:
         s := s * 100 + v
     s
 "}, 1020)]
 #[case::a_loop_that_only_feeds_needs_no_order(indoc! {"
     o: Feed(_)
     m = map([(a=1) -> 10, (a=2) -> 20])
-    for v in m:
+    for _ -> v in m:
         o << v
     sum(o)
 "}, 30)]
@@ -110,17 +110,17 @@ fn comparisons_agree(#[case] code: &str, #[case] expected: i64) {
 #[case::record_keys(indoc! {"
     m = map([(a=1) -> 10, (a=2) -> 20])
     last := 0
-    for v in m:
+    for _ -> v in m:
         last := v
     last
-"}, "positions of type `{a: Int}`, which have no order")]
+"}, "keys of type `{a: Int}`, which have no order")]
 #[case::keys_a_parameter_states(indoc! {"
     def total(m: Map({a: Int}, Int)):
         t := 0
-        for v in m:
+        for _ -> v in m:
             t += v
         t + 0
-    total(box(map([(a=1) -> 10])))
+    total(map([(a=1) -> 10]))
 "}, "keys of type `{a: Int}`, which have no order")]
 #[case::a_concatenation(indoc! {"
     acc := 0
@@ -238,23 +238,42 @@ fn an_escaping_raise_orders_a_loop_of_blocks() {
 }
 
 #[rstest]
-#[case::a_list("[1, 2, 3]", false)]
-#[case::a_concatenation("[1, 2] ++ [3]", true)]
-#[case::a_map_with_record_keys("map([(a=1) -> 1, (a=2) -> 2])", true)]
-fn a_raising_callback_requires_ordered_positions(#[case] source: &str, #[case] refused: bool) {
+#[case::a_list("[1, 2, 3]", "Int", "x", false)]
+#[case::a_concatenation("[1, 2] ++ [3]", "Int", "x", true)]
+#[case::a_map_with_record_keys("map([(a=1) -> 1, (a=2) -> 2])", "{{a: Int}, Int}", "x.1", true)]
+#[case::a_maps_values_with_record_keys(
+    "[v for _ -> v in map([(a=1) -> 1, (a=2) -> 2])]",
+    "Int",
+    "x",
+    true
+)]
+#[case::a_maps_values_with_integer_keys(
+    "[v for _ -> v in map([2 -> 2, 1 -> 1])]",
+    "Int",
+    "x",
+    false
+)]
+fn a_raising_callback_requires_ordered_positions(
+    #[case] source: &str,
+    #[case] element: &str,
+    #[case] raised: &str,
+    #[case] refused: bool,
+) {
     let code = indoc! {"
         def each(f, xs):
             for x in xs:
                 f(x)
             0
-        def fail(x: Int) => Int:
-            raise x
+        def fail(x: ELEMENT) => Int:
+            raise RAISED
         try:
             each(fail, SOURCE)
         except Int as e:
             e
     "}
-    .replace("SOURCE", source);
+    .replace("SOURCE", source)
+    .replace("ELEMENT", element)
+    .replace("RAISED", raised);
     if refused {
         check_compile_error(
             &code,
@@ -317,8 +336,8 @@ fn a_callback_uses_the_declared_order_of_map_keys() {
                 f(x)
             0
         pub def each_map(K, xs: Map(K, Int)) requires Orderable(K, K):
-            def fail(x: Int) => Int:
-                raise x
+            def fail(x: {K, Int}) => Int:
+                raise x.1
             try:
                 each(fail, xs)
             except Int as e:
@@ -481,22 +500,23 @@ fn a_printed_ordering_contract_can_annotate_its_definition(
 }
 
 #[rstest]
-#[case::integer_keys("box(map([2 -> 20, 1 -> 10]))")]
-#[case::string_keys(r#"box(map(["b" -> 20, "a" -> 10]))"#)]
-fn a_callback_requirement_accepts_orderable_map_keys(#[case] source: &str) {
+#[case::integer_keys("Int", "map([2 -> 20, 1 -> 10])")]
+#[case::string_keys("String", r#"map(["b" -> 20, "a" -> 10])"#)]
+fn a_callback_requirement_accepts_orderable_map_keys(#[case] key: &str, #[case] source: &str) {
     let code = indoc! {"
         def each(f, xs):
             for x in xs:
                 f(x)
             0
-        def fail(x: Int) => Int:
-            raise x
+        def fail(x: {KEY, Int}) => Int:
+            raise x.1
         try:
             each(fail, SOURCE)
         except Int as e:
             e
     "}
-    .replace("SOURCE", source);
+    .replace("SOURCE", source)
+    .replace("KEY", key);
     check_scalar(&code, Value::Int(10));
 }
 

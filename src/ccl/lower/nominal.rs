@@ -25,7 +25,7 @@ use super::functions::refuse_misannotated_type_binder;
 use super::stmts::{is_kind, is_mut_annotation, lower_type_expr, reserved_name};
 use super::{LoweringContext, LoweringError};
 use crate::ccl::ccl_utils::strip_refinements;
-use crate::ccl::nominal::{NominalCtor, NominalDecl, WrittenOrder};
+use crate::ccl::nominal::{NominalCtor, NominalDecl, StdCollection, WrittenOrder};
 use crate::ccl::ty::{PolyParam, PolyType, TypeKind, TypeParam, TypeParamId};
 use crate::ccl::{
     Expr, FieldKey, Lit, MethodCandidate, Name, Pattern, PatternHead, Type, TypedBinding,
@@ -570,6 +570,48 @@ fn find_cycle(edges: &[Vec<usize>]) -> Option<Vec<usize>> {
     })
 }
 
+/// The name of the one constructor the compiler gives a `@Builtin` type, whose payload is the
+/// type's representation. It is private to `std`, so no other module builds or matches it.
+const BUILTIN_REP: &str = "rep";
+
+/// The representation of the `@Builtin` type `decl` (`docs/chl-spec.md`, "9.16 The std
+/// root"): `Set(K)` and `Map(K, V)` are sums over a subset of `K`, `Σ (𝐷 : SubtypesOf(𝐾)). 𝐷 ⤇
+/// 𝑉`, which no CHL type spells (`src/ccl/design/collections.md`, "Telling `Set` and `Map`
+/// apart").
+fn builtin_representation(
+    decl: &TypeDecl,
+    head: &Rc<NominalDecl>,
+    ctx: &LoweringContext,
+) -> Result<Type, LoweringError> {
+    let Some(at) = decl.builtin else {
+        return Err(LoweringError::unsupported(
+            decl.name.span,
+            format!(
+                "`type {}` declares no constructors; a type lists its constructors or writes \
+                 `= R`",
+                decl.name.node
+            ),
+        ));
+    };
+    if !super::traits::lowering_std(ctx) {
+        return Err(super::traits::builtin_outside_std(at));
+    }
+    let param = |i: usize| Type::Param(Rc::clone(&head.params[i]));
+    match (StdCollection::named(&decl.name.node), head.params.len()) {
+        (Some(StdCollection::Set), 1) => Ok(Type::set_of(param(0))),
+        (Some(StdCollection::Map), 2) => Ok(Type::map_of(param(0), param(1))),
+        _ => Err(LoweringError::internal(
+            decl.name.span,
+            format!(
+                "the compiler supplies no representation for `@Builtin type {}` over {} \
+                 parameters",
+                decl.name.node,
+                head.params.len()
+            ),
+        )),
+    }
+}
+
 /// Lower `decl`'s constructors, with its type parameters in scope.
 fn lower_constructors(
     decl: &TypeDecl,
@@ -596,7 +638,29 @@ fn lower_constructors(
     }
     let result = (|| {
         let mut ctors: Vec<NominalCtor> = Vec::new();
+        if let Some(at) = decl.builtin
+            && !matches!(decl.body, TypeDeclBody::Builtin)
+        {
+            return Err(LoweringError::unsupported(
+                at,
+                format!(
+                    "a `@Builtin` type's representation is the compiler's, so `type {}` has no \
+                     constructors and no `= R`",
+                    decl.name.node
+                ),
+            ));
+        }
         match &decl.body {
+            TypeDeclBody::Builtin => {
+                let payload = builtin_representation(decl, head, ctx)?;
+                let mut rep = NominalCtor::unwritten(
+                    SmolStr::new_static(BUILTIN_REP),
+                    decl.name.span,
+                    vec![(None, payload)],
+                );
+                rep.public = false;
+                ctors.push(rep);
+            }
             TypeDeclBody::Single(ty) => {
                 let lowered = lower_parameter_type(ty, ctx)?;
                 ctors.push(NominalCtor {
@@ -1909,7 +1973,7 @@ pub(super) fn inherent_params(block: &ImplBlock) -> Result<Vec<Spanned<SmolStr>>
     let ty = &block.ty.node;
     if let Some(v) = block.vars.first() {
         return Err(LoweringError::unsupported(
-            v.span,
+            v.name_span,
             format!(
                 "`impl {ty}(…)` declares functions of the type `{ty}`, whose head names its \
                  parameters; `forall` declares the type variables of an `instance` of a trait"

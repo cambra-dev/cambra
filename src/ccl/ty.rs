@@ -3619,6 +3619,16 @@ impl Type {
         Type::Nominal(Rc::clone(option), vec![payload])
     }
 
+    /// The payload type of the constructor `ctor` of this nominal type, at its arguments, or
+    /// `None` when this is no nominal type declaring `ctor`.
+    pub fn nominal_payload(&self, ctor: &str) -> Option<Self> {
+        let Type::Nominal(decl, args) = self.peel_refinements() else {
+            return None;
+        };
+        let declared = decl.ctor(ctor)?.payload();
+        Some(decl.instantiate(&declared, args))
+    }
+
     /// The payload of an [`option_of`](Self::option_of), or `None` for any other type.
     ///
     /// The constructor's inverse, for a rule that recovers an answer it recorded earlier
@@ -3916,6 +3926,18 @@ impl Type {
     /// witness — dropping that binder is the same silent loss as flipping the kind, and
     /// it is worse, because the rebuilt domain is usually the witness itself and a
     /// `WitnessRef` outside its binder means nothing at all.
+    /// What [`Builtin::Entries`](crate::ccl::Builtin::Entries) gives of a collection of this
+    /// type: over the same keys, and the same witness for a sum, each value beside its key.
+    /// `None` for a type that is not a collection.
+    pub fn entries_of(&self) -> Option<Type> {
+        let (keys, values) = (self.domain()?, self.codomain()?);
+        Some(Type::fun_like(
+            self,
+            keys.clone(),
+            Type::Tuple(vec![keys, values]),
+        ))
+    }
+
     pub fn fun_like(exemplar: &Type, domain: Self, codomain: Self) -> Self {
         match exemplar {
             Type::Fun {
@@ -4136,6 +4158,12 @@ impl Type {
     /// Whether a [`Type::Nominal`] occurs anywhere in this type.
     pub fn mentions_nominal(&self) -> bool {
         self.holds_type(&|ty| matches!(ty, Type::Nominal(..)))
+    }
+
+    /// Whether a [`Type::Nominal`] that `std` does not declare occurs anywhere in this type
+    /// ([`crate::ccl::nominal::NominalDecl::in_std`]).
+    pub fn mentions_nominal_outside_std(&self) -> bool {
+        self.holds_type(&|ty| matches!(ty, Type::Nominal(decl, _) if !decl.in_std()))
     }
 
     pub fn peel_refinements(&self) -> &Type {
@@ -4724,10 +4752,14 @@ impl Type {
             | Type::DataSource(_)
             | Type::ChanDom(..)
             | Type::WitnessRef(_)
-            | Type::WitnessProjection(_)
             | Type::Param(_)
             | Type::FamilyApp(_)
             | Type::Txn => {}
+            Type::WitnessProjection(p) => {
+                if let Some(sum) = &p.read_through {
+                    f(sum);
+                }
+            }
             // A `Poly`'s bounds are its children as its body is: a pass that rewrites
             // types (uniquify's α-renaming, `subst`) must reach a refinement in a bound.
             Type::Poly(poly) => poly.types().for_each(f),
@@ -4801,10 +4833,14 @@ impl Type {
             | Type::DataSource(_)
             | Type::ChanDom(..)
             | Type::WitnessRef(_)
-            | Type::WitnessProjection(_)
             | Type::Param(_)
             | Type::FamilyApp(_)
             | Type::Txn => {}
+            Type::WitnessProjection(p) => {
+                if let Some(sum) = p.read_through_mut() {
+                    f(sum);
+                }
+            }
             Type::Poly(poly) => Rc::make_mut(poly).types_mut().for_each(f),
             Type::Nominal(_, args) => args.iter_mut().for_each(f),
             Type::Split { input, output } => {
@@ -4988,6 +5024,11 @@ pub struct WitnessProjection {
     pub term: Rc<TypedExpr>,
     /// Which of the sum's binders, outermost first.
     pub position: usize,
+    /// The sum an elimination read the term through, where the term's own type slot showed none
+    /// when the projection was made ([`WitnessProjection::through`]). Equality and hashing skip
+    /// it, as they skip the term's type slots. Its codomain is unit: the projection needs the selected binder and its
+    /// type kind.
+    read_through: Option<Rc<Type>>,
     /// The term's normal form, what equality and hashing compare. Private, so a projection is
     /// built through [`WitnessProjection::new`].
     normal: NormalFormCache,
@@ -4998,8 +5039,40 @@ impl WitnessProjection {
         WitnessProjection {
             term,
             position,
+            read_through: None,
             normal: NormalFormCache::default(),
         }
+    }
+
+    /// `σᵢ(term)` for an elimination that reads `term` through a settled sum, `sum()` spelled in
+    /// the term's scope. The projection reads its binder's kind off the term's type, and a term
+    /// whose type slot shows no sum yet keeps `sum()` to read instead: a loop source read through
+    /// an associated type (`Iterable::elements`) has a variable there while its obligation
+    /// settles. The term itself is left as it is, for every reader that meets it once its type
+    /// resolves. A sum whose witness ranges over a candidate inference has not settled is not
+    /// kept: the copy's variable is not the one the term's type resolves through, and would read
+    /// back as no candidate.
+    pub fn through(term: &Rc<TypedExpr>, sum: impl FnOnce() -> Type, position: usize) -> Self {
+        let mut projection = WitnessProjection::new(Rc::clone(term), position);
+        if term.ty.peel_refinements().sum().is_none() {
+            let mut kept = sum().peel_refinements().clone();
+            // A unit codomain keeps the sum binders without retaining unrelated element variables.
+            if let Type::Fun { codomain, .. } = &mut kept {
+                **codomain = Type::Base(BaseType::Unit);
+            }
+            if kept.sum().is_some_and(|ws| {
+                ws.iter()
+                    .all(|w| w.type_kind().children().iter().all(names_no_variable))
+            }) {
+                projection.read_through = Some(Rc::new(kept));
+            }
+        }
+        projection
+    }
+
+    /// The saved sum is a type child in the projection's scope, beside its quoted term.
+    pub(crate) fn read_through_mut(&mut self) -> Option<&mut Type> {
+        self.read_through.as_mut().map(Rc::make_mut)
     }
 
     /// The term's normal form ([`crate::ccl::ccl_utils::normal_form`]).
@@ -5014,10 +5087,37 @@ impl WitnessProjection {
         normal
     }
 
-    /// The witness this projects, as the term's own type binds it.
+    /// The witness this projects, as the term's own type binds it, or as the sum the projection
+    /// was read through does while the term's type shows none.
     pub fn witness(&self) -> Option<&Witness> {
-        self.term.ty.peel_refinements().sum()?.get(self.position)
+        let sum = match self.term.ty.peel_refinements().sum() {
+            Some(sum) => sum,
+            None => self.read_through.as_deref()?.peel_refinements().sum()?,
+        };
+        sum.get(self.position)
     }
+}
+
+/// Whether `ty` holds no inference variable: a kind's candidate that inference has settled.
+fn names_no_variable(ty: &Type) -> bool {
+    fn ty_settled(ty: &Type, seen: &mut std::collections::HashSet<PredicateId>) -> bool {
+        !crate::ccl::subst::type_contains_infer(ty) && {
+            let mut settled = true;
+            ty.walk_quoted_terms(&mut |term| {
+                if seen.insert(Rc::as_ptr(term)) {
+                    settled &= term_settled(term, seen);
+                }
+            });
+            settled
+        }
+    }
+    fn term_settled(term: &TypedExpr, seen: &mut std::collections::HashSet<PredicateId>) -> bool {
+        let mut settled = true;
+        term.walk_type_slots(|ty| settled &= ty_settled(ty, seen));
+        term.walk_children(|child| settled &= term_settled(child, seen));
+        settled
+    }
+    ty_settled(ty, &mut Default::default())
 }
 
 /// The witnesses `ty` references, outside refinement predicates.
@@ -7926,5 +8026,106 @@ mod witness_subst_tests {
             Some(Type::WitnessRef(inner_binder)),
             "the inner sum's own domain still names its own binder"
         );
+    }
+}
+
+#[cfg(test)]
+mod projection_fallback_tests {
+    use super::*;
+
+    #[test]
+    fn projection_fallback_transports_its_scope() {
+        let before = crate::ccl::Name::fresh("before");
+        let after = crate::ccl::Name::fresh("after");
+        let bound = Type::refined_one(
+            Type::UIntRange(3),
+            Refinement::born(Rc::new(
+                TypedExpr::var(&before).with_ty(Type::Base(BaseType::Bool)),
+            )),
+        );
+        let sum = Type::sum_over(
+            TypeKind::SubtypesOf(Box::new(bound)),
+            None,
+            Type::Base(BaseType::Int),
+        );
+        let term = Rc::new(TypedExpr::var("carrier"));
+        let projected = Type::WitnessProjection(WitnessProjection::through(&term, || sum, 0));
+        assert!(crate::ccl::subst::type_free_vars(&projected).contains(&before));
+        let subst = crate::ccl::subst::Subst::rename(&before, &after);
+        let mut rewritten = TypedExpr::lit(Lit::Int(0)).with_ty(projected.clone());
+        subst.rewrite_expr(&mut rewritten);
+        assert!(!crate::ccl::subst::type_free_vars(&rewritten.ty).contains(&before));
+        assert!(crate::ccl::subst::type_free_vars(&rewritten.ty).contains(&after));
+        let pi = Type::pi(
+            before.clone(),
+            Type::Base(BaseType::Bool),
+            projected.clone(),
+        );
+        assert!(!crate::ccl::subst::type_free_vars(&pi).contains(&before));
+        let Type::Fun { codomain, .. } = &pi else {
+            panic!("a pi")
+        };
+        let reopened = crate::ccl::subst::open_codomain(&pi, codomain);
+        assert!(crate::ccl::subst::type_free_vars(&reopened).contains(&before));
+        let mut to_freshen = projected.clone();
+        let Type::WitnessProjection(p) = &mut to_freshen else {
+            panic!("a projection")
+        };
+        p.term =
+            Rc::new(TypedExpr::var("carrier").with_ty(crate::ccl::infer::solver::fresh_var(1)));
+        let fresh = crate::ccl::infer::solver::freshen_above(
+            0,
+            &to_freshen,
+            crate::ccl::infer::solver::FreshenLevel::Preserve,
+            &mut crate::ccl::infer::solver::FreshenCache::new(),
+        );
+        let Type::WitnessProjection(fresh) = fresh else {
+            panic!("a projection")
+        };
+        assert!(
+            fresh.witness().is_some(),
+            "freshening retains the saved sum"
+        );
+        let renamed = subst.apply_type(&projected);
+        let Type::WitnessProjection(projection) = renamed else {
+            panic!("a projection");
+        };
+        let kind = projection.witness().unwrap().type_kind();
+        let children = kind.children();
+        let free = crate::ccl::subst::type_free_vars(&children[0]);
+        assert!(
+            !free.contains(&before) && free.contains(&after),
+            "fallback kind must be transported: {kind}, free: {free:?}"
+        );
+    }
+    #[test]
+    fn a_fallback_retains_the_witness_without_its_unresolved_element_type() {
+        let sum = Type::sum_over(
+            TypeKind::UIntRanges,
+            None,
+            crate::ccl::infer::solver::fresh_var(1),
+        );
+        let projection = WitnessProjection::through(&Rc::new(TypedExpr::var("carrier")), || sum, 0);
+        assert!(projection.witness().is_some());
+        assert!(!crate::ccl::subst::type_contains_infer(
+            &Type::WitnessProjection(projection)
+        ));
+    }
+
+    #[test]
+    fn a_fallback_with_unresolved_quoted_types_is_not_saved() {
+        let bound = Type::refined_one(
+            Type::UIntRange(3),
+            Refinement::born(Rc::new(
+                TypedExpr::var("condition").with_ty(crate::ccl::infer::solver::fresh_var(1)),
+            )),
+        );
+        let sum = Type::sum_over(
+            TypeKind::SubtypesOf(Box::new(bound)),
+            None,
+            Type::Base(BaseType::Int),
+        );
+        let projection = WitnessProjection::through(&Rc::new(TypedExpr::var("carrier")), || sum, 0);
+        assert!(projection.witness().is_none());
     }
 }

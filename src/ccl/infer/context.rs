@@ -1405,6 +1405,7 @@ impl InferCtx {
             };
             let detail = match kind {
                 Some(TypeKind::SubtypesOf(key)) => {
+                    let key = crate::ccl::ccl_utils::strip_refinements(&key);
                     if self
                         .require_trait(
                             self.std_trait(StdTrait::Orderable),
@@ -3426,6 +3427,10 @@ impl Typing for InferCtx {
         self.instances.std_trait(named)
     }
 
+    fn associated_at(&self, trait_: &Trait, args: &[Type], name: &Assoc) -> Option<Type> {
+        self.instances.associated_at(trait_, args, name)
+    }
+
     fn defer_method(
         &mut self,
         function: &mut Expr,
@@ -4780,6 +4785,12 @@ impl Typing for InferCtx {
         _stamped: &Type,
     ) -> Type {
         match key_binder {
+            // A family's body read at a `FullMap`'s key is a variable until the family resolves
+            // (`keyed_access_types`), and a variable names no binder yet, so the discharge is
+            // suspended on it rather than judged vacuous.
+            Some(binder) if matches!(codomain, Type::Infer(_)) => {
+                Subst::discharge(binder.clone(), key.clone_preserving_ids()).apply_type(codomain)
+            }
             Some(binder) => crate::ccl::subst::discharge_codomain(binder, key, codomain),
             None => codomain.clone(),
         }

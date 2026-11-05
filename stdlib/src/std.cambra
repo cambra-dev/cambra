@@ -59,7 +59,7 @@ instance Orderable(Bool, Bool)
 # A value that is present, `some(v)`, or absent, `none`.
 #
 # The checked lookup `c[k]` answers an `Option` of this declaration, and the unwrap `e!` takes one
-# apart (docs/chl-spec.md, "Subscript and unwrap syntax [Decided]"). A module that declares its
+# apart (docs/chl-spec.md, "Subscript and unwrap syntax"). A module that declares its
 # own `Option` shadows the prelude's name, and its lookups still answer this one.
 #
 # Two options are equal when both are `none`, or both are `some` of equal values. An `Option` is
@@ -78,6 +78,33 @@ impl Option(T):
                 False
             case Option::none:
                 True
+
+# --- Collections --------------------------------------------------------------------------------
+
+# A set of distinct keys of type `K`: what `set(xs)` builds.
+#
+# A set iterates its keys (docs/chl-spec.md, "4.6 `for` — iteration"). Its keys are a subset
+# of `K`, and `Set` is covariant in `K`.
+@Builtin
+pub type Set(K)
+
+# A collection with one value of type `V` for each of its keys, some subset of `K`: what
+# `map(kvs)` builds.
+#
+# A map iterates its entries, `(k, v)`, and a lookup `m[k]` answers `Option::none` for a key it
+# lacks (docs/chl-spec.md, "3.9 Subscript and attribute access"). `Map` is covariant in `K` and
+# in `V`.
+@Builtin
+pub type Map(K, V)
+
+# A collection with a value for every key of type `K`, the value at `k` of type `V(k)`: what
+# `groupby` builds, whose groups' domains differ by key.
+#
+# A full map iterates its entries, as a map does, and its lookup `m[k]!` needs no proof that `k` is
+# present. Its constructor is private: `groupby` is the only operation that builds one
+# (docs/chl-spec.md, "6.3 Direction: collection types [Decided]").
+pub type FullMap(K, V: K => Type):
+    new((k: K) |=> V(k))
 
 # --- Arithmetic ---------------------------------------------------------------------------------
 
@@ -174,3 +201,36 @@ instance Negatable(Int):
 pub trait Iterable(C):
     Elements <: _ |=> _
     def elements(c: C) => Elements
+
+# A set iterates its keys, and a map or a full map its entries, `(k, v)`, over the collection's own
+# keys. The compiler supplies each `Elements`, which no CHL type spells.
+@Builtin
+instance forall (K) Iterable(Set(K))
+@Builtin
+instance forall (K, V) Iterable(Map(K, V))
+@Builtin
+instance forall (K, V: K => Type) Iterable(FullMap(K, V))
+
+# --- Indexing -----------------------------------------------------------------------------------
+
+# Types a subscript reads: `entries(c)` is `c` as the function from each of its keys to the value
+# there, of type `Entries`. `c[k]` looks `k` up in it, answering `Option::some` of the value when
+# `k` is present and `Option::none` when the key is known absent. Proven lookup `c[k]!` reads
+# the value directly when the key type establishes membership (docs/chl-spec.md, "Subscript and unwrap syntax").
+#
+# A structural collection is `Indexable` as itself, its `Entries` the collection and `entries`
+# the identity, which no instance states: the compiler answers it. A nominal type is `Indexable`
+# through the instance its module declares.
+@Builtin
+pub trait Indexable(C):
+    Entries <: _ |=> _
+    def entries(c: C) => Entries
+
+# A set's, a map's and a full map's entries are its representation, over the collection's own
+# keys: a set holds `unit` at each. The compiler supplies each `Entries`, which no CHL type spells.
+@Builtin
+instance forall (K) Indexable(Set(K))
+@Builtin
+instance forall (K, V) Indexable(Map(K, V))
+@Builtin
+instance forall (K, V: K => Type) Indexable(FullMap(K, V))
