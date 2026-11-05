@@ -3344,3 +3344,38 @@ fn a_loop_seeded_from_a_static_store_takes_each_delivery(#[values(1, usize::MAX)
         "the loop takes each delivery before its source yields everything"
     );
 }
+
+/// A comprehension over a live source whose rows read a value another pipeline decides: a
+/// transaction store's final value, a sum, a loop's final value. Each delivery's rows park until
+/// that pipeline has decided it, whether its push reaches the comprehension or the comprehension
+/// reads it by pull.
+#[rstest_log::rstest]
+#[case::a_store_s_final_value(indoc! {"
+    out = test_sink()
+    rs = [10, 20]
+    a: Mut(Int, Txn) := 100
+    for r in rs:
+        with begin():
+            a := a - r
+    out << [x + await_final(a) for x in source1()]
+"}, &[(0, 71), (1, 72), (2, 73), (3, 74), (4, 75)])]
+#[case::a_sum_in_a_filter(indoc! {"
+    out = test_sink()
+    ys = [1, 2]
+    out << [x for x in source1() if x > sum(ys)]
+"}, &[(3, 4), (4, 5)])]
+#[case::a_loop_s_final_value(indoc! {"
+    out = test_sink()
+    t := 0
+    for y in [1, 2]:
+        t += y
+    out << [x + t for x in source1()]
+"}, &[(0, 4), (1, 5), (2, 6), (3, 7), (4, 8)])]
+fn a_live_comprehension_reading_a_decided_value(
+    #[case] source: &str,
+    #[case] expected: &[(u64, i64)],
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let (value, _) = dispatched_live(source, rows, two_batches());
+    assert_eq!(keyed_ints(&value), expected, "{source}");
+}

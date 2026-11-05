@@ -496,16 +496,6 @@ fn run_targets(
                         if as_keys {
                             reads_as_keys.push((pipeline, read));
                         }
-                        // A row waiting on the pipeline is read again only where its push names
-                        // the row.
-                        if probe(&pusher, PipelineId(read), &everything, pipeline).is_empty() {
-                            unplace(&planner.placements, targets);
-                            return Err(Refused(format!(
-                                "{} is notified of a live source's arrivals and reads {}, whose \
-                                 pushes reach it nowhere, so no row waiting on it is read again",
-                                members.names[pipeline], members.names[read]
-                            )));
-                        }
                     }
                 }
                 notifies

@@ -1358,8 +1358,6 @@ a `Refused` error that names the shape, and pull mode runs every refused program
 - a program compiled with its sinks pulled;
 - a live source whose arrivals reach no pipeline's entry or reach one as a region that is no
   projection of its keys (below);
-- a pipeline notified of a live source's arrivals beside a pipeline it reads whose pushes reach it
-  nowhere, since no push would name a row waiting on it;
 - a pipeline read directly by a pipeline another pipeline reads;
 - a breaker with no consuming mode (`Breaker::no_consuming_mode`): a transaction store of several
   writers over positions key order does not compare, neither `UInt` positions nor a
