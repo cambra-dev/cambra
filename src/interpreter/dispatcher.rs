@@ -23,8 +23,7 @@ use intervalsets::Bounding;
 
 use crate::interpreter::tile_operators::InputId;
 use crate::interpreter::tile_operators::{
-    Breaker, BreakingProducer, FunctionGuard, Tiling, cut_before, guard_minus, keys_released_whole,
-    partition_gap,
+    Breaker, BreakingProducer, FunctionGuard, Tiling, cut_before, guard_minus, partition_gap,
 };
 use crate::interpreter::{
     Consumer, Extent, Predicate, Projection, SharedConsumer, TileGuard, Value,
@@ -252,21 +251,6 @@ impl Queue {
         true
     }
 
-    /// Append `guard`, rows the pipeline consumed and its breaker's input has not released, as one
-    /// package read again, and answer whether the queue was open to take it
-    /// ([`Dispatcher::keep_open_rows`]). Unlike [`append`](Self::append), it may name a region
-    /// appended before.
-    fn append_again(&self, guard: &TileGuard) -> bool {
-        let mut region = self.region.lock().unwrap_or_else(PoisonError::into_inner);
-        let Some(index) = self.reserve(1) else {
-            return false;
-        };
-        grow(&mut region, guard);
-        drop(region);
-        self.write(index, guard.clone());
-        true
-    }
-
     /// Reserve `count` indices while the queue is open, and answer the first; `None` once it is
     /// closed.
     fn reserve(&self, count: usize) -> Option<usize> {
@@ -331,9 +315,8 @@ struct EpochPipeline {
     acknowledged: AtomicUsize,
     phase: AtomicPhase,
     /// How many of the pipelines it reads have not finished the epoch, plus one for the seal of
-    /// the epoch where it takes arrivals and reads pipelines ([`Dispatcher::take_arrivals`]), plus
-    /// one per consume in flight whose rows a push in the epoch named, where it keeps open rows
-    /// ([`Dispatcher::end_read`]). Whichever brings it to zero closes the queue.
+    /// the epoch where it takes arrivals and reads pipelines
+    /// ([`Dispatcher::take_arrivals`]). Whichever brings it to zero closes the queue.
     unfinished: AtomicUsize,
 }
 
@@ -394,9 +377,6 @@ struct PipelineInfo {
     /// Whether it takes the arrivals of live sources although it reads pipelines
     /// ([`take_arrivals`](Dispatcher::take_arrivals)).
     arrivals: bool,
-    /// Whether it keeps the rows it consumed and its breaker's input has not released, and reads
-    /// them again where a push names them ([`keep_open_rows`](Dispatcher::keep_open_rows)).
-    keeps_open: bool,
     /// The pipelines it reads whose pushes arrive as its own keys, which no arrival names: a push
     /// of one queues the rows it names fresh, though the pipeline takes arrivals
     /// ([`queue_pushes_of`](Dispatcher::queue_pushes_of)).
@@ -438,12 +418,6 @@ struct PipelineState {
     acknowledged: AtomicUsize,
     /// For an ordered pipeline, whether a package of it is in flight, in any epoch.
     in_flight: AtomicBool,
-    /// For a pipeline that keeps open rows, its open rows, every region queued for it, and its
-    /// consumes in flight ([`OpenRows`]).
-    // shared-state-ok: regions of the pipeline's input and the epochs of the pushes that named a
-    // consume in flight, which its consumes, its finishes and the pushes to it read and write under
-    // the lock; what crosses it is guards naming regions, never a tile.
-    open: Mutex<OpenRows>,
     /// For a pipeline that parks its arrivals ([`Dispatcher::park`]), the morsels notified that
     /// the pipelines it reads have not decided yet.
     // shared-state-ok: guards naming regions of the pipeline's input, which its notifies and the
@@ -482,29 +456,6 @@ impl Decided {
             Decided::Region(region) => Decided::Region(region.union(guard)),
         }
     }
-}
-
-/// What a pipeline that keeps open rows knows of the rows it consumed
-/// ([`Dispatcher::keep_open_rows`]).
-#[derive(Default)]
-struct OpenRows {
-    /// The rows of its breaker's input it consumed and the input has not released, and which no
-    /// queue holds to read again; `None` for none.
-    rows: Option<TileGuard>,
-    /// Every region queued for it, in any epoch, `None` for none: a push queues only what of its
-    /// region is not in it.
-    queued: Option<TileGuard>,
-    /// Its consumes in flight ([`Dispatcher::begin_read`]).
-    reading: Vec<Reading>,
-}
-
-/// A consume in flight of a pipeline that keeps open rows: the package, and, per epoch a push to
-/// the pipeline landed in since the consume began, the part of the package that push named.
-struct Reading {
-    epoch: u64,
-    index: usize,
-    guard: TileGuard,
-    named: Vec<(u64, TileGuard)>,
 }
 
 impl PipelineState {
@@ -613,7 +564,6 @@ impl Dispatcher {
                 limit: usize::MAX,
                 pushes_with: pipeline,
                 arrivals: false,
-                keeps_open: false,
                 pushed_rows: Vec::new(),
                 parks: false,
                 opens: false,
@@ -630,7 +580,6 @@ impl Dispatcher {
                 queued: AtomicUsize::new(0),
                 acknowledged: AtomicUsize::new(0),
                 in_flight: AtomicBool::new(false),
-                open: Mutex::new(OpenRows::default()),
                 parked: Mutex::new(Vec::new()),
             })
             .collect();
@@ -708,14 +657,7 @@ impl Dispatcher {
             self.advance();
             return;
         }
-        let queue = &epoch.pipelines[reader.0].queue;
-        let appended = match self.infos[reader.0].keeps_open {
-            true => match unqueued(&mut self.open_of(reader.0), guard) {
-                Some(unqueued) => queue.append(reader.0, &[unqueued]),
-                None => !queue.is_closed(),
-            },
-            false => queue.append_unqueued(guard),
-        };
+        let appended = epoch.pipelines[reader.0].queue.append_unqueued(guard);
         assert!(
             appended,
             "pipeline {} takes packages before the last pipeline it reads finishes",
@@ -731,10 +673,9 @@ impl Dispatcher {
 
     /// Order `reader`'s rounds after `read`'s, a pipeline it reads, in a loop's scope: `reader`
     /// takes no push of `read`'s, and takes a package in an epoch, a round, only once `read` has
-    /// finished it. A scope's planner orders two edges so, where a pipeline cannot keep open rows
-    /// to read again (`src/interpreter/design-operators.md`, "Reading rows again"): a nested loop's
-    /// scope after the pipelines its rounds pull, and a reader after a nested loop's scope, which
-    /// pushes its store only once it is terminal.
+    /// finished it. A scope's planner orders two edges so, where a pipeline cannot park: a nested
+    /// loop's scope after the pipelines its rounds pull, and a reader after a nested loop's scope,
+    /// which pushes its store only once it is terminal.
     ///
     /// # Panics
     ///
@@ -749,35 +690,20 @@ impl Dispatcher {
         self.infos[reader.0].follows.push(read.0);
     }
 
-    /// Mark `pipeline`, which reads pipelines, as also taking the arrivals of live sources: it is
-    /// notified, sealed and closed as a source is ([`notify`](Self::notify), [`seal`](Self::seal),
-    /// [`close`](Self::close)), and its queue in an epoch closes once both the epoch's seal and
-    /// the finishes of the pipelines it reads have happened. It keeps open rows
-    /// ([`keep_open_rows`](Self::keep_open_rows)), so a row it consumes before a pipeline it reads
-    /// is final for the row is read again where that pipeline's push names it.
+    /// Have every push of `read` to `reader`, which takes arrivals and parks
+    /// ([`take_arrivals`](Self::take_arrivals), [`park`](Self::park)),
+    /// bring the rows it names: `read`'s pushes arrive as `reader`'s own keys, as an arm of a
+    /// concatenation, and no arrival names them.
     ///
     /// # Panics
     ///
-    /// When `pipeline` reads no pipeline or takes arrivals already, and when a source has been
-    /// notified, sealed or closed already, since the window's epochs then count without the mark.
-    pub fn take_arrivals(&mut self, pipeline: PipelineId) {
-        self.mark_arrivals(pipeline);
-        self.keep_open_rows(pipeline);
-    }
-
-    /// Have every push of `read` to `reader`, which takes arrivals and keeps open rows
-    /// ([`take_arrivals`](Self::take_arrivals)), queue the rows it names fresh: `read`'s pushes
-    /// arrive as `reader`'s own keys, as an arm of a concatenation, and no arrival names them.
-    ///
-    /// # Panics
-    ///
-    /// When `reader` does not read `read`, takes no arrivals, or keeps no open rows, where a push
-    /// queues no row fresh.
+    /// When `reader` does not read `read`, takes no arrivals, or does not park, where a push
+    /// brings no row.
     pub fn queue_pushes_of(&mut self, reader: PipelineId, read: PipelineId) {
         let info = &mut self.infos[reader.0];
         assert!(
-            info.reads.contains(&read.0) && info.arrivals && (info.keeps_open || info.parks),
-            "pipeline {} takes arrivals, keeps open rows, and reads pipeline {}, whose pushes it \
+            info.reads.contains(&read.0) && info.arrivals && info.parks,
+            "pipeline {} takes arrivals, parks, and reads pipeline {}, whose pushes it \
              queues",
             reader.0,
             read.0
@@ -785,16 +711,17 @@ impl Dispatcher {
         info.pushed_rows.push(read.0);
     }
 
-    /// [`take_arrivals`](Self::take_arrivals) for a pipeline that takes each epoch's package only
-    /// once the pipelines it reads have finished the epoch ([`follow`](Self::follow)), as a loop's
-    /// scope runs its rounds: it keeps no open rows, since it reads no row before those pipelines
-    /// have finished the epoch.
+    /// Mark `pipeline`, which reads pipelines, as also taking the arrivals of live sources: it is
+    /// notified, sealed and closed as a source is ([`notify`](Self::notify), [`seal`](Self::seal),
+    /// [`close`](Self::close)), and its queue in an epoch closes once both the epoch's seal and the
+    /// finishes of the pipelines it reads have happened. It takes an arrival once those pipelines
+    /// have decided it ([`park`](Self::park)) or have finished the epoch ([`follow`](Self::follow)).
     ///
     /// # Panics
     ///
     /// When `pipeline` reads no pipeline or takes arrivals already, and when a source has been
     /// notified, sealed or closed already.
-    pub fn take_arrivals_after_reads(&mut self, pipeline: PipelineId) {
+    pub fn take_arrivals(&mut self, pipeline: PipelineId) {
         self.mark_arrivals(pipeline);
     }
 
@@ -808,8 +735,8 @@ impl Dispatcher {
     ///
     /// # Panics
     ///
-    /// When `pipeline` keeps open rows or reads no pipeline, and when a source has been notified,
-    /// sealed or closed already.
+    /// When `pipeline` reads no pipeline, and when a source has been notified, sealed or closed
+    /// already.
     pub fn park(&mut self, pipeline: PipelineId) {
         let p = pipeline.0;
         assert!(
@@ -821,8 +748,8 @@ impl Dispatcher {
             "pipeline {p} parks its arrivals from before any notify, seal or close"
         );
         assert!(
-            !self.infos[p].keeps_open && !self.infos[p].reads.is_empty(),
-            "pipeline {p} parks its arrivals on the pipelines it reads, and keeps no open rows"
+            !self.infos[p].reads.is_empty(),
+            "pipeline {p} parks its arrivals on the pipelines it reads"
         );
         self.infos[p].parks = true;
     }
@@ -966,28 +893,6 @@ impl Dispatcher {
         }
     }
 
-    /// Mark `pipeline` as keeping open rows: the rows of its breaker's input it consumed and the
-    /// input has not released, which its chain answered nothing for since an input it reads was
-    /// not final for them. Each consume records the rows of its package it leaves open
-    /// ([`end_read`](Self::end_read)). A push to the pipeline queues, in the push's epoch, the
-    /// open rows its region names as one package read again, and queues fresh only what of its
-    /// region no queue of the pipeline held before, in any epoch. At the run's last epoch no row
-    /// may be open (`src/interpreter/design-operators.md`, "Reading rows again"). The pipeline
-    /// finishes its epochs in order.
-    ///
-    /// # Panics
-    ///
-    /// When `pipeline` reads its input whole ([`read_whole`](Self::read_whole)).
-    pub(crate) fn keep_open_rows(&mut self, pipeline: PipelineId) {
-        let info = &mut self.infos[pipeline.0];
-        assert!(
-            info.whole.is_none(),
-            "pipeline {} keeps open rows or reads its input whole, not both",
-            pipeline.0
-        );
-        info.keeps_open = true;
-    }
-
     /// Whether `pipeline` is notified, sealed and closed: a source, or a pipeline that takes
     /// arrivals beside the pipelines it reads ([`take_arrivals`](Self::take_arrivals)).
     fn takes_arrivals(&self, pipeline: usize) -> bool {
@@ -1006,10 +911,10 @@ impl Dispatcher {
         }
     }
 
-    /// Count one feed of `reader`'s queue in `epoch` finished: a pipeline it reads, the end of its
-    /// arrivals, or a consume in flight whose rows a push named ([`end_read`](Self::end_read)).
-    /// The last of them closes the queue, after it appends the reader's whole input where it reads
-    /// that in the run's last epoch ([`read_whole`](Self::read_whole)).
+    /// Count one feed of `reader`'s queue in `epoch` finished: a pipeline it reads, or the end of
+    /// its arrivals. The last of them closes the queue, after it appends the reader's whole input
+    /// where it reads that whole and the sources beneath it have closed
+    /// ([`read_whole`](Self::read_whole)).
     ///
     /// # Panics
     ///
@@ -1118,207 +1023,6 @@ impl Dispatcher {
         }
     }
 
-    /// What `pipeline`, which keeps open rows, knows of the rows it consumed, locked.
-    fn open_of(&self, pipeline: usize) -> std::sync::MutexGuard<'_, OpenRows> {
-        self.states[pipeline]
-            .open
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// The rows `pipeline`, which keeps open rows, has left open and no queue holds to read again.
-    #[cfg(test)]
-    pub(crate) fn open_rows(&self, pipeline: PipelineId) -> Option<TileGuard> {
-        self.state(pipeline);
-        self.open_of(pipeline.0).rows.clone()
-    }
-
-    /// Whether `pipeline` keeps open rows ([`keep_open_rows`](Self::keep_open_rows)).
-    pub(crate) fn keeps_open_rows(&self, pipeline: PipelineId) -> bool {
-        self.infos[pipeline.0].keeps_open
-    }
-
-    /// Record `package`, claimed for a pipeline that keeps open rows, as in flight, before its
-    /// breaker consumes it. A push that names its rows before [`end_read`](Self::end_read) holds
-    /// the pipeline's queue in the push's epoch open, since the consume may have read the pushing
-    /// pipeline before the region was final. A push before this call landed after its pipeline
-    /// decided the region, so the consume reads that region final. A no-op for a pipeline that
-    /// keeps no open rows.
-    pub fn begin_read(&self, package: &WorkPackage) {
-        let p = package.pipeline.0;
-        self.state(package.pipeline);
-        if !self.infos[p].keeps_open {
-            return;
-        }
-        self.open_of(p).reading.push(Reading {
-            epoch: package.epoch,
-            index: package.index,
-            guard: package.guard.clone(),
-            named: Vec::new(),
-        });
-    }
-
-    /// Record `open`, the whole rows of `package`'s guard its breaker's input has not released
-    /// whole after the consume ([`rows_left_open`]), `None` for none. The rows a push named any
-    /// part of since [`begin_read`](Self::begin_read) are queued as a package read again in that
-    /// push's epoch, whose queue the push held open, and the hold ends; the rest join the
-    /// pipeline's open rows.
-    /// It comes before the package's acknowledgement. A no-op for a pipeline that keeps no open
-    /// rows.
-    ///
-    /// # Panics
-    ///
-    /// When `package` is not in flight by `begin_read`.
-    pub fn end_read(&self, package: &WorkPackage, open: Option<TileGuard>) {
-        let p = package.pipeline.0;
-        self.state(package.pipeline);
-        if !self.infos[p].keeps_open {
-            return;
-        }
-        let mut state = self.open_of(p);
-        let at = state
-            .reading
-            .iter()
-            .position(|reading| reading.epoch == package.epoch && reading.index == package.index);
-        self.ensure(at.is_some(), || {
-            format!("pipeline {p} ends the read of a package whose read it began")
-        });
-        let reading = state.reading.swap_remove(at.expect("refused above"));
-        let mut open = open;
-        let mut held = Vec::new();
-        for (number, named) in reading.named {
-            let epoch = self
-                .epoch(number)
-                .expect("an epoch whose queue a read holds open is in the window");
-            if let Some(rows) = &open {
-                let again = rows.intersect(&whole_rows(&named));
-                if !again.is_empty() {
-                    open = nonempty(guard_minus(rows, &again));
-                    let appended = epoch.pipelines[p].queue.append_again(&again);
-                    self.ensure(appended, || {
-                        format!(
-                            "pipeline {p}'s queue in epoch {number} is held open for the rows a \
-                             push named"
-                        )
-                    });
-                }
-            }
-            held.push(epoch);
-        }
-        if let Some(open) = &open {
-            grow(&mut state.rows, open);
-        }
-        drop(state);
-        for epoch in &held {
-            self.count_toward_close(epoch, p);
-        }
-        if !held.is_empty() {
-            self.advance();
-        }
-    }
-
-    /// Land `guard`, a push or an arrival to `reader`, which keeps open rows, in `epoch`: queue the
-    /// open rows it names any part of ([`whole_rows`]) as one package read again, hold the queue
-    /// open for each consume in flight whose package holds such a row
-    /// ([`begin_read`](Self::begin_read)), and, where `fresh` cuts, queue what of it no queue of
-    /// the reader held before as the morsels `fresh` cuts it into.
-    ///
-    /// # Panics
-    ///
-    /// When the reader's queue in `epoch` is closed. Where the guard algebra has no exact
-    /// difference of the open rows and `guard`, or of `guard` and what was queued
-    /// ([`guard_minus`]).
-    fn land_open(
-        &self,
-        epoch: &EpochState,
-        reader: usize,
-        guard: &TileGuard,
-        fresh: Option<fn(&TileGuard, usize) -> Vec<TileGuard>>,
-    ) {
-        let queue = &epoch.pipelines[reader];
-        let mut state = self.open_of(reader);
-        let rows_named = whole_rows(guard);
-        if let Some(rows) = &state.rows {
-            let again = rows.intersect(&rows_named);
-            if !again.is_empty() {
-                state.rows = nonempty(guard_minus(rows, &again));
-                let appended = queue.queue.append_again(&again);
-                self.ensure(appended, || {
-                    format!("pipeline {reader} reads rows again before it finishes the epoch")
-                });
-            }
-        }
-        for reading in &mut state.reading {
-            let named = reading.guard.intersect(&rows_named);
-            if named.is_empty() {
-                continue;
-            }
-            match reading
-                .named
-                .iter_mut()
-                .find(|(number, _)| *number == epoch.number)
-            {
-                Some((_, earlier)) => *earlier = earlier.union(&named),
-                None => {
-                    let before = queue.unfinished.fetch_add(1, Ordering::AcqRel);
-                    debug_assert!(
-                        before > 0 && !queue.queue.is_closed(),
-                        "a push or an arrival lands in pipeline {reader}'s queue in epoch {} while \
-                         the pushing pipeline has not finished it or the arrivals have not ended, \
-                         so the queue is open",
-                        epoch.number
-                    );
-                    reading.named.push((epoch.number, named));
-                }
-            }
-        }
-        if let Some(cut) = fresh
-            && let Some(unqueued) = unqueued(&mut state, guard)
-        {
-            let morsels = cut(&unqueued, self.morsel_rows);
-            debug_assert!(
-                partition_gap(&unqueued, &morsels).is_none(),
-                "the morsels of a fresh region partition it: {}",
-                partition_gap(&unqueued, &morsels).unwrap_or_default()
-            );
-            let appended = queue.queue.append(reader, &morsels);
-            self.ensure(appended, || {
-                format!(
-                    "pipeline {reader} receives packages before the last pipeline it reads finishes"
-                )
-            });
-        }
-    }
-
-    /// Keep of the open rows of `pipeline`, which keeps open rows, only those its breaker's input,
-    /// of tiling `input`, has not released whole by `released` ([`rows_left_open`]), at its finish
-    /// of `epoch`, and answer them.
-    ///
-    /// # Panics
-    ///
-    /// Where the guard algebra has no exact difference of the rows and `released`
-    /// ([`guard_minus`]).
-    pub(crate) fn settle_open_rows(
-        &self,
-        pipeline: PipelineId,
-        epoch: u64,
-        released: &TileGuard,
-        input: &Tiling,
-    ) -> Option<TileGuard> {
-        self.state(pipeline);
-        let mut state = self.open_of(pipeline.0);
-        debug_assert!(
-            state.reading.iter().all(|reading| reading.epoch != epoch),
-            "pipeline {} finishes epoch {epoch} after every consume of it ended",
-            pipeline.0
-        );
-        state.rows = state
-            .rows
-            .take()
-            .and_then(|rows| rows_left_open(&rows, released, input));
-        state.rows.clone()
-    }
-
     /// Whether a claim may take `pipeline`'s packages in `epoch`: once every pipeline it follows
     /// ([`follow`](Self::follow)) has finished the epoch.
     fn takes_from(&self, pipeline: usize, epoch: &EpochState) -> bool {
@@ -1341,11 +1045,6 @@ impl Dispatcher {
     ///
     /// When `pipeline` reads no pipeline.
     pub fn read_whole(&mut self, pipeline: PipelineId, input: &Tiling) {
-        assert!(
-            !self.infos[pipeline.0].keeps_open,
-            "pipeline {} keeps open rows or reads its input whole, not both",
-            pipeline.0
-        );
         assert!(
             !self.infos[pipeline.0].reads.is_empty(),
             "pipeline {} reads its input whole only after a pipeline it reads; a source does so \
@@ -1534,9 +1233,9 @@ impl Dispatcher {
     ///
     /// # Panics
     ///
-    /// When `pipeline` takes no arrivals ([`take_arrivals`](Self::take_arrivals)) or is closed;
-    /// in a debug build, when `guard` meets a region queued for a source before in the epoch. A
-    /// pipeline that keeps open rows is queued only what of `guard` no queue held before.
+    /// When `pipeline` takes no arrivals ([`take_arrivals`](Self::take_arrivals))
+    /// or is closed; in a debug build, when `guard` meets a region queued for a source before in
+    /// the epoch.
     pub fn notify(&self, pipeline: PipelineId, guard: &TileGuard) {
         loop {
             // Read before the check: an acknowledgement the check misses advances the generation
@@ -1563,33 +1262,13 @@ impl Dispatcher {
         self.ensure_source(pipeline);
         let info = &self.infos[pipeline.0];
         debug_assert!(
-            info.keeps_open
-                || info.parks
-                || info.reads.iter().all(|read| info.follows.contains(read)),
-            "pipeline {} keeps no open rows, so it takes an arrival only after every pipeline it \
-             reads has finished the epoch, which it follows",
+            info.parks || info.reads.iter().all(|read| info.follows.contains(read)),
+            "pipeline {} parks no arrival, so it takes one only after every pipeline it reads has \
+             finished the epoch, which it follows",
             pipeline.0
         );
         if self.state(pipeline).outstanding() >= info.limit {
             return false;
-        }
-        // An arrival to a pipeline that keeps open rows lands as a push does. Its arrivals end in
-        // an epoch only at a seal or its close, which take the lock held here, so its queue in
-        // the current epoch is open.
-        if self.infos[pipeline.0].keeps_open {
-            let _sealing = self.sealing.lock().unwrap_or_else(PoisonError::into_inner);
-            self.ensure(!self.state(pipeline).closed.load(Ordering::Acquire), || {
-                format!(
-                    "pipeline {} is queued nothing once it is closed",
-                    pipeline.0
-                )
-            });
-            let epoch = self
-                .epoch(self.current.load(Ordering::Acquire))
-                .expect("the window holds the current epoch");
-            self.land_open(&epoch, pipeline.0, guard, Some(cut_positions));
-            self.advance();
-            return true;
         }
         let morsels = cut_positions(guard, self.morsel_rows);
         debug_assert!(
@@ -1842,8 +1521,7 @@ impl Dispatcher {
     /// Whether `pipeline` may finish `epoch`: it is running in it, its queue there is closed and
     /// every package in it acknowledged, and the epoch is sealed or known to be the last. Its
     /// last epoch it finishes only after every earlier one, since the breaker's `finish` there is
-    /// its last call. An ordered pipeline finishes every epoch after the earlier ones, and so does
-    /// one that keeps open rows, so the open rows its last finish checks are those of every epoch.
+    /// its last call. An ordered pipeline finishes every epoch after the earlier ones.
     fn ready(&self, pipeline: usize, epoch: &EpochState, epochs: &[Arc<EpochState>]) -> bool {
         let state = &epoch.pipelines[pipeline];
         // One read of the count and the close: nothing is reserved after the close, so the count
@@ -1854,9 +1532,7 @@ impl Dispatcher {
             && reserved & CLOSED != 0
             && state.acknowledged.load(Ordering::Acquire) == reserved & !CLOSED
             && (epoch.number < self.current.load(Ordering::Acquire) || last != UNKNOWN)
-            && ((epoch.number != last
-                && !self.infos[pipeline].ordered
-                && !self.infos[pipeline].keeps_open)
+            && ((epoch.number != last && !self.infos[pipeline].ordered)
                 || epochs
                     .iter()
                     .filter(|earlier| earlier.number < epoch.number)
@@ -1976,14 +1652,6 @@ impl Dispatcher {
             ),
         };
         self.ensure(held, refused);
-        // A consume left in flight would hold a queue open that nothing closes.
-        self.ensure(
-            !self.infos[p].keeps_open
-                || !self.open_of(p).reading.iter().any(|reading| {
-                    reading.epoch == package.epoch && reading.index == package.index
-                }),
-            || format!("pipeline {p} ends the read of a package before it acknowledges it"),
-        );
         let in_epoch = in_epoch.expect("an acknowledged package's epoch");
         // Recorded before the count that lets the next package of an ordered pipeline, or the
         // pipeline's finish of the epoch, be claimed.
@@ -2423,22 +2091,6 @@ fn grow(region: &mut Option<TileGuard>, guard: &TileGuard) {
     });
 }
 
-/// What of `guard` no queue of the pipeline whose open rows `state` holds took before, in any
-/// epoch, recorded as queued; `None` for nothing.
-///
-/// # Panics
-///
-/// Where the guard algebra has no exact difference of `guard` and what was queued
-/// ([`guard_minus`]).
-fn unqueued(state: &mut OpenRows, guard: &TileGuard) -> Option<TileGuard> {
-    let unqueued = match &state.queued {
-        Some(queued) => nonempty(guard_minus(guard, queued))?,
-        None => guard.clone(),
-    };
-    grow(&mut state.queued, &unqueued);
-    Some(unqueued)
-}
-
 /// The rows of `rows`, a guard of `input`, that `released` does not name, closed over `input`
 /// (`TileGuard::closed_over`): where a row's level is a finite range of positions, what the input
 /// released through the row's last position covers its paths past it. `None` for none.
@@ -2451,39 +2103,6 @@ fn unreleased(rows: &TileGuard, released: &TileGuard, input: &Tiling) -> Option<
         return None;
     }
     nonempty(guard_minus(rows, released).closed_over(input))
-}
-
-/// The rows `guard`, a guard of a breaker's input, names any part of: where it is a guard of a
-/// collection's keys, every key of the outermost level it names any part of, whole
-/// ([`TileGuard::touched_keys`]), and `guard` itself otherwise. A pipeline that keeps open rows
-/// reads a row again whole, since every chain can be pulled at its outermost keys and a row left
-/// open beneath them is no region every chain restates (`TileProducer::restates`). The breaker
-/// merges no part of a row twice: its input releases every key an answer holds a scalar under
-/// (`Tile::to_guard`), and a pull answers nothing its input released (`TileProducer::get`).
-fn whole_rows(guard: &TileGuard) -> TileGuard {
-    match guard {
-        TileGuard::Function(_) | TileGuard::Or(_) => {
-            TileGuard::Function(FunctionGuard::Domain(guard.touched_keys()))
-        }
-        _ => guard.clone(),
-    }
-}
-
-/// The rows of `consumed`, a guard of `input`, that a consume leaves open: the whole rows
-/// ([`whole_rows`]) of what of `consumed` the input has not released, where a key counts as
-/// released only where a release names it whole (`keys_released_whole`), not where it releases
-/// cells beneath it. `None` for none.
-///
-/// # Panics
-///
-/// Where the guard algebra has no exact difference of `consumed` and the keys released
-/// ([`guard_minus`]).
-fn rows_left_open(consumed: &TileGuard, released: &TileGuard, input: &Tiling) -> Option<TileGuard> {
-    let released = match input.is_data_function() {
-        true => keys_released_whole(released).unwrap_or_else(|| input.empty_guard()),
-        false => released.clone(),
-    };
-    unreleased(consumed, &released, input).map(|open| whole_rows(&open))
 }
 
 /// Whether no pipeline reaches itself through what it reads.
@@ -2751,15 +2370,15 @@ impl Landing<'_> {
     /// paths, as a filter reads one memo for its values and its predicate, is queued once. A
     /// reader that reads its input whole ([`Dispatcher::read_whole`]) takes no push, widened or
     /// not, and nor does one that follows the pipeline that pushed ([`Dispatcher::follow`]). A
-    /// reader that keeps open rows ([`Dispatcher::keep_open_rows`]) reads again the open rows a
-    /// push names, widened or not. A widened push queues nothing else, and nor does one to a reader
-    /// that takes arrivals, but for a push of a pipeline whose rows arrive as the reader's own keys
-    /// ([`Dispatcher::queue_pushes_of`]), which queues the rows it names.
+    /// reader that parks ([`Dispatcher::park`]) queues or parks the rows a push brings of its own,
+    /// and nothing for a widened push or one to a reader that takes arrivals, but for a push of a
+    /// pipeline whose rows arrive as the reader's own keys ([`Dispatcher::queue_pushes_of`]).
     ///
     /// # Panics
     ///
     /// When `reader` does not read the pipeline that pushed, or has begun to finish the epoch;
-    /// when the push was widened on its way to a reader that keeps no open rows; and where the
+    /// when the push was widened on its way to a reader that neither parks nor reads its input
+    /// whole; and where the
     /// guard algebra has no exact difference of `guard` and what is queued ([`guard_minus`]).
     pub fn queue(&mut self, reader: PipelineId, guard: &TileGuard) {
         let (dispatcher, epoch) = match &mut self.target {
@@ -2814,18 +2433,10 @@ impl Landing<'_> {
             }
             return;
         }
-        // A widened push names every row of the reader's input, and a pipeline that takes
-        // arrivals is queued its rows as they arrive, so neither push queues a row fresh, but for
-        // the push of a pipeline whose rows arrive as the reader's own keys.
-        if info.keeps_open {
-            let whole: fn(&TileGuard, usize) -> Vec<TileGuard> = |guard, _| vec![guard.clone()];
-            let fresh = !self.widened && (!info.arrivals || info.pushed_rows.contains(&from));
-            return dispatcher.land_open(epoch, r, guard, fresh.then_some(whole));
-        }
         dispatcher.ensure(!self.widened, || {
             format!(
                 "a push of pipeline {from} is widened to `Everything` on its way to pipeline {r}, \
-                 which keeps no open rows to read again"
+                 which neither parks nor reads its input whole"
             )
         });
         dispatcher.ensure(queue.queue.append_unqueued(guard), || {
@@ -3268,12 +2879,9 @@ pub(crate) fn consume(dispatcher: &Dispatcher, breakers: &[BreakerHandle], packa
 
 fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPackage) {
     let p = package.pipeline.0;
-    let keeps_open = dispatcher.keeps_open_rows(package.pipeline);
-    dispatcher.begin_read(&package);
     // The pushes land once the reach has returned: a breaker reached through a fan-out slot is
     // called while the walk holds the fan-out, which the push climbs.
     let mut landed = None;
-    let mut open = None;
     reach(package.pipeline, &mut |breaker, input| {
         let tiling = breaker.input_tiling(input);
         // A package carries a guard of the tiling of the pipeline that pushed it, or of this
@@ -3284,20 +2892,7 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
             "pipeline {p} consumes a guard of the tiling its breaker's input answers: {:?}",
             package.guard
         );
-        // A pipeline that keeps open rows consumes only the rows its input has not released
-        // whole: a package read again may name rows a later consume or a finish released.
-        let guard = match keeps_open {
-            true => rows_left_open(&package.guard, &breaker.input_released(input), &tiling)
-                .map(|rows| package.guard.intersect(&rows)),
-            false => Some(package.guard.clone()),
-        };
-        let Some(guard) = guard else {
-            return;
-        };
-        breaker.consume_impl(input, guard.clone());
-        if keeps_open {
-            open = rows_left_open(&guard, &breaker.input_released(input), &tiling);
-        }
+        breaker.consume_impl(input, package.guard.clone());
         if let Some(producer) = breaker.as_producer()
             && producer.pushes_while_consuming()
         {
@@ -3309,7 +2904,6 @@ fn consume_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>, package: WorkPac
     if let Some(pushes) = landed {
         dispatcher.land(pushes);
     }
-    dispatcher.end_read(&package, open);
     dispatcher.acknowledge(package);
 }
 
@@ -3337,7 +2931,7 @@ pub fn finish_epoch(dispatcher: &Dispatcher, breakers: &[BreakerHandle], pipelin
 
 /// Finish `pipeline`'s `epoch`, which has begun after consuming `consumed`: push what the epoch
 /// decided and no consume pushed, through the breaker's [`finish`][Breaker::finish], then mark it
-/// finished. A pipeline that keeps open rows first settles them ([`settle_open_rows`]).
+/// finished.
 ///
 /// [Breaker::finish]: crate::interpreter::tile_operators::Breaker::finish
 fn finish_with(
@@ -3356,13 +2950,6 @@ fn finish_with(
         let consumed = consumed
             .take()
             .expect("a reach calls the breaker it reaches once");
-        if dispatcher.keeps_open_rows(pipeline) {
-            settle_open_rows(dispatcher, pipeline, epoch, breaker, input, last);
-            let mut pushes = dispatcher.pushes_in(pipeline, epoch);
-            breaker.finish(&mut pushes, last);
-            finished = Some(pushes);
-            return;
-        }
         let released = breaker.input_released(input);
         dispatcher.ensure(
             consumed.is_none_or(|consumed| {
@@ -3380,38 +2967,6 @@ fn finish_with(
         finished = Some(pushes);
     });
     dispatcher.finish(finished.expect("a reach calls the breaker it reaches"));
-}
-
-/// The first step of a finish of `pipeline`, which keeps open rows
-/// ([`Dispatcher::keep_open_rows`]): its open rows lose what its breaker's input has released.
-/// A row stays open while an input its chain reads is not final for it, since its chain answers
-/// nothing for the row then (`src/interpreter/design-operators.md`, "Reading rows again").
-///
-/// # Panics
-///
-/// At the run's last epoch, where a row is still open. Also where the guard algebra has no exact
-/// difference of the rows and what the input released ([`guard_minus`]).
-fn settle_open_rows(
-    dispatcher: &Dispatcher,
-    pipeline: PipelineId,
-    epoch: u64,
-    breaker: &mut dyn Breaker,
-    input: InputId,
-    last: bool,
-) {
-    let open = dispatcher.settle_open_rows(
-        pipeline,
-        epoch,
-        &breaker.input_released(input),
-        &breaker.input_tiling(input),
-    );
-    dispatcher.ensure(!last || open.is_none(), || {
-        format!(
-            "pipeline {} finishes the run's last epoch after its input has released every row \
-             it consumed, but {open:?} is open",
-            pipeline.0
-        )
-    });
 }
 
 #[cfg(test)]
@@ -3436,66 +2991,6 @@ mod tests {
         };
         assert!(second.contains(&Value::UInt(1 << 63)));
         assert!(!second.contains(&Value::UInt((1 << 63) - 1)));
-    }
-
-    /// A consume that leaves part of a row open beneath its outermost keys leaves the whole row
-    /// open: row `0`, whose inner keys `0..=2` its input released, of a two-level input whose other
-    /// rows it released whole.
-    #[test]
-    fn a_row_left_open_beneath_its_outermost_keys_is_open_whole() {
-        let positions = || Extent::UIntRange(IntervalSet::from(Interval::closed(0, 9)));
-        let input = Tiling::data_function(
-            positions(),
-            Tiling::data_function(positions(), Tiling::Scalar(Extent::Base(BaseType::Int))),
-        );
-        let point = |key: u64| Predicate::point(Value::UInt(key));
-        let inner = Predicate::intervals(IntervalSet::from(Interval::closed(
-            Value::UInt(0),
-            Value::UInt(2),
-        )));
-        let released = TileGuard::Or(vec![
-            TileGuard::Function(FunctionGuard::Domain(Predicate::intervals(
-                IntervalSet::from(Interval::closed_unbound(Value::UInt(1))),
-            ))),
-            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
-                FunctionGuard::Domain(Predicate::qualified(point(0), inner)),
-            )))),
-        ]);
-        let open = rows_left_open(&input.universal_guard(), &released, &input);
-        assert_eq!(
-            open,
-            Some(TileGuard::Function(FunctionGuard::Domain(point(0))))
-        );
-    }
-
-    /// A release of every inner key of a row over the inner level's finite range releases the row
-    /// whole, so the row is left open nowhere.
-    #[test]
-    fn a_row_whose_inner_range_is_released_whole_is_left_open_nowhere() {
-        let positions = || Extent::UIntRange(IntervalSet::from(Interval::closed(0, 9)));
-        let input = Tiling::data_function(
-            positions(),
-            Tiling::data_function(positions(), Tiling::Scalar(Extent::Base(BaseType::Int))),
-        );
-        let every_inner = Predicate::intervals(IntervalSet::from(Interval::closed(
-            Value::UInt(0),
-            Value::UInt(9),
-        )));
-        let released = TileGuard::Or(vec![
-            TileGuard::Function(FunctionGuard::Domain(Predicate::intervals(
-                IntervalSet::from(Interval::closed_unbound(Value::UInt(1))),
-            ))),
-            TileGuard::Function(FunctionGuard::Codomain(Box::new(TileGuard::Function(
-                FunctionGuard::Domain(Predicate::qualified(
-                    Predicate::point(Value::UInt(0)),
-                    every_inner,
-                )),
-            )))),
-        ]);
-        assert_eq!(
-            rows_left_open(&input.universal_guard(), &released, &input),
-            None
-        );
     }
 
     /// A range of several runs is cut every `rows` positions counted across the runs: positions

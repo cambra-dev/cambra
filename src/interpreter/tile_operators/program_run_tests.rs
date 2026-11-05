@@ -403,7 +403,7 @@ fn two_aggregates_of_one_binding() {
 
 /// A group-by's memo reads its input's memo and the `Converse` keying the groups, which reads that
 /// memo too and is no breaker. The input memo's push reaches the group-by's memo widened, so it
-/// keeps open rows and reads them again there.
+/// parks its rows until that memo has decided them.
 #[test]
 fn a_group_by() {
     let source = indoc! {"
@@ -445,8 +445,8 @@ fn a_sum_over_two_concatenated_comprehensions() {
 
 /// A sum read inside another comprehension: the outer sum's pipeline reads the inner sum's and the
 /// list's. The inner sum's push names every key of the outer sum's input, which the list's pushes
-/// name too, so the outer sum keeps open rows: a row consumed at the list's push before the inner
-/// sum is final is read again at the inner sum's push.
+/// name too, so the outer sum parks the rows the list's pushes bring until the inner sum is
+/// decided, and reads each once.
 #[rstest_log::rstest]
 fn a_comprehension_reading_a_sum(#[values(1, usize::MAX)] rows: usize) {
     answers(
@@ -2354,9 +2354,9 @@ fn a_reader_of_a_live_pipeline_through_a_build_edge(
     assert_eq!(value, Value::Int(expected));
 }
 
-/// A breaker whose chain reads a live source and a pipeline takes the source's arrivals and keeps
-/// open rows (`Dispatcher::take_arrivals`): each row adds the sum of `ys`, and a row consumed
-/// before the sum is final is read again at its push.
+/// A breaker whose chain reads a live source and a pipeline takes the source's arrivals and parks
+/// them (`Dispatcher::park`): each row adds the sum of `ys`, and a row arriving before the sum is
+/// decided waits for it.
 #[rstest_log::rstest]
 fn a_reader_of_a_live_source_and_a_pipeline(#[values(1, usize::MAX)] rows: usize) {
     let (value, planned) = dispatched_live(
@@ -2615,11 +2615,10 @@ fn a_map_over_a_live_source_at_main(
     );
 }
 
-/// A filter over a live source that reads a sum takes the source's arrivals and keeps open rows
-/// (`Dispatcher::take_arrivals`). A sum over a literal is final in the first epoch, so the first
-/// delivery's rows are answered in it, read again at the sum's push where they arrived before. A
-/// sum over the live source is final only at the last delivery, so the first delivery's rows stay
-/// open until then and are read again at its push.
+/// A filter over a live source that reads a sum takes the source's arrivals and parks them
+/// (`Dispatcher::park`). A sum over a literal is decided in the first epoch, so the first
+/// delivery's rows are answered in it. A sum over the live source is decided only at the last
+/// delivery, so the first delivery's rows stay parked until then.
 #[rstest_log::rstest]
 #[case::a_sum_over_a_literal("[x for x in source1() if sum([1, 2, 3]) > 5]", 3)]
 #[case::a_sum_over_the_source("[x for x in source1() if sum(source1()) > 2]", 0)]
@@ -2653,11 +2652,11 @@ fn a_filter_over_a_live_source_reading_a_sum(
 }
 
 /// The readers of a pipeline with a live source beneath it read no input whole: the inner
-/// comprehension's memo, the per-row sum and the outer comprehension's memo each keep open rows,
-/// and a push reads again the rows it names (`src/interpreter/design-operators.md`, "Reading rows
-/// again").
+/// comprehension's memo, the per-row sum and the outer comprehension's memo each park their rows
+/// until the pipelines they read have decided them (`src/interpreter/design-operators.md`,
+/// "Parking arrivals until a read is decided").
 #[rstest_log::rstest]
-fn readers_over_a_live_pipeline_keep_open_rows(#[values(1, usize::MAX)] rows: usize) {
+fn readers_over_a_live_pipeline_park_their_rows(#[values(1, usize::MAX)] rows: usize) {
     let source = indoc! {"
         out = test_sink()
         ys = [y for y in source1()]
@@ -2678,14 +2677,15 @@ fn readers_over_a_live_pipeline_keep_open_rows(#[values(1, usize::MAX)] rows: us
     assert_eq!(
         planned.iter().filter(|plan| plan.held).count(),
         3,
-        "the two memos and the sum keep open rows: {planned:?}"
+        "the two memos and the sum park their rows: {planned:?}"
     );
 }
 
-/// The sums of `a_sum_over_rows_carrying_a_constant` over a live list. The sum's pipeline keeps
-/// open rows and reads each row again at its outermost key, above the level the constant applies
-/// at, where `MapResultToConst` panics on a pull at or beneath that level, so the values check it
-/// (`src/interpreter/design-operators.md`, "Reading rows again").
+/// The sums of `a_sum_over_rows_carrying_a_constant` over a live list. The sum's pipeline parks
+/// each row until the constant is decided and reads it once at its outermost key, above the level
+/// the constant applies at, where `MapResultToConst` panics on a pull at or beneath that level, so
+/// the values check it (`src/interpreter/design-operators.md`, "Parking arrivals until a read is
+/// decided").
 #[rstest_log::rstest]
 #[case::zipped_with_a_constant(
     indoc! {"
@@ -2772,7 +2772,7 @@ fn a_sum_over_live_rows_carrying_a_constant(
 
 /// The same filter fed to a sink. The comprehension is the constant of the `()` row above it, so
 /// a delivery's keys reach the sink's pipeline widened, and that pipeline reads its input whole
-/// once the source yields everything, keeping open rows for the sum's push.
+/// once the source yields everything, parked until the sum is decided.
 #[rstest_log::rstest]
 fn a_filter_over_a_live_source_reading_a_sum_into_a_sink(#[values(1, usize::MAX)] rows: usize) {
     let source = indoc! {"
@@ -2793,8 +2793,7 @@ fn a_filter_over_a_live_source_reading_a_sum_into_a_sink(#[values(1, usize::MAX)
 }
 
 /// A sum whose rows read a sum over the same live source: the outer sum's pipeline takes the
-/// source's arrivals and is not ordered, so its open rows are read again when the inner sum is
-/// final, at the last delivery.
+/// source's arrivals and parks them until the inner sum is decided, at the last delivery.
 #[rstest_log::rstest]
 fn a_sum_over_a_live_source_reading_a_sum_over_it(#[values(1, usize::MAX)] rows: usize) {
     let (value, _) = dispatched_live(

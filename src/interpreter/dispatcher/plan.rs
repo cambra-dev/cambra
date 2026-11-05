@@ -42,9 +42,9 @@ use crate::interpreter::{BaseType, DataSink, DataSourceDomainExtentImpl, Extent}
 /// between the two, each of which declares how it passes a push on ([`Consumer::route`]). Where
 /// every path to the reader's entry keeps the pushing pipeline's keys, or that pipeline holds one
 /// value, the reader is queued the rows the pushes name (a stream edge). Where a path widens them,
-/// a push names every row of the reader's input, so the reader keeps open rows
-/// ([`Dispatcher::keep_open_rows`]) and reads them again at the push. So does a reader with two
-/// stream edges whose pushes can name one key. A reader reads its input whole once every pipeline
+/// a push names every row of the reader's input, so the reader parks its rows until every pipeline
+/// it reads has decided them ([`Dispatcher::park`]). So does a reader with two stream edges whose
+/// pushes can name one key. A reader reads its input whole once every pipeline
 /// it reads has finished ([`Dispatcher::read_whole`]) where a pipeline it reads pushes along no
 /// route to it, or where no stream edge and no start region names a region of its input. The
 /// region a push names comes from a probe: the pushing breaker pushes `Everything` through its
@@ -729,9 +729,8 @@ pub(super) enum Consumes {
 /// reads another planned from its routes as a stream edge, a widened edge or a whole read, and the
 /// regions no push names queued at the start ([`run_program`] says how). `arrivals` says whether a
 /// pipeline takes a live source's arrivals beside the pipelines it reads
-/// ([`Dispatcher::take_arrivals`], or [`Dispatcher::take_arrivals_after_reads`] for a store or a
-/// loop's scope). `opens` says whether a pipeline may keep open rows
-/// ([`Dispatcher::keep_open_rows`]), which a loop's scope's may not: there a reader with a widened
+/// ([`Dispatcher::take_arrivals`]), which it parks ([`Dispatcher::park`]). `opens`
+/// says whether a pipeline may park, which a loop's scope's may not: there a reader with a widened
 /// edge or two stream edges that can name one key reads its input whole. `kinds` says how each
 /// pipeline takes its packages; `pushes_with` names, for each pipeline, the first pipeline of its
 /// breaker, whose record of what the breaker pushed it shares ([`Dispatcher::share_pushes`]);
@@ -779,7 +778,6 @@ pub(super) fn plan_edges(
             started: false,
             rounds: Vec::new(),
             live: false,
-            open: false,
             held: false,
         })
         .collect();
@@ -793,16 +791,14 @@ pub(super) fn plan_edges(
                 // A pipeline that pushes takes each delivery, parked until the pipelines it reads
                 // have decided it.
                 Consumes::Pushes => {
-                    dispatcher.take_arrivals_after_reads(PipelineId(reader));
+                    dispatcher.take_arrivals(PipelineId(reader));
                     dispatcher.park(PipelineId(reader));
                     planned[reader].held = true;
                 }
                 // A store or a loop's scope over a live source takes each delivery once the
                 // pipelines it reads have finished the epoch, which it follows (below), so it
                 // reads no row again.
-                Consumes::Rounds | Consumes::Whole => {
-                    dispatcher.take_arrivals_after_reads(PipelineId(reader))
-                }
+                Consumes::Rounds | Consumes::Whole => dispatcher.take_arrivals(PipelineId(reader)),
             }
         }
         let mut input = None;
@@ -928,12 +924,12 @@ pub(super) fn plan_edges(
         let left = brought.iter().fold(input.empty_guard(), |left, arrival| {
             left.union(&guard_minus(&arrival.guard, &pushed))
         });
-        // A loop's scope keeps no open rows, so a reader there reads its input whole, which the
-        // scope leaves in pull mode, where a push can name a row it consumed before: along a
-        // widened edge or a second stream edge. In the run's dispatcher a reader keeps open rows
-        // there instead, and beside arrivals. A pipeline that takes arrivals is queued its rows as
-        // its sources yield them, and any other reads its input whole only where nothing names a
-        // region of it.
+        // A loop's scope parks nothing, so a reader there reads its input whole, which the scope
+        // leaves in pull mode, where a push can name a row it consumed before: along a widened
+        // edge or a second stream edge. In the run's dispatcher a reader parks its rows there
+        // instead until the pipelines it reads have decided them. A pipeline that takes arrivals
+        // is queued its rows as its sources yield them, and any other reads its input whole only
+        // where nothing names a region of it.
         let whole = match opens {
             false => unreached || streams.is_empty() || !apart || !widened.is_empty(),
             true => !arrivals[reader] && (unreached || (streams.is_empty() && left.is_empty())),
@@ -1014,8 +1010,6 @@ pub struct Planned {
     pub rounds: Vec<Planned>,
     /// Whether the run notifies it of what a live source yields.
     pub live: bool,
-    /// Whether it keeps open rows ([`Dispatcher::keep_open_rows`]).
-    pub open: bool,
     /// Whether it parks its arrivals until the pipelines it reads have decided them
     /// ([`Dispatcher::park`]).
     pub held: bool,
