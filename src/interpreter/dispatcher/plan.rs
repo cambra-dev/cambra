@@ -759,6 +759,9 @@ pub(super) fn plan_edges(
             // A nested loop's scope takes the row the scope around it queues it once the pipelines
             // it reads have finished the round, since its rounds pull them, and a store or a
             // loop's scope over a live source takes each delivery so.
+            // In the run's dispatcher a store or a loop's scope over a live source parks each
+            // delivery on what the pipelines it reads have decided instead (`run_targets`).
+            Consumes::Rounds | Consumes::Whole if opens => continue,
             Consumes::Rounds | Consumes::Whole => {
                 for &follow in read {
                     dispatcher.follow(PipelineId(reader), PipelineId(follow));

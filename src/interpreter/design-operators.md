@@ -1393,10 +1393,9 @@ in one of four ways (`LivePipeline::poll`):
   writer's pipeline, read behind an entry no planner places: that pipeline is notified of each
   delivery's keys as its items.
 
-A scope or a store that also reads pipelines takes each delivery once those pipelines have finished
-the epoch (`Dispatcher::take_arrivals`, `Dispatcher::follow`). Where one of those pipelines is final
-only once some live source yields everything, the scope or the store holds its deliveries until then
-([Parking arrivals until a read is decided](#parking-arrivals-until-a-read-is-decided)).
+A scope or a store that also reads pipelines takes each delivery once those pipelines have decided
+it (`Dispatcher::take_arrivals`,
+[Parking arrivals until a read is decided](#parking-arrivals-until-a-read-is-decided)).
 
 A drive and a transaction store decide positions in order, and a debug build checks that a delivery
 adds positions after every one before it. A dispatched run delivers no notification: a loop's scope
@@ -1506,12 +1505,14 @@ pushed. A unit of work is claimable once that union covers the region the work p
 | Work | Claimable today | Claimable in the planned design |
 | --- | --- | --- |
 | A whole read (`Dispatcher::read_whole`) | once every pipeline it reads has decided it (implemented) | as now |
-| A step of a store or a loop's scope that follows its reads (`Dispatcher::follow`) | once its reads have finished the epoch | once its reads are complete over the region the step pulls |
+| A step of a store or a loop's scope over a live source | once every pipeline it reads has decided it (implemented) | as now |
 | A parked delivery of a store or a loop's scope (`Dispatcher::park`) | once every pipeline it reads has decided it (implemented) | as now |
 | A row a push or an arrival brings ([Reading each row once](#reading-each-row-once)) | once every pipeline that reaches it has decided it (implemented) | as now |
 
-The four rows reduce to one rule; what remains of the epochs' part is `follow`. Epochs remain the batches a seal makes of live deliveries,
-and the unit a `main` output answers per (`SinkBreaker::per_epoch`).
+The four rows reduce to one rule in the run's dispatcher. A loop's scope's own dispatcher still
+orders its rounds by the finish of the pipelines a round reads (`Dispatcher::follow`), since an
+epoch there is a round. Epochs remain the batches a seal makes of live deliveries, and the unit a
+`main` output answers per (`SinkBreaker::per_epoch`).
 
 The program below shows what changes. Its store `a` reads a static list, and its loop reads a live
 source that never yields everything:

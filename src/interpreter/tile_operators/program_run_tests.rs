@@ -3013,7 +3013,9 @@ fn a_store_over_a_live_source_reading_a_pipeline(
     assert_eq!(value, expected, "{source}");
     let following: Vec<_> = planned
         .iter()
-        .filter(|plan| plan.live && !plan.follows.is_empty())
+        .filter(|plan| {
+            plan.live && (plan.name.starts_with("Commit") || plan.name.starts_with("LoopScope"))
+        })
         .collect();
     assert_eq!(
         following

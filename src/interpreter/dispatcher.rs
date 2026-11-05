@@ -751,8 +751,9 @@ impl Dispatcher {
     /// Mark `pipeline` as a store's seed input, which the store's other pipelines read: a store
     /// opens before it steps, so once `pipeline` has consumed a package, the seeds are read and
     /// the store is open, and each of its readers records it wholly decided at the finish of that
-    /// epoch, which releases what they parked ([`park`](Self::park)). Its readers follow it, so
-    /// none takes a package of an epoch before it has finished there.
+    /// epoch, which releases what they parked ([`park`](Self::park)). A writer's pipeline that
+    /// reads its input whole takes it only once that record covers it, and one over a live source
+    /// parks each delivery until then.
     ///
     /// # Panics
     ///
