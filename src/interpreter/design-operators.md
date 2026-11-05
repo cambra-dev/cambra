@@ -1047,8 +1047,7 @@ pipelines around its recurrence is no read and records nothing. An induction sto
 scope instead ([A loop in rounds](#a-loop-in-rounds)). A reader of a store reads every pipeline of
 it, so its queue in an epoch closes once the last of them has finished the epoch. The pipelines of
 one store share one record of what the store has pushed (`Dispatcher::share_pushes`), so no tick is
-pushed twice, and `plan_edges` plans their edges into one reader as one: a stream edge whose pushes
-name no key twice, or a widened edge from each of them. The planner refuses:
+pushed twice, and `plan_edges` plans their edges into one reader as one. The planner refuses:
 
 - outside a loop's scope, a nested transaction store, one per enclosing row, whose frontier a flat
   morsel does not name;
@@ -1287,18 +1286,16 @@ any region being pushed: a consumer that keeps its operator's input's keys passe
 tagged union's arm passes it on under the arm's tag, a widening consumer marks it widened
 (`Routes::widened`), and the `Entry` of a placed breaker records its pipeline. Where every path to
 the reader's entry keeps the keys, or the pushing breaker holds one value, whose push is
-`Everything`, the reader is queued the rows the pushes name: a stream edge. Where a path widens
-them, as a lookup's table reaches its reader, a push names every row of the reader's input: a
-widened edge. Its reader parks its rows until the push's pipeline has decided them, and takes its
-rows from its other edges and from a region queued at the start. So does a reader with two stream
-edges whose pushes can name one key, as the output's memo reads two aggregates of one binding
-([Reading each row once](#reading-each-row-once)). A reader reads its input whole once every
-pipeline it reads has finished (`Dispatcher::read_whole`) where a pipeline it reads pushes along no
-route to it, or where no stream edge and no region queued at the start names a row of its input.
-Which region of the reader's input a push names comes from a probe: the read pipeline's breaker
-pushes `Everything` through its consumer into a landing that records what reaches each entry instead
-of queueing it (`Landing::probe`). A widened edge is probed so, and so is each range under a reader
-of pushes, such as the positions of a literal arm of a concatenation. A constant keeps no consumer.
+`Everything`, a push names the rows of its own keys. Where a path widens them, as a lookup's table
+reaches its reader, a push names every row of the reader's input. Either way the reader parks the
+rows a push brings until the pipelines it reads have decided them, and reads each once
+([Reading each row once](#reading-each-row-once)). A reader reads its input whole
+(`Dispatcher::read_whole`) where a pipeline it reads pushes along no route to it, or where no push
+and no region queued at the start names a row of its input. Which region of the reader's input a
+push names comes from a probe: the read pipeline's breaker pushes `Everything` through its consumer
+into a landing that records what reaches each entry instead of queueing it (`Landing::probe`). So
+is each range under a reader of pushes probed, such as the positions of a literal arm of a
+concatenation. A constant keeps no consumer.
 A constant whose keys a reader consumes is one of four kinds, and none brings a key the ranges and
 the pushes do not name:
 
@@ -1310,9 +1307,8 @@ the pushes do not name:
 - a scalar, which has one position, so any push to its reader names all of it.
 
 `run_program` refuses, in a debug build, a constant collection beneath a reader of pushes that is
-not a function operand. What those probes bring, less everything the stream edges' pushes can
-name, is queued for the reader at the start of the run as one region
-(`Dispatcher::queue_for`).
+not a function operand. What the ranges bring, less everything the pushes can name, is queued for
+the reader at the start of the run as one region (`Dispatcher::queue_for`).
 
 Each sink is the breaker of a pipeline of its own (`SinkBreaker`), planned after the pipelines its
 producer's chain reads and read by no pipeline. The walk places the sink's `SinkConsumer` in that
@@ -1555,15 +1551,10 @@ depend on the pipeline. A pipeline read by pull, whose push reaches no entry of 
 all of its input, and the reader records it whole once it is wholly decided.
 
 Every pipeline that reads another parks the rows its pushes, its arrivals and its start bring, in
-the run's dispatcher and in a loop's scope's (`plan_edges`). Its routes from each pipeline it reads
-decide where its rows come from, not whether it parks:
-
-- A stream edge, along routes that keep the pushing pipeline's keys, brings the rows its pushes
-  name.
-- A widened edge brings every row of the input, which the run queues at the start beside what the
-  ranges under the pipeline bring, less what a stream edge names.
-- A read along no route is read by pull, so the pipeline reads its input whole
-  (`Dispatcher::read_whole`), released as the pipelines it reads decide it.
+the run's dispatcher and in a loop's scope's (`plan_edges`). A push brings the rows it names at the
+reader's entry, a widened one every row, less what a push brought before. A pipeline read along no
+route is read by pull, so its reader reads its input whole (`Dispatcher::read_whole`), released as
+the pipelines it reads decide it.
 
 A pipeline whose chain reads a live source and other pipelines takes the source's arrivals
 (`Dispatcher::take_arrivals`), and its queue in an epoch counts the seal as one more event. It is
@@ -1572,7 +1563,7 @@ queued no start region and reads nothing whole.
 A pipeline that takes arrivals brings rows only from its arrivals and from a pipeline whose pushes
 arrive as its own keys (`Dispatcher::queue_pushes_of`), as a let-bound arm of a concatenation or a
 let-bound record's collection field; a push of one value that names only rows the arrivals bring
-brings none. A widened push brings no row.
+brings none. A widened push brings such a pipeline no row: its arrivals name its rows.
 
 A reader inside a loop's scope parks as one in the run's dispatcher does. Its inner pipelines' keys
 carry the loop's position, so a decided region names the rows of one position. A round queues its

@@ -2509,10 +2509,10 @@ impl Landing<'_> {
             format!("pipeline {r} receives packages before it finishes")
         });
         // A reader that parks reads each row once, when every pipeline it reads has decided it:
-        // a push brings rows only where they are its own and not widened, and the decided pushes
-        // release them ([`Dispatcher::park`]).
+        // a push brings the rows it names, widened or not, less what a push brought before, and
+        // the decided pushes release them ([`Dispatcher::park`]).
         if info.parks {
-            if !self.widened && (!info.arrivals || info.pushed_rows.contains(&from)) {
+            if !info.arrivals || (!self.widened && info.pushed_rows.contains(&from)) {
                 dispatcher.queue_or_park(epoch, r, guard, false);
             }
             return;
