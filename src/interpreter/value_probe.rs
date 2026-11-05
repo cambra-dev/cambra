@@ -20,8 +20,9 @@
 //! rows held, to `probes × 2 × rows`. [`CHARS_PER_CELL`] bounds each rendered
 //! key, value, completeness and obsolete guard, however deeply the value nests.
 //! Rendering stops at the budget, so its cost is bounded by it too rather than
-//! by the value's length. Rendering happens on the driver thread, and no tile
-//! is cloned.
+//! by the value's length. A reading is rendered on the thread that runs the
+//! `get`, and no tile is cloned; a frame is rendered from the readings on the
+//! thread that publishes it.
 //!
 //! A pane asks what flowed through a node, which the newest reading cannot
 //! answer: empty readings outnumber row-carrying ones by orders of magnitude.
@@ -29,10 +30,12 @@
 
 use smol_str::SmolStr;
 use std::{
-    cell::RefCell,
     collections::{HashMap, hash_map::Entry},
     fmt::{self, Write as _},
-    rc::Rc,
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use crate::{
@@ -54,8 +57,14 @@ pub const CHARS_PER_CELL: usize = 256;
 ///
 /// Every producer holds a clone, taken from its [`Scheduler`] when it is built,
 /// so one [`enable`](Self::enable) or [`disable`](Self::disable) switches
-/// probing for all of them at once. While the slot is empty a
-/// `TileProducer::get` costs one `None` check.
+/// probing for all of them at once. While probing is off a
+/// `TileProducer::get` costs one atomic load.
+///
+/// The slot is shared with the thread that publishes the inspector's frames,
+/// which switches probing and copies the table on a timer of its own
+/// (`src/inspector_model/design.md`, "Probing follows the live route"). Each
+/// holder takes the table's lock for one reading, one switch or one copy, so a
+/// switch or a copy lands between two readings, never inside one.
 ///
 /// [`Scheduler`]: crate::interpreter::Scheduler
 #[derive(Clone, Default)]
@@ -63,33 +72,56 @@ pub struct ProbeSlot(
     // shared-state-ok: the observation boundary. A producer writes what it has
     // already returned to its consumer, rendered; nothing reads it back into
     // the graph, and no operator reaches another operator's rows. Shared
-    // because the driver reads one table and every producer writes it, and the
-    // producer graph has no `&self` traversal that would let the driver collect
-    // per-producer buffers instead.
-    Rc<RefCell<Option<ProbeTable>>>,
+    // because the publisher reads one table and every producer writes it, and
+    // the producer graph has no `&self` traversal that would let the publisher
+    // collect per-producer buffers instead.
+    Arc<Probes>,
 );
+
+/// What a [`ProbeSlot`] shares: whether probing is on, and the table while it
+/// is.
+#[derive(Default)]
+struct Probes {
+    /// Whether a table is installed, read without the lock on every `get`.
+    enabled: AtomicBool,
+    table: Mutex<Option<ProbeTable>>,
+}
+
+impl Probes {
+    fn lock(&self) -> MutexGuard<'_, Option<ProbeTable>> {
+        self.table.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
 
 impl ProbeSlot {
     /// Start probing with an empty [`ProbeTable`], if not already probing.
     pub fn enable(&self) {
-        self.0
-            .borrow_mut()
-            .get_or_insert_with(ProbeTable::with_defaults);
+        let mut table = self.0.lock();
+        table.get_or_insert_with(ProbeTable::with_defaults);
+        self.0.enabled.store(true, Ordering::Release);
     }
 
     /// Stop probing and drop every reading taken so far.
     pub fn disable(&self) {
-        *self.0.borrow_mut() = None;
+        let mut table = self.0.lock();
+        self.0.enabled.store(false, Ordering::Release);
+        *table = None;
     }
 
     /// Whether producers are taking readings.
     pub fn is_enabled(&self) -> bool {
-        self.0.borrow().is_some()
+        self.0.enabled.load(Ordering::Acquire)
     }
 
     /// Read the table, or `None` while probing is off.
     pub fn with_table<R>(&self, read: impl FnOnce(&ProbeTable) -> R) -> Option<R> {
-        self.0.borrow().as_ref().map(read)
+        self.0.lock().as_ref().map(read)
+    }
+
+    /// A copy of the table, or `None` while probing is off. The readings are shared, so the copy
+    /// costs one entry per probe, and a frame rendered from it holds no lock a `get` waits on.
+    pub fn snapshot(&self) -> Option<ProbeTable> {
+        self.0.lock().clone()
     }
 
     /// Take a reading of `tile` for one producer. A no-op while probing is off.
@@ -101,30 +133,25 @@ impl ProbeSlot {
         tile: &Tile,
         obsolete: &TileGuard,
     ) {
-        if let Some(table) = self.0.borrow_mut().as_mut() {
+        if !self.is_enabled() {
+            return;
+        }
+        if let Some(table) = self.0.lock().as_mut() {
             table.observe_named(node_id, producer_id, name, tile, obsolete);
         }
     }
 
     /// Detach one producer's probe, when that producer is dropped.
     ///
-    /// Nothing drops a producer while the table is borrowed: `observe_named`
-    /// holds a mutable borrow only for the call, and a frame render holds a
-    /// shared one while it iterates, building no producers and dropping none. A
-    /// failed borrow is that invariant breaking. It panics in debug builds only,
-    /// since this runs in `Drop` and a panic there during an unwind aborts.
+    /// The lock is held only for a reading, a switch or a copy, none of which
+    /// builds or drops a producer, so a drop waits only on another thread. A drop
+    /// inside one of them would wait on its own thread forever.
     pub(crate) fn detach(&self, node_id: Option<NodeId>, producer_id: usize) {
-        match self.0.try_borrow_mut() {
-            Ok(mut slot) => {
-                if let Some(table) = slot.as_mut() {
-                    table.detach(node_id, producer_id);
-                }
-            }
-            Err(_) => debug_assert!(
-                false,
-                "a producer was dropped while the probe table was borrowed, so its \
-                 probe outlives it",
-            ),
+        if !self.is_enabled() {
+            return;
+        }
+        if let Some(table) = self.0.lock().as_mut() {
+            table.detach(node_id, producer_id);
         }
     }
 }
@@ -159,7 +186,7 @@ pub struct Reading {
     pub producer_id: usize,
     /// The producer's display name, e.g. `"MapResultWithSource#1"`, shared by
     /// every reading of one probe.
-    pub producer: Rc<str>,
+    pub producer: Arc<str>,
     /// The tile's variant name.
     pub shape: &'static str,
     /// The region of the domain the output is complete for, in its `Debug`
@@ -203,6 +230,7 @@ impl Reading {
 /// Keyed by instance as well as operator because one operator can build
 /// several producers. Which of them a reader is shown is a rendering choice,
 /// and keeping both keys leaves it open.
+#[derive(Clone)]
 pub struct ProbeTable {
     next_seq: u64,
     next_flow: u64,
@@ -220,15 +248,16 @@ pub struct ProbeTable {
 /// consumer releases after the `get` that carried the rows, so both advance on
 /// readings that carry nothing.
 ///
-/// A reading is held behind an `Rc`, so the two share one allocation when the
+/// A reading is held behind an `Arc`, so the two share one allocation when the
 /// newest reading carried rows.
+#[derive(Clone)]
 struct Probe {
     /// The producer's display name, computed once when the probe is attached.
-    name: Rc<str>,
+    name: Arc<str>,
     /// The newest reading, empty or not.
-    newest: Rc<Reading>,
+    newest: Arc<Reading>,
     /// The newest reading that carried rows.
-    last_flow: Option<Rc<Reading>>,
+    last_flow: Option<Arc<Reading>>,
 }
 
 /// One probe's last flow, and its newest reading beside it.
@@ -317,15 +346,15 @@ impl ProbeTable {
                     name(),
                     "two producers share the probe key ({node_id:?}, {producer_id})",
                 );
-                Rc::clone(&probe.name)
+                Arc::clone(&probe.name)
             }
             None => name().into(),
         };
-        let reading = Rc::new(Reading {
+        let reading = Arc::new(Reading {
             seq: self.next_seq,
             node_id,
             producer_id,
-            producer: Rc::clone(&name),
+            producer: Arc::clone(&name),
             shape: rendered.shape,
             completeness: rendered.completeness,
             obsolete: (!obsolete.is_empty()).then(|| bounded(|out| write!(out, "{obsolete:?}"))),
@@ -334,7 +363,7 @@ impl ProbeTable {
             total: rendered.total,
         });
         self.next_seq += 1;
-        let flow = (!reading.is_empty()).then(|| Rc::clone(&reading));
+        let flow = (!reading.is_empty()).then(|| Arc::clone(&reading));
         if flow.is_some() {
             self.next_flow += 1;
         }
@@ -1338,6 +1367,61 @@ mod tests {
             Some(0),
             "switching off drops the readings, and switching on starts empty",
         );
+    }
+
+    /// The publisher switches probing and reads the table from a thread of its own, while
+    /// producers record on the run's thread.
+    #[test]
+    fn another_thread_switches_probing_and_reads_the_readings() {
+        let slot = ProbeSlot::default();
+        let publisher = slot.clone();
+        std::thread::spawn(move || publisher.enable())
+            .join()
+            .expect("the switch does not panic");
+        slot.observe_named(
+            None,
+            1,
+            || "P#1".into(),
+            &collection(&[0], &["a"], &[]),
+            &unreleased(),
+        );
+        let publisher = slot.clone();
+        let flows = std::thread::spawn(move || publisher.with_table(ProbeTable::flows))
+            .join()
+            .expect("the read does not panic");
+        assert_eq!(
+            flows,
+            Some(1),
+            "the reading taken on this thread is read on the other"
+        );
+    }
+
+    /// Readings taken while another thread switches probing on and off and copies the table
+    /// neither panic nor lose count: each copy holds as many flows as readings it saw.
+    #[test]
+    fn readings_and_switches_on_two_threads_interleave() {
+        let slot = ProbeSlot::default();
+        slot.enable();
+        let switching = slot.clone();
+        let switcher = std::thread::spawn(move || {
+            for round in 0..200 {
+                if round % 3 == 0 {
+                    switching.disable();
+                } else {
+                    switching.enable();
+                }
+                if let Some(table) = switching.snapshot() {
+                    assert!(table.flows() <= 1000, "a copy counts the readings it saw");
+                }
+            }
+        });
+        let tile = collection(&[0], &["a"], &[]);
+        for producer in 0..1000 {
+            slot.observe_named(None, producer, || "P".into(), &tile, &unreleased());
+        }
+        switcher
+            .join()
+            .expect("the switching thread does not panic");
     }
 
     /// Every producer holds a clone of one slot, so one switch reaches all.
