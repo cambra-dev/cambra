@@ -12,7 +12,8 @@ use std::collections::HashMap;
 
 use super::{Predicate, Tile, TilePathStep, Tiling};
 use crate::interpreter::{
-    ColumnValue, Extent, FuncBinding, Value, bindings_are_list, transform_hashmap_values,
+    ColumnValue, Extent, FuncBinding, UnionArm, UnionArmTile, Value, bindings_are_list,
+    transform_hashmap_values,
 };
 
 /// A column of values as the tile [`Tiling::from_extent`] gives `extent`: each map value
@@ -76,6 +77,22 @@ pub(crate) fn open_collections(cells: &ColumnValue, extent: &Extent) -> Tile {
                     .collect(),
             )
         }
+        // Each arm's payloads open into their own tile, over the rows carrying the arm.
+        Extent::Union(arm_extents) if extent.holds_a_collection() => {
+            let ColumnValue::Union(arms) = cells else {
+                panic!("a variant-valued column is a union column, got {cells:?}")
+            };
+            Tile::Union(arm_extents.map(|tag, arm_extent| match arms.get(tag) {
+                Some(arm) => UnionArmTile {
+                    rows: arm.rows().to_vec(),
+                    tile: open_collections(arm.values(), arm_extent),
+                },
+                None => UnionArmTile {
+                    rows: Vec::new(),
+                    tile: Tiling::from_extent(arm_extent).empty_at_no_rows(),
+                },
+            }))
+        }
         _ => Tile::Scalar(cells.clone()),
     }
 }
@@ -133,6 +150,14 @@ pub(crate) fn repeat_tile(tile: Tile, len: usize) -> Tile {
                 "a broadcast collection is one whole value, its one row's group"
             );
             collection.select_rows(&vec![0; len])
+        }
+        variant @ Tile::Union(_) => {
+            assert_eq!(
+                variant.rows(),
+                1,
+                "a broadcast variant is one whole value, at its one row"
+            );
+            variant.select_rows(&vec![0; len])
         }
         other => panic!("repeat_tile: unsupported tile shape {other:?}"),
     }
@@ -231,8 +256,8 @@ pub(crate) fn apply_function_tile(
     }
 }
 /// A tile as a column, turning each collection it holds into one map value per row, for the
-/// places one value is required: a variant's payload rides its arm as one, and a store write
-/// is one value per key. The inverse of [`open_collections`].
+/// places one value is required: a store write is one value per key. The inverse of
+/// [`open_collections`].
 ///
 /// Distinct from [`scalar_tile_to_column_value`], which refuses a collection held as a tile:
 /// boxing one is a defect wherever the tile was the point, so the two are separate functions
@@ -274,6 +299,9 @@ pub(crate) fn materialize_collections(tile: Tile) -> ColumnValue {
                     .collect(),
             )
         }
+        Tile::Union(arms) => ColumnValue::Union(arms.map(|_, arm| {
+            UnionArm::new(arm.rows.clone(), materialize_collections(arm.tile.clone()))
+        })),
         other => panic!("materialize_collections: not a value-shaped tile: {other:?}"),
     }
 }
@@ -313,6 +341,23 @@ pub(crate) fn column_value_to_tile(cv: ColumnValue, tiling: &Tiling) -> Tile {
                     .collect(),
             )
         }
+        Tiling::Union(arm_tilings) => {
+            let ColumnValue::Union(arms) = cv else {
+                panic!(
+                    "column_value_to_tile: expected a union column for a union tiling, got {cv:?}"
+                );
+            };
+            Tile::Union(arm_tilings.map(|tag, tiling| match arms.get(tag) {
+                Some(arm) => UnionArmTile {
+                    rows: arm.rows().to_vec(),
+                    tile: column_value_to_tile(arm.values().clone(), tiling),
+                },
+                None => UnionArmTile {
+                    rows: Vec::new(),
+                    tile: tiling.empty_at_no_rows(),
+                },
+            }))
+        }
         other => panic!("column_value_to_tile: unsupported tiling {other:?}"),
     }
 }
@@ -330,6 +375,7 @@ pub(crate) fn change_tiling_result(
                 t.extent()
             })))
         }
+        tiling @ Tiling::Union(_) => transformation(&tiling.extent()),
         Tiling::DataFunction { domain, codomain } => Tiling::DataFunction {
             domain: domain.clone(),
             codomain: Box::new(change_tiling_result(codomain, transformation)),

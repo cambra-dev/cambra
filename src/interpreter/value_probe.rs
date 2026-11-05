@@ -514,6 +514,23 @@ fn render(tile: &Tile, limit: usize) -> Rendered {
                 total,
             }
         }
+        // One row per row the union stands over, each its tag around its payload.
+        Tile::Union(_) => {
+            let total = tile.rows();
+            Rendered {
+                shape: "Union",
+                completeness: None,
+                note: None,
+                rows: tail(total, limit)
+                    .map(|i| ReadingRow {
+                        key: None,
+                        value: position(tile, i),
+                        deleted: false,
+                    })
+                    .collect(),
+                total,
+            }
+        }
         Tile::DataFunction {
             domain,
             codomain,
@@ -695,6 +712,14 @@ fn write_position(tile: &Tile, i: usize, out: &mut Bounded) -> fmt::Result {
             })
         }
         Tile::DataFunction { .. } => out.write_str("<absent>"),
+        Tile::Union(_) => match tile.union_arm_at(i) {
+            Some((tag, arm, slot)) => {
+                write!(out, "`{tag}(")?;
+                write_position(&arm.tile, slot, out)?;
+                out.write_str(")")
+            }
+            None => out.write_str("<absent>"),
+        },
         Tile::Aggregation { accumulator, .. } => write_position(accumulator, i, out),
         // A store is a whole value, so it stands at one row.
         Tile::Store { .. } if i < tile.rows() => {

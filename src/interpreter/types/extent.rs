@@ -109,6 +109,7 @@ impl Extent {
         match self {
             Extent::Function { .. } => true,
             Extent::Record(fields) => fields.values().any(Extent::holds_a_collection),
+            Extent::Union(arms) => arms.values().any(Extent::holds_a_collection),
             _ => false,
         }
     }

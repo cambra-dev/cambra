@@ -3081,13 +3081,11 @@ fn convert_impl_inner(
                     // D ⇒ Scalar(Union) }` (a variant field of a record stream);
                     // `VariantProject` derives its output domain from whichever.
                     let ok = match input.tiling() {
-                        Tiling::Scalar(Extent::Union(_)) => true,
+                        t @ (Tiling::Scalar(_) | Tiling::Union(_)) => is_a_union(t),
                         // The union sits under the levels the scrutinee stands at, however
                         // many: a decision stream inside a nest carries one per innermost
                         // position, and the projection leaves the levels above it alone.
-                        t @ Tiling::DataFunction { .. } => {
-                            matches!(t.deepest_values(), Tiling::Scalar(Extent::Union(_)))
-                        }
+                        t @ Tiling::DataFunction { .. } => is_a_union(t.deepest_values()),
                         _ => false,
                     };
                     if !ok {
@@ -3128,10 +3126,8 @@ fn convert_impl_inner(
                 // which is what a writer decision's guard position takes.
                 Builtin::VariantIs(tag) => {
                     let ok = match input.tiling() {
-                        Tiling::Scalar(Extent::Union(_)) => true,
-                        Tiling::DataFunction { codomain, .. } => {
-                            matches!(codomain.as_ref(), Tiling::Scalar(Extent::Union(_)))
-                        }
+                        t @ (Tiling::Scalar(_) | Tiling::Union(_)) => is_a_union(t),
+                        Tiling::DataFunction { codomain, .. } => is_a_union(codomain),
                         _ => false,
                     };
                     if !ok {
@@ -6470,6 +6466,12 @@ fn convert_flatten_domain(
         convert_impl(argument, None, ctx)?,
         flatten_indices,
     )))
+}
+
+/// Whether `tiling` is a variant's: a union column, or a union of arm tiles where a payload holds
+/// a collection.
+fn is_a_union(tiling: &Tiling) -> bool {
+    matches!(tiling, Tiling::Scalar(Extent::Union(_)) | Tiling::Union(_))
 }
 
 #[cfg(test)]

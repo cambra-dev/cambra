@@ -2,8 +2,8 @@ use bit_set::BitSet;
 
 use super::*;
 use crate::ccl::{FieldKey, TagMap};
-use crate::interpreter::UnionArm;
 use crate::interpreter::operator_graph::value;
+use crate::interpreter::{UnionArm, UnionArmTile};
 use crate::{
     interpreter::{
         BaseType, ColumnValue, Consumer, Extent, FunctionDef, Predicate, Scheduler, Value,
@@ -240,11 +240,23 @@ impl VariantWrap {
             "VariantWrap: tag `{tag}` is not an arm of the union being constructed"
         );
         let union_ext = Extent::Union(variant_extents.clone());
-        // The levels above `level` stand and the payload at it becomes one union column.
-        // The depth is the caller's to state: a collection of payloads and a payload that is
-        // itself a collection are both `Tile::DataFunction`, so only the type separates them,
-        // and reading one level by hand would drop the rest of a nested body's.
-        let tiling = with_values_at(input.tiling(), level, Tiling::Scalar(union_ext));
+        // The levels above `level` stand and the payload at it becomes the union: a column
+        // where no payload holds a collection, and a union of arm tiles where one does, so a
+        // collection payload stays the level it is. The depth is the caller's to state: a
+        // collection of payloads and a payload that is itself a collection are both
+        // `Tile::DataFunction`, so only the type separates them, and reading one level by hand
+        // would drop the rest of a nested body's.
+        //
+        // The wrapped tag's arm keeps the payload's own tiling, which its producer chose (a
+        // record of tiles, say, where the extent alone reads one column of records).
+        let union_tiling = match Tiling::from_extent(&union_ext) {
+            Tiling::Union(arms) => Tiling::Union(arms.map(|arm_tag, arm| match arm_tag == &tag {
+                true => input.tiling().values_at(level).clone(),
+                false => arm.clone(),
+            })),
+            column => column,
+        };
+        let tiling = with_values_at(input.tiling(), level, union_tiling);
         Self {
             base: OperatorBase::new(tiling),
             input,
@@ -344,44 +356,36 @@ impl TileProducer for VariantWrapProducer {
 
     fn get_impl(&mut self, _projection_guard: TileGuard) -> Tile {
         let mut tile = self.input.get(self.input.tiling().universal_guard());
-        // **A collection payload is a value only once it is whole.** The arm holds it as one
-        // materialized cell, which cannot grow, so a row's cell is emitted once that row's
-        // collection is complete and not before. At the outermost level the payload is one
-        // row, the whole input, and once it is released there is nothing left to wrap: a
-        // released collection reads as an empty one, which is not the value it was.
-        if self.input.tiling().values_at(self.level).holds_a_level() {
-            match self.level.enclosing() {
-                None if !tile.is_terminal() || self.obsolete_guard().is_universal() => {
-                    return self.tiling().empty_tile();
-                }
-                None => {}
-                Some(rows) => {
-                    let complete = tile.completion_at(rows);
-                    let paths = tile.paths_at(rows);
-                    let whole = (0..paths.len())
-                        .map(|key| complete.contains_path(&paths[key]))
-                        .collect::<Vec<bool>>();
-                    tile.values_at_mut(rows).retain_keys(&whole);
-                }
-            }
-        }
         // Which of the two cases this is was decided at construction, from the input's
         // tiling, and is read back from the output's: a payload **stream** keeps its domain
         // and wraps element-wise (so the constructor composes as `payload ≫ variant_wrap`),
-        // while a payload **value** becomes one union column. The tile cannot say — a stream
-        // of payloads and a payload that is itself a collection are both `Tile::DataFunction`,
+        // while a payload **value** becomes one union. The tile cannot say — a stream of
+        // payloads and a payload that is itself a collection are both `Tile::DataFunction`,
         // and only the tiling separates them.
-        //
-        // Either way the payload becomes a value: an arm rides its row as one, so a payload
-        // carrying a collection materializes here rather than staying a level.
+        // At the outermost level the payload is one row, the whole value, and once it is
+        // released there is nothing left to wrap: a released collection reads as an empty one,
+        // and wrapping that would deliver the row's tag again. What it stated complete stays
+        // so, as a released collection's statement does.
+        if self.level == CurryLevel::OUTERMOST
+            && matches!(self.tiling(), Tiling::Union(_))
+            && self.obsolete_guard().is_universal()
+        {
+            let mut released = self.tiling().empty_tile();
+            released.map_level_predicates(&mut |_, _| Predicate::True);
+            return released;
+        }
         let slot = tile.values_at_mut(self.level);
-        let payload =
-            materialize_collections(std::mem::replace(slot, Tile::Scalar(ColumnValue::Units(0))));
-        *slot = Tile::Scalar(wrap_variant_column(
-            payload,
-            &self.tag,
-            &self.variant_extents,
-        ));
+        let payload = std::mem::replace(slot, Tile::Scalar(ColumnValue::Units(0)));
+        *slot = match self.tiling().values_at(self.level) {
+            // A collection payload stays a level, as a record field holding one does, so it
+            // grows as it arrives rather than waiting to be whole.
+            Tiling::Union(arm_tilings) => wrap_variant_tile(payload, &self.tag, arm_tilings),
+            _ => Tile::Scalar(wrap_variant_column(
+                scalar_tile_to_column_value(payload),
+                &self.tag,
+                &self.variant_extents,
+            )),
+        };
         tile
     }
 
@@ -400,9 +404,78 @@ impl TileProducer for VariantWrapProducer {
             // wrapped level is shaped against the union extent rather than the payload's,
             // and nothing builds one of those.
             g if guard_depth(&g) < self.level.index() => g,
+            // At the wrapped level a union guard names one region per tag, and the payload's
+            // is the wrapped tag's: the other arms hold nothing this operator built.
+            g if matches!(self.tiling().values_at(self.level), Tiling::Union(_)) => {
+                onto_wrapped_arm(g, 0, self.level.index(), &self.tag, self.input.tiling())
+            }
             g => todo!("Unimplemented guard in VariantWrapProducer: {g:?}"),
         };
         self.input.release(upstream_guard);
+    }
+}
+
+/// `payload`, one tile over every row, as the arm `tag` of a union of `arm_tilings`: that arm
+/// carries every row and every other arm none, so the union stays total over its tags.
+fn wrap_variant_tile(payload: Tile, tag: &FieldKey, arm_tilings: &TagMap<Tiling>) -> Tile {
+    let rows = payload.rows();
+    let mut payload = Some(payload);
+    Tile::Union(arm_tilings.map(|arm_tag, arm_tiling| match arm_tag == tag {
+        true => {
+            let payload = payload.take().expect("one arm is the wrapped tag");
+            // A payload delivered as a materialized map opens into the level its arm holds.
+            let tile = match (&payload, arm_tiling.holds_a_level()) {
+                (Tile::Scalar(cells), true) => open_collections(cells, &arm_tiling.extent()),
+                _ => payload,
+            };
+            UnionArmTile {
+                rows: (0..rows).collect(),
+                tile,
+            }
+        }
+        false => UnionArmTile {
+            rows: Vec::new(),
+            tile: arm_tiling.empty_at_no_rows(),
+        },
+    }))
+}
+
+/// `guard`, standing `depth` levels down a wrap's output, restated over its payload: the
+/// standing levels pass through, and at the wrapped level, `level`, the payload's region is the
+/// union guard's arm for `tag`. `payload` is the input's tiling.
+fn onto_wrapped_arm(
+    guard: TileGuard,
+    depth: usize,
+    level: usize,
+    tag: &FieldKey,
+    payload: &Tiling,
+) -> TileGuard {
+    let at = || payload.values_at(CurryLevel::new(depth));
+    match guard {
+        g if g.is_empty() => at().empty_guard(),
+        g if g.is_universal() => at().universal_guard(),
+        TileGuard::Or(arms) => TileGuard::flatten_or(
+            arms.into_iter()
+                .map(|arm| onto_wrapped_arm(arm, depth, level, tag, payload))
+                .collect(),
+        ),
+        TileGuard::Union(arms) if depth == level => {
+            arms.get(tag).cloned().unwrap_or_else(|| at().empty_guard())
+        }
+        TileGuard::Function(FunctionGuard::Codomain(inner)) if depth < level => {
+            TileGuard::Function(FunctionGuard::Codomain(Box::new(onto_wrapped_arm(
+                *inner,
+                depth + 1,
+                level,
+                tag,
+                payload,
+            ))))
+        }
+        g @ TileGuard::Function(FunctionGuard::Domain(_)) if depth < level => g,
+        g => unreachable!(
+            "a guard over a wrapped union is a chain down to it ending in a union guard, got \
+             {g:?} at depth {depth} of {level}"
+        ),
     }
 }
 
@@ -492,20 +565,33 @@ impl VariantProject {
         // per innermost element projects per innermost element. The output is a function
         // either way: a bare union is keyed by the implicit `0..N` positions the tile
         // materializes.
+        // The payload carries its own levels where it is a collection: an arm holding one is
+        // handed to its consumer as a level rather than as a map in a cell
+        // ([`Tiling::from_extent`]).
+        //
+        // An arm held as a tile keeps the tiling its union states for it, which is the shape its
+        // payload's producer gave it.
+        let arm_tiling = |union: &Tiling| match union {
+            Tiling::Union(arms) => arms
+                .get(&tag)
+                .cloned()
+                .unwrap_or_else(|| Tiling::from_extent(&payload_extent)),
+            _ => Tiling::from_extent(&payload_extent),
+        };
         let tiling = match input.tiling() {
-            Tiling::Scalar(Extent::Union(_)) => Tiling::data_function(
-                Extent::Base(BaseType::UInt),
-                Tiling::Scalar(payload_extent.clone()),
-            ),
+            union @ (Tiling::Scalar(Extent::Union(_)) | Tiling::Union(_)) => {
+                Tiling::data_function(Extent::Base(BaseType::UInt), arm_tiling(union))
+            }
             t @ Tiling::DataFunction { .. } => {
                 assert!(
-                    matches!(t.deepest_values(), Tiling::Scalar(Extent::Union(_))),
-                    "VariantProject: a scrutinee's values must be a Scalar(Union), got {t:?}"
+                    matches!(
+                        t.deepest_values(),
+                        Tiling::Scalar(Extent::Union(_)) | Tiling::Union(_)
+                    ),
+                    "VariantProject: a scrutinee's values must be a union, got {t:?}"
                 );
-                // The payload carries its own levels where it is a collection: an arm
-                // holding one is opened for its consumer rather than left a map in a cell
-                // ([`Tiling::from_extent`]).
-                change_tiling_result(t, |_| Tiling::from_extent(&payload_extent))
+                let arm = arm_tiling(t.deepest_values());
+                with_values_at(t, CurryLevel::values_of(t), arm)
             }
             other => panic!("VariantProject: a scrutinee must be a union, got {other:?}"),
         };
@@ -676,8 +762,21 @@ impl VariantProjectProducer {
         // projected payload co-iterates by key with the outer element) and its
         // union codomain. A bare `Scalar(Union)` has an implicit `0..N` domain,
         // supplied below as the positions themselves.
-        let (domain_col, domain_predicate, deleted, cv) = match tile {
-            Tile::Scalar(cv) => (None, Predicate::True, BitSet::new(), cv),
+        let (domain_col, domain_predicate, deleted, scrutinee) = match tile {
+            Tile::Scalar(cv) => (
+                None,
+                Predicate::True,
+                BitSet::new(),
+                scrutinee_of(Tile::Scalar(cv)),
+            ),
+            // A bare union's positions are known once its row is.
+            arms @ Tile::Union(_) => {
+                let known = match arms.is_empty() {
+                    true => Predicate::False,
+                    false => Predicate::True,
+                };
+                (None, known, BitSet::new(), scrutinee_of(arms))
+            }
             Tile::DataFunction {
                 row_starts,
                 domain,
@@ -695,13 +794,10 @@ impl VariantProjectProducer {
                     Some(domain),
                     domain_predicate,
                     deleted,
-                    scalar_tile_to_column_value(*codomain),
+                    scrutinee_of(*codomain),
                 )
             }
             other => panic!("VariantProject expects a union input, got {other:?}"),
-        };
-        let ColumnValue::Union(arms) = cv else {
-            panic!("VariantProject expects a Union codomain, got {cv:?}");
         };
         // The arm records exactly which rows carry this tag and, by position
         // within it, where each one's payload sits — so the projection is a
@@ -712,41 +808,78 @@ impl VariantProjectProducer {
         // what this projection was built for, so it simply never carries this tag
         // and the restriction is empty. That is what makes variant width
         // subtyping free at runtime.
+        let arm_rows: Vec<usize> = match &scrutinee {
+            Scrutinee::Column(arms) => arms
+                .get(&self.tag)
+                .map_or_else(Vec::new, |arm| arm.rows().to_vec()),
+            Scrutinee::Tiles(arms) => arms
+                .get(&self.tag)
+                .map_or_else(Vec::new, |arm| arm.rows.clone()),
+        };
         let mut key_positions: Vec<usize> = Vec::new();
         let mut slots: Vec<usize> = Vec::new();
-        if let Some(arm) = arms.get(&self.tag) {
-            for (pos, slot) in arm.row_slots() {
-                if !deleted.contains(pos) {
-                    key_positions.push(pos);
-                    slots.push(slot);
-                }
+        for (slot, &pos) in arm_rows.iter().enumerate() {
+            if !deleted.contains(pos) {
+                key_positions.push(pos);
+                slots.push(slot);
             }
         }
+        // An opened payload, and an arm of a bare union, state their completeness over their
+        // own rows, which the projection's keys now reach. An arm under a keyed scrutinee
+        // already states it over those keys' paths.
+        let stated_over_own_rows =
+            domain_col.is_none() || matches!(scrutinee, Scrutinee::Column(_));
         let out_domain = match domain_col {
             // Explicit stream domain: gather the actual keys at the kept positions.
             Some(d) => d.select_indices(key_positions.iter().copied(), key_positions.len()),
             // Implicit `Scalar(Union)` domain: the kept positions *are* the keys.
             None => ColumnValue::uints_from_rows(key_positions),
         };
-        let out_codomain = match arms.get(&self.tag) {
-            Some(arm) => arm
-                .values()
-                .select_indices(slots.iter().copied(), slots.len()),
-            // No arm for this tag: an empty codomain shaped by the arm's own
-            // declared payload extent.
-            None => ColumnValue::from_values(Vec::new(), &self.payload_extent),
+        // A payload held as a tile is handed out as the level it is. One held as a column is
+        // opened the way every other materialized value is ([`Tiling::from_extent`]). An
+        // absent arm's empty result is shaped by the arm's own declared payload extent.
+        let out_codomain = match &scrutinee {
+            Scrutinee::Tiles(arms) => match arms.get(&self.tag) {
+                Some(arm) => arm.tile.select_rows(&slots),
+                None => Tiling::from_extent(&self.payload_extent).empty_at_no_rows(),
+            },
+            Scrutinee::Column(arms) => {
+                let values = match arms.get(&self.tag) {
+                    Some(arm) => arm
+                        .values()
+                        .select_indices(slots.iter().copied(), slots.len()),
+                    None => ColumnValue::from_values(Vec::new(), &self.payload_extent),
+                };
+                open_collections(&values, &self.payload_extent)
+            }
         };
-        // The payload is opened the way every other materialized value is
-        // ([`Tiling::from_extent`]), so a collection riding an arm reaches its consumer as
-        // a level rather than as a map in a cell it would have to open first.
         let mut out = Tile::data_function(
             out_domain,
-            Box::new(open_collections(&out_codomain, &self.payload_extent)),
+            Box::new(out_codomain),
             domain_predicate,
             BitSet::new(),
         );
-        out.qualify_codomain_by_keys();
+        if stated_over_own_rows {
+            out.qualify_codomain_by_keys();
+        }
         out
+    }
+}
+
+/// A union scrutinee's arms, held as a column or, where a payload holds a collection, as tiles.
+enum Scrutinee {
+    Column(TagMap<UnionArm>),
+    Tiles(TagMap<UnionArmTile>),
+}
+
+/// The union `values` holds, as a column or as arm tiles.
+fn scrutinee_of(values: Tile) -> Scrutinee {
+    match values {
+        Tile::Union(arms) => Scrutinee::Tiles(arms),
+        other => match scalar_tile_to_column_value(other) {
+            ColumnValue::Union(arms) => Scrutinee::Column(arms),
+            cv => panic!("VariantProject expects a Union codomain, got {cv:?}"),
+        },
     }
 }
 
@@ -778,14 +911,17 @@ impl VariantIs {
     pub fn new(input: Box<dyn TileOperator>, tag: FieldKey) -> Self {
         // As [`VariantProject::new`], with `Bool` in place of the arm's payload.
         let tiling = match input.tiling() {
-            Tiling::Scalar(Extent::Union(_)) => Tiling::data_function(
+            Tiling::Scalar(Extent::Union(_)) | Tiling::Union(_) => Tiling::data_function(
                 Extent::Base(BaseType::UInt),
                 Tiling::Scalar(Extent::Base(BaseType::Bool)),
             ),
             t @ Tiling::DataFunction { codomain, .. } => {
                 assert!(
-                    matches!(codomain.as_ref(), Tiling::Scalar(Extent::Union(_))),
-                    "VariantIs: a scrutinee must have a Scalar(Union) codomain, got {codomain:?}"
+                    matches!(
+                        codomain.as_ref(),
+                        Tiling::Scalar(Extent::Union(_)) | Tiling::Union(_)
+                    ),
+                    "VariantIs: a scrutinee must have a union codomain, got {codomain:?}"
                 );
                 change_tiling_result(t, |_| Tiling::Scalar(Extent::Base(BaseType::Bool)))
             }
@@ -852,8 +988,7 @@ impl TileProducer for VariantIsProducer {
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         let tile = self.input.get(projection_guard);
-        let (domain_col, domain_predicate, deleted, cv) = match tile {
-            Tile::Scalar(cv) => (None, Predicate::True, BitSet::new(), cv),
+        let (domain_col, domain_predicate, deleted, values) = match tile {
             Tile::DataFunction {
                 domain,
                 codomain,
@@ -861,38 +996,42 @@ impl TileProducer for VariantIsProducer {
                 deleted,
                 ..
             } => {
+                // A union of arm tiles holds levels, but its tags are one per row like a
+                // column's, which is all this reads.
                 assert!(
-                    !codomain.holds_a_level(),
+                    matches!(*codomain, Tile::Union(_)) || !codomain.holds_a_level(),
                     "VariantIs rebuilds its domain from the positions it keeps, which has \
                      no meaning above one level"
                 );
-                (
-                    Some(domain),
-                    domain_predicate,
-                    deleted,
-                    scalar_tile_to_column_value(*codomain),
-                )
+                (Some(domain), domain_predicate, deleted, *codomain)
+            }
+            bare @ (Tile::Scalar(_) | Tile::Union(_)) => {
+                (None, Predicate::True, BitSet::new(), bare)
             }
             other => panic!("VariantIs expects a union input, got {other:?}"),
         };
-        let ColumnValue::Union(arms) = cv else {
-            panic!("VariantIs expects a Union codomain, got {cv:?}");
-        };
         // The arm records which rows carry the tag, so the test is a membership
         // check per surviving position rather than a walk over the payloads.
-        let carried: BitSet = arms
-            .get(&self.tag)
-            .map(|arm| arm.row_slots().map(|(pos, _)| pos).collect())
-            .unwrap_or_default();
+        let (carried, rows): (BitSet, usize) = match scrutinee_of(values) {
+            Scrutinee::Column(arms) => (
+                arms.get(&self.tag)
+                    .map(|arm| arm.row_slots().map(|(pos, _)| pos).collect())
+                    .unwrap_or_default(),
+                arms.values()
+                    .flat_map(|a| a.rows())
+                    .max()
+                    .map_or(0, |m| m + 1),
+            ),
+            Scrutinee::Tiles(arms) => (
+                arms.get(&self.tag)
+                    .map(|arm| arm.rows.iter().copied().collect())
+                    .unwrap_or_default(),
+                arms.values().map(|a| a.rows.len()).sum(),
+            ),
+        };
         let positions: Vec<usize> = match &domain_col {
             Some(d) => (0..d.len()).filter(|p| !deleted.contains(*p)).collect(),
-            None => (0..arms
-                .values()
-                .flat_map(|a| a.rows())
-                .max()
-                .map_or(0, |m| m + 1))
-                .filter(|p| !deleted.contains(*p))
-                .collect(),
+            None => (0..rows).filter(|p| !deleted.contains(*p)).collect(),
         };
         let answers: Vec<bool> = positions.iter().map(|p| carried.contains(*p)).collect();
         let out_domain = match domain_col {
@@ -1261,6 +1400,103 @@ mod tests {
             &[prefix],
             "a domain release must reach the scrutinee unchanged"
         );
+    }
+
+    /// The variant `{`none | `some{0..2 ⤇ Int}}` over a collection payload.
+    fn some_of_a_collection() -> TagMap<Extent> {
+        TagMap::from_arms(vec![
+            (FieldKey::Name("none".into()), Extent::Base(BaseType::Unit)),
+            (
+                FieldKey::Name("some".into()),
+                Extent::Function {
+                    domain: Box::new(Extent::uint_range(2)),
+                    codomain: Box::new(Extent::Base(BaseType::Int)),
+                },
+            ),
+        ])
+    }
+
+    /// The collection `{0 ↦ 10}`, its key `1` still to come.
+    fn growing_collection() -> Tile {
+        Tile::data_function(
+            ColumnValue::from_uints(vec![0]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![10]))),
+            Predicate::False,
+            BitSet::new(),
+        )
+    }
+
+    /// **A collection payload is wrapped as it arrives.** The arm holds it as a level, so the
+    /// wrap delivers the keys it has with the tag, rather than holding the value back until the
+    /// collection is complete as a materialized cell would have to.
+    #[test]
+    fn a_collection_payload_is_wrapped_while_it_grows() {
+        let some = FieldKey::Name("some".into());
+        let extents = some_of_a_collection();
+        let payload_tiling = Tiling::from_extent(extents.get(&some).unwrap());
+        let mut op = VariantWrap::new_at(
+            Box::new(FixedOp {
+                tile: growing_collection(),
+                tiling: payload_tiling,
+            }),
+            some.clone(),
+            extents,
+            CurryLevel::OUTERMOST,
+        );
+        assert!(matches!(op.tiling(), Tiling::Union(_)), "{}", op.tiling());
+        let mut sched = Scheduler::new();
+        let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut sched);
+        let tile = producer.get(producer.tiling().universal_guard());
+        let Some((tag, arm, slot)) = tile.union_arm_at(0) else {
+            panic!("the wrapped value's one row carries a tag: {tile:?}");
+        };
+        assert_eq!((tag, slot), (&some, 0));
+        assert_eq!(
+            arm.tile,
+            growing_collection(),
+            "the payload is its own level, unopened"
+        );
+        assert!(!tile.is_terminal(), "the collection is still growing");
+    }
+
+    /// **A projection hands out an arm's level as it is**: the arm's rows are the keys, and its
+    /// tile their values, with nothing opened or copied.
+    #[test]
+    fn projecting_a_collection_arm_hands_out_its_level() {
+        let some = FieldKey::Name("some".into());
+        let extents = some_of_a_collection();
+        let tiling = Tiling::from_extent(&Extent::Union(extents.clone()));
+        let tile = Tile::Union(TagMap::from_arms(vec![
+            (
+                FieldKey::Name("none".into()),
+                UnionArmTile {
+                    rows: Vec::new(),
+                    tile: Tile::Scalar(ColumnValue::Units(0)),
+                },
+            ),
+            (
+                some.clone(),
+                UnionArmTile {
+                    rows: vec![0],
+                    tile: growing_collection(),
+                },
+            ),
+        ]));
+        let mut op = VariantProject::new(
+            Box::new(FixedOp { tile, tiling }),
+            some.clone(),
+            extents.get(&some).unwrap().clone(),
+        );
+        let mut sched = Scheduler::new();
+        let mut producer = op.subscribe(op.tiling().universal_guard(), Box::new(|| {}), &mut sched);
+        let Tile::DataFunction {
+            domain, codomain, ..
+        } = producer.get(producer.tiling().universal_guard())
+        else {
+            panic!("a projection is keyed by the positions carrying the tag");
+        };
+        assert_eq!(domain, ColumnValue::from_uints(vec![0]));
+        assert_eq!(*codomain, growing_collection());
     }
 
     /// `VariantWrap` is domain-preserving, so output position `d` is payload

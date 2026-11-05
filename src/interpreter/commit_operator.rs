@@ -997,8 +997,8 @@ enum SeedNotReady {
 /// One pull of a seed stream as the value the store holds before any of its positions.
 ///
 /// A seed is one value per key however the producer that supplied it was shaped: a scalar,
-/// a struct-of-arrays record, or a collection-valued variable's whole map
-/// ([`materialized_row`] is what reads each as one). Only a **decided** collection is the
+/// a struct-of-arrays record, a variant whose payload is a tile, or a collection-valued
+/// variable's whole map ([`materialized_row`] is what reads each as one). Only a **decided** collection is the
 /// whole of it — an open one would seed the store with whichever keys had arrived, which
 /// is a partial map presented as the value before any position.
 fn seed_value(tile: &Tile) -> Result<Value, SeedNotReady> {
@@ -1009,7 +1009,7 @@ fn seed_value(tile: &Tile) -> Result<Value, SeedNotReady> {
         // A decided collection is a value at every row it has, the empty map included, so
         // there is no emptiness to test past the domain being closed.
         Tile::DataFunction { .. } => Ok(materialized_row(tile.clone())),
-        Tile::Scalar(_) | Tile::Record { .. } => {
+        Tile::Scalar(_) | Tile::Record { .. } | Tile::Union(_) => {
             let column = materialize_collections(tile.clone());
             if column.is_empty() {
                 Err(SeedNotReady::Empty)
@@ -1035,6 +1035,10 @@ fn is_whole_value(tile: &Tile) -> bool {
         Tile::Scalar(_) => true,
         // A row holding no cell of a field gave that cell back, so the value is not whole.
         Tile::Record { fields, absent } => absent.is_empty() && fields.values().all(is_whole_value),
+        // The row stands in one arm, and an arm holding no row says nothing of it.
+        Tile::Union(arms) => arms
+            .values()
+            .all(|arm| arm.rows.is_empty() || is_whole_value(&arm.tile)),
         _ => false,
     }
 }
@@ -2817,7 +2821,7 @@ impl TileProducer for InductionStoreProducer {
         // down the levels the recurrence is indexed by. An induction store with no rows above it
         // has paths of one component, which is the whole of that statement at depth zero:
         // one store, at the empty path.
-        let Tile::Scalar(union_col) = body_tile.deepest_values().clone() else {
+        let Some((body_tile, union_col)) = whole_decisions(&body_tile) else {
             return self.notifier.notify_if_changed(self.render_store());
         };
         for (path, idx) in decided_paths(&body_tile) {
@@ -3716,10 +3720,8 @@ impl StoreDenseReadProducer {
         let inner = Tile::grouped(
             starts,
             ColumnValue::from_values(positions, &self.domain),
-            Box::new(Tile::Scalar(ColumnValue::from_values(
-                folded_values,
-                &self.value_extent,
-            ))),
+            // Opened into the shape `read_tiling` declares, as every store read is.
+            Box::new(stored_value_tile(folded_values, &self.value_extent)),
             by_frontier
                 .into_iter()
                 .map(|(frontier, keys)| {
@@ -3734,12 +3736,24 @@ impl StoreDenseReadProducer {
                 .fold(Predicate::False, |all, one| all.union(&one)),
             BitSet::new(),
         );
-        Tile::data_function(
+        let mut tile = Tile::data_function(
             rows.clone(),
             Box::new(inner),
             domain_predicate.clone(),
             BitSet::new(),
-        )
+        );
+        // A stored value arrives whole, so what a collection inside it states holds under the
+        // path of the position holding it, which is what `read_tile`'s one-row qualification
+        // says for a read with no rows above.
+        let positions = Predicate::union_all(
+            tile.paths_at(CurryLevel::new(1))
+                .iter()
+                .map(|path| Predicate::exactly(path))
+                .collect(),
+        );
+        tile.values_at_mut(CurryLevel::new(2))
+            .map_level_predicates(&mut |depth, stated| stated.qualified_by(&positions, depth));
+        tile
     }
 }
 
@@ -6335,19 +6349,43 @@ fn body_decision_at(
     write_keys: &[Value],
     tap_fields: &[SmolStr],
 ) -> Option<(bool, Vec<Value>, Vec<bool>)> {
-    let Tile::DataFunction {
-        domain, codomain, ..
-    } = tile
-    else {
+    if !tile.is_data_function() {
         return None;
-    };
-    let keys = &domain;
-    // The decision codomain is a `Scalar(Union)` — one tagged variant per row.
-    let Tile::Scalar(union_col) = codomain.as_ref() else {
-        return None;
+    }
+    // The decision codomain is a union, one tagged variant per row.
+    let (tile, union_col) = whole_decisions(tile)?;
+    let Tile::DataFunction { domain: keys, .. } = &tile else {
+        unreachable!("keeping whole decisions leaves a collection a collection")
     };
     let row = (0..keys.len()).find(|&i| &keys.index_at(i) == pos.value())?;
-    decision_at_index(union_col, row, write_keys, tap_fields)
+    decision_at_index(&union_col, row, write_keys, tap_fields)
+}
+
+/// The decision stream `body_tile` at the positions whose decision is whole, with those
+/// decisions as one column, a decision per row; `None` where the values are no union.
+///
+/// A store holds each write as one value, so a decision is read once it is whole. One whose
+/// payload holds a collection is a union of arm tiles, delivered as the collection grows
+/// (`src/interpreter/design-operators.md`, "A variant's payload stays a tile"), so the positions
+/// whose decision is not yet complete are left for a later pull and the rest materialize.
+fn whole_decisions(body_tile: &Tile) -> Option<(Tile, ColumnValue)> {
+    match body_tile.deepest_values() {
+        Tile::Scalar(column) => Some((body_tile.clone(), column.clone())),
+        Tile::Union(_) => {
+            let mut tile = body_tile.clone();
+            let positions = CurryLevel::new(tile.innermost_depth()?);
+            let complete = tile.completion_at(positions);
+            let paths = tile.paths_at(positions);
+            let whole: Vec<bool> = paths
+                .iter()
+                .map(|path| complete.contains_path(path))
+                .collect();
+            tile.values_at_mut(positions).retain_keys(&whole);
+            let column = materialize_collections(tile.deepest_values().clone());
+            Some((tile, column))
+        }
+        _ => None,
+    }
 }
 
 /// [`body_decision_at`] once the row is known. The induction store finds the row by walking

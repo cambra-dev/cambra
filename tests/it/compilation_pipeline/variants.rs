@@ -1963,8 +1963,9 @@ fn a_collection_payload_is_one_variant_value(#[case] code: &str) {
 }
 
 /// One variant per row when each row's payload is a collection: the groups `[1]`, `[2, 3]`
-/// and `[4]` wrap into three `` `some `` values, each holding its group whole, rather than
-/// one per element.
+/// and `[4]` wrap into three `` `some `` values, rather than one per element, each holding its
+/// group as a level of the `some` arm (`src/interpreter/design-operators.md`, "A variant's
+/// payload stays a tile").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn a_collection_payload_per_row_is_one_variant_per_row() {
@@ -1979,24 +1980,79 @@ fn a_collection_payload_per_row_is_one_variant_per_row() {
         panic!("a collection of variants, got {tile:?}")
     };
     assert_eq!(domain.len(), 3, "one variant per group");
-    let cambra::interpreter::Tile::Scalar(cambra::interpreter::ColumnValue::Union(arms)) =
-        *codomain
-    else {
-        panic!("a union column, got {codomain:?}")
+    let cambra::interpreter::Tile::Union(arms) = *codomain else {
+        panic!("a union of arm tiles, got {codomain:?}")
     };
     let some = arms
         .get(&FieldKey::Name("some".into()))
         .expect("the `some` arm");
-    let lens: Vec<usize> = some
-        .values()
-        .clone()
-        .drain_to_value_iter()
-        .map(|v| match v {
-            Value::Function(bindings) => bindings.len(),
-            other => panic!("a group held whole, got {other:?}"),
-        })
-        .collect();
+    assert_eq!(some.rows, vec![0, 1, 2], "every group carries `some`");
+    let lens: Vec<usize> = some.tile.row_runs().map(|(from, to)| to - from).collect();
     assert_eq!(lens, vec![1, 2, 1]);
+}
+
+/// A mutable variable whose value is a variant with a collection payload, written by a loop:
+/// the store reads its seed and each decision once the payload is complete, as one value
+/// (`src/interpreter/design-operators.md`, "A variant's payload stays a tile"). The written
+/// payload is a list over its own positions, where the declared `List(Int)` bounds them.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::overwritten(
+    indoc! {"
+        o: Mut(Option(List(Int))) := Option::some(box([1, 2]))
+        for x in [3, 4]:
+            o := Option::some(box([7, 8]))
+        v = o
+    "},
+    15
+)]
+#[case::carried(
+    indoc! {"
+        o: Mut(Option(List(Int))) := Option::some(box([1, 2]))
+        for x in [3, 4]:
+            o := o
+        v = o
+    "},
+    3
+)]
+#[case::transactional(
+    indoc! {"
+        o: Mut(Option(List(Int)), Txn) := Option::some(box([1, 2]))
+        for x in [3, 4]:
+            with begin():
+                o := Option::some(box([7, 8]))
+        v = await_final(o)
+    "},
+    15
+)]
+// Merged with another mutable variable by a top-level `if`, the final value is a record
+// holding the payload's level beside a scalar.
+#[case::beside_an_int_in_a_writing_if(
+    indoc! {"
+        o: Mut(Option(List(Int))) := Option::some(box([1, 2]))
+        n := 0
+        i = 3
+        if i > 1:
+            o := Option::some(box([7, 8]))
+            n := 1
+        else:
+            o := Option::none
+            n := 2
+        v = o
+    "},
+    15
+)]
+fn a_mutable_variable_holds_a_collection_payload(#[case] program: &str, #[case] total: i64) {
+    check_scalar(
+        &formatdoc! {"
+            {program}
+            match v:
+                case Option::some(xs):
+                    sum(xs)
+                case Option::none:
+                    0"},
+        Value::Int(total),
+    );
 }
 
 /// A collection **literal** as the payload, written in place, does not compile: planning

@@ -516,14 +516,31 @@ impl TileProducer for ZipProducer {
                         .collect();
                 let mut codomains: Vec<Tile> = Vec::with_capacity(filtered_tiles.len());
                 let mut absent: HashMap<SmolStr, BitSet> = HashMap::new();
+                // What a level inside a value states is the pair's to say only beneath the rows it
+                // pairs: a row one arm states something about and the pair does not hold yet
+                // arrives later.
+                let paired =
+                    Predicate::union_all(rows.iter().map(|p| Predicate::exactly(p)).collect());
                 for (arm, filtered) in filtered_tiles.iter_mut().enumerate() {
                     let held = filtered.paths_at(rows_level);
                     // Lift the values out, leaving the chain of keys behind: what stays is
                     // the output's own shape, and every input has to agree on it.
-                    let values = std::mem::replace(
+                    let mut values = std::mem::replace(
                         filtered.values_at_mut(self.level),
                         Tile::record(HashMap::new()),
                     );
+                    // A statement naming rows is narrowed to the paired ones; one naming none
+                    // is about every row and says nothing a withheld row could contradict.
+                    if values.holds_a_level() {
+                        values.map_level_predicates(
+                            &mut |depth, stated| match stated.qualifies() {
+                                true => {
+                                    stated.intersect(&Predicate::True.qualified_by(&paired, depth))
+                                }
+                                false => stated.clone(),
+                            },
+                        );
+                    }
                     if held == rows {
                         // Presence is intersected over the outermost keys only, so arms that
                         // disagree beneath them would pair one arm's values under another's
