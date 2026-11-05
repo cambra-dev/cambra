@@ -443,7 +443,8 @@ pub(crate) enum Decided {
 }
 
 impl Decided {
-    /// Whether it covers `guard`, a region of the input.
+    /// Whether it covers `guard`, a region of the input, as the end-of-run check reads it.
+    #[cfg(debug_assertions)]
     pub(crate) fn covers(&self, guard: &TileGuard) -> bool {
         match self {
             Decided::Nothing => guard.is_empty(),
@@ -799,17 +800,29 @@ impl Dispatcher {
     /// Whether every pipeline `reader` reads has decided what of `guard`, a region of its input,
     /// it reaches ([`reaches`](Self::reaches)).
     fn reads_decided(&self, reader: usize, guard: &TileGuard) -> bool {
+        guard_minus(guard, &self.decided_part(reader, guard)).is_empty()
+    }
+
+    /// The part of `guard`, a region of `reader`'s input, that every pipeline `reader` reads has
+    /// decided: per read, the rows it reaches that it has decided, and the rows it does not reach
+    /// ([`reaches`](Self::reaches)).
+    fn decided_part(&self, reader: usize, guard: &TileGuard) -> TileGuard {
         let decided = self.states[reader]
             .decided
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let info = &self.infos[reader];
-        (0..info.reads.len()).all(|at| {
-            let needed = match info.reach.get(at).cloned().flatten() {
-                Some(region) => guard.intersect(&region),
-                None => guard.clone(),
-            };
-            decided.get(at).unwrap_or(&Decided::Nothing).covers(&needed)
+        (0..info.reads.len()).fold(guard.clone(), |part, at| {
+            let reach = info.reach.get(at).cloned().flatten();
+            match (decided.get(at).unwrap_or(&Decided::Nothing), reach) {
+                (Decided::Whole, _) => part,
+                (Decided::Region(region), Some(reach)) => {
+                    part.intersect(region).union(&guard_minus(&part, &reach))
+                }
+                (Decided::Region(region), None) => part.intersect(region),
+                (Decided::Nothing, Some(reach)) => guard_minus(&part, &reach),
+                (Decided::Nothing, None) => guard_minus(&part, &part),
+            }
         })
     }
 
@@ -862,9 +875,31 @@ impl Dispatcher {
                 .parked
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            let (released, kept) = std::mem::take(&mut *parked)
-                .into_iter()
-                .partition(|morsel| self.reads_decided(reader, morsel));
+            let morsels = std::mem::take(&mut *parked);
+            // A morsel a source's notify cut counts as one of its packages, so it is released
+            // whole; any other releases the part of it the pipelines it reads have decided, as a
+            // loop's scope reading a live list whole steps at each position the list decides.
+            let (released, kept): (Vec<TileGuard>, Vec<TileGuard>) =
+                match self.infos[reader].arrivals {
+                    true => morsels
+                        .into_iter()
+                        .partition(|morsel| self.reads_decided(reader, morsel)),
+                    false => {
+                        let mut released = Vec::new();
+                        let mut kept = Vec::new();
+                        for morsel in morsels {
+                            let part = self.decided_part(reader, &morsel);
+                            let rest = guard_minus(&morsel, &part);
+                            if !part.is_empty() {
+                                released.push(part);
+                            }
+                            if !rest.is_empty() {
+                                kept.push(rest);
+                            }
+                        }
+                        (released, kept)
+                    }
+                };
             *parked = kept;
             released
         };
@@ -2539,7 +2574,18 @@ pub struct Entry {
     pipeline: Placement,
     input: Tiling,
     inner: Box<dyn Consumer>,
+    /// Where an unplaced entry still records a decided push ([`DecidedTarget`]).
+    decides: DecidedTarget,
 }
+
+/// The pipeline an unplaced [`Entry`] records a decided push at, and that pipeline's input, which
+/// the entry's input keys name the same rows of: a loop's drive reads its source by pull, so the
+/// entry in front of the source queues nothing, but the positions the drive emits are the
+/// source's keys, so what the source decides of its keys the scope's input has decided of its
+/// positions. `None` where nothing records it, as in front of any other pulled input.
+// shared-state-ok: the drive and the entry in front of its source both hold it, the planner
+// writes it before the run, and what crosses it is a pipeline's index and a tiling, never a tile.
+pub type DecidedTarget = Rc<RefCell<Option<(PipelineId, Tiling)>>>;
 
 /// The pipeline an [`Entry`] queues for, which a planner sets once it has put the entry's breaker
 /// in one: `None` before, as in a run that only pulls, where the entry queues nothing.
@@ -2554,6 +2600,7 @@ impl Entry {
             pipeline: Rc::new(Cell::new(Some(pipeline))),
             input,
             inner,
+            decides: DecidedTarget::default(),
         }
     }
 
@@ -2567,8 +2614,15 @@ impl Entry {
             pipeline: pipeline.clone(),
             input,
             inner,
+            decides: DecidedTarget::default(),
         };
         (entry, pipeline)
+    }
+
+    /// The target this entry records a decided push at while it is unplaced, which the holder
+    /// keeps for a planner to set ([`DecidedTarget`]).
+    pub fn decided_target(&self) -> DecidedTarget {
+        self.decides.clone()
     }
 }
 
@@ -2619,10 +2673,25 @@ impl Consumer for Entry {
     }
 
     fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
-        if let Some(pipeline) = self.pipeline.get()
-            && let Some(guard) = pushed_guard(region, &self.input)
+        if let Some(pipeline) = self.pipeline.get() {
+            if let Some(guard) = pushed_guard(region, &self.input) {
+                landing.queue(pipeline, &guard);
+            }
+            return;
+        }
+        if !landing.is_decided() {
+            return;
+        }
+        if let Some((pipeline, input)) = &*self.decides.borrow()
+            && let Some(guard) = pushed_guard(region, input)
         {
-            landing.queue(pipeline, &guard);
+            // The drive's positions are its source's keys, so a region of the source's keys is
+            // one of the store's input.
+            debug_assert!(
+                guard.check_from(input),
+                "a drive's source decides positions of its store's input: {region:?}"
+            );
+            landing.queue(*pipeline, &guard);
         }
     }
     fn route(&mut self, routes: &mut Routes) {

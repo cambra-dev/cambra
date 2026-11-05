@@ -198,6 +198,27 @@ impl LoopScope {
         *self.drive.get_or_init(|| self.find_drive())
     }
 
+    /// Have the entry in front of the drive's source record a decided push of the source's keys
+    /// at `pipeline`, this scope's pipeline in the dispatcher around it, as decided positions of
+    /// the store's input: the drive reads its source by pull, so no push of the source reaches the
+    /// scope's entry otherwise, and the scope would park each round until the source is whole.
+    pub(super) fn decide_through_drive(&self, pipeline: PipelineId) {
+        let input = self.with_store(|store| store.input_tiling(InputId::ONLY));
+        let mut target = None;
+        reach_member(
+            &self.store,
+            &self.members[self.drive().0],
+            self.drive(),
+            &mut |breaker, _| {
+                target = breaker
+                    .as_producer()
+                    .and_then(|producer| producer.decides_through());
+            },
+        );
+        let target = target.expect("a loop's drive records its source's decided pushes");
+        *target.borrow_mut() = Some((pipeline, input));
+    }
+
     fn find_drive(&self) -> PipelineId {
         let drives: Vec<PipelineId> = self
             .starts

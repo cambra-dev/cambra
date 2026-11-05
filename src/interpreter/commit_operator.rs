@@ -6081,6 +6081,8 @@ struct DriverInputs {
     /// The placement of the entry in front of the source, which a planner sets where the drive
     /// is a pipeline breaker ([`InductionDriverProducer`]).
     placement: crate::interpreter::dispatcher::Placement,
+    /// Where the entry in front of the source records a decided push while unplaced.
+    decides: crate::interpreter::dispatcher::DecidedTarget,
     store_producer: Box<dyn TileProducer>,
     source_producer: Box<dyn TileProducer>,
     /// Set by every notification the source sends, for a driver that pulls the source
@@ -6111,10 +6113,26 @@ fn subscribe_behind_entry(
     Box<dyn TileProducer>,
     crate::interpreter::dispatcher::Placement,
 ) {
+    let (producer, placement, _) = subscribe_deciding(op, consumer, scheduler);
+    (producer, placement)
+}
+
+/// [`subscribe_behind_entry`], answering beside the placement the entry's decided target
+/// ([`DecidedTarget`](crate::interpreter::dispatcher::DecidedTarget)).
+fn subscribe_deciding(
+    op: &mut dyn TileOperator,
+    consumer: Box<dyn Consumer>,
+    scheduler: &mut Scheduler,
+) -> (
+    Box<dyn TileProducer>,
+    crate::interpreter::dispatcher::Placement,
+    crate::interpreter::dispatcher::DecidedTarget,
+) {
     let (entry, placement) =
         crate::interpreter::dispatcher::Entry::unplaced(op.tiling().clone(), consumer);
+    let decides = entry.decided_target();
     let producer = op.subscribe(op.tiling().universal_guard(), Box::new(entry), scheduler);
-    (producer, placement)
+    (producer, placement, decides)
 }
 
 fn subscribe_driver_inputs(
@@ -6132,7 +6150,7 @@ fn subscribe_driver_inputs(
     // positions it emits as a pipeline breaker's packages, and the pipelines beneath the source
     // have finished.
     let forward = source_news.consumer(forwarding_consumer(&consumer, &scheduler.wakeup_queue()));
-    let (source_producer, placement) = subscribe_behind_entry(source_op, forward, scheduler);
+    let (source_producer, placement, decides) = subscribe_deciding(source_op, forward, scheduler);
     // The store's progress changes what the drive renders — the next position it may
     // emit, and which rows it calls complete — so the store's wakes reach the drive's
     // consumer like the source's arrivals do.
@@ -6141,6 +6159,7 @@ fn subscribe_driver_inputs(
         consumer,
         gate,
         placement,
+        decides,
         store_producer,
         source_producer,
         source_news,
@@ -6382,6 +6401,7 @@ impl TileOperator for InductionDriver {
             store_producer: inputs.store_producer,
             source_producer: inputs.source_producer,
             source_news: inputs.source_news,
+            decides: inputs.decides,
             source: DecodedSource::default(),
             nested,
             consumer,
@@ -6483,6 +6503,8 @@ struct InductionDriverProducer {
     source_producer: Box<dyn TileProducer>,
     /// Whether the source has notified since it was last read.
     source_news: Notified,
+    /// Where the entry in front of the source records a decided push while unplaced.
+    decides: crate::interpreter::dispatcher::DecidedTarget,
     /// The source as of its last read.
     source: DecodedSource,
     /// `None` for a drive whose body takes the position alone.
@@ -6687,6 +6709,10 @@ impl TileProducer for InductionDriverProducer {
             .next_delivered(self.emitted_through.as_ref())
             .map(|path| path.to_vec());
         Some(next)
+    }
+
+    fn decides_through(&self) -> Option<crate::interpreter::dispatcher::DecidedTarget> {
+        Some(self.decides.clone())
     }
 
     fn release_impl(&mut self, obsolete_guard: TileGuard) {

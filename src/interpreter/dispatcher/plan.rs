@@ -286,6 +286,11 @@ fn run_targets(
             .as_ref()
             .expect("a scope's pipeline holds its scope")
     };
+    for (pipeline, scope) in scopes.iter().enumerate() {
+        if let Some(scope) = scope {
+            scope.borrow().decide_through_drive(PipelineId(pipeline));
+        }
+    }
     let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| match &members.located[pipeline.0] {
         Located::Sink(sink) => call(&mut *sink_breakers[*sink].borrow_mut(), InputId::ONLY),
         Located::Store { store, input, .. } => {

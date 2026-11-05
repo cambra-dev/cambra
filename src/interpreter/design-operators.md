@@ -1448,9 +1448,18 @@ source, which releases none of them until the scope or store consumes them. Over
 sources never yield everything, the scope or store never steps, and its source keeps every row it
 delivered.
 
-A pipeline that reads its input whole (`Dispatcher::read_whole`) parks that input from the start,
-and takes it once every pipeline it reads has decided it. A transaction store over a let-bound
-list, whose list's pipeline is decided in epoch 0, reads its input then.
+A pipeline that reads its input whole (`Dispatcher::read_whole`) parks that input from the start.
+A decided push releases the part of a parked region that every pipeline the reader reads has
+decided, and the rest stays parked (`Dispatcher::decided_part`). A transaction store over a
+let-bound list, whose list's pipeline is decided in epoch 0, reads its input then. A morsel a
+source's notify cut counts as one of that source's packages, so it is released whole.
+
+A loop's drive reads its source by pull, behind an entry no planner places in the run's
+dispatcher, so a push of the source stops there. The positions the drive emits are its source's
+keys, so the entry records a decided push of the source at the loop's scope, as the same keys of
+the store's input (`DecidedTarget`, set by `LoopScope::decide_through_drive`). A loop over a
+let-bound list of a live source then steps at each position the list has decided, before the
+source yields everything.
 
 #### Completeness in pushes
 

@@ -1771,7 +1771,7 @@ fn a_feed_inside_a_transaction_over_a_live_source(
                 out << pool
     "};
     let mut written_before_the_end = Vec::new();
-    let (written, _) = dispatched_live_observed(source, rows, batches, |sink| {
+    let (written, _) = dispatched_live_observed(source, rows, batches, |sink, _| {
         written_before_the_end
             .push(sink.value() == Err(crate::interpreter::SinkReadError::Incomplete));
     });
@@ -1779,6 +1779,46 @@ fn a_feed_inside_a_transaction_over_a_live_source(
     assert!(
         written_before_the_end.first() == Some(&true),
         "the first delivery's commits reach the sink before the next: {written_before_the_end:?}"
+    );
+}
+
+/// A loop over a let-bound list of a live source steps at each position the list has decided,
+/// before the source yields everything: the list's memo pushes its decided keys, which the drive
+/// reads by pull, and the entry in front of the drive's source records them at the loop's scope as
+/// decided positions. The store pushes only once terminal, so what shows the steps is what the
+/// store holds at each idle.
+#[rstest_log::rstest]
+fn a_loop_over_a_let_bound_live_list_steps_before_the_source_ends(
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let source = indoc! {"
+        out = test_sink()
+        xs = [x for x in source1()]
+        n := 0
+        for x in xs:
+            n := n + x
+            out << n
+    "};
+    fn held_by_store(producer: &mut dyn TileProducer) -> Option<usize> {
+        if producer.name().starts_with("InductionStore") {
+            return Some(producer.state_info().values);
+        }
+        let mut held = None;
+        producer.visit_input_producers_mut(&mut |_, input| {
+            held = held.or_else(|| held_by_store(input));
+        });
+        held
+    }
+    let mut held = Vec::new();
+    let (value, _) = dispatched_live_observed(source, rows, one_key_batches(4), |_, root| {
+        let mut root = root.borrow_mut();
+        let producer = root.as_mut().expect("a root holds its producer");
+        held.push(held_by_store(producer.as_mut()).expect("the sink reads the loop's store"));
+    });
+    assert_eq!(keyed_ints(&value), [(0, 1), (1, 3), (2, 6), (3, 10)]);
+    assert!(
+        held.windows(2).all(|pair| pair[0] < pair[1]),
+        "the store steps at each delivery, before the source yields everything: {held:?}"
     );
 }
 
@@ -1870,16 +1910,16 @@ fn dispatched_live_written(
     rows: usize,
     batches: Vec<Batch>,
 ) -> (Value, Vec<Planned>) {
-    dispatched_live_observed(source, rows, batches, |_| {})
+    dispatched_live_observed(source, rows, batches, |_, _| {})
 }
 
-/// [`dispatched_live_written`] with `idle` handed the sink each time the run has nothing to do,
-/// before the next delivery.
+/// [`dispatched_live_written`] with `idle` handed the sink, and the slot of the producer the sink
+/// reads, each time the run has nothing to do, before the next delivery.
 fn dispatched_live_observed(
     source: &str,
     rows: usize,
     batches: Vec<Batch>,
-    mut idle: impl FnMut(&crate::interpreter::TestSink),
+    mut idle: impl FnMut(&crate::interpreter::TestSink, &crate::interpreter::sinks::ProducerSlot),
 ) -> (Value, Vec<Planned>) {
     let mut ctx = GlobalContext::default();
     ctx.defer_sink_pulls();
@@ -1896,6 +1936,15 @@ fn dispatched_live_observed(
     let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
         .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
     let _operators = ctx.take_operator_map();
+    let root = program
+        .outputs
+        .iter()
+        .find(|output| output.name == "out")
+        .and_then(|output| output.sink_consumer.clone())
+        .unwrap_or_else(|| panic!("{source} writes to sink out"))
+        .borrow()
+        .producer_slot()
+        .clone();
     let mut batches = batches.into_iter();
     let deliver = |batch: Option<Batch>| {
         let Some((entries, complete)) = batch else {
@@ -1908,7 +1957,7 @@ fn dispatched_live_observed(
     deliver(batches.next());
     let planned =
         crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut || {
-            idle(&sink);
+            idle(&sink, &root);
             deliver(batches.next())
         })
         .unwrap_or_else(|refused| panic!("{refused}"))

@@ -1884,6 +1884,13 @@ pub trait TileProducer {
         None
     }
 
+    /// Where this producer is a loop's drive, the target the entry in front of its source records
+    /// a decided push at while the drive reads the source by pull, and `None` for any other
+    /// producer ([`DecidedTarget`](crate::interpreter::dispatcher::DecidedTarget)).
+    fn decides_through(&self) -> Option<crate::interpreter::dispatcher::DecidedTarget> {
+        None
+    }
+
     /// Take `cycle`, the handle on the cyclic fan-out whose input this producer is. A store
     /// keeps it to publish its snapshot and have its cycle read again while it steps itself as a
     /// pipeline breaker; every other producer ignores it. A cyclic fan-out calls this once, when
