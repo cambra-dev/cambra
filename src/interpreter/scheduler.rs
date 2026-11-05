@@ -4,6 +4,7 @@ use std::{
     rc::{Rc, Weak},
 };
 
+use crate::interpreter::CurryLevel;
 use crate::interpreter::{
     Consumer, DataSourceDomainExtentImpl, Projection, tile_operators::Notified,
     value_probe::ProbeSlot,
@@ -231,6 +232,42 @@ impl Consumer for Forwarding {
             Err(_) if admission.covers(region) => {}
             Err(_) => self.wakeups.request(shared.clone()),
         }
+    }
+}
+
+/// `consumer` behind a consumer that forwards each region of the input's keys at level `at` as
+/// the same paths one level in, with a component beneath the keys above `at` that admits anything:
+/// an inverse (`Converse`) at `at` passes this to its input, whose keys at `at` stand beneath the
+/// values that become its keys there. Each input key stands beneath exactly one value, so the
+/// region names exactly the paths it changed. A region of the keys above `at` is forwarded as it
+/// is, since those levels stand.
+pub fn one_level_in(at: CurryLevel, consumer: Box<dyn Consumer>) -> Box<dyn Consumer> {
+    Box::new(OneLevelIn { at, consumer })
+}
+
+struct OneLevelIn {
+    at: CurryLevel,
+    consumer: Box<dyn Consumer>,
+}
+
+impl OneLevelIn {
+    /// `region` one level in, `None` where it names keys beneath level `at`.
+    fn restated(&self, region: &Projection) -> Option<Projection> {
+        match region {
+            Projection::Keys { level, keys } if *level == self.at => Some(Projection::keys_at(
+                CurryLevel::new(level.index() + 1),
+                keys.with_level_inserted(level.index(), level.index()),
+            )),
+            Projection::Keys { level, .. } if *level > self.at => None,
+            standing => Some(standing.clone()),
+        }
+    }
+}
+
+impl Consumer for OneLevelIn {
+    fn notify(&mut self, arrived: &Projection) {
+        let restated = self.restated(arrived).unwrap_or(Projection::Everything);
+        self.consumer.notify(&restated);
     }
 }
 
@@ -1022,5 +1059,36 @@ mod tests {
         assert_eq!(*log.borrow_mut(), vec!["a", "b"]);
         scheduler.check_for_notifications(); // nothing left
         assert_eq!(*log.borrow_mut(), vec!["a", "b"]);
+    }
+
+    /// `one_level_in` at a nested level forwards a region of the inverted level's keys one level
+    /// in, beneath any value, passes a region of the standing keys above as it is, and widens a
+    /// region of the keys beneath.
+    #[test]
+    fn one_level_in_restates_the_inverted_level_and_passes_the_standing_one() {
+        use crate::interpreter::{Predicate, Value};
+        struct Record(Rc<RefCell<Vec<Projection>>>);
+        impl Consumer for Record {
+            fn notify(&mut self, arrived: &Projection) {
+                self.0.borrow_mut().push(arrived.clone());
+            }
+        }
+        let arrivals = Rc::new(RefCell::new(Vec::new()));
+        let mut consumer = one_level_in(CurryLevel::new(1), Box::new(Record(arrivals.clone())));
+        let point = |k: u64| Predicate::point(Value::UInt(k));
+        let standing = Projection::keys_at(CurryLevel::OUTERMOST, point(4));
+        let inverted = Predicate::qualified(point(4), point(7));
+        let beneath = Predicate::qualified(Predicate::qualified(point(4), point(7)), point(1));
+        consumer.notify(&standing);
+        consumer.notify(&Projection::keys_at(CurryLevel::new(1), inverted.clone()));
+        consumer.notify(&Projection::keys_at(CurryLevel::new(2), beneath));
+        assert_eq!(
+            *arrivals.borrow(),
+            vec![
+                standing,
+                Projection::keys_at(CurryLevel::new(2), inverted.with_level_inserted(1, 1)),
+                Projection::Everything,
+            ]
+        );
     }
 }
