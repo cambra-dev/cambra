@@ -135,6 +135,12 @@ pub enum SyntheticKind {
     /// ([`crate::ccl::comprehension`]): the index position the element map is
     /// read at, which the generator sources are then indexed by.
     IterRecord,
+    /// A group-by's key binder, in its expansion ([`crate::ccl::comprehension`]): the key
+    /// its group is read at.
+    GroupKey,
+    /// A group-by's member binder, in its expansion ([`crate::ccl::comprehension`]): the
+    /// position of the collection a group's member is read at.
+    GroupMember,
     /// The binder [`crate::ccl::opaque_output`] mints for a lambda's result,
     /// annotated with a barrier variable.
     Output,
@@ -160,6 +166,8 @@ impl SyntheticKind {
             SyntheticKind::AnfTemp => "__anf",
             SyntheticKind::MutRead => "__read",
             SyntheticKind::IterRecord => "__iter_record",
+            SyntheticKind::GroupKey => "__gb_k",
+            SyntheticKind::GroupMember => "__gb_i",
             SyntheticKind::Output => "__output",
             SyntheticKind::Component => "__component",
             SyntheticKind::ExceptionLoop => "__loop",
@@ -630,6 +638,16 @@ impl Name {
     /// encoding ([`crate::ccl::comprehension`]).
     pub fn iter_record() -> Self {
         Self::synthetic(SyntheticKind::IterRecord)
+    }
+
+    /// A fresh key binder for a group-by's expansion ([`crate::ccl::comprehension`]).
+    pub fn group_key() -> Self {
+        Self::synthetic(SyntheticKind::GroupKey)
+    }
+
+    /// A fresh member binder for a group-by's expansion ([`crate::ccl::comprehension`]).
+    pub fn group_member() -> Self {
+        Self::synthetic(SyntheticKind::GroupMember)
     }
 
     /// The binder naming the value a block's mutable-variable reads denote over

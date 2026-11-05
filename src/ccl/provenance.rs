@@ -2683,7 +2683,9 @@ mod tests {
     /// regression that removed the skip would show up nowhere.
     ///
     /// The number moves when the corpus does. It is a measurement, not a bound —
-    /// update it and say what changed.
+    /// update it and say what changed. It is zero since a group-by's predicates, which held
+    /// copies of its lowered collection, are built by the comprehension phase rather than
+    /// swept in lowering; `int_to_uint`'s predicate holds no lowered node.
     #[test]
     fn the_predicate_sweep_skips_this_many_nodes_over_the_corpus() {
         use crate::ccl::context::{GlobalContext, compile_program};
@@ -2700,7 +2702,7 @@ mod tests {
             total += take_predicate_sweep_skips();
         }
         assert_eq!(
-            total, 8,
+            total, 0,
             "the predicate sweep skipped {total} nodes over the corpus",
         );
     }
@@ -2718,8 +2720,8 @@ mod tests {
     /// This is the one property of `lowering_predicate_leaf` that **no leak class
     /// can see**: the fold is last-write-wins, so a node re-recorded by the sweep
     /// is still explained — it has swapped its real span and label for the
-    /// sweep's coarse ones. A blanket sweep clobbers 30 nodes over the pipeline
-    /// corpus and every gate stays green.
+    /// sweep's coarse ones. A blanket sweep clobbers every lowered node a predicate
+    /// holds, and every gate stays green.
     #[test]
     fn the_predicate_sweep_skips_already_recorded_nodes() {
         let [recorded_id, fresh] = ids::<2>();

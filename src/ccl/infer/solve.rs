@@ -2289,8 +2289,8 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
     // deeper; their bodies return to the enclosing level. This lets
     // `should_generalize` recognize the same generalized lets as emission.
     match &mut expr.node {
-        TypedExprNode::Comprehension { .. } => {
-            unreachable!("a Comprehension reached inference; the comprehension phase eliminates it")
+        TypedExprNode::Comprehension { .. } | TypedExprNode::GroupBy { .. } => {
+            unreachable!("a surface node reached inference; the comprehension phase eliminates it")
         }
         TypedExprNode::DefGroup { .. } => {
             unreachable!("a DefGroup reached coalesce; emission rewrites it into `Let`s")

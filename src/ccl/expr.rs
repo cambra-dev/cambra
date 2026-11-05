@@ -401,6 +401,23 @@ pub enum TypedExprNode {
         element: Box<TypedExpr>,
     },
 
+    /// `groupby(collection, key)` kept in surface form, each group collapsed by `collapse`
+    /// where one is given: `set` and `map` are group-bys whose groups collapse to one value.
+    ///
+    /// Lowering builds this node and [`crate::ccl::comprehension`] expands it before
+    /// inference, after encoding the comprehensions in `collection`. The expansion places
+    /// `collection` in its key domain, in its groups' refinement and in its groups, and copies
+    /// of the finished term are one term (`src/ccl/design/collections.md`, "Constructor
+    /// lowering: runtime `groupby` now, constant-folding later").
+    GroupBy {
+        /// The collection grouped.
+        collection: Box<TypedExpr>,
+        /// The key function, from an element to its group's key.
+        key: Box<TypedExpr>,
+        /// The function from a group to the value it collapses to, a `λ`.
+        collapse: Option<Box<TypedExpr>>,
+    },
+
     /// A binary operation.
     BinOp {
         /// The left-hand operand.
@@ -1099,6 +1116,7 @@ impl TypedExprNode {
             TypedExprNode::Apply { .. } => "Apply",
             TypedExprNode::Cast { .. } => "Cast",
             TypedExprNode::Comprehension { .. } => "Comprehension",
+            TypedExprNode::GroupBy { .. } => "GroupBy",
             TypedExprNode::BinOp { .. } => "BinOp",
             TypedExprNode::UnaryOp { .. } => "UnaryOp",
             TypedExprNode::Lambda { .. } => "Lambda",
@@ -1886,6 +1904,15 @@ impl TypedExpr {
         Self::new(TypedExprNode::UnaryOp(op, Box::new(operand)))
     }
 
+    /// Construct a [`TypedExprNode::GroupBy`] expression.
+    pub fn group_by(collection: Self, key: Self, collapse: Option<Self>) -> Self {
+        Self::new(TypedExprNode::GroupBy {
+            collection: Box::new(collection),
+            key: Box::new(key),
+            collapse: collapse.map(Box::new),
+        })
+    }
+
     /// Construct an n-ary composition expression.
     ///
     /// `exprs` must contain at least two morphisms. The composition is
@@ -2096,6 +2123,17 @@ impl TypedExpr {
                     g.guards.iter().for_each(&mut f);
                 }
                 f(element.as_ref());
+            }
+            TypedExprNode::GroupBy {
+                collection,
+                key,
+                collapse,
+            } => {
+                f(collection);
+                f(key);
+                if let Some(collapse) = collapse {
+                    f(collapse);
+                }
             }
             TypedExprNode::Lit(_)
             | TypedExprNode::Var(_)
@@ -2312,6 +2350,17 @@ impl TypedExpr {
                 }
                 f(element.as_mut());
             }
+            TypedExprNode::GroupBy {
+                collection,
+                key,
+                collapse,
+            } => {
+                f(collection);
+                f(key);
+                if let Some(collapse) = collapse {
+                    f(collapse);
+                }
+            }
             TypedExprNode::Lit(_)
             | TypedExprNode::Var(_)
             | TypedExprNode::Builtin(_)
@@ -2479,6 +2528,7 @@ impl TypedExpr {
             | TypedExprNode::Abstract
             | TypedExprNode::Error
             | TypedExprNode::Apply { .. }
+            | TypedExprNode::GroupBy { .. }
             | TypedExprNode::Cast { .. }
             | TypedExprNode::Raise { .. }
             | TypedExprNode::BinOp { .. }
@@ -2566,6 +2616,7 @@ impl TypedExpr {
             | TypedExprNode::Abstract
             | TypedExprNode::Error
             | TypedExprNode::Apply { .. }
+            | TypedExprNode::GroupBy { .. }
             | TypedExprNode::Cast { .. }
             | TypedExprNode::Realized { .. }
             | TypedExprNode::Comprehension { .. }
@@ -2639,6 +2690,7 @@ impl TypedExpr {
             | TypedExprNode::Abstract
             | TypedExprNode::Error
             | TypedExprNode::Apply { .. }
+            | TypedExprNode::GroupBy { .. }
             | TypedExprNode::Cast { .. }
             | TypedExprNode::Raise { .. }
             | TypedExprNode::BinOp { .. }
