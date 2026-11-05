@@ -763,29 +763,14 @@ impl TileProducer for LookupProducer {
         let rows_level = CurryLevel::new(self.level.index() - 1);
         let decided: Vec<bool> = answers.iter().map(Option::is_some).collect();
         if !decided.iter().all(|&d| d) {
-            let undecided: Vec<Vec<Value>> = tile
-                .paths_at(rows_level)
-                .into_iter()
+            let paths = tile.paths_at(rows_level);
+            let withheld: Vec<&[Value]> = paths
+                .iter()
                 .zip(&answers)
                 .filter(|(_, answer)| answer.is_none())
-                .map(|(path, _)| path)
+                .map(|(path, _)| path.as_slice())
                 .collect();
-            for level in 0..self.level.index() {
-                let missing = Predicate::flatten_or(
-                    undecided
-                        .iter()
-                        .map(|path| Predicate::exactly(&path[..=level]))
-                        .collect(),
-                );
-                let Tile::DataFunction {
-                    domain_predicate, ..
-                } = tile.values_at_mut(CurryLevel::new(level))
-                else {
-                    unreachable!("every level above the rows is a collection")
-                };
-                *domain_predicate = domain_predicate.minus(&missing);
-            }
-            tile.values_at_mut(rows_level).retain_keys(&decided);
+            tile.withhold(rows_level, &decided, &withheld);
         }
         *tile.values_at_mut(self.level) = Tile::Scalar(ColumnValue::from_values(
             answers.into_iter().flatten().collect(),
@@ -1088,6 +1073,23 @@ mod tests {
         } = &out
         else {
             panic!("the answer tiles as a collection: {out:?}")
+        };
+        assert!(!domain_predicate.contains_path(&[Value::UInt(1)]));
+    }
+
+    /// Row 1 of `keyed_rows(2)` waits on key `2` in its collection, and a complete path's
+    /// descendants are complete at every depth, so the input calls no path through row 1
+    /// complete.
+    #[test]
+    fn keyed_rows_calls_no_row_awaiting_its_key_complete() {
+        let mut lookup = keyed_rows(2);
+        let guard = lookup.input.tiling().universal_guard();
+        let input = lookup.input.get(guard);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &input
+        else {
+            panic!("the input tiles as a collection: {input:?}")
         };
         assert!(!domain_predicate.contains_path(&[Value::UInt(1)]));
     }
