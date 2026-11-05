@@ -340,7 +340,7 @@ impl LoopScope {
         for &start in starts {
             match self.inner.is_source(start) {
                 true => self.inner.notify(start, guard),
-                false => self.inner.queue_for(start, guard),
+                false => self.inner.queue_round(start, guard),
             }
         }
         // A blocking seal would wait for a retirement only this thread makes.

@@ -393,6 +393,16 @@ struct PipelineInfo {
     reach: Vec<Option<TileGuard>>,
 }
 
+/// A region a pipeline parked ([`Dispatcher::park`]), and whether a release may hand out the part
+/// of it that is decided and keep the rest. A morsel a source's notify cut counts as one of that
+/// source's packages, and a row a loop's round queues is read for the row's end, which its reads
+/// state only once they have decided all of it, so both are released whole.
+#[derive(Debug)]
+struct Parked {
+    guard: TileGuard,
+    splits: bool,
+}
+
 /// What the dispatcher keeps of one pipeline across epochs.
 struct PipelineState {
     /// The region this pipeline's breaker has pushed to its reader, which each push grows by
@@ -418,7 +428,7 @@ struct PipelineState {
     /// the pipelines it reads have not decided yet.
     // shared-state-ok: guards naming regions of the pipeline's input, which its notifies and the
     // decided pushes that release them read and write under the lock; never a tile.
-    parked: Mutex<Vec<TileGuard>>,
+    parked: Mutex<Vec<Parked>>,
     /// For a pipeline that parks the rows pushes bring, every row a push or a start has brought it,
     /// queued or parked, in any epoch, `None` for none: two pushes can name one row, as a widened
     /// read's and a stream read's do, and the pipeline reads each row once
@@ -642,21 +652,33 @@ impl Dispatcher {
 
     /// Queue `guard`, a guard of the input of `reader`'s breaker, as a package of `reader` in the
     /// current epoch, less what is queued for it there already: at the start, what a range brings
-    /// that no push names ([`run_program`]), and in a loop's round, the row of a nested loop's
-    /// store, which follows the pipelines inside the cycle around it ([`follow`](Self::follow),
-    /// `loop_scope::LoopScope`).
+    /// that no push names ([`run_program`]). A reader that parks parks what the pipelines it
+    /// reads have not decided, and a release hands out the part they decide.
     ///
     /// # Panics
     ///
     /// When `reader`'s queue in the current epoch has closed: every pipeline it reads has
     /// finished the epoch.
     pub(crate) fn queue_for(&self, reader: PipelineId, guard: &TileGuard) {
+        self.queue_in_current(reader, guard, false);
+    }
+
+    /// [`queue_for`](Self::queue_for) for a loop's round: the row of a nested loop's store, which
+    /// follows the pipelines inside the cycle around it ([`follow`](Self::follow)), or a row the
+    /// closing round has every inner pipeline read again (`loop_scope::LoopScope`). A reader that
+    /// parks takes the row again whatever it took before, and only once the pipelines it reads
+    /// have decided all of it, the row's end with its rows ([`Parked`]).
+    pub(crate) fn queue_round(&self, reader: PipelineId, guard: &TileGuard) {
+        self.queue_in_current(reader, guard, true);
+    }
+
+    fn queue_in_current(&self, reader: PipelineId, guard: &TileGuard, round: bool) {
         let current = self.current.load(Ordering::Acquire);
         let epoch = self
             .epoch(current)
             .expect("the window holds the current epoch");
         if self.infos[reader.0].parks {
-            self.queue_or_park(&epoch, reader.0, guard);
+            self.queue_or_park(&epoch, reader.0, guard, round);
             self.advance();
             return;
         }
@@ -826,10 +848,12 @@ impl Dispatcher {
         })
     }
 
-    /// Queue `guard`, rows a push or a start brings `reader`, which parks, in `epoch` where every
-    /// pipeline it reads has decided them, and park them otherwise ([`park`](Self::park)). Only
-    /// what of `guard` no push or start brought before, in any epoch, is new.
-    fn queue_or_park(&self, epoch: &EpochState, reader: usize, guard: &TileGuard) {
+    /// Queue `guard`, rows a push or the dispatcher's caller brings `reader`, which parks, in
+    /// `epoch` where every pipeline it reads has decided them, and park the rest
+    /// ([`park`](Self::park)). Of a push, only what no push or queue brought before, in any epoch,
+    /// is new. What the caller queues is queued whole (`again`): a loop's closing round has each
+    /// inner pipeline read its row again, which then states the row complete.
+    fn queue_or_park(&self, epoch: &EpochState, reader: usize, guard: &TileGuard, again: bool) {
         let mut parked = self.states[reader]
             .parked
             .lock()
@@ -839,9 +863,9 @@ impl Dispatcher {
                 .brought
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            let fresh = match brought.as_ref() {
-                Some(brought) => guard_minus(guard, brought),
-                None => guard.clone(),
+            let fresh = match (again, brought.as_ref()) {
+                (false, Some(brought)) => guard_minus(guard, brought),
+                _ => guard.clone(),
             };
             if fresh.is_empty() {
                 return;
@@ -852,12 +876,25 @@ impl Dispatcher {
             });
             fresh
         };
-        if !self.reads_decided(reader, &fresh) {
-            parked.push(fresh);
-            return;
+        let decided = match again {
+            // A row a loop's round queues is consumed whole: its rows' values can be decided
+            // before the row's end is, which only the closing round's reads state.
+            true if !self.reads_decided(reader, &fresh) => guard_minus(&fresh, &fresh),
+            true => fresh.clone(),
+            false => self.decided_part(reader, &fresh),
+        };
+        let rest = guard_minus(&fresh, &decided);
+        if !rest.is_empty() {
+            parked.push(Parked {
+                guard: rest,
+                splits: !again,
+            });
         }
         drop(parked);
-        let appended = epoch.pipelines[reader].queue.append_unqueued(&fresh);
+        if decided.is_empty() {
+            return;
+        }
+        let appended = epoch.pipelines[reader].queue.append_unqueued(&decided);
         self.ensure(appended, || {
             format!(
                 "pipeline {reader} receives packages before the last pipeline it reads finishes"
@@ -875,31 +912,28 @@ impl Dispatcher {
                 .parked
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            let morsels = std::mem::take(&mut *parked);
-            // A morsel a source's notify cut counts as one of its packages, so it is released
-            // whole; any other releases the part of it the pipelines it reads have decided, as a
-            // loop's scope reading a live list whole steps at each position the list decides.
-            let (released, kept): (Vec<TileGuard>, Vec<TileGuard>) =
-                match self.infos[reader].arrivals {
-                    true => morsels
-                        .into_iter()
-                        .partition(|morsel| self.reads_decided(reader, morsel)),
-                    false => {
-                        let mut released = Vec::new();
-                        let mut kept = Vec::new();
-                        for morsel in morsels {
-                            let part = self.decided_part(reader, &morsel);
-                            let rest = guard_minus(&morsel, &part);
-                            if !part.is_empty() {
-                                released.push(part);
-                            }
-                            if !rest.is_empty() {
-                                kept.push(rest);
-                            }
-                        }
-                        (released, kept)
-                    }
+            // A region that splits releases the part the pipelines it reads have decided, so a
+            // loop's scope that reads a live list whole steps once per position the list decides.
+            // Any other region waits until they have decided all of it ([`Parked`]).
+            let mut released = Vec::new();
+            let mut kept = Vec::new();
+            for morsel in std::mem::take(&mut *parked) {
+                let part = match morsel.splits {
+                    true => self.decided_part(reader, &morsel.guard),
+                    false if self.reads_decided(reader, &morsel.guard) => morsel.guard.clone(),
+                    false => guard_minus(&morsel.guard, &morsel.guard),
                 };
+                let rest = guard_minus(&morsel.guard, &part);
+                if !part.is_empty() {
+                    released.push(part);
+                }
+                if !rest.is_empty() {
+                    kept.push(Parked {
+                        guard: rest,
+                        splits: morsel.splits,
+                    });
+                }
+            }
             *parked = kept;
             released
         };
@@ -1089,7 +1123,14 @@ impl Dispatcher {
             .parked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .extend(seed(input, self.morsel_rows));
+            .extend(
+                seed(input, self.morsel_rows)
+                    .into_iter()
+                    .map(|guard| Parked {
+                        guard,
+                        splits: true,
+                    }),
+            );
     }
 
     /// Mark `pipeline` as consuming its morsels one at a time, epoch by epoch: every morsel of an
@@ -1345,7 +1386,10 @@ impl Dispatcher {
                     .iter()
                     .cloned()
                     .partition(|morsel| self.reads_decided(p, morsel));
-                parked.extend(undecided);
+                parked.extend(undecided.into_iter().map(|guard| Parked {
+                    guard,
+                    splits: false,
+                }));
                 parked_out = decided;
                 if parked_out.is_empty() {
                     return;
@@ -2469,7 +2513,7 @@ impl Landing<'_> {
         // release them ([`Dispatcher::park`]).
         if info.parks {
             if !self.widened && (!info.arrivals || info.pushed_rows.contains(&from)) {
-                dispatcher.queue_or_park(epoch, r, guard);
+                dispatcher.queue_or_park(epoch, r, guard, false);
             }
             return;
         }
