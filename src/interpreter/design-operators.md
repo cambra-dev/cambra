@@ -40,6 +40,7 @@ Runtime filtering uses `Filter` operators, not a populated `Restriction` handle;
 | --- | --- |
 | `Scalar(Extent)` | A column of values, empty where no scalar has arrived. |
 | `Record(fields)` | One sub-tiling per field. |
+| `Union(arms)` | One sub-tiling per tag, for a variant whose payload holds a collection; see [A variant's payload stays a tile](#a-variants-payload-stays-a-tile). |
 | `DataFunction { domain, codomain }` | One collection level: keys in the domain extent and values with the codomain tiling. Collections and records can nest. |
 | `Aggregation { kind, accumulator }` | An aggregate kind and its accumulator tiling. A reducing fold has a scalar accumulator; `Sole` retains the element's tiling. |
 | `Store { domain, codomain }` | A step function over a sequencing domain with a per-key state record; see [The store is a changelog, not a function](#the-store-is-a-changelog-not-a-function). |
@@ -62,6 +63,7 @@ the root and the parent collection's key count inside a codomain.
 | --- | --- |
 | `Scalar(ColumnValue)` | Scalar cells in row order. An empty root column denotes an unknown scalar; a known root scalar has one cell. |
 | `Record { fields, absent }` | A tile per field over the same rows. `absent` records released field cells while sibling fields keep their rows live. |
+| `Union(arms)` | Per tag, the rows carrying it and a tile of their payloads over those rows. |
 | `DataFunction { row_starts, domain, codomain, domain_predicate, deleted }` | Collection keys grouped by enclosing row, their value tiles, completion information and logical deletions. |
 | `Aggregation { kind, accumulator, terminal }` | The aggregate's accumulator tile and per-row completion flags. |
 | `Store { … }` | Per-key changelogs, initial values and progress state, with step-function reads rather than collection lookup. The [commit operator](#the-commit-operator-interpretercommit_operatorrs) defines that contract. |
@@ -124,6 +126,7 @@ subset of a tiling.
 | `Scalar(Predicate)` | Whole scalar cells under the paths admitted by the predicate. |
 | `Aggregation(Predicate)` | Whole aggregate results under the paths admitted by the predicate. |
 | `Record(fields)` | One region per field. |
+| `Union(arms)` | One region per tag, within the rows carrying it. |
 | `Function(FunctionGuard)` | Keys or values within a function tiling, as specified below. |
 | `Or(arms)` | A union of regions that no single guard variant represents, such as a mixture of outer-key and inner-key regions. |
 
@@ -446,11 +449,60 @@ and key fit in one column, but an element containing a collection requires a `Ti
 whose `_0` field retains its levels. `Uncurry` combines two key levels into one pair-keyed level
 without materializing their values.
 
-Variant payloads and store writes require materialized values. `VariantWrap` waits for a
-collection payload to complete, then emits it as one cell at the level named by the payload's
-type, not necessarily the input's innermost level. `VariantProject` opens it back into levels.
-For a feed leaving a nested loop, this round trip carries the inner tap collection through the
-enclosing decision's variant payload; the channel then flattens the two collection levels.
+Store writes require materialized values; see
+[Where a collection is materialized](#where-a-collection-is-materialized).
+
+### Joining branch results
+
+The result's type supplies the common codomain. Equal layouts stay in place. Collections whose
+domains differ are read under the bound the result type gives them, with each value retaining its
+keys. The join recurses into record fields and variant payloads. Other differing layouts must
+fit in one column. Each arm is restated in the joined layout before its rows are merged.
+
+A disjoint union tags each arm's keys with its declared tag and dispatches releases by that tag.
+`new` assigns positional tags; `new_tagged` accepts the feed-site tags a channel declares.
+Completion beneath each key uses the same tag. The flat form retains the keys of the selected arm and merges them under the result's declared
+domain bound.
+
+### A variant's payload stays a tile
+
+A variant whose payload holds a collection is a `Tile::Union`, the sum counterpart of a record of
+tiles. It stands over its rows as a record does, and its arms partition them: each arm holds the
+rows carrying its tag, ascending, and its payloads as one tile over those rows. A collection payload
+is that arm tile's level, so it grows as it arrives. A variant with no collection in any payload
+stays a `ColumnValue::Union` column. `Tiling::from_extent` chooses between the two by
+`Extent::holds_a_collection`.
+
+`VariantWrap` places its payload, at the level the payload's type names, as the wrapped tag's arm
+over every row. Every other arm is present and empty, so the union is total over its tags.
+`VariantProject` reads the arm's rows as the projected keys and hands out the arm's tile as their
+values, so nothing is copied in either direction. `VariantIs` reads the arms' rows alone.
+
+The operations follow the record's:
+
+- **Merge.** Under a collection the other side's rows follow these, each in the arm of its own
+  tag. A whole value is one row, whose two arrivals carry one tag, so that arm's tiles merge whole.
+  A row both sides deliver in a keyed merge carries one tag on both sides.
+- **Release.** A `TileGuard::Union` names one region per tag, and each arm releases its own
+  within its rows. With no level above, an arm named whole is cleared, since a row cannot keep its
+  tag without its payload. A row's tag is fixed, so `to_guard` has each arm also name, as whole,
+  the rows the other tags carry. A row is released by its key where every arm names it whole,
+  which its own arm decides (`lift_union` in `tiling/guard.rs`).
+- **Materialization.** `materialize_collections` turns a `Tile::Union` into a union column whose
+  arms hold map cells, and `open_collections` opens one back. A store holds each write as one
+  value, so a writer's decision is read once it is whole: positions whose decision payload is still
+  growing wait for a later pull, and the rest materialize (`whole_decisions` in
+  `commit_operator.rs`). A seed is read the same way, once every arm holding its row is whole
+  (`is_whole_value`).
+- **Branches.** The arm `VariantWrap` wraps keeps its payload's own tiling, a collection over its
+  own keys, and the other arms state the bound the declared type gives. A `UnionOperator` merging
+  two such branches joins their tilings at that bound inside the union. Width subtypes can
+  omit tags: each tag joins only the inputs carrying it. Restatement supplies an empty arm
+  for an omitted tag and converts scalar variant columns to arm tiles when another tag holds
+  a collection.
+
+A path does not say which tag its row carries, so `TileGuard::covers_path` covers a path under a
+union only where every arm covers it.
 
 ---
 
@@ -545,6 +597,14 @@ until the whole pair is released. Whole-pair releases reach every arm. The row-p
 emitted-key tracking drops a pair once it is released whole, including when accumulated field
 releases together cover the pair, and drops a row an arm deletes where the zip gives the row back
 to that arm.
+
+A `Zip` input whose values hold a level releases a key only where the zip's output released it.
+Such an input keeps its rows open itself, so one whose whole value a reader released, a field
+`SelectField` does not read, still holds the keys later rows pair on. In canonical form that
+whole value names the key, so `Zip` keeps the key back from the input and removes the released
+value from its own output. This applies at every standing level: a guard normalized to an
+ancestor's keys is descended to the paired keys before limiting it to the output's released
+paths. Releasing an enclosing key releases every paired key below it.
 
 ### Guard operations are exact
 
@@ -764,9 +824,9 @@ derived from the edges on both sides of the wire rather than serialized separate
 | `FanOut` | `*` | Same as input | Allows multiple operators to consume the output of the same operator. Each consumer subscribes via a `FanOut::slot()` handle; the fan-out forwards `get` requests and tracks the intersection of release guards across slots. Constructed via either `FanOut::new` (no cyclic-mode overhead — the common case) or `FanOut::new_cyclic` (for fan-outs whose slots feed back into their own input, e.g. a commit/induction store whose writer reads the store back before proposing, or a mutation-loop body whose other slot is wired to the cyclic prev-accumulator stream). Cyclic mode adds a per-pull tile-cache and a subscribe-in-progress flag so re-entrant subscribes / pulls skip redundant inner work and serve from the cached snapshot instead of re-entering the inner producer. |
 | `Memo` | `*` | Same as input | Caches the output of an operator so it can be repeatedly read without recomputation. Releases each region as it takes delivery of it, so the input can clear its state; once the input is drained the cache is the sole source of the value. Release builds then skip the upstream pull. A debug build probes the drained input once after it drains and again after each notification, so an input that answers with released data trips the release-contract check at the input; probing on every pull would re-read a shared subgraph once per path to it. A `Memo` is also the one operator wired to `Notified`: after its first pull, while its input has not notified it, the cache is the answer and no pull goes below, in every build, apart from that probe. |
 | `ExtractFinal` | Collection source and optional default | Source codomain | Extracts the last live position's value after source completion; see [Final-value extraction](#final-value-extraction). |
-| `UnionOperator` | N inputs of `DataFunction(dᵢ → 𝑇ᵢ)` tilings | `DataFunction(Union(d₀,…,dₙ₋₁) → Scalar(C'))`, or `DataFunction(Union(d₀,…,dₙ₋₁) → DataFunction(𝐵 → 𝑇))` for jagged rows | Merges N function operators into one. The domain is the discriminated union of the arms' domains, each arm under its operand's tag (`new_tagged`): a position for `++`, a site's tag for a channel ([sites.md](../ccl/design/sites.md#channel-tags)). The codomain is one the caller declares. The domain keeps the arms apart, and `final_or_default` dispatches on the arm a row came from. The codomain is the arms' join, because the arms are alternative values at one row. A union node is typed `D ⤇ V`, with `V` the join inference computed in the full type lattice, and op-conversion reads `V` off the node and passes its extent in. The operator does not join the operand tilings: `Extent`'s lattice has variant and range rules but no record rule, so it would join two arms at different record widths to an anonymous positional sum where the type is `{a: Int}`, a shape no row holds. Arms that agree on a tiling keep it, because a `Tiling` carries a layout (struct-of-arrays for a record) that an `Extent` cannot express. Arms whose codomains are collections over different domains, the rows of a jagged collection, merge at the bound `𝐵` the declared codomain gives their domains, beneath which they share the tiling `𝑇`, as a list literal of boxed rows has it (`OpConversionContext::witness_domain_extent`). Arms whose rows agree on a domain the declared codomain bounds by something else merge there too: which keys a row has is its value's, so a type stating rows of a sum states the bound. Other arms whose codomain tilings differ must each fit in one column (`Tiling::is_scalar`: a `Scalar`, or a `Record` of such at any depth), and each is rebuilt as one column, keeping its own record fields, before the arms merge. A flat union (`new_flat`) collapses the arms' domain to the one they share whatever each row holds, a collection included. A realized conditional's legs are over different domains and disjoint only by their gates, so they flat-merge under the domain bound the sum's type declares (`new_flat_over`), which must include every leg's domain. Release is per arm: an incoming `Predicate::Union` guard splits into per-variant predicates, so one arm can be released in full while its siblings still produce. |
-| `VariantWrap` | Payload: `Scalar(Pₜ)` or `DataFunction(D → Scalar(Pₜ))` | `Scalar(Union(P₀,…,Pₙ))` or `DataFunction(D → Scalar(Union))` | **Sum introduction — dual of `VariantProject`.** Wraps the payload under tag `tag`, so that arm holds the payload and every other arm is empty. Arms are keyed by [`FieldKey`], not by position: a tag's *position* is not stable under width subtyping (``{`b} <: {`a | `b}`` renumbers `b`), and an arm set is part of a union column's layout, so a position-keyed arm would need a renumbering coercion at every subsumption. A bare `Scalar` payload (a scalar `VariantCtor`) yields `Scalar(Union)`; a payload *stream* (a `VariantCtor` inside a lambda, `Builtin::VariantWrap(tag)`) is wrapped element-wise **preserving the domain** `D`, so the constructor composes as the RHS of a `≫`. Because the domain is preserved, a domain release forwards to the payload verbatim. A payload that is a collection is one value, held materialized in its arm's cell: an applied `VariantCtor` wraps its whole payload, and a composed one each row's. A cell cannot grow, so a row's cell is emitted once that row's collection is complete. |
-| `VariantProject` | Scrutinee: `Scalar(Union(P₀,…,Pₙ))` or `DataFunction(D → Scalar(Union))` | `DataFunction(UInt → Scalar(Pᵢ))` for a bare scrutinee (implicit `0..N` keys), or `DataFunction(D → Scalar(Pᵢ))` for a stream scrutinee (the real `D` keys preserved) | **Sum elimination — the read-dual of `VariantWrap`.** Projects the arm named `tag` out of a tagged-union stream, *restricting to the sub-domain of rows carrying that tag* and yielding that arm's payload column, keyed by the original `UInt` position. A tag the scrutinee does not carry yields an **empty** projection rather than an error — that is what makes a width-subtype scrutinee, and so a `match` arm the scrutinee can never reach, inert instead of ill-formed. **Restrict and project are one op**: a [`UnionArm`] stores its rows alongside its payloads, so reading the arm *is* the tag restriction — there is no separate boolean `Restrict` step and no tag-discriminating `Predicate` (a domain-`Restrict` could not express it: the tag lives in the scrutinee's codomain, not its domain). Emitted by `lambda_elim` for a scrutinee-`Case`; consumed as a bare `Builtin::VariantProject(tag)` composed onto the fed scrutinee. |
+| `UnionOperator` | Collections of alternative values | A collection over their disjoint union, or a common domain in the flat form | Restates each arm in the declared result tiling. Collection values retain their levels, including inside records and variants. See [Joining branch results](#joining-branch-results). |
+| `VariantWrap` | Payload: `Scalar(Pₜ)` or `DataFunction(D → Scalar(Pₜ))`, or a collection | `Scalar(Union(P₀,…,Pₙ))` or `DataFunction(D → Scalar(Union))`, or `Union(arms)` where a payload holds a collection | **Sum introduction — dual of `VariantProject`.** Wraps the payload under tag `tag`, so that arm holds the payload and every other arm is empty. Arms are keyed by [`FieldKey`], not by position: a tag's *position* is not stable under width subtyping (``{`b} <: {`a | `b}`` renumbers `b`), and an arm set is part of a union column's layout, so a position-keyed arm would need a renumbering coercion at every subsumption. A bare `Scalar` payload (a scalar `VariantCtor`) yields `Scalar(Union)`; a collection of payloads is wrapped element-wise **preserving the domain** `D`, so the constructor composes as the RHS of a `≫`. Because the domain is preserved, a domain release forwards to the payload verbatim. A payload that holds a collection is the wrapped arm's tile, a level that grows as the payload arrives ([A variant's payload stays a tile](#a-variants-payload-stays-a-tile)). |
+| `VariantProject` | Scrutinee: `Scalar(Union(P₀,…,Pₙ))` or `DataFunction(D → Scalar(Union))`, or `Union(arms)` in place of `Scalar(Union)` | `DataFunction(UInt → Scalar(Pᵢ))` for a bare scrutinee (implicit `0..N` keys), or `DataFunction(D → Scalar(Pᵢ))` for a stream scrutinee (the real `D` keys preserved) | **Sum elimination — the read-dual of `VariantWrap`.** Projects the arm named `tag` out of a tagged-union stream, *restricting to the sub-domain of rows carrying that tag* and yielding that arm's payload column, keyed by the original `UInt` position. A tag the scrutinee does not carry yields an **empty** projection rather than an error — that is what makes a width-subtype scrutinee, and so a `match` arm the scrutinee can never reach, inert instead of ill-formed. An arm held as a tile is handed out as the projected keys' values ([A variant's payload stays a tile](#a-variants-payload-stays-a-tile)). **Restrict and project are one op**: a [`UnionArm`] stores its rows alongside its payloads, so reading the arm *is* the tag restriction — there is no separate boolean `Restrict` step and no tag-discriminating `Predicate` (a domain-`Restrict` could not express it: the tag lives in the scrutinee's codomain, not its domain). Emitted by `lambda_elim` for a scrutinee-`Case`; consumed as a bare `Builtin::VariantProject(tag)` composed onto the fed scrutinee. |
 
 ### Aggregation and extraction
 

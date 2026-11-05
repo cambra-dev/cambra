@@ -2,8 +2,8 @@ use bit_set::BitSet;
 
 use super::*;
 use crate::ccl::FieldKey;
-use crate::interpreter::live_keys;
 use crate::interpreter::operator_graph::value_at;
+use crate::interpreter::{UnionArmTile, live_keys};
 use crate::{
     ccl::TagMap,
     interpreter::{ColumnValue, Consumer, Extent, Scheduler, UnionArm, Value, shared_consumer},
@@ -130,26 +130,13 @@ impl UnionOperator {
                 "the arms agree on a codomain the node's type does not declare"
             );
             codomains[0].clone()
-        } else if let Extent::Function {
-            domain: bound,
-            codomain: declared_inner,
-        } = &declared_codomain
-            && let Some(inner) = Self::jagged_rows(&codomains)
-        {
-            // **Rows of a jagged collection**: each arm's value is a collection over its own
-            // domain, and the node's type bounds them all — a sum, whose witness each row's
-            // value carries in its own keys (`OpConversionContext::witness_domain_extent`).
-            // The merged level is that bound, as a list literal of boxed rows has it.
+        } else if let Some(joined) = Self::joined(&codomains, &declared_codomain) {
             debug_assert_eq!(
-                inner.extent(),
-                **declared_inner,
-                "jagged arms agree beneath their domains on a value the node's type does not \
-                 declare"
+                joined.extent(),
+                declared_codomain,
+                "the arms join at a codomain the node's type does not declare"
             );
-            Tiling::DataFunction {
-                domain: (**bound).clone(),
-                codomain: Box::new(inner.clone()),
-            }
+            joined
         } else {
             // Arms whose tilings differ merge into one column at the declared codomain, so
             // each must fit in one: `Tiling::is_scalar`, a `Scalar` or a `Record` of such
@@ -177,15 +164,102 @@ impl UnionOperator {
         )
     }
 
-    /// The tiling every arm agrees on beneath its domain, where every arm is a collection:
-    /// arms that differ only in which keys their rows have.
-    fn jagged_rows<'t>(codomains: &[&'t Tiling]) -> Option<&'t Tiling> {
-        let mut beneath = codomains.iter().map(|t| match t {
-            Tiling::DataFunction { codomain, .. } => Some(codomain.as_ref()),
+    /// The tiling `tilings` join at, the node's `declared` codomain: the one they agree on,
+    /// or, where they are collections differing only in which keys their rows have, the
+    /// tiling they agree on beneath their domains over `declared`'s domain. Unions and records
+    /// join component by component. `None` where the tilings differ otherwise.
+    ///
+    /// **Rows of a jagged collection** differ in their domains: each arm's value is a
+    /// collection over its own domain, and the node's type bounds them all — a sum, whose
+    /// witness each row's value carries in its own keys
+    /// (`OpConversionContext::witness_domain_extent`). The merged level is that bound, as a
+    /// list literal of boxed rows has it. The same difference sits inside a variant: the arm a
+    /// [`VariantWrap`](super::scalar::VariantWrap) wraps keeps its payload's own tiling, and
+    /// its siblings state the declared bound.
+    fn joined(tilings: &[&Tiling], declared: &Extent) -> Option<Tiling> {
+        if tilings.is_empty() {
+            return Some(Tiling::from_extent(declared));
+        }
+        // Agreeing parts keep their shared tiling where it is the declared one; rows a sum's
+        // bound declares are merged at that bound, as at the top ([`Self::coproduct_of`]).
+        if tilings.windows(2).all(|w| w[0] == w[1]) && tilings[0].extent() == *declared {
+            return Some(tilings[0].clone());
+        }
+        // Value-shaped parts that differ, one arm's a column and another's a record of
+        // columns, merge into one column, as the arms do at the top ([`Self::new`]).
+        if tilings.iter().all(|t| t.is_scalar())
+            && !(matches!(declared, Extent::Union(_)) && declared.holds_a_collection())
+        {
+            return Some(Tiling::Scalar(declared.clone()));
+        }
+        match declared {
+            Extent::Function { domain, codomain } => {
+                let beneath = tilings
+                    .iter()
+                    .map(|t| match t {
+                        Tiling::DataFunction {
+                            domain: own,
+                            codomain,
+                        } => {
+                            debug_assert!(
+                                domain.includes(own),
+                                "a jagged arm's domain {own:?} lies outside the declared bound \
+                                 {domain:?}"
+                            );
+                            Some(codomain.as_ref())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(Tiling::DataFunction {
+                    domain: (**domain).clone(),
+                    codomain: Box::new(Self::joined(&beneath, codomain)?),
+                })
+            }
+            Extent::Union(arms) => {
+                let joined = arms
+                    .iter()
+                    .map(|(tag, extent)| {
+                        let mut at = Vec::new();
+                        for tiling in tilings {
+                            match tiling {
+                                Tiling::Union(ts) => {
+                                    if let Some(t) = ts.get(tag) {
+                                        at.push(t.clone());
+                                    }
+                                }
+                                Tiling::Scalar(Extent::Union(ts)) => {
+                                    if let Some(e) = ts.get(tag) {
+                                        at.push(Tiling::from_extent(e));
+                                    }
+                                }
+                                _ => return None,
+                            }
+                        }
+                        let refs: Vec<_> = at.iter().collect();
+                        Some((tag.clone(), Self::joined(&refs, extent)?))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(Tiling::Union(TagMap::from_arms(joined)))
+            }
+            Extent::Record(fields) => {
+                let joined = fields
+                    .iter()
+                    .map(|(name, extent)| {
+                        let at = tilings
+                            .iter()
+                            .map(|t| match t {
+                                Tiling::Record(ts) => ts.get(name),
+                                _ => None,
+                            })
+                            .collect::<Option<Vec<_>>>()?;
+                        Some((name.clone(), Self::joined(&at, extent)?))
+                    })
+                    .collect::<Option<_>>()?;
+                Some(Tiling::Record(joined))
+            }
             _ => None,
-        });
-        let first = beneath.next()??;
-        beneath.all(|b| b == Some(first)).then_some(first)
+        }
     }
 
     /// Collapse the coproduct domain [`new`](Self::new) built back to one extent: the one
@@ -291,26 +365,71 @@ impl UnionOperator {
     }
 }
 
-/// Flat-merge disjoint `DataFunction` arms into one flat tile, sorted by domain
-/// key. An arm is either a filtered slice of the *same* fed element stream (a
-/// writer-body value-`Case` fan-out `⧺ᵢ filter_values(π̂ᵢ) ≫ eᵢ`, or a `match`'s
-/// tag fan-out), whose keys are disjoint and reassemble the full column — which then
-/// co-iterates with the decision record's sibling fields — or a leg of a
-/// realized sum, over its own arm's domain, of which the first-match gates leave at most
-/// one holding rows. Either way the arms' keys are disjoint, and a key two arms claim
-/// fails the merge. The
-/// codomain is a scalar decision-field value, or a materialized compound `Tile::Record`
-/// for a tuple/record accumulator. A key is complete once every arm calls it complete,
-/// and beneath a key each level states what the arm holding it says.
+/// `tile` laid out as `tiling`, the join of its siblings' tilings ([`UnionOperator::joined`]):
+/// each value-shaped part that `tiling` holds as one column is restated as that column, and a
+/// level, a variant or a record holding one keeps its shape with its parts restated beneath.
+fn restated_in(tile: Tile, tiling: &Tiling) -> Tile {
+    if !tile.holds_a_level() && !tiling.holds_a_level() {
+        return column_value_to_tile(scalar_tile_to_column_value(tile), tiling);
+    }
+    match (tile, tiling) {
+        (
+            Tile::DataFunction {
+                row_starts,
+                domain,
+                codomain,
+                domain_predicate,
+                deleted,
+            },
+            Tiling::DataFunction {
+                codomain: beneath, ..
+            },
+        ) => Tile::DataFunction {
+            row_starts,
+            domain,
+            codomain: Box::new(restated_in(*codomain, beneath)),
+            domain_predicate,
+            deleted,
+        },
+        (Tile::Scalar(column), tiling) if tiling.holds_a_level() => {
+            restated_in(open_collections(&column, &tiling.extent()), tiling)
+        }
+        (Tile::Union(arms), Tiling::Union(tilings)) => {
+            let mut arms: std::collections::BTreeMap<_, _> = arms.into_iter().collect();
+            Tile::Union(tilings.map(|tag, t| match arms.remove(tag) {
+                Some(arm) => UnionArmTile {
+                    tile: restated_in(arm.tile, t),
+                    ..arm
+                },
+                None => UnionArmTile {
+                    rows: Vec::new(),
+                    tile: t.empty_at_no_rows(),
+                },
+            }))
+        }
+        (Tile::Record { fields, absent }, Tiling::Record(tilings)) => Tile::Record {
+            fields: fields
+                .into_iter()
+                .map(|(name, field)| {
+                    let field = match tilings.get(&name) {
+                        Some(t) => restated_in(field, t),
+                        None => field,
+                    };
+                    (name, field)
+                })
+                .collect(),
+            absent,
+        },
+        (tile, _) => tile,
+    }
+}
+
+/// Merge disjoint data-function arms in domain-key order. Duplicate keys fail the merge.
+/// Keys use `Value`'s total order, including coproduct domains. A key is complete when every
+/// arm calls it complete. Levels beneath a key retain the predicates of the arm holding it.
 ///
-/// **The key is the domain value, not a position.** Reassembling needs only a
-/// total order (to restore the fed order) and equality (to catch two arms
-/// claiming one key), and both hold for any *one* collection's keys — its domain
-/// is a single [`Extent`], so its values are homogeneous in shape. A `UInt`
-/// position is the common case; a fed stream whose own index set is a coproduct
-/// carries `Union { tag, inner }` keys instead, which [`Value`]'s order already
-/// compares lexicographically by tag then payload. Keying on `usize` is what
-/// restricted this to the former.
+/// Writer-body and match fan-outs reconstruct sibling decision fields in their source order.
+/// Realized sum arms use the same merge after first-match predicates select their rows.
 fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling) -> Tile {
     // The arms' codomains are concatenated and then gathered in key order, rather than
     // reassembled as a list of `Value` pairs. A gather is shape-agnostic, so an arm whose
@@ -347,30 +466,22 @@ fn flat_merge(tiles: Vec<Tile>, domain_extent: &Extent, codomain_tiling: &Tiling
         }
         offset += domain.len();
         // Arms disagree on whether a compound value rides materialized (`Scalar(Records)`)
-        // or as a struct-of-arrays `Record`, so a value-shaped arm is restated in the
-        // declared shape before being concatenated. An arm carrying a level passes through:
-        // it is already the shape its tiling names, and materializing it is what has no
-        // column to go in.
-        let codomain = if codomain.holds_a_level() {
+        // or as a struct-of-arrays `Record`, so each arm is restated in the declared shape
+        // before being concatenated ([`restated_in`]). An arm carrying a level keeps it, with
+        // only the value-shaped parts around and beneath it restated: materializing a level
+        // is what has no column to go in.
+        let mut codomain = restated_in(*codomain, codomain_tiling);
+        if codomain.holds_a_level() {
             // What an arm states beneath a key is the arm's to say only for the keys it holds
             // live: a key it deleted or never held is a sibling's, whose own statement is the
             // one that counts there.
-            let mut codomain = *codomain;
             let held = Predicate::from_column_value(
                 &domain.select_indices(live.iter().copied(), live.len()),
             );
             codomain.map_level_predicates(&mut |depth, stated| {
                 stated.intersect(&Predicate::True.qualified_by(&held, depth))
             });
-            codomain
-        } else if codomain_tiling.holds_a_level() {
-            unreachable!(
-                "flat_merge: an arm with live rows under a codomain tiling that holds a level \
-                 carries the level itself, got {codomain:?}"
-            )
-        } else {
-            column_value_to_tile(scalar_tile_to_column_value(*codomain), codomain_tiling)
-        };
+        }
         match &mut codomains {
             Some(acc) => acc.merge_rows(codomain),
             None => codomains = Some(codomain),
@@ -684,9 +795,9 @@ impl TileProducer for UnionProducer {
         // collision — so differing arms are both `ColumnValue::Union` and appending merges
         // their tag maps.
         //
-        // Arms whose codomain tilings differ merge into one column at the declared codomain
-        // ([`Self::new`]), so a value-shaped arm is restated in that shape first, as
-        // [`flat_merge`] restates its arms: a product arm may arrive as a record of columns.
+        // Arms whose codomain tilings differ merge at their join ([`Self::new`]), so each arm
+        // is restated in that shape first ([`restated_in`]), as [`flat_merge`] restates its
+        // arms: a product arm may arrive as a record of columns, at the top or beneath a level.
         let Tiling::DataFunction {
             codomain: codomain_tiling,
             ..
@@ -695,15 +806,27 @@ impl TileProducer for UnionProducer {
             panic!("a union tiling is a function, got {}", self.tiling())
         };
         let codomain_tiling = (**codomain_tiling).clone();
-        let restated = |arm: Tile| {
-            if arm.holds_a_level() || codomain_tiling.holds_a_level() {
-                arm
-            } else {
-                column_value_to_tile(scalar_tile_to_column_value(arm), &codomain_tiling)
-            }
+        let restated = |arm: Tile| restated_in(arm, &codomain_tiling);
+        // Beneath the merged keys, a level's statement names its enclosing path through the
+        // arm's own key, which the merged domain spells as that key under the arm's tag.
+        let rekeyed = |(tag, mut values): (&FieldKey, Tile)| {
+            values.map_level_predicates(&mut |depth, stated| {
+                stated.with_component_restated(depth + 1, 0, &|key| match key.as_bool() {
+                    Some(_) => key.clone(),
+                    None => Predicate::tagged(
+                        TagMap::from_arms(vec![(tag.clone(), key.clone())]),
+                        false,
+                    ),
+                })
+            });
+            values
         };
         let codomain_tile: Tile = {
-            let mut arms = codomains.into_iter().map(restated);
+            let mut arms = self
+                .tags
+                .iter()
+                .zip(codomains.into_iter().map(restated))
+                .map(rekeyed);
             let mut combined = arms.next().expect("at least one arm");
             for arm in arms {
                 combined.merge_rows(arm);
@@ -1432,6 +1555,105 @@ mod tests {
             !domain_predicate.contains_path(&[Value::UInt(1), Value::UInt(8)]),
             "arm B's row 1 is open, yet the merged inner level calls [1, 8] complete: {merged:?}"
         );
+    }
+
+    #[test]
+    fn a_tagged_union_restates_nested_completion_under_its_site_tag() {
+        use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
+
+        let uint = Extent::Base(BaseType::UInt);
+        let tag = FieldKey::Name("site".into());
+        let nested = Tiling::data_function(uint.clone(), Tiling::Scalar(uint.clone()));
+        let input_tiling = Tiling::data_function(uint.clone(), nested.clone());
+        let output_tiling = Tiling::data_function(
+            Extent::Union(TagMap::from_arms(vec![(tag.clone(), uint)])),
+            nested,
+        );
+        let input = Tile::data_function(
+            ColumnValue::UInts(vec![7]),
+            Box::new(Tile::grouped(
+                vec![0],
+                ColumnValue::UInts(vec![8]),
+                Box::new(Tile::Scalar(ColumnValue::UInts(vec![8]))),
+                Predicate::exactly(&[Value::UInt(7), Value::UInt(8)]),
+                BitSet::new(),
+            )),
+            Predicate::False,
+            BitSet::new(),
+        );
+        let mut producer = UnionProducer {
+            base: ProducerBase::unowned(UnionProducer::alloc_id(), &output_tiling),
+            level: CurryLevel::OUTERMOST,
+            inputs: vec![Box::new(TestTileProducer::new(input, input_tiling))],
+            tags: vec![tag.clone()],
+            flat: false,
+        };
+        let output = producer.get(output_tiling.universal_guard());
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = output.values_at(CurryLevel::new(1))
+        else {
+            panic!("the union holds a nested collection: {output:?}")
+        };
+        let outer = Value::Union {
+            tag,
+            inner: Box::new(Value::UInt(7)),
+        };
+        assert!(domain_predicate.contains_path(&[outer.clone(), Value::UInt(8)]));
+        assert!(!domain_predicate.contains_path(&[outer, Value::UInt(9)]));
+    }
+
+    #[test]
+    fn a_flat_union_restates_a_scalar_arm_beside_a_collection_payload() {
+        let none = FieldKey::Name("none".into());
+        let some = FieldKey::Name("some".into());
+        let extents = TagMap::from_arms(vec![
+            (none.clone(), Extent::Base(BaseType::Unit)),
+            (
+                some.clone(),
+                Extent::Function {
+                    domain: Box::new(Extent::uint_range(1)),
+                    codomain: Box::new(Extent::Base(BaseType::Int)),
+                },
+            ),
+        ]);
+        let value_tiling = Tiling::from_extent(&Extent::Union(extents));
+        let arm = |key, value| {
+            Tile::data_function(
+                ColumnValue::UInts(vec![key]),
+                Box::new(value),
+                Predicate::True,
+                BitSet::new(),
+            )
+        };
+        let empty = Tile::Scalar(ColumnValue::Union(TagMap::from_arms(vec![(
+            none.clone(),
+            UnionArm::new(vec![0], ColumnValue::Units(1)),
+        )])));
+        let payload = Tile::grouped(
+            vec![0],
+            ColumnValue::UInts(vec![0]),
+            Box::new(Tile::Scalar(ColumnValue::Ints(vec![7]))),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let present = Tile::Union(TagMap::from_arms(vec![(
+            some.clone(),
+            UnionArmTile {
+                rows: vec![0],
+                tile: payload,
+            },
+        )]));
+        let output = flat_merge(
+            vec![arm(0, empty), arm(1, present)],
+            &Extent::uint_range(2),
+            &value_tiling,
+        );
+        assert!(output.check_from(&Tiling::data_function(Extent::uint_range(2), value_tiling)));
+        let values = output.values_at(CurryLevel::new(1));
+        assert_eq!(values.union_arm_at(0).map(|(tag, _, _)| tag), Some(&none));
+        assert_eq!(values.union_arm_at(1).map(|(tag, _, _)| tag), Some(&some));
+        assert!(output.is_terminal());
     }
 
     /// Beneath a standing level, a row one arm has not reached stays open: that arm may

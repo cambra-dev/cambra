@@ -121,6 +121,33 @@ fn tile_rows(tile: &Tile, rows: usize) -> Result<Vec<Value>, SinkReadError> {
                 .collect())
         }
 
+        // Each row carries one tag, and its value is that arm's payload at the row's slot. A
+        // union with no row has not arrived.
+        Tile::Union(arms) => {
+            let held: usize = arms.values().map(|arm| arm.rows.len()).sum();
+            if held == 0 && rows > 0 {
+                return Err(SinkReadError::Incomplete);
+            }
+            if held != rows {
+                return Err(SinkReadError::Malformed(format!(
+                    "union holds {held} rows over {rows} rows"
+                )));
+            }
+            let mut out: Vec<Option<Value>> = vec![None; rows];
+            for (tag, arm) in arms.iter() {
+                for (row, value) in arm.rows.iter().zip(tile_rows(&arm.tile, arm.rows.len())?) {
+                    out[*row] = Some(Value::Union {
+                        tag: tag.clone(),
+                        inner: Box::new(value),
+                    });
+                }
+            }
+            Ok(out
+                .into_iter()
+                .map(|v| v.expect("a union's arms cover its rows"))
+                .collect())
+        }
+
         // A collection groups rather than pairing: row `r` owns the key run
         // `row_starts[r] .. row_starts[r + 1]`, and the values tile is one row per key.
         Tile::DataFunction {

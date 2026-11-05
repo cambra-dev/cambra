@@ -554,14 +554,31 @@ impl TileProducer for ZipProducer {
                         .collect();
                 let mut codomains: Vec<Tile> = Vec::with_capacity(filtered_tiles.len());
                 let mut absent: HashMap<SmolStr, BitSet> = HashMap::new();
+                // What a level inside a value states is the pair's to say only beneath the rows it
+                // pairs: a row one arm states something about and the pair does not hold yet
+                // arrives later.
+                let paired =
+                    Predicate::union_all(rows.iter().map(|p| Predicate::exactly(p)).collect());
                 for (arm, filtered) in filtered_tiles.iter_mut().enumerate() {
                     let held = filtered.paths_at(rows_level);
                     // Lift the values out, leaving the chain of keys behind: what stays is
                     // the output's own shape, and every input has to agree on it.
-                    let values = std::mem::replace(
+                    let mut values = std::mem::replace(
                         filtered.values_at_mut(self.level),
                         Tile::record(HashMap::new()),
                     );
+                    // A statement naming rows is narrowed to the paired ones; one naming none
+                    // is about every row and says nothing a withheld row could contradict.
+                    if values.holds_a_level() {
+                        values.map_level_predicates(
+                            &mut |depth, stated| match stated.qualifies() {
+                                true => {
+                                    stated.intersect(&Predicate::True.qualified_by(&paired, depth))
+                                }
+                                false => stated.clone(),
+                            },
+                        );
+                    }
                     if held == rows {
                         // Presence is intersected over the outermost keys only, so arms that
                         // disagree beneath them would pair one arm's values under another's
@@ -709,12 +726,30 @@ impl TileProducer for ZipProducer {
                 // A zip pairs its arms at the same positions, so the levels above the pair
                 // name the same keys of every arm; at the pair each arm is one field of the
                 // record, and takes that field's part.
-                g => crate::interpreter::tiling::onto_record_field(
-                    g.clone(),
-                    level,
-                    name,
-                    input.tiling(),
-                ),
+                //
+                // An arm whose values hold a level gives up a key only where the zip gave it
+                // up. A scalar arm gives back each row it was released, and the zip keeps the
+                // row (`gave_back` in `get_impl`); an arm holding a level keeps its rows open
+                // itself, so one whose whole value a consumer released (a field `SelectField`
+                // does not read, say) still holds the keys later rows pair on. In canonical form
+                // that whole value is the key, so it is kept back here.
+                g => {
+                    let field = crate::interpreter::tiling::onto_record_field(
+                        g.clone(),
+                        level,
+                        name,
+                        input.tiling(),
+                    );
+                    let holds_a_level = input.tiling().values_at(self.level).holds_a_level();
+                    match level.checked_sub(1) {
+                        Some(keys) if holds_a_level => limit_keys_at(
+                            TileGuard::flatten_or(vec![field]),
+                            keys,
+                            &keys_at(&TileGuard::flatten_or(vec![g.clone()]), keys),
+                        ),
+                        _ => field,
+                    }
+                }
             };
             input.release(guard);
         }
@@ -748,6 +783,41 @@ fn whole_pair_rows(guard: TileGuard, depth: usize, level: usize, empty: &TileGua
             FunctionGuard::Codomain(Box::new(whole_pair_rows(*inner, depth + 1, level, empty))),
         ),
         g => g,
+    }
+}
+
+/// The keys `guard`, in canonical form, names at `depth` codomain steps.
+fn keys_at(guard: &TileGuard, depth: usize) -> Predicate {
+    match guard {
+        TileGuard::Or(arms) => arms
+            .iter()
+            .fold(Predicate::False, |acc, arm| acc.union(&keys_at(arm, depth))),
+        TileGuard::Function(FunctionGuard::Codomain(inner)) if depth > 0 => {
+            keys_at(inner, depth - 1)
+        }
+        TileGuard::Function(FunctionGuard::Domain(pred)) => pred.descend(depth),
+        _ => Predicate::False,
+    }
+}
+
+/// `guard`, in canonical form, naming at `depth` codomain steps only the keys `released`
+/// names; what it names beneath the keys is left as it is.
+fn limit_keys_at(guard: TileGuard, depth: usize, released: &Predicate) -> TileGuard {
+    match guard {
+        TileGuard::Or(arms) => TileGuard::flatten_or(
+            arms.into_iter()
+                .map(|arm| limit_keys_at(arm, depth, released))
+                .collect(),
+        ),
+        TileGuard::Function(FunctionGuard::Codomain(inner)) if depth > 0 => TileGuard::Function(
+            FunctionGuard::Codomain(Box::new(limit_keys_at(*inner, depth - 1, released))),
+        ),
+        TileGuard::Function(FunctionGuard::Domain(pred)) => {
+            CurryLevel::new(depth).wrap_guard(TileGuard::Function(FunctionGuard::Domain(
+                pred.descend(depth).intersect(released),
+            )))
+        }
+        other => other,
     }
 }
 
@@ -1982,5 +2052,71 @@ mod tests {
             "a deleted row stays tracked: {:?}",
             zip.held
         );
+    }
+
+    #[test]
+    fn a_zip_keeps_an_unselected_collections_keys_under_standing_levels() {
+        let uint = Extent::Base(BaseType::UInt);
+        let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+        let under = |mut tiling: Tiling, levels| {
+            for _ in 0..levels {
+                tiling = Tiling::data_function(uint.clone(), tiling);
+            }
+            tiling
+        };
+        for levels in 1..=3 {
+            let collection = under(Tiling::data_function(uint.clone(), scalar.clone()), levels);
+            let value = under(scalar.clone(), levels);
+            let out = under(
+                Tiling::Record(HashMap::from([
+                    (
+                        tuple_field(0),
+                        Tiling::data_function(uint.clone(), scalar.clone()),
+                    ),
+                    (tuple_field(1), scalar.clone()),
+                ])),
+                levels,
+            );
+            let (xs, released) = QuietSpy::new(collection.empty_tile(), collection.clone());
+            let (n, _) = QuietSpy::new(value.empty_tile(), value.clone());
+            let mut zip = ZipProducer {
+                base: ProducerBase::unowned(ZipProducer::alloc_id(), &out),
+                names: vec![tuple_field(0), tuple_field(1)],
+                inputs: vec![Box::new(xs), Box::new(n)],
+                level: CurryLevel::new(levels),
+                held: vec![HashSet::new(); 2],
+                emitted: Predicate::False,
+            };
+            let selected = tuple_field(1);
+            zip.release(guard_at_field(&out, &selected, value.empty_guard()));
+            assert!(released.borrow().iter().all(TileGuard::is_empty));
+
+            let path = vec![Value::UInt(0); levels];
+            let keys = CurryLevel::new(levels - 1).wrap_guard(TileGuard::Function(
+                FunctionGuard::Domain(Predicate::exactly(&path)),
+            ));
+            zip.release(guard_at_field(&out, &selected, keys));
+            let covers = |path: &[Value]| released.borrow().iter().any(|g| g.covers_path(path));
+            assert!(covers(&path));
+            for depth in 0..levels {
+                let mut later = path.clone();
+                later[depth] = Value::UInt(1);
+                assert!(
+                    !covers(&later),
+                    "level {depth} of {levels} was released: {:?}",
+                    released.borrow()
+                );
+            }
+
+            zip.release(TileGuard::Function(FunctionGuard::Domain(
+                Predicate::point(Value::UInt(0)),
+            )));
+            let below = vec![Value::UInt(0); levels + 1];
+            assert!(covers(&below));
+            let mut sibling = below;
+            sibling[0] = Value::UInt(1);
+            assert!(!covers(&sibling));
+            assert!(released.borrow().iter().all(|g| g.check_from(&collection)));
+        }
     }
 }

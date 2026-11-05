@@ -2100,8 +2100,9 @@ fn a_collection_payload_is_one_variant_value(#[case] code: &str) {
 }
 
 /// One variant per row when each row's payload is a collection: the groups `[1]`, `[2, 3]`
-/// and `[4]` wrap into three `` `some `` values, each holding its group whole, rather than
-/// one per element.
+/// and `[4]` wrap into three `` `some `` values, rather than one per element, each holding its
+/// group as a level of the `some` arm (`src/interpreter/design-operators.md`, "A variant's
+/// payload stays a tile").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn a_collection_payload_per_row_is_one_variant_per_row() {
@@ -2116,24 +2117,95 @@ fn a_collection_payload_per_row_is_one_variant_per_row() {
         panic!("a collection of variants, got {tile:?}")
     };
     assert_eq!(domain.len(), 3, "one variant per group");
-    let cambra::interpreter::Tile::Scalar(cambra::interpreter::ColumnValue::Union(arms)) =
-        *codomain
-    else {
-        panic!("a union column, got {codomain:?}")
+    let cambra::interpreter::Tile::Union(arms) = *codomain else {
+        panic!("a union of arm tiles, got {codomain:?}")
     };
     let some = arms
         .get(&FieldKey::Name("some".into()))
         .expect("the `some` arm");
-    let lens: Vec<usize> = some
-        .values()
-        .clone()
-        .drain_to_value_iter()
-        .map(|v| match v {
-            Value::Function(bindings) => bindings.len(),
-            other => panic!("a group held whole, got {other:?}"),
-        })
-        .collect();
+    assert_eq!(some.rows, vec![0, 1, 2], "every group carries `some`");
+    let lens: Vec<usize> = some.tile.row_runs().map(|(from, to)| to - from).collect();
     assert_eq!(lens, vec![1, 2, 1]);
+}
+
+/// A mutable variable whose value is a variant with a collection payload, written by a loop:
+/// the store reads its seed and each decision once the payload is complete, as one value
+/// (`src/interpreter/design-operators.md`, "A variant's payload stays a tile"). The written
+/// payload is a list over its own positions, where the declared `List(Int)` bounds them.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::overwritten(
+    indoc! {"
+        o: Mut(Option(List(Int))) := Option::some(box([1, 2]))
+        for x in [3, 4]:
+            o := Option::some(box([7, 8]))
+        v = o
+    "},
+    15
+)]
+#[case::carried(
+    indoc! {"
+        o: Mut(Option(List(Int))) := Option::some(box([1, 2]))
+        for x in [3, 4]:
+            o := o
+        v = o
+    "},
+    3
+)]
+#[case::transactional(
+    indoc! {"
+        o: Mut(Option(List(Int)), Txn) := Option::some(box([1, 2]))
+        for x in [3, 4]:
+            with begin():
+                o := Option::some(box([7, 8]))
+        v = await_final(o)
+    "},
+    15
+)]
+// Written in both branches of an `if` in a block, each branch's write is a leg the
+// decision joins, and the decision record selects the payload's field out of a pair whose
+// other field no reader takes.
+#[case::transactional_in_a_branch(
+    indoc! {"
+        o: Mut(Option(List(Int)), Txn) := Option::some(box([1, 2]))
+        for x in [3, 4]:
+            with begin():
+                if x > 3:
+                    o := Option::some(box([7, 8, 9]))
+                else:
+                    o := Option::some(box([5]))
+        v = await_final(o)
+    "},
+    24
+)]
+// Merged with another mutable variable by a top-level `if`, the final value is a record
+// holding the payload's level beside a scalar.
+#[case::beside_an_int_in_a_writing_if(
+    indoc! {"
+        o: Mut(Option(List(Int))) := Option::some(box([1, 2]))
+        n := 0
+        i = 3
+        if i > 1:
+            o := Option::some(box([7, 8]))
+            n := 1
+        else:
+            o := Option::none
+            n := 2
+        v = o
+    "},
+    15
+)]
+fn a_mutable_variable_holds_a_collection_payload(#[case] program: &str, #[case] total: i64) {
+    check_scalar(
+        &formatdoc! {"
+            {program}
+            match v:
+                case Option::some(xs):
+                    sum(xs)
+                case Option::none:
+                    0"},
+        Value::Int(total),
+    );
 }
 
 /// A collection **literal** as the payload, written in place, does not compile: planning
@@ -2151,5 +2223,75 @@ fn a_collection_literal_payload_in_place_does_not_compile() {
                 case `none:
                     0"},
         "list literal reached op-conversion without an input",
+    );
+}
+
+#[rstest]
+#[case::left(">", 3)]
+#[case::right("<", 7)]
+fn a_conditional_joins_distinct_collection_payload_tags(#[case] left: &str, #[case] expected: i64) {
+    check_scalar(
+        &formatdoc! {"
+        xs = box([1, 2])
+        ys = box([3, 4])
+        c = 1 {left} 0
+        v = `left(xs) if c else `right(ys)
+        match v:
+            case `left(x):
+                sum(x)
+            case `right(y):
+                sum(y)
+    "},
+        Value::Int(expected),
+    );
+}
+
+#[rstest]
+#[case::collection(">", 3)]
+#[case::scalar("<", 7)]
+fn a_conditional_joins_collection_and_scalar_payload_tags(
+    #[case] collection: &str,
+    #[case] expected: i64,
+) {
+    check_scalar(
+        &formatdoc! {"
+        xs = box([1, 2])
+        c = 1 {collection} 0
+        v = `items(xs) if c else `single(7)
+        match v:
+            case `items(x):
+                sum(x)
+            case `single(y):
+                y
+    "},
+        Value::Int(expected),
+    );
+}
+
+#[rstest]
+#[case::mixed("[1, 2]", "`some(g) if sum(g) > 2 else `none", 18)]
+#[case::every_group("[1, 2]", "`some(g)", 20)]
+#[case::no_groups("[1, 2]", "`some(g) if sum(g) > 10 else `none", 0)]
+#[case::three_outer_rows("[1, 2, 3]", "`some(g) if sum(g) > 2 else `none", 27)]
+#[timeout(Duration::from_secs(10))]
+fn a_collection_payload_match_under_two_loops(
+    #[case] outer: &str,
+    #[case] choice: &str,
+    #[case] expected: i64,
+) {
+    check_scalar(
+        &formatdoc! {r"
+            total := 0
+            for i in {outer}:
+                for g in groupby([1, 2, 3, 4], \x -> x // 2):
+                    v = {choice}
+                    match v:
+                        case `some(xs):
+                            total := total + sum(xs)
+                        case `none:
+                            pass
+            total
+        "},
+        Value::Int(expected),
     );
 }
