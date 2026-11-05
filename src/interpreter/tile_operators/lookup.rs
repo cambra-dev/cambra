@@ -411,7 +411,6 @@ impl TileProducer for CheckedLookupProducer {
         }
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         match &mut self.source {
             ProducerSource::Split { collection, keys } => {
@@ -741,7 +740,6 @@ impl TileProducer for LookupProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }
