@@ -185,7 +185,16 @@ impl TileOperator for CheckedLookup {
             // scheduled to read it (see `shared_consumer`).
             LookupSource::Split { collection, keys } => {
                 let (shared, gate) = shared_consumer(consumer);
-                let keys = subscribe_forwarding(&mut **keys, &shared, scheduler);
+                // A stream of keys is pulled at the projection, and each answer sits at its key's
+                // position; the collection is read whole, since every key is answered against
+                // all of it.
+                let keeps_keys = keys.tiling().is_data_function();
+                let keys = subscribe_forwarding_keeping_keys_if(
+                    keeps_keys,
+                    &mut **keys,
+                    &shared,
+                    scheduler,
+                );
                 let collection = subscribe_forwarding(&mut **collection, &shared, scheduler);
                 (ProducerSource::Split { collection, keys }, Some(gate))
             }
@@ -193,7 +202,9 @@ impl TileOperator for CheckedLookup {
             LookupSource::Paired(pairs) => (
                 ProducerSource::Paired(pairs.subscribe(
                     pairs.tiling().universal_guard(),
-                    widening(consumer),
+                    // The pairs are pulled at the projection, and each answer sits at its
+                    // row's position.
+                    consumer,
                     scheduler,
                 )),
                 None,
