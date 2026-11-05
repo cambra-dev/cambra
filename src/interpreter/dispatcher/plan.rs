@@ -584,41 +584,61 @@ fn run_targets(
             breaker.enter_consuming_mode()
         });
     }
-    in_a_run(|| match live.is_empty() {
-        true => drive(&dispatcher, &mut reach),
-        false => drive_live(&dispatcher, &mut reach, &mut live, on_idle),
+    in_a_run(|| {
+        // A range over a static extent has decided every key from the start.
+        for (pipeline, ranges) in members.leaves.iter().enumerate() {
+            for range in ranges {
+                dispatcher.land_range_decided(PipelineId(pipeline), &Projection::Everything, range);
+            }
+        }
+        match live.is_empty() {
+            true => drive(&dispatcher, &mut reach),
+            false => drive_live(&dispatcher, &mut reach, &mut live, on_idle),
+        }
     });
-    // Every breaker is terminal at the run's end, so each pipeline a push of it reaches along
-    // routes that keep its keys has recorded as decided by it all that a push of its every key
-    // lands as there. A route that widens passes a decided region only once every input of the
-    // operator that widens is decided, which a range does not state.
+    // Every breaker and range is terminal at the run's end, so each pipeline has recorded as
+    // decided by each of its sources all that a push of the source's every key lands as at its
+    // entry.
     #[cfg(debug_assertions)]
     for (reader, reads) in members.reads.iter().enumerate() {
+        let covered = |source: usize, reached: Vec<Arrival>, name: &str| {
+            let Some(reached) = reached
+                .into_iter()
+                .map(|arrival| arrival.guard)
+                .reduce(|a, b| a.union(&b))
+            else {
+                return;
+            };
+            let decided = dispatcher.decided_of(PipelineId(reader), PipelineId(source));
+            debug_assert!(
+                decided.covers(&reached),
+                "{name} has decided all it reaches of {}'s input, {reached:?}, at the run's end, \
+                 which records {decided:?}",
+                members.names[reader]
+            );
+        };
         for &read in reads {
             let (pusher, _) = end_of(PipelineId(read))
                 .unwrap_or_else(|| pushing_end(&mut reach, PipelineId(read)));
-            let routes = routes_to(&pusher, reader);
-            if routes.is_empty() || routes.iter().any(|route| !route.keeps_keys) {
-                continue;
-            }
-            let reached: Vec<TileGuard> =
-                probe(&pusher, PipelineId(read), &Projection::Everything, reader)
-                    .into_iter()
-                    .map(|arrival| arrival.guard)
-                    .collect();
-            let Some(reached) = reached.into_iter().reduce(|a, b| a.union(&b)) else {
-                continue;
-            };
-            let decided = dispatcher.decided_of(PipelineId(reader), PipelineId(read));
-            debug_assert!(
-                decided
-                    .as_ref()
-                    .is_some_and(|decided| guard_minus(&reached, decided).is_empty()),
-                "{} has decided all it reaches of {}'s input, {reached:?}, at the run's end, \
-                 which records {decided:?}",
-                members.names[read],
-                members.names[reader]
-            );
+            let reached = probe(&pusher, PipelineId(read), &Projection::Everything, reader);
+            covered(read, reached, &members.names[read]);
+        }
+        // A range reaches the entries of the pipelines it is listed under, and possibly others.
+        let ranges = members
+            .leaves
+            .iter()
+            .enumerate()
+            .flat_map(|(pipeline, ranges)| ranges.iter().map(move |range| (pipeline, range)));
+        let live = members
+            .live
+            .iter()
+            .enumerate()
+            .flat_map(|(pipeline, leaves)| {
+                leaves.iter().map(move |leaf| (pipeline, &leaf.consumer))
+            });
+        for (pipeline, range) in ranges.chain(live) {
+            let reached = probe(range, PipelineId(pipeline), &Projection::Everything, reader);
+            covered(reader, reached, "a range in its own chain");
         }
     }
     for (plan, scope) in planned.iter_mut().zip(&scopes) {
@@ -2012,6 +2032,12 @@ impl LivePipeline {
                     positions = positions.union(&fresh);
                 }
             }
+            // The keys the source yields are decided: it yields a key once for good.
+            let decided = match yielded.is_true() {
+                true => Projection::Everything,
+                false => Projection::admitting(yielded.clone()),
+            };
+            dispatcher.land_range_decided(self.pipeline, &decided, &leaf.consumer);
             *notified = yielded;
         }
         if !positions.is_false() {

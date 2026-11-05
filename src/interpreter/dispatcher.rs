@@ -419,11 +419,12 @@ struct PipelineState {
     closed_in: AtomicU64,
     /// For a pipeline that reads its input whole, whether that input has been queued.
     whole_queued: AtomicBool,
-    /// Per pipeline it reads, in the order of its `reads`, the region of its breaker's input that
-    /// pipeline's decided pushes have named, `None` for none ([`Pushes::push_final`]).
+    /// Per source of its breaker's input, what that source has decided of it: one per pipeline it
+    /// reads, in the order of its `reads`, then one for the ranges in its own chain
+    /// ([`Decided`]).
     // shared-state-ok: guards naming regions of the pipeline's input, which the decided pushes
-    // of the pipelines it reads grow under the lock; never a tile.
-    decided: Mutex<Vec<Option<TileGuard>>>,
+    // of its sources grow under the lock; never a tile.
+    decided: Mutex<Vec<Decided>>,
     /// How many of a source's packages have been queued, in every epoch.
     queued: AtomicUsize,
     /// How many of a source's packages have been acknowledged, in every epoch.
@@ -441,6 +442,40 @@ struct PipelineState {
     // shared-state-ok: guards naming regions of the pipeline's input, which its notifies and the
     // close that releases them read and write under the lock; never a tile.
     held: Mutex<Held>,
+}
+
+/// What one source of a pipeline's breaker's input has decided of that input: a pipeline it
+/// reads, or the ranges in its own chain.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum Decided {
+    /// Nothing yet.
+    #[default]
+    Nothing,
+    /// The region its decided pushes have named.
+    Region(TileGuard),
+    /// All of what it contributes: it is wholly decided, and a push of it reaches the input only
+    /// widened, or it is read by pull, which reads all of it.
+    Whole,
+}
+
+impl Decided {
+    /// Whether it covers `guard`, a region of the input.
+    #[cfg(debug_assertions)]
+    pub(crate) fn covers(&self, guard: &TileGuard) -> bool {
+        match self {
+            Decided::Nothing => guard.is_empty(),
+            Decided::Region(region) => guard_minus(guard, region).is_empty(),
+            Decided::Whole => true,
+        }
+    }
+
+    fn grown(self, guard: &TileGuard) -> Decided {
+        match self {
+            Decided::Whole => Decided::Whole,
+            Decided::Nothing => Decided::Region(guard.clone()),
+            Decided::Region(region) => Decided::Region(region.union(guard)),
+        }
+    }
 }
 
 /// The arrivals a pipeline holds until the pipelines it holds on have closed
@@ -956,29 +991,37 @@ impl Dispatcher {
         true
     }
 
-    /// Grow the region of `reader`'s input that `read`, a pipeline it reads, has decided by
-    /// `guard`, and that every pipeline it reads which shares `read`'s breaker has: a store's
-    /// pipelines push one store's decided region ([`share_pushes`](Self::share_pushes)).
-    fn record_decided(&self, reader: usize, read: usize, guard: &TileGuard) {
-        self.ensure(self.infos[reader].reads.contains(&read), || {
-            format!("pipeline {read} pushes a decided region to pipeline {reader}, which reads it")
+    /// Grow what `source` has decided of `reader`'s input by `guard`, or record it whole where
+    /// `guard` is `None`. `source` is a pipeline `reader` reads, whose record every pipeline it
+    /// reads that shares `source`'s breaker shares, since a store's pipelines push one store's
+    /// decided region ([`share_pushes`](Self::share_pushes)); or `reader` itself, for the ranges
+    /// in its own chain.
+    fn record_decided(&self, reader: usize, source: usize, guard: Option<&TileGuard>) {
+        let reads = &self.infos[reader].reads;
+        self.ensure(source == reader || reads.contains(&source), || {
+            format!(
+                "pipeline {source} pushes a decided region to pipeline {reader}, which reads it"
+            )
         });
-        let breaker = self.infos[read].pushes_with;
         let mut decided = self.states[reader]
             .decided
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if decided.len() < self.infos[reader].reads.len() {
-            decided.resize(self.infos[reader].reads.len(), None);
+        if decided.len() <= reads.len() {
+            decided.resize(reads.len() + 1, Decided::Nothing);
         }
-        for (at, &read) in self.infos[reader].reads.iter().enumerate() {
-            if self.infos[read].pushes_with != breaker {
-                continue;
-            }
-            decided[at] = Some(match decided[at].take() {
-                Some(before) => before.union(guard),
-                None => guard.clone(),
-            });
+        let slots: Vec<usize> = match source == reader {
+            true => vec![reads.len()],
+            false => (0..reads.len())
+                .filter(|&at| self.infos[reads[at]].pushes_with == self.infos[source].pushes_with)
+                .collect(),
+        };
+        for at in slots {
+            let before = std::mem::take(&mut decided[at]);
+            decided[at] = match guard {
+                Some(guard) => before.grown(guard),
+                None => Decided::Whole,
+            };
         }
     }
 
@@ -1959,11 +2002,41 @@ impl Dispatcher {
     /// breaker's consumer, which restates it as each operator on the way decides
     /// ([`Landing::is_decided`]), and record what reaches each reader's entry
     /// ([`decided_of`](Self::decided_of)).
+    ///
+    /// Where `decided` is every key, each reader the push reached no entry of reads `pipeline` by
+    /// pull, as a store reads its seed, which reads all of it: it records `pipeline` whole.
+    /// `pipeline` is the pushing pipeline, or, for a range in its own chain, the pipeline itself.
     fn land_decided(
         &self,
         pipeline: usize,
         decided: Option<&Projection>,
         to: Option<&SharedConsumer>,
+    ) {
+        self.land_decided_from(pipeline, decided, to, true);
+    }
+
+    /// Push `decided`, the region of its keys a range in `pipeline`'s chain has decided, through
+    /// `to`, the range's consumer, and record what reaches each pipeline's entry as decided by the
+    /// ranges in that pipeline's own chain ([`decided_of`](Self::decided_of)): a range can reach
+    /// the entry of a pipeline beside its own, as the rows of a store per row reach the reader of
+    /// the store.
+    pub(crate) fn land_range_decided(
+        &self,
+        pipeline: PipelineId,
+        decided: &Projection,
+        to: &SharedConsumer,
+    ) {
+        self.land_decided_from(pipeline.0, Some(decided), Some(to), false);
+    }
+
+    /// [`land_decided`](Self::land_decided), applying its rule for readers a push reaches no
+    /// entry of only where `pulled` says the push is a breaker's, which its readers read.
+    fn land_decided_from(
+        &self,
+        pipeline: usize,
+        decided: Option<&Projection>,
+        to: Option<&SharedConsumer>,
+        pulled: bool,
     ) {
         let (Some(decided), Some(to)) = (decided, to) else {
             return;
@@ -1971,34 +2044,54 @@ impl Dispatcher {
         if *decided == Projection::Nothing {
             return;
         }
+        let whole = *decided == Projection::Everything;
         let mut landing = Landing {
-            target: Target::Decided { dispatcher: self },
+            target: Target::Decided {
+                dispatcher: self,
+                whole,
+                reached: Vec::new(),
+                range: !pulled,
+            },
             from: pipeline,
             widened: false,
         };
         to.borrow_mut().push(decided, &mut landing);
+        let Target::Decided { reached, .. } = landing.target else {
+            unreachable!("a decided landing stays one");
+        };
+        if whole && pulled {
+            for &reader in &self.infos[pipeline].readers {
+                if !reached.contains(&reader) {
+                    self.record_decided(reader, pipeline, None);
+                }
+            }
+        }
     }
 
-    /// The region of `reader`'s breaker's input that the decided pushes of `read`, a pipeline it
-    /// reads, have named, `None` for none. Only the end-of-run check reads it, until claims do.
+    /// What `source` has decided of `reader`'s breaker's input: a pipeline `reader` reads, or
+    /// `reader` itself for the ranges in its own chain. Only the end-of-run check reads it, until
+    /// claims do.
     ///
     /// # Panics
     ///
-    /// When `reader` does not read `read`.
+    /// When `source` is neither `reader` nor a pipeline it reads.
     #[cfg(debug_assertions)]
-    pub(crate) fn decided_of(&self, reader: PipelineId, read: PipelineId) -> Option<TileGuard> {
-        let at = self.infos[reader.0]
-            .reads
-            .iter()
-            .position(|&r| r == read.0)
-            .unwrap_or_else(|| panic!("pipeline {} reads pipeline {}", reader.0, read.0));
+    pub(crate) fn decided_of(&self, reader: PipelineId, source: PipelineId) -> Decided {
+        let reads = &self.infos[reader.0].reads;
+        let at = match source.0 == reader.0 {
+            true => reads.len(),
+            false => reads
+                .iter()
+                .position(|&r| r == source.0)
+                .unwrap_or_else(|| panic!("pipeline {} reads pipeline {}", reader.0, source.0)),
+        };
         self.states[reader.0]
             .decided
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(at)
             .cloned()
-            .flatten()
+            .unwrap_or_default()
     }
 
     /// Push `morsels`, pushed by `pipeline` in `epoch`, through `to`, its breaker's consumer, one
@@ -2439,9 +2532,17 @@ enum Target<'d> {
     /// Records each, for a planner that probes which region of a reader's input a pipeline's push
     /// names; which edges keep keys the planner reads off [`Routes`].
     Probe(Vec<Arrival>),
-    /// Grows, for each, the region of the reader's input the pushing pipeline has decided
-    /// ([`Dispatcher::decided_of`]), and queues nothing.
-    Decided { dispatcher: &'d Dispatcher },
+    /// Grows, for each, what the pushing pipeline has decided of the reader's input
+    /// ([`Dispatcher::decided_of`]), and queues nothing. `whole` says the pushing pipeline is
+    /// wholly decided, and `reached` lists the readers whose entry the push reached.
+    Decided {
+        dispatcher: &'d Dispatcher,
+        whole: bool,
+        reached: Vec<usize>,
+        /// Whether a range pushes it, which counts as a range in the chain of each pipeline whose
+        /// entry it reaches.
+        range: bool,
+    },
 }
 
 /// A region a probing push brought to an [`Entry`].
@@ -2480,6 +2581,14 @@ impl Landing<'_> {
         matches!(self.target, Target::Decided { .. })
     }
 
+    /// Whether the region climbing is a decided region of a source that is wholly decided: an
+    /// operator that widens its input's keys passes it as every key, since what that source
+    /// contributes to each of the operator's keys is decided, and the reader intersects what its
+    /// other sources decided.
+    pub fn is_wholly_decided(&self) -> bool {
+        matches!(self.target, Target::Decided { whole: true, .. })
+    }
+
     /// Queue `guard`, a guard of the input of `reader`'s breaker, as a package of `reader` in the
     /// epoch, less what is queued for it there already: a push that reaches a breaker along two
     /// paths, as a filter reads one memo for its values and its predicate, is queued once. A
@@ -2505,8 +2614,18 @@ impl Landing<'_> {
                 });
                 return;
             }
-            Target::Decided { dispatcher } => {
-                return dispatcher.record_decided(reader.0, self.from, guard);
+            Target::Decided {
+                dispatcher,
+                reached,
+                range,
+                ..
+            } => {
+                reached.push(reader.0);
+                let source = match range {
+                    true => reader.0,
+                    false => self.from,
+                };
+                return dispatcher.record_decided(reader.0, source, Some(guard));
             }
         };
         let (from, r) = (self.from, reader.0);
@@ -2560,7 +2679,7 @@ impl Landing<'_> {
             self.from
         );
         match &self.target {
-            Target::Queue { dispatcher, .. } | Target::Decided { dispatcher } => {
+            Target::Queue { dispatcher, .. } | Target::Decided { dispatcher, .. } => {
                 dispatcher.ensure(false, || message)
             }
             Target::Probe(_) => panic!("{message}"),

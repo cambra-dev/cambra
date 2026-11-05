@@ -216,11 +216,12 @@ impl Consumer for Widening {
         self.0.notify(&Projection::Everything);
     }
 
-    /// A change widens to every key. A decided region passes only where it is every key: each
-    /// output key depends on every input key, so none is decided before all of them are.
+    /// A change widens to every key. A decided region passes as every key where its source is
+    /// wholly decided, and not at all otherwise: each output key depends on every input key.
     fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         match region {
             Projection::Everything => self.0.push(region, landing),
+            _ if landing.is_wholly_decided() => self.0.push(&Projection::Everything, landing),
             _ if landing.is_decided() => {}
             _ => landing.widened(|landing| self.0.push(&Projection::Everything, landing)),
         }
@@ -342,12 +343,17 @@ impl Consumer for OneLevelIn {
     }
 
     /// A decided region of the standing levels passes as it is. One that names keys at or beneath
-    /// level `at` passes only where it is every key: which output keys an input row stands
-    /// beneath depends on its values, which no region carries.
+    /// level `at` passes as every key where its source is wholly decided, and not at all
+    /// otherwise: which output keys an input row stands beneath depends on its values, which no
+    /// region carries.
     fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         if landing.is_decided() {
             match region {
-                Projection::Keys { level, .. } if *level >= self.at => {}
+                Projection::Keys { level, .. } if *level >= self.at => {
+                    if landing.is_wholly_decided() {
+                        self.consumer.push(&Projection::Everything, landing);
+                    }
+                }
                 standing => self.consumer.push(standing, landing),
             }
             return;
