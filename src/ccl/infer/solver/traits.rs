@@ -633,6 +633,9 @@ impl fmt::Display for InstanceHead {
 pub struct TraitInstance {
     /// The head's type variables, `T` in `Bag(T)`, declared ([`TypeParam::declared`]).
     pub params: Vec<Rc<TypeParam>>,
+    /// Each family among `params`, `V` in `instance forall (K, V: K => Type) Iterable(FullMap(K,
+    /// V))`, with its index types over the others: what a fresh argument for it ranges over.
+    pub families: Vec<(Rc<TypeParam>, Vec<Type>)>,
     /// The operand types the head names, over `params`: each a **pattern**, built from base
     /// types and nominal types applied to patterns or to the variables.
     pub operands: Vec<Type>,
@@ -717,6 +720,35 @@ impl TraitInstance {
         matches!(self.heads.get(pos as usize), Some(InstanceHead::Any))
     }
 
+    /// A fresh argument for each of the head's type variables, minted at `level`: a variable,
+    /// and for a family the family over fresh binders at its index types whose body is a
+    /// variable minted under them, so it may read them (`src/ccl/design/nominal-types.md`,
+    /// "Family parameters").
+    fn fresh_args(
+        &self,
+        level: crate::ccl::infer_var::Level,
+        telescope: &crate::ccl::infer_var::Telescope,
+    ) -> HashMap<TypeParamId, Type> {
+        let mut fresh: HashMap<TypeParamId, Type> = self
+            .params
+            .iter()
+            .filter(|p| p.arity == 0)
+            .map(|p| (p.id, Type::Infer(InferVar::fresh_in(level, telescope))))
+            .collect();
+        for (family, domains) in &self.families {
+            let binders: Vec<(Name, Type)> = domains
+                .iter()
+                .map(|d| (Name::fresh("k"), replace_params(d, &fresh)))
+                .collect();
+            let telescope = binders
+                .iter()
+                .fold(telescope.clone(), |t, (b, _)| t.extended(b.clone()));
+            let body = Type::Infer(InferVar::fresh_in(level, &telescope));
+            fresh.insert(family.id, Type::family(binders, body));
+        }
+        fresh
+    }
+
     /// Whether this instance accepts `operands`, the types at every operand position: each
     /// matches the head's pattern there, with each type variable standing for one type
     /// throughout.
@@ -758,6 +790,7 @@ impl TraitInstance {
         }
         match at {
             Type::Param(_) => PatternAt::Any,
+            family if family_variable(family).is_some() => PatternAt::Any,
             Type::Base(b) => PatternAt::Head(InstanceHead::Base(b.clone())),
             Type::Nominal(decl, _) => PatternAt::Head(InstanceHead::Nominal(Rc::clone(decl))),
             _ => PatternAt::Absent,
@@ -810,9 +843,130 @@ pub enum InstanceBody {
     Binary(BinOpKind),
     /// Over its one parameter.
     Unary(UnaryOpKind),
+    /// `Iterable`'s `elements` of one of `std`'s collections: its representation's keys for a
+    /// `Set`, and its entries for a `Map` or a `FullMap` (`docs/chl-spec.md`, "4.6 `for` —
+    /// iteration").
+    Elements(crate::ccl::nominal::StdCollection),
+}
+
+/// `value`, a value of `ty`, one of `std`'s collections, as its representation, taken out of its
+/// one constructor by a `match`: the term and the representation's type, at the arguments `ty`
+/// states, refinements kept, since a key type's is the collection's domain. `None` where `ty` is
+/// no collection of `std`.
+pub fn std_collection_representation(value: TypedExpr, ty: &Type) -> Option<(TypedExpr, Type)> {
+    let ty = ty.peel_refinements().clone();
+    let Type::Nominal(decl, _) = &ty else {
+        return None;
+    };
+    crate::ccl::nominal::StdCollection::of(decl)?;
+    let [ctor] = decl.body().ctors.as_slice() else {
+        unreachable!("`std`'s `{}` has one constructor", decl.name)
+    };
+    let rep = ty.nominal_payload(&ctor.name)?;
+    let payload = Name::fresh("__rep");
+    let unwrapped = TypedExpr::match_expr(
+        value,
+        vec![crate::ccl::Branch {
+            pattern: Some(crate::ccl::Pattern {
+                head: crate::ccl::PatternHead::Constructor {
+                    decl: Rc::clone(decl),
+                    ctor: ctor.name.clone(),
+                },
+                binding: crate::ccl::TypedBinding {
+                    ty: rep.clone(),
+                    ..crate::ccl::TypedBinding::new_unannotated(payload.clone())
+                },
+                empty_payload: false,
+            }),
+            guard: TypedExpr::lit(crate::ccl::Lit::Bool(true)).with_ty(Type::Base(BaseType::Bool)),
+            body: TypedExpr::var(payload).with_ty(rep.clone()),
+        }],
+    )
+    .with_ty(rep.clone());
+    Some((unwrapped, rep))
+}
+
+/// `Iterable::elements` of `value`, of type `domain`, one of `std`'s collections: its
+/// representation, taken out of its constructor (the arguments keep their refinements, since a
+/// key type's is the collection's domain), through `map_domain` for a `Set`'s keys or `entries`
+/// for a map's, at `codomain`.
+fn elements_body(
+    collection: crate::ccl::nominal::StdCollection,
+    value: TypedExpr,
+    domain: &Type,
+    codomain: &Type,
+) -> TypedExpr {
+    let (unwrapped, rep) = std_collection_representation(value, domain)
+        .unwrap_or_else(|| panic!("`Iterable` of `{}` reads a value of it", collection.name()));
+    let op = match collection {
+        crate::ccl::nominal::StdCollection::Set => crate::ccl::Builtin::MapDomain,
+        _ => crate::ccl::Builtin::Entries,
+    };
+    TypedExpr::apply(
+        unwrapped,
+        TypedExpr::builtin(op).with_ty(super::fun(rep, codomain.clone())),
+    )
+    .with_ty(codomain.clone())
+}
+
+/// The `Elements` of `std`'s collection `collection` whose representation is `rep`: the keys
+/// of a `Set`, each `(k, v)` of a `Map` or a `FullMap`, over the representation's own keys.
+///
+/// A key is read at the key type the collection declares: `𝐾` of a sum over `SubtypesOf(𝐾)`,
+/// below which every candidate of its witness lies. A value at the witness itself would meet
+/// every concrete type it flows into as a collision ([`super::compact::AtomKey::Witness`]).
+pub fn std_collection_elements(
+    collection: crate::ccl::nominal::StdCollection,
+    rep: &Type,
+) -> Option<Type> {
+    let key = match rep.sum() {
+        Some([witness]) => match witness.type_kind() {
+            crate::ccl::ty::TypeKind::SubtypesOf(key) => *key,
+            other => panic!(
+                "`std`'s `{}` is a sum over a key type, got {other}",
+                collection.name()
+            ),
+        },
+        Some(_) => panic!(
+            "`std`'s `{}` is a sum over one key, got {rep}",
+            collection.name()
+        ),
+        None => rep.domain()?,
+    };
+    let element = match collection {
+        crate::ccl::nominal::StdCollection::Set => key,
+        crate::ccl::nominal::StdCollection::Map | crate::ccl::nominal::StdCollection::FullMap => {
+            Type::Tuple(vec![key, rep.codomain()?])
+        }
+    };
+    Some(Type::fun_like(rep, rep.domain()?, element))
 }
 
 impl InstanceBody {
+    /// The function [`build`](Self::build) makes at `ty`, applied to `argument`: its body with
+    /// its parameter bound to `argument`.
+    ///
+    /// `Elements` reads `argument` where it stands, binding no name: a refinement that quotes
+    /// the call, as a filtered comprehension over the elements does, quotes `argument` itself
+    /// rather than a binder out of its scope, which it would have to replace with the value.
+    pub fn build_applied(&self, argument: TypedExpr, ty: &Type) -> TypedExpr {
+        if let (
+            InstanceBody::Elements(collection),
+            Type::Fun {
+                domain, codomain, ..
+            },
+        ) = (self, ty.peel_refinements())
+        {
+            return elements_body(*collection, argument, domain, codomain);
+        }
+        let function = self.build(ty);
+        let TypedExprNode::Lambda { param, body } = function.node else {
+            unreachable!("an instance's function is built as a lambda")
+        };
+        let result = body.ty.clone();
+        TypedExpr::let_bind(param.name, argument, *body).with_ty(result)
+    }
+
     /// The function as a term of `ty`, the type its call resolved to: `𝐴 ⇒ 𝑂` for one
     /// parameter, `{𝐴, 𝐵} ⇒ 𝑂` for two. The parameters are taken out of the tuple by name,
     /// so each operand the primitive reads is atomic.
@@ -857,6 +1011,9 @@ impl InstanceBody {
             (InstanceBody::Binary(op), other) => {
                 panic!("`{op:?}` is over a pair of operands, got {other}")
             }
+            (InstanceBody::Elements(collection), _) => {
+                elements_body(*collection, read(&param, &domain), &domain, &codomain)
+            }
         };
         TypedExpr::lambda(param, domain, body).with_ty(ty.clone())
     }
@@ -888,6 +1045,16 @@ fn match_pattern(pattern: &Type, ty: &Type, bound: &mut HashMap<TypeParamId, Typ
             }
         }
         Type::Base(b) => matches!(ty, Type::Base(c) if c == b),
+        Type::Family { .. } => match family_variable(pattern) {
+            Some(p) => match bound.get(&p.id) {
+                Some(b) => b == ty,
+                None => {
+                    bound.insert(p.id, ty.clone());
+                    true
+                }
+            },
+            None => false,
+        },
         Type::Nominal(decl, pargs) => match ty {
             Type::Nominal(other, args) if other == decl && args.len() == pargs.len() => pargs
                 .iter()
@@ -896,6 +1063,18 @@ fn match_pattern(pattern: &Type, ty: &Type, bound: &mut HashMap<TypeParamId, Typ
             _ => false,
         },
         _ => false,
+    }
+}
+
+/// The family variable `pattern` passes on, `V` in `\k -> V(k)`: a family whose body applies a
+/// type parameter to its binders, as an instance's head writes one at a family parameter.
+pub(crate) fn family_variable(pattern: &Type) -> Option<&Rc<TypeParam>> {
+    let Type::Family { body, .. } = pattern else {
+        return None;
+    };
+    match &**body {
+        Type::FamilyApp(app) => Some(&app.param),
+        _ => None,
     }
 }
 
@@ -942,6 +1121,9 @@ pub fn unifier(a: &[Type], b: &[Type]) -> Option<HashMap<TypeParamId, Type>> {
             (Type::Nominal(d, xs), Type::Nominal(e, ys)) => {
                 d == e && xs.len() == ys.len() && xs.iter().zip(ys).all(|(x, y)| unify(x, y, subst))
             }
+            // A family variable stands for any family at its position, as a type variable
+            // stands for any type.
+            _ if family_variable(&a).is_some() || family_variable(&b).is_some() => true,
             _ => a == b,
         }
     }
@@ -1553,6 +1735,20 @@ struct AssocPosition {
 }
 
 impl TraitObligation {
+    /// The binders the requirement was stated under: the telescope of a variable it associates,
+    /// which emission mints where the requirement stands and an instantiation freshens with it.
+    /// An instance's type variables are chosen there, so a bound naming one of those binders stays
+    /// in scope. Empty for a requirement that associates no variable.
+    fn stated_in(&self) -> crate::ccl::infer_var::Telescope {
+        self.assoc
+            .iter()
+            .find_map(|p| match &*p.ty.borrow() {
+                Type::Infer(v) => Some(v.telescope.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(crate::ccl::infer_var::Telescope::empty)
+    }
+
     /// Record an instance of `trait_` whose associated names stand at the given type
     /// positions, with every instance the compiler provides still a candidate.
     pub fn new(
@@ -1620,6 +1816,14 @@ impl TraitObligation {
                 ];
                 Rc::new(TraitInstance {
                     params: row.decl.params.clone(),
+                    families: row
+                        .decl
+                        .params
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| p.arity > 0)
+                        .map(|(i, p)| (Rc::clone(p), row.decl.family_domains(i).to_vec()))
+                        .collect(),
                     heads: operands.iter().map(InstanceHead::of_pattern).collect(),
                     operands,
                     assoc: Vec::new(),
@@ -2945,12 +3149,14 @@ impl TraitObligation {
             .map(super::type_level)
             .max()
             .unwrap_or(0);
-        let fresh: HashMap<TypeParamId, Type> = declared
-            .params
-            .iter()
-            .map(|p| (p.id, crate::ccl::infer::solver::fresh_var(level)))
-            .collect();
-        let open = |ty: &Type| replace_params(ty, &fresh);
+        let fresh = declared.fresh_args(level, &self.stated_in());
+        // Each selection owes the sums the instance states their own binders, as an
+        // instantiation of a declaration does ([`crate::ccl::nominal::alpha_convert_sums`]).
+        let open = |ty: &Type| {
+            let mut opened = replace_params(ty, &fresh);
+            crate::ccl::nominal::alpha_convert_sums(&mut opened);
+            opened
+        };
         for (operand, stated) in operands.iter().zip(&declared.operands) {
             if let Some(operand) = operand {
                 constrain_subtype(operand, &open(stated), cache)?;
@@ -4594,8 +4800,13 @@ pub fn entailed(
     })
 }
 
-/// `ty` with each type parameter in `map` replaced by its type.
+/// `ty` with each type parameter in `map` replaced by its type, and each application of a family
+/// parameter in `map` by its family's body at the application's terms
+/// ([`crate::ccl::nominal::substitute_params`]).
 pub(crate) fn replace_params(ty: &Type, map: &HashMap<TypeParamId, Type>) -> Type {
+    if map.values().any(|t| matches!(t, Type::Family { .. })) {
+        return crate::ccl::nominal::substitute_params(ty, map);
+    }
     fn go(ty: &mut Type, map: &HashMap<TypeParamId, Type>) {
         if let Type::Param(p) = ty
             && let Some(to) = map.get(&p.id)

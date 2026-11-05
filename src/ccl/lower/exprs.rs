@@ -4,6 +4,8 @@
 
 use std::rc::Rc;
 
+use crate::ccl::nominal::StdCollection;
+
 use super::*;
 use crate::{
     ccl::{
@@ -103,7 +105,12 @@ pub(super) fn lower_call(
             }
             let collection = lower_expr(&args[0], ctx)?;
             let key = lower_expr(&args[1], ctx)?;
-            Ok(Expr::group_by(collection, key, None))
+            let group_by = ctx.tag_machinery(
+                Expr::group_by(collection, key, None),
+                func.span,
+                "lower.groupby",
+            );
+            wrap_std_collection(StdCollection::FullMap, group_by, func.span, ctx)
         }
         // set(xs) is a re-keying constructor (`src/ccl/design/collections.md`, "Constructor lowering: runtime `groupby` now,
         // constant-folding later"): group the elements by identity — so this site's key
@@ -138,11 +145,13 @@ pub(super) fn lower_call(
                 ctx.tag_machinery(Expr::aggregate(group, AggregateKind::Drain), func.span, sc);
             let collapse =
                 ctx.tag_machinery(Expr::lambda("__set_g", Type::Hole, drained), func.span, sc);
-            Ok(ctx.tag_machinery(
+            let keyed = ctx.tag_machinery(
                 Expr::group_by(elements, id_key, Some(collapse)),
                 func.span,
                 sc,
-            ))
+            );
+            let boxed = boxed(keyed, func.span, ctx);
+            wrap_std_collection(StdCollection::Set, boxed, func.span, ctx)
         }
         // map(kvs) is the other re-keying constructor: group the 2-tuples by their
         // first component — so this site's key domain is the distinct keys — and
@@ -183,11 +192,13 @@ pub(super) fn lower_call(
             let value = ctx.tag_machinery(Expr::apply(sole, val_proj), func.span, sc);
             let collapse =
                 ctx.tag_machinery(Expr::lambda("__map_g", Type::Hole, value), func.span, sc);
-            Ok(ctx.tag_machinery(
+            let keyed = ctx.tag_machinery(
                 Expr::group_by(entries, fst_key, Some(collapse)),
                 func.span,
                 sc,
-            ))
+            );
+            let boxed = boxed(keyed, func.span, ctx);
+            wrap_std_collection(StdCollection::Map, boxed, func.span, ctx)
         }
         Some(b @ (SurfaceBuiltin::Sum | SurfaceBuiltin::Max | SurfaceBuiltin::Min)) => {
             if !b.arity().accepts(args.len()) {
@@ -331,7 +342,12 @@ pub(super) fn lower_call(
                     ),
                 ));
             }
-            Ok(Expr::builtin(Builtin::EmptyMap).with_ty(Type::map_of(Type::Hole, Type::Hole)))
+            let empty = ctx.tag_machinery(
+                Expr::builtin(Builtin::EmptyMap).with_ty(Type::map_of(Type::Hole, Type::Hole)),
+                func.span,
+                "lower.empty_map",
+            );
+            wrap_std_collection(StdCollection::Map, empty, func.span, ctx)
         }
         // An instance stands only before `::`, where the parser reads `summon(T)::f`
         // (`docs/chl-spec.md`, "Summoning an instance").
@@ -915,6 +931,49 @@ pub(super) fn lower_boolop(
     Ok(acc)
 }
 
+/// `inner` as a sum, `inner ▷ box`: the one way into a dependent sum
+/// (`src/ccl/design/type-inference.md`, "Only a term builds a sum").
+fn boxed(inner: Expr, span: Span, ctx: &mut LoweringContext) -> Expr {
+    let op = ctx.tag_machinery(Expr::builtin(Builtin::Box), span, "lower.box");
+    ctx.tag_machinery(Expr::apply(inner, op), span, "lower.box")
+}
+
+/// `payload` built into `std`'s collection type `collection`, by its one constructor: the
+/// private `rep` of a `@Builtin` `Set` or `Map`, whose payload is a sum, or `FullMap::new`
+/// (`docs/chl-spec.md`, "9.16 The std root").
+pub(super) fn wrap_std_collection(
+    collection: StdCollection,
+    payload: Expr,
+    span: Span,
+    ctx: &mut LoweringContext,
+) -> Result<Expr, LoweringError> {
+    let Some((_, decl)) = ctx.std_collections.iter().find(|(c, _)| *c == collection) else {
+        return Err(LoweringError::internal(
+            span,
+            format!(
+                "`{}` builds `std`'s `{}`, and this module lowers before `std`: a std module \
+                 that builds one imports `std`",
+                match collection {
+                    StdCollection::Set => "set(…)",
+                    StdCollection::Map => "map(…)",
+                    StdCollection::FullMap => "groupby(…)",
+                },
+                collection.name()
+            ),
+        ));
+    };
+    let decl = Rc::clone(decl);
+    let [ctor] = decl.body().ctors.as_slice() else {
+        unreachable!("`std`'s `{}` has one constructor", collection.name())
+    };
+    let ctor = ctor.name.clone();
+    Ok(ctx.tag_machinery(
+        Expr::nominal_ctor(decl, ctor, payload),
+        span,
+        "lower.std_collection",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::test_helpers::*;
@@ -1055,24 +1114,24 @@ mod tests {
     #[rstest]
     // Lowering keeps a group-by in surface form; the comprehension phase expands it
     // (`crate::ccl::comprehension`'s tests pin the expansion).
-    #[case("groupby(xs, \\x -> x)", "groupby(xs, λ x → x)")]
+    #[case("groupby(xs, \\x -> x)", "FullMap::new(groupby(xs, λ x → x))")]
     #[case(
         "groupby([1, 2, 3], \\x -> x // 2)",
-        "groupby([1, 2, 3], λ x → x // 2)"
+        "FullMap::new(groupby([1, 2, 3], λ x → x // 2))"
     )]
-    #[case("groupby(xs, key_fn)", "groupby(xs, key_fn)")]
+    #[case("groupby(xs, key_fn)", "FullMap::new(groupby(xs, key_fn))")]
     #[case(
-        "[sum(x) for x in groupby(xs, key_fn)]",
-        "[Sum(x) for x in groupby(xs, key_fn) ▷ Iterable::elements]"
+        "[sum(x) for _ -> x in groupby(xs, key_fn)]",
+        "[Sum(__tuple_payload_4.1) for __tuple_payload_4 in FullMap::new(groupby(xs, key_fn)) ▷ Iterable::elements]"
     )]
     // `set` and `map` are group-bys whose groups collapse.
     #[case(
         "set(xs)",
-        "groupby(xs, λ __set_key → __set_key) ▷ map(λ __set_g → Drain(__set_g))"
+        "Set::rep(groupby(xs, λ __set_key → __set_key) ▷ map(λ __set_g → Drain(__set_g)) ▷ box)"
     )]
     #[case(
         "map(kvs)",
-        "groupby(kvs, λ __map_kv → __map_kv.0) ▷ map(λ __map_g → (Sole(__map_g)).1)"
+        "Map::rep(groupby(kvs, λ __map_kv → __map_kv.0) ▷ map(λ __map_g → (Sole(__map_g)).1) ▷ box)"
     )]
     fn test_lower_groupby(#[case] code: &str, #[case] expected: &str) {
         let expr = parse_expr(code);

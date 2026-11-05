@@ -17,7 +17,7 @@
 //! `check_tile`, `make_int_list`, …) live in [`helpers`] and are reached from each
 //! themed module via `use super::helpers::*;`.
 
-mod helpers;
+pub(crate) mod helpers;
 
 mod chl_types;
 mod comprehensions;

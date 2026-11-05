@@ -1078,6 +1078,10 @@ impl<'a> ProgramLowering<'a> {
         if let Some(option) = ctx.nominal_types.iter().find(|decl| decl.is_option()) {
             ctx.std_option = Some(declared_option(option));
         }
+        ctx.std_collections
+            .extend(ctx.nominal_types.iter().filter_map(|decl| {
+                crate::ccl::nominal::StdCollection::of(decl).map(|c| (c, Rc::clone(decl)))
+            }));
         if module.segments() == [chl_parser::module_path::STD_ROOT] && lowered.errors.is_empty() {
             ctx.declare_std_traits();
         }

@@ -545,30 +545,13 @@ fn commit_stream(ticks: &[u64], values: &[i64]) -> Tile {
 
 /// Drive a program whose result is an `await_final` read and return the `Value` it
 /// settles on. A compound (tuple/record) mutable variable reads back boxed
-/// (`Scalar(Record)`) or struct-of-arrays depending on the read path; both fold to
-/// the same `Value` through `scalar_tile_to_column_value`, so this asserts on the
-/// *value* rather than the (path-dependent) tile shape.
+/// (`Scalar(Record)`) or struct-of-arrays depending on the read path, and a collection, or a
+/// `std` collection's variant around one, as tiles; all fold to the same `Value` through
+/// `materialize_collections`, so this asserts on the value rather than the (path-dependent)
+/// tile shape.
 fn final_mut_var_value(code: &str) -> Value {
-    use cambra::interpreter::tile_operators::scalar_tile_to_column_value;
-    let tile = run_pipeline(code);
-    // A **keyed** mutable variable reads back as the collection it is, one key per row.
-    // Fold it to the single map value the callers assert on, which is the shape-independence
-    // this helper exists for.
-    if let Tile::DataFunction {
-        domain, codomain, ..
-    } = &tile
-    {
-        let values = scalar_tile_to_column_value((**codomain).clone());
-        return Value::Function(
-            (0..domain.len())
-                .map(|i| cambra::interpreter::FuncBinding {
-                    input: domain.index_at(i),
-                    output: values.index_at(i),
-                })
-                .collect(),
-        );
-    }
-    let column = scalar_tile_to_column_value(tile);
+    use cambra::interpreter::tile_operators::materialize_collections;
+    let column = materialize_collections(run_pipeline(code));
     assert_eq!(
         column.len(),
         1,
@@ -650,7 +633,7 @@ fn test_compound_txn_mut_var(#[case] code: &str, #[case] expected: Value) {
 #[timeout(Duration::from_secs(10))]
 #[case::record_seed(
     indoc! {r#"
-        s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=box(map([("x", 1), ("y", 2)])))
+        s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=map([("x", 1), ("y", 2)]))
         n: Mut(Int, Txn) := 0
         for r in [1, 2, 3]:
             with begin():
@@ -661,7 +644,7 @@ fn test_compound_txn_mut_var(#[case] code: &str, #[case] expected: Value) {
 )]
 #[case::tuple_seed(
     indoc! {r#"
-        s: Mut({Int, Map(String, Int)}, Txn) := (5, box(map([("x", 1), ("y", 2)])))
+        s: Mut({Int, Map(String, Int)}, Txn) := (5, map([("x", 1), ("y", 2)]))
         n: Mut(Int, Txn) := 0
         for r in [1, 2, 3]:
             with begin():
@@ -672,7 +655,7 @@ fn test_compound_txn_mut_var(#[case] code: &str, #[case] expected: Value) {
 )]
 #[case::bound_record_seed(
     indoc! {r#"
-        init = (a=5, b=box(map([("x", 1), ("y", 2)])))
+        init = (a=5, b=map([("x", 1), ("y", 2)]))
         s: Mut({a: Int, b: Map(String, Int)}, Txn) := init
         n: Mut(Int, Txn) := 0
         for r in [1, 2, 3]:
@@ -684,10 +667,10 @@ fn test_compound_txn_mut_var(#[case] code: &str, #[case] expected: Value) {
 )]
 #[case::record_write(
     indoc! {r#"
-        s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=box(map([("x", 1), ("y", 2)])))
+        s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=map([("x", 1), ("y", 2)]))
         for r in [1, 2, 3]:
             with begin():
-                s := (a=s.a + 1, b=box(map([("z", 3), ("w", 4)])))
+                s := (a=s.a + 1, b=map([("z", 3), ("w", 4)]))
         await_final(s).a
     "#},
     8
@@ -706,28 +689,27 @@ fn a_sum_inside_a_product_enters_its_declared_sum(#[case] code: &str, #[case] ex
 fn a_one_key_map_inside_a_product() {
     check_tile(
         indoc! {r#"
-            s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=box(map([("x", 1)])))
+            s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=map([("x", 1)]))
             for r in [1, 2, 3]:
                 with begin():
-                    s := (a=s.a + 1, b=box(map([("z", 3)])))
+                    s := (a=s.a + 1, b=map([("z", 3)]))
             await_final(s).a
         "#},
         Tile::Scalar(ColumnValue::Ints(vec![8])),
     );
 }
 
-/// A whole-variable write of a boxed collection enters the variable's declared sum, as its
-/// seed does.
+/// A whole-variable write of a map replaces the variable's map, as its seed set it.
 #[test]
-fn a_boxed_write_enters_its_declared_sum() {
+fn a_whole_map_write_replaces_the_map() {
     assert_eq!(
-        final_mut_var_value(indoc! {r#"
-            m: Mut(Map(String, Int), Txn) := box(map([("x", 1)]))
+        *std_collection_value(&final_mut_var_value(indoc! {r#"
+            m: Mut(Map(String, Int), Txn) := map([("x", 1)])
             for r in [1, 2, 3]:
                 with begin():
-                    m := box(map([("z", 3)]))
+                    m := map([("z", 3)])
             await_final(m)
-        "#}),
+        "#})),
         Value::Function(vec![cambra::interpreter::FuncBinding {
             input: Value::String("z".into()),
             output: Value::Int(3),
@@ -2751,7 +2733,7 @@ fn induction_keyed_write_reading_past_a_lifted_write_rejected() {
         indoc! {r#"
             store: Mut(Int, Txn) := 0
             cnt: Mut(Int) := 5
-            m: Mut(Map(Int, Int)) := box(map([(0, 0)]))
+            m: Mut(Map(Int, Int)) := map([(0, 0)])
             for x in [1, 2]:
                 with begin():
                     store := store + x
@@ -3573,7 +3555,7 @@ fn a_variant_match_inside_a_block_releases_per_commit() {
 #[test]
 fn a_map_valued_mut_var_reads_inside_a_block() {
     let value = final_mut_var_value(indoc! {r#"
-        m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
+        m: Mut(Map(String, Int), Txn) := map([("a", 1), ("b", 2)])
         n: Mut(Int, Txn) := 0
         for r in [1, 2, 3]:
             with begin():
@@ -3594,7 +3576,7 @@ fn a_map_valued_mut_var_reads_inside_a_block() {
 #[test]
 fn a_keyed_write_reaches_a_transactional_store() {
     let value = final_mut_var_value(indoc! {r#"
-        m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
+        m: Mut(Map(String, Int), Txn) := map([("a", 1), ("b", 2)])
         for r in [1, 2, 3]:
             with begin():
                 m["c"] := 3
@@ -3625,7 +3607,7 @@ fn a_keyed_write_reaches_a_transactional_store() {
 #[test]
 fn keyed_writes_at_distinct_keys_compose_across_transactions() {
     let value = final_mut_var_value(indoc! {r#"
-        m: Mut(Map(Int, Int), Txn) := box(map([(1, 10), (2, 20)]))
+        m: Mut(Map(Int, Int), Txn) := map([(1, 10), (2, 20)])
         for x in [3, 4]:
             with begin():
                 m[x] := 99
@@ -3646,7 +3628,7 @@ fn keyed_writes_at_distinct_keys_compose_across_transactions() {
 #[test]
 fn a_keyed_write_reaches_an_induction_store() {
     let value = final_mut_var_value(indoc! {r#"
-        m: Mut(Map(Int, Int)) := box(map([(1, 10), (2, 20)]))
+        m: Mut(Map(Int, Int)) := map([(1, 10), (2, 20)])
         for x in [3, 4]:
             m[x] := 99
         m
@@ -3673,8 +3655,8 @@ fn a_keyed_write_reaches_an_induction_store() {
 fn a_one_entry_seed_reads_as_a_map() {
     check_scalar(
         indoc! {r#"
-            m: Mut(Map(String, Int)) := box(map([("a", 1)]))
-            sum(m)
+            m: Mut(Map(String, Int)) := map([("a", 1)])
+            sum([v for _ -> v in m])
         "#},
         Value::Int(1),
     );
@@ -3683,7 +3665,7 @@ fn a_one_entry_seed_reads_as_a_map() {
 #[test]
 fn a_one_entry_seed_reaches_a_keyed_write() {
     let value = final_mut_var_value(indoc! {r#"
-        m: Mut(Map(String, Int)) := box(map([("a", 1)]))
+        m: Mut(Map(String, Int)) := map([("a", 1)])
         for k in ["b", "c"]:
             m[k] := 9
         m
@@ -3701,7 +3683,7 @@ fn a_one_entry_seed_reaches_a_keyed_write() {
 #[test]
 fn a_one_entry_seed_reaches_a_transactional_keyed_write() {
     let value = final_mut_var_value(indoc! {r#"
-        m: Mut(Map(String, Int), Txn) := box(map([("a", 1)]))
+        m: Mut(Map(String, Int), Txn) := map([("a", 1)])
         for r in [1, 2]:
             with begin():
                 m["c"] := 3
@@ -3728,7 +3710,7 @@ fn a_one_entry_seed_reaches_a_transactional_keyed_write() {
 /// collection domain downstream; the arity is the workaround, not part of what this pins.
 ///
 /// Two adjacent shapes are absent. A constant whole-collection write through a parameter
-/// (`m := box(map(…))`) is not keyed; `a_constant_whole_map_write_through_a_mut_parameter` in
+/// (`m := map(…)`) is not keyed; `a_constant_whole_map_write_through_a_mut_parameter` in
 /// `tests/it/differential_interp.rs` covers it. Transactional pass-by-reference is refused at
 /// lowering: a `with begin():` block takes writes, bindings, guards and feeds, not a call.
 #[test]
@@ -3736,7 +3718,7 @@ fn a_keyed_write_through_a_mut_parameter() {
     let value = final_mut_var_value(indoc! {r#"
         def fw(m: Mut(Map(Int, Int)), k: Int):
             m[k] := 1
-        m: Mut(Map(Int, Int)) := box(map([(1, 10), (2, 20)]))
+        m: Mut(Map(Int, Int)) := map([(1, 10), (2, 20)])
         for x in [3, 4]:
             fw(m, x)
         m
@@ -3790,7 +3772,7 @@ fn an_empty_map_takes_repeated_writes_to_one_key() {
 /// A map value's bindings, key-sorted — a `Value::Function`'s order follows construction,
 /// which is not what a test about *contents* should depend on.
 fn map_entries(v: &Value) -> Vec<(String, i64)> {
-    let Value::Function(bindings) = v else {
+    let Value::Function(bindings) = std_collection_value(v) else {
         panic!("expected a map value, got {v:?}");
     };
     let mut out: Vec<(String, i64)> = bindings
@@ -3806,7 +3788,7 @@ fn map_entries(v: &Value) -> Vec<(String, i64)> {
 
 /// [`map_entries`] for an `Int`-keyed map.
 fn map_entries_int(v: &Value) -> Vec<(i64, i64)> {
-    let Value::Function(bindings) = v else {
+    let Value::Function(bindings) = std_collection_value(v) else {
         panic!("expected a map value, got {v:?}");
     };
     let mut out: Vec<(i64, i64)> = bindings
@@ -3831,7 +3813,7 @@ fn map_entries_int(v: &Value) -> Vec<(i64, i64)> {
 fn a_keyed_write_reads_back_through_a_checked_lookup() {
     check_scalar(
         indoc! {r#"
-            m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
+            m: Mut(Map(String, Int), Txn) := map([("a", 1), ("b", 2)])
             for r in [1, 2, 3]:
                 with begin():
                     m["c"] := 3
@@ -3856,7 +3838,7 @@ fn a_keyed_write_reads_back_through_a_checked_lookup() {
 fn a_product_keys_a_mutable_collection() {
     check_scalar(
         indoc! {r#"
-            m: Mut(Map({Int, Int}, Int), Txn) := box(map([((1, 1), 1)]))
+            m: Mut(Map({Int, Int}, Int), Txn) := map([((1, 1), 1)])
             for r in [1, 2, 3]:
                 with begin():
                     m[(r, r)] := r
@@ -3883,7 +3865,7 @@ fn a_product_keys_a_mutable_collection() {
 fn a_shared_key_component_keys_a_mutable_collection() {
     check_scalar(
         indoc! {r#"
-            m: Mut(Map({Int, String}, Int), Txn) := box(map([((1, "BTC"), 5)]))
+            m: Mut(Map({Int, String}, Int), Txn) := map([((1, "BTC"), 5)])
             for r in [1, 2]:
                 with begin():
                     m[(1, "BTC")] := r
@@ -3904,7 +3886,7 @@ fn a_shared_key_component_keys_a_mutable_collection() {
 fn a_checked_lookup_on_a_mut_var_answers_none_for_an_absent_key() {
     check_scalar(
         indoc! {r#"
-            m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
+            m: Mut(Map(String, Int), Txn) := map([("a", 1), ("b", 2)])
             for r in [1, 2, 3]:
                 with begin():
                     m["c"] := 3
@@ -3936,7 +3918,7 @@ fn a_keyed_read_at_the_loop_item_reads_the_snapshot() {
                     v
                 case Option::none:
                     0
-        m: Mut(Map(Int, Int), Txn) := box(map([(1, 10), (2, 20)]))
+        m: Mut(Map(Int, Int), Txn) := map([(1, 10), (2, 20)])
         n: Mut(Int, Txn) := 0
         for r in [1, 2]:
             with begin():
@@ -3967,7 +3949,7 @@ fn a_keyed_read_at_the_loop_item_reads_the_snapshot() {
 #[test]
 fn a_keyed_write_commits_a_computed_value_at_a_computed_key() {
     let value = final_mut_var_value(indoc! {r#"
-        m: Mut(Map(Int, Int), Txn) := box(map([(1, 10), (2, 20)]))
+        m: Mut(Map(Int, Int), Txn) := map([(1, 10), (2, 20)])
         n: Mut(Int, Txn) := 0
         for x in [3, 4]:
             with begin():
@@ -3992,7 +3974,7 @@ fn a_keyed_write_commits_a_computed_value_at_a_computed_key() {
 fn a_checked_lookup_of_an_absent_key_in_a_read_only_block_answers_none() {
     check_scalar(
         indoc! {r#"
-            m: Mut(Map(Int, Int), Txn) := box(map([(1, 10)]))
+            m: Mut(Map(Int, Int), Txn) := map([(1, 10)])
             out: Feed(_)
             for r in [1, 2, 1]:
                 with begin():
@@ -4026,7 +4008,7 @@ fn a_checked_lookup_of_an_absent_key_in_a_writing_block() {
                         v
                     case Option::none:
                         0
-            m: Mut(Map(Int, Int), Txn) := box(map([(1, 10), (2, 20)]))
+            m: Mut(Map(Int, Int), Txn) := map([(1, 10), (2, 20)])
             n: Mut(Int, Txn) := 0
             for r in [3]:
                 with begin():
@@ -4048,7 +4030,7 @@ fn a_counter_over_an_induction_map_at_a_present_key() {
                     v
                 case Option::none:
                     0
-        m: Mut(Map(Int, Int)) := box(map([(3, 0)]))
+        m: Mut(Map(Int, Int)) := map([(3, 0)])
         for r in [3, 3]:
             m[r] := or_zero(m[r]) + 1
         m
@@ -4069,7 +4051,7 @@ fn a_counter_over_an_induction_map_at_an_absent_key() {
                     v
                 case Option::none:
                     0
-        m: Mut(Map(Int, Int)) := box(map([(1, 10)]))
+        m: Mut(Map(Int, Int)) := map([(1, 10)])
         for r in [3, 3]:
             m[r] := or_zero(m[r]) + 1
         m
@@ -4103,7 +4085,7 @@ fn a_keyed_write_at_a_mutable_variable_key() {
 #[test]
 fn a_keyed_write_of_a_conditional_value_inside_a_block() {
     let value = final_mut_var_value(indoc! {r#"
-        m: Mut(Map(Int, Int), Txn) := box(map([(1, 10)]))
+        m: Mut(Map(Int, Int), Txn) := map([(1, 10)])
         for r in [1, 2]:
             with begin():
                 m[r] := 5 if r > 1 else 6
@@ -4118,7 +4100,7 @@ fn a_keyed_write_of_a_conditional_value_inside_a_block() {
 #[test]
 fn a_keyed_write_under_an_if_inside_a_block() {
     let value = final_mut_var_value(indoc! {r#"
-        m: Mut(Map(Int, Int), Txn) := box(map([(1, 10)]))
+        m: Mut(Map(Int, Int), Txn) := map([(1, 10)])
         for r in [1, 2]:
             with begin():
                 if r > 1:

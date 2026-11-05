@@ -284,12 +284,18 @@ fn emit_node_inner(expr: &mut Expr, ctx: &mut InferCtx) -> Result<Type, LocatedI
             // them; a node built anywhere else would have its refinements never discharged.
             // Inference meets the node as lowering built it; the post-inference check meets
             // it after inlining has substituted the argument, which is already checked.
+            // A payload type with no refinement has none to discharge, so the compiler may
+            // build its value directly, as `set`, `map` and `groupby` build `std`'s collections.
             debug_assert!(
                 matches!(&payload.node, TypedExprNode::Var(n) if n.base() == "__ctor_arg")
-                    || matches!(&payload.node, TypedExprNode::Lit(crate::ccl::Lit::Unit)),
-                "a NominalCtor is built only as its constructor function's body or as a \
-                 nullary constructor's value; anywhere else its refinements are never \
-                 discharged, got payload {}",
+                    || matches!(&payload.node, TypedExprNode::Lit(crate::ccl::Lit::Unit))
+                    || decl.ctor(ctor).is_some_and(|c| {
+                        let declared = c.payload();
+                        crate::ccl::ccl_utils::strip_refinements(&declared) == declared
+                    }),
+                "a NominalCtor is built only as its constructor function's body, as a nullary \
+                 constructor's value, or over a payload type with no refinement; anywhere else \
+                 its refinements are never discharged, got payload {}",
                 symbolic(payload)
             );
             emit_nominal_ctor(decl, ctor, payload, ctx)?
@@ -1180,6 +1186,12 @@ pub(super) fn emit_apply<C: Typing>(
     // Undereffed it meets the demand `fn_ty <: (x: d) ⇒ result` as a mismatch, the relation
     // relating a mutable variable only to another.
     let fn_ty = read_through(&ctx.subexpr(function)?);
+    // One of `std`'s collections applied to a key is its representation applied: the value is
+    // taken out of its constructor here, and the application is typed at what it holds.
+    let fn_ty = match std_collection_applied(function, &fn_ty) {
+        Some(rep) => rep,
+        None => fn_ty,
+    };
     // **The one position where a mutable variable's handle survives.** If the parameter is a
     // mutable variable the argument is passed *by reference* and the handle must reach the
     // parameter, so the invariance rule relates the two value types directly — that is
@@ -1282,6 +1294,26 @@ pub(super) fn emit_apply<C: Typing>(
     }
 }
 
+/// Where `function`, of type `fn_ty`, is a value of one of `std`'s collections, replace it with
+/// its representation taken out of its constructor, and give back the representation's type.
+fn std_collection_applied(function: &mut Expr, fn_ty: &Type) -> Option<Type> {
+    let Type::Nominal(decl, _) = fn_ty.peel_refinements() else {
+        return None;
+    };
+    crate::ccl::nominal::StdCollection::of(decl)?;
+    let value = std::mem::take(function);
+    let _f = crate::ccl::provenance::enter(
+        value.node_id(),
+        "infer.std_collection_applied",
+        crate::ccl::provenance::Nature::Machinery,
+    );
+    let (unwrapped, rep) =
+        crate::ccl::infer::solver::traits::std_collection_representation(value, fn_ty)
+            .expect("a collection of `std` has a representation");
+    *function = unwrapped;
+    Some(rep)
+}
+
 /// Check the key against the collection domain's base and return the supplied value type.
 /// Presence is not a typing obligation here: reads check it at runtime, and writes can add keys.
 /// See `src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]`".
@@ -1296,7 +1328,16 @@ fn keyed_access_value<C: Typing>(
     // them. Keep the collection's base as the upper bound; only presence is checked later.
     // A range's base is `UInt`: `0..𝑛` states which keys are present, and a key outside it is
     // a lookup that answers `none`.
-    let base = match keys.peel_refinements() {
+    // A collection of `std` is keyed by its type argument, a variable until the value its
+    // annotation or initializer states reaches it, which it has where the collection is read.
+    let resolved = match keys {
+        Type::Infer(_) => crate::ccl::infer::resolve_var_type(keys)
+            .ok()
+            .filter(|t| !matches!(t, Type::Infer(_)))
+            .unwrap_or_else(|| keys.clone()),
+        _ => keys.clone(),
+    };
+    let base = match resolved.peel_refinements() {
         Type::UIntRange(_) => &Type::Base(BaseType::UInt),
         base => base,
     };
@@ -1442,6 +1483,25 @@ fn not_a_keyed_access(collection: &Type, what: &str) -> InferError {
 /// See `src/ccl/design/collections.md`, "The checked lookup `𝑐[𝑘]`".
 fn keyed_access_types(collection: &Type) -> Option<(Type, Option<Name>, Type)> {
     let collection = collection.peel_refinements();
+    // One of `std`'s collections is read at its representation, which coalescing then takes out
+    // of the value (`unwrap_std_collection_lookup` in `solve.rs`).
+    if let Type::Nominal(decl, args) = collection
+        && let Some(std_collection) = crate::ccl::nominal::StdCollection::of(decl)
+    {
+        // A `FullMap`'s value at a key is its family at that key: the family's body, under its
+        // own binder. Read through the representation `(k: K) |=> V(k)`, it is the application
+        // `V(k)`, a variable minted before `k` was bound, which a discharge of `k` passes over.
+        if std_collection == crate::ccl::nominal::StdCollection::FullMap
+            && let [keys, Type::Family { binders, body }] = args.as_slice()
+            && let [(binder, _)] = binders.as_slice()
+        {
+            return Some((keys.clone(), binder.clone(), (**body).clone()));
+        }
+        let [ctor] = decl.body().ctors.as_slice() else {
+            unreachable!("`std`'s `{}` has one constructor", std_collection.name())
+        };
+        return keyed_access_types(&collection.nominal_payload(&ctor.name)?);
+    }
     let viewed = match collection.sum() {
         Some([witness, ..]) => {
             let crate::ccl::ty::TypeKind::SubtypesOf(key) = witness.type_kind() else {

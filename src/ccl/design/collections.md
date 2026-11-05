@@ -50,9 +50,9 @@ statically. `Collection`'s `Type` kind admits every domain kind, but does not su
 witness implementation; see
 [Compiling a conditional collection](#compiling-a-conditional-collection).
 
-`FullMap(_, V)` lets inference recover a producer's domain. A list literal can satisfy that
-annotation; this does not give it an unrefined `Int` domain. Likewise, a group-by retains its
-present-key domain. `full_map_annotations_are_satisfiable` and
+`FullMap(_, V)` lets inference recover a group-by's present-key domain, and only a group-by
+satisfies it, since `groupby` is the only operation that builds a `FullMap`.
+`only_a_group_by_satisfies_a_full_map_annotation` and
 `a_groupby_is_a_full_map_at_either_strength` cover annotation cases.
 A `FullMap(Int, Int)` parameter can be type-checked with a proven integer lookup `m[1]!` without
 establishing that a tested concrete collection can inhabit the parameter type.

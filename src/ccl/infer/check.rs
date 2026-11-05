@@ -936,6 +936,12 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
             check_strength_over(&expr.ty, &label, ctx);
             expr.ty.clone()
         }
+        // `entries` is minted at coalescing with a type stamped by hand (`InstanceBody::build`),
+        // so its rule is checked rather than trusted.
+        TypedExprNode::Builtin(Builtin::Entries) => {
+            check_entries(&expr.ty, &label, ctx);
+            expr.ty.clone()
+        }
         // `unbox` is minted after inference with a type stamped by hand
         // (`crate::ccl::ty::unbox_type`), so its rule is checked rather than trusted.
         TypedExprNode::Builtin(Builtin::Unbox) => {
@@ -1394,6 +1400,26 @@ fn check_strength_over(ty: &Type, label: &str, ctx: &mut CheckCtx) {
     // Both directions: the result is the collection's own shape, not a sub- or supertype.
     let _ = ctx.require_sub(&expected, &recorded, &at);
     let _ = ctx.require_sub(&recorded, &expected, &at);
+}
+
+/// The rule for [`Builtin::Entries`]: `𝐶 ⇒ 𝐶′`, where `𝐶′` is `𝐶` over the same keys, and the
+/// same witness for a sum, holding `(𝑘, 𝑣)` for each value `𝑣` at key `𝑘`
+/// ([`Type::entries_of`]). Recorded into `ctx.errors`, as `require_sub` records.
+fn check_entries(ty: &Type, label: &str, ctx: &mut CheckCtx) {
+    let expected = ty.domain().and_then(|collection| collection.entries_of());
+    let (Some(expected), Some(recorded)) = (expected, ty.codomain()) else {
+        let error = ctx.raise(InferError::TypeMismatch {
+            found: Box::new(ty.clone()),
+            expected: None,
+            ctx: format!("{label}: entries takes a collection"),
+        });
+        ctx.errors.push(error);
+        return;
+    };
+    let at = || format!("{label}: entries pairs each value of its collection with its key");
+    // One direction: a recorded key may be wider than the collection's keys, as `std`'s
+    // collections read a key at their declared key type.
+    let _ = ctx.require_sub(&expected, &recorded, &at);
 }
 
 /// The rule for [`Builtin::Unbox`]: `(𝑐 : Σ (σ : 𝐾). 𝐷[σ] ⤇ 𝑉) ⇒ 𝐷[σ ↦ σ₁(𝑐)] ⤇ 𝑉`, the sum's

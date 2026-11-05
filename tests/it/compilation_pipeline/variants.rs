@@ -1955,7 +1955,7 @@ fn test_the_spec_match_in_a_loop_example(#[case] code: &str, #[case] expected: V
     x = `some(m)
     match x:
         case `some(v):
-            sum(v)
+            sum([n for _ -> n in v])
         case `none:
             0"#})]
 fn a_collection_payload_is_one_variant_value(#[case] code: &str) {
@@ -1971,7 +1971,7 @@ fn a_collection_payload_is_one_variant_value(#[case] code: &str) {
 fn a_collection_payload_per_row_is_one_variant_per_row() {
     let tile = run_pipeline(indoc! {r"
         g = groupby([1, 2, 3, 4], \v -> v // 2)
-        [`some(xs) for xs in g]
+        [`some(xs) for _ -> xs in g]
     "});
     let cambra::interpreter::Tile::DataFunction {
         domain, codomain, ..

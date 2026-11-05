@@ -1046,6 +1046,7 @@ fn builtin_preserves_domain(builtin: &Builtin) -> bool {
         | Builtin::CurryOver
         | Builtin::StrengthOver
         | Builtin::MapDomain
+        | Builtin::Entries
         | Builtin::Compose
         | Builtin::Converse
         | Builtin::Uncurry(_)

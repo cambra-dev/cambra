@@ -355,3 +355,12 @@ pub(crate) fn extract_record_field(tile: Tile, field: &str) -> ColumnValue {
         other => panic!("expected records, got {other:?}"),
     }
 }
+
+/// The collection a value of one of `std`'s collections holds: the payload of its one
+/// constructor. Any other value is itself.
+pub(crate) fn std_collection_value(v: &Value) -> &Value {
+    match v {
+        Value::Union { inner, .. } => inner,
+        other => other,
+    }
+}

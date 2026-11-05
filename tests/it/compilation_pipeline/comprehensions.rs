@@ -140,7 +140,7 @@ fn test_comprehensions_filtered(#[case] code: &str, #[case] expected: Tile) {
 )]
 // A per-group filter: groups [1], [2, 3] and [4], and `x > 1` keeps 2, 3 and 4.
 #[case::per_group(
-    r"sum([sum([x for x in g if x > sum([0, 1])]) for g in groupby([1, 2, 3, 4], \v -> v // 2)])",
+    r"sum([sum([x for x in g if x > sum([0, 1])]) for _ -> g in groupby([1, 2, 3, 4], \v -> v // 2)])",
     9
 )]
 // An equi-join whose key side aggregates: `a == b + 1` keeps (2, 1) and (3, 2).
@@ -392,7 +392,7 @@ fn a_filter_over_a_union_source_is_applied(#[case] code: &str) {
 #[case::over_a_group(
     indoc! {r"
         g = groupby([1, 2, 3, 4], \v -> v // 2)
-        sum([sum([x for x in grp if x > 1]) for grp in g])
+        sum([sum([x for x in grp if x > 1]) for _ -> grp in g])
     "},
     9
 )]
@@ -424,11 +424,11 @@ fn a_filtered_inner_comprehension_over_the_outer_row_keeps_its_filter(
     6
 )]
 #[case::mut_var_in_block(indoc! {r"
-    m: Mut(Map(Int, Int), Txn) := box(map([(1, 10)]))
+    m: Mut(Map(Int, Int), Txn) := map([(1, 10)])
     n: Mut(Int, Txn) := 0
     for r in [1, 2]:
         with begin():
-            n := sum([v for v in m if v > 0])
+            n := sum([v for _ -> v in m if v > 0])
     await_final(n)
 "}, 10)]
 fn a_filtered_inner_comprehension_over_a_projected_row_keeps_its_filter(
@@ -515,11 +515,11 @@ fn a_value_binder_reads_a_transactional_map(#[case] rows: &str, #[case] total: i
     check_scalar(
         &format!(
             indoc! {r#"
-                m: Mut(Map(String, Int), Txn) := box(map([("a", 1), ("b", 2)]))
+                m: Mut(Map(String, Int), Txn) := map([("a", 1), ("b", 2)])
                 n: Mut(Int, Txn) := 0
                 for r in {}:
                     with begin():
-                        n := n + sum([v for v in m])
+                        n := n + sum([v for _ -> v in m])
                 await_final(n)
             "#},
             rows
@@ -540,12 +540,12 @@ fn a_transactional_map_reads_back_after_a_keyed_write(#[case] element: &str, #[c
     check_scalar(
         &format!(
             indoc! {r#"
-                m: Mut(Map(String, Int), Txn) := box(map([("a", 1)]))
+                m: Mut(Map(String, Int), Txn) := map([("a", 1)])
                 n: Mut(Int, Txn) := 0
                 for r in [1, 2]:
                     with begin():
                         m["b"] := 10
-                        n := n + sum([{} for v in m])
+                        n := n + sum([{} for _ -> v in m])
                 await_final(n)
             "#},
             element
@@ -563,11 +563,11 @@ fn a_transactional_map_reads_back_after_a_keyed_write(#[case] element: &str, #[c
 // `{a: 1}` summed as `1 + r` for `r` in 1, 2.
 #[case::store_read(
     indoc! {r#"
-        m: Mut(Map(String, Int), Txn) := box(map([("a", 1)]))
+        m: Mut(Map(String, Int), Txn) := map([("a", 1)])
         n: Mut(Int, Txn) := 0
         for r in [1, 2]:
             with begin():
-                n := n + sum([v + r for v in m])
+                n := n + sum([v + r for _ -> v in m])
         await_final(n)
     "#},
     5
@@ -575,12 +575,12 @@ fn a_transactional_map_reads_back_after_a_keyed_write(#[case] element: &str, #[c
 // `{a: 1, b: 10}` after the write, summed as `(1 + r) + (10 + r)`.
 #[case::after_a_keyed_write(
     indoc! {r#"
-        m: Mut(Map(String, Int), Txn) := box(map([("a", 1)]))
+        m: Mut(Map(String, Int), Txn) := map([("a", 1)])
         n: Mut(Int, Txn) := 0
         for r in [1, 2]:
             with begin():
                 m["b"] := 10
-                n := n + sum([v + r for v in m])
+                n := n + sum([v + r for _ -> v in m])
         await_final(n)
     "#},
     28
@@ -591,12 +591,12 @@ fn a_transactional_map_reads_back_after_a_keyed_write(#[case] element: &str, #[c
 // another total.
 #[case::a_map_each_transaction_changes(
     indoc! {r#"
-        m: Mut(Map(Int, Int), Txn) := box(map([(0, 1)]))
+        m: Mut(Map(Int, Int), Txn) := map([(0, 1)])
         n: Mut(Int, Txn) := 0
         for r in [1, 2]:
             with begin():
                 m[r] := 10 * r
-                n := n + sum([v + r for v in m])
+                n := n + sum([v + r for _ -> v in m])
         await_final(n)
     "#},
     50
@@ -604,11 +604,11 @@ fn a_transactional_map_reads_back_after_a_keyed_write(#[case] element: &str, #[c
 // `{x: 1, y: 2}` summed as `(1 + r) + (2 + r)` for `r` in 1, 2, 3.
 #[case::record_field(
     indoc! {r#"
-        s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=box(map([("x", 1), ("y", 2)])))
+        s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=map([("x", 1), ("y", 2)]))
         n: Mut(Int, Txn) := 0
         for r in [1, 2, 3]:
             with begin():
-                n := n + sum([v + r for v in s.b])
+                n := n + sum([v + r for _ -> v in s.b])
         await_final(n)
     "#},
     21
@@ -626,11 +626,11 @@ fn a_comprehension_over_a_transactional_map_reads_its_enclosing_scope(
 fn a_value_binder_reads_a_collection_field_of_a_transactional_record() {
     check_scalar(
         indoc! {r#"
-            s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=box(map([("x", 1), ("y", 2)])))
+            s: Mut({a: Int, b: Map(String, Int)}, Txn) := (a=5, b=map([("x", 1), ("y", 2)]))
             n: Mut(Int, Txn) := 0
             for r in [1, 2, 3]:
                 with begin():
-                    n := n + sum([v for v in s.b])
+                    n := n + sum([v for _ -> v in s.b])
             await_final(n)
         "#},
         Value::Int(9),
@@ -681,7 +681,7 @@ fn an_aggregate_per_element_keeps_a_row_its_filter_empties() {
 #[case::map_of_collections(
     indoc! {r#"
         mm = map([("a", [1, 2]), ("b", [3, 4])])
-        sum([sum([v for v in vs]) for vs in mm])
+        sum([sum([v for v in vs]) for _ -> vs in mm])
     "#},
     10
 )]
@@ -728,7 +728,7 @@ fn a_let_outside_a_filtered_comprehension_moves_into_both_copies_of_its_source()
 #[case::collection_source(
     indoc! {r#"
         c = map([("a", 1), ("b", 2)])
-        sum([sum([v * r for v in c]) for r in [1, 2]])
+        sum([sum([v * r for _ -> v in c]) for r in [1, 2]])
     "#},
     9
 )]
@@ -751,7 +751,7 @@ fn a_let_outside_a_filtered_comprehension_moves_into_both_copies_of_its_source()
 #[case::uncorrelated_filter_over_a_collection(
     indoc! {r#"
         c = map([("a", 1), ("b", 2)])
-        sum([sum([v * r for v in c if v > 1]) for r in [1, 2]])
+        sum([sum([v * r for _ -> v in c if v > 1]) for r in [1, 2]])
     "#},
     6
 )]
@@ -841,7 +841,7 @@ fn several_generators_key_by_the_tuple_of_positions(#[case] source: &str, #[case
 "#}, "[() -> [(_0: 0, _1: 0) -> 1, (_0: 0, _1: 1) -> 2, (_0: 1, _1: 0) -> 3]]")]
 #[case::over_groups(indoc! {r#"
     out = test_sink()
-    out << [x for g in groupby([1, 2, 3, 4], \e -> e // 2) for x in g]
+    out << [x for _ -> g in groupby([1, 2, 3, 4], \e -> e // 2) for x in g]
 "#}, "[() -> [(_0: 0, _1: 0) -> 1, (_0: 1, _1: 1) -> 2, (_0: 1, _1: 2) -> 3, (_0: 2, _1: 3) -> 4]]")]
 #[case::summed(indoc! {r#"
     out = test_sink()
@@ -1069,7 +1069,7 @@ fn correlated_rows_without_an_aggregate(#[case] source: &str, #[case] expected: 
 fn a_correlated_comprehension_without_an_aggregate_over_a_collection() {
     let tile = run_pipeline(indoc! {r#"
         c = map([("a", 1), ("b", 2)])
-        [[v * r for v in c] for r in [1, 2]]
+        [[v * r for _ -> v in c] for r in [1, 2]]
     "#});
     let levels = tile.key_levels();
     let [(_, outer), (_, inner)] = levels.as_slice() else {
@@ -1126,7 +1126,7 @@ fn a_correlated_inner_aggregate_under_a_collection_result() {
 #[case::over_a_map(
     indoc! {r#"
         c = map([("a", 1), ("b", 2)])
-        sum([1 for v in c])
+        sum([1 for _ -> v in c])
     "#},
     2
 )]
@@ -1134,7 +1134,7 @@ fn a_correlated_inner_aggregate_under_a_collection_result() {
 #[case::correlated(
     indoc! {r#"
         c = map([("a", 1), ("b", 2)])
-        sum([sum([1 for v in c]) * r for r in [1, 2]])
+        sum([sum([1 for _ -> v in c]) * r for r in [1, 2]])
     "#},
     6
 )]
@@ -1142,14 +1142,14 @@ fn a_correlated_inner_aggregate_under_a_collection_result() {
 #[case::filtered(
     indoc! {r#"
         c = map([("a", 1), ("b", 2)])
-        sum([1 for v in c if v > 1])
+        sum([1 for _ -> v in c if v > 1])
     "#},
     1
 )]
 #[case::over_a_filtered_list(
     indoc! {r#"
         c = map([("a", 1), ("b", 2)])
-        d = [v for v in c if v > 1]
+        d = [v for _ -> v in c if v > 1]
         sum([1 for w in d])
     "#},
     1
@@ -1157,7 +1157,7 @@ fn a_correlated_inner_aggregate_under_a_collection_result() {
 #[case::over_a_mapped_list(
     indoc! {r#"
         c = map([("a", 1), ("b", 2)])
-        d = [v + 1 for v in c]
+        d = [v + 1 for _ -> v in c]
         sum([1 for w in d])
     "#},
     2
@@ -1175,18 +1175,21 @@ fn a_comprehension_ignoring_the_element_counts_the_present_keys(
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 // 2 keys of `c` × 2 keys of `d`.
-#[case::a_map_by_a_map("sum([1 for v in c for w in d])", 4)]
+#[case::a_map_by_a_map("sum([1 for _ -> v in c for _ -> w in d])", 4)]
 // 2 keys × 3 positions, in either order.
-#[case::a_map_by_a_list("sum([1 for v in c for w in [1, 2, 3]])", 6)]
-#[case::a_list_by_a_map("sum([1 for w in [1, 2, 3] for v in c])", 6)]
+#[case::a_map_by_a_list("sum([1 for _ -> v in c for w in [1, 2, 3]])", 6)]
+#[case::a_list_by_a_map("sum([1 for w in [1, 2, 3] for _ -> v in c])", 6)]
 // (1 + 2) once per key of `d`.
-#[case::reading_the_map_s_element("sum([v for v in c for w in d])", 6)]
+#[case::reading_the_map_s_element("sum([v for _ -> v in c for _ -> w in d])", 6)]
 // (1 + 2) × (1 + 2).
-#[case::reading_both_elements("sum([v * w for v in c for w in [1, 2]])", 9)]
+#[case::reading_both_elements("sum([v * w for _ -> v in c for w in [1, 2]])", 9)]
 // The component's own filter keeps "b" alone, under each key of `d`: 2 × 2.
-#[case::a_filtered_map_by_a_map("sum([v for v in c if v > 1 for w in d])", 4)]
+#[case::a_filtered_map_by_a_map("sum([v for _ -> v in c if v > 1 for _ -> w in d])", 4)]
 // The groups of [1, 2, 3, 4] by `x // 2` are 0, 1 and 2: 3 groups × 2 keys of `d`.
-#[case::a_group_by_by_a_map(r"sum([1 for g in groupby([1, 2, 3, 4], \x -> x // 2) for w in d])", 6)]
+#[case::a_group_by_by_a_map(
+    r"sum([1 for _ -> g in groupby([1, 2, 3, 4], \x -> x // 2) for _ -> w in d])",
+    6
+)]
 fn a_product_enumerates_a_keyed_component_s_present_keys(
     #[case] comprehension: &str,
     #[case] total: i64,
@@ -1273,11 +1276,11 @@ fn a_product_keeps_a_filtered_projection_s_filter(
 #[case::of_two_maps(indoc! {r#"
     c = map([("a", 1), ("b", 2)])
     d = map([("x", 1), ("y", 3)])
-    sum([v * w for v in c for w in d if v == w])
+    sum([v * w for _ -> v in c for _ -> w in d if v == w])
 "#})]
 #[case::of_a_map_and_a_list(indoc! {r#"
     c = map([("a", 1), ("b", 2)])
-    sum([v for v in c for u in [1, 2, 3] if v == u])
+    sum([v for _ -> v in c for u in [1, 2, 3] if v == u])
 "#})]
 #[case::of_a_filtered_list_and_a_list(indoc! {"
     xs = [x for x in [1, 2, 3] if x > 1]
@@ -1296,7 +1299,7 @@ fn a_join_over_an_arm_its_extent_overstates_is_not_planned_yet(#[case] code: &st
 // 1*(1+2+3) + 2*(1+2+3).
 #[case::list_source("sum([v * r for v in [1, 2, 3]])", 18)]
 // Over a collection, whose domain comes from the data: 1*(1+2) + 2*(1+2).
-#[case::collection_source("sum([v * r for v in c])", 9)]
+#[case::collection_source("sum([v * r for _ -> v in c])", 9)]
 fn a_correlated_comprehension_runs_inside_a_transaction(
     #[case] comprehension: &str,
     #[case] total: i64,
@@ -1339,7 +1342,7 @@ fn a_correlated_comprehension_runs_inside_a_transaction(
 #[case::depth_3_collection(
     indoc! {r#"
         m = map([("a", 1), ("b", 2)])
-        sum([sum([sum([v * r * q for v in m]) for r in [1, 2]]) for q in [1, 2]])
+        sum([sum([sum([v * r * q for _ -> v in m]) for r in [1, 2]]) for q in [1, 2]])
     "#},
     27
 )]
@@ -1399,7 +1402,7 @@ fn a_correlated_comprehension_over_collection_valued_rows() {
     check_scalar(
         indoc! {r"
             g = groupby([1, 2, 3, 4], \v -> v // 2)
-            sum([sum([x * sum(v) for x in [1, 2]]) for v in g])
+            sum([sum([x * sum(v) for x in [1, 2]]) for _ -> v in g])
         "},
         Value::Int(30),
     );
@@ -1475,7 +1478,7 @@ fn a_correlated_comprehension_over_an_unnamed_map_source_ranges_over_its_keys() 
     check_scalar(
         indoc! {r#"
             c = map([("a", 1), ("b", 2)])
-            sum([sum([r for v in c]) for r in [1, 2]])
+            sum([sum([r for _ -> v in c]) for r in [1, 2]])
         "#},
         Value::Int(6),
     );
@@ -1497,7 +1500,7 @@ fn a_correlated_comprehension_over_an_unnamed_map_source_ranges_over_its_keys() 
 #[case::collection_source(
     indoc! {r"
         c = map([(1, 10), (2, 20)])
-        sum([sum([v for v in c if v > r * 10]) for r in [1, 2]])
+        sum([sum([v for _ -> v in c if v > r * 10]) for r in [1, 2]])
     "},
     20
 )]
@@ -1551,7 +1554,7 @@ fn a_correlated_filter_over_a_collection() {
     check_scalar(
         indoc! {r"
             c = map([(1, 10), (2, 20)])
-            sum([sum([v * r for v in c if v > r]) for r in [1, 2]])
+            sum([sum([v * r for _ -> v in c if v > r]) for r in [1, 2]])
         "},
         // 1*(10+20) + 2*(10+20).
         Value::Int(90),

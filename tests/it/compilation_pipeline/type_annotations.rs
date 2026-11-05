@@ -814,7 +814,7 @@ m
 fn a_refined_map_key_in_a_mut_annotation_is_reported() {
     check_compile_error(
         r#"
-m: Mut(Map({String where _ != ""}, Int)) := box(map([("a", 1), ("z", 2)]))
+m: Mut(Map({String where _ != ""}, Int)) := map([("a", 1), ("z", 2)])
 m
 "#,
         r#"Type mismatch for collection annotation: expected Σ (σ : SubtypesOf({String | __elem != ""})). (σ ⤇ _), found {String | __elem ▷ ((λ __iter_record : 0..2 → __iter_record ▷ [("a", 1), ("z", 2)] ▷ (λ __map_kv : (String, Int) → __map_kv.0)) ▷ collection_contains)}"#,
@@ -2048,11 +2048,11 @@ q = id(g)
 fn a_refinement_in_an_invariant_nominal_argument_survives_the_barrier() {
     check_scalar(
         indoc! {r#"
-type Index(K):
-    index(FullMap(K, Int))
+type Index(K, V: K => Type):
+    index(FullMap(K, V))
 def f(x: Int):
     r ^= x
-    Index::index(map([(1, 10), (2, 20)]))
+    Index::index(groupby([1, 2], \v -> v))
 i = f(1)
 7
         "#},
@@ -2120,16 +2120,6 @@ i = f(1)
     10
 )]
 #[case::a_codomain("f: Int => _ |=> Int = \\n -> [n, n]\nsum(f(3))", 6)]
-// A group-by's codomain reads its key, and a hole in the annotation's codomain is filled under
-// the annotation's binder.
-#[case::a_group_by(
-    indoc! {"
-        xs = [1, 2, 3]
-        g: _ |=> _ = groupby(xs, \\x -> x > 1)
-        sum([sum(v) for v in g])
-    "},
-    6
-)]
 fn a_data_function_type_admits_both_collections(#[case] code: &str, #[case] expected: i64) {
     check_scalar(code, Value::Int(expected));
 }

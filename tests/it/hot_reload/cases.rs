@@ -16,6 +16,7 @@ use super::serving::{
     drive_until, exchange, http_get, http_post, no_main, raw_http, raw_http_response,
     reserve_test_port, start_sink,
 };
+use crate::compilation_pipeline::helpers::std_collection_value;
 
 /// A loop the reload adds over a collection an existing loop folded reads that
 /// collection whole.
@@ -1682,7 +1683,7 @@ fn an_induction_accumulator_carries_into_its_replacement() {
 #[test]
 fn a_map_valued_variable_carries_whole() {
     let v1 = indoc! {r#"
-        qty: Mut(Map(String, Int), Txn) := box(map([("btc", 2), ("eth", 1)]))
+        qty: Mut(Map(String, Int), Txn) := map([("btc", 2), ("eth", 1)])
         for r in [1]:
             with begin():
                 qty["sol"] := 5
@@ -1735,7 +1736,7 @@ fn a_map_valued_variable_carries_whole() {
 fn a_loaded_collection_is_transformed_into_its_replacement() {
     // Whole units.
     let v1 = indoc! {r#"
-        qty: Mut(Map(String, Int), Txn) := box(map([("btc", 2), ("eth", 1)]))
+        qty: Mut(Map(String, Int), Txn) := map([("btc", 2), ("eth", 1)])
         for c in [1]:
             with begin():
                 qty["sol"] := 3
@@ -1745,7 +1746,7 @@ fn a_loaded_collection_is_transformed_into_its_replacement() {
     let v2 = indoc! {r#"
         @LoadFrom(qty)
         held <: Map(String, Int)
-        qty_units: Mut(Map(String, Int), Txn) := box([q * 10000 for q in held])
+        qty_units: Mut(Map(String, Int), Txn) := map([(k, q * 10000) for k -> q in held])
         for c in [1]:
             with begin():
                 qty_units["xrp"] := 70000
@@ -1780,14 +1781,13 @@ fn a_loaded_collection_is_transformed_into_its_replacement() {
     );
 }
 
-/// A rebuilt collection is a plain collection over the witness the loaded one carries
-/// (`docs/chl-spec.md`, "7.4 `box`"), so it does not initialize a variable annotated with a
-/// sum until it is boxed, whichever annotation the load has
-/// ([`a_loaded_collection_is_transformed_into_its_replacement`] boxes it).
+/// A comprehension over a loaded `Map` is a plain collection over the map's keys, not a
+/// `Map`, so it does not initialize a variable annotated with one
+/// ([`a_loaded_collection_is_transformed_into_its_replacement`] builds the `Map` with `map`).
 #[test]
-fn a_rebuilt_collection_initializes_a_sum_only_boxed() {
+fn a_rebuilt_collection_initializes_a_map_only_through_map() {
     let v1 = indoc! {r#"
-        qty: Mut(Map(String, Int), Txn) := box(map([("btc", 2), ("eth", 1)]))
+        qty: Mut(Map(String, Int), Txn) := map([("btc", 2), ("eth", 1)])
         for c in [1]:
             with begin():
                 qty["sol"] := 3
@@ -1798,7 +1798,7 @@ fn a_rebuilt_collection_initializes_a_sum_only_boxed() {
     let v2 = indoc! {r#"
         @LoadFrom(qty)
         held: Map(String, Int)
-        qty_units: Mut(Map(String, Int), Txn) := [q for q in held]
+        qty_units: Mut(Map(String, Int), Txn) := [q for _ -> q in held]
         await_final(qty_units)
     "#};
     let mut ctx = GlobalContext::default();
@@ -1808,12 +1808,12 @@ fn a_rebuilt_collection_initializes_a_sum_only_boxed() {
     let errors = live
         .reload_text(&mut ctx, MAIN_BRANCH, v2, &no_main)
         .err()
-        .expect("an unboxed comprehension does not initialize a sum");
+        .expect("a comprehension does not initialize a `Map`");
     let rendered = format!("{errors:?}");
     assert!(
         rendered.contains("initializer of mutable `qty_units`")
-            && rendered.contains("a plain collection reached a sum"),
-        "the initializer is refused for the kinds it joins: {rendered}",
+            && rendered.contains("expected Map(String, Int)"),
+        "the initializer is refused as no `Map`: {rendered}",
     );
 }
 
@@ -1833,7 +1833,7 @@ fn a_rebuilt_collection_initializes_a_sum_only_boxed() {
 fn a_loaded_record_valued_collection_is_transformed_into_its_replacement() {
     // A quantity and the lot it was booked under.
     let v1 = indoc! {r#"
-        qty: Mut(Map(String, {units: Int, lot: Int}), Txn) := box(map([("btc", (units=2, lot=7)), ("eth", (units=1, lot=8))]))
+        qty: Mut(Map(String, {units: Int, lot: Int}), Txn) := map([("btc", (units=2, lot=7)), ("eth", (units=1, lot=8))])
         for c in [1]:
             with begin():
                 qty["sol"] := (units=3, lot=9)
@@ -1843,7 +1843,7 @@ fn a_loaded_record_valued_collection_is_transformed_into_its_replacement() {
     let v2 = indoc! {r#"
         @LoadFrom(qty)
         held <: Map(String, {units: Int, lot: Int})
-        qty_units: Mut(Map(String, {units: Int, lot: Int}), Txn) := box([(units=q.units * 10000, lot=q.lot) for q in held])
+        qty_units: Mut(Map(String, {units: Int, lot: Int}), Txn) := map([(k, (units=q.units * 10000, lot=q.lot)) for k -> q in held])
         for c in [1]:
             with begin():
                 qty_units["xrp"] := (units=70000, lot=1)
@@ -1890,7 +1890,7 @@ fn a_loaded_record_valued_collection_is_transformed_into_its_replacement() {
 #[test]
 fn a_collection_load_naming_nothing_is_refused() {
     let v1 = indoc! {r#"
-        qty: Mut(Map(String, Int), Txn) := box(map([("btc", 2), ("eth", 1)]))
+        qty: Mut(Map(String, Int), Txn) := map([("btc", 2), ("eth", 1)])
         for c in [1]:
             with begin():
                 qty["sol"] := 3
@@ -1901,7 +1901,7 @@ fn a_collection_load_naming_nothing_is_refused() {
     let v2 = indoc! {r#"
         @LoadFrom(nonesuch)
         held <: Map(String, Int)
-        qty_units: Mut(Map(String, Int), Txn) := box([q * 10000 for q in held])
+        qty_units: Mut(Map(String, Int), Txn) := map([(k, q * 10000) for k -> q in held])
         await_final(qty_units)
     "#};
     let mut ctx = GlobalContext::default();
@@ -1945,7 +1945,7 @@ fn a_collection_load_naming_nothing_is_refused() {
 #[test]
 fn a_bounded_annotation_does_not_weaken_a_collections_shape_check() {
     let v1 = indoc! {r#"
-        qty: Mut(Map(String, Int), Txn) := box(map([("btc", 2), ("eth", 1)]))
+        qty: Mut(Map(String, Int), Txn) := map([("btc", 2), ("eth", 1)])
         for c in [1]:
             with begin():
                 qty["sol"] := 3
@@ -1954,7 +1954,7 @@ fn a_bounded_annotation_does_not_weaken_a_collections_shape_check() {
     let v2 = indoc! {r#"
         @LoadFrom(qty)
         held <: Map(String, String)
-        labels: Mut(Map(String, String), Txn) := box([q + "!" for q in held])
+        labels: Mut(Map(String, String), Txn) := map([(k, q + "!") for k -> q in held])
         await_final(labels)
     "#};
     let mut ctx = GlobalContext::default();
@@ -3490,7 +3490,8 @@ fn drive_main_int(ctx: &mut GlobalContext, live: &mut LiveProgram) -> i64 {
 /// [`drive_main_to_terminal`] for a program whose value is a `Map`, as its
 /// entries in key order.
 fn drive_main_map(ctx: &mut GlobalContext, live: &mut LiveProgram) -> Vec<(String, i64)> {
-    let Value::Function(bindings) = drive_main_to_value(ctx, live) else {
+    let value = drive_main_to_value(ctx, live);
+    let Value::Function(bindings) = std_collection_value(&value) else {
         panic!("a map's value is a function from keys to values");
     };
     let mut out: Vec<(String, i64)> = bindings
@@ -3510,7 +3511,8 @@ fn drive_main_record_map(
     ctx: &mut GlobalContext,
     live: &mut LiveProgram,
 ) -> Vec<(String, Vec<(String, i64)>)> {
-    let Value::Function(bindings) = drive_main_to_value(ctx, live) else {
+    let value = drive_main_to_value(ctx, live);
+    let Value::Function(bindings) = std_collection_value(&value) else {
         panic!("a map's value is a function from keys to values");
     };
     let mut out: Vec<(String, Vec<(String, i64)>)> = bindings
@@ -4584,7 +4586,7 @@ fn a_reload_does_not_seed_an_accumulator_from_a_released_in_full_binding() {
 #[test]
 fn an_exact_annotation_on_a_loaded_collection_is_transformed() {
     let v1 = indoc! {r#"
-        qty: Mut(Map(String, Int), Txn) := box(map([("btc", 2), ("eth", 1)]))
+        qty: Mut(Map(String, Int), Txn) := map([("btc", 2), ("eth", 1)])
         for c in [1]:
             with begin():
                 qty["sol"] := 3
@@ -4595,7 +4597,7 @@ fn an_exact_annotation_on_a_loaded_collection_is_transformed() {
     let v2 = indoc! {r#"
         @LoadFrom(qty)
         held: Map(String, Int)
-        qty_units: Mut(Map(String, Int), Txn) := box([q * 10000 for q in held])
+        qty_units: Mut(Map(String, Int), Txn) := map([(k, q * 10000) for k -> q in held])
         await_final(qty_units)
     "#};
     let mut ctx = GlobalContext::default();

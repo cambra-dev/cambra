@@ -30,6 +30,51 @@ pub const OPTION: &str = "Option";
 /// recognizes `Option` by this path and its name (`docs/chl-spec.md`, "9.16 The std root").
 pub const OPTION_MODULE: [&str; 1] = ["std"];
 
+/// A collection type `std` declares, which the compiler recognizes by its path and name: it
+/// builds their values (`set`, `map`, `groupby`) and answers their iteration
+/// (`src/ccl/design/collections.md`, "Telling `Set` and `Map` apart \[Decided\]").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StdCollection {
+    /// `Set(K)`, a `@Builtin` type over a sum of a subset of `K`.
+    Set,
+    /// `Map(K, V)`, a `@Builtin` type over a sum of a subset of `K`.
+    Map,
+    /// `FullMap(K, V: K => Type)`, whose one private constructor holds `(k: K) |=> V(k)`.
+    FullMap,
+}
+
+impl StdCollection {
+    /// The name `std` declares the type by.
+    pub fn name(self) -> &'static str {
+        match self {
+            StdCollection::Set => "Set",
+            StdCollection::Map => "Map",
+            StdCollection::FullMap => "FullMap",
+        }
+    }
+
+    /// The collection `std` declares under `name`, if the compiler names one.
+    pub fn named(name: &str) -> Option<StdCollection> {
+        [
+            StdCollection::Set,
+            StdCollection::Map,
+            StdCollection::FullMap,
+        ]
+        .into_iter()
+        .find(|c| c.name() == name)
+    }
+
+    /// The collection `decl` is, if `std` declares it.
+    pub fn of(decl: &NominalDecl) -> Option<StdCollection> {
+        decl.module
+            .iter()
+            .map(SmolStr::as_str)
+            .eq(OPTION_MODULE)
+            .then(|| StdCollection::named(&decl.name))
+            .flatten()
+    }
+}
+
 /// The tag a value built by the constructor `ctor` carries once nominal types erase: the
 /// constructor's name, as a label of the root's namespace whichever module declares the
 /// type. Construction, patterns and erasure all build it here, so they agree, and the
@@ -705,6 +750,12 @@ impl NominalDecl {
         }
     }
 
+    /// Whether `std` declares this type, at its root or in a module beneath it. The compiler
+    /// supplies `std`, so two versions of one running program read one declaration.
+    pub fn in_std(&self) -> bool {
+        self.module.first().is_some_and(|m| m == "std")
+    }
+
     /// Whether the declaration is `std`'s `Option` ([`OPTION_MODULE`]).
     pub fn is_option(&self) -> bool {
         self.name == OPTION && self.module.iter().map(SmolStr::as_str).eq(OPTION_MODULE)
@@ -765,6 +816,7 @@ impl NominalDecl {
         if self.const_args.is_some() {
             replace_consts(&mut out, &consts);
         }
+        alpha_convert_sums(&mut out);
         out
     }
 
@@ -1093,6 +1145,32 @@ fn replace_params(ty: &mut Type, pol: bool, map: &HashMap<TypeParamId, (&Type, &
         }
         _ => ty.walk_children_mut(|child| replace_params(child, pol, map)),
     }
+}
+
+/// `ty` with each type parameter in `map` replaced by its type, and each application of a family
+/// parameter by its family's body at the application's terms, as [`NominalDecl::instantiate`]
+/// substitutes a declaration's arguments.
+pub fn substitute_params(ty: &Type, map: &HashMap<TypeParamId, Type>) -> Type {
+    let sided: HashMap<TypeParamId, (&Type, &Type)> =
+        map.iter().map(|(id, t)| (*id, (t, t))).collect();
+    // The terms an application reads name the binders around them, so the type is substituted
+    // opened ([`NominalDecl::instantiate`]).
+    crate::ccl::provenance::preserving_ids(|| {
+        let mut opened = crate::ccl::generalize::opened_deep(ty);
+        replace_params(&mut opened, true, &sided);
+        crate::ccl::generalize::closed_deep(&opened)
+    })
+}
+
+/// `ty` with every sum it states under fresh binders ([`Type::alpha_convert_sum`]). A
+/// declaration's type binds its sums' witnesses, so each instantiation owes itself its own:
+/// a witness compares by its binder alone, so two instances sharing one, such as `Set(?a)`'s
+/// and `Set(?b)`'s representations, are one type to every edge that deduplicates.
+pub(crate) fn alpha_convert_sums(ty: &mut Type) {
+    if ty.sum().is_some() {
+        *ty = ty.alpha_convert_sum();
+    }
+    ty.walk_children_mut(alpha_convert_sums);
 }
 
 /// `ty` with each nominal type it names, at any depth, the instance whose `const` arguments

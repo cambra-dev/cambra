@@ -79,6 +79,34 @@ impl Option(T):
             case Option::none:
                 True
 
+# --- Collections --------------------------------------------------------------------------------
+
+# A set of distinct keys of type `K`: what `set(xs)` builds.
+#
+# A set iterates its keys, and `k in s` tests whether `k` is one (docs/chl-spec.md, "4.6 `for` —
+# iteration"). Its keys are some subset of `K`, decided by the value, so a `Set(K)` holds any set
+# of `K`s and `Set` is covariant in `K`.
+@Builtin
+pub type Set(K)
+
+# A collection with one value of type `V` for each of its keys, some subset of `K`: what
+# `map(kvs)` builds.
+#
+# A map iterates its entries, `(k, v)`, and a lookup `m[k]` answers `Option::none` for a key it
+# lacks (docs/chl-spec.md, "3.9 Subscript and attribute access"). `Map` is covariant in `K` and
+# in `V`.
+@Builtin
+pub type Map(K, V)
+
+# A collection with a value for every key of type `K`, the value at `k` of type `V(k)`: what
+# `groupby` builds, whose groups' domains differ by key.
+#
+# A full map iterates its entries, as a map does, and its lookup `m[k]!` needs no proof that `k` is
+# present. Its constructor is private: `groupby` is the only operation that builds one
+# (docs/chl-spec.md, "6.3 Direction: collection types [Decided]").
+pub type FullMap(K, V: K => Type):
+    new((k: K) |=> V(k))
+
 # --- Arithmetic ---------------------------------------------------------------------------------
 
 # Types `+` adds: `a + b` is `add(a, b)`, of type `Output`. On strings, `+` concatenates.
@@ -174,3 +202,12 @@ instance Negatable(Int):
 pub trait Iterable(C):
     Elements <: _ |=> _
     def elements(c: C) => Elements
+
+# A set iterates its keys, and a map or a full map its entries, `(k, v)`, over the collection's own
+# keys. The compiler supplies each `Elements`, which no CHL type spells.
+@Builtin
+instance forall (K) Iterable(Set(K))
+@Builtin
+instance forall (K, V) Iterable(Map(K, V))
+@Builtin
+instance forall (K, V: K => Type) Iterable(FullMap(K, V))

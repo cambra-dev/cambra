@@ -1720,7 +1720,7 @@ fn an_operator_trait_function_by_name(#[case] code: &str, #[case] expected: i64)
     true
 )]
 #[case::groupby_keys(
-    "sum([max(g) for g in groupby([1, 2, 3], \\x -> Money::new(x // 2))]) == 4",
+    "sum([max(g) for _ -> g in groupby([1, 2, 3], \\x -> Money::new(x // 2))]) == 4",
     true
 )]
 #[case::a_join(
@@ -1748,7 +1748,7 @@ fn an_operator_trait_function_by_name(#[case] code: &str, #[case] expected: i64)
 #[case::each_group_s_max(
     indoc! {"
         g = groupby([1, 2, 3, 4, 5], \\x -> x // 2)
-        sum([Money::extract(max([Money::new(v) for v in grp])) for grp in g]) == 9
+        sum([Money::extract(max([Money::new(v) for v in grp])) for _ -> grp in g]) == 9
     "},
     true
 )]
@@ -1843,13 +1843,13 @@ fn a_nominal_type_orders_as_declared(#[case] code: &str) {
 #[case::each_group_s_min_with_a_string(
     indoc! {"
         g = groupby([1, 2, 3, 4], \\x -> x // 2)
-        sum([min([(v, \"a\") for v in grp]).0 for grp in g]) == 7
+        sum([min([(v, \"a\") for v in grp]).0 for _ -> grp in g]) == 7
     "}
 )]
 #[case::each_group_s_max(
     indoc! {"
         g = groupby([1, 2, 3, 4], \\x -> x // 2)
-        sum([max([(v, 0) for v in grp]).0 for grp in g]) == 8
+        sum([max([(v, 0) for v in grp]).0 for _ -> grp in g]) == 8
     "}
 )]
 fn a_tuple_orders_lexicographically(#[case] code: &str) {
@@ -2148,11 +2148,10 @@ fn a_loop_over_a_type_without_an_iterable_instance(#[case] code: &str) {
 }
 
 /// An instance's associated type is one type at every use, so a `_ |=> V` there is a plain
-/// collection, and an `elements` returning a sum is refused against it, as against
-/// `FullMap(_, V)`.
+/// collection, and an `elements` returning a sum is refused against it. A `FullMap(_, V)` is a
+/// nominal type, refused at the instance (`a_nominal_elements_is_refused_at_the_instance`).
 #[rstest]
 #[case::a_data_function_type("_ |=> Int")]
-#[case::a_full_map("FullMap(_, Int)")]
 fn an_associated_data_function_type_admits_no_sum(#[case] elements: &str) {
     check_compile_error(
         &formatdoc! {"

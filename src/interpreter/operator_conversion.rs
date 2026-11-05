@@ -1434,7 +1434,7 @@ in it has a correspondent",
                 taken_over.insert(path);
                 continue;
             }
-            if predecessor.holds_nominal(&path) || site.ty.mentions_nominal() {
+            if predecessor.holds_nominal(&path) || site.ty.mentions_nominal_outside_std() {
                 out.push(StateConflict::NominalState { path: path.clone() });
                 taken_over.insert(path);
                 continue;
@@ -1471,7 +1471,7 @@ in it has a correspondent",
                 // A declared type the conversion context cannot resolve to an
                 // extent is a compile error the real compile will raise with its
                 // own diagnostic; the extent comparison has nothing to add.
-                if key.holds_nominal || decl.ty.mentions_nominal() {
+                if key.holds_nominal || decl.ty.mentions_nominal_outside_std() {
                     out.push(StateConflict::NominalState { path: path.clone() });
                 } else if let Ok(extent) = self.extent_of(&decl.ty)
                     && extent != key.value_extent
@@ -2411,6 +2411,16 @@ fn convert_impl_inner(
             Ok(Box::new(MapDomain::new(convert_impl(argument, None, ctx)?)))
         }
 
+        // `𝑐 ▷ entries`: each value of `𝑐` beside its key, over the same keys.
+        TypedExprNode::Apply { argument, function }
+            if input.is_none() && as_builtin(function) == Some(Builtin::Entries) =>
+        {
+            Ok(Box::new(MapDomain::entries_at(
+                convert_impl(argument, None, ctx)?,
+                CurryLevel::OUTERMOST,
+            )))
+        }
+
         // uncurry(n) flattens n collection levels into one keyed by n-tuples: the outer two
         // levels pair, and each pairing past the first pairs the tuple already built with the
         // next level's key, which `[0] ▷ flatten_domain` splices open. With an input, the
@@ -3069,6 +3079,7 @@ fn convert_impl_inner(
                 // it is converted under: a group-by whose key or source varies with an enclosing row
                 // inverts each row's collection on its own.
                 Builtin::MapDomain => Ok(Box::new(MapDomain::new_at(input, ctx.level()))),
+                Builtin::Entries => Ok(Box::new(MapDomain::entries_at(input, ctx.level()))),
                 Builtin::Converse => Ok(Box::new(Converse::new_at(input, ctx.level()))),
                 // `variant_project(c)` consumes the fed scrutinee stream and
                 // narrows it to that tag's restricted sub-domain, yielding the
@@ -3975,7 +3986,7 @@ fn build_commit_store(
                 carried: Some(paths[i].clone()),
                 runtime_key,
                 value_extent: key_value_extent,
-                holds_nominal: k.init.ty.mentions_nominal(),
+                holds_nominal: k.init.ty.mentions_nominal_outside_std(),
             },
         );
         debug_assert!(
@@ -4767,14 +4778,15 @@ pub enum StateConflict {
     /// author needs anyway: the one with the migration taken out.
     NoPredecessor { name: String },
     /// The running program holds it, or the new version declares or loads it, at a type
-    /// that mentions a nominal type.
+    /// that mentions a nominal type the program declares.
     ///
     /// Extents cannot carry such a value over: an extent is the nominal type's
     /// representation, which leaves out the type's name and its declaration's
     /// refinements, so a renamed type or a tightened refinement compares equal. The check
     /// the spec states compares the two declarations (`src/ccl/design/program-evolution.md`,
     /// "A nominal type is compared by declaration"); until it exists, every such value is
-    /// refused, an unchanged declaration included.
+    /// refused, an unchanged declaration included. A type `std` declares is exempt: the
+    /// compiler supplies `std`, so both versions read one declaration.
     NominalState { path: VarPath },
 }
 
@@ -5293,7 +5305,7 @@ fn build_induction_store_single(
                 carried: Some(paths[i].clone()),
                 runtime_key: rk,
                 value_extent,
-                holds_nominal: k.init.ty.mentions_nominal(),
+                holds_nominal: k.init.ty.mentions_nominal_outside_std(),
             },
         );
         debug_assert!(

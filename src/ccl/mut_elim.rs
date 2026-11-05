@@ -1366,14 +1366,37 @@ fn rewrite_keyed_writes(expr: &mut Expr, value_tys: &HashMap<Name, Type>) {
              target is rejected before this phase"
         )
     });
-    let arg_ty = Type::Tuple(vec![map_ty.clone(), key.ty.clone(), value.ty.clone()]);
-    let mut arg = Expr::tuple(vec![tvar(name, map_ty.clone()), *key, (**value).clone()]);
+    // One of `std`'s collections is written through its representation, which the write takes
+    // out of the value and puts back in its constructor: `m := rep(insert(rep⁻¹(m), k, v))`.
+    let read = tvar(name, map_ty.clone());
+    let (collection, collection_ty) =
+        match crate::ccl::infer::solver::traits::std_collection_representation(
+            read.clone_preserving_ids(),
+            &map_ty,
+        ) {
+            Some(unwrapped) => unwrapped,
+            None => (read, map_ty.clone()),
+        };
+    let arg_ty = Type::Tuple(vec![
+        collection_ty.clone(),
+        key.ty.clone(),
+        value.ty.clone(),
+    ]);
+    let mut arg = Expr::tuple(vec![collection, *key, (**value).clone()]);
     arg.ty = arg_ty.clone();
     let mut insert = Expr::builtin(Builtin::Insert);
-    insert.ty = Type::fun(arg_ty, map_ty.clone());
+    insert.ty = Type::fun(arg_ty, collection_ty.clone());
     let mut app = Expr::apply(arg, insert);
-    app.ty = map_ty;
-    **value = app;
+    app.ty = collection_ty;
+    **value = match map_ty.peel_refinements() {
+        Type::Nominal(decl, _) if crate::ccl::nominal::StdCollection::of(decl).is_some() => {
+            let [ctor] = decl.body().ctors.as_slice() else {
+                unreachable!("`std`'s `{}` has one constructor", decl.name)
+            };
+            Expr::nominal_ctor(Rc::clone(decl), ctor.name.clone(), app).with_ty(map_ty)
+        }
+        _ => app,
+    };
 }
 
 /// A `Var` reference stamped with its concrete type.

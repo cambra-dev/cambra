@@ -58,15 +58,16 @@ use super::panic_message::panic_message;
 )]
 #[case::map_literal(
     r#"m = map(["a" -> 1, "b" -> 2])"#,
-    r#"{String where _ in ["a", "b"]} |=> Int"#
+    r#"Map({String where _ in ["a", "b"]}, Int)"#
 )]
-#[case::set_literal("s = set([1, 2])", "{Int where _ in [1, 2]} |=> {}")]
+#[case::set_literal("s = set([1, 2])", "Set({Int where _ in [1, 2]})")]
 #[case::group_by(
     indoc! {"
         xs = [1, 2, 3]
         g = groupby(xs, \\x -> x > 1)
     "},
-    "(k: {Bool where _ in [x > 1 for x in xs]}) |=> {UInt where _ < 3 and (xs[_]! > 1) == k} |=> Int"
+    "FullMap({Bool where _ in [x > 1 for x in xs]}, \\k: {Bool where _ in [x > 1 for x in xs]} -> \
+     {UInt where _ < 3 and (xs[_]! > 1) == k} |=> Int)"
 )]
 // A key the compiler names is spelled apart from the program's own `k`.
 #[case::group_by_beside_k(
@@ -75,7 +76,8 @@ use super::panic_message::panic_message;
         xs = [1, 2, 3]
         g = groupby(xs, \\x -> x + k)
     "},
-    "(k1: {Int where _ in [x + k for x in xs]}) |=> {UInt where _ < 3 and xs[_]! + k == k1} |=> Int"
+    "FullMap({Int where _ in [x + k for x in xs]}, \\k1: {Int where _ in [x + k for x in xs]} -> \
+     {UInt where _ < 3 and xs[_]! + k == k1} |=> Int)"
 )]
 #[case::boxed_literal("b = box([1, 2, 3])", "Box(Array(3, Int))")]
 #[case::boxed_alternatives(

@@ -1434,15 +1434,18 @@ fn eliminate_at(ty: &Type, s: &Subst) -> Option<(Type, Subst)> {
             codomain,
         } => {
             let parts = match fun_kind {
-                FunKind::Data(Some(ws)) => ws.iter().enumerate().fold(rest, |acc, (i, w)| {
-                    acc.extended_witness_discharge(
-                        w.id(),
-                        &Type::WitnessProjection(crate::ccl::ty::WitnessProjection::new(
-                            Rc::clone(&term),
-                            i,
-                        )),
-                    )
-                }),
+                FunKind::Data(Some(ws)) => {
+                    ws.iter().enumerate().fold(rest.clone(), |acc, (i, w)| {
+                        acc.extended_witness_discharge(
+                            w.id(),
+                            &Type::WitnessProjection(crate::ccl::ty::WitnessProjection::through(
+                                &term,
+                                || rest.apply_type(ty),
+                                i,
+                            )),
+                        )
+                    })
+                }
                 FunKind::Var(k) => Subst::then(&rest, &Subst::kind_elim(k, &term)),
                 // Nothing to eliminate: the sum over no binders, or not a collection.
                 FunKind::Data(None) | FunKind::Compute => return Some((ty.clone(), rest)),
@@ -1499,7 +1502,24 @@ fn constrain_go_impl(
         }
         seen.push((sl.clone(), sr.clone()));
     }
+    constrain_shapes(lhs, rhs, sl, sr, cache, scope)
+}
 
+/// [`constrain_go_impl`] past its short-circuit and cycle check: the edge decomposed by the
+/// two sides' shapes.
+///
+/// An extrusion constrains its copy here, past the check its original edge just recorded.
+/// The copy derives every witness of the original ([`Witness::map_types`]), and a witness is
+/// equal to itself whatever its range, so the copy is equal to the original and the check
+/// would take it for the edge it was made to carry.
+fn constrain_shapes(
+    lhs: &Type,
+    rhs: &Type,
+    sl: &Subst,
+    sr: &Subst,
+    cache: &mut ConstrainCache,
+    scope: &dyn ScopeEnv,
+) -> Result<(), ConstrainError> {
     match (lhs, rhs) {
         // Leaf types match by structural equality.
         (Type::Base(a), Type::Base(b)) if a == b => Ok(()),
@@ -2420,7 +2440,7 @@ fn constrain_go_impl(
                 lv.level(),
                 cache.extruded.entry(lv.level()).or_default(),
             );
-            constrain_go(lhs, &new_rhs, sl, sr, cache, scope)
+            constrain_shapes(lhs, &new_rhs, sl, sr, cache, scope)
         }
         (_, Type::Infer(rv)) => {
             if let Some(param) = escaping_param(lhs, rv.level()) {
@@ -2432,7 +2452,7 @@ fn constrain_go_impl(
                 rv.level(),
                 cache.extruded.entry(rv.level()).or_default(),
             );
-            constrain_go(&new_lhs, rhs, sl, sr, cache, scope)
+            constrain_shapes(&new_lhs, rhs, sl, sr, cache, scope)
         }
 
         // A type parameter is a subtype of whatever its bound is a subtype of

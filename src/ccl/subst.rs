@@ -2719,12 +2719,16 @@ impl Subst {
                 fun_kind: FunKind::Data(Some(ws)),
                 ..
             } => {
-                let mut discharging = rest;
+                let mut discharging = rest.clone();
                 for (i, w) in ws.iter().enumerate() {
                     discharging.witnesses.insert(
                         *w.id(),
                         WitnessMapping::Discharge(Type::WitnessProjection(
-                            crate::ccl::ty::WitnessProjection::new(Rc::clone(c), i),
+                            crate::ccl::ty::WitnessProjection::through(
+                                c,
+                                || rest.apply_type(ty),
+                                i,
+                            ),
                         )),
                     );
                 }

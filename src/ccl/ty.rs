@@ -3447,6 +3447,16 @@ impl Type {
         Type::Nominal(Rc::clone(option), vec![payload])
     }
 
+    /// The payload type of the constructor `ctor` of this nominal type, at its arguments, or
+    /// `None` when this is no nominal type declaring `ctor`.
+    pub fn nominal_payload(&self, ctor: &str) -> Option<Self> {
+        let Type::Nominal(decl, args) = self.peel_refinements() else {
+            return None;
+        };
+        let declared = decl.ctor(ctor)?.payload();
+        Some(decl.instantiate(&declared, args))
+    }
+
     /// The payload of an [`option_of`](Self::option_of), or `None` for any other type.
     ///
     /// The constructor's inverse, for a rule that recovers an answer it recorded earlier
@@ -3769,6 +3779,18 @@ impl Type {
     /// witness — dropping that binder is the same silent loss as flipping the kind, and
     /// it is worse, because the rebuilt domain is usually the witness itself and a
     /// `WitnessRef` outside its binder means nothing at all.
+    /// What [`Builtin::Entries`](crate::ccl::Builtin::Entries) gives of a collection of this
+    /// type: over the same keys, and the same witness for a sum, each value beside its key.
+    /// `None` for a type that is not a collection.
+    pub fn entries_of(&self) -> Option<Type> {
+        let (keys, values) = (self.domain()?, self.codomain()?);
+        Some(Type::fun_like(
+            self,
+            keys.clone(),
+            Type::Tuple(vec![keys, values]),
+        ))
+    }
+
     pub fn fun_like(exemplar: &Type, domain: Self, codomain: Self) -> Self {
         match exemplar {
             Type::Fun { name, fun_kind, .. } => {
@@ -3981,6 +4003,12 @@ impl Type {
     /// Whether a [`Type::Nominal`] occurs anywhere in this type.
     pub fn mentions_nominal(&self) -> bool {
         self.holds_type(&|ty| matches!(ty, Type::Nominal(..)))
+    }
+
+    /// Whether a [`Type::Nominal`] that `std` does not declare occurs anywhere in this type
+    /// ([`crate::ccl::nominal::NominalDecl::in_std`]).
+    pub fn mentions_nominal_outside_std(&self) -> bool {
+        self.holds_type(&|ty| matches!(ty, Type::Nominal(decl, _) if !decl.in_std()))
     }
 
     pub fn peel_refinements(&self) -> &Type {
@@ -4820,6 +4848,10 @@ pub struct WitnessProjection {
     pub term: Rc<TypedExpr>,
     /// Which of the sum's binders, outermost first.
     pub position: usize,
+    /// The sum an elimination read the term through, where the term's own type slot showed none
+    /// when the projection was made ([`WitnessProjection::through`]). Equality and hashing skip
+    /// it, as they skip the term's type slots.
+    read_through: Option<Rc<Type>>,
     /// The term's normal form, what equality and hashing compare. Private, so a projection is
     /// built through [`WitnessProjection::new`].
     normal: NormalFormCache,
@@ -4830,8 +4862,23 @@ impl WitnessProjection {
         WitnessProjection {
             term,
             position,
+            read_through: None,
             normal: NormalFormCache::default(),
         }
+    }
+
+    /// `σᵢ(term)` for an elimination that reads `term` through a settled sum, `sum()` spelled in
+    /// the term's scope. The projection reads its binder's kind off the term's type, and a term
+    /// whose type slot shows no sum yet keeps `sum()` to read instead: a loop source read through
+    /// an associated type (`Iterable::elements`) has a variable there while its obligation
+    /// settles. The term itself is left as it is, for every reader that meets it once its type
+    /// resolves.
+    pub fn through(term: &Rc<TypedExpr>, sum: impl FnOnce() -> Type, position: usize) -> Self {
+        let mut projection = WitnessProjection::new(Rc::clone(term), position);
+        if term.ty.peel_refinements().sum().is_none() {
+            projection.read_through = Some(Rc::new(sum()));
+        }
+        projection
     }
 
     /// The term's normal form ([`crate::ccl::ccl_utils::normal_form`]).
@@ -4846,9 +4893,14 @@ impl WitnessProjection {
         normal
     }
 
-    /// The witness this projects, as the term's own type binds it.
+    /// The witness this projects, as the term's own type binds it, or as the sum the projection
+    /// was read through does while the term's type shows none.
     pub fn witness(&self) -> Option<&Witness> {
-        self.term.ty.peel_refinements().sum()?.get(self.position)
+        let sum = match self.term.ty.peel_refinements().sum() {
+            Some(sum) => sum,
+            None => self.read_through.as_deref()?.peel_refinements().sum()?,
+        };
+        sum.get(self.position)
     }
 }
 

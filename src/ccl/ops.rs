@@ -403,6 +403,14 @@ pub enum Builtin {
     Map,
     /// `map_domain : (A → B) → (A → A)` — domain-to-domain identity stream.
     MapDomain,
+    /// `entries : (𝐷 ⤇ 𝑉) ⇒ (𝐷 ⤇ (𝐷, 𝑉))` — each value beside its key, over the same keys, and
+    /// the same witness for a sum: `Σ (σ : 𝐾). σ ⤇ 𝑉` gives `Σ (σ : 𝐾). σ ⤇ (σ, 𝑉)`. What a
+    /// `Map` and a `FullMap` iterate (`src/ccl/design/collections.md`, "Keys and entries").
+    ///
+    /// **Born at coalescing**, by the `Iterable` instance of `std`'s collections
+    /// ([`crate::ccl::infer::solver::traits::InstanceBody`]), and so carries no scheme: it stamps
+    /// its own type, which the post-inference check holds to the rule above.
+    Entries,
     /// `compose : ((A → B), (B → C)) → (A → C)` — composition as a morphism.
     Compose,
     /// `converse : (A → K) → (K → (A → A))` — group-by-key combinator.
@@ -887,6 +895,7 @@ impl Builtin {
             Self::Apply => "apply",
             Self::Map => "map",
             Self::MapDomain => "map_domain",
+            Self::Entries => "entries",
             Self::Compose => "compose",
             Self::Converse => "converse",
             Self::Uncurry(_) => "uncurry",
@@ -1004,6 +1013,7 @@ impl Builtin {
                 self,
                 Self::Converse
                     | Self::MapDomain
+                    | Self::Entries
                     | Self::Uncurry(_)
                     | Self::PermuteDomain
                     | Self::FlattenDomain

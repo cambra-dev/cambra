@@ -1379,7 +1379,7 @@ fn test_boxed_conditional_collection(#[case] code: &str, #[case] expected: Value
 #[case::a_group(
     indoc! {r"
         g = groupby([1, 2, 3], \x -> x > 1)
-        sum([sum([x for x in box(g1)]) for g1 in g])
+        sum([sum([x for x in box(g1)]) for _ -> g1 in g])
     "},
     6
 )]
@@ -1387,7 +1387,7 @@ fn test_boxed_conditional_collection(#[case] code: &str, #[case] expected: Value
     indoc! {r"
         g = groupby([1, 2, 3], \x -> x > 1)
         c = 1 > 0
-        sum([sum([x for x in (box(g1) if c else box([7]))]) for g1 in g])
+        sum([sum([x for x in (box(g1) if c else box([7]))]) for _ -> g1 in g])
     "},
     6
 )]
@@ -1395,14 +1395,14 @@ fn test_boxed_conditional_collection(#[case] code: &str, #[case] expected: Value
     indoc! {r"
         g = groupby([1, 2, 3], \x -> x > 1)
         c = 1 > 2
-        sum([sum([x for x in (box(g1) if c else box([7]))]) for g1 in g])
+        sum([sum([x for x in (box(g1) if c else box([7]))]) for _ -> g1 in g])
     "},
     14
 )]
 #[case::chosen_per_group(
     indoc! {r"
         g = groupby([1, 2, 3], \x -> x > 1)
-        sum([sum([x for x in (box(g1) if sum(g1) > 3 else box([7]))]) for g1 in g])
+        sum([sum([x for x in (box(g1) if sum(g1) > 3 else box([7]))]) for _ -> g1 in g])
     "},
     12
 )]
@@ -1417,7 +1417,7 @@ fn test_boxed_conditional_collection(#[case] code: &str, #[case] expected: Value
     indoc! {r"
         g = groupby([1, 2, 3], \x -> x > 1)
         c = 1 > 0
-        sum([sum([sum([x for x in (box(g1) if c else box(g2))]) for g2 in g]) for g1 in g])
+        sum([sum([sum([x for x in (box(g1) if c else box(g2))]) for _ -> g2 in g]) for _ -> g1 in g])
     "},
     12
 )]

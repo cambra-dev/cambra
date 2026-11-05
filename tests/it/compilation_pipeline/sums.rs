@@ -222,7 +222,7 @@ fn a_filter_over_a_box_that_already_carries_one() {
 #[case(
     indoc! {r#"
         m = map([("a", box([1])), ("b", box([2, 3]))])
-        sum([max(r) for r in m])
+        sum([max(r) for _ -> r in m])
     "#},
     Value::Int(4)
 )]
@@ -417,10 +417,10 @@ fn jagged_rows_merged_by_two_appends() {
 fn jagged_rows_merged_by_a_keyed_write() {
     check_scalar(
         indoc! {r#"
-            m: Mut(Map(String, List(Int)), Txn) := box(map([("a", box([1]))]))
+            m: Mut(Map(String, List(Int)), Txn) := map([("a", box([1]))])
             with begin():
                 m["b"] := box([2, 3])
-            sum([max(r) for r in await_final(m)])
+            sum([max(r) for _ -> r in await_final(m)])
         "#},
         Value::Int(4),
     );
@@ -669,6 +669,36 @@ fn a_conditional_between_collections_whose_domains_their_values_hold(
                 total += x * i
     total
 "}, Value::Int(36))]
+#[case::groups_in_a_comprehension(indoc! {r"
+    type Gs(K, V: K => Type):
+        a((k: K) |=> V(k))
+        b((k: K) |=> V(k))
+    def groups(g):
+        match g:
+            case Gs::a(m):
+                m
+            case Gs::b(m):
+                m
+    gs = Gs::a([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])
+    sum([sum(g) for g in groups(gs)])
+"}, Value::Int(6))]
+#[case::groups_under_nested_loops(indoc! {r"
+    type Gs(K, V: K => Type):
+        a((k: K) |=> V(k))
+        b((k: K) |=> V(k))
+    def groups(g):
+        match g:
+            case Gs::a(m):
+                m
+            case Gs::b(m):
+                m
+    gs = Gs::b([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])
+    t := 0
+    for g1 in groups(gs):
+        for g2 in groups(gs):
+            t := t + sum(g2)
+    t
+"}, Value::Int(12))]
 fn a_match_selecting_a_collection(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -775,11 +805,6 @@ fn a_loop_over_a_comprehension_over_a_sum(#[case] code: &str, #[case] expected: 
     ys: Collection(Int) = box([x for x in xs if x > 1])
     sum(ys)
 "}, Value::Int(5))]
-#[case::a_boxed_comprehension_over_a_map_is_a_map(indoc! {r#"
-    held = box(map([("btc", 2), ("eth", 1)]))
-    qty: Mut(Map(String, Int), Txn) := box([q * 10000 for q in held])
-    sum(await_final(qty))
-"#}, Value::Int(30000))]
 fn a_comprehension_over_a_box_is_keyed_like_it(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
@@ -793,17 +818,17 @@ fn a_comprehension_over_a_box_is_keyed_like_it(#[case] code: &str, #[case] expec
 #[timeout(Duration::from_secs(10))]
 #[case::grouped(indoc! {r"
     b = box([1, 2, 3])
-    sum([sum(g) for g in groupby([x for x in b], \x -> x > 1)])
+    sum([sum(g) for _ -> g in groupby([x for x in b], \x -> x > 1)])
 "}, Value::Int(6))]
 #[case::mapped(indoc! {r"
     b = box([1, 2, 3])
-    sum(map([(x, x * 10) for x in b]))
+    sum([v for _ -> v in map([(x, x * 10) for x in b])])
 "}, Value::Int(60))]
 #[case::returned_from_a_function(indoc! {r"
     def f(b):
         c = [(x, 1) for x in b]
         map(c)
-    sum(f(box([1, 2])))
+    sum([v for _ -> v in f(box([1, 2]))])
 "}, Value::Int(2))]
 fn a_re_keying_constructor_takes_a_comprehension_over_a_box(
     #[case] code: &str,

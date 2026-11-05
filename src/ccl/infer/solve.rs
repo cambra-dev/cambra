@@ -2114,6 +2114,12 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         *expr = collection;
         return coalesce_node_inner(expr, level, ctx);
     }
+    if !ctx.discarding && apply_collection_primitive(expr, ctx) {
+        return coalesce_node_inner(expr, level, ctx);
+    }
+    if !ctx.discarding {
+        unwrap_std_collection_lookup(expr);
+    }
     if !ctx.discarding {
         dispatch_operator(expr, ctx);
     }
@@ -2930,6 +2936,88 @@ pub(crate) fn elements_of_a_collection(expr: &mut Expr) -> Option<Expr> {
         unreachable!("matched an application above")
     };
     Some(*argument)
+}
+
+/// Rewrite `c ▷ Iterable::elements`, where the `@Builtin` instance of one of `std`'s collections
+/// answers it, to that instance's primitive applied to `c`: `let __op = c in …`. The primitive
+/// reads `c` with a `match`, which `lambda_elim` then meets over a bound value, as it meets one a
+/// program writes, rather than over a function's parameter. Whether the rewrite happened.
+fn apply_collection_primitive(expr: &mut Expr, ctx: &CoalesceCtx) -> bool {
+    let TypedExprNode::Apply { function, .. } = &expr.node else {
+        return false;
+    };
+    let TypedExprNode::TraitFn { function: name, .. } = &function.node else {
+        return false;
+    };
+    let Ok(Some(instance)) = matching_instance(function, ctx) else {
+        return false;
+    };
+    let Some(Implementation::Primitive(body @ InstanceBody::Elements(_))) =
+        instance.implementation(name)
+    else {
+        return false;
+    };
+    let Ok(ty) = resolve_var_type(&function.ty) else {
+        return false;
+    };
+    let body = *body;
+    let id = expr.node_id();
+    let TypedExprNode::Apply { argument, function } = std::mem::take(expr).node else {
+        unreachable!("matched an application above")
+    };
+    let built = {
+        let _f = crate::ccl::provenance::enter(
+            function.node_id(),
+            "infer.dispatch_trait_fn",
+            crate::ccl::provenance::Nature::Machinery,
+        );
+        body.build_applied(*argument, &ty)
+    };
+    *expr = Expr::preserve(id, built.node).with_ty(built.ty);
+    true
+}
+
+/// In `(c, k) ▷ lookup?` over one of `std`'s collections, take `c`'s representation out of it
+/// with a `match`, at which emission typed the lookup (`keyed_access_types` in `emit.rs`): the
+/// operator reads a collection, and the nominal value holds one.
+fn unwrap_std_collection_lookup(expr: &mut Expr) {
+    let TypedExprNode::Apply { argument, function } = &mut expr.node else {
+        return;
+    };
+    if !matches!(
+        function.node,
+        TypedExprNode::Builtin(crate::ccl::Builtin::LookupChecked)
+    ) {
+        return;
+    }
+    let TypedExprNode::Tuple(pair) = &mut argument.node else {
+        return;
+    };
+    let Ok(collection_ty) = resolve_var_type(&pair[0].ty) else {
+        return;
+    };
+    if !matches!(collection_ty.peel_refinements(), Type::Nominal(decl, _)
+        if crate::ccl::nominal::StdCollection::of(decl).is_some())
+    {
+        return;
+    }
+    let collection = std::mem::take(&mut pair[0]);
+    let id = collection.node_id();
+    let (unwrapped, _) = {
+        let _f = crate::ccl::provenance::enter(
+            id,
+            "infer.std_collection_lookup",
+            crate::ccl::provenance::Nature::Machinery,
+        );
+        crate::ccl::infer::solver::traits::std_collection_representation(collection, &collection_ty)
+            .expect("a collection of `std` has a representation")
+    };
+    pair[0] = unwrapped;
+    let pair_ty = Type::Tuple(pair.iter().map(|e| e.ty.clone()).collect());
+    argument.ty = pair_ty.clone();
+    if let Type::Fun { domain, .. } = &mut function.ty {
+        **domain = pair_ty;
+    }
 }
 
 /// Replace a `TraitFn` a compiler instance answers with the function the instance builds at

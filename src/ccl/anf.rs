@@ -944,7 +944,7 @@ fn temp_read(name: &Name, definition: &Expr) -> Expr {
 /// siblings on one spine and every type names its binders where they are in scope.
 ///
 /// One exception is known: a nested `for` over a group's rows,
-/// `[r for g in groupby(xs, \s -> s) for r in g]`, still leaves a type naming a temp outside its
+/// `[r for _ -> g in groupby(xs, \s -> s) for r in g]`, still leaves a type naming a temp outside its
 /// scope. It is tracked in the vault as `type-checker-nested-for-over-a-groups-rows-out-of-scope`.
 ///
 /// Only this pass's own binders are peeled ([`Name::is_anf_temp`]). A `let` the

@@ -1638,7 +1638,7 @@ mod tests {
     "#};
     const GROUPBY: &str = indoc! {r#"
         sales = [(region="west", amount=100), (region="east", amount=50)]
-        [sum([s.amount for s in g]) for g in groupby(sales, \r -> r.region)]
+        [sum([s.amount for s in g]) for _ -> g in groupby(sales, \r -> r.region)]
     "#};
     const ACCUM: &str = indoc! {"
         acc := 0
@@ -2533,7 +2533,7 @@ mod tests {
         let program = |k: i64| {
             lower(&format!(
                 indoc! {"
-                    m: Mut(Map(Int, Int), Txn) := box(map([(0, 1)]))
+                    m: Mut(Map(Int, Int), Txn) := map([(0, 1)])
                     for r in [1, 2]:
                         with begin():
                             m[r + {}] := 10 * r

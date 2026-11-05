@@ -309,7 +309,7 @@ fn skeletons() -> Vec<Skeleton> {
         Skeleton { name: "tuple_extreme_per_group", hole: Ty::Int, scope: &[("v", Ty::Int)], body: indoc! {r#"
             g = groupby([1, 2, 3, 4], \x -> x // 2)
             out = test_sink()
-            out << sum([min([(v + {}, "a") for v in grp]).0 for grp in g])
+            out << sum([min([(v + {}, "a") for v in grp]).0 for _ -> grp in g])
         "#}},
         Skeleton { name: "nominal_operator_operand", hole: Ty::Int, scope: &[], body: indoc! {r#"
             type Money = Int
@@ -353,7 +353,7 @@ fn skeletons() -> Vec<Skeleton> {
 
             g = groupby([1, 2, 3, 4], \x -> Money::new(x + {}))
             out = test_sink()
-            out << sum([max(grp) for grp in g])
+            out << sum([max(grp) for _ -> grp in g])
         "#}},
         Skeleton { name: "nominal_key_join", hole: Ty::Int, scope: &[("x", Ty::Int)], body: indoc! {r#"
             type Money = Int
@@ -459,7 +459,7 @@ fn skeletons() -> Vec<Skeleton> {
         "#}},
         Skeleton { name: "lambda_body", hole: Ty::Int, scope: &[("e", Ty::Int)], body: indoc! {r#"
             out = test_sink()
-            out << sum([sum([s for s in g]) for g in groupby([1, 1, 2], \e -> {})])
+            out << sum([sum([s for s in g]) for _ -> g in groupby([1, 1, 2], \e -> {})])
         "#}},
         Skeleton { name: "aggregate_arg", hole: Ty::IntColl, scope: &[], body: indoc! {r#"
             out = test_sink()
@@ -532,7 +532,7 @@ fn skeletons() -> Vec<Skeleton> {
             out << acc
         "#}},
         Skeleton { name: "keyed_write_value", hole: Ty::Int, scope: &[("k", Ty::Str)], body: indoc! {r#"
-            m: Mut(Map(String, Int)) := box(map([("a", 1)]))
+            m: Mut(Map(String, Int)) := map([("a", 1)])
             for k in ["b"]:
                 m[k] := {}
             out = test_sink()
@@ -598,7 +598,7 @@ fn skeletons() -> Vec<Skeleton> {
         "#}},
         Skeleton { name: "groupby_source", hole: Ty::RecColl, scope: &[], body: indoc! {r#"
             out = test_sink()
-            out << sum([sum([r.a for r in g]) for g in groupby({}, \e -> e.b)])
+            out << sum([sum([r.a for r in g]) for _ -> g in groupby({}, \e -> e.b)])
         "#}},
         Skeleton { name: "record_feed", hole: Ty::Rec, scope: &[], body: indoc! {r#"
             out = test_sink()
@@ -750,7 +750,7 @@ fn skeletons() -> Vec<Skeleton> {
         Skeleton { name: "lambda_body_in_loop", hole: Ty::Int, scope: &[("i", Ty::Int), ("e", Ty::Int)], body: indoc! {r#"
             out = test_sink()
             for i in [1, 2]:
-                out << sum([sum([s for s in g]) for g in groupby([1, 1, 2], \e -> {})])
+                out << sum([sum([s for s in g]) for _ -> g in groupby([1, 1, 2], \e -> {})])
         "#}},
 
         // Terminal reads. Every other transactional skeleton reads the store in context, inside
@@ -1115,7 +1115,7 @@ fn skeletons() -> Vec<Skeleton> {
         // A product key: a tuple names each group (`Equatable` on a product).
         Skeleton { name: "groupby_tuple_key", hole: Ty::RecColl, scope: &[], body: indoc! {r#"
             out = test_sink()
-            out << sum([sum([r.a for r in g]) for g in groupby({}, \e -> (e.a, e.b))])
+            out << sum([sum([r.a for r in g]) for _ -> g in groupby({}, \e -> (e.a, e.b))])
         "#}},
     ]
 }
@@ -1134,7 +1134,7 @@ fn fillers() -> Vec<Filler> {
         Filler { name: "filtered_sum", ty: Ty::Int, needs: &[], decls: "", expr: "sum([z for z in [1, 2, 3, 4] if z > 2])" },
         Filler { name: "union_sum", ty: Ty::Int, needs: &[], decls: "", expr: "sum([1, 2] ++ [3, 4])" },
         Filler { name: "nested_comp_sum", ty: Ty::Int, needs: &[], decls: "", expr: "sum([sum([z for z in [1, 2]]) for w in [1, 2]])" },
-        Filler { name: "groupby_sum", ty: Ty::Int, needs: &[], decls: "", expr: "sum([sum([s for s in g]) for g in groupby([1, 1, 2], \\e2 -> e2)])" },
+        Filler { name: "groupby_sum", ty: Ty::Int, needs: &[], decls: "", expr: "sum([sum([s for s in g]) for _ -> g in groupby([1, 1, 2], \\e2 -> e2)])" },
         Filler { name: "tuple_proj", ty: Ty::Int, needs: &[], decls: "", expr: "(3, 4).0" },
         Filler { name: "record_proj", ty: Ty::Int, needs: &[], decls: "", expr: "(p=3, q=4).p" },
         Filler { name: "ternary", ty: Ty::Int, needs: &[], decls: "", expr: "(1 if 2 > 1 else 0)" },

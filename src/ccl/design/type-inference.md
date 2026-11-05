@@ -3649,6 +3649,14 @@ refinement: a group-by under a loop whose key reads the loop's binder has keys
 `{𝐾 | 𝑘 ∈ 𝑀(𝑎)}`. A pair whose second component reads nothing of the first is the `Tuple` it
 always was.
 
+A `let` binding a collection and a one-arm `match` reach the same rule. Both are rewritten to an
+application whose function is a lambda over the bound name: `λ 𝑎 → let 𝑣 = 𝑑 in 𝑏` becomes
+`𝑑 ▷ (λ 𝑣 → 𝑏)`, and `λ 𝑎 → match 𝑠 { 𝑐(𝑤) → 𝑒 }` whose arm reads `𝑎` becomes
+`(𝑠 ▷ variant_project(𝑐)) ▷ (λ 𝑤 → 𝑒)`. The application rule then pairs the bound value with
+`𝑎`. The second case is how one of `std`'s collections built under a loop reaches the rule: its
+`Iterable` instance takes the representation out of its constructor with a `match`, and the
+representation's keys read the loop's binder.
+
 A program cannot write a dependent tuple. Inference introduces one through `uncurry(𝑛)`, which
 flattens a comprehension over several generators ([ir.md, "Several
 generators"](ir.md#several-generators)). Its scheme keys the flattened collection by

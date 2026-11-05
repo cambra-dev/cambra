@@ -4018,17 +4018,7 @@ fn collect_variant_arms(
 /// [`lower_type_application`] its head. `builtin_type_names_are_refused` iterates
 /// this slice, so the test cannot drift from it; nothing catches a constructor
 /// added to [`lower_type_application`] and omitted here.
-pub const RESERVED_TYPE_NAMES: &[&str] = &[
-    "Array",
-    "Collection",
-    "Feed",
-    "FullMap",
-    "List",
-    "Map",
-    "Mut",
-    "Set",
-    "Txn",
-];
+pub const RESERVED_TYPE_NAMES: &[&str] = &["Array", "Collection", "Feed", "List", "Mut", "Txn"];
 
 /// Whether `name` is a capitalized name the type language already spells, and so
 /// is refused as a type-alias target.
@@ -4441,7 +4431,16 @@ fn nominal_application(
             continue;
         }
         let domains = decl.family_domains_at(i, &plain);
-        let family = family_argument(p, &domains, a, ctx)?;
+        // A `FullMap`'s family is over its keys, which is what the program wrote them as; a
+        // declared type's is its parameter's.
+        let of = if crate::ccl::nominal::StdCollection::of(&decl)
+            == Some(crate::ccl::nominal::StdCollection::FullMap)
+        {
+            "the map's key".to_string()
+        } else {
+            format!("`{}`'s family", p.spelling)
+        };
+        let family = family_argument(&of, &domains, a, ctx)?;
         // An index type that is a parameter written `_` takes the domain the family writes, so
         // the parameter's argument and the family's domain stay one type.
         let Type::Family { binders, .. } = &family else {
@@ -4637,8 +4636,8 @@ fn holes_as_params(ty: &Type) -> Type {
     out
 }
 
-/// The family `param`, a family parameter over `domains`, takes as the argument `arg`
-/// (`docs/chl-spec.md`, "Family parameters"):
+/// The family a family parameter over `domains`, named in messages as `of`, takes as the
+/// argument `arg` (`docs/chl-spec.md`, "Family parameters"):
 ///
 /// - `\k: K -> T`, the family written as a lambda over `domains` ([`family_binders`]);
 /// - a family parameter of the declaration around it, `V`, passed as the family it applies,
@@ -4647,28 +4646,20 @@ fn holes_as_params(ty: &Type) -> Type {
 /// - any other type `T`, the family constant at it, whose binders are unnamed: `T` reads none,
 ///   and its holes are inferred outside them.
 fn family_argument(
-    param: &Rc<crate::ccl::ty::TypeParam>,
+    of: &str,
     domains: &[Type],
     arg: &Spanned<ChlExpr>,
     ctx: &mut LoweringContext,
 ) -> Result<Type, LoweringError> {
     if let ChlExpr::Lambda { params, body } = &arg.node {
-        let scope = family_binders(
-            &format!("`{}`'s family", param.spelling),
-            params,
-            domains,
-            arg.span,
-            ctx,
-        )?;
+        let scope = family_binders(of, params, domains, arg.span, ctx)?;
         let scope: Vec<_> = scope.iter().map(|(n, t)| (n, t.clone())).collect();
         let lowered = under_type_binders(&scope, body, ctx)?;
         return Ok(closed_family(&scope, lowered));
     }
     // A family parameter in scope, passed on.
-    if let Some(PassedOnFamily { binders, app }) =
-        passed_on_family(arg, domains, &format!("`{}`'s family", param.spelling), ctx)?
-    {
-        return Ok(Type::family(binders, app));
+    if let Some(family) = passed_on_family(arg, domains, of, ctx)? {
+        return Ok(family);
     }
     let body = lower_type_expr(arg, ctx)?;
     // `_` infers the whole family, so its hole stands under the binders.
@@ -4754,22 +4745,16 @@ fn family_binders(
     Ok(scope)
 }
 
-/// A family parameter passed on ([`passed_on_family`]): fresh binders, and the parameter applied
-/// to them.
-struct PassedOnFamily {
-    binders: Vec<(Name, Type)>,
-    app: Type,
-}
-
-/// `arg` read as a family parameter in scope passed on, at `domains`, the types `of` ranges over.
-/// `None` where `arg` names no family parameter. Its arity and its declared index types agree with `domains`, up to
+/// `arg` read as a family parameter in scope passed on, `\k -> V(k)`, at `domains`, the types `of`
+/// ranges over: fresh binders, and the parameter applied to them. `None` where `arg` names no
+/// family parameter. Its arity and its declared index types agree with `domains`, up to
 /// refinements ([`family_domains_agree`]).
-fn passed_on_family(
+pub(super) fn passed_on_family(
     arg: &Spanned<ChlExpr>,
     domains: &[Type],
     of: &str,
     ctx: &mut LoweringContext,
-) -> Result<Option<PassedOnFamily>, LoweringError> {
+) -> Result<Option<Type>, LoweringError> {
     let ChlExpr::Name(n) = &arg.node else {
         return Ok(None);
     };
@@ -4814,10 +4799,10 @@ fn passed_on_family(
             ))
         })
         .collect();
-    Ok(Some(PassedOnFamily {
+    Ok(Some(Type::family(
         binders,
-        app: Type::FamilyApp(crate::ccl::ty::FamilyApp::new(param, terms)),
-    }))
+        Type::FamilyApp(crate::ccl::ty::FamilyApp::new(param, terms)),
+    )))
 }
 
 /// Whether a family's declared index type and the type it is read at agree: equal up to
@@ -5002,70 +4987,6 @@ fn lower_type_application(
                 return Err(arity_err("one element type"));
             };
             Ok(Type::list_of(lower_type_expr(elem, ctx)?))
-        }
-        // `Map(K, V)` = `Σ (𝐷 : SubtypesOf(K)). 𝐷 ⤇ V` — a sum over the kind of every key
-        // domain on `K` (`Type::map_of`, `src/ccl/design/collections.md`, "The six
-        // collection types").
-        "Map" => {
-            let [k, v] = args else {
-                return Err(arity_err("a key and a value type"));
-            };
-            Ok(Type::map_of(
-                lower_type_expr(k, ctx)?,
-                lower_type_expr(v, ctx)?,
-            ))
-        }
-        // `FullMap(K, V)` = `(𝑘: K) ⤇ V` — a *total* map, and not a sum: its key set is
-        // readable from `K` instead of hidden behind a witness (`Type::full_map_of`,
-        // `src/ccl/design/collections.md`, "The six collection types"). Reaching a
-        // `Map(K, V)` from here is `box`, which is where that readability is given up.
-        "FullMap" => {
-            let [k, v] = args else {
-                return Err(arity_err("a key and a value type"));
-            };
-            let key = lower_type_expr(k, ctx)?;
-            // The value type is a family over the key: written as a lambda, `\k: K -> V`,
-            // its binder is the map's (`docs/chl-spec.md`, "Family parameters").
-            if let ChlExpr::Lambda { params, body } = &v.node {
-                let scope = family_binders(
-                    "the map's key",
-                    params,
-                    std::slice::from_ref(&key),
-                    v.span,
-                    ctx,
-                )?;
-                let [(name, key)] = scope.as_slice() else {
-                    unreachable!("one binder per key")
-                };
-                let value = under_type_binders(&[(name, key.clone())], body, ctx)?;
-                return Ok(Type::Fun {
-                    name: Some(Name::fresh(name.node.clone())),
-                    fun_kind: crate::ccl::FunKind::Data(None),
-                    domain: Box::new(key.clone()),
-                    codomain: Box::new(value),
-                });
-            }
-            // A family parameter passed on is the family it applies, read at the key.
-            if let Some(PassedOnFamily { mut binders, app }) =
-                passed_on_family(v, std::slice::from_ref(&key), "the map's key", ctx)?
-            {
-                let (k, key) = binders.pop().expect("one binder per key");
-                return Ok(Type::pi_kinded(
-                    k,
-                    key,
-                    app,
-                    crate::ccl::FunKind::Data(None),
-                ));
-            }
-            Ok(Type::full_map_of(key, lower_type_expr(v, ctx)?))
-        }
-        // `Set(K)` = `Map(K, unit)` — a map whose codomain is `unit`, so the
-        // key domain is the payload (`Type::set_of`).
-        "Set" => {
-            let [k] = args else {
-                return Err(arity_err("one key type"));
-            };
-            Ok(Type::set_of(lower_type_expr(k, ctx)?))
         }
         // `Collection(T)` = `Σ (𝐷: Any). 𝐷 ⤇ T` — the whole-domain-witness sum (a
         // `TypeKind::Type` type-witness): an unordered, opaque-extent collection, the ⊤

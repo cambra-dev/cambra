@@ -2462,37 +2462,38 @@ fn a_writing_branch_value_merges_as_a_variable(#[case] code: &str, #[case] expec
     bump(acc, 0)
     acc
 "}, Value::Int(108))]
-// A written map is a sum, so this `if` keeps taking the statements after it into each branch.
+// A written map is a nominal value holding a sum, so this `if` keeps taking the statements after it
+// into each branch.
 #[case::writing_a_map(indoc! {"
-    m: Mut(Map(Int, Int)) := box(map([(1, 10)]))
+    m: Mut(Map(Int, Int)) := map([(1, 10)])
     i = 3
     if i > 1:
-        m := box(map([(2, 20), (3, 30)]))
+        m := map([(2, 20), (3, 30)])
     else:
-        m := box(map([(4, 40)]))
-    sum(m)
+        m := map([(4, 40)])
+    sum([v for _ -> v in m])
 "}, Value::Int(50))]
 #[case::writing_a_map_beside_an_int(indoc! {"
-    m: Mut(Map(Int, Int)) := box(map([(1, 10)]))
+    m: Mut(Map(Int, Int)) := map([(1, 10)])
     n := 0
     i = 3
     if i > 1:
-        m := box(map([(2, 20), (3, 30)]))
+        m := map([(2, 20), (3, 30)])
         n := 1
     else:
-        m := box(map([(4, 40)]))
+        m := map([(4, 40)])
         n := 2
-    sum(m) + n
+    sum([v for _ -> v in m]) + n
 "}, Value::Int(51))]
 #[case::a_map_as_its_value(indoc! {"
-    m: Mut(Map(Int, Int)) := box(map([(1, 10)]))
+    m: Mut(Map(Int, Int)) := map([(1, 10)])
     i = 3
     t = if i > 1:
-            m := box(map([(2, 20), (3, 30)]))
+            m := map([(2, 20), (3, 30)])
             m
         else:
             m
-    sum(t)
+    sum([v for _ -> v in t])
 "}, Value::Int(50))]
 fn a_top_level_writing_if_merges_into_one_value(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
@@ -2543,8 +2544,8 @@ fn test_match_arm_write_carries(#[case] code: &str, #[case] expected: Value) {
 fn a_plain_collection_initializing_a_sum_is_told_to_box() {
     check_compile_error(
         indoc! {r#"
-            held = box(map([("btc", 2), ("eth", 1)]))
-            qty: Mut(Map(String, Int), Txn) := [q * 10000 for q in held]
+            held = box([2, 1])
+            qty: Mut(Collection(Int), Txn) := [q * 10000 for q in held]
             await_final(qty)
         "#},
         "a plain collection reached a sum",
@@ -3019,17 +3020,17 @@ cnt
 // does, for a `groupby` loop with no `:=` loop inside or around it. Each case names the
 // comprehension over the same collection, which compiles.
 
-/// A `mut` loop over a **map**, whose keys are its positions. The store records the
+/// A `mut` loop over a **map**, binding each entry's key and value. The store records the
 /// positions it was driven at — `"a"` then `"b"` — and folds the accumulator over them,
 /// so a domain that cannot be enumerated from its type is a loop like any other.
-/// `sum([v for v in m])` over the same map answers 3 as well.
+/// `sum([v for _ -> v in m])` over the same map answers 3 as well.
 #[test]
 fn a_mut_loop_over_a_map_carries_its_accumulator() {
     check_scalar(
         indoc! {r#"
             m = map([("a", 1), ("b", 2)])
             total := 0
-            for v in m:
+            for _ -> v in m:
                 total += v
             total
         "#},
@@ -3075,7 +3076,7 @@ fn a_mut_loop_over_nested_collections_runs_once_per_row(#[case] code: &str, #[ca
 
 /// A `mut` loop over a **`groupby`**, whose positions are the group keys. Each group's
 /// domain reads its key, which the loop binds as its position.
-/// `sum([sum([s.amount for s in g]) for g in groupby(sales, \r -> r.region)])` answers 150
+/// `sum([sum([s.amount for s in g]) for _ -> g in groupby(sales, \r -> r.region)])` answers 150
 /// as well.
 #[test]
 fn a_mut_loop_over_a_groupby_carries_its_accumulator() {
@@ -3083,7 +3084,7 @@ fn a_mut_loop_over_a_groupby_carries_its_accumulator() {
         indoc! {r#"
             sales = [(region="west", amount=100), (region="east", amount=50)]
             total := 0
-            for g in groupby(sales, \r -> r.region):
+            for _ -> g in groupby(sales, \r -> r.region):
                 total += sum([s.amount for s in g])
             total
         "#},
@@ -3097,7 +3098,7 @@ fn a_mut_loop_inside_a_groupby_loop() {
     check_scalar(
         indoc! {r#"
             n := 0
-            for g in groupby([1, 2, 3, 4, 5], \e -> e // 2):
+            for _ -> g in groupby([1, 2, 3, 4, 5], \e -> e // 2):
                 for i in [1, 2]:
                     n += i
             n
@@ -3114,7 +3115,7 @@ fn a_groupby_loop_inside_a_mut_loop() {
         indoc! {r#"
             n := 0
             for i in [1, 2]:
-                for g in groupby([1, 2, 3, 4, 5], \e -> e // 2):
+                for _ -> g in groupby([1, 2, 3, 4, 5], \e -> e // 2):
                     n += sum(g)
             n
         "#},

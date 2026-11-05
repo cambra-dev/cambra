@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
-use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates, walk_refined_predicates_mut};
+use crate::ccl::ccl_utils::{PredMemo, walk_quoted_terms_mut};
 use crate::ccl::infer::solver::compact::JoinedPosition;
 use crate::ccl::infer::solver::display::InferredPoly;
 use crate::ccl::infer::solver::traits::InstanceTable;
@@ -2021,14 +2021,15 @@ fn clear_annotations_in(expr: &mut Expr, predicates: &PredMemo<()>) -> bool {
     let mut cleared = expr.user_annotation.take().is_some();
     expr.walk_binders_mut(|b| cleared |= b.user_annotation.take().is_some());
     // Annotations also ride expressions hanging off *type* slots — a refinement's
-    // predicate — and those nodes are outside `walk_children` entirely. Inference
-    // reads them there (`groupby` stamps the key relation that ties `__gb_k` to its
-    // key function on a node inside the cast target's predicate), so clearing has
-    // to follow the same route, or an annotation survives exactly where only a type
-    // walk can find it.
+    // predicate, a witness projection's sum, a family's argument — and those nodes are
+    // outside `walk_children` entirely. Inference reads them there (`groupby` stamps the
+    // key relation that ties `__gb_k` to its key function on a node inside the cast
+    // target's predicate), and a definition discharged into a projection's sum carries
+    // its own, so clearing has to follow the same route, or an annotation survives
+    // exactly where only a type walk can find it.
     expr.walk_type_slots_mut(|ty| {
-        cleared |= walk_refined_predicates_mut(ty, predicates, &(), &mut |predicate, memo| {
-            clear_annotations_in(predicate, memo)
+        cleared |= walk_quoted_terms_mut(ty, predicates, &(), &mut |term, memo| {
+            clear_annotations_in(term, memo)
         });
     });
     expr.walk_children_mut(|child| cleared |= clear_annotations_in(child, predicates));
@@ -2065,14 +2066,17 @@ fn assert_annotations_cleared(expr: &Expr, visited: &mut HashSet<crate::ccl::Pre
             b.name
         );
     });
-    // An expression also hangs off the *type* slots — a refinement's predicate —
-    // and those nodes are outside `walk_children` entirely. Inference reads
-    // annotations there (`groupby` stamps its key relation on a node inside the
-    // cast target's predicate), so a check that walked only children would
-    // declare the tree clean while a live annotation sat in a type.
+    // An expression also hangs off the *type* slots — a refinement's predicate, a
+    // witness projection's sum, a family's argument — and those nodes are outside
+    // `walk_children` entirely. Inference reads annotations there (`groupby` stamps
+    // its key relation on a node inside the cast target's predicate), so a check
+    // that walked only children would declare the tree clean while a live
+    // annotation sat in a type.
     expr.walk_type_slots(|ty| {
-        walk_refined_predicates(ty, visited, &mut |predicate, visited| {
-            assert_annotations_cleared(predicate, visited);
+        ty.walk_quoted_terms(&mut |term| {
+            if visited.insert(Rc::as_ptr(term)) {
+                assert_annotations_cleared(term, visited);
+            }
         });
     });
     expr.walk_children(|child| assert_annotations_cleared(child, visited));

@@ -856,7 +856,12 @@ fn walk(
 /// which passes its input through and restates its domain.
 fn constructs_variant(e: &crate::ccl::Expr) -> bool {
     use crate::ccl::{Builtin, TypedExprNode};
-    let states_its_output = |b: &Builtin| matches!(b, Builtin::VariantWrap(_) | Builtin::MapDomain);
+    let states_its_output = |b: &Builtin| {
+        matches!(
+            b,
+            Builtin::VariantWrap(_) | Builtin::MapDomain | Builtin::Entries
+        )
+    };
     match &e.node {
         TypedExprNode::Builtin(b) => states_its_output(b),
         TypedExprNode::Apply { function, .. } => {

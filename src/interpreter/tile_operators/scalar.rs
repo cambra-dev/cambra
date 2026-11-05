@@ -30,9 +30,13 @@ impl Constant {
     /// arm set it belongs to, and a `Value::Function` binding table knows its own
     /// keys but not the domain they are drawn from. Every caller has the node's type,
     /// which does.
+    ///
+    /// The column is the one the extent's values take ([`ColumnValue::from_values`]), so it
+    /// merges with what any other producer at the extent delivers: a variant's is a union
+    /// column, where [`ColumnValue::single`] would hold the value whole.
     pub fn new(value: Value, extent: Extent) -> Self {
         Self::of(
-            Tile::Scalar(ColumnValue::single(value)),
+            Tile::Scalar(ColumnValue::from_values(vec![value], &extent)),
             Tiling::Scalar(extent),
         )
     }
