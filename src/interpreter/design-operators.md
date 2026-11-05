@@ -1540,12 +1540,13 @@ loop steps per delivery of `source1`, by the dispatcher's record of which pipeli
 the planned design the same follows from the range over `[10, 20]` pushing the universal guard at
 the start and `a` pushing its final guard in epoch 0, with no record of closes.
 
-Every breaker but the induction store states its decided region in `held`: the transaction store its
-positions through its watermark, a memo, a map aggregate and an induction drive their tiles'
-`to_guard`, and an aggregate or an extraction everything once it is final. An induction store states
-nothing until it is terminal (`BreakerState::held`), though it decides its positions one at a time,
-so a reader of one row of a store per row waits for the whole store. Its held region states its
-decided positions, and its decided rows under rows, before the design is implemented.
+A breaker states its decided region in `BreakingProducer::decided`, which is its held region but
+for the induction store: the transaction store its positions through its watermark, a memo, a map
+aggregate and an induction drive their tiles' `to_guard`, and an aggregate or an extraction
+everything once it is final. An induction store holds nothing until it is terminal
+(`BreakerState::held`), since a reader pulls its tile whole, but decides its positions one at a
+time: its decided region is its tile's statement, the positions it has stepped, row by row under
+rows, so a reader of one row of a store per row waits for that row alone.
 
 #### Reading rows again
 

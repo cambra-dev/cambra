@@ -1476,6 +1476,15 @@ pub trait BreakingProducer: TileProducer + Breaker {
     /// removed is taken out of it. Empty when it holds nothing.
     fn held(&self) -> TileGuard;
 
+    /// The region of the output the producer has decided: keys whose value no longer changes
+    /// and keys its statement rules out, which its readers' work waits for
+    /// (`src/interpreter/design-operators.md`, "Completeness in pushes"). The default is
+    /// [`held`](Self::held). A producer that holds less than it has decided, so that what it
+    /// pushes stays whole, states the difference here.
+    fn decided(&self) -> TileGuard {
+        self.held()
+    }
+
     /// The keys under which the producer holds a cell: [`held`](Self::held) less the keys its
     /// readers have released whole ([`keys_released_whole`]), closed over the producer's tiling
     /// (`TileGuard::closed_over`), so a row released through its last position is held no more. A

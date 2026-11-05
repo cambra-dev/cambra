@@ -1034,6 +1034,16 @@ impl BreakingProducer for InductionStoreProducer {
         self.breaker.held(self.tiling())
     }
 
+    /// The positions the last step decided, row by row under rows: the store tile's own
+    /// statement (`Tile::to_guard`), though it holds nothing short of terminal, since a reader
+    /// pulls the tile whole.
+    fn decided(&self) -> TileGuard {
+        match &self.breaker.snapshot {
+            Some(tile) => tile.to_guard(),
+            None => self.tiling().empty_guard(),
+        }
+    }
+
     /// What the store holds. A release of a store with no rows above it names the positions a
     /// reader reads no more and removes nothing from the tile it reads; a nested store's offer
     /// cuts the rows its readers released.

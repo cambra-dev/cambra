@@ -2477,11 +2477,11 @@ impl Pushes<'_> {
             )
         });
         self.to = to;
-        // The decided region is what the breaker holds, released or not: a released key stays
-        // decided. A held region no projection spells is pushed as nothing decided, which
+        // The decided region is the breaker's statement of it, released or not: a released key
+        // stays decided. A region no projection spells is pushed as nothing decided, which
         // delays a reader and never misleads it.
         self.decided = decided_projection(
-            breaker.held().closed_over(breaker.tiling()),
+            breaker.decided().closed_over(breaker.tiling()),
             breaker.tiling(),
         );
         let decided = breaker.final_guard();

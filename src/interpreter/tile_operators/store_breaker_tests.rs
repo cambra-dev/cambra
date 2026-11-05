@@ -128,6 +128,27 @@ fn writer(k: usize) -> usize {
     k + 1
 }
 
+/// An induction store short of terminal holds nothing, since a reader pulls its tile whole, but
+/// states decided the positions it has stepped: its decided region grows a position a step.
+#[test]
+fn an_induction_store_decides_each_position_it_steps() {
+    let compiled = Compiled::of(SUM);
+    let decided = || compiled.breaker(|store| (store.held(), store.decided()));
+    compiled.breaker(|store| store.consume_impl(InputId::ONLY, keys_between(0, 0)));
+    let (held, after_one) = decided();
+    assert!(held.is_empty(), "{held:?}");
+    compiled.breaker(|store| store.consume_impl(InputId::ONLY, keys_between(1, 1)));
+    let (_, after_two) = decided();
+    assert!(
+        !after_one.is_empty() && guard_minus(&after_one, &after_two).is_empty(),
+        "each step grows what is decided: {after_one:?}, then {after_two:?}"
+    );
+    assert!(
+        !guard_minus(&after_two, &after_one).is_empty(),
+        "the second step decides a position the first did not: {after_one:?}, then {after_two:?}"
+    );
+}
+
 /// A consuming store answers a pull from its last step and pulls its body no more.
 #[test]
 fn a_consuming_store_answers_from_its_snapshot() {
