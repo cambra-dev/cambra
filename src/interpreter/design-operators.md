@@ -514,8 +514,9 @@ level. A producer that declares more than the outermost keys reads its projectio
 `TileGuard::projection_for`, and any other with `TileGuard::projection`. Either panics with the
 guard on a shape that is no projection or that names keys at a level the producer does not restate,
 as [Guard operations are exact](#guard-operations-are-exact) requires of a restatement with no
-spelling. `Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
-(`src/interpreter/design-path-projections.md`, "Representation").
+spelling. A debug build's `get` panics on a pull at such a level. `Tile::restrict_to_paths` cuts a
+tile at a level beneath the outermost (`src/interpreter/design-path-projections.md`,
+"Representation").
 
 - **The answer.** `Tile::restrict_to_keys` keeps the outermost keys 𝑝 admits, each with the value
   under it, and intersects the tile's `domain_predicate` with 𝑝. A group is whole under its key. A
@@ -533,8 +534,10 @@ spelling. `Tile::restrict_to_paths` cuts a tile at a level beneath the outermost
   region pulled, and a pull of one projection states completeness over its keys only, so a pull of
   another region withdraws nothing it said of the first. The debug check keeps the last statement of
   each region.
-- **Check.** Every answer lies within the projection it was asked for: it holds no key the
-  projection omits and no cell where the projection names nothing.
+- **Check.** A debug build's `TileProducer::get` compares each answer with the projection it was
+  asked for (`Tile::within`) and panics on a key the projection omits, on any cell where the
+  projection names nothing, and on a pull for keys that a non-collection answers. A producer that
+  answers whole fails the check at its first pull for keys.
 
 Each operator answers a projection as its row of this table states.
 

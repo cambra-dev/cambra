@@ -455,6 +455,76 @@ impl Tile {
         }
     }
 
+    /// Whether this tile holds only what `projection` names, or why it does not.
+    ///
+    /// A producer answers a pull with a tile inside the projection, so a cell outside it is a
+    /// producer that ignored the guard. Rows deleted but not yet compacted are released, so
+    /// they are not part of the answer. The check reads keys and cells and does not read the
+    /// completeness the tile states.
+    pub fn within(&self, projection: &Projection) -> Result<(), String> {
+        match projection {
+            Projection::Everything => Ok(()),
+            Projection::Nothing => {
+                let mut live = self.clone();
+                live.compact();
+                match live.cell_count() {
+                    0 => Ok(()),
+                    _ => Err("it holds cells, and the projection names none".into()),
+                }
+            }
+            Projection::Keys { level, keys } if *level == CurryLevel::OUTERMOST => {
+                let Tile::DataFunction {
+                    domain, deleted, ..
+                } = self
+                else {
+                    return Err("it is not a collection, so it has no keys to project".into());
+                };
+                match (0..domain.len())
+                    .filter(|row| !deleted.contains(*row))
+                    .map(|row| domain.index_at(row))
+                    .find(|key| !keys.contains(key))
+                {
+                    None => Ok(()),
+                    Some(key) => Err(format!("it holds the key {key:?}, which {keys:?} omits")),
+                }
+            }
+            Projection::Keys { level, keys } => {
+                if self.levels_held() <= level.index() {
+                    return Err(format!(
+                        "it has no collection at {level}, so it has no keys to project there"
+                    ));
+                }
+                let mut live = self.clone();
+                live.compact();
+                for depth in 0..=level.index() {
+                    let at = CurryLevel::new(depth);
+                    let admits = match at == *level {
+                        true => keys.clone(),
+                        false => through_at(keys, *level, at),
+                    };
+                    if let Some(path) = live
+                        .paths_at(at)
+                        .into_iter()
+                        .find(|path| !admits.contains_path(path))
+                    {
+                        return Err(format!(
+                            "it holds the path {path:?}, which {admits:?} omits"
+                        ));
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// How many collection levels this tile holds from its root down.
+    fn levels_held(&self) -> usize {
+        match self {
+            Tile::DataFunction { codomain, .. } => 1 + codomain.levels_held(),
+            _ => 0,
+        }
+    }
+
     /// Cut this tile to `projection`.
     ///
     /// `Nothing` empties it at `tiling`, the tiling of the producer that made it.
@@ -748,6 +818,65 @@ mod tests {
         paths.into_iter().zip(values.iter().copied()).collect()
     }
 
+    /// A cut at level 1 keeps the admitted paths and the keys they run through. What a level
+    /// above stated of a key partly cut is stated of its paths kept, at level 1.
+    #[test]
+    fn restricting_at_a_level_keeps_the_paths_admitted() {
+        let paths = under(key(0), positions(1, 2)).union(&under(key(1), Predicate::True));
+        let projection = level_one(paths.clone());
+        let mut tile = three_rows();
+        tile.restrict_to(&projection, &nested_tiling());
+        let path = |k: u64, j: u64| vec![Value::UInt(k), Value::UInt(j)];
+        assert_eq!(
+            cells(&tile),
+            [(path(0, 1), 11), (path(0, 2), 12), (path(1, 0), 20)]
+        );
+        assert_eq!(tile.within(&projection), Ok(()));
+        let Tile::DataFunction {
+            domain_predicate,
+            codomain,
+            ..
+        } = &tile
+        else {
+            panic!("a collection")
+        };
+        assert_eq!(
+            *domain_predicate,
+            key(1),
+            "key 1 alone is stated whole, every path beneath it being admitted"
+        );
+        let Tile::DataFunction {
+            domain_predicate: rows_stated,
+            ..
+        } = &**codomain
+        else {
+            panic!("a nested collection")
+        };
+        for (k, j, stated) in [(0, 0, false), (0, 1, true), (0, 2, true), (2, 0, false)] {
+            assert_eq!(
+                rows_stated.contains_path(&path(k, j)),
+                stated,
+                "({k}, {j}) in {rows_stated:?}"
+            );
+        }
+        assert!(
+            three_rows()
+                .within(&projection)
+                .unwrap_err()
+                .contains("[u2]"),
+            "key 2 is on no admitted path"
+        );
+        let mut rows_0_and_1 = three_rows();
+        rows_0_and_1.restrict_to_keys(&positions(0, 1));
+        assert!(
+            rows_0_and_1
+                .within(&projection)
+                .unwrap_err()
+                .contains("[u0, u0]"),
+            "the path (0, 0) is not admitted"
+        );
+    }
+
     /// A tile cut to a projection at level 1 and the same tile cut to the rest merge back into
     /// the tile.
     #[test]
@@ -797,6 +926,75 @@ mod tests {
         let keys = Projection::admitting(key(0));
         assert_eq!(keys.above(CurryLevel::new(1)), keys);
         assert_eq!(keys.above(CurryLevel::OUTERMOST), Projection::Everything);
+    }
+
+    /// A key every path beneath which a projection at level 2 admits keeps the outermost
+    /// statement of it, though the region reaches it through an `Or` of enclosing paths only some
+    /// of which are whole.
+    #[test]
+    fn a_key_whole_through_an_or_enclosing_keeps_its_statement() {
+        // 0 ↦ {0 ↦ {0 ↦ 100}, 1 ↦ {0 ↦ 110}}, 1 ↦ {0 ↦ {0 ↦ 200}}, every level stated complete.
+        let tile = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 2],
+                ColumnValue::UInts(vec![0, 1, 0]),
+                Box::new(Tile::grouped(
+                    vec![0, 1, 2],
+                    ColumnValue::UInts(vec![0, 0, 0]),
+                    Box::new(Tile::Scalar(ColumnValue::Ints(vec![100, 110, 200]))),
+                    Predicate::True,
+                    BitSet::new(),
+                )),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        let tiling = Tiling::data_function(
+            Extent::uint_range(2),
+            Tiling::data_function(
+                Extent::uint_range(2),
+                Tiling::data_function(
+                    Extent::uint_range(1),
+                    Tiling::Scalar(Extent::Base(BaseType::Int)),
+                ),
+            ),
+        );
+        let one_path = Projection::Keys {
+            level: CurryLevel::new(2),
+            keys: under(under(key(0), key(1)), key(0)),
+        };
+        let rest = Projection::Everything.minus(&one_path);
+        let mut cut = tile;
+        cut.restrict_to(&rest, &tiling);
+        let Tile::DataFunction {
+            domain_predicate, ..
+        } = &cut
+        else {
+            panic!("a collection")
+        };
+        assert!(
+            domain_predicate.contains(&Value::UInt(1)),
+            "key 1 is whole in {rest:?}, and level 0 states {domain_predicate:?}"
+        );
+        assert_eq!(cut.within(&rest), Ok(()));
+    }
+
+    /// An unqualified region beneath the outermost keys names its keys under every key above,
+    /// so a cut keeps every outermost key and the rows it admits.
+    #[test]
+    fn an_unqualified_region_beneath_the_outermost_keys_keeps_every_key_above() {
+        let projection = level_one(key(0));
+        let mut tile = three_rows();
+        tile.restrict_to(&projection, &nested_tiling());
+        let path = |k: u64, j: u64| vec![Value::UInt(k), Value::UInt(j)];
+        assert_eq!(
+            cells(&tile),
+            [(path(0, 0), 10), (path(1, 0), 20), (path(2, 0), 30)]
+        );
+        assert_eq!(tile.within(&projection), Ok(()));
     }
 
     /// Every key beneath an outermost key reads as that key, so a producer restating the
@@ -968,5 +1166,48 @@ mod tests {
         // the consumer released what it took.
         spy.release(tiling.universal_guard());
         assert_eq!(spy.get(tiling.empty_guard()), tiling.empty_tile());
+    }
+
+    #[test]
+    fn a_tile_is_within_the_keys_it_holds_and_not_beyond() {
+        let tile = ints_by_position(&[10, 20, 30, 40], true);
+        let admitting = |first, last| Projection::admitting(positions(first, last));
+        assert_eq!(tile.within(&admitting(0, 3)), Ok(()));
+        assert_eq!(tile.within(&Projection::Everything), Ok(()));
+        assert!(tile.within(&admitting(1, 2)).unwrap_err().contains("omits"));
+        assert!(tile.within(&Projection::Nothing).is_err());
+        assert_eq!(
+            ints_tiling(4).empty_tile().within(&Projection::Nothing),
+            Ok(())
+        );
+        let mut released = ints_by_position(&[10, 20], true);
+        released.remove_guarded(keys_between(0, 1));
+        assert_eq!(released.within(&Projection::Nothing), Ok(()));
+        assert_eq!(released.within(&admitting(5, 6)), Ok(()));
+        let scalar = Tile::Scalar(ColumnValue::Ints(vec![1]));
+        assert!(scalar.within(&admitting(0, 3)).is_err());
+    }
+
+    /// A producer that restates no projection beneath its outermost keys is caught by the `get`
+    /// wrapper in a debug build when it is pulled at one (`TileProducer::restates`).
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "restates the outermost keys only")]
+    fn get_rejects_a_pull_beneath_the_outermost_keys_of_a_producer_that_restates_none() {
+        use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
+        let mut producer = TestTileProducer::new(three_rows(), nested_tiling());
+        producer.get(codomain(domain(under(key(0), key(1)))));
+    }
+
+    /// A producer that ignores the guard is caught by the `get` wrapper in a debug build, where
+    /// a pull for a morsel returns the whole tile.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "answered a pull at")]
+    fn get_rejects_an_answer_beyond_the_projection() {
+        use crate::interpreter::tile_operators::test_helpers::TestTileProducer;
+        let mut ignoring =
+            TestTileProducer::new(ints_by_position(&[10, 20, 30, 40], true), ints_tiling(4));
+        ignoring.get(keys_between(1, 2));
     }
 }
