@@ -619,6 +619,8 @@ fn collect_traits(body: &[Spanned<Stmt>]) -> Traits {
                         orders.insert((ty.clone(), c.name.node.to_string()), order);
                     }
                 }
+                // A `@Builtin` type has no constructor a program writes.
+                TypeDeclBody::Builtin => {}
             }
             let ctors = match &decl.body {
                 chl_parser::ast::TypeDeclBody::Single(ty) => {
@@ -633,6 +635,7 @@ fn collect_traits(body: &[Spanned<Stmt>]) -> Traits {
                         )
                     })
                     .collect(),
+                chl_parser::ast::TypeDeclBody::Builtin => BTreeMap::new(),
             };
             declared.insert(
                 decl.name.node.to_string(),
@@ -658,7 +661,7 @@ fn collect_traits(body: &[Spanned<Stmt>]) -> Traits {
         if !traits.functions.keys().any(|(t, _)| *t == trait_) {
             continue;
         }
-        let vars: Vec<String> = block.vars.iter().map(|v| v.node.to_string()).collect();
+        let vars: Vec<String> = block.vars.iter().map(|v| v.name.to_string()).collect();
         let heads = block
             .args
             .iter()
@@ -1107,6 +1110,84 @@ impl BuiltinMethod {
 /// prelude, and this interpreter, which loads one file, declares the same members itself.
 const OPTION: &str = "Option";
 
+/// One of `std`'s collections (`stdlib/src/std.cambra`, "Collections"): the type, its one
+/// constructor, and the keyed collection that constructor holds. Built by `map`, `set` and
+/// `groupby`, iterated through `Iterable::elements`, and read and written by key through its
+/// collection.
+#[derive(Clone, Copy, PartialEq)]
+enum StdCollection {
+    Set,
+    Map,
+    FullMap,
+}
+
+impl StdCollection {
+    fn of(ty: &str) -> Option<Self> {
+        match ty {
+            "Set" => Some(StdCollection::Set),
+            "Map" => Some(StdCollection::Map),
+            "FullMap" => Some(StdCollection::FullMap),
+            _ => None,
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            StdCollection::Set => "Set",
+            StdCollection::Map => "Map",
+            StdCollection::FullMap => "FullMap",
+        }
+    }
+
+    fn ctor(self) -> &'static str {
+        match self {
+            StdCollection::Set | StdCollection::Map => "rep",
+            StdCollection::FullMap => "new",
+        }
+    }
+
+    /// A value of this collection holding `c`.
+    fn wrap(self, c: Collection) -> Value {
+        Value::Nominal {
+            ty: self.name().to_string(),
+            ctor: self.ctor().to_string(),
+            payload: Box::new(Value::Collection(c)),
+        }
+    }
+
+    /// The collection `v` holds and which of `std`'s collections it is; `None` for any other
+    /// value.
+    fn unwrap(v: &Value) -> Option<(Self, &Collection)> {
+        let Value::Nominal { ty, payload, .. } = v else {
+            return None;
+        };
+        let Value::Collection(c) = payload.as_ref() else {
+            return None;
+        };
+        Some((Self::of(ty)?, c))
+    }
+
+    /// `Iterable`'s `elements` of a value holding `c`: a set's keys, and a map's entries `(k,
+    /// v)`, each at its key.
+    fn elements(self, c: &Collection) -> Result<Value, Error> {
+        let entries = c
+            .entries()
+            .iter()
+            .map(|(k, v)| {
+                let element = match self {
+                    StdCollection::Set => k.clone(),
+                    StdCollection::Map | StdCollection::FullMap => Value::Record(vec![
+                        ("_0".to_string(), k.clone()),
+                        ("_1".to_string(), v.clone()),
+                    ]),
+                };
+                (k.clone(), element)
+            })
+            .collect();
+        Ok(Value::Collection(collection(entries)?))
+    }
+}
+
 /// What the module declares of one nominal type.
 #[derive(Default)]
 struct TypeMembers {
@@ -1185,6 +1266,7 @@ fn collect_types(body: &[Spanned<Stmt>]) -> BTreeMap<String, TypeMembers> {
                     );
                 }
             }
+            TypeDeclBody::Builtin => {}
         }
     }
     out
@@ -1497,8 +1579,14 @@ impl Interp {
                             self.write(n, &cell, Value::Pending)?;
                             return Ok(None);
                         }
-                        let Value::Collection(c) = current else {
-                            return err(format!("`{n}` is not a mutable collection"));
+                        // One of `std`'s collections is written through the collection it
+                        // holds, and stays that collection.
+                        let (std, c) = match StdCollection::unwrap(&current) {
+                            Some((std, c)) => (Some(std), c.clone()),
+                            None => match current {
+                                Value::Collection(c) => (None, c),
+                                _ => return err(format!("`{n}` is not a mutable collection")),
+                            },
                         };
                         // Last write wins per key, in place; a key not yet present is added.
                         let mut entries = c.entries().to_vec();
@@ -1506,7 +1594,12 @@ impl Interp {
                             Some(entry) => entry.1 = v,
                             None => entries.push((key, v)),
                         }
-                        self.write(n, &cell, Value::Collection(collection(entries)?))?;
+                        let written = collection(entries)?;
+                        let written = match std {
+                            Some(std) => std.wrap(written),
+                            None => Value::Collection(written),
+                        };
+                        self.write(n, &cell, written)?;
                     }
                     other => return err(format!("unsupported write target: {other:?}")),
                 }
@@ -3185,6 +3278,12 @@ impl Interp {
                 if any_pending([&t, &k]) {
                     return Ok(Value::Pending);
                 }
+                // One of `std`'s collections is read at its keys through the collection it
+                // holds.
+                let t = match StdCollection::unwrap(&t) {
+                    Some((_, c)) => Value::Collection(c.clone()),
+                    None => t,
+                };
                 match t {
                     Value::Collection(c) => {
                         let found = c.entries().iter().find(|(key, _)| *key == k);
@@ -3271,8 +3370,9 @@ impl Interp {
                 Ok(cell.borrow().value.clone())
             }
 
-            // A map is written as its entries; `box` marks a value as a whole rather than
-            // a collection to iterate, which changes nothing about what it is.
+            // A map is written as its entries, and is `std`'s `Map` holding them; `box` marks a
+            // value as a whole rather than a collection to iterate, which changes nothing about
+            // what it is.
             Some(SurfaceBuiltin::Map) => {
                 let pairs = match self.eval(&args[0])? {
                     Value::Collection(pairs) => pairs,
@@ -3293,7 +3393,7 @@ impl Interp {
                     };
                     entries.push((get("_0")?, get("_1")?));
                 }
-                Ok(Value::Collection(collection(entries)?))
+                Ok(StdCollection::Map.wrap(collection(entries)?))
             }
 
             Some(SurfaceBuiltin::Box) => self.eval(&args[0]),
@@ -3335,8 +3435,8 @@ impl Interp {
                 Ok(total)
             }
 
-            // `groupby(xs, f)` is keyed by the group key, and each group holds its members
-            // under the keys they had in `xs`.
+            // `groupby(xs, f)` is `std`'s `FullMap` keyed by the group key, and each group holds
+            // its members under the keys they had in `xs`.
             Some(SurfaceBuiltin::Groupby) => {
                 let c = match self.eval(&args[0])? {
                     Value::Collection(c) => c,
@@ -3363,7 +3463,7 @@ impl Interp {
                 for (k, members) in groups {
                     entries.push((k, Value::Collection(collection(members)?)));
                 }
-                Ok(Value::Collection(collection(entries)?))
+                Ok(StdCollection::FullMap.wrap(collection(entries)?))
             }
 
             // An instance stands only before `::` (`docs/chl-spec.md`, "Summoning an instance").
@@ -3763,6 +3863,10 @@ fn builtin_function(
         // A collection is its own `Elements` (`docs/chl-spec.md`, "Trait requirements").
         ("Iterable", "elements") => match values {
             [c @ Value::Collection(_)] => Ok(c.clone()),
+            [v] => {
+                let (std, c) = StdCollection::unwrap(v)?;
+                std.elements(c)
+            }
             _ => return None,
         },
         ("Negatable", "neg") => match values {
@@ -4447,7 +4551,7 @@ mod tests {
     fn an_accumulating_loop_over_a_keyed_collection_is_refused() {
         let e = refused(indoc! {r#"
             acc := 0
-            for v in map([("b", 1), ("a", 2)]):
+            for _ -> v in map([("b", 1), ("a", 2)]):
                 acc := acc * 10 + v
             out = test_sink()
             out << acc
@@ -4462,7 +4566,7 @@ mod tests {
             def step(acc: Mut(Int), v):
                 acc := acc * 10 + v
             acc := 0
-            for v in map([("b", 1), ("a", 2)]):
+            for _ -> v in map([("b", 1), ("a", 2)]):
                 step(acc, v)
             out = test_sink()
             out << acc
@@ -4481,7 +4585,7 @@ mod tests {
                     pool := r
                     out << pool
                 0
-            for v in map([("b", 1), ("a", 2)]):
+            for _ -> v in map([("b", 1), ("a", 2)]):
                 take(v)
         "#});
         assert!(e.contains("may depend on its iteration order"), "{e}");
@@ -4493,7 +4597,7 @@ mod tests {
     fn a_loop_over_a_keyed_collection_may_write_its_own_variables() {
         let v = out(indoc! {r#"
             out = test_sink()
-            for v in map([("b", 1), ("a", 2)]):
+            for _ -> v in map([("b", 1), ("a", 2)]):
                 t := v
                 t := t * 10
                 out << t
@@ -4508,7 +4612,7 @@ mod tests {
         let program = |pairs: &str| {
             indoc::formatdoc! {r#"
                 acc := 0
-                for v in map([{pairs}]):
+                for _ -> v in map([{pairs}]):
                     acc := acc * 10 + v
                 out = test_sink()
                 out << acc

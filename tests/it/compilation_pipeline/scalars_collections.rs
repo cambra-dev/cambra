@@ -228,31 +228,27 @@ fn a_loop_over_the_empty_list_keeps_its_seed() {
 #[timeout(Duration::from_secs(10))]
 #[case::map_annotation(indoc! {r#"
     m: Map(String, Int) = empty_map()
-    sum([v for v in m])
+    sum([v for _ -> v in m])
 "#})]
 #[case::int_keys(indoc! {r#"
     m: Map(Int, Int) = empty_map()
-    sum([v for v in m])
+    sum([v for _ -> v in m])
 "#})]
 fn an_empty_map_takes_its_types_from_the_annotation(#[case] code: &str) {
     check_scalar(code, Value::Int(0));
 }
 
-// `Set(K)` is `Map(K, unit)`, so the same term answers it — the annotation decides which
-// reading, and the codomain it pins is what tells them apart.
+// `empty_map()` is a `Map`, and `Set` is a type of its own, so the empty map does not answer a
+// `Set` annotation.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-fn an_empty_map_answers_a_set_annotation() {
-    check_tile(
+fn an_empty_map_does_not_answer_a_set_annotation() {
+    check_compile_error(
         indoc::indoc! {r#"
             s: Set(String) = empty_map()
-            s"#},
-        Tile::data_function(
-            ColumnValue::Strings(vec![]),
-            Box::new(Tile::Scalar(ColumnValue::Units(0))),
-            Predicate::True,
-            BitSet::new(),
-        ),
+            s
+        "#},
+        "annotated as Set(String), but inferred as Map(",
     );
 }
 
@@ -262,10 +258,22 @@ fn an_empty_map_answers_a_set_annotation() {
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 fn an_empty_map_is_a_typed_empty_tile() {
-    check_tile(
-        indoc::indoc! {r#"
-            m: Map(String, Int) = empty_map()
-            m"#},
+    // A `Map` holds its collection in its one constructor, `rep`.
+    let Tile::Union(arms) = run_pipeline(indoc::indoc! {r#"
+        m: Map(String, Int) = empty_map()
+        m
+    "#}) else {
+        panic!("a `Map` is a value of its constructor");
+    };
+    let rep = arms
+        .iter()
+        .find_map(|(tag, arm)| {
+            matches!(tag, cambra::ccl::FieldKey::Name(name) if name.name() == "rep").then_some(arm)
+        })
+        .expect("the `rep` arm");
+    assert_eq!(rep.rows, vec![0]);
+    assert_eq!(
+        rep.tile,
         Tile::data_function(
             ColumnValue::Strings(vec![]),
             Box::new(Tile::Scalar(ColumnValue::Ints(vec![]))),
@@ -322,16 +330,15 @@ fn a_map_entry_is_a_pair(#[case] code: &str) {
 // With no use the element is unit, as a positional literal's is.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::set_under_an_annotation("s: Set(String) = box(set([]))\nsum([1 for _ in s])")]
-#[case::map_under_an_annotation("m: Map(String, Int) = box(map([]))\nsum([1 for _ in m])")]
+#[case::set_under_an_annotation("s: Set(String) = set([])\nsum([1 for _ in s])")]
+#[case::map_under_an_annotation("m: Map(String, Int) = map([])\nsum([1 for _ in m])")]
 #[case::set("s = set([])\nsum([1 for _ in s])")]
 #[case::map("m = map([])\nsum([1 for _ in m])")]
-#[case::boxed_set("s = box(set([]))\nsum([1 for _ in s])")]
-#[case::boxed_group_by("g = box(groupby([], \\x -> x))\nsum([1 for _ in g])")]
-#[case::empty_comprehension("s: Set(String) = box(set([x for x in []]))\nsum([1 for _ in s])")]
+#[case::group_by("g = groupby([], \\x -> x)\nsum([1 for _ in g])")]
+#[case::empty_comprehension("s: Set(String) = set([x for x in []])\nsum([1 for _ in s])")]
 #[case::beside_a_nonempty_set(indoc! {r#"
-    s: Set(String) = box(set([]))
-    t: Set(String) = box(set(["a"]))
+    s: Set(String) = set([])
+    t: Set(String) = set(["a"])
     sum([1 for _ in s]) + sum([1 for _ in t])
 "#})]
 fn a_re_keying_constructor_takes_an_empty_literal(#[case] code: &str) {
@@ -347,25 +354,25 @@ fn a_re_keying_constructor_takes_an_empty_literal(#[case] code: &str) {
 #[timeout(Duration::from_secs(10))]
 #[case::a_joined_map(indoc! {r#"
     c = 1 == 1
-    m = box(map([("a", 1)])) if c else box(map([]))
+    m = map([("a", 1)]) if c else map([])
     sum([1 for _ in m])
 "#}, 1)]
 #[case::a_joined_set(indoc! {r#"
     c = 1 == 1
-    s = box(set(["a"])) if c else box(set([]))
+    s = set(["a"]) if c else set([])
     sum([1 for _ in s])
 "#}, 1)]
 #[case::a_joined_set_under_an_annotation(indoc! {r#"
     c = 1 == 1
-    s: Set(String) = box(set(["a"])) if c else box(set([]))
+    s: Set(String) = set(["a"]) if c else set([])
     sum([1 for _ in s])
 "#}, 1)]
 #[case::a_mutable_set(indoc! {r#"
-    seen: Mut(Set(String), Txn) := box(set([]))
+    seen: Mut(Set(String), Txn) := set([])
     0
 "#}, 0)]
 #[case::a_mutable_map(indoc! {r#"
-    seen: Mut(Map(String, Int), Txn) := box(map([]))
+    seen: Mut(Map(String, Int), Txn) := map([])
     0
 "#}, 0)]
 fn an_empty_re_keyed_literal_takes_its_key_from_its_uses(#[case] code: &str, #[case] count: i64) {
@@ -373,25 +380,18 @@ fn an_empty_re_keyed_literal_takes_its_key_from_its_uses(#[case] code: &str, #[c
 }
 
 /// Pinned: a `def` returning an empty re-keyed literal keeps its key type as a candidate of the
-/// sum it returns, which instantiation does not generalize, so a call's annotation reaches the
-/// definition's own variable after the definition was read. A debug build stops at the solver's
-/// ordering assertion; a release build reaches the refusal that nothing determines the key.
-/// Expected: `0`.
+/// sum it represents, which instantiation does not generalize, so a call's annotation does not
+/// reach it and nothing determines it. Expected: `0`.
 #[test]
-#[cfg_attr(debug_assertions, should_panic(expected = "ordering invariant"))]
-#[cfg_attr(
-    not(debug_assertions),
-    should_panic(expected = "Nothing determines the type of this expression")
-)]
 fn a_def_returning_an_empty_set_takes_no_key_from_its_calls_yet() {
-    check_scalar(
+    check_compile_error(
         indoc! {"
             def mk():
-                box(set([]))
+                set([])
             a: Set(String) = mk()
             sum([1 for _ in a])
         "},
-        Value::Int(0),
+        "Nothing determines the type of this expression",
     );
 }
 

@@ -542,7 +542,7 @@ impl Subst {
 
     /// A substitution on term binders alone — the ordinary case, no scope change between
     /// sums.
-    fn of_binders(binders: BTreeMap<Binder, Mapping>) -> Self {
+    pub(crate) fn of_binders(binders: BTreeMap<Binder, Mapping>) -> Self {
         Subst {
             binders,
             witnesses: BTreeMap::new(),
@@ -587,19 +587,25 @@ impl Subst {
     /// to its projection `σᵢ(term)`: the sum read through `term`. See
     /// `src/ccl/design/type-inference.md`, "An elimination reads a sum through a term".
     pub(crate) fn discharged_through(
-        mut self,
+        &self,
         binders: &[crate::ccl::ty::Witness],
         term: &Rc<TypedExpr>,
+        read_through: &Type,
     ) -> Subst {
+        let mut discharged = self.clone();
         for (i, w) in binders.iter().enumerate() {
-            self.witnesses.insert(
+            discharged.witnesses.insert(
                 *w.id(),
                 WitnessMapping::Discharge(Type::WitnessProjection(
-                    crate::ccl::ty::WitnessProjection::new(Rc::clone(term), i),
+                    crate::ccl::ty::WitnessProjection::through(
+                        term,
+                        || self.apply_type(read_through),
+                        i,
+                    ),
                 )),
             );
         }
-        self
+        discharged
     }
 
     /// The discharge `[binder ↦ candidate]` alone.
@@ -1303,6 +1309,28 @@ impl Subst {
         self.binders.len()
     }
 
+    /// This substitution without the term-binder entries [`Self::acting_on`] drops for `v`: those
+    /// for binders outside `v`'s telescope. The witness half and the eliminations are kept whole,
+    /// so the result acts on `v` as `self` does. Returns `self` borrowed when every binder entry
+    /// is in the telescope.
+    ///
+    /// A walk composing each edge's substitution onto what it has accumulated trims by this. A
+    /// term reaches a binder crossing only as a binder entry's image, so only the binder half can
+    /// capture there.
+    pub(crate) fn binders_in_scope_of(
+        &self,
+        v: &crate::ccl::infer_var::InferVar,
+    ) -> Cow<'_, Subst> {
+        if self.binders.keys().all(|k| binder_acts_on(k, v)) {
+            return Cow::Borrowed(self);
+        }
+        let mut out = self.clone();
+        out.binders.retain(|k, _| binder_acts_on(k, v));
+        #[cfg(debug_assertions)]
+        dropped_entries::record(v, self, &out);
+        Cow::Owned(out)
+    }
+
     /// This substitution's entries for `names`, without its witness mappings.
     pub fn restricted_to(&self, names: &BTreeSet<Binder>) -> Subst {
         Subst {
@@ -1720,6 +1748,24 @@ impl Subst {
     ) -> bool {
         match ty {
             Type::Infer(v) => self.acts_on_var(v),
+            // The function's binder scopes over its codomain, as in `rewrite_type_go`, so an
+            // entry for that name acts on nothing there.
+            Type::Fun {
+                name: Some(b),
+                fun_kind,
+                domain,
+                codomain,
+                capabilities: _,
+            } if self.binders.contains_key(b) => {
+                fun_kind.witnesses().iter().any(|w| {
+                    w.types()
+                        .iter()
+                        .any(|t| self.acts_on_a_var_in_type_visiting(t, visited))
+                }) || self.acts_on_a_var_in_type_visiting(domain, visited)
+                    || self
+                        .shadow(b)
+                        .acts_on_a_var_in_type_visiting(codomain, visited)
+            }
             _ => {
                 ty.refinements().iter().any(|r| {
                     visited.insert(r.predicate_id())
@@ -2464,6 +2510,7 @@ impl Subst {
             // substitution acts on each whole, and as on a collection's domain, which a witness
             // projection is wherever it stands ([`Self::in_data_domain`]).
             Type::WitnessProjection(_) | Type::FamilyApp(_) => {
+                ty.walk_children_mut(|t| self.rewrite_type_go(t, memo));
                 let s = self.in_data_domain();
                 for held in ty.held_terms_mut() {
                     memo.rebuild(held, &s, |term| {
@@ -2640,9 +2687,11 @@ impl Subst {
     /// collision would capture.
     fn under_binder(&self, binder: &Name, body: &TypedExpr) -> Subst {
         let restricted = self.shadow(binder);
-        // If no substituted binder occurs free in the body, the substitution
-        // is inert there — return the identity so the body is left untouched.
-        if !restricted.binders.keys().any(|k| is_free(k, body)) {
+        // Where the substitution acts on nothing in the body, it is inert there — return the
+        // identity so the body is left untouched. The test is `apply_expr`'s own
+        // ([`Self::acts_on`]): a body naming no substituted binder can still hold a variable
+        // that resolves to a type naming one, and that variable must be suspended.
+        if !restricted.acts_on(body) {
             return Subst::id();
         }
         restricted.assert_no_capture(binder);
@@ -2871,7 +2920,7 @@ impl Subst {
                 fun_kind: FunKind::Data(Some(ws)),
                 ..
             } => rest
-                .discharged_through(ws, c)
+                .discharged_through(ws, c, ty)
                 .apply_type_inner(ty, escaping),
             Type::Fun {
                 fun_kind: FunKind::Var(k),
@@ -2953,6 +3002,7 @@ impl Subst {
             Type::WitnessProjection(_) | Type::FamilyApp(_) => {
                 let s = self.in_data_domain();
                 let mut out = ty.clone();
+                out.walk_children_mut(|t| *t = self.apply_type_inner(t, escaping));
                 if ty.held_terms().any(|t| s.acts_on(t)) {
                     for held in out.held_terms_mut() {
                         let substituted = Rc::new(s.apply_expr(held.held()));
@@ -4221,6 +4271,7 @@ impl<'a> PiWalk<'a> {
             // A projected sum and a family's arguments are converted as a predicate is; they
             // bind no element.
             Type::WitnessProjection(_) | Type::FamilyApp(_) => {
+                ty.walk_children_mut(|t| self.ty(t, depth));
                 for held in ty.held_terms_mut() {
                     self.held(held, depth);
                 }
@@ -4502,9 +4553,13 @@ pub fn references_binder_within(ty: &Type, within: u32) -> bool {
             // A witness reference is a leaf in its own namespace: it neither is
             // nor crosses a Pi index.
             Type::WitnessRef(_) => false,
-            Type::WitnessProjection(_) | Type::FamilyApp(_) => ty.held_terms().any(|t| {
-                visited.insert((Rc::as_ptr(t), depth)) && expr_scan(t, depth, within, visited)
-            }),
+            Type::WitnessProjection(_) | Type::FamilyApp(_) => {
+                ty.any_child(|t| ty_scan(t, depth, within, visited))
+                    || ty.held_terms().any(|t| {
+                        visited.insert((Rc::as_ptr(t), depth))
+                            && expr_scan(t, depth, within, visited)
+                    })
+            }
         }
     }
     fn expr_scan(

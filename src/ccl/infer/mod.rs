@@ -485,15 +485,21 @@ pub(super) fn map_constrain_err(err: ConstrainError, ctx_label: &str) -> InferEr
             trait_,
             position,
             found,
-            accepted,
+            mut accepted,
             ..
-        } => InferError::NoTraitInstance {
-            trait_: trait_.to_string(),
-            position,
-            found: Box::new(found),
-            accepted,
-            at: ctx_label.to_string(),
-        },
+        } => {
+            // The collection rule accepts every structural collection beside the instances.
+            if trait_.reads_collections() {
+                accepted.insert(0, Type::data_fun(Type::Hole, Type::Hole));
+            }
+            InferError::NoTraitInstance {
+                trait_: trait_.to_string(),
+                position,
+                found: Box::new(found),
+                accepted,
+                at: ctx_label.to_string(),
+            }
+        }
         // Reported with the same `ctx` a coalesce-time kinding failure uses: the two
         // differ only in when the type side became known.
         ConstrainError::NotOfKind { found, type_kind } => InferError::TypeMismatch {

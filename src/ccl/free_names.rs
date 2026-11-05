@@ -301,6 +301,7 @@ impl<'m> Walk<'m> {
             // A projected sum and a family's arguments are terms the type holds. They bind no
             // element: a projected term is the collection, not a condition on a key.
             Type::WitnessProjection(_) | Type::FamilyApp(_) => {
+                ty.walk_children(|t| self.ty(t));
                 ty.held_terms().for_each(|t| self.held(t, false))
             }
             Type::Fun {
