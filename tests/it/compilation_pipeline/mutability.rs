@@ -563,6 +563,87 @@ fn test_mutability(#[case] code: &str, #[case] expected: Tile) {
     check_tile(code, expected);
 }
 
+/// A mutable variable's value type is the join of its seed and every write, whether or not
+/// anything reads it. A variable declared at one tag and written at another holds both, in a
+/// loop's recurrence and a transaction's store as at the top level, including where nothing
+/// reads it and where a loop body declares it.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::top_level(indoc! {"
+    st := `ok(0)
+    st := `err(5)
+    match st:
+        case `ok(n):
+            n
+        case `err(e):
+            e
+"}, Value::Int(5))]
+#[case::loop_written(indoc! {"
+    st := `ok(0)
+    for i in [1, 2, 3]:
+        if i == 2:
+            st := `err(i)
+    match st:
+        case `ok(n):
+            n
+        case `err(e):
+            e
+"}, Value::Int(2))]
+#[case::loop_written_unread(indoc! {"
+    o: Feed(_)
+    st := `ok(0)
+    for i in [1, 2, 3]:
+        o << i
+        if i == 2:
+            st := `err(i)
+    sum(o)
+"}, Value::Int(6))]
+#[case::body_introduced(indoc! {"
+    t := 0
+    for i in [1, 2]:
+        inner := `ok(0)
+        for j in [10, 20]:
+            if j == 20:
+                inner := `err(j)
+        match inner:
+            case `ok(_):
+                pass
+            case `err(e):
+                t := t + e
+    t
+"}, Value::Int(40))]
+#[case::ints(indoc! {"
+    x := 1
+    for i in [1, 2, 3]:
+        x := i * 10
+    x
+"}, Value::Int(30))]
+#[case::transactional(indoc! {"
+    st: Mut(_, Txn) := `ok(0)
+    for r in [10, 20]:
+        with begin():
+            if r == 20:
+                st := `err(r)
+    match await_final(st):
+        case `ok(n):
+            n
+        case `err(e):
+            e
+"}, Value::Int(20))]
+#[case::transactional_unread(indoc! {"
+    o: Feed(_)
+    st: Mut(_, Txn) := `ok(0)
+    for r in [10, 20]:
+        with begin():
+            o << r
+            if r == 20:
+                st := `err(r)
+    sum(o)
+"}, Value::Int(30))]
+fn a_mutable_variable_holds_the_join_of_its_writes(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
 // ---------------------------------------------------------------------------
 // Second-class `Mut` discipline (`src/ccl/design/mutability.md`, "No aliasing:
 // `Mut` values are second-class (downward-only)"). A mutable value must stay
