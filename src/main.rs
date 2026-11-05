@@ -80,8 +80,8 @@ fn dispatch_requested() -> bool {
 }
 
 /// Runs `loaded` through the dispatcher on the calling thread ([`dispatcher::run_program_into`]),
-/// printing each epoch's answer of the `main` output ([`PrintedMain`]), as pull mode prints each
-/// pull's answer. A program the planner refuses runs in pull mode in the same context, after a
+/// printing each answer of the `main` output ([`PrintedMain`]), as pull mode prints each pull's
+/// answer. A program the planner refuses runs in pull mode in the same context, after a
 /// note on stderr: its compile has opened its sources and sinks, a port bound or stdin taken, so a
 /// second compile could open none of them. `Err(())` where it does not compile.
 ///

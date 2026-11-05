@@ -819,8 +819,8 @@ struct BreakerState {
     consuming: bool,
     /// The store as the last consumed step rendered it.
     snapshot: Option<Tile>,
-    /// How many of the store's inputs have finished the run's last epoch: the store settles at
-    /// the last of them ([`finish_store`]).
+    /// How many of the store's inputs have finished: the store settles at the last of them
+    /// ([`finish_store`]).
     last_finishes: usize,
 }
 
@@ -866,7 +866,7 @@ trait SteppedStore: BreakingProducer {
     /// One step of the store toward its input `input`'s release, rendering the store.
     fn step_store(&mut self, input: InputId) -> Tile;
 
-    /// Settle the store once every input has finished the run's last epoch, before
+    /// Settle the store once every input has finished, before
     /// [`finish_store`] checks it is terminal. Nothing for a store that decides each position at
     /// the step that releases it.
     fn settle(&mut self) {}
@@ -1380,8 +1380,8 @@ impl Breaker for CommitProducer {
 impl BreakingProducer for CommitProducer {
     /// The commit ticks the store has decided, through its watermark, and everything once it is
     /// terminal. A reader of the store's changelog (`StoreValueStream`) takes the ticks as they are
-    /// decided, and a reader of its final value takes it once the store's pipeline has finished the
-    /// epoch, or, over a live source, once every epoch has run (`Dispatcher::read_whole`).
+    /// decided, and a reader of its final value takes it once the store is terminal
+    /// (`Dispatcher::read_whole`).
     fn held(&self) -> TileGuard {
         if self.breaker.terminal() {
             return self.tiling().universal_guard();
@@ -3190,7 +3190,7 @@ impl CommitProducer {
 
     /// Commit the held decisions in key order, `(position, writer)`, while the least key may
     /// commit: once every other writer has passed its position or is terminal, and at once where
-    /// `settling`, when every input has finished the run's last epoch. A proposal commits where
+    /// `settling`, when every input has finished. A proposal commits where
     /// the engine validates it, and a decision that proposed nothing stands where nothing has
     /// committed since it was made. One that does neither keeps its key: its writer decides the
     /// item again at once ([`drive_again`](Self::drive_again)), before anything with a larger key
@@ -3307,7 +3307,7 @@ impl CommitProducer {
         self.base.clear_gate();
     }
 
-    /// Commit what the store holds once every input has finished the run's last epoch: take what
+    /// Commit what the store holds once every input has finished: take what
     /// each writer still proposes, and commit in key order, until a pull of every writer brings
     /// nothing. That last pull finds each writer terminal: its drive is done once the store has
     /// let go of all its items.

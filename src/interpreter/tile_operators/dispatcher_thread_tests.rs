@@ -303,9 +303,9 @@ fn work(
                     dispatcher, script, observed, pipeline, consumed,
                 ));
             }
-            Next::Wait(epoch) => {
+            Next::Wait(generation) => {
                 jitter(&mut rng);
-                dispatcher.wait(epoch);
+                dispatcher.wait(generation);
             }
             Next::Done | Next::Failed => break,
         }
@@ -347,8 +347,8 @@ fn consume(
     }
 }
 
-/// A scripted [`dispatcher::finish_epoch`](crate::interpreter::dispatcher::finish_epoch), which
-/// checks what a finish rests on as the worker sees it.
+/// A scripted [`dispatcher::finish_pipeline`](crate::interpreter::dispatcher::finish_pipeline),
+/// which checks what a finish rests on as the worker sees it.
 fn finish_scripted(
     dispatcher: &Dispatcher,
     script: &Script,
@@ -1156,7 +1156,7 @@ fn a_racy_scenario_holds_over_many_iterations() {
     }
 }
 
-/// A wait for an epoch a change has already advanced past returns at once.
+/// A wait on a generation a change has already advanced past returns at once.
 #[test]
 fn a_wait_after_a_change_returns_at_once() {
     within("one thread".to_string(), || {
@@ -1166,11 +1166,11 @@ fn a_wait_after_a_change_returns_at_once() {
         let Next::Package(package) = dispatcher.try_claim(None) else {
             panic!("the source's one package");
         };
-        let Next::Wait(epoch) = dispatcher.try_claim(None) else {
+        let Next::Wait(generation) = dispatcher.try_claim(None) else {
             panic!("nothing to claim while the package is in flight");
         };
         dispatcher.acknowledge(package);
-        dispatcher.wait(epoch);
+        dispatcher.wait(generation);
         assert!(matches!(
             dispatcher.try_claim(None),
             Next::Finish {
@@ -1226,23 +1226,20 @@ fn a_claim_after_a_failure_answers_failed() {
     assert!(matches!(dispatcher.claim(None), Next::Failed));
 }
 
-/// A notifying thread queues a source's input in runs and seals an epoch every few runs, into a
-/// window of two epochs, while workers claim. Each epoch's finish of the source pushes what it
-/// consumed in that epoch to the reader. Every key is consumed once by each, every pipeline
-/// finishes every epoch once, and the reader claims a package of an epoch only after the source
-/// finished it. An ordered source claims an epoch's packages only after it finished the epoch
-/// before.
+/// A notifying thread queues a source's input in runs while workers claim. The source's finish
+/// pushes what it consumed to the reader. Every key is consumed once by each, every pipeline
+/// finishes once, and the reader claims a package only after the source finished.
 #[test]
-fn epochs_sealed_while_workers_claim() {
+fn a_source_notified_while_workers_claim() {
     for iteration in 1..=60u64 {
         for threads in [1, 2, 8, 16] {
             let what = format!("iteration {iteration}, {threads} threads");
-            within(what, move || sealed_while_claimed(iteration, threads));
+            within(what, move || notified_while_claimed(iteration, threads));
         }
     }
 }
 
-fn sealed_while_claimed(seed: u64, threads: usize) {
+fn notified_while_claimed(seed: u64, threads: usize) {
     let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], 1 + (seed % 3) as usize);
     if seed.is_multiple_of(2) {
         dispatcher.order(PipelineId(0));
@@ -1250,7 +1247,7 @@ fn sealed_while_claimed(seed: u64, threads: usize) {
     let consumed = [AtomicU64::new(0), AtomicU64::new(0)];
     let finishes = Mutex::new(Vec::new());
     // Each claim of a package, logged after the claim returns, and each finish, logged before
-    // the finish lets a reader claim: (pipeline, epoch, whether it is a finish).
+    // the finish lets a reader claim: (pipeline, whether it is a finish).
     let log = Mutex::new(Vec::new());
     thread::scope(|scope| {
         let (dispatcher, consumed, finishes, log) = (&dispatcher, &consumed, &finishes, &log);
@@ -1273,7 +1270,7 @@ fn sealed_while_claimed(seed: u64, threads: usize) {
                     match dispatcher.claim(None) {
                         Next::Package(package) => {
                             let p = package.pipeline.0;
-                            log.lock().expect("no worker panics").push((p, 0u64, false));
+                            log.lock().expect("no worker panics").push((p, false));
                             let mask = mask_of(&package.guard);
                             jitter(&mut rng);
                             let before = consumed[p].fetch_or(mask, SeqCst);
@@ -1284,13 +1281,10 @@ fn sealed_while_claimed(seed: u64, threads: usize) {
                             pipeline,
                             consumed: region,
                         } => {
-                            finishes
-                                .lock()
-                                .expect("no worker panics")
-                                .push((pipeline.0, 0u64));
+                            finishes.lock().expect("no worker panics").push(pipeline.0);
                             log.lock()
                                 .expect("no worker panics")
-                                .push((pipeline.0, 0u64, true));
+                                .push((pipeline.0, true));
                             let mut pushes = dispatcher.pushes(pipeline);
                             if let (PipelineId(0), Some(region)) = (pipeline, &region) {
                                 pushes.push(region, cut);
@@ -1310,50 +1304,34 @@ fn sealed_while_claimed(seed: u64, threads: usize) {
         [u64::MAX; 2]
     );
     let mut finishes = finishes.into_inner().expect("no worker panics");
-    let epochs = 1;
     finishes.sort();
-    let expected: Vec<_> = (0..2)
-        .flat_map(|p| (0..epochs).map(move |epoch| (p, epoch)))
-        .collect();
-    assert_eq!(
-        finishes, expected,
-        "every pipeline finishes every epoch once"
-    );
+    assert_eq!(finishes, [0, 1], "every pipeline finishes once");
     let log = log.into_inner().expect("no worker panics");
-    for (at, &(p, epoch, finish)) in log.iter().enumerate() {
-        let finished_before = |q, e| log[..at].contains(&(q, e, true));
+    for (at, &(p, finish)) in log.iter().enumerate() {
         if p == 1 && !finish {
             assert!(
-                finished_before(0, epoch),
-                "the reader claims a package of epoch {epoch} after the source finished it"
-            );
-        }
-        if p == 0 && !finish && seed.is_multiple_of(2) && epoch > 0 {
-            assert!(
-                finished_before(0, epoch - 1),
-                "the ordered source claims in epoch {epoch} after it finished the epoch before"
+                log[..at].contains(&(0, true)),
+                "the reader claims a package after the source finished"
             );
         }
     }
 }
 
-/// Two threads notify one source, each half of its keys, while a third seals epochs into a
-/// window of two and closes the source once the notifies are done, and workers claim. A notify
-/// that read the current epoch before a seal moved past it lands in a later epoch. Every key is
-/// consumed once, and the source finishes every epoch once. The races of a notify with a seal and
-/// with an acknowledgement are a few instructions wide, so the test runs them without forcing
-/// either.
+/// Two threads notify one source, each half of its keys, while a third closes the source once the
+/// notifies are done, and workers claim. Every key is consumed once, and the source finishes once.
+/// The race of a notify with an acknowledgement is a few instructions wide, so the test runs it
+/// without forcing it.
 #[test]
-fn a_source_notified_from_two_threads_while_a_third_seals() {
+fn a_source_notified_from_two_threads() {
     for iteration in 1..=60u64 {
         for threads in [1, 2, 8] {
             let what = format!("iteration {iteration}, {threads} threads");
-            within(what, move || notified_while_sealed(iteration, threads));
+            within(what, move || notified_from_two(iteration, threads));
         }
     }
 }
 
-fn notified_while_sealed(seed: u64, threads: usize) {
+fn notified_from_two(seed: u64, threads: usize) {
     let dispatcher = Dispatcher::new(vec![vec![]], 1 + (seed % 3) as usize);
     let consumed = AtomicU64::new(0);
     let finishes = Mutex::new(Vec::new());
@@ -1396,7 +1374,7 @@ fn notified_while_sealed(seed: u64, threads: usize) {
                             dispatcher.acknowledge(package);
                         }
                         Next::Finish { pipeline, .. } => {
-                            finishes.lock().expect("no worker panics").push(0u64);
+                            finishes.lock().expect("no worker panics").push(pipeline.0);
                             dispatcher.finish(dispatcher.pushes(pipeline));
                         }
                         Next::Done => return,
@@ -1408,13 +1386,8 @@ fn notified_while_sealed(seed: u64, threads: usize) {
         }
     });
     assert_eq!(consumed.load(SeqCst), u64::MAX);
-    let mut finishes = finishes.into_inner().expect("no worker panics");
-    finishes.sort();
-    assert_eq!(
-        finishes,
-        (0..1).collect::<Vec<_>>(),
-        "the source finishes every epoch once"
-    );
+    let finishes = finishes.into_inner().expect("no worker panics");
+    assert_eq!(finishes, [0], "the source finishes once");
 }
 
 /// A notifying thread of a limited source waits for the workers: after each of its notifies of
@@ -1494,11 +1467,11 @@ fn a_notify_at_its_limit_returns_once_the_run_fails() {
     });
 }
 
-/// Two sources, one of the even keys and one of the odd, notified and sealed by one thread while
-/// workers claim, read by one pipeline: the reader takes a source's packages of an epoch once
-/// that source finished it and pushed them, and consumes each key once.
+/// Two sources, one of the even keys and one of the odd, notified by one thread while workers
+/// claim, read by one pipeline: the reader takes a source's packages once that source finished
+/// and pushed them, and consumes each key once.
 #[test]
-fn a_reader_of_two_sealed_sources() {
+fn a_reader_of_two_sources() {
     for iteration in 1..=60u64 {
         for threads in [1, 2, 8, 16] {
             let what = format!("iteration {iteration}, {threads} threads");
@@ -1512,8 +1485,7 @@ fn read_from_two(seed: u64, threads: usize) {
     let consumed = [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)];
     let finishes = Mutex::new(Vec::new());
     // Each claim of a package, logged after the claim returns, and each finish, logged before
-    // the finish lets a reader claim: (pipeline, epoch, whether it is a finish, the package's
-    // keys).
+    // the finish lets a reader claim: (pipeline, whether it is a finish, the package's keys).
     let log = Mutex::new(Vec::new());
     thread::scope(|scope| {
         let (dispatcher, consumed, finishes, log) = (&dispatcher, &consumed, &finishes, &log);
@@ -1535,9 +1507,7 @@ fn read_from_two(seed: u64, threads: usize) {
                         Next::Package(package) => {
                             let p = package.pipeline.0;
                             let mask = mask_of(&package.guard);
-                            log.lock()
-                                .expect("no worker panics")
-                                .push((p, 0u64, false, mask));
+                            log.lock().expect("no worker panics").push((p, false, mask));
                             jitter(&mut rng);
                             let before = consumed[p].fetch_or(mask, SeqCst);
                             assert_eq!(before & mask, 0, "pipeline {p} consumes each key once");
@@ -1547,13 +1517,10 @@ fn read_from_two(seed: u64, threads: usize) {
                             pipeline,
                             consumed: region,
                         } => {
-                            finishes
-                                .lock()
-                                .expect("no worker panics")
-                                .push((pipeline.0, 0u64));
+                            finishes.lock().expect("no worker panics").push(pipeline.0);
                             log.lock()
                                 .expect("no worker panics")
-                                .push((pipeline.0, 0u64, true, 0));
+                                .push((pipeline.0, true, 0));
                             let mut pushes = dispatcher.pushes(pipeline);
                             if let (true, Some(region)) = (pipeline.0 < 2, &region) {
                                 pushes.push(region, cut);
@@ -1575,34 +1542,26 @@ fn read_from_two(seed: u64, threads: usize) {
     );
     let mut finishes = finishes.into_inner().expect("no worker panics");
     finishes.sort();
-    let expected: Vec<_> = (0..3)
-        .flat_map(|p| (0..1).map(move |epoch| (p, epoch)))
-        .collect();
-    assert_eq!(
-        finishes, expected,
-        "every pipeline finishes every epoch once"
-    );
+    assert_eq!(finishes, [0, 1, 2], "every pipeline finishes once");
     let log = log.into_inner().expect("no worker panics");
     // The bits of the even keys: source 0 pushes only those, and source 1 only the odd ones.
     const EVEN: u64 = 0x5555_5555_5555_5555;
-    for (at, &(p, epoch, finish, mask)) in log.iter().enumerate() {
+    for (at, &(p, finish, mask)) in log.iter().enumerate() {
         if p == 2 && !finish {
             let source = usize::from(mask & EVEN == 0);
             assert!(
-                log[..at].contains(&(source, epoch, true, 0)),
-                "the reader claims a package of epoch {epoch} after source {source}, which \
-                 pushed it, finished it"
+                log[..at].contains(&(source, true, 0)),
+                "the reader claims a package after source {source}, which pushed it, finished"
             );
         }
     }
 }
 
-/// A source whose workers land a push of each package they consume, before acknowledging it,
-/// while one thread notifies and seals into a window of two, and other workers claim the reader's
-/// packages from its open queue. The reader consumes each key once, and claims a package only
-/// after the push that landed it.
+/// A source whose workers land a push of each package they consume, before acknowledging it, while
+/// one thread notifies, and other workers claim the reader's packages from its open queue. The
+/// reader consumes each key once, and claims a package only after the push that landed it.
 #[test]
-fn pushes_landed_mid_epoch_while_workers_claim() {
+fn pushes_landed_while_workers_claim() {
     for iteration in 1..=60u64 {
         for threads in [1, 2, 8, 16] {
             let what = format!("iteration {iteration}, {threads} threads");

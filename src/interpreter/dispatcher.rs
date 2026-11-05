@@ -1,16 +1,16 @@
 //! A dispatcher of work packages between the pipelines of a program, shared by the threads that
 //! claim them.
 //!
-//! A pipeline is a [`Breaker`] and the chain it owns; the breaker of a pipeline that another
-//! reads is a [`BreakingProducer`]. The dispatcher holds the graph of pipelines, a window of
-//! epochs in flight, and a queue of work packages per pipeline per epoch, each package one morsel
-//! of at most `morsel_rows` held rows. A queue is appended to while it is open, each slot written
-//! once, and read through atomic counters, so a claim takes no lock. A worker takes a lock to sleep
-//! while there is nothing to claim, and a change that can end a sleep takes it to wake the
-//! sleepers, only while there are some. The dispatcher holds no
-//! breaker, so it is `Sync` while the breakers are not `Send`. The single-threaded driver, [`run`],
-//! reaches the breakers through the handles its caller passes, indexed by pipeline. Nothing outside
-//! unit tests calls it, and only unit tests drive the dispatcher from several threads. See
+//! A pipeline is a [`Breaker`] and the chain it owns; the breaker of a pipeline that another reads
+//! is a [`BreakingProducer`]. The dispatcher holds the graph of pipelines and a queue of work
+//! packages per pipeline, each package one morsel of at most `morsel_rows` held rows. Each pipeline
+//! finishes once, when nothing more can be queued for it. A queue is appended to while it is open,
+//! each slot written once, and read through atomic counters, so a claim takes no lock. A worker
+//! takes a lock to sleep while there is nothing to claim, and a change that can end a sleep takes
+//! it to wake the sleepers, only while there are some. The dispatcher holds no breaker, so it is
+//! `Sync` while the breakers are not `Send`. The single-threaded driver, [`run`], reaches the
+//! breakers through the handles its caller passes, indexed by pipeline. Nothing outside unit tests
+//! calls it, and only unit tests drive the dispatcher from several threads. See
 //! `src/interpreter/design-operators.md`, "The dispatcher".
 
 use std::cell::{Cell, RefCell};
@@ -142,8 +142,8 @@ struct Queue {
     /// only while the queue is open, and a read of the count after the close is the last.
     reserved: AtomicUsize,
     /// The union of the guards appended, which the packages partition; `None` while none is.
-    /// Appends take it, and so does the move of the pipeline's epoch to finishing; a claim of a
-    /// package never does.
+    /// Appends take it, and so does the move of the pipeline to finishing; a claim of a package
+    /// never does.
     // shared-state-ok: the region a pipeline's packages partition, which appends grow and its
     // finish reads; what crosses it is a guard naming a region, never a tile.
     region: Mutex<Option<TileGuard>>,
@@ -312,46 +312,6 @@ impl Queue {
     }
 }
 
-/// One pipeline's queue and progress. A claim reads it without a lock.
-struct EpochPipeline {
-    queue: Queue,
-    /// The index of the next package to claim. It never passes `queue.reserved`.
-    claimed: AtomicUsize,
-    /// How many of the pipeline's packages have been acknowledged.
-    acknowledged: AtomicUsize,
-    phase: AtomicPhase,
-    /// How many of the pipelines it reads have not finished, plus one for the close of its
-    /// arrivals where it takes arrivals and reads pipelines ([`Dispatcher::take_arrivals`]).
-    /// Whichever brings it to zero closes the queue.
-    unfinished: AtomicUsize,
-}
-
-/// Every pipeline's queue and progress in the run.
-struct EpochState {
-    pipelines: Vec<EpochPipeline>,
-    /// How many pipelines have not finished. The finish that brings it to zero ends the run.
-    unfinished: AtomicUsize,
-}
-
-impl EpochState {
-    /// The progress of the pipelines `infos` describes, none begun.
-    fn new(infos: &[PipelineInfo]) -> Self {
-        EpochState {
-            pipelines: infos
-                .iter()
-                .map(|info| EpochPipeline {
-                    queue: Queue::new(),
-                    claimed: AtomicUsize::new(0),
-                    acknowledged: AtomicUsize::new(0),
-                    phase: AtomicPhase::new(Phase::Running),
-                    unfinished: AtomicUsize::new(info.reads.len() + usize::from(info.arrivals)),
-                })
-                .collect(),
-            unfinished: AtomicUsize::new(infos.len()),
-        }
-    }
-}
-
 /// What the dispatcher knows of one pipeline: where it sits in the graph and how it consumes.
 /// It is fixed before the dispatcher is shared, since the methods that set it take `&mut self`.
 struct PipelineInfo {
@@ -366,8 +326,8 @@ struct PipelineInfo {
     /// Whether it reads its breaker's input whole rather than what the pipelines it reads push
     /// ([`read_whole`](Dispatcher::read_whole)).
     whole: bool,
-    /// The pipelines it reads that it takes no push from, and whose finish of an epoch it waits
-    /// for before it takes a package there ([`follow`](Dispatcher::follow)).
+    /// The pipelines it reads that it takes no push from, and that it waits to be quiescent before
+    /// it takes a package ([`follow`](Dispatcher::follow)).
     follows: Vec<usize>,
     /// For a source, the most packages queued for it and not yet acknowledged that a notify finds
     /// before it queues more ([`limit`](Dispatcher::limit)); `usize::MAX` for none.
@@ -408,8 +368,17 @@ struct Parked {
     splits: bool,
 }
 
-/// What the dispatcher keeps of one pipeline across epochs.
+/// What the dispatcher keeps of one pipeline in the run: its queue and progress, which a claim
+/// reads without a lock, and what it has pushed, decided and parked.
 struct PipelineState {
+    queue: Queue,
+    /// The index of the next package to claim. It never passes `queue.reserved`.
+    claimed: AtomicUsize,
+    phase: AtomicPhase,
+    /// How many of the pipelines it reads have not finished, plus one for the close of its
+    /// arrivals where it takes arrivals and reads pipelines ([`Dispatcher::take_arrivals`]).
+    /// Whichever brings it to zero closes the queue.
+    unfinished: AtomicUsize,
     /// The region this pipeline's breaker has pushed to its reader, which each push grows by
     /// what it pushes. A push of a breaker's final guard pushes what is not in it.
     // shared-state-ok: the region a pipeline has pushed, which its pushes read and grow under the
@@ -423,11 +392,11 @@ struct PipelineState {
     // shared-state-ok: guards naming regions of the pipeline's input, which the decided pushes
     // of its sources grow under the lock; never a tile.
     decided: Mutex<Vec<Decided>>,
-    /// How many of a source's packages have been queued, in every epoch.
+    /// How many of a source's packages have been queued, which its limit counts against.
     queued: AtomicUsize,
-    /// How many of a source's packages have been acknowledged, in every epoch.
+    /// How many of the pipeline's packages have been acknowledged.
     acknowledged: AtomicUsize,
-    /// For an ordered pipeline, whether a package of it is in flight, in any epoch.
+    /// For an ordered pipeline, whether a package of it is in flight.
     in_flight: AtomicBool,
     /// For a pipeline that parks its arrivals ([`Dispatcher::park`]), the morsels notified that
     /// the pipelines it reads have not decided yet.
@@ -435,7 +404,7 @@ struct PipelineState {
     // decided pushes that release them read and write under the lock; never a tile.
     parked: Mutex<Vec<Parked>>,
     /// For a pipeline that parks the rows pushes bring, every row a push or a start has brought it,
-    /// queued or parked, in any epoch, `None` for none: two pushes can name one row, as a widened
+    /// queued or parked, `None` for none: two pushes can name one row, as a widened
     /// read's and a stream read's do, and the pipeline reads each row once
     /// ([`queue_or_park`](Dispatcher::queue_or_park)).
     // shared-state-ok: a guard naming a region of the pipeline's input, which the pushes to it grow
@@ -488,25 +457,25 @@ impl PipelineState {
     }
 }
 
-/// The graph of pipelines, the epochs in flight, the work packages queued for each pipeline in
-/// each epoch, and what each has consumed.
+/// The graph of pipelines, the work packages queued for each pipeline, and what each has consumed.
 pub struct Dispatcher {
     /// The most held rows a work package names.
     morsel_rows: usize,
     /// What each pipeline is, fixed before the dispatcher is shared.
     infos: Vec<PipelineInfo>,
-    /// What each pipeline has done across epochs, which the workers change.
+    /// What each pipeline has done, which the workers change.
     states: Vec<PipelineState>,
-    /// Every pipeline's queue and progress.
-    epoch: EpochState,
+    /// How many pipelines have not finished. The finish that brings it to zero ends the run.
+    unfinished: AtomicUsize,
     /// Set once every pipeline has finished.
     done: AtomicBool,
     /// Set by [`Dispatcher::fail`], and by every refusal before it panics ([`Dispatcher::ensure`]).
     failed: AtomicBool,
-    /// Advances at every change that can make a claim succeed or end the run: an append, a close, an acknowledgement that frees an ordered pipeline's next package, completes a
-    /// queue or returns credit to a limited source, a finish, and a failure. It also advances when
-    /// a claim of an ordered pipeline that found nothing finds a package queued while it looked,
-    /// for a claim that found the pipeline's flag held meanwhile.
+    /// Advances at every change that can make a claim succeed or end the run: an append, a close,
+    /// an acknowledgement that frees an ordered pipeline's next package, completes a queue or
+    /// returns credit to a limited source, a finish, and a failure. It also advances when a claim
+    /// of an ordered pipeline that found nothing finds a package queued while it looked, for a
+    /// claim that found the pipeline's flag held meanwhile.
     generation: AtomicU64,
     /// How many threads sleep in [`Dispatcher::wait`]. An advance takes the `sleep` lock only when
     /// it is not zero.
@@ -525,16 +494,15 @@ pub struct Dispatcher {
 
 impl Dispatcher {
     /// The dispatcher of the pipelines `reads` describes: `reads[p]` lists the pipelines `p`
-    /// reads. A work package names at most `morsel_rows` held rows. Epoch 0 is open, and the
-    /// window holds [`DEFAULT_WINDOW`] epochs.
+    /// reads. A work package names at most `morsel_rows` held rows.
     ///
     /// # Panics
     ///
     /// When `morsel_rows` is zero, when a pipeline reads one that does not exist or reads one
     /// pipeline twice, or when the graph has a cycle. Several pipelines may read one: a `FanOut`
     /// between them keeps the release of one from removing what another has still to read. A
-    /// pipeline may read several, and its queue in an epoch closes at the finish of the last of
-    /// them, and for one that takes arrivals beside them also at the epoch's seal or its close
+    /// pipeline may read several, and its queue closes at the finish of the last of them, and for
+    /// one that takes arrivals beside them also at its close
     /// ([`take_arrivals`](Self::take_arrivals)). A pipeline in a cycle would wait for itself to
     /// finish.
     pub fn new(reads: Vec<Vec<usize>>, morsel_rows: usize) -> Self {
@@ -578,8 +546,13 @@ impl Dispatcher {
                 whole_only: Vec::new(),
             })
             .collect();
-        let states = (0..count)
-            .map(|_| PipelineState {
+        let states = infos
+            .iter()
+            .map(|info: &PipelineInfo| PipelineState {
+                queue: Queue::new(),
+                claimed: AtomicUsize::new(0),
+                phase: AtomicPhase::new(Phase::Running),
+                unfinished: AtomicUsize::new(info.reads.len()),
                 pushed: Mutex::new(None),
                 closed: AtomicBool::new(false),
                 decided: Mutex::new(Vec::new()),
@@ -590,12 +563,11 @@ impl Dispatcher {
                 brought: Mutex::new(None),
             })
             .collect();
-        let epoch = EpochState::new(&infos);
         Self {
             morsel_rows,
+            unfinished: AtomicUsize::new(infos.len()),
             infos,
             states,
-            epoch,
             done: AtomicBool::new(false),
             failed: AtomicBool::new(false),
             generation: AtomicU64::new(0),
@@ -620,26 +592,25 @@ impl Dispatcher {
     /// queues something. A row it parks waits for a decision no consume of the round makes. A
     /// loop's rounds run on one thread, so a round's pipelines are quiescent once the round has
     /// run all it queued.
-    fn quiescent(&self, pipeline: usize, epoch: &EpochState) -> bool {
-        let state = &epoch.pipelines[pipeline];
+    fn quiescent(&self, pipeline: usize) -> bool {
+        let state = &self.states[pipeline];
         let reserved = state.queue.reserved();
         state.claimed.load(Ordering::Acquire) == reserved
             && state.acknowledged.load(Ordering::Acquire) == reserved
             && self.infos[pipeline]
                 .reads
                 .iter()
-                .all(|&read| self.quiescent(read, epoch))
+                .all(|&read| self.quiescent(read))
     }
 
-    /// Queue `guard`, a guard of the input of `reader`'s breaker, as a package of `reader` in the
-    /// current epoch, less what is queued for it there already: at the start, what a range brings
-    /// that no push names ([`run_program`]). A reader that parks parks what the pipelines it
-    /// reads have not decided, and a release hands out the part they decide.
+    /// Queue `guard`, a guard of the input of `reader`'s breaker, as a package of `reader`, less
+    /// what is queued for it already: at the start, what a range brings that no push names
+    /// ([`run_program`]). A reader that parks parks what the pipelines it reads have not decided,
+    /// and a release hands out the part they decide.
     ///
     /// # Panics
     ///
-    /// When `reader`'s queue in the current epoch has closed: every pipeline it reads has
-    /// finished the epoch.
+    /// When `reader`'s queue has closed: every pipeline it reads has finished.
     pub(crate) fn queue_for(&self, reader: PipelineId, guard: &TileGuard) {
         self.queue_in_current(reader, guard, false);
     }
@@ -654,13 +625,12 @@ impl Dispatcher {
     }
 
     fn queue_in_current(&self, reader: PipelineId, guard: &TileGuard, round: bool) {
-        let epoch = &self.epoch;
         if self.infos[reader.0].parks {
-            self.queue_or_park(epoch, reader.0, guard, round);
+            self.queue_or_park(reader.0, guard, round);
             self.advance();
             return;
         }
-        let queue = &epoch.pipelines[reader.0].queue;
+        let queue = &self.states[reader.0].queue;
         let appended = match round {
             true => queue.append_again(guard),
             false => queue.append_unqueued(guard),
@@ -679,10 +649,10 @@ impl Dispatcher {
     }
 
     /// Order `reader`'s rounds after `read`'s, a pipeline it reads, in a loop's scope: `reader`
-    /// takes no push of `read`'s, and takes a package in an epoch, a round, only once `read` has
-    /// finished it. A scope's planner orders two edges so, where a pipeline cannot park: a nested
-    /// loop's scope after the pipelines its rounds pull, and a reader after a nested loop's scope,
-    /// which pushes its store only once it is terminal.
+    /// takes no push of `read`'s, and takes a package only once `read` is quiescent
+    /// ([`quiescent`](Self::quiescent)), having run the round. A scope's planner orders two edges
+    /// so, where a pipeline cannot park: a nested loop's scope after the pipelines its rounds pull,
+    /// and a reader after a nested loop's scope, which pushes its store only once it is terminal.
     ///
     /// # Panics
     ///
@@ -719,31 +689,29 @@ impl Dispatcher {
     }
 
     /// Mark `pipeline`, which reads pipelines, as also taking the arrivals of live sources: it is
-    /// notified, sealed and closed as a source is ([`notify`](Self::notify), [`seal`](Self::seal),
-    /// [`close`](Self::close)), and its queue in an epoch closes once both the epoch's seal and the
-    /// finishes of the pipelines it reads have happened. It takes an arrival once those pipelines
-    /// have decided it ([`park`](Self::park)) or have finished the epoch ([`follow`](Self::follow)).
+    /// notified and closed as a source is ([`notify`](Self::notify), [`close`](Self::close)), and
+    /// its queue closes once both its close and the finishes of the pipelines it reads have
+    /// happened. It takes an arrival once those pipelines have decided it ([`park`](Self::park)) or
+    /// are quiescent ([`follow`](Self::follow)).
     ///
     /// # Panics
     ///
     /// When `pipeline` reads no pipeline or takes arrivals already, and when a source has been
-    /// notified, sealed or closed already.
+    /// notified or closed already.
     pub fn take_arrivals(&mut self, pipeline: PipelineId) {
         self.mark_arrivals(pipeline);
     }
 
     /// Park `pipeline`'s arrivals until the pipelines it reads have decided them: a notify of a
-    /// region they have not all decided keeps its morsels outside every epoch, and the decided
-    /// push that covers a morsel appends it to the pipeline's queue in the push's epoch
-    /// ([`record_decided`](Self::record_decided)). An epoch before then finishes without them,
-    /// so the pipelines that read `pipeline` move on. A loop's scope or a transaction store, whose
+    /// region they have not all decided keeps its morsels out of the queue, and the decided push
+    /// that covers a morsel appends it to the pipeline's queue
+    /// ([`record_decided`](Self::record_decided)). A loop's scope or a transaction store, whose
     /// steps pull the pipelines it reads, takes each delivery so once what it pulls is final
     /// (`src/interpreter/design-operators.md`, "Parking arrivals until a read is decided").
     ///
     /// # Panics
     ///
-    /// When `pipeline` reads no pipeline, and when a source has been notified, sealed or closed
-    /// already.
+    /// When `pipeline` reads no pipeline, and when a source has been notified or closed already.
     pub fn park(&mut self, pipeline: PipelineId) {
         let p = pipeline.0;
         assert!(
@@ -762,8 +730,8 @@ impl Dispatcher {
 
     /// Mark `pipeline` as a store's seed input, which the store's other pipelines read: a store
     /// opens before it steps, so once `pipeline` has consumed a package, the seeds are read and
-    /// the store is open, and each of its readers records it wholly decided at the finish of that
-    /// epoch, which releases what they parked ([`park`](Self::park)). A writer's pipeline that
+    /// the store is open, and each of its readers records it wholly decided at its finish, which
+    /// releases what they parked ([`park`](Self::park)). A writer's pipeline that
     /// reads its input whole takes it only once that record covers it, and one over a live source
     /// parks each delivery until then.
     ///
@@ -850,12 +818,12 @@ impl Dispatcher {
         })
     }
 
-    /// Queue `guard`, rows a push or the dispatcher's caller brings `reader`, which parks, in
-    /// `epoch` where every pipeline it reads has decided them, and park the rest
-    /// ([`park`](Self::park)). Of a push, only what no push or queue brought before, in any epoch,
-    /// is new. What the caller queues is queued whole (`again`): a loop's closing round has each
-    /// inner pipeline read its row again, which then states the row complete.
-    fn queue_or_park(&self, epoch: &EpochState, reader: usize, guard: &TileGuard, again: bool) {
+    /// Queue `guard`, rows a push or the dispatcher's caller brings `reader`, which parks, where
+    /// every pipeline it reads has decided them, and park the rest ([`park`](Self::park)). Of a
+    /// push, only what no push or queue brought before is new. What the caller queues is queued
+    /// whole (`again`): a loop's closing round has each inner pipeline read its row again, which
+    /// then states the row complete.
+    fn queue_or_park(&self, reader: usize, guard: &TileGuard, again: bool) {
         let mut parked = self.states[reader]
             .parked
             .lock()
@@ -896,7 +864,7 @@ impl Dispatcher {
         if decided.is_empty() {
             return;
         }
-        let queue = &epoch.pipelines[reader].queue;
+        let queue = &self.states[reader].queue;
         let appended = match again {
             true => queue.append_again(&decided),
             false => queue.append_unqueued(&decided),
@@ -909,10 +877,9 @@ impl Dispatcher {
     }
 
     /// Append the morsels `reader` parked that the pipelines it reads have now decided to its
-    /// queue in `epoch` ([`park`](Self::park)). A decided push lands before the pushing pipeline
-    /// counts its finish toward `reader`'s close, and a range's lands in the current epoch before
-    /// its seal, so `reader`'s queue in `epoch` is open.
-    fn release_parked(&self, epoch: &EpochState, reader: usize) {
+    /// queue ([`park`](Self::park)). A decided push lands before the pushing pipeline counts its
+    /// finish toward `reader`'s close, so `reader`'s queue is open.
+    fn release_parked(&self, reader: usize) {
         let released: Vec<(TileGuard, bool)> = {
             let mut parked = self.states[reader]
                 .parked
@@ -946,7 +913,7 @@ impl Dispatcher {
         if released.is_empty() {
             return;
         }
-        let queue = &epoch.pipelines[reader].queue;
+        let queue = &self.states[reader].queue;
         // A pipeline that takes arrivals parks the morsels its sources' notifies cut, which count
         // toward a source's packages; any other parks the rows pushes bring, which two pushes can
         // both name, so each is queued less what is queued already.
@@ -959,7 +926,7 @@ impl Dispatcher {
                     released.into_iter().map(|(morsel, _)| morsel).collect();
                 queue.append(reader, &morsels)
             }
-            // A round's row is read again whole in a run that no seal ends ([`Parked`]).
+            // A round's row is read again whole ([`Parked`]).
             false => released.iter().all(|(morsel, again)| match *again {
                 true => queue.append_again(morsel),
                 false => queue.append_unqueued(morsel),
@@ -986,38 +953,36 @@ impl Dispatcher {
         );
         info.arrivals = true;
         // The progress was made before the mark, so its count gains the close of the arrivals.
-        self.epoch.pipelines[p]
-            .unfinished
-            .fetch_add(1, Ordering::AcqRel);
+        self.states[p].unfinished.fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Whether `pipeline` is notified, sealed and closed: a source, or a pipeline that takes
-    /// arrivals beside the pipelines it reads ([`take_arrivals`](Self::take_arrivals)).
+    /// Whether `pipeline` is notified and closed: a source, or a pipeline that takes arrivals
+    /// beside the pipelines it reads ([`take_arrivals`](Self::take_arrivals)).
     fn takes_arrivals(&self, pipeline: usize) -> bool {
         self.infos[pipeline].reads.is_empty() || self.infos[pipeline].arrivals
     }
 
-    /// End the arrivals of `pipeline`, which takes arrivals, in `epoch`: a source's queue there
-    /// closes, and a pipeline that also reads pipelines counts the end toward its close
+    /// End the arrivals of `pipeline`, which takes arrivals: a source's queue closes, and a
+    /// pipeline that also reads pipelines counts the end toward its close
     /// ([`count_toward_close`](Self::count_toward_close)).
-    fn end_arrivals(&self, epoch: &EpochState, pipeline: usize) {
+    fn end_arrivals(&self, pipeline: usize) {
         match self.infos[pipeline].reads.is_empty() {
             true => {
-                epoch.pipelines[pipeline].queue.close();
+                self.states[pipeline].queue.close();
             }
-            false => self.count_toward_close(epoch, pipeline),
+            false => self.count_toward_close(pipeline),
         }
     }
 
-    /// Count one feed of `reader`'s queue in `epoch` finished: a pipeline it reads, or the end of
+    /// Count one feed of `reader`'s queue finished: a pipeline it reads, or the end of
     /// its arrivals. The last of them closes the queue.
     ///
     /// # Panics
     ///
     /// When the queue was closed already.
-    fn count_toward_close(&self, epoch: &EpochState, reader: usize) {
+    fn count_toward_close(&self, reader: usize) {
         // The decrement orders the appends of every earlier event before the close.
-        let unfinished = epoch.pipelines[reader]
+        let unfinished = self.states[reader]
             .unfinished
             .fetch_sub(1, Ordering::AcqRel);
         debug_assert!(
@@ -1027,7 +992,7 @@ impl Dispatcher {
         if unfinished != 1 {
             return;
         }
-        let closed = epoch.pipelines[reader].queue.close();
+        let closed = self.states[reader].queue.close();
         self.ensure(closed, || {
             format!("pipeline {reader} receives packages once")
         });
@@ -1038,13 +1003,7 @@ impl Dispatcher {
     /// reads that shares `source`'s breaker shares, since a store's pipelines push one store's
     /// decided region ([`share_pushes`](Self::share_pushes)); or `reader` itself, for the ranges
     /// in its own chain.
-    fn record_decided(
-        &self,
-        epoch: &EpochState,
-        reader: usize,
-        source: usize,
-        guard: Option<&TileGuard>,
-    ) {
+    fn record_decided(&self, reader: usize, source: usize, guard: Option<&TileGuard>) {
         let reads = &self.infos[reader].reads;
         // A store's decided push reaches its own pipelines around its recurrence, which is no
         // read: a pipeline of a store reads a sibling only for its seed input's consume
@@ -1086,17 +1045,17 @@ impl Dispatcher {
         }
         drop(decided);
         if self.infos[reader].parks {
-            self.release_parked(epoch, reader);
+            self.release_parked(reader);
         }
     }
 
     /// Whether a claim may take `pipeline`'s packages: once every pipeline it follows
     /// ([`follow`](Self::follow)) is quiescent ([`quiescent`](Self::quiescent)).
-    fn takes_from(&self, pipeline: usize, epoch: &EpochState) -> bool {
+    fn takes_from(&self, pipeline: usize) -> bool {
         self.infos[pipeline]
             .follows
             .iter()
-            .all(|&read| self.quiescent(read, epoch))
+            .all(|&read| self.quiescent(read))
     }
 
     /// Mark `pipeline`, which reads a pipeline, as consuming its breaker's input whole, `input`
@@ -1142,10 +1101,9 @@ impl Dispatcher {
             );
     }
 
-    /// Mark `pipeline` as consuming its morsels one at a time, epoch by epoch: every morsel of an
-    /// epoch in the order it was queued, then the epoch's finish, then the next epoch's. Its
-    /// breaker's state advances through them in order, as a loop's store decides its positions
-    /// ascending.
+    /// Mark `pipeline` as consuming its morsels one at a time, in the order they were queued, then
+    /// its finish. Its breaker's state advances through them in order, as a loop's store decides
+    /// its positions ascending.
     pub fn order(&mut self, pipeline: PipelineId) {
         self.infos[pipeline.0].ordered = true;
     }
@@ -1174,7 +1132,7 @@ impl Dispatcher {
     }
 
     /// Let a notify of the source `pipeline` queue more only while fewer than `packages` of its
-    /// packages are queued and not acknowledged, in every epoch: [`notify`](Self::notify) waits
+    /// packages are queued and not acknowledged: [`notify`](Self::notify) waits
     /// until then, and [`try_notify`](Self::try_notify) answers that it did not queue. A notify
     /// admitted below the limit queues all its morsels, so the packages outstanding exceed
     /// `packages` by at most one notify's morsels less one, for one thread that notifies.
@@ -1225,7 +1183,7 @@ impl Dispatcher {
         panic!("{message}");
     }
 
-    /// The state of `pipeline` across epochs.
+    /// The state of `pipeline`.
     ///
     /// # Panics
     ///
@@ -1255,7 +1213,7 @@ impl Dispatcher {
         }
     }
 
-    /// Queue a source pipeline's input in the current epoch and close the source: `input`, the
+    /// Queue a source pipeline's input and close the source: `input`, the
     /// tiling its breaker's input answers, less `released`, what the breaker's input has already
     /// released, as one package per morsel ([`seed`]). A run's first start passes nothing
     /// released; a run after a pause or a reload starts over a breaker that consumed, and queues
@@ -1288,10 +1246,9 @@ impl Dispatcher {
         self.close(pipeline);
     }
 
-    /// Queue `guard`, a region of a source pipeline's input that has arrived, in the current
-    /// epoch, as one package per morsel: every `morsel_rows` positions, where `guard` names finite
-    /// runs of positions (`Value::UInt` keys), and whole otherwise. The workers claim them while
-    /// the epoch runs.
+    /// Queue `guard`, a region of a source pipeline's input that has arrived, as one package per
+    /// morsel: every `morsel_rows` positions, where `guard` names finite runs of positions
+    /// (`Value::UInt` keys), and whole otherwise. The workers claim them as they are queued.
     ///
     /// A source [limited](Self::limit) to as many packages outstanding as it has waits until one
     /// is acknowledged, so the thread that notifies is held back by the workers. After a failure
@@ -1300,8 +1257,7 @@ impl Dispatcher {
     /// # Panics
     ///
     /// When `pipeline` takes no arrivals ([`take_arrivals`](Self::take_arrivals))
-    /// or is closed; in a debug build, when `guard` meets a region queued for a source before in
-    /// the epoch.
+    /// or is closed; in a debug build, when `guard` meets a region queued for a source before.
     pub fn notify(&self, pipeline: PipelineId, guard: &TileGuard) {
         loop {
             // Read before the check: an acknowledgement the check misses advances the generation
@@ -1329,11 +1285,12 @@ impl Dispatcher {
         let info = &self.infos[pipeline.0];
         debug_assert!(
             info.parks || info.reads.iter().all(|read| info.follows.contains(read)),
-            "pipeline {} parks no arrival, so it takes one only after every pipeline it reads has \
-             finished the epoch, which it follows",
+            "pipeline {} parks no arrival, so it takes one only once every pipeline it reads is \
+             quiescent, which it follows",
             pipeline.0
         );
-        if self.state(pipeline).outstanding() >= info.limit {
+        // A limit is a source's alone (`limit`), whose every package its notifies queue.
+        if info.limit != usize::MAX && self.state(pipeline).outstanding() >= info.limit {
             return false;
         }
         let morsels = cut_positions(guard, self.morsel_rows);
@@ -1387,7 +1344,7 @@ impl Dispatcher {
         // Counted before the append makes the packages claimable, so an acknowledgement never
         // runs ahead of the count `outstanding` subtracts it from.
         state.queued.fetch_add(morsels.len(), Ordering::AcqRel);
-        let appended = self.epoch.pipelines[p].queue.append(p, morsels);
+        let appended = self.states[p].queue.append(p, morsels);
         self.ensure(appended, || {
             format!("pipeline {p} is queued nothing once it is closed")
         });
@@ -1414,19 +1371,18 @@ impl Dispatcher {
         });
         let closed = !state.closed.swap(true, Ordering::AcqRel);
         self.ensure(closed, || format!("pipeline {p} closes its queue once"));
-        self.end_arrivals(&self.epoch, p);
+        self.end_arrivals(p);
         self.advance();
     }
 
     /// The package at the front of `pipeline`'s queue, recorded as claimed, where a claim may take
     /// one. An ordered pipeline has at most one package in flight.
     fn claim_from(&self, pipeline: usize) -> Option<WorkPackage> {
-        let epoch = &self.epoch;
-        if !self.takes_from(pipeline, epoch) {
+        if !self.takes_from(pipeline) {
             return None;
         }
         if !self.infos[pipeline].ordered {
-            return Self::claim_in(pipeline, epoch);
+            return self.claim_in(pipeline);
         }
         let state = &self.states[pipeline];
         // The flag is held while the claim looks, so at most one claim of the pipeline looks at
@@ -1438,7 +1394,7 @@ impl Dispatcher {
         {
             return None;
         }
-        let package = Self::claim_in(pipeline, epoch);
+        let package = self.claim_in(pipeline);
         if package.is_none() {
             state.in_flight.store(false, Ordering::SeqCst);
             // A claim that found the flag held answered nothing for the pipeline, and may wait on
@@ -1447,25 +1403,24 @@ impl Dispatcher {
             // after the release sees that package's advance and every write before it, and a
             // second look finds the package and wakes that claim.
             self.generation.load(Ordering::SeqCst);
-            if Self::claimable(pipeline, epoch) {
+            if self.claimable(pipeline) {
                 self.advance();
             }
         }
         package
     }
 
-    /// Whether the package at the front of `pipeline`'s queue in `epoch` is written and not
-    /// claimed.
-    fn claimable(pipeline: usize, epoch: &EpochState) -> bool {
-        let state = &epoch.pipelines[pipeline];
+    /// Whether the package at the front of `pipeline`'s queue is written and not claimed.
+    fn claimable(&self, pipeline: usize) -> bool {
+        let state = &self.states[pipeline];
         let index = state.claimed.load(Ordering::Acquire);
         index < state.queue.reserved() && state.queue.written(index).is_some()
     }
 
-    /// The package at the front of `pipeline`'s queue in `epoch`, recorded as claimed, where it
-    /// has one written.
-    fn claim_in(pipeline: usize, epoch: &EpochState) -> Option<WorkPackage> {
-        let state = &epoch.pipelines[pipeline];
+    /// The package at the front of `pipeline`'s queue, recorded as claimed, where it has one
+    /// written.
+    fn claim_in(&self, pipeline: usize) -> Option<WorkPackage> {
+        let state = &self.states[pipeline];
         loop {
             // A claim moves `claimed` by compare and exchange, so it never passes a package a
             // later append writes: the index it takes is one whose slot it read written.
@@ -1492,7 +1447,7 @@ impl Dispatcher {
     /// acknowledged. Its queue closes once nothing more can be queued for it, so the finish is
     /// its last.
     fn ready(&self, pipeline: usize) -> bool {
-        let state = &self.epoch.pipelines[pipeline];
+        let state = &self.states[pipeline];
         // One read of the count and the close: nothing is reserved after the close, so the count
         // of a closed queue is its last.
         let reserved = state.queue.reserved.load(Ordering::Acquire);
@@ -1524,14 +1479,12 @@ impl Dispatcher {
             return Next::Package(package);
         }
         for p in 0..count {
-            let begun = self.ready(p)
-                && self.epoch.pipelines[p]
-                    .phase
-                    .moved(Phase::Running, Phase::Finishing);
+            let begun =
+                self.ready(p) && self.states[p].phase.moved(Phase::Running, Phase::Finishing);
             if begun {
                 return Next::Finish {
                     pipeline: PipelineId(p),
-                    consumed: self.epoch.pipelines[p].queue.region(),
+                    consumed: self.states[p].queue.region(),
                 };
             }
         }
@@ -1578,17 +1531,15 @@ impl Dispatcher {
     ///
     /// # Panics
     ///
-    /// When `package` is not one a claim handed out for its pipeline and epoch and not yet
-    /// acknowledged.
+    /// When `package` is not one a claim handed out for its pipeline and not yet acknowledged.
     pub fn acknowledge(&self, package: WorkPackage) {
         if self.failed.load(Ordering::SeqCst) {
             return;
         }
         let p = package.pipeline.0;
         let state = self.state(package.pipeline);
-        let in_epoch = &self.epoch.pipelines[p];
-        let held = package.index < in_epoch.claimed.load(Ordering::Acquire)
-            && in_epoch.queue.slot(package.index).is_some_and(|slot| {
+        let held = package.index < state.claimed.load(Ordering::Acquire)
+            && state.queue.slot(package.index).is_some_and(|slot| {
                 slot.guard.get() == Some(&package.guard)
                     && !slot.is_acknowledged.swap(true, Ordering::AcqRel)
             });
@@ -1610,10 +1561,7 @@ impl Dispatcher {
             pipeline: package.pipeline,
             guard: package.guard,
         });
-        if self.infos[p].reads.is_empty() {
-            state.acknowledged.fetch_add(1, Ordering::AcqRel);
-        }
-        let acknowledged = in_epoch.acknowledged.fetch_add(1, Ordering::AcqRel) + 1;
+        let acknowledged = state.acknowledged.fetch_add(1, Ordering::AcqRel) + 1;
         if self.infos[p].ordered {
             state.in_flight.store(false, Ordering::Release);
         }
@@ -1622,7 +1570,7 @@ impl Dispatcher {
         // notify.
         if self.infos[p].ordered
             || self.infos[p].limit != usize::MAX
-            || acknowledged == in_epoch.queue.reserved()
+            || acknowledged == state.queue.reserved()
         {
             self.advance();
         }
@@ -1637,7 +1585,7 @@ impl Dispatcher {
     pub fn begin_finish(&self, pipeline: PipelineId) -> Option<TileGuard> {
         let p = pipeline.0;
         self.state(pipeline);
-        let state = &self.epoch.pipelines[p];
+        let state = &self.states[p];
         self.ensure(state.phase.load() == Phase::Running, || {
             format!("pipeline {p} finishes once")
         });
@@ -1654,7 +1602,7 @@ impl Dispatcher {
             self.infos[p]
                 .reads
                 .iter()
-                .all(|read| self.epoch.pipelines[*read].phase.load() == Phase::Finished),
+                .all(|read| self.states[*read].phase.load() == Phase::Finished),
             || format!("pipeline {p} finishes after every pipeline it reads has finished"),
         );
         // A source's queue is closed by its close. A pipeline that reads others has its queue
@@ -1689,15 +1637,14 @@ impl Dispatcher {
         if self.failed.load(Ordering::SeqCst) {
             return;
         }
-        let epoch = &self.epoch;
-        self.land_decided(epoch, p, decided.as_ref(), pushes.to.as_ref());
+        self.land_decided(p, decided.as_ref(), pushes.to.as_ref());
         if morsels.is_empty() {
             return;
         }
-        self.ensure(epoch.pipelines[p].phase.load() != Phase::Finished, || {
+        self.ensure(self.states[p].phase.load() != Phase::Finished, || {
             format!("pipeline {p} lands its pushes before it finishes")
         });
-        self.land_in(epoch, p, &morsels, pushes.to.as_ref());
+        self.land_in(p, &morsels, pushes.to.as_ref());
         self.advance();
     }
 
@@ -1712,12 +1659,11 @@ impl Dispatcher {
     /// `pipeline` is the pushing pipeline, or, for a range in its own chain, the pipeline itself.
     fn land_decided(
         &self,
-        epoch: &EpochState,
         pipeline: usize,
         decided: Option<&Projection>,
         to: Option<&SharedConsumer>,
     ) {
-        self.land_decided_from(epoch, pipeline, decided, to, true);
+        self.land_decided_from(pipeline, decided, to, true);
     }
 
     /// Push `decided`, the region of its keys a range in `pipeline`'s chain has decided, through
@@ -1731,14 +1677,13 @@ impl Dispatcher {
         decided: &Projection,
         to: &SharedConsumer,
     ) {
-        self.land_decided_from(&self.epoch, pipeline.0, Some(decided), Some(to), false);
+        self.land_decided_from(pipeline.0, Some(decided), Some(to), false);
     }
 
     /// [`land_decided`](Self::land_decided), applying its rule for readers a push reaches no
     /// entry of only where `pulled` says the push is a breaker's, which its readers read.
     fn land_decided_from(
         &self,
-        epoch: &EpochState,
         pipeline: usize,
         decided: Option<&Projection>,
         to: Option<&SharedConsumer>,
@@ -1757,7 +1702,6 @@ impl Dispatcher {
                 whole,
                 reached: Vec::new(),
                 range: !pulled,
-                epoch,
             },
             from: pipeline,
             widened: false,
@@ -1769,7 +1713,7 @@ impl Dispatcher {
         if whole && pulled {
             for &reader in &self.infos[pipeline].readers {
                 if !reached.contains(&reader) {
-                    self.record_decided(epoch, reader, pipeline, None);
+                    self.record_decided(reader, pipeline, None);
                 }
             }
         }
@@ -1800,24 +1744,15 @@ impl Dispatcher {
             .unwrap_or_default()
     }
 
-    /// Push `morsels`, pushed by `pipeline` in `epoch`, through `to`, its breaker's consumer, one
-    /// region of the breaker's keys per morsel, a projection at any level. Each reader's queue
-    /// there stays open until the last pipeline it reads finishes the epoch.
-    fn land_in(
-        &self,
-        epoch: &EpochState,
-        pipeline: usize,
-        morsels: &[TileGuard],
-        to: Option<&SharedConsumer>,
-    ) {
+    /// Push `morsels`, pushed by `pipeline`, through `to`, its breaker's consumer, one region of
+    /// the breaker's keys per morsel, a projection at any level. Each reader's queue stays open
+    /// until the last pipeline it reads finishes.
+    fn land_in(&self, pipeline: usize, morsels: &[TileGuard], to: Option<&SharedConsumer>) {
         if morsels.is_empty() {
             return;
         }
         let mut landing = Landing {
-            target: Target::Queue {
-                dispatcher: self,
-                epoch,
-            },
+            target: Target::Queue { dispatcher: self },
             from: pipeline,
             widened: false,
         };
@@ -1866,8 +1801,7 @@ impl Dispatcher {
         if self.failed.load(Ordering::SeqCst) {
             return;
         }
-        let epoch = &self.epoch;
-        let finished = epoch.pipelines[p]
+        let finished = self.states[p]
             .phase
             .moved(Phase::Finishing, Phase::Finished);
         self.ensure(finished, || {
@@ -1876,7 +1810,7 @@ impl Dispatcher {
         // Recorded before the reader's queue is closed, which lets the reader finish.
         #[cfg(test)]
         self.record(Event::Finish(PipelineId(p)));
-        self.land_decided(epoch, p, decided.as_ref(), pushes.to.as_ref());
+        self.land_decided(p, decided.as_ref(), pushes.to.as_ref());
         // At its finish every pipeline it reads has decided all of what it reaches (the
         // planner's end-of-run check), so nothing stays parked.
         {
@@ -1893,24 +1827,24 @@ impl Dispatcher {
         }
         // The store's own pipelines wait for its seed input's consume; a reader of the store
         // reads that pipeline too, but waits for what the store decides.
-        if self.infos[p].opens && epoch.pipelines[p].acknowledged.load(Ordering::Acquire) > 0 {
+        if self.infos[p].opens && self.states[p].acknowledged.load(Ordering::Acquire) > 0 {
             for &reader in &self.infos[p].readers {
                 if self.infos[reader].pushes_with == self.infos[p].pushes_with {
-                    self.record_decided(epoch, reader, p, None);
+                    self.record_decided(reader, p, None);
                 }
             }
         }
-        self.land_in(epoch, p, &morsels, pushes.to.as_ref());
+        self.land_in(p, &morsels, pushes.to.as_ref());
         for &reader in &self.infos[p].readers {
-            self.count_toward_close(epoch, reader);
+            self.count_toward_close(reader);
         }
-        if epoch.unfinished.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.unfinished.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.done.store(true, Ordering::Release);
         }
         self.advance();
     }
 
-    /// How many of `pipeline`'s packages are queued and not acknowledged, in every epoch.
+    /// How many of `pipeline`'s packages are queued and not acknowledged.
     #[cfg(test)]
     pub(crate) fn outstanding(&self, pipeline: PipelineId) -> usize {
         self.state(pipeline).outstanding()
@@ -2043,11 +1977,11 @@ impl Drop for Worker<'_> {
     }
 }
 
-/// What a breaker pushes through in one epoch: one morsel of its keys per work package. The
-/// dispatcher [lands](Dispatcher::land) them, as the driver does after each consume, or
-/// [finishes](Dispatcher::finish) the pipeline's epoch: each morsel climbs the breaker's consumer
-/// as a push ([`Consumer::push`]), each operator on the way restates it in its own keys, and the
-/// [`Entry`] of each breaker it reaches queues it for that breaker's pipeline in the epoch.
+/// What a breaker pushes through: one morsel of its keys per work package. The dispatcher
+/// [lands](Dispatcher::land) them, as the driver does after each consume, or
+/// [finishes](Dispatcher::finish) the pipeline: each morsel climbs the breaker's consumer as a push
+/// ([`Consumer::push`]), each operator on the way restates it in its own keys, and the [`Entry`] of
+/// each breaker it reaches queues it for that breaker's pipeline.
 pub struct Pushes<'d> {
     dispatcher: &'d Dispatcher,
     pipeline: usize,
@@ -2064,8 +1998,8 @@ impl Pushes<'_> {
     /// less the region pushed, for the pipelines that read it: one package per morsel the breaker
     /// cuts it into, in the breaker's order. A push of nothing new pushes nothing, and so does a
     /// breaker no pipeline reads. The difference and the region's growth are one step under the
-    /// region's lock, so two pushes of one pipeline from two threads push disjoint regions, and an
-    /// epoch's finish pushes only what no earlier finish pushed.
+    /// region's lock, so two pushes of one pipeline from two threads push disjoint regions, and a
+    /// finish pushes only what no consume pushed.
     ///
     /// # Panics
     ///
@@ -2168,9 +2102,8 @@ impl Drop for Pushes<'_> {
     }
 }
 
-/// Where a push lands: its target, which queues it in an epoch or, in a planner's probe, records
-/// it; the pipeline that pushed it; and whether an operator on the path it is climbing widened
-/// it.
+/// Where a push lands: its target, which queues it or, in a planner's probe, records it; the
+/// pipeline that pushed it; and whether an operator on the path it is climbing widened it.
 pub struct Landing<'d> {
     target: Target<'d>,
     from: usize,
@@ -2179,11 +2112,8 @@ pub struct Landing<'d> {
 
 /// What a [`Landing`] does with the regions that reach an [`Entry`].
 enum Target<'d> {
-    /// Queues each in the reader's queue for the epoch.
-    Queue {
-        dispatcher: &'d Dispatcher,
-        epoch: &'d EpochState,
-    },
+    /// Queues each in the reader's queue.
+    Queue { dispatcher: &'d Dispatcher },
     /// Records each, for a planner that probes which region of a reader's input a pipeline's push
     /// names; which edges keep keys the planner reads off [`Routes`].
     Probe(Vec<Arrival>),
@@ -2200,8 +2130,6 @@ enum Target<'d> {
         /// Whether a range pushes it, which counts as a range in the chain of each pipeline whose
         /// entry it reaches.
         range: bool,
-        /// The epoch the push lands in, which morsels it releases join ([`Dispatcher::park`]).
-        epoch: &'d EpochState,
     },
 }
 
@@ -2265,8 +2193,8 @@ impl Landing<'_> {
         )
     }
 
-    /// Queue `guard`, a guard of the input of `reader`'s breaker, as a package of `reader` in the
-    /// epoch, less what is queued for it there already: a push that reaches a breaker along two
+    /// Queue `guard`, a guard of the input of `reader`'s breaker, as a package of `reader`, less
+    /// what is queued for it already: a push that reaches a breaker along two
     /// paths, as a filter reads one memo for its values and its predicate, is queued once. A
     /// reader that reads its input whole ([`Dispatcher::read_whole`]) takes no push, widened or
     /// not, and nor does one that follows the pipeline that pushed ([`Dispatcher::follow`]). A
@@ -2276,13 +2204,13 @@ impl Landing<'_> {
     ///
     /// # Panics
     ///
-    /// When `reader` does not read the pipeline that pushed, or has begun to finish the epoch;
+    /// When `reader` does not read the pipeline that pushed, or has begun to finish;
     /// when the push was widened on its way to a reader that neither parks nor reads its input
     /// whole; and where the
     /// guard algebra has no exact difference of `guard` and what is queued ([`guard_minus`]).
     pub fn queue(&mut self, reader: PipelineId, guard: &TileGuard) {
-        let (dispatcher, epoch) = match &mut self.target {
-            Target::Queue { dispatcher, epoch } => (*dispatcher, *epoch),
+        let dispatcher = match &mut self.target {
+            Target::Queue { dispatcher } => *dispatcher,
             Target::Probe(arrivals) | Target::ProbeDecided(arrivals) => {
                 arrivals.push(Arrival {
                     pipeline: reader,
@@ -2295,7 +2223,6 @@ impl Landing<'_> {
                 whole,
                 reached,
                 range,
-                epoch,
             } => {
                 reached.push(reader.0);
                 let source = match range {
@@ -2308,7 +2235,7 @@ impl Landing<'_> {
                 // whatever its push was restated to on the way, as an arm of a union restates it
                 // under its tag.
                 let guard = (!(*whole || guard.is_universal())).then_some(guard);
-                return dispatcher.record_decided(epoch, reader.0, source, guard);
+                return dispatcher.record_decided(reader.0, source, guard);
             }
         };
         let (from, r) = (self.from, reader.0);
@@ -2322,7 +2249,7 @@ impl Landing<'_> {
         if info.whole || info.follows.contains(&from) {
             return;
         }
-        let queue = &epoch.pipelines[r];
+        let queue = &dispatcher.states[r];
         dispatcher.ensure(queue.phase.load() == Phase::Running, || {
             format!("pipeline {r} receives packages before it finishes")
         });
@@ -2331,7 +2258,7 @@ impl Landing<'_> {
         // the decided pushes release them ([`Dispatcher::park`]).
         if info.parks {
             if !info.arrivals || (!self.widened && info.pushed_rows.contains(&from)) {
-                dispatcher.queue_or_park(epoch, r, guard, false);
+                dispatcher.queue_or_park(r, guard, false);
             }
             return;
         }
@@ -2815,8 +2742,7 @@ fn start_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
 /// Hand `package` to its pipeline's breaker, land what the breaker decided since its last push
 /// ([`Pushes::push_final`]) where the breaker is a producer ([`Breaker::as_producer`]) that
 /// pushes while consuming ([`BreakingProducer::pushes_while_consuming`]), then acknowledge the
-/// package. The push lands
-/// before the acknowledgement, which may let the pipeline finish the epoch.
+/// package. The push lands before the acknowledgement, which may let the pipeline finish.
 ///
 /// # Panics
 ///

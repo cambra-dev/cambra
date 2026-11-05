@@ -25,8 +25,8 @@ use crate::interpreter::{BaseType, DataSink, DataSourceDomainExtentImpl, Extent}
 /// sink's consumer for a sink, and the entry before the driver's consumer for the `main` output
 /// (`CompiledOutput::main_entry`). A pipeline pulls only its breaker's input, and a sink's pipeline
 /// pulls the sink's producer, so a sink receives its producer's answer one package at a time, and
-/// the `main` output one epoch at a time ([`run_program_into`]). A sink is done once its producer
-/// is released whole; the run ends with one pull of each sink, which signals
+/// the `main` output its answers merged at its finish ([`run_program_into`]). A sink is done once
+/// its producer is released whole; the run ends with one pull of each sink, which signals
 /// `CompiledProgram::done` once every sink is. It answers what it planned for each pipeline, in
 /// pipeline order, and what the `main` output answered, merged ([`Run::main`]).
 ///
@@ -94,12 +94,13 @@ pub fn run_program_polling(
     })
 }
 
-/// [`run_program_polling`] handing `main` one answer of the `main` output per epoch, at the
-/// output pipeline's finish of it: the epoch's packages' answers merged with what the producer
-/// states complete, which is the answer a pull in pull mode makes once the epoch's arrivals have
-/// reached it (`SinkBreaker::per_epoch`). The last epoch's answer is terminal. The driver of a
-/// program that reads a live source prints each delivery's part of the `main` output as it
-/// arrives. It answers what it planned for each pipeline, in pipeline order.
+/// [`run_program_polling`] handing `main` the answers of the `main` output (`SinkBreaker::main`):
+/// with no live source, one answer at the output pipeline's finish, its packages' answers merged
+/// with what the producer states complete, the answer pull mode's one pull makes; over a live
+/// source, each package's answer as it is consumed, and at the finish the answer that states the
+/// output complete. The answers add up to a terminal one. The driver of a program that reads a live
+/// source prints each delivery's part of the `main` output as it arrives. It answers what it
+/// planned for each pipeline, in pipeline order.
 ///
 /// # Errors
 ///
@@ -110,8 +111,8 @@ pub fn run_program_polling(
 /// Where a round of a loop's scope pulls an operator beneath the outermost keys at a level it
 /// restates no projection at (`Planner::unrestated_in_rounds`), and where [`run`] panics. In a
 /// debug build, where a run that returns has not released the `main` output's producer whole, where
-/// a pull at an epoch's finish answers a key or a value no package of the epoch consumed, and where
-/// the last epoch's answer is not terminal.
+/// the pull at the output's finish answers a key or a value no package consumed, and where the
+/// answers do not add up to a terminal one.
 pub fn run_program_into(
     program: &mut CompiledProgram,
     morsel_rows: usize,
@@ -181,13 +182,13 @@ fn pull_sinks(targets: &[RunTarget]) {
 }
 
 /// What a run's driver is told at a run's boundaries, on the run's thread, inside the run
-/// (`dispatcher::in_a_run`): a pass of a run over live sources polls them, then runs every epoch
-/// sealed so far to its finish. A run with no live source has no boundary.
+/// (`dispatcher::in_a_run`): a pass of a run over live sources polls them, then runs until nothing
+/// is claimable. A run with no live source has no boundary.
 pub trait RunObserver {
     /// The pass has polled its live sources and notified no pipeline yet.
     fn polled(&mut self) {}
-    /// No package is in flight and every epoch sealed so far has finished. `changed` says whether
-    /// the pass notified a pipeline or closed one. `Break` ends the run here.
+    /// No package is in flight and none is claimable. `changed` says whether the pass notified a
+    /// pipeline or closed one. `Break` ends the run here.
     fn drained(&mut self, changed: bool) -> ControlFlow<()>;
 }
 
@@ -206,8 +207,8 @@ impl RunObserver for Idle<'_> {
 
 /// How a run ended, with what it planned for each pipeline.
 pub enum Ended {
-    /// Every live source yields everything and every pipeline has finished the last epoch. The
-    /// run has taken its last pull of each sink.
+    /// Every live source yields everything and every pipeline has finished. The run has taken its
+    /// last pull of each sink.
     Done(Vec<Planned>),
     /// The observer broke at a drained boundary. The run left nothing placed and pulled no sink.
     Paused(Vec<Planned>),
@@ -236,8 +237,8 @@ impl Targets {
         }
     }
 
-    /// `program`'s `main` output, whose producer the run pulls from `slot` and hands each epoch's
-    /// answer to `sink` (`SinkBreaker::per_epoch`).
+    /// `program`'s `main` output, whose producer the run pulls from `slot` and hands the answers
+    /// to `sink` (`SinkBreaker::main`).
     ///
     /// # Panics
     ///
@@ -289,7 +290,7 @@ fn sleep_when_idle() {
 pub struct Run {
     /// What the run planned for each pipeline, in pipeline order.
     pub planned: Vec<Planned>,
-    /// The `main` output's answers, one per epoch, merged: terminal, since the last epoch's is.
+    /// The `main` output's answers, merged: terminal.
     /// `None` for a program with no `main` output.
     pub main: Option<Tile>,
 }
@@ -829,11 +830,11 @@ pub(super) enum Consumes {
     /// What the pipelines it reads push, as its edges' probes plan.
     Pushes,
     /// Its input whole, in order, once every pipeline it reads has finished, or over a live
-    /// source each delivery once they have finished its epoch: a store that steps itself, or a
-    /// loop's scope.
+    /// source each delivery once they have decided it: a store that steps itself, or a loop's
+    /// scope.
     Whole,
-    /// One region per epoch, which the scope it runs in queues it, once every pipeline it reads
-    /// has finished the epoch: the scope of a loop nested in the scope's loop, one row per round.
+    /// One row per round of the scope it runs in, which queues it the row, once every pipeline it
+    /// reads is quiescent: the scope of a loop nested in the scope's loop.
     Rounds,
 }
 
@@ -909,8 +910,8 @@ pub(super) fn plan_edges(
                     planned[reader].held = true;
                 }
                 // A store or a loop's scope over a live source takes each delivery once the
-                // pipelines it reads have finished the epoch, which it follows (below), so it
-                // reads no row again.
+                // pipelines it reads have decided it, or are quiescent where it follows them
+                // (below), so it reads no row again.
                 Consumes::Rounds | Consumes::Whole => dispatcher.take_arrivals(PipelineId(reader)),
             }
         }
@@ -954,8 +955,8 @@ pub(super) fn plan_edges(
         let mut seen: Vec<usize> = Vec::new();
         let read_all = read;
         for &read in read {
-            // A nested loop's scope pushes its store once it is terminal, at the run's last epoch,
-            // so a reader inside the cycle around it waits for its finish of each round instead.
+            // A nested loop's scope runs a row per round of the scope around it, and a reader
+            // inside the cycle around it reads the row once the nested scope is quiescent.
             if kinds[read] == Consumes::Rounds {
                 follows.push(read);
                 continue;
@@ -2258,10 +2259,9 @@ impl LivePipeline {
 /// [`drive`] over a run with source pipelines over live sources (`live`). The other sources
 /// start whole. Each pass polls the live sources
 /// (`DataSourceDomainExtentImpl::check_for_new_data`), notifies each live pipeline of what they
-/// yield ([`LivePipeline::poll`]), seals the epoch where it notified or closed one and one is
-/// still open, and runs until nothing is claimable, then tells `observer` (`RunObserver::drained`).
-/// Answers `false` where the observer ended the run, and `true` once every pipeline has finished
-/// the epoch the last live pipeline closed in.
+/// yield ([`LivePipeline::poll`]), and runs until nothing is claimable, then tells `observer`
+/// (`RunObserver::drained`). Answers `false` where the observer ended the run, and `true` once
+/// every pipeline has finished.
 fn drive_live(
     dispatcher: &Dispatcher,
     reach: &mut Reach<'_>,

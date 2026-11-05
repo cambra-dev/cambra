@@ -993,7 +993,7 @@ fn the_pipelines_of_one_breaker_share_what_it_pushed() {
     let all = ints().universal_guard();
     let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![0, 1]], UNBOUNDED);
     dispatcher.share_pushes(&[PipelineId(0), PipelineId(1)]);
-    // Both sources closed, so the epoch is the run's last.
+    // Both sources closed, so each may finish.
     dispatcher.close(PipelineId(1));
     for pipeline in [PipelineId(0), PipelineId(1)] {
         dispatcher.finish_by_hand(pipeline, |pushes| {
@@ -1219,7 +1219,7 @@ fn a_refusal_fails_the_run_before_it_panics() {
                 dispatcher.begin_finish(PipelineId(0));
             },
         ),
-        ("a finish of an epoch not begun", |dispatcher| {
+        ("a finish not begun", |dispatcher| {
             dispatcher.finish(dispatcher.pushes(PipelineId(0)))
         }),
     ];
@@ -1247,8 +1247,8 @@ fn drain(dispatcher: &Dispatcher, pipeline: usize) -> Vec<TileGuard> {
     consumed
 }
 
-/// A source is queued each region it is notified of in the current epoch, cut every
-/// `morsel_rows` positions, while the epoch runs; it finishes the epoch only once closed.
+/// A source is queued each region it is notified of, cut every `morsel_rows` positions, while it
+/// runs; it finishes only once closed.
 #[test]
 fn a_notified_source_consumes_each_region_and_finishes_once_closed() {
     let dispatcher = Dispatcher::new(vec![vec![]], 2);
@@ -1323,7 +1323,7 @@ fn a_second_close_is_refused() {
     dispatcher.close(PipelineId(0));
 }
 
-/// A region notified twice in an epoch would be consumed twice, which a debug build refuses.
+/// A region notified twice would be consumed twice, which a debug build refuses.
 #[cfg(debug_assertions)]
 #[test]
 #[should_panic(expected = "pipeline 0 consumes each region once")]
@@ -1528,7 +1528,7 @@ fn a_push_naming_every_tag_whole_lands_universal() {
 }
 
 /// A push that reaches one reader along two paths, as a filter reads one memo for its values and
-/// its predicate, is queued once: what is queued for the reader in the epoch already is taken out.
+/// its predicate, is queued once: what is queued for the reader already is taken out.
 #[test]
 fn a_push_reaching_a_reader_twice_is_queued_once() {
     let scripted = Scripted::holding(ints().universal_guard());

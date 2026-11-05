@@ -1,6 +1,6 @@
 //! A loop run in rounds: the pipeline of a loop's scope, whose breaker runs a nested dispatcher
-//! over the pipelines inside the loop's cycle, one inner epoch per position, and steps the
-//! loop's store after each. See `src/interpreter/design-operators.md`, "A loop in rounds".
+//! over the pipelines inside the loop's cycle, one round per position, and steps the loop's store
+//! after each. See `src/interpreter/design-operators.md`, "A loop in rounds".
 
 use super::plan::{Consumes, Members, Planned, plan_edges, probe, reach_in_chain, routes_to};
 use super::*;
@@ -17,8 +17,8 @@ pub(super) enum Member {
 
 /// The breaker of a loop's scope in the enclosing dispatcher. Its input is the store's, and a
 /// consume runs one round per position it names: each inner pipeline the round starts is queued
-/// the position, the epoch is sealed, the inner pipelines run until each has finished it, and
-/// the store steps. It is no producer, and pushes the store at the finish where the store is
+/// the position, the inner pipelines run until a pass changes nothing (`run_round`), and the
+/// store steps. It is no producer, and pushes the store at the finish where the store is
 /// terminal.
 pub(super) struct LoopScope {
     store: StoreCell,
@@ -40,9 +40,10 @@ pub(super) struct LoopScope {
 impl LoopScope {
     /// The scope of the store `store`, whose inner pipelines' breakers are `members`, as
     /// `pipelines` plans them. A breaker whose pipeline would read its input whole, which happens
-    /// only in the run's last epoch, is in no pipeline and stays in pull mode: the store has it read
-    /// again before each round and each step, and its readers read the pipelines it reads. The scope places the entries to probe the inner edges, and unplaces them until
-    /// it runs.
+    /// only once the run's sources are whole, is in no pipeline and stays in pull mode: the store
+    /// has it read again before each round and each step, and its readers read the pipelines it
+    /// reads. The scope places the entries to probe the inner edges, and unplaces them until it
+    /// runs.
     ///
     /// # Panics
     ///
@@ -282,9 +283,8 @@ impl LoopScope {
         );
     }
 
-    /// Run the inner dispatcher until nothing is claimable, and answer whether it is done. On
-    /// one thread nothing else advances it, so every inner pipeline has then finished the epoch
-    /// last sealed, which the round's next seal checks.
+    /// Run the inner dispatcher until nothing is claimable, and answer whether it is done. On one
+    /// thread nothing else advances it, so every inner pipeline is then quiescent.
     fn run_inner(&self) -> bool {
         let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
             reach_member(&self.store, &self.members[pipeline.0], pipeline, call)
@@ -324,9 +324,9 @@ impl LoopScope {
     }
 
     /// One round: have the operators inside the cycle read again, queue the position's path for
-    /// every pipeline the round starts, seal the epoch, run it, and step the store at the
-    /// position. The store's last step pulled the operators in pull mode inside the cycle, before
-    /// the pipelines they read took this position.
+    /// every pipeline the round starts, run it (`run_round`), and step the store at the position.
+    /// The store's last step pulled the operators in pull mode inside the cycle, before the
+    /// pipelines they read took this position.
     fn round(&self, position: &[Value]) {
         let guard = self.with_store(|store| {
             Projection::of_path(position).guard(&store.input_tiling(InputId::ONLY))
@@ -931,10 +931,10 @@ mod tests {
         });
     }
 
-    /// A scope whose store is not terminal at the run's last epoch panics.
+    /// A scope whose store is not terminal at its finish panics.
     #[test]
     #[should_panic(expected = "finishes the run terminal")]
-    fn a_scope_short_of_terminal_at_the_last_epoch_panics() {
+    fn a_scope_short_of_terminal_at_its_finish_panics() {
         let mut compiled = Compiled::of(SUM);
         compiled
             .scope

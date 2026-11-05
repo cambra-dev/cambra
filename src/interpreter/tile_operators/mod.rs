@@ -1390,7 +1390,7 @@ impl InputId {
 /// [`consume_impl`] pulls the breaker's input at a guard, merges the answer, and releases the
 /// input at what the answer stated once it has taken delivery of it, so the driver handles no
 /// tile. A breaker that also answers pulls from that state is a [`BreakingProducer`], which pushes
-/// what it decided. When a pipeline may finish an epoch is the dispatcher's to decide
+/// what it decided. When a pipeline may finish is the dispatcher's to decide
 /// (`crate::interpreter::dispatcher`). See `src/interpreter/design-operators.md`, "Pipeline
 /// breakers".
 ///
@@ -1474,7 +1474,8 @@ pub trait Breaker {
 /// A pipeline breaker that answers pulls: a producer that consumes the input it owns into state of
 /// its own, and answers its consumer from that state. After each consume the driver pushes what
 /// it has decided, where it [pushes while consuming](Self::pushes_while_consuming), and once the
-/// pipeline has consumed every package of an epoch it calls [`finish`]. [`offer_impl`] is what the
+/// pipeline has consumed every package and nothing more can be queued for it, it calls
+/// [`finish`]. [`offer_impl`] is what the
 /// producer's `get_impl` answers with once it is consuming: it reads the state `consume_impl`
 /// built and never pulls the input.
 ///
@@ -1532,11 +1533,12 @@ pub trait BreakingProducer: TileProducer + Breaker {
     }
 
     /// Whether the driver pushes what the producer has decided after each consume, and not only at
-    /// an epoch's [`finish`](Breaker::finish). The default answers `true`. A producer whose held
-    /// guard names state a later consume still changes, or groups beneath its outermost keys,
-    /// answers `false`: a release beneath those keys leaves a region beneath the outermost keys, and
-    /// a reader's chain may restate only the outermost keys (`TileProducer::restates`), so it pushes
-    /// once per epoch.
+    /// its [`finish`](Breaker::finish). The default answers `true`. A producer whose held guard
+    /// names state a later consume still changes, or groups beneath its outermost keys, answers
+    /// `false`: a release beneath those keys leaves a region beneath the outermost keys, and a
+    /// reader's chain may restate only the outermost keys (`TileProducer::restates`). It pushes at
+    /// its finish, and inside a loop's rounds where each round has every inner pipeline push what
+    /// it holds (`LoopScope::run_round`).
     fn pushes_while_consuming(&self) -> bool {
         true
     }

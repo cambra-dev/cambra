@@ -174,10 +174,10 @@ fn a_consuming_store_answers_from_its_snapshot() {
     assert_eq!(body_pulls(), before);
 }
 
-/// A store that is not terminal at the run's last epoch panics, naming where it stands.
+/// A store that is not terminal at its finish panics, naming where it stands.
 #[test]
 #[should_panic(expected = "an induction store finishes the run terminal")]
-fn a_store_short_of_terminal_at_the_last_epoch_panics() {
+fn a_store_short_of_terminal_at_its_finish_panics() {
     let compiled = Compiled::of(SUM);
     compiled.breaker(|store| store.consume_impl(InputId::ONLY, keys_between(0, 0)));
     let dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
@@ -300,15 +300,15 @@ fn a_stale_proposal_is_proposed_again_before_a_larger_key_commits() {
     );
 }
 
-/// The last finish of the run's last epoch, across every input, commits what the store still
-/// holds and leaves the store terminal; the earlier inputs' last finishes leave it as it was.
+/// The finish of the last input to finish commits what the store still holds and leaves the
+/// store terminal; the earlier inputs' finishes leave it as it was.
 #[test]
 fn the_last_finish_of_the_last_input_commits_the_rest() {
     let compiled = Compiled::of(TWO_WRITERS);
     compiled.open();
     compiled.consume_whole(writer(0));
     let dispatcher = Dispatcher::new(vec![vec![]; 3], usize::MAX);
-    // Every source closed, so the epoch is the run's last.
+    // Every source closed, so each may finish.
     for input in 1..3 {
         dispatcher.close(PipelineId(input));
     }

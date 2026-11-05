@@ -2680,8 +2680,8 @@ mod aggregate_consuming_tests {
         assert!(aggregate.get(sum_tiling().universal_guard()).is_empty());
     }
 
-    /// An input released in part by the last epoch leaves a partial accumulator that no later
-    /// consume completes, so the last epoch's finish panics rather than push nothing.
+    /// An input released in part by the finish leaves a partial accumulator that no later consume
+    /// completes, so the finish panics rather than push nothing.
     #[test]
     #[should_panic(expected = "finishes after its input was released whole")]
     fn finish_over_a_partial_input_panics() {

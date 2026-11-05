@@ -1516,7 +1516,7 @@ fn deliveries() -> [(&'static str, Vec<Batch>); 3] {
 /// A loop or a transaction over a live source whose drive reads past positions it runs no round
 /// or attempt at: positions a filter on the drive's source drops, and keys a delivery calls
 /// complete and holds nothing at while more are to come. The drive states them complete, so the
-/// store releases them in the epoch that delivered them.
+/// store releases them in the pass that delivered them.
 #[rstest_log::rstest]
 #[case::a_filter_on_the_drive_s_source(
     indoc! {"
@@ -2298,10 +2298,8 @@ fn a_feed_of_a_map_over_a_live_source(
     );
 }
 
-/// A feed written in a loop over a live source, at the `main` output: the loop's store holds
-/// nothing before it is terminal, so the feed's memo takes its input whole at the run's last
-/// epoch, and the output's pull at each earlier epoch's finish reads the rounds' rows through it.
-/// Each row is final as its round writes it, and the output answers each once.
+/// A feed written in a loop over a live source, at the `main` output: the output is handed each
+/// row once, and its value holds every row.
 #[rstest_log::rstest]
 fn a_feed_written_in_a_loop_over_a_live_source_at_main(#[values(1, usize::MAX)] rows: usize) {
     let live = dispatched_live_main(
@@ -2384,10 +2382,9 @@ fn one_key_batches(batches: u64) -> Vec<Batch> {
         .collect()
 }
 
-/// A source delivering in more passes than the dispatcher keeps epochs in flight runs one epoch
-/// per delivery, each finished before the next is sealed.
+/// A sum over a source delivering one key per pass, over ten passes.
 #[test]
-fn a_sum_over_more_deliveries_than_epochs_in_flight() {
+fn a_sum_over_ten_deliveries() {
     let (value, _) = dispatched_live(
         indoc! {"
             out = test_sink()
@@ -2814,9 +2811,9 @@ fn a_map_over_a_live_source_at_main(
 }
 
 /// A filter over a live source that reads a sum takes the source's arrivals and parks them
-/// (`Dispatcher::park`). A sum over a literal is decided in the first epoch, so the first
-/// delivery's rows are answered in it. A sum over the live source is decided only at the last
-/// delivery, so the first delivery's rows stay parked until then.
+/// (`Dispatcher::park`). A sum over a literal is decided before the first delivery, so the first
+/// delivery's rows are answered as they arrive. A sum over the live source is decided only at the
+/// last delivery, so the first delivery's rows stay parked until then.
 #[rstest_log::rstest]
 #[case::a_sum_over_a_literal("[x for x in source1() if sum([1, 2, 3]) > 5]", 3)]
 #[case::a_sum_over_the_source("[x for x in source1() if sum(source1()) > 2]", 0)]
@@ -3070,8 +3067,8 @@ fn rendered_in_key_order(value: &Value) -> String {
 }
 
 /// A loop or a transaction over a live source whose body or seed reads a pipeline: the scope or
-/// the store takes each delivery once the pipelines it reads have finished the epoch. Where one of
-/// them is final only once a live source yields everything, the scope or the store holds its
+/// the store takes each delivery once the pipelines it reads have decided it. Where one of them is
+/// final only once a live source yields everything, the scope or the store holds its
 /// deliveries until then, or reads its input whole where it takes no delivery's keys. `plans`
 /// says how each live scope or store in plan order takes its deliveries.
 #[rstest_log::rstest]
@@ -3292,7 +3289,7 @@ fn an_arm_of_a_live_concatenation_reading_a_live_map(
 
 /// A loop or a transaction over a live source whose body reads a sum of a second live source,
 /// which yields everything only after the first does: the scope or the store is notified of its
-/// whole input once the second also yields everything, the epoch the sum is final in.
+/// whole input once the second also yields everything, when the sum is final.
 #[rstest_log::rstest]
 #[case::a_loop(indoc! {"
     out = test_sink()
@@ -3477,8 +3474,8 @@ fn a_transaction_takes_each_delivery_once_its_seed_is_final(#[values(1, usize::M
 
 /// A loop over a live source seeded from the final value of a transaction store over a let-bound
 /// list: the store reads the list's pipeline whole, nothing live is beneath it, so it reads its
-/// input in the first epoch, and the loop takes each delivery as it arrives, before its source
-/// yields everything.
+/// input at the start, and the loop takes each delivery as it arrives, before its source yields
+/// everything.
 #[rstest_log::rstest]
 fn a_loop_seeded_from_a_static_store_takes_each_delivery(#[values(1, usize::MAX)] rows: usize) {
     let source = indoc! {"
