@@ -241,7 +241,7 @@ impl std::fmt::Display for Restates {
 
 /// How many levels above its own `keys` names a path through: the length of its longest
 /// qualification chain.
-fn qualifying_levels(keys: &Predicate) -> usize {
+pub(super) fn qualifying_levels(keys: &Predicate) -> usize {
     match keys {
         Predicate::Qualified { enclosing, .. } => 1 + qualifying_levels(enclosing),
         Predicate::Or(arms) => arms.iter().map(qualifying_levels).max().unwrap_or(0),
