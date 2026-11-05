@@ -575,6 +575,37 @@ fn a_default_arm_feeds_its_own_defer(
     );
 }
 
+/// A loop body's `match` whose arms are more than one bare feed each. The fan-out takes only
+/// arms that are a single `Feed`, so these reach the generic `Case` handling, where each arm
+/// feeds through its tag's projection of the scrutinee, read once per iteration.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::binding_in_an_arm(indoc! {"
+    o: Feed(_)
+    for m in [`a(2), `b(3)]:
+        match m:
+            case `a(n):
+                y = n + 1
+                o << y
+            case `b(k):
+                o << k * 10
+    sum(o)
+"}, Value::Int(33))]
+#[case::two_feeds_in_an_arm(indoc! {"
+    o: Feed(_)
+    for m in [`a(2), `b(3)]:
+        match m:
+            case `a(n):
+                o << n
+                o << n * 100
+            case `b(k):
+                o << k * 10
+    sum(o)
+"}, Value::Int(232))]
+fn match_arms_beyond_one_feed_in_a_loop(#[case] code: &str, #[case] expected: Value) {
+    check_scalar(code, expected);
+}
+
 /// Three shapes the per-defer pass admits once it admits two complementary arms. Each
 /// read is weighted apart from the others, so a value landing in the wrong channel
 /// changes the answer.
@@ -700,11 +731,9 @@ fn interleaved_feeds_in_a_loop_body(#[case] code: &str, #[case] expected: Value)
 /// semantics"): an `if`, a `match` and a nested `for` are the body's value and stay
 /// last, and a mutable variable is not introduced inside a body at any spelling.
 ///
-/// The three conditional forms compile past lowering without this rejection and fail
-/// deeper — an `if` and a nested `for` on the post-channelize typecheck, a `match` on
-/// `PartialFeedCaseUnsupported`, which names the wrong cause. `channelize`'s fan-out
-/// dispatches on a bare `Case` at the lambda body, and one sequenced under an
-/// `ExprStmt` is not one.
+/// Without this rejection an `if` and a nested `for` compile past lowering and fail on the
+/// post-channelize typecheck: `channelize`'s fan-out dispatches on a bare `Case` at the
+/// lambda body, and one sequenced under an `ExprStmt` is not one.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case(
