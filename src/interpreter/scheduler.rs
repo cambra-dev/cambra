@@ -216,9 +216,12 @@ impl Consumer for Widening {
         self.0.notify(&Projection::Everything);
     }
 
+    /// A change widens to every key. A decided region passes only where it is every key: each
+    /// output key depends on every input key, so none is decided before all of them are.
     fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
         match region {
             Projection::Everything => self.0.push(region, landing),
+            _ if landing.is_decided() => {}
             _ => landing.widened(|landing| self.0.push(&Projection::Everything, landing)),
         }
     }
@@ -338,7 +341,17 @@ impl Consumer for OneLevelIn {
         self.consumer.notify(&restated);
     }
 
+    /// A decided region of the standing levels passes as it is. One that names keys at or beneath
+    /// level `at` passes only where it is every key: which output keys an input row stands
+    /// beneath depends on its values, which no region carries.
     fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        if landing.is_decided() {
+            match region {
+                Projection::Keys { level, .. } if *level >= self.at => {}
+                standing => self.consumer.push(standing, landing),
+            }
+            return;
+        }
         match self.restated(region) {
             Some(restated) => self.consumer.push(&restated, landing),
             None => landing.widened(|landing| self.consumer.push(&Projection::Everything, landing)),

@@ -588,6 +588,39 @@ fn run_targets(
         true => drive(&dispatcher, &mut reach),
         false => drive_live(&dispatcher, &mut reach, &mut live, on_idle),
     });
+    // Every breaker is terminal at the run's end, so each pipeline a push of it reaches along
+    // routes that keep its keys has recorded as decided by it all that a push of its every key
+    // lands as there. A route that widens passes a decided region only once every input of the
+    // operator that widens is decided, which a range does not state.
+    #[cfg(debug_assertions)]
+    for (reader, reads) in members.reads.iter().enumerate() {
+        for &read in reads {
+            let (pusher, _) = end_of(PipelineId(read))
+                .unwrap_or_else(|| pushing_end(&mut reach, PipelineId(read)));
+            let routes = routes_to(&pusher, reader);
+            if routes.is_empty() || routes.iter().any(|route| !route.keeps_keys) {
+                continue;
+            }
+            let reached: Vec<TileGuard> =
+                probe(&pusher, PipelineId(read), &Projection::Everything, reader)
+                    .into_iter()
+                    .map(|arrival| arrival.guard)
+                    .collect();
+            let Some(reached) = reached.into_iter().reduce(|a, b| a.union(&b)) else {
+                continue;
+            };
+            let decided = dispatcher.decided_of(PipelineId(reader), PipelineId(read));
+            debug_assert!(
+                decided
+                    .as_ref()
+                    .is_some_and(|decided| guard_minus(&reached, decided).is_empty()),
+                "{} has decided all it reaches of {}'s input, {reached:?}, at the run's end, \
+                 which records {decided:?}",
+                members.names[read],
+                members.names[reader]
+            );
+        }
+    }
     for (plan, scope) in planned.iter_mut().zip(&scopes) {
         if let Some(scope) = scope {
             plan.rounds = std::mem::take(&mut scope.borrow_mut().planned);

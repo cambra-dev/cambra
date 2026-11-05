@@ -1349,10 +1349,17 @@ impl Breaker for MemoProducer {
 }
 
 impl BreakingProducer for MemoProducer {
-    /// The region the cached tile states. A release removes rows and leaves the statement as it
-    /// was, which `final_guard` takes into account.
+    /// The region the cached tile states, and what its readers released, which they release only
+    /// once it is decided. A release of a collection's rows leaves its statement as it was, but a
+    /// release of a scalar empties it, so the cache alone no longer states it. `final_guard` takes
+    /// the released region out again.
     fn held(&self) -> TileGuard {
-        self.cached_tile.to_guard()
+        let stated = self.cached_tile.to_guard();
+        let released = self.obsolete_guard();
+        match released.is_empty() {
+            true => stated,
+            false => stated.union(released),
+        }
     }
 
     /// Cut at the cached keys.
