@@ -1388,7 +1388,7 @@ A scope or a store that also reads pipelines takes each delivery once those pipe
 finished the epoch (`Dispatcher::take_arrivals_after_reads`, `Dispatcher::follow`), and keeps no
 open rows. Where one of those pipelines is final only once some live source yields everything, the
 scope or the store holds its deliveries until then
-([Holding arrivals until a read is final](#holding-arrivals-until-a-read-is-final)).
+([Parking arrivals until a read is decided](#parking-arrivals-until-a-read-is-decided)).
 
 A drive and a transaction store decide positions in order, and a debug build checks that a delivery
 adds positions after every one before it. A dispatched run delivers no notification: a loop's scope
@@ -1424,7 +1424,7 @@ bound or stdin taken, which a second compile could not open again.
 The differential suites compare a dispatched run at morsels of one row with one at morsels of every
 row (`tests/support/differential.rs`).
 
-#### Holding arrivals until a read is final
+#### Parking arrivals until a read is decided
 
 A pipeline is final once every live pipeline beneath it has closed and it has finished the epoch of
 the last close. A pipeline that reads its input whole (`Dispatcher::read_whole`) reads that input in
@@ -1436,15 +1436,16 @@ live pipelines whose close it waits for in this sense.
 A loop's scope or a transaction store steps on the pipelines it reads by pull, and a step that pulls
 a pipeline not yet final reads a partial answer: a seed `sum(source1())` before `source1` yields
 everything opens the store at a wrong value. Where such a scope or store is notified per delivery
-(`Notifies::Rounds`, `Notifies::Items`), it holds its arrivals on the live pipelines those reads
-wait for (`Dispatcher::hold`). A notify of it before the last of them closes keeps its morsels
-outside every epoch, so each epoch before then finishes without them, and the pipelines that read
-the scope or store finish it too. The close of the last of them appends the held morsels to the
-scope's or store's queue in that close's epoch. The scope or store follows the pipelines it reads,
-so it takes them once those have finished that epoch, final. From then on each delivery is queued as
+(`Notifies::Rounds`, `Notifies::Items`), it parks its arrivals (`Dispatcher::park`). A notify of a
+region that some pipeline it reads has not decided keeps its morsels outside every epoch, so each
+epoch before then finishes without them, and the pipelines that read the scope or store finish it
+too. Each pipeline's decided pushes record what it has decided of the reader's input
+([Completeness in pushes](#completeness-in-pushes)). The decided push that covers a parked morsel
+appends it to the scope's or store's queue in the push's epoch, before the pushing pipeline counts
+its finish toward the reader's close. From then on each delivery the reads have decided is queued as
 it arrives.
 
-The held morsels are guards of the scope's or store's input, not rows: the rows stay in the live
+The parked morsels are guards of the scope's or store's input, not rows: the rows stay in the live
 source, which releases none of them until the scope or store consumes them. Over a seed whose
 sources never yield everything, the scope or store never steps, and its source keeps every row it
 delivered.
@@ -1456,7 +1457,7 @@ source of the run yields everything (`LivePipeline::waits`), in the run's last e
 #### Completeness in pushes
 
 This section is the planned design. The code does not implement it yet: it decides finality by
-epochs, as [Holding arrivals until a read is final](#holding-arrivals-until-a-read-is-final)
+epochs, as [Parking arrivals until a read is decided](#parking-arrivals-until-a-read-is-decided)
 describes.
 
 A key of a pipeline's output is decided where its value can no longer change and its presence or
@@ -1505,12 +1506,12 @@ pushed. A unit of work is claimable once that union covers the region the work p
 | --- | --- | --- |
 | A whole read (`Dispatcher::read_whole`) | once the pipelines beneath it that take arrivals have closed | once its reads' decided regions are universal |
 | A step of a store or a loop's scope that follows its reads (`Dispatcher::follow`) | once its reads have finished the epoch | once its reads are complete over the region the step pulls |
-| A held delivery (`Dispatcher::hold`) | once the live pipelines its reads wait for have closed | as a step |
+| A parked delivery of a store or a loop's scope (`Dispatcher::park`) | once every pipeline it reads has decided it | as a step |
 | An open row read again ([Reading rows again](#reading-rows-again)) | when a push names the row | when a pushed decided region covers the row |
 
-The four rows reduce to one rule, so `Dispatcher::hold`, `LivePipeline::waits` and the planner's
-per-pipeline record of the live pipelines a pipeline is final after (`final_after`) are removed.
-Epochs remain the batches a seal makes of live deliveries, and the unit a `main` output answers per
+The four rows reduce to one rule, so `Dispatcher::park`'s restriction to stores and scopes,
+`LivePipeline::waits` and the planner's per-pipeline record of the live pipelines a pipeline is
+final after (`final_after`) are removed. Epochs remain the batches a seal makes of live deliveries, and the unit a `main` output answers per
 (`SinkBreaker::per_epoch`).
 
 The program below shows what changes. Its store `a` reads a static list, and its loop reads a live

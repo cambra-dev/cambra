@@ -380,8 +380,9 @@ fn run_targets(
         });
         let input = input.expect("a reach calls the breaker it reaches");
         // A store or a loop's scope steps on a pipeline it reads by pull, which an epoch before
-        // that pipeline's live sources close leaves partial. It holds its deliveries until they
-        // have closed (`Dispatcher::hold`), and takes each one as it arrives from then on.
+        // that pipeline's live sources close leaves partial. It parks its deliveries until the
+        // pipelines it reads have decided them (`Dispatcher::park`), and takes each one as it
+        // arrives from then on.
         let late: Vec<usize> = match matches!(
             members.located[pipeline],
             Located::Store { .. } | Located::Scope { .. }
@@ -547,8 +548,7 @@ fn run_targets(
         // One notified per delivery holds the deliveries instead.
         match notifies {
             Notifies::Items | Notifies::Rounds if reads_late => {
-                let on: Vec<PipelineId> = late.iter().map(|&on| PipelineId(on)).collect();
-                dispatcher.hold(PipelineId(pipeline), &on);
+                dispatcher.park(PipelineId(pipeline));
                 planned[pipeline].held = true;
             }
             _ => {}
@@ -978,7 +978,8 @@ pub struct Planned {
     pub live: bool,
     /// Whether it keeps open rows ([`Dispatcher::keep_open_rows`]).
     pub open: bool,
-    /// Whether it holds its arrivals until pipelines it reads are final ([`Dispatcher::hold`]).
+    /// Whether it parks its arrivals until the pipelines it reads have decided them
+    /// ([`Dispatcher::park`]).
     pub held: bool,
 }
 

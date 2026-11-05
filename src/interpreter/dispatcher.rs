@@ -401,9 +401,9 @@ struct PipelineInfo {
     /// of one queues the rows it names fresh, though the pipeline takes arrivals
     /// ([`queue_pushes_of`](Dispatcher::queue_pushes_of)).
     pushed_rows: Vec<usize>,
-    /// The pipelines that take arrivals whose close its arrivals wait for: until the last of them
-    /// closes, a notify of it holds its morsels outside every epoch ([`hold`](Dispatcher::hold)).
-    holds: Vec<usize>,
+    /// Whether it parks its arrivals until the pipelines it reads have decided them
+    /// ([`park`](Dispatcher::park)).
+    parks: bool,
 }
 
 /// What the dispatcher keeps of one pipeline across epochs.
@@ -437,11 +437,11 @@ struct PipelineState {
     // consume in flight, which its consumes, its finishes and the pushes to it read and write under
     // the lock; what crosses it is guards naming regions, never a tile.
     open: Mutex<OpenRows>,
-    /// For a pipeline that holds its arrivals ([`Dispatcher::hold`]), the morsels notified while
-    /// a pipeline it holds on is open, and whether the last of those has closed.
+    /// For a pipeline that parks its arrivals ([`Dispatcher::park`]), the morsels notified that
+    /// the pipelines it reads have not decided yet.
     // shared-state-ok: guards naming regions of the pipeline's input, which its notifies and the
-    // close that releases them read and write under the lock; never a tile.
-    held: Mutex<Held>,
+    // decided pushes that release them read and write under the lock; never a tile.
+    parked: Mutex<Vec<TileGuard>>,
 }
 
 /// What one source of a pipeline's breaker's input has decided of that input: a pipeline it
@@ -460,7 +460,6 @@ pub(crate) enum Decided {
 
 impl Decided {
     /// Whether it covers `guard`, a region of the input.
-    #[cfg(debug_assertions)]
     pub(crate) fn covers(&self, guard: &TileGuard) -> bool {
         match self {
             Decided::Nothing => guard.is_empty(),
@@ -476,14 +475,6 @@ impl Decided {
             Decided::Region(region) => Decided::Region(region.union(guard)),
         }
     }
-}
-
-/// The arrivals a pipeline holds until the pipelines it holds on have closed
-/// ([`Dispatcher::hold`]).
-#[derive(Default)]
-struct Held {
-    morsels: Vec<TileGuard>,
-    released: bool,
 }
 
 /// What a pipeline that keeps open rows knows of the rows it consumed
@@ -617,7 +608,7 @@ impl Dispatcher {
                 arrivals: false,
                 keeps_open: false,
                 pushed_rows: Vec::new(),
-                holds: Vec::new(),
+                parks: false,
             })
             .collect();
         let states = (0..count)
@@ -631,7 +622,7 @@ impl Dispatcher {
                 acknowledged: AtomicUsize::new(0),
                 in_flight: AtomicBool::new(false),
                 open: Mutex::new(OpenRows::default()),
-                held: Mutex::new(Held::default()),
+                parked: Mutex::new(Vec::new()),
             })
             .collect();
         let window = Self::slots(DEFAULT_WINDOW, &infos);
@@ -793,19 +784,19 @@ impl Dispatcher {
         self.mark_arrivals(pipeline);
     }
 
-    /// Hold `pipeline`'s arrivals until every pipeline of `on` has closed: a notify of it before
-    /// then keeps its morsels outside every epoch, and the close of the last of `on` appends them
-    /// to the pipeline's queue in that close's epoch. An epoch before then finishes without them,
-    /// so the pipelines that read `pipeline` move on. A loop's scope or a transaction store that
-    /// reads a pipeline final only once those sources yield everything takes each delivery so,
-    /// rather than all of them at the run's last epoch (`src/interpreter/design-operators.md`,
-    /// "Holding arrivals until a read is final").
+    /// Park `pipeline`'s arrivals until the pipelines it reads have decided them: a notify of a
+    /// region they have not all decided keeps its morsels outside every epoch, and the decided
+    /// push that covers a morsel appends it to the pipeline's queue in the push's epoch
+    /// ([`record_decided`](Self::record_decided)). An epoch before then finishes without them,
+    /// so the pipelines that read `pipeline` move on. A loop's scope or a transaction store, whose
+    /// steps pull the pipelines it reads, takes each delivery so once what it pulls is final
+    /// (`src/interpreter/design-operators.md`, "Parking arrivals until a read is decided").
     ///
     /// # Panics
     ///
-    /// When `pipeline` keeps open rows, when `on` is empty, when a pipeline of `on` takes no
-    /// arrivals, and when a source has been notified, sealed or closed already.
-    pub fn hold(&mut self, pipeline: PipelineId, on: &[PipelineId]) {
+    /// When `pipeline` keeps open rows or reads no pipeline, and when a source has been notified,
+    /// sealed or closed already.
+    pub fn park(&mut self, pipeline: PipelineId) {
         let p = pipeline.0;
         assert!(
             self.current.load(Ordering::Acquire) == 0
@@ -813,60 +804,54 @@ impl Dispatcher {
                     pipeline.queued.load(Ordering::Acquire) == 0
                         && !pipeline.closed.load(Ordering::Acquire)
                 }),
-            "pipeline {p} holds its arrivals from before any notify, seal or close"
+            "pipeline {p} parks its arrivals from before any notify, seal or close"
         );
         assert!(
-            !self.infos[p].keeps_open && !on.is_empty(),
-            "pipeline {p} holds its arrivals on some pipeline, and keeps no open rows"
+            !self.infos[p].keeps_open && !self.infos[p].reads.is_empty(),
+            "pipeline {p} parks its arrivals on the pipelines it reads, and keeps no open rows"
         );
-        for on in on {
-            assert!(
-                self.takes_arrivals(on.0),
-                "pipeline {p} holds its arrivals on pipeline {}, which takes arrivals and closes",
-                on.0
-            );
-            if !self.infos[p].holds.contains(&on.0) {
-                self.infos[p].holds.push(on.0);
-            }
-        }
+        self.infos[p].parks = true;
     }
 
-    /// Append to the queue in `epoch` of each pipeline whose holds `closed`'s close completes the
-    /// morsels it held ([`hold`](Self::hold)). Runs under the `sealing` lock, before the close
-    /// ends `closed`'s arrivals in `epoch`, so a pipeline holding on it has not finished `epoch`.
-    fn release_holds(&self, epoch: &EpochState, closed: usize) {
-        for (p, info) in self.infos.iter().enumerate() {
-            if !info.holds.contains(&closed)
-                || !info
-                    .holds
-                    .iter()
-                    .all(|&on| self.states[on].closed.load(Ordering::Acquire))
-            {
-                continue;
-            }
-            let morsels = {
-                let mut held = self.states[p]
-                    .held
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                held.released = true;
-                std::mem::take(&mut held.morsels)
-            };
-            if morsels.is_empty() {
-                continue;
-            }
-            self.states[p]
-                .queued
-                .fetch_add(morsels.len(), Ordering::AcqRel);
-            let appended = epoch.pipelines[p].queue.append(p, &morsels);
-            self.ensure(appended, || {
-                format!(
-                    "pipeline {p} has not finished epoch {} when the last pipeline it holds on \
-                     closes there",
-                    epoch.number
-                )
-            });
+    /// Whether every pipeline `reader` reads has decided `guard`, a region of its input.
+    fn reads_decided(&self, reader: usize, guard: &TileGuard) -> bool {
+        let decided = self.states[reader]
+            .decided
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (0..self.infos[reader].reads.len())
+            .all(|at| decided.get(at).unwrap_or(&Decided::Nothing).covers(guard))
+    }
+
+    /// Append the morsels `reader` parked that the pipelines it reads have now decided to its
+    /// queue in `epoch` ([`park`](Self::park)). A decided push lands before the pushing pipeline
+    /// counts its finish toward `reader`'s close, so `reader`'s queue in `epoch` is open.
+    fn release_parked(&self, epoch: &EpochState, reader: usize) {
+        let released: Vec<TileGuard> = {
+            let mut parked = self.states[reader]
+                .parked
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let (released, kept) = std::mem::take(&mut *parked)
+                .into_iter()
+                .partition(|morsel| self.reads_decided(reader, morsel));
+            *parked = kept;
+            released
+        };
+        if released.is_empty() {
+            return;
         }
+        self.states[reader]
+            .queued
+            .fetch_add(released.len(), Ordering::AcqRel);
+        let appended = epoch.pipelines[reader].queue.append(reader, &released);
+        self.ensure(appended, || {
+            format!(
+                "pipeline {reader} has not finished epoch {} when a decided push covers what it \
+                 parked",
+                epoch.number
+            )
+        });
     }
 
     fn mark_arrivals(&mut self, pipeline: PipelineId) {
@@ -996,7 +981,13 @@ impl Dispatcher {
     /// reads that shares `source`'s breaker shares, since a store's pipelines push one store's
     /// decided region ([`share_pushes`](Self::share_pushes)); or `reader` itself, for the ranges
     /// in its own chain.
-    fn record_decided(&self, reader: usize, source: usize, guard: Option<&TileGuard>) {
+    fn record_decided(
+        &self,
+        epoch: &EpochState,
+        reader: usize,
+        source: usize,
+        guard: Option<&TileGuard>,
+    ) {
         let reads = &self.infos[reader].reads;
         self.ensure(source == reader || reads.contains(&source), || {
             format!(
@@ -1022,6 +1013,10 @@ impl Dispatcher {
                 Some(guard) => before.grown(guard),
                 None => Decided::Whole,
             };
+        }
+        drop(decided);
+        if self.infos[reader].parks {
+            self.release_parked(epoch, reader);
         }
     }
 
@@ -1525,13 +1520,23 @@ impl Dispatcher {
         let p = pipeline.0;
         self.ensure_source(pipeline);
         let state = self.state(pipeline);
-        if !self.infos[p].holds.is_empty() {
-            let mut held = state.held.lock().unwrap_or_else(PoisonError::into_inner);
-            if !held.released {
-                held.morsels.extend_from_slice(morsels);
-                return;
+        let parked_out;
+        let morsels = match self.infos[p].parks {
+            true => {
+                let mut parked = state.parked.lock().unwrap_or_else(PoisonError::into_inner);
+                let (decided, undecided): (Vec<TileGuard>, Vec<TileGuard>) = morsels
+                    .iter()
+                    .cloned()
+                    .partition(|morsel| self.reads_decided(p, morsel));
+                parked.extend(undecided);
+                parked_out = decided;
+                if parked_out.is_empty() {
+                    return;
+                }
+                &parked_out[..]
             }
-        }
+            false => morsels,
+        };
         // Counted before the append makes the packages claimable, so an acknowledgement never
         // runs ahead of the count `outstanding` subtracts it from.
         state.queued.fetch_add(morsels.len(), Ordering::AcqRel);
@@ -1647,7 +1652,6 @@ impl Dispatcher {
         let epoch = self
             .epoch(current)
             .expect("the window holds the current epoch");
-        self.release_holds(&epoch, p);
         self.end_arrivals(&epoch, p);
         self.advance();
     }
@@ -1978,11 +1982,13 @@ impl Dispatcher {
         if self.failed.load(Ordering::SeqCst) {
             return;
         }
-        self.land_decided(p, decided.as_ref(), pushes.to.as_ref());
+        let epoch = self.epoch(pushes.epoch);
+        if let Some(epoch) = &epoch {
+            self.land_decided(epoch, p, decided.as_ref(), pushes.to.as_ref());
+        }
         if morsels.is_empty() {
             return;
         }
-        let epoch = self.epoch(pushes.epoch);
         self.ensure(
             epoch
                 .as_ref()
@@ -2008,11 +2014,12 @@ impl Dispatcher {
     /// `pipeline` is the pushing pipeline, or, for a range in its own chain, the pipeline itself.
     fn land_decided(
         &self,
+        epoch: &EpochState,
         pipeline: usize,
         decided: Option<&Projection>,
         to: Option<&SharedConsumer>,
     ) {
-        self.land_decided_from(pipeline, decided, to, true);
+        self.land_decided_from(epoch, pipeline, decided, to, true);
     }
 
     /// Push `decided`, the region of its keys a range in `pipeline`'s chain has decided, through
@@ -2026,13 +2033,17 @@ impl Dispatcher {
         decided: &Projection,
         to: &SharedConsumer,
     ) {
-        self.land_decided_from(pipeline.0, Some(decided), Some(to), false);
+        let epoch = self
+            .epoch(self.current.load(Ordering::Acquire))
+            .expect("the window holds the current epoch");
+        self.land_decided_from(&epoch, pipeline.0, Some(decided), Some(to), false);
     }
 
     /// [`land_decided`](Self::land_decided), applying its rule for readers a push reaches no
     /// entry of only where `pulled` says the push is a breaker's, which its readers read.
     fn land_decided_from(
         &self,
+        epoch: &EpochState,
         pipeline: usize,
         decided: Option<&Projection>,
         to: Option<&SharedConsumer>,
@@ -2051,6 +2062,7 @@ impl Dispatcher {
                 whole,
                 reached: Vec::new(),
                 range: !pulled,
+                epoch,
             },
             from: pipeline,
             widened: false,
@@ -2062,7 +2074,7 @@ impl Dispatcher {
         if whole && pulled {
             for &reader in &self.infos[pipeline].readers {
                 if !reached.contains(&reader) {
-                    self.record_decided(reader, pipeline, None);
+                    self.record_decided(epoch, reader, pipeline, None);
                 }
             }
         }
@@ -2175,7 +2187,7 @@ impl Dispatcher {
         // Recorded before the reader's queue is closed, which lets the reader finish.
         #[cfg(test)]
         self.record(Event::Finish(PipelineId(p)));
-        self.land_decided(p, decided.as_ref(), pushes.to.as_ref());
+        self.land_decided(&epoch, p, decided.as_ref(), pushes.to.as_ref());
         self.land_in(&epoch, p, &morsels, pushes.to.as_ref());
         for &reader in &self.infos[p].readers {
             self.count_toward_close(&epoch, reader);
@@ -2542,6 +2554,8 @@ enum Target<'d> {
         /// Whether a range pushes it, which counts as a range in the chain of each pipeline whose
         /// entry it reaches.
         range: bool,
+        /// The epoch the push lands in, which morsels it releases join ([`Dispatcher::park`]).
+        epoch: &'d EpochState,
     },
 }
 
@@ -2618,6 +2632,7 @@ impl Landing<'_> {
                 dispatcher,
                 reached,
                 range,
+                epoch,
                 ..
             } => {
                 reached.push(reader.0);
@@ -2625,7 +2640,7 @@ impl Landing<'_> {
                     true => reader.0,
                     false => self.from,
                 };
-                return dispatcher.record_decided(reader.0, source, Some(guard));
+                return dispatcher.record_decided(epoch, reader.0, source, Some(guard));
             }
         };
         let (from, r) = (self.from, reader.0);
