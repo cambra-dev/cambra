@@ -953,6 +953,61 @@ fn a_fed_accumulator_is_observable_across_the_swap() {
     assert!(flat.contains("Ints([6,],)"), "want a step to 6: {out}");
 }
 
+/// A channel fed from several sites keeps its sites' tags when a version adds a site in
+/// another definition, so the arms it already had carry across the swap under the tags they had
+/// (`src/ccl/design/sites.md`, "Stability").
+#[test]
+fn a_site_added_elsewhere_keeps_a_channels_tags() {
+    let (reply, out) = stdin_across_reload(
+        indoc! {r#"
+            out: Feed(_)
+            n := 0
+            for line in stdin():
+                n := n + 1
+                out << n
+                out << n * 10
+            out
+        "#},
+        indoc! {r#"
+            out: Feed(_)
+            def note(x):
+                out << x
+            n := 0
+            for line in stdin():
+                n := n + 1
+                out << n
+                out << n * 10
+                note(n * 100)
+            out
+        "#},
+        "a\nb",
+        "c",
+    );
+    assert!(
+        reply.contains("reloaded"),
+        "the reload should be accepted: {reply}"
+    );
+    // The driver prints each tile's `Debug` form. Before the swap the two arms are `out<<` and
+    // `out<<#1`. After it the same two arms hold the third line's `3` and `30`, beside the
+    // added site's `300`, the codomain listing the arms in tag order.
+    let flat: String = out.chars().filter(|c| !c.is_whitespace()).collect();
+    for tag in [r#"Name("out<<",)"#, r#"Name("out<<#1",)"#] {
+        assert!(flat.contains(tag), "want the arm {tag}: {out}");
+    }
+    assert!(
+        flat.contains("Ints([1,10,],)"),
+        "want the first line's arms: {out}"
+    );
+    assert!(
+        flat.contains(r#"Name("note()/note.out<<",)"#),
+        "want the added site's arm: {out}"
+    );
+    assert!(
+        flat.contains("Ints([300,3,30,],)"),
+        "want the third line's arms, `n` carried across the swap: {out}"
+    );
+}
+
 /// The state guard covers a `stdin`-sourced loop, not just an `http_serve` one.
 ///
 /// Nothing about the guard is HTTP-specific: it reads the variables a version

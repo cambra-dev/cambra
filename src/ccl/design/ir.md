@@ -335,11 +335,14 @@ different operations:
 
 | Node | Input collections | Result domain | Definedness |
 |---|---|---|---|
-| `Copair` (`⊎`) | `𝐴 ⤇ 𝑉`, `𝐵 ⤇ 𝑉` | Positional sum `𝐴 + 𝐵` | Tags keep all positions distinct. |
+| `Copair` (`⊎`) | `𝐴 ⤇ 𝑉`, `𝐵 ⤇ 𝑉` | Tagged sum `𝐴 + 𝐵` | Tags keep all positions distinct. |
 | `DisjointJoin` (`⊔`) | Partial maps on one 𝐷 | The same 𝐷 | Operand positions must be disjoint. |
 
-`Copair` is the collection operation behind `a ++ b`. `emit_copair` assigns each operand an
-anonymous `FieldKey::Index` tag in a `Type::Variant` domain and joins their codomains. Thus
+`Copair` is the collection operation behind `a ++ b` and behind a channel fed from several sites.
+`emit_copair` assigns each operand of a new copairing an anonymous `FieldKey::Index` tag in a
+`Type::Variant` domain and joins their codomains. A channel's copairing tags each operand by its
+feed's site ([sites.md](sites.md#channel-tags)), and `emit_copair` keeps the tags a recorded
+copairing's type holds. Thus
 `xs ++ xs` retains both copies of every row. `TypedExpr::copair` flattens nested value-form
 copairings at construction; a let-bound operand can still contain its own tagged domain. The
 point-free `Builtin::Copair` form may arise when lambda elimination lifts an inside-lambda
