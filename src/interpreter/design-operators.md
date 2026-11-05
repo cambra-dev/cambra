@@ -696,11 +696,11 @@ and none sends `Nothing`. A closure consumer ignores the region. A consumer that
 notification has no use for it, since its pull reads whatever arrived. A consumer that does not pull
 acts on the region instead.
 
-A component that merges notifications to one consumer unites their regions with `Projection::union`
-and narrows none. A gate passes the first notification after a pull, and after it each one that
-names a key no notification passed since that pull named. It drops the rest, whose keys its consumer
-has already heard of: a consumer that pulls reads them in its next pull, and one that acts on the
-region, as a memo marks it dirty, has marked them.
+A component that merges notifications to one consumer unites their regions with
+`Projection::union` and narrows none. A gate passes the first notification after a pull, and after
+it each one that names a key no notification passed since that pull named (`scheduler::Admission`).
+It drops the rest, whose keys its consumer has already heard of: a consumer that pulls reads them in
+its next pull, and one that acts on the region, as a memo marks it dirty, has marked them.
 
 **Forwarding.** An operator keeps an input's keys, forwarding its region unchanged, only if its row
 of the "Projection guards" table pulls that input at the projection and the input's keys are the
@@ -733,33 +733,37 @@ depends on the input's shape, the operator decides from its tiling when it subsc
 | `CheckedLookup` | one key | widens | One key has no keys to project. |
 | `CheckedLookup` | the collection | widens | Every key is answered against all of it. |
 | `Memo` | the input | keeps | Read at the projection, and its keys are the input's. |
-| `FanOutSlot` | the shared input | widens | The fan-out forwards through a closure that passes one notification between pulls and sends `Everything`; keeping keys needs a region merged across the notifications it suppresses. |
+| `FanOutSlot` | the shared input | keeps | The fan-out forwards the input's region to every live slot. Between pulls it passes only a notification naming a key it has not passed since the last pull, as a gate does, and drops the rest, whose keys every slot consumer has heard of. |
 | `ExtractFinal`, `PermuteRecordDomain`, `FlattenTupleDomain` | the input | widens | Read whole; the keys are re-keyed or the last position. |
 | `Aggregate`, `ExtractAggregate` | the input | widens | The accumulator has no keys. |
 | `MapAggregate`, `MapExtractAggregate` | the input | keeps | The groups keep the input's outermost keys. |
 | Stores, recurrences and the commit operators (`commit_operator.rs`) | every input | widens | A recurrence re-keys its inputs by its own positions. |
 
-`GatedConsumer` forwards at most one notification between pulls to a consumer that pulls.
-`shared_consumer` constructs it with `Notified::clear()`, so the first notification passes,
-including one sent during `subscribe`. Forwarding sets the flag; `ProducerBase::sharing` holds the
-`Gate` token that clears it before each pull. A notification behind a closed gate is not delivered,
-and the consumer's next pull reads the change. `Notified::flag()` instead starts set to permit an
-initial input read, and `Notified::Always` is used when no flag intercepts input notifications. A
-`Notified::Flag` is set by notification and cleared by `take()`. `FanOutShared::forwarded` tracks
-forwarding to fan-out slots. Clearing does not depend on whether the pull reads the notifying input.
-Without this suppression, a change can reach a sink once per path through the graph, and cyclic
-notification paths can continue indefinitely.
+`GatedConsumer` forwards a notification between pulls only where it names a key not passed since the
+last pull. `shared_consumer` constructs it with `Notified::clear()`, so the first notification
+passes, including one sent during `subscribe`. Forwarding sets the flag and grows the region passed;
+`ProducerBase::sharing` holds the `Gate` token that clears the flag before each pull, which starts
+the region afresh. A notification of keys already passed behind a closed gate is not delivered, and
+the consumer's next pull reads the change. `Notified::flag()` instead starts set to permit an
+initial input read. A `Notified::Flag` is set by notification and cleared by `take()`.
+`FanOutShared::admission` gates forwarding to fan-out slots. Clearing does not depend on whether
+the pull reads the notifying input. Without this suppression, a change can reach a sink once per
+path through the graph, and cyclic notification paths can continue indefinitely.
 
 `forwarding_consumer` delivers through the gate when its consumer can be borrowed. On reentry,
-it drops the notification if the gate is set: no pull has occurred since forwarding. Otherwise
-it queues the notification, because a pull during the current cascade may have missed the new
-change. Sharing notification handles does not share tile data; tiles still pass through `get`.
+it drops the notification where the gate would stop it: the gate is set, and the notifications
+passed since the last pull name every key it names (`Admission::covers`). Otherwise it queues the
+consumer on the wakeup queue, because a pull during the current cascade may have missed the new
+change. The queue holds handles, not regions, so the deferred notification is delivered as
+`Everything`. Sharing notification handles does not share tile data; tiles still pass through
+`get`.
 
-A consumer woken by an operator must pull that operator if it still reads it. Until then,
-the operator suppresses later notifications from its inputs. Finished reads, settled seeds,
-recurrences with no remaining reader and wholly released operators need no further pull.
-When `pull_laps` reaches quiescence, a debug check walks `TileProducer::visit_input_producers`
-and rejects an input whose forwarding flag remains set after its reader was pulled that lap.
+A consumer woken by an operator must pull that operator if it still reads it. Until then, the
+operator's gate stops every later notification from its inputs that names only keys already passed.
+Finished reads, settled seeds, recurrences with no remaining reader and wholly released operators
+need no further pull. When `pull_laps` reaches quiescence, a debug check walks
+`TileProducer::visit_input_producers` and rejects an input whose forwarding flag remains set after
+its reader was pulled that lap.
 
 A sink does not pull when notified. It queues its pull on a queue of its own, which holds it
 once however many notifications arrive. `Scheduler::check_for_notifications` delivers its wakes
@@ -769,9 +773,10 @@ a reload replaces hands its state to its successor only if it was pulled.
 
 - `ChangeNotifier` compares successive store outputs and queues a wake when they differ,
   including initialization, decided positions, commits and closure.
-- `Memo` reads on its first pull. Thereafter, while its input has not notified, `Memo` answers
-  from the cache, even when the cache is empty, preventing fan-out slots from repeatedly pulling
-  their shared input.
+- `Memo` keeps a dirty region of its input: what it has not read, and what its input has notified
+  since. A pull that overlaps it reads the whole projection and removes it from the dirty region.
+  A pull outside it answers from the cache, even when the cache is empty, preventing fan-out slots
+  from repeatedly pulling their shared input.
   A debug build probes once after each read when no wakeup is pending, checking for new cells
   or completeness without notification. It also continues probing drained inputs; if such a
   pull changes the cache without a notification, `Memo` queues a wake for its consumer.
@@ -877,7 +882,7 @@ derived from the edges on both sides of the wire rather than serialized separate
 | `MapAggregate` | Collection chain of at least two levels | Enclosing levels ending in `Aggregation` | Folds the innermost collection, preserving the levels above it. |
 | `MapExtractAggregate` | Collection chain ending in `Aggregation` | Enclosing levels ending in the accumulator tiling | Extracts terminal results and removes innermost keys whose aggregates are not terminal. |
 | `FanOut` | `*` | Same as input | Allows multiple operators to consume the output of the same operator. Each consumer subscribes via a `FanOut::slot()` handle; the fan-out forwards `get` requests and tracks the intersection of release guards across slots. Constructed via either `FanOut::new` (no cyclic-mode overhead — the common case) or `FanOut::new_cyclic` (for fan-outs whose slots feed back into their own input, e.g. a commit/induction store whose writer reads the store back before proposing, or a mutation-loop body whose other slot is wired to the cyclic prev-accumulator stream). Cyclic mode adds a per-pull tile-cache and a subscribe-in-progress flag so re-entrant subscribes / pulls skip redundant inner work and serve from the cached snapshot instead of re-entering the inner producer. |
-| `Memo` | `*` | Same as input | Caches the output of an operator so it can be repeatedly read without recomputation. Releases each region as it takes delivery of it, so the input can clear its state; once the input is drained the cache is the sole source of the value. Release builds then skip the upstream pull. A debug build probes the drained input once after it drains and again after each notification, so an input that answers with released data trips the release-contract check at the input; probing on every pull would re-read a shared subgraph once per path to it. A `Memo` is also the one operator wired to `Notified`: after its first pull, while its input has not notified it, the cache is the answer and no pull goes below, in every build, apart from that probe. |
+| `Memo` | `*` | Same as input | Caches the output of an operator so it can be repeatedly read without recomputation. Releases each region as it takes delivery of it, so the input can clear its state; once the input is drained the cache is the sole source of the value. Release builds then skip the upstream pull. A debug build probes the drained input once after it drains and again after each notification of a region the pull reads, so an input that answers with released data trips the release-contract check at the input; probing on every pull would re-read a shared subgraph once per path to it. A `Memo` keeps a dirty region of its input, which starts as everything and takes each region the input notifies (`Arrivals`): a pull outside the dirty region answers from the cache and no pull goes below, in every build, apart from that probe, and a pull inside it reads the input and removes what it read. |
 | `ExtractFinal` | Collection source and optional default | Source codomain | Extracts the last live position's value after source completion; see [Final-value extraction](#final-value-extraction). |
 | `UnionOperator` | N inputs of `DataFunction(dᵢ → 𝑇ᵢ)` tilings | `DataFunction(Union(d₀,…,dₙ₋₁) → Scalar(C'))`, or `DataFunction(Union(d₀,…,dₙ₋₁) → DataFunction(𝐵 → 𝑇))` for jagged rows | Merges N function operators into one. The domain is the discriminated union of the arms' domains, and the codomain is one the caller declares. The domain keeps the arms apart, and `final_or_default` dispatches on the arm a row came from. The codomain is the arms' join, because the arms are alternative values at one row. A union node is typed `D ⤇ V`, with `V` the join inference computed in the full type lattice, and op-conversion reads `V` off the node and passes its extent in. The operator does not join the operand tilings: `Extent`'s lattice has variant and range rules but no record rule, so it would join two arms at different record widths to an anonymous positional sum where the type is `{a: Int}`, a shape no row holds. Arms that agree on a tiling keep it, because a `Tiling` carries a layout (struct-of-arrays for a record) that an `Extent` cannot express. Arms whose codomains are collections over different domains, the rows of a jagged collection, merge at the bound `𝐵` the declared codomain gives their domains, beneath which they share the tiling `𝑇`, as a list literal of boxed rows has it (`OpConversionContext::witness_domain_extent`). Other arms whose codomain tilings differ must each fit in one column (`Tiling::is_scalar`: a `Scalar`, or a `Record` of such at any depth), and each is rebuilt as one column, keeping its own record fields, before the arms merge. A flat union (`new_flat`) collapses the arms' domain to the one they share whatever each row holds, a collection included. A realized conditional's legs are over different domains and disjoint only by their gates, so they flat-merge under the domain bound the sum's type declares (`new_flat_over`), which must include every leg's domain. Release is per arm: an incoming `Predicate::Union` guard splits into per-variant predicates, so one arm can be released in full while its siblings still produce. |
 | `VariantWrap` | Payload: `Scalar(Pₜ)` or `DataFunction(D → Scalar(Pₜ))` | `Scalar(Union(P₀,…,Pₙ))` or `DataFunction(D → Scalar(Union))` | **Sum introduction — dual of `VariantProject`.** Wraps the payload under tag `tag`, so that arm holds the payload and every other arm is empty. Arms are keyed by [`FieldKey`], not by position: a tag's *position* is not stable under width subtyping (``{`b} <: {`a | `b}`` renumbers `b`), and an arm set is part of a union column's layout, so a position-keyed arm would need a renumbering coercion at every subsumption. A bare `Scalar` payload (a scalar `VariantCtor`) yields `Scalar(Union)`; a payload *stream* (a `VariantCtor` inside a lambda, `Builtin::VariantWrap(tag)`) is wrapped element-wise **preserving the domain** `D`, so the constructor composes as the RHS of a `≫`. Because the domain is preserved, a domain release forwards to the payload verbatim. A payload that is a collection is one value, held materialized in its arm's cell: an applied `VariantCtor` wraps its whole payload, and a composed one each row's. A cell cannot grow, so a row's cell is emitted once that row's collection is complete. |

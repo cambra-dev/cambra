@@ -35,7 +35,7 @@ fn another_region() -> Projection {
 }
 
 /// What a recording consumer of the operator `build` makes receives when `region` is notified at
-/// its input `notified`. A consumer passes one notification between pulls, so each call builds an
+/// its input `notified`. A gate passes a region once between pulls, so each call builds an
 /// operator of its own.
 fn received(build: &dyn Fn() -> Built, notified: usize, region: &Projection) -> Vec<Projection> {
     let (mut operator, inputs) = build();
@@ -146,6 +146,37 @@ fn map_result_with_source_carries_no_region_between_notifications() {
 
 fn nested() -> Tiling {
     Tiling::data_function(Extent::uint_range(8), ints())
+}
+
+fn memo() -> Built {
+    let (input, consumer) = feed(ints());
+    (Box::new(Memo::new(input)), vec![consumer])
+}
+
+#[test]
+fn a_memo_forwards_its_inputs_region() {
+    assert_keeps(&memo, 0);
+}
+
+#[test]
+fn a_memo_carries_no_region_between_notifications() {
+    assert_keeps_without_state(&memo, 0);
+}
+
+/// A region that changes at the bottom of `feed → MapDomain → RecordWrap → Memo` reaches the
+/// chain's consumer as it was named: each operator on the way keeps keys.
+#[test]
+fn a_region_crosses_a_chain_of_operators_that_keep_keys() {
+    let chain = || {
+        let (input, consumer) = feed(ints());
+        let domain = MapDomain::new(input);
+        let wrapped = RecordWrap::new_at(SmolStr::new("a"), Box::new(domain), CurryLevel::new(1));
+        (
+            Box::new(Memo::new(Box::new(wrapped))) as Box<dyn TileOperator>,
+            vec![consumer],
+        )
+    };
+    assert_keeps(&chain, 0);
 }
 
 fn zip() -> Built {
@@ -437,4 +468,71 @@ fn make_record_sends_everything_for_a_later_region() {
         received(&make_record, 1, &another_region()),
         [Projection::Everything]
     );
+}
+
+/// A fan-out over a feed with a recording consumer on each of its two slots, as the bindings
+/// `logs`, `producers` and `consumer`: the consumers' logs, the slots' producers, and the consumer
+/// the feed notifies through.
+macro_rules! fan_out_with_two_slots {
+    ($logs:ident, $producers:ident, $consumer:ident) => {
+        let ($logs, mut $producers, $consumer) = {
+            let (input, consumer) = feed(ints());
+            let fan = FanOut::new(input);
+            let mut scheduler = Scheduler::new();
+            let mut logs = Vec::new();
+            let mut producers = Vec::new();
+            for _ in 0..2 {
+                let (log, regions) = RegionLog::new();
+                let mut slot = fan.slot();
+                let guard = slot.tiling().universal_guard();
+                producers.push(slot.subscribe(guard, Box::new(log), &mut scheduler));
+                logs.push(regions);
+            }
+            for regions in &logs {
+                regions.borrow_mut().clear();
+            }
+            (logs, producers, consumer)
+        };
+    };
+}
+
+#[test]
+fn a_fan_out_forwards_a_region_to_every_live_slot_unchanged() {
+    fan_out_with_two_slots!(logs, _producers, consumer);
+    notify_input(&consumer, &region());
+    for regions in &logs {
+        assert_eq!(*regions.borrow_mut(), [region()]);
+    }
+}
+
+/// Between pulls a fan-out passes a notification only for keys it has not passed since the last
+/// pull; a pull reopens it, and the same region passes again.
+#[test]
+fn a_fan_out_suppresses_a_notification_of_keys_it_passed_until_a_pull_reopens_it() {
+    fan_out_with_two_slots!(logs, producers, consumer);
+    notify_input(&consumer, &region());
+    notify_input(&consumer, &region());
+    notify_input(&consumer, &another_region());
+    assert_eq!(*logs[0].borrow_mut(), [region(), another_region()]);
+    let guard = producers[0].tiling().universal_guard();
+    producers[0].get(guard);
+    notify_input(&consumer, &region());
+    assert_eq!(
+        *logs[0].borrow_mut(),
+        [region(), another_region(), region()]
+    );
+}
+
+/// A zip's arms notify different keys between pulls, and the zip's consumer hears of each: a memo
+/// above it marks both regions dirty.
+#[test]
+fn a_zip_passes_the_regions_of_two_arms_between_pulls() {
+    let (mut operator, inputs) = zip();
+    let (log, regions) = RegionLog::new();
+    let guard = operator.tiling().universal_guard();
+    let _producer = operator.subscribe(guard, Box::new(log), &mut Scheduler::new());
+    regions.borrow_mut().clear();
+    notify_input(&inputs[0], &region());
+    notify_input(&inputs[1], &another_region());
+    assert_eq!(*regions.borrow_mut(), [region(), another_region()]);
 }
