@@ -945,22 +945,19 @@ fn consume_store<S: SteppedStore>(store: &mut S, input: InputId, guard: TileGuar
     }
 }
 
-/// Finish an epoch of one of `store`'s inputs: push what the store has decided. At the run's last
-/// epoch of the last input to finish it, the store settles first ([`SteppedStore::settle`]).
+/// Finish one of `store`'s inputs: push what the store has decided. At the finish of the last
+/// input to finish, the store settles first ([`SteppedStore::settle`]).
 ///
 /// # Panics
 ///
-/// At the run's last epoch of the last input to finish it, where the store is not terminal:
-/// nothing steps the store after it.
+/// At the finish of the last input to finish, where the store is not terminal: nothing steps
+/// the store after it.
 fn finish_store<S: SteppedStore>(
     store: &mut S,
     pushes: &mut crate::interpreter::dispatcher::Pushes<'_>,
-    last: bool,
 ) {
-    if last {
-        store.breaker_mut().last_finishes += 1;
-    }
-    let settled = last && store.breaker().last_finishes == store.inputs();
+    store.breaker_mut().last_finishes += 1;
+    let settled = store.breaker().last_finishes == store.inputs();
     if settled {
         store.settle();
     }
@@ -1024,8 +1021,8 @@ impl Breaker for InductionStoreProducer {
     }
 
     /// As [`finish_store`].
-    fn finish(&mut self, pushes: &mut crate::interpreter::dispatcher::Pushes<'_>, last: bool) {
-        finish_store(self, pushes, last);
+    fn finish(&mut self, pushes: &mut crate::interpreter::dispatcher::Pushes<'_>) {
+        finish_store(self, pushes);
     }
 }
 
@@ -1375,8 +1372,8 @@ impl Breaker for CommitProducer {
     }
 
     /// As [`finish_store`].
-    fn finish(&mut self, pushes: &mut crate::interpreter::dispatcher::Pushes<'_>, last: bool) {
-        finish_store(self, pushes, last);
+    fn finish(&mut self, pushes: &mut crate::interpreter::dispatcher::Pushes<'_>) {
+        finish_store(self, pushes);
     }
 }
 

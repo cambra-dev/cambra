@@ -411,13 +411,13 @@ impl Breaker for ExtractFinalProducer {
     ///
     /// # Panics
     ///
-    /// When `last` and the output is unreleased and no value has been extracted: the source has
-    /// not been released whole, or the default it fell back to has not converged. A dispatcher
-    /// issues no `consume_impl` after the last epoch, so nothing would read that default again,
-    /// and pushing nothing would leave the reader with no value.
-    fn finish(&mut self, pushes: &mut Pushes<'_>, last: bool) {
+    /// When the output is unreleased and no value has been extracted: the source has not been
+    /// released whole, or the default it fell back to has not converged. A dispatcher issues no
+    /// `consume_impl` after the finish, so nothing would read that default again, and pushing
+    /// nothing would leave the reader with no value.
+    fn finish(&mut self, pushes: &mut Pushes<'_>) {
         assert!(
-            !last || self.released || self.final_tile.is_some(),
+            self.released || self.final_tile.is_some(),
             "{} finishes after it extracted its value: the source released whole and any \
              default it fell back to converged",
             self.name()
@@ -1076,25 +1076,8 @@ mod consuming_tests {
         assert_eq!(extract.final_guard(), int().universal_guard());
     }
 
-    /// An epoch before the last finishes with no value extracted yet: a later epoch's consume may
-    /// still extract it.
-    #[test]
-    fn an_epoch_before_the_last_finishes_without_a_value() {
-        let source = source([]);
-        let (default, _) = ScriptedProducer::new(Tile::Scalar(ColumnValue::Ints(vec![])), int());
-        let mut extract = final_over(&source, Some(Box::new(default)));
-        extract.enter_consuming_mode();
-        extract.consume_impl(InputId::ONLY, ints().universal_guard());
-        push_to(&mut extract, &[1]);
-        let dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
-        let mut pushes = dispatcher.pushes(PipelineId(0));
-        extract.finish(&mut pushes, false);
-        dispatcher.land(pushes);
-        assert!(dispatcher.pop().is_none(), "nothing to push");
-    }
-
-    /// A default that has not converged by the last epoch's `finish` is never read again: the
-    /// dispatcher issues no later `consume_impl`.
+    /// A default that has not converged by the `finish` is never read again: the dispatcher
+    /// issues no later `consume_impl`.
     #[test]
     #[should_panic(expected = "finishes after it extracted its value")]
     fn finish_with_an_unconverged_default_panics() {
@@ -1103,10 +1086,7 @@ mod consuming_tests {
         let mut extract = final_over(&source, Some(Box::new(default)));
         extract.enter_consuming_mode();
         extract.consume_impl(InputId::ONLY, ints().universal_guard());
-        extract.finish(
-            &mut Dispatcher::new(vec![vec![]], usize::MAX).pushes(PipelineId(0)),
-            true,
-        );
+        extract.finish(&mut Dispatcher::new(vec![vec![]], usize::MAX).pushes(PipelineId(0)));
     }
 
     /// An output released before the value was extracted pushes nothing, and that is no error.
@@ -1119,7 +1099,7 @@ mod consuming_tests {
         extract.release(int().universal_guard());
         push_to(&mut extract, &[1]);
         let dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
-        dispatcher.finish_by_hand(PipelineId(0), |pushes| extract.finish(pushes, true));
+        dispatcher.finish_by_hand(PipelineId(0), |pushes| extract.finish(pushes));
         assert!(dispatcher.pop().is_none());
     }
 

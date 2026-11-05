@@ -271,13 +271,13 @@ impl Breaker for AggregateProducer {
     ///
     /// # Panics
     ///
-    /// At the last epoch, where the output is not released and the input has not been released
-    /// whole. A dispatcher issues no `consume_impl` after the last epoch, so the accumulator would
-    /// stay partial and the reader would get no value.
-    fn finish(&mut self, pushes: &mut Pushes<'_>, last: bool) {
+    /// Where the output is not released and the input has not been released whole. A dispatcher
+    /// issues no `consume_impl` after the finish, so the accumulator would stay partial and the
+    /// reader would get no value.
+    fn finish(&mut self, pushes: &mut Pushes<'_>) {
         assert!(
-            !last || self.released || self.input.obsolete_guard().is_universal(),
-            "{} finishes the last epoch after its input was released whole",
+            self.released || self.input.obsolete_guard().is_universal(),
+            "{} finishes after its input was released whole",
             self.name()
         );
         pushes.push_final(self);
@@ -2683,40 +2683,19 @@ mod aggregate_consuming_tests {
     /// An input released in part by the last epoch leaves a partial accumulator that no later
     /// consume completes, so the last epoch's finish panics rather than push nothing.
     #[test]
-    #[should_panic(expected = "finishes the last epoch after its input was released whole")]
-    fn finish_of_the_last_epoch_over_a_partial_input_panics() {
+    #[should_panic(expected = "finishes after its input was released whole")]
+    fn finish_over_a_partial_input_panics() {
         let source = source(0..10);
         let mut aggregate = sum_over(&source);
         aggregate.enter_consuming_mode();
         aggregate.consume_impl(InputId::ONLY, keys_between(0, 4));
-        aggregate.finish(
-            &mut Dispatcher::new(vec![vec![]], usize::MAX).pushes(PipelineId(0)),
-            true,
-        );
+        aggregate.finish(&mut Dispatcher::new(vec![vec![]], usize::MAX).pushes(PipelineId(0)));
     }
 
-    /// An epoch before the last finishes over a partial input and pushes nothing: the
-    /// accumulator is held by no guard until a later epoch's consume completes it.
+    /// An aggregate whose output was released needs no value, so its finish over a partial input
+    /// neither panics nor pushes.
     #[test]
-    fn an_epoch_before_the_last_finishes_over_a_partial_input() {
-        let source = source(0..10);
-        let mut aggregate = sum_over(&source);
-        aggregate.enter_consuming_mode();
-        aggregate.consume_impl(InputId::ONLY, keys_between(0, 4));
-        push_to(&mut aggregate, &[1]);
-        let dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
-        dispatcher.seal();
-        dispatcher.finish_by_hand(PipelineId(0), |pushes| aggregate.finish(pushes, false));
-        assert!(
-            dispatcher.pop().is_none(),
-            "a partial accumulator pushes nothing"
-        );
-    }
-
-    /// An aggregate whose output was released needs no value, so the last epoch's finish over a
-    /// partial input neither panics nor pushes.
-    #[test]
-    fn finish_of_the_last_epoch_after_the_output_was_released_pushes_nothing() {
+    fn finish_after_the_output_was_released_pushes_nothing() {
         let source = source(0..10);
         let mut aggregate = sum_over(&source);
         aggregate.enter_consuming_mode();
@@ -2724,7 +2703,7 @@ mod aggregate_consuming_tests {
         aggregate.release(sum_tiling().universal_guard());
         push_to(&mut aggregate, &[1]);
         let dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
-        dispatcher.finish_by_hand(PipelineId(0), |pushes| aggregate.finish(pushes, true));
+        dispatcher.finish_by_hand(PipelineId(0), |pushes| aggregate.finish(pushes));
         assert!(
             dispatcher.pop().is_none(),
             "a released output pushes nothing"

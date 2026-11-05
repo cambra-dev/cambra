@@ -2427,7 +2427,7 @@ mod projection_tests {
         memo.consume_impl(InputId::ONLY, ints().universal_guard());
         push_to(&mut memo, &[1]);
         let dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
-        dispatcher.finish_by_hand(PipelineId(0), |pushes| memo.finish(pushes, true));
+        dispatcher.finish_by_hand(PipelineId(0), |pushes| memo.finish(pushes));
         assert!(dispatcher.pop().is_some(), "finish pushed a package");
         assert!(memo.wakeups.is_empty());
     }
@@ -3234,7 +3234,7 @@ mod consuming_tests {
         memo.get(All.guard());
         push_to(&mut memo, &[1]);
         let dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
-        dispatcher.finish_by_hand(PipelineId(0), |pushes| memo.finish(pushes, true));
+        dispatcher.finish_by_hand(PipelineId(0), |pushes| memo.finish(pushes));
         assert!(dispatcher.pop().is_some(), "finish pushed a package");
         assert!(memo.wakeups.is_empty(), "finish queues no wake");
     }

@@ -18,7 +18,7 @@ use super::*;
 use crate::ccl::AggregateKind;
 use crate::interpreter::dispatcher::consume as hand_over;
 use crate::interpreter::dispatcher::{
-    BreakerHandle, Dispatcher, Event, Next, PipelineId, WorkPackage, finish_epoch, run,
+    BreakerHandle, Dispatcher, Event, Next, PipelineId, WorkPackage, finish_pipeline, run,
 };
 use crate::interpreter::{
     BaseType, ColumnValue, Extent, WakeupQueue, domain_prefix, forwarding_consumer_tagging,
@@ -254,9 +254,7 @@ fn a_partly_released_breaker_pushes_only_what_is_left() {
     memo.borrow_mut().release(keys_between(2, 3));
     push_to(&mut *memo.borrow_mut(), &[1]);
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        memo.borrow_mut().finish(pushes, true)
-    });
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| memo.borrow_mut().finish(pushes));
     let package = dispatcher.pop().expect("one package for the reader");
     assert_eq!(package.pipeline, PipelineId(1));
     assert!(same_region(
@@ -347,10 +345,11 @@ fn a_reader_of_two_pipelines_consumes_both_and_finishes_after_both() {
     );
 }
 
-/// A reader takes no push of a pipeline it follows, and no package before that pipeline has
-/// finished the epoch: here pipeline 2 follows 1 and takes 0's pushes.
+/// A reader takes no push of a pipeline it follows, and no package before that pipeline is
+/// quiescent, having consumed every package queued for it: here pipeline 2 follows 1 and takes
+/// 0's pushes.
 #[test]
-fn a_reader_takes_nothing_before_the_pipeline_it_follows_finishes() {
+fn a_reader_takes_nothing_before_the_pipeline_it_follows_is_quiescent() {
     let (low, high) = halves();
     let breakers: Vec<BreakerHandle> = vec![
         Scripted::holding(low.clone()),
@@ -377,8 +376,16 @@ fn a_reader_takes_nothing_before_the_pipeline_it_follows_finishes() {
         .expect("pipeline 2 consumes");
     let built = events
         .iter()
-        .position(|event| *event == finished(1))
-        .expect("pipeline 1 finishes");
+        .rposition(|event| {
+            matches!(
+                event,
+                Event::Consume {
+                    pipeline: PipelineId(1),
+                    ..
+                }
+            )
+        })
+        .expect("pipeline 1 consumes");
     assert!(built < first, "{events:?}");
     assert_eq!(consumed_by(&events, 2), vec![low]);
 }
@@ -441,8 +448,8 @@ fn finish_with_a_package_queued_panics() {
         .borrow_mut()
         .consume_impl(InputId::ONLY, ints().universal_guard());
     dispatcher.close(PipelineId(0));
-    finish_epoch(&dispatcher, &breakers, PipelineId(0));
-    finish_epoch(&dispatcher, &breakers, PipelineId(1));
+    finish_pipeline(&dispatcher, &breakers, PipelineId(0));
+    finish_pipeline(&dispatcher, &breakers, PipelineId(1));
 }
 
 #[test]
@@ -452,7 +459,7 @@ fn finish_before_an_upstream_pipeline_finished_panics() {
         Scripted::holding(ints().universal_guard()),
         Scripted::holding(ints().universal_guard()),
     ];
-    finish_epoch(
+    finish_pipeline(
         &Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED),
         &breakers,
         PipelineId(1),
@@ -469,7 +476,7 @@ fn finish_twice_panics() {
     wire(&[vec![], vec![0]], &breakers);
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     run(&dispatcher, &breakers);
-    finish_epoch(&dispatcher, &breakers, PipelineId(1));
+    finish_pipeline(&dispatcher, &breakers, PipelineId(1));
 }
 
 /// A source finishes once its input has released every region queued for it: one whose input
@@ -490,7 +497,7 @@ fn a_source_pipeline_finishes_after_its_input_released_what_was_queued() {
     memo.borrow_mut()
         .consume_impl(InputId::ONLY, keys_between(0, 3));
     dispatcher.acknowledge(package);
-    finish_epoch(&dispatcher, &[handle], PipelineId(0));
+    finish_pipeline(&dispatcher, &[handle], PipelineId(0));
 }
 
 /// An input of `0..2 ⤇ 0..3 ⤇ Int` that answers nothing: a test names what it releases.
@@ -535,7 +542,7 @@ fn finish_row_released_through(path: Vec<Value>) {
         panic!("a notified source hands out its package")
     };
     hand_over(&dispatcher, &breakers, package);
-    finish_epoch(&dispatcher, &breakers, PipelineId(0));
+    finish_pipeline(&dispatcher, &breakers, PipelineId(0));
 }
 
 /// An input that released a row through its last position has released the row: the row's paths
@@ -877,9 +884,7 @@ fn a_partly_released_source_pushes_morsels_over_what_is_left() {
     memo.borrow_mut().release(keys_between(2, 3));
     push_to(&mut *memo.borrow_mut(), &[1]);
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], 2);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        memo.borrow_mut().finish(pushes, true)
-    });
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| memo.borrow_mut().finish(pushes));
     let mut morsels = Vec::new();
     while let Some(package) = dispatcher.pop() {
         morsels.push(package.guard);
@@ -897,9 +902,7 @@ fn a_breaker_of_one_value_pushes_one_morsel() {
         .consume_impl(InputId::ONLY, ints().universal_guard());
     push_to(&mut *sum.borrow_mut(), &[1]);
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], 1);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        sum.borrow_mut().finish(pushes, true)
-    });
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| sum.borrow_mut().finish(pushes));
     let package = dispatcher.pop().expect("one morsel");
     assert_eq!(package.guard, sum_tiling().universal_guard());
     assert_eq!(dispatcher.pop(), None, "one morsel");
@@ -963,9 +966,7 @@ fn overlapping_morsels_are_refused() {
     let breaker = Scripted::cutting(ints().universal_guard(), cut);
     push_to(&mut *breaker.borrow_mut(), &[1]);
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], 1);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        breaker.borrow_mut().finish(pushes, true)
-    });
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| breaker.borrow_mut().finish(pushes));
 }
 
 /// A pipeline that would consume a region twice is refused: a guard pushed twice names the region
@@ -1011,7 +1012,7 @@ fn a_final_guard_pushed_twice_is_pushed_once() {
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
         for _ in 0..2 {
-            breakers[0].borrow_mut().finish(pushes, true);
+            breakers[0].borrow_mut().finish(pushes);
         }
     });
     let pushed: Vec<_> = std::iter::from_fn(|| dispatcher.pop())
@@ -1101,7 +1102,7 @@ fn ordered_reader() -> (Dispatcher, Vec<BreakerHandle>) {
     let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.order(PipelineId(1));
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        breakers[0].borrow_mut().finish(pushes, true)
+        breakers[0].borrow_mut().finish(pushes)
     });
     (dispatcher, breakers)
 }
@@ -1115,7 +1116,6 @@ fn a_later_morsel_consumed_first_is_refused() {
     let first = dispatcher.pop().expect("the lower morsel");
     let later = WorkPackage {
         pipeline: first.pipeline,
-        epoch: 0,
         guard: TileGuard::Function(FunctionGuard::Domain(
             Predicate::True.minus(&keys_predicate(0, 1)),
         )),
@@ -1167,7 +1167,6 @@ fn a_package_not_claimed_is_refused() {
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     let package = WorkPackage {
         pipeline: PipelineId(1),
-        epoch: 0,
         guard: ints().universal_guard(),
         index: 0,
     };
@@ -1210,7 +1209,6 @@ fn a_refusal_fails_the_run_before_it_panics() {
         ("an acknowledgement for no pipeline", |dispatcher| {
             dispatcher.acknowledge(WorkPackage {
                 pipeline: PipelineId(9),
-                epoch: 0,
                 guard: ints().universal_guard(),
                 index: 0,
             })
@@ -1239,34 +1237,14 @@ fn a_refusal_fails_the_run_before_it_panics() {
 }
 
 /// Claim and acknowledge every package `dispatcher` hands out for `pipeline` now: each one's
-/// epoch and guard, in claim order.
-fn drain(dispatcher: &Dispatcher, pipeline: usize) -> Vec<(u64, TileGuard)> {
+/// guard, in claim order.
+fn drain(dispatcher: &Dispatcher, pipeline: usize) -> Vec<TileGuard> {
     let mut consumed = Vec::new();
     while let Some(package) = dispatcher.claim_of(PipelineId(pipeline)) {
-        consumed.push((package.epoch, package.guard.clone()));
+        consumed.push(package.guard.clone());
         dispatcher.acknowledge(package);
     }
     consumed
-}
-
-/// The finish a claim hands out next, pushed `pushed` and finished: its pipeline, epoch, and
-/// whether the epoch is the last.
-fn finish_next(dispatcher: &Dispatcher, pushed: Option<TileGuard>) -> (usize, u64, bool) {
-    let Next::Finish {
-        pipeline,
-        epoch,
-        last,
-        ..
-    } = dispatcher.try_claim(None)
-    else {
-        panic!("a pipeline may finish an epoch")
-    };
-    let mut pushes = dispatcher.pushes_in(pipeline, epoch);
-    if let Some(pushed) = &pushed {
-        pushes.push(pushed, |guard, _| vec![guard.clone()]);
-    }
-    dispatcher.finish(pushes);
-    (pipeline.0, epoch, last)
 }
 
 /// A source is queued each region it is notified of in the current epoch, cut every
@@ -1277,23 +1255,19 @@ fn a_notified_source_consumes_each_region_and_finishes_once_closed() {
     dispatcher.notify(PipelineId(0), &keys_between(0, 4));
     assert_eq!(
         drain(&dispatcher, 0),
-        vec![
-            (0, keys_between(0, 1)),
-            (0, keys_between(2, 3)),
-            (0, keys_between(4, 4))
-        ]
+        vec![keys_between(0, 1), keys_between(2, 3), keys_between(4, 4)]
     );
     assert!(
         matches!(dispatcher.try_claim(None), Next::Wait(_)),
         "an open source waits for more of its input"
     );
     dispatcher.notify(PipelineId(0), &keys_between(5, 6));
-    assert_eq!(drain(&dispatcher, 0), vec![(0, keys_between(5, 6))]);
+    assert_eq!(drain(&dispatcher, 0), vec![keys_between(5, 6)]);
     dispatcher.close(PipelineId(0));
-    let Next::Finish { consumed, last, .. } = dispatcher.try_claim(None) else {
+    let Next::Finish { consumed, .. } = dispatcher.try_claim(None) else {
         panic!("a closed source whose packages are all acknowledged finishes")
     };
-    assert_eq!((consumed, last), (Some(keys_between(0, 6)), true));
+    assert_eq!(consumed, Some(keys_between(0, 6)));
 }
 
 /// A notified region is cut every `morsel_rows` positions counted across its runs.
@@ -1304,7 +1278,7 @@ fn a_notified_region_is_cut_every_rows_positions_across_its_runs() {
         PipelineId(0),
         &keys_between(0, 2).union(&keys_between(10, 12)),
     );
-    let guards: Vec<_> = drain(&dispatcher, 0).into_iter().map(|(_, g)| g).collect();
+    let guards: Vec<_> = drain(&dispatcher, 0);
     assert_eq!(
         guards,
         vec![
@@ -1320,7 +1294,7 @@ fn a_notified_region_is_cut_every_rows_positions_across_its_runs() {
 fn a_notified_guard_of_no_positions_is_one_package() {
     let dispatcher = Dispatcher::new(vec![vec![]], 2);
     dispatcher.notify(PipelineId(0), &ints().universal_guard());
-    assert_eq!(drain(&dispatcher, 0), vec![(0, ints().universal_guard())]);
+    assert_eq!(drain(&dispatcher, 0), vec![ints().universal_guard()]);
 }
 
 /// A closed source takes no more of its input.
@@ -1359,312 +1333,17 @@ fn a_region_notified_twice_is_refused() {
     dispatcher.notify(PipelineId(0), &keys_between(3, 4));
 }
 
-/// A sealed epoch finishes while the next runs: the source finishes epoch 0 and its reader
-/// consumes what it pushed there and finishes epoch 0 too, while epoch 1's package is in flight.
-#[test]
-fn a_sealed_epoch_finishes_while_the_next_runs() {
-    let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.notify(PipelineId(0), &keys_between(0, 1));
-    dispatcher.seal();
-    dispatcher.notify(PipelineId(0), &keys_between(2, 3));
-    let first = dispatcher
-        .claim_of(PipelineId(0))
-        .expect("epoch 0's package");
-    let second = dispatcher
-        .claim_of(PipelineId(0))
-        .expect("epoch 1's package");
-    assert_eq!((first.epoch, second.epoch), (0, 1));
-    dispatcher.acknowledge(first);
-    assert_eq!(
-        finish_next(&dispatcher, Some(keys_between(0, 1))),
-        (0, 0, false)
-    );
-    assert_eq!(drain(&dispatcher, 1), vec![(0, keys_between(0, 1))]);
-    assert_eq!(finish_next(&dispatcher, None), (1, 0, false));
-    dispatcher.acknowledge(second);
-}
-
-/// A pipeline's epochs run in parallel and finish in any order: epoch 1 finishes first while
-/// epoch 0's package is in flight, and epoch 0 after.
-#[test]
-fn a_pipelines_epochs_finish_in_any_order() {
-    let dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
-    dispatcher.notify(PipelineId(0), &keys_between(0, 1));
-    dispatcher.seal();
-    dispatcher.notify(PipelineId(0), &keys_between(2, 3));
-    dispatcher.seal();
-    let early = dispatcher
-        .claim_of(PipelineId(0))
-        .expect("epoch 0's package");
-    let late = dispatcher
-        .claim_of(PipelineId(0))
-        .expect("epoch 1's package");
-    assert_eq!((early.epoch, late.epoch), (0, 1));
-    dispatcher.acknowledge(late);
-    assert_eq!(finish_next(&dispatcher, None), (0, 1, false));
-    dispatcher.acknowledge(early);
-    assert_eq!(finish_next(&dispatcher, None), (0, 0, false));
-}
-
-/// A seal waits while the window's slot for the next epoch holds an epoch in flight, and opens
-/// it once that epoch has retired.
-#[test]
-fn a_seal_waits_while_the_window_is_full() {
-    let mut dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
-    dispatcher.window(2);
-    assert!(dispatcher.try_seal(), "epoch 1 has a slot of its own");
-    assert!(
-        !dispatcher.try_seal(),
-        "epoch 2 takes epoch 0's slot, which is in flight"
-    );
-    assert_eq!(finish_next(&dispatcher, None), (0, 0, false));
-    assert!(dispatcher.try_seal(), "epoch 0 has retired");
-}
-
-/// The run ends with its last epoch, once every source is closed: a source closed while another
-/// is open finishes its epochs as they are sealed, and the epoch of the last close is the last.
-#[test]
-fn the_last_epoch_is_the_one_every_source_has_closed_in() {
-    let dispatcher = Dispatcher::new(vec![vec![], vec![]], UNBOUNDED);
-    dispatcher.close(PipelineId(0));
-    assert!(
-        matches!(dispatcher.try_claim(None), Next::Wait(_)),
-        "epoch 0 is neither sealed nor known to be the last"
-    );
-    dispatcher.seal();
-    assert_eq!(finish_next(&dispatcher, None), (0, 0, false));
-    assert_eq!(finish_next(&dispatcher, None), (1, 0, false));
-    dispatcher.close(PipelineId(1));
-    assert_eq!(finish_next(&dispatcher, None), (0, 1, true));
-    assert_eq!(finish_next(&dispatcher, None), (1, 1, true));
-    assert!(matches!(dispatcher.try_claim(None), Next::Done));
-}
-
-/// An epoch a source is sealed in after every source closed has no epoch after it.
-#[test]
-#[should_panic(expected = "a seal opens an epoch while a source is open")]
-fn a_seal_after_the_last_close_is_refused() {
-    let dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
-    dispatcher.close(PipelineId(0));
-    dispatcher.seal();
-}
-
-/// A memo over a source notified in two epochs pushes in each epoch, as it consumes, only what
-/// that epoch decided, and the reader consumes every key once.
-#[test]
-fn a_memo_pushes_in_each_epoch_what_it_decided_since_the_last() {
-    let memo = MemoProducer::over(Box::new(Input::over(&source(0..6))), &ints());
-    let memo = Rc::new(RefCell::new(memo));
-    let reader = Scripted::holding(ints().empty_guard());
-    let breakers: Vec<BreakerHandle> = vec![memo, reader];
-    wire(&[vec![], vec![0]], &breakers);
-    for breaker in &breakers {
-        breaker.borrow_mut().enter_consuming_mode();
-    }
-    let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.notify(PipelineId(0), &keys_between(0, 2));
-    dispatcher.seal();
-    let package = dispatcher
-        .claim_of(PipelineId(0))
-        .expect("epoch 0's package");
-    hand_over(&dispatcher, &breakers, package);
-    let pushed = dispatcher
-        .claim_of(PipelineId(1))
-        .expect("the memo's push lands while epoch 0 runs");
-    assert_eq!(pushed.epoch, 0);
-    hand_over(&dispatcher, &breakers, pushed);
-    let Next::Finish {
-        pipeline, epoch, ..
-    } = dispatcher.try_claim(None)
-    else {
-        panic!("the memo finishes epoch 0")
-    };
-    let mut pushes = dispatcher.pushes_in(pipeline, epoch);
-    breakers[0].borrow_mut().finish(&mut pushes, false);
-    dispatcher.finish(pushes);
-    dispatcher.notify(PipelineId(0), &keys_between(3, 5));
-    dispatcher.close(PipelineId(0));
-    run_epochs(&dispatcher, &breakers);
-    let events = dispatcher.into_events();
-    let read: Vec<_> = events
-        .iter()
-        .filter_map(|event| match event {
-            Event::Consume { pipeline, guard } if *pipeline == PipelineId(1) => Some(guard),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(read.len(), 2, "one push per epoch: {read:?}");
-    assert!(guard_minus(read[0], &keys_between(0, 2)).is_empty());
-    assert!(guard_minus(read[1], &keys_between(3, 5)).is_empty());
-}
-
-/// Drive `breakers` through every epoch queued, as [`run`] drives one, without starting the
-/// sources.
-fn run_epochs(dispatcher: &Dispatcher, breakers: &[BreakerHandle]) {
-    loop {
-        match dispatcher.try_claim(None) {
-            Next::Package(package) => hand_over(dispatcher, breakers, package),
-            Next::Finish {
-                pipeline,
-                epoch,
-                last,
-                ..
-            } => {
-                let mut breaker = breakers[pipeline.0].borrow_mut();
-                let mut pushes = dispatcher.pushes_in(pipeline, epoch);
-                match last {
-                    true => breaker.finish(&mut pushes, true),
-                    false => pushes.push_final(&*breaker),
-                }
-                dispatcher.finish(pushes);
-            }
-            Next::Done => return,
-            other => panic!("a run of queued epochs on one thread: {other:?}"),
-        }
-    }
-}
-
-/// An ordered pipeline runs its epochs one after another: an epoch's package waits while a
-/// package of the epoch before is in flight, and until that epoch has finished.
-#[test]
-fn an_ordered_pipeline_runs_its_epochs_one_after_another() {
-    let mut dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
-    dispatcher.order(PipelineId(0));
-    dispatcher.notify(PipelineId(0), &keys_between(0, 1));
-    dispatcher.seal();
-    dispatcher.notify(PipelineId(0), &keys_between(2, 3));
-    let first = dispatcher
-        .claim_of(PipelineId(0))
-        .expect("epoch 0's package");
-    assert!(
-        dispatcher.claim_of(PipelineId(0)).is_none(),
-        "epoch 1's package waits while epoch 0's is in flight"
-    );
-    dispatcher.acknowledge(first);
-    assert!(
-        dispatcher.claim_of(PipelineId(0)).is_none(),
-        "epoch 1's package waits until epoch 0 has finished"
-    );
-    assert_eq!(finish_next(&dispatcher, None), (0, 0, false));
-    let second = dispatcher
-        .claim_of(PipelineId(0))
-        .expect("epoch 1's package");
-    assert_eq!(second.epoch, 1);
-}
-
-/// An ordered reader consumes its epochs in order, though the pipeline it reads finishes the
-/// later epoch first.
-#[test]
-fn an_ordered_reader_consumes_its_epochs_in_order() {
-    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.order(PipelineId(1));
-    dispatcher.notify(PipelineId(0), &keys_between(0, 1));
-    dispatcher.seal();
-    dispatcher.notify(PipelineId(0), &keys_between(2, 3));
-    dispatcher.seal();
-    let held = dispatcher
-        .claim_of(PipelineId(0))
-        .expect("epoch 0's package");
-    assert_eq!(drain(&dispatcher, 0), vec![(1, keys_between(2, 3))]);
-    assert_eq!(
-        finish_next(&dispatcher, Some(keys_between(2, 3))),
-        (0, 1, false)
-    );
-    assert!(
-        dispatcher.claim_of(PipelineId(1)).is_none(),
-        "epoch 1's push waits until the reader has finished epoch 0"
-    );
-    dispatcher.acknowledge(held);
-    assert_eq!(
-        finish_next(&dispatcher, Some(keys_between(0, 1))),
-        (0, 0, false)
-    );
-    assert_eq!(drain(&dispatcher, 1), vec![(0, keys_between(0, 1))]);
-    assert_eq!(finish_next(&dispatcher, None), (1, 0, false));
-    assert_eq!(drain(&dispatcher, 1), vec![(1, keys_between(2, 3))]);
-    assert_eq!(finish_next(&dispatcher, None), (1, 1, false));
-}
-
-/// The last epoch finishes only after every earlier epoch of the pipeline: a package of the
-/// epoch before in flight holds the last epoch's finish back, though its own packages are
-/// acknowledged.
-#[test]
-fn the_last_epoch_finishes_after_the_earlier_ones() {
-    let dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
-    dispatcher.notify(PipelineId(0), &keys_between(0, 1));
-    dispatcher.seal();
-    dispatcher.notify(PipelineId(0), &keys_between(2, 3));
-    let held = dispatcher
-        .claim_of(PipelineId(0))
-        .expect("epoch 0's package");
-    dispatcher.close(PipelineId(0));
-    assert_eq!(drain(&dispatcher, 0), vec![(1, keys_between(2, 3))]);
-    assert!(
-        matches!(dispatcher.try_claim(None), Next::Wait(_)),
-        "the last epoch waits for epoch 0's package"
-    );
-    dispatcher.acknowledge(held);
-    assert_eq!(finish_next(&dispatcher, None), (0, 0, false));
-    assert_eq!(finish_next(&dispatcher, None), (0, 1, true));
-}
-
-/// A package of an epoch that has retired is refused.
-#[test]
-#[should_panic(expected = "pipeline 0 consumes a package claimed for it")]
-fn a_package_of_a_retired_epoch_is_refused() {
-    let mut dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
-    dispatcher.window(2);
-    dispatcher.notify(PipelineId(0), &keys_between(0, 1));
-    let package = dispatcher
-        .claim_of(PipelineId(0))
-        .expect("epoch 0's package");
-    dispatcher.acknowledge(package.clone());
-    dispatcher.seal();
-    assert_eq!(finish_next(&dispatcher, None), (0, 0, false));
-    assert!(
-        dispatcher.try_seal(),
-        "epoch 0 has retired, so its slot opens epoch 2"
-    );
-    dispatcher.acknowledge(package);
-}
-
-/// A window of one epoch would hold the epoch a seal opens in the slot of the one it seals.
-#[test]
-#[should_panic(expected = "a window holds the epoch a seal opens beside the one it seals")]
-fn a_window_of_one_epoch_is_refused() {
-    Dispatcher::new(vec![vec![]], UNBOUNDED).window(1);
-}
-
-/// A window replaces every epoch, so it is set before anything is queued.
-#[test]
-#[should_panic(expected = "a window is set before any notify, seal or close")]
-fn a_window_set_after_a_notify_is_refused() {
-    let mut dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
-    dispatcher.notify(PipelineId(0), &keys_between(0, 1));
-    dispatcher.window(2);
-}
-
-/// A window set after a seal would replace the epoch the seal opened.
-#[test]
-#[should_panic(expected = "a window is set before any notify, seal or close")]
-fn a_window_set_after_a_seal_is_refused() {
-    let mut dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
-    dispatcher.seal();
-    dispatcher.window(2);
-}
-
 /// A limited source takes a notify only while fewer packages than its limit are outstanding,
-/// in every epoch, and takes more once one is acknowledged.
+/// and takes more once one is acknowledged.
 #[test]
 fn a_limited_source_takes_a_notify_below_its_limit() {
     let mut dispatcher = Dispatcher::new(vec![vec![]], 1);
     dispatcher.limit(PipelineId(0), 2);
     assert!(dispatcher.try_notify(PipelineId(0), &keys_between(0, 0)));
-    dispatcher.seal();
     assert!(dispatcher.try_notify(PipelineId(0), &keys_between(1, 1)));
     assert!(
         !dispatcher.try_notify(PipelineId(0), &keys_between(2, 2)),
-        "two packages are outstanding, one in each epoch"
+        "two packages are outstanding"
     );
     let package = dispatcher.claim_of(PipelineId(0)).expect("a package");
     assert!(
@@ -1694,13 +1373,13 @@ fn a_limited_reader_is_refused() {
     Dispatcher::new(vec![vec![], vec![0]], 1).limit(PipelineId(1), 2);
 }
 
-/// A push lands only while its pipeline has not finished the epoch.
+/// A push lands only while its pipeline has not finished.
 #[test]
-#[should_panic(expected = "pipeline 0 lands its pushes in an epoch before it finishes there")]
+#[should_panic(expected = "pipeline 0 lands its pushes before it finishes")]
 fn a_push_landed_after_the_finish_is_refused() {
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.finish_by_hand(PipelineId(0), |_| {});
-    let mut pushes = dispatcher.pushes_in(PipelineId(0), 0);
+    let mut pushes = dispatcher.pushes(PipelineId(0));
     pushes.push(&keys_between(0, 1), |guard, _| vec![guard.clone()]);
     dispatcher.land(pushes);
 }
@@ -1812,9 +1491,7 @@ fn a_push_lands_restated_by_the_chain_and_past_the_gate() {
         .base_mut()
         .pushing_to(Rc::new(RefCell::new(Boxed(arm))));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        scripted.borrow_mut().finish(pushes, true)
-    });
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| scripted.borrow_mut().finish(pushes));
     let queued: Vec<TileGuard> = std::iter::from_fn(|| dispatcher.pop())
         .map(|package| package.guard)
         .collect();
@@ -1843,9 +1520,7 @@ fn a_push_naming_every_tag_whole_lands_universal() {
         .base_mut()
         .pushing_to(Rc::new(RefCell::new(Boxed(path))));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        scripted.borrow_mut().finish(pushes, true)
-    });
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| scripted.borrow_mut().finish(pushes));
     let queued: Vec<TileGuard> = std::iter::from_fn(|| dispatcher.pop())
         .map(|package| package.guard)
         .collect();
@@ -1868,9 +1543,7 @@ fn a_push_reaching_a_reader_twice_is_queued_once() {
         .base_mut()
         .pushing_to(Rc::new(RefCell::new(Paths(paths))));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        scripted.borrow_mut().finish(pushes, true)
-    });
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| scripted.borrow_mut().finish(pushes));
     assert_eq!(
         dispatcher.pop().map(|package| package.guard),
         Some(ints().universal_guard())
@@ -1977,9 +1650,7 @@ fn a_read_decided_only_whole_records_no_part() {
         if whole_only {
             dispatcher.decides_whole_only(PipelineId(1), PipelineId(0));
         }
-        dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-            scripted.borrow_mut().finish(pushes, false)
-        });
+        dispatcher.finish_by_hand(PipelineId(0), |pushes| scripted.borrow_mut().finish(pushes));
         dispatcher.decided_of(PipelineId(1), PipelineId(0))
     };
     assert!(matches!(recorded(true), Decided::Nothing));
@@ -2006,9 +1677,7 @@ fn a_read_decided_only_whole_records_its_whole_push() {
     let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.park(PipelineId(1));
     dispatcher.decides_whole_only(PipelineId(1), PipelineId(0));
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        scripted.borrow_mut().finish(pushes, true)
-    });
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| scripted.borrow_mut().finish(pushes));
     assert!(matches!(
         dispatcher.decided_of(PipelineId(1), PipelineId(0)),
         Decided::Whole
@@ -2030,9 +1699,7 @@ fn a_push_widened_on_its_way_fails_the_run() {
         .base_mut()
         .pushing_to(Rc::new(RefCell::new(Boxed(widening))));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        scripted.borrow_mut().finish(pushes, true)
-    });
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| scripted.borrow_mut().finish(pushes));
 }
 
 /// A push whose chain leads back into a consumer it is passing through fails the run: only a
@@ -2068,9 +1735,7 @@ fn a_push_that_re_enters_its_chain_fails_the_run() {
         .base_mut()
         .pushing_to(Rc::new(RefCell::new(Boxed(path))));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        scripted.borrow_mut().finish(pushes, true)
-    });
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| scripted.borrow_mut().finish(pushes));
 }
 
 /// A push reaches every live slot of a fan-out, past the fan-out's own gate, so each pipeline
@@ -2105,9 +1770,7 @@ fn a_push_reaches_every_slot_of_a_fan_out() {
         .base_mut()
         .pushing_to(Rc::new(RefCell::new(Through(input))));
     let dispatcher = Dispatcher::new(vec![vec![], vec![0], vec![0]], UNBOUNDED);
-    dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        scripted.borrow_mut().finish(pushes, true)
-    });
+    dispatcher.finish_by_hand(PipelineId(0), |pushes| scripted.borrow_mut().finish(pushes));
     let mut queued: Vec<(usize, TileGuard)> = std::iter::from_fn(|| dispatcher.pop())
         .map(|package| (package.pipeline.0, package.guard))
         .collect();

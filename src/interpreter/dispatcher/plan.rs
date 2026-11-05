@@ -338,10 +338,9 @@ fn run_targets(
             TargetEntry::Sink(_) => {
                 crate::interpreter::tile_operators::SinkBreaker::new(root.clone(), sink.clone())
             }
-            TargetEntry::Main(_) => crate::interpreter::tile_operators::SinkBreaker::per_epoch(
-                root.clone(),
-                sink.clone(),
-            ),
+            TargetEntry::Main(_) => {
+                crate::interpreter::tile_operators::SinkBreaker::main(root.clone(), sink.clone())
+            }
         };
         let under = {
             let mut root = root.borrow_mut();
@@ -489,9 +488,6 @@ fn run_targets(
             dispatcher.opens_before(PipelineId(pipeline));
         }
     }
-    // The run is one epoch: each pipeline finishes once, when its input is complete, and its
-    // readers take what it decides from its pushes after each consume.
-    dispatcher.without_seals();
     // A `main` output's pipeline consumes its packages in queue order.
     for ((_, _, entry), (pipeline, breaker)) in targets
         .iter()
@@ -696,7 +692,7 @@ fn run_targets(
     if !live.is_empty() {
         for ((_, _, entry), breaker) in targets.iter().zip(&sink_breakers) {
             if let TargetEntry::Main(_) = entry {
-                breaker.borrow_mut().unsealed();
+                breaker.borrow_mut().hand_each_package();
             }
         }
     }
@@ -2304,12 +2300,9 @@ fn drive_live(
         loop {
             match dispatcher.try_claim(None) {
                 Next::Package(package) => consume_with(dispatcher, reach, package),
-                Next::Finish {
-                    pipeline,
-                    epoch,
-                    consumed,
-                    last,
-                } => finish_with(dispatcher, reach, pipeline, epoch, consumed, last),
+                Next::Finish { pipeline, consumed } => {
+                    finish_with(dispatcher, reach, pipeline, consumed)
+                }
                 Next::Wait(_) => {
                     assert!(
                         live.iter().any(|at| !at.closed),

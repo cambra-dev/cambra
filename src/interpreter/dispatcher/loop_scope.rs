@@ -80,7 +80,7 @@ impl LoopScope {
             // dispatcher, so no inner pipeline is live.
             // A store inside a scope is a nested loop's, whose scope is one pipeline, so no two
             // inner pipelines share a breaker's pushes.
-            let (mut inner, planned) = plan_edges(
+            let (inner, planned) = plan_edges(
                 &reads,
                 &names,
                 &leaves,
@@ -105,8 +105,6 @@ impl LoopScope {
                 .map(|(at, _)| kept[at])
                 .collect();
             if whole.is_empty() {
-                // A round is no epoch: the rounds share one, which no seal ends (`run_round`).
-                inner.without_seals();
                 break (inner, planned, reads);
             }
             kept.retain(|pipeline| !whole.contains(pipeline));
@@ -294,12 +292,9 @@ impl LoopScope {
         loop {
             match self.inner.try_claim(None) {
                 Next::Package(package) => consume_with(&self.inner, &mut reach, package),
-                Next::Finish {
-                    pipeline,
-                    epoch,
-                    consumed,
-                    last,
-                } => finish_with(&self.inner, &mut reach, pipeline, epoch, consumed, last),
+                Next::Finish { pipeline, consumed } => {
+                    finish_with(&self.inner, &mut reach, pipeline, consumed)
+                }
                 Next::Wait(_) => return false,
                 Next::Done => return true,
                 Next::Failed => {
@@ -594,28 +589,26 @@ impl Breaker for LoopScope {
         self.with_store(|store| push(&*store));
     }
 
-    /// Ends the rounds at the run's last epoch, then pushes the store where it is terminal.
+    /// Ends the rounds, then pushes the store, which is terminal.
     ///
     /// # Panics
     ///
-    /// At the run's last epoch, where the store is not terminal.
-    fn finish(&mut self, pushes: &mut Pushes<'_>, last: bool) {
-        if last {
-            self.placed(|scope| {
-                for &start in &scope.starts {
-                    if scope.inner.is_source(start) {
-                        scope.inner.close(start);
-                    }
+    /// Where the store is not terminal.
+    fn finish(&mut self, pushes: &mut Pushes<'_>) {
+        self.placed(|scope| {
+            for &start in &scope.starts {
+                if scope.inner.is_source(start) {
+                    scope.inner.close(start);
                 }
-                assert!(
-                    scope.run_inner(),
-                    "a loop's scope is done once its sources close"
-                );
-            });
-        }
+            }
+            assert!(
+                scope.run_inner(),
+                "a loop's scope is done once its sources close"
+            );
+        });
         self.with_store(|store| {
             assert!(
-                !last || store.held().is_universal(),
+                store.held().is_universal(),
                 "{} finishes the run terminal",
                 store.name()
             );
@@ -947,6 +940,6 @@ mod tests {
             .scope
             .consume_impl(InputId::ONLY, keys_between(0, 0));
         let dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
-        dispatcher.finish_by_hand(PipelineId(0), |pushes| compiled.scope.finish(pushes, true));
+        dispatcher.finish_by_hand(PipelineId(0), |pushes| compiled.scope.finish(pushes));
     }
 }

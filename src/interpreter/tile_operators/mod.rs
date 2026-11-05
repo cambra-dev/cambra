@@ -1455,8 +1455,8 @@ pub trait Breaker {
     /// no-op for every other breaker.
     fn read_source_again(&mut self, _source: &Rc<RefCell<dyn DataSourceDomainExtentImpl>>) {}
 
-    /// Finish an epoch once the pipeline has consumed every package of it. `last` says the epoch
-    /// is the run's last, after which nothing calls the breaker. The default pushes what a
+    /// Finish once the pipeline has consumed every package and nothing more can be queued for it,
+    /// the breaker's last call. The default pushes what a
     /// producer's [`final_guard`](BreakingProducer::final_guard) names and no push named before,
     /// as one morsel per work package ([`morsels`](BreakingProducer::morsels)); an empty guard
     /// pushes nothing. It wakes no one.
@@ -1464,7 +1464,7 @@ pub trait Breaker {
     /// # Panics
     ///
     /// As [`BreakingProducer::final_guard`].
-    fn finish(&mut self, pushes: &mut Pushes<'_>, _last: bool) {
+    fn finish(&mut self, pushes: &mut Pushes<'_>) {
         if let Some(producer) = self.as_producer() {
             pushes.push_final(producer);
         }

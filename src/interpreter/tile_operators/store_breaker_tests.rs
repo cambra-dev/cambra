@@ -182,7 +182,7 @@ fn a_store_short_of_terminal_at_the_last_epoch_panics() {
     compiled.breaker(|store| store.consume_impl(InputId::ONLY, keys_between(0, 0)));
     let dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
     dispatcher.finish_by_hand(PipelineId(0), |pushes| {
-        compiled.breaker(|store| store.finish(pushes, true))
+        compiled.breaker(|store| store.finish(pushes))
     });
 }
 
@@ -314,13 +314,13 @@ fn the_last_finish_of_the_last_input_commits_the_rest() {
     }
     for input in 0..2 {
         dispatcher.finish_by_hand(PipelineId(input), |pushes| {
-            compiled.breaker(|store| store.finish(pushes, true))
+            compiled.breaker(|store| store.finish(pushes))
         });
     }
     assert_eq!(committed(&compiled.snapshot()), Vec::<Value>::new());
     assert!(!compiled.snapshot().is_terminal());
     dispatcher.finish_by_hand(PipelineId(2), |pushes| {
-        compiled.breaker(|store| store.finish(pushes, true))
+        compiled.breaker(|store| store.finish(pushes))
     });
     let settled = compiled.snapshot();
     assert_eq!(committed(&settled), [90, 85, 65].map(Value::Int).to_vec());
@@ -377,7 +377,7 @@ fn a_release_reclaims_no_version_a_held_proposal_read() {
     }
     for input in 0..4 {
         dispatcher.finish_by_hand(PipelineId(input), |pushes| {
-            compiled.breaker(|store| store.finish(pushes, true))
+            compiled.breaker(|store| store.finish(pushes))
         });
     }
     let settled = compiled.snapshot();
