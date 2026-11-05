@@ -1434,17 +1434,10 @@ row (`tests/support/differential.rs`).
 
 #### Parking arrivals until a read is decided
 
-A pipeline is final once every live pipeline beneath it has closed and it has finished the epoch of
-the last close. A pipeline that reads its input whole (`Dispatcher::read_whole`) reads that input in
-the first epoch by which every pipeline beneath it that takes arrivals has closed, so it is final
-after the same live pipelines as the pipelines it reads. A transaction store over a let-bound list,
-with nothing live beneath it, reads its input in epoch 0. The planner records, per pipeline, the
-live pipelines whose close it waits for in this sense.
-
 A loop's scope or a transaction store steps on the pipelines it reads by pull, and a step that pulls
 a pipeline not yet final reads a partial answer: a seed `sum(source1())` before `source1` yields
-everything opens the store at a wrong value. Where such a scope or store is notified per delivery
-(`Notifies::Rounds`, `Notifies::Items`), it parks its arrivals (`Dispatcher::park`). A notify of a
+everything opens the store at a wrong value. A scope or store over a live source that reads
+pipelines parks its arrivals (`Dispatcher::park`). A notify of a
 region that some pipeline it reads has not decided keeps its morsels outside every epoch, so each
 epoch before then finishes without them, and the pipelines that read the scope or store finish it
 too. Each pipeline's decided pushes record what it has decided of the reader's input
@@ -1458,9 +1451,9 @@ source, which releases none of them until the scope or store consumes them. Over
 sources never yield everything, the scope or store never steps, and its source keeps every row it
 delivered.
 
-A scope or store notified of its whole input (`Notifies::Whole`) that reads such a pipeline, as a
-transaction whose writer reads a concatenation with the live source, is notified once every live
-source of the run yields everything (`LivePipeline::waits`), in the run's last epoch.
+A pipeline that reads its input whole (`Dispatcher::read_whole`) parks that input from the start,
+and takes it once every pipeline it reads has decided it. A transaction store over a let-bound
+list, whose list's pipeline is decided in epoch 0, reads its input then.
 
 #### Completeness in pushes
 
@@ -1512,14 +1505,12 @@ pushed. A unit of work is claimable once that union covers the region the work p
 
 | Work | Claimable today | Claimable in the planned design |
 | --- | --- | --- |
-| A whole read (`Dispatcher::read_whole`) | once the pipelines beneath it that take arrivals have closed | once its reads' decided regions are universal |
+| A whole read (`Dispatcher::read_whole`) | once every pipeline it reads has decided it (implemented) | as now |
 | A step of a store or a loop's scope that follows its reads (`Dispatcher::follow`) | once its reads have finished the epoch | once its reads are complete over the region the step pulls |
-| A parked delivery of a store or a loop's scope (`Dispatcher::park`) | once every pipeline it reads has decided it | as a step |
+| A parked delivery of a store or a loop's scope (`Dispatcher::park`) | once every pipeline it reads has decided it (implemented) | as now |
 | A row a push or an arrival brings ([Reading each row once](#reading-each-row-once)) | once every pipeline that reaches it has decided it (implemented) | as now |
 
-The four rows reduce to one rule, so `Dispatcher::park`'s restriction to stores and scopes,
-`LivePipeline::waits` and the planner's per-pipeline record of the live pipelines a pipeline is
-final after (`final_after`) are removed. Epochs remain the batches a seal makes of live deliveries,
+The four rows reduce to one rule; what remains of the epochs' part is `follow`. Epochs remain the batches a seal makes of live deliveries,
 and the unit a `main` output answers per (`SinkBreaker::per_epoch`).
 
 The program below shows what changes. Its store `a` reads a static list, and its loop reads a live
@@ -1780,9 +1771,8 @@ the last. A claim reads the count and the close in one read, and nothing is rese
 close, so the count of a closed queue is its last. The counters only grow, so a pipeline that may
 finish an epoch stays so until it does. Its packages there partition the region its queue was filled
 with, and the finish gets that region as `consumed`: the regions notified to a source in the epoch,
-its input whole in the first epoch by which the sources beneath it have closed for a pipeline that
-reads its input whole, or the union of the
-guards pushed to the pipeline in it.
+its input whole for a pipeline that reads its input whole, in the epoch the pipelines it reads
+decided it, or the union of the guards pushed to the pipeline in it.
 
 The claim that finds a pipeline that may finish an epoch moves its phase there from running to
 finishing with a compare and exchange, so exactly one claim finishes each pipeline in each epoch.

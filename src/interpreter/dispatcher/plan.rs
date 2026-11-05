@@ -338,27 +338,6 @@ fn run_targets(
             dispatcher.opens_before(PipelineId(pipeline));
         }
     }
-    // Per pipeline, the live pipelines whose close it is final only after: itself where it reads
-    // a live source, and those of each pipeline it reads, which is numbered before it. A pipeline
-    // that reads its input whole reads it once the sources beneath it have closed
-    // (`Dispatcher::read_whole`), so it adds none of its own.
-    let mut final_after: Vec<Vec<usize>> = Vec::with_capacity(members.live.len());
-    for (pipeline, leaves) in members.live.iter().enumerate() {
-        debug_assert!(
-            members.reads[pipeline].iter().all(|&read| read < pipeline),
-            "a pipeline reads only pipelines numbered before it"
-        );
-        let mut after = Vec::new();
-        if !leaves.is_empty() {
-            after.push(pipeline);
-        }
-        for &read in &members.reads[pipeline] {
-            after.extend(final_after[read].iter().copied());
-        }
-        after.sort_unstable();
-        after.dedup();
-        final_after.push(after);
-    }
     // A `main` output's breaker merges an epoch's answers until the epoch's finish
     // (`SinkBreaker::per_epoch`), so its pipeline consumes one epoch at a time.
     for ((_, _, entry), (pipeline, breaker)) in targets
@@ -384,26 +363,6 @@ fn run_targets(
             input = Some(breaker.input_tiling(at))
         });
         let input = input.expect("a reach calls the breaker it reaches");
-        // A store or a loop's scope steps on a pipeline it reads by pull, which an epoch before
-        // that pipeline's live sources close leaves partial. It parks its deliveries until the
-        // pipelines it reads have decided them (`Dispatcher::park`), and takes each one as it
-        // arrives from then on.
-        let late: Vec<usize> = match matches!(
-            members.located[pipeline],
-            Located::Store { .. } | Located::Scope { .. }
-        ) {
-            true => {
-                let mut late: Vec<usize> = members.reads[pipeline]
-                    .iter()
-                    .flat_map(|&read| final_after[read].iter().copied())
-                    .collect();
-                late.sort_unstable();
-                late.dedup();
-                late
-            }
-            false => Vec::new(),
-        };
-        let reads_late = !late.is_empty();
         let mut starts: Vec<TileGuard> = Vec::new();
         let notifies = match (&members.located[pipeline], scopes[pipeline].as_ref()) {
             // A transaction store's input is its writer's source, read behind an entry no
@@ -414,19 +373,11 @@ fn run_targets(
                     matches!(input.domain_extent(), Some(Extent::DataSourceDomain(items))
                         if Rc::ptr_eq(&items, &leaf.source))
                 };
-                // One that also reads a late pipeline takes its input whole instead, once every
-                // live source yields everything.
-                match (leaves.iter().all(items_of), reads_late) {
-                    (true, _) => Notifies::Items,
-                    (false, true) => Notifies::Whole,
-                    (false, false) => {
-                        unplace(&planner.placements, targets);
-                        return Err(Refused(format!(
-                            "{} reads a live source other than as its writer's source, whose \
-                             items no delivery of it names",
-                            members.names[pipeline]
-                        )));
-                    }
+                // One whose writer reads the source otherwise, as a concatenation of the source and
+                // a list, takes its input whole once the source yields everything.
+                match leaves.iter().all(items_of) {
+                    true => Notifies::Items,
+                    false => Notifies::Whole,
                 }
             }
             // A loop's scope runs a round per position the drive emits. Its drive's positions are
@@ -562,25 +513,16 @@ fn run_targets(
         };
         planned[pipeline].live = true;
         planned[pipeline].whole |= matches!(notifies, Notifies::Whole);
-        // A pipeline notified of its whole input that reads a late pipeline is notified once
-        // every live source of the run yields everything, in the epoch that pipeline is final in.
-        // One notified per delivery holds the deliveries instead.
-        match notifies {
-            Notifies::Items | Notifies::Rounds if reads_late => {
-                dispatcher.park(PipelineId(pipeline));
-                planned[pipeline].held = true;
-            }
-            _ => {}
+        // A store or a loop's scope steps on the pipelines it reads by pull, so it parks each
+        // delivery until they have decided it (`Dispatcher::park`).
+        if matches!(
+            members.located[pipeline],
+            Located::Store { .. } | Located::Scope { .. }
+        ) && !members.reads[pipeline].is_empty()
+        {
+            dispatcher.park(PipelineId(pipeline));
+            planned[pipeline].held = true;
         }
-        let waits = match reads_late && matches!(notifies, Notifies::Whole) {
-            true => members
-                .live
-                .iter()
-                .flatten()
-                .map(|leaf| leaf.source.clone())
-                .collect(),
-            false => Vec::new(),
-        };
         if matches!(notifies, Notifies::Whole) {
             starts.clear();
         }
@@ -589,7 +531,6 @@ fn run_targets(
             leaves.clone(),
             notifies,
             input,
-            waits,
             starts,
         ));
     }
@@ -2002,8 +1943,7 @@ enum Notifies {
     /// Of the region a push of a delivery's keys through the range's consumer brings the
     /// pipeline's entry.
     Arrivals,
-    /// Of its whole input, once every source it reads and every one it waits for
-    /// ([`LivePipeline::waits`]) yields everything, and of nothing before.
+    /// Of its whole input, once every source it reads yields everything, and of nothing before.
     Whole,
     /// A loop's scope: of a delivery's keys as the positions of its rounds.
     Rounds,
@@ -2021,10 +1961,6 @@ struct LivePipeline {
     notifies: Notifies,
     /// The pipeline's breaker's input, which a notification is a guard of.
     input: Tiling,
-    /// The sources that also yield everything before it closes: every live source of the run, for a
-    /// store or a loop's scope that reads a pipeline final only in the run's last epoch, and none
-    /// otherwise.
-    waits: Vec<LiveSource>,
     /// The regions the pipeline's own ranges bring, which no live source yields and no arrival
     /// names: notified with the first poll, and empty after.
     starts: Vec<TileGuard>,
@@ -2037,7 +1973,6 @@ impl LivePipeline {
         leaves: Vec<LiveLeaf>,
         notifies: Notifies,
         input: Tiling,
-        waits: Vec<LiveSource>,
         starts: Vec<TileGuard>,
     ) -> Self {
         Self {
@@ -2048,7 +1983,6 @@ impl LivePipeline {
                 .collect(),
             notifies,
             input,
-            waits,
             starts,
             closed: false,
         }
@@ -2137,10 +2071,6 @@ impl LivePipeline {
                 &Projection::admitting(positions).guard(&self.input),
             );
         }
-        complete &= self
-            .waits
-            .iter()
-            .all(|source| source.borrow().get_yield_predicate().is_true());
         if complete {
             if matches!(self.notifies, Notifies::Whole) {
                 dispatcher.notify(self.pipeline, &self.input.universal_guard());

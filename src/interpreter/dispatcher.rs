@@ -361,9 +361,9 @@ struct PipelineInfo {
     /// Whether it consumes its morsels in queue order one at a time
     /// ([`order`](Dispatcher::order)).
     ordered: bool,
-    /// Where it reads its breaker's input whole rather than what the pipelines it reads push
-    /// ([`read_whole`](Dispatcher::read_whole)), that input's morsels.
-    whole: Option<Vec<TileGuard>>,
+    /// Whether it reads its breaker's input whole rather than what the pipelines it reads push
+    /// ([`read_whole`](Dispatcher::read_whole)).
+    whole: bool,
     /// The pipelines it reads that it takes no push from, and whose finish of an epoch it waits
     /// for before it takes a package there ([`follow`](Dispatcher::follow)).
     follows: Vec<usize>,
@@ -402,10 +402,6 @@ struct PipelineState {
     pushed: Mutex<Option<TileGuard>>,
     /// For a source, whether it is closed: no more of its input arrives.
     closed: AtomicBool,
-    /// For a source, the epoch it closed in, [`UNKNOWN`] while it is open.
-    closed_in: AtomicU64,
-    /// For a pipeline that reads its input whole, whether that input has been queued.
-    whole_queued: AtomicBool,
     /// Per source of its breaker's input, what that source has decided of it: one per pipeline it
     /// reads, in the order of its `reads`, then one for the ranges in its own chain
     /// ([`Decided`]).
@@ -559,7 +555,7 @@ impl Dispatcher {
                 reads,
                 readers,
                 ordered: false,
-                whole: None,
+                whole: false,
                 follows: Vec::new(),
                 limit: usize::MAX,
                 pushes_with: pipeline,
@@ -574,8 +570,6 @@ impl Dispatcher {
             .map(|_| PipelineState {
                 pushed: Mutex::new(None),
                 closed: AtomicBool::new(false),
-                closed_in: AtomicU64::new(UNKNOWN),
-                whole_queued: AtomicBool::new(false),
                 decided: Mutex::new(Vec::new()),
                 queued: AtomicUsize::new(0),
                 acknowledged: AtomicUsize::new(0),
@@ -912,9 +906,7 @@ impl Dispatcher {
     }
 
     /// Count one feed of `reader`'s queue in `epoch` finished: a pipeline it reads, or the end of
-    /// its arrivals. The last of them closes the queue, after it appends the reader's whole input
-    /// where it reads that whole and the sources beneath it have closed
-    /// ([`read_whole`](Self::read_whole)).
+    /// its arrivals. The last of them closes the queue.
     ///
     /// # Panics
     ///
@@ -931,43 +923,10 @@ impl Dispatcher {
         if unfinished != 1 {
             return;
         }
-        let queue = &epoch.pipelines[reader].queue;
-        let closing = match &self.infos[reader].whole {
-            Some(input)
-                if self.sources_beneath_closed_by(reader, epoch.number)
-                    && !self.states[reader]
-                        .whole_queued
-                        .swap(true, Ordering::AcqRel) =>
-            {
-                input
-            }
-            _ => &Vec::new(),
-        };
-        let closed = queue.append(reader, closing) && queue.close();
+        let closed = epoch.pipelines[reader].queue.close();
         self.ensure(closed, || {
             format!("pipeline {reader} receives packages once")
         });
-    }
-
-    /// Whether every pipeline beneath `pipeline` that takes arrivals closed in `epoch` or before.
-    /// The pipelines beneath it have then consumed all of their input by the time `pipeline`'s
-    /// queue in `epoch` closes, since that queue waits for the pipelines it reads to finish
-    /// `epoch`, and they for theirs.
-    fn sources_beneath_closed_by(&self, pipeline: usize, epoch: u64) -> bool {
-        let mut seen = vec![false; self.infos.len()];
-        let mut stack = self.infos[pipeline].reads.clone();
-        while let Some(read) = stack.pop() {
-            if std::mem::replace(&mut seen[read], true) {
-                continue;
-            }
-            if self.takes_arrivals(read)
-                && self.states[read].closed_in.load(Ordering::Acquire) > epoch
-            {
-                return false;
-            }
-            stack.extend(self.infos[read].reads.iter().copied());
-        }
-        true
     }
 
     /// Grow what `source` has decided of `reader`'s input by `guard`, or record it whole where
@@ -1033,13 +992,12 @@ impl Dispatcher {
     }
 
     /// Mark `pipeline`, which reads a pipeline, as consuming its breaker's input whole, `input`
-    /// cut one package per morsel ([`seed`]), in the first epoch by which every pipeline beneath
-    /// it that takes arrivals has closed, in place of what the pipelines it reads push. A planner
-    /// does so where no push reaches the reader restated in its keys, where two pipelines it reads
-    /// can push one key, or where a pipeline it reads takes no push and names no region the planner
-    /// could queue for the reader at the start (`run_program`). Its input is whole only once those
-    /// pipelines have closed, so its queue in an earlier epoch closes empty, and it takes no push
-    /// ([`Landing::queue`]).
+    /// cut one package per morsel ([`seed`]), in place of what the pipelines it reads push: the
+    /// morsels are parked from the start, and the decided push that leaves every pipeline it reads
+    /// having decided them queues them ([`park`](Self::park)). A planner does so where no push
+    /// reaches the reader restated in its keys, where two pipelines it reads can push one key, or
+    /// where a pipeline it reads takes no push and names no region the planner could queue for the
+    /// reader at the start (`run_program`). It takes no push ([`Landing::queue`]).
     ///
     /// # Panics
     ///
@@ -1051,7 +1009,14 @@ impl Dispatcher {
              from its start",
             pipeline.0
         );
-        self.infos[pipeline.0].whole = Some(seed(input, self.morsel_rows));
+        let info = &mut self.infos[pipeline.0];
+        info.whole = true;
+        info.parks = true;
+        self.states[pipeline.0]
+            .parked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(seed(input, self.morsel_rows));
     }
 
     /// Mark `pipeline` as consuming its morsels one at a time, epoch by epoch: every morsel of an
@@ -1421,7 +1386,6 @@ impl Dispatcher {
         let closed = !state.closed.swap(true, Ordering::AcqRel);
         self.ensure(closed, || format!("pipeline {p} closes its queue once"));
         let current = self.current.load(Ordering::Acquire);
-        state.closed_in.store(current, Ordering::Release);
         if self
             .sources()
             .all(|source| self.states[source].closed.load(Ordering::Acquire))
@@ -2417,7 +2381,7 @@ impl Landing<'_> {
         let info = &dispatcher.infos[r];
         // A reader that reads its input whole takes no push, and a nested loop's scope, or a
         // reader that waits for one, takes its rows in rounds.
-        if info.whole.is_some() || info.follows.contains(&from) {
+        if info.whole || info.follows.contains(&from) {
             return;
         }
         let queue = &epoch.pipelines[r];

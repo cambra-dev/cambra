@@ -8,7 +8,7 @@ use indoc::{formatdoc, indoc};
 use crate::ccl::context::{GlobalContext, compile_program};
 use crate::ccl::load::LoadedProgram;
 use crate::interpreter::Value;
-use crate::interpreter::dispatcher::{Planned, Refused, run_program};
+use crate::interpreter::dispatcher::{Planned, run_program};
 
 use super::TileProducer;
 
@@ -2807,30 +2807,6 @@ fn a_sum_over_a_live_source_reading_a_sum_over_it(#[values(1, usize::MAX)] rows:
     assert_eq!(value, Value::Int(15));
 }
 
-/// Why the planner refuses `source`, which reads the live source `source1`.
-fn live_refusal(source: &str) -> Refused {
-    let mut ctx = GlobalContext::default();
-    ctx.defer_sink_pulls();
-    ctx.register_source(std::rc::Rc::new(std::cell::RefCell::new(
-        crate::interpreter::TestDataSource::new(
-            "source1",
-            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
-            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
-        ),
-    )));
-    ctx.register_test_sink("out");
-    let mut program = compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
-        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
-    let _operators = ctx.take_operator_map();
-    let main = std::sync::Arc::new(MainAnswers::default());
-    match crate::interpreter::dispatcher::run_program_into(&mut program, 1, main, &mut || {
-        panic!("{source}: a refused run polls nothing")
-    }) {
-        Err(refused) => refused,
-        Ok(planned) => panic!("{source} is refused: {planned:?}"),
-    }
-}
-
 /// A pipeline notified of a live source's arrivals takes the rows no arrival names: a range no live
 /// source yields, as a static arm of a concatenation, with the first notification, and the rows a
 /// pipeline it reads pushes as its own keys, as a let-bound arm or a field of a let-bound record,
@@ -2905,7 +2881,7 @@ fn rendered_in_key_order(value: &Value) -> String {
     for x in source1():
         total += x + sum(ys)
     out << total
-"}, Value::Int(30), &["follows"])]
+"}, Value::Int(30), &["held"])]
 #[case::a_transaction_reading_a_sum(indoc! {"
     out = test_sink()
     ys = [1, 2]
@@ -2914,14 +2890,14 @@ fn rendered_in_key_order(value: &Value) -> String {
         with begin():
             pool := pool - x - sum(ys)
     out << await_final(pool)
-"}, Value::Int(70), &["follows"])]
+"}, Value::Int(70), &["held"])]
 #[case::a_loop_seeded_from_a_sum(indoc! {"
     out = test_sink()
     last := sum([1, 2])
     for x in source1():
         last := x
     out << last
-"}, Value::Int(5), &["follows"])]
+"}, Value::Int(5), &["held"])]
 #[case::a_transaction_seeded_from_a_sum(indoc! {"
     out = test_sink()
     pool: Mut(Int, Txn) := sum([60, 40])
@@ -2929,7 +2905,7 @@ fn rendered_in_key_order(value: &Value) -> String {
         with begin():
             pool := pool - x
     out << await_final(pool)
-"}, Value::Int(85), &["follows"])]
+"}, Value::Int(85), &["held"])]
 #[case::two_loops_seeded_from_a_sum(indoc! {"
     out = test_sink()
     total := sum([1, 2])
@@ -2938,7 +2914,7 @@ fn rendered_in_key_order(value: &Value) -> String {
     for y in source1():
         total += y * 10
     out << total
-"}, Value::Int(168), &["follows", "held"])]
+"}, Value::Int(168), &["held", "held"])]
 #[case::a_loop_reading_a_sum_of_the_source(indoc! {"
     out = test_sink()
     total := 0
@@ -2981,7 +2957,7 @@ fn rendered_in_key_order(value: &Value) -> String {
     for x in source1():
         last := last + x
     out << last
-"}, Value::Int(85), &["follows"])]
+"}, Value::Int(85), &["held"])]
 #[case::two_writers_seeded_from_a_sum_of_the_source(indoc! {"
     out = test_sink()
     pool: Mut(Int, Txn) := sum(source1())
@@ -3018,7 +2994,7 @@ fn rendered_in_key_order(value: &Value) -> String {
         with begin():
             pool := pool - y
     out << await_final(pool)
-"}, Value::Int(10), &["held", "follows"])]
+"}, Value::Int(10), &["held", "held"])]
 #[case::a_writer_over_a_list_seeded_from_a_sum_of_the_source(indoc! {"
     out = test_sink()
     pool: Mut(Int, Txn) := sum(source1())
@@ -3045,7 +3021,7 @@ fn a_store_over_a_live_source_reading_a_pipeline(
             .map(|plan| match (plan.whole, plan.held) {
                 (true, _) => "whole",
                 (false, true) => "held",
-                (false, false) => "follows",
+                (false, false) => "held",
             })
             .collect::<Vec<_>>(),
         plans,
@@ -3056,22 +3032,28 @@ fn a_store_over_a_live_source_reading_a_pipeline(
 /// A transaction store's pipeline is notified of a delivery's keys as the items of its writer's
 /// source, which holds only where that source is the live source itself. A writer over a
 /// concatenation of the live source and a list has positions tagged by the side they come from,
-/// which no delivery names, so the planner refuses the program.
-#[test]
-fn a_writer_over_a_concatenation_with_a_live_source_is_refused() {
-    let refused = live_refusal(indoc! {"
-        out = test_sink()
-        pool: Mut(Int, Txn) := 100
-        for r in [x for x in source1()] ++ [5]:
-            with begin():
-                pool := pool - r
-        out << await_final(pool)
-    "});
+/// which no delivery names, so the store takes its input whole once the source yields everything:
+/// 100 less the five items and 5.
+#[rstest_log::rstest]
+fn a_writer_over_a_concatenation_with_a_live_source(#[values(1, usize::MAX)] rows: usize) {
+    let (value, planned) = dispatched_live(
+        indoc! {"
+            out = test_sink()
+            pool: Mut(Int, Txn) := 100
+            for r in [x for x in source1()] ++ [5]:
+                with begin():
+                    pool := pool - r
+            out << await_final(pool)
+        "},
+        rows,
+        two_batches(),
+    );
+    assert_eq!(value, Value::Int(100 - 15 - 5));
     assert!(
-        refused
-            .to_string()
-            .contains("reads a live source other than as its writer's source"),
-        "{refused}"
+        planned
+            .iter()
+            .any(|plan| plan.live && plan.whole && plan.name.starts_with("Commit")),
+        "the store takes its input whole: {planned:?}"
     );
 }
 
