@@ -1,6 +1,7 @@
 //! The projection guards a producer restates: [`Projection`].
 //! See `src/interpreter/design-operators.md`, "Projection guards".
 
+use crate::ccl::{FieldKey, TagMap};
 use crate::interpreter::{CurryLevel, FunctionGuard, Predicate, Tile, TileGuard, Tiling, Value};
 
 /// The part of a producer's tile that a `get` asks for.
@@ -165,6 +166,29 @@ impl Projection {
                 keys.descend(beneath)
             }
         }
+    }
+
+    /// The region of a tagged union that `self`, a region of the union's arm under `tag`, names:
+    /// the same keys under the tag. The arm's [`Everything`](Self::Everything) is every key under
+    /// the tag, and no key under another.
+    ///
+    /// # Panics
+    ///
+    /// For keys beneath the outermost collection, which have no tagged spelling: a tag is a key
+    /// of the outermost collection.
+    pub fn tagged(&self, tag: &FieldKey) -> Projection {
+        let keys = match self {
+            Projection::Nothing => return Projection::Nothing,
+            Projection::Everything => Predicate::True,
+            Projection::Keys { level, keys } if *level == CurryLevel::OUTERMOST => keys.clone(),
+            Projection::Keys { .. } => {
+                panic!("a region beneath the outermost keys has no tagged spelling: {self:?}")
+            }
+        };
+        Projection::admitting(Predicate::tagged(
+            TagMap::from_arms(vec![(tag.clone(), keys)]),
+            false,
+        ))
     }
 
     /// The projection naming the outermost keys `keys` admits ([`keys_at`](Self::keys_at) at the
@@ -1015,6 +1039,12 @@ mod tests {
             codomain(domain(under(key(2), Predicate::True))).projection("Producer"),
             Projection::admitting(key(2))
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "a region beneath the outermost keys has no tagged spelling")]
+    fn a_region_beneath_the_outermost_keys_has_no_tag() {
+        level_one(under(key(0), key(1))).tagged(&FieldKey::Index(0));
     }
 
     /// Closing drops an arm only where its level's extent is a finite range of positions none of
