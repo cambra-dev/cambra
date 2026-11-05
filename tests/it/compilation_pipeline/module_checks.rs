@@ -879,7 +879,7 @@ fn an_error_at_a_node_a_module_check_minted_has_a_span() {
     "};
     let errors = compile_errors(&program(root, &[("lib", library)]));
     assert!(errors.contains("Unbound variable: 'sales'"), "{errors}");
-    assert!(errors.contains("lib.cambra:1:46"), "{errors}");
+    assert!(errors.contains("lib.cambra:1:54"), "{errors}");
 }
 
 /// Checking a file on its own, as `cambra check` and an editor do, reports its type errors past

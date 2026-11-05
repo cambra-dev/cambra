@@ -990,8 +990,8 @@ fn check_node_rule(expr: &mut Expr, ctx: &mut CheckCtx) -> Result<Type, LocatedI
     // `emit_lambda`), taken before the walk borrows the node.
     let recorded_ty = expr.ty.clone();
     let ty = match &mut expr.node {
-        TypedExprNode::Comprehension { .. } => {
-            unreachable!("a Comprehension reached inference; the comprehension phase eliminates it")
+        TypedExprNode::Comprehension { .. } | TypedExprNode::GroupBy { .. } => {
+            unreachable!("a surface node reached inference; the comprehension phase eliminates it")
         }
         TypedExprNode::DefGroup { .. } => {
             unreachable!("a DefGroup reached the check; inference rewrites it into `Let`s")
