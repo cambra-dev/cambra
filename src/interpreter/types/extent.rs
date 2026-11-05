@@ -470,6 +470,15 @@ pub trait DataSourceDomainExtentImpl {
     /// into the version after next.
     fn retire_producer(&mut self, producer: &str);
 
+    /// What `producer` has released of this source: its record, or where a producer registering
+    /// now starts ([`carry_release_to_new_producers`](Self::carry_release_to_new_producers)) for
+    /// one that has not registered. A dispatched run starts a range's notifications here, so a run
+    /// after a pause or a reload notifies nothing the range has already released.
+    ///
+    /// There is no default, for the reason `retire_producer` has none: a source that answered
+    /// nothing released would replay its history into the next run.
+    fn released_by(&self, producer: &str) -> Predicate;
+
     /// The half-open range of indices this source still holds, or `None` for a
     /// source that retains nothing addressable.
     ///

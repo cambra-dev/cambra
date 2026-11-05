@@ -1222,6 +1222,8 @@ struct Beneath {
 pub(super) struct LiveLeaf {
     pub(super) consumer: SharedConsumer,
     pub(super) source: LiveSource,
+    /// The range's producer, by the name it releases the source under.
+    pub(super) producer: String,
 }
 
 /// A live source, as a range over its domain reads it.
@@ -1328,7 +1330,14 @@ impl Planner {
             return Beneath::default();
         }
         let (leaf, live) = match (leaf, sources.into_iter().next()) {
-            (Some(consumer), Some(source)) => (None, Some(LiveLeaf { consumer, source })),
+            (Some(consumer), Some(source)) => (
+                None,
+                Some(LiveLeaf {
+                    consumer,
+                    source,
+                    producer: producer.name(),
+                }),
+            ),
             (leaf, _) => (leaf, None),
         };
         below.live.extend(live);
@@ -2016,6 +2025,14 @@ pub(super) fn reach_in_chain(
     found
 }
 
+/// The region of a range's keys a source's yield `yielded` decides.
+fn decided_region(yielded: &Predicate) -> Projection {
+    match yielded.is_true() {
+        true => Projection::Everything,
+        false => Projection::admitting(yielded.clone()),
+    }
+}
+
 /// How the run notifies a live pipeline of what its sources deliver ([`LivePipeline::poll`]).
 enum Notifies {
     /// Of the region a push of a delivery's keys through the range's consumer brings the
@@ -2042,6 +2059,9 @@ struct LivePipeline {
     /// The regions the pipeline's own ranges bring, which no live source yields and no arrival
     /// names: notified with the first poll, and empty after.
     starts: Vec<TileGuard>,
+    /// Whether the pipeline has been polled. The first poll lands as decided what each range
+    /// starts notified of: an earlier run consumed it, and a source yields a key once for good.
+    polled: bool,
     closed: bool,
 }
 
@@ -2055,13 +2075,21 @@ impl LivePipeline {
     ) -> Self {
         Self {
             pipeline,
+            // A range starts notified of what it has released of its source: a run after a pause
+            // or a reload notifies nothing the range has finished with, and a range a reload
+            // rebuilt starts at the release its predecessor carried
+            // (`DataSourceDomainExtentImpl::released_by`).
             leaves: leaves
                 .into_iter()
-                .map(|leaf| (leaf, Predicate::False))
+                .map(|leaf| {
+                    let released = leaf.source.borrow().released_by(&leaf.producer);
+                    (leaf, released)
+                })
                 .collect(),
             notifies,
             input,
             starts,
+            polled: false,
             closed: false,
         }
     }
@@ -2077,6 +2105,17 @@ impl LivePipeline {
         let mut changed = !self.starts.is_empty();
         for start in std::mem::take(&mut self.starts) {
             dispatcher.notify(self.pipeline, &start);
+        }
+        if !std::mem::replace(&mut self.polled, true) {
+            for (leaf, notified) in &self.leaves {
+                if !notified.is_false() {
+                    dispatcher.land_range_decided(
+                        self.pipeline,
+                        &decided_region(notified),
+                        &leaf.consumer,
+                    );
+                }
+            }
         }
         let mut complete = true;
         // Several ranges can read one source, so a scope or a store is notified of the positions
@@ -2129,11 +2168,7 @@ impl LivePipeline {
                 }
             }
             // The keys the source yields are decided: it yields a key once for good.
-            let decided = match yielded.is_true() {
-                true => Projection::Everything,
-                false => Projection::admitting(yielded.clone()),
-            };
-            dispatcher.land_range_decided(self.pipeline, &decided, &leaf.consumer);
+            dispatcher.land_range_decided(self.pipeline, &decided_region(&yielded), &leaf.consumer);
             *notified = yielded;
         }
         if !positions.is_false() {
@@ -2178,12 +2213,13 @@ fn drive_live(
         if info.reads.is_empty() && !live.iter().any(|at| at.pipeline.0 == pipeline) {
             let mut input = None;
             reach(PipelineId(pipeline), &mut |breaker, at| {
-                input = Some(breaker.input_tiling(at));
+                input = Some((breaker.input_tiling(at), breaker.input_released(at)));
             });
-            let input = input.expect("a reach calls the breaker it reaches");
-            dispatcher.start_source(PipelineId(pipeline), &input);
+            let (input, released) = input.expect("a reach calls the breaker it reaches");
+            dispatcher.start_source(PipelineId(pipeline), &input, &released);
         }
     }
+    let mut sealed_once = false;
     loop {
         let mut sources: Vec<LiveSource> = Vec::new();
         for (leaf, _) in live.iter().flat_map(|at| &at.leaves) {
@@ -2195,13 +2231,17 @@ fn drive_live(
             source.borrow_mut().check_for_new_data();
         }
         observer.polled();
+        let first = std::mem::replace(&mut sealed_once, true);
         let mut changed = false;
         for at in live.iter_mut() {
             changed |= at.poll(dispatcher, reach);
         }
         // Each pass runs every epoch sealed before it to its finish, so the window holds the
-        // epoch a seal opens.
-        if live.iter().any(|at| !at.closed) && changed {
+        // epoch a seal opens. The first pass seals whether or not a source yielded more: a run
+        // after a pause or a reload starts over breakers that hold what an earlier run consumed,
+        // and every breaker pushes what it holds at the finish of the run's first epoch, before
+        // any arrival, as a compile's pull of each sink does in pull mode.
+        if live.iter().any(|at| !at.closed) && (changed || first) {
             assert!(
                 dispatcher.try_seal(),
                 "a live run's seal finds its window free: each pass finishes the epoch it sealed"

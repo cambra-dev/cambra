@@ -482,7 +482,7 @@ fn a_source_pipeline_finishes_after_its_input_released_what_was_queued() {
     let memo = memo_over_rows(0..6);
     let handle: BreakerHandle = memo.clone();
     let dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
-    dispatcher.start_source(PipelineId(0), &ints());
+    dispatcher.start_source(PipelineId(0), &ints(), &ints().empty_guard());
     let Next::Package(package) = dispatcher.try_claim(None) else {
         panic!("a started source hands out its package")
     };
@@ -1179,7 +1179,7 @@ fn a_package_not_claimed_is_refused() {
 #[should_panic(expected = "pipeline 0 consumes a package claimed for it")]
 fn a_package_acknowledged_twice_is_refused() {
     let dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
-    dispatcher.start_source(PipelineId(0), &ints());
+    dispatcher.start_source(PipelineId(0), &ints(), &ints().empty_guard());
     let package = dispatcher.pop().expect("the source's one package");
     dispatcher.acknowledge(package.clone());
     dispatcher.acknowledge(package);
@@ -1190,8 +1190,8 @@ fn a_package_acknowledged_twice_is_refused() {
 #[should_panic(expected = "pipeline 0 is queued nothing once it is closed")]
 fn a_second_start_of_a_source_is_refused() {
     let dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
-    dispatcher.start_source(PipelineId(0), &ints());
-    dispatcher.start_source(PipelineId(0), &ints());
+    dispatcher.start_source(PipelineId(0), &ints(), &ints().empty_guard());
+    dispatcher.start_source(PipelineId(0), &ints(), &ints().empty_guard());
 }
 
 /// Every refusal fails the run before it panics, so a later claim answers `Failed` though no
@@ -1201,11 +1201,11 @@ fn a_refusal_fails_the_run_before_it_panics() {
     type Misuse = fn(&Dispatcher);
     let misuses: [(&str, Misuse); 5] = [
         ("a second start", |dispatcher| {
-            dispatcher.start_source(PipelineId(0), &ints())
+            dispatcher.start_source(PipelineId(0), &ints(), &ints().empty_guard())
         }),
         (
             "a source start of a pipeline that reads one",
-            |dispatcher| dispatcher.start_source(PipelineId(1), &ints()),
+            |dispatcher| dispatcher.start_source(PipelineId(1), &ints(), &ints().empty_guard()),
         ),
         ("an acknowledgement for no pipeline", |dispatcher| {
             dispatcher.acknowledge(WorkPackage {
@@ -1227,7 +1227,7 @@ fn a_refusal_fails_the_run_before_it_panics() {
     ];
     for (what, misuse) in misuses {
         let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-        dispatcher.start_source(PipelineId(0), &ints());
+        dispatcher.start_source(PipelineId(0), &ints(), &ints().empty_guard());
         let refused =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| misuse(&dispatcher)));
         assert!(refused.is_err(), "{what} is refused");
@@ -2143,4 +2143,20 @@ impl Consumer for Through {
             .expect("the operator was subscribed")
             .route(routes);
     }
+}
+
+/// A source whose input was released whole, as a scalar a run before a pause or a reload took, is
+/// queued no package when a later run starts it, and finishes once claimed.
+#[test]
+fn a_source_started_over_an_input_released_whole_is_queued_nothing() {
+    let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+    let dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
+    dispatcher.start_source(PipelineId(0), &scalar, &scalar.universal_guard());
+    assert!(
+        matches!(
+            dispatcher.try_claim(None),
+            Next::Finish { consumed: None, .. }
+        ),
+        "nothing is queued, so the closed source finishes at once"
+    );
 }
