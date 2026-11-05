@@ -363,9 +363,19 @@ impl LoopScope {
                     .filter(|arrival| arrival.pipeline.0 == reader.0)
                     .map(|arrival| (reader, arrival.guard.clone()))
                     .collect();
-                match landed.is_empty() {
+                if !landed.is_empty() {
+                    return landed;
+                }
+                let mut fits = false;
+                reach_member(
+                    &self.store,
+                    &self.members[reader.0],
+                    reader,
+                    &mut |breaker, input| fits = guard.check_from(&breaker.input_tiling(input)),
+                );
+                match fits {
                     true => vec![(reader, guard.clone())],
-                    false => landed,
+                    false => Vec::new(),
                 }
             })
             .collect()

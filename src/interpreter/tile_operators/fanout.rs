@@ -1349,17 +1349,26 @@ impl Breaker for MemoProducer {
 }
 
 impl BreakingProducer for MemoProducer {
-    /// The region the cached tile states, and what its readers released, which they release only
-    /// once it is decided. A release of a collection's rows leaves its statement as it was, but a
-    /// release of a scalar empties it, so the cache alone no longer states it. `final_guard` takes
-    /// the released region out again.
+    /// The region the cached tile states, and what its readers released whole, which they release
+    /// only once it is decided. A release of a collection's rows leaves its statement as it was,
+    /// but a release of a scalar empties it, so the cache alone no longer states it. A release of
+    /// some fields' cells beneath a row leaves the row in the cache, which states it, so only the
+    /// keys released whole are added (`keys_released_whole`). `final_guard` takes the released
+    /// region out again.
     fn held(&self) -> TileGuard {
         let stated = self.cached_tile.to_guard();
         let released = self.obsolete_guard();
-        match released.is_empty() {
-            true => stated,
-            false => stated.union(released),
+        if released.is_empty() {
+            return stated;
         }
+        let released = match names_collection_keys(released) {
+            true => match keys_released_whole(released) {
+                Some(keys) => keys,
+                None => return stated,
+            },
+            false => released.clone(),
+        };
+        stated.union(&released)
     }
 
     /// Cut at the cached keys.
