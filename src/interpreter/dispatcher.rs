@@ -419,6 +419,13 @@ struct PipelineState {
     // shared-state-ok: guards naming regions of the pipeline's input, which its notifies and the
     // decided pushes that release them read and write under the lock; never a tile.
     parked: Mutex<Vec<TileGuard>>,
+    /// For a pipeline that parks the rows pushes bring, every row a push or a start has brought it,
+    /// queued or parked, in any epoch, `None` for none: two pushes can name one row, as a widened
+    /// read's and a stream read's do, and the pipeline reads each row once
+    /// ([`queue_or_park`](Dispatcher::queue_or_park)).
+    // shared-state-ok: a guard naming a region of the pipeline's input, which the pushes to it grow
+    // under the `parked` lock; never a tile.
+    brought: Mutex<Option<TileGuard>>,
 }
 
 /// What one source of a pipeline's breaker's input has decided of that input: a pipeline it
@@ -575,6 +582,7 @@ impl Dispatcher {
                 acknowledged: AtomicUsize::new(0),
                 in_flight: AtomicBool::new(false),
                 parked: Mutex::new(Vec::new()),
+                brought: Mutex::new(None),
             })
             .collect();
         let window = Self::slots(DEFAULT_WINDOW, &infos);
@@ -806,18 +814,37 @@ impl Dispatcher {
     }
 
     /// Queue `guard`, rows a push or a start brings `reader`, which parks, in `epoch` where every
-    /// pipeline it reads has decided them, and park them otherwise ([`park`](Self::park)).
+    /// pipeline it reads has decided them, and park them otherwise ([`park`](Self::park)). Only
+    /// what of `guard` no push or start brought before, in any epoch, is new.
     fn queue_or_park(&self, epoch: &EpochState, reader: usize, guard: &TileGuard) {
         let mut parked = self.states[reader]
             .parked
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if !self.reads_decided(reader, guard) {
-            parked.push(guard.clone());
+        let fresh = {
+            let mut brought = self.states[reader]
+                .brought
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let fresh = match brought.as_ref() {
+                Some(brought) => guard_minus(guard, brought),
+                None => guard.clone(),
+            };
+            if fresh.is_empty() {
+                return;
+            }
+            *brought = Some(match brought.take() {
+                Some(before) => before.union(&fresh),
+                None => fresh.clone(),
+            });
+            fresh
+        };
+        if !self.reads_decided(reader, &fresh) {
+            parked.push(fresh);
             return;
         }
         drop(parked);
-        let appended = epoch.pipelines[reader].queue.append_unqueued(guard);
+        let appended = epoch.pipelines[reader].queue.append_unqueued(&fresh);
         self.ensure(appended, || {
             format!(
                 "pipeline {reader} receives packages before the last pipeline it reads finishes"
@@ -827,7 +854,8 @@ impl Dispatcher {
 
     /// Append the morsels `reader` parked that the pipelines it reads have now decided to its
     /// queue in `epoch` ([`park`](Self::park)). A decided push lands before the pushing pipeline
-    /// counts its finish toward `reader`'s close, so `reader`'s queue in `epoch` is open.
+    /// counts its finish toward `reader`'s close, and a range's lands in the current epoch before
+    /// its seal, so `reader`'s queue in `epoch` is open.
     fn release_parked(&self, epoch: &EpochState, reader: usize) {
         let released: Vec<TileGuard> = {
             let mut parked = self.states[reader]
@@ -1008,6 +1036,15 @@ impl Dispatcher {
             !self.infos[pipeline.0].reads.is_empty(),
             "pipeline {} reads its input whole only after a pipeline it reads; a source does so \
              from its start",
+            pipeline.0
+        );
+        assert!(
+            self.current.load(Ordering::Acquire) == 0
+                && self.states.iter().all(|pipeline| {
+                    pipeline.queued.load(Ordering::Acquire) == 0
+                        && !pipeline.closed.load(Ordering::Acquire)
+                }),
+            "pipeline {} reads its input whole from before any notify, seal or close",
             pipeline.0
         );
         let info = &mut self.infos[pipeline.0];
@@ -1767,9 +1804,13 @@ impl Dispatcher {
         decided: &Projection,
         to: &SharedConsumer,
     ) {
-        let epoch = self
-            .epoch(self.current.load(Ordering::Acquire))
-            .expect("the window holds the current epoch");
+        // An epoch sealed after the read of `current` may have retired since, its slot taken by the
+        // epoch a window later; the reread finds the epoch after it.
+        let epoch = loop {
+            if let Some(epoch) = self.epoch(self.current.load(Ordering::Acquire)) {
+                break epoch;
+            }
+        };
         self.land_decided_from(&epoch, pipeline.0, Some(decided), Some(to), false);
     }
 
@@ -1815,8 +1856,7 @@ impl Dispatcher {
     }
 
     /// What `source` has decided of `reader`'s breaker's input: a pipeline `reader` reads, or
-    /// `reader` itself for the ranges in its own chain. Only the end-of-run check reads it, until
-    /// claims do.
+    /// `reader` itself for the ranges in its own chain, as the end-of-run check reads it.
     ///
     /// # Panics
     ///

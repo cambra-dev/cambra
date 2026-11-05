@@ -3379,3 +3379,72 @@ fn a_live_comprehension_reading_a_decided_value(
     let (value, _) = dispatched_live(source, rows, two_batches());
     assert_eq!(keyed_ints(&value), expected, "{source}");
 }
+
+/// A sum whose rows read a live list and a sum over a second live source that becomes decided
+/// between the list's two deliveries. Each row the list brings parks until the sum is decided; the
+/// sum's decided push brings no row the list's already brought, so the outer sum reads each once.
+#[rstest_log::rstest]
+#[case::a_sum_in_the_row(indoc! {"
+    out = test_sink()
+    xs = [x for x in source1()]
+    out << sum([x * sum(source2()) for x in xs])
+"})]
+#[case::a_let_bound_sum(indoc! {"
+    out = test_sink()
+    xs = [x for x in source1()]
+    n = sum(source2())
+    out << sum([x * n for x in xs])
+"})]
+fn a_reader_of_two_pipelines_decided_apart(
+    #[case] source: &str,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let mut ctx = GlobalContext::default();
+    ctx.defer_sink_pulls();
+    let feed = |name: &str| {
+        std::rc::Rc::new(std::cell::RefCell::new(
+            crate::interpreter::TestDataSource::new(
+                name,
+                crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+                crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+            ),
+        ))
+    };
+    let (list, summed) = (feed("source1"), feed("source2"));
+    ctx.register_source(list.clone());
+    ctx.register_source(summed.clone());
+    let sink = ctx.register_test_sink("out");
+    let mut program = compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    let _operators = ctx.take_operator_map();
+    let entries = |keys: std::ops::Range<u64>| {
+        keys.map(|key| (Value::UInt(key), Value::Int(key as i64 + 1)))
+            .collect::<Vec<_>>()
+    };
+    let up_to = |key: u64| crate::interpreter::Predicate::at_or_below(Value::UInt(key));
+    list.borrow_mut().add_data(&entries(0..2));
+    list.borrow_mut().set_yield_predicate(up_to(1));
+    summed.borrow_mut().add_data(&entries(0..1));
+    summed.borrow_mut().set_yield_predicate(up_to(0));
+    let mut idle = 0;
+    crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut || {
+        idle += 1;
+        let (fed, keys) = match idle {
+            1 => (&summed, 1..4),
+            2 => (&list, 2..5),
+            _ => panic!("{source}: the run waits only for its two batches"),
+        };
+        fed.borrow_mut().add_data(&entries(keys));
+        fed.borrow_mut()
+            .set_yield_predicate(crate::interpreter::Predicate::True);
+    })
+    .unwrap_or_else(|refused| panic!("{source}: {refused}"));
+    let written = sink
+        .value()
+        .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+    // sum(x) over 1..=5 is 15 and sum(source2()) over 1..=4 is 10.
+    let [binding] = written.as_function().as_slice() else {
+        panic!("{source} writes one value: {written:?}")
+    };
+    assert_eq!(binding.output, Value::Int(150), "{source}");
+}
