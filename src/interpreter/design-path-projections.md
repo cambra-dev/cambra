@@ -1,12 +1,13 @@
 # Projections that name a path
 
-A projection names the part of a producer's tile a pull asks for
-(`src/interpreter/design-operators.md`, "Projection guards"). This note specifies projections that
-name keys at any collection level, each under the path of keys above it, and the guard differences
-they need. A producer declares the levels whose keys it restates (`TileProducer::restates`, a
-`Restates`), the outermost keys only by default, and one that declares more reads its projection
-with `TileGuard::projection_for`. The `get` wrapper of a debug build panics on a pull at a level a
-producer does not restate.
+A projection names the part of a producer's tile a pull asks for, and a push names the region a
+pipeline breaker decided (`src/interpreter/design-operators.md`, "Projection guards"). This note
+specifies projections that name keys at any collection level, each under the path of keys above it,
+and the guard differences they need. A producer declares the levels whose keys it restates
+(`TileProducer::restates`, a `Restates`), the outermost keys only by default, and one that declares
+more reads its projection with `TileGuard::projection_for`. The `get` wrapper of a debug build
+panics on a pull at a level a producer does not restate, and a push beneath the outermost keys lands
+in its reader as a projection at its level (`Dispatcher::land_in`).
 
 ## Representation
 
@@ -58,9 +59,10 @@ held − released = Or [ Domain(k = 1), Codomain(Domain(Qualified { enclosing: k
 The arm `(0, j > 1)` is empty where row 0 has no position past 1, which the guard alone does not
 say. `TileGuard::closed_over`, which also closes a guard against a tagged union's tags, drops the
 arm where its level's extent is a finite range of positions none of which it names, so over rows
-of positions `0..2` the difference is `Domain(k = 1)`. A level of any other extent closes no arm,
-and a row there is held no more once a release names it whole. Closing drops an empty arm and does
-not lift an arm naming every position of its row to the key above.
+of positions `0..2` the difference is `Domain(k = 1)`. `BreakingProducer::final_guard` closes its
+difference over the producer's tiling. A level of any other extent closes no arm, and a row there
+is held no more once a release names it whole. Closing drops an empty arm and does not lift an arm
+naming every position of its row to the key above.
 
 A release can also carry an arm of cells beneath keys. A selector releases every field but its own
 at every path (`guard_at_field`, `fan.rs`), and a `FanOut` releases the meet of its readers'
