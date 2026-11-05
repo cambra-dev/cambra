@@ -661,9 +661,10 @@ pub(super) enum Consumes {
     Rounds,
 }
 
-/// The dispatcher over the pipelines `reads` describes, with each edge into a pipeline that
-/// reads another planned from its routes as a stream edge, a widened edge or a whole read, and the
-/// regions no push names queued at the start ([`run_program`] says how). `arrivals` says whether a
+/// The dispatcher over the pipelines `reads` describes, with every pipeline that reads another
+/// parking its rows until the pipelines it reads have decided them, each edge into it planned from
+/// its routes as a stream edge, a widened edge or a whole read, and the regions no push names
+/// queued at the start ([`run_program`] says how). `arrivals` says whether a
 /// pipeline takes a live source's arrivals beside the pipelines it reads
 /// ([`Dispatcher::take_arrivals`]), which it parks ([`Dispatcher::park`]). `opens` says the
 /// dispatcher is the run's, where a store or a loop's scope parks its deliveries; in a loop's
@@ -769,8 +770,6 @@ pub(super) fn plan_edges(
         let mut streams = Vec::new();
         // The nested loops' scopes it reads, whose finish of each round it waits for.
         let mut follows = Vec::new();
-        // The pipelines it reads along a route that widens their keys.
-        let mut widened = Vec::new();
         // Whether a pipeline it reads pushes along no route to it.
         let mut unreached = false;
         // What the widened edges and the leaves bring the reader, which no stream push names.
@@ -790,10 +789,8 @@ pub(super) fn plan_edges(
             // pipelines push one region once between them, so its edge is the first one's, whose
             // pushes are already named.
             if let Some(&(_, edge)) = seen.iter().find(|(shared, _)| *shared == pushes_with[read]) {
-                match edge {
-                    Edge::Stream => {}
-                    Edge::Widened => widened.push(read),
-                    Edge::Unreached => unreached = true,
+                if let Edge::Unreached = edge {
+                    unreached = true;
                 }
                 continue;
             }
@@ -827,10 +824,7 @@ pub(super) fn plan_edges(
             }
             match edge {
                 Edge::Unreached => unreached = true,
-                Edge::Widened => {
-                    widened.push(read);
-                    brought.extend(named);
-                }
+                Edge::Widened => brought.extend(named),
                 Edge::Stream => streams.push(
                     named
                         .into_iter()
@@ -840,13 +834,6 @@ pub(super) fn plan_edges(
                 ),
             }
         }
-        // A key two stream edges can both name is consumed at the first push of it, and read
-        // again at the other's where that pipeline had not decided it.
-        let apart = streams.iter().enumerate().all(|(at, names)| {
-            streams[..at]
-                .iter()
-                .all(|earlier| earlier.intersect(names).is_empty())
-        });
         let pushed = streams
             .iter()
             .fold(input.empty_guard(), |pushed, names| pushed.union(names));
@@ -863,11 +850,11 @@ pub(super) fn plan_edges(
         let left = brought.iter().fold(input.empty_guard(), |left, arrival| {
             left.union(&guard_minus(&arrival.guard, &pushed))
         });
-        // A reader whose pushes can name a row it consumed before, along a widened edge or a
-        // second stream edge, parks its rows until the pipelines it reads have decided them, in a
-        // loop's scope as in the run's dispatcher. A pipeline that takes arrivals is queued its
-        // rows as its sources yield them, and any other reads its input whole only where nothing
-        // names a region of it.
+        // Every reader parks the rows its pushes and its start bring until the pipelines it reads
+        // have decided them, and reads each row once ([`Dispatcher::park`]). A pipeline that takes
+        // arrivals is queued its rows as its sources yield them, and any other reads its input
+        // whole only where a pipeline it reads reaches it by pull or nothing names a region of
+        // it.
         let whole = !arrivals[reader] && (unreached || (streams.is_empty() && left.is_empty()));
         if whole {
             dispatcher.read_whole(PipelineId(reader), &input);
@@ -878,7 +865,7 @@ pub(super) fn plan_edges(
             dispatcher.follow(PipelineId(reader), PipelineId(follow));
             planned[reader].follows.push(follow);
         }
-        if !planned[reader].held && (!apart || !widened.is_empty()) {
+        if !planned[reader].held {
             dispatcher.park(PipelineId(reader));
             planned[reader].held = true;
         }

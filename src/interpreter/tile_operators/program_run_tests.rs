@@ -423,7 +423,7 @@ fn a_group_by() {
 }
 
 /// The two arms of a concatenation of comprehensions push under their own tags, so the sum reads
-/// both pipelines' pushes: two stream edges whose pushes name no key in common.
+/// both pipelines' pushes, parked until each arm has decided its rows, and no region at the start.
 #[test]
 fn a_sum_over_two_concatenated_comprehensions() {
     let source = indoc! {"
@@ -437,7 +437,7 @@ fn a_sum_over_two_concatenated_comprehensions() {
     assert!(
         planned.iter().any(|plan| plan.name.starts_with("Aggregate")
             && !plan.whole
-            && !plan.held
+            && plan.held
             && !plan.started),
         "the sum reads both arms' pushes: {planned:?}"
     );
@@ -487,7 +487,7 @@ fn a_sink_reads_the_pushes_of_a_values_output_memo() {
     answers(source, "3", &["Memo", "SinkBreaker"]);
     let (_, planned) = dispatched(source, 1);
     let sink = sink_of(&planned);
-    assert!(!sink.whole && !sink.held, "{sink:?}");
+    assert!(!sink.whole && sink.held, "{sink:?}");
 }
 
 /// The sink of a collection reads the pushes of the collection's output memo.
@@ -501,7 +501,7 @@ fn a_sink_of_a_collection() {
     answers(source, "Function [ 2, 3, 4 ]", &["Memo", "SinkBreaker"]);
     let (_, planned) = dispatched(source, 1);
     let sink = sink_of(&planned);
-    assert!(!sink.whole && !sink.held, "{sink:?}");
+    assert!(!sink.whole && sink.held, "{sink:?}");
 }
 
 /// Two sinks each run as a pipeline of their own, and the program is done once both are.
@@ -2746,7 +2746,10 @@ fn readers_over_a_live_pipeline_park_their_rows(#[values(1, usize::MAX)] rows: u
         "the per-row sum parks its rows: {planned:?}"
     );
     assert_eq!(
-        planned.iter().filter(|plan| plan.held).count(),
+        planned
+            .iter()
+            .filter(|plan| plan.held && !plan.name.starts_with("SinkBreaker"))
+            .count(),
         3,
         "the two memos and the sum park their rows: {planned:?}"
     );

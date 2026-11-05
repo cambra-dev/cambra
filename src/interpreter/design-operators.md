@@ -1554,16 +1554,20 @@ decided, lands as at the reader's entry (`Dispatcher::reaches`). A row outside t
 depend on the pipeline. A pipeline read by pull, whose push reaches no entry of the reader, reaches
 all of its input, and the reader records it whole once it is wholly decided.
 
-The planner parks the rows of a pipeline, in the run's dispatcher or a loop's scope's, in three
-cases (`plan_edges`):
+Every pipeline that reads another parks the rows its pushes, its arrivals and its start bring, in
+the run's dispatcher and in a loop's scope's (`plan_edges`). Its routes from each pipeline it reads
+decide where its rows come from, not whether it parks:
 
-- Its chain reads a live source and other pipelines (`Dispatcher::take_arrivals`). It takes the
-  source's arrivals, and its queue in an epoch counts the seal as one more event. It is queued no
-  start region and reads nothing whole.
-- A route from a pipeline it reads widens that pipeline's keys, so the pipeline's push names every
-  row of its input, as the group-by's memo reads its input's memo.
-- Two of its stream edges can push one key, as `sum([x * n for x in xs])` reads the list's memo and
-  `n`'s sum. A key the list's push brings waits for `n`'s sum.
+- A stream edge, along routes that keep the pushing pipeline's keys, brings the rows its pushes
+  name.
+- A widened edge brings every row of the input, which the run queues at the start beside what the
+  ranges under the pipeline bring, less what a stream edge names.
+- A read along no route is read by pull, so the pipeline reads its input whole
+  (`Dispatcher::read_whole`), released as the pipelines it reads decide it.
+
+A pipeline whose chain reads a live source and other pipelines takes the source's arrivals
+(`Dispatcher::take_arrivals`), and its queue in an epoch counts the seal as one more event. It is
+queued no start region and reads nothing whole.
 
 A pipeline that takes arrivals brings rows only from its arrivals and from a pipeline whose pushes
 arrive as its own keys (`Dispatcher::queue_pushes_of`), as a let-bound arm of a concatenation or a
