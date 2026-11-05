@@ -1482,6 +1482,18 @@ impl Planner {
             },
         );
         self.scopes[scope].pipeline = Some(pipeline);
+        // The store's seeds reach the scope's pipeline through their entries, which record what
+        // each seed has decided; the scope takes no push of them.
+        let seeds = read
+            .store
+            .borrow_mut()
+            .as_breaking_mut()
+            .map(|store| store.seed_placements())
+            .unwrap_or_default();
+        for placement in &seeds {
+            placement.set(Some(PipelineId(self.local[pipeline])));
+        }
+        self.placements[pipeline].extend(seeds);
         pipeline
     }
 

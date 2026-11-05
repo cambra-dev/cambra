@@ -1544,6 +1544,13 @@ pub trait BreakingProducer: TileProducer + Breaker {
         self.base().placement.clone()
     }
 
+    /// The placements of the entries the producer's seeds are subscribed behind, which a planner
+    /// sets to the pipeline of the loop's scope that runs it: an induction store's. Empty for
+    /// every other producer.
+    fn seed_placements(&self) -> Vec<crate::interpreter::dispatcher::Placement> {
+        Vec::new()
+    }
+
     /// The placements of every entry at input `input`, which a planner sets to that input's
     /// pipeline: an input read through several entries, as a transaction store reads one per
     /// seed, has one per entry. The default answers [`entry_placement`](Self::entry_placement).

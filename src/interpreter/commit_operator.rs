@@ -1034,6 +1034,10 @@ impl BreakingProducer for InductionStoreProducer {
         self.breaker.held(self.tiling())
     }
 
+    fn seed_placements(&self) -> Vec<crate::interpreter::dispatcher::Placement> {
+        self.seed_placements.clone()
+    }
+
     /// The positions the last step decided, row by row under rows: the store tile's own
     /// statement (`Tile::to_guard`), though it holds nothing short of terminal, since a reader
     /// pulls the tile whole.
@@ -1158,10 +1162,32 @@ fn precedes_every(value: &Value, extent: &Extent) -> bool {
     }
 }
 
-/// The tiling of a transaction store's seed input: one value, since the store reads every seed
-/// whole when it opens, so a push of any seed queues the input whole.
+/// The tiling of a store's seed input: one value, since the store reads every seed whole when it
+/// opens, so a push of any seed names the input whole.
 fn seed_input_tiling() -> Tiling {
     Tiling::Scalar(Extent::Base(BaseType::Unit))
+}
+
+/// `op`, a store's seed, subscribed in front of `consumer` behind an unplaced entry of the seed
+/// input's tiling, and the entry's placement, which a planner sets to the pipeline that reads the
+/// store's seeds. A push of the seed names the input whole ([`seed_input_tiling`]).
+fn subscribe_seed(
+    op: &mut dyn TileOperator,
+    consumer: &GatedConsumer,
+    scheduler: &mut Scheduler,
+) -> (
+    Box<dyn TileProducer>,
+    crate::interpreter::dispatcher::Placement,
+) {
+    let forward = forwarding_consumer(consumer, &scheduler.wakeup_queue());
+    let (entry, placement) =
+        crate::interpreter::dispatcher::Entry::unplaced(seed_input_tiling(), forward);
+    let seed = op.subscribe(
+        op.tiling().universal_guard(),
+        crate::interpreter::scheduler::widening(Box::new(entry)),
+        scheduler,
+    );
+    (seed, placement)
 }
 
 impl CommitProducer {
@@ -2509,15 +2535,8 @@ impl TileOperator for CommitOperator {
         let seed_producers = std::mem::take(&mut self.seed_ops)
             .into_iter()
             .map(|(key, mut op)| {
-                let forward = forwarding_consumer(&consumer, &scheduler.wakeup_queue());
-                let (entry, placement) =
-                    crate::interpreter::dispatcher::Entry::unplaced(seed_input_tiling(), forward);
+                let (seed, placement) = subscribe_seed(&mut *op, &consumer, scheduler);
                 seed_placements.push(placement);
-                let seed = op.subscribe(
-                    op.tiling().universal_guard(),
-                    crate::interpreter::scheduler::widening(Box::new(entry)),
-                    scheduler,
-                );
                 (key, seed)
             })
             .collect();
@@ -3549,12 +3568,17 @@ impl TileOperator for InductionStore {
         // seed computed from a loop settles over as many pulls as that loop takes, and the
         // pull it settles on is the one that opens the store. Draining at subscribe
         // instead bounds a seed by how many positions its input can deliver before the
-        // runtime has started. The store reads a seed by pull at a step, so a push from a
-        // pipeline beneath the seed stops in front of it (`subscribe_pulled`) rather than climb
-        // to the store's readers.
+        // runtime has started. The store reads a seed by pull at a step. Each seed is
+        // subscribed behind an entry a planner places in the pipeline of the loop's scope, which
+        // takes no push of it and records what it has decided.
+        let mut seed_placements = Vec::new();
         let seed_producers = std::mem::take(&mut self.seed_ops)
             .into_iter()
-            .map(|(key, mut op)| (key, subscribe_pulled(&mut *op, &consumer, scheduler)))
+            .map(|(key, mut op)| {
+                let (seed, placement) = subscribe_seed(&mut *op, &consumer, scheduler);
+                seed_placements.push(placement);
+                (key, seed)
+            })
             .collect();
         Box::new(InductionStoreProducer {
             base: ProducerBase::new(
@@ -3566,6 +3590,7 @@ impl TileOperator for InductionStore {
             .sharing(gate)
             .breaking(consumer.shared().clone(), placement),
             seed_producers,
+            seed_placements,
             complete_rows: vec![Predicate::False; self.tiling().levels() + 1],
             // Each store holds its accumulators' seeds as its own, so the changelog is
             // self-describing: `read_as_of`/`store_value_at` fold to the seed below
@@ -3626,6 +3651,9 @@ struct InductionStoreProducer {
     /// Per accumulator key, the per-row seed stream. An induction store with no rows above it has
     /// one row, the empty path, so its seed arrives there.
     seed_producers: Vec<(Value, Box<dyn TileProducer>)>,
+    /// Per seed stream, the placement of the entry it is subscribed behind, which a planner sets
+    /// to the pipeline of the loop's scope.
+    seed_placements: Vec<crate::interpreter::dispatcher::Placement>,
     /// What the body says is complete, one predicate per level of its decision stream,
     /// outermost first: the row levels above the stores, then the positions within one. The
     /// drive is what knows, from its source; the store carries it to the read. An induction store

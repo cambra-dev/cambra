@@ -2041,7 +2041,8 @@ impl Dispatcher {
     /// ([`decided_of`](Self::decided_of)).
     ///
     /// Where `decided` is every key, each reader the push reached no entry of reads `pipeline` by
-    /// pull, as a store reads its seed, which reads all of it: it records `pipeline` whole.
+    /// pull, as a loop's rounds pull a sum its body reads from outside the loop's cycle, which
+    /// reads all of it: it records `pipeline` whole.
     /// `pipeline` is the pushing pipeline, or, for a range in its own chain, the pipeline itself.
     fn land_decided(
         &self,
@@ -2676,7 +2677,11 @@ impl Landing<'_> {
                     true => reader.0,
                     false => self.from,
                 };
-                return dispatcher.record_decided(epoch, reader.0, source, Some(guard));
+                // A region that names the entry's input whole is the source wholly decided,
+                // whatever the entry's tiling: a store's seed entry is one value in front of a
+                // pipeline whose input is the loop's positions.
+                let guard = (!guard.is_universal()).then_some(guard);
+                return dispatcher.record_decided(epoch, reader.0, source, guard);
             }
         };
         let (from, r) = (self.from, reader.0);

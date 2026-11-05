@@ -1017,9 +1017,9 @@ decision is stepped, at every level above its positions: the release through the
 the row's positions only, not its paths past the last of them. A consuming store wakes no reader
 outside its cycle: its readers there take the rows it closes from its pushes, and the planner
 refuses a store read inside the cycle of a store that steps itself (`Planner::beneath_cycle`). An
-induction store's seed sits behind an entry no planner places (`subscribe_pulled`), since the store
-reads it by pull at a step, so a push from beneath the seed stops there rather than climb to the
-store's readers. A transaction store reads its seeds as its input 0 instead (below). A drive with no
+induction store's seed sits behind an entry placed in the pipeline of the loop's scope, which takes
+no push of it, since the store reads it by pull at a step, and records what the seed has decided. A
+transaction store reads its seeds as its input 0 instead (below). A drive with no
 rows above it states complete every position below its next one that its source calls complete along
 with every position before, so a position it reads past, one the source filtered out or holds
 nothing at, is stated as one it emitted (`complete_prefix_below`). An induction store with no rows
