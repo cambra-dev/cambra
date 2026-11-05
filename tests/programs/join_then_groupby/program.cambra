@@ -24,6 +24,6 @@ joined = sum([
     if u.id == o.user_id
 ])
 
-grouped = sum([sum(x) for x in groupby([2, 3, 4, 5], \x -> x // 2)])
+grouped = sum([sum(x) for _ -> x in groupby([2, 3, 4, 5], \x -> x // 2)])
 
 joined + grouped

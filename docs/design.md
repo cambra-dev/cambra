@@ -96,7 +96,7 @@ A comprehension denotes the bag of element evaluations over the cross-product of
 
 A `def` whose body contains `yield` is a **generator function**: calling it produces the bag of yielded values, lazily, so a generator over `stdin()` is an unbounded stream. Today the compiler restricts generator bodies to a single top-level `for` loop (general shapes are **[Planned]**).
 
-The compiler recognises comprehension shapes and emits specialised dataflow: an equality guard between two clauses compiles to a **hash join** rather than a nested loop, and `for g in groupby(c, key)` produces a **keyed aggregate** dispatch. Users get query-planner behaviour from ordinary language constructs — there is no embedded query DSL to switch into.
+The compiler recognises comprehension shapes and emits specialised dataflow: an equality guard between two clauses compiles to a **hash join** rather than a nested loop, and `for _ -> g in groupby(c, key)` produces a **keyed aggregate** dispatch. Users get query-planner behaviour from ordinary language constructs — there is no embedded query DSL to switch into.
 
 
 ### Sources, sinks, and feeds

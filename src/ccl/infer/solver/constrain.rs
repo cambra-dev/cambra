@@ -1198,10 +1198,10 @@ fn constrain_type_kinds(
 /// which `UIntRanges` refuses whatever the range. A candidate list naming the witness itself
 /// admits it by equality.
 ///
-/// **Nothing is eager.** An unresolved `d` records `k` on its variable in every kind, drawing
-/// no bound; materialization decides it ([`admits_resolved`]), and the coalesce pass decides one
-/// recorded on a suspension, which no tree position holds. In [`Membership::Check`] it abstains
-/// instead.
+/// **Nothing is eager but a subtype edge.** An unresolved `d` records `k` on its variable,
+/// drawing no bound; materialization decides it ([`admits_resolved`]), and the coalesce pass
+/// decides one recorded on a suspension, which no tree position holds. `SubtypesOf` is the edge
+/// `d <: 𝐾` alone, so it is drawn at once. In [`Membership::Check`] it abstains instead.
 ///
 /// Pass the whole type, including refinements: a refined range is not a dense range.
 /// See `src/ccl/design/type-inference.md`, "Membership is decided at materialization".
@@ -1232,6 +1232,13 @@ fn admits(
         Type::Infer(v) => {
             if mode == Membership::Check {
                 return Ok(());
+            }
+            // **`SubtypesOf` is an edge.** Its membership is `d <: 𝐾` and nothing else, so the
+            // edge is drawn now rather than decided at materialization: a bound on `𝐾` that
+            // only the candidate gives (a nominal collection's key type) reaches it as the
+            // candidate's other bounds do.
+            if let TypeKind::SubtypesOf(b) = k {
+                return constrain_go(d, b, sl, sr, cache, scope);
             }
             // The requirement is on `𝑣` as this edge reads it: through `sl`, the variable
             // that stands for it there.
@@ -1541,7 +1548,7 @@ fn eliminate_at(ty: &Type, s: &Subst) -> Option<(Type, Subst)> {
             capabilities,
         } => {
             let parts = match fun_kind {
-                FunKind::Data(Some(ws)) => rest.discharged_through(ws, &term),
+                FunKind::Data(Some(ws)) => rest.discharged_through(ws, &term, ty),
                 FunKind::Var(k) => Subst::then(&rest, &Subst::kind_elim(k, &term)),
                 // Nothing to eliminate: the sum over no binders, or not a collection.
                 FunKind::Data(None) | FunKind::Compute => return Some((ty.clone(), rest)),
@@ -1599,7 +1606,24 @@ fn constrain_go_impl(
         }
         seen.push((sl.clone(), sr.clone()));
     }
+    constrain_shapes(lhs, rhs, sl, sr, cache, scope)
+}
 
+/// [`constrain_go_impl`] past its short-circuit and cycle check: the edge decomposed by the
+/// two sides' shapes.
+///
+/// An extrusion constrains its copy here, past the check its original edge just recorded.
+/// The copy derives every witness of the original ([`crate::ccl::ty::Witness::map_types`]), and a witness is
+/// equal to itself whatever its range, so the copy is equal to the original and the check
+/// would take it for the edge it was made to carry.
+fn constrain_shapes(
+    lhs: &Type,
+    rhs: &Type,
+    sl: &Subst,
+    sr: &Subst,
+    cache: &mut ConstrainCache,
+    scope: &dyn ScopeEnv,
+) -> Result<(), ConstrainError> {
     match (lhs, rhs) {
         // Leaf types match by structural equality.
         (Type::Base(a), Type::Base(b)) if a == b => Ok(()),
@@ -1641,13 +1665,13 @@ fn constrain_go_impl(
         // Two applications of one nominal type relate argument by argument, as each
         // parameter's variance requires. A contravariant argument flips the way a
         // function's domain does, swapping the two sides' morphisms. An invariant one
-        // equates in both directions under no morphism, as a history's children do: both
-        // directions carrying the sides' morphisms would meet two non-invertible
-        // morphisms at one variable. The second direction relates the sides the other way
-        // round, so it swaps them as a contravariant argument does, and its left side is the
-        // demand's. A nominal type relates to no other type, so every
-        // other pairing falls to the catch-all `Mismatch` below (`docs/chl-spec.md`, "A
-        // nominal type is opaque").
+        // relates in both directions as a data domain does, each direction carrying the
+        // sides' morphisms: an argument reading a binder the edge discharges, as a
+        // group-by's key domain reads the element it groups, crosses the edge with the
+        // discharge applied. The second direction relates the sides the other way round,
+        // so it swaps them as a contravariant argument does. A nominal type relates to no
+        // other type, so every other pairing falls to the catch-all `Mismatch` below
+        // (`docs/chl-spec.md`, "A nominal type is opaque").
         (Type::Nominal(d0, a0), Type::Nominal(d1, a1)) if d0 == d1 => {
             for ((x, y), v) in a0.iter().zip(a1).zip(&d0.body().variances) {
                 match v {
@@ -1656,21 +1680,16 @@ fn constrain_go_impl(
                         cache.swapped(|cache| constrain_go(y, x, sr, sl, cache, scope))?
                     }
                     Variance::Invariant => {
-                        constrain_go(x, y, &Subst::id(), &Subst::id(), cache, scope)?;
-                        cache.swapped(|cache| {
-                            constrain_go(y, x, &Subst::id(), &Subst::id(), cache, scope)
-                        })?;
+                        constrain_go(x, y, sl, sr, cache, scope)?;
+                        cache.swapped(|cache| constrain_go(y, x, sr, sl, cache, scope))?;
                     }
                     // The output sides relate as a covariant argument does and the input
                     // sides as a contravariant one. An argument that is not split is both
-                    // sides, so two of those relate both ways, as an invariant pair does, and
-                    // with no morphism carried in, as an invariant pair's.
+                    // sides, so two of those relate both ways, as an invariant pair does.
                     Variance::Bipolar => {
                         let ((xi, xo), (yi, yo)) = (sides(x), sides(y));
-                        constrain_go(xo, yo, &Subst::id(), &Subst::id(), cache, scope)?;
-                        cache.swapped(|cache| {
-                            constrain_go(yi, xi, &Subst::id(), &Subst::id(), cache, scope)
-                        })?;
+                        constrain_go(xo, yo, sl, sr, cache, scope)?;
+                        cache.swapped(|cache| constrain_go(yi, xi, sr, sl, cache, scope))?;
                     }
                 }
             }
@@ -2355,7 +2374,13 @@ fn constrain_go_impl(
             };
             // A collection above a watched operand answers a trait that reads collections,
             // and a nominal type above a receiver answers a method call.
-            notify_upper(lv, rhs, cache)?;
+            let into = edge_into_holder(sr, sl);
+            if into.is_id() {
+                notify_upper(lv, rhs, cache)?;
+            } else {
+                let at = crate::ccl::provenance::preserving_ids(|| into.apply_type(rhs));
+                notify_upper(lv, &at, cache)?;
+            }
             // **No join here.** A variable's lower bounds are joined where every other
             // join is: at compaction, off these same bounds. Assembling one here as well
             // would compute it twice, by two rules, and — because this arm runs again on
@@ -2473,14 +2498,15 @@ fn constrain_go_impl(
             // land the concrete type here. The one path that bypasses the closure is
             // `extrude`, which seeds a proxy's bounds by direct writes; it copies the
             // watch list instead.
-            // A family application's terms are read where the variable stands, so the edge's
-            // substitution on its side reaches them before it is delivered.
-            if let Type::FamilyApp(_) = lhs.peel_refinements() {
-                let into = edge_into_holder(sl, sr);
+            // The contribution is delivered where the variable stands, the edge's substitution
+            // applied: an obligation compares it with its assumptions and reports it, and both
+            // read it in the operand's frame.
+            let into = edge_into_holder(sl, sr);
+            if into.is_id() {
+                notify_lower(rv, lhs, cache)?;
+            } else {
                 let at = crate::ccl::provenance::preserving_ids(|| into.apply_type(lhs));
                 notify_lower(rv, &at, cache)?;
-            } else {
-                notify_lower(rv, lhs, cache)?;
             }
             match lhs {
                 Type::Infer(lv) => link_watches(lv, rv, &edge_into_holder(sl, sr), cache)?,
@@ -2538,7 +2564,7 @@ fn constrain_go_impl(
                 lv.level(),
                 cache.extruded.entry(lv.level()).or_default(),
             );
-            constrain_go(lhs, &new_rhs, sl, sr, cache, scope)
+            constrain_shapes(lhs, &new_rhs, sl, sr, cache, scope)
         }
         (_, Type::Infer(rv)) => {
             if let Some(param) = escaping_param(lhs, rv.level()) {
@@ -2550,7 +2576,7 @@ fn constrain_go_impl(
                 rv.level(),
                 cache.extruded.entry(rv.level()).or_default(),
             );
-            constrain_go(&new_lhs, rhs, sl, sr, cache, scope)
+            constrain_shapes(&new_lhs, rhs, sl, sr, cache, scope)
         }
 
         // A type parameter is a subtype of whatever its bound is a subtype of

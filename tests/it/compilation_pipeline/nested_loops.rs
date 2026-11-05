@@ -447,7 +447,7 @@ fn a_nested_loop_carries_any_write_law(#[case] program: &str, #[case] total: i64
         m = map([("a", 1), ("b", 2)])
         total := 0
         for x in [1, 2]:
-            for v in m:
+            for _ -> v in m:
                 total += v * x
         total
     "#},
@@ -481,7 +481,7 @@ fn a_nested_loop_carries_any_write_law(#[case] program: &str, #[case] total: i64
     indoc! {r#"
         m = map([("a", 1), ("b", 2)])
         total := 0
-        for x in [v * 10 for v in m]:
+        for x in [v * 10 for _ -> v in m]:
             for y in [1, 2]:
                 total += x * y
         total

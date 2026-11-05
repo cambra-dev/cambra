@@ -259,6 +259,7 @@ impl Walk {
                     .flat_map(|c| &c.params)
                     .for_each(|p| self.expr(&p.ty)),
                 TypeDeclBody::Single(e) => self.expr(e),
+                TypeDeclBody::Builtin => {}
             },
             Stmt::Impl(block) | Stmt::Instance(block) => {
                 block.args.iter().for_each(|a| self.expr(a));

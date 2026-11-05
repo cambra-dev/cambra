@@ -789,23 +789,23 @@ mod tests {
     #[rstest]
     #[case(
         "groupby(xs, \\x -> x)",
-        "λ __gb_k : {_#0 | __elem ▷ ((λ __iter_record → __iter_record ▷ xs ▷ (λ x → x)) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ (λ x → x) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
+        "FullMap::new(λ __gb_k : {_#0 | __elem ▷ ((λ __iter_record → __iter_record ▷ xs ▷ (λ x → x)) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ (λ x → x) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs))"
     )]
     #[case(
         "groupby([1, 2, 3], \\x -> x // 2)",
-        "λ __gb_k : {_#0 | __elem ▷ ((λ __iter_record → __iter_record ▷ [1, 2, 3] ▷ (λ x → x // 2)) ▷ collection_contains)} → cast(({_ | __elem ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ [1, 2, 3])"
+        "FullMap::new(λ __gb_k : {_#0 | __elem ▷ ((λ __iter_record → __iter_record ▷ [1, 2, 3] ▷ (λ x → x // 2)) ▷ collection_contains)} → cast(({_ | __elem ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ [1, 2, 3]))"
     )]
     #[case(
         "groupby(xs, key_fn)",
-        "λ __gb_k : {_#0 | __elem ▷ ((xs ≫ key_fn) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs)"
+        "FullMap::new(λ __gb_k : {_#0 | __elem ▷ ((xs ≫ key_fn) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ key_fn == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs))"
     )]
     #[case(
         "set(xs)",
-        "λ __iter_record : {_#0 | __elem ▷ ((λ __iter_record → __iter_record ▷ xs ▷ (λ __set_key → __set_key)) ▷ collection_contains)} → let __anf = __iter_record ▷ (λ __gb_k : {_#0 | __elem ▷ ((λ __iter_record → __iter_record ▷ xs ▷ (λ __set_key → __set_key)) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ (λ __set_key → __set_key) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs))\nin __anf ▷ (λ __set_g → Drain(__set_g))"
+        "Set::rep((λ __iter_record : {_#0 | __elem ▷ ((λ __iter_record → __iter_record ▷ xs ▷ (λ __set_key → __set_key)) ▷ collection_contains)} → let __anf = __iter_record ▷ (λ __gb_k : {_#0 | __elem ▷ ((λ __iter_record → __iter_record ▷ xs ▷ (λ __set_key → __set_key)) ▷ collection_contains)} → cast(({_ | __elem ▷ xs ▷ (λ __set_key → __set_key) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ xs))\nin __anf ▷ (λ __set_g → Drain(__set_g))) ▷ box)"
     )]
     #[case(
         "map(kvs)",
-        "λ __iter_record : {_#0 | __elem ▷ ((λ __iter_record → __iter_record ▷ kvs ▷ (λ __map_kv → __map_kv.0)) ▷ collection_contains)} → let __anf = __iter_record ▷ (λ __gb_k : {_#0 | __elem ▷ ((λ __iter_record → __iter_record ▷ kvs ▷ (λ __map_kv → __map_kv.0)) ▷ collection_contains)} → cast(({_ | __elem ▷ kvs ▷ (λ __map_kv → __map_kv.0) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ kvs))\nin __anf ▷ (λ __map_g → let __anf = Sole(__map_g)\nin __anf.1)"
+        "Map::rep((λ __iter_record : {_#0 | __elem ▷ ((λ __iter_record → __iter_record ▷ kvs ▷ (λ __map_kv → __map_kv.0)) ▷ collection_contains)} → let __anf = __iter_record ▷ (λ __gb_k : {_#0 | __elem ▷ ((λ __iter_record → __iter_record ▷ kvs ▷ (λ __map_kv → __map_kv.0)) ▷ collection_contains)} → cast(({_ | __elem ▷ kvs ▷ (λ __map_kv → __map_kv.0) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ kvs))\nin __anf ▷ (λ __map_g → let __anf = Sole(__map_g)\nin __anf.1)) ▷ box)"
     )]
     fn the_expansion(#[case] code: &str, #[case] expected: &str) {
         assert_eq!(encoded(code), expected);

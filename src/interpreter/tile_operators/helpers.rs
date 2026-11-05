@@ -309,7 +309,7 @@ pub(crate) fn apply_function_tile(
 /// Distinct from [`scalar_tile_to_column_value`], which refuses a collection held as a tile:
 /// boxing one is a defect wherever the tile was the point, so the two are separate functions
 /// rather than one that always obliges.
-pub(crate) fn materialize_collections(tile: Tile) -> ColumnValue {
+pub fn materialize_collections(tile: Tile) -> ColumnValue {
     match tile {
         Tile::Scalar(cv) => cv,
         Tile::Record { fields: m, absent } => ColumnValue::Records({

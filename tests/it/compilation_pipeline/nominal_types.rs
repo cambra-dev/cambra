@@ -407,18 +407,18 @@ fn a_join_of_an_invariant_type_reaches_no_compiler_panic(#[case] src: &str) {
     }
 }
 
-/// An argument at an equality position, here a map's keys, is one type on both sides of a
+/// An argument at an equality position, here a full map's keys, is one type on both sides of a
 /// relation, so a join whose arguments differ is refused, as two collections over different
 /// domains are.
 #[test]
 fn a_join_at_different_arguments_of_an_equality_position_is_refused() {
     check_compile_error(
         indoc! {r#"
-            type Index(K):
-                index(FullMap(K, Int))
+            type Index(K, V: K => Type):
+                index(FullMap(K, V))
 
             c = 1 > 0
-            x = Index::index(map([(1, 10)])) if c else Index::index(map([(2, 20)]))
+            x = Index::index(groupby([1], \v -> v)) if c else Index::index(groupby([2], \v -> v))
             7
         "#},
         "have no common type",
@@ -665,14 +665,6 @@ fn declaration_errors_name_what_is_wrong() {
         ),
         (
             indoc! {r#"
-                type Map = Int
-
-                1
-            "#},
-            "`Map` is a built-in type",
-        ),
-        (
-            indoc! {r#"
                 def f(x):
                     type Inner = Int
                     x
@@ -710,6 +702,13 @@ fn declaration_errors_name_what_is_wrong() {
     ] {
         check_compile_error(src, needle);
     }
+}
+
+/// A module's own `type` shadows a type the prelude reaches, as `std`'s `Map` (`docs/chl-spec.md`,
+/// "9.16 The std root").
+#[test]
+fn a_type_shadows_the_preludes() {
+    check_scalar("type Map = Int\nMap::new(3).extract()", Value::Int(3));
 }
 
 /// A name declared twice is reported at the second declaration, with the first labelled.
@@ -1277,7 +1276,7 @@ fn extract_answers_the_single_constructors_argument() {
 
         g = Box1::new(groupby([1, 2, 3], \x -> x > 1))
         h = g.extract()
-        sum([sum(grp) for grp in h])
+        sum([sum(grp) for _ -> grp in h])
     "#},
     6
 )]
@@ -1285,7 +1284,7 @@ fn extract_answers_the_single_constructors_argument() {
     indoc! {r#"
         type Box1(K, V: K => Type) = (k: K) |=> V(k)
 
-        g = Box1::new(groupby([1, 2, 3], \x -> x > 1))
+        g = Box1::new([g for _ -> g in groupby([1, 2, 3], \x -> x > 1)])
         h = g.extract()
         sum([sum(grp) for grp in h])
     "#},
@@ -1318,7 +1317,7 @@ fn an_annotated_functions_collection_of_groups_is_a_source() {
                     case Box1::new(g):
                         g
             b = Box1::new(groupby([1, 2, 3], \x -> x > 1))
-            sum([sum(grp) for grp in ex(b)])
+            sum([sum(grp) for _ -> grp in ex(b)])
         "#},
         Value::Int(6),
     );
