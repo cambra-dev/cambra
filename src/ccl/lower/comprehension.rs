@@ -144,7 +144,8 @@ fn lower_clauses(
                     "comprehension `if` clause must follow a `for` clause",
                 ));
             }
-            let guard = lower_expr(guard, ctx)?;
+            // The comprehension phase copies the guard into the filtered domain's predicate.
+            let guard = ctx.with_copied_term(|ctx| lower_expr(guard, ctx))?;
             out.last_mut()
                 .expect("checked non-empty above")
                 .guards

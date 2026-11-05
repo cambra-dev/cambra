@@ -95,9 +95,15 @@ pub(super) fn lower_call(
                 ));
             }
             let collection = lower_expr(&args[0], ctx)?;
-            let key_fn = lower_expr(&args[1], ctx)?;
-            let (keyed, _key_domain) = lower_groupby(collection, key_fn, func.span, ctx);
-            Ok(keyed)
+            // The expansion copies the key function into the key domain and the groups'
+            // refinement.
+            let key_fn = ctx.with_copied_term(|ctx| lower_expr(&args[1], ctx))?;
+            Ok(bind_grouped(
+                collection,
+                func.span,
+                ctx,
+                |collection, ctx| lower_groupby(collection, key_fn, func.span, ctx).0,
+            ))
         }
         // set(xs) is a re-keying constructor ([`lower_rekeyed`];
         // `src/ccl/design/collections.md`, "Constructor lowering: runtime `groupby` now,
@@ -605,8 +611,45 @@ impl MintedTerm {
     }
 }
 
+/// `let __anf = collection in build(__anf)`, or `build(collection)` where the collection is a
+/// variable or the group-by stands in a term copied into a type
+/// ([`LoweringContext::in_copied_term`]): a group-by's collection bound once, so the copies
+/// of it its expansion places in the key domain, in the groups' refinement and in the groups are
+/// one variable. The binder is an A-normalization temp, which that pass floats ahead of the
+/// statement as it floats its own, so the binding scopes over every use of the group-by's value.
+/// Every pass keeps a variable as it stands, so the copies stay one term, and the site's domain is
+/// its own (`src/ccl/design/collections.md`, "A group-by's collection is bound once").
+fn bind_grouped(
+    collection: Expr,
+    span: Span,
+    ctx: &mut LoweringContext,
+    build: impl FnOnce(Expr, &mut LoweringContext) -> Expr,
+) -> Expr {
+    // A variable is one term wherever it is copied already. Any other term is copied before the
+    // passes that rewrite it, a comprehension before its encoding mints binders, so each copy
+    // would be rewritten apart. Inside a term a later pass copies into a type, the binding would
+    // stand inside a refinement predicate, where A-normalization never floats it: the group-by
+    // is written out there, as it is in every copy of that term.
+    if matches!(collection.node, TypedExprNode::Var(_))
+        || ctx.in_copied_term > 0
+        || ctx.in_refinement_predicate
+    {
+        return build(collection, ctx);
+    }
+    let sc = "lower.groupby_collection";
+    let name = Name::anf_temp();
+    let read = ctx.tag_machinery(Expr::var(name.clone()), span, sc);
+    let body = build(read, ctx);
+    ctx.tag_machinery(
+        Expr::let_bind(name, Occurrence::mint(), collection, body),
+        span,
+        sc,
+    )
+}
+
 /// Lower group-by and return its present-key domain for re-keying callers.
 /// Reuse the returned domain: it shares both the key-type hole and the predicate allocation.
+/// `collection` is the variable [`bind_grouped`] binds the group-by's collection to.
 /// See `src/ccl/design/collections.md`, "`groupby`'s exact type".
 fn lower_groupby(
     collection: Expr,
@@ -678,6 +721,21 @@ fn lower_groupby(
 /// See `src/ccl/design/collections.md`,
 /// "Constructor lowering: runtime `groupby` now, constant-folding later".
 fn lower_rekeyed(
+    elements: Expr,
+    key_fn: Expr,
+    group_binder: &'static str,
+    collapse: impl FnOnce(Expr, Span, &mut LoweringContext) -> Expr,
+    span: Span,
+    sc: &'static str,
+    ctx: &mut LoweringContext,
+) -> Expr {
+    bind_grouped(elements, span, ctx, |elements, ctx| {
+        rekeyed(elements, key_fn, group_binder, collapse, span, sc, ctx)
+    })
+}
+
+/// [`lower_rekeyed`] over `elements`, the variable [`bind_grouped`] binds the collection to.
+fn rekeyed(
     elements: Expr,
     key_fn: Expr,
     group_binder: &'static str,
@@ -1281,7 +1339,7 @@ mod tests {
     // List literal collection with a more complex key
     #[case(
         "groupby([1, 2, 3], \\x -> x // 2)",
-        "λ __gb_k : {_#0 | __elem ▷ (([1, 2, 3] ≫ (λ x → x // 2)) ▷ collection_contains)} → cast(({_ | __elem ▷ [1, 2, 3] ▷ (λ x → x // 2) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ [1, 2, 3])"
+        "let __anf = [1, 2, 3]\nin λ __gb_k : {_#0 | __elem ▷ ((__anf ≫ (λ x → x // 2)) ▷ collection_contains)} → cast(({_ | __elem ▷ __anf ▷ (λ x → x // 2) == __gb_k} ⤇ _), λ __gb_i → __gb_i ▷ __anf)"
     )]
     // Key is a variable reference (pre-defined function)
     #[case(

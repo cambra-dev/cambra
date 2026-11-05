@@ -865,6 +865,63 @@ fn a_comprehension_over_a_box_is_keyed_like_it(#[case] code: &str, #[case] expec
     check_scalar(code, expected);
 }
 
+/// A re-keying constructor over a **comprehension over a box**, which reads the box's witness.
+/// `groupby`, `map` and `set` place their collection in their type as well as in their value,
+/// and every copy reads the one binding lowering gives the comprehension
+/// (`src/ccl/design/collections.md`, "A group-by's collection is bound once"). A function whose
+/// body binds the comprehension and returns the constructor closes its type over that binding.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::grouped(indoc! {r"
+    b = box([1, 2, 3])
+    sum([sum(g) for g in groupby([x for x in b], \x -> x > 1)])
+"}, Value::Int(6))]
+#[case::mapped(indoc! {r"
+    b = box([1, 2, 3])
+    sum(map([(x, x * 10) for x in b]))
+"}, Value::Int(60))]
+#[case::returned_from_a_function(indoc! {r"
+    def f(b):
+        c = [(x, 1) for x in b]
+        map(c)
+    sum(f(box([1, 2])))
+"}, Value::Int(2))]
+fn a_re_keying_constructor_takes_a_comprehension_over_a_box(
+    #[case] code: &str,
+    #[case] expected: Value,
+) {
+    check_scalar(code, expected);
+}
+
+/// A group-by nested in a group-by over a comprehension over a box: each level binds its own
+/// collection, and the inner one's groups read the outer group.
+#[test]
+fn a_group_by_nested_in_a_group_by_over_a_box_comprehension() {
+    check_sink(
+        indoc! {r"
+            out = test_sink()
+            b = box([1, 2, 3, 4, 5, 6])
+            out << [sum([sum(h) for h in groupby(g, \y -> y > 4)]) for g in groupby([x for x in b], \x -> x > 2)]
+        "},
+        "[() -> [false -> 3, true -> 18]]",
+    );
+}
+
+/// [`a_re_keying_constructor_takes_a_comprehension_over_a_box`] for `set`, which keeps each
+/// element once.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_set_takes_a_comprehension_over_a_box() {
+    check_sink(
+        indoc! {"
+            out = test_sink()
+            b = box([1, 2, 2])
+            out << set([x for x in b])
+        "},
+        "[() -> [1 -> (), 2 -> ()]]",
+    );
+}
+
 /// The two spellings `box` refuses (`docs/chl-spec.md`, "7.4 `box`"): comprehensions over two
 /// different boxes are keyed differently and do not join, and a filtered box has gaps, so it is
 /// no `List`.

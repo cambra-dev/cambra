@@ -235,6 +235,7 @@ fn check_set_keys(code: &str, sorted_keys: ColumnValue, n: usize) {
             v.sort_unstable();
             ColumnValue::Strings(v)
         }
+        units @ ColumnValue::Units(_) => units,
         other => panic!("unexpected key column: {other:?}"),
     };
     // Sorted but **not** deduplicated: deduplication is what is under test, so
@@ -257,6 +258,20 @@ fn check_set_keys(code: &str, sorted_keys: ColumnValue, n: usize) {
 // ([`a_groupby_over_a_singleton_element_literal`] carries the group-by it is built on).
 #[case("set([1])", ColumnValue::Ints(vec![1]), 1)]
 #[case("set([1, 1])", ColumnValue::Ints(vec![1]), 1)]
+#[case::over_a_named_collection(indoc! {r#"
+    t = [1, 2, 2, 3]
+    set(t)
+"#}, ColumnValue::Ints(vec![1, 2, 3]), 3)]
+// Iterating a set reads its values, which are all `()`, so a set of a set has the one key `()`.
+#[case::nested("set(set([1, 2, 2, 3]))", ColumnValue::Units(1), 1)]
+#[case::nested_through_a_name(indoc! {r#"
+    s = set([1, 2, 2, 3])
+    set(s)
+"#}, ColumnValue::Units(1), 1)]
+#[case::nested_over_a_named_collection(indoc! {r#"
+    t = [1, 2, 2, 3]
+    set(set(t))
+"#}, ColumnValue::Units(1), 1)]
 fn test_set(#[case] code: &str, #[case] sorted_keys: ColumnValue, #[case] n: usize) {
     check_set_keys(code, sorted_keys, n);
 }
@@ -318,11 +333,61 @@ fn bug_duplicate_constant_map_key_panics_instead_of_compile_error() {
 
 // A `set(…)` value **nested as another comprehension's source**, read only for its keys:
 // the element ignores the value, so the source survives only in its domain's membership
-// refinement, and planning enumerates the members (three distinct keys).
+// refinement, and planning enumerates the members. Over a named collection, the source planning
+// builds is headed by the name rather than an `iterate`, and the cleanup after planning keeps it
+// all the same.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
-fn a_set_nested_as_a_comprehension_source_is_driven() {
-    check_scalar("sum([1 for k in set([1,2,2,3])])", Value::Int(3));
+#[case::literal("sum([1 for k in set([1,2,2,3])])", 3)]
+#[case::over_a_named_collection(indoc! {r#"
+    t = [1, 2, 2, 3]
+    sum([1 for k in set(t)])
+"#}, 3)]
+#[case::nested_over_a_named_collection(indoc! {r#"
+    t = [1, 2, 2, 3]
+    sum([1 for k in set(set(t))])
+"#}, 1)]
+#[case::nested_through_a_name(indoc! {r#"
+    s = set([1, 2, 2, 3])
+    sum([1 for k in set(s)])
+"#}, 1)]
+fn a_set_nested_as_a_comprehension_source_is_driven(#[case] code: &str, #[case] count: i64) {
+    check_scalar(code, Value::Int(count));
+}
+
+// Pinned: a set of a set fed to a sink does not compile. The outer set's key domain reads the
+// inner set through a binder, the name `t` or the temporary a literal is bound to, and the
+// discharge of that binder as the fed value leaves its scope does not reach the unresolved
+// variables in the domain's lambda bodies (`Subst::under_binder` sees no binder behind a
+// variable). They later resolve to types naming the binder, so the feed's type names it outside
+// its scope. A literal's error then panics while its types are respelled. Expected:
+// `[() -> [() -> ()]]` for both.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[should_panic(expected = "Barendregt violation")]
+fn a_set_of_a_literal_s_set_fed_to_a_sink_does_not_compile_yet() {
+    check_sink(
+        indoc! {r#"
+            out = test_sink()
+            out << set(set([1, 2, 2, 3]))
+        "#},
+        "[() -> [() -> ()]]",
+    );
+}
+
+/// [`a_set_of_a_literal_s_set_fed_to_a_sink_does_not_compile_yet`] over a named collection.
+#[rstest]
+#[timeout(Duration::from_secs(30))]
+#[should_panic(expected = "Scope violation")]
+fn a_set_of_a_named_set_fed_to_a_sink_does_not_compile_yet() {
+    check_sink(
+        indoc! {r#"
+            out = test_sink()
+            t = [1, 2, 2, 3]
+            out << set(set(t))
+        "#},
+        "[() -> [() -> ()]]",
+    );
 }
 
 // A bare `groupby(…)` **is** driven: the program tail is a chain head, which is where

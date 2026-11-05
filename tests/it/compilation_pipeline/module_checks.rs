@@ -565,6 +565,20 @@ fn a_checked_module_prints_its_nominal_types() {
     );
 }
 
+/// A member bound by a re-keying constructor prints its collection as written: the
+/// A-normalization temp its collection is bound to is machinery no program mentions.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+fn a_checked_module_prints_a_re_keyed_collection_as_written() {
+    let program = program("pub m = map([((1, 2), 10), ((3, 4), 20)])\n", &[]);
+    let interface = check_program(&mut GlobalContext::default(), &program)
+        .unwrap_or_else(|errors| panic!("{errors:?}"));
+    assert!(
+        interface.contains("pub m: {{Int, Int} where _ in [(1, 2), (3, 4)]} |=> Int"),
+        "{interface}"
+    );
+}
+
 /// A family parameter prints with its kind, over one value and over two.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
@@ -906,6 +920,37 @@ fn checking_a_file_reports_its_type_errors_past_another_error(
     assert!(
         messages[1].contains("The values that meet here have no common type"),
         "{messages:?}"
+    );
+}
+
+/// Checking a file on its own reports an error in a re-keying constructor's entries at a span:
+/// every node the group-by's expansion copies traces to the call.
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::mixed_values("m = map([(1, 2), (2, \"a\")])", "have no common type")]
+fn checking_a_file_reports_a_re_keying_constructor_s_error(
+    #[case] source: &str,
+    #[case] reported: &str,
+) {
+    let program = program(&format!("{source}\n"), &[]);
+    let Err(errors) = check_program(&mut GlobalContext::default(), &program) else {
+        panic!("expected `{source}` not to check");
+    };
+    let messages: Vec<String> = errors.errors.iter().map(|e| e.message()).collect();
+    assert!(
+        messages.iter().any(|m| m.contains(reported)),
+        "{messages:?}"
+    );
+    let root = program.sources().root();
+    let elsewhere: Vec<(String, Option<chl_parser::ast::Span>)> = errors
+        .errors
+        .iter()
+        .filter(|e| e.span().is_none_or(|span| span.file != root))
+        .map(|e| (e.message(), e.span()))
+        .collect();
+    assert!(
+        elsewhere.is_empty(),
+        "errors outside the checked file: {elsewhere:?}"
     );
 }
 

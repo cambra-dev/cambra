@@ -305,31 +305,33 @@ fn an_unannotated_empty_map_is_rejected(#[case] code: &str) {
     check_compile_error(code, "Nothing determines the type of this expression");
 }
 
-// The re-keying constructors do not accept an empty literal: their key domain is
-// the key morphism's image (`src/ccl/design/collections.md`, "The key domain is the
-// key morphism's image"), and with no elements there is no image, so nothing
-// determines the key type. `pin_empty_list_element` does not answer for it — the
-// literal the constructor re-keys is copied into the key domain's predicate, and a
-// pin there would decide for the copy alone.
-//
-// So a *re-keying* constructor has no empty form. `empty_map()` is the spelling that
-// works, because it states its type rather than deriving one from entries it does not
-// have (CHL spec, "3.11 List, tuple, record literals"). The rejection here is an
-// inference error rather than a diagnosis of the construct: `map` reads the positions of
-// each entry, so the literal's width is what nothing fixes.
+// `map` does not accept an empty literal. The literal is bound once, so the empty-literal
+// pin decides its one binding (`src/ccl/design/collections.md`, "A group-by's collection is
+// bound once"), but the pin gives the element no width, and `map` reads each entry's
+// positions. The rejection is an inference error rather than a diagnosis of the construct.
+// `empty_map()` is the spelling that works, because it states its type rather than deriving
+// one from entries it does not have (CHL spec, "3.11 List, tuple, record literals").
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::map("map([])", "is never fixed:")]
-#[case::set("set([])", "Nothing determines the type of this expression")]
-#[case::map_under_an_annotation(
-    indoc! {r#"
-        m: Map(String, Int) = box(map([]))
-        m
-    "#},
-    "is never fixed:"
-)]
-fn a_re_keying_constructor_rejects_an_empty_literal(#[case] code: &str, #[case] reported: &str) {
-    check_compile_error(code, reported);
+#[case::map("map([])")]
+#[case::map_under_an_annotation(indoc! {r#"
+    m: Map(String, Int) = box(map([]))
+    m
+"#})]
+fn a_re_keying_constructor_rejects_an_empty_literal(#[case] code: &str) {
+    check_compile_error(code, "No field .1");
+}
+
+/// `set([])` is the empty set: the empty-literal pin decides the one binding of its literal.
+#[test]
+fn a_set_of_an_empty_literal_is_empty() {
+    check_sink(
+        indoc! {"
+            out = test_sink()
+            out << set([])
+        "},
+        "[() -> []]",
+    );
 }
 
 // A collection literal's elements are compile-time values, so an element written as a

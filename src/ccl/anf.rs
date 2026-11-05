@@ -1339,6 +1339,11 @@ fn atomize_stmt_effect(expr: Expr, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, E
 /// above accumulates them in.
 fn let_chain(binds: Vec<(TypedBinding, Expr)>, tail: Expr) -> Expr {
     binds.into_iter().rev().fold(tail, |body, (binding, def)| {
+        // A binding is minted where its binder was: this pass's own temps where it hoisted them,
+        // and the one lowering gives a group-by's collection at the group-by
+        // (`crate::ccl::lower::exprs`'s `bind_grouped`), so an error at that binding points at
+        // the call the program wrote.
+        let _g = provenance::enter(binding.occurrence.id(), "anf.hoist", Nature::Machinery);
         Expr::let_in(binding, def, body)
     })
 }

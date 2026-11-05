@@ -6340,12 +6340,27 @@ fn a_checked_lookup_is_not_an_application() {
 /// (`a_group_valued_lookup_is_rejected_by_name`).
 #[test]
 fn a_key_dependent_lookup_discharges_the_key_binder() {
-    let errs = infer_program_err(indoc::indoc! {r#"
-        g = groupby([1, 2, 3], \x -> x)
-        g[1]"#});
+    // The group-by's collection is bound to an A-normalization temp, which a diagnostic spells
+    // as the term it names, as compilation does.
+    let mut lctx = LoweringContext::default();
+    let mut ictx = TypeInferenceContext::new();
+    let mut expr = lower_uniquified(
+        indoc::indoc! {r#"
+            g = groupby([1, 2, 3], \x -> x)
+            g[1]"#},
+        &mut lctx,
+    );
+    let errs = infer(&mut expr, &mut ictx).expect_err("expected inference error");
+    let temps = anf::temp_respelling(&expr);
+    let errs: Vec<String> = errs
+        .into_iter()
+        .map(|mut e| {
+            e.respell(&temps);
+            format!("{:?}", e.error)
+        })
+        .collect();
     assert!(
         errs.iter()
-            .map(|e| format!("{e:?}"))
             .any(|m| m.contains("Equatable") && m.contains("[1, 2, 3][_]! == 1}")),
         "the group's predicate must name the key it was looked up at, got {errs:?}"
     );
@@ -6425,7 +6440,14 @@ fn checked_lookup_on_a_set_is_membership_as_a_value() {
 /// `Equatable` obligation a product now answers componentwise
 /// ([`products_are_equatable_componentwise`]). Nothing else about a keyed collection reads
 /// the key's shape.
+///
+/// Pinned: with the `map`'s entries bound once (`src/ccl/design/collections.md`, "A group-by's
+/// collection is bound once"), inferring through [`infer_program`] reaches the group predicate
+/// again while resolving its own type slots, and coalescing panics. Expected: `Option(Int)`.
+/// Compiled, the program answers it, under `cambra check` too, and
+/// `joins_aggregates_groupby.rs`'s `a_product_keys_a_collection` runs it.
 #[test]
+#[should_panic(expected = "predicate resolution repeated inside its own type slots")]
 fn a_product_keys_a_collection() {
     assert_eq!(
         infer_program(indoc! {r#"

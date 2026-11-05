@@ -365,8 +365,10 @@ rewrites `uncurry` of the result into a morphism of the pair `(𝑎, 𝑏)` (`tr
   element.
 
 The last law drops `𝑠`, so the pairs are enumerated from the domain the type states. It does not
-fire where a component's keys are a witness projection (`keys_only_in_the_data`), which no extent
-enumerates: planning enumerates those pairs through the unrewritten term.
+fire where a component's keys only a collection holds (`keys_only_in_the_data`): a witness
+projection, which no extent enumerates, or a membership in a collection, whose keys a source
+planning built enumerates and no type does once planning is done. Planning enumerates those pairs
+through the unrewritten term.
 
 At `𝑛 > 2` levels each law pairs the first two keys as above and leaves `uncurry(𝑛 − 1)` of the
 rest over that pair beside the remaining keys:

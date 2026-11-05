@@ -107,12 +107,14 @@ refinement predicate type slots.
 
 ### The empty collection has no key morphism [Interim]
 
-`map([])` and `set([])` fail inference with an unresolved-variable error. Their key type is
-derived from [the key morphism's image](#the-key-domain-is-the-key-morphisms-image), and the empty
-source supplies no key value. The re-keying stores a copy of that source in a refinement
-predicate; the term-only pinning pass does not choose the copied literal's element type.
-`a_re_keying_constructor_rejects_an_empty_literal` also covers `box(map([]))` under an explicit
-`Map(String, Int)` annotation.
+`map([])` fails inference. Its key type is derived from
+[the key morphism's image](#the-key-domain-is-the-key-morphisms-image), and the empty source
+supplies no key value. The source is bound once
+([A group-by's collection is bound once](#a-group-bys-collection-is-bound-once)), so the
+empty-literal pin decides its element, but the pin decides no position of the element, and `map`
+reads each entry's positions. `a_re_keying_constructor_rejects_an_empty_literal` also covers
+`box(map([]))` under an explicit `Map(String, Int)` annotation. `set([])` reads no position, so it
+is the empty set (`a_set_of_an_empty_literal_is_empty`).
 
 `empty_map()` constructs a keyed sum without deriving a type from entries:
 `Σ (σ : SubtypesOf(𝐾)). σ ⤇ 𝑉`. A `Map(𝐾, 𝑉)` annotation fixes its parameters. A `Set(𝐾)`
@@ -205,13 +207,43 @@ A checked lookup substitutes its key into the dependent group type during infere
 The streamed collection-valued answer is rejected later at operator conversion; see
 [The checked lookup](#the-checked-lookup-𝑐𝑘).
 
+### A group-by's collection is bound once
+
+Lowering binds a group-by's collection to an A-normalization temp and expands the group-by over
+that variable: `let __anf = 𝑐 in λ __gb_k : 𝐷 → cast(…, λ __gb_i → __gb_i ▷ __anf)`
+(`lower/exprs.rs`, `bind_grouped`). The expansion places the collection in the key domain, in the
+groups' refinement and in the groups. Each copy is the variable, which every pass keeps as it
+stands, so the copies stay one term. A-normalization floats the binding ahead of the statement,
+as it floats its own temps, so the binding scopes over every use of the group-by's value.
+
+A group-by's domain belongs to its site. Two group-bys over equal collections with equal keys
+have key domains whose predicates hold two different binders, so their domains differ, and the
+two combine as any two collections over different domains do: through `box`
+(`a_family_applied_at_two_sites_over_two_domains_is_refused`).
+Whether two sites agreed would otherwise depend on how the collections are spelled
+(`[1, 2] ++ [3]` against `[1, 2, 3]`) and on which subterms A-normalization names.
+
+Two group-bys are written out with their collection in place instead:
+
+- **A collection that is a variable** is one term in every copy already, so it is not bound
+  again. Two group-bys over one variable state one domain when their keys are one term too:
+  `groupby(xs, \x -> x > 1)` and `groupby(xs, \x -> 1 < x)` have two domains, since keys are
+  compared by structure. Binding the key function to a name as well makes the two keys one term.
+- **A group-by inside a term copied into a type**, a group-by's key function, a comprehension's
+  guard or a refinement predicate, keeps its collection inline. A binding there would stand
+  inside a refinement predicate, which A-normalization never reaches, and every copy of the
+  enclosing term holds the group-by written out alike.
+
 ### The key domain is the key morphism's image
 
 `present_key_domain` in `lower/exprs.rs` constructs
-`{K | __elem ▷ ((c ≫ key) ▷ collection_contains)}`. `comprehension::run` rewrites `c ≫ key` as it
-rewrites a loop, to `λ __iter_record → __iter_record ▷ c ▷ key`, the key at each of `c`'s
-positions. The predicate retains the producer morphism rather than an opaque key-set identifier. Its structural identity therefore depends
-on the named term and its free references, not merely on the keys that term happens to produce.
+`{K | __elem ▷ ((c ≫ key) ▷ collection_contains)}`, where `c` is the temp the group-by's
+collection is bound to, or the collection where it stays in place.
+`comprehension::run` rewrites `c ≫ key` as it rewrites a loop, to
+`λ __iter_record → __iter_record ▷ c ▷ key`, the key at each of `c`'s positions. The predicate
+retains the producer morphism rather than an opaque key-set identifier. Its structural identity
+therefore depends on the named term and its free references, not merely on the keys that term
+happens to produce.
 
 The helper shares one `SharedHole` between the refinement base and the morphism's codomain.
 Using only the builtin scheme would leave a one-way bound instead of establishing that identity.
@@ -279,8 +311,8 @@ The implemented re-keying constructors return concrete data functions:
 | `set(xs)` | Identity on an element | `Drain` | Present-key domain to `unit`. |
 | `map(entries)` | First projection of a pair | `Sole`, then second projection | Present-key domain to the entry value. |
 
-`lower_rekeyed` builds both. It retains the domain returned by `lower_groupby` and
-eta-expands the application as `λ __iter_record → __iter_record ▷ keyed ▷ collapse`.
+`lower_rekeyed` builds both, over the collection's one binding. It retains the domain returned by
+`lower_groupby` and eta-expands the application as `λ __iter_record → __iter_record ▷ keyed ▷ collapse`.
 A bare composition would expose the dependent key binder in the collapse parameter's type.
 The iteration lambda carries both the present-key domain and a data-function annotation;
 the refinement and function-kind stamps serve different constraints.
