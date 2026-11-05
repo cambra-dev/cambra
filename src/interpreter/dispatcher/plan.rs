@@ -333,6 +333,11 @@ fn run_targets(
         &mut reach,
         &mut end_of,
     );
+    for (pipeline, &opens) in members.opens_before.iter().enumerate() {
+        if opens {
+            dispatcher.opens_before(PipelineId(pipeline));
+        }
+    }
     // Per pipeline, the live pipelines whose close it is final only after: itself where it reads
     // a live source, and those of each pipeline it reads, which is numbered before it. A pipeline
     // that reads its input whole reads it once the sources beneath it have closed
@@ -668,7 +673,7 @@ fn reads_a_scope(located: &[&Located], reads: &[Vec<usize>], pipeline: usize) ->
 /// Unplace every entry `placements` holds and every sink consumer of `targets`: a refused run
 /// runs nothing, so it leaves nothing placed. A later run in pull mode pushes nothing, but a
 /// placed entry claims a pipeline that no dispatcher holds.
-fn unplace(placements: &[Option<Placement>], targets: &[RunTarget]) {
+fn unplace(placements: &[Vec<Placement>], targets: &[RunTarget]) {
     for placement in placements.iter().flatten() {
         placement.set(None);
     }
@@ -1088,10 +1093,14 @@ pub(super) struct Members<'p> {
     /// Per pipeline, the first pipeline of its breaker, whose record of the breaker's pushes it
     /// shares ([`plan_edges`]): itself, but for a store's later pipelines.
     pub(super) pushes_with: Vec<usize>,
-    /// The placements of the entries of the breakers in chains.
-    pub(super) placements: Vec<Option<Placement>>,
+    /// The placements of the entries of the breakers in chains: per pipeline, each entry it
+    /// queues through.
+    pub(super) placements: Vec<Vec<Placement>>,
     /// The ranges over a live source in each pipeline's chain.
     live: Vec<Vec<LiveLeaf>>,
+    /// Per pipeline, whether it is a store's seed input, which the store's other pipelines wait
+    /// for the consume of (`Dispatcher::opens_before`).
+    pub(super) opens_before: Vec<bool>,
 }
 
 /// The pipelines [`run_program`] reads off a program's producer chains, every dispatcher's: the
@@ -1113,7 +1122,10 @@ pub(super) struct Planner {
     /// Per pipeline, its id in its dispatcher.
     local: Vec<usize>,
     /// Per pipeline, the placement of its breaker's entry, where the breaker is in a chain.
-    placements: Vec<Option<Placement>>,
+    placements: Vec<Vec<Placement>>,
+    /// The pipelines of stores' seed inputs, which the store's other pipelines read and wait for
+    /// the consume of (`Dispatcher::opens_before`).
+    opens_before: Vec<usize>,
     /// The edges `(read, reader)` whose reader's breaker reads the breaker of `read` directly.
     direct: Vec<(usize, usize)>,
     pub(super) scopes: Vec<PlannedScope>,
@@ -1273,7 +1285,7 @@ impl Planner {
             placement.unwrap_or_else(|| panic!("{name} is placed in a pipeline by its entry"));
         let pipeline = self.add(Located::Chain(id), name, within, below);
         placement.set(Some(PipelineId(self.local[pipeline])));
-        self.placements[pipeline] = Some(placement);
+        self.placements[pipeline] = vec![placement];
         Beneath {
             pipelines: vec![(pipeline, true)],
             ..Beneath::default()
@@ -1348,56 +1360,60 @@ impl Planner {
             return Vec::new();
         }
         let inputs = breaker.inputs();
-        // What each input holds beneath the store's cycle. The store's inputs are its inputs but
-        // the seeds, in the order it visits them. The store reads its seed by pull when it opens,
-        // at the first consume of any input, so every input's pipeline reads a seed's pipelines. A
-        // live source a seed reads stands with the first input's, which the run notifies of it.
-        let mut below: Vec<Beneath> = (0..inputs).map(|_| Beneath::default()).collect();
-        let mut seeds = Vec::new();
-        let mut input = 0;
-        store.visit_input_producers_mut(&mut |role, producer| {
-            let (at, under) = match role.starts_with("seed") {
-                true => {
-                    let under = self.pipelines_under(producer, role);
-                    seeds.extend(under.pipelines.iter().copied());
-                    (0, under)
-                }
-                false => {
-                    input += 1;
-                    (input - 1, self.beneath_cycle(producer, read.fan))
-                }
-            };
-            below[at].read_once(under.pipelines);
-            below[at].live.extend(under.live);
+        // What each input holds beneath the store's cycle. A store with seeds reads them as its
+        // input 0, and its writers' sources as the inputs after, in the order it visits them; one
+        // without reads its writers' sources from input 0.
+        let mut writers = Vec::new();
+        let mut seeds = Beneath::default();
+        let mut seeded = false;
+        store.visit_input_producers_mut(&mut |role, producer| match role.starts_with("seed") {
+            true => {
+                let under = self.pipelines_under(producer, role);
+                seeds.read_once(under.pipelines);
+                seeds.live.extend(under.live);
+                seeded = true;
+            }
+            false => writers.push(self.beneath_cycle(producer, read.fan)),
         });
         assert_eq!(
-            input, inputs,
-            "{name} visits each of its inputs, besides its seeds, as an input of its own"
+            writers.len() + usize::from(seeded),
+            inputs,
+            "{name} reads its seeds as one input and each writer's source as one"
         );
-        for below in below.iter_mut().skip(1) {
-            below.read_once(seeds.clone());
-        }
+        let below: Vec<Beneath> = match seeded {
+            true => std::iter::once(seeds).chain(writers).collect(),
+            false => writers,
+        };
         if self.refused.is_some() {
             return Vec::new();
         }
         let breaker = store
             .as_breaking_mut()
             .unwrap_or_else(|| panic!("{name} is a pipeline breaker"));
-        let placements: Vec<Placement> = (0..inputs)
+        let placements: Vec<Vec<Placement>> = (0..inputs)
             .map(|input| {
-                breaker
-                    .entry_placement(InputId(input))
-                    .unwrap_or_else(|| panic!("{name} is placed in a pipeline by its entry"))
+                let placements = breaker.entry_placements(InputId(input));
+                assert!(
+                    !placements.is_empty(),
+                    "{name} is placed in a pipeline by its entry"
+                );
+                placements
             })
             .collect();
         // A store reads each input whole once the pipelines beneath it have finished, so neither
         // ranges nor constants beneath it bring a key no push names. A live source beneath it is
-        // read as the run notifies the store's pipeline of what the source yields.
+        // read as the run notifies the store's pipeline of what the source yields. A writer's
+        // pipeline reads the seed input's, its sibling: the store opens before it steps, so a
+        // writer's package waits for the seed's (`Dispatcher::opens_before`).
+        let mut seed_pipeline = None;
         below
             .into_iter()
             .zip(placements)
             .enumerate()
-            .map(|(input, (below, placement))| {
+            .map(|(input, (mut below, placements))| {
+                if let Some(seed) = seed_pipeline {
+                    below.read_once(vec![(seed, false)]);
+                }
                 let pipeline = self.add(
                     Located::Store {
                         fan: read.fan,
@@ -1412,8 +1428,14 @@ impl Planner {
                         ..Beneath::default()
                     },
                 );
-                placement.set(Some(PipelineId(self.local[pipeline])));
-                self.placements[pipeline] = Some(placement);
+                for placement in &placements {
+                    placement.set(Some(PipelineId(self.local[pipeline])));
+                }
+                self.placements[pipeline] = placements;
+                if seeded && input == 0 {
+                    seed_pipeline = Some(pipeline);
+                    self.opens_before.push(pipeline);
+                }
                 pipeline
             })
             .collect()
@@ -1538,7 +1560,7 @@ impl Planner {
         self.located.push(located);
         self.names.push(name);
         self.within.push(within);
-        self.placements.push(None);
+        self.placements.push(Vec::new());
         self.reads
             .push(below.pipelines.iter().map(|(read, _)| *read).collect());
         self.leaves.push(below.leaves);
@@ -1694,6 +1716,10 @@ impl Planner {
             placements: ids
                 .iter()
                 .map(|pipeline| self.placements[*pipeline].clone())
+                .collect(),
+            opens_before: ids
+                .iter()
+                .map(|pipeline| self.opens_before.contains(pipeline))
                 .collect(),
             // A live source read inside a scope is read by the scope's pipeline, which stands
             // for the pipelines inside it.

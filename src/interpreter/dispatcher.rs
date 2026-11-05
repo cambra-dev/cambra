@@ -404,6 +404,9 @@ struct PipelineInfo {
     /// Whether it parks its arrivals until the pipelines it reads have decided them
     /// ([`park`](Dispatcher::park)).
     parks: bool,
+    /// Whether it is a store's seed input, which the store's other pipelines read and wait for
+    /// the consume of ([`opens_before`](Dispatcher::opens_before)).
+    opens: bool,
 }
 
 /// What the dispatcher keeps of one pipeline across epochs.
@@ -609,6 +612,7 @@ impl Dispatcher {
                 keeps_open: false,
                 pushed_rows: Vec::new(),
                 parks: false,
+                opens: false,
             })
             .collect();
         let states = (0..count)
@@ -813,6 +817,24 @@ impl Dispatcher {
         self.infos[p].parks = true;
     }
 
+    /// Mark `pipeline` as a store's seed input, which the store's other pipelines read: a store
+    /// opens before it steps, so once `pipeline` has consumed a package, the seeds are read and
+    /// the store is open, and each of its readers records it wholly decided at the finish of that
+    /// epoch, which releases what they parked ([`park`](Self::park)). Its readers follow it, so
+    /// none takes a package of an epoch before it has finished there.
+    ///
+    /// # Panics
+    ///
+    /// When `pipeline` is read by no pipeline.
+    pub fn opens_before(&mut self, pipeline: PipelineId) {
+        assert!(
+            !self.infos[pipeline.0].readers.is_empty(),
+            "a store's seed input {} is read by the store's other pipelines",
+            pipeline.0
+        );
+        self.infos[pipeline.0].opens = true;
+    }
+
     /// Whether every pipeline `reader` reads has decided `guard`, a region of its input.
     fn reads_decided(&self, reader: usize, guard: &TileGuard) -> bool {
         let decided = self.states[reader]
@@ -989,6 +1011,15 @@ impl Dispatcher {
         guard: Option<&TileGuard>,
     ) {
         let reads = &self.infos[reader].reads;
+        // A store's decided push reaches its own pipelines around its recurrence, which is no
+        // read: a pipeline of a store reads a sibling only for its seed input's consume
+        // ([`opens_before`](Self::opens_before)), which records it whole.
+        if guard.is_some()
+            && source != reader
+            && self.infos[source].pushes_with == self.infos[reader].pushes_with
+        {
+            return;
+        }
         self.ensure(source == reader || reads.contains(&source), || {
             format!(
                 "pipeline {source} pushes a decided region to pipeline {reader}, which reads it"
@@ -2188,6 +2219,11 @@ impl Dispatcher {
         #[cfg(test)]
         self.record(Event::Finish(PipelineId(p)));
         self.land_decided(&epoch, p, decided.as_ref(), pushes.to.as_ref());
+        if self.infos[p].opens && epoch.pipelines[p].acknowledged.load(Ordering::Acquire) > 0 {
+            for &reader in &self.infos[p].readers {
+                self.record_decided(&epoch, reader, p, None);
+            }
+        }
         self.land_in(&epoch, p, &morsels, pushes.to.as_ref());
         for &reader in &self.infos[p].readers {
             self.count_toward_close(&epoch, reader);

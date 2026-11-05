@@ -1534,6 +1534,13 @@ pub trait BreakingProducer: TileProducer + Breaker {
         );
         self.base().placement.clone()
     }
+
+    /// The placements of every entry at input `input`, which a planner sets to that input's
+    /// pipeline: an input read through several entries, as a transaction store reads one per
+    /// seed, has one per entry. The default answers [`entry_placement`](Self::entry_placement).
+    fn entry_placements(&self, input: InputId) -> Vec<crate::interpreter::dispatcher::Placement> {
+        self.entry_placement(input).into_iter().collect()
+    }
 }
 
 /// Live runtime counterpart of a [`TileOperator`].

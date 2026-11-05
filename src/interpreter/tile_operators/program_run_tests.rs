@@ -1336,13 +1336,14 @@ fn a_transaction_store_of_several_writers(#[case] source: &str, #[case] expected
     answers(source, expected, &["Commit", "SinkBreaker"]);
     let (_, planned) = dispatched(source, 1);
     let writers = source.matches("with begin()").count();
+    let stores = source.matches(", Txn) :=").count();
     assert_eq!(
         planned
             .iter()
             .filter(|plan| plan.name.starts_with("Commit"))
             .count(),
-        writers,
-        "the store is the breaker of one pipeline per writer: {planned:?}"
+        writers + stores,
+        "a store is the breaker of one pipeline per writer and one for its seeds: {planned:?}"
     );
 }
 
@@ -3018,7 +3019,7 @@ fn rendered_in_key_order(value: &Value) -> String {
         with begin():
             pool := pool - y
     out << await_final(pool)
-"}, Value::Int(10), &["held"])]
+"}, Value::Int(10), &["held", "follows"])]
 #[case::a_writer_over_a_list_seeded_from_a_sum_of_the_source(indoc! {"
     out = test_sink()
     pool: Mut(Int, Txn) := sum(source1())

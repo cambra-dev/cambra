@@ -26,7 +26,7 @@ pub(super) struct LoopScope {
     members: Vec<Member>,
     /// The placements of the inner pipelines' entries, which hold the inner pipelines only while
     /// the scope runs ([`Placed`]).
-    placements: Vec<Option<Placement>>,
+    placements: Vec<Vec<Placement>>,
     /// The inner pipelines a round queues its position for: the sources, and the nested loops,
     /// which take it once the pipelines they read have finished the round.
     starts: Vec<PipelineId>,
@@ -63,7 +63,7 @@ impl LoopScope {
                 placement.set(None);
             }
             for (at, &pipeline) in kept.iter().enumerate() {
-                if let Some(placement) = &pipelines.placements[pipeline] {
+                for placement in &pipelines.placements[pipeline] {
                     placement.set(Some(PipelineId(at)));
                 }
             }
@@ -552,13 +552,13 @@ impl LoopScope {
 /// whole or waits for its finish, and its push stops at the unplaced entry, as a push of the
 /// enclosing dispatcher must: the entry's pipeline is the inner dispatcher's.
 struct Placed<'p> {
-    placements: &'p [Option<Placement>],
+    placements: &'p [Vec<Placement>],
 }
 
 impl<'p> Placed<'p> {
-    fn new(placements: &'p [Option<Placement>]) -> Self {
-        for (pipeline, placement) in placements.iter().enumerate() {
-            if let Some(placement) = placement {
+    fn new(placements: &'p [Vec<Placement>]) -> Self {
+        for (pipeline, placements) in placements.iter().enumerate() {
+            for placement in placements {
                 debug_assert!(
                     placement.get().is_none(),
                     "a loop scope's inner entries are unplaced while the scope does not run"

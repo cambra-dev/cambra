@@ -1016,14 +1016,15 @@ releases its body a position at a time, and whole each row the body calls comple
 decision is stepped, at every level above its positions: the release through the decided path names
 the row's positions only, not its paths past the last of them. A consuming store wakes no reader
 outside its cycle: its readers there take the rows it closes from its pushes, and the planner
-refuses a store read inside the cycle of a store that steps itself (`Planner::beneath_cycle`). A
-seed sits behind an entry no planner places (`subscribe_pulled`), since the store reads it by pull
-at a step, so a push from beneath the seed stops there rather than climb to the store's readers. A
-drive with no rows above it states complete every position below its next one that its source calls
-complete along with every position before, so a position it reads past, one the source filtered out
-or holds nothing at, is stated as one it emitted (`complete_prefix_below`). An induction store with
-no rows above it releases its body through what the body states complete and holds no decision at,
-and a transaction drive releases its source through what it has read past, so either releases such a
+refuses a store read inside the cycle of a store that steps itself (`Planner::beneath_cycle`). An
+induction store's seed sits behind an entry no planner places (`subscribe_pulled`), since the store
+reads it by pull at a step, so a push from beneath the seed stops there rather than climb to the
+store's readers. A transaction store reads its seeds as its input 0 instead (below). A drive with no
+rows above it states complete every position below its next one that its source calls complete along
+with every position before, so a position it reads past, one the source filtered out or holds
+nothing at, is stated as one it emitted (`complete_prefix_below`). An induction store with no rows
+above it releases its body through what the body states complete and holds no decision at, and a
+transaction drive releases its source through what it has read past, so either releases such a
 position without waiting for a later one to be decided. The dispatcher's finish checks that a
 store's input released every morsel the pipeline consumed.
 
@@ -1033,15 +1034,21 @@ input reads the pipelines beneath the store's cycle under that input: a subtree 
 recurrence slot of the store (`reaches_recurrence`) is planned as any chain is, and inside the cycle
 a breaker is no pipeline. A store's pipelines are ordered, since a store decides its positions in
 order. A store that steps itself runs in the run's dispatcher, and the pipeline of an input that
-reads pipelines reads the input whole, or over a live source each delivery once those pipelines
-have finished its epoch (below). A store reads its seed by pull when it opens, at the first consume
-of any input, so every input's pipeline reads the seed's pipelines, and a push from one stops in
-front of the store (`subscribe_pulled`); an induction store runs in a loop's scope instead
-([A loop in rounds](#a-loop-in-rounds)). A reader of a store reads every pipeline of it, so its
-queue in an epoch closes once the last of them has finished the epoch. The pipelines of one store
-share one record of what the store has pushed (`Dispatcher::share_pushes`), so no tick is pushed
-twice, and `plan_edges` plans their edges into one reader as one: a stream edge whose pushes name no
-key twice, or a widened edge from each of them. The planner refuses:
+reads pipelines reads the input whole, or over a live source each delivery once those pipelines have
+finished its epoch (below). A transaction store with seed streams reads them as its input 0, ahead
+of its writers' sources, which are its inputs from 1: each seed is subscribed behind an entry placed
+in input 0's pipeline, a push of any seed queues that input whole, and the store's consume of it
+opens the store. A store opens before it steps, so each writer's pipeline reads input 0's, its
+sibling, and takes no package of an epoch before input 0's has finished it. Once input 0's pipeline
+has consumed its package, each writer's records it wholly decided, which releases what it parked
+(`Dispatcher::opens_before`, [Parking arrivals until a read is
+decided](#parking-arrivals-until-a-read-is-decided)). A store's decided push that reaches its own
+pipelines around its recurrence is no read and records nothing. An induction store runs in a loop's
+scope instead ([A loop in rounds](#a-loop-in-rounds)). A reader of a store reads every pipeline of
+it, so its queue in an epoch closes once the last of them has finished the epoch. The pipelines of
+one store share one record of what the store has pushed (`Dispatcher::share_pushes`), so no tick is
+pushed twice, and `plan_edges` plans their edges into one reader as one: a stream edge whose pushes
+name no key twice, or a widened edge from each of them. The planner refuses:
 
 - outside a loop's scope, a nested transaction store, one per enclosing row, whose frontier a flat
   morsel does not name;
@@ -1049,9 +1056,9 @@ key twice, or a widened edge from each of them. The planner refuses:
 - a transaction store of several writers whose sources' positions are neither `UInt` positions nor
   the tagged positions of a concatenation, which key order cannot compare.
 
-The planner asserts that a transaction store has a writer: its keys are the footprints of its
-`with begin():` blocks, each one of its writers
-([How many commit stores a program has](../ccl/design/mutability.md#how-many-commit-stores-a-program-has)).
+The planner asserts that a transaction store has a writer: its keys are the footprints of its `with
+begin():` blocks, each one of its writers ([How many commit stores a program
+has](../ccl/design/mutability.md#how-many-commit-stores-a-program-has)).
 
 #### Commits in key order
 
@@ -1143,8 +1150,8 @@ A drive releases an item from its source at the take rather than at the commit. 
 over a running program starts where the source's release says
 ([program-evolution.md](../ccl/design/program-evolution.md#where-a-producer-registering-now-starts)),
 so it would skip an item whose decision a store held uncommitted. A dispatched run runs no program
-that another takes over ([Running a compiled program](#running-a-compiled-program)), and a
-resuming drive under a store that states `writer_takes` panics at its first pull.
+that another takes over ([Running a compiled program](#running-a-compiled-program)), and a resuming
+drive under a store that states `writer_takes` panics at its first pull.
 
 ### The dispatcher
 
@@ -1264,7 +1271,7 @@ consumer with other inputs, a store's with its seeds and the drive's with the st
 reader that reaches one along two paths, as a filter reads its input for the values and the
 predicate, reads it once. A pipeline that reads directly a pipeline another breaker's pipeline reads
 is refused, since only a fan-out slot keeps one reader's release from removing what another still
-reads. The pipelines of one store's inputs count as one reader: the store pulls and releases a seed
+reads. The pipelines of one store's inputs count as one reader: the store reads and releases a seed
 once, when it opens. A store is the breaker of a pipeline per input, and a loop's scope of a
 pipeline of its own ([A store as a breaker](#a-store-as-a-breaker),
 [A loop in rounds](#a-loop-in-rounds)), which the walk plans where it reaches a reader slot of the
