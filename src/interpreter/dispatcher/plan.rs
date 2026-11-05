@@ -425,11 +425,52 @@ fn run_targets(
         Located::Scope { .. } => Some(scope_at(pipeline).borrow().pushing_end()),
         _ => None,
     };
+    // A loop's scope with no range of its own over a live source, which reads only pipelines that
+    // range over one, as a loop over a let-bound source reads the source's memo, takes those
+    // ranges as its own where each read's pushes reach its drive as the drive's positions: the
+    // scope is then notified of each delivery as rounds, as over the source itself, and parks each
+    // delivery until the pipelines it reads have decided it (`Dispatcher::park`).
+    let one = Projection::admitting(Predicate::point(Value::UInt(0)));
+    let inherited: Vec<Vec<LiveLeaf>> = (0..members.live.len())
+        .map(|pipeline| {
+            let Some(scope) = scopes[pipeline].as_ref() else {
+                return Vec::new();
+            };
+            if !members.live[pipeline].is_empty() || members.reads[pipeline].is_empty() {
+                return Vec::new();
+            }
+            let mut leaves = Vec::new();
+            for &read in &members.reads[pipeline] {
+                if members.live[read].is_empty() || !members.reads[read].is_empty() {
+                    return Vec::new();
+                }
+                let (pusher, _) = end_of(PipelineId(read))
+                    .unwrap_or_else(|| pushing_end(&mut reach, PipelineId(read)));
+                let scope = scope.borrow();
+                let routes = scope.routes(&pusher);
+                let arrived = scope.arrivals(&pusher, &one);
+                let positions = !routes.is_empty()
+                    && routes.iter().all(|route| route.keeps_keys)
+                    && !arrived.is_empty()
+                    && arrived
+                        .iter()
+                        .all(|arrival| Projection::of(&arrival.guard).as_ref() == Ok(&one));
+                if !positions {
+                    return Vec::new();
+                }
+                leaves.extend(members.live[read].iter().cloned());
+            }
+            leaves
+        })
+        .collect();
     let arrivals: Vec<bool> = members
         .live
         .iter()
+        .zip(&inherited)
         .zip(&members.reads)
-        .map(|(leaves, reads)| !leaves.is_empty() && !reads.is_empty())
+        .map(|((leaves, inherited), reads)| {
+            (!leaves.is_empty() || !inherited.is_empty()) && !reads.is_empty()
+        })
         .collect();
     let (mut dispatcher, mut planned) = plan_edges(
         &members.reads,
@@ -464,7 +505,12 @@ fn run_targets(
     }
     let mut live = Vec::new();
     let mut reads_as_keys = Vec::new();
-    for (pipeline, leaves) in members.live.iter().enumerate() {
+    for (pipeline, (own, inherited)) in members.live.iter().zip(&inherited).enumerate() {
+        let inherits = own.is_empty() && !inherited.is_empty();
+        let leaves = match inherits {
+            true => inherited,
+            false => own,
+        };
         if leaves.is_empty() {
             continue;
         }
@@ -475,6 +521,10 @@ fn run_targets(
         let input = input.expect("a reach calls the breaker it reaches");
         let mut starts: Vec<TileGuard> = Vec::new();
         let notifies = match (&members.located[pipeline], scopes[pipeline].as_ref()) {
+            // Checked where the ranges were taken up: the pipelines it reads reach its drive as
+            // the drive's positions, and the scope parks each delivery until they have decided it
+            // (`Dispatcher::park`).
+            _ if inherits => Notifies::Rounds,
             // A transaction store's input is its writer's source, read behind an entry no
             // planner places, so its items are a delivery's keys where the writer's source is
             // the source every range under the writer reads.
