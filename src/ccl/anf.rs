@@ -108,7 +108,7 @@
 //! mean nothing except as the `expr` an `ExprStmt` sequences — `mut_elim`
 //! recognizes each by pattern-matching an `ExprStmt`'s effect directly
 //! (`mut_elim::rewrite` matches `for` loops by requiring `effect.node` to be
-//! `TypedExprNode::For` verbatim, and `push_continuation_into_case` requires it
+//! `TypedExprNode::For` verbatim, and a writing `if` or `match` by requiring it
 //! to be a `Case`). Atomizing,
 //! say, a `for` loop's compound iteration source and sealing the hoisted
 //! `Let` around the `For` node — the way an ordinary operand is treated —
@@ -122,9 +122,9 @@
 //!
 //! A statement-position `match` is the same shape one level along: its
 //! scrutinee is the compound operand, and a `Let` sealed around the `Case`
-//! leaves `push_continuation_into_case` unable to see the `Case` whose
-//! branches write. The continuation then stays outside the branches and reads
-//! the mutable variable at its entering value, so the write is lost.
+//! leaves `mut_elim` unable to see the `Case` whose branches write. The
+//! continuation then stays outside the branches and reads the mutable
+//! variable at its entering value, so the write is lost.
 //!
 //! `Feed` and `Define` are recognized the same way and get the same
 //! treatment. `mut_elim`'s `collect_feed_only` walks a read-only `with
@@ -966,12 +966,11 @@ fn atomize_list(elts: Vec<Expr>, muts: &Muts) -> (Vec<(TypedBinding, Expr)>, Vec
 /// not `(let __anf = [1,2,3] in for i in __anf: ...); cont` wedged inside
 /// the `ExprStmt`.
 ///
-/// `Case`, `Feed` and `Define` carry the same contract and get the same
-/// treatment: `push_continuation_into_case` requires the effect to be the
-/// `Case`, and `mut_elim`'s `collect_feed_only` and `WriterWalk` require
-/// it to be the `Feed`. Threading reorders nothing, because what moves is the
-/// hoisted binding and not the statements: the feeds keep their spine
-/// positions, which is what `channelize`'s outermost-first collection reads.
+/// `Case`, `Feed` and `Define` carry the same contract and get the same treatment: `mut_elim`
+/// requires the effect to be the writing `Case`, and its `collect_feed_only` and `WriterWalk`
+/// require it to be the `Feed`. Threading reorders nothing, because what moves is the hoisted
+/// binding and not the statements: the feeds keep their spine positions, which is what
+/// `channelize`'s outermost-first collection reads.
 /// `mut_elim`'s `flatten_spine` leaves a `Feed`/`Define`-headed `ExprStmt`
 /// chain nested for a different reason — reassociating there moves the
 /// statements themselves, which would reorder the contributions.
