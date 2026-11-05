@@ -9,6 +9,7 @@ use std::collections::HashMap;
 
 use intervalsets::{Bounding, Interval, IntervalSet};
 
+use crate::ccl::TagMap;
 use crate::interpreter::{CurryLevel, Extent, Predicate, Tiling, Value};
 
 /// Specifies a sub-region of interest within a [`Tile`](crate::interpreter::Tile), used for
@@ -21,6 +22,9 @@ pub enum TileGuard {
     /// its path ends in ([leaf rows](TileGuard::leaf_rows)).
     Scalar(Predicate),
     Record(HashMap<SmolStr, TileGuard>),
+    /// One region per tag of a [`Tiling::Union`], each within the rows carrying that tag, as a
+    /// [`Self::Record`] names one per field.
+    Union(TagMap<TileGuard>),
     Function(FunctionGuard),
     /// An aggregate's result, named under the paths that reach it as [`Self::Scalar`] is.
     Aggregation(Predicate),
@@ -54,6 +58,12 @@ impl TileGuard {
                         })
                         .collect(),
                 ),
+                // A row of a union carries one tag, so an arm's cell is the whole row's value
+                // and goes with the row's key rather than on its own.
+                TileGuard::Union(arms) => TileGuard::Union(arms.map(|_, arm| match arm {
+                    TileGuard::Scalar(_) => TileGuard::Scalar(Predicate::False),
+                    other => walk(other, under_a_level),
+                })),
                 TileGuard::Or(arms) => {
                     TileGuard::flatten_or(arms.iter().map(|arm| walk(arm, under_a_level)).collect())
                 }
@@ -122,6 +132,8 @@ impl TileGuard {
                         .map(|(name, field)| (name.clone(), walk(field, depth, f)))
                         .collect(),
                 ),
+                // A union's arms stand over its rows as a record's fields do.
+                TileGuard::Union(arms) => TileGuard::Union(arms.map(|_, arm| walk(arm, depth, f))),
                 TileGuard::Or(arms) => {
                     TileGuard::flatten_or(arms.iter().map(|arm| walk(arm, depth, f)).collect())
                 }
@@ -166,6 +178,9 @@ impl TileGuard {
             // field's part of it is. A path does not say which field it runs into, so a
             // deeper one asks every field too.
             TileGuard::Record(fields) => fields.values().all(|g| g.covers_at(path, level)),
+            // A path does not say which tag its row carries, so it is covered where every
+            // arm covers it.
+            TileGuard::Union(arms) => arms.values().all(|g| g.covers_at(path, level)),
             // A keyless leaf at `level` stands under the path of the `level` keys above it.
             TileGuard::Scalar(pred) | TileGuard::Aggregation(pred) => {
                 let rows = TileGuard::leaf_rows(pred);
@@ -196,6 +211,7 @@ impl TileGuard {
             TileGuard::Scalar(pred) | TileGuard::Aggregation(pred) => pred.qualifies(),
             TileGuard::Function(FunctionGuard::Codomain(inner)) => inner.names_a_path(),
             TileGuard::Record(fields) => fields.values().any(TileGuard::names_a_path),
+            TileGuard::Union(arms) => arms.values().any(TileGuard::names_a_path),
             TileGuard::Or(arms) => arms.iter().any(TileGuard::names_a_path),
         }
     }
@@ -235,6 +251,7 @@ fn lift(chain: TileGuard) -> Vec<TileGuard> {
             );
         }
         TileGuard::Record(fields) => return lift_record(fields, depth),
+        TileGuard::Union(arms) => return lift_union(arms, depth),
         _ => return vec![chain],
     };
     let arms = match pred {
@@ -299,6 +316,32 @@ fn lift_record(fields: &HashMap<SmolStr, TileGuard>, depth: usize) -> Vec<TileGu
     lifted
 }
 
+/// A union at `depth` codomain steps, restated with the keys above it that every arm names
+/// whole as those keys, as [`lift_record`] restates a record's.
+///
+/// A row carries one tag, and a guard does not say which, so a key is named whole for
+/// certain only where every arm names it whole. What the arms name beyond those keys stays as
+/// a union arm, so the guard still names exactly the region it named.
+fn lift_union(arms: &TagMap<TileGuard>, depth: usize) -> Vec<TileGuard> {
+    let union = || CurryLevel::new(depth).wrap_guard(TileGuard::Union(arms.clone()));
+    let whole = arms
+        .values()
+        .fold(Predicate::True, |acc, arm| acc.intersect(&whole_rows(arm)));
+    if whole.is_false() {
+        return vec![union()];
+    }
+    let mut covered = vec![Predicate::False; depth];
+    covered[depth - 1] = whole.clone();
+    let mut lifted = lift(
+        CurryLevel::new(depth - 1).wrap_guard(TileGuard::Function(FunctionGuard::Domain(whole))),
+    );
+    let rest = TileGuard::Union(arms.map(|_, arm| without_covered_keys(arm.clone(), &covered)));
+    if !rest.is_empty() {
+        lifted.push(CurryLevel::new(depth).wrap_guard(rest));
+    }
+    lifted
+}
+
 /// The paths reaching `guard` under which it names everything: for a guard standing under
 /// a level, the keys of that level whose whole value it names.
 fn whole_rows(guard: &TileGuard) -> Predicate {
@@ -313,6 +356,9 @@ fn whole_rows(guard: &TileGuard) -> Predicate {
         TileGuard::Record(fields) => fields.values().fold(Predicate::True, |acc, field| {
             acc.intersect(&whole_rows(field))
         }),
+        TileGuard::Union(arms) => arms
+            .values()
+            .fold(Predicate::True, |acc, arm| acc.intersect(&whole_rows(arm))),
         TileGuard::Or(arms) => arms
             .iter()
             .fold(Predicate::False, |acc, arm| acc.union(&whole_rows(arm))),
@@ -356,6 +402,9 @@ fn without_covered_keys(guard: TileGuard, covered: &[Predicate]) -> TileGuard {
                 .map(|(name, field)| (name, without_covered_keys(field, covered)))
                 .collect(),
         ),
+        TileGuard::Union(arms) => {
+            TileGuard::Union(arms.map(|_, arm| without_covered_keys(arm.clone(), covered)))
+        }
         TileGuard::Or(arms) => TileGuard::flatten_or(
             arms.into_iter()
                 .map(|arm| without_covered_keys(arm, covered))
@@ -497,6 +546,7 @@ fn same_place(a: &TileGuard, b: &TileGuard) -> bool {
         // A record's fields are cells of their own, so two record guards union field by
         // field ([`TileGuard::union`]) whatever each field names.
         (TileGuard::Record(_), TileGuard::Record(_)) => true,
+        (TileGuard::Union(_), TileGuard::Union(_)) => true,
         (TileGuard::Scalar(_), TileGuard::Scalar(_))
         | (TileGuard::Aggregation(_), TileGuard::Aggregation(_)) => true,
         _ => false,
@@ -515,6 +565,7 @@ fn union_in_place(a: &TileGuard, b: &TileGuard) -> TileGuard {
             TileGuard::Function(FunctionGuard::Codomain(y)),
         ) => TileGuard::Function(FunctionGuard::Codomain(Box::new(union_in_place(x, y)))),
         (TileGuard::Record(_), TileGuard::Record(_))
+        | (TileGuard::Union(_), TileGuard::Union(_))
         | (TileGuard::Scalar(_), TileGuard::Scalar(_))
         | (TileGuard::Aggregation(_), TileGuard::Aggregation(_)) => a.union(b),
         _ => unreachable!("only two guards naming one place are unioned this way"),
@@ -584,6 +635,7 @@ fn without_paths(guard: &TileGuard, above: &[Predicate]) -> TileGuard {
                 .map(|(name, field)| (name.clone(), without_paths(field, above)))
                 .collect(),
         ),
+        TileGuard::Union(arms) => TileGuard::Union(arms.map(|_, arm| without_paths(arm, above))),
         TileGuard::Scalar(cells) => TileGuard::Scalar(Predicate::qualified(
             leaf_rows_beyond(cells, above),
             Predicate::True,
@@ -664,6 +716,26 @@ fn zip_fields(
         .collect()
 }
 
+/// Combine two union guards arm by arm, as [`zip_fields`] combines record guards: both describe
+/// the same `Tiling::Union`, so they name the same tags.
+fn zip_arms(
+    a: &TagMap<TileGuard>,
+    b: &TagMap<TileGuard>,
+    combine: impl Fn(&TileGuard, &TileGuard) -> TileGuard,
+) -> TagMap<TileGuard> {
+    assert_eq!(
+        a.len(),
+        b.len(),
+        "Incompatible union guards: {a:?} vs {b:?}"
+    );
+    a.map(|tag, g| {
+        let other = b
+            .get(tag)
+            .unwrap_or_else(|| panic!("Incompatible union guards: {a:?} vs {b:?}"));
+        combine(g, other)
+    })
+}
+
 impl TileGuard {
     /// Normalize a nonempty union: distribute codomain steps, lift whole regions, combine
     /// matching shapes and prune covered inner domains. Return one arm without an `Or` wrapper.
@@ -737,6 +809,9 @@ impl TileGuard {
             (TileGuard::Record(m1), TileGuard::Record(m2)) => {
                 TileGuard::Record(zip_fields(m1, m2, |a, b| a.intersect_at(b, level)))
             }
+            (TileGuard::Union(a1), TileGuard::Union(a2)) => {
+                TileGuard::Union(zip_arms(a1, a2, |a, b| a.intersect_at(b, level)))
+            }
             // Or distributes over intersect: (A | B) & C = (A & C) | (B & C).
             (TileGuard::Or(arms), g) | (g, TileGuard::Or(arms)) => {
                 TileGuard::flatten_or(arms.iter().map(|a| a.intersect_at(g, level)).collect())
@@ -767,6 +842,11 @@ impl TileGuard {
             // over components of a record value. Keep the per-field shape consumers use.
             (TileGuard::Record(m1), TileGuard::Record(m2)) => {
                 TileGuard::Record(zip_fields(m1, m2, TileGuard::union))
+            }
+            // Arm regions combine independently, as fields do; whole rows lift through the
+            // canonical form ([`lift_union`]).
+            (TileGuard::Union(a1), TileGuard::Union(a2)) => {
+                TileGuard::flatten_or(vec![TileGuard::Union(zip_arms(a1, a2, TileGuard::union))])
             }
             // Or: accumulate all arms, flattening nested Ors.
             (TileGuard::Or(arms), g) | (g, TileGuard::Or(arms)) => {
@@ -844,6 +924,7 @@ impl TileGuard {
         match self {
             TileGuard::Scalar(pred) | TileGuard::Aggregation(pred) => pred.as_bool() == Some(true),
             TileGuard::Record(m) => m.values().all(TileGuard::is_universal),
+            TileGuard::Union(arms) => arms.values().all(TileGuard::is_universal),
             TileGuard::Function(g) => g.is_universal(),
             // Or is universal if any arm covers everything.
             TileGuard::Or(arms) => arms.iter().any(TileGuard::is_universal),
@@ -858,6 +939,7 @@ impl TileGuard {
             // independently, so a guard with one empty field is still meaningful
             // for the non-empty fields.)
             TileGuard::Record(m) => m.values().all(TileGuard::is_empty),
+            TileGuard::Union(arms) => arms.values().all(TileGuard::is_empty),
             TileGuard::Function(g) => g.is_empty(),
             // Or is empty only when every arm is empty.
             TileGuard::Or(arms) => arms.iter().all(TileGuard::is_empty),
@@ -949,6 +1031,16 @@ impl TileGuard {
                     && guard_fields.iter().all(|(k, g)| {
                         tiling_fields
                             .get(k)
+                            .is_some_and(|t| g.check_from_under(t, above))
+                    })
+            }
+            // A union guard names each tag of the tiling, with each arm's guard compatible
+            // with that arm's tiling.
+            (TileGuard::Union(guard_arms), Tiling::Union(tiling_arms)) => {
+                guard_arms.len() == tiling_arms.len()
+                    && guard_arms.iter().all(|(tag, g)| {
+                        tiling_arms
+                            .get(tag)
                             .is_some_and(|t| g.check_from_under(t, above))
                     })
             }
@@ -1054,6 +1146,9 @@ fn require_at(guard: TileGuard, p: &Predicate, at: usize, level: usize) -> TileG
                 .map(|(name, field)| (name, require_at(field, p, at, level)))
                 .collect(),
         ),
+        TileGuard::Union(arms) => {
+            TileGuard::Union(arms.map(|_, arm| require_at(arm.clone(), p, at, level)))
+        }
         // A keyless leaf at `level` is named under the paths above it, so the requirement is
         // conjoined where its chain reaches `at`, as for a key of that level.
         TileGuard::Scalar(pred) => TileGuard::Scalar(require_level(&pred, p, at, level)),
@@ -1185,6 +1280,14 @@ fn subsumes_at(guard: Option<&TileGuard>, other: &TileGuard, above: &[Predicate]
             });
             subsumes_at(own, field, above)
         }),
+        TileGuard::Union(arms) => arms.iter().all(|(tag, arm)| {
+            let own = parts.union.as_ref().map(|union| {
+                union.get(tag).unwrap_or_else(|| {
+                    panic!("guards of one variant name the same tags: {union:?} and {arms:?}")
+                })
+            });
+            subsumes_at(own, arm, above)
+        }),
         TileGuard::Scalar(cells) => {
             TileGuard::leaf_rows(&parts.scalar).subsumes(&leaf_rows_beyond(cells, above))
         }
@@ -1196,11 +1299,13 @@ fn subsumes_at(guard: Option<&TileGuard>, other: &TileGuard, above: &[Predicate]
 }
 
 /// The arms of a guard at one position, by what they name: keys, what lies one level in, a
-/// record's fields, or a keyless leaf. A guard of one tiling names only kinds its shape has.
+/// record's fields, a variant's tags, or a keyless leaf. A guard of one tiling names only kinds
+/// its shape has.
 struct Parts {
     domain: Predicate,
     codomain: Option<TileGuard>,
     record: Option<HashMap<SmolStr, TileGuard>>,
+    union: Option<TagMap<TileGuard>>,
     scalar: Predicate,
     aggregation: Predicate,
 }
@@ -1211,6 +1316,7 @@ impl Parts {
             domain: Predicate::False,
             codomain: None,
             record: None,
+            union: None,
             scalar: Predicate::False,
             aggregation: Predicate::False,
         };
@@ -1234,6 +1340,12 @@ impl Parts {
                     parts.record = Some(match parts.record.take() {
                         Some(held) => zip_fields(&held, fields, TileGuard::union),
                         None => fields.clone(),
+                    });
+                }
+                TileGuard::Union(arms) => {
+                    parts.union = Some(match parts.union.take() {
+                        Some(held) => zip_arms(&held, arms, TileGuard::union),
+                        None => arms.clone(),
                     });
                 }
                 TileGuard::Scalar(cells) => parts.scalar = parts.scalar.union(cells),

@@ -430,14 +430,22 @@ enum EntryValue {
     Row(Tile),
 }
 
-type NodeKey = (Vec<SmolStr>, usize);
-type EntryKey = (Vec<SmolStr>, Vec<Value>);
+/// One step of a [`completion_view`] label: into a record field (a store's part is one), or
+/// into the arm of a union under its tag.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum LabelStep {
+    Field(SmolStr),
+    Arm(crate::ccl::FieldKey),
+}
+
+type NodeKey = (Vec<LabelStep>, usize);
+type EntryKey = (Vec<LabelStep>, Vec<Value>);
 
 /// Flatten `tile` into its collection levels and the entries it holds.
 fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<EntryKey, Entry>) {
     fn walk(
         tile: &Tile,
-        label: &[SmolStr],
+        label: &[LabelStep],
         level: usize,
         rows: &[Option<Vec<Value>>],
         above: &Predicate,
@@ -493,8 +501,35 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
             Tile::Record { fields, .. } => {
                 for (field, field_tile) in fields {
                     let mut label = label.to_vec();
-                    label.push(field.clone());
+                    label.push(LabelStep::Field(field.clone()));
                     walk(field_tile, &label, level, rows, above, nodes, entries);
+                }
+            }
+            // A row's tag is an entry of its own, so a row that changes tags is caught, and each
+            // arm is walked over the rows carrying it, as a record's fields are over the
+            // record's.
+            Tile::Union(arms) => {
+                for (tag, arm) in arms.iter() {
+                    let mut label = label.to_vec();
+                    label.push(LabelStep::Arm(tag.clone()));
+                    let arm_rows: Vec<Option<Vec<Value>>> = arm
+                        .rows
+                        .iter()
+                        .map(|&row| rows.get(row).cloned().flatten())
+                        .collect();
+                    for path in arm_rows.iter().flatten() {
+                        entries.insert(
+                            (label.clone(), path.clone()),
+                            Entry {
+                                value: EntryValue::Key,
+                                complete: match level {
+                                    0 => true,
+                                    _ => above.contains_path(path),
+                                },
+                            },
+                        );
+                    }
+                    walk(&arm.tile, &label, level, &arm_rows, above, nodes, entries);
                 }
             }
             Tile::Scalar(column) => {
@@ -533,7 +568,7 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
                 use crate::interpreter::operator_conversion::store_key;
                 let part = |name: &str| {
                     let mut l = label.to_vec();
-                    l.push(SmolStr::new(name));
+                    l.push(LabelStep::Field(SmolStr::new(name)));
                     l
                 };
                 for (row, path) in rows.iter().enumerate() {
@@ -644,32 +679,63 @@ fn completion_view(tile: &Tile) -> (HashMap<NodeKey, CompletionNode>, HashMap<En
 }
 
 /// Whether `guard` releases the root value under record fields `label` whole.
-fn released_whole(guard: &TileGuard, label: &[SmolStr]) -> bool {
+fn released_whole(guard: &TileGuard, label: &[LabelStep]) -> bool {
     match guard {
         g if g.is_universal() => true,
         TileGuard::Or(arms) => arms.iter().any(|arm| released_whole(arm, label)),
         TileGuard::Record(fields) => label
             .split_first()
-            .and_then(|(field, rest)| fields.get(field).map(|g| released_whole(g, rest)))
+            .and_then(|(step, rest)| record_field(fields, step).map(|g| released_whole(g, rest)))
+            .unwrap_or(false),
+        TileGuard::Union(arms) => label
+            .split_first()
+            .and_then(|(arm, rest)| union_arm(arms, arm).map(|g| released_whole(g, rest)))
             .unwrap_or(false),
         _ => false,
+    }
+}
+
+/// The guard of the union arm a [`completion_view`] label step names.
+fn union_arm<'g>(
+    arms: &'g crate::ccl::TagMap<TileGuard>,
+    step: &LabelStep,
+) -> Option<&'g TileGuard> {
+    match step {
+        LabelStep::Arm(tag) => arms.get(tag),
+        LabelStep::Field(_) => None,
+    }
+}
+
+/// The guard of the record field a [`completion_view`] label step names.
+fn record_field<'g>(
+    fields: &'g HashMap<SmolStr, TileGuard>,
+    step: &LabelStep,
+) -> Option<&'g TileGuard> {
+    match step {
+        LabelStep::Field(field) => fields.get(field),
+        LabelStep::Arm(_) => None,
     }
 }
 
 /// The paths reaching collection level `level` under record fields `label` that `guard`
 /// releases: a domain guard `d` codomain steps in names keys of level `d` and everything
 /// beneath them.
-fn released_at(guard: &TileGuard, label: &[SmolStr], level: usize) -> Predicate {
-    fn walk(guard: &TileGuard, label: &[SmolStr], depth: usize, level: usize) -> Predicate {
+fn released_at(guard: &TileGuard, label: &[LabelStep], level: usize) -> Predicate {
+    fn walk(guard: &TileGuard, label: &[LabelStep], depth: usize, level: usize) -> Predicate {
         match guard {
             TileGuard::Or(arms) => arms
                 .iter()
                 .map(|arm| walk(arm, label, depth, level))
                 .fold(Predicate::False, |all, one| all.union(&one)),
             TileGuard::Record(fields) => match label.split_first() {
-                Some((field, rest)) => fields
-                    .get(field)
+                Some((step, rest)) => record_field(fields, step)
                     .map_or(Predicate::False, |g| walk(g, rest, depth, level)),
+                None => Predicate::False,
+            },
+            TileGuard::Union(arms) => match label.split_first() {
+                Some((arm, rest)) => {
+                    union_arm(arms, arm).map_or(Predicate::False, |g| walk(g, rest, depth, level))
+                }
                 None => Predicate::False,
             },
             TileGuard::Function(FunctionGuard::Codomain(inner)) if depth < level => {
@@ -690,16 +756,22 @@ fn released_at(guard: &TileGuard, label: &[SmolStr], level: usize) -> Predicate 
 }
 
 /// The paths whose value under record fields `label` `guard` names: a keyless leaf's rows.
-fn released_cells_at(guard: &TileGuard, label: &[SmolStr]) -> Predicate {
+fn released_cells_at(guard: &TileGuard, label: &[LabelStep]) -> Predicate {
     match guard {
         TileGuard::Or(arms) => arms
             .iter()
             .map(|arm| released_cells_at(arm, label))
             .fold(Predicate::False, |all, one| all.union(&one)),
         TileGuard::Record(fields) => match label.split_first() {
-            Some((field, rest)) => fields
-                .get(field)
-                .map_or(Predicate::False, |g| released_cells_at(g, rest)),
+            Some((step, rest)) => {
+                record_field(fields, step).map_or(Predicate::False, |g| released_cells_at(g, rest))
+            }
+            None => Predicate::False,
+        },
+        TileGuard::Union(arms) => match label.split_first() {
+            Some((arm, rest)) => {
+                union_arm(arms, arm).map_or(Predicate::False, |g| released_cells_at(g, rest))
+            }
             None => Predicate::False,
         },
         TileGuard::Scalar(pred) | TileGuard::Aggregation(pred) if label.is_empty() => {
@@ -741,7 +813,7 @@ fn completeness_violation(
     }
     // A root value is released by a release naming it whole, through the record fields that
     // reach it; a path beneath the root by one naming it.
-    let is_released = |label: &Vec<SmolStr>, path: &Vec<Value>| match path.len() {
+    let is_released = |label: &Vec<LabelStep>, path: &Vec<Value>| match path.len() {
         0 => released_whole(released, label),
         n => released_at(released, label, n - 1).contains_path(path),
     };
@@ -815,7 +887,7 @@ fn completeness_violation(
 /// by. A key and the scalar value at its path are one entry.
 fn collection_of<'a>(
     nodes: &'a HashMap<NodeKey, CompletionNode>,
-    label: &[SmolStr],
+    label: &[LabelStep],
     path: &[Value],
 ) -> Option<&'a CompletionNode> {
     let level = path.len() - 1;
