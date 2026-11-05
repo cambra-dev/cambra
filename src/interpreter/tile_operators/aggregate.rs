@@ -53,9 +53,10 @@ impl TileOperator for Aggregate {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        let input = BreakerInput::new(consumer, self.input.tiling(), false, scheduler);
         let input_producer = self.input.subscribe(
             self.input.tiling().universal_guard(),
-            widening(consumer),
+            input.consumer,
             scheduler,
         );
         Box::new(AggregateProducer::new(
@@ -64,7 +65,8 @@ impl TileOperator for Aggregate {
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .breaking(input.downstream, input.placement),
             input_producer,
         ))
     }
@@ -202,6 +204,16 @@ impl TileProducer for AggregateProducer {
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
+    }
+
+    #[cfg(test)]
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        Some(self)
     }
 
     /// An accumulator has no keys to project, so the projection is all of it or none. The
@@ -348,16 +360,18 @@ impl TileOperator for ExtractAggregate {
         consumer: Box<dyn Consumer>,
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
+        let input = BreakerInput::new(consumer, self.input.tiling(), false, scheduler);
         let mut producer = ExtractAggregateProducer::new(
             ProducerBase::new(
                 ExtractAggregateProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .breaking(input.downstream, input.placement),
             self.input.subscribe(
                 self.input.tiling().universal_guard(),
-                widening(consumer),
+                input.consumer,
                 scheduler,
             ),
             self.kind,
@@ -428,6 +442,16 @@ impl TileProducer for ExtractAggregateProducer {
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
+    }
+
+    #[cfg(test)]
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        Some(self)
     }
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
@@ -604,6 +628,11 @@ impl TileProducer for MapExtractAggregateProducer {
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
     }
 
     /// The keys of every level of the input are the output's, and only what sits under the
@@ -838,16 +867,20 @@ impl TileOperator for MapAggregate {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         // The groups keep the input's outermost keys.
-        let input_producer =
-            self.input
-                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+        let input = BreakerInput::new(consumer, self.input.tiling(), true, scheduler);
+        let input_producer = self.input.subscribe(
+            self.input.tiling().universal_guard(),
+            input.consumer,
+            scheduler,
+        );
         Box::new(MapAggregateProducer::new(
             ProducerBase::new(
                 MapAggregateProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
                 scheduler,
-            ),
+            )
+            .breaking(input.downstream, input.placement),
             input_producer,
             self.kind,
         ))
@@ -1144,6 +1177,16 @@ impl TileProducer for MapAggregateProducer {
 
     fn visit_input_producers(&self, visit: &mut dyn FnMut(&str, &dyn TileProducer)) {
         visit("input", &*self.input);
+    }
+
+    #[cfg(test)]
+    fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
+        visit("input", &mut *self.input);
+    }
+
+    #[cfg(test)]
+    fn as_breaking_mut(&mut self) -> Option<&mut dyn BreakingProducer> {
+        Some(self)
     }
 
     /// Every level of the output is a level of the input, and the aggregation folds only the
