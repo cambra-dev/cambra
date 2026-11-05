@@ -988,14 +988,6 @@ impl ProducerBase {
         self
     }
 
-    /// Whether a planner has placed this pipeline breaker in a pipeline of a dispatched run
-    /// (`dispatcher::run_program`): its entry's placement names one. A refused run unplaces it.
-    pub(crate) fn is_placed(&self) -> bool {
-        self.placement
-            .as_ref()
-            .is_some_and(|placement| placement.get().is_some())
-    }
-
     /// This producer has no input, and a planner pushes its region through `consumer`, the one it
     /// was subscribed with.
     pub(crate) fn leaf(mut self, consumer: crate::interpreter::SharedConsumer) -> Self {
@@ -1402,13 +1394,19 @@ impl InputId {
 pub trait Breaker {
     /// Pull input `input` at `guard`, a guard of the tiling that input answers, merge the answer into
     /// this breaker's state, and release the input at the guard the answer states once the
-    /// answer is taken. The first call makes a [`BreakingProducer`] consuming.
+    /// answer is taken.
     ///
     /// # Panics
     ///
     /// When the breaker has no consuming mode for its shape, which is the only way a caller
-    /// learns it.
+    /// learns it; in a debug build, before [`enter_consuming_mode`](Self::enter_consuming_mode).
     fn consume_impl(&mut self, input: InputId, guard: TileGuard);
+
+    /// Put the breaker in consuming mode: a pull answers what its consumes have rendered and
+    /// never steps it. A dispatched run calls it on every breaker it drives once its plan stands,
+    /// before any package, and a pull-mode run never calls it, so the mode is fixed for the run.
+    /// [`consume_impl`](Self::consume_impl) runs only after it.
+    fn enter_consuming_mode(&mut self);
 
     /// The tiling of input `input`, which `consume_impl` pulls: what a package's guard is a guard of, and
     /// what a source pipeline's first packages cut.

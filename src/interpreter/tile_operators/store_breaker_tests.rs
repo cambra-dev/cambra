@@ -89,12 +89,15 @@ impl Compiled {
         }
     }
 
-    /// Call `f` with the store as a pipeline breaker.
+    /// Call `f` with the store as a pipeline breaker, in consuming mode as a dispatched run puts
+    /// it.
     fn breaker<R>(&self, f: impl FnOnce(&mut dyn BreakingProducer) -> R) -> R {
         let mut store = self.store.borrow_mut();
-        f(store
+        let store = store
             .as_breaking_mut()
-            .expect("a store is a pipeline breaker"))
+            .expect("a store is a pipeline breaker");
+        store.enter_consuming_mode();
+        f(store)
     }
 
     /// Consume all of the store's input `input`.
@@ -207,19 +210,14 @@ fn input_pulls(compiled: &Compiled) -> u64 {
     pulls
 }
 
-/// A store placed in a pipeline answers a pull before its first consume with the unopened store:
-/// nothing terminal, and no input pulled. Its consumes then run as they would have.
+/// A consuming store answers a pull before its first consume with the unopened store: nothing
+/// terminal, and no input pulled. Its consumes then run as they would have.
 #[rstest_log::rstest]
 #[case::an_induction_store(SUM)]
 #[case::a_transaction_store(TWO_WRITERS)]
-fn a_placed_store_pulled_before_its_first_consume_answers_nothing_final(#[case] source: &str) {
+fn a_consuming_store_pulled_before_its_first_consume_answers_nothing_final(#[case] source: &str) {
     let compiled = Compiled::of(source);
-    compiled.breaker(|store| {
-        store
-            .entry_placement(InputId(0))
-            .expect("a store's input has an entry")
-            .set(Some(PipelineId(0)))
-    });
+    compiled.breaker(|_| {});
     let before = input_pulls(&compiled);
     let whole = compiled.store.borrow().tiling().universal_guard();
     let pulled = compiled.store.borrow_mut().get(whole);

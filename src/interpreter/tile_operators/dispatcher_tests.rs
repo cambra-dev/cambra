@@ -145,6 +145,8 @@ impl TileProducer for Scripted {
 }
 
 impl Breaker for Scripted {
+    fn enter_consuming_mode(&mut self) {}
+
     fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
         self.input.get(guard);
         if let Some(released) = &self.releases {
@@ -246,6 +248,7 @@ fn an_aggregate_folds_what_the_memo_below_it_pushed() {
 #[test]
 fn a_partly_released_breaker_pushes_only_what_is_left() {
     let memo = memo_over_rows(0..6);
+    memo.borrow_mut().enter_consuming_mode();
     memo.borrow_mut()
         .consume_impl(InputId::ONLY, ints().universal_guard());
     memo.borrow_mut().release(keys_between(2, 3));
@@ -433,6 +436,7 @@ fn finish_with_a_package_queued_panics() {
     ];
     wire(&[vec![], vec![0]], &breakers);
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    breakers[0].borrow_mut().enter_consuming_mode();
     breakers[0]
         .borrow_mut()
         .consume_impl(InputId::ONLY, ints().universal_guard());
@@ -482,6 +486,7 @@ fn a_source_pipeline_finishes_after_its_input_released_what_was_queued() {
     let Next::Package(package) = dispatcher.try_claim(None) else {
         panic!("a started source hands out its package")
     };
+    memo.borrow_mut().enter_consuming_mode();
     memo.borrow_mut()
         .consume_impl(InputId::ONLY, keys_between(0, 3));
     dispatcher.acknowledge(package);
@@ -836,6 +841,7 @@ fn a_source_over_a_range_starts_with_morsels_of_rows_positions() {
 #[test]
 fn a_memos_morsels_partition_its_final_guard_and_leave_out_released_keys() {
     let mut memo = MemoProducer::over(Box::new(Input::over(&source(SPARSE))), &ints());
+    memo.enter_consuming_mode();
     memo.consume_impl(InputId::ONLY, ints().universal_guard());
     memo.release(keys_between(3, 3));
     memo.release(keys_between(8, 8));
@@ -865,6 +871,7 @@ fn a_memos_morsels_partition_its_final_guard_and_leave_out_released_keys() {
 #[test]
 fn a_partly_released_source_pushes_morsels_over_what_is_left() {
     let memo = memo_over_rows(0..6);
+    memo.borrow_mut().enter_consuming_mode();
     memo.borrow_mut()
         .consume_impl(InputId::ONLY, ints().universal_guard());
     memo.borrow_mut().release(keys_between(2, 3));
@@ -885,6 +892,7 @@ fn a_partly_released_source_pushes_morsels_over_what_is_left() {
 #[test]
 fn a_breaker_of_one_value_pushes_one_morsel() {
     let sum = aggregate_over(Box::new(Input::over(&source(SPARSE))), &sum_tiling());
+    sum.borrow_mut().enter_consuming_mode();
     sum.borrow_mut()
         .consume_impl(InputId::ONLY, ints().universal_guard());
     push_to(&mut *sum.borrow_mut(), &[1]);
@@ -917,6 +925,7 @@ fn random_morsel_sizes_partition_and_answer_the_same() {
         let trace = format!("seed {seed}: keys {keys:?}, released {released:?}, rows {rows}");
 
         let mut memo = MemoProducer::over(Box::new(Input::over(&source_rows(&keys))), &ints());
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, ints().universal_guard());
         for key in &released {
             memo.release(keys_between(*key, *key));
@@ -1015,6 +1024,7 @@ fn a_final_guard_pushed_twice_is_pushed_once() {
 #[test]
 fn a_guard_naming_part_of_what_is_held_is_cut_at_the_keys_it_names() {
     let mut memo = MemoProducer::over(Box::new(Input::over(&source(0..8))), &ints());
+    memo.enter_consuming_mode();
     memo.consume_impl(InputId::ONLY, ints().universal_guard());
     let guard = keys_between(3, 6);
     let morsels = memo.morsels(&guard, 2);
@@ -1448,6 +1458,9 @@ fn a_memo_pushes_in_each_epoch_what_it_decided_since_the_last() {
     let reader = Scripted::holding(ints().empty_guard());
     let breakers: Vec<BreakerHandle> = vec![memo, reader];
     wire(&[vec![], vec![0]], &breakers);
+    for breaker in &breakers {
+        breaker.borrow_mut().enter_consuming_mode();
+    }
     let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
     dispatcher.notify(PipelineId(0), &keys_between(0, 2));
     dispatcher.seal();

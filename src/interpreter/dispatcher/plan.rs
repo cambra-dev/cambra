@@ -539,6 +539,13 @@ fn run_targets(
     for (reader, read) in reads_as_keys {
         dispatcher.queue_pushes_of(PipelineId(reader), PipelineId(read));
     }
+    // The run drives every breaker it planned, so each takes its consuming mode here, before any
+    // package, and keeps it for the run.
+    for pipeline in 0..members.names.len() {
+        reach(PipelineId(pipeline), &mut |breaker, _| {
+            breaker.enter_consuming_mode()
+        });
+    }
     in_a_run(|| match live.is_empty() {
         true => drive(&dispatcher, &mut reach),
         false => drive_live(&dispatcher, &mut reach, &mut live, on_idle),

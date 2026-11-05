@@ -2599,7 +2599,8 @@ pub(crate) enum Event {
 /// pipeline, starts with its breaker's input whole, as one package per morsel ([`seed`]), and is
 /// closed, so the run is one epoch. The driver consumes the package of the lowest pipeline that
 /// has one; when no pipeline has one, it finishes the lowest pipeline that may finish. It stops
-/// when every pipeline has finished.
+/// when every pipeline has finished. Every breaker takes its consuming mode before the first
+/// package, as in a compiled program's run.
 ///
 /// # Panics
 ///
@@ -2608,6 +2609,9 @@ pub(crate) enum Event {
 /// when a pipeline consumes a region it consumed before, or when a breaker's morsels do not
 /// partition its final guard; and at any of the invariants [`finish_epoch`] asserts.
 pub fn run(dispatcher: &Dispatcher, breakers: &[BreakerHandle]) {
+    for breaker in breakers {
+        breaker.borrow_mut().enter_consuming_mode();
+    }
     assert_eq!(
         breakers.len(),
         dispatcher.infos.len(),

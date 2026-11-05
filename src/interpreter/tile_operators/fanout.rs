@@ -1177,8 +1177,8 @@ pub(crate) struct MemoProducer {
     /// build reads. A probe asks whether the input still answers empty for what it released;
     /// until the input notifies, the answer cannot have changed.
     drain_probed: bool,
-    /// Whether [`Breaker::consume_impl`] has run: a consuming memo answers from its
-    /// cache and never pulls its input.
+    /// Whether the memo is in consuming mode for the run ([`Breaker::enter_consuming_mode`]): it
+    /// then answers from its cache and never pulls its input.
     consuming: bool,
     /// This memo's consumer, woken through [`wakeups`](Self::wakeups) when a pull nothing
     /// notified finds data the cache did not hold.
@@ -1298,7 +1298,7 @@ impl MemoProducer {
 
 impl Breaker for MemoProducer {
     /// Reads the input at `guard` whether or not the cache holds the region, since the caller
-    /// asks for the pipeline to run, and leaves the memo consuming. It wakes no consumer: a
+    /// asks for the pipeline to run. It wakes no consumer: a
     /// consuming memo's only reader is the pipeline the dispatcher pushes to, and what the consume
     /// merged reaches it through the packages pushed after the consume.
     fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
@@ -1307,7 +1307,11 @@ impl Breaker for MemoProducer {
             "{} consumes a guard of its input's tiling: {guard:?}",
             self.name()
         );
-        self.consuming = true;
+        debug_assert!(
+            self.consuming,
+            "{} consumes once a dispatched run has put it in consuming mode",
+            self.name()
+        );
         let projection = guard.projection_for(self);
         if projection == Projection::Nothing || self.upstream_drained {
             return;
@@ -1325,6 +1329,10 @@ impl Breaker for MemoProducer {
                 self.input.release(read);
             }
         }
+    }
+
+    fn enter_consuming_mode(&mut self) {
+        self.consuming = true;
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
@@ -1585,6 +1593,7 @@ mod nested_projection_tests {
         let mut memo = MemoProducer::over(Box::new(input), &tiling);
 
         let every = point(0).union(&point(1)).union(&point(2));
+        memo.enter_consuming_mode();
         memo.consume_impl(
             InputId::ONLY,
             paths_guard(Predicate::qualified(
@@ -2320,6 +2329,7 @@ mod projection_tests {
     fn a_consuming_memo_answers_as_a_lazy_one_does() {
         let (mut lazy, _, _) = memo_over_stream();
         let (mut consuming, _, _) = memo_over_stream();
+        consuming.enter_consuming_mode();
         consuming.consume_impl(InputId::ONLY, ints().universal_guard());
         assert_eq!(consuming.final_guard(), ints().universal_guard());
 
@@ -2342,6 +2352,7 @@ mod projection_tests {
     #[test]
     fn a_consuming_memo_pulls_the_input_once_and_releases_it_whole() {
         let (mut memo, pulled, released) = memo_over_stream();
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, ints().universal_guard());
         assert_eq!(*pulled.borrow(), vec![ints().universal_guard()]);
         assert_eq!(*released.borrow(), vec![ints().universal_guard()]);
@@ -2362,6 +2373,7 @@ mod projection_tests {
     #[test]
     fn a_memo_consumed_in_part_answers_that_part_and_pulls_no_more() {
         let (mut memo, pulled, released) = memo_over_stream();
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, keys_between(0, 3));
         assert_eq!(*pulled.borrow(), vec![keys_between(0, 3)]);
         assert_eq!(*released.borrow(), vec![keys_between(0, 3)]);
@@ -2373,11 +2385,23 @@ mod projection_tests {
         assert_eq!(pulled.borrow().len(), 1, "and it is not pulled either");
     }
 
-    /// Consuming a memo whose input has already drained pulls nothing.
+    /// A memo in consuming mode answers a pull before its first consume with nothing and pulls its
+    /// input nothing.
+    #[test]
+    fn a_consuming_memo_pulled_before_its_first_consume_pulls_nothing() {
+        let (mut memo, pulled, _) = memo_over_stream();
+        memo.enter_consuming_mode();
+        let tile = memo.get(ints().universal_guard());
+        assert!(tile.is_empty() && !tile.is_terminal(), "{tile:?}");
+        assert!(pulled.borrow().is_empty());
+    }
+
+    /// A consume of a memo whose input has already drained pulls nothing.
     #[test]
     fn a_memo_whose_input_has_drained_consumes_nothing() {
         let (mut memo, pulled, _) = memo_over_stream();
-        memo.get(ints().universal_guard());
+        memo.enter_consuming_mode();
+        memo.consume_impl(InputId::ONLY, ints().universal_guard());
         let pulls = pulled.borrow().len();
         memo.consume_impl(InputId::ONLY, ints().universal_guard());
         assert_eq!(memo.final_guard(), ints().universal_guard());
@@ -2389,11 +2413,9 @@ mod projection_tests {
     #[test]
     fn finish_queues_no_wake() {
         let (mut memo, _, _) = memo_over_stream();
-        memo.get(ints().universal_guard());
-        assert!(
-            memo.wakeups.is_empty(),
-            "the first read is what was notified"
-        );
+        memo.enter_consuming_mode();
+        memo.consume_impl(InputId::ONLY, ints().universal_guard());
+        assert!(memo.wakeups.is_empty(), "a consume queues no wake");
         memo.consume_impl(InputId::ONLY, ints().universal_guard());
         push_to(&mut memo, &[1]);
         let dispatcher = Dispatcher::new(vec![vec![], vec![0]], usize::MAX);
@@ -2408,6 +2430,7 @@ mod projection_tests {
     fn a_memo_consumes_the_final_guard_of_the_memo_before_it() {
         let (mut first, _, _) = memo_over_stream();
         let (mut second, pulled, released) = memo_over_stream();
+        first.enter_consuming_mode();
         first.consume_impl(InputId::ONLY, ints().universal_guard());
         first.release(keys_between(0, 3));
         let handed = first.final_guard();
@@ -2416,6 +2439,7 @@ mod projection_tests {
             ints().universal_guard(),
             "the released keys are not handed on"
         );
+        second.enter_consuming_mode();
         second.consume_impl(InputId::ONLY, handed.clone());
         assert_eq!(*pulled.borrow(), vec![handed.clone()]);
         assert_eq!(*released.borrow(), vec![handed]);
@@ -2427,6 +2451,7 @@ mod projection_tests {
     #[test]
     fn consuming_nothing_pulls_nothing() {
         let (mut memo, pulled, _) = memo_over_stream();
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, ints().empty_guard());
         assert!(pulled.borrow().is_empty());
         assert!(int_entries(&memo.get(ints().universal_guard())).is_empty());
@@ -2757,6 +2782,7 @@ mod consuming_tests {
 
         notifier.notify(&region.projection());
         assert!(memo.arrivals.pending());
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, region.guard());
 
         assert!(!memo.arrivals.pending(), "the notification is taken");
@@ -2777,6 +2803,7 @@ mod consuming_tests {
         let (mut memo, mut notifier) = memo_over(&source);
         for region in [Keys(1, 2), Keys(7, 9)] {
             notifier.notify(&region.projection());
+            memo.enter_consuming_mode();
             memo.consume_impl(InputId::ONLY, region.guard());
         }
         assert_eq!(entries(&memo.cached_tile), rows_of([1, 2, 7, 8, 9]));
@@ -2801,6 +2828,7 @@ mod consuming_tests {
         let (mut memo, mut notifier) = memo_over(&source);
         for region in [Keys(2, 5), Keys(4, 8)] {
             notifier.notify(&region.projection());
+            memo.enter_consuming_mode();
             memo.consume_impl(InputId::ONLY, region.guard());
         }
         assert_eq!(entries(&memo.cached_tile), rows_of(2..=8));
@@ -2820,6 +2848,7 @@ mod consuming_tests {
         let source = source(0..10);
         let (mut memo, mut notifier) = memo_over(&source);
         notifier.notify(&Projection::Everything);
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, All.guard());
         assert_eq!(entries(&memo.cached_tile), rows_of(0..10));
         assert!(same_region(&statement(&memo), &Predicate::True));
@@ -2833,6 +2862,7 @@ mod consuming_tests {
         let (mut memo, mut notifier) = memo_over(&source);
         notifier.notify(&Projection::Nothing);
         assert!(!memo.arrivals.pending());
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, ints().empty_guard());
         assert!(source.borrow().pulled.is_empty());
         assert!(entries(&memo.cached_tile).is_empty());
@@ -2844,6 +2874,7 @@ mod consuming_tests {
     fn a_key_the_input_withheld_is_merged_by_a_later_consume() {
         let source = growing_source([0, 1, 2, 4, 5]);
         let (mut memo, _) = memo_over(&source);
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, Keys(0, 5).guard());
         let first = predicate(&source.borrow().released[0]);
         assert!(first.contains(&Value::UInt(2)));
@@ -2863,6 +2894,7 @@ mod consuming_tests {
     #[test]
     fn an_offer_at_a_region_never_consumed_states_nothing() {
         let (mut memo, _) = memo_over(&source(0..10));
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, Keys(0, 3).guard());
         let Tile::DataFunction {
             domain_predicate, ..
@@ -2879,6 +2911,7 @@ mod consuming_tests {
     fn a_consume_after_a_release_merges_nothing_released() {
         let source = source(0..10);
         let (mut memo, _) = memo_over(&source);
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, Keys(0, 3).guard());
         memo.release(Keys(0, 3).guard());
         memo.consume_impl(InputId::ONLY, Keys(0, 3).guard());
@@ -2891,11 +2924,13 @@ mod consuming_tests {
     #[test]
     fn final_guard_after_releasing_everything_or_every_key_is_exact() {
         let (mut memo, _) = memo_over(&source(0..10));
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, All.guard());
         memo.release(All.guard());
         assert_eq!(memo.final_guard(), ints().empty_guard());
 
         let (mut memo, _) = memo_over(&source(0..10));
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, All.guard());
         memo.release(Keys(0, KEYS - 1).guard());
         assert!(same_region(
@@ -2908,6 +2943,7 @@ mod consuming_tests {
     #[test]
     fn a_release_of_nothing_changes_nothing() {
         let (mut memo, _) = memo_over(&source(0..10));
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, All.guard());
         let before = (entries(&memo.cached_tile), memo.final_guard());
         memo.release(ints().empty_guard());
@@ -2923,6 +2959,7 @@ mod consuming_tests {
     fn final_guard_names_everything_consumed() {
         let source = source(0..10);
         let (mut memo, _) = memo_over(&source);
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, All.guard());
         assert_eq!(memo.final_guard(), ints().universal_guard());
     }
@@ -2932,6 +2969,7 @@ mod consuming_tests {
     fn final_guard_excludes_what_was_released() {
         let source = source(0..10);
         let (mut memo, _) = memo_over(&source);
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, All.guard());
         memo.release(keys_between(2, 3));
         let guard = memo.final_guard();
@@ -2951,6 +2989,7 @@ mod consuming_tests {
     fn final_guard_includes_rows_added_and_consumed_later_and_still_excludes_released_ones() {
         let source = source(0..6);
         let (mut memo, mut notifier) = memo_over(&source);
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, keys_between(0, 5));
         memo.release(keys_between(2, 3));
 
@@ -2970,6 +3009,7 @@ mod consuming_tests {
     fn final_guard_of_a_memo_over_an_empty_input_is_the_universe() {
         let source = source([]);
         let (mut memo, _) = memo_over(&source);
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, All.guard());
         assert!(entries(&memo.cached_tile).is_empty());
         assert_eq!(memo.final_guard(), ints().universal_guard());
@@ -2994,6 +3034,7 @@ mod consuming_tests {
         use crate::interpreter::tile_operators::growing::{NestedInput, nested_tiling};
         let mut memo =
             MemoProducer::over(Box::new(NestedInput::over(&source(0..4))), &nested_tiling());
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, nested_tiling().universal_guard());
         let released = TileGuard::Function(FunctionGuard::Codomain(Box::new(Keys(0, 1).guard())));
         memo.release(released.clone());
@@ -3018,6 +3059,7 @@ mod consuming_tests {
         let mut memo =
             MemoProducer::over(Box::new(NestedInput::over(&source(0..4))), &nested_tiling());
         push_to(&mut memo, &[1]);
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, nested_tiling().universal_guard());
         memo.release(TileGuard::Function(FunctionGuard::Codomain(Box::new(
             Keys(0, 1).guard(),
@@ -3066,6 +3108,7 @@ mod consuming_tests {
             Box::new(TestTileProducer::new(tile, tiling.clone())),
             &tiling,
         );
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, tiling.universal_guard());
         for last in 0..2 {
             memo.release(TileGuard::Function(FunctionGuard::Codomain(Box::new(
@@ -3113,6 +3156,7 @@ mod consuming_tests {
             Box::new(TestTileProducer::new(tile, tiling.clone())),
             &tiling,
         );
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, tiling.universal_guard());
         let first_field = TileGuard::Function(FunctionGuard::Codomain(Box::new(
             TileGuard::Record(HashMap::from([
@@ -3171,6 +3215,7 @@ mod consuming_tests {
             "the input's notification reaches the consumer"
         );
 
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, All.guard());
         sched.check_for_notifications();
         assert_eq!(
@@ -3207,6 +3252,7 @@ mod consuming_tests {
         // A pull of the memo reopens the gate the notification closed, as it does in a program.
         memo.base = ProducerBase::unowned(MemoProducer::alloc_id(), &ints()).sharing(gate);
 
+        memo.enter_consuming_mode();
         memo.consume_impl(InputId::ONLY, Keys(0, 1).guard());
         notifier.notify(&Keys(2, 3).projection());
         sched.check_for_notifications();
@@ -3264,7 +3310,8 @@ mod consuming_tests {
                 growing_source(initial.iter().copied()),
                 growing_source(initial.iter().copied()),
             );
-            let (consuming, consuming_notifier) = memo_over(&consuming_source);
+            let (mut consuming, consuming_notifier) = memo_over(&consuming_source);
+            consuming.enter_consuming_mode();
             let (lazy, lazy_notifier) = memo_over(&lazy_source);
             Self {
                 consuming,

@@ -110,6 +110,10 @@ impl Breaker for SinkBreaker {
         }
     }
 
+    /// A sink's breaker keeps no mode: it pulls its producer at each consume, in a dispatched run
+    /// only.
+    fn enter_consuming_mode(&mut self) {}
+
     fn finish(&mut self, pushes: &mut Pushes<'_>, last: bool) {
         let Hands::EachEpoch {
             answer: epoch,

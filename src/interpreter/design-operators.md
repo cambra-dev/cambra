@@ -847,6 +847,7 @@ the placement of the entry at an input, which a planner sets to that input's pip
 | Call | What it does |
 |---|---|
 | `consume_impl(input, guard)` | Pulls the input `input` at `guard`, a guard of the tiling the input answers, merges the answer into the breaker's state, and releases the input at the guard the answer states once it has taken delivery of the answer. The caller handles no tile. |
+| `enter_consuming_mode()` | Puts the breaker in consuming mode for a dispatched run, before its first `consume_impl`; nothing else changes the mode. |
 | `as_producer()` | The breaker as a `BreakingProducer`, or `None` for a breaker that is no producer. |
 | `finish(pushes, last)` | Finishes an epoch once the pipeline has consumed every package of it. The default pushes, through `as_producer`, what the breaker holds and no push named before, one morsel of its outermost keys per work package, through its consumer to the pipelines that read it; a breaker that is no producer pushes nothing. `last` says the epoch is the run's last, after which nothing calls the breaker. An empty guard pushes nothing. It wakes no one. |
 | `morsels(guard, rows)` | Cuts a guard the breaker pushes into morsels of at most `rows` held rows, which partition it. The default answers the guard whole. |
@@ -855,9 +856,12 @@ the placement of the entry at an input, which a planner sets to that input's pip
 
 An operator that consumes its input into state of its own is a breaker. One that answers pulls from
 that state is a producer; `SinkBreaker`, the breaker of a sink's pipeline and of the `main`
-output's, is one that is not. A breaker starts in the pull mode described in
-[The producer protocol](#the-producer-protocol) and is a consuming producer from its first
-`consume_impl`, which it stays. `final_guard` is provided over `held()`: it is `held()` less the
+output's, is one that is not. A breaker is in the pull mode described in
+[The producer protocol](#the-producer-protocol) for a whole run, or consuming for a whole run. A
+dispatched run puts every breaker it drives in consuming mode once its plan stands, before any
+package (`Breaker::enter_consuming_mode`), and a pull-mode run never does, so no consume changes the
+mode. A consuming breaker pulled before its first consume answers what it has consumed, which is
+nothing, and steps nothing. `final_guard` is provided over `held()`: it is `held()` less the
 guard released to the breaker, and the driver pushes the part of it no earlier push named, after
 each consume and at the epoch's `finish`. When a pipeline may finish an epoch is the dispatcher's to
 check ([The dispatcher](#the-dispatcher)). A release removes rows from the state and leaves the
@@ -1000,11 +1004,10 @@ the store only once the store's pipeline has finished the epoch ([The dispatcher
 or, over a live source, once every epoch has run. A store's `final_guard` is `held()`. A release of
 a store with no rows above it names the positions a reader reads no more and removes nothing from
 the store tile; a nested store's offer cuts the rows its readers released ([A loop in
-rounds](#a-loop-in-rounds)). A consuming store answers a pull from its snapshot. A store placed
-in a pipeline (`ProducerBase::is_placed`) answers a pull before its first consume with the unopened
-store, which states nothing final, and steps nothing: it steps only at its pipeline's consumes, and
-a transaction store's writers decide only against a tile it published. A store no planner placed
-steps itself at a pull, as pull mode does.
+rounds](#a-loop-in-rounds)). A consuming store answers a pull from its snapshot. Its first
+consume opens it, and a pull before that answers the unopened store, which states nothing final.
+It steps only at its pipeline's consumes, or its scope's. A transaction store's writers decide only
+against a tile it published. In pull mode a store steps itself at a pull.
 
 In pull mode an induction store releases its body whole once the body is terminal and every decision
 is stepped, and a transaction drive releases its source whole once it is done. A nested induction

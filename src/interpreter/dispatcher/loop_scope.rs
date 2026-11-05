@@ -463,6 +463,17 @@ impl Breaker for LoopScope {
         });
     }
 
+    /// Puts the store and every breaker of the scope's dispatcher in consuming mode, a nested
+    /// loop's scope among them.
+    fn enter_consuming_mode(&mut self) {
+        self.with_store(|store| store.enter_consuming_mode());
+        for (at, member) in self.members.iter().enumerate() {
+            reach_member(&self.store, member, PipelineId(at), &mut |breaker, _| {
+                breaker.enter_consuming_mode()
+            });
+        }
+    }
+
     fn input_tiling(&self, _: InputId) -> Tiling {
         self.with_store(|store| store.input_tiling(InputId::ONLY))
     }
@@ -629,7 +640,8 @@ mod tests {
                 store: stores[0].store().expect("the program subscribed its store"),
             });
             assert_eq!(planner.scopes.len(), 1, "an induction store runs in rounds");
-            let scope = planner.build_scope(0, usize::MAX, &mut Vec::new());
+            let mut scope = planner.build_scope(0, usize::MAX, &mut Vec::new());
+            scope.enter_consuming_mode();
             Self {
                 _ctx: ctx,
                 operators,
@@ -766,6 +778,8 @@ mod tests {
     #[test]
     fn a_drive_emits_only_the_position_its_package_names() {
         let compiled = Compiled::of(SUM);
+        // As the scope's first consume does: the drive reads its source, then the store opens.
+        compiled.scope.read_source();
         compiled.scope.with_store(|store| {
             let none = store.input_tiling(InputId::ONLY).empty_guard();
             store.consume_impl(InputId::ONLY, none);

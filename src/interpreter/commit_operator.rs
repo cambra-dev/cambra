@@ -812,8 +812,10 @@ struct BreakerState {
     /// The handle on the cyclic fan-out the store is the input of, whose cycle a consume has read
     /// again before each step and which it publishes each step's snapshot through.
     cycle: Option<Cycle>,
-    /// Whether a dispatcher drives the store, from its first consume; a pull then answers from
-    /// [`snapshot`](Self::snapshot) and steps nothing.
+    /// Whether a dispatched run drives the store, for the whole run
+    /// ([`Breaker::enter_consuming_mode`]); a pull then answers from
+    /// [`snapshot`](Self::snapshot), or the unopened store before the first consume, and steps
+    /// nothing.
     consuming: bool,
     /// The store as the last consumed step rendered it.
     snapshot: Option<Tile>,
@@ -847,7 +849,7 @@ impl BreakerState {
     fn offer(&self) -> Tile {
         self.snapshot
             .clone()
-            .expect("a store is consuming from its first consume, which renders it")
+            .expect("a consuming store's first consume renders it")
     }
 }
 
@@ -883,8 +885,13 @@ fn read_cycle_again(store: &mut dyn TileProducer, cycle: &Cycle) {
 
 /// Step `store` until its input `input` has released `guard`. Before each step the store has the
 /// operators inside its cycle read again ([`read_cycle_again`]), and after it publishes the
-/// snapshot a re-entrant pull reads. The first consume makes the store consuming with a step, so a
-/// pull answers from the snapshot from then on, whatever the morsel names.
+/// snapshot a re-entrant pull reads. The first consume opens the store with a step, so a pull
+/// answers from the snapshot from then on, whatever the morsel names.
+///
+/// # Panics
+///
+/// In a debug build, where the store is not in consuming mode
+/// ([`Breaker::enter_consuming_mode`]).
 ///
 /// A step wakes no reader outside the cycle. Such a reader is a pipeline, which takes what a step
 /// decides from the store's pushes, or an operator in pull mode inside the cycle of a loop around
@@ -914,10 +921,13 @@ fn consume_store<S: SteppedStore>(store: &mut S, input: InputId, guard: TileGuar
         cycle.publish(&tile);
         tile
     };
-    if !store.breaker().consuming {
-        // Consuming from before the first step, which a step reads: a consuming nested store
-        // releases its body by whole rows too, from its first step on.
-        store.breaker_mut().consuming = true;
+    debug_assert!(
+        store.breaker().consuming,
+        "{} consumes once a dispatched run has put it in consuming mode",
+        store.name()
+    );
+    // The first consume opens the store with a first step.
+    if store.breaker().snapshot.is_none() {
         let tile = step(store);
         store.breaker_mut().snapshot = Some(tile);
     }
@@ -999,6 +1009,10 @@ impl Breaker for InductionStoreProducer {
     /// As [`consume_store`].
     fn consume_impl(&mut self, input: InputId, guard: TileGuard) {
         consume_store(self, input, guard);
+    }
+
+    fn enter_consuming_mode(&mut self) {
+        self.breaker.consuming = true;
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
@@ -1140,6 +1154,10 @@ impl Breaker for CommitProducer {
 
     fn inputs(&self) -> usize {
         self.writer_producers.len()
+    }
+
+    fn enter_consuming_mode(&mut self) {
+        self.breaker.consuming = true;
     }
 
     /// Steps the store until writer `input`'s drive has released `guard` ([`consume_store`]).
@@ -2589,13 +2607,13 @@ impl TileProducer for CommitProducer {
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         if self.breaker.consuming {
+            // The store opens at its first consume, and its writers decide only against a tile
+            // it published, so a pull before then answers the unopened store, which states
+            // nothing final.
+            if self.breaker.snapshot.is_none() {
+                return CommitEngine::unopened().render_full_store_tile(self.tiling());
+            }
             return self.offer_impl(projection_guard);
-        }
-        // A store placed in a pipeline steps at its pipeline's consumes, and its writers decide
-        // only against a tile it published, so a pull before the first consume answers the
-        // unopened store, which states nothing final.
-        if self.base.is_placed() {
-            return CommitEngine::unopened().render_full_store_tile(self.tiling());
         }
         let store = self.drain();
         self.notifier.notify_if_changed(store)
@@ -3090,7 +3108,6 @@ impl CommitProducer {
     /// nothing. That last pull finds each writer terminal: its drive is done once the store has
     /// let go of all its items.
     fn settle_in_key_order(&mut self) {
-        self.breaker.consuming = true;
         self.taking_ahead = true;
         if !self.open_store() {
             return;
@@ -3947,16 +3964,16 @@ impl TileProducer for InductionStoreProducer {
 
     fn get_impl(&mut self, projection_guard: TileGuard) -> Tile {
         if self.breaker.consuming {
+            // The store opens at its first consume, so a pull before then answers the unopened
+            // store, which states nothing final.
+            if self.breaker.snapshot.is_none() {
+                return render_engines(
+                    &Engines::unopened(self.tiling()),
+                    self.tiling(),
+                    &self.complete_rows,
+                );
+            }
             return self.offer_impl(projection_guard);
-        }
-        // A store placed in a pipeline steps at its pipeline's consumes, so a pull before the
-        // first answers the unopened store, which states nothing final.
-        if self.base.is_placed() {
-            return render_engines(
-                &Engines::unopened(self.tiling()),
-                self.tiling(),
-                &self.complete_rows,
-            );
         }
         let store = self.step();
         self.notifier.notify_if_changed(store)
@@ -6324,8 +6341,9 @@ struct InductionDriverProducer {
     /// store's frontier enters that row, for the check that the reseed is the store's seed
     /// there. Checked once per row, so it costs a seed read per row.
     reseeded: Option<(Path, Vec<Value>)>,
-    /// Whether a dispatcher drives the drive as a pipeline breaker, from its first consume; a
-    /// pull then answers from [`rendered`](Self::rendered) and emits nothing.
+    /// Whether a dispatched run drives the drive as a pipeline breaker, for the whole run
+    /// ([`Breaker::enter_consuming_mode`]); a pull then answers from
+    /// [`rendered`](Self::rendered) and emits nothing.
     consuming: bool,
     /// What the last consume rendered.
     rendered: Tile,
@@ -6521,7 +6539,11 @@ impl Breaker for InductionDriverProducer {
     /// One step at `guard`, emitting a position only inside the region it names: a drive with
     /// rows above it is asked for a path of every level.
     fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
-        self.consuming = true;
+        debug_assert!(
+            self.consuming,
+            "{} consumes once a dispatched run has put it in consuming mode",
+            self.name()
+        );
         let asked = guard.projection_for(self);
         // A consume at no position is a loop's scope asking the drive to read its source: the
         // source of a loop nested in another is read through pipelines of the scope around it,
@@ -6530,6 +6552,10 @@ impl Breaker for InductionDriverProducer {
             self.source_news.mark();
         }
         self.rendered = self.step(&asked);
+    }
+
+    fn enter_consuming_mode(&mut self) {
+        self.consuming = true;
     }
 
     /// The source's tiling, which the entry in front of the source and the drive's release of the
