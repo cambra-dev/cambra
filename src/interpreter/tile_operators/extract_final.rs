@@ -154,10 +154,11 @@ impl ExtractFinalProducer {
         let Tile::DataFunction { codomain, .. } = source else {
             panic!("ExtractFinal source must be a collection tile");
         };
-        if codomain.is_data_function() {
-            // That key's group, taken out on its own, is the value at this position. Every
-            // level's predicates are restated over the group's own paths: a level beneath
-            // the group's own still names the indexed key in its enclosing paths.
+        if codomain.holds_a_level() {
+            // That key's group, taken out on its own, is the value at this position, and a
+            // variant or a record holding a collection is that key's row taken out the same
+            // way. Every level's predicates are restated over the group's own paths: a level
+            // beneath the group's own still names the indexed key in its enclosing paths.
             source
                 .group_at(CurryLevel::new(1), final_idx)
                 .expect("a live row of the source has a group")
