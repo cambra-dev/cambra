@@ -232,6 +232,40 @@ impl Consumer for Widening {
     }
 }
 
+/// `consumer` behind a consumer that widens like [`widening`] except for a decided region, which it
+/// passes as `restate` names it: the region of the operator's keys each of whose values the input
+/// region decides. An operator that re-keys its input knows which of its keys an input key
+/// contributes to, as `Uncurry` pairs an outer key with each inner key beneath it, so a decided
+/// region of its input decides that region of its own keys, which [`widening`] would hold back
+/// until the input is wholly decided.
+pub fn widening_restating_decided(
+    restate: fn(&Projection) -> Projection,
+    consumer: Box<dyn Consumer>,
+) -> Box<dyn Consumer> {
+    Box::new(WideningRestatingDecided(restate, consumer))
+}
+
+struct WideningRestatingDecided(fn(&Projection) -> Projection, Box<dyn Consumer>);
+
+impl Consumer for WideningRestatingDecided {
+    fn notify(&mut self, _arrived: &Projection) {
+        self.1.notify(&Projection::Everything);
+    }
+
+    fn push(&mut self, region: &Projection, landing: &mut Landing<'_>) {
+        match region {
+            Projection::Everything => self.1.push(region, landing),
+            _ if landing.is_decided() => self.1.push(&(self.0)(region), landing),
+            _ => landing.widened(|landing| self.1.push(&Projection::Everything, landing)),
+        }
+    }
+
+    /// A change widens, so the path widens.
+    fn route(&mut self, routes: &mut Routes) {
+        routes.widened(|routes| self.1.route(routes));
+    }
+}
+
 /// `consumer` behind a consumer that forwards each notification as the same keys under `tag`
 /// ([`Projection::tagged`]): an arm of a tagged union passes this to the arm's input, since
 /// the union's outermost keys are each arm's keys under the arm's tag.

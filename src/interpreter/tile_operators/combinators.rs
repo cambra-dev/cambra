@@ -770,8 +770,14 @@ impl TileOperator for Uncurry {
         scheduler: &mut Scheduler,
     ) -> Box<dyn TileProducer> {
         // Beneath standing levels the input's outermost keys are the result's; pairing the whole
-        // tile re-keys.
-        let keeps_keys = self.level != CurryLevel::OUTERMOST;
+        // tile re-keys, and an outer key decides every pair whose first field it is.
+        let consumer = match self.level == CurryLevel::OUTERMOST {
+            true => crate::interpreter::scheduler::widening_restating_decided(
+                pairs_of_outer_keys,
+                consumer,
+            ),
+            false => consumer,
+        };
         Box::new(UncurryProducer {
             base: ProducerBase::new(
                 UncurryProducer::alloc_id(),
@@ -779,14 +785,54 @@ impl TileOperator for Uncurry {
                 &self.base,
                 scheduler,
             ),
-            input: self.input.subscribe(
-                self.tiling().universal_guard(),
-                consumer_keeping_keys_if(keeps_keys, consumer),
-                scheduler,
-            ),
+            input: self
+                .input
+                .subscribe(self.tiling().universal_guard(), consumer, scheduler),
             level: self.level,
             empty_pair: self.tiling().values_at(self.level).empty_at_no_rows(),
         })
+    }
+}
+
+/// The pairs an outermost `Uncurry` makes of the keys `region` names: every pair whose first field
+/// is an outer key it names, or, for inner keys, every pair of an inner key it names under an
+/// outer key it names them under.
+///
+/// # Panics
+///
+/// Where `region` names keys deeper than the inner level, which no `Uncurry` input of two levels
+/// has.
+fn pairs_of_outer_keys(region: &Projection) -> Projection {
+    fn pairs(level: CurryLevel, keys: &Predicate) -> Predicate {
+        let field = |at: usize, keys: &Predicate| (tuple_field(at), keys.clone());
+        match keys {
+            _ if level == CurryLevel::OUTERMOST => {
+                Predicate::Record(HashMap::from([field(0, keys), field(1, &Predicate::True)]))
+            }
+            Predicate::Or(arms) => {
+                Predicate::Or(arms.iter().map(|arm| pairs(level, arm)).collect())
+            }
+            Predicate::Qualified { enclosing, here } => {
+                Predicate::Record(HashMap::from([field(0, enclosing), field(1, here)]))
+            }
+            unqualified => Predicate::Record(HashMap::from([
+                field(0, &Predicate::True),
+                field(1, unqualified),
+            ])),
+        }
+    }
+    match region {
+        Projection::Keys { level, keys } => {
+            assert!(
+                level.index() <= 1,
+                "an outermost Uncurry pairs two levels; a region names keys at {level:?}"
+            );
+            Projection::Keys {
+                level: CurryLevel::OUTERMOST,
+                keys: pairs(*level, keys),
+            }
+        }
+        whole_or_none => whole_or_none.clone(),
     }
 }
 
