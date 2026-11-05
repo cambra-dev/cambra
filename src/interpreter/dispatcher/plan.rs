@@ -512,19 +512,33 @@ fn run_targets(
                 // names.
                 if matches!(notifies, Notifies::Arrivals) {
                     let everything = Projection::Everything;
+                    // The region of the pipeline's input its live ranges bring.
+                    let arrived_region = leaves
+                        .iter()
+                        .flat_map(|leaf| {
+                            probe(&leaf.consumer, PipelineId(pipeline), &everything, pipeline)
+                        })
+                        .fold(input.empty_guard(), |region, arrival| {
+                            region.union(&arrival.guard)
+                        });
                     for &read in &members.reads[pipeline] {
                         let (pusher, keyed) = end_of(PipelineId(read))
                             .unwrap_or_else(|| pushing_end(&mut reach, PipelineId(read)));
                         // A keyed breaker's push arrives as keys along a route that keeps them. A
-                        // breaker of one value pushes `Everything`, which reaches the input whole
-                        // where every row reads that value.
+                        // breaker of one value brings rows where its push names rows no arrival
+                        // brings, as a let-bound record's collection field does; where it names
+                        // only rows the arrivals bring, those rows read it, and wait parked for its
+                        // decided push.
                         let as_keys = match keyed {
                             true => routes_to(&pusher, pipeline)
                                 .iter()
                                 .any(|route| route.keeps_keys),
                             false => probe(&pusher, PipelineId(read), &everything, pipeline)
                                 .iter()
-                                .any(|arrival| !arrival.guard.is_universal()),
+                                .any(|arrival| {
+                                    !arrival.guard.is_universal()
+                                        && !guard_minus(&arrival.guard, &arrived_region).is_empty()
+                                }),
                         };
                         // A pipeline whose pushes arrive as this one's keys brings rows no
                         // arrival names, so each of its pushes queues the rows it names.
@@ -776,9 +790,12 @@ pub(super) fn plan_edges(
         }
         if arrivals[reader] {
             match kinds[reader] {
+                // A pipeline that pushes takes each delivery, parked until the pipelines it reads
+                // have decided it.
                 Consumes::Pushes => {
-                    dispatcher.take_arrivals(PipelineId(reader));
-                    planned[reader].open = true;
+                    dispatcher.take_arrivals_after_reads(PipelineId(reader));
+                    dispatcher.park(PipelineId(reader));
+                    planned[reader].held = true;
                 }
                 // A store or a loop's scope over a live source takes each delivery once the
                 // pipelines it reads have finished the epoch, which it follows (below), so it
@@ -826,6 +843,7 @@ pub(super) fn plan_edges(
         // Per breaker whose routes were read, the record of pushes its pipelines share
         // (`pushes_with`), and its edge.
         let mut seen: Vec<(usize, Edge)> = Vec::new();
+        let read_all = read;
         for &read in read {
             // A nested loop's scope pushes its store once it is terminal, at the run's last epoch,
             // so a reader inside the cycle around it waits for its finish of each round instead.
@@ -857,6 +875,21 @@ pub(super) fn plan_edges(
                 Edge::Stream
             };
             seen.push((pushes_with[read], edge));
+            // A read along a route reaches what a push of its every key, wholly decided, lands
+            // as: a row elsewhere waits for nothing of it. One read by pull reaches all of it.
+            if !matches!(edge, Edge::Unreached) {
+                let region = decided_reach(&pusher, PipelineId(read), reader)
+                    .iter()
+                    .fold(input.empty_guard(), |region, arrival| {
+                        region.union(&arrival.guard)
+                    });
+                for &shared in read_all
+                    .iter()
+                    .filter(|&&r| pushes_with[r] == pushes_with[read])
+                {
+                    dispatcher.reaches(PipelineId(reader), PipelineId(shared), region.clone());
+                }
+            }
             match edge {
                 Edge::Unreached => unreached = true,
                 Edge::Widened => {
@@ -914,9 +947,9 @@ pub(super) fn plan_edges(
             dispatcher.follow(PipelineId(reader), PipelineId(follow));
             planned[reader].follows.push(follow);
         }
-        if opens && !planned[reader].open && (!apart || !widened.is_empty()) {
-            dispatcher.keep_open_rows(PipelineId(reader));
-            planned[reader].open = true;
+        if opens && !planned[reader].held && (!apart || !widened.is_empty()) {
+            dispatcher.park(PipelineId(reader));
+            planned[reader].held = true;
         }
         if !arrivals[reader] && !left.is_empty() {
             planned[reader].started = true;
@@ -1037,6 +1070,24 @@ pub(super) fn probe(
 ) -> Vec<Arrival> {
     let mut landing = Landing::probe(from);
     consumer.borrow_mut().push(region, &mut landing);
+    landing
+        .arrivals()
+        .into_iter()
+        .filter(|arrival| arrival.pipeline.0 == reader)
+        .collect()
+}
+
+/// The region of `reader`'s input a push of `from`'s every key reaches through `consumer` when
+/// it is restated as a wholly decided region is: all `from` can ever decide of that input.
+pub(super) fn decided_reach(
+    consumer: &SharedConsumer,
+    from: PipelineId,
+    reader: usize,
+) -> Vec<Arrival> {
+    let mut landing = Landing::probe_decided(from);
+    consumer
+        .borrow_mut()
+        .push(&Projection::Everything, &mut landing);
     landing
         .arrivals()
         .into_iter()

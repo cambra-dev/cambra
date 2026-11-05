@@ -417,8 +417,8 @@ fn a_group_by() {
     assert!(
         planned
             .iter()
-            .any(|plan| plan.name.starts_with("Memo") && !plan.whole && plan.open),
-        "the group-by's memo keeps open rows: {planned:?}"
+            .any(|plan| plan.name.starts_with("Memo") && !plan.whole && plan.held),
+        "the group-by's memo parks its rows: {planned:?}"
     );
 }
 
@@ -437,7 +437,7 @@ fn a_sum_over_two_concatenated_comprehensions() {
     assert!(
         planned.iter().any(|plan| plan.name.starts_with("Aggregate")
             && !plan.whole
-            && !plan.open
+            && !plan.held
             && !plan.started),
         "the sum reads both arms' pushes: {planned:?}"
     );
@@ -471,8 +471,8 @@ fn a_comprehension_reading_a_sum(#[values(1, usize::MAX)] rows: usize) {
         rows,
     );
     assert!(
-        planned.iter().any(|plan| plan.open) && !planned.iter().any(|plan| plan.whole),
-        "the outer sum keeps open rows, and no pipeline reads its input whole: {planned:?}"
+        planned.iter().any(|plan| plan.held) && !planned.iter().any(|plan| plan.whole),
+        "the outer sum parks its rows, and no pipeline reads its input whole: {planned:?}"
     );
 }
 
@@ -487,7 +487,7 @@ fn a_sink_reads_the_pushes_of_a_values_output_memo() {
     answers(source, "3", &["Memo", "SinkBreaker"]);
     let (_, planned) = dispatched(source, 1);
     let sink = sink_of(&planned);
-    assert!(!sink.whole && !sink.open, "{sink:?}");
+    assert!(!sink.whole && !sink.held, "{sink:?}");
 }
 
 /// The sink of a collection reads the pushes of the collection's output memo.
@@ -501,7 +501,7 @@ fn a_sink_of_a_collection() {
     answers(source, "Function [ 2, 3, 4 ]", &["Memo", "SinkBreaker"]);
     let (_, planned) = dispatched(source, 1);
     let sink = sink_of(&planned);
-    assert!(!sink.whole && !sink.open, "{sink:?}");
+    assert!(!sink.whole && !sink.held, "{sink:?}");
 }
 
 /// Two sinks each run as a pipeline of their own, and the program is done once both are.
@@ -2154,8 +2154,8 @@ fn a_let_bound_map_over_a_live_source(#[values(1, usize::MAX)] rows: usize) {
     assert!(
         planned
             .iter()
-            .any(|plan| !plan.live && !plan.whole && plan.open && plan.name.starts_with("Memo")),
-        "the feed's `Memo` keeps open rows: {planned:?}"
+            .any(|plan| !plan.live && !plan.whole && plan.held && plan.name.starts_with("Memo")),
+        "the feed's `Memo` parks its rows: {planned:?}"
     );
 }
 
@@ -2370,8 +2370,8 @@ fn a_reader_of_a_live_source_and_a_pipeline(#[values(1, usize::MAX)] rows: usize
     );
     assert_eq!(value, Value::Int(30));
     assert!(
-        planned.iter().any(|plan| plan.live && plan.open),
-        "the pipeline over the source keeps open rows: {planned:?}"
+        planned.iter().any(|plan| plan.live && plan.held),
+        "the pipeline over the source parks its rows: {planned:?}"
     );
 }
 
@@ -2646,9 +2646,9 @@ fn a_filter_over_a_live_source_reading_a_sum(
     assert!(
         planned.iter().any(|plan| plan.live
             && !plan.whole
-            && plan.open
+            && plan.held
             && plan.name.starts_with("SinkBreaker")),
-        "the `main` output's pipeline takes arrivals and keeps open rows: {planned:?}"
+        "the `main` output's pipeline takes arrivals and parks them: {planned:?}"
     );
 }
 
@@ -2672,11 +2672,11 @@ fn readers_over_a_live_pipeline_keep_open_rows(#[values(1, usize::MAX)] rows: us
     assert!(
         planned
             .iter()
-            .any(|plan| plan.open && plan.name.starts_with("MapAggregate")),
-        "the per-row sum keeps open rows: {planned:?}"
+            .any(|plan| plan.held && plan.name.starts_with("MapAggregate")),
+        "the per-row sum parks its rows: {planned:?}"
     );
     assert_eq!(
-        planned.iter().filter(|plan| plan.open).count(),
+        planned.iter().filter(|plan| plan.held).count(),
         3,
         "the two memos and the sum keep open rows: {planned:?}"
     );
@@ -2723,8 +2723,8 @@ fn a_sum_over_rows_carrying_a_constant_reading_a_live_list(
     assert!(
         planned
             .iter()
-            .any(|plan| plan.open && plan.name.starts_with("MapAggregate")),
-        "the per-row sum keeps open rows: {planned:?}"
+            .any(|plan| plan.held && plan.name.starts_with("MapAggregate")),
+        "the per-row sum parks its rows: {planned:?}"
     );
 }
 
@@ -2787,8 +2787,8 @@ fn a_filter_over_a_live_source_reading_a_sum_into_a_sink(#[values(1, usize::MAX)
     assert!(
         planned
             .iter()
-            .any(|plan| plan.live && plan.whole && plan.open),
-        "a pipeline over the source reads it whole and keeps open rows: {planned:?}"
+            .any(|plan| plan.live && plan.whole && plan.held),
+        "a pipeline over the source reads it whole and parks its rows: {planned:?}"
     );
 }
 
