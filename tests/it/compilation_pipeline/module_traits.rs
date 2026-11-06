@@ -35,7 +35,7 @@ const SHAPES: &str = indoc! {"
 fn stateful_shapes() -> String {
     formatdoc! {"
         {SHAPES}
-        visits := 0
+        visits: Mut(Int, Txn) := 0
     "}
 }
 
