@@ -2041,6 +2041,22 @@ impl TypedExpr {
         .with_ty(result_ty)
     }
 
+    /// [`Self::lambda`] whose parameter is declared `annotation` ([`TypedBinding::declare`]).
+    pub fn lambda_declared(
+        param: impl Into<Name>,
+        occurrence: Occurrence,
+        param_ty: Type,
+        annotation: Annotation,
+        body: TypedExpr,
+    ) -> Self {
+        let mut lambda = Self::lambda(param, occurrence, param_ty, body);
+        let TypedExprNode::Lambda { param, .. } = &mut lambda.node else {
+            unreachable!("`lambda` builds a lambda")
+        };
+        param.declare(annotation);
+        lambda
+    }
+
     /// Construct a [`TypedExprNode::VariantCtor`] node.
     ///
     /// Produces a singleton variant value at the inference layer. Width-

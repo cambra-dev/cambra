@@ -166,13 +166,26 @@ pub(super) fn lower_call(
             let entries = lower_expr(&args[0], ctx)?;
             // The key morphism is the first projection, written as a λ for the same
             // reason `set`'s identity is: a bare `Proj` would leave the key type to be
-            // pinned from outside.
+            // pinned from outside. Its parameter is declared a pair: an entry is a key and a
+            // value, and the projections alone would read only an open tuple, which a wider
+            // entry fits and an empty literal leaves at no width. The declaration stands in
+            // for `map`'s own parameter type (`src/ccl/design/collections.md`, "A map's entry
+            // is declared a pair by lowering [Interim]").
             let sc = "lower.map";
             let kv_var = ctx.tag_machinery(Expr::var("__map_kv"), func.span, sc);
             let key_proj = ctx.tag_machinery(Expr::proj_index(0), func.span, sc);
             let key_read = ctx.tag_machinery(Expr::apply(kv_var, key_proj), func.span, sc);
             let fst_key = ctx.tag_machinery(
-                Expr::lambda("__map_kv", Occurrence::mint(), Type::Hole, key_read),
+                Expr::lambda_declared(
+                    "__map_kv",
+                    Occurrence::mint(),
+                    Type::Hole,
+                    crate::ccl::Annotation::new(
+                        Type::tuple(vec![Type::Hole, Type::Hole]),
+                        Occurrence::mint(),
+                    ),
+                    key_read,
+                ),
                 func.span,
                 sc,
             );

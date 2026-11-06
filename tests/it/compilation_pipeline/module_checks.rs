@@ -928,6 +928,11 @@ fn checking_a_file_reports_its_type_errors_past_another_error(
 #[rstest]
 #[timeout(Duration::from_secs(10))]
 #[case::mixed_values("m = map([(1, 2), (2, \"a\")])", "have no common type")]
+#[case::a_wide_entry(
+    "m = map([(1, 10, 100)])",
+    "tuples of different widths are different types"
+)]
+#[case::an_entry_that_is_no_tuple("m = map([1, 2])", "expected {‹?1›, ‹?2›}, found Int")]
 fn checking_a_file_reports_a_re_keying_constructor_s_error(
     #[case] source: &str,
     #[case] reported: &str,

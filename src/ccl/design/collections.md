@@ -141,6 +141,26 @@ not an implemented replacement for `empty_map()`. The decided nominal `Set` and 
 with the two values `Set::empty` and `Map::empty`; see
 [Telling `Set` and `Map` apart](#telling-set-and-map-apart-decided).
 
+### A map's entry is declared a pair by lowering [Interim]
+
+`map(kvs)` keys each entry by `λ __map_kv → __map_kv.0`, and lowering declares that λ's parameter
+a pair, `{_, _}` (`lower/exprs.rs`). The projection alone constrains an entry only to an open
+tuple, which a wider entry fits, so `map([(1, 10, 100)])` would key by the first component and
+drop the third. `a_map_entry_is_a_pair` pins the refusal of widths 1 and 3.
+
+The requirement belongs to `map`'s own type, as the parameter annotation
+`entries: _ |=> {K, V}`. A `def` states it today: `def mk(kvs: _ |=> {_, _}): map(kvs)` refuses a
+3-wide entry at the call. `map` cannot be declared that way yet, for two reasons:
+
+- Its result type has no CHL spelling. The key domain is a membership predicate over
+  `entries ≫ .0`, and CHL has no `in`.
+- `m[k]` on a map a `def` returns is unsupported: "Reaching a collection through a *parameter*
+  is not supported yet".
+
+Once both hold, `map` is a `@Builtin def` in `std` with that signature
+([9.16 The std root](../../../docs/chl-spec.md#916-the-std-root), the builtins in the prelude), and
+lowering declares nothing.
+
 ## The collection type is declared, not read off the shape
 
 The planned operation interface selects an iteration element by collection type: values for

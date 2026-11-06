@@ -362,13 +362,21 @@ fn uncurry_params_inner(
     // lowering's own: no one place in the source writes it, so it records where the function
     // is tagged.
     let arity = Type::tuple(vec![Type::Hole; params.len()]);
-    let mut lam = Expr::lambda(tuple_name, Occurrence::mint(), arity, body_with_subs);
-    if elem_anns.iter().any(|t| !matches!(t, Type::Hole))
-        && let TypedExprNode::Lambda { param, .. } = &mut lam.node
-    {
-        param.declare(Annotation::new(Type::tuple(elem_anns), Occurrence::mint()));
+    if elem_anns.iter().all(|t| matches!(t, Type::Hole)) {
+        return Ok(Expr::lambda(
+            tuple_name,
+            Occurrence::mint(),
+            arity,
+            body_with_subs,
+        ));
     }
-    Ok(lam)
+    Ok(Expr::lambda_declared(
+        tuple_name,
+        Occurrence::mint(),
+        arity,
+        Annotation::new(Type::tuple(elem_anns), Occurrence::mint()),
+        body_with_subs,
+    ))
 }
 
 /// Whether [`uncurry_params`] curries `params` into one lambda each
