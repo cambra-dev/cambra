@@ -52,9 +52,27 @@ use panic_message::panic_message;
 /// outside this list and [`UNDEFINED`] to agreement and every cell here to its kind, so a fix
 /// that makes one agree removes it, and a cell that starts failing another way fails the grid.
 const BROKEN: &[(&str, &str, &str)] = &[
+    ("groups2_comp", "coll_max[g1]", "CompilerRejects"),
+    ("groups2_comp", "coll_sum[g1]", "CompilerRejects"),
+    ("groups3_comp", "coll_max[g1]", "CompilerRejects"),
+    ("groups3_comp", "coll_max[g2]", "CompilerRejects"),
+    ("groups3_comp", "coll_sum[g1]", "CompilerRejects"),
+    ("groups3_comp", "coll_sum[g2]", "CompilerRejects"),
+    ("groups3_source", "coll_boxed[g1]", "CompilerRejects"),
+    ("groups3_source", "coll_filtered[g1]", "CompilerRejects"),
+    ("groups3_source", "coll_mapped[g1]", "CompilerRejects"),
+    ("groups3_source", "cond_coll", "CompilerPanics"),
+    ("groups3_source", "dup_union", "CompilerRejects"),
+    ("groups3_source", "union", "CompilerRejects"),
     ("loop_source_in_loop", "cond_coll", "CompilerPanics"),
     ("loop_source_in_loop", "dup_union", "CompilerRejects"),
     ("loop_source_in_loop", "union", "CompilerRejects"),
+    ("nested3_mut_source", "cond_coll", "CompilerPanics"),
+    ("nested3_mut_source", "dup_union", "CompilerRejects"),
+    ("nested3_mut_source", "generator_coll", "CompilerPanics"),
+    ("nested3_mut_source", "map_arrow", "InterpreterGap"),
+    ("nested3_mut_source", "map_lit", "InterpreterGap"),
+    ("nested3_mut_source", "union", "CompilerRejects"),
     ("nested_mut_source", "cond_coll", "CompilerPanics"),
     ("nested_mut_source", "dup_union", "CompilerRejects"),
     ("nested_mut_source", "generator_coll", "CompilerPanics"),
@@ -833,6 +851,94 @@ fn skeletons() -> Vec<Skeleton> {
             out = test_sink()
             out << acc
         "#}},
+        // Three levels deep: each skeleton above that nests two constructs, nested in a third, the
+        // hole reading every binder. A rule written for the levels it was tested at shows here.
+        Skeleton { name: "nested3_mut_write_rhs", hole: Ty::Int, scope: &[("i", Ty::Int), ("j", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"
+            acc := 0
+            for i in [1, 2]:
+                for j in [1, 2]:
+                    for q in [1, 2, 3]:
+                        acc := acc + {}
+            out = test_sink()
+            out << acc
+        "#}},
+        Skeleton { name: "nested3_mut_source", hole: Ty::IntColl, scope: &[("i", Ty::Int), ("j", Ty::Int)], body: indoc! {r#"
+            acc := 0
+            for i in [1, 2]:
+                for j in [1, 2]:
+                    for q in {}:
+                        acc := acc + q
+            out = test_sink()
+            out << acc
+        "#}},
+        Skeleton { name: "nested3_comp_sum", hole: Ty::Int, scope: &[("i", Ty::Int), ("j", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            out << sum([sum([sum([{} for q in [1, 2, 3]]) for j in [1, 2]]) for i in [1, 2]])
+        "#}},
+        Skeleton { name: "nested3_comp_source", hole: Ty::IntColl, scope: &[("i", Ty::Int), ("j", Ty::Int)], body: indoc! {r#"
+            out = test_sink()
+            out << sum([sum([sum([q for q in {}]) for j in [1, 2]]) for i in [1, 2]])
+        "#}},
+        Skeleton { name: "nested3_loop_feed", hole: Ty::Int, scope: &[("i", Ty::Int), ("j", Ty::Int), ("q", Ty::Int)], body: indoc! {r#"
+            ch: Feed(_)
+            for i in [1, 2]:
+                for j in [1, 2]:
+                    for q in [10, 20]:
+                        ch << {}
+            out = test_sink()
+            out << sum([v for v in ch])
+        "#}},
+        // Loops over the groups of a `groupby`, each binding a group the hole may read. They feed
+        // rather than accumulate: a write outliving an iteration needs the loop's order, which a
+        // loop over a grouping does not define yet (`docs/chl-spec.md`, "Accumulator iteration
+        // order is not yet defined [Open]").
+        Skeleton { name: "groups1_loop", hole: Ty::Int, scope: &[("g1", Ty::IntColl)], body: indoc! {r#"
+            g = groupby([1, 2, 3, 4, 5], \x -> x > 2)
+            ch: Feed(_)
+            for g1 in g:
+                ch << {}
+            out = test_sink()
+            out << sum([v for v in ch])
+        "#}},
+        Skeleton { name: "groups2_loop", hole: Ty::Int, scope: &[("g1", Ty::IntColl), ("g2", Ty::IntColl)], body: indoc! {r#"
+            g = groupby([1, 2, 3, 4, 5], \x -> x > 2)
+            ch: Feed(_)
+            for g1 in g:
+                for g2 in g:
+                    ch << {}
+            out = test_sink()
+            out << sum([v for v in ch])
+        "#}},
+        Skeleton { name: "groups3_loop", hole: Ty::Int, scope: &[("g1", Ty::IntColl), ("g2", Ty::IntColl), ("g3", Ty::IntColl)], body: indoc! {r#"
+            g = groupby([1, 2, 3, 4, 5], \x -> x > 2)
+            ch: Feed(_)
+            for g1 in g:
+                for g2 in g:
+                    for g3 in g:
+                        ch << {}
+            out = test_sink()
+            out << sum([v for v in ch])
+        "#}},
+        Skeleton { name: "groups2_comp", hole: Ty::Int, scope: &[("g1", Ty::IntColl), ("g2", Ty::IntColl)], body: indoc! {r#"
+            g = groupby([1, 2, 3, 4, 5], \x -> x > 2)
+            out = test_sink()
+            out << sum([sum([{} for g2 in g]) for g1 in g])
+        "#}},
+        Skeleton { name: "groups3_comp", hole: Ty::Int, scope: &[("g1", Ty::IntColl), ("g2", Ty::IntColl), ("g3", Ty::IntColl)], body: indoc! {r#"
+            g = groupby([1, 2, 3, 4, 5], \x -> x > 2)
+            out = test_sink()
+            out << sum([sum([sum([{} for g3 in g]) for g2 in g]) for g1 in g])
+        "#}},
+        Skeleton { name: "groups3_source", hole: Ty::IntColl, scope: &[("g1", Ty::IntColl), ("g2", Ty::IntColl)], body: indoc! {r#"
+            g = groupby([1, 2, 3, 4, 5], \x -> x > 2)
+            ch: Feed(_)
+            for g1 in g:
+                for g2 in g:
+                    for q in {}:
+                        ch << q
+            out = test_sink()
+            out << sum([v for v in ch])
+        "#}},
         // The inner source is the outer element, so each enclosing position has its own domain.
         Skeleton { name: "nested_mut_over_row", hole: Ty::Int, scope: &[("x", Ty::Int)], body: indoc! {r#"
             acc := 0
@@ -1113,6 +1219,12 @@ fn fillers() -> Vec<Filler> {
 
         // --- integer collections, including the empty and duplicated edges
         Filler { name: "list_lit", ty: Ty::IntColl, needs: &[], decls: "", expr: "[1, 2, 3]" },
+        // Readings of a collection the skeleton binds: a group of a `groupby` a loop is over.
+        Filler { name: "coll_sum", ty: Ty::Int, needs: &[Ty::IntColl], decls: "", expr: "sum({b})" },
+        Filler { name: "coll_max", ty: Ty::Int, needs: &[Ty::IntColl], decls: "", expr: "max({b})" },
+        Filler { name: "coll_mapped", ty: Ty::IntColl, needs: &[Ty::IntColl], decls: "", expr: "[u + 1 for u in {b}]" },
+        Filler { name: "coll_filtered", ty: Ty::IntColl, needs: &[Ty::IntColl], decls: "", expr: "[u for u in {b} if u > 1]" },
+        Filler { name: "coll_boxed", ty: Ty::IntColl, needs: &[Ty::IntColl], decls: "", expr: "box({b})" },
         Filler { name: "singleton", ty: Ty::IntColl, needs: &[], decls: "", expr: "[7]" },
         Filler { name: "all_filtered", ty: Ty::IntColl, needs: &[], decls: "", expr: "[z for z in [1, 2, 3] if z > 99]" },
         Filler { name: "comp", ty: Ty::IntColl, needs: &[], decls: "", expr: "[z * 2 for z in [1, 2, 3]]" },
