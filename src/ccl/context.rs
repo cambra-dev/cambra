@@ -2142,7 +2142,13 @@ fn check_modules(
         // As in `run_passes`: an error in a definition inference drops reads a binding the
         // tree it leaves no longer holds.
         let reads_named = mut_read::read_respelling(&tree);
+        // Under a `DerivationSession`, as the comprehension phase is: an error inference raises
+        // at a node it minted, such as a copy of a predicate it normalizes, traces through the
+        // node it was copied from. A module's check is no phase of the linked program, so it
+        // records no rows of one.
+        let derivation = DerivationSession::install();
         let checked = check_module(&mut tree, ctx.inference_ctx(), &check.params, &wanted);
+        blame.derive(&derivation.into_log(), Phase::Infer);
         if checked.is_ok() {
             note_parameter_types(
                 &tree,
