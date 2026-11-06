@@ -1,6 +1,6 @@
 //! The binary's dispatched run (`CAMBRA_DISPATCH`): a pure program prints what pull mode prints, a
-//! program over stdin prints each line's answer as the line arrives, and a program the planner
-//! refuses says so and runs in pull mode.
+//! program over stdin prints each line's answer as the line arrives, and a product of stdin
+//! with a static collection runs dispatched.
 
 use std::io::Write;
 use std::process::{Command, Output, Stdio};
@@ -106,22 +106,18 @@ fn a_collection_in_several_morsels_prints_what_pull_mode_prints(
     );
 }
 
-/// A program the planner refuses runs in pull mode, after a note naming the refusal, in the
-/// context the dispatched run compiled it in: the program reads stdin, and a second compile would
-/// open a second stdin reader, which the first would take the input from.
+/// A live source paired with a static collection runs through the dispatcher.
 #[test]
-fn a_refused_program_runs_in_pull_mode() {
-    // A range over stdin beside a static extent is refused: its keys pair a line's position with
-    // a position of the list, which no region of one source's positions spells.
+fn a_live_product_runs_dispatched() {
     let source = "sum([1 for line in stdin() for s in [1, 2]])\n";
     let input = "a\nb\n";
-    let pulled = run_reading("a_refused_program", source, "0", input);
-    let dispatched = run_reading("a_refused_program", source, "1", input);
+    let pulled = run_reading("a_live_product", source, "0", input);
+    let dispatched = run_reading("a_live_product", source, "1", input);
     assert_eq!(dispatched.stdout, pulled.stdout);
     let stderr = String::from_utf8_lossy(&dispatched.stderr);
     assert!(
-        stderr.contains("CAMBRA_DISPATCH: ") && stderr.contains("running in pull mode"),
-        "the refusal is noted: {stderr}"
+        !stderr.contains("running in pull mode"),
+        "the product runs dispatched: {stderr}"
     );
 }
 

@@ -57,8 +57,7 @@ use crate::interpreter::{BaseType, DataSink, DataSourceDomainExtentImpl, Extent}
 /// Where the planner refuses the program ([`Refused`]), before anything runs and with no entry or
 /// sink left placed: a program compiled with its sinks pulled; a live source whose arrivals reach
 /// no pipeline's entry, reach one as a region that is no projection of its keys, or reach a store
-/// or a loop's scope that also reads a pipeline, or one read beside another source or a static
-/// extent; a pipeline that reads directly a pipeline another pipeline reads; a breaker with no
+/// or a loop's scope that also reads a pipeline; a pipeline that reads directly a pipeline another pipeline reads; a breaker with no
 /// consuming mode (`Breaker::no_consuming_mode`); and where `Planner::store_pipeline` refuses a
 /// store.
 ///
@@ -529,18 +528,18 @@ fn run_targets(
         let input = input.expect("a reach calls the breaker it reaches");
         let mut starts: Vec<TileGuard> = Vec::new();
         let notifies = match (&members.located[pipeline], scopes[pipeline].as_ref()) {
-            // Checked where the ranges were taken up: the pipelines it reads reach its drive as
-            // the drive's positions, and the scope parks each delivery until they have decided it
-            // (`Dispatcher::park`).
-            _ if inherits => Notifies::Rounds,
+            // Inherited ranges reach the drive as its positions. Nonprefix ranges wait for
+            // completion; otherwise the scope parks each delivery on the pipelines it reads.
+            _ if inherits => match leaves.iter().all(LiveLeaf::yields_prefix) {
+                true => Notifies::Rounds,
+                false => Notifies::Whole,
+            },
             // A transaction store's input is its writer's source, read behind an entry no
             // planner places, so its items are a delivery's keys where the writer's source is
             // the source every range under the writer reads.
             (Located::Store { .. }, _) => {
-                let items_of = |leaf: &LiveLeaf| {
-                    matches!(input.domain_extent(), Some(Extent::DataSourceDomain(items))
-                        if Rc::ptr_eq(&items, &leaf.source))
-                };
+                let items_of =
+                    |leaf: &LiveLeaf| input.domain_extent().as_ref() == Some(&leaf.extent);
                 // One whose writer reads the source otherwise, as a concatenation of the source and
                 // a list, takes its input whole once the source yields everything.
                 match leaves.iter().all(items_of) {
@@ -554,14 +553,17 @@ fn run_targets(
             // them, ends the scope's rows only once it yields everything, so the scope then reads
             // its input whole.
             (_, Some(scope)) => {
-                let one = Projection::admitting(Predicate::point(Value::UInt(0)));
                 let keys_are_positions = leaves.iter().all(|leaf| {
+                    if !leaf.yields_prefix() {
+                        return false;
+                    }
+                    let one = leaf.probe_region();
                     let mut scope = induction(scope);
                     let routes = scope.routes(&leaf.consumer);
                     let arrived = scope.arrivals(&leaf.consumer, &one);
                     !routes.is_empty()
                         && routes.iter().all(|route| route.keeps_keys)
-                        && matches!(input.domain_extent(), Some(Extent::DataSourceDomain(_)))
+                        && input.domain_extent().as_ref() == Some(&leaf.extent)
                         && !arrived.is_empty()
                         && arrived
                             .iter()
@@ -579,9 +581,9 @@ fn run_targets(
             // everything, so the pipeline then reads its whole input once, every range's part of it
             // included.
             _ => {
-                let one = Projection::admitting(Predicate::point(Value::UInt(0)));
                 let mut notifies = Notifies::Arrivals;
                 for leaf in leaves {
+                    let one = leaf.probe_region();
                     let routes = routes_to(&leaf.consumer, pipeline);
                     if routes.is_empty() {
                         unplace(&planner.placements, targets);
@@ -1538,12 +1540,52 @@ struct Beneath {
     live: Vec<LiveLeaf>,
 }
 
-/// A range over a live source's domain (`TileProducer::data_sources`): the consumer it pushes
-/// through, and the source.
+/// A live iteration range: its consumer and the full extent whose decided region is announced.
 #[derive(Clone)]
 pub(super) struct LiveLeaf {
     pub(super) consumer: SharedConsumer,
-    pub(super) source: LiveSource,
+    pub(super) extent: Extent,
+}
+
+impl LiveLeaf {
+    // Round requests must not include a later position while earlier positions can still arrive.
+    fn yields_prefix(&self) -> bool {
+        fn prefix(extent: &Extent) -> bool {
+            match extent {
+                Extent::DataSourceDomain(_) => true,
+                Extent::Record(fields) => {
+                    let mut fields: Vec<_> = fields.iter().collect();
+                    fields.sort_by_key(|(name, _)| *name);
+                    fields.first().is_none_or(|(_, extent)| prefix(extent))
+                        && fields
+                            .iter()
+                            .skip(1)
+                            .all(|(_, extent)| !extent.reads_a_source())
+                }
+                _ => !extent.reads_a_source(),
+            }
+        }
+        prefix(&self.extent)
+    }
+
+    fn probe_region(&self) -> Projection {
+        fn probe(extent: &Extent) -> Predicate {
+            match extent {
+                Extent::Record(fields) => Predicate::Record(
+                    fields
+                        .iter()
+                        .map(|(name, extent)| (name.clone(), probe(extent)))
+                        .collect(),
+                ),
+                Extent::Union(arms) => {
+                    Predicate::over_every_tag(arms.map(|_, extent| probe(extent)))
+                }
+                Extent::DataSourceDomain(_) => Predicate::point(Value::UInt(0)),
+                _ => Predicate::True,
+            }
+        }
+        Projection::admitting(probe(&self.extent))
+    }
 }
 
 /// A live source, as a range over its domain reads it.
@@ -1630,27 +1672,21 @@ impl Planner {
             below.unprobed.push(producer.name());
         }
         let sources = producer.data_sources();
-        // A range over a live source is no range the run queues whole at its start: the run
-        // notifies the pipeline above it of what the source yields, as regions of the source's
-        // keys. A cross product of sources, a source beside a static extent, or a source keyed
-        // by anything but positions yields keys whose region no notification of one source's
-        // spells.
-        let one_source = sources.len() == 1
-            && matches!(
-                producer.tiling().domain_extent(),
-                Some(Extent::DataSourceDomain(_))
-            )
-            && sources[0].borrow().element_extent() == Extent::Base(BaseType::UInt);
-        if !sources.is_empty() && !one_source {
+        let extent = producer.tiling().domain_extent();
+        if sources
+            .iter()
+            .any(|source| source.borrow().element_extent() != Extent::Base(BaseType::UInt))
+        {
             self.refuse(format!(
-                "{} ranges over the domain {:?}, which is no one live source's positions",
-                producer.name(),
-                producer.tiling().domain_extent()
+                "{} ranges over a live source without UInt positions",
+                producer.name()
             ));
             return Beneath::default();
         }
-        let (leaf, live) = match (leaf, sources.into_iter().next()) {
-            (Some(consumer), Some(source)) => (None, Some(LiveLeaf { consumer, source })),
+        let (leaf, live) = match (leaf, extent) {
+            (Some(consumer), Some(extent)) if !sources.is_empty() => {
+                (None, Some(LiveLeaf { consumer, extent }))
+            }
             (leaf, _) => (leaf, None),
         };
         below.live.extend(live);
@@ -2565,7 +2601,7 @@ impl LivePipeline {
         let mut positions = Predicate::False;
         let mut fresh_sources: Vec<LiveSource> = Vec::new();
         for (leaf, notified) in &mut self.leaves {
-            let yielded = leaf.source.borrow().get_yield_predicate();
+            let yielded = leaf.extent.decided_region();
             debug_assert!(
                 notified.minus(&yielded).is_false(),
                 "a source's yield only grows: it yields {yielded:?}, short of {notified:?}"
@@ -2593,19 +2629,19 @@ impl LivePipeline {
                     // attempt runs once every position before it is complete, so a source read in
                     // positions yields a prefix of them.
                     debug_assert!(
-                        yielded.is_true()
+                        !matches!(leaf.extent, Extent::DataSourceDomain(_))
+                            || yielded.is_true()
                             || yielded.max_released_position().is_some_and(|last| {
                                 let prefix = Predicate::at_or_below(last.into_value());
                                 prefix.subsumes(&yielded) && yielded.subsumes(&prefix)
                             }),
                         "a live source read in positions yields a prefix of them: {yielded:?}"
                     );
-                    if !fresh_sources
-                        .iter()
-                        .any(|seen| Rc::ptr_eq(seen, &leaf.source))
-                    {
-                        fresh_sources.push(leaf.source.clone());
-                    }
+                    leaf.extent.for_each_source(&mut |source| {
+                        if !fresh_sources.iter().any(|seen| Rc::ptr_eq(seen, source)) {
+                            fresh_sources.push(source.clone());
+                        }
+                    });
                     positions = positions.union(&fresh);
                 }
             }
@@ -2695,9 +2731,11 @@ fn drive_live(
     loop {
         let mut sources: Vec<LiveSource> = Vec::new();
         for (leaf, _) in live.iter().flat_map(|at| &at.leaves) {
-            if !sources.iter().any(|seen| Rc::ptr_eq(seen, &leaf.source)) {
-                sources.push(leaf.source.clone());
-            }
+            leaf.extent.for_each_source(&mut |source| {
+                if !sources.iter().any(|seen| Rc::ptr_eq(seen, source)) {
+                    sources.push(source.clone());
+                }
+            });
         }
         for source in &sources {
             source.borrow_mut().check_for_new_data();

@@ -32,6 +32,30 @@ Source-domain availability and release are delegated to the source implementatio
 Runtime filtering uses `Filter` operators, not a populated `Restriction` handle;
 `iterate_extent` panics on `Extent::Restricted`.
 
+### Cartesian iteration
+
+`IterateExtentProducer` owns the retained keys and decided regions of a live record extent.
+It remains a leaf producer. Each dimension is enumerated on `get`; keys already retained or
+released are excluded before merging new information. The output is the identity over record keys.
+
+The dispatcher polls every physical source in a live range's extent once per pass. The extent's
+decided region is the conjunction of record fields or the tagged regions of a union. Each range
+announces its new region through its consumer; the receiving pipeline subtracts its input release.
+The iterator introduces no breaker or pipeline. A loop receives compound arrivals as rounds only
+when all dimensions after the first are static and the first yields an ordered prefix. Other
+compound loop sources are read whole once their sources close.
+
+The retained tiles include each field's decided predicate, including keys that hold no value.
+Each output projection is cut from the product of the retained keys, with the accumulated output
+release removed. Releasing one pair retains either input key that a future partner can still need.
+A field's keys are reclaimed where the released region covers every other field without
+restriction. A universal output release releases every dimension.
+
+Each occurrence of a source has a separate iteration registration, so releasing one dimension
+cannot reclaim values another dimension still needs. These registrations keep source values
+available to downstream lookups. Source values under a compound field are retained until that
+field is released whole.
+
 ### Tiling
 
 [`Tiling`](tiling/tiling_kind.rs) specifies the tiles a `TileOperator` produces.
@@ -1027,7 +1051,8 @@ no push of it, since the store reads it by pull at a step, and records what the 
 transaction store reads its seeds as its input 0 instead (below). A drive with no
 rows above it states complete every position below its next one that its source calls complete along
 with every position before, so a position it reads past, one the source filtered out or holds
-nothing at, is stated as one it emitted (`complete_prefix_below`). An induction store with no rows
+nothing at, is stated as one it emitted. This progress is a region over the source extent,
+including record-keyed product positions. An induction store with no rows
 above it releases its body through what the body states complete and holds no decision at, and a
 transaction drive releases its source through what it has read past, so either releases such a
 position without waiting for a later one to be decided. The dispatcher's finish checks that a
@@ -1429,9 +1454,9 @@ every source yields everything. A run starts with every breaker pushing what it 
 (`dispatcher::push_held`), as a run after a pause or a reload starts over breakers an earlier run
 consumed into. A pass that finds nothing new calls the caller's `on_idle` after running what is
 claimable (`run_program_polling`): `run_program` sleeps for a millisecond, and a test feeds the
-source there. A range reads one source, keyed by positions: the planner refuses a cross product of
-sources, a source beside a static extent, and a source with other keys, whose arrivals no region of
-one source's positions spells.
+source there. A live range retains its full extent, including record and union domains. The source
+path announces that extent's decided region through the range's consumer
+([Cartesian iteration](#cartesian-iteration)). No iterator pipeline is introduced.
 
 The binary runs a program dispatched where `CAMBRA_DISPATCH` is set to anything but `0` or the empty
 string, and neither `--inspect` nor `--control` is given, at morsels of `CAMBRA_MORSEL_ROWS` rows
@@ -1918,7 +1943,7 @@ derived from the edges on both sides of the wire rather than serialized separate
 | Operator | Input Tiling(s) | Output Tiling | Description |
 |---|---|---|---|
 | `Constant` | None | `Scalar` from `Constant::new`, `DataFunction(domain → Scalar(codomain))` from `Constant::from_bindings`, any tiling from `Constant::collection` | Produces a fixed tile. Which of the two a bindings table is cannot be read off the value: in function position it is one value the consumer applies (a list literal's table), and as a collection it is what a map iterates. Every operator below derives its tiling from its input's, so the choice decides whether a map transforms the table or each of its outputs — and the call site states it. |
-| `IterateExtent` | None | `DataFunction(extent → Scalar(extent))` | Enumerates all values in an `Extent`, producing an identity-mapping function (domain = codomain = extent). Holds no input, so it is the root a data source is read from: it registers a wake-up against each source its extent reaches (`Extent::for_each_source`), and its tiling names them. |
+| `IterateExtent` | None | `DataFunction(extent → Scalar(extent))` | Enumerates all values in an `Extent`, producing an identity-mapping function (domain = codomain = extent). A live record extent retains each field ([Cartesian iteration](#cartesian-iteration)). Other extents enumerate directly and register a wake-up against each source they reach (`Extent::for_each_source`). |
 | `MapResultWithSource` | `DataFunction(DataSourceDomain → Scalar(DataSourceDomain))` | `DataFunction(DataSourceDomain → Scalar)` | Looks up each key of a data-source domain via `DataSourceDomainExtentImpl::get` to produce a function from keys to their output values.  Built with paths (`MapResultWithSource::projecting`, from `Source(name, paths)`: an empty list reads the whole value), it returns the leaf at the one path, or the tuple of the leaves in the order named, and its output extent is that of the leaf or tuple. |
 | `Zip` | `N` inputs of `DataFunction(shared_extent → *)` tilings |  `DataFunction(shared_domain → Record(_0, … _N))` | Merges N function operators that share a domain into one function whose codomain is a Record Tiling of all their codomains. Prefer the free `zip_arms_at` factory at op-conversion call sites: it dispatches to `Zip` (function-tiled arms) or `MakeRecord` (scalar arms) based on the compiled arms' tilings, since the same CCL-level `zip` maps to either tile shape depending on upstream `input`. |
 | `MakeRecord` | `N` inputs at any tilings | `Record(name: input's own tiling, …)` | Builds a product value ([A product value is a record of tiles](#a-product-value-is-a-record-of-tiles)). Pulls every operand whole, and forwards each field's release to that field's operand. |

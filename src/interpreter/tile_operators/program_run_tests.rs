@@ -2430,20 +2430,241 @@ fn two_sums_over_one_live_source() {
     );
 }
 
-/// A cross product of a live source with itself is keyed by pairs of its positions, which no
-/// notification of one source's positions names.
-#[test]
-#[should_panic(expected = "which is no one live source's positions")]
-fn a_cross_product_of_live_sources_is_refused() {
-    dispatched_live(
-        indoc! {"
-            out = test_sink()
-            out << sum([x * y for x in source1() for y in source1()])
-        "},
-        1,
-        two_batches(),
+#[rstest_log::rstest]
+#[case::same_source(indoc! {"
+    out = test_sink()
+    out << sum([x * y for x in source1() for y in source1()])
+"}, 225)]
+#[case::static_inner(indoc! {"
+    out = test_sink()
+    out << sum([x * y for x in source1() for y in [10, 20]])
+"}, 450)]
+#[case::static_outer(indoc! {"
+    out = test_sink()
+    out << sum([x * y for x in [10, 20] for y in source1()])
+"}, 450)]
+#[case::empty_inner(indoc! {"
+    out = test_sink()
+    out << sum([x * y for x in source1() for y in [y for y in [10, 20] if y > 30]])
+"}, 0)]
+fn a_live_cartesian_product(
+    #[case] source: &str,
+    #[case] expected: i64,
+    #[values(1, usize::MAX)] rows: usize,
+    #[values(two_batches(), one_key_batches(5))] batches: Vec<Batch>,
+) {
+    let (value, planned) = dispatched_live(source, rows, batches);
+    assert!(
+        planned
+            .iter()
+            .all(|pipeline| !pipeline.name.starts_with("IterateExtent#")),
+        "iteration runs in its reader's pipeline: {planned:?}"
+    );
+    assert_eq!(value, Value::Int(expected));
+}
+
+#[rstest_log::rstest]
+fn a_cartesian_product_of_two_live_sources(
+    #[values(1, usize::MAX)] rows: usize,
+    #[values(false, true)] together: bool,
+    #[values(false, true)] close_left_first: bool,
+) {
+    use crate::interpreter::{BaseType, Extent, Predicate, TestDataSource};
+    let mut ctx = GlobalContext::default();
+    ctx.defer_sink_pulls();
+    let feeds: Vec<_> = ["source1", "source2"]
+        .into_iter()
+        .map(|name| {
+            let source = std::rc::Rc::new(std::cell::RefCell::new(TestDataSource::new(
+                name,
+                crate::ccl::Type::Base(BaseType::Int),
+                Extent::Base(BaseType::Int),
+            )));
+            ctx.register_source(source.clone());
+            source
+        })
+        .collect();
+    let sink = ctx.register_test_sink("out");
+    let text = indoc! {"
+        out = test_sink()
+        out << sum([x * y for x in source1() for y in source2()])
+    "};
+    let mut program = compile_program(&mut ctx, &LoadedProgram::test(text), Box::new(|| {}))
+        .expect("the product compiles");
+    let _operators = ctx.take_operator_map();
+    let mut stages = vec![(vec![1], false, vec![10], false)];
+    if together {
+        stages.push((vec![2], false, vec![20], false));
+    } else {
+        stages.push((vec![2], false, vec![], false));
+        stages.push((vec![], false, vec![20], false));
+    }
+    if close_left_first {
+        stages.push((vec![3], true, vec![], false));
+        stages.push((vec![], true, vec![], true));
+    } else {
+        stages.push((vec![], false, vec![], true));
+        stages.push((vec![3], true, vec![], true));
+    }
+    let mut stages = stages.into_iter();
+    let mut next = [0_u64; 2];
+    let mut deliver = || {
+        let (a, ac, b, bc) = stages
+            .next()
+            .expect("the product finishes after the last delivery");
+        for (side, (values, closed)) in [(a, ac), (b, bc)].into_iter().enumerate() {
+            let entries: Vec<_> = values
+                .into_iter()
+                .map(|value| {
+                    let key = next[side];
+                    next[side] += 1;
+                    (Value::UInt(key), Value::Int(value))
+                })
+                .collect();
+            let mut feed = feeds[side].borrow_mut();
+            feed.add_data(&entries);
+            let decided = if closed {
+                Predicate::True
+            } else if next[side] == 0 {
+                Predicate::False
+            } else {
+                Predicate::at_or_below(Value::UInt(next[side] - 1))
+            };
+            feed.set_yield_predicate(decided);
+        }
+    };
+    fn product_decided(producer: &mut dyn TileProducer) -> Option<crate::interpreter::TileGuard> {
+        if producer.name().starts_with("IterateExtent#")
+            && matches!(producer.tiling().domain_extent(), Some(Extent::Record(_)))
+        {
+            assert!(producer.as_breaking_mut().is_none());
+            return Some(producer.get(producer.tiling().universal_guard()).to_guard());
+        }
+        let mut found = None;
+        producer.visit_input_producers_mut(&mut |_, input| {
+            if found.is_none() {
+                found = product_decided(input);
+            }
+        });
+        found
+    }
+    let root = program
+        .outputs
+        .iter()
+        .find_map(|output| output.sink_consumer.as_ref())
+        .expect("one sink")
+        .borrow()
+        .producer_slot()
+        .clone();
+    let mut boundaries = Vec::new();
+    deliver();
+    let mut next_delivery = || {
+        let mut slot = root.borrow_mut();
+        let decided = product_decided(slot.as_mut().expect("the sink owns its input").as_mut())
+            .expect("the program has a Cartesian iterator");
+        assert!(
+            !decided.is_empty(),
+            "the product progresses before either source closes"
+        );
+        boundaries.push(decided);
+        drop(slot);
+        deliver();
+    };
+    let planned =
+        crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut next_delivery)
+            .expect("the dispatcher supports both live product dimensions")
+            .planned;
+    let written = sink.value().expect("the result is final");
+    assert_eq!(
+        written.as_function()[0].output,
+        Value::Int(180),
+        "{planned:?}"
+    );
+    assert!(program.done.try_recv().is_ok());
+    assert!(boundaries.len() >= 3);
+    assert!(
+        boundaries
+            .windows(2)
+            .all(|pair| super::guard_minus(&pair[0], &pair[1]).is_empty()),
+        "product decisions survive output releases and grow at every source boundary"
     );
 }
+
+#[rstest_log::rstest]
+#[case::live_outer("[(x, y) for x in source1() for y in [10, 20]]")]
+#[case::live_inner("[(x, y) for x in [10, 20] for y in source1()]")]
+fn a_live_product_as_a_loop_source(#[case] pairs: &str, #[values(1, usize::MAX)] rows: usize) {
+    let source = format!(
+        indoc! {"
+        out = test_sink()
+        total := 0
+        for pair in {pairs}:
+            total += pair.0 * pair.1
+        out << total
+    "},
+        pairs = pairs
+    );
+    assert_eq!(
+        dispatched_live(&source, rows, two_batches()).0,
+        Value::Int(450)
+    );
+}
+
+#[rstest_log::rstest]
+fn a_loop_over_two_open_product_dimensions(#[values(1, usize::MAX)] rows: usize) {
+    use crate::interpreter::{BaseType, Extent, Predicate};
+    let mut ctx = GlobalContext::default();
+    ctx.defer_sink_pulls();
+    let a = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::interpreter::TestDataSource::new(
+            "source1",
+            crate::ccl::Type::Base(BaseType::Int),
+            Extent::Base(BaseType::Int),
+        ),
+    ));
+    let b = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::interpreter::TestDataSource::new(
+            "source2",
+            crate::ccl::Type::Base(BaseType::Int),
+            Extent::Base(BaseType::Int),
+        ),
+    ));
+    ctx.register_source(a.clone());
+    ctx.register_source(b.clone());
+    let sink = ctx.register_test_sink("out");
+    let source = indoc! {"
+        out = test_sink()
+        total := 0
+        for pair in [(x, y) for x in source1() for y in source2()]:
+            total += pair.0 * pair.1
+        out << total
+    "};
+    let mut program =
+        compile_program(&mut ctx, &LoadedProgram::test(source), Box::new(|| {})).unwrap();
+    a.borrow_mut().add_data(&[
+        (Value::UInt(0), Value::Int(1)),
+        (Value::UInt(1), Value::Int(2)),
+    ]);
+    a.borrow_mut()
+        .set_yield_predicate(Predicate::at_or_below(Value::UInt(1)));
+    b.borrow_mut().add_data(&[(Value::UInt(0), Value::Int(10))]);
+    b.borrow_mut()
+        .set_yield_predicate(Predicate::at_or_below(Value::UInt(0)));
+    let mut delivered = false;
+    let mut next = || {
+        assert!(!delivered, "the next delivery closes both sources");
+        delivered = true;
+        b.borrow_mut().add_data(&[(Value::UInt(1), Value::Int(20))]);
+        a.borrow_mut().set_yield_predicate(Predicate::True);
+        b.borrow_mut().set_yield_predicate(Predicate::True);
+    };
+    crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut next).unwrap();
+    assert_eq!(
+        sink.value().unwrap().as_function()[0].output,
+        Value::Int(90)
+    );
+}
+
 /// A reader of a pipeline with a live source beneath it takes the rows that pipeline reaches only
 /// once it has decided them, which it does only once its input is whole: a lookup of a live
 /// store's final value, and of an aggregate over a live map.
@@ -2629,6 +2850,8 @@ impl crate::interpreter::dispatcher::RunObserver for PauseAtOnce {
 )]
 #[case::a_group_by("sum([sum(g) for g in groupby(source1(), \\x -> x > 2)])", "15")]
 #[case::a_sum("sum(source1())", "15")]
+#[case::a_live_product("sum([x * y for x in source1() for y in source1()])", "225")]
+#[case::a_live_static_product("sum([x * y for x in source1() for y in [10, 20]])", "450")]
 #[case::a_static_read(
     "[x + sum([1, 2]) for x in source1()]",
     "[u0 -> 4, u1 -> 5, u2 -> 6, u3 -> 7, u4 -> 8]"

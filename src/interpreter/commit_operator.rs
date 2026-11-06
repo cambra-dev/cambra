@@ -7149,19 +7149,23 @@ impl InductionDriverProducer {
             .next_delivered(self.emitted_through.as_ref())
             .cloned();
         let done = source_complete && pending.is_none();
-        // A drive with no rows above it has read past every position below the next one it
-        // runs that the source calls complete along with every position before it: those it
-        // emitted, and those the source holds nothing at, which it never emits. The body then
-        // states them complete, and the store releases a position with no decision as it
-        // releases a decided one.
+        // Before the lowest pending item, every decided key was emitted or holds no item.
+        // This is a region, including record-keyed products, rather than a numeric cursor.
         let read_past = match levels_above {
-            0 => complete_prefix_below(
-                &source_complete_at(CurryLevel::OUTERMOST),
-                pending.as_ref().map(|p| &p[0]),
-            )
-            .map_or(Predicate::False, |through| {
-                self.window.path_prefix(&[], &through, true)
-            }),
+            0 => {
+                let complete = source_complete_at(CurryLevel::OUTERMOST);
+                match &pending {
+                    Some(next) => complete.intersect(&Predicate::below_in(
+                        next[0].clone(),
+                        &self
+                            .source_producer
+                            .tiling()
+                            .domain_extent()
+                            .expect("a drive's source is a collection"),
+                    )),
+                    None => complete,
+                }
+            }
             _ => Predicate::False,
         };
         let stated: Vec<Predicate> = match done {
