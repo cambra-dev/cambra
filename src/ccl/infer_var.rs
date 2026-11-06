@@ -1091,13 +1091,7 @@ impl InferVar {
         let Some(scope) = WitnessScope::of_kind(kind) else {
             return;
         };
-        fn go(ty: &Type, scope: &WitnessScope) {
-            if let Type::Infer(v) = ty {
-                v.place_under(scope.clone());
-            }
-            ty.walk_children(|c| go(c, scope));
-        }
-        go(ty, &scope);
+        ty.walk_infer_vars(&mut |v| v.place_under(scope.clone()));
     }
 
     /// Carry `original`'s placement onto `self`, a copy of it at the same position (a proxy,

@@ -4227,15 +4227,7 @@ fn reachable_vars(ty: &Type) -> std::collections::HashSet<InferVarId> {
     let mut seen = std::collections::HashSet::new();
     let mut stack: Vec<Type> = vec![ty.clone()];
     while let Some(t) = stack.pop() {
-        let mut found = Vec::new();
-        fn collect(ty: &Type, found: &mut Vec<Rc<crate::ccl::infer_var::InferVar>>) {
-            if let Type::Infer(v) = ty {
-                found.push(Rc::clone(v));
-            }
-            ty.walk_children(|child| collect(child, found));
-        }
-        collect(&t, &mut found);
-        for v in found {
+        t.walk_infer_vars(&mut |v| {
             if seen.insert(v.uid) {
                 let bounds = v.bounds.borrow();
                 stack.extend(
@@ -4246,7 +4238,7 @@ fn reachable_vars(ty: &Type) -> std::collections::HashSet<InferVarId> {
                         .map(|b| b.ty.clone()),
                 );
             }
-        }
+        });
     }
     seen
 }

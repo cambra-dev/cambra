@@ -277,7 +277,7 @@ impl Reach {
         let mut seen_obligations = HashSet::new();
         let mut pending = vec![ty.clone()];
         while let Some(ty) = pending.pop() {
-            visit_vars(&ty, &mut |v| {
+            ty.walk_infer_vars(&mut |v| {
                 if reach.levels.insert(v.uid, v.level()).is_some() || v.level() <= cutoff {
                     // A variable at or below the cutoff is the enclosing scope's: its
                     // bounds name nothing deeper, and its obligations are not this
@@ -308,14 +308,6 @@ impl Reach {
         };
         level > cutoff
     }
-}
-
-/// Call `f` on every inference variable `ty` names, not entering bounds.
-fn visit_vars(ty: &Type, f: &mut impl FnMut(&Rc<crate::ccl::InferVar>)) {
-    if let Type::Infer(v) = ty {
-        f(v);
-    }
-    ty.walk_children(|child| visit_vars(child, f));
 }
 
 /// The polarities each variable occurs at in `ct`.
