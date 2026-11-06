@@ -1329,23 +1329,19 @@ fn a_never_called_function_over_a_source_is_typechecked(
 /// Every generalized definition is checked alone exactly once, whether or not a use
 /// registered a specialization of it. Here `g` is dead code, and its walk reaches the use
 /// `f(q)`, whose instantiation fails to resolve, so it registers nothing. `f`'s record/tuple
-/// key conflict is reported once at `f`'s own sites (`a`, `a`, and the lambda). The sites of
-/// `g` whose types carry the failed instantiation (`f`, `q`, and the lambda) raise the same
-/// defect, which is `f`'s, so they report nothing.
+/// key conflict is reported once, at the first read of `a`. The sites of `g` whose types
+/// carry the failed instantiation (`f`, `q`, and the lambda) raise the same defect, which is
+/// `f`'s, so they report nothing.
 ///
-/// The exact count is the assertion: a second walk of `f` would add three more, and the
-/// cascade at `g` three more again.
+/// The exact count is the assertion: a second walk of `f` would add a report, and the
+/// cascade at `g` another.
 #[test]
 fn a_definition_whose_use_failed_is_checked_alone_once() {
     let errs = infer_program_err(&dead_code(indoc! {r#"
         f = \a -> (a.0, a.foo)
         g = \q -> f(q)
     "#}));
-    assert_eq!(
-        errs.len(),
-        3,
-        "one defect, reported once at each of its definition's sites: {errs:?}"
-    );
+    assert_eq!(errs.len(), 1, "one defect, reported once: {errs:?}");
 }
 
 /// A dead definition nested inside a *live* generalized one sits inside each of that
@@ -1375,7 +1371,7 @@ fn one_defect_does_not_multiply_by_the_enclosing_specialization_count(#[case] us
     let errs = infer_program_err(&code);
     assert_eq!(
         errs.len(),
-        3,
+        1,
         "one defect in a dead helper, however many clones of its enclosing \
          definition contain it: {errs:?}"
     );

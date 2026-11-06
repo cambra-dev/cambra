@@ -582,7 +582,7 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
         CoalesceError::RecursiveType { details } => InferError::Unsupported(format!(
             "recursive type: {details} (residual μ-types are forbidden)"
         )),
-        CoalesceError::DomainJoinConflict { domains } => InferError::DomainJoinConflict {
+        CoalesceError::DomainJoinConflict { domains, .. } => InferError::DomainJoinConflict {
             domains,
             origin: ctx_label.to_string(),
         },
@@ -604,7 +604,7 @@ pub(super) fn map_coalesce_err(err: CoalesceError, ctx_label: &str) -> InferErro
             "a witness reference escaped its binder: {details} (a \
              `WitnessRef` denotes \"whichever domain\", so outside its sum it denotes nothing)"
         )),
-        CoalesceError::KindConflict { details } => InferError::Unsupported(format!(
+        CoalesceError::KindConflict { details, .. } => InferError::Unsupported(format!(
             "one function was required to be both a compute function ⇒ and a data collection ⤇: \
              {details} (the two kinds are incomparable, so no function is both)"
         )),

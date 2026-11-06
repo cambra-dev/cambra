@@ -756,6 +756,7 @@ impl CompactType {
             family,
             nominal,
             nominal_conflict: _,
+            origins: _,
         } = self;
         Occupied {
             atoms: atoms.len(),
@@ -1030,6 +1031,73 @@ impl CompactFun {
     }
 }
 
+/// Where the concrete contributions at a position were born: the origin of each bound whose
+/// bounding side is a type rather than a variable ([`crate::ccl::infer_var::Bound::origin`]),
+/// unioned as positions merge.
+///
+/// Closing an edge over a stored bound keeps the bound's origin, so a contribution copied to
+/// another variable names where it was born. Two positions failing at one set of births meet
+/// one conflict, though no variable links them. A contribution compacted from a type no bound
+/// holds, or from a bound with no origin, leaves the births unknown.
+///
+/// Every two values are equal: positions holding the same types are one position whatever
+/// their contributions' births, so the field changes no comparison compaction makes.
+#[derive(Debug, Clone, Default)]
+pub struct ContributionOrigins {
+    born: BTreeSet<BornAt>,
+    unknown: bool,
+}
+
+/// One birth [`ContributionOrigins`] records: an expression, or a bound or requirement written
+/// in a polymorphic type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BornAt {
+    Node(crate::ccl::provenance::NodeId),
+    Written(chl_parser::source_map::FileId, usize, usize),
+}
+
+impl PartialEq for ContributionOrigins {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl ContributionOrigins {
+    /// A contribution compacted from a type no bound holds.
+    fn unknown() -> Self {
+        ContributionOrigins {
+            born: BTreeSet::new(),
+            unknown: true,
+        }
+    }
+
+    /// A contribution a bound recorded at `origin`.
+    fn born_at(origin: Option<crate::ccl::infer_var::Origin>) -> Self {
+        match origin {
+            Some(crate::ccl::infer_var::Origin::Node(node)) => ContributionOrigins {
+                born: BTreeSet::from([BornAt::Node(node)]),
+                unknown: false,
+            },
+            Some(crate::ccl::infer_var::Origin::Written(at)) => ContributionOrigins {
+                born: BTreeSet::from([BornAt::Written(at.file, at.start, at.end)]),
+                unknown: false,
+            },
+            None => Self::unknown(),
+        }
+    }
+
+    fn union(mut self, other: Self) -> Self {
+        self.born.extend(other.born);
+        self.unknown |= other.unknown;
+        self
+    }
+
+    /// The births, or `None` where some contribution's is unknown or there is none.
+    pub fn known(&self) -> Option<&BTreeSet<BornAt>> {
+        (!self.unknown && !self.born.is_empty()).then_some(&self.born)
+    }
+}
+
 /// Flat per-position representation of a type.
 ///
 /// At positive position, this conceptually represents a *union* of the
@@ -1149,6 +1217,9 @@ pub struct CompactType {
     /// so "check it where the variable resolves" is a local question at coalesce
     /// rather than a list to be drained afterwards.
     pub kinds: Vec<crate::ccl::ty::TypeKind>,
+    /// Where the concrete contributions at this position were born. Identity only: it
+    /// changes no answer compaction gives.
+    pub origins: ContributionOrigins,
 }
 
 /// How many positions a tuple contribution has: exactly its listed ones (a [`Type::Tuple`]),
@@ -1476,6 +1547,7 @@ impl CompactType {
             family,
             nominal,
             nominal_conflict: _,
+            origins: _,
         } = self;
         let is_witness = |a: &&AtomKey| matches!(a, AtomKey::Witness(_));
         atoms.iter().filter(|a| !is_witness(a)).count()
@@ -1617,6 +1689,7 @@ impl CompactType {
             family,
             nominal,
             nominal_conflict: _,
+            origins: _,
         } = self;
         // `atoms` and `refinements` hold no position, so structural equality on those is
         // already denotational — the first is a `BTreeSet` and the second a set of terms.
@@ -1734,6 +1807,7 @@ impl CompactType {
         // See `src/ccl/design/type-inference.md`, "How a sum flows through the solver".
         let mut vars = lhs.vars;
         vars.extend(rhs.vars);
+        let (lhs_origins, rhs_origins) = (lhs.origins, rhs.origins);
         #[allow(clippy::mutable_key_type)]
         // `AtomKey::Witness` holds a `RefCell` kind; ordering reads its `uid` alone.
         let mut atoms = lhs.atoms;
@@ -1889,6 +1963,7 @@ impl CompactType {
             family,
             nominal,
             nominal_conflict,
+            origins: lhs_origins.union(rhs_origins),
         }
     }
 
@@ -1918,6 +1993,7 @@ impl CompactType {
             kinds,
             nominal,
             nominal_conflict: _,
+            origins: _,
         } = self;
         atoms.is_empty()
             && rec.is_none()
@@ -1935,6 +2011,7 @@ impl CompactType {
     /// [`imposes_nothing`](Self::imposes_nothing), leaving everything else as-is.
     fn absorbing_vars_of(mut self, identity: CompactType) -> CompactType {
         self.vars.extend(identity.vars);
+        self.origins = self.origins.union(identity.origins);
         self
     }
     fn merge_refinements(pol: bool, lhs: RefinementSet, rhs: RefinementSet) -> RefinementSet {
@@ -3268,9 +3345,25 @@ fn compact_go(
     pos: Position<'_>,
     st: &mut CompactState,
 ) -> CompactType {
-    stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
+    let mut ct = stacker::maybe_grow(512 * 1024, 1024 * 1024, || {
         compact_go_inner(ty, pol, subst_acc, pos, st)
-    })
+    });
+    // A type a variable's bound holds is born where the bound says; the variable's arm
+    // records it. Any other type contributes without a recorded birth.
+    if !stands_for_a_variable(ty) {
+        ct.origins = ct.origins.union(ContributionOrigins::unknown());
+    }
+    ct
+}
+
+/// Whether `ty` is a variable, refined or not: what it contributes is its bounds', whose births
+/// they record ([`ContributionOrigins`]).
+fn stands_for_a_variable(ty: &Type) -> bool {
+    match ty {
+        Type::Infer(_) => true,
+        Type::Refinement(base, _) => stands_for_a_variable(base),
+        _ => false,
+    }
 }
 
 /// The body of [`compact_go`].
@@ -3934,7 +4027,10 @@ fn compact_go_inner(
                 // arrives with every edge's morphism composed (design §3.6).
                 // Identity edges leave `subst_acc` unchanged (the common case).
                 let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-                let bc = compact_go(&b.ty, pol, &inner_acc, pos.under(&new_parents), st);
+                let mut bc = compact_go(&b.ty, pol, &inner_acc, pos.under(&new_parents), st);
+                if !stands_for_a_variable(&b.ty) {
+                    bc.origins = ContributionOrigins::born_at(b.origin);
+                }
                 bound = CompactType::merge(pol, bound, bc);
             }
             // Whether the *shape* collapse fires: the primary walk produced no
@@ -3966,6 +4062,7 @@ fn compact_go_inner(
                     refinements: _,
                     kinds: _,
                     nominal_conflict: _,
+                    origins: _,
                 } = &bound;
                 // A variant shape counts as concrete only at a **positive**
                 // position, where it is the value's own tags — read off the lower
@@ -4021,7 +4118,10 @@ fn compact_go_inner(
             if read_opposite {
                 for b in opposite_bounds.iter().filter(|b| renders_as_own(b)) {
                     let inner_acc = Subst::then(&b.render_subst(), subst_acc);
-                    let bc = compact_go(&b.ty, !pol, &inner_acc, pos.under(&new_parents), st);
+                    let mut bc = compact_go(&b.ty, !pol, &inner_acc, pos.under(&new_parents), st);
+                    if !stands_for_a_variable(&b.ty) {
+                        bc.origins = ContributionOrigins::born_at(b.origin);
+                    }
                     recovered = Some(match recovered {
                         None => bc,
                         Some(acc) => CompactType::merge(!pol, acc, bc),

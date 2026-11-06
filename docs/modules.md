@@ -684,7 +684,10 @@ written as its module spells it (`error_key`), since each check holds its own co
 its own inference variables and its own names for the module's members. A check's error in another
 module's code is that module's own when its own check raised it. Otherwise the checked module's use
 raised it, and it carries a secondary label at the module's `import` or `run` statement that brings
-that code in (`ModuleCheck::reached_by`). A module whose check fails stops the compile before
+that code in (`ModuleCheck::reached_by`). A module whose own check passed is sound at the types
+its parameters declare, so an error a run raises in its code comes from an argument that does not
+fit them; where the statement bringing the code in has an error of its own, the module's error is
+dropped. A module whose check fails stops the compile before
 linking's inference. A module is checked against its dependencies' bodies, so each check infers them
 again; keeping each module's inferred schemes for its users would remove that cost.
 
