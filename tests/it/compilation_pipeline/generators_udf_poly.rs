@@ -1122,7 +1122,7 @@ fn a_definition_specialized_for_an_argument_reading_a_binder_stands_under_it() {
         ys = [1, 2, 3]
         g(box([x for x in ys if x > 1]))
     "});
-    let expected = "Type mismatch for collection annotation: expected Σ (σ : UIntRanges). (σ ⤇ _), found {0..3 |";
+    let expected = "Type mismatch for collection annotation: expected List(_), found {UInt where _ < 3 and ys[_]! > 1}";
     assert!(
         msg.starts_with("compilation failed:") && msg.contains(expected),
         "expected a compile error containing {expected:?}; got: {msg}"

@@ -551,7 +551,7 @@ fn requirement_errors(#[case] code: &str, #[case] needle: &str) {
             x
         pos(-1)
     "},
-    "found Int@-1",
+    "found {Int where _ == -1}",
 )]
 #[case::parameter_escapes_its_definition(
     indoc! {"
@@ -623,7 +623,7 @@ fn requirement_errors(#[case] code: &str, #[case] needle: &str) {
         g: forall (T <: Int) {T where _ > 0} => Int = \\x -> x
         g(-1)
     "},
-    "expected {Int | __elem > 0}, found Int@-1",
+    "expected {Int where _ > 0}, found {Int where _ == -1}",
 )]
 // The join of `T` with the enclosing definition's implicit parameter has no type: `x`'s
 // type is chosen outside `inner`. Rejected whether or not `outer` is called.

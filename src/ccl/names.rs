@@ -234,6 +234,19 @@ impl std::hash::Hash for PiRef {
     }
 }
 
+/// The display metadata of a [`Name::Unique`] beyond its spelling.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UniqueMeta {
+    /// The imported module or the run whose top-level member it binds, and `None`
+    /// for any other binder: a local, or a member of the root (`docs/modules.md`,
+    /// "Names carry their home").
+    home: Option<Arc<Home>>,
+    /// What each position of the tuple it binds reads as, for the tuple binder a
+    /// `def` of several parameters lowers to (`uncurry_params` in
+    /// `src/ccl/lower/functions.rs`): the parameters' spellings, in order.
+    positions: Option<Box<[SmolStr]>>,
+}
+
 /// Where a module's top-level member lives (`docs/modules.md`, "Names carry
 /// their home").
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -425,16 +438,14 @@ pub enum Name {
     /// Lowering's output; identity is the string. See module docs.
     Raw(SmolStr),
     /// A uniquified source binder; identity is `uid`, `base` is the source
-    /// spelling kept as display metadata. `home` is the imported module or the
-    /// run whose top-level member it binds, and `None` for any other binder: a
-    /// local, or a member of the root (`docs/modules.md`, "Names carry their
-    /// home"). It is display metadata too, and set where the name is minted, so
-    /// a binder and its uses carry the same one. It is behind an `Arc` so it
-    /// costs `Name` one pointer.
+    /// spelling kept as display metadata. `meta` is the rest of its display
+    /// metadata ([`UniqueMeta`]), `None` for a binder with none. It is set where
+    /// the name is minted, so a binder and its uses carry the same one, and it
+    /// is behind an `Arc` so it costs `Name` one pointer.
     Unique {
         base: SmolStr,
         uid: Uid,
-        home: Option<Arc<Home>>,
+        meta: Option<Arc<UniqueMeta>>,
     },
     /// A compiler-introduced binder; identity is `uid`, `kind` is its
     /// provenance and whole display (no source spelling — that was noise).
@@ -483,16 +494,38 @@ impl Name {
         Name::Unique {
             base: base.into(),
             uid: Uid::fresh(),
-            home,
+            meta: home.map(|home| {
+                Arc::new(UniqueMeta {
+                    home: Some(home),
+                    positions: None,
+                })
+            }),
         }
     }
 
-    /// A fresh binder copying `name`'s spelling and home: what a pass that
+    /// [`Name::fresh`] for a binder of a tuple whose position `i` reads as
+    /// `positions[i]` ([`Self::positions`]).
+    pub fn fresh_tuple(base: impl Into<SmolStr>, positions: Vec<SmolStr>) -> Self {
+        Name::Unique {
+            base: base.into(),
+            uid: Uid::fresh(),
+            meta: Some(Arc::new(UniqueMeta {
+                home: None,
+                positions: Some(positions.into_boxed_slice()),
+            })),
+        }
+    }
+
+    /// A fresh binder copying `name`'s spelling and metadata: what a pass that
     /// re-mints a binder it copies or renames gives the copy, so the copy keeps
     /// its display and its [`field_key`](Self::field_key).
     pub fn fresh_like(name: &Name) -> Self {
         match name {
-            Name::Unique { base, home, .. } => Self::fresh_in(base.clone(), home.clone()),
+            Name::Unique { base, meta, .. } => Name::Unique {
+                base: base.clone(),
+                uid: Uid::fresh(),
+                meta: meta.clone(),
+            },
             other => Self::fresh(other.base()),
         }
     }
@@ -501,7 +534,20 @@ impl Name {
     /// binds one.
     pub fn home(&self) -> Option<&Home> {
         match self {
-            Name::Unique { home, .. } => home.as_deref(),
+            Name::Unique {
+                meta: Some(meta), ..
+            } => meta.home.as_deref(),
+            _ => None,
+        }
+    }
+
+    /// What each position of the tuple this binds reads as, for a binder minted by
+    /// [`Self::fresh_tuple`].
+    pub fn positions(&self) -> Option<&[SmolStr]> {
+        match self {
+            Name::Unique {
+                meta: Some(meta), ..
+            } => meta.positions.as_deref(),
             _ => None,
         }
     }
@@ -717,11 +763,7 @@ impl Name {
             }
             // A member of a run is labeled in its run, `eu::stock`, so the
             // variables of two runs of one module keep distinct histories.
-            Name::Unique {
-                base,
-                home: Some(home),
-                ..
-            } => match &**home {
+            Name::Unique { base, .. } if let Some(home) = self.home() => match home {
                 Home::Run(run) => crate::ccl::Label::in_run(run.clone(), base.clone()),
                 Home::Import(shared) => unreachable!(
                     "`{base}` of the shared import `{shared}` is no mutable variable: an import of \
@@ -831,11 +873,9 @@ impl fmt::Display for Name {
             Name::Reserved(ReservedName::Elem(up)) if *up > 0 => write!(f, "__elem^{up}"),
             // An imported module's or a run's member renders qualified, in every
             // module's diagnostics alike.
-            Name::Unique {
-                base,
-                home: Some(home),
-                ..
-            } => write!(f, "{home}::{base}"),
+            Name::Unique { base, .. } if let Some(home) = self.home() => {
+                write!(f, "{home}::{base}")
+            }
             _ => f.write_str(self.base()),
         }
     }

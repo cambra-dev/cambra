@@ -88,11 +88,8 @@ xs[int_to_uint(1)]! == 2
     )
 }
 
-/// The key's refinement refutes the bound, so the proven lookup is rejected.
-///
-/// TODO: Improve the confusing type error. The type `{UInt | (__int,
-/// __elem) ▷ int_eq_uint}` is asserting that the key is equal to the
-/// Int passed into `int_to_uint`, namely `5`.  But that's not obvious.
+/// The key's refinement refutes the bound, so the proven lookup is rejected. The key's type
+/// is `int_to_uint`'s result at the argument `5`.
 #[test]
 fn list_lookup_rejected() {
     check_compile_error(
@@ -100,6 +97,6 @@ fn list_lookup_rejected() {
 xs = [1,2,3]
 xs[int_to_uint(5)]! == 2
         "#},
-        "Type mismatch for Apply: expected 0..3, found {UInt | (__int, __elem) ▷ int_eq_uint}",
+        "Type mismatch for Apply: expected {UInt where _ < 3}, found {UInt where 5 == _}",
     )
 }
