@@ -516,9 +516,6 @@ fn hash_payload<'a>(
                 g.guards.len().hash(h);
             }
         }
-        // `Realize` wraps the value it realizes and adds no content of its own beyond the
-        // discriminant hashed by the caller.
-        N::Realize { value: v, .. } => hash_payload(v, env, wenv, free, fold, h),
         N::Lit(Lit::Int(n)) => n.hash(h),
         N::Lit(Lit::String(s)) => s.hash(h),
         N::Lit(Lit::Bool(b)) => b.hash(h),
@@ -548,6 +545,7 @@ fn hash_payload<'a>(
         | N::Compose(_)
         | N::Copair(_)
         | N::DisjointJoin(_)
+        | N::Realized { .. }
         | N::Feed { .. }
         | N::Define { .. }
         | N::MutWrite { .. } => {}
@@ -719,7 +717,9 @@ fn hash_rel<'a>(
         // `Copair` is only associative — operand position picks the coproduct
         // tag, so `a ++ b` and `b ++ a` land on different domains — and folds in
         // position order with the ordered nodes below.
-        N::DisjointJoin(_) => {
+        // A realized conditional's legs are over distinct candidates, and which leg holds a
+        // row is its gate's, not its position's, so they canonicalize the same way.
+        N::DisjointJoin(_) | N::Realized { .. } => {
             children.sort_unstable();
             children.hash(&mut h);
         }

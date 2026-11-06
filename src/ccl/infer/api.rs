@@ -2242,9 +2242,12 @@ fn one_per_unfixed_width(expr: &Expr, open: Vec<LocatedInferError>) -> Vec<Locat
                     below |= self.go(value);
                     self.join_open_child(e, value);
                 }
-                TypedExprNode::Realize { value, .. } => {
-                    below |= self.go(value);
-                    self.join_open_child(e, value);
+                // Each leg is the value in one arm, so it passes through as a cast's value does.
+                TypedExprNode::Realized { legs, .. } => {
+                    for leg in legs {
+                        below |= self.go(leg);
+                        self.join_open_child(e, leg);
+                    }
                 }
                 TypedExprNode::Let {
                     binding,

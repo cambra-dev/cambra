@@ -7,14 +7,11 @@
 //! restricted arms are unioned. Exactly one leg is non-empty, so the union's extent *is*
 //! the selected domain.
 //!
-//! This lives in planning rather than `lambda_elim` for two reasons, and they are the
-//! same reason twice. It is a logical-to-executable rewrite, which is what this pass is
-//! for. And it *changes the representation*: a `Case` typed `Σ (𝐷 : 𝐾). 𝐷 ⤇ 𝑉` becomes a
-//! union typed `Variant({𝑖: {𝐷ᵢ | π̂ᵢ}}) ⤇ 𝑉`, a tagged union. Those are different types —
-//! the sum picks one branch, the tagged union has rows from every leg — and only the gates
-//! make them agree, which no typing rule can check. Performing it *after* the type system
-//! is done is what lets the two coexist without a `Fun(Data) <: Σ` bridge to relate them
-//! (`src/ccl/design/type-inference.md`, "Only a term builds a sum").
+//! This lives in planning rather than `lambda_elim` because it is a logical-to-executable
+//! rewrite, which is what this pass is for. The union is a `Realized` node typed as the sum the
+//! `Case` was, each leg the sum's body at one candidate, which the check after planning holds it
+//! to (`src/ccl/design/type-inference.md`, "A realized conditional is typed as its sum"). Nothing
+//! that mentions the `Case`'s type changes.
 //!
 //! Only a witness over **named candidates** can be realized here: the legs are the
 //! candidates, so there have to be finitely many, named. A witness a `Case` picks between is
@@ -30,9 +27,7 @@ use crate::ccl::ccl_utils::{
     PredMemo, apply_primitive, flatten_trailing_value_case, make_cast, refine_with,
     synthesize_arm_predicate, walk_refined_predicates, walk_refined_predicates_mut,
 };
-use crate::ccl::{
-    BaseType, BinOpKind, Builtin, Expr, FieldKey, LogicKind, Type, TypedExprNode, provenance,
-};
+use crate::ccl::{BaseType, BinOpKind, Builtin, Expr, LogicKind, Type, TypedExprNode, provenance};
 
 /// The witnesses realization realized, by binder.
 ///
@@ -379,9 +374,9 @@ fn is_value_case(expr: &Expr) -> bool {
 /// The design is `src/ccl/design/collections.md`, "Compiling a conditional collection". The
 /// site is a collection-valued value `Case`: every consumer reads it through `unbox`, over its
 /// projected domain, so no consumer names its witness and none is a site. The union replaces
-/// the `Case` under a [`TypedExprNode::Realize`] that asserts the `Case`'s type and stages the
-/// `Case` itself. A witness-free conditional is the degenerate case: substituting the arm for
-/// the conditional leaves the arm, and the union's own type is asserted.
+/// the `Case` as a [`TypedExprNode::Realized`] typed as the `Case`'s sum, or for a same-domain
+/// conditional as a [`TypedExprNode::DisjointJoin`]. A witness-free conditional is the degenerate
+/// case: substituting the arm for the conditional leaves the arm.
 ///
 /// Returns whether this node was realized, which is load-bearing rather than bookkeeping: a
 /// `Case` inside a **refinement predicate** is rewritten through [`PredMemo::rebuild`],
@@ -427,7 +422,6 @@ fn realize(
     let original = expr.ty.clone();
     let bool_ty = Type::Base(BaseType::Bool);
     let mut legs: Vec<Expr> = Vec::new();
-    let mut tags: Vec<(FieldKey, Type)> = Vec::new();
     for combination in combinations(&choices) {
         // **The gate is the conjunction**, built while still pointful and eliminated once:
         // the leg is the one where *every* witness took the arm this combination names, and
@@ -512,7 +506,6 @@ fn realize(
             Type::fun(leg_dom.clone(), bool_ty.clone()),
         );
         let refined = refine_with(leg_dom, &gate_fn);
-        tags.push((FieldKey::Index(tags.len()), refined.clone()));
         // The gate rides a **`cast`** whose target refines the leg's domain rather than
         // being written onto the leg's type in place. Two things read it, and neither
         // would find a bare retyping: the post-planning consistency wall re-derives a
@@ -538,8 +531,8 @@ fn realize(
     for w in &witnesses {
         realized.insert(*w.id());
     }
-    // Every witness of the site is instantiated in its legs, so the union is a plain data
-    // function over the flat `Variant` of their domains — no binder is left for it to carry.
+    // Every witness of the site is instantiated in its legs, so each leg is a plain data
+    // function and no binder is left for it to carry.
     debug_assert!(
         legs[0].ty.peel_refinements().sum().is_none(),
         "a realized leg quantifies a witness the site did not name: site {:?} named {:?}, leg {:?}",
@@ -547,60 +540,33 @@ fn realize(
         witnesses.iter().map(|w| w.id()).collect::<Vec<_>>(),
         legs[0].ty.peel_refinements().to_string()
     );
-    // **Which union, decided by whether the site names a witness.** A site that does is a
-    // conditional between *distinct* domains: its legs live over different index sets, so
-    // combining them is a `Copair` over the `Variant` of those sets, and the sum it realizes
-    // is asserted back on top. A site that does not is a same-domain conditional: every leg
-    // is a gated restriction of one domain `𝐷`, first-match keeps their supports disjoint,
-    // and the union *is* `𝐷 ⤇ 𝑉` — a [`TypedExprNode::DisjointJoin`], typed at the site's
-    // own type. A coproduct domain there would claim the legs live over distinct index sets,
-    // which every consumer's `𝐷`-shaped demand would then have to undo
-    // (`src/ccl/design/ir.md`, "`Copair` and `DisjointJoin` — two collection-combining
-    // operations, not one").
-    let mentions_witness = !witnesses.is_empty() || original.is_witness_indexed();
-    // One leg denotes just that arm's collection — no union, and no witness to discriminate
-    // on. It keeps its gate, which rides its domain either way.
-    let union = if legs.len() == 1 {
+    // **First-match gates keep the legs' rows apart**, so at most one leg holds any. A site that
+    // names a witness is a conditional between distinct domains, and becomes a
+    // [`TypedExprNode::Realized`] typed as the sum it realizes, which the legs are bodies of
+    // (`check_realized`). Nothing that mentions the site's type has to change, and the value is
+    // the leg holding rows, keyed by its own keys under the sum's bound. The node keeps the
+    // conditional it replaces as the term it stages: a consumer's type quotes the conditional
+    // (`σ₁(𝑐)`), and normal form reads the node as that term, so the two compare as one.
+    //
+    // A site that names no witness is a same-domain conditional: every leg is a gated
+    // restriction of one domain `𝐷`, so the union is a [`TypedExprNode::DisjointJoin`] at
+    // `𝐷 ⤇ 𝑉`, the site's own type, or the one leg there is (`src/ccl/design/ir.md`,
+    // "`Copair` and `DisjointJoin` — two collection-combining operations, not one").
+    // Inside a lifted predicate a `Case` is lambda-eliminated to its function view `𝑤 ⤇ 𝑉`, the
+    // sum opened and the witness still named; `realize_everywhere` does not enter predicates.
+    assert!(
+        !witnesses.is_empty() || !original.is_witness_indexed(),
+        "a realized site is typed by a sum's function view `{original}`, which only a lifted \
+         predicate holds, and realization does not enter predicates"
+    );
+    *expr = if !witnesses.is_empty() {
+        let staged = Rc::new(std::mem::take(expr));
+        Expr::new(TypedExprNode::Realized { legs, staged }).with_ty(original)
+    } else if legs.len() == 1 {
         legs.pop().expect("len == 1")
-    } else if mentions_witness {
-        let union_ty = Type::fun_like(&legs[0].ty, Type::variant(tags), value_ty);
-        Expr::copair(legs).with_ty(union_ty)
     } else {
-        Expr::disjoint_join(legs).with_ty(original.clone())
+        Expr::disjoint_join(legs).with_ty(original)
     };
-    // **Assert the pre-realization type.** The union is the executable form of a term the
-    // rest of the tree still refers to as a sum, and every one of those mentions would
-    // otherwise have to be rewritten — a chain that does not terminate, since the mentions
-    // reach through composes, products and projections and are not all sums by the end.
-    // Asserting the original type here means nothing above changes.
-    //
-    // [`TypedExprNode::Realize`] rather than [`TypedExprNode::Cast`] because the relation
-    // is not a subtype one: the sum picks a branch, the tagged union has rows from every leg,
-    // and only the gates reconcile them. A cast would be claiming an obligation that does
-    // not hold; this asserts an isomorphism the rules cannot see, which is what it is for.
-    //
-    // Only where the site *mentioned a witness*. A same-domain conditional types as a plain
-    // collection, so its realization changes no mention and needs no assertion.
-    //
-    // A sum is the usual such type but not the only one: by the time a `Case` reaches here
-    // inside a **predicate** it has been lambda-eliminated to its function view `𝑤 ⤇ 𝑉` — the
-    // sum opened, the witness still named — and realizing that without an assertion shifts
-    // the enclosing composition's domain from the witness to the union. The condition is
-    // therefore about what the type *says*, not which constructor says it.
-    // The realization stages the conditional it replaces, so a type quoting the conditional
-    // (a consumer's `σ₁(𝑐)`) and this node compare as one term: normal form reads a `Realize`
-    // as what it stages.
-    let staged = Rc::new(std::mem::take(expr));
-    let asserted = if mentions_witness {
-        original
-    } else {
-        union.ty.clone()
-    };
-    *expr = Expr::new(TypedExprNode::Realize {
-        value: Box::new(union),
-        staged,
-    })
-    .with_ty(asserted);
     true
 }
 
@@ -648,8 +614,8 @@ fn arm_choices(
 /// spelling of its sum alike, and each occurrence instantiates against what it holds.
 ///
 /// The erased set is **local** to the arm, which is what keeps realization's own witness out
-/// of it: an arm-level `box` names the arm's binder, never the site's, so the sum
-/// [`TypedExprNode::Realize`] asserts over the union is untouched.
+/// of it: an arm-level `box` names the arm's binder, never the site's, so the sum the
+/// realized conditional is typed as is untouched.
 fn discharge_determined_witnesses(arm: Expr) -> Expr {
     fn go(
         expr: &mut Expr,
@@ -969,8 +935,6 @@ fn erase_determined_boxes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ccl::infer_var::fresh_witness_binder_id;
-    use crate::ccl::ty::{TypeKind, Witness};
     use crate::ccl::{Branch, Lit, Name};
 
     /// **A `Case` inside a refinement predicate is left alone.** The gated union it would
@@ -1019,65 +983,6 @@ mod tests {
         assert!(
             rendered.contains('→'),
             "the predicate's `Case` must be left for the per-leg discharge: {rendered}"
-        );
-    }
-
-    /// **Realization never changes a type that names the witness.** `Realize` asserts the
-    /// pre-realization type precisely so that nothing above a realized `Case` has to be
-    /// rewritten, and the mentions that would need rewriting are exactly the ones naming
-    /// the witness — whether the naming type is the sum itself or the function view
-    /// `𝑤 ⤇ 𝑉` a lambda-eliminated `Case` carries inside a predicate.
-    ///
-    /// Pinned as a unit test because end-to-end the shift it forbids is invisible until
-    /// something above the `Case` reads the type: the function view is what a mapping
-    /// comprehension leaves, and only its *filtered* form
-    /// (`a_filter_over_a_conditional_source_is_applied`) looks. Without the assertion that
-    /// path silently shifts the enclosing composition's domain from the witness to the
-    /// realized union.
-    #[test]
-    fn realizing_a_body_fun_case_keeps_the_witness_in_its_type() {
-        let int = Type::Base(BaseType::Int);
-        let w = fresh_witness_binder_id();
-        let wv = Witness::bound_to(w, TypeKind::Type);
-        let witness = Type::WitnessRef(*wv.id());
-        // Two guarded arms, each a concrete collection — the shape a conditional
-        // collection has once `box` is gone and the sum has been opened.
-        let arm = |dom: u64| {
-            Expr::new(TypedExprNode::Var(Name::from("xs")))
-                .with_ty(Type::data_fun(Type::UIntRange(dom), int.clone()))
-        };
-        let guard = |b: bool| Expr::lit(Lit::Bool(b)).with_ty(Type::Base(BaseType::Bool));
-        let case = TypedExprNode::Case {
-            scrutinee: None,
-            branches: vec![
-                Branch {
-                    pattern: None,
-                    guard: guard(true),
-                    body: arm(2),
-                },
-                Branch {
-                    pattern: None,
-                    guard: guard(true),
-                    body: arm(3),
-                },
-            ],
-        };
-        // The **function view**: the sum opened, the witness still named. Not a `Type::Sigma`,
-        // which is the whole point — the old condition tested the constructor.
-        let body_fun = Type::data_fun(witness.clone(), int.clone());
-        let mut expr = Expr::new(case).with_ty(body_fun.clone());
-
-        realize_conditional_collections(&mut expr, &mut Witnesses::default());
-
-        assert_eq!(
-            expr.ty, body_fun,
-            "realization must assert the pre-realization type, not the union's: {}",
-            expr.ty
-        );
-        assert!(
-            matches!(expr.node, TypedExprNode::Realize { .. }),
-            "the assertion is carried by a `Realize` node, got {:?}",
-            expr.node
         );
     }
 }

@@ -663,9 +663,9 @@ fn normalize(mut e: Expr, fuel: &mut usize) -> Expr {
              either a reduction rule loops or the predicate outgrew the bound"
         )
     });
-    // A realization reads as the conditional it stages: its legs are that conditional's
-    // value, split by arm.
-    if let TypedExprNode::Realize { staged, .. } = &e.node {
+    // A realized conditional reads as the conditional it stages. Its gated legs are a change of
+    // representation, not a respelling, so they are not read back.
+    if let TypedExprNode::Realized { staged, .. } = &e.node {
         return normalize(staged.clone_preserving_ids(), fuel);
     }
     e.map_children(|c| normalize(c, fuel));
@@ -3260,26 +3260,16 @@ mod tests {
         assert_ne!(filtered_sum(1), filtered_sum(2));
     }
 
-    /// A realized conditional over two collections: a term op-conversion can only compile by
-    /// iterating it.
+    /// A union of two collections: a term op-conversion can only compile by iterating it.
     #[cfg(debug_assertions)]
-    fn realized_union() -> Expr {
+    fn a_union() -> Expr {
         let arm = |n| {
             Expr::new(TypedExprNode::Var(Name::from("xs"))).with_ty(Type::data_fun(
                 Type::UIntRange(n),
                 Type::Base(BaseType::Int),
             ))
         };
-        Expr::new(TypedExprNode::Realize {
-            value: Box::new(
-                Expr::new(TypedExprNode::Copair(vec![arm(2), arm(3)])).with_ty(Type::data_fun(
-                    Type::UIntRange(2),
-                    Type::Base(BaseType::Int),
-                )),
-            ),
-            staged: Rc::new(arm(2)),
-        })
-        .with_ty(Type::data_fun(
+        Expr::new(TypedExprNode::Copair(vec![arm(2), arm(3)])).with_ty(Type::data_fun(
             Type::UIntRange(2),
             Type::Base(BaseType::Int),
         ))
@@ -3290,10 +3280,7 @@ mod tests {
     #[test]
     #[cfg(debug_assertions)]
     fn a_predicate_may_state_a_term_needing_iteration() {
-        let ty = Type::refined_one(
-            Type::UIntRange(2),
-            Refinement::born(Rc::new(realized_union())),
-        );
+        let ty = Type::refined_one(Type::UIntRange(2), Refinement::born(Rc::new(a_union())));
         debug_assert_no_iteration_markers_in_type(&ty);
     }
 

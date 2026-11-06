@@ -419,7 +419,10 @@ impl<'a> Indexed<'a> {
 /// permutation of them a move.
 fn has_unordered_children(e: &TypedExpr) -> bool {
     use super::TypedExprNode as N;
-    matches!(e.node, N::Record(_) | N::DisjointJoin(_))
+    matches!(
+        e.node,
+        N::Record(_) | N::DisjointJoin(_) | N::Realized { .. }
+    )
 }
 
 /// The direct child expressions of `e`: [`TypedExpr::child_exprs`], plus a

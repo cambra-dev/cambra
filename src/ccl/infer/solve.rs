@@ -2150,9 +2150,6 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         TypedExprNode::Cast { value, .. } => {
             coalesce_node(value, level, ctx);
         }
-        // Born after inference, so nothing here resolves — but its child is an ordinary
-        // term and still needs the walk.
-        TypedExprNode::Realize { value, .. } => coalesce_node(value, level, ctx),
         TypedExprNode::BinOp { left, right, .. } => {
             coalesce_node(left, level, ctx);
             coalesce_node(right, level, ctx);
@@ -2256,7 +2253,8 @@ fn coalesce_node_inner(expr: &mut Expr, level: Level, ctx: &mut CoalesceCtx) {
         TypedExprNode::List(elts)
         | TypedExprNode::Tuple(elts)
         | TypedExprNode::Copair(elts)
-        | TypedExprNode::DisjointJoin(elts) => {
+        | TypedExprNode::DisjointJoin(elts)
+        | TypedExprNode::Realized { legs: elts, .. } => {
             for e in elts.iter_mut() {
                 coalesce_node(e, level, ctx);
             }
