@@ -33,8 +33,18 @@ pub(super) struct LoopScope {
     /// What the inner dispatcher planned for each inner pipeline, in pipeline order.
     pub(super) planned: Vec<Planned>,
     opened: bool,
+    request: Option<Request>,
     /// The drive, which the plan fixes: found on the first call of [`drive`](Self::drive).
     drive: std::cell::OnceCell<PipelineId>,
+}
+
+struct Request {
+    guard: TileGuard,
+    rows: bool,
+    read: bool,
+    rounds: usize,
+    closing: bool,
+    round: Option<TileGuard>,
 }
 
 impl LoopScope {
@@ -143,6 +153,7 @@ impl LoopScope {
             starts,
             planned,
             opened: false,
+            request: None,
             drive: std::cell::OnceCell::new(),
         }
     }
@@ -344,29 +355,14 @@ impl LoopScope {
         }
     }
 
-    /// One round: have the operators inside the cycle read again, queue the position's path for
-    /// every pipeline the round starts, run it (`run_round`), and step the store at the position.
-    /// The store's last step pulled the operators in pull mode inside the cycle, before the
-    /// pipelines they read took this position.
-    fn round(&self, position: &[Value]) {
-        let guard = self.with_store(|store| {
-            Projection::of_path(position).guard(&store.input_tiling(InputId::ONLY))
-        });
-        self.round_at(&guard, &self.starts);
-    }
-
-    /// A round at `guard`, queued to every inner pipeline but the sources in the store's chain,
-    /// the drive among them, which emit no position for it: a round at a row the drive has emitted
-    /// every position of, or at positions it emits none of.
-    fn closing_round(&self, guard: &TileGuard) {
-        let readers: Vec<PipelineId> = (0..self.members.len())
+    fn closing_readers(&self) -> Vec<PipelineId> {
+        (0..self.members.len())
             .map(PipelineId)
             .filter(|&pipeline| {
                 !(self.inner.is_source(pipeline)
                     && matches!(self.members[pipeline.0], Member::Chain(_)))
             })
-            .collect();
-        self.round_at(guard, &readers);
+            .collect()
     }
 
     /// The row `guard`, a guard of the store's input, as each inner pipeline in `readers` takes
@@ -418,13 +414,101 @@ impl LoopScope {
             .collect()
     }
 
-    /// A round at `guard`, queued to `starts`: a position's path, queued to the pipelines a round
-    /// starts, or a closing round's region, queued to every inner pipeline but the sources
-    /// ([`closing_round`](Self::closing_round)).
-    fn round_at(&self, guard: &TileGuard, starts: &[PipelineId]) {
-        self.queue_round(guard, starts);
-        self.run_round();
-        self.step(guard);
+    fn begin_request(&mut self, guard: TileGuard) {
+        assert!(
+            self.request.is_none(),
+            "a loop completes one request before starting another"
+        );
+        if !self.opened {
+            // The drive reads before the opening step, so the step emits no position outside
+            // a round. Each emitted position must run the body before the next store step.
+            self.read_source();
+            self.with_store(|store| {
+                let none = store.input_tiling(InputId::ONLY).empty_guard();
+                store.consume_impl(InputId::ONLY, none);
+            });
+            self.opened = true;
+        }
+        let rows = self.with_store(|store| !matches!(store.tiling(), Tiling::Store { .. }));
+        if rows {
+            self.placed(|scope| scope.read_source());
+        }
+        self.request = Some(Request {
+            guard,
+            rows,
+            read: rows,
+            rounds: 0,
+            closing: false,
+            round: None,
+        });
+    }
+
+    /// Queue one round. The request remains pending until a later call finds no more rounds.
+    fn queue_next_round(&mut self) -> bool {
+        let mut request = self.request.take().expect("a loop has a pending request");
+        assert!(
+            request.round.is_none(),
+            "the body and store step complete before the next round"
+        );
+        if request.closing {
+            return false;
+        }
+        loop {
+            if !self.terminal()
+                && let Some(position) = self.next_position()
+                && request.guard.covers_path(&position)
+            {
+                let guard = self.with_store(|store| {
+                    Projection::of_path(&position).guard(&store.input_tiling(InputId::ONLY))
+                });
+                self.placed(|scope| scope.queue_round(&guard, &scope.starts));
+                request.rounds += 1;
+                request.round = Some(guard);
+                self.request = Some(request);
+                return true;
+            }
+            // A flat scope reads newly delivered source positions at most once per request,
+            // after exhausting the positions the drive buffered before this request.
+            if request.read || self.terminal() || self.next_position().is_some() {
+                break;
+            }
+            self.placed(|scope| scope.read_source());
+            request.read = true;
+        }
+        let closing = request.rows
+            || (request.rounds == 0
+                && !self.terminal()
+                && !guard_minus(
+                    &request.guard,
+                    &self.with_store(|store| store.input_released(InputId::ONLY)),
+                )
+                .is_empty());
+        if !closing {
+            return false;
+        }
+        self.placed(|scope| {
+            // A row's last position does not state the row's end. Render the drive once more
+            // at no position so the closing round can release the row whole, including an
+            // empty row. A flat request closes only positions the source emitted none of.
+            if request.rows {
+                scope.read_source();
+            }
+            scope.queue_round(&request.guard, &scope.closing_readers());
+        });
+        request.closing = true;
+        request.round = Some(request.guard.clone());
+        self.request = Some(request);
+        true
+    }
+
+    /// Step the queued round after its body and held pushes settle.
+    fn complete_round(&mut self) {
+        let guard = self
+            .request
+            .as_mut()
+            .and_then(|request| request.round.take())
+            .expect("a loop steps one queued round");
+        self.placed(|scope| scope.step(&guard));
     }
 
     /// Queue the body's work for one position or closing row, before the store steps it.
@@ -537,71 +621,11 @@ impl Breaker for LoopScope {
     /// queued one row of its store per round of the loop around it, and steps its store until
     /// the body has released the row whole, which a row of no position needs too.
     fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
-        if !self.opened {
-            // The drive consumes before the store's opening step pulls it, so it emits no position
-            // outside a round: a position emitted there would run no round of a loop nested in
-            // this one.
-            self.read_source();
-            self.with_store(|store| {
-                let none = store.input_tiling(InputId::ONLY).empty_guard();
-                store.consume_impl(InputId::ONLY, none);
-            });
-            self.opened = true;
+        self.begin_request(guard);
+        while self.queue_next_round() {
+            self.placed(|scope| scope.run_round());
+            self.complete_round();
         }
-        let rows = self.with_store(|store| !matches!(store.tiling(), Tiling::Store { .. }));
-        self.placed(|scope| {
-            if rows {
-                scope.read_source();
-            }
-            let mut rounds = 0;
-            let mut read = rows;
-            loop {
-                while !scope.terminal()
-                    && let Some(position) = scope.next_position()
-                    && guard.covers_path(&position)
-                {
-                    scope.round(&position);
-                    rounds += 1;
-                }
-                // A dispatched run notifies the drive of nothing. Once the drive has emitted
-                // every position it read, it reads its source again for what a live source
-                // delivered since, once per consume.
-                if read || scope.terminal() || scope.next_position().is_some() {
-                    break;
-                }
-                scope.read_source();
-                read = true;
-            }
-            // A package can name positions the drive runs no round at: those a filter on the
-            // drive's source dropped, keys a live source calls complete and never delivers, and
-            // the delivery that completes a source. The drive states them complete, having read
-            // past them, so a closing round at the package has every other inner pipeline read
-            // that, and the store's step releases them; the drive's next position, which lies
-            // past the package, is no part of it. A row's own closing round below closes a nested
-            // store's.
-            if rounds == 0
-                && !rows
-                && !scope.terminal()
-                && !guard_minus(
-                    &guard,
-                    &scope.with_store(|store| store.input_released(InputId::ONLY)),
-                )
-                .is_empty()
-            {
-                scope.closing_round(&guard);
-            }
-            // A drive states a row complete once the store has decided every position of it, so
-            // its rendering of the row's last position says nothing of the row's end, and a
-            // consuming memo answers from what it read then. The drive renders again at no
-            // position, and a round at the row, queued to every other inner pipeline, has each
-            // read the row again, which now states it complete; the store's step releases the
-            // row whole. Every position of the row has run a round, so a notification of the row
-            // would name nothing the drive has not been notified.
-            if rows {
-                scope.read_source();
-                scope.closing_round(&guard);
-            }
-        });
     }
 
     fn input_tiling(&self, _: InputId) -> Tiling {
@@ -824,6 +848,52 @@ mod tests {
             "a terminal body whose every decision is stepped is released whole"
         );
         assert_eq!(compiled.value(), Value::Int(6));
+    }
+
+    #[test]
+    fn requests_resume_between_rounds_independently() {
+        let mut sum = Compiled::of(SUM);
+        let mut guarded = Compiled::of(GUARDED_SUM);
+        for compiled in [&mut sum, &mut guarded] {
+            let whole = compiled.scope.input_tiling(InputId::ONLY).universal_guard();
+            compiled.scope.begin_request(whole);
+            assert!(compiled.scope.queue_next_round());
+        }
+        for position in 0..3 {
+            for compiled in [&mut sum, &mut guarded] {
+                assert!(compiled.scope.request.is_some());
+                compiled.scope.placed(|scope| scope.run_round());
+                compiled.scope.complete_round();
+                assert_eq!(
+                    store_frontier(&compiled.snapshot()),
+                    Some(Position::new(Value::UInt(position))),
+                );
+                if position < 2 {
+                    assert!(compiled.scope.queue_next_round());
+                } else {
+                    assert!(!compiled.scope.queue_next_round());
+                    assert!(compiled.scope.request.is_none());
+                }
+            }
+            if position < 2 {
+                assert!(!sum.snapshot().is_terminal());
+                assert!(!guarded.snapshot().is_terminal());
+            }
+        }
+        assert!(sum.snapshot().is_terminal());
+        assert!(guarded.snapshot().is_terminal());
+        assert_eq!(sum.value(), Value::Int(6));
+        assert_eq!(guarded.value(), Value::Int(5));
+    }
+
+    #[test]
+    #[should_panic(expected = "the body and store step complete before the next round")]
+    fn a_request_cannot_queue_the_next_round_before_stepping() {
+        let mut compiled = Compiled::of(SUM);
+        let whole = compiled.scope.input_tiling(InputId::ONLY).universal_guard();
+        compiled.scope.begin_request(whole);
+        assert!(compiled.scope.queue_next_round());
+        compiled.scope.queue_next_round();
     }
 
     /// A guarded loop's `Memo`s are inner pipelines, which each round queues the position for and

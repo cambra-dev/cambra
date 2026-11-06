@@ -1645,6 +1645,12 @@ runs none:
 4. The store consumes the position, which one step decides and releases
    ([A store as a breaker](#a-store-as-a-breaker)).
 
+`LoopScope` retains one request across its rounds. `begin_request` opens the store on the first
+request and reads the source at a nested row's start. `queue_next_round` queues one position or a
+closing row; `complete_round` steps that round after its body settles. No next round is queued before
+the previous round steps. A request ends once its positions and any closing round have completed.
+`consume_impl` drives these operations synchronously.
+
 A consume of the drive emits a position only where the package names its whole path at the
 positions' level, so a round emits one position and a round at a row emits none; a pull in pull mode
 emits the next position whatever it names. A consume at no position reads the drive's source and
