@@ -544,8 +544,12 @@ lambda elimination, after loop recognition, and after planning:
   conjunction keeps its conjuncts that do not. `∀ (𝐷 <: 0..4). (𝐷 ⤇ Int) ⇒ Int`. A generalized
   parameter is a `TypeParam` with `generalized` set, at level 0. A `Poly` is generalized when it has
   parameters and all of them are (`PolyType::is_generalized`).
+- A sum's candidates are parts of its type like any other, so a candidate naming the binder is
+  generalized: `box` of a filter reading `𝑘` is `∀ (𝐷 <: 0..3). (𝐷 ⤇ Int) ⇒ Σ (σ : [𝐷]). (σ ⤇
+  Int)`.
 - A witness projection read through a term out of scope ranges over the witness's kind, bounded
-  only where the kind is `SubtypesOf`. A parameter with no bound is below nothing but itself, which
+  only where the kind is `SubtypesOf`. A candidate of the kind that names the binder is bounded by
+  its base, as a part is. A parameter with no bound is below nothing but itself, which
   is all a body generic in the choice of a sum's domain needs: instantiation replaces the parameter
   before operator conversion reads an extent off it, and conversion reports one that reaches it as
   unsupported. A part whose base still names the binder does not generalize, and the program is
@@ -579,7 +583,10 @@ Check instantiates a generalized type where it is used: at a chain edge from the
 at a chain's head from the chain's input, and at an application from the argument
 (`generalize::instantiate`). It matches the type's domain against what it receives, with every
 binder of both read by name, and closes the result again. Each binder of the generalized type is
-paired with the binder of the received type at the same position. A family applied to binders of the
+paired with the binder of the received type at the same position, and so is each candidate of a sum.
+A sum over fewer candidates is the instance whose extra candidates repeat its last, `Σ[𝑋]` being
+`Σ[𝑋, 𝑋]`: a planned conditional that kept one arm hands a consumer stated over both arms that arm's
+sum. A family applied to binders of the
 generalized type is bound to the type received there, over the binders they pair with, and an
 application in the generalized type is that type with those binders discharged to its arguments. Two
 applications of one family are one type where they apply it at the same values, and an application
@@ -592,7 +599,9 @@ generic node is checked at its body, and so are its other type slots: a nested `
 parameter is read at its body, and its source is instantiated at the parameter's enclosing
 component. Subtyping aligns a generic side with the other first (`generalize::align`), its
 parameters renamed apart from those the other side reads, and aligns the instance's own generic
-components in turn, as a pair of generic morphisms has. A builtin's type is trusted whole. After
+components in turn, as a pair of generic morphisms has. A builtin's type is trusted whole, except
+that `unbox`'s own rule reads a generic type at its body. Op-conversion bounds a sum's keys by its
+candidates' key types, and a generic candidate's by its bound's. After
 loop recognition and after planning, `close_free_params` wraps each type slot a rebuild left reading
 a generalized parameter that nothing binds. Loop recognition reads a generic history at its body and
 builds the `Transact` from its parts, reading the writer's parameter, which the source slot's own

@@ -538,17 +538,31 @@ fn match_direct(
         (
             Type::Fun {
                 name: pn,
+                fun_kind: pk,
                 domain: pd,
                 codomain: pc,
-                ..
             },
             Type::Fun {
                 name: an,
+                fun_kind: ak,
                 domain: ad,
                 codomain: ac,
-                ..
             },
         ) => {
+            // A sum's candidates are parts of it, paired by position as its binders are. A sum
+            // over fewer candidates is below one over more, and is the instance whose extra
+            // candidates repeat its last: `Σ[𝑋]` is `Σ[𝑋, 𝑋]`. A planned conditional that kept
+            // one arm hands a consumer stated over both arms that arm's sum.
+            for (pw, aw) in pk.witnesses().iter().zip(ak.witnesses()) {
+                let actual = aw.types();
+                if actual.is_empty() || pw.types().len() < actual.len() {
+                    continue;
+                }
+                for (i, p) in pw.types().iter().enumerate() {
+                    let a = &actual[i.min(actual.len() - 1)];
+                    match_direct(p, a, params, pairs, out, met);
+                }
+            }
             match_direct(pd, ad, params, pairs, out, met);
             let mut inner = pairs.to_vec();
             if let Some(ours) = pn {
@@ -1318,7 +1332,9 @@ fn binder_domain(ty: &Type, b: &crate::ccl::Name) -> Option<Type> {
 /// and a part holding it reads its parameter.
 fn contained_first(mut groups: Vec<Type>) -> Vec<Type> {
     let contains = |outer: &Type, inner: &Type| {
-        outer != inner && abstract_go(outer, inner, &Type::Hole) != *outer
+        let mut replaced = false;
+        abstract_go(outer, inner, &Type::Hole, &mut replaced);
+        outer != inner && replaced
     };
     let mut ordered = Vec::with_capacity(groups.len());
     while !groups.is_empty() {
@@ -1355,6 +1371,43 @@ fn part_range(
             .witness()
             .map(|w| w.type_kind())
             .unwrap_or(crate::ccl::ty::TypeKind::Type);
+        // A candidate naming a binder out of scope is bounded as a part is: by its base, without
+        // the refinements that name the binder.
+        let in_scope = |c: &Type| -> Result<Type, Ungeneralizable> {
+            if !crate::ccl::subst::type_free_vars(c)
+                .iter()
+                .any(out_of_scope)
+            {
+                return Ok(c.clone());
+            }
+            let base = refinements_in_scope(c, out_of_scope, reads_own);
+            if crate::ccl::subst::type_free_vars(&base)
+                .iter()
+                .any(out_of_scope)
+            {
+                return Err(Ungeneralizable(format!(
+                    "`{at}`'s type reads `{group}`, whose candidate `{c}` still names a binder \
+                     out of scope once its refinements naming it are dropped"
+                )));
+            }
+            Ok(closed_deep(&base))
+        };
+        let kind = match kind {
+            crate::ccl::ty::TypeKind::Enumerated(candidates) => {
+                let mut kept: Vec<Type> = Vec::with_capacity(candidates.len());
+                for c in &candidates {
+                    let c = in_scope(c)?;
+                    if !kept.contains(&c) {
+                        kept.push(c);
+                    }
+                }
+                crate::ccl::ty::TypeKind::Enumerated(kept)
+            }
+            crate::ccl::ty::TypeKind::SubtypesOf(b) => {
+                crate::ccl::ty::TypeKind::SubtypesOf(Box::new(in_scope(&b)?))
+            }
+            other => other,
+        };
         let bound = match &kind {
             crate::ccl::ty::TypeKind::SubtypesOf(b) => Some((**b).clone()),
             _ => None,
@@ -1471,7 +1524,20 @@ fn abstract_deep(
     d: &Type,
     out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
 ) -> Type {
-    let mut out = abstract_go(ty, group, d);
+    abstract_deep_go(ty, group, d, out_of_scope, &mut false)
+}
+
+/// [`abstract_deep`], setting `replaced` where it replaced anything. Reported rather than read
+/// off the result: a type compares a Σ's binder by identity, not by its candidates, so a rewrite
+/// of a candidate leaves the type equal to what it was.
+fn abstract_deep_go(
+    ty: &Type,
+    group: &Type,
+    d: &Type,
+    out_of_scope: &dyn Fn(&crate::ccl::Name) -> bool,
+    replaced: &mut bool,
+) -> Type {
+    let mut out = abstract_go(ty, group, d, replaced);
     crate::ccl::ccl_utils::walk_quoted_terms_mut(
         &mut out,
         &crate::ccl::ccl_utils::PredMemo::default(),
@@ -1485,21 +1551,24 @@ fn abstract_deep(
             ) -> bool {
                 let mut changed = false;
                 e.walk_type_slots_mut(|t| {
-                    let next = abstract_deep(t, group, d, out_of_scope);
-                    changed |= next != *t;
-                    *t = next;
+                    *t = abstract_deep_go(t, group, d, out_of_scope, &mut changed);
                 });
                 e.walk_children_mut(|c| changed |= in_term(c, group, d, out_of_scope));
                 changed
             }
-            in_term(term, group, d, out_of_scope)
+            let changed = in_term(term, group, d, out_of_scope);
+            *replaced |= changed;
+            changed
         },
     );
     out
 }
 
-fn abstract_go(ty: &Type, group: &Type, d: &Type) -> Type {
+/// `ty` with `group` replaced by `d` ([`abstract_deep`] outside the terms `ty` quotes), setting
+/// `replaced` where it replaced anything.
+fn abstract_go(ty: &Type, group: &Type, d: &Type, replaced: &mut bool) -> Type {
     if ty == group {
+        *replaced = true;
         return d.clone();
     }
     if let (Type::Refinement(base, refinements), Type::Refinement(gbase, grefinements)) =
@@ -1514,12 +1583,13 @@ fn abstract_go(ty: &Type, group: &Type, d: &Type) -> Type {
             .filter(|r| !grefinements.iter().any(|g| g == *r))
             .cloned()
             .collect();
+        *replaced = true;
         return Type::refined(d.clone(), rest);
     }
     // The type is abstracted opened, its dependent tuples reading their components by name;
     // closing it again ([`closed_deep`]) makes a tuple whose components read none plain.
     let mut out = ty.clone();
-    out.walk_children_mut(|c| *c = abstract_go(c, group, d));
+    out.walk_children_mut(|c| *c = abstract_go(c, group, d, replaced));
     out
 }
 
