@@ -6,7 +6,7 @@ use bit_set::BitSet;
 use super::*;
 use crate::interpreter::operator_graph::{value, value_at};
 use crate::interpreter::{
-    Consumer, Projection, RowIndex, Scheduler, Value, shared_consumer, tuple_field,
+    Consumer, Projection, RowIndex, SubscribeContext, Value, shared_consumer, tuple_field,
 };
 
 /// Pairs its operands at `level`, producing a collection carrying the levels standing above it
@@ -187,18 +187,18 @@ impl TileOperator for RecordWrap {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // The input is pulled at the projection.
-        let input =
-            self.input
-                .subscribe(self.input.tiling().universal_guard(), consumer, scheduler);
+        let input = self
+            .input
+            .subscribe(self.input.tiling().universal_guard(), consumer, cx);
         Box::new(RecordWrapProducer {
             base: ProducerBase::new(
                 RecordWrapProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             ),
             name: self.name.clone(),
             level: self.level,
@@ -278,24 +278,19 @@ impl TileOperator for Zip {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
         Box::new(ZipProducer {
-            base: ProducerBase::new(
-                ZipProducer::alloc_id(),
-                self.tiling(),
-                &self.base,
-                scheduler,
-            )
-            .sharing(gate),
+            base: ProducerBase::new(ZipProducer::alloc_id(), self.tiling(), &self.base, cx)
+                .sharing(gate),
             names: self.names.clone(),
             level: self.level,
             inputs: self
                 .inputs
                 .iter_mut()
                 // Every arm is pulled at the projection: the arms share the pair's keys.
-                .map(|i| subscribe_forwarding_keeping_keys(&mut **i, &shared, scheduler))
+                .map(|i| subscribe_forwarding_keeping_keys(&mut **i, &shared, cx))
                 .collect(),
         })
     }
@@ -777,7 +772,7 @@ impl TileOperator for MakeRecord {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         let (shared, gate) = shared_consumer(consumer);
         Box::new(MakeRecordProducer {
@@ -785,14 +780,14 @@ impl TileOperator for MakeRecord {
                 MakeRecordProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             )
             .sharing(gate),
             names: self.names.clone(),
             inputs: self
                 .inputs
                 .iter_mut()
-                .map(|i| subscribe_forwarding(&mut **i, &shared, scheduler))
+                .map(|i| subscribe_forwarding(&mut **i, &shared, cx))
                 .collect(),
         })
     }
@@ -982,7 +977,7 @@ impl TileOperator for SelectField {
         &mut self,
         _intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer> {
         // A stream of records is pulled at the projection; a product of collections is read whole.
         let keeps_keys = self.input.tiling().is_data_function();
@@ -992,14 +987,14 @@ impl TileOperator for SelectField {
         let input_producer = self.input.subscribe(
             input_tiling.universal_guard(),
             consumer_keeping_keys_if(keeps_keys, consumer),
-            scheduler,
+            cx,
         );
         Box::new(SelectFieldProducer {
             base: ProducerBase::new(
                 SelectFieldProducer::alloc_id(),
                 self.tiling(),
                 &self.base,
-                scheduler,
+                cx,
             ),
             input: input_producer,
             name: self.name.clone(),
@@ -1412,7 +1407,7 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
-            _scheduler: &mut Scheduler,
+            _cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             unreachable!("only the correlation is read")
         }

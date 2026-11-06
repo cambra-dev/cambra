@@ -398,8 +398,8 @@ keep that separation, per the note below.
 
 **A branch's producers are the ones its version's compile registered and the ones under the
 operators it holds.** A producer registers with a source from `IterateExtent::subscribe`, which
-reports it to the innermost frame `Scheduler::begin_source_producers` opened. A fan-out opens a
-frame around subscribing its input and keeps what it collects (`FanOut::source_producers`), so the
+reports it to the innermost frame `SubscribeContext::begin_source_producers` opened. A fan-out opens
+a frame around subscribing its input and keeps what it collects (`FanOut::source_producers`), so the
 producers under a kept operator are read off the operator. A compile opens a frame around conversion
 and subscription and keeps what it collects (`CompiledProgram::source_producers`), which covers its
 outputs' producers. The carry runs before the reloaded branch's teardown, because the teardown drops

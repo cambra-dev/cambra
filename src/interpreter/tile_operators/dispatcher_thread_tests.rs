@@ -125,7 +125,11 @@ impl Script {
 
     fn start(&self, dispatcher: &Dispatcher) {
         for pipeline in (0..self.count()).filter(|p| self.reads[*p].is_empty()) {
-            dispatcher.start_source(PipelineId(pipeline), &keys_tiling(self.positions[pipeline]));
+            dispatcher.start_source(
+                PipelineId(pipeline),
+                &keys_tiling(self.positions[pipeline]),
+                &keys_tiling(self.positions[pipeline]).empty_guard(),
+            );
         }
     }
 

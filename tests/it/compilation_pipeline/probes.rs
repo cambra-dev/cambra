@@ -45,7 +45,7 @@ fn every_probed_node_is_an_operator_of_the_served_graph() {
         compile_program(&mut ctx, &loaded, Box::new(|| {})).unwrap_or_render(&loaded);
     // After the subscribe, as `/api/live` switches it: every producer already
     // holds the slot this fills.
-    ctx.scheduler().probes().enable();
+    ctx.subscribe_context().probes().enable();
     let producer = compiled
         .main_mut()
         .and_then(|output| output.producer.as_mut())
@@ -70,7 +70,7 @@ fn every_probed_node_is_an_operator_of_the_served_graph() {
         })
         .collect();
     let probed: Vec<Option<NodeId>> = ctx
-        .scheduler()
+        .subscribe_context()
         .probes()
         .with_table(|table| table.probe_keys().map(|(node, _)| node).collect())
         .expect("probing is on");

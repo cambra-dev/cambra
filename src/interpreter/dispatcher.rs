@@ -32,7 +32,10 @@ use crate::interpreter::{
 pub(crate) mod loop_scope;
 mod plan;
 
-pub use plan::{Planned, Refused, Run, run_program, run_program_into, run_program_polling};
+pub use plan::{
+    Ended, Planned, Refused, Run, RunObserver, Targets, run_program, run_program_into,
+    run_program_polling,
+};
 
 /// A pipeline, by its index in the [`Dispatcher`].
 #[derive(Clone, Copy)]
@@ -396,6 +399,9 @@ struct PipelineState {
     acknowledged: AtomicUsize,
     /// For an ordered pipeline, whether a package of it is in flight.
     in_flight: AtomicBool,
+    /// Whether this pipeline waits for its loop's round to settle before following its reads.
+    followers_held: AtomicBool,
+    held: AtomicBool,
     /// For a pipeline that parks its arrivals ([`Dispatcher::park`]), the morsels notified that
     /// the pipelines it reads have not decided yet.
     // shared-state-ok: guards naming regions of the pipeline's input, which its notifies and the
@@ -408,8 +414,6 @@ struct PipelineState {
     // shared-state-ok: a guard naming a region of the pipeline's input, which the pushes to it grow
     // under the `parked` lock; never a tile.
     brought: Mutex<Option<TileGuard>>,
-    followers_held: AtomicBool,
-    held: AtomicBool,
 }
 
 /// What one source of a pipeline's breaker's input has decided of that input: a pipeline it
@@ -568,7 +572,7 @@ impl Dispatcher {
             .collect();
         let states = infos
             .iter()
-            .map(|info| PipelineState::new(info.reads.len()))
+            .map(|info: &PipelineInfo| PipelineState::new(info.reads.len()))
             .collect();
         Self {
             morsel_rows,
@@ -625,6 +629,7 @@ impl Dispatcher {
         self.done.store(false, Ordering::Relaxed);
         offset
     }
+
     /// Add a pipeline after its dependencies, before execution starts.
     pub(crate) fn add_pipeline(&mut self, reads: Vec<PipelineId>) -> PipelineId {
         let pipeline = self.infos.len();
@@ -657,6 +662,7 @@ impl Dispatcher {
         self.done.store(false, Ordering::Relaxed);
         PipelineId(pipeline)
     }
+
     /// Accept pushes at this entry only from the configured input graph.
     pub(crate) fn restrict_ingress(&mut self, pipeline: PipelineId, from: std::ops::Range<usize>) {
         assert!(
@@ -665,12 +671,14 @@ impl Dispatcher {
         );
         self.infos[pipeline.0].ingress = Some(from);
     }
+
     /// Hold a pipeline's packages and finish until it is activated by its execution handler.
     pub(crate) fn hold_pipeline(&self, pipeline: PipelineId, held: bool) {
         if self.state(pipeline).held.swap(held, Ordering::SeqCst) != held {
             self.advance();
         }
     }
+
     /// The count of the dispatcher's changes so far ([`Generation`]): an equal count read twice
     /// says nothing was queued, consumed or finished between.
     pub(crate) fn changes(&self) -> u64 {
@@ -715,7 +723,7 @@ impl Dispatcher {
 
     /// [`queue_for`](Self::queue_for) for a loop's round: the row of a nested loop's store, which
     /// follows the pipelines inside the cycle around it ([`follow`](Self::follow)), or a row the
-    /// closing round has every inner pipeline read again (`InductionStoreProducer`). A reader that
+    /// closing round has every inner pipeline read again. A reader that
     /// parks takes the row again whatever it took before, and only once the pipelines it reads
     /// have decided all of it, the row's end with its rows ([`Parked`]).
     pub(crate) fn queue_round(&self, reader: PipelineId, guard: &TileGuard) {
@@ -1333,26 +1341,34 @@ impl Dispatcher {
         }
     }
 
-    /// Queue a source pipeline's input whole and close the source: `input`,
-    /// the tiling its breaker's input answers, as one package per morsel ([`seed`]). It queues as
-    /// [`notify`](Self::notify) would, without waiting for any limit, the universal guard cut by
-    /// the range of positions `input` states, then [`close`](Self::close)s the source.
+    /// Queue a source pipeline's input and close the source: `input`, the
+    /// tiling its breaker's input answers, less `released`, what the breaker's input has already
+    /// released, as one package per morsel ([`seed`]). A run's first start passes nothing
+    /// released; a run after a pause or a reload starts over a breaker that consumed, and queues
+    /// it nothing it has finished with. It queues as [`notify`](Self::notify) would, without
+    /// waiting for any limit, then [`close`](Self::close)s the source.
     ///
     /// # Panics
     ///
-    /// When `pipeline` reads a pipeline, or is closed.
-    pub fn start_source(&self, pipeline: PipelineId, input: &Tiling) {
+    /// When `pipeline` reads a pipeline, or is closed, and where the guard algebra has no exact
+    /// difference of a morsel and `released` ([`guard_minus`]).
+    pub fn start_source(&self, pipeline: PipelineId, input: &Tiling, released: &TileGuard) {
         self.ensure(self.infos[pipeline.0].reads.is_empty(), || {
             format!(
                 "pipeline {} starts whole only as a source, which reads no pipeline",
                 pipeline.0
             )
         });
-        let morsels = seed(input, self.morsel_rows);
+        let left = guard_minus(&input.universal_guard(), released).closed_over(input);
+        let morsels: Vec<TileGuard> = seed(input, self.morsel_rows)
+            .iter()
+            .map(|morsel| guard_minus(morsel, released).closed_over(input))
+            .filter(|morsel| !morsel.is_empty())
+            .collect();
         debug_assert!(
-            partition_gap(&input.universal_guard(), &morsels).is_none(),
-            "the morsels of a source's input partition it: {}",
-            partition_gap(&input.universal_guard(), &morsels).unwrap_or_default()
+            partition_gap(&left, &morsels).is_none(),
+            "the morsels of a source's unreleased input partition it: {}",
+            partition_gap(&left, &morsels).unwrap_or_default()
         );
         self.append_to_source(pipeline, &morsels);
         self.close(pipeline);
@@ -2864,7 +2880,9 @@ fn start_with(dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
                 input = Some(breaker.input_tiling(at));
             });
             let input = input.expect("a reach calls the breaker it reaches");
-            dispatcher.start_source(PipelineId(pipeline), &input);
+            // A run with no live source has no boundary to pause at, so it starts over breakers
+            // that have consumed nothing.
+            dispatcher.start_source(PipelineId(pipeline), &input, &input.empty_guard());
         }
     }
 }

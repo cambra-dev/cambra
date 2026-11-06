@@ -390,6 +390,53 @@ fn a_reader_takes_nothing_before_the_pipeline_it_follows_is_quiescent() {
     assert_eq!(consumed_by(&events, 2), vec![low]);
 }
 
+/// Two loops in one dispatcher hold and release their step pipelines independently while the
+/// bodies' pushes settle. Releasing one loop does not release the other's step.
+#[test]
+fn loop_steps_are_held_independently_in_one_dispatcher() {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![0], vec![1]], 1);
+    for (step, body) in [(2, 0), (3, 1)] {
+        dispatcher.order(PipelineId(step));
+        dispatcher.follow(PipelineId(step), PipelineId(body));
+        dispatcher.notify(PipelineId(body), &keys_between(0, 0));
+        dispatcher.queue_for(PipelineId(step), &keys_between(0, 0));
+    }
+    dispatcher.hold_followers([PipelineId(2), PipelineId(3)], true);
+    for body in [0, 1] {
+        let Next::Package(package) = dispatcher.try_claim(Some(PipelineId(body))) else {
+            panic!("each loop's body is claimable while its step is held");
+        };
+        assert_eq!(package.pipeline, PipelineId(body));
+        dispatcher.acknowledge(package);
+    }
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+
+    dispatcher.hold_followers([PipelineId(3)], false);
+    let Next::Package(package) = dispatcher.try_claim(Some(PipelineId(2))) else {
+        panic!("the second loop's step is released");
+    };
+    assert_eq!(package.pipeline, PipelineId(3));
+    dispatcher.acknowledge(package);
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+
+    dispatcher.hold_followers([PipelineId(2)], false);
+    let Next::Package(package) = dispatcher.try_claim(None) else {
+        panic!("the first loop's step is released");
+    };
+    assert_eq!(package.pipeline, PipelineId(2));
+    dispatcher.acknowledge(package);
+    for body in [0, 1] {
+        dispatcher.close(PipelineId(body));
+    }
+    loop {
+        match dispatcher.try_claim(None) {
+            Next::Finish { pipeline, .. } => dispatcher.finish(dispatcher.pushes(pipeline)),
+            Next::Done => break,
+            _ => panic!("both loops have consumed their bodies and steps"),
+        }
+    }
+}
+
 /// The driver consumes the lowest pipeline's package first and finishes only when nothing is
 /// queued, which pins the order across two chains: pipeline 0's push lands as it consumes, and
 /// pipeline 2 consumes it before any pipeline finishes.
@@ -489,7 +536,7 @@ fn a_source_pipeline_finishes_after_its_input_released_what_was_queued() {
     let memo = memo_over_rows(0..6);
     let handle: BreakerHandle = memo.clone();
     let dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
-    dispatcher.start_source(PipelineId(0), &ints());
+    dispatcher.start_source(PipelineId(0), &ints(), &ints().empty_guard());
     let Next::Package(package) = dispatcher.try_claim(None) else {
         panic!("a started source hands out its package")
     };
@@ -1178,7 +1225,7 @@ fn a_package_not_claimed_is_refused() {
 #[should_panic(expected = "pipeline 0 consumes a package claimed for it")]
 fn a_package_acknowledged_twice_is_refused() {
     let dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
-    dispatcher.start_source(PipelineId(0), &ints());
+    dispatcher.start_source(PipelineId(0), &ints(), &ints().empty_guard());
     let package = dispatcher.pop().expect("the source's one package");
     dispatcher.acknowledge(package.clone());
     dispatcher.acknowledge(package);
@@ -1189,8 +1236,8 @@ fn a_package_acknowledged_twice_is_refused() {
 #[should_panic(expected = "pipeline 0 is queued nothing once it is closed")]
 fn a_second_start_of_a_source_is_refused() {
     let dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
-    dispatcher.start_source(PipelineId(0), &ints());
-    dispatcher.start_source(PipelineId(0), &ints());
+    dispatcher.start_source(PipelineId(0), &ints(), &ints().empty_guard());
+    dispatcher.start_source(PipelineId(0), &ints(), &ints().empty_guard());
 }
 
 /// Every refusal fails the run before it panics, so a later claim answers `Failed` though no
@@ -1200,11 +1247,11 @@ fn a_refusal_fails_the_run_before_it_panics() {
     type Misuse = fn(&Dispatcher);
     let misuses: [(&str, Misuse); 5] = [
         ("a second start", |dispatcher| {
-            dispatcher.start_source(PipelineId(0), &ints())
+            dispatcher.start_source(PipelineId(0), &ints(), &ints().empty_guard())
         }),
         (
             "a source start of a pipeline that reads one",
-            |dispatcher| dispatcher.start_source(PipelineId(1), &ints()),
+            |dispatcher| dispatcher.start_source(PipelineId(1), &ints(), &ints().empty_guard()),
         ),
         ("an acknowledgement for no pipeline", |dispatcher| {
             dispatcher.acknowledge(WorkPackage {
@@ -1225,7 +1272,7 @@ fn a_refusal_fails_the_run_before_it_panics() {
     ];
     for (what, misuse) in misuses {
         let dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-        dispatcher.start_source(PipelineId(0), &ints());
+        dispatcher.start_source(PipelineId(0), &ints(), &ints().empty_guard());
         let refused =
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| misuse(&dispatcher)));
         assert!(refused.is_err(), "{what} is refused");
@@ -1752,7 +1799,7 @@ fn a_push_reaches_every_slot_of_a_fan_out() {
     let scripted = Scripted::cutting(ints().universal_guard(), vec![low.clone(), high.clone()]);
     let (feed, input) = NotifyingOp::new(ints().empty_tile(), ints());
     let fan = FanOut::new(Box::new(feed));
-    let mut scheduler = Scheduler::new();
+    let mut cx = SubscribeContext::new();
     let _slots: Vec<_> = (1..=2)
         .map(|reader| {
             let entry = crate::interpreter::dispatcher::Entry::new(
@@ -1762,7 +1809,7 @@ fn a_push_reaches_every_slot_of_a_fan_out() {
             );
             let mut slot = fan.slot();
             let guard = slot.tiling().universal_guard();
-            slot.subscribe(guard, Box::new(entry), &mut scheduler)
+            slot.subscribe(guard, Box::new(entry), &mut cx)
         })
         .collect();
     scripted
@@ -1808,51 +1855,20 @@ impl Consumer for Through {
     }
 }
 
-/// Two loops in one dispatcher hold and release their step pipelines independently while the
-/// bodies' pushes settle. Releasing one loop does not release the other's step.
+/// A source whose input was released whole, as a scalar a run before a pause or a reload took, is
+/// queued no package when a later run starts it, and finishes once claimed.
 #[test]
-fn loop_steps_are_held_independently_in_one_dispatcher() {
-    let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![0], vec![1]], 1);
-    for (step, body) in [(2, 0), (3, 1)] {
-        dispatcher.order(PipelineId(step));
-        dispatcher.follow(PipelineId(step), PipelineId(body));
-        dispatcher.notify(PipelineId(body), &keys_between(0, 0));
-        dispatcher.queue_for(PipelineId(step), &keys_between(0, 0));
-    }
-    dispatcher.hold_followers([PipelineId(2), PipelineId(3)], true);
-    for body in [0, 1] {
-        let Next::Package(package) = dispatcher.try_claim(Some(PipelineId(body))) else {
-            panic!("each loop's body is claimable while its step is held");
-        };
-        assert_eq!(package.pipeline, PipelineId(body));
-        dispatcher.acknowledge(package);
-    }
-    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
-
-    dispatcher.hold_followers([PipelineId(3)], false);
-    let Next::Package(package) = dispatcher.try_claim(Some(PipelineId(2))) else {
-        panic!("the second loop's step is released");
-    };
-    assert_eq!(package.pipeline, PipelineId(3));
-    dispatcher.acknowledge(package);
-    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
-
-    dispatcher.hold_followers([PipelineId(2)], false);
-    let Next::Package(package) = dispatcher.try_claim(None) else {
-        panic!("the first loop's step is released");
-    };
-    assert_eq!(package.pipeline, PipelineId(2));
-    dispatcher.acknowledge(package);
-    for body in [0, 1] {
-        dispatcher.close(PipelineId(body));
-    }
-    loop {
-        match dispatcher.try_claim(None) {
-            Next::Finish { pipeline, .. } => dispatcher.finish(dispatcher.pushes(pipeline)),
-            Next::Done => break,
-            _ => panic!("both loops have consumed their bodies and steps"),
-        }
-    }
+fn a_source_started_over_an_input_released_whole_is_queued_nothing() {
+    let scalar = Tiling::Scalar(Extent::Base(BaseType::Int));
+    let dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
+    dispatcher.start_source(PipelineId(0), &scalar, &scalar.universal_guard());
+    assert!(
+        matches!(
+            dispatcher.try_claim(None),
+            Next::Finish { consumed: None, .. }
+        ),
+        "nothing is queued, so the closed source finishes at once"
+    );
 }
 
 #[test]
@@ -1909,6 +1925,37 @@ fn an_appended_graph_keeps_queued_work_and_follows_its_own_dependencies() {
 }
 
 #[test]
+fn appended_shared_pushes_are_deduplicated_without_reusing_the_original_graphs_record() {
+    let reads = vec![vec![], vec![0], vec![], vec![], vec![2, 3]];
+    let breakers: Vec<BreakerHandle> = (0..reads.len())
+        .map(|_| Scripted::holding(ints().universal_guard()) as BreakerHandle)
+        .collect();
+    wire(&reads, &breakers);
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    let mut body = Dispatcher::new(vec![vec![], vec![], vec![0, 1]], UNBOUNDED);
+    body.share_pushes(&[PipelineId(0), PipelineId(1)]);
+    assert_eq!(dispatcher.append_graph(body), 2);
+
+    for pipeline in [0, 2, 3] {
+        let mut pushes = dispatcher.pushes(PipelineId(pipeline));
+        {
+            let breaker = breakers[pipeline].borrow();
+            pushes.push_final(breaker.as_producer().expect("a scripted breaker pushes"));
+        }
+        dispatcher.land(pushes);
+    }
+    for expected in [1, 4] {
+        let Next::Package(package) = dispatcher.try_claim(None) else {
+            panic!("each graph's reader receives one retained-output package")
+        };
+        assert_eq!(package.pipeline, PipelineId(expected));
+        assert_eq!(package.guard, ints().universal_guard());
+        dispatcher.acknowledge(package);
+    }
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+}
+
+#[test]
 fn an_added_step_pipeline_waits_for_its_body_and_its_claim_hold() {
     let mut dispatcher = Dispatcher::new(vec![vec![], vec![]], UNBOUNDED);
     dispatcher.close(PipelineId(0));
@@ -1955,37 +2002,6 @@ fn an_added_step_pipeline_waits_for_its_body_and_its_claim_hold() {
     assert_eq!(pipeline, PipelineId(0));
     dispatcher.finish(dispatcher.pushes(pipeline));
     assert!(matches!(dispatcher.try_claim(None), Next::Done));
-}
-
-#[test]
-fn appended_shared_pushes_are_deduplicated_without_reusing_the_original_graphs_record() {
-    let reads = vec![vec![], vec![0], vec![], vec![], vec![2, 3]];
-    let breakers: Vec<BreakerHandle> = (0..reads.len())
-        .map(|_| Scripted::holding(ints().universal_guard()) as BreakerHandle)
-        .collect();
-    wire(&reads, &breakers);
-    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
-    let mut body = Dispatcher::new(vec![vec![], vec![], vec![0, 1]], UNBOUNDED);
-    body.share_pushes(&[PipelineId(0), PipelineId(1)]);
-    assert_eq!(dispatcher.append_graph(body), 2);
-
-    for pipeline in [0, 2, 3] {
-        let mut pushes = dispatcher.pushes(PipelineId(pipeline));
-        {
-            let breaker = breakers[pipeline].borrow();
-            pushes.push_final(breaker.as_producer().expect("a scripted breaker pushes"));
-        }
-        dispatcher.land(pushes);
-    }
-    for expected in [1, 4] {
-        let Next::Package(package) = dispatcher.try_claim(None) else {
-            panic!("each graph's reader receives one retained-output package")
-        };
-        assert_eq!(package.pipeline, PipelineId(expected));
-        assert_eq!(package.guard, ints().universal_guard());
-        dispatcher.acknowledge(package);
-    }
-    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
 }
 
 #[test]

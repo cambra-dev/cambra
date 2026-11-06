@@ -123,12 +123,15 @@ fn await_reloaded_frame(socket: &mut WebSocket<TcpStream>, deadline: Instant) {
 
 /// A reload of `main` replaces the served payload with the new version's, and
 /// creating another branch does not.
-#[test]
-fn the_served_payload_follows_a_reload_of_main_and_no_other_branch() {
+#[rstest::rstest]
+fn the_served_payload_follows_a_reload_of_main_and_no_other_branch(
+    #[values("0", "1")] dispatch: &str,
+) {
     let inspect = reserve_test_port();
     let launched = launch_under_control_with(
         "[\"A\" + line for line in stdin()]\n",
         &[format!("--inspect={inspect}")],
+        dispatch,
     );
     await_inspector(inspect);
 
@@ -170,12 +173,13 @@ fn the_served_payload_follows_a_reload_of_main_and_no_other_branch() {
 /// After a reload of `main`, probe frames carry the new version, and
 /// `/api/snapshot` already serves that version when the first such frame
 /// arrives (`src/inspector_model/design.md`, "A reload of main is followed").
-#[test]
-fn probe_frames_follow_a_reload_of_main_after_the_payload_does() {
+#[rstest::rstest]
+fn probe_frames_follow_a_reload_of_main_after_the_payload_does(#[values("0", "1")] dispatch: &str) {
     let inspect = reserve_test_port();
     let mut launched = launch_under_control_with(
         "[\"A\" + line for line in stdin()]\n",
         &[format!("--inspect={inspect}")],
+        dispatch,
     );
     await_inspector(inspect);
     let mut socket = connect_live(inspect);
@@ -214,12 +218,13 @@ fn probe_frames_follow_a_reload_of_main_after_the_payload_does() {
 /// The first version can publish a frame of its own before the reload. Each
 /// constant's first reading carries its row, and the driver takes it with
 /// probing on when the client connects before the driver's first pass.
-#[test]
-fn a_reload_of_main_publishes_a_frame_before_any_input() {
+#[rstest::rstest]
+fn a_reload_of_main_publishes_a_frame_before_any_input(#[values("0", "1")] dispatch: &str) {
     let inspect = reserve_test_port();
     let launched = launch_under_control_with(
         "[\"A\" + line for line in stdin()]\n",
         &[format!("--inspect={inspect}")],
+        dispatch,
     );
     await_inspector(inspect);
     let mut socket = connect_live(inspect);

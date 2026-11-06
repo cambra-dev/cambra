@@ -35,7 +35,7 @@ use crate::{
     interpreter::operator_graph::{EdgeKind, InputEdgeSpec},
     interpreter::value_probe::ProbeSlot,
     interpreter::{
-        ColumnValue, Consumer, Extent, Gate, GatedConsumer, Projection, Scheduler, Value,
+        ColumnValue, Consumer, Extent, Gate, GatedConsumer, Projection, SubscribeContext, Value,
         forwarding_consumer, forwarding_consumer_keeping_keys, validate_tile, widening,
     },
     pretty_graph::VizOptions,
@@ -133,7 +133,7 @@ pub trait TileOperator {
     }
 
     /// Constructs one producer for `consumer` over the requested `intent_guard` region.
-    /// Its [`ProducerBase`] names this operator and holds `scheduler`'s probe slot.
+    /// Its [`ProducerBase`] names this operator and holds `cx`'s probe slot.
     /// An input's producer comes from the input's own `subscribe`, which attributes it
     /// to that operator.
     /// See `src/interpreter/design-operators.md`, "The producer protocol".
@@ -141,7 +141,7 @@ pub trait TileOperator {
         &mut self,
         intent_guard: TileGuard,
         consumer: Box<dyn Consumer>,
-        scheduler: &mut Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Box<dyn TileProducer>;
 
     /// Render this operator and what it holds as an [`InspectNode`].
@@ -201,12 +201,12 @@ static PRODUCER_COUNTERS: OnceLock<Mutex<HashMap<&'static str, usize>>> = OnceLo
 pub(crate) fn subscribe_forwarding(
     op: &mut dyn TileOperator,
     shared: &GatedConsumer,
-    scheduler: &mut Scheduler,
+    cx: &mut SubscribeContext,
 ) -> Box<dyn TileProducer> {
     op.subscribe(
         op.tiling().universal_guard(),
-        forwarding_consumer(shared, &scheduler.wakeup_queue()),
-        scheduler,
+        forwarding_consumer(shared, &cx.scheduler().wakeup_queue()),
+        cx,
     )
 }
 
@@ -230,12 +230,12 @@ pub(crate) fn consumer_keeping_keys_if(
 pub(crate) fn subscribe_forwarding_keeping_keys(
     op: &mut dyn TileOperator,
     shared: &GatedConsumer,
-    scheduler: &mut Scheduler,
+    cx: &mut SubscribeContext,
 ) -> Box<dyn TileProducer> {
     op.subscribe(
         op.tiling().universal_guard(),
-        forwarding_consumer_keeping_keys(shared, &scheduler.wakeup_queue()),
-        scheduler,
+        forwarding_consumer_keeping_keys(shared, &cx.scheduler().wakeup_queue()),
+        cx,
     )
 }
 
@@ -244,11 +244,11 @@ pub(crate) fn subscribe_forwarding_keeping_keys_if(
     keeps_keys: bool,
     op: &mut dyn TileOperator,
     shared: &GatedConsumer,
-    scheduler: &mut Scheduler,
+    cx: &mut SubscribeContext,
 ) -> Box<dyn TileProducer> {
     match keeps_keys {
-        true => subscribe_forwarding_keeping_keys(op, shared, scheduler),
-        false => subscribe_forwarding(op, shared, scheduler),
+        true => subscribe_forwarding_keeping_keys(op, shared, cx),
+        false => subscribe_forwarding(op, shared, cx),
     }
 }
 
@@ -275,12 +275,12 @@ impl BreakerInput {
         consumer: Box<dyn Consumer>,
         input: &Tiling,
         keeps_keys: bool,
-        scheduler: &Scheduler,
+        cx: &mut SubscribeContext,
     ) -> Self {
         let shared = GatedConsumer::new(consumer, Notified::Always);
         let forwarding = match keeps_keys {
-            true => forwarding_consumer_keeping_keys(&shared, &scheduler.wakeup_queue()),
-            false => forwarding_consumer(&shared, &scheduler.wakeup_queue()),
+            true => forwarding_consumer_keeping_keys(&shared, &cx.scheduler().wakeup_queue()),
+            false => forwarding_consumer(&shared, &cx.scheduler().wakeup_queue()),
         };
         let (entry, placement) =
             crate::interpreter::dispatcher::Entry::unplaced(input.clone(), forwarding);
@@ -928,7 +928,7 @@ pub struct ProducerBase {
     /// The operator that built this producer. `None` only for a test double
     /// built with `ProducerBase::unowned`.
     pub node_id: Option<NodeId>,
-    /// The probe slot of the scheduler this producer was subscribed under,
+    /// The probe slot of the subscribe context this producer was subscribed under,
     /// written on every [`TileProducer::get`] while it holds a table.
     pub(crate) probes: ProbeSlot,
     /// Output tiling for this producer.
@@ -960,12 +960,12 @@ impl ProducerBase {
         id: usize,
         tiling: &Tiling,
         owner: &OperatorBase,
-        scheduler: &Scheduler,
+        cx: &SubscribeContext,
     ) -> Self {
         Self {
             id,
             node_id: Some(owner.id),
-            probes: scheduler.probes().clone(),
+            probes: cx.probes().clone(),
             tiling: tiling.clone(),
             obsolete_guard: tiling.empty_guard(),
             gate: None,
@@ -1331,9 +1331,13 @@ pub(crate) fn cut_before(region: &Predicate, cuts: &[Value], domain: &Extent) ->
 }
 
 /// Why `morsels` do not partition `guard`, or `None` when they do: each morsel is non-empty, no
-/// two intersect, and their union is `guard`. One morsel partitions `guard` when it is `guard`;
-/// several are guards of a collection's outermost keys.
+/// two intersect, and their union is `guard`. An empty list partitions exactly an empty guard. One
+/// morsel partitions `guard` when it is `guard`; several are guards of a collection's outermost
+/// keys.
 pub(crate) fn partition_gap(guard: &TileGuard, morsels: &[TileGuard]) -> Option<String> {
+    if morsels.is_empty() {
+        return (!guard.is_empty()).then(|| format!("no morsel of {guard:?}"));
+    }
     if let [only] = morsels {
         return (only != guard).then(|| format!("one morsel {only:?} that is not {guard:?}"));
     }
@@ -1422,6 +1426,15 @@ pub trait Breaker {
     /// that answers `None` pushes nothing, after a consume or at a finish.
     fn as_producer(&self) -> Option<&dyn BreakingProducer>;
 
+    /// Hand `push` the producer whose decided region this breaker's pipeline pushes to the
+    /// pipelines that read it: the breaker itself where it is a producer, and nothing for a breaker
+    /// no pipeline reads. A loop's scope, which is no producer, hands its store.
+    fn pushing(&self, push: &mut dyn FnMut(&dyn BreakingProducer)) {
+        if let Some(producer) = self.as_producer() {
+            push(producer);
+        }
+    }
+
     /// How many inputs the breaker consumes, each the input of a pipeline of its own: one, but for
     /// a transaction store, which consumes one per writer.
     fn inputs(&self) -> usize {
@@ -1441,14 +1454,6 @@ pub trait Breaker {
     /// breaker is a transaction store, whose writer's drive caches what it read of its source. A
     /// no-op for every other breaker.
     fn read_source_again(&mut self, _source: &Rc<RefCell<dyn DataSourceDomainExtentImpl>>) {}
-
-    /// Hand `push` the producer whose decided region this breaker's pipeline pushes: itself
-    /// where it is a producer, or the store of a loop's scope.
-    fn pushing(&self, push: &mut dyn FnMut(&dyn BreakingProducer)) {
-        if let Some(producer) = self.as_producer() {
-            push(producer);
-        }
-    }
 
     /// Finish once the pipeline has consumed every package and nothing more can be queued for it,
     /// the breaker's last call. The default pushes what a
@@ -1533,7 +1538,8 @@ pub trait BreakingProducer: TileProducer + Breaker {
     /// `false`: a release beneath those keys leaves a region beneath the outermost keys, and a
     /// reader's chain may restate only the outermost keys (`TileProducer::restates`). It pushes at
     /// its finish, and inside a loop's rounds where each round has every inner pipeline push what
-    /// it holds during its body-settlement pass.
+    /// it holds through the run's scope-local publication pass. See
+    /// `src/interpreter/design-operators.md`, "A loop in rounds".
     fn pushes_while_consuming(&self) -> bool {
         true
     }
@@ -1867,6 +1873,7 @@ pub trait TileProducer {
         None
     }
 
+    /// The concrete induction store behind a cyclic store cell, where this is one.
     fn as_induction_store_mut(
         &mut self,
     ) -> Option<&mut crate::interpreter::commit_operator::InductionStoreProducer> {
@@ -2142,7 +2149,7 @@ pub(crate) mod test_helpers {
                 || {
                     let mut op = make();
                     let guard = op.tiling().universal_guard();
-                    op.subscribe(guard, Box::new(|| {}), &mut super::Scheduler::new())
+                    op.subscribe(guard, Box::new(|| {}), &mut super::SubscribeContext::new())
                 },
                 paths_guard(paths),
             );
@@ -2297,7 +2304,7 @@ pub(crate) mod test_helpers {
             &mut self,
             _intent_guard: TileGuard,
             mut consumer: Box<dyn super::Consumer>,
-            _scheduler: &mut super::Scheduler,
+            _cx: &mut super::SubscribeContext,
         ) -> Box<dyn TileProducer> {
             consumer.notify(&Projection::Everything);
             let (mut spy, _, _) = ProjectionSpy::new(self.tile.clone(), self.tiling.clone());
@@ -2415,7 +2422,7 @@ pub(crate) mod test_helpers {
             &mut self,
             _intent_guard: TileGuard,
             mut consumer: Box<dyn super::Consumer>,
-            _scheduler: &mut super::Scheduler,
+            _cx: &mut super::SubscribeContext,
         ) -> Box<dyn TileProducer> {
             consumer.notify(&Projection::Everything);
             Box::new(ScriptedProducer {
@@ -2509,7 +2516,7 @@ pub(crate) mod test_helpers {
             &mut self,
             _intent_guard: TileGuard,
             consumer: Box<dyn super::Consumer>,
-            _scheduler: &mut super::Scheduler,
+            _cx: &mut super::SubscribeContext,
         ) -> Box<dyn TileProducer> {
             *self.consumer.borrow_mut() = Some(consumer);
             let (mut spy, _, _) = ProjectionSpy::new(self.tile.clone(), self.tiling.clone());
@@ -2794,7 +2801,7 @@ pub(crate) mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::{
-        Consumer, InputEdgeSpec, OperatorBase, ProducerBase, Scheduler, Tile, TileGuard,
+        Consumer, InputEdgeSpec, OperatorBase, ProducerBase, SubscribeContext, Tile, TileGuard,
         TileOperator, TileProducer, Tiling,
     };
     use crate::interpreter::{Extent, types::BaseType, types::ColumnValue};
@@ -2830,15 +2837,10 @@ mod tests {
             &mut self,
             _intent_guard: TileGuard,
             _consumer: Box<dyn Consumer>,
-            scheduler: &mut Scheduler,
+            cx: &mut SubscribeContext,
         ) -> Box<dyn TileProducer> {
             Box::new(OneRow {
-                base: ProducerBase::new(
-                    OneRow::alloc_id(),
-                    &self.base.tiling,
-                    &self.base,
-                    scheduler,
-                ),
+                base: ProducerBase::new(OneRow::alloc_id(), &self.base.tiling, &self.base, cx),
             })
         }
     }
@@ -2846,24 +2848,20 @@ mod tests {
     /// A producer subscribed before probing is switched on is probed once it
     /// is, under its operator's id: probes attach on demand, not at build.
     #[test]
-    fn a_producer_is_probed_under_its_operator_once_its_scheduler_enables_probing() {
+    fn a_producer_is_probed_under_its_operator_once_its_subscribe_context_enables_probing() {
         let mut op = Leaf {
             base: OperatorBase::new(int_tiling()),
         };
-        let mut scheduler = Scheduler::new();
-        let mut producer = op.subscribe(
-            int_tiling().universal_guard(),
-            Box::new(|| {}),
-            &mut scheduler,
-        );
+        let mut cx = SubscribeContext::new();
+        let mut producer = op.subscribe(int_tiling().universal_guard(), Box::new(|| {}), &mut cx);
         assert_eq!(producer.operator_id(), op.operator_id());
 
         producer.get(int_tiling().universal_guard());
-        assert!(!scheduler.probes().is_enabled());
+        assert!(!cx.probes().is_enabled());
 
-        scheduler.probes().enable();
+        cx.probes().enable();
         producer.get(int_tiling().universal_guard());
-        let keys: Vec<_> = scheduler
+        let keys: Vec<_> = cx
             .probes()
             .with_table(|table| table.probe_keys().collect())
             .expect("probing is on");
@@ -2871,9 +2869,7 @@ mod tests {
 
         drop(producer);
         assert_eq!(
-            scheduler
-                .probes()
-                .with_table(|table| table.probe_keys().count()),
+            cx.probes().with_table(|table| table.probe_keys().count()),
             Some(0),
             "dropping a producer detaches its probe",
         );

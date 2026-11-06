@@ -70,12 +70,11 @@ It does not reuse the static lookups. A live read is `node → readings` and a s
 
 ### Probing follows the live route
 
-Probing is on while at least one client holds `/api/live` open, and off otherwise. The switch is
-all or nothing: every producer holds a clone of one `ProbeSlot`, taken from the `Scheduler` it was
-subscribed under, and the driver fills or empties that slot before each pull to match
-`LiveChannel::is_watched`. While the slot is empty a `get` costs one `None` check and the driver
-samples no source windows, so an unwatched `--inspect` run costs what a run without `--inspect`
-does.
+Probing is on while at least one client holds `/api/live` open, and off otherwise. The switch is all
+or nothing: every producer holds a clone of one `ProbeSlot`, taken from the `SubscribeContext` it
+was subscribed under, and the slot is filled or emptied to match `LiveChannel::is_watched`. While the
+slot is empty a `get` costs one atomic load and no source window is sampled, so an unwatched
+`--inspect` run costs what a run without `--inspect` does.
 
 Switching off drops the table and every reading in it, and switching on starts an empty one. A
 client therefore sees what flowed while some client was connected. Switching off also clears the
@@ -83,6 +82,16 @@ channel's newest frame, which renders the dropped table, so a client that connec
 nothing until the fresh table's first flow. A client that connects after the run has finished
 receives the `final` frame. It carries readings when a client stayed connected through the end,
 and only the source windows otherwise: nothing pulls after the run.
+
+In pull mode the driver switches the slot and publishes a frame once per pass, between two pulls. In
+a dispatched run (`CAMBRA_DISPATCH`) a publisher thread does both on a timer of its own
+(`PUBLISH_INTERVAL`, `src/main.rs`), independent of the run's passes. The slot is an `Arc` with an
+atomic switch and a lock that a `get` holds to record one reading and the publisher holds to copy
+the table, which it renders from outside the lock. The run's poll also switches the
+slot on where a client watches, so input a client sends after its handshake is recorded, and samples
+the source windows there, which the publisher sends with its next frame. A frame then holds each
+producer's newest reading at the moment it is read, and can pair a reading of one pass with its
+input's reading of the pass before.
 
 ### A reload of main is followed
 
@@ -96,11 +105,11 @@ The driver compares `main`'s version with the one it follows after each control-
 change it renders the new version's payload into the served snapshot (`ServedSnapshot::replace`),
 re-derives each source's anchors (`source_nodes`), and stamps later frames with the new version
 (`LiveChannel::follow`), in that order. A frame stamped before the payload is installed would send a
-client to refetch the previous one. While probing is on, the same pass publishes a frame whether or
-not any flow arrived. Until then the newest frame carries the previous version's stamp and source
-anchors, and a client that connects is handed it.
-A request in flight finishes on the payload it started with, and the replacement does not wait for
-it, so a client that stops reading cannot stall the driver.
+client to refetch the previous one. While probing is on, the next frame is published whether or not
+any flow arrived: in the same pass in pull mode, and at the publisher's next tick in a dispatched
+run. Until then the newest frame carries the previous version's stamp and source anchors, and a
+client that connects is handed it. A request in flight finishes on the payload it started with, and
+the replacement does not wait for it, so a client that stops reading cannot stall the driver.
 
 A reload keeps some operators and rebuilds the rest. A kept operator keeps its `NodeId`. A rebuilt
 operator mints a fresh one, and the producers it replaced detach their probes at teardown, so no
@@ -116,7 +125,7 @@ span, the same source text under it and the same label (`resolveTag`). Any other
 edit above a construct shifts its bytes and an edit inside it changes its text.
 
 Only `main` is followed. Every branch's producers hold the same `ProbeSlot`, because every branch
-subscribes under the one `Scheduler`
+subscribes under the one `SubscribeContext`
 ([program-evolution.md](../ccl/design/program-evolution.md#the-branch-table)). An operator another
 branch built and `main` does not hold mints a `NodeId` the payload does not contain, so its entries
 arrive in every probe frame and match no pane node. Reloading another branch changes nothing the
