@@ -21,7 +21,6 @@ pub(super) enum Member {
 pub(crate) struct InductionRun {
     /// Configured but never executed here; moved into the run before the first request.
     pub(super) body_graph: Option<Dispatcher>,
-    sources: Vec<bool>,
     pub(super) shared: Option<SharedLoop>,
     pub(super) members: Vec<Member>,
     /// Entries placed at global body IDs after activation. Explicitly queued source entries
@@ -48,19 +47,16 @@ pub(super) struct SharedLoop {
 }
 
 struct Request {
-    guard: TileGuard,
-    rows: bool,
     read: bool,
-    rounds: usize,
+    emitted: bool,
     closing: bool,
     round: Option<TileGuard>,
-    package: Option<WorkPackage>,
+    package: WorkPackage,
 }
 
 impl InductionRun {
     pub(super) fn new(
         body_graph: Dispatcher,
-        sources: Vec<bool>,
         members: Vec<Member>,
         placements: Vec<Vec<Placement>>,
         starts: Vec<PipelineId>,
@@ -69,7 +65,6 @@ impl InductionRun {
     ) -> Self {
         Self {
             body_graph: Some(body_graph),
-            sources,
             shared: None,
             members,
             placements,
@@ -110,29 +105,6 @@ impl InductionStoreProducer {
         PipelineId(self.run().shared.as_ref().map_or(0, |shared| shared.base) + local.0)
     }
 
-    pub(super) fn reach_shared(&mut self, pipeline: PipelineId, call: &mut Call<'_>) -> bool {
-        let Some(shared) = &self.run().shared else {
-            return false;
-        };
-        if (shared.base..shared.base + self.run().members.len()).contains(&pipeline.0) {
-            let member = self.run().members[pipeline.0 - shared.base].clone();
-            reach_member(self, &member, pipeline, call);
-            return true;
-        }
-        let children: Vec<_> = self
-            .run()
-            .members
-            .iter()
-            .filter_map(|member| match member {
-                Member::Scope(store) => Some(store.clone()),
-                Member::Chain(_) => None,
-            })
-            .collect();
-        children
-            .iter()
-            .any(|store| induction(store).reach_shared(pipeline, call))
-    }
-
     fn activate(&mut self, dispatcher: &Dispatcher) {
         let run = self.run_mut();
         let shared = run
@@ -146,7 +118,7 @@ impl InductionStoreProducer {
         for (local, placements) in run.placements.iter().enumerate() {
             let pipeline = PipelineId(shared.base + local);
             for placement in placements {
-                placement.set((!run.sources[local]).then_some(pipeline));
+                placement.set((!dispatcher.is_source(pipeline)).then_some(pipeline));
             }
             dispatcher.hold_pipeline(pipeline, false);
         }
@@ -212,24 +184,6 @@ impl InductionStoreProducer {
         self.queue_package_round(dispatcher)
     }
 
-    pub(super) fn queue_package_round(&mut self, dispatcher: &Dispatcher) -> Option<WorkPackage> {
-        let package = self
-            .run_mut()
-            .request
-            .as_mut()
-            .and_then(|request| request.package.take())
-            .expect("a shared loop retains its parent request");
-        if !self.queue_next_round(dispatcher) {
-            return Some(package);
-        }
-        self.run_mut()
-            .request
-            .as_mut()
-            .expect("a queued round retains its request")
-            .package = Some(package);
-        None
-    }
-
     pub(super) fn begin_shared_finish(
         &mut self,
         dispatcher: &Dispatcher,
@@ -246,7 +200,7 @@ impl InductionStoreProducer {
             .expect("a shared scope has global pipelines")
             .finishing = Some(consumed);
         for &local in &self.run().starts {
-            if self.run().sources[local.0] {
+            if dispatcher.is_source(self.pipeline(local)) {
                 dispatcher.close(self.pipeline(local));
             }
         }
@@ -406,11 +360,11 @@ impl InductionStoreProducer {
         });
     }
 
-    fn closing_readers(&self) -> Vec<PipelineId> {
+    fn closing_readers(&self, dispatcher: &Dispatcher) -> Vec<PipelineId> {
         (0..self.run().members.len())
             .map(PipelineId)
             .filter(|&pipeline| {
-                !(self.run().sources[pipeline.0]
+                !(dispatcher.is_source(self.pipeline(pipeline))
                     && matches!(self.run().members[pipeline.0], Member::Chain(_)))
             })
             .collect()
@@ -461,7 +415,7 @@ impl InductionStoreProducer {
             .collect()
     }
 
-    fn begin_request(&mut self, guard: TileGuard) {
+    fn begin_package(&mut self, package: WorkPackage) {
         assert!(
             self.run().request.is_none(),
             "a loop completes one request before starting another"
@@ -479,33 +433,20 @@ impl InductionStoreProducer {
             self.placed(|scope| scope.read_source());
         }
         self.run_mut().request = Some(Request {
-            guard,
-            rows,
             read: rows,
-            rounds: 0,
+            emitted: false,
             closing: false,
             round: None,
-            package: None,
+            package,
         });
     }
 
-    pub(super) fn begin_package(&mut self, package: WorkPackage) {
-        self.begin_request(package.guard.clone());
-        self.run_mut()
-            .request
-            .as_mut()
-            .expect("the request just began")
-            .package = Some(package);
-    }
-
     pub(super) fn has_package(&self) -> bool {
-        self.run()
-            .request
-            .as_ref()
-            .is_some_and(|request| request.package.is_some())
+        self.run().request.is_some()
     }
 
-    fn queue_next_round(&mut self, dispatcher: &Dispatcher) -> bool {
+    pub(super) fn queue_package_round(&mut self, dispatcher: &Dispatcher) -> Option<WorkPackage> {
+        let rows = !matches!(self.tiling(), Tiling::Store { .. });
         let mut request = self
             .run_mut()
             .request
@@ -516,20 +457,20 @@ impl InductionStoreProducer {
             "the body and store step complete before the next round"
         );
         if request.closing {
-            return false;
+            return Some(request.package);
         }
         loop {
             if !self.terminal()
                 && let Some(position) = self.next_round_position()
-                && request.guard.covers_path(&position)
+                && request.package.guard.covers_path(&position)
             {
                 let guard = Projection::of_path(&position).guard(&self.input_tiling(InputId::ONLY));
                 let starts = self.run().starts.clone();
                 self.placed(|store| store.queue_round_on(dispatcher, &guard, &starts));
-                request.rounds += 1;
+                request.emitted = true;
                 request.round = Some(guard);
                 self.run_mut().request = Some(request);
-                return true;
+                return None;
             }
             // A flat scope reads newly delivered source positions at most once per request,
             // after exhausting the positions the drive buffered before this request.
@@ -539,26 +480,31 @@ impl InductionStoreProducer {
             self.placed(|scope| scope.read_source());
             request.read = true;
         }
-        let closing = request.rows
-            || (request.rounds == 0
+        let closing = rows
+            || (!request.emitted
                 && !self.terminal()
-                && !guard_minus(&request.guard, &self.input_released(InputId::ONLY)).is_empty());
+                && !guard_minus(&request.package.guard, &self.input_released(InputId::ONLY))
+                    .is_empty());
         if !closing {
-            return false;
+            return Some(request.package);
         }
         self.placed(|scope| {
             // A row's last position does not state the row's end. Render the drive once more
             // at no position so the closing round can release the row whole, including an
             // empty row. A flat request closes only positions the source emitted none of.
-            if request.rows {
+            if rows {
                 scope.read_source();
             }
-            scope.queue_round_on(dispatcher, &request.guard, &scope.closing_readers());
+            scope.queue_round_on(
+                dispatcher,
+                &request.package.guard,
+                &scope.closing_readers(dispatcher),
+            );
         });
         request.closing = true;
-        request.round = Some(request.guard.clone());
+        request.round = Some(request.package.guard.clone());
         self.run_mut().request = Some(request);
-        true
+        None
     }
 
     /// Step the queued round after its body and held pushes settle.
@@ -582,7 +528,7 @@ impl InductionStoreProducer {
         self.read_cycle_again();
         let (sources, readers): (Vec<PipelineId>, Vec<PipelineId>) = starts
             .iter()
-            .partition(|&&start| self.run().sources[start.0]);
+            .partition(|&&start| dispatcher.is_source(self.pipeline(start)));
         for source in sources {
             dispatcher.notify(self.pipeline(source), guard);
         }
@@ -769,8 +715,7 @@ mod tests {
             induction(&scope).enter_consuming_mode();
             let mut dispatcher = Dispatcher::new(vec![vec![]], usize::MAX);
             dispatcher.order(PipelineId(0));
-            let mut execution = Execution::new(&[Some(scope.clone())]);
-            execution.attach(&mut dispatcher);
+            let execution = Execution::new(&[Some(scope.clone())], &mut dispatcher);
             Self {
                 _runs: runs,
                 _ctx: ctx,
@@ -782,12 +727,11 @@ mod tests {
         }
 
         fn tick(&self) -> Option<PipelineId> {
+            let mut root = |_: PipelineId, _: &mut Call<'_>| {
+                panic!("the test's pipelines all belong to its induction run");
+            };
             let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
-                if pipeline == PipelineId(0) {
-                    call(&mut *induction(&self.scope), InputId::ONLY);
-                } else {
-                    assert!(induction(&self.scope).reach_shared(pipeline, call));
-                }
+                self.execution.reach(pipeline, &mut root, call);
             };
             match self.dispatcher.try_claim(None) {
                 Next::Package(package) => {
@@ -954,7 +898,7 @@ mod tests {
             .universal_guard();
         compiled.dispatcher.notify(PipelineId(0), &whole);
         assert_eq!(compiled.tick(), Some(PipelineId(0)));
-        induction(&compiled.scope).queue_next_round(&compiled.dispatcher);
+        let _ = induction(&compiled.scope).queue_package_round(&compiled.dispatcher);
     }
 
     /// A guarded loop's `Memo`s are inner pipelines, which each round queues the position for and

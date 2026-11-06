@@ -54,12 +54,10 @@ use crate::interpreter::{BaseType, DataSink, DataSourceDomainExtentImpl, Extent}
 ///
 /// # Errors
 ///
-/// Where the planner refuses the program ([`Refused`]), before anything runs and with no entry or
-/// sink left placed: a program compiled with its sinks pulled; a live source whose arrivals reach
-/// no pipeline's entry, reach one as a region that is no projection of its keys, or reach a store
-/// or a loop's scope that also reads a pipeline; a pipeline that reads directly a pipeline another pipeline reads; a breaker with no
-/// consuming mode (`Breaker::no_consuming_mode`); and where `Planner::store_pipeline` refuses a
-/// store.
+/// Return [`Refused`] before execution, clearing entry and sink placements, for a program
+/// compiled with its sinks pulled; live arrivals that reach no pipeline or cannot be restated as
+/// input projections; a direct pipeline read shared by another reader; a breaker with no consuming
+/// mode (`Breaker::no_consuming_mode`); or a store shape `Planner::store_pipeline` refuses.
 ///
 /// # Panics
 ///
@@ -214,14 +212,10 @@ pub enum Ended {
 }
 
 /// The roots of a run over one compiled program's outputs, which `program` keeps.
+#[derive(Default)]
 pub struct Targets(Vec<RunTarget>);
 
 impl Targets {
-    /// No root yet.
-    pub fn new() -> Self {
-        Self(Vec::new())
-    }
-
     /// Every sink output of `program`.
     pub fn add_sinks(&mut self, program: &CompiledProgram) {
         for output in &program.outputs {
@@ -271,12 +265,6 @@ impl Targets {
             pull_sinks(&self.0);
         }
         Ok(ended)
-    }
-}
-
-impl Default for Targets {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -394,38 +382,28 @@ fn run_targets(
             induction(scope).decide_through_drive(PipelineId(pipeline));
         }
     }
-    let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
-        if pipeline.0 >= members.located.len() {
-            for scope in scopes.iter().flatten() {
-                if induction(scope).reach_shared(pipeline, call) {
+    let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| match &members.located[pipeline.0] {
+        Located::Sink(sink) => call(&mut *sink_breakers[*sink].borrow_mut(), InputId::ONLY),
+        Located::Store { store, input, .. } => {
+            let mut store = store.borrow_mut();
+            call(
+                store
+                    .as_breaking_mut()
+                    .expect("a planned store is a pipeline breaker"),
+                InputId(*input),
+            )
+        }
+        Located::Scope { .. } => call(&mut *induction(scope_at(pipeline)), InputId::ONLY),
+        Located::Chain(id) => {
+            let mut call = Some(call);
+            for root in &roots {
+                let mut root = root.borrow_mut();
+                let producer = root.as_mut().expect("a root holds the producer it pulls");
+                if reach_in_chain(&mut **producer, *id, &mut call) {
                     return;
                 }
             }
-            panic!("global pipeline {} belongs to a loop body", pipeline.0);
-        }
-        match &members.located[pipeline.0] {
-            Located::Sink(sink) => call(&mut *sink_breakers[*sink].borrow_mut(), InputId::ONLY),
-            Located::Store { store, input, .. } => {
-                let mut store = store.borrow_mut();
-                call(
-                    store
-                        .as_breaking_mut()
-                        .expect("a planned store is a pipeline breaker"),
-                    InputId(*input),
-                )
-            }
-            Located::Scope { .. } => call(&mut *induction(scope_at(pipeline)), InputId::ONLY),
-            Located::Chain(id) => {
-                let mut call = Some(call);
-                for root in &roots {
-                    let mut root = root.borrow_mut();
-                    let producer = root.as_mut().expect("a root holds the producer it pulls");
-                    if reach_in_chain(&mut **producer, *id, &mut call) {
-                        return;
-                    }
-                }
-                panic!("pipeline {} has its breaker in a root's chain", pipeline.0)
-            }
+            panic!("pipeline {} has its breaker in a root's chain", pipeline.0)
         }
     };
     // Induction request and step roles target the same store producer.
@@ -715,8 +693,11 @@ fn run_targets(
             breaker.enter_consuming_mode()
         });
     }
-    let mut execution = Execution::new(&scopes);
-    execution.attach(&mut dispatcher);
+    let execution = Execution::new(&scopes, &mut dispatcher);
+    let mut root_reach = reach;
+    let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
+        execution.reach(pipeline, &mut root_reach, call);
+    };
     let done = in_a_run(|| {
         // A range over a static extent has decided every key from the start.
         for (pipeline, ranges) in members.leaves.iter().enumerate() {
@@ -828,78 +809,78 @@ impl Drop for InductionRuns {
     }
 }
 
+// Body owners belong to the execution table, outside producer run metadata; a store retains
+// no handle to itself through its handlers.
+enum Handler {
+    Root,
+    Body { store: StoreCell, address: usize },
+    Request(StoreCell),
+    Step(StoreCell),
+}
+
 pub(super) struct Execution {
-    scopes: Vec<Option<StoreCell>>,
-    steps: Vec<Option<StoreCell>>,
+    handlers: Vec<Handler>,
     roots: usize,
 }
 
 impl Execution {
-    pub(super) fn new(scopes: &[Option<StoreCell>]) -> Self {
-        Self {
-            scopes: scopes.to_vec(),
-            steps: vec![None; scopes.len()],
+    pub(super) fn new(scopes: &[Option<StoreCell>], dispatcher: &mut Dispatcher) -> Self {
+        let mut execution = Self {
+            handlers: scopes
+                .iter()
+                .map(|scope| match scope {
+                    Some(store) => Handler::Request(store.clone()),
+                    None => Handler::Root,
+                })
+                .collect(),
             roots: scopes.len(),
-        }
-    }
-
-    pub(super) fn attach(&mut self, dispatcher: &mut Dispatcher) {
-        for pipeline in 0..self.roots {
-            if let Some(scope) = self.scopes[pipeline].clone() {
-                Self::attach_store(
-                    &scope,
-                    dispatcher,
-                    PipelineId(pipeline),
-                    &mut self.scopes,
-                    &mut self.steps,
-                );
+        };
+        for pipeline in 0..execution.roots {
+            if let Handler::Request(store) = &execution.handlers[pipeline] {
+                let store = store.clone();
+                execution.attach_store(&store, dispatcher, PipelineId(pipeline));
             }
         }
+        execution
     }
 
     fn attach_store(
+        &mut self,
         store: &StoreCell,
         dispatcher: &mut Dispatcher,
         pipeline: PipelineId,
-        stores: &mut Vec<Option<StoreCell>>,
-        steps: &mut Vec<Option<StoreCell>>,
     ) {
-        let graph = induction(store)
-            .run
-            .as_mut()
-            .expect("an induction run is planned")
-            .body_graph
-            .take()
-            .expect("a body graph is attached once");
+        let (graph, members) = {
+            let mut producer = induction(store);
+            let run = producer.run.as_mut().expect("an induction run is planned");
+            (
+                run.body_graph
+                    .take()
+                    .expect("a body graph is attached once"),
+                run.members.clone(),
+            )
+        };
         let base = dispatcher.append_graph(graph);
-        let count = induction(store)
-            .run
-            .as_ref()
-            .expect("an induction run is planned")
-            .members
-            .len();
-        for local in 0..count {
-            dispatcher.restrict_ingress(PipelineId(base + local), base..base + count);
+        assert_eq!(
+            base,
+            self.handlers.len(),
+            "each global pipeline has one handler"
+        );
+        self.handlers
+            .extend(members.iter().map(|member| match member {
+                Member::Chain(address) => Handler::Body {
+                    store: store.clone(),
+                    address: *address,
+                },
+                Member::Scope(child) => Handler::Request(child.clone()),
+            }));
+        for (local, member) in members.iter().enumerate() {
+            dispatcher.restrict_ingress(PipelineId(base + local), base..base + members.len());
+            if let Member::Scope(child) = member {
+                self.attach_store(child, dispatcher, PipelineId(base + local));
+            }
         }
-        stores.resize_with(dispatcher.infos.len(), || None);
-        steps.resize_with(dispatcher.infos.len(), || None);
-        let children: Vec<_> = induction(store)
-            .run
-            .as_ref()
-            .expect("an induction run is planned")
-            .members
-            .iter()
-            .enumerate()
-            .filter_map(|(at, member)| match member {
-                Member::Scope(child) => Some((PipelineId(base + at), child.clone())),
-                Member::Chain(_) => None,
-            })
-            .collect();
-        for (pipeline, child) in children {
-            stores[pipeline.0] = Some(child.clone());
-            Self::attach_store(&child, dispatcher, pipeline, stores, steps);
-        }
-        let body: Vec<_> = (base..base + count).map(PipelineId).collect();
+        let body: Vec<_> = (base..base + members.len()).map(PipelineId).collect();
         let step = dispatcher.add_pipeline(body.clone());
         dispatcher.order(step);
         for &member in &body {
@@ -907,9 +888,12 @@ impl Execution {
             dispatcher.hold_pipeline(member, true);
         }
         dispatcher.hold_pipeline(step, true);
-        stores.resize_with(dispatcher.infos.len(), || None);
-        steps.resize_with(dispatcher.infos.len(), || None);
-        steps[step.0] = Some(store.clone());
+        assert_eq!(
+            step.0,
+            self.handlers.len(),
+            "each global pipeline has one handler"
+        );
+        self.handlers.push(Handler::Step(store.clone()));
         induction(store)
             .run
             .as_mut()
@@ -922,6 +906,28 @@ impl Execution {
             followers_released: false,
             finishing: None,
         });
+    }
+
+    pub(super) fn reach(&self, pipeline: PipelineId, root: &mut Reach<'_>, call: &mut Call<'_>) {
+        match &self.handlers[pipeline.0] {
+            Handler::Root => root(pipeline, call),
+            Handler::Body { store, address } => loop_scope::reach_member(
+                &mut induction(store),
+                &Member::Chain(*address),
+                pipeline,
+                call,
+            ),
+            Handler::Request(store) | Handler::Step(store) => {
+                call(&mut *induction(store), InputId::ONLY)
+            }
+        }
+    }
+
+    fn scopes(&self) -> impl Iterator<Item = &StoreCell> {
+        self.handlers.iter().filter_map(|handler| match handler {
+            Handler::Request(store) => Some(store),
+            _ => None,
+        })
     }
 
     fn complete(&self, dispatcher: &Dispatcher, scope: &StoreCell, package: Option<WorkPackage>) {
@@ -938,7 +944,7 @@ impl Execution {
     }
 
     fn hold_followers(&self, dispatcher: &Dispatcher) {
-        for scope in self.scopes.iter().flatten() {
+        for scope in self.scopes() {
             induction(scope).hold_followers(dispatcher);
         }
     }
@@ -949,16 +955,18 @@ impl Execution {
         reach: &mut Reach<'_>,
         package: WorkPackage,
     ) {
-        if let Some(scope) = &self.steps[package.pipeline.0] {
-            induction(scope).complete_round();
-            dispatcher.acknowledge(package);
-            let completed = induction(scope).queue_package_round(dispatcher);
-            self.complete(dispatcher, scope, completed);
-        } else if let Some(scope) = &self.scopes[package.pipeline.0] {
-            let completed = induction(scope).begin_shared(dispatcher, package);
-            self.complete(dispatcher, scope, completed);
-        } else {
-            consume_with(dispatcher, reach, package);
+        match &self.handlers[package.pipeline.0] {
+            Handler::Step(scope) => {
+                induction(scope).complete_round();
+                dispatcher.acknowledge(package);
+                let completed = induction(scope).queue_package_round(dispatcher);
+                self.complete(dispatcher, scope, completed);
+            }
+            Handler::Request(scope) => {
+                let completed = induction(scope).begin_shared(dispatcher, package);
+                self.complete(dispatcher, scope, completed);
+            }
+            Handler::Root | Handler::Body { .. } => consume_with(dispatcher, reach, package),
         }
         self.hold_followers(dispatcher);
     }
@@ -970,19 +978,19 @@ impl Execution {
         pipeline: PipelineId,
         consumed: Option<TileGuard>,
     ) {
-        if self.steps[pipeline.0].is_some() {
-            dispatcher.finish(dispatcher.pushes(pipeline));
-        } else if let Some(scope) = &self.scopes[pipeline.0] {
-            induction(scope).begin_shared_finish(dispatcher, consumed);
-        } else {
-            finish_with(dispatcher, reach, pipeline, consumed);
+        match &self.handlers[pipeline.0] {
+            Handler::Step(_) => dispatcher.finish(dispatcher.pushes(pipeline)),
+            Handler::Request(scope) => induction(scope).begin_shared_finish(dispatcher, consumed),
+            Handler::Root | Handler::Body { .. } => {
+                finish_with(dispatcher, reach, pipeline, consumed)
+            }
         }
         self.hold_followers(dispatcher);
     }
 
     pub(super) fn resume(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) -> bool {
         let mut progressed = false;
-        for scope in self.scopes.iter().flatten() {
+        for scope in self.scopes() {
             let finished = induction(scope).take_shared_finish(dispatcher);
             if let Some((pipeline, consumed)) = finished {
                 finish_with(dispatcher, reach, pipeline, consumed);
@@ -1005,15 +1013,16 @@ impl Execution {
     }
 
     fn push_held(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
-        let pipelines = (0..dispatcher.infos.len())
-            .filter(|&pipeline| {
-                self.steps[pipeline].is_none()
-                    && !dispatcher.states[pipeline].held.load(Ordering::SeqCst)
-                    && !self.scopes[pipeline]
-                        .as_ref()
-                        .is_some_and(|scope| induction(scope).has_package())
+        let pipelines = self
+            .handlers
+            .iter()
+            .enumerate()
+            .filter(|(pipeline, handler)| {
+                !matches!(handler, Handler::Step(_))
+                    && !dispatcher.states[*pipeline].held.load(Ordering::SeqCst)
+                    && !matches!(handler, Handler::Request(scope) if induction(scope).has_package())
             })
-            .map(PipelineId)
+            .map(|(pipeline, _)| PipelineId(pipeline))
             .collect::<Vec<_>>();
         push_held(dispatcher, reach, pipelines);
     }
@@ -1335,7 +1344,7 @@ enum TargetEntry {
 }
 
 /// What [`run_program`] planned for one pipeline.
-#[derive(Debug)]
+#[cfg_attr(test, derive(Debug))]
 pub struct Planned {
     /// Its breaker's name.
     pub name: String,
@@ -2288,12 +2297,9 @@ impl Planner {
             .iter()
             .map(|&at| pipelines.placements[at].clone())
             .collect();
-        let sources: Vec<_> = (0..members.len())
-            .map(|at| inner.is_source(PipelineId(at)))
-            .collect();
         let mut drives = Vec::new();
         for &start in &starts {
-            if sources[start.0] && matches!(members[start.0], Member::Chain(_)) {
+            if inner.is_source(start) && matches!(members[start.0], Member::Chain(_)) {
                 let mut drive = false;
                 loop_scope::reach_member(
                     &mut induction(&store),
@@ -2320,9 +2326,8 @@ impl Planner {
             }),
             "run metadata does not retain its own store cell"
         );
-        let run = loop_scope::InductionRun::new(
-            inner, sources, members, placements, starts, planned, *drive,
-        );
+        let run =
+            loop_scope::InductionRun::new(inner, members, placements, starts, planned, *drive);
         runs.install(&store, run);
         kept_scopes.push((scope, induction(&store).chain_breakers()));
         store
@@ -2921,18 +2926,15 @@ mod tests {
             dispatcher.notify(PipelineId(pipeline), &keys_between(0, 2));
         }
         scopes.resize_with(4, || None);
-        let mut execution = Execution::new(&scopes);
-        execution.attach(&mut dispatcher);
+        let execution = Execution::new(&scopes, &mut dispatcher);
         for reader in [2, 3] {
             dispatcher.hold_pipeline(PipelineId(reader), true);
         }
+        let mut root = |_: PipelineId, _: &mut Call<'_>| {
+            panic!("the test's ordinary readers stay held");
+        };
         let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
-            for scope in scopes.iter().flatten() {
-                if induction(scope).reach_shared(pipeline, call) {
-                    return;
-                }
-            }
-            panic!("the execution handler retains scope requests and handles store steps");
+            execution.reach(pipeline, &mut root, call);
         };
         for _ in 0..2 {
             let Next::Package(package) = dispatcher.try_claim(None) else {
@@ -2957,11 +2959,12 @@ mod tests {
         }) {
             match dispatcher.try_claim(None) {
                 Next::Package(package) => {
-                    let step = execution.steps[package.pipeline.0].as_ref().map(|owner| {
-                        (0..2)
-                            .find(|&index| Rc::ptr_eq(scopes[index].as_ref().unwrap(), owner))
-                            .unwrap()
-                    });
+                    let step = match &execution.handlers[package.pipeline.0] {
+                        Handler::Step(owner) => {
+                            (0..2).find(|&index| Rc::ptr_eq(scopes[index].as_ref().unwrap(), owner))
+                        }
+                        _ => None,
+                    };
                     execution.consume(&dispatcher, &mut reach, package);
                     if let Some(index) = step {
                         let position = steps[index];

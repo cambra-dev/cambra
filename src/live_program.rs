@@ -655,7 +655,7 @@ impl LiveProgram {
         print: &dyn Fn(&str) -> Arc<dyn DataSink>,
         observer: &mut dyn RunObserver,
     ) -> Result<Ended, Refused> {
-        let mut targets = Targets::new();
+        let mut targets = Targets::default();
         let mut mains = Vec::new();
         for (at, branch) in self.branches.iter_mut().enumerate() {
             targets.add_sinks(&branch.program);

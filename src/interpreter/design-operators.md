@@ -1644,6 +1644,10 @@ round and global pipeline IDs. The producer also retains the accumulator and its
 scheduling metadata contains no handle back to its own store cell. `Dispatcher` queues guards and
 tracks claims, acknowledgements and finishes; it holds no loop or operator state.
 
+`Execution` uses one handler table indexed by global pipeline ID. A body handler records its owning
+store and breaker address; a request or step handler names the induction store. Lookup reaches the
+recorded owner directly.
+
 The planner configures each body graph locally, removes whole-input breakers that must remain in pull
 mode, and appends the configured graphs to the run. Composition remaps dependency, follower and shared
 push-record indices. The `Planned.rounds` report remains a tree with indices local to each sibling

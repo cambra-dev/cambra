@@ -1812,15 +1812,30 @@ fn a_feed_inside_a_transaction_over_a_live_source(
                 pool := pool - r
                 out << pool
     "};
-    let mut written_before_the_end = Vec::new();
+    let expected_before_next_delivery: Vec<_> = batches
+        .iter()
+        .take(batches.len() - 1)
+        .scan(0, |delivered, (entries, _)| {
+            *delivered += entries.len();
+            Some(expected[..*delivered].to_vec())
+        })
+        .collect();
+    let mut written_before_next_delivery = Vec::new();
     let (written, _) = dispatched_live_observed(source, rows, batches, |sink, _| {
-        written_before_the_end
-            .push(sink.value() == Err(crate::interpreter::SinkReadError::Incomplete));
+        assert_eq!(
+            sink.value(),
+            Err(crate::interpreter::SinkReadError::Incomplete),
+            "the feed stays open until the source ends"
+        );
+        let partial = sink
+            .written_so_far()
+            .expect("the delivery's feed rows reach the sink before the next delivery");
+        written_before_next_delivery.push(keyed_ints(&partial));
     });
     assert_eq!(keyed_ints(&written), expected);
-    assert!(
-        written_before_the_end.first() == Some(&true),
-        "the first delivery's commits reach the sink before the next: {written_before_the_end:?}"
+    assert_eq!(
+        written_before_next_delivery, expected_before_next_delivery,
+        "each delivery's commits reach the sink before the next"
     );
 }
 
@@ -1841,15 +1856,30 @@ fn a_feed_out_of_a_loop_over_a_live_source(
             n := n + x
             out << n
     "};
-    let mut written_before_the_end = Vec::new();
+    let expected_before_next_delivery: Vec<_> = batches
+        .iter()
+        .take(batches.len() - 1)
+        .scan(0, |delivered, (entries, _)| {
+            *delivered += entries.len();
+            Some(expected[..*delivered].to_vec())
+        })
+        .collect();
+    let mut written_before_next_delivery = Vec::new();
     let (written, _) = dispatched_live_observed(source, rows, batches, |sink, _| {
-        written_before_the_end
-            .push(sink.value() == Err(crate::interpreter::SinkReadError::Incomplete));
+        assert_eq!(
+            sink.value(),
+            Err(crate::interpreter::SinkReadError::Incomplete),
+            "the feed stays open until the source ends"
+        );
+        let partial = sink
+            .written_so_far()
+            .expect("the delivery's feed rows reach the sink before the next delivery");
+        written_before_next_delivery.push(keyed_ints(&partial));
     });
     assert_eq!(keyed_ints(&written), expected);
-    assert!(
-        written_before_the_end.first() == Some(&true),
-        "the first delivery's positions reach the sink before the next: {written_before_the_end:?}"
+    assert_eq!(
+        written_before_next_delivery, expected_before_next_delivery,
+        "each delivery's positions reach the sink before the next"
     );
 }
 
@@ -2906,7 +2936,7 @@ fn a_run_paused_at_every_boundary_answers_each_arrival_once(
     let slot: crate::interpreter::sinks::ProducerSlot =
         std::rc::Rc::new(std::cell::RefCell::new(Some(producer)));
     let main = std::sync::Arc::new(MainAnswers::default());
-    let mut targets = Targets::new();
+    let mut targets = Targets::default();
     targets.add_main(&program, slot.clone(), main.clone());
     let placement = program
         .main()

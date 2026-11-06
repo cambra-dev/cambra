@@ -58,6 +58,17 @@ pub struct TestSink {
 }
 
 impl TestSink {
+    /// Rows received so far, including values from an unfinished stream.
+    #[cfg(test)]
+    pub(crate) fn written_so_far(&self) -> Result<Value, SinkReadError> {
+        let guard = self.accumulated.lock().unwrap();
+        let tile = guard.as_ref().ok_or(SinkReadError::NothingWritten)?;
+        if !validate_tile(tile) {
+            return Err(SinkReadError::Malformed(format!("{tile:?}")));
+        }
+        Ok(tile_rows(tile, 1)?.remove(0))
+    }
+
     /// What the program wrote, once it is complete.
     pub fn value(&self) -> Result<Value, SinkReadError> {
         let guard = self.accumulated.lock().unwrap();

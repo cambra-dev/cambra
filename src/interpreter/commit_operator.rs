@@ -9028,7 +9028,7 @@ mod tests {
             }
 
             fn targets(&self) -> Targets {
-                let mut targets = Targets::new();
+                let mut targets = Targets::default();
                 targets.add_sinks(&self.program);
                 targets
             }
@@ -9135,7 +9135,7 @@ mod tests {
             )
             .expect("the preceding root compiles");
             let _extra_operators = extra_ctx.take_operator_map();
-            let mut targets = Targets::new();
+            let mut targets = Targets::default();
             targets.add_sinks(&extra);
             targets.add_sinks(&fixture.program);
             {
