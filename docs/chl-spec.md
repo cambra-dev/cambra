@@ -3237,6 +3237,10 @@ gs = Groups::new(groupby([1, 2, 3], \x -> x > 1))
 - **Two families relate value by value.** `\k: K -> T₁` is a subtype of `\k: K -> T₂` when `T₁`
   is a subtype of `T₂` at every `k`. A family parameter's variance is computed from the
   constructors as any parameter's is, and an index type is invariant.
+- **Values of a family at different keys join at the bound on its values.** A value of `V(k)`
+  and a value of `V(j)` have no common type except through that bound, as two type parameters
+  have none except through their bounds ([Type parameters](#type-parameters)). Their join
+  cannot stand where `V(k)` is required. Without a bound, the join is an error.
 
 A polymorphic type's and a `def`'s type parameter may be a family parameter too. Two parameters of
 one family state that two values share it, and inside the body an application of it is opaque, as
