@@ -1410,9 +1410,22 @@ sources yield beyond what it was notified of (`get_yield_predicate`), and seals 
 notified one and one is still open. A live pipeline closes once its sources yield everything, and
 the run ends with the epoch the last one closes in. A pass that finds nothing new calls the caller's
 `on_idle` after running what is claimable (`run_program_polling`): `run_program` sleeps for a
-millisecond, and a test feeds the source there. A range reads one source, keyed by positions: the
-planner refuses a cross product of sources, a source beside a static extent, and a source with other
-keys, whose arrivals no region of one source's positions spells.
+millisecond, and a test feeds the source there.
+
+A range over a product of positions, each field over a live source's positions or a static extent,
+yields no region of one source's positions, so no notification names its keys. Its pipeline parks
+its whole input instead (`Dispatcher::park_on_ranges`). Each poll lands the range's decided region:
+the record of what each field's source has yielded. A static field is decided whole from the start.
+That region releases the parked keys it covers, which after a second delivery are the pairs it
+completes, the difference of two products (`Predicate::minus`).
+
+The ranges of one chain land their decided regions in one record, as they arrive at the pipeline's
+entry. A range's region is not widened to the whole input on the way: an arm of a union restates it
+under the arm's tag, so the record names each arm's rows apart, and a static arm is decided from the
+start while a live arm waits for its source. A row reached by two ranges is decided only once both
+have decided it, which one record cannot spell. The planner refuses a product pipeline whose ranges reach one row together or leave a
+row unreached, a store or a loop's scope over such a range, and a range whose field nests a source
+deeper than its whole extent. Every live source is keyed by positions, which the planner asserts.
 
 The binary runs a program dispatched where `CAMBRA_DISPATCH` is set to anything but `0` or the empty
 string, and neither `--inspect` nor `--control` is given, at morsels of `CAMBRA_MORSEL_ROWS` rows

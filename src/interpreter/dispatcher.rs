@@ -364,6 +364,9 @@ struct PipelineInfo {
     /// Whether it reads its breaker's input whole rather than what the pipelines it reads push
     /// ([`read_whole`](Dispatcher::read_whole)).
     whole: bool,
+    /// Whether what it parked waits also for the ranges in its own chain to decide it
+    /// ([`park_on_ranges`](Dispatcher::park_on_ranges)).
+    on_ranges: bool,
     /// The pipelines it reads that it takes no push from, and whose finish of an epoch it waits
     /// for before it takes a package there ([`follow`](Dispatcher::follow)).
     follows: Vec<usize>,
@@ -577,6 +580,7 @@ impl Dispatcher {
                 readers,
                 ordered: false,
                 whole: false,
+                on_ranges: false,
                 follows: Vec::new(),
                 limit: usize::MAX,
                 pushes_with: pipeline,
@@ -859,7 +863,15 @@ impl Dispatcher {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let info = &self.infos[reader];
-        (0..info.reads.len()).fold(guard.clone(), |part, at| {
+        // The ranges in a pipeline's own chain decide, together, the rows their sources have
+        // yielded: an arm of a union lands its region under its tag, so the region names each
+        // arm's rows apart.
+        let own = match (info.on_ranges, decided.get(info.reads.len())) {
+            (false, _) | (true, Some(Decided::Whole)) => guard.clone(),
+            (true, Some(Decided::Region(region))) => guard.intersect(region),
+            (true, _) => guard_minus(guard, guard),
+        };
+        (0..info.reads.len()).fold(own, |part, at| {
             let reach = info.reach.get(at).cloned().flatten();
             match (decided.get(at).unwrap_or(&Decided::Nothing), reach) {
                 (Decided::Whole, _) => part,
@@ -969,7 +981,8 @@ impl Dispatcher {
         // A pipeline that takes arrivals parks the morsels its sources' notifies cut, which count
         // toward a source's packages; any other parks the rows pushes bring, which two pushes can
         // both name, so each is queued less what is queued already.
-        let appended = match self.infos[reader].arrivals {
+        let info = &self.infos[reader];
+        let appended = match info.arrivals || info.on_ranges {
             true => {
                 self.states[reader]
                     .queued
@@ -1149,6 +1162,45 @@ impl Dispatcher {
         info.whole = true;
         info.parks = true;
         self.states[pipeline.0]
+            .parked
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .extend(
+                seed(input, self.morsel_rows)
+                    .into_iter()
+                    .map(|guard| Parked {
+                        guard,
+                        splits: true,
+                    }),
+            );
+    }
+
+    /// Park `pipeline`'s whole input, `input` cut one package per morsel ([`seed`]), until the
+    /// ranges in its own chain have decided it: each decided region a range lands releases the
+    /// part of the parked morsels it covers ([`park`](Self::park)). A range over a product of live
+    /// sources decides the pairs of what each source has yielded, so each delivery releases the
+    /// keys it completes, and no notification names them.
+    ///
+    /// The ranges' decided regions land in one record, so they must reach disjoint regions of the
+    /// input that together cover it, as the arms of a union do; the planner checks that.
+    ///
+    /// # Panics
+    ///
+    /// After any notify, seal or close.
+    pub fn park_on_ranges(&mut self, pipeline: PipelineId, input: &Tiling) {
+        let p = pipeline.0;
+        assert!(
+            self.current.load(Ordering::Acquire) == 0
+                && self.states.iter().all(|pipeline| {
+                    pipeline.queued.load(Ordering::Acquire) == 0
+                        && !pipeline.closed.load(Ordering::Acquire)
+                }),
+            "pipeline {p} parks its input from before any notify, seal or close"
+        );
+        let info = &mut self.infos[p];
+        info.parks = true;
+        info.on_ranges = true;
+        self.states[p]
             .parked
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -2517,10 +2569,13 @@ impl Landing<'_> {
                 };
                 // A region that names the entry's input whole is the source wholly decided,
                 // whatever the entry's tiling: a store's seed entry is one value in front of a
-                // pipeline whose input is the loop's positions. A wholly decided source is, along
-                // whatever its push was restated to on the way, as an arm of a union restates it
-                // under its tag.
-                let guard = (!(*whole || guard.is_universal())).then_some(guard);
+                // pipeline whose input is the loop's positions. A wholly decided breaker is, along
+                // whatever its push was restated to on the way. A range's region is recorded as it
+                // arrives: the ranges of a chain share one record, and an arm of a union restates
+                // its range's region under the arm's tag, which names that arm's rows only. An
+                // operator on the way still reads a range's whole push as wholly decided
+                // (`is_wholly_decided`), so a widening operator passes it as every key.
+                let guard = (!((*whole && !*range) || guard.is_universal())).then_some(guard);
                 return dispatcher.record_decided(epoch, reader.0, source, guard);
             }
         };

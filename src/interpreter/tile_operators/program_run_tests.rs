@@ -2381,18 +2381,55 @@ fn two_sums_over_one_live_source() {
     );
 }
 
-/// A cross product of a live source with itself is keyed by pairs of its positions, which no
-/// notification of one source's positions names.
-#[test]
-#[should_panic(expected = "which is no one live source's positions")]
-fn a_cross_product_of_live_sources_is_refused() {
-    dispatched_live(
-        indoc! {"
-            out = test_sink()
-            out << sum([x * y for x in source1() for y in source1()])
-        "},
-        1,
-        two_batches(),
+/// A range over a product of live sources, or of a live source and a list, is keyed by pairs of
+/// positions. Its pipeline parks its whole input, and each delivery releases the pairs it
+/// completes (`Dispatcher::park_on_ranges`): the first delivery, positions `0..3`, hands the
+/// `main` output 9 pairs before the second arrives. A row another range or a pipeline brings
+/// waits only for what reaches it: a static arm of a concatenation, and a sum that each product
+/// row reads.
+/// `handed` is the number of pairs the `main` output holds before the second delivery, `None`
+/// for a sum.
+#[rstest_log::rstest]
+#[case::a_sum_of_a_cross_product("sum([x * y for x in source1() for y in source1()])", "225", None)]
+#[case::a_cross_product(
+    "[x * y for x in source1() for y in source1()]",
+    "[{u0, u0} -> 1, {u0, u1} -> 2, {u0, u2} -> 3, {u0, u3} -> 4, {u0, u4} -> 5, {u1, u0} -> 2, {u1, u1} -> 4, {u1, u2} -> 6, {u1, u3} -> 8, {u1, u4} -> 10, {u2, u0} -> 3, {u2, u1} -> 6, {u2, u2} -> 9, {u2, u3} -> 12, {u2, u4} -> 15, {u3, u0} -> 4, {u3, u1} -> 8, {u3, u2} -> 12, {u3, u3} -> 16, {u3, u4} -> 20, {u4, u0} -> 5, {u4, u1} -> 10, {u4, u2} -> 15, {u4, u3} -> 20, {u4, u4} -> 25]",
+    Some(9)
+)]
+#[case::a_source_beside_a_list(
+    "[x * y for x in source1() for y in [1, 2, 3]]",
+    "[{u0, u0} -> 1, {u0, u1} -> 2, {u0, u2} -> 3, {u1, u0} -> 2, {u1, u1} -> 4, {u1, u2} -> 6, {u2, u0} -> 3, {u2, u1} -> 6, {u2, u2} -> 9, {u3, u0} -> 4, {u3, u1} -> 8, {u3, u2} -> 12, {u4, u0} -> 5, {u4, u1} -> 10, {u4, u2} -> 15]",
+    Some(9)
+)]
+#[case::a_list_beside_a_source("sum([x * y for x in [1, 2, 3] for y in source1()])", "90", None)]
+#[case::concatenated_with_a_list(
+    "sum([x * y for x in source1() for y in [1, 2]] ++ [5])",
+    "50",
+    None
+)]
+#[case::reading_a_pipeline(
+    indoc! {"
+        n = sum([1, 2])
+        sum([x * y + n for x in source1() for y in [1, 2]])
+    "},
+    "75",
+    None
+)]
+fn a_range_over_a_product_of_live_sources(
+    #[case] source: &str,
+    #[case] expected: &str,
+    #[case] handed: Option<usize>,
+    #[values(1, usize::MAX)] rows: usize,
+) {
+    let live = dispatched_live_main(source, rows, two_batches());
+    assert_eq!(rendered_in_key_order(&live.value), expected, "{source}");
+    if let Some(handed) = handed {
+        assert_eq!(live.handed, [handed], "{source}");
+    }
+    assert!(
+        live.planned.iter().any(|plan| plan.live && plan.held),
+        "the pipeline over the product parks its input: {:?}",
+        live.planned
     );
 }
 /// A reader of a pipeline with a live source beneath it takes the rows that pipeline reaches only

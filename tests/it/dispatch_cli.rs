@@ -111,9 +111,9 @@ fn a_collection_in_several_morsels_prints_what_pull_mode_prints(
 /// open a second stdin reader, which the first would take the input from.
 #[test]
 fn a_refused_program_runs_in_pull_mode() {
-    // A range over stdin beside a static extent is refused: its keys pair a line's position with
-    // a position of the list, which no region of one source's positions spells.
-    let source = "sum([1 for line in stdin() for s in [1, 2]])\n";
+    // A loop over a product of stdin's lines and a list is refused: its scope runs a round per
+    // position of one source, and the product's keys are pairs.
+    let source = "t := 0\nfor x in [1 for line in stdin() for s in [1, 2]]:\n    t += x\nt\n";
     let input = "a\nb\n";
     let pulled = run_reading("a_refused_program", source, "0", input);
     let dispatched = run_reading("a_refused_program", source, "1", input);

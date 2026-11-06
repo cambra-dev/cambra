@@ -366,7 +366,52 @@ fn run_targets(
         });
         let input = input.expect("a reach calls the breaker it reaches");
         let mut starts: Vec<TileGuard> = Vec::new();
+        let parked = leaves.iter().any(|leaf| leaf.product.is_some());
+        if parked && !matches!(members.located[pipeline], Located::Chain(_)) {
+            unplace(&planner.placements, targets);
+            return Err(Refused(format!(
+                "{} is a store or a loop's scope over a product of live sources",
+                members.names[pipeline]
+            )));
+        }
         let notifies = match (&members.located[pipeline], scopes[pipeline].as_ref()) {
+            _ if parked => {
+                // The ranges in the pipeline's chain land their decided regions in one record, so
+                // each row is reached by exactly one of them, as each arm of a union reaches its
+                // own tag: where two reach one row, the row is decided only once both have
+                // decided it, which one record cannot say.
+                let everything = Projection::Everything;
+                let reaches: Vec<TileGuard> = members.leaves[pipeline]
+                    .iter()
+                    .chain(leaves.iter().map(|leaf| &leaf.consumer))
+                    .map(|range| {
+                        probe(range, PipelineId(pipeline), &everything, pipeline)
+                            .into_iter()
+                            .fold(input.empty_guard(), |reach, arrival| {
+                                reach.union(&arrival.guard)
+                            })
+                    })
+                    .collect();
+                let overlap = reaches.iter().enumerate().any(|(at, reach)| {
+                    reaches[..at]
+                        .iter()
+                        .any(|earlier| !earlier.intersect(reach).is_empty())
+                });
+                let reached = reaches
+                    .iter()
+                    .fold(input.empty_guard(), |all, reach| all.union(reach));
+                if overlap || !guard_minus(&input.universal_guard(), &reached).is_empty() {
+                    unplace(&planner.placements, targets);
+                    return Err(Refused(format!(
+                        "{} ranges over a product of live sources beside a range that reaches its rows \
+                         too, or with rows no range reaches",
+                        members.names[pipeline]
+                    )));
+                }
+                dispatcher.park_on_ranges(PipelineId(pipeline), &input);
+                planned[pipeline].held = true;
+                Notifies::Parked
+            }
             // A transaction store's input is its writer's source, read behind an entry no
             // planner places, so its items are a delivery's keys where the writer's source is
             // the source every range under the writer reads.
@@ -1101,7 +1146,13 @@ struct Beneath {
 #[derive(Clone)]
 pub(super) struct LiveLeaf {
     pub(super) consumer: SharedConsumer,
+    /// The source it ranges over; for a product, the first of its fields' sources, which only
+    /// the product's own fields stand for.
     pub(super) source: LiveSource,
+    /// For a range over a product of positions, each field of its keys and the live source
+    /// whose positions it ranges over, `None` for a field over a static extent; `None` for a
+    /// range over one source's positions.
+    pub(super) product: Option<Vec<(smol_str::SmolStr, Option<LiveSource>)>>,
 }
 
 /// A live source, as a range over its domain reads it.
@@ -1190,16 +1241,48 @@ impl Planner {
         let sources = producer.data_sources();
         // A range over a live source is no range the run queues whole at its start: the run
         // notifies the pipeline above it of what the source yields, as regions of the source's
-        // keys. A cross product of sources, a source beside a static extent, or a source keyed
-        // by anything but positions yields keys whose region no notification of one source's
-        // spells.
+        // positions. Every source is keyed by positions.
+        assert!(
+            sources
+                .iter()
+                .all(|source| source.borrow().element_extent() == Extent::Base(BaseType::UInt)),
+            "every live source is keyed by positions: {} ranges over the domain {:?}",
+            producer.name(),
+            producer.tiling().domain_extent()
+        );
         let one_source = sources.len() == 1
             && matches!(
                 producer.tiling().domain_extent(),
                 Some(Extent::DataSourceDomain(_))
-            )
-            && sources[0].borrow().element_extent() == Extent::Base(BaseType::UInt);
-        if !sources.is_empty() && !one_source {
+            );
+        // A range over a record of fields, each over a live source's positions or a static extent,
+        // decides the product of what each field's source has yielded.
+        let product = match (one_source, producer.tiling().domain_extent()) {
+            // Every source is a field's whole extent; a source nested deeper in a field would be
+            // read as a static field, decided from the start.
+            (false, Some(Extent::Record(fields)))
+                if !sources.is_empty()
+                    && fields
+                        .values()
+                        .filter(|extent| matches!(extent, Extent::DataSourceDomain(_)))
+                        .count()
+                        == sources.len() =>
+            {
+                Some(
+                    fields
+                        .iter()
+                        .map(|(name, extent)| match extent {
+                            Extent::DataSourceDomain(source) => {
+                                (name.clone(), Some(source.clone()))
+                            }
+                            _ => (name.clone(), None),
+                        })
+                        .collect(),
+                )
+            }
+            _ => None,
+        };
+        if !sources.is_empty() && !one_source && product.is_none() {
             self.refuse(format!(
                 "{} ranges over the domain {:?}, which is no one live source's positions",
                 producer.name(),
@@ -1208,7 +1291,14 @@ impl Planner {
             return Beneath::default();
         }
         let (leaf, live) = match (leaf, sources.into_iter().next()) {
-            (Some(consumer), Some(source)) => (None, Some(LiveLeaf { consumer, source })),
+            (Some(consumer), Some(source)) => (
+                None,
+                Some(LiveLeaf {
+                    consumer,
+                    source,
+                    product,
+                }),
+            ),
             (leaf, _) => (leaf, None),
         };
         below.live.extend(live);
@@ -1909,6 +1999,9 @@ enum Notifies {
     /// read its source again ([`Breaker::read_source_again`]): the drive reads its source only
     /// once told it gained items.
     Items,
+    /// Of nothing: its whole input is parked, and what its product ranges decide releases it
+    /// ([`Dispatcher::park_on_ranges`]).
+    Parked,
 }
 
 /// A source pipeline of the run's dispatcher over live sources, and the region of each range's
@@ -1964,7 +2057,26 @@ impl LivePipeline {
         let mut positions = Predicate::False;
         let mut fresh_sources: Vec<LiveSource> = Vec::new();
         for (leaf, notified) in &mut self.leaves {
-            let yielded = leaf.source.borrow().get_yield_predicate();
+            // A product's keys are yielded where every field's position is: the record of each
+            // field's yield, a static field yielding all of its extent.
+            let yielded = match &leaf.product {
+                None => leaf.source.borrow().get_yield_predicate(),
+                Some(fields) => {
+                    let fields: Vec<(smol_str::SmolStr, Predicate)> = fields
+                        .iter()
+                        .map(|(name, source)| {
+                            let yielded = source.as_ref().map_or(Predicate::True, |source| {
+                                source.borrow().get_yield_predicate()
+                            });
+                            (name.clone(), yielded)
+                        })
+                        .collect();
+                    match fields.iter().all(|(_, yielded)| yielded.is_true()) {
+                        true => Predicate::True,
+                        false => Predicate::Record(fields.into_iter().collect()),
+                    }
+                }
+            };
             debug_assert!(
                 notified.minus(&yielded).is_false(),
                 "a source's yield only grows: it yields {yielded:?}, short of {notified:?}"
@@ -1986,7 +2098,7 @@ impl LivePipeline {
                         dispatcher.notify(self.pipeline, &arrival.guard);
                     }
                 }
-                Notifies::Whole => {}
+                Notifies::Whole | Notifies::Parked => {}
                 Notifies::Rounds | Notifies::Items => {
                     // A drive and a transaction store decide positions in order, and a round or an
                     // attempt runs once every position before it is complete, so a source read in
