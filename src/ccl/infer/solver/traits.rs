@@ -746,6 +746,26 @@ impl Trait {
                 .all(|(name, _)| assoc.iter().any(|(n, _)| n == name)),
             "an instance of `{self}` fixes each associated type its trait declares"
         );
+        let at = self.params_at(operands, assoc);
+        self.requires
+            .iter()
+            .map(|r| r.map_types(|t| replace_params(t, &at)))
+            .collect()
+    }
+
+    /// Each of this trait's own parameters mapped to its type at `operands` and at the
+    /// associated types `assoc` names; a parameter `assoc` leaves out is not mapped.
+    pub fn params_at(
+        &self,
+        operands: &[Type],
+        assoc: &[(Assoc, Type)],
+    ) -> HashMap<TypeParamId, Type> {
+        debug_assert_eq!(
+            operands.len(),
+            self.operands.len(),
+            "`{self}` is over {} operand(s); its parameters are mapped at as many types",
+            self.operands.len()
+        );
         let mut at: HashMap<TypeParamId, Type> = self
             .operands
             .iter()
@@ -757,10 +777,7 @@ impl Trait {
                 at.insert(p.id, t.clone());
             }
         }
-        self.requires
-            .iter()
-            .map(|r| r.map_types(|t| replace_params(t, &at)))
-            .collect()
+        at
     }
 
     /// The function this trait declares by `name`.
@@ -1422,17 +1439,7 @@ impl InstanceTable {
     ) -> Option<Vec<(SmolStr, Type)>> {
         let (trait_, instance, function) = self.declared_function(binding)?;
         let signature = &trait_.function(function)?.signature;
-        let mut at_instance: HashMap<TypeParamId, Type> = trait_
-            .operands
-            .iter()
-            .zip(&instance.operands)
-            .map(|(p, t)| (p.id, t.clone()))
-            .collect();
-        for (name, p) in &trait_.assocs {
-            if let Some(t) = instance.assoc_ty(name) {
-                at_instance.insert(p.id, t);
-            }
-        }
+        let at_instance = trait_.params_at(&instance.operands, &instance.assoc);
         let pattern = replace_params(
             &function_over(&signature.inputs, signature.output.clone()),
             &at_instance,

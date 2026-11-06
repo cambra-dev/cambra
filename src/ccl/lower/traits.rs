@@ -957,17 +957,7 @@ fn declare_instance(
     // and its other choices, which the bound may name. A type variable of the instance is
     // inference's question wherever the instance is used; a choice of another form than the
     // bound has no use that could satisfy it.
-    let mut at: HashMap<TypeParamId, Type> = trait_
-        .operand_params()
-        .iter()
-        .zip(&operands)
-        .map(|(p, t)| (p.id, t.clone()))
-        .collect();
-    for (name, ty) in &assoc {
-        if let Some(p) = trait_.assoc_param(name) {
-            at.insert(p.id, ty.clone());
-        }
-    }
+    let at = trait_.params_at(&operands, &assoc);
     for ((name, ty), a) in assoc.iter().zip(&block.assoc) {
         let Some(declared) = trait_.assoc_bound(name) else {
             continue;
@@ -1630,15 +1620,7 @@ fn lower_instance_def(
         bound_at: None,
     }));
     // The trait's signature at the instance's types.
-    let mut at_instance: HashMap<TypeParamId, Type> = HashMap::new();
-    for (p, t) in trait_.operands.iter().zip(&instance.operands) {
-        at_instance.insert(p.id, t.clone());
-    }
-    for (name, p) in &trait_.assocs {
-        if let Some((_, t)) = instance.assoc.iter().find(|(n, _)| n == name) {
-            at_instance.insert(p.id, t.clone());
-        }
-    }
+    let mut at_instance = trait_.params_at(&instance.operands, &instance.assoc);
     for (p, mine) in sig.params.iter().zip(&own) {
         at_instance.insert(p.id, Type::Param(Rc::clone(mine)));
     }
