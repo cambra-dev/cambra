@@ -371,8 +371,10 @@ requested output and inference past parse and lowering errors, and inference's e
 to theirs. An undetermined type is not reported, as in a run that starts over.
 
 A module with lowering errors has no interface or linked chain and is not inferred. A reference
-into it lowers to the placeholder. A load error or a lowering error without a placeholder stops
-the compile after lowering: the tree can be inconsistent outside a placeholder.
+into it lowers to the placeholder. A module that did not load has errors of its own; a qualified
+reference or a `use` name into it also lowers to the placeholder, so inference continues past load
+errors. A lowering error without a placeholder stops the compile after lowering: the tree can be
+inconsistent outside a placeholder.
 
 Each later run's errors are added to the earlier runs', but for those saying the program does not
 determine a type (`InferError::is_undetermined`): an unresolved variable or tuple width, or a

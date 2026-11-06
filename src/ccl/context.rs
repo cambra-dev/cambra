@@ -2007,8 +2007,8 @@ fn run_frontend(
     // The parse and lower phases accumulate errors before bailing: when the
     // parser recovers from a syntax error it still produces a partial AST, which
     // lowering can run on and report its own errors against, so the user sees
-    // everything at once. A tree only lowering failed in is inferred too, and the
-    // compile stops after inference; past a parse or load error nothing is.
+    // everything at once. The tree is inferred past parse, load and lowering errors too
+    // when every lowering error is a statement's, and the compile stops after inference.
     let mut errors: Vec<CompileError> = Vec::new();
 
     // Keep the table across phase scopes and possible audits. Early returns drop
@@ -2060,13 +2060,17 @@ fn run_frontend(
     // `TypedExprNode::Error` placeholder, binding the names it introduces
     // (`lower::stmts::stand_in_for_failed`), which the passes up to and including
     // inference read as a statement that failed; so is an expression the parser could not
-    // read. A module that did not load names nothing it declares, and a lowering error no
+    // read. A module that did not load is one with errors of its own, which a reference into
+    // reaches nothing through (`lower::modules::Qualifier::reachable`). A lowering error no
     // placeholder stands for, such as a run missing a type argument, can leave the tree
-    // inconsistent where it is read: past either, bail here.
+    // inconsistent where it is read: past one, bail here.
     if !contained
-        || errors
-            .iter()
-            .any(|e| !matches!(e, CompileError::Lower(_) | CompileError::Parse(_)))
+        || errors.iter().any(|e| {
+            !matches!(
+                e,
+                CompileError::Lower(_) | CompileError::Parse(_) | CompileError::Load(_)
+            )
+        })
     {
         return Err(errors);
     }
