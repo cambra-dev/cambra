@@ -783,7 +783,7 @@ pulls.
 | `Zip`, `Product` | every arm, both sides | keeps | Pulled at the projection and aligned row for row. |
 | `MakeRecord` | every field | widens | A record of values has no keys. |
 | `Filter` | the predicate, the input | keeps for a side that is a collection, else widens | A collection side shares the mask's keys; the other is read whole. |
-| `Uncurry` | the input | keeps beneath a standing level, widens at the outermost | Pairing the outermost collection re-keys it. |
+| `Uncurry` | the input | restates beneath a standing level, widens at the outermost | A region at or beneath the paired level names the pairs it heads; pairing the outermost collection re-keys it, and a decided region of outer keys names every pair they head. |
 | `Converse` | the input | keeps the standing keys, and restates the inverted level's keys one level in, beneath every value (`scheduler::one_level_in`) | Each input key stands beneath exactly one value. |
 | `UnionOperator` | every arm | keeps for a flat union, restates under the arm's tag for a tagged one | Flat arms are disjoint slices of one collection; a tagged union keys an arm's rows by the arm's keys under its tag, and `Everything` of an arm is every key under that tag. |
 | `CheckedLookup` | a stream of keys, or the pairs | keeps | Each answer sits at its key's position. |
@@ -865,30 +865,36 @@ the placement of the entry at an input, which a planner sets to that input's pip
 | `consume_impl(input, guard)` | Pulls the input `input` at `guard`, a guard of the tiling the input answers, merges the answer into the breaker's state, and releases the input at the guard the answer states once it has taken delivery of the answer. The caller handles no tile. |
 | `enter_consuming_mode()` | Puts the breaker in consuming mode for a dispatched run, before its first `consume_impl`; nothing else changes the mode. |
 | `as_producer()` | The breaker as a `BreakingProducer`, or `None` for a breaker that is no producer. |
-| `finish(pushes)` | Finishes once the pipeline has consumed every package and nothing more can be queued for it. The default pushes, through `as_producer`, what the breaker holds and no push named before, one morsel of its outermost keys per work package, through its consumer to the pipelines that read it; a breaker that is no producer pushes nothing. This is the last call to the breaker. An empty guard pushes nothing. It wakes no one. |
+| `finish(pushes)` | Finishes once the pipeline has consumed every package and nothing more can be queued for it, the breaker's last call. The default pushes, through `as_producer`, what the breaker holds and no push named before, one morsel of its outermost keys per work package, through its consumer to the pipelines that read it; a breaker that is no producer pushes nothing. An empty guard pushes nothing. It wakes no one. |
 | `morsels(guard, rows)` | Cuts a guard the breaker pushes into morsels of at most `rows` held rows, which partition it. The default answers the guard whole. |
 | `pushes_while_consuming()` | Whether the driver also pushes after each `consume_impl`. The default answers `true`. |
 | `offer_impl(guard)` | Answers from the state `consume_impl` built and pulls nothing. The breaker's own `get_impl` calls it once the breaker is consuming. |
 
 An operator that consumes its input into state of its own is a breaker. One that answers pulls from
-that state is a producer; `SinkBreaker`, the breaker of a sink's pipeline, is one that is not. A
-breaker starts in the pull mode described in [The producer protocol](#the-producer-protocol) and is
-a consuming producer from its first `consume_impl`, which it stays. `final_guard` is provided over
-`held()`: it is `held()` less the guard released to the breaker, and the driver pushes the part of
-it no earlier push named, after each consume and at `finish`. When a pipeline may finish is the dispatcher's to check ([The dispatcher](design-dispatcher.md#the-dispatcher)). A release removes rows
-from the state and leaves the statement of the tile as it was, so the difference is taken in the
-guard algebra. `guard_minus` (`tile_operators/mod.rs`) spells it for guards of a collection's
-outermost keys, of a scalar and of an aggregation, none of them qualified by an enclosing path, and
-for a record of such guards field by field. Two guards of a collection's keys at any levels differ
-as their projections do: a release up to the path `(𝑘, 𝑗)` leaves of a held row 𝑘 its paths past 𝑗,
-which `TileGuard::closed_over` drops where the row's level is a finite range of positions with none
-past 𝑗; `final_guard` closes the difference over the producer's tiling. A state of another shape has
-no spelling, and a push after the first panics naming the gap instead of answering a smaller or
-larger region. `MapAggregate` holds a state released beneath the keys of a group, and what a release
-beneath them leaves is a region beneath the outermost keys. A reader's chain may restate only the
-outermost keys (`TileProducer::restates`), so it answers `pushes_while_consuming` with `false` and
-pushes at `finish`. A push beneath the outermost keys lands in each reader as a
-projection at its level ([The dispatcher](design-dispatcher.md#the-dispatcher)).
+that state is a producer; `SinkBreaker`, the breaker of a sink's pipeline and of the `main`
+output's, is one that is not. A breaker is in the pull mode described in [The producer
+protocol](#the-producer-protocol) for a whole run, or consuming for a whole run. A dispatched run
+puts every breaker it drives in consuming mode once its plan stands, before any package
+(`Breaker::enter_consuming_mode`), and a pull-mode run never does, so no consume changes the mode. A
+consuming breaker pulled before its first consume answers what it has consumed, which is nothing,
+and steps nothing. `final_guard` is provided over `held()`: it is `held()` less the guard released
+to the breaker, and the driver pushes the part of it no earlier push named, after each consume and
+at its `finish`. When a pipeline may finish is the dispatcher's to check ([The
+dispatcher](design-dispatcher.md#the-dispatcher)). A release removes rows from the state and leaves the statement of the
+tile as it was, so the difference is taken in the guard algebra. `guard_minus`
+(`tile_operators/mod.rs`) spells it for guards of a collection's outermost keys, of a scalar and of
+an aggregation, none of them qualified by an enclosing path, and for a record of such guards field
+by field. Two guards of a collection's keys at any levels differ as their projections do: a release
+up to the path `(𝑘, 𝑗)` leaves of a held row 𝑘 its paths past 𝑗, which `TileGuard::closed_over`
+drops where the row's level is a finite range of positions with none past 𝑗; `final_guard` closes
+the difference over the producer's tiling. A state of another shape has no spelling, and a push
+after the first panics naming the gap instead of answering a smaller or larger region.
+`MapAggregate` holds state released beneath a group's keys. A release there leaves a region beneath
+the outermost keys, which a reader's chain may be unable to restate (`TileProducer::restates`). It
+returns `false` from `pushes_while_consuming`. It publishes at finish and during explicit held-state
+publication passes (`dispatcher::push_held`), including loop-body settlement. A push beneath the
+outermost keys lands in each reader as a projection at its level ([The
+dispatcher](design-dispatcher.md#the-dispatcher)).
 
 ### Memo
 
@@ -907,8 +913,8 @@ final when the input has been released whole and holds the one value until the c
 output. A consume at part of the input folds that part once: the input releases what it answered and
 does not answer it again. Its guards are `Aggregation` guards, which are all or nothing. `held`
 names the accumulator only once it is final, when the input has been released whole, so no guard
-names a partial aggregation. `finish` panics where the output is unreleased and the
-input has not been released whole, because no later consume completes the accumulator.
+names a partial aggregation. `finish` panics where the output is unreleased and the input has not
+been released whole, because no later consume completes the accumulator.
 
 ### ExtractAggregate
 
@@ -927,11 +933,14 @@ under its key. An answer of a pull beneath the groups' keys states only the elem
 the folded level's statements are united too, and a group is final once they cover every element
 under its key (`Stated::settled`). The input releases a complete group whole and an open one only
 beneath its key, so a group that arrives later in a region already consumed is still the input's to
-answer. The dispatcher finishes the pipeline once its input has released every guard the
-pipeline consumed in it, so every group it holds is then final, and `MapAggregate` pushes then
-rather than after each consume. The guard it pushes is the guard of the output built from the
-accumulators, less every group whose accumulator is not terminal, less the guard released. A
-release of the output drops the accumulators it covers and forwards to the input, as in pull mode.
+answer. Present enclosing keys whose children are empty are retained alongside the accumulators:
+no accumulator path names such a key, but a later fold still needs its empty group and completeness.
+`MapAggregate` pushes at the pipeline's finish rather than after each consume.
+The guard it pushes is the guard of the output built from the accumulators, less every group whose
+accumulator is not terminal, less the guard released. The dispatcher pushes each region once
+(`Pushes::push_final`), so a group still folding at one finish is pushed at the finish where it is
+final, and a reader that kept the row open reads it again then. A release of the output drops the
+accumulators it covers and forwards to the input, as in pull mode.
 
 ### Converse
 
@@ -967,20 +976,21 @@ which a consuming `ExtractFinal` does not. Keys of one collection are totally or
 collection whose keys do not compare panics. The value is extracted once the source has been
 released whole. A source that held nothing falls back to the default, which `consume_impl` reads
 when the source drains and reads again at each later `consume_impl` until it has converged; until
-then nothing is held. The dispatcher issues no `consume_impl` after the finish, so `finish` panics when the output is unreleased and no value has been extracted rather than push
-nothing. A source declared total that held nothing panics as it does in pull mode. The value is
-final from then, and stays until the consumer releases the output, which is all or nothing.
+then nothing is held. The dispatcher issues no `consume_impl` after the finish, so `finish` panics
+when the output is unreleased and no value has been extracted rather than push nothing. A source
+declared total that held nothing panics as it does in pull mode. The value is final from then, and
+stays until the consumer releases the output, which is all or nothing.
 
 ### A store as a breaker
 
 A transaction store (`CommitProducer`, `commit_operator.rs`) is the breaker of one pipeline per
 writer (`Breaker::inputs`): a writer's cycle, the store, the writer and its drive, is the pipeline
 of the writer's input, and the operators inside it stay in pull mode. An induction store
-(`InductionStoreProducer`) implements `Breaker`, but in a run its loop's scope (`LoopScope`) is the
-breaker: the loop runs in rounds ([A loop in rounds](design-dispatcher.md#a-loop-in-rounds)), and its store steps once
-per round; a loop nested in it runs as a scope inside that loop's scope, a row of its store per
-round. A cyclic `FanOut` holds its store in a cell of its own (`Inner::Store`,
-`tile_operators/fanout.rs`) and hands the store a `Cycle` when it subscribes it
+(`InductionStoreProducer`) implements `Breaker` and owns its request and store-step control through
+per-run `InductionRun` metadata. Its body runs before each store step ([A loop in
+rounds](design-dispatcher.md#a-loop-in-rounds)). A nested request names one row of the nested store and remains in
+flight until that row finishes. A cyclic `FanOut` holds its store in a cell of its own
+(`Inner::Store`, `tile_operators/fanout.rs`) and hands the store a `Cycle` when it subscribes it
 (`TileProducer::enter_cycle`). The call that steps the store holds the store's cell, so the
 recurrence's pull of the store finds the cell borrowed and is answered from the snapshot the store
 published after its previous step. The fan-out forwards the intersection of its live slots' release
@@ -1014,11 +1024,13 @@ store pushes to its reader slots and not its recurrence slots (`FanOutInput::pus
 reader pulls the store whole. `StoreValueStream`, a reader of a transaction store's changelog, keeps
 the store's keys and cuts its answer to the ticks a pull names, so a feed inside a transaction takes
 the ticks as they are decided; any other reader widens the push, so its pipeline takes a package of
-the store only once the store's pipeline has finished ([The dispatcher](design-dispatcher.md#the-dispatcher)).
-A store's `final_guard` is `held()`. A release of
+the store only once it is terminal ([The dispatcher](design-dispatcher.md#the-dispatcher)). A store's `final_guard` is `held()`. A release of
 a store with no rows above it names the positions a reader reads no more and removes nothing from
 the store tile; a nested store's offer cuts the rows its readers released ([A loop in
-rounds](design-dispatcher.md#a-loop-in-rounds)). A consuming store answers a pull from its snapshot.
+rounds](design-dispatcher.md#a-loop-in-rounds)). A consuming store answers a pull from its snapshot. Its first
+consume opens it, and a pull before that answers the unopened store, which states nothing final.
+It steps only at its pipeline's consumes, or its scope's. A transaction store's writers decide only
+against a tile it published. In pull mode a store steps itself at a pull.
 
 In pull mode an induction store releases its body whole once the body is terminal and every decision
 is stepped, and a transaction drive releases its source whole once it is done. A nested induction
@@ -1027,14 +1039,15 @@ releases its body a position at a time, and whole each row the body calls comple
 decision is stepped, at every level above its positions: the release through the decided path names
 the row's positions only, not its paths past the last of them. A consuming store wakes no reader
 outside its cycle: its readers there take the rows it closes from its pushes, and the planner
-refuses a store read inside the cycle of a store that steps itself (`Planner::beneath_cycle`). A
-seed sits behind an entry no planner places (`subscribe_pulled`), since the store reads it by pull
-at a step, so a push from beneath the seed stops there rather than climb to the store's readers. A
-drive with no rows above it states complete every position below its next one that its source calls
-complete along with every position before, so a position it reads past, one the source filtered out
-or holds nothing at, is stated as one it emitted (`complete_prefix_below`). An induction store with
-no rows above it releases its body through what the body states complete and holds no decision at,
-and a transaction drive releases its source through what it has read past, so either releases such a
+refuses a store read inside the cycle of a store that steps itself (`Planner::beneath_cycle`). An
+induction store's seed sits behind an entry placed in the pipeline of the loop's scope, which takes
+no push of it, since the store reads it by pull at a step, and records what the seed has decided. A
+transaction store reads its seeds as its input 0 instead (below). A drive with no
+rows above it states complete every position below its next one that its source calls complete along
+with every position before, so a position it reads past, one the source filtered out or holds
+nothing at, is stated as one it emitted (`complete_prefix_below`). An induction store with no rows
+above it releases its body through what the body states complete and holds no decision at, and a
+transaction drive releases its source through what it has read past, so either releases such a
 position without waiting for a later one to be decided. The dispatcher's finish checks that a
 store's input released every morsel the pipeline consumed.
 
@@ -1044,14 +1057,20 @@ input reads the pipelines beneath the store's cycle under that input: a subtree 
 recurrence slot of the store (`reaches_recurrence`) is planned as any chain is, and inside the cycle
 a breaker is no pipeline. A store's pipelines are ordered, since a store decides its positions in
 order. A store that steps itself runs in the run's dispatcher, and the pipeline of an input that
-reads pipelines reads the input whole. A store reads its seed by pull when it opens, at the first
-consume of any input, so every input's pipeline reads the seed's pipelines, and a push from one
-stops in front of the store (`subscribe_pulled`); an induction store runs in a loop's scope instead
-([A loop in rounds](design-dispatcher.md#a-loop-in-rounds)). A reader of a store reads every pipeline of it, so its
-queue closes once the last of them has finished. The pipelines of one store
-share one record of what the store has pushed (`Dispatcher::share_pushes`), so no tick is pushed
-twice, and one record of what it has decided at each reader. `plan_edges` plans their edges into one
-reader as one. The planner refuses:
+reads pipelines reads the input whole, or over a live source each delivery once those pipelines have
+decided it (below). A transaction store with seed streams reads them as its input 0, ahead
+of its writers' sources, which are its inputs from 1: each seed is subscribed behind an entry placed
+in input 0's pipeline, a push of any seed queues that input whole, and the store's consume of it
+opens the store. A store opens before it steps, so each writer's pipeline reads input 0's, its
+sibling, and takes no package before input 0's has finished. Once input 0's pipeline
+has consumed its package, each writer's records it wholly decided, which releases what it parked
+(`Dispatcher::opens_before`, [Parking arrivals until a read is
+decided](design-dispatcher.md#parking-arrivals-until-a-read-is-decided)). A store's decided push that reaches its own
+pipelines around its recurrence is no read and records nothing. An induction store runs in a loop's
+scope instead ([A loop in rounds](design-dispatcher.md#a-loop-in-rounds)). A reader of a store reads every pipeline of
+it, so its queue closes once the last of them has finished. The pipelines of
+one store share one record of what the store has pushed (`Dispatcher::share_pushes`), so no tick is
+pushed twice, and `plan_edges` plans their edges into one reader as one. The planner refuses:
 
 - outside a loop's scope, a nested transaction store, one per enclosing row, whose frontier a flat
   morsel does not name;
@@ -1059,9 +1078,9 @@ reader as one. The planner refuses:
 
 The source positions of different transaction writers need no common ordering.
 
-The planner asserts that a transaction store has a writer: its keys are the footprints of its
-`with begin():` blocks, each one of its writers
-([How many commit stores a program has](../ccl/design/mutability.md#how-many-commit-stores-a-program-has)).
+The planner asserts that a transaction store has a writer: its keys are the footprints of its `with
+begin():` blocks, each one of its writers ([How many commit stores a program
+has](../ccl/design/mutability.md#how-many-commit-stores-a-program-has)).
 
 #### Ready transaction decisions
 

@@ -1,7 +1,7 @@
 //! Loop request control and body graph planning for the run's shared dispatcher.
 //! See `src/interpreter/design-dispatcher.md`, "A loop in rounds".
 
-use super::plan::{Planned, reach_in_chain};
+use super::plan::{Planned, probe, reach_in_chain, routes_to};
 use super::*;
 use crate::interpreter::commit_operator::InductionStoreProducer;
 use crate::interpreter::tile_operators::{StoreCell, TileProducer};
@@ -254,6 +254,21 @@ impl InductionStoreProducer {
     }
 
     pub(super) fn clear_run(&mut self) {
+        if self.run.is_none() {
+            return;
+        }
+        let mut target = None;
+        self.reach_local(self.drive(), &mut |breaker, _| {
+            target = breaker
+                .as_producer()
+                .and_then(|producer| producer.decides_through());
+        });
+        if let Some(target) = target {
+            *target.borrow_mut() = None;
+        }
+        for placement in self.seed_placements() {
+            placement.set(None);
+        }
         self.run = None;
     }
 
@@ -301,6 +316,29 @@ impl InductionStoreProducer {
         self.run().drive
     }
 
+    /// Have the entry in front of the drive's source record a decided push of the source's keys
+    /// at `pipeline`, this scope's pipeline in the dispatcher around it, as decided positions of
+    /// the store's input: the drive reads its source by pull, so no push of the source reaches the
+    /// scope's entry otherwise, and the scope would park each round until the source is whole.
+    pub(super) fn decide_through_drive(&mut self, pipeline: PipelineId) {
+        let input = self.input_tiling(InputId::ONLY);
+        let mut target = None;
+        self.reach_local(self.drive(), &mut |breaker, _| {
+            target = breaker
+                .as_producer()
+                .and_then(|producer| producer.decides_through());
+        });
+        let target = target.expect("a loop's drive records its source's decided pushes");
+        *target.borrow_mut() = Some((pipeline, input));
+    }
+
+    /// The paths a push from the range in front of `consumer` takes to the drive's entry, as the
+    /// consumers on the way declare them (`Consumer::route`).
+    pub(super) fn routes(&mut self, consumer: &SharedConsumer) -> Vec<Route> {
+        let drive = self.drive();
+        self.placed(|_| routes_to(consumer, drive.0))
+    }
+
     /// Where a push of `region` from the range in front of `consumer` lands at the drive's entry,
     /// as guards of the drive's input, the drive's source: a planner probes how a live source's
     /// arrivals reach the scope's rounds.
@@ -310,15 +348,7 @@ impl InductionStoreProducer {
         region: &Projection,
     ) -> Vec<Arrival> {
         let drive = self.drive();
-        self.placed(|_| {
-            let mut landing = Landing::probe(drive);
-            consumer.borrow_mut().push(region, &mut landing);
-            landing
-                .arrivals()
-                .into_iter()
-                .filter(|arrival| arrival.pipeline.0 == drive.0)
-                .collect()
-        })
+        self.placed(|_| probe(consumer, drive, region, drive.0))
     }
 
     /// Have the drive read what its source holds, emitting nothing: a consume at no position. A
@@ -326,9 +356,9 @@ impl InductionStoreProducer {
     /// has run, so the scope reads them before it runs the row's rounds.
     fn read_source(&mut self) {
         let drive = self.drive();
-        self.reach_local(drive, &mut |breaker, _| {
-            let none = breaker.input_tiling(InputId::ONLY).empty_guard();
-            breaker.consume_impl(InputId::ONLY, none);
+        self.reach_local(drive, &mut |breaker, input| {
+            let none = breaker.input_tiling(input).empty_guard();
+            breaker.consume_impl(input, none);
         });
     }
 
@@ -376,8 +406,8 @@ impl InductionStoreProducer {
                     return landed;
                 }
                 let mut fits = false;
-                self.reach_local(reader, &mut |breaker, _| {
-                    fits = guard.check_from(&breaker.input_tiling(InputId::ONLY))
+                self.reach_local(reader, &mut |breaker, input| {
+                    fits = guard.check_from(&breaker.input_tiling(input))
                 });
                 match fits {
                     true => vec![(reader, guard.clone())],
@@ -509,8 +539,8 @@ impl InductionStoreProducer {
             // included, and reads it no more: it is no longer there to read. A row released in
             // part is read again whole, for its end.
             let mut released = false;
-            self.reach_local(reader, &mut |breaker, _| {
-                released = guard_minus(&row, &breaker.input_released(InputId::ONLY)).is_empty()
+            self.reach_local(reader, &mut |breaker, input| {
+                released = guard_minus(&row, &breaker.input_released(input)).is_empty()
             });
             if !released {
                 dispatcher.queue_round(self.pipeline(reader), &row);
@@ -895,7 +925,8 @@ mod tests {
         assert_eq!(compiled.value(), Value::Int(5));
     }
 
-    /// A static store publishes nothing before it is terminal, then everything.
+    /// A static store knows decided positions before it is terminal, but publishes only when
+    /// terminal.
     #[test]
     fn the_store_holds_its_decided_positions_then_everything_once_terminal() {
         let compiled = Compiled::of(SUM);
@@ -905,7 +936,7 @@ mod tests {
             (store.final_guard(), store.decided())
         };
         assert!(
-            held.is_empty() && decided.is_empty(),
+            held.is_empty() && !decided.is_empty() && !decided.is_universal(),
             "{held:?}, deciding {decided:?}"
         );
         compiled.consume(keys_between(1, 2));
