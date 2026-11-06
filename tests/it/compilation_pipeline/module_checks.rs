@@ -835,3 +835,28 @@ fn an_error_at_a_node_a_module_check_minted_has_a_span() {
     assert!(errors.contains("Unbound variable: 'sales'"), "{errors}");
     assert!(errors.contains("lib.cambra:1:46"), "{errors}");
 }
+
+/// Checking a file on its own, as `cambra check` and an editor do, reports its type errors past
+/// a parse, load or lowering error a placeholder stands in for (`docs/modules.md`, "Checking a
+/// module on its own").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_lowering_error("pub x: Mut(Int) = 3\npub y = [1, \"a\"]\n", "introduces a mutable")]
+#[case::a_parse_error("pub a = 1 +* 2\npub y = [1, \"a\"]\n", "found '*'")]
+#[case::a_loading_error("import nothere\npub y = [1, \"a\"]\n", "no module `nothere`")]
+fn checking_a_file_reports_its_type_errors_past_another_error(
+    #[case] root: &str,
+    #[case] first: &str,
+) {
+    let program = program(root, &[]);
+    let Err(errors) = check_program(&mut GlobalContext::default(), &program) else {
+        panic!("expected `{root}` not to check");
+    };
+    let messages: Vec<String> = errors.errors.iter().map(|e| e.message()).collect();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert!(messages[0].contains(first), "{messages:?}");
+    assert!(
+        messages[1].contains("The values that meet here have no common type"),
+        "{messages:?}"
+    );
+}

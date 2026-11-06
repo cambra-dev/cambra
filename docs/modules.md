@@ -720,15 +720,20 @@ specialization can reject a use in ways their signatures do not express. A diagn
 label in a broken module suppresses nothing: the
 label can name a valid requirement that the caller violates.
 
-A module with lowering errors of its own has no check, and its code is not linked, so its type
-errors are not reported until its lowering errors are fixed. A module is checked against its
-dependencies' bodies, so each check infers them again; keeping each module's inferred schemes for
-its users would remove that cost.
+A module with lowering errors of its own is not linked, and a reference into it reaches nothing.
+When each of those errors is a statement's the placeholder stands in for
+(`src/ccl/design/type-inference.md`, "An error stops its statement, not the pass"), the module is
+checked all the same, on the statements that lowered (`ProgramLowering::with_errors`), and its type
+errors are reported with its lowering errors. A module is checked against its dependencies' bodies,
+so each check infers them again; keeping each module's inferred schemes for its users would remove
+that cost.
 
 `cambra check lib.cambra` checks a file on its own (`check_program`). It lowers the file as a module
 rather than as a root (`lower_for_check`), so its parameters need no defaults, and links nothing: it
 checks each module the file reaches and then the file. Each route a module declares is a source
-that opens nothing, so the check binds no port. It prints the file's interface
+that opens nothing, so the check binds no port. Past parse and loading errors, and lowering errors
+that are each a statement's the placeholder stands in for, it checks all the same and reports what
+the checks find with them, as compiling a program does. It prints the file's interface
 (`Interface::written`): each parameter with its type, bound, or Module type, then each public member
 in the order declared. A failed check prints established contracts alongside its diagnostics and
 exits unsuccessfully. Values whose omitted definitions establish no complete contract are absent

@@ -125,7 +125,9 @@ pub fn lower_for_check(program: &LoadedProgram, ctx: &mut LoweringContext) -> Ve
     for lowered in lowering.lowered.values().flatten() {
         ctx.declare_unopened_routes(&lowered.sinks);
     }
-    if lowering.errors.is_empty() {
+    // As in `lower_program`: linking found nothing wrong but statements the placeholder
+    // stands in for.
+    if lowering.errors.iter().all(LoweringError::has_stand_in) {
         lowering.check_all(order, ctx);
     }
     in_source_order(lowering.errors)
@@ -200,7 +202,12 @@ impl<'a> ProgramLowering<'a> {
     /// statements raise is raised here, and no other module's check raises it
     /// ([`ProgramLowering::nested`]).
     pub(super) fn check(&mut self, file: FileId, ctx: &mut LoweringContext) -> Option<ModuleCheck> {
-        let lowered = self.lowered.get(&file).cloned().flatten()?;
+        let lowered = self
+            .lowered
+            .get(&file)
+            .cloned()
+            .flatten()
+            .or_else(|| self.with_errors.get(&file).cloned())?;
         // The shared imports it reaches, each after the ones it reaches.
         let mut reached = HashSet::new();
         let mut pending: Vec<SharedImport> = self.program.ast(file).map_or_else(Vec::new, |ast| {

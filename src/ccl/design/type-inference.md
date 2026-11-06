@@ -371,9 +371,10 @@ lowering error is marked, the passes reach the earlier of the requested output a
 parse, loading and lowering errors, and inference's errors are added to theirs. An undetermined type
 is not reported, as in a run that starts over.
 
-A module with lowering errors has no interface or linked chain and is not inferred. A value
-reference into it lowers to a placeholder. A lowering error without a placeholder stops compilation
-after lowering: the tree can be inconsistent outside a placeholder.
+A module with lowering errors has no linkable interface or chain. When every lowering error has a
+placeholder, a separate chain retains its usable declarations for its own check. Importer references
+use placeholders. A lowering error without a placeholder stops compilation after lowering: the tree
+can be inconsistent outside a placeholder.
 
 A module that did not load supplies placeholders for value and type references. A `use` member
 records an unavailable state when its declaration category cannot be determined. Constructor
