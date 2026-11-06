@@ -260,6 +260,71 @@ fn a_tagged_union_sends_everything_for_any_region() {
     assert_widens(&|| union(false), 1);
 }
 
+fn lookup(keys: Tiling) -> Built {
+    let (collection, table) = feed(ints());
+    let (keys, stream) = feed(keys);
+    let op = CheckedLookup::split(collection, keys, int());
+    (Box::new(op), vec![table, stream])
+}
+
+fn lookup_of_a_stream() -> Built {
+    lookup(ints())
+}
+
+#[test]
+fn a_lookup_forwards_the_region_of_a_stream_of_keys() {
+    assert_keeps(&lookup_of_a_stream, 1);
+}
+
+#[test]
+fn a_lookup_of_a_stream_carries_no_region_between_notifications() {
+    assert_keeps_without_state(&lookup_of_a_stream, 1);
+}
+
+/// One key has no keys to project.
+#[test]
+fn a_lookup_of_one_key_sends_everything_for_any_region() {
+    let one_key = || lookup(Tiling::Scalar(Extent::Base(BaseType::UInt)));
+    assert_widens(&one_key, 1);
+}
+
+/// The pairs are one stream, and each answer sits at its row's position.
+fn paired_lookup() -> Built {
+    let pairs = Tiling::data_function(
+        Extent::uint_range(8),
+        Tiling::Record(
+            [
+                (
+                    crate::interpreter::tuple_field(0),
+                    Tiling::Scalar(Extent::Function {
+                        domain: Box::new(Extent::Base(BaseType::UInt)),
+                        codomain: Box::new(int()),
+                    }),
+                ),
+                (
+                    crate::interpreter::tuple_field(1),
+                    Tiling::Scalar(Extent::Base(BaseType::UInt)),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        ),
+    );
+    let (input, consumer) = feed(pairs);
+    let op = CheckedLookup::paired(input, int()).expect("a stream of pairs");
+    (Box::new(op), vec![consumer])
+}
+
+#[test]
+fn a_paired_lookup_forwards_the_region_of_its_rows() {
+    assert_keeps(&paired_lookup, 0);
+}
+
+#[test]
+fn a_paired_lookup_carries_no_region_between_notifications() {
+    assert_keeps_without_state(&paired_lookup, 0);
+}
+
 fn filter(predicate: Tiling) -> Built {
     let (input, data) = feed(ints());
     let (predicate, mask) = feed(predicate);
@@ -474,6 +539,109 @@ fn uncurry_at_the_outermost_level_sends_everything() {
     assert_widens(&|| uncurry(CurryLevel::OUTERMOST), 0);
 }
 
+fn extract_final() -> Built {
+    let (source, keys) = feed(ints());
+    let (default, fallback) = feed(Tiling::Scalar(int()));
+    let op = ExtractFinal::new(source, default);
+    (Box::new(op), vec![keys, fallback])
+}
+
+/// The final value is the last position's, which a region of keys does not name.
+#[test]
+fn extract_final_sends_everything_for_a_region_of_its_source() {
+    assert_widens(&extract_final, 0);
+}
+
+#[test]
+fn extract_final_sends_everything_for_a_later_region() {
+    assert_eq!(
+        received(&extract_final, 0, &another_region()),
+        [Projection::Everything]
+    );
+}
+
+fn two_keys() -> Extent {
+    Extent::Record(
+        [
+            (crate::interpreter::tuple_field(0), Extent::uint_range(8)),
+            (crate::interpreter::tuple_field(1), Extent::uint_range(8)),
+        ]
+        .into_iter()
+        .collect(),
+    )
+}
+
+fn permute_record_domain() -> Built {
+    let (input, consumer) = feed(Tiling::data_function(two_keys(), Tiling::Scalar(int())));
+    let op = PermuteRecordDomain::new(input, vec![1, 0]);
+    (Box::new(op), vec![consumer])
+}
+
+/// Tuple keys named field by field: field `i` admits the key `fields[i]`.
+fn tuple_keys(fields: &[Predicate]) -> Predicate {
+    Predicate::Record(
+        fields
+            .iter()
+            .enumerate()
+            .map(|(at, field)| (crate::interpreter::tuple_field(at), field.clone()))
+            .collect(),
+    )
+}
+
+fn position(key: u64) -> Predicate {
+    Predicate::point(Value::UInt(key))
+}
+
+/// The keys are the input's with their fields renamed, so a region of the input's keys is the
+/// same keys renamed: `(1, 2)` is `(2, 1)` with the fields swapped.
+#[test]
+fn permute_record_domain_renames_the_fields_of_a_region_of_its_input() {
+    let sent = Projection::admitting(tuple_keys(&[position(1), position(2)]));
+    assert_eq!(
+        received(&permute_record_domain, 0, &sent),
+        [Projection::admitting(tuple_keys(&[
+            position(2),
+            position(1)
+        ]))]
+    );
+}
+
+fn flatten_tuple_domain() -> Built {
+    let outer = Extent::Record(
+        [(crate::interpreter::tuple_field(0), two_keys())]
+            .into_iter()
+            .collect(),
+    );
+    let (input, consumer) = feed(Tiling::data_function(outer, Tiling::Scalar(int())));
+    let op = FlattenTupleDomain::new(input, vec![0]);
+    (Box::new(op), vec![consumer])
+}
+
+/// The keys are the input's with the flattened field's fields spliced in, so a region of the
+/// input's keys is the same keys spliced: `((1, 2))` is `(1, 2)`. A union inside the flattened
+/// field splices each arm.
+#[test]
+fn flatten_tuple_domain_splices_the_fields_of_a_region_of_its_input() {
+    let pair = |a, b| tuple_keys(&[position(a), position(b)]);
+    assert_eq!(
+        received(
+            &flatten_tuple_domain,
+            0,
+            &Projection::admitting(tuple_keys(&[pair(1, 2)]))
+        ),
+        [Projection::admitting(pair(1, 2))]
+    );
+    let either = pair(1, 2).union(&pair(3, 4));
+    assert_eq!(
+        received(
+            &flatten_tuple_domain,
+            0,
+            &Projection::admitting(tuple_keys(&[either]))
+        ),
+        [Projection::admitting(pair(1, 2).union(&pair(3, 4)))]
+    );
+}
+
 fn make_record() -> Built {
     let (a, first) = feed(ints());
     let (b, second) = feed(ints());
@@ -492,6 +660,20 @@ fn make_record_sends_everything_for_a_region_of_either_field() {
 fn make_record_sends_everything_for_a_later_region() {
     assert_eq!(
         received(&make_record, 1, &another_region()),
+        [Projection::Everything]
+    );
+}
+
+/// Every key is answered against all of the collection.
+#[test]
+fn a_lookup_sends_everything_for_its_collection() {
+    assert_widens(&lookup_of_a_stream, 0);
+}
+
+#[test]
+fn a_lookup_sends_everything_for_a_later_region_at_its_collection() {
+    assert_eq!(
+        received(&lookup_of_a_stream, 0, &another_region()),
         [Projection::Everything]
     );
 }

@@ -73,9 +73,21 @@ impl TileOperator for PermuteRecordDomain {
                 &self.base,
                 scheduler,
             ),
-            input: self
-                .input
-                .subscribe(intent_guard, widening(consumer), scheduler),
+            input: self.input.subscribe(
+                intent_guard,
+                {
+                    let permutation = self.permutation.clone();
+                    // The keys are the input's with their fields renamed, so a region of the
+                    // input's keys is the region of the same keys renamed.
+                    crate::interpreter::scheduler::restating(
+                        Box::new(move |region| {
+                            at_outermost(region, &|keys| permute_componentwise(keys, &permutation))
+                        }),
+                        consumer,
+                    )
+                },
+                scheduler,
+            ),
             permutation: self.permutation.clone(),
         })
     }
@@ -100,14 +112,8 @@ fn permute_result_correlation(
         return if corr.is_empty() { None } else { Some(corr) };
     };
 
-    // Build inverse permutation: inv_perm[j] = i where permutation[i] = j.
-    // Input field _j is now at output field _inv_perm[j].
-    let mut inv_perm = vec![0usize; permutation.len()];
-    for (i, &target) in permutation.iter().enumerate() {
-        inv_perm[target] = i;
-    }
-    let j = tuple_field_index(f);
-    *f = tuple_field(inv_perm[j]);
+    // Input field `_j` is now output field `_{inverse[j]}`.
+    *f = tuple_field(inverse_permutation(permutation)[tuple_field_index(f)]);
     Some(corr)
 }
 
@@ -148,6 +154,15 @@ impl TileProducer for PermuteRecordDomainProducer {
         };
         let output_domain = ColumnValue::Records(permute_record(input_fields, &self.permutation));
         let output_domain_pred = permute_componentwise(&domain_predicate, &self.permutation);
+        // A collection beneath names its paths through this level's keys, which are now
+        // permuted.
+        let permutation = &self.permutation;
+        let mut codomain = codomain;
+        codomain.map_level_predicates(&mut |depth, pred| {
+            pred.with_component_restated(depth + 1, 0, &|keys| {
+                permute_componentwise(keys, permutation)
+            })
+        });
         let mut permuted = Tile::grouped(
             row_starts,
             output_domain,
@@ -163,13 +178,28 @@ impl TileProducer for PermuteRecordDomainProducer {
         let upstream_guard = match obsolete_guard {
             g if g.is_universal() => self.input.tiling().universal_guard(),
             g if g.is_empty() => self.input.tiling().empty_guard(),
-            TileGuard::Function(FunctionGuard::Domain(pred)) => TileGuard::Function(
-                FunctionGuard::Domain(permute_componentwise(&pred, &self.permutation)),
-            ),
+            // A release names output keys, whose field `at` is input field `permutation[at]`, so
+            // it reaches the input through the inverse permutation.
+            TileGuard::Function(FunctionGuard::Domain(pred)) => {
+                TileGuard::Function(FunctionGuard::Domain(permute_componentwise(
+                    &pred,
+                    &inverse_permutation(&self.permutation),
+                )))
+            }
             g => unreachable!("PermuteRecordDomain cannot honor the release guard {g:?}"),
         };
         self.input.release(upstream_guard);
     }
+}
+
+/// The permutation that undoes `permutation`: field `permutation[at]` of its input goes back to
+/// field `at`.
+fn inverse_permutation(permutation: &[usize]) -> Vec<usize> {
+    let mut inverse = vec![0; permutation.len()];
+    for (at, &from) in permutation.iter().enumerate() {
+        inverse[from] = at;
+    }
+    inverse
 }
 
 /// `pred`, a region of a tuple domain, with its fields permuted.
@@ -180,7 +210,17 @@ impl TileProducer for PermuteRecordDomainProducer {
 fn permute_componentwise(pred: &Predicate, permutation: &[usize]) -> Predicate {
     match pred {
         Predicate::True | Predicate::False => pred.clone(),
-        Predicate::Record(fields) => Predicate::Record(permute_record(fields.clone(), permutation)),
+        // A field the record does not name is unconstrained.
+        Predicate::Record(fields) => Predicate::Record(
+            permutation
+                .iter()
+                .enumerate()
+                .map(|(at, &from)| {
+                    let field = fields.get(&tuple_field(from)).cloned();
+                    (tuple_field(at), field.unwrap_or(Predicate::True))
+                })
+                .collect(),
+        ),
         Predicate::Or(arms) => Predicate::flatten_or(
             arms.iter()
                 .map(|arm| permute_componentwise(arm, permutation))
@@ -189,6 +229,18 @@ fn permute_componentwise(pred: &Predicate, permutation: &[usize]) -> Predicate {
         p => unreachable!(
             "a tuple domain's region is a union of componentwise predicates, got {p:?}"
         ),
+    }
+}
+
+/// `region` with `restate` applied to what it names of the outermost keys: a key beneath stands
+/// under the restated path of the keys above it.
+fn at_outermost(region: &Projection, restate: &dyn Fn(&Predicate) -> Predicate) -> Projection {
+    match region {
+        Projection::Keys { level, keys } => Projection::keys_at(
+            *level,
+            keys.with_component_restated(level.index(), 0, restate),
+        ),
+        whole_or_none => whole_or_none.clone(),
     }
 }
 
@@ -215,25 +267,43 @@ fn tuple_field_index(field: &str) -> usize {
 fn flatten_predicate(pred: &Predicate, field_map: &[(SmolStr, Option<SmolStr>)]) -> Predicate {
     match pred {
         Predicate::True | Predicate::False => pred.clone(),
+        // A flattened field named by a union of componentwise predicates splices each, so the
+        // record is the union of the records with that field taking each arm.
+        Predicate::Record(outer_preds)
+            if let Some((outer_k, Predicate::Or(arms))) = field_map
+                .iter()
+                .filter(|(_, inner)| inner.is_some())
+                .find_map(|(outer_k, _)| outer_preds.get_key_value(outer_k)) =>
+        {
+            Predicate::flatten_or(
+                arms.iter()
+                    .map(|arm| {
+                        let mut taking = outer_preds.clone();
+                        taking.insert(outer_k.clone(), arm.clone());
+                        flatten_predicate(&Predicate::Record(taking), field_map)
+                    })
+                    .collect(),
+            )
+        }
+        // A field the record does not name is unconstrained.
         Predicate::Record(outer_preds) => Predicate::Record(
             field_map
                 .iter()
                 .enumerate()
                 .map(|(out_idx, (outer_k, inner_k_opt))| {
-                    let outer_pred = outer_preds
-                        .get(outer_k)
-                        .unwrap_or_else(|| panic!("missing outer field {outer_k} in predicate"));
+                    let outer_pred = outer_preds.get(outer_k).unwrap_or(&Predicate::True);
                     let out_pred = match inner_k_opt {
                         None => outer_pred.clone(),
                         Some(inner_k) => match outer_pred {
                             Predicate::True => Predicate::True,
                             Predicate::False => Predicate::False,
                             Predicate::Record(inner_preds) => {
-                                inner_preds.get(inner_k).cloned().unwrap_or_else(|| {
-                                    panic!("missing inner field {inner_k} in sub-predicate")
-                                })
+                                inner_preds.get(inner_k).cloned().unwrap_or(Predicate::True)
                             }
-                            p => panic!("unexpected predicate for outer field {outer_k}: {p:?}"),
+                            p => unreachable!(
+                                "a flattened field of a tuple domain is named field by field, \
+                                 got {p:?} for {outer_k}"
+                            ),
                         },
                     };
                     (tuple_field(out_idx), out_pred)
@@ -442,7 +512,17 @@ impl TileOperator for FlattenTupleDomain {
             ),
             input: self.input.subscribe(
                 self.tiling().universal_guard(),
-                widening(consumer),
+                {
+                    let field_map = self.field_map.clone();
+                    // The keys are the input's with some fields' fields spliced in, so a region
+                    // of the input's keys is the region of the same keys spliced.
+                    crate::interpreter::scheduler::restating(
+                        Box::new(move |region| {
+                            at_outermost(region, &|keys| flatten_predicate(keys, &field_map))
+                        }),
+                        consumer,
+                    )
+                },
                 scheduler,
             ),
             field_map: self.field_map.clone(),
@@ -709,6 +789,71 @@ mod tests {
         assert_eq!(fields[&tuple_field(0)], Predicate::True);
         assert_eq!(fields[&tuple_field(1)], Predicate::False);
         assert_eq!(fields[&tuple_field(2)], Predicate::True);
+    }
+
+    fn point(key: u64) -> Predicate {
+        Predicate::point(Value::UInt(key))
+    }
+
+    fn tuple(fields: Vec<Predicate>) -> Predicate {
+        Predicate::Record(
+            fields
+                .into_iter()
+                .enumerate()
+                .map(|(at, field)| (tuple_field(at), field))
+                .collect(),
+        )
+    }
+
+    /// A field a record predicate does not name is unconstrained, before a permutation and after:
+    /// `(_1: 2)` permuted by `[1, 0]` is `(_0: 2, _1: anything)`.
+    #[test]
+    fn permute_componentwise_reads_a_missing_field_as_any_key() {
+        let pred = Predicate::Record(HashMap::from([(tuple_field(1), point(2))]));
+        assert_eq!(
+            permute_componentwise(&pred, &[1, 0]),
+            tuple(vec![point(2), Predicate::True])
+        );
+    }
+
+    /// A flattened field named by a union splices each arm, a `False` arm splices nothing, and a
+    /// pass-through field beside it and a missing field come through as they read: the outer key
+    /// `(_0: (1, 2) or nothing, _1: 5)` with `_0` flattened is `(1, 2, 5)`, and without `_1` named
+    /// it is `(1, 2, anything)`.
+    #[test]
+    fn flatten_predicate_splices_each_arm_of_a_flattened_union() {
+        let field_map = vec![
+            (tuple_field(0), Some(tuple_field(0))),
+            (tuple_field(0), Some(tuple_field(1))),
+            (tuple_field(1), None),
+        ];
+        let either = Predicate::Or(vec![tuple(vec![point(1), point(2)]), Predicate::False]);
+        assert_eq!(
+            flatten_predicate(&tuple(vec![either.clone(), point(5)]), &field_map),
+            tuple(vec![point(1), point(2), point(5)])
+        );
+        let unnamed = Predicate::Record(HashMap::from([(tuple_field(0), either)]));
+        assert_eq!(
+            flatten_predicate(&unnamed, &field_map),
+            tuple(vec![point(1), point(2), Predicate::True])
+        );
+    }
+
+    /// A key beneath the outermost level stands under the restated path of the key above it: key
+    /// 5 under `(1, 2)` permuted by `[1, 0]` is key 5 under `(2, 1)`.
+    #[test]
+    fn at_outermost_restates_the_path_of_a_key_beneath() {
+        let beneath = Projection::keys_at(
+            CurryLevel::new(1),
+            Predicate::qualified(tuple(vec![point(1), point(2)]), point(5)),
+        );
+        assert_eq!(
+            at_outermost(&beneath, &|keys| permute_componentwise(keys, &[1, 0])),
+            Projection::keys_at(
+                CurryLevel::new(1),
+                Predicate::qualified(tuple(vec![point(2), point(1)]), point(5)),
+            )
+        );
     }
 
     /// `unflatten_predicate` is the inverse of `flatten_predicate` for Record predicates.
@@ -1023,10 +1168,10 @@ mod tests {
         assert_eq!(fields[&tuple_field(2)], Predicate::False); // in_1 = False
     }
 
-    /// `PermuteRecordDomainProducer::release_impl` applies the permutation to a `Record` guard.
-    ///
-    /// Release guard `{_0: True, _1: False, _2: True}` with permutation `[2, 0, 1]`.
-    /// Upstream receives `{_0: True, _1: True, _2: False}`.
+    /// `PermuteRecordDomainProducer::release_impl` restates a `Record` guard over the input's
+    /// fields. With permutation `[2, 0, 1]` output field `_1` is input field `_0`, so the release
+    /// `{_0: True, _1: (-∞, 1], _2: True}` reaches the input as `{_0: (-∞, 1], _1: True,
+    /// _2: True}`.
     #[test]
     fn permute_producer_release_record_guard_is_permuted() {
         use std::sync::mpsc;
@@ -1081,17 +1226,12 @@ mod tests {
         let TileGuard::Function(FunctionGuard::Domain(Predicate::Record(fields))) = upstream else {
             panic!("expected Function/Domain/Record guard, got {upstream:?}");
         };
-        // permutation [2,0,1]: upstream field `target` receives the downstream field at that index.
-        // `release_impl` calls permute_record(fields, permutation):
-        //   upstream._0 ← downstream._2 = True
-        //   upstream._1 ← downstream._0 = True
-        //   upstream._2 ← downstream._1 = (-∞, 1]
-        assert_eq!(fields[&tuple_field(0)], Predicate::True);
-        assert_eq!(fields[&tuple_field(1)], Predicate::True);
         assert_eq!(
-            fields[&tuple_field(2)],
+            fields[&tuple_field(0)],
             Predicate::at_or_below(Value::Int(1))
         );
+        assert_eq!(fields[&tuple_field(1)], Predicate::True);
+        assert_eq!(fields[&tuple_field(2)], Predicate::True);
     }
 
     // ── permute_result_correlation ────────────────────────────────────────────
@@ -1382,6 +1522,25 @@ mod projection_tests {
             (vec![vec![1, 1], vec![0, 1]], vec![11, 13])
         );
         assert!(pulled.borrow()[0].is_universal());
+    }
+
+    /// A release names output keys and reaches the input as the same keys under the input's
+    /// field names: rotating `(a, b, c)` to `(b, c, a)`, a release of the rows whose output
+    /// field `_0` is `1` releases the input rows whose field `_1` is `1`.
+    #[test]
+    fn a_release_of_rotated_keys_names_the_input_field_each_came_from() {
+        let tiling = Tiling::data_function(
+            Extent::Record(record_of(vec![uint(), uint(), uint()])),
+            Tiling::Scalar(Extent::Base(BaseType::Int)),
+        );
+        let (input, _, released) = ProjectionSpy::new(tiling.empty_tile(), tiling.clone());
+        let mut rotated = PermuteRecordDomainProducer {
+            base: ProducerBase::unowned(PermuteRecordDomainProducer::alloc_id(), &tiling),
+            input: Box::new(input),
+            permutation: vec![1, 2, 0],
+        };
+        rotated.release(field_is(0, 1, 3));
+        assert_eq!(*released.borrow(), [field_is(1, 1, 3)]);
     }
 
     #[test]
