@@ -309,3 +309,63 @@ fn a_defect_is_reported_once_per_site(#[case] code: &str, #[case] expected: &[&s
 fn each_defect_is_reported_past_a_failed_statement(#[case] code: &str, #[case] expected: &[&str]) {
     assert_eq!(underlined(code), expected);
 }
+
+/// Compile `code` and return each error's phase and the source text it underlines, in
+/// report order.
+fn underlined_by_phase(code: &str) -> Vec<(&'static str, String)> {
+    let mut ctx = GlobalContext::default();
+    let consumer: Box<dyn Consumer> = Box::new(|| {});
+    let program = LoadedProgram::test(code);
+    let Err(errs) = compile_program(&mut ctx, &program, consumer) else {
+        panic!("expected a compile error, but the program compiled");
+    };
+    errs.iter()
+        .map(|e| {
+            let phase = match e {
+                CompileError::Lower(_) => "lower",
+                CompileError::Infer { .. } => "infer",
+                _ => panic!("expected only lowering and inference errors, got {errs:?}"),
+            };
+            let span = e.span().expect("a lowering or inference error has a span");
+            (phase, code[span.start..span.end].to_string())
+        })
+        .collect()
+}
+
+/// A statement lowering fails in hides no inference error elsewhere, and its names are bound
+/// at a poison, so their uses report nothing (`src/ccl/design/type-inference.md`, "An error
+/// stops its statement, not the pass").
+#[rstest]
+#[timeout(Duration::from_secs(10))]
+#[case::a_join_past_a_failed_binding(
+    indoc! {r#"
+        x: Mut(Int) = 3
+        y = [1, "a"]
+        z = x + 1
+        y
+    "#},
+    &[("lower", "x: Mut(Int) = 3"), ("infer", r#"[1, "a"]"#)],
+)]
+#[case::a_join_past_a_failed_function(
+    indoc! {r#"
+        def f(a):
+            pass
+        y = [1, "a"]
+        f(1)
+    "#},
+    &[("lower", "pass"), ("infer", r#"[1, "a"]"#)],
+)]
+#[case::a_join_past_a_failed_last_statement(
+    indoc! {r#"
+        y = [1, "a"]
+        x: Mut(Int) = 3
+    "#},
+    &[("lower", "x: Mut(Int) = 3"), ("infer", r#"[1, "a"]"#)],
+)]
+fn inference_runs_past_a_statement_lowering_failed_in(
+    #[case] code: &str,
+    #[case] expected: &[(&str, &str)],
+) {
+    let expected: Vec<(&str, String)> = expected.iter().map(|(p, s)| (*p, s.to_string())).collect();
+    assert_eq!(underlined_by_phase(code), expected);
+}

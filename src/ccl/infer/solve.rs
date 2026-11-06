@@ -2931,8 +2931,9 @@ fn build_instance_function(expr: &mut Expr, instance: &TraitInstance) {
 }
 
 /// The instance a `TraitFn`'s operand types match (`src/ccl/design/type-inference.md`,
-/// "Trait functions"), or `None` while an operand does not resolve: the node's own type
-/// holds the same variable, and its resolution failure is reported there.
+/// "Trait functions"), or `None` while an operand does not resolve, or resolves to a
+/// variable nothing determines: the node's own type holds the same variable, and what
+/// leaves it unresolved or undetermined is reported there.
 ///
 /// The obligation the node's emission placed accepted these operands, so an instance
 /// matches; one that does not is reported as a missing instance.
@@ -2956,6 +2957,9 @@ fn matching_instance(
     else {
         return Ok(None);
     };
+    if resolved.iter().any(|ty| matches!(ty, Type::Infer(_))) {
+        return Ok(None);
+    }
     let instances = ctx.instances.instances(trait_);
     let mut matching = instances.iter().filter(|i| i.matches(&resolved));
     let Some(instance) = matching.next() else {

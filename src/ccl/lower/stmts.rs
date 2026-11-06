@@ -51,9 +51,8 @@ pub(super) fn lower_chain_recovering(
                 Ok(e) => e,
                 Err(e) => {
                     errors.push(e);
-                    // As in `lower_stmts_recovering`: the partial tree is not consumed
-                    // past lowering, so the placeholder's role is structural.
-                    Expr::expr_stmt(Expr::error(), backup)
+                    ctx.stood_in += 1;
+                    stand_in_for_failed(stmt, &stmts[..i], &outer_bindings, backup, ctx)
                 }
             }
         });
@@ -208,12 +207,16 @@ pub(super) fn lower_stmts_recovering(
             Ok(e) => e,
             Err(e) => {
                 errors.push(e);
-                Expr::error()
+                ctx.stood_in += 1;
+                ctx.tag_image(Expr::error(), last.span)
             }
         },
         None => {
-            errors.push(block_contributes_nothing(stmts));
-            Expr::error()
+            let error = block_contributes_nothing(stmts);
+            let failed = ctx.tag_image(Expr::error(), error.span());
+            errors.push(error);
+            ctx.stood_in += 1;
+            failed
         }
     };
 
@@ -241,12 +244,8 @@ pub(super) fn lower_stmts_recovering(
                 Ok(e) => e,
                 Err(e) => {
                     errors.push(e);
-                    // Wrap with a placeholder ExprStmt so the continuation
-                    // (`backup`) and any later siblings remain reachable in
-                    // the partial tree. The tree is not consumed past
-                    // lowering when errors are present, so the placeholder's
-                    // role is purely structural.
-                    Expr::expr_stmt(Expr::error(), backup)
+                    ctx.stood_in += 1;
+                    stand_in_for_failed(stmt, &rest[..i], &outer_bindings, backup, ctx)
                 }
             }
         });
@@ -1255,6 +1254,61 @@ pub(super) fn lower_middle_stmt(
              before the final expression",
         )),
     }
+}
+
+/// The statement `stmt` stands for when its lowering failed, over its continuation `body`:
+/// each name it introduces bound at the [`Error`](crate::ccl::TypedExprNode::Error)
+/// placeholder, or, when it introduces none, the placeholder as an expression statement.
+///
+/// The continuation was lowered first and names what `stmt` binds, so inference, which runs
+/// on a tree lowering failed in, binds each at a poison and reports nothing a use of it
+/// raises (`src/ccl/design/type-inference.md`, "An error stops its statement, not the
+/// pass"). A write, `+=` or a bare `:=` to a name in scope, introduces nothing.
+fn stand_in_for_failed(
+    stmt: &Spanned<ChlStmt>,
+    preceding: &[Spanned<ChlStmt>],
+    outer_bindings: &HashSet<String>,
+    body: Expr,
+    ctx: &mut LoweringContext,
+) -> Expr {
+    if let ChlStmt::Pub { stmt: inner, .. } = &stmt.node {
+        return stand_in_for_failed(inner, preceding, outer_bindings, body, ctx);
+    }
+    let writes = match &stmt.node {
+        ChlStmt::AugAssign { .. } => true,
+        ChlStmt::MutAssign {
+            annotation: None, ..
+        } => {
+            let mut scope = outer_bindings.clone();
+            collect_stmt_names(preceding, &mut scope);
+            let mut names = HashSet::new();
+            collect_stmt_names(std::slice::from_ref(stmt), &mut names);
+            names.iter().all(|name| scope.contains(name))
+        }
+        _ => false,
+    };
+    let mut names = HashSet::new();
+    if !writes {
+        collect_stmt_names(std::slice::from_ref(stmt), &mut names);
+    }
+    if let ChlStmt::Param { name, .. } = &stmt.node {
+        names.insert(name.node.to_string());
+    }
+    if names.is_empty() {
+        let failed = ctx.tag_image(Expr::error(), stmt.span);
+        return ctx.tag_machinery(Expr::expr_stmt(failed, body), stmt.span, "lower.stmt_seq");
+    }
+    // Sorted, so the tree does not depend on the set's order.
+    let mut names: Vec<String> = names.into_iter().collect();
+    names.sort();
+    names.into_iter().fold(body, |body, name| {
+        let failed = ctx.tag_image(Expr::error(), stmt.span);
+        ctx.tag_machinery(
+            Expr::let_bind(name, failed, body),
+            stmt.span,
+            "lower.failed_stmt",
+        )
+    })
 }
 
 /// Collect the names assignment and function-def statements bind into `names`, every name
