@@ -309,16 +309,35 @@ impl LoopScope {
     /// until a pass changes nothing: a pipeline the round queues nothing, as the drive in a closing
     /// round, states there what it read past, and a breaker that pushes only at a finish, as
     /// `MapAggregate`, hands its readers the round's groups.
+    ///
+    /// The pipelines that follow others are held while those passes run, and released for one
+    /// claim at a time, after which the passes settle again: a follower reads by pull what it
+    /// follows, which is quiescent before its pushes settle, and a follower's consume can feed
+    /// another breaker that pushes only at `push_held`.
     fn run_round(&self) {
         let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
             reach_member(&self.store, &self.members[pipeline.0], pipeline, call)
         };
         loop {
-            let before = self.inner.changes();
-            push_held(&self.inner, &mut reach);
-            self.run_inner();
-            if self.inner.changes() == before {
-                return;
+            self.inner.hold_followers(true);
+            loop {
+                let before = self.inner.changes();
+                push_held(&self.inner, &mut reach);
+                self.run_inner();
+                if self.inner.changes() == before {
+                    break;
+                }
+            }
+            self.inner.hold_followers(false);
+            match self.inner.try_claim(None) {
+                Next::Package(package) => consume_with(&self.inner, &mut reach, package),
+                Next::Finish { pipeline, consumed } => {
+                    finish_with(&self.inner, &mut reach, pipeline, consumed)
+                }
+                Next::Wait(_) | Next::Done => return,
+                Next::Failed => {
+                    panic!("a loop's rounds run on one thread, which fails by panicking")
+                }
             }
         }
     }

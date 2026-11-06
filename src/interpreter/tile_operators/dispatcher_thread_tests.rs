@@ -10,12 +10,12 @@ use std::cell::RefCell;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
-use std::sync::{Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
 use super::growing::{Rng, predicate, same_region};
-use super::test_helpers::{keys_between, wire};
+use super::test_helpers::{keys_between, push_to, wire};
 use super::*;
 use crate::interpreter::dispatcher::{
     BreakerHandle, Dispatcher, Event, Next, PipelineId, WorkPackage, run,
@@ -1467,6 +1467,140 @@ fn a_notify_at_its_limit_returns_once_the_run_fails() {
     });
 }
 
+/// A breaker of a source whose held keys are every key its pipeline's workers have consumed, so a
+/// push after one worker's consume pushes what every worker decided so far.
+struct SharedHeld {
+    base: ProducerBase,
+    consumed: Arc<AtomicU64>,
+}
+
+impl SharedHeld {
+    fn new(consumed: Arc<AtomicU64>) -> Self {
+        Self {
+            base: ProducerBase::unowned(Self::alloc_id(), &keys_tiling(UNIVERSE)),
+            consumed,
+        }
+    }
+}
+
+impl TileProducer for SharedHeld {
+    impl_producer_base!();
+
+    fn get_impl(&mut self, _guard: TileGuard) -> Tile {
+        self.tiling().empty_tile()
+    }
+
+    fn release_impl(&mut self, _guard: TileGuard) {}
+}
+
+impl Breaker for SharedHeld {
+    fn enter_consuming_mode(&mut self) {}
+
+    fn consume_impl(&mut self, _: InputId, guard: TileGuard) {
+        self.consumed.fetch_or(mask_of(&guard), SeqCst);
+    }
+
+    fn input_tiling(&self, _: InputId) -> Tiling {
+        keys_tiling(UNIVERSE)
+    }
+
+    fn input_released(&self, _: InputId) -> TileGuard {
+        keys_tiling(UNIVERSE).universal_guard()
+    }
+
+    fn as_producer(&self) -> Option<&dyn BreakingProducer> {
+        Some(self)
+    }
+}
+
+impl BreakingProducer for SharedHeld {
+    fn held(&self) -> TileGuard {
+        guard_of(self.consumed.load(SeqCst))
+    }
+
+    fn morsels(&self, guard: &TileGuard, rows: usize) -> Vec<TileGuard> {
+        cut(guard, rows)
+    }
+
+    fn offer_impl(&mut self, _guard: TileGuard) -> Tile {
+        self.tiling().empty_tile()
+    }
+}
+
+/// A source whose workers each push what the breaker holds after every consume, on several threads
+/// at once, and once more at its finish: each push names the held keys less what any push named
+/// before, which `Pushes::record` asserts in a debug build, and the reader consumes every key once.
+/// The reader parks nothing, so its queue would take a key pushed twice only once: the assertion
+/// in `record` is what catches two pushes of one key.
+#[test]
+fn pushes_of_one_pipeline_from_several_threads_push_each_key_once() {
+    for iteration in 1..=60u64 {
+        for threads in [2, 8, 16] {
+            let what = format!("iteration {iteration}, {threads} threads");
+            within(what, move || {
+                pushed_from_several_threads(iteration, threads)
+            });
+        }
+    }
+}
+
+fn pushed_from_several_threads(seed: u64, threads: usize) {
+    let dispatcher = Dispatcher::new(vec![vec![], vec![0]], 1 + (seed % 3) as usize);
+    let held = Arc::new(AtomicU64::new(0));
+    let read = AtomicU64::new(0);
+    thread::scope(|scope| {
+        let (dispatcher, held, read) = (&dispatcher, &held, &read);
+        scope.spawn(move || {
+            let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15));
+            let mut key = 0;
+            while key < UNIVERSE {
+                let last = (key + rng.below(6)).min(UNIVERSE - 1);
+                dispatcher.notify(PipelineId(0), &keys_between(key, last));
+                key = last + 1;
+                jitter(&mut rng);
+            }
+            dispatcher.close(PipelineId(0));
+        });
+        for at in 0..threads {
+            scope.spawn(move || {
+                let _worker = dispatcher.worker();
+                let mut breaker = SharedHeld::new(held.clone());
+                push_to(&mut breaker, &[1]);
+                let mut rng = Rng(seed ^ (at as u64 + 1) << 32);
+                loop {
+                    match dispatcher.claim(None) {
+                        Next::Package(package) if package.pipeline == PipelineId(0) => {
+                            breaker.consume_impl(InputId::ONLY, package.guard.clone());
+                            jitter(&mut rng);
+                            let mut pushes = dispatcher.pushes(package.pipeline);
+                            pushes.push_final(&breaker);
+                            dispatcher.land(pushes);
+                            dispatcher.acknowledge(package);
+                        }
+                        Next::Package(package) => {
+                            let mask = mask_of(&package.guard);
+                            assert_eq!(read.fetch_or(mask, SeqCst) & mask, 0, "read once");
+                            dispatcher.acknowledge(package);
+                        }
+                        Next::Finish { pipeline, .. } => {
+                            let mut pushes = dispatcher.pushes(pipeline);
+                            if pipeline == PipelineId(0) {
+                                jitter(&mut rng);
+                                pushes.push_final(&breaker);
+                            }
+                            dispatcher.finish(pushes);
+                        }
+                        Next::Done => return,
+                        Next::Failed => panic!("the run failed"),
+                        Next::Wait(_) => unreachable!("a blocking claim waits itself"),
+                    }
+                }
+            });
+        }
+    });
+    assert_eq!(read.load(SeqCst), u64::MAX, "the reader read every key");
+}
+
 /// Two sources, one of the even keys and one of the odd, notified by one thread while workers
 /// claim, read by one pipeline: the reader takes a source's packages once that source finished
 /// and pushed them, and consumes each key once.
@@ -1639,4 +1773,97 @@ fn landed_while_claimed(seed: u64, threads: usize) {
             ),
         }
     }
+}
+
+/// A loop's rounds in one dispatcher shared by workers, with no scope of its own: pipeline 0 is
+/// the drive, a source notified of one position per round; pipeline 1 is the body, which reads the
+/// drive's pushes; pipeline 2 is the store's step, ordered, which reads the body, follows it and
+/// takes no push of it. A step's package is one position, queued with the round's notify. Its
+/// consume opens the next round: it notifies the drive of the next position and queues the step
+/// of it, and the last step closes the drive. The store steps at each position after the body has
+/// consumed it, one position at a time and in order. A claim race lets the step run ahead of the
+/// body only in some interleavings, so the test catches it in some runs, not every one.
+#[test]
+fn rounds_in_one_dispatcher_step_after_their_body() {
+    for iteration in 1..=60u64 {
+        for threads in [1, 2, 8, 16] {
+            let what = format!("iteration {iteration}, {threads} threads");
+            within(what, move || stepped_in_rounds(iteration, threads));
+        }
+    }
+}
+
+fn stepped_in_rounds(seed: u64, threads: usize) {
+    const ROUNDS: u64 = 24;
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![0], vec![1]], 1);
+    dispatcher.order(PipelineId(2));
+    dispatcher.follow(PipelineId(2), PipelineId(1));
+    // Positions the body consumed, and the positions the store stepped, in step order.
+    let bodied = AtomicU64::new(0);
+    let stepped = Mutex::new(Vec::new());
+    let position = |p: u64| keys_between(p, p);
+    dispatcher.notify(PipelineId(0), &position(0));
+    dispatcher.queue_for(PipelineId(2), &position(0));
+    thread::scope(|scope| {
+        let (dispatcher, bodied, stepped) = (&dispatcher, &bodied, &stepped);
+        for at in 0..threads {
+            scope.spawn(move || {
+                let _worker = dispatcher.worker();
+                let mut rng = Rng(seed ^ (at as u64 + 1) << 32);
+                loop {
+                    match dispatcher.claim(None) {
+                        Next::Package(package) => {
+                            let mask = mask_of(&package.guard);
+                            assert_eq!(mask.count_ones(), 1, "a round's package is one position");
+                            let p = u64::from(mask.trailing_zeros());
+                            jitter(&mut rng);
+                            match package.pipeline.0 {
+                                0 => {
+                                    let mut pushes = dispatcher.pushes(package.pipeline);
+                                    pushes.push(&package.guard, cut);
+                                    dispatcher.land(pushes);
+                                }
+                                1 => {
+                                    let before = bodied.fetch_or(mask, SeqCst);
+                                    assert_eq!(before & mask, 0, "the body consumes {p} once");
+                                }
+                                _ => {
+                                    assert_ne!(
+                                        bodied.load(SeqCst) & mask,
+                                        0,
+                                        "the store steps at {p} after the body consumed it"
+                                    );
+                                    stepped.lock().expect("no worker panics").push(p);
+                                    match p + 1 < ROUNDS {
+                                        true => {
+                                            dispatcher.notify(PipelineId(0), &position(p + 1));
+                                            dispatcher.queue_for(PipelineId(2), &position(p + 1));
+                                        }
+                                        false => dispatcher.close(PipelineId(0)),
+                                    }
+                                }
+                            }
+                            dispatcher.acknowledge(package);
+                        }
+                        Next::Finish { pipeline, .. } => {
+                            dispatcher.finish(dispatcher.pushes(pipeline))
+                        }
+                        Next::Done => return,
+                        Next::Failed => panic!("the run failed"),
+                        Next::Wait(_) => unreachable!("a blocking claim waits itself"),
+                    }
+                }
+            });
+        }
+    });
+    assert_eq!(
+        bodied.load(SeqCst),
+        (1 << ROUNDS) - 1,
+        "the body consumed every position"
+    );
+    assert_eq!(
+        stepped.into_inner().expect("no worker panics"),
+        (0..ROUNDS).collect::<Vec<_>>(),
+        "the store stepped every position once, in order"
+    );
 }

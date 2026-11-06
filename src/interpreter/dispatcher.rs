@@ -471,6 +471,10 @@ pub struct Dispatcher {
     done: AtomicBool,
     /// Set by [`Dispatcher::fail`], and by every refusal before it panics ([`Dispatcher::ensure`]).
     failed: AtomicBool,
+    /// Whether a pipeline that follows another takes no package ([`hold_followers`]).
+    ///
+    /// [`hold_followers`]: Dispatcher::hold_followers
+    followers_held: AtomicBool,
     /// Advances at every change that can make a claim succeed or end the run: an append, a close,
     /// an acknowledgement that frees an ordered pipeline's next package, completes a queue or
     /// returns credit to a limited source, a finish, and a failure. It also advances when a claim
@@ -570,6 +574,7 @@ impl Dispatcher {
             states,
             done: AtomicBool::new(false),
             failed: AtomicBool::new(false),
+            followers_held: AtomicBool::new(false),
             generation: AtomicU64::new(0),
             sleepers: AtomicUsize::new(0),
             sleep: Mutex::new(()),
@@ -588,19 +593,27 @@ impl Dispatcher {
     }
 
     /// Whether `pipeline` has consumed every package queued for it, and every pipeline it reads is
-    /// quiescent too: nothing it reads can bring it more until a pipeline outside what it reads
-    /// queues something. A row it parks waits for a decision no consume of the round makes. A
-    /// loop's rounds run on one thread, so a round's pipelines are quiescent once the round has
-    /// run all it queued.
+    /// quiescent too: no package of theirs is outstanding. A breaker that pushes only what
+    /// `push_held` asks of it, as `MapAggregate`, can be quiescent before its readers took what it
+    /// decided, which is why a loop's round holds its followers until its pushes settle
+    /// ([`hold_followers`](Self::hold_followers)).
     fn quiescent(&self, pipeline: usize) -> bool {
+        // The pipelines it reads first: a push lands before the acknowledgement of the package
+        // that made it, so a read found quiescent has queued all it pushed before this pipeline's
+        // counts are read, and a package in flight on another thread is seen.
+        if !self.infos[pipeline]
+            .reads
+            .iter()
+            .all(|&read| self.quiescent(read))
+        {
+            return false;
+        }
+        // Acknowledged before reserved: the count only grows and never passes the reservations,
+        // so the two equal says no package of the pipeline was outstanding when the second was
+        // read.
         let state = &self.states[pipeline];
-        let reserved = state.queue.reserved();
-        state.claimed.load(Ordering::Acquire) == reserved
-            && state.acknowledged.load(Ordering::Acquire) == reserved
-            && self.infos[pipeline]
-                .reads
-                .iter()
-                .all(|&read| self.quiescent(read))
+        let acknowledged = state.acknowledged.load(Ordering::SeqCst);
+        acknowledged == state.queue.reserved.load(Ordering::SeqCst) & !CLOSED
     }
 
     /// Queue `guard`, a guard of the input of `reader`'s breaker, as a package of `reader`, less
@@ -935,6 +948,10 @@ impl Dispatcher {
         self.ensure(appended, || {
             format!("pipeline {reader} has not finished when a decided push covers what it parked")
         });
+        // A sleeping worker learns of the rows released; a push that releases none changes no
+        // queue, so the fixpoints of a live pass and a loop's round, which wait for the generation
+        // to stand still, end.
+        self.advance();
     }
 
     fn mark_arrivals(&mut self, pipeline: PipelineId) {
@@ -1052,10 +1069,19 @@ impl Dispatcher {
     /// Whether a claim may take `pipeline`'s packages: once every pipeline it follows
     /// ([`follow`](Self::follow)) is quiescent ([`quiescent`](Self::quiescent)).
     fn takes_from(&self, pipeline: usize) -> bool {
-        self.infos[pipeline]
-            .follows
-            .iter()
-            .all(|&read| self.quiescent(read))
+        let follows = &self.infos[pipeline].follows;
+        follows.is_empty()
+            || (!self.followers_held.load(Ordering::SeqCst)
+                && follows.iter().all(|&read| self.quiescent(read)))
+    }
+
+    /// Hold every pipeline that follows another ([`follow`](Self::follow)) from taking a package,
+    /// or release them. A loop's round holds them while the pipelines they follow push what they
+    /// decided: a breaker that pushes only what `push_held` asks it to, as `MapAggregate`, is
+    /// quiescent before its readers have taken what it decided (`LoopScope::run_round`).
+    pub(crate) fn hold_followers(&self, held: bool) {
+        self.followers_held.store(held, Ordering::SeqCst);
+        self.advance();
     }
 
     /// Mark `pipeline`, which reads a pipeline, as consuming its breaker's input whole, `input`
@@ -1378,9 +1404,6 @@ impl Dispatcher {
     /// The package at the front of `pipeline`'s queue, recorded as claimed, where a claim may take
     /// one. An ordered pipeline has at most one package in flight.
     fn claim_from(&self, pipeline: usize) -> Option<WorkPackage> {
-        if !self.takes_from(pipeline) {
-            return None;
-        }
         if !self.infos[pipeline].ordered {
             return self.claim_in(pipeline);
         }
@@ -1403,7 +1426,7 @@ impl Dispatcher {
             // after the release sees that package's advance and every write before it, and a
             // second look finds the package and wakes that claim.
             self.generation.load(Ordering::SeqCst);
-            if self.claimable(pipeline) {
+            if self.claimable(pipeline) && self.takes_from(pipeline) {
                 self.advance();
             }
         }
@@ -1418,7 +1441,7 @@ impl Dispatcher {
     }
 
     /// The package at the front of `pipeline`'s queue, recorded as claimed, where it has one
-    /// written.
+    /// written and a claim may take it ([`takes_from`](Self::takes_from)).
     fn claim_in(&self, pipeline: usize) -> Option<WorkPackage> {
         let state = &self.states[pipeline];
         loop {
@@ -1429,6 +1452,12 @@ impl Dispatcher {
                 return None;
             }
             let guard = state.queue.written(index)?;
+            // Read after the package is seen written, and the exchange takes that package alone:
+            // what queued it queued the work the pipelines it follows do first, so the check sees
+            // that work.
+            if !self.takes_from(pipeline) {
+                return None;
+            }
             let taken = state
                 .claimed
                 .compare_exchange(index, index + 1, Ordering::AcqRel, Ordering::Relaxed)

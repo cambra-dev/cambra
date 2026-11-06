@@ -2304,6 +2304,14 @@ fn drive_live(
                     finish_with(dispatcher, reach, pipeline, consumed)
                 }
                 Next::Wait(_) => {
+                    // A breaker that pushes only at its finish, as `MapAggregate`, finishes only
+                    // once every source yields everything: it pushes what it decided here, and the
+                    // pass runs on while that brings anything.
+                    let before = dispatcher.changes();
+                    push_held(dispatcher, reach);
+                    if dispatcher.changes() != before {
+                        continue;
+                    }
                     assert!(
                         live.iter().any(|at| !at.closed),
                         "a run whose live pipelines have all closed has a pipeline that may finish"

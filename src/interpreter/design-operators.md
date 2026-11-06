@@ -1415,12 +1415,15 @@ The run starts the other sources whole and then polls: each pass asks every live
 (`DataSourceDomainExtentImpl::check_for_new_data`), notifies each live pipeline of the keys its
 sources yield beyond what it was notified of (`get_yield_predicate`), and runs what is claimable. A
 live pipeline closes once its sources yield everything, and the run ends once every pipeline has
-finished. A run starts with every breaker pushing what it holds (`dispatcher::push_held`), as a run
-after a pause or a reload starts over breakers an earlier run consumed into. A pass that finds
-nothing new calls the caller's `on_idle` after running what is claimable (`run_program_polling`):
-`run_program` sleeps for a millisecond, and a test feeds the source there. A range reads one source,
-keyed by positions: the planner refuses a cross product of sources, a source beside a static extent,
-and a source with other keys, whose arrivals no region of one source's positions spells.
+finished. Once a pass's claims run out, every breaker pushes what it holds and no push named, and
+the pass runs on while that brings anything: `MapAggregate` pushes only so, and finishes only once
+every source yields everything. A run starts with every breaker pushing what it holds
+(`dispatcher::push_held`), as a run after a pause or a reload starts over breakers an earlier run
+consumed into. A pass that finds nothing new calls the caller's `on_idle` after running what is
+claimable (`run_program_polling`): `run_program` sleeps for a millisecond, and a test feeds the
+source there. A range reads one source, keyed by positions: the planner refuses a cross product of
+sources, a source beside a static extent, and a source with other keys, whose arrivals no region of
+one source's positions spells.
 
 The binary runs a program dispatched where `CAMBRA_DISPATCH` is set to anything but `0` or the empty
 string, and neither `--inspect` nor `--control` is given, at morsels of `CAMBRA_MORSEL_ROWS` rows
@@ -1629,7 +1632,9 @@ runs none:
    it holds and no push named, and the dispatcher runs until nothing is claimable, again until a
    pass changes nothing. No finish ends a round, so this is where a pipeline the round queues
    nothing, as the drive in a closing round, states what it read past, and where a breaker that
-   pushes only at its finish, as `MapAggregate`, hands the round's groups on.
+   pushes only at its finish, as `MapAggregate`, hands the round's groups on. The pipelines that
+   follow others are held while those passes run, and released for one claim at a time, after which
+   the passes settle again.
 4. The store consumes the position, which one step decides and releases
    ([A store as a breaker](#a-store-as-a-breaker)).
 
@@ -1710,7 +1715,10 @@ pushing what it holds and no push named (`dispatcher::push_held`), before any ar
 In a loop's scope a reader takes a package only once every pipeline it follows
 (`Dispatcher::follow`) is quiescent: it has consumed every package queued for it, and so has every
 pipeline it reads (`Dispatcher::quiescent`). It takes no push of theirs
-([A loop in rounds](#a-loop-in-rounds)). An ordered pipeline has at most one package in flight and
+([A loop in rounds](#a-loop-in-rounds)). A claim of such a reader reads the package's index first,
+then checks the pipelines it follows, then takes that index alone, so the check sees the work that
+the package was queued after. A round holds its followers while its pushes settle
+(`Dispatcher::hold_followers`). An ordered pipeline has at most one package in flight and
 takes its packages in queue order.
 
 #### Claiming from several threads

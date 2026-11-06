@@ -994,6 +994,18 @@ fn a_nested_loop_with_a_condition(#[case] source: &str, #[case] expected: &str) 
             total += sum([q.0 for q in [(y, z) for z in xs] if q.1 > 1])
     out << total
 "}, "12")]
+#[case::an_inner_source_of_sums_over_the_outer_position(indoc! {"
+    out = test_sink()
+    ws = [1, 2, 3]
+    qs = [1, 2]
+    total := 0
+    for x in [1, 2]:
+        acc := 0
+        for z in [sum([w * x * q for w in ws]) for q in qs]:
+            acc += z
+        total += acc
+    out << total
+"}, "54")]
 fn a_nested_loop_body_reading(#[case] source: &str, #[case] expected: &str) {
     answers(source, expected, &["LoopScope", "SinkBreaker"]);
 }
@@ -2807,6 +2819,29 @@ fn a_map_over_a_live_source_at_main(
             .iter()
             .any(|plan| plan.live && !plan.whole && plan.name.starts_with("SinkBreaker")),
         "the `main` output's pipeline is notified of each delivery: {planned:?}"
+    );
+}
+
+/// An aggregate per row over a live source at the `main` output hands the first delivery's rows
+/// before the second arrives: `MapAggregate` pushes only what `push_held` asks of it, which each
+/// pass of a live run does once its claims run out (`drive_live`).
+#[rstest_log::rstest]
+fn an_aggregate_per_row_over_a_live_source_at_main(#[values(1, usize::MAX)] rows: usize) {
+    let LiveMain { value, handed, .. } = dispatched_live_main(
+        "[max([x * s for s in [1, 10]]) for x in source1()]",
+        rows,
+        two_batches(),
+    );
+    assert_eq!(
+        keyed_ints(&value),
+        (0..5)
+            .map(|key| (key, 10 * (key as i64 + 1)))
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        handed,
+        [3],
+        "the first delivery's rows reach the `main` output before the second delivery"
     );
 }
 
