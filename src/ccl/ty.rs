@@ -4459,6 +4459,16 @@ impl Type {
     pub fn holds_type<F: Fn(&Type) -> bool + ?Sized>(&self, hit: &F) -> bool {
         hit(self) || self.any_child(|child| child.holds_type(hit))
     }
+
+    /// Call `f` on each inference variable in this type or a child [`Self::walk_children`]
+    /// reaches, at any depth, in pre-order. Neither a variable's bounds nor a refinement
+    /// predicate is entered.
+    pub fn walk_infer_vars(&self, f: &mut impl FnMut(&Rc<InferVar>)) {
+        if let Type::Infer(v) = self {
+            f(v);
+        }
+        self.walk_children(|child| child.walk_infer_vars(f));
+    }
 }
 
 /// Represents a type refinement: a base type narrowed by a boolean predicate.

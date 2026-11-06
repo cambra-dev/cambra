@@ -577,7 +577,7 @@ fn own_bounds(v: &crate::ccl::infer_var::InferVar) -> Vec<OwnBound> {
         })
         .map(|b| {
             let mut reached = Vec::new();
-            collect_vars(&b.ty, &mut reached);
+            b.ty.walk_infer_vars(&mut |v| reached.push(Rc::clone(v)));
             OwnBound {
                 render: b.render_subst().image_table(),
                 reads: OwnReads {
@@ -590,14 +590,6 @@ fn own_bounds(v: &crate::ccl::infer_var::InferVar) -> Vec<OwnBound> {
             }
         })
         .collect()
-}
-
-/// The inference variables `ty`'s structure holds, outside refinement predicates.
-fn collect_vars(ty: &Type, out: &mut Vec<Rc<crate::ccl::infer_var::InferVar>>) {
-    if let Type::Infer(v) = ty {
-        out.push(Rc::clone(v));
-    }
-    ty.walk_children(|c| collect_vars(c, out));
 }
 
 /// A history in a compacted position: its function's binder, domain and value, the two
