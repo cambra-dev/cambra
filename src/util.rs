@@ -1,4 +1,4 @@
-//! General-purpose utilities shared across compiler and inference passes.
+//! General-purpose utilities shared across the crate's modules.
 
 use std::collections::HashMap;
 
@@ -350,6 +350,20 @@ fn strongly_connected(successors: &[Vec<usize>]) -> Vec<Vec<usize>> {
         }
     }
     tarjan.components
+}
+
+/// The TCP port `server` is listening on, or `requested` for a server that is
+/// not on one.
+///
+/// The inspector's and the control port's startup lines both print this
+/// rather than the port asked for: they differ under port `0`, where the OS
+/// picks a free port, and printing `0` would leave nothing able to reach the
+/// server.
+pub(crate) fn bound_port(server: &tiny_http::Server, requested: u16) -> u16 {
+    server
+        .server_addr()
+        .to_ip()
+        .map_or(requested, |addr| addr.port())
 }
 
 #[cfg(test)]

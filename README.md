@@ -113,7 +113,7 @@ printf 'hello\nworld\n' | cargo run -- --inspect tests/programs/streaming_echo/p
 
 The browser's `Values` pane draws them: choose “inspect data” on a source or an operator to watch what it holds. The page holds `/api/live` open while it is loaded, so that is when values are recorded.
 
-Both default to port 8080 (`--inspect=9090` to change it). Under `--inspect` values are recorded only while a client holds `/api/live` open, and the process stays alive after the program finishes, so a client connected through the run can still read them; Ctrl+C to exit. `--dump-snapshot` prints the static payload as JSON and exits. See [docs/inspector.md](docs/inspector.md).
+Both default to port 8080 (`--inspect=9090` to change it; `--inspect=0` lets the OS pick a free one, and the startup line on stderr names the port it picked). Under `--inspect` values are recorded only while a client holds `/api/live` open, and the process stays alive after the program finishes, so a client connected through the run can still read them; Ctrl+C to exit. `--dump-snapshot` prints the static payload as JSON and exits. See [docs/inspector.md](docs/inspector.md).
 
 ### Control port
 
@@ -131,7 +131,7 @@ curl --data-binary @v2.cambra localhost:8081/reload
 
 A reload may change the program's logic freely, add endpoints, and stop serving ones it no longer wants (their addresses then answer 404). A variable may even move to another loop: it keeps its value and starts counting positions in whatever it now iterates. The one thing a reload may not do is break continuity of state: a variable the running program is holding a value for must be one the new version declares, or one it loads under another name with `@LoadFrom`, at a type the value fits, and one the source names well enough to tell from its siblings — or the reload is refused and the running program is left serving. See [program-evolution.md](src/ccl/design/program-evolution.md#state-takeover).
 
-The control port defaults to 8081 (`--control=9090` to change it).
+The control port defaults to 8081 (`--control=9090` to change it, `--control=0` for any free port, named on stderr at startup).
 
 ## License
 

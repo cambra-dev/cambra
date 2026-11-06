@@ -48,6 +48,7 @@ use crate::ccl::context::{CompiledProgram, GlobalContext, compile_program};
 use crate::inspector_model::{Diagnostic, InspectorPayload, diagnostics_from_compile_errors};
 use crate::inspector_server::live::{LIVE_PATH, LiveChannel, LiveServer};
 use crate::interpreter::Consumer;
+use crate::util::bound_port;
 
 use super::{snapshot_json, snapshot_json_at_version, snapshot_json_pretty};
 
@@ -267,6 +268,7 @@ fn route(url: &str) -> &str {
 fn bind(name: &str, port: u16) -> io::Result<tiny_http::Server> {
     let server = tiny_http::Server::http(format!("127.0.0.1:{port}"))
         .map_err(|e| io::Error::other(e.to_string()))?;
+    let port = bound_port(&server, port);
     // Names the scheme and says where to look: `https://` to a plain-HTTP port
     // fails the handshake and renders as a blank page with nothing logged here.
     eprintln!("cambra: inspecting {name} at http://localhost:{port} — Ctrl+C to stop");
