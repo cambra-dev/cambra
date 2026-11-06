@@ -45,20 +45,29 @@ const source: LiveSource = {
 };
 
 describe("livePanelState", () => {
-  // The four states are four different sentences, and conflating them is the
-  // failure this union exists to prevent.
+  // Each state is a different sentence, and conflating them is the failure this
+  // union exists to prevent.
   it("says nothing is pinned before anything is", () => {
     expect(livePanelState(state()).kind).toBe("no-tags");
   });
 
   it("distinguishes a program that was not run from one that recorded nothing", () => {
-    const notRun = state({ status: { kind: "connecting" }, tags: [{ id: "t10", label: "T10", anchorId: 10, nodes: [10], shown: true, span: null }] });
+    const notRun = state({ status: { kind: "not-run" }, tags: [{ id: "t10", label: "T10", anchorId: 10, nodes: [10], shown: true, span: null }] });
     expect(livePanelState(notRun).kind).toBe("not-run");
 
     const ranButSilent = livePanelState(state({ tags: [{ id: "t10", label: "T10", anchorId: 10, nodes: [10], shown: true, span: null }] }));
     expect(ranButSilent.kind).toBe("groups");
     if (ranButSilent.kind !== "groups") return;
     expect(ranButSilent.groups[0]?.kind).toBe("silent");
+  });
+
+  it("distinguishes a run that has not published yet from no run at all", () => {
+    // The header reads "waiting for values" before a live run's first frame, so
+    // the pane must not say the program was never run.
+    const panel = livePanelState(state({ status: { kind: "connecting" }, tags: [{ id: "t10", label: "T10", anchorId: 10, nodes: [10], shown: true, span: null }] }));
+    expect(panel.kind).toBe("connecting");
+    expect(serializeLivePanel(panel)).toContain("waiting for values");
+    expect(serializeLivePanel(panel)).not.toContain("not run");
   });
 
   it("keeps the values on screen when the connection drops", () => {
