@@ -339,9 +339,6 @@ pub struct StoreRead {
     pub(crate) fan: usize,
     /// The store, the fan-out's input.
     pub(crate) store: StoreCell,
-    /// The producers registered with a data source inside the store's chain
-    /// ([`FanOut::source_producers`]).
-    pub(crate) sources: Vec<String>,
 }
 
 /// A store's handle on the cyclic fan-out whose input it is ([`TileProducer::enter_cycle`]).
@@ -388,6 +385,7 @@ struct FanOutInput {
 
 impl Consumer for FanOutInput {
     fn notify(&mut self, arrived: &Projection) {
+        crate::interpreter::dispatcher::debug_assert_outside_a_run();
         // Clone the consumer handles while holding a short borrow, then release the borrow before
         // calling notify(). This prevents a re-entrant panic when a consumer (e.g. SinkConsumer)
         // calls FanOutProducer::get_impl(), which needs shared.borrow_mut() for the same Rc.
@@ -997,7 +995,6 @@ impl TileProducer for FanOutProducer {
         Some(StoreRead {
             fan: shared.id,
             store: store.clone(),
-            sources: shared.source_producers.clone(),
         })
     }
 

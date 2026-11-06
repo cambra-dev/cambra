@@ -56,11 +56,11 @@ debug build that a package fits its breaker's input.
 
 A push lands by climbing the breaker's consumer (`ProducerBase::downstream`) one morsel at a time,
 as a projection of the breaker's keys at any level (`Consumer::push`). Each consumer between two
-breakers restates the region in its operator's keys, as it restates a notification ([The
-notification contract](design-operators.md#the-notification-contract)), and passes it on: a fan-out to every live slot,
-a tagged union under the arm's tag. No gate holds a push back, since every pushed region is a work
-package, and a consumer that pulls ignores it, so a push wakes no one. The `dispatcher::Entry` at
-the input of each breaker the push reaches queues the region, as a guard of that breaker's input
+breakers restates the region in its operator's keys, as it restates a notification
+([The notification contract](design-operators.md#the-notification-contract)), and passes it on: a fan-out to every live
+slot, a tagged union under the arm's tag. No gate holds a push back, since every pushed region is a
+work package, and a consumer that pulls ignores it, so a push wakes no one. The `dispatcher::Entry`
+at the input of each breaker the push reaches queues the region, as a guard of that breaker's input
 tiling, for the breaker's pipeline, less what is queued for that pipeline there
 already. The difference and the queue's growth are one step under the queue's lock, so a push that
 reaches a breaker along two paths, as a filter reads one memo for its values and its predicate, is
@@ -68,9 +68,10 @@ queued once. A push an operator widens to `Everything` on its way fails the run 
 reaches (`Landing::widened` marks the path, `Landing::queue` refuses it), since the reader could not
 tell which of its keys it names: a reader reached that way reads the pushing pipeline once it has
 finished, instead of its pushes. A push that re-enters a consumer it is passing through has met a
-cycle, and fails the run too. The push path sits beside `notify` while runs still pull. Once every
-run goes through the dispatcher, `notify`, its gates and `WakeupQueue` go, and `push` takes their
-place.
+cycle, and fails the run too. A compiled program's dispatched run notifies no consumer: a producer
+that caches what it reads reads it again where a store steps or a live source yields more
+(`TileProducer::read_again`), and a debug build checks that no consumer is notified inside the run
+(`dispatcher::debug_assert_outside_a_run`). `notify`, its gates and `WakeupQueue` serve pull mode.
 
 `dispatcher::finish_pipeline` finishes a pipeline once. It checks that the pipeline has not
 begun to finish, its queue is closed and every package acknowledged, each pipeline it reads has
@@ -83,9 +84,8 @@ The dispatcher reads a breaker's input `input` through `input_tiling` and `input
 tiling a package's guard is a guard of and the guard the breaker has released of that input, so a
 breaker whose input sits inside a shared cell can answer both.
 
-A dispatcher run delivers no wake-up queued on the scheduler. A breaker's reader learns of what it
-holds through the push, and a producer's notifications queue on the scheduler as in pull mode
-(`WakeupQueue`), to be delivered by a scheduler that pulls the program afterwards.
+A compiled program's dispatched run queues no wake-up: `WakeupQueue::request` drops one inside the
+run (`dispatcher::in_a_run`). A breaker's reader learns of what it holds through the push.
 
 ### Running a compiled program
 
@@ -162,30 +162,56 @@ The run pulls only the breakers' inputs. The program is compiled with
 a `Refused` error that names the shape, and pull mode runs every refused program:
 
 - a program compiled with its sinks pulled;
-- a live source read anywhere but by a source pipeline of the run's dispatcher whose input the
-  source's keys reach as its outermost keys (below);
+- a live source whose arrivals reach no pipeline's entry, reach one as a region that is no
+  projection of its keys, or reach a pipeline that also reads pushes (below);
 - a pipeline read directly by a pipeline another pipeline reads;
 - a breaker with no consuming mode (`Breaker::no_consuming_mode`): a transaction store of several
   writers;
 - the stores [A store as a breaker](design-operators.md#a-store-as-a-breaker) lists.
 
 A range over a live source's domain (`TileProducer::data_sources`, an `IterateExtent` over a
-`DataSourceDomain`) is no range the run queues whole at its start. The pipeline above it must be a
-source of the run's dispatcher, and a push of one of the range's keys through the range's consumer
-must reach that pipeline's entry restated, as a guard of the input's outermost keys: a reader of
-pushes, a loop's round and a store take no package a source's arrival names, and a feed `out << 𝑒`
-is keyed by the sink's one row, so its source's keys sit beneath it. Such a pipeline is live
-(`Planned::live`). The run starts the other sources whole and then polls: each pass asks every live
-source for new data (`DataSourceDomainExtentImpl::check_for_new_data`), notifies each live pipeline
-of the keys its sources yield beyond what it was notified of (`get_yield_predicate`), as the region
-a push of them brings its entry. Once claims run out, every breaker pushes what it holds, and
-claims run again while that queues more work. A live pipeline closes once its sources yield
-everything. The run ends once every source has closed and every pipeline has finished. A pass that finds nothing new calls the caller's `on_idle` after running what is
-claimable (`run_program_polling`): `run_program` sleeps for a millisecond, and a test feeds the
-source there. A live range retains its full extent, including record and union domains. The run
-polls every physical source once per pass and announces the extent's new decided region through
-the range's consumer. Cartesian iteration remains a leaf of its reader's pipeline
-([Cartesian iteration](design-operators.md#cartesian-iteration)). Source positions must be unsigned indices.
+`DataSourceDomain`) is no range the run queues whole at its start. The pipeline that stands for it
+in the run's dispatcher is live (`Planned::live`), and the run notifies it of what the source yields
+in one of four ways (`LivePipeline::poll`):
+
+- A push of one of the range's keys through the range's consumer reaches the pipeline's entry
+  restated, as a projection of the input's keys at any level, as a `Converse` restates its input's
+  keys one level in: the pipeline is notified of the keys each delivery adds, as the region a push
+  of them brings its entry.
+- The push reaches the entry widened, as a feed `out << 𝑒` widens its source's keys, which sit
+  beneath the sink's one row: the pipeline reads its input whole once every live source under it
+  yields everything (`Planned::whole`). The widened pushes of several ranges, as of a sink fed from
+  two sites, name their parts of the input together.
+- The range is read inside a loop's scope, whose pipeline stands for every pipeline inside it
+  (`Planner::members`). Where the push reaches the scope's own drive, the scope is notified of each
+  delivery's keys as positions of its rounds. Where it reaches no drive of the scope, the source is
+  read inside a loop nested in it, whose rows end only once the source yields everything, so the
+  scope reads its input whole then, as pull mode waits for each row.
+- The range is read under a transaction store, whose input is its writer's source, read behind an
+  entry no planner places: the store's pipeline is notified of each delivery's keys as its items.
+
+A drive and a transaction store decide positions in order, and a debug build checks that a delivery
+adds positions after every one before it. A dispatched run delivers no notification: a loop's scope
+has its drive read its source once the drive has emitted every position it read, and a delivery to a
+transaction store has its writer's drive read its source again (`Breaker::read_source_again`). A
+package of positions the drive emits none of, such as the delivery that completes a source or one of
+keys a filter on its source drops, runs no round of a position; the scope runs a closing round at
+the package, queued to every inner pipeline but the sources in the store's chain, which has them
+read what the drive read past, and the store's step releases the package. A reader of a pipeline
+takes no package a source's arrival names, so the planner refuses a pipeline that reads both. A
+pipeline with a live source beneath it decides its input as consumes and held pushes advance.
+A reader of it takes the rows it reaches only once its input is whole.
+
+The run starts the other sources whole and has every breaker push what it holds before polling.
+Each pass asks every live source for new data (`DataSourceDomainExtentImpl::check_for_new_data`),
+notifies each live pipeline of the keys its sources yield beyond what it was notified of
+(`get_yield_predicate`), and runs what is claimable. Once claims run out, every breaker pushes what
+it holds and no push named, and the pass runs on while that brings work. A live pipeline closes
+once its sources yield everything, and the run ends once every pipeline has finished. A pass that
+notifies no new region and closes no live pipeline calls the caller's `on_idle` after draining work
+(`run_program_polling`): `run_program` sleeps for a millisecond, and a test feeds the source there. A live range retains its full extent, including record and union domains. The run polls every
+physical source once per pass and announces the extent's new decided region through its consumer.
+The iterator remains a leaf ([Cartesian iteration](design-operators.md#cartesian-iteration)).
 
 The binary runs a program dispatched where `CAMBRA_DISPATCH` is set to anything but `0` or the empty
 string, and neither `--inspect` nor `--control` is given, at morsels of `CAMBRA_MORSEL_ROWS` rows
@@ -292,6 +318,12 @@ position alone does not state the row's end, so this closing round has every rea
 completeness and lets the store release the row whole. A row is restated at each reader's input by
 `InductionStoreProducer::row_for`; a reader whose input has released the whole row is not queued it.
 
+A flat package can name positions the source filtered out, or a delivery that only closes the
+source.
+If it emitted no position and its input remains unreleased, it runs a closing round at that package.
+The body pipelines read what the drive read past, and the store step releases those absent
+positions.
+
 Finishing a request pipeline closes its body sources. The execution handler retains the finish
 until all body and step pipelines have finished in the same dispatcher. The store is terminal then;
 its final push lands before the request pipeline's finish releases its readers. A nested store
@@ -299,12 +331,12 @@ releases its body a position at a time and each row it decides whole. Its reader
 rows as they finish with them, and the store's offer cuts rows released since its last step from
 the snapshot. A flat store holds nothing short of terminal.
 
-A scope inside 𝑑 others runs rounds at paths of 𝑑 + 1 keys (`Projection::of_path`). The planner
-refuses a nested loop where a pulled operator restates no projection at that level
-(`Planner::refusal_of_nested`). The walk stops at consuming breakers: their consumes pull their own
-inputs, and their scopes check those pulls. A breaker left in pull mode passes the pull on. The
-planner panics on such a loop, as it does on the stores
-[A store as a breaker](design-operators.md#a-store-as-a-breaker) lists.
+A scope whose store has 𝑑 row levels above its positions runs rounds at paths of 𝑑 + 1 keys
+(`Projection::of_path`). The planner asserts that operators its rounds pull restate a projection
+at that level (`Planner::unrestated_in_rounds`). This check covers nested loops and stores per
+comprehension row. The walk stops at consuming breakers: their consumes pull their own inputs, and
+their scopes check those pulls. A breaker left in pull mode passes the pull on. A level violation
+panics before execution.
 
 ### Claiming from several threads
 

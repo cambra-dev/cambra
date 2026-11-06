@@ -890,11 +890,12 @@ projection at its level ([The dispatcher](design-dispatcher.md#the-dispatcher)).
 ### Memo
 
 A consuming memo answers from its cache, and the cache's statement says which region that answer
-covers. A consume over a memo whose input has drained pulls nothing. The memo's consumer is woken by
-the input's notifications, which reach it as they do for a memo in pull mode, and by the rule that
-wakes it when a pull finds rows no notification announced. A consuming memo's only reader is the
-pipeline the dispatcher pushes to, so a consume wakes no consumer and a push queues no wake: what
-the memo holds reaches its reader through the packages the driver pushes after each consume.
+covers. A consume over a memo whose input has drained pulls nothing. A consuming memo is woken by no
+notification. Its reader takes what it holds from the pushes after each consume, and the memo reads
+its input again where a store steps or a live source yields more (`TileProducer::read_again`). A
+consuming memo's only reader is the pipeline the dispatcher pushes to, so a consume wakes no
+consumer and a push queues no wake: what the memo holds reaches its reader through the packages the
+driver pushes after each consume.
 
 ### Aggregate
 
@@ -999,13 +1000,20 @@ a step that changes neither the store nor its input's release panics, and so doe
 terminal at its finish. A transaction's deny commits nothing and progresses through its
 source's release alone.
 
-A store holds everything once it is terminal and nothing before, since a reader pulls the store
-tile, which `restrict_to` cannot cut to part of its positions. It pushes once, at the finish where
-it is terminal (`pushes_while_consuming` answers `false`), to its reader slots and not its
-recurrence slots (`FanOutInput::push`), and every reader reads the store whole. Its `final_guard` is
-`held()`. A release of a store with no rows above it names the positions a reader reads no more and
-removes nothing from the store tile; a nested store's offer cuts the rows its readers released ([A
-loop in rounds](design-dispatcher.md#a-loop-in-rounds)). A consuming store answers a pull from its snapshot.
+An induction store holds everything once it is terminal and nothing before, since a reader pulls the
+store tile, which `restrict_to` cannot cut to part of its positions, and it pushes once, at the
+finish where it is terminal (`pushes_while_consuming` answers `false`). A transaction store holds
+the commit ticks it has decided, through its watermark (`store_frontier`), and everything once it is
+terminal, and it pushes the ticks each consume decides (`pushes_while_consuming` answers `true`). A
+store pushes to its reader slots and not its recurrence slots (`FanOutInput::push`), and every
+reader pulls the store whole. `StoreValueStream`, a reader of a transaction store's changelog, keeps
+the store's keys and cuts its answer to the ticks a pull names, so a feed inside a transaction takes
+the ticks as they are decided; any other reader widens the push, so its pipeline takes a package of
+the store only once the store's pipeline has finished ([The dispatcher](design-dispatcher.md#the-dispatcher)).
+A store's `final_guard` is `held()`. A release of
+a store with no rows above it names the positions a reader reads no more and removes nothing from
+the store tile; a nested store's offer cuts the rows its readers released ([A loop in
+rounds](design-dispatcher.md#a-loop-in-rounds)). A consuming store answers a pull from its snapshot.
 
 In pull mode an induction store releases its body whole once the body is terminal and every decision
 is stepped, and a transaction drive releases its source whole once it is done. A nested induction
@@ -1017,9 +1025,13 @@ outside its cycle: its readers there take the rows it closes from its pushes, an
 refuses a store read inside the cycle of a store that steps itself (`Planner::beneath_cycle`). A
 seed sits behind an entry no planner places (`subscribe_pulled`), since the store reads it by pull
 at a step, so a push from beneath the seed stops there rather than climb to the store's readers. A
-release through the decided positions or the last finished item never names a position the source
-filtered out, and the dispatcher's finish checks that a store's input released every morsel the
-pipeline consumed.
+drive with no rows above it states complete every position below its next one that its source calls
+complete along with every position before, so a position it reads past, one the source filtered out
+or holds nothing at, is stated as one it emitted (`complete_prefix_below`). An induction store with
+no rows above it releases its body through what the body states complete and holds no decision at,
+and a transaction drive releases its source through what it has read past, so either releases such a
+position without waiting for a later one to be decided. The dispatcher's finish checks that a
+store's input released every morsel the pipeline consumed.
 
 `run_program` plans a store's pipeline where it reaches a reader slot of the store's fan-out
 (`TileProducer::store_read`). The pipeline reads the pipelines beneath the store's cycle: a subtree
@@ -1033,7 +1045,6 @@ refuses:
 
 - outside a loop's scope, a nested transaction store, one per enclosing row, whose frontier a flat
   morsel does not name;
-- a store over a live source, whose arrivals no run notifies;
 - a store inside the cycle of a store that steps itself, which no round reaches;
 - a transaction store of several writers, since a morsel names positions of one source.
 

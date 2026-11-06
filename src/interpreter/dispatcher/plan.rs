@@ -66,7 +66,8 @@ pub fn run_program(program: &mut CompiledProgram, morsel_rows: usize) -> Result<
 
 /// [`run_program`] with `on_idle` called each time nothing is claimable and a live source has
 /// yielded no new region since the last poll, before the next poll: [`run_program`] sleeps, and
-/// a test feeds the source there.
+/// a test feeds the source there. `on_idle` runs inside the run, so it notifies no consumer
+/// (`dispatcher::in_a_run`).
 ///
 /// # Errors
 ///
@@ -188,17 +189,6 @@ fn run_targets(
         sink_breakers.push(RefCell::new(breaker));
     }
     planner.check_direct();
-    // Only a source pipeline of the run's dispatcher is notified of what a source yields: a
-    // loop's round or a reader of pushes is queued nothing a source's arrival names. A loop's
-    // store records every source its chain reads (`StoreRead::sources`), so a store whose cycle
-    // reads one is refused before its cycle is walked.
-    debug_assert!(
-        planner.refused.is_some()
-            || (0..planner.located.len()).all(|pipeline| {
-                planner.within[pipeline].is_none() || planner.live[pipeline].is_empty()
-            }),
-        "a live source inside a loop's cycle refuses the loop's store"
-    );
     let live_reader = {
         let members = planner.members(None);
         (0..members.live.len())
@@ -209,8 +199,8 @@ fn run_targets(
     };
     if let Some(name) = live_reader {
         planner.refuse(format!(
-            "{name} reads pushes and a live source, whose arrivals a reader of pushes is queued \
-             none of"
+            "{name} reads a pipeline and a live source, whose arrivals a reader of a pipeline is \
+             queued none of"
         ));
     }
     if let Some(refused) = planner.refused.take() {
@@ -290,42 +280,94 @@ fn run_targets(
         if leaves.is_empty() {
             continue;
         }
-        // A source's arrivals are restated keys of the outermost level of the pipeline's input,
-        // or no package names them: one key's push is probed.
-        for leaf in leaves {
-            let arrived = probe(
-                &leaf.consumer,
-                PipelineId(pipeline),
-                &leaf.probe_region(),
-                pipeline,
-            );
-            if arrived.is_empty() {
-                unplace(&planner.placements, targets);
-                return Err(Refused(format!(
-                    "a live source's arrivals reach no entry of {}, so no package names them",
-                    members.names[pipeline]
-                )));
+        let mut input = None;
+        reach(PipelineId(pipeline), &mut |breaker| {
+            input = Some(breaker.input_tiling(InputId::ONLY))
+        });
+        let input = input.expect("a reach calls the breaker it reaches");
+        let notifies = match (&members.located[pipeline], scopes[pipeline].as_ref()) {
+            // A transaction store's input is its writer's source, read behind an entry no
+            // planner places, so its items are a delivery's keys where the writer's source is
+            // the source every range under the store reads.
+            (Located::Store { .. }, _) => {
+                let items_of =
+                    |leaf: &LiveLeaf| input.domain_extent().as_ref() == Some(&leaf.extent);
+                if !leaves.iter().all(items_of) {
+                    unplace(&planner.placements, targets);
+                    return Err(Refused(format!(
+                        "{} reads a live source other than as its writer's source, whose items \
+                         no delivery of it names",
+                        members.names[pipeline]
+                    )));
+                }
+                Notifies::Items
             }
-            if arrived.iter().any(|arrival| arrival.widened) {
-                unplace(&planner.placements, targets);
-                return Err(Refused(format!(
-                    "a live source's arrivals reach {} widened, so no package names them",
-                    members.names[pipeline]
-                )));
+            // A loop's scope runs a round per position the drive emits. Its drive's positions are
+            // a delivery's keys where one key reaches the drive's entry as itself, over the
+            // source's domain. A source read otherwise, inside a loop nested in this one among
+            // them, ends the scope's rows only once it yields everything, so the scope then reads
+            // its input whole.
+            (_, Some(scope)) => {
+                let keys_are_positions = leaves.iter().all(|leaf| {
+                    if !leaf.yields_prefix() {
+                        return false;
+                    }
+                    let one = leaf.probe_region();
+                    let arrived = induction(scope).arrivals(&leaf.consumer, &one);
+                    !arrived.is_empty()
+                        && input.domain_extent().as_ref() == Some(&leaf.extent)
+                        && arrived.iter().all(|arrival| {
+                            !arrival.widened && Projection::of(&arrival.guard).as_ref() == Ok(&one)
+                        })
+                });
+                match keys_are_positions {
+                    true => Notifies::Rounds,
+                    false => Notifies::Whole,
+                }
             }
-            if !arrived.iter().all(|arrival| {
-                matches!(arrival.guard, TileGuard::Function(FunctionGuard::Domain(_)))
-            }) {
-                unplace(&planner.placements, targets);
-                return Err(Refused(format!(
-                    "a live source's arrivals reach {} beneath its outermost keys, which no \
-                     package names",
-                    members.names[pipeline]
-                )));
+            // Any other pipeline: one key's push is probed. An arrival
+            // restated as a projection of the input's keys, at any level, is notified as it
+            // arrives. An arrival widened on its way names every key of the input, which is final
+            // only once the source yields everything, so the pipeline then reads its whole input
+            // once, every range's part of it included.
+            _ => {
+                let mut notifies = Notifies::Arrivals;
+                for leaf in leaves {
+                    let one = leaf.probe_region();
+                    let arrived = probe(&leaf.consumer, PipelineId(pipeline), &one, pipeline);
+                    if arrived.is_empty() {
+                        unplace(&planner.placements, targets);
+                        return Err(Refused(format!(
+                            "a live source's arrivals reach no entry of {}, so no package names \
+                             them",
+                            members.names[pipeline]
+                        )));
+                    }
+                    if arrived.iter().any(|arrival| arrival.widened) {
+                        notifies = Notifies::Whole;
+                    } else if !arrived
+                        .iter()
+                        .all(|arrival| Projection::of(&arrival.guard).is_ok())
+                    {
+                        unplace(&planner.placements, targets);
+                        return Err(Refused(format!(
+                            "a live source's arrivals reach {} as a region that is no \
+                             projection of its keys, which no package names",
+                            members.names[pipeline]
+                        )));
+                    }
+                }
+                notifies
             }
-        }
+        };
         planned[pipeline].live = true;
-        live.push(LivePipeline::new(PipelineId(pipeline), leaves.clone()));
+        planned[pipeline].whole |= matches!(notifies, Notifies::Whole);
+        live.push(LivePipeline::new(
+            PipelineId(pipeline),
+            leaves.clone(),
+            notifies,
+            input,
+        ));
     }
     // The run drives every breaker it planned, so each takes its consuming mode here, before any
     // package, and keeps it for the run.
@@ -339,11 +381,10 @@ fn run_targets(
     let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
         execution.reach(pipeline, &mut root_reach, call)
     };
-    match live.is_empty() {
+    in_a_run(|| match live.is_empty() {
         true => execution.drive(&dispatcher, &mut reach),
         false => drive_live(&dispatcher, &mut reach, &mut live, on_idle, &execution),
-    }
-
+    });
     for (plan, scope) in planned.iter_mut().zip(&scopes) {
         if let Some(scope) = scope {
             plan.rounds = std::mem::take(&mut induction(scope).run.as_mut().unwrap().planned);
@@ -672,6 +713,7 @@ pub(super) enum Consumes {
 /// regions no push names ([`run_program`] says how). `kinds` says how each
 /// pipeline takes its packages; `end_of` answers the consumer a pipeline pushes to where its
 /// breaker is no producer that answers it.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn plan_edges(
     reads: &[Vec<usize>],
     names: &[String],
@@ -810,7 +852,9 @@ type SinkTarget = Rc<RefCell<crate::interpreter::sinks::SinkConsumer>>;
 pub struct Planned {
     /// Its breaker's name.
     pub name: String,
-    /// Whether it reads its input whole, once every pipeline it reads has finished.
+    /// Whether it reads its input whole: once every pipeline it reads has finished, or, over a live
+    /// source whose arrivals reach it widened or reach no drive of its loop's scope, once every
+    /// live source under it yields everything.
     pub whole: bool,
     /// Whether the run queued it a region at the start: what the ranges under it (`IterateExtent`)
     /// bring, less what the pushes of the pipelines it reads name.
@@ -838,7 +882,11 @@ fn pushing_end(reach: &mut Reach<'_>, pipeline: PipelineId) -> (SharedConsumer, 
                 pipeline.0
             )
         });
-        let keyed = matches!(producer.tiling(), Tiling::DataFunction { .. });
+        // A store is keyed by its positions, which a transaction store pushes as it decides them.
+        let keyed = matches!(
+            producer.tiling(),
+            Tiling::DataFunction { .. } | Tiling::Store { .. }
+        );
         end = Some((producer.base().downstream.clone(), keyed));
     });
     let (downstream, keyed) = end.expect("a reach calls the breaker it reaches");
@@ -965,6 +1013,26 @@ pub(super) struct LiveLeaf {
 }
 
 impl LiveLeaf {
+    // Round requests must not include a later position while earlier positions can still arrive.
+    fn yields_prefix(&self) -> bool {
+        fn prefix(extent: &Extent) -> bool {
+            match extent {
+                Extent::DataSourceDomain(_) => true,
+                Extent::Record(fields) => {
+                    let mut fields: Vec<_> = fields.iter().collect();
+                    fields.sort_by_key(|(name, _)| *name);
+                    fields.first().is_none_or(|(_, extent)| prefix(extent))
+                        && fields
+                            .iter()
+                            .skip(1)
+                            .all(|(_, extent)| !extent.reads_a_source())
+                }
+                _ => !extent.reads_a_source(),
+            }
+        }
+        prefix(&self.extent)
+    }
+
     fn probe_region(&self) -> Projection {
         fn probe(extent: &Extent) -> Predicate {
             match extent {
@@ -1130,10 +1198,9 @@ impl Planner {
     /// store's cycle; the operators inside the cycle, its own breakers among them, stay in pull
     /// mode within it.
     ///
-    /// `None` where the planner refuses the store ([`refuse`](Self::refuse)): a store over a live
-    /// source, whose arrivals no run notifies; a nested transaction store reached outside the
-    /// scope of the loop around it; a store with no consuming mode; and a store inside the cycle
-    /// of a store that steps itself.
+    /// `None` where the planner refuses the store ([`refuse`](Self::refuse)): a nested
+    /// transaction store reached outside the scope of the loop around it; a store with no
+    /// consuming mode; and a store inside the cycle of a store that steps itself.
     pub(super) fn store_pipeline(
         &mut self,
         read: crate::interpreter::tile_operators::StoreRead,
@@ -1145,13 +1212,6 @@ impl Planner {
             )
         }) {
             return Some(pipeline);
-        }
-        if !read.sources.is_empty() {
-            self.refuse(format!(
-                "a store over a live source {:?} runs in no pipeline: no run notifies its arrivals",
-                read.sources
-            ));
-            return None;
         }
         let within = self.dispatcher_of(&**read.store.borrow());
         if read.store.borrow_mut().as_induction_store_mut().is_some() {
@@ -1192,6 +1252,7 @@ impl Planner {
                 false => self.beneath_cycle(input, read.fan),
             };
             below.read_once(under.pipelines);
+            below.live.extend(under.live);
         });
         if self.refused.is_some() {
             return None;
@@ -1205,7 +1266,8 @@ impl Planner {
             .clone()
             .unwrap_or_else(|| panic!("{name} is placed in a pipeline by its entry"));
         // A store reads its input whole once the pipelines beneath it have finished, so neither
-        // ranges nor constants beneath it bring a key no push names.
+        // ranges nor constants beneath it bring a key no push names. A live source beneath it is
+        // read as the run notifies the store's pipeline of what the source yields.
         let pipeline = self.add(
             Located::Store {
                 fan: read.fan,
@@ -1215,6 +1277,7 @@ impl Planner {
             within,
             Beneath {
                 pipelines: below.pipelines,
+                live: below.live,
                 ..Beneath::default()
             },
         );
@@ -1297,6 +1360,7 @@ impl Planner {
             inputs += 1;
             let under = self.beneath_cycle(input, fan);
             below.read_once(under.pipelines);
+            below.live.extend(under.live);
         });
         assert_eq!(
             inputs,
@@ -1468,9 +1532,19 @@ impl Planner {
                 .iter()
                 .map(|pipeline| self.placements[*pipeline].clone())
                 .collect(),
+            // A live source read inside a scope is read by the scope's pipeline, which stands
+            // for the pipelines inside it.
             live: ids
                 .iter()
-                .map(|pipeline| self.live[*pipeline].clone())
+                .map(|&pipeline| {
+                    (0..self.located.len())
+                        .filter(|&inside| {
+                            self.dispatchers_around(inside).contains(&within)
+                                && self.stand_in(inside, within) == pipeline
+                        })
+                        .flat_map(|inside| self.live[inside].clone())
+                        .collect()
+                })
                 .collect(),
         }
     }
@@ -1817,35 +1891,60 @@ fn reads_of_kept(reads: &[Vec<usize>], kept: &[usize]) -> Vec<Vec<usize>> {
         .collect()
 }
 
+/// How the run notifies a live pipeline of what its sources deliver ([`LivePipeline::poll`]).
+enum Notifies {
+    /// Of the region a push of a delivery's keys through the range's consumer brings the
+    /// pipeline's entry.
+    Arrivals,
+    /// Of its whole input, once every source yields everything, and of nothing before.
+    Whole,
+    /// A loop's scope: of a delivery's keys as the positions of its rounds.
+    Rounds,
+    /// A transaction store: of a delivery's keys as its items. The store has the writer's drive
+    /// read its source again ([`Breaker::read_source_again`]): the drive reads its source only
+    /// once told it gained items.
+    Items,
+}
+
 /// A source pipeline of the run's dispatcher over live sources, and the region of each range's
 /// keys it has been notified of.
 struct LivePipeline {
     pipeline: PipelineId,
     leaves: Vec<(LiveLeaf, Predicate)>,
+    notifies: Notifies,
+    /// The pipeline's breaker's input, which a notification is a guard of.
+    input: Tiling,
     closed: bool,
 }
 
 impl LivePipeline {
-    fn new(pipeline: PipelineId, leaves: Vec<LiveLeaf>) -> Self {
+    fn new(pipeline: PipelineId, leaves: Vec<LiveLeaf>, notifies: Notifies, input: Tiling) -> Self {
         Self {
             pipeline,
             leaves: leaves
                 .into_iter()
                 .map(|leaf| (leaf, Predicate::False))
                 .collect(),
+            notifies,
+            input,
             closed: false,
         }
     }
 
     /// Notify `dispatcher`'s pipeline of what each range's sources yield beyond what it was
-    /// notified of, as the region a push of those keys brings its entry, and close it once
-    /// every source yields everything. Answers whether it notified or closed anything.
-    fn poll(&mut self, dispatcher: &Dispatcher) -> bool {
+    /// notified of, as [`Notifies`] says, and close it once every source yields everything.
+    /// `reach` reaches the pipeline's breaker. Answers whether a source yielded more or the
+    /// pipeline closed.
+    fn poll(&mut self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) -> bool {
         if self.closed {
             return false;
         }
         let mut changed = false;
         let mut complete = true;
+        // Several ranges can read one source, so a scope or a store is notified of the positions
+        // they gained together, once.
+        let mut positions = Predicate::False;
+        let mut fresh_sources: Vec<LiveSource> = Vec::new();
         for (leaf, notified) in &mut self.leaves {
             let yielded = leaf.extent.decided_region();
             debug_assert!(
@@ -1857,18 +1956,59 @@ impl LivePipeline {
             if fresh.is_false() {
                 continue;
             }
-            for arrival in probe(
-                &leaf.consumer,
-                self.pipeline,
-                &Projection::admitting(fresh),
-                self.pipeline.0,
-            ) {
-                dispatcher.notify(self.pipeline, &arrival.guard);
+            changed = true;
+            match self.notifies {
+                Notifies::Arrivals => {
+                    for arrival in probe(
+                        &leaf.consumer,
+                        self.pipeline,
+                        &Projection::admitting(fresh),
+                        self.pipeline.0,
+                    ) {
+                        dispatcher.notify(self.pipeline, &arrival.guard);
+                    }
+                }
+                Notifies::Whole => {}
+                Notifies::Rounds | Notifies::Items => {
+                    // A drive and a transaction store decide positions in order, and a round or an
+                    // attempt runs once every position before it is complete, so a source read in
+                    // positions yields a prefix of them.
+                    debug_assert!(
+                        !matches!(leaf.extent, Extent::DataSourceDomain(_))
+                            || yielded.is_true()
+                            || yielded.max_released_position().is_some_and(|last| {
+                                let prefix = Predicate::at_or_below(last.into_value());
+                                prefix.subsumes(&yielded) && yielded.subsumes(&prefix)
+                            }),
+                        "a live source read in positions yields a prefix of them: {yielded:?}"
+                    );
+                    leaf.extent.for_each_source(&mut |source| {
+                        if !fresh_sources.iter().any(|seen| Rc::ptr_eq(seen, source)) {
+                            fresh_sources.push(source.clone());
+                        }
+                    });
+                    positions = positions.union(&fresh);
+                }
             }
             *notified = yielded;
-            changed = true;
+        }
+        if !positions.is_false() {
+            if matches!(self.notifies, Notifies::Items) {
+                for source in &fresh_sources {
+                    reach(self.pipeline, &mut |breaker| {
+                        breaker.read_source_again(source)
+                    });
+                }
+            }
+            dispatcher.notify(
+                self.pipeline,
+                &Projection::admitting(positions).guard(&self.input),
+            );
         }
         if complete {
+            if matches!(self.notifies, Notifies::Whole) {
+                dispatcher.notify(self.pipeline, &self.input.universal_guard());
+            }
             dispatcher.close(self.pipeline);
             self.closed = true;
             changed = true;
@@ -1916,7 +2056,7 @@ fn drive_live(
         }
         let mut changed = false;
         for at in live.iter_mut() {
-            changed |= at.poll(dispatcher);
+            changed |= at.poll(dispatcher, reach);
         }
         loop {
             match dispatcher.try_claim(None) {

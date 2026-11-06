@@ -48,6 +48,7 @@ pub(super) struct SharedLoop {
 
 struct Request {
     read: bool,
+    emitted: bool,
     closing: bool,
     round: Option<TileGuard>,
     package: WorkPackage,
@@ -300,6 +301,26 @@ impl InductionStoreProducer {
         self.run().drive
     }
 
+    /// Where a push of `region` from the range in front of `consumer` lands at the drive's entry,
+    /// as guards of the drive's input, the drive's source: a planner probes how a live source's
+    /// arrivals reach the scope's rounds.
+    pub(super) fn arrivals(
+        &mut self,
+        consumer: &SharedConsumer,
+        region: &Projection,
+    ) -> Vec<Arrival> {
+        let drive = self.drive();
+        self.placed(|_| {
+            let mut landing = Landing::probe(drive);
+            consumer.borrow_mut().push(region, &mut landing);
+            landing
+                .arrivals()
+                .into_iter()
+                .filter(|arrival| arrival.pipeline.0 == drive.0)
+                .collect()
+        })
+    }
+
     /// Have the drive read what its source holds, emitting nothing: a consume at no position. A
     /// loop nested in another learns the positions of a row once the round of the loop around it
     /// has run, so the scope reads them before it runs the row's rounds.
@@ -385,6 +406,7 @@ impl InductionStoreProducer {
         }
         self.run_mut().request = Some(Request {
             read: rows,
+            emitted: false,
             closing: false,
             round: None,
             package,
@@ -417,6 +439,7 @@ impl InductionStoreProducer {
                 let guard = Projection::of_path(&position).guard(&self.input_tiling(InputId::ONLY));
                 let starts = self.run().starts.clone();
                 self.placed(|store| store.queue_round_on(dispatcher, &guard, &starts));
+                request.emitted = true;
                 request.round = Some(guard);
                 self.run_mut().request = Some(request);
                 return None;
@@ -429,7 +452,12 @@ impl InductionStoreProducer {
             self.placed(|scope| scope.read_source());
             request.read = true;
         }
-        if !rows {
+        let closing = rows
+            || (!request.emitted
+                && !self.terminal()
+                && !guard_minus(&request.package.guard, &self.input_released(InputId::ONLY))
+                    .is_empty());
+        if !closing {
             return Some(request.package);
         }
         self.placed(|scope| {
@@ -648,7 +676,6 @@ mod tests {
             planner.store_pipeline(crate::interpreter::tile_operators::StoreRead {
                 fan: stores[0].id(),
                 store: stores[0].store().expect("the program subscribed its store"),
-                sources: stores[0].source_producers(),
             });
             assert_eq!(planner.scopes.len(), 1, "an induction store runs in rounds");
             let mut runs = InductionRuns::new();
