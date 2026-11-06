@@ -96,15 +96,19 @@ each producer whose `as_breaking_mut` answers one as a pipeline breaker. A break
 the pipelines of the nearest breakers beneath it, which are numbered before it, and the walk places
 the `Entry` at the breaker's input in the pipeline. A breaker's operator installs that entry when it
 subscribes its input (`BreakerInput`), and keeps the consumer it was subscribed with as the one it
-pushes to; a range (`IterateExtent`) keeps its consumer too. A producer is identified by its
-address, since `producer_id` counts per producer type. A breaker a second reader reaches keeps its
-pipeline, and a reader that reaches one along two paths, as a filter reads its input for the values
-and the predicate, reads it once. A pipeline that reads directly a pipeline another pipeline reads
-is refused, since only a fan-out slot keeps one reader's release from removing what another still
-reads. A program that reads a store is refused, since no breaker runs a store's cycle: the walk
-asserts at the slot of a store's fan-out (`store_of`). Each package reaches its breaker by walking
-the chains again, and the pushes a call makes land once the walk has returned, since a breaker
-reached through a fan-out slot is called while the walk holds the fan-out its push climbs.
+pushes to; a store and the induction drive build their entries themselves, since each shares its
+consumer with other inputs, a store's with its seeds and the drive's with the store, and a range
+(`IterateExtent`) keeps its consumer too. A producer is identified by its address, since
+`producer_id` counts per producer type. A breaker a second reader reaches keeps its pipeline, and a
+reader that reaches one along two paths, as a filter reads its input for the values and the
+predicate, reads it once. A pipeline that reads directly a pipeline another pipeline reads is
+refused, since only a fan-out slot keeps one reader's release from removing what another still
+reads. A store, or a loop's scope, is the breaker of a pipeline of its own
+([A store as a breaker](design-operators.md#a-store-as-a-breaker), [A loop in rounds](#a-loop-in-rounds)), which the
+walk plans where it reaches a reader slot of the store's fan-out (`TileProducer::store_read`).
+Each package reaches its breaker by walking the chains again, and the pushes a call makes land
+once the walk has returned, since a breaker reached through a fan-out slot is called while the walk
+holds the fan-out its push climbs.
 
 Before the run, each edge from a pipeline to the pipeline that reads it is probed: the read
 pipeline's breaker pushes `Everything` through its consumer into a landing that records what reaches
@@ -127,8 +131,8 @@ brings a key the ranges and the pushes do not name:
 
 `run_program` refuses, in a debug build, a constant collection beneath a reader of pushes that is
 not a function operand. What the ranges bring, less everything the pushes can name, is queued for
-the reader at the start of the run as one region (`Dispatcher::queue_at_start`), parked as a push's
-rows are. A reader that neither a push nor a range brings a row reads its input whole.
+the reader at the start of the run as one region (`Dispatcher::queue_for`), parked as a push's rows
+are. A reader that neither a push nor a range brings a row reads its input whole.
 
 Each sink is the breaker of a pipeline of its own (`SinkBreaker`), planned after the pipelines its
 producer's chain reads and read by no pipeline. The walk places the sink's `SinkConsumer` in that
@@ -169,6 +173,92 @@ pushing pipeline counts its finish toward the reader's close (`Dispatcher::relea
 pipelines whose pushes name one key, as the output's memo reads two aggregates of one binding, are
 read once: the key waits until both have decided it. At the finish every pipeline has
 decided all it pushes, so nothing stays parked.
+
+### A loop in rounds
+
+An induction loop runs one round per source position. Its request, body and ordered store-step
+pipelines share the run's dispatcher. The request and store-step pipelines target the same
+`InductionStoreProducer`. Its optional `InductionRun` retains the pending request package, current
+round and global pipeline IDs. The producer retains the accumulator and its published snapshot;
+scheduling metadata contains no handle back to its own store cell. `Dispatcher` queues guards and
+tracks claims, acknowledgements and finishes; it holds no loop or operator state. The test-only
+`run_program` planner and execution handler live in `dispatcher.rs`.
+
+`Execution` uses one handler table indexed by global pipeline ID. A body handler records its owning
+store and breaker address; a request or step handler names the induction store. Lookup reaches the
+recorded owner directly.
+
+The planner configures each body graph locally, removes whole-input breakers that must remain in
+pull mode, and appends the configured graphs to the run. Composition remaps dependency and follower
+indices. The `Planned.rounds` report remains a tree with indices local to each sibling list; those
+indices describe planning and are not runtime pipeline IDs.
+
+Each plan installs fresh run metadata through a plan-scoped `InductionRuns` owner. The owner covers
+graph construction and execution, and clears run metadata when the plan exits or unwinds. Cleanup
+clears body entry placements and keeps engines, snapshots and input releases unchanged.
+
+A scope's request pipeline is ordered. Claiming a request opens its store if necessary and queues
+one round. The execution handler retains the request's acknowledgement until every position and
+closing round in that request has stepped. Other pipelines remain claimable during that interval.
+A nested scope's request names one row of its store and remains in flight until that row finishes,
+so the outer store-step cannot pass a pending nested row.
+
+A round proceeds as follows:
+
+1. The store has its cycle's pull-mode operators read again (`TileProducer::read_cycle_again`). The
+   previous step pulled them before the body pipelines consumed this position.
+2. Explicitly queued source pipelines receive the position. Nested requests and closing-row readers
+   receive the region restated at their own input entries. The store-step pipeline receives one
+   package for the same round, after those body packages have been queued.
+3. The body pipelines consume through the shared dispatcher. Their held and decided output pushes
+   land before their packages are acknowledged.
+4. Once claims drain, the execution handler has the active scope's body pipelines push held state.
+   Followers remain held until that scope's publication pass changes nothing. `MapAggregate` can be
+   quiescent while it still holds unpublished groups, so quiescence alone does not release a step.
+5. The serial execution driver releases followers for one claim, then holds them again before
+   another publication pass. The ordered step follows every direct body pipeline and becomes
+   claimable only after they are quiescent. Its handler steps the store and queues the next position
+   or closing row.
+
+The execution driver coordinates one claim at a time because breakers use `Rc<RefCell<_>>`. A scope
+compares the dispatcher generation only around its own publication pass; no other claim runs during
+that pass, so another scope's work cannot be mistaken for one of these pushes.
+
+Body pipelines are held from claims and finishes until their first request activates them. Their
+non-source entries then stay placed at global IDs until the scope finishes. Each body entry accepts
+pushes only from the configured body graph (`Dispatcher::restrict_ingress`); a push from outside
+that graph stops there. Cross-scope dependencies are represented by request pipelines instead of
+entering a body outside its current round. A breaker inside the cycle is reached by walking the
+store's chain while its cell is borrowed, so recurrence reads use the published snapshot.
+
+The drive (`InductionDriverProducer`) is an explicitly queued source pipeline. Its source entry
+stays unplaced; the controller alone queues positions for the drive. The drive consumes at an empty
+guard to read its source without emitting a position. A position package emits only the next
+position it covers; a consuming pull returns that rendering and advances nothing. A position the
+source filters out runs no position round.
+
+The first request has the drive read its source before the store's opening step publishes its seed.
+A flat request reads the source again after its buffered positions run out, at most once per
+request.
+A nested row reads at its start and end. Its closing round queues the whole row to every body
+pipeline except the sources in the store's chain, including a row containing no positions. The last
+position alone does not state the row's end, so this closing round has every reader observe that
+completeness and lets the store release the row whole. A row is restated at each reader's input by
+`InductionStoreProducer::row_for`; a reader whose input has released the whole row is not queued it.
+
+Finishing a request pipeline closes its body sources. The execution handler retains the finish
+until all body and step pipelines have finished in the same dispatcher. The store is terminal then;
+its final push lands before the request pipeline's finish releases its readers. A nested store
+releases its body a position at a time and each row it decides whole. Its readers release their
+rows as they finish with them, and the store's offer cuts rows released since its last step from
+the snapshot. A flat store holds nothing short of terminal.
+
+A scope inside 𝑑 others runs rounds at paths of 𝑑 + 1 keys (`Projection::of_path`). The planner
+refuses a nested loop where a pulled operator restates no projection at that level
+(`Planner::refusal_of_nested`). The walk stops at consuming breakers: their consumes pull their own
+inputs, and their scopes check those pulls. A breaker left in pull mode passes the pull on. The
+planner panics on such a loop, as it does on the stores
+[A store as a breaker](design-operators.md#a-store-as-a-breaker) lists.
 
 ### Claiming from several threads
 

@@ -613,7 +613,6 @@ impl TileProducer for MapResultProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("fn", &mut *self.function);
         visit("input", &mut *self.input);
@@ -872,7 +871,6 @@ impl TileProducer for MapResultToConstProducer {
         role == "constant" && self.constant_unread
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
         visit("constant", &mut *self.constant);
@@ -1341,7 +1339,6 @@ impl TileProducer for MapResultWithSourceProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }

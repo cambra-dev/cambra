@@ -221,7 +221,6 @@ impl TileProducer for RecordWrapProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }
@@ -348,7 +347,6 @@ impl TileProducer for ZipProducer {
         }
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         for (i, input) in self.inputs.iter_mut().enumerate() {
             visit(&format!("_{i}"), &mut **input);
@@ -951,7 +949,6 @@ impl TileProducer for MakeRecordProducer {
         }
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         for (i, input) in self.inputs.iter_mut().enumerate() {
             visit(&format!("{i}"), &mut **input);
@@ -1188,7 +1185,6 @@ impl TileProducer for SelectFieldProducer {
         visit("input", &*self.input);
     }
 
-    #[cfg(test)]
     fn visit_input_producers_mut(&mut self, visit: &mut dyn FnMut(&str, &mut dyn TileProducer)) {
         visit("input", &mut *self.input);
     }

@@ -197,6 +197,23 @@ impl Projection {
         Projection::keys_at(CurryLevel::OUTERMOST, keys)
     }
 
+    /// The projection of the one path `path`, a key per level from the outermost: the key of its
+    /// last level under the keys above it.
+    ///
+    /// # Panics
+    ///
+    /// For an empty path, which names no level.
+    pub fn of_path(path: &[Value]) -> Projection {
+        let (last, above) = path.split_last().expect("a path names a key at its level");
+        let enclosing = above.iter().fold(Predicate::True, |enclosing, key| {
+            Predicate::qualified(enclosing, Predicate::point(key.clone()))
+        });
+        Projection::keys_at(
+            CurryLevel::new(above.len()),
+            Predicate::qualified(enclosing, Predicate::point(last.clone())),
+        )
+    }
+
     /// The projection naming the keys of `level` that `keys` admits, normalized: to
     /// [`Everything`](Self::Everything) or [`Nothing`](Self::Nothing) where it admits all or
     /// none, and to the level above where it is every key beneath keys of that level.

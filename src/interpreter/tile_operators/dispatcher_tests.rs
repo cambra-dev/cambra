@@ -1673,3 +1673,152 @@ fn a_finish_records_what_its_breaker_decided_at_each_reader() {
     ));
     assert!(matches!(decided(ints().universal_guard()), Decided::Whole));
 }
+
+/// Two loops in one dispatcher hold and release their step pipelines independently while the
+/// bodies' pushes settle. Releasing one loop does not release the other's step.
+#[test]
+fn loop_steps_are_held_independently_in_one_dispatcher() {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![], vec![0], vec![1]], 1);
+    for (step, body) in [(2, 0), (3, 1)] {
+        dispatcher.order(PipelineId(step));
+        dispatcher.follow(PipelineId(step), PipelineId(body));
+        dispatcher.notify(PipelineId(body), &keys_between(0, 0));
+        dispatcher.queue_for(PipelineId(step), &keys_between(0, 0));
+    }
+    dispatcher.hold_followers([PipelineId(2), PipelineId(3)], true);
+    for body in [0, 1] {
+        let Next::Package(package) = dispatcher.try_claim(Some(PipelineId(body))) else {
+            panic!("each loop's body is claimable while its step is held");
+        };
+        assert_eq!(package.pipeline, PipelineId(body));
+        dispatcher.acknowledge(package);
+    }
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+
+    dispatcher.hold_followers([PipelineId(3)], false);
+    let Next::Package(package) = dispatcher.try_claim(Some(PipelineId(2))) else {
+        panic!("the second loop's step is released");
+    };
+    assert_eq!(package.pipeline, PipelineId(3));
+    dispatcher.acknowledge(package);
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+
+    dispatcher.hold_followers([PipelineId(2)], false);
+    let Next::Package(package) = dispatcher.try_claim(None) else {
+        panic!("the first loop's step is released");
+    };
+    assert_eq!(package.pipeline, PipelineId(2));
+    dispatcher.acknowledge(package);
+    for body in [0, 1] {
+        dispatcher.close(PipelineId(body));
+    }
+    loop {
+        match dispatcher.try_claim(None) {
+            Next::Finish { pipeline, .. } => dispatcher.finish(dispatcher.pushes(pipeline)),
+            Next::Done => break,
+            _ => panic!("both loops have consumed their bodies and steps"),
+        }
+    }
+}
+
+#[test]
+fn an_appended_graph_keeps_queued_work_and_follows_its_own_dependencies() {
+    let guard = keys_between(3, 3);
+    let mut dispatcher = Dispatcher::new(vec![vec![]], UNBOUNDED);
+    dispatcher.close(PipelineId(0));
+    dispatcher.hold_pipeline(PipelineId(0), true);
+
+    let mut body = Dispatcher::new(vec![vec![], vec![0]], UNBOUNDED);
+    body.order(PipelineId(0));
+    body.follow(PipelineId(1), PipelineId(0));
+    body.notify(PipelineId(0), &guard);
+    body.queue_round(PipelineId(1), &guard);
+    body.close(PipelineId(0));
+    body.hold_pipeline(PipelineId(0), true);
+    assert_eq!(dispatcher.append_graph(body), 1);
+
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+    dispatcher.hold_pipeline(PipelineId(1), false);
+    let Next::Package(source) = dispatcher.try_claim(None) else {
+        panic!("the appended source retains its queued package")
+    };
+    assert_eq!(source.pipeline, PipelineId(1));
+    assert_eq!(source.guard, guard);
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+    dispatcher.acknowledge(source);
+
+    let Next::Package(reader) = dispatcher.try_claim(None) else {
+        panic!("the appended reader follows the appended source")
+    };
+    assert_eq!(reader.pipeline, PipelineId(2));
+    assert_eq!(reader.guard, guard);
+    dispatcher.acknowledge(reader);
+    dispatcher.hold_pipeline(PipelineId(1), true);
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+
+    dispatcher.hold_pipeline(PipelineId(1), false);
+    for expected in [1, 2] {
+        let Next::Finish { pipeline, .. } = dispatcher.try_claim(None) else {
+            panic!("the appended source and reader finish in dependency order")
+        };
+        assert_eq!(pipeline, PipelineId(expected));
+        dispatcher.finish(dispatcher.pushes(pipeline));
+    }
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+    dispatcher.hold_pipeline(PipelineId(0), false);
+    let Next::Finish { pipeline, .. } = dispatcher.try_claim(None) else {
+        panic!("the original source stays unfinished until its hold is released")
+    };
+    assert_eq!(pipeline, PipelineId(0));
+    dispatcher.finish(dispatcher.pushes(pipeline));
+    assert!(matches!(dispatcher.try_claim(None), Next::Done));
+}
+
+#[test]
+fn an_added_step_pipeline_waits_for_its_body_and_its_claim_hold() {
+    let mut dispatcher = Dispatcher::new(vec![vec![], vec![]], UNBOUNDED);
+    dispatcher.close(PipelineId(0));
+    dispatcher.hold_pipeline(PipelineId(0), true);
+    let step = dispatcher.add_pipeline(vec![PipelineId(1)]);
+    assert_eq!(step, PipelineId(2));
+    dispatcher.order(step);
+    dispatcher.follow(step, PipelineId(1));
+    dispatcher.hold_pipeline(step, true);
+    let guard = keys_between(0, 0);
+    dispatcher.notify(PipelineId(1), &guard);
+    dispatcher.queue_round(step, &guard);
+    dispatcher.close(PipelineId(1));
+
+    let Next::Package(body) = dispatcher.try_claim(None) else {
+        panic!("the body runs while the step is held")
+    };
+    assert_eq!(body.pipeline, PipelineId(1));
+    dispatcher.acknowledge(body);
+    let Next::Finish { pipeline, .. } = dispatcher.try_claim(None) else {
+        panic!("the body's close is retained")
+    };
+    assert_eq!(pipeline, PipelineId(1));
+    dispatcher.finish(dispatcher.pushes(pipeline));
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+
+    dispatcher.hold_pipeline(step, false);
+    let Next::Package(package) = dispatcher.try_claim(None) else {
+        panic!("the settled step becomes claimable after releasing its hold")
+    };
+    assert_eq!(package.pipeline, step);
+    assert_eq!(package.guard, guard);
+    dispatcher.acknowledge(package);
+    let Next::Finish { pipeline, .. } = dispatcher.try_claim(None) else {
+        panic!("the step finishes after consuming its package")
+    };
+    assert_eq!(pipeline, step);
+    dispatcher.finish(dispatcher.pushes(pipeline));
+    assert!(matches!(dispatcher.try_claim(None), Next::Wait(_)));
+    dispatcher.hold_pipeline(PipelineId(0), false);
+    let Next::Finish { pipeline, .. } = dispatcher.try_claim(None) else {
+        panic!("the original source remains in the shared finish count")
+    };
+    assert_eq!(pipeline, PipelineId(0));
+    dispatcher.finish(dispatcher.pushes(pipeline));
+    assert!(matches!(dispatcher.try_claim(None), Next::Done));
+}
