@@ -237,6 +237,69 @@ struct MapResultProducer {
 }
 
 impl MapResultProducer {
+    /// A function whose values are collections, applied at arguments standing at
+    /// [`level`](Self::level) beneath the input's keys: each argument's group gathered in its
+    /// place, beneath the input's levels.
+    ///
+    /// An argument the function has not answered is withheld, as at a scalar-valued function,
+    /// and one it has settled without holding is dropped. Each gathered group is complete
+    /// wherever the input calls complete the path that looks it up, because every argument left
+    /// is one the function calls complete, beneath it as well.
+    fn apply_beneath(
+        &self,
+        mut input_tile: Tile,
+        f_domain: &ColumnValue,
+        f_groups: &Tile,
+        f_domain_predicate: &Predicate,
+    ) -> Tile {
+        let innermost = CurryLevel::new(
+            self.level
+                .index()
+                .checked_sub(1)
+                .unwrap_or_else(|| unreachable!("the input was matched as a collection")),
+        );
+        let arguments = |tile: &Tile| -> ColumnValue {
+            match tile.values_at(self.level) {
+                Tile::Scalar(arguments) => arguments.clone(),
+                other => panic!(
+                    "MapResult over a function expects a scalar argument column at {}, got {other:?}",
+                    self.level
+                ),
+            }
+        };
+        let mut f_index: HashMap<Value, Vec<usize>> = HashMap::new();
+        for i in 0..f_domain.len() {
+            f_index.entry(f_domain.index_at(i)).or_default().push(i);
+        }
+        let held = arguments(&input_tile);
+        let paths = input_tile.row_paths_at(self.level.index());
+        let mut keep = vec![true; held.len()];
+        let mut withheld: Vec<&[Value]> = Vec::new();
+        for (i, path) in paths.iter().enumerate() {
+            let argument = held.index_at(i);
+            if !f_domain_predicate.contains(&argument) {
+                keep[i] = false;
+                withheld.push(path);
+            } else if !f_index.contains_key(&argument) {
+                keep[i] = false;
+            }
+        }
+        if keep.iter().any(|k| !k) {
+            input_tile.withhold(innermost, &keep, &withheld);
+        }
+        let held = arguments(&input_tile);
+        let groups: Vec<Vec<usize>> = (0..held.len())
+            .map(|i| f_index[&held.index_at(i)].clone())
+            .collect();
+        let complete = input_tile.completion_at(innermost);
+        let mut applied = gather_applied(f_groups, &groups);
+        applied.map_level_predicates(&mut |depth, stated| {
+            restate_gathered(stated, depth, &complete, &[])
+        });
+        *input_tile.values_at_mut(self.level) = applied;
+        input_tile
+    }
+
     /// The function applied at every argument the input holds.
     fn apply(&mut self, projection_guard: TileGuard) -> Tile {
         let f_tiling = self.function.tiling().clone();
@@ -312,6 +375,13 @@ impl MapResultProducer {
                     false => Predicate::False,
                 });
                 return out;
+            }
+
+            // Arguments beneath more than one level of keys: one lookup per element, the input's
+            // levels kept above the groups it gathers.
+            if matches!(&input_tile, Tile::DataFunction { codomain, .. } if codomain.is_data_function())
+            {
+                return self.apply_beneath(input_tile, &f_domain, &f_groups, &f_domain_predicate);
             }
 
             let Tile::DataFunction {
@@ -1736,6 +1806,89 @@ mod tests {
         );
         *next.borrow_mut() = f_at(vec![5, 6]);
         let _ = producer.get(producer.tiling().universal_guard());
+    }
+
+    /// A function whose values are collections, applied at arguments two levels beneath the
+    /// input's keys: an answered argument's group stands in its place, complete beneath a
+    /// complete path; an argument the function has not answered is withheld, so no level calls
+    /// its prefixes complete; one the function settled without holding is dropped.
+    #[test]
+    fn a_grouping_applied_beneath_two_levels_gathers_each_argument_s_group() {
+        let uint = || Extent::Base(BaseType::UInt);
+        let in_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(uint(), Tiling::Scalar(uint())),
+        );
+        let fn_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(uint(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+        );
+        let out_tiling = Tiling::data_function(
+            uint(),
+            Tiling::data_function(
+                uint(),
+                Tiling::data_function(uint(), Tiling::Scalar(Extent::Base(BaseType::Int))),
+            ),
+        );
+        // Paths [0, 10] ↦ 0, [0, 11] ↦ 1, [1, 10] ↦ 0, [1, 11] ↦ 2, every one complete.
+        let input = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 2],
+                ColumnValue::UInts(vec![10, 11, 10, 11]),
+                Box::new(Tile::Scalar(ColumnValue::UInts(vec![0, 1, 0, 2]))),
+                Predicate::True,
+                BitSet::new(),
+            )),
+            Predicate::True,
+            BitSet::new(),
+        );
+        // Group 0 is answered, group 1 is held but not answered, and 2 is settled absent.
+        let function = Tile::data_function(
+            ColumnValue::UInts(vec![0, 1]),
+            Box::new(Tile::grouped(
+                vec![0, 1],
+                ColumnValue::UInts(vec![100, 100]),
+                Box::new(Tile::Scalar(ColumnValue::Ints(vec![7, 8]))),
+                Predicate::False,
+                BitSet::new(),
+            )),
+            Predicate::from_column_value(&ColumnValue::UInts(vec![0, 2])),
+            BitSet::new(),
+        );
+        let mut producer = MapResultProducer {
+            base: ProducerBase::unowned(MapResultProducer::alloc_id(), &out_tiling),
+            input: Box::new(TestTileProducer::new(input, in_tiling)),
+            function: Box::new(TestTileProducer::new(function, fn_tiling)),
+            level: CurryLevel::new(2),
+        };
+        let out = producer.get(producer.tiling().universal_guard());
+        let paths = out.row_paths_at(3);
+        let u = Value::UInt;
+        assert_eq!(
+            paths,
+            vec![vec![u(0), u(10), u(100)], vec![u(1), u(10), u(100)]],
+            "each answered argument's group, beneath its path: {out:?}"
+        );
+        assert_eq!(
+            scalar_tile_to_column_value(out.deepest_values().clone()),
+            ColumnValue::Ints(vec![7, 7])
+        );
+        let outer = out.completion_at(CurryLevel::new(0));
+        assert!(
+            outer.contains(&u(1)) && !outer.contains(&u(0)),
+            "row 0 holds a withheld argument and row 1 does not: {outer:?}"
+        );
+        let inner = out.completion_at(CurryLevel::new(1));
+        assert!(
+            inner.contains_path(&[u(0), u(10)]) && !inner.contains_path(&[u(0), u(11)]),
+            "[0, 11] was withheld: {inner:?}"
+        );
+        assert!(
+            out.completion_at(CurryLevel::new(2))
+                .contains_path(&[u(1), u(10), u(100)]),
+            "a group the function calls complete is complete beneath a complete path: {out:?}"
+        );
     }
 
     /// At a level above the innermost, `MapResultToConst` replaces each value there whole:
