@@ -315,31 +315,28 @@ fn a_map_entry_is_a_pair(#[case] code: &str) {
     check_compile_error(code, "tuples of different widths are different types");
 }
 
-// The re-keying constructors do not accept an empty literal: their key domain is
-// the key morphism's image (`src/ccl/design/collections.md`, "The key domain is the
-// key morphism's image"), and with no elements there is no image, so nothing
-// determines the key type. `pin_empty_list_element` does not answer for it — the
-// literal the constructor re-keys is copied into the key domain's predicate, and a
-// pin there would decide for the copy alone.
-//
-// So a *re-keying* constructor has no empty form. `empty_map()` is the spelling that
-// works, because it states its type rather than deriving one from entries it does not
-// have (CHL spec, "3.11 List, tuple, record literals"). The rejection here is an
-// inference error rather than a diagnosis of the construct: `map` reads the positions of
-// each entry, so the literal's width is what nothing fixes.
+// A re-keying constructor takes an empty literal, whose element type comes from the
+// constructor's uses as any empty literal's does (`src/ccl/design/collections.md`, "The empty
+// collection's key type comes from its uses"). An annotation gives the key type: a `Set(String)`
+// annotation is met by a `String` key, and an element type chosen without it would be refused.
+// With no use the element is unit, as a positional literal's is.
 #[rstest]
 #[timeout(Duration::from_secs(10))]
-#[case::map("map([])", "is never fixed:")]
-#[case::set("set([])", "Nothing determines the type of this expression")]
-#[case::map_under_an_annotation(
-    indoc! {r#"
-        m: Map(String, Int) = box(map([]))
-        m
-    "#},
-    "is never fixed:"
-)]
-fn a_re_keying_constructor_rejects_an_empty_literal(#[case] code: &str, #[case] reported: &str) {
-    check_compile_error(code, reported);
+#[case::set_under_an_annotation("s: Set(String) = box(set([]))\nsum([1 for _ in s])")]
+#[case::map_under_an_annotation("m: Map(String, Int) = box(map([]))\nsum([1 for _ in m])")]
+#[case::set("s = set([])\nsum([1 for _ in s])")]
+#[case::map("m = map([])\nsum([1 for _ in m])")]
+#[case::boxed_set("s = box(set([]))\nsum([1 for _ in s])")]
+#[case::boxed_group_by("g = box(groupby([], \\x -> x))\nsum([1 for _ in g])")]
+#[case::empty_comprehension("s: Set(String) = box(set([x for x in []]))\nsum([1 for _ in s])")]
+#[case::beside_a_nonempty_set(indoc! {r#"
+    s: Set(String) = box(set([]))
+    t: Set(String) = box(set(["a"]))
+    sum([1 for _ in s]) + sum([1 for _ in t])
+"#})]
+fn a_re_keying_constructor_takes_an_empty_literal(#[case] code: &str) {
+    let expected = if code.contains(r#"["a"]"#) { 1 } else { 0 };
+    check_scalar(code, Value::Int(expected));
 }
 
 // A collection literal's elements are compile-time values, so an element written as a

@@ -20,7 +20,7 @@
 #
 #     import std::time
 #
-#     deadlines: Mut(Map(String, time::Instant), Txn) := Map::empty
+#     deadlines: Mut(Map(String, time::Instant), Txn) := empty_map()
 #
 #     for r in requests:
 #         with begin():
@@ -109,7 +109,7 @@ pub def now() => Instant:
 #
 #     expiries, set_expiry = time::alarms()
 #
-#     sessions: Mut(Map(String, time::Instant), Txn) := Map::empty   # session id -> expiry
+#     sessions: Mut(Map(String, time::Instant), Txn) := empty_map()   # session id -> expiry
 #     expired: Feed(_)
 #
 #     for r in requests:

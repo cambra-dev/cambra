@@ -1204,9 +1204,6 @@ something returns what its effects give at each call
 a reading at each position and call path
 ([Inputs from outside the program](#inputs-from-outside-the-program)).
 
-> **Direction [Decided].** `empty_map()` becomes the values `Map::empty` and `Set::empty`
-> ([6.3 Direction: collection types [Decided]](#63-direction-collection-types-decided)).
-
 ### 3.9 Subscript and attribute access
 
 Lookup and projection use the following syntax forms:
@@ -1393,7 +1390,9 @@ see [Re-keying is explicit](#re-keying-is-explicit-decided).
 unconstrained element type becomes unit. For example, `xs: List(Int) = box([])` selects `Int`.
 A value it is joined with is a use: in `box([1]) if c else box([])`, `[]` takes the other
 branch's element type, so the empty branch is an `Array(0, {Int where _ == 1})`.
-This does not provide a key type to `map([])` or `set([])`; those constructors are rejected.
+The same holds under a re-keying constructor: in `m: Map(String, Int) = box(map([]))` the
+annotation gives `[]` its element type, `(String, Int)`, and `set([])` with no use is a set of
+`unit`.
 
 `empty_map()` directly constructs an empty keyed sum. Its annotation must determine the key
 and value types:
@@ -1426,8 +1425,7 @@ equality; general discharge through contextual parameters remains planned.
 
 The delimiter split retains `(…)` for products, `[…]` for collections and `{…}` for types.
 Whether a future empty constructor can cover all collection kinds remains open; `empty_map()`
-is the current keyed constructor, not a general empty-collection term. The values `Set::empty`
-and `Map::empty` replace it ([3.8 Function calls](#38-function-calls)).
+is the current keyed constructor, not a general empty-collection term.
 
 ### 3.12 Comprehensions
 
@@ -2791,14 +2789,10 @@ the `Iterable` instance ([Membership expressions](#membership-expressions-decide
 representation is
 [Telling `Set` and `Map` apart](../src/ccl/design/collections.md#telling-set-and-map-apart-decided).
 
-A builtin differs from a declared nominal type in four ways:
+A builtin differs from a declared nominal type in three ways:
 
-- **No constructors or `extract`.** A program builds one through `set`, `map`, `groupby` or an
-  empty value, and takes it apart through its operations.
-- **Associated values.** `Set::empty` and `Map::empty` are values of the builtin, whose type
-  parameters are determined by their use ([Type parameters](#type-parameters)). A declared type
-  has no spelling for an associated value
-  ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)).
+- **No constructors or `extract`.** A program builds one through `set`, `map`, `groupby` or
+  `empty_map()`, and takes it apart through its operations.
 - **Trait instances.** All three satisfy `Iterable` through instances the compiler provides
   ([Trait requirements](#trait-requirements)). A declared type satisfies the traits its module
   declares instances of ([Declaring an instance](#declaring-an-instance)).
@@ -4159,9 +4153,8 @@ first("a", "b")   # T = String
   and `T`'s bound determines `B`.
 
   > **Direction [Decided] — determined by the use.** A type parameter may instead appear only in
-  > the result, and each use determines it from the type the use requires. `Map::empty` has type
-  > `forall (K, V) Map(K, V)`, so `m: Map(String, Int) = Map::empty` determines `K` and `V`, and
-  > `Option::none` is the same case
+  > the result, and each use determines it from the type the use requires. `Option::none` has
+  > type `forall (T) Option(T)`, so `o: Option(Int) = Option::none` determines `T`
   > ([6.8 Nominal types and methods [Decided]](#68-nominal-types-and-methods-decided)). A use that
   > determines none is an unresolved-type error at the use, as an unannotated `empty_map()` is
   > today ([3.11 List, tuple, record literals](#311-list-tuple-record-literals)).
@@ -5108,7 +5101,7 @@ import std::time
 
 expiries, set_expiry = time::alarms()
 
-sessions: Mut(Map(String, time::Instant), Txn) := Map::empty   # session id -> expiry
+sessions: Mut(Map(String, time::Instant), Txn) := empty_map()   # session id -> expiry
 expired: Feed(_)
 
 for r in requests:
@@ -5945,7 +5938,7 @@ pub def Price::discounted(self, pct: Int) => Price: …
 `pub` on a transactional mutable variable:
 
 ```python
-pub stock: Mut(Map(String, Int), Txn) := Map::empty
+pub stock: Mut(Map(String, Int), Txn) := empty_map()
 ```
 
 **[Planned]** A declaration loaded with `@LoadFrom` is an ordinary declaration without an
@@ -6038,7 +6031,7 @@ with its top level, so no other module reaches them.
 
 ```python
 # inventory.cambra: declares a transactional variable, so it is run and not imported
-stock: Mut(Map(String, Int), Txn) := Map::empty
+stock: Mut(Map(String, Int), Txn) := empty_map()
 pub def reserve(sku, qty) requires Transaction:
     …
 pub InStock = {String where _ in stock.keys()}   # intended; not supported today
