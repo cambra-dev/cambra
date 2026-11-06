@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 
 use crate::ccl::FieldKey;
 use crate::ccl::ccl_utils::cast_target_refinement;
+use crate::ccl::chl_print::chl_type;
 use crate::ccl::infer::solver::{PolyScheme, fun, prim};
 use crate::ccl::infer::{EscapeTarget, InferError, LocatedInferError};
 use crate::ccl::provenance::NodeId;
@@ -1154,12 +1155,14 @@ pub(super) fn emit_apply<C: Typing>(
         let pair_ty = ctx.subexpr(argument)?;
         let Type::Tuple(elts) = &pair_ty else {
             return Err(ctx.raise(InferError::Unsupported(format!(
-                "`lookup?` is applied to a `(collection, key)` pair, got `{pair_ty}`"
+                "`lookup?` is applied to a `(collection, key)` pair, got `{}`",
+                chl_type(&pair_ty)
             ))));
         };
         let [collection, key_ty] = elts.as_slice() else {
             return Err(ctx.raise(InferError::Unsupported(format!(
-                "`lookup?` takes exactly a collection and a key, got `{pair_ty}`"
+                "`lookup?` takes exactly a collection and a key, got `{}`",
+                chl_type(&pair_ty)
             ))));
         };
         let (collection, key_ty) = (read_through(collection), key_ty.clone());
@@ -1396,8 +1399,9 @@ fn emit_keyed_write(
             if matches!(collection, Type::Infer(_) | Type::Hole) {
                 return InferError::Unsupported(format!(
                     "keyed write `{label}[k] := …` needs the collection's type at this \
-                     point, but `{collection}` is not resolved yet — annotate the \
-                     introduction (`{label}: Mut(Map(K, V), Txn) := …`)"
+                     point, but `{}` is not resolved yet — annotate the introduction \
+                     (`{label}: Mut(Map(K, V), Txn) := …`)",
+                    chl_type(collection)
                 ));
             }
             not_a_keyed_access(collection, &format!("keyed write `{label}[k] := …`"))
@@ -1412,8 +1416,9 @@ fn emit_keyed_write(
     {
         return Err(ctx.raise(InferError::Unsupported(format!(
             "keyed write `{label}[k] := …` on a collection whose values depend on the \
-             key: `{collection}`'s codomain names its key binder, so the value written \
-             at one key is a different type from the value written at another"
+             key: `{}`'s codomain names its key binder, so the value written at one key is \
+             a different type from the value written at another",
+            chl_type(collection)
         ))));
     }
     // A write is `Unit`-valued, so nothing downstream would resolve a fresh variable
@@ -1435,18 +1440,20 @@ fn emit_keyed_write(
 fn not_a_keyed_access(collection: &Type, what: &str) -> InferError {
     if matches!(collection, Type::Infer(_) | Type::Hole) {
         return InferError::Unsupported(format!(
-            "{what} needs the collection's type at this point, but `{collection}` is not \
-             resolved yet. Reaching a collection through a *parameter* is not supported yet \
-             — bind it with `=` in the same scope, or iterate it instead"
+            "{what} needs the collection's type at this point, but `{}` is not resolved \
+             yet. Reaching a collection through a *parameter* is not supported yet — bind it \
+             with `=` in the same scope, or iterate it instead",
+            chl_type(collection)
         ));
     }
     if crate::ccl::subst::is_dependent(collection) {
         return InferError::Unsupported(format!(
-            "{what} is not supported on a collection whose values depend on the key: \
-             `{collection}`'s codomain names its key binder, so the answer at a key that is \
-             only *maybe* present would have to be typed under the assumption that it is. \
-             Iterate the collection instead, which binds each key to a group that is \
-             present by construction"
+            "{what} is not supported on a collection whose values depend on the key: `{}`'s \
+             codomain names its key binder, so the answer at a key that is only *maybe* \
+             present would have to be typed under the assumption that it is. Iterate the \
+             collection instead, which binds each key to a group that is present by \
+             construction",
+            chl_type(collection)
         ));
     }
     InferError::ExpectedFunction {

@@ -160,3 +160,18 @@ fn an_inference_variable_keeps_its_identity() {
     assert!(domain.starts_with("‹?"), "a variable; got: {inferred}");
     assert_eq!(domain, codomain);
 }
+
+/// A sum's witness read outside the sum is the keys of the value it is projected through,
+/// written as the program wrote that value: a loop source's `elements` call is the
+/// collection it iterates.
+#[test]
+fn a_projected_witness_names_the_collection_it_reads() {
+    check_compile_error(
+        indoc! {"
+            c = sum([1]) > 0
+            ys = [x for x in box([1, 2])] if c else [x for x in box([1, 2, 3])]
+            sum(ys)
+        "},
+        "Conflicting Domains: ‹the keys of box([1, 2])› vs ‹the keys of box([1, 2, 3])›",
+    );
+}

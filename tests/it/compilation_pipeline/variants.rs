@@ -1556,7 +1556,7 @@ fn test_one_arm_variant_type_rejections(#[case] code: &str) {
 /// The `Openness` marker is inference-internal, but a diagnostic naming the
 /// demand is the one place it has to be *visible*: an arm set the scrutinee
 /// merely failed to be a subtype of reads very differently from one it failed to
-/// match exactly, and only the trailing `| …` distinguishes them. The rendering
+/// match exactly, and only the trailing `| ..` distinguishes them. The rendering
 /// exists on `Type` either way; what this pins is that openness survives the
 /// compact/coalesce round-trip every reported type goes through, which is the
 /// step that would silently close it.
@@ -1570,7 +1570,7 @@ fn test_open_demand_renders_its_ellipsis_in_a_diagnostic() {
     };
     let err = format!("{errs:?}");
     assert!(
-        err.contains("| …"),
+        err.contains("| ..}"),
         "the demand admits tags it does not list, and should render as a partial \
          arm set; got: {err}"
     );

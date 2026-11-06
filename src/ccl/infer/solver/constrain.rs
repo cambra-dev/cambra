@@ -1048,10 +1048,7 @@ fn constrain_type_kinds(
     scope: &dyn ScopeEnv,
     mode: Membership,
 ) -> Result<(), ConstrainError> {
-    let mismatch = || ConstrainError::Mismatch {
-        lhs: Box::new(lhs.clone()),
-        rhs: Box::new(rhs.clone()),
-    };
+    let mismatch = || mismatch(lhs, rhs, sl, sr);
     match (sub, sup) {
         (TypeKind::Family { .. }, _) | (_, TypeKind::Family { .. }) => {
             unreachable!("a family's kind is a family parameter's, and no witness ranges over it")
@@ -1204,10 +1201,7 @@ fn admits(
         },
         TypeKind::SubtypesOf(_) | TypeKind::Enumerated(_) if open => Ok(()),
         TypeKind::SubtypesOf(b) => constrain_go(d, b, sl, sr, cache, scope),
-        TypeKind::Enumerated(_) => Err(ConstrainError::Mismatch {
-            lhs: Box::new(lhs.clone()),
-            rhs: Box::new(rhs.clone()),
-        }),
+        TypeKind::Enumerated(_) => Err(mismatch(lhs, rhs, sl, sr)),
     }
 }
 
@@ -1856,10 +1850,7 @@ fn constrain_go_impl(
         // equal width, position by position (`docs/chl-spec.md`, "Tuple width").
         (Type::Tuple(a), Type::Tuple(b)) => {
             if a.len() != b.len() {
-                return Err(ConstrainError::Mismatch {
-                    lhs: Box::new(lhs.clone()),
-                    rhs: Box::new(rhs.clone()),
-                });
+                return Err(mismatch(lhs, rhs, sl, sr));
             }
             for (t0, t1) in a.iter().zip(b) {
                 constrain_go(t0, t1, sl, sr, cache, scope)?;
@@ -1946,10 +1937,7 @@ fn constrain_go_impl(
 
         // An open tuple fixes no width, so it is below no closed tuple: a type parameter
         // bounded by `{𝐴, ..}` cannot be taken apart as a tuple of any one width.
-        (Type::OpenTuple(_), Type::Tuple(_)) => Err(ConstrainError::Mismatch {
-            lhs: Box::new(lhs.clone()),
-            rhs: Box::new(rhs.clone()),
-        }),
+        (Type::OpenTuple(_), Type::Tuple(_)) => Err(mismatch(lhs, rhs, sl, sr)),
 
         // Family: pointwise, a family below another where at each value of the binders its
         // body is below the other's (`src/ccl/design/nominal-types.md`, "Family parameters").
@@ -2037,10 +2025,7 @@ fn constrain_go_impl(
             if a == b {
                 Ok(())
             } else {
-                Err(ConstrainError::Mismatch {
-                    lhs: Box::new(lhs.clone()),
-                    rhs: Box::new(rhs.clone()),
-                })
+                Err(mismatch(lhs, rhs, sl, sr))
             }
         }
 
@@ -2058,10 +2043,7 @@ fn constrain_go_impl(
         // bounds like any other leaf. Two witnesses compare by identity (the arm above).
         (Type::WitnessRef(_) | Type::WitnessProjection(_), other) if !is_witness_or_var(other) => {
             let Some(range) = witness_range(lhs, &cache.lctx) else {
-                return Err(ConstrainError::Mismatch {
-                    lhs: Box::new(lhs.clone()),
-                    rhs: Box::new(rhs.clone()),
-                });
+                return Err(mismatch(lhs, rhs, sl, sr));
             };
             constrain_type_kinds(
                 &range,
@@ -2077,10 +2059,7 @@ fn constrain_go_impl(
         }
         (other, Type::WitnessRef(_) | Type::WitnessProjection(_)) if !is_witness_or_var(other) => {
             let Some(TypeKind::Enumerated(candidates)) = witness_range(rhs, &cache.rctx) else {
-                return Err(ConstrainError::Mismatch {
-                    lhs: Box::new(lhs.clone()),
-                    rhs: Box::new(rhs.clone()),
-                });
+                return Err(mismatch(lhs, rhs, sl, sr));
             };
             for c in &candidates {
                 constrain_go(other, c, sl, sr, cache, scope)?;
@@ -2421,10 +2400,7 @@ fn constrain_go_impl(
         (Type::Param(param), _) if !matches!(rhs.peel_refinements(), Type::Param(q) if q == param) => {
             match &param.bound {
                 Some(bound) => constrain_go(bound, rhs, sl, sr, cache, scope),
-                None => Err(ConstrainError::Mismatch {
-                    lhs: Box::new(lhs.clone()),
-                    rhs: Box::new(rhs.clone()),
-                }),
+                None => Err(mismatch(lhs, rhs, sl, sr)),
             }
         }
         // A family's bound holds at every value it is applied to.
@@ -2623,10 +2599,7 @@ fn constrain_go_impl(
                 let demanded = Type::refined(rbase.clone(), deficit);
                 constrain_go(lbase, &demanded, sl, sr, cache, scope)
             } else if scope.is_skip_smt() {
-                Err(ConstrainError::Mismatch {
-                    lhs: Box::new(lhs.clone()),
-                    rhs: Box::new(rhs.clone()),
-                })
+                Err(mismatch(lhs, rhs, sl, sr))
             } else if range_demand {
                 // Both bases are leaves, so the entailment is the whole edge.
                 let proven = super::smt::smt_sub_at(
@@ -2640,27 +2613,28 @@ fn constrain_go_impl(
                 if proven {
                     Ok(())
                 } else {
-                    Err(ConstrainError::Mismatch {
-                        lhs: Box::new(lhs.clone()),
-                        rhs: Box::new(rhs.clone()),
-                    })
+                    Err(mismatch(lhs, rhs, sl, sr))
                 }
             } else if super::smt::smt_sub(lbase, &lrefs_in_ambient, &rrefs_in_ambient, scope)
                 .or_else(|error| smt_undecided_is_mismatch(error, lhs, rhs))?
             {
                 constrain_go(lbase, rbase, sl, sr, cache, scope)
             } else {
-                Err(ConstrainError::Mismatch {
-                    lhs: Box::new(lhs.clone()),
-                    rhs: Box::new(rhs.clone()),
-                })
+                Err(mismatch(lhs, rhs, sl, sr))
             }
         }
 
-        _ => Err(ConstrainError::Mismatch {
-            lhs: Box::new(lhs.clone()),
-            rhs: Box::new(rhs.clone()),
-        }),
+        _ => Err(mismatch(lhs, rhs, sl, sr)),
+    }
+}
+
+/// The failed edge `lhs‹sl› <: rhs‹sr›`, each side under its substitution, so a message
+/// reads a dependent application's result at its argument rather than at the binder the
+/// argument discharges.
+fn mismatch(lhs: &Type, rhs: &Type, sl: &Subst, sr: &Subst) -> ConstrainError {
+    ConstrainError::Mismatch {
+        lhs: Box::new(sl.apply_type(lhs)),
+        rhs: Box::new(sr.apply_type(rhs)),
     }
 }
 

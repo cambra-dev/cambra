@@ -440,49 +440,47 @@ fn jagged_rows_merged_by_a_keyed_write() {
     def f(c: List(Int)):
         sum(c)
     f(box([x for x in [1, 2, 3] if x > 1]) if True else box([1, 2]))
-"}, "found {0..3 |")]
+"}, "found {UInt where _ < 3 and")]
 #[case::let_bound(indoc! {r"
     def f(c: List(Int)):
         sum(c)
     x = box([x for x in [1, 2, 3] if x > 1]) if True else box([1, 2])
     f(x)
-"}, "found {0..3 |")]
+"}, "found {UInt where _ < 3 and")]
 #[case::per_row(indoc! {r"
     def f(c: List(Int)):
         sum(c)
     rows = [1, 2]
     [f(box([x for x in [1, 2, 3] if x > r]) if r > 1 else box([1])) for r in rows]
-"}, "found {0..3 |")]
+"}, "found {UInt where _ < 3 and")]
 #[case::through_a_def(indoc! {r"
     def f(c: List(Int)):
         sum(c)
     def g(c):
         f(c)
     g(box([x for x in [1, 2, 3] if x > 1]) if True else box([1, 2]))
-"}, "found {0..3 |")]
+"}, "found {UInt where _ < 3 and")]
 #[case::annotation(indoc! {r"
     xs: List(Int) = box([x for x in [1, 2, 3] if x > 1]) if True else box([1, 2])
     sum(xs)
-"}, "found {0..3 |")]
+"}, "found {UInt where _ < 3 and")]
 #[case::mut_write(indoc! {r"
     xs: Mut(List(Int)) := box([1, 2])
     xs := box([x for x in [1, 2, 3] if x > 1])
     sum(xs)
-"}, "found {0..3 |")]
+"}, "found {UInt where _ < 3 and")]
 #[case::mut_write_in_a_loop(indoc! {r"
     xs: Mut(List(Int)) := box([1, 2])
     for r in [1, 2]:
         xs := box([x for x in [1, 2, 3] if x > r])
     sum(xs)
-"}, "found Σ (σ : SubtypesOf(0..3)). (σ ⤇ _)")]
+"}, "found Map({UInt where _ < 3}, _)")]
 fn a_filtered_candidate_reaching_a_list_position_is_refused(
     #[case] code: &str,
     #[case] found: &str,
 ) {
     let msg = compile_panic(code);
-    let expected = format!(
-        "Type mismatch for collection annotation: expected Σ (σ : UIntRanges). (σ ⤇ _), {found}"
-    );
+    let expected = format!("Type mismatch for collection annotation: expected List(_), {found}");
     assert!(
         msg.starts_with("compilation failed:") && msg.contains(&expected),
         "expected a compile error containing {expected:?}; got: {msg}"

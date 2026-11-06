@@ -12,6 +12,7 @@ use std::ops::{Deref, DerefMut};
 use std::rc::Rc;
 
 use crate::ccl::ccl_utils::{PredMemo, walk_refined_predicates, walk_refined_predicates_mut};
+use crate::ccl::chl_print::chl_type;
 use crate::ccl::infer::CheckMode;
 use crate::ccl::infer::solver::compact::JoinedPosition;
 use crate::ccl::infer::solver::display::InferredPoly;
@@ -274,11 +275,7 @@ pub struct StatedRequirement {
 impl std::fmt::Display for StatedRequirement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         fn or_list(types: &[Type]) -> String {
-            types
-                .iter()
-                .map(|t| t.to_string())
-                .collect::<Vec<_>>()
-                .join(" or ")
+            types.iter().map(chl_type).collect::<Vec<_>>().join(" or ")
         }
         write!(
             f,
@@ -1122,9 +1119,9 @@ impl LocatedInferError {
 /// "expected" — an application's domain can be raised from either side of its edge.
 /// Where two types that **render identically** actually differ.
 ///
-/// `Display` is deliberately lossy: a refinement prints its predicate through `symbolic`,
-/// which shows terms without their types, so two refinements whose predicates differ only in
-/// their *internal* annotations print the same. A mismatch between them reads as
+/// A type written in CHL (`chl_print::chl_type`) is lossy: a refinement writes its
+/// predicate without the types of its terms, and a sum writes no binder, so two types that
+/// differ only there print the same. A mismatch between them reads as
 /// "expected 𝑇, found 𝑇" — a message that states the types agree while reporting that they
 /// do not, which sends a reader looking for the bug anywhere but where it is.
 ///
@@ -1147,7 +1144,7 @@ fn without_node_ids(debug: &str) -> String {
 }
 
 fn identical_rendering_hint(type_a: &Type, type_b: &Type) -> Option<String> {
-    if type_a.to_string() != type_b.to_string() {
+    if chl_type(type_a) != chl_type(type_b) {
         return None;
     }
     // A predicate's node ids name where its nodes came from, not what the type says, so the
@@ -1202,8 +1199,8 @@ fn identical_rendering_hint(type_a: &Type, type_b: &Type) -> Option<String> {
         s[start..end].to_string()
     };
     Some(format!(
-        "note: these render identically — they differ where `Display` does not look, \
-         most often a refinement predicate's own types. First structural difference:\n             expected: …{}…\n    found:    …{}…",
+        "note: these render identically — they differ where the written type does not \
+         look, most often a refinement predicate's own types or a sum's binder. First structural difference:\n             expected: …{}…\n    found:    …{}…",
         window(&a),
         window(&b)
     ))
@@ -1314,10 +1311,12 @@ fn undischarged_index_hint(type_a: &Type, type_b: &Type) -> Option<String> {
         return None;
     }
     Some(format!(
-        "hint: `{index}` is not known to lie in the collection's domain `{domain}`, so this \
-         lookup is not provably total. A proven lookup needs an index whose type carries \
-         that proof (one drawn from the collection itself); write `c[k]` for the checked \
-         form, which answers `some(v)`/`none` for any key."
+        "hint: `{}` is not known to lie in the collection's domain `{}`, so this lookup is \
+         not provably total. A proven lookup needs an index whose type carries that proof \
+         (one drawn from the collection itself); write `c[k]` for the checked form, which \
+         answers `some(v)`/`none` for any key.",
+        chl_type(index),
+        chl_type(domain)
     ))
 }
 
@@ -1334,7 +1333,9 @@ impl std::fmt::Debug for InferError {
                 Some(expected) => {
                     write!(
                         f,
-                        "Type mismatch for {ctx}: expected {expected}, found {found}"
+                        "Type mismatch for {ctx}: expected {}, found {}",
+                        chl_type(expected),
+                        chl_type(found)
                     )?;
                     if let Some(hint) = product_keying_hint(expected, found) {
                         write!(f, "\n  {hint}")?;
@@ -1354,7 +1355,7 @@ impl std::fmt::Debug for InferError {
                 }
                 // A one-sided violation (`ExtraTag`): the `ctx` says what is wrong and
                 // there is no second type the demand could be.
-                None => write!(f, "Type mismatch for {ctx}: found {found}"),
+                None => write!(f, "Type mismatch for {ctx}: found {}", chl_type(found)),
             },
             InferError::NoTraitInstance {
                 trait_,
@@ -1365,6 +1366,7 @@ impl std::fmt::Debug for InferError {
             } => {
                 // A trait with no instance accepting anything at the position, as one a
                 // module declares no instance of, has no type to list.
+                let found = chl_type(found);
                 if accepted.is_empty() {
                     return write!(
                         f,
@@ -1375,7 +1377,7 @@ impl std::fmt::Debug for InferError {
                 }
                 let accepted = accepted
                     .iter()
-                    .map(|t| t.to_string())
+                    .map(chl_type)
                     .collect::<Vec<_>>()
                     .join(" or ");
                 write!(
@@ -1417,9 +1419,9 @@ impl std::fmt::Debug for InferError {
                     ts.iter()
                         .map(|(name, t)| {
                             if name.is_empty() {
-                                format!("`{t}`")
+                                format!("`{}`", chl_type(t))
                             } else {
-                                format!("`{name} = {t}`")
+                                format!("`{name} = {}`", chl_type(t))
                             }
                         })
                         .collect::<Vec<_>>()
@@ -1483,18 +1485,15 @@ impl std::fmt::Debug for InferError {
             InferError::UnresolvedMethod {
                 method,
                 receiver: Some(ty @ Type::Nominal(..)),
-            } => write!(
-                f,
-                "`{}` has no method `{method}`",
-                crate::ccl::chl_print::chl_type(ty)
-            ),
+            } => write!(f, "`{}` has no method `{method}`", chl_type(ty)),
             InferError::UnresolvedMethod {
                 method,
                 receiver: Some(ty),
             } => write!(
                 f,
-                "`.{method}(…)` calls a method, and `{ty}` is not a nominal type, so it has no \
-                 methods; the function a field holds is called as `(r.{method})(…)`"
+                "`.{method}(…)` calls a method, and `{}` is not a nominal type, so it has no \
+                 methods; the function a field holds is called as `(r.{method})(…)`",
+                chl_type(ty)
             ),
             InferError::ParamReadsBinder { param, binder } => match binder {
                 Some(binder) => write!(
@@ -1573,8 +1572,10 @@ impl std::fmt::Debug for InferError {
             } => {
                 writeln!(
                     f,
-                    "This value is already {found}, but it is required to be \
-                     {required}, so it can never be called:"
+                    "This value is already {}, but it is required to be {}, so it can never \
+                     be called:",
+                    chl_type(found),
+                    chl_type(required)
                 )?;
                 for r in requirements {
                     writeln!(f, "  {r}")?;
@@ -1586,24 +1587,29 @@ impl std::fmt::Debug for InferError {
                 // projection asked for a position past the end.
                 (FieldKey::Index(i), Type::Tuple(elems)) => write!(
                     f,
-                    "No position .{i} for {at}: {found} is a tuple with {} position{}",
+                    "No position .{i} for {at}: {} is a tuple with {} position{}",
+                    chl_type(found),
                     elems.len(),
                     if elems.len() == 1 { "" } else { "s" },
                 ),
-                // A record's `Display` already lists its fields, so naming the absent
+                // A written record already lists its fields, so naming the absent
                 // one against it is the whole message.
                 (FieldKey::Name(name), _) => {
-                    write!(f, "No field .{name} for {at}: {found} has no such field")
+                    write!(
+                        f,
+                        "No field .{name} for {at}: {} has no such field",
+                        chl_type(found)
+                    )
                 }
                 // `found` degraded to a shape whose keying the message cannot lean on
                 // (`coalesce_for_error` falls back to `Type::Hole`).
-                _ => write!(f, "No field .{key} for {at}: {found}"),
+                _ => write!(f, "No field .{key} for {at}: {}", chl_type(found)),
             },
             InferError::ExpectedFunction { found, at } => {
                 write!(
                     f,
                     "Expected function type at {at}, found {}",
-                    crate::ccl::chl_print::chl_type(found)
+                    chl_type(found)
                 )?;
                 if matches!(found, Type::Tuple(_) | Type::Record(_)) {
                     write!(
@@ -1625,8 +1631,8 @@ impl std::fmt::Debug for InferError {
                 write!(
                     f,
                     "Annotation mismatch: annotated as {}, but inferred as {}",
-                    crate::ccl::chl_print::chl_type(annotation),
-                    crate::ccl::chl_print::chl_type(inferred)
+                    chl_type(annotation),
+                    chl_type(inferred)
                 )?;
                 if let Some(hint) = product_keying_hint(annotation, inferred) {
                     write!(f, "\n  {hint}")?;
@@ -1647,7 +1653,7 @@ impl std::fmt::Debug for InferError {
                 )?;
                 match &**inferred {
                     Type::Tuple(found) => write!(f, "a {}-tuple", found.len())?,
-                    found => write!(f, "{}", crate::ccl::chl_print::chl_type(found))?,
+                    found => write!(f, "{}", chl_type(found))?,
                 }
                 let pattern = Type::Tuple(vec![Type::Hole; *positions]);
                 if let Some(hint) = product_keying_hint(&pattern, inferred) {
@@ -1662,7 +1668,7 @@ impl std::fmt::Debug for InferError {
                 write!(
                     f,
                     "Annotation mismatch: annotated as {}, but inferred as {}",
-                    crate::ccl::chl_print::chl_type(annotation),
+                    chl_type(annotation),
                     crate::ccl::chl_print::chl_inferred_poly(inferred)
                 )
             }
@@ -1696,9 +1702,10 @@ impl std::fmt::Debug for InferError {
                     .join(", ");
                 write!(
                     f,
-                    "this function's result type {ty} refines a parameter by {names}, which \
+                    "this function's result type {} refines a parameter by {names}, which \
                      the function body binds opaquely; annotate the function's result type \
-                     with a type that does not name {names}"
+                     with a type that does not name {names}",
+                    chl_type(ty)
                 )
             }
             InferError::ScopeViolation { at, ty, unbound } => {
@@ -1745,7 +1752,7 @@ impl std::fmt::Debug for InferError {
                 // Joined with `vs`, not commas: a domain is often a tuple and renders with
                 // commas of its own, so a comma-separated list of them reads as one long
                 // tuple.
-                let listed: Vec<String> = domains.iter().map(|d| d.to_string()).collect();
+                let listed: Vec<String> = domains.iter().map(chl_type).collect();
                 write!(
                     f,
                     "Type Inference Error: collection domains have no common answer\n\
@@ -1778,7 +1785,7 @@ impl std::fmt::Debug for InferError {
                         spelled(reads).join(", ")
                     ));
                 }
-                let predicate = symbolic(predicate);
+                let predicate = crate::ccl::chl_print::chl_predicate(predicate);
                 let depends = depends.join("; and on ");
                 match position {
                     JoinedPosition::Keys => write!(
@@ -1820,7 +1827,8 @@ impl std::fmt::Debug for InferError {
                 write!(
                     f,
                     "a mutable-reference type may not appear inside a composite type \
-                     (Mut second-class rule 2): {ty} at {at}"
+                     (Mut second-class rule 2): {} at {at}",
+                    chl_type(ty)
                 )
             }
             InferError::MutArgNotMutable { at } => {
@@ -2635,7 +2643,7 @@ fn collect_type_errors(
             }
             hole_for_infer(&mut open);
             errors.push(InferError::UnresolvedTupleWidth {
-                open: crate::ccl::chl_print::chl_type(&open),
+                open: chl_type(&open),
                 at: context_sym.to_string(),
             });
             return;
@@ -5830,8 +5838,8 @@ mod tests {
         };
         let (a, b) = (sum(), sum());
         assert_eq!(
-            a.to_string(),
-            b.to_string(),
+            chl_type(&a),
+            chl_type(&b),
             "the premise: these must render identically"
         );
         assert_ne!(a, b, "the premise: these must actually differ");

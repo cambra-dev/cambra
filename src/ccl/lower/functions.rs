@@ -308,7 +308,15 @@ pub(super) fn uncurry_params(
     // double-underscore names here), this guarantees the outer
     // substitution's inserted `Var(outer_name)` never collides with an
     // inner binder.
-    let tuple_name = ctx.fresh_tuple_arg();
+    // Minted here rather than by `uniquify`, so the binder carries what each position
+    // reads as: a diagnostic writes `__arg_tuple_N.0` as the parameter it stands for.
+    let tuple_name = Name::fresh_tuple(
+        ctx.fresh_tuple_arg(),
+        params
+            .iter()
+            .map(|p| SmolStr::from(p.name.as_str()))
+            .collect(),
+    );
     let up = "lower.param_proj";
     let body_with_subs = params.iter().enumerate().fold(body_expr, |acc, (i, arg)| {
         // The projection plumbing is manufactured per *occurrence*: the
@@ -334,7 +342,7 @@ pub(super) fn uncurry_params(
         // only channel that can name its site — see `src/ccl/design/ir.md`,
         // "Source locations on substituted parameter projections".
         let site = arg.name_span;
-        let var = ctx.tag_machinery(Expr::var(&tuple_name), site, up);
+        let var = ctx.tag_machinery(Expr::var(tuple_name.clone()), site, up);
         let idx = ctx.tag_machinery(Expr::proj_index(i), site, up);
         let proj = ctx.tag_machinery(Expr::apply(var, idx), site, up);
         let name = Name::raw(arg.name.as_str());
@@ -365,7 +373,7 @@ pub(super) fn uncurry_params(
     // lowering's own: no one place in the source writes it, so it records where the function
     // is tagged.
     let arity = Type::Tuple(vec![Type::Hole; params.len()]);
-    let mut lam = Expr::lambda(&tuple_name, Occurrence::mint(), arity, body_with_subs);
+    let mut lam = Expr::lambda(tuple_name, Occurrence::mint(), arity, body_with_subs);
     if elem_anns.iter().any(|t| !matches!(t, Type::Hole))
         && let TypedExprNode::Lambda { param, .. } = &mut lam.node
     {
