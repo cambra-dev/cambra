@@ -12,8 +12,11 @@ serves.
 
 ## What it shows
 
-- **Source pane** — the CHL source in a read-only editor, with hover types,
-  Ctrl/Cmd-click goto-definition, and diagnostic squiggles.
+- **Source pane** — the CHL source in a read-only editor, with syntax
+  highlighting, hover types, Ctrl/Cmd-click goto-definition, and diagnostic
+  squiggles. The highlighting is the VS Code grammar run in the page, and
+  `./ci.sh editors` checks it against the lexer beside the VS Code and Neovim
+  grammars ([editors/README.md](../editors/README.md#inspector)).
 - **Values pane** — the rows the operators a reader pinned currently hold, over
   the `/api/live` websocket. Pinning is a gesture in the source rather than a
   selection, so the pane keeps showing a construct while the reader reads
@@ -137,7 +140,9 @@ payload is too large to commit is asserted structurally in
 (`tests/it/inspector_goldens.rs`).
 
 **Frontend (TypeScript):** see [`web/README.md`](../web/README.md). In short, from
-`web/`: `npm run typecheck`, `npm run test` (vitest), `npm run build`.
+`web/`: `npm run typecheck`, `npm run test` (vitest), `npm run build`. The source
+pane's highlighting is checked against the lexer by `./ci.sh editors`
+([Editor highlight check](../editors/README.md#editor-highlight-check)).
 
 > ⚠ **Never run `npm run dev`** — it starts a Vite server that does not exit.
 > All of `typecheck` / `test` / `build` are one-shot. `--inspect-only` also
@@ -149,7 +154,9 @@ payload is too large to commit is asserted structurally in
 the binary works without Node. **After changing anything under `web/src/`, rerun
 `npm run build` and commit the regenerated bundle** — `ci.sh web` compares it
 against a fresh build (see the "Committed bundle (R7)" section of
-[`web/README.md`](../web/README.md)).
+[`web/README.md`](../web/README.md)). The bundle also embeds
+`editors/vscode/syntaxes/cambra.tmLanguage.json` and
+`editors/highlight-classes.json`, so a change to either needs the rebuild too.
 
 ## Design & background
 
