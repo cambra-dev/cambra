@@ -442,6 +442,7 @@ struct FlaggingConsumer {
 
 impl Consumer for FlaggingConsumer {
     fn notify(&mut self, arrived: &Projection) {
+        crate::interpreter::dispatcher::debug_assert_outside_a_run();
         self.flag.mark();
         self.downstream.notify(arrived);
     }
@@ -506,6 +507,7 @@ struct RecordingConsumer {
 
 impl Consumer for RecordingConsumer {
     fn notify(&mut self, arrived: &Projection) {
+        crate::interpreter::dispatcher::debug_assert_outside_a_run();
         self.arrivals.record(arrived);
         self.downstream.notify(arrived);
     }
@@ -1421,6 +1423,12 @@ pub trait Breaker {
     fn no_consuming_mode(&self) -> Option<String> {
         None
     }
+
+    /// Have every producer in this breaker's chain that reads the live source `source` read it
+    /// again at its next pull: a dispatched run calls it once the source yields more, where the
+    /// breaker is a transaction store, whose writer's drive caches what it read of its source. A
+    /// no-op for every other breaker.
+    fn read_source_again(&mut self, _source: &Rc<RefCell<dyn DataSourceDomainExtentImpl>>) {}
 
     /// Hand `push` the producer whose decided region this breaker's pipeline pushes: itself
     /// where it is a producer, or the store of a loop's scope.
