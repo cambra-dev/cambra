@@ -3114,7 +3114,7 @@ pub fn type_free_vars(ty: &Type) -> BTreeSet<Binder> {
 /// The indices of the element references `t` reads free: `0` for the element of the
 /// refinement whose predicate holds `t`, one more per refinement further out.
 pub fn free_elem_indices(t: &TypedExpr) -> BTreeSet<u32> {
-    crate::ccl::free_names::names(t, crate::ccl::free_names::EVERY_READ)
+    crate::ccl::ccl_utils::free_names(t)
         .iter()
         .filter_map(Name::elem_index)
         .collect()
