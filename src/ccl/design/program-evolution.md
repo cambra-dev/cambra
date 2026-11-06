@@ -73,11 +73,12 @@ Three questions decide a reload:
 > (`every_branch_verb_parses_by_position`, `a_malformed_name_or_path_answers_404`) and each verb's
 > reply by `tests/it/hot_reload/branching.rs`.
 
-`--control` (default 8081, `--control=PORT` to change it) serves the verbs below. Dispatch is on the
-path. `/reload` and the `/branch` forms that create or delete change what runs, so they require
-`POST` and answer 405 to any other method (`ControlRequest::mutates`); the other verbs accept any
-method. A verb that takes a source reads it from the request body when the body is non-blank, and
-otherwise from the query string, percent-decoded. Every reply is `text/plain; charset=utf-8`.
+`--control` (default 8081, `--control=PORT` to change it) serves the verbs below on loopback
+(`127.0.0.1`) only, because `/reload` runs the source it carries. Dispatch is on the path. `/reload`
+and the `/branch` forms that create or delete change what runs, so they require `POST` and answer
+405 to any other method (`ControlRequest::mutates`); the other verbs accept any method. A verb that
+takes a source reads it from the request body when the body is non-blank, and otherwise from the
+query string, percent-decoded. Every reply is `text/plain; charset=utf-8`.
 
 A `<source>` is one file, the version's root. A version that imports or runs a module therefore
 fails to load it, and the 400 says that a program of several modules cannot be reloaded yet.

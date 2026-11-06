@@ -296,6 +296,16 @@ impl Drop for ControlMessage {
     }
 }
 
+/// Bind the control port on loopback.
+///
+/// Loopback, not `0.0.0.0`: a `/reload` replaces the running program with
+/// whatever source it carries, so any host that can reach the port can run code
+/// in the process. Reaching it from another host is a port-forward, as for the
+/// inspector's port (`docs/inspector.md`, "Running it").
+fn bind(port: u16) -> Result<tiny_http::Server, Box<dyn std::error::Error + Send + Sync>> {
+    tiny_http::Server::http(format!("127.0.0.1:{port}"))
+}
+
 /// The main loop's end of the control port.
 ///
 /// Holding one keeps the server thread's channel open; dropping it makes every
@@ -312,7 +322,7 @@ impl ControlPort {
     /// leaves the program running with no control port and nothing saying so.
     pub fn new(port: u16) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let (tx, rx) = sync_channel::<ControlMessage>(0);
-        let server = tiny_http::Server::http(format!("0.0.0.0:{port}"))?;
+        let server = bind(port)?;
         let port = bound_port(&server, port);
         // Printed rather than logged: a log line is hidden unless `RUST_LOG`
         // asks for it, and under `--control=0` this line is the only place
@@ -629,6 +639,15 @@ fn percent_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The control port answers loopback only, because a `/reload` runs the
+    /// code it carries.
+    #[test]
+    fn the_control_port_binds_loopback() {
+        let server = bind(0).expect("binding an ephemeral port");
+        let addr = server.server_addr().to_ip().expect("an ip address");
+        assert!(addr.ip().is_loopback(), "bound {addr}, not loopback");
+    }
 
     /// A posted version naming a module is refused with the reason the module
     /// has no file: a posted version is one file.
