@@ -1965,8 +1965,49 @@ impl Entry {
     }
 }
 
+// Whether this thread is in a compiled program's dispatched run (`run_program`), which a debug
+// build checks no consumer is notified in.
+//
+// shared-state-ok: a debug check's one bit. Nothing crosses it between operators; the run sets it
+// and the consumers a notification passes read it.
+thread_local! {
+    // shared-state-ok: the flag itself, for the reason on the macro above. The checker's upward
+    // scan stops at `thread_local! {`, so the note above does not reach this line.
+    static IN_A_RUN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Run `run` as a compiled program's dispatched run on this thread, in which no consumer is
+/// notified ([`debug_assert_outside_a_run`]).
+pub(crate) fn in_a_run<R>(run: impl FnOnce() -> R) -> R {
+    struct Leave(bool);
+    impl Drop for Leave {
+        fn drop(&mut self) {
+            IN_A_RUN.with(|in_a_run| in_a_run.set(self.0));
+        }
+    }
+    let _leave = Leave(IN_A_RUN.with(|in_a_run| in_a_run.replace(true)));
+    run()
+}
+
+/// Whether this thread is inside a compiled program's dispatched run ([`in_a_run`]).
+pub(crate) fn is_in_a_run() -> bool {
+    IN_A_RUN.with(Cell::get)
+}
+
+/// Panic in a debug build where a consumer is notified inside a compiled program's dispatched
+/// run ([`in_a_run`]): the run has the producers that cache what they read read it again directly
+/// (`tile_operators::read_again_toward`), and pushes carry what a pipeline's readers take.
+pub(crate) fn debug_assert_outside_a_run() {
+    debug_assert!(
+        !is_in_a_run(),
+        "a dispatched run notifies no consumer: a producer that caches what it reads reads it \
+         again through `read_again_toward`"
+    );
+}
+
 impl Consumer for Entry {
     fn notify(&mut self, arrived: &Projection) {
+        debug_assert_outside_a_run();
         self.inner.notify(arrived);
     }
 
@@ -2378,5 +2419,32 @@ mod tests {
             })
             .collect();
         assert_eq!(held, vec![vec![0, 1], vec![2, 3], vec![6, 7], vec![8]]);
+    }
+}
+
+#[cfg(test)]
+mod in_a_run_tests {
+    use super::*;
+    use crate::interpreter::tile_operators::Arrivals;
+
+    /// A consumer notified inside a compiled program's dispatched run panics in a debug build.
+    #[test]
+    #[cfg_attr(
+        debug_assertions,
+        should_panic(expected = "a dispatched run notifies no consumer")
+    )]
+    fn a_consumer_notified_inside_a_run_panics() {
+        let mut consumer = Arrivals::new().consumer(Box::new(|| {}));
+        in_a_run(|| consumer.notify(&Projection::Everything));
+    }
+
+    /// A run that panics leaves the thread outside a run, so a later notification passes.
+    #[test]
+    fn a_run_that_panics_leaves_the_thread_outside_a_run() {
+        let unwound = std::panic::catch_unwind(|| in_a_run(|| panic!("the run fails")));
+        assert!(unwound.is_err());
+        assert!(!is_in_a_run());
+        let mut consumer = Arrivals::new().consumer(Box::new(|| {}));
+        consumer.notify(&Projection::Everything);
     }
 }
