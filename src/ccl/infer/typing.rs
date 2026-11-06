@@ -107,6 +107,13 @@ pub(super) trait Typing {
         statement: NodeId,
     ) -> Result<(), LocatedInferError>;
 
+    /// Record what the A-normalization temp `temp` names ([`super::emit::written_variable`]),
+    /// for a pass-by-reference argument the temp is.
+    fn note_temp(&mut self, temp: &Name, written: Option<Type>);
+
+    /// What [`Self::note_temp`] recorded for `temp`, `None` when nothing did.
+    fn temp_written(&self, temp: &Name) -> Option<Option<Type>>;
+
     /// Pass over a statement whose expression is the [`Error`](crate::ccl::TypedExprNode::Error)
     /// stand-in for one that failed in an earlier run ([`super::run_with_params`]): it is
     /// typed as a failed statement is, reporting nothing, and counts toward

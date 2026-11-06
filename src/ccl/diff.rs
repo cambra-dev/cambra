@@ -2823,7 +2823,7 @@ mod tests {
         // would otherwise be handed a tree whose illegal construct was silently
         // dropped, and two versions differing only in it would diff as
         // identical. `x := 2` writes to an immutable binding, which
-        // `check_mut_write_targets` is what rejects.
+        // inference rejects where it emits the write.
         let src = indoc! {"
             x = 1
             x := 2
