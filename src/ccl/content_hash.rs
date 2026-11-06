@@ -279,8 +279,10 @@ fn hash_type<'a>(
             codomain,
             fun_kind,
             name: _,
+            effects,
         } => {
             std::mem::discriminant(fun_kind).hash(state);
+            effects.hash(state);
             if let FunKind::Var(v) = fun_kind {
                 std::mem::discriminant(&v.resolved()).hash(state);
             }
@@ -1080,6 +1082,7 @@ mod tests {
                 fun_kind: FunKind::fresh_var(),
                 domain: Box::new(int()),
                 codomain: Box::new(int()),
+                effects: crate::ccl::effects::Effects::none(),
             })
         };
         assert_ne!(h(&unpinned()), h(&typed(Type::fun(int(), int()))));
@@ -1104,6 +1107,7 @@ mod tests {
                 fun_kind,
                 domain: Box::new(int()),
                 codomain: Box::new(int()),
+                effects: crate::ccl::effects::Effects::none(),
             })
         };
         assert_ne!(h(&pinned(true)), h(&pinned(false)));

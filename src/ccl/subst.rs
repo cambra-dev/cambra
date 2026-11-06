@@ -2288,6 +2288,9 @@ impl Subst {
                 fun_kind,
                 domain,
                 codomain,
+                // A capability names a variable bound outside the function, never a term
+                // this substitution maps (`src/ccl/design/type-inference.md`, "Effect variables").
+                effects: _,
             } => {
                 // A witness binder is a *type*-level binder, so a term substitution has
                 // no name to map here — only the kinds' type children need rewriting.
@@ -2305,6 +2308,9 @@ impl Subst {
                 fun_kind,
                 domain,
                 codomain,
+                // A capability names a variable bound outside the function, never a term
+                // this substitution maps (`src/ccl/design/type-inference.md`, "Effect variables").
+                effects: _,
             } => {
                 for w in fun_kind.witnesses_mut() {
                     for t in w.types_mut() {
@@ -2632,12 +2638,14 @@ impl Subst {
                         name,
                         domain,
                         codomain,
+                        effects,
                         ..
                     } => Type::Fun {
                         name,
                         fun_kind: FunKind::Data(None),
                         domain,
                         codomain,
+                        effects,
                     },
                     other => other,
                 }
@@ -2709,11 +2717,13 @@ impl Subst {
                 fun_kind,
                 domain,
                 codomain,
+                effects,
             } => Type::Fun {
                 name: None,
                 fun_kind: self.apply_fun_kind(fun_kind),
                 domain: Box::new(self.apply_domain(fun_kind, domain)),
                 codomain: Box::new(self.apply_type(codomain)),
+                effects: effects.clone(),
             },
 
             Type::Fun {
@@ -2721,6 +2731,7 @@ impl Subst {
                 fun_kind,
                 domain,
                 codomain,
+                effects,
             } => {
                 let domain = Box::new(self.apply_domain(fun_kind, domain));
                 let inner = self.under_binder_ty(b, codomain);
@@ -2729,6 +2740,7 @@ impl Subst {
                     fun_kind: self.apply_fun_kind(fun_kind),
                     domain,
                     codomain: Box::new(inner),
+                    effects: effects.clone(),
                 }
             }
 
@@ -3064,6 +3076,8 @@ fn collect_type_fv(
             fun_kind,
             domain,
             codomain,
+            // A capability names a mutable variable or a feed, which a refinement never reads.
+            effects: _,
         } => {
             // A witness binder binds no *term* variable, so the kinds' free term vars
             // are collected under the enclosing binders, with nothing subtracted.
@@ -3304,6 +3318,9 @@ pub fn walk_children_opened<'t>(
             fun_kind,
             domain,
             codomain,
+            // A capability names a variable bound outside the function, never its own binder,
+            // so the binder's substitution reaches no capability.
+            effects: _,
         } => {
             for w in fun_kind.witnesses() {
                 for t in w.types() {
@@ -3687,6 +3704,7 @@ impl<'a> PiWalk<'a> {
                 fun_kind,
                 domain,
                 codomain,
+                ..
             } => {
                 // A binder scopes over its codomain only: the domain stays at
                 // the enclosing depth, the codomain is one crossing deeper. A name
@@ -4497,6 +4515,7 @@ mod tests {
             fun_kind: crate::ccl::ty::FunKind::Compute,
             domain: Box::new(Type::infer()),
             codomain: Box::new(refined(gt(var("i"), var("k")))),
+            effects: crate::ccl::effects::Effects::none(),
         };
         let out = Subst::discharge("k", int(5)).apply_type(&ty);
         let Type::Fun { codomain, .. } = &out else {
@@ -5175,6 +5194,7 @@ mod locally_nameless_tests {
                 fun_kind: crate::ccl::FunKind::Compute,
                 domain: Box::new(int()),
                 codomain: Box::new(refined(TypedExpr::var(x.clone()))),
+                effects: crate::ccl::effects::Effects::none(),
             },
         );
         let Type::Fun {

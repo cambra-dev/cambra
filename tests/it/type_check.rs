@@ -2181,7 +2181,8 @@ fn test_list_comp_identity() {
             name: None,
             fun_kind: cambra::ccl::FunKind::Data(None),
             domain: Box::new(Type::UIntRange(2)),
-            codomain: Box::new(int())
+            codomain: Box::new(int()),
+            effects: cambra::ccl::effects::Effects::none(),
         }
     );
 }
@@ -2195,7 +2196,8 @@ fn test_list_comp_arithmetic_body() {
             name: None,
             fun_kind: cambra::ccl::FunKind::Data(None),
             domain: Box::new(Type::UIntRange(2)),
-            codomain: Box::new(int())
+            codomain: Box::new(int()),
+            effects: cambra::ccl::effects::Effects::none(),
         }
     );
 }
@@ -2210,7 +2212,8 @@ fn test_list_comp_two_gens() {
             name: None,
             fun_kind: cambra::ccl::FunKind::Data(None),
             domain: Box::new(Type::Tuple(vec![Type::UIntRange(2), Type::UIntRange(2)])),
-            codomain: Box::new(int())
+            codomain: Box::new(int()),
+            effects: cambra::ccl::effects::Effects::none(),
         },
         "got {ty}"
     );

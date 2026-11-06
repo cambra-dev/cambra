@@ -2546,6 +2546,10 @@ fn run_passes(
     // mutable reference.
     check_mut_rules(&expr, &blame)?;
 
+    // The last check that reads effects has run, so they are erased: every pass after this
+    // one builds function types that state none.
+    crate::ccl::effects::erase(&mut expr);
+
     // Give each named read its position back, now that inference has run and no
     // refinement needs a binder to mention (`crate::ccl::mut_read::unbind`).
     // Before the pane below, so one phase sits on one side of it; before
@@ -3455,7 +3459,11 @@ Error: lowering error
     /// covers exactly the `nth` occurrence of `expected` in `code`.
     #[rstest]
     #[case::write_to_an_immutable("x = 1\nx += 2\nx\n", "x += 2", 0)]
-    #[case::mut_rule_1("def g(n):\n    z := n\n    z\ng(5)\n", "g(5)", 0)]
+    #[case::mut_rule_1(
+        "def bump(c: Mut(Int)):\n    c += 1\nx := 0\ny := 1\nbump(x if True else y)\nx\n",
+        "x if True else y",
+        0
+    )]
     #[case::ambiguous_program("f = \\x -> [x, x]\nf\n", "f = \\x -> [x, x]", 0)]
     #[case::used_after_await_final(
         indoc::indoc! {"

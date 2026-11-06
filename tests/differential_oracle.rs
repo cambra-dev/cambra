@@ -101,6 +101,7 @@ fn gen_pair(rng: &mut Rng, depth: u32) -> (Type, Type) {
                 fun_kind: k,
                 domain: Box::new(d),
                 codomain: Box::new(c),
+                effects: cambra::ccl::effects::Effects::none(),
             };
             (fun(nl, kl, dl, cl), fun(nr, kr, dr, cr))
         }
@@ -337,6 +338,7 @@ fn close_all(ty: &Type) -> Type {
             fun_kind,
             domain,
             codomain,
+            effects,
         } => {
             let domain = close_all(domain);
             let codomain = close_all(codomain);
@@ -349,6 +351,7 @@ fn close_all(ty: &Type) -> Type {
                 fun_kind: fun_kind.clone(),
                 domain: Box::new(domain),
                 codomain: Box::new(codomain),
+                effects: effects.clone(),
             }
         }
         Type::Refinement(base, r) => Type::Refinement(Box::new(close_all(base)), r.clone()),
@@ -380,6 +383,7 @@ fn ty_json(t: &Type) -> Option<String> {
             fun_kind,
             domain,
             codomain,
+            effects: _,
         } => {
             let binder = match name {
                 None => "null".to_string(),
@@ -654,11 +658,13 @@ fn open_some_tuples(rng: &mut Rng, ty: Type) -> Type {
             fun_kind,
             domain,
             codomain,
+            effects,
         } => Type::Fun {
             name,
             fun_kind,
             domain: Box::new(open_some_tuples(rng, *domain)),
             codomain: Box::new(open_some_tuples(rng, *codomain)),
+            effects,
         },
         Type::Record(fs) => Type::Record(
             fs.into_iter()
@@ -687,11 +693,13 @@ fn strip_binders(t: &Type) -> Type {
             fun_kind,
             domain,
             codomain,
+            effects: _,
         } => Type::Fun {
             name: None,
             fun_kind: fun_kind.clone(),
             domain: Box::new(strip_binders(domain)),
             codomain: Box::new(strip_binders(codomain)),
+            effects: cambra::ccl::effects::Effects::none(),
         },
         Type::Tuple(ts) => Type::Tuple(ts.iter().map(strip_binders).collect()),
         Type::OpenTuple(ts) => Type::OpenTuple(ts.iter().map(strip_binders).collect()),

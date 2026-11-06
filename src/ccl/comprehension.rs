@@ -379,6 +379,7 @@ fn encode(
                 fun_kind: FunKind::Data(None),
                 domain: Box::new(shared.clone()),
                 codomain: Box::new(Type::Hole),
+                effects: crate::ccl::effects::Effects::none(),
             }),
             None => read,
         };
@@ -424,6 +425,7 @@ fn encode(
                 fun_kind: result_kind.clone(),
                 domain: Box::new(Type::Hole),
                 codomain: Box::new(Type::Hole),
+                effects: crate::ccl::effects::Effects::none(),
             });
         let target_ty = refined_data_fun(Type::Hole, pred_expr, Type::Hole, result_kind);
         make_cast(unrefined_lambda, target_ty)
@@ -440,6 +442,7 @@ fn encode(
             fun_kind: result_kind,
             domain: Box::new(iter_dom.unwrap_or(Type::Hole)),
             codomain: Box::new(Type::Hole),
+            effects: crate::ccl::effects::Effects::none(),
         })
     };
     at_id(core, comprehension_id)

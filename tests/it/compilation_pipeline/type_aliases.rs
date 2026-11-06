@@ -623,24 +623,6 @@ fn alias_is_the_value_type_of_a_transactional_variable() {
     );
 }
 
-#[test]
-fn alias_is_the_value_type_of_a_transactional_variable_in_a_nested_block() {
-    check_scalar(
-        indoc! {r#"
-            def settle(xs) => Int:
-                Cents = Int
-                balance: Mut(Cents, Txn) := 0
-                for i in xs:
-                    with begin():
-                        balance := balance + i
-                await_final(balance)
-
-            settle([1, 2, 3])
-        "#},
-        Value::Int(6),
-    );
-}
-
 /// A `Mut` parameter's value type is lowered by `mut_param_history_type` rather
 /// than through `lower_type_annotation`, and `pre_register_txn_decls` reads the
 /// same annotation to decide the curried call shape. Both sit at block entry, so

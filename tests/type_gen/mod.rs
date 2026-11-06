@@ -208,11 +208,13 @@ pub fn maybe_kind_var_from(rng: &mut Rng, pool: &mut KindVarPool, t: Type) -> Ty
             fun_kind,
             domain,
             codomain,
+            effects,
         } if !matches!(fun_kind, FunKind::Data(Some(_))) && rng.chance(1, 2) => Type::Fun {
             name,
             fun_kind: FunKind::Var(pool.pick(rng)),
             domain,
             codomain,
+            effects: effects.clone(),
         },
         other => other,
     }
@@ -298,6 +300,7 @@ pub fn gen_ty(rng: &mut Rng, depth: u32, fragment: Fragment) -> Type {
                 fun_kind,
                 domain: Box::new(domain),
                 codomain: Box::new(codomain),
+                effects: cambra::ccl::effects::Effects::none(),
             }
         }
         1 => Type::Tuple(
@@ -397,6 +400,7 @@ pub fn partner(rng: &mut Rng, t: &Type, fragment: Fragment) -> Type {
                 fun_kind,
                 domain,
                 codomain,
+                effects,
             } => {
                 let flip_kind = rng.chance(1, 4);
                 Type::Fun {
@@ -422,6 +426,7 @@ pub fn partner(rng: &mut Rng, t: &Type, fragment: Fragment) -> Type {
                     } else {
                         (**codomain).clone()
                     }),
+                    effects: effects.clone(),
                 }
             }
             _ => edit(rng, t, fragment),
