@@ -910,17 +910,16 @@ c: Bool = False
 sum([y for y in (box([1, 5]) if c else box([3, 4])) if y > 3])",
     Value::Int(4)
 )]
-// **Two consumers, each with its own conditional.** A restriction is discharged into the
-// arms, so arms cannot be shared between consumers that restrict differently — spelled
-// inline, each consumer has its own `Case` and there is nothing to share. These are the
-// controls for the let-bound pair below, which is the same program with one binding.
+// **Two consumers, each with its own conditional.** Spelled inline, each consumer has its own
+// `Case`. These and the `c: Bool = False` case of the pair that opens this test are the controls
+// for the let-bound cases below, which are the same three programs with one binding.
 #[case(
     r"
 c: Bool = False
 sum([y for y in (box([1, 2]) if c else box([1, 2, 3])) if y > 1]) + sum([z for z in (box([1, 2]) if c else box([1, 2, 3])) if z > 2])",
     Value::Int(8)
 )]
-// ...including one consumer that restricts nothing, which owes the arms *no* gate.
+// ...including one consumer that restricts nothing.
 #[case(
     r"
 c: Bool = False
@@ -928,9 +927,8 @@ sum([y for y in (box([1, 2]) if c else box([1, 2, 3]))]) + sum([z for z in (box(
     Value::Int(11)
 )]
 // **Let-bound**, the same three programs with the conditional shared through a binding.
-// The legs carry the consumer's filter, so a shared conditional is inlined at each consumer
-// before realization — which is also what puts the `Case` back below the site that restricts
-// it, where the binding had placed it above.
+// The conditional is realized once, in its binding, and its consumers share it
+// (`src/ccl/design/collections.md`, "Compiling a conditional collection").
 #[case(
     r"
 c: Bool = False
@@ -1478,14 +1476,12 @@ sum([x + y for x in (box([1, 2]) if c else box([1, 2, 3])) for y in (box([10, 20
     check_scalar(&code, Value::Int(expected));
 }
 
-/// **A conditional as one generator among several.** The union realization builds is an
-/// iteration *source*, so it has to sit at the head of the pipeline consuming it — and
-/// rewriting the `Case` in place puts it there only when the conditional is the sole
-/// generator. With a second generator the head is the product iterate above it, so the union
-/// is built around the outermost node binding the witness, with the intervening chain copied
-/// into each leg.
+/// **A conditional as one generator among several.** A-normalization binds the conditional
+/// generator's source ahead of the comprehension (`anf::bind_sources_ahead`), so the conditional
+/// is realized in its binding, and the product reads it through `unbox` as it reads its other
+/// generator.
 ///
-/// Both orders, and a filter, since the copy has to carry whatever sits between.
+/// Both orders.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
 #[case(
@@ -1513,18 +1509,10 @@ fn a_conditional_generator_beside_another(#[case] code: &str, #[case] expected: 
 
 /// A filter anywhere in the product, which is the same site with a restriction on it.
 ///
-/// The restriction rides the *product*: with one generator a consuming filter types as
-/// `Σ (σ : 𝐾). ({σ | 𝑝} ⤇ 𝑉)`, and with a second the site is indexed by a product, so the
-/// same filter lands on `{(σ, 0..2) | 𝑝}` — the witness one position of the domain rather
-/// than the whole of it. Every rule that reads "the witness the domain names" therefore has
-/// to match a *mention*: reading only the whole makes the product case a different case,
-/// silently, at each place that does it.
-///
-/// Two did. `restriction_on_a_witness` decides which witness owes the restriction, and
-/// `planning::iterate` decides whether the site still owes a `restrict` at all — and a site
-/// whose owed restriction was discharged into the legs but whose witness that check failed
-/// to recognize emits the chain a second time, over a witness with no extent.
-///
+/// As in `a_conditional_generator_beside_another`, the conditional is realized in its binding,
+/// so the site's domain quotes the conditional rather than naming its witness
+/// (`src/ccl/design/collections.md`, "Compiling a conditional collection"). The filter on
+/// either generator restricts that product like a filter over any other source.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
 // The filter on the conditional generator.
@@ -1671,9 +1659,8 @@ fn a_product_of_two_let_bound_conditional_generators(#[case] c: &str, #[case] ex
 }
 
 /// One binding consumed by **two** generators of one site. Both positions name the same
-/// conditional, so the site's domain is the square of whichever domain it took — and the
-/// copy each consumer gets must be gated by that one conditional's arms rather than by a
-/// pair of independent choices.
+/// conditional, so the site's domain is the square of whichever domain it took, and both
+/// generators read the one realized union rather than a pair of independent choices.
 #[rstest]
 #[timeout(Duration::from_secs(30))]
 #[case("False", 36)]
