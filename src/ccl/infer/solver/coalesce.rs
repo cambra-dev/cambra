@@ -251,6 +251,57 @@ fn relate_params_by_bounds(ct: &CompactType, polarity: bool) -> Option<CompactTy
     use crate::ccl::ty::TypeParam;
     use std::rc::Rc;
 
+    // **A family application meets its bound as itself**, as a parameter does below: where the
+    // bound on the family's values, applied at the application's terms, is below the rest of
+    // the position, the meet is the application (`docs/chl-spec.md`, "Family parameters").
+    if !polarity && ct.shapes() >= 2 {
+        let bounded: Vec<(&AtomKey, Type)> = ct
+            .atoms
+            .iter()
+            .filter_map(|a| match a {
+                AtomKey::Family(c) => match c.ty() {
+                    Type::FamilyApp(app) => crate::ccl::subst::family_bound_at(app).map(|b| (a, b)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        if let [(atom, applied)] = bounded.as_slice() {
+            let mut rest = ct.clone();
+            rest.atoms.remove(*atom);
+            // A binder name nothing reads is a spelling, which `is_below` compares; the bound's
+            // is its own.
+            let unnamed = match applied {
+                Type::Fun {
+                    name: Some(b),
+                    fun_kind,
+                    domain,
+                    codomain,
+                } if !crate::ccl::subst::codomain_depends_on(b, codomain) => Type::Fun {
+                    name: None,
+                    fun_kind: fun_kind.clone(),
+                    domain: domain.clone(),
+                    codomain: codomain.clone(),
+                },
+                other => other.clone(),
+            };
+            let bound = super::compact::compact_type(&unnamed);
+            if rest.denotes_a_type()
+                && bound.rec_vars.is_empty()
+                && bound.term.denotes_a_type()
+                && bound.term.is_below(&rest)
+            {
+                return Some(CompactType {
+                    vars: ct.vars.clone(),
+                    kinds: ct.kinds.clone(),
+                    refinements: ct.refinements.clone(),
+                    atoms: std::iter::once((*atom).clone()).collect(),
+                    ..CompactType::default()
+                });
+            }
+        }
+    }
+
     fn params(ct: &CompactType) -> Vec<Rc<TypeParam>> {
         ct.atoms
             .iter()

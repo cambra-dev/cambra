@@ -512,7 +512,7 @@ pub(super) fn lower_def(
         ));
     }
     let aliases = ctx.snapshot_type_aliases();
-    let scoped = ctx.type_params_in_scope.len();
+    let scoped = ctx.type_param_scope();
     let in_scope = ctx.named_requirements.len();
     let result = declare_type_params(type_params, ctx).and_then(|mut declared| {
         let written: Vec<(crate::ccl::ty::TypeParamId, Span)> = declared
@@ -538,7 +538,7 @@ pub(super) fn lower_def(
         )
     });
     ctx.named_requirements.truncate(in_scope);
-    ctx.type_params_in_scope.truncate(scoped);
+    ctx.end_type_params(scoped);
     ctx.restore_type_aliases(aliases);
     result
 }
@@ -588,8 +588,8 @@ pub(super) fn lower_def_declared(
 
 /// The type parameters a call's arguments determine (`docs/chl-spec.md`, "Type
 /// parameters"): `determined`, those the parameters' types name, then, until nothing is
-/// added, those in the bound of a determined one of `params`, and the associated types of
-/// each requirement whose operands are all determined.
+/// added, those in the bound or the family's index types of a determined one of `params`, and
+/// the associated types of each requirement whose operands are all determined.
 pub(super) fn determined_params(
     mut determined: HashSet<crate::ccl::ty::TypeParamId>,
     params: &[crate::ccl::ty::PolyParam],
@@ -598,10 +598,10 @@ pub(super) fn determined_params(
     loop {
         let before = determined.len();
         for p in params {
-            if determined.contains(&p.param.id)
-                && let Some(bound) = p.bound()
-            {
-                collect_params(bound, &mut determined);
+            if determined.contains(&p.param.id) {
+                for t in p.kind.children() {
+                    collect_params(t, &mut determined);
+                }
             }
         }
         for r in requires {
@@ -624,8 +624,15 @@ pub(super) fn determined_params(
 
 /// Every type parameter `ty` names, into `out`.
 pub(super) fn collect_params(ty: &Type, out: &mut HashSet<crate::ccl::ty::TypeParamId>) {
-    if let Type::Param(param) = ty {
-        out.insert(param.id);
+    match ty {
+        Type::Param(param) => {
+            out.insert(param.id);
+        }
+        // An application of a family parameter is an occurrence of it.
+        Type::FamilyApp(app) => {
+            out.insert(app.param.id);
+        }
+        _ => {}
     }
     ty.walk_children(|child| collect_params(child, out));
 }

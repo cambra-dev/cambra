@@ -828,6 +828,8 @@ fn tk_json(k: &TypeKind) -> Option<String> {
             let each = ds.iter().map(ty_json).collect::<Option<Vec<_>>>()?;
             format!(r#"{{"k":"candidates","ds":[{}]}}"#, each.join(","))
         }
+        // A family parameter's kind, which no Σ binder has: the model has no spelling for it.
+        TypeKind::Family { .. } => return None,
     })
 }
 

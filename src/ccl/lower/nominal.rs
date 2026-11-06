@@ -239,11 +239,22 @@ pub(super) fn declare_nominal_types(
     errors
 }
 
+/// A `def`'s or a `forall`'s family parameter, `V: K => Type`: its index types, or `None` for a
+/// parameter that takes a type, whose kind [`super::stmts::lower_kind`] reads
+/// (`docs/chl-spec.md`, "Family parameters"). A bound on its values is a requirement,
+/// `requires forall (k: K) V(k) <: U`.
+pub(super) fn family_kind(
+    param: &ChlTypeParam,
+) -> Result<Option<Vec<&Spanned<ChlExpr>>>, LoweringError> {
+    match &param.annotation {
+        Some(KindAnnotation::Kind(kind)) => kind_arrow_indices(&param.name, kind),
+        _ => Ok(None),
+    }
+}
+
 /// The index types a type declaration's parameter declares, read off its kind: none for a
-/// parameter of kind `Type`, written or not, and for a family parameter its kind's domain, `K` in
-/// `V: K => Type`, one per component of a tuple domain, `K₁, K₂` in `V: {K₁, K₂} => Type`, as a
-/// function of two parameters takes their tuple, and `K` in `V: (k: K) => Type`
-/// (`docs/chl-spec.md`, "Family parameters").
+/// parameter of kind `Type`, written or not, and for a family parameter its kind's domain
+/// ([`kind_arrow_indices`]).
 fn family_indices(param: &ChlTypeParam) -> Result<Vec<&Spanned<ChlExpr>>, LoweringError> {
     let kind = match &param.annotation {
         None => return Ok(Vec::new()),
@@ -258,68 +269,84 @@ fn family_indices(param: &ChlTypeParam) -> Result<Vec<&Spanned<ChlExpr>>, Loweri
             ));
         }
     };
-    let name = &param.name;
-    match &kind.node {
-        ChlExpr::Name(n) if n == "Type" => Ok(Vec::new()),
-        ChlExpr::FunctionType {
-            domain,
-            arrow,
-            codomain,
-        } if is_kind(&codomain.node) => {
-            if !matches!(&codomain.node, ChlExpr::Name(n) if n == "Type") {
-                let hint = if matches!(codomain.node, ChlExpr::FunctionType { .. }) {
-                    format!(
-                        "; a family over two values is `{name}: {{A, B}} => Type`, applied as \
-                         `{name}(a, b)`"
-                    )
-                } else {
-                    String::new()
-                };
-                return Err(LoweringError::unsupported(
-                    codomain.span,
-                    format!(
-                        "`{name}` is a type for each value it is indexed by, so its kind is \
-                         `K => Type`{hint}"
-                    ),
-                ));
-            }
-            if matches!(arrow, chl_parser::ast::Arrow::Data) {
-                return Err(LoweringError::unsupported(
-                    kind.span,
-                    format!("the kind arrow is `=>`: `{name}: K => Type`"),
-                ));
-            }
-            match &domain.node {
-                // The binder's name is a spelling: nothing in a kind reads it, so
-                // `V: (k: K) => Type` is `V: K => Type`.
-                ChlExpr::TypeBinder { name: binder, ty } => {
-                    refuse_misannotated_type_binder(binder, ty)?;
-                    Ok(vec![&**ty])
-                }
-                d if is_kind(d) => Err(LoweringError::unsupported(
-                    domain.span,
-                    format!(
-                        "`{name}` is indexed by values, so its kind's domain is a type, \
-                         `{name}: K => Type`, and not a kind"
-                    ),
-                )),
-                ChlExpr::BraceGroup(parts)
-                    if parts.len() > 1
-                        && !parts.iter().any(|p| {
-                            matches!(p.node, ChlExpr::Rest) || p.node.is_variant_arms()
-                        }) =>
-                {
-                    Ok(parts.iter().collect())
-                }
-                _ => Ok(vec![&**domain]),
-            }
-        }
-        _ => Err(LoweringError::unsupported(
+    match kind_arrow_indices(&param.name, kind)? {
+        Some(indices) => Ok(indices),
+        None if matches!(&kind.node, ChlExpr::Name(n) if n == "Type") => Ok(Vec::new()),
+        None => Err(LoweringError::unsupported(
             kind.span,
             format!(
-                "the kind of `{name}` is `Type`, or `K => Type` for a type for each value of `K`"
+                "the kind of `{}` is `Type`, or `K => Type` for a type for each value of `K`",
+                param.name
             ),
         )),
+    }
+}
+
+/// The index types a family parameter `name`'s kind arrow declares: `K` in `V: K => Type`, one
+/// per component of a tuple domain, `K₁, K₂` in `V: {K₁, K₂} => Type`, as a function of two
+/// parameters takes their tuple, and `K` in `V: (k: K) => Type` (`docs/chl-spec.md`, "Family
+/// parameters"). `None` where `kind` is not an arrow to a kind.
+fn kind_arrow_indices<'a>(
+    name: &str,
+    kind: &'a Spanned<ChlExpr>,
+) -> Result<Option<Vec<&'a Spanned<ChlExpr>>>, LoweringError> {
+    let ChlExpr::FunctionType {
+        domain,
+        arrow,
+        codomain,
+    } = &kind.node
+    else {
+        return Ok(None);
+    };
+    if !is_kind(&codomain.node) {
+        return Ok(None);
+    }
+    if !matches!(&codomain.node, ChlExpr::Name(n) if n == "Type") {
+        let hint = if matches!(codomain.node, ChlExpr::FunctionType { .. }) {
+            format!(
+                "; a family over two values is `{name}: {{A, B}} => Type`, applied as \
+                 `{name}(a, b)`"
+            )
+        } else {
+            String::new()
+        };
+        return Err(LoweringError::unsupported(
+            codomain.span,
+            format!(
+                "`{name}` is a type for each value it is indexed by, so its kind is \
+                 `K => Type`{hint}"
+            ),
+        ));
+    }
+    if matches!(arrow, chl_parser::ast::Arrow::Data) {
+        return Err(LoweringError::unsupported(
+            kind.span,
+            format!("the kind arrow is `=>`: `{name}: K => Type`"),
+        ));
+    }
+    match &domain.node {
+        // The binder's name is a spelling: nothing in a kind reads it, so
+        // `V: (k: K) => Type` is `V: K => Type`.
+        ChlExpr::TypeBinder { name: binder, ty } => {
+            refuse_misannotated_type_binder(binder, ty)?;
+            Ok(Some(vec![&**ty]))
+        }
+        d if is_kind(d) => Err(LoweringError::unsupported(
+            domain.span,
+            format!(
+                "`{name}` is indexed by values, so its kind's domain is a type, \
+                 `{name}: K => Type`, and not a kind"
+            ),
+        )),
+        ChlExpr::BraceGroup(parts)
+            if parts.len() > 1
+                && !parts
+                    .iter()
+                    .any(|p| matches!(p.node, ChlExpr::Rest) || p.node.is_variant_arms()) =>
+        {
+            Ok(Some(parts.iter().collect()))
+        }
+        _ => Ok(Some(vec![&**domain])),
     }
 }
 
@@ -523,8 +550,7 @@ fn lower_constructors(
     ctx: &mut LoweringContext,
 ) -> Result<Vec<NominalCtor>, LoweringError> {
     let aliases = ctx.snapshot_type_aliases();
-    let scoped = ctx.type_params_in_scope.len();
-    let families = ctx.family_params.len();
+    let scoped = ctx.type_param_scope();
     for (i, param) in head.params.iter().enumerate() {
         if param.arity == 0 {
             ctx.declare_type_throughout(
@@ -591,8 +617,7 @@ fn lower_constructors(
         }
         Ok(ctors)
     })();
-    ctx.type_params_in_scope.truncate(scoped);
-    ctx.family_params.truncate(families);
+    ctx.end_type_params(scoped);
     ctx.restore_type_aliases(aliases);
     result
 }

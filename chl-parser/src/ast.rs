@@ -708,6 +708,20 @@ pub enum Requirement {
         member: Spanned<SmolStr>,
         bound: Spanned<Expr>,
     },
+    /// A type below another, `V(k) <: U`: a bound on a family's values, under a
+    /// [`Requirement::Forall`] that binds its index (`docs/chl-spec.md`, "Family parameters").
+    Subtype {
+        sub: Spanned<Expr>,
+        sup: Spanned<Expr>,
+    },
+    /// Requirements at every value of the types its binders range over:
+    /// `forall (k: K) V(k) <: U`, or a parenthesised group, `forall (k: K) (V(k) <: U, …)`.
+    /// Each binder, `k: K`, binds a value of its type (`docs/chl-spec.md`, "Family
+    /// parameters").
+    Forall {
+        binders: Vec<(Spanned<SmolStr>, Spanned<Expr>)>,
+        requirements: Vec<Spanned<Requirement>>,
+    },
 }
 
 /// A trait applied to its operand types, `Addable(A, B)`, or a bare name such as
