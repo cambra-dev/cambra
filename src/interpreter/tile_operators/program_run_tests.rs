@@ -1091,10 +1091,9 @@ fn a_transaction_store_of_two_writers_is_refused() {
     );
 }
 
-/// A program that reads a live source runs in no pipeline: no run notifies the source's
-/// arrivals.
+/// A loop over a live source runs in no pipeline: no round takes the source's arrivals.
 #[test]
-#[should_panic(expected = "reads a live source")]
+#[should_panic(expected = "a store over a live source")]
 fn a_loop_over_a_live_source_is_refused() {
     dispatched_with(
         indoc! {"
@@ -1180,6 +1179,366 @@ fn a_sink_fed_from_two_sites(#[values(1, usize::MAX)] rows: usize) {
         .value()
         .unwrap_or_else(|error| panic!("the sink holds a value: {error:?}"));
     assert_eq!(written.as_function().len(), 2, "both feeds: {written:?}");
+}
+
+/// One delivery of a live source: the entries it adds, and the region it then calls complete.
+type Batch = (Vec<(Value, Value)>, crate::interpreter::Predicate);
+
+/// `source`, reading the live source `source1`, compiled with a test sink `out` and run through
+/// the dispatcher at morsels of `rows`, the source fed `batches`: the first before the run, and
+/// each next one when the run has nothing to do. What the sink holds, and what the run planned.
+fn dispatched_live(source: &str, rows: usize, batches: Vec<Batch>) -> (Value, Vec<Planned>) {
+    let mut ctx = GlobalContext::default();
+    ctx.defer_sink_pulls();
+    let feed = std::rc::Rc::new(std::cell::RefCell::new(
+        crate::interpreter::TestDataSource::new(
+            "source1",
+            crate::ccl::Type::Base(crate::interpreter::BaseType::Int),
+            crate::interpreter::Extent::Base(crate::interpreter::BaseType::Int),
+        ),
+    ));
+    ctx.register_source(feed.clone());
+    let sink = ctx.register_test_sink("out");
+    let loaded = LoadedProgram::test(source);
+    let mut program = compile_program(&mut ctx, &loaded, Box::new(|| {}))
+        .unwrap_or_else(|errors| panic!("{source} compiles: {errors:?}"));
+    let _operators = ctx.take_operator_map();
+    let mut batches = batches.into_iter();
+    let deliver = |batch: Option<Batch>| {
+        let Some((entries, complete)) = batch else {
+            panic!("{source}: the run waits after the last batch")
+        };
+        let mut feed = feed.borrow_mut();
+        feed.add_data(&entries);
+        feed.set_yield_predicate(complete);
+    };
+    deliver(batches.next());
+    let planned =
+        crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut || {
+            deliver(batches.next())
+        })
+        .unwrap_or_else(|refused| panic!("{refused}"))
+        .planned;
+    assert!(
+        program.done.try_recv().is_ok(),
+        "{source}: the run's last pull of the sink finds it done"
+    );
+    let written = sink
+        .value()
+        .unwrap_or_else(|error| panic!("{source}: {error:?}"));
+    let [binding] = written.as_function().as_slice() else {
+        panic!("{source} writes one value: {written:?}")
+    };
+    (binding.output.clone(), planned)
+}
+
+/// Two deliveries of `source1`: keys 0 to 2, then 3 and 4, valued one more than the key.
+fn two_batches() -> Vec<Batch> {
+    let entries = |keys: std::ops::Range<u64>| {
+        keys.map(|key| (Value::UInt(key), Value::Int(key as i64 + 1)))
+            .collect::<Vec<_>>()
+    };
+    vec![
+        (
+            entries(0..3),
+            crate::interpreter::Predicate::at_or_below(Value::UInt(2)),
+        ),
+        (entries(3..5), crate::interpreter::Predicate::True),
+    ]
+}
+
+/// A sum over a live source runs in a source pipeline the run notifies of each delivery, and
+/// answers once the source yields everything.
+#[rstest_log::rstest]
+fn a_sum_over_a_live_source(#[values(1, 2, usize::MAX)] rows: usize) {
+    let (value, planned) = dispatched_live(
+        indoc! {"
+            out = test_sink()
+            out << sum(source1())
+        "},
+        rows,
+        two_batches(),
+    );
+    assert_eq!(value, Value::Int(15));
+    assert!(
+        planned.iter().any(|plan| plan.live),
+        "a source pipeline over the live source: {planned:?}"
+    );
+}
+
+/// A let-bound map over a live source is a `Memo` keyed by the source's keys, which the run
+/// notifies of each delivery. The sink reads the `Memo` through its feed, which is keyed by the
+/// sink's one row, so the `Memo`'s pushes reach it widened and it parks the row until the `Memo`
+/// is decided.
+#[rstest_log::rstest]
+fn a_let_bound_map_over_a_live_source(#[values(1, usize::MAX)] rows: usize) {
+    let (value, planned) = dispatched_live(
+        indoc! {"
+            out = test_sink()
+            ys = [x * 2 for x in source1()]
+            out << ys
+        "},
+        rows,
+        two_batches(),
+    );
+    // A collection's entries are keyed, and their order says nothing.
+    let mut pairs: Vec<(Value, Value)> = value
+        .as_function()
+        .iter()
+        .map(|binding| (binding.input.clone(), binding.output.clone()))
+        .collect();
+    pairs.sort_by_key(|(key, _)| match key {
+        Value::UInt(key) => *key,
+        other => panic!("the map is keyed by the source's keys: {other:?}"),
+    });
+    assert_eq!(
+        pairs,
+        (0..5)
+            .map(|key| (Value::UInt(key), Value::Int(2 * (key as i64 + 1))))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        planned
+            .iter()
+            .any(|plan| plan.live && plan.name.starts_with("Memo")),
+        "the map's `Memo` is the live source pipeline: {planned:?}"
+    );
+}
+
+/// A feed of a map over a live source is keyed by the sink's one row, so a push of a delivery's
+/// keys is widened on its way to the pipeline above the source, which no package names.
+#[test]
+#[should_panic(expected = "widened, so no package names them")]
+fn a_feed_of_a_map_over_a_live_source_is_refused() {
+    dispatched_live(
+        indoc! {"
+            out = test_sink()
+            out << [x * 2 for x in source1()]
+        "},
+        1,
+        two_batches(),
+    );
+}
+
+/// `batches` deliveries of `source1`, one key each, valued one more than the key.
+fn one_key_batches(batches: u64) -> Vec<Batch> {
+    (0..batches)
+        .map(|key| {
+            let complete = match key + 1 == batches {
+                true => crate::interpreter::Predicate::True,
+                false => crate::interpreter::Predicate::at_or_below(Value::UInt(key)),
+            };
+            (
+                vec![(Value::UInt(key), Value::Int(key as i64 + 1))],
+                complete,
+            )
+        })
+        .collect()
+}
+
+/// Successive source deliveries contribute to one sum before the source closes.
+#[test]
+fn a_sum_over_many_deliveries() {
+    let (value, _) = dispatched_live(
+        indoc! {"
+            out = test_sink()
+            out << sum(source1())
+        "},
+        1,
+        one_key_batches(10),
+    );
+    assert_eq!(value, Value::Int(55));
+}
+
+/// Two pipelines over one source are each notified of every delivery.
+#[test]
+fn two_sums_over_one_live_source() {
+    let (value, planned) = dispatched_live(
+        indoc! {"
+            out = test_sink()
+            out << sum(source1()) + sum([x * 2 for x in source1()])
+        "},
+        1,
+        two_batches(),
+    );
+    assert_eq!(value, Value::Int(45));
+    assert_eq!(
+        planned.iter().filter(|plan| plan.live).count(),
+        2,
+        "two live source pipelines: {planned:?}"
+    );
+}
+
+#[rstest_log::rstest]
+#[case::same_source(indoc! {"
+    out = test_sink()
+    out << sum([x * y for x in source1() for y in source1()])
+"}, 225)]
+#[case::static_inner(indoc! {"
+    out = test_sink()
+    out << sum([x * y for x in source1() for y in [10, 20]])
+"}, 450)]
+#[case::static_outer(indoc! {"
+    out = test_sink()
+    out << sum([x * y for x in [10, 20] for y in source1()])
+"}, 450)]
+fn a_live_cartesian_product(
+    #[case] source: &str,
+    #[case] expected: i64,
+    #[values(1, usize::MAX)] rows: usize,
+    #[values(two_batches(), one_key_batches(5))] batches: Vec<Batch>,
+) {
+    let (value, planned) = dispatched_live(source, rows, batches);
+    assert!(
+        planned
+            .iter()
+            .all(|pipeline| !pipeline.name.starts_with("IterateExtent#")),
+        "iteration runs in its reader's pipeline: {planned:?}"
+    );
+    assert_eq!(value, Value::Int(expected));
+}
+
+#[rstest_log::rstest]
+fn a_cartesian_product_of_two_live_sources(
+    #[values(1, usize::MAX)] rows: usize,
+    #[values(false, true)] together: bool,
+    #[values(false, true)] close_left_first: bool,
+) {
+    use crate::interpreter::{BaseType, Extent, Predicate, TestDataSource};
+    let mut ctx = GlobalContext::default();
+    ctx.defer_sink_pulls();
+    let feeds: Vec<_> = ["source1", "source2"]
+        .into_iter()
+        .map(|name| {
+            let source = std::rc::Rc::new(std::cell::RefCell::new(TestDataSource::new(
+                name,
+                crate::ccl::Type::Base(BaseType::Int),
+                Extent::Base(BaseType::Int),
+            )));
+            ctx.register_source(source.clone());
+            source
+        })
+        .collect();
+    let sink = ctx.register_test_sink("out");
+    let text = indoc! {"
+        out = test_sink()
+        out << sum([x * y for x in source1() for y in source2()])
+    "};
+    let mut program = compile_program(&mut ctx, &LoadedProgram::test(text), Box::new(|| {}))
+        .expect("the product compiles");
+    let _operators = ctx.take_operator_map();
+    let mut stages = vec![(vec![1], false, vec![10], false)];
+    if together {
+        stages.push((vec![2], false, vec![20], false));
+    } else {
+        stages.push((vec![2], false, vec![], false));
+        stages.push((vec![], false, vec![20], false));
+    }
+    if close_left_first {
+        stages.push((vec![3], true, vec![], false));
+        stages.push((vec![], true, vec![], true));
+    } else {
+        stages.push((vec![], false, vec![], true));
+        stages.push((vec![3], true, vec![], true));
+    }
+    let mut stages = stages.into_iter();
+    let mut next = [0_u64; 2];
+    let mut deliver = || {
+        let (a, ac, b, bc) = stages
+            .next()
+            .expect("the product finishes after the last delivery");
+        for (side, (values, closed)) in [(a, ac), (b, bc)].into_iter().enumerate() {
+            let entries: Vec<_> = values
+                .into_iter()
+                .map(|value| {
+                    let key = next[side];
+                    next[side] += 1;
+                    (Value::UInt(key), Value::Int(value))
+                })
+                .collect();
+            let mut feed = feeds[side].borrow_mut();
+            feed.add_data(&entries);
+            let decided = if closed {
+                Predicate::True
+            } else if next[side] == 0 {
+                Predicate::False
+            } else {
+                Predicate::at_or_below(Value::UInt(next[side] - 1))
+            };
+            feed.set_yield_predicate(decided);
+        }
+    };
+    fn product_decided(producer: &mut dyn TileProducer) -> Option<crate::interpreter::TileGuard> {
+        if producer.name().starts_with("IterateExtent#")
+            && matches!(producer.tiling().domain_extent(), Some(Extent::Record(_)))
+        {
+            assert!(producer.as_breaking_mut().is_none());
+            return Some(producer.get(producer.tiling().universal_guard()).to_guard());
+        }
+        let mut found = None;
+        producer.visit_input_producers_mut(&mut |_, input| {
+            if found.is_none() {
+                found = product_decided(input);
+            }
+        });
+        found
+    }
+    let root = program
+        .outputs
+        .iter()
+        .find_map(|output| output.sink_consumer.as_ref())
+        .expect("one sink")
+        .borrow()
+        .producer_slot()
+        .clone();
+    let mut boundaries = Vec::new();
+    deliver();
+    let mut next_delivery = || {
+        let mut slot = root.borrow_mut();
+        let decided = product_decided(slot.as_mut().expect("the sink owns its input").as_mut())
+            .expect("the program has a Cartesian iterator");
+        assert!(
+            !decided.is_empty(),
+            "the product progresses before either source closes"
+        );
+        boundaries.push(decided);
+        drop(slot);
+        deliver();
+    };
+    let planned =
+        crate::interpreter::dispatcher::run_program_polling(&mut program, rows, &mut next_delivery)
+            .expect("the dispatcher supports both live product dimensions")
+            .planned;
+    let written = sink.value().expect("the result is final");
+    assert_eq!(
+        written.as_function()[0].output,
+        Value::Int(180),
+        "{planned:?}"
+    );
+    assert!(program.done.try_recv().is_ok());
+    assert!(boundaries.len() >= 3);
+    assert!(
+        boundaries
+            .windows(2)
+            .all(|pair| super::guard_minus(&pair[0], &pair[1]).is_empty()),
+        "product decisions survive output releases and grow at every source boundary"
+    );
+}
+
+/// A breaker whose chain reads a live source and a pipeline takes the pipeline's pushes, and no
+/// package a source's delivery names.
+#[test]
+#[should_panic(expected = "reads pushes and a live source")]
+fn a_reader_of_pushes_over_a_live_source_is_refused() {
+    dispatched_live(
+        indoc! {"
+            out = test_sink()
+            ys = [1, 2]
+            out << sum([x + sum(ys) for x in source1()])
+        "},
+        1,
+        two_batches(),
+    );
 }
 
 #[rstest::rstest]

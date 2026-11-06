@@ -10,10 +10,10 @@ use super::loop_scope::{self, Member, induction};
 use super::*;
 use crate::ccl::context::CompiledProgram;
 use crate::interpreter::CurryLevel;
-use crate::interpreter::DataSink;
 use crate::interpreter::sinks::ProducerSlot;
 use crate::interpreter::tile_operators::StoreCell;
 use crate::interpreter::tiling::Tile;
+use crate::interpreter::{BaseType, DataSink, DataSourceDomainExtentImpl, Extent};
 
 /// Run `program`'s pipelines through a dispatcher of `morsel_rows` on the calling thread, the
 /// program compiled with its sinks unpulled (`GlobalContext::defer_sink_pulls`). The breakers
@@ -49,30 +49,43 @@ use crate::interpreter::tiling::Tile;
 ///
 /// # Errors
 ///
-/// Where the planner refuses the program ([`Refused`]), before anything runs and with no entry or
-/// sink left placed: a program compiled with its sinks pulled; one that reads a live source; a
-/// pipeline that reads directly a pipeline another pipeline reads; a breaker with no consuming
-/// mode (`Breaker::no_consuming_mode`); and where `Planner::store_pipeline` refuses a store.
+/// Where planning encounters an unsupported program shape, before execution and with no entry or
+/// sink left placed: sinks compiled in pull mode; live ranges whose arrivals cannot be routed to
+/// a supported input projection; incompatible direct shared reads; a breaker with no consuming
+/// mode; or a store refused by [`Planner::store_pipeline`].
 ///
 /// # Panics
 ///
 /// Where a round of a loop's scope pulls an operator beneath the outermost keys at a level it
 /// restates no projection at (`Planner::unrestated_in_rounds`), and where [`run`] panics.
 pub fn run_program(program: &mut CompiledProgram, morsel_rows: usize) -> Result<Run, Refused> {
+    run_program_polling(program, morsel_rows, &mut || {
+        thread::sleep(std::time::Duration::from_millis(1));
+    })
+}
+
+/// [`run_program`] with `on_idle` called each time nothing is claimable and a live source has
+/// yielded no new region since the last poll, before the next poll: [`run_program`] sleeps, and
+/// a test feeds the source there.
+///
+/// # Errors
+///
+/// As [`run_program`].
+///
+/// # Panics
+///
+/// As [`run_program`].
+pub fn run_program_polling(
+    program: &mut CompiledProgram,
+    morsel_rows: usize,
+    on_idle: &mut dyn FnMut(),
+) -> Result<Run, Refused> {
     if !program.sink_pulls_deferred() {
         return Err(Refused(
             "the program was compiled with its sinks pulled, which runs part of it in pull mode \
              (`GlobalContext::defer_sink_pulls`)"
                 .to_string(),
         ));
-    }
-    if !program.source_producers.is_empty() {
-        let mut producers: Vec<_> = program.source_producers.iter().cloned().collect();
-        producers.sort();
-        return Err(Refused(format!(
-            "the program reads a live source, through {producers:?}, whose arrivals no run \
-             notifies"
-        )));
     }
     // A `main` output's producer is the driver's to pull; the run takes it into a slot, as a
     // sink's sits in one, and hands it back after. A program has at most one.
@@ -94,7 +107,7 @@ pub fn run_program(program: &mut CompiledProgram, morsel_rows: usize) -> Result<
             targets.push((slot, collected, None));
         }
     }
-    let result = run_targets(&targets, morsel_rows);
+    let result = run_targets(&targets, morsel_rows, on_idle);
     if let Some((at, slot, _)) = &main {
         program.outputs[*at].producer = slot.borrow_mut().take();
     }
@@ -155,6 +168,7 @@ impl DataSink for Collected {
 fn run_targets(
     targets: &[(ProducerSlot, Arc<dyn DataSink>, Option<SinkTarget>)],
     morsel_rows: usize,
+    on_idle: &mut dyn FnMut(),
 ) -> Result<Vec<Planned>, Refused> {
     let mut runs = InductionRuns::new();
     let mut planner = Planner::default();
@@ -174,7 +188,32 @@ fn run_targets(
         sink_breakers.push(RefCell::new(breaker));
     }
     planner.check_direct();
-    if let Some(refused) = planner.refused {
+    // Only a source pipeline of the run's dispatcher is notified of what a source yields: a
+    // loop's round or a reader of pushes is queued nothing a source's arrival names. A loop's
+    // store records every source its chain reads (`StoreRead::sources`), so a store whose cycle
+    // reads one is refused before its cycle is walked.
+    debug_assert!(
+        planner.refused.is_some()
+            || (0..planner.located.len()).all(|pipeline| {
+                planner.within[pipeline].is_none() || planner.live[pipeline].is_empty()
+            }),
+        "a live source inside a loop's cycle refuses the loop's store"
+    );
+    let live_reader = {
+        let members = planner.members(None);
+        (0..members.live.len())
+            .find(|pipeline| {
+                !members.live[*pipeline].is_empty() && !members.reads[*pipeline].is_empty()
+            })
+            .map(|pipeline| members.names[pipeline].clone())
+    };
+    if let Some(name) = live_reader {
+        planner.refuse(format!(
+            "{name} reads pushes and a live source, whose arrivals a reader of pushes is queued \
+             none of"
+        ));
+    }
+    if let Some(refused) = planner.refused.take() {
         unplace(&planner.placements, targets);
         return Err(refused);
     }
@@ -246,6 +285,48 @@ fn run_targets(
         &mut reach,
         &mut end_of,
     );
+    let mut live = Vec::new();
+    for (pipeline, leaves) in members.live.iter().enumerate() {
+        if leaves.is_empty() {
+            continue;
+        }
+        // A source's arrivals are restated keys of the outermost level of the pipeline's input,
+        // or no package names them: one key's push is probed.
+        for leaf in leaves {
+            let arrived = probe(
+                &leaf.consumer,
+                PipelineId(pipeline),
+                &leaf.probe_region(),
+                pipeline,
+            );
+            if arrived.is_empty() {
+                unplace(&planner.placements, targets);
+                return Err(Refused(format!(
+                    "a live source's arrivals reach no entry of {}, so no package names them",
+                    members.names[pipeline]
+                )));
+            }
+            if arrived.iter().any(|arrival| arrival.widened) {
+                unplace(&planner.placements, targets);
+                return Err(Refused(format!(
+                    "a live source's arrivals reach {} widened, so no package names them",
+                    members.names[pipeline]
+                )));
+            }
+            if !arrived.iter().all(|arrival| {
+                matches!(arrival.guard, TileGuard::Function(FunctionGuard::Domain(_)))
+            }) {
+                unplace(&planner.placements, targets);
+                return Err(Refused(format!(
+                    "a live source's arrivals reach {} beneath its outermost keys, which no \
+                     package names",
+                    members.names[pipeline]
+                )));
+            }
+        }
+        planned[pipeline].live = true;
+        live.push(LivePipeline::new(PipelineId(pipeline), leaves.clone()));
+    }
     // The run drives every breaker it planned, so each takes its consuming mode here, before any
     // package, and keeps it for the run.
     for pipeline in 0..members.names.len() {
@@ -258,7 +339,11 @@ fn run_targets(
     let mut reach = |pipeline: PipelineId, call: &mut Call<'_>| {
         execution.reach(pipeline, &mut root_reach, call)
     };
-    execution.drive(&dispatcher, &mut reach);
+    match live.is_empty() {
+        true => execution.drive(&dispatcher, &mut reach),
+        false => drive_live(&dispatcher, &mut reach, &mut live, on_idle, &execution),
+    }
+
     for (plan, scope) in planned.iter_mut().zip(&scopes) {
         if let Some(scope) = scope {
             plan.rounds = std::mem::take(&mut induction(scope).run.as_mut().unwrap().planned);
@@ -525,6 +610,21 @@ impl Execution {
         progressed
     }
 
+    fn push_held(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
+        let pipelines = self
+            .handlers
+            .iter()
+            .enumerate()
+            .filter(|(pipeline, handler)| {
+                !matches!(handler, Handler::Step(_))
+                    && !dispatcher.states[*pipeline].held.load(Ordering::SeqCst)
+                    && !matches!(handler, Handler::Request(scope) if induction(scope).has_package())
+            })
+            .map(|(pipeline, _)| PipelineId(pipeline))
+            .collect::<Vec<_>>();
+        push_held(dispatcher, reach, pipelines);
+    }
+
     fn drive(&self, dispatcher: &Dispatcher, reach: &mut Reach<'_>) {
         for pipeline in 0..self.roots {
             if dispatcher.is_source(PipelineId(pipeline)) {
@@ -597,6 +697,7 @@ pub(super) fn plan_edges(
             held: false,
             follows: Vec::new(),
             rounds: Vec::new(),
+            live: false,
         })
         .collect();
     let mut starts = Vec::new();
@@ -722,6 +823,8 @@ pub struct Planned {
     pub follows: Vec<usize>,
     /// The body planning tree, whose IDs refer to siblings rather than global runtime pipelines.
     pub rounds: Vec<Planned>,
+    /// Whether it is a source the run notifies of what a live source yields.
+    pub live: bool,
 }
 
 /// The consumer `pipeline`'s breaker pushes to, and whether its output has keys of its own, so a
@@ -804,6 +907,8 @@ pub(super) struct Members<'p> {
     pub(super) kinds: Vec<Consumes>,
     /// The placements of the entries of the breakers in chains.
     pub(super) placements: Vec<Option<Placement>>,
+    /// The ranges over a live source in each pipeline's chain.
+    live: Vec<Vec<LiveLeaf>>,
 }
 
 /// Pipelines discovered in a program's producer chains. An index here identifies a pipeline
@@ -818,6 +923,8 @@ pub(super) struct Planner {
     /// Per pipeline, the consumers of the ranges in its chain (`ProducerBase::leaf`), above
     /// every breaker beneath it.
     leaves: Vec<Vec<SharedConsumer>>,
+    /// Per pipeline, the ranges over a live source in its chain, above every breaker beneath it.
+    live: Vec<Vec<LiveLeaf>>,
     /// Per pipeline, its body planning scope; `None` for the root graph.
     within: Vec<Option<usize>>,
     /// Per pipeline, its local ID in that scoped planning graph.
@@ -846,7 +953,40 @@ struct Beneath {
     /// The constant collections above those breakers that are no function operand: producers
     /// with no input and keys of their own that keep no consumer, so no probe names their keys.
     unprobed: Vec<String>,
+    /// The ranges over a live source above those breakers.
+    live: Vec<LiveLeaf>,
 }
+
+/// A live iteration range: its consumer and the full extent whose decided region is announced.
+#[derive(Clone)]
+pub(super) struct LiveLeaf {
+    pub(super) consumer: SharedConsumer,
+    pub(super) extent: Extent,
+}
+
+impl LiveLeaf {
+    fn probe_region(&self) -> Projection {
+        fn probe(extent: &Extent) -> Predicate {
+            match extent {
+                Extent::Record(fields) => Predicate::Record(
+                    fields
+                        .iter()
+                        .map(|(name, extent)| (name.clone(), probe(extent)))
+                        .collect(),
+                ),
+                Extent::Union(arms) => {
+                    Predicate::over_every_tag(arms.map(|_, extent| probe(extent)))
+                }
+                Extent::DataSourceDomain(_) => Predicate::point(Value::UInt(0)),
+                _ => Predicate::True,
+            }
+        }
+        Projection::admitting(probe(&self.extent))
+    }
+}
+
+/// A live source, as a range over its domain reads it.
+pub(super) type LiveSource = Rc<RefCell<dyn DataSourceDomainExtentImpl>>;
 
 impl Beneath {
     /// Add `pipelines` to the pipelines beneath, each once: a reader that reaches a pipeline
@@ -910,6 +1050,7 @@ impl Planner {
             below.read_once(under.pipelines);
             below.leaves.extend(under.leaves);
             below.unprobed.extend(under.unprobed);
+            below.live.extend(under.live);
         });
         assert_eq!(
             inputs,
@@ -927,6 +1068,25 @@ impl Planner {
         if inputs == 0 && leaf.is_none() && role != "fn" && producer.tiling().is_data_function() {
             below.unprobed.push(producer.name());
         }
+        let sources = producer.data_sources();
+        let extent = producer.tiling().domain_extent();
+        if sources
+            .iter()
+            .any(|source| source.borrow().element_extent() != Extent::Base(BaseType::UInt))
+        {
+            self.refuse(format!(
+                "{} ranges over a live source without UInt positions",
+                producer.name()
+            ));
+            return Beneath::default();
+        }
+        let (leaf, live) = match (leaf, extent) {
+            (Some(consumer), Some(extent)) if !sources.is_empty() => {
+                (None, Some(LiveLeaf { consumer, extent }))
+            }
+            (leaf, _) => (leaf, None),
+        };
+        below.live.extend(live);
         let Some(breaker) = producer.as_breaking_mut() else {
             below.leaves.extend(leaf);
             for (_, direct) in &mut below.pipelines {
@@ -1185,6 +1345,7 @@ impl Planner {
         self.reads
             .push(below.pipelines.iter().map(|(read, _)| *read).collect());
         self.leaves.push(below.leaves);
+        self.live.push(below.live);
         pipeline
     }
 
@@ -1306,6 +1467,10 @@ impl Planner {
             placements: ids
                 .iter()
                 .map(|pipeline| self.placements[*pipeline].clone())
+                .collect(),
+            live: ids
+                .iter()
+                .map(|pipeline| self.live[*pipeline].clone())
                 .collect(),
         }
     }
@@ -1650,6 +1815,136 @@ fn reads_of_kept(reads: &[Vec<usize>], kept: &[usize]) -> Vec<Vec<usize>> {
             into
         })
         .collect()
+}
+
+/// A source pipeline of the run's dispatcher over live sources, and the region of each range's
+/// keys it has been notified of.
+struct LivePipeline {
+    pipeline: PipelineId,
+    leaves: Vec<(LiveLeaf, Predicate)>,
+    closed: bool,
+}
+
+impl LivePipeline {
+    fn new(pipeline: PipelineId, leaves: Vec<LiveLeaf>) -> Self {
+        Self {
+            pipeline,
+            leaves: leaves
+                .into_iter()
+                .map(|leaf| (leaf, Predicate::False))
+                .collect(),
+            closed: false,
+        }
+    }
+
+    /// Notify `dispatcher`'s pipeline of what each range's sources yield beyond what it was
+    /// notified of, as the region a push of those keys brings its entry, and close it once
+    /// every source yields everything. Answers whether it notified or closed anything.
+    fn poll(&mut self, dispatcher: &Dispatcher) -> bool {
+        if self.closed {
+            return false;
+        }
+        let mut changed = false;
+        let mut complete = true;
+        for (leaf, notified) in &mut self.leaves {
+            let yielded = leaf.extent.decided_region();
+            debug_assert!(
+                notified.minus(&yielded).is_false(),
+                "a source's yield only grows: it yields {yielded:?}, short of {notified:?}"
+            );
+            complete &= yielded.is_true();
+            let fresh = yielded.minus(notified);
+            if fresh.is_false() {
+                continue;
+            }
+            for arrival in probe(
+                &leaf.consumer,
+                self.pipeline,
+                &Projection::admitting(fresh),
+                self.pipeline.0,
+            ) {
+                dispatcher.notify(self.pipeline, &arrival.guard);
+            }
+            *notified = yielded;
+            changed = true;
+        }
+        if complete {
+            dispatcher.close(self.pipeline);
+            self.closed = true;
+            changed = true;
+        }
+        changed
+    }
+}
+
+/// [`drive`] over a run with source pipelines over live sources (`live`). The other sources
+/// start whole. Each pass polls the live sources
+/// (`DataSourceDomainExtentImpl::check_for_new_data`), notifies each live pipeline of what they
+/// yield ([`LivePipeline::poll`]), and runs until nothing is claimable. Each drained pass has
+/// every breaker push what it holds and repeats while that queues more work. A pass that polls
+/// nothing new calls `on_idle`. The run ends once every source has closed and every pipeline has
+/// finished.
+fn drive_live(
+    dispatcher: &Dispatcher,
+    reach: &mut Reach<'_>,
+    live: &mut [LivePipeline],
+    on_idle: &mut dyn FnMut(),
+    execution: &Execution,
+) {
+    for (pipeline, info) in dispatcher.infos.iter().take(execution.roots).enumerate() {
+        if info.reads.is_empty() && !live.iter().any(|at| at.pipeline.0 == pipeline) {
+            let mut input = None;
+            reach(PipelineId(pipeline), &mut |breaker| {
+                input = Some(breaker.input_tiling(InputId::ONLY));
+            });
+            let input = input.expect("a reach calls the breaker it reaches");
+            dispatcher.start_source(PipelineId(pipeline), &input);
+        }
+    }
+    execution.push_held(dispatcher, reach);
+    loop {
+        let mut sources: Vec<LiveSource> = Vec::new();
+        for (leaf, _) in live.iter().flat_map(|at| &at.leaves) {
+            leaf.extent.for_each_source(&mut |source| {
+                if !sources.iter().any(|seen| Rc::ptr_eq(seen, source)) {
+                    sources.push(source.clone());
+                }
+            });
+        }
+        for source in &sources {
+            source.borrow_mut().check_for_new_data();
+        }
+        let mut changed = false;
+        for at in live.iter_mut() {
+            changed |= at.poll(dispatcher);
+        }
+        loop {
+            match dispatcher.try_claim(None) {
+                Next::Package(package) => execution.consume(dispatcher, reach, package),
+                Next::Finish { pipeline, consumed } => {
+                    execution.finish(dispatcher, reach, pipeline, consumed)
+                }
+                Next::Wait(_) if execution.resume(dispatcher, reach) => {}
+                Next::Wait(_) => {
+                    let before = dispatcher.changes();
+                    execution.push_held(dispatcher, reach);
+                    if dispatcher.changes() != before {
+                        continue;
+                    }
+                    assert!(
+                        live.iter().any(|at| !at.closed),
+                        "a run whose live pipelines have all closed has a pipeline that may finish"
+                    );
+                    break;
+                }
+                Next::Done => return,
+                Next::Failed => panic!("a run on one thread fails only by panicking on it"),
+            }
+        }
+        if !changed {
+            on_idle();
+        }
+    }
 }
 
 #[cfg(test)]
