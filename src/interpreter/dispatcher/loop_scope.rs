@@ -79,11 +79,14 @@ impl LoopScope {
             let kinds: Vec<Consumes> = kept.iter().map(|&at| pipelines.kinds[at]).collect();
             // A live source read inside a scope is read by the scope's pipeline in the run's
             // dispatcher, so no inner pipeline is live.
+            // A store inside a scope is a nested loop's, whose scope is one pipeline, so no two
+            // inner pipelines share a breaker's pushes.
             let (inner, planned) = plan_edges(
                 &reads,
                 &names,
                 &leaves,
                 &kinds,
+                &(0..names.len()).collect::<Vec<_>>(),
                 morsel_rows,
                 &mut reach,
                 &mut |pipeline| match &members[kept[pipeline.0]] {
@@ -169,12 +172,17 @@ impl LoopScope {
     fn next_position(&self) -> Option<Vec<Value>> {
         let drive = self.drive();
         let mut next = None;
-        reach_member(&self.store, &self.members[drive.0], drive, &mut |breaker| {
-            next = breaker
-                .as_producer()
-                .and_then(|producer| producer.next_position())
-                .flatten();
-        });
+        reach_member(
+            &self.store,
+            &self.members[drive.0],
+            drive,
+            &mut |breaker, _| {
+                next = breaker
+                    .as_producer()
+                    .and_then(|producer| producer.next_position())
+                    .flatten();
+            },
+        );
         next
     }
 
@@ -199,11 +207,16 @@ impl LoopScope {
             })
             .filter(|&start| {
                 let mut drive = false;
-                reach_member(&self.store, &self.members[start.0], start, &mut |breaker| {
-                    drive = breaker
-                        .as_producer()
-                        .is_some_and(|producer| producer.next_position().is_some());
-                });
+                reach_member(
+                    &self.store,
+                    &self.members[start.0],
+                    start,
+                    &mut |breaker, _| {
+                        drive = breaker
+                            .as_producer()
+                            .is_some_and(|producer| producer.next_position().is_some());
+                    },
+                );
                 drive
             })
             .collect();
@@ -237,10 +250,15 @@ impl LoopScope {
     /// has run, so the scope reads them before it runs the row's rounds.
     fn read_source(&self) {
         let drive = self.drive();
-        reach_member(&self.store, &self.members[drive.0], drive, &mut |breaker| {
-            let none = breaker.input_tiling(InputId::ONLY).empty_guard();
-            breaker.consume_impl(InputId::ONLY, none);
-        });
+        reach_member(
+            &self.store,
+            &self.members[drive.0],
+            drive,
+            &mut |breaker, input| {
+                let none = breaker.input_tiling(input).empty_guard();
+                breaker.consume_impl(input, none);
+            },
+        );
     }
 
     /// Run the inner dispatcher until nothing is claimable, and answer whether it is done. On
@@ -334,11 +352,16 @@ impl LoopScope {
     fn row_for(&self, guard: &TileGuard, readers: &[PipelineId]) -> Vec<(PipelineId, TileGuard)> {
         let drive = self.drive();
         let mut consumer = None;
-        reach_member(&self.store, &self.members[drive.0], drive, &mut |breaker| {
-            consumer = breaker
-                .as_producer()
-                .and_then(|producer| producer.base().downstream.clone());
-        });
+        reach_member(
+            &self.store,
+            &self.members[drive.0],
+            drive,
+            &mut |breaker, _| {
+                consumer = breaker
+                    .as_producer()
+                    .and_then(|producer| producer.base().downstream.clone());
+            },
+        );
         let consumer = consumer.expect("a loop's drive pushes to the pipelines that read it");
         let region = Projection::of(guard)
             .unwrap_or_else(|why| panic!("a loop's round names a row of its store: {why}"));
@@ -361,7 +384,7 @@ impl LoopScope {
                     &self.store,
                     &self.members[reader.0],
                     reader,
-                    &mut |breaker| fits = guard.check_from(&breaker.input_tiling(InputId::ONLY)),
+                    &mut |breaker, input| fits = guard.check_from(&breaker.input_tiling(input)),
                 );
                 match fits {
                     true => vec![(reader, guard.clone())],
@@ -391,8 +414,8 @@ impl LoopScope {
                 &self.store,
                 &self.members[reader.0],
                 reader,
-                &mut |breaker| {
-                    released = guard_minus(&row, &breaker.input_released(InputId::ONLY)).is_empty()
+                &mut |breaker, input| {
+                    released = guard_minus(&row, &breaker.input_released(input)).is_empty()
                 },
             );
             if !released {
@@ -443,7 +466,7 @@ fn reads_of_kept(reads: &[Vec<usize>], kept: &[usize]) -> Vec<Vec<usize>> {
 /// a nested loop's scope.
 fn reach_member(store: &StoreCell, member: &Member, pipeline: PipelineId, call: &mut Call<'_>) {
     match member {
-        Member::Scope(scope) => call(&mut *scope.borrow_mut()),
+        Member::Scope(scope) => call(&mut *scope.borrow_mut(), InputId::ONLY),
         Member::Chain(id) => {
             let mut store = store.borrow_mut();
             let mut call = Some(call);
@@ -467,7 +490,7 @@ impl Breaker for LoopScope {
     fn enter_consuming_mode(&mut self) {
         self.with_store(|store| store.enter_consuming_mode());
         for (at, member) in self.members.iter().enumerate() {
-            reach_member(&self.store, member, PipelineId(at), &mut |breaker| {
+            reach_member(&self.store, member, PipelineId(at), &mut |breaker, _| {
                 breaker.enter_consuming_mode()
             });
         }
