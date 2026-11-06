@@ -2469,6 +2469,25 @@ fn some_of_a_computed_value(#[case] code: &str, #[case] expected: Value) {
     check_scalar(code, expected);
 }
 
+/// `b ^+ x` in a comprehension's element, with `b` computed. Its type carries
+/// `__elem == b ^+ x`; planning replaces the operand `b` with `6 ▷ const` in the term but not
+/// in the recorded refinement, so the refinement the post-planning check re-derives from the
+/// operands names `6` where the recorded one names `b`, and the check rejects the tree.
+/// [`some_of_a_computed_value`] is the same failure through `Option::some`'s refinement.
+#[test]
+#[should_panic(expected = "post-planning produced an invalid tree")]
+fn refined_add_of_a_computed_value_in_a_comprehension() {
+    check_scalar(
+        indoc! {"
+            a = 5
+            b = a + 1
+            xs = [1, 2]
+            sum([b ^+ x for x in xs])
+        "},
+        Value::Int(15),
+    );
+}
+
 /// `!` in a comprehension's element: lambda elimination reads `unwrap`'s `match` at a scrutinee
 /// type that no longer excludes `none`, so the match's one arm is non-exhaustive.
 #[test]
