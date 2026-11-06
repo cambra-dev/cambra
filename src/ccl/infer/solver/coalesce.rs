@@ -251,6 +251,34 @@ fn relate_params_by_bounds(ct: &CompactType, polarity: bool) -> Option<CompactTy
     use crate::ccl::ty::TypeParam;
     use std::rc::Rc;
 
+    /// The bound on the values of the family `atom` applies, at the application's terms, where
+    /// `atom` is an application of a bounded family.
+    fn family_bound(atom: &AtomKey) -> Option<Type> {
+        let AtomKey::Family(c) = atom else {
+            return None;
+        };
+        let Type::FamilyApp(app) = c.ty() else {
+            return None;
+        };
+        let applied = crate::ccl::subst::family_bound_at(app)?;
+        // A binder name nothing reads is a spelling, which `is_below` and a merge compare; the
+        // bound's is its own.
+        Some(match applied {
+            Type::Fun {
+                name: Some(b),
+                fun_kind,
+                domain,
+                codomain,
+            } if !crate::ccl::subst::codomain_depends_on(&b, &codomain) => Type::Fun {
+                name: None,
+                fun_kind,
+                domain,
+                codomain,
+            },
+            other => other,
+        })
+    }
+
     // **A family application meets its bound as itself**, as a parameter does below: where the
     // bound on the family's values, applied at the application's terms, is below the rest of
     // the position, the meet is the application (`docs/chl-spec.md`, "Family parameters").
@@ -258,34 +286,12 @@ fn relate_params_by_bounds(ct: &CompactType, polarity: bool) -> Option<CompactTy
         let bounded: Vec<(&AtomKey, Type)> = ct
             .atoms
             .iter()
-            .filter_map(|a| match a {
-                AtomKey::Family(c) => match c.ty() {
-                    Type::FamilyApp(app) => crate::ccl::subst::family_bound_at(app).map(|b| (a, b)),
-                    _ => None,
-                },
-                _ => None,
-            })
+            .filter_map(|a| family_bound(a).map(|b| (a, b)))
             .collect();
-        if let [(atom, applied)] = bounded.as_slice() {
+        if let [(atom, unnamed)] = bounded.as_slice() {
             let mut rest = ct.clone();
             rest.atoms.remove(*atom);
-            // A binder name nothing reads is a spelling, which `is_below` compares; the bound's
-            // is its own.
-            let unnamed = match applied {
-                Type::Fun {
-                    name: Some(b),
-                    fun_kind,
-                    domain,
-                    codomain,
-                } if !crate::ccl::subst::codomain_depends_on(b, codomain) => Type::Fun {
-                    name: None,
-                    fun_kind: fun_kind.clone(),
-                    domain: domain.clone(),
-                    codomain: codomain.clone(),
-                },
-                other => other.clone(),
-            };
-            let bound = super::compact::compact_type(&unnamed);
+            let bound = super::compact::compact_type(unnamed);
             if rest.denotes_a_type()
                 && bound.rec_vars.is_empty()
                 && bound.term.denotes_a_type()
@@ -331,8 +337,33 @@ fn relate_params_by_bounds(ct: &CompactType, polarity: bool) -> Option<CompactTy
             .any(|b| matches!(b, Type::Param(q) if q == high))
     }
 
+    // **Otherwise a family application is widened to its bound**, at either polarity, as a
+    // parameter is below: values of a family at two different terms, or one beside another
+    // type, have no common type but the bound on the family's values (`docs/chl-spec.md`,
+    // "Family parameters", "Kinds and bounds").
+    let mut joined = None;
+    if ct.shapes() >= 2 {
+        let mut at = ct.clone();
+        let mut changed = false;
+        while at.shapes() >= 2 {
+            let Some((atom, bound)) = at.atoms.iter().find_map(|a| {
+                family_bound(a).map(|b| (a.clone(), super::compact::compact_type(&b)))
+            }) else {
+                break;
+            };
+            if !bound.rec_vars.is_empty() {
+                break;
+            }
+            at.atoms.remove(&atom);
+            at = CompactType::merge(polarity, at, bound.term);
+            changed = true;
+        }
+        joined = changed.then_some(at);
+    }
+    let ct = joined.as_ref().unwrap_or(ct);
+
     if params(ct).is_empty() || ct.shapes() < 2 {
-        return None;
+        return joined;
     }
     let mut ct = ct.clone();
     while ct.shapes() >= 2 {
